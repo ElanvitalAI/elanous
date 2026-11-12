@@ -106,11 +106,13 @@ describe('codex 갱신 관측 — 일곱 갈래를 «실제로 태워» 문다',
     expectNoSecrets();
   });
 
-  test('remote access-only host without the owner mirror fails before a network call', async () => {
+  test('remote access-only host uses valid same-user config auth before a missing owner mirror', async () => {
     process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
+    setStore({ ...state(3_600_000), authMode: 'chatgpt' });
     let calls = 0;
     const fetchImpl = (async () => { calls++; throw new Error('network must not be called'); }) as unknown as typeof fetch;
-    await expect(loadFreshCodexAuthState({ fetchImpl })).rejects.toThrow(CODEX_OWNER_MIRROR_REQUIRED);
+    const result = await loadFreshCodexAuthState({ fetchImpl });
+    expect(result?.tokens.accessToken).toBe(ACCESS);
     expect(calls).toBe(0);
     expect(events()).not.toContain('refresh-start');
   });

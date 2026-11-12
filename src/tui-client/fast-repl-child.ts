@@ -11,7 +11,9 @@ if (!sessionId || !configDir) {
 setElanousConfigDir(configDir);
 const { getUserConfig, reloadUserConfig } = await import('../user-config.js');
 const cfg = getUserConfig();
-if ((await import('../onboarding.js')).needsOnboarding(cfg)) {
+// The parent only launches this child from Next. Provider-ready sessions may
+// chat while optional web/Telegram onboarding remains unfinished.
+if ((await import('../onboarding.js')).needsOnboarding(cfg) && cfg.onboarding.ready !== true) {
   process.stderr.write('No config yet — run `elanous` once interactively before using the Next TUI REPL.\n');
   process.exit(2);
 }

@@ -37,6 +37,7 @@ import { debug } from '../debug/log.js';
 import { isCodexStoreKey } from './codex-account.js';
 import { migrateLegacyXdgFile } from '../storage/legacy-elanous-dir-migrate.js';
 import { withFileLockSync } from '../storage/file-lock.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 
 export interface OAuthTokens {
   accessToken: string;
@@ -104,10 +105,9 @@ const STORE_VERSION = 1;
 //   call migrates legacy XDG file with `.bak` rename · 0o600 preserved.
 //   XDG_CONFIG_HOME explicit honors legacy path (Phase 6 deprecation).
 export function authStorePath(): string {
-  const xdg = process.env.XDG_CONFIG_HOME?.trim();
-  if (xdg) return join(xdg, 'elanous', 'auth.json');
-  migrateLegacyXdgFile('auth.json', 0o600);
-  return join(homedir(), '.elanous', 'auth.json');
+  const root = getElanousConfigDir();
+  if (root === join(homedir(), '.elanous')) migrateLegacyXdgFile('auth.json', 0o600);
+  return join(root, 'auth.json');
 }
 
 /** 기본 계정의 홈 — 종전 규칙 그대로. ⛔ 이름 계정은 «자기 기록»의 codexHome 을 쓴다. */

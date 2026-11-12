@@ -24,14 +24,17 @@
 // the official CLI stays in sync.
 
 import { execFileSync } from 'node:child_process';
-import { chmodSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
 import { decodeJWTPayload } from './jwt.js';
 import { authStorePath, isUnderTestRunner } from './store.js';
-import { codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { getUserConfig } from '../user-config.js';
+import { debug } from '../debug/log.js';
 import { platform, release, arch } from 'node:os';
 import {
   saveTokens, loadTokens, expiresAtFromSeconds,
@@ -469,8 +472,27 @@ function remainingSeconds(state: ProviderAuthState | null): number | null {
 /** Shared remote consumer for availability probes and every Codex provider request. */
 export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: ProviderAuthState; storeKey: string } {
   const mirrorPath = ownerMirrorPath ?? codexOwnerMirrorAuthPath();
-  const account = resolveCodexAccountForRun(process.env, { storePath: mirrorPath });
-  return { state: readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath }), storeKey: account.storeKey };
+  const account = resolveCodexAccountForRun(process.env, { storePath: ownerMirrorPath ?? codexAccountReadStorePath(authStorePath()) });
+  if (!ownerMirrorPath) {
+    for (const [source, path] of [['config-dir', authStorePath()], ['default-root', join(homedir(), '.elanous', 'auth.json')]] as const) {
+      try {
+        const stat = lstatSync(path);
+        if (!stat.isFile() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) continue;
+      } catch { continue; }
+      const state = loadTokens(account.storeKey, path);
+      if (!state?.tokens.accessToken || typeof state.tokens.expiresAt !== 'number'
+        || state.tokens.expiresAt <= Date.now() + CODEX_REFRESH_BUFFER_MS) continue;
+      if (state.authMode !== 'chatgpt' || (source === 'default-root' && !(state.chatGPT?.accountId || state.accountUuid))) continue;
+      if (state.chatGPT?.accountId && state.accountUuid && state.chatGPT.accountId !== state.accountUuid) continue;
+      observeCodexAuth('fresh', { storeKey: account.storeKey, source,
+        rootSha256: createHash('sha256').update(dirname(path)).digest('hex').slice(0, 16) });
+      return { state, storeKey: account.storeKey };
+    }
+  }
+  const state = readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath });
+  observeCodexAuth('fresh', { storeKey: account.storeKey, source: 'owner-mirror',
+    rootSha256: createHash('sha256').update(dirname(mirrorPath)).digest('hex').slice(0, 16) });
+  return { state, storeKey: account.storeKey };
 }
 
 export async function loadFreshCodexAuthState(
@@ -499,6 +521,22 @@ export async function loadFreshCodexAuthState(
   //   호출자마다 읽으면 「설정 읽기는 한 자리」라는 배선을 호출자가 스스로 깬다.
   const account = resolveCodexAccountForRun();
   const stored = loadTokens(account.storeKey);
+  if (!stored && authStorePath() !== join(homedir(), '.elanous', 'auth.json')) {
+    const defaultPath = join(homedir(), '.elanous', 'auth.json');
+    try {
+      const stat = lstatSync(defaultPath);
+      if (stat.isFile() && !stat.isSymbolicLink() && (!process.getuid || stat.uid === process.getuid())) {
+        const fallback = loadTokens(account.storeKey, defaultPath);
+        if (fallback?.authMode === 'chatgpt' && (fallback.chatGPT?.accountId || fallback.accountUuid)
+          && fallback.tokens.accessToken && !isExpiringSoon(fallback, CODEX_REFRESH_BUFFER_MS)
+          && (!fallback.chatGPT?.accountId || !fallback.accountUuid || fallback.chatGPT.accountId === fallback.accountUuid)) {
+          try { debug.log('llm.auth', 'path-found', { source: 'default-root',
+            rootSha256: createHash('sha256').update(dirname(defaultPath)).digest('hex').slice(0, 16) }); } catch { /* fail-soft */ }
+          return fallback;
+        }
+      }
+    } catch { /* continue to owner mirror or local Codex CLI */ }
+  }
   if (stored?.source === 'mirror') return readCodexOwnerAccessMirror(account.storeKey, { path: authStorePath() });
   // ⛔⭐⭐⭐ 읽기(reconcile) 방향도 «그 계정의 홈»으로만 본다(2R must-fix).
   //   종전엔 기본 미러 경로를 봐서, 이름 계정이 «계정 A 의 미러»를 읽어 정본을 오염시킬 수 있었다.

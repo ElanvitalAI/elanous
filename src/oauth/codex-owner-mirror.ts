@@ -1,8 +1,8 @@
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { CODEX_CREDENTIAL_SLOT, credentialOwnerLedgerPath, normalizeCredentialHost, readCredentialOwner, recordCredentialMirror, resolveCodexCredentialOwnerHost, type CredentialOwnerRecord } from '../nexus/config/secrets/cred-owner.js';
@@ -13,7 +13,7 @@ export const CODEX_OWNER_MIRROR_RELATIVE_PATH = join('remote-parent-credentials'
 export const CODEX_OWNER_MIRROR_REQUIRED = 'Codex owner access mirror rejected — inspect llm.codex/owner-mirror-rejected for the precise reason';
 
 export function codexOwnerMirrorAuthPath(): string {
-  const stateRoot = elanousStateRoot();
+  const stateRoot = getElanousConfigDir();
   const derivedPath = join(stateRoot, CODEX_OWNER_MIRROR_RELATIVE_PATH);
   const accessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1';
   const explicitCodexHome = accessOnly ? process.env.CODEX_HOME?.trim() : undefined;
@@ -76,10 +76,40 @@ export function deliverCodexMirrorAndRecord(
 
 /** Account discovery and rotation must read the same remote snapshot as execution. */
 export function codexAccountReadStorePath(ownerStorePath: string): string {
-  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1') return codexOwnerMirrorAuthPath();
-  if (!isCodexTokenOwnerHost()) {
-    const mirror = codexOwnerMirrorAuthPath();
-    if (existsSync(mirror)) return mirror;
+  const candidates = [
+    ['config-dir', ownerStorePath],
+    ['default-root', join(homedir(), '.elanous', 'auth.json')],
+    ['owner-mirror', codexOwnerMirrorAuthPath()],
+  ] as const;
+  for (const [source, path] of candidates) {
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) continue;
+      if (source === 'owner-mirror') {
+        const parsed = JSON.parse(readFileSync(path, 'utf8')) as { providers?: Record<string, unknown> };
+        const keys = Object.keys(parsed.providers ?? {});
+        if (keys.length === 0) keys.push('openai-codex');
+        if (!keys.some(key => {
+          if (key !== 'openai-codex' && !key.startsWith('openai-codex:')) return false;
+          try { readCodexOwnerAccessMirror(key, { path }); return true; } catch { return false; }
+        })) continue;
+      } else {
+        const keys = Object.keys((JSON.parse(readFileSync(path, 'utf8')) as { providers?: Record<string, unknown> }).providers ?? {});
+        if (!keys.some(key => {
+          if (key !== 'openai-codex' && !key.startsWith('openai-codex:')) return false;
+          const state = loadTokens(key, path);
+          const expiry = state?.tokens.expiresAt;
+          const accountId = state?.chatGPT?.accountId ?? state?.accountUuid;
+          return Boolean(state?.authMode === 'chatgpt' && state.tokens.accessToken
+            && typeof expiry === 'number' && expiry > Date.now() + 120_000
+            && (source === 'config-dir' || accountId)
+            && (!state.chatGPT?.accountId || !state.accountUuid || state.chatGPT.accountId === state.accountUuid));
+        })) continue;
+      }
+      const root = source === 'owner-mirror' ? dirname(dirname(dirname(path))) : dirname(path);
+      try { debug.log('llm.auth', 'path-found', { source, rootSha256: rootFingerprint(root) }); } catch { /* fail-soft */ }
+      return path;
+    } catch { continue; }
   }
   return ownerStorePath;
 }

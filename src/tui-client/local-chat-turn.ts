@@ -489,6 +489,28 @@ export async function runLocalChatTurn(
 ): Promise<{ goalComplete: boolean; goalStopReason?: string }> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
+  // An auth refusal in the child can leave the Next TUI waiting indefinitely.
+  // Resolve the same provider auth before starting the turn, request one bounded
+  // owner mirror refresh on a missing mirror, then use the normal error card.
+  const cfg = (await import('../user-config.js')).getUserConfig();
+  if (cfg.llm.provider === 'openai-codex') {
+    const { preflightNextTuiAuth, requestOwnerMirrorOnce } = await import('./next-auth-preflight.js');
+    const { loadFreshCodexAuthState, readCodexOwnerMirrorForRun } = await import('../oauth/codex.js');
+    const { isCodexTokenOwnerHost } = await import('../oauth/codex-owner-mirror.js');
+    const remote = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1' || !isCodexTokenOwnerHost(cfg);
+    await preflightNextTuiAuth(cfg, {
+      load: async () => remote ? readCodexOwnerMirrorForRun().state : loadFreshCodexAuthState(),
+      request: () => requestOwnerMirrorOnce(cfg),
+      observe: (reason, requested) => {
+        try { debug.log('llm.auth', 'next-tui-mirror-request', { reason, requested }); }
+        catch { /* observation cannot block the turn */ }
+      },
+    });
+  }
+  // A resumed session id may be selected in another test universe. Its sticky
+  // child must not keep reading or writing memory in the previous universe.
+  const existing = sessions.get(sessionId);
+  if (existing && existing.instanceRoot !== effectiveInstanceRoot()) await closeLocalChatSession(sessionId);
   // The REPL child reloads the session store each turn, so compacting the store here is what this
   // turn's model call sees. Over the shared threshold only; a failure leaves the turn uncompacted.
   // Lazy like this module itself: the compaction path pulls in the LLM router, so next TUI boot stays light.

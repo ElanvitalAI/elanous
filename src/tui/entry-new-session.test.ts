@@ -126,8 +126,8 @@ describe('next TUI /new in a real PTY (L3)', () => {
     if (!ptyAvailable()) return;
     const iso = live ? join(live, 'iso') : dir;
     mkdirSync(iso, { recursive: true });
-    // First-run onboarding would otherwise ask for a provider before the TUI opens.
-    writeFileSync(join(iso, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+    // A provider-ready seat opens Next even when optional web onboarding is incomplete.
+    writeFileSync(join(iso, 'config.json'), JSON.stringify({ onboarding: { ready: true, completed: false }, errorReports: { enabled: false } }));
     const sessionsRoot = join(iso, 'sessions');
     process.env.ELANOUS_STATE_DIR = iso;
     process.env.ELANOUS_SESSION_ROOT = sessionsRoot;
@@ -176,9 +176,9 @@ describe('next TUI /new in a real PTY (L3)', () => {
     try {
       await waitFor('boot', (s) => s.split('\n').includes(NEXT_TUI_TITLE) && s.includes('Ctrl+Q 종료'));
       await send('첫 메시지');
-      await waitFor('after message 1', (s) => count(s, reply) === 1 && s.includes('응답 완료'));
+      await waitFor('after message 1', (s) => count(s, reply) === 1 && s.includes('턴 완료'));
       await send('둘째 메시지');
-      const before = await waitFor('before /new (2 messages)', (s) => count(s, reply) === 2 && s.includes('응답 완료'));
+      const before = await waitFor('before /new (2 messages)', (s) => count(s, reply) === 2 && s.includes('턴 완료'));
       expect(before).toContain('첫 메시지');
       const oldId = getActiveSessionId() ?? '';
       await send('/new');
@@ -187,7 +187,7 @@ describe('next TUI /new in a real PTY (L3)', () => {
       expect(after).not.toContain('첫 메시지');
       expect(after).not.toContain(reply);
       await send('셋째 메시지');
-      await waitFor('after message 3 (new session)', (s) => count(s, reply) === 1 && s.includes('응답 완료') && s.includes('셋째 메시지'));
+      await waitFor('after message 3 (new session)', (s) => count(s, reply) === 1 && s.includes('턴 완료') && s.includes('셋째 메시지'));
       const newId = getActiveSessionId() ?? '';
       expect(newId).not.toBe(oldId);
       expect(loadSession(oldId)?.messages.filter((m) => m.role === 'user').map((m) => m.content)).toEqual(['첫 메시지', '둘째 메시지']);

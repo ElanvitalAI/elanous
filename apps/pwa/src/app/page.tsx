@@ -1,5 +1,5 @@
-import { redirect } from 'next/navigation';
+import { ChatPanel } from '@/components/chat/ChatPanel';
 
 export default function RootPage() {
-  redirect('/chat');
+  return <ChatPanel showConversationList mobileSimple />;
 }
