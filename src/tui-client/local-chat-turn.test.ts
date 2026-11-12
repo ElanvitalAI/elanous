@@ -13,6 +13,7 @@ import { compactNextTuiSession, isCompactCommand, type NextTuiCompactOutcome } f
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { LONG_SHELL_ESC_CONFIRMATION_MS, monotonicNowMs } from '../esc-abort-gate.js';
 import { clearSessionTierOverride, setSessionTierOverride } from '../model-tier/session-override.js';
+import { listMemories } from '../memory.js';
 
 test('a cancellation before lazy turn loading never starts a child', async () => {
   const abort = new AbortController();
@@ -66,6 +67,88 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
     routeLog.mockRestore();
     delete process.env.EXPECTED_CONFIG_DIR;
     resetElanousConfigDir();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the sticky REPL follows a changed test universe for the same session id', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-memory-universe-'));
+  const firstRoot = join(dir, 'first');
+  const secondRoot = join(dir, 'second');
+  const cli = join(dir, 'root-cli.ts');
+  mkdirSync(firstRoot, { recursive: true });
+  mkdirSync(secondRoot, { recursive: true });
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: process.env.ELANOUS_STATE_DIR }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'ok', provider: 'test', model: 'scope' }));
+    }
+  `);
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  const seen: string[] = [];
+  try {
+    process.env.ELANOUS_STATE_DIR = firstRoot;
+    setElanousConfigDir(firstRoot);
+    await runLocalChatTurn('shared-session-id', 'remember first', new AbortController().signal, cli,
+      undefined, (text) => seen.push(text));
+    process.env.ELANOUS_STATE_DIR = secondRoot;
+    setElanousConfigDir(secondRoot);
+    await runLocalChatTurn('shared-session-id', 'recall second', new AbortController().signal, cli,
+      undefined, (text) => seen.push(text));
+    expect(seen).toEqual([firstRoot, secondRoot]);
+  } finally {
+    await closeLocalChatSession('shared-session-id');
+    resetElanousConfigDir();
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a universe switch cannot recall the previous universe pinned memory', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-memory-isolation-'));
+  const firstRoot = join(dir, 'first');
+  const secondRoot = join(dir, 'second');
+  const cli = join(dir, 'memory-cli.ts');
+  mkdirSync(firstRoot, { recursive: true });
+  mkdirSync(secondRoot, { recursive: true });
+  const memoryModule = join(import.meta.dir, '..', 'memory.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    import { saveMemory, buildMemoryInjection } from ${JSON.stringify(memoryModule)};
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      const answer = request.prompt === 'remember'
+        ? (saveMemory({ id: 'universe-fact', type: 'user', name: 'isolation', description: 'test', body: 'only-first-universe', pinned: true }), 'saved')
+        : buildMemoryInjection('isolation').block.includes('only-first-universe') ? 'leaked' : 'missing';
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: answer }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: answer, provider: 'test', model: 'memory' }));
+    }
+  `);
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  const seen: string[] = [];
+  try {
+    process.env.ELANOUS_STATE_DIR = firstRoot;
+    setElanousConfigDir(firstRoot);
+    await runLocalChatTurn('same-memory-session', 'remember', new AbortController().signal, cli,
+      undefined, (text) => seen.push(text));
+    process.env.ELANOUS_STATE_DIR = secondRoot;
+    setElanousConfigDir(secondRoot);
+    await runLocalChatTurn('same-memory-session', 'recall', new AbortController().signal, cli,
+      undefined, (text) => seen.push(text));
+    expect(seen).toEqual(['saved', 'missing']);
+    const firstMemories = listMemories({}, join(firstRoot, 'elanous', 'memory'));
+    const secondMemories = listMemories({}, join(secondRoot, 'elanous', 'memory'));
+    expect(firstMemories).toHaveLength(1);
+    expect(firstMemories[0]?.pinned).toBe(true);
+    expect(secondMemories).toHaveLength(0);
+  } finally {
+    await closeLocalChatSession('same-memory-session');
+    resetElanousConfigDir();
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
     rmSync(dir, { recursive: true, force: true });
   }
 });

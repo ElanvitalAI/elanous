@@ -17,6 +17,7 @@ import { getSessionTierOverride } from '../model-tier/session-override.js';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawnElanousBun } from '../instance/spawn-elanous.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 
 const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
@@ -93,6 +94,7 @@ interface WaitingTurn {
 class LocalChatSession {
   readonly child: ReturnType<typeof Bun.spawn>;
   readonly exited: Promise<number>;
+  readonly instanceRoot: string;
   private readonly writeInput: (payload: string) => Promise<void>;
   private waiting: WaitingTurn | null = null;
   private stderrTail = '';
@@ -103,6 +105,7 @@ class LocalChatSession {
   private readonly pendingShellApprovalIds = new Set<string>();
 
   constructor(private readonly sessionId: string, cli: string) {
+    this.instanceRoot = effectiveInstanceRoot();
     // TUI-NEXT-QUEUE-AND-WAKE: the child's ScheduleWakeup asks this process over Bun IPC — the scheduler
     // lives here because the child dies on Esc and /new. No tool registered → no IPC, env unchanged.
     const wakeupTool = nextTuiWakeupTool();
@@ -114,6 +117,7 @@ class LocalChatSession {
         : ['--config-dir', getElanousConfigDir(), 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
       {
       bin: useFastChild ? fastChild : cli,
+      stateDir: this.instanceRoot,
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
       env: {
         ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
