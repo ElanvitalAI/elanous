@@ -5200,6 +5200,25 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.12
+
+Source: https://docs.elanous.ai/releases/0-3-12/
+
+This focused update addresses four startup problems in 0.3.11.
+
+- Next TUI can open when a provider is authenticated and ready, even if optional web or Telegram onboarding is incomplete. First-time setup remains for a provider that is not ready.
+- The PWA first screen no longer crashes with React error #310. The fix was checked in a real browser at a narrow viewport.
+- Provider login respects an explicit configuration directory, so login and the following session use the same credential store.
+- Next TUI shows a provider authentication error instead of waiting silently when the first turn cannot authenticate.
+
+The release package includes the built PWA files, so the web app can open on first start without a local build.
+
+The broader feature release is planned as 0.3.13.
+
+Installers and assets are available from the [v0.3.12 release](https://github.com/ElanvitalAI/elanous/releases/tag/v0.3.12).
+
+---
+
 # 0.3.11
 
 Source: https://docs.elanous.ai/releases/0-3-11/
@@ -5214,7 +5233,7 @@ The release package was checked by clean installation, version output, a Next TU
 
 ## Known issue
 
-- The PWA at /app/ can fail on first load with React error #310. This is under investigation and targeted for a fix in 0.3.12.
+- The PWA at /app/ can fail on first load with React error #310. The 0.3.11 release archive also omits built PWA files, which can make /app/ return 404 on first start. Both issues are addressed in [0.3.12](/releases/0-3-12); upgrade to that release.
 
 Installers and assets are available from the [v0.3.11 release](https://github.com/ElanvitalAI/elanous/releases/tag/v0.3.11).
 
