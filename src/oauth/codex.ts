@@ -32,7 +32,8 @@ import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, effectiveCode
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
 import { decodeJWTPayload } from './jwt.js';
 import { authStorePath, isUnderTestRunner } from './store.js';
-import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { resolveCodexCredentialOwnerHost } from '../nexus/config/secrets/cred-owner.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { platform, release, arch } from 'node:os';
@@ -501,8 +502,10 @@ export async function loadFreshCodexAuthState(
   const accessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1';
   const ownerConfig = getUserConfig();
   const testRunner = isUnderTestRunner();
-  let tokenOwnerHost = !accessOnly && isCodexTokenOwnerHost(ownerConfig);
-  if (tokenOwnerHost && !testRunner) {
+  // A standalone install has no fleet owner to supply a mirror. Its local login is authoritative.
+  const standalone = !accessOnly && !resolveCodexCredentialOwnerHost(ownerConfig);
+  let tokenOwnerHost = !shouldUseCodexOwnerMirror(ownerConfig);
+  if (tokenOwnerHost && !testRunner && !standalone) {
     const { hqFenceDecision } = await import('../hq/hq.js');
     tokenOwnerHost = hqFenceDecision('ledger-cli').run;
   }

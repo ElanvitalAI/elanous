@@ -500,8 +500,8 @@ export async function runLocalChatTurn(
   if (cfg.llm.provider === 'openai-codex') {
     const { preflightNextTuiAuth, requestOwnerMirrorOnce } = await import('./next-auth-preflight.js');
     const { loadFreshCodexAuthState, readCodexOwnerMirrorForRun } = await import('../oauth/codex.js');
-    const { isCodexTokenOwnerHost } = await import('../oauth/codex-owner-mirror.js');
-    const remote = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1' || !isCodexTokenOwnerHost(cfg);
+    const { shouldUseCodexOwnerMirror } = await import('../oauth/codex-owner-mirror.js');
+    const remote = shouldUseCodexOwnerMirror(cfg);
     await preflightNextTuiAuth(cfg, {
       load: async () => remote ? readCodexOwnerMirrorForRun().state : loadFreshCodexAuthState(),
       request: () => requestOwnerMirrorOnce(cfg),

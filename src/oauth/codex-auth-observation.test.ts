@@ -106,6 +106,23 @@ describe('codex 갱신 관측 — 일곱 갈래를 «실제로 태워» 문다',
     expectNoSecrets();
   });
 
+  test('standalone default config uses its local Codex login without a fleet mirror', async () => {
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, codexTokenOwnerHost: undefined } }));
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    setStore({ ...state(3_600_000), authMode: 'chatgpt' });
+    const auth = await loadFreshCodexAuthState({ fetchImpl: failingFetch, mirrorCodex: false });
+    expect(auth?.tokens.accessToken).toBe(ACCESS);
+    expect(events()).toContain('fresh');
+    expect(events()).not.toContain('refresh-start');
+  });
+
+  test('explicit access-only mode still refuses a missing mirror with no fleet owner', async () => {
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, codexTokenOwnerHost: undefined } }));
+    process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
+    setStore(null);
+    await expect(loadFreshCodexAuthState({ fetchImpl: failingFetch })).rejects.toThrow(CODEX_OWNER_MIRROR_REQUIRED);
+  });
+
   test('remote access-only host uses valid same-user config auth before a missing owner mirror', async () => {
     process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
     setStore({ ...state(3_600_000), authMode: 'chatgpt' });

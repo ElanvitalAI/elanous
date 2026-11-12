@@ -6,7 +6,7 @@ import { loadFreshCodexAuthState } from './codex.js';
 import { _setCodexAccountOutboundSenderForTesting, autoConsumeCodexResetCredit, listCodexAccountsInStore, resolveCodexAccountForRun } from './codex-account-store.js';
 import { debug } from '../debug/log.js';
 import '../llm.js';
-import { collectCodexMirrorCredentials, CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { collectCodexMirrorCredentials, CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 const oldEnv = {
@@ -137,7 +137,7 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
     expect(() => readCodexOwnerAccessMirror('openai-codex')).toThrow('reason=refresh-not-empty');
   });
 
-  test('a local Codex login cannot refresh when no owner host is configured', async () => {
+  test('a standalone local Codex login is usable when no fleet owner is configured', async () => {
     const { root } = fixture();
     delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
     delete process.env.BUN_TEST;
@@ -153,9 +153,20 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
       tokens: { access_token: accessToken, refresh_token: 'local-refresh-token', account_id: 'local-account' },
     }));
 
-    await expect(loadFreshCodexAuthState({
+    const state = await loadFreshCodexAuthState({
       fetchImpl: (async () => { throw new Error('local unexpired login must not refresh'); }) as unknown as typeof fetch,
-    })).rejects.toThrow('reason=missing-file');
+    });
+    expect(state?.tokens.accessToken).toBe(accessToken);
+  });
+
+  test('Next TUI and provider share the standalone versus fleet mirror decision', () => {
+    fixture();
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    expect(shouldUseCodexOwnerMirror({ llm: {} } as never, 'standalone')).toBe(false);
+    expect(shouldUseCodexOwnerMirror({ llm: { codexTokenOwnerHost: 'mshq' } } as never, 'node-c')).toBe(true);
+    expect(shouldUseCodexOwnerMirror({ llm: { codexTokenOwnerHost: 'mshq' } } as never, 'mshq')).toBe(false);
+    process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
+    expect(shouldUseCodexOwnerMirror({ llm: {} } as never, 'standalone')).toBe(true);
   });
 
   test('access-only seats still require the owner mirror even when a local Codex file exists', async () => {

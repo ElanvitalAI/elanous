@@ -14,6 +14,38 @@ import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from 
 import { LONG_SHELL_ESC_CONFIRMATION_MS, monotonicNowMs } from '../esc-abort-gate.js';
 import { clearSessionTierOverride, setSessionTierOverride } from '../model-tier/session-override.js';
 import { listMemories } from '../memory.js';
+import { setUserConfigOverlay } from '../user-config.js';
+
+test('standalone Codex login passes Next TUI preflight for two turns without an owner mirror', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-standalone-codex-'));
+  const cli = join(dir, 'fake-cli.ts');
+  writeFileSync(cli, `import { createInterface } from 'node:readline';
+    for await (const _line of createInterface({ input: process.stdin }))
+      console.log(JSON.stringify({ reply: 'ok', provider: 'openai-codex', model: 'gpt-6.1-terra' }));`);
+  const priorCodexHome = process.env.CODEX_HOME;
+  const priorAccessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+  try {
+    setElanousConfigDir(join(dir, 'config'));
+    process.env.CODEX_HOME = join(dir, 'codex-home');
+    mkdirSync(process.env.CODEX_HOME, { recursive: true });
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, provider: 'openai-codex', codexTokenOwnerHost: undefined } }));
+    const expiresAt = Math.floor(Date.now() / 1000 + 3600);
+    const accessToken = `e30.${Buffer.from(JSON.stringify({ exp: expiresAt })).toString('base64url')}.sig`;
+    writeFileSync(join(process.env.CODEX_HOME, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt',
+      tokens: { access_token: accessToken, refresh_token: 'local-refresh', account_id: 'local-account' } }));
+    await expect(runLocalChatTurn('standalone-codex', 'first', new AbortController().signal, cli)).resolves.toEqual({ goalComplete: false });
+    await expect(runLocalChatTurn('standalone-codex', 'second', new AbortController().signal, cli)).resolves.toEqual({ goalComplete: false });
+  } finally {
+    await closeLocalChatSession('standalone-codex');
+    setUserConfigOverlay(null);
+    resetElanousConfigDir();
+    if (priorCodexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = priorCodexHome;
+    if (priorAccessOnly === undefined) delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    else process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = priorAccessOnly;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('a cancellation before lazy turn loading never starts a child', async () => {
   const abort = new AbortController();

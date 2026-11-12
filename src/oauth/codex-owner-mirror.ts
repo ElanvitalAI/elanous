@@ -48,6 +48,12 @@ export function isCodexTokenOwnerHost(config = getUserConfig(), machine = hostna
   } catch { return false; }
 }
 
+/** A standalone install owns its local login; only explicit access-only or configured fleet nonowners consume a mirror. */
+export function shouldUseCodexOwnerMirror(config = getUserConfig(), machine = hostname()): boolean {
+  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1') return true;
+  return Boolean(resolveCodexCredentialOwnerHost(config) && !isCodexTokenOwnerHost(config, machine));
+}
+
 /** Run the existing install on an owner host, then record only slot and host metadata. */
 export function deliverCodexMirrorAndRecord(
   targetHost: string,
