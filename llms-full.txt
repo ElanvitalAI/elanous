@@ -5210,7 +5210,11 @@ Source: https://docs.elanous.ai/releases/0-3-11/
 - App and dashboard updates improve chat provenance, member access, and the six-scene demo flow.
 - Release and test orchestration carry stronger image, shard, and recovery evidence.
 
-The release package was checked by clean installation, version output, a Next TUI conversation, focused regression tests, and checksums. The full automated sweep was interrupted by test-host resource exhaustion, so its incomplete result was not counted as a passing gate. Live post-publish checks are in progress.
+The release package was checked by clean installation, version output, a Next TUI conversation, focused regression tests, and checksums. The full automated sweep was interrupted by test-host resource exhaustion, so its incomplete result was not counted as a passing gate. Post-publish clean installation and live Next TUI, CLI, and Telegram conversations passed; the README harness task was not verified.
+
+## Known issue
+
+- The PWA at /app/ can fail on first load with React error #310. This is under investigation and targeted for a fix in 0.3.12.
 
 Installers and assets are available from the [v0.3.11 release](https://github.com/ElanvitalAI/elanous/releases/tag/v0.3.11).
 
