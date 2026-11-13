@@ -17,7 +17,7 @@ export interface EmergencyPublishGateGit {
 
 export function readGitTreeEntry(commit: string, path: string,
   runGit: (args: string[]) => { status: number | null; error?: Error; stdout: string; stderr: string } = (args) =>
-    spawnSync('git', args, { encoding: 'utf8', timeout: 10_000 })):
+    spawnSync('git', args, { encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 })):
   { mode: string; type: string; object: string } | null {
   const result = runGit(['--literal-pathspecs', 'ls-tree', '-z', commit, '--', path]);
   if (result.status !== 0 || result.error) throw new Error(`cannot inspect ${commit.slice(0, 12)}:${path}: ${(result.stderr || result.error || 'no output').toString().trim()}`);
@@ -35,15 +35,15 @@ if (import.meta.main) {
   await registerStandaloneLogSink('release-loop');
   const git: EmergencyPublishGateGit = {
     resolveCommit(ref) {
-      const result = spawnSync('git', ['rev-parse', '--verify', `${ref}^{commit}`], { encoding: 'utf8', timeout: 10_000 });
+      const result = spawnSync('git', ['rev-parse', '--verify', `${ref}^{commit}`], { encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
       return result.status === 0 ? result.stdout.trim() : undefined;
     },
     isAncestor(ancestor, descendant) {
-      const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { encoding: 'utf8', timeout: 10_000 });
+      const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
       return result.status === 0;
     },
     pathsChangedByCommit(commit) {
-      const result = spawnSync('git', ['diff-tree', '--root', '--no-commit-id', '--name-only', '--no-renames', '-r', commit], { encoding: 'utf8', timeout: 10_000 });
+      const result = spawnSync('git', ['diff-tree', '--root', '--no-commit-id', '--name-only', '--no-renames', '-r', commit], { encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
       if (result.status !== 0 || result.error) throw new Error(`cannot inspect hotfix commit diff: ${(result.stderr || result.error || 'no output').toString().trim()}`);
       return result.stdout.split(/\r?\n/).filter(Boolean);
     },

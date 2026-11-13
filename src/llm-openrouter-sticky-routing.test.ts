@@ -2,7 +2,7 @@ import type { LLMToolSpec } from './llm/tool-spec.js';
 // OR-STICKY-ROUTING (2026-10-10) — OpenRouter 요청에 세션/런 단위 고정 라우팅 키(body session_id ⊕ x-session-id).
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { getProviderForConfig, openRouterStickySessionKey, streamLLMWithTools } from './llm.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import type { UserConfig } from './user-config/types.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Read', description: 'd', parameters: { type: 'object', properties: { p: { type: 'string' } } } }];
@@ -14,7 +14,7 @@ afterEach(() => { if (savedRunId === undefined) delete process.env.ELANOUS_RUN_I
 
 async function capture(provider: string, model: string, opts: Record<string, unknown> = {}, prefs?: Record<string, unknown>) {
   const out: { raw: string; headers: Record<string, string> }[] = [];
-  await withFakeFetchDevice([
+  await withRealProviderFakeFetchDevice([
     { url: '/api/v1/chat/completions', method: 'POST', response: (request) => { out.push({ raw: request.body ?? '', headers: { ...request.headers } }); return new Response('data: [DONE]\n\n', { status: 200 }); } },
     { url: '/v1/chat/completions', method: 'POST', response: (request) => { out.push({ raw: request.body ?? '', headers: { ...request.headers } }); return new Response('data: [DONE]\n\n', { status: 200 }); } },
   ], async (device) => {
@@ -107,7 +107,7 @@ test('tool loop: streamLLMWithTools carries the same sessionId into every OpenRo
   const bodies: Record<string, any>[] = [];
   const resolved: string[] = [];
   let call = 0;
-  await withFakeFetchDevice([{ url: '/api/v1/chat/completions', method: 'POST', response: (request) => {
+  await withRealProviderFakeFetchDevice([{ url: '/api/v1/chat/completions', method: 'POST', response: (request) => {
     bodies.push(JSON.parse(request.body ?? 'null'));
     call++;
     const sse = call === 1

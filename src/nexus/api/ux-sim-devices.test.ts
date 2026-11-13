@@ -57,6 +57,7 @@ test('GET /v1/ux-sim/devices is owner-gated, read-only, and returns the complete
   expect(response?.status).toBe(200);
   expect(await response!.json()).toEqual({
     catalogVersion: catalog.version,
+    deviceCatalogVersion: catalog.deviceCatalogVersion,
     devices: catalog.devices,
     scenarios: catalog.scenarios,
     runEvidence: catalog.runEvidence,

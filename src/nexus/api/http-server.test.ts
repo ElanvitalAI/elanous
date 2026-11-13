@@ -204,6 +204,48 @@ test('Nexus app-host connector serves a public Host request through the authenti
   }
 });
 
+test('half-configured relay member credentials fail before Nexus binds its port', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nexus-relay-member-config-'));
+  const port = uniquePort();
+  setElanousConfigDir(dir);
+  resetUserConfig();
+  try {
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ nexus: { relay: {
+      enabled: true, url: 'ws://127.0.0.1:8765/host', memberNexusUrl: 'https://members.example.test/',
+    } } }));
+    const appHost = {} as NonNullable<Parameters<typeof startNexusHttpServer>[0]['appHost']>;
+    expect(() => startNexusHttpServer({ ...serverFixture(), startPort: port, appHost }))
+      .toThrow('relay member Nexus URL and key file must be valid and configured together');
+    const probe = Bun.serve({ hostname: '127.0.0.1', port, fetch: () => new Response('free') });
+    probe.stop();
+  } finally {
+    resetUserConfig();
+    resetElanousConfigDir();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Nexus startup refuses malformed member relay settings before binding a listener', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nexus-relay-member-invalid-'));
+  setElanousConfigDir(dir);
+  try {
+    for (const relay of [
+      { enabled: true, url: 'wss://relay.example.test/host', memberNexusUrl: 7, memberKeyFile: 'keys/member.key' },
+      { enabled: true, url: 'wss://relay.example.test/host', memberNexusUrl: '   ', memberKeyFile: 'keys/member.key' },
+      { enabled: true, url: 'wss://relay.example.test/host', memberNexusUrl: 'https://members.example.test/', memberKeyFile: '   ' },
+    ]) {
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({ nexus: { relay } }));
+      resetUserConfig();
+      expect(() => startNexusHttpServer({ ...serverFixture(), startPort: uniquePort() }))
+        .toThrow('relay member Nexus URL and key file must be valid and configured together');
+    }
+  } finally {
+    resetUserConfig();
+    resetElanousConfigDir();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('GET /v1/loops/resources is bearer-gated and read-only, preserving existing route responses', async () => {
   let observations = 0;
   const resource: import('../../loops/orchestrator/traffic.js').TrafficResult = { seats: [{ seat: 'MK', cap: 6, running: 2, borrowed: 1, lent: 0, launchCap: 4, idle: true,

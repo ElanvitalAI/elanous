@@ -142,6 +142,55 @@ test('inventory failure and GitHub file cap stay unknown, never become no-overla
     .toMatchObject({ status: 'unknown', reason: expect.stringContaining('수정 줄 조회 실패') });
 });
 
+test('oversized PR diff 406 rechecks paged file paths and keeps strict overlap closed', () => {
+  const source = fixture([pr(7, ['src/stale.ts'])], { filePages: { 7: [['src/first.ts'], ['src/shared.ts']] } });
+  const calls: string[] = [];
+  const run: PrToolCommand = (command, args, opts) => {
+    calls.push(args.join(' '));
+    if (args[0] === 'pr' && args[1] === 'list') return { ok: true, out: JSON.stringify([{ number: 7, changedFiles: 1, files: [{ path: 'src/stale.ts' }] }]) };
+    if (args[0] === 'pr' && args[1] === 'diff') return { ok: false, out: '', err: 'HTTP 406: diff too_large' };
+    return source.run(command, args, opts);
+  };
+  const inventory = readOpenPrs(run, { candidateFiles: ['src/stale.ts'], seatOfPr: () => 'UX' });
+  expect(inventory).toMatchObject({ status: 'checked', prs: [{ number: 7, files: ['src/first.ts', 'src/shared.ts'] }] });
+  expect(calls.filter(call => call.includes('/pulls/7/files?'))).toHaveLength(1);
+  expect(guardNewPr({ files: ['src/shared.ts'], seat: 'UX' }, inventory)).toMatchObject({ status: 'allow', warnings: [{ code: 'file-overlap', prs: [7] }] });
+  expect(guardNewPr({ files: ['src/shared.ts'], seat: 'UX', hunkOverlap: 'refuse' }, inventory)).toMatchObject({
+    status: 'refuse', reasons: [{ code: 'file-overlap', prs: [7], files: ['src/shared.ts'] }],
+  });
+  expect(guardNewPr({ files: ['src/other.ts'], seat: 'UX', hunkOverlap: 'refuse' }, inventory).status).toBe('allow');
+});
+
+test('diff 500 mentioning PR 406 and unreadable fallback files stay unknown', () => {
+  const base = fixture([pr(406, ['src/shared.ts'])]);
+  const run = (diffError: string, failFiles = false): PrToolCommand => (command, args, opts) => {
+    if (args[0] === 'pr' && args[1] === 'diff') return { ok: false, out: '', err: diffError };
+    if (failFiles && args.some(arg => arg.includes('/pulls/406/files?'))) return { ok: false, out: '', err: 'HTTP 502' };
+    return base.run(command, args, opts);
+  };
+  expect(readOpenPrs(run('HTTP 500 for PR #406'), { candidateFiles: ['src/shared.ts'] }))
+    .toMatchObject({ status: 'unknown', reason: expect.stringContaining('수정 줄 조회 실패') });
+  expect(readOpenPrs(run('HTTP 406', true), { candidateFiles: ['src/shared.ts'] }))
+    .toMatchObject({ status: 'unknown', reason: expect.stringContaining('HTTP 502') });
+  const malformed: PrToolCommand = (command, args, opts) => {
+    if (args[0] === 'pr' && args[1] === 'diff') return { ok: false, out: '', err: 'HTTP 406' };
+    if (args.some(arg => arg.includes('/pulls/406/files?'))) return { ok: true, out: '[{}]' };
+    return base.run(command, args, opts);
+  };
+  expect(readOpenPrs(malformed, { candidateFiles: ['src/shared.ts'] }))
+    .toMatchObject({ status: 'unknown', reason: expect.stringContaining('파일명 누락') });
+  const capped = fixture([pr(406, ['src/shared.ts'])], {
+    filePages: { 406: Array.from({ length: 30 }, () => Array.from({ length: 100 }, (_, i) => `src/${i}.ts`)) },
+  });
+  const cappedRun: PrToolCommand = (command, args, opts) => {
+    if (args[0] === 'pr' && args[1] === 'list') return { ok: true, out: JSON.stringify([{ number: 406, changedFiles: 1, files: [{ path: 'src/shared.ts' }] }]) };
+    if (args[0] === 'pr' && args[1] === 'diff') return { ok: false, out: '', err: 'HTTP 406' };
+    return capped.run(command, args, opts);
+  };
+  expect(readOpenPrs(cappedRun, { candidateFiles: ['src/shared.ts'] }))
+    .toMatchObject({ status: 'unknown', reason: expect.stringContaining('3000') });
+});
+
 test('guard refuses goal-only, warns on duplicate files and a measured seat cap', () => {
   const f = fixture([pr(1, ['src/a.ts']), pr(2, ['docs/goals/GOAL-x.md'])]);
   const inventory = readOpenPrs(f.run, { seatOfPr: () => 'UX' });

@@ -3,7 +3,8 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
-import { runPrepare } from './prepare-node.js';
+import { assertPreparePrerequisites, runPrepare } from './prepare-node.js';
+import type { GraphContext } from './node-verdict.js';
 
 const oldContext = process.env.ELANOUS_GRAPH_CONTEXT;
 const roots: string[] = [];
@@ -29,6 +30,16 @@ function fixture(refreshedFrom: string | null = old) {
   writeFileSync(join(out, 'archive.txt'), 'old archive');
   return { root, out };
 }
+
+test('prepare accepts only a verified signed PWA failure and still requires a passing gate', () => {
+  const context: GraphContext = { input: { version: '0.3.15', previousVersion: '0.3.14' }, outputs: {
+    gate: { outcome: 'ok' }, pwa: { outcome: 'fail' },
+  } };
+  expect(() => assertPreparePrerequisites(context, () => false)).toThrow('pwa did not pass');
+  expect(() => assertPreparePrerequisites(context, () => true)).not.toThrow();
+  context.outputs.gate = { outcome: 'fail' };
+  expect(() => assertPreparePrerequisites(context, () => true)).toThrow('gate did not pass');
+});
 
 test('first prepare reaches the command when the release output directory does not exist', () => {
   const root = mkdtempSync(join(tmpdir(), 'release-prepared-fresh-'));

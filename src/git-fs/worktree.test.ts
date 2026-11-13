@@ -357,6 +357,37 @@ describe('createWorktree — elanous dev 기본 브랜치 분기', () => {
   });
 });
 
+test('git-only repository ignores stale origin/main and a same-name tag, then launches from local master', () => {
+  const root = mkdtempSync(join(tmpdir(), 'wt-no-origin-'));
+  const repo = join(root, 'repo');
+  git(root, 'init', '-q', '-b', 'master', 'repo');
+  git(repo, 'config', 'user.email', 't@t.t');
+  git(repo, 'config', 'user.name', 't');
+  writeFileSync(join(repo, 'README.md'), 'before\n');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-qm', 'base');
+  git(repo, 'tag', 'master');
+  git(repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+  writeFileSync(join(repo, 'README.md'), 'local default is newer\n');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-qm', 'local main advanced');
+  const base = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+  git(repo, 'checkout', '-q', '-b', 'feature/caller');
+  writeFileSync(join(repo, 'caller.txt'), 'separate\n');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-qm', 'caller');
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const child = createWorktree({ repoRoot: repo, worktreeRoot: root, branch: 'child/readme', base: DEFAULT_BRANCH_WORKTREE_BASE });
+    expect(child.resolvedBase).toBe(base);
+    expect(child.baseFreshness).toBe('local-only');
+    expect(log).toHaveBeenCalledWith('git-fs.worktree', 'base.no-origin-local', { branch: 'child/readme', base: 'refs/heads/master' });
+    expect(child.base).toBe('refs/heads/master');
+    expect(existsSync(join(child.path, 'caller.txt'))).toBe(false);
+    git(repo, 'worktree', 'remove', '--force', child.path);
+  } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
+
 describe('linkWorktreeDependencies — 항목별 fail-soft 결과', () => {
   let tmp: string, repo: string, worktree: string;
   const originalDependencyStore = process.env.ELANOUS_WORKTREE_DEPS_DIR;

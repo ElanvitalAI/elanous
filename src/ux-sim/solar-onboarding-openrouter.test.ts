@@ -76,18 +76,32 @@ test('SOLAR-ONBOARDING-OPENROUTER sim: empty config to key, Solar chat, implemen
       rotation: saved.llm.rotation, baseApiKey: saved.llm.apiKey, env: {},
     }, async (id) => secrets.get(id));
     expect(credential.source).toBe('secret-store');
-    const requests: Array<{ url: string; model: string }> = [];
+    const requests: Array<{ url: string; model: string; authorization: string; messages: Array<{ role: string; content: string }> }> = [];
     await withFakeFetchDevice([{
       url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST',
       response: (request) => {
-        requests.push({ url: request.url, model: JSON.parse(request.body ?? '{}').model });
-        return new Response('data: [DONE]\n\n', { status: 200 });
+        const body = JSON.parse(request.body ?? '{}');
+        requests.push({ url: request.url, model: body.model, authorization: request.headers.authorization ?? '', messages: body.messages });
+        const answer = `solar-${requests.length}`;
+        return new Response(`data: {"choices":[{"delta":{"content":"${answer}"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`, { status: 200 });
       },
     }], async () => {
       const provider = makeOpenRouterProvider({ ...saved.llm, apiKey: credential.apiKey });
-      for await (const _ of provider.streamChat!([{ role: 'user', content: 'Solar 첫 채팅' }])) { /* wire proof */ }
+      const history: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      for (const turn of [1, 2, 3]) {
+        history.push({ role: 'user', content: `Solar 질문 ${turn}` });
+        const events = await Array.fromAsync(provider.streamChat!(history));
+        const answer = events.filter((event) => event.type === 'text').map((event) => event.delta).join('');
+        expect(answer).toBe(`solar-${turn}`);
+        history.push({ role: 'assistant', content: answer });
+      }
     });
-    expect(requests).toEqual([{ url: 'https://openrouter.ai/api/v1/chat/completions', model: 'upstage/solar-pro4' }]);
+    expect(requests).toHaveLength(3);
+    expect(requests.map(({ model }) => model)).toEqual(Array(3).fill('upstage/solar-pro4'));
+    expect(requests.map(({ authorization }) => authorization)).toEqual(Array(3).fill(`Bearer ${key}`));
+    expect(requests.map(({ messages }) => messages.length)).toEqual([1, 3, 5]);
+    expect(requests[1]!.messages[1]).toMatchObject({ role: 'assistant', content: 'solar-1' });
+    expect(requests[2]!.messages[3]).toMatchObject({ role: 'assistant', content: 'solar-2' });
     const firstChat = await Array.fromAsync(testFakeLlmProvider.chat([{ role: 'user', content: 'Solar 첫 채팅' }]));
     expect(firstChat.join('')).toBe('[test-fake-llm] OK');
     world = await createWorld(appScenario);

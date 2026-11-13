@@ -55,7 +55,8 @@ export interface GraphRunState {
   /** The node now running and when it started; cleared when its record is written. */
   currentNode?: { nodeId: string; executionId?: string; startedAt: string };
   input?: unknown;
-  pending?: { nodeId: string; message: string; since: string; inputSha256?: string; approvalNonce?: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; decidedBy?: string; decidedAt?: string };
+  kstDayFallback?: { reason: 'missing-calendar-day' | 'invalid-calendar-day'; selected: string };
+  pending?: { nodeId: string; message: string; since: string; inputSha256?: string; approvalNonce?: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; outcome?: string; decidedBy?: string; decidedAt?: string };
   approvalSourceHash?: string;
   /** Hash of the graph and recipes used for this run; required to safely restart a failed path. */
   sourceHash?: string;
@@ -98,6 +99,7 @@ export interface GraphRunState {
   fanOuts?: Record<string, { from: string; join: string; branches: Record<string, {
     runId: string; status: 'running' | 'done' | 'failed'; startedAt: string; endedAt?: string;
     artifactSha256?: string; output?: unknown; error?: string; path?: string[];
+    waiver?: { verdict: 'waived'; decidedBy: 'OP'; reason: string; documentSha256: string; signatureSha256: string; pairedLogSha256: string; originalStatus: 'failed' };
     completionReceipt?: { inputSha256: string; commit: string; artifactSha256: string };
   }> }>;
   /** Highest visit number handed to each unit in this run; not rewound by a restart, so
@@ -150,6 +152,7 @@ export interface GraphRunOptions {
   quiet?: boolean;
   /** Release-only: accept the recorded failed node without executing it, and expose its regression to known-issues. */
   releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[]; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; unmeasured?: string };
+  releasePwaFanOutWaiver?: { reason: string };
   /** Release-only: durable authorization ledger from which a waived graph transition must be consumed. */
   waiverLedgerRoot?: string;
   /** Release-only: add accepted issues independently of a waiver at a restart boundary. */
@@ -181,6 +184,8 @@ export interface GraphRunOptions {
   branchGraphSnapshot?: { graphSha: string; recipesSha: string };
   /** Parent outputs visible to a fan-out child, before its branch-local outputs. */
   branchParentOutputs?: Readonly<Record<string, unknown>>;
+  /** Internal fan-out proof: parent revalidated the signed T6 post-gate route. */
+  branchWaiverParentRunId?: string;
   /** Optional per-run Bloom edge policy hook. */
   researchEdgeDecisionRegistry?: ResearchEdgeDecisionRegistry;
   deps?: {

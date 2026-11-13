@@ -250,7 +250,7 @@ export interface SessionMeta {
    *  future coordinator does not require a migration pass. */
   retiredAt?: string | null;
   /** Per-session Next TUI presentation preferences. */
-  uiState?: { sidetabOpen?: boolean };
+  uiState?: { sidetabOpen?: boolean; sidetabSectionOrder?: string[] };
 }
 
 /** Runtime channel attachments. Each key is optional; presence means
@@ -317,6 +317,12 @@ export interface SerializedMessage {
   tokenEstimate?: number;
   /** Goal-loop iteration reply, not the final assistant answer. */
   goalInterim?: boolean;
+  /** Persisted only for a completed assistant turn; partial/draft text stays private in basic history. */
+  replyFinal?: boolean;
+  /** A fixed public failure marker persisted after a failed turn; partial reply text stays private. */
+  replyFailure?: boolean;
+  /** Trusted Next TUI preflight kind; arbitrary provider error text never sets this. */
+  replyFailureKind?: 'codex-auth-missing' | 'codex-auth-failed';
   /** Per-turn stable identifier. Auto-populated by `appendMessage` when the
    *  caller omits it (SAM S0 seed · M1.2 narrow). The wire format stays a
    *  bare 26-char ULID; external inputs should pass through `asTurnUri()`

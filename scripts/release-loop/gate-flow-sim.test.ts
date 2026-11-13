@@ -81,8 +81,18 @@ echo "Ran \${#files[@]} tests across \${#files[@]} files."
 [ "$fails" -eq 0 ]
 `;
 
-/** `timeout -k 10 <n> <cmd…>` → `<cmd…>`: the shell's own deadline math is real time; the fake Pod never waits. */
-const FAKE_TIMEOUT = '#!/bin/bash\n[ "$1" = -k ] && shift 2\nshift\nexec "$@"\n';
+/** Strip GNU timeout options for both gate shards and bounded Git metadata reads. */
+const FAKE_TIMEOUT = `#!/bin/bash
+while :; do
+  case "$1" in
+    -k|--kill-after) shift 2 ;;
+    --kill-after=*) shift ;;
+    *) break ;;
+  esac
+done
+shift
+exec "$@"
+`;
 
 /** Any real kubectl/ssh child leaves a line here — the flow sim asserts this file never appears. */
 const TRIPWIRE = `#!/bin/bash\necho "$(basename "$0") $*" >> "$GATE_SIM_TRIPWIRE"\nexit 97\n`;
@@ -146,6 +156,12 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
   process.env.PATH = `${join(root, 'bin')}:${previousPath ?? ''}`;
   process.env.GATE_SIM_TRIPWIRE = tripwire;
   try {
+    // gateGitSync uses this GNU form on Linux. If the fake consumes only -k,
+    // Git inventory reads silently fail and the file-CAS plan disappears.
+    const boundedGit = spawnSync('timeout', ['--kill-after=1s', '5s', 'git', 'rev-parse', 'HEAD'],
+      { cwd: repo, encoding: 'utf8' });
+    expect(boundedGit.status).toBe(0);
+    expect(boundedGit.stdout.trim()).toBe(CUT);
     const emitted: Array<Record<string, unknown>> = [];
     const progressLogSpy = spyOn(debug, 'log');
     spies.push(progressLogSpy);

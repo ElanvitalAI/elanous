@@ -144,7 +144,7 @@ describe('dashboard tool catalog observability', () => {
       'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
       'PtyShellStart', 'PtyShellPoll', 'PtyShellSend',
       'PtyShellKill', 'PtyShellList', 'run_tests', 'elanous_skills_list', 'skill_exec',
-      'PersistentGrounding', 'ToolSearch', 'elanous_linear_issue',
+      'PersistentGrounding', 'ToolSearch',
       'GetDashboardState', // always on — shell.allowDashboardState removed (CONFIG-ALWAYS-TRUE-OUT)
     ]);
     expect(new Set(names).size).toBe(names.length);

@@ -229,6 +229,20 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
   if (selectedRecord?.reviewer === 'OP-waiver') {
     const waiver = validOpWaiver(selectedRecord, input.pr, selectedHead);
     if (!waiver.ok) return { ok: false, reason: waiver.reason };
+    if (waiver.plainZeroFinding) {
+      // A plain waiver has nothing to adjudicate. A real FAIL from an earlier head
+      // still needs its established per-finding disposition, even if it is outside
+      // the current-head candidate set below.
+      for (const name of names) {
+        if (!filename.test(name) || name === basename(selected)) continue;
+        let prior: Record<string, unknown> | undefined;
+        try { prior = lastReviewRecord(input.readFile(join(dir, name))); }
+        catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
+        if (String(prior?.pr) === String(input.pr) && prior?.reviewed === true && prior.verdict === 'fail') {
+          return { ok: false, reason: 'review-op-waiver-dispositions-missing' };
+        }
+      }
+    }
     const linkedSameHeadFailure = candidates.some((path) => {
       if (path === selected || !adjudicatesReviewFile(waiver.adjudicates, path)) return false;
       const failed = checkReview(input, { reviewResult: path }, selectedHead);
@@ -241,7 +255,9 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
       const prior = reviewAttemptHasTerraFailOnPriorHead(input, path, selectedHead);
       return prior !== undefined && waiverHasFixedAfterReviewDiffEvidence(selectedRecord!, path, prior, selectedHead, input.pr);
     });
-    if (!linkedSameHeadFailure && !linkedPriorHeadFailure) return { ok: false, reason: 'review-op-waiver-same-head-failure-missing' };
+    if (!waiver.plainZeroFinding && !linkedSameHeadFailure && !linkedPriorHeadFailure) {
+      return { ok: false, reason: 'review-op-waiver-same-head-failure-missing' };
+    }
   }
   const actionableSupersedes = (entries ?? []).some((entry) => typeof entry?.reviewResult === 'string' && !errorCandidates.has(entry.reviewResult));
   if (actionableSupersedes || hasResolvedPrior) {
@@ -367,7 +383,7 @@ function opWaiverTestResult(value: unknown, head: string): boolean {
 }
 
 function validOpWaiver(record: Record<string, unknown> | undefined, pr: number, head: string):
-  | { ok: true; adjudicates: string; findingCount: number }
+  | { ok: true; adjudicates: string; findingCount: number; plainZeroFinding: boolean }
   | { ok: false; reason: string } {
   if (!record || record.reviewer !== 'OP-waiver') return { ok: false, reason: 'review-op-waiver-reviewer' };
   const waiver = record.waiver;
@@ -376,11 +392,22 @@ function validOpWaiver(record: Record<string, unknown> | undefined, pr: number, 
   if (value.by !== 'OP' || typeof value.approvedBy !== 'string' || !value.approvedBy.trim()) {
     return { ok: false, reason: 'review-op-waiver-approval-missing' };
   }
-  if (typeof value.adjudicates !== 'string' || !value.adjudicates.trim()) return { ok: false, reason: 'review-op-waiver-adjudication-missing' };
   if (!opWaiverTestResult(value.headTestRun, head)) return { ok: false, reason: 'review-op-waiver-head-test-missing' };
-  if (!Array.isArray(value.dispositions) || value.dispositions.length === 0) return { ok: false, reason: 'review-op-waiver-dispositions-missing' };
+  const dispositions = value.dispositions === undefined ? [] : value.dispositions;
+  if (!Array.isArray(dispositions)) return { ok: false, reason: 'review-op-waiver-dispositions-missing' };
+  const plainZeroFinding = dispositions.length === 0;
+  if (plainZeroFinding) {
+    if (value.adjudicates !== undefined && (typeof value.adjudicates !== 'string' || !/^\s*(?:none)?\s*$/i.test(value.adjudicates))) {
+      return { ok: false, reason: 'review-op-waiver-dispositions-missing' };
+    }
+    if (record.reviewed !== true || record.verdict !== 'pass' || !Array.isArray(record.mustFix) || record.mustFix.length !== 0) {
+      return { ok: false, reason: 'review-op-waiver-zero-finding-invalid' };
+    }
+  } else if (typeof value.adjudicates !== 'string' || !value.adjudicates.trim()) {
+    return { ok: false, reason: 'review-op-waiver-adjudication-missing' };
+  }
   const findings = new Set<number>();
-  for (const raw of value.dispositions) {
+  for (const raw of dispositions) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'review-op-waiver-disposition-invalid' };
     const item = raw as Record<string, unknown>;
     if (!Number.isSafeInteger(item.finding) || (item.finding as number) < 1 || findings.has(item.finding as number)
@@ -396,7 +423,7 @@ function validOpWaiver(record: Record<string, unknown> | undefined, pr: number, 
   if (ordered.some((finding, index) => finding !== index + 1)) return { ok: false, reason: 'review-op-waiver-findings-incomplete' };
   const recordPr = typeof record.pr === 'number' ? record.pr : Number(record.pr);
   if (!Number.isSafeInteger(recordPr) || recordPr !== pr) return { ok: false, reason: 'review-op-waiver-pr-mismatch' };
-  return { ok: true, adjudicates: value.adjudicates, findingCount: findings.size };
+  return { ok: true, adjudicates: typeof value.adjudicates === 'string' ? value.adjudicates : '', findingCount: findings.size, plainZeroFinding };
 }
 
 function adjudicatesReviewFile(adjudicates: string, path: string): boolean {

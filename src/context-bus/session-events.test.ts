@@ -25,6 +25,11 @@ test('four structured session kinds use the existing journal and context_now eve
       now: () => new Date('2026-10-03T04:01:00.000Z'), version: () => '0.2.0',
       checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
       decisions: () => [], seatEntries: () => [], events: since => listCoordEvents({ since }, { db }),
+      // The only un-injected default scans the operator's real federated run
+      // ledger (host-global ~/.elanous/run-ledger by design, outside the
+      // ELANOUS_STATE_DIR test isolation). This journal test has no run facts
+      // under test, so pin the empty world and keep the 5s unit budget.
+      runningRuns: () => [],
     });
     expect(answer.events.map(event => event.kind).reverse()).toEqual([...SESSION_EVENT_KINDS]);
     expect(answer.events.map(event => event.summary).reverse()).toEqual([0, 1, 2, 3].map(index => `CTX1 event ${index}`));
@@ -50,6 +55,7 @@ test('long one-line text and ref survive the journal while the context summary s
       now: () => new Date('2026-10-03T04:01:00.000Z'), version: () => '0.2.0',
       checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
       decisions: () => [], seatEntries: () => [], events: since => listCoordEvents({ since }, { db }),
+      runningRuns: () => [],
     });
     expect(answer.events[0]?.summary).toBe(event?.summary);
     expect(answer.events[0]?.source).toBe(`elanous://context/ref/${encodeURIComponent(ref)}`);
@@ -59,7 +65,15 @@ test('long one-line text and ref survive the journal while the context summary s
 test('CLI emits all four kinds; unknown kind exits 2 without writing; legacy hook CLI still works', () => {
   const state = mkdtempSync(resolve(tmpdir(), 'context-session-'));
   const env = { ...process.env, ELANOUS_CONFIG_DIR: state, ELANOUS_STATE_DIR: state };
-  const invoke = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', '--test', 'context', 'emit', ...args],
+  // Pin the `--test` root to this run's temp dir. The bare `--test` flag
+  // resolves its own worktree-scoped root (<repo>/.elanous-test, see
+  // resolveTestRoot in src/cli/test-flag.ts) and applyIsolatedRoot then
+  // deliberately overrides ELANOUS_STATE_DIR with it — so a bare `--test`
+  // child shares one persistent surface-events db across runs of this file:
+  // the first run on a fresh worktree passes and every later one also sees
+  // the earlier runs' rows. The explicit `--test=<dir>` form is the supported
+  // way to keep every invocation hermetic.
+  const invoke = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${state}`, 'context', 'emit', ...args],
     { cwd: root, env, encoding: 'utf8', timeout: 30_000 });
   try {
     for (const [index, kind] of SESSION_EVENT_KINDS.entries()) {
@@ -71,7 +85,7 @@ test('CLI emits all four kinds; unknown kind exits 2 without writing; legacy hoo
     expect(invalid.stderr).toContain('unknown context session kind');
     const hook = invoke('--kind', 'claimed', '--summary', 'Legacy hook', '--source', 'https://example.org/claim');
     expect(hook.status).toBe(0);
-    const query = spawnSync('bun', ['bin/elanous.mjs', '--test', 'coord', 'events', '--since', '2000-01-01T00:00:00Z', '--json'],
+    const query = spawnSync('bun', ['bin/elanous.mjs', `--test=${state}`, 'coord', 'events', '--since', '2000-01-01T00:00:00Z', '--json'],
       { cwd: root, env, encoding: 'utf8', timeout: 30_000 });
     expect(query.status).toBe(0);
     const rows = JSON.parse(query.stdout) as Array<{ kind: string; summary: string; refs: { seat: string; ref?: string } }>;
@@ -82,7 +96,7 @@ test('CLI emits all four kinds; unknown kind exits 2 without writing; legacy hoo
     const text = `Session ${'analysis '.repeat(24)}completed`;
     const ref = `PR-${'1234567890'.repeat(15)}-end`;
     expect(invoke('asked', '--seat', 'TC', '--text', text, '--ref', ref).status).toBe(0);
-    const longQuery = spawnSync('bun', ['bin/elanous.mjs', '--test', 'coord', 'events', '--since', '2000-01-01T00:00:00Z', '--json'],
+    const longQuery = spawnSync('bun', ['bin/elanous.mjs', `--test=${state}`, 'coord', 'events', '--since', '2000-01-01T00:00:00Z', '--json'],
       { cwd: root, env, encoding: 'utf8', timeout: 30_000 });
     expect(longQuery.status).toBe(0);
     const longRows = JSON.parse(longQuery.stdout) as Array<{ text: string; summary: string; refs: { ref?: string } }>;

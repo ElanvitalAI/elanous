@@ -16,6 +16,7 @@
 import { emitDecision } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
 import type { CodexAccountResolution } from './codex-account.js';
+import { createHash } from 'node:crypto';
 
 /** 회전이 고를 수 있는 후보 하나. ⛔ 홈을 모르는 계정은 «후보가 아니다». */
 export interface RotationCandidate {
@@ -30,6 +31,8 @@ export interface RotationCandidate {
   readonly creditBalance?: number;
   readonly hasCredits?: boolean;
   readonly resetCreditAvailability?: 'available' | 'unavailable' | 'unknown';
+  /** A known revoked grant or 401 must never be selected for a new run. */
+  readonly unhealthy?: boolean;
 }
 
 /** ⛔ 비공개 — 밖에서 이름으로 부를 소비처가 없다(리뷰 must-fix: dead export 금지). */
@@ -103,6 +106,9 @@ interface RotationInput {
   readonly thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
   /** 지금 계정을 «뺀» 후보들. */
   readonly candidates: readonly RotationCandidate[];
+  /** Present only for a new run. The same key makes a weighted choice reproducible. */
+  readonly balanceKey?: string;
+  readonly accountWeights?: Readonly<Record<string, number>>;
   /** «먼저 쓸» 계정 순서(설정 `llm.codexAccountOrder`). 없으면 이름 코드포인트 순.
    *  ⛔ 여기 없는 계정은 버리지 않는다 — 뒤로 가서 이름순으로 붙는다. */
   readonly accountOrder?: readonly string[];
@@ -123,7 +129,20 @@ interface RotationInput {
  * ⛔ 후보 선택은 «결정론»이다(이름 오름차순). 무작위면 같은 상황에서 다른 답이 나와
  *   「왜 이 계정인가」를 사후에 못 재구성한다.
  */
-const DEFAULT_ROTATION_THRESHOLD_PERCENT = 95;
+const DEFAULT_ROTATION_THRESHOLD_PERCENT = 85;
+
+function balancedCandidate(
+  candidates: readonly RotationCandidate[], key: string, weights: Readonly<Record<string, number>> | undefined,
+): RotationCandidate | undefined {
+  return candidates.map((candidate) => {
+    const weight = weights?.[candidate.name];
+    const available = Math.max(1, 100 - (candidate.usedPercent ?? 100));
+    const effectiveWeight = available * (typeof weight === 'number' && Number.isFinite(weight) && weight > 0 ? weight : 1);
+    const hash = createHash('sha256').update(`${key}\u0000${candidate.name}`).digest();
+    const sample = (hash.readUInt32BE(0) + 1) / 0x100000001;
+    return { candidate, score: -Math.log(sample) / effectiveWeight };
+  }).sort((a, b) => a.score - b.score || (a.candidate.name < b.candidate.name ? -1 : 1))[0]?.candidate;
+}
 
 // 대표 "첫 번째 계정의 경우 멀티 계정이 있을 때 50% 이상은 소모하지 않도록 해 주세요. 외부에서 코딩 용도가 아니라 다른 용도로도 많이 사용하고 있습니다."
 // 공유 default 계정에 여유를 남기기 위한 기본 임계 60%; 명시적 계정별 설정이 우선한다.
@@ -181,7 +200,7 @@ function accountThreshold(
 
 export function decideCodexRotation(input: RotationInput): RotationDecision {
   const candidateCount = input.candidates.length;
-  const otherCandidates = input.candidates.filter((candidate) => candidate.name !== input.current.name);
+  const otherCandidates = input.candidates.filter((candidate) => candidate.name !== input.current.name && candidate.unhealthy !== true);
   const accounts = [
     { name: input.current.name, reached: input.currentReached, usedPercent: input.currentUsedPercent },
     ...otherCandidates,
@@ -196,8 +215,10 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
   });
   if (input.explicit) return { reason: 'explicit', candidateCount, accountThresholds };
   if (!input.enabled) return { reason: 'disabled', candidateCount, accountThresholds, ...(input.disabledProvenance ? { disabledProvenance: input.disabledProvenance } : {}) };
+  const currentCandidate = input.candidates.find((candidate) => candidate.name === input.current.name);
   const currentUsageUnknown = input.currentReached === undefined && input.currentUsedPercent == null;
-  if (input.currentReached !== true && !currentUsageUnknown && accountThresholds[0]?.status !== 'threshold-reached') {
+  if (!input.balanceKey && currentCandidate?.unhealthy !== true && input.currentReached !== true
+    && !currentUsageUnknown && accountThresholds[0]?.status !== 'threshold-reached') {
     return { reason: 'not-reached', candidateCount, accountThresholds };
   }
   const resetCreditUnknown = input.resetCreditAvailability === 'unknown';
@@ -216,6 +237,7 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
     };
   const usable = candidateStatuses
     .filter(({ candidate, status }) => candidate.home.length > 0
+      && candidate.unhealthy !== true
       && status !== 'reached' && status !== 'threshold-reached')
     .map(({ candidate }) => candidate)
     .sort((a, b) => {
@@ -223,9 +245,25 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
       if (ra !== rb) return ra - rb;
       return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;   // ⛔ 코드포인트 비교 — localeCompare 는 ICU/로케일에 따라 답이 갈린다
     });
+  const currentHealthy = input.balanceKey
+    ? currentCandidate !== undefined && currentCandidate.unhealthy !== true
+    : currentCandidate?.unhealthy !== true;
+  if (input.balanceKey) {
+    const self = input.candidates.find((candidate) => candidate.name === input.current.name)
+      ?? (input.current.home ? { name: input.current.name, storeKey: input.current.storeKey, home: input.current.home,
+        reached: input.currentReached, usedPercent: input.currentUsedPercent } : undefined);
+    const selfHealthy = self && !self.unhealthy && accountThresholds[0]?.status === 'below-threshold';
+    const measured = usable.filter((candidate) => accountThresholds.find((row) => row.name === candidate.name)?.status === 'below-threshold');
+    const selected = balancedCandidate(selfHealthy ? [...measured, self] : measured, input.balanceKey, input.accountWeights);
+    if (selected?.name === input.current.name) return { reason: 'not-reached', candidateCount, accountThresholds };
+    if (selected) return { reason: 'rotated', candidateCount, accountThresholds, to: selected };
+  }
+  // 측정된 below-threshold 가 없으면 기존 순서의 usable 로 간다. 사용량을 모르는
+  // 신선한 미러가 런 아이디 때문에 빠지지 않게 한다. usable 은 unhealthy · 빈 홈 ·
+  // reached · threshold-reached 를 이미 빼므로 만료 미러(후보 제외)와 비정상 계정은 그대로다.
   const to = usable[0];
   if (!to) {
-    if (input.resetCreditAvailability === 'available') return { reason: 'reset-credit-available', candidateCount, accountThresholds };
+    if (currentHealthy && input.resetCreditAvailability === 'available') return { reason: 'reset-credit-available', candidateCount, accountThresholds };
     const resetCreditAccount = otherCandidates
       .filter((candidate) => candidate.home.trim() && candidate.resetCreditAvailability === 'available')
       .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)[0]?.name;
@@ -240,7 +278,7 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
       const currentHas = input.currentHasCredits ?? self?.hasCredits;
       const richest = otherCandidates.filter((candidate) => eligible(candidate.name, candidate.creditBalance, candidate.hasCredits, candidate.home))
         .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
-      if (eligible(input.current.name, currentBalance, currentHas, self?.home ?? input.current.home)) {
+      if (currentHealthy && eligible(input.current.name, currentBalance, currentHas, self?.home ?? input.current.home)) {
         return { reason: 'credit-pace', candidateCount, accountThresholds };
       }
       if (richest) return { reason: 'credit-pace', candidateCount, accountThresholds, to: richest };
@@ -262,10 +300,11 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
       const self = input.candidates.find((c) => c.name === input.current.name);
       const cur = input.currentCreditBalance ?? self?.creditBalance;
       const curHas = input.currentHasCredits ?? self?.hasCredits;
-      const currentDry = curHas === false || (typeof cur === 'number' && cur <= floor);
+      const currentDry = !currentHealthy || curHas === false || (typeof cur === 'number' && cur <= floor);
       if (richest && (currentDry || (typeof cur === 'number' && richest.creditBalance! > cur * 1.2))) {
         return { reason: 'rotated', candidateCount, accountThresholds, to: richest, creditEntry: true };
       }
+      if (!currentHealthy) return { reason: 'no-candidate', candidateCount, accountThresholds };
       // 🩸 10-11: 크레딧이 0 이 돼도 여기 머물러 codex 로 계속 쐈다. 잔액이 «알려져 있고» 예비분 이하이며
       //   예비분을 넘는 다른 계정도 없으면 «갈 곳 없음» — 폴백 체인이 다음 칸을 정한다. 모르면 종전대로 머문다.
       if (reserve !== undefined && typeof cur === 'number' && Number.isFinite(cur) && cur <= reserve) {

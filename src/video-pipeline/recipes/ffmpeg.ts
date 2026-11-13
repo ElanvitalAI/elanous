@@ -23,7 +23,7 @@ export function run(bin: string, args: readonly string[], timeoutMs = 180_000): 
 }
 
 export const ffmpeg = (args: readonly string[], t?: number): RunResult =>
-  run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], t);
+  run(process.env.ELANOUS_FFMPEG_BIN || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], t);
 
 /**
  * ⛔⭐⭐ 되읽기의 «단 하나의» 자 — 길이를 «컨테이너 헤더»가 아니라 ***센 프레임***으로 읽는다.

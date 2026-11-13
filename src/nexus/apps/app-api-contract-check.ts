@@ -43,3 +43,91 @@ export function planAppApiRoleChecks(manifest: AppManifest): AppApiRoleCheck[] {
   }
   return cases;
 }
+
+export interface RecordedAppApiCall {
+  readonly method: string;
+  /** Contract-relative OpenAPI path (/rpc/... or /actions/...), not a production host URL. */
+  readonly path: string;
+  readonly role: string;
+  readonly status: number;
+  readonly response: unknown;
+}
+
+export interface AppApiCallMismatch {
+  /** Ordinal locators deliberately exclude caller-controlled route names and response values. */
+  readonly path: string;
+  readonly reason: 'route' | 'method' | 'status' | 'response-type' | 'missing-field';
+}
+
+export interface AppApiCheckReceipt {
+  readonly world: 'simulation';
+  readonly ok: boolean;
+  readonly checkedCalls: number;
+  readonly mismatches: readonly AppApiCallMismatch[];
+  /** Stable call ordinals to replay against the fake host; never includes bodies or credentials. */
+  readonly rerun: { readonly callIndexes: readonly number[] };
+}
+
+function matchesField(value: unknown, definition: unknown): boolean {
+  const type = typeof definition === 'string' ? definition : record(definition).type;
+  switch (type) {
+    case 'int': return typeof value === 'number' && Number.isSafeInteger(value);
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'boolean': return typeof value === 'boolean';
+    case 'json': return value !== undefined;
+    case 'text': case 'timestamp': case 'object-ref': return typeof value === 'string';
+    default: return false;
+  }
+}
+
+/** Compare captured fake-host calls with the implementation manifest. This receipt is simulation
+ * evidence only: it neither runs network requests nor authorizes a production deployment gate.
+ * Replaying rerun.callIndexes after repairing a host yields an independent new receipt. */
+export function checkRecordedAppApiCalls(
+  manifest: AppManifest,
+  calls: readonly RecordedAppApiCall[],
+): AppApiCheckReceipt {
+  const matrix = planAppApiRoleChecks(manifest);
+  const mismatches: AppApiCallMismatch[] = [];
+  const rerun = new Set<number>();
+  calls.forEach((call, index) => {
+    const at = `/calls/${index}`;
+    const issue = (path: string, reason: AppApiCallMismatch['reason']) => {
+      mismatches.push({ path, reason });
+      rerun.add(index);
+    };
+    const routes = matrix.filter(item => item.path === call.path);
+    if (routes.length === 0) { issue(`${at}/path`, 'route'); return; }
+    if (call.method !== 'POST') { issue(`${at}/method`, 'method'); return; }
+    const allowed = routes.some(item => item.role === call.role && item.expected === 'allow');
+    const actionName = call.path.startsWith('/actions/') ? decodeURIComponent(call.path.slice('/actions/'.length)) : undefined;
+    const declaration = actionName === undefined ? undefined : record(record(manifest.actions)[actionName]);
+    const expectedStatus = allowed ? declaration?.async === true ? 202 : 200 : 403;
+    if (call.status !== expectedStatus) { issue(`${at}/status`, 'status'); return; }
+    if (!allowed) return;
+    if (!call.response || typeof call.response !== 'object' || Array.isArray(call.response)) {
+      issue(`${at}/response`, 'response-type'); return;
+    }
+    const body = call.response as Record<string, unknown>;
+    if (!declaration) {
+      if (!Array.isArray(body.rows)) issue(`${at}/response/rows`, 'response-type');
+      return;
+    }
+    if (body.ok !== true) issue(`${at}/response/ok`, 'response-type');
+    if (declaration.async === true) {
+      if (typeof body.jobId !== 'string' || body.jobId.length === 0) issue(`${at}/response/jobId`, 'response-type');
+      return;
+    }
+    if (declaration.output === undefined) return;
+    Object.entries(record(declaration.output)).forEach(([name, definition], fieldIndex) => {
+      const location = `${at}/response/@field:${fieldIndex}`;
+      if (!Object.hasOwn(body, name)) {
+        const optional = typeof definition === 'object' && definition !== null && Object.hasOwn(definition, 'default');
+        if (!optional) issue(location, 'missing-field');
+      } else if (!matchesField(body[name], definition)) issue(location, 'response-type');
+    });
+  });
+  if (calls.length === 0) mismatches.push({ path: '/calls', reason: 'missing-field' });
+  return { world: 'simulation', ok: mismatches.length === 0, checkedCalls: calls.length,
+    mismatches, rerun: { callIndexes: [...rerun] } };
+}

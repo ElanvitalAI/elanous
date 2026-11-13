@@ -1025,21 +1025,25 @@ function gitHasCommit(git: (...args: string[]) => ReturnType<GitRunner>, sha: st
 export function resolveDefaultBranchBase(repoRoot: string): string | null {
   const run = (...args: string[]) => spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
   const exists = (candidate: string): boolean => run('rev-parse', '--verify', '--quiet', `${candidate}^{commit}`).status === 0;
-  const remoteHead = run('symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD');
-  const trackedHead = (remoteHead.stdout ?? '').trim().replace(/^refs\/remotes\//, '');
-  if (trackedHead && exists(trackedHead)) return trackedHead;
+  const hasOrigin = run('remote', 'get-url', 'origin').status === 0;
+  if (hasOrigin) {
+    const remoteHead = run('symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD');
+    const trackedHead = (remoteHead.stdout ?? '').trim().replace(/^refs\/remotes\//, '');
+    if (trackedHead && exists(trackedHead)) return trackedHead;
+  }
 
   // A clone can lack refs/remotes/origin/HEAD even though the remote publishes its
   // default branch. Read that metadata before heuristics, but retain a local fallback
   // when the remote is unavailable.
-  const remoteSymref = run('ls-remote', '--symref', 'origin', 'HEAD');
-  const remoteDefault = (remoteSymref.stdout ?? '').match(/^ref:\s+refs\/heads\/(.+)\s+HEAD$/m)?.[1];
-  if (remoteDefault) return `origin/${remoteDefault}`;
+  if (hasOrigin) {
+    const remoteSymref = run('ls-remote', '--symref', 'origin', 'HEAD');
+    const remoteDefault = (remoteSymref.stdout ?? '').match(/^ref:\s+refs\/heads\/(.+)\s+HEAD$/m)?.[1];
+    if (remoteDefault) return `origin/${remoteDefault}`;
+  }
 
   for (const name of ['main', 'master', 'develop', 'trunk']) {
-    for (const candidate of [`origin/${name}`, name]) {
-      if (exists(candidate)) return candidate;
-    }
+    if (hasOrigin && exists(`refs/remotes/origin/${name}`)) return `origin/${name}`;
+    if (exists(`refs/heads/${name}`)) return hasOrigin ? name : `refs/heads/${name}`;
   }
   return null;
 }
@@ -1428,15 +1432,19 @@ export function createWorktree(opts: CreateWorktreeOpts, deps: WorktreeAddDeps =
   const requestedBase = opts.base ?? 'HEAD';
   const isDefaultBranchBase = requestedBase === DEFAULT_BRANCH_WORKTREE_BASE;
   const defaultBranchBase = isDefaultBranchBase ? resolveDefaultBranchBase(repoRoot) : null;
+  const noOriginDefault = isDefaultBranchBase && spawnSync('git', ['remote', 'get-url', 'origin'], {
+    cwd: repoRoot, encoding: 'utf8', timeout: GIT_TIMEOUT_MS,
+  }).status !== 0;
   // When Git cannot identify a default branch, preserve the old HEAD behavior rather
   // than rejecting the launch. Explicit bases never enter this fallback.
   const base = defaultBranchBase ?? (isDefaultBranchBase ? 'HEAD' : requestedBase);
   // ⭐ 낡은 로컬 base 차단(2026-07-29) — 원격에 그 브랜치가 있으면 **원격 tip 에서** 갈린다.
   //    `base`(결과 필드)는 요청한 **ref 이름** 그대로 두고, git 에는 확정된 커밋을 넘긴다.
   const { checkout: baseCheckout, freshness: baseFreshness } = defaultBranchBase || opts.base
-    ? syncBaseWithRemote(repoRoot, base, opts.skipRemoteBaseSync === true)
+    ? syncBaseWithRemote(repoRoot, base, opts.skipRemoteBaseSync === true || noOriginDefault)
     : { checkout: base, freshness: 'head' as WorktreeBaseFreshness };
   if (isDefaultBranchBase) {
+    if (noOriginDefault) debug.log('git-fs.worktree', 'base.no-origin-local', { branch, base });
     debug.log('git-fs.worktree', 'base.default-branch', {
       branch,
       base,

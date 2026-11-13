@@ -45,6 +45,19 @@ describe('member mini board API', () => {
     await expect(api.getVerifiedOwner()).rejects.toThrow('본인 앱 소유권을 확인하지 못했습니다');
   });
 
+  test('briefing request carries the verified app scope required by the Nexus route', async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return Response.json({ briefings: [] });
+    }) as typeof fetch;
+    const api = createMemberMiniBoardApi('https://nexus.example.test/', fetchImpl);
+    await api.getBriefings('2026-11-14', 'lecture-scrap');
+    expect(calls).toEqual(['https://nexus.example.test/v1/briefings?day=2026-11-14&appSlug=lecture-scrap']);
+    await api.getBriefing?.('ticket-brief', 'lecture-scrap');
+    expect(calls[1]).toBe('https://nexus.example.test/v1/briefings/ticket-brief?appSlug=lecture-scrap');
+  });
+
   test('subscribes with the member cookie and refreshes only for that member event', () => {
     const source = new FakeEventSource();
     let init: EventSourceInit | undefined;

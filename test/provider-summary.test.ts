@@ -10,6 +10,7 @@ import * as config from '../src/config';
 import { saveTokens } from '../src/oauth/store';
 import { CODEX_DEFAULT_MODEL } from '../src/llm';
 import type { UserConfig } from '../src/user-config';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir';
 
 function baseConfig(): UserConfig {
   return {
@@ -29,8 +30,9 @@ function baseConfig(): UserConfig {
 
 const savedEnv: Record<string, string | undefined> = {};
 const resolveGrokCredential = grokCredential.resolveGrokCredential;
-const isolatedEnv = ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL', 'HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME'] as const;
+const isolatedEnv = ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL', 'HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME'] as const;
 let root: string;
+let previousConfigDir: string | undefined;
 
 function writeGrokSubscriptionCredential(): void {
   mkdirSync(join(root, '.grok'), { recursive: true });
@@ -41,6 +43,9 @@ function writeGrokSubscriptionCredential(): void {
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'provider-summary-'));
+  previousConfigDir = getElanousConfigDirOverride();
+  // HOME alone cannot isolate the memoized instance root between test cases.
+  setElanousConfigDir(join(root, 'elanous'));
   for (const k of isolatedEnv) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
@@ -56,6 +61,7 @@ beforeEach(() => {
   ));
   spyOn(config, 'getAnthropicApiKey').mockImplementation(() => process.env.ANTHROPIC_API_KEY);
   spyOn(config, 'getOpenAIApiKey').mockImplementation(() => process.env.OPENAI_API_KEY);
+  spyOn(config, 'getOpenRouterApiKey').mockImplementation(() => process.env.OPENROUTER_API_KEY);
   spyOn(config, 'getGeminiApiKey').mockImplementation(() => process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
   spyOn(config, 'getLocalLLMUrl').mockImplementation(() => process.env.LOCAL_LLM_URL);
 });
@@ -64,12 +70,15 @@ afterEach(() => {
   spyOn(config, 'getGrokApiKey').mockRestore();
   spyOn(config, 'getAnthropicApiKey').mockRestore();
   spyOn(config, 'getOpenAIApiKey').mockRestore();
+  spyOn(config, 'getOpenRouterApiKey').mockRestore();
   spyOn(config, 'getGeminiApiKey').mockRestore();
   spyOn(config, 'getLocalLLMUrl').mockRestore();
   for (const [k, v] of Object.entries(savedEnv)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+  if (previousConfigDir === undefined) resetElanousConfigDir();
+  else setElanousConfigDir(previousConfigDir);
   rmSync(root, { recursive: true, force: true });
 });
 

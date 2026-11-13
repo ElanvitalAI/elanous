@@ -341,6 +341,27 @@ describe('quorum (OP 08:40 rule ①②③)', () => {
     expect(parseLease(store.raw)).toMatchObject({ holder: 'node-b', generation: 2, promotedFrom: 'mbp' });
   });
 
+  test('priority promotion uses the same holder snapshot as candidate selection', () => {
+    for (const holderObservation of [{ reachable: true, at: clock + 600 }, undefined]) {
+      const store = memStore();
+      expect(hqLease('acquire', deps('aws1', store, fakeSsh(new Set()))).ok).toBe(true);
+      clock += 600;
+      hqHeartbeat(deps('node-b', store, fakeSsh(new Set())));
+      const base = deps('cloud-vm', store, fakeSsh(new Set()));
+      const arbiter = {
+        ...base,
+        config: { ...base.config, autoPromote: { enabled: true, streak: 1 } },
+        priorityObservations: () => ({
+          'mshq': { reachable: false, at: clock }, 'node-b': { reachable: true, at: clock },
+          ...(holderObservation ? { 'aws1': holderObservation } : {}),
+        }),
+        promote: () => { throw new Error('live or unknown holder must not move'); },
+      };
+      expect(hqArbiterCheck(arbiter)).toMatchObject({ promoted: false, streak: 0, holder: 'aws1', generation: 1 });
+      expect(parseLease(store.raw)).toMatchObject({ holder: 'aws1', generation: 1 });
+    }
+  });
+
   test('arbiter default files one OP seat request (not a CEO card) at streak 3 without changing the lease', () => {
     const store = memStore();
     hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));

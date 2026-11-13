@@ -25,7 +25,7 @@
 // back-fill merge — so tests don't need to stub config paths either.
 
 import { existsSync, statSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { isHeadlessEnv, spawnCodexLogin, type CodexLoginResult } from './acp/codex-auth.js';
 import { getRunContext, type RunContext } from './agent/run-context.js';
@@ -1605,8 +1605,19 @@ export async function runOnboarding(opts: RunWizardOpts = {}): Promise<UserConfi
       // Explicit role choices are preserved by updateOpenRouterRoleDefaults.
       next.roleLlm = updateOpenRouterRoleDefaults(next.roleLlm, initial.llm.provider === 'openrouter' ? initial.llm.model : undefined, next.llm.model);
     }
+    // First-run packages are local assets. Keep setup incomplete when a
+    // package fails so the next onboarding attempt can retry it.
+    const { installDemo1114PluginGroup } = await import('./plugins/install/plugin-install.js');
+    const demoPlugins = await installDemo1114PluginGroup({ ...(opts.path ? { root: dirname(path) } : {}) });
+    if (demoPlugins.failed.length) {
+      const message = `데모 플러그인 ${demoPlugins.failed.join(', ')} 설치 실패 — elanous onboarding 으로 다시 시도하세요.`;
+      io.print(`  ${message}`);
+      if (existsSync(path)) saveUserConfig({ ...next, onboarding: { ...next.onboarding, completed: false } }, path);
+      throw new Error(message);
+    }
     const marked = markOnboardingComplete(next);
     saveUserConfig(marked, path);
+    io.print(`  데모 플러그인 ${demoPlugins.installed.length}개 설치됨 — elanous plugin list 로 확인하세요.`);
 
     io.print('');
     io.print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');

@@ -6,7 +6,7 @@ import { FEATURE_MATURITY, visibleOn } from '../../../../src/maturity/feature-ma
 import { SIDEBAR_NAV_ITEMS } from '../components/shell/sidebar-nav-items';
 
 const app = resolve(dirname(import.meta.path), '../app');
-const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/ops/release', '/settings', '/setup', '/setup/done', '/share/received', '/term', '/vault'];
+const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/member/invite', '/ops/release', '/scraps', '/settings', '/setup', '/setup/done', '/share/received', '/signup', '/signup/complete', '/term', '/vault', '/voice-notes'];
 
 function builtPages(directory = app): string[] {
   const pages: string[] = [];

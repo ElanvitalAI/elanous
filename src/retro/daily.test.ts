@@ -270,8 +270,12 @@ test('graph CLI child collect reads the explicitly selected config universe', ()
     event: 'rework-blocked-draft-pr', data: { number },
   }, surface: 'test' })));
   store.close();
+  // #36028 made an explicit --test state root take precedence over --config-dir for graph
+  // runs (test isolation beats process-local config overrides), so this probe uses the
+  // production shape: --config-dir alone selects the universe — run ledger, facts child and
+  // day file — end-to-end through two spawn levels.
   const child = spawnSync('bun', [
-    'bin/elanous.mjs', `--test=${root}`, 'graph', 'run', RETRO_DAILY_GRAPH, '--json',
+    'bin/elanous.mjs', 'graph', 'run', RETRO_DAILY_GRAPH, '--json',
     '--input', JSON.stringify({ day: '2026-10-09', greenCells: [] }), '--config-dir', configDir,
   ], { encoding: 'utf8', timeout: 120_000 });
   expect(child.status).toBe(0);

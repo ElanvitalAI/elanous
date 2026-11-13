@@ -118,6 +118,31 @@ function failedAfterGate(state: GraphRunState, index: number): boolean {
     && failedAfterTrafficRestore(state, index + 1);
 }
 
+/** A rejected heal decision is a runner approval boundary; the failed run cannot be resumed across it. */
+function rejectedHealRequiresNewRun(state: GraphRunState, gateIndex: number): boolean {
+  const suffix = ['gate', 'cloud-leave', 'gate-triage', 'gate-heal-decision', 'traffic-failed-restore', 'failed'];
+  const gate = state.nodes[gateIndex];
+  if (state.status !== 'failed' || state.path.length !== state.nodes.length
+    || gate?.nodeId !== 'gate' || gate.ok !== false || gate.executed !== true
+    || state.path[0] !== 'version-release' || state.nodes[0]?.nodeId !== 'version-release'
+    || state.nodes[0]?.ok !== true || state.nodes[0]?.executed !== true
+    || (gateIndex > 1 && state.path[gateIndex - 1] !== 'pod-reuse-prep')
+    || state.path.slice(0, gateIndex).some((nodeId, index) => state.nodes[index]?.nodeId !== nodeId)
+    || state.path.lastIndexOf('gate') !== gateIndex
+    || state.path.length - gateIndex !== suffix.length
+    || !suffix.every((nodeId, offset) => offset === 1
+      ? (state.path[gateIndex + offset] === 'cloud-leave-error' || state.path[gateIndex + offset] === 'cloud-leave-fail')
+        && state.nodes[gateIndex + offset]?.nodeId === state.path[gateIndex + offset]
+      : state.path[gateIndex + offset] === nodeId && state.nodes[gateIndex + offset]?.nodeId === nodeId)) return false;
+  const cloud = state.nodes[gateIndex + 1];
+  const triage = state.nodes[gateIndex + 2];
+  const decision = state.nodes[gateIndex + 3];
+  const restore = state.nodes[gateIndex + 4];
+  return cloud?.ok === true && cloud.executed === true && triage?.ok === true && triage.executed === true
+    && decision?.ok === false && decision.executed === false && lastJsonObject(decision.output)?.outcome === 'rejected'
+    && restore?.executed === true;
+}
+
 export function gateUnmeasuredDetail(state: GraphRunState, index: number): string | undefined {
   const record = state.nodes[index];
   if (!record || record.nodeId !== 'gate' || state.path[index] !== 'gate' || record.ok !== false || record.waiver !== undefined) return undefined;
@@ -209,6 +234,9 @@ export function releaseResumeWaiver(
     if (!approvedBy || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(approvedBy)) throw new Error('--owner-waive requires --approved-by');
     if (opts.from !== opts.ownerWaive) throw new Error('--from must name the owner-waived node');
     const index = state.path.indexOf(opts.ownerWaive), record = state.nodes[index];
+    if (index >= 0 && rejectedHealRequiresNewRun(state, index)) {
+      throw new Error('owner waiver unavailable after rejected gate heal; start a new release run from the same cut');
+    }
     if (index < 0 || state.path.lastIndexOf(opts.ownerWaive) !== index || record?.nodeId !== opts.ownerWaive || record.ok !== false || record.executed !== true || !failedAfterGate(state, index)) throw new Error('owner waiver requires the failed executable gate on the saved path');
     const reason = opts.reason.trim();
     const gateResult = lastJsonObject(record.output);

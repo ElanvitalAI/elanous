@@ -491,7 +491,11 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         { label: 'attachment page two', text: '/context page 2', enter: true, until: (s) => s.includes('2/2쪽') && showsAttachment(s, 2, 'b.txt') },
         { label: 'attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
         { label: 'attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/') && s.includes('❯') },
-        { label: 'attachment path page up keeps input', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
+        { label: 'attachment path page four down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 4/') && s.includes('❯') },
+        { label: 'attachment path page five down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 5/') && s.includes('❯') },
+        { label: 'attachment path page up keeps input', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 4/') && s.includes('❯') },
+        { label: 'attachment path page three up', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 3/') && s.includes('❯') },
+        { label: 'attachment path page two up', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
         { label: 'attachment first path page', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 1/') && s.includes('❯') },
         { label: 'page up at first attachment page enters log navigation', keys: '\x1b[5~', until: (s) => s.includes('턴 로그') },
         { label: 'escape returns to composer after log navigation', keys: '\x1b', until: (s) => s.includes('❯') },
@@ -501,8 +505,10 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         { label: 'third attachment selected refreshes area', keys: '\r', until: (s) => s.includes('첨부 3건 · 2/3쪽') && s.includes('❯') },
         { label: 'third attachment sent', keys: '\r', until: (s) => storedReplyCount() >= 2 && s.includes('완료') && s.includes('❯ ') },
         { label: 'attachment page three shows new item', text: '/context page 3', enter: true, until: (s) => s.includes('첨부 3건 · 3/3쪽') && showsAttachment(s, 3, 'c.txt') },
-        { label: 'new attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/3') && s.includes('❯') },
-        { label: 'new attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/3') && s.includes('❯') },
+        { label: 'new attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/5') && s.includes('❯') },
+        { label: 'new attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/5') && s.includes('❯') },
+        { label: 'new attachment path page four down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 4/5') && s.includes('❯') },
+        { label: 'new attachment path page five down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 5/5') && s.includes('❯') },
         { label: 'second attachment dropped', text: '/context drop 2', enter: true, until: (s) => s.includes('첨부 #2 삭제') && showsAttachment(s, 1, 'a.txt') },
         { label: 'attachment area cleared', text: '/context clear', enter: true, until: (s) => s.includes('첨부 2건 삭제') },
         { label: 'empty attachment area', text: '/context', enter: true, until: (s) => s.includes('/context: (없음)') },
@@ -521,9 +527,11 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     };
     const longPathAcrossPages = [
       'attachment page two', 'attachment path page two down', 'attachment path page three down',
+      'attachment path page four down', 'attachment path page five down',
     ].map(attachmentViewportText).join('');
     const newAttachmentPathAcrossPages = [
       'attachment page three shows new item', 'new attachment path page two down', 'new attachment path page three down',
+      'new attachment path page four down', 'new attachment path page five down',
     ].map(attachmentViewportText).join('');
     return {
       scenario: spec.scenario, universe: scenarioRoot, run, store: { fixtureA, fixtureB, fixtureC }, logs: readLogs({ ...spec, root: scenarioRoot }, 'tui.next'), checks: {

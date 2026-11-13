@@ -8,7 +8,7 @@
 //   5. Auto-wired queue only enqueues BACKGROUND tasks
 //   6. Output truncation above TASK_NOTIFICATION_OUTPUT_CAP
 
-import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -30,6 +30,16 @@ import type {
   AgentDefinition, AgentTask,
 } from '../src/agent/types';
 import type { LLMProvider, LLMStreamEvent } from '../src/llm';
+
+let previousLlmMode: string | undefined;
+beforeEach(() => {
+  previousLlmMode = process.env.ELANOUS_LLM_MODE;
+  process.env.ELANOUS_LLM_MODE = 'real'; // Honor explicit in-process providers in this test file.
+});
+afterEach(() => {
+  if (previousLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+  else process.env.ELANOUS_LLM_MODE = previousLlmMode;
+});
 
 function fakeProvider(turns: LLMStreamEvent[][]): LLMProvider {
   let call = 0;

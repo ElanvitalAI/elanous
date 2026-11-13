@@ -64,9 +64,12 @@ describe('MCP Agent spawn and retrieval', () => {
       expect((collected.result as { structuredContent: { text: string; retrievalStatus: string } }).structuredContent)
         .toMatchObject({ text: 'child final text', retrievalStatus: 'success' });
       const dispatched = observations.find(r => r.category === 'agent.spawn' && r.event === 'dispatch');
+      // #36673 (two-level Agent completion): a first-level child keeps the
+      // recursive Agent tool so it may spawn one grandchild; only grandchildren
+      // (parentTaskId set) have it stripped (stripAgentToolForOneLevelNesting).
       expect(((dispatched?.data as { tools?: string[] } | undefined)?.tools ?? []).sort())
-        .toEqual(expectedNames.filter(n => n !== 'Agent'));
-      expect(modelToolNames).toEqual(expectedNames.filter(n => ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch'].includes(n)));
+        .toEqual(expectedNames);
+      expect(modelToolNames).toEqual(expectedNames.filter(n => ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch', 'Agent'].includes(n)));
       expect(modelToolNames.length).toBeGreaterThan(0);
     } finally {
       model.mockRestore();
@@ -106,7 +109,7 @@ describe('MCP Agent spawn and retrieval', () => {
       expect(result.error).toBeUndefined();
       expect(childCwd).toBe(cwd);
       expect(clientArgs.cwd).toBe(cwd);
-      expect(childNames).toEqual(buildCliAgentTools(getUserConfig(), undefined, cwd).specs.map(s => s.name).filter(n => n !== 'Agent').sort());
+      expect(childNames).toEqual(buildCliAgentTools(getUserConfig(), undefined, cwd).specs.map(s => s.name).sort());
     } finally {
       spawn.mockRestore();
     }
@@ -130,7 +133,7 @@ describe('MCP Agent spawn and retrieval', () => {
       expect('taskId' in result && result.taskId).toBe('runtime-cwd-id');
       expect(spawn.mock.calls[0]?.[0].cwd).toBe(cwd);
       expect(spawn.mock.calls[0]?.[0].tools?.map(s => s.name).sort())
-        .toEqual(catalog.specs.map(s => s.name).filter(n => n !== 'Agent').sort());
+        .toEqual(catalog.specs.map(s => s.name).sort());
       expect(typeof spawn.mock.calls[0]?.[0].dispatchTool).toBe('function');
     } finally {
       spawn.mockRestore();

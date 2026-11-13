@@ -631,7 +631,8 @@ export function claimItem(v: string, id: string, by: string, options: { force?: 
       if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
       from = item.owner ?? null;
       if (from === by) { outcome = 'same'; return false; }
-      const currentOwner = from ? parseOwner(from) : undefined;
+      // OP-signed force with a reason can repair legacy owner text; keep it verbatim in history.
+      const currentOwner = from && !options.force ? parseOwner(from) : undefined;
       if (process.env.ELANOUS_TRACK !== 'OP' && (!currentOwner || currentOwner.seat !== actorSeat)) {
         throw new CliUserError(`칸 주인 또는 OP만 claim 할 수 있다 (caller: ${actor || 'unknown'})`);
       }

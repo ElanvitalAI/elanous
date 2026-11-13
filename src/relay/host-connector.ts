@@ -31,7 +31,9 @@ export interface RelayHostConnectorOptions {
   readonly daemonKeys: DaemonKeyPair;
   readonly hostSigningKey: KeyLike;
   readonly handleRequest: (request: Request) => Response | undefined | Promise<Response | undefined>;
-  readonly webSocketFactory?: (url: string) => WebSocket;
+  /** Fresh, server-bound relay.connect credential for a member-gated relay. */
+  readonly getMemberToken?: (serverId: string, signal?: AbortSignal) => string | Promise<string>;
+  readonly webSocketFactory?: (url: string, protocols?: string[]) => WebSocket;
   readonly onError?: (error: Error) => void;
   readonly onClose?: () => void;
   readonly signal?: AbortSignal;
@@ -317,7 +319,13 @@ export async function connectRelayHost(options: RelayHostConnectorOptions): Prom
   const requestedServerId = relayUrl.searchParams.get('serverId');
   if (requestedServerId && requestedServerId !== serverId) throw new Error('relayUrl serverId does not match daemon public key');
   relayUrl.searchParams.set('serverId', serverId);
-  const socket = (options.webSocketFactory ?? (url => new WebSocket(url)))(relayUrl.toString());
+  const memberToken = await options.getMemberToken?.(serverId, options.signal);
+  if (options.signal?.aborted) throw new Error('relay host connection aborted before socket');
+  if (memberToken !== undefined && !/^emt_[A-Za-z0-9_-]+$/.test(memberToken)) {
+    throw new Error('invalid relay member token');
+  }
+  const socket = (options.webSocketFactory ?? ((url, protocols) => new WebSocket(url, protocols)))(
+    relayUrl.toString(), memberToken ? [memberToken] : undefined);
   const clients = new Map<number, ClientChannel>();
   const clientQueues = new Map<number, Promise<void>>();
   let closed = false;

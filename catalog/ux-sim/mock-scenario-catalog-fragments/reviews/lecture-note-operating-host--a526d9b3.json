@@ -1,0 +1,4 @@
+{
+  "deviceKey": "lecture-note-operating-host",
+  "review": "2026-11-13 TC/H9 A37 재검토 after JUD #23480: the owner-only lecture note list now uses a stable created_at and id cursor, and the exported page exposes an older-notes action. The operating Chrome device confirms the first note remains reachable after 20 newer owner RPC saves, Host/database reopen and browser reload. Catalog v32 still enters through the real App Host. Ordinary member public URL and deployed installation remain separate LIVE measurements."
+}

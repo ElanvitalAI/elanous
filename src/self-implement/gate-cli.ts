@@ -1629,7 +1629,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   }
 
   if (ledgerWriter?.required) throw new Error('remote train self-gate refused: execution bypassed the HQ shard ledger');
-  const test = (deps.runTests ?? ((dir, files) => (deps.runCommand ?? defaultRunCommand)('bun', ['test', ...files], dir)))(cwd, testFiles);
+  const test = (deps.runTests ?? ((dir, files) => (deps.runCommand ?? defaultRunCommand)('bun', ['test', '--preserve-symlinks', ...files], dir)))(cwd, testFiles);
   const worktreeLog = formatProcessOutput(test);
   Object.assign(capture, { unshardedRc: test.status, artifactsUnavailable: 'unsharded' } satisfies GateArtifactCapture);
   if (test.status === 0 && !test.error) {

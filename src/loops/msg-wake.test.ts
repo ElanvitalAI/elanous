@@ -706,6 +706,49 @@ test('a wake that meets a busy TUI is deferred, then redelivered exactly once af
   } finally { log.mockRestore(); }
 });
 
+test('AUTO-WAKE-EXPANSION: a failed first PTY wake checks unread mail before bounded recovery', async () => {
+  for (const unread of [0, 1, null]) {
+    let fail = true;
+    const injected: string[] = [];
+    const f = fixture({
+      readUnread: () => unread,
+      ptyInjector: async () => async (_id, line) => {
+        if (fail) throw new Error('temporary PTY failure');
+        injected.push(line);
+      },
+    });
+    expect(await wakeRecipient('OPT', 11, { from: 'OP' }, f.deps)).toMatchObject({ result: 'failed' });
+    fail = false;
+    if (unread === 0) {
+      expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'dropped-read', count: 1 }]);
+      expect(injected).toEqual([]);
+    } else {
+      f.setTurn('busy');
+      expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'waiting', count: 1, reason: 'turn=busy' }]);
+      expect(injected).toEqual([]);
+      f.setTurn('idle');
+      expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'redelivered', count: 1 }]);
+      expect(injected).toEqual(['[우편 깨움 · 미룬 1통] OP → OPT #11 — eln msg list --to OPT 로 읽고 처리']);
+    }
+    expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+  }
+});
+
+test('AUTO-WAKE-EXPANSION: first-failure recovery honors revoked consent and retry cap', async () => {
+  let optIn = true;
+  const f = fixture({ hasOptIn: () => optIn, readUnread: () => 1, ptyInjector: async () => async () => { throw new Error('PTY unavailable'); } });
+  expect((await wakeRecipient('OPT', 12, { from: 'OP' }, f.deps)).result).toBe('failed');
+  for (let attempt = 1; attempt < MAX_REDELIVER_ATTEMPTS; attempt++) {
+    expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'failed', count: 1, reason: 'PTY unavailable' }]);
+  }
+  expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'gave-up', count: 1,
+    reason: `attempts>=${MAX_REDELIVER_ATTEMPTS}:PTY unavailable` }]);
+  expect(await redeliverPendingWakes(f.deps)).toEqual([]);
+  await wakeRecipient('OPT', 13, { from: 'OP' }, f.deps);
+  optIn = false;
+  expect(await redeliverPendingWakes(f.deps)).toEqual([{ seat: 'OPT', result: 'gave-up', count: 1, reason: 'human-pane-no-opt-in' }]);
+});
+
 test('several posts inside the debounce window fold into one redelivery that waits for the window too', async () => {
   const f = fixture();
   expect((await wakeRecipient('OPT', 20, { from: 'OP' }, f.deps)).result).toBe('injected');

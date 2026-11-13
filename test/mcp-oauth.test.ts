@@ -115,7 +115,7 @@ beforeEach(() => {
   universeDir = mkdtempSync(join(tmpdir(), 'mcp-oauth-universe-'));
   prevStateDir = process.env.ELANOUS_STATE_DIR;
   prevXdg = process.env.XDG_CONFIG_HOME;
-  // ⛔ 기본 자격 파일은 전역(authStorePath)이다 — 시험은 XDG 로 그 자리를 tmp 에 못 박는다.
+  // XDG is unrelated to the selected config/auth universe.
   process.env.XDG_CONFIG_HOME = storeDir;
   process.env.ELANOUS_STATE_DIR = universeDir;
 });
@@ -217,30 +217,32 @@ describe('RFC 7591 dynamic registration', () => {
   });
 });
 
-describe('global store path (isolation manual §6)', () => {
-  test('credential file is the global auth store, not under effectiveInstanceRoot()', () => {
+describe('credential store follows the selected universe', () => {
+  test('credential file uses the selected universe rather than XDG', () => {
     const path = mcpOAuthStorePath();
     expect(path).toBe(authStorePath());
-    expect(path).toBe(join(storeDir, 'elanous', 'auth.json'));
-    expect(path.startsWith(resolve(universeDir))).toBe(false);
+    expect(path).toBe(join(universeDir, 'auth.json'));
+    expect(path.startsWith(resolve(storeDir))).toBe(false);
     expect(path).not.toBe(join(homedir(), '.elanous', 'auth.json'));
   });
 
-  test('a credential stranded under the universe root is adopted once, add-only', () => {
-    const legacy = join(universeDir, 'auth.json');
+  test('a credential in another universe is not adopted', () => {
+    const legacy = join(storeDir, 'elanous', 'auth.json');
     saveTokens(
       ISSUER,
       { accessToken: 'stranded-access', refreshToken: 'stranded-refresh', expiresAt: Date.now() + 3600_000 },
       { authMode: 'mcp-oauth', accountUuid: 'stranded-client', mirrorCodex: false },
       legacy,
     );
+    expect(loadStoredAccessToken(ISSUER)).toBeNull();
+    expect(loadTokens(ISSUER, mcpOAuthStorePath())).toBeNull();
+    // Selecting that universe exposes its own credential without copying it.
+    process.env.ELANOUS_STATE_DIR = join(storeDir, 'elanous');
     expect(loadStoredAccessToken(ISSUER)).toBe('stranded-access');
-    const adopted = loadTokens(ISSUER, mcpOAuthStorePath());
-    expect(adopted?.tokens.refreshToken).toBe('stranded-refresh');
     expect(loadStoredRegistration(ISSUER)?.clientId).toBe('stranded-client');
   });
 
-  test('adoption never overwrites a credential already in the global store', () => {
+  test('another universe never overwrites the selected credential', () => {
     saveTokens(
       ISSUER,
       { accessToken: 'global-access', refreshToken: 'global-refresh', expiresAt: Date.now() + 3600_000 },
@@ -251,18 +253,18 @@ describe('global store path (isolation manual §6)', () => {
       ISSUER,
       { accessToken: 'old-access', refreshToken: 'old-refresh', expiresAt: Date.now() + 3600_000 },
       { authMode: 'mcp-oauth', mirrorCodex: false },
-      join(universeDir, 'auth.json'),
+      join(storeDir, 'elanous', 'auth.json'),
     );
     expect(loadStoredAccessToken(ISSUER)).toBe('global-access');
     expect(loadTokens(ISSUER, mcpOAuthStorePath())?.tokens.refreshToken).toBe('global-refresh');
   });
 
-  test('non-MCP records under the universe root are not adopted', () => {
+  test('non-MCP records in another universe are not adopted', () => {
     saveTokens(
       ISSUER,
       { accessToken: 'other-mode', refreshToken: '', expiresAt: Date.now() + 3600_000 },
       { authMode: 'chatgpt', mirrorCodex: false },
-      join(universeDir, 'auth.json'),
+      join(storeDir, 'elanous', 'auth.json'),
     );
     expect(loadStoredAccessToken(ISSUER)).toBeNull();
     expect(loadTokens(ISSUER, mcpOAuthStorePath())).toBeNull();

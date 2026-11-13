@@ -19,7 +19,9 @@ test('ticket design becomes an unpriced single-GCP proposal; purchase path stays
     expect(proposal.comparisonRegion).toBe('us-central1');
     expect(proposal.estimate.price).toBe('unpriced');
     expect(proposal.security.grade).toBe('internal');
-    expect(proposal.ticketDesign.localComponents).toContain('결제');
+    expect(proposal.ticketDesign.localComponents).toContain('Booking API');
+    expect(proposal.ticketDesign.localComponents).toContain('Seat ledger');
+    expect(proposal.ticketDesign.offloadWorkload).toBe('비식별 이벤트 집계·리포트 생성');
     expect(proposal.realGcpCalls).toBe(0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -44,8 +46,8 @@ test('sensitive or non-retryable ticketing workload fails before proposal output
   try {
     const input = join(dir, 'design.json');
     const design = JSON.parse(readFileSync(join(import.meta.dir, '../../../../plugins/gcp-architect-expand/demo/fixtures/ticketing-design.json'), 'utf8'));
-    design.containsPii = true;
-    design.retryable = false;
+    design.designResult.containsPii = true;
+    design.designResult.retryable = false;
     writeFileSync(input, JSON.stringify(design));
     const output = join(dir, 'proposal.json');
     const result = spawnSync('bun', [join(import.meta.dir, '../../../../scripts/gcp-architect-expand/demo/propose.ts'), '--ticket-design', input,

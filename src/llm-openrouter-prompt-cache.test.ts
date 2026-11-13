@@ -3,7 +3,7 @@ import type { LLMToolSpec } from './llm/tool-spec.js';
 import { expect, test } from 'bun:test';
 import { getProviderForConfig, type LLMMessage } from './llm.js';
 import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import type { UserConfig } from './user-config/types.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Read', description: 'read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
@@ -18,7 +18,7 @@ const loop: LLMMessage[] = [
 
 async function capture(provider: string, model: string, opts: Record<string, unknown> = {}) {
   const bodies: string[] = [];
-  await withFakeFetchDevice([
+  await withRealProviderFakeFetchDevice([
     { url: '/api/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
     { url: '/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
   ], async (device) => {

@@ -61,7 +61,7 @@ export function createGlobalSubagentCallable(
   // Fall back to the builtin loader — the same order `dispatchAgent` uses.
   const resolveDefinition = opts.resolveDefinition ?? ((name: string) => resolveAgentLayered(name) ?? resolveAgent(name));
 
-  return async ({ definitionName, prompt, model, signal }) => {
+  return async ({ definitionName, prompt, model, providerName, signal }) => {
     const startedAt = Date.now();
     const definition = resolveDefinition(definitionName);
     if (!definition) {
@@ -104,6 +104,13 @@ export function createGlobalSubagentCallable(
     }
 
     let childSignal: AbortSignal | undefined;
+    if (providerName && providerName !== 'grok') throw new Error('TOX fallback provider is not supported');
+    const selectedProvider = providerName
+      ? (await import('../llm.js')).PROVIDERS[providerName]
+      : opts.provider;
+    if (providerName && (!selectedProvider || selectedProvider.name !== providerName)) {
+      throw new Error('TOX fallback provider unavailable');
+    }
     const handle = registry.spawn({
       definition: effectiveDefinition,
       prompt,
@@ -114,7 +121,7 @@ export function createGlobalSubagentCallable(
           return opts.dispatchTool!(name, args, childSignal);
         }
         : undefined,
-      provider: opts.provider,
+      provider: selectedProvider,
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
     });
     childSignal = handle.task.controller?.signal;

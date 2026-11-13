@@ -1,6 +1,6 @@
 import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -375,9 +375,11 @@ describe('runMcpDiagnose HTTP loopback', () => {
   });
 
   test('configured OAuth issuer reuses a stored credential without printing it', async () => {
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
     const previousXdg = process.env.XDG_CONFIG_HOME;
     const configDir = mkdtempSync(join(tmpdir(), 'mcp-diagnose-oauth-'));
     process.env.XDG_CONFIG_HOME = configDir;
+    process.env.ELANOUS_STATE_DIR = configDir;
     const issuer = 'https://issuer.example.test';
     const token = 'diagnose-stored-token';
     saveTokens(
@@ -420,13 +422,18 @@ describe('runMcpDiagnose HTTP loopback', () => {
       await loop.close();
       if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousXdg;
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(configDir, { recursive: true, force: true });
     }
   });
 
   test('OAuth authentication failure distinguishes missing credentials from rejected stored credentials', async () => {
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
     const previousXdg = process.env.XDG_CONFIG_HOME;
     const configDir = mkdtempSync(join(tmpdir(), 'mcp-diagnose-oauth-failure-'));
     process.env.XDG_CONFIG_HOME = configDir;
+    process.env.ELANOUS_STATE_DIR = configDir;
     const issuer = 'https://issuer.example.test';
     const loop = await listenLoopback((_req, res) => {
       res.writeHead(401);
@@ -452,6 +459,9 @@ describe('runMcpDiagnose HTTP loopback', () => {
       await loop.close();
       if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousXdg;
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(configDir, { recursive: true, force: true });
     }
   });
 

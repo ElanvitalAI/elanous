@@ -83,6 +83,8 @@ export interface GuardianCostSnapshot {
 export interface HostReadinessHeartbeat {
   host: string;
   at: string;
+  /** Start of the current successful sample or failed-probe streak; at remains the latest observed tick. */
+  freshnessAt?: string;
   sshAvailable: boolean;
   maintenance: boolean;
   gateProtected: boolean;
@@ -93,6 +95,8 @@ export interface HostReadinessHeartbeat {
     memoryAvailablePercent: number;
     rootDiskUsedPercent: number;
     tmpDiskUsedPercent: number;
+    rootDiskFreeGb?: number;
+    tmpDiskFreeGb?: number;
   };
 }
 
@@ -326,16 +330,23 @@ function parseResourceLedgerEventsWithObservations(text: string): {
     }
     if (eventType === 'host-readiness-heartbeat') {
       const heartbeat = row.heartbeat;
-      // Source: BRIEF-LOCAL-FIRST-PLACEMENT-1111.md, all readiness resource values are percentages from 0 to 100.
+      const freshnessAt = isRecord(heartbeat) ? heartbeat.freshnessAt : undefined;
+      // Readiness load-per-core may exceed 100%; memory and disk percentages stay within 0–100.
       const isPercent = (sample: unknown) => typeof sample === 'number' && Number.isFinite(sample) && sample >= 0 && sample <= 100;
+      const isNonNegativeMetric = (sample: unknown) => typeof sample === 'number' && Number.isFinite(sample) && sample >= 0;
+      const sample = isRecord(heartbeat) && isRecord(heartbeat.sample) ? heartbeat.sample : undefined;
       if (!isRecord(heartbeat) || !validHost(String(heartbeat.host ?? '')) || !validTimestamp(heartbeat.at)
+        || (freshnessAt !== undefined && (typeof freshnessAt !== 'string' || !validTimestamp(freshnessAt)
+          || Date.parse(freshnessAt) > Date.parse(String(heartbeat.at))))
         || heartbeat.at !== row.at || typeof heartbeat.sshAvailable !== 'boolean'
         || typeof heartbeat.maintenance !== 'boolean' || typeof heartbeat.gateProtected !== 'boolean'
         || !isRecord(heartbeat.tools) || !Object.entries(heartbeat.tools).every(([tool, available]) => validGuardianText(tool) && typeof available === 'boolean')
-        || (heartbeat.sample !== undefined && (!isRecord(heartbeat.sample)
-          || !isPercent(heartbeat.sample.loadPercent) || !isPercent(heartbeat.sample.load15Percent)
-          || !isPercent(heartbeat.sample.memoryAvailablePercent) || !isPercent(heartbeat.sample.rootDiskUsedPercent)
-          || !isPercent(heartbeat.sample.tmpDiskUsedPercent))))
+        || (heartbeat.sample !== undefined && (!sample
+          || !isNonNegativeMetric(sample.loadPercent) || !isNonNegativeMetric(sample.load15Percent)
+          || !isPercent(sample.memoryAvailablePercent) || !isPercent(sample.rootDiskUsedPercent)
+          || !isPercent(sample.tmpDiskUsedPercent)
+          || ['rootDiskFreeGb', 'tmpDiskFreeGb'].some(key => sample[key] !== undefined
+            && (!Number.isFinite(sample[key]) || Number(sample[key]) < 0)))))
         throw new Error(`resource ledger invalid host readiness heartbeat at line ${index + 1}`);
     }
     if (eventType === 'train-worker-policy') {

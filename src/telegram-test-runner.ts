@@ -35,6 +35,18 @@ import { createNexusTelegramTriggerBot } from './nexus/api/telegram-trigger-bot.
  *  the test bot writes to, without duplicating the path literal. */
 export const DEFAULT_TELEGRAM_TEST_STATE_DIR = join(homedir(), '.elanous', 'telegram-test');
 
+/** Only an isolated test runner may redirect Bot API traffic to a loopback fake. */
+export function telegramTestApiBase(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error('telegram-test: invalid API base URL'); }
+  if (url.protocol !== 'http:' || !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+    || url.pathname !== '/' || url.search || url.hash || url.username || url.password) {
+    throw new Error('telegram-test: API base must be a bare loopback HTTP origin');
+  }
+  return url.origin;
+}
+
 export interface TelegramTestRunnerOpts {
   /** Optional override; when omitted the token comes from
    *  `telegram.testChannel.botToken` in the production config. */
@@ -120,6 +132,7 @@ export async function runTelegramTestMessenger(opts: TelegramTestRunnerOpts = {}
   // entry 파라미터(--token/--allow override 반영) — 전역도 이미 test-safe 라
   // 이중 안전. builder 는 override 적용층으로 유지.
   const testCfg = buildTelegramTestConfig(cfg, token, allowedUsers);
+  const apiBase = telegramTestApiBase(process.env.ELANOUS_TELEGRAM_API_BASE);
 
   // `nexus run --test` 와 같은 테스트 토큰을 쓴다 — 동시에 폴링하면 409 로 메시지를 나눠 먹는다.
   const { acquireTelegramPollLock } = await import('./telegram-poll-lock.js');
@@ -132,6 +145,7 @@ export async function runTelegramTestMessenger(opts: TelegramTestRunnerOpts = {}
 
   const handle = createNexusTelegramTriggerBot({
     token,
+    ...(apiBase ? { apiBase } : {}),
     allowedUsers,
     // No workflow-runtime triggers in test mode — pure inbound Q&A/agent.
     dispatch: async () => undefined,

@@ -49,8 +49,10 @@ import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-miss
 import { resolveVerifiedMemberOwner as resolveVerifiedAppMemberOwner, resolveVerifiedOwner, type NexusAppHost } from '../apps/app-host.js';
 import type { AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
 import type { AppSimulationSnapshot } from '../apps/app-simulation.js';
+import { AppVersionConflict, openAppVersionStore, type AppVersionStore, type AppVersionCheckpointInput } from '../apps/app-versions.js';
 import { consoleAddress, publicAppAddress, simulationPreviewAddress } from '../apps/console-address.js';
 import { connectRelayHost, loadOrCreateRelayHostIdentity, type RelayHostConnection } from '../../relay/host-connector.js';
+import { createRelayMemberTokenProvider, readRelayMemberKeyFile } from '../../relay/member-token-provider.js';
 import { resolvePublicAppUserId } from '../../relay/relay-server.js';
 import { elanousConfigDir } from '../config/paths.js';
 
@@ -192,6 +194,8 @@ import { handleProjectAutopsy } from './project-autopsy.js';
 import { handleRoleJudge } from './role-judge.js';
 import { handleAudioStt } from './audio-stt.js';
 import { handleScraps, type ScrapsRouteOptions } from './scraps.js';
+import { issueTelegramMemberCode } from '../../telegram-member-scrap.js';
+import { createAbsorbShareSummaryRequestApi, publishAbsorbShareSummaryResults, resolveVerifiedShareSummaryOwner, shareSummaryNexusEvent } from './share-summary-requests.js';
 import { handleLlmModels } from './llm-models.js';
 import { handleLlmHostsConfig } from './llm-hosts-config.js';
 import { handleLlmRotationGet, handleLlmRotationNext } from './llm-rotation.js';
@@ -614,6 +618,8 @@ export interface NexusHttpServerOpts {
   capabilityProviders?: GraphCapabilityRegistry;
   /** Nexus state-directory event journal shared by `store.events@1` and member board routes. */
   boardEventStore?: MemberEventStore;
+  /** Test-world LLM response seam; production uses the configured operating provider. */
+  shareSummaryGenerator?: import('./share-summary-requests.js').ShareSummaryRequestOptions['generateSummary'];
   /** Plugin-owned handler for an explicitly approved member card. */
   boardApprovalDispatch?: BoardApiDeps['dispatchApproved'];
   /** Resolves the asynchronously booted configured MCP clients on each resource request. */
@@ -647,6 +653,8 @@ export interface NexusHttpServerOpts {
    *  `<slug>.app.localhost` hostname. Known app hosts never fall through to PWA/API routes. */
   appHost?: NexusAppHost;
   /** Durable lifecycle projection used by app tiles; missing rows remain null rather than inventing state. */
+  /** App-version persistence override for isolated simulation worlds. Production opens the instance store per request. */
+  appVersionStore?: () => AppVersionStore;
   appLifecycleSnapshot?: (appSlug: string) => AppLifecycleSnapshot | null;
   /** Simulation-only UI projection, isolated from the live lifecycle ledger. */
   appSimulationSnapshot?: (appSlug: string) => AppSimulationSnapshot;
@@ -823,6 +831,20 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
   const range = opts.portRange ?? NEXUS_HTTP_PORT_RANGE;
   const hostname = opts.hostname ?? '127.0.0.1';
   const portProbe = opts.portProbe ?? probeNexusHttpPort;
+  const relayConfig = resolveNexusRelayConfig(getUserConfig());
+  // Reject explicit malformed member mode before binding a listener, even if
+  // the app host is currently absent and would otherwise disable the relay.
+  if (relayConfig.enabled && Boolean(relayConfig.memberNexusUrl) !== Boolean(relayConfig.memberKeyFile))
+    throw new Error('relay member Nexus URL and key file must be valid and configured together');
+  if (relayConfig.enabled && relayConfig.memberNexusUrl)
+    createRelayMemberTokenProvider({ nexusUrl: relayConfig.memberNexusUrl, readMemberKey: () => '' });
+  const relayConfigured = relayConfig.enabled && !!opts.appHost && !!relayConfig.url;
+  const memberKeyPath = relayConfigured && relayConfig.memberKeyFile
+    ? (isAbsolute(relayConfig.memberKeyFile) ? relayConfig.memberKeyFile : resolve(elanousConfigDir(), relayConfig.memberKeyFile))
+    : undefined;
+  const getMemberToken = relayConfigured && relayConfig.memberNexusUrl && memberKeyPath
+    ? createRelayMemberTokenProvider({ nexusUrl: relayConfig.memberNexusUrl,
+      readMemberKey: () => readRelayMemberKeyFile(memberKeyPath) }) : undefined;
   // P-2D.2 — every request reads from this ref. Admin endpoint
   // mutates it. When the caller didn't pass one we own the lifecycle.
   const devProxyRef: DevProxyRuntimeRef = opts.devProxyRef ?? createDevProxyRuntimeRef();
@@ -913,7 +935,7 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
   }
 
   const stopBoardEventSubscription = opts.boardEventStore?.subscribe?.(event => {
-    const nexusEvent = boardCardNexusEvent(event);
+    const nexusEvent = boardCardNexusEvent(event) ?? shareSummaryNexusEvent(event);
     if (nexusEvent) pushEvent(opts.state, nexusEvent);
   });
 
@@ -925,7 +947,6 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
   let relayRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let relayRetryDelayMs = 1_000;
   let relayConnecting = false;
-  const relayConfig = resolveNexusRelayConfig(getUserConfig());
   if (relayConfig.enabled) {
     if (!opts.appHost || !relayConfig.url) {
       debug.log('nexus.relay-host', 'disabled', { reason: !opts.appHost ? 'app-host-not-wired' : 'relay-url-missing' });
@@ -954,6 +975,7 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
             relayUrl: relayConfig.url!,
             daemonKeys: identity.daemonKeys,
             hostSigningKey: identity.hostSigningKey,
+            ...(getMemberToken ? { getMemberToken } : {}),
             handleRequest: request => opts.appHost!.handle(request),
             onError: error => debug.log('nexus.relay-host', 'request-error', { serverId: identity.serverId, errorType: error.name }),
             onClose: scheduleRelayRetry,
@@ -1194,6 +1216,53 @@ export async function routeRequest(
   const resolvedAppResponse = appResponse instanceof Promise ? await appResponse : appResponse;
   if (resolvedAppResponse) return resolvedAppResponse;
   const requestPath = new URL(req.url).pathname;
+  const appVersionsMatch = /^\/v1\/apps\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\/versions(?:\/(checkpoints))?$/.exec(requestPath);
+  if (appVersionsMatch) {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    const appId = appVersionsMatch[1]!;
+    if (!opts.appHost?.getManifest(appId)) return jsonResponse({ error: 'app-not-found' }, 404);
+    const saving = appVersionsMatch[2] === 'checkpoints';
+    if (req.method !== (saving ? 'POST' : 'GET')) return jsonResponse({ error: 'method-not-allowed' }, 405);
+    const environment = new URL(req.url).searchParams.get('environment');
+    if (environment !== null && environment !== 'simulation' && environment !== 'live') return jsonResponse({ error: 'invalid-environment' }, 400);
+    let input: AppVersionCheckpointInput | undefined;
+    if (saving) {
+      try {
+        const reader = req.body?.getReader();
+        if (!reader) throw new Error('invalid checkpoint');
+        let text = '';
+        let bytes = 0;
+        const decoder = new TextDecoder();
+        for (;;) {
+          const part = await reader.read();
+          if (part.done) break;
+          bytes += part.value.byteLength;
+          if (bytes > 4096) { await reader.cancel(); return jsonResponse({ error: 'checkpoint-too-large' }, 413); }
+          text += decoder.decode(part.value, { stream: true });
+        }
+        const body: unknown = JSON.parse(text + decoder.decode());
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || Object.keys(body).some(key => !['eventId', 'trigger', 'summary', 'thumbnailObjectKey'].includes(key))) throw new Error('invalid checkpoint');
+        input = body as AppVersionCheckpointInput;
+      } catch { return jsonResponse({ error: 'invalid-checkpoint' }, 400); }
+    }
+    let store: AppVersionStore | undefined;
+    try {
+      store = (opts.appVersionStore ?? openAppVersionStore)();
+      const result = saving ? { checkpoint: store.checkpoint(appId, input!) }
+        : { versions: store.list(appId, environment ?? undefined) };
+      const response = jsonResponse(result, saving ? 201 : 200);
+      response.headers.set('cache-control', 'no-store');
+      return response;
+    } catch (error) {
+      if (error instanceof AppVersionConflict) return jsonResponse({ error: 'checkpoint-evidence-conflict' }, 409);
+      if (saving && error instanceof Error && error.message === 'invalid checkpoint') return jsonResponse({ error: 'invalid-checkpoint' }, 400);
+      debug.log('nexus.app-versions', 'store-unavailable', { appId });
+      return jsonResponse({ error: 'app-versions-unavailable' }, 503);
+    } finally { store?.close(); }
+  }
+
   if (requestPath === '/v1/apps') {
     if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
@@ -1469,7 +1538,7 @@ export async function routeRequest(
     && !graphWebhookSelfVerified
     && !(pathname === '/v1/events' && (() => {
       const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
-      return topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready');
+      return topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready' || topic === 'scrap.summary.result');
     })())
   ) {
     const fallbackToken = runtimeLessMetaRoute ? ensureAuthToken().token : undefined;
@@ -1501,12 +1570,39 @@ export async function routeRequest(
     const response = await membersApi.handle(req, networkKey ?? 'unknown');
     if (response) return response;
   }
-  if (pathname === '/v1/scraps') {
+  if (pathname === '/v1/telegram/member-enrollment') {
+    if (method !== 'POST') return jsonResponse({ error: 'method not allowed' }, 405);
+    if (!opts.scraps) return jsonResponse({ error: 'scraps-not-wired' }, 503);
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
+    const headers = new Headers();
+    for (const name of ['cookie', 'origin', 'authorization']) {
+      const value = req.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+    const profileResponse = await membersApi.handle(new Request(new URL('/v1/members', req.url), { headers }), 'unknown');
+    const profile = profileResponse?.ok ? await profileResponse.json() as { member?: { id?: unknown } } : null;
+    let memberId = profile?.member?.id;
+    if (typeof memberId !== 'string' || !memberId) {
+      const ownerResponse = await membersApi.handle(new Request(new URL('/v1/members/owner', req.url), { headers }), 'unknown');
+      const owner = ownerResponse?.ok ? await ownerResponse.json() as { memberId?: unknown } : null;
+      memberId = owner?.memberId;
+    }
+    if (typeof memberId !== 'string' || !memberId) return jsonResponse({ error: 'unauthorized' }, 401);
+    return jsonResponse({ code: issueTelegramMemberCode(opts.scraps.instanceRoot, memberId), expiresInSeconds: 600 });
+  }
+  if (pathname === '/v1/scraps' || pathname === '/v1/scrap-folders'
+    || /^\/v1\/scrap-folders\/[a-f0-9-]{36}$/.test(pathname)
+    || /^\/v1\/scraps\/[a-f0-9]{16}\/(folder|class-date|export)$/.test(pathname)) {
     if (!opts.scraps) return jsonResponse({ error: 'scraps-not-wired' }, 503);
     const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
     if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
     return handleScraps(req, {
       ...opts.scraps,
+      onSettled: opts.boardEventStore ? (memberId, scrapId) => publishAbsorbShareSummaryResults({
+        instanceRoot: opts.scraps!.instanceRoot, events: opts.boardEventStore!, memberId, scrapId,
+        generateSummary: opts.shareSummaryGenerator,
+      }) : undefined,
       resolveOwner: async (scrapRequest) => {
         const ownerUrl = new URL('/v1/members/owner', scrapRequest.url);
         const headers = new Headers();
@@ -1523,6 +1619,21 @@ export async function routeRequest(
         return { memberId: (owner as { memberId: string }).memberId };
       },
     });
+  }
+  if (pathname === '/v1/scraps/summary-requests' || pathname.startsWith('/v1/scraps/summary-requests/')) {
+    if (!opts.scraps || !opts.boardEventStore) return jsonResponse({ error: 'summary-requests-not-wired' }, 503);
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
+    const api = createAbsorbShareSummaryRequestApi({
+      instanceRoot: opts.scraps.instanceRoot,
+      events: opts.boardEventStore,
+      generateSummary: opts.shareSummaryGenerator,
+      ownerForRequest: async request => {
+        const owner = await resolveVerifiedShareSummaryOwner(request, membersApi);
+        return owner?.memberId ?? null;
+      },
+    });
+    return (await api(req)) ?? jsonResponse({ error: 'not-found' }, 404);
   }
   // OAuth 동적 클라이언트 등록(RFC 7591) — Elanous 는 OAuth 를 쓰지 않는다. 405 대신 «이렇게 등록하라»를 돌려준다.
   if (method === 'POST' && pathname === '/register') {
@@ -3629,17 +3740,22 @@ export async function routeRequest(
     const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
     const hasBoardTopic = topics.includes('board.card');
     const hasBriefingTopic = topics.includes('briefing.ready');
-    const memberOnlyTopics = topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready');
+    const hasSummaryTopic = topics.includes('scrap.summary.result');
+    const memberOnlyTopics = topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready' || topic === 'scrap.summary.result');
     const operatorAuthorized = !!opts.metaApi && !!bearerCredential(req, opts.metaApi);
     if (hasBoardTopic && !memberOnlyTopics && !operatorAuthorized) {
       return jsonResponse({ error: 'member_topic_must_be_isolated' }, 400);
     }
     if (hasBriefingTopic && !memberOnlyTopics && !operatorAuthorized) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (hasSummaryTopic && !memberOnlyTopics) return jsonResponse({ error: 'member_topic_must_be_isolated' }, 400);
     const needsMemberScope = memberOnlyTopics;
+    const memberApi = opts.membersApi ?? defaultMembersApi(opts.appHost);
     const owner = needsMemberScope
-      ? await resolveVerifiedMemberOwner(req, opts.membersApi ?? defaultMembersApi(opts.appHost), opts.appHost?.slugs)
+      ? hasSummaryTopic && memberApi
+        ? await resolveVerifiedShareSummaryOwner(req, memberApi)
+        : await resolveVerifiedMemberOwner(req, memberApi, opts.appHost?.slugs)
       : null;
-    if (needsMemberScope && !owner && (!operatorAuthorized || (hasBoardTopic && !hasBriefingTopic))) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (needsMemberScope && !owner && (hasSummaryTopic || !operatorAuthorized || (hasBoardTopic && !hasBriefingTopic))) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleSseEvents(opts.eventBus, url, owner?.memberId ?? (operatorAuthorized ? { operatorBriefings: true } : undefined));
   }
   // Phase 0.5 (2026-05-08) — intent-prediction REST + SSE.

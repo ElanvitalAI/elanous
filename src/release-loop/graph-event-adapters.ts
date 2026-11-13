@@ -5,7 +5,6 @@ import { debug } from '../debug/log.js';
 import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { openMsgStore, type MsgStore } from '../msg/msg-store.js';
 import { listCoordEvents } from '../context-bus/coord-events.js';
-import { releaseRunContextSummary } from '../context-bus/context-now.js';
 import { recordExternalEvent, type ExternalEventInput } from '../context-bus/external-events.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { appendReleaseStageMail, emitReleaseStageTransition, type ReleaseStageMailInput, type ReleaseStageState } from './stage-mail.js';
@@ -92,11 +91,19 @@ export function registerReleaseGraphEventAdapters(
   const summaryIntervalMs = Number.isSafeInteger(deps.summaryIntervalMs) && (deps.summaryIntervalMs ?? 0) > 0
     ? deps.summaryIntervalMs! : RELEASE_RUN_OP_SUMMARY_INTERVAL_MS;
   let lastSummarySlot: number | undefined;
-  const releaseSummary = deps.releaseSummary ?? (() => releaseRunContextSummary(scope.runId, {
-    stateRoot: deps.root,
-    ledgerRoot: deps.ledgerRoot ?? releaseLedgerRoot(),
-    events: contextDb ? listCoordEvents({ since: '2000-01-01T00:00:00.000Z', seat: 'release-graph' }, { db: contextDb }) : [],
-  }));
+  const releaseSummary = deps.releaseSummary ?? (() => {
+    // Lazy require — a static context-now import here re-closes the runtime import cycle
+    // registry → graph-runner → adapters → context-now → loops-table → registry (guard:
+    // src/loops/checker-registry-cycle.test.ts; edge first added by PR #36009). Same
+    // lazy-load idiom as user-config.ts resolveActiveProvider.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { releaseRunContextSummary } = require('../context-bus/context-now.js') as typeof import('../context-bus/context-now.js');
+    return releaseRunContextSummary(scope.runId, {
+      stateRoot: deps.root,
+      ledgerRoot: deps.ledgerRoot ?? releaseLedgerRoot(),
+      events: contextDb ? listCoordEvents({ since: '2000-01-01T00:00:00.000Z', seat: 'release-graph' }, { db: contextDb }) : [],
+    });
+  });
   const publishReleaseSummary = () => {
     const slot = Math.floor((deps.now?.() ?? Date.now()) / summaryIntervalMs);
     if (slot === lastSummarySlot) return;

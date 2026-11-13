@@ -20,6 +20,7 @@ import { decryptSecretBundle, encryptSecretBundle } from '../nexus/config/secret
 import { SECRETS_VERSION } from '../nexus/config/types.js';
 import { parseSecretEnvFile, renderSecretEnvExports } from '../nexus/config/secrets/env-import.js';
 import { registerCredCommands } from './cred-cli.js';
+import { registerCredentialsMigrationCommands } from './credentials-migration-cli.js';
 import { appSecretId, appSecretIdForExistingApp } from '../nexus/config/secrets/app-secret-ledger.js';
 import type { SecretBackendId } from '../nexus/config/secrets/types.js';
 import { revokeAppSecretValues, setAppSecretValue, type AppSecretRevokeResult } from '../nexus/config/secrets/file-backend.js';
@@ -158,6 +159,7 @@ function resolveDeps(deps: SecretCliDeps) {
 
 export function registerSecretCommands(program: Command, deps: SecretCliDeps = {}): Command {
   const cli = resolveDeps(deps);
+  registerCredentialsMigrationCommands(program);
   const cred = registerCredCommands(program, {
     listSecrets: cli.listSecrets,
     getSecret: cli.getSecret,

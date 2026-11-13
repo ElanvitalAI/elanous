@@ -1,4 +1,5 @@
 import { runLocalHarnessCommand } from '../../tui-client/local-harness-command.js';
+import { goalFilePath, runGoalFileHarnessCommand } from '../../tui-client/goal-file-harness-command.js';
 
 export type NextTuiHarnessCommand = { readonly command: 'ask'; readonly goal: string }
   | { readonly command: 'runs'; readonly goal: '' };
@@ -28,5 +29,13 @@ export function runNextTuiHarnessBranchRoute(
   onLine: (line: string) => void,
   run: NextTuiHarnessRunner = runLocalHarnessCommand,
 ): Promise<void> {
+  if (request.command === 'ask') {
+    // Keep quoted paths intact; only an unquoted standalone token is a CLI flag.
+    const words: string[] = request.goal.match(/"[^"]*"|'[^']*'|\S+/gu) ?? [];
+    const dryRun = words.includes('--dry-run');
+    const input = dryRun ? words.filter(word => word !== '--dry-run').join(' ') : request.goal;
+    const path = goalFilePath(input);
+    if (path) return runGoalFileHarnessCommand(path, dryRun, signal, onLine);
+  }
   return run(request.command, request.goal, signal, onLine);
 }

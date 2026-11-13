@@ -46,8 +46,14 @@ test('KAIST-SIGNUP-APP-SLOT: fake Google signup creates one isolated app slot an
         `${FAKE_MEMBER_OIDC_REDIRECT_URI}?code=${authorization.code}&state=${authorization.state}`,
         { headers: { cookie: authorization.stateCookie } },
       ));
-      expect(callback?.status).toBe(200);
-      return callback!.headers.get('set-cookie')!.split(';', 1)[0]!;
+      expect(callback?.status).toBe(303);
+      const location = callback!.headers.get('location') ?? '';
+      expect(new URL(location).pathname).toBe('/v1/members/home');
+      const sessionCookie = callback!.headers.get('set-cookie')!.split(';', 1)[0]!;
+      expect(sessionCookie.startsWith('__Host-elanous_member_session=')).toBe(true);
+      const home = await world.membersApi.handle(new Request(location, { headers: { cookie: sessionCookie } }));
+      expect(home?.status).toBe(200);
+      return sessionCookie;
     }));
     const members = await Promise.all(sessions.map(async sessionCookie => {
       const profile = await world.membersApi.handle(new Request('https://members.example.test/v1/members', {
@@ -178,7 +184,8 @@ test('fake-member-oidc-world test Nexus issues a real app-slot bearer that autho
       FormData: class { get(name: string) { return ({ privacy: 'on', terms: 'on', eventCode: 'KAIST-IPHONE-SIM' } as Record<string, string>)[name] ?? null; } },
       URLSearchParams,
       fetch: async (url: string, init: RequestInit) => {
-        const response = await browserFetch(url, { ...init, headers: { ...Object.fromEntries(new Headers(init.headers)), origin: new URL(nexus!.url).origin } });
+        // The browser app is hosted at the member web origin; the local Nexus URL is only the test transport.
+        const response = await browserFetch(url, { ...init, headers: { ...Object.fromEntries(new Headers(init.headers)), origin: 'https://app.example.test' } });
         if (new URL(url, nexus!.url).pathname === '/v1/members' && init.method === 'POST') browserSignupStartResponse = response;
         return response;
       },
@@ -187,10 +194,11 @@ test('fake-member-oidc-world test Nexus issues a real app-slot bearer that autho
     });
     expect(submit).toBeTypeOf('function');
     await submit!({ preventDefault() {} });
+    expect(browserSignupStartResponse?.status).toBe(201);
     expect(status.textContent).toBe('Google 로그인으로 이동합니다…');
     expect(authorizationUrlFromPage).toMatch(/^https:\/\//);
     const started = browserSignupStartResponse!;
-    expect(started.status).toBe(201);
+    expect(started.headers.get('access-control-allow-origin')).toBe('https://app.example.test');
     expect(browserCookies.size).toBe(1);
     const stateCookie = [...browserCookies.values()][0]!;
     expect(stateCookie).toMatchObject({ secure: true, httpOnly: true, sameSite: 'Lax', path: '/' });

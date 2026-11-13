@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import type { MiniBoardCard } from '@/lib/mini-board-projection';
 import type { MemberMiniBoardApi, VerifiedMemberOwner } from '@/lib/member-mini-board-api';
 import {
-  MINI_BOARD_COLUMNS, msUntilNextSeoulMidnight, projectMemberBoardCards, rowsForVerifiedMember, rowsFromApi, todayInSeoul,
+  MINI_BOARD_COLUMNS, msUntilNextSeoulMidnight, projectMemberBoardCards, recheckedBriefing, rowsForVerifiedMember, rowsFromApi, todayInSeoul,
   type BriefingCard, type MemberBoardCard, type MemberBoardAttachment,
 } from './member-board-model';
 
@@ -49,6 +49,9 @@ export function MemberMiniBoardView({
           {briefings.map((briefing, index) => <li key={briefing.id ?? `${briefing.day ?? 'briefing'}-${index}`}>
             <article className="h-full space-y-3 rounded-xl border border-border bg-card p-4">
               <h3 className="font-semibold">{briefing.day ?? '브리핑'}</h3>
+              {briefing.sourceScrapIds && <p className="break-all text-xs text-muted-foreground">브리핑 ID · {briefing.id}</p>}
+              {!!briefing.sourceScrapIds?.length && <p className="break-all text-xs text-muted-foreground">출처 스크랩 · {briefing.sourceScrapIds.join(', ')}</p>}
+              {briefing.sourceScrapIds && briefing.runId && <p className="break-all text-xs text-muted-foreground">run · {briefing.runId}</p>}
               {briefing.topics?.map((topic, topicIndex) => <div key={`${topic.title ?? 'topic'}-${topicIndex}`}>
                 <p className="text-sm font-medium">{topic.title ?? '주제'}</p>
                 {topic.summary && <p className="mt-1 whitespace-pre-wrap text-sm text-muted-foreground">{topic.summary}</p>}
@@ -131,11 +134,18 @@ export function MemberMiniBoardScreen({ api }: { api: MemberMiniBoardApi | null 
     setBriefings([]);
     setRefreshedAt(null);
     void api.getVerifiedOwner().then(async (verifiedOwner) => {
-      const [board, briefingRows] = await Promise.all([api.getBoard(), api.getBriefings(todayInSeoul())]);
+      const [board, briefingRows] = await Promise.all([api.getBoard(), api.getBriefings(todayInSeoul(), verifiedOwner.appSlug)]);
       if (!active) return;
       setOwner(verifiedOwner);
       setCards(rowsForVerifiedMember(rowsFromApi<MemberBoardCard>(board, 'cards'), verifiedOwner.memberId));
-      setBriefings(rowsForVerifiedMember(rowsFromApi<BriefingCard>(briefingRows, 'briefings'), verifiedOwner.memberId));
+      const listed = rowsForVerifiedMember(rowsFromApi<BriefingCard>(briefingRows, 'briefings'), verifiedOwner.memberId);
+      const checked = await Promise.all(listed.map(async (briefing) => {
+        if (!briefing.id || !api.getBriefing) return briefing;
+        try { return recheckedBriefing(briefing, await api.getBriefing(briefing.id, verifiedOwner.appSlug), verifiedOwner.memberId); }
+        catch { return briefing; }
+      }));
+      if (!active) return;
+      setBriefings(checked);
       setRefreshedAt(new Date().toLocaleTimeString());
     }).catch((cause: unknown) => {
       if (active) {

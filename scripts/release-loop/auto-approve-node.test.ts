@@ -5,15 +5,15 @@ import { join } from 'node:path';
 import { BLOCKING_METRIC_NAMES, runAutoApprove } from './auto-approve-node.js';
 import type { GraphContext } from './node-verdict.js';
 
-const fixture = () => {
+const fixture = (version = '0.2.4', runId = 'run-tui-subcheck') => {
   const root = mkdtempSync(join(tmpdir(), 'release-auto-approve-'));
   const repo = join(root, 'repo');
-  const out = join(root, 'release', '0.2.4', 'prepared');
+  const out = join(root, 'release', version, 'prepared');
   mkdirSync(join(out, 'dist'), { recursive: true });
   mkdirSync(repo);
   writeFileSync(join(repo, '.bun-version'), `${Bun.version}\n`);
   for (let n = 0; n < 5; n++) writeFileSync(join(out, 'dist', `file-${n}`), 'fixture');
-  const context: GraphContext = { runId: 'run-tui-subcheck', input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: {
+  const context: GraphContext = { runId, input: { version, previousVersion: '0.2.3' }, outputs: {
     gate: { outcome: 'ok', introduced: [] }, prepare: { outcome: 'ok', out, candidate: join(out, 'dist', 'elanous.tgz'), commit: 'a'.repeat(40) },
     upgrade: { outcome: 'ok' }, tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
       results: Array.from({ length: 7 }, (_, i) => ({ id: `R${i + 1}`, title: 'check', ok: true, reason: 'passed' })) } },
@@ -21,6 +21,23 @@ const fixture = () => {
   } };
   return { root, repo, out, context, run: () => runAutoApprove(context, { instanceRoot: root, repo }) };
 };
+
+test('signed T6 waiver counts the gate metric only for the exact OP run and traffic edge', () => {
+  const f = fixture('0.3.15', '636f9e96-0aae-4cb0-babd-b509c44e2f34');
+  try {
+    const cut = '7d951adb3163ba16a784d5b937d12732ef9be625';
+    f.context.graphId = 'release-loop';
+    f.context.outputs['version-release'] = { outcome: 'ok', commit: cut };
+    f.context.outputs.gate = { outcome: 'error', commit: cut, introduced: [],
+      error: 'Error: remote gate refused: HQ shard result batch is incomplete (pod-68)' };
+    f.context.outputs['gate-heal-decision'] = { outcome: 'waived-known-issue', graphId: 'release-loop',
+      runId: f.context.runId, nodeId: 'gate-heal-decision', decidedBy: 'OP', decidedAt: '2026-11-13T03:50:00.000Z' };
+    f.context.outputs['traffic-gate-passed'] = { outcome: 'ok' };
+    expect(f.run().metrics[0]?.verdict).toBe('pass');
+    f.context.outputs['gate-heal-decision']!.decidedBy = 'other';
+    expect(f.run().metrics[0]?.verdict).toBe('fail');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
 
 test('eight measured metrics approve and write a rollback report', () => {
   const f = fixture();

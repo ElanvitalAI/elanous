@@ -521,7 +521,11 @@ function createNexusAppHost(
       }
       const pathname = normalizeRequestPath(url.pathname);
       if (!pathname) return notFound();
-      const filePath = mounted.files.has(pathname) ? pathname : `${pathname.replace(/\/$/, '')}/index.html`;
+      const stem = pathname.replace(/\/$/, '');
+      const directoryIndex = `${stem}/index.html`;
+      const filePath = mounted.files.has(pathname) ? pathname
+        : mounted.files.has(directoryIndex) ? directoryIndex
+          : `${stem}.html`;
       const body = mounted.files.get(filePath);
       if (!body) return notFound();
       const headers = new Headers({

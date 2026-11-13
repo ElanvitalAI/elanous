@@ -231,6 +231,32 @@ describe('ABSORB /v1/scraps', () => {
       }), opts, {} as never, null, {} as never);
       expect(response?.status).toBe(CREATED);
       expect((await response!.json() as { memberId: string }).memberId).toBe(member.id);
+      const folders = await routeRequest(new Request('http://nexus.test/v1/scrap-folders', {
+        headers: { authorization: `Bearer ${appSessionToken}` },
+      }), opts, {} as never, null, {} as never);
+      expect(folders?.status).toBe(200);
+      expect(await folders!.json()).toEqual({ folders: [] });
+      const voice = await routeRequest(new Request('http://nexus.test/v1/scraps', {
+        method: 'POST', headers: { authorization: `Bearer ${appSessionToken}`, ...idempotencyHeaders('route-export-voice-0001') },
+        body: JSON.stringify({ kind: 'voice', source: 'android-record', raw: { mediaRef: 'scraps/route-voice' } }),
+      }), opts, {} as never, null, {} as never);
+      expect(voice?.status).toBe(CREATED);
+      const voiceId = (await voice!.json() as { id: string }).id;
+      let exportWrites = 0;
+      fixture.options.writeVaultFile = async () => { exportWrites++; return Response.json({ ok: true }); };
+      const exportBody = JSON.stringify({ vaultId: 'configured', vaultRelativeFolder: 'Lectures' });
+      const authorizedExport = await routeRequest(new Request(`http://nexus.test/v1/scraps/${voiceId}/export`, {
+        method: 'POST', headers: { authorization: `Bearer ${appSessionToken}`, 'content-type': 'application/json' }, body: exportBody,
+      }), opts, {} as never, null, {} as never);
+      expect(authorizedExport?.status).toBe(CREATED);
+      const deniedExport = await routeRequest(new Request(`http://nexus.test/v1/scraps/${voiceId}/export`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: exportBody,
+      }), opts, {} as never, null, {} as never);
+      expect(deniedExport?.status).toBe(UNAUTHORIZED);
+      expect(exportWrites).toBe(1);
+      const deniedFolders = await routeRequest(new Request('http://nexus.test/v1/scrap-folders'),
+        opts, {} as never, null, {} as never);
+      expect(deniedFolders?.status).toBe(UNAUTHORIZED);
       const denied = await routeRequest(new Request('http://nexus.test/v1/scraps', {
         method: 'POST', headers: { ...idempotencyHeaders('route-request-0002') }, body: JSON.stringify({ kind: 'text', source: 'tui', raw: { text: 'No bearer' } }),
       }), opts, {} as never, null, {} as never);

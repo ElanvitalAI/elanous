@@ -59,6 +59,9 @@ export interface BudgetGate {
   (goalSlug: string, estimateUsd?: number): Promise<{
     canAfford: boolean;
     tripped: readonly string[];
+    /** An explicitly admitted task-local fallback; adapters must use this provider. */
+    providerName?: string;
+    model?: string;
   }>;
 }
 

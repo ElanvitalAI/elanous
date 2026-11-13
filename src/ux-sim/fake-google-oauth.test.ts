@@ -9,6 +9,7 @@ import { createAppLifecycleStore } from '../nexus/apps/app-db.js';
 import { isPublicRoute } from '../nexus/api/public-routes.js';
 import { routeRequest } from '../nexus/api/http-server.js';
 import { createDevProxyRuntimeRef } from '../nexus/api/admin-dev-proxy.js';
+import { debug } from '../debug/log.js';
 
 const CLIENT_ID = 'member-client-test';
 const REDIRECT = 'https://api.example.test/v1/members/oauth/google/callback';
@@ -135,8 +136,14 @@ describe('fake Google OAuth member boundary', () => {
         const callback = (await api.handle(new Request(`${REDIRECT}?code=${authorization.code}&state=${authorization.state}`, {
           headers: { cookie: authorization.stateCookie },
         })))!;
-        expect(callback.status).toBe(200);
+        expect(callback.status).toBe(303);
+        const location = callback.headers.get('location') ?? '';
+        expect(new URL(location).pathname).toBe('/v1/members/home');
+        expect(await callback.text()).not.toContain('Save your member key');
         const sessionCookie = callback.headers.get('set-cookie')!.split(';', 1)[0]!;
+        expect(sessionCookie.startsWith('__Host-elanous_member_session=')).toBe(true);
+        const home = (await api.handle(new Request(location, { headers: { cookie: sessionCookie } })))!;
+        expect(home.status).toBe(200);
         const profile = (await api.handle(new Request('https://api.example.test/v1/members', {
           headers: { cookie: sessionCookie },
         })))!;
@@ -147,6 +154,11 @@ describe('fake Google OAuth member boundary', () => {
   });
 
   test('native Google callback returns an allowlisted one-time state-bound app-slot exchange code', async () => {
+    const exchangeEvents: Array<{ stage?: string; status?: number }> = [];
+    const stopCapture = debug.registerSink({ name: 'member-exchange-stage-test', emit(record) {
+      if (record.category === 'nexus.member-app-slot' && record.event === 'exchange')
+        exchangeEvents.push(record.data as { stage?: string; status?: number });
+    } });
     let clock = Date.parse('2026-11-14T01:00:00.000Z');
     const now = () => clock;
     const store = createMemberStore({ path: ':memory:', now });
@@ -162,6 +174,7 @@ describe('fake Google OAuth member boundary', () => {
     const issued: Array<{ appSlug: string; memberId: string }> = [];
     const api = createMembersApi({ store, google, successRedirectUri: 'https://app.example.test/signup/complete', now,
       appAuthRedirectUris: ['elanous://auth/callback'],
+      publicAppUrl: slot => `https://${slot.appSlug}--member.elanous.app/`,
       issueOwnerSession: (appSlug, memberId) => {
         issued.push({ appSlug, memberId });
         return { sessionToken: 'aps-one-time-session', expiresAt: new Date(clock + 60_000).toISOString() };
@@ -200,8 +213,10 @@ describe('fake Google OAuth member boundary', () => {
       expect((await exchange(exchangeCode, state, `${codeVerifier}wrong`))?.status).toBe(401);
       const exchanged = await exchange(exchangeCode, state);
       expect(exchanged?.status).toBe(200);
-      const payload = await exchanged!.json() as { appId: string; sessionToken: string; tokenType: string; expiresAt: string };
+      const payload = await exchanged!.json() as { appId: string; sessionToken: string; tokenType: string; expiresAt: string;
+        appSlot: { appId: string; appSlug: string; url: string | null } };
       expect(payload).toMatchObject({ appId: expect.stringMatching(/^kaist-/), sessionToken: 'aps-one-time-session', tokenType: 'Bearer' });
+      expect(payload.appSlot).toMatchObject({ appId: payload.appId, url: `https://${payload.appSlot.appSlug}--member.elanous.app/` });
       expect(Number.isFinite(Date.parse(payload.expiresAt))).toBe(true);
       expect(issued).toHaveLength(1);
       expect((await exchange(exchangeCode, state))?.status).toBe(401);
@@ -216,7 +231,51 @@ describe('fake Google OAuth member boundary', () => {
       clock += 2 * 60_000 + 1;
       expect(store.pruneExpiredAppAuthCodes?.(new Date(clock).toISOString())).toBe(1);
       expect((await exchange(expiredAppCallback.searchParams.get('code')!, expiredAuthorization.state))?.status).toBe(401);
-    } finally { store.close(); }
+      expect(exchangeEvents).toEqual([
+        { stage: 'code-invalid-or-expired', status: 401 },
+        { stage: 'code-invalid-or-expired', status: 401 },
+        { stage: 'session-issued', status: 200 },
+        { stage: 'code-invalid-or-expired', status: 401 },
+        { stage: 'code-invalid-or-expired', status: 401 },
+      ]);
+      expect(JSON.stringify(exchangeEvents)).not.toContain(exchangeCode);
+    } finally { stopCapture(); store.close(); }
+  });
+
+  test('app-slot exchange traces slot lookup and owner issuer failures separately without values', async () => {
+    const events: Array<{ stage?: string; status?: number }> = [];
+    const stopCapture = debug.registerSink({ name: 'member-exchange-failure-stage-test', emit(record) {
+      if (record.category === 'nexus.member-app-slot' && record.event === 'exchange')
+        events.push(record.data as { stage?: string; status?: number });
+    } });
+    const store = createMemberStore({ path: ':memory:' });
+    const code = 'private-one-time-code';
+    const memberId = 'private-member-id';
+    const appId = 'kaist-private-app';
+    const request = new Request('https://api.example.test/v1/members/app-slot/exchange', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code, state: 'private-state', codeVerifier: 'private-verifier' }),
+    });
+    const makeApi = (lookup: () => ReturnType<typeof store.appSlotForMember>, issue: () => never) =>
+      createMembersApi({
+        store: { ...store, consumeAppAuthCode: () => ({ appId, memberId }), appSlotForMember: lookup },
+        google: { redirectUri: REDIRECT } as Parameters<typeof createMembersApi>[0]['google'],
+        successRedirectUri: 'https://app.example.test/signup/complete',
+        issueOwnerSession: issue,
+      });
+    try {
+      const failedLookup = makeApi(() => { throw new Error('private-db-detail'); }, () => { throw new Error('issuer must not be called'); });
+      expect((await failedLookup.handle(request.clone()))?.status).toBe(503);
+      const failedIssuer = makeApi(() => ({ appId, appSlug: 'private-app-slug' } as NonNullable<ReturnType<typeof store.appSlotForMember>>),
+        () => { throw new Error('private-issuer-detail'); });
+      expect((await failedIssuer.handle(request.clone()))?.status).toBe(503);
+      expect(events).toEqual([
+        { stage: 'slot-lookup-failed', status: 503 },
+        { stage: 'session-issuer-failed', status: 503 },
+      ]);
+      const trace = JSON.stringify(events);
+      for (const secret of [code, memberId, appId, 'private-db-detail', 'private-issuer-detail']) expect(trace).not.toContain(secret);
+    } finally { stopCapture(); store.close(); }
   });
 
   test('drives real signup, consent/code attribution, member session and deletion through fake Google', async () => {
@@ -229,7 +288,7 @@ describe('fake Google OAuth member boundary', () => {
       ensureCreated: (event: Parameters<typeof appLifecycle.ensureCreated>[0]) => {
         lifecycleCreateAttempts += 1;
         if (lifecycleCreateAttempts === 1) throw new Error('temporary lifecycle write failure');
-        appLifecycle.ensureCreated(event);
+        return appLifecycle.ensureCreated(event);
       },
     };
     // Source: src/nexus/members/member-store.ts — the two-use event code permits two distinct members then exhausts.
@@ -307,15 +366,17 @@ describe('fake Google OAuth member boundary', () => {
     expect(forged?.status).toBe(401);
     const completed = await routeRequest(new Request(callbackUrl, { headers: { cookie: stateCookie.split(';')[0]! } }),
       { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
-    expect(completed?.status).toBe(200);
-    expect(await completed!.text()).toContain('emk_');
+    expect(completed?.status).toBe(303);
+    expect(completed?.headers.get('location')).toBe('https://api.example.test/v1/members/home');
+    expect(await completed!.text()).toBe('');
     const setCookie = completed?.headers.get('set-cookie') ?? '';
+    expect(setCookie.startsWith('__Host-elanous_member_session=')).toBe(true);
     expect(setCookie).toContain('HttpOnly; Secure; SameSite=Lax');
     const memberCookie = setCookie.split(';', 1)[0]!;
     const keyList = await routeRequest(new Request('https://api.example.test/v1/member/keys', { headers: { cookie: memberCookie } }),
       { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
     expect(keyList?.status).toBe(200);
-    expect((await keyList!.json() as { keys: unknown[] }).keys).toHaveLength(1);
+    expect((await keyList!.json() as { keys: unknown[] }).keys).toHaveLength(0);
     const keyPreflight = await routeRequest(new Request('https://api.example.test/v1/member/keys', {
       method: 'OPTIONS', headers: { origin: 'https://app.example.test', 'access-control-request-method': 'POST' },
     }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
@@ -337,15 +398,18 @@ describe('fake Google OAuth member boundary', () => {
     const profile = await api.handle(new Request('https://api.example.test/v1/members', { headers: { cookie: sessionCookie, origin: 'https://app.example.test' } }));
     expect(profile?.status).toBe(200);
     expect(lifecycleLookups).toBe(2);
-    expect(lifecycleCreateAttempts).toBe(2);
+    expect(lifecycleCreateAttempts).toBe(1);
     const profileBody = await profile!.json();
-    expect(profileBody).toMatchObject({ member: { email: 'new@example.test', invitedBy: inviter.id, eventCode: 'KAIST-2026' } });
+    expect(profileBody).toMatchObject({ member: { email: 'new@example.test', invited: true, eventCode: 'KAIST-2026' } });
+    expect(JSON.stringify(profileBody)).not.toContain('invitedBy');
     expect(JSON.stringify(profileBody)).not.toContain('fake-google-access');
+    expect(JSON.stringify(profileBody)).not.toContain(inviter.id);
     const slotResponse = await routeRequest(new Request('https://api.example.test/v1/members/app-slot', {
       headers: { cookie: sessionCookie, origin: 'https://app.example.test' },
     }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
     expect(slotResponse?.status).toBe(200);
     expect(lifecycleLookups).toBe(2);
+    expect(lifecycleCreateAttempts).toBe(2);
     const { appSlot } = await slotResponse!.json() as { appSlot: { appId: string; templateSlug: string; createdAt: string } };
     expect(appSlot).toMatchObject({ templateSlug: 'next-app-lecture-scrap' });
     expect(appSlot.appId).not.toBe(appSlot.templateSlug);

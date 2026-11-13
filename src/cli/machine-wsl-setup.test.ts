@@ -16,7 +16,7 @@ const hostProbe = (manufacturer = 'Contoso', product = 'Workstation') => (comman
   return undefined;
 };
 
-test('WSL bootstrap registers a startup resume before requesting distro installation', () => {
+test('WSL bootstrap registers installing-user logon resume before requesting distro installation', () => {
   const calls: string[][] = [];
   const events: string[] = [];
   const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-resume-create-'));
@@ -51,7 +51,7 @@ test('WSL bootstrap registers a startup resume before requesting distro installa
     expect(taskWrapper).toContain('Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force');
     expect(taskXml).toContain('encoding="UTF-16"');
     expect(taskXml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');
-    expect(taskXml).toContain('<BootTrigger><Enabled>true</Enabled></BootTrigger>');
+    expect(taskXml).toContain('<LogonTrigger><Enabled>true</Enabled><UserId>user</UserId></LogonTrigger>');
     expect(taskXml).toContain(`<Arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${taskWrapperPath}</Arguments>`);
     const encodedResume = /FromBase64String\('([^']+)'\)/.exec(taskWrapper)?.[1];
     expect(encodedResume).toBeDefined();
@@ -59,15 +59,16 @@ test('WSL bootstrap registers a startup resume before requesting distro installa
       executable: 'C:\\Program Files\\Elanous\\bun.exe',
       arguments: ['C:\\Program Files\\Elanous\\elanous.mjs', 'machine', 'apply', '--from',
         'C:\\Users\\User\\capture.json', '--profile', 'developer', '--platform', 'wsl', '--distribution',
-        'Ubuntu-24.04', '--wsl-user', 'user', '--resume-trigger', 'onstart', '--resume', '--yes',
+        'Ubuntu-24.04', '--wsl-user', 'user', '--resume-trigger', 'onlogon', '--resume', '--yes',
         '--resume-task-wrapper', taskWrapperPath],
     });
-    expect(taskXml).toContain('<LogonType>S4U</LogonType>');
+    expect(taskXml).toContain('<UserId>user</UserId><LogonType>InteractiveToken</LogonType>');
     expect(existsSync(taskPath)).toBe(true);
     expect(calls.find(call => call[0] === 'schtasks.exe')).toEqual([
       'schtasks.exe', '/Create', '/TN', 'ElanousMachineSetupResume', '/XML', taskPath, '/F',
     ]);
-    expect(result.detail).toContain('Reboot resumes setup automatically; sign in to Codex once on Windows. WSL does not create or refresh Codex credentials.');
+    expect(result.detail).toContain('sign in to the installing Windows account to resume setup');
+    expect(result.detail).toContain('eln machine apply --resume');
     expect(events).toEqual(['probe', 'probe', 'probe', 'schedule', 'install']);
     expect(calls.map(call => call[0])).toEqual(['systeminfo.exe', 'reg.exe', 'reg.exe', 'schtasks.exe', 'wsl.exe']);
     expect(calls.at(-1)).toEqual(['wsl.exe', '--install', '--distribution', 'Ubuntu-24.04', '--no-launch']);
@@ -76,15 +77,14 @@ test('WSL bootstrap registers a startup resume before requesting distro installa
   }
 });
 
-test('WSL resume task keeps the Task Scheduler action short for a SYSTEM profile install path', () => {
-  const systemProfileRoot = 'C:\\Windows\\system32\\config\\systemprofile\\AppData\\Local\\Elanous';
-  const taskPath = `${systemProfileRoot}\\machine-setup-resume.xml`;
-  const executable = `${systemProfileRoot}\\runtime\\node.exe`;
-  const entry = `${systemProfileRoot}\\versions\\0.3.8\\node_modules\\elanous\\bin\\elanous.mjs`;
-  const capture = 'C:\\Windows\\Temp\\win1-machine-capture.json';
+test('WSL resume task keeps its Task Scheduler action short for the installing user', () => {
+  const userProfileRoot = 'C:\\Users\\tester\\AppData\\Local\\Elanous';
+  const taskPath = `${userProfileRoot}\\machine-setup-resume.xml`;
+  const executable = `${userProfileRoot}\\runtime\\node.exe`;
+  const entry = `${userProfileRoot}\\versions\\0.3.8\\node_modules\\elanous\\bin\\elanous.mjs`;
+  const capture = 'C:\\Users\\tester\\capture.json';
   const legacyResumeCommand = buildMachineWslResumeCommand({ executable, entry, capture, profile: 'developer',
     distribution: 'Ubuntu', user: 'elanous' });
-  // Source: Azure win-blank Run Command log 2026-11-10 records schtasks rejecting /TR values over 261 characters.
   const taskSchedulerRunTextLimit = 261;
   expect(legacyResumeCommand.length).toBeGreaterThan(taskSchedulerRunTextLimit);
 
@@ -93,7 +93,7 @@ test('WSL resume task keeps the Task Scheduler action short for a SYSTEM profile
   let taskWrapper = '';
   let taskWrapperPath = '';
   const result = applyMachineWslBootstrap({ capture, profile: 'developer', distribution: 'Ubuntu', user: 'elanous', resume: false,
-    deps: { platform: 'win32', executable, entry, env: { USERNAME: 'SYSTEM', WINDIR: 'C:\\Windows' },
+    deps: { platform: 'win32', executable, entry, env: { USERNAME: 'tester', COMPUTERNAME: 'win-blank', WINDIR: 'C:\\Windows' },
       resumeTaskDefinitionPath: taskPath,
       writeResumeTaskWrapper: (path, script) => { taskWrapperPath = path; taskWrapper = script; },
       writeResumeTaskDefinition: (_path, xml) => { taskXml = xml; },
@@ -102,24 +102,29 @@ test('WSL resume task keeps the Task Scheduler action short for a SYSTEM profile
         return hostProbe()(command, args) ?? { status: 0 };
       } } });
 
-  expect(result).toMatchObject({ status: 'resume-pending', distribution: 'Ubuntu', user: 'elanous' });
+  expect(result).toMatchObject({ status: 'resume-pending', distribution: 'Ubuntu', user: 'elanous', resumeTrigger: 'onlogon' });
   const taskArguments = /<Arguments>(.*?)<\/Arguments>/.exec(taskXml)?.[1]?.replaceAll('&quot;', '"');
   expect(taskXml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');
+  expect(taskXml).toContain('<LogonTrigger><Enabled>true</Enabled><UserId>tester</UserId></LogonTrigger>');
+  expect(taskXml).toContain('<UserId>tester</UserId><LogonType>InteractiveToken</LogonType>');
   expect(taskArguments).toContain(`-File ${taskWrapperPath}`);
   expect(taskArguments?.length).toBeLessThan(taskSchedulerRunTextLimit);
   expect(taskArguments).not.toContain('--from');
+  expect(taskWrapper).toContain('eventcreate.exe /L APPLICATION /T ERROR /ID 100 /SO ElanousMachineSetupResume');
+  expect(taskWrapper).toContain('Sign in to Windows and run eln machine apply --resume to finish WSL setup.');
+  expect(taskWrapper).toContain('machine-setup-resume.log');
   const encodedResume = /FromBase64String\('([^']+)'\)/.exec(taskWrapper)?.[1];
   expect(JSON.parse(Buffer.from(encodedResume!, 'base64').toString('utf8'))).toEqual({
     executable,
     arguments: [currentMachineWslEntry(entry), 'machine', 'apply', '--from', capture, '--profile', 'developer', '--platform', 'wsl',
-      '--distribution', 'Ubuntu', '--wsl-user', 'elanous', '--resume-trigger', 'onstart', '--resume', '--yes',
+      '--distribution', 'Ubuntu', '--wsl-user', 'elanous', '--resume-trigger', 'onlogon', '--resume', '--yes',
       '--resume-task-wrapper', taskWrapperPath],
   });
   expect(calls.find(call => call[0] === 'schtasks.exe')).toContain('/XML');
   expect(calls.find(call => call[0] === 'schtasks.exe')).not.toContain('/TR');
 });
 
-test('startup resume task supports ONSTART S4U and ONLOGON interactive fallback without storing a password', () => {
+test('startup resume task uses the current entry without storing a password', () => {
   const command = buildMachineWslResumeCommand({ executable: 'C:\\Program Files\\Elanous\\bun.exe',
     entry: 'C:\\Program Files\\Elanous\\current\\node_modules\\elanous\\bin\\elanous.mjs',
     capture: 'C:\\Users\\User\\capture.json', profile: 'developer', distribution: 'Ubuntu-24.04', user: 'user' });
@@ -141,6 +146,26 @@ test('startup task XML keeps its action separate from schtasks arguments and nev
   expect(xml).not.toContain('<Password>');
   expect(buildMachineWslStartupTaskArgs({ taskXmlPath: 'C:\\Users\\tester\\AppData\\Local\\Elanous\\resume.xml', windowsUser: 'tester' }))
     .toEqual(['/Create', '/TN', 'ElanousMachineSetupResume', '/XML', 'C:\\Users\\tester\\AppData\\Local\\Elanous\\resume.xml', '/F']);
+});
+
+test('LocalSystem and boot-triggered resume cannot be registered for a user-owned WSL distribution', () => {
+  for (const windowsUser of ['SYSTEM', 'NT AUTHORITY\\SYSTEM', 'win-blank$']) {
+    const input = { executable: 'C:\\Windows\\System32\\cmd.exe', arguments: '/c exit 0', windowsUser,
+      computerName: 'win-blank' };
+    expect(() => buildMachineWslStartupTaskXml(input)).toThrow('WSL resume requires the installing Windows account, not LocalSystem');
+  }
+  expect(() => buildMachineWslStartupTaskXml({ executable: 'C:\\Windows\\System32\\cmd.exe',
+    arguments: '/c exit 0', windowsUser: 'tester', trigger: 'onstart' })).toThrow('WSL resume requires an ONLOGON trigger');
+});
+
+test('LocalSystem bootstrap fails with a user-resume instruction before task or WSL side effects', () => {
+  const calls: string[] = [];
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'developer', distribution: 'Ubuntu',
+    user: 'elanous', resume: false, deps: { platform: 'win32', env: { USERNAME: 'win-blank$', COMPUTERNAME: 'win-blank' },
+      run: (command, args) => { calls.push(command); return hostProbe()(command, args) ?? { status: 0 }; } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'register-resume' });
+  expect(result.failures[0]?.reason).toContain('Sign in to Windows and run eln machine apply --resume');
+  expect(calls).toEqual(['systeminfo.exe', 'reg.exe', 'reg.exe']);
 });
 
 test('startup task XML write failure is returned as a structured register-resume failure', () => {
@@ -208,7 +233,7 @@ test('ONLOGON resume reports that signing in after reboot resumes setup', () => 
       scheduleResume: () => ({ status: 0 }),
       run: (command, args) => hostProbe()(command, args) ?? { status: 0 } } });
   expect(result).toMatchObject({ status: 'resume-pending', resumeTrigger: 'onlogon' });
-  expect(result.detail).toContain('After reboot, Windows sign-in resumes setup automatically; complete Codex identity login on Windows.');
+  expect(result.detail).toContain('sign in to the installing Windows account to resume setup');
 });
 
 test('missing distro resume writes ONLOGON XML through the default registration path', () => {
@@ -1072,11 +1097,12 @@ test('machine apply shows the selected distro before approval and prints manual 
     output.length = 0;
     await parse(['--platform', 'wsl', '--distribution', 'Debian', '--yes']);
     expect(output.join('\n')).toContain('cloud-vm-confirmation-required');
+    expect(output.join('\n')).toContain('Sign in to Windows and run eln machine apply --resume to finish WSL setup.');
     expect(scheduled).toBe(0);
 
     output.length = 0;
     await parse(['--platform', 'wsl', '--distribution', 'Debian', '--yes', '--allow-cloud-vm']);
-    expect(output.join('\n')).toContain('Reboot resumes setup automatically; sign in to Codex once on Windows. WSL does not create or refresh Codex credentials.');
+    expect(output.join('\n')).toContain('sign in to the installing Windows account to resume setup');
     expect(scheduled).toBe(1);
 
     output.length = 0;
@@ -1100,7 +1126,7 @@ test('manual machine resume discovers and removes the scheduled wrapper from tas
   } }));
   const taskXml = buildMachineWslStartupTaskXml({ executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
     arguments: `-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${resumeTaskWrapperPath}"`,
-    windowsUser: 'user', trigger: 'onstart' });
+    windowsUser: 'user', trigger: 'onlogon' });
   writeFileSync(taskDefinitionPath, Buffer.from(`\uFEFF${taskXml}`, 'utf16le'));
   writeFileSync(resumeTaskWrapperPath, 'resume wrapper');
   const output: string[] = [];

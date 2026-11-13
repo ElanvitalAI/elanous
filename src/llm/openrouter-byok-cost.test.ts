@@ -94,7 +94,7 @@ describe('OR-BYOK-COST — ledger cost', () => {
     };
     const rows: Array<Record<string, unknown>> = [];
     const spy = spyOn(debug, 'log').mockImplementation((c, e, d) => { if (c === 'llm.usage' && e === 'llm-usage') rows.push(d as Record<string, unknown>); });
-    try { await streamLLM([{ role: 'user', content: 'x' }], () => {}, { provider }); } finally { spy.mockRestore(); }
+    try { await streamLLM([{ role: 'user', content: 'x' }], () => {}, { provider, preferExplicitProvider: true }); } finally { spy.mockRestore(); }
     expect(rows).toHaveLength(1);
     expect(rows[0]!.cost).toMatchObject({ kind: 'actual', usd: 0.0000093, byok: true, costSource: 'byok-upstream' });
   });

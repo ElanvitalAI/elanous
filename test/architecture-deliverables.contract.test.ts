@@ -183,8 +183,15 @@ test('verify preserves unrelated files added or changed while rendering', () => 
     const context = join(root, 'run.json');
     writeFileSync(context, JSON.stringify({ input: { designHtmlPath: join(sample, 'architecture.html'),
       diagramSourcePath: join(sample, 'architecture.excalidraw'), outDir } }));
-    const step = (name: string) => JSON.parse(new TextDecoder().decode(Bun.spawnSync(['bun', stepPath, name],
-      { env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context }, stdout: 'pipe' }).stdout).trim()) as { outcome: string; error?: string };
+    const step = (name: string) => {
+      const child = Bun.spawnSync(['bun', stepPath, name],
+        { env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context }, stdout: 'pipe', stderr: 'pipe' });
+      const stdout = new TextDecoder().decode(child.stdout).trim();
+      const stderr = new TextDecoder().decode(child.stderr).trim();
+      if (child.exitCode !== 0 || !stdout)
+        throw new Error(`architecture ${name} did not return a result (exit=${child.exitCode}): ${stderr}`);
+      return JSON.parse(stdout) as { outcome: string; error?: string };
+    };
     expect(step('design').outcome).toBe('ok');
     const lock = JSON.parse(readFileSync(outDir + '.architecture-run.json', 'utf8')) as { stageDir: string };
     copyFileSync(join(sample, 'architecture.png'), join(lock.stageDir, 'architecture.png'));
@@ -215,7 +222,8 @@ test('verify preserves unrelated files added or changed while rendering', () => 
     expect(readFileSync(join(firstDir, 'verification.json'), 'utf8')).toContain(first.generation);
     expect(readFileSync(join(outDir, 'notes.txt'), 'utf8')).toBe('changed during render');
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+  // 출처: the installed graph integration below uses the same 30s renderer budget.
+}, 30000);
 
 test('first publish refuses an occupied output directory without deleting its contents', () => {
   const root = mkdtempSync(join(tmpdir(), 'architecture-occupied-output-'));
@@ -243,7 +251,8 @@ test('first publish refuses an occupied output directory without deleting its co
     expect(existsSync(join(outDir, '.architecture-current'))).toBe(false);
     expect(existsSync(outDir + '.architecture-run.json')).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+  // 출처: the installed graph integration below uses the same 30s renderer budget.
+}, 30000);
 
 test('failed diagram releases owned staging so the same output can be retried', () => {
   const root = mkdtempSync(join(tmpdir(), 'architecture-retry-test-'));

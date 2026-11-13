@@ -113,6 +113,7 @@ export async function runDaemonPromptTurn(opts: {
   verifiedOwner?: { id: string };
   /** Verified app-bound member owner proof for Nexus deployment tools. */
   appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
+  appDeployPublishHook?: import('../agent/app-deploy-plugin.js').AppDeployPublishHook;
   appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** Optional structured-question channels for the triggering chat surface. */
   surfaceQuestionChannels?: QuestionChannel[];
@@ -238,6 +239,7 @@ export async function runDaemonPromptTurn(opts: {
             ...(request.userText ? { userText: request.userText } : {}),
             ...(opts.verifiedOwner ? { verifiedOwner: opts.verifiedOwner } : {}),
             ...(opts.appDeploymentOwner ? { appDeploymentOwner: opts.appDeploymentOwner } : {}),
+            ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
             ...(opts.appDeploymentSession ? { appDeploymentSession: opts.appDeploymentSession } : {}),
             ...(opts.surface !== undefined || sourceResolution.surface !== 'unknown' ? { surface } : {}),
             ...(opts.surfaceHitlChannels ? { surfaceHitlChannels: opts.surfaceHitlChannels } : {}),

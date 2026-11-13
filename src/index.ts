@@ -6483,12 +6483,13 @@ selfCmd
     const { getOpenRouterApiKey: getOpenRouterApiKeyForReview } = await import('./config.js');
     const { ROLE_REVIEWER_FALLBACK_MODEL } = await import('./agent-substrate/self-review-cli.js');
     const contextOrder = reviewerContextArgs(process.argv.slice(2));
-    const configuredAcpBackend = getUserConfig().acp.reviewBackend;
+    const reviewConfig = getUserConfig();
+    const configuredAcpBackend = reviewConfig.acp.reviewBackend;
     // ⭐ Same reviewer row the harness reads (`dev-pipeline` → `resolveSubscriptionReviewer`).
     //    The seam decides whether it applies (only without an explicit reviewer flag).
     const { loadLlmPolicy, resolveSubscriptionReviewer } = await import('./policy/llm-policy.js');
-    const roleReviewerSelection = resolveSubscriptionReviewer(loadLlmPolicy(), getUserConfig().roleLlm);
-    const reviewRoleSpec = getUserConfig().roleLlm?.review;
+    const roleReviewerSelection = resolveSubscriptionReviewer(loadLlmPolicy(), reviewConfig.roleLlm);
+    const reviewRoleSpec = reviewConfig.roleLlm?.review;
     const configuredReviewModel = apiReviewModelFromRoleSpec(reviewRoleSpec);
     const { results, failed } = await runSelfReviewCliCommand(prArgs, {
       ...opts,
@@ -7160,9 +7161,10 @@ agentCmd.hook('preAction', async (_thisCommand, actionCommand) => {
   } catch { /* fail-soft — 관측 실패가 명령 실행을 막지 않음 */ }
 });
 
-agentCmd.command('mirror')
-  .description('Codex 주인 호스트의 refresh 없는 접근 미러')
-  .command('push <host>')
+const codexMirrorCmd = agentCmd.command('mirror')
+  .description('Codex 주인 호스트의 접근 미러와 소유권 이전');
+
+codexMirrorCmd.command('push <host>')
   .description('현재 주인 호스트의 사용 가능한 Codex 계정들을 원격 CLI 미러로 보낸다')
   .action(async (host: string) => {
     try {
@@ -7194,6 +7196,20 @@ agentCmd.command('mirror')
       console.log(`OAuth 접근 미러 설치 완료 · host=${target.host} · codex=${codex.mirrors.length} · providers=${providerMirrors.map((m) => m.provider).join(',') || '없음'}${skippedText} · refresh=미포함`);
     } catch (error) {
       console.error(`codex mirror push 실패: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  });
+
+codexMirrorCmd.command('transfer-owner <newOwner>')
+  .description('HQ 임대 fence와 기존 주인 확인 아래 Codex refresh 주인을 이전한다')
+  .requiredOption('--expected-owner <host>', '현재 주인 호스트 — 설정값과 정확히 일치해야 이전한다')
+  .action(async (newOwner: string, opts: { expectedOwner: string }) => {
+    try {
+      const { transferCodexCredentialOwner } = await import('./nexus/config/secrets/cred-owner.js');
+      const result = await transferCodexCredentialOwner({ newOwner, expectedOwner: opts.expectedOwner });
+      console.log(`Codex owner transfer 완료 · ${result.previousOwner} → ${result.ownerHost} · HQ lease=fenced`);
+    } catch (error) {
+      console.error(`codex mirror transfer-owner 실패: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
     }
   });
@@ -12926,8 +12942,17 @@ async function main(): Promise<void> {
   // user-config can opt into benchmark mode persistently
   // (`dashboard.benchmark: true`) so callers don't have to retype the
   // flag every run. CLI `--benchmark` still forces it on regardless.
-  const benchmarkConfigured = getUserConfig().dashboard.benchmark === true;
+  const entryConfig = getUserConfig();
+  const benchmarkConfigured = entryConfig.dashboard.benchmark === true;
   const benchmark = rawArgs.includes('--benchmark') || benchmarkConfigured;
+  // The member identity is never supplied by a REPL child or a remote admin token.
+  // Both TUI entries receive the same private Nexus credential source; their hosts
+  // resolve the actual owner again at the Nexus endpoint for each scoped call.
+  const memberSessionReader = await import('./tui/member-session-contract.js');
+  const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+  const memberSessionFile = memberSessionReader.tuiMemberSessionPath(
+    getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE);
+  const getNexusMemberSession = () => memberSessionReader.readTuiMemberSession(memberSessionFile);
   const dashboardOpts = {
     debug: rawArgs.includes('--debug'),
     chatOnly:
@@ -12939,6 +12964,7 @@ async function main(): Promise<void> {
     benchmark,
     ...(remote ? { remote } : {}),
     ...(resumeSessionId ? { resumeSessionId } : {}),
+    getNexusMemberSession,
   };
   // Strip root `--resume <id>` before Commander parses.
   // The dashboard-only two-token form must not become a subcommand
@@ -13009,7 +13035,7 @@ async function main(): Promise<void> {
     // Maturity filtering mutates command visibility; register the final PR
     // object before filtering so replacing the placeholder cannot reveal it.
     if (prSelectedForParse(['node', 'elanous', ...args])) ensurePrRegistered();
-    const role = getUserConfig().cli?.helpRole ?? 'owner';
+    const role = entryConfig.cli?.helpRole ?? 'owner';
     const { shown, hidden } = filterCliRootHelp(program.commands, role, showAll);
     debug.log('cli.maturity', 'help-filtered', { role, shown, hidden });
     await program.parseAsync(['node', 'elanous', ...(showAll ? ['--help'] : args)]);
@@ -13019,7 +13045,7 @@ async function main(): Promise<void> {
   // First-run owns onboarding, so it starts the Nexus daemon before handing off to web setup,
   // including in a headless session. Later bare invocations keep the dashboard's read-only probe.
   const firstRunStartedAt = Date.now();
-  const cfg = getUserConfig();
+  const cfg = entryConfig;
   // A provider-ready Next TUI is usable while optional web onboarding remains
   // incomplete. Keep first-run setup for an unready provider and for classic.
   if ((await import('./onboarding.js')).needsFirstRun(cfg)
@@ -13147,7 +13173,9 @@ async function main(): Promise<void> {
     }
     const { showNextTui } = await import('./tui/entry.js');
     const tuiConfig = getUserConfig().tui;
-    await showNextTui({ resumeSessionId, sidetabMode: tuiConfig?.sidetab ?? 'collapsed', compactHeight: tuiConfig?.next?.compactHeight });
+    const nextOpts = { resumeSessionId, sidetabMode: tuiConfig?.sidetab ?? 'collapsed', compactHeight: tuiConfig?.next?.compactHeight,
+      getNexusMemberSession, memberBoardSession: getNexusMemberSession };
+    await showNextTui(nextOpts);
     bootTimer.phase('show-next');
     bootTimer.done();
   } else {

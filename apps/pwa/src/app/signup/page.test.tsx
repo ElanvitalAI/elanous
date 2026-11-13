@@ -54,6 +54,20 @@ test('ordinary referred signup completion keeps the invite-link path', async () 
   }
 });
 
+test('signup completion does not offer invite management without a verified member', async () => {
+  const priorFetch = globalThis.fetch;
+  globalThis.fetch = (async () => Response.json({ error: 'unauthorized' }, { status: 401 })) as unknown as typeof fetch;
+  let tree: ReturnType<typeof create> | null = null;
+  try {
+    await act(async () => { tree = create(<TryPage />); await Promise.resolve(); });
+    expect(tree!.root.findAllByType('a')).toHaveLength(0);
+    expect(JSON.stringify(tree!.toJSON())).toContain('로그인이 끝나지 않았습니다.');
+  } finally {
+    if (tree) await act(async () => tree!.unmount());
+    globalThis.fetch = priorFetch;
+  }
+});
+
 test('KCB QR fills the event code and signup sends it to member OAuth once', async () => {
   const priorWindow = globalThis.window;
   const priorStorage = globalThis.sessionStorage;
@@ -81,6 +95,34 @@ test('KCB QR fills the event code and signup sends it to member OAuth once', asy
   } finally {
     if (tree) await act(async () => tree.unmount());
     Object.assign(globalThis, { window: priorWindow, sessionStorage: priorStorage, fetch: priorFetch });
+  }
+});
+
+test('KCB printed and spoken aliases display and submit the one canonical event code', async () => {
+  for (const alias of ['KCB_1114', 'kcb-1114', 'K C B 1 1 1 4']) {
+    const priorWindow = globalThis.window;
+    const priorStorage = globalThis.sessionStorage;
+    const priorFetch = globalThis.fetch;
+    let posted: Record<string, unknown> | undefined;
+    Object.assign(globalThis, {
+      window: { location: { search: `?code=${encodeURIComponent(alias)}`, assign: () => {} } },
+      sessionStorage: { getItem: () => null, setItem: () => {} },
+      fetch: async (_url: string, init: RequestInit) => {
+        posted = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return Response.json({ authorizationUrl: 'https://accounts.google.test/authorize' }, { status: 201 });
+      },
+    });
+    let tree: ReturnType<typeof create> | null = null;
+    try {
+      await act(async () => { tree = create(<MemberSignupPage />); });
+      expect(tree!.root.findByProps({ 'aria-label': '행사 코드' }).props.value).toBe('KCB1114');
+      await act(async () => { tree!.root.findAllByType('input')[1]!.props.onChange({ target: { checked: true } }); });
+      await act(async () => { await tree!.root.findByType('button').props.onClick(); });
+      expect(posted?.eventCode).toBe('KCB1114');
+    } finally {
+      if (tree) await act(async () => tree!.unmount());
+      Object.assign(globalThis, { window: priorWindow, sessionStorage: priorStorage, fetch: priorFetch });
+    }
   }
 });
 
@@ -176,10 +218,14 @@ test('real QR and completion components observe first-result SLA through fake OI
     let memberCookie = '';
     let generated = 0;
     const storage = new Map<string, string>();
-    const world = createFakeMemberOidcWorld({ now: () => now, runTryExample: async () => {
-      now += 30_000;
-      return `가짜 첫 결과 ${++generated}`;
-    } });
+    const world = createFakeMemberOidcWorld({
+      now: () => now,
+      kcbSuccessRedirectUri: 'https://app.example.test/app/signup/complete/',
+      runTryExample: async () => {
+        now += 30_000;
+        return `가짜 첫 결과 ${++generated}`;
+      },
+    });
     // 출처: #36725 — 두 독립 여정이 동일한 가짜 행사 코드에서 가입할 수 있는 fixture 용량.
     world.memberStore.provisionEventCode({ code: 'KCB1114', maxUses: 3 });
     Date.now = () => now;
@@ -210,12 +256,20 @@ test('real QR and completion components observe first-result SLA through fake OI
       const callback = await world.membersApi.handle(new Request(
         `${FAKE_MEMBER_OIDC_REDIRECT_URI}?code=${auth.code}&state=${auth.state}`, { headers: { cookie: stateCookie } },
       ));
-      expect(callback?.status).toBe(200);
-      const continueHref = /<a href="([^"]+)" rel="noreferrer">Continue<\/a>/.exec(await callback!.text())?.[1];
-      expect(continueHref).toBeTruthy();
-      expect(new URL(continueHref!).pathname).toBe('/app/signup/complete/');
-      memberCookie = callback!.headers.get('set-cookie')!.split(';', 1)[0]!;
+      expect(callback?.status).toBe(303);
+      const location = callback!.headers.get('location') ?? '';
+      expect(new URL(location).pathname).toBe('/app/signup/complete/');
+      expect(await callback!.text()).not.toContain('Save your member key');
+      const setCookie = callback!.headers.get('set-cookie') ?? '';
+      expect(setCookie.startsWith('__Host-elanous_member_session=')).toBe(true);
+      memberCookie = setCookie.split(';', 1)[0]!;
       await act(async () => { signup.unmount(); completion = create(<TryPage />); await Promise.resolve(); });
+      const profile = await world.membersApi.handle(new Request('https://members.example.test/v1/members', {
+        headers: { cookie: memberCookie, origin: 'https://app.example.test' },
+      }));
+      const issuedLink = (await profile!.json() as { inviteLink: string | null }).inviteLink;
+      expect(issuedLink).toBeNull();
+      expect(completion.root.findByType('a').props.href).toBe('/app/member/invite/');
       expect(completion.root.findAllByProps({ 'aria-pressed': false })).toHaveLength(2);
       await act(async () => { completion.root.findByType('textarea').props.onChange({ target: { value: '기사 제목: 행사 시작' } }); });
       await act(async () => { completion.root.findAllByType('button').at(-1)!.props.onClick(); await Promise.resolve(); });

@@ -1,0 +1,20 @@
+id: brief-design
+version: 1
+kind: design-input-contract
+description: Design an existing member app from the three requirements derived from a member-owned briefing.
+source: { capability: store, collection: member-app-slots, ownerScoped: true }
+fields:
+  - { name: briefingId, type: string, required: true }
+  - { name: scrapIds, type: 'string[]', required: true }
+  - { name: requirementLines, type: 'string[]', required: true }
+  - { name: appId, type: string, required: true }
+  - { name: changes, type: 'object[]', required: true }
+changeFields:
+  - { name: requirement, type: string, required: true }
+  - { name: target, type: string, required: true }
+  - { name: action, type: string, required: true }
+constraints:
+  - requirementLines contains exactly three lines in the same order as the requirements node
+  - each change cites one input requirement line and names an existing screen or RPC from the owner-verified app slot
+  - owner scope comes from the server context and cannot be overridden by a graph input
+  - missing source evidence or app slot yields no design

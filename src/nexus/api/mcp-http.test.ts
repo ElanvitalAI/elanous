@@ -288,6 +288,13 @@ describe('handleMcpHttpPost — catalog automatic SSE progress', () => {
       const response = await handleMcpHttpPost(jsonRpcReq(rpc), loopbackContext({ mcpToolCatalog: catalog }));
 
       expect(response.status).toBe(200);
+      if (tool.id === 'msg_inbox' || tool.id === 'msg_ack') {
+        // Seat mail is deliberately unavailable to an anonymous loopback caller.
+        unchanged.push(tool);
+        expect(decision).toEqual({ stream: false, automatic: false });
+        expect(await response.json()).toMatchObject({ error: { code: -32601 } });
+        continue;
+      }
       if (decision.automatic) {
         automatic.push(tool);
         expect(decision).toMatchObject({ stream: true, toolName: tool.id });

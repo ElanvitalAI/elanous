@@ -8,6 +8,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { userConfigPath } from '../user-config.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { addMarket, codexPluginPackagePath, ensureInternalMarketIndex, listMarkets, MarketFetchError, updateMarket } from '../plugins/install/market-fetch.js';
+import { listAvailableMarketPlugins } from '../plugins/install/market-list.js';
 import { readCodexPluginList } from '../acp/codex-plugins.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
@@ -266,9 +267,17 @@ export function registerPluginCommands(program: Command): void {
         process.exitCode = 1;
       }
     });
-  market.command('list').description('List configured marketplaces').option('--json', 'JSON array')
-    .action((opts: { json?: boolean }) => {
+  market.command('list').description('List configured marketplaces or all available plugins').option('--json', 'JSON array')
+    .option('--all', 'List every plugin in every configured signed public market')
+    .action(async (opts: { json?: boolean; all?: boolean }) => {
       try {
+        if (opts.all) {
+          const plugins = await listAvailableMarketPlugins({ root: elanousStateRoot(), marketDir: join(elanousStateRoot(), 'plugins', 'markets') });
+          debug.log('plugin.cli', 'market.list.all', { count: plugins.length });
+          if (opts.json) stdout.write(JSON.stringify(plugins) + '\n');
+          else for (const { market, plugin } of plugins) console.log(`${plugin.name}@${plugin.version} (${market})${plugin.description ? ` — ${plugin.description}` : ''}`);
+          return;
+        }
         const markets = listMarkets();
         debug.log('plugin.cli', 'market.list', { count: markets.length });
         if (opts.json) stdout.write(JSON.stringify(markets) + '\n');

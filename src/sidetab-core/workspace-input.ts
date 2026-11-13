@@ -76,7 +76,7 @@ export function setWorkspaceInputDraft(state: WorkspaceInputState, mode: Workspa
 /** Bind a concrete child PTY. A workspace header itself is never a write target. */
 export function bindWorkspacePty(state: WorkspaceInputState, row: SidetabRow): WorkspaceInputState {
   const spaceId = state.activeSpaceId;
-  if (!spaceId || row.spaceId !== spaceId || !row.ptyId || row.badge === 'exited' ||
+  if (!spaceId || row.spaceId !== spaceId || !row.ptyId || row.badge === 'exited' || row.currentProcess ||
       !Number.isSafeInteger(row.ownerPid) || (row.ownerPid ?? 0) <= 0 ||
       !Number.isSafeInteger(row.ptyStartedAt) || (row.ptyStartedAt ?? 0) <= 0) {
     throw new Error('select a live PTY belonging to the active workspace');
@@ -116,7 +116,7 @@ export function prepareWorkspaceInput(
   const target = current.target;
   const live = freshRows.find(row => row.id === target.rowId && row.spaceId === spaceId && row.ptyId === target.ptyId
     && row.remoteHost === target.remoteHost && row.ownerPid === target.ownerPid
-    && row.ptyStartedAt === target.ptyStartedAt && row.badge !== 'exited');
+    && row.ptyStartedAt === target.ptyStartedAt && row.badge !== 'exited' && !row.currentProcess);
   if (!live) throw new Error('workspace PTY target changed; select it again');
   const text = mode === 'terminal' ? current.terminalDraft : current.sidechatDraft;
   if (!text.trim()) throw new Error('workspace input is empty');

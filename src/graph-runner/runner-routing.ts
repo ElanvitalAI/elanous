@@ -56,7 +56,9 @@ export function planHarnessLoopRoute(graph: GraphTemplateSpec, unitSuccessExit: 
 export function nextNode(edges: readonly GraphEdgeSpec[], nodeId: string, exitOutcome: 'ok' | 'fail', namedOutcome?: string): string | undefined {
   const edge = edges.find((item) => item.from === nodeId);
   if (!edge) return undefined;
-  if (edge.to !== undefined) return edge.to;
+  // A static edge is the success continuation. A failed node must not run
+  // downstream side effects and later turn the whole graph into a false done.
+  if (edge.to !== undefined) return exitOutcome === 'ok' ? edge.to : undefined;
   if (edge.on !== 'outcome') throw new Error(`unsupported edge condition: ${edge.on}`);
   if (namedOutcome !== undefined && edge.map && Object.hasOwn(edge.map, namedOutcome)) return edge.map[namedOutcome];
   return edge.map?.[exitOutcome] ?? edge.fallback?.[0]?.node;
@@ -64,21 +66,25 @@ export function nextNode(edges: readonly GraphEdgeSpec[], nodeId: string, exitOu
 
 export function releaseRouteReachesKnownIssues(edges: readonly GraphEdgeSpec[], startAt: string): boolean {
   const forbidden = new Set(['publish', 'approve-publish']);
-  const seen = new Set<string>();
-  let cursor: string | undefined = startAt;
-  while (cursor && cursor !== 'known-issues' && !seen.has(cursor)) {
-    if (forbidden.has(cursor)) return false;
-    seen.add(cursor);
+  const reaches = (cursor: string | undefined, seen: ReadonlySet<string>): boolean => {
+    if (!cursor || forbidden.has(cursor) || seen.has(cursor)) return false;
+    if (cursor === 'known-issues') return true;
     const edge = edges.find((candidate) => candidate.from === cursor);
     if (!edge) return false;
+    const visited = new Set(seen).add(cursor);
     if (edge.branches) {
       if (Object.values(edge.branches).flat().some((nodeId) => forbidden.has(nodeId))) return false;
-      cursor = edge.join;
-    } else {
-      cursor = nextNode(edges, cursor, 'ok', 'ok');
+      return reaches(edge.join, visited);
     }
-  }
-  return cursor === 'known-issues' && ![...seen].some((nodeId) => forbidden.has(nodeId));
+    // This release switch has two valid success exits, neither named "ok".
+    // An owner waiver may continue only if both exits reach known-issues before publication.
+    if (cursor === 'gate-cutover-switch') {
+      return !!edge.map?.legacy && !!edge.map?.audit
+        && reaches(edge.map.legacy, visited) && reaches(edge.map.audit, visited);
+    }
+    return reaches(nextNode(edges, cursor, 'ok', 'ok'), visited);
+  };
+  return reaches(startAt, new Set());
 }
 
 export function fanOutGraphSource(source: string, graph: GraphTemplateSpec, branchNode: string): string {

@@ -22,6 +22,63 @@ function recordApproval(root: string, runId: string, decidedAt: string) {
   return approval;
 }
 
+test('publish gate check accepts only the exact signed T6 OP waiver route', () => {
+  const root = mkdtempSync(join(tmpdir(), 'publish-signed-t6-'));
+  const before = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    const runId = '636f9e96-0aae-4cb0-babd-b509c44e2f34';
+    const cut = '7d951adb3163ba16a784d5b937d12732ef9be625';
+    const approval = recordApproval(root, runId, '2026-11-13T03:55:00.000Z');
+    const context: GraphContext = { graphId: 'release-loop', nodeId: 'publish', runId,
+      input: { version: '0.3.15', previousVersion: '0.3.14' }, outputs: {
+        'version-release': { outcome: 'ok', commit: cut },
+        gate: { outcome: 'error', commit: cut, introduced: [],
+          error: 'Error: remote gate refused: HQ shard result batch is incomplete (pod-68)' },
+        'gate-heal-decision': { outcome: 'waived-known-issue', graphId: 'release-loop', runId,
+          nodeId: 'gate-heal-decision', decidedBy: 'OP', decidedAt: '2026-11-13T03:50:00.000Z' },
+        'traffic-gate-passed': { outcome: 'ok' }, 'approve-publish': approval,
+      } };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    const noCommand = () => { throw new Error('publish command must not run in this fixture'); };
+    expect(runPublish(noCommand, undefined, undefined, root).summary).toBe('publish blocked: recorded PWA waiver signature or original failure differs');
+    const statePath = join(root, 'graph-runs/release-loop', `${runId}.json`);
+    const saved = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+    saved.fanOuts = { 'traffic-gate-passed:ok': { from: 'traffic-gate-passed', join: 'pre-prepare-join', branches: {
+      pwa: { runId: '0c489b82-e332-4bb8-b694-46430b94172b', status: 'failed', waiver: { verdict: 'waived', decidedBy: 'OP' } },
+    } } };
+    writeFileSync(statePath, JSON.stringify(saved));
+    context.outputs.pwa = { outcome: 'ok', commit: cut, verdict: 'pass' };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runPublish(noCommand, undefined, undefined, root).summary).toBe('publish blocked: recorded PWA waiver signature or original failure differs');
+    context.outputs.gate = { outcome: 'ok', commit: cut };
+    context.outputs['version-release']!.commit = 'b'.repeat(40);
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runPublish(noCommand, undefined, undefined, root).summary).toBe('publish blocked: recorded PWA waiver signature or original failure differs');
+    const otherRun = 'other-publish-run';
+    const otherApproval = recordApproval(root, otherRun, '2026-11-13T03:56:00.000Z');
+    const otherPath = join(root, 'graph-runs/release-loop', `${otherRun}.json`);
+    context.runId = otherRun;
+    context.input.acceptedRegressions = [{ id: 'waive:pwa', note: 'recorded OP waiver' }];
+    context.outputs['approve-publish'] = otherApproval;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runPublish(noCommand, undefined, undefined, root).summary).toBe('publish blocked: recorded PWA waiver signature or original failure differs');
+    delete context.input.acceptedRegressions;
+    const otherState = JSON.parse(readFileSync(otherPath, 'utf8')) as Record<string, unknown>;
+    otherState.fanOuts = saved.fanOuts;
+    writeFileSync(otherPath, JSON.stringify(otherState));
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runPublish(noCommand, undefined, undefined, root).summary).toBe('publish blocked: recorded PWA waiver signature or original failure differs');
+    context.outputs['gate-heal-decision']!.decidedBy = 'other';
+    context.outputs.gate = { outcome: 'error', commit: cut, introduced: [],
+      error: 'Error: remote gate refused: HQ shard result batch is incomplete (pod-68)' };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runPublish(noCommand, undefined, undefined, root).summary).toContain('gate outcome is not ok');
+  } finally {
+    if (before === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = before;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // The local freeze universe is isolated too (runPublish → beginLandingMerge reads effectiveInstanceRoot()).
 let isolatedStateDir = '';
 let savedStateDir: string | undefined;
@@ -333,6 +390,7 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
   const sleeps: number[] = [];
   const calls: string[] = [];
   const publishTimeouts: Array<number | undefined> = [];
+  let scheduledAt: string | undefined;
   const run = (command: string, args: string[], _cwd?: string, timeoutMs?: number) => {
     calls.push(`${command} @ ${now}`);
     if (command === 'bun') publishTimeouts.push(timeoutMs);
@@ -346,7 +404,7 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
       outputs: authorized ? outputs : { ...outputs, 'auto-approve': { outcome: 'fail' } } });
     calls.length = 0;
     sleeps.length = 0;
-    return runPublish(run, root, clock);
+    return runPublish(run, root, clock, root, () => scheduledAt ? { publishAt: scheduledAt } : null);
   };
   try {
     expect(publish('2099-10-09T20:00+09:00')).toMatchObject({ outcome: 'ok', tag: `v${version}` });
@@ -361,6 +419,11 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
     expect(calls.at(-1)).toBe(`bun @ ${now}`);
     expect(publish('2099-10-09T10:58:00Z').outcome).toBe('ok');
     expect(sleeps).toEqual([]);
+    scheduledAt = '2099-10-09T11:02:00Z';
+    expect(publish('2099-10-09T10:58:00Z').outcome).toBe('ok');
+    expect(sleeps).toEqual([60_000, 60_000]);
+    expect(calls.at(-1)).toBe(`bun @ ${Date.parse(scheduledAt)}`);
+    scheduledAt = undefined;
     expect(publish('2099-10-09T11:01:00Z', false).outcome).toBe('fail');
     expect(calls).toEqual([]);
     expect(sleeps).toEqual([]);

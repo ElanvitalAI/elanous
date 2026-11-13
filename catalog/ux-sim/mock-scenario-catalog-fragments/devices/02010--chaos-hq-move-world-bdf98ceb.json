@@ -1,0 +1,37 @@
+{
+  "id": "chaos-hq-move-world",
+  "name": "HQ heartbeat and durable TASK chaos recovery world",
+  "implementation": [
+    "src/ux-sim/chaos-hq-move-world.ts",
+    "src/ux-sim/chaos-hq-task-queue.ts"
+  ],
+  "tests": [
+    "src/ux-sim/chaos-hq-move-world.test.ts",
+    "src/ux-sim/chaos-hq-task-queue.test.ts",
+    "src/ux-sim/chaos-hq-move-consumer.test.ts"
+  ],
+  "target": "Virtual HQ failure and TASK recovery through the real heartbeat/arbiter/fence and supported OS-sandboxed world runner; no operational host or lease mutation.",
+  "inputs": [
+    "Monkey/Gorilla/Kong fault and repetition",
+    "virtual host reachability and process PID inventory",
+    "durable virtual TASK queue",
+    "explicit virtual Kong approval",
+    "restart, replacement claim and queue-loss controls"
+  ],
+  "observations": [
+    "selected holder and generation",
+    "observed virtual recovery time",
+    "lost TASK IDs and live replacement completion records",
+    "manual intervention count and zero real machine stops",
+    "old PID ACK rejection only after accepted replacement claim",
+    "failed replacement claim retains pending TASK without success evidence"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/chaos-hq-move-world.test.ts src/ux-sim/chaos-hq-task-queue.test.ts src/ux-sim/chaos-hq-move-consumer.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "chaos-hq-move"
+  ],
+  "recentUse": null
+}

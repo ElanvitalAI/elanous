@@ -34,6 +34,7 @@ import { decodeJWTPayload } from './jwt.js';
 import { authStorePath, isUnderTestRunner } from './store.js';
 import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { resolveCodexCredentialOwnerHost } from '../nexus/config/secrets/cred-owner.js';
+import { codexHealthCredential, recordCodexUnauthorized } from './codex-account-health.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { platform, release, arch } from 'node:os';
@@ -470,10 +471,14 @@ function remainingSeconds(state: ProviderAuthState | null): number | null {
   return Math.round((exp - Date.now()) / 1000);
 }
 
-/** Shared remote consumer for availability probes and every Codex provider request. */
-export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: ProviderAuthState; storeKey: string } {
+/** Shared remote consumer for availability probes and every Codex provider request.
+ *  `storePath` is the file that supplied `state` (config-dir, default-root, or the mirror). */
+export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: ProviderAuthState; storeKey: string; storePath: string } {
   const mirrorPath = ownerMirrorPath ?? codexOwnerMirrorAuthPath();
-  const account = resolveCodexAccountForRun(process.env, { storePath: ownerMirrorPath ?? codexAccountReadStorePath(authStorePath()) });
+  const account = resolveCodexAccountForRun(process.env, {
+    storePath: (ownerMirrorPath || process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH)
+      ? mirrorPath : codexAccountReadStorePath(authStorePath()),
+  });
   if (!ownerMirrorPath) {
     for (const [source, path] of [['config-dir', authStorePath()], ['default-root', join(homedir(), '.elanous', 'auth.json')]] as const) {
       try {
@@ -487,17 +492,18 @@ export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: P
       if (state.chatGPT?.accountId && state.accountUuid && state.chatGPT.accountId !== state.accountUuid) continue;
       observeCodexAuth('fresh', { storeKey: account.storeKey, source,
         rootSha256: createHash('sha256').update(dirname(path)).digest('hex').slice(0, 16) });
-      return { state, storeKey: account.storeKey };
+      return { state, storeKey: account.storeKey, storePath: path };
     }
   }
   const state = readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath });
   observeCodexAuth('fresh', { storeKey: account.storeKey, source: 'owner-mirror',
     rootSha256: createHash('sha256').update(dirname(mirrorPath)).digest('hex').slice(0, 16) });
-  return { state, storeKey: account.storeKey };
+  return { state, storeKey: account.storeKey, storePath: mirrorPath };
 }
 
 export async function loadFreshCodexAuthState(
-  opts: { fetchImpl?: typeof fetch; mirrorCodex?: boolean; ownerMirrorPath?: string } = {},
+  opts: { fetchImpl?: typeof fetch; mirrorCodex?: boolean; ownerMirrorPath?: string;
+    onSelectedAccount?: (storeKey: string, storePath: string) => void } = {},
 ): Promise<ProviderAuthState | null> {
   const accessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1';
   const ownerConfig = getUserConfig();
@@ -512,7 +518,8 @@ export async function loadFreshCodexAuthState(
   if (!tokenOwnerHost) {
     // A non-owner host reads only the HQ-pushed access snapshot. It never
     // reconciles ~/.codex or reaches the refresh endpoint with local credentials.
-    const { state, storeKey } = readCodexOwnerMirrorForRun(opts.ownerMirrorPath);
+    const { state, storeKey, storePath } = readCodexOwnerMirrorForRun(opts.ownerMirrorPath);
+    opts.onSelectedAccount?.(storeKey, storePath);
     observeCodexAuth('fresh', { storeKey, remainingSeconds: remainingSeconds(state), refreshed: false, source: 'owner-cli-mirror' });
     return state;
   }
@@ -523,6 +530,7 @@ export async function loadFreshCodexAuthState(
   // ⛔⭐ 설정을 «여기서 다시 읽지 않는다» — 해석기 안에 한 자리만 둔다(리뷰 must-fix).
   //   호출자마다 읽으면 「설정 읽기는 한 자리」라는 배선을 호출자가 스스로 깬다.
   const account = resolveCodexAccountForRun();
+  opts.onSelectedAccount?.(account.storeKey, authStorePath());
   const stored = loadTokens(account.storeKey);
   if (!stored && authStorePath() !== join(homedir(), '.elanous', 'auth.json')) {
     const defaultPath = join(homedir(), '.elanous', 'auth.json');
@@ -535,6 +543,7 @@ export async function loadFreshCodexAuthState(
           && (!fallback.chatGPT?.accountId || !fallback.accountUuid || fallback.chatGPT.accountId === fallback.accountUuid)) {
           try { debug.log('llm.auth', 'path-found', { source: 'default-root',
             rootSha256: createHash('sha256').update(dirname(defaultPath)).digest('hex').slice(0, 16) }); } catch { /* fail-soft */ }
+          opts.onSelectedAccount?.(account.storeKey, defaultPath);
           return fallback;
         }
       }
@@ -597,7 +606,7 @@ export async function loadFreshCodexAuthState(
     const reconciled = mirrorPath
       ? reconcileCodexTokensFromMirror(loadTokens(account.storeKey), authStorePath(), mirrorPath, account.storeKey)
       : loadTokens(account.storeKey);
-    if (reconciled && !isExpiringSoon(reconciled, 0)) {
+    if (reconciled && reconciled.tokens.refreshToken !== state.tokens.refreshToken && !isExpiringSoon(reconciled, 0)) {
       // ⭐ 「내 갱신은 졌지만 남이 이미 갱신해 뒀다」 — 경합의 «정상» 결말이라 실패로 세지 않는다.
       observeCodexAuth('refresh-lost-race-recovered', {
         storeKey: account.storeKey, refreshed: false,
@@ -605,6 +614,10 @@ export async function loadFreshCodexAuthState(
         ...classifyAuthError(err),
       });
       return reconciled;
+    }
+    if (classifyAuthError(err).errorKind === 'unauthorized') {
+      try { recordCodexUnauthorized(authStorePath(), account.storeKey, codexHealthCredential(state.tokens)); }
+      catch { /* auth failure remains authoritative when health recording fails */ }
     }
     // Both stores dead → genuine re-login needed.
     if (isExpiringSoon(state, 0)) {

@@ -793,6 +793,7 @@ describe('OP FU (MK #8178 shard-9) — a failed shard leaves <shardId>.failure.j
   const baseline = ((_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base')) as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree;
   // Fake child: test/boom exits 2 before writing JUnit (huge stdout, a secret on stderr); everything else writes JUnit and exits 0.
   const fakeSpawn = ((command: string[]) => {
+    expect(command).toContain('--preserve-symlinks');
     const outfile = command.find((arg) => arg.startsWith('--reporter-outfile='))!.slice('--reporter-outfile='.length);
     const selected = command.filter((arg) => arg.endsWith('.test.ts'));
     if (selected.includes('test/boom.test.ts')) {

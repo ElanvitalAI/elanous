@@ -7,7 +7,7 @@ const GOOGLE_TOKEN = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO = 'https://openidconnect.googleapis.com/v1/userinfo';
 const APPROVED_SCOPES = ['email', 'openid', 'profile'] as const;
 // 출처: #89454 — encrypted OAuth state is short-lived; retain the prior 10-minute state TTL.
-const STATE_TTL_MS = 10 * 60_000;
+export const STATE_TTL_MS = 10 * 60_000;
 // Source: KAIST 강당 300명 동시 · 1분 창
 // One shared public IP can have 300 legitimate starts in a minute.
 // Keep a finite per-network cap with 20% headroom for retries.

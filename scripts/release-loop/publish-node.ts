@@ -7,11 +7,13 @@ import { beginLandingMerge, landingFreezeMessage } from '../../src/release-loop/
 import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { getSchedule } from '../../src/release-loop/release-schedule.js';
 import { prereleaseKind } from './release-version.js';
 import { hasPassingEmergencyPublishGate } from './emergency-publish-authorization.js';
 import { publishAtError } from './publish-at.js';
 import { validatedTuiRegress } from './tui-node-checks.js';
-import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
+import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, signedT6KnownIssueGatePassed, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
+import { T6_PWA_WAIVER } from '../../src/graph-runner/release-pwa-known-issue.js';
 
 /** The approval output alone is not authority: the runner also stores a one-winner decision claim for this visit. */
 export function hasRecordedPublishApproval(context: GraphContext, root: string): boolean {
@@ -36,6 +38,21 @@ export function hasRecordedPublishApproval(context: GraphContext, root: string):
     const claim = JSON.parse(readFileSync(`${statePath}.${visit + 1}.decision.json`, 'utf8')) as Record<string, unknown>;
     return claim.nodeId === 'approve-publish' && claim.decision === 'approved'
       && claim.decidedAt === approval.decidedAt;
+  } catch { return false; }
+}
+
+/** A persisted PWA waiver remains a publish gate even if the current context identity was changed. */
+function hasRecordedPwaWaiver(context: GraphContext, root: string): boolean {
+  const accepted = context.input.acceptedRegressions;
+  if (Array.isArray(accepted) && accepted.some((item: unknown) => item && typeof item === 'object' &&
+    (item as { id?: unknown }).id === 'waive:pwa')) return true;
+  if (!context.runId || !/^[A-Za-z0-9_-]+$/.test(context.runId)) return false;
+  try {
+    const state = JSON.parse(readFileSync(join(root, 'graph-runs/release-loop', `${context.runId}.json`), 'utf8')) as {
+      fanOuts?: Record<string, { branches?: Record<string, Record<string, unknown>> }>;
+    };
+    const branch = state.fanOuts?.['traffic-gate-passed:ok']?.branches?.pwa;
+    return !!branch && Object.hasOwn(branch, 'waiver');
   } catch { return false; }
 }
 
@@ -89,7 +106,8 @@ export function waitForAssets(run: CommandRunner, repo: string, tag: string, nam
 
 export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: string,
   clock: { now: () => number; sleep: (ms: number) => void } = { now: Date.now, sleep: Bun.sleepSync },
-  approvalRoot = effectiveInstanceRoot()) {
+  approvalRoot = effectiveInstanceRoot(),
+  schedule: (version: string) => { publishAt?: string | null } | null = (v) => getSchedule(v, approvalRoot)) {
   const context = readGraphContext();
   // A resumed graph once invoked this irreversible node at npm-publish, docs-land, and failed.
   // The runner's context is the authority: only the publish visit may publish.
@@ -120,9 +138,16 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
     && (gate.outcome === 'ok' || gate.outcome === 'pass(owner-waived)')
     && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
     && typeof gate.reason === 'string' && gate.reason.trim().length > 0;
-  if (gate?.outcome !== 'ok' && !ownerWaivedGate && !emergencyGate)
+  if (gate?.outcome !== 'ok' && !ownerWaivedGate && !signedT6KnownIssueGatePassed(context) && !emergencyGate)
     return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: gate outcome is not ok, explicitly owner-waived, or replaced by a same-run emergency gate' };
+  const exactT6Pwa = context.runId === T6_PWA_WAIVER.runId && context.input.version === '0.3.15'
+    && context.outputs['version-release']?.commit === T6_PWA_WAIVER.cut;
+  const pwaWaiverGate = hasRecordedPwaWaiver(context, approvalRoot) || exactT6Pwa;
+  const signedPwa = pwaWaiverGate && signedT6PwaKnownIssue(context, approvalRoot);
+  if (pwaWaiverGate && !signedPwa)
+    return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: recorded PWA waiver signature or original failure differs' };
   for (const node of ['pwa', 'upgrade', 'tui', 'prepare', 'docs']) {
+    if (node === 'pwa' && signedPwa) continue;
     if (context.outputs[node]?.outcome !== 'ok') return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `publish blocked: ${node} outcome is not ok` };
   }
   if (nodeOutput(context, 'prepare', 'commit') !== nodeOutput(context, 'version-release', 'commit')) throw new Error('prepare commit differs from release commit');
@@ -140,8 +165,11 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
     if (typeof at !== 'string' || publishAtError(at) !== null) {
       throw new Error('invalid publishAt in release run input');
     }
-    const deadline = Date.parse(at);
-    while (clock.now() < deadline) {
+    const inputDeadline = Date.parse(at);
+    while (true) {
+      const scheduledAt = schedule(version)?.publishAt;
+      const deadline = Math.max(inputDeadline, scheduledAt ? Date.parse(scheduledAt) : 0);
+      if (clock.now() >= deadline) break;
       const remaining = deadline - clock.now();
       clock.sleep(Math.min(remaining, 60_000));
     }

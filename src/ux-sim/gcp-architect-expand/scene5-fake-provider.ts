@@ -7,6 +7,8 @@ import { emptyGraphCapabilityRegistry, registerGraphCapabilityContract,
   type GraphContractId } from '../../graph-runner/capabilities.js';
 import { activeResourceLeases, beginResourceLease, endResourceLease,
   readResourceLedger } from '../../resource-ledger/resource-ledger.js';
+import { proposalFromScene4Bytes } from './proposal-from-scene4.js';
+import { validateProposalPressure } from '../../../scripts/gcp-architect-expand/demo/pressure-input.js';
 
 type Attachment = { kind: 'diagram' | 'diagram-source' | 'pdf' | 'html'; title: string;
   url: string; mime: string; sha256: string; producedBy: string };
@@ -20,11 +22,11 @@ type FakeRunState = { graphId: string; runId: string; proposalId: string; estima
   realGcpCalls: 0; resourceLedgerPath: string };
 
 export interface GcpScene5FakeWorld {
-  proposal: Proposal;
   pressure: unknown;
   outDir: string;
   stateRoot: string;
   approvalNodeId?: string;
+  designNodeId?: string;
   deliverables: () => Promise<{ attachments: Attachment[]; receipt: { status?: string; immutableDirectory?: string } }>;
   onInvoke?: (nodeId: string) => void;
 }
@@ -39,12 +41,14 @@ export function registerGcpScene5FakeProvider(world: GcpScene5FakeWorld,
   base: GraphCapabilityRegistry = emptyGraphCapabilityRegistry()): GraphCapabilityRegistry {
   if (!isAbsolute(world.outDir) || !isAbsolute(world.stateRoot))
     throw new Error('Scene 5 output and graph state directories must be absolute');
-  const proposal = world.proposal;
-  if (!proposal.id || !proposal.inputSha256 || !proposal.region || !proposal.architecture
-    || !proposal.shortageAxes?.length || !Number.isFinite(proposal.idleTtlMs) || proposal.idleTtlMs <= 0
-    || proposal.estimate?.price !== 'unpriced'
-    || !proposal.estimate.formula || !proposal.estimate.skuSource || proposal.realGcpCalls !== 0)
-    throw new Error('invalid fake GCP proposal');
+  if (!world.designNodeId) throw new Error('Scene 5 design node identity is required');
+  const proposalsByRun = new Map<string, Proposal>();
+  const runKey = (graphId: string, runId: string) => `${graphId}:${runId}`;
+  const activeProposal = (graphId: string, runId: string): Proposal => {
+    const proposal = proposalsByRun.get(runKey(graphId, runId));
+    if (!proposal) throw new Error(`fake GCP proposal is unavailable for ${graphId}/${runId}`);
+    return proposal;
+  };
   let registry = base;
   for (const id of contracts) {
     if (!registry.contracts[id]) registry = registerGraphCapabilityContract(registry, { id, input: { type: 'object' }, output: { type: 'object' } });
@@ -57,10 +61,10 @@ export function registerGcpScene5FakeProvider(world: GcpScene5FakeWorld,
   const costPath = (graphId: string, runId: string) => join(runDir(graphId, runId), 'cost-ledger.json');
   const readRun = (graphId: string, runId: string): FakeRunState => {
     const path = costPath(graphId, runId);
-    if (!existsSync(path)) return { graphId, runId, proposalId: proposal.id, estimate: proposal.estimate,
+    if (!existsSync(path)) return { graphId, runId, proposalId: activeProposal(graphId, runId).id, estimate: activeProposal(graphId, runId).estimate,
       events: [], realGcpCalls: 0, resourceLedgerPath: join(runDir(graphId, runId), 'resource-events.jsonl') };
     const state = JSON.parse(readFileSync(path, 'utf8')) as FakeRunState;
-    if (state.graphId !== graphId || state.runId !== runId || state.proposalId !== proposal.id
+    if (state.graphId !== graphId || state.runId !== runId || state.proposalId !== activeProposal(graphId, runId).id
       || state.realGcpCalls !== 0 || !Array.isArray(state.events)
       || state.resourceLedgerPath !== join(runDir(graphId, runId), 'resource-events.jsonl'))
       throw new Error('fake GCP run ledger identity mismatch');
@@ -74,14 +78,14 @@ export function registerGcpScene5FakeProvider(world: GcpScene5FakeWorld,
   };
   const addEvent = (state: FakeRunState, name: string, at = Date.now()) => {
     if (!state.events.some(item => item.event === name))
-      state.events.push({ event: name, amount: 'unpriced', at: new Date(at).toISOString(), proposalId: proposal.id });
+      state.events.push({ event: name, amount: 'unpriced', at: new Date(at).toISOString(), proposalId: activeProposal(state.graphId, state.runId).id });
     persist(state);
   };
-  const inputMatchesProposal = (value: unknown): boolean => {
+  const inputMatchesProposal = (value: unknown, graphId: string, runId: string): boolean => {
     const input = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
     const path = input.ticketDesignPath;
     if (typeof path !== 'string' || !isAbsolute(path)) return false;
-    try { return createHash('sha256').update(readFileSync(path)).digest('hex') === proposal.inputSha256; }
+    try { return createHash('sha256').update(readFileSync(path)).digest('hex') === activeProposal(graphId, runId).inputSha256; }
     catch { return false; }
   };
   const attachmentFile = (item: Attachment, immutableDirectory?: string): string | null => {
@@ -115,19 +119,62 @@ export function registerGcpScene5FakeProvider(world: GcpScene5FakeWorld,
       } catch { return false; }
     });
   };
+  const approvedDesignMatchesProposal = (graphId: string, runId: string): boolean => {
+    const path = join(world.stateRoot, 'graph-runs', graphId, `${runId}.json`);
+    try {
+      const state = JSON.parse(readFileSync(path, 'utf8')) as { nodes?: Array<{ nodeId?: string; output?: string }> };
+      const node = state.nodes?.find(item => item.nodeId === world.designNodeId);
+      if (typeof node?.output !== 'string') return false;
+      const output = JSON.parse(node.output);
+      const approved = output?.result?.architectureSpec;
+      return !!approved && JSON.stringify(approved) === JSON.stringify(activeProposal(graphId, runId));
+    } catch { return false; }
+  };
   return registerGraphCapabilityProviderDeclaration(registry, {
     id: 'gcp-scene5-fake-world', provides: contracts, tier: 'free', invoke: async ({ requires, graphId, runId, nodeId, input, graphInput }) => {
       world.onInvoke?.(nodeId);
+      const graphArgs = graphInput && typeof graphInput === 'object' && !Array.isArray(graphInput)
+        ? graphInput as Record<string, unknown> : {};
+      const inputPath = graphArgs.ticketDesignPath;
+      const key = runKey(graphId, runId);
+      const proposalForRun = (): Proposal => {
+        const existing = proposalsByRun.get(key);
+        if (existing) return existing;
+        if (typeof inputPath !== 'string' || !isAbsolute(inputPath))
+          throw new Error('Scene 4 ticketDesignPath is required in graph input');
+        const built = proposalFromScene4Bytes(readFileSync(inputPath), world.pressure) as Proposal;
+        proposalsByRun.set(key, built);
+        return built;
+      };
+      if (requires !== 'cloud-resource.observe@1' && requires !== 'cloud-resource.design@1') {
+        try { proposalForRun(); }
+        catch (error) { return { ok: false, outcome: 'failed', error: error instanceof Error ? error.message : 'Scene 4 proposal unavailable' }; }
+      }
+      if (requires === 'cloud-resource.provision@1' || requires === 'cloud-resource.schedule@1'
+        || requires === 'cloud-resource.idle-stop@1') {
+        if (!approvedInGraphLedger(graphId, runId))
+          return { ok: false, outcome: 'failed', error: 'user approval required' };
+        if (!approvedDesignMatchesProposal(graphId, runId)
+          || !inputMatchesProposal(graphInput ?? input, graphId, runId))
+          return { ok: false, outcome: 'failed', error: 'Scene 4 design input changed after approval' };
+      }
       switch (requires) {
         case 'cloud-resource.observe@1':
+          {
+          const observedPressure = validateProposalPressure(world.pressure);
           return { ok: true, outcome: 'shortage', result: { signal: world.pressure,
-            shortageAxes: proposal.shortageAxes, source: proposal.signalSource } };
+            shortageAxes: observedPressure.shortage, source: observedPressure.source } };
+          }
         case 'cloud-resource.design@1':
-          if (!inputMatchesProposal(graphInput ?? input))
+          {
+          try { proposalForRun(); }
+          catch (error) { return { ok: false, outcome: 'failed', error: error instanceof Error ? error.message : 'invalid Scene 4 design input' }; }
+          if (!inputMatchesProposal(graphInput, graphId, runId))
             return { ok: false, outcome: 'failed', error: 'Scene 4 design input SHA does not match GCP proposal' };
-          return { ok: true, outcome: 'proposed', result: { proposalId: proposal.id,
-            architectureSpec: proposal, estimate: proposal.estimate, savings: proposal.savings,
-            security: proposal.security } };
+          return { ok: true, outcome: 'proposed', result: { proposalId: activeProposal(graphId, runId).id,
+            architectureSpec: activeProposal(graphId, runId), estimate: activeProposal(graphId, runId).estimate,
+            savings: activeProposal(graphId, runId).savings, security: activeProposal(graphId, runId).security } };
+          }
         case 'cloud-resource.architecture-deliverables@1': {
           const output = await world.deliverables();
           const required = ['diagram', 'diagram-source', 'pdf', 'html'];
@@ -140,21 +187,18 @@ export function registerGcpScene5FakeProvider(world: GcpScene5FakeWorld,
           return { ok: true, outcome: 'done', result: output };
         }
         case 'cloud-resource.provision@1':
-          if (!approvedInGraphLedger(graphId, runId)) return { ok: false, outcome: 'failed', error: 'user approval required' };
-          if (!inputMatchesProposal(graphInput ?? input))
-            return { ok: false, outcome: 'failed', error: 'Scene 4 design input changed after approval' };
           {
           const state = readRun(graphId, runId);
           if (state.project) return { ok: true, outcome: 'done', result: { project: state.project } };
           mkdirSync(runDir(graphId, runId), { recursive: true });
-          const leaseFp = `fp_${createHash('sha256').update(`${proposal.id}:${graphId}:${runId}`).digest('hex').slice(0, 12)}`;
+          const leaseFp = `fp_${createHash('sha256').update(`${activeProposal(graphId, runId).id}:${graphId}:${runId}`).digest('hex').slice(0, 12)}`;
           if (!activeResourceLeases(readResourceLedger(state.resourceLedgerPath)).some(item => item.id === leaseFp))
             beginResourceLease({ fp: leaseFp,
-            host: `fakegcp.${proposal.region}`, lane: 'unknown',
-            resources: { cpu: 2, memoryBytes: 2 * 1024 ** 3 }, mission: { cell: proposal.id },
-            ttlMs: proposal.idleTtlMs, now: new Date() }, state.resourceLedgerPath);
+            host: `fakegcp.${activeProposal(graphId, runId).region}`, lane: 'unknown',
+            resources: { cpu: 2, memoryBytes: 2 * 1024 ** 3 }, mission: { cell: activeProposal(graphId, runId).id },
+            ttlMs: activeProposal(graphId, runId).idleTtlMs, now: new Date() }, state.resourceLedgerPath);
           state.leaseId = leaseFp;
-          state.project = { id: `fake-${proposal.id}-${runId}`, state: 'created', provider: 'fake-gcp' };
+          state.project = { id: `fake-${activeProposal(graphId, runId).id}-${runId}`, state: 'created', provider: 'fake-gcp' };
           addEvent(state, 'project-created');
           return { ok: true, outcome: 'done', result: { project: state.project } };
           }
@@ -178,8 +222,8 @@ export function registerGcpScene5FakeProvider(world: GcpScene5FakeWorld,
           // Virtual clock: the fake job is idle for the declared TTL; no real wait or cloud call.
           if (activeResourceLeases(readResourceLedger(state.resourceLedgerPath)).some(item => item.id === state.leaseId))
             endResourceLease(state.leaseId, 'fake idle TTL', 'gcp-scene5-fake-world',
-              new Date(state.scheduledAt + proposal.idleTtlMs), state.resourceLedgerPath);
-          state.project.state = 'stopped'; addEvent(state, 'idle-stopped', state.scheduledAt + proposal.idleTtlMs);
+              new Date(state.scheduledAt + activeProposal(graphId, runId).idleTtlMs), state.resourceLedgerPath);
+          state.project.state = 'stopped'; addEvent(state, 'idle-stopped', state.scheduledAt + activeProposal(graphId, runId).idleTtlMs);
           return { ok: true, outcome: 'stopped', result: { project: state.project, costLedger: state.events,
             activeLeases: activeResourceLeases(readResourceLedger(state.resourceLedgerPath)).length } };
           }

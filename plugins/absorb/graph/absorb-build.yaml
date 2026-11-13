@@ -101,10 +101,10 @@ nodes:
         title: "$lookup-suggestion.evidence.suggestion.ask"
         summary: 앱 배포 완료
         runId: "$context.runId"
+        attachments: "$input.attachments?"
         result:
           publicUrl: "$publish.result.resultUrl"
           resultUrl: "$publish.result.resultUrl"
-        attachments: "$input.attachments"
         at: "$context.nodeStartedAt"
 edges:
   - { from: lookup-suggestion, on: outcome, map: { done: board-building, failed: failed } }

@@ -104,6 +104,10 @@ beforeEach(() => {
   savedEnv.XDG_STATE_HOME = process.env.XDG_STATE_HOME;
   savedEnv.LOCAL_LLM_URL = process.env.LOCAL_LLM_URL;
   savedEnv.LOCAL_LLM_MODEL = process.env.LOCAL_LLM_MODEL;
+  savedEnv.ELANOUS_LLM_MODE = process.env.ELANOUS_LLM_MODE;
+  // Exercise the real local provider against fakeFetch, rather than the
+  // NODE_ENV=test default fake LLM that bypasses the HTTP adapter entirely.
+  process.env.ELANOUS_LLM_MODE = 'real';
   process.env.ELANOUS_STATE_DIR = join(tmpRoot, 'state');
   process.env.XDG_DATA_HOME = join(tmpRoot, 'data');
   process.env.XDG_STATE_HOME = join(tmpRoot, 'state');

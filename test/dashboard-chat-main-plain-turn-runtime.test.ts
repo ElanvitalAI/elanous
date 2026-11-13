@@ -929,7 +929,7 @@ describe('runDashboardChatMainPlainTurn', () => {
 
   it('sends repaired pairs through the real local ACP path on the second Codex request', async () => {
     const root = mkdtempSync(join(tmpdir(), 'compact-prepass-wire-'));
-    const envKeys = ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_STATE_DIR',
+    const envKeys = ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_STATE_DIR', 'ELANOUS_LLM_MODE',
       'ELANOUS_CODEX_ACCOUNT', 'ELANOUS_CODEX_ACCOUNT_HOME'] as const;
     const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
     const originalFetch = globalThis.fetch;
@@ -937,6 +937,7 @@ describe('runDashboardChatMainPlainTurn', () => {
     let boot: Awaited<ReturnType<typeof bootDashboardAcpSession>> | undefined;
     try {
     for (const key of envKeys) delete process.env[key];
+    process.env.ELANOUS_LLM_MODE = 'real';
     process.env.HOME = root;
     process.env.XDG_CONFIG_HOME = root;
     process.env.CODEX_HOME = join(root, 'codex-home');

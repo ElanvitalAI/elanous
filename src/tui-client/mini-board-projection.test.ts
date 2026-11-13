@@ -83,3 +83,19 @@ test('widget scroll exposes every board column when the pane is shorter than its
   expect(lastPage.join('\n')).toContain('배포됨(1)');
   expect(lastPage.join('\n')).toContain('완료 카드');
 });
+
+test('Scene 6 NEXT projection shows diagram and PDF links on the deployed card', () => {
+  const board = projectTuiMiniBoard([event('scene-6', 'intake', 0, 'intake', { title: '티켓팅 MVP' }), event('scene-6', 'release', 1, 'released', {
+    title: '티켓팅 MVP', status: 'done', attachments: [
+      { kind: 'diagram', title: '아키텍처', url: 'https://demo.example.test/diagram.svg' },
+      { kind: 'pdf', title: '설계 보고서', url: 'https://demo.example.test/report.pdf' },
+    ],
+  })], 1);
+  const text = renderTuiMiniBoard(board, 60).join('\n');
+  expect(text).toContain('배포됨(1)');
+  expect(text).toContain('티켓팅 MVP');
+  expect(text).toContain('도면 아키텍처');
+  expect(text.replace(/\s+/g, '')).toContain('https://demo.example.test/diagram.svg');
+  expect(text).toContain('PDF 설계 보고서');
+  expect(text.replace(/\s+/g, '')).toContain('https://demo.example.test/report.pdf');
+});

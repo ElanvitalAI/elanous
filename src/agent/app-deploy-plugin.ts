@@ -20,7 +20,7 @@ export type AppDeployOutput = {
 };
 
 export interface AppDeployPublishHook {
-  publish(input: { appId: 'lecture-scrap'; ownerUserId: string; simulationReceipt: string }): Promise<{ publicUrl: string }>;
+  publish(input: { appId: 'lecture-scrap'; ownerUserId: string; simulationReceipt: string; owner: NonNullable<ToolRuntimeContext['appDeploymentOwner']> }): Promise<{ publicUrl: string }>;
   verifyPublicUrl(publicUrl: string): Promise<boolean>;
 }
 
@@ -106,7 +106,7 @@ export async function runAppDeploy(
   } catch (error) {
     return { kind: 'site-deploy', status: 'failed', error: error instanceof Error ? error.message : String(error) };
   }
-  const hook = deps.hook ?? publishHook;
+  const hook = deps.hook ?? context?.appDeployPublishHook ?? publishHook;
   if (!hook) return { kind: 'site-deploy', status: 'simulated', simulationReceipt: receiptId };
   const memberOwner = context?.appDeploymentOwner;
   if (context?.requestOrigin === 'external-agent' || context?.appDeploymentSession !== 'nexus-owner'
@@ -130,7 +130,7 @@ export async function runAppDeploy(
   });
   if (!confirmation.answer) return { kind: 'site-deploy', status: 'rejected', simulationReceipt: receiptId };
   try {
-    const published = await hook.publish({ appId: 'lecture-scrap', ownerUserId, simulationReceipt: receiptId });
+    const published = await hook.publish({ appId: 'lecture-scrap', ownerUserId, simulationReceipt: receiptId, owner: memberOwner });
     const publicUrl = verifiedAppDeploymentUrl('lecture-scrap', ownerUserId, published.publicUrl);
     if (!await hook.verifyPublicUrl(publicUrl)) throw new Error('public app URL did not open');
     return { kind: 'site-deploy', status: 'published', publicUrl, simulationReceipt: receiptId };

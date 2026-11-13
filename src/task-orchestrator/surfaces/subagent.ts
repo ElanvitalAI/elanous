@@ -23,6 +23,7 @@ export interface SubagentCallable {
     definitionName: string;
     prompt: string;
     model?: string;
+    providerName?: string;
     signal?: AbortSignal;
   }): Promise<{
     address: string;
@@ -73,6 +74,7 @@ export function createSubagentAdapter(opts: SubagentAdapterOptions) {
         definitionName: surface.definitionName,
         prompt: surface.prompt,
         model,
+        providerName: ctx.providerName,
         signal: ctx.signal,
       });
       address = res.address;

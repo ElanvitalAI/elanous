@@ -13,6 +13,9 @@ export interface SidetabRouteHost {
   spawnSideAgent(agent: SidetabAgent): Promise<string | undefined>;
   sendSelectedAgent(input: string): Promise<boolean>;
   readSelectedAgent(): Promise<string | undefined>;
+  bindWorkspaceSelected(): Promise<boolean>;
+  submitWorkspace(mode: 'terminal' | 'sidechat', text: string): Promise<{ sent: boolean; reply?: string }>;
+  broadcastWorkspace(rowIds: readonly string[], text: string): Promise<{ sent: number; total: number; outcome: 'complete' | 'rejected' | 'unknown' }>;
   addHelp(...lines: string[]): void;
   setStatus(message: string): void;
 }
@@ -22,8 +25,32 @@ export async function runNextTuiBranchRoute(input: string, host: SidetabRouteHos
   const parts = input.slice(1).trim().split(/\s+/);
   const action = parts[1]?.toLowerCase();
   if (action === 'help') {
-    host.addHelp('/side [open|close|off|on|all|workspaces|new|kill|help]', '/side agent codex|claude|hermes · /side send 내용 · /side read');
+    host.addHelp('/side [open|close|off|on|all|workspaces|new|kill|help]', '/side agent codex|claude|hermes · /side send 내용 · /side read',
+      '/side bind · /side chat 내용 · /side terminal 내용 · /side broadcast 행ID,행ID -- 내용');
     host.setStatus('Enter 전송');
+  } else if (action === 'bind') {
+    host.setStatus(await host.bindWorkspaceSelected() ? '워크스페이스 PTY 결합' : '워크스페이스의 실행 중인 PTY 행을 선택하세요');
+  } else if (action === 'chat' || action === 'terminal') {
+    const text = input.trim().replace(/^\/[\w-]+\s+(?:chat|terminal)\s*/i, '');
+    if (!text) { host.setStatus('워크스페이스 입력이 비었습니다'); return; }
+    try {
+      const result = await host.submitWorkspace(action === 'chat' ? 'sidechat' : 'terminal', text);
+      if (result.reply) host.addHelp(result.reply);
+      host.setStatus(result.sent ? (action === 'chat' ? '워크스페이스 별도 대화 응답' : '워크스페이스 PTY 전송') : '워크스페이스 PTY 전송 거부 · 대상을 확인하세요');
+    } catch (error) {
+      host.setStatus(error instanceof Error && 'code' in error && error.code === 'WORKSPACE_TERMINAL_OUTCOME_UNKNOWN'
+        ? '워크스페이스 PTY 전송 결과 미확인 · 대상 화면과 이력을 확인하기 전 재시도 금지'
+        : `워크스페이스 입력 중지 · ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else if (action === 'broadcast') {
+    const match = /^\/side\s+broadcast\s+([^\s]+)\s+--\s+([\s\S]+)$/i.exec(input.trim());
+    if (!match) { host.setStatus('사용법: /side broadcast 행ID,행ID -- 내용'); return; }
+    try {
+      const result = await host.broadcastWorkspace(match[1]!.split(',').filter(Boolean), match[2]!);
+      host.setStatus(result.outcome === 'unknown'
+        ? `워크스페이스 전송 ${result.sent}/${result.total} · 마지막 전송 결과 미확인, PTY 확인 전 재시도 금지`
+        : `워크스페이스 전송 ${result.sent}/${result.total} · ${result.outcome === 'complete' ? '완료' : '거부된 대상 재확인'}`);
+    } catch (error) { host.setStatus(`워크스페이스 방송 중지 · ${error instanceof Error ? error.message : String(error)}`); }
   } else if (action === 'agent') {
     const agent = parts[2]?.toLowerCase() ?? '';
     if (!isSidetabAgent(agent)) { host.setStatus('에이전트 선택: codex · claude · hermes'); return; }

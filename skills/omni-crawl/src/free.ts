@@ -91,9 +91,9 @@ export async function searchDdg(query: string, opts?: { maxResults?: number; tim
  * deer-flow 는 HTML 받아 로컬 readability 를 돌리지만, Jina 는 마크다운을
  * 서버측에서 직접 반환하므로 dep-free 로 더 간단.
  */
-export async function fetchJina(url: string, opts?: { timeoutMs?: number; allowPrivate?: boolean }): Promise<{ title: string; content: string } | null> {
+export async function fetchJina(url: string, opts?: { timeoutMs?: number; allowPrivate?: boolean; quiet?: boolean; onFailure?: (reason: 'invalid-url' | 'http' | 'timeout' | 'network' | 'empty', status?: number) => void }): Promise<{ title: string; content: string } | null> {
   const err = await validatePublicHttpUrl(url, { action: 'fetch', allowPrivate: opts?.allowPrivate });
-  if (err) { console.log(`  [jina-free] 차단: ${url.slice(0, 50)} — ${err}`); return null; }
+  if (err) { opts?.onFailure?.('invalid-url'); if (!opts?.quiet) console.log(`  [jina-free] 차단: ${url.slice(0, 50)} — ${err}`); return null; }
   try {
     const headers: Record<string, string> = { 'X-Return-Format': 'markdown', 'User-Agent': UA };
     const jinaKey = env('JINA_API_KEY');
@@ -101,9 +101,13 @@ export async function fetchJina(url: string, opts?: { timeoutMs?: number; allowP
     const res = await fetch(`https://r.jina.ai/${url}`, {
       headers, signal: AbortSignal.timeout(opts?.timeoutMs ?? 25_000),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      opts?.onFailure?.('http', res.status);
+      if (!opts?.quiet) console.log(`  [jina-free] 실패(${url.slice(0, 50)}): HTTP ${res.status}`);
+      return null;
+    }
     const raw = (await res.text()).trim();
-    if (!raw || raw.startsWith('Error:')) return null;
+    if (!raw || raw.startsWith('Error:')) { opts?.onFailure?.('empty'); return null; }
 
     // Jina 헤더 파싱: "Title: ...\nURL Source: ...\n...\nMarkdown Content:\n<본문>"
     let title = url; let content = raw;
@@ -111,10 +115,11 @@ export async function fetchJina(url: string, opts?: { timeoutMs?: number; allowP
     if (titleM) title = titleM[1].trim();
     const mcIdx = raw.indexOf('Markdown Content:');
     if (mcIdx >= 0) content = raw.slice(mcIdx + 'Markdown Content:'.length).trim();
-    if (!content || content.length < 30) return null;
+    if (!content || content.length < 30) { opts?.onFailure?.('empty'); return null; }
     return { title, content };
   } catch (e: any) {
-    console.log(`  [jina-free] 실패(${url.slice(0, 50)}): ${e.message?.slice(0, 60)}`);
+    opts?.onFailure?.(e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'timeout' : 'network');
+    if (!opts?.quiet) console.log(`  [jina-free] 실패(${url.slice(0, 50)}): ${e.message?.slice(0, 60)}`);
     return null;
   }
 }

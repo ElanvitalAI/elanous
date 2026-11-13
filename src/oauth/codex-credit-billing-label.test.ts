@@ -16,7 +16,7 @@ import {
 } from './codex-account-store.js';
 import { saveTokens } from './store.js';
 
-const ENV_KEYS = ['ELANOUS_STATE_DIR', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_CODEX_ACCOUNT', 'ELANOUS_RUN_ID'] as const;
+const ENV_KEYS = ['ELANOUS_STATE_DIR', 'CODEX_HOME', 'ELANOUS_CODEX_ACCOUNT', 'ELANOUS_RUN_ID'] as const;
 const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 const dirs: string[] = [];
 
@@ -37,13 +37,13 @@ function fixture(usedPercent: number, credits?: { balance?: number; hasCredits?:
   const root = mkdtempSync(join(tmpdir(), 'codex-credit-billing-'));
   dirs.push(root);
   process.env.ELANOUS_STATE_DIR = root;
-  process.env.XDG_CONFIG_HOME = root;
   delete process.env.ELANOUS_CODEX_ACCOUNT;
   delete process.env.ELANOUS_RUN_ID;
   const home = join(root, 'default-home');
   mkdirSync(home, { recursive: true });
   process.env.CODEX_HOME = home;
-  const store = join(root, 'elanous', 'auth.json');
+  // authStorePath follows the isolated state/config root (7c8fb3dbea).
+  const store = join(root, 'auth.json');
   saveTokens('openai-codex', { accessToken: 'a', refreshToken: 'r', expiresAt: null }, { mirrorCodex: false, codexHome: home }, store);
   writeQuotaSignal(undefined, usedPercent, home, undefined, credits);
   writeAvailabilityState(0, home);

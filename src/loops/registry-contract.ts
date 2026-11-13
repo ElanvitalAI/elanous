@@ -1,4 +1,4 @@
-import type { GraphRunState } from '../graph-runner/runner.js';
+import type { GraphRunState } from '../graph-runner/runner-types.js';
 import type { LoopReplyBody, MessageWake } from './msg-address.js';
 import type { WakeResolution } from './msg-wake.js';
 

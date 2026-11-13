@@ -11,7 +11,7 @@ import { runDashboardPlainTurnStream, type DashboardPlainTurnAcpSend } from './d
 import { createTurnStreamFormatter } from './dashboard/turn-stream-formatter.js';
 import { setUserConfigOverlay } from './user-config.js';
 import { testFakeLlmProvider } from './ux-sim/fake-llm.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import { OverloadFailoverError } from './session-runtime/retry-api.js';
 import { resetProviderCircuitForTest } from './session-runtime/provider-circuit.js';
 import { _explainAndLogFallbackCandidatesForTest, PROVIDERS, streamLLM, streamLLMWithTools, type LLMMessage, type LLMProvider, type LLMStreamEvent } from './llm.js';
@@ -397,7 +397,7 @@ describe('retry budget is per provider', () => {
     setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
       provider: 'openai-codex', model: 'gpt-6-sol', apiKey: 'fake-codex-test-only',
       fallbackChain: ['codex-rotate', 'grok', 'zai'] } }));
-    await withFakeFetchDevice([{
+    await withRealProviderFakeFetchDevice([{
       url: '/v1/chat/completions', method: 'POST',
       response: () => {
         codexFetches++;
@@ -465,4 +465,12 @@ describe('retry budget is per provider', () => {
     expect(status).toContain('⚠ 공급자 전환: grok → anthropic (network-transient)');
     expect(logs.some((l) => l.category === 'llm.router' && l.event === 'fallback-candidates')).toBe(true);
   });
+});
+
+// Provider wire expectations run with a fake HTTP transport, not the gate's default fake LLM.
+let previousWireMode: string | undefined;
+beforeEach(() => { previousWireMode = process.env.ELANOUS_LLM_MODE; process.env.ELANOUS_LLM_MODE = 'real'; });
+afterEach(() => {
+  if (previousWireMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+  else process.env.ELANOUS_LLM_MODE = previousWireMode;
 });

@@ -5,7 +5,7 @@
 // fake LLMProvider so no network is needed; `isolation: 'worktree'` is
 // covered by a separate scope (see worktree integration notes).
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,16 @@ import {
 import { globalAgentRegistry } from '../src/agent/registry';
 import type { AgentDefinition } from '../src/agent/types';
 import type { LLMProvider, LLMStreamEvent } from '../src/llm';
+
+let previousLlmMode: string | undefined;
+beforeEach(() => {
+  previousLlmMode = process.env.ELANOUS_LLM_MODE;
+  process.env.ELANOUS_LLM_MODE = 'real'; // Honor the explicit fake provider supplied by these tests.
+});
+afterEach(() => {
+  if (previousLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+  else process.env.ELANOUS_LLM_MODE = previousLlmMode;
+});
 
 // ── Test helpers ──
 

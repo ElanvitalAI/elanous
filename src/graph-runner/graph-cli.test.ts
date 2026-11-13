@@ -810,17 +810,25 @@ edges:
       mode: 'spawn', allowPaths: [['graph', 'approve']], stateRoot, cwd: root,
     }),
   ]);
-  const approvedCode = approve.exitCode;
-  const rejectedCode = reject.exitCode;
-  expect([approvedCode, rejectedCode].sort()).toEqual([0, 1]);
-  const winner = approvedCode === 0 ? 'approved' : 'rejected';
-  const winnerBy = approvedCode === 0 ? 'first' : 'second';
-  const loserError = approvedCode === 0 ? reject.stderr : approve.stderr;
+  // Rejection is an accepted decision but intentionally exits 1. Exit codes
+  // alone cannot identify the winner when rejection claims the visit first.
+  const approveWon = approve.stdout.includes(`${pending.graphId} ${pending.runId}: approved`);
+  const rejectWon = reject.stdout.includes(`${pending.graphId} ${pending.runId}: rejected`);
+  expect(Number(approveWon) + Number(rejectWon)).toBe(1);
+  expect(approve.exitCode).toBe(approveWon ? 0 : 1);
+  expect(reject.exitCode).toBe(1);
+  const winner = approveWon ? 'approved' : 'rejected';
+  const winnerBy = approveWon ? 'first' : 'second';
+  const loserError = approveWon ? reject.stderr : approve.stderr;
   expect(loserError).toContain('not awaiting an undecided approval');
+  const claim = JSON.parse(readFileSync(join(stateRoot, 'graph-runs', pending.graphId,
+    `${pending.runId}.json.1.decision.json`), 'utf8'));
+  expect(claim).toMatchObject({ decision: winner, decidedBy: winnerBy });
   const status = await spawnGraph(stateRoot, 'status', pending.graphId, '--json');
   expect(JSON.parse(status.stdout).pending).toMatchObject({ decision: winner, decidedBy: winnerBy });
   expect((await spawnGraph(stateRoot, 'approve', pending.graphId, pending.runId, '--reject')).code).toBe(1);
   const resume = await spawnGraph(stateRoot, 'run', graph, '--resume', pending.runId, '--json');
+  expect(resume.code).toBe(approveWon ? 0 : 1);
   expect(JSON.parse(resume.stdout).status).toBe(winner === 'approved' ? 'done' : 'failed');
   expect(JSON.parse(resume.stdout).nodes[0]).toMatchObject({ ok: winner === 'approved', decidedBy: winnerBy });
 }, 60000);

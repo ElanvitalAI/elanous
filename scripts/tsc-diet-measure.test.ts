@@ -27,7 +27,7 @@ test('virtual static edge cut reduces the measured reverse gate radius without w
 });
 
 test('virtual edge cut retains a dynamic import of the same module', () => {
-  const overlap = { ...content, 'src/consumer.ts': "import { value } from './hub.js'; export const load = () => import('./hub.js');\n" };
+  const overlap: Record<string, string> = { ...content, 'src/consumer.ts': "import { value } from './hub.js'; export const load = () => import('./hub.js');\n" };
   const source: ClosureTree = { files: Object.keys(overlap), read: (path) => overlap[path], preload: [] };
   const cut = { kind: 'edge' as const, from: 'src/consumer.ts', to: 'src/hub.ts' };
   const rewritten = virtualTree(source, cut);
@@ -55,6 +55,8 @@ test('branch CLI reports a conservative full gate for a deleted changed path', (
     expect(cli.status).toBe(0);
     const result = JSON.parse(cli.stdout);
     expect(result.changedFiles).toEqual(['src/gone.ts']);
+    expect(result.baseCommit).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.contractSelection).toMatchObject({ status: 'full', reason: 'change outside declared implementations' });
     expect(result.before.gate.mode).toBe('full-fallback');
     expect(result.before.tsc.mode).toBe('full');
   } finally { rmSync(repo, { recursive: true, force: true }); }
@@ -78,6 +80,25 @@ test('branch CLI includes both paths of a rename before choosing the full gate',
     expect(result.changedFiles).toEqual(['src/after.ts', 'src/before.ts']);
     expect(result.before.gate.mode).toBe('full-fallback');
     expect(result.before.tsc.mode).toBe('full');
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('explicit files keep working without origin/main and use a full selector candidate', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'tsc-diet-no-origin-main-'));
+  const run = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  try {
+    mkdirSync(join(repo, 'src'));
+    writeFileSync(join(repo, 'src', 'hub.ts'), 'export const value = 1;\n');
+    writeFileSync(join(repo, 'src', 'hub.test.ts'), "import './hub.js';\n");
+    expect(run('init').status).toBe(0);
+    expect(run('add', '.').status).toBe(0);
+    expect(run('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'initial').status).toBe(0);
+    const cli = spawnSync('bun', [join(import.meta.dir, 'tsc-diet-measure.ts'), '--repo', repo,
+      '--branch', 'HEAD', '--files', 'src/hub.ts'], { cwd: repo, encoding: 'utf8' });
+    expect(cli.status).toBe(0);
+    const result = JSON.parse(cli.stdout);
+    expect(result.baseCommit).toBeNull();
+    expect(result.contractSelection).toMatchObject({ status: 'full', reason: 'baseline commit unavailable', files: ['src/hub.test.ts'] });
   } finally { rmSync(repo, { recursive: true, force: true }); }
 });
 

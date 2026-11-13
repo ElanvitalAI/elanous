@@ -82,7 +82,7 @@ describe('pwa registration lifecycle', () => {
       });
       expect(events).toEqual(['register', 'runtime-http']);
     } finally {
-      handle?.release();
+      await handle?.release();
       if (previousNexusDir === undefined) delete process.env.ELANOUS_NEXUS_DIR;
       else process.env.ELANOUS_NEXUS_DIR = previousNexusDir;
       rmSync(nexusDir, { recursive: true, force: true });

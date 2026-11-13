@@ -1,0 +1,16 @@
+graph_id: train-manager
+version: 1
+loop:
+  title: Versioned train manager tick
+  description: Run one repository-owned train manager tick against the operational queue.
+  owner: TC
+  trigger:
+    events: [manual]
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: tick, kind: agent, recipe: 'cmd:train-manager', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

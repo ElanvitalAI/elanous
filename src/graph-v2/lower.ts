@@ -339,6 +339,13 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
     nodePostById.set(node.id, post);
     const withPayload = record(node.with);
     if (node.with !== undefined && !withPayload) errors.push({ path: `${path}/with`, message: 'with 는 맵이어야 한다' });
+    if (withPayload && Object.hasOwn(withPayload, 'optional')) {
+      const optional = record(withPayload.optional);
+      if (!node.call || !optional || Object.keys(optional).length === 0 ||
+          Object.entries(optional).some(([key, binding]) => !/^[A-Za-z][A-Za-z0-9_-]*$/.test(key)
+            || typeof binding !== 'string' || !/^\$[A-Za-z0-9][A-Za-z0-9._-]*\.result\.[A-Za-z0-9._-]+$/.test(binding)))
+        errors.push({ path: `${path}/with/optional`, message: 'optional 은 unit call 의 비어 있지 않은 선행 result 배열 참조 맵이어야 한다' });
+    }
     let requires = typeof node.requires === 'string' && /^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*@[1-9]\d*$/.test(node.requires) ? node.requires : undefined;
     if (node.requires !== undefined && requires === undefined) errors.push({ path: `${path}/requires`, message: 'requires 는 <namespace>.<contract>@<positive version> 이어야 한다' });
     const uses = node.uses === undefined ? undefined : list(node.uses);
@@ -463,8 +470,10 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
       const unit = resolveGraphUnit(node.call!, join(process.cwd(), 'graph-v2-lower.yaml'));
       const edge = base.edges.find(candidate => candidate.from === node.nodeId && candidate.on === 'outcome');
       const expectedExits = [...(unit.template.unit?.exits ?? [])].sort();
-      const mappedExits = Object.keys(edge?.map ?? {}).sort();
-      if (!edge?.map || JSON.stringify(expectedExits) !== JSON.stringify(mappedExits))
+      const optional = node.input && typeof node.input === 'object' && !Array.isArray(node.input)
+        && Object.hasOwn(node.input, 'optional');
+      const mappedExits = Object.keys(edge?.map ?? {}).filter(exit => !(optional && exit === 'skip')).sort();
+      if (!edge?.map || (optional && !edge.map.skip) || JSON.stringify(expectedExits) !== JSON.stringify(mappedExits))
         errors.push({ path: label + '/nodes/' + node.nodeId + '/exit-map', message: 'unit exits(done/rework/needs-human/failed 등)는 부모 outcome map에 모두 명시해야 한다' });
     } catch { /* unresolved calls require an explicit budget; their exit contract is checked by the runtime resolver */ }
   }

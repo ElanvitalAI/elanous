@@ -155,6 +155,32 @@ export function declaredPluginHandlers(root: string): Set<string> {
   return allowed;
 }
 
+/** A JSON package's executable main is owned by its declared skill and route. */
+export function declaredPluginEntrypoints(root: string): Set<string> {
+  const allowed = new Set<string>();
+  const pluginsDir = join(root, 'plugins');
+  if (!existsSync(pluginsDir)) return allowed;
+  for (const entry of readdirSync(pluginsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = join(pluginsDir, entry.name, 'plugin.json');
+    if (!existsSync(manifestPath)) continue;
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      const main = manifest.main;
+      const contributes = manifest.contributes as { skills?: unknown } | undefined;
+      if (manifest.id !== entry.name || typeof main !== 'string' || !/^\.\/[A-Za-z0-9_-]+\.ts$/.test(main)
+        || !Array.isArray(manifest.activationEvents) || !manifest.activationEvents.includes('onRoute')
+        || !Array.isArray(contributes?.skills) || !contributes.skills.some(skill => skill && typeof skill === 'object'
+          && typeof (skill as { path?: unknown }).path === 'string'
+          && /^\.\/skills\/[A-Za-z0-9_-]+\/SKILL\.md$/.test((skill as { path: string }).path)
+          && existsSync(join(pluginsDir, entry.name, (skill as { path: string }).path)))) continue;
+      const relativePath = `plugins/${entry.name}/${main.slice(2)}`;
+      if (existsSync(join(root, relativePath))) allowed.add(relativePath);
+    } catch { /* malformed manifests never grant an exception */ }
+  }
+  return allowed;
+}
+
 function inventoryAtRef(root: string, ref: string): Pick<PluginOnlyBaseline, 'pluginCodeFiles' | 'coreFeatureIdentifiers'> {
   const dir = mkdtempSync(join(tmpdir(), 'plugin-only-ratchet-'));
   try {
@@ -215,7 +241,7 @@ export function checkPluginOnlyRatchet(root: string): string[] {
       throw new Error(`plugin-only baseline does not match sourceRef inventory: ${baseline.sourceRef}`);
     }
   }
-  const declared = declaredPluginHandlers(root);
+  const declared = new Set([...declaredPluginHandlers(root), ...declaredPluginEntrypoints(root)]);
   return compareInventory(inventoryFromTree(root), baseline)
     .filter(violation => !violation.startsWith('plugin-code-added:') || !declared.has(violation.slice('plugin-code-added:'.length)));
 }

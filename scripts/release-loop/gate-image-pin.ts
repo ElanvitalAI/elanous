@@ -50,13 +50,17 @@ export function gateImageLayerRuntimeKey(input: { baseImageDigest: string; lockH
     input.buildRecipeHash.toLowerCase(), input.gateDepsDigest.toLowerCase(), input.skillsDigest.toLowerCase()].join('\n')).digest('hex').slice(0, 40);
 }
 
+export function normalizeGateRuntimeArchitecture(value: string): string {
+  return value.replace(/^aarch64$/i, 'arm64').replace(/^x86_64$/i, 'amd64');
+}
+
 export function gateRuntimeBaseReuseMode(
   identities: readonly ({ digest: string; architecture: string } | null)[],
   existingTagDigests: readonly (string | null)[],
 ): 'uniform-base' | 'shared-tag' {
   if (!identities.length || identities.some((identity) => !identity))
     throw new Error('gate runtime base digest or architecture could not be measured consistently across pools');
-  const distinctBases = new Set(identities.map((identity) => `${identity!.digest}\n${identity!.architecture}`));
+  const distinctBases = new Set(identities.map((identity) => `${identity!.digest}\n${normalizeGateRuntimeArchitecture(identity!.architecture)}`));
   if (distinctBases.size === 1) return 'uniform-base';
   const digests = existingTagDigests.map(normalizeGateImageDigest);
   if (digests.length !== identities.length || digests.some((digest) => !digest)
@@ -107,7 +111,7 @@ export async function prebuildGateImagePinForRuntimeBases(input: Parameters<type
 }): Promise<GateImagePrebuildResult> {
   if (input.runtimeBases.some((identity) => !identity))
     throw new Error('gate runtime base digest or architecture could not be measured consistently across pools');
-  const distinctBases = new Set(input.runtimeBases.map((identity) => `${identity!.digest}\n${identity!.architecture}`));
+  const distinctBases = new Set(input.runtimeBases.map((identity) => `${identity!.digest}\n${normalizeGateRuntimeArchitecture(identity!.architecture)}`));
   const observed = distinctBases.size === 1 ? [] : input.members.map(input.probe);
   const mode = gateRuntimeBaseReuseMode(input.runtimeBases, observed);
   if (mode === 'uniform-base') return prebuildGateImagePinAtCut(input);
@@ -424,7 +428,7 @@ async function prebuildFromArgs(args: string[]): Promise<ChildGateImagePrebuildO
       if (probe.status !== 0) return null;
       const lines = probe.stdout.trim().split(/\r?\n/);
       const digest = /@?(sha256:[a-f0-9]{64})$/i.exec(lines[0] ?? '')?.[1]?.toLowerCase();
-      const architecture = lines.at(-1)?.trim();
+      const architecture = normalizeGateRuntimeArchitecture(lines.at(-1)?.trim() ?? '');
       return digest && architecture ? { digest, architecture } : null;
     });
     if (layerIdentities.some((identity) => !identity))

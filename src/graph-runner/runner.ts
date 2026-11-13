@@ -52,6 +52,8 @@ import { RELEASE_NODE_COMMANDS } from '../../scripts/release-loop/runner-release
 import { activeReleaseCloudDeadline } from '../../scripts/release-loop/cloud-lease-deadline.js';
 import type { AcceptedRegression, GateExecutorOverride, GatePodPoolOverride, GateShardRerouteOverride } from '../../scripts/release-loop/resume-types.js';
 import { gateUnmeasuredDetail } from '../../scripts/release-loop/resume.js';
+import { assertReleaseKnownIssueWaiverApproval, KNOWN_ISSUE_ROUTE, T6_WAIVER_DOCUMENT_SHA, T6_WAIVER_TABLE_SHA } from './release-known-issue-waiver.js';
+import { assertSignedPwaBranchWaiver } from './release-pwa-waiver.js';
 import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest, type AdaptiveGateHealAppendNodeReceipt, type AdaptiveGateHealRerunGateRequest } from '../../scripts/release-loop/adaptive-gate-heal-adapter.js';
 import type { AdaptiveGateHealPlan } from '../../scripts/release-loop/adaptive-gate-heal.js';
 import { resolveChildAllowance } from './arg-allowance.js';
@@ -94,6 +96,44 @@ const fanOutDailyBudgetExemptRunIds = new Set<string>();
 
 function stableSha256(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value) ?? 'undefined').digest('hex');
+}
+
+/** Recheck the recorded T6 decision before preserving its failed gate or using
+ * a repaired verifier. The original failed gate and approval claim stay intact. */
+function signedT6PostGateResume(state: GraphRunState, root: string, from: string): boolean {
+  if (state.graphId !== KNOWN_ISSUE_ROUTE.graph || state.runId !== '636f9e96-0aae-4cb0-babd-b509c44e2f34'
+    || from !== 'traffic-gate-passed' || state.pending || state.dryRun || !['failed', 'running'].includes(state.status)
+    || (state.input as { version?: string; cutCommit?: string } | undefined)?.version !== '0.3.15'
+    || (state.input as { cutCommit?: string } | undefined)?.cutCommit !== '7d951adb3163ba16a784d5b937d12732ef9be625') return false;
+  const gateIndex = state.path.indexOf('gate');
+  const approvalIndex = state.path.indexOf('gate-heal-decision');
+  const trafficIndex = state.path.indexOf('traffic-gate-passed');
+  if (gateIndex < 0 || approvalIndex <= gateIndex || trafficIndex <= approvalIndex
+    || state.path.lastIndexOf('gate') !== gateIndex || state.path.lastIndexOf('gate-heal-decision') !== approvalIndex
+    || state.path.lastIndexOf('traffic-gate-passed') !== trafficIndex
+    || state.nodes[gateIndex]?.ok !== false || state.nodes[approvalIndex]?.ok !== true
+    || state.nodes[trafficIndex]?.ok !== true || lastJsonObject(state.nodes[trafficIndex]?.output)?.outcome !== 'ok') return false;
+  const approval = state.nodes[approvalIndex]!;
+  const output = lastJsonObject(approval.output);
+  const edge = (state.adaptiveGraphEdges ?? []).find((item) => item.from === 'gate-heal-decision'
+    && item.to === 'traffic-gate-passed' && item.triggerEvent === 'release.gate.waiver'
+    && item.rationale === `JUD:${T6_WAIVER_TABLE_SHA}` && item.eventId === T6_WAIVER_DOCUMENT_SHA
+    && item.subscriberId === 'arg-gate-waiver');
+  if (!edge || output?.outcome !== 'waived-known-issue' || output.graphId !== state.graphId
+    || output.runId !== state.runId || output.nodeId !== KNOWN_ISSUE_ROUTE.approval
+    || output.decidedBy !== 'OP' || output.decidedAt !== approval.decidedAt) return false;
+  let claim: { nodeId?: string; decision?: string; outcome?: string; decidedBy?: string; decidedAt?: string; inputSha256?: string };
+  try { claim = JSON.parse(readFileSync(`${state.statePath}.${approvalIndex + 1}.decision.json`, 'utf8')); }
+  catch { return false; }
+  if (claim.nodeId !== KNOWN_ISSUE_ROUTE.approval || claim.decision !== 'approved'
+    || claim.outcome !== 'waived-known-issue' || claim.decidedBy !== 'OP'
+    || claim.decidedAt !== approval.decidedAt || claim.inputSha256 !== stableSha256(state.input)) return false;
+  const beforeDecision: GraphRunState = { ...state, status: 'awaiting-approval',
+    path: state.path.slice(0, approvalIndex + 1), nodes: state.nodes.slice(0, approvalIndex),
+    pending: { nodeId: KNOWN_ISSUE_ROUTE.approval, message: '', since: approval.decidedAt!,
+      decision: 'approved', outcome: 'waived-known-issue', decidedBy: 'OP', decidedAt: approval.decidedAt } };
+  assertReleaseKnownIssueWaiverApproval(beforeDecision, root, true);
+  return true;
 }
 
 function requiredContractForNode(node: GraphNodeSpec): string | undefined {
@@ -576,7 +616,7 @@ function applyRecordedDecision(state: GraphRunState): GraphRunState {
   if (!state.pending) return state;
   // A legacy card had no pinned input. Its claim is archived and a fresh card is issued on resume.
   if (!state.pending.inputSha256) return state;
-  let recorded: { nodeId: string; decision: 'approved' | 'rejected'; decidedBy?: string; decidedAt: string; inputSha256?: string };
+  let recorded: { nodeId: string; decision: 'approved' | 'rejected'; outcome?: string; decidedBy?: string; decidedAt: string; inputSha256?: string };
   try { recorded = JSON.parse(readFileSync(approvalDecisionPath(state), 'utf8')); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return state;
@@ -584,7 +624,10 @@ function applyRecordedDecision(state: GraphRunState): GraphRunState {
   }
   if (recorded.nodeId !== state.pending.nodeId || !['approved', 'rejected'].includes(recorded.decision) ||
     typeof recorded.decidedAt !== 'string' || (recorded.decidedBy !== undefined && typeof recorded.decidedBy !== 'string') ||
+    (recorded.outcome !== undefined && (recorded.decision !== 'approved' || recorded.outcome !== 'waived-known-issue' ||
+      state.graphId !== KNOWN_ISSUE_ROUTE.graph || state.pending.nodeId !== KNOWN_ISSUE_ROUTE.approval)) ||
     (state.pending.decision && state.pending.decision !== recorded.decision) ||
+    (state.pending.outcome && state.pending.outcome !== recorded.outcome) ||
     (state.pending.inputSha256 !== undefined && state.pending.inputSha256 !== stableSha256(state.input)) ||
     (recorded.inputSha256 !== undefined && (recorded.inputSha256 !== stableSha256(state.input) ||
       recorded.inputSha256 !== state.pending.inputSha256))) {
@@ -594,7 +637,7 @@ function applyRecordedDecision(state: GraphRunState): GraphRunState {
   return state;
 }
 
-function readGraphRun(graphId: string, runId: string, root: string): GraphRunState {
+export function readGraphRun(graphId: string, runId: string, root: string): GraphRunState {
   const file = graphRunPath(graphId, runId, root);
   const state = JSON.parse(readFileSync(file, 'utf8')) as GraphRunState;
   if (state.graphId !== graphId || state.runId !== runId) throw new Error(`run identity mismatch: ${graphId}/${runId}`);
@@ -829,6 +872,12 @@ function kstCalendarDay(instant: string): string {
   return `${value.year}-${value.month}-${value.day}`;
 }
 
+function validKstCalendarDay(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
 function graphLoopBudget(graph: GraphTemplateSpec): { runsPerDay?: number; llmCalls?: number } {
   // Release graph policies are namespaced in loop.ext; absorb owns this budget contract.
   const budget = (graph.loop?.budget ?? graph.loop?.ext?.['absorb.budget']) as Readonly<Record<string, unknown>> | undefined;
@@ -891,7 +940,7 @@ function persistOwnedRun(state: GraphRunState, expected: Partial<Pick<GraphRunSt
   });
 }
 
-export interface ExpectedGraphApprovalVisit { nodeId: string; visit: number }
+export interface ExpectedGraphApprovalVisit { nodeId: string; visit: number; outcome?: string }
 
 export function decideGraphApproval(graphId: string, runId: string, decision: 'approved' | 'rejected', by?: string, root = effectiveInstanceRoot(), expected?: ExpectedGraphApprovalVisit): GraphRunState {
   const state = readGraphRun(graphId, runId, root);
@@ -904,7 +953,14 @@ export function decideGraphApproval(graphId: string, runId: string, decision: 'a
   if (by !== undefined && !by.trim()) throw new Error('approver name must not be empty');
   if (!state.pending.inputSha256 || state.pending.inputSha256 !== stableSha256(state.input))
     throw new Error(`approval input changed since card was shown: ${graphId}/${runId}`);
-  const recorded = { nodeId: state.pending.nodeId, decision, ...(by === undefined ? {} : { decidedBy: by }),
+  const outcome = expected?.outcome;
+  if (outcome !== undefined) {
+    if (decision !== 'approved' || outcome !== KNOWN_ISSUE_ROUTE.outcome || graphId !== KNOWN_ISSUE_ROUTE.graph ||
+      state.pending.nodeId !== KNOWN_ISSUE_ROUTE.approval || by !== 'OP')
+      throw new Error('named approval outcome is unavailable for this graph, node, or approver');
+    assertReleaseKnownIssueWaiverApproval(state, root);
+  }
+  const recorded = { nodeId: state.pending.nodeId, decision, ...(outcome === undefined ? {} : { outcome }), ...(by === undefined ? {} : { decidedBy: by }),
     decidedAt: new Date().toISOString(), inputSha256: state.pending.inputSha256 };
   // A card can claim only the visit it names; never derive a later visit's claim path from a fresh read.
   const decisionPath = approvalDecisionPath(state);
@@ -1021,12 +1077,24 @@ function withSubscriptionGraphAppends(graph: GraphTemplateSpec,
 
 function withAdaptiveGraphEdges(graph: GraphTemplateSpec,
   edges: NonNullable<GraphRunState['adaptiveGraphEdges']>, vocabulary: readonly string[]): GraphTemplateSpec {
+  let current = graph;
   for (const edge of edges) {
-    if (!graph.nodes.some((node) => node.nodeId === edge.from) || !graph.nodes.some((node) => node.nodeId === edge.to) ||
+    if (!current.nodes.some((node) => node.nodeId === edge.from) || !current.nodes.some((node) => node.nodeId === edge.to) ||
       !edge.triggerEvent.trim() || !edge.rationale.trim() || !vocabulary.includes(edge.triggerEvent))
       throw new Error('invalid saved adaptive graph edge');
+    if (edge.triggerEvent === 'release.gate.waiver') {
+      if (current.graphId !== KNOWN_ISSUE_ROUTE.graph || edge.from !== KNOWN_ISSUE_ROUTE.approval ||
+          edge.to !== KNOWN_ISSUE_ROUTE.passed || edge.subscriberId !== 'arg-gate-waiver' ||
+          edge.eventId !== T6_WAIVER_DOCUMENT_SHA || edge.rationale !== `JUD:${T6_WAIVER_TABLE_SHA}`)
+        throw new Error('invalid saved release gate waiver edge');
+      const source = current.edges.find((candidate) => candidate.from === edge.from);
+      if (source?.map?.ok !== 'gate-same-run-recheck' || source.map.fail !== 'traffic-failed-restore')
+        throw new Error('saved release gate waiver source differs');
+      current = { ...current, edges: current.edges.map((candidate) => candidate === source
+        ? { ...candidate, map: { ...candidate.map, 'waived-known-issue': edge.to } } : candidate) };
+    }
   }
-  return graph;
+  return current;
 }
 
 type ResolvedUnit = ResolvedGraphUnit & { readonly source?: string; readonly shapeHash?: string };
@@ -1058,7 +1126,9 @@ function validateUnitCallsWithResolver(graph: GraphTemplateSpec, path: string, a
         contract.inputs.some(key => !unit.template.unit!.inputs.includes(key)) ||
         contract.outputs.length !== unit.template.unit.outputs.length ||
         contract.outputs.some(key => !unit.template.unit!.outputs.includes(key)) || edge?.on !== 'outcome' ||
-        !edge.map || Object.keys(edge.map).length !== unit.template.unit.exits.length ||
+        !edge.map || Object.keys(edge.map).filter(exit => !(node.input && typeof node.input === 'object' && !Array.isArray(node.input)
+          && Object.hasOwn(node.input, 'optional') && exit === 'skip')).length !== unit.template.unit.exits.length ||
+        (node.input && typeof node.input === 'object' && !Array.isArray(node.input) && Object.hasOwn(node.input, 'optional') && !edge.map.skip) ||
         unit.template.unit.exits.some(exit => !Object.hasOwn(edge.map!, exit))) {
       debug.log('graph.unit', 'contract-mismatch', { graphId: graph.graphId, nodeId: node.nodeId, call: node.call });
       throw new Error(`unit contract mismatch: ${node.nodeId} -> ${node.call}`);
@@ -1091,6 +1161,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.useCurrentGraph && !options.resumeRunId) throw new Error('--use-current-graph requires --resume');
   if (options.variant && options.resumeRunId) throw new Error('variant cannot be combined with --resume');
   if (options.releaseWaiver && (!options.resumeRunId || options.fromNodeId !== options.releaseWaiver.nodeId)) throw new Error('release waiver requires --resume --from <waived node>');
+  if (options.releasePwaFanOutWaiver && (!options.resumeRunId || options.fromNodeId !== 'traffic-gate-passed' || options.releaseWaiver))
+    throw new Error('PWA fan-out waiver requires release resume --from traffic-gate-passed');
   if (options.releaseAcceptedRegressions && (!options.resumeRunId || !options.fromNodeId || options.releaseWaiver)) throw new Error('accepted regressions require a release resume boundary');
   if (options.releaseGateExecutor && (!options.resumeRunId || !options.fromNodeId)) throw new Error('gate executor override requires a release resume boundary');
   if (options.releaseGatePodPool !== undefined && (!options.resumeRunId || !options.fromNodeId)) throw new Error('gate pod pool override requires a release resume boundary');
@@ -1664,6 +1736,41 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       ...(options.input === undefined ? {} : { input: options.input }),
       ...(options.unitContext?.entryNodeId === undefined ? {} : { entryNodeId: options.unitContext.entryNodeId }),
       executed: 0, dryRun: options.dryRun === true, graphRevision: 1, statePath };
+  if (state.pending?.outcome === 'waived-known-issue') {
+    // This run's original graph snapshot predates the named edge. Keep every
+    // other node and recipe pinned; graft only the route declared by the
+    // installed release graph after rechecking the frozen JUD adjudication.
+    assertReleaseKnownIssueWaiverApproval(state, root, true);
+    const installed = parseGraphTemplateYaml(readFileSync(path, 'utf8'), path).template;
+    const declared = installed?.edges.find((edge) => edge.from === KNOWN_ISSUE_ROUTE.approval);
+    if (declared?.map?.[KNOWN_ISSUE_ROUTE.outcome] !== KNOWN_ISSUE_ROUTE.passed)
+      throw new Error('installed release graph lacks the signed known-issue waiver edge');
+    const edge = { from: KNOWN_ISSUE_ROUTE.approval, to: KNOWN_ISSUE_ROUTE.passed,
+      triggerEvent: 'release.gate.waiver', rationale: `JUD:${T6_WAIVER_TABLE_SHA}`,
+      eventId: T6_WAIVER_DOCUMENT_SHA, subscriberId: 'arg-gate-waiver' };
+    if (!(state.adaptiveGraphEdges ?? []).some((savedEdge) => savedEdge.eventId === edge.eventId &&
+        savedEdge.subscriberId === edge.subscriberId)) {
+      state.adaptiveGraphEdges = [...(state.adaptiveGraphEdges ?? []), edge];
+      state.adaptiveGraphVocabulary = [...new Set([...(state.adaptiveGraphVocabulary ?? []), edge.triggerEvent])];
+      state.graphRevision = (state.graphRevision ?? 1) + 1;
+    }
+    graph = withAdaptiveGraphEdges(graph, [edge], state.adaptiveGraphVocabulary ?? []);
+  }
+  // Plugin-declared daily store keys use the run start as their fallback date.
+  const kstDayBinding = graph.loop?.ext?.['absorb.kstDay'];
+  const kstDayPolicy = kstDayBinding && typeof kstDayBinding === 'object' && !Array.isArray(kstDayBinding)
+    ? kstDayBinding as Record<string, unknown> : {};
+  if (!options.resumeRunId && kstDayPolicy.default === 'run-start') {
+    const input = state.input && typeof state.input === 'object' && !Array.isArray(state.input)
+      ? state.input as Record<string, unknown> : {};
+    const context = input.context && typeof input.context === 'object' && !Array.isArray(input.context)
+      ? input.context as Record<string, unknown> : {};
+    if (!validKstCalendarDay(context.kstDay)) {
+      const selected = kstCalendarDay(state.startedAt!);
+      state.input = { ...input, context: { ...context, kstDay: selected } };
+      state.kstDayFallback = { reason: context.kstDay === undefined ? 'missing-calendar-day' : 'invalid-calendar-day', selected };
+    }
+  }
   if (options.resumeRunId && state.status === 'cancelled') throw new Error(`cancelled graph run cannot be resumed: ${graphId}/${runId}`);
   if (graphExtensionLedger) {
     if (state.graphExtensionLedger && JSON.stringify(state.graphExtensionLedger) !== JSON.stringify(graphExtensionLedger))
@@ -1735,6 +1842,13 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     state.input = { ...(state.input as Record<string, unknown>), ...options.resumeInputPatch };
   }
   let savedGateUnmeasured: string | undefined;
+  let signedT6PostGate = false;
+  let signedPwaFanOut = false;
+  const pwaFanOutReceiptInput = options.releasePwaFanOutWaiver ? state.input : undefined;
+  if (state.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa?.waiver) {
+    assertSignedPwaBranchWaiver(state, root, true);
+    signedPwaFanOut = true;
+  }
   if (options.fromNodeId) {
     const budgetResume = options.releaseBudgetExceededResume;
     if (budgetResume && (graphId !== 'release-loop' || !budgetResume.reason.trim() || state.status !== 'budget-exceeded'))
@@ -1750,6 +1864,20 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       ? state.nodes.findIndex((record) => record.executionId === options.fromVisitId)
       : state.path.lastIndexOf(options.fromNodeId);
     if (from < 0 || graph.terminalNodes.includes(options.fromNodeId)) throw new Error(`--from node is not on the saved executable path: ${options.fromNodeId}`);
+    signedT6PostGate = signedT6PostGateResume(state, root, options.fromNodeId);
+    if (options.releasePwaFanOutWaiver) {
+      const pwaProof = assertSignedPwaBranchWaiver(state, root);
+      signedPwaFanOut = true;
+      const reason = options.releasePwaFanOutWaiver.reason.trim();
+      if (!reason) throw new Error('PWA known-issue waiver requires a reason');
+      state.input = { ...(state.input as Record<string, unknown>), acceptedRegressions:
+        releaseResumeAcceptedRegressions(state, [{ id: 'waive:pwa', note: reason }], 'traffic-gate-passed') };
+      state.fanOuts!['traffic-gate-passed:ok']!.branches.pwa!.waiver = {
+        verdict: 'waived', decidedBy: 'OP', reason, documentSha256: pwaProof.documentSha256,
+        signatureSha256: pwaProof.signatureSha256, pairedLogSha256: pwaProof.pairedLogSha256,
+        originalStatus: 'failed',
+      };
+    }
     if (state.path.length !== state.nodes.length || state.nodes.some((record, i) => record.nodeId !== state.path[i]) ||
       state.executed !== state.nodes.filter((record) => record.executed).length) {
       throw new Error('saved run path and node records do not match');
@@ -1800,7 +1928,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         // later release step; a branching failure is still a hard stop.
         const edge = graph.edges.find((candidate) => candidate.from === recorded.nodeId);
         const next = state.path[i + 1];
-        if (edge?.on !== 'outcome' || !next || !(['ok', 'fail', 'error'] as const).every((outcome) => edge.map?.[outcome] === next)) {
+        if (!(signedT6PostGate && recorded.nodeId === KNOWN_ISSUE_ROUTE.gate) &&
+            (edge?.on !== 'outcome' || !next || !(['ok', 'fail', 'error'] as const).every((outcome) => edge.map?.[outcome] === next))) {
           throw new Error('cannot preserve a failed predecessor when resuming');
         }
       }
@@ -2359,8 +2488,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   };
   const liveRlaTick = async (plan: AdaptiveGateHealPlan, event: GraphEvent): Promise<void> => {
     const input = state.input;
-    if (process.env.ELANOUS_RLA_ARG_LIVE !== '1' || state.dryRun ||
-        releaseGateCutoverPath(input) !== 'audit') return;
+    if (state.dryRun || releaseGateCutoverPath(input) !== 'audit') return;
     const { runArgSupervisorTick } = await import('./arg-supervisor.js');
     const feedbackIdentity: ArgFeedbackIdentity = { member: 'loop:rla@1',
       universe: options.deps?.argFeedbackUniverse ?? (getTestStateRoot() ? 'test' : 'prod'), template: graphId };
@@ -2685,7 +2813,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const warningBranches = joinedFanout
       ? graph.edges.find((edge) => edge.from === joinedFanout.from)?.warningBranches ?? [] : [];
     let ok: boolean = operatorNoGo ? false : approval && !state.dryRun ? state.pending?.decision === 'approved' : joinedFanout
-      ? Object.entries(joinedFanout.branches).every(([branchId, branch]) => branch.status === 'done' || warningBranches.includes(branchId)) : true;
+      ? Object.entries(joinedFanout.branches).every(([branchId, branch]) => branch.status === 'done' ||
+        (signedPwaFanOut && joinedFanout.from === KNOWN_ISSUE_ROUTE.passed && branchId === 'pwa' && branch.waiver?.verdict === 'waived') ||
+        warningBranches.includes(branchId)) : true;
     let exit: number | null = null;
     let error: string | undefined;
     let commandFailureReason: string | undefined;
@@ -2717,8 +2847,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const joinedOutcome = everyBranchHasUnitExit
         ? (['failed', 'needs-human', 'rework', 'done'].find((candidate) => mapOutcomes.includes(candidate)) ?? (ok ? 'ok' : 'fail'))
         : ok ? 'ok' : 'fail';
+      const typedWaiverVerdicts = signedPwaFanOut && joinedFanout.from === KNOWN_ISSUE_ROUTE.passed && joinedFanout.branches.pwa?.waiver?.verdict === 'waived'
+        ? { branchVerdicts: Object.fromEntries(Object.entries(joinedFanout.branches).map(([id, branch]) =>
+          [id, branch.waiver?.verdict === 'waived' ? 'waived' : branch.status === 'done' ? 'pass' : 'fail'])) } : {};
       output = JSON.stringify({ ...(mappedItems === undefined ? {} : { result: { items: mappedItems } }),
-        outcome: joinedOutcome, branches: joinedFanout.branches });
+        outcome: joinedOutcome, branches: joinedFanout.branches, ...typedWaiverVerdicts });
     }
     const waiving = options.releaseWaiver?.nodeId === current && waivedRecord !== undefined;
     if (waiving && current === 'gate') {
@@ -2798,6 +2931,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           reportedNodeOutcome = result.outcome;
           output = redactSerializedJson({ ...(result.result === undefined ? {} : { result: result.result }),
             ...(result.evidence === undefined ? {} : { evidence: result.evidence }), outcome: result.outcome,
+            ...(current === kstDayPolicy.outputNode && state.kstDayFallback ? { kstDayFallback: state.kstDayFallback } : {}),
             ...(result.error ? { error: result.error } : {}) }) ?? 'null';
           ok = result.ok;
           exit = ok ? 0 : 1;
@@ -2862,10 +2996,23 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         ...(record.endedAt ? { endedAt: record.endedAt } : {}),
         ...(record.output === undefined ? {} : { output: lastJsonObject(record.output) ?? record.output }) }));
       writeFileSync(contextPath, JSON.stringify({ graphId, runId, startedAt: state.startedAt, executionId, nodeId: current,
+        ...(options.branchWaiverParentRunId ? { parentRunId: options.branchWaiverParentRunId } : {}),
         input: nodeRunInput, ...(Object.hasOwn(node, 'input') ? { nodeInput: node.input } : {}), outputs, nodeHistory }, null, 2) + '\n');
       let code: number | null = null;
       const runBash: BashRun = async (body, opts) => {
         const commandRoot = verifyReleaseSource();
+        const repairedVerifier = current === 'pwa' ? 'node-verdict.ts pwa'
+          : current === 'auto-approve' ? 'auto-approve-node.ts'
+            : current === 'publish' ? 'publish-node.ts' : undefined;
+        if (repairedVerifier && !state.dryRun &&
+            (signedT6PostGate || (options.branchWaiverParentRunId === '636f9e96-0aae-4cb0-babd-b509c44e2f34'
+              && signedT6PostGateResume(readGraphRun('release-loop', options.branchWaiverParentRunId, root), root, 'traffic-gate-passed')))) {
+          const expected = `bun scripts/release-loop/${repairedVerifier}`;
+          if (body !== expected) throw new Error(`signed T6 verifier recipe changed: ${current}`);
+          const installed = join(resolve(import.meta.dir, '../..'), 'scripts/release-loop', repairedVerifier.split(' ')[0]!);
+          const quoted = `'${installed.replaceAll("'", "'\\''")}'`;
+          body = `bun ${quoted}${repairedVerifier.includes(' ') ? ` ${repairedVerifier.split(' ')[1]}` : ''}`;
+        }
         // Hash the actual /bin/bash argv after interpolation. Keep the command text (which may contain
         // credentials) out of logs, but leave enough to distinguish a replayed publish from npm/docs.
         const argvSha256 = createHash('sha256').update(JSON.stringify(['/bin/bash', '-c', body])).digest('hex');
@@ -3102,8 +3249,18 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       for (const key of contract.inputs) {
         const binding = callMetadata[key];
         const optionalBinding = typeof binding === 'string' && binding.endsWith('?');
+        const suppliedContext = key === 'context' && supplied.context && typeof supplied.context === 'object' && !Array.isArray(supplied.context)
+          ? supplied.context as Record<string, unknown> : undefined;
+        const declaredContext = key === 'context' && binding && typeof binding === 'object' && !Array.isArray(binding)
+          ? binding as Record<string, unknown> : undefined;
+        const resolvedContext = declaredContext && Object.fromEntries(Object.entries(declaredContext).map(([name, value]) => [
+          name, typeof value === 'string' && value.startsWith('$') ? resolveUnitInputBinding(value, previous) : value,
+        ]));
         const resolvedBinding = binding !== undefined
-          ? resolveUnitInputBinding(optionalBinding ? binding.slice(0, -1) : binding, previous) : undefined;
+          ? resolvedContext
+            ? { ...suppliedContext, ...resolvedContext, ...(suppliedContext?.ext && resolvedContext.ext
+              ? { ext: { ...(suppliedContext.ext as Record<string, unknown>), ...(resolvedContext.ext as Record<string, unknown>) } } : {}) }
+            : resolveUnitInputBinding(optionalBinding ? binding.slice(0, -1) : binding, previous) : undefined;
         const value = optionalBinding && resolvedBinding === undefined && Object.hasOwn(supplied, key)
           ? supplied[key]
           : binding !== undefined ? resolvedBinding
@@ -3130,6 +3287,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (contract.inputs.includes('context') && node.context?.ext) {
         inputs.context = withGraphProviderContextExtensions(inputs.context, node.context.ext);
       }
+      const optionalEvidence = callMetadata.optional && typeof callMetadata.optional === 'object' && !Array.isArray(callMetadata.optional)
+        ? callMetadata.optional as Record<string, unknown> : undefined;
+      const unavailableEvidence = optionalEvidence && Object.entries(optionalEvidence).find(([, binding]) => {
+        const value = typeof binding === 'string' && binding.startsWith('$')
+          ? resolveUnitInputBinding(binding, previous) : binding;
+        return !Array.isArray(value) || value.length === 0;
+      });
+      const optionalSkipReason = unavailableEvidence ? `optional-evidence-unavailable:${unavailableEvidence[0]}` : undefined;
       const alreadySpent = state.path.length + (state.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);
       const remaining = Math.min(
         graph.allowance ? graph.allowance.innerSteps - alreadySpent : Infinity,
@@ -3145,7 +3310,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         ...(recordEntry ? { entry: selectedEntry } : {}) };
       let entered = false;
       let span: { visit: number; enteredAtMs: number } | undefined;
-      if (optionalInputMissing && unit.template.unit!.exits.includes('skip')) {
+      if (optionalSkipReason) {
+        output = JSON.stringify({ outcome: 'skip', reason: optionalSkipReason, evidence: { reason: optionalSkipReason } });
+        ok = true;
+      } else if (optionalInputMissing && unit.template.unit!.exits.includes('skip')) {
         output = JSON.stringify({ outcome: 'skip', verdict: 'skip', reason: 'candidate-path-unavailable', receiptPath: '' });
         ok = true;
       } else if (allowance.kind === 'needs-human') {
@@ -3376,7 +3544,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         const selected = node.hitl?.options.length === 2
           ? node.hitl.options.find(option => (option.default === true) === !ok)
           : undefined;
-        output = JSON.stringify({ outcome: selected?.exit ?? (ok ? 'approved' : 'rejected'),
+        output = JSON.stringify({ outcome: state.pending?.outcome ?? selected?.exit ?? (ok ? 'approved' : 'rejected'),
           ...(selected ? { choice: selected.key } : {}), graphId, runId, nodeId: current,
           ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null,
           ...(rejectionReason ? { error: rejectionReason } : {}) });
@@ -3673,9 +3841,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         ? actualSourceCommit(sourceRoot, options.releaseCommandSource?.git)
         : undefined;
       const branchInputSha256 = (branchId: string) => stableSha256({ graphId, sourceHash: state.sourceHash ?? null,
-        input: state.input ?? null, from: current, branchId, outputs: parentOutputs });
+        input: fanOutKey === 'traffic-gate-passed:ok' && pwaFanOutReceiptInput ? pwaFanOutReceiptInput : state.input ?? null,
+        from: current, branchId, outputs: parentOutputs });
       const selected = destinations.filter((branchId) => {
         const branch = fanout.branches[branchId];
+        if (signedPwaFanOut && fanOutKey === 'traffic-gate-passed:ok' && branchId === 'pwa' && branch?.waiver?.verdict === 'waived') return false;
         if (branch?.status !== 'done') return true;
         const receipt = branch.completionReceipt;
         const artifactSnapshot = completionArtifactSnapshot(branch.output, options.deps?.root ?? process.cwd());
@@ -3707,6 +3877,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
             branchCutTip: lastJsonObject(state.nodes.find((record) => record.nodeId === 'version-release')?.output)?.commit as string | undefined,
             branchGraphSnapshot: state.graphSnapshot,
             branchParentOutputs: Object.fromEntries(state.nodes.map((record) => [record.nodeId, lastJsonObject(record.output) ?? record.output ?? null])),
+            ...(signedT6PostGate ? { branchWaiverParentRunId: state.runId } : {}),
             researchEdgeDecisionRegistry: options.researchEdgeDecisionRegistry,
             loopBudgetScopes,
             deps: options.deps }); }
@@ -4174,6 +4345,7 @@ function isDecisionClaim(raw: unknown): boolean {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
   const value = raw as Record<string, unknown>;
   return typeof value.nodeId === 'string' && (value.decision === 'approved' || value.decision === 'rejected')
+    && (value.outcome === undefined || value.outcome === 'waived-known-issue')
     && typeof value.decidedAt === 'string' && (value.decidedBy === undefined || typeof value.decidedBy === 'string')
     && !('graphId' in value) && !('runId' in value);
 }

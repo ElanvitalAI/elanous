@@ -434,6 +434,8 @@ describe('grokQuotaFromUsageSnapshot — 공급자 판정이 «우리 산술보�
 
   it('주간 quota 창이 있으면 provider 사용률로 소진·사용 가능을 가른다', () => {
     expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: 58 }] })).toBe('usable');
+    expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: 31 }] })).toBe('usable');
+    expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: 30 }] })).toBe('exhausted');
     expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: 0 }] })).toBe('exhausted');
     expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'weekly', remainingPercent: Number.NaN }] })).toBe('unknown');
     expect(grokQuotaFromUsageSnapshot({ windows: [{ kind: 'monthly', remainingPercent: 0 }] })).toBe('unknown');

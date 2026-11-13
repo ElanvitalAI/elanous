@@ -212,6 +212,9 @@ export function sidetabRowsFromManifest(
         nestDepth: row.nestDepth,
         ownerPid: row.ownerPid,
         ptyStartedAt: row.startedAt,
+        // The manifest's cumulative output count advances on PTY output.
+        // A missing legacy count cannot certify a full sidechat observation.
+        ...(row.outputBytesTotal !== undefined ? { lastActivityAt: row.outputBytesTotal } : {}),
         currentProcess: row.kind === 'tui' && row.ownerPid === process.pid,
         ...(scope?.controlByPtyId?.[row.id]
           ? { controlState: sidetabControlState(scope.controlByPtyId[row.id]!) }

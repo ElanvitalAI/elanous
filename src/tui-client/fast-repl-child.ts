@@ -24,8 +24,10 @@ if (process.env.ELANOUS_NEXT_TUI_BG_STATUS === '1') {
 }
 
 const { runRepl } = await import('../repl/index.js');
+const { requestMemberBoardSession } = await import('./next-member-board-session.js');
 const code = await runRepl({
   cfg: reloadUserConfig(),
+  memberBoardSession: () => requestMemberBoardSession(),
   initialSessionId: sessionId,
   forceNew: false,
   continueActive: false,

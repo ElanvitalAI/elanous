@@ -11,14 +11,18 @@ export type HostReadinessState = {
   verdict: 'READY' | 'BLOCKED' | 'UNMEASURED';
   at: string;
   stale?: boolean;
+  freshness?: 'fresh' | 'stale' | 'down' | 'unmeasured';
   failed: string[];
   reason?: string;
   sample?: HostReadinessHeartbeat['sample'];
   tools?: Record<string, boolean>;
 };
 
-// Source: BRIEF-LOCAL-FIRST-PLACEMENT-1111.md, rubric v1 marks a heartbeat older than 24 hours stale.
+// Source: RESOURCE-HOST-HEARTBEAT-LEDGER owns the existing 24h historical-stale boundary.
 const HOST_READINESS_STALE_MS = 24 * 60 * 60 * 1_000;
+// Source: RESOURCE-HEARTBEAT-COLLECT-CRON 0.3.10 adds batch freshness without replacing that boundary.
+const HOST_READINESS_BATCH_STALE_MS = 5 * 60 * 1_000;
+const HOST_READINESS_DOWN_MS = 15 * 60 * 1_000;
 // Source: BRIEF-LOCAL-FIRST-PLACEMENT-1111.md, rubric v1 thresholds for green/yellow host health.
 const HOST_READINESS_RUBRIC = {
   green: { loadPercent: 40, load15Percent: 50, memoryAvailablePercent: 30, diskUsedPercent: 85 },
@@ -26,17 +30,46 @@ const HOST_READINESS_RUBRIC = {
 } as const;
 
 function stateForHeartbeat(heartbeat: HostReadinessHeartbeat, now: Date): HostReadinessState {
-  const ageMs = now.getTime() - Date.parse(heartbeat.at);
-  if (ageMs < 0 || ageMs >= HOST_READINESS_STALE_MS) {
+  if (!heartbeat.sample) {
+    const reason = heartbeat.gateProtected ? 'gate-protected' : heartbeat.maintenance ? 'maintenance'
+      : !heartbeat.sshAvailable ? 'ssh-unavailable' : 'metrics-unavailable';
+    const ageMs = now.getTime() - Date.parse(heartbeat.freshnessAt ?? heartbeat.at);
+    if (ageMs < 0 || ageMs >= HOST_READINESS_STALE_MS) {
+      const historicalReason = ageMs < 0 ? 'heartbeat-from-future' : 'heartbeat-stale';
+      return { host: heartbeat.host, grade: 'black', symbol: '⚫', verdict: 'UNMEASURED', at: heartbeat.at,
+        stale: true, freshness: ageMs < 0 ? 'unmeasured' : 'down', failed: [historicalReason], reason: historicalReason, tools: heartbeat.tools };
+    }
+    const freshness = ageMs >= HOST_READINESS_DOWN_MS ? 'down'
+      : ageMs >= HOST_READINESS_BATCH_STALE_MS ? 'stale' : 'unmeasured';
+    return { host: heartbeat.host, grade: 'black', symbol: '⚫', verdict: freshness === 'down' ? 'BLOCKED' : 'UNMEASURED', at: heartbeat.at,
+      stale: false, freshness, failed: [reason], reason, tools: heartbeat.tools };
+  }
+  const ageMs = now.getTime() - Date.parse(heartbeat.freshnessAt ?? heartbeat.at);
+  if (ageMs < 0) {
     return { host: heartbeat.host, grade: 'black', symbol: '⚫', verdict: 'UNMEASURED', at: heartbeat.at,
-      stale: true, failed: ['heartbeat-stale'], reason: ageMs < 0 ? 'heartbeat-from-future' : 'heartbeat-stale',
+      stale: true, freshness: 'unmeasured', failed: ['heartbeat-from-future'], reason: 'heartbeat-from-future',
+      ...(heartbeat.sample ? { sample: heartbeat.sample } : {}), tools: heartbeat.tools };
+  }
+  if (ageMs >= HOST_READINESS_STALE_MS) {
+    return { host: heartbeat.host, grade: 'black', symbol: '⚫', verdict: 'UNMEASURED', at: heartbeat.at,
+      stale: true, freshness: 'down', failed: ['heartbeat-stale'], reason: 'heartbeat-stale',
+      ...(heartbeat.sample ? { sample: heartbeat.sample } : {}), tools: heartbeat.tools };
+  }
+  if (ageMs >= HOST_READINESS_DOWN_MS) {
+    return { host: heartbeat.host, grade: 'black', symbol: '⚫', verdict: 'BLOCKED', at: heartbeat.at,
+      stale: false, freshness: 'down', failed: ['heartbeat-down'], reason: 'heartbeat-down',
+      ...(heartbeat.sample ? { sample: heartbeat.sample } : {}), tools: heartbeat.tools };
+  }
+  if (ageMs >= HOST_READINESS_BATCH_STALE_MS) {
+    return { host: heartbeat.host, grade: 'black', symbol: '⚫', verdict: 'UNMEASURED', at: heartbeat.at,
+      stale: false, freshness: 'stale', failed: ['heartbeat-stale'], reason: 'heartbeat-stale',
       ...(heartbeat.sample ? { sample: heartbeat.sample } : {}), tools: heartbeat.tools };
   }
   if (heartbeat.gateProtected || heartbeat.maintenance || !heartbeat.sshAvailable || !heartbeat.sample) {
     const reason = heartbeat.gateProtected ? 'gate-protected' : heartbeat.maintenance ? 'maintenance'
       : !heartbeat.sshAvailable ? 'ssh-unavailable' : 'metrics-unavailable';
     return { host: heartbeat.host, grade: 'black', symbol: '⚫', verdict: 'UNMEASURED', at: heartbeat.at,
-      stale: false, failed: [reason], reason, ...(heartbeat.sample ? { sample: heartbeat.sample } : {}), tools: heartbeat.tools };
+      stale: false, freshness: 'fresh', failed: [reason], reason, ...(heartbeat.sample ? { sample: heartbeat.sample } : {}), tools: heartbeat.tools };
   }
 
   const { sample } = heartbeat;
@@ -52,7 +85,7 @@ function stateForHeartbeat(heartbeat: HostReadinessHeartbeat, now: Date): HostRe
   const grade: HostReadinessGrade = withinGreen ? 'green' : withinYellow ? 'yellow' : 'red';
   const symbol = grade === 'green' ? '🟢' : grade === 'yellow' ? '🟡' : '🔴';
   return { host: heartbeat.host, grade, symbol, verdict: grade === 'red' ? 'BLOCKED' : 'READY', at: heartbeat.at,
-    stale: false, failed: grade === 'red' ? ['rubric-v1-threshold'] : [], sample, tools: heartbeat.tools };
+    stale: false, freshness: 'fresh', failed: grade === 'red' ? ['rubric-v1-threshold'] : [], sample, tools: heartbeat.tools };
 }
 
 /** Project the latest Nexus ledger heartbeat per host; stale or unavailable hosts never appear ready. */

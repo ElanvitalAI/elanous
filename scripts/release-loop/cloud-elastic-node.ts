@@ -57,7 +57,7 @@ function trustedHourlyRateKrw(request: CloudElasticToolRequest, env: NodeJS.Proc
   if (env.ELANOUS_CLOUD_HOST_MAP) map = readFileSync(env.ELANOUS_CLOUD_HOST_MAP, 'utf8');
   else {
     const script = join(homedir(), 'elanous-hq/seat-state/OP/tools/cloud-vm.sh');
-    const result = spawnSync('zsh', [script, 'map'], { encoding: 'utf8', timeout: 5_000 });
+    const result = spawnSync('zsh', [script, 'map'], { encoding: 'utf8', timeout: 5_000, maxBuffer: 16 * 1024 * 1024 });
     if (result.status !== 0) return undefined;
     map = result.stdout;
   }
@@ -109,7 +109,7 @@ function remoteProcessProbe(host: string, pid: number, namespace: string): boole
     + 'if kill -0 "$1" 2>/dev/null; then echo ALIVE; else echo DEAD; fi';
   // Source: .rules/30-harness/testing-gates.md — bounded SSH probe must fail closed on timeout.
   const result = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=1', host,
-    'sh', '-c', script, 'cloud-elastic-probe', String(pid), namespace], { encoding: 'utf8', timeout: 2_000 });
+    'sh', '-c', script, 'cloud-elastic-probe', String(pid), namespace], { encoding: 'utf8', timeout: 2_000, maxBuffer: 16 * 1024 * 1024 });
   if (result.error || result.status !== 0) return undefined;
   if (result.stdout.trim() === 'ALIVE') return true;
   if (result.stdout.trim() === 'DEAD') return false;
@@ -214,7 +214,7 @@ function approvalCheck(env: NodeJS.ProcessEnv, now = Date.now(), deps: Pick<Clou
 async function defaultRunHandTool(operation: 'join' | 'leave', host: string, waitMinutes: number, timeoutMs?: number): Promise<CloudElasticHandToolResult> {
   const script = join(homedir(), 'elanous-hq/seat-state/OP/tools', operation === 'join' ? 'cloud-join.sh' : 'cloud-leave.sh');
   const args = operation === 'join' ? [script, host] : [script, host, '--wait-min', String(waitMinutes)];
-  const result = spawnSync('zsh', args, { encoding: 'utf8', timeout: timeoutMs ?? (operation === 'join' ? CLOUD_JOIN_MAX_MS : CLOUD_LEAVE_TOOL_TIMEOUT_MS) });
+  const result = spawnSync('zsh', args, { encoding: 'utf8', timeout: timeoutMs ?? (operation === 'join' ? CLOUD_JOIN_MAX_MS : CLOUD_LEAVE_TOOL_TIMEOUT_MS), maxBuffer: 16 * 1024 * 1024 });
   return { exitCode: result.status ?? 1, stdout: result.stdout, stderr: result.error?.message ?? result.stderr };
 }
 

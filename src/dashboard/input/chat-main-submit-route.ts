@@ -14,7 +14,8 @@ export function resolveDashboardChatMainSubmitIntent(
     source?: InputSourceRef;
   },
 ): SubmitTurnIntent | ControlTurnIntent {
-  const commandText = inputText.trim();
+  const trimmed = inputText.trim();
+  const commandText = deps.stickyBackend && /^(?:exit|quit)$/i.test(trimmed) ? '/exit' : trimmed;
   const source = deps.source ?? { kind: 'keyboard', surface: 'dashboard-chat-main' };
   const textBytes = Buffer.byteLength(commandText, 'utf8');
   if (deps.stickyBackend && commandText.length > 0 && !commandText.startsWith('/')) {

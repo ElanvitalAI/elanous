@@ -69,12 +69,13 @@ test('real verb-make-doc unit executes its headless goal-loop with AIMock and re
   process.env.ELANOUS_CONFIG_DIR = join(projectRoot, 'host-config-sentinel');
   process.env.XDG_CONFIG_HOME = join(projectRoot, 'host-xdg-config-sentinel');
   process.env.ELANOUS_STATE_DIR_SOURCE = 'host-source-sentinel';
+  // The child inherits ELANOUS_STATE_DIR, which takes precedence over XDG_DATA_HOME.
   saveMemory({
     id: 'ux-headless-fixture-memory', type: 'reference', name: 'Rehearsal report memory',
     description: 'A deterministic fixture for the headless document rehearsal.',
     body: 'When writing a research report, include a short findings section and cite the requested document path.',
     pinned: false,
-  }, join(dataRoot, 'elanous', 'memory'));
+  }, join(stateRoot, 'elanous', 'memory'));
 
   try {
     writeFileSync(join(stateRoot, 'recipes.yaml'), '{}\n');

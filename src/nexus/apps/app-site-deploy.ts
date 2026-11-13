@@ -6,6 +6,7 @@ import { publicAppAddress } from './console-address.js';
 import { resolveAppDeploymentOwner, type AppMemberOwnerReceipt } from './app-deployment-owner.js';
 import { parseAppManifest } from './app-contract.js';
 import { parsePublicAppHost } from '../../relay/relay-server.js';
+import type { AppDeployPublishHook } from '../../agent/app-deploy-plugin.js';
 
 const APP_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const TEMPLATE_ID = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -39,6 +40,8 @@ export interface AppSiteDeploymentRuntime {
   readonly build: (input: { appSlug: string; source: AppSiteDeploymentSource }) => Promise<AppSiteDeploymentBuild>;
   readonly publish: (input: { appSlug: string; userSlug: string; publicUrl: string; build: AppSiteDeploymentBuild; owner: AppSiteDeploymentOwner }) => Promise<void>;
   readonly verify: (input: { publicUrl: string; verifyText: string }) => Promise<{ status: number; body: string }>;
+  /** Persist the member board result only after the deployed content has been verified. */
+  readonly recordPublished?: (input: { appSlug: string; owner: AppSiteDeploymentOwner; publicUrl: string; runId: string }) => Promise<void>;
   /** Optional shared lock that serializes source publication with receipt-gated promotion. */
   readonly withSourceLock?: <T>(appSlug: string, run: (assertHeld: () => void) => T | Promise<T>) => Promise<T>;
 }
@@ -291,6 +294,7 @@ export function createAppSiteDeployRoute(runtime?: AppSiteDeploymentRuntime) {
     if (!/^application\/json(?:\s*;|\s*$)/i.test(request.headers.get('content-type') ?? '')) return jsonError('json-required', 415);
     const templateId = await readTemplateId(request);
     if (!templateId) return jsonError('invalid-deploy-request', 400);
+    const runId = randomUUID();
     const deploy = async (assertLockHeld: () => void = () => undefined): Promise<Response> => {
       let publicUrl: string | undefined;
       let source: AppSiteDeploymentSource | undefined;
@@ -305,6 +309,7 @@ export function createAppSiteDeployRoute(runtime?: AppSiteDeploymentRuntime) {
         assertLockHeld();
         const verified = await runtime.verify({ publicUrl, verifyText: build.verifyText });
         if (verified.status !== 200 || !verified.body.includes(build.verifyText)) throw new Error('published app verification failed');
+        await runtime.recordPublished?.({ appSlug, owner, publicUrl, runId });
         const rawOutput: AppSiteDeployRawOutput = { kind: 'site-deploy', status: 'success', publicUrl };
         return Response.json({ rawOutput }, { status: 200, headers: { 'cache-control': 'no-store' } });
       } catch {
@@ -317,5 +322,33 @@ export function createAppSiteDeployRoute(runtime?: AppSiteDeploymentRuntime) {
     };
     try { return runtime.withSourceLock ? await runtime.withSourceLock(appSlug, assertHeld => deploy(assertHeld)) : await deploy(); }
     catch { return jsonError('app-source-lock-unavailable', 503); }
+  };
+}
+
+/** The agent tool enters the same bounded build/publish/verify route with a server-verified owner receipt. */
+export function createVerifiedAppSiteDeployPublisher(runtime: AppSiteDeploymentRuntime): AppDeployPublishHook {
+  return {
+    async publish({ appId, ownerUserId, owner }) {
+      if (appId !== LECTURE_APP_SLUG || owner.appSlug !== appId
+        || ownerUserId !== resolveAppDeploymentOwner('member', runtime.configuredPublicUserId, owner)) {
+        throw new Error('app deployment owner mismatch');
+      }
+      const route = createAppSiteDeployRoute({ ...runtime, resolveOwner: async () => owner });
+      const response = await route(new Request(`http://localhost/v1/apps/${appId}/deploy`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ templateId: LECTURE_TEMPLATE_ID }),
+      }));
+      if (!response?.ok) throw new Error('app site deployment failed');
+      const result: unknown = await response.json();
+      const output = (result as { rawOutput?: AppSiteDeployRawOutput } | null)?.rawOutput;
+      if (output?.status !== 'success' || !output.publicUrl) throw new Error('app site deployment returned no public URL');
+      return { publicUrl: output.publicUrl };
+    },
+    async verifyPublicUrl(publicUrl) {
+      try {
+        const response = await runtime.verify({ publicUrl, verifyText: '' });
+        return response.status === 200;
+      } catch { return false; }
+    },
   };
 }

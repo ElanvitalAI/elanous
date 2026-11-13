@@ -108,6 +108,7 @@ describe('/term 등록 (src/tui/slash/term.ts)', () => {
       termSlash: {
         sessionRegistry: registry,
         slashRuntime: createDashboardTermSlashRuntime({ accent: format, muted: format, warning: format, error: format, text: format }),
+        modalRouter: { current: () => null, set: () => {} },
         openSession: (session: { id: string }) => { openedId = session.id; },
       },
     } as unknown as TermSlashContext;

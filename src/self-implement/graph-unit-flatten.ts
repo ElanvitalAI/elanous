@@ -41,7 +41,10 @@ export function flattenGraphUnits(
     // Earlier calls may already have rewritten this call's destinations.
     const outgoing = edges.find((edge) => edge.from === callNode.nodeId);
     if (!outgoing || outgoing.on !== 'outcome' || !outgoing.map ||
-        Object.keys(outgoing.map).length !== unitHeader.exits.length ||
+        Object.keys(outgoing.map).filter(exit => !(callNode.input && typeof callNode.input === 'object' && !Array.isArray(callNode.input)
+          && Object.hasOwn(callNode.input, 'optional') && exit === 'skip')).length !== unitHeader.exits.length ||
+        (callNode.input && typeof callNode.input === 'object' && !Array.isArray(callNode.input)
+          && Object.hasOwn(callNode.input, 'optional') && !outgoing.map.skip) ||
         unitHeader.exits.some((exit) => !Object.hasOwn(outgoing.map!, exit)) ||
         !callNode.contract ||
         callNode.contract.inputs.length !== unitHeader.inputs.length ||

@@ -6,16 +6,23 @@ export function bindGraphV2NodeInput(
 ): unknown {
   const root = graphInput && typeof graphInput === 'object' && !Array.isArray(graphInput)
     ? graphInput as Record<string, unknown> : {};
-  const resolvePath = (value: unknown, path: string, reference: string): unknown => {
+  const omittedOptional = Symbol('omitted optional graph input');
+  const resolvePath = (value: unknown, path: string, reference: string, optional = false): unknown => {
+    const parts = path.split('.');
+    if (parts.some(part => ['__proto__', 'prototype', 'constructor'].includes(part)))
+      throw new Error(`unbound graph input reference: ${reference}`);
     let current = value;
-    for (const part of path.split('.')) {
-      if (['__proto__', 'prototype', 'constructor'].includes(part) || current === null
-        || typeof current !== 'object' || !Object.hasOwn(current, part)) {
+    for (const part of parts) {
+      if (current === null || typeof current !== 'object' || !Object.hasOwn(current, part)) {
+        if (optional) return omittedOptional;
         throw new Error(`unbound graph input reference: ${reference}`);
       }
       current = (current as Record<string, unknown>)[part];
     }
-    if (current === undefined) throw new Error(`unbound graph input reference: ${reference}`);
+    if (current === undefined) {
+      if (optional) return omittedOptional;
+      throw new Error(`unbound graph input reference: ${reference}`);
+    }
     return current;
   };
   const visit = (value: unknown): unknown => {
@@ -24,6 +31,8 @@ export function bindGraphV2NodeInput(
         if (graphInput === undefined) throw new Error(`unbound graph input reference: ${value}`);
         return graphInput;
       }
+      const optionalInput = /^\$input\.([A-Za-z_][A-Za-z0-9_.]*)\?$/.exec(value);
+      if (optionalInput) return resolvePath(root, optionalInput[1]!, value, true);
       const reference = /^\$(input|context|[a-z][a-z0-9-]*)(?:\.([A-Za-z_][A-Za-z0-9_.]*))?$/.exec(value);
       if (!reference) return value;
       const [, source, path] = reference;
@@ -47,13 +56,18 @@ export function bindGraphV2NodeInput(
       }
       throw new Error(`unbound graph output reference: ${value}`);
     }
-    if (Array.isArray(value)) return value.map(visit);
+    if (Array.isArray(value)) return value.map(item => {
+      const bound = visit(item);
+      return bound === omittedOptional ? undefined : bound;
+    });
     if (value && typeof value === 'object') return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, visit(item)]),
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, visit(item)])
+        .filter(([, item]) => item !== omittedOptional),
     );
     return value;
   };
-  return visit(nodeInput);
+  const bound = visit(nodeInput);
+  return bound === omittedOptional ? undefined : bound;
 }
 
 /** Bind a declared store write and seal only its owner-scoped payload for dispatch. */

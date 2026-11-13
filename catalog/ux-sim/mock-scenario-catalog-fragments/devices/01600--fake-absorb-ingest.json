@@ -1,13 +1,43 @@
 {
   "id": "fake-absorb-ingest",
   "name": "Fake seven-kind ABSORB inbox and extractors",
-  "checklistCells": ["ABSORB-INGEST-CONTRACT", "ABSORB-INGEST-EXTRACT", "ABSORB-INGEST-CARD"],
-  "implementation": ["src/ux-sim/fake-absorb-ingest.ts", "src/intake-plane/absorb-extract.ts"],
-  "tests": ["src/ux-sim/fake-absorb-ingest.test.ts", "src/nexus/api/scraps.test.ts"],
+  "checklistCells": [
+    "ABSORB-INGEST-CONTRACT",
+    "ABSORB-INGEST-EXTRACT",
+    "ABSORB-INGEST-CARD",
+    "DEMO1114-S2-PWA"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-absorb-ingest.ts",
+    "src/intake-plane/absorb-extract.ts",
+    "scenarios/ux-sim/demo1114-s2-pwa-graph.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/fake-absorb-ingest.test.ts",
+    "src/nexus/api/scraps.test.ts",
+    "src/ux-sim/scene2-pwa-world.test.ts",
+    "apps/pwa/src/components/member-board/MemberBriefingScene2.test.tsx"
+  ],
   "target": "Exercise all seven scrap input kinds, member-scoped inbox reads, extraction failure injection and deterministic no-BYOK summary cards.",
-  "inputs": ["Seven fixed scrap records", "Two member identities", "One injected extractor failure", "BYOK absent"],
-  "observations": ["All seven kinds produce extracted content and cards", "Member A cannot read member B records", "Injected extraction failure is recorded", "No BYOK uses deterministic summary fallback"],
-  "entryCommands": ["bun test src/ux-sim/fake-absorb-ingest.test.ts src/nexus/api/scraps.test.ts"],
+  "inputs": [
+    "Seven fixed scrap records",
+    "Two member identities",
+    "One injected extractor failure",
+    "BYOK absent"
+  ],
+  "observations": [
+    "All seven kinds produce extracted content and cards",
+    "Member A cannot read member B records",
+    "Injected extraction failure is recorded",
+    "No BYOK uses deterministic summary fallback",
+    "Scene 2 catalog-owned world preserves same runId, scrap ID and briefing ID through production runGraph and an explicit fake PWA API projection",
+    "Extractor failure prevents the briefing node and card; current snapshot drift is rejected from a single source root"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-absorb-ingest.test.ts src/nexus/api/scraps.test.ts",
+    "bun test src/ux-sim/scene2-pwa-world.test.ts",
+    "bun scripts/demo1114-s2-pwa-receipt.ts <evidence-root>"
+  ],
   "logsRecorded": "no",
   "eventNames": [],
   "recentUse": null

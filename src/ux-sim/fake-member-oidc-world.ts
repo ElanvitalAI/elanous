@@ -13,6 +13,8 @@ export interface FakeMemberOidcWorldOptions {
   readonly now?: () => number;
   readonly identity?: FakeGoogleIdentity | ((authorizationUrl: URL, sequence: number) => FakeGoogleIdentity);
   readonly successRedirectUri?: string;
+  /** Explicit KCB landing page for one test. Omitted calls keep the product default `/members/`. */
+  readonly kcbSuccessRedirectUri?: string;
   readonly runTryExample?: NonNullable<Parameters<typeof createMembersApi>[0]['runTryExample']>;
   /** Test-only app session issuer. Never configure this on a deployed members API. */
   readonly issueOwnerSession?: (appId: string, memberId: string) => { readonly sessionToken: string; readonly expiresAt: string };
@@ -67,6 +69,7 @@ export function createFakeMemberOidcWorld(options: FakeMemberOidcWorldOptions = 
     store: memberStore,
     google,
     successRedirectUri: options.successRedirectUri ?? 'https://app.example.test/signup/complete',
+    ...(options.kcbSuccessRedirectUri ? { kcbSuccessRedirectUri: options.kcbSuccessRedirectUri } : {}),
     now,
     getAppLifecycle: () => appLifecycle,
     ...(options.runTryExample ? { runTryExample: options.runTryExample } : {}),

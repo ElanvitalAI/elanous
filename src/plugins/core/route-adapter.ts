@@ -38,7 +38,7 @@ export function createPluginRouteAdapter(options: {
   /** Non-modal TUI confirmation. Missing confirmation capability always fails closed. */
   requestConfirmation?: (prompt: string) => Promise<boolean>;
   dispatchAppDeploy?: (args: Record<string, unknown>, context?: ToolRuntimeContext) => Promise<unknown>;
-  getDispatchContext?: () => Partial<ToolRuntimeContext>;
+  getDispatchContext?: () => Partial<ToolRuntimeContext> | Promise<Partial<ToolRuntimeContext>>;
 }): PluginRouteAdapter {
   const tools = loadNativeRouteTools(options.pluginRoot);
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
@@ -49,7 +49,7 @@ export function createPluginRouteAdapter(options: {
     parameters: tool.parameters,
     // Route-only manifests use symbolic handlers. The TUI adapter resolves those at dispatch time.
     handler: async (args) => {
-      const context = options.getDispatchContext?.() as ToolRuntimeContext | undefined;
+      const context = await options.getDispatchContext?.() as ToolRuntimeContext | undefined;
       const result = await dispatch(tool, args as Record<string, unknown>, false, context);
       return result.ok ? result.result : { error: result.error };
     },

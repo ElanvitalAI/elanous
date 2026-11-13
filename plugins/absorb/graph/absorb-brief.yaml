@@ -1,14 +1,15 @@
 apiVersion: elanous.dev/graph/v2
-graph: { id: absorb-brief, version: 1.0.0, layer: flow, purpose: "회원 스크랩 → 오늘의 브리핑 → 앱 제안" }
+graph: { id: absorb-brief, version: 1.0.0, layer: flow, purpose: "회원 스크랩 → 브리핑 → 세 줄 요구사항 → 설계 팩 → 제안" }
 loop:                                      # 루프 등록 = 그래프 머리 한 곳 (레지스트리가 읽는 자리)
   root: 조율자
   parent: intake-daily
   stage: shadow
   trigger: { events: [scrap.shared, brief.requested], cron: "0 7 * * *" }   # 하루 경계 KST
   scope: { owner: member, entitlement: absorb }
-  ext: { absorb.budget: { runs_per_day: 2, llm_calls: 3 } }
-entry: collect
+  ext: { absorb.budget: { runs_per_day: 2, llm_calls: 5 }, absorb.kstDay: { default: run-start, outputNode: save-brief } } # Source: #37285 KST day fallback plus five model turns.
+entry: load-app-slots
 nodes:
+  - { id: load-app-slots, type: store, requires: store.read@1, with: { op: list, collection: member-app-slots, owner: "$context.memberId", ownerScoped: true } }
   - { id: collect, type: store, requires: store.read@1, with: { op: list, collection: scraps, where: "status == new", owner: "$context.memberId", ownerScoped: true } }
   - id: extract
     type: extract                          # 종류 7(web·x·youtube·voice·video·photo·text)은 공급자 표가 고른다
@@ -21,8 +22,8 @@ nodes:
     skill: absorb/card
     uses: [llm-judge, store]
     contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
-    # Source: y-path upper bound: collect(1) + extract fork/7 branches/join(9) + 3 verb calls + save-brief(1) + suggestion save fork/3 branches/join(5) + notify/done(2) = 21 nodes; absorb-v2-runGraph-sim.ts.
-    budget: { inner_steps: 21 }
+    # Source: base 21 nodes + load-design/suggest/validation(3) + mapped save fork/3 branches/join(5) = 29 nodes.
+    budget: { inner_steps: 29 }
   - id: brief
     type: decide
     call: verb-decide@^1
@@ -30,34 +31,71 @@ nodes:
     uses: [llm-judge, store]
     packs: [member-apps@1]
     contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
-    # Source: y-path upper bound: collect(1) + extract fork/7 branches/join(9) + 3 verb calls + save-brief(1) + suggestion save fork/3 branches/join(5) + notify/done(2) = 21 nodes; absorb-v2-runGraph-sim.ts.
-    budget: { inner_steps: 21 }
+    # Source: same 29-node upper bound as card.
+    budget: { inner_steps: 29 }
+  - id: requirements
+    type: decide
+    call: verb-decide@^1
+    skill: absorb/requirements
+    with: { prior: "$brief.result", optional: { sources: "$brief.result.scrapIds", slots: "$load-app-slots.result.items" } }
+    uses: [llm-judge]
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+    # Source: The same 29-node upper bound as the other absorb-brief verb nodes, including this requirements node and design node.
+    budget: { inner_steps: 29 }
+    post: [ "result.lines.length == 3" ]
+  - id: design
+    type: make
+    call: verb-make@^1
+    skill: absorb/design
+    with: { context: { appSlots: "$load-app-slots.result.items" } }
+    uses: [llm-judge, store]
+    packs: [brief-design@1]
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+    # Source: The same 29-node upper bound as the other absorb-brief verb nodes, including this requirements node and design node.
+    budget: { inner_steps: 29 }
+    post: [ "result.requirementLines.length == 3" ]
+  - { id: save-brief, type: store, requires: store.write@1, with: { op: upsert, collection: briefings, owner: "$context.memberId", key: "$context.kstDay", value: "$brief.evidence.briefing", ownerScoped: true } }
+  - { id: validate-design, type: capability, requires: absorb.design-proposal@1, with: { owner: "$context.memberId" } }
+  - { id: save-design, type: capability, requires: absorb.design-write@1, with: { op: upsert, collection: design-packs, owner: "$context.memberId", key: "$brief.evidence.briefing.id", value: "$design.evidence.design", ownerScoped: true } }
+  - { id: persist-design, type: store, requires: store.write@1, with: { op: "$save-design.result.write.op", collection: "$save-design.result.write.collection", owner: "$save-design.result.write.owner", key: "$save-design.result.write.key", value: "$save-design.result.write.value", ownerScoped: "$save-design.result.write.ownerScoped", __validatedWrite: "$save-design.result.write" } }
+  - { id: load-design, type: store, requires: store.read@1, with: { op: get, collection: design-packs, owner: "$context.memberId", key: "$brief.evidence.briefing.id", ownerScoped: true } }
   - id: suggest
     type: decide
     call: verb-decide@^1
     skill: absorb/suggest
-    uses: [store]
+    with: { prior: "$load-design.result", context: { appSlots: "$load-app-slots.result.items" } }
+    uses: [llm-judge, store]
     contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
-    # Source: y-path upper bound: collect(1) + extract fork/7 branches/join(9) + 3 verb calls + save-brief(1) + suggestion save fork/3 branches/join(5) + notify/done(2) = 21 nodes; absorb-v2-runGraph-sim.ts.
-    budget: { inner_steps: 21 }
-    post: [ "result.items[*].evidenceScrapIds.length >= 1" ]
-  - { id: save-brief, type: store, requires: store.write@1, with: { op: upsert, collection: briefings, owner: "$context.memberId", key: "$context.kstDay", value: "$brief.evidence.briefing", ownerScoped: true } }
+    budget: { inner_steps: 29 } # Source: base 21 plus load/suggest/validation(3) and mapped save fork/3 branches/join(5).
+    post: [ "result.items.length > 0" ]
+  - { id: load-existing-suggestions, type: store, requires: store.read@1, with: { op: list, collection: suggestions, owner: "$context.memberId", ownerScoped: true } }
+  - { id: validate-suggestions, type: capability, requires: absorb.suggestion-write@1, with: { owner: "$context.memberId", briefingId: "$brief.evidence.briefing.id", design: "$load-design.result", suggestions: "$suggest.result.items" } }
   - id: save-suggestions
     type: store
     requires: store.write@1
-    # Source: absorb/suggest returns at most three proposals; lowerStaticMaps expands one write per item.
-    map: { over: "$suggest.result.items", as: suggestion, max_parallel: 3 }
-    with: { op: upsert, collection: suggestions, owner: "$context.memberId", key: "$suggestion.id", value: "$suggestion", ownerScoped: true }
+    map: { over: "$validate-suggestions.result.items", as: suggestionwrite, max_parallel: 3 }
+    with: { op: "$suggestionwrite.op", collection: "$suggestionwrite.collection", owner: "$suggestionwrite.owner", key: "$suggestionwrite.key", value: "$suggestionwrite.value", ownerScoped: "$suggestionwrite.ownerScoped", __validatedWrite: "$suggestionwrite" }
   - { id: notify,  type: notify, requires: notify.channel@1, with: { channels: [android, tui, telegram], dedup: "briefing:$brief.evidence.briefing.id" } }
+  - { id: notify-brief-hold, type: notify, requires: notify.channel@1, with: { channels: [android, tui, telegram], dedup: "briefing:$brief.evidence.briefing.id" } }
 edges:
+  - { from: load-app-slots, to: collect }
   - { from: collect, to: extract }
   - { from: extract, on: outcome, map: { ok: card, fail: failed } }      # fan-out join 출구 = ok·fail
   - { from: card,    on: outcome, map: { done: brief, rework: card, needs-human: failed, failed: failed } }
-  - { from: brief,   on: outcome, map: { done: suggest, rework: brief, needs-human: failed, failed: failed } }
-  - { from: suggest, on: outcome, map: { done: save-brief, rework: suggest, needs-human: failed, failed: failed } }
-  - { from: save-brief, to: save-suggestions }
-  - { from: save-suggestions, to: notify }
+  - { from: brief,   on: outcome, map: { done: save-brief, rework: brief, needs-human: failed, failed: failed } }
+  - { from: save-brief, to: requirements }
+  - { from: requirements, on: outcome, map: { done: design, skip: notify, rework: requirements, needs-human: notify-brief-hold, failed: notify-brief-hold } }
+  - { from: design, on: outcome, map: { done: validate-design, rework: design, needs-human: notify-brief-hold, failed: notify-brief-hold } }
+  - { from: validate-design, on: outcome, map: { done: save-design, failed: notify-brief-hold } }
+  - { from: save-design, on: outcome, map: { done: persist-design, failed: notify-brief-hold } }
+  - { from: persist-design, on: outcome, map: { done: load-design, failed: notify-brief-hold, needs-human: notify-brief-hold } }
+  - { from: load-design, on: outcome, map: { done: suggest, failed: notify-brief-hold } }
+  - { from: suggest, on: outcome, map: { done: load-existing-suggestions, rework: suggest, needs-human: notify-brief-hold, failed: notify-brief-hold } }
+  - { from: load-existing-suggestions, on: outcome, map: { done: validate-suggestions, failed: notify-brief-hold } }
+  - { from: validate-suggestions, on: outcome, map: { done: save-suggestions, failed: notify-brief-hold } }
+  - { from: save-suggestions, on: outcome, map: { done: notify, failed: notify-brief-hold } }
   - { from: notify,  to: done }
+  - { from: notify-brief-hold, to: failed }
 terminal: [done, failed]                 # 종단 노드는 선언만으로 생김(낮춤이 IR 노드로 만든다)
 observe: { categories: [graph.run, graph.unit, intake.pack, absorb.brief] }
 sims: [sims/absorb-demo-world.yaml]        # 검증 ③ — 가짜 추출기·LLM·텔레그램·시계·앱 호스트

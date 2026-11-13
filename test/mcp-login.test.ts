@@ -33,7 +33,7 @@ afterEach(() => {
 function isolated(): void {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-login-'));
   dirs.push(dir);
-  // ⛔ MCP 자격은 전역 자격 파일(authStorePath)에 간다 — XDG 로 tmp 에 못 박는다.
+  // The config/auth root follows the isolated state root unless explicitly overridden.
   process.env.XDG_CONFIG_HOME = join(dir, 'config');
   process.env.ELANOUS_STATE_DIR = join(dir, 'universe');
 }
@@ -119,9 +119,8 @@ describe('runMcpLogin', () => {
     expect(stored?.tokens.accessToken).toBe('access-secret');
     expect(stored?.tokens.refreshToken).toBe('refresh-secret');
     expect(stored?.authMode).toBe('mcp-oauth');
-    // ⛔ 저장 위치는 «우주 밖» 전역 자격 파일이다(격리 매뉴얼 §6).
-    expect(mcpOAuthStorePath().startsWith(process.env.XDG_CONFIG_HOME!)).toBe(true);
-    expect(mcpOAuthStorePath().startsWith(process.env.ELANOUS_STATE_DIR!)).toBe(false);
+    // Without an explicit config-dir override, credentials follow the isolated state root.
+    expect(mcpOAuthStorePath()).toBe(join(process.env.ELANOUS_STATE_DIR!, 'auth.json'));
   });
 
   test('SSH Mac and displayless Linux keep authorization URL but never call opener; local Mac calls it once', async () => {

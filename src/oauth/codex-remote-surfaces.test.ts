@@ -3,8 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getProviderForConfig, PROVIDERS, streamLLM } from '../llm.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import type { UserConfig } from '../user-config/types.js';
 import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
+import { codexOwnerMirrorAuthPath } from './codex-owner-mirror.js';
+import { resolveCodexAccountForRun } from './codex-account-store.js';
 
 test('Pod, remote tab, and remote API review consume the same owner Codex mirror', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-remote-surfaces-'));
@@ -21,11 +24,13 @@ test('Pod, remote tab, and remote API review consume the same owner Codex mirror
       tokens: { accessToken, refreshToken: '', refresh_token: '', expiresAt: expiry },
     } } }));
   };
-  const config = { llm: { provider: 'openai-codex', model: 'gpt-6.1-terra', apiKey: 'sk-decoy-api-key' } } as UserConfig;
+  const config = { llm: { provider: 'openai-codex', model: 'gpt-6.1-terra', apiKey: 'sk-decoy-api-key', codexTokenOwnerHost: 'mshq' }, hq: { hostName: 'remote-tab' } } as UserConfig;
   try {
+    setUserConfigOverlay((current) => ({ ...current, llm: { ...current.llm, codexTokenOwnerHost: 'mshq' }, hq: { ...current.hq, hostName: 'remote-tab' } }));
     process.env.XDG_CONFIG_HOME = join(root, 'xdg');
     process.env.ELANOUS_STATE_DIR = state;
     process.env.ELANOUS_CODEX_ACCOUNT = 'team';
+    delete process.env.CODEX_HOME;
     process.env.NODE_ENV = 'production';
     delete process.env.BUN_TEST;
     delete process.env.ELANOUS_TEST_RUNNER;
@@ -39,6 +44,8 @@ test('Pod, remote tab, and remote API review consume the same owner Codex mirror
       // Pod child has an isolated state root and an explicit parent mirror path.
       process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
       process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = podMirror;
+      expect(codexOwnerMirrorAuthPath()).toBe(podMirror);
+      expect(resolveCodexAccountForRun(process.env, { storePath: podMirror }).name).toBe('team');
       const pod = getProviderForConfig(config);
       expect(pod.available()).toBe(true);
       for await (const _ of pod.streamChat!([{ role: 'user', content: 'pod' }])) { /* drain */ }
@@ -58,6 +65,7 @@ test('Pod, remote tab, and remote API review consume the same owner Codex mirror
     });
     expect(observed).toEqual([`Bearer ${token('pod')}`, `Bearer ${token('remote')}`, `Bearer ${token('remote')}`]);
   } finally {
+    setUserConfigOverlay(null);
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     for (const [key, value] of Object.entries(saved)) process.env[key] = value;
     rmSync(root, { recursive: true, force: true });

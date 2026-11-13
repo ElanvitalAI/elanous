@@ -1,0 +1,18 @@
+graph_id: machine-sanitize-daily
+loop:
+  title: Machine sanitation daily inventory
+  root: 수호자
+  owner: RES
+  description: Guardian-owned daily heavy inventory; destructive worktree, branch, Docker, cache, and log cleanup requires a separate reviewed plan.
+  trigger:
+    cron: '17 3 * * *'
+    events: [manual]
+version: 1
+entry_node: inventory
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: inventory, kind: agent, recipe: 'cmd:machine-sanitize-heavy', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: inventory, on: outcome, map: { ok: done, skipped: done, fail: failed, error: failed } }

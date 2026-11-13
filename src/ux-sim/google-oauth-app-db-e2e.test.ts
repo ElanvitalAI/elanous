@@ -120,9 +120,16 @@ test('SIM-MOBILE-OWNER-SESSION resolves Google subject to its app slot and issue
       `https://api.example.test/v1/members/oauth/google/callback?code=${callback.code}&state=${callback.state}`,
       { headers: { cookie: stateCookie } },
     ));
-    expect(completed?.status).toBe(200);
+    expect(completed?.status).toBe(303);
+    const callbackLocation = completed!.headers.get('location');
+    expect(callbackLocation).toBe('https://api.example.test/v1/members/home');
+    expect(await completed!.text()).toBe('');
+    const memberCookie = completed!.headers.get('set-cookie')!.split(';', 1)[0]!;
+    expect(memberCookie).toContain('__Host-elanous_member_session=');
+    expect(completed!.headers.get('set-cookie')).toContain('HttpOnly; Secure; SameSite=Lax');
+    expect((await membersApi.handle(new Request(callbackLocation!, { headers: { cookie: memberCookie } })))?.status).toBe(200);
     const profile = await membersApi.handle(new Request('https://api.example.test/v1/members', {
-      headers: { cookie: completed!.headers.get('set-cookie')!.split(';', 1)[0]! },
+      headers: { cookie: memberCookie },
     }));
     let { appSlot } = await profile!.json() as { appSlot: { appId: string; appSlug: string; url: string | null } };
     expect(appSlot.appId).toMatch(/^kaist-[a-f0-9]{24}$/);
@@ -145,7 +152,7 @@ test('SIM-MOBILE-OWNER-SESSION resolves Google subject to its app slot and issue
     appHost = loaded.appHost;
     expect(loaded.issues).toEqual([]);
     const publishedProfile = await membersApi.handle(new Request('https://api.example.test/v1/members', {
-      headers: { cookie: completed!.headers.get('set-cookie')!.split(';', 1)[0]! },
+      headers: { cookie: memberCookie },
     }));
     ({ appSlot } = await publishedProfile!.json() as { appSlot: typeof appSlot });
     expect(appSlot.url).toBe(`https://${appSlot.appSlug}--kaist-demo.elanous.app/`);
@@ -173,7 +180,8 @@ test('SIM-MOBILE-OWNER-SESSION resolves Google subject to its app slot and issue
     }));
     expect(verifiedOwner?.status).toBe(200);
     expect(await verifiedOwner!.json()).toEqual({ memberId: members.memberForGoogleSub('google-subject-mobile')!.id,
-      userSlug: 'kaist-demo', plan: 'free', entitlements: {} });
+      // Source: member-store free-plan catalog grants relay.connect for existing and new members.
+      userSlug: 'kaist-demo', plan: 'free', entitlements: { 'relay.connect': true } });
 
     const otherIssued = await membersApi.handle(new Request('https://api.example.test/v1/members/app-slot/session', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ googleIdToken: 'sim-other-google-id-token' }),
@@ -186,7 +194,7 @@ test('SIM-MOBILE-OWNER-SESSION resolves Google subject to its app slot and issue
     });
     expect(crossSlot.status).toBe(401);
     const otherOwner = await appHost.resolveVerifiedOwner(otherSlot.appSlug, otherSession.sessionToken, members, 'kaist-demo');
-    expect(otherOwner).toMatchObject({ memberId: otherMember.id, userSlug: 'kaist-demo', plan: 'free', entitlements: {} });
+    expect(otherOwner).toMatchObject({ memberId: otherMember.id, userSlug: 'kaist-demo', plan: 'free', entitlements: { 'relay.connect': true } });
 
     const shareLink = appHost.issueInvitation(appSlot.appSlug, 'share-inviter', undefined, 'member');
     const shareAccepted = await appRequest(appHost, appSlot.appSlug,
@@ -306,10 +314,15 @@ test('SIM-APP-GOOGLE-OAUTH-APP-DB-E2E follows Google callback into isolated app 
       null,
       createDevProxyRuntimeRef(),
     );
-    expect(completed?.status).toBe(200);
-    expect(await completed!.text()).toContain('emk_');
+    expect(completed?.status).toBe(303);
+    const location = completed!.headers.get('location');
+    expect(location).toBe('https://api.example.test/v1/members/home');
+    expect(await completed!.text()).toBe('');
     const memberCookie = completed!.headers.get('set-cookie')!.split(';', 1)[0]!;
     expect(memberCookie).toContain('__Host-elanous_member_session=');
+    expect(completed!.headers.get('set-cookie')).toContain('HttpOnly; Secure; SameSite=Lax');
+    const home = await membersApi.handle(new Request(location!, { headers: { cookie: memberCookie } }));
+    expect(home?.status).toBe(200);
 
     const profile = await membersApi.handle(new Request('https://api.example.test/v1/members', {
       headers: { cookie: memberCookie },

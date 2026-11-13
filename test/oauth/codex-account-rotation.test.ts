@@ -134,17 +134,16 @@ describe('회전 판정 — 결정 넷', () => {
     expect(d.to?.name).toBe('team');
   });
 
-  // 🆕 `OBS-T188` (2026-08-20 · [F] 발견 · 대표 지시) — 「못 쟀다」가 「비어 있다」로 접히면
-  //   소진된 자격 위에 머문다. 판정 «입력»을 만들 때 그 홈의 신호가 «이 계정의 것»인지 묻는다.
-  test('🆕 정본이 홈을 모르는 계정(source=default)의 신호는 «이 계정 것»으로 귀속하지 않는다', async () => {
+  // Source: #37222 selects the default auth root as credential evidence; an absent home remains unattributable.
+  test('선택된 default auth root 신호는 귀속하고 홈이 없으면 귀속하지 않는다', async () => {
     const store = await import('../../src/oauth/codex-account-store');
     expect(store.signalAttributableToAccount({ source: 'store' })).toBe(true);
     expect(store.signalAttributableToAccount({ source: 'env' })).toBe(true);
-    // ⛔ 아래 둘이 이 시험의 «본체» — 근거 없이 ~/.codex 로 떨어진 홈의 0% 는 측정값이 아니다.
-    expect(store.signalAttributableToAccount({ source: 'default' })).toBe(false);
+    expect(store.signalAttributableToAccount({ source: 'default' })).toBe(true);
     expect(store.signalAttributableToAccount({ source: 'none' })).toBe(false);
   });
 
+  // Historical OBS-T188 note below predates #37222; selected default-root signals are now attributable.
   // 🆕⛔⭐ `OBS-T188` — ***호출부 배선을 무는 통합 시험을 「못 썼다」*** (무인 리뷰 must-fix · 2026-08-20).
   //
   //   리뷰 지적은 «정당하다»: 아래 두 시험은 헬퍼와 순수 판정기만 각각 물어서,
@@ -257,16 +256,16 @@ describe('회전 판정 — 결정 넷', () => {
     }
   });
 
-  test('default 계정 기본 60%와 계정별 명시값·전역 95%의 우선순위', () => {
+  test('default 계정 기본 60%와 계정별 명시값·전역 85%의 우선순위', () => {
     expect(DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT).toEqual({ default: 60 });
     expect(codexAccountThresholdPercent('default', {})).toBe(60);
     expect(codexAccountThresholdPercent('default', { thresholdPercent: 80 })).toBe(60);
-    expect(codexAccountThresholdPercent('team', {})).toBe(95);
+    expect(codexAccountThresholdPercent('team', {})).toBe(85);
     expect(codexAccountThresholdPercent('team', { thresholdPercent: 80 })).toBe(80);
     expect(codexAccountThresholdPercent('default', { thresholdPercentByAccount: { default: 50 } })).toBe(50);
     expect(codexAccountThresholdPercent('default', { thresholdPercentByAccount: { default: 0 } })).toBe(60);
     expect(codexAccountThresholdPercent('team', { thresholdPercent: 80, thresholdPercentByAccount: { team: 101 } })).toBe(80);
-    expect(codexAccountThresholdPercent('toString', {})).toBe(95);
+    expect(codexAccountThresholdPercent('toString', {})).toBe(85);
   });
 
   test('판정에 사용한 default 기본값·계정별 설정·전역 임계와 후보 상태를 함께 낸다', () => {
@@ -819,7 +818,8 @@ describe('계정별 임계 설정 배선 — store 판정에 전달된다', () =
     const storeModule = await import('../../src/oauth/codex-account-store');
     try {
       process.env.ELANOUS_STATE_DIR = root;
-      process.env.ELANOUS_RUN_ID = 'run-default-60-pin';
+      // Source: #37174, this run ID deterministically selects default at 59% before pin release.
+      process.env.ELANOUS_RUN_ID = 'run-reg21-8';
       const homeA = join(root, 'home-A'); const homeB = join(root, 'home-B');
       mkdirSync(homeA, { recursive: true }); mkdirSync(homeB, { recursive: true });
       process.env.CODEX_HOME = homeA;
@@ -851,7 +851,8 @@ describe('계정별 임계 설정 배선 — store 판정에 전달된다', () =
     const storeModule = await import('../../src/oauth/codex-account-store');
     try {
       process.env.ELANOUS_STATE_DIR = root;
-      process.env.ELANOUS_RUN_ID = 'run-threshold-by-account';
+      // Source: #37174, this run ID selects default below the explicit 95% override.
+      process.env.ELANOUS_RUN_ID = 'run-reg21-8';
       const homeA = join(root, 'home-A'); const homeB = join(root, 'home-B');
       mkdirSync(homeA, { recursive: true }); mkdirSync(homeB, { recursive: true });
       process.env.CODEX_HOME = homeA;
@@ -1517,11 +1518,12 @@ describe('Codex 계정 이벤트 outbound', () => {
 });
 
 describe('default 계정 60% 는 «상한» — 더 엄한 전역을 따른다 (2026-09-27 지시)', () => {
-  test('전역 없음·95 → 60 · 전역 42 → 42 · 계정별 명시가 이긴다 · 다른 계정은 전역', () => {
+  test('전역 없음·95 → 60 · 전역 42 → 42 · 계정별 명시가 이긴다 · 다른 계정은 전역 85', () => {
     expect(codexAccountThresholdPercent('default', {})).toBe(60);
     expect(codexAccountThresholdPercent('default', { thresholdPercent: 95 })).toBe(60);
     expect(codexAccountThresholdPercent('default', { thresholdPercent: 42 })).toBe(42);
     expect(codexAccountThresholdPercent('default', { thresholdPercent: 42, thresholdPercentByAccount: { default: 80 } })).toBe(80);
-    expect(codexAccountThresholdPercent('team', { thresholdPercent: 0 })).toBe(95);
+    // Source: #37174, invalid global values fall back to the configured 85% default.
+    expect(codexAccountThresholdPercent('team', { thresholdPercent: 0 })).toBe(85);
   });
 });

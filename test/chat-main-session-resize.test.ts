@@ -330,6 +330,7 @@ describe('chat main prompt resize', () => {
     const originalColumns = process.stdout.columns;
     const writes: string[] = [];
     let releaseRead: ((key: Key) => void) | undefined;
+    let notifyNextRead: (() => void) | undefined;
     let pending: Promise<unknown> | undefined;
     let disposeResize: (() => void) | undefined;
     let stdout: { mockRestore: () => void } | undefined;
@@ -373,7 +374,11 @@ describe('chat main prompt resize', () => {
             },
             requestRender: () => { draw(); },
           },
-          readKey: () => new Promise<Key>((resolve) => { releaseRead = resolve; }),
+          readKey: () => new Promise<Key>((resolve) => {
+            releaseRead = resolve;
+            notifyNextRead?.();
+            notifyNextRead = undefined;
+          }),
         },
       });
       await Promise.resolve();
@@ -400,6 +405,11 @@ describe('chat main prompt resize', () => {
         }
         expect(pickerSurface?.getBounds?.()?.width).toBe(cols);
       }
+      const nextRead = new Promise<void>((resolve) => { notifyNextRead = resolve; });
+      releaseRead?.(escapeKey);
+      // The first Escape dismisses the picker. Wait until the input turn has
+      // registered its own next read before sending the cancellation key.
+      await nextRead;
       releaseRead?.(escapeKey);
       await pending;
     } finally {

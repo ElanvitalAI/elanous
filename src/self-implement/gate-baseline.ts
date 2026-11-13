@@ -920,7 +920,7 @@ function runIsolatedBunTest(cwd: string, args: string[], timeout: number): Proce
     // SIGKILL — a test that traps SIGTERM while blocked in a native wait never runs its handler, so spawnSync
     // waited forever and its drive grandchildren lived on as ppid=1 orphans (09-30 O1: 19 processes, up to 11h).
     const started = Date.now();
-    const result = spawnSync('bun', ['test', ...args], { cwd, env: isolated.env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024 });
+    const result = spawnSync('bun', ['test', '--preserve-symlinks', ...args], { cwd, env: isolated.env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024 });
     debug.log('self-implement.gate-baseline', 'test-process-result', {
       status: result.status, signal: result.signal, errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code ?? null,
       elapsedMs: Date.now() - started, timeoutMs: timeout, parentRssBytes: process.memoryUsage().rss,

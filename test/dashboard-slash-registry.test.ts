@@ -1928,7 +1928,11 @@ describe('buildDashboardSlashRegistry — output census', () => {
   // registry → session-chat 일 때만 — baseline 은 반대 순서라 통과). mac 에선 census 가 5s 기본 시한에 걸려
   // `/pause` 까지 못 가 안 보였다. census 동안의 pause 표시를 census 전 값으로 되돌리고, 끝까지 돌게 시한을 준다.
   test('dispatches every registered slash command and preserves output classifications', async () => {
-    const registry = buildDashboardSlashRegistry();
+    const registry = buildDashboardSlashRegistry({
+      now: () => new Date('2026-11-12T00:00:00.000Z'), version: () => '0.3.15',
+      checklist: () => ({ items: [] }) as any, decisions: () => [], seatEntries: () => [], events: () => [],
+      runningRuns: () => [], releaseRun: () => null, lateSchedules: () => null,
+    });
     const pausedBefore = isPauseRequested();
     let census: Awaited<ReturnType<typeof censusRegisteredSlashOutputs>>;
     let pausedByCensus = false;

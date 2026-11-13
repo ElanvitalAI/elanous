@@ -8,9 +8,14 @@ import {
   CODEX_AUTH_EVENTS,
   _setCodexAuthObserverForTesting,
 } from './codex.js';
-import { CODEX_OWNER_MIRROR_REQUIRED } from './codex-owner-mirror.js';
+import { CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath } from './codex-owner-mirror.js';
 import { authStorePath } from './store.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { setUserConfigOverlay } from '../user-config.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
+import { isCodexUnauthorized } from './codex-account-health.js';
+import type { UserConfig } from '../user-config/types.js';
+import { getProviderForConfig } from '../llm.js';
 
 // ⛔⭐ 관측을 «넣었는데 무는 테스트가 없었다»를 고치는 파일 (리뷰 3·4라운드 must-fix).
 //
@@ -64,11 +69,13 @@ beforeEach(() => {
   savedRemoteAccessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
   process.env.XDG_CONFIG_HOME = join(home, '.config');
   process.env.CODEX_HOME = join(home, '.codex');
+  setElanousConfigDir(join(home, 'config'));
   setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, codexTokenOwnerHost: 'mshq' }, hq: { ...config.hq, hostName: 'mshq' } }));
   _setCodexAuthObserverForTesting((event, data) => { seen.push({ event, data }); observedEvents.add(event); });
 });
 
 afterEach(() => {
+  resetElanousConfigDir();
   setUserConfigOverlay(null);
   _setCodexAuthObserverForTesting(null);
   // ⛔ 원래 값을 «복원»한다 — 지우면 실행 환경·병렬 테스트를 오염시킨다(리뷰 should-fix).
@@ -90,6 +97,40 @@ function expectNoSecrets(): void {
 }
 
 describe('codex 갱신 관측 — 일곱 갈래를 «실제로 태워» 문다', () => {
+  test('Responses 401 marks the account selected for the request even when account env changes before the error', async () => {
+    const saved = { account: process.env.ELANOUS_CODEX_ACCOUNT, accountHome: process.env.ELANOUS_CODEX_ACCOUNT_HOME,
+      mode: process.env.ELANOUS_LLM_MODE, node: process.env.NODE_ENV };
+    try {
+      process.env.ELANOUS_LLM_MODE = 'real';
+      process.env.NODE_ENV = 'production';
+      process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
+      delete process.env.ELANOUS_CODEX_ACCOUNT;
+      setStore({ ...state(3_600_000), authMode: 'chatgpt' });
+      const provider = getProviderForConfig({ llm: { provider: 'openai-codex', model: 'gpt-6.1-terra' } } as UserConfig);
+      expect(provider.name).toBe('openai-codex');
+      await withFakeFetchDevice([{ url: 'https://chatgpt.com/backend-api/codex/responses', method: 'POST', response: () => {
+        process.env.ELANOUS_CODEX_ACCOUNT = 'team';
+        process.env.ELANOUS_CODEX_ACCOUNT_HOME = join(home, 'team');
+        return new Response('unauthorized', { status: 401 });
+      } }], async (device) => {
+        let failure: unknown;
+        try { for await (const _ of provider.streamChat!([{ role: 'user', content: 'probe' }])) { /* drain */ } }
+        catch (error) { failure = error; }
+        expect(String(failure)).toContain('401');
+        expect(device.calls().every((call) => call.status === 401)).toBe(true);
+      });
+      const selected = authStorePath();
+      expect(isCodexUnauthorized(selected, 'openai-codex', REFRESH, selected)).toBe(true);
+      expect(isCodexUnauthorized(selected, 'openai-codex:team', REFRESH, selected)).toBe(false);
+      const mirror = codexOwnerMirrorAuthPath();
+      expect(isCodexUnauthorized(mirror, 'openai-codex', REFRESH, mirror)).toBe(false);
+    } finally {
+      for (const [key, value] of Object.entries({ ELANOUS_CODEX_ACCOUNT: saved.account,
+        ELANOUS_CODEX_ACCOUNT_HOME: saved.accountHome, ELANOUS_LLM_MODE: saved.mode, NODE_ENV: saved.node })) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
   test('① no-credential', async () => {
     setStore(null);
     expect(await loadFreshCodexAuthState()).toBeNull();

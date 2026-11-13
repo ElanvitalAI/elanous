@@ -14,7 +14,7 @@ import type { UserConfig } from './user-config/types.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { withFakeFetchDevice, type FakeFetchRouteRequest } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice, type FakeFetchRouteRequest } from './ux-sim/fake-fetch.js';
 
 const FLASH = 'openrouter/deepseek/deepseek-v4.1-flash';
 const PRO = 'openrouter/deepseek/deepseek-v4-pro-0813';
@@ -40,7 +40,7 @@ async function capture(
   llmExtra: Record<string, unknown> = {},
 ): Promise<Record<string, any>> {
   const bodies: string[] = [];
-  await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? '')), async (device) => {
+  await withRealProviderFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? '')), async (device) => {
     const config = { llm: { provider: 'openrouter', model, apiKey: 'test-key', ...llmExtra } } as unknown as UserConfig;
     for await (const _ of getProviderForConfig(config).streamChat!(messages, opts)) { /* consume */ }
     expect(bodies.length).toBe(1);
@@ -61,7 +61,7 @@ test('① openrouter/deepseek/* → open-weight 군 · 맨 deepseek/* (LM Studio
 
 test('① 실 OpenRouter 배선: deepseek 요청에 open-weight 도구 규율이 실린다', async () => {
   const bodies: any[] = [];
-  await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(JSON.parse(request.body ?? '{}')),
+  await withRealProviderFakeFetchDevice(llmFetchRoutes((request) => bodies.push(JSON.parse(request.body ?? '{}')),
     () => sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }])), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: FLASH, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
@@ -80,7 +80,7 @@ const TUNE_IMPL_LINE = '- 구현을 끝냈다고 말하기 전에 바꾼 파일�
 
 async function captureToolBodies(model: string): Promise<string[]> {
   const bodies: string[] = [];
-  await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? ''),
+  await withRealProviderFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? ''),
     () => sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }])), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
@@ -104,7 +104,7 @@ test('①-a GLM(open-weight) 요청에 튜닝 두 줄이 실린다 — 상수 �
 test('①-a 대조: codex·claude 요청에는 튜닝 두 줄이 실리지 않는다', async () => {
   for (const [provider, model] of [['openai-codex', 'gpt-5.6-terra'], ['anthropic', 'claude-sonnet-4-5']] as const) {
     const bodies: string[] = [];
-    await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? ''),
+    await withRealProviderFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? ''),
       () => sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }])), async (device) => {
       const prov = getProviderForConfig({ llm: { provider, model, apiKey: 'k' } } as unknown as UserConfig);
       await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
@@ -210,7 +210,7 @@ test('④ 파서: 텍스트만 낸 턴의 추론은 플래그가 있을 때만 �
 
 test('④ 도구 루프: deepseek 최종 텍스트 턴이 추론을 들고 history 로 나가고, 다음 요청에 되돌아간다', async () => {
   let turnMessages: LLMMessage[] = [];
-  await withFakeFetchDevice(llmFetchRoutes(() => {}, () => sse(reasoningChunks)), async (device) => {
+  await withRealProviderFakeFetchDevice(llmFetchRoutes(() => {}, () => sse(reasoningChunks)), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: FLASH, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }],
       { onText() {}, dispatchTool: async () => 'ok', onTurnComplete: (m) => { turnMessages = m; } },
@@ -226,7 +226,7 @@ test('④ 도구 루프: deepseek 최종 텍스트 턴이 추론을 들고 histo
 
 test('④ 대조: GLM 도구 루프의 최종 텍스트 턴엔 providerMeta 가 없다', async () => {
   let turnMessages: LLMMessage[] = [];
-  await withFakeFetchDevice(llmFetchRoutes(() => {}, () => sse(reasoningChunks)), async (device) => {
+  await withRealProviderFakeFetchDevice(llmFetchRoutes(() => {}, () => sse(reasoningChunks)), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: GLM, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }],
       { onText() {}, dispatchTool: async () => 'ok', onTurnComplete: (m) => { turnMessages = m; } },

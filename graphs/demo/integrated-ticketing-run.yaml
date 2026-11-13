@@ -1,0 +1,22 @@
+# Executable six-scene chain. The host supplies production scene adapters;
+# every scene must return an observed receipt for this same root run.
+graph_id: integrated-ticketing-run
+version: 1
+entry_node: scene-1
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: scene-1, kind: agent, recipe: 'handler:demo-scene-1', max_visits: 1 }
+  - { node_id: scene-2, kind: agent, recipe: 'handler:demo-scene-2', max_visits: 1 }
+  - { node_id: scene-3, kind: agent, recipe: 'handler:demo-scene-3', max_visits: 1 }
+  - { node_id: scene-4, kind: agent, recipe: 'handler:demo-scene-4', max_visits: 1 }
+  - { node_id: scene-5, kind: agent, recipe: 'handler:demo-scene-5', max_visits: 1 }
+  - { node_id: scene-6, kind: agent, recipe: 'handler:demo-scene-6', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: scene-1, on: outcome, map: { ok: scene-2, fail: failed } }
+  - { from: scene-2, on: outcome, map: { ok: scene-3, fail: failed } }
+  - { from: scene-3, on: outcome, map: { ok: scene-4, fail: failed } }
+  - { from: scene-4, on: outcome, map: { ok: scene-5, fail: failed } }
+  - { from: scene-5, on: outcome, map: { ok: scene-6, fail: failed } }
+  - { from: scene-6, on: outcome, map: { ok: done, fail: failed } }

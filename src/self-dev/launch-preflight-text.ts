@@ -542,10 +542,14 @@ export function parseAskTargetPathHintsResult(askText: string): AskTargetPathHin
   const paths: string[] = [];
   const rejected: AskTargetPathHintRejection[] = [];
   for (const fragment of parsed.fragments) {
-    const piece = fragment.trim().replace(/^`+|`+$/g, '');
+    const trimmed = fragment.trim();
+    const quoted = /^([`"'])(.*?)\1(?:\s|$)/u.exec(trimmed);
+    // Unquoted whitespace is ambiguous with a real filename. Only explicit
+    // dash/parenthesis separators or a closed quote mark a following description.
+    const piece = quoted ? quoted[2]! : trimmed.split(/\s+[—–-]\s+|(?=[(（])/, 1)[0] ?? '';
     if (piece === '') rejected.push({ fragment, reason: 'empty' });
     // ⛔ 「경로처럼 생긴 것」만 남긴다 — 확장자나 디렉터리 구분자가 있어야 한다.
-    else if (!/[/.]/.test(piece)) rejected.push({ fragment, reason: 'not-path-like' });
+    else if ((!quoted && /^[`"']/.test(piece)) || !/[/.]/.test(piece)) rejected.push({ fragment, reason: 'not-path-like' });
     else if (/\s/.test(piece)) rejected.push({ fragment, reason: 'has-whitespace' });
     else paths.push(piece);
   }

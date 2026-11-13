@@ -108,6 +108,8 @@ export interface ToolRuntimeContext {
   appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** Verified app-scoped member receipt resolved by Nexus at the request boundary. */
   appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
+  /** Nexus-owned publisher bound to this verified request; never accepted from tool arguments. */
+  appDeployPublishHook?: import('../agent/app-deploy-plugin.js').AppDeployPublishHook;
   /** Server-assigned provenance; omitted on existing owner tool paths. */
   requestOrigin?: RequestOrigin;
   /** Confirm through the originating chat's channels, not another user's global channel. */

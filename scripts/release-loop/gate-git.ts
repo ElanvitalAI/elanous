@@ -20,6 +20,7 @@ export function gateGitSync(args: string[], cwd: string, options: GateGitSyncOpt
   const { encoding, ...rest } = options;
   const spawnOptions = {
     ...rest,
+    maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024,
     ...(encoding === 'utf8' ? { encoding: 'utf8' as const } : {}),
     cwd,
     env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },
@@ -40,6 +41,7 @@ export function gateGitSyncPerlFallback(args: string[], cwd: string, options: Ga
   const { encoding, ...rest } = options;
   const result = spawnSync('perl', ['-e', perlProcessGroupRunner, String(timeoutMs), 'git', ...args], {
     ...rest,
+    maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024,
     ...(encoding === 'utf8' ? { encoding: 'utf8' as const } : {}),
     cwd,
     env: { ...process.env, GIT_NO_LAZY_FETCH: '1' },

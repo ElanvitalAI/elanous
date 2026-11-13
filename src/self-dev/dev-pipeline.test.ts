@@ -3134,12 +3134,14 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
 
   it('리뷰 폴백은 모델에서 해석한 provider를 streamLLM에 함께 전달하고 unknown 모델은 건너뛴다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'dev-pipeline-review-provider-'));
+    const originalLlmMode = process.env.ELANOUS_LLM_MODE;
     const calls: Array<{ model?: string; provider?: { name: string } }> = [];
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const log = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: Record<string, unknown>) => {
       if (category === 'self-dev.review-fallback' || category === 'review.fallback') events.push({ event, data: data ?? {} });
     });
     try {
+      process.env.ELANOUS_LLM_MODE = 'real';
       writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
       setUserConfigOverlay((config) => ({
         ...config,
@@ -3149,6 +3151,7 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
       }));
       const seams = await buildDefaultSelfImplementSeams(planDevPipeline(T()), {
         toolReviewerRate: 0,
+        reviewGrokQuota: () => 'usable',
         streamLLM: async (_messages, _onChunk, options) => {
           calls.push({ model: options?.model, provider: options?.provider });
           options?.onResolvedProvider?.('openai-codex', 'unregistered-review-model');
@@ -3176,6 +3179,35 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
         data: expect.objectContaining({ provider: 'grok', resolvedProvider: 'openai-codex' }),
       }));
     } finally {
+      if (originalLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = originalLlmMode;
+      setUserConfigOverlay(null);
+      log.mockRestore();
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('Grok review fallback is skipped when cached weekly usage reaches 70 percent', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'dev-pipeline-grok-cap-'));
+    const calls: string[] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'self-dev.review-fallback') events.push({ event, data: data ?? {} });
+    });
+    try {
+      writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
+      setUserConfigOverlay((config) => ({ ...config, roleLlm: {}, roleModels: { review: 'unregistered-review-model' },
+        llm: { ...config.llm, provider: 'openai-codex', reviewFallbackModels: ['grok-4.6'] } }));
+      const seams = await buildDefaultSelfImplementSeams(planDevPipeline(T()), {
+        toolReviewerRate: 0,
+        reviewGrokQuota: () => 'exhausted',
+        streamLLM: async (_messages, _onChunk, options) => { calls.push(options?.model ?? 'unknown'); return 'VERDICT: PASS'; },
+        reviewScopeDiff: async () => 'diff --git a/changed.ts b/changed.ts\n+export const changed = true;\n',
+      });
+      try { await seams.reviewDiff!(repo, { goal: 'review quota guard' }); } catch { /* no usable reviewer is expected */ }
+      expect(calls).toEqual([]);
+      expect(events.some(({ data }) => String(data.errorMessage ?? '').includes('quota-threshold'))).toBe(true);
+    } finally {
       setUserConfigOverlay(null);
       log.mockRestore();
       rmSync(repo, { recursive: true, force: true });
@@ -3184,9 +3216,11 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
 
   it('GLM alias를 role source와 무관하게 canonical OpenRouter ID로 review에 전달한다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'dev-pipeline-review-provider-pin-'));
+    const originalLlmMode = process.env.ELANOUS_LLM_MODE;
     const originalOpenRouterKey = process.env.OPENROUTER_API_KEY;
     const requests: Array<{ url: string; model: string }> = [];
     try {
+      process.env.ELANOUS_LLM_MODE = 'real';
       process.env.OPENROUTER_API_KEY = 'test-review-openrouter-key';
       writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
       await withFakeFetchDevice([{
@@ -3224,6 +3258,8 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
       expect(device.calls().every(call => call.routeId === 'route-1' && call.status === 200)).toBe(true);
       });
     } finally {
+      if (originalLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = originalLlmMode;
       if (originalOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = originalOpenRouterKey;
       setUserConfigOverlay(null);

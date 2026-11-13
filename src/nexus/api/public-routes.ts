@@ -72,8 +72,28 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'scrap writes ignore request memberId and resolve owner from the server-verified member session',
   },
   {
+    method: 'POST', match: 'exact', path: '/v1/telegram/member-enrollment', selfVerified: true,
+    why: 'Telegram enrollment resolves the member from a revocable server session before issuing a one-use code',
+  },
+  {
     method: 'GET', match: 'exact', path: '/v1/members', selfVerified: true,
     why: 'member profile uses only the revocable HttpOnly member-session cookie',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/home', selfVerified: true,
+    why: 'member home verifies the revocable HttpOnly member-session cookie before rendering private profile data',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/newsletter-preference', selfVerified: true,
+    why: 'newsletter preference read verifies the revocable member-session cookie',
+  },
+  {
+    method: 'PUT', match: 'exact', path: '/v1/members/newsletter-preference', selfVerified: true,
+    why: 'newsletter preference update verifies the revocable member-session cookie and validates the explicit choice',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/newsletter-preference/count', selfVerified: true,
+    why: 'aggregate-only newsletter count verifies its separate private bearer token before reading the store',
   },
   {
     method: 'POST', match: 'exact', path: '/v1/members/referral-code', selfVerified: true,
@@ -90,6 +110,18 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
   {
     method: 'GET', match: 'exact', path: '/v1/members/owner', selfVerified: true,
     why: 'verified owner context is resolved from an app-bound session cookie or bearer by the member API',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/sessions', selfVerified: true,
+    why: 'member session list resolves the owner from the member cookie or aps_ bearer and never reads the shared store first',
+  },
+  {
+    method: 'POST', match: 'exact', path: '/v1/members/sessions', selfVerified: true,
+    why: 'member session save binds the turn to the member id resolved by server auth and ignores body owner fields',
+  },
+  {
+    method: 'GET', match: 'prefix', path: '/v1/members/sessions/', selfVerified: true,
+    why: 'one owned member session transcript uses the same verified principal and ownership check as the list',
   },
   {
     method: 'GET', match: 'exact', path: '/v1/board', selfVerified: true,
@@ -183,6 +215,14 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     match: 'prefix',
     path: '/v1/setup/',
     why: 'setup wizard routes; public only while setupMode is true (P24b)',
+  },
+  {
+    method: 'POST', match: 'exact', path: '/v1/scraps/summary-requests', selfVerified: true,
+    why: 'share summary requests verify the member session and scrap owner before recording a request',
+  },
+  {
+    method: 'GET', match: 'prefix', path: '/v1/scraps/summary-requests/', selfVerified: true,
+    why: 'share summary status verifies the member session and request owner before returning the result',
   },
 ];
 

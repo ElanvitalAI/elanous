@@ -71,8 +71,12 @@ import { observeDevRequestRouteFailSoft } from './skills/dev-request-router.js';
 import { runUrlRoute } from './skills/url-route-exec.js';
 import { recordRoutedLinkAbsorbed } from './intake-plane/link-ledger.js';
 import { classifyFrontInput, telegramAbsorbUrls } from './intake-plane/front-classifier.js';
-import { scheduleIntakeEvent } from './intake-plane/route.js';
-import { dispatchTaskCreate } from './task-orchestrator/runtimes/create.js';
+import { createNexusScrapsRouteOptions } from './nexus/api/scraps-web-digest.js';
+import { nexusRootDir } from './nexus/paths.js';
+import type { ScrapsRouteOptions } from './nexus/api/scraps.js';
+import { activeTelegramMember, consumeTelegramMemberCode, markTelegramCompletionSent, markTelegramReceiptSent,
+  pendingTelegramCompletion, pendingTelegramReceipts,
+  recordTelegramCompletion, retryPendingTelegramMemberCards, saveTelegramMemberScrap, telegramReceiptStatus, verifiedTelegramMember } from './telegram-member-scrap.js';
 import { handleTelegramSeatWork, type TelegramSeatWorkDeps } from './intake-plane/telegram-seat-work.js';
 import { deliverSeatAnswers } from './seat-dispatch/seat-ask.js';
 import { effectiveInstanceRoot } from './instance/resolve.js';
@@ -176,6 +180,10 @@ export interface TelegramBotOpts {
   onMessage: TgMessageHandler;
   /** Dependency injection for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
+  /** Isolated test seam for the member scrap extractor; production uses Nexus' web digest. */
+  scrapRouteOptions?: Pick<ScrapsRouteOptions, 'instanceRoot' | 'extractors' | 'byokCard' | 'now'> & { memberActive?: (memberId: string) => boolean };
+  /** Test runner only: local fake Bot API origin. Production never supplies this. */
+  apiBase?: string;
   /** Dependency injection for tests — override the polling delay after
    *  non-fatal errors (default: 5000ms). Tests pass 0. */
   errorBackoffMs?: number;
@@ -318,6 +326,8 @@ export class TelegramBot {
   private readonly onMessage: TelegramBotOpts['onMessage'];
   private readonly briefLedger: BriefItemsLedger | undefined;
   private readonly fetchImpl: typeof fetch;
+  private readonly scrapRouteOptions?: TelegramBotOpts['scrapRouteOptions'];
+  private readonly apiBase: string;
   private readonly errorBackoffMs: number;
   private readonly pollTimeoutSec: number;
   private readonly maxChars: number;
@@ -402,6 +412,8 @@ export class TelegramBot {
     this.briefLedger = opts.briefLedger ?? (opts.nowImpl === undefined && opts.fetchImpl === undefined ? new BriefItemsLedger() : undefined);
     this.homeChannel = opts.homeChannel;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.scrapRouteOptions = opts.scrapRouteOptions;
+    this.apiBase = opts.apiBase ?? 'https://api.telegram.org';
     this.errorBackoffMs = opts.errorBackoffMs ?? DEFAULT_ERROR_BACKOFF;
     this.pollTimeoutSec = opts.pollTimeoutSec ?? DEFAULT_POLL_TIMEOUT;
     this.maxChars = opts.maxMessageChars ?? DEFAULT_MAX_CHARS;
@@ -494,7 +506,7 @@ export class TelegramBot {
   }
 
   private apiUrl(method: string): string {
-    return `https://api.telegram.org/bot${this.token}/${method}`;
+    return `${this.apiBase}/bot${this.token}/${method}`;
   }
 
   private async apiCall<T>(method: string, body: unknown): Promise<T> {
@@ -561,7 +573,7 @@ export class TelegramBot {
     const bytes = new ArrayBuffer(png.byteLength);
     new Uint8Array(bytes).set(png);
     form.set('photo', new Blob([bytes], { type: 'image/png' }), 'screen.png');
-    const url = `https://api.telegram.org/bot${this.token}/sendPhoto`;
+    const url = this.apiUrl('sendPhoto');
     try {
       const res = await this.fetchImpl(url, { method: 'POST', body: form });
       const payload = (await res.json()) as ApiResponse<{ message_id?: number }>;
@@ -589,7 +601,7 @@ export class TelegramBot {
       'getFile', { file_id: fileId },
     );
     if (!info || !info.file_path) throw new Error(`getFile: missing file_path for ${fileId}`);
-    const binUrl = `https://api.telegram.org/file/bot${this.token}/${info.file_path}`;
+    const binUrl = `${this.apiBase}/file/bot${this.token}/${info.file_path}`;
     const res = await this.fetchImpl(binUrl);
     if (!res.ok) throw new Error(`download failed: status=${res.status}`);
     const ab = await res.arrayBuffer();
@@ -884,7 +896,7 @@ export class TelegramBot {
       'voice.ogg',
     );
 
-    const url = `https://api.telegram.org/bot${this.token}/sendVoice`;
+    const url = this.apiUrl('sendVoice');
     const res = await this.fetchImpl(url, { method: 'POST', body: form });
     let payload: ApiResponse<{ message_id?: number }>;
     try {
@@ -937,7 +949,7 @@ export class TelegramBot {
       filename,
     );
 
-    const url = `https://api.telegram.org/bot${this.token}/sendDocument`;
+    const url = this.apiUrl('sendDocument');
     let res: Response;
     try {
       res = await this.fetchImpl(url, { method: 'POST', body: form });
@@ -1233,6 +1245,11 @@ export class TelegramBot {
     }, 10_000);
     if (this.allowedUsers.size === 0) this.log('telegram.owner-gate empty-allowlist');
 
+    // Drain committed DM cards before polling new updates. Each batch yields so
+    // cards past the batch cap continue in this start. A failed chat stays
+    // pending for a later start and does not block a later healthy chat.
+    await this.retryPendingMemberCards();
+
     // Publish the slash-command menu to Telegram. Clients pick up the
     // update automatically next time they open the chat — no user-side
     // install or restart required. Failure here is non-fatal: the bot
@@ -1433,6 +1450,26 @@ export class TelegramBot {
     await this.channelOpReplyRoute?.stop();
     this.channelOpReplyRoute = undefined;
     this.log('telegram bot stopped');
+  }
+
+  private async retryPendingMemberCards(): Promise<void> {
+    const root = this.scrapRouteOptions?.instanceRoot ?? nexusRootDir();
+    const isActive = this.scrapRouteOptions?.memberActive ?? ((memberId: string) => activeTelegramMember(root, memberId));
+    try {
+      await retryPendingTelegramMemberCards({
+        root, botId: this.botId, memberActive: (memberId) => isActive(memberId),
+        yieldBetweenBatches: () => new Promise((resolve) => setTimeout(resolve, 0)),
+        transport: {
+          send: async (identity, text) => {
+            if (!this.isOwnerAllowed(identity.userId)) return false;
+            const sent = await this.sendMessage(identity.chatId, text);
+            return Boolean(sent?.messageId);
+          },
+        },
+      });
+    } catch (error) {
+      debug.log('telegram.scrap', 'retry-pending', { reason: error instanceof Error ? error.name : 'unknown' });
+    }
   }
 
   stop(): void {
@@ -1645,6 +1682,16 @@ export class TelegramBot {
   private async handleIncoming(ctx: TgIncoming): Promise<void> {
     if (!this.isOwnerAllowed(ctx.userId)) {
       await this.refuseMessage(ctx);
+      return;
+    }
+    if (/^\/connect(?:\s|$)/.test(ctx.text)) {
+      const code = ctx.text.trim().split(/\s+/)[1] ?? '';
+      const identity = { botId: this.botId, userId: ctx.userId, chatId: ctx.chatId };
+      const connected = ctx.isDm && consumeTelegramMemberCode(this.scrapRouteOptions?.instanceRoot ?? nexusRootDir(), identity, code, this.nowImpl());
+      await this.sendMessage(ctx.chatId, connected
+        ? '회원 계정이 연결되었습니다. 이제 이 대화에서 링크를 저장할 수 있습니다.'
+        : '연결할 수 없습니다. 회원 화면에서 새 연결 코드를 발급받아 이 봇의 1:1 대화에 입력해 주세요.',
+      { replyTo: ctx.messageId, threadId: ctx.threadId });
       return;
     }
     this.noteUtterance(ctx);
@@ -2030,27 +2077,64 @@ export class TelegramBot {
       if (!activeDeleg) {
         const urlDec = detectUrlRoute(ctx.text, getUserConfig().skills.urlRouting);
         if (urlDec) {
+          let absorbAttempted = false;
           try {
             const frontInput = { text: ctx.text, surface: 'telegram' as const };
             const decision = classifyFrontInput(frontInput, { urlRouting: getUserConfig().skills.urlRouting });
             const absorbUrls = telegramAbsorbUrls(frontInput, decision);
+            absorbAttempted = absorbUrls.length > 0;
             for (const url of absorbUrls) {
-              const result = await scheduleIntakeEvent(effectiveInstanceRoot(), url, {
-                eventMax: getUserConfig().intake.eventMax,
-                post: async ({ url: link }) => {
-                  const posted = await dispatchTaskCreate({
-                    title: `흡수: ${link}`.slice(0, 80),
-                    surface: { kind: 'llm-direct', prompt: `이 링크를 흡수하고 노트로 저장하세요: ${link}` },
-                  });
-                  if (!posted.taskId) throw new Error('intake event task not created');
-                  return { taskId: posted.taskId };
+              const root = this.scrapRouteOptions?.instanceRoot ?? nexusRootDir();
+              const identity = { botId: this.botId, userId: ctx.userId, chatId: ctx.chatId };
+              if (!ctx.isDm || !verifiedTelegramMember(root, identity)) {
+                await this.sendMessage(ctx.chatId, '회원 계정 연결이 필요합니다. 회원 화면에서 연결 코드를 발급받아 이 봇의 1:1 대화에서 /connect 코드로 연결해 주세요.', { threadId: ctx.threadId });
+                continue;
+              }
+              let receiptConfirmed = false;
+              const result = await saveTelegramMemberScrap({
+                options: this.scrapRouteOptions ?? createNexusScrapsRouteOptions(root),
+                identity, messageId: ctx.messageId, url,
+                onAccepted: async (receiptId, scrapId) => {
+                  if (telegramReceiptStatus(root, identity, receiptId, scrapId) === 'sent') {
+                    receiptConfirmed = true;
+                    return;
+                  }
+                  try {
+                    const sent = await this.sendMessage(ctx.chatId, `접수했습니다. 접수 ID: ${receiptId}`, { threadId: ctx.threadId });
+                    receiptConfirmed = Boolean(sent?.messageId);
+                    if (receiptConfirmed) markTelegramReceiptSent(root, identity, receiptId);
+                  } catch {
+                    // Transport failure must not abort the already accepted scrap.
+                    // Its pending receipt and later completion are retried on start.
+                    debug.log('telegram.scrap', 'receipt-pending', { receiptId });
+                  }
                 },
               });
-              if (result.reply) await this.sendMessage(ctx.chatId, result.reply, { threadId: ctx.threadId, markdown: true });
+              if (result.status === 'failed') {
+                await this.sendMessage(ctx.chatId, '링크 저장과 요약을 완료하지 못했습니다. 잠시 후 다시 보내 주세요.', { threadId: ctx.threadId });
+                continue;
+              }
+              recordTelegramCompletion(root, identity, result);
+              if (!receiptConfirmed) return;
+              try {
+                for (const pending of pendingTelegramCompletion(root, identity)) {
+                  if (verifiedTelegramMember(root, identity) !== result.memberId) return;
+                  const delivered = await this.sendMessage(ctx.chatId, pending.text, { threadId: ctx.threadId });
+                  if (delivered?.messageId) markTelegramCompletionSent(root, identity, pending.receiptId);
+                }
+              } catch {
+                debug.log('telegram.scrap', 'delivery-pending', { receiptId: result.receiptId });
+                return;
+              }
             }
             if (absorbUrls.length) return;
           } catch (error) {
-            debug.log('intake.event', 'failed', { reason: error instanceof Error ? error.name : 'unknown' });
+            debug.log('intake.event', 'failed', { reason: error instanceof Error && error.message === 'intake event task not created'
+              ? 'task-create-unavailable' : error instanceof Error ? error.name : 'unknown' });
+            if (absorbAttempted) {
+              await this.sendMessage(ctx.chatId, '링크는 받았지만 저장 작업을 시작하지 못했습니다. 잠시 후 다시 보내 주세요.', { threadId: ctx.threadId });
+              return;
+            }
           }
           const handled = await this.runUrlRouteReply(ctx, urlDec);
           if (handled) return;

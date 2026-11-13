@@ -8,6 +8,9 @@ import { TaskDispatcher } from './dispatcher.js';
 import { SurfaceRegistry } from './surface-registry.js';
 import { dispatchTaskCreate } from './runtimes/create.js';
 import { setUserConfigOverlay } from '../user-config.js';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function add(graph: TaskGraph, title: string, priority: TaskPriority, createdAt: number, status: TaskStatus = 'ready'): Task {
   const task = createTask({ title, priority, status, goalSlug: 'test',
@@ -179,6 +182,99 @@ describe('TOX ready loop', () => {
       expect((await loop.tick()).dispatched).toHaveLength(0);
       expect(starts).toBe(0);
     } finally { loop.stop(); }
+  });
+
+  test('next-provider admits only a provider-aware task and carries grok into its adapter', async () => {
+    const graph = new TaskGraph();
+    const task = createTask({ title: 'intake', goalSlug: 'test', status: 'ready',
+      surface: { kind: 'llm-direct', prompt: 'absorb a link' } }, { id: 'task:fallback', now: 1 });
+    graph.addTask(task);
+    const routed: Array<{ providerName?: string; modelHint?: string }> = [];
+    const registry = new SurfaceRegistry();
+    registry.register('llm-direct', async (_task, ctx) => {
+      routed.push({ providerName: ctx.providerName, modelHint: ctx.modelHint });
+      return { executionId: 'exec:fallback', promise: new Promise<import('./types.js').TaskExecution>(() => {}) };
+    });
+    const readBudget = {
+      config: { tools: { selfImplement: { childLlm: { mode: 'auto', chain: [
+        { provider: 'openai-codex' }, { provider: 'grok' },
+      ] } } }, llm: {} } as never,
+      inspectCodex: () => ({ candidates: [{ name: 'default', usedPercent: 60 }] }) as never,
+      grokSnapshot: () => ({ windows: [{ kind: 'weekly', used: 10 }] }) as never,
+    };
+    const loop = startToxLoop({ graph, dispatcher: new TaskDispatcher({ graph, registry }),
+      intervalMs: 60_000, readBudget, grokSubscriptionOnly: () => true });
+    try {
+      expect((await loop.tick()).dispatched).toHaveLength(1);
+      expect(routed).toEqual([{ providerName: 'grok', modelHint: 'grok-4.7' }]);
+    } finally { loop.stop(); }
+
+    const deniedGraph = new TaskGraph();
+    const denied = createTask({ title: 'intake', goalSlug: 'test', status: 'ready',
+      surface: { kind: 'llm-direct', prompt: 'absorb a link' } }, { id: 'task:no-subscription', now: 2 });
+    deniedGraph.addTask(denied);
+    let deniedStarts = 0;
+    const deniedRegistry = new SurfaceRegistry();
+    deniedRegistry.register('llm-direct', async () => {
+      deniedStarts++;
+      return { executionId: 'exec:denied', promise: new Promise<import('./types.js').TaskExecution>(() => {}) };
+    });
+    const deniedLoop = startToxLoop({ graph: deniedGraph,
+      dispatcher: new TaskDispatcher({ graph: deniedGraph, registry: deniedRegistry }),
+      intervalMs: 60_000, readBudget, grokSubscriptionOnly: () => false });
+    try {
+      expect((await deniedLoop.tick()).dispatched).toHaveLength(0);
+      expect(deniedStarts).toBe(0);
+    } finally { deniedLoop.stop(); }
+  });
+
+  test('next-provider uses real isolated credential resolution and holds absent subscription or paid API', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'tox-grok-credentials-'));
+    const emptyHome = mkdtempSync(join(tmpdir(), 'tox-grok-empty-'));
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::test': { key: 'isolated-subscription-token', expires_at: '2099-01-01T00:00:00Z' },
+    }));
+    const readBudget = {
+      config: { tools: { selfImplement: { childLlm: { mode: 'auto', chain: [
+        { provider: 'openai-codex' }, { provider: 'grok' },
+      ] } } }, llm: {} } as never,
+      inspectCodex: () => ({ candidates: [{ name: 'default', usedPercent: 60 }] }) as never,
+      grokSnapshot: () => ({ windows: [{ kind: 'weekly', used: 10 }] }) as never,
+    };
+    try {
+      for (const [label, context, shouldDispatch] of [
+        ['subscription-only', { home, env: {} as NodeJS.ProcessEnv }, true],
+        ['no-subscription', { home: emptyHome, env: {} as NodeJS.ProcessEnv }, false],
+        ['paid-api-present', { home, env: { XAI_API_KEY: 'isolated-paid-key' } as NodeJS.ProcessEnv }, false],
+      ] as const) {
+        const graph = new TaskGraph();
+        const task = createTask({ title: label, goalSlug: 'test', status: 'ready',
+          surface: { kind: 'llm-direct', prompt: 'isolated prompt' } }, { id: `task:${label}`, now: 1 });
+        graph.addTask(task);
+        const routed: string[] = [];
+        const events: string[] = [];
+        const registry = new SurfaceRegistry();
+        registry.register('llm-direct', async (_task, ctx) => {
+          routed.push(ctx.providerName ?? 'none');
+          return { executionId: `exec:${label}`, promise: new Promise<import('./types.js').TaskExecution>(() => {}) };
+        });
+        const loop = startToxLoop({ graph, dispatcher: new TaskDispatcher({ graph, registry }),
+          intervalMs: 60_000, readBudget, grokCredentialContext: context,
+          log: event => { events.push(event); } });
+        try {
+          expect((await loop.tick()).dispatched).toHaveLength(shouldDispatch ? 1 : 0);
+          expect(routed).toEqual(shouldDispatch ? ['grok'] : []);
+          if (!shouldDispatch) {
+            expect(graph.getTask(task.id)?.status).toBe('ready');
+            expect(events).toContain('budget-hold');
+          }
+        } finally { loop.stop(); }
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
   });
 
   test('real dispatcher starts only the budget-approved task (not a second ready task)', async () => {

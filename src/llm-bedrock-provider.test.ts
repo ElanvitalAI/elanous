@@ -1,3 +1,4 @@
+import { beforeEach, afterEach } from 'bun:test';
 import type { LLMToolSpec } from './llm/tool-spec.js';
 // BEDROCK-PROVIDER — 공급자 본체(요청 몸 꼴·응답 파싱·캐시·관측) ⊕ 불변식(다른 공급자·자동 선택 불변).
 // ⛔ 실 AWS 호출 0 — 자격·서명·HTTP 전부 주입. 자격 값은 가짜다.
@@ -12,7 +13,7 @@ import { resolveImplementationChildModel } from './self-dev/dev-cli.js';
 import { childLlmSelectionEnv } from './agent/run-context.js';
 import { makeBedrockProvider } from './llm/bedrock-provider.js';
 import { podNamedChildProvider } from './task-orchestrator/surfaces/self-implement-pod.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 const ENV: Record<string, string> = { AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'AKIDFAKE', AWS_SECRET_ACCESS_KEY: 'fake' };
 const FAKE = { accessKeyId: 'AKIDFAKE', secretAccessKey: 'fake' };
@@ -235,7 +236,7 @@ test('retry re-signs the request (SigV4 x-amz-date freshness) via fetchApiWithRe
   let calls = 0;
   const seenAuth: string[] = [];
   const redirects: unknown[] = [];
-  await withFakeFetchDevice([{ url: 'https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages', method: 'POST', response: (request) => {
+  await withRealProviderFakeFetchDevice([{ url: 'https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages', method: 'POST', response: (request) => {
     calls++;
     seenAuth.push(request.headers.authorization ?? '');
     redirects.push(request.redirect);
@@ -260,7 +261,7 @@ test('retry re-signs the request (SigV4 x-amz-date freshness) via fetchApiWithRe
 test('re-sign failure on retry is not retried again (credential error thrown as-is)', async () => {
   let calls = 0;
   let resolves = 0;
-  await withFakeFetchDevice([{ url: 'https://bedrock-runtime.us-east-1.amazonaws.com/model/global.anthropic.claude-sonnet-5-5/invoke-with-response-stream', method: 'POST', response: () => {
+  await withRealProviderFakeFetchDevice([{ url: 'https://bedrock-runtime.us-east-1.amazonaws.com/model/global.anthropic.claude-sonnet-5-5/invoke-with-response-stream', method: 'POST', response: () => {
     calls++;
     return new Response('{"message":"overloaded"}', { status: 500 });
   } }], async () => {
@@ -335,7 +336,7 @@ test('cache marker placement is byte-identical to the Anthropic provider (system
     { role: 'user' as const, content: 'read a.ts' },
   ];
   let anthropicBody: any;
-  await withFakeFetchDevice([{ url: 'https://api.anthropic.com/v1/messages', method: 'POST', response: (request) => {
+  await withRealProviderFakeFetchDevice([{ url: 'https://api.anthropic.com/v1/messages', method: 'POST', response: (request) => {
     anthropicBody = JSON.parse(request.body ?? 'null');
     return new Response(STREAM, { status: 200, headers: { 'content-type': 'text/event-stream' } });
   } }], async () => {
@@ -377,7 +378,7 @@ test('the production path (fetchApiWithRetry → ApiHttpError) also masks the AR
   const body = JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'User: arn:aws:iam::123456789012:user/x is not authorized to perform: bedrock-mantle:CreateInference' } });
   const logSpy = spyOn(debug, 'log').mockImplementation((() => {}) as typeof debug.log);
   try {
-    await withFakeFetchDevice([{ url: 'https://bedrock-runtime.us-east-1.amazonaws.com/model/global.anthropic.claude-sonnet-5-5/invoke-with-response-stream', method: 'POST', response: () => new Response(body, { status: 403 }) }], async () => {
+    await withRealProviderFakeFetchDevice([{ url: 'https://bedrock-runtime.us-east-1.amazonaws.com/model/global.anthropic.claude-sonnet-5-5/invoke-with-response-stream', method: 'POST', response: () => new Response(body, { status: 403 }) }], async () => {
       const p = makeBedrockProvider({ provider: 'bedrock' } as UserConfig['llm'], { env: ENV, resolveCredentials: async () => FAKE, sign: async ({ headers }) => headers });
       const err = await (async () => { for await (const _ of p.streamChat!([{ role: 'user', content: 'x' }])) { /* */ } })().then(() => null, (e: Error & { status?: number; bodyText?: string }) => e);
       expect(err?.name).toBe('ApiHttpError');
@@ -387,4 +388,12 @@ test('the production path (fetchApiWithRetry → ApiHttpError) also masks the AR
       expect(`${err?.message} ${err?.bodyText}`).not.toMatch(/arn:aws/);
     });
   } finally { logSpy.mockRestore(); }
+});
+
+// Provider wire expectations run with a fake HTTP transport, not the gate's default fake LLM.
+let previousWireMode: string | undefined;
+beforeEach(() => { previousWireMode = process.env.ELANOUS_LLM_MODE; process.env.ELANOUS_LLM_MODE = 'real'; });
+afterEach(() => {
+  if (previousWireMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+  else process.env.ELANOUS_LLM_MODE = previousWireMode;
 });

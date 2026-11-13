@@ -5,7 +5,7 @@
 // (short, reference-only) rather than re-transporting the full body
 // or re-spawning the sub-agent.
 
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -72,7 +72,16 @@ describe('dispatchRead + SessionCache', () => {
 });
 
 describe('dispatchAgent + SessionCache', () => {
-  beforeEach(() => globalAgentRegistry.clear());
+  let previousLlmMode: string | undefined;
+  beforeEach(() => {
+    globalAgentRegistry.clear();
+    previousLlmMode = process.env.ELANOUS_LLM_MODE;
+    process.env.ELANOUS_LLM_MODE = 'real'; // Honor the explicitly injected provider in Bun's test environment.
+  });
+  afterEach(() => {
+    if (previousLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+    else process.env.ELANOUS_LLM_MODE = previousLlmMode;
+  });
 
   const def: AgentDefinition = {
     name: 'general-purpose',

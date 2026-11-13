@@ -9,12 +9,18 @@ import { buildUserConfig, runWithUserConfigSnapshot } from '../user-config.js';
 
 class FakeApprovalProcess extends EventEmitter implements ShellApprovalIpcProcess {
   approved = true;
+  autoReply = true;
   calls: Array<{ type: string; callId: string; command: string }> = [];
+  cancellations: Array<{ type: string; callId: string; reason: string }> = [];
 
   send(message: unknown): boolean {
-    const call = message as { type: string; callId: string; command: string };
+    const call = message as { type: string; callId: string; command: string; reason?: string };
+    if (call.type === 'elanous.shell-approval.cancel') {
+      this.cancellations.push({ type: call.type, callId: call.callId, reason: call.reason ?? '' });
+      return true;
+    }
     this.calls.push(call);
-    queueMicrotask(() => this.emit('message', {
+    if (this.autoReply) queueMicrotask(() => this.emit('message', {
       type: 'elanous.shell-approval.result', callId: call.callId, approved: this.approved,
     }));
     return true;
@@ -22,6 +28,39 @@ class FakeApprovalProcess extends EventEmitter implements ShellApprovalIpcProces
 }
 
 describe('Next TUI REPL Bash dispatch approval boundary', () => {
+  test('Esc cancellation settles an unresolved approval and never dispatches Bash', async () => {
+    const priorEnv = process.env[NEXT_TUI_SHELL_APPROVAL_IPC_ENV];
+    process.env[NEXT_TUI_SHELL_APPROVAL_IPC_ENV] = '1';
+    try {
+      const approvalProcess = new FakeApprovalProcess();
+      approvalProcess.autoReply = false;
+      const controller = new AbortController();
+      let dispatched = false;
+      const tools = buildReplTools({
+        shellApprovalProcess: approvalProcess,
+        getSignal: () => controller.signal,
+        dispatchBash: async () => { dispatched = true; return { ok: true }; },
+      });
+      const pending = tools.dispatch('Bash', { command: 'rm -rf /tmp/pending-approval' });
+      expect(approvalProcess.calls).toHaveLength(1);
+      controller.abort();
+      const outcome = await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('cancel did not settle')), 1000)),
+      ]);
+      expect(outcome).toEqual({ error: 'Bash blocked: turn cancelled.' });
+      expect(approvalProcess.cancellations).toEqual([{
+        type: 'elanous.shell-approval.cancel',
+        callId: approvalProcess.calls[0]!.callId,
+        reason: 'turn-cancelled',
+      }]);
+      expect(dispatched).toBe(false);
+    } finally {
+      if (priorEnv === undefined) delete process.env[NEXT_TUI_SHELL_APPROVAL_IPC_ENV];
+      else process.env[NEXT_TUI_SHELL_APPROVAL_IPC_ENV] = priorEnv;
+    }
+  });
+
   test('buildReplTools waits for approval IPC before dispatching and never dispatches a denial', async () => {
     const priorEnv = process.env[NEXT_TUI_SHELL_APPROVAL_IPC_ENV];
     const approvalProcess = new FakeApprovalProcess();

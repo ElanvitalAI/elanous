@@ -1,21 +1,220 @@
 {
-  "schemaVersion": 1,
-  "sourceKind": "synthetic-ticket-design-fixture",
-  "title": "공연 티켓팅 플랫폼",
-  "summary": "구매 API와 좌석 재고·결제 경로는 로컬에 유지한다. 비식별 이벤트 집계와 리포트 생성만 비동기 배치로 분리한다.",
-  "requirements": [
-    "좌석 예약과 결제는 멱등 키로 중복 처리를 막는다",
-    "구매 경로와 분석 배치의 장애 영역을 분리한다",
-    "집계 작업은 재시도·체크포인트 가능하고 사용자 요청 지연에 영향을 주지 않는다"
-  ],
-  "localComponents": ["구매 API", "좌석 재고", "결제", "작업 대기열"],
-  "offloadWorkload": "비식별 이벤트 집계·리포트 생성",
-  "offloadKind": "batch",
-  "retryable": true,
-  "checkpointable": true,
-  "exportData": "식별자 제거된 집계 이벤트",
-  "containsPii": false,
-  "dataClass": "internal",
-  "region": "asia-northeast3",
-  "usage": { "vcpuHours": 4, "gibHours": 8 }
+  "source": {
+    "kind": "plugin-scene2-scene3-fixture",
+    "sessionId": "elanous-session-s070vh",
+    "sha256": "e469fcc57951d5cb0bf9451776ca6036a3a8ed3881f5d15c042ca613606c8b41"
+  },
+  "runId": "4d4eed28-3a83-4fa1-adcc-42a0c8397619",
+  "producer": {
+    "graphId": "demo-scene4-architecture",
+    "status": "done"
+  },
+  "sourceLimit": "Input is plugin fixture, not a live scene 2/3 acceptance record",
+  "designResult": {
+    "schemaVersion": 1,
+    "title": "Concert ticketing architecture",
+    "version": "1.0",
+    "summary": "콘서트 티켓팅 서비스 시스템 아키텍처 초안 (100,000 동시 접속 데모 가정) 1.",
+    "background": "concert ticketing · 콘서트 티켓팅 서비스 시스템 아키텍처를 설계해줘. 규모: 동시 100,000명(설계 가정: 장면 4 피크 부하 검증을 위한 데모 가정; 원문 기사 수치가 아님). 핵심 제약: 접속 폭주 시 공정한 대기열 · 같은 좌석 중복 예매 0건과 결제 실패 복구. 미정책은 가정으로 명시하고 질문 없이 초안을 완성해줘. 모델 답변에서 추출한 일반 시스템 설계. 용량·비용 수치는 검증 전 가정이다.",
+    "deployment": {
+      "provider": "generic",
+      "project": "ticketing-system",
+      "region": "primary-zone",
+      "vpc": "private-network"
+    },
+    "nodes": [
+      {
+        "id": "fans",
+        "label": "Fans",
+        "layer": "users",
+        "zone": "external",
+        "service": "Browser clients",
+        "details": [
+          "100,000 concurrent",
+          "Queue admission token"
+        ]
+      },
+      {
+        "id": "edge",
+        "label": "Public edge",
+        "layer": "edge",
+        "zone": "project",
+        "service": "TLS edge and rate limits",
+        "details": [
+          "Admission boundary"
+        ]
+      },
+      {
+        "id": "booking",
+        "label": "Booking API",
+        "layer": "application",
+        "zone": "vpc",
+        "service": "Stateless booking workers",
+        "details": [
+          "Seat hold and expiry",
+          "Idempotent requests"
+        ]
+      },
+      {
+        "id": "queue",
+        "label": "Admission queue",
+        "layer": "data",
+        "zone": "vpc",
+        "service": "Redis admission queue",
+        "details": [
+          "Fair ordering",
+          "Capacity gate"
+        ]
+      },
+      {
+        "id": "ledger",
+        "label": "Seat ledger",
+        "layer": "data",
+        "zone": "vpc",
+        "service": "PostgreSQL seat ledger",
+        "details": [
+          "Atomic seat transition",
+          "Order consistency"
+        ]
+      },
+      {
+        "id": "observe",
+        "label": "Telemetry",
+        "layer": "observability",
+        "zone": "vpc",
+        "service": "Metrics and tracing",
+        "details": [
+          "Queue lag and conflicts"
+        ]
+      },
+      {
+        "id": "security",
+        "label": "Trust boundary",
+        "layer": "security",
+        "zone": "external",
+        "service": "Identity and policy controls",
+        "details": [
+          "Buyer PII boundary"
+        ]
+      }
+    ],
+    "flows": [
+      {
+        "from": "fans",
+        "to": "edge",
+        "label": "TLS request",
+        "kind": "sync"
+      },
+      {
+        "from": "edge",
+        "to": "queue",
+        "label": "join and admission",
+        "kind": "sync"
+      },
+      {
+        "from": "queue",
+        "to": "booking",
+        "label": "admitted request",
+        "kind": "sync"
+      },
+      {
+        "from": "booking",
+        "to": "ledger",
+        "label": "atomic hold and confirmation",
+        "kind": "sync"
+      },
+      {
+        "from": "booking",
+        "to": "observe",
+        "label": "metrics and traces",
+        "kind": "telemetry"
+      }
+    ],
+    "requirements": [
+      {
+        "id": "R1",
+        "kind": "fairness",
+        "statement": "공정한 대기열",
+        "verification": "동일 입장 조건에서 순서 역전·중복 토큰 시험"
+      },
+      {
+        "id": "R2",
+        "kind": "correctness",
+        "statement": "같은 좌석 중복 확정 0건",
+        "verification": "동일 좌석 동시 경쟁 및 최종 원장 유일성 시험"
+      },
+      {
+        "id": "R3",
+        "kind": "recovery",
+        "statement": "결제 실패 복구",
+        "verification": "웹훅 중복·지연·역순 및 만료 경합 시험"
+      }
+    ],
+    "security": [
+      {
+        "class": "public",
+        "data": "공연·좌석 공개 정보",
+        "controls": "공개 캐시와 TLS"
+      },
+      {
+        "class": "confidential",
+        "data": "구매자·결제 식별자",
+        "controls": "최소 권한·암호화·로그 마스킹"
+      }
+    ],
+    "capacity": [
+      {
+        "item": "동시 사용자",
+        "assumption": "100,000명; 대기열에 수용하고 좌석 API 입장률은 실측으로 결정",
+        "verification": "피크 부하·DB 연결 상한·큐 지연 측정"
+      }
+    ],
+    "costs": [
+      {
+        "item": "월 비용",
+        "formula": "리전·서비스·처리율 미확정: 추정 전 단가 입력 필요",
+        "monthlyUsd": 0
+      }
+    ],
+    "savings": [
+      {
+        "name": "정적 자산 캐시",
+        "mechanism": "반복 조회 분산",
+        "guardrail": "개인화·결제 응답은 공유 캐시 금지"
+      }
+    ],
+    "alternatives": [
+      {
+        "name": "캐시를 최종 좌석 원장으로 사용",
+        "when": "원장 유실·재구축 보증을 별도 증명한 경우",
+        "tradeoff": "중복 확정 불변식 검증이 어려움"
+      }
+    ],
+    "decisions": [
+      {
+        "id": "ADR-1",
+        "decision": "PostgreSQL seat ledger를 최종 좌석 원장으로 사용",
+        "rationale": "PostgreSQL] (콘서트/좌석/예약/결제/감사로그 - 단일 진실 소스)",
+        "revisit": "피크 성능 실측 시"
+      }
+    ],
+    "references": [
+      {
+        "title": "공정한 대기열과 입장권",
+        "url": "pack:ticketing-architecture-public@0.2.0#card:0e1f23acea1bb143"
+      },
+      {
+        "title": "좌석 원장과 상태 전이",
+        "url": "pack:ticketing-architecture-public@0.2.0#card:0f2e2e8a051e29e9"
+      },
+      {
+        "title": "고객 관점 SLI와 SLO",
+        "url": "pack:ticketing-architecture-public@0.2.0#card:1d0e7201d00dd1b7"
+      },
+      {
+        "title": "시간 제한 임대와 좌석 홀드의 경계",
+        "url": "pack:ticketing-architecture-public@0.2.0#card:2530751a6e278843"
+      }
+    ]
+  }
 }

@@ -11,9 +11,10 @@ import { analyzeImportGraphScc } from './release-loop/import-graph-scc.js';
 import { buildClosureGraph, gitClosureTree, testsReachingChangedFromGraph, type ClosureGraph, type ClosureTree } from './release-loop/gate-closure.js';
 import { isTestPath, sourceCandidates } from '../src/self-implement/importer-test-index.js';
 import { reverseImportAffectedRoots } from '../src/self-implement/pwa-import-graph.js';
+import { contractTestCandidate, gitContractRead } from './release-loop/contract-test-select.js';
 
 export type DietCut = { kind: 'edge'; from: string; to: string } | { kind: 'module'; path: string };
-export interface DietInput { repo: string; commit: string; files: readonly string[]; cut?: DietCut; includeScc?: boolean }
+export interface DietInput { repo: string; commit: string; baseCommit?: string; files: readonly string[]; cut?: DietCut; includeScc?: boolean }
 
 // Source: cache schema for the serialized ClosureGraph shape below; bump when its meaning changes.
 const CACHE_SCHEMA = 1;
@@ -120,7 +121,8 @@ export function virtualTree(tree: ClosureTree, cut: DietCut): ClosureTree {
 }
 
 function rootPlan(repo: string, tree: ClosureTree, files: readonly string[]) {
-  return planRootCheck({ wholeRepository: false, rootChanged: new Set(files), cwd: repo, env: {},
+  // The repository's ProcessEnv declaration requires NODE_ENV; planRootCheck only reads its two gate overrides.
+  return planRootCheck({ wholeRepository: false, rootChanged: new Set(files), cwd: repo, env: { NODE_ENV: 'test' },
     affectedRoots: (_cwd, changed) => reverseImportAffectedRoots(repo, changed, {
       listFiles: () => tree.files.filter((file) => /^(?:src|scripts|test)\/.*\.ts$/.test(file)),
       readFile: (absolute) => {
@@ -188,7 +190,12 @@ export function measureTscDiet(input: DietInput) {
   const { graph, cache } = loadGraph(input.repo, input.commit, tree);
   const before = profile(input.repo, tree, graph, files, input.includeScc ?? false);
   const after = input.cut ? profile(input.repo, virtualTree(tree, input.cut), virtualGraph(graph, input.cut, tree), files, false) : undefined;
-  return { commit: input.commit, changedFiles: files, cut: input.cut, cache, elapsedMs: Math.round(performance.now() - start),
+  const tests = tree.files.filter(isTestPath).sort();
+  const contractSelection = input.baseCommit
+    ? contractTestCandidate({ tree, priorRead: gitContractRead(input.repo, input.baseCommit), changed: files, tests })
+    : { status: 'full' as const, reason: 'baseline commit unavailable', files: tests, direct: 0, twoHop: 0 };
+  return { commit: input.commit, baseCommit: input.baseCommit ?? null, changedFiles: files, cut: input.cut, cache, elapsedMs: Math.round(performance.now() - start),
+    contractSelection,
     analyzerCheckout: resolve(import.meta.dir, '..'), before, after,
     note: 'The analyzer runs from analyzerCheckout, which may differ from the measured commit. Counterfactuals only change the in-memory source graph; TypeScript validity and runtime behavior require a real code change and gate.' };
 }
@@ -206,13 +213,21 @@ function parse(args: string[]) {
   if (values.has('--cut-edge') && values.has('--delete-module')) throw new Error('pass one virtual change');
   const repo = resolve(values.get('--repo') ?? process.cwd());
   const commit = exactCommit(repo, values.get('--commit') ?? values.get('--branch')!);
-  const files = values.get('--files')?.split(',').map((file) => file.trim())
-    ?? git(repo, 'diff', '--no-renames', '--name-only', `${exactCommit(repo, values.get('--base') ?? 'origin/main')}...${commit}`).split('\n').filter(Boolean);
+  const explicitFiles = values.get('--files')?.split(',').map((file) => file.trim());
+  let baseCommit: string | undefined;
+  try { baseCommit = exactCommit(repo, values.get('--base') ?? 'origin/main'); }
+  catch (error) {
+    if (!explicitFiles) throw error;
+  }
+  const files = explicitFiles ?? (baseCommit
+    ? git(repo, 'diff', '--no-renames', '--name-only', `${baseCommit}...${commit}`).split('\n').filter(Boolean)
+    : undefined);
+  if (!files) throw new Error('base commit unavailable; pass --files or an available --base');
   const edge = values.get('--cut-edge')?.split(':');
   if (edge && (edge.length !== 2 || edge.some((part) => !part))) throw new Error('cut edge must be from:to');
   const cut: DietCut | undefined = edge ? { kind: 'edge', from: edge[0]!, to: edge[1]! }
     : values.get('--delete-module') ? { kind: 'module', path: values.get('--delete-module')! } : undefined;
-  return { repo, commit, files, cut, includeScc };
+  return { repo, commit, ...(baseCommit ? { baseCommit } : {}), files, cut, includeScc };
 }
 
 if (import.meta.main) {

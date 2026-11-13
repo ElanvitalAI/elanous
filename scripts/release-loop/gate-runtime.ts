@@ -23,11 +23,12 @@ import { runPairedIsolatedBatch } from './gate-baseline-isolated.js';
 import { baselineCommit, GATE_COMMIT_SHA as sha } from './gate-baseline-manifest.js';
 export { baselineCommit } from './gate-baseline-manifest.js';
 import { baselineFromCutLogs } from './baseline-from-logs';
-import { changedFilesBetween, mergePartialFailures, readPartialPlanResult, testFileOfId, verifyDocsOnlyCarry } from './gate-partial';
+import { changedFilesBetween, mergePartialFailures, readPartialPlanResult, testFileOfId, verifyDocsOnlyCarry, type PartialPlan } from './gate-partial';
 import { planGateRadiusShadow, shadowActual, versionOnlyBumps, writeGateRadiusShadow, type GateRadiusShadowPlan } from './gate-radius-shadow';
 import { planHardRehearsalRadius, partialGateImagesMatch, preflightGateBaseImageDigest, preflightGateExecutionIdentity, preflightGateImageDigest } from './gate-radius-live';
 import { gitClosureTree, testsReachingChanged } from './gate-closure.js';
-import { compareContractShadowFailures, contractTestCandidate, gitContractRead } from './contract-test-select.js';
+import { compareContractShadowFailures, contractTestCandidate, gitContractRead, runContractTestPrimary,
+  fullContractTestCandidate, type ContractTestCandidate, type ContractTestPrimaryObservation } from './contract-test-select.js';
 import { selectFormalReceiptRadiusFallback } from './formal-receipt-radius.js';
 import { actualGatePodImageDigest, gateBaselineReceipt, gateEnvFingerprint, gateGraphPins, gateShardRecipeIdentityAtCommit, gateSourcePins, parseGatePodRuntimeIdentity,
   POD_SWEEP_INTEGRATION_ONLY, gateAssignableTestsAtCommit } from './gate-baseline-receipt';
@@ -72,6 +73,7 @@ import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, merg
 import { appendGateShardLedgerBatch, appendGateShardLedgerForGate, gateShardFilesCovered, gateShardLedgerBatchComplete, gateShardLedgerPath, readGateShardLedger, reusableGateShardLedgerBatch, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { carryGateShardResult, markGateShardUnmeasured, nextGateShardAttempt, readGateShardManifest, readGateShardManifestHistory, readGateShardResult, reusableGateShardFailures, saveGateFileReceipt, saveGateShardResult } from './gate-shard-receipts.js';
 import { gateFileReceiptClosureDigest, gateFileReceiptIdentityFromClosure, gateFileReceiptKey } from './gate-file-receipts.js';
+import { buildJudgedRunInventory, selectJudgedCutRadius, validFinalJudgedRun, type JudgedFileRow } from './gate-radius-judged-run.js';
 import type { ClosureTree } from './gate-closure.js';
 import { gateProgressTransitionKey, gateShardRuntimeIdentityKey, planGateReceiptRadius, planGateShardDispatch, summarizeGateProgress, type GateProgressGroup, type GateShardReceipt } from './gate-shard-dispatch.js';
 import type { TrainFileCasPlan } from './gate-train-file-cas.js';
@@ -417,8 +419,12 @@ export function writeGateVerdictRecord(path: string, value: Record<string, unkno
   chmodSync(attemptsPath, 0o600);
   const complete = (record: Record<string, unknown> | null): boolean => {
     const receipt = recordValue(record?.baselineReceipt);
+    const inventory = record?.radiusJudgedRun;
+    const completeRadius = validFinalJudgedRun(inventory, record?.runId, record?.commit)
+      && (record?.outcome !== 'ok' || inventory.files.every((row) => row.outcome === 'pass'));
+    if (inventory !== undefined && !completeRadius) return false;
     return !!record && ['ok', 'regression'].includes(String(record.outcome))
-      && receipt?.schema === 2 && receipt.valid === true && receipt.commit === record.commit;
+      && (receipt?.schema === 2 && receipt.valid === true && receipt.commit === record.commit || completeRadius);
   };
   const incomingComplete = complete(value);
   debug.log('release-loop.gate', 'verdict-attempt-recorded', {
@@ -4145,6 +4151,15 @@ function assertValidPodSweepOptions(opts: GateOptions): void {
   }
 }
 
+export function contractSelectOptInLogFields(
+  activationRequested: boolean,
+  primaryRun: ContractTestPrimaryObservation,
+  fallbackAction?: string,
+): { activationRequested?: true; primaryRun?: ContractTestPrimaryObservation; fallbackAction?: string } {
+  if (!activationRequested) return {};
+  return { activationRequested: true, primaryRun, ...(fallbackAction ? { fallbackAction } : {}) };
+}
+
 export async function judgeGate(opts: GateOptions, runner?: GateRunner,
   imageProbe: typeof preflightGateImageDigest = preflightGateImageDigest,
   identityProbe: typeof preflightGateExecutionIdentity = preflightGateExecutionIdentity,
@@ -4206,9 +4221,16 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
   let cutSweepInvocationId: string | null = null;
   let fileCasPlan: TrainFileCasPlan | null = null;
   let fileCasSkipSweep = false;
+  let judgedImageDigest: string | null = null;
+  let winnowCarryRows: JudgedFileRow[] = [];
+  let winnowMeasuredFiles: string[] = [];
   let radiusShadow: GateRadiusShadowPlan | undefined;
   const trees: string[] = [];
   const baselineVersion = opts.baselineVersion;
+  const contractSelectActivationRequested = process.env.ELANOUS_GATE_CONTRACT_TEST_SELECT === '1';
+  let contractSelectPriorCommit: string | undefined;
+  let contractSelectPrimary: ContractTestPrimaryObservation = { status: 'disabled', selectedFiles: [], rc: null, reason: 'opt-in flag is off' };
+  let contractSelectCandidate: ContractTestCandidate | undefined;
   try {
     if (!sha.test(opts.commit) || !versionPattern.test(opts.version)
       || (opts.baselineVersion && !versionPattern.test(opts.baselineVersion))
@@ -4430,6 +4452,7 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
       && scopedImageProbe && opts.pod ? imageProbe(opts.pod.pool, opts.pod.imageTagCommit ?? opts.commit) : null);
     const receiptImage = currentImage ?? (scopedImageProbe && opts.pod
       ? imageProbe(opts.pod.pool, opts.pod.imageTagCommit ?? opts.commit) : null);
+    judgedImageDigest = receiptImage;
     const receiptBase = opts.baselineCommit ?? (roots.some((location) =>
       existsSync(join(location, 'release', baselineVersion, 'release.json')))
       ? baselineReleaseCommit(baselineVersion) : undefined);
@@ -4598,6 +4621,37 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
         reason: !explicitPodDigest || !probedPodDigest ? 'executed-pod-image-digest-missing' : 'executed-pod-image-digest-mismatch' }, { level: 'warn' });
       partial = null;
     }
+    // Experimental cut radius takes effect only when this graph run names one canonical prior run.
+    // Any missing receipt, identity drift, or failed preflight restores the complete sweep.
+    let winnowPlan: PartialPlan | null = null;
+    if (opts.radiusWinnowOptIn) {
+      const selection = !opts.full && !explicitPartial && opts.graphRunId && opts.pod && receiptImage
+        && opts.radiusWinnowPriorRunId
+        ? selectJudgedCutRadius({ ledgerRoot: ledger, receiptRoot: join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts'),
+          repo, version: opts.version, priorRunId: opts.radiusWinnowPriorRunId,
+          newCutSha: opts.commit, currentImageDigest: receiptImage }) : null;
+      winnowPlan = selection?.plan ?? null;
+      partial = winnowPlan;
+      winnowCarryRows = winnowPlan ? selection!.carryRows : [];
+      winnowMeasuredFiles = winnowPlan ? [...winnowPlan.files] : [];
+      result.radiusWinnow = { action: winnowPlan ? 'radius' : 'full',
+        priorRunId: opts.radiusWinnowPriorRunId ?? null,
+        priorCutSha: selection?.decision?.priorCutSha ?? null,
+        carry: selection?.decision?.action === 'radius' ? selection.decision.carry.map(({ file, sourceRunId, sourceCutSha }) =>
+          ({ file, sourceRunId, sourceCutSha })) : [],
+        measuredFiles: winnowMeasuredFiles,
+        reuseRatio: winnowPlan && selection?.decision?.action === 'radius' ? selection.decision.reuseRatio : 0,
+        reason: selection?.decision?.reason ?? (selection && 'reason' in selection ? selection.reason : 'scope or image preflight unavailable') };
+      fileCasPlan = null;
+      fileCasSkipSweep = false;
+      trainReceiptPlan = null;
+      selectedFormalReceiptPlan = null;
+      debug.log('release-loop.gate', 'radius-winnow-selection', { runId: opts.graphRunId ?? null,
+        priorRunId: opts.radiusWinnowPriorRunId ?? null, action: partial ? 'radius' : 'full',
+        reason: selection?.decision?.reason ?? (selection && 'reason' in selection ? selection.reason : 'scope or image preflight unavailable'),
+        measure: partial?.files.length ?? null,
+        carry: selection?.decision?.action === 'radius' ? selection.decision.carry.length : 0 });
+    }
     // Record only the plan that survived preflight and will actually execute. Earlier receipt
     // planning is provisional: an explicit plan can win, or image preflight can force a full sweep.
     const testInventory = gateAssignableTestsAtCommit(repo, opts.commit);
@@ -4651,7 +4705,40 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
       } catch (error) { debug.log('release-loop.gate', 'known-failures-unavailable', { error: String(error) }); }
     }
     const durationSource = join(ledger, 'release', baselineVersion, 'gate-logs', 'cut');
-    const runCut = async (selected: typeof partial) => {
+    if (contractSelectActivationRequested) {
+      try {
+        contractSelectPriorCommit = opts.baselineCommit ?? radiusShadow?.priorCommit ?? baselineReleaseCommit(baselineVersion);
+        const changed = changedFilesBetween(repo, contractSelectPriorCommit, opts.commit);
+        const tree = gitClosureTree(repo, opts.commit);
+        const tests = testInventory ?? gateAssignableTestsAtCommit(repo, opts.commit);
+        if (!tests) throw new Error('gate test inventory unreadable');
+        contractSelectCandidate = contractTestCandidate({ tree, priorRead: gitContractRead(repo, contractSelectPriorCommit), changed, tests });
+      } catch (error) {
+        debug.log('gate.contract-select.primary', 'unmeasured', { version: opts.version, commit: opts.commit, reason: String(error) });
+        try {
+          const fallbackInventory = testInventory ?? gateAssignableTestsAtCommit(repo, opts.commit);
+          if (fallbackInventory) contractSelectCandidate = fullContractTestCandidate(fallbackInventory, `selection evidence unavailable: ${String(error)}`);
+          else contractSelectPrimary = { status: 'unmeasured', selectedFiles: [], rc: null,
+            reason: `full test inventory unavailable: ${String(error)}` };
+        } catch (fallbackError) {
+          contractSelectPrimary = { status: 'unmeasured', selectedFiles: [], rc: null,
+            reason: `full test inventory unavailable: ${String(fallbackError)}` };
+        }
+      }
+      // The selector's cut shadow must measure a fresh, complete inventory, including when another
+      // gate optimization had proposed a partial/carry plan.
+      partial = null;
+      fileCasSkipSweep = false;
+      if (winnowPlan) {
+        winnowPlan = null;
+        winnowCarryRows = [];
+        winnowMeasuredFiles = [];
+        if (result.radiusWinnow) result.radiusWinnow = { ...result.radiusWinnow, action: 'full',
+          carry: [], measuredFiles: [], reuseRatio: 0,
+          reason: 'contract test selector requires a fresh full sweep' };
+      }
+    }
+    const runCut = async (selected: typeof partial, contractSelectFullShadow = false) => {
       if (selected?.kind === 'carry') return undefined;
       const progressFile = opts.graphRunId && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(opts.graphRunId)
         ? join(ledger, 'graph-runs', 'release-loop', `${opts.graphRunId}.json.contexts`, 'gate-progress.jsonl') : undefined;
@@ -4684,36 +4771,70 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
       };
       const cancel = (runner.progressScheduler ?? scheduleGateProgress)(emitProgress, 60_000);
       try {
+        const podOptions = opts.pod ? { ...opts.pod,
+          ...(contractSelectFullShadow ? { freshShards: true, warmReplay: undefined, warmShardExecutionEnabled: false,
+            warmProducerEnabled: false } : {}),
+          ...(opts.imagePin ? { imagePin: opts.imagePin } : {}), durationSource, ...(knownFailures.length ? { knownFailures } : {}), onSelectionTimed: ({ ms }: { ms: number }) => { result.selectionMs = ms; },
+          // GATE-RISK-LANE — the watch list is read from this gate's own ledgers (the instance root ⊕ the machine ledger);
+          // the cut sweep puts those files first, the baseline sweep keeps its plan.
+          riskWatch: { instanceRoots: roots, ledgerRoots: roots },
+          // GATE-LIVE-OBS: the release ledger's shards.json (UX #24782) — never the run tree's universe; an explicit
+          // --ledger-root or an explicit test instance keeps it in that ledger.
+          shardsFile: { path: gateShardsPath(opts.version, ledger), version: opts.version,
+            ledgerPath: gateShardLedgerPath(opts.version, opts.shardLedgerRoot ?? ledger), envFingerprint: gateEnvFingerprint(process.env),
+            receiptRoot: join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts'),
+            base40: receiptBase, ...(receiptBase ? { sameHeadPreexistingFailureIds: sameHeadPreexistingFailureIds(ledger, opts.version, opts.commit, receiptBase) } : {}),
+            expectedImageDigest: receiptImage, graphPins: opts.pod.shardsFile?.graphPins ?? gateSourcePins(repo, opts.commit),
+            executionIdentity: currentIdentity ?? opts.pod.shardsFile?.executionIdentity ?? null,
+            ...(selected?.priorCommit ? { radiusPriorCommit: selected.priorCommit } : {}) } } : undefined;
         const sweepResult = await runner.sweep(cutTree,
       join(root, 'release', opts.version, 'gate-logs', selected ? 'cut-partial' : 'cut'),
-      opts.pod ? { ...opts.pod, ...(opts.imagePin ? { imagePin: opts.imagePin } : {}), durationSource, ...(knownFailures.length ? { knownFailures } : {}), onSelectionTimed: ({ ms }) => { result.selectionMs = ms; },
-        // GATE-RISK-LANE — the watch list is read from this gate's own ledgers (the instance root ⊕ the machine ledger);
-        // the cut sweep puts those files first, the baseline sweep keeps its plan.
-        riskWatch: { instanceRoots: roots, ledgerRoots: roots },
-        // GATE-LIVE-OBS: the release ledger's shards.json (UX #24782) — never the run tree's universe; an explicit
-        // --ledger-root or an explicit test instance keeps it in that ledger.
-        shardsFile: { path: gateShardsPath(opts.version, ledger), version: opts.version,
-          ledgerPath: gateShardLedgerPath(opts.version, opts.shardLedgerRoot ?? ledger), envFingerprint: gateEnvFingerprint(process.env),
-          receiptRoot: join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts'),
-          base40: receiptBase, ...(receiptBase ? { sameHeadPreexistingFailureIds: sameHeadPreexistingFailureIds(ledger, opts.version, opts.commit, receiptBase) } : {}),
-          expectedImageDigest: receiptImage, graphPins: opts.pod.shardsFile?.graphPins ?? gateSourcePins(repo, opts.commit),
-          executionIdentity: currentIdentity ?? opts.pod.shardsFile?.executionIdentity ?? null, ...(selected?.priorCommit ? { radiusPriorCommit: selected.priorCommit } : {}) } } : undefined,
+      podOptions,
       selected?.files, (progress) => { latest = progress; emitProgress(); });
         emitProgress();
         return sweepResult;
       } finally { cancel?.(); }
     };
-    let cutRun = fileCasSkipSweep ? undefined : await runCut(partial);
+    if (contractSelectActivationRequested && contractSelectCandidate) {
+      const primaryPod = opts.pod ? { ...opts.pod, freshShards: true, shardsFile: undefined,
+        warmReplay: undefined, warmShardExecutionEnabled: false, warmProducerEnabled: false,
+        ...(opts.imagePin ? { imagePin: opts.imagePin } : {}) } : undefined;
+      const primaryLogDir = join(root, 'release', opts.version, 'gate-logs', `contract-select-primary-${randomUUID()}`);
+      contractSelectPrimary = await runContractTestPrimary({ enabled: true, candidate: contractSelectCandidate,
+        sweep: (only) => runner.sweep(cutTree, primaryLogDir, primaryPod, only).then(({ rc }) => ({ rc })) });
+      debug.log('gate.contract-select.primary', 'measured', { version: opts.version, commit: opts.commit,
+        priorCommit: contractSelectPriorCommit, candidate: contractSelectCandidate.status,
+        totalTests: testInventory?.length ?? null, selectedTests: contractSelectPrimary.selectedFiles.length,
+        rc: contractSelectPrimary.rc, status: contractSelectPrimary.status, reason: contractSelectPrimary.reason });
+    }
+    // The opt-in candidate is followed by a fresh full cut. That sweep is the safety shadow and
+    // becomes the final result whenever the candidate misses a failure or cannot be measured.
+    let cutRun = fileCasSkipSweep ? undefined : await runCut(partial, contractSelectActivationRequested);
     const radiusSelectionMatched = partial?.files && cutRun?.podSweep?.files
       && JSON.stringify([...partial.files].sort()) === JSON.stringify([...cutRun.podSweep.files].sort());
-    if (!fileCasPlan && radius?.plan && radius.plan.kind !== 'carry' && (!radiusSelectionMatched
+    if (winnowPlan && (!radiusSelectionMatched
+      || !partialGateImagesMatch(root, opts.version, receiptImage!, opts.commit, cutRun?.podSweep)
+      || !buildJudgedRunInventory({ repo, receiptRoot: join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts'),
+        runId: opts.graphRunId!, cutSha: opts.commit, imageDigest: receiptImage!,
+        measuredFiles: winnowMeasuredFiles, carriedRows: winnowCarryRows,
+        strictPassReceipts: true, failures: [], errors: [] }))) {
+      debug.log('release-loop.gate', 'radius-winnow-execution-fallback', { version: opts.version,
+        priorRunId: opts.radiusWinnowPriorRunId, action: 'full-sweep' }, { level: 'warn' });
+      partial = null;
+      cutRun = await runCut(null);
+      winnowCarryRows = [];
+      winnowMeasuredFiles = [];
+      if (result.radiusWinnow) result.radiusWinnow = { ...result.radiusWinnow, action: 'full',
+        carry: [], measuredFiles: [], reuseRatio: 0, reason: 'selected files or image proof differed at execution' };
+    }
+    if (!contractSelectActivationRequested && !opts.radiusWinnowOptIn && !fileCasPlan && radius?.plan && radius.plan.kind !== 'carry' && (!radiusSelectionMatched
       || !partialGateImagesMatch(root, opts.version, currentImage!, opts.commit, cutRun?.podSweep))) {
       debug.log('release-loop.gate', 'radius-live-image-drift', { version: opts.version,
         rehearsalRunId: radius.rehearsalRunId, action: 'full-sweep' }, { level: 'warn' });
       partial = null;
       cutRun = await runCut(null);
     }
-    if (!fileCasPlan && explicitPodDigest && partial === explicitPartial && (!radiusSelectionMatched
+    if (!contractSelectActivationRequested && !fileCasPlan && explicitPodDigest && partial === explicitPartial && (!radiusSelectionMatched
       || !partialGateImagesMatch(root, opts.version, explicitPodDigest, opts.commit, cutRun?.podSweep))) {
       debug.log('release-loop.gate', 'partial-image-drift', { version: opts.version, action: 'full-sweep' }, { level: 'warn' });
       partial = null;
@@ -5318,7 +5439,8 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
     };
     const observed = { ...(result.selectionMs !== undefined ? { selectionMs: result.selectionMs } : {}),
       ...(result.warmShadow?.length ? { warmShadow: result.warmShadow } : {}),
-      ...(result.attributionRecheck ? { attributionRecheck: result.attributionRecheck } : {}) };
+      ...(result.attributionRecheck ? { attributionRecheck: result.attributionRecheck } : {}),
+      ...(result.radiusWinnow ? { radiusWinnow: result.radiusWinnow } : {}) };
     // Receipt is advisory for a later radius gate. Missing identity makes reuse invalid, never this gate's verdict.
     const baselineReceipt = gateBaselineReceipt({ root, version: opts.version, commit: opts.commit,
       graphPins: gateGraphPins(root, opts.graphRunId) ?? (opts.rehearsalBaseline ? gateSourcePins(repo, opts.commit) : null),
@@ -5328,6 +5450,19 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
       fullSweep: result.outcome !== 'error' && cutSweepUsable && !result.partial && !fileCasSkipSweep && !!cutFailures
         && !result.rcNonzeroNoFailures.length && !result.stalledShards?.length && !result.stalledEnv.length
         && !result.unmeasuredRecheckFiles?.length && !result.unmeasuredErrors?.length });
+    const radiusJudgedRun = (opts.radiusWinnowOptIn || process.env.ELANOUS_GATE_RADIUS_RECORD === '1')
+      && result.outcome !== 'error' && cutSweepUsable && (!result.partial || winnowCarryRows.length > 0)
+      && !fileCasSkipSweep && cutFailures && judgedImageDigest && opts.graphRunId
+      ? buildJudgedRunInventory({ repo, receiptRoot: join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts'),
+        runId: opts.graphRunId, cutSha: opts.commit, imageDigest: judgedImageDigest,
+        measuredFiles: winnowCarryRows.length && result.partial ? winnowMeasuredFiles : gateAssignableTestsAtCommit(repo, opts.commit) ?? [],
+        carriedRows: winnowCarryRows.length && result.partial ? winnowCarryRows : [],
+        strictPassReceipts: winnowCarryRows.length > 0 && !!result.partial,
+        failures: cutFailures.failures, errors: cutFailures.errors }) : null;
+    if (winnowCarryRows.length && result.partial && !radiusJudgedRun) {
+      result.outcome = 'error';
+      result.error = 'radius winnow final judged inventory could not be verified';
+    }
     try {
       for (const location of roots) {
         const path = verdictFile(location, opts.version);
@@ -5337,7 +5472,9 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
         const path = verdictFile(location, opts.version);
         const warmHistory = readWarmVerdictHistory(path) ?? [];
         writeGateVerdictRecord(path, { version: opts.version, commit: opts.commit,
+          ...(opts.graphRunId || opts.runId ? { runId: opts.graphRunId ?? opts.runId } : {}),
           outcome: result.outcome, baselineCommit, ...ids, ...observed, baselineReceipt,
+          ...(radiusJudgedRun ? { radiusJudgedRun } : {}),
           ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) });
       }
     } catch (error) {
@@ -5347,7 +5484,9 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
       try {
         const warmHistory = readWarmVerdictHistory(path) ?? [];
         writeGateVerdictRecord(path, { version: opts.version, commit: opts.commit,
+          ...(opts.graphRunId || opts.runId ? { runId: opts.graphRunId ?? opts.runId } : {}),
           outcome: result.outcome, baselineCommit, ...ids, ...observed, baselineReceipt,
+          ...(radiusJudgedRun ? { radiusJudgedRun } : {}),
           ...(opts.pod?.warmReplay ? { baselineCommit, warmHistory } : {}) });
       } catch (persistenceError) {
         result.error += `; error verdict persistence: ${String(persistenceError)}`;
@@ -5437,28 +5576,31 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
         lazyRequireComparison: record.actual.lazyRequireComparison ?? 'not-planned' });
     } catch (error) { debug.log('release-loop.gate', 'radius-shadow-unavailable', { reason: String(error) }); }
   }
-  // GATE-CONTRACT-TEST-SELECT: selection is disabled by default. Every gate reports a candidate
-  // against the actual full sweep; rehearsal and cut decisions above continue to use their existing plans.
+  // GATE-CONTRACT-TEST-SELECT: the selected primary is opt-in; its fresh full cut shadow remains authoritative.
   try {
-    // Reserved activation flag: ignored until the required shadow cohort has been reviewed.
-    const activationRequested = process.env.ELANOUS_GATE_CONTRACT_TEST_SELECT === '1';
-    const priorCommit = opts.baselineCommit ?? radiusShadow?.priorCommit;
+    const activationRequested = contractSelectActivationRequested;
+    const priorCommit = contractSelectPriorCommit ?? opts.baselineCommit ?? radiusShadow?.priorCommit;
     if (!priorCommit) {
       debug.log('gate.contract-select.shadow', 'observation', { version: opts.version, commit: opts.commit,
-        comparison: 'unmeasured', reason: 'prior commit absent', activationRequested, liveEnabled: false });
+        comparison: 'unmeasured', reason: 'prior commit absent', activationRequested,
+        ...contractSelectOptInLogFields(activationRequested, contractSelectPrimary, 'full-cut-rerun-final'),
+        liveEnabled: contractSelectPrimary.status === 'measured' });
     } else {
       const rawChanged = changedFilesBetween(repo, priorCommit, opts.commit);
-      const inertVersionFiles = versionOnlyBumps(repo, priorCommit, opts.commit, opts.version, rawChanged);
+      const inertVersionFiles = activationRequested ? [] : versionOnlyBumps(repo, priorCommit, opts.commit, opts.version, rawChanged);
       const changed = rawChanged.filter((file) => !inertVersionFiles.includes(file));
-      const relevant = changed.some((file) => file === 'src/graph-runner/runner.ts' || file === 'scripts/release-loop/gate-node.ts');
-      if (!relevant) {
+      const relevant = rawChanged.some((file) => file === 'src/graph-runner/runner.ts' || file === 'scripts/release-loop/gate-node.ts');
+      if (!relevant && !activationRequested) {
         debug.log('gate.contract-select.shadow', 'observation', { version: opts.version, commit: opts.commit,
-          priorCommit, comparison: 'not-applicable', reason: 'declared implementation unchanged', activationRequested, liveEnabled: false });
+          priorCommit, comparison: 'not-applicable', reason: 'declared implementation unchanged',
+          activationRequested, ...contractSelectOptInLogFields(activationRequested, contractSelectPrimary),
+          liveEnabled: contractSelectPrimary.status === 'measured' });
       } else {
-        const tree = gitClosureTree(repo, opts.commit);
         const tests = gateAssignableTestsAtCommit(repo, opts.commit);
         if (!tests) throw new Error('gate test inventory unreadable');
-        const candidate = contractTestCandidate({ tree, priorRead: gitContractRead(repo, priorCommit), changed, tests });
+        const candidate = activationRequested ? contractSelectCandidate
+          : contractTestCandidate({ tree: gitClosureTree(repo, opts.commit), priorRead: gitContractRead(repo, priorCommit), changed, tests });
+        if (!candidate) throw new Error('primary selector candidate unavailable for shadow comparison');
         const fullSweep = cutSweepUsable && !result.partial && !fileCasSkipSweep && !!cutFailures && result.outcome !== 'error'
           && !result.rcNonzeroNoFailures.length && !result.stalledShards?.length && !result.stalledEnv.length
           && !result.unmeasuredRecheckFiles?.length && !result.unmeasuredErrors?.length;
@@ -5470,12 +5612,18 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
           changed, candidate: candidate.status, reason: candidate.reason,
           totalTests: tests.length, selectedTests: candidate.files.length,
           directTests: candidate.direct, twoHopTests: candidate.twoHop,
-          ...comparison, activationRequested, liveEnabled: false });
+          ...comparison, activationRequested,
+          ...contractSelectOptInLogFields(activationRequested, contractSelectPrimary,
+            comparison.comparison === 'unmeasured' || comparison.missedFailureCount !== 0
+              ? 'full-cut-rerun-final' : 'full-cut-shadow-final'),
+          liveEnabled: contractSelectPrimary.status === 'measured' });
       }
     }
   } catch (error) {
     debug.log('gate.contract-select.shadow', 'observation', { version: opts.version, commit: opts.commit,
-      comparison: 'unmeasured', reason: String(error), liveEnabled: false });
+      comparison: 'unmeasured', reason: String(error),
+      ...contractSelectOptInLogFields(contractSelectActivationRequested, contractSelectPrimary, 'full-cut-rerun-final'),
+      liveEnabled: false });
   }
   // GATE-LIVE-OBS-RC-WORDING ⓒ — the shards board says «판정 전» until this lands; then «새 실패 N» only (UX · gate-shards.ts).
   // Same ledger as the board's own writes (sweep's shardsFile). A write failure is logged and never changes the verdict.
@@ -5616,6 +5764,10 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
       || !['darwin', 'linux'].includes((value as { os?: string }).os ?? ''))))
     throw new Error('gateShardCapabilities must map pod-N to {os: darwin|linux}');
   const opts: GateOptions = {
+    ...(env.ELANOUS_GATE_RADIUS_WINNOW === '1' ? { radiusWinnowOptIn: true } : {}),
+    ...(env.ELANOUS_GATE_RADIUS_WINNOW === '1' && typeof env.ELANOUS_GATE_RADIUS_PRIOR_RUN_ID === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(env.ELANOUS_GATE_RADIUS_PRIOR_RUN_ID)
+      ? { radiusWinnowPriorRunId: env.ELANOUS_GATE_RADIUS_PRIOR_RUN_ID } : {}),
     ...(context?.graphId ? { graphId: context.graphId } : {}),
     // The pod image-pin guard runs before judge() receives context.runId; carry the run scope here.
     ...(context?.runId ? { graphRunId: context.runId } : {}),

@@ -522,15 +522,19 @@ describe('dispatch passthrough', () => {
     expect(r).toEqual({ consumed: false });
   });
 
-  test('Esc in picker mode returns passthrough so host Esc handler fires', async () => {
+  test('Esc dismisses the picker before a second Esc reaches the host', async () => {
     const s = createPickerState({
       commands: cmds,
       onAtCandidates: async () => atCandidates,
     });
     const b = buf('@src', 4);
     await s.refresh(b);
+    expect(s.mode(b)).toBe('at');
     const r = await s.dispatch(key('escape'), b);
-    expect(r).toEqual({ consumed: false });
+    expect(r).toEqual({ consumed: true, action: null });
+    await s.refresh(b);
+    expect(s.mode(b)).toBeNull();
+    expect(await s.dispatch(key('escape'), b)).toEqual({ consumed: false });
   });
 
   test('Ctrl+Y in picker mode returns passthrough', async () => {

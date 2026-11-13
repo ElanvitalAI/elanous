@@ -48,7 +48,13 @@ function opts() {
   };
 }
 
+const savedProviderEnv: Record<string, string | undefined> = {};
 beforeEach(() => {
+  for (const key of ['ELANOUS_LLM_MODE', 'ELANOUS_TEST_FAKE_LLM']) {
+    savedProviderEnv[key] = process.env[key];
+  }
+  process.env.ELANOUS_LLM_MODE = 'real';
+  delete process.env.ELANOUS_TEST_FAKE_LLM;
   const worktreeRunSpy = spyOn(enterWorktreeRuntime, 'run').mockImplementation(req => (
     worktreeRun({ name: String(req.name ?? '') }) as ReturnType<typeof enterWorktreeRuntime.run>
   ));
@@ -59,6 +65,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const [key, value] of Object.entries(savedProviderEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   restoreWorktreeRunSpy();
   globalAgentRegistry.clear();
   __resetSessionWorkingDir();

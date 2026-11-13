@@ -26,6 +26,8 @@ import { inspectGateShardReceipts } from './gate-shard-receipts.js';
 import { stalledGateEvidence, type StalledGateEvidence } from './gate-stalled-evidence.js';
 import { gitClosureTree, testsReachingChanged, testsReachingChangedForGateReuse, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateWaiverCoverage, gateUnmeasuredDetail, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
+import { assertSignedPwaBranchWaiver } from '../../src/graph-runner/release-pwa-waiver.js';
+import { publicWaiverReason } from './known-issues-node.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
 import { runCutGateImagePrebuild } from './gate-image-pin.js';
@@ -88,6 +90,16 @@ function releaseResumeNode(run: GraphRunState, requested: string): string {
     if (fanout.branches[requested]?.status === 'failed') return fanout.from;
   }
   return requested;
+}
+
+function signedPwaFanOutRequest(run: GraphRunState, opts: ResumeReleaseOptions, root: string): boolean {
+  if (opts.waive !== 'pwa') return false;
+  if (opts.from !== 'pwa' || opts.ownerWaive !== undefined || opts.acceptedRegressions !== undefined ||
+      !opts.reason?.trim()) throw new Error('--waive pwa requires --from pwa and a known-issue --reason');
+  publicWaiverReason(opts.reason.trim());
+  assertSignedPwaBranchWaiver(run, root);
+  releaseResumeAcceptedRegressions(run, [{ id: 'waive:pwa', note: opts.reason.trim() }], 'traffic-gate-passed');
+  return true;
 }
 
 function validateBudgetExceededResume(run: GraphRunState, opts: ResumeReleaseOptions): void {
@@ -781,6 +793,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   validateBudgetExceededResume(savedRun, opts);
+  const pwaFanOutWaiver = signedPwaFanOutRequest(savedRun, opts, deps.root!);
   opts = { ...opts, from: releaseResumeNode(savedRun, opts.from) };
   assertReleaseResumeApprovalBoundary({ ...savedRun, statePath }, opts.from);
   if (opts.gateHost !== undefined && opts.gateExecutor === undefined) throw new Error('--gate-host requires --gate-executor host');
@@ -792,19 +805,21 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   if (original && opts.gateExecutor !== undefined) releaseResumeGateExecutor(original, { from: opts.from, executor: opts.gateExecutor, host: opts.gateHost });
   if (original && opts.gatePodPool !== undefined) releaseResumeGatePodPool(original, { from: opts.from, pool: opts.gatePodPool });
   if (original && opts.rerouteShard !== undefined) releaseResumeGateShardReroute(original, { from: opts.from, shard: opts.rerouteShard, host: opts.shardHost, os: opts.shardOs });
-  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded)) ? resolveResumeWaiver(original, opts) : undefined;
+  const waiver = !pwaFanOutWaiver && original && (opts.waive !== undefined || opts.ownerWaive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded)) ? resolveResumeWaiver(original, opts) : undefined;
   if (original && opts.acceptedRegressions !== undefined && !waiver)
     releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from);
   const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
   let waiverCommit: string | undefined;
-  if (waiver) {
+  if (waiver || pwaFanOutWaiver) {
     const output = lastJsonObject(savedRun.nodes.find((node) => node.nodeId === 'version-release')?.output);
     const version = output?.version, recorded = output?.commit;
     if (typeof version !== 'string' || typeof recorded !== 'string' || !isReleaseVersion(version) || !/^[0-9a-f]{40}$/i.test(recorded)) throw new Error('release waiver requires a recorded release commit');
-    const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
-    const branch = `release/${version}`;
-    const advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0];
-    if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
+    if (!pwaFanOutWaiver || (savedRun.input as { branchCut?: boolean } | undefined)?.branchCut === true) {
+      const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
+      const branch = `release/${version}`;
+      const advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0];
+      if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
+    }
     waiverCommit = recorded;
   }
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true);
@@ -837,6 +852,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   validateBudgetExceededResume(savedRun, opts);
+  const pwaFanOutWaiver = signedPwaFanOutRequest(savedRun, opts, deps.root!);
   opts = { ...opts, from: releaseResumeNode(savedRun, opts.from) };
   assertReleaseResumeApprovalBoundary({ ...savedRun, statePath }, opts.from);
   let waiverCommit: string | undefined;
@@ -856,7 +872,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   if (gatePodPool) debug.log('release-loop.resume', 'gate-pod-pool', {
     runId: opts.runId, from: opts.from, pool: gatePodPool.set.gatePodPool, previous: gatePodPool.previous,
   });
-  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded))
+  const waiver = !pwaFanOutWaiver && original && (opts.waive !== undefined || opts.ownerWaive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded))
     ? resolveResumeWaiver(original, opts) : undefined;
   if (waiver) debug.log('release-loop.resume', 'waiver', { runId: opts.runId, node: waiver.nodeId, reason: waiver.reason, unmeasured: waiver.unmeasured ?? null });
   const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
@@ -865,16 +881,18 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // A waived verdict may reuse its original commit. A moved tip still requires a full re-gate.
-  if (waiver) {
+  if (waiver || pwaFanOutWaiver) {
     const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
     const output = lastJsonObject(versionRecord?.output);
     const version = output?.version;
     const recorded = output?.commit;
     if (typeof version !== 'string' || typeof recorded !== 'string' || !isReleaseVersion(version) || !/^[0-9a-f]{40}$/i.test(recorded)) throw new Error('release waiver requires a recorded release commit');
-    const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
-    const branch = `release/${version}`;
-    const advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0];
-    if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
+    if (!pwaFanOutWaiver || (savedRun.input as { branchCut?: boolean } | undefined)?.branchCut === true) {
+      const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
+      const branch = `release/${version}`;
+      const advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0];
+      if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
+    }
     waiverCommit = recorded;
   }
   // The read-only tip and recipe pin preflight must pass before fetch or a saved-run rewrite.
@@ -935,6 +953,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     ...(opts.resumeBudgetExceeded ? { releaseBudgetExceededResume: { reason: opts.reason!.trim() } } : {}),
     releaseCommandSource: { root: commandRoot, cutTip: tip.to, ...(sourceGit ? { git: sourceGit } : {}) },
     ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [] } } : {}),
+    ...(pwaFanOutWaiver ? { releasePwaFanOutWaiver: { reason: opts.reason!.trim() } } : {}),
     ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
     ...(gateExecutor ? { releaseGateExecutor: { executor: gateExecutor.set.gateExecutor, ...(opts.gateHost !== undefined ? { host: opts.gateHost } : {}) } } : {}),
     ...(gatePodPool ? { releaseGatePodPool: gatePodPool.set.gatePodPool } : {}),

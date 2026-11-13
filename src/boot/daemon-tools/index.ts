@@ -400,6 +400,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         ...(ctx.verifiedOwner ? { verifiedOwner: ctx.verifiedOwner } : {}),
         ...(ctx.appDeploymentSession ? { appDeploymentSession: ctx.appDeploymentSession } : {}),
         ...(ctx.appDeploymentOwner ? { appDeploymentOwner: ctx.appDeploymentOwner } : {}),
+        ...(ctx.appDeployPublishHook ? { appDeployPublishHook: ctx.appDeployPublishHook } : {}),
         ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.surfaceHitlChannels ? { confirmChannels: ctx.surfaceHitlChannels } : {}),
         ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),

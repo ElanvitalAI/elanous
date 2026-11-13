@@ -12,7 +12,7 @@ import { debug } from './debug/log.js';
 import { getProviderForConfig, openRouterToolChoice, toChatToolChoice, toResponsesToolChoice, type ToolChoice } from './llm.js';
 import { saveTokens } from './oauth/store.js';
 import type { UserConfig } from './user-config/types.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 const tools: LLMToolSpec[] = [{ name: 'demo', description: 'demo', parameters: { type: 'object', properties: { a: { type: 'string' } } } }];
 const messages = [{ role: 'user' as const, content: 'hello' }];
@@ -57,6 +57,7 @@ async function withCodexResponsesCredential(run: () => Promise<void>): Promise<v
     mkdirSync(join(xdg, 'elanous'), { recursive: true });
     mkdirSync(join(root, 'codex-home'), { recursive: true });
     process.env.XDG_CONFIG_HOME = xdg;
+    process.env.ELANOUS_STATE_DIR = join(xdg, 'elanous');
     process.env.CODEX_HOME = join(root, 'codex-home');
     process.env.ELANOUS_SUPPRESS_XDG_WARNING = '1';
     delete process.env.ELANOUS_CODEX_ACCOUNT;   // 기본 계정(storeKey 'openai-codex') 고정
@@ -79,7 +80,7 @@ async function captureBody(llm: Record<string, unknown>, opts: { toolChoice?: To
       bodies.push(request.body ?? '');
       return new Response('data: [DONE]\n\n', { status: 200 });
     } }));
-  await withFakeFetchDevice(routes, async (fetchDevice) => {
+  await withRealProviderFakeFetchDevice(routes, async (fetchDevice) => {
     const provider = getProviderForConfig({ llm } as unknown as UserConfig);
     const streamOpts = {
       ...(opts.tools === null ? {} : { tools: opts.tools ?? tools }),

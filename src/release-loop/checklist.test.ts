@@ -963,6 +963,43 @@ describe('release checklist ledger', () => {
     expect(snapshot.items.filter((item) => ownerMatches(item.owner, 'TC/rel')).map((item) => item.id)).toEqual(['K1']);
   });
 
+  test('CHECKLIST-FORCE-CLAIM-UNPARSEABLE-OWNER: signed force repairs legacy owner and preserves audit', () => {
+    const dir = root();
+    const version = '8.8.8';
+    const legacyOwner = 'TC·UX';
+    mkdirSync(join(dir, 'release', version), { recursive: true });
+    writeFileSync(join(dir, 'release', version, 'checklist.json'), JSON.stringify({
+      version, released: '', dev: devVersion(), items: [
+        { id: 'LEGACY', title: 'legacy owner', status: 'yellow', owner: legacyOwner,
+          updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'OP' },
+      ], history: [],
+    }));
+    const before = listChecklist(version);
+    const track = process.env.ELANOUS_TRACK;
+    try {
+      process.env.ELANOUS_TRACK = 'TC';
+      expect(() => claimItem(version, 'LEGACY', 'TC', { force: true, actor: 'OP', reason: 'spoofed actor' })).toThrow(/OP/);
+      expect(listChecklist(version)).toEqual(before);
+      process.env.ELANOUS_TRACK = 'OP';
+      expect(() => claimItem(version, 'LEGACY', 'TC')).toThrow(/잘못된 담당/);
+      expect(() => claimItem(version, 'LEGACY', 'TC', { force: true, reason: ' ' })).toThrow(/--reason/);
+      expect(() => claimItem(version, 'LEGACY', 'TC/', { force: true, reason: 'invalid destination' })).toThrow(/잘못된 담당/);
+      expect(listChecklist(version)).toEqual(before);
+      claimItem(version, 'LEGACY', 'TC', { force: true, reason: '  OP approved legacy repair  ' });
+      const repaired = listChecklist(version);
+      expect(repaired.items[0]).toMatchObject({ owner: 'TC', updatedBy: 'OP' });
+      expect(repaired.history.at(-1)).toMatchObject({ id: 'LEGACY', field: 'claim', from: legacyOwner,
+        to: 'TC', by: 'OP', force: true, reason: 'OP approved legacy repair' });
+      setItem(version, 'LEGACY', { evidence: 'audit round trip' }, 'TC');
+      expect(listChecklist(version).history.find((entry) => entry.field === 'claim')).toMatchObject({
+        from: legacyOwner, to: 'TC', by: 'OP', force: true, reason: 'OP approved legacy repair',
+      });
+    } finally {
+      if (track === undefined) delete process.env.ELANOUS_TRACK;
+      else process.env.ELANOUS_TRACK = track;
+    }
+  });
+
   test('claim 은 무주인·상위 자리만 양도하고 타인 거부는 원자적이며 강제는 이력과 관측에 남긴다', () => {
     root();
     const version = '9.9.9';

@@ -70,6 +70,9 @@ export interface GateResult {
   /** A residual summary/name mismatch triggers an explicit baseline rerun before the gate stays fail-closed. */
   attributionRecheck?: { summary: number; observed: number; identified: number; collapsed: number;
     targetFiles: string[]; baselineResult: 'completed' | 'failed' | 'timeout' };
+  radiusWinnow?: { action: 'radius' | 'full'; priorRunId: string | null; priorCutSha: string | null;
+    carry: Array<{ file: string; sourceRunId: string; sourceCutSha: string }>;
+    measuredFiles: string[]; reuseRatio: number; reason: string };
   /** GATE-SPEED A4 — a swept baseline ran only the cut's failing files that exist at the previous release. */
   baselineDeferred?: { cutFiles: number; swept: number };
   durationMs: number;
@@ -156,6 +159,9 @@ export interface GateRunner {
 }
 export interface GateOptions {
   commit: string;
+  /** Explicit experimental cut radius. A missing prior judged run forces the full sweep. */
+  radiusWinnowOptIn?: boolean;
+  radiusWinnowPriorRunId?: string;
   /** Present only when launched as a graph command; used to scope release-stage stall mail. */
   graphId?: string;
   dryRun?: boolean;

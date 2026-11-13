@@ -128,12 +128,12 @@ export class TaskDispatcher {
   }
 
   /** Dispatch exactly one admitted task, without walking the rest of the ready queue. */
-  tickTask(taskId: string): DispatchTickResult {
+  tickTask(taskId: string, selection?: { providerName?: string; model?: string }): DispatchTickResult {
     const task = this.opts.graph.getTask(taskId);
-    return this.dispatch(task?.status === 'ready' ? [task] : []);
+    return this.dispatch(task?.status === 'ready' ? [task] : [], selection);
   }
 
-  private dispatch(tasks: Task[]): DispatchTickResult {
+  private dispatch(tasks: Task[], selection?: { providerName?: string; model?: string }): DispatchTickResult {
     const dispatched: DispatchTickResult['dispatched'] = [];
     const deferred: DispatchTickResult['deferred'] = [];
 
@@ -162,7 +162,7 @@ export class TaskDispatcher {
         deferred.push({ taskId: task.id, reason: 'anomaly-hold' });
         continue;
       }
-      const result = this.spawn(task, adapter);
+      const result = this.spawn(task, adapter, selection);
       dispatched.push({
         taskId: task.id,
         executionId: result.executionId,
@@ -261,7 +261,8 @@ export class TaskDispatcher {
     }
   }
 
-  private spawn(task: Task, adapter: Parameters<SurfaceRegistry['override']>[1]): DispatchResult {
+  private spawn(task: Task, adapter: Parameters<SurfaceRegistry['override']>[1],
+    selection?: { providerName?: string; model?: string }): DispatchResult {
     const executionId = newExecutionId();
     const ctrl = new AbortController();
     this.abortByTask.set(task.id, ctrl);
@@ -269,6 +270,8 @@ export class TaskDispatcher {
 
     const ctx: DispatchContext = {
       signal: ctrl.signal,
+      ...(selection?.providerName ? { providerName: selection.providerName } : {}),
+      ...(selection?.model ? { modelHint: selection.model } : {}),
       metadata: { executionId },
     };
 

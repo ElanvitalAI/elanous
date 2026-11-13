@@ -2172,6 +2172,24 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
         ctx.setChatScrollOffset(-1);
         return;
       }
+      const { resolveClassicHarnessPreview, runClassicHarnessPreview } = await import('./harness-preview-route.js');
+      const preview = resolveClassicHarnessPreview(say);
+      if (preview.kind === 'invalid') {
+        ctx.chatLines.push(ctx.warning(`  ${preview.reason}`));
+        ctx.setChatScrollOffset(-1);
+        return;
+      }
+      if (preview.kind === 'preview') {
+        const show = (line: string): void => {
+          ctx.pushChatLine(ctx.text(`  ${line}`));
+          ctx.setChatScrollOffset(-1);
+          ctx.draw();
+        };
+        void runClassicHarnessPreview(preview, new AbortController().signal, show)
+          .then(() => show('✓ /harness ask --dry-run 완료'))
+          .catch((error: unknown) => show(`✗ /harness ask --dry-run 실패: ${error instanceof Error ? error.message : String(error)}`));
+        return;
+      }
       launchAsk(say);
       return;
     }

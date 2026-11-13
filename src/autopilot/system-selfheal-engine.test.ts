@@ -98,9 +98,11 @@ describe('runSystemLookback role pin', () => {
       process.env.ELANOUS_LOOKBACK_MODEL = 'claude-env-lookback';
       stream.mockResolvedValue('env 보고');
       await runSystemLookback(args);
-      expect(stream.mock.calls.at(-1)?.[2]).toMatchObject({ model: 'claude-env-lookback', provider: llm.PROVIDERS.anthropic, usageRole: 'audit' });
+      // env 모델은 role overlay 를 무시하고 getProvider(model) 을 탄다. 테스트 기본은 fake 가 prefix 보다 먼저다.
+      const envProvider = llm.getProvider('claude-env-lookback');
+      expect(stream.mock.calls.at(-1)?.[2]).toMatchObject({ model: 'claude-env-lookback', provider: envProvider, usageRole: 'audit' });
       expect(log.mock.calls.filter(([category, event]) => category === 'llm.role-pin' && event === 'resolved').at(-1)?.[2])
-        .toMatchObject({ site: 'system-lookback', role: 'audit', model: 'claude-env-lookback', provider: 'anthropic', source: 'env' });
+        .toMatchObject({ site: 'system-lookback', role: 'audit', model: 'claude-env-lookback', provider: envProvider.name, source: 'env' });
     } finally {
       log.mockRestore();
       stream.mockRestore();

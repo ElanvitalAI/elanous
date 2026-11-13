@@ -7,6 +7,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { hostname } from 'node:os';
 import { mkdirSync, openSync, closeSync, unlinkSync, readFileSync, writeFileSync, statSync, renameSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { consumeCodexResetCredits, listCodexResetCredits } from '../budget/codex-reset-credits.js';
@@ -16,6 +17,7 @@ import {
   resolveCodexAccount, effectiveCodexHome, type CodexHomeSource, type CodexAccountResolution,
 } from './codex-account.js';
 import { authStorePath, defaultCodexHome, isUnderTestRunner, listProviders, loadTokens, saveTokens } from './store.js';
+import { codexHealthCredential, isCodexUnauthorized } from './codex-account-health.js';
 import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaSignalCredits, readQuotaSignalUsedPercent, readQuotaSignalObservedAt, readQuotaSignalObservedAtRaw } from '../budget/codex-reset-credit-state.js';
 import { creditPaceStatus } from '../budget/codex-credit-pace.js';
 import { noteCodexBillingDecision, type CodexCreditSpendReason } from './codex-billing-route.js';
@@ -60,7 +62,7 @@ export function _setCodexAccountOutboundSenderForTesting(sender: CodexAccountOut
 /** ⛔⭐ 정적 import 로 읽는다 — 종전 `require()` 는 ESM 에서 «정의되지 않을 수 있고», 그러면
  *  fail-soft 가 삼켜 ***config false 가 영영 무시된다***(리뷰 should-fix: 노브가 no-op 이 된다).
  *  ⚠️ 순환 없음을 확인했다 — user-config 는 oauth 를 안 끌어온다. */
-type RotationConfig = { llm?: { provider?: string; model?: string; codexCreditReserve?: unknown; codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexCreditsAllowed?: boolean; codexResetAutoConsumePerDay?: number; codexQuotaPolicy?: unknown; fallbackChain?: unknown; openrouter?: { fallbackModel?: unknown } } };
+type RotationConfig = { llm?: { provider?: string; model?: string; codexCreditReserve?: unknown; codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexAccountHostWeights?: Readonly<Record<string, Readonly<Record<string, number>>>>; codexCreditsAllowed?: boolean; codexResetAutoConsumePerDay?: number; codexQuotaPolicy?: unknown; fallbackChain?: unknown; openrouter?: { fallbackModel?: unknown } } };
 
 function readUserConfig(): RotationConfig {
   return getUserConfig();
@@ -170,7 +172,7 @@ export interface ActiveCodexAccountView {
  * ⚠️ 계정이 하나뿐인 환경은 후보가 없어 `no-candidate` 로 끝나므로 동작이 안 바뀐다.
  */
 export function signalAttributableToAccount(home: { readonly source: CodexHomeSource }): boolean {
-  return home.source === 'store' || home.source === 'env';
+  return home.source === 'store' || home.source === 'env' || home.source === 'default';
 }
 
 export function activeCodexAccountView(
@@ -359,6 +361,7 @@ function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessE
         home,
         reached: readQuotaSignal(now, home),
         resetCreditAvailability: resetCreditAvailability(home, now),
+        unhealthy: isCodexUnauthorized(path, row.storeKey, codexHealthCredential(stored?.tokens ?? {})),
         ...(usedPercent === undefined ? {} : { usedPercent }),
         ...(credits.balance === undefined ? {} : { creditBalance: credits.balance }),
         ...(credits.hasCredits === undefined ? {} : { hasCredits: credits.hasCredits }),
@@ -611,6 +614,11 @@ function accountOrderFromConfig(): readonly string[] | undefined {
   } catch { return undefined; }
 }
 
+function accountWeightsForHost(): Readonly<Record<string, number>> | undefined {
+  try { return configReader().llm?.codexAccountHostWeights?.[hostname()]; }
+  catch { return undefined; }
+}
+
 /** 현재 저장된 가용 수를 판정의 삼상 계약으로 바꾼다. ⛔ 읽기 실패·손상·만료·음수·비정수는 「없음」이 아니다. */
 function resetCreditAvailability(home: string | undefined, now: number): 'available' | 'unavailable' | 'unknown' {
   if (!home?.trim()) return 'unknown';
@@ -701,7 +709,7 @@ export function inspectCodexRotation(
   const rawThreshold = rotationThresholdFromConfig();
   const thresholdPercentByAccount = rotationThresholdsByAccountFromConfig();
   const decision = decideCodexRotation({
-    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, creditsAllowed: rotationCreditsGrant(candidates).allowed, creditReserve: codexCreditReserveFromConfig(), ...currentCredits, candidates, creditPace: rotationCreditPace(candidates, now),
+    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), balanceKey: env.ELANOUS_RUN_ID?.trim(), accountWeights: accountWeightsForHost(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, creditsAllowed: rotationCreditsGrant(candidates).allowed, creditReserve: codexCreditReserveFromConfig(), ...currentCredits, candidates, creditPace: rotationCreditPace(candidates, now),
   });
   // ⛔⭐ 나이는 «만료돼도» 낸다 — 「65분 전」과 「3일 전」은 다른 진단이다(리뷰 must-fix).
   const observedAtByHome: Record<string, number> = {};
@@ -811,6 +819,8 @@ export function resolveCodexAccountForRun(
     creditReserve: codexCreditReserveFromConfig(),
     ...currentCreditsInput(currentSignalAttributable ? currentHome : undefined, now),
     candidates,
+    balanceKey: runId,
+    accountWeights: accountWeightsForHost(),
     creditPace,
   });
   observeCodexCreditsStep(creditsGrant, decision, current.name);
@@ -1201,9 +1211,18 @@ export function resolveRunFallback(
     //   ⛔ 정책이 within-quota 면 체인 밖으로 안 나간다(종전 규칙 그대로).
     const reserveHit = snapshot.creditReserveHit;
     const reserveReroute = reserveHit !== undefined && codexPolicyAllowsFallback(quotaPolicy);
+    // 구독이 다 찬 함대만 grok 으로 접는다(#37223 · 설정된 zai 를 건너뜀).
+    // 예비분 넘김(openrouter)과 설정된 codex-credits 칸은 그 접기보다 앞이다.
+    const allCodexUnavailable = !reserveReroute
+      && !chain.includes('codex-credits')
+      && snapshot.reason === 'no-candidate'
+      && snapshot.candidates.length > 0 && chain.includes('grok')
+      && (llm?.provider === undefined || llm.provider === 'auto' || llm.provider === 'openai-codex');
     const effectiveChain: readonly FallbackStep[] = reserveReroute
       ? ['codex-rotate', 'openrouter', ...chain.filter((step) => step !== 'codex-rotate' && step !== 'openrouter')]
-      : chain;
+      : allCodexUnavailable
+        ? ['codex-rotate', 'grok']
+        : chain;
     const openrouterFallbackModel = typeof fallbackModel === 'string' && fallbackModel.trim()
       ? fallbackModel
       : reserveReroute ? CREDIT_RESERVE_OPENROUTER_MODEL : undefined;

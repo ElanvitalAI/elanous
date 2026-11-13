@@ -3,6 +3,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { existsSync, statSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { getElanousConfigDirOverride, setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 import { join } from 'node:path';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -14,20 +15,34 @@ import {
 } from '../src/oauth/store';
 
 let root: string;
+let priorConfigDir: string | undefined;
+let priorEnv: Record<string, string | undefined>;
+const fixtureEnvKeys = ['XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_CODEX_ACCOUNT', 'ELANOUS_CODEX_ACCOUNT_HOME'] as const;
 let cfgPath: string;
 let codexHome: string;
 
 beforeEach(() => {
+  priorConfigDir = getElanousConfigDirOverride();
+  priorEnv = Object.fromEntries(fixtureEnvKeys.map((key) => [key, process.env[key]]));
   root = mkdtempSync(join(tmpdir(), 'oauth-store-'));
   cfgPath = join(root, 'elanous', 'auth.json');
   codexHome = join(root, 'codex-home');
+  // OAuth uses the config resolver; XDG alone leaves all cases in the preload's shared store.
+  setElanousConfigDir(join(root, 'elanous'));
+  delete process.env.ELANOUS_CODEX_ACCOUNT;
+  delete process.env.ELANOUS_CODEX_ACCOUNT_HOME;
   process.env.XDG_CONFIG_HOME = root;
   process.env.CODEX_HOME = codexHome;
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
-  delete process.env.XDG_CONFIG_HOME;
-  delete process.env.CODEX_HOME;
+  if (priorConfigDir === undefined) resetElanousConfigDir();
+  else setElanousConfigDir(priorConfigDir);
+  for (const key of fixtureEnvKeys) {
+    const value = priorEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 const sampleTokens: OAuthTokens = {
@@ -43,8 +58,9 @@ function codexIdToken(accountId: string): string {
   return `${segment({ alg: 'none' })}.${segment({ chatgpt_account_id: accountId })}.signature`;
 }
 
-describe('authStorePath respects XDG_CONFIG_HOME', () => {
-  test('under XDG_CONFIG_HOME/elanous/auth.json', () => {
+describe('authStorePath respects the explicit config root', () => {
+  test('explicit root takes precedence over XDG_CONFIG_HOME', () => {
+    process.env.XDG_CONFIG_HOME = join(root, 'unused-xdg');
     expect(authStorePath()).toBe(join(root, 'elanous', 'auth.json'));
   });
 });

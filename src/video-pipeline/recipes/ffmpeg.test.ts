@@ -7,10 +7,35 @@
  *   내가 손으로 한 번 눌러 고쳤고 ***그 누름을 버렸다.*** ⇒ 여기 옮긴다.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { probeDuration, probeSoundEnd, run } from './ffmpeg.js';
+import { ffmpeg, probeDuration, probeSoundEnd, run } from './ffmpeg.js';
+
+test('ffmpeg uses an explicit binary and otherwise resolves PATH', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ffmpeg-bin-'));
+  const override = join(dir, 'override');
+  const pathBin = join(dir, 'ffmpeg');
+  for (const bin of [override, pathBin]) {
+    writeFileSync(bin, '#!/bin/sh\nprintf "%s\n" "$0" >&2\nexit 0\n');
+    chmodSync(bin, 0o755);
+  }
+  const oldOverride = process.env.ELANOUS_FFMPEG_BIN;
+  const oldPath = process.env.PATH;
+  try {
+    process.env.PATH = `${dir}:${oldPath ?? ''}`;
+    process.env.ELANOUS_FFMPEG_BIN = override;
+    expect(ffmpeg(['-version']).err).toContain(override);
+    delete process.env.ELANOUS_FFMPEG_BIN;
+    expect(ffmpeg(['-version']).err).toContain(pathBin);
+  } finally {
+    if (oldOverride === undefined) delete process.env.ELANOUS_FFMPEG_BIN;
+    else process.env.ELANOUS_FFMPEG_BIN = oldOverride;
+    if (oldPath === undefined) delete process.env.PATH;
+    else process.env.PATH = oldPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 /** 앞 `sound` 초는 소리, 뒤 `tail` 초는 «무음»인 파일. */
 function makeAudio(dir: string, sound: number, tail: number): string {

@@ -31,6 +31,14 @@ describe('restoreTerminalAfterContinue', () => {
     expect(f.writes.join('')).not.toContain(ansi.altOn);
     expect(f.writes.join('')).toContain(ansi.kittyKbOn);
   });
+  test('compact primary screen keeps terminal mouse scrollback after resume', () => {
+    const f = fakeIo();
+    restoreTerminalAfterContinue({ raw: true, alt: false, mouse: false }, f.io);
+    const out = f.writes.join('');
+    expect(out).toContain(ansi.mouseOff);
+    expect(out).not.toContain(ansi.mouseOn);
+    expect(out).not.toContain(ansi.altOn);
+  });
   test('TUI 가 아무것도 안 켰으면(닫힌 뒤) 아무것도 하지 않는다', () => {
     const f = fakeIo();
     expect(restoreTerminalAfterContinue({ raw: false, alt: false }, f.io)).toBe(false);

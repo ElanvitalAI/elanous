@@ -30,7 +30,7 @@ export interface UserConfig {
   /** Root CLI help audience; absent or invalid means owner. */
   cli?: { helpRole?: 'owner' | 'contributor' | 'general' };
   /** Daemon public demonstration mode; absent means off. */
-  nexus?: { demoMode?: boolean; relay?: { enabled?: boolean; url?: string; identityFile?: string } };
+  nexus?: { demoMode?: boolean; relay?: { enabled?: boolean; url?: string; identityFile?: string; memberNexusUrl?: string; memberKeyFile?: string } };
   /** Execution-phase HITL answer deadline; absent means 30 minutes. */
   hitl?: { executionDeadlineMinutes?: number };
   /** Outbound notifications. quietHours is `off` or `HH:MM-HH:MM` KST; absent keeps 00:00-06:30. */

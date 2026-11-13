@@ -1,0 +1,28 @@
+# KINGDOM-INTAKE-GRAPH shadow template. The event router and execution handlers
+# are bound in later slices; this graph declares their contract for simulation.
+# Source: 내부 문서 `RFC-federation-kingdoms-on-graph` §3, §4 #10.
+# Classification context comes from 내부 문서 `FEDERATION-OPERATIONS` §1, §3.
+graph_id: judiciary-intake
+loop:
+  title: 판정국 접수
+  description: 요청 한 건을 분류·판정·집행·원장에 기록한다. 모호하면 사람에게 넘긴다.
+  trigger:
+    events: [LAND-REQ, CAP-REQ, WAIVER-REQ]
+version: 1
+entry_node: classify
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: classify, kind: classify, recipe: none, max_visits: 1 }
+  - { node_id: judge, kind: judge, recipe: 'handler:judiciary-judge', max_visits: 1 }
+  # An approved failure at needs-human may retry execute once.
+  - { node_id: execute, kind: agent, recipe: 'handler:judiciary-execute', max_visits: 2 }
+  - { node_id: record, kind: observe, recipe: 'handler:judiciary-record', max_visits: 1 }
+  - { node_id: needs-human, kind: hitl, recipe: 'approval:judiciary-unknown', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: classify, on: outcome, map: { ok: judge, fail: needs-human, error: needs-human } }
+  - { from: judge, on: outcome, map: { ready: execute, unknown: needs-human, fail: needs-human, error: needs-human } }
+  - { from: execute, on: outcome, map: { done: record, fail: needs-human, error: needs-human } }
+  - { from: record, on: outcome, map: { recorded: done, fail: failed, error: failed } }
+  - { from: needs-human, on: outcome, map: { ok: execute, fail: failed, error: failed } }

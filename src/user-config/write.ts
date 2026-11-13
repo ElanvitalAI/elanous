@@ -186,6 +186,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       codexAccountRotationThresholdPercent: cfg.llm.codexAccountRotationThresholdPercent,
       codexAccountRotationThresholdPercentByAccount: cfg.llm.codexAccountRotationThresholdPercentByAccount,
       codexAccountOrder: cfg.llm.codexAccountOrder,
+      codexAccountHostWeights: cfg.llm.codexAccountHostWeights,
       // ★ 2026-09-28: 타입·파서에만 넣고 이 whitelist 를 빠뜨려 `config set llm.codexCreditsAllowed true` 가 «직렬화 드롭» 됐다(#21375 직후 운영 실측).
       codexCreditsAllowed: cfg.llm.codexCreditsAllowed,
       codexQuotaPolicy: cfg.llm.codexQuotaPolicy,

@@ -113,6 +113,11 @@ describe('elanous repro tool surface selection', () => {
   //   runEvalPrompt 가 (a) tier-flip 결과를 프로바이더에 넘기고 (b) daemon dispatcher 를
   //   고르는지 경계에서 확인한다(provider 주입 seam 으로 실 LLM 없이).
   test('★ runEvalPrompt 가 tier-flip 결과를 프로바이더에 넘기고 daemon dispatcher 를 쓴다', async () => {
+    // Search a current deferred schema; the retired SolveMission fixture cannot hydrate.
+    const deferredTool = 'BrowserRead';
+    const selected = buildEvalPromptToolSurface('webterm', 'claude', cfg);
+    expect(splitDeferredToolSpecs(selected.specs).deferred.map((tool) => tool.name))
+      .toContain(deferredTool);
     let sawTools: string[] = [];
     const provider = {
       name: 'scripted',
@@ -121,7 +126,7 @@ describe('elanous repro tool surface selection', () => {
       async *streamChat(_h: unknown, o?: { tools?: { name: string }[] }) {
         sawTools = (o?.tools ?? []).map((t) => t.name);
         // deferred 도구를 소환한다 → daemon dispatcher 경유가 결과로 드러난다.
-        yield { type: 'tool_call', id: 't1', name: 'ToolSearch', args: { query: 'select:SolveMission' } };
+        yield { type: 'tool_call', id: 't1', name: 'ToolSearch', args: { query: `select:${deferredTool}` } };
       },
       async *chat() {},
     };

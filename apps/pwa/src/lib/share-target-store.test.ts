@@ -9,7 +9,8 @@
 // catching real regressions.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { acknowledgeSharedPayloadFiles, takeSharedPayload } from './share-target-store';
+import { acknowledgeSharedPayloadFiles, markSharedPayloadProgress, readSharedPayloadReceipt, takeSharedPayload } from './share-target-store';
+import type { SavedScrapReceipt } from './share-scraps';
 
 const realCaches = (globalThis as { caches?: unknown }).caches;
 
@@ -99,6 +100,14 @@ afterEach(() => {
 });
 
 describe('takeSharedPayload', () => {
+  test('restores persisted receipt metadata after a completed share step', async () => {
+    await stubCaches.caches.open('elanous-pwa-share-target-v2');
+    const receipt: SavedScrapReceipt = { id: 'saved-article', kind: 'web',
+      raw: { text: 'Saved article', url: 'https://example.test/article' } };
+    await markSharedPayloadProgress('share-retry', 'url', receipt);
+    expect(await readSharedPayloadReceipt('share-retry', 'url')).toEqual(receipt);
+  });
+
   test('returns null for empty id', async () => {
     const r = await takeSharedPayload('');
     expect(r).toBe(null);

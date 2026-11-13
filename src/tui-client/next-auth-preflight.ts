@@ -5,6 +5,17 @@ import type { UserConfig } from '../user-config/schema.js';
 type Reason = 'missing-file' | 'expired' | 'other';
 const HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
+export type NextTuiAuthFailureKind = 'codex-auth-missing' | 'codex-auth-failed';
+/** Only this preflight may create a public Codex auth failure. */
+export class NextTuiAuthError extends Error {
+  constructor(readonly kind: NextTuiAuthFailureKind) {
+    super(kind === 'codex-auth-missing'
+      ? 'Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.'
+      : 'Codex 인증에 실패했습니다. eln login openai-codex를 확인하세요.');
+    this.name = 'NextTuiAuthError';
+  }
+}
+
 export function classifyNextAuthFailure(error: unknown): Reason {
   const message = error instanceof Error ? error.message : String(error);
   if (/reason=missing-file|mirror.*(?:missing|absent)/i.test(message)) return 'missing-file';
@@ -39,8 +50,7 @@ export async function preflightNextTuiAuth(
     if (requested) {
       try { if (await deps.load()) return; } catch { /* show one safe recovery line */ }
     }
-    throw new Error(reason === 'missing-file' || reason === 'expired'
-      ? 'Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.'
-      : 'Codex 인증에 실패했습니다. eln login openai-codex를 확인하세요.');
+    throw new NextTuiAuthError(reason === 'missing-file' || reason === 'expired'
+      ? 'codex-auth-missing' : 'codex-auth-failed');
   }
 }

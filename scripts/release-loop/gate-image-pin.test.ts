@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
@@ -176,6 +177,51 @@ it('reuses a mixed-base runtime only when every pool already has the same immuta
   expect(() => gateRuntimeBaseReuseMode([arm, amd], [digestC, digestB])).toThrow('no shared pinned image tag');
   expect(() => gateRuntimeBaseReuseMode([arm, null], [digestC, digestC])).toThrow('could not be measured');
 });
+
+it('prebuild entry accepts ARM aliases and probes one runtime key on both pools', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-arch-alias-entry-'));
+  const bin = join(root, 'bin');
+  const calls = join(root, 'ssh-calls.log');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'ssh'), `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_SSH_CALLS"
+case "$*" in
+  *ubuntu:24.04*)
+    printf '%s\n' 'ubuntu@${digestA}'
+    case "$*" in *node-b*) echo arm64;; *aws1*) echo aarch64;; esac
+    ;;
+  *) printf 'HTTP/1.1 200 OK\r\nDocker-Content-Digest: ${digestC}\r\n\r\n';;
+esac
+`);
+  chmodSync(join(bin, 'ssh'), 0o755);
+  try {
+    const repo = process.cwd();
+    const commit = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+    const observedTags: string[] = [];
+    for (const [runId, pool] of [
+      ['arm-first', 'pool-node-b@node-b:1#k3d-registry:5051,pool-aws1@aws1:1#k3d-registry:5052'],
+      ['alias-first', 'pool-aws1@aws1:1#k3d-registry:5052,pool-node-b@node-b:1#k3d-registry:5051'],
+    ]) {
+      writeFileSync(calls, '');
+      const result = spawnSync(process.execPath, [join(repo, 'scripts/release-loop/gate-image-pin.ts'), '--prebuild',
+        '--root', root, '--repo', repo, '--run-id', runId!, '--version', '0.3.15', '--commit', commit,
+        '--pool', pool!], {
+        cwd: repo, encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_SSH_CALLS: calls },
+      });
+      expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toMatchObject({ status: 0 });
+      expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'reused', digest: digestC,
+        eligiblePools: pool!.split(',').map((part) => part.split('@')[0]) });
+      const probes = readFileSync(calls, 'utf8').split('\n').filter((line) => line.includes('/manifests/'));
+      expect(probes).toHaveLength(2);
+      const tags = probes.map((line) => /\/manifests\/([a-f0-9]{12})/.exec(line)?.[1]);
+      expect(tags[0]).toMatch(/^[a-f0-9]{12}$/);
+      expect(tags[1]).toBe(tags[0]);
+      observedTags.push(tags[0]!);
+    }
+    expect(observedTags[1]).toBe(observedTags[0]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 30_000);
 
 it('persists a mixed-base shared tag for the new run without building, and rejects missing or drifting pools', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-mixed-base-prebuild-'));

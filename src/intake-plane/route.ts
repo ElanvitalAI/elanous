@@ -106,10 +106,12 @@ export async function scheduleIntakeEvent(
       db.query('DELETE FROM intake_event_claims WHERE url = ? AND claimed_at = ?').run(normalized, now);
       throw error;
     }
-    db.query("UPDATE intake_events SET status = 'scheduled', task_id = ? WHERE url = ? AND status = 'pending' AND claimed_at = ?")
+    const saved = db.query("UPDATE intake_events SET status = 'scheduled', task_id = ? WHERE url = ? AND status = 'pending' AND claimed_at = ?")
       .run(posted.taskId, normalized, now);
+    if (saved.changes !== 1) return { status: 'duplicate', url: normalized, reason: 'claim-lost' };
     debug.log('intake.event', 'scheduled', { url: normalized, reason: 'telegram-absorb' });
-    return { status: 'scheduled', url: normalized, reason: 'telegram-absorb' };
+    return { status: 'scheduled', url: normalized, reason: 'telegram-absorb',
+      reply: `접수했습니다. 작업 ID: ${posted.taskId}` };
   } finally {
     db.close();
   }

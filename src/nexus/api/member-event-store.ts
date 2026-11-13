@@ -23,8 +23,25 @@ export interface MemberEventQuery {
   readonly since?: string;
 }
 
+interface ClaimClock { readonly now: () => Date; readonly leaseMs: number }
+
+function claimDecisionTime(clock: ClaimClock): { at: string; since: number } {
+  const now = clock.now();
+  if (!Number.isFinite(now.getTime()) || !Number.isFinite(clock.leaseMs) || clock.leaseMs <= 0) throw new Error('invalid claim clock');
+  return { at: now.toISOString(), since: now.getTime() - clock.leaseMs };
+}
+
 export interface MemberEventStore {
   append(event: unknown): Promise<void>;
+  /** Atomically dedupe by key and reserve capacity under the private journal lock. */
+  reserveUniqueEvent?(event: unknown, limit: { type: string; key: string; since: string; max: number }):
+    Promise<{ status: 'appended' | 'existing' | 'limited'; event?: MemberEvent }>;
+  /** One process may generate an unsettled request during the lease window. */
+  claimPendingEvent?(event: unknown, limit: { resultType: string; key: string } & ClaimClock):
+    Promise<'claimed' | 'renewed' | 'busy' | 'settled'>;
+  /** Append a result only while the caller still owns the newest generation claim. */
+  appendClaimedResult?(event: unknown, claim: { claimType: string; key: string; claimId: string } & ClaimClock):
+    Promise<{ status: 'appended' | 'existing' | 'stale'; event?: MemberEvent }>;
   scan(request: { type: string }): Promise<readonly MemberEvent[]>;
   query(request: MemberEventQuery): Promise<readonly MemberEvent[]>;
   subscribe(listener: (event: MemberEvent) => void): () => void;
@@ -120,6 +137,107 @@ export function createJsonlMemberEventStore(directory: string): MemberEventStore
       for (const listener of listeners) {
         try { listener(event); } catch { /* one subscriber cannot break journal append */ }
       }
+    },
+
+    async reserveUniqueEvent(value, limit) {
+      if (!isRecord(value) || !validMemberId(value.memberId)) throw new Error('memberId is required for event append');
+      const event = parseEvent(value, value.memberId);
+      const since = Date.parse(limit.since);
+      if (!EVENT_TYPE.test(limit.type) || event.type !== limit.type
+        || !/^[A-Za-z][A-Za-z0-9]*$/.test(limit.key) || typeof event[limit.key] !== 'string'
+        || !Number.isFinite(since) || !Number.isSafeInteger(limit.max) || limit.max < 1) {
+        throw new Error('invalid member event limit');
+      }
+      ensurePrivateDirectory(directory);
+      const path = memberFile(directory, event.memberId);
+      const reservation = withPrivateFileLock(`${path}.lock`, () => {
+        const rows = readMemberEvents(directory, event.memberId);
+        const existing = rows.find(row => row.type === limit.type && row[limit.key] === event[limit.key]);
+        if (existing) return { status: 'existing' as const, event: existing };
+        const used = rows.filter(row => row.type === limit.type
+          && typeof row.at === 'string' && Number.isFinite(Date.parse(row.at)) && Date.parse(row.at) >= since).length;
+        if (used >= limit.max) return { status: 'limited' as const };
+        const serialized = Buffer.from(`${JSON.stringify(event)}\n`, 'utf8');
+        const fd = openSync(path, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+        try {
+          const stat = fstatSync(fd);
+          if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error('member event journal must be a private regular file');
+          appendJournalRecord(fd, serialized);
+        } finally { closeSync(fd); }
+        return { status: 'appended' as const };
+      }, 'nexus.member-event-store', true);
+      if (reservation.status === 'appended') for (const listener of listeners) {
+        try { listener(event); } catch { /* one subscriber cannot break journal append */ }
+      }
+      return reservation;
+    },
+
+    async claimPendingEvent(value, limit) {
+      if (!isRecord(value) || !validMemberId(value.memberId)) throw new Error('memberId is required for event claim');
+      let event = parseEvent(value, value.memberId);
+      if (!EVENT_TYPE.test(limit.resultType) || !/^[A-Za-z][A-Za-z0-9]*$/.test(limit.key)
+        || typeof event[limit.key] !== 'string' || typeof event.claimId !== 'string' || !event.claimId
+        || typeof event.at !== 'string'
+        || !Number.isFinite(Date.parse(event.at)) || typeof limit.now !== 'function') throw new Error('invalid member event claim');
+      ensurePrivateDirectory(directory);
+      const path = memberFile(directory, event.memberId);
+      const claimed = withPrivateFileLock(`${path}.lock`, () => {
+        const { at, since } = claimDecisionTime(limit);
+        event = { ...event, at };
+        const rows = readMemberEvents(directory, event.memberId);
+        if (rows.some(row => row.type === limit.resultType && row[limit.key] === event[limit.key])) return 'settled' as const;
+        const latest = rows.slice().reverse().find(row => row.type === event.type && row[limit.key] === event[limit.key]);
+        if (latest) {
+          const latestAt = typeof latest.at === 'string' ? Date.parse(latest.at) : NaN;
+          if (!Number.isFinite(latestAt)) return 'busy' as const;
+          // An expired owner cannot revive its claim, even before another worker takes over.
+          if (latest.claimId === event.claimId ? latestAt <= since : latestAt > since) return 'busy' as const;
+        }
+        const serialized = Buffer.from(`${JSON.stringify(event)}\n`, 'utf8');
+        const fd = openSync(path, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+        try {
+          const stat = fstatSync(fd);
+          if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error('member event journal must be a private regular file');
+          appendJournalRecord(fd, serialized);
+        } finally { closeSync(fd); }
+        return latest?.claimId === event.claimId ? 'renewed' as const : 'claimed' as const;
+      }, 'nexus.member-event-store', true);
+      if (claimed === 'claimed' || claimed === 'renewed') for (const listener of listeners) {
+        try { listener(event); } catch { /* one subscriber cannot break journal append */ }
+      }
+      return claimed;
+    },
+
+    async appendClaimedResult(value, claim) {
+      if (!isRecord(value) || !validMemberId(value.memberId)) throw new Error('memberId is required for claimed result');
+      const event = parseEvent(value, value.memberId);
+      if (!EVENT_TYPE.test(claim.claimType) || !/^[A-Za-z][A-Za-z0-9]*$/.test(claim.key)
+        || typeof event[claim.key] !== 'string' || !claim.claimId || typeof claim.now !== 'function') throw new Error('invalid claimed result');
+      ensurePrivateDirectory(directory);
+      const path = memberFile(directory, event.memberId);
+      const appended = withPrivateFileLock(`${path}.lock`, () => {
+        const { since } = claimDecisionTime(claim);
+        const rows = readMemberEvents(directory, event.memberId);
+        const existing = rows.find(row => row.type === event.type && row[claim.key] === event[claim.key]);
+        if (existing) return { status: 'existing' as const, event: existing };
+        const latest = rows.slice().reverse().find(row => row.type === claim.claimType && row[claim.key] === event[claim.key]);
+        if (!latest || latest.claimId !== claim.claimId || typeof latest.at !== 'string'
+          || !Number.isFinite(Date.parse(latest.at)) || Date.parse(latest.at) <= since) {
+          return { status: 'stale' as const };
+        }
+        const serialized = Buffer.from(`${JSON.stringify(event)}\n`, 'utf8');
+        const fd = openSync(path, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+        try {
+          const stat = fstatSync(fd);
+          if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error('member event journal must be a private regular file');
+          appendJournalRecord(fd, serialized);
+        } finally { closeSync(fd); }
+        return { status: 'appended' as const };
+      }, 'nexus.member-event-store', true);
+      if (appended.status === 'appended') for (const listener of listeners) {
+        try { listener(event); } catch { /* one subscriber cannot break journal append */ }
+      }
+      return appended;
     },
 
     async query(request) {

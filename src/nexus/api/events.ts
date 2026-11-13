@@ -51,6 +51,7 @@ export function handleSseEvents(bus: NexusEventBus, url: URL, memberScope?: stri
         // routeRequest resolved through /v1/members/owner.
         if (ev.kind.startsWith('board.card') && (!memberId || ev.memberId !== memberId)) return;
         if (ev.kind.startsWith('briefing.ready') && !(memberId && ev.memberId === memberId) && !operatorBriefings) return;
+        if (ev.kind.startsWith('scrap.summary.') && (!memberId || ev.memberId !== memberId)) return;
         send(`event: ${ev.kind}\n`);
         send(`data: ${JSON.stringify(ev)}\n\n`);
       };

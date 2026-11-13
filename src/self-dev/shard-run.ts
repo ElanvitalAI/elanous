@@ -594,7 +594,7 @@ export function runBunShardWithSpawn(cwd: string, files: readonly string[], spaw
   const isolated = prepareDeterministicChildEnvironment('elanous-shard-test-env-', { env: withGateTestEnv(process.env) });
   try {
     const measured = files.length === 1;
-    const args = ['test', ...(spawnLane ? [`--timeout=${timeout}`] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
+    const args = ['test', '--preserve-symlinks', ...(spawnLane ? [`--timeout=${timeout}`] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
     const started = performance.now();
     const result = spawn(['bun', ...args], {
       cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe', timeout,
@@ -633,7 +633,7 @@ export async function runBunShardAsync(cwd: string, files: readonly string[], dr
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
   const drainAbort = new AbortController();
   try {
-    const args = ['test', ...(spawnLane ? [`--timeout=${timeout}`] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
+    const args = ['test', '--preserve-symlinks', ...(spawnLane ? [`--timeout=${timeout}`] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
     const started = performance.now();
     const child = Bun.spawn(['bun', ...args], { cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe' });
     let timedOut = false;

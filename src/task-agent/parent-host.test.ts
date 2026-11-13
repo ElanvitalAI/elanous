@@ -13,6 +13,7 @@ import {
   installRemoteCodexAccess, installRemoteCodexAccessBatch, installRemoteCodexCliMirror, REMOTE_CODEX_CLI_MIRROR_DIR, installRemoteGrokAccess, resolveOwnerGrokAccessMirror, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, rankParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, PARENT_HOST_ACTIVE_FILTER, PARENT_HOST_PROC_COUNT_SCRIPT, type ParentHostConfig, type SshRunner,
 } from './parent-host.js';
 import { handTask, shellQuote } from './task-hand.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 const TARGET: ParentHostConfig = { host: 'node-b', cwd: '/Users/me/source/elanous' };
 const GOOD_FACTS = 'version=0.2.20-dev.0\nconfig=1\npodPool=1\nrepo=1\nkubectl=1\ngrokCli=1\ncodexCli=1\n';
@@ -1595,6 +1596,13 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
     const root = mkdtempSync(join(tmpdir(), 'owner-mirror-selector-'));
     const previousXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = root;
+    // #37169 made the auth store follow the config-dir resolver (explicit
+    // --config-dir/state-dir first). Under bun test a preload pins
+    // ELANOUS_STATE_DIR to a per-run global root, so ambient XDG_CONFIG_HOME no
+    // longer redirects authStorePath() — the fixture store below would be
+    // ignored and hostCredentials would read the test-global store instead.
+    // Pin the fixture with the sanctioned programmatic override.
+    setElanousConfigDir(join(root, 'elanous'));
     try {
       const storePath = join(root, 'elanous', 'auth.json');
       mkdirSync(join(root, 'elanous'), { recursive: true });
@@ -1734,6 +1742,7 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
         { runId: 'run-ownernolease', launchId: 'tl-ownernolease', env: { ELANOUS_RUN_ID: 'run-ownernolease' } },
         { ...baseDeps, ownerCodexLeaseHolder: () => false })).rejects.toThrow('주인 임대');
     } finally {
+      resetElanousConfigDir();
       if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousXdg;
       rmSync(root, { recursive: true, force: true });

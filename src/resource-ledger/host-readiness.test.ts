@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { projectHostReadiness, readHostReadiness } from './host-readiness.js';
+import { collectHostReadinessTick } from './host-readiness-collector.js';
 import { readResourceLedger, recordHostReadinessHeartbeat, type HostReadinessHeartbeat } from './resource-ledger.js';
 
 // Source: BRIEF-LOCAL-FIRST-PLACEMENT-1111.md, rubric v1; samples span the four host grades and stale heartbeat boundary.
@@ -119,4 +120,47 @@ test('legacy TSV remains visible until a newer resource-ledger heartbeat replace
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a newer failed probe overrides legacy READY and starts failure freshness at that tick', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-host-readiness-legacy-failure-'));
+  const path = join(dir, 'events.jsonl');
+  const legacy = join(dir, 'host-readiness.tsv');
+  try {
+    const priorAt = new Date(Date.now() - 20 * 60_000).toISOString();
+    const legacyAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    const tickAt = new Date();
+    writeFileSync(legacy, ['host\titem\tstatus\trepaired\tat\tdetail',
+      `node-b\tverdict\tREADY\tno\t${legacyAt}\tlegacy`].join('\n'));
+    recordHostReadinessHeartbeat(heartbeat('node-b', priorAt), path);
+    const result = await collectHostReadinessTick({ hosts: () => [{ name: 'node-b', host: 'node-b' }],
+      run: () => ({ status: 255, stdout: '', stderr: 'unreachable' }),
+      events: () => readResourceLedger(path), record: row => recordHostReadinessHeartbeat(row, path), now: () => tickAt });
+    expect(result.unmeasured).toEqual(['node-b']);
+    expect(withLegacyLedgerPath(legacy, () => readHostReadiness(path))).toMatchObject([
+      { host: 'node-b', at: tickAt.toISOString(), freshness: 'unmeasured', verdict: 'UNMEASURED', reason: 'ssh-unavailable' },
+    ]);
+    const latest = readResourceLedger(path).at(-1);
+    expect(latest?.event === 'host-readiness-heartbeat' ? latest.heartbeat.freshnessAt : undefined).toBe(tickAt.toISOString());
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a recent successful sample cannot make a failed SSH or incomplete metrics probe READY', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-host-readiness-recent-failure-'));
+  try {
+    for (const [name, status, reason] of [['ssh', 255, 'ssh-unavailable'], ['metrics', 0, 'metrics-unavailable']] as const) {
+      const path = join(dir, `${name}.jsonl`);
+      const tickAt = new Date();
+      const priorAt = new Date(tickAt.getTime() - 60_000).toISOString();
+      recordHostReadinessHeartbeat(heartbeat('node-b', priorAt), path);
+      await collectHostReadinessTick({ hosts: () => [{ name: 'node-b', host: 'node-b' }],
+        run: () => ({ status, stdout: '', stderr: status ? 'unreachable' : '' }),
+        events: () => readResourceLedger(path), record: row => recordHostReadinessHeartbeat(row, path), now: () => tickAt });
+      expect(withLegacyLedgerPath(join(dir, 'missing.tsv'), () => readHostReadiness(path))).toMatchObject([
+        { host: 'node-b', at: tickAt.toISOString(), freshness: 'unmeasured', verdict: 'UNMEASURED', reason },
+      ]);
+      const latest = readResourceLedger(path).at(-1);
+      expect(latest?.event === 'host-readiness-heartbeat' ? latest.heartbeat.sample : undefined).toBeUndefined();
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -1,3 +1,4 @@
+import { beforeEach, afterEach } from 'bun:test';
 import { setDefaultTimeout, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,7 +6,7 @@ import { join } from 'node:path';
 import { debug } from './debug/log.js';
 import { _setGpt6CodexGuardFlagsForTest, _usesAdaptiveThinkingForContractTest, AnthropicProvider, billingRouteForProvider, codexOAuthAvailable, getProvider, getGpt6CodexGuardFlags, getGpt6CodexGuardStats, logAgentTurnUsage, PROVIDERS, resetGpt6CodexGuardObservations, streamLLM, streamLLMWithTools, type Gpt6CodexGuardId, type LLMMessage, type LLMProvider } from './llm.js';
 import { _resetCodexBillingDecisionForTesting, noteCodexBillingDecision } from './oauth/codex-billing-route.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 test('access-only remote routes explicit Codex GPT model requests to the mirrored subscription provider', () => {
   const previous = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
@@ -497,7 +498,7 @@ test('Anthropic request for Claude 5.5 includes interleaved-thinking beta', asyn
   process.env.ANTHROPIC_API_KEY = 'test-key';
   const sent: { model: string; beta: string | null }[] = [];
   try {
-    await withFakeFetchDevice([{ url: '/v1/messages', method: 'POST', response: request => {
+    await withRealProviderFakeFetchDevice([{ url: '/v1/messages', method: 'POST', response: request => {
       const headers = new Headers(request.headers);
       sent.push({ model: JSON.parse(String(request.body)).model, beta: headers.get('anthropic-beta') });
       return new Response('data: {"type":"message_stop"}\n\n', { status: 200 });
@@ -911,4 +912,12 @@ test('streamLLMWithTools carries request compaction into canonical history for t
   expect(requests[1]!.join('\n')).toContain('persistent compact summary');
   expect(requests[1]!.join('\n')).not.toContain('large history');
   expect(requests[1]!.join('\n')).toContain('tool evidence');
+});
+
+// Provider wire expectations run with a fake HTTP transport, not the gate's default fake LLM.
+let previousWireMode: string | undefined;
+beforeEach(() => { previousWireMode = process.env.ELANOUS_LLM_MODE; process.env.ELANOUS_LLM_MODE = 'real'; });
+afterEach(() => {
+  if (previousWireMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+  else process.env.ELANOUS_LLM_MODE = previousWireMode;
 });

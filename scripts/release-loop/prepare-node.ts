@@ -3,7 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdtempSync, op
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
-import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
+import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
 import { isReleaseVersion } from './release-version.js';
 
 /** Apparent bytes of the preserved archive; never follow a symlink out of its private directory. */
@@ -49,13 +49,18 @@ function preparedByRun(root: string, runId: string, out: string, commit: string)
   } catch { return false; }
 }
 
+export function assertPreparePrerequisites(context: GraphContext, signedPwa = signedT6PwaKnownIssue): void {
+  if (context.outputs.gate?.outcome !== 'ok') throw new Error('gate did not pass');
+  if (context.outputs.pwa?.outcome !== 'ok' && !signedPwa(context)) throw new Error('pwa did not pass');
+}
+
 export function runPrepare(run: CommandRunner = runCommand, move: typeof renameSync = renameSync) {
   const context = readGraphContext();
   const { version, previousVersion } = context.input;
   if (!isReleaseVersion(version)) throw new Error(`invalid release version: ${version}`);
   if (context.runId && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(context.runId)) throw new Error('invalid release runId');
   const commit = nodeOutput(context, 'version-release', 'commit');
-  for (const node of ['gate', 'pwa']) if (context.outputs[node]?.outcome !== 'ok') throw new Error(`${node} did not pass`);
+  assertPreparePrerequisites(context);
   const root = effectiveInstanceRoot();
   const attempt = context.runId ? releaseAttempt(root, version, context.runId) : undefined;
   const out = join(root, 'release', version, 'prepared');

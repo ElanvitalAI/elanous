@@ -33,6 +33,7 @@ import { nexusLockPath, nexusRuntimePath, nexusRootDir } from './paths.js';
 import { createJsonlMemberEventStore, createNexusCapabilityRegistry } from './api/member-event-store.js';
 import { createPwaRegistration, type PwaRegistrationDeps } from './pwa-registration.js';
 import { resolveCurrentInstance } from '../instance/current.js';
+import { isolatedFakeToxBudget } from './tox-test-budget.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getOrCreateElanousId } from '../mss/identity-store.js';
 import { startPortLeaseHeartbeat } from '../control-plane/port-lease-heartbeat.js';
@@ -119,6 +120,7 @@ import {
 import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-runtime/discovery.js';
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
+import { createNexusScrapsRouteOptions } from './api/scraps-web-digest.js';
 import { trustedTlsEdgeFromEnv } from './api/tls-edge.js';
 import { loadNexusAppHost, resolveVerifiedOwner as resolveVerifiedAppOwner, type NexusAppHost } from './apps/app-host.js';
 import { createMemberStore, type MemberStore } from './members/member-store.js';
@@ -126,9 +128,11 @@ import { createVerifiedAbsorbBriefingsAppRoute } from './api/briefings-api.js';
 import { createAppPublishServerAdapter } from './apps/app-publish.js';
 import {
   createAppSiteDeployRoute,
+  createVerifiedAppSiteDeployPublisher,
   fetchAppMemberOwner,
   createLectureScrapDeploymentOperations,
   type AppSiteDeploymentOperations,
+  type AppSiteDeploymentRuntime,
 } from './apps/app-site-deploy.js';
 import { publicAppAddress } from './apps/console-address.js';
 import { resolvePublicAppUserId } from '../relay/relay-server.js';
@@ -484,6 +488,9 @@ export interface RunNexusOptions {
   /** Bypass the wait loop (tests). When true, runNexus returns the
    *  release callback after writing runtime.json instead of blocking. */
   detachForTesting?: boolean;
+  /** Test-only external usage boundary; ignored by operating Nexus boot. */
+  toxBudgetReadForTesting?: import('../self-implement/budget-gate.js').ReadBudgetInputsDeps
+    & { readLiveGrok?: () => Promise<number | undefined> };
   /** Test-only isolated post-office boot; production starts it with the normal Nexus lifetime. */
   msgSseForTesting?: { stateRoot: string; token: string; port?: number };
   /** Test-only observation of the live continuation scheduler created by runNexus. */
@@ -2556,6 +2563,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       toxStore = new TaskStore();
       toxHandle = wireTox({
         graph: hydrateGraph(toxStore), store: toxStore,
+        budgetCheck: isolatedFakeToxBudget(resolveCurrentInstance().kind, process.env, allowed =>
+          console.debug('[nexus] isolated fake TOX budget', allowed ? 'allow' : 'hold')),
+        ...(opts.detachForTesting && opts.toxBudgetReadForTesting ? { readBudget: opts.toxBudgetReadForTesting } : {}),
         getWorkflowDaemon: () => workflowDaemon ?? null,
         surfaces: {
           subagent,
@@ -3319,7 +3329,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       appsRoot: joinPath(nexusRootDir(), 'apps'),
       templatesRoot: resolvePath(import.meta.dir, '../../templates'),
     });
-    const appSiteDeployRoute = appPublicUserSlug ? createAppSiteDeployRoute({
+    const appSiteDeploymentRuntime: AppSiteDeploymentRuntime | undefined = appPublicUserSlug ? {
       ...appSiteDeploymentOperations,
       configuredPublicUserId: appPublicUserSlug,
       withSourceLock: (slug, run) => withAppSourceLock(slug, joinPath(nexusRootDir(), 'apps', slug), run),
@@ -3330,11 +3340,23 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         await appSiteDeploymentOperations.publish(input);
         appHost.mountDirectory(input.appSlug, input.owner.entitlements);
       },
+      recordPublished: async ({ appSlug, owner, publicUrl, runId }) => {
+        const title = appHost.getManifest(appSlug)?.title ?? appSlug;
+        await boardEventStore.append({
+          type: 'board.card', cardId: `app-${appSlug}`, memberId: owner.memberId,
+          state: 'released', appSlug, runId, title, summary: '앱 공개 배포 완료',
+          result: { publicUrl, resultUrl: publicUrl }, at: new Date().toISOString(),
+        });
+      },
       discard: async source => {
         if (source.appSlug) appHost.unmountDirectory(source.appSlug);
         await appSiteDeploymentOperations.discard?.(source);
       },
-    }) : undefined;
+    } : undefined;
+    const appSiteDeployRoute = appSiteDeploymentRuntime ? createAppSiteDeployRoute(appSiteDeploymentRuntime) : undefined;
+    if (metaApiOpts && appSiteDeploymentRuntime) {
+      metaApiOpts.appDeployPublishHook = createVerifiedAppSiteDeployPublisher(appSiteDeploymentRuntime);
+    }
     const absorbBriefingsRoute = createVerifiedAbsorbBriefingsAppRoute({
       root: elanousStateRoot(),
       endpointOrigin: () => httpServer?.url ?? null,
@@ -3423,7 +3445,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       boardEventStore,
       boardApprovalDispatch,
       capabilityProviders,
-      scraps: { instanceRoot: nexusRootDir(), extractors: {} },
+      scraps: createNexusScrapsRouteOptions(nexusRootDir()),
       ...(trustedTlsEdge ? { trustedTlsEdge } : {}),
       setup: { mode: nexusSetup.setupMode, missing: nexusSetup.setupMissing },
       ...(supervisor ? { supervisor } : {}),

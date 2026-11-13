@@ -30,12 +30,20 @@ export function formatSidetabLines(
   mode: 'list' | 'new' = 'list',
 ): string[] {
   const selectedRow = rows[selected] as PreviewSidetabRow | undefined;
+  // Agent PTYs are conversations. Give their selected row a longer live tail
+  // while keeping the parent chat on screen and one selectable row visible.
+  const agentSidechat = selectedRow !== undefined
+    && ['agent', 'coding-agent', 'codex', 'claude', 'claude-code', 'grok', 'hermes'].includes(selectedRow.kind);
+  const previewLimit = agentSidechat
+    ? Number.isFinite(height) ? Math.min(6, Math.max(0, Math.floor(height) - 6)) : 6
+    : 3;
   const peekLines = mode === 'list' && selectedRow
-    ? formatSidetabPeekLines(selectedRow.previewSource ?? '', width)
+    ? formatSidetabPeekLines(selectedRow.previewSource ?? '', width, previewLimit)
     : [];
   if (peekLines.length === 0) return formatCoreSidetabLines(rows, selected, width, height, mode);
 
-  const reservedRows = peekLines.length + 1;
+  const sidechatHeading = agentSidechat ? [' agent chat · Enter attach'.slice(0, Math.max(0, width)).padEnd(width)] : [];
+  const reservedRows = peekLines.length + sidechatHeading.length + 1;
   const coreLines = formatCoreSidetabLines(rows, selected, width, Math.max(0, height - reservedRows), mode);
   // The core formatter reserves the leading ` › ` token for selection; a
   // session label may itself contain `›`, so searching anywhere in the line
@@ -44,6 +52,6 @@ export function formatSidetabLines(
   if (selectedLine < 0) return coreLines;
 
   const lines = [...coreLines];
-  lines.splice(selectedLine + 1, 0, ' '.repeat(width), ...peekLines);
+  lines.splice(selectedLine + 1, 0, ' '.repeat(width), ...peekLines, ...sidechatHeading);
   return Number.isFinite(height) ? lines.slice(0, Math.max(0, Math.floor(height))) : lines;
 }

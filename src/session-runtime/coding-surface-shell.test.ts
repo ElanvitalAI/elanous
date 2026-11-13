@@ -284,7 +284,11 @@ describe('coding surface — shell 실행 tool 노출', () => {
       expect(agentSpawnEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({ tools: ['ChildRead'], noTools: false }) })]);
       expect(buildChildToolCatalog).toHaveBeenCalledTimes(1);
       expect(spawnOpts?.tools).toEqual(childTools);
-      expect(spawnOpts?.dispatchTool).toBe(childDispatchTool);
+      // #36673 wraps the catalog dispatcher so nested Agent calls route back through
+      // dispatchAgent with parent linkage — the spawn sees the wrapper, not the raw
+      // catalog dispatch. Dispatcher preservation is proven by the forwarding below.
+      expect(spawnOpts?.dispatchTool).toBeDefined();
+      expect(spawnOpts?.dispatchTool).not.toBe(dispatchTool);
       await spawnOpts?.dispatchTool?.('ChildRead', { file_path: 'child.ts' });
       expect(childDispatchTool).toHaveBeenCalledWith('ChildRead', { file_path: 'child.ts' });
       expect(dispatchTool).not.toHaveBeenCalled();
@@ -297,7 +301,11 @@ describe('coding surface — shell 실행 tool 노출', () => {
       }));
       expect(buildChildToolCatalog).toHaveBeenCalledTimes(1);
       expect(spawn.mock.calls[1]?.[0]?.tools).toEqual(hostTools);
-      expect(spawn.mock.calls[1]?.[0]?.dispatchTool).toBe(dispatchTool);
+      // Same #36673 wrapper on the no-catalog fallback — non-Agent calls forward
+      // to the parent dispatcher (the catalog dispatch is never built here).
+      await spawn.mock.calls[1]?.[0]?.dispatchTool?.('Read', { file_path: 'parent.ts' });
+      expect(dispatchTool).toHaveBeenCalledWith('Read', { file_path: 'parent.ts' });
+      expect(buildChildToolCatalog).toHaveBeenCalledTimes(1);
     } finally {
       for (const r of spawn.mock.results) {
         const id = (r.value as { task?: { id?: string } } | undefined)?.task?.id;
@@ -323,6 +331,13 @@ describe('coding surface — shell 실행 tool 노출', () => {
       const inheritedProvider = providerIsExplicit
         ? undefined
         : spyOn(llm, 'resolveDefaultProvider').mockReturnValue(provider);
+      // #36422/#36949: under bun test (NODE_ENV=test) a providerless LLM call
+      // defaults to the fake provider BEFORE any resolution, so the resolveDefaultProvider
+      // spy would never fire. The inherited round pins real-resolution mode to keep
+      // measuring the default-provider path this test exists for; an explicit provider
+      // (round 1) already owns its turn without the override.
+      const savedLlmMode = process.env.ELANOUS_LLM_MODE;
+      if (!providerIsExplicit) process.env.ELANOUS_LLM_MODE = 'real';
       const realSpawn = globalAgentRegistry.spawn.bind(globalAgentRegistry);
       const spawn = spyOn(globalAgentRegistry, 'spawn').mockImplementation(spawnOpts => realSpawn(spawnOpts));
       const parent = new AbortController();
@@ -352,6 +367,8 @@ describe('coding surface — shell 실행 tool 노출', () => {
         expect(globalAgentRegistry.list().filter(task => task.state === 'pending' || task.state === 'running')).toHaveLength(runningBefore);
       } finally {
         parent.abort();
+        if (savedLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+        else process.env.ELANOUS_LLM_MODE = savedLlmMode;
         spawn.mockRestore();
         inheritedProvider?.mockRestore();
         await waitForAbortProbe(

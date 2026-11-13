@@ -54,7 +54,9 @@ test('fake workspace PTYs keep separate drafts and pin terminal input to the sel
   expect(() => prepareWorkspaceInput(state, 'terminal', [{ ...aPty, ptyStartedAt: aPty.ptyStartedAt! + 1 }, bPty])).toThrow('target changed');
   expect(() => bindWorkspacePty(state, { ...aPty, ownerPid: undefined })).toThrow('live PTY');
   expect(() => bindWorkspacePty(state, { ...aPty, ptyStartedAt: undefined })).toThrow('live PTY');
+  expect(() => bindWorkspacePty(state, { ...aPty, currentProcess: true })).toThrow('live PTY');
   expect(() => prepareWorkspaceInput(state, 'terminal', [{ ...aPty, badge: 'exited' }, bPty])).toThrow('target changed');
+  expect(() => prepareWorkspaceInput(state, 'terminal', [{ ...aPty, currentProcess: true }, bPty])).toThrow('target changed');
 });
 
 test('fake sidechat sees full bound terminal transcript and never writes to the PTY', () => {

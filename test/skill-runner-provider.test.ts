@@ -9,7 +9,7 @@
 // led every skill execution down the Grok path, contradicting the
 // user's configured default.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { debug } from '../src/debug/log';
 import { tmpdir } from 'node:os';
@@ -18,6 +18,7 @@ import {
   resolveDefaultProvider, inferProviderFromModel, isModelCompatible,
   PROVIDERS,
 } from '../src/llm';
+import * as codexOwnerMirror from '../src/oauth/codex-owner-mirror';
 import { saveTokens } from '../src/oauth/store';
 import { saveUserConfig, buildUserConfig, resetUserConfig } from '../src/user-config';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir';
@@ -33,6 +34,11 @@ let root: string;
 let cfgPath: string;
 
 beforeEach(() => {
+  // Test routing against fixture credentials, independently of the fake default
+  // and the host's fallback account store. No provider request is made.
+  saved.ELANOUS_LLM_MODE = process.env.ELANOUS_LLM_MODE;
+  process.env.ELANOUS_LLM_MODE = 'real';
+  spyOn(codexOwnerMirror, 'codexAccountReadStorePath').mockImplementation(path => path);
   root = mkdtempSync(join(tmpdir(), 'skill-provider-'));
   setElanousConfigDir(join(root, 'elanous'));
   cfgPath = join(root, 'elanous', 'config.json');
@@ -47,6 +53,7 @@ beforeEach(() => {
   resetUserConfig();
 });
 afterEach(() => {
+  spyOn(codexOwnerMirror, 'codexAccountReadStorePath').mockRestore();
   for (const [k, v] of Object.entries(saved)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;

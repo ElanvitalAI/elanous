@@ -19,7 +19,7 @@ function fitLine(value: string, width: number): string {
   return `${result}…`;
 }
 
-/** Return up to three recent plain-text output lines for the selected sidebar row. */
+/** Return a bounded plain-text tail for the selected sidebar row. */
 export function formatSidetabPeekLines(
   source: string,
   width: number,
@@ -45,7 +45,7 @@ export function formatSidetabPeekLines(
   const recent = clean.split('\n')
     .map((line) => line.trimEnd())
     .filter((line) => line.trim().length > 0)
-    .slice(-Math.min(3, Math.floor(maxLines)));
+    .slice(-Math.min(6, Math.floor(maxLines)));
   const prefix = '   ↳ ';
   const textWidth = Math.max(1, width - Bun.stringWidth(prefix));
   return recent.map((line) => `${prefix}${fitLine(line, textWidth)}`);

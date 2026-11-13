@@ -4,7 +4,49 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { lastJsonObject } from '../../src/graph-runner/runner.js';
 import { debug } from '../../src/debug/log.js';
-import { cutoffNotesEmpty, emitNodeResult, finishNode, latestGateOutput, readGraphContext, runNodeVerdict } from './node-verdict.js';
+import { cutoffNotesEmpty, emitNodeResult, finishNode, latestGateOutput, readGraphContext, runNodeVerdict, signedT6KnownIssueGatePassed, type GraphContext } from './node-verdict.js';
+
+const t6Cut = '7d951adb3163ba16a784d5b937d12732ef9be625';
+const t6Run = '636f9e96-0aae-4cb0-babd-b509c44e2f34';
+const signedT6Context = (): GraphContext => ({ graphId: 'release-loop', nodeId: 'pwa', runId: t6Run,
+  input: { version: '0.3.15', previousVersion: '0.3.14' }, outputs: {
+    'version-release': { outcome: 'ok', commit: t6Cut },
+    gate: { outcome: 'error', commit: t6Cut, introduced: [],
+      error: 'Error: remote gate refused: HQ shard result batch is incomplete (pod-68)' },
+    'gate-heal-decision': { outcome: 'waived-known-issue', graphId: 'release-loop', runId: t6Run,
+      nodeId: 'gate-heal-decision', decidedBy: 'OP', decidedAt: '2026-11-13T03:50:00.000Z' },
+    'traffic-gate-passed': { outcome: 'ok' },
+  } });
+
+test('T6 PWA accepts only its same-run OP waiver after traffic-gate-passed', async () => {
+  const context = signedT6Context();
+  const run = async (value: typeof context) => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (line: string) => { lines.push(line); };
+    try {
+      const code = await runNodeVerdict(['pwa'], { ELANOUS_GRAPH_CONTEXT: JSON.stringify(value) }, () =>
+        ({ status: 0, stdout: '{"verdict":"pass"}\n', stderr: '' }));
+      return { code, output: lastJsonObject(lines.join('\n')) };
+    } finally { console.log = original; }
+  };
+  expect(signedT6KnownIssueGatePassed(context)).toBe(true);
+  expect((await run(context)).code).toBe(0);
+  const child = { ...structuredClone(context), runId: 'pwa-child-run', parentRunId: t6Run };
+  expect(signedT6KnownIssueGatePassed(child)).toBe(true);
+  expect((await run(child)).code).toBe(0);
+  for (const change of [
+    (value: typeof context) => { value.outputs['gate-heal-decision'].decidedBy = 'other'; },
+    (value: typeof context) => { value.outputs['traffic-gate-passed'].outcome = 'fail'; },
+    (value: typeof context) => { value.outputs.gate.introduced = ['new failure']; },
+    (value: typeof context) => { value.runId = 'another-run'; },
+  ]) {
+    const invalid = structuredClone(context);
+    change(invalid);
+    expect(signedT6KnownIssueGatePassed(invalid)).toBe(false);
+    expect((await run(invalid)).output?.summary).toBe('gate did not pass');
+  }
+});
 
 test('emitted last line is read unchanged by graph runner', () => {
   const lines: string[] = [];

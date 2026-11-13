@@ -1,0 +1,14 @@
+graph_id: demo1114-s2-pwa-fake
+version: 1
+entry_node: scrap
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: scrap, kind: agent, recipe: 'cmd:scrap', max_visits: 1 }
+  - { node_id: extract, kind: agent, recipe: 'cmd:extract', max_visits: 1 }
+  - { node_id: brief, kind: agent, recipe: 'cmd:brief', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: scrap, on: outcome, map: { ok: extract, fail: failed } }
+  - { from: extract, on: outcome, map: { ok: brief, fail: failed } }
+  - { from: brief, on: outcome, map: { ok: done, fail: failed } }

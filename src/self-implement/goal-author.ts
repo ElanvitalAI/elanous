@@ -7257,7 +7257,9 @@ async function authorGoalWithSupersededRootIntent(
     '## REQUIRED EVIDENCE',
     ...requiredEvidence(criteria, facts ? implementationCandidates(facts) : [], authorRunId, deps.repositoryRoot),
     '',
-    ...(goalType === 'implement' ? ['## TRACED PATHS', ...tracedPathsForDocument, ''] : []),
+    ...(goalType === 'implement' ? [
+      '## TRACED PATHS', ...tracedPathsForDocument, '',
+    ] : []),
     '## SCOPE BOUNDARY',
     ...scopeBoundarySection,
     '',

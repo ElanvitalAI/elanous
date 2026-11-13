@@ -68,7 +68,7 @@ While #36517 and #36524 are pending, `bun scripts/gcp-architect-expand/demo/run-
 
 ## Scene 4 JSON → scene 5 input seam
 
-Scene 4의 실제 설계 JSON이 정본 입력이다. GCP `proposal.json`은 출력이며 입력으로 다시 넣으면 어댑터가 거부한다. run `4d4eed28` 원문과 SHA를 확보하면 합성 fixture를 그 구조로 교체한다.
+Scene 4의 구조화 설계 JSON이 정본 입력이다. GCP `proposal.json`은 출력이며 입력으로 다시 넣으면 어댑터가 거부한다. R-TICKET run `4d4eed28`의 구조화 설계 원문은 `fixtures/scene4-structured-design.json`에 보존하고, SHA-256 `e469fcc57951d5cb0bf9451776ca6036a3a8ed3881f5d15c042ca613606c8b41`로 고정했다. 이는 실제 Scene 4 출력이지만 live Scene 2/3 acceptance 기록은 아니다.
 
 The route's `ticketDesignPath` can point to the **actual structured #36522 design result JSON**: either a top-level `ticketDesign` object or a Graph run state whose `design` node output contains `result.ticketDesign`. `demo/design-result.ts` validates every field needed for a safe non-PII retryable batch proposal. It preserves a supplied session ID and Graph run ID in the normalized proposal; ambiguous booleans, missing classification, prose-only output, and invalid usage fail closed. `demo/run.py --design-result <JSON>` invokes the same adapter and writes `ticketing-design.normalized.json`, `proposal.json`, `demo-result.json`, diagram, PNG and PDF. `inputSha256` hashes the **original JSON bytes**, so the scene 4→5 link is auditable.
 

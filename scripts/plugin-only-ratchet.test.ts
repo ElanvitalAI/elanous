@@ -3,9 +3,22 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkPluginOnlyRatchet, compareInventory, declaredPluginHandlers, inventoryFromTree, PLUGIN_ONLY_BASELINE, regenerateBaseline } from './plugin-only-ratchet.js';
+import { checkPluginOnlyRatchet, compareInventory, declaredPluginHandlers, declaredPluginEntrypoints, inventoryFromTree, PLUGIN_ONLY_BASELINE, regenerateBaseline } from './plugin-only-ratchet.js';
 
 describe('PLUGIN-ONLY-RATCHET', () => {
+  test('permits a JSON route main only with an owning packaged skill', () => {
+    const root = mkdtempSync(join(tmpdir(), 'plugin-entry-declaration-'));
+    try {
+      mkdirSync(join(root, 'plugins/app/skills/app'), { recursive: true });
+      writeFileSync(join(root, 'plugins/app/plugin.ts'), 'export default {}');
+      writeFileSync(join(root, 'plugins/app/skills/app/SKILL.md'), '# App');
+      const manifest = { id: 'app', main: './plugin.ts', activationEvents: ['onRoute'], contributes: { skills: [{ id: 'app', path: './skills/app/SKILL.md' }] } };
+      writeFileSync(join(root, 'plugins/app/plugin.json'), JSON.stringify(manifest));
+      expect([...declaredPluginEntrypoints(root)]).toEqual(['plugins/app/plugin.ts']);
+      writeFileSync(join(root, 'plugins/app/plugin.json'), JSON.stringify({ ...manifest, contributes: { skills: [] } }));
+      expect([...declaredPluginEntrypoints(root)]).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test('permits only a manifest-declared handler with an owning skill', () => {
     const root = mkdtempSync(join(tmpdir(), 'plugin-handler-declaration-'));
     try {

@@ -10,6 +10,7 @@ import { getUserConfig } from '../user-config/reader.js';
 import { parsePodPool, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { activeResourceLeases, parseResourceLedgerEvents, readResourceLedger, reconcileResourceLeases, reassignResourcePools, resourceLedgerPath, resourceMatrix,
   RESOURCE_LANES, type ResourceLane, type ResourceMeasurement } from '../resource-ledger/resource-ledger.js';
+import { resourceUtilizationView } from '../resource-ledger/resource-utilization.js';
 
 export interface ResourceCommandRunner { (command: string, args: string[], host?: string): { status: number | null; stdout: string; stderr: string } }
 export interface ResourceLedgerCliDeps {
@@ -204,7 +205,21 @@ export function buildResourceLedgerSnapshot(deps: Required<Pick<ResourceLedgerCl
     .filter(row => !filters.lane || row.lane === filters.lane);
   const findings = [...reconcileResourceLeases({ leases: selectedLeases, measurements: scopedMeasurements, now: deps.now() }),
     ...remoteLedgerErrors.map(error => ({ kind: 'measurement-unavailable' as const, host: error.host, id: `${error.host}:resource-ledger`, detail: error.detail, action: 'report-only' as const }))];
-  return { ledgerPath: resourceLedgerPath(), observedAt: deps.now().toISOString(), readStatus: 'ok' as const, matrix, leases: selectedLeases, recentReclaims, measurements: selectedMeasurements, findings };
+  // Host totals and idle decisions always include every lane/mission consumer.
+  // Filtering the displayed lease rows must not make an occupied host look idle.
+  const fullUtilization = resourceUtilizationView({ hosts, events, now: deps.now() });
+  const complete = remoteLedgerErrors.length === 0;
+  const utilization = {
+    observedAt: fullUtilization.observedAt,
+    readStatus: complete ? 'ok' as const : 'partial' as const,
+    lanes: fullUtilization.lanes.filter(row => (!filters.host || row.host === filters.host) && (!filters.lane || row.lane === filters.lane))
+      .map(row => complete ? row : { ...row, utilizationRatio: null }),
+    hosts: fullUtilization.hosts.filter(row => !filters.host || row.host === filters.host)
+      .map(row => complete ? row : { ...row, utilizationRatio: null, idle: row.leases > 0 ? false : null }),
+    // A missing source can contain other hosts' leases; partial data cannot prove idleness.
+    idleHosts: complete ? fullUtilization.idleHosts.filter(host => !filters.host || host === filters.host) : [],
+  };
+  return { ledgerPath: resourceLedgerPath(), observedAt: deps.now().toISOString(), readStatus: 'ok' as const, matrix, leases: selectedLeases, recentReclaims, measurements: selectedMeasurements, findings, utilization };
 }
 
 export async function postResourcePoolDeclaration(pool: MachinePoolDeclaration, options: {
@@ -290,8 +305,21 @@ export function registerResourceLedgerCommands(resources: Command, overrides: Re
         const result = buildResourceLedgerSnapshot(deps, { host: opts.host, lane: opts.lane as ResourceLane | undefined, mission: opts.mission });
         if (opts.json) console.log(JSON.stringify(result));
         else {
-          console.log('호스트\t차선\t용량\t임대\t임대 CPU/메모리(B)\tPod 요청 CPU/메모리(B)\tPod 수\tFP 연계 프로세스\t미귀속 프로세스(unknown)\t임대−Pod');
-          for (const row of result.matrix) console.log(`${row.host}\t${row.lane}\t${row.capacity ?? 'unknown'}\t${row.leases}\t${row.leasedCpu}/${row.leasedMemoryBytes}\t${row.observedPodCpuRequests ?? 'unknown'}/${row.observedPodMemoryRequestsBytes ?? 'unknown'}\t${row.measuredPods ?? 'unknown'}\t${row.measuredProcesses ?? 'unknown'}\t${row.unknownProcesses ?? 'unknown'}\t${row.deltaLeasesVsPods ?? 'unknown'}`);
+          console.log('호스트\t차선\t용량\t임대\t임대 CPU/메모리(B)\tPod 요청 CPU/메모리(B)\tPod 수\tFP 연계 프로세스\t미귀속 프로세스(unknown)\t임대−Pod\t차선 활용률(전체 임대/용량)');
+          for (const row of result.matrix) {
+            const utilization = result.utilization.lanes.find(lane => lane.host === row.host && lane.lane === row.lane);
+            console.log(`${row.host}\t${row.lane}\t${row.capacity ?? 'unknown'}\t${row.leases}\t${row.leasedCpu}/${row.leasedMemoryBytes}\t${row.observedPodCpuRequests ?? 'unknown'}/${row.observedPodMemoryRequestsBytes ?? 'unknown'}\t${row.measuredPods ?? 'unknown'}\t${row.measuredProcesses ?? 'unknown'}\t${row.unknownProcesses ?? 'unknown'}\t${row.deltaLeasesVsPods ?? 'unknown'}\t${utilization?.utilizationRatio ?? 'unknown'}`);
+          }
+          for (const host of result.utilization.hosts) console.log(`호스트 활용\t${host.host}\t${host.leases}/${host.capacity ?? 'unknown'}\t${host.utilizationRatio ?? 'unknown'}\tL15%=${host.load15Percent ?? 'unknown'}\tidle=${host.idle ?? 'unknown'}`);
+          const idleUnknownHosts = result.utilization.hosts.filter(host => host.idle === null).map(host => host.host);
+          const confirmedIdle = result.utilization.idleHosts.length > 0
+            ? result.utilization.idleHosts.join(',') : '확인된 유휴 없음';
+          const idleSummary = result.utilization.readStatus === 'partial'
+            ? 'unknown (원장 일부 미측정)'
+            : idleUnknownHosts.length > 0
+              ? `${confirmedIdle} · 유휴 여부 미측정: ${idleUnknownHosts.join(',')}`
+              : result.utilization.idleHosts.length > 0 ? confirmedIdle : '없음';
+          console.log(`유휴 호스트\t${idleSummary}`);
           for (const finding of result.findings) console.log(`사건\t${finding.kind}\t${finding.host}\t${finding.id}\t${finding.detail}`);
         }
       } catch (error) { console.error(`resource ledger unavailable: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }

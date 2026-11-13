@@ -1,0 +1,9 @@
+world: chaos-hq-move
+seed: 1113
+devices: [fake-clock, fake-ps]
+events:
+  - { at: "+0s", id: chaos-hq-move }
+steps:
+  - inject: { id: chaos-hq-move, approveKong: true }
+  - observe: chaos-hq-move
+expect: { scenarios: 9, lostTasks: 0 }

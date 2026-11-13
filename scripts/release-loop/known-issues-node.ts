@@ -4,7 +4,7 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { lastJsonObject } from '../../src/graph-runner/runner-primitives.js';
 import type { GraphRunState } from '../../src/graph-runner/runner-types.js';
 import { join } from 'node:path';
-import { emitNodeResult, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
+import { emitNodeResult, readGraphContext, runCommand, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
 
 const FALLBACK = 'Known issues have been reported for this release.';
 const APPROVED_0233_INPUT = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8')) as Issue[];
@@ -113,6 +113,14 @@ function recordedWaivers(context: GraphContext, accepted: Issue[]): Issue[] {
   return accepted.flatMap((issue) => {
     if (!issue.id.startsWith('waive:')) return [];
     const node = issue.id.slice('waive:'.length);
+    if (node === 'pwa') {
+      const branch = state.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa;
+      const joinIndex = state.path.indexOf('pre-prepare-join');
+      return branch?.status === 'failed' && branch.waiver?.verdict === 'waived' &&
+        branch.waiver.decidedBy === 'OP' && branch.waiver.reason === issue.note &&
+        joinIndex >= 0 && joinIndex < visit - 1 && signedT6PwaKnownIssue(context)
+        ? [{ ...issue, approvedBy: 'OP' }] : [];
+    }
     const index = state.path.indexOf(node);
     const record = state.nodes[index];
     const waiver = record?.waiver;

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildUserConfig, saveUserConfig } from './user-config.js';
 import { getProviderForConfig, sanitizeToolSchemaForKimi } from './llm.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import { isOpenRouterGrokModel, sanitizeToolSchemaForGrok } from './llm-tool-schema.js';
 import type { UserConfig } from './user-config/types.js';
 
@@ -32,7 +32,7 @@ async function captureRequest(provider: string, model: string, preferences?: Rec
     bodies.push(JSON.parse(request.body ?? 'null'));
     return new Response('data: [DONE]\n\n', { status: 200 });
   };
-  await withFakeFetchDevice([
+  await withRealProviderFakeFetchDevice([
     { url, method: 'POST', response: respond },
   ], async () => {
     // Give Grok an explicit fake gateway so a host subscription cannot replace
@@ -65,7 +65,7 @@ test('user config preserves object-shaped OpenRouter provider preferences', asyn
     saveUserConfig(loaded, savedPath);
     expect(buildUserConfig(savedPath).llm.openrouter?.providerPreferences).toEqual({ order: ['z-ai'] });
     const bodies: any[] = [];
-    await withFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: (request) => {
+    await withRealProviderFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: (request) => {
       bodies.push(JSON.parse(request.body ?? 'null'));
       return new Response('data: [DONE]\n\n', { status: 200 });
     } }], async () => {
@@ -190,7 +190,7 @@ test('OpenRouter upstream Provider returned error retries and labels debug.log o
   const urls: string[] = [];
   let calls = 0;
   try {
-    await withFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: (request) => {
+    await withRealProviderFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: (request) => {
       urls.push(request.url);
       calls++;
       return calls === 1
@@ -215,7 +215,7 @@ test('non-OpenRouter upstream error body retains its generic 400 retry policy an
   });
   let calls = 0;
   try {
-    await withFakeFetchDevice([{ url: 'https://api.openai.com/v1/chat/completions', method: 'POST', response: () => {
+    await withRealProviderFakeFetchDevice([{ url: 'https://api.openai.com/v1/chat/completions', method: 'POST', response: () => {
       calls++;
       return new Response('{"error":"Provider returned error"}', { status: 400 });
     } }], async () => {
@@ -241,7 +241,7 @@ test('OpenRouter upstream error body retries as overloaded even when the HTTP st
   });
   let calls = 0;
   try {
-    await withFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: () => {
+    await withRealProviderFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: () => {
       calls++;
       return calls === 1
         ? new Response('{"error":"Provider returned error"}', { status: 400 })

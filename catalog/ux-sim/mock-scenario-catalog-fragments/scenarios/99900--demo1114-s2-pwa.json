@@ -1,0 +1,11 @@
+{
+  "id": "DEMO1114-S2-PWA",
+  "name": "Same-run Scene 2 PWA fake briefing and extractor-denied counterexample",
+  "kind": "catalog-world-runGraph-pwa-projection",
+  "device": "fake-absorb-ingest",
+  "implementation": ["src/ux-sim/fake-absorb-ingest.ts", "scenarios/ux-sim/demo1114-s2-pwa-graph.yaml", "scripts/demo1114-s2-pwa-receipt.ts"],
+  "tests": ["src/ux-sim/scene2-pwa-world.test.ts", "apps/pwa/src/components/member-board/MemberBriefingScene2.test.tsx"],
+  "trigger": "bun scripts/demo1114-s2-pwa-receipt.ts <evidence-root>",
+  "observe": ["A current catalog-owned demo1114-s2-pwa world executes production runGraph", "One runId links scrap and briefing IDs to the fake PWA consumer", "Extractor failure prevents briefing execution and PWA card", "Same-root snapshot membership drift is refused"],
+  "expected": "Positive fixture completes and extraction-denied fixture fails before briefing; fake API projection only, installed LIVE remains yellow."
+}

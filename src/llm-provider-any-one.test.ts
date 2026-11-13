@@ -13,7 +13,7 @@ import { podChildLlmArgs, podNamedChildProvider, podSelfImplementSpawn } from '.
 import { runResearchQuestionLadder } from './auto-research/research-turn.js';
 import { routeResearchOutput } from './research/output-router.js';
 import { getUserConfig } from './user-config.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import { bootDashboardAcpSession } from './dashboard/acp-boot.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from './elanous-config-dir.js';
 
@@ -59,7 +59,7 @@ async function withOpenAICompatibleServer(
       status: 200, headers: { 'content-type': 'text/event-stream' },
     });
   }
-  await withFakeFetchDevice([
+  await withRealProviderFakeFetchDevice([
     { url: '/api/v1/chat/completions', method: 'POST', response: makeResponse },
     { url: '/api/coding/paas/v4/chat/completions', method: 'POST', response: makeResponse },
   ], async (device) => {

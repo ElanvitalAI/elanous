@@ -1,0 +1,10 @@
+world: chaos-hq-move
+seed: 1113
+clock: { start: "2026-11-13T09:00:00Z", speed: 60 }
+devices: [fake-clock, fake-ps]
+hosts:
+  - { name: mshq, arch: arm64, cpu: 14, pools: [hq], egress: false }
+  - { name: node-b, arch: arm64, cpu: 32, pools: [hq], egress: false }
+  - { name: aws1, arch: amd64, cpu: 8, pools: [hq], egress: false }
+events:
+  - { at: "+0s", id: chaos-hq-move }

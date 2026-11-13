@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectRecipesAgainstCatalog, loadNodeCatalog } from './graph-catalog.js';
+import { HARNESS_CORE_KINDS } from '../graph-kinds/registry.js';
 import { parseGraphTemplateYaml, type GraphTemplateSpec } from './graph-yaml.js';
 
 const catalog = loadNodeCatalog();
@@ -23,7 +24,8 @@ edges: []
 
 describe('node catalog declaration inspection', () => {
   test('default catalog loads role details and all active kinds', () => {
-    expect(catalog.kinds).toEqual(['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'prompt', 'subgraph', 'classify']);
+    // Source: graph-yaml.ts accepts the core registry kinds; catalog #36239 also declares capability.
+    expect([...catalog.kinds].sort()).toEqual([...HARNESS_CORE_KINDS].sort());
     expect(catalog.roles.get('observe-logs')).toEqual({
       kind: 'observe', outcomes: ['ok', 'empty'], spawn: 'runtime', grain: 'atom', effects: 'none',
     });

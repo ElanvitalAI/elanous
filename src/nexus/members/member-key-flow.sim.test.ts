@@ -140,7 +140,8 @@ test('fake signup exchanges a one-time member key for a scoped token and revokes
     expect(listed.status).toBe(200);
     const listedText = await listed.text();
     expect(listedText).not.toContain(rotated.key);
-    expect(JSON.parse(listedText).keys).toMatchObject([{ id: rotated.id, name: 'second' }]);
+    expect(JSON.parse(listedText).keys).toMatchObject([{ id: rotated.id, name: 'second',
+      rotateUrl: `/v1/member/keys/${rotated.id}/rotate`, revokeUrl: `/v1/member/keys/${rotated.id}` }]);
     const wal = `${path}-wal`;
     for (const file of [path, ...(existsSync(wal) ? [wal] : [])]) {
       const stored = readFileSync(file);

@@ -1,5 +1,51 @@
 import { expect, test } from 'bun:test';
-import { formatNextTuiStatusLine, nextTuiStatusLine } from './status-line.js';
+import { formatNextTuiStatusLine, nextTuiElapsedMs, nextTuiStatusLine } from './status-line.js';
+
+test('shown turn duration never decreases across timer redraws and settlement', () => {
+  expect(nextTuiElapsedMs(100, 460, 250)).toBe(360);
+  expect(nextTuiElapsedMs(100, 420, 360)).toBe(360);
+  expect(nextTuiElapsedMs(100, 80, 360)).toBe(360);
+});
+
+test('turn status shows elapsed time and provider-measured input/output tokens at normal and narrow widths', () => {
+  const input = { turnState: '응답 중 · Esc 취소', model: 'provider/model-x', queued: 0, backgroundTasks: 0,
+    elapsedMs: 1450, measuredUsage: { inputTokens: 14, outputTokens: 6 } };
+  const wide = formatNextTuiStatusLine({ ...input, width: 100 });
+  expect(wide).toContain('경과 1.4초 · 토큰 14/6');
+  const narrow = formatNextTuiStatusLine({ ...input, width: 40 });
+  expect(narrow).toContain('1.4초');
+  expect(narrow).toContain('14/6t');
+  expect(Bun.stringWidth(narrow)).toBeLessThanOrEqual(40); // Source: #37098 CORE21 row 11 narrow Next PTY uses 40 columns.
+  const unavailable = formatNextTuiStatusLine({ ...input, measuredUsage: undefined, width: 100 });
+  expect(unavailable).toContain('토큰 ?/?');
+  const compact = nextTuiStatusLine({ state: '응답 중', queued: 0, activeChildren: 0,
+    columns: 40, elapsedMs: 1450, measuredUsage: { inputTokens: 14, outputTokens: 6 } });
+  expect(compact).toContain('1.4초 · 14/6t');
+  expect(formatNextTuiStatusLine({ ...input, turnState: '응답 완료', width: 44 })).toContain('턴 완료');
+});
+
+test('40-column status keeps exact provider counts at the seven-digit boundary', () => {
+  const line = formatNextTuiStatusLine({
+    turnState: '응답 완료', model: 'provider/a-long-model-name', queued: 0, backgroundTasks: 0,
+    width: 40, elapsedMs: 1450, measuredUsage: { inputTokens: 1_234_567, outputTokens: 7_654_321 },
+  });
+  expect(Bun.stringWidth(line)).toBeLessThanOrEqual(40); // Source: #37098 CORE21 row 11 requires an exact measured pair at 40 columns.
+  expect(line).toContain('1234567/7654321t');
+  expect(line).toContain('완료');
+  expect(line).toContain('Q0');
+  expect(line).toContain('B0');
+});
+
+test('40-column status keeps exact max-safe provider counts before optional counters', () => {
+  const line = formatNextTuiStatusLine({
+    turnState: '응답 완료', model: 'provider/a-long-model-name', queued: 0, backgroundTasks: 0,
+    width: 40, elapsedMs: Number.MAX_SAFE_INTEGER,
+    measuredUsage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: Number.MAX_SAFE_INTEGER },
+  });
+  expect(Bun.stringWidth(line)).toBeLessThanOrEqual(40); // Source: #37098 B3 row 11 measured status at 40 columns.
+  expect(line).toContain('9007199254740991/9007199254740991t');
+  expect(line).toContain('~9e12s');
+});
 
 test('status line keeps turn, model, queue and background task counts together', () => {
   const line = formatNextTuiStatusLine({

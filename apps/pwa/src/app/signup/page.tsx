@@ -47,7 +47,8 @@ export default function MemberSignupPage() {
     {intent?.eventCode === KCB_EVENT_CODE && <p className="text-sm text-muted-foreground">KCB 행사 체험</p>}
     <h1 className="text-3xl font-semibold">{intent?.eventCode === KCB_EVENT_CODE ? 'QR로 시작해 바로 해 보기' : 'Elanous 회원 가입'}</h1>
     <p>Google 계정으로 가입합니다. 초대 링크로 오셨다면 추천 관계가 가입 시 기록됩니다.</p>
-    {intent?.referralCode && <p className="rounded border border-border bg-card p-3 text-sm">초대 코드가 적용됩니다.</p>}
+    {intent?.ref && <p className="rounded border border-border bg-card p-3 text-sm">회원 ID {intent.ref}의 추천 링크가 적용됩니다.</p>}
+    {intent?.referralCode && <p className="rounded border border-border bg-card p-3 text-sm">기존 초대 링크가 적용됩니다.</p>}
     {intent?.eventCode === KCB_EVENT_CODE ? <label className="flex flex-col gap-2 text-sm">행사 코드
       <input value={intent.eventCode} readOnly className="rounded-md border bg-muted px-3 py-2" aria-label="행사 코드" />
     </label> : intent?.eventCode && <p className="rounded border border-border bg-card p-3 text-sm">행사 코드 {intent.eventCode}가 적용됩니다.</p>}

@@ -33,7 +33,7 @@ test('Telegram saved link schedules one immediate absorption; same canonical URL
   const url = telegramAbsorbUrls(input, decision)[0]!;
   const first = await scheduleIntakeEvent(dir, url, { now, post });
   const second = await scheduleIntakeEvent(dir, 'https://example.org/post?a=1&b=2', { now, post });
-  expect(first.status).toBe('scheduled');
+  expect(first).toMatchObject({ status: 'scheduled', reply: '접수했습니다. 작업 ID: task-1' });
   expect(second.status).toBe('duplicate');
   expect(posted).toEqual(['https://example.org/post?a=1&b=2']);
   expect(loadIntakeLedger(dir).items.size).toBe(1);
@@ -105,6 +105,26 @@ test('failed task post releases the claim so the same URL can be retried or pick
   await expect(scheduleIntakeEvent(dir, url, { now, post: async () => { throw new Error('unavailable'); } })).rejects.toThrow('unavailable');
   expect(pickAbsorbQueue(dir, { max: 10, dryRun: true }, '2026-10-05T22:00:00.000Z').map((item) => item.url)).toEqual([url]);
   expect((await scheduleIntakeEvent(dir, url, { now, post: async () => ({ taskId: 'retry' }) })).status).toBe('scheduled');
+});
+
+test('a competing claim replacement during task post cannot produce an intake receipt', async () => {
+  const dir = root();
+  const url = 'https://example.org/raced';
+  const result = await scheduleIntakeEvent(dir, url, { now, post: async () => {
+    const competing = new Database(join(dir, 'intake', 'events.sqlite'));
+    try {
+      expect(competing.query("UPDATE intake_events SET claimed_at = ? WHERE url = ? AND status = 'pending'")
+        .run('2026-10-05T22:15:00.000Z', url).changes).toBe(1);
+    } finally { competing.close(); }
+    return { taskId: 'task-stale' };
+  } });
+  expect(result).toEqual({ status: 'duplicate', url, reason: 'claim-lost' });
+  const db = new Database(join(dir, 'intake', 'events.sqlite'));
+  try {
+    expect(db.query('SELECT status, task_id, claimed_at FROM intake_events WHERE url = ?').get(url)).toEqual({
+      status: 'pending', task_id: null, claimed_at: '2026-10-05T22:15:00.000Z',
+    });
+  } finally { db.close(); }
 });
 
 test('crashed pending post expires into the daily queue without excluding the URL forever', async () => {

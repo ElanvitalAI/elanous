@@ -10,10 +10,55 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { inspectCodexRotation, resolveCodexAccountForRun, _setCodexAccountOutboundSenderForTesting } from './codex-account-store.js';
 import { saveTokens } from './store.js';
 import { debug } from '../debug/log.js';
+
+const BALANCED_CHOICES_REQUIRED = 3; // Source: both eligible accounts must receive three choices across ten deterministic runs (rotation distribution fixture).
+// Source: the credit-pace fixture keeps usage below its test threshold before exhaustion.
+const CREDIT_PACE_USED_PERCENT = 90;
+const CREDIT_PACE_THRESHOLD_PERCENT = 95;
+
+test('new run balances healthy accounts by remaining capacity and keeps the run choice stable', () => {
+  const current = { name: 'first', storeKey: 'openai-codex', home: '/h/first', source: 'default' } as const;
+  const candidates = [
+    { name: 'first', storeKey: 'openai-codex', home: '/h/first', reached: false, usedPercent: 19 },
+    { name: 'busy', storeKey: 'openai-codex:busy', home: '/h/busy', reached: false, usedPercent: 92 },
+    { name: 'other', storeKey: 'openai-codex:other', home: '/h/other', reached: false, usedPercent: 33 },
+  ];
+  const input = { current, explicit: false, enabled: true, currentReached: false, currentUsedPercent: 19,
+    resetCreditAvailability: 'unavailable' as const, candidates };
+  const chosen = Array.from({ length: 10 }, (_, index) => {
+    const decision = decideCodexRotation({ ...input, balanceKey: `run-${index}` });
+    return decision.to?.name ?? current.name;
+  });
+  expect(chosen.filter((name) => name === 'busy')).toHaveLength(0);
+  expect(chosen.filter((name) => name === 'first').length).toBeGreaterThanOrEqual(BALANCED_CHOICES_REQUIRED);
+  expect(chosen.filter((name) => name === 'other').length).toBeGreaterThanOrEqual(BALANCED_CHOICES_REQUIRED);
+  expect(decideCodexRotation({ ...input, balanceKey: 'run-4' }).to?.name ?? current.name).toBe(chosen[4]);
+});
+
+test('run id keeps ordinal selection when usage is unknown and still skips an unhealthy account', () => {
+  const current = { name: 'default', storeKey: 'openai-codex', home: '/h/default', source: 'default' } as const;
+  const team = { name: 'team', storeKey: 'openai-codex:team', home: '/h/team', reached: undefined };
+  const third = { name: 'third', storeKey: 'openai-codex:third', home: '/h/third', reached: undefined };
+  const input = {
+    current, explicit: false, enabled: true,
+    currentReached: undefined, currentUsedPercent: undefined,
+    resetCreditAvailability: 'unavailable' as const,
+    candidates: [team, third],
+    balanceKey: 'run-mirror-unknown-usage',
+  };
+  expect(decideCodexRotation(input)).toMatchObject({ reason: 'rotated', to: { name: 'team' } });
+  expect(decideCodexRotation({
+    ...input,
+    candidates: [{ ...team, unhealthy: true }, third],
+  })).toMatchObject({ reason: 'rotated', to: { name: 'third' } });
+});
+
 describe('일별 선불 크레딧 페이스', () => {
   const current = { name: 'third', storeKey: 'k-third', home: '/h/third', source: 'default' } as const;
   const team = { name: 'team', storeKey: 'k-team', home: '/h/team', reached: true, usedPercent: 100, creditBalance: 65_833, hasCredits: true };
-  const base = { current, explicit: false, enabled: true, currentReached: false, currentUsedPercent: 90, resetCreditAvailability: 'unavailable', candidates: [team] } as const;
+  const base = { current, explicit: false, enabled: true, currentReached: false,
+    currentUsedPercent: CREDIT_PACE_USED_PERCENT, thresholdPercent: CREDIT_PACE_THRESHOLD_PERCENT,
+    resetCreditAvailability: 'unavailable', candidates: [team] } as const;
   // CODEX-ORDER(10-09): 구독 → 리셋권 → 크레딧. 페이스는 «구독 남은 계정도 리셋권도 없을 때»만 본다.
   const exhausted = { ...base, currentReached: true, currentUsedPercent: 100 } as const;
   test('찬 team 구독의 크레딧을 미달 몫만큼 먼저 쓰고, 몫이 차면 기존 판정으로 돌아간다', () => {

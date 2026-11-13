@@ -125,10 +125,16 @@ edges:
   test('release-loop readiness groups are derived from node needs, not edge branch lists', () => {
     const parsed = parseGraphTemplateYaml(readFileSync(join(GRAPHS_DIR, 'release/release-loop.yaml'), 'utf8'));
     expect(parsed.errors).toEqual([]);
+    // Snapshot of the real release graph's fan-outs. #36347 added regression-suite
+    // (needs: [cutoff]) to the derived pre-gate group, and #36691 declares the
+    // post-gate fan-out explicitly on the edge — ok-only, mac-smoke warning-only —
+    // instead of deriving ok/fail/error readiness groups from node needs. The
+    // derivation contract itself stays pinned by the needs-fanout test above and
+    // by the still-derived traffic-npm-published entry below.
     expect(parsed.template?.edges.filter((edge) => edge.branches).map((edge) => ({ from: edge.from, branches: edge.branches, join: edge.join })))
       .toEqual([
-        { from: 'cutoff', branches: { ok: ['checklist-gate', 'prefetch'] }, join: 'pre-gate-join' },
-        { from: 'traffic-gate-passed', branches: { ok: ['export-check', 'mac-smoke', 'pwa'], fail: ['export-check', 'mac-smoke', 'pwa'], error: ['export-check', 'mac-smoke', 'pwa'] }, join: 'pre-prepare-join' },
+        { from: 'cutoff', branches: { ok: ['checklist-gate', 'regression-suite', 'prefetch'] }, join: 'pre-gate-join' },
+        { from: 'traffic-gate-passed', branches: { ok: ['export-check', 'pwa', 'mac-smoke'] }, join: 'pre-prepare-join' },
         { from: 'traffic-npm-published', branches: { ok: ['docs-land', 'version-dev-bump'], fail: ['docs-land', 'version-dev-bump'], error: ['docs-land', 'version-dev-bump'] }, join: 'release-post-publish-join' },
       ]);
   });

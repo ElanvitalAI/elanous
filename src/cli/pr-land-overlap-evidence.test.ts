@@ -864,6 +864,33 @@ describe('explicit review attempt selection', () => {
 
 describe('official OP review waiver fixtures', () => {
   const fixtureDir = join(import.meta.dir, 'fixtures/review-loop-breaker');
+  const runPlainZeroFinding = (options: { failed?: boolean; priorFailed?: boolean; priorFailedNoFindings?: boolean; mutate?: (record: Record<string, unknown>) => void } = {}) => {
+    const pr = 37150;
+    const head = 'c'.repeat(40);
+    const selected = `opwaiver-${pr}-${head.slice(0, 12)}.json`;
+    const failed = `card-${pr}-${head.slice(0, 12)}.json`;
+    const priorHead = 'b'.repeat(40);
+    const priorFailed = `card-${pr}-${priorHead.slice(0, 12)}.json`;
+    const selectedPath = `${STD_DIR}/${selected}`;
+    const failedPath = `${STD_DIR}/${failed}`;
+    const priorFailedPath = `${STD_DIR}/${priorFailed}`;
+    const record: Record<string, unknown> = { pr, headCommit: head, reviewed: true, verdict: 'pass', mustFix: [],
+      reviewer: 'OP-waiver', model: 'none', waiver: { by: 'OP', approvedBy: 'OP #9799',
+        headTestRun: { sha: head, command: 'bun test exact-head', pass: 2, fail: 0, exit: 0 }, dispositions: [] } };
+    options.mutate?.(record);
+    return verifyOverlapEvidence({
+      evidencePath: '/evidence.json', pr, expectedHead: head, remote: 'origin', branch: 'main', cwd: '/repo',
+      run: () => ({ ok: true, out: '', err: '' }), reviewResultsDir: STD_DIR,
+      listDir: () => [selected, ...(options.failed ? [failed] : []), ...(options.priorFailed || options.priorFailedNoFindings ? [priorFailed] : [])],
+      reviewMtime: (path) => path === selectedPath ? 20 : 10, reviewRealPath: (path) => path,
+      readFile: (path) => path === '/evidence.json' ? JSON.stringify({ pr, head, reviewResult: selectedPath })
+        : path === selectedPath ? JSON.stringify(record)
+          : path === failedPath ? JSON.stringify({ pr, headCommit: head, reviewed: true, verdict: 'fail', mustFix: ['real defect'] })
+            : path === priorFailedPath ? JSON.stringify({ pr, headCommit: priorHead, reviewed: true, verdict: 'fail', mustFix: options.priorFailedNoFindings ? [] : ['earlier real defect'] })
+            : (() => { throw new Error(`unexpected review path: ${path}`); })(),
+      overlappingLandings: ['abcdef1234567'],
+    });
+  };
   const cases = [
     'opwaiver-32853-bd8f73595c83.json',
     'opwaiver-33097-1cc85900413c.json',
@@ -871,6 +898,34 @@ describe('official OP review waiver fixtures', () => {
     'opwaiver-32646-1694ccc7a170.json',
     'opwaiver-33113-3ab51f05968f.json',
   ];
+
+  test('plain OP waiver with zero findings and exact-head passing tests may land across overlap', () => {
+    expect(runPlainZeroFinding()).toMatchObject({ ok: true, mode: 'already-ancestor' });
+    expect(runPlainZeroFinding({ mutate: (record) => { delete (record.waiver as Record<string, unknown>).dispositions; } }))
+      .toMatchObject({ ok: true, mode: 'already-ancestor' });
+  });
+
+  test('plain OP waiver cannot hide a real same-head FAIL or claim an undisposed review', () => {
+    expect(runPlainZeroFinding({ failed: true }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-dispositions-missing' });
+    expect(runPlainZeroFinding({ priorFailed: true }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-dispositions-missing' });
+    expect(runPlainZeroFinding({ priorFailedNoFindings: true }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-dispositions-missing' });
+    expect(runPlainZeroFinding({ mutate: (record) => { (record.waiver as Record<string, unknown>).adjudicates = 'card-37150-cccccccccccc.json'; } }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-dispositions-missing' });
+    expect(runPlainZeroFinding({ mutate: (record) => { (record.waiver as Record<string, unknown>).dispositions = 'none'; } }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-dispositions-missing' });
+  });
+
+  test('plain OP waiver still needs approval, exact-head tests and a PASS with zero must-fix', () => {
+    expect(runPlainZeroFinding({ mutate: (record) => { (record.waiver as Record<string, unknown>).approvedBy = ''; } }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-approval-missing' });
+    expect(runPlainZeroFinding({ mutate: (record) => { ((record.waiver as Record<string, unknown>).headTestRun as Record<string, unknown>).sha = 'd'.repeat(40); } }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-head-test-missing' });
+    expect(runPlainZeroFinding({ mutate: (record) => { record.mustFix = ['real defect']; } }))
+      .toMatchObject({ ok: false, reason: 'review-op-waiver-zero-finding-invalid' });
+  });
   const runFixture = (name: string, mutate?: (value: Record<string, unknown>) => void, includeSupersedes = false) => {
     const selectedText = readFileSync(join(fixtureDir, name), 'utf8');
     const selectedRecord = JSON.parse(selectedText) as Record<string, unknown>;

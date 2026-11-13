@@ -6,6 +6,7 @@ import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../
 import { answerNextSidetabCall, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
 import type { AgentDisplayEvent } from '../tui/core/agents.js';
 import type { MessageBlock } from '../conv-substrate/message-block.js';
+import type { MeasuredTurnUsage } from '../session/turn-usage.js';
 import {
   answerShellApprovalCall,
   isShellApprovalCallMessage,
@@ -19,12 +20,19 @@ import { fileURLToPath } from 'node:url';
 import { spawnElanousBun } from '../instance/spawn-elanous.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import { answerMemberBoardSessionCall, isMemberBoardSessionCall, type MemberBoardSessionSource } from './next-member-board-session.js';
 
 const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
 let nextSidetabHandler: NextSidetabHandler | null = null;
 let nextSidetabIpcEnabled = false;
-let nextTuiShellApprovalHandler: ((command: string, callId: string) => Promise<boolean>) | null = null;
+let nextTuiShellApprovalHandler: ((command: string, callId: string, kind: 'bash' | 'graph') => Promise<boolean>) | null = null;
 let nextTuiShellApprovalCancelHandler: ((callId: string, reason: 'timeout' | 'turn-cancelled' | 'host-cancelled') => void) | null = null;
+let nextMemberBoardSessionSource: MemberBoardSessionSource | null = null;
+
+/** The Next host supplies only its existing authenticated member session. */
+export function setNextMemberBoardSessionSource(source: MemberBoardSessionSource | null): void {
+  nextMemberBoardSessionSource = source;
+}
 
 export function setNextSidetabHandler(handler: NextSidetabHandler | null): void {
   nextSidetabHandler = handler;
@@ -36,7 +44,7 @@ export function setNextSidetabIpcEnabled(enabled: boolean): void {
 }
 
 /** Installs the human-facing approval prompt before a sticky REPL child is created. */
-export function setNextTuiShellApprovalHandler(handler: ((command: string, callId: string) => Promise<boolean>) | null): void {
+export function setNextTuiShellApprovalHandler(handler: ((command: string, callId: string, kind: 'bash' | 'graph') => Promise<boolean>) | null): void {
   nextTuiShellApprovalHandler = handler;
 }
 
@@ -68,7 +76,20 @@ interface TurnResult {
   outcome?: string;
   activeTools?: unknown;
   selfHealth?: NextTuiSelfHealthSnapshot | null;
+  usage?: MeasuredTurnUsage;
   block?: MessageBlock;
+}
+
+/** Accept only provider-measured fields from the matching child frame. */
+export function isMeasuredTurnUsage(value: unknown): value is MeasuredTurnUsage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const usage = value as Record<string, unknown>;
+  if (!Object.keys(usage).every((key) => key === 'inputTokens' || key === 'outputTokens')) return false;
+  return ['inputTokens', 'outputTokens'].some((key) => usage[key] !== undefined)
+    && ['inputTokens', 'outputTokens'].every((key) => {
+      const count = usage[key];
+      return count === undefined || (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0);
+    });
 }
 export type LocalChatToolActivity =
   | { phase: 'start' | 'finish'; id: string; name: string }
@@ -87,6 +108,8 @@ interface WaitingTurn {
   ) => void;
   onToolActivity?: (event: LocalChatToolActivity) => void;
   onPushNowResult?: (event: LocalChatPushNowResult) => void;
+  onMeasuredUsage?: (usage: MeasuredTurnUsage) => void;
+  usageSeen?: boolean;
   resolve: (result: TurnResult) => void;
   reject: (error: Error) => void;
 }
@@ -132,7 +155,10 @@ class LocalChatSession {
         [NEXT_TUI_SHELL_APPROVAL_IPC_ENV]: '1',
       },
       ipc: (message: unknown, child: { send(message: unknown): unknown }) => {
-          if (wakeupTool && isWakeupCallMessage(message)) {
+          if (isMemberBoardSessionCall(message)) {
+            try { child.send(answerMemberBoardSessionCall(nextMemberBoardSessionSource, message)); }
+            catch { /* the child exited before the reply */ }
+          } else if (wakeupTool && isWakeupCallMessage(message)) {
             void answerWakeupCall(wakeupTool, message).then((reply) => {
               try { child.send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
             });
@@ -147,7 +173,9 @@ class LocalChatSession {
             catch { /* cancellation bookkeeping cannot break the child */ }
           } else if (isShellApprovalCallMessage(message)) {
             this.pendingShellApprovalIds.add(message.callId);
-            void answerShellApprovalCall(nextTuiShellApprovalHandler, message).then((reply) => {
+            void answerShellApprovalCall(nextTuiShellApprovalHandler
+              ? (command, callId) => nextTuiShellApprovalHandler!(command, callId, message.kind === 'graph' ? 'graph' : 'bash')
+              : null, message).then((reply) => {
               this.pendingShellApprovalIds.delete(message.callId);
               try { child.send(reply); } catch { /* the child exited mid-approval; its request times out */ }
             });
@@ -199,6 +227,12 @@ class LocalChatSession {
       const waiting = this.waiting;
       if (!waiting) return;
       if ('turnId' in result && result.turnId !== waiting.turnId) return;
+      if (result.event === 'usage-complete') {
+        if (waiting.usageSeen || result.turnId !== waiting.turnId || result.sessionId !== this.sessionId || !isMeasuredTurnUsage(result.usage)) return;
+        waiting.usageSeen = true;
+        try { waiting.onMeasuredUsage?.(result.usage); } catch { /* display cannot break the turn */ }
+        return;
+      }
       if (result.event === 'delta') {
         if (result.turnId !== waiting.turnId) return;
         if (typeof result.text === 'string') {
@@ -359,13 +393,13 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean) => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult']): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean) => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage']): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
     const modelTier = getSessionTierOverride(this.sessionId)?.llm;
     const payload = JSON.stringify({ prompt, id: turnId, ...(modelTier ? { modelTier } : {}), ...(attachments.length ? { attachments } : {}) }) + '\n';
-    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, resolve, reject }; });
+    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, onMeasuredUsage, resolve, reject }; });
     try {
       if (writePrompt) await writePrompt(payload);
       else await this.writeInput(payload);
@@ -431,6 +465,7 @@ export interface LocalChatTurnCompact {
   readonly deps?: NextTuiCompactDeps;
   readonly onCompact?: (outcome: NextTuiCompactOutcome) => void;
   readonly onMessageBlock?: (block: MessageBlock) => void;
+  readonly onMeasuredUsage?: (usage: MeasuredTurnUsage) => void;
 }
 const statusListeners = new Map<string, Set<(json: string | null) => void>>();
 const selfHealthListeners = new Map<string, Set<(snapshot: NextTuiSelfHealthSnapshot | null) => void>>();
@@ -537,7 +572,8 @@ export async function runLocalChatTurn(
     (block) => { if (!signal.aborted) compact.onMessageBlock?.(block); },
     (event) => { if (!signal.aborted) onShellActivity?.(event); },
     (event) => { if (!signal.aborted) onToolActivity?.(event); },
-    (event) => { if (!signal.aborted) onPushNowResult?.(event); });
+    (event) => { if (!signal.aborted) onPushNowResult?.(event); },
+    (usage) => { if (!signal.aborted) compact.onMeasuredUsage?.(usage); });
   } catch (error) {
     if (signal.aborted) throw new Error('응답을 취소했습니다');
     await closeLocalChatSession(sessionId);

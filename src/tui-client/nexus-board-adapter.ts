@@ -1,6 +1,14 @@
 import type { TaskCardEntry, TaskCardSection } from '../../apps/pwa/src/lib/task-card-model.js';
+import { terminalSafeText } from './terminal-safe-text.js';
 
 export type MemberBoardState = 'proposed' | 'approved' | 'developing' | 'testing' | 'deployed' | 'failed';
+
+export interface MemberBoardAttachment {
+  readonly kind: 'diagram' | 'diagram-source' | 'pdf' | 'html';
+  readonly title: string;
+  readonly url: string;
+  readonly sha256: string;
+}
 
 export interface MemberBoardCard {
   readonly id: string;
@@ -14,6 +22,7 @@ export interface MemberBoardCard {
   readonly resultUrl?: string;
   readonly publicUrl?: string;
   readonly updatedAt?: string;
+  readonly attachments?: readonly MemberBoardAttachment[];
 }
 
 export interface NexusBoardAdapterOptions {
@@ -42,24 +51,48 @@ function string(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function displayString(value: unknown): string | undefined {
+  const clean = typeof value === 'string' ? terminalSafeText(value).trim() : '';
+  return clean || undefined;
+}
+
+function safeAttachment(value: unknown): MemberBoardAttachment | undefined {
+  const row = object(value);
+  if (!row) return undefined;
+  const kind = string(row.kind);
+  const title = displayString(row.title);
+  const sha256 = string(row.sha256);
+  const rawUrl = string(row.url);
+  if (!kind || !['diagram', 'diagram-source', 'pdf', 'html'].includes(kind)
+    || !title || !sha256 || !/^[a-fA-F0-9]{64}$/.test(sha256) || !rawUrl) return undefined;
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:' || url.username || url.password) return undefined;
+    return { kind: kind as MemberBoardAttachment['kind'], title, url: url.href, sha256 };
+  } catch { return undefined; }
+}
+
 function parseCard(value: unknown): MemberBoardCard | undefined {
   const row = object(value);
   if (!row) return undefined;
   const id = string(row.id);
   const memberId = string(row.memberId);
-  const title = string(row.title);
+  const title = displayString(row.title);
   const state = string(row.state) as MemberBoardState | undefined;
   if (!id || !memberId || !title || !state || !Object.prototype.hasOwnProperty.call(SECTION_BY_STATE, state)) return undefined;
-  const optional = (key: string) => string(row[key]);
+  const optional = (key: string) => displayString(row[key]);
   return {
     id, memberId, title, state,
     ...(optional('progress') ? { progress: optional('progress') } : {}),
     ...(optional('summary') ? { summary: optional('summary') } : {}),
     ...(optional('reason') ? { reason: optional('reason') } : {}),
-    ...(optional('runId') ? { runId: optional('runId') } : {}),
+    ...(typeof row.runId === 'string' && row.runId.trim() ? { runId: row.runId } : {}),
     ...(optional('resultUrl') ? { resultUrl: optional('resultUrl') } : {}),
     ...(optional('publicUrl') ? { publicUrl: optional('publicUrl') } : {}),
     ...(optional('updatedAt') ? { updatedAt: optional('updatedAt') } : {}),
+    attachments: Array.isArray(row.attachments)
+      ? row.attachments.map(safeAttachment).filter((item): item is MemberBoardAttachment => item !== undefined)
+      : [],
   };
 }
 
@@ -74,10 +107,11 @@ export function memberBoardCardToTaskCardEntry(card: MemberBoardCard): TaskCardE
     section: SECTION_BY_STATE[card.state],
     owner: 'member-board-api',
     key: `member-board:${card.id}:${card.state}:${card.updatedAt ?? ''}`,
-    ...(card.runId ? { runId: card.runId.replace(/^run-/, '') } : {}),
+    ...(card.runId ? { runId: card.runId } : {}),
     data: {
       title: card.title,
       ...(summary ? { summary } : {}),
+      attachments: card.attachments ?? [],
       ...(card.state === 'testing' ? { status: 'testing' } : {}),
       ...(card.state === 'failed' ? { status: 'failed' } : {}),
       ...(card.state === 'deployed' ? {

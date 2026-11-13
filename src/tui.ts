@@ -24,6 +24,7 @@ import { startForegroundGuard } from './tty-foreground.js';
 
 let _raw = false;
 let _alt = false;
+let _mouse = false;
 let _cancelReadKey: (() => void) | undefined;
 let _stopForegroundGuard: (() => void) | undefined;
 let _restoreConsole: (() => void) | undefined;
@@ -133,7 +134,9 @@ function cleanup(): void {
   _cancelReadKey?.();
   resetInputState();
   if (_raw || _alt) process.stdout.write(ansi.mouseOff + ansi.kittyKbOff + ansi.modKeysOff + ansi.pasteOff);
+  _mouse = false;
   if (_alt) { process.stdout.write(ansi.showCursor + ansi.altOff); _alt = false; }
+  else if (_raw) process.stdout.write(ansi.showCursor);
   if (_raw && process.stdin.isTTY) {
     process.stdin.setRawMode(false);
     process.stdin.pause();
@@ -169,13 +172,13 @@ export interface TerminalRestoreIo {
   stdin: { isTTY?: boolean; setRawMode?: (mode: boolean) => unknown; resume?: () => unknown };
   stdout: { write: (chunk: string) => unknown; emit?: (event: string) => unknown };
 }
-export function restoreTerminalAfterContinue(state: { raw: boolean; alt: boolean }, io: TerminalRestoreIo): boolean {
+export function restoreTerminalAfterContinue(state: { raw: boolean; alt: boolean; mouse?: boolean }, io: TerminalRestoreIo): boolean {
   if (!state.raw && !state.alt) return false;
   if (state.raw && io.stdin.isTTY) {
     io.stdin.setRawMode?.(true);
     io.stdin.resume?.();
   }
-  io.stdout.write(ansi.mouseOn + ansi.pasteOn + ansi.kittyKbOn + ansi.modKeysOn);
+  io.stdout.write((state.mouse === false ? ansi.mouseOff : ansi.mouseOn) + ansi.pasteOn + ansi.kittyKbOn + ansi.modKeysOn);
   io.stdout.write(state.alt ? ansi.altOn + ansi.hideCursor : ansi.hideCursor);
   resetRenderCache();
   debug.log('tui.lifecycle', 'sigcont-restored', { raw: state.raw, alt: state.alt });
@@ -190,7 +193,7 @@ function registerExitHandlers(): void {
   _exitHandlersRegistered = true;
   process.on('exit', cleanup);
   process.on('SIGCONT', () => {
-    try { restoreTerminalAfterContinue({ raw: _raw, alt: _alt }, { stdin: process.stdin, stdout: process.stdout }); }
+    try { restoreTerminalAfterContinue({ raw: _raw, alt: _alt, mouse: _mouse }, { stdin: process.stdin, stdout: process.stdout }); }
     catch { /* fail-soft: 복구 실패가 프로세스를 죽이지 않는다 */ }
   });
   process.on('SIGINT',  () => { cleanup(); runExitNotice(); process.exit(130); });
@@ -198,6 +201,15 @@ function registerExitHandlers(): void {
 }
 
 export function initTui(altScreen = true): void {
+  initializeTui(altScreen, true);
+}
+
+/** Start a compact primary-screen TUI without mouse capture so terminal scrollback works. */
+export function initTuiPrimary(): void {
+  initializeTui(false, false);
+}
+
+function initializeTui(altScreen: boolean, captureMouse: boolean): void {
   if (!process.stdin.isTTY) return;
   registerExitHandlers();
   resetRenderCache();
@@ -217,7 +229,8 @@ export function initTui(altScreen = true): void {
   // is additive: unsupported terminals ignore the CSI sequence, so
   // this is safe to turn on globally. Cleanup in `cleanup()` writes
   // the matching "off" sequences.
-  process.stdout.write(ansi.mouseOn + ansi.pasteOn + ansi.kittyKbOn + ansi.modKeysOn);
+  process.stdout.write((captureMouse ? ansi.mouseOn : ansi.mouseOff) + ansi.pasteOn + ansi.kittyKbOn + ansi.modKeysOn);
+  _mouse = captureMouse;
   _restoreConsole ??= muteConsoleWhileTui();
   if (altScreen) {
     process.stdout.write(ansi.altOn + ansi.hideCursor);
@@ -225,6 +238,22 @@ export function initTui(altScreen = true): void {
   } else {
     process.stdout.write(ansi.hideCursor);
   }
+}
+
+/** Next TUI switches to the primary screen for short terminals and back on resize. */
+export function setTuiAltScreen(enabled: boolean): void {
+  if (!_raw || _alt === enabled) return;
+  process.stdout.write((enabled ? ansi.altOn + ansi.mouseOn : ansi.altOff + ansi.mouseOff) + ansi.hideCursor);
+  _alt = enabled;
+  _mouse = enabled;
+  resetRenderCache();
+}
+
+/** Sidebar clicks still need mouse reporting when the short TUI uses the primary screen. */
+export function setTuiMouseCapture(enabled: boolean): void {
+  if (!_raw || _mouse === enabled) return;
+  process.stdout.write(enabled ? ansi.mouseOn : ansi.mouseOff);
+  _mouse = enabled;
 }
 
 export function closeTui(): void {

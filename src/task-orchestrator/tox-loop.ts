@@ -10,11 +10,17 @@ import { PRIORITY_RANK } from './priority.js';
 import type { Task } from './types.js';
 import { decideBudget, readBudgetInputsLive, type ReadBudgetInputsDeps } from '../self-implement/budget-gate.js';
 import { getUserConfig } from '../user-config/reader.js';
+import { PROVIDER_DEFAULT_MODEL } from '../user-config.js';
+import { resolveGrokCredential } from '../grok/credential.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { projectLinearTask } from '../connectors/linear-projector.js';
 import type { TaskStore } from './store.js';
 
-async function defaultBudgetCheck(readBudget?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> }): Promise<{ canAfford: boolean; tripped: readonly string[] }> {
+async function defaultBudgetCheck(readBudget?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> },
+  grokSubscriptionOnly?: () => boolean,
+  credentialContext?: { home: string; env: NodeJS.ProcessEnv }): Promise<{
+  canAfford: boolean; tripped: readonly string[]; providerName?: string; model?: string;
+}> {
   const inputs = await readBudgetInputsLive({ config: getUserConfig(), ...readBudget });
   const maxUsedPercent = {
     ...inputs.maxUsedPercent,
@@ -24,10 +30,18 @@ async function defaultBudgetCheck(readBudget?: ReadBudgetInputsDeps & { readLive
   const decision = decideBudget({ ...inputs, maxUsedPercent });
   // TOX adapters do not receive the selected fallback provider. Do not admit
   // a next-provider decision until that provider can actually be routed.
-  const canAfford = decision.action === 'proceed';
+  const subscriptionOnly = grokSubscriptionOnly ?? (() => {
+    const credential = resolveGrokCredential(credentialContext);
+    const paidApi = resolveGrokCredential({ ...credentialContext, skipSubscription: true });
+    return credential?.kind === 'subscription' && paidApi === null;
+  });
+  const fallback = decision.action === 'next-provider' && decision.provider === 'grok'
+    && subscriptionOnly();
+  const canAfford = decision.action === 'proceed' || fallback;
   return {
     canAfford,
     tripped: canAfford ? [] : decision.reasons,
+    ...(fallback ? { providerName: 'grok', model: decision.model ?? PROVIDER_DEFAULT_MODEL.grok } : {}),
   };
 }
 
@@ -46,6 +60,10 @@ export interface ToxLoopOptions {
   budgetCheck?: BudgetGate;
   /** Usage-reader seam; still exercises the default P15 evaluator. */
   readBudget?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> };
+  /** Subscription-only credential check; tests inject a no-network answer. */
+  grokSubscriptionOnly?: () => boolean;
+  /** Isolated credential file/env boundary; production resolves its own sources. */
+  grokCredentialContext?: { home: string; env: NodeJS.ProcessEnv };
   /** Test seam; production hands each admitted task to the TOX dispatcher. */
   launch?: (task: Task) => Promise<void> | void;
   log?: (event: 'tick' | 'launched' | 'waiting-capacity' | 'budget-hold' | 'skipped', data: {
@@ -55,13 +73,14 @@ export interface ToxLoopOptions {
 }
 
 export function startToxLoop({ graph, dispatcher, bus, store, linearProjection, maxConcurrent = 2, intervalMs = 1000,
-  budgetCheck, readBudget, launch, log }: ToxLoopOptions): { tick: () => Promise<DispatchTickResult>; stop: () => void } {
+  budgetCheck, readBudget, grokSubscriptionOnly, grokCredentialContext, launch, log }: ToxLoopOptions): { tick: () => Promise<DispatchTickResult>; stop: () => void } {
   if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) throw new RangeError('maxConcurrent must be a positive integer');
   if (!Number.isFinite(intervalMs) || intervalMs < 1) throw new RangeError('intervalMs must be positive');
   const slot = new TimeSlotManager();
   const scheduler = new ResourceScheduler({ slot: () => slot.currentSlot() });
   const inflight = new Set<string>();
-  const gate = budgetCheck ?? (() => defaultBudgetCheck(readBudget));
+  const gate = budgetCheck ?? (() => defaultBudgetCheck(readBudget, grokSubscriptionOnly, grokCredentialContext));
+  const selections = new Map<string, { providerName: string; model?: string }>();
   let stopped = false;
   const projections = new Map<string, Promise<void>>();
   let pending = false;
@@ -96,7 +115,15 @@ export function startToxLoop({ graph, dispatcher, bus, store, linearProjection, 
       const task = graph.getTask(candidate.id);
       if (stopped || !task || task.status !== 'ready' || inflight.has(task.id)) return 'not-ready';
       const decision = await gate(task.goalSlug ?? '', task.estimateUsd);
-      if (!decision.canAfford || decision.tripped.length > 0) return 'budget-hold';
+      if (!decision.canAfford || decision.tripped.length > 0) {
+        selections.delete(task.id);
+        return 'budget-hold';
+      }
+      if (decision.providerName) {
+        if (task.surface.kind !== 'llm-direct' && task.surface.kind !== 'subagent') return 'budget-hold';
+        selections.set(task.id, { providerName: decision.providerName,
+          ...(decision.model ? { model: decision.model } : {}) });
+      } else selections.delete(task.id);
       return undefined;
     },
     launch: (candidate) => {
@@ -106,7 +133,8 @@ export function startToxLoop({ graph, dispatcher, bus, store, linearProjection, 
       if (launch) {
         completion = launch(task);
       } else {
-        const result = dispatcher.tickTask(task.id);
+        const result = dispatcher.tickTask(task.id, selections.get(task.id));
+        selections.delete(task.id);
         const started = result.dispatched[0];
         if (!started) {
           currentResult?.deferred.push(...result.deferred);

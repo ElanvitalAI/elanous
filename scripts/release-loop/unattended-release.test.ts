@@ -2,9 +2,10 @@ import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { dlopen, FFIType } from 'bun:ffi';
-import { assertReleaseCliCurrent, buildReleaseRunInput, latestPublishedPreviousVersion, runUnattendedRelease } from './unattended-release.js';
+import { APPROVED_RELEASE_EXEC_PATCH_MANIFEST_SHA256, assertReleaseCliCurrent, buildReleaseRunInput, latestPublishedPreviousVersion, runUnattendedRelease } from './unattended-release.js';
 import { parseOptions } from './gate-node.js';
 import { enableLandingFreeze, disableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
@@ -71,6 +72,57 @@ test('incident 0306: release launch rejects a CLI checkout behind origin/main', 
   expect(() => assertReleaseCliCurrent(repo)).toThrow(/stale release CLI/);
   writeFileSync(join(repo, 'untracked-source'), 'modified');
   expect(() => assertReleaseCliCurrent(repo, cut)).toThrow(/uncommitted changes/);
+  rmSync(join(repo, 'untracked-source'));
+  git(repo, 'push', 'origin', `${old}:refs/heads/release/0.2.3`);
+  expect(() => assertReleaseCliCurrent(repo)).not.toThrow();
+}));
+
+const APPROVED_RELEASE_EXEC_PATCH_MANIFEST_BYTES = `{
+  "baseHead": "06c67bdd0b1143391fd3801596c8bf2a360d3c72",
+  "paths": [
+    "scripts/release-loop/publish-node.ts",
+    "scripts/release-loop/unattended-release.ts",
+    "scripts/release-loop/version-node.ts"
+  ],
+  "diffSha256": "5b1e0deda2d77c50e8e9cd2ed8f358199ac9618db72cf610ca760a59fb50ef96",
+  "recordedAt": "2026-11-11T22:12:27.326848+00:00",
+  "note": "OP approved #37063 and #37070 append; release-only execution patches carried to final cut tip"
+}
+`;
+
+test('forged execution patch manifest is rejected even when its diff hash matches the dirty CLI', () => fixture((root) => {
+  const remote = join(root, 'origin.git'), repo = join(root, 'repo');
+  mkdirSync(repo);
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  execFileSync('git', ['init', '--bare', remote], { stdio: ['ignore', 'pipe', 'pipe'] });
+  git('init', '-b', 'main'); git('config', 'user.name', 'release-sim'); git('config', 'user.email', 'release-sim@example.invalid');
+  const paths = ['scripts/release-loop/publish-node.ts', 'scripts/release-loop/unattended-release.ts', 'scripts/release-loop/version-node.ts'];
+  for (const path of paths) { mkdirSync(join(repo, 'scripts', 'release-loop'), { recursive: true }); writeFileSync(join(repo, path), 'before\n'); }
+  git('add', '.'); git('commit', '-m', 'base'); git('remote', 'add', 'origin', remote); git('push', '-u', 'origin', 'main');
+  for (const path of paths) writeFileSync(join(repo, path), 'after\n');
+  const forgedBody = JSON.stringify({ baseHead: git('rev-parse', 'HEAD'), paths,
+    diffSha256: createHash('sha256').update(git('diff', '--binary', '--', ...paths)).digest('hex') });
+  const forged = join(root, 'manifest.json');
+  const forgedNamed = join(root, 'release-exec-patch-manifest-0623.json');
+  writeFileSync(forged, forgedBody);
+  writeFileSync(forgedNamed, forgedBody);
+  const approvedDir = join(root, 'approved');
+  mkdirSync(approvedDir, { recursive: true });
+  const approved = join(approvedDir, 'release-exec-patch-manifest-0623.json');
+  writeFileSync(approved, APPROVED_RELEASE_EXEC_PATCH_MANIFEST_BYTES);
+  expect(createHash('sha256').update(readFileSync(approved)).digest('hex')).toBe(APPROVED_RELEASE_EXEC_PATCH_MANIFEST_SHA256);
+  const previous = process.env.ELANOUS_RELEASE_EXEC_PATCH_MANIFEST;
+  try {
+    process.env.ELANOUS_RELEASE_EXEC_PATCH_MANIFEST = forged;
+    expect(() => assertReleaseCliCurrent(repo)).toThrow(/unapproved release CLI execution patch manifest/);
+    process.env.ELANOUS_RELEASE_EXEC_PATCH_MANIFEST = forgedNamed;
+    expect(() => assertReleaseCliCurrent(repo)).toThrow(/unapproved release CLI execution patch manifest/);
+    process.env.ELANOUS_RELEASE_EXEC_PATCH_MANIFEST = approved;
+    expect(() => assertReleaseCliCurrent(repo)).toThrow(/manifest does not match checkout/);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_RELEASE_EXEC_PATCH_MANIFEST;
+    else process.env.ELANOUS_RELEASE_EXEC_PATCH_MANIFEST = previous;
+  }
 }));
 
 test('incident 0306: a new request resumes the saved same-version failed run id', async () => {
@@ -113,6 +165,50 @@ test('incident 0306: a new request resumes the saved same-version failed run id'
     const completed = await runUnattendedRelease({ version: '0.2.4' }, deps);
     expect(observed).toHaveLength(2);
     expect(completed.state?.runId).toBe(runId);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('force-new ignores a finished fan-out child and still blocks a real root', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'unattended-child-done-'));
+  try {
+    record(root, '0.3.15', { version: '0.3.15', publishedAt: 'now' });
+    const runsDir = join(root, 'graph-runs', 'release-loop');
+    mkdirSync(runsDir, { recursive: true });
+    const cut = { outcome: 'ok', version: '0.3.16', commit: 'c'.repeat(40), branch: 'release/0.3.16' };
+    const input = { version: '0.3.16', previousVersion: '0.3.15', gatePodPool: 'pool', gateExecutor: 'pod', branchCut: true };
+    const child = (runId: string, entry: 'prefetch' | 'checklist-gate' | 'regression-suite') => ({
+      graphId: 'release-loop', runId, parentRunId: 'root-live', entryNodeId: entry, startedAt: '2026-11-13T00:00:00Z', status: 'done', input,
+      path: ['version-release', entry, 'done'],
+      nodes: [
+        { nodeId: 'version-release', ok: true, output: JSON.stringify(cut) },
+        { nodeId: entry, ok: true },
+        { nodeId: 'done', ok: true },
+      ], executed: 3,
+    });
+    writeFileSync(join(runsDir, 'b66e1251.json'), JSON.stringify({ ...child('b66e1251', 'prefetch'), parentRunId: undefined }));
+    for (const [runId, entry] of [['child-check', 'checklist-gate'], ['child-reg', 'regression-suite']] as const) {
+      writeFileSync(join(runsDir, `${runId}.json`), JSON.stringify(child(runId, entry)));
+    }
+    let graphCalls = 0;
+    const deps = { ledgerRoot: root, assertCliCurrent: () => {}, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      graph: async () => { graphCalls++; return { status: 'running', runId: 'fresh-root', path: ['version-release'], nodes: [], executed: 0 } as never; } };
+    const launched = await runUnattendedRelease({ version: '0.3.16', forceNew: true }, deps);
+    expect(launched.state?.runId).toBe('fresh-root');
+    expect(graphCalls).toBe(1);
+    writeFileSync(join(runsDir, 'root-done.json'), JSON.stringify({ graphId: 'release-loop', runId: 'root-done', startedAt: '2026-11-13T00:00:00Z',
+      status: 'done', input, path: ['version-release', 'done'],
+      nodes: [{ nodeId: 'version-release', ok: true, output: JSON.stringify(cut) }, { nodeId: 'done', ok: true }], executed: 2 }));
+    const blocked = await runUnattendedRelease({ version: '0.3.16', forceNew: true }, deps);
+    expect(blocked.state?.runId).toBe('root-done');
+    expect(graphCalls).toBe(1);
+    const pidStartedAt = psProcessStartMs(process.pid);
+    expect(pidStartedAt).not.toBeNull();
+    writeFileSync(join(runsDir, 'root-live.json'), JSON.stringify({ graphId: 'release-loop', runId: 'root-live', startedAt: new Date().toISOString(),
+      pid: process.pid, pidStartedAt: new Date(pidStartedAt!).toISOString(), status: 'running', input, path: ['version-release'], nodes: [], executed: 0 }));
+    rmSync(join(runsDir, 'root-done.json'));
+    await expect(runUnattendedRelease({ version: '0.3.16', forceNew: true }, deps)).rejects.toThrow('release run claim already exists');
+    expect(graphCalls).toBe(1);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -193,6 +289,20 @@ test('release.loop config builds the full graph input with ledger previousVersio
     gateRemote: 'node-b', gateRemoteMirror: '/mirror/repo.git', opsHosts: ['local', 'node-b'], internalDist: '~/dist', opsRestart: true };
   writeFileSync(configPath, JSON.stringify({ release: { loop } }));
   expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', ...loop });
+}));
+
+test('cold shard opt-in reaches pod runs only', () => fixture((root) => {
+  record(root, '0.10.0', { version: '0.10.0', publishedAt: 'now' });
+  const previous = process.env.ELANOUS_RELEASE_FORCE_FRESH_SHARDS;
+  process.env.ELANOUS_RELEASE_FORCE_FRESH_SHARDS = '1';
+  try {
+    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } })).toMatchObject({ gateExecutor: 'pod', gatePodFreshShards: true });
+    process.env.ELANOUS_RELEASE_FORCE_FRESH_SHARDS = '0';
+    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } })).not.toHaveProperty('gatePodFreshShards');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_RELEASE_FORCE_FRESH_SHARDS;
+    else process.env.ELANOUS_RELEASE_FORCE_FRESH_SHARDS = previous;
+  }
 }));
 
 test('freeze stops gate and publish graph; force-freeze records bypass and off resumes', async () => {

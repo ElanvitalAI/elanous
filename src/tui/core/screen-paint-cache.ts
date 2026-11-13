@@ -13,13 +13,16 @@ export class ScreenPaintCache {
   diff(lines: readonly string[], columns: number, rows: number): ScreenPaintDiff {
     const size = `${columns}x${rows}`;
     const prior = this.#size === size ? this.#previous : null;
+    // Writing a row below the physical viewport scrolls the terminal and
+    // invalidates every cached position. Only paint rows the terminal owns.
+    const visible = lines.slice(0, Math.max(0, rows));
     const changedRows: { row: number; text: string }[] = [];
-    for (let row = 0; row < Math.max(lines.length, prior?.length ?? 0); row++) {
-      const text = lines[row] ?? '';
+    for (let row = 0; row < Math.max(visible.length, prior?.length ?? 0); row++) {
+      const text = visible[row] ?? '';
       if (prior?.[row] === text) continue;
       changedRows.push({ row, text });
     }
-    this.#previous = [...lines];
+    this.#previous = [...visible];
     this.#size = size;
     return { clear: prior === null, changedRows };
   }
@@ -28,7 +31,7 @@ export class ScreenPaintCache {
     if (this.#previous !== null) {
       // An overlay can paint below the last logical TUI line. Repaint the
       // full viewport on the next frame so those rows are restored too.
-      this.#previous = Array.from({ length: Math.max(this.#previous.length, terminalRows) }, () => undefined);
+      this.#previous = Array.from({ length: Math.max(0, terminalRows) }, () => undefined);
     }
   }
 }

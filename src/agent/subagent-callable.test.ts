@@ -86,3 +86,20 @@ test('run callable filters host tools and fails closed when tools or dispatch ar
   await expect(spawns[1]!.dispatchTool!('Read', {})).rejects.toThrow("subagent tool 'Read' is not allowed");
   expect(dispatchedNames).toEqual(['Bash']);
 });
+
+test('task-local TOX fallback pins grok instead of the parent provider', async () => {
+  const spawns: AgentSpawnOpts[] = [];
+  const registry = { spawn: (opts: AgentSpawnOpts) => {
+    spawns.push(opts);
+    return { task: { id: 'agent-fallback', controller: new AbortController() },
+      events: (async function* () { yield { type: 'done', text: 'ok' } as const; })() };
+  }, abort: () => {} } as unknown as AgentRegistry;
+  const call = createGlobalSubagentCallable({ registry,
+    hostTools: [{ name: 'Bash' } as LLMToolSpec], dispatchTool: async () => 'ok',
+    provider: { name: 'parent', defaultModel: 'parent-model' } as LLMProvider });
+  const result = await call({ definitionName: 'general-purpose', prompt: 'absorb',
+    model: 'grok-4.7', providerName: 'grok' });
+  expect((await result.done).status).toBe('completed');
+  expect(spawns[0]!.provider?.name).toBe('grok');
+  expect(spawns[0]!.definition.model).toBe('grok-4.7');
+});

@@ -150,6 +150,51 @@ describe('session chat terminal-capable turns', () => {
     delete process.env.ELANOUS_SESSION_ROOT;
   });
 
+  test('keeps provider usage inside the completed invocation and never promotes estimates', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-measured-usage-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'test-provider', defaultModel: 'test-model', available: () => true,
+      async *chat() { yield 'plain'; },
+      async *streamChat() {
+        yield { type: 'text', delta: 'plain' } as const;
+        yield { type: 'usage', usage: { inputTokens: 8, outputTokens: 2 } } as const;
+      },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    activeStreamScript = async (_messages, handlers) => {
+      handlers.onUsage?.({ inputTokens: 10 });
+      handlers.onUsage?.({ outputTokens: 3 });
+      handlers.onUsage?.({ inputTokens: 5, outputTokens: 2 });
+      return 'first';
+    };
+    const base = { userConfig: testConfig(provider), sessionId: session.id,
+      systemPrompt: 'base', skipMemoryInjection: true, tools: [tool('Read')],
+      dispatchTool: async () => 'ok', provider };
+    const first = await runTurn({ ...base, userText: 'hello' });
+    expect(first.measuredUsage).toEqual({ inputTokens: 15, outputTokens: 5 });
+    expect(loadSession(session.id)!.messages.at(-1)?.replyFinal).toBe(true);
+    expect(streamCalls[0]?.opts.onUsage).toBeUndefined();
+    // 출처: #37057 measuredUsage 경계 — usedTokens 는 기존 추정 예산 필드이므로 양수만 확인한다.
+    expect(first.usedTokens).toBeGreaterThan(0);
+    activeStreamScript = async () => 'second';
+    const second = await runTurn({ ...base, userText: 'again' });
+    expect(second.measuredUsage).toBeUndefined();
+    const aborted = new AbortController();
+    activeStreamScript = async (_messages, handlers) => {
+      handlers.onUsage?.({ inputTokens: 4, outputTokens: 1 });
+      aborted.abort();
+      return 'partial';
+    };
+    const interrupted = await runTurn({ ...base, userText: 'abort', signal: aborted.signal });
+    expect(interrupted.measuredUsage).toBeUndefined();
+    const interruptedAnswer = loadSession(session.id)!.messages.filter((message) => message.role === 'assistant').pop();
+    expect(interruptedAnswer?.replyFinal).toBe(false);
+    const plain = await runTurn({ ...base, userText: 'Explain the direct provider path', tools: undefined });
+    expect(plain.measuredUsage).toEqual({ inputTokens: 8, outputTokens: 2 });
+  });
+
   test('wires PtyShell-family tools through the canonical terminal-capable turn', async () => {
     sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-terminal-'));
     process.env.ELANOUS_SESSION_ROOT = sessionRoot;
@@ -717,6 +762,38 @@ describe('Next TUI research turn routing', () => {
     if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
     delete process.env.ELANOUS_SESSION_ROOT;
     activeProvider = undefined;
+    activeStreamScript = undefined;
+    streamCalls.length = 0;
+  });
+
+  test('real core turn forwards provider usage into the completed chat result', async () => {
+    streamCalls.length = 0;
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-core-usage-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'test-provider', defaultModel: 'test-model', available: () => true,
+      async *chat() { yield 'plain'; }, async *streamChat() { yield { type: 'text', delta: 'plain' } as const; },
+    };
+    activeProvider = provider;
+    activeStreamScript = async (_messages, handlers) => {
+      handlers.onUsage?.({ inputTokens: 7, outputTokens: 3 });
+      return 'core reply';
+    };
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    const realCoreTurn = coreTurnModule.runCoreTurn;
+    const core = spyOn(coreTurnModule, 'runCoreTurn').mockImplementation((ctx) => realCoreTurn(ctx));
+    try {
+      const result = await runTurn({
+        userConfig: testConfig(provider, false), sessionId: session.id,
+        userText: '이번 주 한국 시장의 변화를 조사해줘', utteranceSurface: 'tui', systemPrompt: 'TUI prompt',
+        skipMemoryInjection: true, tools: [tool('Read')], dispatchTool: async () => 'read result', provider,
+      });
+      expect(core).toHaveBeenCalledTimes(1);
+      expect(core.mock.calls[0]?.[0].callbacks?.onUsage).toBeFunction();
+      expect(streamCalls).toHaveLength(2);
+      expect(result.measuredUsage).toEqual({ inputTokens: 14, outputTokens: 6 });
+      expect(result.text).toBe('core reply');
+    } finally { core.mockRestore(); }
   });
 
   test('the chat entry passes the human utterance into the armed goal loop', async () => {
@@ -728,9 +805,10 @@ describe('Next TUI research turn routing', () => {
     };
     activeProvider = provider;
     const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
-    const loop = spyOn(goalLoopModule, 'runGoalLoop').mockImplementation(async () => ({
-      finalText: 'loop reply', goalComplete: false, stopReason: 'max_iterations', iterations: 1,
-    }) as never);
+    const loop = spyOn(goalLoopModule, 'runGoalLoop').mockImplementation(async (ctx) => {
+      ctx.callbacks?.onUsage?.({ inputTokens: 11, outputTokens: 4 });
+      return { finalText: 'loop reply', goalComplete: false, stopReason: 'max_iterations', iterations: 1 } as never;
+    });
     try {
       const result = await runTurn({
         userConfig: testConfig(provider, false), sessionId: session.id,
@@ -741,6 +819,7 @@ describe('Next TUI research turn routing', () => {
       expect(loop).toHaveBeenCalledTimes(1);
       expect(loop.mock.calls[0]?.[0].userText).toBe('human research request');
       expect(result.text).toBe('loop reply');
+      expect(result.measuredUsage).toEqual({ inputTokens: 11, outputTokens: 4 });
     } finally { loop.mockRestore(); }
   });
 

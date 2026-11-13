@@ -2,7 +2,7 @@ import { Option, type Command } from 'commander';
 import { win32 } from 'node:path';
 import { applyMachineSetupPlan, type MachineSetupApplyDeps, type MachineSetupApplyResult } from './machine-setup-apply.js';
 import { buildMachineSetupPlan, formatMachineSetupPlan, readMachineCaptureForPlan } from './machine-setup-plan.js';
-import { applyMachineWslBootstrap, applyMachineWslProfile, machineWslResumeTaskDefinitionPath, runMachineWslCommand, type MachineWslSetupDeps } from './machine-wsl-setup.js';
+import { applyMachineWslBootstrap, applyMachineWslProfile, machineWslResumeTaskDefinitionPath, runMachineWslCommand, WSL_RESUME_FAILURE_GUIDANCE, type MachineWslSetupDeps } from './machine-wsl-setup.js';
 
 export interface MachineApplyFromCaptureDeps extends MachineSetupApplyDeps {
   readonly platform?: () => string;
@@ -53,7 +53,7 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
     .option('--profile <profile>', 'default, developer, or headquarters', 'default')
     .option('--platform <platform>', 'target platform; inferred from the current host when omitted')
     .option('--distribution <name>', 'WSL distribution to create', 'Ubuntu')
-    .option('--resume-trigger <trigger>', 'Windows resume trigger: onstart (default) or onlogon fallback', 'onstart')
+    .option('--resume-trigger <trigger>', 'Windows WSL resume trigger: onlogon (installing user)', 'onlogon')
     .addOption(new Option('--resume-task-wrapper <file>').hideHelp())
     .option('--wsl-user <name>', 'Linux account to create in the WSL distribution', 'elanous')
     .option('--resume', 'resume WSL setup after reboot; normally started by the scheduled task')
@@ -62,7 +62,7 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
     .option('--json', 'structured stdout; command stdout is suppressed while interactive prompts remain on the terminal')
     .action((options: { from: string; profile: string; platform?: string; distribution: string; resumeTrigger: 'onstart' | 'onlogon'; wslUser: string; resume?: boolean; resumeTaskWrapper?: string; allowCloudVm?: boolean; yes?: boolean; json?: boolean }) => {
       try {
-        if (!['onstart', 'onlogon'].includes(options.resumeTrigger)) throw new Error('--resume-trigger must be onstart or onlogon');
+        if (options.resumeTrigger !== 'onlogon') throw new Error('--resume-trigger must be onlogon because WSL requires the installing Windows account');
         const capture = readMachineCaptureForPlan(options.from);
         const platform = options.platform ?? (deps.platform ?? currentMachineSetupPlatform)();
         const wslHost = platform === 'wsl' && (deps.wsl?.platform ?? process.platform) === 'win32';
@@ -98,11 +98,13 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
             attempted: bootstrap.attempted + profileResult.attempted, profileResult,
             failures: profileResult.failures.map(item => ({ operation: item.operation, reason: `${item.target}: ${item.reason}` })) }
             : bootstrap;
-          if (options.json) out.log(JSON.stringify({ ...result, credentialGuidance: WSL_CODEX_CREDENTIAL_GUIDANCE }, null, 2));
+          if (options.json) out.log(JSON.stringify({ ...result, credentialGuidance: WSL_CODEX_CREDENTIAL_GUIDANCE,
+            ...(result.status === 'failed' ? { resumeGuidance: WSL_RESUME_FAILURE_GUIDANCE } : {}) }, null, 2));
           else if (result.status === 'resume-pending') out.log(`machine apply · ${result.detail}`);
           else {
             out.log(`machine apply · WSL ${result.status} · ${result.distribution}/${result.user} · attempted ${result.attempted} · failures ${result.failures.length}`);
             if (result.failures.length) out.log(result.failures.map(item => `${item.operation}: ${item.reason}`).join('\n'));
+            if (result.status === 'failed') err.error(WSL_RESUME_FAILURE_GUIDANCE);
             if (profileResult?.manual.length) out.log(`manual steps: ${profileResult.manual.join(', ')}`);
           }
           if (result.status === 'failed') setExitCode(1);

@@ -37,6 +37,7 @@ export async function handleUxSimDevices(req: Request): Promise<Response> {
     const catalog = loadMockScenarioCatalog();
     return jsonResponse({
       catalogVersion: catalog.version,
+      deviceCatalogVersion: catalog.deviceCatalogVersion,
       devices: catalog.devices,
       scenarios: catalog.scenarios,
       runEvidence: catalog.runEvidence,

@@ -17,6 +17,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 //   힐링 = 문이 열리면 next 가 내부 턴 한 번 · 바쁘면 1분마다 미룸(상한 30분) · 끝내 못 열면 «⏰ 예약 깨움 놓침» 한 줄
 
 import { createInternalTurnGate, formatInternalTurnBanner, isInternalTurnEnabledByEnv, type InternalTurnGate, type InternalTurnRequest } from '../tui/input/internal-turn.js';
+import { createNextMailWake, type NextMailWakeDeps } from './next-mail-wake.js';
 
 import type { LLMToolDef, PluginContext } from '../plugins/core/types.js';
 import {
@@ -118,6 +119,12 @@ export function createReplWakeupTool(
 export interface NextTuiWakeupDeps {
   /** next 의 `busy`(채팅 턴·압축·provider·harness 명령 중). */
   isTurnRunning: () => boolean;
+  /** 입력칸이 실제로 앞에 있는가; 로그·파일 선택·사이드탭 위로 자동 턴이 끼어들지 않는다. */
+  isInputForeground?: () => boolean;
+  /** 자리 opt-in(`autowake`) 우편은 외부 pane 입력 대신 이 H2 문으로 받는다. */
+  enableSeatMailWake?: boolean;
+  /** Isolated mail source for the opt-in revocation race test. */
+  mailWakeOptions?: Omit<NextMailWakeDeps, 'startTurnIfIdle'>;
   /** 입력칸 글 — 비어 있지 않으면 문이 HumanTyping 으로 거부한다. */
   getBufferText: () => string;
   /** 턴 중 쌓인 대기 제출 수 — 있으면 사람 몫이 먼저다(HumanTyping). */
@@ -141,6 +148,8 @@ export interface NextTuiWakeup {
   /** REPL 자식이 부를 도구(부모 handler) — 하니스 자식이면 null. */
   readonly tool: LLMToolDef | null;
   banner(request: Pick<InternalTurnRequest, 'origin' | 'reason'>): string;
+  /** 키 큐에서 홉을 꺼낼 때 다시 확인한다. 판정 뒤 사람이 포커스·초안·대기 제출을 바꿀 수 있다. */
+  takePendingIfIdle(): InternalTurnRequest | null;
   dispose(): void;
 }
 
@@ -151,6 +160,7 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     && env.ELANOUS_TEST_FAST_WAKEUP_CLOCK === '1';
   const gate = createInternalTurnGate({
     isTurnRunning: deps.isTurnRunning,
+    ...(deps.isInputForeground ? { isInputForeground: deps.isInputForeground } : {}),
     getBufferText: deps.getBufferText,
     getTypeaheadCount: deps.getQueuedCount,
     isEnabled: () => isInternalTurnEnabledByEnv(env),
@@ -171,12 +181,36 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     ...(deps.log ? { log: deps.log } : {}),
   });
   const tool = env.ELANOUS_HARNESS_ROLE?.trim() ? null : buildScheduleWakeupHostTool(scheduler);
+  const mailWake = deps.enableSeatMailWake && !env.ELANOUS_HARNESS_ROLE?.trim()
+    ? createNextMailWake({ ...deps.mailWakeOptions, startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
+      intervalMs: deps.mailWakeOptions?.intervalMs ?? (acceleratedTestClock ? 1_000 : undefined) }) : null;
   return {
     gate,
     scheduler,
     tool,
     banner: formatInternalTurnBanner,
+    takePendingIfIdle() {
+      if (mailWake && !mailWake.pendingDeliveryAllowed()) {
+        gate.port.declined?.('mail-opt-in-revoked');
+        mailWake.withdrawPending();
+        return null;
+      }
+      const detail = deps.isTurnRunning() ? 'turn-running'
+        : deps.getBufferText().length > 0 ? 'buffer'
+        : deps.pendingKeyCount && deps.pendingKeyCount() > 0 ? 'unread-keys'
+        : deps.getQueuedCount() > 0 ? 'typeahead'
+        : deps.isInputForeground && !deps.isInputForeground() ? 'input-not-foreground' : null;
+      if (detail) {
+        gate.port.declined?.(detail);
+        mailWake?.withdrawPending();
+        return null;
+      }
+      const request = gate.takePending();
+      if (request?.origin === 'msg-wake') mailWake?.confirmDelivery();
+      return request;
+    },
     dispose() {
+      mailWake?.dispose();
       scheduler.dispose();
       gate.port.detach({ yielded: true });
     },

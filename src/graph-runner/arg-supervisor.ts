@@ -7,7 +7,8 @@ import { claimIncident, createFileIncidentClaimStore, isIncidentClaimCurrent, wi
 import { MACROPHAGE_REPAIR_LADDER_LIMITS } from '../release-loop/macrophage-repair-ladder.js';
 import { proposeOpenArg, recordOpenArgMemory, validateOpenArgProposal, type ArgOpenDecision, type ArgOpenProposal } from './arg-open-proposal.js';
 import { ArgFeedbackDurabilityError, readArgFeedback, type ArgFeedbackLedgerPort, type ArgFeedbackSignature } from './arg-feedback-consumer.js';
-import { runGraph, type GraphRunState } from './runner.js';
+import { readGraphRun, runGraph, type GraphRunState } from './runner.js';
+import { assertReleaseKnownIssueWaiverApproval, T6_WAIVER_DOCUMENT_SHA, T6_WAIVER_TABLE_SHA } from './release-known-issue-waiver.js';
 
 export type ArgVerb = 'observe' | 'propose' | 'validate' | 'apply' | 'verify' | 'rollback';
 export type ArgOperation = 'reroute' | 'add-node' | 'repair' | 'hitl'
@@ -17,7 +18,9 @@ export type ArgEffect =
   | { readonly kind: 'vocabulary'; readonly term: string }
   | { readonly kind: 'node'; readonly nodeId: string }
   | { readonly kind: 'repair'; readonly nodeId: string }
-  | { readonly kind: 'hitl'; readonly decisionId: string };
+  | { readonly kind: 'hitl'; readonly decisionId: string }
+  | { readonly kind: 'gate-waiver'; readonly from: 'gate-heal-decision'; readonly to: 'traffic-gate-passed';
+      readonly evidence: { readonly documentSha256: string; readonly tableSha256: string } };
 /** Stable identity for the complete, validated graph effect, independent of object key order. */
 export const argEffectKey = (effect: ArgEffect): string => {
   const fields = Object.entries(effect).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
@@ -32,6 +35,9 @@ const effectOperation = (effect: ArgEffect): ArgSupervisorTickRequest['operation
   if (effect.kind === 'node' && typeof effect.nodeId === 'string' && effect.nodeId.trim()) return 'add-node';
   if (effect.kind === 'repair' && typeof effect.nodeId === 'string' && effect.nodeId.trim()) return 'repair';
   if (effect.kind === 'hitl' && typeof effect.decisionId === 'string' && effect.decisionId.trim()) return 'hitl';
+  if (effect.kind === 'gate-waiver' && effect.from === 'gate-heal-decision' && effect.to === 'traffic-gate-passed' &&
+      effect.evidence?.documentSha256 === T6_WAIVER_DOCUMENT_SHA && effect.evidence.tableSha256 === T6_WAIVER_TABLE_SHA)
+    return 'gate-waiver';
   return undefined;
 };
 export interface ArgStepResult {
@@ -101,7 +107,8 @@ export async function runArgSupervisorTick(request: ArgSupervisorTickRequest): P
   const memory = card?.templateMemory as Record<string, unknown> | undefined;
   const packs = card?.knowledgePacks;
   const authority = card?.authority;
-  if (card?.apiVersion !== 'elanous.dev/loop/v1' || identity !== 'loop:rla@1' ||
+  if (card?.apiVersion !== 'elanous.dev/loop/v1' || typeof identity !== 'string' ||
+      !/^loop:[a-z][a-z0-9-]*@[1-9]\d*$/.test(identity) ||
       typeof graph !== 'string' || !/^\.\/[a-z][a-z0-9-]*\.yaml$/.test(graph) ||
       cardBody?.role !== 'primary' || !Array.isArray(cardBody?.supervises) || !cardBody.supervises.includes(request.targetGraphId) ||
       !Array.isArray(cardBody.extensions) || !cardBody.extensions.includes('elanous.dev/arg') ||
@@ -208,6 +215,16 @@ export async function runArgSupervisorTick(request: ArgSupervisorTickRequest): P
           renameSync(temporary, request.vocabularyOverlay.path);
         }
         request.mutableState.adaptiveGraphVocabulary = [...new Set([...(request.mutableState.adaptiveGraphVocabulary ?? []), effect.term])];
+      } else if (effect.kind === 'gate-waiver') {
+        if (request.targetGraphId !== 'release-loop') return { outcome: 'fail', evidence: 'gate waiver requires release-loop' };
+        assertReleaseKnownIssueWaiverApproval(readGraphRun(request.targetGraphId, request.targetRunId, request.root), request.root);
+        const edges = request.mutableState.adaptiveGraphEdges ?? [];
+        if (edges.some((edge) => edge.eventId === effect.evidence.documentSha256 && edge.subscriberId === 'arg-gate-waiver'))
+          return { outcome: 'reuse', evidence: 'gate waiver edge already installed', graphRevision: request.mutableState.graphRevision };
+        request.mutableState.adaptiveGraphEdges = [...edges, { from: effect.from, to: effect.to,
+          triggerEvent: 'release.gate.waiver', rationale: `JUD:${effect.evidence.tableSha256}`,
+          eventId: effect.evidence.documentSha256, subscriberId: 'arg-gate-waiver' }];
+        request.mutableState.adaptiveGraphVocabulary = [...new Set([...(request.mutableState.adaptiveGraphVocabulary ?? []), 'release.gate.waiver'])];
       } else return { outcome: 'input_required', evidence: 'high-risk ARG effect requires MRTR approval' };
       request.mutableState.graphRevision = (request.mutableState.graphRevision ?? request.graphRevision) + 1;
       await request.ports.persist?.();

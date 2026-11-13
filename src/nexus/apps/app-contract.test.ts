@@ -4,6 +4,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseAppManifest } from './app-contract.js';
+import { createAppDatabase } from './app-db.js';
 import { createAppSimulationStore } from './app-simulation-db.js';
 import { createAppSimulationRoute } from './app-simulation-route.js';
 import { runRegisteredAppSimulation } from './app-simulation-runner.js';
@@ -57,6 +58,41 @@ describe('NEXUS-APP-CONTRACT', () => {
       builtin: 'extract', input: { url: 'text' },
       output: { url: 'text', title: 'text', excerpt: 'text', content: 'text', provider: 'text' }, uses: [],
     });
+  });
+  test('lecture note input is owner-only and pages to the first note after reopening the app database', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lecture-scrap-live-note-'));
+    try {
+      const parsed = parseAppManifest(readFileSync(join(import.meta.dir, '../../../templates/next-app-lecture-scrap/app.yaml'), 'utf8'));
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+      const first = createAppDatabase([parsed.manifest], { directory });
+      try {
+        expect(() => first.rpc('lecture-scrap', 'addLectureNote', {
+          id: 'note-1', title: '첫 노트', body: '실제 저장', created_at: '2026-11-12T00:00:00.000Z',
+        }, 'public')).toThrow('app role is not allowed');
+        first.rpc('lecture-scrap', 'addLectureNote', {
+          id: 'note-1', title: '첫 노트', body: '실제 저장', created_at: '2026-11-12T00:00:00.000Z',
+        }, 'owner');
+      } finally { first.close(); }
+      const reopened = createAppDatabase([parsed.manifest], { directory });
+      try {
+        expect(reopened.rpc('lecture-scrap', 'listLectureNotes', {}, 'owner'))
+          .toMatchObject([{ id: 'note-1', title: '첫 노트', body: '실제 저장' }]);
+        // Source: #23480; twenty later saves make the original the twenty-first note.
+        for (let index = 2; index <= 21; index++) reopened.rpc('lecture-scrap', 'addLectureNote', {
+          id: `note-${index}`, title: `나중 노트 ${index}`, body: '다음 페이지 검증',
+          created_at: new Date(Date.parse('2026-11-12T00:00:00.000Z') + index * 1000).toISOString(),
+        }, 'owner');
+        const firstPage = reopened.rpc('lecture-scrap', 'listLectureNotes', {}, 'owner') as Array<{ id: string; created_at: string }>;
+        expect(firstPage).toHaveLength(20);
+        expect(firstPage.some(note => note.id === 'note-1')).toBe(false);
+        const cursor = firstPage.at(-1)!;
+        expect(reopened.rpc('lecture-scrap', 'listLectureNotes', { beforeCreatedAt: cursor.created_at, beforeId: cursor.id }, 'owner'))
+          .toMatchObject([{ id: 'note-1', title: '첫 노트', body: '실제 저장' }]);
+        expect(() => reopened.rpc('lecture-scrap', 'listLectureNotes', {}, 'public'))
+          .toThrow('app role is not allowed');
+      } finally { reopened.close(); }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
   test('KAIST lecture-scrap static build is served at canonical routes by the registered simulation and receipt route', async () => {
     const root = join(import.meta.dir, '../../../templates/next-app-lecture-scrap');

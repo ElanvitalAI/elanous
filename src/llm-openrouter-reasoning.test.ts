@@ -1,7 +1,8 @@
+import { beforeEach, afterEach } from 'bun:test';
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
 import { getProviderForConfig, type LLMOpts } from './llm.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import type { UserConfig } from './user-config/types.js';
 
 // OpenRouter effort request bodies and non-OpenRouter byte preservation; fetch is mocked (no API calls).
@@ -10,7 +11,7 @@ const messages = [{ role: 'user' as const, content: 'hello' }];
 
 async function captureRaw(provider: string, model: string, opts: LLMOpts = {}, reasoningLevel?: 'off' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<string> {
   const bodies: string[] = [];
-  await withFakeFetchDevice([
+  await withRealProviderFakeFetchDevice([
     { url: '/api/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
     { url: '/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
   ], async (device) => {
@@ -132,7 +133,7 @@ test('openrouter: cross-family model route preserves the resolved config effort'
     const provider = getProviderForConfig(config, model);
     expect(provider.name).toBe('openrouter');
     const bodies: string[] = [];
-    await withFakeFetchDevice([{ url: '/api/v1/chat/completions', method: 'POST', response: (request) => {
+    await withRealProviderFakeFetchDevice([{ url: '/api/v1/chat/completions', method: 'POST', response: (request) => {
       bodies.push(request.body ?? '');
       return new Response('data: [DONE]\n\n', { status: 200 });
     } }], async (device) => {
@@ -173,3 +174,11 @@ for (const [provider, model] of [['grok', 'grok-4.7'], ['openai', 'gpt-5.6'], ['
     expect(withEffort.usage).toBeUndefined();
   });
 }
+
+// Provider wire expectations run with a fake HTTP transport, not the gate's default fake LLM.
+let previousWireMode: string | undefined;
+beforeEach(() => { previousWireMode = process.env.ELANOUS_LLM_MODE; process.env.ELANOUS_LLM_MODE = 'real'; });
+afterEach(() => {
+  if (previousWireMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+  else process.env.ELANOUS_LLM_MODE = previousWireMode;
+});

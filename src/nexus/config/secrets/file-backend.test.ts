@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync, existsSync, openSync, fsyncSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../../elanous-config-dir.js';
-import { fileBackend, importSecretsFileRaw, writeSecretsFileRaw } from './file-backend.js';
+import { fileBackend, importSecretsFileRaw, setSecretFileSyncHooksForTest, writeSecretsFileRaw } from './file-backend.js';
 
 if (process.env.ELANOUS_SECRETS_RACE_WORKER === '1') {
   setElanousConfigDir(process.env.ELANOUS_SECRETS_RACE_DIR!);
@@ -13,7 +13,7 @@ if (process.env.ELANOUS_SECRETS_RACE_WORKER === '1') {
 } else {
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'secrets-file-')); setElanousConfigDir(dir); });
-afterEach(() => { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { setSecretFileSyncHooksForTest(null); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); });
 
 test('corrupt or version-mismatched secrets never become an empty store on set or delete', async () => {
   const path = join(dir, 'secrets.json');
@@ -107,4 +107,46 @@ test('simultaneously released processes serialize writes to the same secrets fil
     for (const worker of workers) worker.kill();
   }
 }, 30_000);
+test('Windows EPERM model uses writable descriptors through actual backend write and backup', async () => {
+  const opened = new Map<number, string>();
+  const synced: string[] = [];
+  setSecretFileSyncHooksForTest({
+    platform: 'win32',
+    openFile: (path, flags) => { const fd = openSync(path, flags); opened.set(fd, flags); return fd; },
+    sync: (fd) => {
+      const flags = opened.get(fd);
+      if (flags === 'r') throw Object.assign(new Error('Windows read-only fsync'), { code: 'EPERM' });
+      synced.push(flags ?? 'directory');
+      fsyncSync(fd);
+    },
+  });
+  await fileBackend.set('first', 'one');
+  await fileBackend.set('second', 'two');
+  expect(synced).toEqual(['r+', 'r+', 'r+']);
+  expect(JSON.parse(readFileSync(join(dir, 'secrets.json'), 'utf8')).secrets).toEqual({ first: 'one', second: 'two' });
+  expect(JSON.parse(readFileSync(join(dir, 'secrets.json.bak'), 'utf8')).secrets).toEqual({ first: 'one' });
+  expect(readdirSync(dir).sort()).toEqual(['secrets.json', 'secrets.json.bak']);
+});
+
+test('backend fsync error leaves the previous secret and backup intact', async () => {
+  await fileBackend.set('first', 'one');
+  await fileBackend.set('second', 'two');
+  const path = join(dir, 'secrets.json');
+  const before = readFileSync(path, 'utf8');
+  const backup = readFileSync(`${path}.bak`, 'utf8');
+  for (const code of ['EPERM', 'EACCES']) {
+    setSecretFileSyncHooksForTest({ platform: 'win32', sync: () => { throw Object.assign(new Error(code), { code }); } });
+    await expect(fileBackend.set('third', 'three')).rejects.toThrow(code);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect(readFileSync(`${path}.bak`, 'utf8')).toBe(backup);
+    expect(readdirSync(dir).sort()).toEqual(['secrets.json', 'secrets.json.bak']);
+  }
+});
+
+test('non-Windows backend still calls directory fsync', async () => {
+  let calls = 0;
+  setSecretFileSyncHooksForTest({ platform: 'darwin', sync: (fd) => { calls += 1; fsyncSync(fd); } });
+  await fileBackend.set('first', 'one');
+  expect(calls).toBe(2);
+});
 }

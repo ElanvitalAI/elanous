@@ -260,6 +260,20 @@ export const testFakeLlmProvider: LLMProvider = {
     const call = scriptedToolCall(messages);
     if (call) { yield call; return; }
     for (const delta of responseChunks(testFakeLlmResponse(messages))) yield { type: 'text', delta };
+    // Explicit device telemetry, supplied by the test world rather than
+    // estimated from the answer. Ordinary fake turns report no usage.
+    const measured = process.env.ELANOUS_TEST_FAKE_LLM_MEASURED_USAGE;
+    if (measured) {
+      try {
+        const usage = JSON.parse(measured) as { inputTokens?: unknown; outputTokens?: unknown };
+        if (usage && typeof usage === 'object'
+          && typeof usage.inputTokens === 'number' && typeof usage.outputTokens === 'number'
+          && Number.isSafeInteger(usage.inputTokens) && Number.isSafeInteger(usage.outputTokens)
+          && usage.inputTokens >= 0 && usage.outputTokens >= 0) {
+          yield { type: 'usage', usage: { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens } };
+        }
+      } catch { /* a malformed device value cannot become measured usage */ }
+    }
   },
 };
 

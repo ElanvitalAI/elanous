@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { compareContractShadowFailures, contractTestCandidate, publicContract } from './contract-test-select.js';
+import { compareContractShadowFailures, contractTestCandidate, fullContractTestCandidate, publicContract, runContractTestPrimary } from './contract-test-select.js';
 import surfaces from './gate-contract-surfaces.json';
 
 const runner = 'src/graph-runner/runner.ts';
@@ -32,6 +32,32 @@ test('shadow failure join requires the measured full inventory and preserves unk
     savedTests: null, missedFailures: null });
   expect(compareContractShadowFailures({ ...input, failureIds: ['unknown.test.ts > fails'] })).toMatchObject({ comparison: 'unmeasured',
     observedFailureCount: null, missedFailureCount: null });
+});
+
+test('opt-in primary run executes only the candidate list and remains disabled by default', async () => {
+  const candidate = { status: 'limited' as const, reason: 'unchanged contract', files: ['a.test.ts'], direct: 1, twoHop: 1 };
+  let selected: readonly string[] | undefined;
+  const disabled = await runContractTestPrimary({ enabled: false, candidate, sweep: async (only) => {
+    selected = only; return { rc: 0 };
+  } });
+  expect(disabled).toMatchObject({ status: 'disabled', rc: null });
+  expect(selected).toBeUndefined();
+  const measured = await runContractTestPrimary({ enabled: true, candidate, sweep: async (only) => {
+    selected = only; return { rc: 0 };
+  } });
+  expect(selected).toEqual(['a.test.ts']);
+  expect(measured).toMatchObject({ status: 'measured', selectedFiles: ['a.test.ts'], rc: 0 });
+  const failed = await runContractTestPrimary({ enabled: true, candidate, sweep: async (only) => {
+    expect(only).toEqual(['a.test.ts']); return { rc: 1 };
+  } });
+  expect(failed).toMatchObject({ status: 'measured', rc: 1 });
+});
+
+test('unreadable selector evidence uses the full test inventory as a conservative candidate', () => {
+  const tests = ['src/a.test.ts', 'src/b.test.ts'];
+  expect(fullContractTestCandidate(tests, 'selection evidence unavailable')).toEqual({
+    status: 'full', reason: 'selection evidence unavailable', files: tests, direct: 0, twoHop: 0,
+  });
 });
 
 test('implementation changes select direct and two-hop tests; contract and other changes expand to full', () => {
@@ -73,6 +99,8 @@ test('implementation changes select direct and two-hop tests; contract and other
     tests: files.filter((f) => f.endsWith('.test.ts')) }).reason).toBe(`public contract changed: ${runner}`);
   expect(contractTestCandidate({ tree: actualTree, priorRead: (path) => path === runner ? current : undefined,
     changed: [runner, 'src/helper.ts'], tests: files.filter((f) => f.endsWith('.test.ts')) }).status).toBe('full');
+  expect(contractTestCandidate({ tree: actualTree, priorRead: (path) => path === runner ? current : undefined,
+    changed: [runner, 'package.json'], tests: files.filter((f) => f.endsWith('.test.ts')) }).status).toBe('full');
   expect(publicContract(runner, current.replace('export function withRunnerGateObservation<T>(', 'export function renamedObservation<T>(')).names)
     .not.toEqual(surfaces[runner]);
 });

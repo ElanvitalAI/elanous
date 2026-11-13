@@ -6,6 +6,7 @@ import { decideGraphApproval, runGraph } from '../../../src/graph-runner/runner.
 import { runSharedDeliverables } from '../../../src/ux-sim/gcp-architect-expand/shared-deliverables.js';
 import { registerGcpScene5FakeProvider } from '../../../src/ux-sim/gcp-architect-expand/scene5-fake-provider.js';
 import { ticketDesignFromArchitectureJson } from './design-result.js';
+import { scene5DecisionPacket } from './decision-packet.js';
 
 const repo = resolve(import.meta.dir, '../../..');
 const plugin = resolve(repo, 'plugins/gcp-architect-expand');
@@ -20,30 +21,30 @@ const decision = process.argv[5];
 if (decision !== undefined && decision !== 'y' && decision !== 'N') throw new Error('fake-world decision must be y or N');
 const externalDesign = process.argv[3] !== undefined;
 if (externalDesign && process.argv[4] === undefined) throw new Error('structured design JSON requires an explicit capacity signal path');
-const sourceDir = externalDesign ? join(target, 'generated-from-design') : join(plugin, 'sim/sample-output');
-const proposalPath = join(sourceDir, 'proposal.json');
+const sourceDir = join(target, 'generated-from-design');
+const proposalDir = sourceDir;
+const proposalPath = join(proposalDir, 'proposal.json');
 const iconRegistryPath = join(repo, 'plugins/architecture-deliverables/references/official-gcp-icons.json');
 const sha256 = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
-if (externalDesign) {
-  mkdirSync(sourceDir, { recursive: true });
-  const propose = Bun.spawnSync(['bun', join(scriptDir, 'propose.ts'), '--ticket-design', ticketDesignPath,
-    '--pressure', pressurePath, '--output', proposalPath], { cwd: repo, stdout: 'pipe', stderr: 'pipe' });
-  if (propose.exitCode !== 0) throw new Error(`structured design proposal failed: ${new TextDecoder().decode(propose.stderr).slice(0, 600)}`);
-  const rendererDir = join(repo, 'skills/diagram-master/references');
-  const prepare = (command: string[]) => {
-    const result = Bun.spawnSync(command, { cwd: rendererDir, stdout: 'pipe', stderr: 'pipe' });
-    if (result.exitCode !== 0) {
-      const detail = new TextDecoder().decode(result.stderr).trim().split('\n').at(-1) ?? 'unknown error';
-      throw new Error(`fake-world renderer setup failed — cd ${rendererDir} && uv sync --extra python-engines && uv run --extra python-engines playwright install chromium (${detail})`);
-    }
-  };
-  prepare(['uv', 'sync', '--extra', 'python-engines']);
-  prepare(['uv', 'run', '--extra', 'python-engines', 'playwright', 'install', 'chromium']);
-  const render = Bun.spawnSync(['uv', 'run', '--extra', 'python-engines', 'python',
-    join(scriptDir, '../sim/build-sample.py'), '--proposal', proposalPath, '--output', sourceDir],
-    { cwd: rendererDir, stdout: 'pipe', stderr: 'pipe' });
-  if (render.exitCode !== 0) throw new Error(`fake-world design source render failed: ${new TextDecoder().decode(render.stderr).trim().split('\n').at(-1)}`);
-}
+mkdirSync(proposalDir, { recursive: true });
+const propose = Bun.spawnSync(['bun', join(scriptDir, 'propose.ts'), '--ticket-design', ticketDesignPath,
+  '--pressure', pressurePath, '--output', proposalPath], { cwd: repo, stdout: 'pipe', stderr: 'pipe' });
+if (propose.exitCode !== 0) throw new Error(`structured design proposal failed: ${new TextDecoder().decode(propose.stderr).slice(0, 600)}`);
+mkdirSync(sourceDir, { recursive: true });
+const rendererDir = join(repo, 'skills/diagram-master/references');
+const prepare = (command: string[]) => {
+  const result = Bun.spawnSync(command, { cwd: rendererDir, stdout: 'pipe', stderr: 'pipe' });
+  if (result.exitCode !== 0) {
+    const detail = new TextDecoder().decode(result.stderr).trim().split('\n').at(-1) ?? 'unknown error';
+    throw new Error(`fake-world renderer setup failed — cd ${rendererDir} && uv sync --extra python-engines && uv run --extra python-engines playwright install chromium (${detail})`);
+  }
+};
+prepare(['uv', 'sync', '--extra', 'python-engines']);
+prepare(['uv', 'run', '--extra', 'python-engines', 'playwright', 'install', 'chromium']);
+const render = Bun.spawnSync(['uv', 'run', '--extra', 'python-engines', 'python',
+  join(scriptDir, '../sim/build-sample.py'), '--proposal', proposalPath, '--output', sourceDir],
+  { cwd: rendererDir, stdout: 'pipe', stderr: 'pipe' });
+if (render.exitCode !== 0) throw new Error(`fake-world design source render failed: ${new TextDecoder().decode(render.stderr).trim().split('\n').at(-1)}`);
 const proposal = JSON.parse(readFileSync(proposalPath, 'utf8'));
 const pressure = JSON.parse(readFileSync(pressurePath, 'utf8'));
 const ticket = ticketDesignFromArchitectureJson(JSON.parse(readFileSync(ticketDesignPath, 'utf8')) as unknown);
@@ -86,7 +87,7 @@ diagram.metadata = { ...(diagram.metadata ?? {}), iconLibraryUrl:'https://cloud.
 writeFileSync(diagramPath, JSON.stringify(diagram,null,2)+'\n');
 const called: string[] = [];
 const registry = registerGcpScene5FakeProvider({
-  proposal, pressure, outDir, stateRoot,
+  pressure, outDir, stateRoot, designNodeId: 'design',
   onInvoke: nodeId => called.push(nodeId),
   deliverables: () => runSharedDeliverables({ designHtmlPath:htmlPath, diagramSourcePath:diagramPath,
     outDir,stateRoot:join(target,'shared-graph-state'),resourceRoot:repo,attachmentUrlBase:outDir }),
@@ -95,6 +96,33 @@ let graph = await runGraph(join(plugin,'graph.yaml'), {input:{ticketDesignPath,c
   deps:{root:stateRoot,capabilityProviders:registry}});
 if (graph.status !== 'awaiting-approval' || graph.pending?.nodeId !== 'approve') throw new Error(`expected spending gate after outputs, got ${graph.status}/${graph.pending?.nodeId}`);
 if (called.join(',') !== 'detect,design,deliverables') throw new Error(`unexpected provider calls: ${called.join(',')}`);
+const designOutputText = graph.nodes.find(node => node.nodeId === 'design')?.output;
+if (typeof designOutputText !== 'string') throw new Error('design graph output missing');
+const graphDesign = JSON.parse(designOutputText).result?.architectureSpec;
+const graphTicket = graphDesign?.ticketDesign;
+if (graphDesign?.inputSha256 !== sha256(ticketDesignPath) || !graphTicket?.sourceKind)
+  throw new Error('graph design output does not preserve the supplied Scene 4 input');
+if (JSON.stringify(graphTicket) !== JSON.stringify(ticket)) throw new Error('graph design output trace differs from the Scene 4 input');
+const verificationPath = join(outDir,'verification.json');
+const verification = JSON.parse(readFileSync(verificationPath,'utf8'));
+if (verification.status !== 'verified') throw new Error('shared output not verified');
+const files = ['architecture.excalidraw','architecture.png','architecture.pdf','architecture.html','verification.json'];
+for (const name of files) if (!existsSync(join(outDir,name))) throw new Error(`missing ${name}`);
+const deliverablesOutput = graph.nodes.find(node => node.nodeId === 'deliverables')?.output;
+if (typeof deliverablesOutput !== 'string') throw new Error('deliverables graph output missing');
+const output = JSON.parse(deliverablesOutput);
+const attachments = output.result?.attachments ?? [];
+if (!/^\.architecture-bundles\/\.architecture-stage-[A-Za-z0-9]+$/u.test(verification.immutableDirectory ?? ''))
+  throw new Error('verified immutable architecture bundle path missing');
+if (!verification.sha256 || attachments.some((item:{sha256:string;url:string}) => item.sha256 !== sha256(item.url)))
+  throw new Error('attachment contract/hash mismatch');
+const packet = scene5DecisionPacket({graphId:graph.graphId,runId:graph.runId,pendingNode:graph.pending?.nodeId,
+  designSha256:sha256(ticketDesignPath),proposal,
+  designOutput:JSON.parse(designOutputText),
+  artifactDirectory:join(outDir,verification.immutableDirectory),verifiedSha256:verification.sha256,
+  attachments,verified:verification.status === 'verified'});
+const packetPath = join(target,'scene5-decision-packet.json');
+writeFileSync(packetPath,JSON.stringify(packet,null,2)+'\n');
 if (decision) {
   decideGraphApproval(graph.graphId, graph.runId, decision === 'y' ? 'approved' : 'rejected', 'fake-test-user', stateRoot);
   graph = await runGraph(join(plugin,'graph.yaml'), {resumeRunId:graph.runId,resumeGraphId:graph.graphId,quiet:true,
@@ -112,30 +140,20 @@ if (decision === 'y') {
     || Date.parse(ledger.events[2].at) - Date.parse(ledger.events[1].at) !== proposal.idleTtlMs)
     throw new Error('fake world did not stop after the declared idle TTL');
 } else if (existsSync(fakeCostLedgerPath)) throw new Error('fake project created without y approval');
-const verificationPath = join(outDir,'verification.json');
-const verification = JSON.parse(readFileSync(verificationPath,'utf8'));
-if (verification.status !== 'verified') throw new Error('shared output not verified');
-const files = ['architecture.excalidraw','architecture.png','architecture.pdf','architecture.html','verification.json'];
-for (const name of files) if (!existsSync(join(outDir,name))) throw new Error(`missing ${name}`);
-const deliverablesOutput = graph.nodes.find(node => node.nodeId === 'deliverables')?.output;
-if (typeof deliverablesOutput !== 'string') throw new Error('deliverables graph output missing');
-const output = JSON.parse(deliverablesOutput);
-const attachments = output.result?.attachments ?? [];
-if (attachments.length !== 4 || attachments.some((item:{sha256:string;url:string}) => item.sha256 !== sha256(item.url))) throw new Error('attachment contract/hash mismatch');
 const receipt = {checkedAt:new Date().toISOString(),mode:'direct runGraph in isolated test world',graphId:graph.graphId,runId:graph.runId,
   status:graph.status,pendingNode:graph.pending?.nodeId ?? null,decision:decision ?? null,executedNodes:called,
   fakeLifecycleExecuted:decision === 'y',spendingNodesExecuted:false,realGcpCalls:0,
   fakeCostLedgerPath:decision === 'y' ? fakeCostLedgerPath : null,
-  input:{ticketDesignPath,designResultSha256:sha256(ticketDesignPath),sourceKind:ticket.sourceKind,
-    sourceSessionId:ticket.sourceSessionId ?? null,sourceGraphRunId:ticket.sourceGraphRunId ?? null,
+  input:{ticketDesignPath,designResultSha256:sha256(ticketDesignPath),sourceKind:graphTicket.sourceKind,
+    sourceSessionId:graphTicket.sourceSessionId ?? null,sourceGraphRunId:graphTicket.sourceGraphRunId ?? null,
     pressurePath,proposalPath,sourceHtml:join(sourceDir,'architecture-design.html'),sourceDiagram:join(sourceDir,'architecture.excalidraw')},
   assumptions:proposal.assumptions ?? [],assumptionStatus:proposal.assumptionStatus ?? 'none',
-  sharedGraphId:output.result.graphId,sharedGraphRunId:output.result.runId,verification,
+  scene5DecisionPacketPath:packetPath,sharedGraphId:output.result.graphId,sharedGraphRunId:output.result.runId,verification,
   files:files.map(name=>({path:join(outDir,name),sha256:sha256(join(outDir,name))})),attachments,
-  limitations:[externalDesign ? 'structured architecture JSON supplied by caller' : 'synthetic ticket design fixture',
+  limitations:[externalDesign ? 'structured architecture JSON supplied by caller' : 'R-TICKET structured Scene 4 fixture; not a live Scene 2/3 acceptance record',
     pressure.source === 'synthetic-demo-fixture' ? 'synthetic pressure fixture' : 'caller-supplied pressure JSON',
     'diagram/PDF content uses the existing fake-world renderer adapted for the common output contract',
     decision ? 'HITL decision injected by fake test driver; no actual TUI interaction' : 'no HITL approval or GCP provisioning executed',
     'no real GCP provisioning executed','not a classic TUI/board attachment receipt']};
 writeFileSync(join(target,'graph-direct-receipt.json'),JSON.stringify(receipt,null,2)+'\n');
-console.log(JSON.stringify({status:receipt.status,runId:receipt.runId,outDir,receipt:join(target,'graph-direct-receipt.json'),pages:verification.pages,attachments:attachments.length}));
+console.log(JSON.stringify({status:receipt.status,runId:receipt.runId,outDir,decisionPacket:packetPath,receipt:join(target,'graph-direct-receipt.json'),pages:verification.pages,attachments:attachments.length}));

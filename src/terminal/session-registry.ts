@@ -165,6 +165,7 @@ export class TerminalSessionRegistry {
         registryOrigin: spec.registryOrigin,
         registryPurpose: spec.registryPurpose,
         registrySeat: spec.registrySeat,
+        onRawOutput: spec.onRawOutput,
         bounds: spec.bounds,
         sizePreset: spec.sizePreset,
         onExit: (code) => {

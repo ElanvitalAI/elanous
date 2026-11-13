@@ -46,6 +46,39 @@ test('cut-branch prebuilds the cut-commit image for the same graph run before re
   }
 });
 
+test('explicit cut commit prebuilds and attests the image before readiness countdown', () => {
+  const { root } = fixture('0.2.5');
+  const commit = 'a'.repeat(40);
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, chosen: commit, chosenVersion: '0.2.4',
+    branchTip: commit, onMain: false }));
+  const previousPath = process.env.PATH;
+  const previousRoot = process.env.VERSION_NODE_TEST_ROOT;
+  const previousContext = process.env.ELANOUS_GRAPH_CONTEXT;
+  const runId = 'explicit-cut-gate-run';
+  process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
+  process.env.VERSION_NODE_TEST_ROOT = root;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId, input: { version: '0.2.4', cutCommit: commit,
+    gateExecutor: 'pod', gateImagePin: 'cut-commit', gatePodPool: 'pool-a@aws1:1' }, outputs: {} });
+  const calls: unknown[] = [];
+  try {
+    const output = versionNodeMain(['release', '--version', '0.2.4', '--cut-commit', commit], root, {
+      prebuildGateImage: (input) => {
+        calls.push(input);
+        return { outcome: 'reused', runId: input.runId, cutCommit: input.commit,
+          digest: `sha256:${'d'.repeat(64)}`, eligiblePools: ['pool-a'] };
+      },
+    });
+    expect(calls).toEqual([{ root: expect.any(String), repo: root, runId, version: '0.2.4', commit, pool: 'pool-a@aws1:1' }]);
+    expect(output).toMatchObject({ outcome: 'ok', commit, gateImagePrebuild: { outcome: 'reused', runId,
+      cutCommit: commit, eligiblePools: ['pool-a'] } });
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
+    if (previousContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previousContext;
+  }
+});
+
 test('cut-branch refuses graph progress when the image prebuild fails', () => {
   const previous = process.env.ELANOUS_GRAPH_CONTEXT;
   const commit = 'c'.repeat(40);

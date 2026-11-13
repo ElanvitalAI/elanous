@@ -12,7 +12,8 @@ import { hostCredentials } from '../../../task-orchestrator/surfaces/self-implem
 import { setUserConfigOverlay } from '../../../user-config.js';
 import { hqFenceDecision } from '../../../hq/hq.js';
 import { serializeLease } from '../../../hq/lease.js';
-import { credentialOwnerLedgerPath, readCredentialOwner, recordCredentialMirror, resolveCodexCredentialOwnerHost } from './cred-owner.js';
+import { simCli } from '../../../ux-sim/in-process-cli.js';
+import { credentialOwnerLedgerPath, readCredentialOwner, recordCredentialMirror, resolveCodexCredentialOwnerHost, transferCodexCredentialOwner } from './cred-owner.js';
 
 function fakeRemoteShell(home: string, observedHosts: string[] = []): SshRunner {
   return (host, script, timeoutMs, stdin) => {
@@ -202,6 +203,70 @@ test('configured fleet owner is the only ownership source; the local mirror rece
     expect(resolveCodexCredentialOwnerHost({ llm: { codexTokenOwnerHost: 'node-b' } })).toBe('node-b');
     expect(isCodexTokenOwnerHost({ llm: { codexTokenOwnerHost: 'mshq' }, hq: { hostName: 'mshq' } } as never)).toBe(true);
     expect(isCodexTokenOwnerHost({ llm: { codexTokenOwnerHost: 'mshq' }, hq: { hostName: 'node-b' } } as never)).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Codex owner transfer requires the HQ fence and an exact expected-owner CAS', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cred-owner-transfer-'));
+  const configPath = join(root, 'config.json');
+  try {
+    writeFileSync(configPath, JSON.stringify({ version: 1, llm: { codexTokenOwnerHost: 'mshq', provider: 'openai-codex' }, global: { keep: true } }));
+    await expect(transferCodexCredentialOwner({ newOwner: 'aws2', expectedOwner: 'mshq', configPath, hqLeaseHeld: () => false }))
+      .rejects.toThrow('CREDENTIAL_OWNER_TRANSFER_HQ_LEASE_REQUIRED');
+    await expect(transferCodexCredentialOwner({ newOwner: 'aws2', expectedOwner: 'mbp', configPath, hqLeaseHeld: () => true }))
+      .rejects.toThrow('CREDENTIAL_OWNER_TRANSFER_EXPECTED_OWNER_MISMATCH: expected=mbp observed=mshq');
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ llm: { codexTokenOwnerHost: 'mshq', provider: 'openai-codex' } });
+
+    writeFileSync(configPath, JSON.stringify({ version: 1, llm: { codexTokenOwnerHost: 'MSHQ.local', provider: 'openai-codex' }, global: { keep: true } }));
+    await expect(transferCodexCredentialOwner({ newOwner: 'aws2', expectedOwner: 'mshq', configPath, hqLeaseHeld: () => true }))
+      .rejects.toThrow('CREDENTIAL_OWNER_TRANSFER_EXPECTED_OWNER_MISMATCH: expected=mshq observed=MSHQ.local');
+    await expect(transferCodexCredentialOwner({ newOwner: 'aws2', expectedOwner: 'MSHQ.local', configPath, hqLeaseHeld: () => true }))
+      .resolves.toEqual({ previousOwner: 'MSHQ.local', ownerHost: 'aws2' });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({ llm: { codexTokenOwnerHost: 'aws2', provider: 'openai-codex' } });
+    writeFileSync(configPath, JSON.stringify({ version: 1, llm: { codexTokenOwnerHost: 'mshq', provider: 'openai-codex' }, global: { keep: true } }));
+    await expect(transferCodexCredentialOwner({ newOwner: 'AWS2.local', expectedOwner: 'mshq', configPath, hqLeaseHeld: () => true }))
+      .resolves.toEqual({ previousOwner: 'mshq', ownerHost: 'AWS2.local' });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({
+      version: 1, llm: { codexTokenOwnerHost: 'AWS2.local', provider: 'openai-codex' }, global: { keep: true },
+    });
+    await expect(transferCodexCredentialOwner({ newOwner: 'gcp2', expectedOwner: 'mshq', configPath, hqLeaseHeld: () => true }))
+      .rejects.toThrow('CREDENTIAL_OWNER_TRANSFER_EXPECTED_OWNER_MISMATCH: expected=mshq observed=AWS2.local');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('codex mirror transfer-owner CLI reports success and fails with a stale expected owner', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cred-owner-transfer-cli-'));
+  const home = join(root, 'home');
+  const configDir = join(root, 'config');
+  const binDir = join(home, 'bin');
+  const hqDir = join(home, '.elanous-hq');
+  try {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(configDir, { recursive: true });
+    mkdirSync(hqDir, { recursive: true });
+    writeFileSync(join(hqDir, 'host'), 'mshq\n');
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ version: 1,
+      llm: { codexTokenOwnerHost: 'mshq' }, hq: { hostName: 'mshq', arbiter: 'cloud-vm' } }));
+    writeFileSync(join(binDir, 'ssh'), [
+      '#!/bin/sh',
+      'now=$(date +%s)',
+      `printf '%s\\n----\\n{"holder":"mshq","generation":1,"acquiredAt":%s,"renewedAt":%s,"ttlSeconds":1500}\\n' "$now" "$now" "$now"`,
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const run = (expectedOwner: string) => simCli(['codex', 'mirror', 'transfer-owner', 'aws2', '--expected-owner', expectedOwner], {
+      mode: 'spawn', allowPaths: [['codex', 'mirror', 'transfer-owner']], stateRoot: root, configRoot: configDir,
+      injectTestFlag: false, timeoutMs: 15_000, // Source: CLI process-boundary regression remains bounded by the fake HQ lease.
+      env: { HOME: home, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    });
+    const transferred = await run('mshq');
+    expect(transferred.exitCode).toBe(0);
+    expect(transferred.stdout).toContain('Codex owner transfer 완료 · mshq → aws2 · HQ lease=fenced');
+    expect(JSON.parse(readFileSync(join(configDir, 'config.json'), 'utf8'))).toMatchObject({ llm: { codexTokenOwnerHost: 'aws2' } });
+
+    const stale = await run('mshq');
+    expect(stale.exitCode).toBe(1);
+    expect(stale.stderr).toContain('CREDENTIAL_OWNER_TRANSFER_EXPECTED_OWNER_MISMATCH: expected=mshq observed=aws2');
+    expect(JSON.parse(readFileSync(join(configDir, 'config.json'), 'utf8'))).toMatchObject({ llm: { codexTokenOwnerHost: 'aws2' } });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

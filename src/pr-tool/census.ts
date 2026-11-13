@@ -498,10 +498,17 @@ export function readOpenPrs(run: PrToolCommand, options: {
       pendingDiffs.forEach((pr, index) => {
         const patch = results[index];
         if (!patch) throw new Error(`PR #${pr.number}: 수정 줄 조회 결과 없음 · 판정 불가`);
-        if (!patch.ok) throw new Error(`PR #${pr.number}: 수정 줄 조회 실패: ${patch.err || patch.out}`);
+        if (!patch.ok) {
+          if (!/\bHTTP(?:\/\d(?:\.\d)?)?\s+406\b/i.test(`${patch.err} ${patch.out}`))
+            throw new Error(`PR #${pr.number}: 수정 줄 조회 실패: ${patch.err || patch.out}`);
+          // GitHub refuses oversized whole-PR patches. Re-read every file page so
+          // the path overlap verdict remains measured even if the projection was stale.
+          pr.files = pathsFromFilesResult(run('gh', pagesArgs(filesEndpoint(pr.number)), callOpts.opts), pr.number);
+        }
       });
       pendingDiffs.forEach((pr, index) => {
         const patch = results[index]!;
+        if (!patch.ok) return;
         pr.hunks = parseDiffHunks(patch.out);
         options.diffCache?.set(pr.number, pr.headSha, patch.out);
       });
@@ -573,6 +580,13 @@ export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat
   const sameCell = input.cellId ? inventory.prs.filter(pr => pr.cellId === input.cellId) : [];
   if (sameCell.length) reasons.push({ code: 'same-cell', detail: `같은 칸 ${input.cellId} OPEN PR이 있음`, prs: sameCell.map(pr => pr.number) });
   const overlaps = inventory.prs.filter(pr => pr.files.some(file => candidate.has(file)));
+  const unmeasuredHunks = input.hunkOverlap === 'refuse'
+    ? overlaps.filter(pr => pr.hunks === undefined) : [];
+  if (unmeasuredHunks.length) reasons.push({ code: 'file-overlap',
+    detail: '같은 파일의 OPEN PR이 있고 수정 줄은 미측정 · 엄격 겹침 판정 거부',
+    prs: unmeasuredHunks.map(pr => pr.number),
+    files: [...new Set(unmeasuredHunks.flatMap(pr => pr.files.filter(file => candidate.has(file))))],
+  });
   const hunkFiles = new Set<string>();
   const sameHunk = overlaps.filter(pr => {
     const paths = (pr.hunks ?? []).filter(other => input.hunks?.some(own => own.path === other.path && own.start <= other.end && other.start <= own.end)).map(other => other.path);

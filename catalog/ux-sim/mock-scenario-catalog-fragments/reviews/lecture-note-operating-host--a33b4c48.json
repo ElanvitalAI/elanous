@@ -1,0 +1,4 @@
+{
+  "deviceKey": "lecture-note-operating-host",
+  "review": "2026-11-13 TC/H9 A37 재검토: device catalog v32 records an isolated Chrome run through the exported lecture page and operating Nexus App Host. Owner form save, list, Host/database reopen and browser reload are observed; anonymous list is denied. Ordinary member public URL and deployed installation remain separate LIVE measurements. The merged generated manual preserves KCB, chaos, iOS and lecture device rows."
+}

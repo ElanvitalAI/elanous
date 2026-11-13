@@ -54,6 +54,7 @@ import type { TaskSurfaceKind } from './types.js';
 import type { TaskStore } from './store.js';
 import { startToxLoop } from './tox-loop.js';
 import { getUserConfig } from '../user-config/reader.js';
+import type { ReadBudgetInputsDeps } from '../self-implement/budget-gate.js';
 
 export type AndonSubscribeSeam = (
   fn: (signal: AndonSignalLike, kind: AndonSubscriberKind) => void,
@@ -65,6 +66,8 @@ export interface ToxBootOptions {
 
   terminationCheck?: TerminationGate;
   budgetCheck?: BudgetGate;
+  /** Test-only external usage reader for the normal TOX admission gate. */
+  readBudget?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> };
   hasPendingCritical?: () => boolean;
 
   startFeedbackLoop?: boolean;
@@ -167,7 +170,7 @@ export function wireTox(opts: ToxBootOptions = {}): ToxBootHandle {
   if (opts.startFeedbackLoop !== false) loop.start();
   if (opts.startRetryPolicy !== false) retry.start();
   toxLoop = !loopEnabled ? null : startToxLoop({
-    graph, dispatcher, bus, store: opts.store, budgetCheck: opts.budgetCheck,
+    graph, dispatcher, bus, store: opts.store, budgetCheck: opts.budgetCheck, readBudget: opts.readBudget,
     maxConcurrent: loopMaxConcurrent,
     intervalMs: opts.tox?.loop?.intervalMs ?? 1000,
   });

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import type { AgentDisplayEvent } from './agents.js';
 import { decideNextTuiAutoContinue, startNextTuiTurn } from './turn.js';
+import { NextTuiAuthError } from '../../tui-client/next-auth-preflight.js';
 
 test('turn sim streams once, replaces preview, and settles after the runner', async () => {
   const events: string[] = [];
@@ -70,6 +71,18 @@ test('compaction and runner failure reach settle with a failed auto-check', asyn
   expect(events).toEqual(['압축 9→4 메시지', 'tool active']);
   expect(result).toMatchObject({ kind: 'failed', error: 'provider unavailable', compacted: true, compactNote: '압축 9→4 메시지' });
   expect(decideNextTuiAutoContinue(result, 0, '')).toBe('check');
+});
+
+test('only the trusted preflight error carries a public auth failure kind', async () => {
+  const unrelated = await startNextTuiTurn({ sessionId: 's1', text: 'work' }, {
+    run: async () => { throw new Error('provider said Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.'); },
+  }).done;
+  expect(unrelated.kind).toBe('failed');
+  expect(unrelated.authFailureKind).toBeUndefined();
+  const trusted = await startNextTuiTurn({ sessionId: 's1', text: 'work' }, {
+    run: async () => { throw new NextTuiAuthError('codex-auth-missing'); },
+  }).done;
+  expect(trusted.authFailureKind).toBe('codex-auth-missing');
 });
 
 test('Agent progress reaches the display only during the active turn', async () => {

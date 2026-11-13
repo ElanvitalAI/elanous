@@ -66,6 +66,7 @@ export default function KcbTryPage() {
     <p className="text-sm text-muted-foreground">KCB 행사 체험</p>
     <h1 className="text-3xl font-semibold">바로 해 보기</h1>
     <p>원하는 예제 하나를 고르고 짧게 입력해 보세요. 계정당 최대 세 번 실행할 수 있습니다.</p>
+    {ready && <a href="/app/member/invite/" className="text-sm font-medium underline">내 추천 링크 확인</a>}
     <div className="grid gap-3 sm:grid-cols-3" role="group" aria-label="체험 예제">
       {EXAMPLES.map(example => <button key={example.id} type="button" onClick={() => { setSelected(example.id); setAdditional(''); }}
         aria-pressed={selected === example.id} className="rounded-lg border p-4 text-left aria-pressed:border-primary">

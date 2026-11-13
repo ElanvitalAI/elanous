@@ -28,9 +28,20 @@ placement-rubric-v1:
 harness-gc-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/harness/harness-gc.ts" --json'
   timeout_ms: 300000
+judiciary-unknown:
+  approval: '판정국 접수 근거가 모호합니다. 이 요청의 집행을 승인하시겠습니까?'
+machine-sanitize-light:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/ops/machine-sanitize.ts" --root "$HOME/.elanous/sanitize-scratch" --mode light --init-root'
+  timeout_ms: 120000
+machine-sanitize-heavy:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/ops/machine-sanitize.ts" --root "$HOME/.elanous/sanitize-scratch" --mode heavy --init-root'
+  timeout_ms: 120000
 # Source: loop:silence-watch is shadow-only; observations are injected through graph context and claims persist in the state-root incident ledger.
 silence-watch-shadow:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/supervision/silence-watch.ts" --shadow'
 host-reservation-watch-shadow:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/host-reservation-watch.ts"'
   timeout_ms: 120000 # // Source: LOOP-HOST-RESERVATION-WATCH shadow tick must finish before the next five-minute cron tick.
+resource-heartbeat-collect:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/resource-ledger/host-readiness-collector.ts"'
+  timeout_ms: 120000 # Five-minute collection interval; bounded SSH probes per registered host.

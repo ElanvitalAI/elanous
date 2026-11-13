@@ -691,7 +691,7 @@ describe('stream-llm site — reportedCostUsd (G9)', () => {
     };
     const spy = spyOn(debug, 'log');
     try {
-      expect(await streamLLM([{ role: 'user', content: 'hi' }], () => {}, { provider })).toBe('ok');
+      expect(await streamLLM([{ role: 'user', content: 'hi' }], () => {}, { provider, preferExplicitProvider: true })).toBe('ok');
       const row = spy.mock.calls.find((c) => c[0] === 'llm.usage' && c[1] === 'llm-usage' && (c[2] as { site?: string })?.site === 'stream-llm');
       expect(row).toBeDefined();
       expect((row![2] as { cost: unknown }).cost).toMatchObject({ kind: 'actual', usd: 0.0042, source: 'provider-reported' });
@@ -716,7 +716,7 @@ describe('stream-llm site — reportedCostUsd (G9)', () => {
     };
     const spy = spyOn(debug, 'log');
     try {
-      await streamLLM([{ role: 'user', content: 'hi' }], () => {}, { provider });
+      await streamLLM([{ role: 'user', content: 'hi' }], () => {}, { provider, preferExplicitProvider: true });
       const row = spy.mock.calls.find((c) => c[0] === 'llm.usage' && (c[2] as { site?: string })?.site === 'stream-llm');
       expect((row![2] as { cost: { kind: string } }).cost.kind).toBe('unknown');
     } finally {

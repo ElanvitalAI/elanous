@@ -3688,6 +3688,21 @@ describe('셋째 축이 «실행 경로»에 있다 — 실물 진입점', () =>
 //   📏 2026-08-11: 그래서 두 트랙이 같은 파일을 겨눴고 «사람이» 채널로 막았다(검사가 아니라).
 //   ⇒ ask 첫 줄의 「대상 경로」로 ***저작 전에*** 예비 판정한다. ⛔ 이것은 «추정»이고 정본은 TRACED PATHS 다.
 describe('parseAskTargetPathHints — 저작 «전»에 쓸 경로 힌트', () => {
+  test('inline description after a target path is not part of the path', () => {
+    expect(parseAskTargetPathHints('대상 경로: README.md — 한 줄 수정')).toEqual(['README.md']);
+    expect(parseAskTargetPathHints('대상 경로: README.md - 한 줄 수정')).toEqual(['README.md']);
+    expect(parseAskTargetPathHints('대상 경로: src/app.ts(설명)')).toEqual(['src/app.ts']);
+    expect(parseAskTargetPathHints('대상 경로: README.md, 설명')).toEqual(['README.md']);
+    expect(parseAskTargetPathHints('대상 경로: `README.md` 설명')).toEqual(['README.md']);
+    expect(parseAskTargetPathHints('대상 경로: "\'README.md" 설명')).toEqual(["'README.md"]);
+    expect(parseAskTargetPathHintsResult('대상 경로: path with space.ts').rejected[0]?.reason).toBe('has-whitespace');
+    expect(parseAskTargetPathHintsResult('대상 경로: src/my file.ts').rejected[0]?.reason).toBe('has-whitespace');
+    expect(parseAskTargetPathHintsResult('대상 경로: src/my.file name.ts').rejected[0]?.reason).toBe('has-whitespace');
+    expect(parseAskTargetPathHintsResult('대상 경로: src/my file').rejected[0]?.reason).toBe('has-whitespace');
+    expect(parseAskTargetPathHintsResult('대상 경로: `src/my file.ts` 설명').rejected[0]?.reason).toBe('has-whitespace');
+    expect(parseAskTargetPathHintsResult('대상 경로: README.md 설명').rejected[0]?.reason).toBe('has-whitespace');
+    expect(parseAskTargetPathHintsResult('대상 경로: `README.md').rejected[0]?.reason).toBe('not-path-like');
+  });
   test('[first-line-only] 첫 줄의 「대상 경로:」만 읽는다', () => {
     const ask = '대상 경로: src/a.ts · src/b.ts\n\nSituation: 본문에 src/never.ts 가 나와도 안 뽑는다';
     expect(parseAskTargetPathHints(ask)).toEqual(['src/a.ts', 'src/b.ts']);

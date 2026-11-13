@@ -11,6 +11,7 @@ export interface ShellApprovalCallMessage {
   readonly type: typeof CALL_TYPE;
   readonly callId: string;
   readonly command: string;
+  readonly kind?: 'bash' | 'graph';
 }
 
 export interface ShellApprovalResultMessage {
@@ -67,7 +68,24 @@ export function createReplShellApprover(
   proc: ShellApprovalIpcProcess,
   env: NodeJS.ProcessEnv = process.env,
   timeoutMs = NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS,
-): ((command: string) => Promise<boolean>) | null {
+): ((command: string, signal?: AbortSignal) => Promise<boolean>) | null {
+  return createReplApprover(proc, env, timeoutMs, 'bash');
+}
+
+export function createReplGraphApprover(
+  proc: ShellApprovalIpcProcess,
+  env: NodeJS.ProcessEnv = process.env,
+  timeoutMs = NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS,
+): ((prompt: string, signal?: AbortSignal) => Promise<boolean>) | null {
+  return createReplApprover(proc, env, timeoutMs, 'graph');
+}
+
+function createReplApprover(
+  proc: ShellApprovalIpcProcess,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+  kind: 'bash' | 'graph',
+): ((command: string, signal?: AbortSignal) => Promise<boolean>) | null {
   if (env[NEXT_TUI_SHELL_APPROVAL_IPC_ENV] !== '1' || typeof proc.send !== 'function') return null;
   const send = proc.send.bind(proc);
   const waiting = new Map<string, (approved: boolean) => void>();
@@ -81,21 +99,26 @@ export function createReplShellApprover(
     waiting.get(message.callId)?.(message.approved);
   };
   proc.on('message', listener);
-  return (command) => new Promise<boolean>((resolve) => {
-    const callId = `s${++seq}`;
+  return (command, signal) => new Promise<boolean>((resolve) => {
+    if (signal?.aborted) { resolve(false); return; }
+    const callId = `${kind === 'graph' ? 'g' : 's'}${++seq}`;
     const finish = (approved: boolean, reason?: ShellApprovalCancelMessage['reason']): void => {
       if (!waiting.delete(callId)) return;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       if (reason) {
         try { send({ type: SHELL_APPROVAL_CANCEL_TYPE, callId, reason } satisfies ShellApprovalCancelMessage); }
         catch { /* the host may already be closing */ }
       }
       resolve(approved);
     };
+    const onAbort = (): void => finish(false, 'turn-cancelled');
     const timer = setTimeout(() => finish(false, 'timeout'), timeoutMs);
     waiting.set(callId, finish);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) { onAbort(); return; }
     try {
-      send({ type: CALL_TYPE, callId, command } satisfies ShellApprovalCallMessage);
+      send({ type: CALL_TYPE, callId, command, kind } satisfies ShellApprovalCallMessage);
     } catch {
       finish(false);
     }
@@ -119,12 +142,17 @@ export async function dispatchNextTuiBash<T>(opts: {
   readonly command: string;
   readonly enabled: boolean;
   readonly requiresApproval?: boolean;
-  readonly approve: ((command: string) => Promise<boolean>) | null;
+  readonly approve: ((command: string, signal?: AbortSignal) => Promise<boolean>) | null;
+  readonly signal?: AbortSignal;
   readonly dispatch: () => Promise<T>;
 }): Promise<T | { error: string }> {
+  if (opts.signal?.aborted) return { error: 'Bash blocked: turn cancelled.' };
   if (opts.enabled && (opts.requiresApproval ?? isPotentiallyDestructiveShellCommand(opts.command))) {
     if (!opts.approve) return { error: 'Bash blocked: human approval channel is unavailable.' };
-    if (!await opts.approve(opts.command)) return { error: 'Bash blocked: human approval was denied.' };
+    const approved = await opts.approve(opts.command, opts.signal);
+    if (opts.signal?.aborted) return { error: 'Bash blocked: turn cancelled.' };
+    if (!approved) return { error: 'Bash blocked: human approval was denied.' };
   }
+  if (opts.signal?.aborted) return { error: 'Bash blocked: turn cancelled.' };
   return opts.dispatch();
 }

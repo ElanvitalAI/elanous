@@ -241,7 +241,8 @@ async function run(bun, args, env) {
   const childEnv = { ...env, ELANOUS_INSTALL_PREFIX: dataPrefix(env), PATH: `${join(dataPrefix(env), 'bin')}${delimiter}${env.PATH || ''}` };
   if (shouldAutoBootstrap(args, env)) {
     try {
-      const bootstrap = await spawnWithTimeout(bun, [ENTRY, 'bootstrap'], { stdio: 'inherit', env: childEnv, windowsHide: true });
+      // Bootstrap runs before the requested command. Keep its progress off stdout so --json stays parseable on first use.
+      const bootstrap = await spawnWithTimeout(bun, [ENTRY, 'bootstrap'], { stdio: ['inherit', 2, 'inherit'], env: childEnv, windowsHide: true });
       if (bootstrap.error) process.stderr.write(`elanous: first-run bootstrap could not run: ${bootstrap.error.message}; retry with \`eln bootstrap\`.\n`);
       else if (bootstrap.timedOut) process.stderr.write('elanous: first-run bootstrap timed out after 10 minutes; retry with `eln bootstrap`.\n');
       else if (bootstrap.status !== 0) process.stderr.write(`elanous: first-run bootstrap exited ${bootstrap.status ?? bootstrap.signal}; retry with \`eln bootstrap\`.\n`);

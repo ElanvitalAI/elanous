@@ -34,6 +34,7 @@ import { explicitTurnTier } from '../model-tier/turn-tier.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { isSimpleQuestionFastRoute } from '../model-tier/simple-question-fast-route.js';
 import { recordTurn } from '../status/metrics.js';
+import { createMeasuredTurnUsage, type MeasuredTurnUsage } from './turn-usage.js';
 import {
   buildTerminalCapableTurn,
   isTerminalCapableTurn,
@@ -182,6 +183,8 @@ export interface RunTurnResult {
   finishReason?: string;
   meta: SessionMeta;
   usedTokens: number;
+  /** Provider-reported tokens for this invocation only; absent fields are unavailable. */
+  measuredUsage?: MeasuredTurnUsage;
   droppedMessages: number;
   provider: string;
   model: string;
@@ -307,6 +310,11 @@ const childContextComposedSessions = new Set<string>();
 /** Run one conversational turn, persisting both sides to the session
  *  JSONL. Never throws on LLM failure — reraises with context. */
 export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
+  const measuredUsage = createMeasuredTurnUsage();
+  const onUsage = (usage: Parameters<NonNullable<LLMOpts['onUsage']>>[0]): void => {
+    measuredUsage.accept(usage);
+    try { opts.llmOpts?.onUsage?.(usage); } catch { /* observer cannot break a turn */ }
+  };
   const loaded = loadSession(opts.sessionId);
   if (!loaded) throw new Error(`session not found: ${opts.sessionId}`);
   const { meta } = loaded;
@@ -519,6 +527,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   let text = '';
   let goalComplete = false;
   let goalStopReason: string | undefined;
+  let turnFailed = false;
   // Branch — tool-loop path when caller supplies a non-empty tool
   // catalog (CLI agent surface), legacy text-only stream otherwise
   // (telegram, discord, scheduler, etc — all unchanged).
@@ -622,6 +631,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
             opts.onToolResult?.(call);
           },
           onReasoning: (event) => { opts.onReasoning?.(event); },
+          onUsage,
         },
         ...(turnLlmOpts?.model ? { modelOverride: turnLlmOpts.model } : {}),
         ...(turnLlmOpts?.reasoningEffort ? { reasoningEffort: turnLlmOpts.reasoningEffort } : {}),
@@ -644,9 +654,11 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         text = gl.finalText;
         goalComplete = gl.goalComplete;
         goalStopReason = gl.stopReason;
+        turnFailed = gl.stopReason === 'aborted' || gl.stopReason === 'error' || gl.stopReason === 'auth_rejected';
       } else {
         const coreResult = await runCoreTurn(coreCtx);
         text = coreResult.finalText;
+        turnFailed = coreResult.stopReason === 'aborted' || coreResult.stopReason === 'error' || coreResult.stopReason === 'auth_rejected';
         if (coreResult.stopReason === 'auth_rejected') throw new Error(coreResult.errorMessage ?? 'Authentication was rejected');
       }
     } else {
@@ -667,6 +679,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           } catch { /* telemetry persistence must not break the turn */ }
           opts.onToolResult?.(call);
         },
+        onUsage,
       },
       {
         ...(guardedTurnLlmOpts ?? {}),
@@ -675,6 +688,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         onFinishReason: (reason: string) => { finishReason = reason; llmOpts?.onFinishReason?.(reason); },
         tools: turnTools,
         provider,
+        // The handler above is the sole observer. The fallback path invokes
+        // both opts.onUsage and handlers.onUsage when both are present.
+        onUsage: undefined,
         // ★ /cancel 범용화(대표 2026-07-12) — per-turn abort signal 을 tool 루프·llm 호출에 전파.
         //   이게 없으면 /cancel(turnAborters.abort)이 진행 중 tool 반복(grep 폭주 등)을 못 멈춘다.
         ...(opts.signal ? { signal: opts.signal } : {}),
@@ -693,6 +709,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       onFinishReason: (reason: string) => { finishReason = reason; llmOpts?.onFinishReason?.(reason); },
       ...(requestSizeGuard ? { requestSizeGuard: llmOpts?.requestSizeGuard ?? requestSizeGuard } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
+      onUsage,
     };
     text = await streamLLM(kept, (delta) => { opts.onDelta?.(delta); }, { ...plainOpts, provider, preferExplicitProvider: true });
   }
@@ -705,6 +722,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     content: text,
     ts: asstTs,
     tokenEstimate: estimateTokens(text),
+    replyFinal: opts.signal?.aborted !== true && !turnFailed,
   };
   const updatedMeta = appendMessage(opts.sessionId, asstMsg);
 
@@ -743,11 +761,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     seconds: turnSeconds,
   });
 
+  const reportedUsage = opts.signal?.aborted || turnFailed ? undefined : measuredUsage.snapshot();
   return {
     text,
     ...(finishReason ? { finishReason } : {}),
     meta: updatedMeta,
     usedTokens: used,
+    ...(reportedUsage ? { measuredUsage: reportedUsage } : {}),
     droppedMessages: dropped,
     provider: provider.name,
     model: resolvedModel,

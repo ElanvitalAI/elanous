@@ -11,7 +11,8 @@ export interface MemberMiniBoardApi {
   getVerifiedOwner(): Promise<VerifiedMemberOwner>;
   getBoard(): Promise<unknown>;
   approveCard?(cardId: string): Promise<{ dispatch?: { acceptanceId: string } }>;
-  getBriefings(day: string): Promise<unknown>;
+  getBriefings(day: string, appSlug: string): Promise<unknown>;
+  getBriefing?(id: string, appSlug: string): Promise<unknown>;
   subscribe(memberId: string, onChange: () => void): () => void;
 }
 
@@ -56,7 +57,8 @@ export function createMemberMiniBoardApi(
       if (!response.ok) throw new Error(`제안 승인 실패 (HTTP ${response.status})`);
       return response.json() as Promise<{ dispatch?: { acceptanceId: string } }>;
     },
-    getBriefings: (day) => get(`/v1/briefings?day=${encodeURIComponent(day)}`),
+    getBriefings: (day, appSlug) => get(`/v1/briefings?day=${encodeURIComponent(day)}&appSlug=${encodeURIComponent(appSlug)}`),
+    getBriefing: (id, appSlug) => get(`/v1/briefings/${encodeURIComponent(id)}?appSlug=${encodeURIComponent(appSlug)}`),
     subscribe(memberId, onChange) {
       const url = new URL(`${base}/v1/events`);
       url.searchParams.set('topics', 'briefing.ready,board.card');

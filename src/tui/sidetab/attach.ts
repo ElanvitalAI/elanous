@@ -6,13 +6,17 @@ import { createTerminalModalRouter } from '../../terminal/terminal-modal-router.
 import { getSessionCwd } from '../../session/working-dir.js';
 import { TerminalSessionRegistry, type TerminalSession } from '../../terminal/session-registry.js';
 import { requestRemotePtyControl } from '../../pty-shell/pty-control-ipc.js';
+import { listPtyManifestRows } from '../../pty-shell/pty-manifest.js';
 import { debug } from '../../debug/log.js';
+import { redactSecretText } from '../../debug/secret-redaction.js';
 import { runVisibleAgentMission, type VisibleAgentCli, type VisibleMissionPty } from '../../sidetab-core/visible-agent-mission.js';
 import type { Key } from '../../tui.js';
 import type { SidetabRow } from './list.js';
 import { createHerdrSidetabPortal, herdrPaneIdFromSidetabRow, type HerdrSidetabPortal } from './herdr-portal.js';
 import { createSidetabMissionBranch, type AgentCliDetection } from '../branches/sidetab/mission.js';
 import { readSidetabAgent, sendSidetabAgent, sidetabAgentLaunch, type SidetabAgent } from '../../tui-client/sidetab-agent-pty.js';
+import type { CompleteTerminalObservation, WorkspacePtyTarget } from '../../sidetab-core/workspace-input.js';
+import { createFullTranscriptCapture } from './full-transcript.js';
 
 export type SidetabCharacter = 'shell' | 'elanous' | VisibleAgentCli | 'hermes';
 
@@ -24,6 +28,7 @@ export interface SidetabAttachmentController {
   spawnSideAgent(agent: SidetabAgent): string | undefined;
   readSideAgent(row: SidetabRow): string | undefined;
   sendSideAgent(row: SidetabRow, input: string): Promise<boolean>;
+  observeSidechat(target: WorkspacePtyTarget): CompleteTerminalObservation | undefined;
   runMission(agent: VisibleAgentCli, mission: string): Promise<Awaited<ReturnType<typeof runVisibleAgentMission>>>;
   runMissionPair(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
   kill(row: SidetabRow): boolean;
@@ -62,6 +67,7 @@ export function createSidetabAttachmentController(deps: {
     writeOverlay: (ansi) => { try { process.stdout.write(ansi); } catch { /* TUI closed */ } },
   });
   const registry = deps.terminalRegistry ?? new TerminalSessionRegistry({ coordinator, eventBus });
+  const transcripts = new Map<string, ReturnType<typeof createFullTranscriptCapture>>();
   let controllerClosed = false;
   const modalRouter = createTerminalModalRouter();
   let attachedSessionId: string | null = null;
@@ -262,6 +268,7 @@ export function createSidetabAttachmentController(deps: {
       return false;
     }
     const id = `next-sidetab-${randomUUID()}`;
+    const transcript = createFullTranscriptCapture();
     const cwd = getSessionCwd();
     const title = character === 'claude' ? 'claude-code' : character === 'grok' ? 'grok-build' : character;
     const common = {
@@ -298,6 +305,7 @@ export function createSidetabAttachmentController(deps: {
       }
       const session = registry.spawn({
         ...common,
+        onRawOutput: (chunk) => transcript.append(chunk),
         ...(command ? { command } : {}),
         ...(env ? { env } : {}),
         ...(unsetEnv ? { unsetEnv } : {}),
@@ -311,6 +319,7 @@ export function createSidetabAttachmentController(deps: {
         },
       }, { termCols: cols, termRows: rows });
       lastSpawnedSession = session;
+      transcripts.set(session.id, transcript);
       if (character === 'codex' || character === 'claude' || character === 'hermes') {
         deps.setStatus(`${character} 실행 · agent-mission 구독 경로 scrub 적용(${unsetEnv?.length ?? 0}개 env 제거)`);
       }
@@ -340,6 +349,26 @@ export function createSidetabAttachmentController(deps: {
   });
 
   return {
+    observeSidechat(target) {
+      if (target.remoteHost) return undefined;
+      const manifest = listPtyManifestRows().find((row) => row.id === target.ptyId);
+      if (!manifest || !manifest.alive || manifest.ownerPid !== target.ownerPid
+        || manifest.startedAt !== target.ptyStartedAt || manifest.outputBytesTotal === undefined
+        || manifest.outputBytesTotal < 0) return undefined;
+      const sessionId = manifest.purpose?.startsWith('next-tui-sidetab:')
+        ? manifest.purpose.slice('next-tui-sidetab:'.length) : '';
+      const session = registry.get(sessionId);
+      const transcript = transcripts.get(sessionId);
+      if (!session || session.state === 'exited' || !transcript
+        || transcript.bytes() !== manifest.outputBytesTotal) return undefined;
+      const text = transcript.transcript();
+      const screen = redactSecretText(session.preview.renderForLLM());
+      if (!text?.trim() || !screen.trim()) return undefined;
+      return {
+        target, screen, transcript: text, observedAt: new Date().toISOString(),
+        activityAt: manifest.outputBytesTotal, coverage: 'full',
+      };
+    },
     attach(row) {
       stopRemote();
       if (row.kind === 'herdr') return startHerdr(row);
@@ -524,6 +553,7 @@ export function createSidetabAttachmentController(deps: {
       stopHerdr();
       modalRouter.close();
       for (const session of registry.list()) registry.kill(session.id);
+      transcripts.clear();
       missionBranch.close();
     },
   };

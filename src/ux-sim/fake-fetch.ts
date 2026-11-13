@@ -199,3 +199,20 @@ export async function withFakeFetchDevice<T>(
     device.restore();
   }
 }
+
+/** Run a provider wire fixture through fake HTTP while bypassing the test-world fake LLM. */
+export async function withRealProviderFakeFetchDevice<T>(
+  routes: readonly FakeFetchRoute[],
+  run: (device: FakeFetchDevice) => T | Promise<T>,
+): Promise<T> {
+  const device = await acquireFakeFetchDevice(routes);
+  const previousMode = process.env.ELANOUS_LLM_MODE;
+  process.env.ELANOUS_LLM_MODE = 'real';
+  try {
+    return await run(device);
+  } finally {
+    if (previousMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+    else process.env.ELANOUS_LLM_MODE = previousMode;
+    device.restore();
+  }
+}

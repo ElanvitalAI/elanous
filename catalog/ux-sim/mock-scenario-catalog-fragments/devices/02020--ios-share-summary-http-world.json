@@ -1,0 +1,27 @@
+{
+  "id": "ios-share-summary-http-world",
+  "name": "iPhone shared article summary through Nexus HTTP",
+  "audience": "internal",
+  "checklistCells": ["DEMO1114-IOS-NEW-SUMMARY"],
+  "implementation": [
+    "src/nexus/api/http-server.ts",
+    "src/nexus/api/share-summary-requests.ts",
+    "src/nexus/api/scraps.ts"
+  ],
+  "tests": ["src/ux-sim/ios-share-summary-request-contract.test.ts"],
+  "target": "A verified member submits an article scrap, requests a new model summary, and receives a durable generated result through the production Nexus HTTP route.",
+  "inputs": [
+    "Isolated member ledger and verified app Bearer session",
+    "Fake LLM response injected at the Nexus HTTP server option",
+    "One extracted article body and an idempotency key"
+  ],
+  "observations": [
+    "POST and GET return the fake generated text with summarySource generated",
+    "The durable member event marks generated provenance and excludes another member",
+    "A failed model response falls back to stored-card provenance without leaking provider details"
+  ],
+  "entryCommands": ["bun test src/ux-sim/ios-share-summary-request-contract.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

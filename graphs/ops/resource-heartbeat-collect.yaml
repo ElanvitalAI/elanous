@@ -1,0 +1,17 @@
+graph_id: resource-heartbeat-collect
+loop:
+  title: Resource host heartbeat collection
+  description: Read host load, memory, disk, and tool availability into the Nexus resource ledger; observe gate host without admitting it to placement.
+  owner: MVP-B
+  trigger:
+    cron: '*/5 * * * *'
+    events: [manual]
+version: 1
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: collect, kind: agent, recipe: 'cmd:resource-heartbeat-collect', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: collect, on: outcome, map: { ok: done, partial: failed, fail: failed, error: failed } }

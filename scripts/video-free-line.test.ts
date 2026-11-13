@@ -2,7 +2,7 @@
  * 🟢 무료 라인 시험 — ⛔ ***「돌았다」를 종료코드만으로 믿지 않는다.***
  *   이 파일은 «산출물»을 직접 잰다(프레임 수 · 규격 · 자막이 픽셀에 있나).
  */
-import { setDefaultTimeout, describe, expect, it } from 'bun:test';
+import { beforeAll, setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,7 +21,7 @@ const TEST_WALKER = join(HERE, 'video-free-line-test-walker.ts');
 function run(args: string[], walker?: string): { status: number; out: string } {
   const r = spawnSync(process.execPath, [CLI, ...args], {
     cwd: REPO, encoding: 'utf8', timeout: 600_000,
-    env: walker ? { ...process.env, GRAPH_WALKER: walker } : process.env,
+    env: { ...process.env, ...(walker ? { GRAPH_WALKER: walker } : {}), ...(FFMPEG_BIN ? { ELANOUS_FFMPEG_BIN: FFMPEG_BIN } : {}) },
   });
   if (r.status === null) throw new Error(`죽었다(signal=${r.signal})`);
   return { status: r.status, out: `${r.stdout}${r.stderr}` };
@@ -44,11 +44,15 @@ function probeField(path: string, entries: string, key: string, stream = 'v:0'):
 }
 
 // ⛔ ffmpeg 가 없는 기계에서는 이 시험이 «못 돈다» — 「실패」로 읽지 않는다.
-const HAS_FFMPEG = spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' }).status === 0;
+const homebrewFull = spawnSync('brew', ['--prefix', 'ffmpeg-full'], { encoding: 'utf8' });
+const fullCandidate = homebrewFull.status === 0 ? join(homebrewFull.stdout.trim(), 'bin', 'ffmpeg') : null;
+const FFMPEG_BIN = [Bun.which('ffmpeg'), fullCandidate].find((bin) => bin && existsSync(bin)
+  && spawnSync(bin, ['-hide_banner', '-filters'], { encoding: 'utf8' }).stdout?.includes(' ass ')) ?? Bun.which('ffmpeg');
+const HAS_FFMPEG = Boolean(FFMPEG_BIN) && spawnSync(FFMPEG_BIN!, ['-version'], { encoding: 'utf8' }).status === 0;
 const HAS_FFPROBE = spawnSync('ffprobe', ['-version'], { encoding: 'utf8' }).status === 0;
 const HAS_WALKER = existsSync(process.env.GRAPH_WALKER ?? `${process.env.HOME}/temp/agentic-consulting/scripts/graph-walk.ts`);
 const HAS_KOREAN_FONT = koreanCaptionFont() !== null;
-const HAS_ASS_FILTER = HAS_FFMPEG && spawnSync('ffmpeg', ['-hide_banner', '-filters'], { encoding: 'utf8' }).stdout?.includes(' ass ') === true;
+const HAS_ASS_FILTER = HAS_FFMPEG && spawnSync(FFMPEG_BIN!, ['-hide_banner', '-filters'], { encoding: 'utf8' }).stdout?.includes(' ass ') === true;
 const HAS_TEST_WALKER = existsSync(TEST_WALKER);
 const SCENE_READY = HAS_FFMPEG && HAS_FFPROBE && HAS_KOREAN_FONT && HAS_ASS_FILTER && HAS_TEST_WALKER;
 const MISSING_SCENE_TOOLS = [
@@ -431,22 +435,39 @@ describe.skipIf(!SCENE_READY)(`📝 받아쓰기(SRT)로 정렬한다 — 균등
 //      ***음악 있는 판이 더 조용했고 무음 구간 수가 똑같았다***(= 안 들어간 것).
 //   🔑 ***「섞었다」는 스트림이 아니라 «귀에 닿는 값»으로 확인해야 한다.***
 describe.skipIf(!SCENE_READY)(`🎵 음악 믹스 — 「넣었다」를 음량으로 확인한다 (결손: ${MISSING_SCENE_TOOLS || '없음'})`, () => {
-  const work = mkdtempSync(join(tmpdir(), 'mix-'));
-  const src = mkdtempSync(join(tmpdir(), 'mix-src-'));
+  let work = '';
+  let src = '';
   const imgs: string[] = [];
-  for (const [i, c] of ['0x22303a', '0x3a2230'].entries()) {
-    const p = join(src, `p${i}.png`);
-    spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
-      '-i', `color=c=${c}:s=1280x720`, '-frames:v', '1', p], { timeout: 120_000 });
-    imgs.push(p);
-  }
-  // 나레이션: 말 사이에 «조용한» 구간이 있게 만든다 — 그래야 음악이 채우는지 보인다
-  const vo = join(work, 'vo.wav');
-  spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
-    '-i', 'sine=frequency=330:duration=2,apad=pad_dur=2', '-ar', '24000', vo], { timeout: 120_000 });
-  const bgm = join(work, 'bgm.wav');
-  spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi',
-    '-i', 'anoisesrc=d=8:c=pink:a=0.25', '-ac', '2', '-ar', '44100', bgm], { timeout: 120_000 });
+  let vo = '';
+  let bgm = '';
+  let withM = '';
+  let withoutM = '';
+
+  beforeAll(() => {
+    work = mkdtempSync(join(tmpdir(), 'mix-'));
+    src = mkdtempSync(join(tmpdir(), 'mix-src-'));
+    const make = (args: string[]): void => {
+      const result = spawnSync(FFMPEG_BIN!, ['-hide_banner', '-loglevel', 'error', '-y', ...args], {
+        // Source: #36191 ffmpeg fixture generation requires a bounded child process.
+        encoding: 'utf8', timeout: 120_000,
+      });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    for (const [i, c] of ['0x22303a', '0x3a2230'].entries()) {
+      const image = join(src, `p${i}.png`);
+      make(['-f', 'lavfi', '-i', `color=c=${c}:s=1280x720`, '-frames:v', '1', image]);
+      imgs.push(image);
+    }
+    // A quiet interval in the voice track lets the assertions measure music fill.
+    vo = join(work, 'vo.wav');
+    make(['-f', 'lavfi', '-i', 'sine=frequency=330:duration=2,apad=pad_dur=2', '-ar', '24000', vo]);
+    bgm = join(work, 'bgm.wav');
+    make(['-f', 'lavfi', '-i', 'anoisesrc=d=8:c=pink:a=0.25', '-ac', '2', '-ar', '44100', bgm]);
+    withM = join(work, 'out-m');
+    withoutM = join(work, 'out-n');
+    build(bgm, withM);
+    build(null, withoutM);
+  });
 
   function build(music: string | null, out: string): void {
     const sc = join(work, `scene-${music ? 'm' : 'n'}.json`);
@@ -456,12 +477,10 @@ describe.skipIf(!SCENE_READY)(`🎵 음악 믹스 — 「넣었다」를 음량�
     expect(existsSync(join(out, 'master.mp4'))).toBe(true);
   }
   function silences(f: string): number {
-    const r = spawnSync('ffmpeg', ['-hide_banner', '-i', f, '-af', 'silencedetect=n=-40dB:d=0.4', '-f', 'null', '-'],
+    const r = spawnSync(FFMPEG_BIN!, ['-hide_banner', '-i', f, '-af', 'silencedetect=n=-40dB:d=0.4', '-f', 'null', '-'],
       { encoding: 'utf8', timeout: 120_000 });
     return (`${r.stdout}${r.stderr}`.match(/silence_start/g) ?? []).length;
   }
-  const withM = join(work, 'out-m'), withoutM = join(work, 'out-n');
-  build(bgm, withM); build(null, withoutM);
 
   it('음악을 넣으면 «무음 구간이 줄어든다» — 말 사이를 채웠다는 뜻', () => {
     const a = silences(join(withM, 'master.mp4'));

@@ -28,3 +28,19 @@ test('external overlays repaint the full viewport without forcing a screen clear
   expect(restored.changedRows[23]).toEqual({ row: 23, text: '' });
   expect(cache.diff(['main restored', 'prompt'], 100, 24).clear).toBe(true);
 });
+
+test('oversized frames never paint below the terminal or poison later row diffs', () => {
+  const cache = new ScreenPaintCache();
+  expect(cache.diff(['top', 'prompt', 'offscreen'], 80, 2)).toEqual({
+    clear: true,
+    changedRows: [{ row: 0, text: 'top' }, { row: 1, text: 'prompt' }],
+  });
+  expect(cache.diff(['top', 'prompt changed', 'different offscreen'], 80, 2)).toEqual({
+    clear: false,
+    changedRows: [{ row: 1, text: 'prompt changed' }],
+  });
+  cache.invalidate(2);
+  expect(cache.diff(['top', 'prompt changed', 'offscreen'], 80, 2).changedRows).toEqual([
+    { row: 0, text: 'top' }, { row: 1, text: 'prompt changed' },
+  ]);
+});

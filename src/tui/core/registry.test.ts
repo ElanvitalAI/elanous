@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { parseResumeCommand } from '../slash/resume-command.js';
 import {
   buildNextTuiPrefixSlashIndex,
   matchesNextTuiSlashPrefix,
@@ -92,4 +93,19 @@ test('indexed slash prefixes preserve the complete multi-word prefix', () => {
   expect(candidates?.some((candidate) => candidate.slashPrefixes.some((prefix) =>
     matchesNextTuiSlashPrefix('/session list argument', prefix)))).toBe(true);
   expect(matchesNextTuiSlashPrefix('/session listing', '/session list')).toBe(false);
+});
+test('resume aliases reach the existing parser while session new retains its route', () => {
+  for (const command of [
+    '/resume', '/resume abc123', '/session', '/sessions',
+    '/session list', '/sessions list', '/session ls', '/sessions ls',
+    '/session load abc123', '/sessions load abc123',
+    '/session resume abc123', '/sessions resume abc123',
+  ]) {
+    expect(resolveNextTuiRoute(command, NEXT_TUI_INPUT_CONTEXT)?.id).toBe('session.resume');
+    expect(parseResumeCommand(command)).not.toBeNull();
+  }
+  expect(resolveNextTuiRoute('/session new', NEXT_TUI_INPUT_CONTEXT)?.id).toBe('session.new');
+  for (const command of ['/session fork', '/sessionish', 'session']) {
+    expect(resolveNextTuiRoute(command, NEXT_TUI_INPUT_CONTEXT)).toBeNull();
+  }
 });

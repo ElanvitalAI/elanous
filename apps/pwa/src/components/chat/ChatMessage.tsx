@@ -318,9 +318,9 @@ export function ChatMessageView({ message, mobileSimple = false, minimal = false
             >
               {isError ? '⚠ Error' : 'Note'}
             </span>
-            <pre className="flex-1 whitespace-pre-wrap break-all">{message.text}</pre>
+            <pre className="flex-1 whitespace-pre-wrap break-all">{isError ? '요청을 처리하지 못했습니다.' : message.text}</pre>
           </div>
-          <div className="mt-1 text-[10px] text-muted-foreground/80">{time}</div>
+          {!isError && <div className="mt-1 text-[10px] text-muted-foreground/80">{time}</div>}
         </div>
       </div>
     );

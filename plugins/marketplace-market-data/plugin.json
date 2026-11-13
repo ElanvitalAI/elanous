@@ -5,6 +5,7 @@
   "description": "Marketplace graph unit fixture providing the market.ohlcv@1 contract.",
   "extensions": {
     "ai.elanous": {
+      "capabilities": ["market"],
       "graphs": ["./graphs/units/market-quote.yaml", "./graphs/units/market-ohlcv.yaml"],
       "graphManifests": {
         "market-quote": {

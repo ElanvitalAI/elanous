@@ -79,6 +79,8 @@ export interface InteractiveTerminalModalSpec {
   onClose?: () => void;
   /** P13 — forwarded to PreviewTerminal. Fires on OSC 9/99/777. */
   onOscNotify?: (ev: { code: 9 | 99 | 777; title: string; body: string; raw: string }) => void;
+  /** Capture raw output from the first PTY chunk, before any modal repaint. */
+  onRawOutput?: (chunk: string) => void;
   /** Owner tag for surface registry — defaults to 'dashboard'. */
   owner?: SurfaceOwner;
   /** User clicked a title-bar control button.
@@ -222,6 +224,7 @@ export function createInteractiveTerminalModal(
     registryOrigin: spec.registryOrigin,
     registryPurpose: spec.registryPurpose,
     registrySeat: spec.registrySeat,
+    onRawOutput: spec.onRawOutput,
     onUpdate: () => {
       // First output → leave the placeholder state. Stops the
       // spinner timer + flushes a render so the real PTY frame

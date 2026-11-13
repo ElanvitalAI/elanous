@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,9 +15,13 @@ import {
   type GraphCapabilityRegistry,
 } from '../graph-runner/capabilities.js';
 import type { InProcessHandlerResult } from '../graph-runner/in-process-registry.js';
+import { registerAbsorbDesignGuards } from '../graph-runner/absorb-design-provider.js';
 import { decideGraphApproval, runGraph, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
 import { createFakeAppHost, type FakeAppHost } from './fake-app-host.js';
 import { withSimClock } from './fake-clock.js';
+import { listAbsorbScraps } from '../intake-plane/items.js';
+import { createJsonlMemberEventStore, type MemberEventStore } from '../nexus/api/member-event-store.js';
+import { boardCardNexusEvent } from '../nexus/api/board-api.js';
 
 type Row = Record<string, unknown>;
 type ProviderResult = InProcessHandlerResult;
@@ -61,7 +66,7 @@ function absorbSimulationCapabilityRegistry(providers: AbsorbSimulationProviders
       invoke,
     });
   }
-  return registry;
+  return registerAbsorbDesignGuards(registry);
 }
 
 export function publishFakeSimulatedArtifact(input: { host: FakeAppHost; appId: string; owner: string; artifact: Row;
@@ -130,6 +135,9 @@ export async function runAbsorbStoreRouteSimulation(): Promise<Row> {
         const items = scraps.filter((row) => row.owner === context.memberId && row.status === 'new');
         return { ok: true, outcome: 'done', result: { items }, evidence: { items, owner: context.memberId, count: items.length } };
       }
+      if (config.op === 'list' && config.collection === 'member-app-slots') {
+        return { ok: true, outcome: 'done', result: { items: [] }, evidence: { owner: context.memberId, count: 0 } };
+      }
       if (config.op === 'list' && config.collection === 'suggestions') {
         const items = suggestions.filter((row) => row.owner === context.memberId);
         return { ok: true, outcome: 'done', result: { items }, evidence: { items, owner: context.memberId, count: items.length } };
@@ -192,6 +200,35 @@ function resultFrom(output: unknown): Row {
   return object(object(parsed).result);
 }
 
+function savedSuggestionsFromBrief(root: string, briefRunId: string, graphId: string, memberId: string, sourceScrapId: string, rootRunId: string) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(briefRunId)) throw new Error('invalid source brief run ID');
+  const path = join(root, briefRunId, 'graph-runs', 'absorb-brief', `${briefRunId}.json`);
+  const raw = readFileSync(path, 'utf8');
+  const run = object(JSON.parse(raw) as unknown);
+  const input = object(run.input);
+  const nodes = Array.isArray(run.nodes) ? run.nodes.map(object) : [];
+  const node = (id: string) => object(nodes.find(row => row.nodeId === id));
+  const output = (id: string) => {
+    const value = node(id).output;
+    return typeof value === 'string' ? object(JSON.parse(value) as unknown) : {};
+  };
+  const briefing = object(object(output('brief').evidence).briefing);
+  const design = object(object(output('persist-design').evidence).design);
+  const proposed = object(output('suggest').result).items;
+  const saved = object(output('save-suggestions').result).items;
+  const suggestions = Array.isArray(proposed) ? proposed.map(object) : [];
+  const savedIds = Array.isArray(saved) ? saved.map(row => object(row)).filter(row => row.stored === true).map(row => text(row.id)) : [];
+  if (run.graphId !== graphId || run.runId !== briefRunId || run.status !== 'done'
+    || input.sourceScrapId !== sourceScrapId || input.rootRunId !== rootRunId
+    || inputContext(input).memberId !== memberId || briefing.id !== design.briefingId
+    || !briefing.id || !savedIds.length || savedIds.length !== suggestions.length
+    || suggestions.some(row => !savedIds.includes(text(row.id)) || row.owner !== memberId
+      || row.briefingId !== briefing.id || row.designPackId !== design.briefingId
+      || !Array.isArray(row.evidenceScrapIds) || !row.evidenceScrapIds.includes(sourceScrapId)))
+    throw new Error('source brief did not save matching owner suggestions and design');
+  return { path, sha256: createHash('sha256').update(raw).digest('hex'), suggestions };
+}
+
 function inputContext(value: unknown): Row {
   return object(object(value).context);
 }
@@ -202,18 +239,16 @@ function parsePromptInput(prompt: string): Row {
   try { return object(JSON.parse(match[1]) as unknown); } catch { return {}; }
 }
 
-function fakeModel(prompt: string, world: Row, calls: string[], fallbackKstDay: string): string {
+function fakeModel(prompt: string, calls: string[], fallbackKstDay: string, mutateDesign?: (design: Row) => Row,
+  designInputs?: Row[], mutateRequirements?: (requirements: Row) => Row, mutateDesignResult?: (result: Row) => Row,
+  suggestOutcome?: 'needs-human' | 'failed', mutateSuggestion?: (suggestion: Row) => Row): string {
   const input = parsePromptInput(prompt);
   const context = object(input.context);
   const prior = object(input.prior);
   const kstDay = text(context.kstDay) || fallbackKstDay;
-  const fixture = object(world.fixtures);
-  const fixtureMember = Array.isArray(fixture.members)
-    ? fixture.members.map(object).find((member) => member.id === 'member-demo')
-    : undefined;
-  const apps = fixtureMember?.apps;
   calls.push(prompt.includes('absorb/card') ? 'absorb/card' : prompt.includes('absorb/brief') ? 'absorb/brief'
-    : prompt.includes('absorb/build') ? 'absorb/build' : 'absorb/suggest');
+    : prompt.includes('absorb/requirements') ? 'absorb/requirements' : prompt.includes('absorb/design') ? 'absorb/design'
+      : prompt.includes('absorb/build') ? 'absorb/build' : 'absorb/suggest');
   if (prompt.includes('absorb/card')) {
     const items = Array.isArray(prior.items) ? prior.items.map(object) : [];
     const cards = items.map((item) => ({ id: `card-${text(item.id)}`, scrapId: item.id, title: item.title ?? item.kind, points: [item.text], tags: [item.kind] }));
@@ -227,6 +262,46 @@ function fakeModel(prompt: string, world: Row, calls: string[], fallbackKstDay: 
       evidence: { briefing: { id: `brief-${text(context.memberId)}-${kstDay}`, summary, groups: cards, todos: [], scrapIds: cards.map((card) => card.scrapId) },
         memberId: context.memberId, kstDay, scrapIds: cards.map((card) => card.scrapId) } });
   }
+  if (prompt.includes('absorb/requirements')) {
+    const scrapIds = Array.isArray(prior.scrapIds) ? prior.scrapIds.map(text).filter(Boolean) : [];
+    const briefingId = text(prior.id);
+    if (!scrapIds.length || !briefingId) return JSON.stringify({ outcome: 'needs-human', result: {}, evidence: { reason: 'briefing-evidence-missing' } });
+    const source = scrapIds[0]!;
+    const cards = Array.isArray(prior.groups) ? prior.groups.map(object) : [];
+    const articleText = cards.filter(card => card.scrapId === source)
+      .map(card => Array.isArray(card.points) ? text(card.points[0]) : '').join(' ');
+    const ticketingBrief = ['동시 접속', '중복 예매', '공정 대기열'].every(topic => articleText.includes(topic));
+    const lines = ticketingBrief ? [
+      `동시 접속 폭주에도 예매 화면에 입장할 수 있어야 한다 [${source}]`,
+      `같은 좌석의 중복 예매를 막고 확정 결과를 보여줘야 한다 [${source}]`,
+      `공정 대기열에서 순번과 대기 상태를 볼 수 있어야 한다 [${source}]`,
+    ] : [
+      `Save the article as a member-owned reading item [${source}]`,
+      `Show the article summary in the briefing view [${source}]`,
+      `Open the source article from the reading item [${source}]`,
+    ];
+    const requirements = mutateRequirements ? mutateRequirements({ lines, briefingId, scrapIds }) : { lines, briefingId, scrapIds };
+    return JSON.stringify({ outcome: 'done', result: requirements,
+      evidence: { requirements: requirements.lines, briefingId: requirements.briefingId, scrapIds: requirements.scrapIds } });
+  }
+  if (prompt.includes('absorb/design')) {
+    designInputs?.push(input);
+    const lines = Array.isArray(prior.lines) ? prior.lines.map(text) : [];
+    const scrapIds = Array.isArray(prior.scrapIds) ? prior.scrapIds.map(text) : [];
+    const appSlot = Array.isArray(context.appSlots) ? object(context.appSlots[0]) : {};
+    const appId = text(appSlot.id);
+    const declaredPacks = object(context.graphNode).packs;
+    if (!Array.isArray(declaredPacks) || !declaredPacks.includes('brief-design@1') || lines.length !== 3 || !appId || !scrapIds.length)
+      return JSON.stringify({ outcome: 'needs-human', result: {}, evidence: { reason: 'design-input-or-pack-missing' } });
+    const screens = Array.isArray(appSlot.screens) ? appSlot.screens.map(text) : [];
+    const screen = screens[0] ?? 'scraps';
+    const design = { briefingId: text(prior.briefingId), appId, requirementLines: lines, scrapIds,
+      changes: lines.map((line, index) => ({ requirement: line, target: screen, action: ['capture', 'summarize', 'open-source'][index] })) };
+    const produced = mutateDesign ? mutateDesign(design) : design;
+    const result = { requirementLines: produced.requirementLines, design: produced, scrapIds: produced.scrapIds };
+    return JSON.stringify({ outcome: 'done', result: mutateDesignResult ? mutateDesignResult(result) : result,
+      evidence: { design: produced } });
+  }
   if (prompt.includes('absorb/build')) {
     const artifact = { id: `artifact-${text(context.suggestionId) || 'member-demo'}`, files: { '/index.html': '<main>simulated ticketing service</main>' } };
     // Source: 내부 문서 `DEMO-INTEGRATED-NORTH-STAR` scene 2; 300 is the declared synthetic scenario load.
@@ -234,30 +309,49 @@ function fakeModel(prompt: string, world: Row, calls: string[], fallbackKstDay: 
     const service = 'ticketing service';
     return JSON.stringify({ outcome: 'done', result: { artifact, service, capacityAssumption }, evidence: { artifact, service, capacityAssumption, suggestionId: context.suggestionId, owner: context.memberId } });
   }
-  const slotList = Array.isArray(context.appSlots) ? context.appSlots.map(object) : Array.isArray(apps) ? apps.map(object) : [];
+  if (suggestOutcome) return JSON.stringify({ outcome: suggestOutcome, result: {}, evidence: { reason: 'simulated-suggest-boundary' } });
+  const slotList = Array.isArray(context.appSlots) ? context.appSlots.map(object) : [];
   const scrapIds = Array.isArray(prior.scrapIds) ? prior.scrapIds : [];
   const sourceMarker = scrapIds.find((id) => /^[a-f0-9]{16}$/u.test(id));
   const suggestions = slotList.length && scrapIds.length ? [1, 2].map((index) => ({
-    id: `suggestion-${kstDay}-${index}${sourceMarker ? `-${sourceMarker}` : ''}`, appId: slotList[0]!.id,
+    id: `suggestion-${kstDay}-${index}${sourceMarker ? `-${sourceMarker}` : ''}`, owner: context.memberId,
+    briefingId: prior.briefingId, designPackId: prior.briefingId, requirementLines: prior.requirementLines,
+    appId: slotList[0]!.id,
     ask: `우리 행사용 티켓팅 서비스 만들어 볼까요?${sourceMarker ? ` · 원본 스크랩 ${sourceMarker}` : ''}`,
-    change: `브리핑 근거를 반영한 티켓팅 서비스 ${index}`, evidenceScrapIds: scrapIds })) : [];
+    change: `브리핑 근거를 반영한 티켓팅 서비스 ${index} [${text(scrapIds[0])}]`, evidenceScrapIds: scrapIds })).map(suggestion => mutateSuggestion ? mutateSuggestion(suggestion) : suggestion) : [];
   return JSON.stringify({ outcome: 'done', result: { items: suggestions }, evidence: { suggestions, matchedSlotIds: slotList.map((slot) => slot.id) } });
 }
 
 /** Run the plugin's graph through the production runGraph with a fully local fake capability world. */
 export async function runAbsorbGraphSimulation(options: {
   confirmation?: string; worldPath?: string; briefOnly?: boolean; buildOnly?: boolean; receiptScenariosOnly?: boolean; routeReceiptOnly?: boolean; buildGraphFile?: string;
+  instanceRoot?: string; sourceScrapId?: string; sourceUrl?: string; rootRunId?: string;
+  briefDesignOnly?: boolean; concurrentBriefRuns?: boolean; withoutSuggestionFixtures?: boolean; verifyApprovalTarget?: boolean;
+  initialSuggestions?: readonly Row[];
+  sourceBriefRunId?: string;
+  omitStoredDesignOnRead?: boolean;
+  mutateSuggestion?: (suggestion: Row) => Row;
+  mutateLoadedDesign?: (design: Row) => Row;
+  briefGraphFile?: string; omitAppSlotsFromGraphInput?: boolean; omitAppSlotsFromStore?: boolean;
+  permissiveDesignStore?: boolean; mutateDesign?: (design: Row) => Row;
+  suggestOutcome?: 'needs-human' | 'failed';
+  mutateRequirements?: (requirements: Row) => Row; mutateDesignResult?: (result: Row) => Row;
   routeSuggestionId?: string; memberId?: string;
   boardAttachments?: readonly Row[];
   dispatchGraph?: (graphFile: string, options: GraphRunOptions) => Promise<GraphRunState>;
+  briefRunId?: string;
+  omitBriefKstDay?: boolean;
+  briefKstDay?: string;
   approvalRunId?: string;
   onSuggestion?: (records: { briefing: Row; suggestions: readonly Row[] }) => Promise<void>;
-  onAppPublish?: (event: { action: 'simulate' | 'publish'; runId: string; suggestion: Row; artifact: Row; result: Row; evidence: Row }) => Promise<void>;
+  onAppPublish?: (event: { action: 'simulate' | 'publish'; runId: string; suggestion: Row; artifact: Row; result: Row; evidence: Row;
+    readback?: { status: number; sha256: string } }) => Promise<void>;
   onAcceptedBuild?: (state: Awaited<ReturnType<typeof runGraph>>) => Promise<void>;
 } = {}): Promise<Row> {
   const worldPath = resolve(options.worldPath ?? join(import.meta.dir, '../../plugins/absorb/sims/absorb-demo-world.yaml'));
   const world = object(parseYaml(readFileSync(worldPath, 'utf8')));
   const graphRoot = resolve(join(import.meta.dir, '../../plugins/absorb/graph'));
+  const suggestionListNodeId = text(object(parseYaml(readFileSync(join(graphRoot, 'absorb-suggest-list.yaml'), 'utf8'))).entry);
   const buildHitlNodeIds = declaredHitlNodeIds(join(graphRoot, 'absorb-build.yaml'));
   const briefGraphId = text(object(object(parseYaml(readFileSync(join(graphRoot, 'absorb-brief.yaml'), 'utf8'))).graph).id);
   const buildGraphId = text(object(object(parseYaml(readFileSync(join(graphRoot, 'absorb-build.yaml'), 'utf8'))).graph).id);
@@ -291,24 +385,46 @@ export async function runAbsorbGraphSimulation(options: {
   }
   if (!options.briefOnly && confirmationDispatch.status !== 'dispatched') throw new Error('suggest_accept graph route is not allowlisted');
 
-  const scraps = Array.isArray(fixture.scraps) ? fixture.scraps.map(value => {
+  const fixtureScraps = Array.isArray(fixture.scraps) ? fixture.scraps.map(value => {
     const row = object(value);
     return options.memberId && row.owner === fixtureMember!.id ? { ...row, owner: member.id } : row;
   }) : [];
+  if (Boolean(options.instanceRoot) !== Boolean(options.sourceScrapId))
+    throw new Error('same-root source requires instanceRoot and sourceScrapId');
+  if (options.sourceScrapId && !options.rootRunId)
+    throw new Error('same-root source requires rootRunId');
+  const source = options.instanceRoot && options.sourceScrapId
+    ? listAbsorbScraps(options.instanceRoot, text(member.id)).find(item => item.id === options.sourceScrapId) : undefined;
+  if (options.sourceScrapId && (source?.absorb?.status !== 'absorbed' || source.absorb.kind !== 'web'
+    || !source.absorb.extractedBody || !source.absorb.raw.url
+    || (options.sourceUrl && source.absorb.raw.url !== options.sourceUrl)))
+    throw new Error('same-root owner source scrap unavailable');
+  const scraps = source ? [{ id: source.id, owner: member.id, kind: 'web', status: 'new',
+    url: source.absorb!.raw.url, text: source.absorb!.extractedBody, sourceStatus: source.absorb!.status }] : fixtureScraps;
   const storedScraps = [...scraps];
   const storedBriefings: Row[] = [];
+  const storedDesignPacks: Row[] = [];
   const storedSuggestions: Row[] = Array.isArray(fixture.suggestions)
     ? fixture.suggestions.map((suggestion: unknown) => {
       const row = object(suggestion);
       return options.memberId && row.owner === fixtureMember!.id ? { ...row, owner: member.id } : row;
     }) : [];
+  storedSuggestions.push(...(options.initialSuggestions ?? []).map(row => ({ ...row })));
+  const sourceBrief = options.sourceBriefRunId && options.instanceRoot && options.sourceScrapId && options.rootRunId
+    ? savedSuggestionsFromBrief(options.instanceRoot, options.sourceBriefRunId, briefGraphId, text(member.id), options.sourceScrapId, options.rootRunId)
+    : undefined;
+  if (options.sourceBriefRunId && (!options.buildOnly || !sourceBrief || options.initialSuggestions?.length))
+    throw new Error('source brief handoff requires build-only mode and no injected suggestions');
+  if (sourceBrief) storedSuggestions.push(...sourceBrief.suggestions);
   const appSlots: Row[] = Array.isArray(member.apps) ? member.apps.map((value: unknown) => {
     const row = object(value);
     return options.memberId && row.owner === fixtureMember!.id ? { ...row, owner: member.id } : row;
   }) : [];
   const calls = { llm: [] as string[], notifications: [] as string[], appHost: [] as string[], appHostByRun: new Map<string, string[]>(),
+    suggestionFixtureIds: [] as string[],
     boardEvents: [] as Row[],
     llmPrompts: [] as string[],
+    designInputs: [] as Row[],
     appHostBodyByRun: new Map<string, string>(),
     appPublishSimulations: [] as Array<{ runId: string; suggestionId: string; outcome: string; requireOwnerRef: string; suggestionRef: string; artifactRef: string }>,
     appPublishAttempts: [] as Array<{ runId: string; requirePassingReceipt: boolean; receiptRef: string; artifactRef: string }>,
@@ -316,11 +432,15 @@ export async function runAbsorbGraphSimulation(options: {
     suggestionLookupsByRun: new Map<string, Array<{ owner: string; suggestionId: string; found: boolean; reason?: string }>>() };
   const delivered = new Set<string>();
   const app = appSlots[0];
-  if (!app || typeof app.id !== 'string') throw new Error('absorb simulation has no fake member app slot');
-  const host = createFakeAppHost([{ slug: app.id, current: 'v1', versions: [{ id: 'v1', files: { '/index.html': '<main>v1</main>' } }] }]);
+  if ((!app || typeof app.id !== 'string') && !options.briefDesignOnly) throw new Error('absorb simulation has no fake member app slot');
+  const host = createFakeAppHost(app ? [{ slug: text(app.id), current: 'v1', versions: [{ id: 'v1', files: { '/index.html': '<main>v1</main>' } }] }] : []);
 
   const fakeStt: GraphCapabilityProvider = async ({ nodeId }) => ({ ok: true, outcome: 'done', result: { text: `fake stt ${nodeId}` }, evidence: { provider: 'fake-stt' } });
   const fakeOcr: GraphCapabilityProvider = async ({ nodeId }) => ({ ok: true, outcome: 'done', result: { text: `fake ocr ${nodeId}` }, evidence: { provider: 'fake-ocr' } });
+  let releaseConcurrentReads: () => void = () => {};
+  const concurrentReadsReady = new Promise<void>(resolve => { releaseConcurrentReads = resolve; });
+  let concurrentReadCount = 0;
+  let approvedConcurrentSuggestion = false;
   const storeProvider: GraphCapabilityProvider = async ({ runId, nodeInput, input, graphInput, outputs }) => {
       const config = object(nodeInput);
       const query = config;
@@ -332,11 +452,16 @@ export async function runAbsorbGraphSimulation(options: {
         return { ok: true, outcome: 'done', result: { items: owned }, evidence: { owner: context.memberId, items: owned, count: owned.length } };
       }
       if (query.op === 'list' && query.collection === 'member-app-slots') {
-        const owned = appSlots.filter((slot) => slot.owner === context.memberId || slot.owner === undefined);
+        const owned = options.omitAppSlotsFromStore ? [] : appSlots.filter((slot) => slot.owner === context.memberId || slot.owner === undefined);
         return { ok: true, outcome: 'done', result: { items: owned }, evidence: { owner: context.memberId, count: owned.length } };
       }
       if (query.op === 'list' && query.collection === 'suggestions') {
         const owned = storedSuggestions.filter((suggestion) => suggestion.owner === context.memberId);
+        if (options.concurrentBriefRuns) {
+          concurrentReadCount++;
+          if (concurrentReadCount === 2) releaseConcurrentReads();
+          await concurrentReadsReady;
+        }
         return { ok: true, outcome: 'done', result: { items: owned }, evidence: { owner: context.memberId, items: owned, count: owned.length } };
       }
       if (query.op === 'get' && query.collection === 'suggestions') {
@@ -353,6 +478,13 @@ export async function runAbsorbGraphSimulation(options: {
         runLookups.push({ owner: text(context.memberId), suggestionId, found: true });
         calls.suggestionLookupsByRun.set(runId, runLookups);
         return { ok: true, outcome: 'done', result: suggestion, evidence: { owner: context.memberId, suggestion } };
+      }
+      if (query.op === 'get' && query.collection === 'design-packs') {
+        const design = options.omitStoredDesignOnRead ? undefined
+          : storedDesignPacks.find((candidate) => candidate.owner === context.memberId && candidate.briefingId === query.key);
+        if (!design) return { ok: false, outcome: 'failed', error: 'owner design pack unavailable', evidence: { owner: context.memberId, key: query.key } };
+        return { ok: true, outcome: 'done', result: options.mutateLoadedDesign ? options.mutateLoadedDesign(design) : design,
+          evidence: { owner: context.memberId, key: query.key } };
       }
       if (query.op === 'create' && query.collection === 'scraps') {
         const saved = { ...runInput, id: text(runInput.id) || `scrap-added-${storedScraps.length + 1}`,
@@ -371,16 +503,56 @@ export async function runAbsorbGraphSimulation(options: {
         }
         return { ok: true, outcome: 'done', result: { stored: true }, evidence: { stored: true, count: storedBriefings.length } };
       }
-      if (query.op === 'upsert' && query.collection === 'suggestions') {
+      if (query.op === 'upsert' && query.collection === 'design-packs') {
+        // The runner binds the declared output references before invoking this fake provider.
+        const key = query.key;
+        const value = query.value;
+        const design = object(value);
+        const briefing = object(object(object(outputs.brief).evidence).briefing);
+        const requirements = object(object(outputs.requirements).result);
+        const lines = Array.isArray(requirements.lines) ? requirements.lines : [];
+        const sourceIds = Array.isArray(requirements.scrapIds) ? requirements.scrapIds : [];
+        const slot = appSlots.find((candidate) => candidate.id === design.appId && (candidate.owner === undefined || candidate.owner === context.memberId));
+        const targets = slot ? [...(Array.isArray(slot.screens) ? slot.screens : []), ...(Array.isArray(slot.rpc) ? slot.rpc : [])] : [];
+        const changes = Array.isArray(design.changes) ? design.changes.map(object) : [];
+        const valid = typeof key === 'string' && key !== '' && key === briefing.id && design.briefingId === key
+          && lines.length === 3 && JSON.stringify(design.requirementLines) === JSON.stringify(lines)
+          && sourceIds.length > 0 && JSON.stringify(design.scrapIds) === JSON.stringify(sourceIds)
+          && JSON.stringify(sourceIds) === JSON.stringify(object(briefing).scrapIds)
+          && sourceIds.every((id) => storedScraps.some((scrap) => scrap.id === id && scrap.owner === context.memberId))
+          && slot !== undefined && changes.length === lines.length
+          && changes.every((change, index) => change.requirement === lines[index] && targets.includes(change.target)
+            && typeof change.action === 'string' && change.action.trim().length > 0);
+        if (!valid && !options.permissiveDesignStore) return { ok: false, outcome: 'failed',
+          error: `design pack must match the briefing, requirements, sources, and verified app slot: ${JSON.stringify({
+            key, briefingId: briefing.id, designBriefingId: design.briefingId,
+            lines, designLines: design.requirementLines, sourceIds, designScrapIds: design.scrapIds,
+            briefingScrapIds: briefing.scrapIds, slotId: slot?.id, targets, changes,
+          })}` };
+        const row: Row = { ...design, owner: text(context.memberId) };
+        const index = storedDesignPacks.findIndex((candidate) => candidate.owner === row.owner && candidate.briefingId === row.briefingId);
+        if (index >= 0) storedDesignPacks[index] = row; else storedDesignPacks.push(row);
+        calls.storeWrites.push(`design-packs:${row.owner}:${text(row.briefingId)}`);
+        return { ok: true, outcome: 'done', result: { stored: true }, evidence: { stored: true, design: row } };
+      }
+      if (query.op === 'create' && query.collection === 'suggestions') {
         const suggestion = object(query.suggestion);
         const id = query.key;
         const value = query.value;
         const rowValue = object(value);
         if (typeof id !== 'string' || !id || rowValue.id !== id)
-          return { ok: false, outcome: 'failed', evidence: { reason: 'mapped-key-value-mismatch', key: query.key, value: query.value }, error: 'suggestion upsert key/value must resolve to the same mapped id' };
-        const row = { ...rowValue, owner: text(context.memberId) };
+          return { ok: false, outcome: 'failed', evidence: { reason: 'mapped-key-value-mismatch', key: query.key, value: query.value }, error: 'suggestion create key/value must resolve to the same mapped id' };
+        if (query.owner !== context.memberId || query.ownerScoped !== true || rowValue.owner !== context.memberId)
+          return { ok: false, outcome: 'failed', error: 'suggestion owner mismatch' };
+        const row: Row = { ...rowValue, owner: text(context.memberId) };
         const index = storedSuggestions.findIndex((candidate) => candidate.id === id && candidate.owner === row.owner);
-        if (index >= 0) storedSuggestions[index] = row; else storedSuggestions.push(row);
+        if (index >= 0) return { ok: false, outcome: 'failed', error: 'suggestion ID already exists for owner',
+          evidence: { reason: 'owner-key-conflict', owner: row.owner, id } };
+        storedSuggestions.push(row);
+        if (options.concurrentBriefRuns && !approvedConcurrentSuggestion) {
+          row.approvalStatus = 'approved';
+          approvedConcurrentSuggestion = true;
+        }
         calls.storeWrites.push(`suggestions:${row.owner}:${id}`);
         return { ok: true, outcome: 'done', result: { stored: true, id }, evidence: { stored: true, suggestionId: id } };
       }
@@ -404,7 +576,7 @@ export async function runAbsorbGraphSimulation(options: {
           } else if (kind === 'voice' || kind === 'video') {
             const result = await fakeStt({ graphId: briefGraphId, runId: 'absorb-sim-extract', nodeId: `stt-${text(scrap.id)}`, input: scrap, nodeInput: scrap, outputs: {} });
             extracted = `STT: ${text(object(result.result).text)}`;
-          } else extracted = kind === 'text' ? text(scrap.text) : `Extracted ${kind}: ${text(scrap.url)}`;
+          } else extracted = text(scrap.text) || (kind === 'text' ? '' : `Extracted ${kind}: ${text(scrap.url)}`);
           return { id: scrap.id, kind, title: `${kind} scrap`, text: extracted, sourceRef: scrap.url ?? scrap.mediaRef ?? scrap.id };
         }));
       } catch (cause) {
@@ -429,12 +601,17 @@ export async function runAbsorbGraphSimulation(options: {
       });
       return { ok: true, outcome: 'done', result: { delivered: sent }, evidence: { briefingId: briefId } };
   };
+  let durableBoardStore: MemberEventStore | undefined;
   const boardEventProvider: GraphCapabilityProvider = async ({ nodeInput }) => {
       const config = object(nodeInput);
       const event = object(config.event);
       if (config.operation !== 'append' || !text(config.memberId) || event.memberId !== config.memberId
         || event.type !== 'board.card' || !text(event.cardId) || !text(event.at)) {
         return { ok: false, outcome: 'fail', error: 'invalid fake board event contract' };
+      }
+      if (durableBoardStore) {
+        if (!boardCardNexusEvent(event)) return { ok: false, outcome: 'fail', error: 'invalid member board event' };
+        await durableBoardStore.append(event);
       }
       calls.boardEvents.push(structuredClone(event));
       return { ok: true, outcome: 'ok', result: { appended: true } };
@@ -477,7 +654,12 @@ export async function runAbsorbGraphSimulation(options: {
       const result = publishFakeSimulatedArtifact({ host, appId: String(app.id), owner: text(context.memberId), artifact, receipt, calls: runAppHostCalls });
       calls.appHost.push(...runAppHostCalls);
       calls.appHostByRun.set(runId, runAppHostCalls);
-      if (result.ok) await options.onAppPublish?.({ action, runId, suggestion, artifact, result: object(result.result), evidence: object(result.evidence) });
+      if (result.ok) {
+        const url = new URL(text(object(result.result).resultUrl));
+        const readback = host.fetch(url.hostname, url.pathname);
+        await options.onAppPublish?.({ action, runId, suggestion, artifact, result: object(result.result), evidence: object(result.evidence),
+          readback: { status: readback.status, sha256: createHash('sha256').update(readback.body).digest('hex') } });
+      }
       return result;
   };
   const providers = absorbSimulationCapabilityRegistry({
@@ -489,45 +671,94 @@ export async function runAbsorbGraphSimulation(options: {
     'app-publish.action@1': appPublishProvider,
   });
 
-  const root = mkdtempSync(join(tmpdir(), 'absorb-v2-runGraph-sim-'));
+  const root = options.instanceRoot ?? mkdtempSync(join(tmpdir(), 'absorb-v2-runGraph-sim-'));
+  if (options.instanceRoot) durableBoardStore = createJsonlMemberEventStore(join(root, 'member-board-events'));
   try {
     const run = async (graphFile: string, kstDay: string, runId: string,
       runOptions: { suggestionId?: string; simulationOutcome?: 'passed' | 'failed' | 'missing' | 'mismatched'; memberId?: string; resumeRunId?: string; boardAttachments?: readonly Row[] } = {}) => {
       const file = graphFile === 'absorb-build.yaml' && options.buildGraphFile
-        ? options.buildGraphFile : resolve(join(import.meta.dir, '../../plugins/absorb/graph', graphFile));
-      const graphOptions = { ...(!runOptions.resumeRunId ? { runId } : {}), ...(runOptions.resumeRunId ? { resumeRunId: runOptions.resumeRunId } : {}), quiet: true, input: { ask: 'run the member absorb graph', suggestionId: runOptions.suggestionId ?? 'suggestion-member-demo', startedAt: '2026-11-10T00:00:00.000Z', context: { memberId: member.id, kstDay, runId,
-        appSlots, appRef: app.id, suggestionId: runOptions.suggestionId ?? 'suggestion-member-demo', mode: 'upgrade',
+        ? options.buildGraphFile : graphFile === 'absorb-brief.yaml' && options.briefGraphFile
+          ? options.briefGraphFile : resolve(join(import.meta.dir, '../../plugins/absorb/graph', graphFile));
+      const sourceInput = options.sourceScrapId && graphFile === 'absorb-brief.yaml'
+        ? { sourceScrapId: options.sourceScrapId, rootRunId: options.rootRunId } : {};
+      const graphOptions = { ...(!runOptions.resumeRunId ? { runId } : {}), ...(runOptions.resumeRunId ? { resumeRunId: runOptions.resumeRunId } : {}), quiet: true, input: { ask: 'run the member absorb graph', suggestionId: runOptions.suggestionId ?? 'suggestion-member-demo', startedAt: '2026-11-10T00:00:00.000Z', ...sourceInput, context: { memberId: member.id, ...sourceInput, ...((options.omitBriefKstDay && graphFile === 'absorb-brief.yaml') ? {} : { kstDay: graphFile === 'absorb-brief.yaml' ? options.briefKstDay ?? kstDay : kstDay }), runId,
+        ...(!options.omitAppSlotsFromGraphInput ? { appSlots } : {}), appRef: app?.id, suggestionId: runOptions.suggestionId ?? 'suggestion-member-demo', mode: 'upgrade',
         simulationOutcome: runOptions.simulationOutcome ?? 'passed', ...(runOptions.memberId ? { memberId: runOptions.memberId } : {}) },
-        attachments: runOptions.boardAttachments ?? [] },
+        ...(runOptions.boardAttachments ? { attachments: runOptions.boardAttachments } : {}) },
         deps: { root: join(root, runId), callLLM: async (prompt: string) => {
           calls.llmPrompts.push(prompt);
-          return fakeModel(prompt, world, calls.llm, kstDay);
+          return fakeModel(prompt, calls.llm, kstDay, options.mutateDesign, calls.designInputs,
+            options.mutateRequirements, options.mutateDesignResult, options.suggestOutcome, options.mutateSuggestion);
         }, capabilityProviders: providers } } as unknown as GraphRunOptions;
       const selectedRouteBuild = graphFile === 'absorb-build.yaml'
         && runOptions.suggestionId === (options.routeSuggestionId ?? 'suggestion-2026-11-09-1');
-      return options.dispatchGraph && selectedRouteBuild
+      const state = await (options.dispatchGraph && selectedRouteBuild
         ? options.dispatchGraph(file, graphOptions)
-        : runGraph(file, graphOptions);
+        : runGraph(file, graphOptions));
+      // DEMO-BRIEF-SUGGEST-BINDING is a follow-up. Existing build/board simulations
+      // still need owner-scoped suggestions, so bind deterministic test fixtures
+      // after the design-only graph completes. This is not a graph store write.
+      if (graphFile === 'absorb-brief.yaml' && state.status === 'done' && !options.briefDesignOnly && !options.withoutSuggestionFixtures) {
+        const design = storedDesignPacks.find((row) => row.owner === member.id && row.briefingId === `brief-${text(member.id)}-${kstDay}`);
+        if (!design) throw new Error('test-only suggestion binding requires a saved design');
+        const scrapIds = Array.isArray(design.scrapIds) ? design.scrapIds : [];
+        const sourceMarker = scrapIds.find((id) => typeof id === 'string' && /^[a-f0-9]{16}$/u.test(id));
+        for (const index of [1, 2]) {
+          const suggestion = { id: `suggestion-${kstDay}-${index}${sourceMarker ? `-${sourceMarker}` : ''}`,
+            owner: member.id, appId: design.appId,
+            ask: `우리 행사용 티켓팅 서비스 만들어 볼까요?${sourceMarker ? ` · 원본 스크랩 ${sourceMarker}` : ''}`,
+            change: `브리핑 근거를 반영한 티켓팅 서비스 ${index}`, evidenceScrapIds: scrapIds };
+          const at = storedSuggestions.findIndex((row) => row.id === suggestion.id && row.owner === member.id);
+          // Legacy build fixtures fill absent rows only; the real brief graph owns
+          // already persisted suggestion fields and any later approval state.
+          if (at < 0) storedSuggestions.push(suggestion);
+          if (!calls.suggestionFixtureIds.includes(suggestion.id)) calls.suggestionFixtureIds.push(suggestion.id);
+        }
+      }
+      return state;
     };
 
     const start = new Date(text(object(world.clock).start));
     if (!Number.isFinite(start.getTime())) throw new Error('absorb sim world clock.start is invalid');
     if (options.briefOnly) {
-      const briefRun = await withSimClock(start, () => run('absorb-brief.yaml', '2026-11-09', 'absorb-brief-only'));
+      const briefRun = await withSimClock(start, () => run('absorb-brief.yaml', '2026-11-09', options.briefRunId ?? 'absorb-brief-only'));
       const briefing = storedBriefings.find((row) => row.owner === member.id);
       const generatedSuggestions = storedSuggestions.filter((row) => row.owner === member.id);
-      if (briefRun.status !== 'done' || !briefing || generatedSuggestions.length < 1)
+      const design = storedDesignPacks.find((row) => row.owner === member.id && row.briefingId === briefing?.id);
+      if (briefRun.status !== 'done' || !briefing || !design || generatedSuggestions.length < 1)
         throw new Error(`absorb briefing graph did not save its owner records: ${JSON.stringify({ status: briefRun.status, briefing, generatedSuggestions })}`);
+      const listRun = await withSimClock(start, () => run('absorb-suggest-list.yaml', '2026-11-09', 'absorb-suggest-list-after-brief'));
+      const listedSuggestions = resultFrom(listRun.nodes.find(node => node.nodeId === suggestionListNodeId)?.output).items;
+      if (listRun.status !== 'done' || !Array.isArray(listedSuggestions)
+        || !generatedSuggestions.every(item => listedSuggestions.some(candidate => object(candidate).id === item.id)))
+        throw new Error('real suggestion list did not consume graph-stored owner suggestions');
+      let approvalTarget: Row | undefined;
+      if (options.verifyApprovalTarget) {
+        if (confirmationDispatch.status !== 'dispatched') throw new Error('suggestion approval target requires explicit confirmation');
+        const suggestionId = text(object(listedSuggestions[0]).id);
+        const buildRun = await withSimClock(start, () => run('absorb-build.yaml', '2026-11-09', 'absorb-approval-target-after-brief', { suggestionId }));
+        const lookupNodeId = text(object(parseYaml(readFileSync(join(graphRoot, 'absorb-build.yaml'), 'utf8'))).entry);
+        const lookup = resultFrom(buildRun.nodes.find(node => node.nodeId === lookupNodeId)?.output);
+        if (buildRun.status !== 'awaiting-approval' || !buildRun.path.includes(lookupNodeId) || lookup.id !== suggestionId)
+          throw new Error('confirmed approval route did not consume the graph-stored suggestion ID');
+        approvalTarget = { graphId: buildRun.graphId, status: buildRun.status, suggestionId, lookup,
+          runId: buildRun.runId, path: buildRun.path };
+      }
       await options.onSuggestion?.({ briefing, suggestions: generatedSuggestions });
       return { ok: true, status: briefRun.status, runId: briefRun.runId, graphId: briefGraphId,
-        briefing, suggestions: generatedSuggestions, evidence: briefRun.nodes.map(({ nodeId, output, error }) => ({ nodeId, output, error })) };
+        briefing, design, suggestions: generatedSuggestions, suggestionSource: options.withoutSuggestionFixtures ? 'graph-store' : 'graph-store-plus-fixture',
+        suggestionStoreWrites: calls.storeWrites.filter(write => write.startsWith('suggestions:')),
+        consumer: { graphId: listRun.graphId, status: listRun.status, path: listRun.path, suggestions: listedSuggestions },
+        ...(approvalTarget ? { approvalTarget } : {}),
+        evidence: briefRun.nodes.map(({ nodeId, ok, output, error }) => ({ nodeId, ok, output, error })) };
     }
     if (options.buildOnly) {
       const selectedSuggestionId = options.routeSuggestionId;
       const selectedSuggestion = storedSuggestions.find((row) => row.id === selectedSuggestionId && row.owner === member.id);
       if (!selectedSuggestionId || !selectedSuggestion) throw new Error('absorb build-only simulation requires the saved owner suggestion from the briefing graph');
       let build = await run('absorb-build.yaml', '2026-11-10', options.approvalRunId ?? 'absorb-build-only', {
-        suggestionId: selectedSuggestionId, simulationOutcome: 'passed', boardAttachments: options.boardAttachments ?? [] });
+        suggestionId: selectedSuggestionId, simulationOutcome: 'passed',
+        ...(options.boardAttachments ? { boardAttachments: options.boardAttachments } : {}) });
       if (build.status !== 'awaiting-approval' || !buildHitlNodeIds.includes(build.pending?.nodeId ?? ''))
         throw new Error(`absorb build-only graph did not stop at publish approval: ${JSON.stringify({ status: build.status, pending: build.pending?.nodeId })}`);
       decideGraphApproval(build.graphId, build.runId, 'approved', text(member.id), join(root, build.runId));
@@ -540,8 +771,39 @@ export async function runAbsorbGraphSimulation(options: {
         throw new Error(`absorb build-only graph did not use its saved suggestion: ${JSON.stringify({ status: build.status, path: build.path, lookup })}`);
       }
       return { ok: true, started: true, graph: 'plugins/absorb/graph/absorb-build.yaml', status: build.status,
-        path: build.path, selectedSuggestion, lookupSuggestion: lookup, llmInputs: calls.llmPrompts,
+        path: build.path, selectedSuggestion, lookupSuggestion: lookup, sourceBrief: sourceBrief && {
+          path: sourceBrief.path, sha256: sourceBrief.sha256 }, llmInputs: calls.llmPrompts,
         boardProgress: calls.boardEvents.filter(event => event.runId === build.runId) };
+    }
+    if (options.concurrentBriefRuns) {
+      const runs = await withSimClock(start, () => Promise.all([
+        run('absorb-brief.yaml', '2026-11-09', 'absorb-concurrent-a'),
+        run('absorb-brief.yaml', '2026-11-09', 'absorb-concurrent-b'),
+      ]));
+      return { statuses: runs.map(state => state.status), paths: runs.map(state => state.path),
+        suggestions: storedSuggestions.filter(item => item.owner === member.id),
+        suggestionStoreWrites: calls.storeWrites.filter(write => write.startsWith('suggestions:')),
+        concurrentReadCount };
+    }
+    if (options.briefDesignOnly) {
+      const brief = await withSimClock(start, () => run('absorb-brief.yaml', '2026-11-09', options.briefRunId ?? 'absorb-article-design'));
+      const ownedArticles = storedScraps.filter((row) => row.owner === member.id && row.kind === 'web');
+      const design = storedDesignPacks.find((row) => row.owner === member.id);
+      const lines = design && Array.isArray(design.requirementLines) ? design.requirementLines : [];
+      const changes = design && Array.isArray(design.changes) ? design.changes.map(object) : [];
+      const ok = brief.status === 'done' && ownedArticles.length === 1 && lines.length === 3
+        && changes.length === lines.length && changes.every((change, index) => change.requirement === lines[index])
+        && design !== undefined && design.appId === app.id && Array.isArray(design.scrapIds)
+        && design.scrapIds.length === 1 && design.scrapIds[0] === ownedArticles[0]!.id
+        && calls.storeWrites.includes(`design-packs:${member.id}:${text(design.briefingId)}`)
+        && calls.ownersRead.every((owner) => owner === member.id);
+      return { ok, graphStatus: brief.status, graphPath: brief.path, runId: brief.runId, briefing: storedBriefings[0],
+        graphNodes: brief.nodes.map(({ nodeId, output, error }) => ({ nodeId, output, error })),
+        articleId: ownedArticles[0]?.id, design, suggestions: storedSuggestions.filter(row => row.owner === member.id),
+        suggestionStoreWrites: calls.storeWrites.filter(write => write.startsWith('suggestions:')),
+        requirementLines: lines, designChanges: changes,
+        storeWrites: calls.storeWrites, notificationDeliveries: calls.notifications,
+        llmCalls: calls.llm, designInputs: calls.designInputs };
     }
     if (options.routeReceiptOnly) {
       const sourceRun = await withSimClock(start, () => run('absorb-brief.yaml', '2026-11-09', 'absorb-classic-route-brief'));
@@ -557,12 +819,11 @@ export async function runAbsorbGraphSimulation(options: {
     }
     if (options.receiptScenariosOnly) {
       const sourceRun = await withSimClock(start, () => run('absorb-brief.yaml', '2026-11-09', 'absorb-receipt-source'));
-      const storedSuggestionIds = calls.storeWrites.filter((write) => write.startsWith(`suggestions:${member.id}:`))
-        .map((write) => write.slice(`suggestions:${member.id}:`.length)).sort();
+      const storedSuggestionIds = [...calls.suggestionFixtureIds].sort();
       const storedSuggestionId = storedSuggestionIds[0];
       if (sourceRun.status !== 'done' || !storedSuggestionId
         || !storedSuggestions.some((suggestion) => suggestion.id === storedSuggestionId && suggestion.owner === member.id)) {
-        throw new Error(`absorb receipt scenarios require a suggestion saved by the actual brief graph: ${JSON.stringify({
+        throw new Error(`absorb receipt scenarios require a test-bound suggestion after design save: ${JSON.stringify({
           sourceStatus: sourceRun.status, storedSuggestionIds, storeWrites: calls.storeWrites })}`);
       }
 
@@ -584,7 +845,8 @@ export async function runAbsorbGraphSimulation(options: {
         { suggestionId: storedSuggestionId, simulationOutcome: 'mismatched' });
       calls.appHostBodyByRun.set(runIds.mismatched, host.fetch(`${app.id}.app.sim.invalid`, '/').body);
       builds.passed = await run('absorb-build.yaml', '2026-11-09', runIds.passed,
-        { suggestionId: storedSuggestionId, simulationOutcome: 'passed', boardAttachments: options.boardAttachments ?? [] });
+        { suggestionId: storedSuggestionId, simulationOutcome: 'passed',
+          ...(options.boardAttachments ? { boardAttachments: options.boardAttachments } : {}) });
       if (builds.passed.status === 'awaiting-approval' && buildHitlNodeIds.includes(builds.passed.pending?.nodeId ?? '')) {
         decideGraphApproval(builds.passed.graphId, builds.passed.runId, 'approved', 'simulated-owner', join(root, runIds.passed));
         builds.passed = await run('absorb-build.yaml', '2026-11-09', runIds.passed,
@@ -617,7 +879,7 @@ export async function runAbsorbGraphSimulation(options: {
         const buildOutput = object(typeof build.nodes.find(node => node.nodeId === ['buil', 'd'].join(''))?.output === 'string'
           ? JSON.parse(String(build.nodes.find(node => node.nodeId === ['buil', 'd'].join(''))?.output)) : build.nodes.find(node => node.nodeId === ['buil', 'd'].join(''))?.output);
         receiptScenarios[key] = { graphId: build.graphId, status: build.status, path: build.path, suggestionId,
-          suggestionWasSavedByBrief: key === 'foreign-owner' ? false : storedSuggestionIds.includes(suggestionId),
+          suggestionFixtureBound: key === 'foreign-owner' ? false : storedSuggestionIds.includes(suggestionId),
           suggestionStoredForOtherOwner: key === 'foreign-owner' && storedSuggestions.some((suggestion) => suggestion.id === suggestionId && suggestion.owner !== member.id),
           suggestionLookupObserved: suggestionLookup !== undefined, suggestionLookupFound: suggestionLookup?.found,
           suggestionLookupReason: suggestionLookup?.reason,
@@ -631,7 +893,7 @@ export async function runAbsorbGraphSimulation(options: {
       }
       const receiptCasesPass = ['failed', 'missing', 'mismatched'].every((key) => {
         const scenario = object(receiptScenarios[key]);
-        return scenario.graphId === buildGraphId && scenario.status === 'failed' && scenario.suggestionWasSavedByBrief === true
+        return scenario.graphId === buildGraphId && scenario.status === 'failed' && scenario.suggestionFixtureBound === true
           && scenario.suggestionLookupObserved === true && scenario.simulateReached === true && scenario.simulateSuggestionId === storedSuggestionId
           && Array.isArray(scenario.appHostCalls) && scenario.appHostCalls.length === 0 && scenario.currentBody === '<main>v1</main>'
           && (key === 'failed' ? scenario.publishNodeReached === false
@@ -648,7 +910,7 @@ export async function runAbsorbGraphSimulation(options: {
         && Array.isArray(foreign.appHostCalls) && foreign.appHostCalls.length === 0;
       if (!ok) throw new Error(`absorb-build receipt boundary invariants failed: ${JSON.stringify({ storedSuggestionIds, receiptScenarios })}`);
       return { ok, started: true, graph: 'plugins/absorb/graph/absorb-build.yaml', storedSuggestionId, receiptScenarios,
-        suggestionStoreWrites: calls.storeWrites.filter((write) => write.startsWith(`suggestions:${member.id}:`)),
+        suggestionFixtureIds: calls.suggestionFixtureIds,
         suggestionLookups: calls.suggestionLookups };
     }
     const first = await withSimClock(start, async (clock) => {
@@ -661,7 +923,8 @@ export async function runAbsorbGraphSimulation(options: {
     });
     const acceptedSuggestionId = options.routeSuggestionId ?? 'suggestion-2026-11-09-1';
     let acceptedBuild = await run('absorb-build.yaml', '2026-11-10', options.approvalRunId ?? 'absorb-demo-build-pass', {
-      suggestionId: acceptedSuggestionId, simulationOutcome: 'passed', boardAttachments: options.boardAttachments ?? [] });
+      suggestionId: acceptedSuggestionId, simulationOutcome: 'passed',
+      ...(options.boardAttachments ? { boardAttachments: options.boardAttachments } : {}) });
     // Source: #36491; the KAIST test owner approves only after the simulated publish graph pauses at its explicit HITL node.
     if (options.onAcceptedBuild && acceptedBuild.status === 'awaiting-approval'
       && buildHitlNodeIds.includes(acceptedBuild.pending?.nodeId ?? '')) {
@@ -688,6 +951,8 @@ export async function runAbsorbGraphSimulation(options: {
       && foreignBuild.status === 'failed' && calls.appHost.length === (options.onAcceptedBuild ? 1 : 0)
       && first.sameDayNotificationCount === 3 && calls.notifications.length === 6 && calls.llm.length > 0
       && actualKinds.join(',') === ['photo', 'text', 'video', 'voice', 'web', 'x', 'youtube'].join(',')
+      && calls.suggestionFixtureIds.includes('suggestion-2026-11-09-1')
+      && calls.suggestionFixtureIds.includes('suggestion-2026-11-09-2')
       && calls.storeWrites.includes(`suggestions:${member.id}:suggestion-2026-11-09-1`)
       && calls.storeWrites.includes(`suggestions:${member.id}:suggestion-2026-11-09-2`)
       && calls.suggestionLookups.includes(`${member.id}:${options.routeSuggestionId ?? 'suggestion-2026-11-09-1'}`)
@@ -708,10 +973,10 @@ export async function runAbsorbGraphSimulation(options: {
       appHostCalls: calls.appHost, sameDayNotificationCount: first.sameDayNotificationCount, nextDayNotificationCount: calls.notifications.length - first.sameDayNotificationCount,
       fakeClock: first.simulatedNow, memberIsolation: calls.ownersRead.every((owner) => owner === member.id), extractionKinds: actualKinds,
       routeSuggestionId: options.routeSuggestionId ?? 'suggestion-2026-11-09-1',
-      suggestionStoreWrites: calls.storeWrites.filter((write) => write.startsWith('suggestions:')), suggestionLookups: calls.suggestionLookups,
+      suggestionFixtureIds: calls.suggestionFixtureIds, suggestionStoreWrites: calls.storeWrites.filter((write) => write.startsWith('suggestions:')), suggestionLookups: calls.suggestionLookups,
       boardProgress: calls.boardEvents.filter(event => event.runId === acceptedBuild.runId) };
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    if (!options.instanceRoot) rmSync(root, { recursive: true, force: true });
   }
 }
 

@@ -1,0 +1,18 @@
+graph_id: machine-sanitize
+loop:
+  title: Machine sanitation light sweep
+  root: 수호자
+  owner: RES
+  description: Guardian-owned bounded host inventory and quarantine of explicitly marked stale scratch only.
+  trigger:
+    cron: '*/30 * * * *'
+    events: [manual]
+version: 1
+entry_node: sweep
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: sweep, kind: agent, recipe: 'cmd:machine-sanitize-light', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: sweep, on: outcome, map: { ok: done, skipped: done, fail: failed, error: failed } }

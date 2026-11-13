@@ -83,7 +83,7 @@ export const NON_MENU_SIDEBAR_ROUTE_CATEGORIES = [
   'provider-onboarding-complete', 'settings-subpage', 'workflow-subflow',
   'workflow-legacy-redirect', 'root-welcome', 'error-page', 'unwired-screen',
   'diagnostic-readonly', 'contact-form', 'beta-direct-link', 'operator-direct-link',
-  'member-signup',
+  'member-signup', 'member-scraps',
 ];
 export type NonMenuSidebarRouteCategory = typeof NON_MENU_SIDEBAR_ROUTE_CATEGORIES[number];
 export interface NonMenuSidebarRoute {
@@ -102,6 +102,7 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/ops/release', category: 'operator-direct-link', reason: '운영자 릴리스 그래프 직접 진입점.' },
   { href: '/live-run/adaptive', category: 'beta-direct-link', reason: '런 장면에서 여는 적응형 그래프 시뮬레이션 재생 화면.' },
   { href: '/share/received', category: 'system-share-target', reason: 'OS 공유 수신 후 회원 스크랩 저장 화면.' },
+  { href: '/scraps', category: 'member-scraps', reason: '공유 완료 화면에서 여는 회원 본인의 저장한 스크랩 목록.' },
   { href: '/setup', category: 'provider-onboarding', reason: 'LLM provider 온보딩 진입점.' },
   { href: '/setup/done', category: 'provider-onboarding-complete', reason: 'LLM provider 온보딩 완료 화면.' },
   { href: '/', category: 'root-welcome', reason: '첫 방문자를 위한 루트 welcome 화면.' },
@@ -117,6 +118,7 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'make', href: '/apps', label: '앱', hint: '앱 스튜디오 — 시뮬레이션과 운영 상태', icon: LayoutGrid },
   { group: 'make', href: '/design-check', label: '디자인 방향', hint: '앱 디자인 방향 고르기', icon: Palette },
   { group: 'files', href: '/vault', label: 'Obsidian 노트', hint: 'Vault — Obsidian 노트 (브라우저·에디터·검색·그래프)', icon: BookOpen },
+  { group: 'files', href: '/voice-notes', label: '음성 노트', hint: '녹음 날짜별 타임라인 · 폴더 · 내보내기', icon: BookOpen },
   { group: 'settings', href: '/settings', label: '설정', hint: '환경 + provider + theme', icon: Settings },
   { group: 'settings', href: '/credentials', label: '자격', hint: '넥서스 금고의 자격 슬롯 상태', icon: Settings },
 ] as const;

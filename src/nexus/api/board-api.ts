@@ -196,7 +196,7 @@ function responseCards(events: readonly BoardCardEvent[]): BoardCardResponse[] {
     return {
       id: latest.cardId,
       memberId: latest.memberId,
-      title: projectedCard.title,
+      title: latest.title,
       state: API_STATES[latest.state],
       ...(summary ?? projectedCard.summary ? { summary: summary ?? projectedCard.summary } : {}),
       ...(runId ? { runId } : {}),

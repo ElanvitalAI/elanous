@@ -276,7 +276,7 @@ export interface ReviewProviderCandidateSkip {
   readonly label: string;
   readonly model: string;
   readonly provider?: string;
-  readonly why: 'model-unknown' | 'provider-mismatch' | 'provider-unresolved' | 'provider-not-allowed' | 'no-credential' | 'availability-check-failed';
+  readonly why: 'model-unknown' | 'provider-mismatch' | 'provider-unresolved' | 'provider-not-allowed' | 'no-credential' | 'availability-check-failed' | 'quota-threshold' | 'quota-unmeasured';
 }
 
 export interface ReviewProviderAttemptPlan {

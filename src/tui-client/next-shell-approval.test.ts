@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   applyShellApprovalKey,
+  createReplGraphApprover,
   createReplShellApprover,
   dispatchNextTuiBash,
   NEXT_TUI_SHELL_APPROVAL_IPC_ENV,
@@ -85,5 +86,21 @@ describe('Next TUI human Bash approval', () => {
     });
     ipc.receive({ type: 'elanous.shell-approval.result', callId: call.callId, approved: true });
     expect(await pending).toBe(false);
+  });
+
+  test('a graph approval reply cannot approve a simultaneous Bash request', async () => {
+    const ipc = new FakeIpc();
+    const env = { [NEXT_TUI_SHELL_APPROVAL_IPC_ENV]: '1' };
+    const bash = createReplShellApprover(ipc, env, 1000)!;
+    const graph = createReplGraphApprover(ipc, env, 1000)!;
+    const pendingBash = bash('rm -rf /tmp/demo');
+    const pendingGraph = graph('GCP 확장 설계 그래프를 실행할까요?');
+    const calls = ipc.sent as Array<{ callId: string; kind: string }>;
+    expect(calls.map(call => call.callId)).toEqual(['s1', 'g1']);
+    expect(calls.map(call => call.kind)).toEqual(['bash', 'graph']);
+    ipc.receive({ type: 'elanous.shell-approval.result', callId: 'g1', approved: true });
+    expect(await pendingGraph).toBe(true);
+    ipc.receive({ type: 'elanous.shell-approval.result', callId: 's1', approved: false });
+    expect(await pendingBash).toBe(false);
   });
 });

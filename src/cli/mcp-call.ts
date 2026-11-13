@@ -2,6 +2,9 @@ import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/
 import { RemotesStore } from './remotes.js';
 import { bookmarkAttachDefaults } from './remote-resolve.js';
 import { getNodeKind } from '../graph-kinds/registry.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 
 export type McpCliClassification =
   | 'ok'
@@ -272,11 +275,12 @@ function resolveMcpEndpoint(opts: McpListOpts):
         message: 'mcp: no local daemon. Start one with `elanous nexus run` (a port is not guessed).',
       };
     }
+    const token = opts.localToken ?? (opts.localUrl === undefined ? readLocalAcpToken(url) : undefined);
     return {
       ok: true,
       value: {
         url,
-        ...(opts.localToken ? { token: opts.localToken } : {}),
+        ...(token ? { token } : {}),
       },
     };
   }
@@ -327,6 +331,16 @@ function resolveMcpEndpoint(opts: McpListOpts):
     };
   }
   return { ok: true, value: { url: `${origin}/v1/mcp`, token, remoteLabel: label } };
+}
+
+function readLocalAcpToken(url: string): string | undefined {
+  try {
+    const host = new URL(url).hostname;
+    if (host !== 'localhost' && host !== '127.0.0.1' && host !== '[::1]') return undefined;
+    return readFileSync(join(getElanousConfigDir(), 'acp-token'), 'utf8').trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function localMcpUrl(opts: McpListOpts): string | null {

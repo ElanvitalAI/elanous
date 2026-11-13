@@ -6,7 +6,7 @@ import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { listChecklist } from '../../src/release-loop/checklist.js';
 import { hasPassingEmergencyPublishGate } from './emergency-publish-authorization.js';
-import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
+import { emitNodeResult, readGraphContext, signedT6KnownIssueGatePassed, type GraphContext } from './node-verdict.js';
 import { regressWarning, validatedTuiRegress } from './tui-node-checks.js';
 
 export type MetricVerdict = 'pass' | 'fail' | 'unmeasured';
@@ -57,6 +57,7 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
     && (gate.outcome === 'ok' || gate.outcome === 'pass(owner-waived)')
     && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
     && typeof gate.reason === 'string' && gate.reason.trim().length > 0;
+  const signedKnownIssueGate = signedT6KnownIssueGatePassed(context);
   const prepare = context.outputs.prepare;
   let pinned: string | undefined;
   try { pinned = readFileSync(join(repo, '.bun-version'), 'utf8').trim(); } catch { pinned = undefined; }
@@ -86,9 +87,9 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   context.outputs['checklist-gate'] = { ...context.outputs['checklist-gate'], publishBlockingYellow };
   const holdReasons = publishApprovalHoldReasons(context);
   const metrics: ApprovalMetric[] = [
-    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate, emergencyGate }),
+    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate, signedKnownIssueGate, emergencyGate }),
       verdict: !gate || gate.outcome === undefined ? 'unmeasured'
-        : ownerWaivedGate || emergencyGate ? 'pass' : !Array.isArray(gate.introduced) ? 'unmeasured'
+        : ownerWaivedGate || signedKnownIssueGate || emergencyGate ? 'pass' : !Array.isArray(gate.introduced) ? 'unmeasured'
           : gate.outcome === 'ok' && gate.introduced.length === 0 && gateErrorAbsent ? 'pass' : 'fail' },
     { name: BLOCKING_METRIC_NAMES[1], value: `running=${bunVersion}; pinned=${pinned ?? 'missing'}`,
       verdict: !pinned ? 'unmeasured' : bunVersion === pinned ? 'pass' : 'fail' },

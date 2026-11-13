@@ -19,12 +19,14 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 // REPL that pipes through ssh / tmux / VS Code terminal alike.
 
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
-import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath, isAbsolute, basename } from 'node:path';
 import * as ui from '../ui.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
 import { runTurn } from '../session/chat.js';
+import type { MeasuredTurnUsage } from '../session/turn-usage.js';
+import { createTurnIdClaim, usageCompletionFrame } from './usage-completion.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import {
   ensureCliSession,
@@ -53,8 +55,10 @@ import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js'
 import { buildSeatBootSystemMessages, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
 import { installNextTuiSelfHealthTracker } from '../tui/chat/self-health-status.js';
 import { bashApprovalFinding } from '../tool-runtime/bash-approval.js';
-import { createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
+import { createReplGraphApprover, createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { isToolSearchCall, routeToolSearch } from '../skills/tools/tool-search-route.js';
+import { buildToolSearchTool } from '../skills/tools/tool-search-spec.js';
 import { agentResultStatus, type AgentDisplayEvent } from '../tui/core/agents.js';
 import { createNextTuiMessageBlockEmitter } from './next-tui-message-blocks.js';
 import { monotonicNowMs } from '../esc-abort-gate.js';
@@ -166,6 +170,8 @@ export interface ReplOpts {
   /** Initial user-config snapshot. Reloaded inside REPL on `:reload`
    *  or after `:provider <label>`. */
   cfg: UserConfig;
+  /** Authenticated Next host session; missing identity leaves board receipts unavailable. */
+  memberBoardSession?: () => Promise<{ nexusUrl: string; sessionToken: string } | undefined> | { nexusUrl: string; sessionToken: string } | undefined;
   /** Resume an explicit session (id or unique prefix). When omitted,
    *  REPL creates a fresh session at boot. */
   initialSessionId: string | undefined;
@@ -241,7 +247,12 @@ interface PendingAttachment {
  *  module is self-contained when consumed in tests. */
 export function buildReplTools(options: {
   readonly shellApprovalProcess?: ShellApprovalIpcProcess;
-  readonly dispatchBash?: (args: Record<string, unknown>, options: { cwd: string }) => Promise<unknown>;
+  readonly dispatchBash?: (args: Record<string, unknown>, options: { cwd: string; signal?: AbortSignal }) => Promise<unknown>;
+  readonly getSignal?: () => AbortSignal | undefined;
+  /** An authenticated member session supplied by the Next host. */
+  readonly memberBoardSession?: ReplOpts['memberBoardSession'];
+  /** Injected route bridge for focused dispatcher regressions. */
+  readonly pluginRuntime?: Pick<import('../cli/child-plugin-runtime.js').ChildPluginRuntimeContract, 'hostTools' | 'dispatchPluginTool'>;
 } = {}): {
   specs: LLMToolSpec[];
   dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
@@ -272,7 +283,11 @@ export function buildReplTools(options: {
   const dispatchBash = options.dispatchBash ?? bashMod.dispatchBash;
   specs.push(bashMod.buildBashTool());
   const shellApprover = createReplShellApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
+  const graphApprover = createReplGraphApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
+  const runBash = (args: Record<string, unknown>, signal?: AbortSignal) =>
+    dispatchBash(args, { cwd: process.cwd(), ...(signal ? { signal } : {}) });
   dispatchByName.set('Bash', async (args) => {
+    const signal = options.getSignal?.();
     const command = typeof args.command === 'string' ? args.command : '';
     const approvalFinding = bashApprovalFinding(command, getUserConfig().shell.bashApproval);
     if (approvalFinding) {
@@ -281,17 +296,68 @@ export function buildReplTools(options: {
         enabled: true,
         requiresApproval: true,
         approve: shellApprover,
-        dispatch: () => dispatchBash(args, { cwd: process.cwd() }),
+        signal,
+        dispatch: () => runBash(args, signal),
       });
     }
-    return dispatchBash(args, { cwd: process.cwd() });
+    return runBash(args, signal);
   });
   const appDeploy = require('../agent/app-deploy-plugin.js') as typeof import('../agent/app-deploy-plugin.js');
   const appDeploySpec = appDeploy.appDeployPluginSpec();
   specs.push(appDeploySpec);
   dispatchByName.set(appDeploySpec.name, (args) => appDeploy.runAppDeploy(args));
-  const pluginBridge = (require('../cli/child-plugin-runtime.js') as typeof import('../cli/child-plugin-runtime.js'))
-    .createChildPluginRuntimeContract();
+  const nextTestRoot = getElanousConfigDir();
+  const nextTestSessionFile = resolvePath(nextTestRoot, 'next-member-session.test.json');
+  const nextTestGraphFile = resolvePath(nextTestRoot, 'next-graph-results.test.json');
+  const stampedStateDir = process.env.ELANOUS_STATE_DIR;
+  const nextTestWorld = process.env.ELANOUS_TEST_FAKE_LLM === '1' && process.env.ELANOUS_NEXT_TUI_BG_STATUS === '1'
+    && !!stampedStateDir && resolvePath(stampedStateDir) === resolvePath(nextTestRoot)
+    && (require('../instance/resolve.js') as typeof import('../instance/resolve.js'))
+      .resolveInstance({ stampedStateDir }).kind === 'test';
+  const pluginBridge = options.pluginRuntime ?? (require('../cli/child-plugin-runtime.js') as typeof import('../cli/child-plugin-runtime.js'))
+    .createChildPluginRuntimeContract({
+      requestConfirmation: async (prompt) => await graphApprover?.(prompt) ?? false,
+      // An isolated fake-LLM universe may supply a member session. The owner ID
+      // still comes only from the Nexus owner endpoint, never from this file.
+      ...(nextTestWorld && existsSync(nextTestSessionFile)
+        ? { resolveVerifiedOwner: async () => {
+          const fixture = JSON.parse(readFileSync(nextTestSessionFile, 'utf8')) as {
+            nexusUrl?: string; sessionToken?: string;
+          };
+          const { resolveDashboardVerifiedOwner } = await import('../dashboard/plugin-route-adapter.js');
+          return resolveDashboardVerifiedOwner({ nexusUrl: fixture.nexusUrl ?? '', sessionToken: fixture.sessionToken });
+        } } : {}),
+      ...(nextTestWorld && existsSync(nextTestGraphFile)
+        ? { dispatchGraph: async (_pluginId: string, graphId: string, _graphFile: string,
+            args: Record<string, unknown>, context?: import('../tool-runtime/types.js').ToolRuntimeContext) => {
+          if (!context?.verifiedOwner?.id) throw new Error('graph route requires a verified owner context');
+          const fixtures = JSON.parse(readFileSync(nextTestGraphFile, 'utf8')) as Record<string, unknown>;
+          if (!Object.hasOwn(fixtures, graphId)) throw new Error(`test graph fixture missing: ${graphId}`);
+          let result = fixtures[graphId];
+          if (result && typeof result === 'object'
+            && (result as { status?: unknown }).status === 'awaiting-approval') {
+            const pending = result as { runId?: unknown; designSha256?: unknown; packetSha256?: unknown; pendingNode?: unknown };
+            if (pending.pendingNode !== 'approve' || typeof pending.runId !== 'string'
+              || typeof pending.designSha256 !== 'string' || typeof pending.packetSha256 !== 'string'
+              || !/^[a-f0-9]{64}$/u.test(pending.packetSha256)) throw new Error('Scene 5 graph has no bound spending gate');
+            const designPath = args.ticketDesignPath;
+            if (typeof designPath !== 'string' || !existsSync(designPath)
+              || createHash('sha256').update(readFileSync(designPath)).digest('hex') !== pending.designSha256)
+              throw new Error('Scene 5 pending graph does not match the submitted design');
+            const packetFile = resolvePath(nextTestRoot, 'next-scene5-decision.test.json');
+            if (!existsSync(packetFile)) throw new Error('Scene 5 decision packet missing');
+            const { scene5DecisionPrompt } = await import('../tui-client/scene5-decision-consumer.js');
+            const prompt = scene5DecisionPrompt(readFileSync(packetFile),
+              { graphId, runId: pending.runId, designSha256: pending.designSha256, packetSha256: pending.packetSha256 });
+            const approved = await graphApprover?.(prompt) ?? false;
+            result = { graphId, runId: pending.runId, status: 'decision-recorded',
+              decision: approved ? 'approved' : 'rejected', realGcpCalls: 0 };
+          }
+          appendFileSync(resolvePath(nextTestRoot, 'next-graph-calls.test.jsonl'),
+            `${JSON.stringify({ graphId, args, verifiedOwner: context.verifiedOwner.id, result })}\n`);
+          return result;
+        } } : {}),
+    });
   const exposedNames = new Set(specs.map((spec) => spec.name));
   for (const tool of pluginBridge.hostTools) {
     if (!tool.route || exposedNames.has(tool.name)) continue;
@@ -299,6 +365,7 @@ export function buildReplTools(options: {
       pluginId: tool.pluginId, route: tool.route });
     exposedNames.add(tool.name);
   }
+  if (!specs.some(spec => isToolSearchCall(spec.name))) specs.push(buildToolSearchTool());
   // TUI-NEXT-QUEUE-AND-WAKE: the next TUI parent opens an IPC hop only for its own REPL children;
   // the classic ScheduleWakeup spec is advertised and each call is answered by the parent's scheduler.
   const wakeMod = require('../tui-client/next-wakeup.js') as typeof import('../tui-client/next-wakeup.js');
@@ -332,7 +399,37 @@ export function buildReplTools(options: {
         },
         getToolRuntime: () => undefined,
         dispatchToolRuntime: async (n) => ({ error: `runtime unavailable in REPL: ${n}` }),
-        dispatchPluginTool: pluginBridge.dispatchPluginTool,
+        dispatchPluginTool: async (toolName, toolArgs) => {
+          const routed = await pluginBridge.dispatchPluginTool(toolName, toolArgs);
+          if (!routed.ok) return routed;
+          if (toolName === 'brief_today') {
+            const handlerRef = pluginBridge.hostTools.find(tool => tool.name === toolName)?.handlerRef;
+            const expectedGraphId = handlerRef?.replace(/^(?:\.\/)?graph:/, '') ?? '';
+            if (!handlerRef || !/^(?:\.\/)?graph:/.test(handlerRef)) return routed;
+            const { nextScene2BriefReceipt } = await import('./scene2-brief-receipt.js');
+            const output = nextScene2BriefReceipt(routed.result, expectedGraphId);
+            if (!output || !routed.result || typeof routed.result !== 'object') return routed;
+            const { output: _oldOutput, ...graphResult } = routed.result as Record<string, unknown>;
+            return { ok: true, result: { output, ...graphResult } };
+          }
+          if (toolName !== 'suggest_accept' || typeof toolArgs.suggestionId !== 'string') return routed;
+          try {
+            const session = await options.memberBoardSession?.();
+            if (!session?.nexusUrl || !session.sessionToken) return routed;
+            const { resolveDashboardVerifiedOwner } = await import('../dashboard/plugin-route-adapter.js');
+            const owner = await resolveDashboardVerifiedOwner(session);
+            if (!owner?.id) return routed;
+            const handlerRef = pluginBridge.hostTools.find(tool => tool.name === toolName)?.handlerRef;
+            if (!handlerRef || !/^(?:\.\/)?graph:/.test(handlerRef)) return routed;
+            const { nextScene6BoardReceipt } = await import('./scene6-board-receipt.js');
+            const output = await nextScene6BoardReceipt({ graph: routed.result,
+              expectedGraphId: handlerRef.replace(/^(?:\.\/)?graph:/, ''), cardId: toolArgs.suggestionId,
+              memberId: owner.id, nexusUrl: session.nexusUrl, sessionToken: session.sessionToken });
+            if (!output || !routed.result || typeof routed.result !== 'object') return routed;
+            const { output: _oldOutput, ...graphResult } = routed.result as Record<string, unknown>;
+            return { ok: true, result: { output, ...graphResult } };
+          } catch { return routed; }
+        },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -488,7 +585,7 @@ async function runOneTurn(
   shellSnapshotTurnId?: string,
   onJsonToolActivity?: (event: ReplToolActivity) => void,
   onPushNowRequest?: (requestId: string, phase: 'probe' | 'commit', activeTools: string[]) => void,
-): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; goalComplete?: boolean; goalStopReason?: string }> {
+): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; measuredUsage?: MeasuredTurnUsage; goalComplete?: boolean; goalStopReason?: string }> {
   const startedAt = Date.now();
   let memorySaveFailed = false;
   (require('../tui/persistent-user-memory.js') as typeof import('../tui/persistent-user-memory.js'))
@@ -644,6 +741,7 @@ async function runOneTurn(
     model: result.model ?? null,
     durationMs: Date.now() - startedAt,
     logPath,
+    ...(result.measuredUsage ? { measuredUsage: result.measuredUsage } : {}),
     ...(result.goalComplete ? { goalComplete: true } : {}),
     ...(result.goalStopReason ? { goalStopReason: result.goalStopReason } : {}),
   };
@@ -839,7 +937,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
   const nextTuiDelivery = process.env.ELANOUS_NEXT_TUI_BG_STATUS === '1'
     ? { pending: [] as PendingTaskNotification[] } : undefined;
   const backgroundBridge = createNextTuiBackgroundBridge(session.id, () => nextTuiDelivery?.pending.length ?? 0);
-  const baseTools = opts.enableTools ? buildReplTools() : undefined;
+  let activeTurnSignal: AbortSignal | undefined;
+  const baseTools = opts.enableTools ? buildReplTools({ getSignal: () => activeTurnSignal,
+    memberBoardSession: opts.memberBoardSession }) : undefined;
   const tools = baseTools && backgroundBridge ? {
     ...baseTools,
     dispatch: async (name: string, args: Record<string, unknown>) => {
@@ -964,6 +1064,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
   if (!isTty || opts.scriptedFromStdin) {
     // JSONL stream — one turn per line.
     const lines = readStdinLines();
+    const claimTurnId = createTurnIdClaim();
     for await (const raw of lines) {
       const trimmed = raw.trim();
       if (trimmed.length === 0) continue;
@@ -973,6 +1074,14 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       } catch {
         // Non-JSON line — treat as a plain prompt for forward-compat.
         turn = { prompt: trimmed };
+      }
+      // A repeated transport ID is a replay, so it cannot receive a new
+      // completion frame that a parent might attach to the old turn.
+      if (process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string') {
+        if (!claimTurnId(turn.id)) {
+          process.stdout.write(`${JSON.stringify({ turnId: turn.id, error: 'duplicate or empty turn ID' })}\n`);
+          continue;
+        }
       }
       if (turn.rotate) {
         const { cfg: nextCfg, entry } = jumpToRotationEntry(cfg, turn.rotate);
@@ -1004,6 +1113,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       let terminateAfterTurn = false;
       const onTerminate = (): void => { terminateAfterTurn = true; turnAbort.abort(); };
       const streamTurn = process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string';
+      activeTurnSignal = streamTurn ? turnAbort.signal : undefined;
       if (streamTurn) process.once('SIGTERM', onTerminate);
       try {
         result = await runOneTurn(
@@ -1071,6 +1181,8 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         }
         console.log(JSON.stringify({ sessionId: sessionIdRef.current, error: error instanceof Error ? error.message : String(error) }));
         continue;
+      } finally {
+        activeTurnSignal = undefined;
       }
       if (streamTurn) process.off('SIGTERM', onTerminate);
       if (terminateAfterTurn) {
@@ -1094,6 +1206,12 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         assertFailures: failures,
         selfHealth,
       };
+      const usageFrame = streamTurn
+        ? usageCompletionFrame(turn.id!, sessionIdRef.current, result.measuredUsage, turnAbort.signal.aborted)
+        : undefined;
+      if (usageFrame) {
+        process.stdout.write(`${JSON.stringify(usageFrame)}\n`);
+      }
       console.log(JSON.stringify(out));
     }
     backgroundBridge?.dispose();

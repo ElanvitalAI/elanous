@@ -17,20 +17,24 @@ export type IntakePrivacy = 'public' | 'user-private';
 export const INTAKE_STATUSES = ['new', 'queued', 'absorbed', 'checked', 'routed', 'discarded', 'deferred'] as const;
 export type IntakeStatus = typeof INTAKE_STATUSES[number];
 export type AbsorbScrapKind = 'text' | 'web' | 'x' | 'youtube' | 'voice' | 'video' | 'photo';
-export interface AbsorbScrapTimelineEntry {
-  t: number;
-  kind: 'voice' | 'photo' | 'video';
-  mediaRef: string;
-  mime: string;
-}
+export type AbsorbScrapTimelineEntry =
+  | { t: number; kind: 'voice' | 'photo' | 'video'; mediaRef: string; mime: string }
+  | { t: number; kind: 'marker'; label: string };
 export interface AbsorbScrapPayload {
   schema: 'absorb/v0';
   memberId: string;
   kind: AbsorbScrapKind;
   source: 'android-share' | 'android-record' | 'flutter-share' | 'flutter-record' | 'tui' | 'pwa' | 'telegram';
-  raw: { text?: string; url?: string; mediaRef?: string; mime?: string; timeline?: AbsorbScrapTimelineEntry[] };
+  raw: { text?: string; url?: string; mediaRef?: string; mime?: string; timeline?: AbsorbScrapTimelineEntry[];
+    recordedAt?: string; recordedTimeZone?: string; recordedDate?: string; classDate?: string };
+  folderId?: string | null;
+  exports?: { vaultId: string; path: string; savedAt: string }[];
+  /** Durable create-only reservation; restart verifies file bytes before finalizing. */
+  pendingExports?: { vaultId: string; path: string; contentSha256: string; startedAt: string; content?: string; writeMarker?: string }[];
   status: 'new' | 'extracting' | 'absorbed' | 'failed';
   card?: { title: string; points: [string, string?, string?]; tags: string[]; originUrl?: string };
+  /** Member-scoped extracted source for a later model-generated share summary. */
+  extractedBody?: string;
   failure?: { stage: 'extract' | 'card'; reason: string };
   createdAt: string;
   absorbedAt?: string;
@@ -274,7 +278,8 @@ export function listAbsorbScraps(instanceRoot: string, memberId: string): Intake
     .sort((a, b) => b.absorb!.createdAt.localeCompare(a.absorb!.createdAt));
 }
 
-export function updateAbsorbScrap(instanceRoot: string, id: string, patch: Partial<Pick<AbsorbScrapPayload, 'status' | 'card' | 'failure' | 'absorbedAt'>>): boolean {
+export function updateAbsorbScrap(instanceRoot: string, id: string, patch: Partial<Pick<AbsorbScrapPayload,
+  'status' | 'card' | 'extractedBody' | 'failure' | 'absorbedAt' | 'folderId' | 'raw' | 'exports' | 'pendingExports'>>): boolean {
   const { items } = loadIntakeLedger(instanceRoot);
   const item = items.get(id);
   if (!item?.absorb) return false;

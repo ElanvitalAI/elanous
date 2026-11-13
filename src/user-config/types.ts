@@ -121,6 +121,8 @@ export interface LLMConfig {
    *  🩸 2026-09-24(대표): 「third 부터 소진하고 그다음 team」 — 이름순(default<new<third)으론 못 만든다.
    *  ⛔ 여기 없는 계정은 버리지 않는다 — 뒤로 가서 이름순으로 붙는다. */
   codexAccountOrder?: string[];
+  /** Host name → account name → positive selection weight for new Codex runs. */
+  codexAccountHostWeights?: Record<string, Record<string, number>>;
   /** Automatic reset-credit uses across all Codex accounts per UTC day; default 1, 0 disables. */
   codexResetAutoConsumePerDay?: number;
   /** 대표 2026-09-28 «크레딧 사용 허가» — 주간 한도가 찬 codex 계정도 «선불 크레딧으로 계속» 쓴다(서버가 한도 소진 시 크레딧으로 넘긴다).

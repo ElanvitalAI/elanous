@@ -56,6 +56,27 @@ export interface ContractTestCandidate {
   twoHop: number;
 }
 
+export function fullContractTestCandidate(tests: readonly string[], reason: string): ContractTestCandidate {
+  return { status: 'full', reason, files: [...tests], direct: 0, twoHop: 0 };
+}
+
+export type ContractTestPrimaryObservation = { status: 'disabled' | 'measured' | 'unmeasured';
+  selectedFiles: string[]; rc: number | null; reason: string | null };
+
+/** Execute the opt-in primary selection. A separate full cut sweep remains the gate shadow/verdict. */
+export async function runContractTestPrimary(input: { enabled: boolean; candidate: ContractTestCandidate;
+  sweep: (only: readonly string[]) => Promise<{ rc: number }> }): Promise<ContractTestPrimaryObservation> {
+  if (!input.enabled) return { status: 'disabled', selectedFiles: [], rc: null, reason: 'opt-in flag is off' };
+  try {
+    const result = await input.sweep(input.candidate.files);
+    return { status: 'measured', selectedFiles: [...input.candidate.files], rc: result.rc,
+      reason: input.candidate.reason };
+  } catch (error) {
+    return { status: 'unmeasured', selectedFiles: [...input.candidate.files], rc: null,
+      reason: `primary selection failed: ${String(error)}` };
+  }
+}
+
 /** Join the candidate to the failure IDs from the same fully measured cut sweep. */
 export function compareContractShadowFailures(input: { candidate: ContractTestCandidate; tests: readonly string[];
   measuredFiles: readonly string[] | null; failureIds: readonly string[] | null; sweepComplete: boolean;
@@ -85,7 +106,7 @@ export function compareContractShadowFailures(input: { candidate: ContractTestCa
 /** Changed tests run as well; unrelated code and configuration changes retain the full radius. */
 export function contractTestCandidate(input: { tree: ClosureTree; priorRead: (path: string) => string | undefined;
   changed: readonly string[]; tests: readonly string[] }): ContractTestCandidate {
-  const full = (reason: string): ContractTestCandidate => ({ status: 'full', reason, files: [...input.tests], direct: 0, twoHop: 0 });
+  const full = (reason: string): ContractTestCandidate => fullContractTestCandidate(input.tests, reason);
   if (!input.changed.length || input.changed.some((path) => !targets.includes(path as typeof targets[number]) && !testPath.test(path)))
     return full('change outside declared implementations');
   try {

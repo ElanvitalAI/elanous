@@ -83,10 +83,11 @@ describe('external execution', () => {
         status: 'completed', surface: devTask.surface,
         output: JSON.stringify({ runId: 'run-dev-11', prUrl: 'https://github.com/test/pr/11', ok: true }),
       }]);
-      const run = dispatcher.tickTask(runTask.id);
+      const run = dispatcher.tickTask(runTask.id, { providerName: 'grok', model: 'grok-4.7' });
       await run.dispatched[0]!.promise;
       expect(subInputs).toHaveLength(1);
-      expect(subInputs[0]).toMatchObject({ definitionName: 'general-purpose' });
+      expect(subInputs[0]).toMatchObject({ definitionName: 'general-purpose',
+        providerName: 'grok', model: 'grok-4.7' });
       expect(subInputs[0]!.prompt).toStartWith(runTask.surface.kind === 'llm-direct' ? runTask.surface.prompt : '');
       expect(subInputs[0]!.prompt).toContain('On the final line of your response, report the outcome as JSON:');
       expect(store.getTask(runTask.id)?.status).toBe('done');

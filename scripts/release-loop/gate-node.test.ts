@@ -14,6 +14,7 @@ import { buildUserConfig, getUserConfig, resetUserConfig } from '../../src/user-
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { simCli } from '../../src/ux-sim/in-process-cli.js';
 import { debug } from '../../src/debug/log.js';
+import { contractSelectOptInLogFields } from './gate-runtime.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial';
 import { hardRehearsalGateVersion } from './gate-radius-live';
@@ -42,6 +43,7 @@ import { gateImagePinPath, writeGateImagePin } from './gate-image-pin.js';
 import { computeReceiptKey, gateEnvFingerprint as registryEnvFingerprint, gateLockfileHash, saveGateReceipt, type GateReceipt } from '../../src/self-implement/gate-receipt-registry.js';
 import { gateLockfileHashAtCommit, gateTestedFileHashesAtCommit } from './gate-reuse-identity.js';
 import { gateReceiptChangedFileImpact, summarizeSelectedGateReceiptPlan } from './gate-runtime.js';
+import gateContractSurfaces from './gate-contract-surfaces.json';
 import { planTrainFileCas, recordTrainFileCasResult } from './gate-train-file-cas.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -171,6 +173,88 @@ test('same-head preexisting failures are reusable only from a fully judged verdi
       preexisting: ['src/a.test.ts > stable baseline failure'] });
     expect(sameHeadPreexistingFailureIds(root, '1.0.1', CUT, BASE)).toBeUndefined();
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-CONTRACT-TEST-SELECT: opt-in runs a selected primary then a fresh pinned full cut and records coverage', async () => {
+  const f = fake([], [], true);
+  const repo = join(f.root, 'contract-selector-repo');
+  mkdirSync(join(repo, 'src/graph-runner'), { recursive: true });
+  const contractNames = gateContractSurfaces['src/graph-runner/runner.ts'];
+  const functionName = 'hasApprovedGraphNodeInput';
+  const moduleFor = (value: number) => contractNames.map((name) =>
+    `export function ${name}(): number { return ${name === functionName ? value : 1}; }`).join('\n') + '\n';
+  const files: Record<string, string> = {
+    'src/graph-runner/runner.ts': moduleFor(1),
+    'src/graph-runner/runner.test.ts': `import { ${functionName} } from './runner.js'; test('gate', () => expect(${functionName}()).toBeGreaterThan(0));\n`,
+    'src/unrelated.test.ts': "test('unrelated', () => expect(true).toBe(true));\n",
+  };
+  for (const [path, body] of Object.entries(files)) {
+    mkdirSync(dirname(join(repo, path)), { recursive: true });
+    writeFileSync(join(repo, path), body);
+  }
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  const runGit = (args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: rc=${result.status} ${result.error ?? ''} ${result.stdout} ${result.stderr}`);
+  };
+  runGit(['init', '-q']); runGit(['config', 'user.name', 'Gate selector test']); runGit(['config', 'user.email', 'gate-selector@example.invalid']);
+  runGit(['add', '.']); runGit(['-c', 'user.name=Gate selector test', '-c', 'user.email=gate-selector@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'baseline']);
+  const baseline = git('rev-parse', 'HEAD');
+  writeFileSync(join(repo, 'src/graph-runner/runner.ts'), moduleFor(2));
+  runGit(['add', '.']); runGit(['-c', 'user.name=Gate selector test', '-c', 'user.email=gate-selector@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'implementation body change']);
+  const commit = git('rev-parse', 'HEAD');
+  writeFileSync(join(f.instanceRoot, 'release/1.0.0/release.json'), JSON.stringify({ sourceCommit: baseline }));
+  writeFileSync(join(f.instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: baseline, failures: [], errors: [] }));
+  const previous = process.env.ELANOUS_GATE_CONTRACT_TEST_SELECT;
+  process.env.ELANOUS_GATE_CONTRACT_TEST_SELECT = '1';
+  const calls: Array<{ logDir: string; pod?: Record<string, unknown>; only?: string[] }> = [];
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'gate.contract-select.shadow' && data && typeof data === 'object') events.push({ event, data: data as Record<string, unknown> });
+  });
+  f.runner.sweep = async (_tree, logDir, pod, only) => {
+    calls.push({ logDir: logDir ?? '', pod: pod as Record<string, unknown> | undefined, only: only as string[] | undefined });
+    const selected = only ? [...only] : ['src/graph-runner/runner.test.ts', 'src/unrelated.test.ts'];
+    return { rc: 0, output: `0 fail\nRan ${selected.length} tests across ${selected.length} files.\n`,
+      podSweep: { files: selected, invocationId: `sweep-${calls.length}` } } as never;
+  };
+  try {
+    const result = await judgeGate({ ...options(f.instanceRoot), repo, commit, baselineCommit: baseline,
+      pod: { pool: 'pool-test:1', shards: 1 }, imagePin: 'cut-commit' }, f.runner);
+    expect(result.outcome).toBe('ok');
+    const cutCalls = calls.filter((call) => call.logDir.includes('contract-select-primary-') || /\/cut(?:$|\/)/.test(call.logDir));
+    expect(cutCalls).toHaveLength(2);
+    expect(cutCalls[0]?.only).toEqual(['src/graph-runner/runner.test.ts']);
+    expect(cutCalls[0]?.pod).toMatchObject({ imagePin: 'cut-commit', freshShards: true,
+      warmShardExecutionEnabled: false, warmProducerEnabled: false });
+    expect(cutCalls[0]?.pod?.shardsFile).toBeUndefined();
+    expect(cutCalls[1]?.only).toBeUndefined();
+    expect(cutCalls[1]?.pod).toMatchObject({ imagePin: 'cut-commit', freshShards: true,
+      warmShardExecutionEnabled: false, warmProducerEnabled: false });
+    expect(events.at(-1)?.data).toMatchObject({ comparison: 'complete', candidate: 'limited',
+      fallbackAction: 'full-cut-shadow-final', primaryRun: { status: 'measured' } });
+    delete process.env.ELANOUS_GATE_CONTRACT_TEST_SELECT;
+    await judgeGate({ ...options(f.instanceRoot), repo, commit, baselineCommit: baseline,
+      pod: { pool: 'pool-test:1', shards: 1 }, imagePin: 'cut-commit' }, f.runner);
+    expect(events.at(-1)?.data).not.toHaveProperty('fallbackAction');
+    expect(events.at(-1)?.data).not.toHaveProperty('primaryRun');
+    expect(events.at(-1)?.data).toHaveProperty('activationRequested', false);
+  } finally {
+    log.mockRestore();
+    if (previous === undefined) delete process.env.ELANOUS_GATE_CONTRACT_TEST_SELECT;
+    else process.env.ELANOUS_GATE_CONTRACT_TEST_SELECT = previous;
+  }
+});
+
+test('GATE-CONTRACT-TEST-SELECT: opt-in-only shadow fields stay absent on default-off and catch paths', () => {
+  const primary = { status: 'disabled' as const, selectedFiles: [], rc: null, reason: 'opt-in flag is off' };
+  expect(contractSelectOptInLogFields(false, primary, 'full-cut-rerun-final')).toEqual({});
+  expect(contractSelectOptInLogFields(true, { ...primary, status: 'measured', rc: 0 }, 'full-cut-rerun-final'))
+    .toEqual({ activationRequested: true, primaryRun: { ...primary, status: 'measured', rc: 0 }, fallbackAction: 'full-cut-rerun-final' });
 });
 
 test('judgeGate preserves a regression receipt and passed shard evidence across an incomplete retry', async () => {

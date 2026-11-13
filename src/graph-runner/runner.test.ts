@@ -1710,6 +1710,25 @@ test('declared unit input binding wins over a conflicting caller-supplied value'
   }
 });
 
+test('declared unit context adds verified slot data without dropping caller owner or ext', async () => {
+  const fixture = unitFixture();
+  writeFileSync(join(fixture.root, 'units', 'recipes.yaml'), `produce:\n  command: >-\n    bun -e 'const c=JSON.parse(require("fs").readFileSync(process.env.ELANOUS_GRAPH_CONTEXT,"utf8")); console.log(JSON.stringify({answer:c.input.context}))'\n`);
+  writeFileSync(fixture.graph, readFileSync(fixture.graph, 'utf8')
+    .replace('contract: { inputs: [request], tools: read-only, outputs: [answer] }',
+      'input: { context: { appSlots: [slot-1], ext: { declared: true } } }\n    contract: { inputs: [context], tools: read-only, outputs: [answer] }'));
+  writeFileSync(fixture.unit, readFileSync(fixture.unit, 'utf8').replace('inputs: [request]', 'inputs: [context]'));
+  try {
+    const result = await runGraph(fixture.graph, { input: { context: { memberId: 'verified-member',
+      ext: { caller: true } } }, deps: { root: fixture.root } });
+    expect(result.status).toBe('done');
+    expect(JSON.parse(String(result.nodes.find(node => node.nodeId === 'invoke')!.output))).toMatchObject({
+      answer: { memberId: 'verified-member', appSlots: ['slot-1'], ext: { caller: true, declared: true } },
+    });
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('explicit input prior takes precedence over the previous node result', async () => {
   const { graph, root } = unitFixtureWithPriorResult();
   try {

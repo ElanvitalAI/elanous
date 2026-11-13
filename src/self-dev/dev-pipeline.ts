@@ -48,6 +48,7 @@ import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 import type { RoleLlmSource } from '../user-config/types.js';
 import { applyGlmCredentialFallback, GlmChildCredentialError } from './glm-credential-guard.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
+import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
 import { getProvider, getProviderForConfig, inferProviderFromModel } from '../llm.js';
 import { noUsableReviewProviderError, planReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
 import { loadLlmPolicy, resolveSubscriptionReviewer } from '../policy/llm-policy.js';
@@ -1121,6 +1122,8 @@ export async function buildDefaultSelfImplementSeams(
     makeToolReviewLLM?: () => UnmannedToolReviewLLM | Promise<UnmannedToolReviewLLM>;
     subscriptionReviewerDeps?: SubscriptionReviewerDeps;
     makeSubscriptionReviewLLM?: (spawn: ReturnType<typeof import('./review-provider-fallback.js').subscriptionReviewerSpawn>) => (prompt: string) => Promise<string>;
+    /** Cached Grok weekly usage verdict; unmeasured is never authorized for an automatic review fallback. */
+    reviewGrokQuota?: () => 'usable' | 'exhausted' | 'unknown';
     /** REVIEW-ACP-POD ②-b 시험 주입 — 기본은 env `ELANOUS_REVIEW_DEFERRED_TO_HOST=1`(발사 호스트가 싣는다). */
     reviewDeferredToHost?: boolean;
   } = {},
@@ -1204,7 +1207,15 @@ export async function buildDefaultSelfImplementSeams(
       }),
       (event, data) => { try { debug.log('self-dev.review-fallback', event, { ...data }); } catch { /* fail-soft */ } },
       {
-        ...(process.env.ELANOUS_SUBSTRATE === 'pod' ? { skipUnavailable: (attempt: (typeof reviewAttempts)[number]) => {
+        skipUnavailable: (attempt: (typeof reviewAttempts)[number]) => {
+          if (attempt.label !== 'primary' && inferProviderFromModel(attempt.model) === 'grok') {
+            const quota = (deps.reviewGrokQuota ?? readCachedGrokQuota)();
+            if (quota !== 'usable') return {
+              label: attempt.label, model: attempt.model, provider: 'grok',
+              why: quota === 'exhausted' ? 'quota-threshold' as const : 'quota-unmeasured' as const,
+            };
+          }
+          if (process.env.ELANOUS_SUBSTRATE !== 'pod') return undefined;
           if (!attempt.provider) return undefined;
           try {
             return attempt.provider.available() ? undefined : {
@@ -1215,7 +1226,7 @@ export async function buildDefaultSelfImplementSeams(
               label: attempt.label, model: attempt.model, provider: attempt.provider.name, why: 'availability-check-failed' as const,
             };
           }
-        } } : {}),
+        },
         preSkipped: reviewPlan.skipped,
         maxCalls: 2,
       },

@@ -9,7 +9,7 @@ describe('declaredNewFilePaths', () => {
   });
 
   test('② 목록 기호·굵게·영문·전각 콜론 꼴도 읽는다', () => {
-    expect(declaredNewFilePaths('- **신설:** x.ts\nnew files: y.ts\n신설：z.ts')).toEqual(['x.ts', 'y.ts', 'z.ts']);
+    expect(declaredNewFilePaths('- **신설:** x.ts\nnew files: y.ts\n신설：z.ts\ncreate: docs/new.md')).toEqual(['x.ts', 'y.ts', 'z.ts', 'docs/new.md']);
   });
 
   test('장식·전각·쉼표/가운데점 신설 줄을 같은 경로로 정규화하고 중복을 제거한다', () => {

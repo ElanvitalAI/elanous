@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { createFakeFetchDevice, withFakeFetchDevice } from './fake-fetch.js';
+import { createFakeFetchDevice, withFakeFetchDevice, withRealProviderFakeFetchDevice } from './fake-fetch.js';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
 
 const originalFetch = globalThis.fetch;
@@ -275,6 +275,22 @@ test('fake-fetch is registered for the shared core and PWA test adapter', () => 
   expect(device?.implementation).toEqual(['src/ux-sim/fake-fetch.ts', 'apps/pwa/src/test-devices/fake-fetch.ts']);
   expect(device?.tests).toContain('src/ux-sim/fake-fetch.test.ts');
   expect(catalog.sourceModules.find((module) => module.path === 'src/ux-sim/fake-fetch.ts')?.deviceIds).toContain('fake-fetch');
+});
+
+test('provider wire fixture selects real LLM only while fake HTTP is installed and restores after throw', async () => {
+  const prior = process.env.ELANOUS_LLM_MODE;
+  process.env.ELANOUS_LLM_MODE = 'fake';
+  try {
+    await expect(withRealProviderFakeFetchDevice([{ url: 'http://fixture.test/', response: Response.json({ ok: true }) }], async () => {
+      expect(process.env.ELANOUS_LLM_MODE).toBe('real');
+      throw new Error('fixture failure');
+    })).rejects.toThrow('fixture failure');
+    expect(process.env.ELANOUS_LLM_MODE).toBe('fake');
+    expect(globalThis.fetch).toBe(originalFetch);
+  } finally {
+    if (prior === undefined) delete process.env.ELANOUS_LLM_MODE;
+    else process.env.ELANOUS_LLM_MODE = prior;
+  }
 });
 
 });

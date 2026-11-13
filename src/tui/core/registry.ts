@@ -88,8 +88,8 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
   {
     id: 'session.resume',
     action: 'command',
-    slash: [],
-    slashPrefixes: ['/resume'],
+    slash: ['/session', '/sessions', '/session list', '/sessions list', '/session ls', '/sessions ls'],
+    slashPrefixes: ['/resume', '/session load', '/sessions load', '/session resume', '/sessions resume'],
     phrases: [],
     roles: ['human'],
     minimumMaturity: 'stable',

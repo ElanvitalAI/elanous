@@ -51,7 +51,11 @@ const EXPECTED_ESSENTIAL_MEMBERS = [
   'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
   'PersistentGrounding',
   'ToolSearch',
-  'elanous_linear_issue',
+  // 2026-11-10 #36527 (a9eae0c91bd9) deferred elanous_linear_issue to ToolSearch:
+  // native-tool-catalog.ts gained alwaysLoad:false·shouldDefer:true·warmPreload:false,
+  // and the explicit-integration lane in index.ts only admits alwaysLoad!==false entries,
+  // so it left the essential catalog by design. ToolSearch above stays essential and is
+  // the recovery path for the deferred schema (tool-router world sim asserts the round trip).
 ];
 const PARITY_GUARD = 'The essential fixed catalog changed; if intentional, update this test with the reason. This guard makes the change visible rather than forbidding it.';
 

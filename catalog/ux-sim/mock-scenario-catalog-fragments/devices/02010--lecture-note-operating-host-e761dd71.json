@@ -1,0 +1,35 @@
+{
+  "id": "lecture-note-operating-host",
+  "name": "Lecture note input through exported Next page and operating App Host",
+  "audience": "internal",
+  "defaultProfile": {
+    "credentials": "fake-only",
+    "network": "loopback-only",
+    "storage": "temporary"
+  },
+  "checklistCells": ["LECTURE-SCRAP-LIVE-INPUT-RPC"],
+  "implementation": [
+    "templates/next-app-lecture-scrap/app/notes/new/page.jsx",
+    "src/nexus/apps/app-host.ts",
+    "src/ux-sim/lecture-note-operating-host.test.ts"
+  ],
+  "tests": ["src/ux-sim/lecture-note-operating-host.test.ts"],
+  "target": "Export the real lecture note page, mount it in the operating Nexus App Host, submit its owner form in isolated Chrome, reopen the host database and reach the first note after 20 newer owner saves",
+  "inputs": [
+    "temporary lecture-scrap static export and App Host database",
+    "server-issued owner session in an isolated browser",
+    "unique title and note body entered through the form",
+    "20 later notes saved through owner App Host RPC before browser refresh"
+  ],
+  "observations": [
+    "canonical /notes/new returns HTTP 200",
+    "browser form causes one owner addLectureNote HTTP 200 and owner listLectureNotes HTTP 200",
+    "same note ID and content appear in the owner RPC result and refreshed browser screen after App Host reopen and the older-notes action",
+    "first note is absent from the latest 20 and reachable through the browser's next owner list query",
+    "anonymous listLectureNotes returns HTTP 403"
+  ],
+  "entryCommands": ["bun test src/ux-sim/lecture-note-operating-host.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

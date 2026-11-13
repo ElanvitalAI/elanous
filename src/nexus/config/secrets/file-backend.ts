@@ -40,6 +40,27 @@ function readSecretsFile(): SecretsFile {
   }
 }
 
+// Windows Bun rejects fsync on a read-only file fd but accepts an r+ fd.
+// Test hooks exercise the actual backend write path with Windows fd behavior.
+interface SecretFileSyncHooks {
+  platform?: NodeJS.Platform;
+  openFile?: (path: string, flags: 'r+') => number;
+  sync?: (fd: number) => void;
+}
+let secretFileSyncHooks: SecretFileSyncHooks = {};
+export function setSecretFileSyncHooksForTest(hooks: SecretFileSyncHooks | null): void {
+  secretFileSyncHooks = hooks ?? {};
+}
+function openSecretFileForSync(path: string): number {
+  return (secretFileSyncHooks.openFile ?? openSync)(path, 'r+');
+}
+function syncSecretFile(fd: number): void {
+  (secretFileSyncHooks.sync ?? fsyncSync)(fd);
+}
+function syncSecretDirectory(fd: number): void {
+  if ((secretFileSyncHooks.platform ?? process.platform) !== 'win32') (secretFileSyncHooks.sync ?? fsyncSync)(fd);
+}
+
 export interface AppSecretMutationTestHooks {
   beforeSecretsDirectorySync?: () => void;
   beforeLedgerDirectorySync?: () => void;
@@ -62,8 +83,8 @@ function writeSecretsFile(s: SecretsFile, beforeDirectorySync?: () => void): voi
   try {
     writeFileSync(tmp, JSON.stringify(s, null, 2), { mode: 0o600, flag: 'wx' });
     chmodSync(tmp, 0o600);
-    const tmpFd = openSync(tmp, 'r');
-    try { fsyncSync(tmpFd); }
+    const tmpFd = openSecretFileForSync(tmp);
+    try { syncSecretFile(tmpFd); }
     finally { closeSync(tmpFd); }
     if (existsSync(path)) {
       let backupContents: string | undefined;
@@ -80,15 +101,15 @@ function writeSecretsFile(s: SecretsFile, beforeDirectorySync?: () => void): voi
       if (backupContents === undefined) copyFileSync(path, backupTmp);
       else writeFileSync(backupTmp, backupContents, { mode: 0o600, flag: 'wx' });
       chmodSync(backupTmp, 0o600);
-      const backupFd = openSync(backupTmp, 'r');
-      try { fsyncSync(backupFd); }
+      const backupFd = openSecretFileForSync(backupTmp);
+      try { syncSecretFile(backupFd); }
       finally { closeSync(backupFd); }
       renameSync(backupTmp, `${path}.bak`);
     }
     renameSync(tmp, path);
     beforeDirectorySync?.();
     const dirFd = openSync(dirname(path), 'r');
-    try { fsyncSync(dirFd); }
+    try { syncSecretDirectory(dirFd); }
     finally { closeSync(dirFd); }
   } finally {
     if (existsSync(tmp)) unlinkSync(tmp);
@@ -99,12 +120,12 @@ function writeSecretsFile(s: SecretsFile, beforeDirectorySync?: () => void): voi
 function syncSecretsFileDurability(): void {
   const path = secretsPath();
   if (existsSync(path)) {
-    const fileFd = openSync(path, 'r');
-    try { fsyncSync(fileFd); }
+    const fileFd = openSecretFileForSync(path);
+    try { syncSecretFile(fileFd); }
     finally { closeSync(fileFd); }
   }
   const dirFd = openSync(dirname(path), 'r');
-  try { fsyncSync(dirFd); }
+  try { syncSecretDirectory(dirFd); }
   finally { closeSync(dirFd); }
 }
 

@@ -11,6 +11,7 @@
 // ⛔ 종료(`process.exit`)는 여기가 «안» 한다 — 호출자가 자기 표면에 맞게 끝낸다.
 //   그래서 결과를 «세 값»으로 낸다: 발사 / 저작 전 중단 / 전제 검사 중단.
 import { linesOutsideFencedCode, readGoalAuthorGroundingTimebox, type GoalAuthorGroundingTimebox } from '../self-implement/goal-author.js';
+import { declaredNewFilePaths } from '../self-implement/goal-new-paths.js';
 import { existsSync } from 'node:fs';
 import { debug } from '../debug/log.js';
 import { appendRunLedgerEntry, runLedgerDir } from '../self-implement/run-ledger.js';
@@ -1046,6 +1047,12 @@ export async function runAskLaunchFlow(
         sanitizeFailure = error;
       }
     }
+    // Read explicit declarations from the final authored goal after clarification and sanitization.
+    let declaredNewTargets: string[] = [];
+    if (!sanitizeFailed && existsSync(goalFile)) {
+      const authoredDocument = deps.readFile(goalFile);
+      declaredNewTargets = declaredNewFilePaths(authoredDocument);
+    }
     const preflightDeps = await deps.buildPreflightDeps();
     observeLaunchingTree(deps, preflightDeps);
     const askOutsidePathHints = parseAskTargetPathHintsResult(input.askText).paths;
@@ -1064,6 +1071,11 @@ export async function runAskLaunchFlow(
       input.forceRequested,
     );
     const preflight = decision.result;
+    if (decision.shouldLaunch) {
+      for (const path of declaredNewTargets.filter((target) => preflight.paths.includes(target))) {
+        deps.print(`새 파일을 만듭니다: ${path}`);
+      }
+    }
     deps.print(renderLaunchPreflight(preflight, input.forceRequested && decision.shouldLaunch && preflight.blockers.length > 0, 'before-launch'));
     observeLaunchPreflight(deps, 'before-launch', decision);
     let siblingCards = input.cardsTouchingPaths;

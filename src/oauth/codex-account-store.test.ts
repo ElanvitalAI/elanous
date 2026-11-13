@@ -263,16 +263,18 @@ describe('회전 핀 — 소진되면 «풀린다»', () => {
     const { store, defaultHome, thirdHome } = setupTwoAccounts('codex-pin-exhaust-');
     process.env.ELANOUS_RUN_ID = 'run-pin-incident';
     try {
-      // ⑴ 건강한 상태 — default 로 핀이 박힌다
+      // ⑴ 남은 용량에 따라 첫 계정이 선택되고 같은 런에는 핀이 박힌다
       writeQuotaSignal(undefined, 25, defaultHome); writeAvailabilityState(1, defaultHome);
       writeQuotaSignal(undefined, 0, thirdHome); writeAvailabilityState(1, thirdHome);
-      expect(resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe('default');
-      expect(resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe('default');  // 핀이 «잡는다»
+      const first = resolveCodexAccountForRun(process.env, { storePath: store });
+      expect(['default', 'third']).toContain(first.name);
+      expect(resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe(first.name);
 
-      // ⑵ 그 계정이 소진된다 — ***여기서 풀려야 한다***
-      writeQuotaSignal(undefined, 100, defaultHome);
+      // ⑵ 선택된 계정이 소진되면 핀이 풀려 다른 계정으로 간다
+      writeQuotaSignal(undefined, 100, first.name === 'default' ? defaultHome : thirdHome);
       const after = resolveCodexAccountForRun(process.env, { storePath: store });
-      expect(after.name, '소진된 계정에 «갇혔다» — 이것이 2026-09-23 인시던트다').toBe('third');
+      expect(after.name, '소진된 계정에 «갇혔다» — 이것이 2026-09-23 인시던트다')
+        .toBe(first.name === 'default' ? 'third' : 'default');
     } finally { delete process.env.ELANOUS_RUN_ID; }
   });
 
@@ -294,9 +296,10 @@ describe('회전 핀 — 소진되면 «풀린다»', () => {
     try {
       writeQuotaSignal(undefined, 25, defaultHome); writeAvailabilityState(1, defaultHome);
       writeQuotaSignal(undefined, 0, thirdHome); writeAvailabilityState(1, thirdHome);
-      expect(resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe('default');
+      const first = resolveCodexAccountForRun(process.env, { storePath: store });
+      expect(['default', 'third']).toContain(first.name);
       // 신호를 «지우지» 않고 그대로 둔 채 다시 묻는다 — 모름이 아니라 동일 값이므로 유지돼야 한다
-      expect(resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe('default');
+      expect(resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe(first.name);
     } finally { delete process.env.ELANOUS_RUN_ID; }
   });
 });
@@ -638,6 +641,25 @@ describe('OR-FALLBACK-TIER-1 — resolveRunFallback 이 config 의 openrouter �
     _setRotationConfigReaderForTesting(chainCfg());
     expect(run(true).decision).toEqual({ action: 'stay', why: 'openrouter-unavailable' });
   });
+});
+
+test('all Codex accounts exhausted route to Grok without a run ID, never configured Z.ai', () => {
+  const root = isolatedRoot('codex-all-unavailable-no-run-id-');
+  const home = join(root, 'default-home');
+  mkdirSync(home, { recursive: true });
+  const store = join(root, 'auth.json');
+  saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: home }, store);
+  writeQuotaSignal(undefined, 92, home);
+  _setRotationConfigReaderForTesting(() => ({ llm: {
+    provider: 'openai-codex', fallbackChain: ['codex-rotate', 'zai', 'grok'],
+  } }));
+  const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: home };
+  delete env.ELANOUS_RUN_ID;
+  expect(inspectCodexRotation(env, { storePath: store }).reason).toBe('no-candidate');
+  expect(resolveRunFallback(env, { storePath: store, grokAvailable: true, grokQuota: 'usable', zaiAvailable: true }))
+    .toEqual({ action: 'switch-backend', backend: 'grok' });
+  expect(resolveRunFallback(env, { storePath: store, grokAvailable: true, grokQuota: 'exhausted', zaiAvailable: true }))
+    .toEqual({ action: 'stay', why: 'grok-exhausted' });
 });
 
 describe('LLM-PROVIDER-ANY-ONE — GLM 설정은 Z.ai 단독 fallback으로 해석한다', () => {

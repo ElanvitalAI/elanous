@@ -195,6 +195,12 @@ export function toolFoldSummary(toolName: string, totalLines: number, columns?: 
  */
 interface ToolDisplay { envelope: boolean; status: string; body: string }
 
+function toolOutputParts(body: string): string[] {
+  const parts = body.split('\n');
+  if (parts.length > 1 && parts.at(-1) === '') parts.pop();
+  return parts;
+}
+
 function formatToolBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
@@ -227,10 +233,10 @@ function toolLinesUnfolded(message: SerializedMessage, columns: number): string[
   const lines: string[] = [];
   if (display.envelope) {
     lines.push(...wrapLine(`도구: ${label}${display.status ? ` · ${display.status}` : ''}`, columns));
-    for (const part of display.body.split('\n')) lines.push(...wrapLine(`  ${part}`, columns));
+    for (const part of toolOutputParts(display.body)) lines.push(...wrapLine(`  ${part}`, columns));
     return lines;
   }
-  const parts = `${label} ${display.body}`.split('\n');
+  const parts = toolOutputParts(`${label} ${display.body}`);
   for (let i = 0; i < parts.length; i++) {
     const prefix = i === 0 ? '도구: ' : '  ';
     lines.push(...wrapLine(prefix + parts[i], columns));
@@ -240,7 +246,7 @@ function toolLinesUnfolded(message: SerializedMessage, columns: number): string[
 
 /** Wrapped line count of a finished tool's output alone (label and tool name excluded) — the fold measure. */
 function toolOutputLineCount(message: SerializedMessage, columns: number): number {
-  return toolDisplay(message).body.split('\n').reduce((sum, part) => sum + wrapLine(`  ${part}`, columns).length, 0);
+  return toolOutputParts(toolDisplay(message).body).reduce((sum, part) => sum + wrapLine(`  ${part}`, columns).length, 0);
 }
 
 /**

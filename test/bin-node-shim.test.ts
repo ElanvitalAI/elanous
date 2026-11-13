@@ -23,6 +23,10 @@ function findNode(): string | null {
 }
 const node = findNode();
 
+function runNodeShim(args: string[], options: { env: Record<string, string>; encoding: 'utf8'; timeout?: number }) {
+  return spawnSync(node!, [SHIM, ...args], options);
+}
+
 /** Bun 이 «없는» 환경: PATH 에 node 폴더만 · HOME·BUN_INSTALL 을 빈 임시 폴더로 · ELANOUS_BUN 없음. */
 function noBunEnv(): Record<string, string> {
   const home = mkdtempSync(join(tmpdir(), 'r6-nobun-'));
@@ -37,7 +41,7 @@ describe.skipIf(!node)('bin/elanous.cjs (npm entry)', () => {
   test('Bun 이 없어도 --version 은 package.json 판을 낸다', () => {
     const env = noBunEnv();
     expect(spawnSync('bun', ['--version'], { env, encoding: 'utf8' }).error).toBeTruthy(); // 전제: 이 PATH 에 bun 이 없다
-    const r = spawnSync(node!, [SHIM, '--version'], { env, encoding: 'utf8' });
+    const r = runNodeShim(['--version'], { env, encoding: 'utf8' });
     expect(r.status, r.stderr).toBe(0);
     expect(r.stdout.startsWith(`${pkg.version} `)).toBe(true);
   });
@@ -57,6 +61,19 @@ describe.skipIf(!node)('bin/elanous.cjs (npm entry)', () => {
     const bad = spawnSync(node!, [SHIM, 'no-such-command-r6'], { env, encoding: 'utf8' });
     expect(bad.status).not.toBe(0);
   }, 60_000);
+
+  test('first-run bootstrap keeps JSON command stdout clean', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'r6-json-bootstrap-'));
+    const fakeBun = join(dir, 'bun');
+    writeFileSync(fakeBun, `#!${node}\nif (process.argv[2] === '--version') { console.log('1.4.2'); process.exit(0); }\nif (process.argv[3] === 'bootstrap') { console.log('Bootstrap ready'); process.exit(0); }\nconsole.log(JSON.stringify([{ market: 'elanous', plugin: { name: 'sample' } }]));\n`);
+    chmodSync(fakeBun, 0o755);
+    const r = runNodeShim(['plugin', 'market', 'list', '--all', '--json'], {
+      env: { ...noBunEnv(), ELANOUS_BUN: fakeBun }, encoding: 'utf8', timeout: 60_000, // 출처: #37152 — reuse this file’s existing 60 s subprocess budget.
+    });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual([{ market: 'elanous', plugin: { name: 'sample' } }]);
+    expect(r.stderr).toContain('Bootstrap ready');
+  });
 
   test('부모에 온 SIGTERM 은 자식(Bun)에게 넘어가 둘 다 끝난다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'r6-sig-'));

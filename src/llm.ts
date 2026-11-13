@@ -4871,10 +4871,21 @@ export async function streamLLM(
   } = {},
 ): Promise<string> {
   const started = Date.now();
-  const fakeDefault = testFakeLlmDefaultSelected();
-  let activeProvider = opts.preferExplicitProvider && opts.provider
-    ? opts.provider
-    : fakeDefault ? testFakeLlmProvider : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
+  // NODE_ENV=test chooses a fake default, but an injected fixture provider
+  // owns this turn. Explicit fake and sim-world switches still forbid using it.
+  // Same contract as streamLLMWithTools (#36949) — preferExplicitProvider stays
+  // the session-turn pin and is not required for a direct fixture injection.
+  const forcedFake = process.env.ELANOUS_LLM_MODE === 'fake'
+    || process.env.ELANOUS_TEST_FAKE_LLM === '1'
+    || Boolean(process.env.ELANOUS_UX_SIM_RUN_ID?.trim())
+    || process.env.ELANOUS_SIM_UNIVERSE === '1';
+  const fakeDefault = testFakeLlmDefaultSelected()
+    && (!(opts.provider ?? opts.initialProvider) || forcedFake);
+  // Explicit fake/sim selection fences every injection path, including the
+  // session-turn pin. A plain test default still yields to an injected provider.
+  let activeProvider = fakeDefault
+    ? testFakeLlmProvider
+    : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
   const attemptedProviders = new Set<string>([activeProvider.name, ...(opts.skipProviders ?? [])]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   let modelOverride = opts.model;
@@ -8522,6 +8533,8 @@ export async function streamLLMWithTools(
     }, { level: 'info' });
     const fallbackText = await streamLLM(messages, handlers.onText, {
       ...opts,
+      provider: activeProvider,
+      preferExplicitProvider: true,
       onUsage: usage => { opts.onUsage?.(usage); handlers.onUsage?.(usage); },
     });
     // Even the no-tools path emits onTurnComplete so callers can treat
@@ -11899,6 +11912,7 @@ export async function streamLLMWithTools(
 
 import type { LLMConfig as UCLLMConfig, UserConfig } from './user-config/types.js';
 import { authStorePath, loadTokens, readCodexMirrorTokens } from './oauth/store.js';
+import { codexHealthCredential, recordCodexUnauthorized } from './oauth/codex-account-health.js';
 import { resolveCodexAccount, effectiveCodexHome } from './oauth/codex-account.js';
 import { codexCreditSpendReason } from './oauth/codex-billing-route.js';
 import { join } from 'node:path';
@@ -12288,7 +12302,10 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
       // own copy can be stale), refreshes when expiring, and survives the
       // concurrent-refresh race (401 → re-read → retry). See
       // loadFreshCodexAuthState.
-      const state = await loadFreshCodexAuthState();
+      let requestedAccount: { storeKey: string; storePath: string } | undefined;
+      const state = await loadFreshCodexAuthState({
+        onSelectedAccount: (storeKey, storePath) => { requestedAccount = { storeKey, storePath }; },
+      });
 
       // Precedence:
       //   OAuth tokens present → Codex Responses API at chatgpt.com/
@@ -12510,18 +12527,27 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
             throw new RequestSizeLimitError(requestChars, requestGuard.maxChars, requestCompactReason);
           }
         }
-        yield* streamCodexResponsesEvents(responsesUrl, tokens.accessToken, requestBody, opts.signal, {
-          accountId,
-          promptCache,
-          ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
-          ...(serializedWireBody ? { serializedWireBody } : {}),
-          // Capture the new response id from the SSE stream so the
-          // next call can thread it. If the backend skips the event
-          // lastResponseId stays undefined and we fall back to full
-          // input on the next turn (safe — just no token savings).
-          onResponseCreated: useStore ? (id) => { lastResponseId = id; } : undefined,
-          remainingFallbacks: opts.remainingFallbacks,
-        });
+        try {
+          yield* streamCodexResponsesEvents(responsesUrl, tokens.accessToken, requestBody, opts.signal, {
+            accountId,
+            promptCache,
+            ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+            ...(serializedWireBody ? { serializedWireBody } : {}),
+            // Capture the new response id from the SSE stream so the
+            // next call can thread it. If the backend skips the event
+            // lastResponseId stays undefined and we fall back to full
+            // input on the next turn (safe — just no token savings).
+            onResponseCreated: useStore ? (id) => { lastResponseId = id; } : undefined,
+            remainingFallbacks: opts.remainingFallbacks,
+          });
+        } catch (error) {
+          if (requestedAccount && responsesUrl.startsWith(CODEX_API_BASE_URL) && error instanceof ApiHttpError
+            && (error.status === 401 || error.status === 403)) {
+            try { recordCodexUnauthorized(requestedAccount.storePath, requestedAccount.storeKey, codexHealthCredential(tokens)); }
+            catch { /* preserve the original API error */ }
+          }
+          throw error;
+        }
         // Snapshot full input AFTER the stream completes so the next
         // call's delta computation uses what the backend actually has
         // stored. If the stream errors out partway, lastInput stays
@@ -12774,8 +12800,10 @@ export function getProviderForConfig(
   userConfig: UserConfig,
   model?: string,
 ): LLMProvider {
-  if (testFakeLlmDefaultSelected()) return testFakeLlmProvider;
   const { provider } = userConfig.llm;
+  // A named config provider is the caller's contract. The test default fake
+  // covers only an unset provider (and the 'auto' no-candidate path below).
+  if (!provider && testFakeLlmDefaultSelected()) return testFakeLlmProvider;
   if (provider === 'hq-proxy') return makeHqProxyProvider(userConfig.llm);
   // CLAUDE-IMPL-LANE(10-11) — `claude-acp` 는 LLM provider 가 아니라 구독 ACP 구현 실행기 선택이다.
   //   여기서 풀리면 모델 이름(claude-…)이 anthropic(API 키 provider)으로 넘어가 «구독» 런이 API 로 과금된다 → 거부.

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { dlopen, FFIType } from 'bun:ffi';
@@ -28,6 +28,12 @@ export const DEFAULT_PLUGIN_GROUP = [
   { id: 'demo-browser-hand', label: '브라우저 손', requiredServiceKeys: [], optionalServiceKeys: ['linear'], requiredPrerequisites: ['llm-provider', 'aside'], optionalPrerequisites: [] },
   { id: 'demo-video-briefing', label: '영상 브리핑', requiredServiceKeys: [], optionalServiceKeys: ['elevenlabs', 'telegram', 'telegram-chat'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
   { id: 'demo-plugin-wizard', label: '플러그인 마법사', requiredServiceKeys: [], optionalServiceKeys: [], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: ['claude-cli', 'github-cli'] },
+] as const;
+
+/** Packages used by the 11-14 six-scene walkthrough, in dependency order. */
+export const DEMO1114_PLUGIN_IDS = [
+  'architecture-deliverables', 'elanous-app-deploy', 'absorb',
+  'demo-absorption-briefing', 'demo-brief-to-requirements', 'gcp-architect-expand',
 ] as const;
 
 export type DefaultPluginStatus = {
@@ -95,6 +101,49 @@ export async function installDefaultPluginGroup(opts: InstallOptions = {}): Prom
   return installed;
 }
 
+/** First-run install from packaged assets; retain per-package failures for a visible retry. */
+export async function installDemo1114PluginGroup(opts: InstallOptions = {}): Promise<{
+  installed: InstalledPlugin[]; failed: string[];
+}> {
+  const root = resolve(opts.root ?? elanousStateRoot());
+  const installed: InstalledPlugin[] = [];
+  const failed: string[] = [];
+  for (const id of DEMO1114_PLUGIN_IDS) {
+    try {
+      const source = join(DEFAULT_PLUGIN_ROOT, id);
+      const manifest = loadPluginManifestFromDir(source, { id }).manifest;
+      const existing = listInstalledPlugins(root).find(item =>
+        item.market === 'local' && item.name === manifest.id && item.version === manifest.version);
+      if (existing && id === 'elanous-app-deploy' && manifest.main) {
+        const sourceMain = inside(source, manifest.main);
+        const installedMain = inside(existing.path, manifest.main);
+        assertInstallParents(root, installedMain);
+        if (!existsSync(installedMain)) {
+          // Restore only the missing bundled entry; keep the version and user config.
+          copyFileSync(sourceMain, installedMain, constants.COPYFILE_EXCL);
+        }
+        const entry = lstatSync(installedMain);
+        if (!entry.isFile() || entry.isSymbolicLink() || !readFileSync(installedMain).equals(readFileSync(sourceMain)))
+          fail('scan', `bundled plugin entry differs: ${id}`);
+      }
+      if (existing) {
+        const expectedRoot = mkdtempSync(join(tmpdir(), 'elanous-demo-pack-'));
+        try {
+          const expected = join(expectedRoot, 'package');
+          copyPlugin(source, expected);
+          if (!samePackTree(existing.path, expected)) fail('scan', `bundled plugin package differs: ${id}`);
+        } finally { rmSync(expectedRoot, { recursive: true, force: true }); }
+      }
+      // These six bundled first-party packages are part of the selected first-run product.
+      // Their declared capabilities remain subject to the static security scan.
+      installed.push(existing ?? await installPlugin(source, {
+        ...opts, root, yes: opts.yes ?? true, deferRuntimePreparation: true,
+      }));
+    } catch { failed.push(id); }
+  }
+  return { installed, failed };
+}
+
 export type InstallEvent =
   | { event: 'resolve'; plugin: string; version: string; sha256: string | null }
   | { event: 'verify'; signature: 'ok' | 'missing' | 'bad'; scan: 'safe' | 'caution' | 'dangerous' }
@@ -117,6 +166,8 @@ export interface InstalledPlugin {
 
 export interface InstallOptions {
   root?: string;
+  /** Stage bundled packages during first run; runtime requirements remain declared for use. */
+  deferRuntimePreparation?: boolean;
   marketDir?: string;
   cwd?: string;
   allowUnsigned?: boolean;
@@ -564,6 +615,10 @@ export function parseDeclaredPluginRef(value: NonNullable<NonNullable<PluginMani
 }
 
 function prepareDeclaredRuntime(manifest: PluginManifest, destination: string, opts: InstallOptions, bundledSource: boolean): void {
+  if (opts.deferRuntimePreparation) {
+    if (!bundledSource) fail('io', `runtime preparation can only be deferred for bundled plugins: ${manifest.id}`);
+    return;
+  }
   for (const runtime of manifest.dependencies?.runtime ?? []) {
     const distributionProject = runtime.project.startsWith('@distribution/');
     if (distributionProject && !bundledSource) fail('io', `runtime project unavailable: ${manifest.id}`);

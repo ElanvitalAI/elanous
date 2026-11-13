@@ -92,6 +92,26 @@ function startMock(handler: (body: Record<string, unknown>, req: Request) => Res
 }
 
 describe('runMcpCall', () => {
+  test('local daemon calls use only the current universe token and do not send it to an explicit URL', async () => {
+    const { requests, url } = startMock(() => jsonRpc({ structuredContent: { ok: true } }));
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-local-token-'));
+    dirs.push(dir);
+    writeFileSync(join(dir, 'acp-token'), 'isolated-token', { mode: 0o600 });
+    const previous = getElanousConfigDirOverride();
+    setElanousConfigDir(dir);
+    try {
+      const discovered = await runMcpCall({ tool: 'demo.tool', resolveEndpoint: () => ({ baseUrl: new URL(url).origin }), out: sink().out });
+      const explicit = await runMcpCall({ tool: 'demo.tool', localUrl: url, out: sink().out });
+      expect(discovered.exitCode).toBe(0);
+      expect(explicit.exitCode).toBe(0);
+      expect(requests.map((request) => request.auth)).toEqual(['Bearer isolated-token', null]);
+      expect(discovered.message).not.toContain('isolated-token');
+    } finally {
+      if (previous === undefined) resetElanousConfigDir();
+      else setElanousConfigDir(previous);
+    }
+  });
+
   test('posts tools/call with --arg k=v and prints structured content', async () => {
     const { requests, url } = startMock((body) => {
       expect(body.method).toBe('tools/call');

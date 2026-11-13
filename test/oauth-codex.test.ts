@@ -3,9 +3,11 @@
 // fetch is fully stubbed. No sleeps — sleepImpl is a no-op in tests so
 // the poll loop turns instantly.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import * as os from 'node:os';
+import { getElanousConfigDirOverride, setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 import { join } from 'node:path';
 import {
   loginWithCodex, requestDeviceCode, pollDeviceCode, exchangeDeviceAuthCode,
@@ -39,9 +41,21 @@ function makeFetch(responder: (call: Call) => { status: number; json: any }): { 
 }
 
 let root: string;
+let homeSpy: ReturnType<typeof spyOn>;
+let priorConfigDir: string | undefined;
+let priorEnv: Record<string, string | undefined>;
+const fixtureEnvKeys = ['XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_CODEX_ACCOUNT', 'ELANOUS_CODEX_ACCOUNT_HOME'] as const;
 let restoreCodexWorld: (() => void) | undefined;
 beforeEach(() => {
+  priorConfigDir = getElanousConfigDirOverride();
+  priorEnv = Object.fromEntries(fixtureEnvKeys.map((key) => [key, process.env[key]]));
   root = mkdtempSync(join(tmpdir(), 'oauth-codex-'));
+  // The no-token case must not read the loader's default-home credential fallback.
+  homeSpy = spyOn(os, 'homedir').mockReturnValue(root);
+  // OAuth uses the config resolver; XDG alone leaves all cases in the preload's shared store.
+  setElanousConfigDir(join(root, 'elanous'));
+  delete process.env.ELANOUS_CODEX_ACCOUNT;
+  delete process.env.ELANOUS_CODEX_ACCOUNT_HOME;
   process.env.XDG_CONFIG_HOME = root;
   process.env.CODEX_HOME = join(root, 'codex-home');
   restoreCodexWorld = installCodexOwnerTestWorld(root);
@@ -49,11 +63,15 @@ beforeEach(() => {
 afterEach(() => {
   restoreCodexWorld?.();
   restoreCodexWorld = undefined;
+  homeSpy.mockRestore();
   rmSync(root, { recursive: true, force: true });
-  delete process.env.XDG_CONFIG_HOME;
-  delete process.env.CODEX_HOME;
-  delete process.env.ELANOUS_CODEX_ACCOUNT;
-  delete process.env.ELANOUS_CODEX_ACCOUNT_HOME;
+  if (priorConfigDir === undefined) resetElanousConfigDir();
+  else setElanousConfigDir(priorConfigDir);
+  for (const key of fixtureEnvKeys) {
+    const value = priorEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 // ⛔⭐⭐⭐ 6R should-fix — 계정별 배선(storeKey · 미러 경로 · refresh 저장 방향)을 «실제 진입점»으로

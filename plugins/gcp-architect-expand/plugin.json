@@ -13,7 +13,7 @@
         "parameters": {
           "type": "object",
           "properties": {
-          "ticketDesignPath": { "type": "string", "description": "#36522 시스템 설계의 구조화된 JSON 파일 경로(ticketDesign 또는 design 노드 결과). 가짜 세계 테스트에서는 평탄한 fixture 경로도 허용합니다." }
+          "ticketDesignPath": { "type": "string", "description": "시스템 설계의 구조화된 JSON 파일 경로(ticketDesign 또는 design 노드 결과). 가짜 세계 테스트에서는 평탄한 fixture 경로도 허용합니다." }
           },
           "required": ["ticketDesignPath"],
           "additionalProperties": false

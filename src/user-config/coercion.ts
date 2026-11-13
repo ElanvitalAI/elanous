@@ -34,3 +34,10 @@ export function numArray(v: unknown, fallback: number[]): number[] {
   if (!Array.isArray(v)) return fallback;
   return v.filter((x): x is number => typeof x === 'number' && Number.isFinite(x));
 }
+
+export function spreadIfDefined<K extends string, V>(
+  key: K,
+  value: V | undefined,
+): Record<K, V> | Record<string, never> {
+  return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
+}

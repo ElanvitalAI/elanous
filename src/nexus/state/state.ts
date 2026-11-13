@@ -99,6 +99,7 @@ export interface NexusEvent {
     // Member-scoped mini-board invalidation. The SSE bridge filters this
     // event by the verified owner memberId before emitting it.
     | 'board.card'
+    | 'scrap.summary.result'
     // Hand mission addressed line. Durable rows live in agent-missions; this event
     // is only the existing /v1/events SSE notification edge.
     | 'mission.line'

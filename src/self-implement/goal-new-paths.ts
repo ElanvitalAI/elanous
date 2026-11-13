@@ -7,7 +7,7 @@
 
 // SCOPE-NEW-FILES-LINE — 칸 문면은 새로 만들 파일을 «신설:» 줄로 따로 적는다(OP D칸 규칙).
 //    저작과 실행이 이 함수를 공유한다(한쪽만 읽으면 저작과 실행이 갈린다).
-export const DECLARED_NEW_FILES_LINE = /^\s*(?:신설|new\s*files?)\s*[:：]\s*(.*)$/i;
+export const DECLARED_NEW_FILES_LINE = /^\s*(?:신설|create|new\s*files?)\s*[:：]\s*(.*)$/i;
 
 /** 목록 기호 «- »·굵게 «**» 는 장식이다 — 그것만 벗기고 같은 정규식으로 문는다. */
 function bareDeclarationLine(line: string): string {

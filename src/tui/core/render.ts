@@ -265,6 +265,152 @@ export function isNextTuiContextCountStatus(value: string): boolean {
   return /^ctx\s+[\d,]+\s+chars(?:\s*\/\s*[\d,]+)?$/i.test(value.trim());
 }
 
+/** Render all logical history without a fixed viewport; the painter owns visible rows. */
+export function renderNextTuiCompactFrame(input: NextTuiLogFrameInput, prepared = prepareHistory(input)): NextTuiLogFrame {
+  const promptLines = (input.promptLines?.length ? input.promptLines : [input.promptLine]).slice(-Math.max(1, input.rows));
+  const body = [
+    ...prepared.lines,
+    ...input.notices.map((line) => fitLogLine(line, input.columns)),
+    ...input.activity.map((line) => fitLogLine(line, input.columns)),
+  ];
+  const bodyRows = Math.max(1, input.rows - input.header.length - input.footer.length - promptLines.length);
+  const maxScroll = Math.max(0, body.length - bodyRows);
+  const scroll = Math.max(0, Math.min(input.scroll, maxScroll));
+  const start = Math.max(0, body.length - bodyRows - scroll);
+  // The tail stays full-length so the primary-screen painter can commit only
+  // new history. A scrolled view is a temporary viewport, never new history.
+  const visibleBody = scroll > 0 ? body.slice(start, start + bodyRows) : body;
+  const lines = [...input.header, ...visibleBody, ...input.footer, ...promptLines];
+  return { lines, body, promptRow: lines.length - promptLines.length + 1, scroll, maxScroll,
+    logWindow: { start, rows: Math.min(bodyRows, body.length), columns: input.columns,
+      bodyTop: input.header.length + 1, leadingBlankRows: 0, foldTargets: prepared.foldTargets } };
+}
+
+/** Only rows newly pushed out of the viewport enter terminal scrollback. */
+type CompactViewportDecoration = (visible: readonly string[]) => readonly string[];
+
+export function createNextTuiCompactPainter(write: (text: string) => void): {
+  paint(lines: readonly string[], cursorCol: number, rows: number, columns: number, stableCount?: number, cursorRow?: number, stableStart?: number, decorate?: CompactViewportDecoration,
+    boundary?: { kind: 'layout' | 'resize'; chatColumns: number; retainedStableCount: number }, retainedStableCount?: number): void;
+  paintViewport(lines: readonly string[], cursorCol: number, rows: number, columns: number, cursorRow?: number, decorate?: CompactViewportDecoration): void;
+  beforeExternalPaint(rows: number): void;
+  invalidateViewport(resizeSegment?: boolean): void;
+} {
+  let committed = 0;
+  let previousStable: readonly string[] = [];
+  let previousRows: number | null = null;
+  let previousColumns: number | null = null;
+  let resizeSegmentPending = false;
+  let initialViewportPreserved = false;
+  const preserveInitialViewport = (rows: number) => {
+    if (initialViewportPreserved) return;
+    initialViewportPreserved = true;
+    // The shell's last output can still be in the physical viewport. Move it
+    // into terminal scrollback before any clear-screen paint replaces it.
+    write(`\x1b[?25l\x1b[${rows};1H${'\r\n'.repeat(rows)}`);
+  };
+  return {
+    beforeExternalPaint(rows) {
+      // The sidebar and too-small-terminal views paint through the entry
+      // screen cache. They share this primary-screen boundary with chat.
+      preserveInitialViewport(rows);
+      previousRows = null;
+    },
+    paintViewport(lines, cursorCol, rows, columns, cursorRow = lines.length, decorate) {
+      preserveInitialViewport(rows);
+      const visible = lines.slice(-rows);
+      const visibleCursorRow = Math.max(1, Math.min(rows, cursorRow - Math.max(0, lines.length - rows)));
+      write(`\x1b[?25l\x1b[H\x1b[2J${(decorate?.(visible) ?? visible).join('\r\n')}\x1b[${visibleCursorRow};${Math.max(1, cursorCol)}H\x1b[?25h`);
+    },
+    invalidateViewport(resizeSegment = false) {
+      // Another view can replace the physical chat rows. Keep only history that
+      // was already written to scrollback; the next paint must restore the rest.
+      if (resizeSegment && previousColumns !== null) resizeSegmentPending = true;
+      previousRows = null;
+    },
+    paint(lines, cursorCol, rows, columns, stableCount = Math.max(0, lines.length - 1), cursorRow = lines.length, stableStart = 0, decorate, boundary, retainedStableCount) {
+      preserveInitialViewport(rows);
+      // Chrome before stableStart can change on every paint. Only committed
+      // chat history participates in the append-only scrollback ledger.
+      const historyStart = Math.max(0, Math.min(lines.length, stableStart));
+      const stable = lines.slice(historyStart, Math.max(historyStart, Math.min(lines.length, stableCount)));
+      const changedCommitted = previousStable.slice(0, committed).some((line, index) => stable[index] !== line);
+      const reservedRows = Math.min(rows, lines.length - stable.length);
+      const resized = previousColumns !== null && (resizeSegmentPending || columns !== previousColumns || previousRows !== null && rows !== previousRows);
+      const segment = previousColumns !== null ? boundary?.kind ?? (resized ? 'resize' : null) : null;
+      if (segment) {
+        // Primary-screen scrollback is append-only. A resize may reflow old
+        // rows, so begin a new transcript segment rather than guessing which
+        // old rows to replay. The terminal's shell and older TUI segments stay.
+        const marker = (segment === 'layout'
+          ? `── layout chat ${boundary!.chatColumns}x${rows} ──`
+          : `── resize ${columns}x${rows} ──`).slice(0, Math.max(1, columns));
+        // Repaint only the uncommitted stable tail before moving it into
+        // scrollback. The physical viewport can contain streaming previews,
+        // unsent input and sidetab chrome that must remain temporary.
+        if (boundary) {
+          const stableTail = previousStable.slice(committed);
+          write(`\x1b[?25l\x1b[H\x1b[2J${stableTail.join('\r\n')}\x1b[${rows};1H${'\r\n'.repeat(rows)}${marker}${'\r\n'.repeat(rows)}`);
+        } else {
+          // Direct painter callers have no source cursor from the entry. Keep
+          // their existing terminal-resize behavior until ownership is known.
+          write(`\x1b[?25l\x1b[${rows};1H${'\r\n'.repeat(rows)}${marker}${'\r\n'.repeat(rows)}`);
+        }
+        // A pure append can be identified even when the terminal has wrapped
+        // each old line at a new width. Keep rows appended in this same paint
+        // in the new segment. An edited history becomes the boundary snapshot.
+        if (boundary) committed = Math.min(stable.length, boundary.retainedStableCount);
+        else {
+          const oldText = previousStable.join('');
+          const newText = stable.join('');
+          let firstNew = 0;
+          let matchedChars = 0;
+          if (newText.startsWith(oldText)) {
+            while (firstNew < stable.length && matchedChars < oldText.length) matchedChars += stable[firstNew++]!.length;
+          }
+          committed = newText.startsWith(oldText) && matchedChars === oldText.length ? firstNew : stable.length;
+        }
+      } else if (changedCommitted || stable.length < committed) {
+        // Fold state changes rewrap already committed source units. The entry
+        // supplies their source-position prefix; only a replacement session
+        // with no common source starts at zero.
+        committed = retainedStableCount === undefined ? 0 : Math.min(stable.length, retainedStableCount);
+      }
+      const newStable = stable.slice(Math.min(committed, stable.length));
+      // Only persisted history may be pushed into terminal scrollback. Streaming
+      // previews and menus are repainted in the viewport until they become stable.
+      if (newStable.length + reservedRows > rows) {
+        const padding = Array.from({ length: reservedRows }, () => '');
+        write(`\x1b[?25l\x1b[H\x1b[2J${[...newStable, ...padding].join('\r\n')}`);
+        committed = Math.min(stable.length, stable.length + reservedRows - rows);
+      }
+      const committedEnd = committed > 0 ? historyStart + committed : 0;
+      // A fold can shrink the entire transcript back into the viewport.
+      // Previously committed rows must be painted again in that case, or
+      // PageUp at the now-zero scroll range leaves only the footer visible.
+      const visibleStart = historyStart > 0 && lines.length <= rows
+        ? 0 : Math.max(Math.min(committedEnd, lines.length), lines.length - rows);
+      // A 24-row viewport otherwise keeps only the tail, so the title scrolls
+      // off while the seeded tail, footer, and prompt stay. Keep the header
+      // rows in the visible screen; the same number of older body rows yield.
+      const chrome = Math.min(historyStart, Math.max(0, rows - 1));
+      let visible = lines.slice(visibleStart);
+      if (chrome > 0 && visibleStart > 0 && visible.length > chrome) {
+        visible = [...lines.slice(0, chrome), ...visible.slice(chrome)];
+      }
+      const topChrome = Math.max(0, Math.min(visible.length, historyStart - visibleStart));
+      const padding = Array.from({ length: historyStart > 0 ? Math.max(0, rows - visible.length) : 0 }, () => '');
+      const pinned = [...visible.slice(0, topChrome), ...padding, ...visible.slice(topChrome)];
+      const visibleCursorRow = Math.max(1, Math.min(rows, cursorRow - visibleStart + padding.length));
+      write(`\x1b[?25l\x1b[H\x1b[2J${(decorate?.(pinned) ?? pinned).join('\r\n')}\x1b[${visibleCursorRow};${Math.max(1, cursorCol)}H\x1b[?25h`);
+      previousRows = rows;
+      previousColumns = columns;
+      previousStable = [...stable];
+      resizeSegmentPending = false;
+    },
+  };
+}
+
 /** Enter advances the nearest visible MessageBlock by one detail tier. */
 export function visibleMessageBlockDetailTarget(
   levels: ReadonlyMap<string, TuiDetailLevel>,

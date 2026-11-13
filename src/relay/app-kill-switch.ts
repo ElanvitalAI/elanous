@@ -159,7 +159,8 @@ function assertPrivateDirectory(stateRoot: string, relativeDirectory: string, ui
   }
 }
 
-function openPrivateDatabase(databasePath: string, stateRoot: string): { db: Database; descriptor: number; parentDescriptor: number } {
+/** Shared safe-open boundary for private relay SQLite state files. */
+export function openPrivateDatabase(databasePath: string, stateRoot: string): { db: Database; descriptor: number; parentDescriptor: number } {
   const uid = process.getuid?.();
   if (uid === undefined) throw new Error('app kill switch requires an OS user identity');
   const absolute = resolve(databasePath);

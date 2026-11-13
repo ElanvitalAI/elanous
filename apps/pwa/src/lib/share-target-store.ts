@@ -18,6 +18,7 @@
 // a coordinated client release; the page simply finds the latest.
 
 import { debugLog } from './debug';
+import type { SavedScrapReceipt } from './share-scraps';
 
 const SHARE_CACHE_PREFIX = 'elanous-pwa-share-target-';
 const SHARE_PROGRESS_PREFIX = 'elanous.pwa.share-progress.';
@@ -198,14 +199,33 @@ export async function readSharedPayloadProgress(id: string): Promise<string[]> {
   return [...new Set([...cached, ...fallback])];
 }
 
-export async function markSharedPayloadProgress(id: string, key: string): Promise<void> {
+/** Receipt metadata lets a later tab restore a completed save without another POST. */
+export async function readSharedPayloadReceipt(id: string, key: string): Promise<SavedScrapReceipt | null> {
+  const path = `${progressPath(id)}${encodeURIComponent(key)}`;
+  const cache = await findShareCache();
+  const cached = cache ? await cache.match(path) : null;
+  let value: unknown;
+  try {
+    value = cached ? await cached.json() : JSON.parse(localStorage.getItem(`${progressStoragePrefix(id)}${encodeURIComponent(key)}`) ?? 'null');
+  } catch { return null; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const receipt = value as Record<string, unknown>;
+  if (typeof receipt.id !== 'string' || typeof receipt.kind !== 'string'
+    || !receipt.raw || typeof receipt.raw !== 'object' || Array.isArray(receipt.raw)) return null;
+  return receipt as unknown as SavedScrapReceipt;
+}
+
+export async function markSharedPayloadProgress(id: string, key: string, receipt?: SavedScrapReceipt): Promise<void> {
   const cache = await findShareCache();
   if (!cache) throw new Error('공유 저장 기록을 찾지 못했습니다.');
+  const body = receipt ? JSON.stringify(receipt) : '1';
   try {
-    await cache.put(`${progressPath(id)}${encodeURIComponent(key)}`, new Response('1'));
+    await cache.put(`${progressPath(id)}${encodeURIComponent(key)}`, new Response(body, {
+      headers: receipt ? { 'content-type': 'application/json' } : undefined,
+    }));
   } catch (error) {
     if (typeof localStorage === 'undefined') throw error;
-    localStorage.setItem(`${progressStoragePrefix(id)}${encodeURIComponent(key)}`, '1');
+    localStorage.setItem(`${progressStoragePrefix(id)}${encodeURIComponent(key)}`, body);
   }
 }
 

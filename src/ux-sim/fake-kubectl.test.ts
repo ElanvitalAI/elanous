@@ -60,8 +60,17 @@ function stage(jobForLease?: string) {
     runtimeIdentity: { baseImageDigest, lockHash: key.lockHash, os: 'linux', architecture: 'amd64', bunVersion: workerBunVersion },
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     rotationStatePath: join(warmProviderStateRoot, `stage-${++warmProviderStateIndex}.json`),
-    kubectl: device.kubectl, fetch: device.fetchLease, transport: () => ({ request: async () => { transports++;
-      return { status: 'observed', reason: 'complete', reply: null }; } }),
+    kubectl: device.kubectl, fetch: device.fetchLease, transport: () => ({ request: async (command) => { transports++;
+      // WarmPodProvider accepts completion only with a reset receipt bound to this lease.
+      return { status: 'observed', reason: 'complete', reply: {
+        protocol: 1, runId: command.runId, attemptId: command.attemptId, cutSha: command.cutSha,
+        ...(command.baselineSha ? { baselineSha: command.baselineSha } : {}),
+        leaseId: command.leaseId, generation: command.generation, workerId: command.workerId,
+        key: command.key, envProfile: command.envProfile, startedAt: Date.now(), finishedAt: Date.now(),
+        files: command.files.map(file => ({ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true })),
+        resetReceipt: { baseImageDigest: command.baseImageDigest!,
+          resetMethod: 'git-reset-clean-status-v1', postRunDiff: [] },
+      } }; } }),
   });
   const request = (input: ReturnType<typeof replay> = replay()) => provider.request(input,
     { kind: 'gate', lockHash: key.lockHash, imageDigest: key.imageDigest,

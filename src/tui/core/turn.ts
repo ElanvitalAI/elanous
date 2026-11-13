@@ -1,6 +1,7 @@
 /** Chat-turn lifetime for the Next TUI. Key parsing and queued submissions live in sibling cores. */
 import type { AgentDisplayEvent } from './agents.js';
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
+import { NextTuiAuthError, type NextTuiAuthFailureKind } from '../../tui-client/next-auth-preflight.js';
 export interface NextTuiTurnInput {
   readonly sessionId: string;
   readonly text: string;
@@ -19,6 +20,7 @@ export interface NextTuiTurnOutcome {
   readonly compacted: boolean;
   readonly compactNote?: string;
   readonly error?: string;
+  readonly authFailureKind?: NextTuiAuthFailureKind;
 }
 
 export interface NextTuiTurnDeps {
@@ -87,6 +89,7 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
   const done = Promise.resolve().then(async (): Promise<NextTuiTurnOutcome> => {
     let result: NextTuiTurnResult | void = undefined;
     let error: string | undefined;
+    let authFailureKind: NextTuiAuthFailureKind | undefined;
     try {
       result = await deps.run({ ...input, signal: controller.signal }, onDelta, (status) => {
         if (settled || controller.signal.aborted) return;
@@ -99,6 +102,7 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
       (block) => { if (!settled && !controller.signal.aborted) deps.onMessageBlock?.(block); });
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
+      if (cause instanceof NextTuiAuthError) authFailureKind = cause.kind;
     }
     settled = true;
     clearRenderTimer();
@@ -109,6 +113,7 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
       compacted,
       ...(compactNote ? { compactNote } : {}),
       ...(error ? { error } : {}),
+      ...(authFailureKind ? { authFailureKind } : {}),
     };
     await deps.onSettled?.(outcome);
     return outcome;

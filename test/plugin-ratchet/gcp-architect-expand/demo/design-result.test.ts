@@ -6,12 +6,14 @@ import { ticketDesignFromArchitectureJson } from '../../../../scripts/gcp-archit
 const fixture = JSON.parse(readFileSync(join(import.meta.dir, '../../../../plugins/gcp-architect-expand/demo/fixtures/ticketing-design.json'), 'utf8'));
 
 test('general architect JSON and graph-run output retain their source trace', () => {
-  const wrapped = { source: { sessionId: 'test-session' }, runId: 'test-graph-run', ticketDesign: { ...fixture, sourceKind: undefined } };
+  const structured = fixture.designResult;
+  const wrapped = { source: { sessionId: 'test-session' }, runId: 'test-graph-run', ticketDesign: structured };
   const design = ticketDesignFromArchitectureJson(wrapped);
-  expect(design).toMatchObject({ title: fixture.title, sourceKind: 'structured-architecture-design-json',
-    sourceSessionId: 'test-session', sourceGraphRunId: 'test-graph-run', assumptions: [] });
-  const graph = { runId: 'test-graph-run', nodes: [{ nodeId: 'design', output: JSON.stringify({ result: { ticketDesign: fixture } }) }] };
-  expect(ticketDesignFromArchitectureJson(graph).title).toBe(fixture.title);
+  expect(design).toMatchObject({ title: structured.title, sourceKind: 'structured-architecture-design-json',
+    sourceSessionId: 'test-session', sourceGraphRunId: 'test-graph-run' });
+  expect(design.assumptions).toHaveLength(10);
+  const graph = { runId: 'test-graph-run', nodes: [{ nodeId: 'design', output: JSON.stringify({ result: { ticketDesign: structured } }) }] };
+  expect(ticketDesignFromArchitectureJson(graph).title).toBe(structured.title);
 });
 
 test('Solar structured design without offload fields receives visible unconfirmed assumptions', () => {
@@ -51,12 +53,12 @@ test('general architect schema v1 maps requirement statements and local diagram 
 });
 
 test('explicit unsafe or ambiguous design values and prose-only Graph output fail closed', () => {
-  expect(() => ticketDesignFromArchitectureJson({ ticketDesign: fixture, inputSha256: 'output-only', estimate: {} }))
+  expect(() => ticketDesignFromArchitectureJson({ ticketDesign: fixture.designResult, inputSha256: 'output-only', estimate: {} }))
     .toThrow('GCP proposal output cannot be used as Scene 4 design input');
   expect(() => ticketDesignFromArchitectureJson({ nodes: [{ nodeId: 'design', output: 'prose only' }] }))
     .toThrow('not structured JSON');
   for (const patch of [{ containsPii: true }, { containsPii: 'false' }, { retryable: 'true' },
     { checkpointable: 1 }, { dataClass: 'confidential' }, { usage: { vcpuHours: 0, gibHours: 8 } }]) {
-    expect(() => ticketDesignFromArchitectureJson({ ticketDesign: { ...fixture, ...patch } })).toThrow('explicit design value conflicts');
+    expect(() => ticketDesignFromArchitectureJson({ ticketDesign: { ...fixture.designResult, ...patch } })).toThrow('explicit design value conflicts');
   }
 });

@@ -10,7 +10,7 @@ import type { LLMToolSpec } from './llm/tool-spec.js';
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
 import { buildInvalidToolArgsMessage, getProviderForConfig, parseOpenAISSELines, streamLLMWithTools, type LLMMessage, type LLMProvider, type LLMStreamEvent } from './llm.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import type { UserConfig } from './user-config/types.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Write', description: 'write', parameters: { type: 'object', properties: { file_path: { type: 'string' } } } }];
@@ -104,7 +104,7 @@ test('parser invariant: without the flag, broken args still collapse to {} with 
 // ── provider wiring (fake fetch) ──────────────────────────────────────────────
 
 async function streamFrom(llm: Record<string, unknown>, lines: string[]): Promise<LLMStreamEvent[]> {
-  return withFakeFetchDevice([
+  return withRealProviderFakeFetchDevice([
     { url: '/api/v1/chat/completions', method: 'POST', response: () => new Response(lines.map((l) => `${l}\n\n`).join(''), { status: 200 }) },
     { url: '/v1/chat/completions', method: 'POST', response: () => new Response(lines.map((l) => `${l}\n\n`).join(''), { status: 200 }) },
   ], async (device) => {

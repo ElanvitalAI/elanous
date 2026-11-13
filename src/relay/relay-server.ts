@@ -5,6 +5,7 @@ import { debug } from '../debug/log.js';
 import { challengeMessage, createPhoneChannel, MAX_FRAME_BYTES, serverIdFromPublicKey } from './channel.js';
 export { challengeMessage } from './channel.js';
 import { MAX_MUX_FRAME_BYTES, MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
+import { buildPublicDispatchRoutes, type PublicDispatchRoute } from './public-dispatch.js';
 
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const MAX_CLIENTS_PER_SERVER = 8;
@@ -21,8 +22,23 @@ const PING_INTERVAL_MS = 30_000;
 const DEAD_PEER_MS = 90_000;
 const AUTH_TIMEOUT_MS = 10_000;
 
-export interface RelayTrafficCapConfig {
-  readonly free: { readonly memberBytesPerMinute: number; readonly connectionBytesPerMinute: number };
+export type RelayTrafficCapConfig =
+  | { readonly free: { readonly memberBytesPerMinute: number; readonly connectionBytesPerMinute: number } }
+  | { readonly mode: 'measure-only' };
+
+export type RelayTrafficDirection = 'ingress' | 'egress';
+export interface RelayTrafficUsage {
+  readonly minute: number;
+  readonly ingressBytes: number;
+  readonly egressBytes: number;
+}
+export interface RelayTrafficStore {
+  read(memberId: string, minute: number): { readonly ingressBytes: number; readonly egressBytes: number };
+  /** Atomically compare the persisted member total with the cap, then add accepted bytes. */
+  charge(event: { readonly memberId: string; readonly connectionId: string; readonly minute: number;
+    readonly direction: RelayTrafficDirection; readonly bytes: number }, memberLimit?: number):
+    { readonly status: 'allowed' | 'limited'; readonly usage: { readonly ingressBytes: number; readonly egressBytes: number } };
+  close?(): void;
 }
 
 export interface RelayCustomDomainRoute {
@@ -98,40 +114,75 @@ export function loadRelayTrafficCap(path: string): RelayTrafficCapConfig {
   if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0
     || (process.getuid && stat.uid !== process.getuid())) throw new Error('relay traffic cap config must be owner-only regular file');
   const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'free') {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('invalid relay traffic cap config');
   }
+  if (Object.keys(parsed).join() === 'mode' && (parsed as { mode?: unknown }).mode === 'measure-only') {
+    return { mode: 'measure-only' };
+  }
+  if (Object.keys(parsed).join() !== 'free') throw new Error('invalid relay traffic cap config');
   const free = (parsed as { free?: unknown }).free;
   if (!free || typeof free !== 'object' || Array.isArray(free)
     || Object.keys(free).sort().join() !== 'connectionBytesPerMinute,memberBytesPerMinute') {
     throw new Error('invalid relay traffic cap config');
   }
-  const config = { free: free as RelayTrafficCapConfig['free'] };
+  const config = { free: free as Extract<RelayTrafficCapConfig, { free: unknown }>['free'] };
   createRelayTrafficMeter(config);
   return config;
 }
 
 /** Fixed UTC minute windows; limit values come from operator config, never a public response. */
-export function createRelayTrafficMeter(config: RelayTrafficCapConfig, now: () => number = Date.now) {
-  const { memberBytesPerMinute, connectionBytesPerMinute } = config.free;
-  if (![memberBytesPerMinute, connectionBytesPerMinute].every(value => Number.isSafeInteger(value) && value > 0)) {
+export function createRelayTrafficMeter(config: RelayTrafficCapConfig, now: () => number = Date.now,
+  store?: RelayTrafficStore) {
+  const limits = 'free' in config ? config.free : undefined;
+  const memberBytesPerMinute = limits?.memberBytesPerMinute;
+  const connectionBytesPerMinute = limits?.connectionBytesPerMinute;
+  if (limits && ![memberBytesPerMinute, connectionBytesPerMinute].every(value => typeof value === 'number' && Number.isSafeInteger(value) && value > 0)) {
     throw new Error('invalid relay traffic cap config');
+  }
+  if (!limits && (!('mode' in config) || config.mode !== 'measure-only' || !store)) {
+    throw new Error('measure-only relay traffic requires a ledger');
   }
   let minute = -1;
   const members = new Map<string, number>();
   const connections = new Map<string, number>();
+  const usage = new Map<string, { ingressBytes: number; egressBytes: number }>();
+  const currentMinute = () => Math.floor(now() / 60_000);
+  const rollWindow = () => {
+    const current = currentMinute();
+    if (current !== minute) { minute = current; members.clear(); connections.clear(); usage.clear(); }
+  };
   return {
-    charge(memberId: string | null | undefined, connectionId: string, bytes: number): 'allowed' | 'limited' | 'member-required' {
+    charge(memberId: string | null | undefined, connectionId: string, bytes: number,
+      direction: RelayTrafficDirection = 'ingress'): 'allowed' | 'limited' | 'member-required' | 'ledger-unavailable' {
       if (!memberId) return 'member-required';
-      if (!connectionId || !Number.isSafeInteger(bytes) || bytes < 0) throw new Error('invalid relay traffic measurement');
-      const currentMinute = Math.floor(now() / 60_000);
-      if (currentMinute !== minute) { minute = currentMinute; members.clear(); connections.clear(); }
-      const memberTotal = members.get(memberId) ?? 0;
+      if (!connectionId || !Number.isSafeInteger(bytes) || bytes < 0 || !['ingress', 'egress'].includes(direction)) {
+        throw new Error('invalid relay traffic measurement');
+      }
+      rollWindow();
       const connectionTotal = connections.get(connectionId) ?? 0;
-      if (memberTotal + bytes > memberBytesPerMinute || connectionTotal + bytes > connectionBytesPerMinute) return 'limited';
-      members.set(memberId, memberTotal + bytes);
+      if (connectionBytesPerMinute !== undefined && connectionTotal + bytes > connectionBytesPerMinute) return 'limited';
+      if (store) {
+        let result: ReturnType<RelayTrafficStore['charge']>;
+        try { result = store.charge({ memberId, connectionId, minute, direction, bytes }, memberBytesPerMinute); }
+        catch { return 'ledger-unavailable'; }
+        if (result.status === 'limited') return 'limited';
+        usage.set(memberId, { ...result.usage });
+      } else {
+        const memberTotal = members.get(memberId) ?? 0;
+        if (memberBytesPerMinute !== undefined && memberTotal + bytes > memberBytesPerMinute) return 'limited';
+        members.set(memberId, memberTotal + bytes);
+        const currentUsage = usage.get(memberId) ?? { ingressBytes: 0, egressBytes: 0 };
+        currentUsage[direction === 'ingress' ? 'ingressBytes' : 'egressBytes'] += bytes;
+        usage.set(memberId, currentUsage);
+      }
       connections.set(connectionId, connectionTotal + bytes);
       return 'allowed';
+    },
+    usage(memberId: string): RelayTrafficUsage {
+      rollWindow();
+      const value = store?.read(memberId, minute) ?? usage.get(memberId);
+      return { minute, ingressBytes: value?.ingressBytes ?? 0, egressBytes: value?.egressBytes ?? 0 };
     },
     forgetConnection(connectionId: string): void { connections.delete(connectionId); },
   };
@@ -157,6 +208,8 @@ export interface RelayServerOptions {
   validateMemberToken?: (token: string, serverId: string) => Promise<{ memberId: string } | null>;
   /** Operator-provided private free-tier limits. The server never returns these values. */
   trafficCap?: RelayTrafficCapConfig;
+  /** Optional synchronous private usage store; read/write failure rejects the measured frame. */
+  trafficStore?: RelayTrafficStore;
   /** @internal Deterministic clock for traffic-window simulations. */
   trafficNowForTesting?: () => number;
   /** Durable app stop ledger used by the public report route and request gate. */
@@ -165,10 +218,12 @@ export interface RelayServerOptions {
   publicListedApps?: ReadonlySet<string>;
   /** Opt in to the invited-app reverse proxy for exactly this public domain. */
   publicDomain?: 'elanous.app' | 'elanous.ai';
-  /** One pinned Nexus host receives requests for its configured user id only. */
+  /** Legacy single-user public host pin. */
   publicServerId?: string;
-  /** User label bound to the pinned public Nexus host; multi-user dispatch belongs to ops relay. */
+  /** Legacy single-user public label. */
   publicUserId?: string;
+  /** Operator-pinned public labels for multiple authenticated Nexus hosts. */
+  publicDispatchRoutes?: ReadonlyMap<string, PublicDispatchRoute>;
   /** Verified custom hostnames from the domain/certificate control plane; absent entries fail closed. */
   customDomainRoutes?: ReadonlyMap<string, RelayCustomDomainRoute>;
   /** @internal Short timeout for focused relay lifecycle tests. */
@@ -284,21 +339,33 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     throw new Error('relay member gate requires a token verifier and owner for every trusted host');
   }
   if (options.trafficCap && !options.memberRequired) throw new Error('relay traffic cap requires member authentication');
-  const trafficMeter = options.trafficCap ? createRelayTrafficMeter(options.trafficCap, options.trafficNowForTesting) : null;
+  if (options.trafficCap && !options.trafficStore) throw new Error('relay traffic cap requires a durable traffic ledger');
+  if (options.trafficStore && !options.trafficCap) throw new Error('relay traffic store requires traffic cap');
+  const trafficMeter = options.trafficCap
+    ? createRelayTrafficMeter(options.trafficCap, options.trafficNowForTesting, options.trafficStore) : null;
+  const multiUser = options.publicDispatchRoutes !== undefined;
+  if (multiUser && (!options.publicDomain || options.publicServerId || options.publicUserId
+    || !options.memberRequired || !options.hostOwnerMemberIds)) {
+    throw new Error('multi-user public dispatch requires a domain and member gate without a single-user pin');
+  }
+  const publicRoutes = multiUser
+    ? buildPublicDispatchRoutes(options.publicDispatchRoutes!, new Set(trustedHostKeys.keys()), options.hostOwnerMemberIds!)
+    : undefined;
   if (options.publicDomain !== undefined) {
-    if (!options.publicServerId || !trustedHostKeys.has(options.publicServerId)
+    if (!multiUser && (!options.publicServerId || !trustedHostKeys.has(options.publicServerId)
       || !options.publicUserId || options.publicUserId.length < 3 || options.publicUserId.length > 20
-      || options.publicUserId.includes('--') || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(options.publicUserId)) {
+      || options.publicUserId.includes('--') || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(options.publicUserId))) {
       throw new Error('public relay requires a pinned publicServerId and valid publicUserId');
     }
     if (options.hostname && !['127.0.0.1', '::1', 'localhost'].includes(options.hostname)) {
       throw new Error('public relay listener must stay loopback behind the TLS edge');
     }
-  } else if (options.publicServerId !== undefined || options.publicUserId !== undefined) {
+  } else if (options.publicServerId !== undefined || options.publicUserId !== undefined || multiUser) {
     throw new Error('publicServerId and publicUserId require publicDomain');
   }
   const publicListedApps = new Set(options.publicListedApps ?? []);
   if (publicListedApps.size && !options.publicDomain) throw new Error('public app listing requires public relay mode');
+  if (publicListedApps.size && multiUser) throw new Error('multi-user public listing requires per-user opt-in');
   for (const app of publicListedApps) {
     if (parsePublicAppHost(`${app}--${options.publicUserId}.${options.publicDomain}`, options.publicDomain)?.app !== app) {
       throw new Error('invalid public listing app id');
@@ -310,7 +377,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     if (!hostname || hostname.includes(':') || hostname.includes('/') || hostname.includes('..')
       || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(hostname)
       || (!!options.publicDomain && !!parsePublicAppHost(hostname, options.publicDomain))
-      || !options.publicDomain || route.user !== options.publicUserId
+      || !options.publicDomain || !(publicRoutes?.has(route.user) || route.user === options.publicUserId)
       || !route.ownershipVerified || !route.certificateReady
       || parsePublicAppHost(`${route.app}--${route.user}.${options.publicDomain}`, options.publicDomain)?.app !== route.app) {
       throw new Error('invalid or unverified custom domain route');
@@ -399,21 +466,24 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     return true;
   };
   const publicFetch = async (req: Request): Promise<Response> => {
-    const serverId = options.publicServerId!;
-    const room = rooms.get(serverId);
     const hostHeader = req.headers.get('host') ?? '';
     const normalizedHost = hostHeader.trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '');
     const customRoute = customDomainRoutes.get(normalizedHost);
     const publicApp = parsePublicAppHost(hostHeader, options.publicDomain)
       ?? (customRoute ? { app: customRoute.app, user: customRoute.user } : undefined);
     if (!publicApp) {
-      if (room) fail(room, 'public-invalid-host');
+      const legacyRoom = options.publicServerId ? rooms.get(options.publicServerId) : undefined;
+      if (legacyRoom) fail(legacyRoom, 'public-invalid-host');
       return new Response('Not found', { status: 404 });
     }
-    if (publicApp.user !== options.publicUserId) {
-      if (room) fail(room, 'public-user-mismatch');
+    const serverId = publicRoutes?.get(publicApp.user)?.serverId ??
+      (publicApp.user === options.publicUserId ? options.publicServerId : undefined);
+    if (!serverId) {
+      const legacyRoom = options.publicServerId ? rooms.get(options.publicServerId) : undefined;
+      if (legacyRoom) fail(legacyRoom, 'public-user-mismatch');
       return new Response('Not found', { status: 404 });
     }
+    const room = rooms.get(serverId);
     if (new URL(req.url).pathname === '/.well-known/elanous/apps') {
       if (req.method !== 'GET') return new Response('Method not allowed', { status: 405 });
       // Source: 내부 문서 `nexus-backend-in-a-box` APP-PUBLIC-LISTING; owner opt-in defaults off.
@@ -535,12 +605,12 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       releaseSlot();
       return new Response('Request cancelled', { status: 499 });
     }
-    let trafficLimited = false;
+    let trafficFailure: 'limited' | 'ledger-unavailable' | undefined;
     const send = (bytes: Uint8Array): boolean => {
       if (!room.host || room.host.readyState !== WebSocket.OPEN) return false;
-      if (trafficMeter && trafficMeter.charge(memberId, connectionId, bytes.byteLength) !== 'allowed') {
-        trafficLimited = true;
-        return false;
+      if (trafficMeter) {
+        const result = trafficMeter.charge(memberId, connectionId, bytes.byteLength);
+        if (result !== 'allowed') { trafficFailure = result === 'ledger-unavailable' ? result : 'limited'; return false; }
       }
       room.bytes += bytes.byteLength;
       room.host.send(encodeClientId(clientId, bytes));
@@ -574,7 +644,8 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       headers: Object.fromEntries(forwardedHeaders.entries()) });
     if (!opened.ok || !send(phone.phonePublicKey)) {
       clearTimeout(pending.timer); room.publicRequests.delete(clientId); releaseSlot();
-      return new Response(trafficLimited ? 'Traffic limited' : 'Bad gateway', { status: trafficLimited ? 429 : 502 });
+      return new Response(trafficFailure === 'limited' ? 'Traffic limited' : 'Bad gateway',
+        { status: trafficFailure === 'limited' ? 429 : trafficFailure ? 503 : 502 });
     }
     const sendFrame = (frame: Parameters<typeof encoder.encode>[0]): boolean => {
       const encoded = encoder.encode(frame);
@@ -588,7 +659,8 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       || !sendFrame({ streamId: 1, kind: 'end' })) {
       clearTimeout(pending.timer); room.publicRequests.delete(clientId); releaseSlot();
       sendControl(room.host, { type: 'client-disconnected', clientId });
-      return new Response(trafficLimited ? 'Traffic limited' : 'Bad gateway', { status: trafficLimited ? 429 : 502 });
+      return new Response(trafficFailure === 'limited' ? 'Traffic limited' : 'Bad gateway',
+        { status: trafficFailure === 'limited' ? 429 : trafficFailure ? 503 : 502 });
     }
     return response;
     } catch {
@@ -701,8 +773,11 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         if (!capacity(ws, bytes.length)) { fail(room, 'rate-limit'); ws.close(1008, 'rate limit exceeded'); return; }
         if (data.role === 'client') {
           if (!room.host || data.clientId === undefined) { ws.close(1012, 'host offline'); return; }
-          if (trafficMeter && trafficMeter.charge(data.memberId, data.connectionId, bytes.length) !== 'allowed') {
-            fail(room, 'traffic-cap'); ws.close(1008, 'traffic limited'); return;
+          const traffic = trafficMeter?.charge(data.memberId, data.connectionId, bytes.length);
+          if (traffic && traffic !== 'allowed') {
+            fail(room, traffic === 'ledger-unavailable' ? 'traffic-ledger' : 'traffic-cap');
+            ws.close(traffic === 'ledger-unavailable' ? 1011 : 1008,
+              traffic === 'ledger-unavailable' ? 'usage ledger unavailable' : 'traffic limited'); return;
           }
           room.bytes += bytes.length;
           room.host.send(encodeClientId(data.clientId, bytes));
@@ -712,13 +787,16 @@ export function startRelayServer(options: RelayServerOptions = {}) {
           const client = room.clients.get(clientId);
           const pending = room.publicRequests.get(clientId);
           if (!client && !pending) { fail(room, 'unknown-client'); return; }
-          if (trafficMeter && trafficMeter.charge(client ? client.data.memberId : pending?.memberId,
-            client ? client.data.connectionId : pending?.connectionId ?? '', bytes.length - 4) !== 'allowed') {
-            fail(room, 'traffic-cap');
+          const traffic = trafficMeter?.charge(client ? client.data.memberId : pending?.memberId,
+            client ? client.data.connectionId : pending?.connectionId ?? '', bytes.length - 4, 'egress');
+          if (traffic && traffic !== 'allowed') {
+            fail(room, traffic === 'ledger-unavailable' ? 'traffic-ledger' : 'traffic-cap');
             if (pending) {
               clearTimeout(pending.timer); room.publicRequests.delete(clientId); pending.releaseSlot();
-              pending.resolve(new Response('Traffic limited', { status: 429 }));
-            } else client?.close(1008, 'traffic limited');
+              pending.resolve(new Response(traffic === 'ledger-unavailable' ? 'Bad gateway' : 'Traffic limited',
+                { status: traffic === 'ledger-unavailable' ? 503 : 429 }));
+            } else client?.close(traffic === 'ledger-unavailable' ? 1011 : 1008,
+              traffic === 'ledger-unavailable' ? 'usage ledger unavailable' : 'traffic limited');
             return;
           }
           room.bytes += bytes.length - 4;
@@ -772,6 +850,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         publicSlots: room.publicSlots, bytes: room.bytes, failures: { ...room.failures } } :
         { host: false, clients: 0, publicRequests: 0, publicSlots: 0, bytes: 0, failures: {} as Record<string, number> };
     },
+    trafficUsage(memberId: string): RelayTrafficUsage | undefined { return trafficMeter?.usage(memberId); },
     stop() {
       clearInterval(heartbeat);
       for (const ws of sockets) ws.close(1001, 'relay stopping');
@@ -784,6 +863,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         room.publicRequests.clear();
       }
       server.stop(true);
+      options.trafficStore?.close?.();
       options.appKillSwitch?.close?.();
     },
   };

@@ -8,7 +8,7 @@ import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 //   - Tool spec: required params, name, description mentions "spawn"
 //   - Resolution: known agent → that def; unknown → general-purpose
 //                 fallback; missing entirely → inline FALLBACK
-//   - Recursion guard: child tool list strips Agent itself
+//   - Recursion guard: only grandchildren strip Agent itself
 //   - Abort: parent signal cancels the spawned task
 //   - Budget: max_turns clamped to ceiling, default = 20
 //   - Debug: agent.spawn / agent.done events emit when debug enabled
@@ -68,11 +68,21 @@ const stubDef: AgentDefinition = {
   tools: ['Bash'],
 };
 
+const savedProviderEnv: Record<string, string | undefined> = {};
 beforeEach(() => {
+  for (const key of ['ELANOUS_LLM_MODE', 'ELANOUS_TEST_FAKE_LLM']) {
+    savedProviderEnv[key] = process.env[key];
+  }
+  process.env.ELANOUS_LLM_MODE = 'real';
+  delete process.env.ELANOUS_TEST_FAKE_LLM;
   globalAgentRegistry.clear();
   debug.disable();
 });
 afterEach(() => {
+  for (const [key, value] of Object.entries(savedProviderEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   globalAgentRegistry.clear();
   debug.disable();
 });
@@ -199,8 +209,8 @@ describe('dispatchAgent — agent resolution', () => {
 
 // ── Recursion guard ──
 
-describe('dispatchAgent — Agent tool stripped from child', () => {
-  test('child sees host tools minus Agent', async () => {
+describe('dispatchAgent — one level of nesting', () => {
+  test('first-level child retains Agent and grandchild strips it', async () => {
     let childToolNames: string[] = [];
     const provider: LLMProvider = {
       name: 'capture',
@@ -225,6 +235,11 @@ describe('dispatchAgent — Agent tool stripped from child', () => {
     );
     expect(childToolNames).toContain('Bash');
     expect(childToolNames).toContain('Read');
+    expect(childToolNames).toContain('Agent');
+    await dispatchAgent(
+      { description: 'grandchild', prompt: 'p' },
+      { provider, hostTools, resolveAgentDef: () => def, parentTaskId: result.taskId },
+    );
     expect(childToolNames).not.toContain('Agent');
   });
 });
@@ -282,9 +297,9 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     );
     const text = debug.tail(20).join('\n');
     expect(text).toContain('[agent.spawn] tool-filter');
-    expect(text).toContain('"available":4');
+    expect(text).toContain('"available":5');
     expect(text).toContain('"remaining":1');
-    expect(text).toContain('"removed":3');
+    expect(text).toContain('"removed":4');
   });
 
   test('deny removes specific tools from the child tool set', async () => {
@@ -293,7 +308,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'WebFetch'] } },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
-    expect(cap.names().sort()).toEqual(['Edit', 'Read']);
+    expect(cap.names().sort()).toEqual(['Agent', 'Edit', 'Read']);
   });
 
   test('allow + deny compose — deny wins the conflict', async () => {
@@ -316,7 +331,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       { description: 'd', prompt: 'p', tool_filter: { allow: [] } },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
-    expect(cap.names().sort()).toEqual(['Bash', 'Edit', 'Read', 'WebFetch']);
+    expect(cap.names().sort()).toEqual(['Agent', 'Bash', 'Edit', 'Read', 'WebFetch']);
   });
 
   test('allow with only unknown names (name mismatch) is ignored with a warning — not 49→0', async () => {
@@ -327,7 +342,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       { description: 'd', prompt: 'p', tool_filter: { allow: ['read_file', 'shell', 'grep'] } },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
-    expect(cap.names().sort()).toEqual(['Bash', 'Edit', 'Read', 'WebFetch']);
+    expect(cap.names().sort()).toEqual(['Agent', 'Bash', 'Edit', 'Read', 'WebFetch']);
     const text = debug.tail(20).join('\n');
     expect(text).toContain('"allowIgnored":"no-known-names"');
     expect(text).toContain('"unknownAllow":["read_file","shell","grep"]');
@@ -341,7 +356,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       { description: 'd', prompt: 'p', tool_filter: { deny: ['bash_tool'] } },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
-    expect(cap.names().sort()).toEqual(['Bash', 'Edit', 'Read', 'WebFetch']);
+    expect(cap.names().sort()).toEqual(['Agent', 'Bash', 'Edit', 'Read', 'WebFetch']);
     const row = debug.events().find((e) => e.category === 'agent.spawn' && e.event === 'tool-filter');
     expect(row?.level).toBe('warn');
     expect(JSON.stringify(row?.data)).toContain('"unknownDeny":["bash_tool"]');
@@ -364,13 +379,13 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       async *chat() {},
     };
     const r = await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'Read', 'Edit', 'WebFetch'] } },
+      { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'Read', 'Edit', 'WebFetch', 'Agent'] } },
       { provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(called).toBe(false);
     expect(r.taskId).toBe('no-tools-refused');
     expect(r.output).toContain('NOT SPAWNED');
-    expect(r.output).toContain('0 of 4 tools');
+    expect(r.output).toContain('0 of 5 tools');
   });
 
   test('default general-purpose spawn keeps Read and the shell tool (반례)', async () => {
@@ -393,7 +408,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     expect(cap.names()).toEqual(expect.arrayContaining(['Read', 'RunShell']));
   });
 
-  test('omitted tool_filter keeps the pre-filter behaviour (Agent stripped only)', async () => {
+  test('omitted tool_filter preserves the first-level child tool catalog', async () => {
     const cap = captureProvider();
     await dispatchAgent(
       { description: 'd', prompt: 'p' },
@@ -401,7 +416,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     );
     expect(cap.names()).toContain('Bash');
     expect(cap.names()).toContain('Read');
-    expect(cap.names()).not.toContain('Agent');
+    expect(cap.names()).toContain('Agent');
   });
 
   test('child research tool is explicit: parent grounding does not auto-repeat the same crawl', async () => {
@@ -447,7 +462,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     expect(toolNames).toContain('WebFetch');
     expect(toolNames).toContain('skill_exec');
     expect(toolNames).not.toContain('Read');
-    expect(toolNames).not.toContain('Agent');
+    expect(toolNames).toContain('Agent');
     // Parent seam output is grounding; inheriting this tool does not trigger a
     // second same-query crawl unless the child explicitly calls skill_exec.
     expect(childSkillDispatches).toBe(0);
@@ -995,7 +1010,7 @@ describe('SUBAGENT-NO-NARROWING — 기본은 모델이 넘긴 allow 를 무시�
       { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'Bash'] } },
       { provider: cap.provider, hostTools: host, resolveAgentDef: () => def },
     );
-    expect(cap.names().sort()).toEqual(host.map((t) => t.name).filter((n) => n !== 'Agent').sort());
+    expect(cap.names().sort()).toEqual(host.map((t) => t.name).sort());
     const r = applySpawnToolFilter(host, { allow: ['Read', 'Bash'] });
     expect(r.allowIgnored).toBe('model-allow-ignored');
     expect(r.tools.length).toBe(host.length);

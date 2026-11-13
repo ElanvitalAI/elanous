@@ -16,6 +16,7 @@ import { createMemberStore } from './members/member-store.js';
 import { listAbsorbScraps } from '../intake-plane/items.js';
 import { handleCreateTab } from './api/tabs-mutations.js';
 import { startNexusHttpServer } from './api/http-server.js';
+import { handleBoardRoute } from './api/board-api.js';
 import { createRegistryBackend } from './webterm/pty.js';
 import { createFakeStt } from '../ux-sim/fake-stt.js';
 import { fakeElevenLabsAudioBytes, startFakeElevenLabs } from '../ux-sim/fake-elevenlabs.js';
@@ -99,8 +100,6 @@ test('APP-MADE-WITH-BADGE deploy wiring forwards verified owner entitlements to 
     };
     // Source: Bun.serve uses port 0 to bind an ephemeral local test endpoint.
     ownerServer = Bun.serve({ port: 0, fetch: () => Response.json(owner) });
-    const appRoot = join(root, 'nexus', 'apps', 'lecture-scrap');
-    const outputRoot = join(appRoot, 'out');
     nexus = await runNexus({
       detachForTesting: true, skipHttpServer: false, skipRuntimeApi: true,
       skipSupervisor: true, mcpEnabled: false, skipEnvMigration: true,
@@ -110,10 +109,12 @@ test('APP-MADE-WITH-BADGE deploy wiring forwards verified owner entitlements to 
       cleanGhostTailscaleServeFn: async () => {},
       appSiteDeploymentOperations: {
         createFromTemplate: async ({ appSlug }) => {
+          const appRoot = join(root, 'nexus', 'apps', appSlug);
+          const outputRoot = join(appRoot, 'out');
           mkdirSync(outputRoot, { recursive: true });
           writeFileSync(join(appRoot, 'app.yaml'), `apiVersion: elanous.app/v0
 slug: ${appSlug}
-title: Public lecture notes
+title: ${appSlug === 'lecture-scrap' ? 'Public lecture notes' : 'Team notes app'}
 frontend:
   kind: static-export
   out: out
@@ -123,30 +124,50 @@ roles:
           writeFileSync(join(outputRoot, 'index.html'), '<html><body><main>managed app</main></body></html>');
           return { appRoot, appSlug };
         },
-        build: async () => ({ appRoot: outputRoot, verifyText: 'managed-deploy-proof' }),
+        build: async ({ source }) => ({ appRoot: join(source.appRoot, 'out'), verifyText: 'managed-deploy-proof' }),
         publish: async () => {},
         // Source: app-site-deploy treats HTTP 200 with its marker as a successful publish verification.
         verify: async ({ verifyText }) => ({ status: 200, body: verifyText }),
       },
       startNexusHttpServerFn: ((opts: import('./api/http-server.js').NexusHttpServerOpts) => {
         httpOpts = opts;
-        return { port: ownerServer!.port, hostname: '127.0.0.1', url: ownerServer!.url, stop: () => {} };
+        const port = ownerServer!.port;
+        if (port === undefined) throw new Error('owner server has no port');
+        return { port, hostname: '127.0.0.1', url: ownerServer!.url.toString(), stop: () => {} };
       }) as typeof import('./api/http-server.js').startNexusHttpServer,
     });
     if (!nexus || !httpOpts) throw new Error('Nexus deploy routes were not wired');
-    const deployRequest = () => new Request('http://nexus.invalid/v1/apps/lecture-scrap/deploy', {
+    const { appRoutes, appHost, boardEventStore } = httpOpts;
+    if (!appRoutes || !appHost || !boardEventStore) throw new Error('Nexus deploy dependencies were not wired');
+    const deployRequest = (appSlug = 'lecture-scrap') => new Request(`http://nexus.invalid/v1/apps/${appSlug}/deploy`, {
       method: 'POST', headers: {
         authorization: 'Bearer aps_abcdefghijklmnopqrstuvwxyz123456', 'content-type': 'application/json',
       }, body: JSON.stringify({ templateId: 'next-app-lecture-scrap' }),
     });
     let deployResponse: Response | undefined;
-    for (const route of httpOpts.appRoutes) {
+    for (const route of appRoutes) {
       deployResponse = await route(deployRequest()) ?? undefined;
       if (deployResponse) break;
     }
     // Source: app-site-deploy returns HTTP 200 after the owner deployment verifies successfully.
     expect(deployResponse?.status).toBe(200);
-    const hosted = await httpOpts.appHost.handle(new Request('http://lecture-scrap.app.localhost/', {
+    const published = await boardEventStore.query({ memberId: owner.memberId, type: 'board.card' });
+    expect(published).toHaveLength(1);
+    expect(published[0]).toMatchObject({ type: 'board.card', memberId: owner.memberId,
+      cardId: 'app-lecture-scrap', state: 'released', appSlug: 'lecture-scrap',
+      title: 'Public lecture notes', result: { publicUrl: 'https://lecture-scrap--public-owner.elanous.app' } });
+    expect(published[0]?.runId).toMatch(/^[0-9a-f-]{36}$/);
+    const boardResponse = await handleBoardRoute(new Request('http://localhost/v1/board'), '/v1/board', {
+      resolveOwner: async () => ({ memberId: owner.memberId }), store: boardEventStore,
+    });
+    expect(boardResponse?.status).toBe(200);
+    const cards = (await boardResponse!.json()).cards;
+    expect(cards).toMatchObject([{
+      id: 'app-lecture-scrap', memberId: owner.memberId, state: 'deployed',
+      title: 'Public lecture notes', publicUrl: 'https://lecture-scrap--public-owner.elanous.app/',
+    }]);
+    expect(cards[0].runId).toBe(published[0]?.runId);
+    const hosted = await appHost.handle(new Request('http://lecture-scrap.app.localhost/', {
       headers: { host: 'lecture-scrap.app.localhost' },
     }));
     // Source: the Nexus app host returns HTTP 200 for a mounted public-read HTML response.
@@ -155,6 +176,22 @@ roles:
     expect(html).toContain('<main>managed app</main>');
     expect(html).not.toContain('made-with-badge');
     expect(html).not.toContain('made with elanous');
+    let otherDeploy: Response | undefined;
+    for (const route of appRoutes) {
+      otherDeploy = await route(deployRequest('team-notes')) ?? undefined;
+      if (otherDeploy) break;
+    }
+    expect(otherDeploy?.status).toBe(200);
+    const otherEvents = await boardEventStore.query({ memberId: owner.memberId, type: 'board.card' });
+    expect(otherEvents.find(event => event.cardId === 'app-team-notes')).toMatchObject({
+      appSlug: 'team-notes', title: 'Team notes app', state: 'released',
+    });
+    const otherBoard = await handleBoardRoute(new Request('http://localhost/v1/board'), '/v1/board', {
+      resolveOwner: async () => ({ memberId: owner.memberId }), store: boardEventStore,
+    });
+    expect((await otherBoard!.json()).cards).toContainEqual(expect.objectContaining({
+      id: 'app-team-notes', title: 'Team notes app', state: 'deployed',
+    }));
   } finally {
     await nexus?.release();
     ownerServer?.stop();
@@ -1306,7 +1343,7 @@ describe('runNexus · scraps API wiring', () => {
     try {
       expect(httpOpts?.scraps).toEqual({
         instanceRoot: join(stateRoot, 'nexus'),
-        extractors: {},
+        extractors: { digestWeb: expect.any(Function) },
       });
       if (!nexus.httpServer) throw new Error('Nexus HTTP server did not start');
       const response = await fetch(`${nexus.httpServer.url}/v1/scraps`, {

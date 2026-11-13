@@ -15,7 +15,8 @@ nodes:
   - id: design
     type: cloud-resource
     requires: cloud-resource.design@1
-    with: { action: propose, ticketDesignPath: "$input.ticketDesignPath" }
+    # The registered design provider reads ticketDesignPath from the immutable graph input.
+    with: { action: propose }
   - id: deliverables
     type: cloud-resource
     requires: cloud-resource.architecture-deliverables@1

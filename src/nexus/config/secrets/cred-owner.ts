@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { acquireLockSync } from '../../../storage/file-lock.js';
-import { elanousConfigDir } from '../paths.js';
+import { acquireLockSync, withFileLockSync } from '../../../storage/file-lock.js';
+import { elanousConfigDir, userConfigPath } from '../paths.js';
 import { parseCredentialSlotId } from './cred-slot-schema.js';
 
 export const CODEX_CREDENTIAL_SLOT = 'cred:codex-login';
@@ -78,6 +78,50 @@ export function resolveCodexCredentialOwnerHost(
 ): string | undefined {
   const configured = config.llm?.codexTokenOwnerHost?.trim();
   return configured ? normalizeCredentialHost(configured) : undefined;
+}
+
+/** Move the configured Codex refresh owner under the HQ lease fence and an expected-owner CAS. */
+export async function transferCodexCredentialOwner(input: {
+  readonly newOwner: string;
+  readonly expectedOwner: string;
+  readonly configPath?: string;
+  readonly hqLeaseHeld?: () => boolean;
+}): Promise<{ previousOwner: string; ownerHost: string }> {
+  const newOwner = normalizeCredentialHost(input.newOwner);
+  const normalizedExpectedOwner = normalizeCredentialHost(input.expectedOwner);
+  if (newOwner === normalizedExpectedOwner) throw new Error('CREDENTIAL_OWNER_TRANSFER_NOOP');
+  const hq = input.hqLeaseHeld ? undefined : await import('../../../hq/hq.js');
+  const hqLeaseHeld = input.hqLeaseHeld ?? (() => hq!.hqFenceDecision('ledger-cli').run);
+
+  const path = input.configPath ?? userConfigPath();
+  return withFileLockSync(`${path}.lock`, () => {
+    if (!hqLeaseHeld()) throw new Error('CREDENTIAL_OWNER_TRANSFER_HQ_LEASE_REQUIRED');
+    let raw: unknown;
+    try { raw = JSON.parse(readFileSync(path, 'utf8')); }
+    catch { throw new Error('CREDENTIAL_OWNER_TRANSFER_CONFIG_UNREADABLE'); }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('CREDENTIAL_OWNER_TRANSFER_CONFIG_INVALID');
+    const config = raw as Record<string, unknown>;
+    const llm = config.llm;
+    if (!llm || typeof llm !== 'object' || Array.isArray(llm)) throw new Error('CREDENTIAL_OWNER_TRANSFER_OWNER_UNSET');
+    const llmConfig = llm as Record<string, unknown>;
+    const currentOwner = typeof llmConfig.codexTokenOwnerHost === 'string' ? llmConfig.codexTokenOwnerHost : undefined;
+    if (!currentOwner) throw new Error('CREDENTIAL_OWNER_TRANSFER_OWNER_UNSET');
+    normalizeCredentialHost(currentOwner);
+    if (currentOwner !== input.expectedOwner) throw new Error(`CREDENTIAL_OWNER_TRANSFER_EXPECTED_OWNER_MISMATCH: expected=${input.expectedOwner} observed=${currentOwner}`);
+
+    llmConfig.codexTokenOwnerHost = input.newOwner;
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+      chmodSync(temporary, 0o600);
+      const fd = openSync(temporary, 'r');
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(temporary, path);
+      const dirFd = openSync(dirname(path), 'r');
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    } finally { if (existsSync(temporary)) unlinkSync(temporary); }
+    return { previousOwner: currentOwner, ownerHost: input.newOwner };
+  });
 }
 
 /** Called only after a mirror install succeeds; this local file records the latest push receipt, not authority. */

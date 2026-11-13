@@ -1,0 +1,16 @@
+graph_id: train-batch
+version: 1
+loop:
+  title: Versioned train batch
+  description: Run the repository-owned train batch against an explicit queue and pinned base.
+  owner: TC
+  trigger:
+    events: [manual]
+entry_node: batch
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: batch, kind: agent, recipe: 'cmd:train-batch', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: batch, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -1,0 +1,15 @@
+{
+  "id": "tox-test-zero-spend",
+  "name": "Isolated Nexus TOX admission with fake LLM and zero estimated spend",
+  "audience": "internal",
+  "checklistCells": ["DEMO1114-S1-NEXT"],
+  "implementation": ["src/nexus/tox-test-budget.ts", "src/nexus/index.ts", "src/task-orchestrator/tox-loop.ts"],
+  "tests": ["src/nexus/tox-test-budget.test.ts", "src/nexus/tox-test-budget-runtime.test.ts"],
+  "target": "An isolated Nexus --test run may admit a zero-estimate TOX intake task with an explicitly selected fake LLM while production keeps its normal budget gate.",
+  "inputs": ["Test instance", "Effective ELANOUS_LLM_MODE=fake, selected with --fake-llm for live --test CLI", "ELANOUS_TEST_TOX_ZERO_SPEND=1", "ELANOUS_TEST_FAKE_LLM=1", "ELANOUS_TEST_FAKE_LLM_AS_PROVIDER=1", "Zero or absent task estimate"],
+  "observations": ["Actual runNexus and TOX dispatch admit zero-estimate fake work with an observed launch event and real provider request count zero", "Positive estimate and missing switches emit budget-hold with dispatch zero", "Real LLM mode and production kind do not install the seam; production runtime hold is tracked by PR #37329"],
+  "entryCommands": ["bun test src/nexus/tox-test-budget.test.ts src/nexus/tox-test-budget-runtime.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

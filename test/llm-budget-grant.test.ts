@@ -4,13 +4,27 @@
 // a headless coding-agent terminal) is actually dispatched, bounded by a
 // ceiling. Verified here against the real streamLLMWithTools loop.
 
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { streamLLMWithTools } from '../src/llm';
 import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 import { __resetSnapshotStore, __resetTurnState } from '../src/undo-turn/index.js';
 import { resetPlanModeState } from '../src/plan-mode/index.js';
 
+// Gate baseline ELANOUS_TEST_FAKE_LLM=1 makes streamLLMWithTools
+// (src/llm.ts forcedFake) select test-fake-llm ahead of this file's
+// injected driveProvider. testFakeLlmDefaultSelected returns false when
+// ELANOUS_LLM_MODE=real (src/ux-sim/fake-llm.ts), so the fixture owns the
+// turn. #36949 and #37477 keep that fence for an explicit fake switch.
+let savedLlmMode: string | undefined;
+
+beforeEach(() => {
+  savedLlmMode = process.env.ELANOUS_LLM_MODE;
+  process.env.ELANOUS_LLM_MODE = 'real';
+});
+
 afterEach(() => {
+  if (savedLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+  else process.env.ELANOUS_LLM_MODE = savedLlmMode;
   __resetSnapshotStore();
   __resetTurnState();
   resetPlanModeState();

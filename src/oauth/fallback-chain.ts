@@ -374,7 +374,7 @@ export function grokQuotaFromUsageSnapshot(snapshot: {
   if (typeof snapshot.rateLimitReached === 'string' && snapshot.rateLimitReached.length > 0) return 'exhausted';
   const weekly = snapshot.windows?.find((window) => window.kind === 'weekly');
   if (weekly && Number.isFinite(weekly.remainingPercent) && weekly.remainingPercent >= 0 && weekly.remainingPercent <= 100) {
-    return weekly.remainingPercent === 0 ? 'exhausted' : 'usable';
+    return 100 - weekly.remainingPercent >= 70 ? 'exhausted' : 'usable';
   }
   const credits = snapshot.credits;
   if (!credits) return 'unknown';

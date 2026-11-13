@@ -372,6 +372,16 @@ test('재현: RunShell/Bash 봉투는 output 줄을 보이고 exit 코드를 머
   expect(open.slice(1, 31)).toEqual(output.split('\n').map((l) => `  ${l}`));
 });
 
+test('Bash stdout 끝 개행은 빈 출력 줄로 세거나 그리지 않는다', () => {
+  const output = Array.from({ length: 30 }, (_, i) => `fold-line-${String(i).padStart(2, '0')}`).join('\n') + '\n';
+  const envelope = JSON.stringify({ output, stdout: output, stderr: '', exitCode: 0 });
+  const message = toolMsg('Bash', envelope);
+  expect(logViewLines([message], 100)[0]).toBe('▸ 도구 Bash · 30줄 (접힘)');
+  const open = logViewLines([message], 100, new Set([0]));
+  expect(open[0]).toBe('도구: Bash · exit 0');
+  expect(open.slice(1, -1)).toEqual(output.trimEnd().split('\n').map((line) => `  ${line}`));
+});
+
 test('짧은 봉투는 접지 않고 펼친 그대로 · 오류 봉투는 error 문면 · 일반 문자열 결과는 옛 모양', () => {
   const short = JSON.stringify({ output: '     1\tonly', linesRead: 1, totalLines: 1, totalBytes: 5, truncated: false, kind: 'text' });
   expect(logViewLines([toolMsg('Read', short)], 100)).toEqual(['도구: Read · 1줄 · 5B', '       1 only', '']);

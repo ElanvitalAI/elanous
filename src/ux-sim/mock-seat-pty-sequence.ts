@@ -15,6 +15,8 @@ export type ScreenUntil = string | RegExp | ((screen: string) => boolean);
 
 export interface SeatPtyStep {
   label: string;
+  /** Resize both the real PTY and the observer terminal before sending input. */
+  resize?: { cols: number; rows: number };
   /** Raw bytes written to the PTY (already a key: '\x1b', '\x11' …). */
   keys?: string;
   /** Typed text; with `enter` (default true) a separate '\r' follows after a short gap, like a person. */
@@ -47,6 +49,7 @@ export interface SeatPtySequenceSpec {
   artifactPath?: string;
   /** Observe actual PTY bytes and Enter time for latency/paint receipts. */
   onOutput?: (chunk: string, atMs: number) => void;
+  onResize?: (cols: number, rows: number, atMs: number) => void;
   onStepInput?: (label: string, atMs: number) => void;
 }
 
@@ -125,7 +128,7 @@ export async function mockSeatPtySequence(spec: SeatPtySequenceSpec): Promise<Se
   const readScreen = async () => {
     await pending;
     const buffer = terminal.buffer.active;
-    const lines = Array.from({ length: rows }, (_, row) => buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? '');
+    const lines = Array.from({ length: terminal.rows }, (_, row) => buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? '');
     while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
     return { screen: lines.join('\n'), cursor: { row: buffer.cursorY + 1, col: buffer.cursorX + 1 } };
   };
@@ -150,12 +153,13 @@ export async function mockSeatPtySequence(spec: SeatPtySequenceSpec): Promise<Se
     for (const name of Object.keys(childEnv)) {
       if (CREDENTIAL_ENV.test(name)) throw new Error(`N03 refuses credential-shaped env: ${name}`);
     }
-    pty = spawn(executable, args, { name: 'xterm-256color', cols, rows, cwd: root, env: childEnv });
-    const data = pty.onData((chunk) => {
+    const activePty: MinimalPty = spawn(executable, args, { name: 'xterm-256color', cols, rows, cwd: root, env: childEnv });
+    pty = activePty;
+    const data = activePty.onData((chunk) => {
       spec.onOutput?.(chunk, performance.now());
       pending = pending.then(() => new Promise<void>((r) => terminal.write(chunk, r)));
     });
-    const exit = pty.onExit(({ exitCode: code, signal: s }) => { exitCode = code; signal = s ?? null; });
+    const exit = activePty.onExit(({ exitCode: code, signal: s }) => { exitCode = code; signal = s ?? null; });
     const capture = async (label: string, input: string, until: ScreenUntil, timeoutMs: number) => {
       const deadline = Date.now() + timeoutMs;
       for (;;) {
@@ -173,21 +177,26 @@ export async function mockSeatPtySequence(spec: SeatPtySequenceSpec): Promise<Se
       await capture(spec.ready.label, '', spec.ready.until, spec.ready.timeoutMs ?? 60_000);
       for (const step of spec.steps) {
         let input = '';
-        if (step.keys) { pty.write(step.keys); input += step.keys; }
+        if (step.resize) {
+          activePty.resize(step.resize.cols, step.resize.rows);
+          terminal.resize(step.resize.cols, step.resize.rows);
+          spec.onResize?.(step.resize.cols, step.resize.rows, performance.now());
+        }
+        if (step.keys) { activePty.write(step.keys); input += step.keys; }
         if (step.text !== undefined) {
           const typed = typeof step.text === 'function' ? step.text() : step.text;
-          pty.write(typed);
+          activePty.write(typed);
           input += typed;
-          if (step.enter !== false) { await sleep(150); spec.onStepInput?.(step.label, performance.now()); pty.write('\r'); input += '\r'; }
+          if (step.enter !== false) { await sleep(150); spec.onStepInput?.(step.label, performance.now()); activePty.write('\r'); input += '\r'; }
         }
         for (const [i, chunk] of (step.chunks ?? []).entries()) {
           if (i > 0 && step.gapMs) await sleep(step.gapMs);
-          pty.write(chunk);
+          activePty.write(chunk);
           input += chunk;
         }
         await capture(step.label, input, step.until, step.timeoutMs ?? 60_000);
       }
-      pty.write(spec.quitKeys ?? '\x11');
+      activePty.write(spec.quitKeys ?? '\x11');
       const deadline = Date.now() + (spec.exitTimeoutMs ?? 10_000);
       while (exitCode === undefined && Date.now() < deadline) await sleep(100);
     } finally {

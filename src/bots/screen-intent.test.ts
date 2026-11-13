@@ -13,6 +13,15 @@ describe('read-only bot command intents', () => {
     expect(matchRoutinesIntent('루틴 뭐 있어')).toBe('/routines');
   });
 
+  test('appointment app work and routine edits stay in the conversation', () => {
+    expect(matchRoutinesIntent('동네 가게 예약 앱을 만들어줘')).toBeNull();
+    expect(matchRoutinesIntent('예약 취소와 빈 시간 표시를 추가해줘')).toBeNull();
+    expect(matchRoutinesIntent('예약 목록 보여줘')).toBeNull();
+    expect(matchRoutinesIntent('루틴 목록에 새 항목 추가해줘')).toBeNull();
+    expect(matchRoutinesIntent('루틴 목록 보여주는 앱 개발해줘')).toBeNull();
+    expect(matchRoutinesIntent('루틴 목록 보여줘')).toBe('/routines');
+  });
+
   test('translates one named bot status request', () => {
     expect(matchBotIntent('newsbot 상태', resolveBot)).toBe('/bot newsbot');
   });

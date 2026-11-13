@@ -71,9 +71,16 @@ If you run the installer as **root** on Debian or Ubuntu, it installs any missin
 As a regular user it only tells you what is missing, so install the basics first:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y curl ca-certificates unzip git
-curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
-source ~/.bashrc
+sudo apt-get update && sudo apt-get install -y curl ca-certificates unzip git &&
+(
+  tmp="$(mktemp)" &&
+  trap 'rm -f "$tmp"' EXIT &&
+  curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh -o "$tmp" &&
+  test -s "$tmp" &&
+  bash -n "$tmp" &&
+  bash "$tmp" --yes
+) &&
+source ~/.bashrc &&
 elanous --version && elanous doctor
 ```
 

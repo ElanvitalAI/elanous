@@ -7,12 +7,25 @@ import { createAppLifecycleEvent, validateAppLifecycleEvent, type AppLifecycleEv
 
 export interface MemberSignupIntent {
   readonly consents: Readonly<Record<string, string>>;
+  readonly newsletterPreference?: MemberNewsletterPreferenceInput;
+  /** Public member handle from a referral link; never an authentication credential. */
+  readonly referrerMemberId?: string;
+  readonly legacyPublicId?: string;
   readonly referralCode?: string;
   readonly eventCode?: string;
   /** OAuth-only native return URI; it is carried inside the encrypted state cookie, never persisted on the member. */
   readonly appRedirectUri?: string;
   /** S256 challenge for the verifier retained by the native app, preventing custom-scheme interception. */
   readonly appCodeChallenge?: string;
+}
+
+export interface MemberNewsletterPreferenceInput {
+  readonly choice: 'opted_in' | 'declined';
+  readonly revision: 'newsletter-v1';
+}
+
+export interface MemberNewsletterPreference extends MemberNewsletterPreferenceInput {
+  readonly updatedAt: string;
 }
 
 export interface MemberAppAuthCode {
@@ -83,7 +96,12 @@ export interface MemberStore {
   consumeAppAuthCode?(code: string, state: string, codeVerifier: string, now?: string): MemberAppAuthCode | null;
   pruneExpiredAppAuthCodes?(now?: string): number;
   validateCode(code: string, kind?: 'referral' | 'event', now?: string): MemberCodeValidation;
-  register(identity: GoogleMemberIdentity, intent: MemberSignupIntent, now?: string): MemberRegistration;
+  register(identity: GoogleMemberIdentity, intent: MemberSignupIntent, now?: string, issueInitialKey?: boolean): MemberRegistration;
+  publicIdForMember(memberId: string): string | null;
+  memberForPublicId(publicId: string): string | null;
+  handleForMember(memberId: string): string | null;
+  memberForHandle(handle: string): string | null;
+  claimHandle(memberId: string, handle: string): string;
   createMemberKey(memberId: string, name: string, now?: string, deliver?: (issued: IssuedMemberKey) => void): IssuedMemberKey;
   listMemberKeys(memberId: string): MemberKeyInfo[];
   revokeMemberKey(memberId: string, keyId: string, now?: string): boolean;
@@ -94,11 +112,15 @@ export interface MemberStore {
   listMemberAccessTokens(memberId: string): Array<{ id: string; scopes: string[]; expiresAt: string; createdAt: string }>;
   revokeMemberAccessToken(memberId: string, tokenId: string, now?: string): boolean;
   memberForGoogleSub(sub: string): MemberProfile | null;
+  newsletterPreference(memberId: string): MemberNewsletterPreference | null;
+  setNewsletterPreference(memberId: string, preference: MemberNewsletterPreferenceInput, now?: string): MemberNewsletterPreference | null;
+  newsletterOptInCount(): number;
   memberPlanForMember(memberId: string): MemberPlanEntitlements | null;
   provisionPlan(input: { readonly plan: string; readonly entitlements: Readonly<Record<string, unknown>> }): void;
   assignPlan(memberId: string, plan: string): boolean;
   appSlotForMember(memberId: string): MemberAppSlot | null;
   createAppSlotForMember(memberId: string, now?: string): MemberAppSlotCreation;
+  ensureNativeAppSlotForMember(memberId: string, now?: string): MemberAppSlot | null;
   createSession(memberId: string, now?: string): { token: string; expiresAt: string };
   memberForSession(token: string, now?: string): MemberProfile | null;
   reserveEventTry(memberId: string, eventCode: string, maxAttempts: number, now?: string): string | null;
@@ -109,6 +131,9 @@ export interface MemberStore {
 }
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
+function validNewsletterPreference(value: MemberNewsletterPreferenceInput): boolean {
+  return (value.choice === 'opted_in' || value.choice === 'declined') && value.revision === 'newsletter-v1';
+}
 // Source: KCB try execution is deadline-capped; this lease permits process recovery after a crash.
 const MEMBER_TRY_RESERVATION_TTL_MS = 2 * 60_000;
 const EVENT_START = '2026-11-13T15:00:00.000Z'; // 2026-11-14 00:00 Asia/Seoul
@@ -121,6 +146,12 @@ const APP_AUTH_CODE_VALUE = /^[A-Za-z0-9_-]{32,128}$/;
 const APP_AUTH_CODE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
 const APP_AUTH_CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 export const KAIST_APP_TEMPLATE_SLUG = 'next-app-lecture-scrap';
+
+/** Accept the advertised KCB1114 spellings while preserving every other event code. */
+function normalizeEventCode(code: string): string {
+  const folded = code.replace(/[\s_-]/g, '').toUpperCase();
+  return folded === 'KCB1114' ? 'KCB1114' : code.trim().toUpperCase();
+}
 
 function hash(value: string): string { return createHash('sha256').update(value).digest('hex'); }
 function iso(value: string | number | Date): string { return new Date(value).toISOString(); }
@@ -164,6 +195,15 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       name TEXT NOT NULL, referral_code TEXT NOT NULL UNIQUE, invited_by TEXT REFERENCES members(id),
       event_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS member_public_ids (
+      member_id TEXT PRIMARY KEY REFERENCES members(id), public_id TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS member_handles (
+      member_id TEXT PRIMARY KEY REFERENCES members(id), handle TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      CHECK(length(handle) BETWEEN 3 AND 30 AND handle GLOB '[a-z]*'
+        AND handle NOT GLOB '*[^a-z0-9_]*'
+        AND handle NOT GLOB 'em_*' AND handle NOT GLOB 'emk_*' AND handle NOT GLOB 'emt_*')
+    );
     CREATE TABLE IF NOT EXISTS member_referral_codes (
       code TEXT PRIMARY KEY COLLATE BINARY, member_id TEXT NOT NULL REFERENCES members(id),
       created_at TEXT NOT NULL, revoked_at TEXT
@@ -185,6 +225,12 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     CREATE TABLE IF NOT EXISTS member_consents (
       member_id TEXT NOT NULL REFERENCES members(id), policy TEXT NOT NULL, revision TEXT NOT NULL,
       accepted_at TEXT NOT NULL, PRIMARY KEY (member_id, policy, revision)
+    );
+    CREATE TABLE IF NOT EXISTS member_newsletter_preferences (
+      member_id TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+      choice TEXT NOT NULL CHECK(choice IN ('opted_in', 'declined')),
+      revision TEXT NOT NULL CHECK(revision = 'newsletter-v1'),
+      updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS member_event_codes (
       code TEXT PRIMARY KEY COLLATE NOCASE, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
@@ -314,6 +360,13 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     WHERE plan = 'free' AND json_type(entitlements_json, '$."relay.connect"') IS NULL`).run();
   db.query(`INSERT OR IGNORE INTO member_plan_assignments (member_id, plan)
     SELECT id, 'free' FROM members`).run();
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const missingIds = db.query(`SELECT id FROM members WHERE id NOT IN (SELECT member_id FROM member_public_ids)`).all() as Array<{ id: string }>;
+    for (const { id } of missingIds) db.query('INSERT INTO member_public_ids (member_id, public_id) VALUES (?, ?)')
+      .run(id, `em_${randomBytes(16).toString('base64url')}`);
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
   const nowMs = options.now ?? Date.now;
   let closed = false;
   const assertOpen = () => { if (closed) throw new Error('member store is closed'); };
@@ -401,15 +454,28 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       if (referral) return { valid: true, kind: 'referral', referredReward: 'none' };
       if (kind === 'referral') return { valid: false, reason: 'invalid' };
     }
-    const normalized = exact.toUpperCase();
-    const event = db.query('SELECT starts_at, ends_at, max_uses FROM member_event_codes WHERE code = ? COLLATE NOCASE').get(normalized) as { starts_at: string; ends_at: string; max_uses: number } | null;
+    const eventCode = normalizeEventCode(code);
+    const event = db.query('SELECT starts_at, ends_at, max_uses FROM member_event_codes WHERE code = ? COLLATE NOCASE').get(eventCode) as { starts_at: string; ends_at: string; max_uses: number } | null;
     if (event) {
       if (at < event.starts_at || at >= event.ends_at) return { valid: false, reason: 'inactive' };
-      const uses = db.query('SELECT COUNT(*) AS count FROM member_event_uses WHERE code = ? COLLATE NOCASE').get(normalized) as { count: number };
+      const uses = db.query('SELECT COUNT(*) AS count FROM member_event_uses WHERE code = ? COLLATE NOCASE').get(eventCode) as { count: number };
       if (Number(uses.count) >= Number(event.max_uses)) return { valid: false, reason: 'exhausted' };
       return { valid: true, kind: 'event', referredReward: null, benefit: 'non-monetary', finalizesAt: iso(Date.parse(at) + EVENT_FINALIZATION_MS) };
     }
     return { valid: false, reason: 'invalid' };
+  }
+
+  function memberForPublicId(publicId: string): string | null {
+    if (!/^[A-Za-z0-9_-]{3,80}$/.test(publicId)) return null;
+    const current = db.query('SELECT member_id FROM member_public_ids WHERE public_id = ? COLLATE BINARY')
+      .get(publicId) as { member_id: string } | null;
+    return current?.member_id ?? null;
+  }
+
+  function memberForHandle(handle: string): string | null {
+    if (!/^[a-z][a-z0-9_]{2,29}$/.test(handle)) return null;
+    return (db.query('SELECT member_id FROM member_handles WHERE handle = ? COLLATE BINARY')
+      .get(handle) as { member_id: string } | null)?.member_id ?? null;
   }
 
   return {
@@ -450,7 +516,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       if (!startsAt || !endsAt || startsAt >= endsAt) throw new Error('invalid event code configuration');
       db.query(`INSERT INTO member_event_codes (code, starts_at, ends_at, max_uses, benefit_kind)
         VALUES (?, ?, ?, ?, 'non-monetary') ON CONFLICT(code) DO UPDATE SET
-        starts_at = excluded.starts_at, ends_at = excluded.ends_at, max_uses = excluded.max_uses`).run(input.code.trim().toUpperCase(), startsAt, endsAt, input.maxUses);
+        starts_at = excluded.starts_at, ends_at = excluded.ends_at, max_uses = excluded.max_uses`).run(normalizeEventCode(input.code), startsAt, endsAt, input.maxUses);
     },
     recordSignupStart(networkKey, at, windowStartsAt, limit) {
       assertOpen();
@@ -520,9 +586,10 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     },
     pruneExpiredAppAuthCodes(at = iso(nowMs())) { assertOpen(); return pruneExpiredAppAuthCodes(at); },
     validateCode: validate,
-    register(identity, intent, at = iso(nowMs())) {
+    register(identity, intent, at = iso(nowMs()), issueInitialKey = true) {
       assertOpen();
       if (!identity.sub || !identity.email || !identity.name || identity.emailVerified !== true) throw new Error('verified Google identity required');
+      if (intent.newsletterPreference && !validNewsletterPreference(intent.newsletterPreference)) throw new Error('invalid newsletter preference');
       const consents = Object.entries(intent.consents);
       if (!consents.some(([policy, revision]) => policy === 'privacy' && revision.trim())
         || !consents.some(([policy, revision]) => policy === 'terms' && revision.trim())) throw new Error('privacy and terms consent required');
@@ -533,10 +600,10 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         let initialKey: IssuedMemberKey | undefined;
         if (existing) {
           const memberId = String(existing.id);
-          if (intent.referralCode) throw new Error('existing member cannot accept another referral');
+          if (intent.referralCode || intent.referrerMemberId || intent.legacyPublicId) throw new Error('existing member cannot accept another referral');
           let eventCode = existing.event_code == null ? null : String(existing.event_code);
           if (intent.eventCode) {
-            const requestedCode = intent.eventCode.trim().toUpperCase();
+            const requestedCode = normalizeEventCode(intent.eventCode);
             if (eventCode && eventCode !== requestedCode) throw new Error('member already used a different event code');
             if (!eventCode) {
               const validation = validate(requestedCode, 'event', at);
@@ -552,6 +619,16 @@ export function createMemberStore(options: { readonly path?: string; readonly no
           if (eventCode) insertAppSlot(memberId, at);
         } else {
           let inviter: string | null = null;
+          if ([intent.referrerMemberId, intent.legacyPublicId, intent.referralCode].filter(Boolean).length > 1)
+            throw new Error('ambiguous referral');
+          if (intent.referrerMemberId) {
+            inviter = memberForHandle(intent.referrerMemberId);
+            if (!inviter) throw new Error('invalid member ID');
+          }
+          if (intent.legacyPublicId) {
+            inviter = memberForPublicId(intent.legacyPublicId);
+            if (!inviter) throw new Error('invalid legacy member ID');
+          }
           if (intent.referralCode) {
             const referral = validate(intent.referralCode, 'referral', at);
             if (!referral.valid) throw new Error('invalid referral code');
@@ -562,17 +639,25 @@ export function createMemberStore(options: { readonly path?: string; readonly no
           if (intent.eventCode) {
             const event = validate(intent.eventCode, 'event', at);
             if (!event.valid) throw new Error(`event code ${event.reason}`);
-            eventCode = intent.eventCode.trim().toUpperCase();
+            eventCode = normalizeEventCode(intent.eventCode);
           }
           const id = randomUUID();
           let ownCode = referralCode();
           while (db.query('SELECT 1 FROM member_referral_codes WHERE code = ? COLLATE BINARY').get(ownCode)) ownCode = referralCode();
           db.query(`INSERT INTO members (id, google_sub, email, name, referral_code, invited_by, event_code, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, identity.sub, identity.email, identity.name, ownCode, inviter, eventCode, at, at);
+          db.query('INSERT INTO member_public_ids (member_id, public_id) VALUES (?, ?)')
+            .run(id, `em_${randomBytes(16).toString('base64url')}`);
           db.query('INSERT INTO member_referral_codes (code, member_id, created_at) VALUES (?, ?, ?)').run(ownCode, id, at);
-          if (inviter) db.query(`INSERT INTO member_referrals (invitee_id, inviter_id, code, event_code, invited_at)
-            VALUES (?, ?, ?, ?, ?)`).run(id, inviter, intent.referralCode!.trim(), eventCode, at);
-          initialKey = insertMemberKey(id, 'signup', at);
+          if (inviter) {
+            // Public links remain valid when legacy invitation codes are rotated or revoked.
+            const ledgerCode = intent.referrerMemberId || intent.legacyPublicId
+              ? (db.query('SELECT referral_code FROM members WHERE id = ?').get(inviter) as { referral_code: string }).referral_code
+              : intent.referralCode!.trim();
+            db.query(`INSERT INTO member_referrals (invitee_id, inviter_id, code, event_code, invited_at)
+              VALUES (?, ?, ?, ?, ?)`).run(id, inviter, ledgerCode, eventCode, at);
+          }
+          if (issueInitialKey) initialKey = insertMemberKey(id, 'signup', at);
           row = db.query('SELECT * FROM members WHERE id = ?').get(id) as Record<string, unknown>;
           db.query(`INSERT INTO member_plan_assignments (member_id, plan) VALUES (?, 'free')`).run(id);
           if (eventCode) {
@@ -585,9 +670,43 @@ export function createMemberStore(options: { readonly path?: string; readonly no
           db.query(`INSERT INTO member_consents (member_id, policy, revision, accepted_at) VALUES (?, ?, ?, ?)
             ON CONFLICT(member_id, policy, revision) DO NOTHING`).run(String(row.id), policy, revision, at);
         }
+        if (intent.newsletterPreference) {
+          db.query(`INSERT INTO member_newsletter_preferences (member_id, choice, revision, updated_at)
+            VALUES (?, ?, ?, ?) ON CONFLICT(member_id) DO UPDATE SET
+            choice = excluded.choice, revision = excluded.revision, updated_at = excluded.updated_at`)
+            .run(String(row.id), intent.newsletterPreference.choice, intent.newsletterPreference.revision, at);
+        }
         const session = insertSession(String(row.id), at);
         db.exec('COMMIT');
         return { ...profile(row), ...(initialKey ? { initialKey } : {}), session };
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    publicIdForMember(memberId) {
+      assertOpen();
+      const row = db.query('SELECT public_id FROM member_public_ids WHERE member_id = ?').get(memberId) as { public_id: string } | null;
+      return row?.public_id ?? null;
+    },
+    memberForPublicId(publicId) { assertOpen(); return memberForPublicId(publicId); },
+    handleForMember(memberId) {
+      assertOpen();
+      return (db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null)?.handle ?? null;
+    },
+    memberForHandle(handle) { assertOpen(); return memberForHandle(handle); },
+    claimHandle(memberId, requested) {
+      assertOpen();
+      const handle = requested;
+      if (!/^[a-z][a-z0-9_]{2,29}$/.test(handle)
+        || ['em_', 'emk_', 'emt_'].some(prefix => handle.startsWith(prefix))) throw new Error('invalid member ID');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (!db.query('SELECT 1 FROM members WHERE id = ?').get(memberId)) throw new Error('member not found');
+        const current = db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null;
+        if (current?.handle === handle) { db.exec('COMMIT'); return handle; }
+        if (current) throw new Error('member ID cannot be changed');
+        if (memberForHandle(handle)) throw new Error('member ID already taken');
+        db.query('INSERT INTO member_handles (member_id, handle) VALUES (?, ?)').run(memberId, handle);
+        db.exec('COMMIT');
+        return handle;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     },
     createMemberKey(memberId, name, at = iso(nowMs()), deliver) {
@@ -702,6 +821,27 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       const row = db.query('SELECT * FROM members WHERE google_sub = ?').get(sub) as Record<string, unknown> | null;
       return row ? profile(row) : null;
     },
+    newsletterPreference(memberId) {
+      assertOpen();
+      const row = db.query('SELECT choice, revision, updated_at FROM member_newsletter_preferences WHERE member_id = ?')
+        .get(memberId) as { choice: 'opted_in' | 'declined'; revision: 'newsletter-v1'; updated_at: string } | null;
+      return row ? { choice: row.choice, revision: row.revision, updatedAt: row.updated_at } : null;
+    },
+    setNewsletterPreference(memberId, preference, at = iso(nowMs())) {
+      assertOpen();
+      if (!validNewsletterPreference(preference)) throw new Error('invalid newsletter preference');
+      const updated = db.query(`INSERT INTO member_newsletter_preferences (member_id, choice, revision, updated_at)
+        SELECT id, ?, ?, ? FROM members WHERE id = ?
+        ON CONFLICT(member_id) DO UPDATE SET choice = excluded.choice, revision = excluded.revision, updated_at = excluded.updated_at`)
+        .run(preference.choice, preference.revision, at, memberId);
+      return Number(updated.changes) > 0 ? { ...preference, updatedAt: at } : null;
+    },
+    newsletterOptInCount() {
+      assertOpen();
+      const row = db.query("SELECT COUNT(*) AS count FROM member_newsletter_preferences WHERE choice = 'opted_in' AND revision = 'newsletter-v1'")
+        .get() as { count: number };
+      return Number(row.count);
+    },
     memberPlanForMember(memberId) {
       assertOpen();
       if (!memberId || memberId.length > 256) return null;
@@ -741,6 +881,19 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         const slot = insertAppSlot(memberId, at);
         db.exec('COMMIT');
         return { outcome: 'created', slot };
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    ensureNativeAppSlotForMember(memberId, at = iso(nowMs())) {
+      assertOpen();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const existing = readAppSlot(memberId);
+        if (existing) { db.exec('COMMIT'); return existing; }
+        const member = db.query('SELECT id FROM members WHERE id = ?').get(memberId);
+        if (!member) { db.exec('COMMIT'); return null; }
+        const slot = insertAppSlot(memberId, at);
+        db.exec('COMMIT');
+        return slot;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     },
     createSession(memberId, at = iso(nowMs())) {

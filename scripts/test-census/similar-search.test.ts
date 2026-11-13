@@ -94,22 +94,6 @@ let close: (() => void) | undefined;
 afterEach(() => { close?.(); close = undefined; });
 
 describe('test census similar-search adapters', () => {
-  test('BM25 finds lexical neighbors when test titles differ but share trigrams', async () => {
-    const adapter = await createCensusSearchAdapter([
-      { id: 'repository-query', file: 'scripts/scan.test.ts', name: 'repository default scan is clean and uses package.json devDependency keys',
-        assertions: 'default scan uses package metadata', targetSummary: 'package scan is clean' },
-      { id: 'repository-neighbor', file: 'scripts/defaults.test.ts', name: 'uses package.json devDependency keys when scanning clean repository defaults',
-        assertions: 'default scan uses package metadata', targetSummary: 'package scan is clean' },
-      { id: 'unrelated', file: 'src/ledger.test.ts', name: 'persists a transaction receipt after commit',
-        assertions: 'ledger transaction remains durable', targetSummary: 'receipt persists after commit' },
-    ], fakeEmbed);
-    close = adapter.close;
-
-    const result = await adapter.compare('repository-query');
-    expect(result.bm25).toContain('repository-neighbor');
-    expect(result.bm25).not.toContain('repository-query');
-  });
-
   test('BM25 overlap includes punctuation trigrams and normalizes both query and documents', () => {
     const punctuation = rankByTrigramFts('a-b', [
       { sessionId: 'punctuation-neighbor', content: 'a-b test case' },
@@ -144,7 +128,12 @@ describe('test census similar-search adapters', () => {
     expect(adapter.ontologyModuleIds).toContain('src/orphan');
     const result = await adapter.compare('auth-refresh-a');
 
+    // Retains the removed title-difference BM25 case on a non-identical fixture pair.
+    expect(cases[0]!.id).toBe('auth-refresh-a');
+    expect(cases[0]!.contractId).toBe(cases[1]!.contractId);
+    expect(cases[0]!.name).not.toBe(cases[1]!.name);
     expect(result.bm25).toContain('auth-refresh-b');
+    expect(result.bm25).not.toContain('auth-refresh-a');
     expect(result.bm25).toContain('receipt-write');
     expect(result.bm25.slice(0, 20)).toContain('auth-refresh-missing-ontology-edge');
     expect(result.bm25.slice(0, 20)).toContain('auth-refresh-zero-vector-score');
@@ -165,13 +154,6 @@ describe('test census similar-search adapters', () => {
     expect(missingRelationQuery.bm25VectorOntology).toEqual(['auth-refresh-b', 'auth-refresh-zero-vector-score']);
     expect(result.disagreements.ontologyOnly).not.toContain('receipt-write');
     expect(result.rrf).toContain('auth-refresh-b');
-    const limited = await adapter.compare('auth-refresh-a', 1);
-    const expectedScores = new Map<string, number>();
-    for (const ranking of [limited.bm25, limited.vector, limited.ontology]) {
-      ranking.slice(0, 1).forEach((id, rank) => expectedScores.set(id, (expectedScores.get(id) ?? 0) + 1 / (60 + rank + 1)));
-    }
-    const expectedRrf = [...expectedScores].sort((a, b) => b[1] - a[1]).map(([id]) => id);
-    expect(limited.rrf).toEqual(expectedRrf);
     const boundary = await adapter.compare('auth-refresh-a', 20);
     expect(boundary.vector).not.toContain('auth-refresh-a');
     expect(boundary.vector).toHaveLength(cases.length - 1);
@@ -195,10 +177,15 @@ describe('test census similar-search adapters', () => {
     ];
     const adapter = await createCensusSearchAdapter(crowdedCases, fakeEmbed);
     close = adapter.close;
+    // Retains the removed top-one RRF formula check while also checking each input cap.
     const comparison = await adapter.compare('auth-refresh-a', 1);
+    // 출처: #36760 — compare() returns the raw BM25 ranking and caps only fusion inputs; this fixture has multiple lexical neighbors.
+    expect(comparison.bm25.length).toBeGreaterThan(1);
+    const fusionInputs = [comparison.bm25, comparison.vector, comparison.ontology].map((ranking) => ranking.slice(0, 1));
+    expect(fusionInputs.every((ranking) => ranking.length === 1)).toBe(true);
     const expectedScores = new Map<string, number>();
-    for (const ranking of [comparison.bm25, comparison.vector, comparison.ontology]) {
-      ranking.slice(0, 1).forEach((id, rank) => expectedScores.set(id, (expectedScores.get(id) ?? 0) + 1 / (60 + rank + 1)));
+    for (const ranking of fusionInputs) {
+      ranking.forEach((id, rank) => expectedScores.set(id, (expectedScores.get(id) ?? 0) + 1 / (60 + rank + 1)));
     }
     const expectedRrf = [...expectedScores].sort((a, b) => b[1] - a[1]).map(([id]) => id);
     expect(comparison.rrf).toEqual(expectedRrf);

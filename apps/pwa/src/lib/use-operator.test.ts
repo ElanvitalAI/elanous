@@ -64,7 +64,7 @@ test('useOperator uses readOperator /v1/me and only accepts exact true', async (
   expect(await settle()).toBe(false);
 });
 
-test('SidebarNav gates operations separately from role/Labs and remembers group collapse', async () => {
+test('SidebarNav stays role-driven without an operator section and remembers group collapse', async () => {
   const stored = new Map<string, string>([[PWA_ROLE_KEY, 'general']]);
   const listeners = new Map<string, Set<(event: StorageEvent) => void>>();
   Object.defineProperty(globalThis, 'window', {
@@ -82,36 +82,38 @@ test('SidebarNav gates operations separately from role/Labs and remembers group 
       removeEventListener: (name: string, listener: (event: StorageEvent) => void) => { listeners.get(name)?.delete(listener); },
     },
   });
-  let operator = false;
+  // #35204 여섯 화면 다이어트 뒤 사이드바는 역할·기기 설정으로만 거른다 — 운영 문은 사이드바가 아니라
+  //  페이지 수준(/ops/release · live-run 자원 보기)과 운영자→오너 역할 기본값(operator-role)이 맡는다.
+  //  공급자 응답이 operator:true 여도 운영 칸이 사이드바로 돌아오면 이 시험이 잡는다(가짜 fetch 는 걸어둔다).
+  let operator = true;
   globalThis.fetch = (async () => ({ ok: true, json: async () => ({ operator }) } as Response)) as unknown as typeof fetch;
   await act(async () => { renderer = create(createElement(SidebarNav)); });
   const root = () => renderer!.root.findByType('nav');
+  const links = () => root().findAllByType('a').map((link) => link.props.href as string);
   expect(root().findAllByProps({ 'aria-label': '운영🔒' })).toHaveLength(0);
-  operator = true;
-  await act(async () => { for (const listener of listeners.get('storage') ?? []) listener({ key: null } as StorageEvent); });
-  expect(root().findAllByProps({ 'aria-label': '운영🔒' })).toHaveLength(1);
-  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/bots');
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/loops');
-  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/release');
-  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/checklist');
+  expect(links()).toEqual(expect.arrayContaining(['/chat', '/board', '/term', '/editor', '/settings']));
+  expect(links()).not.toContain('/vault'); // «자료» 는 오너 전용 — 역할 거름이 그대로 산다.
+  expect(links()).not.toContain('/loops'); // #35204: /loops 경로 자체가 물렀다(운영 창구는 /ops/release 직접 진입).
+  expect(links()).not.toContain('/bots');
+  expect(links()).not.toContain('/ceo');
+  expect(links()).not.toContain('/exec');
+  expect(links()).not.toContain('/ops/release');
+  expect(links()).not.toContain('/ops/checklist');
   // NAV1b: a group with one visible item renders that item alone (no group header) — «대화» here has only /chat.
   expect(root().findAllByType('button').filter((button) => button.props['aria-controls'] === 'nav-group-talk')).toHaveLength(0);
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/chat');
-  const ops = root().findAllByType('button').find((button) => button.props['aria-controls'] === 'nav-group-ops')!;
-  expect(ops.props['aria-expanded']).toBe(true);
-  await act(async () => { ops.props.onClick(); });
-  expect(stored.get('elanous.nav.collapsedGroups')).toContain('ops');
-  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/checklist');
+  // «만들기» 는 보이는 항목이 둘(터미널·그래프)이라 머리 단추가 있다 — 접었다 펴도 기억한다(elanous.nav.collapsedGroups).
+  const make = root().findAllByType('button').find((button) => button.props['aria-controls'] === 'nav-group-make')!;
+  expect(make.props['aria-expanded']).toBe(true);
+  await act(async () => { make.props.onClick(); });
+  expect(stored.get('elanous.nav.collapsedGroups')).toContain('make');
+  expect(links()).not.toContain('/term');
   await act(async () => { renderer!.unmount(); renderer = create(createElement(SidebarNav)); });
-  expect(root().findAllByType('button').find((button) => button.props['aria-controls'] === 'nav-group-ops')!.props['aria-expanded']).toBe(false);
-  await act(async () => { const o = root().findAllByType('button').find((button) => button.props['aria-controls'] === 'nav-group-ops')!; o.props.onClick(); });
+  expect(root().findAllByType('button').find((button) => button.props['aria-controls'] === 'nav-group-make')!.props['aria-expanded']).toBe(false);
+  await act(async () => { const m = root().findAllByType('button').find((button) => button.props['aria-controls'] === 'nav-group-make')!; m.props.onClick(); });
+  expect(links()).toContain('/term');
   await act(async () => { renderer!.unmount(); renderer = create(createElement(() => SidebarNav({ compact: true }))); });
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/chat');
-  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/exec');
-  // Retired ops screens are absent; the surviving ops destination is /loops.
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/loops');
-  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ceo');
-  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/checklist');
+  expect(links()).toContain('/chat');
+  expect(links()).not.toContain('/exec');
   operator = false;
   await act(async () => { for (const listener of listeners.get('storage') ?? []) listener({ key: null } as StorageEvent); });
   expect(root().findAllByProps({ 'aria-label': '운영🔒' })).toHaveLength(0);

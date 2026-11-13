@@ -1,0 +1,6 @@
+train-batch:
+  command: 'python3 "$ELANOUS_RUNTIME_ROOT/scripts/train/graph-node.py"'
+  timeout_ms: 14400000
+train-manager:
+  command: 'python3 "$ELANOUS_RUNTIME_ROOT/scripts/train/manager-node.py"'
+  timeout_ms: 600000

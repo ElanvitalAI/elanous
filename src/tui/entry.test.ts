@@ -15,6 +15,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Terminal } from '@xterm/headless';
 import { debug } from '../debug/log.js';
 import { writeCliStderr } from '../git-fs/cli-stderr.js';
 import {
@@ -39,7 +40,7 @@ import {
   defaultControlSignalBus,
   type ControlSignal,
 } from '../input/control-signal.js';
-import { removePtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestSession, upsertPtyManifest } from '../pty-shell/pty-manifest.js';
+import { listPtyManifestRows, removePtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestSession, upsertPtyManifest } from '../pty-shell/pty-manifest.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import { appendSimWorldWatchEvents } from '../ux-sim/world-watch.js';
@@ -105,6 +106,8 @@ function replayPaintWrites(writes: readonly string[]): string[] {
 }
 const turnAbortSignals: AbortSignal[] = [];
 let duringTurnHook: ((signal: AbortSignal) => void | Promise<void>) | null = null;
+let mockChildStatus: string | null = null;
+let mockCompactStatus: string | null = null;
 type ShellActivityEvent =
   | { phase: 'start'; id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }
   | { phase: 'finish'; id: string; name: 'Bash' | 'RunShell' }
@@ -162,7 +165,10 @@ beforeEach(() => {
 
 mock.module('../tui.js', () => ({
   initTui: () => {},
+  initTuiPrimary: () => {},
   closeTui: () => {},
+  setTuiAltScreen: () => {},
+  setTuiMouseCapture: () => {},
   injectKey: () => {},
   readKey: () => {
     const key = keys.shift();
@@ -193,9 +199,9 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
     _cli: unknown,
     _writePrompt: unknown,
     onDelta?: (delta: string) => void,
-    _onCompact?: { onMessageBlock?: (block: MessageBlock) => void },
+    _onCompact?: { onMessageBlock?: (block: MessageBlock) => void; onCompact?: (outcome: { status: string }) => void },
     _attachments?: unknown,
-    _onStatus?: unknown,
+    _onStatus?: (text: string) => void,
     _onAgent?: (event: import('./core/agents.js').AgentDisplayEvent) => void,
     onShellActivity?: (event: ShellActivityEvent) => void,
     onToolActivity?: (event: import('../tui-client/local-chat-turn.js').LocalChatToolActivity) => void,
@@ -211,6 +217,8 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
     const tier = resolveLlmTier(undefined, 'openai-codex', { sessionId });
     turnTiersSeen.push({ tier: tier.tier, source: tier.source });
     onDelta?.('첫 응답 델타');
+    if (mockChildStatus) _onStatus?.(mockChildStatus);
+    if (mockCompactStatus) _onCompact?.onCompact?.({ status: mockCompactStatus });
     for (const block of messageBlocksForTurn) _onCompact?.onMessageBlock?.(block);
     messageBlocksForTurn = [];
     await duringTurnHook?.(signal);
@@ -357,6 +365,8 @@ afterEach(() => {
   committedPushNowIds.length = 0;
   requestedPushNowIds.length = 0;
   duringTurnHook = null;
+  mockChildStatus = null;
+  mockCompactStatus = null;
   mockLocalChatTurnResult = undefined;
   mockLocalChatTurnError = undefined;
   mockBackgroundLine = null;
@@ -423,6 +433,56 @@ test('compact first screen keeps welcome state, model and background graph statu
     expect(screen).toContain('🧠 test-model');
     expect(screen).toContain(mockBackgroundLine);
     expect(screen).not.toContain('NaN;');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('open sidetab first paint preserves the primary viewport before clearing', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 40, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 8, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  keys.push({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'open', compactHeight: 8 });
+    const flush = `\x1b[?25l\x1b[8;1H${'\r\n'.repeat(8)}`;
+    const clear = '\x1b[H\x1b[2J';
+    expect(transcript.join('')).toContain(flush);
+    expect(transcript.join('')).toContain(clear);
+    expect(transcript.findIndex((chunk) => chunk.includes(flush)) < transcript.findIndex((chunk) => chunk.includes(clear))).toBe(true);
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('first-paint boundary matrix: compact sidetab reopen repaints rows overwritten by chat', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 40, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 8, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  keys.push(
+    { name: '\\', ctrl: true, shift: false, raw: '\x1c' },
+    { name: 'x', ctrl: false, shift: false, raw: 'x' },
+    { name: '\\', ctrl: true, shift: false, raw: '\x1c' },
+    { name: 'x', ctrl: false, shift: false, raw: 'x' },
+    { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+  );
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'open', compactHeight: 8 });
+    const terminal = new Terminal({ cols: 40, rows: 8, scrollback: 200, allowProposedApi: true });
+    try {
+      await new Promise<void>((done) => terminal.write(transcript.join(''), done));
+      const screen = Array.from({ length: terminal.rows }, (_, row) =>
+        terminal.buffer.active.getLine(terminal.buffer.active.viewportY + row)?.translateToString(true) ?? '');
+      expect(screen.join('\n')).toContain('Sessions · 0');
+    } finally { terminal.dispose(); }
   } finally {
     process.stdout.write = output;
   }
@@ -499,13 +559,13 @@ test('narrow live status stays visible while the attachment page hint is active'
   }
 });
 
-test('failed turn shows the recovery card through the real Next TUI entry path', async () => {
+test('unrelated provider error containing Codex auth words stays generic on screen and resume', async () => {
   Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
   Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
   const session = createSession({ source: 'tui' });
   setActiveSessionId(session.id);
-  mockLocalChatTurnError = 'provider unavailable';
+  mockLocalChatTurnError = 'unrelated provider: Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.';
   keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
   keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
   submittedInputs.push('test failed turn');
@@ -514,16 +574,23 @@ test('failed turn shows the recovery card through the real Next TUI entry path',
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const screen = transcript.join('');
-    expect(screen).toContain('✘ 응답 실패 · provider unavailable');
+    expect(screen).toContain('요청을 처리하지 못했습니다.');
+    expect(screen).not.toContain('Codex 인증이 준비되지 않았습니다');
     expect(screen).toContain('↑ 이전 입력 후 Enter');
-    expect(screen).toContain('제공자 변경: /provider');
-    expect(screen).toContain('이어가기: /resume');
+    expect(loadSession(session.id)?.messages.some((message) => message.replyFailure === true)).toBe(true);
+    transcript.length = 0;
+    mockLocalChatTurnError = undefined;
+    keys.push({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    const resumed = transcript.join('');
+    expect(resumed).toContain('요청을 처리하지 못했습니다.');
+    expect(resumed).not.toContain('Codex 인증이 준비되지 않았습니다');
   } finally {
     process.stdout.write = output;
   }
 });
 
-test('partial reply followed by stream disconnect shows the recovery card through the real Next TUI entry path', async () => {
+test('partial raw reply and stream disconnect do not expose the delta or error through Next TUI', async () => {
   Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
   Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
@@ -539,14 +606,139 @@ test('partial reply followed by stream disconnect shows the recovery card throug
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const screen = transcript.join('');
     expect(turnTextsSeen).toContain('test interrupted stream');
-    expect(screen).toContain('첫 응답 델타');
-    expect(screen).toContain('✘ 응답 실패 · stream disconnected after partial reply');
-    expect(screen).toContain('재시도: ↑ 이전 입력 후 Enter');
-    expect(screen).toContain('제공자 변경: /provider');
-    expect(screen).toContain('이어가기: /resume');
+    expect(screen).toContain('응답을 준비하고 있습니다.');
+    expect(screen).toContain('요청을 처리하지 못했습니다.');
+    expect(screen).not.toContain('첫 응답 델타');
+    expect(screen).not.toContain('stream disconnected after partial reply');
   } finally {
     process.stdout.write = output;
   }
+});
+
+test('Next TUI status frames cannot expose child diagnostics on the basic screen', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  mockChildStatus = 'tool failed: token=secret-output';
+  mockCompactStatus = 'compacted: token=secret-compact';
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('test status boundary');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    const screen = transcript.join('');
+    expect(screen).not.toContain('secret-output');
+    expect(screen).not.toContain('secret-compact');
+    expect(screen).not.toContain('tool failed');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('compact Next TUI projects shell and tool activity without internal names', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  // 출처: 위 status-frame 회귀와 같은 80×18 compact 화면 fixture.
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  appendMessage(session.id, { role: 'user', content: 'test activity boundary', ts: new Date().toISOString() });
+  duringTurnHook = () => {
+    shellActivityHandler?.({ phase: 'start', id: 'shell', name: 'Bash', startedAtMonotonicMs: performance.now() });
+    shellActivityHandler?.({ phase: 'finish', id: 'shell', name: 'Bash' });
+    toolActivityHandler?.({ phase: 'start', id: 'private', name: 'PRIVATE-tool-diagnostic' });
+    agentEventHandler?.({ phase: 'start', id: 'child-private', description: 'PRIVATE-agent-command' });
+    toolActivityHandler?.({ phase: 'finish', id: 'private', name: 'PRIVATE-tool-diagnostic' });
+  };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('test activity boundary');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', compactHeight: 18 });
+    const screen = transcript.join('');
+    expect(screen).toContain('응답을 준비하고 있습니다.');
+    expect(screen).not.toContain('Bash 실행 중');
+    expect(screen).not.toContain('PRIVATE-tool-diagnostic');
+    expect(screen).not.toContain('PRIVATE-agent-command');
+    expect(screen).not.toContain('실행 중인 도구');
+    expect(screen).not.toContain('도구 실행');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('resumed Next TUI basic chat hides saved tool output and interim prose', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  appendMessage(session.id, { role: 'user', content: '질문', ts: '2026-11-12T00:00:00Z' });
+  appendMessage(session.id, { role: 'assistant', content: '내부 초안 PRIVATE', goalInterim: true, ts: '2026-11-12T00:00:01Z' });
+  appendMessage(session.id, { role: 'tool', content: 'stdout SECRET', toolName: 'Bash SECRET', toolResult: 'stdout SECRET', ts: '2026-11-12T00:00:02Z' });
+  appendMessage(session.id, { role: 'assistant', content: '    안전한 최종 답\n\t탭 들여쓰기\n\n```ts\nfunction answer() {\n    return 42;\n}\n```', replyFinal: true, ts: '2026-11-12T00:00:03Z' });
+  keys.push({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    const screen = transcript.join('');
+    expect(screen).toContain('안전한 최종 답');
+    expect(screen).toContain('    안전한 최종 답');
+    expect(screen).toContain('      탭 들여쓰기');
+    expect(screen).toContain('    return 42;');
+    expect(screen).not.toContain('stdout SECRET');
+    expect(screen).not.toContain('Bash SECRET');
+    expect(screen).not.toContain('내부 초안 PRIVATE');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('resumed Next TUI restores the last legacy answer without a replyFinal field', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  appendMessage(session.id, { role: 'user', content: '첫 질문', ts: '2026-11-12T00:00:00Z' });
+  appendMessage(session.id, { role: 'assistant', content: 'LEGACY_FINAL_ANSWER', ts: '2026-11-12T00:00:01Z' });
+  keys.push({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(transcript.join('')).toContain('LEGACY_FINAL_ANSWER');
+    expect(transcript.join('')).toContain('완료 여부 확인 안 됨');
+  } finally { process.stdout.write = output; }
+});
+
+test('resumed Next display keeps an action-shaped list inside an unclosed tilde fence', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  appendMessage(session.id, { role: 'user', content: '코드', ts: '2026-11-12T00:00:00Z' });
+  appendMessage(session.id, { role: 'assistant',
+    content: '설명\n\n~~~text\n코드\n\n할 일:\n- 비밀 목록',
+    replyFinal: true, ts: '2026-11-12T00:00:01Z' });
+  keys.push({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    const screen = transcript.join('');
+    expect(screen).toContain('할 일:');
+    expect(screen).toContain('- 비밀 목록');
+    expect(screen).not.toContain('할 일: 비밀 목록');
+  } finally { process.stdout.write = output; }
 });
 
 test('failed turn retry restores the prompt through the real composer in showNextTui', async () => {
@@ -761,7 +953,7 @@ test('empty Enter keeps the queued turn while a non-shell tool is running', asyn
     mockToolSnapshot = [{ id: 'read-1', name: 'Read' }];
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
-    for (let tries = 0; tries < 100 && !transcript.join('').includes('실행 중인 도구 Read 뒤에 대기 입력 전송'); tries++) await Bun.sleep(10);
+    for (let tries = 0; tries < 100 && !transcript.join('').includes('작업 중 · 완료 뒤 대기 입력 전송'); tries++) await Bun.sleep(10);
     interruptedDuringTool = signal.aborted;
     toolActivityHandler?.({ phase: 'finish', id: 'read-1', name: 'Read' });
     enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
@@ -773,7 +965,8 @@ test('empty Enter keeps the queued turn while a non-shell tool is running', asyn
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(interruptedDuringTool as boolean | null).toBe(false);
-    expect(transcript.join('')).toMatch(/턴 도구 실행 .*대기 1 · 배경 0/);
+    expect(transcript.join('')).toMatch(/턴 작업 중 .*대기 1 · 배경 0/);
+    expect(transcript.join('')).not.toContain('실행 중인 도구 Read');
   } finally {
     process.stdout.write = output;
   }
@@ -894,6 +1087,7 @@ test('late AgentOutput changes the settled child group from running to completed
         ts: new Date().toISOString(),
       });
       backgroundStatusHandler?.(null);
+      enqueueReadKey({ name: 'pageup', ctrl: false, shift: false, raw: '\x1b[5~' });
       enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
     }, 30);
   };
@@ -911,7 +1105,7 @@ test('late AgentOutput changes the settled child group from running to completed
   }
 }, 10_000);
 
-test('child-agent noise collapses to one status card without duplicate MessageBlock output', async () => {
+test('basic chat hides child-agent traces and MessageBlock output', async () => {
   Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
   Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
@@ -951,9 +1145,9 @@ test('child-agent noise collapses to one status card without duplicate MessageBl
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const frame = transcript.at(-1) ?? '';
-    expect(frame.match(/하위 에이전트/g)?.length).toBe(1);
-    expect(frame).toContain('완료 3');
-    expect(frame.match(/child answer one/g)?.length).toBe(1);
+    expect(frame).not.toContain('하위 에이전트');
+    expect(frame).not.toContain('Agent(child');
+    expect(frame).not.toContain('child answer one');
     expect(frame).not.toContain('internal poll');
     expect(frame).not.toContain('AgentOutput');
     expect(frame).not.toContain('private goal text');
@@ -1066,6 +1260,43 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       expect(turnsSeen).toEqual([]);
     } finally {
       process.stdout.write = output;
+    }
+  }, 10_000);
+
+  test('right click on an operating sidetab row opens its menu and cancel leaves the row running', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const session = createSession({ source: 'tui' });
+    setActiveSessionId(session.id);
+    const now = Date.now();
+    upsertPtyManifest({ id: 'agent:menu-target', kind: 'agent', cmd: 'agent', nickname: 'MENU_TARGET',
+      purpose: `next-tui-sidetab:${session.id}`,
+      startedAt: now, now, ptyPid: 81031 });
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    try {
+      keys.push(
+        { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+        { name: 'mouse', ctrl: false, shift: false, raw: '', mouse: { type: 'right-click', row: 4, col: 2 } },
+        { name: 'mouse', ctrl: false, shift: false, raw: '', mouse: { type: 'release', row: 4, col: 2 } },
+        { name: '', ctrl: false, shift: false },
+        { name: '3', ctrl: false, shift: false, raw: '3' },
+        { name: 'n', ctrl: false, shift: false, raw: 'n' },
+        { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+      );
+      submittedInputs.push('/side all');
+      await showNextTui({ resumeSessionId: session.id, sidetabMode: 'collapsed' });
+      const rendered = transcript.join('');
+      expect(rendered).toContain('Open here');
+      expect(rendered).toContain('Rename');
+      expect(rendered).toContain('Close');
+      expect(rendered).toContain('PTY 종료 확인');
+      expect(rendered).toContain('PTY 종료 취소');
+      expect(listPtyManifestRows().some((row) => row.id === 'agent:menu-target')).toBe(true);
+    } finally {
+      process.stdout.write = output;
+      removePtyManifest('agent:menu-target');
     }
   }, 10_000);
 
@@ -1233,7 +1464,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     const original = createSession({ source: 'tui' });
     const target = createSession({ source: 'tui' });
     setActiveSessionId(original.id);
-    appendMessage(target.id, { role: 'assistant', content: 'WORKSPACE_SWITCH_TARGET_MARKER', ts: new Date().toISOString() });
+    appendMessage(target.id, { role: 'assistant', content: 'WORKSPACE_SWITCH_TARGET_MARKER', replyFinal: true, ts: new Date().toISOString() });
     const now = Date.now();
     upsertPtyManifest({
       id: 'tui:81001', kind: 'tui', cmd: 'elanous', purpose: `next-tui-sidetab:${target.id}`,
@@ -1297,7 +1528,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     const original = createSession({ source: 'tui' });
     const target = createSession({ source: 'tui' });
     setActiveSessionId(original.id);
-    appendMessage(target.id, { role: 'assistant', content: 'NL_SWITCH_TARGET_MARKER', ts: new Date().toISOString() });
+    appendMessage(target.id, { role: 'assistant', content: 'NL_SWITCH_TARGET_MARKER', replyFinal: true, ts: new Date().toISOString() });
     const now = Date.now();
     upsertPtyManifest({
       id: 'tui:81000', kind: 'tui', cmd: 'elanous', purpose: `next-tui-sidetab:${target.id}`,
@@ -1372,7 +1603,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     expect(captured.filter((l) => l.data.key !== turnSessionKey).length).toBe(0); // 다른 세션 경계 0건
   }, 10_000);
 
-  test('Next TUI 중 git/gh stderr는 프롬프트를 덮지 않고 화면 오류 경로와 debug.log에 보존된다', async () => {
+  test.each([false, true])('Next TUI stderr stays in explicit log/debug and outside basic chat (detail=%s)', async (showLog) => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
     Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
@@ -1395,16 +1626,29 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       return debugWrite.call(debug, category, event, data);
     }) as typeof debug.log;
     const raw = Buffer.from('fatal: synthetic git failure\n');
-    duringTurnHook = () => writeCliStderr({ source: 'git', exitCode: 128, raw });
+    duringTurnHook = () => {
+      writeCliStderr({ source: 'git', exitCode: 128, raw });
+      process.stderr.write('PRIVATE runtime diagnostic\n');
+    };
     keys.push(
       { name: 'enter', ctrl: false, shift: false, raw: '\r' },
-      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
     );
+    keysAfterTurn = [
+      ...(showLog ? [{ name: 'pageup', ctrl: false, shift: false, raw: '\x1b[5~' }] : []),
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    ];
     submittedInputs.push('stderr 격리 확인');
     try {
       await showNextTui({ resumeSessionId: createSession().id });
       const rendered = transcript.join('');
-      expect(rendered).toContain('[git stderr · rc=128] fatal: synthetic git failure');
+      expect(rendered).not.toContain('요청을 처리하지 못했습니다.');
+      if (showLog) {
+        expect(rendered).toContain('[git stderr · rc=128] fatal: synthetic git failure');
+        expect(rendered).toContain('PRIVATE runtime diagnostic');
+      } else {
+        expect(rendered).not.toContain('synthetic git failure');
+        expect(rendered).not.toContain('PRIVATE runtime diagnostic');
+      }
       expect(replayPaintWrites(transcript).at(-1)).toContain('❯ ');
       expect(stderrWrites).toEqual([]);
       expect(cliStderrEvents).toHaveLength(1);

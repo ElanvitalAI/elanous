@@ -39,6 +39,14 @@ const LEGACY_PATTERNS: RegExp[] = [
 // intentional legacy references — recognise them via the option name.
 const INTENT_LEGACY_HINTS = ['legacyHomeRel', 'migrateLegacyHomeDir', 'migrateLegacyHomeFile'];
 
+function isLegacyConsumerLiteral(rel: string, line: string): boolean {
+  // Credential import reads this old dotenv file as a migration source, not
+  // as an active config root. Keep the exception limited to this exact read.
+  if (rel === 'src/setup/cred-import-scan.ts'
+    && line.trim() === "join(home, '.config', 'elanous', '.env'),") return false;
+  return LEGACY_PATTERNS.some((pattern) => pattern.test(line));
+}
+
 function* walkTs(dir: string, base: string): Iterable<{ rel: string; abs: string }> {
   for (const entry of readdirSync(dir)) {
     if (entry === 'node_modules' || entry === '.git') continue;
@@ -54,6 +62,16 @@ function* walkTs(dir: string, base: string): Iterable<{ rel: string; abs: string
 }
 
 describe('Phase 5 · consumer audit · grep guard', () => {
+  test('allows only the credential importer legacy dotenv source, retaining consumer guards', () => {
+    const importer = 'src/setup/cred-import-scan.ts';
+    const dotenv = "join(home, '.config', 'elanous', '.env'),";
+    expect(isLegacyConsumerLiteral(importer, dotenv)).toBe(false);
+    expect(isLegacyConsumerLiteral('src/other-consumer.ts', dotenv)).toBe(true);
+    for (const name of ['config.json', 'policy', 'budget']) {
+      expect(isLegacyConsumerLiteral(importer, `join(home, '.config', 'elanous', '${name}'),`)).toBe(true);
+    }
+  });
+
   test('scans production TypeScript but not test fixtures containing legacy paths', () => {
     const scanned = [...walkTs(SRC_ROOT, '')].map(({ rel }) => rel);
     expect(scanned).toContain('src/user-config.ts');
@@ -82,11 +100,8 @@ describe('Phase 5 · consumer audit · grep guard', () => {
         // (multi-line `migrateLegacyHomeFile({ legacyHomeRel: ... })`).
         const window = lines.slice(Math.max(0, i - 3), i + 1).join('\n');
         if (INTENT_LEGACY_HINTS.some((h) => window.includes(h))) continue;
-        for (const pat of LEGACY_PATTERNS) {
-          if (pat.test(line)) {
-            offenders.push(`${rel}: ${line.trim()}`);
-            break;
-          }
+        if (isLegacyConsumerLiteral(rel, line)) {
+          offenders.push(`${rel}: ${line.trim()}`);
         }
       }
     }

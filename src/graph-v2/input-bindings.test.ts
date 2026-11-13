@@ -21,6 +21,23 @@ test('Graph v2 capability input binding fails closed when a declared reference i
   expect(() => bindGraphV2NodeInput({ title: '$missing.result.title' }, {}, {})).toThrow('unbound graph output reference');
 });
 
+test('optional graph input attachment binding preserves supplied values and omits an absent value', () => {
+  const declared = { event: { cardId: '$input.suggestionId', attachments: '$input.attachments?' } };
+  const attachments = [{ kind: 'pdf', url: 'https://nexus.test/design.pdf' }];
+  expect(bindGraphV2NodeInput(declared, { suggestionId: 's-1', attachments }, {}))
+    .toEqual({ event: { cardId: 's-1', attachments } });
+  expect(bindGraphV2NodeInput(declared, { suggestionId: 's-1' }, {}))
+    .toEqual({ event: { cardId: 's-1' } });
+  const absent = bindGraphV2NodeInput({ missing: '$input.absent.nested?', explicit: undefined }, {}, {}) as Record<string, unknown>;
+  expect(Object.hasOwn(absent, 'missing')).toBe(false);
+  expect(Object.hasOwn(absent, 'explicit')).toBe(true);
+  expect(absent.explicit).toBeUndefined();
+  expect(() => bindGraphV2NodeInput('$input.__proto__?', {}, {}))
+    .toThrow('unbound graph input reference');
+  expect(() => bindGraphV2NodeInput('$input.missing.__proto__?', {}, {}))
+    .toThrow('unbound graph input reference');
+});
+
 test('Graph v2 store writes seal the resolved owner payload and reject another owner', () => {
   const declared = { type: 'store', op: 'upsert', collection: 'suggestions', owner: '$context.memberId',
     key: '$suggestion.id', value: '$suggestion', ownerScoped: true,

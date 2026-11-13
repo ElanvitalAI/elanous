@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-CHAOS-HQ-MOVE-WORLD-TS",
+  "path": "src/ux-sim/chaos-hq-move-world.ts",
+  "boundary": "Drives real HQ heartbeat, arbiter and lease fencing under virtual host/process faults; recovery is measured from durable TASK completions and rejected claims cannot emit stale-ACK success evidence.",
+  "deviceIds": [
+    "chaos-hq-move-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

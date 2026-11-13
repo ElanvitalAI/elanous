@@ -12,6 +12,7 @@ import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { getUserConfig } from '../user-config/reader.js';
 import type { HqConfig, HqFenceRole } from '../user-config/types.js';
 import { fenceOutcomeDir, recordFenceOutcome } from './fence-outcomes.js';
+import { decideHqPriorityCandidate, HQ_PRIORITY, type HqHostObservation, type HqPriorityHost } from './arbiter.contract.js';
 import { promoteHq, proposeHqPromotion, writeOpSeatRequest } from './promote.js';
 import type { HqOpRequestWriter, PromoteResult } from './promote.js';
 import {
@@ -78,6 +79,8 @@ export interface HqDeps {
   /** Injection points for the OP seat request and the promotion runbook; production uses durable defaults. */
   opRequest?: HqOpRequestWriter;
   promote?: (host: string, apply: boolean) => PromoteResult;
+  /** Inject dated host observations for a deterministic arbiter drill. Production probes each host. */
+  priorityObservations?: (now: number) => Partial<Record<HqPriorityHost, HqHostObservation>>;
 }
 
 interface Resolved { me: string; arbiter: string; standby: string; ttl: number; failOpen: Set<HqFenceRole>; store: LeaseStore; ssh: SshRunner; probe: HostProbe; localPath: string; seenPath: string; now: () => number; log: typeof debug.log }
@@ -350,18 +353,40 @@ export function hqArbiterCheck(deps: HqDeps & { leasePath?: string } = {}) {
   const r0 = resolve(deps);
   const r = deps.store ? r0 : { ...r0, store: fileLeaseStore(deps.leasePath ?? join(process.env.HOME ?? '', '.elanous-hq', 'lease.json')) };
   let outcome: { promoted: boolean; streak: number; holder?: string; generation?: number; ping?: boolean; health?: boolean; runbookFailed?: string } = { promoted: false, streak: 0 };
-  let proposal: { holder: string; generation: number; streak: number } | undefined;
+  let proposal: { holder: string; generation: number; streak: number; standby: string } | undefined;
   const config = deps.config ?? getUserConfig().hq ?? {};
   const threshold = config.autoPromote?.streak ?? 3;
   const autoPromote = config.autoPromote?.enabled === true;
   let leaseMoved: { from: string; to: string; generation: number } | undefined;
   const result = mutate(r, (record, now) => {
     if (!record) return { ok: false, reason: 'no lease' };
-    const seen = probeReachable(record.holder, r.probe);
-    const checked = decideArbiterCheck(record, { arbiter: r.me, standby: r.standby, arbiterReachesHolder: seen.reachable, now,
+    let seen: { reachable: boolean; ping?: boolean; health?: boolean };
+    // The existing two-host lease fixtures retain their configured standby. The three-host
+    // office policy applies only to a lease whose holder belongs to that office.
+    let standby = r.standby;
+    let eligible = true;
+    if (HQ_PRIORITY.includes(record.holder as HqPriorityHost)) {
+      const observations = deps.priorityObservations?.(now) ?? Object.fromEntries(
+        HQ_PRIORITY.map((host) => [host, { reachable: probeReachable(host, r.probe).reachable, at: now }]),
+      ) as Record<HqPriorityHost, HqHostObservation>;
+      const priority = decideHqPriorityCandidate({ now, observations });
+      const holderView = observations[record.holder as HqPriorityHost];
+      const holderReachable = holderView && Number.isFinite(holderView.at) && holderView.at <= now
+        && now - holderView.at <= 1500 && typeof holderView.reachable === 'boolean'
+        ? holderView.reachable : undefined;
+      // Promotion and candidate selection must use the same observation snapshot.
+      // An unknown holder is held, never counted as a failed probe.
+      seen = { reachable: holderReachable !== false };
+      eligible = holderReachable === false && priority.kind === 'candidate' && priority.host !== record.holder;
+      if (priority.kind === 'candidate') standby = priority.host;
+      try { r.log('hq.arbiter', 'priority-decision', { kind: priority.kind, holder: record.holder,
+        candidate: priority.kind === 'candidate' ? priority.host : null,
+        unknownHost: priority.kind === 'unknown' ? priority.host : null }); } catch { /* observation is fail-soft */ }
+    } else seen = probeReachable(record.holder, r.probe);
+    const checked = decideArbiterCheck(record, { arbiter: r.me, standby: eligible ? standby : record.holder, arbiterReachesHolder: seen.reachable, now,
       promote: autoPromote, promoteAfterChecks: threshold });
-    proposal = !autoPromote && !seen.reachable && record.holder !== r.standby && checked.streak >= threshold
-      ? { holder: record.holder, generation: record.generation, streak: checked.streak } : undefined;
+    proposal = !autoPromote && eligible && !seen.reachable && record.holder !== standby && checked.streak >= threshold
+      ? { holder: record.holder, generation: record.generation, streak: checked.streak, standby } : undefined;
     // promoteHq's own precondition is «lease holder = target», so the lease moves first and the runbook follows.
     if (checked.promoted) leaseMoved = { from: record.holder, to: checked.next.holder, generation: checked.next.generation };
     outcome = { promoted: false, streak: checked.streak, holder: checked.next.holder, generation: checked.next.generation, ping: seen.ping, health: seen.health };
@@ -388,9 +413,9 @@ export function hqArbiterCheck(deps: HqDeps & { leasePath?: string } = {}) {
       } catch (error) { try { r.log('hq.arbiter', 'promote-request-failed', { ...moved, error: String(error) }); } catch { /* fail-soft */ } }
     }
   }
-  const proposed = proposal as { holder: string; generation: number; streak: number } | undefined;
+  const proposed = proposal as { holder: string; generation: number; streak: number; standby: string } | undefined;
   if (result.ok && proposed) {
-    try { proposeHqPromotion({ ...proposed, standby: r.standby }, { request: deps.opRequest, log: r.log }); }
+    try { proposeHqPromotion(proposed, { request: deps.opRequest, log: r.log }); }
     catch (error) { try { r.log('hq.arbiter', 'promote-proposal-failed', { ...proposed, error: String(error) }); } catch { /* observation is fail-soft */ } }
   }
   observe(r, 'hq.lease', outcome.promoted ? 'promoted' : 'arbiter-check', { ...outcome, ok: result.ok });

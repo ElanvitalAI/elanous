@@ -427,7 +427,9 @@ export function hasScreenIntentWord(text: string): boolean {
 }
 
 export const BOTS_INTENT_WORDS = ['봇 목록', '봇들', '무슨 봇', 'bots'] as const;
-export const ROUTINES_INTENT_WORDS = ['루틴', '예약', '스케줄', 'routines'] as const;
+export const ROUTINES_INTENT_WORDS = ['루틴', 'routines'] as const;
+const ROUTINE_LIST_WORDS = ['목록', '리스트', '뭐', '보여', '알려', '조회', '상태', 'list'] as const;
+const ROUTINE_WRITE_WORDS = ['만들', '추가', '수정', '취소', '삭제', '변경', '등록', '개발', '구현', '앱', '프로그램', '코드'] as const;
 export const BOT_INTENT_WORDS = ['상태', '어때', 'status'] as const;
 
 /** Return whether a natural-language request needs the persona registry. */
@@ -456,7 +458,9 @@ export function matchBotsIntent(text: string): string | null {
 /** Translate a read-only routine-list request. */
 export function matchRoutinesIntent(text: string): string | null {
   const said = nonSlashIntentText(text);
-  return said !== null && hasIntentWord(said, ROUTINES_INTENT_WORDS) ? '/routines' : null;
+  if (said === null || !hasIntentWord(said, ROUTINES_INTENT_WORDS)) return null;
+  if (!hasIntentWord(said, ROUTINE_LIST_WORDS) || hasIntentWord(said, ROUTINE_WRITE_WORDS)) return null;
+  return '/routines';
 }
 
 /** Translate an unambiguous named-bot status request through the injected bot resolver. */

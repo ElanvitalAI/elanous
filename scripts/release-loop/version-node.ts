@@ -608,7 +608,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     }
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
     const output = landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId, branchCutBaseCommit);
-    const gateImagePrebuild = kind === 'release' && branchCut ? prebuildGateImage(output.commit) : undefined;
+    const gateImagePrebuild = kind === 'release' && (branchCut || cutCommit !== undefined) ? prebuildGateImage(output.commit) : undefined;
     return gateImagePrebuild ? { ...output, gateImagePrebuild } : output;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

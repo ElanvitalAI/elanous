@@ -38,7 +38,7 @@ export function compilePluginYaml(pluginDir: string): string {
   const source = readFileSync(yamlPath, 'utf8');
   const raw = record(parseYaml(source), 'plugin.yaml');
   if (raw.apiVersion !== 'elanous.dev/plugin/v2') throw new Error('plugin.yaml apiVersion must be elanous.dev/plugin/v2');
-  const allowedKeys = new Set(['apiVersion', 'id', 'name', 'version', 'description', 'graphs', 'capabilities', 'ext',
+  const allowedKeys = new Set(['apiVersion', 'id', 'name', 'version', 'description', 'graphs', 'graphProviders', 'capabilities', 'ext',
     'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers', 'dependencies']);
   const unknownKeys = Object.keys(raw).filter(key => !allowedKeys.has(key));
   if (unknownKeys.length) throw new Error(`plugin.yaml has unsupported keys: ${unknownKeys.join(', ')}`);
@@ -50,6 +50,20 @@ export function compilePluginYaml(pluginDir: string): string {
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error('plugin.yaml version is invalid');
   const graphAssets = strings(raw.graphs, 'plugin.yaml graphs');
   if (!graphAssets.length) throw new Error('plugin.yaml must declare at least one graph');
+  const graphProviders = raw.graphProviders === undefined ? {} : record(raw.graphProviders, 'plugin.yaml graphProviders');
+  for (const [graphAsset, value] of Object.entries(graphProviders)) {
+    const normalizedGraphAsset = graphAsset.replace(/^\.\//, '');
+    if (!graphAssets.some(asset => asset.replace(/^\.\//, '') === normalizedGraphAsset))
+      throw new Error(`plugin.yaml graphProviders references an undeclared graph: ${graphAsset}`);
+    const provider = record(value, `plugin.yaml graphProviders.${graphAsset}`);
+    if (typeof provider.module !== 'string' || typeof provider.factory !== 'string'
+      || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(provider.factory))
+      throw new Error(`plugin.yaml graphProviders.${graphAsset} requires module and factory`);
+    const moduleParts = provider.module.split('/');
+    if (!provider.module.startsWith('src/graph-runner/') || !provider.module.endsWith('.ts')
+      || moduleParts.some(part => !part || part === '.' || part === '..'))
+      throw new Error(`plugin.yaml graphProviders.${graphAsset}.module must be a shared graph-runner TypeScript module`);
+  }
   const contributes = raw.contributes === undefined ? {} : record(raw.contributes, 'plugin.yaml contributes');
   const skills = raw.skills === undefined ? [] : raw.skills;
   if (!Array.isArray(skills)) throw new Error('plugin.yaml skills must be an array');
@@ -133,6 +147,7 @@ export function compilePluginYaml(pluginDir: string): string {
     } } : {}),
     extensions: { 'ai.elanous': {
       graphs: graphAssets,
+      ...(Object.keys(graphProviders).length ? { graphProviders } : {}),
       graphManifests,
       capabilities: strings(raw.capabilities, 'plugin.yaml capabilities'),
       ...(raw.trust === undefined ? {} : { authoredTrust: raw.trust }),

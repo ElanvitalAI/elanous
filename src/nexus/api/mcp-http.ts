@@ -17,8 +17,10 @@ import { resolveToken, type TokenStorePaths } from '../../auth/token-store.js';
 import { tokenScopeAllows, type TokenScope } from '../../auth/scope.js';
 import { hasProxyMarker } from '../../boot/check-same-origin.js';
 import { debug } from '../../debug/log.js';
+import { getElanousConfigDir } from '../../elanous-config-dir.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
 import { handleMcpRequest } from '../../mcp/server.js';
+import { canonicalSeatId } from '../../msg/msg-store.js';
 import { listNativeToolsForHost, type NativeToolCatalogEntry } from '../../native-tool-catalog.js';
 import { getToolRuntime, listToolRuntimes } from '../../tool-runtime/registry.js';
 import type { ToolRuntime } from '../../tool-runtime/types.js';
@@ -92,10 +94,24 @@ function authorizeMcpHttpRequest(
   if (!credential) {
     return { allowed: false, reason: context.peerAddress ? 'missing_bearer' : 'missing_peer' };
   }
-  const token = resolveToken(credential, context.tokenStorePaths);
+  const token = resolveToken(credential, context.tokenStorePaths ?? { configDir: getElanousConfigDir() });
   if (!token) return { allowed: false, reason: 'invalid_token' };
   const scope = tokenScopeAllows(token, { method: 'POST', pathname: '/v1/mcp' });
   return scope.ok ? { allowed: true, scope: token.scope } : { allowed: false, reason: 'insufficient_scope' };
+}
+
+function boundMcpSeat(req: Request, scope: TokenScope): string | undefined {
+  // The daemon operator binds one seat. A caller-selected tool argument or
+  // public MCP token cannot select a mailbox.
+  if (scope !== 'admin' || !extractBearerCredential(req.headers.get('authorization'))) return undefined;
+  const seat = process.env.ELANOUS_SEAT_ID?.trim();
+  if (!seat) return undefined;
+  try {
+    const canonical = canonicalSeatId(seat);
+    return canonical === 'ALL' ? undefined : canonical;
+  } catch {
+    return undefined;
+  }
 }
 
 function unauthorizedMcpResponse(): Response {
@@ -285,7 +301,9 @@ export async function handleMcpHttpPost(
   };
 
   const progress = isProgressStreamOptIn(req, rpc, context);
-  const mcpContext = { surface: 'mcp' as const, origin: 'mcp-http' as const, tokenScope: access.scope };
+  const authenticatedSeat = boundMcpSeat(req, access.scope);
+  const mcpContext = { surface: 'mcp' as const, origin: 'mcp-http' as const, tokenScope: access.scope,
+    ...(authenticatedSeat ? { authenticatedSeat } : {}) };
   if (!isNotification && progress.stream) {
     logMcpResponseMode('sse', progress);
     return sseProgressResponse(async (send) => {

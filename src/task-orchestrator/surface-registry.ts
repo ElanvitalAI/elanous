@@ -47,6 +47,8 @@ export interface DispatchContext {
   /** Carry-over for LLM surfaces that need turn-kickoff model
    *  recommendation (PFC-S5). */
   readonly modelHint?: string;
+  /** Provider selected by the TOX budget gate for this task only. */
+  readonly providerName?: string;
   /** Free-form — tests + callers extend as needed. */
   readonly metadata?: Record<string, unknown>;
 }

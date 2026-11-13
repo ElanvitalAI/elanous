@@ -28,13 +28,30 @@ export interface MemberBoardCard {
   updatedAt?: string;
 }
 
-export interface BriefingTopic { title?: string; summary?: string; }
+export interface BriefingTopic { title?: string; summary?: string; scrapIds?: string[]; }
 export interface BriefingCard {
   id?: string;
   memberId: string;
   day?: string;
+  runId?: string;
+  sourceScrapIds?: string[];
   topics?: BriefingTopic[];
   todos?: Array<string | { text?: string }>;
+}
+
+/** Only a second, owner-scoped read can attest which sources belong to a listed briefing. */
+export function recheckedBriefing(listed: BriefingCard, detail: unknown, memberId: string): BriefingCard {
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return listed;
+  const row = detail as Partial<BriefingCard>;
+  if (!listed.id || row.id !== listed.id || row.memberId !== memberId || listed.memberId !== memberId
+    || row.day !== listed.day || (listed.runId && row.runId !== listed.runId)) return listed;
+  const sources = Array.isArray(row.topics)
+    ? row.topics.flatMap(topic => Array.isArray(topic?.scrapIds) ? topic.scrapIds : [])
+      .filter((id): id is string => typeof id === 'string' && !!id.trim())
+    : [];
+  if (!sources.length) return listed;
+  return { ...row, runId: listed.runId && row.runId === listed.runId ? row.runId : undefined,
+    sourceScrapIds: [...new Set(sources)] } as BriefingCard;
 }
 
 export const MINI_BOARD_COLUMNS: readonly { id: BoardColumn; label: string }[] = [

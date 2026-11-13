@@ -78,6 +78,8 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   }
   expect(catalog.devices.every((device) => device.entryCommands.length > 0 && ['yes', 'no', 'conditional', 'runner-dependent'].includes(device.logsRecorded))).toBe(true);
   const sourceModules = new Map(catalog.sourceModules.map((module) => [module.path, module]));
+  expect(sourceModules.get('src/ux-sim/tui-400-runtime-contract.ts')?.deviceIds).toContain('fault-injection');
+  expect(sourceModules.get('src/ux-sim/kcb-phone-rehearsal.ts')?.deviceIds).toContain('kcb-integrated-pwa-lap');
   const worldFiles = listSourceModuleFiles(join(REPO, 'src/ux-sim')).filter((path) => path.endsWith('-world.ts'));
   expect([...sourceModules.keys()].filter((path) => path.endsWith('-world.ts')).sort()).toEqual(worldFiles.sort());
   expect(sourceModules.get('src/ux-sim/smart-merge-world.ts')).toMatchObject({
@@ -396,10 +398,14 @@ test('candidate audit rejects duplicate paths, invalid dispositions, missing exc
   expect(() => parseMockScenarioCatalog(inconsistentExcludedPaths)).toThrow('counts do not match');
 });
 
-test('MS-01, MS-04, and MS-07 ask registered devices for independent and distinguishable failure verdicts', async () => {
+test('MS-01 asks its registered child-result device for report-deficit', () => {
   const child = renderPodChildResult(podChildResultScenario()).join('\n');
   expect(child).toContain('failure=report-deficit');
+});
 
+// Source: fault-pod-codex-503.test.ts gives its combined 503/401 production-retry simulation 40,000ms.
+// The fake HTTP boundary still runs real retry backoff; the catalog's default 5s was not its device budget.
+test('MS-04 distinguishes missing credentials, temporary overload and rejected credentials', async () => {
   const credential = simGlmNoCredential({ zaiKey: false, openrouterKey: false });
   expect(credential.result).toBe('refused');
   expect(credential.error).toBeTruthy();
@@ -412,7 +418,9 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
   expect(temporaryProviderFailure.forbiddenZaiAttempts).toBe(0);
   expect(credentialRejected.result).toBe('no-fallback');
   expect(credentialRejected.error).toMatch(/401/);
+}, 40_000);
 
+test('MS-07 distinguishes a full pool from a failed pool query', () => {
   const pool = simPoolCap({ spec: 'pool-node-b@node-b', running: { 'pool-node-b': 2 } });
   expect(pool.recommendation).toMatchObject({ recommended: 0, limitedBy: 'pool-cap' });
   const failedPoolQuery = simPoolCap({ spec: 'pool-node-b@node-b', running: {}, queryFailures: { 'pool-node-b': 'kubectl query failed' } });

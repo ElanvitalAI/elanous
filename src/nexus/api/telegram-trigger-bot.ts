@@ -48,6 +48,8 @@ export interface NexusTelegramTriggerBotOpts {
   /** Bot token (without `Bot ` prefix). Production reads
    *  the channel token resolved by the NEXUS caller. */
   token: string;
+  /** Isolated telegram-test runner only; production callers leave this unset. */
+  apiBase?: string;
   /** Allowlist of Telegram user ids — empty array refuses everyone
    *  (see `src/telegram.ts` allowedUsers gate). */
   allowedUsers: number[];
@@ -193,6 +195,7 @@ export function createNexusTelegramTriggerBot(
         telegramBotOpts: {
           token: opts.token,
           onTriggerTap,
+          ...(opts.apiBase ? { apiBase: opts.apiBase } : {}),
           ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
         },
       })
@@ -204,6 +207,7 @@ export function createNexusTelegramTriggerBot(
         onMessage: async () => undefined,
         log,
         onTriggerTap,
+        ...(opts.apiBase ? { apiBase: opts.apiBase } : {}),
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       }));
 

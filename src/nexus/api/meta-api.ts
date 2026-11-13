@@ -153,6 +153,8 @@ export interface MetaApiOpts {
    *  Never derive this result from request body, claimed source, or bearer possession alone.
    *  Without a verifier, prompt tool mutations remain unavailable. */
   resolveVerifiedOwner?: (req: Request, appSlug?: string) => ({ id: string } & Partial<VerifiedAppOwner> & { appSlug?: string }) | undefined;
+  /** Bound Nexus publisher; only dispatched after resolveVerifiedOwner succeeds. */
+  appDeployPublishHook?: import('../../agent/app-deploy-plugin.js').AppDeployPublishHook;
   /** Convenience for Tailscale-only / dogfood-loopback mode. */
   noAuth?: boolean;
   // ── PR k · runtime DI for the lifted endpoints ─────────────────
@@ -859,6 +861,7 @@ export async function handlePromptPost(
         ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
         ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
         ...((owner) => owner ? { verifiedOwner: { id: owner.memberId }, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
+        ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
         ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
         ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
         ...(projectContext?.cwd || opts.toolCwd ? { toolCwd: projectContext?.cwd ?? opts.toolCwd } : {}),
@@ -1225,6 +1228,7 @@ export async function handlePromptStreamPost(
                 ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
                 ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
                 ...((owner) => owner ? { verifiedOwner: { id: owner.memberId }, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
+                ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
                 ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
                 ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
                 ...(projectContext?.cwd || opts.toolCwd ? { toolCwd: projectContext?.cwd ?? opts.toolCwd } : {}),

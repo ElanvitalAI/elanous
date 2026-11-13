@@ -1,6 +1,6 @@
 import type { Command } from 'commander';
 import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { writeStdoutJson } from '../cli/stdout-json.js';
@@ -14,6 +14,7 @@ import { loadGraphPluginFromDir } from './graph-manifest-loader.js';
 import { watchGraphRunEvents } from './graph-run-event-ledger.js';
 import { saveGraphRunMsgSubscriber } from './graph-run-msg-subscriptions.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { KNOWN_ISSUE_ROUTE } from './release-known-issue-waiver.js';
 
 function findGraphFile(graphId: string, extraRoots: string[] = []): string | undefined {
   const roots = [...extraRoots.map((root) => resolve(root)), resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
@@ -42,9 +43,10 @@ async function defaultCapabilityRegistryForGraph(file: string) {
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions?: { 'ai.elanous'?: {
     graphs?: string[]; graphProviders?: Record<string, { module: string; factory: string; withPluginRoot?: boolean }> } } };
   const extension = manifest.extensions?.['ai.elanous'];
-  const relativeGraph = `./graphs/${basename(graphPath)}`;
-  if (!extension?.graphs?.includes(relativeGraph)) return createDefaultMarketDataRegistry();
-  const declaration = extension.graphProviders?.[relativeGraph];
+  const relativeGraph = relative(pluginRoot, graphPath).split(sep).join('/').replace(/^\.\//, '');
+  const declaredGraphs = (extension?.graphs ?? []).map(graph => graph.replace(/^\.\//, ''));
+  if (!declaredGraphs.includes(relativeGraph)) return createDefaultMarketDataRegistry();
+  const declaration = extension?.graphProviders?.[relativeGraph] ?? extension?.graphProviders?.[`./${relativeGraph}`];
   if (!declaration) return createDefaultMarketDataRegistry();
   const modulePath = realpathSync(resolve(import.meta.dir, '../..', declaration.module));
   const providerRoot = realpathSync(resolve(import.meta.dir, '.'));
@@ -444,8 +446,9 @@ export function registerGraphCommands(program: Command, runsDeps: {
     });
   graph.command('approve <graph_id> <run_id>')
     .option('--reject', 'Reject instead of approving')
+    .option('--outcome <name>', 'Choose a declared named approval outcome (release gate waiver only)')
     .option('--by <name>', 'Record the approver name')
-    .action(async (graphId: string, runId: string, opts: { reject?: boolean; by?: string }) => {
+    .action(async (graphId: string, runId: string, opts: { reject?: boolean; outcome?: string; by?: string }) => {
       try {
         // A release approval is the decision point for a live publish run. Resume its
         // saved graph immediately so approval does not depend on a later manual tick.
@@ -453,7 +456,14 @@ export function registerGraphCommands(program: Command, runsDeps: {
         // is unavailable, leave the approval undecided so an operator can retry.
         const releaseGraph = graphId === 'release-loop' ? findGraphFile(graphId, runsDeps.graphRoots) : undefined;
         if (graphId === 'release-loop' && !releaseGraph) throw new Error('release-loop graph file not found; approval was not recorded');
-        const state = decideGraphApproval(graphId, runId, opts.reject ? 'rejected' : 'approved', opts.by, runsDeps.root);
+        if (opts.outcome === 'waived-known-issue') {
+          if (!releaseGraph) throw new Error('known-issue waiver requires the release-loop graph');
+          const installed = parseYaml(readFileSync(releaseGraph, 'utf8')) as { edges?: Array<{ from?: string; map?: Record<string, string> }> };
+          if (installed.edges?.find((edge) => edge.from === KNOWN_ISSUE_ROUTE.approval)?.map?.[KNOWN_ISSUE_ROUTE.outcome] !== KNOWN_ISSUE_ROUTE.passed)
+            throw new Error('installed release graph lacks the known-issue waiver edge');
+        }
+        const state = decideGraphApproval(graphId, runId, opts.reject ? 'rejected' : 'approved', opts.by, runsDeps.root,
+          opts.outcome === undefined ? undefined : { nodeId: KNOWN_ISSUE_ROUTE.approval, visit: 1, outcome: opts.outcome });
         if (releaseGraph) {
           await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
           const { graphTick } = await import('./graph-tick.js');

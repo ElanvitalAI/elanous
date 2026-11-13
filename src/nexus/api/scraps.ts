@@ -1,6 +1,8 @@
 import { debug } from '../../debug/log.js';
 import { buildAbsorbSummaryCard, extractAbsorbScrap, type AbsorbCardLlm, type AbsorbExtraction, type AbsorbExtractorAdapters } from '../../intake-plane/absorb-extract.js';
 import { ingestAbsorbScrap, listAbsorbScraps, updateAbsorbScrap, type AbsorbScrapKind, type AbsorbScrapPayload } from '../../intake-plane/items.js';
+import { createScrapFolder, findScrapFolder, listScrapFolders, updateScrapFolder, validScrapFolderName } from './scrap-folders.js';
+import { handleVoiceNoteExport } from './scrap-export.js';
 
 const KINDS: readonly AbsorbScrapKind[] = ['text', 'web', 'x', 'youtube', 'voice', 'video', 'photo'];
 const SOURCES: readonly AbsorbScrapPayload['source'][] = ['android-share', 'android-record', 'flutter-share', 'flutter-record', 'tui', 'pwa', 'telegram'];
@@ -36,6 +38,12 @@ export interface ScrapsRouteOptions {
   extractors: AbsorbExtractorAdapters;
   byokCard?: AbsorbCardLlm;
   now?: () => Date;
+  writeVaultFile?: (input: { path: string; content: string; createOnly: boolean }) => Promise<Response>;
+  readVaultFile?: (path: string) => Promise<Response>;
+  /** Notify durable follow-up requests after the absorb ledger reaches a terminal state. */
+  onSettled?: (memberId: string, scrapId: string) => Promise<void>;
+  /** Durable acceptance hook, before extraction; used by a connected Telegram DM receipt. */
+  onAccepted?: (memberId: string, scrapId: string) => Promise<void>;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -55,6 +63,23 @@ function memberScopedMediaRef(value: string, memberId: string): string | null {
   return `${memberId}/${value}`;
 }
 
+function recordingDate(instant: unknown, timeZone: unknown): string | null {
+  if (typeof instant !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(instant)) return null;
+  const date = new Date(instant);
+  if (!Number.isFinite(date.getTime()) || date.toISOString() !== instant || typeof timeZone !== 'string') return null;
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const parts = Object.fromEntries(formatter.formatToParts(date).map(({ type, value }) => [type, value]));
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  } catch { return null; }
+}
+
+function validCalendarDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
 function parseScrap(value: unknown, memberId: string, now: string): AbsorbScrapPayload | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const input = value as Record<string, unknown>;
@@ -69,6 +94,7 @@ function parseScrap(value: unknown, memberId: string, now: string): AbsorbScrapP
     }
   }
   const kind = input.kind as AbsorbScrapKind;
+  if (input.folderId !== undefined && input.folderId !== null && typeof input.folderId !== 'string') return null;
   const hasContent = kind === 'text' ? Boolean(raw.text?.trim())
     : kind === 'web' || kind === 'x' || kind === 'youtube' ? Boolean(raw.url?.trim())
       : Boolean(raw.mediaRef?.trim());
@@ -89,6 +115,13 @@ function parseScrap(value: unknown, memberId: string, now: string): AbsorbScrapP
       if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
       const entry = value as Record<string, unknown>;
       if (!Number.isSafeInteger(entry.t) || (entry.t as number) < 0) return null;
+      if (entry.kind === 'marker') {
+        if (kind !== 'voice' || typeof entry.label !== 'string' || !entry.label.trim()
+          || entry.label.length > 80 || /[\\/\x00-\x1f\x7f]/.test(entry.label)
+          || entry.mediaRef !== undefined || entry.mime !== undefined) return null;
+        timeline.push({ t: entry.t as number, kind: 'marker', label: entry.label });
+        continue;
+      }
       if (entry.kind !== 'voice' && entry.kind !== 'photo' && entry.kind !== 'video') return null;
       if (typeof entry.mediaRef !== 'string' || typeof entry.mime !== 'string') return null;
       const scopedMediaRef = memberScopedMediaRef(entry.mediaRef, memberId);
@@ -99,8 +132,21 @@ function parseScrap(value: unknown, memberId: string, now: string): AbsorbScrapP
     }
     raw.timeline = timeline;
   }
+  if (candidate.recordedAt !== undefined || candidate.recordedTimeZone !== undefined) {
+    if (kind !== 'voice') return null;
+    const day = recordingDate(candidate.recordedAt, candidate.recordedTimeZone);
+    if (!day) return null;
+    raw.recordedAt = candidate.recordedAt as string;
+    raw.recordedTimeZone = candidate.recordedTimeZone as string;
+    raw.recordedDate = day;
+  }
+  if (candidate.classDate !== undefined) {
+    if (kind !== 'voice' || !validCalendarDate(candidate.classDate)) return null;
+    raw.classDate = candidate.classDate;
+  }
   return {
     schema: 'absorb/v0', memberId, kind, source: input.source as AbsorbScrapPayload['source'], raw,
+    ...(input.folderId !== undefined ? { folderId: input.folderId as string | null } : {}),
     status: 'new', createdAt: now,
   };
 }
@@ -108,9 +154,79 @@ function parseScrap(value: unknown, memberId: string, now: string): AbsorbScrapP
 /** `POST/GET /v1/scraps`, scoped only to the server-authenticated member. */
 export async function handleScraps(req: Request, options: ScrapsRouteOptions): Promise<Response> {
   const method = req.method.toUpperCase();
-  if (method !== 'GET' && method !== 'POST') return json({ error: 'method not allowed' }, HTTP_METHOD_NOT_ALLOWED);
   const owner = await options.resolveOwner(req);
   if (!owner?.memberId) return json({ error: 'unauthorized' }, HTTP_UNAUTHORIZED);
+  const pathname = new URL(req.url).pathname;
+  if (pathname === '/v1/scrap-folders') {
+    if (method === 'GET') return json({ folders: listScrapFolders(options.instanceRoot, owner.memberId) });
+    if (method !== 'POST') return json({ error: 'method not allowed' }, HTTP_METHOD_NOT_ALLOWED);
+    let input: { name?: unknown; parentId?: unknown };
+    try { input = await req.json() as typeof input; } catch { return json({ error: 'invalid-json' }, HTTP_BAD_REQUEST); }
+    if (!validScrapFolderName(input?.name) || (input.parentId !== undefined && input.parentId !== null && typeof input.parentId !== 'string')) {
+      return json({ error: 'invalid-folder' }, HTTP_BAD_REQUEST);
+    }
+    const parentId = typeof input.parentId === 'string' ? input.parentId : null;
+    if (parentId && !findScrapFolder(options.instanceRoot, owner.memberId, parentId)) return json({ error: 'folder-not-found' }, 404);
+    return json(createScrapFolder(options.instanceRoot, owner.memberId, input.name, parentId,
+      (options.now ?? (() => new Date()))().toISOString()), HTTP_CREATED);
+  }
+  const folderAction = /^\/v1\/scrap-folders\/([a-f0-9-]{36})$/.exec(pathname);
+  if (folderAction) {
+    if (method !== 'PATCH') return json({ error: 'method not allowed' }, HTTP_METHOD_NOT_ALLOWED);
+    const current = findScrapFolder(options.instanceRoot, owner.memberId, folderAction[1]!);
+    if (!current) return json({ error: 'folder-not-found' }, 404);
+    let input: { name?: unknown; parentId?: unknown };
+    try { input = await req.json() as typeof input; } catch { return json({ error: 'invalid-json' }, HTTP_BAD_REQUEST); }
+    if (!input || (!Object.hasOwn(input, 'name') && !Object.hasOwn(input, 'parentId'))
+      || (input.name !== undefined && !validScrapFolderName(input.name))
+      || (input.parentId !== undefined && input.parentId !== null && typeof input.parentId !== 'string')) {
+      return json({ error: 'invalid-folder' }, HTTP_BAD_REQUEST);
+    }
+    const parentId = input.parentId === undefined ? current.parentId : input.parentId as string | null;
+    const folders = listScrapFolders(options.instanceRoot, owner.memberId);
+    let ancestor = parentId;
+    while (ancestor) {
+      if (ancestor === current.id) return json({ error: 'folder-cycle' }, HTTP_BAD_REQUEST);
+      const parent = folders.find((folder) => folder.id === ancestor);
+      if (!parent) return json({ error: 'folder-not-found' }, 404);
+      ancestor = parent.parentId;
+    }
+    return json(updateScrapFolder(options.instanceRoot, current, {
+      name: input.name === undefined ? current.name : input.name as string, parentId,
+    }));
+  }
+  const action = /^\/v1\/scraps\/([a-f0-9]{16})\/(folder|class-date|export)$/.exec(pathname);
+  if (action) {
+    const id = action[1]!;
+    if (action[2] === 'export') return handleVoiceNoteExport(req, {
+      instanceRoot: options.instanceRoot, memberId: owner.memberId, id, now: options.now,
+      writeVaultFile: options.writeVaultFile, readVaultFile: options.readVaultFile,
+    });
+    const item = listAbsorbScraps(options.instanceRoot, owner.memberId).find((candidate) => candidate.id === id);
+    if (!item?.absorb) return json({ error: 'scrap-not-found' }, 404);
+    if (method !== 'PATCH') return json({ error: 'method not allowed' }, HTTP_METHOD_NOT_ALLOWED);
+    if (action[2] === 'folder') {
+      let input: { folderId?: unknown };
+      try { input = await req.json() as typeof input; } catch { return json({ error: 'invalid-json' }, HTTP_BAD_REQUEST); }
+      if (!input || !Object.hasOwn(input, 'folderId') || (input.folderId !== null && typeof input.folderId !== 'string')) {
+        return json({ error: 'invalid-folder' }, HTTP_BAD_REQUEST);
+      }
+      if (typeof input.folderId === 'string' && !findScrapFolder(options.instanceRoot, owner.memberId, input.folderId)) {
+        return json({ error: 'folder-not-found' }, 404);
+      }
+      updateAbsorbScrap(options.instanceRoot, id, { folderId: input.folderId as string | null });
+      return json({ id, ...item.absorb, folderId: input.folderId });
+    }
+    if (item.absorb.kind !== 'voice') return json({ error: 'not-voice-note' }, HTTP_CONFLICT);
+    let input: { classDate?: unknown };
+    try { input = await req.json() as typeof input; } catch { return json({ error: 'invalid-json' }, HTTP_BAD_REQUEST); }
+    if (!validCalendarDate(input?.classDate)) return json({ error: 'invalid-class-date' }, HTTP_BAD_REQUEST);
+    const raw = { ...item.absorb.raw, classDate: input.classDate };
+    updateAbsorbScrap(options.instanceRoot, id, { raw });
+    return json({ id, ...item.absorb, raw });
+  }
+  if (pathname !== '/v1/scraps') return json({ error: 'not-found' }, 404);
+  if (method !== 'GET' && method !== 'POST') return json({ error: 'method not allowed' }, HTTP_METHOD_NOT_ALLOWED);
   if (method === 'GET') return json({ scraps: listAbsorbScraps(options.instanceRoot, owner.memberId).map((item) => ({ id: item.id, ...item.absorb })) });
   const idempotencyKey = req.headers.get('idempotency-key')?.trim() ?? '';
   if (!IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) return json({ error: 'idempotency-key-required' }, HTTP_BAD_REQUEST);
@@ -120,6 +236,8 @@ export async function handleScraps(req: Request, options: ScrapsRouteOptions): P
   const now = (options.now ?? (() => new Date()))().toISOString();
   const payload = parseScrap(body, owner.memberId, now);
   if (!payload) return json({ error: 'invalid-scrap' }, HTTP_BAD_REQUEST);
+  if (payload.folderId !== undefined && payload.folderId !== null
+    && !findScrapFolder(options.instanceRoot, owner.memberId, payload.folderId)) return json({ error: 'folder-not-found' }, 404);
   let ingested: ReturnType<typeof ingestAbsorbScrap>;
   try { ingested = ingestAbsorbScrap(options.instanceRoot, payload, idempotencyKey, now); }
   catch (error) {
@@ -127,8 +245,18 @@ export async function handleScraps(req: Request, options: ScrapsRouteOptions): P
     throw error;
   }
   const item = ingested.item;
-  if (ingested.replayed) return json({ id: item.id, ...item.absorb }, item.absorb?.status === 'failed' ? HTTP_EXTRACTION_FAILED : HTTP_OK);
-  if (item.absorb?.status === 'absorbed') return json({ id: item.id, ...item.absorb }, 200);
+  if (options.onAccepted) {
+    try { await options.onAccepted(owner.memberId, item.id); }
+    catch { debug.log('absorb.accept', 'receipt-delivery-failed', { id: item.id, memberId: owner.memberId }); }
+  }
+  if (ingested.replayed) {
+    if (item.absorb?.status === 'absorbed' || item.absorb?.status === 'failed') await options.onSettled?.(owner.memberId, item.id);
+    return json({ id: item.id, ...item.absorb }, item.absorb?.status === 'failed' ? HTTP_EXTRACTION_FAILED : HTTP_OK);
+  }
+  if (item.absorb?.status === 'absorbed') {
+    await options.onSettled?.(owner.memberId, item.id);
+    return json({ id: item.id, ...item.absorb }, HTTP_OK);
+  }
   updateAbsorbScrap(options.instanceRoot, item.id, { status: 'extracting' });
   let extracted: AbsorbExtraction | undefined;
   try {
@@ -141,7 +269,9 @@ export async function handleScraps(req: Request, options: ScrapsRouteOptions): P
   if (extracted) {
     try {
       const card = await buildAbsorbSummaryCard(extracted, options.byokCard ? { byok: options.byokCard } : {});
-      updateAbsorbScrap(options.instanceRoot, item.id, { status: 'absorbed', card, absorbedAt: (options.now ?? (() => new Date()))().toISOString() });
+      updateAbsorbScrap(options.instanceRoot, item.id, { status: 'absorbed', card,
+        extractedBody: extracted.body.slice(0, MAX_SCRAP_FIELD_CHARS),
+        absorbedAt: (options.now ?? (() => new Date()))().toISOString() });
       debug.log('absorb.card', 'card-built', { id: item.id, memberId: owner.memberId, kind: payload.kind });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -150,5 +280,6 @@ export async function handleScraps(req: Request, options: ScrapsRouteOptions): P
     }
   }
   const result = listAbsorbScraps(options.instanceRoot, owner.memberId).find((scrap) => scrap.id === item.id);
+  if (result?.absorb?.status === 'absorbed' || result?.absorb?.status === 'failed') await options.onSettled?.(owner.memberId, item.id);
   return json(result ? { id: result.id, ...result.absorb } : { error: 'scrap-not-found' }, result?.absorb?.status === 'failed' ? HTTP_EXTRACTION_FAILED : HTTP_CREATED);
 }

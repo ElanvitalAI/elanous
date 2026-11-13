@@ -27,6 +27,7 @@ async function authoredPaths(ask: string, files: readonly string[], evidence: re
     return {
       paths: tracedPathReferences(authored.document).map(({ path }) => path),
       section: authored.document.slice(authored.document.indexOf('## TRACED PATHS'), authored.document.indexOf('## SCOPE BOUNDARY')),
+      document: authored.document,
     };
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -132,11 +133,45 @@ test('a path and unknown text in the same target piece keep the unknown text vis
   expect(result.section).toContain('미해석: ???');
 });
 
-test('only an explicit new-file declaration permits a missing traced target', async () => {
+test('an explicit new-file declaration permits a missing traced target', async () => {
   const target = 'scripts/new-cycle-e2e.ts';
   const result = await authoredPaths(`대상 경로: ${target}\n신설: ${target}\n새 시험을 만든다.`, [], [], []);
   expect(result.paths).toEqual([target]);
   expect(result.section).not.toContain(`미해석: ${target}`);
+});
+
+test('creation prose alone does not declare a missing target', async () => {
+  const target = 'docs/SMOKE-first-run-zero-mk-1112.md';
+  const result = await authoredPaths(`대상 경로: ${target}\n새 문서를 만들고 첫 실행을 기록한다.`, [], [], []);
+  expect(result.paths).toEqual([]);
+  expect(result.section).toContain(`미해석: ${target}`);
+});
+
+test.each(['새 파일을 만들지 마세요.', 'Do not create a new file.', 'Never create a new file.', 'Never ever create a new file.', 'Never edit files but create a new file.'])('prose without a marker does not declare a missing target: %s', async (instruction) => {
+  const target = 'docs/new.md';
+  const result = await authoredPaths(`대상 경로: ${target}\n${instruction}`, [], [], []);
+  expect(result.paths).toEqual([]);
+  expect(result.document).not.toContain(`- 신설: ${target}\n`);
+});
+
+test('an English create marker declares exactly one missing target even alongside negation prose', async () => {
+  const target = 'docs/new.md';
+  const result = await authoredPaths(`대상 경로: ${target}\nNever edit files but create a new file.\ncreate: ${target}`, [], [], []);
+  expect(result.paths).toEqual([target]);
+  expect(result.section).not.toContain(`미해석: ${target}`);
+});
+
+test('multiple missing targets do not become implicit new files', async () => {
+  const result = await authoredPaths('대상 경로: docs/first.md · docs/second.md\n새 문서를 만든다.', [], [], []);
+  expect(result.paths).toEqual([]);
+  expect(result.section).toContain('미해석: docs/first.md');
+  expect(result.section).toContain('미해석: docs/second.md');
+});
+
+test('an outside repository path never becomes an implicit new file', async () => {
+  const result = await authoredPaths('대상 경로: ../outside.md\n새 문서를 만든다.', [], [], []);
+  expect(result.paths).toEqual([]);
+  expect(result.document).not.toContain('- 신설: ../outside.md');
 });
 
 test('a bare evidence filename cannot borrow an explicitly new path as if it existed', async () => {

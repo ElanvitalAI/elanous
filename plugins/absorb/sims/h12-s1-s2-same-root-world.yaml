@@ -1,0 +1,24 @@
+apiVersion: elanous.dev/graph-sim/v1
+id: h12-s1-s2-same-root-world
+graph: ../graph/absorb-brief.yaml
+effects: fake-only
+clock:
+  timezone: Asia/Seoul
+  start: 2026-11-09T06:59:00+09:00
+providers:
+  store: fake-member-store
+  extract: fake-extractors
+  llm-judge: fake-llm
+  notify: fake-telegram-outbound
+fixtures:
+  members:
+    - id: member-demo
+      byok: true
+      apps:
+        - id: lecture-scrap-demo
+          screens: [scraps, lecture-notes]
+          rpc: [scraps.list, notes.create]
+  scraps: []
+assertions:
+  - source scrap is read from the same instanceRoot by server-authenticated memberId and sourceScrapId
+  - the real absorb-brief graph saves a briefing referencing that exact scrap ID

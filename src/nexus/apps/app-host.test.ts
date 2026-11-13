@@ -204,6 +204,37 @@ test('NEXUS-APP-HOST-FS-HARDEN mounts an immutable snapshot on an isolated app o
   }
 });
 
+test('app host serves extensionless Next static-export routes and preserves directory-index precedence', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-next-route-'));
+  const outDir = writeApp(root, '<main>home</main>');
+  mkdirSync(join(outDir, 'notes'), { recursive: true });
+  writeFileSync(join(outDir, 'notes', 'new.html'), '<main>next export</main>');
+  try {
+    const first = loadNexusAppHost(root, undefined, appAuthOptions(root));
+    try {
+      expect(first.issues).toEqual([]);
+      const owner = first.appHost.issueOwnerSession('voice-note', 'owner-1');
+      const cookie = `__Host-app-session=${owner.sessionToken}`;
+      for (const path of ['/notes/new', '/notes/new/']) {
+        const response = await appRequest(first.appHost, path, 'GET', cookie);
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain('next export');
+      }
+    } finally { first.appHost.close(); }
+
+    mkdirSync(join(outDir, 'notes', 'new'), { recursive: true });
+    writeFileSync(join(outDir, 'notes', 'new', 'index.html'), '<main>directory index</main>');
+    const second = loadNexusAppHost(root, undefined, appAuthOptions(root));
+    try {
+      expect(second.issues).toEqual([]);
+      const owner = second.appHost.issueOwnerSession('voice-note', 'owner-1');
+      const response = await appRequest(second.appHost, '/notes/new', 'GET', `__Host-app-session=${owner.sessionToken}`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('directory index');
+    } finally { second.appHost.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('public-read RPC remains anonymous with an unrelated cookie', async () => {
   const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-public-read-cookie-'));
   const appDir = join(root, 'public-note');

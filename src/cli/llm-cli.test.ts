@@ -78,6 +78,11 @@ describe('llmQuery', () => {
   });
 
   test('a failed first provider falls back through the real streamLLM to a recording provider', async () => {
+    // bun test selects the fake LLM by default, which replaces the injected
+    // initial provider before streamLLM can fall back. Pin real selection for
+    // this case only; both providers stay in-process recordings.
+    const priorLlmMode = process.env.ELANOUS_LLM_MODE;
+    process.env.ELANOUS_LLM_MODE = 'real';
     const originalGrok = PROVIDERS.grok;
     const calls: Array<{ provider: string; messages: LLMMessage[]; opts: LLMOpts | undefined }> = [];
     const fallbackProvider = {
@@ -116,6 +121,8 @@ describe('llmQuery', () => {
       expect(calls[1]!.opts?.tools).toBeUndefined();
     } finally {
       PROVIDERS.grok = originalGrok!;
+      if (priorLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = priorLlmMode;
     }
   });
 
@@ -133,6 +140,11 @@ describe('llmQuery', () => {
   });
 
   test('recording fake provider receives only the user message through the actual streaming boundary', async () => {
+    // The test/sim default answers with test-fake-llm and never calls the
+    // injected provider. Select the real stream boundary so this recording
+    // provider is the one that receives the user message.
+    const priorLlmMode = process.env.ELANOUS_LLM_MODE;
+    process.env.ELANOUS_LLM_MODE = 'real';
     const calls: Array<{ messages: LLMMessage[]; opts: LLMOpts | undefined }> = [];
     const fakeProvider = {
       name: 'recording-provider',
@@ -151,7 +163,13 @@ describe('llmQuery', () => {
       streamLLM,
       trimToBudget,
     } as unknown as LlmQueryDeps;
-    const result = await llmQuery({ text: 'verbatim\nquestion', provider: 'local', deps });
+    let result: Awaited<ReturnType<typeof llmQuery>>;
+    try {
+      result = await llmQuery({ text: 'verbatim\nquestion', provider: 'local', deps });
+    } finally {
+      if (priorLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = priorLlmMode;
+    }
     expect(calls).toHaveLength(1);
     expect(calls[0]!.messages).toEqual([{ role: 'user', content: 'verbatim\nquestion' }]);
     expect(calls[0]!.opts?.model).toBe('recording-model');

@@ -12,7 +12,7 @@ import {
 } from './sidebar-nav-items';
 
 const app = resolve(dirname(import.meta.path), '../../app');
-const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/member/invite', '/ops/release', '/settings', '/setup', '/setup/done', '/share/received', '/signup', '/signup/complete', '/term', '/vault'];
+const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/member/invite', '/ops/release', '/scraps', '/settings', '/setup', '/setup/done', '/share/received', '/signup', '/signup/complete', '/term', '/vault', '/voice-notes'];
 
 function builtRoutes(directory = app): string[] {
   const pages: string[] = [];
@@ -33,9 +33,9 @@ function builtRoutes(directory = app): string[] {
 describe('PWA screens-out navigation', () => {
   test('keeps the public screens, member board and App Studio destinations', () => {
     expect(SIDEBAR_NAV_ITEMS.map((item) => item.href)).toEqual([
-      '/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings', '/credentials',
+      '/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/voice-notes', '/settings', '/credentials',
     ]);
-    expect(new Set(SIDEBAR_NAV_ITEMS.map((item) => item.href)).size).toBe(10);
+    expect(new Set(SIDEBAR_NAV_ITEMS.map((item) => item.href)).size).toBe(11);
     expect(NAV_GROUPS.map((group) => group.id)).toEqual(['talk', 'work', 'make', 'files', 'settings']);
   });
 
@@ -51,6 +51,8 @@ describe('PWA screens-out navigation', () => {
     expect(accounted.sort()).toEqual([...retainedRoutes].sort());
     expect(NON_MENU_SIDEBAR_ROUTES.filter((route) => route.category === 'member-signup').map((route) => route.href))
       .toEqual(['/signup', '/signup/complete']);
+    expect(NON_MENU_SIDEBAR_ROUTES.filter((route) => route.category === 'member-scraps').map((route) => route.href))
+      .toEqual(['/scraps']);
   });
 
   test('role and beta filtering only affects the retained menu', () => {
@@ -59,9 +61,9 @@ describe('PWA screens-out navigation', () => {
       const groups = visibleNavGroups(SIDEBAR_NAV_ITEMS, prefs, role, { showBeta });
       return [...groups.main, ...groups.labs, ...groups.hidden].map((item) => item.href);
     };
-    expect(hrefs('owner')).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings', '/credentials']);
+    expect(hrefs('owner')).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/voice-notes', '/settings', '/credentials']);
     expect(hrefs('general')).toEqual(['/chat', '/board', '/term', '/editor', '/settings']);
-    expect(hrefs('general', true)).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/vault', '/settings']);
+    expect(hrefs('general', true)).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/vault', '/voice-notes', '/settings']);
     expect(hrefs('contributor')).toEqual(hrefs('owner').filter((href) => href !== '/credentials'));
     for (const role of ['owner', 'contributor', 'general'] as const) {
       expect(visibleNavGroups(SIDEBAR_NAV_ITEMS, prefs, role).main.map((item) => item.href))

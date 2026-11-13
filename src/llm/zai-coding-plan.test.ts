@@ -55,7 +55,14 @@ async function drain(gen: AsyncGenerator<LLMStreamEvent, void, unknown>): Promis
 
 describe('키 있음/없음 — glm 은 키가 있을 때만 직결이다', () => {
   const saved = { ...process.env };
-  beforeEach(async () => { (await import('../config.js'))._resetKeyCacheForTests(); });
+  beforeEach(async () => {
+    // The test/sim default (src/ux-sim/fake-llm.ts, #36422) replaces every configured
+    // provider with test-fake-llm — gate pods also set ELANOUS_TEST_FAKE_LLM=1 globally.
+    // This describe asserts the explicit glm wiring, so it opts into the real resolver;
+    // keys, endpoints and compat/OpenRouter peers below all stay synthetic.
+    process.env.ELANOUS_LLM_MODE = 'real';
+    (await import('../config.js'))._resetKeyCacheForTests();
+  });
   afterEach(async () => { process.env = { ...saved }; (await import('../config.js'))._resetKeyCacheForTests(); });
 
   async function construct(): Promise<{ ok: true; p: LLMProvider } | { ok: false; message: string }> {

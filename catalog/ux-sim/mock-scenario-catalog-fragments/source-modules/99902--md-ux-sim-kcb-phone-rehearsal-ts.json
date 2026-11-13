@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-KCB-PHONE-REHEARSAL-TS",
+  "path": "src/ux-sim/kcb-phone-rehearsal.ts",
+  "boundary": "Validates three unique phone rehearsal timestamps and example receipts against the two-minute journey contract; it does not contact phones or infer missing first-result times.",
+  "deviceIds": [
+    "kcb-integrated-pwa-lap"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

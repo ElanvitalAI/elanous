@@ -38,7 +38,11 @@ test('next TUI grows, scrolls and shrinks its composer with Kitty and xterm newl
     expect(run.frames[4]?.cursor.row).toBeLessThanOrEqual(8); // Source: #36682
     expect(run.frames[5]?.screen).not.toContain('❯ alpha');
     expect(run.frames[6]?.screen).toEndWith('❯ ');
-    expect(run.frames[7]?.cursor).toEqual({ row: 8, col: 3 }); // Source: #36682
+    const wrapped = run.frames[7];
+    expect(wrapped?.cursor).toEqual({
+      row: (wrapped?.screen.split('\n').findIndex((line) => line.includes('  X')) ?? -1) + 1,
+      col: 3,
+    }); // Source: #36755 — primary-screen compact mode leaves the cursor on its visible prompt row.
     const requests = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {
       messages: Array<{ role: string; content: unknown }>;
     });

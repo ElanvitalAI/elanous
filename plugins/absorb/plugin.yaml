@@ -80,17 +80,28 @@ capabilities:
   - llm-judge
   - notify
   - app-publish
+  - absorb
 graphs:
   - graph/absorb-ingest.yaml
   - graph/absorb-brief.yaml
   - graph/absorb-suggest-list.yaml
   - graph/absorb-build.yaml
+graphProviders:
+  graph/absorb-brief.yaml:
+    module: src/graph-runner/absorb-design-provider.ts
+    factory: createAbsorbDesignRegistry
 skills:
   - id: absorb/card
     path: skills/absorb/card/SKILL.md
     sideEffects: none
   - id: absorb/brief
     path: skills/absorb/brief/SKILL.md
+    sideEffects: none
+  - id: absorb/requirements
+    path: skills/absorb/requirements/SKILL.md
+    sideEffects: none
+  - id: absorb/design
+    path: skills/absorb/design/SKILL.md
     sideEffects: none
   - id: absorb/suggest
     path: skills/absorb/suggest/SKILL.md
@@ -99,8 +110,12 @@ skills:
     path: skills/absorb/build/SKILL.md
     sideEffects: none
 packs:
+  - id: brief-design
+    version: 1
+    path: packs/brief-design/pack.yaml
   - id: member-apps
     version: 1
     path: packs/member-apps/pack.yaml
 sims:
   - sims/absorb-demo-world.yaml
+  - sims/brief-requirements-design-world.yaml

@@ -77,6 +77,35 @@ test('streamLLM attributes measured and unmeasured usage to its active model', a
   ]);
 });
 
+test('streamLLM forced fake fences provider, initialProvider, and session pin', async () => {
+  let calls = 0;
+  const injected: LLMProvider = {
+    name: 'injected', defaultModel: 'injected-model', available: () => true,
+    async *chat() { calls++; yield 'injected-reply'; },
+    async *streamChat() { calls++; yield { type: 'text', delta: 'injected-reply' }; },
+  };
+  const keys = ['ELANOUS_LLM_MODE', 'ELANOUS_TEST_FAKE_LLM', 'ELANOUS_UX_SIM_RUN_ID', 'ELANOUS_SIM_UNIVERSE'] as const;
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  try {
+    for (const forced of [{ ELANOUS_LLM_MODE: 'fake' }, { ELANOUS_TEST_FAKE_LLM: '1' },
+      { ELANOUS_UX_SIM_RUN_ID: 'forced-sim' }, { ELANOUS_SIM_UNIVERSE: '1' }]) {
+      for (const key of keys) delete process.env[key];
+      Object.assign(process.env, forced);
+      for (const options of [{ provider: injected }, { initialProvider: injected },
+        { provider: injected, preferExplicitProvider: true }]) {
+        const reply = await streamLLM([{ role: 'user', content: 'question' }], () => {}, options);
+        expect(reply).not.toBe('injected-reply');
+      }
+    }
+    expect(calls).toBe(0);
+  } finally {
+    for (const key of keys) {
+      const value = prior[key];
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
 test('streamLLM usageSite overrides the ledger site and omission keeps the default', async () => {
   const provider: LLMProvider = {
     name: 'usage-site-provider',

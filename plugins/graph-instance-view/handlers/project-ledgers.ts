@@ -191,15 +191,15 @@ export const liveLedgers: ViewLedgers = {
 };
 
 /** Sidebar projection for a selected run; an unbound tab shows the resource fleet. */
-export function readLiveGraphInstance(runId?: string): GraphInstanceView | null {
+export function readLiveGraphInstance(runId?: string, ledgers: ViewLedgers = liveLedgers): GraphInstanceView | null {
   if (!runId) {
-    const view = projectView({ source: 'resource' }, liveLedgers);
+    const view = projectView({ source: 'resource' }, ledgers);
     return view && graphInstanceViewIssues(view).length === 0 ? view : null;
   }
-  const graph = liveLedgers.graphRuns().find(run => run.runId === runId);
+  const graph = ledgers.graphRuns().find(run => run.runId === runId);
   const view = graph
-    ? projectView({ source: graph.graphId === 'release-loop' ? 'release' : 'graph', runId, graphId: graph.graphId }, liveLedgers)
-    : projectView({ source: 'harness', runId }, liveLedgers);
+    ? projectView({ source: graph.graphId === 'release-loop' ? 'release' : 'graph', runId, graphId: graph.graphId }, ledgers)
+    : projectView({ source: 'harness', runId }, ledgers);
   return view && graphInstanceViewIssues(view).length === 0 ? view : null;
 }
 

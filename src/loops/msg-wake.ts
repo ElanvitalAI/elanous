@@ -572,7 +572,7 @@ function logPending(event: PendingWakeEvent, data: Record<string, unknown>): voi
 }
 
 /**
- * After a fresh wake: a pty-inject TUI that was busy or inside the 5-minute window is remembered (not dropped);
+ * After a fresh wake: busy, debounced, or failed pty-inject wakes are remembered for unread-aware recovery;
  * an injected wake absorbs whatever was pending for that address (the line tells the reader to list everything).
  */
 function settlePending(outcome: WakeOutcome, from: string, deps: WakeDeps): void {
@@ -587,8 +587,8 @@ function settlePending(outcome: WakeOutcome, from: string, deps: WakeDeps): void
     try { conn.query('DELETE FROM pending_wakes WHERE address = ?1 AND last_msg_id <= ?2').run(address, outcome.msgId); } finally { conn.close(); }
     return;
   }
-  if (outcome.result !== 'busy' && outcome.result !== 'debounced') return;
-  const reason = outcome.result === 'debounced' ? 'debounced' : outcome.reason ?? 'busy';
+  if (outcome.result !== 'busy' && outcome.result !== 'debounced' && outcome.result !== 'failed') return;
+  const reason = outcome.result === 'debounced' ? 'debounced' : outcome.reason ?? outcome.result;
   const conn = openWakeDb(claimDbPath(deps));
   let count = 1;
   try {

@@ -28,10 +28,16 @@ test('normal fake child provider response records firstLlm=ok for the parent row
   const stateDir = mkdtempSync(join(tmpdir(), 'child-first-llm-ok-'));
   const savedStateDir = process.env.ELANOUS_STATE_DIR;
   const savedRunId = process.env.ELANOUS_RUN_ID;
+  const savedLlmMode = process.env.ELANOUS_LLM_MODE;
   const runId = 'run-68e6c0a1-734c-43f7-9d2b-6f197a11fb03';
   try {
     process.env.ELANOUS_STATE_DIR = stateDir;
     process.env.ELANOUS_RUN_ID = runId;
+    // NODE_ENV=test selects the shared test-fake provider unless the caller
+    // pins real mode. The injected fixture must own this turn (streamLLM
+    // keeps an explicit provider only when preferExplicitProvider is set,
+    // which session turns use; this direct call does not).
+    process.env.ELANOUS_LLM_MODE = 'real';
     const provider: LLMProvider = {
       name: 'fake-child-provider',
       defaultModel: 'fake-child-model',
@@ -57,6 +63,8 @@ test('normal fake child provider response records firstLlm=ok for the parent row
     else process.env.ELANOUS_STATE_DIR = savedStateDir;
     if (savedRunId === undefined) delete process.env.ELANOUS_RUN_ID;
     else process.env.ELANOUS_RUN_ID = savedRunId;
+    if (savedLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+    else process.env.ELANOUS_LLM_MODE = savedLlmMode;
     rmSync(stateDir, { recursive: true, force: true });
   }
 });

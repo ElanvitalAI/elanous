@@ -2041,11 +2041,41 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
       } finally { storage.close(); }
     }
     if (steps.length !== 2 || stepKeys[0] !== 'inject' || stepKeys[1] !== 'observe'
-      || !['release-readiness', 'hq-move', 'gate-roster-second-pool'].includes(String(steps[1]?.observe))) {
-      throw new Error('scenario steps must be inject followed by observe: release-readiness, hq-move, or gate-roster-second-pool');
+      || !['release-readiness', 'hq-move', 'chaos-hq-move', 'gate-roster-second-pool'].includes(String(steps[1]?.observe))) {
+      throw new Error('scenario steps must be inject followed by observe: release-readiness, hq-move, chaos-hq-move, or gate-roster-second-pool');
     }
     const injection = steps[0]!;
     const event = object(injection.inject, 'scenario inject');
+    if (event.id === 'chaos-hq-move') {
+      if (Object.keys(event).some(key => !['id', 'fault', 'approveKong'].includes(key))) throw new Error('unsupported HQ chaos inject field');
+      if (!world.spec.events.some(entry => entry.id === event.id)) throw new Error('HQ chaos event is not declared by world');
+      if (steps[1]?.observe !== 'chaos-hq-move') throw new Error('HQ chaos scenario must observe chaos-hq-move');
+      const expected = object(scenario.expect, 'scenario.expect');
+      if (Object.keys(expected).sort().join(',') !== 'lostTasks,scenarios' || expected.scenarios !== 9 || expected.lostTasks !== 0) {
+        throw new Error('HQ chaos expectation must require nine scenarios and zero lost TASKs');
+      }
+      const fault = event.fault ?? 'none';
+      if (!['none', 'restart-denied', 'claim-denied', 'queue-loss'].includes(String(fault))) throw new Error('unsupported HQ chaos fault');
+      if (event.approveKong !== true) throw new Error('HQ chaos matrix requires explicit virtual Kong approval');
+      const clockDevice = assembled.devices.get('fake-clock') as { withClock?: typeof withSimClock } | undefined;
+      if (!clockDevice?.withClock) throw new Error('HQ chaos scenario requires fake-clock');
+      const { runChaosHqMoveMatrix } = await import('./chaos-hq-move-world.js');
+      const rows = await clockDevice.withClock(new Date(world.spec.clock?.start ?? '2100-01-01T00:00:00Z'), clock =>
+        runChaosHqMoveMatrix({ clock, approveKong: () => event.approveKong === true,
+          restartAllowed: fault !== 'restart-denied', replacementClaimAllowed: fault !== 'claim-denied', ...(fault === 'queue-loss' ? { dropTask: 'task-01' } : {}) }));
+      const validRow = (row: (typeof rows)[number]): boolean => row.lostTasks === expected.lostTasks
+        && row.recoveredAt !== null && row.realMachineStops === 0
+        && (row.scenario.startsWith('monkey') || row.oldHolderFenced)
+        && (row.scenario.startsWith('monkey') || !row.scenario.endsWith('-3')
+          || (row.returnedWorkerFenceProof?.deniedAck === false && row.returnedWorkerFenceProof.permittedAck === true));
+      return {
+        pass: rows.length === expected.scenarios && rows.every(validRow),
+        observations: rows.map(row => ({ event: row.scenario, verdict: JSON.stringify(row),
+          invariant: validRow(row) ? 'pass' as const : 'fail' as const,
+          durationMs: row.recoveredAt === null ? null : row.recoveryMs })),
+        devices: ['fake-clock', 'fake-ps', 'chaos-hq-move-world'],
+      };
+    }
     if (event.id === 'hq-move') {
       if (Object.keys(event).some((key) => key !== 'id' && key !== 'fault')) throw new Error('unsupported HQ move inject field');
       if (!world.spec.events.some((entry) => entry.id === event.id)) throw new Error('scenario event is not declared by world: hq-move');

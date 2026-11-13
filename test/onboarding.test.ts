@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { runOnboarding, runOnboardingStep, scriptedIO, needsOnboarding, resetOnboardingMarker, shouldRefuseInteractiveOnboarding } from '../src/onboarding';
 import { CODEX_MODELS } from '../src/codex/models';
 import { buildUserConfig, resetUserConfig, saveUserConfig } from '../src/user-config';
+import { DEMO1114_PLUGIN_IDS, listInstalledPlugins } from '../src/plugins/install/plugin-install';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -632,6 +633,8 @@ describe('onboarding wizard', () => {
     ]);
     await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     const prompts = io.outputs.join('\n');
+    expect(listInstalledPlugins(root).map(plugin => plugin.name).sort()).toEqual([...DEMO1114_PLUGIN_IDS].sort());
+    expect(prompts).toContain('데모 플러그인 6개 설치됨');
     // The scripted wizard runs six configuration steps; the seventh slot
     // is reserved for the interactive-only wrap-up recap.
     expect(prompts).toMatch(/Step 1 \/ 7/);

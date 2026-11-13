@@ -74,20 +74,21 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (activeHandle) {
-    try { activeHandle.release(); } catch { /* swallow */ }
+  try {
+    if (activeHandle) await activeHandle.release();
+  } finally {
     activeHandle = undefined;
+    if (prevNexusDir === undefined) delete process.env.ELANOUS_NEXUS_DIR;
+    else process.env.ELANOUS_NEXUS_DIR = prevNexusDir;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    setIntakeStoreForTest(null);
+    registerDefaultConfirmChannels([]);
+    registerDefaultQuestionChannels([]);
+    setAskUserQuestionDeps(null);
+    setAskUserQuestionResolver(null);
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* swallow */ }
   }
-  if (prevNexusDir === undefined) delete process.env.ELANOUS_NEXUS_DIR;
-  else process.env.ELANOUS_NEXUS_DIR = prevNexusDir;
-  if (prevHome === undefined) delete process.env.HOME;
-  else process.env.HOME = prevHome;
-  setIntakeStoreForTest(null);
-  registerDefaultConfirmChannels([]);
-  registerDefaultQuestionChannels([]);
-  setAskUserQuestionDeps(null);
-  setAskUserQuestionResolver(null);
-  try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* swallow */ }
 });
 
 function uniquePort(): number {
@@ -139,7 +140,7 @@ describe('NEXUS PWA HITL channel · runNexus integration', () => {
   test('release() clears both default channels', async () => {
     const h = await bootNexus();
     expect(getDefaultConfirmChannels()).toHaveLength(2);
-    h.release();
+    await h.release();
     activeHandle = undefined;
     expect(getDefaultConfirmChannels()).toHaveLength(0);
   });
@@ -152,7 +153,7 @@ describe('NEXUS PWA HITL channel · runNexus integration', () => {
   test('two sequential boots — no inherited channel from prior NEXUS', async () => {
     const h1 = await bootNexus();
     expect(getDefaultConfirmChannels()).toHaveLength(2);
-    h1.release();
+    await h1.release();
     activeHandle = undefined;
     expect(getDefaultConfirmChannels()).toHaveLength(0);
 
@@ -369,7 +370,7 @@ describe('NEXUS PWA question channel · runNexus wiring', () => {
   test('release() clears the question channel registry', async () => {
     const h = await bootNexus();
     expect(getDefaultQuestionChannels()).toHaveLength(1);
-    h.release();
+    await h.release();
     activeHandle = undefined;
     expect(getDefaultQuestionChannels()).toHaveLength(0);
   });
@@ -439,7 +440,7 @@ describe('NEXUS PWA question channel · runNexus wiring', () => {
     setAskUserQuestionResolver(prior);
     const h = await bootNexus();
     expect(getAskUserQuestionResolver()).toBe(prior);
-    h.release();
+    await h.release();
     activeHandle = undefined;
     expect(getAskUserQuestionResolver()).toBe(prior);
   });
@@ -447,7 +448,7 @@ describe('NEXUS PWA question channel · runNexus wiring', () => {
   test('release() clears the default resolver this boot installed', async () => {
     const h = await bootNexus();
     expect(getAskUserQuestionResolver()).not.toBeNull();
-    h.release();
+    await h.release();
     activeHandle = undefined;
     expect(getAskUserQuestionResolver()).toBeNull();
   });

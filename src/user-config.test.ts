@@ -58,13 +58,25 @@ test('intake.briefingTopic is a trimmed config value and survives save', () => {
 });
 
 test('nexus relay config is opt-in and normalizes its connection fields', () => {
-  writeConfig({ nexus: { relay: { enabled: true, url: '  wss://relay.example.test/host  ', identityFile: ' keys/relay.json ' } } });
+  writeConfig({ nexus: { relay: { enabled: true, url: '  wss://relay.example.test/host  ', identityFile: ' keys/relay.json ', memberNexusUrl: ' https://members.example.test/ ', memberKeyFile: ' keys/member.key ' } } });
   const config = buildUserConfig(configPath);
-  expect(resolveNexusRelayConfig(config)).toEqual({ enabled: true, url: 'wss://relay.example.test/host', identityFile: 'keys/relay.json' });
+  expect(resolveNexusRelayConfig(config)).toEqual({ enabled: true, url: 'wss://relay.example.test/host', identityFile: 'keys/relay.json', memberNexusUrl: 'https://members.example.test/', memberKeyFile: 'keys/member.key' });
   saveUserConfig(config, configPath);
-  expect(resolveNexusRelayConfig(buildUserConfig(configPath))).toEqual({ enabled: true, url: 'wss://relay.example.test/host', identityFile: 'keys/relay.json' });
+  expect(resolveNexusRelayConfig(buildUserConfig(configPath))).toEqual({ enabled: true, url: 'wss://relay.example.test/host', identityFile: 'keys/relay.json', memberNexusUrl: 'https://members.example.test/', memberKeyFile: 'keys/member.key' });
   writeConfig({ nexus: { relay: { enabled: 'yes', url: '  ' } } });
   expect(resolveNexusRelayConfig(buildUserConfig(configPath))).toEqual({ enabled: false });
+});
+
+test('explicit relay member settings cannot disappear during config normalization', () => {
+  for (const relay of [
+    { enabled: true, url: 'wss://relay.example.test/host', memberNexusUrl: 7, memberKeyFile: 'keys/member.key' },
+    { enabled: true, url: 'wss://relay.example.test/host', memberNexusUrl: '   ', memberKeyFile: 'keys/member.key' },
+    { enabled: true, url: 'wss://relay.example.test/host', memberNexusUrl: 'https://members.example.test/', memberKeyFile: '   ' },
+    { enabled: true, url: 'wss://relay.example.test/host', memberNexusUrl: 'https://members.example.test/' },
+  ]) {
+    writeConfig({ nexus: { relay } });
+    expect(() => buildUserConfig(configPath)).toThrow('relay member Nexus URL and key file must be valid and configured together');
+  }
 });
 
 test('Guardian train worker policy comes from config and rejects invalid overrides', () => {

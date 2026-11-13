@@ -51,6 +51,9 @@ test('fake codex, claude and hermes PTYs launch in sidetab, receive input and ex
     spawnSideAgent: async (agent) => { selectedId = controller.spawnSideAgent(agent) ?? ''; return selectedId; },
     sendSelectedAgent: async (input) => controller.sendSideAgent(row(), input),
     readSelectedAgent: async () => controller.readSideAgent(row()),
+    bindWorkspaceSelected: async () => false,
+    submitWorkspace: async () => ({ sent: false }),
+    broadcastWorkspace: async () => ({ sent: 0, total: 0, outcome: 'rejected' }),
     addHelp: (...lines) => screens.push(...lines), setStatus: (message) => statuses.push(message),
   };
   try {

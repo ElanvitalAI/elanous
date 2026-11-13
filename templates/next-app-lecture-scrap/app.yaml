@@ -60,6 +60,13 @@ rpc:
       body: { type: text }
       created_at: { type: timestamp }
     allow: [owner]
+  listLectureNotes:
+    sql: SELECT id, title, body, created_at FROM lecture_notes WHERE :beforeCreatedAt = '' OR created_at < :beforeCreatedAt OR (created_at = :beforeCreatedAt AND id < :beforeId) ORDER BY created_at DESC, id DESC LIMIT :limit
+    params:
+      limit: { type: int, max: 50, default: 20 }
+      beforeCreatedAt: { type: text, default: '' }
+      beforeId: { type: text, default: '' }
+    allow: [owner]
   searchLibrary:
     sql: SELECT id, title, excerpt FROM scraps WHERE title LIKE :query OR excerpt LIKE :query UNION ALL SELECT id, title, body AS excerpt FROM lecture_notes WHERE title LIKE :query OR body LIKE :query LIMIT :limit
     params:

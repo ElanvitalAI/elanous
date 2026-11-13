@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { routeRequest, type NexusHttpServerOpts } from '../nexus/api/http-server.js';
@@ -13,10 +13,50 @@ import { runAbsorbGraphSimulation } from './absorb-v2-runGraph-sim.js';
 import type { BoardCardEvent } from '../nexus/api/board-api.js';
 import { createHash } from 'node:crypto';
 import { emptyGraphCapabilityRegistry, registerGraphCapabilityContract, registerGraphCapabilityProviderDeclaration } from '../graph-runner/capabilities.js';
-import { createArchitectureDeliverablesRegistry } from '../graph-runner/capability-providers/architecture-deliverables.js';
+import { generateStructuredDesign } from '../graph-runner/architecture-output/structured-design.js';
 import { decideGraphApproval, runGraph } from '../graph-runner/runner.js';
 import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { nextScene6BoardReceipt } from '../repl/scene6-board-receipt.js';
+
+function createTestWorldArchitectureRegistry(repo: string, structuredDesignPath: string, output: string) {
+  // The KAIST world tests graph approval and attachment routing. Renderer installation
+  // and actual PNG/PDF generation have their own architecture-deliverables contract tests.
+  const stages = ['design', 'diagram', 'pdf', 'verify'] as const;
+  const sample = join(repo, 'docs/samples/architecture-deliverables/ticketing');
+  let registry = emptyGraphCapabilityRegistry();
+  for (const stage of stages) registry = registerGraphCapabilityContract(registry, {
+    id: `architecture.${stage}@1`, input: { type: 'object' }, output: { type: 'object' },
+  });
+  return registerGraphCapabilityProviderDeclaration(registry, {
+    id: 'kaist-test-world-architecture', provides: stages.map(stage => `architecture.${stage}@1` as const), tier: 'free',
+    invoke: ({ nodeId, graphInput }) => {
+      const input = graphInput && typeof graphInput === 'object' ? graphInput as Record<string, unknown> : {};
+      if (input.structuredDesignPath !== structuredDesignPath || input.outDir !== output)
+        return { ok: false, outcome: 'fail', error: 'test-world architecture input mismatch' };
+      mkdirSync(output, { recursive: true });
+      if (nodeId === 'design') {
+        const design = generateStructuredDesign(JSON.parse(readFileSync(structuredDesignPath, 'utf8')) as unknown);
+        writeFileSync(join(output, 'architecture.html'), design.html);
+        writeFileSync(join(output, 'architecture.excalidraw'), design.diagram);
+      } else if (nodeId === 'diagram') {
+        copyFileSync(join(sample, 'architecture.png'), join(output, 'architecture.png'));
+      } else if (nodeId === 'pdf') {
+        copyFileSync(join(sample, 'architecture.pdf'), join(output, 'architecture.pdf'));
+      } else if (nodeId === 'verify') {
+        const html = readFileSync(join(output, 'architecture.html'), 'utf8');
+        const source = JSON.parse(readFileSync(join(output, 'architecture.excalidraw'), 'utf8')) as { type?: string; elements?: unknown[] };
+        const png = readFileSync(join(output, 'architecture.png'));
+        const pdf = readFileSync(join(output, 'architecture.pdf'));
+        if (!html.includes('kaist-design-output-300') || source.type !== 'excalidraw' || !source.elements?.length
+          || png.subarray(0, 4).toString('hex') !== '89504e47' || pdf.subarray(0, 4).toString() !== '%PDF')
+          return { ok: false, outcome: 'fail', error: 'test-world architecture artifact validation failed' };
+        writeFileSync(join(output, 'verification.json'), JSON.stringify({ status: 'verified', mode: 'test-world-fixture' }));
+      } else return { ok: false, outcome: 'fail', error: `unknown architecture stage: ${nodeId}` };
+      return { ok: true, outcome: 'ok', result: { stage: nodeId, mode: 'test-world-fixture' } };
+    },
+  });
+}
 
 async function runFakeGcpExpansionAndDeliverables(root: string) {
   const repo = resolve(import.meta.dir, '../..');
@@ -59,7 +99,7 @@ async function runFakeGcpExpansionAndDeliverables(root: string) {
           writeFileSync(structuredDesignPath, `${JSON.stringify(architectureSpec, null, 2)}\n`);
           const sharedState = await runGraph(join(repo, 'plugins/architecture-deliverables/graphs/architecture-deliverables.yaml'), {
             input: { structuredDesignPath, outDir: output, resourceRoot: repo }, quiet: true,
-            deps: { root: join(stateRoot, 'shared'), capabilityProviders: createArchitectureDeliverablesRegistry(join(repo, 'plugins/architecture-deliverables')) },
+            deps: { root: join(stateRoot, 'shared'), capabilityProviders: createTestWorldArchitectureRegistry(repo, structuredDesignPath, output) },
           });
           if (sharedState.status !== 'done') throw new Error(`shared graph ${sharedState.status}: ${JSON.stringify(sharedState.nodes.map(step => ({ id: step.nodeId, error: step.error, output: step.output })))}`);
           const verification = JSON.parse(readFileSync(join(output, 'verification.json'), 'utf8')) as { status?: string };
@@ -150,6 +190,9 @@ describe('KAIST absorb path · fake member session and fixed-response provider',
     let suggested!: BoardCardEvent;
     let graphSuggestion: Record<string, unknown> = {};
     let graphRun: Promise<unknown> | undefined;
+    let acceptedBuild: { graphId: string; status: string; runId: string } | undefined;
+    let deployedReadback: { status: number; sha256: string } | undefined;
+    let appArtifactSha256: string | undefined;
     let gcpExpansion: Awaited<ReturnType<typeof runFakeGcpExpansionAndDeliverables>> | undefined;
     let worldPath = '';
     const opts = {
@@ -162,16 +205,18 @@ describe('KAIST absorb path · fake member session and fixed-response provider',
         createRunId: () => 'accept-kaist-test-1',
         runGraph: async (file, options) => {
           expect(file).toContain('absorb-build.yaml');
-          expect(options.input).toMatchObject({ suggestionId: suggested.cardId, context: { memberId: member.id, target: realpathSync(appDir) } });
+          if (!options) throw new Error('board approval graph options missing');
+          const runOptions = options;
+          expect(runOptions.input).toMatchObject({ suggestionId: suggested.cardId, context: { memberId: member.id, target: realpathSync(appDir) } });
           graphRun = (async () => {
             gcpExpansion = await runFakeGcpExpansionAndDeliverables(root);
             expect(gcpExpansion.approved).toBe(true);
             expect(gcpExpansion.state.status).toBe('done');
             expect(gcpExpansion.state.path).toContain('idle-stop');
-            return await runAbsorbGraphSimulation({ confirmation: 'y', buildOnly: true, approvalRunId: options.runId, worldPath, memberId: member.id,
-              routeSuggestionId: String((options.input as { suggestionId: string }).suggestionId),
+            return await runAbsorbGraphSimulation({ confirmation: 'y', buildOnly: true, approvalRunId: runOptions.runId, worldPath, memberId: member.id,
+              routeSuggestionId: String((runOptions.input as { suggestionId: string }).suggestionId),
               onAppPublish: async event => {
-                if (event.runId !== options.runId) return;
+                if (event.runId !== runOptions.runId) return;
                 if (event.action === 'simulate') {
                   await boardEventStore.append({ ...suggested, state: 'building', runId: event.runId,
                     summary: `[시뮬] 앱 빌드 산출물 ${String(event.artifact.id)}`, at: '2026-11-09T01:05:00.000Z' });
@@ -179,6 +224,10 @@ describe('KAIST absorb path · fake member session and fixed-response provider',
                     summary: `[시뮬] 격리 시험 영수증 ${String(event.evidence.receipt && (event.evidence.receipt as Record<string, unknown>).id)}`,
                     at: '2026-11-09T01:06:00.000Z' });
                 } else {
+                  deployedReadback = event.readback;
+                  const index = (event.artifact.files as Record<string, unknown>)?.['/index.html'];
+                  if (typeof index !== 'string') throw new Error('simulated app index artifact missing');
+                  appArtifactSha256 = createHash('sha256').update(index).digest('hex');
                   await boardEventStore.append({ ...suggested, state: 'released', runId: event.runId,
                     summary: `[시뮬] 그래프 발행 완료; GCP 가짜 소유자 승인·유휴 종료 ${gcpExpansion!.state.runId}`,
                     attachments: gcpExpansion!.attachments,
@@ -186,6 +235,7 @@ describe('KAIST absorb path · fake member session and fixed-response provider',
                 }
               },
               onAcceptedBuild: async state => {
+                acceptedBuild = { graphId: state.graphId, status: state.status, runId: state.runId };
                 expect(state.status).toBe('done');
                 expect(state.path).toEqual(expect.arrayContaining(['build', 'simulate', 'publish']));
                 const lookup = state.nodes.find(node => node.nodeId === 'lookup-suggestion');
@@ -279,12 +329,42 @@ describe('KAIST absorb path · fake member session and fixed-response provider',
       expect(board.cards[0]?.summary).toStartWith('[시뮬] 그래프 발행 완료; GCP 가짜 소유자 승인·유휴 종료 ');
       expect(board.cards[0]?.publicUrl).toBe('https://lecture-scrap-demo.app.sim.invalid/');
       expect(gcpExpansion).toBeDefined();
-      expect((board.cards[0] as { attachments?: Array<{ kind: string; sha256: string; producedBy: string }> })?.attachments).toEqual(gcpExpansion!.attachments);
-      expect((board.cards[0] as { attachments?: Array<{ kind: string }> }).attachments?.map(attachment => attachment.kind))
+      const boardCard = board.cards[0];
+      if (!boardCard) throw new Error('simulated board card missing');
+      const cardAttachments = (boardCard as unknown as { attachments?: Array<{ kind: string; sha256: string; producedBy: string }> }).attachments;
+      expect(JSON.stringify(cardAttachments)).toBe(JSON.stringify(gcpExpansion!.attachments));
+      expect(cardAttachments?.map(attachment => attachment.kind))
         .toEqual(['diagram-source', 'diagram', 'pdf', 'html']);
+      const deployedUrl = boardCard.publicUrl;
+      if (!deployedUrl) throw new Error('simulated deployed URL missing');
+      expect(deployedReadback?.status).toBe(200);
+      expect(deployedReadback?.sha256).toBe(appArtifactSha256);
+      const pdfAttachment = gcpExpansion!.attachments.find(attachment => attachment.url.endsWith('/architecture.pdf'));
+      if (!pdfAttachment) throw new Error('simulated PDF attachment missing');
+      const pdfBytes = readFileSync(join(gcpExpansion!.output, 'architecture.pdf'));
+      const pdfSha256 = createHash('sha256').update(pdfBytes).digest('hex');
+      expect(pdfBytes.subarray(0, 4).toString()).toBe('%PDF');
+      expect(pdfSha256).toBe(pdfAttachment.sha256);
+      expect(cardAttachments?.some(attachment => attachment.kind === 'pdf' && attachment.sha256 === pdfSha256)).toBe(true);
+      if (!acceptedBuild) throw new Error('accepted build graph missing');
+      const s6Receipt = await nextScene6BoardReceipt({ graph: acceptedBuild,
+        expectedGraphId: acceptedBuild.graphId, cardId: suggested.cardId, memberId: member.id,
+        nexusUrl: 'https://nexus.test', sessionToken: fakeSession.sessionToken,
+        fetchImpl: async (_input, init) => await routeRequest(new Request('http://nexus.test/v1/board', init), opts, nexusState, null, createDevProxyRuntimeRef()) ?? new Response(null, { status: 404 }),
+      });
+      expect(s6Receipt).toContain('PDF');
+      const receiptPath = process.env.ELANOUS_S6_SIM_RECEIPT_PATH;
+      if (receiptPath) writeFileSync(receiptPath, `${JSON.stringify({
+        source: 'kaist-absorb-e2e', nexusDevice: 'mini-board-card', graphId: acceptedBuild.graphId, runId: acceptedBuild.runId,
+        boardCardId: boardCard.id, boardRunId: boardCard.runId, boardState: boardCard.state,
+        deployedUrl, appReadbackStatus: deployedReadback?.status, appReadbackSha256: deployedReadback?.sha256,
+        appArtifactSha256,
+        pdfSha256, pdfBytes: pdfBytes.length,
+        pdfHeader: '%PDF', boardPdfHashMatched: true, scene6Receipt: s6Receipt,
+      }, null, 2)}\n`);
       expect(graphEvents).toHaveLength(5);
       expect(graphEvents.map(event => (event as { state: string }).state)).toEqual(['suggested', 'approved', 'building', 'testing', 'released']);
-      expect((await call('/v1/board', 'GET')).status).toBe(200);
+      expect((await call('/v1/board', 'GET'))?.status).toBe(200);
       const invalidSession = await call('/v1/scraps', 'POST', {
         kind: 'text', source: 'tui', raw: { text: 'invalid session must not write' },
       }, 'aps_invalid_test_session');

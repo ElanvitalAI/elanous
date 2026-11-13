@@ -4,7 +4,7 @@
 // door (`createInternalTurnGate`); only the REPL-child ↔ TUI hop (Bun IPC) is new, so the unit tests below
 // drive that hop end to end, and the L3 tests drive the real `--tui next` of this tree on the fake LLM.
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildScheduleWakeupHostTool, createWakeupScheduler, SCHEDULE_WAKEUP_TOOL_NAME } from '../skills/tools/schedule-wakeup.js';
@@ -134,6 +134,108 @@ describe('REPL child ↔ next TUI wakeup hop', () => {
       expect(wake.gate.startTurnIfIdle('scheduled test', { origin: 'scheduled', reason: 'test' }))
         .toMatchObject({ opened: false, reason: 'HumanTyping', detail: 'quiet-window' });
       wake.dispose();
+    }
+  });
+
+  test('H2 keeps a wakeup behind log focus and withdraws a pending wakeup if a person takes focus', () => {
+    let foreground = false;
+    let queued = 0;
+    let pendingKeys = 0;
+    const wake = createNextTuiWakeup({
+      isTurnRunning: () => false,
+      isInputForeground: () => foreground,
+      getBufferText: () => '',
+      getQueuedCount: () => queued,
+      requestYield: () => true,
+      notify: () => {},
+      lastHumanKeyAt: () => 0,
+      pendingKeyCount: () => pendingKeys,
+      log: () => {},
+    });
+    const opts = { origin: 'scheduled' as const, reason: '점검' };
+    expect(wake.gate.startTurnIfIdle('예약 점검', opts)).toMatchObject({ opened: false, reason: 'NotIdle', detail: 'input-not-foreground' });
+    foreground = true;
+    expect(wake.gate.startTurnIfIdle('예약 점검', opts).opened).toBe(true);
+    foreground = false;
+    expect(wake.takePendingIfIdle()).toBeNull();
+    expect(wake.gate.takePending()).toBeNull();
+    foreground = true;
+    expect(wake.gate.startTurnIfIdle('예약 점검', opts).opened).toBe(true);
+    queued = 1;
+    expect(wake.takePendingIfIdle()).toBeNull();
+    queued = 0;
+    expect(wake.gate.startTurnIfIdle('예약 점검', opts).opened).toBe(true);
+    pendingKeys = 1;
+    expect(wake.takePendingIfIdle()).toBeNull();
+    pendingKeys = 0;
+    expect(wake.gate.startTurnIfIdle('예약 점검', opts).opened).toBe(true);
+    expect(wake.takePendingIfIdle()?.input).toBe('예약 점검');
+    wake.dispose();
+  });
+
+  test('mail opt-in revoked after poll withdraws the pending H2 turn before consumption', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'next-mail-consume-'));
+    const seatDir = join(home, 'elanous-hq', 'seat-state', 'R-TICKET');
+    const optIn = join(seatDir, 'autowake');
+    mkdirSync(seatDir, { recursive: true });
+    writeFileSync(optIn, 'on\n');
+    let reads = 0;
+    const wake = createNextTuiWakeup({
+      enableSeatMailWake: true,
+      mailWakeOptions: { home, seat: 'R-TICKET', intervalMs: 60_000,
+        readUnread: () => { reads++; return { count: 1, maxId: 7 }; } }, // Source: #36648 pending fake mail fixture.
+      isTurnRunning: () => false,
+      getBufferText: () => '',
+      getQueuedCount: () => 0,
+      requestYield: () => true,
+      notify: () => {},
+      lastHumanKeyAt: () => 0,
+      log: () => {},
+    });
+    try {
+      await Promise.resolve(); // Source: next-mail-wake.ts schedules its first poll as a microtask.
+      expect(reads).toBe(1);
+      rmSync(optIn);
+      expect(wake.takePendingIfIdle()).toBeNull();
+      expect(wake.gate.takePending()).toBeNull();
+      expect(wake.gate.startTurnIfIdle('later scheduled turn', { origin: 'scheduled' }).opened).toBe(true);
+      expect(wake.takePendingIfIdle()?.input).toBe('later scheduled turn');
+    } finally {
+      wake.dispose();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('human withdrawal clears mail identity before a later scheduled turn', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'next-mail-human-withdraw-'));
+    const seatDir = join(home, 'elanous-hq', 'seat-state', 'R-TICKET');
+    const optIn = join(seatDir, 'autowake');
+    mkdirSync(seatDir, { recursive: true });
+    writeFileSync(optIn, 'on\n');
+    let buffer = '';
+    const wake = createNextTuiWakeup({
+      enableSeatMailWake: true,
+      mailWakeOptions: { home, seat: 'R-TICKET', intervalMs: 60_000,
+        readUnread: () => ({ count: 1, maxId: 7 }) }, // Source: #36648 pending fake mail fixture.
+      isTurnRunning: () => false,
+      getBufferText: () => buffer,
+      getQueuedCount: () => 0,
+      requestYield: () => true,
+      notify: () => {},
+      lastHumanKeyAt: () => 0,
+      log: () => {},
+    });
+    try {
+      await Promise.resolve();
+      buffer = 'person typing';
+      expect(wake.takePendingIfIdle()).toBeNull();
+      buffer = '';
+      expect(wake.gate.startTurnIfIdle('later scheduled turn', { origin: 'scheduled' }).opened).toBe(true);
+      rmSync(optIn);
+      expect(wake.takePendingIfIdle()?.input).toBe('later scheduled turn');
+    } finally {
+      wake.dispose();
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

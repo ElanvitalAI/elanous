@@ -1,0 +1,27 @@
+apiVersion: elanous.dev/graph-sim/v1
+id: brief-requirements-design-world
+graph: ../graph/absorb-brief.yaml
+effects: fake-only
+clock:
+  timezone: Asia/Seoul
+  start: 2026-11-09T06:59:00+09:00
+providers:
+  store: fake-member-store
+  extract: fake-extractors
+  llm-judge: fake-llm
+  notify: fake-telegram-outbound
+fixtures:
+  members:
+    - id: member-demo
+      byok: true
+      apps:
+        - id: lecture-scrap-demo
+          screens: [scraps, lecture-notes]
+          rpc: [scraps.list, notes.create]
+  scraps:
+    - { id: article-1, owner: member-demo, kind: web, status: new, url: https://example.test/article, text: "티켓 예매의 동시 접속 폭주, 같은 좌석 중복 예매, 공정 대기열이 쟁점이다." }
+    - { id: private-other-member, owner: member-other, kind: web, status: new, url: https://example.test/private }
+assertions:
+  - one owner-scoped article produces one briefing and exactly three source-backed requirement lines
+  - the design pack uses those three lines and the verified member app slot
+  - another member article never enters the briefing or design pack

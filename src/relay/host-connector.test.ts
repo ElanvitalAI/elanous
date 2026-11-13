@@ -180,6 +180,45 @@ test('relay host connector rejects non-loopback plaintext transport before conne
   expect(connected).toBe(false);
 });
 
+test('member token is never minted or sent to a remote plaintext relay; loopback remains usable', async () => {
+  const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(7));
+  const signingKeys = generateKeyPairSync('ed25519');
+  let tokenGrants = 0;
+  let connected = 0;
+  const base = {
+    daemonKeys,
+    hostSigningKey: signingKeys.privateKey,
+    handleRequest: () => new Response('unused'),
+    getMemberToken: () => { tokenGrants += 1; return 'emt_local_only'; },
+    webSocketFactory: () => { connected += 1; throw new Error('stop before network'); },
+  };
+  for (const relayUrl of ['ws://relay.example.test/host', 'ws://0.0.0.0/host', 'ws://127.0.0.2/host']) {
+    await expect(connectRelayHost({ ...base, relayUrl })).rejects.toThrow('non-loopback relay connections require wss://');
+  }
+  expect(tokenGrants).toBe(0);
+  expect(connected).toBe(0);
+  for (const relayUrl of ['ws://localhost/host', 'ws://127.0.0.1/host', 'ws://[::1]/host']) {
+    await expect(connectRelayHost({ ...base, relayUrl })).rejects.toThrow('stop before network');
+  }
+  expect(tokenGrants).toBe(3);
+  expect(connected).toBe(3);
+});
+
+test('relay host abort during member-token mint never opens a socket', async () => {
+  const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(10));
+  const signingKeys = generateKeyPairSync('ed25519');
+  const controller = new AbortController();
+  let connected = false;
+  await expect(connectRelayHost({
+    relayUrl: 'wss://relay.example.test/host', daemonKeys,
+    hostSigningKey: signingKeys.privateKey, signal: controller.signal,
+    handleRequest: () => new Response('unused'),
+    getMemberToken: async () => { controller.abort(); return 'emt_unused'; },
+    webSocketFactory() { connected = true; throw new Error('must not connect'); },
+  })).rejects.toThrow('relay host connection aborted before socket');
+  expect(connected).toBe(false);
+});
+
 test('relay host identity stays inside the config root and rejects symlink parents', async () => {
   const root = mkdtempSync(join(tmpdir(), 'relay-identity-root-'));
   const outside = mkdtempSync(join(tmpdir(), 'relay-identity-outside-'));

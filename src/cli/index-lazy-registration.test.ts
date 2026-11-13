@@ -55,7 +55,8 @@ test('selected full-CLI commands keep their help and read-only actions without d
       env: { ...process.env, ELANOUS_CONFIG_DIR: join(dir, 'ignored-env-config') },
     });
     expect(unknownFlag.status).not.toBe(0);
-    expect(unknownFlag.stderr).toContain('DASHBOARD_EAGERLY_LOADED');
+    expect(unknownFlag.stderr).toContain("unknown option '--unknown-global'");
+    expect(unknownFlag.stderr).not.toContain('DASHBOARD_EAGERLY_LOADED');
     const fullHelp = spawnSync(process.execPath, ['bin/elanous.mjs', '--help'], {
       cwd: root, encoding: 'utf8', timeout: 30_000,
       env: { ...process.env, ELANOUS_CONFIG_DIR: join(dir, 'ignored-env-config') },

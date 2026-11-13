@@ -67,6 +67,7 @@ test('waive the failed tui node on the saved release path; record the original f
       nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }>;
     };
     seen.push(ctx);
+    if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     if (ctx.nodeId === 'tui') return { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}\n', stderr: '' };
     if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
@@ -128,7 +129,7 @@ if (process.argv[2] === 'rev-list') console.log('0');
       acceptedRegressions: [{ id: 'R2', note: 'Settings do not persist' }] }, deps);
     expect(resumed.state.status).toBe('done');
     const waived = resumed.state.nodes.find((node) => node.nodeId === 'tui')!;
-    expect(waived).toMatchObject({ ok: true, executed: false, exit: 0, waiver: { reason: 'Help does not close when requested', original: { exit: 1, output: '{"outcome":"fail","summary":"help-closes"}\n' } } });
+    expect(waived).toMatchObject({ ok: true, executed: false, exit: 0, waiver: { reason: 'Help does not close when requested', original: { exit: 1, output: '{"outcome":"fail","summary":"help-closes"}' } } });
     expect(JSON.parse(String(waived.output))).toMatchObject({ outcome: 'ok', verdict: 'waived' });
     expect(seen.filter((ctx) => ctx.nodeId === 'tui')).toHaveLength(1);
     expect(seen.find((ctx) => ctx.nodeId === 'known-issues')?.input.acceptedRegressions).toEqual([
@@ -158,6 +159,7 @@ test('a waived tui whose recorded failure has exit null (killed or timed out) st
   const waiverReason = 'The app may remain open after an interrupted launch';
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; outputs?: { gate?: { outcome?: string } } };
+    if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     if (ctx.nodeId === 'tui') return { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}\n', stderr: '' };
     if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
@@ -221,6 +223,7 @@ test('accepted regressions without a waiver are persisted and delivered to the g
       nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }>;
     };
     seen.push(ctx);
+    if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui' && ++tuiVisits === 1) return { exitCode: 1, stdout: '{"outcome":"fail"}', stderr: '' };
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}', stderr: '' };
@@ -256,6 +259,7 @@ test('a waived tui keeps its recorded issue while failed publish waits at approv
       outputs?: Record<string, { outcome?: string }>;
     };
     seen.push(ctx);
+    if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui') return ++tuiVisits === 1
       ? { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}', stderr: '' }
@@ -312,6 +316,7 @@ test('restarting before a waived tui (from mac-smoke) keeps its issue while publ
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }> };
     seen.push(ctx);
+    if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui') return ++tuiVisits === 1
       ? { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}', stderr: '' }
@@ -364,6 +369,7 @@ test.each(['partial', 'unknown'] as const)('real publish entrypoint routes %s pu
     const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as {
       nodeId: string; runId: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown>>;
     };
+    if (context.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
     if (context.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version, commit, branch: `release/${version}` }), stderr: '' };
     if (context.nodeId === 'prepare') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit, out: root }), stderr: '' };
     if (context.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${version}` }), stderr: '' };
@@ -499,6 +505,7 @@ test('release resume --gate-pod-pool updates the saved run input before re-runni
       return { exitCode: outcome === 'ok' ? 0 : outcome === 'error' ? 2 : 1,
         stdout: JSON.stringify({ outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: 'fixture receipt audit' }) + '\n', stderr: '' };
     }
+    if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
   };
@@ -614,6 +621,7 @@ test('release resume graph consumes the exact gate-waiver event and routes its n
   process.stdout.write = ((value: string | Uint8Array) => { lines.push(String(value).trim()); return true; }) as typeof process.stdout.write;
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; outputs?: { gate?: { outcome?: string } } };
+    if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"audit"}\n', stderr: '' };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutTip, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     // The gate output may not carry a commit; the event remains bound to the saved release cut.
     if (ctx.nodeId === 'gate') return { exitCode: 1, stdout: JSON.stringify({ outcome: 'error', commit: cutTip, introduced: [], introducedIds: [], error: 'pod sweep incomplete: worker interrupted' }) + '\n', stderr: '' };
@@ -683,7 +691,11 @@ test('release resume graph consumes the exact gate-waiver event and routes its n
     const gate = saved.nodes.find((node) => node.nodeId === 'gate');
     expect(JSON.parse(String(gate?.output))).toMatchObject({ outcome: 'ok', verdict: 'owner-waived', approvedBy: 'OP', reason });
     expect(gate).toMatchObject({ ok: true, executed: false, waiver: { reason } });
-    expect(saved.path[saved.path.indexOf('gate') + 1]).toBe('receipt-audit');
+    expect(saved.path).toContain('gate');
+    expect(saved.path).toContain('receipt-audit');
+    expect(saved.path.indexOf('gate')).toBeLessThan(saved.path.indexOf('receipt-audit'));
+    expect(saved.path.slice(saved.path.indexOf('gate') + 1, saved.path.indexOf('receipt-audit')))
+      .toEqual(['cloud-leave-ok', 'gate-cutover-switch']);
     expect(saved.nodes.find((node) => node.nodeId === 'receipt-audit')).toMatchObject({ ok: true, executed: true });
     expect(saved.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa).toMatchObject({ status: 'done' });
     expect(saved.nodes.find((node) => node.nodeId === 'prepare')).toMatchObject({ ok: true, executed: true });
@@ -718,4 +730,43 @@ test('owner gate waiver rejects every nonempty or malformed measured regression 
   expect(releaseResumeWaiver(unmeasured, { from: 'gate', ownerWaive: 'gate', reason: 'Owner approved known gate risk.', approvedBy: 'OP' }))
     .toMatchObject({ nodeId: 'gate', approvedBy: 'OP', ownerWaived: true, unmeasured: 'sweep incomplete: pod sweep incomplete: worker interrupted',
       acceptedRegressions: [{ id: 'waive:gate', note: 'Owner approved known gate risk.' }] });
+});
+
+test('rejected gate-heal terminal path instructs a new run and forged paths keep the generic refusal', () => {
+  const state = { graphId: 'release-loop', runId: 'rejected-heal-owner-waiver', status: 'failed',
+    path: ['version-release', 'gate', 'cloud-leave-error', 'gate-triage', 'gate-heal-decision', 'traffic-failed-restore', 'failed'],
+    nodes: [
+      { nodeId: 'version-release', ok: true, executed: true },
+      { nodeId: 'gate', ok: false, executed: true, exit: 1,
+        output: '{"outcome":"error","introduced":[],"error":"pod sweep incomplete: worker interrupted"}' },
+      { nodeId: 'cloud-leave-error', ok: true, executed: true },
+      { nodeId: 'gate-triage', ok: true, executed: true },
+      { nodeId: 'gate-heal-decision', ok: false, executed: false, output: '{"outcome":"rejected"}' },
+      { nodeId: 'traffic-failed-restore', ok: true, executed: true },
+      { nodeId: 'failed', ok: true, executed: false },
+    ], input: { version: '0.3.15', acceptedRegressions: [] } } as unknown as GraphRunState;
+  const request = { from: 'gate' as const, ownerWaive: 'gate' as const,
+    reason: 'Owner accepts an unmeasured gate risk.', approvedBy: 'OP' };
+  expect(() => releaseResumeWaiver(state, request)).toThrow('start a new release run from the same cut');
+  const failedCloud = structuredClone(state);
+  failedCloud.path[2] = 'cloud-leave-fail';
+  failedCloud.nodes[2]!.nodeId = 'cloud-leave-fail';
+  expect(() => releaseResumeWaiver(failedCloud, request)).toThrow('start a new release run from the same cut');
+  for (const mutate of [
+    (copy: GraphRunState) => { copy.path[0] = 'wrong-prefix'; },
+    (copy: GraphRunState) => { copy.nodes[0]!.nodeId = 'wrong-prefix'; },
+    (copy: GraphRunState) => { copy.path[0] = 'wrong-prefix'; copy.nodes[0]!.nodeId = 'wrong-prefix'; },
+    (copy: GraphRunState) => { copy.path.shift(); copy.nodes.shift(); },
+    (copy: GraphRunState) => { copy.path.splice(1, 0, 'wrong-prefix'); copy.nodes.splice(1, 0, { ...copy.nodes[0]!, nodeId: 'wrong-prefix' }); },
+    (copy: GraphRunState) => { copy.nodes[2]!.executed = false; },
+    (copy: GraphRunState) => { copy.nodes[4]!.output = '{"outcome":"approved"}'; },
+    (copy: GraphRunState) => { copy.nodes[5]!.executed = false; },
+    (copy: GraphRunState) => { copy.nodes[1]!.ok = true; },
+    (copy: GraphRunState) => { copy.nodes[1]!.executed = false; },
+    (copy: GraphRunState) => { copy.path.splice(1, 0, 'gate'); copy.nodes.splice(1, 0, { ...copy.nodes[1]! }); },
+  ]) {
+    const forged = structuredClone(state);
+    mutate(forged);
+    expect(() => releaseResumeWaiver(forged, request)).toThrow('owner waiver requires the failed executable gate');
+  }
 });

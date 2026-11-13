@@ -1,0 +1,10 @@
+{
+  "turnId": "surface-reply-golden-turn",
+  "progress": "응답을 준비하고 있습니다.",
+  "answer": "완료했습니다.",
+  "actions": ["검토하세요.", "공유하세요."],
+  "finalProse": "완료했습니다.\n\n할 일:\n- 검토하세요.\n- 공유하세요.",
+  "expectedFinalText": "완료했습니다.\n할 일: 검토하세요.\n할 일: 공유하세요.",
+  "failure": "요청을 처리하지 못했습니다.",
+  "internalMarker": "SURFACE-PRIVATE-INTERNAL"
+}

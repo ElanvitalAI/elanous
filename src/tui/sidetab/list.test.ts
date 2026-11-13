@@ -1,6 +1,6 @@
 import { NEXT_TUI_TITLE } from '../core/render.js';
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Terminal } from '@xterm/headless';
@@ -329,21 +329,24 @@ describe('next TUI sidetab', () => {
           return ready;
         } },
         steps: [
-          { label: 'sidetab-open-ctrl-backslash-default-scope', keys: '\x1c', until: (screen) => screen.includes('+ new') },
-          { label: 'sidetab-toggle-all-sessions', text: '/side all\r', until: (screen) => screen.includes('other-session') },
-          { label: 'sidetab-focus-list', keys: '\x1cs', until: (screen) => screen.includes('사이드탭 포커스') },
-          { label: 'sidetab-focus-escape-to-input', keys: '\x1b', until: (screen) => screen.includes('입력 포커스') },
-          { label: 'sidetab-prefix-return-parent', keys: '\x1cp', until: (screen) => screen.includes('부모 채팅') },
-          { label: 'sidetab-prefix-ordinal-two', keys: '\x1c2', until: (screen) => screen.includes('SIDETAB_SECOND_SESSION_MARKER') },
-          { label: 'sidetab-click-session-row', keys: '\x1b[<0;5;3M', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER') },
-          { label: 'sidetab-closed-ctrl-backslash', keys: '\x1c', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER') && !screen.includes('│') },
-          { label: 'sidetab-open-slash-alias', text: '/side', until: (screen) => screen.includes('other-session') },
-          { label: 'sidetab-closed-slash-alias', text: '/side', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER') && !screen.includes('│') },
+          { label: 'sidetab-open-ctrl-backslash-default-scope', keys: '\x1c', until: (screen) => screen.includes('+ new'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-toggle-all-sessions', text: '/side all\r', until: (screen) => screen.includes('other-session'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-focus-list', keys: '\x1cs', until: (screen) => screen.includes('사이드탭 포커스'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-focus-escape-to-input', keys: '\x1b', until: (screen) => screen.includes('입력 포커스'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-prefix-return-parent', keys: '\x1cp', until: (screen) => screen.includes('부모 채팅'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-prefix-ordinal-two', keys: '\x1c2', until: (screen) => screen.includes('SIDETAB_SECOND_SESSION_MARKER'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-click-session-row', keys: '\x1b[<0;5;4M', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER'), timeoutMs: 8_000 }, // Source: #36690 · T2 section header adds one row
+          { label: 'sidetab-closed-ctrl-backslash', keys: '\x1c', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER') && !screen.includes('│'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-open-slash-alias', text: '/side', until: (screen) => screen.includes('other-session'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-closed-slash-alias', text: '/side', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER') && !screen.includes('│'), timeoutMs: 8_000 }, // Source: #36690
         ],
         quitKeys: '\x11',
       });
       expect(run.frames[1]?.screen).not.toContain('other-session');
       expect(run.frames[1]?.screen.split('\n')).not.toContain('──');
+      // The default 24-row compact chat must still expose the session selector.
+      expect(run.frames[1]?.screen).toContain('+ new');
+      expect(run.frames[1]?.screen).toContain('│');
       expect(run.frames[2]?.screen).toContain('other-session');
       expect(run.frames[3]?.screen).toContain('사이드탭 포커스');
       expect(run.frames[4]?.screen).toContain('입력 포커스');
@@ -354,6 +357,85 @@ describe('next TUI sidetab', () => {
       expect(run.frames[9]?.screen).toContain('other-session');
       expect(run.frames[10]?.screen).toContain('SIDETAB_TARGET_SESSION_MARKER');
       expect(run.exitCode).toBe(0);
+    } finally {
+      setPtyManifestDbPathForTesting(null);
+      for (const name of envKeys) {
+        const value = savedEnv[name];
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('real next TUI renders five sections and persists their drag order', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'next-sidetab-sections-'));
+    try {
+      writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+      const run = await mockSeatPtySequence({
+        executable: process.execPath,
+        args: [BIN, '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
+        root, rows: 24, cols: 80,
+        env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
+        ready: { label: 'next-ready', timeoutMs: 30_000, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) }, // Source: #37153 live Next PTY readiness
+        steps: [
+          { label: 'five-sections', keys: '\x1c', until: (screen) =>
+            ['Sessions · 0', 'Harness runs · 0', 'Pods · 0', 'Herdr · 0', 'Remote · 0'].every((label) => screen.includes(label)) },
+          { label: 'drag-remote-first', keys: '\x1b[<0;5;7M\x1b[<32;5;3M\x1b[<0;5;3m', until: (screen) =>
+            screen.indexOf('Remote · 0') >= 0 && screen.indexOf('Remote · 0') < screen.indexOf('Sessions · 0') },
+          { label: 'drag-remote-to-end', keys: '\x1b[<0;5;3M\x1b[<32;5;8M\x1b[<0;5;8m', until: (screen) =>
+            screen.indexOf('Remote · 0') > screen.indexOf('Herdr · 0') },
+        ],
+        quitKeys: '\x11',
+      });
+      expect(run.exitCode).toBe(0);
+      const index = JSON.parse(readFileSync(join(root, 'sessions', 'index.json'), 'utf8')) as Array<{
+        uiState?: { sidetabSectionOrder?: string[] };
+      }>;
+      expect(index[0]?.uiState?.sidetabSectionOrder).toEqual(['sessions', 'harness', 'pods', 'herdr', 'remote']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('real Next PTY scroll reaches empty sections after a long session list and drags one', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'next-sidetab-long-sections-'));
+    const envKeys = ['ELANOUS_STATE_DIR', 'ELANOUS_STATE_DIR_SOURCE', 'ELANOUS_SESSION_ROOT'] as const;
+    const savedEnv = Object.fromEntries(envKeys.map((name) => [name, process.env[name]]));
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      process.env.ELANOUS_STATE_DIR_SOURCE = 'explicit';
+      process.env.ELANOUS_SESSION_ROOT = join(root, 'sessions');
+      setPtyManifestDbPathForTesting(join(root, 'pty', 'manifest.db'));
+      writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+      const now = Date.now();
+      for (let index = 0; index < 30; index++) { // 출처: #37153 긴 세션 목록의 빈 구획 접근 반례
+        const session = createSession({ source: 'tui' });
+        const ptyId = `tui:${83000 + index}`;
+        upsertPtyManifest({ id: ptyId, kind: 'tui', cmd: 'elanous', purpose: `long-session-${index}`,
+          startedAt: now + index, now: now + index });
+        expect(updatePtyManifestSession(ptyId, session.id, now + index)).toBe(true);
+      }
+      const run = await mockSeatPtySequence({
+        executable: process.execPath,
+        args: [BIN, '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
+        root, rows: 24, cols: 80,
+        env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
+        ready: { label: 'next-ready', timeoutMs: 30_000, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) }, // 출처: #37153 실제 Next PTY 준비
+        steps: [
+          { label: 'open-sidetab', keys: '\x1c', timeoutMs: 8_000, until: (screen) => screen.includes('+ new') }, // 출처: #37153 실제 PTY 단계 대기
+          { label: 'all-rows', keys: '/side all\r', timeoutMs: 8_000, until: (screen) => /Sessions · 3[01]/.test(screen) }, // 출처: #37153 실제 PTY 단계 대기
+          { label: 'scroll-to-empty-sections', chunks: Array.from({ length: 12 }, () => '\x1b[<65;5;10M'), gapMs: 50,
+            timeoutMs: 8_000, until: (screen) => screen.includes('Remote · 0') }, // 출처: #37153 wheel viewport 끝 clamp
+          { label: 'drag-empty-remote', keys: '\x1b[<0;5;22M\x1b[<32;5;19M\x1b[<0;5;19m', timeoutMs: 8_000, until: (screen) => // 출처: #37153 실제 PTY 단계 대기
+            screen.indexOf('Remote · 0') >= 0 && screen.indexOf('Remote · 0') < screen.indexOf('Harness runs · 0') },
+        ],
+        quitKeys: '\x11',
+      });
+      expect(run.exitCode).toBe(0);
+      const index = JSON.parse(readFileSync(join(root, 'sessions', 'index.json'), 'utf8')) as Array<{
+        uiState?: { sidetabSectionOrder?: string[] };
+      }>;
+      expect(index[0]?.uiState?.sidetabSectionOrder).toEqual(['sessions', 'remote', 'harness', 'pods', 'herdr']);
     } finally {
       setPtyManifestDbPathForTesting(null);
       for (const name of envKeys) {
@@ -383,16 +465,16 @@ describe('next TUI sidetab', () => {
           { label: 'open-new-menu', keys: '/side new\r', timeoutMs: 15_000, until: (screen) => screen.includes('새 PTY') },
           { label: 'spawn-shell', keys: 's', timeoutMs: 15_000, until: (screen) => screen.includes('shell ─') },
           { label: 'detach-shell', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next TUI') },
-          { label: 'attach-shell', keys: '\x1b[B\r', timeoutMs: 15_000, until: (screen) => screen.includes('shell ─') },
+          { label: 'attach-shell', keys: '\x1b[<0;5;8M\r', timeoutMs: 15_000, until: (screen) => screen.includes('shell ─') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
           { label: 'detach-shell-again', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next TUI') && !screen.includes('╭') },
-          { label: 'kill-shell', keys: '/side kill\r', timeoutMs: 15_000, until: (screen) => screen.includes('종료 요청 완료') },
+          { label: 'kill-shell', keys: '/side kill\r', timeoutMs: 15_000, until: (screen) => !screen.includes('shell · Next TUI') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
         ],
         quitKeys: '\x11',
       });
       expect(run.frames.some((frame) => frame.label === 'spawn-shell' && frame.screen.includes('shell'))).toBe(true);
       expect(run.frames.some((frame) => frame.label === 'detach-shell' && frame.screen.includes('PTY 분리됨') && frame.screen.includes('shell · Next TUI'))).toBe(true);
       expect(run.frames.some((frame) => frame.label === 'attach-shell' && frame.screen.includes('shell'))).toBe(true);
-      expect(run.frames.some((frame) => frame.label === 'kill-shell' && frame.screen.includes('종료 요청 완료'))).toBe(true);
+      expect(run.frames.some((frame) => frame.label === 'kill-shell' && !frame.screen.includes('shell · Next TUI'))).toBe(true);
       expect(run.exitCode).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });

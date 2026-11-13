@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TUI-400-RUNTIME-CONTRACT-TS",
+  "path": "src/ux-sim/tui-400-runtime-contract.ts",
+  "boundary": "Defines the typed production boot, plain-turn and autoheal runtime injected into the isolated Codex 400 simulator; it does not boot a live TUI.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

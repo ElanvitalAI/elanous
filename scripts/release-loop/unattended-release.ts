@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { userConfigPath } from '../../src/user-config.js';
@@ -49,16 +49,53 @@ function gitOutput(repo: string, args: string[]): string {
   return result.stdout.trim();
 }
 
+/** Canonical REL record release-exec-patch-manifest-0623.json.
+ *  The env path only locates this file. Its SHA256 is the trust anchor.
+ *  Recorded diff SHA256 is 5b1e0deda2d77c50e8e9cd2ed8f358199ac9618db72cf610ca760a59fb50ef96.
+ */
+export const APPROVED_RELEASE_EXEC_PATCH_MANIFEST_SOURCE = 'release-exec-patch-manifest-0623.json';
+export const APPROVED_RELEASE_EXEC_PATCH_MANIFEST_SHA256 = '2dc5022e5872e19bdb0ec1e5ad9139e1dbdb38b1454a0d5393ae5a74fcfed391';
+
+const RELEASE_EXEC_PATCH_PATHS = [
+  'scripts/release-loop/publish-node.ts',
+  'scripts/release-loop/unattended-release.ts',
+  'scripts/release-loop/version-node.ts',
+] as const;
+
 /** A stale installed/seat CLI must not start a release graph with recipes that differ from main. */
 export function assertReleaseCliCurrent(repo: string, cutCommit?: string): void {
-  if (gitOutput(repo, ['status', '--porcelain', '--untracked-files=all'])) {
-    throw new Error('release CLI checkout has uncommitted changes');
+  const dirty = gitOutput(repo, ['status', '--porcelain', '--untracked-files=all']);
+  if (dirty) {
+    const manifestPath = process.env.ELANOUS_RELEASE_EXEC_PATCH_MANIFEST;
+    if (!manifestPath) throw new Error('release CLI checkout has uncommitted changes');
+    const bytes = readFileSync(manifestPath);
+    const fileSha256 = createHash('sha256').update(bytes).digest('hex');
+    if (basename(manifestPath) !== APPROVED_RELEASE_EXEC_PATCH_MANIFEST_SOURCE
+      || fileSha256 !== APPROVED_RELEASE_EXEC_PATCH_MANIFEST_SHA256) {
+      throw new Error('unapproved release CLI execution patch manifest');
+    }
+    const manifest = JSON.parse(bytes.toString('utf8')) as
+      { baseHead?: unknown; paths?: unknown; diffSha256?: unknown };
+    const paths = [...RELEASE_EXEC_PATCH_PATHS];
+    const actual = dirty.split('\n').map((row) => row.replace(/^\s*[A-Z?!]{1,2}\s+/, '')).sort();
+    const expected = [...paths].sort();
+    const head = gitOutput(repo, ['rev-parse', 'HEAD']);
+    const diff = gitOutput(repo, ['diff', '--binary', '--', ...paths]);
+    const digest = createHash('sha256').update(diff).digest('hex');
+    if (manifest.baseHead !== head || JSON.stringify(manifest.paths) !== JSON.stringify(expected)
+      || JSON.stringify(actual) !== JSON.stringify(expected) || manifest.diffSha256 !== digest
+      || gitOutput(repo, ['diff', '--cached', '--name-only'])) {
+      throw new Error('release CLI execution patch manifest does not match checkout');
+    }
   }
   const head = gitOutput(repo, ['rev-parse', 'HEAD']);
   const remoteMain = gitOutput(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
   if (!remoteMain || !/^[0-9a-f]{40,64}$/i.test(remoteMain)) throw new Error('cannot resolve origin/main for release CLI freshness check');
   const cutParent = cutCommit ? gitOutput(repo, ['rev-parse', `${cutCommit}^{commit}^`]) : undefined;
-  if (head !== remoteMain && head !== cutParent) {
+  const remoteReleaseTips = (cutCommit === undefined || cutCommit === head)
+    ? gitOutput(repo, ['ls-remote', 'origin', 'refs/heads/release/*']).split('\n').map((line) => line.split(/\s+/)[0]) : [];
+  const exactReleaseTip = remoteReleaseTips.includes(head);
+  if (head !== remoteMain && head !== cutParent && !exactReleaseTip) {
     throw new Error(`stale release CLI: HEAD ${head} does not match origin/main ${remoteMain}${cutParent ? ` or cut parent ${cutParent}` : ''}`);
   }
 }
@@ -75,6 +112,8 @@ export interface ReleaseLoopConfig {
   gatePodPool?: string;
   gatePodBunCache?: string;
   gatePodShards?: number;
+  /** Release-room opt-in: start every gate shard fresh for the cold cut. */
+  gatePodFreshShards?: boolean;
   /** GATE-TIMEOUT-HEAL — the per-shard deadline floor; each shard gets planned × 1.5 above it (capped). */
   gatePodShardTimeoutSeconds?: number;
   /** GATE-INSTALL-CACHE — concurrent `bun install`s per gate node (default 4 · 0 = off). */
@@ -233,6 +272,7 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
     version, previousVersion,
     ...(cutCommit !== undefined ? { cutCommit } : {}),
     ...(method.executor === 'pod' ? { gatePodPool: method.pool } : {}),
+    ...(method.executor === 'pod' && process.env.ELANOUS_RELEASE_FORCE_FRESH_SHARDS === '1' ? { gatePodFreshShards: true } : {}),
     gateExecutor: method.executor,
     gateImagePin: method.imagePin,
     // A future policy may select host; only then can its validated host request reach this input.
@@ -342,7 +382,13 @@ async function runUnattendedReleaseLocked(
   if (findActiveReleaseRun(version, root)) throw new ReleaseRunClaimConflict();
   const runInventory = listGraphRuns(root);
   if (runInventory.unreadable > 0) throw new Error(`cannot safely claim release ${version}: ${runInventory.unreadable} graph run ledger(s) are unreadable`);
+  // Fan-out children (prefetch, checklist-gate, regression-suite) are separate release-loop
+  // ledgers. Their graph still lists version-release, and a finished child is status=done.
+  // Only a root — entry is version-release, no parent — may block or satisfy this launch.
   const priorRuns = runInventory.runs.filter((run) => run.graphId === 'release-loop'
+    && run.parentRunId === undefined
+    && (run.entryNodeId === undefined || run.entryNodeId === 'version-release')
+    && run.path[0] === 'version-release'
     && !!run.input && typeof run.input === 'object' && !Array.isArray(run.input)
     && (run.input as Record<string, unknown>).version === version);
   const completed = priorRuns.find((run) => run.status === 'done' || run.status === 'awaiting-approval');

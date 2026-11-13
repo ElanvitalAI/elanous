@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-CHAOS-HQ-TASK-QUEUE-TS",
+  "path": "src/ux-sim/chaos-hq-task-queue.ts",
+  "boundary": "Persists simulated TASK claims and completion receipts; validates captured caller PID against the live process and assigned worker across restart, requeue and lease generation changes.",
+  "deviceIds": [
+    "chaos-hq-move-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

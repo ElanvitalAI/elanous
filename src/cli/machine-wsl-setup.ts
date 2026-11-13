@@ -27,6 +27,8 @@ export interface MachineWslSetupResult {
 
 export type MachineWslResumeTrigger = 'onstart' | 'onlogon';
 
+export const WSL_RESUME_FAILURE_GUIDANCE = 'Sign in to Windows and run eln machine apply --resume to finish WSL setup.';
+
 export interface MachineWslSetupDeps {
   readonly run?: (command: string, args: readonly string[], captureOutput?: boolean) => MachineWslCommandResult;
   readonly platform?: string;
@@ -45,9 +47,8 @@ export interface MachineWslSetupDeps {
 const RESUME_TASK_NAME = 'ElanousMachineSetupResume';
 
 function resumeTriggerDetail(trigger: MachineWslResumeTrigger): string {
-  return trigger === 'onlogon'
-    ? 'After reboot, Windows sign-in resumes setup automatically; complete Codex identity login on Windows.'
-    : 'Reboot resumes setup automatically; sign in to Codex once on Windows. WSL does not create or refresh Codex credentials.';
+  if (trigger !== 'onlogon') throw new Error('WSL resume requires an ONLOGON trigger');
+  return `After reboot, sign in to the installing Windows account to resume setup. If the task fails, ${WSL_RESUME_FAILURE_GUIDANCE} Complete Codex identity login on Windows.`;
 }
 
 function run(command: string, args: readonly string[], captureOutput = false): MachineWslCommandResult {
@@ -95,7 +96,7 @@ function buildMachineWslResumeArguments(input: {
 }): string[] {
   const args = [currentMachineWslEntry(input.entry), 'machine', 'apply', '--from', input.capture, '--profile', input.profile,
     '--platform', 'wsl', '--distribution', input.distribution, '--wsl-user', input.user,
-    '--resume-trigger', input.resumeTrigger ?? 'onstart', '--resume', '--yes'];
+    '--resume-trigger', input.resumeTrigger ?? 'onlogon', '--resume', '--yes'];
   if (input.resumeTaskWrapperPath) args.push('--resume-task-wrapper', input.resumeTaskWrapperPath);
   return args;
 }
@@ -109,29 +110,37 @@ function xmlEscape(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-// Source: Microsoft Task Scheduler XML schema version 1.2 supports BootTrigger and S4U principals.
+function isLocalSystemAccount(windowsUser: string, computerName?: string): boolean {
+  const machineAccount = computerName?.trim();
+  return /^(?:NT AUTHORITY\\)?SYSTEM$/i.test(windowsUser)
+    || Boolean(machineAccount && windowsUser.toUpperCase() === `${machineAccount.toUpperCase()}$`);
+}
+
+// Source: Microsoft Task Scheduler XML schema version 1.2 supports a user-scoped LogonTrigger.
 const MACHINE_WSL_TASK_XML_VERSION = '1.2';
 
 export function buildMachineWslStartupTaskXml(input: {
   readonly executable: string;
   readonly arguments: string;
   readonly windowsUser: string;
+  readonly computerName?: string;
   readonly trigger?: MachineWslResumeTrigger;
 }): string {
   const windowsUser = input.windowsUser.trim();
-  const trigger = input.trigger ?? 'onstart';
+  const trigger = input.trigger ?? 'onlogon';
   if (!windowsUser || /[\r\n\0]/.test(windowsUser)) throw new Error('Windows account name is required for startup resume');
   if (!input.executable || /[\r\n\0]/.test(input.executable)) throw new Error('startup resume executable is invalid');
   if (/\0/.test(input.arguments)) throw new Error('startup resume arguments are invalid');
-  const triggerXml = trigger === 'onstart'
-    ? '<BootTrigger><Enabled>true</Enabled></BootTrigger>'
-    : `<LogonTrigger><Enabled>true</Enabled><UserId>${xmlEscape(windowsUser)}</UserId></LogonTrigger>`;
-  const logonType = trigger === 'onstart' ? 'S4U' : 'InteractiveToken';
+  // WSL distributions belong to the installing Windows user. LocalSystem cannot resume them.
+  const localSystem = isLocalSystemAccount(windowsUser, input.computerName);
+  if (localSystem) throw new Error('WSL resume requires the installing Windows account, not LocalSystem');
+  if (trigger !== 'onlogon') throw new Error('WSL resume requires an ONLOGON trigger');
+  const triggerXml = `<LogonTrigger><Enabled>true</Enabled><UserId>${xmlEscape(windowsUser)}</UserId></LogonTrigger>`;
   return [
     `<?xml version="1.0" encoding="UTF-16"?>`,
     `<Task version="${MACHINE_WSL_TASK_XML_VERSION}" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">`,
     `<Triggers>${triggerXml}</Triggers>`,
-    `<Principals><Principal id="Author"><UserId>${xmlEscape(windowsUser)}</UserId><LogonType>${logonType}</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>`,
+    `<Principals><Principal id="Author"><UserId>${xmlEscape(windowsUser)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>`,
     '<Settings><Enabled>true</Enabled><StartWhenAvailable>true</StartWhenAvailable></Settings>',
     `<Actions Context="Author"><Exec><Command>${xmlEscape(input.executable)}</Command><Arguments>${xmlEscape(input.arguments)}</Arguments></Exec></Actions>`,
     '</Task>',
@@ -181,6 +190,7 @@ function buildMachineWslResumeTaskWrapper(input: {
     '$resumeArgs = @($resume.arguments)',
     '& $resume.executable @resumeArgs',
     '$resumeExit = $LASTEXITCODE',
+    `if ($resumeExit -ne 0) { $guidance = '${WSL_RESUME_FAILURE_GUIDANCE}'; Write-Host $guidance; & eventcreate.exe /L APPLICATION /T ERROR /ID 100 /SO ElanousMachineSetupResume /D $guidance 2>$null | Out-Null; Add-Content -LiteralPath (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'machine-setup-resume.log') -Value $guidance -ErrorAction SilentlyContinue }`,
     'if ($resumeExit -eq 0 -and (Test-Path -LiteralPath $MyInvocation.MyCommand.Path)) { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force }',
     'exit $resumeExit',
     '',
@@ -227,7 +237,7 @@ markAttempt: () => void): {
   if (!taskDefinitionPath) return { result: { status: null, errorCode: 'LOCALAPPDATA_REQUIRED' } };
   const action = machineWslResumeTaskAction(taskDefinitionPath, env);
   const taskXml = buildMachineWslStartupTaskXml({ executable: action.executable, arguments: action.arguments,
-    windowsUser, trigger: input.resumeTrigger });
+    windowsUser, computerName: env.COMPUTERNAME, trigger: input.resumeTrigger });
   const wrapper = buildMachineWslResumeTaskWrapper(input, action.wrapperPath);
   try {
     writeResumeTaskWrapper(action.wrapperPath, wrapper, deps.writeResumeTaskWrapper);
@@ -432,6 +442,8 @@ export function applyMachineWslBootstrap(input: {
   const deps = input.deps ?? {};
   const platform = deps.platform ?? process.platform;
   if (platform !== 'win32') throw new Error('WSL bootstrap must run from Windows; run machine apply inside WSL to apply a profile');
+  if (input.resumeTrigger === 'onstart') return fail(distribution, user, 'register-resume', { status: null }, 0,
+    `WSL resume requires the installing Windows account at sign-in. ${WSL_RESUME_FAILURE_GUIDANCE}`);
   const command = deps.run ?? run;
   let attempted = 0;
   const invoke = (name: string, args: readonly string[], captureOutput = false) => {
@@ -462,19 +474,21 @@ export function applyMachineWslBootstrap(input: {
     const executable = deps.executable ?? process.execPath;
     const entry = deps.entry ?? process.argv[1];
     if (!entry) throw new Error('cannot register WSL resume because the Elanous entry path is unavailable');
-    const windowsUser = (deps.env ?? process.env).USERNAME?.trim();
-    if (!deps.scheduleResume && !windowsUser) return fail(distribution, user, 'register-resume', { status: null,
-      errorCode: 'WINDOWS_USER_REQUIRED' }, attempted, 'cannot register an unattended startup task without the current Windows account name');
+    const windowsEnv = deps.env ?? process.env;
+    const windowsUser = windowsEnv.USERNAME?.trim();
+    if (!deps.scheduleResume && (!windowsUser || isLocalSystemAccount(windowsUser, windowsEnv.COMPUTERNAME)))
+      return fail(distribution, user, 'register-resume', { status: null }, attempted,
+        `Run setup from the installing Windows account; LocalSystem cannot access that user's WSL distribution. ${WSL_RESUME_FAILURE_GUIDANCE}`);
     const registration = registerMachineWslResumeTask({ executable, entry, capture: input.capture,
-      profile: input.profile, distribution, user, resumeTrigger: input.resumeTrigger }, deps, windowsUser ?? '', invoke, () => { attempted += 1; });
+      profile: input.profile, distribution, user, resumeTrigger: 'onlogon' }, deps, windowsUser ?? '', invoke, () => { attempted += 1; });
     if (registration.result.status !== 0) {
       return failResumeRegistration(distribution, user, registration.result, attempted,
         registration.taskDefinitionPath, registration.wrapperPath);
     }
     const installed = invoke('wsl.exe', ['--install', '--distribution', distribution, '--no-launch'], true);
     if (installed.status !== 0) return fail(distribution, user, 'wsl-install', installed, attempted);
-    const resumeTrigger = input.resumeTrigger ?? 'onstart';
-    return { kind: 'machine-wsl-setup-result', status: 'resume-pending', distribution, user, resumeTrigger: input.resumeTrigger ?? 'onstart',
+    const resumeTrigger = 'onlogon';
+    return { kind: 'machine-wsl-setup-result', status: 'resume-pending', distribution, user, resumeTrigger,
       detail: `${preflightWarning ? `${preflightWarning} ` : ''}WSL install requested. ${resumeTriggerDetail(resumeTrigger)}`,
       attempted, failures: [] };
   }
@@ -488,9 +502,11 @@ export function applyMachineWslBootstrap(input: {
     const executable = deps.executable ?? process.execPath;
     const entry = deps.entry ?? process.argv[1];
     if (!entry) throw new Error('cannot register WSL resume because the Elanous entry path is unavailable');
-    const windowsUser = (deps.env ?? process.env).USERNAME?.trim();
-    if (!deps.scheduleResume && !windowsUser) return fail(distribution, user, 'register-resume', { status: null,
-      errorCode: 'WINDOWS_USER_REQUIRED' }, attempted, 'cannot register an unattended startup task without the current Windows account name');
+    const windowsEnv = deps.env ?? process.env;
+    const windowsUser = windowsEnv.USERNAME?.trim();
+    if (!deps.scheduleResume && (!windowsUser || isLocalSystemAccount(windowsUser, windowsEnv.COMPUTERNAME)))
+      return fail(distribution, user, 'register-resume', { status: null }, attempted,
+        `Run setup from the installing Windows account; LocalSystem cannot access that user's WSL distribution. ${WSL_RESUME_FAILURE_GUIDANCE}`);
     const registration = registerMachineWslResumeTask({ executable, entry, capture: input.capture,
       profile: input.profile, distribution, user, resumeTrigger }, deps, windowsUser ?? '', invoke, () => { attempted += 1; });
     if (registration.result.status !== 0) {
