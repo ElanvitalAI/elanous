@@ -110,7 +110,7 @@ export function assertPwaMailWaiver(
   let cut: unknown;
   try { cut = JSON.parse(String(cutNode?.output ?? '{}')).commit; } catch { /* invalid source */ }
   const inputCut = (state.input as { cutCommit?: unknown } | undefined)?.cutCommit;
-  if (typeof version !== 'string' || !VERSION.test(version) || version !== '0.3.15'
+  if (typeof version !== 'string' || !VERSION.test(version)
     || typeof cut !== 'string' || !CUT.test(cut)
     || (inputCut !== undefined && inputCut !== cut))
     throw new Error('PWA mail waiver run version or cut unavailable');

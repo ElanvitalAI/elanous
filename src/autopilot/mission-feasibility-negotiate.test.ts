@@ -71,9 +71,14 @@ describe('defaultJudge role pin', () => {
   it('기본 하드코딩 모델 없이 planning overlay 를 쓰고 env 가 우선한다', async () => {
     const oldNegotiate = process.env.ELANOUS_NEGOTIATE_MODEL;
     const oldDecompose = process.env.ELANOUS_DECOMPOSE_MODEL;
+    // Provider wire expectations run with the mocked transport, not the
+    // gate's default fake LLM (#36422) — declare real mode like the other
+    // provider-resolution tests (cf. llm-openrouter-reasoning.test.ts).
+    const oldMode = process.env.ELANOUS_LLM_MODE;
     const stream = spyOn(llm, 'streamLLM').mockResolvedValue('{"kind":"replan"}');
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
+      process.env.ELANOUS_LLM_MODE = 'real';
       delete process.env.ELANOUS_NEGOTIATE_MODEL;
       delete process.env.ELANOUS_DECOMPOSE_MODEL;
       for (const path of ['mission-feasibility-negotiate.ts', 'system-lookback-run.ts']) {
@@ -99,6 +104,8 @@ describe('defaultJudge role pin', () => {
       log.mockRestore();
       stream.mockRestore();
       setUserConfigOverlay(null);
+      if (oldMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = oldMode;
       if (oldNegotiate === undefined) delete process.env.ELANOUS_NEGOTIATE_MODEL;
       else process.env.ELANOUS_NEGOTIATE_MODEL = oldNegotiate;
       if (oldDecompose === undefined) delete process.env.ELANOUS_DECOMPOSE_MODEL;

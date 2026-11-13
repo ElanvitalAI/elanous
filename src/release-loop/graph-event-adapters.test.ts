@@ -213,6 +213,9 @@ test('live OP inbox receives production gate failure and ARG repair lifecycle ev
         input: { version: '0.3.6', previousVersion: '0.3.5', gateExecutor: 'pod' }, deps: {
           root, releaseGraphEventAdapters: true,
           runBash: async (command: string, opts) => {
+            // The release graph cutover switch selects a declared route, not generic ok.
+            if (command.includes('gate-cutover-switch-node.ts'))
+              return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy' }), stderr: '' };
             if (command.includes('gate-node.ts --json')) {
               gateVisits++;
               return gateVisits === 1
@@ -367,8 +370,12 @@ test('runGraph restores queued subscriber actions across approval resume and reg
   const seen: string[] = [];
   bus.subscribe((event) => { seen.push(`${event.graphId}:${event.type}`); });
   try {
-    writeFileSync(join(root, 'recipes.yaml'), 'publish:\n  approval: "Continue?"\n');
-    const approvalGraph = join(root, 'approval.yaml');
+    // Keep the release fixture's plugin manifest scoped to its own directory;
+    // the independent parent/worker fixtures below must not inherit that owner.
+    const approvalDirectory = join(root, 'approval');
+    mkdirSync(approvalDirectory);
+    writeFileSync(join(approvalDirectory, 'recipes.yaml'), 'publish:\n  approval: "Continue?"\n');
+    const approvalGraph = join(approvalDirectory, 'approval.yaml');
     writeReleaseGraphFixture(approvalGraph, [
       'graph_id: release-loop', 'version: 1', 'entry_node: approve-publish', 'terminal_nodes: [done, failed]', 'nodes:',
       '  - { node_id: approve-publish, kind: judge, recipe: approval:publish, max_visits: 1 }',
@@ -396,6 +403,7 @@ test('runGraph restores queued subscriber actions across approval resume and reg
       '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }', '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }',
       'edges:', '  - { from: emit, to: done }', '',
     ].join('\n'));
+    writeFileSync(join(root, 'recipes.yaml'), '{}\n');
     const parentGraph = join(root, 'parent.yaml');
     writeFileSync(parentGraph, [
       'graph_id: parent-contract', 'version: 1', 'entry_node: invoke', 'terminal_nodes: [done, failed]', 'nodes:',

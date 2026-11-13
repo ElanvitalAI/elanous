@@ -723,7 +723,7 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
       && !s.includes('대기 1') && !s.includes('대기 2'), timeoutMs: 60_000 },
     // The draft becomes a slow turn; one more is queued behind it. Esc cancels this
     // ordinary chat turn and restores that queued input to the composer.
-    { label: 'slow draft turn started', text: ` ${slow}`, until: (s) => s.includes('slow draft held') && s.includes('턴 스트리밍'), timeoutMs: 30_000 },
+    { label: 'slow draft turn started', text: ` ${slow}`, until: (s) => s.includes('응답을 준비하고 있습니다.') && s.includes('턴 스트리밍'), timeoutMs: 30_000 },
     { label: 'fifth turn queued', text: '다섯째', until: (s) => s.includes('대기 1'), timeoutMs: 10_000 },
     { label: 'unsent draft stays behind queue', text: '미전송 초안', enter: false, until: (s) => s.includes('대기 1') && s.includes('미전송 초안'), timeoutMs: 10_000 },
     // Source: .rules/30-harness/testing-gates.md — immediate Esc recovery has a two-second upper bound.

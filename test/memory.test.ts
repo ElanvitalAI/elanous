@@ -13,21 +13,38 @@ import {
   writeFileDurable,
 } from '../src/memory';
 
+// #36659 gave ELANOUS_STATE_DIR precedence over XDG_DATA_HOME in memoryRoot(),
+// and test/preload-isolation.ts sets ELANOUS_STATE_DIR process-wide for every
+// bun test run — a per-test XDG_DATA_HOME override alone no longer isolates
+// this store. Isolate through the winning layer instead (save/restore pattern
+// per test/acp-session-bounding.test.ts).
 let root: string;
+const ORIG_STATE_DIR = process.env.ELANOUS_STATE_DIR;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'memory-'));
-  process.env.XDG_DATA_HOME = root;
+  process.env.ELANOUS_STATE_DIR = root;
+  process.env.XDG_DATA_HOME = join(root, 'xdg-data');
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
   delete process.env.XDG_DATA_HOME;
+  if (ORIG_STATE_DIR === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = ORIG_STATE_DIR;
 });
 
 function memDir() { return join(root, 'elanous', 'memory'); }
 
-describe('memoryRoot respects XDG_DATA_HOME', () => {
-  test('path under XDG_DATA_HOME/elanous/memory', () => {
+describe('memoryRoot environment precedence', () => {
+  test('ELANOUS_STATE_DIR wins, then XDG_DATA_HOME is the fallback', () => {
     expect(memoryRoot()).toBe(memDir());
+    const saved = process.env.ELANOUS_STATE_DIR;
+    delete process.env.ELANOUS_STATE_DIR;
+    try {
+      expect(memoryRoot()).toBe(join(root, 'xdg-data', 'elanous', 'memory'));
+    } finally {
+      if (saved === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = saved;
+    }
   });
 });
 

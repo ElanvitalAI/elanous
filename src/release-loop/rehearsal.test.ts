@@ -658,7 +658,7 @@ test('rehearsal tick stamps a failed TUI screen result as an error, not a succes
 test('explicit shard count and host reach the RC run and its stamp', async () => {
   const root = newRoot();
   const h = harness(at(420), rc({ shards: 4, remote: 'aws1' }));
-  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { reason: string; plannedShards?: number } }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => {
     selections.push(selection);
@@ -666,7 +666,7 @@ test('explicit shard count and host reach the RC run and its stamp', async () =>
   };
   const tick = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, shards: 12, remote: 'aws1' }, h.deps);
   expect(tick.status).toBe('due');
-  expect(selections).toEqual([{ shards: 4, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true, fullFallback: { reason: 'requested shard count 12 does not match the full host gate' } }]);
   expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 4, remote: 'aws1' }, result: { shards: 4, remote: 'aws1' } });
 });
 
@@ -698,7 +698,7 @@ test('measured rc-7h gate failure remains error after shard normalization', asyn
 
 test('no-option tick calls the actual planner with selected files, stored board and resources', async () => {
   const root = newRoot(), h = harness(at(420), rc());
-  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { reason: string; plannedShards?: number } }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
   h.deps.shardPlan = planRehearsalShards;
@@ -709,13 +709,13 @@ test('no-option tick calls the actual planner with selected files, stored board 
     board: () => ({ v: 1, version: schedule.version, updatedAt: at(420).toISOString(), shards: Array.from({ length: 5 }, (_, i) => ({ id: String(i), state: 'done' })) }),
   };
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
-  expect(selections).toEqual([{ shards: 4, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true, fullFallback: { reason: 'planned shard count 3 does not match the aws1 host-gate contract; selected file memory not measured: 3/3; importer coverage not reported; selected-file memory revision is not verified; planned shard count 3 does not match the full host gate', plannedShards: 3 } }]);
   expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 4 }, shardPlan: { testFiles: 3, gatePlanShards: 5, resources: { cpus: 2, freeBytes: 8e9, totalBytes: 16e9 } } });
   expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
 });
 
 test('complete selected-file memory and a measured RC can finish a no-option tick as ok', async () => {
-  const root = newRoot(), h = harness(at(420), rc({ shards: 2 }));
+  const root = newRoot(), h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS }));
   h.deps.shardPlan = planRehearsalShards;
   h.deps.shardPlanDeps = {
     resolveBase: () => 'base', readAlways: () => 'test/always.test.ts',
@@ -725,14 +725,13 @@ test('complete selected-file memory and a measured RC can finish a no-option tic
     board: () => ({ v: 1, version: schedule.version, updatedAt: at(420).toISOString(), shards: [{ id: '0', state: 'done' }, { id: '1', state: 'done' }] }),
   };
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 2 }, shardPlan: { testFiles: 2, gatePlanShards: 2, unmeasured: null } });
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: LIGHT_RC_DEFAULT_SHARDS, fullFallback: { plannedShards: 2, reason: 'planned shard count 2 does not match the aws1 host-gate contract; planned shard count 2 does not match the full host gate' } }, shardPlan: { testFiles: 2, gatePlanShards: 2, unmeasured: null } });
 });
 
 test('remote no-option tick does not use local memory to cap its shard count', async () => {
   for (const freeBytes of [3 * 1024 ** 3, 7 * 1024 ** 3, 227 * 1024 ** 3]) {
-    const expected = 5;
     const root = newRoot(), h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS }));
-    const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+    const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { reason: string; plannedShards?: number } }> = [];
     const lightRc = h.deps.lightRc!;
     h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
     h.deps.shardPlan = planRehearsalShards;
@@ -743,7 +742,7 @@ test('remote no-option tick does not use local memory to cap its shard count', a
       board: () => ({ v: 1, version: schedule.version, updatedAt: at(420).toISOString(), shards: Array.from({ length: 5 }, (_, i) => ({ id: String(i), state: 'done' })) }),
     };
     await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
-    expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true }]);
+    expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true, fullFallback: { reason: 'planned shard count 5 does not match the aws1 host-gate contract; selected file memory not measured: 30/30; selected-file memory revision is not verified; planned shard count 5 does not match the full host gate', plannedShards: 5 } }]);
     expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: LIGHT_RC_DEFAULT_SHARDS }, shardPlan: { testFiles: 30, gatePlanShards: 5, resources: { freeBytes } } });
     expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
   }
@@ -763,18 +762,18 @@ test('remote no-option tick runs RC despite a zero local memory slot and stamps 
   await runRehearsalTick(opts, h.deps);
   await runRehearsalTick(opts, h.deps);
   expect(h.calls).toEqual([schedule.version]);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 1, remote: 'aws1' }, shardPlan: { capacity: { memoryShards: 0, peakFileBytes: 6_000_000_000 }, remoteCapacityVerifiedBy: 'aws1', unmeasured: null } });
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', fullFallback: { plannedShards: 1, reason: 'planned shard count 1 does not match the aws1 host-gate contract; planned shard count 1 does not match the full host gate' } }, shardPlan: { capacity: { memoryShards: 0, peakFileBytes: 6_000_000_000 }, remoteCapacityVerifiedBy: 'aws1', unmeasured: null } });
   expect(h.notifications).toHaveLength(1);
 });
 
-test('no-option tick records real planning evidence and forwards candidate shards; incomplete evidence stays unmeasured', async () => {
+test('no-option tick records real planning evidence and uses full fallback while preserving incomplete planning evidence', async () => {
   const root = newRoot(), h = harness(at(420), rc());
-  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { reason: string; plannedShards?: number } }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
   h.deps.shardPlan = () => ({ shards: 12, testFiles: 699, gatePlanShards: 12, resources: { cpus: 16, freeBytes: 227e9, totalBytes: 256e9 }, unmeasured: 'sufficiency threshold not measured' });
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
-  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true, fullFallback: { reason: 'planned shard count 12 does not match the aws1 host-gate contract; planned shard count 12 does not match the full host gate', plannedShards: 12 } }]);
   expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: LIGHT_RC_DEFAULT_SHARDS }, shardPlan: { shards: 12, testFiles: 699, gatePlanShards: 12, resources: { cpus: 16, freeBytes: 227e9 } } });
   expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
   expect(stamp(root, 'rc-7h').shardPlan.testFiles).toBe(699);
@@ -784,7 +783,7 @@ test('no-option tick records real planning evidence and forwards candidate shard
 });
 
 test('a preflight with no runnable shards releases its claim and the next tick retries the same RC', async () => {
-  const root = newRoot(), h = harness(at(420), rc({ shards: 1 }));
+  const root = newRoot(), h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS }));
   const stage = join(root, 'release', schedule.version, 'rehearsal', 'rc-7h.json');
   let files = 0;
   h.deps.shardPlan = () => ({ shards: 1, testFiles: files, gatePlanShards: 4,
@@ -820,7 +819,7 @@ test('unknown selected test inventory stays unmeasured without launching the RC'
 test('missing gate shard plan runs the conservative four-shard host gate once', async () => {
   const root = newRoot(), h = harness(at(420), rc({ shards: 4 }));
   const stage = join(root, 'release', schedule.version, 'rehearsal', 'rc-7h.json');
-  const executionSelections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const executionSelections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { reason: string; plannedShards?: number } }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection, runId) => {
     executionSelections.push(selection);
@@ -944,17 +943,17 @@ test('leak-check failure stays recorded even when the gate shard plan is missing
   expect(h.calls).toEqual([]);
 });
 
-test('rc-7h keeps its aws1 host pin when a remote override leaves capacity unmeasured', async () => {
+test('rc-7h keeps its aws1 host pin and measures a full fallback while retaining the planning warning', async () => {
   const root = newRoot(), h = harness(at(420));
-  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { reason: string; plannedShards?: number } }> = [];
   h.deps.shardPlan = () => ({ shards: 3, testFiles: 18, gatePlanShards: 3, resources: { cpus: 8, freeBytes: 4e9, totalBytes: 8e9 }, unmeasured: 'remote capacity not measured' });
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, remote: 'node-c' }, h.deps);
-  expect(selections).toEqual([{ shards: 3, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true, fullFallback: { reason: 'planned shard count 3 does not match the aws1 host-gate contract; planned shard count 3 does not match the full host gate', plannedShards: 3 } }]);
   expect(stamp(root, 'rc-7h').shardPlan.unmeasured).toContain('remote capacity not measured');
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured' });
-  expect(stamp(root, 'rc-7h').summary).toContain('remote capacity not measured');
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok' });
+  expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
 });
 
 test('scheduled aws1 rehearsal starts through CloudVmAdapter and stops only after a persisted clean receipt', async () => {
@@ -1497,7 +1496,7 @@ test('CLI preview is read-only and JSON remains one line; loop registry names th
 
 test('CLI apply accepts injected clock and checkout, emits one JSON result and claims once', async () => {
   const root = newRoot(), h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1' }));
-  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { reason: string; plannedShards?: number } }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => {
     selections.push(selection);
@@ -1522,7 +1521,7 @@ test('CLI apply accepts injected clock and checkout, emits one JSON result and c
   expect(JSON.parse(output[0]!)).toMatchObject({ ok: true, status: 'due', stamps: [{ outcome: 'ok' }] });
   expect(JSON.parse(output[1]!)).toMatchObject({ ok: true, status: 'not-yet' });
   expect(h.calls).toEqual([schedule.version]);
-  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true, fullFallback: { reason: 'requested shard count 12 does not match the full host gate' } }]);
   expect(stamp(root, 'rc-7h').sha).toBe('1234567890abcdef');
 });
 

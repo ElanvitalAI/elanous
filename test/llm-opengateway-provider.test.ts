@@ -6,8 +6,14 @@ import { join } from 'node:path';
 const keyDir = mkdtempSync(join(tmpdir(), 'opengateway-keys-'));
 const priorCacheDir = process.env.ELANOUS_KEY_CACHE_DIR;
 const priorKey = process.env.OPENGATEWAY_API_KEY;
+const priorLlmMode = process.env.ELANOUS_LLM_MODE;
 process.env.ELANOUS_KEY_CACHE_DIR = keyDir;
 process.env.OPENGATEWAY_API_KEY = 'test-env-key';
+// The test/sim default (src/ux-sim/fake-llm.ts) replaces every configured provider
+// with test-fake-llm, and gate pods set ELANOUS_TEST_FAKE_LLM=1 globally. This file
+// asserts the explicit OpenGateway wiring, so it must opt into the real resolver —
+// requests stay synthetic via the fake fetch device installed below.
+process.env.ELANOUS_LLM_MODE = 'real';
 writeFileSync(join(keyDir, 'opengateway_api_key'), 'test-cache-key\n');
 
 const { _resetKeyCacheForTests, getOpenGatewayApiKey, OPENGATEWAY_API_URL } = await import('../src/config.js');
@@ -45,6 +51,7 @@ afterAll(() => {
   _resetKeyCacheForTests();
   if (priorCacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR; else process.env.ELANOUS_KEY_CACHE_DIR = priorCacheDir;
   if (priorKey === undefined) delete process.env.OPENGATEWAY_API_KEY; else process.env.OPENGATEWAY_API_KEY = priorKey;
+  if (priorLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE; else process.env.ELANOUS_LLM_MODE = priorLlmMode;
   rmSync(keyDir, { recursive: true, force: true });
 });
 

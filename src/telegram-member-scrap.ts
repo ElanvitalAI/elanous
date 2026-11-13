@@ -92,6 +92,20 @@ export function verifiedTelegramMember(root: string, identity: TelegramMemberIde
   } finally { db.close(); }
 }
 
+/** Public member ID for a currently authenticated Telegram binding. Never return the internal ID or a connection code. */
+export function telegramMemberPublicHandle(root: string, identity: TelegramMemberIdentity): string | null {
+  const memberId = verifiedTelegramMember(root, identity);
+  if (!memberId || !activeTelegramMember(root, memberId)) return null;
+  const path = join(root, 'members', 'members.sqlite');
+  let db: Database;
+  try { db = new Database(path, { readonly: true }); } catch { return null; }
+  try {
+    const row = db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null;
+    return row && /^[a-z][a-z0-9_]{2,29}$/.test(row.handle) ? row.handle : null;
+  } catch { return null; } // Older installs have no member_handles table yet.
+  finally { db.close(); }
+}
+
 /** The receipt row is committed before Bot API send; sent is recorded immediately after confirmation. */
 export function telegramReceiptStatus(root: string, identity: TelegramMemberIdentity, receiptId: string, scrapId: string): 'pending' | 'sent' {
   const memberId = verifiedTelegramMember(root, identity);

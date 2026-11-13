@@ -247,7 +247,9 @@ describe('next TUI on N03 (this tree · fake LLM)', () => {
       const r = await runNextTuiScenario({ scenario: 'next-queue', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
       expect(r.checks).toEqual({
         queueShownWhileBusy: true, userTurnsInOrder: true, threeReplies: true, draftKept: true,
-        escCancelsWithoutShellConfirmation: true, escRestoresQueue: true, onlyFakeProvider: true, exitedClean: true,
+        escCancelsWithoutShellConfirmation: true, escRestoresQueue: true,
+        escRestoresQueueAndDraft: true, queueRestoreEventCarriesRestoredCount: true,
+        onlyFakeProvider: true, exitedClean: true,
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 150_000);

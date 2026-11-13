@@ -37,7 +37,8 @@ describe('nexus telegram unified inbound (Q&A + triggers)', () => {
     // Boot delegates per-channel creation to wireNexusTelegramQaPollers.
     // Assert both concrete edges: the real factory injection and the
     // channel-scoped userConfig forwarded through the injected factory.
-    expect(boot).toMatch(/wireNexusTelegramQaPollers\(cfg,\s*workflowDaemon!,\s*\{[\s\S]{0,400}?createTriggerBot:\s*createNexusTelegramTriggerBot/);
+    expect(boot).toMatch(/wireNexusTelegramQaPollers\(cfg,\s*workflowDaemon!,\s*\{[\s\S]{0,400}?createTriggerBot:\s*testApiBase[\s\S]{0,200}?:\s*createNexusTelegramTriggerBot/);
+    expect(boot).toMatch(/resolveCurrentInstance\(\)\.kind === 'test'[\s\S]{0,120}?telegramTestApiBase\(process\.env\.ELANOUS_TELEGRAM_API_BASE\)/);
     expect(boot).toMatch(/deps\.createTriggerBot\(\{[\s\S]{0,400}?userConfig:\s*channelScopedConfig\b/);
   });
 });

@@ -179,11 +179,22 @@ export function createKaistPwaReplayWorld(envelope = loadKaistClassicPtyReceipt(
         return Response.json({ items: graphApprovalPosts.length ? [] : [{ ...demo.gcpApproval,
           since: '2026-11-10T08:09:42.170Z', path: ['detect', 'design', 'deliverables'], recent: [] }] });
       }
-      if (url.pathname === '/v1/briefings') return Response.json({ briefings: [{
+      const briefingRecord = {
         id: String(briefing.id ?? 'brief-kaist-1'), memberId: owner, day: String(briefing.day ?? '2026-11-09'),
         topics: briefingTopics, todos: [], suggestionIds: [String(suggestion.id ?? 'suggestion-2026-11-09-1')],
         createdAt: '2026-11-11T00:32:15.000Z',
-      }] });
+      };
+      if (url.pathname === '/v1/briefings') return Response.json({ briefings: [briefingRecord] });
+      if (url.pathname.startsWith('/v1/briefings/')) {
+        let id = '';
+        try { id = decodeURIComponent(url.pathname.slice('/v1/briefings/'.length)); }
+        catch { return Response.json({ error: 'not-found' }, { status: 404 }); }
+        const requestedApp = url.searchParams.get('appSlug');
+        if (!id || id.includes('/') || id !== briefingRecord.id || (requestedApp !== null && requestedApp !== appSlug)) {
+          return Response.json({ error: 'not-found' }, { status: 404 });
+        }
+        return Response.json(briefingRecord);
+      }
       if (url.pathname === '/v1/graph-instance-view') {
         const view = this.graphInstanceView();
         if (url.searchParams.get('source') !== 'graph'

@@ -22,7 +22,7 @@ function builtPages(directory: string): string[] {
   return [...pages, '/404'];
 }
 
-const retainedRoutes = ['/', '/404', '/setup', '/setup/done', '/chat', '/share/received', '/term', '/live-run', '/live-run/adaptive', '/ops/release', '/settings', '/editor', '/vault', '/apps', '/board', '/design-check'];
+const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/member/invite', '/ops/release', '/scraps', '/settings', '/setup', '/setup/done', '/share/received', '/signup', '/signup/complete', '/term', '/vault', '/voice-notes'];
 
 describe('feature maturity across surfaces', () => {
   test('each existing PWA page has exactly one PWA grade', () => {

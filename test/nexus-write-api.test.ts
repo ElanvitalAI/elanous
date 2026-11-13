@@ -205,7 +205,10 @@ describe('POST /v1/nexus/tabs · create', () => {
         expect(handle!.webtermSessions!.has(id)).toBe(false);
       }
 
-      handle!.release();
+      // release() became async in #36421 (Guardian train worker lifecycle
+      // awaits before the webterm destroy loop); the kills are only
+      // observable once the returned promise settles.
+      await handle!.release();
       handle = undefined;
       expect(actualWebtermKills.get(children[2]!.id) ?? 0).toBe(1);
       await waitForChildExit(children[2]!.child, children[2]!.id);

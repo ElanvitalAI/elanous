@@ -3,14 +3,17 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from './elanous-config-dir.js';
 import { codexStagePromptCacheKey, getProviderForConfig } from './llm.js';
 import { saveTokens } from './oauth/store.js';
 import type { UserConfig } from './user-config/types.js';
 import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 let envSnapshot: Record<string, string | undefined> = {};
-test('Codex Responses keeps a byte-stable same-stage prefix and forwards provider cache usage', async () => {
+async function exerciseCodexCachePrefix(failAfterConfigDir = false): Promise<void> {
   envSnapshot = { ...process.env };
+  const previousLlmMode = process.env.ELANOUS_LLM_MODE;
+  const previousConfigDir = getElanousConfigDirOverride();
   const root = mkdtempSync(join(tmpdir(), 'codex-cache-prefix-'));
   try {
     const xdg = join(root, 'xdg');
@@ -22,10 +25,19 @@ test('Codex Responses keeps a byte-stable same-stage prefix and forwards provide
     process.env.ELANOUS_SUPPRESS_XDG_WARNING = '1';
     delete process.env.ELANOUS_RUN_ID;
     delete process.env.ELANOUS_CODEX_ACCOUNT;
+    // #36422 — under NODE_ENV=test, getProviderForConfig hands out the
+    // test-universe fake LLM by default; this case drives the real Codex
+    // Responses client, so pin the documented escape hatch (same pin as
+    // llm-openrouter-reasoning.test.ts).
+    process.env.ELANOUS_LLM_MODE = 'real';
+    // #37169 — authStorePath() follows the explicit config dir and no longer
+    // honors XDG_CONFIG_HOME; write the fixture store where it reads.
+    setElanousConfigDir(root);
+    if (failAfterConfigDir) throw new Error('intentional failure after config-dir override');
     saveTokens('openai-codex', {
       accessToken: 'test-access-token', refreshToken: 'test-refresh-token',
       expiresAt: Date.now() + 3_600_000, tokenType: 'Bearer',
-    }, { authMode: 'chatgpt', mirrorCodex: false }, join(xdg, 'elanous', 'auth.json'));
+    }, { authMode: 'chatgpt', mirrorCodex: false }, join(root, 'auth.json'));
     const provider = getProviderForConfig({ llm: { provider: 'openai-codex', model: 'gpt-6.1-sol' } } as unknown as UserConfig);
     const messages = [{ role: 'user' as const, content: 'same prompt' }];
     const alpha: LLMToolSpec = { name: 'alpha', description: 'alpha', parameters: { type: 'object', properties: { z: { type: 'string' }, a: { type: 'number' } } } };
@@ -73,7 +85,40 @@ test('Codex Responses keeps a byte-stable same-stage prefix and forwards provide
     expect(bodies[3]!.prompt_cache_key).not.toBe(bodies[2]!.prompt_cache_key);
     expect(observedUsage.map((usage) => usage.cacheReadInputTokens)).toEqual([0, 512, 512, 512]);
   } finally {
+    if (previousConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(previousConfigDir);
+    if (previousLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+    else process.env.ELANOUS_LLM_MODE = previousLlmMode;
     rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('Codex Responses keeps a byte-stable same-stage prefix and forwards provider cache usage', async () => {
+  const previousConfigDir = getElanousConfigDirOverride();
+  try {
+    resetElanousConfigDir();
+    await exerciseCodexCachePrefix();
+    expect(getElanousConfigDirOverride()).toBeUndefined();
+  } finally {
+    if (previousConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(previousConfigDir);
+  }
+});
+
+test.each([false, true])('Codex cache prefix restores a preexisting config-dir override after throw=%s', async (failAfterConfigDir) => {
+  const previousConfigDir = getElanousConfigDirOverride();
+  const preexistingConfigDir = join(tmpdir(), 'preexisting-codex-cache-prefix-override');
+  try {
+    setElanousConfigDir(preexistingConfigDir);
+    if (failAfterConfigDir) {
+      await expect(exerciseCodexCachePrefix(true)).rejects.toThrow('intentional failure after config-dir override');
+    } else {
+      await exerciseCodexCachePrefix();
+    }
+    expect(getElanousConfigDirOverride()).toBe(preexistingConfigDir);
+  } finally {
+    if (previousConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(previousConfigDir);
   }
 });
 

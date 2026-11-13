@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph } from '../../src/graph-runner/runner.js';
+import { releaseGateCutoverPath } from '../../src/graph-runner/release-gate-cutover-policy.js';
 import { parse as parseYaml } from 'yaml';
 import type { GraphContext } from './node-verdict.js';
 import { runTrafficNode } from './traffic-node.js';
@@ -25,11 +26,15 @@ test('named release graph lowers traffic after gate and restores it only after v
   const gateTraffic = 'traffic-gate-passed';
   const verifyTraffic = 'traffic-verify-complete';
 
-  expect(edge('gate')).toMatchObject({ ok: gateTraffic, fail: 'gate-triage', error: 'gate-triage' });
+  // Cloud capacity drains before the pinned cutover policy selects the traffic path.
+  expect(edge('gate')).toEqual({ ok: 'cloud-leave-ok', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
+  expect(edge('cloud-leave-ok')).toEqual({ ok: 'gate-cutover-switch', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
+  expect(edge('gate-cutover-switch')).toEqual({ legacy: gateTraffic, audit: 'receipt-audit', error: 'traffic-failed-restore' });
   expect(graph.edges.find((item) => item.from === gateTraffic)).toMatchObject({ warning_branches: ['mac-smoke'] });
   expect(graph.nodes.find((node) => node.node_id === 'pre-prepare-join')?.needs).toEqual(['mac-smoke', 'pwa', 'export-check']);
   expect(edge('verify')).toMatchObject({ ok: verifyTraffic, fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
-  expect(edge(verifyTraffic)).toEqual({ ok: 'vault-note', fail: 'vault-note', error: 'vault-note' });
+  expect(edge(verifyTraffic)).toEqual({ ok: 'pwa-formal-update', fail: 'pwa-formal-update', error: 'pwa-formal-update' });
+  expect(edge('pwa-formal-update')).toEqual({ ok: 'vault-note', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
 
   for (const [nodeId, recipeId] of [[gateTraffic, 'traffic-gate-passed'], [verifyTraffic, 'traffic-verify-complete']]) {
     const node = graph.nodes.find((item) => item.node_id === nodeId);
@@ -69,7 +74,8 @@ test('named release graph lowers traffic after gate and restores it only after v
             else afterVerify = snapshot;
             return { exitCode: run.status ?? 1, stdout: run.stdout, stderr: run.stderr };
           }
-          return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fixture"}\n', stderr: '' };
+          const outcome = context.nodeId === 'gate-cutover-switch' ? releaseGateCutoverPath(context.input) : 'ok';
+          return { exitCode: 0, stdout: `${JSON.stringify({ outcome, verdict: 'pass', summary: 'fixture' })}\n`, stderr: '' };
         },
       },
     });

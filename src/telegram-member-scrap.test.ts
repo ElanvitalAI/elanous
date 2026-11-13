@@ -8,7 +8,7 @@ import { handleScraps } from './nexus/api/scraps.js';
 import { setUserConfigOverlay } from './user-config.js';
 import { activeTelegramMember, consumeTelegramMemberCode, issueTelegramMemberCode, markTelegramCompletionSent, markTelegramReceiptSent,
   pendingTelegramCompletion, pendingTelegramReceipts, recordTelegramCompletion, retryPendingTelegramMemberCards, telegramReceiptStatus,
-  saveTelegramMemberScrap, verifiedTelegramMember } from './telegram-member-scrap.js';
+  saveTelegramMemberScrap, telegramMemberPublicHandle, verifiedTelegramMember } from './telegram-member-scrap.js';
 
 const previousStateDir = process.env.ELANOUS_STATE_DIR;
 const roots: string[] = [];
@@ -21,6 +21,118 @@ afterEach(() => {
 });
 
 const identity = { botId: '123', userId: 42, chatId: 42 };
+
+test('Telegram connection and invite show only the public member ID and never the one-time secret key', async () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  const path = join(dir, 'members', 'members.sqlite');
+  const store = createMemberStore({ path });
+  try {
+    const member = store.register({ sub: 'telegram-public-id', email: 'public-id@example.test', emailVerified: true, name: 'Owner' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    expect(store.claimHandle(member.id, 'ElanvitalAI')).toBe('ElanvitalAI');
+    const secretKey = issueTelegramMemberCode(dir, member.id);
+    const sent: string[] = [];
+    let polls = 0;
+    let bot!: TelegramBot;
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      const method = new URL(String(url)).pathname.split('/').at(-1);
+      if (method === 'getUpdates') {
+        if (polls++ === 0) return Response.json({ ok: true, result: [
+          { update_id: 1, message: { message_id: 1, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: `/connect ${secretKey}` } },
+          { update_id: 2, message: { message_id: 2, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: '/invite' } },
+        ] });
+        bot.stop();
+        return Response.json({ ok: true, result: [] });
+      }
+      if (method === 'sendMessage') sent.push((JSON.parse(String(init?.body)) as { text: string }).text);
+      return Response.json({ ok: true, result: { message_id: sent.length } });
+    }) as typeof fetch;
+    bot = new TelegramBot({ token: '123:fake', allowedUsers: [42], fetchImpl, perChatGapMs: 0, pollTimeoutSec: 0,
+      scrapRouteOptions: { instanceRoot: dir, extractors: { digestWeb: async () => { throw new Error('not used'); } } },
+      onMessage: async () => 'unexpected' });
+    await bot.start();
+    expect(telegramMemberPublicHandle(dir, identity)).toBe('ElanvitalAI');
+    expect(sent).toHaveLength(2);
+    for (const reply of sent) {
+      expect(reply).toContain('회원 ID: ElanvitalAI');
+      expect(reply).toContain('https://elanous.ai/r/ElanvitalAI');
+      expect(reply).not.toContain(secretKey);
+      expect(reply).not.toContain(member.id);
+    }
+    expect(store.requestDeletion(member.session.token)).toBe(true);
+    expect(telegramMemberPublicHandle(dir, identity)).toBeNull();
+  } finally { store.close(); }
+});
+
+test('active HITL text capture cannot hold a one-time /connect command behind the waiting turn', async () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  const secretKey = issueTelegramMemberCode(dir, 'member-a');
+  let buttonReady!: () => void;
+  const otherButtonPosted = new Promise<void>((resolve) => { buttonReady = resolve; });
+  let otherButtonData = '';
+  let connectReplyReady!: () => void;
+  const connectReplied = new Promise<void>((resolve) => { connectReplyReady = resolve; });
+  let captured: string | null | undefined;
+  const sent: string[] = [];
+  let polls = 0;
+  let bot!: TelegramBot;
+  const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const method = new URL(String(url)).pathname.split('/').at(-1);
+    if (method === 'getUpdates') {
+      if (polls++ === 0) return Response.json({ ok: true, result: [
+        { update_id: 1, message: { message_id: 1, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: 'wait-for-hitl' } },
+      ] });
+      if (polls === 2) {
+        await otherButtonPosted;
+        return Response.json({ ok: true, result: [
+          { update_id: 2, callback_query: { id: 'other-tap', from: { id: 42 },
+            message: { message_id: 10, chat: { id: 42, type: 'private' } }, data: otherButtonData } },
+        ] });
+      }
+      if (polls === 3) {
+        return Response.json({ ok: true, result: [
+          { update_id: 3, message: { message_id: 2, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: `/connect ${secretKey}` } },
+        ] });
+      }
+      if (polls === 4) {
+        await connectReplied;
+        return Response.json({ ok: true, result: [
+          { update_id: 4, message: { message_id: 3, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: 'hitl-answer' } },
+        ] });
+      }
+      bot.stop();
+      return Response.json({ ok: true, result: [] });
+    }
+    if (method === 'sendMessage') {
+      const body = JSON.parse(String(init?.body)) as {
+        text: string; reply_markup?: { inline_keyboard?: Array<Array<{ callback_data: string }>> };
+      };
+      sent.push(body.text);
+      const other = body.reply_markup?.inline_keyboard?.flat().find((button) => button.callback_data.endsWith(':other'));
+      if (other) { otherButtonData = other.callback_data; buttonReady(); }
+      if (body.text.includes('회원 계정이 연결되었습니다')) connectReplyReady();
+    }
+    return Response.json({ ok: true, result: { message_id: sent.length } });
+  }) as typeof fetch;
+  bot = new TelegramBot({ token: '123:fake', allowedUsers: [42], fetchImpl, perChatGapMs: 0, pollTimeoutSec: 0,
+    scrapRouteOptions: { instanceRoot: dir, extractors: { digestWeb: async () => { throw new Error('not used'); } } },
+    onMessage: async (ctx) => {
+      if (ctx.text !== 'wait-for-hitl') return 'unexpected';
+      const answer = await bot.hitlQuestionChannelForChat(ctx.chatId, ctx.threadId).ask({ questions: [{
+        id: 'scope', header: 'Scope', question: 'Which scope?',
+        options: [{ label: 'One', description: 'First' }], includeOther: true,
+      }] });
+      captured = answer?.otherText?.scope;
+      return 'HITL complete';
+    } });
+  await bot.start();
+  expect(verifiedTelegramMember(dir, identity)).toBe('member-a');
+  expect(captured).toBe('hitl-answer');
+  expect(sent.some((reply) => reply.includes('회원 계정이 연결되었습니다'))).toBe(true);
+  expect(sent.join('\n')).not.toContain(secretKey);
+});
 
 test('member-issued code binds only the exact DM identity and can be consumed once', () => {
   const dir = root();

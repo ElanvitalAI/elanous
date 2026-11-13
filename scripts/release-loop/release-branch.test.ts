@@ -256,7 +256,13 @@ test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not fa
     expect(readFileSync(runFile, 'utf8')).toBe(original);
     await expect(resumeReleaseRun({ runId: 'r', from: 'version-release' }, { root, git, isAncestor: () => true, graph: async () => { graphs++; return {} as never; } })).rejects.toThrow('would cut again');
     expect(readFileSync(runFile, 'utf8')).toBe(original);
-    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git, isAncestor: () => true,
+    const commandRoot = join(root, 'command-root');
+    addResumeRuntimeDirs(commandRoot);
+    mkdirSync(join(commandRoot, 'graphs', 'release'), { recursive: true });
+    for (const name of ['release-loop.yaml', 'recipes.yaml']) {
+      copyFileSync(join(import.meta.dir, '../../graphs/release', name), join(commandRoot, 'graphs', 'release', name));
+    }
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, { root, git, isAncestor: () => true,
       graph: async (_path, options) => { graphs++; expect(options).toMatchObject({ resumeRunId: 'r', fromNodeId: 'gate', pinChildUniverse: true }); return { status: 'done', runId: 'r' } as never; } });
     expect(resumed.tip).toMatchObject({ changed: true, to: 'b'.repeat(40) });
     expect(graphs).toBe(1);
@@ -266,7 +272,7 @@ test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not fa
     await expect(resumeReleaseRun({ runId: 'r', from: 'gate', resumeBudgetExceeded: true }, { root, git, isAncestor: () => true }))
       .rejects.toThrow('--resume-budget-exceeded requires --reason');
     write('done');
-    expect(() => refreshReleaseBranchTip('r', { root, git })).toThrow('only a failed run');
+    expect(() => refreshReleaseBranchTip('r', { root, git })).toThrow('only a failed or paused run');
     expect(() => refreshReleaseBranchTip('../r', { root, git })).toThrow('invalid run id');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -458,6 +464,8 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
       const copy = join(f.root, `ctx-${seen.length}.json`);
       writeFileSync(copy, raw);
       seen.push({ nodeId: context.nodeId, commit: context.outputs['version-release']?.commit, context: copy, command: body });
+      // gate-cutover-switch routes on legacy/audit, not the generic ok outcome.
+      if (context.nodeId === 'gate-cutover-switch') return { exitCode: 0, stderr: '', stdout: '{"outcome":"legacy"}\n' };
       if (context.nodeId === failNode) return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
       return { exitCode: 0, stderr: '', stdout: '{"outcome":"ok","verdict":"pass"}\n' };
     };
@@ -473,12 +481,16 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     // The resumed runner validates this persisted aggregate against executed node records, including fan-out joins.
     expect(first.executed).toBe(first.nodes.filter((record) => record.executed).length);
     expectPersistedExecutionCount();
-    expect(first.path.slice(0, 8)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
-      'pre-gate-join', 'gate', 'emergency-switch', 'gate-triage']);
+    // The declared cloud (#35378) and Pod preparation (#36653) nodes precede the gate.
+    expect(first.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
+      'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate',
+      'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    expect(seen.map((item) => item.nodeId)).toEqual(['readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate',
-      'prefetch', 'gate', 'emergency-switch', 'gate-triage', 'traffic-failed-restore']);
-    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut, cut, cut, cut]);
+    const firstCommands = ['readiness-countdown', 'traffic-cut-start', 'cutoff', 'regression-suite',
+      'prefetch', 'checklist-gate', 'cloud-approval-check', 'cloud-join', 'gate', 'cloud-leave-fail',
+      'emergency-switch', 'gate-triage', 'traffic-failed-restore'];
+    expect(seen.map((item) => item.nodeId)).toEqual(firstCommands);
+    expect(seen.map((item) => item.commit)).toEqual(firstCommands.map(() => cut));
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });
@@ -533,8 +545,8 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     expect(seen.map((item) => item.nodeId)).toContain('docs');
     expect(seen.map((item) => item.nodeId)).toContain('publish');
     // The final resumed tail includes the graph's publication and verification stages.
-    expect(resumed.state.path.slice(-13)).toEqual(['known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published',
-      'release-post-publish-join', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(resumed.state.path.slice(-14)).toEqual(['known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published',
+      'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     // Shadow publication on the real resume path: the three post-approval visits must dispatch three
     // distinct commands. The injected runner never publishes anything outside this temporary test universe.
     expect(seen.filter((item) => ['publish', 'npm-publish', 'docs-land'].includes(item.nodeId)).map((item) => [item.nodeId, item.command]))

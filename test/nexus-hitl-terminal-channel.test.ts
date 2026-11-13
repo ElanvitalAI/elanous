@@ -359,7 +359,10 @@ describe('runNexus terminal channel integration', () => {
       },
     });
     expect(getDefaultConfirmChannels().map((c) => c.name)).toContain('terminal');
-    h.release();
+    // release() became async in #36421 (Guardian train worker lifecycle
+    // awaits before the confirm-channel clearing); the registry is only
+    // empty once the returned promise settles.
+    await h.release();
     activeHandle = undefined;
     expect(getDefaultConfirmChannels()).toHaveLength(0);
   });

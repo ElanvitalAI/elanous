@@ -110,11 +110,15 @@ describe('Obsidian and skills setup', () => {
     const urlRouting = { ...cfg.skills.urlRouting, enabled: false };
     const devRequestRouting = { ...cfg.skills.devRequestRouting, enabled: false };
     saveUserConfig({ ...cfg, skills: { ...cfg.skills, urlRouting, devRequestRouting, allow: ['wanted'] } });
-    expect(disk().skills?.urlRouting).toMatchObject(urlRouting);
+    // Source: saveUserConfig stores defaults-relative overrides, not the resolved routing defaults.
+    const persistedSkills = disk().skills;
+    expect(getUserConfig().skills).toMatchObject({ urlRouting, devRequestRouting, allow: ['wanted'] });
     const res = await handleSkillsSet(post('skills', { dirs: [skillDir] }));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, skills: { activeSet: 'custom', dirs: [skillDir] } });
-    expect(disk().skills).toMatchObject({ activeSet: 'custom', dirs: [skillDir], urlRouting, devRequestRouting, allow: ['wanted'] });
+    expect(disk().skills).toMatchObject({ ...persistedSkills, activeSet: 'custom', dirs: [skillDir] });
+    resetUserConfig();
+    expect(getUserConfig().skills).toMatchObject({ activeSet: 'custom', dirs: [skillDir], urlRouting, devRequestRouting, allow: ['wanted'] });
   });
 
   test('HTTP GET and POST dispatch use existing bearer authentication', async () => {
@@ -160,7 +164,9 @@ describe('Obsidian and skills setup', () => {
     } else {
       const res = await handleSkillsSet(post('skills', { activeSet: preset!.key }));
       expect(res.status).toBe(200);
-      expect(disk().skills?.dirs).toEqual([dir]);
+      // Source: saveUserConfig omits a preset directory when it equals the resolved default.
+      resetUserConfig();
+      expect(getUserConfig().skills.dirs).toEqual([dir]);
     }
     const file = join(root, 'file'); writeFileSync(file, 'x');
     const clear = await handleSkillsSet(post('skills', { dirs: [] }));

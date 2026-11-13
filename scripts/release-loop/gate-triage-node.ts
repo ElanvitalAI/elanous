@@ -552,7 +552,7 @@ if (import.meta.main) {
     errorVersion = context?.input.version ?? 'unknown';
     if (context && !context.outputs.gate) throw new Error('gate output is missing; adaptive triage is unmeasured');
     const history = context ? priorGateDecisionsFromLedger(context) : [];
-    const ownerLedger = context ? readKnownFailOwnerLedger(effectiveInstanceRoot()) : undefined;
+    const ownerLedger = context ? readKnownFailOwnerLedger(effectiveInstanceRoot(), context.input.version) : undefined;
     const rawTriageEvidence = context?.input.gateTriageEvidence;
     const suppliedTriageEvidence = rawTriageEvidence && typeof rawTriageEvidence === 'object'
       && !Array.isArray(rawTriageEvidence) ? rawTriageEvidence as Record<string, unknown> : {};
@@ -566,7 +566,7 @@ if (import.meta.main) {
       }, history) };
     if (context && ownerLedger?.writable) {
       try {
-        appendKnownFailOwnerLedger(effectiveInstanceRoot(), [
+        appendKnownFailOwnerLedger(effectiveInstanceRoot(), context.input.version, [
           ...(Array.isArray(suppliedTriageEvidence.knownFailOwners) ? suppliedTriageEvidence.knownFailOwners : []),
           ...result.unmeasuredOwnerAssignments,
         ]);

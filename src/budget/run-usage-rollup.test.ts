@@ -158,9 +158,12 @@ describe('usage runs --by phase', () => {
       } else original(category, event, data, options);
     });
     try {
-      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, usagePhase: 'review' })).toBe('ok');
+      // #36422: the test universe defaults to the fake LLM — streamLLM only lets an
+      // injected fixture provider own the turn with preferExplicitProvider
+      // (streamLLMWithTools already does, cf. llm.ts "owns this turn").
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, preferExplicitProvider: true, usagePhase: 'review' })).toBe('ok');
       expect(await streamLLMWithTools([{ role: 'user', content: 'measure' }], { onText() {}, dispatchTool: async () => 'unused' }, { provider, usagePhase: 'implement' })).toBe('ok');
-      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider })).toBe('ok');
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, preferExplicitProvider: true })).toBe('ok');
       expect(observed).toHaveLength(3);
       expect(observed[0]).toMatchObject({ phase: 'review', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
       expect(observed[1]).toMatchObject({ phase: 'implement', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
@@ -281,9 +284,12 @@ describe('usage runs --by job', () => {
       } else original(category, event, data, options);
     });
     try {
-      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, usageJobKind: 'dev' })).toBe('ok');
+      // #36422: the test universe defaults to the fake LLM — streamLLM only lets an
+      // injected fixture provider own the turn with preferExplicitProvider
+      // (streamLLMWithTools already does, cf. llm.ts "owns this turn").
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, preferExplicitProvider: true, usageJobKind: 'dev' })).toBe('ok');
       expect(await streamLLMWithTools([{ role: 'user', content: 'measure' }], { onText() {}, dispatchTool: async () => 'unused' }, { provider, usageJobKind: 'deploy' })).toBe('ok');
-      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider })).toBe('ok');
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, preferExplicitProvider: true })).toBe('ok');
       expect(observed).toHaveLength(3);
       expect(observed[0]).toMatchObject({ jobKind: 'dev', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
       expect(observed[1]).toMatchObject({ jobKind: 'deploy', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });

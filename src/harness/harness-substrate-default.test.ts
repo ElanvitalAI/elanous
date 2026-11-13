@@ -18,6 +18,7 @@ import { program } from '../index.js';
 import * as podPool from '../task-orchestrator/surfaces/pod-pool.js';
 import * as podSurface from '../task-orchestrator/surfaces/self-implement-pod.js';
 import * as accounts from '../oauth/codex-account-store.js';
+import * as ownerMirror from '../oauth/codex-owner-mirror.js';
 import { saveTokens } from '../oauth/store.js';
 import { writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
 import * as accountBroker from '../task-orchestrator/surfaces/pod-account-broker.js';
@@ -132,6 +133,7 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
   const participant = spyOn(runStore, 'addSelfDevRunParticipant').mockImplementation(() => {});
   const pid = spyOn(orchestrate, 'writeRunPidRecord').mockImplementation(() => 'isolated-pid');
   const prodRoot = spyOn(instance, 'prodInstanceRoot').mockReturnValue(operationalRoot);
+  const accountStore = spyOn(ownerMirror, 'codexAccountReadStorePath').mockReturnValue(join(operationalRoot, 'auth.json'));
   const check = spyOn(podPool, 'checkPodPool').mockImplementation((members) => {
     poolSpecs.push(members.map((m) => `${m.context}@${m.sshHost}:${m.capacity}`).join(','));
     return { ok: true, ready: [...members], dropped: [] };
@@ -179,18 +181,15 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
     expect(warnings.filter((line) => line.includes('launch policy: 파생 시험 우주 정책이 없거나 운영과 다르다'))).toHaveLength(1);
     expect(warnings.join('\n')).not.toContain('쓸 codex 계정이 없다');
 
-    // The real account inspector reads the host credential store, not a worktree's stale auth.json.
+    // Bind the real account inspector to this fixture's operational store, not the worktree's stale auth.json.
     inspect.mockRestore();
-    process.env.XDG_CONFIG_HOME = join(root, 'xdg');
-    const credentialRoot = join(root, 'xdg', 'elanous');
-    mkdirSync(credentialRoot, { recursive: true });
-    const tokens = { accessToken: 'fixture', refreshToken: 'fixture', expiresAt: null };
+    const tokens = { accessToken: 'fixture', refreshToken: 'fixture', expiresAt: Date.UTC(2099, 0, 1) };
     const teamHome = join(root, 'codex-team');
     const otherHome = join(root, 'codex-other');
     mkdirSync(teamHome);
     mkdirSync(otherHome);
-    saveTokens('openai-codex:team', tokens, { codexHome: teamHome, mirrorCodex: false }, join(credentialRoot, 'auth.json'));
-    saveTokens('openai-codex:other', tokens, { codexHome: otherHome, mirrorCodex: false }, join(credentialRoot, 'auth.json'));
+    saveTokens('openai-codex:team', tokens, { codexHome: teamHome, mirrorCodex: false, authMode: 'chatgpt', accountUuid: 'fixture-team' }, join(operationalRoot, 'auth.json'));
+    saveTokens('openai-codex:other', tokens, { codexHome: otherHome, mirrorCodex: false, authMode: 'chatgpt', accountUuid: 'fixture-other' }, join(operationalRoot, 'auth.json'));
     saveTokens('openai-codex:stale', tokens, { codexHome: join(root, 'codex-stale'), mirrorCodex: false }, join(derivedRoot, 'auth.json'));
     writeQuotaSignal(undefined, 100, teamHome);
     writeQuotaSignal(undefined, 98, otherHome);
@@ -285,7 +284,7 @@ test('selfOrchestrateCmd uses operational policy under NODE_ENV=test with a miss
     for (const [key, value] of Object.entries({ HOME: originalHome, XDG_CONFIG_HOME: originalXdg, ELANOUS_STATE_DIR: originalState, ELANOUS_STATE_DIR_SOURCE: originalStateSource, ELANOUS_HARNESS_ENTRANCE: originalEntrance, NODE_ENV: originalNodeEnv, ELANOUS_POD_POOL: originalPool, ELANOUS_CODEX_QUOTA_POLICY: originalQuota, ELANOUS_REMOTE_CODEX_ACCOUNT: originalOwnerAccount, ELANOUS_REMOTE_CODEX_USED_PERCENT: originalOwnerUsed, ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT: originalOwnerThreshold })) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
-    error.mockRestore(); warn.mockRestore(); exit.mockRestore(); prepare.mockRestore(); load.mockRestore(); save.mockRestore(); participant.mockRestore(); pid.mockRestore(); prodRoot.mockRestore(); check.mockRestore(); freshness.mockRestore(); sync.mockRestore(); inspect.mockRestore(); broker.mockRestore(); grok.mockRestore(); run.mockRestore();
+    error.mockRestore(); warn.mockRestore(); exit.mockRestore(); prepare.mockRestore(); load.mockRestore(); save.mockRestore(); participant.mockRestore(); pid.mockRestore(); prodRoot.mockRestore(); accountStore.mockRestore(); check.mockRestore(); freshness.mockRestore(); sync.mockRestore(); inspect.mockRestore(); broker.mockRestore(); grok.mockRestore(); run.mockRestore();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -54,7 +54,7 @@ test('auto-start --apply delegates the selected version to the guarded release r
   let graphs = 0;
   const lock = join(root, 'release', version, 'run.lock');
   const cli = new Command();
-  registerReleaseCommands(cli, { ledgerRoot: root, config: { gatePodPool: 'pool' },
+  registerReleaseCommands(cli, { ledgerRoot: root, config: { gatePodPool: 'pool' }, assertCliCurrent: () => {},
     checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
     graph: async (_path, opts) => {
       expect(opts.input.version).toBe(version);
@@ -180,7 +180,8 @@ function writeRunningGraph(runId: string, runVersion: string, startedAt: string)
   const dir = join(root, 'graph-runs', 'release-loop');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId, status: 'running', pid: process.pid,
-    pidStartedAt: new Date(psProcessStartMs(process.pid)!).toISOString(), startedAt, input: { version: runVersion } }));
+    pidStartedAt: new Date(psProcessStartMs(process.pid)!).toISOString(), startedAt, path: [], nodes: [],
+    input: { version: runVersion } }));
 }
 
 test('auto-start --apply refuses a live same-version graph run with rc1 and its runId/startedAt, before readiness or launch', async () => {
@@ -218,7 +219,7 @@ test('auto-start --apply is not blocked by a live graph run of another version',
   const before = process.exitCode;
   let graphs = 0;
   const cli = new Command();
-  registerReleaseCommands(cli, { ledgerRoot: root, config: { gatePodPool: 'pool' },
+  registerReleaseCommands(cli, { ledgerRoot: root, config: { gatePodPool: 'pool' }, assertCliCurrent: () => {},
     checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
     graph: async () => { graphs++; return { status: 'done' } as never; } });
   try {

@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { runGraph } from '../../src/graph-runner/runner.js';
+import { releaseGateCutoverPath } from '../../src/graph-runner/release-gate-cutover-policy.js';
 
 const RELEASE = '0.3.1';
 const DEV = '0.3.1-dev.0';
@@ -255,7 +256,9 @@ exec ${JSON.stringify(bun)} "$@"
       }
     }
 
-    const result: Record<string, unknown> = { outcome: 'ok', nodeId };
+    // Match the production cutover judge: its outcome selects a route, not generic success.
+    const outcome = nodeId === 'gate-cutover-switch' ? releaseGateCutoverPath(context.input) : 'ok';
+    const result: Record<string, unknown> = { outcome, nodeId };
     if (nodeId === 'version-release') Object.assign(result, { version: RELEASE, commit: CUT, branch: `release/${RELEASE}`, base: MAIN });
     if (nodeId === 'docs') Object.assign(result, { branch: `release-docs/${RELEASE}`, worktree: docsWorktree,
       notes: join(docsWorktree, 'release-notes.md') });

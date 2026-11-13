@@ -395,12 +395,6 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
       expect(prompt).toContain('attemptsPolicy');
       expect(prompt).not.toContain('release.gate.failure.attribution-gap');
       proposalCalls++;
-      if (proposalCalls > 1) return JSON.stringify({ // Source: RLA-ARG-FULL-VERBS high-risk MRTR simulation.
-        apiVersion: 'elanous.dev/arg-proposal/v1', verb: 'propose-new-gate-node',
-        rationale: 'Pod failure needs a new diagnostic node',
-        changes: [{ kind: 'node', node: { node_id: 'diagnostic-gate', kind: 'gate', recipe: 'none' } }],
-        rollbackWhen: ['verification fails'],
-      });
       return JSON.stringify({
       apiVersion: 'elanous.dev/arg-proposal/v1', verb: 'register-attribution-gap',
       rationale: 'Previously unseen host attribution gap',
@@ -418,9 +412,14 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
     expect(state.adaptiveGraphEdges).toEqual([expect.objectContaining({ from: 'gate-triage', to: 'gate', triggerEvent: 'release.gate.failed' })]);
     expect(state.adaptiveGraphVocabulary).toContain('release.gate.failure.attribution-gap');
     expect(state.graphRevision).toBe(3); // Source: RLA-SUPERVISOR-ARG-GRAPH edge and vocabulary apply contracts.
-    expect(proposalCalls).toBe(2); // Source: RLA-ARG-FULL-VERBS one proposal per unmeasured gate event.
-    expect(state.argInputRequests?.[0]?.resultType).toBe('input_required');
-    expect(state.argInputRequests?.[0]?.requestState.proposal).toContain('diagnostic-gate');
+    // arg-supervisor.ts completes one incident claim per gate event. The first event
+    // commits the retry edge; only the second event can propose vocabulary. HITL
+    // comes from the exhausted retry budget, without a new high-risk node proposal.
+    expect(proposalCalls).toBe(1);
+    expect(liveTriage?.prescription).toMatchObject({
+      reason: 'adaptive repair retry budget is exhausted or visit state is invalid',
+    });
+    expect(state.argInputRequests ?? []).toEqual([]);
     const vocabulary = parseYaml(readFileSync(join(`${state.statePath}.graph`, 'release-edge-vocabulary.yaml'), 'utf8'));
     expect(vocabulary.failureTypes['release.gate.failure.attribution-gap']).toMatchObject({
       source: 'rla-open-proposal', graphRevision: 3, // Source: RLA-SUPERVISOR-ARG-GRAPH edge and vocabulary apply contracts.
@@ -527,7 +526,9 @@ test('RELEASE-RUN-HEAL-IMAGE-MISSING sim: same run builds and pins cut image, th
     expect(state.path.filter((nodeId) => nodeId === 'gate')).toHaveLength(2);
     const repairNode = state.path.find((nodeId) => /^gate-image-repair-[a-f0-9]{12}$/.test(nodeId));
     expect(repairNode).toBeTruthy();
-    expect(state.path.indexOf(repairNode!)).toBe(state.path.indexOf('gate') + 2);
+    // release-loop.yaml routes an errored gate through cloud cleanup before triage.
+    expect(state.path.slice(state.path.indexOf('gate'), state.path.indexOf(repairNode!) + 1))
+      .toEqual(['gate', 'cloud-leave-error', 'gate-triage', repairNode!]);
     expect(state.path[state.path.indexOf(repairNode!) + 1]).toBe('gate');
     expect(imageSourceGitCommands).toHaveLength(2);
     expect(imageSourceGitCommands[0]).toMatchObject({

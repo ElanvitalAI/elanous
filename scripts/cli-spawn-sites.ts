@@ -10,6 +10,11 @@ export function cliSpawnSites(source: string, file: string): string[] {
   const isCode = (line: string) => !/^\s*(?:\/\/|\*|\/\*)/.test(line);
   const codeLines = lines.map((line) => isCode(line) ? line : '');
   const code = codeLines.join('\n');
+  const entryPath = /bin[\\/]elanous\.(?:mjs|cjs)|['"]bin['"]\s*,\s*['"]elanous\.(?:mjs|cjs)['"]/;
+  // Alias seeds come only from this same entry-path pattern below. Without a seed
+  // neither direct args nor alias propagation can produce a site. Test stripped
+  // code, not raw source: comment-only lines can separate multiline join args.
+  if (!entryPath.test(code)) return [];
   const launchNames = new Set(['spawn', 'spawnSync', 'exec', 'execFile', 'execFileSync', 'execSync']);
   for (const match of code.matchAll(/import\s*\{([^}]+)\}\s*from\s*['"](?:node:)?child_process['"]/g)) {
     for (const specifier of match[1]!.split(',')) {
@@ -34,7 +39,6 @@ export function cliSpawnSites(source: string, file: string): string[] {
     ?? /(?:const|let|var)\s+(\w+)\s*=\s*require\(['"](?:node:)?child_process['"]\)/.exec(code)?.[1];
   const names = [...launchNames].map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   const call = new RegExp(`(?:\\b(?:${names.join('|')})\\s*\\(|${namespace ? `\\b${namespace}\\s*\\.\\s*(?:spawn|spawnSync|exec|execFile|execFileSync|execSync)\\s*\\(` : '(?!)'}|\\bBun\\s*\\.\\s*spawn(?:Sync)?\\s*\\()`, 'g');
-  const entryPath = /bin[\\/]elanous\.(?:mjs|cjs)|['"]bin['"]\s*,\s*['"]elanous\.(?:mjs|cjs)['"]/;
   const entryVariables = new Set<string>();
   for (const match of code.matchAll(/(?:const|let|var)\s+(\w+)\s*=\s*join\([\s\S]{0,240}?['"]bin['"]\s*,\s*['"]elanous\.(?:mjs|cjs)['"]/g)) {
     entryVariables.add(match[1]!);

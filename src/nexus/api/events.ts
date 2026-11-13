@@ -18,9 +18,29 @@ import type { NexusEvent } from '../state/state.js';
 import type { NexusEventBus } from './event-bus.js';
 import { SSE_HEARTBEAT_MS } from './sse-heartbeat.js';
 
-export function handleSseEvents(bus: NexusEventBus, url: URL, memberScope?: string | { readonly operatorBriefings: true }): Response {
+/** Prefix subscriptions can include the private namespace without naming its exact topic. */
+export function requestsPluginEvents(prefixes: readonly string[]): boolean {
+  return prefixes.some(prefix => 'plugin.event'.startsWith(prefix) || prefix.startsWith('plugin.event.'));
+}
+
+/** Opaque device selector, never an ownership credential or a filesystem path. */
+export function isPluginEventDeviceId(value: unknown): value is string {
+  return typeof value === 'string' && value === value.trim() && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value);
+}
+
+function isPluginEventKind(kind: string): boolean {
+  return kind === 'plugin.event' || kind.startsWith('plugin.event.');
+}
+
+export type SseEventScope = string | { readonly operatorBriefings?: true; readonly operatorDeviceId?: string };
+
+export function handleSseEvents(bus: NexusEventBus, url: URL, memberScope?: SseEventScope): Response {
   const memberId = typeof memberScope === 'string' ? memberScope : undefined;
   const operatorBriefings = typeof memberScope === 'object' && memberScope !== null && memberScope.operatorBriefings === true;
+  // Only the HTTP route may grant this scope after a configured operator bearer check.
+  const deviceId = typeof memberScope === 'object' && memberScope !== null && Object.hasOwn(memberScope, 'operatorDeviceId')
+    && isPluginEventDeviceId(memberScope.operatorDeviceId)
+    ? memberScope.operatorDeviceId : undefined;
   const raw = url.searchParams.get('topics') ?? '';
   const prefixes = raw.split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -46,6 +66,13 @@ export function handleSseEvents(bus: NexusEventBus, url: URL, memberScope?: stri
         // App rows contain tenant data. They are available only from the
         // bearer-gated app-scoped endpoint, never from this public stream.
         if (ev.kind.startsWith('app.row.')) return;
+        // Private device commands must never ride the public/all-topic or member stream.
+        // Operator authority covers this Nexus; the selector narrows it to one device.
+        if (isPluginEventKind(ev.kind)) {
+          const data = ev.detail?.data;
+          if (!deviceId || !data || typeof data !== 'object' || Array.isArray(data) || !Object.hasOwn(data, 'deviceId')
+            || (data as Record<string, unknown>).deviceId !== deviceId) return;
+        }
         // Board and briefing payloads are member-owned. A client-side filter
         // is not an authorization boundary, so require the owner scope that
         // routeRequest resolved through /v1/members/owner.

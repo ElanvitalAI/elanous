@@ -107,14 +107,15 @@ test('compact AppShell reserves space for retained tabs and more, wide shell has
   const daemon = { config, client: new DaemonClient(config), sessionId: 's', setSessionId() {}, setConfig() {} };
   mount(createElement(DaemonContext.Provider, { value: daemon }, createElement(ThemeProvider, null,
     createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement('p', null, 'body') }))));
-  expect(bottomNav().findAllByType('button').map((node) => node.props['aria-label'])).toEqual(['만들기', '더보기']);
-  expect(bottomNav().findAllByType('a').map((node) => [node.props['aria-label'], node.props.href])).toEqual([['대화', '/chat'], ['실행', '/live-run']]);
+  expect(bottomNav().findAllByType('button').map((node) => node.props['aria-label'])).toEqual(['실행', '만들기', '더보기']);
+  expect(bottomNav().findAllByType('a').map((node) => [node.props['aria-label'], node.props.href])).toEqual([['대화', '/chat']]);
   expect(bottomNav().props.className).toContain('h-[calc(3.5rem+env(safe-area-inset-bottom))]');
   expect(bottomNav().props.className).toContain('pb-[env(safe-area-inset-bottom)]');
   expect(bottomNav().findByType('div').props.className).toContain('h-full');
   expect(bottomNav().findAllByType('button').every((node) => node.props.className.includes('text-xs'))).toBe(true);
   expect(bottomNav().findAllByType('span').map((node) => node.children.join(''))).toEqual(['대화', '실행', '만들기', '더보기']);
   expect(bottomNav().findAllByType('svg')).toHaveLength(4);
+  expect(open('실행').findAllByType('a').map((node) => node.props.href)).toEqual(['/live-run', '/board']);
   const main = tree!.root.findByType('main');
   expect(main.props.className).toBe('flex-1 overflow-auto min-w-0');
   width = COMPACT_MAX_WIDTH + 1;
@@ -138,8 +139,9 @@ test('retained more sheet groups files and settings without retired operations r
   mount();
   const more = open('더보기');
   expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);
-  expect(more.findAllByType('a').map((node) => node.props.href)).toContain('/settings');
-  expect(more.findAllByType('h2')).toHaveLength(0);
+  const settings = more.findByProps({ 'aria-label': '설정' });
+  expect(settings.findAllByType('a').map((node) => node.props.href)).toEqual(['/settings', '/credentials']);
+  expect(more.findAllByType('h2').map((node) => node.children.join(''))).toEqual(['설정']);
   expect(more.findAllByType('a').map((node) => node.props.href)).not.toContain('/ops/release');
   act(() => tree!.unmount());
   operator = true;
@@ -180,9 +182,10 @@ test('single visible item navigates directly without a sheet, and role/Labs hide
 
 test('sidebar renders a single visible item without the duplicate group heading', () => {
   mount(createElement(SidebarNav));
-  const settings = tree!.root.findByProps({ 'aria-label': '설정' });
-  expect(settings.findAllByType('button')).toHaveLength(0);
-  expect(settings.findAllByType('a').map((node) => node.props.href)).toEqual(['/settings']);
-  expect(settings.findAllByType('a')[0]!.children.filter((child) => child === '설정')).toHaveLength(1);
-  expect(settings.findAllByType('a')[0]!.findAllByType('svg')).toHaveLength(1);
+  const files = tree!.root.findByProps({ 'aria-label': '자료' });
+  expect(files.findAllByType('button')).toHaveLength(0);
+  expect(files.findAllByType('a').map((node) => node.props.href)).toEqual(['/vault']);
+  expect(files.findAllByType('a')[0]!.children.filter((child) => child === 'Obsidian 노트')).toHaveLength(1);
+  expect(files.findAllByType('a')[0]!.findAllByType('svg')).toHaveLength(1);
+  expect(files.findAll((node) => node.children.includes('자료'))).toHaveLength(0);
 });

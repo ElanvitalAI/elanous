@@ -2,12 +2,17 @@ import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
-import { releaseRouteReachesKnownIssues } from './runner-routing.js';
+import { nextNode, releaseRouteReachesKnownIssues } from './runner-routing.js';
 import type { GraphEdgeSpec } from '../self-implement/graph-yaml.js';
 
 test('release waiver guard follows both declared gate cutover success exits to known issues', () => {
   const graph = parse(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { edges: GraphEdgeSpec[] };
   expect(releaseRouteReachesKnownIssues(graph.edges, 'cloud-leave-ok')).toBe(true);
+  expect(nextNode(graph.edges, 'gate', 'ok', 'waived')).toBe('receipt-audit');
+  expect(nextNode(graph.edges, 'gate', 'ok', 'ok')).toBe('cloud-leave-ok');
+  const unrelated: GraphEdgeSpec[] = [{ from: 'other-gate', on: 'outcome',
+    map: { ok: 'ordinary-next', audit: 'other-audit' } }];
+  expect(nextNode(unrelated, 'other-gate', 'ok', 'waived')).toBe('ordinary-next');
   const switchEdge = graph.edges.find(edge => edge.from === 'gate-cutover-switch')!;
   expect(switchEdge.map?.legacy).toBeDefined();
   expect(switchEdge.map?.audit).toBeDefined();

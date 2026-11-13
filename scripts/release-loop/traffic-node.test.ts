@@ -10,7 +10,11 @@ import { applyReleaseTrafficEvent, type TrafficFile } from './traffic-transition
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 const TRAFFIC_NODES = new Set(['traffic-cut-start', 'traffic-gate-passed', 'traffic-npm-published', 'traffic-verify-complete', 'traffic-failed-restore']);
 
-async function scenario(failNode?: 'pwa' | 'docs-land') {
+// Source: PR37374 train packet #33813 records a 10.013s single graph run;
+// resume runs the graph twice. Bound that integration work separately from Bun's 5s default.
+const GRAPH_SCENARIO_TIMEOUT_MS = 30_000;
+
+function trafficFixture() {
   const root = mkdtempSync(join(tmpdir(), 'release-traffic-events-'));
   const trafficFile = join(root, 'traffic.json');
   const initial: TrafficFile = {
@@ -18,6 +22,27 @@ async function scenario(failNode?: 'pwa' | 'docs-land') {
     seats: Object.fromEntries(['OP', 'TC', 'MK', 'UX'].map(seat => [seat, { perCycle: 8, keep: seat }])),
   };
   writeFileSync(trafficFile, JSON.stringify(initial));
+  return { root, trafficFile, initial, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+async function restoredTrafficScenario() {
+  const fixture = trafficFixture();
+  const state = { runId: 'traffic-transition-retry', startedAt: new Date().toISOString() };
+  const context = { ...state, input: { version: '0.2.38-rc.1', previousVersion: '0.2.37' }, outputs: {} };
+  try {
+    // Exercise the actual writer, without unrelated graph setup in these transition-only cases.
+    for (const [nodeId, event] of [
+      ['traffic-cut-start', 'cut-start'], ['traffic-gate-passed', 'gate-passed'], ['traffic-failed-restore', 'failed'],
+    ] as const) {
+      expect(await applyReleaseTrafficEvent({ ...context, nodeId }, event, { trafficFile: fixture.trafficFile }))
+        .toMatchObject({ applied: true });
+    }
+    return { ...fixture, state };
+  } catch (error) { fixture.cleanup(); throw error; }
+}
+
+async function scenario(failNode?: 'pwa' | 'docs-land') {
+  const { root, trafficFile, initial } = trafficFixture();
   const snapshots = new Map<string, TrafficFile>();
   const reports: string[] = [];
   try {
@@ -38,16 +63,19 @@ async function scenario(failNode?: 'pwa' | 'docs-land') {
           snapshots.set(context.nodeId!, JSON.parse(readFileSync(trafficFile, 'utf8')) as TrafficFile);
           return { exitCode, stdout: `${lines.at(-1)}\n`, stderr: '' };
         }
+        // release-loop.yaml requires a cutover branch, not a generic success outcome.
+        if (context.nodeId === 'gate-cutover-switch')
+          return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy' }) + '\n', stderr: '' };
         const failed = context.nodeId === failNode;
         return { exitCode: failed ? 1 : 0,
           stdout: JSON.stringify({ outcome: failed ? 'fail' : 'ok', verdict: failed ? 'fail' : 'pass', summary: 'fixture' }) + '\n', stderr: '' };
       };
     const state = await runGraph(GRAPH, {
       input: { version: '0.2.38-rc.1', previousVersion: '0.2.37' },
-      deps: { root, runBash },
+      deps: { root, runBash, releaseGraphEventAdapters: false },
     });
     return { state, initial, snapshots, reports, trafficFile,
-      resume: (fromNodeId: string) => runGraph(GRAPH, { resumeRunId: state.runId, fromNodeId, deps: { root, runBash } }),
+      resume: (fromNodeId: string) => runGraph(GRAPH, { resumeRunId: state.runId, fromNodeId, deps: { root, runBash, releaseGraphEventAdapters: false } }),
       cleanup: () => rmSync(root, { recursive: true, force: true }) };
   } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
 }
@@ -68,7 +96,7 @@ test('graph events move gate → half → full and reject an old run', async () 
       .toMatchObject({ applied: false, reason: 'different-run-is-current' });
     expect(readFileSync(run.trafficFile, 'utf8')).toBe(before);
   } finally { run.cleanup(); }
-});
+}, GRAPH_SCENARIO_TIMEOUT_MS);
 
 test('a failure before npm publish restores the exact pre-cut mode', async () => {
   const run = await scenario('pwa');
@@ -93,7 +121,7 @@ test('a failure before npm publish restores the exact pre-cut mode', async () =>
       input: { version: '0.2.38-rc.1', previousVersion: '0.2.37' }, outputs: { 'npm-publish': { outcome: 'ok' } } }, 'npm-published', { trafficFile: run.trafficFile }))
       .toMatchObject({ applied: true, stage: 2 });
   } finally { run.cleanup(); }
-});
+}, GRAPH_SCENARIO_TIMEOUT_MS);
 
 test('an already restored failure event is idempotent success for the graph node', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-traffic-already-restored-'));
@@ -135,10 +163,10 @@ test('a failure after npm publish keeps full traffic and reports the follow-up f
     expect(published.releaseLifecycle).toMatchObject({ runId: run.state.runId, stage: 2, event: 'npm-published' });
     expect(run.reports.some(body => body.includes('published-keeps-full'))).toBe(true);
   } finally { run.cleanup(); }
-});
+}, GRAPH_SCENARIO_TIMEOUT_MS);
 
 test('a same-run retry from traffic-cut-start reopens the gate after restoration', async () => {
-  const run = await scenario('pwa');
+  const run = await restoredTrafficScenario();
   try {
     expect(await applyReleaseTrafficEvent({ runId: run.state.runId, startedAt: run.state.startedAt, nodeId: 'traffic-cut-start',
       input: { version: '0.2.38-rc.1', previousVersion: '0.2.37' }, outputs: {} }, 'cut-start', { trafficFile: run.trafficFile }))
@@ -162,7 +190,7 @@ test('graph resume reruns the cut node and restores traffic again after a second
     expect(restored.seats.OP.perCycle).toBe(8);
     expect(restored.releaseLifecycle).toMatchObject({ runId: run.state.runId, event: 'failed', stage: 3 });
   } finally { run.cleanup(); }
-});
+}, GRAPH_SCENARIO_TIMEOUT_MS);
 
 test('a failure without a cut record reports missing baseline without changing traffic', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-traffic-no-cut-'));
@@ -198,7 +226,7 @@ test('a later run of the same version retains the first pre-cut baseline', async
 });
 
 test('verify success can repair a missed full transition after a same-run retry', async () => {
-  const run = await scenario('pwa');
+  const run = await restoredTrafficScenario();
   try {
     expect(await applyReleaseTrafficEvent({ runId: 'later-run', startedAt: '2026-10-26T01:00:00Z',
       nodeId: 'traffic-verify-complete', input: { version: '0.2.38-rc.1', previousVersion: '0.2.37' }, outputs: {} },

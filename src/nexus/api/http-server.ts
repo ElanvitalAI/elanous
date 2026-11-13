@@ -72,7 +72,7 @@ import { handleDevProxyHttpRequest, pathMatchesDevProxy } from './dev-proxy.js';
 import { OPENAI_RELAY_PATH, tryHandleOpenAiRelay } from './openai-relay.js';
 import { handleHealth, type HealthSetupContext } from './health.js';
 import { handleTabsList, handleTabDetail, handleNexusSnapshot } from './tabs.js';
-import { handleSseEvents } from './events.js';
+import { handleSseEvents, isPluginEventDeviceId, requestsPluginEvents } from './events.js';
 import { handleGraphRunEvents } from './graph-run-events.js';
 import { handleInsideEvents, INSIDE_EVENTS_PATH, startInsideEventRelay } from './inside-events.js';
 import { dispatchIntentPredictionRoute } from './intent-prediction.js';
@@ -1593,7 +1593,7 @@ export async function routeRequest(
   }
   if (pathname === '/v1/scraps' || pathname === '/v1/scrap-folders'
     || /^\/v1\/scrap-folders\/[a-f0-9-]{36}$/.test(pathname)
-    || /^\/v1\/scraps\/[a-f0-9]{16}\/(folder|class-date|export)$/.test(pathname)) {
+    || /^\/v1\/scraps\/[a-f0-9]{16}\/(folder|class-date|export|retry)$/.test(pathname)) {
     if (!opts.scraps) return jsonResponse({ error: 'scraps-not-wired' }, 503);
     const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
     if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
@@ -3738,6 +3738,15 @@ export async function routeRequest(
   }
   if (pathname === '/v1/events') {
     const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
+    if (requestsPluginEvents(topics)) {
+      // Same-origin, member cookies, setup/temp tokens and noAuth are not operator credentials.
+      if (!opts.metaApi || bearerCredential(req, opts.metaApi) !== 'bearer-match')
+        return jsonResponse({ error: 'unauthorized' }, 401);
+      const devices = url.searchParams.getAll('deviceId');
+      if (devices.length !== 1 || !isPluginEventDeviceId(devices[0]))
+        return jsonResponse({ error: 'device_scope_required' }, 400);
+      return handleSseEvents(opts.eventBus, url, { operatorBriefings: true, operatorDeviceId: devices[0] });
+    }
     const hasBoardTopic = topics.includes('board.card');
     const hasBriefingTopic = topics.includes('briefing.ready');
     const hasSummaryTopic = topics.includes('scrap.summary.result');

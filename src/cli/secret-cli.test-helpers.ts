@@ -10,6 +10,7 @@ export function createEmptySecretCliMock() {
   const verified: string[] = [];
   const deps: SecretCliDeps = {
     isInteractive: () => true,
+    isStdoutTTY: () => false,
     promptSecret: async () => 'mock-secret-value',
     saveSecret: async (id, value) => { values.set(id, value); },
     revokeAppSecrets: async (app, name) => {

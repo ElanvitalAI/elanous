@@ -364,16 +364,25 @@ test('legacy rootless loop with an existing cron can still stop and restart', as
 
 test('registry projects metadata from YAML through list, all, and status; new root-backed loop registers', async () => {
   const f = fixture();
-  writeFileSync(join(f.root, 'graphs', 'child.yaml'), "graph_id: child\nloop:\n  title: Child\n  root: 수호자\n  parent: daily\n  owner: TC\n  purpose: 검증\n  stage: shadow\n  trigger:\n    cron: '0 8 * * *'\n");
+  writeFileSync(join(f.root, 'graphs', 'child.yaml'), "graph_id: child\nloop:\n  title: Child\n  root: 수호자\n  parent: daily\n  owner: RES\n  purpose: 검증\n  stage: shadow\n  trigger:\n    cron: '0 8 * * *'\n");
   const actions: string[] = [];
   const opts: LoopRegistryOptions = { ...f.opts, schedules: [], scheduleAction: async action => { actions.push(action); return { changed: true }; } };
-  const metadata = { root: '수호자', parent: 'daily', owner: 'TC', ownerSource: 'header', purpose: '검증', stage: 'shadow' };
+  const metadata = { root: '수호자', parent: 'daily', owner: 'RES', ownerSource: 'header', purpose: '검증', stage: 'shadow' };
   expect(listLoops(opts).find(loop => loop.id === 'child')).toMatchObject(metadata);
   expect(loopStatus('child', opts)).toMatchObject(metadata);
   expect(listAllLoops(opts).find(loop => loop.id === 'child')).toMatchObject(metadata);
   expect(await setLoopEnabled('child', true, false, opts)).toMatchObject({ dryRun: true, changes: [{ action: 'create' }] });
   expect(await setLoopEnabled('child', true, true, opts)).toMatchObject({ changed: true });
   expect(actions).toEqual(['create']);
+});
+
+test('registry still projects TC from a graph header after accepting RES', () => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'graphs', 'tc-child.yaml'), "graph_id: tc-child\nloop:\n  title: TC Child\n  root: 수호자\n  owner: TC\n  trigger:\n    events: [manual]\n");
+  const metadata = { owner: 'TC', ownerSource: 'header' };
+  expect(listLoops(f.opts).find(loop => loop.id === 'tc-child')).toMatchObject(metadata);
+  expect(loopStatus('tc-child', f.opts)).toMatchObject(metadata);
+  expect(listAllLoops(f.opts).find(loop => loop.id === 'tc-child')).toMatchObject(metadata);
 });
 
 test('registry rejects invalid root and stage rather than silently assigning a tree position', () => {

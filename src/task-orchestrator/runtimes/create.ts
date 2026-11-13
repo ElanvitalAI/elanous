@@ -86,8 +86,10 @@ export async function dispatchTaskCreate(
     generatedBy: { kind: 'user' },
   });
   let scheduleDeferred: string | null = null;
+  let added = false;
   try {
     graph.addTask(task);
+    added = true;
     if (task.scheduleText) {
       // V2.2-7 (2026-05-11) — TOX→workflow-runtime direct wire. The
       // legacy `scheduler-bridge.ts` + `src/scheduler/jobs.ts` path was
@@ -120,12 +122,15 @@ export async function dispatchTaskCreate(
         scheduleDeferred = 'workflow-runtime daemon not yet wired';
       }
     }
+    if (!task.scheduleText) graph.promoteReady();
+    const store = getToxRuntimeDeps().getStore?.();
+    if (store instanceof TaskStore) store.saveTask(graph.getTask(task.id)!);
   } catch (err) {
+    if (added) graph.restoreTask(task.id);
     return {
       output: `TaskCreate failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-  if (!task.scheduleText) graph.promoteReady();
   const scheduleSuffix = task.scheduleText
     ? ` · scheduled via ${task.scheduleText}${scheduleDeferred ? ' (deferred — ' + scheduleDeferred + ')' : ''}`
     : '';

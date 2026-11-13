@@ -33,7 +33,7 @@ function renderVoiceNote(note: AbsorbScrapPayload): string {
   const timeline = (note.raw.timeline ?? []).map((entry) => `- ${Math.floor(entry.t / 1000)}s ${entry.kind}: ${entry.kind === 'marker' ? entry.label : entry.mediaRef}`);
   return [`# ${title}`, '', `녹음 날짜: ${note.raw.recordedDate ?? '미상'}`,
     `수업일: ${note.raw.classDate ?? '미지정'}`, `녹음 원본: ${note.raw.mediaRef ?? ''}`,
-    '', '## 요약', '', note.raw.text ?? '', '', '## 전사', '', note.extractedBody ?? '전사 원문 없음',
+    '', '## 요약', '', note.raw.text ?? '', '', '## 전사', '', note.raw.transcript ?? note.extractedBody ?? '전사 원문 없음',
     '', '## 타임라인', '', ...timeline, ''].join('\n');
 }
 

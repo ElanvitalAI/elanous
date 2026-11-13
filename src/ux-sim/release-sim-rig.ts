@@ -203,6 +203,15 @@ export function createReleaseSimRigFakeGitScript(): string {
   ].join('\n');
 }
 
+/** Execute the pinned cutover recipe consistently across simulation runners. */
+function runGateCutoverCommand(command: string, env: NodeJS.ProcessEnv | undefined) {
+  if (command.trim() !== 'bun scripts/release-loop/gate-cutover-switch-node.ts') return undefined;
+  const child = spawnSync('bun', ['scripts/release-loop/gate-cutover-switch-node.ts'], {
+    cwd: REPOSITORY_ROOT, env: { ...process.env, ...env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
+  });
+  return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
+}
+
 /** Extends the existing release graph rig with fake incident/PR/owner boundaries and the production recovery decision core. */
 export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIncidentSimInput): Promise<{
   readonly pass: boolean;
@@ -290,7 +299,8 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
   let graphRepairInputGateExecutionId: string | undefined;
   let graphState: GraphRunState;
   try { graphState = await runGraph(RELEASE_GRAPH, { runId: input.runId,
-    input: { version, previousVersion: '0.3.5' }, eventBus: bus, pinChildUniverse: true, quiet: true,
+    input: { version, previousVersion: '0.3.5',
+      ...(input.receiptAuditKeyMismatchFirst ? { graphCutover: 'audit', graphCutoverEvidenceId: 'simulation-receipt-key-mismatch' } : {}) }, eventBus: bus, pinChildUniverse: true, quiet: true,
     deps: { root, runBash: async (_command: string, options: { env?: NodeJS.ProcessEnv }) => {
       const { nodeId } = parseContext(options.env ?? process.env);
       if (!incidentsInjected && nodeId === 'gate') {
@@ -357,6 +367,9 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
           preexisting: 0, fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [],
           rcNonzeroNoFailures: [], durationMs: 1 })}\n`, stderr: 'TypeScript TS2322: simulated introduced regression after receipt-key mismatch' };
       }
+      // This command routes on legacy/audit, not the generic simulated ok outcome.
+      const cutover = runGateCutoverCommand(_command, options.env);
+      if (cutover) return cutover;
       if (nodeId === 'gate-triage') {
         const context = readGraphContext(options.env);
         const latest = latestGateOutput(context);
@@ -2505,12 +2518,10 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
       return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
     }
-    if (command.trim() === 'bun scripts/release-loop/gate-cutover-switch-node.ts') {
-      const child = spawnSync('bun', ['scripts/release-loop/gate-cutover-switch-node.ts'], {
-        cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
-      });
+    const cutover = runGateCutoverCommand(command, options.env);
+    if (cutover) {
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
-      return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
+      return cutover;
     }
     const injectedFault = item.mode === 'approval-graph-path-mismatch' && nodeId === 'auto-approve'
       ? { node: nodeId, outcome: 'error' as const, evidence: { approvalSnapshot: 'other graph path' } } : item.fault;

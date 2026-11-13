@@ -179,7 +179,7 @@ test('serial release baseline: RFC #24935 recorded figures (not a live measureme
   expect(graph.nodes.find((node) => node.node_id === 'pod-reuse-prep')?.call).toBe('pod-reuse-prep@1');
   expect(graph.edges.find((edge) => edge.from === 'cloud-join')?.map).toEqual({ ok: 'pod-reuse-prep', fail: 'cloud-leave-join-fail', error: 'cloud-leave-join-fail' });
   expect(graph.edges.find((edge) => edge.from === 'pod-reuse-prep')?.map).toEqual({ reuse: 'gate', legacy: 'gate', skip: 'gate', failed: 'gate', error: 'gate' });
-  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'cloud-leave-ok', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'cloud-leave-ok', waived: 'receipt-audit', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
   expect(graph.nodes.find((node) => node.node_id === 'emergency-switch')).toMatchObject({ kind: 'judge', recipe: 'cmd:emergency-switch' });
   expect(graph.nodes.find((node) => node.node_id === 'emergency-gate')).toMatchObject({ kind: 'gate', recipe: 'cmd:emergency-gate' });
   expect(graph.edges.find((edge) => edge.from === 'emergency-switch')?.map).toMatchObject({ switch: 'emergency-gate', 'stay-normal': 'gate-triage' });
@@ -291,7 +291,7 @@ test('public export check fails after gate and blocks prepare/publish', async ()
   expect(graph.edges.find((edge) => edge.from === 'export-check')).toBeUndefined();
   expect(graph.nodes.find((node) => node.node_id === 'regression-suite')?.needs).toEqual(['cutoff']);
   expect(graph.nodes.find((node) => node.node_id === 'pre-gate-join')?.needs).toEqual(['checklist-gate', 'regression-suite', 'prefetch']);
-  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'cloud-leave-ok', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'cloud-leave-ok', waived: 'receipt-audit', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
   expect(recipes['mac-smoke']).toEqual({ command: 'bun scripts/release-loop/mac-smoke-node.ts', timeout_ms: 1_800_000 });
   expect(recipes['export-check']).toEqual({ command: 'bun scripts/release-loop/export-check-node.ts', timeout_ms: 1_800_000 });
   const root = mkdtempSync(join(tmpdir(), 'release-export-failed-'));

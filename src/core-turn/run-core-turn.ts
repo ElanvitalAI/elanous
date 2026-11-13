@@ -574,13 +574,24 @@ export async function runCoreTurn(
     researchIntent: researchTurn,
     reasoningEffort: ctx.reasoningEffort,
   });
-  const { messages, tools: tieredTools, stats } = applyDeferredTools(
+  const deferredSplit = applyDeferredTools(
     ctx.messages,
     ctx.tools,
     { enabled: deferredEnabled,
       activePluginIds: new Set(ctx.tools.flatMap((tool) => tool.pluginId ? [tool.pluginId] : [])),
       ...(recentUserText ? { userText: recentUserText } : {}) },
   );
+  // Catalog defers elanous_linear_issue (warmPreload: false, ops-fleet). An
+  // ordered Linear step must still see that schema on the first dispatch,
+  // before ToolSearch hydration or a later research graph.
+  const messages = deferredSplit.messages;
+  const stats = deferredSplit.stats;
+  const tieredTools = orderedLinearIssueStep
+    ? [
+      ...ctx.tools.filter((tool) => tool.name === 'elanous_linear_issue' && !deferredSplit.tools.some((active) => active.name === tool.name)),
+      ...deferredSplit.tools,
+    ]
+    : deferredSplit.tools;
   // Preserve the pre-routing contract: a named skill only skips the research
   // prepass when skill_exec is actually active after the normal tier split.
   // Resolve the installed skill name even if skill_exec is deferred/missing:

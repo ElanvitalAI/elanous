@@ -380,11 +380,11 @@ test('host-down from runGateNode is preserved through resume and switches the sa
     state.input.gatePodPool = 'pool-test';
     state.input.gateImagePin = 'cut-commit';
     state.input.previousVersion = '0.2.18';
-    // Source: the current release graph inserts readiness-countdown before traffic-cut-start.
-    state.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+    // Source: release-loop.yaml routes pre-gate-join through cloud approval/join and pod reuse before gate.
+    state.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
     state.nodes = state.path.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true,
       output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
-        : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
+        : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: nodeId === 'pod-reuse-prep' ? 'skip' : 'ok' }) }));
     const gateRecord = state.nodes.at(-1)!;
     gateRecord.ok = false;
     gateRecord.exit = 2;
@@ -432,7 +432,8 @@ test('host-down from runGateNode is preserved through resume and switches the sa
         }
         return { exitCode: 0, stdout: '{"outcome":"ok"}', stderr: '' };
       } });
-    expect(inventoryCalls).toBeGreaterThan(0);
+    // Source: macrophage-heal-node.ts inventories PHASE_WAKE_NODES only; gate resumes after pre-gate-join.
+    expect(inventoryCalls).toBe(0);
     expect(gateInput).toMatchObject({ gateRerouteShard: 'auto', gatePodPool: 'pool-test' });
     expect(resumedPlacement?.[0]).toMatchObject({ kind: 'run', host: 'replacement-host', replacing: { host: 'old-host' } });
     expect(acquiredHost).toBe('replacement-host');
@@ -469,13 +470,13 @@ test('interference partial-resume rechecks only affected files at the same cut',
   runState.input.commit = SHA;
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
-  // Source: the current graph adds readiness-countdown before traffic-cut-start.
-  runState.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+  // Source: release-loop.yaml routes pre-gate-join through cloud approval/join and pod reuse before gate.
+  runState.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
     output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'cutoff' ? JSON.stringify({ baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: SHA } })
         : nodeId === 'gate' ? JSON.stringify(gateOutput)
-        : JSON.stringify({ outcome: 'ok' }) }));
+        : JSON.stringify({ outcome: nodeId === 'pod-reuse-prep' ? 'skip' : 'ok' }) }));
   runState.executed = runState.nodes.length;
   writeFileSync(saved.statePath, JSON.stringify(runState));
   mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });

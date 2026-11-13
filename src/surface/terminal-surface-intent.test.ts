@@ -11,9 +11,11 @@ test('terminal mouse events preserve the canonical semantic intent', () => {
     exposure: { userExposure: 'user-interactive', agentInteractive: true },
   });
 
+  // double-click is host-synthesized (G4). SGR 1006 has no byte for it,
+  // so isPtyForwardMouseEventType keeps it on the host lane.
   expect(event).toMatchObject({
     type: 'terminal:mouse-intent',
-    transport: 'pty-forward',
+    transport: 'host-only',
     interactionPolicy: expect.any(Object),
   });
   expect(intentFromMouseEvent(event)).toMatchObject({

@@ -362,7 +362,9 @@ test('production release-loop re-entry audits same-run receipts and keeps failed
           if (context.graphId === 'pod-reuse-prep') return output({ outcome: 'legacy', verdict: 'legacy',
             reason: 'prep-body-pending', receiptPath: '' });
           if (context.nodeId === 'gate-cutover-switch') return output({ outcome: 'audit' });
-          if (context.nodeId === 'version-release' || context.nodeId === 'cutoff') return output({ outcome: 'ok', commit });
+          if (context.nodeId === 'version-release') return output({ outcome: 'ok', commit });
+          // Source: release-loop.yaml binds Pod reuse inputs from cutoff.cutoff.sha and cutoff.candidatePath.
+          if (context.nodeId === 'cutoff') return output({ outcome: 'ok', commit, cutoff: { sha: commit }, candidatePath: context.input.candidatePath });
           if (context.nodeId === 'gate') return output({ outcome: 'ok', commit, introduced: [] });
           if (context.nodeId === 'receipt-audit' || context.nodeId === 'receipt-audit-recheck') {
             const audit = auditGateFileReceipts(context, { repo: process.cwd(), roots: { instance: root, ledger: root },

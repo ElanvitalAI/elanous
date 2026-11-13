@@ -76,7 +76,8 @@ import { nexusRootDir } from './nexus/paths.js';
 import type { ScrapsRouteOptions } from './nexus/api/scraps.js';
 import { activeTelegramMember, consumeTelegramMemberCode, markTelegramCompletionSent, markTelegramReceiptSent,
   pendingTelegramCompletion, pendingTelegramReceipts,
-  recordTelegramCompletion, retryPendingTelegramMemberCards, saveTelegramMemberScrap, telegramReceiptStatus, verifiedTelegramMember } from './telegram-member-scrap.js';
+  recordTelegramCompletion, retryPendingTelegramMemberCards, saveTelegramMemberScrap, telegramMemberPublicHandle,
+  telegramReceiptStatus, verifiedTelegramMember } from './telegram-member-scrap.js';
 import { handleTelegramSeatWork, type TelegramSeatWorkDeps } from './intake-plane/telegram-seat-work.js';
 import { deliverSeatAnswers } from './seat-dispatch/seat-ask.js';
 import { effectiveInstanceRoot } from './instance/resolve.js';
@@ -1394,6 +1395,14 @@ export class TelegramBot {
               });
             } catch (err) { this.log(`brief feedback failed: ${err instanceof Error ? err.message : String(err)}`); }
           }
+          // A one-time connection code must bypass both HITL text capture and a
+          // turn that may be waiting for that capture on the serialized chain.
+          if (/^\/connect(?:\s|$)/.test(incoming.text)) {
+            void this.handleMemberConnect(incoming).catch(() => {
+              debug.log('telegram.member-link', 'connect-delivery-failed', { failed: true });
+            });
+            continue;
+          }
           // HITL "Other" free-text: consume inline (before the turn
           // chain) so it isn't queued behind the turn awaiting it.
           if (this.tryConsumeTextCapture(incoming)) continue;
@@ -1679,18 +1688,33 @@ export class TelegramBot {
     return true;
   }
 
+  private async handleMemberConnect(ctx: TgIncoming): Promise<void> {
+    const code = ctx.text.trim().split(/\s+/)[1] ?? '';
+    const identity = { botId: this.botId, userId: ctx.userId, chatId: ctx.chatId };
+    const root = this.scrapRouteOptions?.instanceRoot ?? nexusRootDir();
+    const connected = ctx.isDm && consumeTelegramMemberCode(root, identity, code, this.nowImpl());
+    const handle = connected ? telegramMemberPublicHandle(root, identity) : null;
+    debug.log('telegram.member-link', 'connect', { connected, hasPublicMemberId: handle !== null });
+    await this.sendMessage(ctx.chatId, connected
+      ? `회원 계정이 연결되었습니다. 이제 이 대화에서 링크를 저장할 수 있습니다.${handle
+        ? `\n회원 ID: ${handle}\n추천 링크: https://elanous.ai/r/${handle}`
+        : '\n추천 링크를 쓰려면 회원 화면에서 회원 ID를 설정해 주세요.'}`
+      : '연결할 수 없습니다. 회원 화면에서 새 연결 코드를 발급받아 이 봇의 1:1 대화에 입력해 주세요.',
+    { replyTo: ctx.messageId, threadId: ctx.threadId });
+  }
+
   private async handleIncoming(ctx: TgIncoming): Promise<void> {
     if (!this.isOwnerAllowed(ctx.userId)) {
       await this.refuseMessage(ctx);
       return;
     }
-    if (/^\/connect(?:\s|$)/.test(ctx.text)) {
-      const code = ctx.text.trim().split(/\s+/)[1] ?? '';
+    if (/^\/invite(?:\s|$)/.test(ctx.text)) {
       const identity = { botId: this.botId, userId: ctx.userId, chatId: ctx.chatId };
-      const connected = ctx.isDm && consumeTelegramMemberCode(this.scrapRouteOptions?.instanceRoot ?? nexusRootDir(), identity, code, this.nowImpl());
-      await this.sendMessage(ctx.chatId, connected
-        ? '회원 계정이 연결되었습니다. 이제 이 대화에서 링크를 저장할 수 있습니다.'
-        : '연결할 수 없습니다. 회원 화면에서 새 연결 코드를 발급받아 이 봇의 1:1 대화에 입력해 주세요.',
+      const handle = ctx.isDm ? telegramMemberPublicHandle(this.scrapRouteOptions?.instanceRoot ?? nexusRootDir(), identity) : null;
+      debug.log('telegram.member-link', 'invite', { hasPublicMemberId: handle !== null });
+      await this.sendMessage(ctx.chatId, handle
+        ? `회원 ID: ${handle}\n추천 링크: https://elanous.ai/r/${handle}`
+        : '추천 링크를 보려면 1:1 대화에서 회원 계정을 연결하고 회원 화면에서 회원 ID를 설정해 주세요.',
       { replyTo: ctx.messageId, threadId: ctx.threadId });
       return;
     }

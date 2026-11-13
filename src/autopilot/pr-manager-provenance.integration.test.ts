@@ -37,12 +37,22 @@ import json,os,sys
 a=sys.argv[1:]
 with open(os.environ['TC_GH_CALLS'],'a') as f:f.write(json.dumps(a)+'\\n')
 head=os.environ['TC_PR_HEAD']; body=os.environ['TC_PR_BODY']; url='https://github.com/o/r/pull/7'
-if a[:3]==['api','--paginate','--slurp'] and '/pulls?' in a[3]:
- print(json.dumps([[{'number':7,'state':'open','draft':True,'head':{'ref':'old-branch','sha':head},'labels':[],'body':body,'title':'old','updated_at':'2026-10-21T00:00:00Z'}]]))
-elif a[:3]==['api','--paginate','--slurp'] and '/files?' in a[3]:
- print(json.dumps([[{'filename':'old.txt'}]]))
+# The census dropped --slurp (#34926): gh api --paginate now emits one FLAT
+# array per page — match the endpoint anywhere in the args and answer flat.
+ep=next((x for x in a if '/pulls?' in x or '/files?' in x),'')
+if a[:2]==['api','--paginate'] and '/pulls?' in ep:
+ print(json.dumps([{'number':7,'state':'open','draft':True,'head':{'ref':'old-branch','sha':head},'labels':[],'body':body,'title':'old','updated_at':'2026-10-21T00:00:00Z'}]))
+elif a[:2]==['api','--paginate'] and '/files?' in ep:
+ print(json.dumps([{'filename':'old.txt'}]))
+# The census projection asks pr list --json number,changedFiles,files (no --head);
+# findPrForBranchOutcome asks --head <branch> --json url --jq '.[0].url // ""' and
+# real gh prints the url only when that head has an open PR, an empty line otherwise.
 elif a[:2]==['pr','list']:
- print(json.dumps([{'number':7,'changedFiles':1,'files':[{'path':'old.txt'}]}]))
+ if '--head' in a:
+  h=next((a[i+1] for i,x in enumerate(a) if x=='--head'),'')
+  print(url if h=='old-branch' else '')
+ else:
+  print(json.dumps([{'number':7,'changedFiles':1,'files':[{'path':'old.txt'}]}]))
 elif a[:2]==['pr','view']:
  print(json.dumps({'state':'OPEN','headRefOid':head,'headRefName':'old-branch','body':body,'isCrossRepository':False,'isDraft':True,'labels':[],'url':url}))
 elif a[:2]==['pr','diff']:

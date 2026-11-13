@@ -183,9 +183,20 @@ test('pinned heavy typecheck drift reaches the operational refusal observer with
     pty: { unreadable: [], observedRefCount: 0, withoutRunIdCount: 0, notCountedRefCount: 0 },
   };
   let heavyReason = 'gate-rc-1 · remote: stderr: [typecheck] FAIL — tsc failed with errors.';
+  // The PR view's url below names the base repository whose main ref #35917's pin probes.
+  const baseRepository = 'example/repo';
   try {
     const run: NonNullable<PrLandDeps['run']> = (command, args, options) => {
-      if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/typecheck-drift', baseRefName: 'main', state: 'OPEN', isDraft: false, url: `https://github.com/example/repo/pull/${PR}` }) };
+      if (command === 'gh') {
+        // #35917 (718b100d1f) pins heavy-remote main to the PR base repository through
+        // `gh api repos/<owner>/<repo>/git/ref/heads/main` — answer exactly that probe for
+        // this PR's base repository with this repo's base tip so the pinned landing reaches
+        // the heavy gate instead of failing closed at overlap-preflight. Any other
+        // repository or a trailing path falls through to the PR-view body (no SHA) and
+        // fails closed, so a repo-pin regression cannot hide behind this fake.
+        if (args[0] === 'api' && args[1] === `repos/${baseRepository}/git/ref/heads/main`) return { ok: true, out: base };
+        return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/typecheck-drift', baseRefName: 'main', state: 'OPEN', isDraft: false, url: `https://github.com/${baseRepository}/pull/${PR}` }) };
+      }
       if (command === 'git' && args[0] === 'fetch') return { ok: true, out: '' };
       const result = spawnSync(command, args, { cwd: options?.cwd ?? repo, encoding: 'utf8' });
       return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };

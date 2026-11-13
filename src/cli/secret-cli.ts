@@ -29,6 +29,7 @@ import { credentialSlotWizardPlan, runCredentialSlotWizard } from '../nexus/conf
 
 export interface SecretCliDeps {
   isInteractive?: () => boolean;
+  isStdoutTTY?: () => boolean;
   promptSecret?: (message: string) => Promise<string | undefined>;
   saveSecret?: (id: string, value: string) => Promise<void>;
   saveAppSecret?: (id: string, value: string) => Promise<void>;
@@ -121,6 +122,7 @@ function resolveDeps(deps: SecretCliDeps) {
   const getSecret = deps.getSecret ?? getSecretAsync;
   return {
     isInteractive: deps.isInteractive ?? (() => process.stdin.isTTY === true && process.stdout.isTTY === true),
+    isStdoutTTY: deps.isStdoutTTY ?? (() => process.stdout.isTTY === true),
     promptSecret: deps.promptSecret ?? createSecretPrompt(),
     saveSecret: deps.saveSecret ?? setSecretAsync,
     saveCredentialSlot: deps.saveCredentialSlot ?? setCredentialSlotAsync,
@@ -589,11 +591,17 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
     });
 
   const envCommand = secret.command('env')
-    .description('Print shell-quoted exports for the requested stored environment names only.')
+    .description('Print shell-quoted exports to a pipe; terminal output requires --print.')
+    .option('--print', 'Explicitly allow secret values on a terminal')
     .requiredOption('--names <names>', 'Comma-separated environment variable names')
     .allowExcessArguments(false)
-    .action(async (options: { names: string }) => {
+    .action(async (options: { names: string; print?: boolean }) => {
       try {
+        if (cli.isStdoutTTY() && options.print !== true) {
+          cli.output.error('secret env refuses terminal output; use a pipe or explicitly pass --print');
+          cli.setExitCode(1);
+          return;
+        }
         cli.initializeBackend();
         const names = options.names.split(',');
         const secrets: Record<string, string> = {};

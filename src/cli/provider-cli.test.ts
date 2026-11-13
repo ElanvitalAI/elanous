@@ -8,7 +8,7 @@ import { writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
 import { _setRotationConfigReaderForTesting } from '../oauth/codex-account-store.js';
 import * as codexModule from '../oauth/codex.js';
 import { refreshCodexAccountHome } from '../oauth/codex.js';
-import { loadTokens, saveTokens } from '../oauth/store.js';
+import { authStorePath, loadTokens, saveTokens } from '../oauth/store.js';
 import { createFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import {
   registerProviderCommands,
@@ -127,7 +127,11 @@ function statusFixture(): string[] {
   const homes = ['default', 'team', 'third'].map(name => join(root, `${name}-home`));
   for (const home of homes) mkdirSync(home, { recursive: true });
   process.env.CODEX_HOME = homes[0]!;
-  const store = join(root, 'elanous', 'auth.json');
+  // #37169 — authStorePath() 는 config-dir(§4d: ELANOUS_STATE_DIR 을 따라감) 아래로
+  // 해석된다. 픽스처도 «CLI 가 읽는 그 경로»에 기록해야 한다; 옛 XDG 레이아웃에 쓰면
+  // CLI 는 빈 저장소를 보고 codexAccountReadStorePath 가 실제 홈(~/.elanous)으로
+  // 넘어가 버린다 — 격리 위반이자 이 네 케이스의 실패 원인.
+  const store = authStorePath();
   for (const [index, name] of ['default', 'team', 'third'].entries()) {
     saveTokens(index === 0 ? 'openai-codex' : `openai-codex:${name}`,
       { accessToken: 'fixture', refreshToken: 'fixture', expiresAt: null },
@@ -284,7 +288,7 @@ describe('provider codex account refresh', () => {
     const backups = readdirSync(homes[2]!).filter((f) => f.startsWith('auth.json.bak-'));
     expect(backups).toHaveLength(1);
     expect(statSync(join(homes[2]!, backups[0]!)).mode & 0o777).toBe(0o600);
-    const stored = loadTokens('openai-codex:third', join(process.env.XDG_CONFIG_HOME!, 'elanous', 'auth.json'));
+    const stored = loadTokens('openai-codex:third', authStorePath());
     expect(stored?.tokens.refreshToken).toBe('rt-new.Zz-9_rotated-token');
     expect(stored?.codexHome).toBe(homes[2]);
   });
@@ -294,7 +298,7 @@ describe('provider codex account refresh', () => {
     const original = JSON.stringify({ tokens: { access_token: jwt(2.5), refresh_token: 'rt-old.Yy-8_original-token' } });
     writeFileSync(join(homes[1]!, 'auth.json'), original, { mode: 0o600 });
     const res = await refreshCodexAccountHome('team', {
-      storePath: join(process.env.XDG_CONFIG_HOME!, 'elanous', 'auth.json'),
+      storePath: authStorePath(),
       refresh: async () => { throw new Error('codex refresh failed: status=400 rt-old.Yy-8_original-token'); },
     });
     expect(res).toMatchObject({ ok: false, kind: 'refresh-failed' });

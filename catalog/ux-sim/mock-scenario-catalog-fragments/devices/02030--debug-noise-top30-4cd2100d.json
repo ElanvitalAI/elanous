@@ -1,0 +1,15 @@
+{
+  "id": "debug-noise-top30",
+  "name": "Isolated 24-hour debug noise and judgment replay",
+  "audience": "internal",
+  "checklistCells": ["DEBUG-NOISE-TOP30-OUT"],
+  "implementation": ["src/ux-sim/debug-noise-top30.ts", "src/debug/log.ts", "src/debug/log-diet.ts"],
+  "tests": ["src/ux-sim/debug-noise-top30.test.ts"],
+  "target": "Replay one fixed 24-hour input through production debug.log with Log Diet off and on, each into an isolated logs.db.",
+  "inputs": ["720 repeated tox.loop/tick events and five protected decision events per hour", "Temporary logs.db stores and a deterministic LogDietGuard clock"],
+  "observations": ["Top-30 category/event counts and payload bytes from each isolated logs.db", "Live database plus WAL bytes before checkpoint", "Admission, observe, self-heal, HITL, and failure row counts remain equal"],
+  "entryCommands": ["bun test src/ux-sim/debug-noise-top30.test.ts"],
+  "logsRecorded": "yes",
+  "eventNames": ["tox.loop/tick", "log.diet/suppressed", "pod-lease/admit-by-usage", "observe/state-changed", "self-heal/failure", "hitl/awaiting", "failure/critical"],
+  "recentUse": null
+}

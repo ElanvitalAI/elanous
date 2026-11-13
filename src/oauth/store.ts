@@ -37,7 +37,7 @@ import { debug } from '../debug/log.js';
 import { isCodexStoreKey } from './codex-account.js';
 import { migrateLegacyXdgFile } from '../storage/legacy-elanous-dir-migrate.js';
 import { withFileLockSync } from '../storage/file-lock.js';
-import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 
 export interface OAuthTokens {
   accessToken: string;
@@ -104,9 +104,22 @@ const STORE_VERSION = 1;
 //   moved from ~/.config/elanous/auth.json → ~/.elanous/auth.json. First
 //   call migrates legacy XDG file with `.bak` rename · 0o600 preserved.
 //   XDG_CONFIG_HOME explicit honors legacy path (Phase 6 deprecation).
+// #37169 routes auth through the config-dir resolver: an explicitly selected
+//   universe (--config-dir · ELANOUS_STATE_DIR) keeps its own auth.json.
+//   ⛔ But the resolver's *default* root must still honor XDG_CONFIG_HOME —
+//   `codexCredentialRoot()` (OBS-T112: auth · quota signal · reset credit
+//   share one root) and `provider-detect.ts`/`parent-host.ts` read
+//   $XDG_CONFIG_HOME/elanous/auth.json. #37169 dropped that branch and split
+//   credentials from their state in XDG environments; it is restored here.
 export function authStorePath(): string {
   const root = getElanousConfigDir();
-  if (root === join(homedir(), '.elanous')) migrateLegacyXdgFile('auth.json', 0o600);
+  // Selection provenance outranks XDG even when the selected path is ~/.elanous.
+  if (getElanousConfigDirOverride() !== undefined || process.env.ELANOUS_STATE_DIR?.trim())
+    return join(root, 'auth.json');
+  if (root !== join(homedir(), '.elanous')) return join(root, 'auth.json');
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  if (xdg) return join(xdg, 'elanous', 'auth.json');
+  migrateLegacyXdgFile('auth.json', 0o600);
   return join(root, 'auth.json');
 }
 

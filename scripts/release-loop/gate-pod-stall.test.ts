@@ -193,10 +193,10 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
   // The direct gate entry test above checks the 15s stop bound; this full graph test checks only the persisted verdict.
   expect(gate.code).toBe(2);
   expect(first.status).toBe('failed');
-  expect(first.path.slice(-4)).toEqual(['gate', 'gate-triage', 'traffic-failed-restore', 'failed']);
+  expect(first.path.slice(-5)).toEqual(['gate', 'cloud-leave-error', 'gate-triage', 'traffic-failed-restore', 'failed']);
   // What `release resume` reads: the state file the runner saved, not the in-memory result.
   const saved = JSON.parse(readFileSync(join(ledger, 'graph-runs', 'release-loop', `${first.runId}.json`), 'utf8')) as GraphRunState;
-  expect(saved.path.slice(-4)).toEqual(['gate', 'gate-triage', 'traffic-failed-restore', 'failed']);
+  expect(saved.path.slice(-5)).toEqual(['gate', 'cloud-leave-error', 'gate-triage', 'traffic-failed-restore', 'failed']);
   expect(saved.nodes.find((node) => node.nodeId === 'gate-triage')).toMatchObject({ executed: true, ok: true });
   const record = saved.nodes.find((node) => node.nodeId === 'gate')!;
   // An executed failure (exit 2 with the verdict line on the ledger) — not a stopped/no-verdict node.
@@ -229,8 +229,11 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
         return { status: 'done', runId: first.runId } as never;
       } });
     expect(graphCalled).toBe(true);
-    expect(resumed.partial).toMatchObject({ requested: true, applied: true, files: files.length, priorCommit: CUT });
-    expect(plan).toMatchObject({ kind: 'recheck', priorCommit: CUT, forCommit: CUT, files, stalledFiles: files });
+    // This fixture has no saved cutoff baseline. The resume receipt guard must
+    // accept the waiver while declining a same-commit partial recheck plan.
+    expect(resumed.partial).toMatchObject({ requested: true, applied: false, auto: true,
+      reason: expect.stringContaining('saved cutoff baseline is absent or invalid') });
+    expect(plan).toBeUndefined();
   } finally { resetElanousConfigDir(); }
 }, 90_000);
 

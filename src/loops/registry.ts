@@ -161,7 +161,7 @@ function schedules(opts: LoopRegistryOptions): ScheduleRow[] {
 
 type OwnerSource = NonNullable<LoopEntry['ownerSource']>;
 function resolveOwner(id: string, title: string, config: UserConfig, header?: unknown, seat?: string, seatSource: OwnerSource = 'seat'): { owner: string; ownerSource: OwnerSource } {
-  if (typeof header === 'string' && /^(OP|TC|MK|UX)$/.test(header)) return { owner: header, ownerSource: 'header' };
+  if (typeof header === 'string' && /^(OP|TC|MK|UX|RES)$/.test(header)) return { owner: header, ownerSource: 'header' };
   const owners = config.loops?.owners;
   const configured = owners && (Object.hasOwn(owners, id) ? owners[id] : Object.hasOwn(owners, title) ? owners[title] : undefined);
   if (configured) return { owner: configured, ownerSource: 'config' };

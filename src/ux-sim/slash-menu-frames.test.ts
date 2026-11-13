@@ -84,10 +84,15 @@ describe('TUI-DIRECT-WRITE-ROWS — picker close erases nothing outside the pick
     const top = Math.min(...band);
     const bottom = Math.max(...band);
     expect(bottom - top).toBeGreaterThan(2);
+    // textInput also redraws its prompt outside the picker band. Exclude only
+    // that exact, content-preserving redraw, never a bare row erase.
+    const promptRedraw = open.bytes.match(/\x1b\[\d+;1H\x1b\[2K❯ \/abcd[^\x1b]*/)?.[0];
+    expect(promptRedraw).toBeDefined();
     // Everything before the first full-screen clear is the direct-write window
-    // the frame cache cannot see; nothing there may touch a row outside the band.
+    // the frame cache cannot see; other writes must stay inside the picker band.
     const preRepaint = close.bytes.split('\x1b[1;1H\x1b[J')[0]!;
-    const outside = erasedRows(preRepaint).filter((row) => row < top || row > bottom);
+    expect(preRepaint).toContain(promptRedraw!);
+    const outside = erasedRows(preRepaint.replaceAll(promptRedraw!, '')).filter((row) => row < top || row > bottom);
     expect(outside).toEqual([]);
     // The close still repaints exactly once (popModal's Q7 / F9 blanket force).
     expect(close.fullClears).toBe(1);

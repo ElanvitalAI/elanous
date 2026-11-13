@@ -1,3 +1,4 @@
+import { isReleaseVersion } from './release-version.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -34,12 +35,13 @@ export interface KnownFailOwnerRecord {
 
 export interface KnownFailOwnerLedgerSnapshot { records: unknown[]; writable: boolean; }
 
-function knownFailOwnerLedgerPath(root: string): string {
-  return join(root, 'graph-runs', 'release-loop', 'known-fail-owner-ledger.json');
+function knownFailOwnerLedgerPath(root: string, version: string): string {
+  if (!isReleaseVersion(version)) throw new Error('invalid known-fail ledger release version');
+  return join(root, 'release', version, 'known-fail-owner-ledger.json');
 }
 
-export function readKnownFailOwnerLedger(root: string): KnownFailOwnerLedgerSnapshot {
-  const path = knownFailOwnerLedgerPath(root);
+export function readKnownFailOwnerLedger(root: string, version: string): KnownFailOwnerLedgerSnapshot {
+  const path = knownFailOwnerLedgerPath(root, version);
   if (!existsSync(path)) return { records: [], writable: true };
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as { schema?: unknown; records?: unknown };
@@ -49,8 +51,8 @@ export function readKnownFailOwnerLedger(root: string): KnownFailOwnerLedgerSnap
   } catch { return { records: [], writable: false }; }
 }
 
-export function appendKnownFailOwnerLedger(root: string, records: readonly unknown[]): void {
-  const path = knownFailOwnerLedgerPath(root);
+export function appendKnownFailOwnerLedger(root: string, version: string, records: readonly unknown[]): void {
+  const path = knownFailOwnerLedgerPath(root, version);
   mkdirSync(dirname(path), { recursive: true });
   const lock = `${path}.lock.d`;
   const deadline = Date.now() + 10_000;
@@ -60,7 +62,7 @@ export function appendKnownFailOwnerLedger(root: string, records: readonly unkno
       mkdirSync(lock);
       writeFileSync(join(lock, 'owner'), `${token}\n`);
       try {
-        const snapshot = readKnownFailOwnerLedger(root);
+        const snapshot = readKnownFailOwnerLedger(root, version);
         if (!snapshot.writable) throw new Error('known-fail owner ledger is unreadable; refusing to replace it');
         const additions = records.filter(isKnownFailOwnerRecord);
         const combined = [...snapshot.records];

@@ -26,7 +26,8 @@ test('owner-only GET kinds exposes separately scoped core catalogs', async () =>
   const all = await request('/v1/graph/kinds');
   expect(all?.status).toBe(200);
   const entries = (await all!.json() as { kinds: Array<{ graph: string; kind: string; description: string; core: boolean }> }).kinds;
-  expect(entries.filter((entry) => entry.graph === 'harness' && entry.core)).toHaveLength(9); // #25170 prompt ⊕ GRAPH-UNIFY-CALLERS classify.
+  expect(entries.filter((entry) => entry.graph === 'harness' && entry.core)).toHaveLength(10); // #25170 prompt, GRAPH-UNIFY-CALLERS classify, #36131 capability.
+  expect(entries).toContainEqual(expect.objectContaining({ graph: 'harness', kind: 'capability', core: true }));
   // W8 둘째 조각 #23226 — subworkflow(하위 워크플로 노드)가 core 종류에 더해졌다.
   expect(entries.filter((entry) => entry.graph === 'workflow' && entry.core)).toHaveLength(24);
   expect(entries.every((entry) => entry.description.length > 0)).toBe(true);

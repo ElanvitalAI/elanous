@@ -39,7 +39,8 @@ export async function extractAbsorbScrap(scrap: AbsorbScrapPayload, adapters: Ab
       return { title: out.title, body: out.transcript, transcript: out.transcript, originUrl: scrap.raw.url };
     }
     case 'voice': {
-      const transcript = await adapters.transcribeAudio?.(required(scrap.raw.mediaRef, 'mediaRef'));
+      const transcript = scrap.raw.transcript?.trim()
+        ?? await adapters.transcribeAudio?.(required(scrap.raw.mediaRef, 'mediaRef'));
       if (transcript === undefined) throw new Error('audio STT adapter is not configured');
       return { title: 'Voice note', body: transcript, transcript };
     }

@@ -3333,6 +3333,8 @@ describe('detached baseline worktree dependency access', () => {
     mkdirSync(join(cwd, 'test'), { recursive: true });
     mkdirSync(join(cwd, 'node_modules/tiny-gate-dep'), { recursive: true });
     writeFileSync(join(cwd, 'package.json'), '{"type":"module"}\n');
+    // Dependency sharing deliberately requires a matching lockfile at both checkouts.
+    writeFileSync(join(cwd, 'bun.lock'), 'fixture-lock\n');
     writeFileSync(join(cwd, 'node_modules/tiny-gate-dep/package.json'), '{"name":"tiny-gate-dep","type":"module","exports":"./index.js"}\n');
     writeFileSync(join(cwd, 'node_modules/tiny-gate-dep/index.js'), 'export const value = 7;\n');
     writeFileSync(join(cwd, 'test/external.test.js'), [
@@ -3341,7 +3343,7 @@ describe('detached baseline worktree dependency access', () => {
       "test('base red through dependency', () => expect(value).toBe(8));",
       '',
     ].join('\n'));
-    git(cwd, 'add', 'package.json', 'test/external.test.js');
+    git(cwd, 'add', 'package.json', 'bun.lock', 'test/external.test.js');
     git(cwd, 'commit', '-m', 'base failing integration test');
     const baseRef = git(cwd, 'rev-parse', 'HEAD');
 

@@ -158,6 +158,7 @@ test('real export-check CLI sends graph commit/version through a fake SSH remote
   const bareMirror = join(root, 'mirror.git');
   const sshScript = join(root, 'ssh-script.log');
   const sshArgs = join(root, 'ssh-args.log');
+  const redactions = join(root, 'redactions.tsv');
   const ssh = join(bin, 'ssh');
   const currentCommit = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
   mkdirSync(bin, { recursive: true });
@@ -172,6 +173,8 @@ test('real export-check CLI sends graph commit/version through a fake SSH remote
     'printf \'\\n__GATE_REMOTE_RC=0\\n\' >&2',
   ].join('\n'));
   chmodSync(ssh, 0o755);
+  writeFileSync(redactions, 'private-test-value\tpublic-placeholder\n', { mode: 0o600 });
+  chmodSync(redactions, 0o600);
   const fakeResult = JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake remote export-check pass', step: 'build', tail: '' });
   const context = JSON.stringify({ input: { version: '0.3.6', previousVersion: '0.3.5' }, outputs: { 'version-release': { commit: currentCommit } } });
   try {
@@ -182,6 +185,7 @@ test('real export-check CLI sends graph commit/version through a fake SSH remote
         PATH: `${bin}:${process.env.PATH ?? ''}`,
         ELANOUS_GRAPH_CONTEXT: context,
         ELANOUS_STATE_DIR: join(root, 'state'),
+        ELANOUS_EXPORT_REDACTIONS: redactions,
         MOCK_GATE_MIRROR: bareMirror,
         MOCK_GATE_SSH_ARGS: sshArgs,
         MOCK_GATE_SSH_SCRIPT: sshScript,
@@ -195,6 +199,7 @@ test('real export-check CLI sends graph commit/version through a fake SSH remote
     expect(receivedScript).toContain(`'bun' 'scripts/release-loop/export-check-node.ts' '--local' '--commit' '${currentCommit}' '--version' '0.3.6'`);
     expect(receivedScript).toContain('ELANOUS_GRAPH_CONTEXT="$W/payload-0"');
     expect(receivedScript).toContain(context);
+    expect(receivedScript).toContain('private-test-value\tpublic-placeholder');
     expect(receivedScript).toContain(`git fetch -q origin refs/elanous/gate/${currentCommit}`);
   } finally {
     rmSync(root, { recursive: true, force: true });

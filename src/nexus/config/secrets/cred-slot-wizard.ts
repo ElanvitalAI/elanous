@@ -6,12 +6,16 @@ export interface CredentialSlotWizardPlan {
   readonly slots: readonly string[];
 }
 
+// Market account routing fields can be added later; requiring them here prevents the
+// credential pair from being saved when a user only has the API credentials.
+const OPTIONAL_MARKET_SLOTS = new Set(['cred:toss.account_seq', 'cred:toss.base_url', 'cred:kis.account']);
+
 /** Resolve a catalog service to its typed shared slots; explicit catalog names bound market-data scope. */
 export function credentialSlotWizardPlan(service: string): CredentialSlotWizardPlan | undefined {
   const entry = SERVICE_KEY_CATALOG.find((item) => item.id === service && item.kind === 'api-key');
   const definition = CREDENTIAL_SLOT_DEFINITIONS.find((item) => item.service === service);
   if (!entry || !definition || !entry.storeIds?.length) return undefined;
-  const slots = [...entry.storeIds];
+  const slots = entry.storeIds.filter((slot) => !OPTIONAL_MARKET_SLOTS.has(slot));
   if (new Set(slots).size !== slots.length ||
     !slots.every((slot) => parseCredentialSlotId(slot)?.service === service)) return undefined;
   return { service, slots };

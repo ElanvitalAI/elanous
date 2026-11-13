@@ -58,7 +58,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   if (activeHandle) {
-    try { activeHandle.release(); } catch { /* swallow */ }
+    try { await activeHandle.release(); } catch { /* swallow */ }
     activeHandle = undefined;
   }
   if (prevNexusDir === undefined) delete process.env.ELANOUS_NEXUS_DIR;
@@ -213,7 +213,7 @@ describe('runNexus discord channel integration', () => {
       discordHitlOpts: { token: 't', channelId: '1', bot: makeStubDiscordBot() },
     });
     expect(getDefaultConfirmChannels().map((c) => c.name)).toContain('discord');
-    h.release();
+    await h.release();
     activeHandle = undefined;
     expect(getDefaultConfirmChannels()).toHaveLength(0);
   });

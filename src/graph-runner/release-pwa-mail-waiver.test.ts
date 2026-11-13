@@ -19,7 +19,7 @@ const output = JSON.stringify({ outcome: 'fail', verdict: 'fail', commit: cut, w
   cells: [...['T1', 'T1b', 'T4a', 'T5', 'T5b', 'C2a', 'C2b'].map(id => ({ id, first: 'pass', final: 'pass', reruns: [] })),
     ...['N1', 'N5a', 'N6a'].map(id => ({ id, first: 'fail', final: 'fail', reruns: ['fail', 'fail'] }))] });
 
-test('fresh PWA waiver requires exact current child raw and ordered immutable JUD/OP mail rows', () => {
+test.each(['0.3.15', '0.3.16'])('fresh PWA waiver %s requires exact current child raw and ordered immutable JUD/OP mail rows', (version) => {
   const root = mkdtempSync(join(tmpdir(), 'pwa-mail-waiver-'));
   const put = (path: string, data: string) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, data); };
   try {
@@ -67,6 +67,7 @@ test('fresh PWA waiver requires exact current child raw and ordered immutable JU
     expect(assertSignedPwaBranchWaiver(state, root, false, lookup)).toEqual({ documentSha256: packetSha256,
       signatureSha256: pin.judMessageSha256, pairedLogSha256: hash(paired) });
     expect(() => assertPwaMailWaiver({ ...state, runId: 'different-run' }, root, false, lookup)).toThrow();
+    expect(() => assertPwaMailWaiver({ ...state, input: { version: version === '0.3.16' ? '0.3.15' : '0.3.16' } }, root, false, lookup)).toThrow();
     expect(() => assertPwaMailWaiver({ ...state, input: { version, cutCommit: 'b'.repeat(40) } }, root, false, lookup)).toThrow();
     const withoutSibling = structuredClone(state);
     delete withoutSibling.fanOuts!['traffic-gate-passed:ok']!.branches['export-check'];

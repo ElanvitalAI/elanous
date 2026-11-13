@@ -41,7 +41,7 @@ requires: []
 | 스크린샷 | 로컬 capture | — |
 
 `--engine <id>`는 기존 엔진 ID를 직접 호출하는 호환 경로다. `--free`는 요구 능력에서 무료 공급자만 허용한다. `--json`과 `--print`의 출력 마커는 유지된다. `OMNI_CRAWL_TAVILY`는 자동 순위를 제어하지 않으며 명시 `--engine tavily`도 그대로 동작한다.
-기간을 지정한 뉴스는 DDG를 제외하고 기간 필터를 지원하는 공급자만 선택한다. `research.deep@1`과 `extract.structured@1`의 상위 계약은 #36151 레지스트리가 맡고, 이 스킬의 deep 합성은 단계별 검색·스크랩 계약을 소비한다.
+기간을 지정한 뉴스는 DDG를 제외하고 기간 필터를 지원하는 공급자만 선택한다. `research.deep@1`과 `extract.structured@1`의 상위 계약은 capability 레지스트리가 맡고, 이 스킬의 deep 합성은 단계별 검색·스크랩 계약을 소비한다.
 
 ## 무료로 쓰는 길 (키 없이)
 

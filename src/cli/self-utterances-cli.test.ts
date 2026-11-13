@@ -10,17 +10,18 @@ const interval = { from: '2026-10-12T00:00:00Z', to: '2026-10-13T00:00:00Z' };
 test('self utterance CLI records explicit human and defaults unmarked Claude Code speech to agent', () => {
   const dir = mkdtempSync(join(tmpdir(), 'self-utterance-origin-'));
   const env = { ...process.env, ELANOUS_STATE_DIR: dir, ELANOUS_CONFIG_DIR: dir };
+  const testFlag = `--test=${dir}`;
   try {
     for (const [text, origin] of [['human prompt', 'human'], ['unmarked prompt', ''], ['explicit agent', 'agent']]) {
-      const args = ['bun', 'bin/elanous.mjs', '--test', 'self', 'utterance', '--source', 'claude-code', '--text', text, '--ts', '2026-10-12T12:00:00Z'];
+      const args = ['bun', 'bin/elanous.mjs', testFlag, 'self', 'utterance', '--source', 'claude-code', '--text', text, '--ts', '2026-10-12T12:00:00Z'];
       if (origin) args.push('--origin', origin);
       const child = Bun.spawnSync(args, { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
       expect(child.exitCode).toBe(0);
     }
-    const codex = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'self', 'utterance', '--source', 'codex', '--text', 'codex human prompt', '--ts', '2026-10-12T12:00:00Z', '--origin', 'human'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
+    const codex = Bun.spawnSync(['bun', 'bin/elanous.mjs', testFlag, 'self', 'utterance', '--source', 'codex', '--text', 'codex human prompt', '--ts', '2026-10-12T12:00:00Z', '--origin', 'human'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
     expect(codex.exitCode).toBe(0);
     // The record command validates --origin in src/index.ts; the read command's validator is not a substitute.
-    const invalid = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'self', 'utterance', '--source', 'claude-code', '--text', 'invalid prompt', '--origin', 'robot'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
+    const invalid = Bun.spawnSync(['bun', 'bin/elanous.mjs', testFlag, 'self', 'utterance', '--source', 'claude-code', '--text', 'invalid prompt', '--origin', 'robot'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
     expect(invalid.exitCode).not.toBe(0);
     expect(new TextDecoder().decode(invalid.stdout) + new TextDecoder().decode(invalid.stderr)).toContain('--origin must be human or agent');
     const db = openSurfaceEventsDb(join(dir, 'surface_events.db'));
@@ -41,7 +42,7 @@ test('self utterance CLI records explicit human and defaults unmarked Claude Cod
         ['unmarked prompt', 'ext:claude-code', { origin: 'claude-code' }],
       ]);
     } finally { db.close(); }
-    const read = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'self', 'utterances', '--from', interval.from, '--to', interval.to, '--surface', 'ext:claude-code', '--origin', 'human', '--json'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
+    const read = Bun.spawnSync(['bun', 'bin/elanous.mjs', testFlag, 'self', 'utterances', '--from', interval.from, '--to', interval.to, '--surface', 'ext:claude-code', '--origin', 'human', '--json'], { cwd: import.meta.dir + '/../..', env, stdout: 'pipe', stderr: 'pipe' });
     expect(read.exitCode).toBe(0);
     expect(JSON.parse(new TextDecoder().decode(read.stdout)).utterances.map((row: { text: string; origin: string }) => [row.text, row.origin])).toEqual([['human prompt', 'human']]);
   } finally { rmSync(dir, { recursive: true, force: true }); }

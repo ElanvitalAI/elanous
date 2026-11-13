@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -133,7 +134,12 @@ test('notify raises an approval card exactly once across ticks while retaining t
 });
 
 test('notify applies a decided card once even after its text has already been sent', async () => {
-  const { root, graphsDir, statePath } = fixture();
+  const { root, graphsDir, statePath, state } = fixture();
+  // #36491 pins the run input on every approval card; decideGraphApproval
+  // refuses an unpinned legacy pending (inputSha256 of undefined input is the
+  // sha256 of the literal 'undefined' — same pin the approval-card fixture uses).
+  state.pending = { ...state.pending!, inputSha256: createHash('sha256').update('undefined').digest('hex') };
+  writeFileSync(statePath, JSON.stringify(state));
   const ledger = new DecisionLedger({ stateDir: root, resolveVersion: () => ({ released: '0.2.9', dev: '0.2.10', codename: null }) });
   const opts = { root, graphsDir, approvalCard: { ledger }, send: () => {} };
   await notifyGraphEvents(opts);

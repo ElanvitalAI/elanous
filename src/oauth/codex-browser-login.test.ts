@@ -7,18 +7,25 @@ import { createHash } from 'node:crypto';
 import { assistCodexBrowserLogin, browserLaunchCommand, loginWithCodexBrowser } from './codex-browser-login.js';
 import { CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL } from './codex.js';
 import { loadTokens, saveTokens } from './store.js';
+import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 let root: string;
 let previousXdg: string | undefined;
 let previousCodexHome: string | undefined;
+let previousConfigDir: string | undefined;
 beforeEach(() => {
+  previousConfigDir = getElanousConfigDirOverride();
   previousXdg = process.env.XDG_CONFIG_HOME;
   previousCodexHome = process.env.CODEX_HOME;
   root = mkdtempSync(join(tmpdir(), 'codex-browser-'));
+  // Auth follows the selected config root, not XDG when preload selected a test universe.
+  setElanousConfigDir(join(root, 'elanous'));
   process.env.XDG_CONFIG_HOME = root;
   process.env.CODEX_HOME = join(root, 'codex');
 });
 afterEach(() => {
+  resetElanousConfigDir();
+  if (previousConfigDir !== undefined) setElanousConfigDir(previousConfigDir);
   if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = previousXdg;
   if (previousCodexHome === undefined) delete process.env.CODEX_HOME;

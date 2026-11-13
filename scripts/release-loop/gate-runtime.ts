@@ -4116,7 +4116,9 @@ export function readBaselineFileCache(ledger: string, commit: string): Map<strin
       if (!line.trim()) throw new Error('empty line');
       const row: unknown = JSON.parse(line);
       if (!validFileResult(row, commit)) throw new Error('invalid row');
-      entries.set(`${row.file}\0${row.host}`, row);
+      const key = `${row.file}\0${row.host}`;
+      if (entries.has(key)) throw new Error('duplicate row');
+      entries.set(key, row);
     }
   } catch (error) {
     debug.log('release.gate', 'baseline-cache-corrupt', { path, error: String(error) });

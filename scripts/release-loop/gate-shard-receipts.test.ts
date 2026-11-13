@@ -43,19 +43,19 @@ test('known-fail owner ledger reads and appends without dropping ambiguous prior
   const root = mkdtempSync(join(tmpdir(), 'known-fail-ledger-')); roots.push(root);
   const owned = { failureId: 'src/a.test.ts > existing failure', checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) };
   const conflicting = { failureId: owned.failureId, checklistCellId: 'OTHER-CELL', firstSeenCommit: 'b'.repeat(40) };
-  expect(readKnownFailOwnerLedger(root)).toMatchObject({ records: [], writable: true });
-  appendKnownFailOwnerLedger(root, [owned, conflicting]);
-  expect(readKnownFailOwnerLedger(root)).toEqual({ records: [owned, conflicting], writable: true });
-  expect(auditKnownFailFailures([owned.failureId], readKnownFailOwnerLedger(root).records).residual).toEqual([owned.failureId]);
+  expect(readKnownFailOwnerLedger(root, '0.3.16')).toMatchObject({ records: [], writable: true });
+  appendKnownFailOwnerLedger(root, '0.3.16', [owned, conflicting]);
+  expect(readKnownFailOwnerLedger(root, '0.3.16')).toEqual({ records: [owned, conflicting], writable: true });
+  expect(auditKnownFailFailures([owned.failureId], readKnownFailOwnerLedger(root, '0.3.16').records).residual).toEqual([owned.failureId]);
 });
 
 test('an unreadable known-fail ledger stays fail-closed and is never overwritten', () => {
   const root = mkdtempSync(join(tmpdir(), 'known-fail-ledger-corrupt-')); roots.push(root);
-  const path = join(root, 'graph-runs', 'release-loop', 'known-fail-owner-ledger.json');
-  mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+  const path = join(root, 'release', '0.3.16', 'known-fail-owner-ledger.json');
+  mkdirSync(join(root, 'release', '0.3.16'), { recursive: true });
   writeFileSync(path, '{invalid');
-  expect(readKnownFailOwnerLedger(root)).toEqual({ records: [], writable: false });
-  expect(() => appendKnownFailOwnerLedger(root, [{ failureId: 'src/a.test.ts > failure',
+  expect(readKnownFailOwnerLedger(root, '0.3.16')).toEqual({ records: [], writable: false });
+  expect(() => appendKnownFailOwnerLedger(root, '0.3.16', [{ failureId: 'src/a.test.ts > failure',
     checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) }])).toThrow('refusing to replace');
   expect(readFileSync(path, 'utf8')).toBe('{invalid');
 });
@@ -71,7 +71,7 @@ import { appendKnownFailOwnerLedger } from ${JSON.stringify(moduleUrl)};
 const [root, ready, id] = process.argv.slice(2);
 writeFileSync(ready, 'ready');
 while (!existsSync(${JSON.stringify(start)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-appendKnownFailOwnerLedger(root!, [{ failureId: id!, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'c'.repeat(40) }]);
+appendKnownFailOwnerLedger(root!, '0.3.16', [{ failureId: id!, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'c'.repeat(40) }]);
 `);
   const children = ['src/a.test.ts > first', 'src/b.test.ts > second'].map((failureId, index) => {
     const ready = join(root, `ready-${index}`);
@@ -88,7 +88,7 @@ appendKnownFailOwnerLedger(root!, [{ failureId: id!, checklistCellId: 'PREEXIST-
     child.once('close', code => resolve(code ?? -1));
   })));
   expect(exits).toEqual([0, 0]);
-  expect(readKnownFailOwnerLedger(root).records.map(record => (record as { failureId: string }).failureId).sort())
+  expect(readKnownFailOwnerLedger(root, '0.3.16').records.map(record => (record as { failureId: string }).failureId).sort())
     .toEqual(['src/a.test.ts > first', 'src/b.test.ts > second']);
 });
 
@@ -260,4 +260,20 @@ test('a replacement attempt blocks reuse of its predecessor before execution', (
   markGateShardUnmeasured(root, { ...old, attempt: 2 });
   expect(JSON.parse(readFileSync(gateShardReceiptPath(root, old.id), 'utf8')).status).toBe('unmeasured');
   expect(readGateShardResult(root, { shard: old, head40: old.head40, base40: old.base40, envKey: old.envKey })).toBeNull();
+});
+
+
+test('known-fail owner ledgers are release-scoped and ignore legacy graph metadata files', () => {
+  const root = mkdtempSync(join(tmpdir(), 'known-fail-version-')); roots.push(root);
+  const record = { failureId: 'src/isolated.test.ts > known', checklistCellId: 'CELL', firstSeenCommit: 'a'.repeat(40) };
+  appendKnownFailOwnerLedger(root, '0.3.15', [record]);
+  expect(readKnownFailOwnerLedger(root, '0.3.16').records).toEqual([]);
+  const legacy = join(root, 'graph-runs', 'release-loop', 'known-fail-owner-ledger.json');
+  mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+  writeFileSync(legacy, '{legacy-corrupt');
+  appendKnownFailOwnerLedger(root, '0.3.16', [record]);
+  expect(readKnownFailOwnerLedger(root, '0.3.16').records).toEqual([record]);
+  expect(readFileSync(legacy, 'utf8')).toBe('{legacy-corrupt');
+  expect(existsSync(join(root, 'release', '0.3.16', 'known-fail-owner-ledger.json'))).toBe(true);
+  expect(() => appendKnownFailOwnerLedger(root, '../escape', [record])).toThrow('release version');
 });

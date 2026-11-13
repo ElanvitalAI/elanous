@@ -125,7 +125,7 @@ edges:
   - { from: approve-cloud-elastic, on: outcome, map: { ok: cloud-join, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: cloud-join, on: outcome, map: { ok: pod-reuse-prep, fail: cloud-leave-join-fail, error: cloud-leave-join-fail } }
   - { from: pod-reuse-prep, on: outcome, map: { reuse: gate, legacy: gate, skip: gate, failed: gate, error: gate } }
-  - { from: gate, on: outcome, map: { ok: cloud-leave-ok, fail: cloud-leave-fail, error: cloud-leave-error } }
+  - { from: gate, on: outcome, map: { ok: cloud-leave-ok, waived: receipt-audit, fail: cloud-leave-fail, error: cloud-leave-error } }
   - { from: cloud-leave-ok, on: outcome, map: { ok: gate-cutover-switch, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: cloud-leave-fail, on: outcome, map: { ok: emergency-switch, fail: gate-triage, error: gate-triage } }
   - { from: cloud-leave-error, on: outcome, map: { ok: gate-triage, fail: gate-triage, error: gate-triage } }

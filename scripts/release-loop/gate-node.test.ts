@@ -2579,8 +2579,9 @@ test('baseline cache: an introduced verdict is reproduced from the cache, and a 
 
 test('baseline cache: a corrupt cache file is re-run, never read as a pass', async () => {
   const valid = JSON.stringify({ commit: BASE, file: 'src/b.test.ts', host: 'local', failures: [B], errors: [], missing: false });
+  const conflicting = JSON.stringify({ commit: BASE, file: 'src/b.test.ts', host: 'local', failures: [], errors: [], missing: false });
   for (const corrupt of ['{not json\n', JSON.stringify({ commit: BASE, file: 'src/b.test.ts', host: 'local', failures: ['src/other.test.ts > X'], errors: [], missing: false }) + '\n',
-    `${valid}\n\n${valid}\n`, valid, '']) {
+    `${valid}\n\n${valid}\n`, `${valid}\n${conflicting}\n`, `${conflicting}\n${valid}\n`, valid, '']) {
     const { instanceRoot, ledgerRoot, runner, calls } = fake([B], []);
     mkdirSync(join(ledgerRoot, 'gate-baseline-cache'), { recursive: true });
     writeFileSync(join(ledgerRoot, 'gate-baseline-cache', `${BASE}.jsonl`), corrupt);

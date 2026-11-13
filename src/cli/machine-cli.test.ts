@@ -91,7 +91,9 @@ test('machine command list snapshot includes capture and both apply surfaces', (
   const program = new Command();
   registerMachineCommands(program);
   const machine = program.commands.find(command => command.name() === 'machine');
-  expect(machine?.commands.map(command => command.name())).toEqual(['set', 'render', 'ledger-set', 'show', 'setup', 'apply', 'capture', 'join', 'leave']);
+  // 'diagnose' registered between apply and capture — #36099 (WSL intermediate-state
+  // diagnosis) landed without updating this snapshot; list re-armed at that surface.
+  expect(machine?.commands.map(command => command.name())).toEqual(['set', 'render', 'ledger-set', 'show', 'setup', 'apply', 'diagnose', 'capture', 'join', 'leave']);
   expect(machine?.commands.find(command => command.name() === 'setup')?.commands.map(command => command.name())).toEqual(['plan', 'apply']);
 });
 

@@ -25,7 +25,7 @@ export interface AbsorbScrapPayload {
   memberId: string;
   kind: AbsorbScrapKind;
   source: 'android-share' | 'android-record' | 'flutter-share' | 'flutter-record' | 'tui' | 'pwa' | 'telegram';
-  raw: { text?: string; url?: string; mediaRef?: string; mime?: string; timeline?: AbsorbScrapTimelineEntry[];
+  raw: { text?: string; transcript?: string; url?: string; mediaRef?: string; mime?: string; timeline?: AbsorbScrapTimelineEntry[];
     recordedAt?: string; recordedTimeZone?: string; recordedDate?: string; classDate?: string };
   folderId?: string | null;
   exports?: { vaultId: string; path: string; savedAt: string }[];

@@ -426,7 +426,7 @@ function outcomeLine(stamp: RehearsalStamp): string {
   const planningGap = stamp.shardPlan?.unmeasured
     || (stamp.selection?.shards !== undefined && result.shards !== stamp.selection.shards)
     || (stamp.selection?.remote !== undefined && result.remote !== stamp.selection.remote);
-  const detail = stamp.summary && (stamp.outcome === 'unmeasured' || stamp.outcome === 'error' && planningGap) ? ` · ${stamp.summary}` : '';
+  const detail = stamp.summary && (stamp.selection?.fullFallback || stamp.outcome === 'unmeasured' || stamp.outcome === 'error' && planningGap) ? ` · ${stamp.summary}` : '';
   return `${head} · 새 회귀 ${result.introduced ?? 'UNKNOWN'} · 기존 ${result.preexisting ?? 'UNKNOWN'} · 미분류 ${result.unclassified ?? 'UNKNOWN'} · ${result.remote ?? 'local'} · ${duration}분${stamp.outcome === 'error' ? ` · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}` : ''}${stamp.regressionFiles?.length ? ` · 파일 ${stamp.regressionFiles.slice(0, 3).join(', ')}` : ''}${detail}`;
 }
 

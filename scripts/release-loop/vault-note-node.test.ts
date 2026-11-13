@@ -475,6 +475,9 @@ test('release graph runner writes note before later ops-upgrade results in its r
         return output(nodeId, result);
       }
       if (nodeId === 'gate') return output(nodeId, { outcome: 'ok', introduced: [], preexisting: 0 });
+      // The current release graph branches on legacy/audit here; a generic ok
+      // stops the fixture before vault-note can verify its ordering contract.
+      if (nodeId === 'gate-cutover-switch') return output(nodeId, { outcome: 'legacy' });
       if (nodeId === 'cutoff') return output(nodeId, { outcome: 'ok', baseline: { sha: 'base' }, cutoff: { sha: 'cut' }, in: [] });
       if (nodeId === 'known-issues') return output(nodeId, { outcome: 'ok', count: 0 });
       if (nodeId === 'ops-upgrade') return output(nodeId, { outcome: 'ok', hosts: [{ ok: true }, { ok: false }] });

@@ -89,6 +89,7 @@ export function formatGoalAuthorTimeboxResultLine(
 
 export type LaunchingTreeProbe =
   | { readonly kind: 'measured'; readonly ahead: number; readonly behind: number; readonly reference: string }
+  | { readonly kind: 'local-base'; readonly baseRef: string; readonly baseSha: string; readonly reason: string }
   | { readonly kind: 'unmeasurable'; readonly error: string };
 
 type AskLaunchPreflightDeps = AskPreflightDeps & {
@@ -98,6 +99,7 @@ type AskLaunchPreflightDeps = AskPreflightDeps & {
 /** ⛔ I/O 는 «전부» 여기로 들어온다 — 그래야 CLI·TUI·시험이 같은 흐름을 쓴다. */
 export type InvokerBehindDefaultBranch =
   | { readonly state: 'measured'; readonly commits: number; readonly baseRef: string }
+  | { readonly state: 'local-base'; readonly baseRef: string; readonly baseSha: string; readonly reason: string }
   | { readonly state: 'unmeasurable'; readonly reason: string };
 
 /** Ambient git location vars override `git -C <cwd>`; the invoker tree is the given cwd only. */
@@ -121,6 +123,38 @@ function gitRead(cwd: string, args: readonly string[]): string {
   }).trim();
 }
 
+/** A local branch is evidence of its own commit, never evidence of remote freshness. */
+export function resolveLocalDefaultBranch(cwd: string): Extract<InvokerBehindDefaultBranch, { state: 'local-base' }> | null {
+  const configured = (() => {
+    try { return gitRead(cwd, ['config', '--get', 'init.defaultBranch']); } catch { return ''; }
+  })();
+  const candidates = [...new Set([configured, 'main', 'master'].filter(Boolean))];
+  for (const branch of candidates) {
+    if (!/^[A-Za-z0-9._/-]+$/.test(branch)) continue;
+    const baseRef = `refs/heads/${branch}`;
+    try {
+      // git-spawn-allow: Verifies only a local branch commit without fetching or changing repository state.
+      const baseSha = gitRead(cwd, ['rev-parse', '--verify', `${baseRef}^{commit}`]);
+      if (/^[0-9a-f]{40,64}$/.test(baseSha)) {
+        return { state: 'local-base', baseRef, baseSha, reason: 'origin default branch unavailable; verified local default branch only' };
+      }
+    } catch { /* Try the next conventional local default branch. */ }
+  }
+  return null;
+}
+
+/** Whether a cached origin default-branch ref still resolves — presence turns a measurement failure into a real error, never into «no origin». */
+export function originDefaultRefResolvable(cwd: string): boolean {
+  for (const ref of ['origin/HEAD', 'refs/remotes/origin/main']) {
+    try {
+      // git-spawn-allow: Only verifies that a cached remote-tracking ref resolves; never fetches or changes repository state.
+      const resolved = gitRead(cwd, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+      if (/^[0-9a-f]{40,64}$/.test(resolved)) return true;
+    } catch { /* This conventional remote-tracking ref is absent; try the other. */ }
+  }
+  return false;
+}
+
 /** 현재 인보커 작업 트리의 HEAD를 이미 알려진 원격 기본 브랜치 ref와만 비교한다. */
 export function measureInvokerBehindDefaultBranch(cwd: string): InvokerBehindDefaultBranch {
   try {
@@ -133,6 +167,11 @@ export function measureInvokerBehindDefaultBranch(cwd: string): InvokerBehindDef
     if (!Number.isSafeInteger(commits) || commits < 0) throw new Error(`뒤처진 커밋 수가 유효하지 않다: ${raw || '(빈 값)'}`);
     return { state: 'measured', commits, baseRef };
   } catch {
+    // A resolvable origin ref means the comparison itself failed — keep that failure visible instead of masking it with a local base.
+    if (!originDefaultRefResolvable(cwd)) {
+      const localBase = resolveLocalDefaultBranch(cwd);
+      if (localBase) return localBase;
+    }
     // Git stderr may contain newlines; preserve the preflight's one-line rendering contract.
     return { state: 'unmeasurable', reason: '원격 기본 브랜치 대비를 측정하지 못했다' };
   }
@@ -175,9 +214,9 @@ export function measureToolTreeBehindDefaultBranch(cwd: string, toolDir: string 
 }
 
 function renderInvokerBehindDefaultBranch(observation: InvokerBehindDefaultBranch): string {
-  return observation.state === 'measured'
-    ? `[preflight] 인보커 작업 트리 원격 기본 브랜치 대비 — ${observation.commits === 0 ? '뒤처지지 않았다' : `${observation.commits}커밋 뒤처졌다`} (${observation.baseRef})`
-    : `[preflight] 인보커 작업 트리 원격 기본 브랜치 대비 — ⚠️ 못 쟀다 (${observation.reason})`;
+  if (observation.state === 'measured') return `[preflight] 인보커 작업 트리 원격 기본 브랜치 대비 — ${observation.commits === 0 ? '뒤처지지 않았다' : `${observation.commits}커밋 뒤처졌다`} (${observation.baseRef})`;
+  if (observation.state === 'local-base') return `[preflight] 인보커 작업 트리 원격 기본 브랜치 대비 — ⚠️ 원격 비교 못 쟀다; 로컬 기준 ${observation.baseRef}@${observation.baseSha} (${observation.reason})`;
+  return `[preflight] 인보커 작업 트리 원격 기본 브랜치 대비 — ⚠️ 못 쟀다 (${observation.reason})`;
 }
 
 export interface AskLaunchFlowDeps {
@@ -681,6 +720,11 @@ function observeLaunchingTree(deps: AskLaunchFlowDeps, preflightDeps: AskLaunchP
   if (probe.kind === 'unmeasurable') {
     deps.print(`[ask] ⓪ 발사 트리 검사 — ⚠️ 못 쟀다 (${probe.error}; ⛔ 최신이라는 뜻이 아니다)`);
     deps.log('ask-launching-tree', { outcome: 'unmeasurable', error: probe.error }, 'warn');
+    return;
+  }
+  if (probe.kind === 'local-base') {
+    deps.print(`[ask] ⓪ 발사 트리 검사 — ⚠️ 원격 비교 못 쟀다; 로컬 기준 ${probe.baseRef}@${probe.baseSha} (${probe.reason}; ⛔ 최신이라는 뜻이 아니다)`);
+    deps.log('ask-launching-tree', { outcome: 'local-base', baseRef: probe.baseRef, baseSha: probe.baseSha, reason: probe.reason }, 'warn');
     return;
   }
   if (probe.behind > 0) {

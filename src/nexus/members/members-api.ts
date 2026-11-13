@@ -672,6 +672,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           const session = options.issueOwnerSession(slot.appSlug, exchanged.memberId);
           return exchangeResponse('session-issued', 200, { appId: slot.appId, sessionToken: session.sessionToken,
             tokenType: 'Bearer', expiresAt: session.expiresAt,
+            publicId: options.store.handleForMember(exchanged.memberId),
             appSlot: publicAppSlot(slot, options.publicAppUrl?.(slot) ?? null) });
         } catch { return exchangeResponse('session-issuer-failed', 503, { error: 'app-session-unavailable' }); }
       }

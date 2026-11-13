@@ -153,7 +153,7 @@ describe('fake Google OAuth member boundary', () => {
     } finally { store.close(); }
   });
 
-  test('native Google callback returns an allowlisted one-time state-bound app-slot exchange code', async () => {
+  test.each([null, 'demo_member'] as const)('native Google callback returns an allowlisted one-time state-bound app-slot exchange code with publicId %s', async publicId => {
     const exchangeEvents: Array<{ stage?: string; status?: number }> = [];
     const stopCapture = debug.registerSink({ name: 'member-exchange-stage-test', emit(record) {
       if (record.category === 'nexus.member-app-slot' && record.event === 'exchange')
@@ -206,6 +206,8 @@ describe('fake Google OAuth member boundary', () => {
       expect(callback!.headers.get('set-cookie')).toContain('Max-Age=0');
       expect(callback!.headers.get('set-cookie')).not.toContain('__Host-elanous_member_session=');
 
+      const member = store.memberForGoogleSub('google-subject-1')!;
+      if (publicId !== null) store.claimHandle(member.id, publicId);
       const exchange = (code: string, boundState: string, verifier = codeVerifier) => api.handle(new Request('https://api.example.test/v1/members/app-slot/exchange', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, state: boundState, codeVerifier: verifier }),
       }));
@@ -213,9 +215,12 @@ describe('fake Google OAuth member boundary', () => {
       expect((await exchange(exchangeCode, state, `${codeVerifier}wrong`))?.status).toBe(401);
       const exchanged = await exchange(exchangeCode, state);
       expect(exchanged?.status).toBe(200);
-      const payload = await exchanged!.json() as { appId: string; sessionToken: string; tokenType: string; expiresAt: string;
+      const payload = await exchanged!.json() as { appId: string; sessionToken: string; tokenType: string; expiresAt: string; publicId: string | null;
         appSlot: { appId: string; appSlug: string; url: string | null } };
       expect(payload).toMatchObject({ appId: expect.stringMatching(/^kaist-/), sessionToken: 'aps-one-time-session', tokenType: 'Bearer' });
+      expect(payload.publicId).toBe(publicId);
+      expect(payload.publicId).not.toBe(member.id);
+      expect(Object.keys(payload).sort()).toEqual(['appId', 'appSlot', 'expiresAt', 'publicId', 'sessionToken', 'tokenType']);
       expect(payload.appSlot).toMatchObject({ appId: payload.appId, url: `https://${payload.appSlot.appSlug}--member.elanous.app/` });
       expect(Number.isFinite(Date.parse(payload.expiresAt))).toBe(true);
       expect(issued).toHaveLength(1);

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createJsonlMemberEventStore } from '../nexus/api/member-event-store.js';
 import { createAbsorbShareSummaryRequestApi, createShareSummaryRequestApi, resolveVerifiedShareSummaryOwner, shareSummaryNexusEvent, type SummaryScrap } from '../nexus/api/share-summary-requests.js';
 import { handleScraps } from '../nexus/api/scraps.js';
@@ -160,6 +161,132 @@ describe('iOS share summary request contract simulation', () => {
       expect(failedFrame).toContain(failedId);
       expect(failedFrame).toContain('failed');
       await failedReader.cancel();
+      } finally { server.stop(); }
+    } finally { memberStore.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('server extraction-pending boundary is separate from the extension save-response chain', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ios-summary-extraction-boundary-'));
+    try {
+      const events = createJsonlMemberEventStore(join(root, 'member-events'));
+      let generated = 0;
+      // Server contract only: this fixture already knows an extracting scrap ID.
+      // It does not represent the extension, which must wait for its save response.
+      const api = createShareSummaryRequestApi({ ownerForRequest: () => 'member-a', events,
+        getScrap: () => ({ id: 'extracting-scrap', status: 'extracting' }),
+        generateSummary: async () => { generated++; return 'Unexpected summary'; } });
+      const pending = await api(new Request(base, { method: 'POST', headers: {
+        'idempotency-key': 'ios-extraction-boundary-0001', 'content-type': 'application/json',
+      }, body: JSON.stringify({ scrapId: 'extracting-scrap' }) }));
+      expect(pending?.status).toBe(202);
+      const body = await pending!.json() as { requestId: string; status: string };
+      expect(body).toMatchObject({ status: 'pending' });
+      expect(body.requestId).toStartWith('sum_');
+      expect(generated).toBe(0);
+      expect(await events.query({ memberId: 'member-a', type: 'scrap.summary.requested' })).toHaveLength(1);
+      expect(await events.query({ memberId: 'member-a', type: 'scrap.summary.result' })).toHaveLength(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('installed share extension chain keeps save request and result notice on one requestId', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ios-extension-chain-'));
+    const memberStore = createMemberStore({ path: join(root, 'members.sqlite') });
+    try {
+      const member = memberStore.register({ sub: 'ios-extension-chain', email: 'chain@example.test', emailVerified: true, name: 'Owner' }, { consents: { privacy: 'v1', terms: 'v1' } });
+      const memberId = member.id;
+      const appSessionToken = 'aps_ios-extension-chain';
+      const membersApi = createMembersApi({
+        store: memberStore,
+        google: { redirectUri: 'https://example.test/v1/members/oauth/google/callback',
+          // Source: 내부 문서 `user-ops-space` — this OAuth stub never issues a session.
+          start: async () => ({ authorizationUrl: 'https://accounts.example.test', state: 'unused', cookieValue: 'unused', maxAgeSeconds: 0 }),
+          complete: async () => { throw new Error('unused'); } },
+        successRedirectUri: 'https://example.test/signup/complete',
+        resolveVerifiedMemberOwner: credential => credential === appSessionToken
+          ? { memberId, userSlug: 'owner', plan: 'free', entitlements: {} } : null,
+      });
+      let extractionStarted!: () => void;
+      let finishExtraction!: (value: { title: string; body: string }) => void;
+      const started = new Promise<void>(resolve => { extractionStarted = resolve; });
+      const extraction = new Promise<{ title: string; body: string }>(resolve => { finishExtraction = resolve; });
+      let generated = 0;
+      const events = createJsonlMemberEventStore(join(root, 'member-events'));
+      const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
+      const eventBus = new NexusEventBus();
+      state.bus = eventBus;
+      const server = startNexusHttpServer({ state, registry: new TabRegistry(state), eventBus, membersApi,
+        scraps: { instanceRoot: root, extractors: { digestWeb: async () => {
+          extractionStarted(); return extraction;
+        } } }, boardEventStore: events,
+        shareSummaryGenerator: async scrap => { generated++; return `새 모델 요약: ${scrap.extractedBody ?? scrap.card?.title}`; },
+        metaApi: { bearerToken: 'operator-token', noAuth: false },
+        startPort: 46_000 + Math.floor(Math.random() * 1_000),
+      });
+      const authorization = `Bearer ${appSessionToken}`;
+      try {
+        const stream = await fetch(`${server.url}/v1/events?topics=scrap.summary.result`, { headers: { authorization } });
+        expect(stream.status).toBe(200);
+        const reader = stream.body!.getReader();
+        await reader.read(); // initial SSE comment
+        // Extension save leg: ShareScrapClient posts kind=web with ShareAPIContract.shareSource.
+        const saving = fetch(`${server.url}/v1/scraps`, {
+          method: 'POST', headers: { authorization, 'idempotency-key': 'ios-share-chain-0001', 'content-type': 'application/json' },
+          body: JSON.stringify({ kind: 'web', source: 'android-share', raw: { url: 'https://example.test/chain' } }),
+        });
+        await started;
+        // The extension cannot request a summary until save returns its scrap ID.
+        expect(await events.query({ memberId, type: 'scrap.summary.requested' })).toHaveLength(0);
+        finishExtraction({ title: 'Chain lecture', body: 'One point.' });
+        const saved = await saving;
+        expect(saved.status).toBe(201);
+        const savedBody = await saved.json() as { id: string };
+        const scrapId = savedBody.id;
+        expect(scrapId).toBeString();
+        expect(scrapId).not.toBe('');
+        const storedExtensionState = JSON.stringify({ scrapId });
+        // ShareSummaryRequestClient.idempotencyKey derives from the scrapID alone, so a
+        // restarted extension re-derives the same key and replays the same requestId.
+        const extensionKey = `iossum_${createHash('sha256').update(scrapId).digest('hex')}`;
+        const expectedRequestId = `sum_${createHash('sha256').update(JSON.stringify([memberId, extensionKey])).digest('hex').slice(0, 32)}`;
+        const post = (savedScrapId: string) => fetch(`${server.url}/v1/scraps/summary-requests`, {
+          method: 'POST', headers: { authorization, 'idempotency-key': `iossum_${createHash('sha256').update(savedScrapId).digest('hex')}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ scrapId: savedScrapId }),
+        });
+        const created = await post(scrapId);
+        expect(created.status).toBe(201);
+        const createdBody = await created.json() as { requestId: string; status: string };
+        expect(createdBody).toMatchObject({ requestId: expectedRequestId, status: 'ready' });
+        // Simulate a fresh extension instance with only its persisted save response ID.
+        const restartedState = JSON.parse(storedExtensionState) as { scrapId: string };
+        const restartReplay = await post(restartedState.scrapId);
+        expect(restartReplay.status).toBe(200);
+        expect(await restartReplay.json()).toMatchObject({ requestId: expectedRequestId, status: 'ready' });
+        // requestAndPoll leg: at most four status polls before showing the receipt.
+        let receipt: { requestId: string; status: string; scrapId?: string; summary?: string; summarySource?: string }
+          = { requestId: expectedRequestId, status: 'pending' };
+        for (let polls = 0; polls < 4 && receipt.status === 'pending'; polls++) {
+          const polled = await fetch(`${server.url}/v1/scraps/summary-requests/${receipt.requestId}`, { headers: { authorization } });
+          expect(polled.status).toBe(200);
+          receipt = await polled.json() as typeof receipt;
+        }
+        expect(receipt).toMatchObject({ requestId: expectedRequestId, scrapId, status: 'ready',
+          summary: '새 모델 요약: One point.', summarySource: 'generated' });
+        const frame = new TextDecoder().decode((await reader.read()).value);
+        expect(frame).toContain('scrap.summary.result');
+        expect(frame).toContain(expectedRequestId);
+        expect(frame).toContain(scrapId);
+        await reader.cancel();
+        const requested = await events.query({ memberId, type: 'scrap.summary.requested' });
+        expect(requested).toHaveLength(1);
+        const durable = await events.query({ memberId, type: 'scrap.summary.result' });
+        expect(durable).toHaveLength(1);
+        expect(durable[0]).toMatchObject({ requestId: expectedRequestId, scrapId, status: 'ready' });
+        // A restart after the result replays the receipt without generating again.
+        const afterReady = await post((JSON.parse(storedExtensionState) as { scrapId: string }).scrapId);
+        expect(afterReady.status).toBe(200);
+        expect(await afterReady.json()).toMatchObject({ requestId: expectedRequestId, status: 'ready' });
+        expect(generated).toBe(1);
+        expect(await events.query({ memberId, type: 'scrap.summary.requested' })).toHaveLength(1);
       } finally { server.stop(); }
     } finally { memberStore.close(); rmSync(root, { recursive: true, force: true }); }
   });

@@ -11,6 +11,7 @@
 //   - gemini     GEMINI_API_KEY   (alias: GOOGLE_API_KEY)      cf. config.ts:105
 //   - local      LOCAL_LLM_URL    (base URL, not an API key)   cf. config.ts:92
 //   - openai-codex shares OPENAI_API_KEY for apikey-mode       cf. onboarding.ts:431
+//   - hq-proxy   ELANOUS_HQ_PROXY_MACHINE_TOKEN                cf. llm/hq-proxy-provider.ts
 //
 // Auxiliary AI env vars (firecrawl/supadata/elevenlabs/…) are surfaced
 // as info-only — they're consumed by skills/voice/web-search elsewhere
@@ -81,6 +82,14 @@ export const PROVIDER_ENV_SPEC: readonly ProviderEnvSpec[] = [
     provider: 'opengateway',
     primaryKeyEnv: 'OPENGATEWAY_API_KEY',
     modelEnv: 'OPENGATEWAY_MODEL',
+  },
+  // shipping 사다리(`hq-proxy` = CODEX, status shipping)인데 키 감지 표가 비어
+  // 셋업·온보딩이 머신 토큰을 못 봤다. 자 = test/llm-provider-name-lists.test.ts.
+  // 런타임이 읽는 값은 src/llm/hq-proxy-provider.ts 의 ELANOUS_HQ_PROXY_MACHINE_TOKEN.
+  // base URL·owner bearer 는 llm.baseUrl / llm.apiKey 이지 env 키가 아니다.
+  {
+    provider: 'hq-proxy',
+    primaryKeyEnv: 'ELANOUS_HQ_PROXY_MACHINE_TOKEN',
   },
 ] as const;
 

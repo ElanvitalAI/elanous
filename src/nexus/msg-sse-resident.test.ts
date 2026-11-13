@@ -22,11 +22,14 @@ test('isolated Nexus boot owns the resident message SSE listener until release',
     expect(handle).toBeDefined();
     const info = readPostOffice(root);
     expect(info).not.toBeNull();
-    expect(await discoverPostOfficeUrl(root)).toBe(info?.url);
+    expect(await discoverPostOfficeUrl(root)).toBe(info!.url);
     const stream = await fetch(`${info?.url}/stream?to=TC&since=0`, { headers: { Authorization: 'Bearer fake-nexus-token' } });
     expect(stream.status).toBe(200);
     await stream.body?.cancel();
-    handle?.release();
+    // release is `() => void | Promise<void>` (PR #36421 made the shutdown
+    // path async via the Guardian train-worker drain) — the post-office clear
+    // is only observable after the returned promise settles.
+    await handle?.release();
     handle = undefined;
     expect(readPostOffice(root)).toBeNull();
   } finally {

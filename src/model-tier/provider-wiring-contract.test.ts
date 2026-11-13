@@ -31,11 +31,17 @@ async function constructionOutcome(provider: string): Promise<{ ok: true } | { o
   const llm = await import('../llm.js');
   const uc = await import('../user-config.js');
   const base = uc.getUserConfig();
+  const savedMode = process.env.ELANOUS_LLM_MODE;
   try {
+    // Inspect the requested constructor, not NODE_ENV=test's default fake provider.
+    process.env.ELANOUS_LLM_MODE = 'real';
     llm.getProviderForConfig({ ...base, llm: { ...base.llm, provider, model: undefined } } as never);
     return { ok: true };
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    if (savedMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+    else process.env.ELANOUS_LLM_MODE = savedMode;
   }
 }
 

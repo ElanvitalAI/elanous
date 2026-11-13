@@ -153,17 +153,37 @@ describe('POST /v1/setup/llm-provider — auto flow', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as LlmProviderSetResponse;
     expect(body.ok).toBe(true);
-    // Note: `body.active.provider` may be the llm-fallback substrate's
-    // provider (e.g. 'local') rather than the literal 'auto' — by
-    // design, `isLlmSectionEmpty('auto')` is true so the fallback merges
-    // in on reload. We assert that the on-disk file holds 'auto' so the
-    // wire intent is preserved.
+    // saveUserConfig/sparseUserConfig omit generated defaults when no raw key
+    // was present. Auto still round-trips through the isolated config reader.
+    expect(body.active.provider).toBe('auto');
     const cfgRaw = fs.readFileSync(
       path.join(testConfigDir, 'config.json'),
       'utf8',
     );
     const cfgObj = JSON.parse(cfgRaw) as { llm?: { provider?: string } };
-    expect(cfgObj.llm?.provider).toBe('auto');
+    expect(cfgObj.llm?.provider).toBeUndefined();
+    const list = await handleLlmProvidersList(makeGet('/v1/setup/llm-providers')).json() as LlmProvidersResponse;
+    expect(list.activeProvider).toBe('auto');
+  });
+
+  test('switching to auto preserves explicit intent and clears prior active credentials', async () => {
+    fs.writeFileSync(path.join(testConfigDir, 'config.json'), JSON.stringify({
+      llm: { provider: 'anthropic', apiKey: 'synthetic-prior-key', baseUrl: 'http://fixture.invalid', model: 'fixture-model' },
+    }));
+    resetUserConfig();
+    const res = await handleLlmProviderSet(makePost('/v1/setup/llm-provider', { provider: 'auto' }));
+    expect(res.status).toBe(200);
+    const saved = JSON.parse(fs.readFileSync(path.join(testConfigDir, 'config.json'), 'utf8')) as {
+      llm?: { provider?: string; apiKey?: string; baseUrl?: string; model?: string };
+    };
+    // sparseUserConfig retains explicit raw keys, including a provider selected earlier.
+    expect(saved.llm?.provider).toBe('auto');
+    expect(saved.llm?.apiKey).toBeUndefined();
+    expect(saved.llm?.baseUrl).toBeUndefined();
+    expect(saved.llm?.model).toBeUndefined();
+    const list = await handleLlmProvidersList(makeGet('/v1/setup/llm-providers')).json() as LlmProvidersResponse;
+    expect(list.activeProvider).toBe('auto');
+    expect(list.providers.some(provider => provider.hasSavedKey)).toBe(false);
   });
 });
 

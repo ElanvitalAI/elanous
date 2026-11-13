@@ -16,7 +16,7 @@ import {
   type PreflightOpenPr,
   type PreflightUnfinishedRun,
 } from './launch-preflight.js';
-import type { LaunchingTreeProbe } from './ask-launch-flow.js';
+import { originDefaultRefResolvable, resolveLocalDefaultBranch, type LaunchingTreeProbe } from './ask-launch-flow.js';
 
 export interface InterruptedRunPreflightSource {
   readonly runId: string;
@@ -82,7 +82,7 @@ export interface BuildAskPreflightDepsOptions {
 function inspectLaunchingTree(cwd: string): LaunchingTreeProbe {
   try {
     // git-spawn-allow: Reads only local HEAD and cached origin/main ancestry; it never fetches or changes repository state.
-    const raw = execFileSync('git', ['rev-list', '--left-right', '--count', 'HEAD...refs/remotes/origin/main'], { cwd, encoding: 'utf8' }).trim();
+    const raw = execFileSync('git', ['rev-list', '--left-right', '--count', 'HEAD...refs/remotes/origin/main'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     const [aheadRaw, behindRaw] = raw.split(/\s+/);
     const ahead = Number(aheadRaw);
     const behind = Number(behindRaw);
@@ -91,6 +91,11 @@ function inspectLaunchingTree(cwd: string): LaunchingTreeProbe {
     }
     return { kind: 'measured', ahead, behind, reference: 'origin/main (cached)' };
   } catch (error) {
+    // A resolvable origin ref means the comparison itself failed — keep that failure visible instead of claiming a verified local base.
+    if (!originDefaultRefResolvable(cwd)) {
+      const localBase = resolveLocalDefaultBranch(cwd);
+      if (localBase) return { kind: 'local-base', baseRef: localBase.baseRef, baseSha: localBase.baseSha, reason: localBase.reason };
+    }
     return { kind: 'unmeasurable', error: String((error as { message?: unknown })?.message ?? error) };
   }
 }

@@ -44,16 +44,18 @@ test('RELEASE-NODE-COMMANDS-BINDING sim: every release graph node matches a runn
   const root = join(import.meta.dir, '../..');
   const graph = parseYaml(readFileSync(join(root, 'graphs/release/release-loop.yaml'), 'utf8')) as ReleaseGraph;
   const recipes = parseYaml(readFileSync(join(root, 'graphs/release/recipes.yaml'), 'utf8')) as Record<string, Recipe>;
+  const pluginBindings = JSON.parse(readFileSync(join(root, 'graphs/release/node-command-bindings.json'), 'utf8')) as Bindings;
+  const effectiveBindings = { ...pluginBindings, ...RELEASE_NODE_COMMANDS };
 
-  expect(bindingDefects(graph, recipes, RELEASE_NODE_COMMANDS)).toEqual([]);
+  expect(bindingDefects(graph, recipes, effectiveBindings)).toEqual([]);
   expect(RELEASE_NODE_COMMANDS['emergency-switch']).toEqual({
     recipe: 'cmd:emergency-switch', command: 'bun scripts/release-loop/emergency-publish-switch-sim.ts',
   });
 
   // Mutation proof: both an omitted binding and a newly declared graph node are rejected.
-  const missingEmergency = { ...RELEASE_NODE_COMMANDS };
+  const missingEmergency = { ...effectiveBindings };
   delete (missingEmergency as Record<string, { recipe: string; command?: string }>)['emergency-switch'];
   expect(bindingDefects(graph, recipes, missingEmergency)).toContain('emergency-switch: missing RELEASE_NODE_COMMANDS binding');
   const addedNode = { ...graph, nodes: [...graph.nodes, { node_id: 'new-release-node', recipe: 'cmd:new-release-node' }] };
-  expect(bindingDefects(addedNode, recipes, RELEASE_NODE_COMMANDS)).toContain('new-release-node: missing RELEASE_NODE_COMMANDS binding');
+  expect(bindingDefects(addedNode, recipes, effectiveBindings)).toContain('new-release-node: missing RELEASE_NODE_COMMANDS binding');
 });

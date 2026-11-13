@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as core from '../core-turn/run-core-turn.js';
-import * as llm from '../llm.js';
-import type { LLMMessage, LLMProvider } from '../llm.js';
+import type { LLMMessage, LLMStreamEvent } from '../llm.js';
+import { testFakeLlmProvider } from '../ux-sim/fake-llm.js';
 import { extractLastAssistantText } from './core-turn-bridge.js';
 import * as config from '../user-config.js';
 import { debug } from '../debug/log.js';
@@ -156,23 +156,30 @@ test('real core turn caps repeated search requests and synthesizes from returned
   });
   const seen: LLMMessage[][] = [];
   const synthesis: LLMMessage[][] = [];
-  const provider: LLMProvider = {
-    name: 'fact-test-provider', defaultModel: 'gpt-5.6', available: () => true,
-    chat: async function* (messages) {
-      synthesis.push(structuredClone(messages));
-      const source = /https:\/\/example\.com\/model/.exec(JSON.stringify(messages))?.[0];
-      if (!source) throw new Error('synthesis did not receive search evidence');
-      yield `검색 결과의 Model 항목에 따르면 A model입니다. [출처](${source})`;
-    },
-    streamChat: async function* (messages) {
-      seen.push(structuredClone(messages));
-      if (seen.length > 12) throw new Error(`excessive model calls: ${seen.length}`);
-      yield { type: 'tool_call', id: `search-${seen.length}`, name: 'WebSearch', args: { query: `model-${seen.length}` } };
-      yield { type: 'tool_call', id: `search-${seen.length}-b`, name: 'WebSearch', args: { query: `model-${seen.length}-b` } };
-    },
-  };
-  spyOn(llm, 'resolveDefaultProvider').mockReturnValue(provider);
-  const persisted: LLMMessage[][] = [];
+  // bun test selects testFakeLlmProvider before resolveDefaultProvider, and streamLLM
+  // prefers streamChat over chat. Its model id `test-fake-llm` is family `other`,
+  // which cuts exploratory WebSearch at turn 4 — before the fact cap of 6.
+  // Report the configured gpt-5.6 id so the frontier family keeps searching.
+  const fakeModel = testFakeLlmProvider.defaultModel;
+  testFakeLlmProvider.defaultModel = 'gpt-5.6';
+  spyOn(testFakeLlmProvider, 'streamChat').mockImplementation(async function* (messages): AsyncGenerator<LLMStreamEvent> {
+    const snapshot = structuredClone(messages);
+    seen.push(snapshot);
+    if (seen.length > 12) throw new Error(`excessive model calls: ${seen.length}`);
+    yield { type: 'tool_call', id: `search-${seen.length}`, name: 'WebSearch', args: { query: `model-${seen.length}` } };
+    yield { type: 'tool_call', id: `search-${seen.length}-b`, name: 'WebSearch', args: { query: `model-${seen.length}-b` } };
+  });
+  // Four search-only model turns dispatch 8 requests; the fact cap keeps 6.
+  // The loop then synthesizes through provider.chat, which must see the URL.
+  spyOn(testFakeLlmProvider, 'chat').mockImplementation(async function* (messages): AsyncGenerator<string> {
+    const snapshot = structuredClone(messages);
+    const source = /https:\/\/example\.com\/model/.exec(JSON.stringify(snapshot))?.[0];
+    if (!source) throw new Error('synthesis did not receive search evidence');
+    synthesis.push(snapshot);
+    yield `검색 결과의 Model 항목에 따르면 A model입니다. [출처](${source})`;
+  });
+  try {
+    const persisted: LLMMessage[][] = [];
   const pushes: string[] = [];
   const dispatched: string[] = [];
   const budgetEvents: Array<{ factQuestion: boolean; count: number; kinds: string[]; maxToolTurns: number }> = [];
@@ -196,19 +203,21 @@ test('real core turn caps repeated search requests and synthesizes from returned
     pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
     requestApproval: async () => 'deny-once' as const,
   } as unknown as AcpTurnContext);
-  expect(seen.length).toBeGreaterThan(3);
-  expect(seen.length).toBeLessThan(7);
-  expect(dispatched).toHaveLength(6);
-  expect(dispatched.every((name) => name === 'WebSearch')).toBe(true);
-  expect(JSON.stringify(persisted[0])).toContain('https://example.com/model');
-  expect(synthesis).toHaveLength(1);
-  expect(JSON.stringify(synthesis[0])).toContain('https://example.com/model');
-  const savedAnswer = extractLastAssistantText(persisted[0]!);
-  expect(savedAnswer).toContain('https://example.com/model');
-  expect(savedAnswer).toEndWith('더 찾아볼까요?');
-  expect(pushes.join('')).toBe(savedAnswer ?? '');
-  expect(savedAnswer).toContain('A model');
-  expect(budgetEvents).toContainEqual({ factQuestion: true, count: 6, kinds: ['WebSearch'], maxToolTurns: 6 });
+    expect([4, 5, 6].includes(seen.length)).toBe(true);
+    expect(dispatched).toHaveLength(6);
+    expect(dispatched.every((name) => name === 'WebSearch')).toBe(true);
+    expect(JSON.stringify(persisted[0])).toContain('https://example.com/model');
+    expect(synthesis).toHaveLength(1);
+    expect(JSON.stringify(synthesis[0])).toContain('https://example.com/model');
+    const savedAnswer = extractLastAssistantText(persisted[0]!);
+    expect(savedAnswer).toContain('https://example.com/model');
+    expect(savedAnswer).toEndWith('더 찾아볼까요?');
+    expect(pushes.join('')).toBe(savedAnswer ?? '');
+    expect(savedAnswer).toContain('A model');
+    expect(budgetEvents.some((event) => event.factQuestion && event.count === 6 && event.maxToolTurns === 6 && event.kinds.join() === 'WebSearch')).toBe(true);
+  } finally {
+    testFakeLlmProvider.defaultModel = fakeModel;
+  }
 }, 30_000);
 
 test('budget followup targets last assistant rather than trailing tool result', async () => {

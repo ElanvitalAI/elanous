@@ -50,12 +50,14 @@ async function postRequest(harness: ReturnType<typeof setupRequest>, body: Recor
 }
 
 test('GET /v1/ux-sim/devices is owner-gated, read-only, and returns the complete catalog', async () => {
-  expect((await request('/v1/ux-sim/devices', 'GET', false))?.status).toBe(401);
+  const denied = await request('/v1/ux-sim/devices', 'GET', false);
+  expect(denied?.status).toBe(401);
   const harness = setupRequest();
   const before = { tabs: structuredClone(harness.state.tabs), events: structuredClone(harness.state.events) };
   const response = await harness.request();
   expect(response?.status).toBe(200);
-  expect(await response!.json()).toEqual({
+  const body = await response!.json();
+  expect(body).toEqual({
     catalogVersion: catalog.version,
     deviceCatalogVersion: catalog.deviceCatalogVersion,
     devices: catalog.devices,
@@ -66,6 +68,13 @@ test('GET /v1/ux-sim/devices is owner-gated, read-only, and returns the complete
   });
   expect({ tabs: harness.state.tabs, events: harness.state.events }).toEqual(before);
   expect(harness.publishEvents).toEqual([]);
+  const device = body.devices.find((row: { id: string }) => row.id === 'debug-noise-top30');
+  expect(device?.checklistCells).toEqual(['DEBUG-NOISE-TOP30-OUT']);
+  expect(catalog.sourceModules.find((row) => row.id === 'MD-UX-SIM-DEBUG-NOISE-TOP30-TS')?.deviceIds)
+    .toEqual(['debug-noise-top30']);
+  console.log(JSON.stringify({ route: 'GET /v1/ux-sim/devices', deniedStatus: denied?.status,
+    authorizedStatus: response?.status, deviceId: device?.id,
+    catalogVersion: body.catalogVersion, deviceCatalogVersion: body.deviceCatalogVersion }));
   expect((await request('/v1/ux-sim/devices', 'POST'))?.status).toBe(403);
   expect((await request('/v1/ux-sim/devices', 'PUT'))?.status).toBe(405);
   expect((await request('/v1/devices'))?.status).toBe(503);

@@ -393,3 +393,44 @@ test('service errors are suppressed so credential-bearing diagnostics cannot esc
   expect(f.errors.join('\n')).not.toContain('mock-secret-value');
   expect(f.exitCodes).toEqual([1]);
 });
+
+
+test('secret env refuses TTY before backend access even with redirected stdin', async () => {
+  let reads = 0;
+  let initialized = 0;
+  const f = makeProgram(fixture => {
+    fixture.deps.isInteractive = () => false;
+    fixture.deps.isStdoutTTY = () => true;
+    fixture.deps.initializeBackend = () => { initialized += 1; };
+    fixture.deps.getSecret = async () => { reads += 1; return 'synthetic-tty-canary'; };
+  });
+  await parse(f, 'secret', 'env', '--names', 'EXA_API_KEY');
+  expect(f.output).toEqual([]);
+  expect(f.errors).toEqual(['secret env refuses terminal output; use a pipe or explicitly pass --print']);
+  expect(f.exitCodes).toEqual([1]);
+  expect(reads).toBe(0);
+  expect(initialized).toBe(0);
+});
+
+test('secret env explicit print permits synthetic TTY export only when requested', async () => {
+  const f = makeProgram(fixture => {
+    fixture.deps.isStdoutTTY = () => true;
+    fixture.values.set('EXA_API_KEY', 'synthetic-print-canary');
+  });
+  await parse(f, 'secret', 'env', '--names', 'EXA_API_KEY', '--print');
+  expect(f.output).toEqual(["export EXA_API_KEY='synthetic-print-canary'"]);
+  expect(f.errors).toEqual([]);
+  expect(f.exitCodes).toEqual([0]);
+});
+
+test('secret env keeps pipe consumption when input is interactive', async () => {
+  const f = makeProgram(fixture => {
+    fixture.deps.isInteractive = () => true;
+    fixture.deps.isStdoutTTY = () => false;
+    fixture.values.set('EXA_API_KEY', 'synthetic-pipe-canary');
+  });
+  await parse(f, 'secret', 'env', '--names', 'EXA_API_KEY');
+  expect(f.output).toEqual(["export EXA_API_KEY='synthetic-pipe-canary'"]);
+  expect(f.errors).toEqual([]);
+  expect(f.exitCodes).toEqual([0]);
+});

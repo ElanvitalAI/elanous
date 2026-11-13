@@ -72,21 +72,15 @@ test('harness say live launch gate rejects a same-goal active run and observes a
 
     const codexHome = join(home, '.codex');
     saveTokens('openai-codex', { accessToken: 'test', refreshToken: 'test', expiresAt: null },
-      { mirrorCodex: false, codexHome }, join(home, '.config', 'elanous', 'auth.json'));
-    const previousStateDir = process.env.ELANOUS_STATE_DIR;
-    try {
-      process.env.ELANOUS_STATE_DIR = state;
-      writeQuotaSignal(undefined, 95, codexHome);
-    } finally {
-      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
-      else process.env.ELANOUS_STATE_DIR = previousStateDir;
-    }
+      { mirrorCodex: false, codexHome }, join(state, 'auth.json'));
+    // --test selects this config/auth root; write quota to the same explicit fixture root.
+    writeQuotaSignal(undefined, 95, codexHome, { root: state });
     const budgetBlocked = spawnSync(process.execPath, [
       cli, `--test=${state}`, 'harness', 'say', sentence,
       '--child-llm-provider', 'openai-codex', '--force-gate', '--source', 'local-only',
     ], { cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000 });
     expect(budgetBlocked.error).toBeUndefined();
-    expect(budgetBlocked.status).toBe(3);
+    expect(budgetBlocked.status, budgetBlocked.stderr).toBe(3);
     expect(budgetBlocked.stderr.split('\n').filter((line) => line.includes('❌ launch gate:'))).toEqual([
       '❌ launch gate: blocked-budget — codex: default 95% ≥ 95',
     ]);

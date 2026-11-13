@@ -69,32 +69,38 @@ test('the general-only switch updates beta entries in the six-screen desktop and
   const sheet = () => root.findByProps({ role: 'dialog' });
   const open = (label: string) => act(() => root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('button').find((node) => node.props['aria-label'] === label)!.props.onClick({ currentTarget: null }));
   const close = () => act(() => sheet().findAllByProps({ 'aria-label': '메뉴 닫기' })[0]!.props.onClick());
-  expect(hrefs()).toEqual(['/chat', '/term', '/editor', '/settings']);
+  expect(hrefs()).toEqual(['/chat', '/board', '/term', '/editor', '/settings']);
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(1);
   expect(root.findByProps({ role: 'switch' }).props.checked).toBe(false);
-  expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').map((link) => link.props.href)).toEqual(['/chat']);
+  expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').map((link) => link.props.href)).toEqual(['/chat', '/board']);
   act(() => root.findByProps({ role: 'switch' }).props.onChange({ currentTarget: { checked: true } }));
   expect(root.findByProps({ role: 'switch' }).props.checked).toBe(true);
   for (const path of ['/live-run', '/vault']) {
     expect(hrefs()).toContain(path);
     expect(sidebar().findAllByType('a').find((link) => link.props.href === path)!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
   }
+  expect(sidebar().findAllByType('a').find((link) => link.props.href === '/board')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
   expect(hrefs()).toContain('/apps');
   for (const path of ['/workspace', '/scheduler', '/ops/release', '/design-check']) expect(hrefs()).not.toContain(path);
   expect(sidebar().findAllByType('a').find((link) => link.props.href === '/settings')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
+  open('실행');
+  expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/live-run', '/board']);
+  expect(sheet().findAllByType('a').find((link) => link.props.href === '/live-run')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
+  expect(sheet().findAllByType('a').find((link) => link.props.href === '/board')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
+  close();
   open('더보기');
   expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/vault', '/settings']);
   expect(sheet().findAllByType('a').find((link) => link.props.href === '/vault')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
   close();
   act(() => root.findByProps({ role: 'switch' }).props.onChange({ currentTarget: { checked: false } }));
-  expect(hrefs()).toEqual(['/chat', '/term', '/editor', '/settings']);
+  expect(hrefs()).toEqual(['/chat', '/board', '/term', '/editor', '/settings']);
   act(() => { store.set(PWA_ROLE_KEY, 'contributor'); window.dispatchEvent(new Event(PWA_ROLE_EVENT)); });
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(0);
-  expect(hrefs()).toEqual(['/chat', '/live-run', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings']);
+  expect(hrefs()).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings']);
   expect(sidebar().findAllByType('a').find((link) => link.props.href === '/live-run')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
   act(() => { store.set(PWA_ROLE_KEY, 'owner'); window.dispatchEvent(new Event(PWA_ROLE_EVENT)); });
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(0);
-  expect(hrefs()).toEqual(['/chat', '/live-run', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings']);
+  expect(hrefs()).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings', '/credentials']);
 });
 
 test('defaults off, synchronizes every mounted hook and remembers opt-in across mounts', () => {

@@ -27,11 +27,11 @@ import { debug } from '../debug/log.js';
 /** 추가 묶음 — 코딩 기본에서 빠지고 «고르면 더해지는» 도구들. 접두 ⊕ 정확한 이름. */
 export const TOOL_EXTRA_GROUPS = {
   finance: { prefixes: ['finance_', 'conatus_'], names: [] as string[] },
-  ops: { prefixes: [] as string[], names: ['schedule_manage', 'session_manage', 'autopilot_missions', 'ops_status', 'se_build', 'mission_decide'] },
+  ops: { prefixes: [] as string[], names: ['schedule_manage', 'session_manage', 'autopilot_missions', 'ops_status', 'se_build', 'mission_decide', 'app_deploy'] },
   /** 판·자리·결정 운영 — 코딩 일에는 안 쓴다. */
   admin: { prefixes: ['release_'], names: ['coo_admin', 'ops_seats', 'decisions_pending', 'proact_meter'] },
-  /** 기억·회수·관측 조회. */
-  recall: { prefixes: [] as string[], names: ['memory_recall', 'fact_check', 'self_recall', 'context_now', 'logs_query'] },
+  /** 기억 저장(#36659)·회수·관측 — 저장은 공통 턴 몫이지 코딩 자식 몫이 아니다. */
+  recall: { prefixes: [] as string[], names: ['memory_save', 'memory_recall', 'fact_check', 'self_recall', 'context_now', 'logs_query'] },
   /** 스킬 목록·실행. */
   skills: { prefixes: [] as string[], names: ['elanous_skills_list', 'skill_exec'] },
   /** 서브에이전트 — ⚠️ 기본에서 빼도 완주율이 안 떨어지는지는 아직 안 쟀다(SMALL-MODEL-BENCH 가 잰다). 신호·ToolSearch 로 되살린다. */

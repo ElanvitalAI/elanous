@@ -31,7 +31,7 @@ test('same release run parks on HITL after bounded landing recovery fails, then 
     kind: 'hitl', recipe: 'approval:repair-recovery',
   });
   expect(productionGraph.edges.find((edge) => edge.from === scenario.expected.pendingNode)).toMatchObject({
-    map: { ok: 'gate', fail: 'failed', error: 'failed' },
+    map: { ok: 'gate', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' },
   });
   expect(productionRecipes['repair-recovery']).toMatchObject({ approval: expect.stringContaining('같은 런에서 gate를 재측정') });
   const root = mkdtempSync(join(tmpdir(), 'rla-postland-hitl-sim-'));
@@ -140,4 +140,5 @@ test('same release run parks on HITL after bounded landing recovery fails, then 
     expect(commandErrorRun.path).not.toContain(scenario.expected.pendingNode);
     expect(commandErrorRun.path.at(-1)).toBe('gate-heal-decision');
   } finally { rmSync(root, { recursive: true, force: true }); }
-}, { timeout: 15_000 });
+// 출처: .rules/30-harness/testing-gates.md R-TST36; RES-Q10 focused2.log measured three graph runs at 49.8s on shared node-b.
+}, { timeout: 120_000 });

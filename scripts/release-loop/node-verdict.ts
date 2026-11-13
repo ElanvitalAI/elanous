@@ -74,7 +74,7 @@ export function signedT6PwaKnownIssue(context: GraphContext, root = effectiveIns
   const runId = context.runId;
   const cut = context.outputs['version-release']?.commit;
   if (context.graphId !== 'release-loop' || typeof runId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(runId)
-    || context.input.version !== '0.3.15' || typeof cut !== 'string' || !/^[a-f0-9]{40}$/.test(cut)
+    || !isReleaseVersion(context.input.version) || typeof cut !== 'string' || !/^[a-f0-9]{40}$/.test(cut)
     || context.outputs.pwa?.outcome !== 'fail' || context.outputs.pwa?.commit !== cut) return false;
   try {
     const state = JSON.parse(readFileSync(join(root, 'graph-runs/release-loop', `${runId}.json`), 'utf8')) as GraphRunState;

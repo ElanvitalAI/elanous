@@ -76,8 +76,15 @@ describe('TUI RunShell task-unit grouping E2E', () => {
         mcp: { enabled: false },
         shell: { allowDashboardRunShell: true },
       }));
+      // This regression guards the classic dashboard's kind-unit RunShell grouping
+      // (src/dashboard/rendered-tool-runtime.ts coalesces adjacent same-kind calls
+      // into «… (2 RunShell)», and its pinned thinking line carries the «esc 중단»
+      // hint). #36784 made a bare local root launch open the next TUI instead, and
+      // #37048 then hid tool blocks from the next TUI's composer-focused (L0) view —
+      // so a bare launch no longer shows this surface at all. Pin `--legacy` to keep
+      // booting the dashboard these assertions were written against.
       handle = startPty({
-        cmd: 'bun', args: ['bin/elanous.mjs', '--config-dir', tempDir, '--test-state-dir', tempDir],
+        cmd: 'bun', args: ['bin/elanous.mjs', '--legacy', '--config-dir', tempDir, '--test-state-dir', tempDir],
         cols: 160, rows: 40, workdir: repoRoot,
         env: {
           ...process.env, ELANOUS_DRIVE_TUI: '1', ELANOUS_STATE_DIR: tempDir,

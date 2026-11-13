@@ -211,7 +211,10 @@ describe('runNexus telegram channel integration', () => {
       telegramHitlOpts: { token: 't:1', chatId: 1, bot: makeStubBot() },
     });
     expect(getDefaultConfirmChannels().map((c) => c.name)).toContain('telegram');
-    h.release();
+    // #36421 made RunNexusHandle.release async (Guardian train worker
+    // lifecycle stop precedes the default-channel registry clear), so the
+    // registry empties in a microtask — await the release before asserting.
+    await h.release();
     activeHandle = undefined;
     expect(getDefaultConfirmChannels()).toHaveLength(0);
   });

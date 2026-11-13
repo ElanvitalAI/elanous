@@ -102,8 +102,7 @@ describe('start CLI', () => {
     mkdirSync(home);
     mkdirSync(isolated);
     writeFileSync(join(isolated, 'config.json'), JSON.stringify({ llm: { provider: 'auto' } }));
-    mkdirSync(join(home, '.elanous'));
-    writeFileSync(join(home, '.elanous', 'auth.json'), JSON.stringify({ version: 1, providers: {
+    writeFileSync(join(isolated, 'auth.json'), JSON.stringify({ version: 1, providers: {
       'openai-codex': { tokens: { accessToken: 'fixture-access', refreshToken: 'fixture-refresh', expiresAt: null }, lastRefresh: 'fixture' },
     } }));
     const entry = join(process.cwd(), 'bin/elanous.mjs');
@@ -125,7 +124,7 @@ describe('start CLI', () => {
       expect(loginStart.llm).toBe('available');
       expect(loginDoctor.readiness.items.find((entry: { id: string }) => entry.id === 'provider-decision'))
         .toMatchObject({ status: 'ok', evidence: 'llm.provider=auto → login openai-codex' });
-      rmSync(join(home, '.elanous', 'auth.json'));
+      rmSync(join(isolated, 'auth.json'));
       for (const [input, expected, via] of [
         [{ LOCAL_LLM_URL: 'http://127.0.0.1:12345/v1' }, 'available', 'local-server local'],
         [{ OPENAI_API_KEY: 'sk-fixture-do-not-print' }, 'available', 'key openai'],

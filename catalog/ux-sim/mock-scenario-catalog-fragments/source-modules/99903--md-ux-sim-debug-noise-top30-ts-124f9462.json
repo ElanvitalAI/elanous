@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-DEBUG-NOISE-TOP30-TS",
+  "path": "src/ux-sim/debug-noise-top30.ts",
+  "boundary": "Compares fixed simulated 24-hour noise and protected decisions through production debug.log and isolated logs.db; it does not measure the host's historical top 30.",
+  "deviceIds": ["debug-noise-top30"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

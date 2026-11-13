@@ -2984,6 +2984,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
             const { makeTelegramAgentRunTurn } = await import('../telegram-agent.js');
             const { resolveTelegramChannels, interactivePollerTokens } = await import('../domains/telegram-channels.js');
             const { tryAcquireTelegramPollLock, acquireTelegramPollLock } = await import('../telegram-poll-lock.js');
+            const testApiBase = resolveCurrentInstance().kind === 'test'
+              ? (await import('../telegram-test-runner.js')).telegramTestApiBase(process.env.ELANOUS_TELEGRAM_API_BASE)
+              : undefined;
             const adopt = ({ channel, handle }: NexusTelegramQaPollerWireHandle): void => {
               telegramPollerHandles.push(handle);
               if (channel.botToken === telegramToken) workflowTelegramBot = handle;
@@ -2997,7 +3000,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
                 makeTelegramAgentRunTurn,
                 resolveTelegramChannels,
                 interactivePollerTokens,
-                createTriggerBot: (opts) => createNexusTelegramTriggerBot({ ...opts, poll: false }),
+                createTriggerBot: (opts) => createNexusTelegramTriggerBot({ ...opts, poll: false, ...(testApiBase ? { apiBase: testApiBase } : {}) }),
               });
               for (const { channel, handle } of sendOnly) {
                 telegramPollerHandles.push(handle);
@@ -3009,7 +3012,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
                 makeTelegramAgentRunTurn,
                 resolveTelegramChannels,
                 interactivePollerTokens,
-                createTriggerBot: createNexusTelegramTriggerBot,
+                createTriggerBot: testApiBase
+                  ? (opts) => createNexusTelegramTriggerBot({ ...opts, apiBase: testApiBase })
+                  : createNexusTelegramTriggerBot,
                 pollLock: {
                   tryAcquire: (token) => tryAcquireTelegramPollLock(token, 'nexus'),
                   acquire: (token) => acquireTelegramPollLock(token, 'nexus'),

@@ -30,6 +30,8 @@ const HTTP_CONFLICT = 409;
 const HTTP_EXTRACTION_FAILED = 502;
 // Source: HTTP newly created resource response contract.
 const HTTP_CREATED = 201;
+/** Live extraction claims for this server process; a restart leaves only the durable ledger. */
+const processingScraps = new Set<string>();
 
 export interface ScrapsRouteOptions {
   instanceRoot: string;
@@ -87,13 +89,14 @@ function parseScrap(value: unknown, memberId: string, now: string): AbsorbScrapP
   if (!input.raw || typeof input.raw !== 'object' || Array.isArray(input.raw)) return null;
   const candidate = input.raw as Record<string, unknown>;
   const raw: AbsorbScrapPayload['raw'] = {};
-  for (const field of ['text', 'url', 'mediaRef', 'mime'] as const) {
+  for (const field of ['text', 'transcript', 'url', 'mediaRef', 'mime'] as const) {
     if (candidate[field] !== undefined) {
       if (typeof candidate[field] !== 'string' || candidate[field].length > MAX_SCRAP_FIELD_CHARS) return null;
       raw[field] = candidate[field] as string;
     }
   }
   const kind = input.kind as AbsorbScrapKind;
+  if (raw.transcript !== undefined && (kind !== 'voice' || !raw.transcript.trim())) return null;
   if (input.folderId !== undefined && input.folderId !== null && typeof input.folderId !== 'string') return null;
   const hasContent = kind === 'text' ? Boolean(raw.text?.trim())
     : kind === 'web' || kind === 'x' || kind === 'youtube' ? Boolean(raw.url?.trim())
@@ -151,6 +154,41 @@ function parseScrap(value: unknown, memberId: string, now: string): AbsorbScrapP
   };
 }
 
+async function withScrapFlight(instanceRoot: string, id: string, work: () => Promise<Response>): Promise<Response> {
+  const claim = JSON.stringify([instanceRoot, id]);
+  if (processingScraps.has(claim)) return json({ error: 'scrap-extracting' }, HTTP_CONFLICT);
+  processingScraps.add(claim);
+  try { return await work(); }
+  finally { processingScraps.delete(claim); }
+}
+
+async function processClaimedScrap(id: string, payload: AbsorbScrapPayload, options: ScrapsRouteOptions, successStatus: number): Promise<Response> {
+  updateAbsorbScrap(options.instanceRoot, id, { status: 'extracting', failure: undefined });
+  let extracted: AbsorbExtraction | undefined;
+  try { extracted = await extractAbsorbScrap(payload, options.extractors); }
+  catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    updateAbsorbScrap(options.instanceRoot, id, { status: 'failed', failure: { stage: 'extract', reason } });
+    debug.log('absorb.extract', 'extract-failed', { id, memberId: payload.memberId, kind: payload.kind, reason });
+  }
+  if (extracted) {
+    try {
+      const card = await buildAbsorbSummaryCard(extracted, options.byokCard ? { byok: options.byokCard } : {});
+      updateAbsorbScrap(options.instanceRoot, id, { status: 'absorbed', card, failure: undefined,
+        extractedBody: extracted.body.slice(0, MAX_SCRAP_FIELD_CHARS),
+        absorbedAt: (options.now ?? (() => new Date()))().toISOString() });
+      debug.log('absorb.card', 'card-built', { id, memberId: payload.memberId, kind: payload.kind });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      updateAbsorbScrap(options.instanceRoot, id, { status: 'failed', failure: { stage: 'card', reason } });
+      debug.log('absorb.card', 'card-failed', { id, memberId: payload.memberId, kind: payload.kind, reason });
+    }
+  }
+  const result = listAbsorbScraps(options.instanceRoot, payload.memberId).find((scrap) => scrap.id === id);
+  if (result?.absorb?.status === 'absorbed' || result?.absorb?.status === 'failed') await options.onSettled?.(payload.memberId, id);
+  return json(result ? { id: result.id, ...result.absorb } : { error: 'scrap-not-found' }, result?.absorb?.status === 'failed' ? HTTP_EXTRACTION_FAILED : successStatus);
+}
+
 /** `POST/GET /v1/scraps`, scoped only to the server-authenticated member. */
 export async function handleScraps(req: Request, options: ScrapsRouteOptions): Promise<Response> {
   const method = req.method.toUpperCase();
@@ -195,7 +233,7 @@ export async function handleScraps(req: Request, options: ScrapsRouteOptions): P
       name: input.name === undefined ? current.name : input.name as string, parentId,
     }));
   }
-  const action = /^\/v1\/scraps\/([a-f0-9]{16})\/(folder|class-date|export)$/.exec(pathname);
+  const action = /^\/v1\/scraps\/([a-f0-9]{16})\/(folder|class-date|export|retry)$/.exec(pathname);
   if (action) {
     const id = action[1]!;
     if (action[2] === 'export') return handleVoiceNoteExport(req, {
@@ -204,6 +242,19 @@ export async function handleScraps(req: Request, options: ScrapsRouteOptions): P
     });
     const item = listAbsorbScraps(options.instanceRoot, owner.memberId).find((candidate) => candidate.id === id);
     if (!item?.absorb) return json({ error: 'scrap-not-found' }, 404);
+    if (action[2] === 'retry') {
+      if (method !== 'POST') return json({ error: 'method not allowed' }, HTTP_METHOD_NOT_ALLOWED);
+      return withScrapFlight(options.instanceRoot, id, async () => {
+        const current = listAbsorbScraps(options.instanceRoot, owner.memberId).find((candidate) => candidate.id === id);
+        if (!current?.absorb) return json({ error: 'scrap-not-found' }, 404);
+        if (current.absorb.status === 'absorbed') {
+          await options.onSettled?.(owner.memberId, id);
+          return json({ id, ...current.absorb }, HTTP_OK);
+        }
+        if (!['new', 'extracting', 'failed'].includes(current.absorb.status)) return json({ error: 'scrap-not-retryable' }, HTTP_CONFLICT);
+        return processClaimedScrap(id, current.absorb, options, HTTP_OK);
+      });
+    }
     if (method !== 'PATCH') return json({ error: 'method not allowed' }, HTTP_METHOD_NOT_ALLOWED);
     if (action[2] === 'folder') {
       let input: { folderId?: unknown };
@@ -245,41 +296,18 @@ export async function handleScraps(req: Request, options: ScrapsRouteOptions): P
     throw error;
   }
   const item = ingested.item;
-  if (options.onAccepted) {
-    try { await options.onAccepted(owner.memberId, item.id); }
-    catch { debug.log('absorb.accept', 'receipt-delivery-failed', { id: item.id, memberId: owner.memberId }); }
-  }
-  if (ingested.replayed) {
-    if (item.absorb?.status === 'absorbed' || item.absorb?.status === 'failed') await options.onSettled?.(owner.memberId, item.id);
-    return json({ id: item.id, ...item.absorb }, item.absorb?.status === 'failed' ? HTTP_EXTRACTION_FAILED : HTTP_OK);
-  }
-  if (item.absorb?.status === 'absorbed') {
-    await options.onSettled?.(owner.memberId, item.id);
-    return json({ id: item.id, ...item.absorb }, HTTP_OK);
-  }
-  updateAbsorbScrap(options.instanceRoot, item.id, { status: 'extracting' });
-  let extracted: AbsorbExtraction | undefined;
-  try {
-    extracted = await extractAbsorbScrap(payload, options.extractors);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    updateAbsorbScrap(options.instanceRoot, item.id, { status: 'failed', failure: { stage: 'extract', reason } });
-    debug.log('absorb.extract', 'extract-failed', { id: item.id, memberId: owner.memberId, kind: payload.kind, reason });
-  }
-  if (extracted) {
-    try {
-      const card = await buildAbsorbSummaryCard(extracted, options.byokCard ? { byok: options.byokCard } : {});
-      updateAbsorbScrap(options.instanceRoot, item.id, { status: 'absorbed', card,
-        extractedBody: extracted.body.slice(0, MAX_SCRAP_FIELD_CHARS),
-        absorbedAt: (options.now ?? (() => new Date()))().toISOString() });
-      debug.log('absorb.card', 'card-built', { id: item.id, memberId: owner.memberId, kind: payload.kind });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      updateAbsorbScrap(options.instanceRoot, item.id, { status: 'failed', failure: { stage: 'card', reason } });
-      debug.log('absorb.card', 'card-failed', { id: item.id, memberId: owner.memberId, kind: payload.kind, reason });
+  return withScrapFlight(options.instanceRoot, item.id, async () => {
+    if (options.onAccepted) {
+      try { await options.onAccepted(owner.memberId, item.id); }
+      catch { debug.log('absorb.accept', 'receipt-delivery-failed', { id: item.id, memberId: owner.memberId }); }
     }
-  }
-  const result = listAbsorbScraps(options.instanceRoot, owner.memberId).find((scrap) => scrap.id === item.id);
-  if (result?.absorb?.status === 'absorbed' || result?.absorb?.status === 'failed') await options.onSettled?.(owner.memberId, item.id);
-  return json(result ? { id: result.id, ...result.absorb } : { error: 'scrap-not-found' }, result?.absorb?.status === 'failed' ? HTTP_EXTRACTION_FAILED : HTTP_CREATED);
+    // The receipt hook can be slow; decide from the latest ledger while holding the same flight.
+    const current = listAbsorbScraps(options.instanceRoot, owner.memberId).find((candidate) => candidate.id === item.id);
+    if (!current?.absorb) return json({ error: 'scrap-not-found' }, 404);
+    if (current.absorb.status === 'absorbed' || (ingested.replayed && current.absorb.status === 'failed')) {
+      await options.onSettled?.(owner.memberId, item.id);
+      return json({ id: item.id, ...current.absorb }, current.absorb.status === 'failed' ? HTTP_EXTRACTION_FAILED : HTTP_OK);
+    }
+    return processClaimedScrap(item.id, current.absorb, options, ingested.replayed ? HTTP_OK : HTTP_CREATED);
+  });
 }

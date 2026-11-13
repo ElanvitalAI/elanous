@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decideGraphApproval, runGraph } from '../../src/graph-runner/runner.js';
+import { releaseGateCutoverPath } from '../../src/graph-runner/release-gate-cutover-policy.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -40,7 +41,9 @@ test('release HITL approval waits inside the live orchestration and continues th
           : node === 'publish' ? { tag: 'v9.9.9' } : {};
     return {
       exitCode: autoApproval ? 1 : 0,
-      stdout: JSON.stringify({ outcome: autoApproval ? 'fail' : 'ok', verdict: autoApproval ? 'fail' : 'pass', summary: node, ...fields }) + '\n',
+      // The cutover judge emits a route, not the generic command success outcome.
+      stdout: JSON.stringify({ outcome: autoApproval ? 'fail'
+        : body.includes('gate-cutover-switch-node.ts') ? releaseGateCutoverPath({}) : 'ok', verdict: autoApproval ? 'fail' : 'pass', summary: node, ...fields }) + '\n',
       stderr: '',
     };
   };
@@ -98,7 +101,7 @@ test('release HITL approval waits inside the live orchestration and continues th
     expect(done.runId).toBe(pending.runId);
     expect(done.path.slice(done.path.indexOf('approve-publish'))).toEqual([
       'approve-publish', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join',
-      'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'done',
+      'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done',
     ]);
     expect(events.filter((event) => event === `publish:${pending.runId}`)).toHaveLength(1);
     expect(events.indexOf('approval-pending')).toBeLessThan(events.findIndex((event) => event.startsWith(`answer:${pending.runId}:`)));
@@ -120,11 +123,13 @@ test('release HITL approval waits inside the live orchestration and continues th
       skippedNodeIds,
     };
     console.info(`[release-cut-measurement] ${JSON.stringify(cutMeasurement)}`);
-    expect(cutMeasurement.reused).toBe(13);
-    expect(skippedNodeIds).toHaveLength(13);
+    // The declared release graph now includes readiness, cloud lifecycle, reuse prep, and cutover.
+    expect(cutMeasurement.reused).toBe(19);
+    expect(skippedNodeIds).toHaveLength(19);
     expect(cutMeasurement.rerun).toBe(0);
     expect(skippedNodeIds).toEqual([
-      'version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate',
+      'version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join',
+      'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch',
       'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check',
     ]);
     expect(rerunNodeIds).toEqual([]);
