@@ -5200,6 +5200,24 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.15
+
+Source: https://docs.elanous.ai/releases/0-3-15/
+
+This release brings more of your work into one connected flow, from saving an article to acting on it in your own workspace.
+
+- Open a recommendation link using your member ID and continue in your own view.
+- Send an article to the Telegram bot to save it as a scrap and use it in later work.
+- Connect the Android companion app to your account and share content into Elanous.
+- Record a voice note and return to it alongside your other saved material.
+- Keep separate conversations and tools within reach using side tabs.
+
+## Known issues
+
+Some PWA flows may still be unreliable, and the full automated test sweep did not complete.
+
+---
+
 # 0.3.14
 
 Source: https://docs.elanous.ai/releases/0-3-14/
