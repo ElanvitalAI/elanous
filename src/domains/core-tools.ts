@@ -1,3 +1,4 @@
+import { firecrawlPluginSpec, runFirecrawl } from '../agent/firecrawl-plugin.js';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── L2 코어 앱 도구 레지스트리 (서피스·도메인 무관 · 2026-07-08) ───────────
 //
@@ -167,6 +168,7 @@ async function dispatchMemoryRecall(args: Record<string, unknown>, onPartial?: (
 
 /** L2 코어 앱 도구 dispatch 핸들러 — 이름 → 구현. 새 코어 도구는 여기 추가. */
 const CORE_TOOL_HANDLERS: Record<string, (args: Record<string, unknown>, onPartial?: (result: Record<string, unknown>) => void) => Promise<unknown>> = {
+  firecrawl: (args) => runFirecrawl(args),
   schedule_manage: dispatchScheduleManage,
   session_manage: (args) => dispatchSessionQuery(args), // 대화 세션 검색·열람·목록·삭제(내용/ID/텔레그램)
   memory_recall: dispatchMemoryRecall,
@@ -199,7 +201,7 @@ const SELF_RECALL_BUDGET_SPEC: LLMToolSpec = {
     },
   },
 };
-export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, MEMORY_SAVE_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, CONTEXT_NOW_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, PROACT_METER_SPEC];
+export const CORE_TOOL_SPECS: LLMToolSpec[] = [firecrawlPluginSpec(), SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, MEMORY_SAVE_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, CONTEXT_NOW_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, PROACT_METER_SPEC];
 
 export interface CoreTools {
   specs: LLMToolSpec[];
@@ -217,6 +219,7 @@ export function buildCoreTools(recallSearch?: RecallSearch): CoreTools {
     dispatch: async (name, args, onPartial, context) => {
       const h = CORE_TOOL_HANDLERS[name];
       if (!h && name !== 'release_change' && name !== 'ops_seats' && name !== 'decisions_pending' && name !== 'proact_meter') return { error: `unknown core tool: ${name}` };
+      if (name === 'firecrawl') return runFirecrawl(args, context);
       if (name === 'release_change') return dispatchReleaseChange(args, context);
       if (name === 'ops_seats') return dispatchOpsSeats(args, context);
       if (name === 'decisions_pending') return dispatchDecisionsPending(context);

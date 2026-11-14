@@ -18,7 +18,7 @@ contributes:
       parameters:
         type: object
         properties:
-          kind: { type: string, enum: [web, x, youtube, voice, video, photo, text] }
+          kind: { type: string, enum: [web, x, youtube, voice, video, photo, text, pdf] }
           text: { type: string }
           url: { type: string }
           mediaRef: { type: string }
@@ -87,10 +87,23 @@ graphs:
   - graph/absorb-suggest-list.yaml
   - graph/absorb-build.yaml
 graphProviders:
+  graph/absorb-ingest.yaml:
+    module: src/graph-runner/capability-providers/absorb-member-registry.ts
+    factory: createAbsorbIngestMemberRegistry
   graph/absorb-brief.yaml:
-    module: src/graph-runner/absorb-design-provider.ts
-    factory: createAbsorbDesignRegistry
+    module: src/graph-runner/capability-providers/absorb-member-registry.ts
+    factory: createAbsorbBriefMemberRegistry
+    defaultAsk: 오늘의 회원 스크랩을 근거로 브리핑과 세 줄 요구사항, 설계, 제안을 만들어줘
+  graph/absorb-suggest-list.yaml:
+    module: src/graph-runner/capability-providers/absorb-member-registry.ts
+    factory: createAbsorbReadMemberRegistry
+  graph/absorb-build.yaml:
+    module: src/graph-runner/capability-providers/absorb-member-registry.ts
+    factory: createAbsorbBuildMemberRegistry
 skills:
+  - id: absorb/docparse
+    path: skills/absorb/docparse/SKILL.md
+    sideEffects: none
   - id: absorb/card
     path: skills/absorb/card/SKILL.md
     sideEffects: none

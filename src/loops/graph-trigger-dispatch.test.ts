@@ -70,6 +70,25 @@ test('one event starts every exact {from,on} match and ignores nonmatching decla
   expect(listGraphRuns(f.root).runs.some(run => run.graphId === 'wrong-source' || run.graphId === 'wrong-event')).toBe(false);
 });
 
+test('duplicate declared target IDs refuse delivery before any target starts, then replay after repair', async () => {
+  const f = fixture();
+  writeTarget(f.graphs, 'target', 'source', 'demo.ready');
+  writeFileSync(join(f.graphs, 'duplicate.yaml'), readFileSync(join(f.graphs, 'target.yaml'), 'utf8'));
+  await runSource(f);
+
+  expect(listGraphRuns(f.root).runs.filter(run => run.graphId === 'target')).toHaveLength(0);
+  const sourceStatePath = join(f.root, 'graph-runs', 'source', 'source-run.json');
+  expect((JSON.parse(readFileSync(sourceStatePath, 'utf8')) as { pendingGraphEvents: GraphEvent[] }).pendingGraphEvents)
+    .toHaveLength(1);
+  await expect(dispatchGraphEventToDeclaredTargets(f.emitted[0]!, {
+    graphRoot: f.root, registryRoot: f.root, stateRoot: f.root,
+  })).rejects.toThrow('duplicate graph event target id: target');
+
+  rmSync(join(f.graphs, 'duplicate.yaml'));
+  await dispatchGraphEventToDeclaredTargets(f.emitted[0]!, { graphRoot: f.root, registryRoot: f.root, stateRoot: f.root });
+  expect(listGraphRuns(f.root).runs.filter(run => run.graphId === 'target')).toHaveLength(1);
+});
+
 test('custom events using lifecycle-like prefixes still route', async () => {
   for (const eventType of ['node-custom', 'release.custom']) {
     const f = fixture(eventType);

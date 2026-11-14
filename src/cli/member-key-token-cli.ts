@@ -29,7 +29,9 @@ export function issueToPrivateFile(path: string, issue: (deliver: (issued: Issue
 }
 
 export function registerMemberKeyTokenCommands(program: Command, tokenCommand: Command): void {
-  const key = program.command('member').description('Manage local Nexus member credentials').command('key');
+  const member = program.commands.find(command => command.name() === 'member')
+    ?? program.command('member').description('Manage local Nexus member credentials');
+  const key = member.command('key');
   key.command('create').requiredOption('--member-id <id>').requiredOption('--name <name>').requiredOption('--out <file>')
     .action((opts: { memberId: string; name: string; out: string }) => {
       const store = createMemberStore();

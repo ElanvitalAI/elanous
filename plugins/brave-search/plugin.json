@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "brave-search",
+  "version": "0.1.0",
+  "description": "Search public web sources from a graph using a Brave Search credential.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/brave-search.yaml"],
+      "graphProviders": {
+        "./graphs/brave-search.yaml": {
+          "module": "src/graph-runner/capability-providers/brave-search.ts",
+          "factory": "createBraveSearchRegistry"
+        }
+      },
+      "capabilities": ["search"],
+      "graphManifests": {
+        "brave-search": {
+          "purpose": "Search the public web for source-attributed results using Brave Search.",
+          "allow": { "recipes": [], "skills": [], "domainPacks": [] },
+          "hitl": [],
+          "observe": { "categories": ["graph.run", "graph.capability"] }
+        }
+      },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

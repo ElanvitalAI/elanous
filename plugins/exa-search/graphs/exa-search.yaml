@@ -1,0 +1,18 @@
+apiVersion: elanous.dev/graph/v2
+graph:
+  id: exa-search
+  version: 1.0.0
+  layer: flow
+  purpose: "Exa 제공자의 공개 웹 검색"
+entry: search
+nodes:
+  - id: search
+    type: capability
+    requires: search.web@1
+    with:
+      query: $input.query
+      limit: $input.limit?
+edges:
+  - { from: search, on: outcome, map: { done: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.capability] }

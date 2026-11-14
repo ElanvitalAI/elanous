@@ -43,6 +43,7 @@ function graphYamlFiles(directory: string): string[] {
 
 function declaredEventTargets(root: string): DeclaredEventTarget[] {
   const targets: DeclaredEventTarget[] = [];
+  const graphIds = new Map<string, string>();
   for (const graphPath of graphYamlFiles(join(root, 'graphs'))) {
     const documents = parseAllDocuments(readFileSync(graphPath, 'utf8'));
     for (const document of documents) {
@@ -61,6 +62,9 @@ function declaredEventTargets(root: string): DeclaredEventTarget[] {
           typeof declaration.from !== 'string' || !declaration.from.trim() ||
           typeof declaration.on !== 'string' || !declaration.on.trim())
         throw new Error(`invalid graph event trigger declaration: ${graphPath}`);
+      const previousPath = graphIds.get(graph.graph_id);
+      if (previousPath) throw new Error(`duplicate graph event target id: ${graph.graph_id} (${previousPath}, ${graphPath})`);
+      graphIds.set(graph.graph_id, graphPath);
       targets.push({ graphId: graph.graph_id, graphPath, from: declaration.from, on: declaration.on });
     }
   }

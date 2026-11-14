@@ -1,0 +1,28 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "exa-search",
+  "version": "0.1.0",
+  "description": "Search public web sources from a graph using the owner's Exa credential.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/exa-search.yaml"],
+      "graphProviders": {
+        "./graphs/exa-search.yaml": {
+          "module": "src/graph-runner/capability-providers/exa-search.ts",
+          "factory": "createExaSearchRegistry"
+        }
+      },
+      "capabilities": ["search"],
+      "graphManifests": {
+        "exa-search": {
+          "purpose": "Search the public web for source-attributed results using Exa.",
+          "allow": { "recipes": [], "skills": [], "domainPacks": [] },
+          "hitl": [],
+          "observe": { "categories": ["graph.run", "graph.capability"] }
+        }
+      },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

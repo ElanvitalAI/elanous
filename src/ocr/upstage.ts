@@ -24,6 +24,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join as joinPath } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { getSecret, getSecretAsync } from '../nexus/config/secrets/index.js';
 
 import { OcrProvider, ocrFailure } from './provider.js';
 import type {
@@ -32,8 +33,19 @@ import type {
   OcrResult,
 } from './types.js';
 
-const UPSTAGE_SYNC_URL = 'https://api.upstage.ai/v1/document-digitization';
-const UPSTAGE_ASYNC_URL = 'https://api.upstage.ai/v1/document-digitization/async';
+const UPSTAGE_BASE_URL = 'https://api.upstage.ai/v1';
+
+/** The URL override is deliberately unavailable outside an isolated test run. */
+export function upstageBaseUrl(): string {
+  if (process.env.NODE_ENV !== 'test') return UPSTAGE_BASE_URL;
+  const override = process.env.UPSTAGE_BASE_URL;
+  if (!override) return UPSTAGE_BASE_URL;
+  const url = new URL(override);
+  if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.protocol !== 'http:' ||
+    url.username || url.password || url.search || url.hash || url.pathname.replace(/\/$/, '') !== '/v1')
+    throw new Error('UPSTAGE_BASE_URL must be a loopback HTTP /v1 test server');
+  return `${url.origin}/v1`;
+}
 
 /** Upstage 2026 model surface (verified 2026-05 via console docs +
  *  https://upstage.ai/pricing/api):
@@ -135,13 +147,18 @@ export interface UpstageOcrOpts {
 }
 
 /** Resolve the Upstage API key from (in order):
- *  1. `UPSTAGE_API_KEY` env
- *  2. `~/.cache/upstage_api_key` plain-text file
- *  3. Re-source `~/.zshrc` and `printenv UPSTAGE_API_KEY` (handles
+ *  1. canonical shared slot `cred:upstage.api_key`
+ *  2. legacy `UPSTAGE_API_KEY` env
+ *  3. legacy `~/.cache/upstage_api_key` plain-text file
+ *  4. Re-source `~/.zshrc` and `printenv UPSTAGE_API_KEY` (handles
  *     the case where the daemon was launched without the user's
  *     interactive shell env)
  *  Returns null when not found anywhere. */
 export function resolveUpstageApiKey(): string | null {
+  try {
+    const slotKey = getSecret('cred:upstage.api_key')?.trim();
+    if (slotKey) return slotKey;
+  } catch { /* non-sync secret backend: legacy read-only sources remain available */ }
   const envKey = (process.env.UPSTAGE_API_KEY ?? '').trim();
   if (envKey) return envKey;
 
@@ -171,6 +188,15 @@ export function resolveUpstageApiKey(): string | null {
   return null;
 }
 
+/** Async callers can read a non-file secret backend before legacy sources. */
+export async function resolveUpstageApiKeyAsync(): Promise<string | null> {
+  try {
+    const slotKey = (await getSecretAsync('cred:upstage.api_key'))?.trim();
+    if (slotKey) return slotKey;
+  } catch { /* preserve legacy read compatibility */ }
+  return resolveUpstageApiKey();
+}
+
 function toBlob(file: Buffer | Uint8Array | Blob, mimeType: string): Blob {
   if (typeof Blob !== 'undefined' && file instanceof Blob) return file;
   // Buffer / Uint8Array → Blob
@@ -182,12 +208,12 @@ function toBlob(file: Buffer | Uint8Array | Blob, mimeType: string): Blob {
  *  result). */
 export async function runUpstageOcr(opts: UpstageOcrOpts): Promise<UpstageOcrResult> {
   const apiKey = opts.apiKey
-    ?? (opts.resolveApiKey ?? resolveUpstageApiKey)();
+    ?? (opts.resolveApiKey ? opts.resolveApiKey() : await resolveUpstageApiKeyAsync());
   if (!apiKey) {
     return {
       ok: false,
       stage: 'auth',
-      message: 'UPSTAGE_API_KEY not found in env, ~/.cache/upstage_api_key, or zsh login env',
+      message: 'Upstage 키 필요 · `eln setup upstage`',
     };
   }
 
@@ -195,7 +221,7 @@ export async function runUpstageOcr(opts: UpstageOcrOpts): Promise<UpstageOcrRes
   const model = opts.model ?? DEFAULT_MODEL;
   const mimeType = opts.mimeType ?? 'application/octet-stream';
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const url = opts.useAsync ? UPSTAGE_ASYNC_URL : UPSTAGE_SYNC_URL;
+  const url = `${upstageBaseUrl()}/document-digitization${opts.useAsync ? '/async' : ''}`;
 
   const form = new FormData();
   form.append('model', model);
@@ -224,6 +250,7 @@ export async function runUpstageOcr(opts: UpstageOcrOpts): Promise<UpstageOcrRes
   try {
     res = await fetchFn(url, {
       method: 'POST',
+      redirect: 'error',
       headers: {
         Authorization: `Bearer ${apiKey}`,
         // Don't set Content-Type — fetch + FormData computes the
@@ -234,35 +261,34 @@ export async function runUpstageOcr(opts: UpstageOcrOpts): Promise<UpstageOcrRes
       body: form,
       signal: ctrl.signal,
     });
-  } catch (e) {
+  } catch {
     clearTimeout(timer);
     return {
       ok: false,
       stage: 'network',
-      message: (e as Error).message ?? String(e),
+      message: 'Upstage OCR network request failed',
     };
   }
   clearTimeout(timer);
 
   if (!res.ok) {
-    let detail = '';
-    try { detail = (await res.text()).slice(0, 400); } catch { /* */ }
+    void res.body?.cancel().catch(() => {});
     return {
       ok: false,
       stage: 'http',
       status: res.status,
-      message: `Upstage OCR HTTP ${res.status}${detail ? `: ${detail}` : ''}`,
+      message: `Upstage OCR HTTP ${res.status}`,
     };
   }
 
   let payload: Record<string, unknown>;
   try {
     payload = (await res.json()) as Record<string, unknown>;
-  } catch (e) {
+  } catch {
     return {
       ok: false,
       stage: 'parse',
-      message: `Upstage OCR returned non-JSON: ${(e as Error).message}`,
+      message: 'Upstage OCR returned invalid JSON',
     };
   }
 
@@ -328,9 +354,9 @@ export class UpstageProvider extends OcrProvider {
     super();
   }
 
-  isAvailable(): boolean {
-    const resolver = this.providerOpts.resolveApiKey ?? resolveUpstageApiKey;
-    return resolver() !== null;
+  isAvailable(): boolean | Promise<boolean> {
+    if (this.providerOpts.resolveApiKey) return this.providerOpts.resolveApiKey() !== null;
+    return resolveUpstageApiKeyAsync().then((key) => key !== null);
   }
 
   async run(input: OcrInput): Promise<OcrResult> {

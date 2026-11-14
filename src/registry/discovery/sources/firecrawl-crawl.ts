@@ -31,7 +31,7 @@
 //   src/storage/s3.ts (availability-probe precedent)
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { getFirecrawlConfig } from '../config.js';
+import { getFirecrawlConfigAsync } from '../config.js';
 import {
   extractCrawlJson,
   GROK_CRAWL_PROVIDERS,
@@ -477,14 +477,18 @@ export const firecrawlCrawlSource = {
     if (opts.signal?.aborted) {
       return cancelledResult(now, startedAt);
     }
-    const { apiKey } = getFirecrawlConfig();
+    let apiKey: string;
+    try { ({ apiKey } = await getFirecrawlConfigAsync()); }
+    catch {
+      return { source: 'firecrawl-crawl', ok: false, models: [], durationMs: now() - startedAt, error: 'Firecrawl secret store unavailable' };
+    }
     if (!apiKey) {
       return {
         source: 'firecrawl-crawl',
         ok: false,
         models: [],
         durationMs: now() - startedAt,
-        error: 'missing-api-key: registry.discovery.firecrawl.apiKey unset',
+        error: 'missing-api-key: run elanous setup firecrawl',
       };
     }
     if (opts.signal?.aborted) {

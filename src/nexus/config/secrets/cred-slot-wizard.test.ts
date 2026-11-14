@@ -11,6 +11,7 @@ import { currentBackendId, getSecretAsync, useBackend } from './index.js';
 test('wizard plans catalogued canonical slots, excluding optional market account fields', () => {
   expect(credentialSlotWizardPlan('toss')?.slots).toEqual(['cred:toss.client_id', 'cred:toss.client_secret']);
   expect(credentialSlotWizardPlan('kis')?.slots).toEqual(['cred:kis.app_key', 'cred:kis.app_secret']);
+  expect(credentialSlotWizardPlan('firecrawl')?.slots).toEqual(['cred:firecrawl.api_key']);
   expect(credentialSlotWizardPlan('eodhd')?.slots).toEqual(['cred:eodhd.api_key']);
   expect(credentialSlotWizardPlan('twelvedata')?.slots).toEqual(['cred:twelvedata.api_key']);
   expect(credentialSlotWizardPlan('fds')?.slots).toEqual(['cred:fds.api_key']);
@@ -29,7 +30,7 @@ test('wizard simulation prompts for every field and writes one batch, returning 
     prompt: async (name) => { prompted.push(name); return values.shift(); },
     saveBatch: async (batch) => { writes.push({ ...batch }); },
   });
-  expect(prompted).toEqual(plan.slots);
+  expect(prompted).toEqual([...plan.slots]);
   expect(writes).toEqual([{ 'cred:toss.client_id': 'simulated-private-id', 'cred:toss.client_secret': 'simulated-private-secret' }]);
   expect(result).toEqual({ service: 'toss', slots: plan.slots });
   expect(JSON.stringify(result)).not.toContain('simulated-private');

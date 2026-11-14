@@ -260,6 +260,17 @@ export async function runArgSupervisorTick(request: ArgSupervisorTickRequest): P
     throw new Error(`RLA incident claim denied: ${incidentClaim.reason}`);
   const activeClaim = incidentClaim.claim;
   await assertIncidentClaim(activeClaim.claimToken);
+  // Journal the ownership handoff (§2.6 상신 기록) as its own ledger record so lease acquisition
+  // and escalation stay distinct from the effect records (§2.6 적용 기록) that advance graphRevision.
+  await runWithIncidentClaim(activeClaim.claimToken, () => {
+    mkdirSync(dirname(ledgerPath), { recursive: true });
+    appendFileSync(ledgerPath, JSON.stringify({ supervisorId: identity, targetGraphId: request.targetGraphId,
+      targetRunId: request.targetRunId, gateEventId: request.gateEventId, verb: 'claim',
+      outcome: incidentClaim.disposition, evidence: incidentClaim.disposition === 'escalated'
+        ? 'incident claim escalated to this owner after the prior lease expired'
+        : 'incident claim granted to the first owner in the incident order',
+      beforeRevision: revision, graphRevision: revision }) + '\n');
+  });
   const finalizeGraphRun = async (completedRun: GraphRunState): Promise<void> => {
     if (terminalFailure || durabilityUnknown) throw terminalFailure ??
       new Error('ARG rollback persistence failed; durable graphRevision is unknown');

@@ -1,0 +1,22 @@
+graph_id: verb-execute
+version: 1
+entry_node: execute
+terminal_nodes: [done, rework, needs-human, failed]
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence, undo]
+  exits: [done, rework, needs-human, failed]
+nodes:
+  - node_id: execute
+    kind: agent
+    recipe: 'handler:ta-execute'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: none, outputs: [outcome, result, evidence, undo] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence, undo] } }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence, undo] } }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence, undo] } }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence, undo] } }
+edges:
+  - from: execute
+    on: outcome
+    map: { done: done, rework: rework, needs-human: needs-human, failed: failed }

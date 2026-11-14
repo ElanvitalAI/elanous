@@ -382,6 +382,7 @@ const SESSION_TOOL_FAMILY_RULES: SessionToolFamilyRule[] = [
       'session_manage',
       'schedule_manage',
       'fact_check',
+      'firecrawl',
       'se_build', // SE 격리 빌드 관측(B2 · #3990) — 빌드 안 뭐 하나·로그 tail·worktree diff
     ],
     match: (text) => hasAny(text, [

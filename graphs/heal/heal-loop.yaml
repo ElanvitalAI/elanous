@@ -163,3 +163,15 @@ edges:
   - from: ground-external
     on: outcome
     map: { ok: triage, empty: triage }
+
+# 🔎 선언된 수리 어휘(GRAPH-HEAL-EVIDENCE-FU · #37716) — heal_edges 는 plugin.json 의 edgeVocabulary 안에서만 집행된다.
+#    collect 가 스스로 부서질 때(결과 fail/error) 갈래가 없어 «조용히 run-failed» 되던 구멍을 막는다:
+#    observe-deeper 의 fail/error 와 같은 원칙으로 사람 관측 승인(observe-deeper-human)에 올린다.
+#    수리 영수증·상한 소진이 성공으로 승격되지 않는 완주 판은 src/graph-runner/declared-heal-edges.test.ts 의
+#    GRAPH-HEAL-EVIDENCE-FU 가짜 세계에서 증명한다(heal: 분류→수리, detour: 영수증 게이트→독립 재검증, escalate: 사람).
+heal_edges:
+  - kind: escalate
+    from: collect
+    on: [fail, error]
+    to: observe-deeper-human
+    evidence: [failure-signature]

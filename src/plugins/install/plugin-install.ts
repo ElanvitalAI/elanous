@@ -22,6 +22,7 @@ const HASH = /^[a-fA-F0-9]{64}$/;
 /** Curated scene packages offered by the default install group. Service-key
  *  declarations live in each package manifest and use the shared key catalog. */
 export const DEFAULT_PLUGIN_GROUP = [
+  { id: 'firecrawl', label: '웹사이트 크롤링', requiredServiceKeys: ['firecrawl'], optionalServiceKeys: [], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
   { id: 'demo-research', label: '리서치', requiredServiceKeys: [], optionalServiceKeys: ['exa', 'firecrawl', 'xai', 'tavily'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
   { id: 'demo-linear-secretary', label: '리니어 비서', requiredServiceKeys: ['linear'], optionalServiceKeys: ['telegram', 'telegram-chat'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
   { id: 'demo-absorption-briefing', label: '흡수 브리핑', requiredServiceKeys: [], optionalServiceKeys: ['exa', 'firecrawl', 'xai', 'telegram', 'telegram-chat', 'linear'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
@@ -30,9 +31,9 @@ export const DEFAULT_PLUGIN_GROUP = [
   { id: 'demo-plugin-wizard', label: '플러그인 마법사', requiredServiceKeys: [], optionalServiceKeys: [], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: ['claude-cli', 'github-cli'] },
 ] as const;
 
-/** Packages used by the 11-14 six-scene walkthrough, in dependency order. */
+/** Packages used by first-run onboarding and the 11-14 walkthrough, in dependency order. */
 export const DEMO1114_PLUGIN_IDS = [
-  'architecture-deliverables', 'elanous-app-deploy', 'absorb',
+  'firecrawl', 'architecture-deliverables', 'elanous-app-deploy', 'absorb',
   'demo-absorption-briefing', 'demo-brief-to-requirements', 'gcp-architect-expand',
 ] as const;
 
@@ -134,7 +135,7 @@ export async function installDemo1114PluginGroup(opts: InstallOptions = {}): Pro
           if (!samePackTree(existing.path, expected)) fail('scan', `bundled plugin package differs: ${id}`);
         } finally { rmSync(expectedRoot, { recursive: true, force: true }); }
       }
-      // These six bundled first-party packages are part of the selected first-run product.
+      // These bundled first-party packages are part of the selected first-run product.
       // Their declared capabilities remain subject to the static security scan.
       installed.push(existing ?? await installPlugin(source, {
         ...opts, root, yes: opts.yes ?? true, deferRuntimePreparation: true,

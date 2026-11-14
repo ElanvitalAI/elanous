@@ -1,0 +1,90 @@
+{
+  "id": "firecrawl",
+  "name": "Firecrawl",
+  "version": "0.3.17",
+  "description": "Scrape a page or crawl a public website in one tool call.",
+  "activationEvents": [
+    "onRoute"
+  ],
+  "contributes": {
+    "connectors": [
+      {
+        "id": "firecrawl",
+        "required": true,
+        "fields": [
+          {
+            "name": "apiKey",
+            "secret": true,
+            "env": "FIRECRAWL_API_KEY",
+            "secretRef": "cred:firecrawl.api_key"
+          }
+        ]
+      }
+    ],
+    "skills": [
+      {
+        "id": "firecrawl",
+        "name": "Firecrawl",
+        "path": "./skills/firecrawl/SKILL.md"
+      }
+    ],
+    "aiTools": [
+      {
+        "name": "firecrawl",
+        "description": "For a specific website URL, scrape its page or crawl the site with Firecrawl in one call. No external CLI needed. Without a key, run elanous setup firecrawl.",
+        "handler": "native:firecrawl",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "scrape",
+                "crawl"
+              ],
+              "default": "crawl"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 10
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        },
+        "route": {
+          "triggers": [
+            "이 사이트 크롤링",
+            "사이트 크롤링",
+            "크롤링해줘",
+            "스크랩해줘",
+            "crawl website",
+            "scrape url"
+          ],
+          "examples": [
+            "https://example.com 이 사이트 크롤링해줘"
+          ],
+          "sideEffects": "read-only",
+          "risk": "low",
+          "cost": "spends-cloud",
+          "requiresConfirm": false
+        }
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "network:fetch",
+      "hosts": [
+        "api.firecrawl.dev"
+      ]
+    }
+  ]
+}

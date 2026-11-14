@@ -61,6 +61,8 @@ export interface GraphRunState {
   /** Hash of the graph and recipes used for this run; required to safely restart a failed path. */
   sourceHash?: string;
   graphSnapshot?: { graphSha: string; recipesSha: string };
+  /** Direct child units resolved when this run began; resume must use the same definitions. */
+  unitPins?: Record<string, { unit: string; version: number; path: string; hash: string; shapeHash?: string }>;
   /** v2 extension data retained in the run ledger; graphHash binds it to the lowered IR. */
   graphExtensionLedger?: { graphHash: string; ext: GraphV2ExtensionLedger };
   graphPath?: string;
@@ -117,6 +119,9 @@ export interface GraphRunState {
   /** The declared edge selected for each completed source visit. */
   healTransitions?: Array<{ edgeRef: string; kind: string; from: string; visit: number; to: string }>;
   resume?: { from: string; visitId?: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current'; budgetReset?: { reason: string; at: string; priorExecuted: number; resumedPrefixExecuted: number; priorUnitCalls: number; resumedPrefixUnitCalls: number } };
+  /** GRAPH-RECIPE-PIN-FU — resume refusals from graph/recipes edition drift,
+   *  recorded in the run ledger before any node effect executes. */
+  sourcePinRefusals?: Array<{ at: string; reason: string; graphSha: string; recipesSha: string; pinnedGraphSha: string; pinnedRecipesSha: string }>;
   /** GATE-HOST-EXECUTOR — every explicit input change a resume made (what was set and what it replaced), oldest first. */
   inputOverrides?: Array<GateExecutorOverride | GatePodPoolOverride | GateShardRerouteOverride>;
   executed: number;
@@ -128,6 +133,8 @@ export interface GraphRunOptions {
   /** Event envelope clock for deterministic simulation; defaults to the wall clock. */
   eventNow?: () => Date;
   input?: unknown;
+  /** Authenticated owner from the host route; graph input cannot establish this identity. */
+  verifiedOwnerId?: string;
   /** Merge a small compatibility repair into the saved input while holding the run's resume lock. */
   resumeInputPatch?: Record<string, unknown>;
   /** Abort an active graph command and stop before dispatching the next node. */

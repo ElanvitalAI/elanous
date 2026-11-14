@@ -280,7 +280,7 @@ export function createJsonlMemberEventStore(directory: string): MemberEventStore
   };
 }
 
-function storeEventsProvider(store: MemberEventStore): GraphCapabilityProviderDeclaration {
+export function storeEventsProvider(store: MemberEventStore): GraphCapabilityProviderDeclaration {
   return {
     id: 'nexus-jsonl-event-store',
     provides: ['store.events@1'],

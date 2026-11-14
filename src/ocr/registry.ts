@@ -58,7 +58,9 @@ export class OcrRegistry {
   async pick(requirements: OcrRequirements = {}): Promise<PickResult | null> {
     const ranking: { provider: OcrProvider; score: number }[] = [];
     for (const p of this.providers.values()) {
-      const available = await p.isAvailable();
+      let available: boolean;
+      try { available = await p.isAvailable(); }
+      catch { continue; } // One failed credential backend must not hide other OCR providers.
       if (!available) continue;
       const score = p.matchScore(requirements);
       if (score === null) continue;  // hard-filtered

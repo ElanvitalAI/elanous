@@ -8,6 +8,27 @@ import { registerGcpScene5FakeProvider } from '../ux-sim/gcp-architect-expand/sc
 import { buildCliAgentTools } from './agent-cli.js';
 import { registerToolRuntime, unregisterToolRuntime } from '../tool-runtime/registry.js';
 
+test('default child route supplies the declared document provider and verified owner to the actual graph', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'child-graph-deps-'));
+  const priorState = process.env.ELANOUS_STATE_DIR;
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'member-kcb' }, graphDeps: { root } });
+    const response = await bridge.dispatchPluginTool('scrap_add', { kind: 'text', text: 'KCB receipt' });
+    expect(response).toMatchObject({ ok: true, result: { graphId: 'absorb-ingest', status: 'done' } });
+    if (!response.ok) throw new Error(response.error);
+    const state = response.result as { runId: string; path: string[] };
+    // The default manifest composes document parsing with the authenticated member store.
+    expect(state.path).toContain('save');
+    const ledger = JSON.parse(readFileSync(join(root, 'graph-runs', 'absorb-ingest', `${state.runId}.json`), 'utf8'));
+    expect(ledger.input.context.memberId).toBe('member-kcb');
+  } finally {
+    if (priorState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorState;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('default Scene 5 route consumes the actual paused Graph visit and records N before spending', async () => {
   const root = mkdtempSync(join(tmpdir(), 'scene5-route-graph-'));
   try {

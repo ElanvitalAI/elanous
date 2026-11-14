@@ -237,7 +237,7 @@ test('next TUI test world completes scene 1 scrap route with a verified mock Nex
   }
 }, 120_000);
 
-test('next TUI test world carries briefing and suggestion approval through y', async () => {
+test('next TUI private host session carries briefing and suggestion approval through y', async () => {
   const keptRoot = process.env.ELANOUS_PLUGIN_DISPATCH_LIVE_OUT?.trim();
   if (keptRoot) mkdirSync(resolve(keptRoot), { recursive: true });
   const root = keptRoot ? mkdtempSync(join(resolve(keptRoot), 'scene2-3-')) : mkdtempSync(join(tmpdir(), 'next-scene2-3-'));
@@ -249,7 +249,9 @@ test('next TUI test world carries briefing and suggestion approval through y', a
     }
     return Response.json({ memberId: 'member-next-demo' });
   } });
-  writeFileSync(join(root, 'next-member-session.test.json'), JSON.stringify({ nexusUrl: `http://127.0.0.1:${nexus.port}`, sessionToken: token }));
+  // Use the real private host envelope, not the test-only owner override.
+  writeFileSync(join(root, 'member-session.json'), JSON.stringify({ nexusUrl: `http://127.0.0.1:${nexus.port}`, sessionToken: token,
+    expiresAt: new Date(Date.now() + 60_000).toISOString() }), { mode: 0o600 }); // Source: next-tui-scene6-cli-member-board fixture's one-turn session lifetime.
   writeFileSync(join(root, 'next-graph-results.test.json'), JSON.stringify({
     'absorb-brief': { graphId: 'absorb-brief', status: 'done', result: { briefing: { id: 'brief-kcb-ticket-1',
       topics: [{ summary: '접속 폭주·예매 실패', sourceScrapIds: ['scrap-kcb-article-1'] }] } } },

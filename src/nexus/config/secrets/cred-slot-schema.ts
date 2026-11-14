@@ -1,7 +1,11 @@
 /** Canonical shared credential slots consumed by Nexus app actions. */
 export const CREDENTIAL_SLOT_DEFINITIONS = [
+  { service: 'firecrawl', label: 'Firecrawl', fields: ['api_key'], setupUrl: 'https://www.firecrawl.dev/app/api-keys' },
+  { service: 'exa', label: 'Exa', fields: ['api_key'], setupUrl: 'https://dashboard.exa.ai/' },
+  { service: 'brave', label: 'Brave Search', fields: ['api_key'], setupUrl: 'https://api-dashboard.search.brave.com/' },
   { service: 'openai', label: 'OpenAI', fields: ['api_key'], setupUrl: 'https://platform.openai.com/api-keys' },
   { service: 'openrouter', label: 'OpenRouter', fields: ['api_key'], setupUrl: 'https://openrouter.ai/keys' },
+  { service: 'upstage', label: 'Upstage', fields: ['api_key'], setupUrl: 'https://console.upstage.ai/api-keys' },
   { service: 'elevenlabs', label: 'ElevenLabs', fields: ['api_key'], setupUrl: 'https://elevenlabs.io/app/settings/api-keys' },
   { service: 'higgsfield', label: 'Higgsfield', fields: ['key_id', 'secret'], setupUrl: 'https://console.higgsfield.ai/' },
   { service: 'eodhd', label: 'EODHD', fields: ['api_key'], setupUrl: 'https://eodhd.com/register' },

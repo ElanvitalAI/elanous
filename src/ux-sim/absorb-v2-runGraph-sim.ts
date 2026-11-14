@@ -16,6 +16,7 @@ import {
 } from '../graph-runner/capabilities.js';
 import type { InProcessHandlerResult } from '../graph-runner/in-process-registry.js';
 import { registerAbsorbDesignGuards } from '../graph-runner/absorb-design-provider.js';
+import { createDocumentParseProvider } from '../graph-runner/capability-providers/document-parse.js';
 import { decideGraphApproval, runGraph, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
 import { createFakeAppHost, type FakeAppHost } from './fake-app-host.js';
 import { withSimClock } from './fake-clock.js';
@@ -42,7 +43,7 @@ function declaredHitlNodeIds(graphFile: string): string[] {
   return Array.isArray(policy.hitl) ? policy.hitl.map(text) : [];
 }
 
-type AbsorbContractId = 'store.read@1' | 'store.write@1' | 'store.events@1' | 'extract.item@1' | 'notify.channel@1' | 'app-publish.action@1';
+type AbsorbContractId = 'store.read@1' | 'store.write@1' | 'store.events@1' | 'extract.item@1' | 'notify.channel@1' | 'app-publish.action@1' | 'absorb.document-parse@1';
 type AbsorbSimulationProviders = Partial<Record<AbsorbContractId, GraphCapabilityProvider>>;
 
 const ABSORB_SIMULATION_CONTRACTS: readonly GraphCapabilityContract[] = [
@@ -50,6 +51,7 @@ const ABSORB_SIMULATION_CONTRACTS: readonly GraphCapabilityContract[] = [
   { id: 'store.write@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'store.events@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'extract.item@1', input: { type: 'object' }, output: { type: 'object' } },
+  { id: 'absorb.document-parse@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'notify.channel@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'app-publish.action@1', input: { type: 'object' }, output: { type: 'object' } },
 ];
@@ -149,6 +151,7 @@ export async function runAbsorbStoreRouteSimulation(): Promise<Row> {
     'store.read@1': storeProvider,
     'store.write@1': storeProvider,
     'extract.item@1': extractProvider,
+    'absorb.document-parse@1': createDocumentParseProvider({ apiKey: '' }),
   });
   const run = (graphFile: string, runId: string, input: Row) => runGraph(resolve(join(import.meta.dir, '../../plugins/absorb/graph', graphFile)),
     { runId, quiet: true, input, deps: { root: join(root, runId), capabilityProviders: providers } } as unknown as GraphRunOptions);
@@ -667,6 +670,7 @@ export async function runAbsorbGraphSimulation(options: {
     'store.write@1': storeProvider,
     'store.events@1': boardEventProvider,
     'extract.item@1': extractProvider,
+    'absorb.document-parse@1': createDocumentParseProvider({ apiKey: '' }),
     'notify.channel@1': notifyProvider,
     'app-publish.action@1': appPublishProvider,
   });

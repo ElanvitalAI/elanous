@@ -1,0 +1,31 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "upstage-embeddings",
+  "version": "0.1.0",
+  "description": "Consent-gated Solar Embedding 2 query and passage embeddings through the shared Upstage credential.",
+  "contributes": {
+    "skills": [{ "id": "upstage-embeddings", "name": "Upstage Embeddings", "path": "./skills/embeddings/SKILL.md" }]
+  },
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/embeddings.yaml"],
+      "graphProviders": {
+        "./graphs/embeddings.yaml": {
+          "module": "src/graph-runner/capability-providers/upstage-embeddings.ts",
+          "factory": "createUpstageEmbeddingsRegistry"
+        }
+      },
+      "capabilities": ["upstage"],
+      "graphManifests": {
+        "upstage-embeddings": {
+          "purpose": "Embed consented query or passage text for knowledge-pack and scrap retrieval.",
+          "allow": { "recipes": [], "skills": [], "domainPacks": [] },
+          "hitl": [],
+          "observe": { "categories": ["graph.run", "graph.capability"] }
+        }
+      },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

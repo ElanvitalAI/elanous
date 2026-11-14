@@ -161,8 +161,9 @@ describe('runUpstageOcr · fetch contract (mocked)', () => {
   });
 
   test('http error surfaces stage=http with status', async () => {
+    const sensitive = 'synthetic-private-value';
     const fakeFetch = asFetch(async () => new Response(
-      'rate limited',
+      `rate limited ${sensitive}`,
       { status: 429, headers: { 'content-type': 'text/plain' } },
     ));
     const res = await runUpstageOcr({
@@ -175,13 +176,15 @@ describe('runUpstageOcr · fetch contract (mocked)', () => {
     if (!res.ok) {
       expect(res.stage).toBe('http');
       expect(res.status).toBe(429);
-      expect(res.message).toContain('rate limited');
+      expect(res.message).toBe('Upstage OCR HTTP 429');
+      expect(JSON.stringify(res)).not.toContain(sensitive);
     }
   });
 
   test('network failure surfaces stage=network', async () => {
+    const sensitive = 'synthetic-private-value';
     const fakeFetch = asFetch(async () => {
-      throw new TypeError('connection refused');
+      throw new TypeError(`connection refused ${sensitive}`);
     });
     const res = await runUpstageOcr({
       file: new Uint8Array([0]),
@@ -192,13 +195,15 @@ describe('runUpstageOcr · fetch contract (mocked)', () => {
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.stage).toBe('network');
-      expect(res.message).toContain('connection refused');
+      expect(res.message).toBe('Upstage OCR network request failed');
+      expect(JSON.stringify(res)).not.toContain(sensitive);
     }
   });
 
   test('non-JSON response surfaces stage=parse', async () => {
+    const sensitive = 'synthetic-private-value';
     const fakeFetch = asFetch(async () => new Response(
-      'not json{',
+      `not json{ ${sensitive}`,
       { status: 200, headers: { 'content-type': 'application/json' } },
     ));
     const res = await runUpstageOcr({
@@ -208,7 +213,11 @@ describe('runUpstageOcr · fetch contract (mocked)', () => {
       fetchImpl: fakeFetch,
     });
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.stage).toBe('parse');
+    if (!res.ok) {
+      expect(res.stage).toBe('parse');
+      expect(res.message).toBe('Upstage OCR returned invalid JSON');
+      expect(JSON.stringify(res)).not.toContain(sensitive);
+    }
   });
 
   test('default model + override', async () => {

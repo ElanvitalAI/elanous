@@ -24,7 +24,7 @@ class StubProvider extends OcrProvider {
     public readonly capabilities: OcrCapabilities,
     private readonly available = true,
   ) { super(); }
-  isAvailable(): boolean { return this.available; }
+  isAvailable(): boolean | Promise<boolean> { return this.available; }
   async run(_input: OcrInput): Promise<OcrResult> {
     return {
       ok: true, provider: this.name,
@@ -99,6 +99,28 @@ describe('OcrProvider.matchScore · capability scoring', () => {
 });
 
 describe('OcrRegistry.pick · availability gating + ranking', () => {
+  test('awaits Promise true/false and skips a rejecting provider before choosing fallback', async () => {
+    class AsyncProvider extends StubProvider {
+      constructor(name: string, private readonly availability: () => Promise<boolean>) {
+        super(name, baseCaps({ outputs: ['markdown'] }));
+      }
+      override isAvailable(): Promise<boolean> { return this.availability(); }
+    }
+    const reg = new OcrRegistry();
+    reg.register(new AsyncProvider('async-true', async () => true));
+    reg.register(new AsyncProvider('async-false', async () => false));
+    reg.register(new AsyncProvider('async-reject', async () => { throw new Error('synthetic backend detail'); }));
+    reg.register(new StubProvider('fallback', baseCaps({ outputs: ['markdown'] })));
+    const picked = await reg.pick({ outputs: ['markdown'] });
+    expect(picked?.provider.name).toBe('async-true');
+    expect(picked?.ranking.map(row => row.provider.name)).toEqual(['async-true', 'fallback']);
+
+    const rejectedFirst = new OcrRegistry();
+    rejectedFirst.register(new AsyncProvider('async-reject', async () => { throw new Error('synthetic backend detail'); }));
+    rejectedFirst.register(new StubProvider('fallback', baseCaps({ outputs: ['markdown'] })));
+    expect((await rejectedFirst.pick({ outputs: ['markdown'] }))?.provider.name).toBe('fallback');
+  });
+
   test('empty registry returns null', async () => {
     const reg = new OcrRegistry();
     expect(await reg.pick()).toBeNull();

@@ -13,7 +13,7 @@ import { createTuiDeployConfirmChannel, type TuiDeployApproval } from './runtime
 import type { InlineChoiceBroker } from '../tui/inline-choice.js';
 import type { GraphRunOptions } from '../graph-runner/runner.js';
 
-const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy']);
+const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:firecrawl', 'native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy']);
 const NON_EXECUTABLE_NATIVE_HANDLERS = new Set(['native:release_graph_start']);
 
 /** Preserve the originating ACP ask when present; otherwise confirm in the TUI itself. */
@@ -100,6 +100,7 @@ export async function dispatchVerifiedDashboardGraph(
   const graphStartedAt = typeof inputContext.startedAt === 'string' ? inputContext.startedAt : new Date().toISOString();
   return runGraph(graphFile, {
     ...runOptions,
+    verifiedOwnerId: memberId,
     runId: graphRunId,
     input: { ...args, ...(needsAsk ? { ask } : {}), context: { ...inputContext, memberId, runId: graphRunId, startedAt: graphStartedAt } },
     quiet: true,
@@ -118,7 +119,8 @@ export function createDashboardGraphRouteDispatcher(
       const approved = await requestGraphApproval?.(state.pending.message) ?? false;
       decideGraphApproval(state.graphId, state.runId, approved ? 'approved' : 'rejected', 'classic-tui', runOptions.deps?.root);
       const { runId: _runId, resumeRunId: _resumeRunId, resumeGraphId: _resumeGraphId, ...resumeOptions } = runOptions;
-      state = await runGraph(graphFile, { ...resumeOptions, resumeRunId: state.runId, resumeGraphId: state.graphId });
+      state = await runGraph(graphFile, { ...resumeOptions, verifiedOwnerId: context?.verifiedOwner?.id,
+        resumeRunId: state.runId, resumeGraphId: state.graphId });
     }
     return state;
   };

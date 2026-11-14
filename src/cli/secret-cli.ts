@@ -21,6 +21,8 @@ import { SECRETS_VERSION } from '../nexus/config/types.js';
 import { parseSecretEnvFile, renderSecretEnvExports } from '../nexus/config/secrets/env-import.js';
 import { registerCredCommands } from './cred-cli.js';
 import { registerCredentialsMigrationCommands } from './credentials-migration-cli.js';
+import { registerSealedMoveCommand } from './credentials-migration-sealed-move.js';
+import { registerSecretBackupCommands } from './secret-backup-cli.js';
 import { appSecretId, appSecretIdForExistingApp } from '../nexus/config/secrets/app-secret-ledger.js';
 import type { SecretBackendId } from '../nexus/config/secrets/types.js';
 import { revokeAppSecretValues, setAppSecretValue, type AppSecretRevokeResult } from '../nexus/config/secrets/file-backend.js';
@@ -182,6 +184,8 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
   // Commander shares output configuration across parent/child commands. Override
   // error handling on this command tree instead so sibling commands keep theirs.
   redactParserErrors(secret);
+  registerSealedMoveCommand(secret);
+  registerSecretBackupCommands(secret);
 
   const slots = secret.command('slot').description('Inspect shared credential slots without displaying their values.');
   slots.command('list')

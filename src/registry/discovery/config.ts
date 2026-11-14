@@ -1,3 +1,4 @@
+import { readStoredFirecrawlKey } from '../../setup/firecrawl-key.js';
 // RFC #2161 Phase 6 FU · 2026-05-11 — discovery user-config resolver.
 //
 // The original Phase 6 follow-ups (#2206 omni-crawl bridge · #2209 cron
@@ -48,6 +49,13 @@ export function getFirecrawlConfig(cfg?: UserConfig): ResolvedFirecrawlConfig {
   return {
     apiKey: fromConfig || readEnv('FIRECRAWL_API_KEY'),
   };
+}
+
+/** Async consumers prefer the canonical secret; backend errors remain observable.
+ * Legacy config/env reads remain for existing installations, without new plaintext writes. */
+export async function getFirecrawlConfigAsync(cfg?: UserConfig): Promise<ResolvedFirecrawlConfig> {
+  const stored = await readStoredFirecrawlKey();
+  return stored ? { apiKey: stored } : getFirecrawlConfig(cfg);
 }
 
 /** Resolve discovery cron config. user-config wins; falls back to

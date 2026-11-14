@@ -4,7 +4,10 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parse as parseYaml } from 'yaml';
 import { runGraph } from './runner.js';
+import { declaredHealEdges, graphHealManifest } from './declared-heal-edges.js';
+import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -506,4 +509,182 @@ test('SIM GRAPH-EDGE-VOCAB-EXEC: a saved rejoin resumes without repeating the re
   expect(resumed.status).toBe('done');
   expect(resumed.path).toEqual(['start', 'repair', 'start', 'done']);
   expect(repairCalls).toBe(1);
+});
+
+// ── GRAPH-HEAL-EVIDENCE-FU (#37716): 실패→분류→선언된 수리→수리 영수증 게이트→독립 재검증→성공/HITL/failed 완주 ──
+// 수리 영수증 누락·상한 소진은 성공으로 승격되지 않고 원래 실패와 함께 남는다 — 러너 실물 규칙(heal/detour/escalate
+// 어휘 해석)으로 보장하고, 이 가짜 세계가 그 완주 판을 증명한다.
+function healEvidenceGraph(healing: string, additions: { nodes?: string; edges?: string } = {}): { root: string; path: string } {
+  const root = mkdtempSync(join(tmpdir(), 'graph-heal-evidence-fu-'));
+  dirs.push(root);
+  const path = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'review-receipt:\n  approval: "Accept the repair receipt and re-verify?"\n');
+  writeFileSync(join(root, 'plugin.json'), JSON.stringify({ name: 'graph-heal-evidence-fu', version: '1.0.0',
+    extensions: { 'ai.elanous': { identity: 'elanous.test-graph-heal-evidence-fu', inputs: [], graphs: ['./graph.yaml'],
+      graphManifests: { 'graph-heal-evidence-fu': {
+        purpose: 'Exercise fail, classify, declared repair, receipt gate, and independent reverify exits.',
+        allow: { recipes: ['handler:work', 'handler:repair', 'handler:receipt-gate'], skills: [], domainPacks: [] },
+        edgeVocabulary: ['heal', 'retry', 'detour', 'append-recheck', 'accept', 'escalate'],
+        hitl: ['review'], policy: {},
+      } } } } }));
+  writeFileSync(path, `graph_id: graph-heal-evidence-fu\nversion: 1\nentry_node: work\nterminal_nodes: [done, failed]\nnodes:\n`
+    + `  - { node_id: work, kind: agent, recipe: 'handler:work', max_visits: 3 }\n`
+    + `  - { node_id: repair, kind: agent, recipe: 'handler:repair', max_visits: 2 }\n`
+    + `  - { node_id: receipt-gate, kind: agent, recipe: 'handler:receipt-gate', max_visits: 2 }\n`
+    + `  - { node_id: review, kind: hitl, recipe: 'approval:review-receipt', max_visits: 1 }\n`
+    + `  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n`
+    + `  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\n`
+    + `${additions.nodes ?? ''}edges:\n`
+    + `  - { from: work, on: outcome, map: { ok: done, fail: failed } }\n`
+    + `  - { from: review, on: outcome, map: { ok: failed, fail: failed, error: failed } }\n`
+    + `${additions.edges ?? ''}heal_edges:\n${healing}\n`);
+  return { root, path };
+}
+
+// work 실패 → 분류(quota-exhausted) → 수리 → 영수증 게이트(detour) → 원 노드 재실행(독립 재검증) 체인 선언.
+const CHAIN_HEAL_EDGES = `  - kind: heal\n    from: work\n    on: [fail]\n    classify: { classes: [quota-exhausted, transient-flake] }\n    repair:\n      quota-exhausted: repair\n      transient-flake: { escalate: review }\n    attempts: 2\n    escalate: failed\n`
+  + `  - kind: detour\n    from: repair\n    on: [ok]\n    via: receipt-gate\n    rejoin: { to: work }\n    escalate: review\n`;
+
+// 영수증 게이트는 러너가 넘긴 수리 결과(context.outputs.repair — 직전 repair visit의 실제 출력)만 판정한다.
+// 클로저 플래그·하드코딩 판정 없음: 같은 게이트 함수가 아래 두 실행(runGraph)에서 영수증 유무만으로 갈린다.
+const receiptGate = (context: { readonly outputs: Readonly<Record<string, unknown>> }): { ok: boolean; outcome: string; evidence: Record<string, unknown> } => {
+  const repairOutput = context.outputs.repair;
+  const evidence = repairOutput && typeof repairOutput === 'object' && !Array.isArray(repairOutput)
+    ? (repairOutput as { evidence?: unknown }).evidence : undefined;
+  const receipt = evidence && typeof evidence === 'object' && !Array.isArray(evidence)
+    ? (evidence as { repairReceipt?: unknown }).repairReceipt : undefined;
+  return receipt && typeof receipt === 'object' && !Array.isArray(receipt)
+    ? { ok: true, outcome: 'ok', evidence: { repairReceipt: receipt } }
+    // 판정 근거를 그대로 남긴다 — 게이트가 본 것 = 러너 수리 출력.
+    : { ok: false, outcome: 'receipt-missing', evidence: { judgedRepairOutput: repairOutput ?? null } };
+};
+
+test('SIM GRAPH-HEAL-EVIDENCE-FU: the runner repair result alone gates reverify — receipt present succeeds, absent escalates to HITL', async () => {
+  const { root, path } = healEvidenceGraph(CHAIN_HEAL_EDGES);
+  // 한 판·한 게이트·한 work 핸들러에서 두 번 실행. 유일한 차이 = repair 출력의 수리 영수증 유무.
+  const run = async (runId: string, withReceipt: boolean) => {
+    const events: Array<{ event: string; data: unknown }> = [];
+    let workRuns = 0;
+    const result = await runGraph(path, { runId, deps: { root,
+      log: (event: string, data: unknown) => { events.push({ event, data }); },
+      inProcessHandlers: {
+        work: () => ++workRuns === 1
+          ? { ok: false, outcome: 'quota-exhausted', evidence: { class: 'quota-exhausted' } }
+          : { ok: true, outcome: 'ok' },
+        repair: () => ({ ok: true, outcome: 'ok', evidence: { class: 'quota-exhausted',
+          ...(withReceipt ? { repairReceipt: { edgeRef: 'heal_edges/0', class: 'quota-exhausted',
+            diff: 'rotate quota credential', at: '2026-11-14T00:00:00.000Z' } } : {}) } }),
+        'receipt-gate': receiptGate,
+      } } });
+    return { result, events, workRuns };
+  };
+
+  const receipted = await run('evidence-receipt-present', true);
+  expect(receipted.result.status).toBe('done');
+  expect(receipted.result.path).toEqual(['work', 'repair', 'receipt-gate', 'work', 'done']);
+  expect(receipted.result.healTransitions?.map((step) => [step.edgeRef, step.kind, step.from, step.to])).toEqual([
+    ['heal_edges/0', 'heal', 'work', 'repair'],
+    ['heal_edges/1', 'detour', 'repair', 'receipt-gate'],
+    ['heal_edges/1', 'rejoin', 'receipt-gate', 'work'],
+  ]);
+  // 원시 영수증: graph.heal(분류·수리·시도) · graph.edge-added(영수증 게이트 detour) · graph.rejoin(재검증 예산)
+  expect(receipted.events.filter(({ event }) => ['graph.heal', 'graph.edge-added', 'graph.rejoin'].includes(event))
+    .map(({ event, data }) => ({ event, edgeRef: (data as Record<string, unknown>).edgeRef }))).toEqual([
+    { event: 'graph.heal', edgeRef: 'heal_edges/0' },
+    { event: 'graph.edge-added', edgeRef: 'heal_edges/1' },
+    { event: 'graph.rejoin', edgeRef: 'heal_edges/1' },
+  ]);
+  expect((receipted.events.find(({ event }) => event === 'graph.heal')!.data as Record<string, unknown>).repair).toBe('repair');
+  expect(receipted.result.nodes.filter((node) => node.nodeId === 'work').map((node) => node.ok)).toEqual([false, true]); // 원래 실패 보존
+  expect(receipted.workRuns).toBe(2);
+
+  const unreceipted = await run('evidence-receipt-absent', false);
+  expect(unreceipted.result.status).toBe('awaiting-approval');
+  expect(unreceipted.result.pending?.nodeId).toBe('review');
+  expect(unreceipted.result.path).toEqual(['work', 'repair', 'receipt-gate', 'review']);
+  expect(unreceipted.result.path).not.toContain('done');
+  expect(unreceipted.result.healTransitions?.map((step) => [step.edgeRef, step.kind])).toEqual([
+    ['heal_edges/0', 'heal'], ['heal_edges/1', 'detour'], ['heal_edges/1', 'escalate'],
+  ]);
+  expect(unreceipted.result.nodes.filter((node) => node.nodeId === 'work').map((node) => node.ok)).toEqual([false]); // 원래 실패와 함께 남는다
+  // 게이트가 기각한 대상은 클로저가 아니라 러너가 전달한 수리 출력 자체다(영수증 없는 실물 출력).
+  const judged = unreceipted.result.nodes.find((node) => node.nodeId === 'receipt-gate')?.output;
+  const judgedEvidence = typeof judged === 'string' ? JSON.parse(judged) : judged;
+  expect((judgedEvidence as { evidence?: { judgedRepairOutput?: { evidence?: { repairReceipt?: unknown } } } })
+    .evidence?.judgedRepairOutput?.evidence?.repairReceipt).toBeUndefined();
+  expect((judgedEvidence as { evidence?: { judgedRepairOutput?: { evidence?: { class?: unknown } } } })
+    .evidence?.judgedRepairOutput?.evidence?.class).toBe('quota-exhausted');
+});
+
+test('SIM GRAPH-HEAL-EVIDENCE-FU: exhausted repair budget stays failed with the original failure and no extra attempt', async () => {
+  const { root, path } = healEvidenceGraph(CHAIN_HEAL_EDGES);
+  const events: Array<{ event: string; data: unknown }> = [];
+  let workRuns = 0;
+  const result = await runGraph(path, { runId: 'evidence-exhausted', deps: { root,
+    log: (event: string, data: unknown) => { events.push({ event, data }); },
+    inProcessHandlers: {
+      work: () => { workRuns++; return { ok: false, outcome: 'quota-exhausted', evidence: { class: 'quota-exhausted' } }; },
+      repair: () => ({ ok: true, outcome: 'ok', evidence: { class: 'quota-exhausted', repairReceipt: { edgeRef: 'heal_edges/0' } } }),
+      'receipt-gate': receiptGate,
+    } } });
+  expect(result.status).toBe('failed');
+  expect(result.path).toEqual(['work', 'repair', 'receipt-gate', 'work', 'repair', 'receipt-gate', 'work', 'failed']);
+  expect(result.healTransitions?.map((step) => step.kind)).toEqual(['heal', 'detour', 'rejoin', 'heal', 'detour', 'rejoin', 'escalate']);
+  const escalations = events.filter(({ event }) => event === 'graph.escalate').map(({ data }) => data as Record<string, unknown>);
+  expect(escalations.at(-1)).toMatchObject({ edgeRef: 'heal_edges/0', to: 'failed', exhausted: true });
+  expect(workRuns).toBe(3); // 시작 1 + 재검증 2 — 상한(2) 소진 뒤 네 번째 시도는 없다
+  expect(result.nodes.filter((node) => node.nodeId === 'work').every((node) => node.ok === false)).toBe(true);
+});
+
+test('SIM GRAPH-HEAL-EVIDENCE-FU: unclassified failure escalates instead of repairing', async () => {
+  const first = healEvidenceGraph(CHAIN_HEAL_EDGES);
+  let repairCalls = 0;
+  const unknown = await runGraph(first.path, { runId: 'evidence-unknown-class', deps: { root: first.root, inProcessHandlers: {
+    work: () => ({ ok: false, outcome: 'disk-corruption', evidence: { class: 'disk-corruption' } }),
+    repair: () => { repairCalls++; return { ok: true, outcome: 'ok' }; },
+    'receipt-gate': receiptGate,
+  } } });
+  expect(unknown.status).toBe('failed');
+  expect(unknown.path).toEqual(['work', 'failed']);
+  expect(unknown.healTransitions?.map((step) => step.kind)).toEqual(['escalate']);
+  expect(repairCalls).toBe(0);
+
+  const second = healEvidenceGraph(CHAIN_HEAL_EDGES);
+  const flake = await runGraph(second.path, { runId: 'evidence-flake-human', deps: { root: second.root, inProcessHandlers: {
+    work: () => ({ ok: false, outcome: 'transient-flake', evidence: { class: 'transient-flake' } }),
+    repair: () => { repairCalls++; return { ok: true, outcome: 'ok' }; },
+    'receipt-gate': receiptGate,
+  } } });
+  expect(flake.status).toBe('awaiting-approval');
+  expect(flake.pending?.nodeId).toBe('review');
+  expect(flake.path).toEqual(['work', 'review']);
+  expect(repairCalls).toBe(0); // 선언된 클래스라도 수리 불가 판정이면 사람에게 간다
+});
+
+test('SIM GRAPH-HEAL-EVIDENCE-FU: a repair node that fails never reaches reverify', async () => {
+  const { root, path } = healEvidenceGraph(CHAIN_HEAL_EDGES);
+  let gateCalls = 0;
+  const result = await runGraph(path, { runId: 'evidence-repair-crashed', deps: { root, inProcessHandlers: {
+    work: () => ({ ok: false, outcome: 'quota-exhausted', evidence: { class: 'quota-exhausted' } }),
+    repair: () => ({ ok: false, outcome: 'repair-crashed' }),
+    'receipt-gate': (context: { readonly outputs: Readonly<Record<string, unknown>> }) => { gateCalls++; return receiptGate(context); },
+  } } });
+  expect(result.status).toBe('failed');
+  expect(result.path).toEqual(['work', 'repair', 'failed']);
+  expect(result.healTransitions?.map((step) => step.kind)).toEqual(['heal', 'escalate']);
+  expect(gateCalls).toBe(0);
+});
+
+test('GRAPH-HEAL-EVIDENCE-FU: the heal standard declares collect breakage to the human observer', () => {
+  const file = join(import.meta.dir, '../../graphs/heal/heal-loop.yaml');
+  const source = readFileSync(file, 'utf8');
+  const parsed = parseGraphTemplateYaml(source, 'heal-loop.yaml');
+  expect(parsed.errors).toEqual([]);
+  const manifest = graphHealManifest(file, 'heal-loop');
+  expect(manifest?.edgeVocabulary).toContain('escalate');
+  expect(manifest?.hitl).toEqual(['observe-deeper-human']);
+  const edges = declaredHealEdges(parseYaml(source) as Record<string, unknown>, parsed.template!, manifest);
+  expect(edges).toHaveLength(1);
+  expect(edges[0]).toMatchObject({ kind: 'escalate', edgeRef: 'heal_edges/0', from: 'collect',
+    on: ['fail', 'error'], to: 'observe-deeper-human', evidence: ['failure-signature'] });
 });

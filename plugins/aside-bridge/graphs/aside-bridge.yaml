@@ -1,0 +1,10 @@
+graph_id: aside-bridge
+version: 1
+entry_node: aside
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: aside, kind: capability, recipe: none, requires: aside.exec@1, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: aside, on: outcome, map: { done: done, failed: failed } }

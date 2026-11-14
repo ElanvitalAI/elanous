@@ -160,8 +160,9 @@ export async function runStaticBuild(appDir = resolve(import.meta.dir, '..'), ho
     linkStagedRepoDirectory(repoRoot, stagedRepo, 'catalog');
     // The OpenRouter model picker also imports its Solar profile from docs/.
     linkStagedRepoDirectory(repoRoot, stagedRepo, 'docs/profiles');
-    mkdirSync(join(stagedRepo, 'plugins'), { recursive: true });
-    symlinkSync(join(repoRoot, 'plugins', 'graph-instance-view'), join(stagedRepo, 'plugins', 'graph-instance-view'), 'dir');
+    // Source type-checking follows imports into bundled plugin TypeScript too.
+    // Stage the shipped plugin tree, not only the graph UI plugin.
+    linkStagedRepoDirectory(repoRoot, stagedRepo, 'plugins');
     const appNodeModules = join(appDir, 'node_modules');
     linkRepositoryNodeModules(repoRoot, stagedRepo, appNodeModules);
     if (existsSync(appNodeModules)) symlinkSync(appNodeModules, join(stagedApp, 'node_modules'), 'dir');

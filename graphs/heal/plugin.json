@@ -1,0 +1,46 @@
+{
+  "name": "heal-loop",
+  "version": "1.0.0",
+  "description": "Heal standard template graph and its declared healing vocabulary.",
+  "extensions": {
+    "ai.elanous": {
+      "identity": "elanous-heal-loop",
+      "inputs": [],
+      "graphs": [
+        "./heal-loop.yaml"
+      ],
+      "graphManifests": {
+        "heal-loop": {
+          "purpose": "Run the heal standard template as one policy-bound graph with a declared healing vocabulary.",
+          "allow": {
+            "recipes": [
+              "observe-ledger",
+              "triage",
+              "verify-classification-evidence",
+              "verify",
+              "acknowledge-untestable",
+              "rework-note",
+              "revise-goal",
+              "observe-deeper",
+              "ground-external"
+            ],
+            "skills": [],
+            "domainPacks": []
+          },
+          "edgeVocabulary": [
+            "heal",
+            "retry",
+            "detour",
+            "append-recheck",
+            "accept",
+            "escalate"
+          ],
+          "hitl": [
+            "observe-deeper-human"
+          ],
+          "policy": {}
+        }
+      }
+    }
+  }
+}

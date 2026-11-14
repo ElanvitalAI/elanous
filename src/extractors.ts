@@ -68,6 +68,11 @@ export async function readText(path: string): Promise<ExtractResult> {
 
 export async function extractPdf(path: string): Promise<ExtractResult> {
   const buf = await readFile(path);
+  return extractPdfBytes(buf);
+}
+
+/** Extract already-authorized PDF bytes without reopening a caller-supplied path. */
+export async function extractPdfBytes(buf: Uint8Array): Promise<ExtractResult> {
   // pdf-parse loads pdfjs-dist and @napi-rs/canvas (system fonts) at import time.
   // A plain text/CLI help request must not pay for the PDF renderer.
   const { PDFParse } = await import('pdf-parse');

@@ -1,36 +1,14 @@
-// RFC #2161 FU A6-real · P5 (2026-05-11) — interactive Firecrawl setup.
-//
-// Invoked via `elanous nexus setup-firecrawl`. Walks the user through:
-//   1. CLI binary detection (`firecrawl --version` probe)
-//   2. API key entry (existing value reuse · prompt if absent)
-//   3. Persist key to `registry.discovery.firecrawl.apiKey` via
-//      patchUserConfig (atomic · file-locked)
-//
-// Why a dedicated setup helper instead of the catch-all
-// `elanous config set` command:
-//   • Discovery of the CLI gate (missing-cli vs missing-key) gives
-//     users a precise next step (install · register · enter key).
-//   • Key entry uses `askValidated` with `secret: true` so the
-//     terminal doesn't echo characters — mirrors channel-bot-setup
-//     (Telegram/Discord token entry).
-//   • Persists to the canonical user-config path automatically;
-//     the dotted-path resolver in `elanous config set` doesn't yet
-//     know about `registry.discovery.firecrawl.apiKey`.
-//
-// The wizard is *non-interactive-friendly* — if the user passes the
-// key inline (`--api-key <value>`) it skips the prompt entirely.
-// This lets CI / scripted setup use the same code path.
-//
-// Cross-ref:
-//   src/cli/channel-bot-setup.ts (Telegram/Discord token entry · same pattern)
-//   src/registry/discovery/sources/firecrawl-crawl.ts (consumer)
-//   src/nexus/config/user-config.ts (patchUserConfig)
+// Legacy nexus setup-firecrawl entry. New onboarding uses elanous setup firecrawl.
+// CLI detection is only informational for model discovery; built-in website crawling needs no CLI.
+// Persist new keys in the secret store, reuse legacy config/env reads, and never render a key prefix.
+// The legacy inline option is retained for compatibility; prefer the masked setup command.
 
 import { isFirecrawlCliAvailable } from '../registry/discovery/sources/firecrawl-crawl.js';
 import { askValidated } from '../onboarding/validators.js';
 import { defaultIO, type WizardIO } from '../onboarding.js';
 import { getFirecrawlConfig } from '../registry/discovery/config.js';
-import { getUserConfig, resetUserConfig, saveUserConfig } from '../user-config.js';
+import { FIRECRAWL_CREDENTIAL_SLOT, readStoredFirecrawlKey } from '../setup/firecrawl-key.js';
+import { setCredentialSlotAsync } from '../nexus/config/secrets/cred-slots.js';
 
 export interface FirecrawlSetupDeps {
   io?: WizardIO;
@@ -43,17 +21,17 @@ export interface FirecrawlSetupDeps {
   /** Test seam — replace the CLI probe. Production reads
    *  `isFirecrawlCliAvailable()`. */
   cliProbeFn?: () => boolean | Promise<boolean>;
-  /** Test seam — replace the patchUserConfig writer. */
-  patchFn?: (apiKey: string) => void;
+  /** Test seam — replace the secret-store writer. */
+  patchFn?: (apiKey: string) => void | Promise<void>;
   /** Test seam — replace getFirecrawlConfig reader for the existing-
    *  key reuse hint. */
-  readExistingFn?: () => { apiKey: string };
+  readExistingFn?: () => { apiKey: string } | Promise<{ apiKey: string }>;
   out?: { log: (s: string) => void; error: (s: string) => void };
 }
 
 export interface FirecrawlSetupResult {
   exitCode: number;
-  /** True when the wizard wrote an API key to user-config. */
+  /** True when the wizard wrote an API key to the secret store. */
   keyWritten: boolean;
   /** True when the CLI binary was detected. False = wizard surfaced
    *  the install hint; key may still have been written. */
@@ -69,15 +47,8 @@ function validateApiKey(value: string): string | null {
   return null;
 }
 
-const defaultPatchFn = (apiKey: string): void => {
-  // Read-modify-write through Path A (saveUserConfig) — it preserves
-  // both the typed sections and the NEXUS schema fields (global /
-  // tabs / version). We can't use NEXUS's patchUserConfig here
-  // because its UserConfig type doesn't carry the `registry` field.
-  const cfg = getUserConfig();
-  cfg.registry.discovery.firecrawl.apiKey = apiKey;
-  saveUserConfig(cfg);
-  resetUserConfig(); // force the cache to rebuild on next read
+const defaultPatchFn = async (apiKey: string): Promise<void> => {
+  await setCredentialSlotAsync(FIRECRAWL_CREDENTIAL_SLOT, apiKey);
 };
 
 export async function runFirecrawlSetup(opts: FirecrawlSetupDeps = {}): Promise<FirecrawlSetupResult> {
@@ -86,11 +57,11 @@ export async function runFirecrawlSetup(opts: FirecrawlSetupDeps = {}): Promise<
   const out = opts.out ?? console;
   const cliProbe = opts.cliProbeFn ?? isFirecrawlCliAvailable;
   const patchFn = opts.patchFn ?? defaultPatchFn;
-  const readExisting = opts.readExistingFn ?? getFirecrawlConfig;
+  const readExisting = opts.readExistingFn ?? (async () => ({ apiKey: (await readStoredFirecrawlKey()) || getFirecrawlConfig().apiKey }));
 
   try {
     io.print('');
-    io.print('  Firecrawl model-discovery setup');
+    io.print('  Firecrawl setup (legacy entry; prefer elanous setup firecrawl)');
     io.print('');
 
     // Step 1 — CLI binary detection (informational; doesn't gate the key).
@@ -101,7 +72,7 @@ export async function runFirecrawlSetup(opts: FirecrawlSetupDeps = {}): Promise<
       io.print('  ⚠ Firecrawl CLI not found on PATH.');
       io.print('    Install (after registering at https://www.firecrawl.dev):');
       io.print('      npm install -g firecrawl-cli');
-      io.print('    The key will still be saved — discovery activates once');
+      io.print('    Built-in website crawling needs no CLI. Discovery activates once');
       io.print('    the CLI binary is on PATH.');
     }
     io.print('');
@@ -109,9 +80,13 @@ export async function runFirecrawlSetup(opts: FirecrawlSetupDeps = {}): Promise<
     // Step 2 — collect / reuse the key.
     let apiKey = (opts.apiKeyInline ?? '').trim();
     if (!apiKey) {
-      const existing = readExisting().apiKey;
+      if (!io.askSecret || io.nonInteractive) {
+        out.error('Use elanous setup firecrawl from an interactive terminal.');
+        return { exitCode: 1, keyWritten: false, cliPresent };
+      }
+      const existing = (await readExisting()).apiKey;
       if (existing) {
-        io.print(`  Found existing key (${existing.slice(0, 4)}…). Press Enter to keep,`);
+        io.print('  Found existing key. Press Enter to keep,');
         io.print('  or paste a new key to replace.');
       } else {
         io.print('  Paste the API key from https://app.firecrawl.dev → API Keys.');
@@ -135,9 +110,9 @@ export async function runFirecrawlSetup(opts: FirecrawlSetupDeps = {}): Promise<
     }
 
     // Step 3 — persist.
-    patchFn(apiKey);
-    out.log(`✓ Firecrawl API key saved (${apiKey.slice(0, 4)}…).`);
-    out.log('  Used by: web search (omni_search) · model discovery');
+    await patchFn(apiKey);
+    out.log('✓ Firecrawl API key saved to secret store.');
+    out.log('  Used by: website crawl tool · model discovery');
     if (cliPresent) {
       out.log('  Discovery will pick up the new key on the next /v1/registry/discovery call.');
     } else {
@@ -145,7 +120,7 @@ export async function runFirecrawlSetup(opts: FirecrawlSetupDeps = {}): Promise<
     }
     return { exitCode: 0, keyWritten: true, cliPresent };
   } catch (err) {
-    out.error(`firecrawl setup failed: ${(err as Error).message}`);
+    out.error('firecrawl setup failed; sensitive error details hidden.');
     return { exitCode: 1, keyWritten: false, cliPresent: false };
   } finally {
     if (ownIo) io.close();

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, readlinkSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runStaticBuild } from './static-generation';
+import ts from 'typescript';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -10,16 +11,22 @@ afterEach(() => {
 });
 
 describe('PWA staged repository inputs', () => {
-  test('runStaticBuild stages catalog and docs/profiles before invoking Next', async () => {
+  test('runStaticBuild stages plugin TypeScript imports, catalog and profiles before invoking Next', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pwa-stage-inputs-test-'));
     roots.push(root);
     const repo = join(root, 'checkout');
     const appDir = join(repo, 'apps', 'pwa');
-    const expected = ['scenarios', 'catalog', 'docs/profiles', 'plugins/graph-instance-view', 'node_modules'];
+    const expected = ['scenarios', 'catalog', 'docs/profiles', 'plugins', 'node_modules'];
     for (const path of [...expected, 'src', 'scripts', 'skills/omni-crawl', 'scenarios', 'catalog/models/openrouter', 'docs/profiles', 'plugins/graph-instance-view', 'node_modules']) {
       mkdirSync(join(repo, path), { recursive: true });
     }
     mkdirSync(appDir, { recursive: true });
+
+    const consumer = 'src/graph-runner/capability-providers/upstage-solar-decide.ts';
+    mkdirSync(join(repo, 'src/graph-runner/capability-providers'), { recursive: true });
+    mkdirSync(join(repo, 'plugins/upstage-solar-decide'), { recursive: true });
+    writeFileSync(join(repo, consumer), "export { SOLAR_DECIDE } from '../../../plugins/upstage-solar-decide/plugin.js';\n");
+    writeFileSync(join(repo, 'plugins/upstage-solar-decide/plugin.ts'), "export const SOLAR_DECIDE = 'synthetic';\n");
 
     let inspected = false;
     await runStaticBuild(appDir, {
@@ -30,6 +37,10 @@ describe('PWA staged repository inputs', () => {
           expect(realpathSync(staged)).toBe(realpathSync(join(repo, path)));
         }
         expect(existsSync(join(stagedRepo, 'catalog/models/openrouter'))).toBe(true);
+        const resolved = ts.resolveModuleName('../../../plugins/upstage-solar-decide/plugin.js',
+          join(stagedRepo, consumer), { moduleResolution: ts.ModuleResolutionKind.Bundler }, ts.sys).resolvedModule;
+        expect(resolved?.resolvedFileName).toBe(join(stagedRepo, 'plugins/upstage-solar-decide/plugin.ts'));
+        expect(existsSync(join(stagedRepo, 'plugins/upstage-solar-decide/plugin.js'))).toBe(false);
         const out = join(stagedApp, 'out');
         mkdirSync(join(out, '_next'), { recursive: true });
         writeFileSync(join(out, 'index.html'), '<html>fixture</html>');

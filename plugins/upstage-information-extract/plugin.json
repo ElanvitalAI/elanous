@@ -1,0 +1,37 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "upstage-information-extract",
+  "version": "0.1.0",
+  "description": "Extracts schema checked JSON from one consented document through Upstage Information Extract.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/information-extract.yaml"],
+      "graphManifests": {
+        "upstage-information-extract": {
+          "purpose": "Extract schema checked fields from one document after consent.",
+          "allow": { "recipes": [], "skills": [], "domainPacks": [], "maxSideEffects": "none" },
+          "hitl": []
+        }
+      },
+      "graphProviders": {
+        "./graphs/information-extract.yaml": {
+          "module": "src/graph-runner/capability-providers/upstage-information-extract.ts",
+          "factory": "createUpstageInformationExtractRegistry"
+        }
+      },
+      "capabilities": ["document", "network:upstage"],
+      "connectors": [],
+      "pricing": { "model": "byok" },
+      "trust": "official",
+      "category": "Productivity",
+      "inputContract": {
+        "graphInputKeys": { "upstage-information-extract": ["documentDataUrl", "schemaName", "schema", "consentToUpstage"] },
+        "secretRef": "cred:upstage.api_key",
+        "documentDataUrl": "One base64 data URL for a user-approved document",
+        "schemaName": "JSON schema name (1–64 letters, digits, underscores, or dashes)",
+        "schema": "JSON schema using type, properties, required, items, enum, and additionalProperties",
+        "consentToUpstage": "Must be true after the user accepts sending this document to Upstage"
+      }
+    }
+  }
+}

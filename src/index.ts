@@ -304,6 +304,9 @@ const registerControlCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'control
 const registerHooksCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
   ? (() => undefined)
   : (require('./cli/hooks-cli.js') as typeof import('./cli/hooks-cli.js')).registerHooksCommands) as typeof import('./cli/hooks-cli.js').registerHooksCommands;
+const registerMemberConnectCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'member'
+  ? (() => undefined)
+  : (require('./cli/member-connect-cli.js') as typeof import('./cli/member-connect-cli.js')).registerMemberConnectCommands) as typeof import('./cli/member-connect-cli.js').registerMemberConnectCommands;
 const registerSetupCommand = (shouldRegisterSetupCommand
   ? (require('./cli/setup-cli.js') as typeof import('./cli/setup-cli.js')).registerSetupCommand
   : (() => undefined)) as typeof import('./cli/setup-cli.js').registerSetupCommand;
@@ -1638,6 +1641,7 @@ registerDoctorCommand(program);
 registerControlCommands(program);
 registerHooksCommands(program);
 registerSetupCommand(program);
+registerMemberConnectCommands(program);
 if (shouldRegisterSetupCommand) {
   program.commands.find(command => command.name() === 'setup')!
     .option('--terminal', 'Run the terminal onboarding wizard')

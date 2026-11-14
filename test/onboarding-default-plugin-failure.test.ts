@@ -42,3 +42,24 @@ test('failed rerun clears a previously completed onboarding marker', async () =>
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('onboarding collects optional Firecrawl key through the masked seam before plugin installation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-onboarding-firecrawl-'));
+  const path = join(root, 'config.json');
+  const output: string[] = [];
+  const writes: string[][] = [];
+  const key = 'synthetic-onboarding-firecrawl-key';
+  writeFileSync(join(root, 'plugins'), 'blocked');
+  try {
+    const base = nonInteractiveIO({ answers: {
+      llm: { provider: 'auto' }, skills: { activeSet: 'codex' }, obsidian: { vault: root },
+      telegram: { enabled: false }, discord: { enabled: false },
+    }, env: {} });
+    const io = { ...base, nonInteractive: false, print: (line: string) => output.push(line),
+      askSecret: async (_prompt: string, field?: string) => { expect(field).toBe('firecrawl.apiKey'); return key; } };
+    await expect(runOnboarding({ path, io, firecrawlKeyDeps: { setSecret: async (id, value) => { writes.push([id, value]); } } })).rejects.toThrow('데모 플러그인');
+    expect(writes).toEqual([['cred:firecrawl.api_key', key]]);
+    expect(output.join('\n')).not.toContain(key);
+    expect(existsSync(path)).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -1,3 +1,4 @@
+import { configureFirecrawlKey, type FirecrawlKeySetupDeps } from './setup/firecrawl-key.js';
 // ── Onboarding wizard ──
 //
 // Six-step interactive setup, plain-TTY (not altscreen), runs once on
@@ -1352,6 +1353,7 @@ async function askDiscord(
 // ── Orchestrator ─────────────────────────────────────────────────────
 
 export interface RunWizardOpts {
+  firecrawlKeyDeps?: Pick<FirecrawlKeySetupDeps, 'setSecret'>;
   io?: WizardIO;
   /** Path to config.json — defaults to userConfigPath(). Tests pass a tmp path. */
   path?: string;
@@ -1605,6 +1607,11 @@ export async function runOnboarding(opts: RunWizardOpts = {}): Promise<UserConfi
       // Explicit role choices are preserved by updateOpenRouterRoleDefaults.
       next.roleLlm = updateOpenRouterRoleDefaults(next.roleLlm, initial.llm.provider === 'openrouter' ? initial.llm.model : undefined, next.llm.model);
     }
+    // Do not fall back to an echoing prompt for credentials.
+    if (io.askSecret && !io.nonInteractive) {
+      const result = await configureFirecrawlKey({ promptSecret: message => io.askSecret!(message, 'firecrawl.apiKey'), print: message => io.print(message), setSecret: opts.firecrawlKeyDeps?.setSecret });
+      if (result === 'failed') throw new Error('Firecrawl secret setup failed; retry elanous setup firecrawl');
+    } else io.print('Firecrawl 선택 키 설정: elanous setup firecrawl (현재 건너뜀)');
     // First-run packages are local assets. Keep setup incomplete when a
     // package fails so the next onboarding attempt can retry it.
     const { installDemo1114PluginGroup } = await import('./plugins/install/plugin-install.js');

@@ -1,0 +1,20 @@
+apiVersion: elanous.dev/graph/v2
+graph:
+  id: upstage-embeddings
+  version: 1.0.0
+  layer: flow
+  purpose: "동의한 검색 질의 또는 문서의 Upstage 임베딩"
+entry: embed
+nodes:
+  - id: embed
+    type: capability
+    requires: upstage.embeddings@1
+    with:
+      input: $input.input
+      consent: $input.consent?
+      purpose: $input.purpose?
+      model: $input.model?
+edges:
+  - { from: embed, on: outcome, map: { ok: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.capability] }

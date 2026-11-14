@@ -16,7 +16,7 @@ const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': {
 const CODEX_AUTH = JSON.stringify({ tokens: { access_token: 'access', refresh_token: 'refresh' } });
 const config = (provider?: string, fastPath = true) => ({ llm: { provider }, chat: { fastPath } }) as UserConfig;
 
-type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; gitAvailable?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[]; firstRunTopics?: boolean; doctorFixThrows?: boolean; providerWriteThrows?: boolean };
+type SetupState = { firecrawlKey?: string; elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; gitAvailable?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[]; firstRunTopics?: boolean; doctorFixThrows?: boolean; providerWriteThrows?: boolean };
 
 async function runSetup(state: SetupState = {}) {
   const output: string[] = [];
@@ -24,6 +24,7 @@ async function runSetup(state: SetupState = {}) {
   const exitCodes: number[] = [];
   const writes: UserConfig[] = [];
   const prompts: string[] = [];
+  const secretWrites: string[][] = [];
   let doctorCalls = 0;
   const doctorFixCalls: string[][] = [];
   let currentProvider = state.provider;
@@ -33,6 +34,9 @@ async function runSetup(state: SetupState = {}) {
   if (state.codex) files.set('/home/fake/.codex/auth.json', state.codexAuth ?? CODEX_AUTH);
   const program = new Command();
   registerSetupCommand(program, {
+    promptSecret: async () => state.firecrawlKey,
+    setSecretAsync: async (id, value) => { secretWrites.push([id, value]); },
+    setCredentialSlotAsync: async (id, value) => { secretWrites.push([id, value]); },
     homeDir: () => '/home/fake',
     firstRunTopics: state.firstRunTopics,
     exists: (path) => files.has(path),
@@ -63,7 +67,7 @@ async function runSetup(state: SetupState = {}) {
     resolveRuntimeProvider: () => state.runtimeProvider,
   });
   await program.parseAsync(['node', 'elanous', 'setup', ...(state.nonInteractive === false ? [] : ['--non-interactive']), ...(state.yes ? ['--yes'] : [])]);
-  return { text: output.join('\n'), output, errors, exitCodes, writes, prompts, doctorCalls, doctorFixCalls, deniedSkills };
+  return { secretWrites, text: output.join('\n'), output, errors, exitCodes, writes, prompts, doctorCalls, doctorFixCalls, deniedSkills };
 }
 
 function section(text: string, heading: string, nextHeading?: string): string {
@@ -224,6 +228,7 @@ test('first-run setup uses one consent and does not prompt for starter topics', 
   const program = new Command();
   try {
     registerSetupCommand(program, {
+      promptSecret: async () => undefined,
       firstRunTopics: true, watchRoot: root, getUserConfig: () => cfg, saveUserConfig: (next) => { cfg = next; },
       runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }), detectSkillCliAuth: () => [],
       isStdinTty: () => true, prompt: async (message) => { prompts.push(message); return 'y'; },
@@ -231,7 +236,7 @@ test('first-run setup uses one consent and does not prompt for starter topics', 
     });
     await program.parseAsync(['node', 'elanous', 'setup']);
     expect(prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
-    expect(output).toHaveLength(1);
+    expect(output.filter(line => line.startsWith('First setup '))).toHaveLength(1);
     expect(fixes).toBe(1);
     expect(cfg.starter?.topics).toBeUndefined();
     expect(listSources({ seat: 'user' }, root)).toEqual([]);
@@ -246,6 +251,7 @@ test('first-run acceptance does not ask a second question for starter topics', a
   const program = new Command();
   try {
     registerSetupCommand(program, {
+      promptSecret: async () => undefined,
       firstRunTopics: true, watchRoot: root, getUserConfig: () => cfg,
       saveUserConfig: () => {},
       runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }), detectSkillCliAuth: () => [],
@@ -409,7 +415,7 @@ describe('setup CLI', () => {
     expect(accepted.prompts).toEqual(['첫 설정을 적용할까요? [y/N] ']);
     expect(accepted.writes).toHaveLength(1);
     expect(accepted.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
-    expect(accepted.output).toHaveLength(1);
+    expect(accepted.output.filter(line => line.startsWith('First setup '))).toHaveLength(1);
 
     const fixFailed = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y', doctorFixThrows: true });
     expect(fixFailed.output).toHaveLength(1);
@@ -576,7 +582,7 @@ describe('setup CLI', () => {
 
   test('interactive first-run uses one consent and reports one result without the manual bundle list', async () => {
     const result = await runSetup({ firstRunTopics: true, provider: 'openai-codex', nonInteractive: false, stdinTty: true, answer: 'y' });
-    expect(result.output).toHaveLength(1);
+    expect(result.output.filter(line => line.startsWith('First setup '))).toHaveLength(1);
     expect(result.text).not.toContain('묶음 1/1:');
     expect(result.writes).toEqual([]);
     expect(result.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
@@ -768,4 +774,13 @@ describe('setup CLI', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+test('first setup offers optional masked Firecrawl key and keeps it out of config and output', async () => {
+  const key = 'synthetic-first-setup-firecrawl-key';
+  const result = await runSetup({ firstRunTopics: true, nonInteractive: false, stdinTty: true, answer: 'y', firecrawlKey: key });
+  expect(result.exitCodes).toEqual([0]);
+  expect(result.secretWrites).toEqual([['cred:firecrawl.api_key', key]]);
+  expect(result.text).not.toContain(key);
+  expect(JSON.stringify(result.writes)).not.toContain(key);
 });

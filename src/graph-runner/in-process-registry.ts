@@ -5,6 +5,8 @@ export interface InProcessHandlerContext {
   readonly graphId: string;
   readonly runId: string;
   readonly nodeId: string;
+  /** Authenticated owner supplied by the execution host, never copied from graph input. */
+  readonly verifiedOwnerId?: string;
   /** Node-scoped resolved secret values; never copied into graph input or ledger output. */
   readonly secrets?: Readonly<Record<string, string>>;
   /** Contract identifiers lowered from graph-v2 node requires. */
@@ -28,6 +30,8 @@ export interface InProcessHandlerResult {
   /** Data passed to downstream `result.*` references; evidence remains audit metadata. */
   readonly result?: unknown;
   readonly evidence?: Readonly<Record<string, unknown>>;
+  /** Execute-unit compensation plan. Only declared `undo` outputs reach the run ledger. */
+  readonly undo?: unknown;
   readonly error?: string;
 }
 

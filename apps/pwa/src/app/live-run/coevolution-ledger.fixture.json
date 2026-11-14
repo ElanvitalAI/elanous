@@ -1,0 +1,10 @@
+{
+  "id": "timely-1116-fixed-ledger-r1-r3",
+  "label": "타임리 공진화 고정 원장",
+  "kind": "fixture",
+  "rounds": [
+    { "round": 1, "evidenceBackedCards": 1, "remainingGaps": 4, "passedChecks": 1 },
+    { "round": 2, "evidenceBackedCards": 3, "remainingGaps": 2, "passedChecks": 2 },
+    { "round": 3, "evidenceBackedCards": 4, "remainingGaps": 0, "passedChecks": 3 }
+  ]
+}

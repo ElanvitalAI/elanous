@@ -1,6 +1,7 @@
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { sessionRoot } from '../session/index.js';
 import { NEXT_TUI_WAKEUP_IPC_ENV, answerWakeupCall, isWakeupCallMessage, nextTuiWakeupTool } from './next-wakeup.js';
 import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
 import { answerNextSidetabCall, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
@@ -144,6 +145,7 @@ class LocalChatSession {
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
       env: {
         ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
+        ...(process.env.NODE_ENV === 'test' ? { ELANOUS_SESSION_ROOT: sessionRoot() } : {}),
         ELANOUS_NEXT_TUI_SELF_HEALTH: '1',
         ...(wakeupTool ? { [NEXT_TUI_WAKEUP_IPC_ENV]: '1' } : {}),
         // The Next TUI explicitly enables this before child startup. The

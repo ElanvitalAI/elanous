@@ -12,6 +12,7 @@ import { ReleaseRunsView } from '@/components/ops/ReleaseRunsView';
 import { claimSetupLink, readSetupLinkToken } from '@/lib/setup-link';
 import { loadDaemonConfig, saveDaemonConfig } from '@/lib/daemon-config';
 import { useOperator } from '@/lib/use-operator';
+import { CoevolutionMetricsPanel, DEMO_COEVOLUTION_LEDGER } from './coevolution-metrics';
 
 export default function LiveRunPage() {
   return <Suspense fallback={<p className="p-4 text-sm">런 장면을 불러오는 중…</p>}><LiveRunRoute /></Suspense>;
@@ -79,6 +80,7 @@ function LiveRunRoute() {
       : { source: source as 'harness' | 'graph' | 'release', ...(runId ? { runId } : {}), ...(source !== 'harness' && graphId ? { graphId } : {}) }} />;
   }
   if (params.get('view') === 'release') return operator ? <ReleaseRunsView /> : <p className="p-4">운영자만 볼 수 있습니다</p>;
+  if (params.get('view') === 'coevolution-metrics') return <div className="min-h-screen bg-slate-100 px-4 py-8"><CoevolutionMetricsPanel ledger={DEMO_COEVOLUTION_LEDGER} /></div>;
   const runId = params.get('run')?.trim() || null;
   if (!runId) return <><div className="flex justify-end gap-2 px-4 pt-2">{operator && <Link href="/live-run/?view=instance&source=resource" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">자원 현황</Link>}<Link href="/live-run/?view=instance-sim" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">인스턴스 재생</Link><Link href="/live-run/adaptive/" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">적응형 그래프 재생</Link>{operator && <Link href="/live-run?view=release" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">릴리스 그래프</Link>}</div><LiveRunAutoFollowPanel /></>;
   const stageMode = params.get('stage') === '1';

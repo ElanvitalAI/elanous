@@ -317,6 +317,16 @@ export function buildReplTools(options: {
   const pluginBridge = options.pluginRuntime ?? (require('../cli/child-plugin-runtime.js') as typeof import('../cli/child-plugin-runtime.js'))
     .createChildPluginRuntimeContract({
       requestConfirmation: async (prompt) => await graphApprover?.(prompt) ?? false,
+      // The host supplies only a private app session. Nexus remains the authority
+      // for the owner; a missing, expired or rejected session stays anonymous.
+      resolveVerifiedOwner: async () => {
+        try {
+          const session = await options.memberBoardSession?.();
+          if (!session?.nexusUrl || !session.sessionToken) return undefined;
+          const { resolveDashboardVerifiedOwner } = await import('../dashboard/plugin-route-adapter.js');
+          return await resolveDashboardVerifiedOwner(session);
+        } catch { return undefined; }
+      },
       // An isolated fake-LLM universe may supply a member session. The owner ID
       // still comes only from the Nexus owner endpoint, never from this file.
       ...(nextTestWorld && existsSync(nextTestSessionFile)

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "aside-bridge",
+  "version": "0.1.0",
+  "description": "Run an explicitly requested Aside task from an Elanous graph and retain its session receipt.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/aside-bridge.yaml"],
+      "graphProviders": {
+        "./graphs/aside-bridge.yaml": {
+          "module": "src/graph-runner/capability-providers/aside.ts",
+          "factory": "createAsideCapabilityRegistry"
+        }
+      }
+    }
+  }
+}

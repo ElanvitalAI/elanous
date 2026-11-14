@@ -165,6 +165,8 @@ export interface LLMToolDef {
 // state field is plugin-owned, opaque to the host. setState triggers a
 // re-render of the plugin's panes.
 export interface PluginContext {
+  /** Explicit beta action; host supplies U-0 transport, never credential material. */
+  solarDecide?: (input: import('../../../plugins/upstage-solar-decide/plugin.js').DecideInput, limits: { timeoutMs: number; maxResponseBytes: number }) => Promise<import('../../../plugins/upstage-solar-decide/plugin.js').DecideResult>;
   pluginName: string;
   state: unknown;
   setState(patch: Record<string, unknown>): void;

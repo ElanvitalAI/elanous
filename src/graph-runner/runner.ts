@@ -458,6 +458,25 @@ export function verifyReleaseRecipeSnapshot(commandRoot: string, snapshot?: { gr
   }
 }
 
+/** GRAPH-RECIPE-PIN-FU — the general start/resume pin contract behind the
+ *  release-only `verifyReleaseRecipeSnapshot` above: a run may execute nodes
+ *  only when the graph and recipes editions hash-match the ones pinned at run
+ *  start. Returns the ledger-ready mismatch (reason + current hashes) or
+ *  undefined when the editions are identical. */
+export function graphRecipePinMismatch(
+  graphSource: string,
+  recipeSource: string,
+  pin: { graphSha: string; recipesSha: string },
+): { reason: string; graphSha: string; recipesSha: string } | undefined {
+  const graphSha = createHash('sha256').update(graphSource).digest('hex');
+  const recipesSha = createHash('sha256').update(recipeSource).digest('hex');
+  if (graphSha === pin.graphSha && recipesSha === pin.recipesSha) return undefined;
+  const changed: string[] = [];
+  if (graphSha !== pin.graphSha) changed.push('graph');
+  if (recipesSha !== pin.recipesSha) changed.push('recipes');
+  return { reason: `graph/recipes pin mismatch: ${changed.join('+')} edition differs from run start`, graphSha, recipesSha };
+}
+
 function safeSegment(value: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) || value === '.' || value === '..') {
     throw new Error(`invalid graph run identifier: ${value}`);
@@ -1219,6 +1238,20 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const loopBudget = graphLoopBudget(graph);
   const unitResolver = createGraphUnitResolver();
   const units = validateUnitCallsWithResolver(graph, path, options.unitContext?.ancestors ?? [], undefined, unitResolver);
+  const unitPins: NonNullable<GraphRunState['unitPins']> = Object.fromEntries([...units].map(([node, unit]) => [node, {
+    unit: unit.template.graphId, version: unit.template.version, path: unit.path, hash: unit.hash,
+    ...(unit.shapeHash === undefined ? {} : { shapeHash: unit.shapeHash }),
+  }]));
+  if (saved?.unitPins) {
+    for (const [node, pin] of Object.entries(saved.unitPins)) {
+      const current = unitPins[node];
+      if (!current || current.unit !== pin.unit || current.version !== pin.version || current.path !== pin.path ||
+          current.hash !== pin.hash || current.shapeHash !== pin.shapeHash)
+        throw new Error(`unit source changed since run started: ${node}`);
+    }
+    if (Object.keys(unitPins).length !== Object.keys(saved.unitPins).length)
+      throw new Error('unit calls changed since run started');
+  }
   if (units.size > 0) {
     const staticView = flattenGraphUnits(graph, path, unitResolver);
     debug.log('graph.unit', 'static-view', { graphId: graph.graphId, hash: graphVersionHash(staticView),
@@ -1731,6 +1764,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     ? readGraphRun(graphId, runId, root)
     : { graphId, runId, startedAt: new Date().toISOString(), ...runnerOwner, status: 'running', path: [], nodes: [], sourceHash: approvalSourceHash,
       graphSnapshot: { graphSha: createHash('sha256').update(variantSource).digest('hex'), recipesSha: createHash('sha256').update(recipeSource).digest('hex') },
+      ...(units.size > 0 ? { unitPins } : {}),
       ...(graphExtensionLedger ? { graphExtensionLedger } : {}),
       graphPath: resolve(path), ...(variant?.ok ? { variant: { overlayId: variant.overlay.overlayId, ...options.variant! } } : {}),
       ...(options.input === undefined ? {} : { input: options.input }),
@@ -1825,6 +1859,23 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.resumeRunId && options.dryRun !== undefined && options.dryRun !== state.dryRun) throw new Error('cannot change dryRun when resuming');
   if (options.resumeRunId && state.growth?.length && graphMode === 'current' && state.sourceHash !== approvalSourceHash) {
     throw new Error('graph or recipes changed since grown run');
+  }
+  // GRAPH-RECIPE-PIN-FU — general pin contract for every other current-mode
+  // resume (plain paused re-entry, interrupted `running` re-entry, and
+  // --use-current-graph). The dedicated paths above (growth, --from, awaiting-
+  // approval, snapshot mode) keep their own checks; this one closes the gap
+  // where a mid-run file replacement would otherwise execute swapped content.
+  // The refusal lands in the run ledger before any node effect can run.
+  if (options.resumeRunId && graphMode === 'current' && state.graphSnapshot && !options.fromNodeId
+    && !state.growth?.length && !state.growthPark && state.status !== 'awaiting-approval') {
+    const pinMismatch = graphRecipePinMismatch(variantSource, recipeSource, state.graphSnapshot);
+    if (pinMismatch) {
+      state.sourcePinRefusals ??= [];
+      state.sourcePinRefusals.push({ at: new Date().toISOString(), ...pinMismatch,
+        pinnedGraphSha: state.graphSnapshot.graphSha, pinnedRecipesSha: state.graphSnapshot.recipesSha });
+      persistOwnedRun(state, saved!);
+      throw new Error(`graph or recipes changed since run started: ${pinMismatch.reason} (${graphId}/${runId})`);
+    }
   }
   if (options.unitContext) {
     if (state.parentRunId !== undefined && state.parentRunId !== options.unitContext.parentRunId) throw new Error('unit parent run changed');
@@ -2892,6 +2943,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         ? { ...(state.input as Record<string, unknown>), context: {
           ...((state.input as Record<string, unknown>).context && typeof (state.input as Record<string, unknown>).context === 'object'
             ? (state.input as Record<string, unknown>).context as Record<string, unknown> : {}),
+          runId,
           nodeStartedAt,
         } } : state.input;
       handlerExecuted = true;
@@ -2899,6 +2951,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       try {
         const nodeSecrets = await resolveNodeSecrets(node);
         const handlerContext = { graphId, runId, nodeId: current, input: state.input ?? null,
+          ...(options.verifiedOwnerId ? { verifiedOwnerId: options.verifiedOwnerId } : {}),
           ...(Object.keys(nodeSecrets).length ? { secrets: nodeSecrets } : {}),
           ...(node.requires === undefined ? {} : { requires: node.requires }),
           ...(Object.hasOwn(node, 'input') ? { nodeInput: mapBinding.skipped
@@ -2931,6 +2984,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           reportedNodeOutcome = result.outcome;
           output = redactSerializedJson({ ...(result.result === undefined ? {} : { result: result.result }),
             ...(result.evidence === undefined ? {} : { evidence: result.evidence }), outcome: result.outcome,
+            ...(node.contract?.outputs.includes('undo') && result.undo !== undefined ? { undo: result.undo } : {}),
             ...(current === kstDayPolicy.outputNode && state.kstDayFallback ? { kstDayFallback: state.kstDayFallback } : {}),
             ...(result.error ? { error: result.error } : {}) }) ?? 'null';
           ok = result.ok;
@@ -3871,6 +3925,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           fanOutDailyBudgetExemptRunIds.add(runId);
           let child: GraphRunState;
           try { child = await runGraph(path, { runId, graphSource: fanOutGraphSource(variantSource, graph, branchId), input: state.input,
+            ...(options.verifiedOwnerId ? { verifiedOwnerId: options.verifiedOwnerId } : {}),
             ...(baseEventBus === undefined ? {} : { eventBus: baseEventBus }),
             dryRun: state.dryRun, quiet: true, signal: options.signal, pinChildUniverse: options.pinChildUniverse,
             releaseCommandSource: options.releaseCommandSource,

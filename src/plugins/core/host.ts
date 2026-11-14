@@ -15,7 +15,7 @@
 // commands. Full key-routing and LLM tool dispatch land in Phase 4.
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'fs';
-import { basename, dirname, join, resolve, type PlatformPath } from 'path';
+import { basename, dirname, join, resolve } from 'path';
 import { listInstalledPlugins, parseDeclaredPluginRef } from '../install/plugin-install.js';
 import { satisfies as satisfiesSemver } from 'semver';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
@@ -84,7 +84,7 @@ export interface PluginEntry {
 }
 
 /** The installed tree is plugins/<market>/<id>/<version>; use native path operations on each host. */
-export function installedPluginMarketFromPath(pluginPath: string, paths: Pick<PlatformPath, 'basename' | 'dirname'> = { basename, dirname }): string {
+export function installedPluginMarketFromPath(pluginPath: string, paths: { basename: typeof basename; dirname: typeof dirname } = { basename, dirname }): string {
   return paths.basename(paths.dirname(paths.dirname(pluginPath)));
 }
 
@@ -212,6 +212,8 @@ export interface HostHooks {
 }
 
 export interface PluginHostOptions {
+  /** Host-owned verified wire adapter; absent until upstream contract is confirmed. Never supplied by tool arguments. */
+  solarDecideWire?: import('../../../plugins/upstage-solar-decide/plugin.js').DecideWireContract;
   trustStore?: PluginTrustStore;
   /** PX-2 P4: optional plugin-state persistence backend. When omitted,
    *  ctx.persistentState is undefined (older callers see no change). */
@@ -259,6 +261,7 @@ export class PluginHost {
   private activeEntries = new Map<string, ActivePlugin>();
   private lifecycleTail: Promise<void> = Promise.resolve();
   private hooks: HostHooks;
+  private solarDecideWire: PluginHostOptions['solarDecideWire'];
   /** Optional widget host. When set, plugin-host calls buildLayout on
    *  activation and auto-disposes widgets on deactivate. */
   private widgetHost: WidgetHost | null;
@@ -293,6 +296,7 @@ export class PluginHost {
 
   constructor(hooks: HostHooks, widgetHost: WidgetHost | null = null, opts: PluginHostOptions = {}) {
     this.hooks = hooks;
+    this.solarDecideWire = opts.solarDecideWire;
     this.widgetHost = widgetHost;
     this.trustStore = opts.trustStore ?? new PluginTrustStore();
     this.userDir = opts.userDir ?? USER_DIR;
@@ -1356,6 +1360,10 @@ export class PluginHost {
   private buildContext(active = this.activeEntry): PluginContext {
     const host = this;
     return {
+      solarDecide: active?.name === 'upstage-solar-decide' ? async (input, limits) => {
+        const { createSolarDecideUserAction } = await import('../../graph-runner/capability-providers/upstage-solar-decide.js');
+        return createSolarDecideUserAction({ wire: host.solarDecideWire })(input, limits);
+      } : undefined,
       get pluginName() { return active?.name ?? ''; },
       get state() { return active?.state ?? {}; },
       get display() { return host.hooks.display; },

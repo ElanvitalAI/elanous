@@ -2701,6 +2701,65 @@ test('snapshot source hash mismatch refuses --from without truncating the saved 
   expect(readFileSync(first.statePath, 'utf8')).toBe(before);
 });
 
+// GRAPH-RECIPE-PIN-FU — start/resume pin contract on current-mode resumes.
+// A run paused at a node boundary must refuse a mid-run graph/recipes file
+// replacement before any node effect runs, and the run ledger must name the
+// mismatching edition. Identical editions still execute normally.
+async function pausedAtFirstBoundary(command: string): Promise<{ graph: string; root: string; first: Awaited<ReturnType<typeof runGraph>> }> {
+  const { graph, root } = fixture(command);
+  const first = await runGraph(graph, { deps: { root } });
+  expect(first.status).toBe('done');
+  const ledger = JSON.parse(readFileSync(first.statePath, 'utf8')) as Record<string, unknown>;
+  ledger.status = 'paused';
+  ledger.pausedAt = new Date().toISOString();
+  delete ledger.finishedAt;
+  ledger.path = ['first'];
+  ledger.nodes = (ledger.nodes as Array<Record<string, unknown>>).slice(0, 1);
+  writeFileSync(first.statePath, JSON.stringify(ledger));
+  return { graph, root, first };
+}
+
+test('GRAPH-RECIPE-PIN-FU: replaced recipes refuse current-mode resume before effects and record the mismatch in the ledger', async () => {
+  const { graph, root, first } = await pausedAtFirstBoundary('exit 0');
+  const originalRecipes = readFileSync(join(root, 'recipes.yaml'), 'utf8');
+  writeFileSync(join(root, 'recipes.yaml'), originalRecipes.replace('second:\n  command: "exit 0"', 'second:\n  command: "printf TAMPERED-RAN"'));
+  const bodies: string[] = [];
+  await expect(runGraph(graph, { resumeRunId: first.runId, useCurrentGraph: true,
+    deps: { root, runBash: async (body: string) => { bodies.push(body); return { stdout: '', stderr: '', exitCode: 0 }; } } }))
+    .rejects.toThrow('graph or recipes changed since run started');
+  expect(bodies.some((body) => body.includes('TAMPERED-RAN'))).toBe(false);
+  const ledger = JSON.parse(readFileSync(first.statePath, 'utf8'));
+  expect(ledger.sourcePinRefusals).toHaveLength(1);
+  expect(ledger.sourcePinRefusals[0].reason).toContain('recipes');
+  expect(ledger.sourcePinRefusals[0].pinnedRecipesSha).toBe(createHash('sha256').update(originalRecipes).digest('hex'));
+  expect(ledger.sourcePinRefusals[0].recipesSha).toBe(createHash('sha256').update(readFileSync(join(root, 'recipes.yaml'), 'utf8')).digest('hex'));
+  expect(ledger.status).toBe('paused');
+});
+
+test('GRAPH-RECIPE-PIN-FU: replaced graph refuses current-mode resume before effects and names the graph edition', async () => {
+  const { graph, root, first } = await pausedAtFirstBoundary('exit 0');
+  const originalGraph = readFileSync(graph, 'utf8');
+  writeFileSync(graph, originalGraph.replace('version: 1', 'version: 2'));
+  const bodies: string[] = [];
+  await expect(runGraph(graph, { resumeRunId: first.runId, useCurrentGraph: true,
+    deps: { root, runBash: async (body: string) => { bodies.push(body); return { stdout: '', stderr: '', exitCode: 0 }; } } }))
+    .rejects.toThrow('graph or recipes changed since run started');
+  expect(bodies).toHaveLength(0);
+  const ledger = JSON.parse(readFileSync(first.statePath, 'utf8'));
+  expect(ledger.sourcePinRefusals).toHaveLength(1);
+  expect(ledger.sourcePinRefusals[0].reason).toContain('graph');
+  expect(ledger.sourcePinRefusals[0].pinnedGraphSha).toBe(createHash('sha256').update(originalGraph).digest('hex'));
+});
+
+test('GRAPH-RECIPE-PIN-FU: identical editions still execute the paused run under the pin contract', async () => {
+  const { graph, root, first } = await pausedAtFirstBoundary('exit 0');
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, useCurrentGraph: true, deps: { root } });
+  expect(resumed.status).toBe('done');
+  expect(resumed.path).toEqual(['first', 'second', 'done']);
+  const ledger = JSON.parse(readFileSync(first.statePath, 'utf8'));
+  expect(ledger.sourcePinRefusals).toBeUndefined();
+});
+
 test('snapshot recipes still run current node scripts after repair', async () => {
   const { graph, root } = fixture('exit 0');
   const script = join(root, 'repair.sh');

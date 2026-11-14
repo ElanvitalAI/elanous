@@ -1,0 +1,20 @@
+apiVersion: elanous.dev/graph/v2
+graph:
+  id: upstage-information-extract
+  version: 1.0.0
+  layer: flow
+  purpose: "One consented document to schema checked JSON"
+entry: extract
+nodes:
+  - id: extract
+    type: capability
+    requires: document.information-extract@1
+    with:
+      documentDataUrl: $input.documentDataUrl
+      schemaName: $input.schemaName
+      schema: $input.schema
+      consentToUpstage: $input.consentToUpstage
+edges:
+  - { from: extract, on: outcome, map: { ok: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.unit] }

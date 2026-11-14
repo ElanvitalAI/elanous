@@ -1,4 +1,6 @@
 export interface MemberSignupLinkIntent { ref?: string; referralCode?: string; eventCode?: string }
+export type NewsletterChoice = 'opted_in' | 'declined';
+export const NEWSLETTER_REVISION = 'newsletter-v1';
 
 /** Public member ID and legacy referral code are distinct, mutually exclusive inputs. */
 export function memberSignupIntentFromSearch(search: string): MemberSignupLinkIntent {
@@ -23,8 +25,9 @@ export function memberSignupIntentFromSearch(search: string): MemberSignupLinkIn
   return { ...(ref ? { ref } : {}), ...(referralCode ? { referralCode } : {}), ...(eventCode ? { eventCode } : {}) };
 }
 
-export function memberSignupBody(intent: MemberSignupLinkIntent) {
+export function memberSignupBody(intent: MemberSignupLinkIntent, newsletterChoice?: NewsletterChoice) {
   const { ref, ...rest } = intent;
   return { consents: { privacy: 'privacy-v1', terms: 'terms-v1' },
-    ...(ref ? ref.startsWith('em_') ? { legacyPublicId: ref } : { referrerMemberId: ref } : {}), ...rest };
+    ...(ref ? ref.startsWith('em_') ? { legacyPublicId: ref } : { referrerMemberId: ref } : {}), ...rest,
+    ...(newsletterChoice ? { newsletterPreference: { choice: newsletterChoice, revision: NEWSLETTER_REVISION } } : {}) };
 }

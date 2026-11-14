@@ -75,8 +75,8 @@ nodes:
     requires: store.write@1
     map: { over: "$validate-suggestions.result.items", as: suggestionwrite, max_parallel: 3 }
     with: { op: "$suggestionwrite.op", collection: "$suggestionwrite.collection", owner: "$suggestionwrite.owner", key: "$suggestionwrite.key", value: "$suggestionwrite.value", ownerScoped: "$suggestionwrite.ownerScoped", __validatedWrite: "$suggestionwrite" }
-  - { id: notify,  type: notify, requires: notify.channel@1, with: { channels: [android, tui, telegram], dedup: "briefing:$brief.evidence.briefing.id" } }
-  - { id: notify-brief-hold, type: notify, requires: notify.channel@1, with: { channels: [android, tui, telegram], dedup: "briefing:$brief.evidence.briefing.id" } }
+  - { id: notify, type: notify, requires: notify.channel@1, with: { text: "회원 브리핑과 제안이 준비되었습니다.", kind: notify, refId: "$brief.evidence.briefing.id" } }
+  - { id: notify-brief-hold, type: notify, requires: notify.channel@1, with: { text: "회원 브리핑은 준비되었고 제안은 검토가 필요합니다.", kind: notify, refId: "$brief.evidence.briefing.id" } }
 edges:
   - { from: load-app-slots, to: collect }
   - { from: collect, to: extract }

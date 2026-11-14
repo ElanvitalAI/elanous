@@ -21,6 +21,7 @@ import { renderMemberHomePage } from './member-home-page.js';
 import { nexusRootDir } from '../paths.js';
 import { sessionRoot } from '../../session/index.js';
 import { createMemberSessionService, MEMBER_SESSION_ID, MemberSessionAccessError, type MemberSessionService } from './member-sessions.js';
+import { createMemberCloudBackupRoute } from './member-cloud-backup-route.js';
 
 export const MEMBER_GOOGLE_CALLBACK_PATH = '/v1/members/oauth/google/callback';
 // Source: OP #16901, 2026-11-12 19:01 KST. Signup admission is separate from the 11/14 draw eligibility window.
@@ -94,6 +95,8 @@ export interface MembersApi {
 
 export interface MembersApiOptions {
   readonly store: MemberStore;
+  /** Injected only by the isolated member backup route tests; production uses the member store and Nexus state root. */
+  readonly cloudBackupRoute?: ReturnType<typeof createMemberCloudBackupRoute>;
   readonly google: GoogleSignin;
   /** Fixed post-signup destination, never accepted from request data. */
   readonly successRedirectUri: string;
@@ -259,11 +262,12 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
   if (new URL(webOrigin).origin !== webOrigin || (new URL(webOrigin).protocol !== 'https:' && new URL(webOrigin).hostname !== 'localhost')) {
     throw new Error('member web origin must be a fixed HTTPS origin');
   }
-  const kcbSuccess = new URL(options.kcbSuccessRedirectUri ?? '/members/', webOrigin);
+  const kcbSuccess = new URL(options.kcbSuccessRedirectUri ?? '/app/board/', webOrigin);
   if (kcbSuccess.origin !== webOrigin) throw new Error('KCB success redirect must share the member web origin');
   const appAuthRedirectUris = new Set(options.appAuthRedirectUris ?? []);
   if ([...appAuthRedirectUris].some(uri => !validAppAuthRedirectUri(uri))) throw new Error('app auth redirects must be exact allowlisted elanous:// URIs');
   const now = options.now ?? Date.now;
+  const cloudBackupRoute = options.cloudBackupRoute ?? createMemberCloudBackupRoute({ memberStore: options.store });
   const tokens = createMemberTokenApi({ store: options.store, now });
   let resolvedAppLifecycle: Pick<AppLifecycleStore, 'ensureCreated'> | undefined;
   let hasResolvedAppLifecycle = false;
@@ -305,6 +309,9 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       // POST must work without granting that origin access to member cookie routes.
       const appLoginStartOrigin = path === '/v1/members' && request.method === 'POST' && origin === callback.origin;
       if (origin && origin !== webOrigin && !appLoginStartOrigin && request.method !== 'GET') return json({ error: 'origin-not-allowed' }, 403);
+      if (path === '/v1/members/secret-backups' || path.startsWith('/v1/members/secret-backups/')) {
+        return withCors(request, (await cloudBackupRoute.handle(request))!, webOrigin);
+      }
       if (path.startsWith('/v1/member/keys') || path.startsWith('/v1/member/tokens')) {
         const respond = (response: Response) => withCors(request, response, webOrigin);
         const session = sessionFromCookie(request);
@@ -502,8 +509,11 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         const appSlug = url.searchParams.get('appSlug');
         const memberSession = sessionFromCookie(request);
         const member = memberSession ? options.store.memberForSession(memberSession, new Date(now()).toISOString()) : null;
+        const webSlot = appSlug && member ? options.store.appSlotForMember(member.id) : null;
         const owner = appSlug
-          ? options.resolveVerifiedOwner?.(appSlug, bearer ?? request.headers.get('cookie') ?? '', options.store)
+          ? member
+            ? webSlot?.appSlug === appSlug ? { memberId: member.id } : null
+            : options.resolveVerifiedOwner?.(appSlug, bearer ?? request.headers.get('cookie') ?? '', options.store)
           : bearer?.startsWith('aps_') ? options.resolveVerifiedMemberOwner?.(bearer, options.store)
             : member ? { memberId: member.id } : null;
         return withCors(request, owner ? json(owner) : json({ error: 'unauthorized' }, 401), webOrigin);
@@ -783,7 +793,7 @@ export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'iss
   const mobileVerifier = mobileClientIds.length > 0 ? createMobileGoogleIdTokenVerifier(mobileClientIds) : undefined;
   const appAuthRedirectUris = (process.env.MEMBER_APP_AUTH_REDIRECT_URIS ?? '').split(',').map(value => value.trim()).filter(Boolean);
   return createMembersApi({ store, google, successRedirectUri, webOrigin, getAppLifecycle,
-    kcbSuccessRedirectUri: process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI?.trim() || new URL('/members/', webOrigin).toString(),
+    kcbSuccessRedirectUri: process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI?.trim() || new URL('/app/board/', webOrigin).toString(),
     ...(options.now ? { now: options.now } : {}),
     getNewsletterCountToken: () => getSecretAsync('NEWSLETTER_COUNT_READ_TOKEN'),
     appAuthRedirectUris,

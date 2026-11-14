@@ -1,0 +1,62 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "upstage-solar-decide",
+  "name": "upstage-solar-decide",
+  "version": "0.1.0-beta.1",
+  "description": "Solar Decide beta; explicit adapter only, upstream field contract and shared U-0 transport required.",
+  "contributes": {
+    "providers": [
+      {
+        "id": "upstage-solar-decide",
+        "name": "Solar Decide (beta)",
+        "module": "./plugin.ts",
+        "factory": "createSolarDecideProvider"
+      }
+    ],
+    "skills": [
+      {
+        "id": "upstage-solar-decide/decide",
+        "path": "./skills/decide/SKILL.md"
+      }
+    ],
+    "aiTools": [
+      {
+        "name": "SolarDecideBeta",
+        "description": "Explicit Solar Decide beta with opt-in and transmission consent; upstream wire confirmation required.",
+        "route": {
+          "triggers": [
+            "solar decide beta"
+          ],
+          "examples": [
+            "Use Solar Decide beta with explicit consent"
+          ],
+          "sideEffects": "external",
+          "risk": "medium",
+          "cost": "cheap",
+          "requiresConfirm": true
+        }
+      }
+    ]
+  },
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "capabilities": [
+        "net:api.upstage.ai",
+        "secret:upstage"
+      ],
+      "authoredTrust": "official",
+      "beta": true,
+      "defaultGraphProvider": false,
+      "credentialRefs": [
+        "cred:upstage.api_key"
+      ],
+      "wireContract": "owner-confirmation-required",
+      "sharedTransport": "U-0 PR #37565; explicit createSharedSolarDecideTransport adapter"
+    }
+  },
+  "main": "./plugin.ts",
+  "activationEvents": [
+    "onRoute"
+  ]
+}

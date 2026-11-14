@@ -9,6 +9,8 @@ import { resetUserConfig } from '../src/user-config.js';
 import { scriptedIO } from '../src/onboarding.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 
+const maskedIO = (lines: string[]) => { const io = scriptedIO(lines); return { ...io, askSecret: io.ask }; };
+
 let tmpDir: string;
 
 beforeEach(() => {
@@ -30,7 +32,7 @@ describe('runFirecrawlSetup', () => {
     let captured = '';
     const output: string[] = [];
     const result = await runFirecrawlSetup({
-      io: scriptedIO([]),
+      io: maskedIO([]),
       apiKeyInline: 'fc-test-key-1234567890',
       cliProbeFn: () => true,
       patchFn: (k) => { captured = k; },
@@ -41,13 +43,13 @@ describe('runFirecrawlSetup', () => {
     expect(result.keyWritten).toBe(true);
     expect(result.cliPresent).toBe(true);
     expect(captured).toBe('fc-test-key-1234567890');
-    expect(output).toContain('  Used by: web search (omni_search) · model discovery');
+    expect(output).toContain('  Used by: website crawl tool · model discovery');
   });
 
   test('non-interactive: --api-key persists even when CLI absent (deferred install path)', async () => {
     let captured = '';
     const result = await runFirecrawlSetup({
-      io: scriptedIO([]),
+      io: maskedIO([]),
       apiKeyInline: 'fc-test-key-1234567890',
       cliProbeFn: () => false,
       patchFn: (k) => { captured = k; },
@@ -64,7 +66,7 @@ describe('runFirecrawlSetup', () => {
     let captured = '';
     const output: string[] = [];
     const result = await runFirecrawlSetup({
-      io: scriptedIO(['fc-interactive-key-9876']),
+      io: maskedIO(['fc-interactive-key-9876']),
       cliProbeFn: () => true,
       patchFn: (k) => { captured = k; },
       readExistingFn: () => ({ apiKey: '' }),
@@ -73,13 +75,13 @@ describe('runFirecrawlSetup', () => {
     expect(result.exitCode).toBe(0);
     expect(result.keyWritten).toBe(true);
     expect(captured).toBe('fc-interactive-key-9876');
-    expect(output).toContain('  Used by: web search (omni_search) · model discovery');
+    expect(output).toContain('  Used by: website crawl tool · model discovery');
   });
 
   test('interactive: empty input with existing key keeps existing', async () => {
     let captured = '';
     const result = await runFirecrawlSetup({
-      io: scriptedIO(['']),
+      io: maskedIO(['']),
       cliProbeFn: () => true,
       patchFn: (k) => { captured = k; },
       readExistingFn: () => ({ apiKey: 'existing-fc-key-abcdef' }),
@@ -93,7 +95,7 @@ describe('runFirecrawlSetup', () => {
   test('interactive: re-prompts on too-short key, then accepts a valid one', async () => {
     let captured = '';
     const result = await runFirecrawlSetup({
-      io: scriptedIO(['short', 'fc-properly-sized-key-3210']),
+      io: maskedIO(['short', 'fc-properly-sized-key-3210']),
       cliProbeFn: () => true,
       patchFn: (k) => { captured = k; },
       readExistingFn: () => ({ apiKey: '' }),
@@ -105,7 +107,7 @@ describe('runFirecrawlSetup', () => {
 
   test('non-interactive: empty inline key + no existing → exit 1', async () => {
     const result = await runFirecrawlSetup({
-      io: scriptedIO(['', '', '']),  // would also fail interactively
+      io: maskedIO(['', '', '']),  // would also fail interactively
       cliProbeFn: () => true,
       patchFn: () => { throw new Error('should not patch'); },
       readExistingFn: () => ({ apiKey: '' }),

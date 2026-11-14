@@ -64,7 +64,7 @@ test('configured daemon admits KCB signup now, closes December 1 KST, and refuse
   }
 });
 
-test('configured KCB callback defaults to /members/, honors same-origin override, and leaves ordinary callback unchanged', async () => {
+test('configured KCB callback defaults to /app/board/, honors same-origin override, and leaves ordinary callback unchanged', async () => {
   const previous = {
     redirect: process.env.GOOGLE_OAUTH_REDIRECT_URI,
     success: process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI,
@@ -104,7 +104,7 @@ test('configured KCB callback defaults to /members/, honors same-origin override
   };
   try {
     delete process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI;
-    expect(await complete('KCB1114')).toBe('https://app.example.test/members/');
+    expect(await complete('KCB1114')).toBe('https://app.example.test/app/board/');
     expect(await complete()).toBe('https://api.example.test/v1/members/home');
     process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI = 'https://app.example.test/custom-success';
     expect(await complete('KCB1114')).toBe('https://app.example.test/custom-success');

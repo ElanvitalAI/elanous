@@ -1,3 +1,4 @@
+import { configureFirecrawlKey } from '../setup/firecrawl-key.js';
 import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
@@ -13,6 +14,7 @@ import { getUserConfig, saveUserConfig, userConfigPath } from '../user-config.js
 import type { UserConfig } from '../user-config/types.js';
 import { collectServiceKeys, printKeySetupReport } from '../onboarding/key-setup.js';
 import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js';
+import { setCredentialSlotAsync } from '../nexus/config/secrets/cred-slots.js';
 import { probeProvider } from '../llm/provider-probe.js';
 import { createSecretPrompt } from '../onboarding/secret-prompt.js';
 import { realIO } from '../onboarding.js';
@@ -53,6 +55,7 @@ export interface SetupCliDeps extends DoctorOptions {
   promptSecret?: (message: string) => Promise<string | undefined>;
   getSecretAsync?: typeof getSecretAsync;
   setSecretAsync?: typeof setSecretAsync;
+  setCredentialSlotAsync?: typeof setCredentialSlotAsync;
   probeKey?: typeof probeProvider;
   isStdinTty?: () => boolean;
   out?: { log: (value: string) => void; error?: (value: string) => void };
@@ -384,6 +387,10 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
             return exitCode;
           });
           const fixCode = await runDoctorFix(['doctor', '--fix', '--yes']);
+          if (fixCode === 0 && isStdinTty() && !opts.yes) {
+            const result = await configureFirecrawlKey({ promptSecret: askSecret, print: out.log, setSecret: deps.setCredentialSlotAsync ?? setCredentialSlotAsync });
+            if (result === 'failed') { setExitCode(1); return; }
+          } else out.log('Firecrawl 선택 키 설정: elanous setup firecrawl');
           out.log(`First setup ${fixCode === 0 ? 'complete' : 'incomplete'}; provider/GitHub authentication and OS security approvals remain manual.`);
           setExitCode(fixCode);
         } catch {
@@ -440,6 +447,43 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         return;
       }
       setExitCode(0);
+    });
+
+  setup.command('upstage')
+    .description('Optionally save one Upstage API key without displaying its value')
+    .option('--skip', 'Leave Upstage unconfigured')
+    .allowExcessArguments(false)
+    .action(async (opts: { skip?: boolean }) => {
+      if (opts.skip || !isStdinTty()) {
+        out.log('Upstage setup skipped · `eln setup upstage` to configure later');
+        setExitCode(0);
+        return;
+      }
+      try {
+        const value = await askSecret('Upstage API key (blank to skip): ');
+        if (!value?.trim()) {
+          out.log('Upstage setup skipped');
+          setExitCode(0);
+          return;
+        }
+        await (deps.setCredentialSlotAsync ?? setCredentialSlotAsync)('cred:upstage.api_key', value);
+        out.log('Upstage credential saved · value hidden');
+        setExitCode(0);
+      } catch {
+        (out.error ?? out.log)('Upstage credential setup failed · value hidden');
+        setExitCode(1);
+      }
+    });
+
+  setup.command('firecrawl')
+    .description('Set an optional Firecrawl key in the secret store; Enter skips')
+    .action(async () => {
+      if (!isStdinTty()) {
+        (out.error ?? out.log)('Firecrawl 키 설정은 TTY에서 elanous setup firecrawl 로 실행하세요.');
+        setExitCode(1); return;
+      }
+      const result = await configureFirecrawlKey({ promptSecret: askSecret, print: out.log, setSecret: deps.setCredentialSlotAsync ?? setCredentialSlotAsync });
+      setExitCode(result === 'failed' ? 1 : 0);
     });
 
   setup.command('service-keys')

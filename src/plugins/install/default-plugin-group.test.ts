@@ -15,8 +15,9 @@ function fixture(): string {
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('default plugin group', () => {
-  test('installs the six curated packages into an empty config and only Linear key changes readiness', async () => {
+  test('installs the curated packages into an empty config and individual keys change readiness', async () => {
     const expectedIds: Array<(typeof DEFAULT_PLUGIN_GROUP)[number]['id']> = [
+      'firecrawl',
       'demo-research',
       'demo-linear-secretary',
       'demo-absorption-briefing',
@@ -26,7 +27,7 @@ describe('default plugin group', () => {
     ];
     expect(DEFAULT_PLUGIN_GROUP.map(plugin => plugin.id)).toEqual(expectedIds);
 
-    const installed = await installDefaultPluginGroup({ root: fixture() });
+    const installed = await installDefaultPluginGroup({ root: fixture(), yes: true });
     expect(installed.map(plugin => plugin.name)).toEqual(expectedIds);
     for (const plugin of installed) {
       expect(existsSync(join(plugin.path, 'skills', plugin.name, 'SKILL.md'))).toBe(true);
@@ -42,7 +43,7 @@ describe('default plugin group', () => {
 
     const baseline = defaultPluginStatuses({ satisfiedPrerequisites: ['llm-provider', 'aside'] });
     expect(baseline.filter(plugin => plugin.status === 'key-needed').map(plugin => plugin.id))
-      .toEqual(['demo-linear-secretary']);
+      .toEqual(['firecrawl', 'demo-linear-secretary']);
     const afterLinearKey = defaultPluginStatuses({
       readyServiceKeyIds: ['linear'],
       satisfiedPrerequisites: ['llm-provider', 'aside'],

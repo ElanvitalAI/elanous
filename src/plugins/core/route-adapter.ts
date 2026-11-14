@@ -8,7 +8,7 @@ import { dispatchToolRoute, type ToolRouteMatch } from '../../tool-router/index.
 import { runAppDeploy } from '../../agent/app-deploy-plugin.js';
 import type { ToolRuntimeContext } from '../../tool-runtime/types.js';
 
-const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy']);
+const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:firecrawl', 'native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy']);
 const NON_EXECUTABLE_NATIVE_HANDLERS = new Set(['native:release_graph_start']);
 
 interface NativePluginRouteTool extends LLMToolSpec {

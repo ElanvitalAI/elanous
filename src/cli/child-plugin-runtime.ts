@@ -5,6 +5,38 @@ import { buildCoreTools } from '../domains/core-tools.js';
 import { dispatchToolByName, getToolRuntime, listToolRuntimes, registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import type { GraphRunOptions } from '../graph-runner/runner.js';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+/** Resolve only a declared graph route, using the graph CLI's trusted runner boundary. */
+async function graphRouteForFile(graphFile: string, injected?: GraphRunOptions['deps']): Promise<{
+  deps: GraphRunOptions['deps']; defaultAsk?: string;
+}> {
+  const graphPath = realpathSync(graphFile);
+  const pluginRoot = resolve(dirname(graphPath), '..');
+  const manifestPath = join(pluginRoot, 'plugin.json');
+  if (!existsSync(manifestPath)) return { deps: injected };
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions?: { 'ai.elanous'?: {
+    graphs?: string[]; graphProviders?: Record<string, { module: string; factory: string; withPluginRoot?: boolean;
+      defaultAsk?: string }> } } };
+  const extension = manifest.extensions?.['ai.elanous'];
+  const relativeGraph = relative(pluginRoot, graphPath).split(sep).join('/');
+  if (!extension?.graphs?.some(graph => graph.replace(/^\.\//, '') === relativeGraph)) return { deps: injected };
+  const declaration = extension.graphProviders?.[relativeGraph] ?? extension.graphProviders?.[`./${relativeGraph}`];
+  if (!declaration) return { deps: injected };
+  const defaultAsk = typeof declaration.defaultAsk === 'string' && declaration.defaultAsk.trim()
+    ? declaration.defaultAsk : undefined;
+  if (injected?.capabilityProviders) return { deps: injected, defaultAsk };
+  const runnerRoot = realpathSync(resolve(import.meta.dir, '../graph-runner'));
+  const modulePath = realpathSync(resolve(import.meta.dir, '../..', declaration.module));
+  if (!modulePath.startsWith(`${runnerRoot}${sep}`)) throw new Error('plugin graph provider must use the shared graph runner');
+  const module = await import(pathToFileURL(modulePath).href) as Record<string, unknown>;
+  const factory = module[declaration.factory];
+  if (typeof factory !== 'function') throw new Error(`plugin graph provider factory missing: ${declaration.factory}`);
+  return { deps: { ...injected, capabilityProviders: declaration.withPluginRoot ? factory(pluginRoot) : factory() },
+    defaultAsk };
+}
 
 /** The same catalog and dispatch seams used by the classic PluginHost route bridge. */
 export interface ChildPluginRuntimeContract {
@@ -25,6 +57,8 @@ export interface ChildPluginRuntimeOptions {
   dispatchGraph?: (pluginId: string, graphId: string, graphFile: string, args: Record<string, unknown>, context?: ToolRuntimeContext) => Promise<unknown>;
   /** Isolated graph provider/root for an actual-runner test world. */
   graphDeps?: GraphRunOptions['deps'];
+  /** Fake model for the isolated default graph route; production uses the CLI model provider. */
+  graphPrompt?: (prompt: string) => Promise<string>;
 }
 
 export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOptions = {}): ChildPluginRuntimeContract {
@@ -52,9 +86,15 @@ export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOpti
       const { decideGraphApproval, runGraph } = await import('../graph-runner/runner.js');
       const inputContext = args.context && typeof args.context === 'object' && !Array.isArray(args.context)
         ? args.context as Record<string, unknown> : {};
-      const input = { ...args, context: { ...inputContext, memberId: owner.id } };
-      const deps = options.graphDeps;
-      const state = await runGraph(graphFile, { input, quiet: true, ...(deps ? { deps } : {}) });
+      const route = await graphRouteForFile(graphFile, options.graphDeps);
+      const input = { ...args,
+        ...(args.ask === undefined && route.defaultAsk ? { ask: route.defaultAsk } : {}),
+        context: { ...inputContext, memberId: owner.id } };
+      const deps = { ...route.deps, callLLM: route.deps?.callLLM ?? options.graphPrompt ?? (async (prompt: string) => {
+        const { buildCliWorkflowDeps } = await import('./workflow.js');
+        return buildCliWorkflowDeps().callLLM({ prompt });
+      }) };
+      const state = await runGraph(graphFile, { input, verifiedOwnerId: owner.id, quiet: true, ...(deps ? { deps } : {}) });
       if (state.status !== 'awaiting-approval' || !Object.hasOwn(args, 'ticketDesignPath')) return state;
       if (!options.requestConfirmation) throw new Error('Scene 5 approval surface is unavailable');
       const { scene5DecisionPromptFromGraph } = await import('../tui-client/scene5-decision-consumer.js');
@@ -63,7 +103,7 @@ export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOpti
       const pendingNodeId = state.pending!.nodeId;
       decideGraphApproval(state.graphId, state.runId, approved ? 'approved' : 'rejected', owner.id,
         deps?.root, { nodeId: pendingNodeId, visit: state.path.filter(node => node === pendingNodeId).length });
-      return runGraph(graphFile, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+      return runGraph(graphFile, { resumeRunId: state.runId, resumeGraphId: state.graphId, verifiedOwnerId: owner.id,
         quiet: true, ...(deps ? { deps } : {}) });
     }),
     requestConfirmation: options.requestConfirmation,
