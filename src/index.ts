@@ -12888,8 +12888,8 @@ async function main(): Promise<void> {
     const resolved = await resolveRemoteTarget({});
     if (resolved) remote = resolved;
   }
-  // Bare entry is classic. The next TUI has no remote transport yet;
-  // an explicit --tui next still reports the unsupported combination below.
+  // Bare entry is Next. A configured remote requires explicit classic until
+  // Next supports its transport; the unsupported combination is reported below.
   const tuiEntry = effectiveRootTuiEntry(rootTui, Boolean(remote));
 
   // Root dashboard resume accepts `--resume`. Only a
@@ -12984,7 +12984,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Bare `elanous` (no subcommand) → classic dashboard; next TUI only via `--tui next`. The former
+  // Bare root (no subcommand) opens Next; classic requires --tui classic. The former
   // `global.entry.defaultMode` switch (which could route here to the
   // headless NEXUS daemon) was removed 2026-07-24: T3/T4 deleted the
   // NEXUS interactive TUI, so every non-dashboard route was a dead-end
@@ -12993,8 +12993,8 @@ async function main(): Promise<void> {
   // this host emit one hint so the user knows the dashboard + daemon
   // coexist. See 내부 문서 `REPORT-tui-observation-methodology-2026-07-24` §12.
   if (args.length === 0) {
-    if (remote && tuiEntry === 'classic') {
-      console.log('기본 TUI는 classic입니다. next는 --tui next로 열 수 있습니다. 원격 next TUI는 지원하지 않습니다.');
+    if (remote && tuiEntry === 'next') {
+      console.log('기본 TUI는 next입니다. 원격 연결은 --tui classic으로 열어 주세요.');
     }
     const { isNexusDaemonLive, nexusDaemonLiveHint } = await import('./cli/nexus-daemon-hint.js');
     if (isNexusDaemonLive()) console.log(nexusDaemonLiveHint());
@@ -13166,7 +13166,7 @@ async function main(): Promise<void> {
   bootTimer.begin();
   if (tuiEntry === 'next') {
     if (remote) {
-      console.error('elanous: --tui next currently reads local sessions only; drop it (classic is the default) for remote attach');
+      console.error('elanous: next currently reads local sessions only; use --tui classic for remote attach');
       process.exitCode = 1;
       return;
     }

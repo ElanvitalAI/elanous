@@ -5,16 +5,16 @@ export interface RootTuiEntry {
   readonly error?: string;
 }
 
-/** A configured remote still needs the dashboard transport until next supports it. */
-export function effectiveRootTuiEntry(root: RootTuiEntry, hasRemote: boolean): 'classic' | 'next' {
-  return hasRemote && !root.explicit ? 'classic' : root.entry;
+/** Classic is selected only by an explicit launch flag, even with a configured remote. */
+export function effectiveRootTuiEntry(root: RootTuiEntry, _hasRemote: boolean): 'classic' | 'next' {
+  return root.entry;
 }
 
 /** Extract a root TUI flag only from the launch-option prefix. */
 export function extractRootTuiEntry(rawArgs: readonly string[]): RootTuiEntry {
   for (let i = 0; i < rawArgs.length; i++) {
     const arg = rawArgs[i]!;
-    if (arg === '--') return { args: [...rawArgs], entry: 'classic', explicit: false };
+    if (arg === '--') return { args: [...rawArgs], entry: i === rawArgs.length - 1 ? 'next' : 'classic', explicit: false };
     if (arg === '--legacy') {
       const args = [...rawArgs.slice(0, i), ...rawArgs.slice(i + 1)];
       const other = extractRootTuiEntry(args);
@@ -43,6 +43,6 @@ export function extractRootTuiEntry(rawArgs: readonly string[]): RootTuiEntry {
     }
     if (!arg.startsWith('-')) return { args: [...rawArgs], entry: 'classic', explicit: false };
   }
-  // Local and remote root launches default to classic; next stays explicit.
-  return { args: [...rawArgs], entry: 'classic', explicit: false };
+  // Root launches open Next; subcommands above retain their own routing.
+  return { args: [...rawArgs], entry: 'next', explicit: false };
 }

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { packPwaOutput } from './lib/pack-pwa-output.js';
 import { spawnSyncText } from '../src/util/spawn-sync-output.js';
 
 export function publishInternalDist(checkout: string, out: string, keep = 3): { ok: true; version: string; commit: string; sha256: string; out: string; pwaBuild: 'present' | 'missing' } {
@@ -29,6 +30,8 @@ export function publishInternalDist(checkout: string, out: string, keep = 3): { 
     const tgz = readdirSync(staging).find((file) => file.endsWith('.tgz'));
     if (!tgz) throw new Error('bun pm pack produced no tgz');
     const archive = join(staging, tgz);
+    if (!existsSync(join(checkout, 'apps/pwa/out/index.html'))) throw new Error('PWA build missing: apps/pwa/out/index.html');
+    packPwaOutput(checkout, archive);
     const listed = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8' });
     if (listed.status !== 0 || !listed.stdout.split('\n').includes('package/scripts/botlab/bot-canary.ts')) {
       throw new Error('packed archive is missing scripts/botlab/bot-canary.ts');
@@ -43,6 +46,7 @@ export function publishInternalDist(checkout: string, out: string, keep = 3): { 
     const isBuildOutput = (path: string): boolean => path.startsWith('apps/pwa/out/') || path === 'src/version/packed-revision.json';
     const publishedPaths = [...new Set([...packedPaths, 'scripts/install.sh'])].filter((path) => !isBuildOutput(path));
     const pwaBuild: 'present' | 'missing' = packedPaths.includes('apps/pwa/out/index.html') ? 'present' : 'missing';
+    if (pwaBuild === 'missing') throw new Error('packed archive is missing apps/pwa/out/index.html');
     const committed = new Set(spawnSyncText('git', ['ls-files', '--cached', '-z'], { cwd: checkout, encoding: 'utf8' }).split('\0').filter(Boolean));
     const uncommitted = publishedPaths.filter((path) => !committed.has(path));
     if (uncommitted.length) throw new Error(`packed files not committed at HEAD: ${uncommitted.join(', ')}`);

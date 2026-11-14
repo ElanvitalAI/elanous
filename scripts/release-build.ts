@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { packPwaOutput } from './lib/pack-pwa-output.js';
 
 export interface ReleaseFile { name: string; sha256: string; bytes: number }
 export interface ReleaseResult { version: string; files: ReleaseFile[]; tag?: string; prerelease: boolean }
@@ -27,7 +28,7 @@ export function buildRelease(opts: ReleaseOptions): ReleaseResult {
   if (existsSync(out) && (!statSync(out).isDirectory() || readdirSync(out).length > 0)) {
     throw new NonemptyReleaseDirectoryError(out);
   }
-  if (!existsSync(join(root, 'apps/pwa/out/index.html'))) console.error('웹 화면 없는 판');
+  if (!existsSync(join(root, 'apps/pwa/out/index.html'))) throw new Error('PWA build missing: apps/pwa/out/index.html');
   mkdirSync(out, { recursive: true });
   const packed = spawnSync('bun', ['pm', 'pack', '--destination', out, '--quiet'], {
     cwd: root, encoding: 'utf8',
@@ -37,6 +38,7 @@ export function buildRelease(opts: ReleaseOptions): ReleaseResult {
   const tarballs = readdirSync(out).filter((name) => name.endsWith('.tgz'));
   if (tarballs.length !== 1) throw new Error(`bun pm pack produced ${tarballs.length} tarballs`);
   renameSync(join(out, tarballs[0]!), join(out, 'elanous.tgz'));
+  packPwaOutput(root, join(out, 'elanous.tgz'));
   copyFileSync(join(root, 'scripts/install.sh'), join(out, 'install.sh'));
   const pinnedBunVersion = readFileSync(join(root, '.bun-version'), 'utf8').trim();
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pinnedBunVersion)) throw new Error(`invalid .bun-version: ${pinnedBunVersion}`);

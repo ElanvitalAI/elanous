@@ -15,6 +15,9 @@ test('two checkout revisions publish verified bot archives; latest switches and 
   const checkout = join(root, 'checkout');
   const out = join(root, 'out');
   mkdirSync(join(checkout, 'scripts/botlab'), { recursive: true });
+  mkdirSync(join(checkout, 'apps/pwa/out'), { recursive: true });
+  writeFileSync(join(checkout, 'apps/pwa/out/index.html'), '<html>fixture</html>');
+  writeFileSync(join(checkout, '.gitignore'), 'apps/pwa/out/\n');
   writeFileSync(join(checkout, 'package.json'), JSON.stringify({ name: 'elanous', version: '0.2.3', files: ['scripts/'], private: true }));
   writeFileSync(join(checkout, 'scripts/install.sh'), '#!/usr/bin/env bash\necho install\n');
   writeFileSync(join(checkout, 'scripts/botlab/bot-canary.ts'), 'export const revision = 1;\n');
@@ -79,6 +82,9 @@ test('CLI refuses untracked and modified packed files before publishing latest',
   const checkout = join(root, 'checkout');
   const out = join(root, 'out');
   mkdirSync(join(checkout, 'scripts/botlab'), { recursive: true });
+  mkdirSync(join(checkout, 'apps/pwa/out'), { recursive: true });
+  writeFileSync(join(checkout, 'apps/pwa/out/index.html'), '<html>fixture</html>');
+  writeFileSync(join(checkout, '.gitignore'), 'apps/pwa/out/\n');
   writeFileSync(join(checkout, 'package.json'), JSON.stringify({ name: 'elanous', version: '0.2.3', files: ['scripts/'], private: true }));
   writeFileSync(join(checkout, 'scripts/install.sh'), '#!/bin/sh\necho install\n');
   const git = (...args: string[]) => {
@@ -121,6 +127,9 @@ test('CLI refuses uncommitted pack ignore rules without moving latest', () => {
   const checkout = join(root, 'checkout');
   const out = join(root, 'out');
   mkdirSync(join(checkout, 'scripts/botlab'), { recursive: true });
+  mkdirSync(join(checkout, 'apps/pwa/out'), { recursive: true });
+  writeFileSync(join(checkout, 'apps/pwa/out/index.html'), '<html>fixture</html>');
+  writeFileSync(join(checkout, '.gitignore'), 'apps/pwa/out/\n');
   writeFileSync(join(checkout, 'package.json'), JSON.stringify({ name: 'elanous', version: '0.2.3', files: ['scripts/'], private: true }));
   writeFileSync(join(checkout, 'scripts/install.sh'), '#!/bin/sh\necho install\n');
   writeFileSync(join(checkout, 'scripts/botlab/bot-canary.ts'), 'export const revision = 1;\n');
@@ -155,6 +164,9 @@ test('an uncommitted PWA build output is packed (build artifact) while other unc
   const out = mkdtempSync(join(tmpdir(), 'internal-dist-pwa-out-'));
   try {
     mkdirSync(join(checkout, 'scripts/botlab'), { recursive: true });
+  mkdirSync(join(checkout, 'apps/pwa/out'), { recursive: true });
+  writeFileSync(join(checkout, 'apps/pwa/out/index.html'), '<html>fixture</html>');
+  writeFileSync(join(checkout, '.gitignore'), 'apps/pwa/out/\n');
     mkdirSync(join(checkout, 'apps/pwa/out'), { recursive: true });
     writeFileSync(join(checkout, 'package.json'), JSON.stringify({ name: 'elanous', version: '0.2.3', files: ['scripts/', 'apps/pwa/out/'], private: true }));
     writeFileSync(join(checkout, '.gitignore'), 'apps/pwa/out/\n');
@@ -176,4 +188,22 @@ test('an uncommitted PWA build output is packed (build artifact) while other unc
     rmSync(checkout, { recursive: true, force: true });
     rmSync(out, { recursive: true, force: true });
   }
+});
+
+
+test('missing PWA blocks publication and leaves latest unset', () => {
+  const root = mkdtempSync(join(tmpdir(), 'internal-dist-no-pwa-'));
+  const checkout = join(root, 'checkout');
+  const out = join(root, 'out');
+  try {
+    mkdirSync(join(checkout, 'scripts/botlab'), { recursive: true });
+    writeFileSync(join(checkout, 'package.json'), JSON.stringify({ name: 'elanous', version: '0.2.3', files: ['scripts/'] }));
+    writeFileSync(join(checkout, 'scripts/install.sh'), '#!/bin/sh');
+    writeFileSync(join(checkout, 'scripts/botlab/bot-canary.ts'), 'export {};');
+    for (const args of [['init', '-q'], ['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'fixture']]) expect(spawnSync('git', args, { cwd: checkout }).status).toBe(0);
+    const result = spawnSync('bun', [entry, '--checkout', checkout, '--out', out], { encoding: 'utf8' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('PWA build missing');
+    expect(existsSync(join(out, 'latest/download'))).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -1,7 +1,7 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, readlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildRelease } from './release-build.js';
@@ -18,6 +18,8 @@ function fixture(version = '0.0.1'): { root: string; out: string } {
   const root = join(base, 'public-tree');
   const out = join(base, 'assets');
   mkdirSync(join(root, 'scripts'), { recursive: true });
+  mkdirSync(join(root, 'apps/pwa/out'), { recursive: true });
+  writeFileSync(join(root, 'apps/pwa/out/index.html'), '<html>fixture</html>');
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'elanous', version, files: ['scripts/'] }));
   writeFileSync(join(root, '.bun-version'), '1.4.2\n');
   writeFileSync(join(root, 'scripts/install.sh'), '#!/bin/sh\necho shell\n');
@@ -57,15 +59,13 @@ test('packs only the supplied tree, copies installers, writes sorted SHA256SUMS 
   expect(JSON.parse(pkg.stdout).version).toBe('0.0.1');
 });
 
-test('CLI prints only JSON on stdout and warns once for missing PWA output', () => {
+test('CLI refuses missing PWA output before creating a release', () => {
   const { root, out } = fixture();
+  rmSync(join(root, 'apps/pwa/out'), { recursive: true });
   const child = spawnSync('bun', [script, '--root', root, '--out', out], { encoding: 'utf8' });
-  expect(child.status).toBe(0);
-  expect(child.stderr.trim().split('\n')).toEqual(['웹 화면 없는 판']);
-  expect(JSON.parse(child.stdout)).toEqual({ version: '0.0.1', files: ['install.ps1', 'install.sh', 'elanous.tgz', 'uninstall.sh'].map((name) => {
-    const body = readFileSync(join(out, name));
-    return { name, sha256: createHash('sha256').update(body).digest('hex'), bytes: body.byteLength };
-  }), prerelease: false });
+  expect(child.status).toBe(1);
+  expect(child.stderr).toContain('PWA build missing');
+  expect(existsSync(join(out, 'SHA256SUMS'))).toBe(false);
 });
 
 test('CLI accepts matching stable tag and packs five files with the package version', () => {
@@ -146,4 +146,23 @@ test('pack runs the supplied tree prepack hook and does not warn when PWA is pre
 test('CLI requires --out', () => {
   const child = spawnSync('bun', [script], { encoding: 'utf8' });
   expect(child.status).toBe(2);
+});
+
+
+test('release archive materializes the active symlink without changing the build tree', () => {
+  const { root, out } = fixture();
+  const pwa = join(root, 'apps/pwa');
+  rmSync(join(pwa, 'out'), { recursive: true });
+  mkdirSync(join(pwa, '.pwa-generations/active/_next'), { recursive: true });
+  writeFileSync(join(pwa, '.pwa-generations/active/index.html'), '<html>active</html>');
+  writeFileSync(join(pwa, '.pwa-generations/active/_next/app.js'), 'active asset');
+  symlinkSync('.pwa-generations/active', join(pwa, 'out'));
+  buildRelease({ root, out });
+  expect(readlinkSync(join(pwa, 'out'))).toBe('.pwa-generations/active');
+  const unpack = join(root, 'unpacked');
+  mkdirSync(unpack);
+  expect(spawnSync('tar', ['-xzf', join(out, 'elanous.tgz'), '-C', unpack]).status).toBe(0);
+  expect(readFileSync(join(unpack, 'package/apps/pwa/out/index.html'), 'utf8')).toBe('<html>active</html>');
+  expect(readFileSync(join(unpack, 'package/apps/pwa/out/_next/app.js'), 'utf8')).toBe('active asset');
+  expect(existsSync(join(unpack, 'package/apps/pwa/.pwa-generations'))).toBe(false);
 });
