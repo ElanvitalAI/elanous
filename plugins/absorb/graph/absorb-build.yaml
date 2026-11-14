@@ -27,12 +27,15 @@ nodes:
         summary: 앱 빌드 시작
         runId: "$context.runId"
         at: "$context.nodeStartedAt"
-  - id: build
+  - id: source-draft
     type: make
     call: verb-make@^1
     skill: absorb/build
     uses: [llm-judge]
-    with: { ask: "$lookup-suggestion.evidence.suggestion.ask" }
+    with:
+      ask: "$lookup-suggestion.evidence.suggestion.ask"
+      context:
+        appId: "$lookup-suggestion.evidence.suggestion.appId"
     contract:
       inputs: [ask, context, prior]
       tools: read-only
@@ -45,7 +48,12 @@ nodes:
             type: object
             required: [artifact, service, capacityAssumption]
             properties:
-              artifact: { type: object }
+              artifact:
+                type: object
+                required: [manifestYaml, html]
+                properties:
+                  manifestYaml: { type: string }
+                  html: { type: string }
               service: { type: string }
               capacityAssumption:
                 type: object
@@ -61,6 +69,14 @@ nodes:
       - "result.capacityAssumption.concurrentUsers > 0"
       - "result.capacityAssumption.rationale != ''"
     budget: { inner_steps: 2 }
+  - id: build
+    type: capability
+    requires: app-publish.source@1
+    with:
+      draft: "$source-draft.result.artifact"
+      suggestion: "$lookup-suggestion.evidence.suggestion"
+      appId: "$lookup-suggestion.evidence.suggestion.appId"
+      memberId: "$context.memberId"
   - id: simulate
     type: app-publish
     requires: app-publish.action@1
@@ -86,7 +102,7 @@ nodes:
   - id: publish
     type: app-publish
     requires: app-publish.action@1
-    with: { action: publish, isolated: true, owner: "$context.memberId", requireOwner: "$context.memberId", requirePassingReceipt: true, receipt: "$simulate.evidence.receipt", artifact: "$build.evidence.artifact", service: "$build.result.service", capacityAssumption: "$build.result.capacityAssumption" }
+    with: { action: publish, isolated: true, owner: "$context.memberId", requireOwner: "$context.memberId", requirePassingReceipt: true, receipt: "$simulate.evidence.receipt", artifact: "$build.evidence.artifact", service: "$source-draft.result.service", capacityAssumption: "$source-draft.result.capacityAssumption" }
   - id: board-deployed
     type: capability
     requires: store.events@1
@@ -108,8 +124,9 @@ nodes:
         at: "$context.nodeStartedAt"
 edges:
   - { from: lookup-suggestion, on: outcome, map: { done: board-building, failed: failed } }
-  - { from: board-building, on: outcome, map: { ok: build, fail: failed, failed: failed } }
-  - { from: build, on: outcome, map: { done: simulate, rework: build, needs-human: failed, failed: failed } }
+  - { from: board-building, on: outcome, map: { ok: source-draft, fail: failed, failed: failed } }
+  - { from: source-draft, on: outcome, map: { done: build, rework: source-draft, needs-human: failed, failed: failed } }
+  - { from: build, on: outcome, map: { done: simulate, failed: failed } }
   - { from: simulate, on: outcome, map: { done: board-testing, failed: failed } }
   - { from: board-testing, on: outcome, map: { ok: approve-publish, fail: failed, failed: failed } }
   - { from: approve-publish, on: outcome, map: { approved: publish, rejected: failed } }

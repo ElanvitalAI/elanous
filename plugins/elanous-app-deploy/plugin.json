@@ -4,31 +4,58 @@
   "version": "0.3.9",
   "description": "Build, simulate and publish a registered Elanous app through the shared app lifecycle.",
   "main": "./plugin.ts",
-  "activationEvents": ["onRoute"],
+  "activationEvents": [
+    "onRoute"
+  ],
   "contributes": {
-    "aiTools": [{
-      "name": "app_deploy",
-      "description": "Build and simulate the KAIST lecture notes and scrap app, ask once before publishing, and return its public app URL.",
-      "handler": "native:app_deploy",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "appId": { "type": "string", "const": "lecture-scrap" },
-          "requestText": { "type": "string", "minLength": 1 }
+    "aiTools": [
+      {
+        "name": "app_deploy",
+        "description": "Build and simulate a registered member-owned app, confirm before deployment, and return its verified app URL.",
+        "handler": "native:app_deploy",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "appId": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+            },
+            "requestText": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "appId",
+            "requestText"
+          ],
+          "additionalProperties": false
         },
-        "required": ["appId", "requestText"],
-        "additionalProperties": false
-      },
-      "route": {
-        "triggers": ["배포해줘", "앱 만들어 배포", "강의 노트 스크랩 앱", "deploy app"],
-        "examples": ["강의 노트·스크랩 앱 만들어 배포해 줘", "lecture scrap app deploy please"],
-        "sideEffects": "external",
-        "risk": "high",
-        "cost": "spends-cloud",
-        "requiresConfirm": true
+        "route": {
+          "triggers": [
+            "배포해줘",
+            "앱 만들어 배포",
+            "강의 노트 스크랩 앱",
+            "deploy app"
+          ],
+          "examples": [
+            "강의 노트·스크랩 앱 만들어 배포해 줘",
+            "lecture scrap app deploy please"
+          ],
+          "sideEffects": "external",
+          "risk": "high",
+          "cost": "spends-cloud",
+          "requiresConfirm": true
+        }
       }
-    }],
-    "skills": [{ "id": "app-deploy", "name": "App Deploy", "path": "./skills/app-deploy/SKILL.md" }]
+    ],
+    "skills": [
+      {
+        "id": "app-deploy",
+        "name": "App Deploy",
+        "path": "./skills/app-deploy/SKILL.md"
+      }
+    ]
   },
   "capabilities": []
 }

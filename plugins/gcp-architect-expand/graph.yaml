@@ -1,5 +1,5 @@
-# Declarative Graph v2. No production cloud-resource provider is bundled:
-# without an explicitly injected test-world provider the graph fails closed.
+# The production provider observes explicitly connected GCP resources read-only.
+# With no connection it records that fact and proposes from requirements only.
 apiVersion: elanous.dev/graph/v2
 graph:
   id: gcp-architect-expand
@@ -31,6 +31,13 @@ nodes:
       options:
         - { key: y, exit: approved, default: false }
         - { key: N, exit: declined, default: true }
+  - id: connect-first
+    type: hitl
+    with: { approval: "클라우드 연결 필요 — 연결하면 이 설계로 배포 승인. 지금은 실제 자원·견적이 없으며 배포할 수 없습니다." }
+    hitl:
+      options:
+        - { key: y, exit: acknowledged, default: false }
+        - { key: N, exit: deferred, default: true }
   - id: provision
     type: cloud-resource
     requires: cloud-resource.provision@1
@@ -44,9 +51,10 @@ nodes:
     requires: cloud-resource.idle-stop@1
     with: { action: stop-idle-resources }
 edges:
-  - { from: detect, on: outcome, map: { shortage: design, none: done, unknown: failed, failed: failed } }
-  - { from: design, on: outcome, map: { proposed: deliverables, failed: failed } }
-  - { from: deliverables, on: outcome, map: { done: approve, failed: failed } }
+  - { from: detect, on: outcome, map: { shortage: design, observed: design, no-connection: design, none: done, unknown: failed, failed: failed } }
+  - { from: design, on: outcome, map: { proposed: deliverables, requirements-only: deliverables, observed-design: done, failed: failed } }
+  - { from: deliverables, on: outcome, map: { done: approve, connection-needed: connect-first, failed: failed } }
+  - { from: connect-first, on: outcome, map: { acknowledged: done, deferred: done } }
   - { from: approve, on: outcome, map: { approved: provision, declined: failed } }
   - { from: provision, on: outcome, map: { done: schedule, failed: failed } }
   - { from: schedule, on: outcome, map: { done: idle-stop, failed: idle-stop } }

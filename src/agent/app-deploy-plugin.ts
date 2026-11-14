@@ -20,7 +20,7 @@ export type AppDeployOutput = {
 };
 
 export interface AppDeployPublishHook {
-  publish(input: { appId: 'lecture-scrap'; ownerUserId: string; simulationReceipt: string; owner: NonNullable<ToolRuntimeContext['appDeploymentOwner']> }): Promise<{ publicUrl: string }>;
+  publish(input: { appId: string; ownerUserId: string; simulationReceipt: string; owner: NonNullable<ToolRuntimeContext['appDeploymentOwner']> }): Promise<{ publicUrl: string }>;
   verifyPublicUrl(publicUrl: string): Promise<boolean>;
 }
 
@@ -92,14 +92,15 @@ export async function runAppDeploy(
   context?: ToolRuntimeContext,
   deps: { simulate?: (appId: string) => Promise<AppSimulationResult>; hook?: AppDeployPublishHook; resolveOwner?: () => string } = {},
 ): Promise<AppDeployOutput> {
-  if (args.appId !== 'lecture-scrap' || typeof args.requestText !== 'string' || !args.requestText.trim()) {
-    return { kind: 'site-deploy', status: 'failed', error: 'registered lecture-scrap appId and requestText are required' };
+  if (typeof args.appId !== 'string' || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(args.appId) || typeof args.requestText !== 'string' || !args.requestText.trim()) {
+    return { kind: 'site-deploy', status: 'failed', error: 'registered appId and requestText are required' };
   }
+  const appId = args.appId;
   let receiptId: string;
   try {
-    const simulation = await (deps.simulate ?? runRegisteredAppSimulation)('lecture-scrap');
-    const receipt = simulation.receipts.find(item => item.appId === 'lecture-scrap' && item.outcome === 'passed');
-    if (!receipt || simulation.receipts.some(item => item.appId === 'lecture-scrap' && item.outcome === 'failed')) {
+    const simulation = await (deps.simulate ?? runRegisteredAppSimulation)(appId);
+    const receipt = simulation.receipts.find(item => item.appId === appId && item.outcome === 'passed');
+    if (!receipt || simulation.receipts.some(item => item.appId === appId && item.outcome === 'failed')) {
       return { kind: 'site-deploy', status: 'failed', error: 'app simulation did not pass' };
     }
     receiptId = receipt.id;
@@ -111,7 +112,7 @@ export async function runAppDeploy(
   const memberOwner = context?.appDeploymentOwner;
   if (context?.requestOrigin === 'external-agent' || context?.appDeploymentSession !== 'nexus-owner'
     || !context?.verifiedOwner?.id || !memberOwner || context.verifiedOwner.id !== memberOwner.memberId
-    || memberOwner.appSlug !== 'lecture-scrap'
+    || memberOwner.appSlug !== appId
     || !context?.confirmChannels?.length) {
     return { kind: 'site-deploy', status: 'rejected', simulationReceipt: receiptId, error: 'verified owner and originating confirmation channel are required' };
   }
@@ -122,7 +123,7 @@ export async function runAppDeploy(
     return { kind: 'site-deploy', status: 'rejected', simulationReceipt: receiptId, error: error instanceof Error ? error.message : String(error) };
   }
   const confirmation = await requestConfirmation({
-    prompt: '강의 노트·스크랩 앱을 공개 배포할까요?',
+    prompt: '이 앱을 공개 배포할까요?',
     detail: `시뮬레이션 PASS · 영수증 ${receiptId}`,
     yesLabel: 'y', noLabel: 'N', header: '배포',
     channels: context.confirmChannels, onTimeout: () => false,
@@ -130,8 +131,8 @@ export async function runAppDeploy(
   });
   if (!confirmation.answer) return { kind: 'site-deploy', status: 'rejected', simulationReceipt: receiptId };
   try {
-    const published = await hook.publish({ appId: 'lecture-scrap', ownerUserId, simulationReceipt: receiptId, owner: memberOwner });
-    const publicUrl = verifiedAppDeploymentUrl('lecture-scrap', ownerUserId, published.publicUrl);
+    const published = await hook.publish({ appId, ownerUserId, simulationReceipt: receiptId, owner: memberOwner });
+    const publicUrl = verifiedAppDeploymentUrl(appId, ownerUserId, published.publicUrl);
     if (!await hook.verifyPublicUrl(publicUrl)) throw new Error('public app URL did not open');
     return { kind: 'site-deploy', status: 'published', publicUrl, simulationReceipt: receiptId };
   } catch (error) {

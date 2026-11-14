@@ -17,12 +17,17 @@ test('briefings appRoute resolves its owner through the real /v1/members/owner H
   const nowMs = Date.parse('2026-11-14T01:00:00.000Z');
   const now = () => nowMs;
   const members = createMemberStore({ path: ':memory:', now });
-  // 출처: #36116 integration fixture event code is intentionally single-use.
-  members.provisionEventCode({ code: 'ABSORB-TEST', maxUses: 1 });
+  const fixtureMembers = ['owner', 'other'] as const;
+  // 출처: #36116 integration fixture event code covers only the fixture members.
+  members.provisionEventCode({ code: 'ABSORB-TEST', maxUses: fixtureMembers.length });
   const profile = members.register({ sub: 'absorb-owner-google', email: 'owner@example.test', emailVerified: true, name: 'Owner' },
     { consents: { privacy: 'privacy-v1', terms: 'terms-v1' }, eventCode: 'ABSORB-TEST' }, new Date(nowMs).toISOString());
   const slot = members.appSlotForMember(profile.id);
   if (!slot) throw new Error('member app slot was not created');
+  const other = members.register({ sub: 'absorb-other-google', email: 'other@example.test', emailVerified: true, name: 'Other' },
+    { consents: { privacy: 'privacy-v1', terms: 'terms-v1' }, eventCode: 'ABSORB-TEST' }, new Date(nowMs).toISOString());
+  const otherSlot = members.appSlotForMember(other.id);
+  if (!otherSlot) throw new Error('other member app slot was not created');
   const appDir = join(appsDir, slot.appSlug);
   mkdirSync(join(appDir, 'out'), { recursive: true });
   writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: ${slot.appSlug}\ntitle: Briefings\nfrontend:\n  kind: static-export\n  out: out\nroles:\n  owner: { via: nexus-session }\n`);
@@ -60,6 +65,39 @@ test('briefings appRoute resolves its owner through the real /v1/members/owner H
       headers: { authorization: `Bearer ${session.sessionToken}` },
     }));
     expect(wrongApp?.status).toBe(401);
+
+    const ownerCookie = `__Host-elanous_member_session=${members.createSession(profile.id).token}`;
+    const otherCookie = `__Host-elanous_member_session=${members.createSession(other.id).token}`;
+    const list = (appSlug: string, cookie?: string) => route(new Request(
+      `http://nexus.test/v1/briefings?day=2026-11-14&appSlug=${encodeURIComponent(appSlug)}`,
+      cookie ? { headers: { cookie } } : undefined,
+    ));
+    const ownList = await list(slot.appSlug, ownerCookie);
+    expect(ownList?.status).toBe(200);
+    expect((await ownList?.json()).briefings.map((item: { id: string }) => item.id)).toEqual([briefing.id]);
+    expect((await list(otherSlot.appSlug, ownerCookie))?.status).toBe(401);
+    expect((await list('forged-app-slug', ownerCookie))?.status).toBe(401);
+    expect((await list(slot.appSlug, otherCookie))?.status).toBe(401);
+    expect((await list(slot.appSlug, '__Host-elanous_member_session=forged'))?.status).toBe(401);
+    expect((await list(slot.appSlug, `${ownerCookie}; ${otherCookie}`))?.status).toBe(401);
+    expect((await list(slot.appSlug))?.status).toBe(401);
+    const forgedCookieWithAppSession = await route(new Request(
+      `http://nexus.test/v1/briefings?day=2026-11-14&appSlug=${slot.appSlug}`, {
+        headers: { cookie: '__Host-elanous_member_session=forged', authorization: `Bearer ${session.sessionToken}` },
+      }));
+    expect(forgedCookieWithAppSession?.status).toBe(401);
+    const otherList = await list(otherSlot.appSlug, otherCookie);
+    expect(otherList?.status).toBe(200);
+    expect((await otherList?.json()).briefings).toEqual([]);
+    const ownDetail = await route(new Request(`http://nexus.test/v1/briefings/brief-owned?appSlug=${slot.appSlug}`, {
+      headers: { cookie: ownerCookie },
+    }));
+    expect(ownDetail?.status).toBe(200);
+    expect((await ownDetail?.json()).id).toBe(briefing.id);
+    const crossDetail = await route(new Request(`http://nexus.test/v1/briefings/brief-owned?appSlug=${otherSlot.appSlug}`, {
+      headers: { cookie: otherCookie },
+    }));
+    expect(crossDetail?.status).toBe(404);
   } finally {
     server.stop(true);
     loaded.appHost.close();

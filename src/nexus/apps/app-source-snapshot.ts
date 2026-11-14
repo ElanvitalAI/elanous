@@ -140,7 +140,7 @@ function assertNoSecrets(files: readonly { path: string; data: Uint8Array }[]): 
   }
 }
 
-function collectFiles(rootPath: string): Array<{ path: string; data: Uint8Array; mode: number }> {
+function collectFiles(rootPath: string, includeGeneratedFiles = false): Array<{ path: string; data: Uint8Array; mode: number }> {
   let root: string;
   try { root = realpathSync(rootPath); }
   catch { throw new AppSourceSnapshotError('invalid-input', 'source root is unavailable'); }
@@ -153,7 +153,7 @@ function collectFiles(rootPath: string): Array<{ path: string; data: Uint8Array;
   const visit = (dir: string): void => {
     const names = readdirSync(dir).sort((a, b) => a.localeCompare(b));
     for (const name of names) {
-      if (EXCLUDED_DIRS.has(name)) continue;
+      if (!includeGeneratedFiles && EXCLUDED_DIRS.has(name)) continue;
       const absolute = join(dir, name);
       const stat = lstatSync(absolute);
       if (stat.isSymbolicLink()) throw new AppSourceSnapshotError('invalid-input', 'source contains a symbolic link');
@@ -174,8 +174,8 @@ function collectFiles(rootPath: string): Array<{ path: string; data: Uint8Array;
 }
 
 /** Compute the same stable identity used by immutable source snapshots without writing an object. */
-export function fingerprintAppSourceDirectory(sourceRoot: string): string {
-  const files = collectFiles(sourceRoot);
+export function fingerprintAppSourceDirectory(sourceRoot: string, options: { includeGeneratedFiles?: boolean } = {}): string {
+  const files = collectFiles(sourceRoot, options.includeGeneratedFiles === true);
   return fingerprintOf(files.map(({ path, data, mode }) => ({ path, sha256: sha256(data), size: data.byteLength, mode })));
 }
 

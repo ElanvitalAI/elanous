@@ -14,11 +14,13 @@ async function graphRouteForFile(graphFile: string, injected?: GraphRunOptions['
   deps: GraphRunOptions['deps']; defaultAsk?: string;
 }> {
   const graphPath = realpathSync(graphFile);
-  const pluginRoot = resolve(dirname(graphPath), '..');
+  const graphDir = dirname(graphPath);
+  const pluginRoot = existsSync(join(graphDir, 'plugin.json')) ? graphDir : resolve(graphDir, '..');
   const manifestPath = join(pluginRoot, 'plugin.json');
   if (!existsSync(manifestPath)) return { deps: injected };
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions?: { 'ai.elanous'?: {
     graphs?: string[]; graphProviders?: Record<string, { module: string; factory: string; withPluginRoot?: boolean;
+      withGraphRoot?: boolean;
       defaultAsk?: string }> } } };
   const extension = manifest.extensions?.['ai.elanous'];
   const relativeGraph = relative(pluginRoot, graphPath).split(sep).join('/');
@@ -34,7 +36,9 @@ async function graphRouteForFile(graphFile: string, injected?: GraphRunOptions['
   const module = await import(pathToFileURL(modulePath).href) as Record<string, unknown>;
   const factory = module[declaration.factory];
   if (typeof factory !== 'function') throw new Error(`plugin graph provider factory missing: ${declaration.factory}`);
-  return { deps: { ...injected, capabilityProviders: declaration.withPluginRoot ? factory(pluginRoot) : factory() },
+  const providerRegistry = declaration.withGraphRoot ? factory(injected?.root)
+    : declaration.withPluginRoot ? factory(pluginRoot) : factory();
+  return { deps: { ...injected, capabilityProviders: providerRegistry },
     defaultAsk };
 }
 
@@ -96,6 +100,8 @@ export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOpti
       }) };
       const state = await runGraph(graphFile, { input, verifiedOwnerId: owner.id, quiet: true, ...(deps ? { deps } : {}) });
       if (state.status !== 'awaiting-approval' || !Object.hasOwn(args, 'ticketDesignPath')) return state;
+      // A connection-needed card must remain visible and cannot authorize spending.
+      if (state.pending?.message.includes('클라우드 연결 필요')) return state;
       if (!options.requestConfirmation) throw new Error('Scene 5 approval surface is unavailable');
       const { scene5DecisionPromptFromGraph } = await import('../tui-client/scene5-decision-consumer.js');
       const prompt = scene5DecisionPromptFromGraph(state, graphId, args.ticketDesignPath);

@@ -3,7 +3,7 @@
   "name": "gcp-architect-expand",
   "version": "0.1.0",
   "dependencies": { "plugins": ["architecture-deliverables@^0.1.0"] },
-  "description": "Local-first capacity and cost proposal graph. Declaration and fake-world simulation only; no Google Cloud calls.",
+  "description": "Local-first capacity and cost proposal graph. Connected resource observation is read-only; no connection yields a requirements-only design.",
   "contributes": {
     "aiTools": [
       {
@@ -56,6 +56,12 @@
   "extensions": {
     "ai.elanous": {
       "graphs": ["./graph.yaml", "./tiered-graph.yaml"],
+      "graphProviders": {
+        "graph.yaml": {
+          "module": "src/graph-runner/capability-providers/gcp-resource-observe.ts",
+          "factory": "createGcpResourceObserveRegistry"
+        }
+      },
       "capabilities": ["cloud-resource", "fs:workdir"],
       "graphManifests": {
         "gcp-architect-expand": {
@@ -66,7 +72,7 @@
             "skills": [],
             "domainPacks": ["gcp-architect-expand"]
           },
-          "hitl": ["approve"],
+          "hitl": ["approve", "connect-first"],
           "observe": { "categories": ["graph.run", "graph.unit", "cloud-resource"] }
         },
         "gcp-advanced-tiered-design": {

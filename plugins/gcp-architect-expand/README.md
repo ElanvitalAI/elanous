@@ -1,6 +1,6 @@
 # GCP architect expand — declaration + offline simulation
 
-`plugin.json` and `graph.yaml` retain the existing ticket-design workflow. `tiered-graph.yaml` adds the one-requirement, three-option simulation route. Every bundled executable recipe fails closed; no GCP connector is included. Installing this skeleton cannot provision a cloud resource.
+`plugin.json` and `graph.yaml` retain the existing ticket-design workflow. `tiered-graph.yaml` adds the one-requirement, three-option simulation route. The operating provider for `cloud-resource.observe@1` reports `연결 없음` when `ELANOUS_GCP_OBSERVE_PROJECT` is unset; a configured project is observed only with `gcloud compute instances list`. The graph creates a requirements-only, unpriced architecture PDF, editable diagram and PNG through the shared deliverables graph. With no connection it pauses at a visible `connect-first` card: `클라우드 연결 필요 — 연결하면 이 설계로 배포 승인`. Acknowledging or deferring that card cannot enter provision. The result claims zero created or fake resources. Provision, schedule and idle-stop remain unprovided in the operating registry.
 
 From the repository root run `bun scripts/gcp-architect-expand/sim/fake-world.ts`. The simulation creates temporary fake project/cost records, calls the existing resource lease ledger, checks the approval gate and deletes its temporary files. `realGcpCalls` must be `0`.
 
@@ -8,7 +8,7 @@ Design: [RFC](../../내부 문서 `RFC-gcp-expand-architect-plugin`) · [officia
 
 Membership feature grants are declared in `entitlements.json` with a deny-by-default policy. The public `detect` node consumes the generic feature checker with a free membership identity. Paid routes are absent until the host can supply a verified membership resolver. Graph input never controls membership. No plugin code branches on membership tier.
 
-`detect` reads the existing self-dev gate host measurement (load, available memory, `/tmp` free space) and existing harness queue. These repository-local imports are a development seam; packaging this plugin outside the repository needs a stable host API. The remaining recipes still fail closed and no GCP connector is bundled.
+The older fake-world `detect` recipe reads self-dev host measurements and the harness queue. The operating capability uses the explicit GCP project setting above and never substitutes fake pressure or resource rows for a missing connection. A configured but unreadable project yields `unknown` and stops; it is not reported as an empty connected project. The remaining recipes still fail closed.
 
 ## Architecture output contract
 

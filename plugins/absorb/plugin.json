@@ -220,7 +220,8 @@
         },
         "graph/absorb-build.yaml": {
           "module": "src/graph-runner/capability-providers/absorb-member-registry.ts",
-          "factory": "createAbsorbBuildMemberRegistry"
+          "factory": "createAbsorbBuildGraphRootRegistry",
+          "withGraphRoot": true
         }
       },
       "graphManifests": {

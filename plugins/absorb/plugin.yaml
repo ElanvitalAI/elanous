@@ -99,7 +99,8 @@ graphProviders:
     factory: createAbsorbReadMemberRegistry
   graph/absorb-build.yaml:
     module: src/graph-runner/capability-providers/absorb-member-registry.ts
-    factory: createAbsorbBuildMemberRegistry
+    factory: createAbsorbBuildGraphRootRegistry
+    withGraphRoot: true
 skills:
   - id: absorb/docparse
     path: skills/absorb/docparse/SKILL.md

@@ -37,7 +37,8 @@ function findGraphFile(graphId: string, extraRoots: string[] = []): string | und
 
 async function defaultCapabilityRegistryForGraph(file: string) {
   const graphPath = resolve(file);
-  const pluginRoot = resolve(dirname(graphPath), '..');
+  const graphDir = dirname(graphPath);
+  const pluginRoot = existsSync(join(graphDir, 'plugin.json')) ? graphDir : resolve(graphDir, '..');
   const manifestPath = join(pluginRoot, 'plugin.json');
   if (!existsSync(manifestPath)) return createDefaultMarketDataRegistry();
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions?: { 'ai.elanous'?: {

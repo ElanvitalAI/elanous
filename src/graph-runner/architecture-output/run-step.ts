@@ -294,12 +294,15 @@ try {
       'import json,pymupdf,sys; doc=pymupdf.open(sys.argv[1]); blocks=lambda p: sorted((b for b in p.get_text("blocks") if isinstance(b[4],str)),key=lambda b:(b[0]>=p.rect.width/2,b[1],b[0])); text=chr(10).join(chr(10).join(b[4] for b in blocks(p)) for p in doc if p.number>=1); print(json.dumps({"pages":len(doc),"text":text},ensure_ascii=False))',
       pdfPath], rendererDir)) as { pages: number; text: string };
     const text = inspected.text;
+    const unpriced = /<td>미산정<\/td>/u.test(html);
+    if (unpriced && !text.includes('미산정')) throw new Error('unpriced cost missing from PDF text');
     const missing = missingPdfBodySections(text, sections);
     if (missing.length) throw new Error(`PDF text missing sections: ${missing.join(', ')}`);
     for (const heading of ['목차', '요약', '부록']) if (!new RegExp(`^\\s*${heading}\\s*$`, 'mu').test(text)) throw new Error(`PDF heading missing ${heading}`);
     const pages = inspected.pages;
     if (!Number.isFinite(pages) || pages < 4) throw new Error('reference PDF requires at least four pages');
-    const receipt = { status: 'verified', contract: quality.provider === 'gcp' ? 'system-architecture/cloud-expansion@2' : 'system-architecture@2',
+    const receipt = { status: 'verified', costStatus: unpriced ? 'unpriced' : 'priced',
+      contract: quality.provider === 'gcp' ? 'system-architecture/cloud-expansion@2' : 'system-architecture@2',
       profile: quality.provider, quality: 'reference', pages, iconLibraryUrl: quality.iconLibraryUrl, verifiedIcons: quality.verifiedIcons,
       files: ['architecture.excalidraw', 'architecture.png', 'architecture.html', 'architecture.pdf'], pdfSections: sections,
       elements, pngBytes: png.length, pdfBytes: pdf.length,

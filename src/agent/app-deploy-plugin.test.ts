@@ -131,3 +131,15 @@ test('a publish hook cannot report another owner origin as this owner deployment
   expect(result).toMatchObject({ status: 'failed', error: 'public app URL is invalid' });
   expect(result.publicUrl).toBeUndefined();
 });
+
+test('registered app simulation uses the requested app id rather than a lecture constant', async () => {
+  let observed = '';
+  const result = await runAppDeploy({ appId: 'custom-generated-app', requestText: 'simulate my app' }, undefined, {
+    simulate: async appId => {
+      observed = appId;
+      return { ...passed, receipts: passed.receipts.map(receipt => ({ ...receipt, appId })) };
+    },
+  });
+  expect(observed).toBe('custom-generated-app');
+  expect(result.status).toBe('simulated');
+});

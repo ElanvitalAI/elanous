@@ -75,6 +75,36 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fetchAppMemberOwner } from '../apps/app-site-deploy.js';
 
+const MEMBER_SESSION_COOKIE = '__Host-elanous_member_session';
+
+/** Ask the server owner endpoint to bind a web session to its persisted app slot. */
+async function fetchMemberWebBriefingsOwner(
+  request: Request, appSlug: string, endpointOrigin: string, fetcher: typeof fetch,
+): Promise<string | null> {
+  const cookies = (request.headers.get('cookie') ?? '').split(';').map(part => part.trim())
+    .filter(part => part.slice(0, part.indexOf('=')).trim() === MEMBER_SESSION_COOKIE);
+  if (cookies.length !== 1) return null;
+  let endpoint: URL;
+  try {
+    const base = new URL(endpointOrigin);
+    if (base.protocol !== 'http:' || base.username || base.password || base.pathname !== '/' || base.search || base.hash) return null;
+    endpoint = new URL('/v1/members/owner', base);
+    endpoint.searchParams.set('appSlug', appSlug);
+  } catch { return null; }
+  try {
+    const response = await fetcher(endpoint, {
+      method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(5_000),
+      headers: { cookie: cookies[0]!, accept: 'application/json' },
+    });
+    if (!response.ok || !/^application\/json(?:\s*;|\s*$)/i.test(response.headers.get('content-type') ?? '')) return null;
+    const owner: unknown = await response.json();
+    if (!owner || typeof owner !== 'object' || Array.isArray(owner)) return null;
+    const value = owner as Record<string, unknown>;
+    return Object.keys(value).length === 1 && typeof value.memberId === 'string' && value.memberId.trim()
+      ? value.memberId : null;
+  } catch { return null; }
+}
+
 
 /** Ready-to-register Nexus appRoute: supply the server-verified session owner and ABSORB state root. */
 export function createAbsorbBriefingsAppRoute(input: {
@@ -85,9 +115,8 @@ export function createAbsorbBriefingsAppRoute(input: {
   return createBriefingsApi({ ownerForRequest: input.ownerForRequest, ...repository });
 }
 
-/** Production route using the server-verified #36071 app-owner session endpoint.
- * Requests include `appSlug` as app-session scope; it selects which app-bound
- * credential is checked and never supplies the returned member identity. */
+/** Production route using the server-verified member and app-owner endpoint.
+ * appSlug selects the server-side app-slot check, never the returned identity. */
 export function createVerifiedAbsorbBriefingsAppRoute(input: {
   readonly root: string;
   readonly endpointOrigin: () => string | null;
@@ -101,6 +130,9 @@ export function createVerifiedAbsorbBriefingsAppRoute(input: {
       const appSlug = new URL(request.url).searchParams.get('appSlug')?.trim();
       const endpointOrigin = input.endpointOrigin();
       if (!appSlug || !endpointOrigin) return null;
+      const hasMemberCookie = (request.headers.get('cookie') ?? '').split(';').some(part =>
+        part.trim().startsWith(`${MEMBER_SESSION_COOKIE}=`));
+      if (hasMemberCookie) return fetchMemberWebBriefingsOwner(request, appSlug, endpointOrigin, input.fetcher ?? fetch);
       const owner = await fetchAppMemberOwner(request, appSlug, endpointOrigin, input.fetcher);
       return owner?.memberId ?? null;
     },

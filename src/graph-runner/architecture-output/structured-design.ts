@@ -93,7 +93,8 @@ export function generateStructuredDesign(raw: unknown): StructuredDesignResult {
     if (!['sync', 'async', 'telemetry'].includes(value(flow, 'kind'))) throw new Error('flow.kind must be sync, async, or telemetry');
   }
   for (const row of items(d, 'costs')) {
-    if (typeof row.monthlyUsd !== 'number' || !Number.isFinite(row.monthlyUsd) || row.monthlyUsd < 0) throw new Error('costs.monthlyUsd must be a nonnegative finite number');
+    if (row.monthlyUsd !== null && (typeof row.monthlyUsd !== 'number' || !Number.isFinite(row.monthlyUsd) || row.monthlyUsd < 0))
+      throw new Error('costs.monthlyUsd must be null (unpriced) or a nonnegative finite number');
   }
 
   let seq = 0;
@@ -182,7 +183,8 @@ export function generateStructuredDesign(raw: unknown): StructuredDesignResult {
   const table = (headers: string[], rows: string[][]): string => `<table class="table"><thead><tr>${headers.map(h => `<th>${escaped(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${escaped(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
   const sectionRows = (name: string, keys: string[]): string[][] => items(d, name).map(row => keys.map(key => String(row[key] ?? '')));
   const flowRows = flows.map((flow, index) => [circled[index]!, value(flow, 'from'), value(flow, 'to'), value(flow, 'label'), value(flow, 'kind')]);
-  const costRows = items(d, 'costs').map(row => [value(row, 'item'), value(row, 'formula'), String(row.monthlyUsd ?? '')]);
+  const costRows = items(d, 'costs').map(row => [value(row, 'item'), value(row, 'formula'),
+    row.monthlyUsd === null ? '미산정' : String(row.monthlyUsd)]);
   const referenceHtml = items(d, 'references').map(row => `<li>${escaped(value(row, 'title'))}: ${escaped(value(row, 'url'))}</li>`).join('');
   const css = readFileSync(join(pluginRoot, 'references/structured-template.css'), 'utf8');
   // Source: the flow table needs a dedicated page when the diagram has more than six numbered flows.

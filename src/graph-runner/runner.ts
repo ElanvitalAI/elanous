@@ -514,7 +514,10 @@ function resolveNodeRecipe(node: GraphNodeSpec, recipes: Record<string, Recipe>,
   }
   if (node.kind === 'hitl' && node.hitl?.options.length === 2) {
     const choices = node.hitl.options.map(option => `${option.key} → ${option.exit}${option.default ? ' (default)' : ''}`).join(', ');
-    return { approval: { approval: `Choose one graph option: ${choices}` } };
+    const input = node.input && typeof node.input === 'object' && !Array.isArray(node.input)
+      ? node.input as Record<string, unknown> : undefined;
+    const prompt = typeof input?.approval === 'string' && input.approval.trim() ? input.approval : 'Choose one graph option:';
+    return { approval: { approval: `${prompt} ${choices}` } };
   }
   if (node.recipe === 'none') return {};
   if (node.recipe === 'cmd:gate-repair' && /^gate-repair-[a-f0-9]{12}$/.test(node.nodeId))

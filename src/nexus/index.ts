@@ -122,6 +122,7 @@ import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workf
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
 import { createNexusScrapsRouteOptions } from './api/scraps-web-digest.js';
 import { trustedTlsEdgeFromEnv } from './api/tls-edge.js';
+import { createGeneratedAppPublisher, createGeneratedAppPublishRoute, withGeneratedAppsPrivateIngress, type GeneratedAppPublisher } from './apps/generated-app-publish.js';
 import { loadNexusAppHost, resolveVerifiedOwner as resolveVerifiedAppOwner, type NexusAppHost } from './apps/app-host.js';
 import { createMemberStore, type MemberStore } from './members/member-store.js';
 import { createVerifiedAbsorbBriefingsAppRoute } from './api/briefings-api.js';
@@ -1456,6 +1457,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   let runtimeHistory: DaemonSessionHistory | undefined;
   let deploymentOwnerAppHost: NexusAppHost | undefined;
   let deploymentOwnerMemberStore: MemberStore | undefined;
+  let generatedAppPublisher: GeneratedAppPublisher | undefined;
   let runtimeHitlPending: HitlPendingCallbacks | undefined;
   // Identity of the AskUserQuestion resolver this boot installed (or null
   // when a prior resolver already owned the hook). release() clears only
@@ -3359,6 +3361,25 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       },
     } : undefined;
     const appSiteDeployRoute = appSiteDeploymentRuntime ? createAppSiteDeployRoute(appSiteDeploymentRuntime) : undefined;
+    generatedAppPublisher = createGeneratedAppPublisher({
+      artifactRoot: nexusRootDir(), appsRoot: joinPath(nexusRootDir(), 'apps'), appHost,
+    });
+    const generatedRestore = await generatedAppPublisher.restore();
+    debug.log('nexus.app-publish', 'restore', generatedRestore);
+    const generatedAppPublishRoute = createGeneratedAppPublishRoute(generatedAppPublisher, async request => {
+      if (!httpServer || !deploymentOwnerMemberStore) return null;
+      const headers = new Headers();
+      for (const name of ['cookie', 'authorization']) {
+        const value = request.headers.get(name); if (value) headers.set(name, value);
+      }
+      const response = await fetch(new URL('/v1/members/owner', httpServer.url), { headers, redirect: 'manual',
+        signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return null;
+      const value = await response.json() as { memberId?: unknown };
+      return typeof value.memberId === 'string' && deploymentOwnerMemberStore.memberPlanForMember(value.memberId)
+        ? value.memberId : null;
+    }, process.env.GOOGLE_OAUTH_REDIRECT_URI ? new URL(process.env.GOOGLE_OAUTH_REDIRECT_URI).origin : undefined);
+
     if (metaApiOpts && appSiteDeploymentRuntime) {
       metaApiOpts.appDeployPublishHook = createVerifiedAppSiteDeployPublisher(appSiteDeploymentRuntime);
     }
@@ -3465,7 +3486,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       reloadMcpClients,
       ...(getMcpWidgetServerId ? { getMcpWidgetServerId } : {}),
       ...(pwaStaticDir ? { staticDir: pwaStaticDir } : {}),
-      appHost: publicAppHost,
+      appHost: withGeneratedAppsPrivateIngress(publicAppHost, slug => generatedAppPublisher?.isPrivateSlug(slug) ?? false),
       appLifecycleSnapshot: (slug: string) => {
         if (!appLifecycleStore) throw new Error('app lifecycle store is unavailable');
         return appLifecycleStore.snapshot(slug);
@@ -3475,7 +3496,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         return appSimulationStore.snapshot(slug);
       },
       ...(appPublicUserSlug ? { appPreviewUserSlug: appPublicUserSlug } : {}),
-      appRoutes: [...(appPublishRoute ? [appPublishRoute] : []), ...(appSiteDeployRoute ? [appSiteDeployRoute] : []), absorbBriefingsRoute, appActionRoute, ...(appSimulationRoute ? [appSimulationRoute] : []), appPromoteRoute, appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
+      appRoutes: [generatedAppPublishRoute, ...(appPublishRoute ? [appPublishRoute] : []), ...(appSiteDeployRoute ? [appSiteDeployRoute] : []), absorbBriefingsRoute, appActionRoute, ...(appSimulationRoute ? [appSimulationRoute] : []), appPromoteRoute, appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
       // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.
@@ -3978,6 +3999,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     httpServer?.stop();
     try { appGenerationRuntime?.jobs.close(); } catch { /* best-effort shutdown */ }
     try { appLifecycleStore?.close(); } catch { /* best-effort shutdown */ }
+    generatedAppPublisher?.close(); generatedAppPublisher = undefined;
     try { deploymentOwnerMemberStore?.close(); } catch { /* best-effort shutdown */ }
     deploymentOwnerMemberStore = undefined;
     deploymentOwnerAppHost = undefined;
