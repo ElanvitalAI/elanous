@@ -5200,6 +5200,25 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.22
+
+Source: https://docs.elanous.ai/releases/0-3-22/
+
+- The default TUI is classic. Use `eln --tui next` to open next.
+- Fix classic startup warnings and show background results only for the active terminal session.
+- Improve recovery of long build turns before the model request-size limit.
+- Fix same-origin handling for the browser member-approval form.
+
+## Known issues
+
+- Some focused validation reported an unexplained nonzero process exit; its cause remains under investigation.
+- Terminal member connection still has edge cases around slow polling, session revocation during approval, and request limits across proxy clients.
+- The full automated release gate is not part of this manual hotfix path. Complete installed demo flows and live-key integrations require separate verification.
+- Key backup needs a matching server update; production backup and restore remain unverified.
+- The test setup path can copy existing credential files. Use an explicitly isolated configuration with synthetic credentials.
+
+---
+
 # 0.3.21
 
 Source: https://docs.elanous.ai/releases/0-3-21/
