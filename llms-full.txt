@@ -5200,6 +5200,35 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.17
+
+Source: https://docs.elanous.ai/releases/0-3-17/
+
+This release lets you crawl a website in one step with Firecrawl, brings Upstage document reading and extraction into Elanous, and lets you back up and move your keys securely.
+
+- Ask Elanous to crawl or scrape a website and it does it in one step with Firecrawl, now built in. The same crawl works from the terminal, the web app and Telegram. Large crawls report their progress instead of claiming they are finished.
+- Add your Firecrawl key during setup, or any time later with `elanous setup firecrawl`. You can skip it, and if no key is set Elanous tells you how to add one.
+- Add your Upstage key once with `elanous setup upstage`. It is kept in the secret store, and Upstage document reading uses it first.
+- Create Upstage Solar Embedding 2 embeddings through a new plugin. Elanous asks before it sends your text to Upstage.
+- In the terminal, graph tools such as today's briefing now recognise your signed-in member session.
+- Read PDF documents into your scraps with Upstage Document Parse, keeping titles, tables and paragraphs. Without an Upstage key, Elanous falls back to local text extraction and says so.
+- Pull structured fields out of a document with a new Upstage Information Extract plugin, using a schema you provide. Elanous asks before it sends the document.
+- Try Upstage Solar Decide as an opt-in beta for typed decisions with a probability attached.
+- Back up your stored keys with `elanous secret backup push`, and bring them back with `elanous secret backup restore`. Keys are encrypted on your machine before upload, only ciphertext is stored, and restoring needs your member sign-in and your local recovery key.
+- Move stored keys to another machine with `elanous secret move`, in a sealed bundle you approve by hand. The keys on the original machine are not deleted automatically.
+- Results that graph runs create for you, such as scraps, suggestions and board items, are now saved to your own member store and survive restarts. Work that a graph fans out keeps your member identity, so another member's data cannot be written in your name.
+- Graph runs are more dependable: a run will not resume if its graph or recipes changed since it started, a repair only counts once an independent re-check passes, and when two supervisors pick up the same problem only one of them acts.
+
+## Known issues
+
+- The full automated release gate was not completed; this release uses the approved manual release path.
+- Live-key behavior for Firecrawl and Upstage and the complete first-run flow from an empty configuration remain unverified.
+- Key backup needs a matching server update. Production backup and restore have not been verified.
+- The `--test` setup path can copy existing credential files into a test directory. Use explicitly isolated configurations with synthetic credentials only.
+- The complete graph-driven demo still needs the app-publishing and cloud-observation hotfix. Full end-to-end operation is not yet verified.
+
+---
+
 # 0.3.16
 
 Source: https://docs.elanous.ai/releases/0-3-16/
