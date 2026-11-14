@@ -77,9 +77,9 @@ import { fetchAppMemberOwner } from '../apps/app-site-deploy.js';
 
 const MEMBER_SESSION_COOKIE = '__Host-elanous_member_session';
 
-/** Ask the server owner endpoint to bind a web session to its persisted app slot. */
+/** Verify a member web session; an explicit app scope must match its persisted slot. */
 async function fetchMemberWebBriefingsOwner(
-  request: Request, appSlug: string, endpointOrigin: string, fetcher: typeof fetch,
+  request: Request, appSlug: string | undefined, endpointOrigin: string, fetcher: typeof fetch,
 ): Promise<string | null> {
   const cookies = (request.headers.get('cookie') ?? '').split(';').map(part => part.trim())
     .filter(part => part.slice(0, part.indexOf('=')).trim() === MEMBER_SESSION_COOKIE);
@@ -89,7 +89,7 @@ async function fetchMemberWebBriefingsOwner(
     const base = new URL(endpointOrigin);
     if (base.protocol !== 'http:' || base.username || base.password || base.pathname !== '/' || base.search || base.hash) return null;
     endpoint = new URL('/v1/members/owner', base);
-    endpoint.searchParams.set('appSlug', appSlug);
+    if (appSlug !== undefined) endpoint.searchParams.set('appSlug', appSlug);
   } catch { return null; }
   try {
     const response = await fetcher(endpoint, {
@@ -116,7 +116,8 @@ export function createAbsorbBriefingsAppRoute(input: {
 }
 
 /** Production route using the server-verified member and app-owner endpoint.
- * appSlug selects the server-side app-slot check, never the returned identity. */
+ * Member web requests may omit appSlug; an explicit slug is still checked.
+ * App-bound sessions require appSlug. Neither path takes identity from the query. */
 export function createVerifiedAbsorbBriefingsAppRoute(input: {
   readonly root: string;
   readonly endpointOrigin: () => string | null;
@@ -127,12 +128,14 @@ export function createVerifiedAbsorbBriefingsAppRoute(input: {
   return createBriefingsApi({
     ...repository,
     ownerForRequest: async (request) => {
-      const appSlug = new URL(request.url).searchParams.get('appSlug')?.trim();
+      const rawAppSlug = new URL(request.url).searchParams.get('appSlug');
+      const appSlug = rawAppSlug?.trim();
       const endpointOrigin = input.endpointOrigin();
-      if (!appSlug || !endpointOrigin) return null;
+      if (!endpointOrigin || rawAppSlug !== null && !appSlug) return null;
       const hasMemberCookie = (request.headers.get('cookie') ?? '').split(';').some(part =>
         part.trim().startsWith(`${MEMBER_SESSION_COOKIE}=`));
       if (hasMemberCookie) return fetchMemberWebBriefingsOwner(request, appSlug, endpointOrigin, input.fetcher ?? fetch);
+      if (!appSlug) return null;
       const owner = await fetchAppMemberOwner(request, appSlug, endpointOrigin, input.fetcher);
       return owner?.memberId ?? null;
     },

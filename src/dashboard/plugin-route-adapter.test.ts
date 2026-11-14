@@ -1,4 +1,6 @@
 import { expect, test } from 'bun:test';
+import { runGoalLoop } from '../core-turn/run-goal-loop.js';
+import type { CoreTurnContext } from '../core-turn/types.js';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -868,3 +870,45 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
     rmSync(root, { recursive: true, force: true });
   }
 }, { timeout: 180_000 }); // Source: #95987 fake-member graph-route receipt; setup time is not a wall-clock pass criterion.
+
+test('production graph owner denial keeps a structured user-action code through the TUI tool wrapper', async () => {
+  let graphEffects = 0;
+  const routeAdapter = createDashboardPluginRouteAdapter({
+    pluginRoot: join(import.meta.dir, '..', '..', 'plugins'),
+    dispatchCore: async () => undefined,
+    dispatchGraph: async (_pluginId, _graphId, file, args, context) => {
+      graphEffects += 1;
+      return dispatchVerifiedDashboardGraph(file, args, context);
+    },
+  });
+  const scrap = routeAdapter.classicHostTools([]).find(tool => tool.name === 'scrap_add')!;
+  const denial = await scrap.handler({ url: 'https://example.test/article' }, {} as never);
+  expect(denial).toMatchObject({ code: 'VERIFIED_OWNER_REQUIRED', error: expect.stringContaining('verified owner') });
+  expect(graphEffects).toBe(1);
+  let turns = 0;
+  let delegated = 0;
+  const result = await runGoalLoop({
+    sessionId: 'owner-block-product-seam',
+    messages: [{ role: 'user', content: 'save this public article' }],
+    tools: [],
+    signal: new AbortController().signal,
+    dispatchTool: async name => {
+      if (name === 'Agent') delegated += 1;
+      return {};
+    },
+  } as CoreTurnContext, {
+    intentStallProvider: null,
+    runTurn: async ctx => {
+      turns += 1;
+      const actualResult = await scrap.handler({ url: 'https://example.test/article' }, {} as never);
+      ctx.callbacks?.onToolResult?.({ id: 'scrap-auth', name: 'scrap_add', result: actualResult });
+      expect(ctx.signal.aborted).toBe(true);
+      await ctx.dispatchTool('Agent', { prompt: 'investigate source owner lookup' });
+      return { stopReason: 'aborted', finalText: '' };
+    },
+  });
+  expect(result).toMatchObject({ iterations: 1, stopReason: 'no_progress', goalComplete: false });
+  expect(result.finalText).toContain('회원 연결');
+  expect(turns).toBe(1);
+  expect(delegated).toBe(0);
+});

@@ -543,3 +543,60 @@ describe('runGoalLoop wires file-heartbeat emission before waiting', () => {
     expect(order).toEqual(['start', 'turn', 'stop']);
   });
 });
+
+describe('verified owner denial returns control to the user', () => {
+  test('structured graph auth denial stops after one iteration and suppresses delegation', async () => {
+    let turns = 0;
+    let effects = 0;
+    let callbackCalls = 0;
+    const result = await runGoalLoop({
+      ...baseCtx(),
+      dispatchTool: async () => { effects += 1; return {}; },
+      callbacks: { onToolResult: () => { callbackCalls += 1; } },
+    }, {
+      intentStallProvider: null,
+      runTurn: async ctx => {
+        turns += 1;
+        ctx.callbacks?.onToolResult?.({
+          id: 'blocked-scrap', name: 'scrap_add',
+          result: { error: 'graph route requires a verified owner context', code: 'VERIFIED_OWNER_REQUIRED' },
+        });
+        expect(ctx.signal.aborted).toBe(true);
+        await ctx.dispatchTool('Agent', { prompt: 'find another owner route' });
+        return { stopReason: 'aborted', finalText: '' };
+      },
+    });
+    expect(result).toMatchObject({ iterations: 1, stopReason: 'no_progress', goalComplete: false });
+    expect(result.finalText).toContain('회원 연결');
+    expect(turns).toBe(1);
+    expect(effects).toBe(0);
+    expect(callbackCalls).toBe(1);
+  });
+
+  test('ordinary tool errors and model prose do not become authentication stops', async () => {
+    let turns = 0;
+    const result = await runGoalLoop(baseCtx(), {
+      intentStallProvider: null,
+      // 출처: #37757 negative-control fixture: transient error iteration followed by a successful receipt.
+      maxIterations: 2,
+      runTurn: async ctx => {
+        turns += 1;
+        if (turns === 1) {
+          ctx.callbacks?.onToolResult?.({ id: 'temporary', name: 'scrap_add', result: { error: 'temporary network outage' } });
+          ctx.callbacks?.onTurnComplete?.([{ role: 'assistant', content: [{
+            type: 'tool_use', id: 'temporary', name: 'scrap_add', input: { kind: 'web', url: 'https://example.test/article' },
+          }] }]);
+          expect(ctx.signal.aborted).toBe(false);
+          return { stopReason: 'end_turn', finalText: 'verified owner required is quoted document text' };
+        }
+        ctx.callbacks?.onTurnComplete?.([{ role: 'assistant', content: [{
+          type: 'tool_use', id: 'done', name: 'update_goal',
+          input: { status: 'complete', evidence: 'retry produced a persisted receipt' },
+        }] }]);
+        return { stopReason: 'end_turn', finalText: 'saved' };
+      },
+    });
+    expect(turns).toBe(2);
+    expect(result.goalComplete).toBe(true);
+  });
+});

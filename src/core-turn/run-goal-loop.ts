@@ -888,6 +888,7 @@ export async function runGoalLoop(
     let iterUsageCalls = 0;
     let iterUsageMissing = 0;
     let postToolSoftStop = false;
+    let ownerAuthBlocked = false;
     const turnAbortController = new AbortController();
     // TUI-SEAT-TURN-CAP — core 턴마다 도구·벽시계 상한; idle streak 도 core 턴마다 새로 센다.
     const seatCap = opts.seatTurnCap;
@@ -1014,6 +1015,9 @@ export async function runGoalLoop(
       ...(previousFinalText.trim().length > 0 ? { terminalPriorAnswerVisible: true } : {}),
       // update_goal 은 종결 신호 — 실 dispatcher 로 새지 않게 가로채 ack 만 돌려준다.
       dispatchTool: (name, args, dctx) => {
+        if (ownerAuthBlocked) return Promise.resolve({
+          error: 'verified member connection required', code: 'VERIFIED_OWNER_REQUIRED',
+        });
         dispatchCount += 1;
         if (name !== UPDATE_GOAL_TOOL_NAME) toolCallsThisIteration += 1;
         try {
@@ -1102,6 +1106,12 @@ export async function runGoalLoop(
                 pass: typeof r.pass === 'number' ? r.pass : 0,
               };
             }
+          }
+          if (call.result && typeof call.result === 'object'
+            && (call.result as { code?: unknown }).code === 'VERIFIED_OWNER_REQUIRED'
+            && typeof (call.result as { error?: unknown }).error === 'string') {
+            ownerAuthBlocked = true;
+            turnAbortController.abort(new Error('verified member connection required'));
           }
           ctx.callbacks?.onToolResult?.(call); // ⚠️ 기존 콜백 체이닝(끊지 말 것).
           if (controlSpaceId && ctx.sessionId) {
@@ -1200,6 +1210,19 @@ export async function runGoalLoop(
     if (seatCapHit) lastResult = { ...lastResult, stopReason: 'max_turns' };
     else if (seatIdleHit && lastResult.stopReason === 'aborted') lastResult = { ...lastResult, stopReason: 'end_turn' };
     messages.push(...turnNewMessages);
+
+    // A host authentication denial needs the user, not another autonomous iteration.
+    // Preserve caller cancellation; never turn an auth failure into goal completion.
+    if (ownerAuthBlocked && !ctx.signal.aborted) {
+      debug.log('goal.loop', 'verified-owner-required', {
+        sessionId: ctx.sessionId, ...runAttribution, iteration: iterations,
+        action: 'return-to-user', code: 'VERIFIED_OWNER_REQUIRED',
+      }, { level: 'warn' });
+      return finish({
+        finalText: '회원 연결이 필요합니다. 승인된 회원 연결을 완료한 뒤 다시 요청해 주세요. 요청한 작업은 완료되지 않았습니다.',
+        iterations, stopReason: 'no_progress', goalComplete: false,
+      });
+    }
 
     const goalUpdate = findGoalUpdate(turnNewMessages);
     const rejectedTools = findRejectedToolCalls(turnNewMessages);

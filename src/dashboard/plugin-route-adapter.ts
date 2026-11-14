@@ -84,7 +84,9 @@ export async function dispatchVerifiedDashboardGraph(
   runOptions: GraphRunOptions = {},
 ): Promise<import('../graph-runner/runner.js').GraphRunState> {
   const memberId = context?.verifiedOwner?.id;
-  if (!memberId) throw new Error('graph route requires a verified owner context');
+  if (!memberId) throw Object.assign(new Error('graph route requires a verified owner context'), {
+    code: 'VERIFIED_OWNER_REQUIRED' as const,
+  });
   const { runGraph } = await import('../graph-runner/runner.js');
   const graphDeclaration = parseYaml(readFileSync(graphFile, 'utf8')) as {
     graph?: { purpose?: unknown };
@@ -167,7 +169,8 @@ export function createDashboardPluginRouteAdapter(options: {
     handler: async (args) => {
       const context = await options.getTuiDispatchContext?.() as ToolRuntimeContext | undefined;
       const result = await dispatch(tool, args as Record<string, unknown>, false, context);
-      return result.ok ? result.result : { error: result.error };
+      return result.ok ? result.result : { error: result.error,
+        ...('code' in result ? { code: result.code } : {}) };
     },
     pluginId: tool.pluginId,
     route: tool.route,
@@ -224,7 +227,11 @@ export function createDashboardPluginRouteAdapter(options: {
       if (result.status === 'confirmation-required') return { ok: false as const, error: `confirmation declined for ${tool.name}` };
       if (result.status === 'graph-not-allowlisted') return { ok: false as const, error: `graph route is not allowlisted: ${tool.name}` };
       try { return { ok: true as const, result: await result.result }; }
-      catch (error) { return { ok: false as const, error: String(error) }; }
+      catch (error) {
+        return { ok: false as const, error: String(error),
+          ...(error instanceof Error && (error as Error & { code?: unknown }).code === 'VERIFIED_OWNER_REQUIRED'
+            ? { code: 'VERIFIED_OWNER_REQUIRED' as const } : {}) };
+      }
     }
     if (!EXECUTABLE_NATIVE_HANDLERS.has(tool.handlerRef)) {
       return { ok: false as const, error: `native plugin handler is not registered: ${tool.handlerRef}` };

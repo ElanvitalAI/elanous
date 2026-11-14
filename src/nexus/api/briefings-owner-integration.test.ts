@@ -72,6 +72,32 @@ test('briefings appRoute resolves its owner through the real /v1/members/owner H
       `http://nexus.test/v1/briefings?day=2026-11-14&appSlug=${encodeURIComponent(appSlug)}`,
       cookie ? { headers: { cookie } } : undefined,
     ));
+    // The operating PWA sends day only: identity must come from its web session.
+    const unscoped = (path: string, cookie?: string, authorization?: string) => route(new Request(
+      'http://nexus.test' + path,
+      { headers: { ...(cookie ? { cookie } : {}), ...(authorization ? { authorization } : {}) } },
+    ));
+    const dayPath = '/v1/briefings?day=2026-11-14';
+    const webList = await unscoped(dayPath, ownerCookie);
+    expect(webList?.status).toBe(200);
+    expect((await webList?.json()).briefings.map((item: { id: string }) => item.id)).toEqual([briefing.id]);
+    const otherWebList = await unscoped(dayPath, otherCookie);
+    expect(otherWebList?.status).toBe(200);
+    expect((await otherWebList?.json()).briefings).toEqual([]);
+    const webDetail = await unscoped('/v1/briefings/brief-owned', ownerCookie);
+    expect(webDetail?.status).toBe(200);
+    expect((await webDetail?.json()).id).toBe(briefing.id);
+    expect((await unscoped('/v1/briefings/brief-owned', otherCookie))?.status).toBe(404);
+    expect((await unscoped(dayPath))?.status).toBe(401);
+    expect((await unscoped(dayPath, '__Host-elanous_member_session=forged'))?.status).toBe(401);
+    expect((await unscoped(dayPath, ownerCookie + '; ' + otherCookie))?.status).toBe(401);
+    expect((await unscoped(dayPath, '__Host-elanous_member_session=forged',
+      'Bearer ' + session.sessionToken))?.status).toBe(401);
+    expect((await unscoped(dayPath, undefined, 'Bearer ' + session.sessionToken))?.status).toBe(401);
+    expect((await unscoped(dayPath + '&appSlug=', ownerCookie))?.status).toBe(401);
+    const queryIdentity = await unscoped(dayPath + '&memberId=' + encodeURIComponent(profile.id), otherCookie);
+    expect(queryIdentity?.status).toBe(200);
+    expect((await queryIdentity?.json()).briefings).toEqual([]);
     const ownList = await list(slot.appSlug, ownerCookie);
     expect(ownList?.status).toBe(200);
     expect((await ownList?.json()).briefings.map((item: { id: string }) => item.id)).toEqual([briefing.id]);

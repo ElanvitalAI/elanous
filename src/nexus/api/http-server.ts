@@ -21,6 +21,7 @@ import { BUILTIN_DIR } from '../../plugins/core/host.js';
 import { getUserConfig, resolveNexusRelayConfig } from '../../user-config.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
+import { isIP } from 'node:net';
 import { isAbsolute, join, dirname, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { readdirSync, realpathSync, statSync } from 'node:fs';
@@ -1566,8 +1567,19 @@ export async function routeRequest(
   if (pathname.startsWith('/v1/members') || pathname.startsWith('/v1/member/keys') || pathname.startsWith('/v1/member/tokens')) {
     const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
     if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
-    const networkKey = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
-    const response = await membersApi.handle(req, networkKey ?? 'unknown');
+    const socketAddress = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
+    let networkKey = socketAddress ?? 'unknown';
+    // This entry is served behind the local Caddy reverse proxy. Trust one
+    // forwarded address only when the immediate socket is that loopback proxy;
+    // never let a direct caller select another caller's rate bucket.
+    if (pathname.startsWith('/v1/members/connect/') && (socketAddress === '127.0.0.1' || socketAddress === '::1')) {
+      const forwarded = req.headers.get('x-forwarded-for');
+      const real = req.headers.get('x-real-ip');
+      const candidate = forwarded ?? real;
+      networkKey = candidate && !candidate.includes(',') && candidate.trim() === candidate && isIP(candidate) !== 0
+        && (!forwarded || !real || real === forwarded) ? candidate : 'unknown';
+    }
+    const response = await membersApi.handle(req, networkKey);
     if (response) return response;
   }
   if (pathname === '/v1/telegram/member-enrollment') {

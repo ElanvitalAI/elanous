@@ -12,6 +12,7 @@ import type { MemberAppSlot } from './member-store.js';
 import type { VerifiedAppOwner } from '../apps/app-host.js';
 import type { GraphCapabilityRegistry } from '../../graph-runner/capabilities.js';
 import { createMemberTokenApi } from './member-token-api.js';
+import { createMemberConnectEntry } from './member-connect-entry-api.js';
 import type { MemberAccessMatch } from './member-store.js';
 import { KCB_EVENT_CODE, KCB_TRY_EXAMPLES, KCB_TRY_MAX_ATTEMPTS, KCB_TRY_MAX_INPUT_CHARS,
   runKcbTryExample, type KcbTryExampleId } from './kcb-try.js';
@@ -269,6 +270,16 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
   const now = options.now ?? Date.now;
   const cloudBackupRoute = options.cloudBackupRoute ?? createMemberCloudBackupRoute({ memberStore: options.store });
   const tokens = createMemberTokenApi({ store: options.store, now });
+  const connectEntry = createMemberConnectEntry({
+    store: options.store, origin: callback.origin, now,
+    enabled: Boolean(options.issueOwnerSession && options.store.createAppAuthCode),
+    memberForRequest: request => {
+      try {
+        const token = sessionFromCookie(request);
+        return token ? options.store.memberForSession(token, new Date(now()).toISOString())?.id ?? null : null;
+      } catch { return null; }
+    },
+  });
   let resolvedAppLifecycle: Pick<AppLifecycleStore, 'ensureCreated'> | undefined;
   let hasResolvedAppLifecycle = false;
   const appLifecycleStore = (): Pick<AppLifecycleStore, 'ensureCreated'> | undefined => {
@@ -300,6 +311,8 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       const url = new URL(request.url);
       const path = url.pathname;
       if (!path.startsWith('/v1/members') && !path.startsWith('/v1/member/keys') && !path.startsWith('/v1/member/tokens')) return undefined;
+      const connectResponse = await connectEntry.handle(request, normalizeMemberSignupNetworkKey(networkKey));
+      if (connectResponse) return connectResponse;
       const origin = request.headers.get('origin');
       if (request.method === 'OPTIONS' && (path.startsWith('/v1/member/keys') || path.startsWith('/v1/member/tokens'))) {
         if (origin !== webOrigin) return new Response(null, { status: 403 });
