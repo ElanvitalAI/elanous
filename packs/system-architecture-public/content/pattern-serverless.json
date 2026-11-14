@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "아키텍처 패턴: serverless",
+  "source": "https://docs.aws.amazon.com/whitepapers/latest/serverless-multi-tier-architectures-api-gateway-lambda/serverless-multi-tier-architectures-api-gateway-lambda.html",
+  "body": "언제: 요청량 변동이 크고 관리형 실행·이벤트 트리거가 맞을 때.\n구성: API gateway, function/container, managed data, object storage, observability\n배치: 관리형 서비스가 VPC 내부 자원인지 프로젝트 범위인지 사실에 맞게 구분한다.\n예시 레이아웃 참고: left API → function → managed database; object storage below\n클라우드 대응: {}\n결정과 반증: 요구사항에서 노드와 간선을 다시 선택한다. 이 예시를 고정 도식으로 복사하지 않는다."
+}

@@ -1,3 +1,4 @@
+import { withCapabilityDiscoveryDescription } from './capability-discovery.js';
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -159,7 +160,10 @@ function loadNativeRouteTools(pluginRoot: string): NativePluginRouteTool[] {
     let rawAiTools: Record<string, unknown>[] = [];
     if (existsSync(yamlPath)) {
       const raw = parseYaml(readFileSync(yamlPath, 'utf8')) as Record<string, unknown>;
-      manifest = parsePluginManifest({ id: raw.id, name: raw.name, version: raw.version, contributes: raw.contributes });
+      manifest = parsePluginManifest({ id: raw.id, name: raw.name, version: raw.version, contributes: raw.contributes,
+        ...(raw.whenToUse === undefined ? {} : Object.fromEntries(
+          ['description', 'whenToUse', 'inputs', 'outputs', 'examples', 'requires'].map(key => [key, raw[key]]))),
+      });
       const rawContributes = raw.contributes as Record<string, unknown> | undefined;
       rawAiTools = Array.isArray(rawContributes?.aiTools) ? rawContributes.aiTools as Record<string, unknown>[] : [];
       graphFiles = graphFilesForAssets(directory, Array.isArray(raw.graphs) ? raw.graphs : []);
@@ -179,7 +183,7 @@ function loadNativeRouteTools(pluginRoot: string): NativePluginRouteTool[] {
       tools.push({
         pluginId: manifest.id,
         name: contribution.name,
-        description: contribution.description,
+        description: withCapabilityDiscoveryDescription(contribution.description, manifest),
         parameters: contribution.parameters ?? { type: 'object', properties: {} },
         handlerRef: contribution.handler,
         route: contribution.route,

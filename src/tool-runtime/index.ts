@@ -48,7 +48,7 @@ import { ALL_CONDUCTOR_RUNTIMES } from './conductor-runtimes.js';
 import { ALL_TOX_RUNTIMES } from '../task-orchestrator/runtimes/index.js';
 import { ACP_SESSION_RUNTIMES } from './acp-session-runtime.js';
 import { announceCompletionRuntime } from './announce-completion-runtime.js';
-import { toolSearchRuntime } from './tool-search-runtime.js';
+import { capabilitySearchRuntime, toolSearchRuntime } from './tool-search-runtime.js';
 import { gitCommitRuntime } from './git-commit-runtime.js';
 import { openPullRequestRuntime, mergePullRequestRuntime } from './git-pr-runtime.js';
 import { findRepoRuntime } from './find-repo-runtime.js';
@@ -146,6 +146,7 @@ export function registerAllDefaultToolRuntimes(opts: RegisterAllDefaultToolRunti
   for (const rt of ACP_SESSION_RUNTIMES) registerToolRuntime(rt);
   registerToolRuntime(announceCompletionRuntime);
   registerToolRuntime(toolSearchRuntime);
+  registerToolRuntime(capabilitySearchRuntime);
   registerToolRuntime(gitCommitRuntime);
   registerToolRuntime(openPullRequestRuntime);
   registerToolRuntime(mergePullRequestRuntime);

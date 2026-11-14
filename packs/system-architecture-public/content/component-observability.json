@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: observability",
+  "source": "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html",
+  "body": "무엇: 로그·메트릭·추적을 연결해 상태와 실패를 진단한다.\n언제: SLO·장애 분석·비동기 추적이 필요한 운영 경로에서.\n대안: 단일 서버 구조화 로그\nAWS: Amazon CloudWatch / AWS X-Ray / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Management-Tools/48/Arch_Amazon-CloudWatch_48.png\nGCP: Cloud Logging / Monitoring / Trace / 공식 범주 아이콘 경로 Category Icons/Observability/PNG/Observability-512-color.png\n공식 출처: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html, https://docs.cloud.google.com/docs/observability\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

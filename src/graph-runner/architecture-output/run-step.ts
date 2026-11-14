@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, openSync, closeSync, readFileSync, 
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { generateStructuredDesign } from './structured-design.js';
+import { exportEditableDiagram } from './editable-exports.js';
 import { missingPdfBodySections } from './pdf-body.js';
 
 type Data = Record<string, unknown>;
@@ -11,7 +12,8 @@ const sections = ['배경', '요구사항', '구성도', '데이터 흐름', '�
 const graphDir = import.meta.dir;
 const pluginRoot = str(process.env.ELANOUS_ARCHITECTURE_PLUGIN_ROOT) || resolve(graphDir, '../../../plugins/architecture-deliverables');
 type OwnedRun = { outDir: string; lockPath: string; stageDir: string };
-const outputFiles = ['architecture.html', 'architecture.excalidraw', 'architecture.png', 'architecture.pdf', 'verification.json'];
+const outputFiles = ['architecture.html', 'architecture.excalidraw', 'architecture.drawio', 'architecture.svg', 'architecture.png', 'architecture.pdf', 'verification.json'];
+const additiveFiles = new Set(['architecture.drawio', 'architecture.svg']);
 const bundleRootName = '.architecture-bundles';
 const currentName = '.architecture-current';
 function pathExists(path: string): boolean {
@@ -42,6 +44,7 @@ function publishOutputs(outDir: string, stageDir: string): void {
     throw new Error('architecture current pointer is not owned by this publisher');
   if (!firstPublish) for (const name of outputFiles) {
     const target = join(outDir, name);
+    if (!pathExists(target) && additiveFiles.has(name)) continue;
     if (!pathExists(target) || !lstatSync(target).isSymbolicLink() || readlinkSync(target) !== `${currentName}/${name}`)
       throw new Error(`architecture output alias changed: ${name}`);
   }
@@ -60,6 +63,11 @@ function publishOutputs(outDir: string, stageDir: string): void {
         if (pathExists(target)) { renameSync(target, join(backupDir, name)); backedUp.push(name); }
       }
       for (const name of outputFiles) {
+        symlinkSync(`${currentName}/${name}`, join(outDir, name));
+        installed.push(name);
+      }
+    } else {
+      for (const name of additiveFiles) if (!pathExists(join(outDir, name))) {
         symlinkSync(`${currentName}/${name}`, join(outDir, name));
         installed.push(name);
       }
@@ -151,7 +159,7 @@ function validateExcalidraw(source: string): number {
   if (parsed.type !== 'excalidraw' || !Array.isArray(parsed.elements) || parsed.elements.length < 3) throw new Error('editable Excalidraw source missing or empty');
   return parsed.elements.length;
 }
-function validateReferenceQuality(html: string, source: string): { provider: 'gcp' | 'generic'; iconLibraryUrl: string; verifiedIcons: number } {
+function validateReferenceQuality(html: string, source: string): { provider: 'gcp' | 'aws' | 'local' | 'generic'; iconLibraryUrl: string; verifiedIcons: number } {
   for (const heading of ['목차', '요약', '부록']) {
     if (!new RegExp(`<h[1-6][^>]*>\\s*${heading}\\s*</h[1-6]>`, 'iu').test(html)) throw new Error(`reference PDF heading missing: ${heading}`);
   }
@@ -160,23 +168,24 @@ function validateReferenceQuality(html: string, source: string): { provider: 'gc
   const elements = Array.isArray(parsed.elements) ? parsed.elements.map(asObject) : [];
   const metadata = asObject(parsed.metadata);
   const provider = str(metadata.provider) || 'gcp';
-  if (provider !== 'gcp' && provider !== 'generic') throw new Error('unsupported architecture diagram provider');
+  if (!['gcp', 'aws', 'local', 'generic'].includes(provider)) throw new Error('unsupported architecture diagram provider');
   const boxes = elements.filter(element => element.type === 'rectangle' && ['x', 'y', 'width', 'height'].every(key => typeof element[key] === 'number'));
   const within = (inner: Data, outer: Data): boolean => Number(inner.x) >= Number(outer.x) && Number(inner.y) >= Number(outer.y)
     && Number(inner.x) + Number(inner.width) <= Number(outer.x) + Number(outer.width)
     && Number(inner.y) + Number(inner.height) <= Number(outer.y) + Number(outer.height);
   const named = (pattern: RegExp): Data | undefined => boxes.filter(box => elements.some(element => element.type === 'text' && pattern.test(str(element.text)) && within(element, box)))
     .sort((a, b) => Number(a.width) * Number(a.height) - Number(b.width) * Number(b.height))[0];
-  const project = named(provider === 'gcp' ? /PROJECT|ACCOUNT/iu : /SYSTEM SCOPE/iu);
-  const region = named(provider === 'gcp' ? /REGION/iu : /ZONE/iu);
-  const vpc = named(provider === 'gcp' ? /VPC/iu : /NETWORK/iu);
+  const cloud = provider === 'gcp' || provider === 'aws';
+  const project = named(cloud ? /PROJECT|ACCOUNT/iu : /SYSTEM SCOPE/iu);
+  const region = named(cloud ? /REGION/iu : /ZONE/iu);
+  const vpc = named(cloud ? /VPC/iu : /NETWORK/iu);
   if (!project || !region || !vpc || project === region || region === vpc || !within(region, project) || !within(vpc, region)) throw new Error('reference diagram requires nested project, region and VPC shapes');
   if (elements.filter(element => element.type === 'arrow').length < 2) throw new Error('reference diagram requires actual flow arrows');
   const labels = elements.map(element => str(element.text)).join(' ');
   const requiredLabels: Array<[string, RegExp]> = [
-    ['outer boundary', provider === 'gcp' ? /PROJECT|ACCOUNT/iu : /SYSTEM SCOPE/iu],
-    ['zone', provider === 'gcp' ? /REGION/iu : /ZONE/iu],
-    ['network', provider === 'gcp' ? /VPC/iu : /NETWORK/iu],
+    ['outer boundary', cloud ? /PROJECT|ACCOUNT/iu : /SYSTEM SCOPE/iu],
+    ['zone', cloud ? /REGION/iu : /ZONE/iu],
+    ['network', cloud ? /VPC/iu : /NETWORK/iu],
     ['users', /USERS|CLIENTS/iu], ['edge', /EDGE/iu], ['application', /APPLICATION|APP/iu],
     ['data', /DATA|LEDGER|DATABASE/iu], ['observability', /MONITORING|OBSERVABILITY|CLOUDWATCH/iu],
     ['security', /SECURITY|TRUST/iu], ['legend', /LEGEND/iu], ['version', /v\d+\.\d+/iu],
@@ -185,11 +194,11 @@ function validateReferenceQuality(html: string, source: string): { provider: 'gc
   if ((labels.match(/[①②③④⑤⑥⑦⑧⑨]/gu) ?? []).length < 2) throw new Error('reference diagram needs numbered data flows');
   const imageFiles = asObject(parsed.files);
   const images = elements.filter(element => element.type === 'image' && str(element.fileId) && imageFiles[str(element.fileId)]);
-  if (provider === 'gcp' && images.length < 3) throw new Error('GCP reference diagram requires embedded official service icons');
-  if (provider === 'generic' && images.length) throw new Error('generic reference diagram must not embed GCP service icons');
+  if (cloud && images.length < 3) throw new Error('cloud reference diagram requires embedded official service icons');
+  if (!cloud && images.length) throw new Error('local and generic reference diagrams must not embed cloud service icons');
   const iconLibraryUrl = str(metadata.iconLibraryUrl);
-  const registry = asObject(JSON.parse(readFileSync(join(pluginRoot, 'references/official-gcp-icons.json'), 'utf8')) as unknown);
-  if (provider === 'gcp' && iconLibraryUrl !== str(registry.libraryUrl)) throw new Error('official cloud icon library source missing');
+  const registry = cloud ? asObject(JSON.parse(readFileSync(join(pluginRoot, `references/official-${provider}-icons.json`), 'utf8')) as unknown) : {};
+  if (cloud && iconLibraryUrl !== str(registry.libraryUrl)) throw new Error('official cloud icon library source missing');
   const knownAssets = asObject(registry.assets);
   const iconAssets = asObject(metadata.iconAssets);
   for (const image of images) {
@@ -202,7 +211,7 @@ function validateReferenceQuality(html: string, source: string): { provider: 'gc
       throw new Error(`official icon provenance mismatch: ${fileId}`);
     }
   }
-  return { provider, iconLibraryUrl, verifiedIcons: images.length };
+  return { provider: provider as 'gcp' | 'aws' | 'local' | 'generic', iconLibraryUrl, verifiedIcons: images.length };
 }
 
 let ownedRun: OwnedRun | undefined;
@@ -245,6 +254,7 @@ try {
     validateHtml(html);
     const elements = validateExcalidraw(diagram);
     const quality = validateReferenceQuality(html, diagram);
+    const exports = exportEditableDiagram(diagram);
     if (existsSync(lockPath)) throw new Error('architecture output already has an active run; inspect its lock before retrying');
     assertOutputDirectory(outDir);
     mkdirSync(dirname(outDir), { recursive: true });
@@ -263,6 +273,8 @@ try {
     pdfPath = join(stageDir, 'architecture.pdf');
     writeFileSync(htmlPath, html, { flag: 'wx' });
     writeFileSync(sourcePath, diagram, { flag: 'wx' });
+    writeFileSync(join(stageDir, 'architecture.drawio'), exports.drawio, { flag: 'wx' });
+    writeFileSync(join(stageDir, 'architecture.svg'), exports.svg, { flag: 'wx' });
     console.log(JSON.stringify({ outcome: 'ok', htmlPath, sourcePath, elements, verifiedIcons: quality.verifiedIcons }));
   } else if (step === 'diagram') {
     const { rendererDir, renderer } = resourcePaths(input);
@@ -285,6 +297,10 @@ try {
     const elements = validateExcalidraw(diagram);
     validateHtml(html);
     const quality = validateReferenceQuality(html, diagram);
+    const expectedExports = exportEditableDiagram(diagram);
+    if (readFileSync(filePath(join(stageDir, 'architecture.drawio'), 'architecture.drawio'), 'utf8') !== expectedExports.drawio
+      || readFileSync(filePath(join(stageDir, 'architecture.svg'), 'architecture.svg'), 'utf8') !== expectedExports.svg)
+      throw new Error('editable diagram exports differ from validated source');
     const png = readFileSync(filePath(pngPath, 'architecture.png'));
     const pdf = readFileSync(filePath(pdfPath, 'architecture.pdf'));
     if (png.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') throw new Error('PNG signature invalid');
@@ -294,6 +310,8 @@ try {
       'import json,pymupdf,sys; doc=pymupdf.open(sys.argv[1]); blocks=lambda p: sorted((b for b in p.get_text("blocks") if isinstance(b[4],str)),key=lambda b:(b[0]>=p.rect.width/2,b[1],b[0])); text=chr(10).join(chr(10).join(b[4] for b in blocks(p)) for p in doc if p.number>=1); print(json.dumps({"pages":len(doc),"text":text},ensure_ascii=False))',
       pdfPath], rendererDir)) as { pages: number; text: string };
     const text = inspected.text;
+    if (str(input.structuredDesignPath) && (!text.includes('구성 요소 표') || !text.includes('선택 패턴')))
+      throw new Error('structured PDF missing component table or selected pattern');
     const unpriced = /<td>미산정<\/td>/u.test(html);
     if (unpriced && !text.includes('미산정')) throw new Error('unpriced cost missing from PDF text');
     const missing = missingPdfBodySections(text, sections);
@@ -302,9 +320,9 @@ try {
     const pages = inspected.pages;
     if (!Number.isFinite(pages) || pages < 4) throw new Error('reference PDF requires at least four pages');
     const receipt = { status: 'verified', costStatus: unpriced ? 'unpriced' : 'priced',
-      contract: quality.provider === 'gcp' ? 'system-architecture/cloud-expansion@2' : 'system-architecture@2',
+      contract: quality.provider === 'gcp' ? 'system-architecture/cloud-expansion@2' : quality.provider === 'aws' ? 'system-architecture/aws@1' : 'system-architecture@2',
       profile: quality.provider, quality: 'reference', pages, iconLibraryUrl: quality.iconLibraryUrl, verifiedIcons: quality.verifiedIcons,
-      files: ['architecture.excalidraw', 'architecture.png', 'architecture.html', 'architecture.pdf'], pdfSections: sections,
+      files: ['architecture.excalidraw', 'architecture.drawio', 'architecture.svg', 'architecture.png', 'architecture.html', 'architecture.pdf'], pdfSections: sections,
       elements, pngBytes: png.length, pdfBytes: pdf.length,
       generation: basename(stageDir),
       immutableDirectory: `${bundleRootName}/${basename(stageDir)}`,

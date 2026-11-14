@@ -170,3 +170,15 @@ describe('소환로 · 사슬 e2e (tier-flip → dispatch)', () => {
     expect(r.matched).toEqual(split.deferred.map((d) => d.name));
   });
 });
+
+test('capability_search is registered and surface scoped on daemon chat and webterm', async () => {
+  for (const name of ['chat', 'webterm'] as const) {
+    const surface = toolSurface(name);
+    expect(surface.specs.filter(spec => spec.name === 'capability_search')).toHaveLength(1);
+    const result = await surface.dispatch('capability_search', { query: 'select:Read' }, ctx());
+    expect(contentOf(result)).toContain('<functions>');
+    const absent = await surface.dispatch('capability_search',
+      { query: 'select:unregistered_synthetic_capability' }, ctx()) as { matched: string[] };
+    expect(absent.matched).toEqual([]);
+  }
+});

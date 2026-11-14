@@ -105,7 +105,8 @@ function replayPaintWrites(writes: readonly string[]): string[] {
   return snapshots;
 }
 const turnAbortSignals: AbortSignal[] = [];
-let duringTurnHook: ((signal: AbortSignal) => void | Promise<void>) | null = null;
+type MockMeasuredUsage = { inputTokens?: number; outputTokens?: number };
+let duringTurnHook: ((signal: AbortSignal, emit?: NonNullable<Parameters<typeof localChatTurnOriginal.runLocalChatTurn>[5]>, onUsage?: (usage: MockMeasuredUsage) => void) => void | Promise<void>) | null = null;
 let mockChildStatus: string | null = null;
 let mockCompactStatus: string | null = null;
 type ShellActivityEvent =
@@ -124,6 +125,8 @@ const requestedPushNowIds: string[] = [];
 let mockToolSnapshot: Array<{ id: string; name: string }> = [];
 let mockLocalChatTurnResult: { goalComplete?: boolean; goalStopReason?: string } | undefined;
 let mockLocalChatTurnError: string | undefined;
+let mockAssistantTextSource = false;
+let mockDeltaText = '첫 응답 델타';
 let providerCommandCalls: string[] = [];
 let recoveryResumeTargetId = '';
 let useRealComposerForRecovery = false;
@@ -198,8 +201,8 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
     signal: AbortSignal,
     _cli: unknown,
     _writePrompt: unknown,
-    onDelta?: (delta: string) => void,
-    _onCompact?: { onMessageBlock?: (block: MessageBlock) => void; onCompact?: (outcome: { status: string }) => void },
+    onDelta?: (delta: string, replace?: boolean, source?: 'assistant-text') => void,
+    _onCompact?: { onMessageBlock?: (block: MessageBlock) => void; onCompact?: (outcome: { status: string }) => void; onMeasuredUsage?: (usage: MockMeasuredUsage) => void },
     _attachments?: unknown,
     _onStatus?: (text: string) => void,
     _onAgent?: (event: import('./core/agents.js').AgentDisplayEvent) => void,
@@ -216,12 +219,12 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
     turnTextsSeen.push(text);
     const tier = resolveLlmTier(undefined, 'openai-codex', { sessionId });
     turnTiersSeen.push({ tier: tier.tier, source: tier.source });
-    onDelta?.('첫 응답 델타');
+    onDelta?.(mockDeltaText, undefined, mockAssistantTextSource ? 'assistant-text' : undefined);
     if (mockChildStatus) _onStatus?.(mockChildStatus);
     if (mockCompactStatus) _onCompact?.onCompact?.({ status: mockCompactStatus });
     for (const block of messageBlocksForTurn) _onCompact?.onMessageBlock?.(block);
     messageBlocksForTurn = [];
-    await duringTurnHook?.(signal);
+    await duringTurnHook?.(signal, onDelta, _onCompact?.onMeasuredUsage);
     const afterTurn = keysAfterTurn;
     keysAfterTurn = [];
     if (afterTurn.length) setTimeout(() => afterTurn.forEach(enqueueReadKey), 25);
@@ -369,6 +372,8 @@ afterEach(() => {
   mockCompactStatus = null;
   mockLocalChatTurnResult = undefined;
   mockLocalChatTurnError = undefined;
+  mockAssistantTextSource = false;
+  mockDeltaText = '첫 응답 델타';
   mockBackgroundLine = null;
   messageBlocksForTurn = [];
   selfHealthListener = null;
@@ -610,6 +615,117 @@ test('partial raw reply and stream disconnect do not expose the delta or error t
     expect(screen).toContain('요청을 처리하지 못했습니다.');
     expect(screen).not.toContain('첫 응답 델타');
     expect(screen).not.toContain('stream disconnected after partial reply');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test.each(['basic', 'log'] as const)('%s focus paints classified assistant text or explicitly opened diagnostics before settlement', async (mode) => {
+  mockAssistantTextSource = mode === 'basic';
+  mockDeltaText = '첫 응답 델타\nDEMO_API_KEY=private-fixture-value-123456\n\x1b]52;c;PRIVATE-CLIPBOARD\x07';
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  submittedInputs.push('이 폴더에서 콘서트 티케팅 시스템을 만들어줘. 프론트엔드, 백엔드 시스템을 설계하고 실제 배포해줘');
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  let streamingFrames: string[] = [];
+  duringTurnHook = async () => {
+    if (mode === 'log') {
+      enqueueReadKey({ name: 'pageup', ctrl: false, shift: false, raw: '\x1b[5~' });
+      await Bun.sleep(10);
+      enqueueReadKey({ name: 'pagedown', ctrl: false, shift: false, raw: '\x1b[6~' });
+    }
+    await Bun.sleep(10);
+    streamingFrames = replayPaintWrites(transcript);
+  };
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(streamingFrames.some((frame) => frame.includes('엘라누스: 첫 응답 델타') && frame.includes('턴 스트리밍'))).toBe(true);
+    expect(transcript.join('')).not.toContain('private-fixture-value-123456');
+    expect(transcript.join('')).not.toContain('PRIVATE-CLIPBOARD');
+    expect(replayPaintWrites(transcript).at(-1)).not.toContain('첫 응답 델타');
+    expect(loadSession(session.id)?.messages.some((message) => message.content.includes('첫 응답 델타'))).toBe(false);
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('live assistant output estimates grow on deltas, ignore replace/diagnostics and reset on the next turn', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  mockAssistantTextSource = true;
+  mockDeltaText = 'abcd ';
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  const ask = '이 폴더에서 콘서트 티케팅 시스템을 만들어줘. 프론트엔드, 백엔드 시스템을 설계하고 실제 배포해줘';
+  submittedInputs.push(ask, ask);
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  const observed: string[] = [];
+  let turns = 0;
+  duringTurnHook = async (_signal, emit) => {
+    observed.push(replayPaintWrites(transcript).at(-1) ?? '');
+    if (++turns === 1) {
+      emit?.('efgh ', false, 'assistant-text');
+      await Bun.sleep(40); // 출처: #37786 — 33ms preview paint throttle 다음 프레임을 관측한다.
+      observed.push(replayPaintWrites(transcript).at(-1) ?? '');
+      emit?.('canonical replacement', true, 'assistant-text');
+      emit?.('PRIVATE diagnostic', false);
+      await Bun.sleep(40);
+      observed.push(replayPaintWrites(transcript).at(-1) ?? '');
+      keysAfterTurn = [{ name: 'enter', ctrl: false, shift: false, raw: '\r' }];
+    } else keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  };
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(turns).toBe(2);
+    expect(observed[0]).toContain('출력 토큰 추정 2');
+    expect(observed[1]).toContain('출력 토큰 추정 3');
+    expect(observed[2]).toContain('출력 토큰 추정 3');
+    expect(observed[2]).not.toContain('PRIVATE diagnostic');
+    expect(observed[3]).toContain('출력 토큰 추정 2');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('streaming partial measured usage keeps the input count and growing output estimate', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  mockAssistantTextSource = true;
+  mockDeltaText = 'abcd ';
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  submittedInputs.push('stream partial usage');
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  const observed: string[] = [];
+  duringTurnHook = async (_signal, emit, onUsage) => {
+    onUsage?.({ inputTokens: 77 });
+    observed.push(replayPaintWrites(transcript).at(-1) ?? '');
+    emit?.('efgh ', false, 'assistant-text');
+    await Bun.sleep(40); // Source: #37786 waits beyond the 33ms preview paint throttle.
+    observed.push(replayPaintWrites(transcript).at(-1) ?? '');
+    onUsage?.({ inputTokens: 77, outputTokens: 0 });
+    observed.push(replayPaintWrites(transcript).at(-1) ?? '');
+  };
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(observed[0]).toContain('토큰 77/추정2');
+    expect(observed[0]).toContain('턴 스트리밍');
+    expect(observed[1]).toContain('토큰 77/추정3');
+    expect(observed[2]).toContain('토큰 77/0');
+    expect(observed[2]).not.toContain('추정');
   } finally {
     process.stdout.write = output;
   }

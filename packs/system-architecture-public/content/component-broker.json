@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: broker",
+  "source": "https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is.html",
+  "body": "무엇: 이벤트를 여러 구독자에게 전달한다.\n언제: 하나의 사건을 여러 독립 소비자가 처리하거나 스트림 재생이 필요할 때.\n대안: 단일 작업 큐 또는 동기 이벤트 호출\nAWS: Amazon EventBridge / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Application-Integration/48/Arch_Amazon-EventBridge_48.png\nGCP: Pub/Sub / 공식 범주 아이콘 경로 Category Icons/Integration Services/PNG/IntegrationServices-512-color.png\n공식 출처: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is.html, https://cloud.google.com/pubsub/docs/overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

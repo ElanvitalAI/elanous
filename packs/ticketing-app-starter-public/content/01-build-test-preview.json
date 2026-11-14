@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "콘서트 티케팅 앱 한 줄 구현 · 시험 · 게시 경계",
+  "source": "https://12factor.net/processes",
+  "body": "언제: 사용자가 콘서트 티케팅 웹앱의 프론트엔드·백엔드 구현과 배포를 한 턴에 요청할 때. 아키텍처 도식만 요청하거나 문구 수정만 요청할 때 로드하지 않는다.\n시작: ticketing-bun-sqlite@0.1.0 고정 스캐폴드를 빈 경로에 생성한다. 공연명·날짜·좌석 수·공개 대상만 입력에서 추출하고 미정 값은 미정으로 유지하며 임의 좌석 수 등 기본값은 샘플/가상으로 표시한다. 좌석 상태기계와 HTTP 경로를 처음부터 재작성하지 않는다.\n구현: Bun+SQLite durable seat/hold/order/ticket, 정적 FE와 BE 동일 origin, 사용자 두 명 좌석 충돌 409, 재시작 뒤 멱등 replay를 보존한다. 구매는 합성 결제이며 실결제·실회원 인증이 아니다.\n시험: 생성 직후 bun test, loopback HTTP에서 HTML·JS·health·hold·checkout·conflict·my-tickets를 확인한다. 실패하면 증거를 읽고 한 번만 수정·재시험한다.\n게시: 127.0.0.1 315xx 로컬 미리보기와 공개 URL을 분리한다. 승인된 회원/relay 연결이 없으면 연결 필요 카드와 로컬 검증 영수증만 반환한다. 연결이 있으면 승인된 배포 입구에서 URL 200·타회원 거부·되돌리기 영수증을 확인한 뒤 완료를 주장한다.\n관련 설계 근거: ticketing-architecture-public 카드 02-seat, 03-unique, 07-idempotency, 20-twelve-factor. 15분 한도에 각 단계 시작·종료·결과를 남기고 초과 시 막힌 단계와 부분 산출물을 정직하게 반환한다."
+}

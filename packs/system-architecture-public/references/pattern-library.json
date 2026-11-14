@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "description": "패턴은 요구 분석의 비교 기준이며 완성 도식의 고정 템플릿이 아니다. 도식 노드와 간선은 선택된 요구사항에서 다시 만든다.",
+  "patterns": [
+    {
+      "id": "local-single-node",
+      "whenToUse": "작은 팀의 개발·시연·내부 운영이며 단일 호스트 장애 허용이 명시될 때.",
+      "components": [
+        "browser",
+        "Bun/Node/Python process",
+        "SQLite file",
+        "local logs"
+      ],
+      "placement": "브라우저는 호스트 밖, 앱 프로세스와 SQLite 파일은 같은 호스트; 선택적 Tailscale Serve는 tailnet 회원 내부 접근만 허용한다. 파일 백업과 단일 장애 지점을 표시한다.",
+      "exampleLayout": "left browser → center local process → right SQLite; logs below process",
+      "cloudCounterparts": {
+        "Bun/Node/Python process": "Cloud Run / AWS Lambda or ECS",
+        "SQLite file": "Cloud SQL / Amazon RDS"
+      },
+      "source": "https://www.sqlite.org/whentouse.html"
+    },
+    {
+      "id": "local-relay-public",
+      "whenToUse": "회원 연결 없는 공개 브라우저 접속이 필요하고 운영자 호스트 앱은 127.0.0.1에만 둘 때. 공개 릴레이 또는 명시적으로 공개 승인된 Tailscale Funnel의 인증·되돌리기를 설계한다.",
+      "components": [
+        "public browser",
+        "DNS",
+        "public HTTPS relay or Tailscale Funnel",
+        "localhost process",
+        "SQLite file",
+        "rollback control"
+      ],
+      "placement": "공개 릴레이 또는 Funnel 경계와 127.0.0.1 내부 프로세스를 분리한다. Tailscale Serve는 tailnet 내부 전용이므로 공개 입구로 세지 않는다. 공개 URL·인증·가용성·되돌리기를 명시한다.",
+      "exampleLayout": "left public browser → upper public relay/Funnel → center localhost process → right SQLite; rollback below",
+      "cloudCounterparts": {
+        "public HTTPS relay or Tailscale Funnel": "Cloud Load Balancing / Application Load Balancer",
+        "localhost process": "Cloud Run / Amazon ECS"
+      },
+      "source": "https://tailscale.com/docs/features/tailscale-funnel"
+    },
+    {
+      "id": "cloud-three-tier",
+      "whenToUse": "웹·API·영속 데이터의 변경·보안·확장 경계가 달라질 때.",
+      "components": [
+        "CDN/WAF",
+        "load balancer",
+        "application",
+        "RDBMS",
+        "observability"
+      ],
+      "placement": "사용자와 공개 edge, 앱 서브넷, 데이터 서브넷을 분리하고 지역·VPC·장애 구역을 표기한다.",
+      "exampleLayout": "left user → edge → app zone → private data zone; telemetry below",
+      "cloudCounterparts": {},
+      "source": "https://docs.cloud.google.com/application-design-center/docs/three-tier-web-app"
+    },
+    {
+      "id": "serverless",
+      "whenToUse": "요청량 변동이 크고 관리형 실행·이벤트 트리거가 맞을 때.",
+      "components": [
+        "API gateway",
+        "function/container",
+        "managed data",
+        "object storage",
+        "observability"
+      ],
+      "placement": "관리형 서비스가 VPC 내부 자원인지 프로젝트 범위인지 사실에 맞게 구분한다.",
+      "exampleLayout": "left API → function → managed database; object storage below",
+      "cloudCounterparts": {},
+      "source": "https://docs.aws.amazon.com/whitepapers/latest/serverless-multi-tier-architectures-api-gateway-lambda/serverless-multi-tier-architectures-api-gateway-lambda.html"
+    },
+    {
+      "id": "event-driven",
+      "whenToUse": "생산자와 여러 소비자의 처리율·가용성을 분리하고 재시도가 필요할 때.",
+      "components": [
+        "producer",
+        "broker/queue",
+        "workers",
+        "idempotency ledger",
+        "dead-letter path",
+        "observability"
+      ],
+      "placement": "비동기 간선, 재시도·중복 처리, 실패 격리와 DLQ를 명시한다.",
+      "exampleLayout": "left producer → broker → parallel workers → durable ledger; DLQ below broker",
+      "cloudCounterparts": {},
+      "source": "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_prevent_interaction_failure.html"
+    }
+  ]
+}

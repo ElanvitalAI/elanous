@@ -66,6 +66,8 @@ interface TurnResult {
   status?: string;
   sessionId?: string;
   text?: string;
+  /** Origin is a display classification, not a final-answer or authentication claim. */
+  source?: unknown;
   error?: string;
   provider?: string;
   model?: string | null;
@@ -100,7 +102,7 @@ export type LocalChatToolActivity =
 export type LocalChatPushNowResult = { requestId: string; outcome: 'ready' | 'interrupted' | 'deferred'; activeTools: string[] };
 interface WaitingTurn {
   turnId: string;
-  onDelta?: (text: string, replace?: boolean) => void;
+  onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void;
   onStatus?: (text: string) => void;
   onAgent?: (event: AgentDisplayEvent) => void;
   onMessageBlock?: (block: MessageBlock) => void;
@@ -240,7 +242,7 @@ class LocalChatSession {
       if (result.event === 'delta') {
         if (result.turnId !== waiting.turnId) return;
         if (typeof result.text === 'string') {
-          try { waiting.onDelta?.(result.text); } catch { /* renderer cannot break the turn */ }
+          try { waiting.onDelta?.(result.text, undefined, result.source === 'assistant-text' ? 'assistant-text' : undefined); } catch { /* renderer cannot break the turn */ }
         }
         return;
       }
@@ -399,7 +401,7 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean) => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage']): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage']): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
@@ -523,7 +525,7 @@ export async function runLocalChatTurn(
   signal: AbortSignal,
   cli = process.argv[1],
   writePrompt?: (payload: string) => Promise<void>,
-  onDelta?: (text: string, replace?: boolean) => void,
+  onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void,
   compact: LocalChatTurnCompact = {},
   attachments: readonly string[] = [],
   onStatus?: (line: string) => void,
@@ -572,8 +574,8 @@ export async function runLocalChatTurn(
   if (signal.aborted) abort();
   let result: TurnResult;
   try {
-    result = await session.turn(text, writePrompt, (delta, replace) => {
-      if (!signal.aborted) onDelta?.(delta, replace);
+    result = await session.turn(text, writePrompt, (delta, replace, source) => {
+      if (!signal.aborted) onDelta?.(delta, replace, source);
     }, attachments, (line) => { if (!signal.aborted) onStatus?.(line); }, (event) => { if (!signal.aborted) onAgent?.(event); },
     (block) => { if (!signal.aborted) compact.onMessageBlock?.(block); },
     (event) => { if (!signal.aborted) onShellActivity?.(event); },

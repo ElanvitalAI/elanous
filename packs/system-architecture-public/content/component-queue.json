@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: queue",
+  "source": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html",
+  "body": "무엇: 작업을 비동기로 버퍼링해 생산자와 소비자의 부하를 분리한다.\n언제: 요청 처리와 느린 작업을 분리하거나 급증을 완충할 때. 중복 전달과 재시도 정책을 정한다.\n대안: 동기 호출 또는 데이터베이스 작업 테이블\nAWS: Amazon SQS / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Application-Integration/48/Arch_Amazon-Simple-Queue-Service_48.png\nGCP: Cloud Tasks / 공식 범주 아이콘 경로 Category Icons/Integration Services/PNG/IntegrationServices-512-color.png\n공식 출처: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html, https://docs.cloud.google.com/tasks/docs/dual-overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

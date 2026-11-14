@@ -740,33 +740,90 @@ test('rejected gate-heal terminal path instructs a new run and forged paths keep
       { nodeId: 'gate', ok: false, executed: true, exit: 1,
         output: '{"outcome":"error","introduced":[],"error":"pod sweep incomplete: worker interrupted"}' },
       { nodeId: 'cloud-leave-error', ok: true, executed: true },
-      { nodeId: 'gate-triage', ok: true, executed: true },
+      { nodeId: 'gate-triage', ok: false, executed: true, output: '{"outcome":"fail"}' },
       { nodeId: 'gate-heal-decision', ok: false, executed: false, output: '{"outcome":"rejected"}' },
       { nodeId: 'traffic-failed-restore', ok: true, executed: true },
       { nodeId: 'failed', ok: true, executed: false },
     ], input: { version: '0.3.15', acceptedRegressions: [] } } as unknown as GraphRunState;
+  // Use the complete canonical parent prefix; a one-node prefix is not release provenance.
+  const prefix = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
+    'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep'];
+  state.path.splice(0, 1, ...prefix);
+  state.nodes.splice(0, 1, ...prefix.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true })));
+  const gateIndex = prefix.length;
   const request = { from: 'gate' as const, ownerWaive: 'gate' as const,
     reason: 'Owner accepts an unmeasured gate risk.', approvedBy: 'OP' };
   expect(() => releaseResumeWaiver(state, request)).toThrow('start a new release run from the same cut');
   const failedCloud = structuredClone(state);
-  failedCloud.path[2] = 'cloud-leave-fail';
-  failedCloud.nodes[2]!.nodeId = 'cloud-leave-fail';
+  failedCloud.path[gateIndex + 1] = 'cloud-leave-fail';
+  failedCloud.nodes[gateIndex + 1]!.nodeId = 'cloud-leave-fail';
   expect(() => releaseResumeWaiver(failedCloud, request)).toThrow('start a new release run from the same cut');
+  const approvedCloud = structuredClone(state);
+  approvedCloud.path.splice(6, 0, 'approve-cloud-elastic');
+  approvedCloud.nodes.splice(6, 0, { nodeId: 'approve-cloud-elastic', ok: true, exit: null, executed: false });
+  expect(() => releaseResumeWaiver(approvedCloud, request)).toThrow('start a new release run from the same cut');
+  for (const index of prefix.keys()) {
+    for (const mutation of ['replace', 'omit', 'duplicate', 'swap'] as const) {
+      const forged = structuredClone(state);
+      if (mutation === 'replace') { forged.path[index] = 'forged-middle'; forged.nodes[index]!.nodeId = 'forged-middle'; }
+      if (mutation === 'omit') { forged.path.splice(index, 1); forged.nodes.splice(index, 1); }
+      if (mutation === 'duplicate') { forged.path.splice(index, 0, prefix[index]!); forged.nodes.splice(index, 0, { ...forged.nodes[index]! }); }
+      if (mutation === 'swap' && index < prefix.length - 1) {
+        [forged.path[index], forged.path[index + 1]] = [forged.path[index + 1]!, forged.path[index]!];
+        [forged.nodes[index], forged.nodes[index + 1]] = [forged.nodes[index + 1]!, forged.nodes[index]!];
+      } else if (mutation === 'swap') continue;
+      expect(() => releaseResumeWaiver(forged, request)).toThrow('owner waiver requires the failed executable gate');
+    }
+  }
   for (const mutate of [
     (copy: GraphRunState) => { copy.path[0] = 'wrong-prefix'; },
     (copy: GraphRunState) => { copy.nodes[0]!.nodeId = 'wrong-prefix'; },
     (copy: GraphRunState) => { copy.path[0] = 'wrong-prefix'; copy.nodes[0]!.nodeId = 'wrong-prefix'; },
     (copy: GraphRunState) => { copy.path.shift(); copy.nodes.shift(); },
     (copy: GraphRunState) => { copy.path.splice(1, 0, 'wrong-prefix'); copy.nodes.splice(1, 0, { ...copy.nodes[0]!, nodeId: 'wrong-prefix' }); },
-    (copy: GraphRunState) => { copy.nodes[2]!.executed = false; },
-    (copy: GraphRunState) => { copy.nodes[4]!.output = '{"outcome":"approved"}'; },
-    (copy: GraphRunState) => { copy.nodes[5]!.executed = false; },
-    (copy: GraphRunState) => { copy.nodes[1]!.ok = true; },
-    (copy: GraphRunState) => { copy.nodes[1]!.executed = false; },
+    (copy: GraphRunState) => { copy.nodes[gateIndex + 1]!.executed = false; },
+    (copy: GraphRunState) => { copy.nodes[gateIndex + 2]!.output = '{"outcome":"ok"}'; },
+    (copy: GraphRunState) => { copy.nodes[gateIndex + 3]!.output = '{"outcome":"approved"}'; },
+    (copy: GraphRunState) => { copy.nodes[gateIndex + 4]!.executed = false; },
+    (copy: GraphRunState) => { copy.nodes[gateIndex]!.ok = true; },
+    (copy: GraphRunState) => { copy.nodes[gateIndex]!.executed = false; },
     (copy: GraphRunState) => { copy.path.splice(1, 0, 'gate'); copy.nodes.splice(1, 0, { ...copy.nodes[1]! }); },
   ]) {
     const forged = structuredClone(state);
     mutate(forged);
     expect(() => releaseResumeWaiver(forged, request)).toThrow('owner waiver requires the failed executable gate');
   }
+});
+
+test('canonical graph rejected heal keeps new-run guidance and approval refusal without resuming effects', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-prefix-provenance-'));
+  try {
+    const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+    const commands: string[] = [];
+    const options = { deps: { root, runBash: async (body: string) => {
+      commands.push(body);
+      if (body.includes('/gate-node.ts')) return { exitCode: 1,
+        stdout: '{"outcome":"error","introduced":[],"error":"pod sweep incomplete: worker interrupted"}\n', stderr: '' };
+      if (body.includes('/gate-triage-node.ts')) return { exitCode: 1, stdout: '{"outcome":"fail"}\n', stderr: '' };
+      return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
+    } } };
+    const waiting = await runGraph(graphPath, { input: { version: '9.9.9', previousVersion: '0.3.15' }, ...options });
+    expect(waiting.pending?.nodeId).toBe('gate-heal-decision');
+    decideGraphApproval(waiting.graphId, waiting.runId, 'rejected', 'fixture-owner', root);
+    const rejected = await runGraph(graphPath, { resumeRunId: waiting.runId, ...options });
+    expect(rejected.status).toBe('failed');
+    const before = readFileSync(rejected.statePath, 'utf8');
+    const commandCount = commands.length;
+    const request = { from: 'gate', ownerWaive: 'gate', reason: 'Owner accepts an unmeasured gate risk.', approvedBy: 'OP' };
+    expect(() => releaseResumeWaiver(rejected, request)).toThrow('start a new release run from the same cut');
+    expect(() => assertReleaseResumeApprovalBoundary(rejected, 'gate')).toThrow('cannot restart across an approval decision');
+    const forged = structuredClone(rejected);
+    const at = forged.path.indexOf('pod-reuse-prep');
+    forged.path.splice(at, 0, 'forged-middle');
+    forged.nodes.splice(at, 0, { ...forged.nodes[0]!, nodeId: 'forged-middle' });
+    expect(() => releaseResumeWaiver(forged, request)).toThrow('owner waiver requires the failed executable gate');
+    expect(readFileSync(rejected.statePath, 'utf8')).toBe(before);
+    expect(commands.length).toBe(commandCount);
+    expect(rejected.path).not.toContain('publish');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

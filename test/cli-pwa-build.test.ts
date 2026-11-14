@@ -78,8 +78,7 @@ describe('PWA type package precheck', () => {
       expect(result.exitCode).toBe(1);
       expect(spawned).toBe(false);
       expect(sink.errors).toEqual([
-        `✗ elanous nexus build: missing or incomplete node_modules in ${pwaDir}: @types/d3-force`,
-        `  fix:  cd "${pwaDir}" && bun install --force`,
+        `✗ elanous nexus build: package.json or bun.lock missing in ${pwaDir}; bun install cannot prepare a frozen PWA tree`,
       ]);
       mkdirSync(joinPath(typeDir, declaration, '..'), { recursive: true });
       writeFileSync(joinPath(typeDir, declaration), 'export {};');

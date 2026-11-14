@@ -90,6 +90,8 @@ export interface MembersApi {
   /** Shared graph capability providers may be injected for route adapters without changing route behavior. */
   readonly capabilityProviders?: GraphCapabilityRegistry;
   handle(request: Request, networkKey?: string): Promise<Response | undefined>;
+  /** Private host resolver, not an HTTP identity lookup endpoint. */
+  publicUserSlugForApp?(appSlug: string): string | null;
   handleToken?(request: Request): Promise<Response>;
   memberForScope?(request: Request, scope: string, audience?: string): MemberAccessMatch | null;
 }
@@ -115,8 +117,8 @@ export interface MembersApiOptions {
   readonly verifyMobileGoogleIdToken?: (idToken: string) => Promise<string | null>;
   /** Issues an app-scoped session after the member and app slot have been resolved server-side. */
   readonly issueOwnerSession?: (appId: string, memberId: string) => { readonly sessionToken: string; readonly expiresAt: string };
-  readonly resolveVerifiedOwner?: (appSlug: string, sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'>) => VerifiedAppOwner | null;
-  readonly resolveVerifiedMemberOwner?: (sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'>) => VerifiedAppOwner | null;
+  readonly resolveVerifiedOwner?: (appSlug: string, sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'> & Partial<Pick<MemberStore, 'publicUserSlugForMember'>>) => VerifiedAppOwner | null;
+  readonly resolveVerifiedMemberOwner?: (sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'> & Partial<Pick<MemberStore, 'publicUserSlugForMember'>>) => VerifiedAppOwner | null;
   readonly publicAppUrl?: (slot: MemberAppSlot) => string | null;
   /** Shared provider registry for graph-backed member route adapters. */
   readonly capabilityProviders?: GraphCapabilityRegistry;
@@ -291,6 +293,12 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
     }
     return lifecycle;
   };
+  const publicSlot = (slot: MemberAppSlot) => {
+    const userSlug = options.store.publicUserSlugForMember(slot.memberId);
+    return { ...publicAppSlot(slot, userSlug
+      ? 'https://' + slot.appSlug + '--' + userSlug + '.elanous.app/'
+      : options.publicAppUrl?.(slot) ?? null), userSlug };
+  };
   const synchronizeAppSlot = (memberId: string): MemberAppSlot | null => {
     const slot = options.store.appSlotForMember(memberId);
     if (slot) {
@@ -305,6 +313,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
 
   return {
     ...(options.capabilityProviders ? { capabilityProviders: options.capabilityProviders } : {}),
+    publicUserSlugForApp: appSlug => options.store.publicUserSlugForApp(appSlug),
     handleToken: request => tokens.handle(request),
     memberForScope: (request, scope, audience) => tokens.memberForScope(request, scope, audience),
     async handle(request, networkKey = 'unknown') {
@@ -584,13 +593,22 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         const publicMember = { ...ownProfile, handle, canClaimHandle: handle === null,
           membership: options.store.memberPlanForMember(member.id)?.plan ?? 'free', invited: invitedBy !== null, referralCount };
         return withCors(request, json({ member: publicMember, inviteLink: handle ? memberInviteLink(webOrigin, handle) : null, referralCount,
-          ...(slot ? { appSlot: publicAppSlot(slot, options.publicAppUrl?.(slot) ?? null) } : {}) }), webOrigin);
+          ...(slot ? { appSlot: publicSlot(slot) } : {}) }), webOrigin);
       }
       if (path === '/v1/members/handle') {
         if (request.method !== 'PUT') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
         const token = sessionFromCookie(request);
         const member = token ? options.store.memberForSession(token, new Date(now()).toISOString()) : null;
-        if (!member) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        const memberCookies = (request.headers.get('cookie') ?? '').split(';')
+          .filter(part => part.trim().split('=', 1)[0]?.trim() === MEMBER_COOKIE);
+        if (memberCookies.length > 1) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        const authorization = request.headers.get('authorization');
+        const bearer = /^Bearer\s+(aps_[A-Za-z0-9_-]+)$/i.exec(authorization ?? '')?.[1];
+        const appOwner = bearer ? options.resolveVerifiedMemberOwner?.(bearer, options.store) : null;
+        const memberId = request.headers.has('authorization')
+          ? appOwner && (memberCookies.length === 0 || member?.id === appOwner.memberId) ? appOwner.memberId : null
+          : member?.id;
+        if (!memberId) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
         let body: unknown;
         try { body = await readJson(request); } catch { return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin); }
         if (!body || typeof body !== 'object' || Array.isArray(body)
@@ -598,10 +616,32 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           return withCors(request, json({ error: 'invalid-member-id' }, 400), webOrigin);
         }
         try {
-          const handle = options.store.claimHandle(member.id, (body as { handle: string }).handle);
-          return withCors(request, json({ handle, inviteLink: memberInviteLink(webOrigin, handle) }), webOrigin);
+          if (!options.store.activeForAuth(memberId)) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+          const requested = (body as { handle: string }).handle;
+          // Public handle must also be a safe relay DNS user label.
+          if (!/^[a-z][a-z0-9]{2,19}$/.test(requested)) throw new Error('invalid member ID');
+          const slot = options.store.appSlotForMember(memberId);
+          const previousUrl = slot ? options.publicAppUrl?.(slot) : null;
+          let previousUserSlug: string | undefined;
+          if (previousUrl && slot) {
+            try {
+              const publicHost = new URL(previousUrl).hostname;
+              const prefix = slot.appSlug + '--';
+              if (publicHost.startsWith(prefix) && publicHost.endsWith('.elanous.app'))
+                previousUserSlug = publicHost.slice(prefix.length, -'.elanous.app'.length);
+            } catch { /* absent legacy URL needs no migration */ }
+          }
+          const handle = options.store.claimHandle(memberId, requested, previousUserSlug);
+          debug.log('members.handle', 'claimed', { authSource: appOwner ? 'app-session' : 'web-session',
+            hasAppSlot: Boolean(slot), migratedLegacy: Boolean(previousUserSlug && previousUserSlug !== handle) });
+          return withCors(request, json({ handle, inviteLink: memberInviteLink(webOrigin, handle),
+            ...(slot ? { appSlot: publicSlot(slot) } : {}) }), webOrigin);
         } catch (error) {
           const reason = error instanceof Error ? error.message : '';
+          if (reason === 'member is not active for handle change')
+            return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+          if (reason !== 'invalid member ID' && reason !== 'member ID already taken' && reason !== 'member ID cannot be changed')
+            return withCors(request, json({ error: 'member-state-unavailable' }, 503), webOrigin);
           return withCors(request, json({ error: reason === 'member ID already taken' ? 'member-id-taken'
             : reason === 'member ID cannot be changed' ? 'member-id-locked' : 'invalid-member-id' },
           reason === 'member ID already taken' || reason === 'member ID cannot be changed' ? 409 : 400), webOrigin);
@@ -626,13 +666,13 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         if (!member) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
         if (request.method === 'GET') {
           const slot = synchronizeAppSlot(member.id);
-          return withCors(request, slot ? json({ appSlot: publicAppSlot(slot, options.publicAppUrl?.(slot) ?? null) }) : json({ error: 'app-slot-not-found' }, 404), webOrigin);
+          return withCors(request, slot ? json({ appSlot: publicSlot(slot) }) : json({ error: 'app-slot-not-found' }, 404), webOrigin);
         }
         const created = options.store.createAppSlotForMember(member.id, new Date(now()).toISOString());
         if (created.outcome === 'already-exists') return withCors(request, json({ error: 'app-slot-already-exists' }, 409), webOrigin);
         if (created.outcome !== 'created') return withCors(request, json({ error: 'event-code-required' }, 403), webOrigin);
         synchronizeAppSlot(member.id);
-        return withCors(request, json({ appSlot: publicAppSlot(created.slot, options.publicAppUrl?.(created.slot) ?? null) }, 201), webOrigin);
+        return withCors(request, json({ appSlot: publicSlot(created.slot) }, 201), webOrigin);
       }
       if (path === '/v1/members/app-slot/session') {
         if (request.method !== 'POST') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
@@ -656,12 +696,19 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         if (!sub) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
         const member = options.store.memberForGoogleSub(sub);
         if (!member) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        try {
+          if (!options.store.activeForAuth(member.id)) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        } catch { return withCors(request, json({ error: 'member-state-unavailable' }, 503), webOrigin); }
         try { options.store.ensureNativeAppSlotForMember(member.id, new Date(now()).toISOString()); }
         catch { return withCors(request, json({ error: 'app-slot-unavailable' }, 503), webOrigin); }
-        const slot = synchronizeAppSlot(member.id);
-        if (!slot) return withCors(request, json({ error: 'app-slot-not-found' }, 404), webOrigin);
         try {
-          const session = options.issueOwnerSession(slot.appSlug, member.id);
+          const issued = options.store.withActiveForAuth(member.id, () => {
+            const slot = synchronizeAppSlot(member.id);
+            return slot ? { slot, session: options.issueOwnerSession!(slot.appSlug, member.id) } : null;
+          });
+          if (!issued.active) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+          if (!issued.value) return withCors(request, json({ error: 'app-slot-not-found' }, 404), webOrigin);
+          const { slot, session } = issued.value;
           return withCors(request, json({ appId: slot.appId, sessionToken: session.sessionToken,
             tokenType: 'Bearer', expiresAt: session.expiresAt,
             publicId: options.store.handleForMember(member.id) }), webOrigin);
@@ -685,18 +732,23 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           || typeof input.codeVerifier !== 'string' || input.code.length > 128 || input.state.length > 128 || input.codeVerifier.length > 128) {
           return exchangeResponse('body-invalid', 400, { error: 'invalid-request' });
         }
-        const exchanged = options.store.consumeAppAuthCode!(input.code, input.state, input.codeVerifier, new Date(now()).toISOString());
+        let exchanged: ReturnType<NonNullable<MemberStore['consumeAppAuthCode']>>;
+        try { exchanged = options.store.consumeAppAuthCode!(input.code, input.state, input.codeVerifier, new Date(now()).toISOString()); }
+        catch { return exchangeResponse('code-store-failed', 503, { error: 'app-session-unavailable' }); }
         if (!exchanged) return exchangeResponse('code-invalid-or-expired', 401, { error: 'invalid-or-expired-app-auth-code' });
         let slot: ReturnType<MemberStore['appSlotForMember']>;
         try { slot = options.store.appSlotForMember(exchanged.memberId); }
         catch { return exchangeResponse('slot-lookup-failed', 503, { error: 'app-session-unavailable' }); }
         if (!slot || slot.appId !== exchanged.appId) return exchangeResponse('slot-missing', 404, { error: 'app-slot-not-found' });
         try {
-          const session = options.issueOwnerSession(slot.appSlug, exchanged.memberId);
+          const issued = options.store.withActiveForAuth(exchanged.memberId,
+            () => options.issueOwnerSession!(slot.appSlug, exchanged.memberId));
+          if (!issued.active) return exchangeResponse('member-inactive', 401, { error: 'unauthorized' });
+          const session = issued.value;
           return exchangeResponse('session-issued', 200, { appId: slot.appId, sessionToken: session.sessionToken,
             tokenType: 'Bearer', expiresAt: session.expiresAt,
             publicId: options.store.handleForMember(exchanged.memberId),
-            appSlot: publicAppSlot(slot, options.publicAppUrl?.(slot) ?? null) });
+            appSlot: publicSlot(slot) });
         } catch { return exchangeResponse('session-issuer-failed', 503, { error: 'app-session-unavailable' }); }
       }
       if (path === '/v1/members' && request.method === 'DELETE') {

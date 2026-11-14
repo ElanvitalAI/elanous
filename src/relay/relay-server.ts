@@ -191,6 +191,8 @@ export function createRelayTrafficMeter(config: RelayTrafficCapConfig, now: () =
 type SocketData = { role: 'host' | 'client'; serverId: string; clientId?: number; challenge?: string; authenticated: boolean; lastSeen: number; tokens: number; refillAt: number; memberId?: string; connectionId: string; authTimer?: ReturnType<typeof setTimeout> };
 type Socket = ServerWebSocket<SocketData>;
 type PublicResponse = { status: number; headers: Record<string, string>; body: string };
+const publicNotFound = () => new Response('Not Found', { status: 404,
+  headers: { 'content-type': 'text/plain; charset=utf-8' } });
 type PublicRequest = { channel: import('./channel.js').EncryptedChannel; decoder: MuxDecoder; resolve: (response: Response) => void; timer: ReturnType<typeof setTimeout>; publicHost: string; internalHost: string; memberId?: string; connectionId: string; releaseSlot: () => void; response?: PublicResponse };
 type AppKillSwitch = Pick<ReturnType<typeof import('./app-kill-switch.js').createAppKillSwitch>, 'applyIncident' | 'isDown' | 'close'>;
 type Room = { host?: Socket; hostPublicKey?: Uint8Array; clients: Map<number, Socket>; publicRequests: Map<number, PublicRequest>; publicSlots: number; nextId: number; bytes: number; failures: Record<string, number> };
@@ -404,7 +406,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     if (protocol) credentials.push({ token: protocol, source: 'protocol' });
     return credentials;
   };
-  type MemberGate = { status: 'allowed'; consumed: MemberCredential[] } | { status: 'denied' | 'busy'; consumed: [] };
+  type MemberGate = { status: 'allowed'; consumed: MemberCredential[] } | { status: 'denied' | 'foreign' | 'busy'; consumed: [] };
   const memberAuthorized = async (req: Request, serverId: string): Promise<MemberGate> => {
     if (!options.memberRequired) return { status: 'allowed', consumed: [] };
     const credentials = memberCredentials(req);
@@ -412,6 +414,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     if (activeMemberChecks >= MAX_MEMBER_CHECKS) return { status: 'busy', consumed: [] };
     activeMemberChecks += 1;
     const consumed: MemberCredential[] = [];
+    let foreignMember = false;
     try {
       const ownerId = options.hostOwnerMemberIds!.get(serverId);
       if (!ownerId) return { status: 'denied', consumed: [] };
@@ -419,10 +422,12 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         let member: { memberId: string } | null = null;
         try { member = await options.validateMemberToken!(credential.token, serverId); } catch { /* fail closed */ }
         if (member?.memberId === ownerId) consumed.push(credential);
+        else if (member) foreignMember = true;
       }
     }
     finally { activeMemberChecks -= 1; }
-    return consumed.length ? { status: 'allowed', consumed } : { status: 'denied', consumed: [] };
+    return consumed.length ? { status: 'allowed', consumed }
+      : { status: foreignMember ? 'foreign' : 'denied', consumed: [] };
   };
   const sendControl = (ws: Socket, value: object) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value)); };
   const drop = (ws: Socket) => {
@@ -474,14 +479,14 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     if (!publicApp) {
       const legacyRoom = options.publicServerId ? rooms.get(options.publicServerId) : undefined;
       if (legacyRoom) fail(legacyRoom, 'public-invalid-host');
-      return new Response('Not found', { status: 404 });
+      return publicNotFound();
     }
     const serverId = publicRoutes?.get(publicApp.user)?.serverId ??
       (publicApp.user === options.publicUserId ? options.publicServerId : undefined);
     if (!serverId) {
       const legacyRoom = options.publicServerId ? rooms.get(options.publicServerId) : undefined;
       if (legacyRoom) fail(legacyRoom, 'public-user-mismatch');
-      return new Response('Not found', { status: 404 });
+      return publicNotFound();
     }
     const room = rooms.get(serverId);
     if (new URL(req.url).pathname === '/.well-known/elanous/apps') {
@@ -546,6 +551,9 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     const memberGate = await memberAuthorized(req, serverId);
     if (memberGate.status !== 'allowed') {
       debug.log('relay.auth', 'member-denied', { serverId, route: 'public' });
+      // A verified member of another host must not learn whether this app is mounted.
+      // Match the app-host's missing-app response, including body and content type.
+      if (memberGate.status === 'foreign') return publicNotFound();
       return new Response(memberGate.status === 'busy' ? 'busy' : 'unauthorized', { status: memberGate.status === 'busy' ? 429 : 401 });
     }
     if (options.appKillSwitch?.isDown(publicApp.user, publicApp.app)) return new Response('App unavailable', { status: 403 });

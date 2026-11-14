@@ -60,6 +60,12 @@ test('LOAD-2/APP-DEPLOY public origin routes static and RPC reads, isolates user
     expect(page?.headers.get('x-nexus-app-host')).toBe(publicHost);
     expect(page?.headers.get('x-nexus-app-origin')).toBe(`https://${publicHost}`);
     expect(await page?.text()).toContain('강의 자료 공개 목록');
+    appHost.setPublicUserSlugResolver?.(() => { throw new Error('synthetic member lookup failure'); });
+    const lookupFailure = await appHost.handle(request(publicHost, '/'));
+    expect(lookupFailure?.status).toBe(503);
+    expect(lookupFailure?.headers.get('cache-control')).toBe('no-store');
+    appHost.setPublicUserSlugResolver?.(() => null);
+    expect((await appHost.handle(request(publicHost, '/')))?.status).toBe(200);
     expect((await appHost.handle(request('lecture-scrap--other-user.elanous.app', '/')))?.status).toBe(404);
     expect(await appHost.handle(request('lecture-scrap--kaist-demo.elanous.ai', '/'))).toBeUndefined();
 

@@ -1,3 +1,4 @@
+import type { CapabilityRequirementMetadata } from './capability-discovery.js';
 import type { LLMToolRouteMetadata } from '../../llm/tool-spec.js';
 // ── Plugin system core types ──
 // Phase 2: full plugin contract. Plugins are plain TS modules whose
@@ -28,7 +29,7 @@ import type {
 export type PaneSlot = 'skills' | 'files' | 'preview' | 'log' | 'hud';
 
 /** Requirements declared by a plugin.json `requires` block. This is metadata, not an install request. */
-export interface PluginDependency {
+export interface PluginDependency extends CapabilityRequirementMetadata {
   elanous?: string;
   tools?: string[];
   optionalTools?: string[];

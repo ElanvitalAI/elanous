@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: dns",
+  "source": "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/Welcome.html",
+  "body": "무엇: 서비스 이름을 접속 가능한 엔드포인트에 연결한다.\n언제: 공개 도메인, 장애 전환 또는 라우팅 정책이 필요할 때.\n대안: 로컬 호스트 이름 또는 tailnet 이름\nAWS: Amazon Route 53 / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-Route-53_48.png\nGCP: Cloud DNS / 공식 범주 아이콘 경로 Category Icons/Networking/PNG/Networking-512-color.png\n공식 출처: https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/Welcome.html, https://cloud.google.com/dns/docs/overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

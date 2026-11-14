@@ -10,6 +10,7 @@ export interface NextTuiStatusLineInput {
   readonly width: number;
   readonly elapsedMs?: number;
   readonly measuredUsage?: { readonly inputTokens?: number; readonly outputTokens?: number };
+  readonly estimatedOutputTokens?: number;
 }
 
 export interface NextTuiCompactStatusLineInput {
@@ -20,13 +21,27 @@ export interface NextTuiCompactStatusLineInput {
   readonly columns: number;
   readonly elapsedMs?: number;
   readonly measuredUsage?: { readonly inputTokens?: number; readonly outputTokens?: number };
+  readonly estimatedOutputTokens?: number;
 }
 
-function turnTelemetry(elapsedMs: number | undefined, usage: { readonly inputTokens?: number; readonly outputTokens?: number } | undefined, compact = false): string {
+function tokenTelemetry(usage: NextTuiStatusLineInput['measuredUsage'], estimate: number | undefined, compact: boolean): string {
+  if (usage?.outputTokens === undefined
+    && estimate !== undefined && Number.isSafeInteger(estimate) && estimate >= 0) {
+    if (usage?.inputTokens !== undefined) {
+      const pair = `${usage.inputTokens}/추정${estimate}`;
+      return compact ? `${pair}t` : `토큰 ${pair}`;
+    }
+    return compact ? `추정${estimate}t` : `출력 토큰 추정 ${estimate}`;
+  }
+  const pair = `${usage?.inputTokens ?? '?'}/${usage?.outputTokens ?? '?'}`;
+  return compact ? `${pair}t` : `토큰 ${pair}`;
+}
+
+function turnTelemetry(elapsedMs: number | undefined, usage: NextTuiStatusLineInput['measuredUsage'], compact = false, estimate?: number): string {
   if (elapsedMs === undefined) return '';
   const seconds = `${(Math.max(0, elapsedMs) / 1000).toFixed(1)}초`;
-  const tokens = `${usage?.inputTokens ?? '?'}/${usage?.outputTokens ?? '?'}`;
-  return compact ? `${seconds} · ${tokens}t` : `경과 ${seconds} · 토큰 ${tokens}`;
+  const tokens = tokenTelemetry(usage, estimate, compact);
+  return compact ? `${seconds} · ${tokens}` : `경과 ${seconds} · ${tokens}`;
 }
 
 /** Only elapsed time may be approximated; provider token counts must stay exact. */
@@ -37,11 +52,11 @@ function compactElapsed(value: number | undefined): string {
   return `≈${digits[0]}${digits[1] === '0' ? '' : `.${digits[1]}`}e${digits.length - 1}`;
 }
 
-function minimumTelemetry(elapsedMs: number | undefined, usage: { readonly inputTokens?: number; readonly outputTokens?: number } | undefined): string {
+function minimumTelemetry(elapsedMs: number | undefined, usage: NextTuiStatusLineInput['measuredUsage'], estimate?: number): string {
   if (elapsedMs === undefined) return '';
   const seconds = Math.max(0, elapsedMs) / 1000;
   const elapsed = String(Math.floor(seconds)).length <= 4 ? `${seconds.toFixed(1)}초` : `${compactElapsed(seconds)}초`;
-  return `${elapsed}·${usage?.inputTokens ?? '?'}/${usage?.outputTokens ?? '?'}t`;
+  return `${elapsed}·${tokenTelemetry(usage, estimate, true)}`;
 }
 
 function smallestElapsed(elapsedMs: number): string {
@@ -104,9 +119,9 @@ export function formatNextTuiStatusLine(input: NextTuiStatusLineInput): string {
   const shortModel = modelWithoutProvider(model);
   const queued = Math.max(0, Math.floor(input.queued));
   const backgroundTasks = Math.max(0, Math.floor(input.backgroundTasks));
-  const telemetry = turnTelemetry(input.elapsedMs, input.measuredUsage);
-  const shortTelemetry = turnTelemetry(input.elapsedMs, input.measuredUsage, true);
-  const minimum = minimumTelemetry(input.elapsedMs, input.measuredUsage);
+  const telemetry = turnTelemetry(input.elapsedMs, input.measuredUsage, false, input.estimatedOutputTokens);
+  const shortTelemetry = turnTelemetry(input.elapsedMs, input.measuredUsage, true, input.estimatedOutputTokens);
+  const minimum = minimumTelemetry(input.elapsedMs, input.measuredUsage, input.estimatedOutputTokens);
   const metricState = /실패/iu.test(shortState) ? '실패' : /취소/iu.test(shortState) ? '취소' : shortState;
   const candidates = [
     ...(telemetry ? [
@@ -119,6 +134,12 @@ export function formatNextTuiStatusLine(input: NextTuiStatusLineInput): string {
       ...(input.measuredUsage?.inputTokens !== undefined && input.measuredUsage?.outputTokens !== undefined
         ? [`${input.measuredUsage.inputTokens}/${input.measuredUsage.outputTokens}t${smallestElapsed(input.elapsedMs!)}`,
           `${metricState}·${input.measuredUsage.inputTokens}/${input.measuredUsage.outputTokens}t`]
+        : []),
+      ...(input.measuredUsage?.outputTokens === undefined && input.estimatedOutputTokens !== undefined
+        && Number.isSafeInteger(input.estimatedOutputTokens) && input.estimatedOutputTokens >= 0
+        ? [`${tokenTelemetry(input.measuredUsage, input.estimatedOutputTokens, true)}·${smallestElapsed(input.elapsedMs!)}`,
+          `${metricState}·${tokenTelemetry(input.measuredUsage, input.estimatedOutputTokens, true)}`,
+          tokenTelemetry(input.measuredUsage, input.estimatedOutputTokens, true)]
         : []),
     ] : []),
     `턴 ${shortState} · 모델 ${model} · 대기 ${queued} · 배경 ${backgroundTasks}`,
@@ -176,7 +197,7 @@ export function nextTuiStatusLine(input: NextTuiCompactStatusLineInput): string 
   const model = input.model ? safeStatusText(input.model).trim() : '';
   const parts = [
     state,
-    turnTelemetry(input.elapsedMs, input.measuredUsage, true),
+    turnTelemetry(input.elapsedMs, input.measuredUsage, true, input.estimatedOutputTokens),
     model,
     input.queued > 0 ? `대기 ${input.queued}` : '',
     input.activeChildren > 0 ? `하위 ${input.activeChildren}` : '',

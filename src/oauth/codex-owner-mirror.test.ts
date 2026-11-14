@@ -6,8 +6,12 @@ import { loadFreshCodexAuthState } from './codex.js';
 import { _setCodexAccountOutboundSenderForTesting, autoConsumeCodexResetCredit, listCodexAccountsInStore, resolveCodexAccountForRun } from './codex-account-store.js';
 import { debug } from '../debug/log.js';
 import '../llm.js';
-import { collectCodexMirrorCredentials, CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { collectCodexMirrorCredentials, CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexAccountReadStorePath, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
+import { setUserConfigOverlay } from '../user-config/reader.js';
+import { homedir } from 'node:os';
+import { detectProviders } from '../llm/provider-detect.js';
+import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 
 const oldEnv = {
   xdg: process.env.XDG_CONFIG_HOME,
@@ -22,6 +26,7 @@ const oldEnv = {
   testRunner: process.env.ELANOUS_TEST_RUNNER,
   nodeEnv: process.env.NODE_ENV,
   llmMode: process.env.ELANOUS_LLM_MODE,
+  testHome: process.env.ELANOUS_TEST_HOME,
 };
 const roots: string[] = [];
 const fixture = () => {
@@ -46,6 +51,7 @@ const writeMirror = (path: string, accessToken: string, expiresAt: number, refre
 }));
 
 afterEach(() => {
+  setUserConfigOverlay(null);
   _setCodexAccountOutboundSenderForTesting(null);
   for (const [key, value] of Object.entries({ XDG_CONFIG_HOME: oldEnv.xdg, ELANOUS_STATE_DIR: oldEnv.state,
     ELANOUS_STATE_DIR_SOURCE: oldEnv.source, ELANOUS_CODEX_ACCOUNT: oldEnv.account, ELANOUS_RUN_ID: oldEnv.runId })) {
@@ -56,13 +62,104 @@ afterEach(() => {
   if (oldEnv.remoteMirrorPath === undefined) delete process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH;
   else process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = oldEnv.remoteMirrorPath;
   for (const [key, value] of Object.entries({ CODEX_HOME: oldEnv.codexHome, BUN_TEST: oldEnv.bunTest,
-    ELANOUS_TEST_RUNNER: oldEnv.testRunner, NODE_ENV: oldEnv.nodeEnv, ELANOUS_LLM_MODE: oldEnv.llmMode })) {
+    ELANOUS_TEST_RUNNER: oldEnv.testRunner, NODE_ENV: oldEnv.nodeEnv, ELANOUS_LLM_MODE: oldEnv.llmMode,
+    ELANOUS_TEST_HOME: oldEnv.testHome })) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe("remote direct Codex uses the owner's access-only mirror", () => {
+  test('remote --test child selects the host mirror before expired isolated auth without refresh', async () => {
+    const { root } = fixture();
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    process.env.ELANOUS_STATE_DIR_SOURCE = 'explicit';
+    process.env.ELANOUS_TEST_HOME = join(root, 'state');
+    setUserConfigOverlay((config) => ({ ...config,
+      llm: { ...config.llm, codexTokenOwnerHost: 'fixture-owner' },
+      hq: { ...config.hq, hostName: 'fixture-remote' },
+    }));
+    const stalePath = join(root, 'state', 'auth.json');
+    writeMirror(stalePath, 'stale-isolated-access', Date.now() - 60_000, 'stale-refresh', 'stale-refresh');
+    const mirrorPath = join(root, 'synthetic-host', 'auth.json');
+    mkdirSync(join(root, 'synthetic-host'), { recursive: true });
+    const fresh = Date.now() + 60 * 60_000;
+    writeMirror(mirrorPath, jwt(Math.floor(fresh / 1000)), fresh);
+    expect(codexOwnerMirrorAuthPath()).toBe(join(homedir(), '.elanous', CODEX_OWNER_MIRROR_RELATIVE_PATH));
+    expect(codexAccountReadStorePath(stalePath)).toBe(join(homedir(), '.elanous', CODEX_OWNER_MIRROR_RELATIVE_PATH));
+    const discoveryReads: string[] = [];
+    const detected = await detectProviders({ env: { HOME: root, PATH: '' }, home: root,
+      readFile: async (file) => {
+        discoveryReads.push(file);
+        if (file !== codexOwnerMirrorAuthPath()) throw new Error('fixture file absent');
+        return await Bun.file(mirrorPath).text();
+      },
+      isFile: async () => false, isDirectory: async () => false, access: async () => false,
+      runCli: async () => { throw new Error('no CLI'); },
+    });
+    expect(discoveryReads).toContain(codexOwnerMirrorAuthPath());
+    expect(discoveryReads).not.toContain(stalePath);
+    expect(detected.some((entry) => entry.provider === 'openai-codex' && entry.auth === 'oauth')).toBe(true);
+    let networkCalls = 0;
+    const state = await loadFreshCodexAuthState({ ownerMirrorPath: mirrorPath,
+      fetchImpl: (async () => { networkCalls++; throw new Error('network forbidden'); }) as unknown as typeof fetch });
+    expect(state?.tokens.accessToken).toBe(jwt(Math.floor(fresh / 1000)));
+    expect(state?.tokens.refreshToken).toBe('');
+    expect(networkCalls).toBe(0);
+    rmSync(mirrorPath);
+    await expect(loadFreshCodexAuthState({ ownerMirrorPath: mirrorPath,
+      fetchImpl: (async () => { networkCalls++; throw new Error('network forbidden'); }) as unknown as typeof fetch }))
+      .rejects.toThrow(CODEX_OWNER_MIRROR_REQUIRED);
+    expect(networkCalls).toBe(0);
+  });
+
+  test('normal fleet remote retains its custom state-root mirror for resolver and discovery', async () => {
+    const { root, path } = fixture();
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    delete process.env.ELANOUS_TEST_HOME;
+    process.env.NODE_ENV = 'production';
+    setUserConfigOverlay((config) => ({ ...config,
+      llm: { ...config.llm, codexTokenOwnerHost: 'fixture-owner' },
+      hq: { ...config.hq, hostName: 'fixture-remote' },
+    }));
+    const expiresAt = Math.floor(Date.now() / 1000 + 3600) * 1000;
+    const accessToken = jwt(expiresAt / 1000);
+    writeMirror(path, accessToken, expiresAt);
+    expect(codexOwnerMirrorAuthPath()).toBe(path);
+    expect(codexAccountReadStorePath(join(root, 'state', 'auth.json'))).toBe(path);
+    process.env.NODE_ENV = 'test';
+    expect(codexOwnerMirrorAuthPath()).toBe(path);
+    process.env.NODE_ENV = 'production';
+    const state = await loadFreshCodexAuthState({
+      fetchImpl: (async () => { throw new Error('normal remote must not refresh'); }) as unknown as typeof fetch,
+    });
+    expect(state?.tokens.accessToken).toBe(accessToken);
+    const reads: string[] = [];
+    const detected = await detectProviders({ env: { HOME: root, PATH: '' }, home: root,
+      readFile: async (file) => { reads.push(file); return await Bun.file(file).text(); },
+      isFile: async () => false, isDirectory: async () => false, access: async () => false,
+      runCli: async () => { throw new Error('no CLI'); },
+    });
+    expect(reads).toContain(path);
+    expect(detected.some((entry) => entry.provider === 'openai-codex' && entry.auth === 'oauth')).toBe(true);
+  });
+  test('explicit --test custom root uses the host mirror through the CLI test-state marker', () => {
+    const { root } = fixture();
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    delete process.env.ELANOUS_TEST_HOME;
+    process.env.NODE_ENV = 'production';
+    setUserConfigOverlay((config) => ({ ...config,
+      llm: { ...config.llm, codexTokenOwnerHost: 'fixture-owner' },
+      hq: { ...config.hq, hostName: 'fixture-remote' },
+    }));
+    const priorTestRoot = getTestStateRoot();
+    try {
+      setTestStateRoot(join(root, 'state'));
+      expect(codexOwnerMirrorAuthPath()).toBe(join(homedir(), '.elanous', CODEX_OWNER_MIRROR_RELATIVE_PATH));
+    } finally {
+      setTestStateRoot(priorTestRoot ?? null);
+    }
+  });
   test('mirror accounts are first-class rotation candidates and an expiring one is excluded', async () => {
     _setCodexAccountOutboundSenderForTesting(() => true);
     const { path } = fixture();

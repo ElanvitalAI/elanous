@@ -64,6 +64,8 @@ export interface ToolSearchArgs {
 }
 
 export interface ToolSearchOpts {
+  /** OP53607/JUD54990: general discovery requires capability evidence, without penalizing unmatched project context. */
+  requireQueryCoverage?: boolean;
   /** Surface-local spec pool — the full tool list the calling surface
    *  exposes this turn. Schemas resolve from here before the runtime
    *  registry, so surfaces with no ToolRuntime registration can still
@@ -127,6 +129,8 @@ export function parseToolSearchQuery(raw: string): ParsedQuery {
  *  surface spec pool can participate in both `select:` and keyword
  *  queries. */
 interface SearchCandidate {
+  intentText?: string;
+  subjectText?: string;
   /** LLM-facing name rendered into the result + reported in `matched`. */
   displayName: string;
   /** Every string that should count as a "name" hit, lowercased. */
@@ -385,9 +389,39 @@ export function dispatchToolSearch(
     });
     return result;
   }
-  const parsed = parseToolSearchQuery(args.query);
   const entries = listSearchCandidates(surfaceSpecs)
     .filter(({ spec }) => !spec.pluginId || !activePluginIds || activePluginIds.has(spec.pluginId));
+  const declaredSubjects = new Set<string>();
+  for (const entry of entries) {
+    const marker = String.fromCharCode(10, 10) + 'Capability discovery:' + String.fromCharCode(10);
+    const description = entry.spec.description ?? '';
+    const split = description.indexOf(marker);
+    let target = entry.nameText + ' ' + description.trim().split(/\s+/u)[0];
+    if (split >= 0) {
+      try {
+        const usage = JSON.parse(description.slice(split + marker.length)).whenToUse;
+        if (typeof usage === 'string') target += ' ' + usage.split(/[.!?。]/u)[0].split(/[을를](?=\s)/u)[0];
+      } catch { /* malformed metadata declares no subject */ }
+    }
+    for (const word of target.split(/[^\p{L}\p{N}_]+/u)) {
+      const subject = word.replace(/(?:으로|은|는|이|가|을|를|의|에|와|과)$/u, '');
+      if (/^[가-힣]$/u.test(subject)) declaredSubjects.add(subject);
+      if (/^[가-힣]$/u.test(word)) declaredSubjects.add(word);
+    }
+  }
+  // Only catalog-declared one-character subjects can be split from joined request wording.
+  const discoveryQuery = opts.requireQueryCoverage && !/^select:/i.test(args.query)
+    ? args.query
+      .replace(/([가-힣]+?)(?:으로|을|를|은|는|이|가|의|에|와|과)(?=\s*(?:만들|개발|구현|설계|배포|게시)|\s|[.!?]|$)/g, (whole, word: string) => {
+        if (declaredSubjects.has(word)) return ' ' + word + ' ';
+        // A complete declared multi-character word takes precedence over a suffix subject.
+        if (entries.some(entry => (entry.nameText + ' ' + entry.description).includes(word))) return whole;
+        const subject = word.slice(-1);
+        return declaredSubjects.has(subject) ? word.slice(0, -1) + ' ' + subject + ' ' : whole;
+      })
+      .replace(/([가-힣])(?:어|아|해)\s*(?:줘|주세요|주십시오)(?=\s|[.!?]|$)/g, '$1')
+    : args.query;
+  const parsed = parseToolSearchQuery(discoveryQuery);
 
   if (parsed.kind === 'select') {
     const matched: SearchCandidate[] = [];
@@ -412,7 +446,47 @@ export function dispatchToolSearch(
   }
 
   // Keyword search.
-  const scored = entries
+  // General request wording alone is not capability evidence. Unknown project/environment
+  // words do not dilute known intent: there is deliberately no query-length coverage floor.
+  const requestWords = new Set(['please', 'help', 'the', 'this', 'that', 'with', 'and', 'for', 'from',
+    'can', 'you', 'could', 'would', 'my', 'our', 'me', 'to', 'of', 'in', 'on', 'a', 'an',
+    '줘', '해줘', '주세요', '좀', '해', '만들', '개발', '조회', '상태', '결과', '결과를', '보여줘', '알려줘']);
+  const keywordEntries = opts.requireQueryCoverage ? entries.map(entry => {
+    const marker = String.fromCharCode(10, 10) + 'Capability discovery:' + String.fromCharCode(10);
+    const split = entry.description.indexOf(marker.toLowerCase());
+    const direct = split < 0 ? entry.description : entry.description.slice(0, split);
+    let usage = '';
+    let subject = '';
+    if (split >= 0) {
+      try {
+        const metadata = JSON.parse((entry.spec.description ?? '').slice(split + marker.length));
+        if (typeof metadata.whenToUse === 'string') {
+          // The first object phrase names the capability's target; later clauses may mention other capabilities.
+          subject = metadata.whenToUse.toLowerCase().split(/[.!?。]/u)[0].split(/[을를](?=\s)/u)[0];
+        }
+        usage = [typeof metadata.whenToUse === 'string' ? metadata.whenToUse.split(/[.!?。]/u)[0] : undefined,
+          ...(Array.isArray(metadata.examples) ? metadata.examples : [])]
+          .filter(value => typeof value === 'string').join(' ').toLowerCase();
+      } catch { /* malformed prose is not an additional discovery authority */ }
+    }
+    const routeText = JSON.stringify(entry.spec.route ?? {}).toLowerCase();
+    return { ...entry, description: entry.description + ' ' + routeText,
+      subjectText: entry.nameText + ' ' + subject + ' ' + direct.trim().split(/\s+/u)[0],
+      intentText: entry.nameText + ' ' + entry.summary + ' ' + direct + ' ' + routeText + ' ' + usage };
+  }) : entries;
+  const intentTerms = [...new Set(parsed.terms)].filter(term => !requestWords.has(term));
+  const particles = new Set(['은', '는', '이', '가', '을', '를', '의', '에', '와', '과', '으로']);
+  const eligibleEntries = opts.requireQueryCoverage ? keywordEntries.filter(entry => {
+    const terms = [...new Set(parsed.terms)];
+    if (terms.length <= 1) return true; // Exact keyword discovery remains useful.
+    if (!entry.intentText) return false;
+    if (intentTerms.some(term => term.length > 1 && entry.intentText?.includes(term))) return true;
+    // Match each candidate independently: another tool's longer match must not suppress this subject.
+    const words = (entry.subjectText ?? '').split(/[^\p{L}\p{N}_]+/u);
+    return intentTerms.some(term => term.length === 1 && /\p{L}/u.test(term)
+      && words.some(word => word === term || (word.startsWith(term) && particles.has(word.slice(term.length)))));
+  }) : entries;
+  const scored = eligibleEntries
     .map((entry) => ({ entry, score: scoreEntry(entry, parsed) }))
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score);

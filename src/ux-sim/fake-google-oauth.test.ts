@@ -255,7 +255,8 @@ describe('fake Google OAuth member boundary', () => {
     } });
     const store = createMemberStore({ path: ':memory:' });
     const code = 'private-one-time-code';
-    const memberId = 'private-member-id';
+    const memberId = store.register({ sub: 'private-active-sub', email: 'private@example.test',
+      emailVerified: true, name: 'Private Active' }, { consents: { privacy: 'v1', terms: 'v1' } }).id;
     const appId = 'kaist-private-app';
     const request = new Request('https://api.example.test/v1/members/app-slot/exchange', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -444,7 +445,7 @@ describe('fake Google OAuth member boundary', () => {
     }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
     expect(secondMemberSlot?.status).toBe(200);
     expect(await secondMemberSlot!.json()).toEqual({ appSlot: { appId: secondSlot?.appId, appSlug: secondSlot?.appSlug,
-      templateSlug: secondSlot?.templateSlug, createdAt: secondSlot?.createdAt, url: null } });
+      templateSlug: secondSlot?.templateSlug, createdAt: secondSlot?.createdAt, url: null, userSlug: null } });
     const anonymousSlot = await api.handle(new Request('https://api.example.test/v1/members/app-slot', { headers: { origin: 'https://app.example.test' } }));
     expect(anonymousSlot?.status).toBe(401);
     appLifecycle.ensureCreated(createAppLifecycleEvent({ appId: appSlot.templateSlug, action: 'created', environment: 'simulation', actor: 'system',

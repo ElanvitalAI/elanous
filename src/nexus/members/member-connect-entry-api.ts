@@ -1,7 +1,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { MemberStore } from './member-store.js';
+import { runKcbTryWithinDeadline } from './kcb-try-deadline.js';
+import { debug } from '../../debug/log.js';
 
 const TTL_MS = 2 * 60_000;
+// CONNECT-APPROVE-ROBUST / OP48402: bound stalled request bodies independently of challenge TTL.
+const BODY_READ_TIMEOUT_MS = 5_000;
 const MAX_PENDING = 512;
 const MAX_PER_CALLER = 3;
 const MAX_START_ATTEMPTS = 8;
@@ -26,11 +30,13 @@ interface Pending {
 }
 
 export interface MemberConnectEntryOptions {
-  readonly store: Pick<MemberStore, 'createAppAuthCode' | 'ensureNativeAppSlotForMember'>;
+  readonly store: Pick<MemberStore, 'activeForAuth' | 'withActiveForAuth' | 'createAppAuthCode' | 'ensureNativeAppSlotForMember'>;
   readonly memberForRequest: (request: Request) => string | null;
   readonly origin: string;
   readonly enabled?: boolean;
   readonly now?: () => number;
+  /** Internal test seam; production callers use the bounded default. */
+  readonly bodyReadTimeoutMs?: number;
 }
 
 function response(body: unknown, status: number): Response {
@@ -43,31 +49,55 @@ function busy(retryMs: number): Response {
   } });
 }
 
-async function readTextBounded(request: Request, maxBytes: number): Promise<string | null> {
+async function readTextBounded(request: Request, maxBytes: number, timeoutMs: number): Promise<string | null> {
   const length = Number(request.headers.get('content-length') ?? 0);
-  if (!Number.isFinite(length) || length > maxBytes) return null;
+  if (!Number.isFinite(length) || length > maxBytes || request.signal.aborted) {
+    // Do not leave already-aborted or declared-oversized bodies unconsumed.
+    void request.body?.cancel().catch(() => {});
+    debug.log('members.connect', 'body-read-refused', {
+      reason: request.signal.aborted ? 'request-abort' : 'declared-byte-limit', limitBytes: maxBytes,
+    });
+    return null;
+  }
   if (!request.body) return '';
   const reader = request.body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel().catch(() => {});
-        return null;
+    return await runKcbTryWithinDeadline(async signal => {
+      const cancel = () => { void reader.cancel().catch(() => {}); };
+      signal.addEventListener('abort', cancel, { once: true });
+      if (signal.aborted) cancel();
+      const chunks: Buffer[] = [];
+      let total = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (signal.aborted) return null;
+          if (done) break;
+          total += value.byteLength;
+          if (total > maxBytes) {
+            debug.log('members.connect', 'body-read-refused', { reason: 'byte-limit', limitBytes: maxBytes });
+            cancel(); return null;
+          }
+          chunks.push(Buffer.from(value));
+        }
+        return Buffer.concat(chunks, total).toString('utf8');
+      } finally {
+        signal.removeEventListener('abort', cancel);
+        try { reader.releaseLock(); } catch { /* pending read is being cancelled */ }
       }
-      chunks.push(Buffer.from(value));
-    }
-    return Buffer.concat(chunks, total).toString('utf8');
-  } catch { return null; }
-  finally { reader.releaseLock(); }
+    }, timeoutMs, request.signal);
+  } catch (error) {
+    debug.log('members.connect', 'body-read-refused', {
+      reason: request.signal.aborted ? 'request-abort'
+        : error instanceof Error && error.message === 'try-timeout' ? 'deadline' : 'read-error',
+      limitBytes: maxBytes,
+    });
+    return null;
+  }
 }
 
-async function readBody(request: Request): Promise<Record<string, unknown> | null> {
-  const text = await readTextBounded(request, 4096);
+async function readBody(request: Request, timeoutMs: number): Promise<Record<string, unknown> | null> {
+  const text = await readTextBounded(request, 4096, timeoutMs);
   if (text === null) return null;
   try {
     const value: unknown = JSON.parse(text);
@@ -82,6 +112,8 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
   const pending = new Map<string, Pending>();
   const startAttempts = new Map<string, { count: number; expiresAt: number }>();
   const now = options.now ?? Date.now;
+  const bodyReadTimeoutMs = Number.isFinite(options.bodyReadTimeoutMs) && options.bodyReadTimeoutMs! > 0
+    ? Math.min(BODY_READ_TIMEOUT_MS, options.bodyReadTimeoutMs!) : BODY_READ_TIMEOUT_MS;
   const prune = () => {
     const at = now();
     for (const [id, item] of pending) if (item.expiresAt <= at) pending.delete(id);
@@ -104,7 +136,7 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
       if (budget) budget.count++;
       else startAttempts.set(caller, { count: 1, expiresAt: at + TTL_MS });
       // Count attempts before reading even malformed or indefinitely streamed bodies.
-      const body = await readBody(request);
+      const body = await readBody(request, bodyReadTimeoutMs);
       if (!body || Object.keys(body).length !== 3 || typeof body.state !== 'string' || !VALUE.test(body.state)
         || typeof body.codeChallenge !== 'string' || !VALUE.test(body.codeChallenge)
         || typeof body.pollSecret !== 'string' || !VALUE.test(body.pollSecret)) return response({ error: 'invalid-request' }, 400);
@@ -134,7 +166,7 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
 
     if (path === '/v1/members/connect/poll') {
       if (request.method !== 'POST') return response({ error: 'method-not-allowed' }, 405);
-      const body = await readBody(request);
+      const body = await readBody(request, bodyReadTimeoutMs);
       if (pending.get(id) !== item || item.expiresAt <= now()) return response({ error: 'not-found' }, 404);
       const rejectPoll = () => {
         item.pollFailures = (item.pollFailures ?? 0) + 1;
@@ -147,12 +179,33 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
       const supplied = createHash('sha256').update(body.pollSecret).digest();
       if (!timingSafeEqual(supplied, item.pollHash)) return rejectPoll();
       if (!item.code) return response({ approved: false }, 202);
-      pending.delete(id);
-      return response({ code: item.code, state: item.state }, 200);
+      const memberId = item.previewMemberId;
+      if (!memberId) {
+        pending.delete(id);
+        return response({ error: 'unauthorized' }, 401);
+      }
+      try {
+        const decision = options.store.withActiveForAuth(memberId, () => {
+          // The deletion transaction cannot commit between this decision and response creation.
+          if (pending.get(id) !== item || item.expiresAt <= now() || item.previewMemberId !== memberId || !item.code)
+            return response({ error: 'not-found' }, 404);
+          const delivered = response({ code: item.code, state: item.state }, 200);
+          pending.delete(id);
+          return delivered;
+        });
+        if (!decision.active) {
+          pending.delete(id);
+          return response({ error: 'unauthorized' }, 401);
+        }
+        return decision.value;
+      } catch { return response({ error: 'member-state-unavailable' }, 503); }
     }
 
     const memberId = options.memberForRequest(request);
     if (!memberId) return response({ error: 'unauthorized' }, 401);
+    try {
+      if (!options.store.activeForAuth(memberId)) return response({ error: 'unauthorized' }, 401);
+    } catch { return response({ error: 'member-state-unavailable' }, 503); }
     if (item.previewMemberId && item.previewMemberId !== memberId) return response({ error: 'wrong-member' }, 403);
     if (request.method === 'GET') {
       item.previewMemberId = memberId;
@@ -165,7 +218,7 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
     }
     if (request.method !== 'POST') return response({ error: 'method-not-allowed' }, 405);
     if (request.headers.get('origin') !== options.origin || item.code) return response({ error: 'approval-refused' }, 403);
-    const text = await readTextBounded(request, 512);
+    const text = await readTextBounded(request, 512, bodyReadTimeoutMs);
     if (text === null) return response({ error: 'invalid-request' }, 400);
     const form = new URLSearchParams(text);
     const suppliedCode = form.get('userCode');
@@ -179,6 +232,12 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
     // Body reads yield to other approvals and the expiry timer. Claim this item before issuing.
     if (pending.get(id) !== item || item.expiresAt <= now() || item.previewMemberId !== memberId
       || item.code || item.issuing) return response({ error: 'approval-refused' }, 403);
+    try {
+      if (!options.store.activeForAuth(memberId)) {
+        pending.delete(id);
+        return response({ error: 'unauthorized' }, 401);
+      }
+    } catch { return response({ error: 'member-state-unavailable' }, 503); }
     item.issuing = true;
     try {
       const at = new Date(now()).toISOString();

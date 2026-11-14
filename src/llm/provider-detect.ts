@@ -4,7 +4,7 @@ import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { authStorePath } from '../oauth/store.js';
-import { codexAccountReadStorePath } from '../oauth/codex-owner-mirror.js';
+import { codexAccountReadStorePath, shouldPreferHostCodexMirror } from '../oauth/codex-owner-mirror.js';
 import { envLiteral } from '../platform/env-literal.js';
 
 /** Discovery is read-only; agent-cli entries are not direct-call LLM providers. */
@@ -174,9 +174,11 @@ export async function detectProviders(deps: ProviderDetectDeps = {}): Promise<De
           if (oauthUsable(state, clock())) add(provider, 'oauth', 'elanous-auth');
         }
       }),
-      json(join(env.CODEX_HOME?.trim() || join(home, '.codex'), 'auth.json')).then((codex) => {
-        if (oauthUsable(codex?.tokens, clock())) add('openai-codex', 'oauth', 'codex-auth');
-      }),
+      ...(shouldPreferHostCodexMirror() ? [] : [
+        json(join(env.CODEX_HOME?.trim() || join(home, '.codex'), 'auth.json')).then((codex) => {
+          if (oauthUsable(codex?.tokens, clock())) add('openai-codex', 'oauth', 'codex-auth');
+        }),
+      ]),
       Promise.resolve().then(() => isFile(join(env.CLAUDE_CONFIG_DIR?.trim() || join(home, '.claude'), '.credentials.json'))).then((exists) => {
         if (exists) { agentEvidence.credentials = true; updateClaude(); }
       }).catch(() => {}),

@@ -77,26 +77,26 @@ const NOW = new Date('2026-10-06T20:30:00.000Z');
 test('RELEASE-RUN-LAUNCH-SEAT-GUARD refuses non-owner production launches and /tmp source trees', () => {
   const productionRoot = '/sim/home/.elanous';
   expect(releaseRunLaunchRefusal({ seat: 'POD-REUSE-2', instanceRoot: productionRoot, productionRoot,
-    sourcePath: '/Users/user/worktrees/release' })).toContain('--test');
+    sourcePath: '/sim/home/worktrees/release' })).toContain('--test');
   expect(releaseRunLaunchRefusal({ seat: '', instanceRoot: productionRoot, productionRoot,
-    sourcePath: '/Users/user/worktrees/release' })).toContain('미설정');
+    sourcePath: '/sim/home/worktrees/release' })).toContain('미설정');
   expect(releaseRunLaunchRefusal({ seat: '  ', instanceRoot: productionRoot, productionRoot,
-    sourcePath: '/Users/user/worktrees/release' })).toContain('미설정');
+    sourcePath: '/sim/home/worktrees/release' })).toContain('미설정');
   expect(releaseRunLaunchRefusal({ instanceRoot: productionRoot, productionRoot,
-    sourcePath: '/Users/user/worktrees/release' })).toContain('미설정');
+    sourcePath: '/sim/home/worktrees/release' })).toContain('미설정');
   expect(releaseRunLaunchRefusal({ seat: 'OP', instanceRoot: productionRoot, productionRoot,
     sourcePath: '/private/tmp/pod-reuse-2-main.K2pGJE' })).toContain('/tmp 소스 경로');
   expect(releaseRunLaunchRefusal({ seat: 'OP', instanceRoot: '/sim/test/.elanous', productionRoot,
     sourcePath: '/private/tmp/pod-reuse-2-main.K2pGJE' })).toBeNull();
   expect(releaseRunLaunchRefusal({ seat: 'OP', instanceRoot: productionRoot, productionRoot,
-    sourcePath: '/Users/user/elanous-hq/repo.git' })).toBeNull();
+    sourcePath: '/sim/home/elanous-hq/repo.git' })).toBeNull();
 });
 
 test('RELEASE-RUN-LAUNCH-SEAT-GUARD keeps read-only preflight diagnostics for non-owner seats', () => isolated(async (root) => {
   let inputChecked = false;
   const result = await releasePreflight('0.2.18', deps(root, {
     launchContext: { seat: 'NT-3', instanceRoot: '/sim/prod/.elanous', productionRoot: '/sim/prod/.elanous' },
-    sourcePath: '/Users/user/elanous-hq/src/cli/release-cli.ts',
+    sourcePath: '/sim/home/elanous-hq/src/cli/release-cli.ts',
     runInput: async () => { inputChecked = true; return { input: { previousVersion: '0.2.17', gatePodPool: 'pool-test' } }; },
   }));
   expect(result.findings.find((finding) => finding.check === 'run-input')).toMatchObject({ level: 'block', message: expect.stringContaining('OP 자리만') });
@@ -112,7 +112,7 @@ test('RELEASE-RUN-LAUNCH-SEAT-GUARD lets countdown report diagnostics and blocks
   const result = await runReleaseCountdown('0.2.18', deps(root, {
     countdown: true,
     launchContext: { seat: 'NT-3', instanceRoot: '/sim/prod/.elanous', productionRoot: '/sim/prod/.elanous' },
-    sourcePath: '/Users/user/elanous-hq/src/cli/release-cli.ts',
+    sourcePath: '/sim/home/elanous-hq/src/cli/release-cli.ts',
     runInput: async () => { inputChecked = true; return { input: { previousVersion: '0.2.17', gatePodPool: 'pool-test' } }; },
     manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 1, byNextMd: 1, unlinked: 0, unknown: 0 }, escalate: [] }),
     gateSlot: () => ({ dispatcherPaused: true, podTargetFrom: 6, podTargetTo: 2 }),
@@ -126,7 +126,7 @@ test('RELEASE-RUN-LAUNCH-SEAT-GUARD lets countdown report diagnostics and blocks
 
 test('RELEASE-RUN-LAUNCH-SEAT-GUARD checks the executing module when argv points outside its checkout', () => {
   const previousArgv = process.argv[1];
-  process.argv[1] = '/Users/user/elanous-hq/bin/wrapper.mjs';
+  process.argv[1] = '/sim/home/elanous-hq/bin/wrapper.mjs';
   try {
     const modulePath = fileURLToPath(import.meta.url);
     const temporaryModule = ['/tmp/', '/private/tmp/'].some((prefix) => modulePath.startsWith(prefix));

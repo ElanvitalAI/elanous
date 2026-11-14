@@ -219,7 +219,7 @@ export type GraphExternalTriggerDispatchResult =
 
 /** Starts a graph only when its YAML declares this external event; the dispatch registry owns idempotency.
  *  Internal GraphEventBus subscribers remain scoped to an existing graph/run and never call this ingress. */
-export async function dispatchDeclaredGraphExternalEvent(graphPath: string, event: GraphExternalTriggerEvent, options: {
+export async function dispatchDeclaredGraphExternalEvent(graphPath: string, event: unknown, options: {
   registryRoot?: string;
   stateRoot?: string;
   runRoot?: string;
@@ -229,10 +229,20 @@ export async function dispatchDeclaredGraphExternalEvent(graphPath: string, even
   eventNow?: () => Date;
   graphRunOptions?: Pick<import('./runner.js').GraphRunOptions, 'eventBus' | 'quiet' | 'deps' | 'routeGraphEvents'>;
 } = {}): Promise<GraphExternalTriggerDispatchResult> {
-  if (!event.eventId.trim()) throw new Error('external graph event requires eventId');
-  if (!event.type.trim()) throw new Error('external graph event requires type');
-  if (!event.dedupeKey.trim()) throw new Error('external graph event requires dedupeKey');
-  if (!Number.isFinite(Date.parse(event.at))) throw new Error('external graph event requires a valid at timestamp');
+  if (!event || typeof event !== 'object' || Array.isArray(event))
+    throw new Error('external graph event requires an object envelope');
+  const envelope = event as Record<string, unknown>;
+  for (const field of ['eventId', 'type', 'dedupeKey']) {
+    if (typeof envelope[field] !== 'string' || !envelope[field].trim())
+      throw new Error(`external graph event requires ${field}`);
+  }
+  if (typeof envelope.at !== 'string' || !Number.isFinite(Date.parse(envelope.at)))
+    throw new Error('external graph event requires a valid at timestamp');
+  if (!envelope.payload || typeof envelope.payload !== 'object' || Array.isArray(envelope.payload))
+    throw new Error('external graph event requires an object payload');
+  if (envelope.sequence !== undefined && (!Number.isSafeInteger(envelope.sequence) || (envelope.sequence as number) < 0))
+    throw new Error('external graph event requires a non-negative safe integer sequence');
+  const delivery = envelope as unknown as GraphExternalTriggerEvent;
 
   const { readFileSync } = await import('node:fs');
   const { parse: parseYaml } = await import('yaml');
@@ -241,26 +251,33 @@ export async function dispatchDeclaredGraphExternalEvent(graphPath: string, even
     ? document as Record<string, unknown> : {};
   const graphId = typeof root.graph_id === 'string' ? root.graph_id : '';
   if (!graphId) throw new Error('external graph event target requires graph_id');
+  if (root.loop !== undefined && (!root.loop || typeof root.loop !== 'object' || Array.isArray(root.loop)))
+    throw new Error('external graph event target requires an object loop declaration');
   const loop = root.loop && typeof root.loop === 'object' && !Array.isArray(root.loop)
     ? root.loop as Record<string, unknown> : {};
+  if (loop.trigger !== undefined && (!loop.trigger || typeof loop.trigger !== 'object' || Array.isArray(loop.trigger)))
+    throw new Error('external graph event target requires an object trigger declaration');
   const trigger = loop.trigger && typeof loop.trigger === 'object' && !Array.isArray(loop.trigger)
     ? loop.trigger as Record<string, unknown> : {};
+  if (trigger.events !== undefined && (!Array.isArray(trigger.events)
+    || trigger.events.some(type => typeof type !== 'string' || !type.trim())))
+    throw new Error('external graph event target requires an array of non-empty event types');
   const declarations = Array.isArray(trigger.events) ? trigger.events : [];
-  if (!declarations.includes(event.type))
-    return { disposition: 'ignored', reason: 'event-not-declared', graphId, eventId: event.eventId };
+  if (!declarations.includes(delivery.type))
+    return { disposition: 'ignored', reason: 'event-not-declared', graphId, eventId: delivery.eventId };
 
   const { dispatchGraphTriggerRun } = await import('../loops/graph-trigger-dispatch.js');
   const result = await dispatchGraphTriggerRun({
     graphId,
     graphPath,
-    triggerId: `event:${graphId}:${event.type}`,
-    dedupeKey: event.dedupeKey,
-    payload: { ...event.payload, graphEvent: { eventId: event.eventId, type: event.type, dedupeKey: event.dedupeKey,
-      at: event.at, ...(event.sequence === undefined ? {} : { sequence: event.sequence }) } },
+    triggerId: `event:${graphId}:${delivery.type}`,
+    dedupeKey: delivery.dedupeKey,
+    payload: { ...delivery.payload, graphEvent: { eventId: delivery.eventId, type: delivery.type, dedupeKey: delivery.dedupeKey,
+      at: delivery.at, ...(delivery.sequence === undefined ? {} : { sequence: delivery.sequence }) } },
   }, options);
   const disposition = !result.claimed ? 'busy'
     : result.mode === 'start' ? 'started'
       : result.mode === 'resume' ? 'resumed' : 'duplicate';
-  return { disposition, graphId, eventId: event.eventId, runId: result.registration.runId,
+  return { disposition, graphId, eventId: delivery.eventId, runId: result.registration.runId,
     ...(result.state ? { state: result.state } : {}) };
 }

@@ -8,6 +8,31 @@
     ]
   },
   "description": "Generates editable system architecture diagrams and integrated PDFs from structured design JSON (nodes, zones, flows, tables).",
+  "contributes": {
+    "aiTools": [{
+      "name": "architecture_deliverables",
+      "description": "Render a requirements-derived structured system design into editable Excalidraw and draw.io diagrams, SVG and PNG exports, and an integrated architecture PDF. Use after creating structured design JSON with nodes, zones, flows and decision tables; no cloud resources are created.",
+      "handler": "graph:architecture-deliverables",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "structuredDesignPath": { "type": "string", "description": "Existing absolute path to structured design JSON" },
+          "outDir": { "type": "string", "description": "Absolute directory for verified artifacts" },
+          "resourceRoot": { "type": "string", "description": "Absolute repository path containing diagram and PDF renderers" }
+        },
+        "required": ["structuredDesignPath"],
+        "additionalProperties": false
+      },
+      "route": {
+        "triggers": ["시스템 아키텍처 도식", "draw.io 설계도", "Excalidraw 설계도", "architecture deliverables"],
+        "examples": ["구조화 설계 JSON으로 편집 가능한 아키텍처 도식과 PDF를 만들어줘", "이 설계에서 draw.io와 SVG를 내보내줘"],
+        "sideEffects": "mutating",
+        "risk": "medium",
+        "cost": "spawns-run",
+        "requiresConfirm": false
+      }
+    }]
+  },
   "extensions": {
     "ai.elanous": {
       "graphs": [
@@ -28,6 +53,8 @@
         ],
         "requiredFiles": [
           "architecture.excalidraw",
+          "architecture.drawio",
+          "architecture.svg",
           "architecture.png",
           "architecture.html",
           "architecture.pdf",
@@ -45,7 +72,7 @@
           "결정 기록"
         ],
         "diagramQuality": {
-          "iconSource": "Generic: editable vector shapes. GCP: official core/category icon archives, verified by source path and SHA-256",
+          "iconSource": "Local/generic: editable shapes. GCP: official core/category icons. AWS: official Architecture Icons. Cloud source path and SHA-256 verified",
           "layers": [
             "users",
             "edge",
@@ -55,7 +82,7 @@
             "security"
           ],
           "boundaries": [
-          "system/project",
+            "system/project/account",
           "zone/region",
           "network/VPC"
           ],
@@ -76,9 +103,10 @@
         ],
         "referenceStyle": [
           "https://cloud.google.com/icons",
+          "https://aws.amazon.com/architecture/icons/",
           "https://docs.aws.amazon.com/reference-architecture-diagrams/"
         ],
-        "completionRule": "All required files exist, nested boundary and flow shapes are present, and the integrated PDF has cover, contents, summary, body, tables, and appendix. GCP mode also verifies official icons."
+        "completionRule": "All required files exist, editable Excalidraw and draw.io XML plus SVG derive from the same validated source, nested boundary and flow shapes are present, and the integrated PDF has cover, contents, summary, body, tables, and appendix. Cloud modes verify official icon bytes."
       },
       "capabilities": [
         "fs:workdir",

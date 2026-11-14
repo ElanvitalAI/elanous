@@ -1,0 +1,227 @@
+{
+  "schemaVersion": 1,
+  "title": "Concert ticketing on a local operator host",
+  "version": "1.0",
+  "summary": "운영자 단일 호스트의 로컬 시연 설계. 외부 공개·고가용성·부하 보장은 별도 검증한다.",
+  "background": "로컬 Bun 서버, 브라우저, SQLite 파일, tailnet 입구로 티케팅 시연을 구성한다. 클라우드 자원은 생성하지 않으며 부하와 비용은 측정 전 가정이다.",
+  "deployment": {
+    "provider": "local",
+    "project": "ticketing-local-sim",
+    "region": "operator-host",
+    "vpc": "loopback"
+  },
+  "nodes": [
+    {
+      "id": "fans",
+      "label": "Fans",
+      "layer": "users",
+      "zone": "external",
+      "service": "Browser clients",
+      "details": [
+        "Demo users; load unmeasured",
+        "Signed admission token"
+      ],
+      "localIcon": "laptop"
+    },
+    {
+      "id": "edge",
+      "label": "Tailnet ingress",
+      "layer": "edge",
+      "zone": "project",
+      "service": "Tailscale Serve or operator relay",
+      "details": [
+        "TLS and rate limits"
+      ],
+      "purpose": "tailnet 회원에게 로컬 HTTP 앱을 TLS로 전달한다. 공개 CDN과 WAF는 없다.",
+      "alternative": "127.0.0.1 운영자 전용 접속",
+      "awsService": "",
+      "gcpService": "",
+      "localIcon": "tailnet"
+    },
+    {
+      "id": "booking",
+      "label": "Booking API",
+      "layer": "application",
+      "zone": "vpc",
+      "service": "Bun local booking API",
+      "details": [
+        "Single-process limit",
+        "Idempotency keys"
+      ],
+      "purpose": "동기 예약 요청을 처리하고 SQLite 좌석 원장 트랜잭션을 호출한다.",
+      "alternative": "Node or Python local API",
+      "awsService": "",
+      "gcpService": "",
+      "localIcon": "process"
+    },
+    {
+      "id": "queue",
+      "label": "Admission state",
+      "layer": "data",
+      "zone": "vpc",
+      "service": "SQLite admission table",
+      "details": [
+        "Admission order",
+        "Short seat map TTL"
+      ],
+      "purpose": "입장 허용과 재시도 상태를 SQLite 테이블에서 읽고 갱신한다.",
+      "alternative": "단일 프로세스 메모리 입장 제한",
+      "awsService": "",
+      "gcpService": "",
+      "localIcon": "relay"
+    },
+    {
+      "id": "ledger",
+      "label": "Seat ledger",
+      "layer": "data",
+      "zone": "vpc",
+      "service": "SQLite file",
+      "details": [
+        "Seat/order/outbox",
+        "Confirmed UNIQUE"
+      ],
+      "purpose": "트랜잭션과 관계형 질의가 필요한 영속 데이터를 보관한다.",
+      "alternative": "PostgreSQL after measured concurrency limit",
+      "awsService": "Amazon RDS",
+      "gcpService": "Cloud SQL",
+      "localIcon": "sqlite"
+    },
+    {
+      "id": "observe",
+      "label": "Telemetry",
+      "layer": "observability",
+      "zone": "vpc",
+      "service": "Structured local logs",
+      "details": [
+        "p95, conflicts, queue lag"
+      ],
+      "purpose": "로그·메트릭·추적을 연결해 상태와 실패를 진단한다.",
+      "alternative": "단일 서버 구조화 로그",
+      "awsService": "Amazon CloudWatch / AWS X-Ray",
+      "gcpService": "Cloud Logging / Monitoring / Trace",
+      "localIcon": "docker"
+    },
+    {
+      "id": "security",
+      "label": "Trust boundary",
+      "layer": "security",
+      "zone": "external",
+      "service": "Local session and OS permissions",
+      "details": [
+        "Least privilege",
+        "PII masking"
+      ],
+      "purpose": "서비스와 사용자의 인증·권한 경계를 정의한다.",
+      "alternative": "로컬 앱 자체 세션과 권한 저장소",
+      "awsService": "AWS IAM / IAM Identity Center",
+      "gcpService": "Cloud IAM / Identity Platform",
+      "localIcon": "laptop"
+    }
+  ],
+  "flows": [
+    {
+      "from": "fans",
+      "to": "edge",
+      "label": "TLS request",
+      "kind": "sync"
+    },
+    {
+      "from": "edge",
+      "to": "booking",
+      "label": "admitted request",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "queue",
+      "label": "admission state read and update",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "ledger",
+      "label": "transactional hold and confirm",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "observe",
+      "label": "metrics and traces",
+      "kind": "telemetry"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "R1",
+      "kind": "correctness",
+      "statement": "확정 좌석 중복 0건",
+      "verification": "동일 좌석 500명 경쟁·DB UNIQUE 위반 0건"
+    },
+    {
+      "id": "R2",
+      "kind": "resilience",
+      "statement": "결제 실패·지연 성공 복구",
+      "verification": "웹훅 중복·역순·지연 주입"
+    }
+  ],
+  "security": [
+    {
+      "class": "tailnet",
+      "data": "공연·좌석 시연 정보",
+      "controls": "Tailscale Serve tailnet TLS와 로컬 세션 권한. 공개 CDN·WAF 없음."
+    },
+    {
+      "class": "confidential",
+      "data": "구매자·결제 시연 식별자",
+      "controls": "SQLite 파일 OS 권한, 로그 마스킹, 공개 노출 금지"
+    }
+  ],
+  "capacity": [
+    {
+      "item": "시연 동시 사용자",
+      "assumption": "단일 호스트 부하 미측정; 10만 동시 사용자 보장 없음",
+      "verification": "두 사용자 좌석 경합·재시작 replay 시험 후 부하 별도 측정"
+    },
+    {
+      "item": "애플리케이션",
+      "assumption": "Bun 단일 프로세스와 SQLite 파일; Pod·오토스케일 없음",
+      "verification": "SQLite busy 처리·단일 호스트 실패·수동 재시작"
+    }
+  ],
+  "costs": [
+    {
+      "item": "로컬 운영 비용",
+      "formula": "호스트·네트워크·백업 비용 미산정; 실제 사용량 필요",
+      "monthlyUsd": null
+    }
+  ],
+  "savings": [
+    {
+      "name": "단일 호스트 시작",
+      "mechanism": "관리형 자원 미사용",
+      "guardrail": "호스트 장애와 데이터 백업 책임 명시"
+    }
+  ],
+  "alternatives": [
+    {
+      "name": "관리형 클라우드 3계층",
+      "when": "운영 부하·가용성·공개 요구가 실측될 때",
+      "tradeoff": "클라우드 비용과 운영 연결 필요"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "ADR-1",
+      "decision": "시연 단계는 로컬 Bun API와 SQLite 파일 사용",
+      "rationale": "명시된 단일 호스트·비연결 제약; 영속성과 백업 필요",
+      "revisit": "동시 쓰기·복구 시험 또는 가용성 요구 변경 시"
+    }
+  ],
+  "references": [
+    {
+      "title": "SQLite transactions",
+      "url": "https://www.sqlite.org/lang_transaction.html"
+    }
+  ],
+  "designPattern": "local-single-node: 운영자 한 호스트의 시연과 수동 되돌리기; 가용성은 미보장"
+}

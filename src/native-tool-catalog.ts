@@ -2938,6 +2938,23 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     intentScope: 'always',
   },
 
+  {
+    id: 'capability_search',
+    kind: 'other',
+    aliases: ['capability_search'],
+    displayName: 'capability_search',
+    description: 'Search registered capabilities by user intent and fetch callable schemas with usage and prerequisites. Discovery grants no execution authority.',
+    promptSummary: 'Use capability_search(query) before choosing tools for an unfamiliar request; inspect prerequisites and call a returned tool.',
+    host: ['skill', 'tui'],
+    safety: ['read-only'],
+    supportsParallel: true,
+    defaultEnabled: true,
+    alwaysLoad: true,
+    toolSearchable: false,
+    coreReason: 'N3',
+    intentScope: 'always',
+  },
+
   // Presentation P5c — LLM scenario tools (registered by
   // registerScenarioRuntimes · src/tool-runtime/scenario-runtimes.ts).
   // Adding catalog entries here lets the LLM call them by PascalCase

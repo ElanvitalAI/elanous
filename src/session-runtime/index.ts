@@ -1767,7 +1767,7 @@ const ESSENTIAL_HOST_FAMILY_IDS = ['self-ops', 'release-read'] as const;
 // ScheduleWakeup (H5) is a dashboard-only host tool — present only when the TUI registered it.
 const ESSENTIAL_HOST_EXTRA_NAMES = ['logs_query', 'ScheduleWakeup'] as const;
 const ESSENTIAL_RUNTIME_FAMILY_IDS = ['bash', 'run-shell', 'ops-ledger', 'pty-shell', 'run-tests', 'elanous_skills_list', 'skill_exec', 'code-grounding'] as const;
-const ESSENTIAL_RUNTIME_EXTRA_NAMES = ['tool_search'] as const;
+const ESSENTIAL_RUNTIME_EXTRA_NAMES = ['tool_search', 'capability_search'] as const;
 const ESSENTIAL_OPTIONAL_TOOL_NAMES = [
   'GetDashboardState',
   'TerminalModalList', 'TerminalModalObserve', 'TerminalModalFocus', 'TerminalModalDetach', 'TerminalModalKill',

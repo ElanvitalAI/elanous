@@ -7,6 +7,8 @@ import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { appendRunLedgerEntry, runLedgerDir } from './run-ledger.js';
+import { parseGraphTemplateYaml } from './graph-yaml.js';
+import { inspectRecipesAgainstCatalog, loadNodeCatalog } from './graph-catalog.js';
 
 export type FailureSource = 'release-run' | 'harness-run' | 'loop-tick' | 'cron';
 
@@ -84,6 +86,12 @@ export async function startHealLoop(file: string, options: HealLoopOptions, env:
     debug.log('heal.intake', 'loop-start-skipped-test', { runId: options.runId });
     return undefined;
   }
+  // Diagnose static dependencies before claiming an inbox event. A bad graph must not strand a claim.
+  const parsed = parseGraphTemplateYaml(readFileSync(file, 'utf8'), file);
+  const catalogIssues = parsed.template ? inspectRecipesAgainstCatalog(parsed.template, loadNodeCatalog()) : [];
+  if (parsed.errors.length || catalogIssues.length) {
+    throw new Error(`heal dependency preflight failed: ${JSON.stringify({ errors: parsed.errors, catalogIssues })}`);
+  }
   const root = options.deps.root;
   const claimDir = join(root, 'heal', 'starts');
   const selected = withInboxLock(inboxPath(root), () => {
@@ -110,7 +118,10 @@ export async function startHealLoop(file: string, options: HealLoopOptions, env:
     }
     const next = readInbox(inboxPath(root)).find(event => !claimed.has(healRunId(event)) &&
       !existsSync(join(root, 'graph-runs', 'heal-loop', `${healRunId(event)}.json`)));
-    if (!next) return undefined;
+    if (!next) {
+      debug.log('heal.intake', 'loop-drained', { root, live: live.size, claimed: claimed.size });
+      return undefined;
+    }
     const runId = healRunId(next);
     writeFileSync(join(claimDir, `${runId}.json`), JSON.stringify({ active: true, pid: process.pid,
       pidStartedAt: new Date(Date.now() - process.uptime() * 1_000).toISOString() }), { flag: 'wx' });
@@ -121,6 +132,9 @@ export async function startHealLoop(file: string, options: HealLoopOptions, env:
   try {
     const result = await run(file, { runId: selected.runId, input: { failureEvent: selected.event, runId: selected.event.ref, goal: selected.event.goalText, goalId: selected.event.goalId, goalFile: selected.event.goalFile }, deps: { root } });
     started = true;
+    const status = result && typeof result === 'object' && 'status' in result ? (result as { status?: unknown }).status : undefined;
+    debug.log('heal.intake', status === 'awaiting-approval' || status === 'paused' ? 'loop-paused' : 'loop-finished',
+      { runId: selected.runId, status: typeof status === 'string' ? status : 'unknown' });
     const request = reauthorRequest(result);
     if (request) {
       const cellKey = selected.event.goalId || selected.event.goalFile || selected.event.cellKey

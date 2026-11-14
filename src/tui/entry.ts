@@ -1,4 +1,5 @@
 import { updateToolActivity, toolActivityLines, type ToolActivityRow } from './chat/tool-activity.js';
+import { nextAssistantPreviewText } from './chat/assistant-preview.js';
 import { initTui, initTuiPrimary, closeTui, injectKey, pendingKeyCount as tuiPendingKeyCount, readKey, setTuiAltScreen, setTuiMouseCapture, type Key } from '../tui.js';
 import { createNextTuiCompactPainter, createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiCompactFrame, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
 import { renderNextTuiEntryFrame, shellApprovalCommandViewport } from './core/entry-render.js';
@@ -153,6 +154,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let busy = false;
   let turnElapsedMs: number | undefined;
   let measuredUsage: { inputTokens?: number; outputTokens?: number } | undefined;
+  let streamedOutputChars: number | undefined;
   let telemetrySessionId: string | null = null;
   let turnElapsedTimer: ReturnType<typeof setInterval> | null = null;
   let turnAbort: AbortController | null = null;
@@ -220,6 +222,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const residueWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
   let residueTimer: ReturnType<typeof setTimeout> | null = null;
   let activity: string[] = [];
+  // Only the typed assistant-text lane may preview in basic chat. Unclassified
+  // child output stays in the explicit diagnostic log; neither is persisted here.
+  let streamPreview: { sessionId: string; text: string; assistantText: boolean } | null = null;
   let agents: AgentDisplay[] = [];
   /** Rows of the last `/resume` list — `/resume <n>` picks from what the user saw. */
   let lastResumeRows: import('../session/index.js').SessionMeta[] | null = null;
@@ -300,6 +305,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     messageBlockLevels = saved.levels;
     messageBlockRawTexts = saved.rawTexts;
     messageBlockAfterMessageIndexes = saved.afterMessageIndexes;
+  };
+  const advanceMessageBlockDetail = (blockId: string): void => {
+    if (!id) return;
+    const block = messageBlocks.find((candidate) => candidate.id === blockId);
+    if (!block) return;
+    const level = nextMessageBlockDetailLevel(block, messageBlockLevels.get(block.id) ?? 0);
+    messageBlockLevels.set(block.id, level);
+    if (level === 3 && block.detail?.rawRef && !messageBlockRawTexts.has(block.id)) {
+      const trace = resolveMessageBlockRawTrace(loadSession(id)?.messages ?? [], block);
+      if (trace) messageBlockRawTexts.set(block.id, formatMessageBlockRawTrace(trace));
+    }
+    saveMessageBlockSession();
   };
   let logWindow: { start: number; rows: number; columns: number; bodyTop: number; leadingBlankRows: number; foldTargets: readonly ({ kind: 'message'; id: string; start: number; end: number } | { kind: 'tool'; index: number; start: number; end: number })[] } = { start: 0, rows: 0, columns: 80, bodyTop: 1, leadingBlankRows: 0, foldTargets: [] };
   let lastFoldTargetKey: string | null = null;
@@ -546,6 +563,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       width: statusWidth,
       elapsedMs: id === telemetrySessionId ? turnElapsedMs : undefined,
       measuredUsage: id === telemetrySessionId ? measuredUsage : undefined,
+      // 출처: #37786 — classic의 본문 문자/4 추정과 공급자 실측 값을 구분한다.
+      estimatedOutputTokens: busy && id === telemetrySessionId && streamedOutputChars !== undefined
+        ? Math.ceil(streamedOutputChars / 4) : undefined,
     });
     const turnStatus = [statusLine, attachmentHint].filter(Boolean).join(' · ');
     const compactActionStatus = nextTuiCompactActionStatus(turnStatus);
@@ -623,6 +643,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         ? { ...message, content: displayNextPublicReplyText(message.content) } : message);
     }
     const reconciledAgents = reconcileAgentOutputStatuses(agents, messages, backgroundJobs.snapshot()?.tasks);
+    const previewText = streamPreview?.assistantText
+      ? nextAssistantPreviewText(streamPreview.text) : streamPreview?.text;
     const displayActivity = [
       ...toolActivityLines(visibleToolActivity, performance.now()),
       ...(!basicChat ? [
@@ -630,7 +652,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         ...reconciledAgents.map(agentDisplayLine),
         ...(backgroundJobs.taskLines?.() ?? []).map(safeStatusText),
       ] : []),
-      ...activity,
+      ...(busy && streamPreview?.sessionId === id && previewText
+        && (!basicChat || streamPreview.assistantText)
+        ? streamReplyLines(previewText, chatColumns) : activity),
     ];
     // Source: renderNextTuiLogFrame reserves one prompt row after header and footer.
     const firstScreen = nextFirstScreenLines({
@@ -1100,6 +1124,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const turnStartedAt = performance.now();
     turnElapsedMs = 0;
     measuredUsage = undefined;
+    streamedOutputChars = 0;
     if (turnElapsedTimer !== null) clearInterval(turnElapsedTimer);
     turnElapsedTimer = setInterval(() => {
       if (tuiClosed || !busy || id !== turnSessionId) return;
@@ -1126,7 +1151,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         pushNowRequest.current = (requestId) => requestLocalChatPushNow(sessionId, requestId);
         pushNowCommit.current = (requestId) => commitLocalChatPushNow(sessionId, requestId);
         observeSession(sessionId, onLocalChatBackgroundStatus);
-        return runLocalChatTurn(sessionId, text, signal, undefined, undefined, onDelta,
+        return runLocalChatTurn(sessionId, text, signal, undefined, undefined, (...args) => {
+          const [delta, replace, source] = args;
+          if (!signal.aborted && id === sessionId && !replace && source === 'assistant-text') {
+            streamedOutputChars = Math.min(Number.MAX_SAFE_INTEGER, (streamedOutputChars ?? 0) + delta.length);
+          }
+          onDelta(...args);
+        },
           { onCompact: (outcome) => onCompact(outcome.status ?? ''), onMessageBlock,
             onMeasuredUsage: (usage) => {
               if (id !== turnSessionId || !busy) return;
@@ -1170,8 +1201,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       },
       onProgress: reportTuiProgress,
       onStreamOpen: () => dashboardRuntime.endTurnStartSegments(turnSessionId, 'stream-open'),
-      onPreview: (preview) => {
-        // Child deltas are provisional and may include tool or diagnostic text.
+      onPreview: (preview, _replace, source) => {
+        // The REPL tags only session/chat onText; tool, reasoning and diagnostic frames stay separate.
+        streamPreview = { sessionId: turnSessionId, text: preview, assistantText: source === 'assistant-text' };
         const progress = preview ? streamReplyProgress(turnSessionId) : null;
         activity = progress ? streamReplyLines(progress, process.stdout.columns || 80) : [];
         render();
@@ -1217,6 +1249,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (turnElapsedTimer !== null) clearInterval(turnElapsedTimer);
         turnElapsedTimer = null;
         turnElapsedMs = nextTuiElapsedMs(turnStartedAt, performance.now(), turnElapsedMs);
+        streamedOutputChars = undefined;
         if (outcome.kind !== 'completed') measuredUsage = undefined;
         pendingEcho = null;
         stopConfirmationSelection = null;
@@ -1244,6 +1277,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         session = loadSession(turnSessionId);
         messages = session?.messages ?? [];
         activity = [];
+        streamPreview = null;
         // Keep the completed tree visible after settlement; a new turn resets it.
         busy = false;
         turnAbort = null;
@@ -1689,7 +1723,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         continue;
       }
       if (key.name !== 'mouse') { sidetabDragSource = null; sidetabDragOver = null; }
-      if (key.name === 'mouse' && (key.mouse?.type === 'click' || key.mouse?.type === 'right-click')) {
+      if (key.name === 'mouse' && (key.mouse?.type === 'click' || key.mouse?.type === 'double-click' || key.mouse?.type === 'right-click')) {
         let panelClick = false;
         if (sidetabOpen && sidetabMode === 'list' && !sidetabAttachments?.hasRemoteView() && !sidetabAttachments?.hasModal()) {
           const panelWidth = sidetabApi!.sidetabWidthForTerminal(process.stdout.columns || 0);
@@ -1718,17 +1752,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           }
         }
         if (!panelClick) sidetabDragSource = null;
-        if (!panelClick && key.mouse.type === 'click' && !sidetabAttachments?.hasModal() && !sidetabAttachments?.hasRemoteView()) {
+        if (!panelClick && (key.mouse.type === 'click' || key.mouse.type === 'double-click') && !sidetabAttachments?.hasModal() && !sidetabAttachments?.hasRemoteView()) {
           const target = foldTargetAtScreenRow(logWindow.foldTargets, logWindow, key.mouse.row);
           if (target) {
             focus = 'log';
             lastFoldTargetKey = target.kind === 'message' ? `message:${target.id}` : `tool:${target.index}`;
             if (target.kind === 'message') {
-              const block = messageBlocks.find((candidate) => candidate.id === target.id);
-              if (block) messageBlockLevels.set(block.id, (messageBlockLevels.get(block.id) ?? 0) === 0 ? 1 : 0);
+              advanceMessageBlockDetail(target.id);
             } else if (expandedToolBlocks.has(target.index)) expandedToolBlocks.delete(target.index);
             else expandedToolBlocks.add(target.index);
-            saveMessageBlockSession();
           }
         }
         render();
@@ -1779,6 +1811,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
+      // Releases/motion left unclaimed by a pane are pointer events, not composer input.
+      // In particular, releasing a fold click must not switch back to basic chat.
+      if (key.name === 'mouse') continue;
       if (key.ctrl && key.name === 'q') {
         turnAbort?.abort();
         await turnDone;
@@ -1892,20 +1927,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const target = nextVisibleFoldTarget(visibleTargets, messageBlocks, messageBlockLevels, lastFoldTargetKey);
         if (target?.kind === 'message') {
           lastFoldTargetKey = targetKey(target);
-          const block = messageBlocks.find((candidate) => candidate.id === target.id);
-          if (block) {
-            const current = messageBlockLevels.get(block.id) ?? 0;
-            messageBlockLevels.set(block.id, nextMessageBlockDetailLevel(block, current));
-          }
-          const expanded = block && messageBlockLevels.get(block.id) === 3 && block.detail?.rawRef ? block : undefined;
-          if (expanded?.detail?.rawRef && !messageBlockRawTexts.has(expanded.id)) {
-            const trace = resolveMessageBlockRawTrace(loadSession(id!)?.messages ?? [], expanded);
-            if (trace) {
-              messageBlockRawTexts.set(expanded.id, formatMessageBlockRawTrace(trace));
-              saveMessageBlockSession();
-            }
-          }
-          saveMessageBlockSession();
+          advanceMessageBlockDetail(target.id);
           render();
           continue;
         }

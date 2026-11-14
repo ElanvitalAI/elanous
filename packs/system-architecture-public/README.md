@@ -1,6 +1,14 @@
 # System architecture public pack
 
-Version `0.1.0` · 51 KPACK1 cards · Korean authored decision summaries. `CC-BY-4.0` applies to these original cards only. The pack links to public references; it does not redistribute their prose, diagrams, examples, or source files. Check each linked work's own terms before using that source outside the cited decision context.
+For an isolated on/off evaluation of automatic pack selection, run the off arm with `ELANOUS_SYSTEM_ARCH_PACK=off` and the on arm with the variable unset. Keep the KGS empty in both arms. This switch affects automatic selection of this architecture pack; an explicit pack ID request remains an explicit user choice.
+
+A question-only KnowledgeQuery call searches knowledge packs only. If no pack matches, it returns an empty result with a reason and does not discover or create an Obsidian vault. Vault search remains available through explicit vault filter inputs.
+
+Version `0.2.0` · 73 KPACK1 cards · Korean authored decision summaries. `CC-BY-4.0` applies to these original cards only. The pack links to public references; it does not redistribute their prose, diagrams, examples, or source files. Check each linked work's own terms before using that source outside the cited decision context.
+
+## Component and pattern references
+
+The 16 component records in [component-knowledge.json](references/component-knowledge.json) contain a description, when to use, an alternative, AWS and GCP service mappings, exact official icon registry paths, and direct official source URLs. The five records in [pattern-library.json](references/pattern-library.json) cover local single node, local with relay, cloud three tier, serverless, and event driven systems. Each has a placement rule and a layout example. The generated diagram must select nodes and flows from the request; the examples are not templates to copy. The [workflow](references/workflow.json) links requirements, architecture, FE, BE, DB, testing and deployment documents. These 22 records are also indexed as KPACK1 cards so a requested knowledge query can cite them. A successful pack query emits `pack.load` with document ID and SHA-256, while a request that does not query the pack emits no such event.
 
 ## Source map
 

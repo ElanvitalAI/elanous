@@ -11,7 +11,7 @@ import {
   dispatchToolSearch,
   type ToolSearchArgs,
 } from '../skills/tools/tool-search.js';
-import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
+import { buildCapabilitySearchTool, HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
 
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
@@ -62,6 +62,7 @@ export const toolSearchRuntime: ToolRuntime<ToolSearchArgs, ToolSearchRunResult>
     const result = dispatchToolSearch(req, {
       ...(ctx.surfaceSpecs ? { specs: ctx.surfaceSpecs } : {}),
       surface: ctx.surface,
+      requireQueryCoverage: false,
     });
     const hydrated = result[HYDRATED_TOOLS_KEY];
     return {
@@ -70,5 +71,19 @@ export const toolSearchRuntime: ToolRuntime<ToolSearchArgs, ToolSearchRunResult>
       unknown: result.unknown,
       ...(hydrated && hydrated.length > 0 ? { [HYDRATED_TOOLS_KEY]: hydrated } : {}),
     };
+  },
+};
+
+/** Fail closed without a surface catalog; reuse the same schema hydration hand-off. */
+export const capabilitySearchRuntime: ToolRuntime<ToolSearchArgs, ToolSearchRunResult> = {
+  id: 'capability_search',
+  spec: buildCapabilitySearchTool(),
+  async run(req, ctx) {
+    const result = dispatchToolSearch(req, {
+      specs: ctx.surfaceSpecs ?? [], surface: ctx.surface, requireQueryCoverage: true,
+    });
+    const hydrated = result[HYDRATED_TOOLS_KEY];
+    return { output: result.content, matched: result.matched, unknown: result.unknown,
+      ...(hydrated?.length ? { [HYDRATED_TOOLS_KEY]: hydrated } : {}) };
   },
 };

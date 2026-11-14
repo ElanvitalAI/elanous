@@ -11,7 +11,7 @@ import { runPrLand, runPrLandTypecheckGate, runPrLandTypecheckWithReceipt, shoul
 setDefaultTimeout(60_000);
 
 test('pr land refuses local test-suite and PWA gates on HQ unless the heavy gate already ran remotely', () => {
-  const seat = '/Users/user/elanous-hq/seats/OP';
+  const seat = '/sim/home/elanous-hq/seats/OP';
   expect(shouldRefusePrLandLocalHeavySteps({}, 'MacBookProM5', seat, false)).toBe(true);
   expect(shouldRefusePrLandLocalHeavySteps({}, 'MacStudioB1', seat, false)).toBe(true);
   expect(shouldRefusePrLandLocalHeavySteps({}, 'MacBookProM5', seat, true)).toBe(false);

@@ -58,6 +58,32 @@ export function registerGraphCommands(program: Command, runsDeps: {
         process.exitCode = 1;
       }
     });
+  graph.command('event <file>')
+    .description('Deliver an external event to a graph declaring loop.trigger.events, with durable deduplication')
+    .requiredOption('--event-file <path>', 'JSON envelope: eventId, type, dedupeKey, at, payload, and optional sequence')
+    .option('--json', 'Print the dispatch disposition and run identity as JSON')
+    .action(async (file: string, opts: { eventFile: string; json?: boolean }) => {
+      try {
+        const source = readFileSync(resolve(opts.eventFile), 'utf8');
+        let event: unknown;
+        try { event = JSON.parse(source); }
+        catch { throw new Error('--event-file must contain a JSON event envelope'); }
+        const { dispatchDeclaredGraphExternalEvent } = await import('./graph-events.js');
+        const result = await dispatchDeclaredGraphExternalEvent(resolve(file), event, {
+          registryRoot: runsDeps.root, stateRoot: runsDeps.root, runRoot: runsDeps.root,
+          graphRunOptions: { quiet: true, deps: {
+            ...(runsDeps.runBash ? { runBash: runsDeps.runBash } : {}),
+            capabilityProviders: runsDeps.capabilityProviders ?? await defaultCapabilityRegistryForGraph(file, runsDeps.root),
+          } },
+        });
+        if (opts.json) await writeStdoutJson(JSON.stringify(result) + '\n');
+        else console.log(`${result.graphId}: ${result.disposition}${'runId' in result ? ` · ${result.runId}` : ''}`);
+        if ('state' in result && result.state && !['done', 'awaiting-approval'].includes(result.state.status)) process.exitCode = 1;
+      } catch (error) {
+        console.error(`graph event: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   graph.command('import-n8n <file>')
     .description('Convert a supported n8n Execute Workflow export into graph-v2 YAML')
     .requiredOption('--unit <workflow-id=unit@version>', 'Map the Execute Workflow target id to an installed graph unit')

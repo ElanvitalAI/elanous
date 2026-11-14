@@ -1,3 +1,4 @@
+import { withCapabilityDiscoveryDescription } from '../plugins/core/capability-discovery.js';
 import { readFileSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
@@ -80,7 +81,7 @@ export function appDeployPluginSpec(): LLMToolSpec {
   if (!tool?.route) throw new Error('app deploy plugin route is missing');
   return {
     name: tool.name,
-    description: tool.description,
+    description: withCapabilityDiscoveryDescription(tool.description, manifest),
     parameters: tool.parameters ?? { type: 'object', properties: {} },
     pluginId: manifest.id,
     route: tool.route,

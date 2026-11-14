@@ -24,13 +24,13 @@ export interface NextTuiTurnOutcome {
 }
 
 export interface NextTuiTurnDeps {
-  run(input: NextTuiTurnInput, onDelta: (text: string, replace?: boolean) => void,
+  run(input: NextTuiTurnInput, onDelta: (text: string, replace?: boolean, source?: 'assistant-text') => void,
     onCompact: (status: string) => void, onNotice: (line: string) => void,
     onAgent: (event: AgentDisplayEvent) => void, onStatus: (line: string) => void,
     onMessageBlock: (block: MessageBlock) => void): Promise<NextTuiTurnResult | void>;
   onStreamOpen?(): void;
   onProgress?(): void;
-  onPreview?(text: string, replace: boolean): void;
+  onPreview?(text: string, replace: boolean, source?: 'assistant-text'): void;
   onCompact?(status: string): void;
   onNotice?(line: string): void;
   onAgent?(event: AgentDisplayEvent): void;
@@ -50,6 +50,10 @@ export interface NextTuiTurnHandle {
 export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: NextTuiTurnDeps): NextTuiTurnHandle {
   const controller = new AbortController();
   let preview = '';
+  const pemOpening = '-----BEGIN';
+  let pemOpeningTail = '';
+  let secretPreviewBlocked = false;
+  let previewSource: 'assistant-text' | undefined;
   let lastRender = 0;
   let renderTimer: ReturnType<typeof setTimeout> | null = null;
   let streamOpened = false;
@@ -61,28 +65,54 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
     if (renderTimer !== null) clearTimeout(renderTimer);
     renderTimer = null;
   };
-  const onDelta = (text: string, replace = false): void => {
+  controller.signal.addEventListener('abort', () => {
+    if (settled) return;
+    const hadPreview = preview.length > 0;
+    preview = '';
+    previewSource = undefined;
+    clearRenderTimer();
+    if (hadPreview) deps.onPreview?.('', true);
+  }, { once: true });
+  const onDelta = (text: string, replace = false, source?: 'assistant-text'): void => {
     if (settled || controller.signal.aborted) return;
     deps.onProgress?.();
     if (!streamOpened) { streamOpened = true; deps.onStreamOpen?.(); }
+    // Every frame carries security state, including text on replacement/reset frames.
+    const securityText = pemOpeningTail + text;
+    secretPreviewBlocked ||= securityText.toUpperCase().includes(pemOpening);
+    pemOpeningTail = securityText.slice(-(pemOpening.length - 1));
     if (replace) {
       preview = '';
+      previewSource = undefined;
       clearRenderTimer();
       lastRender = now();
       deps.onPreview?.('', true);
       return;
     }
+    // Security state belongs to the turn, not to a provenance lane or replaceable preview.
+    // Conservatively stop provisional text after any PEM opening; canonical history is unchanged.
+    if (secretPreviewBlocked) {
+      preview = '';
+      previewSource = undefined;
+      clearRenderTimer();
+      deps.onPreview?.('', true);
+      return;
+    }
+    // Never promote an earlier unclassified chunk when a typed assistant delta arrives.
+    if (source !== previewSource) preview = '';
+    previewSource = source;
+    // The turn-scoped latch survives truncation; normal text keeps its latest streamed tail.
     preview = (preview + text).slice(-32_768);
     const timestamp = now();
     if (lastRender === 0 || timestamp - lastRender >= 33) {
       lastRender = timestamp;
-      deps.onPreview?.(preview, false);
+      deps.onPreview?.(preview, false, previewSource);
     } else if (renderTimer === null) {
       renderTimer = setTimeout(() => {
         renderTimer = null;
         if (settled || controller.signal.aborted) return;
         lastRender = now();
-        deps.onPreview?.(preview, false);
+        deps.onPreview?.(preview, false, previewSource);
       }, 33 - (timestamp - lastRender));
     }
   };

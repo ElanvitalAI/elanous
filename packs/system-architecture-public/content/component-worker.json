@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: worker",
+  "source": "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html",
+  "body": "무엇: 백그라운드 작업을 실행한다.\n언제: 요청 지연 한도와 별개로 처리할 작업이 있을 때. 멱등성과 재시도 한도를 둔다.\n대안: 요청 핸들러 내부 처리\nAWS: AWS Lambda / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Compute/48/Arch_AWS-Lambda_48.png\nGCP: Cloud Run jobs / 공식 제품 아이콘 경로 Unique Icons/Cloud Run/PNG/CloudRun-512-color-rgb.png\n공식 출처: https://docs.aws.amazon.com/lambda/latest/dg/welcome.html, https://cloud.google.com/run/docs/create-jobs\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

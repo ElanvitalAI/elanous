@@ -404,13 +404,13 @@ test('delta frames reach only their turn before the final JSONL response', async
       if (previous) console.log(JSON.stringify({ event: 'delta', turnId: previous, text: 'stale' }));
       console.log(JSON.stringify({ event: 'status', turnId: 'stale-turn', text: 'stale status' }));
       console.log(JSON.stringify({ event: 'status', turnId: input.id, text: '스트림 무응답 · 재시도 1/1' }));
-      console.log(JSON.stringify({ event: 'delta', turnId: input.id, text: '첫' }));
+      console.log(JSON.stringify({ event: 'delta', turnId: input.id, text: '첫', source: 'assistant-text' }));
       console.log(JSON.stringify({ event: 'heartbeat', turnId: input.id }));
       console.log(JSON.stringify({ event: '', turnId: input.id }));
       console.log(JSON.stringify({ event: null, turnId: input.id }));
       console.log(JSON.stringify({ event: 'result', turnId: '', reply: 'wrong turn' }));
       await Bun.sleep(30);
-      console.log(JSON.stringify({ event: 'delta', turnId: input.id, text: ' 토큰' }));
+      console.log(JSON.stringify({ event: 'delta', turnId: input.id, text: ' 토큰', source: 'tool-result' }));
       console.log(JSON.stringify({ event: 'result', turnId: input.id, reply: '첫 토큰' }));
       previous = input.id;
     }
@@ -419,14 +419,17 @@ test('delta frames reach only their turn before the final JSONL response', async
   const second: string[] = [];
   const statuses: string[] = [];
   const order: string[] = [];
+  const sources: Array<string | undefined> = [];
   try {
-    await runLocalChatTurn('delta-session', 'one', new AbortController().signal, cli, undefined, (delta) => {
+    await runLocalChatTurn('delta-session', 'one', new AbortController().signal, cli, undefined, (delta, _replace, source) => {
+      sources.push(source);
       first.push(delta);
       order.push('delta');
     }, undefined, [], (line) => { statuses.push(line); order.push('status'); });
     order.push('final');
     await runLocalChatTurn('delta-session', 'two', new AbortController().signal, cli, undefined, (delta) => second.push(delta));
     expect(first).toEqual(['첫', ' 토큰']);
+    expect(sources).toEqual(['assistant-text', undefined]);
     expect(second).toEqual(['첫', ' 토큰']);
     expect(statuses).toEqual(['스트림 무응답 · 재시도 1/1']);
     expect(order).toEqual(['status', 'delta', 'delta', 'final']);

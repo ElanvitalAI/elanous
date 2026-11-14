@@ -18,6 +18,7 @@ import {
   type PathExists,
 } from '../../src/self-implement/heal-triage.js';
 import { appendRunLedgerEntry, loadRunLedger, parseNamespacedRunId, runLedgerDir, type RunLedgerEntry, type RunLedgerWriter } from '../../src/self-implement/run-ledger.js';
+import { normalizeRunId } from '../../src/harness/harness-space.js';
 import { readDoctorVisits } from '../../src/self-implement/doctor-visit.js';
 
 interface GraphContext {
@@ -297,19 +298,27 @@ export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps =
           return withAddedFacts({ outcome: 'fail', reason: 'invalid-failure-event-selector' }, []);
         }
         const since = typeof input.since === 'string' ? input.since : undefined;
-        const event = readFailureInbox({ since }, deps.stateRoot)
-          .filter(row => row.source === selector.source && row.ref === selector.ref)
-          .sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).at(0);
+        let event;
+        try {
+          event = readFailureInbox({ since }, deps.stateRoot)
+            .filter(row => row.source === selector.source && row.ref === selector.ref)
+            .sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).at(0);
+        } catch (error) {
+          return withAddedFacts({ outcome: 'fail', reason: 'failure-inbox-read-error', error: String(error) }, []);
+        }
         if (!event) return withAddedFacts({ outcome: 'empty', reason: 'inbox-event-not-found' }, []);
-        const runId = event.ref;
+        // External failure refs are not necessarily ledger IDs. Only known run IDs have ledger dependencies.
+        const runId = parseNamespacedRunId(event.ref)?.uuid ?? (event.ref === normalizeRunId(event.ref) ? event.ref : '');
         let ledger: RunLedgerEntry[] | null = null;
         let visits: ReturnType<typeof readDoctorVisits> = [];
         try {
-          ledger = deps.loadLedger ? deps.loadLedger(runId)
+          ledger = !runId ? null : deps.loadLedger ? deps.loadLedger(runId)
             : loadRunLedger(runId, deps.ledgerDir ?? (deps.stateRoot ? runLedgerDir(deps.stateRoot) : undefined));
-          visits = deps.readVisits ? deps.readVisits(runId)
+          visits = !runId ? [] : deps.readVisits ? deps.readVisits(runId)
             : readDoctorVisits(runId, deps.ledgerDir || deps.stateRoot ? { dir: deps.ledgerDir ?? runLedgerDir(deps.stateRoot!) } : {});
-        } catch { /* inbox refs can be non-ledger identifiers; absent evidence remains absent */ }
+        } catch (error) {
+          return withAddedFacts({ outcome: 'fail', reason: 'failure-evidence-read-error', error: String(error) }, []);
+        }
         const facts = materializedFacts(ledger ?? []);
         return withAddedFacts({ outcome: 'ok', entries: [{ errorText: event.summary, goalText: event.goalText,
           goalId: event.goalId, goalFile: event.goalFile, ...facts, doctorVisits: visits }], event }, ['errorText', 'materializedPaths', 'doctorVisits']);

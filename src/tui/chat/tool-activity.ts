@@ -30,15 +30,22 @@ export function safeCommandSummary(value: unknown): string | undefined {
     return '(비공개 명령)';
   if (command === '(비공개 명령)') return command;
   const first = command.split(/[|;&<>]/, 1)[0] ?? '';
-  const tokens = first.replace(/"[^"]*"|'[^']*'/g, '[인자]').split(/\s+/).filter(Boolean);
+  const privateFile = '(비공개 파일)';
+  const atomicFile = '__ELANOUS_FILE_MARK__';
+  const tokens = first.replaceAll(privateFile, atomicFile).replace(/"[^"]*"|'[^']*'/g, '[인자]').split(/\s+/).filter(Boolean);
   const safeWords = new Set(['test', 'run', 'build', 'install', 'status', 'diff', 'log', 'show', 'check', 'typecheck', 'lint']);
   return tokens.map((word, index) => {
+    if (word === atomicFile || word === './' + atomicFile) return privateFile;
     if (word === '[인자]') return word;
     if (word.includes('=')) return '[인자]';
-    if (index === 0) return safeToolTarget(word) ?? '명령';
+    if (index === 0) return /^[a-zA-Z0-9_./~\\-]+$/.test(word) ? safeToolTarget(word) ?? '명령' : '명령';
     if (safeWords.has(word) || /^--?[a-zA-Z][a-zA-Z-]*$/.test(word)) return word;
-    if (/[\/\\]/.test(word) || /\.[a-zA-Z0-9]{1,5}$/.test(word))
-      return safeToolTarget(word) ?? '[인자]';
+    // Only explicitly local path-shaped arguments qualify; dots, email addresses and URLs are not file evidence.
+    if (/^(?:\/|\.{1,2}\/|~\/|[a-zA-Z]:[\\/])/.test(word) && !/[@?#]|:\/\//.test(word)) {
+      const target = safeToolTarget(word);
+      // Private placeholders are atomic; safe basenames retain synthetic local provenance.
+      return target === privateFile ? privateFile : './' + (target ?? '[인자]');
+    }
     return '[인자]';
   }).join(' ').slice(0, 40);
 }
@@ -54,7 +61,10 @@ export function safeToolTarget(value: unknown): string | undefined {
     .replace(/(?:^|[a-zA-Z]:)\/(?:Users|home)\/[^/\s]+/g, '~');
   const name = normalized.split('/').at(-1)?.trim();
   if (!name) return undefined;
-  if (/(?:auth|secret|credential|token|member-session|^\.env|^id_rsa|^id_ed25519|sk-|aps_)/i.test(name)) return '(비공개 파일)';
+  // OP50183 / postland #37764 MF1: credential filenames are private even without sensitive contents.
+  if (/(?:auth|secret|credential|token|member-session|^\.env|^id_rsa|^id_ed25519|sk-|aps_)/i.test(name)
+    || /^(?:\.netrc|\.npmrc|\.pypirc)(?:$|[._~-])/i.test(name)
+    || /\.(?:pem|key)(?:$|[._~-])/i.test(name)) return '(비공개 파일)';
   return name.slice(0, 80);
 }
 export function toolActivityTarget(name: string, args: Record<string, unknown>): string | undefined {
@@ -74,6 +84,8 @@ export function updateToolActivity(rows: readonly ToolActivityRow[], event: Publ
     return result;
   }
   const previous = rows.find(row => row.id === event.id);
+  // An evicted/unknown completion must not reinsert an old call and displace newer starts.
+  if (event.phase === 'finish' && !previous) return [...rows];
   const row: ToolActivityRow = {
     id: event.id, name: event.name, target: safeToolActivityTarget(event.name, event.target ?? previous?.target),
     startedAt: previous?.startedAt ?? now,
@@ -86,7 +98,8 @@ export function updateToolActivity(rows: readonly ToolActivityRow[], event: Publ
 export function toolActivityLines(rows: readonly ToolActivityRow[], now: number): string[] {
   return rows.map(row => {
     const name = publicToolName(row.name);
-    const target = safeToolActivityTarget(row.name, row.target);
+    const projectedTarget = safeToolActivityTarget(row.name, row.target);
+    const target = shellTool(row.name) ? projectedTarget?.replace(/(^| )\.\//g, '$1') : projectedTarget;
     const seconds = Math.max(0, Math.floor(((row.finishedAt ?? now) - row.startedAt) / 1000));
     return ['활동', name, target, row.finishedAt === undefined ? '실행 중' : '완료', seconds + '초'].filter(Boolean).join(' · ');
   });

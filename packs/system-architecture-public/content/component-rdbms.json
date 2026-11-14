@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: rdbms",
+  "source": "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html",
+  "body": "무엇: 트랜잭션과 관계형 질의가 필요한 영속 데이터를 보관한다.\n언제: 원자성·제약·조인·정합성이 핵심일 때.\n대안: SQLite 단일 노드 또는 적합한 NoSQL 모델\nAWS: Amazon RDS / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-RDS_48.png\nGCP: Cloud SQL / 공식 제품 아이콘 경로 Unique Icons/Cloud SQL/PNG/CloudSQL-512-color.png\n공식 출처: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html, https://cloud.google.com/sql/docs/introduction\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

@@ -3,6 +3,17 @@ export interface MemberInviteApi {
   claim(handle: string): Promise<{ link: string; handle: string }>;
 }
 
+const MEMBER_SETUP_RECOVERY = '회원 기능이 아직 연결되지 않았습니다. 설치 관리자에게 회원 서비스 설정을 요청해 주세요.';
+
+async function membersNotConfigured(response: Response): Promise<boolean> {
+  if (response.status !== 503) return false;
+  try {
+    const body: unknown = await response.json();
+    return !!body && typeof body === 'object' && !Array.isArray(body)
+      && (body as Record<string, unknown>).error === 'members-not-configured';
+  } catch { return false; }
+}
+
 /** A shareable example-kit email draft; the browser's mail client owns sending. */
 export function memberExampleKitMailto(inviteLink: string): string {
   const subject = 'Elanous 예제 키트 초대';
@@ -22,7 +33,8 @@ export function createMemberInviteApi(baseUrl: string, fetchImpl: typeof fetch =
   return {
     async read() {
       const response = await fetchImpl(endpoint, { credentials: 'include', headers: { accept: 'application/json' } });
-      if (!response.ok) throw new Error(response.status === 401 ? '회원 로그인 후 초대 링크를 확인해 주세요.' : `초대 링크 요청 실패 (HTTP ${response.status})`);
+      if (!response.ok) throw new Error(response.status === 401 ? '회원 로그인 후 초대 링크를 확인해 주세요.'
+        : await membersNotConfigured(response) ? MEMBER_SETUP_RECOVERY : `초대 링크 요청 실패 (HTTP ${response.status})`);
       const body = await response.json() as { inviteLink?: unknown; referralCount?: unknown; member?: { handle?: unknown; canClaimHandle?: unknown } };
       const handle = body.member?.handle;
       if (handle !== null && (typeof handle !== 'string' || !/^[a-z][a-z0-9_]{2,29}$/.test(handle))) throw new Error('회원 ID 응답이 올바르지 않습니다.');
@@ -35,7 +47,8 @@ export function createMemberInviteApi(baseUrl: string, fetchImpl: typeof fetch =
       const response = await fetchImpl(`${endpoint}/handle`, { method: 'PUT', credentials: 'include',
         headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ handle }) });
       if (!response.ok) throw new Error(response.status === 409 ? '이미 사용 중이거나 변경할 수 없는 회원 ID입니다.'
-        : response.status === 401 ? '회원 로그인 후 다시 시도해 주세요.' : '회원 ID를 설정하지 못했습니다.');
+        : response.status === 401 ? '회원 로그인 후 다시 시도해 주세요.'
+          : await membersNotConfigured(response) ? MEMBER_SETUP_RECOVERY : '회원 ID를 설정하지 못했습니다.');
       const body = await response.json() as { handle?: unknown; inviteLink?: unknown };
       if (typeof body.handle !== 'string' || body.handle !== handle) throw new Error('회원 ID 응답이 올바르지 않습니다.');
       return { handle: body.handle, link: verifiedLink(body.inviteLink, body.handle) };

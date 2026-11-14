@@ -3,6 +3,27 @@
   "name": "Elanous App Deploy",
   "version": "0.3.9",
   "description": "Build, simulate and publish a registered Elanous app through the shared app lifecycle.",
+  "whenToUse": "등록된 Elanous 앱의 시뮬레이션을 실행하고, 게시 hook과 회원 소유자·확인 채널이 준비된 경우 승인 후 게시할 때 사용한다. 현재 static-export와 AppManifest SQL/RPC 계약을 사용하며 임의 Bun 서버 게시를 보장하지 않는다. hook이 없으면 시뮬레이션 결과만 반환한다.",
+  "inputs": {
+    "appId": "실제로 등록되고 시뮬레이션 가능한 앱 slug",
+    "requestText": "사용자가 요청한 변경 또는 게시 작업"
+  },
+  "outputs": {
+    "status": "simulated, published, rejected 또는 failed",
+    "simulationReceipt": "해당 앱의 통과 시뮬레이션 영수증",
+    "publicUrl": "실제 검증까지 끝난 published 결과에만 존재하는 URL"
+  },
+  "examples": [
+    "등록된 앱을 시뮬레이션하고 승인 후 게시해 줘",
+    "기존 앱의 게시 가능 여부와 검증된 결과 URL을 확인해 줘"
+  ],
+  "requires": {
+    "memberConnection": true,
+    "appKinds": [
+      "static-export"
+    ],
+    "confirmation": true
+  },
   "main": "./plugin.ts",
   "activationEvents": [
     "onRoute"

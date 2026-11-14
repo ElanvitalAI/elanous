@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "아키텍처 패턴: local-single-node",
+  "source": "https://www.sqlite.org/whentouse.html",
+  "body": "언제: 작은 팀의 개발·시연·내부 운영이며 단일 호스트 장애 허용이 명시될 때.\n구성: browser, Bun/Node/Python process, SQLite file, local logs\n배치: 브라우저는 호스트 밖, 앱 프로세스와 SQLite 파일은 같은 호스트; 선택적 Tailscale Serve는 tailnet 회원 내부 접근만 허용한다. 파일 백업과 단일 장애 지점을 표시한다.\n예시 레이아웃 참고: left browser → center local process → right SQLite; logs below process\n클라우드 대응: {\"Bun/Node/Python process\": \"Cloud Run / AWS Lambda or ECS\", \"SQLite file\": \"Cloud SQL / Amazon RDS\"}\n결정과 반증: 요구사항에서 노드와 간선을 다시 선택한다. 이 예시를 고정 도식으로 복사하지 않는다."
+}

@@ -15,7 +15,7 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 //   - 대시보드는 tool-runtime 레지스트리에 `toolSearchRuntime` 이 등록돼 있어 자동.
 
 import { dispatchToolSearch } from './tool-search.js';
-import { TOOL_SEARCH_NAME } from './tool-search-spec.js';
+import { CAPABILITY_SEARCH_NAME, TOOL_SEARCH_NAME } from './tool-search-spec.js';
 import { debug } from '../../debug/log.js';
 
 
@@ -23,7 +23,7 @@ export { TOOL_SEARCH_NAME };
 
 /** 이 이름이 소환기인가. 각 서피스 dispatch 의 첫 분기. */
 export function isToolSearchCall(name: string): boolean {
-  return name === TOOL_SEARCH_NAME;
+  return name === TOOL_SEARCH_NAME || name === CAPABILITY_SEARCH_NAME;
 }
 
 /**
@@ -36,7 +36,7 @@ export function isToolSearchCall(name: string): boolean {
 export function routeToolSearch(
   args: Record<string, unknown>,
   surfaceSpecs: readonly LLMToolSpec[],
-  meta: { surface: string; activePluginIds?: ReadonlySet<string> },
+  meta: { surface: string; activePluginIds?: ReadonlySet<string>; requireQueryCoverage?: boolean },
 ): unknown {
   const query = typeof args.query === 'string' ? args.query : '';
   if (!query.trim()) return { error: 'ToolSearch: `query` is required' };
@@ -45,7 +45,7 @@ export function routeToolSearch(
       query,
       ...(typeof args.max_results === 'number' ? { max_results: args.max_results } : {}),
     },
-    { specs: surfaceSpecs, surface: meta.surface,
+    { specs: surfaceSpecs, surface: meta.surface, requireQueryCoverage: meta.requireQueryCoverage,
       activePluginIds: meta.activePluginIds ?? new Set(surfaceSpecs.flatMap((spec) => spec.pluginId ? [spec.pluginId] : [])) },
   );
   debug.log('capability.resolve', 'tool-search', {

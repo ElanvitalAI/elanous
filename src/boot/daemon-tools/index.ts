@@ -1,3 +1,5 @@
+import { buildInstalledPackQueryTool, dispatchInstalledPackQuery } from '../installed-pack-query.js';
+import { buildCapabilitySearchTool, CAPABILITY_SEARCH_NAME } from '../../skills/tools/tool-search-spec.js';
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // MVP M1.5 A.2 — daemon tool surface registry.
 //
@@ -321,6 +323,8 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
   const capped = nestCapReached();
   if (capped) debug.log('substrate.nest', 'surface-capped', nestInfo(), { level: 'warn' });
   const chatSpecs: LLMToolSpec[] = [
+    buildInstalledPackQueryTool(),
+    buildCapabilitySearchTool(),
     ...readonlySpecs,
     buildEditTool(),
     buildWriteTool(),
@@ -352,6 +356,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     args: Record<string, unknown>,
     ctx: DaemonToolDispatchCtx,
   ): Promise<unknown> => {
+    if (name === 'KnowledgeQuery') return dispatchInstalledPackQuery(args);
     if (READONLY_TOOL_NAMES.has(name)) {
       switch (name) {
         case 'Read':
@@ -439,7 +444,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         args: Record<string, unknown>,
         ctx: DaemonToolDispatchCtx,
       ): Promise<unknown> {
-        if (isToolSearchCall(name)) return routeToolSearch(args, chatLive.specs(), { surface: 'daemon-chat' });
+        if (isToolSearchCall(name)) return routeToolSearch(args, chatLive.specs(), { surface: 'daemon-chat', requireQueryCoverage: name === CAPABILITY_SEARCH_NAME });
         const chatRegistryName = chatLive.registryNameOf(name);
         if (chatRegistryName) return dispatchDaemonMcpRuntime(chatRegistryName, args, ctx);
         const result = await dispatchChatTool(name, args, ctx);
@@ -504,7 +509,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     ): Promise<unknown> {
       // ⭐ 소환기 먼저 — webterm 이 defer 하는 배틀쉽(SelfImplement·RunDevHarness·
       //   도구의 스키마를 하이드레이트할 유일한 경로.
-      if (isToolSearchCall(name)) return routeToolSearch(args, webtermLive.specs(), { surface: 'daemon-webterm' });
+      if (isToolSearchCall(name)) return routeToolSearch(args, webtermLive.specs(), { surface: 'daemon-webterm', requireQueryCoverage: name === CAPABILITY_SEARCH_NAME });
       const webtermRegistryName = webtermLive.registryNameOf(name);
       if (webtermRegistryName) return dispatchDaemonMcpRuntime(webtermRegistryName, args, ctx);
       if (name === 'BrowserNavigate') {

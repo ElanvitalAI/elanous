@@ -247,7 +247,7 @@ test('private ledger persists member limits and directional totals across relay 
       expect(second.charge('member-a', 'new-connection', 3)).toBe('allowed');
       expect(second.usage('member-a')).toEqual({ minute: Math.floor(now() / 60_000), ingressBytes: 7, egressBytes: 3 });
       expect(secondStore.monthUsage('member-a', 2026, 11)).toEqual({
-        minute: Date.UTC(2026, 10, 1) / 60_000, ingressBytes: 7, egressBytes: 3,
+        minute: Date.parse('2026-11-01T00:00:00+09:00') / 60_000, ingressBytes: 7, egressBytes: 3,
       });
       expect(secondStore.monthUsage('member-b', 2026, 11).egressBytes).toBe(6);
     } finally { secondStore.close(); }

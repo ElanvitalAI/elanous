@@ -1,0 +1,7 @@
+{
+  "eventTitle": "샘플 공연",
+  "eventDate": "미정",
+  "venue": "미정",
+  "seatCount": 24,
+  "sampleFields": ["공연명", "공연일", "장소", "좌석 수"]
+}

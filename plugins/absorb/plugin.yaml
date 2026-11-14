@@ -3,6 +3,11 @@ id: absorb
 name: Absorb
 version: 0.3.9
 description: Member-owned scrap absorption, daily briefing, and app upgrade suggestion graph.
+whenToUse: "회원 본인의 링크·텍스트·미디어를 스크랩에 저장하거나, 저장한 자료의 오늘 브리핑과 근거 기반 앱 제안을 조회할 때 사용한다. 앱 생성·게시 하위 흐름은 해당 도구의 입력·소유자·승인 및 게시 형식 조건을 별도로 충족해야 한다."
+inputs: {"kind": "해당 도구가 선언한 web, text, pdf 등 자료 종류", "source": "해당 도구 스키마의 url, text 또는 mediaRef", "suggestion": "앱 생성 흐름에서 요구하는 저장된 제안 식별자"}
+outputs: {"scrap": "인증된 회원 소유 스크랩", "briefing": "회원 자료에 근거한 브리핑", "suggestions": "근거 스크랩과 연결된 앱 개선 제안"}
+examples: ["이 자료를 내 스크랩에 저장해 줘", "내가 저장한 자료의 오늘 브리핑과 제안을 확인해 줘"]
+requires: {"memberConnection": true}
 # Source: graph/absorb-build.yaml uses the host app-publish action today; the app-deploy plugin is an optional integration.
 dependencies:
   plugins:

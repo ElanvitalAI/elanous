@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: api-gateway",
+  "source": "https://docs.aws.amazon.com/apigateway/latest/developerguide/welcome.html",
+  "body": "무엇: API 입구에서 라우팅과 정책을 중앙 관리한다.\n언제: 여러 API나 서버리스 엔드포인트에 공통 인증·제한·버전 정책이 필요할 때.\n대안: 앱 또는 프록시에서 직접 라우팅\nAWS: Amazon API Gateway / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-API-Gateway_48.png\nGCP: API Gateway / 공식 Integration Services 범주 아이콘 경로 Category Icons/Integration Services/PNG/IntegrationServices-512-color.png (API Gateway 제품 전용 아이콘 아님)\n공식 출처: https://docs.aws.amazon.com/apigateway/latest/developerguide/welcome.html, https://cloud.google.com/api-gateway/docs/about-api-gateway\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

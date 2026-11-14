@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: object-storage",
+  "source": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html",
+  "body": "무엇: 파일과 정적 객체를 내구성 있게 보관한다.\n언제: 업로드·미디어·백업·정적 배포 등 객체 단위 접근이 있을 때.\n대안: 로컬 파일 시스템 또는 블록 저장소\nAWS: Amazon S3 / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Storage/48/Arch_Amazon-Simple-Storage-Service_48.png\nGCP: Cloud Storage / 공식 제품 아이콘 경로 Unique Icons/Cloud Storage/PNG/Cloud_Storage-512-color.png\n공식 출처: https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html, https://cloud.google.com/storage/docs/introduction\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: cdn",
+  "source": "https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Introduction.html",
+  "body": "무엇: 정적 또는 캐시 가능한 응답을 사용자 가까이에 전달한다.\n언제: 지리적으로 분산된 읽기 부하나 큰 정적 자산이 있을 때. 개인화 응답 캐시 정책을 먼저 정한다.\n대안: 원본 서버 직접 전달\nAWS: Amazon CloudFront / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-CloudFront_48.png\nGCP: Cloud CDN / 공식 범주 아이콘 경로 Category Icons/Networking/PNG/Networking-512-color.png\n공식 출처: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Introduction.html, https://cloud.google.com/cdn/docs/overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

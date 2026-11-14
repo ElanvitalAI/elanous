@@ -1,0 +1,13 @@
+{
+  "kind": "knowledge-pack",
+  "name": "ticketing-app-starter-public",
+  "version": "0.1.0",
+  "description": "One concise, source-linked card for a concert ticketing app starter with durable seat state, same-origin frontend, tests and honest publication status.",
+  "signature": { "alg": "ed25519", "keyId": "00000000" },
+  "dependencies": [],
+  "license": "CC-BY-4.0",
+  "visibility": "public",
+  "content": [
+    { "type": "document", "path": "content/01-build-test-preview.json" }
+  ]
+}

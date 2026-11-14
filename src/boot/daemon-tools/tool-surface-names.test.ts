@@ -26,11 +26,15 @@ const financeOn = { finance: { enabled: true } } as unknown as UserConfig;
 const READONLY = ['Read', 'Grep', 'WebSearch', 'Plan', 'MarkStepDone'];
 // chat = readonly + 코딩코어 편집/실행(Edit/Write/Bash) + delegate + L2 core(schedule_manage…mission_decide).
 const CHAT_CORE = [
+  // #37807 pack-only query and parent #37791 discovery are intentional chat/webterm tools.
+  'KnowledgeQuery', 'capability_search',
   ...READONLY,
   'Edit', 'Write', 'Bash', 'delegate_code_agent',
   'SelfImplement', 'AskUserQuestion', 'AcpSessionCreate', 'AcpSessionSend', 'AcpSessionClose',
   'AcpSessionList', 'AcpSessionResume', 'AcpSessionSpawnSub', 'AcpSessionStartBackground',
   'AcpSessionStatus', 'AcpSessionCancel', 'AcpSessionJoin', 'AcpPlanThenExecute',
+  // Parent's Firecrawl plugin is callable on both finance-off and finance-on surfaces.
+  'firecrawl',
   'schedule_manage', 'session_manage', 'memory_recall', 'memory_save', 'fact_check', 'self_recall', 'context_now',
   'autopilot_missions', 'ops_status', 'se_build', 'logs_query', 'mission_decide', 'coo_admin',
   // SYNC1 ① #23007 — owner-only read tools; names are listed, dispatch refuses without a server-verified owner (like release_change).

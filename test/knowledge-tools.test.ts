@@ -1,7 +1,7 @@
 // ── PFC-S4.2 + S4.3 tool layer ──
 
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../src/debug/log';
@@ -54,7 +54,21 @@ describe('KnowledgeQuery tool', () => {
     expect(selections).toBe(0);
   });
 
-  test('auto-select failure is observed and falls back to the vault query', async () => {
+  test('pack.load records selected document identity and digest only after a pack hit', async () => {
+    const events: LogRecord[] = [];
+    const unregister = debug.registerSink({ name: 'knowledge-pack-load-receipt-test', emit: event => events.push(event) });
+    try {
+      await dispatchKnowledgeQuery({ question: '아키텍처' }, { selectPack: () => ({ id: 'pack:sysarch@1.0.0', title: 'Architecture' }),
+        searchPack: () => [{ id: 'component-cdn', ref: 'pack:sysarch@1.0.0#component-cdn', title: 'CDN', body: 'official summary', updatedAt: '2026-11-14' }] });
+      expect(events).toContainEqual(expect.objectContaining({ category: 'pack.load', event: 'document',
+        data: expect.objectContaining({ packId: 'pack:sysarch@1.0.0', documentId: 'component-cdn', documentSha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }) }));
+      events.length = 0;
+      await dispatchKnowledgeQuery({ question: '아키텍처' }, { selectPack: () => ({ id: 'pack:sysarch@1.0.0', title: 'Architecture' }), searchPack: () => [] });
+      expect(events.some(event => event.category === 'pack.load')).toBe(false);
+    } finally { unregister(); }
+  });
+
+  test('auto-select storage failure stays explicit instead of masquerading as an empty vault result', async () => {
     const vault = seedVault();
     const events: LogRecord[] = [];
     const unregister = debug.registerSink({ name: 'knowledge-query-test', emit: event => events.push(event) });
@@ -64,15 +78,142 @@ describe('KnowledgeQuery tool', () => {
         selectPack: () => { throw new Error('KGS store unavailable'); },
       });
 
-      expect(result.pack_hits).toBeUndefined();
-      expect(result.total).toBe(1);
-      expect(result.results[0]?.relPath).toBe('Incidents/a.md');
+      expect(result.pack_hits).toEqual([]);
+      expect(result.total).toBe(0);
+      expect(result.output).toContain('KGS store unavailable');
       expect(events).toContainEqual(expect.objectContaining({
         category: 'knowledge-pack.select', event: 'failed', level: 'warn',
-        data: expect.objectContaining({ fallback: 'vault', errorType: 'Error' }),
+        data: expect.objectContaining({ fallback: 'none', errorType: 'Error' }),
       }));
     } finally {
       unregister();
+    }
+  });
+
+  test('shipped system architecture pack on/off uses the same request without persistent installation', async () => {
+    const vault = seedVault();
+    for (const question of ['FE BE DB 시험 배포 아키텍처 설계', '동네 도서관 대출 사이트 구조와 API DB 시험 배포 절차를 설계해줘']) {
+      const on = await dispatchKnowledgeQuery({ question }, { vault, resolvePack: () => ({ kind: 'none' }), bundledSystemArchitecture: true });
+      const off = await dispatchKnowledgeQuery({ question }, { vault, resolvePack: () => ({ kind: 'none' }), bundledSystemArchitecture: false });
+      expect(on.selectedPack?.id).toBe('pack:system-architecture-public@0.2.0');
+      expect(on.pack_hits?.[0]?.ref).toContain('pack:system-architecture-public@0.2.0#');
+      expect(off.selectedPack).toBeUndefined();
+      expect(off.pack_hits).toEqual([]);
+      expect(off.reason).toBe('pack-disabled');
+    }
+    const unrelated = await dispatchKnowledgeQuery({ question: '오늘 9시 알림 설정' }, { vault, resolvePack: () => ({ kind: 'none' }) });
+    expect(unrelated.selectedPack).toBeUndefined();
+    expect(unrelated.pack_hits).toEqual([]);
+    const previousArm = process.env.ELANOUS_SYSTEM_ARCH_PACK;
+    try {
+      process.env.ELANOUS_SYSTEM_ARCH_PACK = 'off';
+      const envOff = await dispatchKnowledgeQuery({ question: 'FE BE DB 시험 배포 아키텍처 설계' },
+        { vault, resolvePack: () => ({ kind: 'none' }) });
+      expect(envOff.selectedPack).toBeUndefined();
+      expect(envOff.pack_hits).toEqual([]);
+      expect(envOff.reason).toBe('pack-disabled');
+    } finally {
+      if (previousArm === undefined) delete process.env.ELANOUS_SYSTEM_ARCH_PACK;
+      else process.env.ELANOUS_SYSTEM_ARCH_PACK = previousArm;
+    }
+  });
+
+  test('negated architecture wording in deploy and photo requests does not load bundled or installed architecture cards', async () => {
+    const vault = seedVault();
+    const prompts = [
+      '기존 앱 배포만 해줘. 아키텍처 설계는 필요 없어.',
+      '사진만 검색해 줘. 시스템 설계는 하지 마.',
+    ];
+    for (const question of prompts) {
+      const bundled = await dispatchKnowledgeQuery({ question }, { vault, resolvePack: () => ({ kind: 'none' }), bundledSystemArchitecture: true });
+      expect(bundled.selectedPack).toBeUndefined();
+      expect(bundled.pack_hits).toEqual([]);
+      expect(bundled.reason).toBe('architecture-not-requested');
+      const installed = await dispatchKnowledgeQuery({ question }, { vault,
+        resolvePack: () => ({ kind: 'selected', pack: { id: 'pack:system-architecture-public@0.2.0', title: 'system architecture' }, priority: 1, intentTags: [] }),
+        bundledSystemArchitecture: true,
+        searchPack: () => { throw new Error('negated architecture pack must not be searched'); },
+      });
+      expect(installed.selectedPack).toBeUndefined();
+      expect(installed.pack_hits).toEqual([]);
+      expect(installed.reason).toBe('architecture-not-requested');
+    }
+  });
+
+  test('backend architecture remains selected on either side of a UI-design exclusion', async () => {
+    for (const question of [
+      '기존 UI 설계는 필요 없어. 대신 새 백엔드 시스템 아키텍처를 설계해줘.',
+      '새 백엔드 시스템 아키텍처를 설계해줘. 기존 UI 설계는 필요 없어.',
+    ]) {
+      const result = await dispatchKnowledgeQuery({ question }, {
+        resolvePack: () => ({ kind: 'none' }), bundledSystemArchitecture: true,
+      });
+      expect(result.selectedPack?.id).toBe('pack:system-architecture-public@0.2.0');
+      expect(result.pack_hits?.[0]?.ref).toContain('pack:system-architecture-public@0.2.0#');
+    }
+  });
+
+  test('copy edit of architecture wording alone does not load design cards', async () => {
+    const question = '아키텍처 설계 문구 오탈자만 수정해줘.';
+    for (const resolvePack of [
+      () => ({ kind: 'none' as const }),
+      () => ({ kind: 'selected' as const, pack: { id: 'pack:system-architecture-public@0.2.0', title: 'system architecture' }, priority: 1, intentTags: [] }),
+    ]) {
+      const result = await dispatchKnowledgeQuery({ question }, { resolvePack,
+        searchPack: () => { throw new Error('copy edit must not search architecture pack'); } });
+      expect(result.selectedPack).toBeUndefined();
+      expect(result.pack_hits).toEqual([]);
+      expect(result.reason).toBe('architecture-not-requested');
+    }
+  });
+
+  test('trustedPackOnly fulltext never reads a supplied or discovered vault', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'knowledge-trusted-pack-'));
+    const absentVault = join(root, 'must-stay-absent');
+    const seededVault = seedVault();
+    writeFileSync(join(seededVault.root, 'Incidents', 'secret.md'), '# SYNTHETIC_VAULT_MARKER');
+    const previousVault = process.env.ELANOUS_OBSIDIAN_VAULT;
+    const opts = { trustedPackOnly: true, resolvePack: () => ({ kind: 'none' as const }) };
+    Object.defineProperty(opts, 'vault', { get: () => { throw new Error('vault read forbidden'); } });
+    try {
+      process.env.ELANOUS_OBSIDIAN_VAULT = absentVault;
+      const noPack = await dispatchKnowledgeQuery({ fulltext: 'SYNTHETIC_VAULT_MARKER' }, opts);
+      expect(noPack.reason).toBe('no-matching-pack');
+      expect(noPack.results).toEqual([]);
+      expect(noPack.output).not.toContain('SYNTHETIC_VAULT_MARKER');
+      const seeded = await dispatchKnowledgeQuery({ fulltext: 'SYNTHETIC_VAULT_MARKER' },
+        { trustedPackOnly: true, vault: seededVault, resolvePack: () => ({ kind: 'none' }) });
+      expect(seeded.results).toEqual([]);
+      expect(seeded.total).toBe(0);
+      const packOnly = await dispatchKnowledgeQuery({ question: '백엔드 시스템 아키텍처 설계', fulltext: 'API' }, opts);
+      expect(packOnly.selectedPack?.id).toBe('pack:system-architecture-public@0.2.0');
+      expect(packOnly.pack_hits?.[0]?.ref).toContain('pack:system-architecture-public@0.2.0#');
+      expect(packOnly.results).toEqual([]);
+      expect(existsSync(absentVault)).toBe(false);
+    } finally {
+      if (previousVault === undefined) delete process.env.ELANOUS_OBSIDIAN_VAULT;
+      else process.env.ELANOUS_OBSIDIAN_VAULT = previousVault;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(seededVault.root, { recursive: true, force: true });
+    }
+  });
+
+  test('no pack for a question returns a reason without creating an Obsidian vault directory', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'knowledge-no-pack-'));
+    const absentVault = join(root, 'must-stay-absent');
+    const previousVault = process.env.ELANOUS_OBSIDIAN_VAULT;
+    try {
+      process.env.ELANOUS_OBSIDIAN_VAULT = absentVault;
+      const result = await dispatchKnowledgeQuery({ question: '오늘 9시 알림 설정' },
+        { resolvePack: () => ({ kind: 'none' }) });
+      expect(result.reason).toBe('no-matching-pack');
+      expect(result.pack_hits).toEqual([]);
+      expect(result.results).toEqual([]);
+      expect(existsSync(absentVault)).toBe(false);
+    } finally {
+      if (previousVault === undefined) delete process.env.ELANOUS_OBSIDIAN_VAULT;
+      else process.env.ELANOUS_OBSIDIAN_VAULT = previousVault;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

@@ -1,3 +1,4 @@
+import { withCapabilityDiscoveryDescription } from './capability-discovery.js';
 // ── Plugin host — discovery, lifecycle, slash contribution ──
 // Loads plugins from `<repo>/plugins/<name>/plugin.ts` (built-in) and
 // `~/.claude/plugins/<name>/plugin.ts` (user). User-scope plugins with
@@ -1762,7 +1763,7 @@ export class PluginHost {
       if (!manifest) return tool;
       return {
         ...tool,
-        description: manifest.description || tool.description,
+        description: withCapabilityDiscoveryDescription(manifest.description || tool.description, entry.manifest),
         parameters: manifest.parameters ?? (manifest.schema ? this.loadAIToolSchema(entry, manifest.schema) : tool.parameters),
         ...(manifest.route ? { pluginId: entry.manifest.id, route: manifest.route } : {}),
       };
@@ -1772,7 +1773,7 @@ export class PluginHost {
       if (runtimeNames.has(manifest.name) || !manifest.handler) continue;
       resolved.push({
         name: manifest.name,
-        description: manifest.description,
+        description: withCapabilityDiscoveryDescription(manifest.description, entry.manifest),
         parameters: manifest.parameters ?? (manifest.schema ? this.loadAIToolSchema(entry, manifest.schema) : { type: 'object', properties: {} }),
         handler: await this.loadAIToolHandler(entry, manifest.handler, manifest.name),
         ...(manifest.route ? { pluginId: entry.manifest.id, route: manifest.route } : {}),

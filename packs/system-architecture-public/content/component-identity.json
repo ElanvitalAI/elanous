@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: identity",
+  "source": "https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html",
+  "body": "무엇: 서비스와 사용자의 인증·권한 경계를 정의한다.\n언제: 역할별 데이터나 운영 권한이 다를 때. 최소 권한으로 설계한다.\n대안: 로컬 앱 자체 세션과 권한 저장소\nAWS: AWS IAM / IAM Identity Center / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Security-Identity/48/Arch_AWS-IAM-Identity-Center_48.png\nGCP: Cloud IAM / Identity Platform / 공식 범주 아이콘 경로 Category Icons/Security Identity/PNG/SecurityIdentity-512-color.png\n공식 출처: https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html, https://cloud.google.com/iam/docs/overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: load-balancer",
+  "source": "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html",
+  "body": "무엇: 요청을 여러 백엔드로 분산하고 상태를 검사한다.\n언제: 여러 인스턴스나 지역으로 가용성과 처리량을 늘릴 때.\n대안: 단일 서버 직접 연결\nAWS: Application Load Balancer / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Elastic-Load-Balancing_48.png\nGCP: Application Load Balancer / 공식 범주 아이콘 경로 Category Icons/Networking/PNG/Networking-512-color.png\n공식 출처: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html, https://cloud.google.com/load-balancing/docs/load-balancing-overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

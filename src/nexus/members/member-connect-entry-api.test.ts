@@ -1,10 +1,13 @@
 import { expect, test } from 'bun:test';
 import { createMemberConnectEntry } from './member-connect-entry-api.js';
+import type { MemberStore } from './member-store.js';
 
 const origin = 'https://api.elanous.ai';
 const state = 's'.repeat(43);
 const challenge = 'c'.repeat(43);
 const pollSecret = 'p'.repeat(43);
+const withActiveForAuth: MemberStore['withActiveForAuth'] = (_memberId, effect) =>
+  ({ active: true, value: effect() });
 const post = (url: string, body: unknown, headers: Record<string, string> = {}) =>
   new Request(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
 
@@ -13,7 +16,7 @@ test('approved browser member alone creates a PKCE-bound code; foreign member, C
   const created: Array<Record<string, unknown>> = [];
   const api = createMemberConnectEntry({ origin, now: () => at,
     memberForRequest: request => request.headers.get('x-member'),
-    store: {
+    store: { activeForAuth: () => true, withActiveForAuth,
       ensureNativeAppSlotForMember: memberId => ({ memberId, appId: `app-${memberId}` }) as never,
       createAppAuthCode: input => { created.push(input); },
     },
@@ -68,7 +71,7 @@ test('expired or unavailable issuer refuses without a code', async () => {
   let at = Date.parse('2026-11-14T00:00:00.000Z');
   let issued = 0;
   const api = createMemberConnectEntry({ origin, now: () => at, memberForRequest: () => 'member-a',
-    store: { ensureNativeAppSlotForMember: () => ({ appId: 'app-a' }) as never,
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => ({ appId: 'app-a' }) as never,
       createAppAuthCode: () => { issued++; } } });
   const start = await api.handle(post(`${origin}/v1/members/connect/start`, { state, codeChallenge: challenge, pollSecret }));
   const { approvalUrl } = await start!.json() as { approvalUrl: string };
@@ -76,14 +79,14 @@ test('expired or unavailable issuer refuses without a code', async () => {
   expect((await api.handle(new Request(approvalUrl)))?.status).toBe(404);
   expect(issued).toBe(0);
   const disabled = createMemberConnectEntry({ origin, enabled: false, memberForRequest: () => null,
-    store: { ensureNativeAppSlotForMember: () => null } });
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => null } });
   expect((await disabled.handle(post(`${origin}/v1/members/connect/start`, { state, codeChallenge: challenge, pollSecret })))?.status).toBe(503);
 });
 
 test('start refuses an oversized stream before buffering it', async () => {
   let cancelled = false;
   const api = createMemberConnectEntry({ origin, memberForRequest: () => null,
-    store: { ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => {} } });
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => {} } });
   const request = new Request(`${origin}/v1/members/connect/start`, { method: 'POST',
     body: new ReadableStream<Uint8Array>({
       start(controller) { controller.enqueue(new Uint8Array(4097)); },
@@ -97,7 +100,7 @@ test('start refuses an oversized stream before buffering it', async () => {
 test('concurrent approval bodies issue only one auth code', async () => {
   let issued = 0;
   const api = createMemberConnectEntry({ origin, memberForRequest: () => 'member-a',
-    store: { ensureNativeAppSlotForMember: () => ({ appId: 'app-a' }) as never,
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => ({ appId: 'app-a' }) as never,
       createAppAuthCode: () => { issued++; } } });
   const start = await api.handle(post(`${origin}/v1/members/connect/start`, { state, codeChallenge: challenge, pollSecret }));
   const { approvalUrl, userCode } = await start!.json() as { approvalUrl: string; userCode: string };
@@ -125,7 +128,7 @@ test('approval body crossing expiry and expiry during slot lookup issue no code'
   let issued = 0;
   let expireDuringSlot = false;
   const api = createMemberConnectEntry({ origin, now: () => at, memberForRequest: () => 'member-a',
-    store: { ensureNativeAppSlotForMember: () => {
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => {
       if (expireDuringSlot) at += 120_000;
       return { appId: 'app-a' } as never;
     }, createAppAuthCode: () => { issued++; } } });
@@ -157,7 +160,7 @@ test('approval body crossing expiry and expiry during slot lookup issue no code'
 test('public start is limited per trusted caller and recovers after expiry', async () => {
   let at = Date.parse('2026-11-14T00:00:00.000Z');
   const api = createMemberConnectEntry({ origin, now: () => at, memberForRequest: () => null,
-    store: { ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => {} } });
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => {} } });
   const start = (caller: string) => api.handle(post(`${origin}/v1/members/connect/start`,
     { state, codeChallenge: challenge, pollSecret }), caller);
   for (let index = 0; index < 3; index++) expect((await start('ipv4:203.0.113.1'))?.status).toBe(201);
@@ -174,7 +177,7 @@ test('public start is limited per trusted caller and recovers after expiry', asy
 test('start attempt window runs before body read, bounds caller map and recovers', async () => {
   let at = Date.parse('2026-11-14T00:00:00.000Z');
   const api = createMemberConnectEntry({ origin, now: () => at, memberForRequest: () => null,
-    store: { ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => {} } });
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => {} } });
   const invalid = (caller: string) => api.handle(post(`${origin}/v1/members/connect/start`, {}), caller);
   for (let index = 0; index < 8; index++) expect((await invalid('caller-a'))?.status).toBe(400);
   const blocked = new Request(`${origin}/v1/members/connect/start`, { method: 'POST',
@@ -191,7 +194,7 @@ test('start attempt window runs before body read, bounds caller map and recovers
 
 test('failed poll secrets are bounded and a consumed code is delivered only once', async () => {
   const api = createMemberConnectEntry({ origin, memberForRequest: () => 'member-a',
-    store: { ensureNativeAppSlotForMember: () => ({ appId: 'app-a' }) as never,
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => ({ appId: 'app-a' }) as never,
       createAppAuthCode: () => {} } });
   const create = async () => {
     const started = await api.handle(post(`${origin}/v1/members/connect/start`, { state, codeChallenge: challenge, pollSecret }));
@@ -225,4 +228,88 @@ test('failed poll secrets are bounded and a consumed code is delivered only once
   const bResult = api.handle(b.request);
   a.release(); b.release();
   expect([(await aResult)?.status, (await bResult)?.status].sort()).toEqual([200, 404]);
+});
+
+test('stalled start and poll streams return at the read deadline even if cancellation never settles', async () => {
+  // Exercise actual stream/timer cancellation; a shorter private seam avoids waiting the production five seconds.
+  let cancellations = 0;
+  let issued = 0;
+  const api = createMemberConnectEntry({ origin, bodyReadTimeoutMs: 5, memberForRequest: () => 'member-a',
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => { issued++; } } });
+  const stalled = () => new ReadableStream<Uint8Array>({
+    pull() { return new Promise<void>(() => {}); },
+    cancel() { cancellations++; return new Promise<void>(() => {}); },
+  });
+  const startPath = origin + '/v1/members/connect/start';
+  expect((await api.handle(new Request(startPath, { method: 'POST', body: stalled() })))?.status).toBe(400);
+  const state = 's'.repeat(43), codeChallenge = 'c'.repeat(43), pollSecret = 'p'.repeat(43);
+  const started = await api.handle(post(startPath, { state, codeChallenge, pollSecret }));
+  expect(started?.status).toBe(201);
+  const { id } = await started!.json() as { id: string };
+  const poll = origin + '/v1/members/connect/poll?id=' + id;
+  expect((await api.handle(new Request(poll, { method: 'POST', body: stalled() })))?.status).toBe(404);
+  expect((await api.handle(post(poll, { pollSecret })))?.status).toBe(202);
+  expect(cancellations).toBe(2);
+  expect(issued).toBe(0);
+});
+
+test('request abort cancels a body read without waiting for the body deadline or issuing a code', async () => {
+  const abort = new AbortController();
+  let cancelled = false;
+  const api = createMemberConnectEntry({ origin, memberForRequest: () => null,
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => { throw new Error('must not issue'); } } });
+  const pending = api.handle(new Request(origin + '/v1/members/connect/start', {
+    method: 'POST', signal: abort.signal,
+    body: new ReadableStream<Uint8Array>({ pull() { return new Promise<void>(() => {}); }, cancel() { cancelled = true; } }),
+  }));
+  abort.abort();
+  expect((await pending)?.status).toBe(400);
+  expect(cancelled).toBe(true);
+});
+
+test('already-aborted connect requests cancel their unread stream even if cancellation never settles', async () => {
+  let cancelled = false;
+  const abort = new AbortController();
+  abort.abort();
+  const body = new ReadableStream<Uint8Array>({
+    pull() { return new Promise<void>(() => {}); },
+    cancel() { cancelled = true; return new Promise<void>(() => {}); },
+  });
+  const api = createMemberConnectEntry({ origin, memberForRequest: () => null,
+    store: { activeForAuth: () => true, withActiveForAuth, ensureNativeAppSlotForMember: () => null, createAppAuthCode: () => { throw new Error('must not issue'); } } });
+  const result = await api.handle(new Request(origin + '/v1/members/connect/start', {
+    method: 'POST', signal: abort.signal, body,
+  }));
+  expect(result?.status).toBe(400);
+  expect(cancelled).toBe(true);
+});
+
+test('approval body deadline and abort never issue a code, and a fresh complete body still approves', async () => {
+  let issued = 0;
+  let cancelled = 0;
+  const api = createMemberConnectEntry({ origin, bodyReadTimeoutMs: 5, memberForRequest: () => 'member-a',
+    store: { activeForAuth: () => true, withActiveForAuth,
+      ensureNativeAppSlotForMember: () => ({ appId: 'synthetic-native-app' } as never),
+      createAppAuthCode: () => { issued++; },
+    } });
+  const start = await api.handle(post(origin + '/v1/members/connect/start', {
+    state: 's'.repeat(43), codeChallenge: 'c'.repeat(43), pollSecret: 'p'.repeat(43),
+  }));
+  const { approvalUrl, userCode } = await start!.json() as { approvalUrl: string; userCode: string };
+  const page = await api.handle(new Request(approvalUrl));
+  const csrf = /name="csrf" value="([^"]+)"/.exec(await page!.text())![1]!;
+  const stalled = () => new ReadableStream<Uint8Array>({
+    pull() { return new Promise<void>(() => {}); }, cancel() { cancelled++; },
+  });
+  expect((await api.handle(new Request(approvalUrl, { method: 'POST', headers: { origin }, body: stalled() })))?.status).toBe(400);
+  expect(issued).toBe(0);
+  const abort = new AbortController();
+  const waiting = api.handle(new Request(approvalUrl, { method: 'POST', headers: { origin }, signal: abort.signal, body: stalled() }));
+  abort.abort();
+  expect((await waiting)?.status).toBe(400);
+  expect(issued).toBe(0);
+  expect(cancelled).toBe(2);
+  expect((await api.handle(new Request(approvalUrl, { method: 'POST', headers: { origin },
+    body: new URLSearchParams({ csrf, userCode }).toString() })))?.status).toBe(200);
+  expect(issued).toBe(1);
 });

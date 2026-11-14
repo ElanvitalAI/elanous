@@ -40,6 +40,10 @@
       "type": "string",
       "minLength": 1
     },
+    "designPattern": {
+      "type": "string",
+      "description": "Selected pattern and rationale from the request; examples are not fixed diagram templates."
+    },
     "deployment": {
       "type": "object",
       "required": [
@@ -50,7 +54,7 @@
       ],
       "properties": {
         "provider": {
-          "enum": ["generic", "gcp"]
+          "enum": ["generic", "local", "gcp", "aws"]
         },
         "project": {
           "type": "string",
@@ -105,10 +109,15 @@
               "vpc"
             ]
           },
+          "subnet": { "type": "string", "minLength": 1, "description": "Optional named subnet for a VPC node." },
           "service": {
             "type": "string",
             "minLength": 1
           },
+          "purpose": { "type": "string" },
+          "alternative": { "type": "string" },
+          "awsService": { "type": "string" },
+          "gcpService": { "type": "string" },
           "details": {
             "type": "array",
             "items": {
@@ -118,7 +127,11 @@
           },
           "icon": {
             "type": "string",
-            "description": "Exact PNG sourcePath in references/official-gcp-icons.json; at least three nodes need icons."
+            "description": "Exact PNG sourcePath in the selected provider's official icon registry; cloud diagrams need at least three icons. Local and generic diagrams use editable shapes."
+          },
+          "localIcon": {
+            "enum": ["laptop", "process", "sqlite", "docker", "tailnet", "relay"],
+            "description": "Editable semantic badge for local mode; does not claim a vendor logo."
           }
         }
       }
@@ -344,7 +357,7 @@
             "minLength": 1
           },
           "monthlyUsd": {
-            "type": "number",
+            "type": ["number", "null"],
             "minimum": 0
           }
         }

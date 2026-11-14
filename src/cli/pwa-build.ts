@@ -136,20 +136,36 @@ export async function runPwaBuild(opts: PwaBuildOpts = {}): Promise<PwaBuildResu
     return { exitCode: 1, cwd: '', durationMs: 0 };
   }
 
-  // FU5 — precheck. Catches the "stale tree · `bun install` never ran"
-  // case before webpack does and emits a one-line fix.
-  const deps = checkPwaBuildDeps(cwd);
+  const t0 = Date.now();
+  const spawnFn = opts.spawnFn ?? defaultSpawn;
+  // Prepare a cold install from the checked-in lockfile and verify that the
+  // dependencies appeared before allowing the build to run.
+  let deps = checkPwaBuildDeps(cwd);
   if (!deps.ok) {
-    out.error(`✗ elanous nexus build: missing or incomplete node_modules in ${cwd}: ${deps.missing.slice(0, 3).join(', ')}${deps.missing.length > 3 ? ` (+${deps.missing.length - 3} more)` : ''}`);
-    out.error(`  fix:  cd "${cwd}" && bun install --force`);
-    return { exitCode: 1, cwd, durationMs: 0 };
+    if (!existsSync(joinPath(cwd, 'package.json')) || !existsSync(joinPath(cwd, 'bun.lock'))) {
+      out.error(`✗ elanous nexus build: package.json or bun.lock missing in ${cwd}; bun install cannot prepare a frozen PWA tree`);
+      return { exitCode: 1, cwd, durationMs: Date.now() - t0 };
+    }
+    out.log(`elanous nexus build: preparing missing PWA dependencies in ${cwd}`);
+    let installExit: number;
+    try { installExit = await spawnFn('bun', ['install', '--frozen-lockfile'], cwd); }
+    catch { installExit = 1; }
+    if (installExit !== 0) {
+      out.error(`✗ elanous nexus build: PWA dependency install failed (exit ${installExit})`);
+      return { exitCode: installExit, cwd, durationMs: Date.now() - t0 };
+    }
+    deps = checkPwaBuildDeps(cwd);
+    if (!deps.ok) {
+      out.error(`✗ elanous nexus build: PWA dependencies still missing after bun install: ${deps.missing.slice(0, 3).join(', ')}`);
+      return { exitCode: 1, cwd, durationMs: Date.now() - t0 };
+    }
   }
 
   out.log(`elanous nexus build: ${cwd}`);
   out.log('  bun run build  (Next.js static export · ~30s typical)');
-  const t0 = Date.now();
-  const spawnFn = opts.spawnFn ?? defaultSpawn;
-  const exitCode = await spawnFn('bun', ['run', 'build'], cwd);
+  let exitCode: number;
+  try { exitCode = await spawnFn('bun', ['run', 'build'], cwd); }
+  catch { exitCode = 1; }
   const durationMs = Date.now() - t0;
   const secs = (durationMs / 1000).toFixed(1);
   if (exitCode === 0) {

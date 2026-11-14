@@ -199,10 +199,14 @@ describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSI
   test('tool-enabled internal hint keeps local operator deployment private and reversible', () => {
     const prompt = buildReplSystemPrompt({ cfg: fakeConfig, enabledToolNames: [], cwd: process.cwd() }) ?? '';
     expect(prompt).toContain('127.0.0.1의 빈 31500~31599 포트');
-    expect(prompt).toContain('tailscale serve로 tailnet 전용 URL만 노출');
+    expect(prompt).toContain('tailscale serve status --json');
+    expect(prompt).toContain('tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>');
+    expect(prompt).toContain('443의 루트 경로와 기존 Serve 설정 변경 금지');
+    expect(prompt).not.toContain('tailscale serve --bg --https=443');
     expect(prompt).toContain('공개 인터넷 노출 금지');
     expect(prompt).toContain('HTTP 200과 앱 화면을 확인');
     expect(prompt).toContain('로컬 운영자 배포 되돌리기');
+    expect(prompt).toContain('tailscale serve --tls-terminated-tcp <선택포트> off');
     const disabled = buildReplSystemPrompt({ cfg: fakeConfig, enabledToolNames: undefined, cwd: process.cwd() }) ?? '';
     expect(disabled).not.toContain('tailscale serve');
   });

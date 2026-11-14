@@ -33,7 +33,7 @@ function catalogEntry(id: string, deferred = false): NativeToolCatalogEntry {
 const EXPECTED_NATIVE_CORE_REASONS: Readonly<Record<string, NativeToolCatalogEntry['coreReason']>> = {
   read: 'N1', grep: 'N1', glob: 'N1', list_dir: 'N1', edit: 'N1', write: 'N1',
   bash: 'N1', run_shell: 'N1', ask_user_question: 'N2', elanous_hold: 'N2',
-  tool_search: 'N3', agent: 'N1', agent_output: 'N1', agent_stop: 'N1', context_now: 'N4',
+  tool_search: 'N3', capability_search: 'N3', agent: 'N1', agent_output: 'N1', agent_stop: 'N1', context_now: 'N4',
 };
 
 describe('native core admission index', () => {

@@ -118,6 +118,18 @@ function failedAfterGate(state: GraphRunState, index: number): boolean {
     && failedAfterTrafficRestore(state, index + 1);
 }
 
+/** Parent-path order in graphs/release/release-loop.yaml; cutoff's children live in fanOuts, not path.
+ * Only cloud approval is optional. Matching merely the endpoints would bless forged middle history.
+ * This recognizes an error message, never authorizes a waiver or bypasses the runner's approval boundary.
+ */
+function canonicalPreGatePrefix(prefix: string[]): boolean {
+  const expected = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
+    'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep'];
+  const withApproval = [...expected.slice(0, 6), 'approve-cloud-elastic', ...expected.slice(6)];
+  return [expected, withApproval].some((path) => path.length === prefix.length
+    && path.every((nodeId, index) => prefix[index] === nodeId));
+}
+
 /** A rejected heal decision is a runner approval boundary; the failed run cannot be resumed across it. */
 function rejectedHealRequiresNewRun(state: GraphRunState, gateIndex: number): boolean {
   const suffix = ['gate', 'cloud-leave', 'gate-triage', 'gate-heal-decision', 'traffic-failed-restore', 'failed'];
@@ -126,7 +138,7 @@ function rejectedHealRequiresNewRun(state: GraphRunState, gateIndex: number): bo
     || gate?.nodeId !== 'gate' || gate.ok !== false || gate.executed !== true
     || state.path[0] !== 'version-release' || state.nodes[0]?.nodeId !== 'version-release'
     || state.nodes[0]?.ok !== true || state.nodes[0]?.executed !== true
-    || (gateIndex > 1 && state.path[gateIndex - 1] !== 'pod-reuse-prep')
+    || !canonicalPreGatePrefix(state.path.slice(0, gateIndex))
     || state.path.slice(0, gateIndex).some((nodeId, index) => state.nodes[index]?.nodeId !== nodeId)
     || state.path.lastIndexOf('gate') !== gateIndex
     || state.path.length - gateIndex !== suffix.length
@@ -138,7 +150,9 @@ function rejectedHealRequiresNewRun(state: GraphRunState, gateIndex: number): bo
   const triage = state.nodes[gateIndex + 2];
   const decision = state.nodes[gateIndex + 3];
   const restore = state.nodes[gateIndex + 4];
-  return cloud?.ok === true && cloud.executed === true && triage?.ok === true && triage.executed === true
+  const triageOutcome = lastJsonObject(triage?.output)?.outcome;
+  return cloud?.ok === true && cloud.executed === true && triage?.executed === true
+    && (triageOutcome === 'fail' || triageOutcome === 'error')
     && decision?.ok === false && decision.executed === false && lastJsonObject(decision.output)?.outcome === 'rejected'
     && restore?.executed === true;
 }

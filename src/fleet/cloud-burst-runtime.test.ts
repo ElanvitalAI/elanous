@@ -10,7 +10,7 @@ import { cloudBurstRuntimeConfig, cloudPoolImageDigestReady, installCloudBurstAu
 
 // Source: 내부 문서 `CONDUCTOR` §6c defines the cost, capacity, TTL and pinned image inputs.
 const burstConfigFixture = () => ({
-  joinCommand: '/Users/user/elanous-hq/seat-state/OP/tools/cloud-join.sh',
+  joinCommand: '/sim/home/elanous-hq/seat-state/OP/tools/cloud-join.sh',
   host: 'aws2', context: 'pool-cloud', capacity: 2, threshold: 2, // Source: 내부 문서 `CONDUCTOR` §6c.
   hourlyCostKrw: 100_000, ttlHours: 2, imageDigest: `sha256:${'a'.repeat(64)}`,
   owner: 'NT-3', purpose: 'execution',
@@ -21,7 +21,7 @@ function configWith(raw: Record<string, unknown>): UserConfig { return { raw } a
 test('cloud burst config requires explicit complete argv command settings', () => {
   expect(cloudBurstRuntimeConfig(configWith({}))).toBeUndefined();
   const parsed = cloudBurstRuntimeConfig(configWith({ fleet: { cloudBurst: burstConfigFixture() } }));
-  expect(parsed).toMatchObject({ joinCommand: '/Users/user/elanous-hq/seat-state/OP/tools/cloud-join.sh', host: 'aws2', capacity: 2, purpose: 'execution' }); // Source: 내부 문서 `CONDUCTOR` §6c.
+  expect(parsed).toMatchObject({ joinCommand: '/sim/home/elanous-hq/seat-state/OP/tools/cloud-join.sh', host: 'aws2', capacity: 2, purpose: 'execution' }); // Source: 내부 문서 `CONDUCTOR` §6c.
 });
 
 test('cloud burst config fails closed for unsafe command paths, hosts, and incomplete cost bounds', () => {

@@ -1,7 +1,8 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { useLayoutEffect, useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { toast } from 'sonner';
 import type { PromptStreamHandlers } from '@/lib/daemon-client';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { ChatLayout } from './ChatLayout';
@@ -71,7 +72,7 @@ function sharedCardAttachmentFixture(): AttachmentMeta {
   return { id: 'shared-card', filename: source.name, size: source.size, mediaType: source.type, downloadUrl: '/v1/attachments/shared-card' };
 }
 
-async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean; mobileSimple?: boolean; actions?: boolean; search?: string; failStorageKey?: string; sessionStore?: Storage; localDraft?: string; cardOutcome?: 'done' | 'failed' }) {
+async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean; mobileSimple?: boolean; actions?: boolean; search?: string; failStorageKey?: string; sessionStore?: Storage; localDraft?: string; cardOutcome?: 'done' | 'failed'; restoreFailure?: boolean; restorePending?: boolean }) {
   const sessionStorage = opts.sessionStore ?? storage(opts.failStorageKey);
   const localStorage = storage();
   if (opts.localDraft !== undefined) localStorage.setItem('elanous.pwa.snapshot.chatInput.singleton', JSON.stringify(opts.localDraft));
@@ -89,6 +90,8 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: localStorage });
   Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
   const requests: Array<{ method: string; body: unknown }> = [];
+  const restoreRequests: string[] = [];
+  let rejectRestore: ((error: Error) => void) | undefined;
   const streams: unknown[] = [];
   const turns: Array<{ resolve: (result: { sessionId: string; text: string; stopReason: string }) => void; reject: (reason: Error) => void; signal: AbortSignal }> = [];
   const uploads: Array<{ file: Blob; filename: string }> = [];
@@ -124,7 +127,14 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     connectAcp: () => { if (!opts.acp) throw new Error('no ACP'); return acp; },
     voiceWsUrl: () => '',
     voiceCost: async () => ({}),
-    fetchJson: async () => ({ messages: [] }),
+    fetchJson: async (path: string) => {
+      restoreRequests.push(path);
+      if (opts.restorePending && path === '/v1/sessions/store/session-1?ifExists=1') {
+        return new Promise((_, reject) => { rejectRestore = reject; });
+      }
+      if (opts.restoreFailure && path.startsWith('/v1/sessions/store/')) throw new Error('HTTP 503: session store unavailable');
+      return { messages: [] };
+    },
     fetchResponse: async (path: string) => {
       if (path === '/v1/card-followup') return new Response(JSON.stringify({ id: 'card-followup-1' }), { status: 200 });
       if (path === '/v1/card-followup/card-followup-1') return new Response(JSON.stringify(opts.cardOutcome === 'done'
@@ -152,15 +162,58 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     setSessionId: () => {},
     setConfig: () => {},
   };
-  await act(async () => {
-    tree = create(<DaemonContext.Provider value={daemon}><ChatLayout {...(opts.leading ? { leading: <button aria-label="대화 목록">☰</button> } : {})} {...(opts.mobileSimple ? { mobileSimple: true, mobileActivity: { kind: 'active' as const, run: { subjectId: 'task', runId: 'run-1', origin: 'system' as const, progressLine: '구현 중', progressStatus: 'running' as const, href: '/live-run?run=run-1' }, extraLiveCount: 0 }, conversationButton: <button aria-label="대화 목록">☰</button> } : {})} /></DaemonContext.Provider>);
-  });
+  const renderChat = (sessionId: string) => <DaemonContext.Provider value={{ ...daemon, sessionId }}><ChatLayout {...(opts.leading ? { leading: <button aria-label="대화 목록">☰</button> } : {})} {...(opts.mobileSimple ? { mobileSimple: true, mobileActivity: { kind: 'active' as const, run: { subjectId: 'task', runId: 'run-1', origin: 'system' as const, progressLine: '구현 중', progressStatus: 'running' as const, href: '/live-run?run=run-1' }, extraLiveCount: 0 }, conversationButton: <button aria-label="대화 목록">☰</button> } : {})} /></DaemonContext.Provider>;
+  await act(async () => { tree = create(renderChat('session-1')); });
   const input = tree!.root.findByType(ChatInput);
-  return { requests, streams, turns, uploads, input, sessionStorage, historyCalls,
+  return { requests, restoreRequests, rejectRestore: (error: Error) => rejectRestore?.(error), switchSession: async (sessionId: string) => { await act(async () => { tree!.update(renderChat(sessionId)); }); }, streams, turns, uploads, input, sessionStorage, historyCalls,
     observer: () => observerHandlers!, receiveAsk: (payload: unknown) => inbound!(payload) };
 }
 
 test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
+
+test('a session store failure is visible instead of being treated as an absent new session', async () => {
+  const error = spyOn(toast, 'error').mockImplementation(() => '' as never);
+  try {
+    const { restoreRequests } = await mount({ acp: false, restoreFailure: true });
+    expect(restoreRequests).toContain('/v1/sessions/store/session-1?ifExists=1');
+    expect(error).toHaveBeenCalledWith('대화를 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.');
+    expect(JSON.stringify(tree!.root.findByType(ChatHistory).props)).not.toContain('session store unavailable');
+  } finally { error.mockRestore(); }
+});
+
+test('a confirmed absent chat session leaves the new conversation empty', async () => {
+  const error = spyOn(toast, 'error').mockImplementation(() => '' as never);
+  try {
+    const { restoreRequests } = await mount({ acp: false });
+    expect(restoreRequests).toContain('/v1/sessions/store/session-1?ifExists=1');
+    expect(tree!.root.findByType(ChatHistory).props.messages).toEqual([]);
+    expect(error).not.toHaveBeenCalled();
+  } finally { error.mockRestore(); }
+});
+
+test('a failed restore after the chat unmounts does not show a stale error', async () => {
+  const error = spyOn(toast, 'error').mockImplementation(() => '' as never);
+  try {
+    const { rejectRestore, restoreRequests } = await mount({ acp: false, restorePending: true });
+    expect(restoreRequests).toContain('/v1/sessions/store/session-1?ifExists=1');
+    await act(async () => { tree!.unmount(); });
+    tree = undefined;
+    await act(async () => { rejectRestore(new Error('HTTP 503: late failure')); });
+    expect(error).not.toHaveBeenCalled();
+  } finally { error.mockRestore(); }
+});
+
+test('a failed restore from the previous session does not warn in the next session', async () => {
+  const error = spyOn(toast, 'error').mockImplementation(() => '' as never);
+  try {
+    const { rejectRestore, restoreRequests, switchSession } = await mount({ acp: false, restorePending: true });
+    await switchSession('session-2');
+    expect(restoreRequests).toContain('/v1/sessions/store/session-2?ifExists=1');
+    await act(async () => { rejectRestore(new Error('HTTP 503: old session failure')); });
+    expect(error).not.toHaveBeenCalled();
+    expect(tree!.root.findByType(ChatHistory).props.messages).toEqual([]);
+  } finally { error.mockRestore(); }
+});
 
 test('share target text is staged in the composer on the retained Chat screen', async () => {
   const { input, historyCalls } = await mount({ acp: false, search: '?title=Shared&text=hello&url=https%3A%2F%2Fexample.test&session=session-1' });

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "아키텍처 패턴: event-driven",
+  "source": "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_prevent_interaction_failure.html",
+  "body": "언제: 생산자와 여러 소비자의 처리율·가용성을 분리하고 재시도가 필요할 때.\n구성: producer, broker/queue, workers, idempotency ledger, dead-letter path, observability\n배치: 비동기 간선, 재시도·중복 처리, 실패 격리와 DLQ를 명시한다.\n예시 레이아웃 참고: left producer → broker → parallel workers → durable ledger; DLQ below broker\n클라우드 대응: {}\n결정과 반증: 요구사항에서 노드와 간선을 다시 선택한다. 이 예시를 고정 도식으로 복사하지 않는다."
+}

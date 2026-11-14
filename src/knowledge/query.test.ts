@@ -86,7 +86,7 @@ test('ambiguity asks about the top two equally ranked packs even when a third ti
   } finally { store.close(); }
 });
 
-test('a generic 설계해 expression alone falls back to the vault instead of selecting an unrelated pack', async () => {
+test('an explicit vault filter on a generic 설계해 question does not select an unrelated pack', async () => {
   const store = new KgsSqliteStore(':memory:');
   const root = mkdtempSync(join(tmpdir(), 'knowledge-query-korean-generic-design-'));
   try {
@@ -97,7 +97,7 @@ test('a generic 설계해 expression alone falls back to the vault instead of se
     const question = '티켓팅 시스템을 설계해';
 
     expect(selectInstalledKnowledgePack(question, store)).toBeNull();
-    const result = await dispatchKnowledgeQuery({ question }, {
+    const result = await dispatchKnowledgeQuery({ question, fulltext: 'Vault' }, {
       resolvePack: text => resolveInstalledKnowledgePack(text, store),
       vault: { root, isSimulated: true, label: 'fixture' },
     });
@@ -110,7 +110,7 @@ test('a generic 설계해 expression alone falls back to the vault instead of se
   }
 });
 
-test('generic 설계하 and 방법 overlap cannot select a different topic pack and dispatch falls back to the vault', async () => {
+test('explicit vault filtering does not select a different-topic pack from 설계하 and 방법 overlap', async () => {
   const store = new KgsSqliteStore(':memory:');
   const root = mkdtempSync(join(tmpdir(), 'knowledge-query-korean-generic-method-'));
   try {
@@ -122,7 +122,7 @@ test('generic 설계하 and 방법 overlap cannot select a different topic pack 
     const question = '티켓팅을 설계하는 방법';
 
     expect(resolveInstalledKnowledgePack(question, store)).toEqual({ kind: 'none' });
-    const result = await dispatchKnowledgeQuery({ question }, {
+    const result = await dispatchKnowledgeQuery({ question, fulltext: 'Vault' }, {
       resolvePack: text => resolveInstalledKnowledgePack(text, store),
       vault,
     });
@@ -136,7 +136,7 @@ test('generic 설계하 and 방법 overlap cannot select a different topic pack 
   }
 });
 
-test('generic English question words do not select an unrelated pack and dispatch falls back to the vault', async () => {
+test('generic English question words with an explicit vault filter do not select an unrelated pack', async () => {
   const store = new KgsSqliteStore(':memory:');
   const root = mkdtempSync(join(tmpdir(), 'knowledge-query-vault-fallback-'));
   try {
@@ -148,7 +148,7 @@ test('generic English question words do not select an unrelated pack and dispatc
     const question = 'how do I design a payment system';
 
     expect(selectInstalledKnowledgePack(question, store)).toBeNull();
-    const result = await dispatchKnowledgeQuery({ question }, {
+    const result = await dispatchKnowledgeQuery({ question, fulltext: 'Vault' }, {
       vault,
       selectPack: query => selectInstalledKnowledgePack(query, store),
       searchPack: (packId, query) => queryInstalledPack(packId, query, store),
@@ -163,7 +163,7 @@ test('generic English question words do not select an unrelated pack and dispatc
   }
 });
 
-test('generic please/service overlap cannot select an unrelated pack and dispatch falls back to the vault', async () => {
+test('generic please/service overlap with an explicit vault filter does not select an unrelated pack', async () => {
   const store = new KgsSqliteStore(':memory:');
   const root = mkdtempSync(join(tmpdir(), 'knowledge-query-generic-words-'));
   try {
@@ -175,7 +175,7 @@ test('generic please/service overlap cannot select an unrelated pack and dispatc
     const question = 'please design a payment service';
 
     expect(selectInstalledKnowledgePack(question, store)).toBeNull();
-    const result = await dispatchKnowledgeQuery({ question }, {
+    const result = await dispatchKnowledgeQuery({ question, fulltext: 'Vault' }, {
       vault,
       selectPack: query => selectInstalledKnowledgePack(query, store),
       searchPack: (packId, query) => queryInstalledPack(packId, query, store),
@@ -191,7 +191,7 @@ test('generic please/service overlap cannot select an unrelated pack and dispatc
   }
 });
 
-test('generic Korean question word overlap cannot select an unrelated pack and dispatch falls back to the vault', async () => {
+test('generic Korean question word overlap with an explicit vault filter does not select an unrelated pack', async () => {
   const store = new KgsSqliteStore(':memory:');
   const root = mkdtempSync(join(tmpdir(), 'knowledge-query-korean-question-word-'));
   try {
@@ -203,7 +203,7 @@ test('generic Korean question word overlap cannot select an unrelated pack and d
     const question = '티켓팅을 어떻게 설계해?';
 
     expect(selectInstalledKnowledgePack(question, store)).toBeNull();
-    const result = await dispatchKnowledgeQuery({ question }, {
+    const result = await dispatchKnowledgeQuery({ question, fulltext: 'Vault' }, {
       vault,
       selectPack: query => selectInstalledKnowledgePack(query, store),
       searchPack: (packId, query) => queryInstalledPack(packId, query, store),

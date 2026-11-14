@@ -110,7 +110,7 @@ describe('checkPwaBuildDeps', () => {
 });
 
 describe('runPwaBuild precheck integration', () => {
-  test('returns exit=1 + one-line fix message when @dagrejs/dagre is missing', async () => {
+  test('returns exit=1 before spawn when a missing dependency has no lockfile', async () => {
     const root = setupTree({ installedDeps: ['next', 'react'] });
     const errors: string[] = [];
     const logs: string[] = [];
@@ -124,8 +124,7 @@ describe('runPwaBuild precheck integration', () => {
       });
       expect(res.exitCode).toBe(1);
       const joined = errors.join('\n');
-      expect(joined).toContain('@dagrejs/dagre');
-      expect(joined).toContain('cd "');
+      expect(joined).toContain('bun.lock missing');
       expect(joined).toContain('bun install');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

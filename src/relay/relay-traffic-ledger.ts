@@ -95,11 +95,15 @@ export function createRelayTrafficLedger(
     },
     monthUsage(memberId, year, monthNumber) {
       if (closed) throw new Error('relay traffic ledger closed');
-      if (!Number.isInteger(year) || year < 1970 || !Number.isInteger(monthNumber) || monthNumber < 1 || monthNumber > 12) {
+      // 출처: OP #59665 service-era billing contract excludes historical Seoul DST years.
+      const earliestBillingYear = 2020;
+      if (!Number.isInteger(year) || year < earliestBillingYear || !Number.isInteger(monthNumber) || monthNumber < 1 || monthNumber > 12) {
         throw new Error('invalid relay traffic month');
       }
-      const firstMinute = Date.UTC(year, monthNumber - 1, 1) / 60_000;
-      const endMinute = Date.UTC(year, monthNumber, 1) / 60_000;
+      // OP52711: billing months begin at 00:00 Asia/Seoul (UTC+09:00), not UTC midnight.
+      const kstOffsetMinutes = 9 * 60;
+      const firstMinute = Date.UTC(year, monthNumber - 1, 1) / 60_000 - kstOffsetMinutes;
+      const endMinute = Date.UTC(year, monthNumber, 1) / 60_000 - kstOffsetMinutes;
       const row = month.get(memberId, firstMinute, endMinute) as { ingressBytes: number; egressBytes: number };
       return { minute: firstMinute, ingressBytes: row.ingressBytes, egressBytes: row.egressBytes };
     },

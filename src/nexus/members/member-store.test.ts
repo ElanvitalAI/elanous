@@ -146,3 +146,57 @@ test('migrates existing app auth code tables to the PKCE challenge column', () =
     } finally { migrated.close(); }
   } finally { store?.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('persisted deletion state gates synchronous auth effects after reopening', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'member-deletion-auth-'));
+  const path = join(directory, 'members.sqlite');
+  let store = createMemberStore({ path });
+  try {
+    const member = store.register({ sub: 'deleted-sub', email: 'deleted@example.test', emailVerified: true, name: 'Deleted' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    let effects = 0;
+    expect(store.withActiveForAuth(member.id, () => ++effects)).toEqual({ active: true, value: 1 });
+    expect(store.requestDeletion(member.session.token)).toBe(true);
+    store.close();
+    store = createMemberStore({ path });
+    expect(store.activeForAuth(member.id)).toBe(false);
+    expect(store.withActiveForAuth(member.id, () => ++effects)).toEqual({ active: false });
+    expect(effects).toBe(1);
+    expect(() => store.createSession(member.id)).toThrow('member is not active for session');
+    expect(() => store.register({ sub: 'deleted-sub', email: 'deleted@example.test', emailVerified: true, name: 'Deleted' },
+      { consents: { privacy: 'v1', terms: 'v1' } })).toThrow('member is not active for registration');
+    expect(store.ensureNativeAppSlotForMember(member.id)).toBeNull();
+    const db = new Database(path);
+    try {
+      // Simulate a stale unrevoked row: persisted deletion must still deny its session.
+      db.query('UPDATE member_sessions SET revoked_at = NULL WHERE member_id = ?').run(member.id);
+      expect(store.memberForSession(member.session.token)).toBeNull();
+      db.query("UPDATE member_deletion_requests SET status = 'completed' WHERE member_id = ?").run(member.id);
+      expect(store.activeForAuth(member.id)).toBe(false);
+      expect(store.memberForSession(member.session.token)).toBeNull();
+      db.query("UPDATE member_deletion_requests SET status = 'cancelled' WHERE member_id = ?").run(member.id);
+      expect(store.activeForAuth(member.id)).toBe(true);
+      expect(store.memberForSession(member.session.token)?.id).toBe(member.id);
+      expect(store.createSession(member.id).token).toBeTruthy();
+    } finally { db.close(); }
+    expect(store.activeForAuth('missing-member')).toBe(false);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('deletion lookup failure is an error and cannot run an auth effect', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'member-deletion-lookup-'));
+  const path = join(directory, 'members.sqlite');
+  const store = createMemberStore({ path });
+  try {
+    const member = store.register({ sub: 'failure-sub', email: 'failure@example.test', emailVerified: true, name: 'Failure' },
+      { consents: { privacy: 'v1', terms: 'v1' } });
+    const db = new Database(path);
+    try { db.exec('DROP TABLE member_deletion_requests'); } finally { db.close(); }
+    let effects = 0;
+    expect(() => store.activeForAuth(member.id)).toThrow();
+    expect(() => store.withActiveForAuth(member.id, () => ++effects)).toThrow();
+    expect(() => store.createSession(member.id)).toThrow();
+    expect(() => store.memberForSession(member.session.token)).toThrow();
+    expect(effects).toBe(0);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});

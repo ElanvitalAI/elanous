@@ -828,6 +828,10 @@ export interface NexusHttpServer {
  *  resolved port + a stop() thunk. Throws when the entire port range
  *  is exhausted. */
 export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer {
+  // Resolve each member-owned app label from its private canonical slot binding.
+  // Unbound legacy apps retain the configured host label; retired labels fail at appHost.
+  opts.appHost?.setPublicUserSlugResolver?.(appSlug =>
+    (opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders))?.publicUserSlugForApp?.(appSlug));
   const startPort = opts.startPort ?? DEFAULT_NEXUS_HTTP_PORT;
   const range = opts.portRange ?? NEXUS_HTTP_PORT_RANGE;
   const hostname = opts.hostname ?? '127.0.0.1';

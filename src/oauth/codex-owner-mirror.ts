@@ -1,8 +1,9 @@
 import { hostname, homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { getTestStateRoot } from '../nexus/paths.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { CODEX_CREDENTIAL_SLOT, credentialOwnerLedgerPath, normalizeCredentialHost, readCredentialOwner, recordCredentialMirror, resolveCodexCredentialOwnerHost, type CredentialOwnerRecord } from '../nexus/config/secrets/cred-owner.js';
@@ -12,9 +13,25 @@ import { decodeJWTPayload } from './jwt.js';
 export const CODEX_OWNER_MIRROR_RELATIVE_PATH = join('remote-parent-credentials', 'cli-mirror', 'auth.json');
 export const CODEX_OWNER_MIRROR_REQUIRED = 'Codex owner access mirror rejected — inspect llm.codex/owner-mirror-rejected for the precise reason';
 
+/** Only an explicit test child uses the host mirror outside its isolated root. */
+export function shouldPreferHostCodexMirror(): boolean {
+  const stateRoot = getElanousConfigDir();
+  const explicitTestRoot = getTestStateRoot();
+  const testUniverse = Boolean(process.env.ELANOUS_TEST_HOME?.trim())
+    || (explicitTestRoot !== undefined && resolve(explicitTestRoot) === stateRoot)
+    || (process.env.NODE_ENV === 'test' && basename(stateRoot) === '.elanous-test');
+  return process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1'
+    && testUniverse
+    && stateRoot !== join(homedir(), '.elanous')
+    && shouldUseCodexOwnerMirror();
+}
+
 export function codexOwnerMirrorAuthPath(): string {
   const stateRoot = getElanousConfigDir();
-  const derivedPath = join(stateRoot, CODEX_OWNER_MIRROR_RELATIVE_PATH);
+  // A --test child has its own config root. The access snapshot belongs to the
+  // host, so a fleet nonowner must resolve it outside that isolated universe.
+  const mirrorRoot = shouldPreferHostCodexMirror() ? join(homedir(), '.elanous') : stateRoot;
+  const derivedPath = join(mirrorRoot, CODEX_OWNER_MIRROR_RELATIVE_PATH);
   const accessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1';
   const explicitCodexHome = accessOnly ? process.env.CODEX_HOME?.trim() : undefined;
   const codexHomePath = explicitCodexHome ? join(resolve(explicitCodexHome), 'auth.json') : undefined;
@@ -24,7 +41,8 @@ export function codexOwnerMirrorAuthPath(): string {
   const path = codexHomePath ?? (configuredPath && isAbsolute(configuredPath) ? configuredPath : derivedPath);
   try {
     debug.log('llm.codex', 'owner-mirror-path-compared', {
-      source: path === codexHomePath ? 'codex-home' : path === derivedPath ? 'state-root' : 'remote-explicit',
+      source: path === codexHomePath ? 'codex-home' : path === derivedPath
+        ? mirrorRoot === stateRoot ? 'state-root' : 'host-root' : 'remote-explicit',
       stateRootSha256: rootFingerprint(stateRoot),
       derivedMirrorRootSha256: rootFingerprint(dirname(dirname(dirname(derivedPath)))),
       resolvedMirrorRootSha256: rootFingerprint(dirname(dirname(dirname(path)))),
@@ -82,6 +100,9 @@ export function deliverCodexMirrorAndRecord(
 
 /** Account discovery and rotation must read the same remote snapshot as execution. */
 export function codexAccountReadStorePath(ownerStorePath: string): string {
+  // Never inspect an isolated universe's stale auth before a fleet mirror.
+  // The caller validates the access-only snapshot at the point of use.
+  if (shouldPreferHostCodexMirror()) return codexOwnerMirrorAuthPath();
   const candidates = [
     ['config-dir', ownerStorePath],
     ['default-root', join(homedir(), '.elanous', 'auth.json')],

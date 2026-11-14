@@ -1,0 +1,72 @@
+{
+  "libraryUrl": "https://aws.amazon.com/architecture/icons/",
+  "archiveUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+  "archiveSha256": "d2d166c453526471749d520e0db022c459abef759d2946cf2dd1d1c992dc6526",
+  "use": "AWS states customers and partners may use these assets to create architecture diagrams and in whitepapers, presentations, data sheets and posters. AWS marks remain AWS property; assets are embedded only in generated diagrams.",
+  "assets": {
+    "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-CloudFront_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "b132df4f324863f9930a8a8de40afd4a706100d4f0cedaf301680e8dc72517d3"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Security-Identity/48/Arch_AWS-WAF_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "b37a7763bcca498d9fe4594f16ec93d222a0456b31fc3653dd859f399827e64e"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Elastic-Load-Balancing_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "dcf3df1f875b3f6f63f36772df3d19d3c417d802bd17af03098309fbd494d01f"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-API-Gateway_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "c220cf32987bf162c2a6233589e7c39a259a45c33410b0bce0e7a4a8aa6e6eea"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Application-Integration/48/Arch_Amazon-Simple-Queue-Service_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "09f5e701a039a8101b6467224851db0bb752b33027c6c533621f9c100da306bb"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-ElastiCache_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "3edbfc1009143858540540c8bb2fc9115050daa9c43d1762dd7d945381f078f5"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-RDS_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "aca87b56f1a06382e52a010e5db040ca4338ce8d484f72c2f0f6e0a4c3e0c2be"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-DynamoDB_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "e15ee090401abeafdfc4a3e3a31280354d1783c4170074f692796be330265b32"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Storage/48/Arch_Amazon-Simple-Storage-Service_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "6715951abe7d964792afc3d36dec4e2f89e7d27df74d702ba75e575304a80d22"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Compute/48/Arch_AWS-Lambda_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "c10101a20a279b47c66caaf8adb54aedaad4735a27ad54075e1d200a15af55e1"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Management-Tools/48/Arch_Amazon-CloudWatch_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "bff48c147d824c98be094794975e628b666d0a46e90378cf0265225aee27c802"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Security-Identity/48/Arch_AWS-Secrets-Manager_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "cc96442f09e220c210022d0b3cd5978cee7fcdca8b35855ce784f22495eafdbd"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Developer-Tools/48/Arch_AWS-CodePipeline_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "1ce617341edc119cbb11ed216ef6ad126bf48bf5ac5c5709c1ecf2bdf9d88983"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-Route-53_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "4e655fa9c25359ff9b74e5fd71bbff47676abb0bc5b0fe8c05132a7b5e947838"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Application-Integration/48/Arch_Amazon-EventBridge_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "dd1b23d029e338ab13119f8617c19f578e3254ab2e91a76562d61833273b4426"
+    },
+    "Architecture-Service-Icons_07312026/Arch_Security-Identity/48/Arch_AWS-IAM-Identity-Center_48.png": {
+      "archive": "Icon-package_07312026",
+      "sha256": "b50e733cd8bd79c61539148aade5ef6355372f41f78e4245265355fcaa59e3d9"
+    }
+  }
+}

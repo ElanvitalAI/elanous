@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: nosql",
+  "source": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html",
+  "body": "무엇: 키 기반 대규모 접근 패턴에 맞춘 관리형 데이터 저장소다.\n언제: 접근 키와 일관성 요구가 명확하고 관계형 트랜잭션이 우선이 아닐 때.\n대안: 관계형 DB\nAWS: Amazon DynamoDB / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-DynamoDB_48.png\nGCP: Firestore / 공식 범주 아이콘 경로 Category Icons/Databases/PNG/Databases-512-color.png\n공식 출처: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html, https://cloud.google.com/firestore/docs/overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "아키텍처 패턴: local-relay-public",
+  "source": "https://tailscale.com/docs/features/tailscale-funnel",
+  "body": "언제: 회원 연결 없는 공개 브라우저 접속이 필요하고 운영자 호스트 앱은 127.0.0.1에만 둘 때. 공개 릴레이 또는 명시적으로 공개 승인된 Tailscale Funnel의 인증·되돌리기를 설계한다.\n구성: public browser, DNS, public HTTPS relay or Tailscale Funnel, localhost process, SQLite file, rollback control\n배치: 공개 릴레이 또는 Funnel 경계와 127.0.0.1 내부 프로세스를 분리한다. Tailscale Serve는 tailnet 내부 전용이므로 공개 입구로 세지 않는다. 공개 URL·인증·가용성·되돌리기를 명시한다.\n예시 레이아웃 참고: left public browser → upper public relay/Funnel → center localhost process → right SQLite; rollback below\n클라우드 대응: {\"public HTTPS relay or Tailscale Funnel\": \"Cloud Load Balancing / Application Load Balancer\", \"localhost process\": \"Cloud Run / Amazon ECS\"}\n결정과 반증: 요구사항에서 노드와 간선을 다시 선택한다. 이 예시를 고정 도식으로 복사하지 않는다."
+}

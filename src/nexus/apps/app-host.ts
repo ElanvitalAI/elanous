@@ -23,11 +23,15 @@ import { createAppAuth, type AppAuthOptions, type IssuedAppInvitation } from './
 import { detectDeclaredHtmlCharset, MADE_WITH_BADGE_ENTITLEMENT } from './made-with-badge.js';
 import { applyConceptProofBadge, type SimReceipt } from '../../ux-sim/sim-receipt.js';
 import { createAppDatabase, type AppDatabase } from './app-db.js';
+import { fingerprintAppSourceDirectory } from './app-source-snapshot.js';
 import type { NexusEventBus } from '../api/event-bus.js';
 import type { AppDbBackupOptions, AppDbBackupStatus } from './app-db-backup.js';
 import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 import type { MemberStore } from '../members/member-store.js';
 import { parsePublicAppHost, resolvePublicAppUserId } from '../../relay/relay-server.js';
+
+export type MemberOwnerStore = Pick<MemberStore, 'memberPlanForMember'>
+  & Partial<Pick<MemberStore, 'publicUserSlugForMember'>>;
 
 export interface VerifiedAppOwner {
   readonly memberId: string;
@@ -41,7 +45,7 @@ export function resolveVerifiedOwner(
   appHost: NexusAppHost,
   appSlug: string,
   sessionCredential: string,
-  members: Pick<MemberStore, 'memberPlanForMember'>,
+  members: MemberOwnerStore,
   configuredPublicUserId?: string,
 ): VerifiedAppOwner | null {
   return appHost.resolveVerifiedOwner(appSlug, sessionCredential, members, configuredPublicUserId);
@@ -51,7 +55,7 @@ export function resolveVerifiedOwner(
 export function resolveVerifiedMemberOwner(
   appHost: NexusAppHost,
   sessionCredential: string,
-  members: Pick<MemberStore, 'memberPlanForMember'>,
+  members: MemberOwnerStore,
   configuredPublicUserId?: string,
 ): VerifiedAppOwner | null {
   return appHost.resolveVerifiedMemberOwner(sessionCredential, members, configuredPublicUserId);
@@ -76,14 +80,18 @@ export interface NexusAppHostIssue {
 export interface NexusAppHost {
   /** Reserves app-host origins before API routing, even when no app bundle mounted. */
   handle(req: Request): Response | undefined | Promise<Response | undefined>;
+  /** Private member-store lookup; never accepts request-supplied identity. */
+  setPublicUserSlugResolver?(resolve: (appSlug: string) => string | null | undefined): void;
   /** Trusted server-side invitation issuance. Public app-host requests cannot call this operation. */
   issueInvitation(appSlug: string, invitedBy: string, ttlMs?: number, role?: string): IssuedAppInvitation;
   /** Trusted server-side Google-member owner session issuance; never exposed as a public app-host route. */
   issueOwnerSession(appSlug: string, memberId: string): { sessionToken: string; expiresAt: string };
+  /** Bind a generated app's verified owner and source before mounting; never accepts a public request. */
+  bindGeneratedOwner?(appSlug: string, memberId: string, fingerprint: string): void;
   /** Validates a host-bound owner cookie/Bearer, then joins the member plan from the private member DB. */
-  resolveVerifiedOwner(appSlug: string, sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'>, configuredPublicUserId?: string): VerifiedAppOwner | null;
+  resolveVerifiedOwner(appSlug: string, sessionCredential: string, members: MemberOwnerStore, configuredPublicUserId?: string): VerifiedAppOwner | null;
   /** Validates an owner app session by its server-verified token claim, without an appSlug input. */
-  resolveVerifiedMemberOwner(sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'>, configuredPublicUserId?: string): VerifiedAppOwner | null;
+  resolveVerifiedMemberOwner(sessionCredential: string, members: MemberOwnerStore, configuredPublicUserId?: string): VerifiedAppOwner | null;
   readonly slugs: readonly string[];
   /** Parsed, validated manifest snapshot for app-scoped route registration. */
   getManifest(appSlug: string): AppManifest | undefined;
@@ -110,6 +118,28 @@ interface MountedApp {
   readonly manifest: AppManifest;
   readonly files: ReadonlyMap<string, Buffer>;
   readonly entitlements?: Readonly<Record<string, unknown>>;
+  readonly generatedFingerprint?: string | null;
+}
+
+interface GeneratedOwnerBinding { schema: 1; slug: string; memberId: string; fingerprint: string }
+const GENERATED_OWNER_MARKER = '.elanous-generated-owner';
+function readGeneratedOwnerBinding(path: string, slug: string): GeneratedOwnerBinding | null {
+  let stat;
+  try { stat = lstatSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0
+    || stat.size > 8192 || process.getuid && stat.uid !== process.getuid()) throw new Error('app owner binding is untrusted');
+  const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('app owner binding is invalid');
+  const binding = value as Partial<GeneratedOwnerBinding>;
+  if (binding.schema !== 1 || binding.slug !== slug || typeof binding.memberId !== 'string' || !binding.memberId
+    || typeof binding.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(binding.fingerprint)) {
+    throw new Error('app owner binding is invalid');
+  }
+  return binding as GeneratedOwnerBinding;
 }
 
 interface FileIdentity {
@@ -362,11 +392,23 @@ function createNexusAppHost(
   mountDirectory?: (appSlug: string, entitlements?: Readonly<Record<string, unknown>>) => void,
   unmountDirectory?: (appSlug: string) => void,
   publicUserSlug?: string,
+  generatedOwnerBinding?: (appSlug: string) => GeneratedOwnerBinding | null,
+  bindGeneratedOwner?: (appSlug: string, memberId: string, fingerprint: string) => void,
 ): NexusAppHost {
+  let memberPublicUserSlug: ((appSlug: string) => string | null | undefined) | undefined;
   let conceptProofResolver: ((appSlug: string) => SimReceipt | undefined) | undefined;
+  const trustedGeneratedMount = (appSlug: string, mounted: MountedApp): GeneratedOwnerBinding | null | false => {
+    try {
+      const binding = generatedOwnerBinding?.(appSlug) ?? null;
+      if (mounted.generatedFingerprint === undefined) return binding ? false : null;
+      if (!binding || mounted.generatedFingerprint !== binding.fingerprint) return false;
+      return binding;
+    } catch { return false; }
+  };
   const decorateHtml = (appSlug: string, html: string, mounted: MountedApp): string =>
     applyConceptProofBadge(html, conceptProofResolver?.(appSlug), mounted.entitlements);
   return {
+    setPublicUserSlugResolver(resolve) { memberPublicUserSlug = resolve; },
     get slugs() { return [...mounts.keys()]; },
     getManifest(appSlug) { return mounts.get(appSlug)?.manifest; },
     databaseBackupStatus(appSlug) { return appDb?.backupStatus?.(appSlug) ?? null; },
@@ -407,6 +449,8 @@ function createNexusAppHost(
       const auth = authBySlug.get(appSlug);
       const mounted = mounts.get(appSlug);
       if (!mounted || !auth) throw new Error('app is not mounted or app authentication is unavailable');
+      const binding = trustedGeneratedMount(appSlug, mounted);
+      if (binding === false || binding && binding.memberId !== memberId) throw new Error('app owner binding refused');
       const roles = mounted.manifest.roles as Record<string, unknown> | undefined;
       const ownerRole = roles?.owner;
       const via = typeof ownerRole === 'object' && ownerRole !== null && !Array.isArray(ownerRole)
@@ -414,14 +458,21 @@ function createNexusAppHost(
       if (via !== 'nexus-session') throw new Error('owner role is not available through a member session');
       return auth.issueTrustedSession({ appSlug, memberId, role: 'owner' });
     },
+    bindGeneratedOwner(appSlug, memberId, fingerprint) {
+      if (!bindGeneratedOwner) throw new Error('app owner binding is unavailable');
+      bindGeneratedOwner(appSlug, memberId, fingerprint);
+    },
     resolveVerifiedOwner(appSlug, sessionCredential, members, configuredPublicUserId) {
       const auth = authBySlug.get(appSlug);
       const mounted = mounts.get(appSlug);
       if (!auth || !mounted || !sessionCredential) return null;
       const session = auth.getSessionRecord(sessionCredential);
       if (!session || session.appSlug !== appSlug || session.role !== 'owner' || session.source !== 'google-member') return null;
+      const binding = trustedGeneratedMount(appSlug, mounted);
+      if (binding === false || binding && binding.memberId !== session.invitedBy) return null;
       const plan = members.memberPlanForMember(session.invitedBy);
-      const userSlug = resolvePublicAppUserId(undefined, configuredPublicUserId);
+      const userSlug = members.publicUserSlugForMember?.(session.invitedBy)
+        ?? resolvePublicAppUserId(undefined, configuredPublicUserId);
       if (!plan || !userSlug) return null;
       return { memberId: session.invitedBy, userSlug, plan: plan.plan, entitlements: plan.entitlements };
     },
@@ -432,8 +483,11 @@ function createNexusAppHost(
         if (!mounted) continue;
         const session = auth.getSessionRecord(sessionCredential);
         if (!session || session.appSlug !== appSlug || session.role !== 'owner' || session.source !== 'google-member') continue;
+        const binding = trustedGeneratedMount(appSlug, mounted);
+        if (binding === false || binding && binding.memberId !== session.invitedBy) return null;
         const plan = members.memberPlanForMember(session.invitedBy);
-        const userSlug = resolvePublicAppUserId(undefined, configuredPublicUserId);
+        const userSlug = members.publicUserSlugForMember?.(session.invitedBy)
+        ?? resolvePublicAppUserId(undefined, configuredPublicUserId);
         if (!plan || !userSlug) return null;
         return { memberId: session.invitedBy, userSlug, plan: plan.plan, entitlements: plan.entitlements };
       }
@@ -445,10 +499,18 @@ function createNexusAppHost(
       const localHost = hostname.endsWith(APP_HOST_SUFFIX);
       const publicHost = parsePublicAppHost(hostname, PUBLIC_APP_DOMAIN);
       if (!localHost && !hostname.endsWith(`.${PUBLIC_APP_DOMAIN}`)) return undefined;
-      if (!localHost && (!publicHost || !publicUserSlug || publicHost.user !== publicUserSlug)) return notFound();
+      if (!localHost && !publicHost) return notFound();
       const slug = localHost ? hostname.slice(0, -APP_HOST_SUFFIX.length) : publicHost!.app;
+      if (!localHost) {
+        let canonical: string | null | undefined;
+        try { canonical = memberPublicUserSlug?.(slug) ?? publicUserSlug; }
+        catch { return new Response(null, { status: 503, headers: { 'cache-control': 'no-store' } }); }
+        if (!canonical || publicHost!.user !== canonical) return notFound();
+      }
       const mounted = mounts.get(slug);
       if (!mounted) return notFound();
+      const binding = trustedGeneratedMount(slug, mounted);
+      if (binding === false) return notFound();
       const auth = authBySlug.get(slug);
       const roles = mounted.manifest.roles as Record<string, unknown> | undefined;
       const publicRole = roles?.public;
@@ -480,6 +542,9 @@ function createNexusAppHost(
         const sessionCredential = bearerToken ?? req.headers.get('cookie') ?? '';
         let session = auth?.getSessionRecord(sessionCredential);
         let role = session?.appSlug === slug ? session.role : undefined;
+        if (role === 'owner' && binding && (binding.memberId !== session?.invitedBy || session?.source !== 'google-member')) {
+          return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+        }
         if (session && bearerToken && session.source !== 'google-member') return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
         if (!role && publicRead && !authorization) role = 'public';
         if (!role) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
@@ -497,8 +562,16 @@ function createNexusAppHost(
         }
         try {
           // The request body may have taken long enough for the session to expire or be revoked.
+          const currentBinding = trustedGeneratedMount(slug, mounted);
+          if (currentBinding === false || binding && (!currentBinding
+            || currentBinding.memberId !== binding.memberId || currentBinding.fingerprint !== binding.fingerprint)) {
+            return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+          }
           session = auth?.getSessionRecord(sessionCredential);
           role = session?.appSlug === slug ? session.role : undefined;
+          if (role === 'owner' && currentBinding && (currentBinding.memberId !== session?.invitedBy || session?.source !== 'google-member')) {
+            return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+          }
           if (session && bearerToken && session.source !== 'google-member') return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
           if (!role && publicRead && !authorization) role = 'public';
           if (!role) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
@@ -628,9 +701,40 @@ export function loadNexusAppHost(
   const issues: NexusAppHostIssue[] = [];
   const configuredAppsRoot = resolve(appsDir);
   const appsRoot = () => realpathSync(configuredAppsRoot);
+  const authRoot = resolve(authOptions?.dir ?? join(configuredAppsRoot, '..', 'app-session-tokens'));
+  const ownerBindingRoot = join(authRoot, '.generated-owner-bindings');
+  const ownerBindingPath = (slug: string) => join(ownerBindingRoot, slug + '.json');
+  const getGeneratedOwnerBinding = (slug: string) => readGeneratedOwnerBinding(ownerBindingPath(slug), slug);
+  const sourceFingerprint = (slug: string) => fingerprintAppSourceDirectory(join(appsRoot(), slug), { includeGeneratedFiles: true });
+  const bindGeneratedOwner = (slug: string, memberId: string, fingerprint: string) => {
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug) || !memberId
+      || !/^[0-9a-f]{64}$/.test(fingerprint)) throw new Error('app owner binding is invalid');
+    const previous = getGeneratedOwnerBinding(slug);
+    if (previous && previous.memberId !== memberId) throw new Error('app owner binding refused');
+    if (existsSync(join(appsRoot(), slug)) && sourceFingerprint(slug) !== fingerprint) throw new Error('app owner source changed');
+    mkdirSync(ownerBindingRoot, { recursive: true, mode: 0o700 });
+    const path = ownerBindingPath(slug);
+    const pending = path + '.tmp-' + randomUUID();
+    writeFileSync(pending, JSON.stringify({ schema: 1, slug, memberId, fingerprint }), { flag: 'wx', mode: 0o600 });
+    try { renameSync(pending, path); }
+    catch (error) { try { unlinkSync(pending); } catch { /* not published */ } throw error; }
+    const mounted = mounts.get(slug);
+    if (mounted) mounts.set(slug, { ...mounted, generatedFingerprint: fingerprint });
+  };
   const mountDirectory = (appSlug: string, entitlements?: Readonly<Record<string, unknown>>, initializeDatabase = true) => {
     const root = appsRoot();
     const mountedBase = mountApp(root, appSlug, simulation);
+    const binding = getGeneratedOwnerBinding(appSlug);
+    let marker = false;
+    try {
+      const stat = lstatSync(join(root, appSlug, GENERATED_OWNER_MARKER));
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('app owner marker is untrusted');
+      marker = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const fingerprint = binding || marker ? sourceFingerprint(appSlug) : undefined;
+    if (binding && fingerprint !== binding.fingerprint) throw new Error('app owner source changed');
     const stateDirectory = join(root, APP_HOST_STATE_DIR);
     let mountedEntitlements = entitlements;
     if (mountedEntitlements === undefined) {
@@ -648,7 +752,11 @@ export function loadNexusAppHost(
         if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
       }
     }
-    const mounted: MountedApp = mountedEntitlements ? { ...mountedBase, entitlements: mountedEntitlements } : mountedBase;
+    const mounted: MountedApp = {
+      ...mountedBase,
+      ...(mountedEntitlements ? { entitlements: mountedEntitlements } : {}),
+      ...(fingerprint !== undefined ? { generatedFingerprint: binding ? fingerprint : null } : {}),
+    };
     if (mounted.slug !== appSlug) throw new Error('app directory slug does not match its manifest');
     if (mounts.has(appSlug)) throw new Error('app is already mounted');
     let auth: ReturnType<typeof createAppAuth> | undefined;
@@ -740,5 +848,6 @@ export function loadNexusAppHost(
       close() { for (const database of databases.values()) database.close(); databases.clear(); },
     };
   }
-  return { appHost: createNexusAppHost(mounts, authBySlug, appDb, authOptions?.funnel, mountDirectory, unmountDirectory, publicUserSlug), issues };
+  return { appHost: createNexusAppHost(mounts, authBySlug, appDb, authOptions?.funnel, mountDirectory, unmountDirectory,
+    publicUserSlug, getGeneratedOwnerBinding, bindGeneratedOwner), issues };
 }

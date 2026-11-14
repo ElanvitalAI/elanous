@@ -1,8 +1,8 @@
 {
   "kind": "knowledge-pack",
   "name": "system-architecture-public",
-  "version": "0.1.0",
-  "description": "한국어 원저작 시스템 설계 결정 카드: 3계층, 이벤트·큐, CQRS·이벤트 소싱, 마이크로서비스·메시, 서버리스, 데이터 파이프라인·스트리밍, 검색, 실시간 채팅·알림, 미디어 처리, 멀티 테넌트 SaaS, ML 서빙, 캐시·샤딩·rate limit·멱등성·outbox·격리 패턴. 3줄 설계 요구에서 관련 카드를 선택한다.",
+  "version": "0.2.0",
+  "description": "한국어 원저작 시스템 설계 결정 카드: 3계층, 이벤트·큐, CQRS·이벤트 소싱, 마이크로서비스·메시, 서버리스, 데이터 파이프라인·스트리밍, 검색, 실시간 채팅·알림, 미디어 처리, 멀티 테넌트 SaaS, ML 서빙, 캐시·샤딩·rate limit·멱등성·outbox·격리 패턴. 3줄 설계 요구에서 관련 카드를 선택한다. 공식 AWS/GCP 구성 요소 16종과 로컬·클라우드 패턴 5종 선택 카드. 요구→설계→FE/BE/DB→시험→배포 절차 카드.",
   "signature": {
     "alg": "ed25519",
     "keyId": "00000000"
@@ -214,6 +214,94 @@
     {
       "type": "document",
       "path": "content/shared-patterns-07.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-cdn.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-waf.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-load-balancer.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-api-gateway.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-queue.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-cache.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-rdbms.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-nosql.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-object-storage.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-broker.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-worker.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-identity.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-observability.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-secrets.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-cicd.json"
+    },
+    {
+      "type": "document",
+      "path": "content/component-dns.json"
+    },
+    {
+      "type": "document",
+      "path": "content/pattern-local-single-node.json"
+    },
+    {
+      "type": "document",
+      "path": "content/pattern-local-relay-public.json"
+    },
+    {
+      "type": "document",
+      "path": "content/pattern-cloud-three-tier.json"
+    },
+    {
+      "type": "document",
+      "path": "content/pattern-serverless.json"
+    },
+    {
+      "type": "document",
+      "path": "content/pattern-event-driven.json"
+    },
+    {
+      "type": "document",
+      "path": "content/workflow-end-to-end.json"
     }
   ]
 }

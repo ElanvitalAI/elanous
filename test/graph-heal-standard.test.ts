@@ -1,8 +1,12 @@
 // 힐 표준 템플릿(graphs/heal/heal-loop.yaml)이 «선언으로서» 온전한가 — 파싱 · 카탈로그 역할 · 결과 간선 · 도달성.
 // 설계 = 내부 문서 `RFC-the-heal-loop-is-a-graph-that-raises-its-own-resolution-2026-09-26` §3.1 · 우산 RFC one-loop-engine §3
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { decideGraphApproval, runGraph } from '../src/graph-runner/runner.js';
+import { roleResult } from '../scripts/heal/run-role.js';
+import { recordFailureEvent, startHealLoop } from '../src/self-implement/heal-intake.js';
 import { edgeMapOf, parseGraphTemplateYaml } from '../src/self-implement/graph-yaml.js';
 import { inspectRecipesAgainstCatalog, loadNodeCatalog } from '../src/self-implement/graph-catalog.js';
 
@@ -45,9 +49,15 @@ describe('heal-loop standard template', () => {
     expect(bad).toEqual([]);
   });
 
-  test('triage 는 역할의 결과를 전부 갈래로 받는다(빠진 갈래 = 조용히 막힌 판)', () => {
-    const triageEdge = parsed.template!.edges.find((e) => e.from === 'triage')!;
-    expect(Object.keys(triageEdge.map!).sort()).toEqual([...catalog.roles.get('triage')!.outcomes].sort());
+  test('collect 와 triage 결과는 선언과 양방향으로 맞고 runner error 도 간선이 있다', () => {
+    for (const nodeId of ['collect', 'triage']) {
+      const node = parsed.template!.nodes.find((item) => item.nodeId === nodeId)!;
+      const edge = parsed.template!.edges.find((item) => item.from === nodeId)!;
+      const declared = catalog.roles.get(node.recipe)!.outcomes;
+      expect(Object.keys(edge.map!).filter((outcome) => outcome !== 'error').sort()).toEqual([...declared].sort());
+    }
+    const collectEdge = parsed.template!.edges.find((item) => item.from === 'collect')!;
+    expect(collectEdge.map).toMatchObject({ fail: 'observe-deeper-human', error: 'observe-deeper-human' });
   });
 
   test('모든 노드가 entry 에서 닿고, 모든 비종결 노드가 종결에 닿는다', () => {
@@ -72,6 +82,72 @@ describe('heal-loop standard template', () => {
     const observeFailure = parsed.template!.edges.find((e) => e.from === 'observe-deeper')!;
     expect(observeFailure.map).toMatchObject({ fail: 'observe-deeper-human', error: 'observe-deeper-human' });
     expect(parsed.template!.nodes.find((n) => n.nodeId === 'observe-deeper-human')).toMatchObject({ kind: 'hitl', recipe: 'approval:observe-deeper-failure' });
+  });
+});
+
+describe('heal collect saved failure replay', () => {
+  test('dependency preflight rejects a broken graph before claiming a saved event', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'heal-collect-preflight-'));
+    try {
+      const graph = join(root, 'broken.yaml');
+      writeFileSync(graph, 'graph_id: broken\nentry_node: missing\nnodes: []\n');
+      const event = { source: 'release-run' as const, kind: 'graph-run', ref: 'saved-failure',
+        summary: 'saved failure', at: '2026-11-14T00:00:00.000Z' };
+      recordFailureEvent(event, root);
+      let called = false;
+      await expect(startHealLoop(graph, { runId: 'saved-preflight', input: { failureEvent: event }, deps: { root } }, {},
+        async () => { called = true; })).rejects.toThrow('heal dependency preflight failed');
+      expect(called).toBe(false);
+      expect(existsSync(join(root, 'heal', 'starts'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('missing selector is explicit fail and the real runner pauses at the declared observer', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'heal-collect-edge-'));
+    try {
+      const state = await runGraph(join(ROOT, 'graphs/heal/heal-loop.yaml'), {
+        runId: 'saved-collect-fail', input: { failureEvent: { source: '', ref: 'saved' } }, deps: { root },
+      });
+      expect(state.status).toBe('awaiting-approval');
+      expect(state.path).toEqual(['collect', 'observe-deeper-human']);
+      expect(state.pending?.nodeId).toBe('observe-deeper-human');
+      expect(state.nodes.find((node) => node.nodeId === 'collect')?.output).toContain('invalid-failure-event-selector');
+      const stillPaused = await runGraph(join(ROOT, 'graphs/heal/heal-loop.yaml'), { resumeRunId: state.runId, deps: { root } });
+      expect(stillPaused.status).toBe('awaiting-approval');
+      expect(stillPaused.path).toEqual(state.path);
+      decideGraphApproval(state.graphId, state.runId, 'rejected', 'fake-reviewer', root);
+      const resumed = await runGraph(join(ROOT, 'graphs/heal/heal-loop.yaml'), { resumeRunId: state.runId, deps: { root } });
+      expect(resumed.status).toBe('failed');
+      expect(resumed.path).toEqual(['collect', 'observe-deeper-human', 'failed']);
+      expect(resumed.path.filter((node) => node === 'collect')).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  test('runner error at collect reaches the same saved observer pause', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'heal-collect-runner-error-'));
+    try {
+      const state = await runGraph(join(ROOT, 'graphs/heal/heal-loop.yaml'), {
+        runId: 'saved-collect-error', input: { failure: { failedTests: 1 } },
+        deps: { root, runBash: async () => { throw new Error('fake collect runner error'); } },
+      });
+      expect(state.status).toBe('awaiting-approval');
+      expect(state.path).toEqual(['collect', 'observe-deeper-human']);
+      expect(state.nodes.find((node) => node.nodeId === 'collect')?.error).toContain('fake collect runner error');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  test('ledger read failure is a failed observation, while confirmed absence stays empty', () => {
+    const root = mkdtempSync(join(tmpdir(), 'heal-collect-ledger-'));
+    try {
+      const event = { source: 'release-run' as const, kind: 'graph-run', ref: 'saved-failure',
+        summary: 'saved failure', at: '2026-11-14T00:00:00.000Z' };
+      recordFailureEvent(event, root);
+      const input = { failureEvent: { source: event.source, ref: event.ref } };
+      expect(roleResult('observe-ledger', { input }, { stateRoot: root, loadLedger: () => { throw new Error('read denied'); } }))
+        .toMatchObject({ outcome: 'fail', reason: 'failure-evidence-read-error' });
+      expect(roleResult('observe-ledger', { input: { failureEvent: { source: event.source, ref: 'absent' } } }, { stateRoot: root }))
+        .toMatchObject({ outcome: 'empty', reason: 'inbox-event-not-found' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

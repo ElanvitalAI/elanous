@@ -614,7 +614,11 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           // a stored reply belongs to this poll, so preserve the entire history.
           return [...restorableChatMessages(r.messages!, Date.now()), ...prev];
         });
-      } catch { /* 저장소에 없으면(신규 세션) 무시 */ }
+      } catch {
+        // ifExists=1 returns an empty successful response for a new session.
+        // A rejected request means restore failed; keep that distinct for the user.
+        if (alive) toast.error('대화를 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.');
+      }
     })();
     return () => { alive = false; };
   }, [sessionId, client]);

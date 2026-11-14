@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: cicd",
+  "source": "https://docs.aws.amazon.com/codepipeline/latest/userguide/welcome.html",
+  "body": "무엇: 변경을 시험하고 배포·롤백 절차를 기록한다.\n언제: 반복 배포나 여러 환경에서 재현 가능한 릴리스가 필요할 때.\n대안: 수동 배포와 기록된 검증 절차\nAWS: AWS CodePipeline / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Developer-Tools/48/Arch_AWS-CodePipeline_48.png\nGCP: Cloud Build / Cloud Deploy / 공식 범주 아이콘 경로 Category Icons/DevOps/PNG/DevOps-512-color.png\n공식 출처: https://docs.aws.amazon.com/codepipeline/latest/userguide/welcome.html, https://cloud.google.com/build/docs/overview\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

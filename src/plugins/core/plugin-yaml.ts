@@ -1,3 +1,4 @@
+import { parseCapabilityDiscovery, parseCapabilityRequirements } from './capability-discovery.js';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -39,7 +40,8 @@ export function compilePluginYaml(pluginDir: string): string {
   const raw = record(parseYaml(source), 'plugin.yaml');
   if (raw.apiVersion !== 'elanous.dev/plugin/v2') throw new Error('plugin.yaml apiVersion must be elanous.dev/plugin/v2');
   const allowedKeys = new Set(['apiVersion', 'id', 'name', 'version', 'description', 'graphs', 'graphProviders', 'capabilities', 'ext',
-    'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers', 'dependencies', 'httpGet']);
+    'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers', 'dependencies', 'httpGet',
+    'whenToUse', 'inputs', 'outputs', 'examples', 'requires']);
   const unknownKeys = Object.keys(raw).filter(key => !allowedKeys.has(key));
   if (unknownKeys.length) throw new Error(`plugin.yaml has unsupported keys: ${unknownKeys.join(', ')}`);
   const id = raw.id;
@@ -141,6 +143,8 @@ export function compilePluginYaml(pluginDir: string): string {
     };
   }
 
+  const discovery = parseCapabilityDiscovery(raw);
+  if (discovery) parseCapabilityRequirements(record(raw.requires, 'plugin.yaml requires'), true);
   const manifest = {
     $schema: 'https://antigravity.google/schemas/v1/plugin.json',
     id,
@@ -148,6 +152,8 @@ export function compilePluginYaml(pluginDir: string): string {
     version,
     ...(raw.dependencies === undefined ? {} : { dependencies: record(raw.dependencies, 'plugin.yaml dependencies') }),
     ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
+    ...(discovery ?? {}),
+    ...(raw.requires === undefined ? {} : { requires: record(raw.requires, 'plugin.yaml requires') }),
     ...(Object.keys(contributes).length || skills.length ? { contributes: {
       ...contributes, ...(skills.length ? { skills } : {}),
     } } : {}),

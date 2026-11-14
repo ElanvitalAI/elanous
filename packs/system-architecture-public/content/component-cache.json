@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "구성 요소: cache",
+  "source": "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html",
+  "body": "무엇: 재계산이나 반복 읽기를 줄이는 임시 데이터 계층이다.\n언제: 읽기 병목과 허용 가능한 신선도 지연이 관측될 때. 최종 원장은 별도로 둔다.\n대안: 원본 데이터 저장소 직접 조회\nAWS: Amazon ElastiCache / 공식 아이콘 경로 Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-ElastiCache_48.png\nGCP: Memorystore / 공식 범주 아이콘 경로 Category Icons/Databases/PNG/Databases-512-color.png\n공식 출처: https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html, https://docs.cloud.google.com/memorystore/docs\n결정과 반증: 요구·비용·운영 조건과 맞지 않으면 이 요소를 넣지 않는다."
+}

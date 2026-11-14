@@ -80,6 +80,10 @@ export type MemberCodeValidation =
   | { readonly valid: false; readonly reason: 'invalid' | 'inactive' | 'exhausted' };
 
 export interface MemberStore {
+  /** Persisted deletion state is authoritative for every new app credential or owner mutation. */
+  activeForAuth(memberId: string): boolean;
+  /** Serialize a synchronous issuer with DELETE's member-store transaction. */
+  withActiveForAuth<T>(memberId: string, effect: () => T): { active: true; value: T } | { active: false };
   activeReferralCodeForMember(memberId: string): string | null;
   referralsForMember(memberId: string): Array<{ inviteeId: string; referralCode: string; eventCode: string | null; invitedAt: string }>;
   rotateReferralCode(memberId: string, now?: string): string;
@@ -101,7 +105,10 @@ export interface MemberStore {
   memberForPublicId(publicId: string): string | null;
   handleForMember(memberId: string): string | null;
   memberForHandle(handle: string): string | null;
-  claimHandle(memberId: string, handle: string): string;
+  claimHandle(memberId: string, handle: string, previousPublicUserSlug?: string): string;
+  publicUserSlugForMember(memberId: string): string | null;
+  publicUserSlugForApp(appSlug: string): string | null;
+  memberForPublicUserSlug(userSlug: string): string | null;
   createMemberKey(memberId: string, name: string, now?: string, deliver?: (issued: IssuedMemberKey) => void): IssuedMemberKey;
   listMemberKeys(memberId: string): MemberKeyInfo[];
   revokeMemberKey(memberId: string, keyId: string, now?: string): boolean;
@@ -204,6 +211,13 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         AND handle NOT GLOB '*[^a-z0-9_]*'
         AND handle NOT GLOB 'em_*' AND handle NOT GLOB 'emk_*' AND handle NOT GLOB 'emt_*')
     );
+    CREATE TABLE IF NOT EXISTS member_public_user_slugs (
+      user_slug TEXT PRIMARY KEY COLLATE NOCASE,
+      member_id TEXT NOT NULL REFERENCES members(id),
+      retired INTEGER NOT NULL DEFAULT 0 CHECK(retired IN (0,1))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS member_public_user_slugs_active
+      ON member_public_user_slugs(member_id) WHERE retired = 0;
     CREATE TABLE IF NOT EXISTS member_referral_codes (
       code TEXT PRIMARY KEY COLLATE BINARY, member_id TEXT NOT NULL REFERENCES members(id),
       created_at TEXT NOT NULL, revoked_at TEXT
@@ -370,6 +384,13 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   const nowMs = options.now ?? Date.now;
   let closed = false;
   const assertOpen = () => { if (closed) throw new Error('member store is closed'); };
+  const activeForAuth = (memberId: string): boolean => {
+    assertOpen();
+    if (!memberId || memberId.length > 256) return false;
+    return Boolean(db.query(`SELECT 1 FROM members m WHERE m.id = ? AND NOT EXISTS (
+      SELECT 1 FROM member_deletion_requests d WHERE d.member_id = m.id AND d.status IN ('pending', 'completed')
+    )`).get(memberId));
+  };
   const pruneExpiredAppAuthCodes = (at: string): number => Number(db.query(`DELETE FROM member_app_auth_codes
     WHERE expires_at <= ? OR consumed_at IS NOT NULL`).run(at).changes);
   const appAuthCodeCleanupTimer = setInterval(() => {
@@ -409,6 +430,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   }
 
   function insertSession(memberId: string, at: string): { token: string; expiresAt: string } {
+    if (!activeForAuth(memberId)) throw new Error('member is not active for session');
     const token = randomBytes(32).toString('base64url');
     const expiresAt = iso(Date.parse(at) + SESSION_TTL_MS);
     db.query('INSERT INTO member_sessions (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(hash(token), memberId, at, expiresAt);
@@ -426,6 +448,12 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       throw new Error('member app slot lifecycle identity mismatch');
     }
     return { appId, appSlug, memberId, templateSlug: String(row.template_slug), createdAt: String(row.created_at), lifecycleEvent };
+  }
+
+  function publicUserSlugForMember(memberId: string): string | null {
+    const active = db.query('SELECT user_slug FROM member_public_user_slugs WHERE member_id = ? AND retired = 0')
+      .get(memberId) as { user_slug: string } | null;
+    return active?.user_slug ?? null;
   }
 
   function readAppSlot(memberId: string): MemberAppSlot | null {
@@ -479,6 +507,17 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   }
 
   return {
+    activeForAuth,
+    withActiveForAuth<T>(memberId: string, effect: () => T): { active: true; value: T } | { active: false } {
+      assertOpen();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (!activeForAuth(memberId)) { db.exec('COMMIT'); return { active: false }; }
+        const value = effect();
+        db.exec('COMMIT');
+        return { active: true, value };
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
     activeReferralCodeForMember(memberId) {
       assertOpen();
       return (db.query(`SELECT code FROM member_referral_codes WHERE member_id = ? AND revoked_at IS NULL
@@ -557,6 +596,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       }
       db.exec('BEGIN IMMEDIATE');
       try {
+        if (!activeForAuth(input.memberId)) throw new Error('member is not active for app auth');
         const slot = db.query('SELECT 1 AS found FROM member_app_slots WHERE app_id = ? AND member_id = ?').get(input.appId, input.memberId);
         if (!slot) throw new Error('app auth code owner does not match app slot');
         pruneExpiredAppAuthCodes(at);
@@ -577,6 +617,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
           WHERE code_hash = ? AND state_hash = ? AND code_challenge = ? AND consumed_at IS NULL AND expires_at > ?`).get(codeHash, hash(state), codeChallenge, at) as
           { app_id: string; member_id: string } | null;
         if (!row) { db.exec('COMMIT'); return null; }
+        if (!activeForAuth(row.member_id)) { db.exec('COMMIT'); return null; }
         const updated = db.query(`UPDATE member_app_auth_codes SET consumed_at = ?
           WHERE code_hash = ? AND state_hash = ? AND code_challenge = ? AND consumed_at IS NULL AND expires_at > ?`).run(at, codeHash, hash(state), codeChallenge, at);
         if (Number(updated.changes) !== 1) { db.exec('COMMIT'); return null; }
@@ -600,6 +641,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         let initialKey: IssuedMemberKey | undefined;
         if (existing) {
           const memberId = String(existing.id);
+          if (!activeForAuth(memberId)) throw new Error('member is not active for registration');
           if (intent.referralCode || intent.referrerMemberId || intent.legacyPublicId) throw new Error('existing member cannot accept another referral');
           let eventCode = existing.event_code == null ? null : String(existing.event_code);
           if (intent.eventCode) {
@@ -692,19 +734,75 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       return (db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null)?.handle ?? null;
     },
     memberForHandle(handle) { assertOpen(); return memberForHandle(handle); },
-    claimHandle(memberId, requested) {
+    publicUserSlugForMember(memberId) { assertOpen(); return publicUserSlugForMember(memberId); },
+    publicUserSlugForApp(appSlug) {
+      assertOpen();
+      if (!/^[a-f0-9]{24}$/.test(appSlug)) return null;
+      const row = db.query('SELECT member_id FROM member_app_slots WHERE app_id = ?')
+        .get('kaist-' + appSlug) as { member_id: string } | null;
+      return row ? publicUserSlugForMember(row.member_id) : null;
+    },
+    memberForPublicUserSlug(userSlug) {
+      assertOpen();
+      return (db.query('SELECT member_id FROM member_public_user_slugs WHERE user_slug = ? AND retired = 0')
+        .get(userSlug) as { member_id: string } | null)?.member_id ?? null;
+    },
+    claimHandle(memberId, requested, previousPublicUserSlug) {
       assertOpen();
       const handle = requested;
       if (!/^[a-z][a-z0-9_]{2,29}$/.test(handle)
         || ['em_', 'emk_', 'emt_'].some(prefix => handle.startsWith(prefix))) throw new Error('invalid member ID');
+      const publicLabel = /^[a-z][a-z0-9]{2,19}$/.test(handle);
       db.exec('BEGIN IMMEDIATE');
       try {
-        if (!db.query('SELECT 1 FROM members WHERE id = ?').get(memberId)) throw new Error('member not found');
+        if (!activeForAuth(memberId)) throw new Error('member is not active for handle change');
         const current = db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null;
-        if (current?.handle === handle) { db.exec('COMMIT'); return handle; }
-        if (current) throw new Error('member ID cannot be changed');
-        if (memberForHandle(handle)) throw new Error('member ID already taken');
-        db.query('INSERT INTO member_handles (member_id, handle) VALUES (?, ?)').run(memberId, handle);
+        const active = db.query('SELECT user_slug FROM member_public_user_slugs WHERE member_id = ? AND retired = 0')
+          .get(memberId) as { user_slug: string } | null;
+        const migratingLegacy = Boolean(current && current.handle !== handle && publicLabel
+          && !/^[a-z][a-z0-9]{2,19}$/.test(current.handle)
+          && (!active || active.user_slug === previousPublicUserSlug));
+        if (current && current.handle !== handle && !migratingLegacy) throw new Error('member ID cannot be changed');
+        if (active && active.user_slug !== handle && active.user_slug !== previousPublicUserSlug) {
+          throw new Error('member ID cannot be changed');
+        }
+        const existingOwner = memberForHandle(handle);
+        if (existingOwner && existingOwner !== memberId) throw new Error('member ID already taken');
+        const reserved = db.query('SELECT member_id, retired FROM member_public_user_slugs WHERE user_slug = ?').get(handle) as { member_id: string; retired: number } | null;
+        if (reserved && (reserved.member_id !== memberId || reserved.retired)) throw new Error('member ID already taken');
+        if (publicLabel) {
+          // Only trusted server configuration supplies the legacy slug; never request JSON.
+          if (previousPublicUserSlug && previousPublicUserSlug !== handle) {
+            if (!/^[a-z0-9](?:[a-z0-9-]{1,18}[a-z0-9])$/.test(previousPublicUserSlug)
+              || previousPublicUserSlug.includes('--')) throw new Error('invalid member ID');
+            const old = db.query('SELECT member_id, retired FROM member_public_user_slugs WHERE user_slug = ?')
+              .get(previousPublicUserSlug) as { member_id: string; retired: number } | null;
+            const oldHandleOwner = memberForHandle(previousPublicUserSlug);
+            // A legacy process-wide label may have been shared by several slots.
+            // Never retire another member's binding; reserve it only when unowned.
+            if ((!old || old.member_id === memberId) && (!oldHandleOwner || oldHandleOwner === memberId)) {
+              if (old && !old.retired) db.query('UPDATE member_public_user_slugs SET retired = 1 WHERE user_slug = ? AND member_id = ?')
+                .run(previousPublicUserSlug, memberId);
+              else if (!old) db.query('INSERT INTO member_public_user_slugs (user_slug, member_id, retired) VALUES (?, ?, 1)')
+                .run(previousPublicUserSlug, memberId);
+            } else if (active?.user_slug === previousPublicUserSlug) {
+              throw new Error('member ID already taken');
+            }
+          }
+          if (migratingLegacy && current) {
+            const oldHandle = db.query('SELECT member_id, retired FROM member_public_user_slugs WHERE user_slug = ?')
+              .get(current.handle) as { member_id: string; retired: number } | null;
+            if (oldHandle && oldHandle.member_id !== memberId) throw new Error('member ID already taken');
+            if (oldHandle && !oldHandle.retired) db.query('UPDATE member_public_user_slugs SET retired = 1 WHERE user_slug = ? AND member_id = ?')
+              .run(current.handle, memberId);
+            else if (!oldHandle) db.query('INSERT INTO member_public_user_slugs (user_slug, member_id, retired) VALUES (?, ?, 1)')
+              .run(current.handle, memberId);
+          }
+          if (!reserved) db.query('INSERT INTO member_public_user_slugs (user_slug, member_id, retired) VALUES (?, ?, 0)')
+            .run(handle, memberId);
+        }
+        if (migratingLegacy) db.query('UPDATE member_handles SET handle = ? WHERE member_id = ?').run(handle, memberId);
+        else if (!current) db.query('INSERT INTO member_handles (member_id, handle) VALUES (?, ?)').run(memberId, handle);
         db.exec('COMMIT');
         return handle;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -889,8 +987,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       try {
         const existing = readAppSlot(memberId);
         if (existing) { db.exec('COMMIT'); return existing; }
-        const member = db.query('SELECT id FROM members WHERE id = ?').get(memberId);
-        if (!member) { db.exec('COMMIT'); return null; }
+        if (!activeForAuth(memberId)) { db.exec('COMMIT'); return null; }
         const slot = insertAppSlot(memberId, at);
         db.exec('COMMIT');
         return slot;
@@ -898,13 +995,20 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     },
     createSession(memberId, at = iso(nowMs())) {
       assertOpen();
-      return insertSession(memberId, at);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const session = insertSession(memberId, at);
+        db.exec('COMMIT');
+        return session;
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
     },
     memberForSession(token, at = iso(nowMs())) {
       assertOpen();
       if (!token || token.length > 512) return null;
       const row = db.query(`SELECT m.* FROM member_sessions s JOIN members m ON m.id = s.member_id
-        WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`).get(hash(token), at) as Record<string, unknown> | null;
+        WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+          AND NOT EXISTS (SELECT 1 FROM member_deletion_requests d
+            WHERE d.member_id = m.id AND d.status IN ('pending', 'completed'))`).get(hash(token), at) as Record<string, unknown> | null;
       return row ? profile(row) : null;
     },
     reserveEventTry(memberId, eventCode, maxAttempts, at = iso(nowMs())) {

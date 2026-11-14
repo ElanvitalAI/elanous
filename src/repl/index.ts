@@ -1,3 +1,4 @@
+import { buildInstalledPackQueryTool, dispatchInstalledPackQuery } from '../boot/installed-pack-query.js';
 import { toolActivityTarget } from '../tui/chat/tool-activity.js';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 // Sticky-session REPL — multi-turn CLI conversation in one process.
@@ -59,7 +60,7 @@ import { bashApprovalFinding } from '../tool-runtime/bash-approval.js';
 import { createReplGraphApprover, createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { isToolSearchCall, routeToolSearch } from '../skills/tools/tool-search-route.js';
-import { buildToolSearchTool } from '../skills/tools/tool-search-spec.js';
+import { buildCapabilitySearchTool, CAPABILITY_SEARCH_NAME, buildToolSearchTool, TOOL_SEARCH_NAME } from '../skills/tools/tool-search-spec.js';
 import { agentResultStatus, type AgentDisplayEvent } from '../tui/core/agents.js';
 import { createNextTuiMessageBlockEmitter } from './next-tui-message-blocks.js';
 import { monotonicNowMs } from '../esc-abort-gate.js';
@@ -260,6 +261,9 @@ export function buildReplTools(options: {
 } {
   const specs: LLMToolSpec[] = [];
   const dispatchByName = new Map<string, (args: Record<string, unknown>) => Promise<unknown>>();
+  const packQuery = buildInstalledPackQueryTool();
+  specs.push(packQuery);
+  dispatchByName.set(packQuery.name, args => dispatchInstalledPackQuery(args));
   const sr = require('../session-runtime/index.js') as typeof import('../session-runtime/index.js');
   const surface = sr.resolveSessionSurfaceProfile({ preferredSurfaceId: 'coding/turn' });
   for (const spec of sr.resolveDynamicSessionNativeToolSpecs({
@@ -376,7 +380,8 @@ export function buildReplTools(options: {
       pluginId: tool.pluginId, route: tool.route });
     exposedNames.add(tool.name);
   }
-  if (!specs.some(spec => isToolSearchCall(spec.name))) specs.push(buildToolSearchTool());
+  if (!specs.some(spec => spec.name === TOOL_SEARCH_NAME)) specs.push(buildToolSearchTool());
+  if (!specs.some(spec => spec.name === CAPABILITY_SEARCH_NAME)) specs.push(buildCapabilitySearchTool());
   // TUI-NEXT-QUEUE-AND-WAKE: the next TUI parent opens an IPC hop only for its own REPL children;
   // the classic ScheduleWakeup spec is advertised and each call is answered by the parent's scheduler.
   const wakeMod = require('../tui-client/next-wakeup.js') as typeof import('../tui-client/next-wakeup.js');
@@ -389,7 +394,7 @@ export function buildReplTools(options: {
   const planner = sr.createSearchPlannerState({ maxAutoNarrowCandidates: 2 });
   const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
     try {
-      if (isToolSearchCall(name)) return routeToolSearch(args, specs, { surface: 'tui-next' });
+      if (isToolSearchCall(name)) return routeToolSearch(args, specs, { surface: 'tui-next', requireQueryCoverage: name === CAPABILITY_SEARCH_NAME });
       const direct = dispatchByName.get(name);
       if (direct) return await direct(args);
       if (isReplMessageTool(name)) return await dispatchReplMessageTool(name, args);
@@ -524,7 +529,7 @@ export function buildReplSystemPrompt(ctx: {
     }
   }
   const card = buildSeatBootCardText(ctx);
-  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve로 tailnet 전용 URL만 노출하는 로컬 운영자 배포를 진행하라(공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 보고한 프로세스·serve 설정 범위로만 수행하라.';
+  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve status --json으로 해당 포트의 기존 매핑이 없는지 확인한 뒤 tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>로 그 포트만 tailnet에 공유하라(443의 루트 경로와 기존 Serve 설정 변경 금지, 공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 tailscale serve --tls-terminated-tcp <선택포트> off와 보고한 프로세스 종료만 수행하라(serve reset 금지).';
   const parts = [skillCatalogText, base ?? '', appCapabilityHint, card].filter(part => part.length > 0);
   return parts.length > 0 ? parts.join('\n\n') : undefined;
 }
@@ -1138,7 +1143,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
           true, // JSONL stream → always JSON output
           nextTuiDelivery,
           process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
-            ? (delta) => { process.stdout.write(`${JSON.stringify({ event: 'delta', turnId: turn.id, text: delta })}\n`); }
+            ? (delta) => { process.stdout.write(`${JSON.stringify({ event: 'delta', turnId: turn.id, text: delta, source: 'assistant-text' })}\n`); }
             : undefined,
           process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
             ? (text) => { process.stdout.write(`${JSON.stringify({ event: 'status', turnId: turn.id, text })}\n`); }

@@ -14,6 +14,24 @@ export interface ArchitectureDeliverablesInput {
   stateRoot: string;
 }
 
+const verifiedArtifacts = ['architecture.excalidraw', 'architecture.drawio', 'architecture.svg', 'architecture.png', 'architecture.html', 'architecture.pdf'] as const;
+
+/** Recheck the immutable generation, including both editable exports, before reporting success. */
+export function verifyArchitectureBundleArtifacts(bundleDir: string, sha256: Record<string, string> | undefined): void {
+  for (const name of verifiedArtifacts) {
+    const expected = sha256?.[name];
+    if (!expected || !/^[a-f0-9]{64}$/u.test(expected)) throw new Error(`architecture deliverables receipt digest missing: ${name}`);
+    let bytes: Buffer;
+    try { bytes = readFileSync(join(bundleDir, name)); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`architecture deliverables bundle artifact missing: ${name}`);
+      throw error;
+    }
+    if (createHash('sha256').update(bytes).digest('hex') !== expected)
+      throw new Error(`architecture deliverables digest mismatch: ${name}`);
+  }
+}
+
 /** Common Graph v2 consumer seam for GCP expansion and other architecture producers. */
 export async function runArchitectureDeliverables(input: ArchitectureDeliverablesInput) {
   for (const [key, path] of Object.entries(input)) if (path !== undefined && !isAbsolute(path)) throw new Error(`${key} must be absolute`);
@@ -29,15 +47,12 @@ export async function runArchitectureDeliverables(input: ArchitectureDeliverable
   if (state.status !== 'done') throw new Error(`architecture deliverables graph ${state.status}`);
   const receipt = JSON.parse(readFileSync(join(input.outDir, 'verification.json'), 'utf8')) as {
     status?: string; contract?: string; generation?: string; immutableDirectory?: string; sha256?: Record<string, string> };
-  if (receipt.status !== 'verified' || !['system-architecture@2', 'system-architecture/cloud-expansion@2'].includes(receipt.contract ?? ''))
+  if (receipt.status !== 'verified' || !['system-architecture@2', 'system-architecture/cloud-expansion@2', 'system-architecture/aws@1'].includes(receipt.contract ?? ''))
     throw new Error('architecture deliverables verification missing');
   if (!/^\.architecture-stage-[\w-]+$/u.test(receipt.generation ?? '') ||
       receipt.immutableDirectory !== `.architecture-bundles/${receipt.generation}`)
     throw new Error('architecture deliverables generation missing');
   const bundleDir = join(input.outDir, receipt.immutableDirectory);
-  for (const name of ['architecture.excalidraw', 'architecture.png', 'architecture.html', 'architecture.pdf']) {
-    const digest = createHash('sha256').update(readFileSync(join(bundleDir, name))).digest('hex');
-    if (digest !== receipt.sha256?.[name]) throw new Error(`architecture deliverables digest mismatch: ${name}`);
-  }
+  verifyArchitectureBundleArtifacts(bundleDir, receipt.sha256);
   return { graphId: state.graphId, runId: state.runId, receipt, outDir: input.outDir, bundleDir };
 }

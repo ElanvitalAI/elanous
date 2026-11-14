@@ -32,7 +32,7 @@ import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, effectiveCode
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
 import { decodeJWTPayload } from './jwt.js';
 import { authStorePath, isUnderTestRunner } from './store.js';
-import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, shouldPreferHostCodexMirror, shouldUseCodexOwnerMirror, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { resolveCodexCredentialOwnerHost } from '../nexus/config/secrets/cred-owner.js';
 import { codexHealthCredential, recordCodexUnauthorized } from './codex-account-health.js';
 import { getUserConfig } from '../user-config.js';
@@ -476,10 +476,12 @@ function remainingSeconds(state: ProviderAuthState | null): number | null {
 export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: ProviderAuthState; storeKey: string; storePath: string } {
   const mirrorPath = ownerMirrorPath ?? codexOwnerMirrorAuthPath();
   const account = resolveCodexAccountForRun(process.env, {
-    storePath: (ownerMirrorPath || process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH)
+    storePath: (shouldPreferHostCodexMirror() || ownerMirrorPath || process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH)
       ? mirrorPath : codexAccountReadStorePath(authStorePath()),
   });
-  if (!ownerMirrorPath) {
+  // On a fleet nonowner, an isolated store can contain an expired credential
+  // with refresh authority. Select the host access mirror before reading it.
+  if (!ownerMirrorPath && !shouldPreferHostCodexMirror()) {
     for (const [source, path] of [['config-dir', authStorePath()], ['default-root', join(homedir(), '.elanous', 'auth.json')]] as const) {
       try {
         const stat = lstatSync(path);

@@ -110,3 +110,17 @@ export function buildToolSearchTool(): LLMToolSpec {
     },
   };
 }
+
+/** General capability discovery shares ToolSearch's authoritative surface pool and hydration. */
+export const CAPABILITY_SEARCH_NAME = 'capability_search';
+export function buildCapabilitySearchTool(): LLMToolSpec {
+  const spec = buildToolSearchTool();
+  return {
+    ...spec,
+    name: CAPABILITY_SEARCH_NAME,
+    description: 'Before choosing how to fulfill an unfamiliar request, search registered capabilities by the user intent. ' +
+      'Read the returned usage, prerequisites and input/output schema, then call an available tool. ' +
+      'Discovery does not grant authority or bypass owner verification or confirmation. ' +
+      'Use query keywords, route:<request>, or select:<tool-name>; only this surface callable tools are returned.',
+  };
+}

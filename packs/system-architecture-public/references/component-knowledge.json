@@ -1,0 +1,247 @@
+{
+  "version": 1,
+  "description": "공식 AWS/GCP 문서를 바탕으로 작성한 구성 요소 선택 질문. 서비스 대응은 동일한 보장이나 가격을 뜻하지 않는다.",
+  "whenToUse": "요구사항에서 트래픽, 보안 경계, 영속성, 비동기 처리, 운영 관측 조건을 뽑아 구성 요소를 선택할 때. 미요청 일반 대화에는 로드하지 않는다.",
+  "components": [
+    {
+      "id": "cdn",
+      "description": "정적 또는 캐시 가능한 응답을 사용자 가까이에 전달한다.",
+      "whenToUse": "지리적으로 분산된 읽기 부하나 큰 정적 자산이 있을 때. 개인화 응답 캐시 정책을 먼저 정한다.",
+      "alternative": "원본 서버 직접 전달",
+      "aws": "Amazon CloudFront",
+      "gcp": "Cloud CDN",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-CloudFront_48.png",
+      "gcpIconKey": "Category Icons/Networking/PNG/Networking-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Introduction.html",
+        "https://cloud.google.com/cdn/docs/overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "waf",
+      "description": "HTTP 요청 규칙으로 공개 웹 입구를 보호한다.",
+      "whenToUse": "공개 API나 웹의 악성 요청 완화가 필요할 때. 인증과 권한 검사를 대체하지 않는다.",
+      "alternative": "애플리케이션 규칙 및 전용 보안 프록시",
+      "aws": "AWS WAF",
+      "gcp": "Cloud Armor",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Security-Identity/48/Arch_AWS-WAF_48.png",
+      "gcpIconKey": "Category Icons/Security Identity/PNG/SecurityIdentity-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/waf/latest/developerguide/waf-chapter.html",
+        "https://cloud.google.com/armor/docs/cloud-armor-overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "load-balancer",
+      "description": "요청을 여러 백엔드로 분산하고 상태를 검사한다.",
+      "whenToUse": "여러 인스턴스나 지역으로 가용성과 처리량을 늘릴 때.",
+      "alternative": "단일 서버 직접 연결",
+      "aws": "Application Load Balancer",
+      "gcp": "Application Load Balancer",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Elastic-Load-Balancing_48.png",
+      "gcpIconKey": "Category Icons/Networking/PNG/Networking-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html",
+        "https://cloud.google.com/load-balancing/docs/load-balancing-overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "api-gateway",
+      "description": "API 입구에서 라우팅과 정책을 중앙 관리한다.",
+      "whenToUse": "여러 API나 서버리스 엔드포인트에 공통 인증·제한·버전 정책이 필요할 때.",
+      "alternative": "앱 또는 프록시에서 직접 라우팅",
+      "aws": "Amazon API Gateway",
+      "gcp": "API Gateway",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-API-Gateway_48.png",
+      "gcpIconKey": "Category Icons/Integration Services/PNG/IntegrationServices-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/apigateway/latest/developerguide/welcome.html",
+        "https://cloud.google.com/api-gateway/docs/about-api-gateway"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "queue",
+      "description": "작업을 비동기로 버퍼링해 생산자와 소비자의 부하를 분리한다.",
+      "whenToUse": "요청 처리와 느린 작업을 분리하거나 급증을 완충할 때. 중복 전달과 재시도 정책을 정한다.",
+      "alternative": "동기 호출 또는 데이터베이스 작업 테이블",
+      "aws": "Amazon SQS",
+      "gcp": "Cloud Tasks",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Application-Integration/48/Arch_Amazon-Simple-Queue-Service_48.png",
+      "gcpIconKey": "Category Icons/Integration Services/PNG/IntegrationServices-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html",
+        "https://docs.cloud.google.com/tasks/docs/dual-overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "cache",
+      "description": "재계산이나 반복 읽기를 줄이는 임시 데이터 계층이다.",
+      "whenToUse": "읽기 병목과 허용 가능한 신선도 지연이 관측될 때. 최종 원장은 별도로 둔다.",
+      "alternative": "원본 데이터 저장소 직접 조회",
+      "aws": "Amazon ElastiCache",
+      "gcp": "Memorystore",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-ElastiCache_48.png",
+      "gcpIconKey": "Category Icons/Databases/PNG/Databases-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/WhatIs.html",
+        "https://docs.cloud.google.com/memorystore/docs"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "rdbms",
+      "description": "트랜잭션과 관계형 질의가 필요한 영속 데이터를 보관한다.",
+      "whenToUse": "원자성·제약·조인·정합성이 핵심일 때.",
+      "alternative": "SQLite 단일 노드 또는 적합한 NoSQL 모델",
+      "aws": "Amazon RDS",
+      "gcp": "Cloud SQL",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-RDS_48.png",
+      "gcpIconKey": "Unique Icons/Cloud SQL/PNG/CloudSQL-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html",
+        "https://cloud.google.com/sql/docs/introduction"
+      ],
+      "gcpIconScope": "product"
+    },
+    {
+      "id": "nosql",
+      "description": "키 기반 대규모 접근 패턴에 맞춘 관리형 데이터 저장소다.",
+      "whenToUse": "접근 키와 일관성 요구가 명확하고 관계형 트랜잭션이 우선이 아닐 때.",
+      "alternative": "관계형 DB",
+      "aws": "Amazon DynamoDB",
+      "gcp": "Firestore",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Databases/48/Arch_Amazon-DynamoDB_48.png",
+      "gcpIconKey": "Category Icons/Databases/PNG/Databases-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html",
+        "https://cloud.google.com/firestore/docs/overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "object-storage",
+      "description": "파일과 정적 객체를 내구성 있게 보관한다.",
+      "whenToUse": "업로드·미디어·백업·정적 배포 등 객체 단위 접근이 있을 때.",
+      "alternative": "로컬 파일 시스템 또는 블록 저장소",
+      "aws": "Amazon S3",
+      "gcp": "Cloud Storage",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Storage/48/Arch_Amazon-Simple-Storage-Service_48.png",
+      "gcpIconKey": "Unique Icons/Cloud Storage/PNG/Cloud_Storage-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html",
+        "https://cloud.google.com/storage/docs/introduction"
+      ],
+      "gcpIconScope": "product"
+    },
+    {
+      "id": "broker",
+      "description": "이벤트를 여러 구독자에게 전달한다.",
+      "whenToUse": "하나의 사건을 여러 독립 소비자가 처리하거나 스트림 재생이 필요할 때.",
+      "alternative": "단일 작업 큐 또는 동기 이벤트 호출",
+      "aws": "Amazon EventBridge",
+      "gcp": "Pub/Sub",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Application-Integration/48/Arch_Amazon-EventBridge_48.png",
+      "gcpIconKey": "Category Icons/Integration Services/PNG/IntegrationServices-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-what-is.html",
+        "https://cloud.google.com/pubsub/docs/overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "worker",
+      "description": "백그라운드 작업을 실행한다.",
+      "whenToUse": "요청 지연 한도와 별개로 처리할 작업이 있을 때. 멱등성과 재시도 한도를 둔다.",
+      "alternative": "요청 핸들러 내부 처리",
+      "aws": "AWS Lambda",
+      "gcp": "Cloud Run jobs",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Compute/48/Arch_AWS-Lambda_48.png",
+      "gcpIconKey": "Unique Icons/Cloud Run/PNG/CloudRun-512-color-rgb.png",
+      "sources": [
+        "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html",
+        "https://cloud.google.com/run/docs/create-jobs"
+      ],
+      "gcpIconScope": "product"
+    },
+    {
+      "id": "identity",
+      "description": "서비스와 사용자의 인증·권한 경계를 정의한다.",
+      "whenToUse": "역할별 데이터나 운영 권한이 다를 때. 최소 권한으로 설계한다.",
+      "alternative": "로컬 앱 자체 세션과 권한 저장소",
+      "aws": "AWS IAM / IAM Identity Center",
+      "gcp": "Cloud IAM / Identity Platform",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Security-Identity/48/Arch_AWS-IAM-Identity-Center_48.png",
+      "gcpIconKey": "Category Icons/Security Identity/PNG/SecurityIdentity-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html",
+        "https://cloud.google.com/iam/docs/overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "observability",
+      "description": "로그·메트릭·추적을 연결해 상태와 실패를 진단한다.",
+      "whenToUse": "SLO·장애 분석·비동기 추적이 필요한 운영 경로에서.",
+      "alternative": "단일 서버 구조화 로그",
+      "aws": "Amazon CloudWatch / AWS X-Ray",
+      "gcp": "Cloud Logging / Monitoring / Trace",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Management-Tools/48/Arch_Amazon-CloudWatch_48.png",
+      "gcpIconKey": "Category Icons/Observability/PNG/Observability-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html",
+        "https://docs.cloud.google.com/docs/observability"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "secrets",
+      "description": "자격 정보를 코드와 일반 설정에서 분리해 관리한다.",
+      "whenToUse": "서비스 키·DB 자격의 회전과 접근 감사가 필요할 때.",
+      "alternative": "로컬 운영자 관리 비밀 저장소",
+      "aws": "AWS Secrets Manager",
+      "gcp": "Secret Manager",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Security-Identity/48/Arch_AWS-Secrets-Manager_48.png",
+      "gcpIconKey": "Category Icons/Security Identity/PNG/SecurityIdentity-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html",
+        "https://cloud.google.com/secret-manager/docs/overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "cicd",
+      "description": "변경을 시험하고 배포·롤백 절차를 기록한다.",
+      "whenToUse": "반복 배포나 여러 환경에서 재현 가능한 릴리스가 필요할 때.",
+      "alternative": "수동 배포와 기록된 검증 절차",
+      "aws": "AWS CodePipeline",
+      "gcp": "Cloud Build / Cloud Deploy",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Developer-Tools/48/Arch_AWS-CodePipeline_48.png",
+      "gcpIconKey": "Category Icons/DevOps/PNG/DevOps-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/codepipeline/latest/userguide/welcome.html",
+        "https://cloud.google.com/build/docs/overview"
+      ],
+      "gcpIconScope": "category"
+    },
+    {
+      "id": "dns",
+      "description": "서비스 이름을 접속 가능한 엔드포인트에 연결한다.",
+      "whenToUse": "공개 도메인, 장애 전환 또는 라우팅 정책이 필요할 때.",
+      "alternative": "로컬 호스트 이름 또는 tailnet 이름",
+      "aws": "Amazon Route 53",
+      "gcp": "Cloud DNS",
+      "awsIconKey": "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/48/Arch_Amazon-Route-53_48.png",
+      "gcpIconKey": "Category Icons/Networking/PNG/Networking-512-color.png",
+      "sources": [
+        "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/Welcome.html",
+        "https://cloud.google.com/dns/docs/overview"
+      ],
+      "gcpIconScope": "category"
+    }
+  ]
+}

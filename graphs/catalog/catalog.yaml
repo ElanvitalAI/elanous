@@ -422,7 +422,7 @@ roles:
   - role: observe-ledger
     kind: observe
     grain: atom
-    outcomes: [ok, empty]
+    outcomes: [ok, empty, fail]
     effects: none
     spawn: runtime
     body: { ref: "src/self-implement/run-ledger.ts:608", symbol: "loadRunLedger · queryRunChain(:2396) · timeline(:633)", llm: false }

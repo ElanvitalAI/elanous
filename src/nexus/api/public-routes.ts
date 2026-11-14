@@ -25,6 +25,8 @@ export interface PublicRoute {
 }
 
 export const PUBLIC_ROUTES: Array<PublicRoute> = [
+  { method: 'PUT', match: 'exact', path: '/v1/members/handle', selfVerified: true,
+    why: 'handle registration verifies its own member web session or app owner session before claiming a name' },
   { method: 'POST', match: 'exact', path: '/v1/tokens', selfVerified: true,
     why: 'member key bearer is checked by the token API before minting a scoped access token' },
   { method: 'POST', match: 'exact', path: '/v1/tokens/introspect', selfVerified: true,

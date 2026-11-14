@@ -36,6 +36,21 @@ test('40-column status keeps exact provider counts at the seven-digit boundary',
   expect(line).toContain('B0');
 });
 
+test('live output estimates remain labelled at narrow widths and never replace measured usage', () => {
+  const input = { turnState: '응답 중', model: 'provider/model-x', queued: 0, backgroundTasks: 0,
+    elapsedMs: 1450, estimatedOutputTokens: 123 };
+  expect(formatNextTuiStatusLine({ ...input, width: 100 })).toContain('출력 토큰 추정 123');
+  const narrow = formatNextTuiStatusLine({ ...input, width: 40 });
+  expect(narrow).toContain('추정123t');
+  expect(narrow).toContain('1.4초');
+  expect(Bun.stringWidth(narrow)).toBeLessThanOrEqual(40); // Source: #37098 CORE21 40-column narrow Next PTY contract.
+  const completed = formatNextTuiStatusLine({ ...input, width: 100, turnState: '응답 완료',
+    measuredUsage: { inputTokens: 77, outputTokens: 9 } });
+  expect(completed).toContain('토큰 77/9');
+  expect(completed).not.toContain('추정');
+  expect(formatNextTuiStatusLine({ ...input, width: 100, estimatedOutputTokens: NaN })).toContain('토큰 ?/?');
+});
+
 test('40-column status keeps exact max-safe provider counts before optional counters', () => {
   const line = formatNextTuiStatusLine({
     turnState: '응답 완료', model: 'provider/a-long-model-name', queued: 0, backgroundTasks: 0,
@@ -45,6 +60,32 @@ test('40-column status keeps exact max-safe provider counts before optional coun
   expect(Bun.stringWidth(line)).toBeLessThanOrEqual(40); // Source: #37098 B3 row 11 measured status at 40 columns.
   expect(line).toContain('9007199254740991/9007199254740991t');
   expect(line).toContain('~9e12s');
+});
+
+test('streaming partial usage preserves measured input alongside labelled output estimate', () => {
+  const input = { turnState: '응답 중', model: 'provider/model-x', queued: 0, backgroundTasks: 0,
+    elapsedMs: 1450, measuredUsage: { inputTokens: 77 }, estimatedOutputTokens: 123 };
+  expect(formatNextTuiStatusLine({ ...input, width: 100 })).toContain('토큰 77/추정123');
+  expect(formatNextTuiStatusLine({ ...input, width: 40 })).toContain('77/추정123t');
+  expect(nextTuiStatusLine({ state: '응답 중', queued: 0, activeChildren: 0, columns: 40,
+    elapsedMs: input.elapsedMs, measuredUsage: input.measuredUsage, estimatedOutputTokens: 123 })).toContain('77/추정123t');
+  const actualOutput = formatNextTuiStatusLine({ ...input, width: 100, measuredUsage: { inputTokens: 77, outputTokens: 0 } });
+  expect(actualOutput).toContain('토큰 77/0');
+  expect(actualOutput).not.toContain('추정');
+});
+
+test('40-column long-duration partial usage keeps the estimate label and exact counts', () => {
+  const line = formatNextTuiStatusLine({ turnState: '응답 중', model: 'provider/model-x',
+    queued: 0, backgroundTasks: 0, width: 40, elapsedMs: Number.MAX_SAFE_INTEGER,
+    measuredUsage: { inputTokens: 77 }, estimatedOutputTokens: Number.MAX_SAFE_INTEGER });
+  expect(Bun.stringWidth(line)).toBeLessThanOrEqual(40); // Source: #37098 CORE21 40-column viewport contract.
+  expect(line).toContain('77/추정9007199254740991t');
+  expect(line).toContain('~9e12s');
+  const fullPair = formatNextTuiStatusLine({ turnState: '응답 중', model: 'provider/model-x',
+    queued: 0, backgroundTasks: 0, width: 40, elapsedMs: Number.MAX_SAFE_INTEGER,
+    measuredUsage: { inputTokens: Number.MAX_SAFE_INTEGER }, estimatedOutputTokens: Number.MAX_SAFE_INTEGER });
+  expect(Bun.stringWidth(fullPair)).toBeLessThanOrEqual(40); // Source: #37098 CORE21 40-column viewport contract.
+  expect(fullPair).toContain('9007199254740991/추정9007199254740991t');
 });
 
 test('status line keeps turn, model, queue and background task counts together', () => {

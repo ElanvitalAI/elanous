@@ -1,0 +1,9 @@
+{
+  "name": "elanous-ticketing-starter",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "start": "bun run backend/server.ts",
+    "test": "bun test test"
+  }
+}

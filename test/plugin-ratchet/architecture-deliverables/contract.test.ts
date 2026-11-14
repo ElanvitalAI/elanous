@@ -8,7 +8,8 @@ import { installedPluginGraphs } from '../../../src/exec-requests/planner.js';
 import { simCli } from '../../../src/ux-sim/in-process-cli.js';
 
 const dir = join(import.meta.dir, '../../../plugins/architecture-deliverables');
-const required = ['architecture.excalidraw', 'architecture.png', 'architecture.html', 'architecture.pdf', 'verification.json'];
+const required = ['architecture.excalidraw', 'architecture.drawio', 'architecture.svg', 'architecture.png', 'architecture.html', 'architecture.pdf', 'verification.json'];
+const legacySampleRequired = ['architecture.excalidraw', 'architecture.png', 'architecture.html', 'architecture.pdf', 'verification.json'];
 const sections = ['배경', '요구사항', '구성도', '데이터 흐름', '보안 등급', '비용 예측', '절감안', '대안', '결정 기록'];
 
 test('plugin declares the four-stage output contract and installs', async () => {
@@ -18,8 +19,8 @@ test('plugin declares the four-stage output contract and installs', async () => 
   expect(ext.outputContract.pdfSections).toEqual(sections);
   expect(ext.outputContract.diagramQuality.layers).toEqual(['users', 'edge', 'application', 'data', 'observability', 'security']);
   expect(ext.outputContract.pdfQuality).toEqual(['cover', 'table of contents', 'executive summary', 'embedded diagram', 'tables', 'appendix']);
-  const graph = parseYaml(readFileSync(join(dir, 'graphs/architecture-deliverables.yaml'), 'utf8')) as { nodes: Array<{ node_id: string }>; edges: Array<{ from: string; map: Record<string, string> }> };
-  expect(graph.nodes.map(n => n.node_id)).toEqual(['design', 'diagram', 'pdf', 'verify', 'done', 'failed']);
+  const graph = parseYaml(readFileSync(join(dir, 'graphs/architecture-deliverables.yaml'), 'utf8')) as { nodes: Array<{ id: string }>; edges: Array<{ from: string; map: Record<string, string> }> };
+  expect(graph.nodes.map(n => n.id)).toEqual(['design', 'diagram', 'pdf', 'verify']);
   expect(graph.edges.map(e => e.map.ok)).toEqual(['diagram', 'pdf', 'verify', 'done']);
   const root = mkdtempSync(join(tmpdir(), 'architecture-plugin-test-'));
   try {
@@ -28,7 +29,7 @@ test('plugin declares the four-stage output contract and installs', async () => 
     expect(existsSync(join(installed.path, 'graphs/architecture-deliverables.yaml'))).toBe(true);
     const catalog = installedPluginGraphs(join(root, 'plugins'));
     expect(catalog.errors).toEqual([]);
-    expect(catalog.graphs.find(graph => graph.id === 'architecture-deliverables')?.inputKeys).toEqual(['designHtmlPath', 'diagramSourcePath', 'outDir']);
+    expect(catalog.graphs.find(graph => graph.id === 'architecture-deliverables')?.inputKeys).toEqual(['structuredDesignPath', 'outDir', 'resourceRoot']);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -56,7 +57,7 @@ test('GCP reference samples meet the professional diagram and integrated PDF con
 test('all PR samples contain an editable source, rendered PNG, and complete PDF', () => {
   for (const name of ['cloud-sim', 'ticketing', 'solar-ticketing-gcp']) {
     const sample = join(dir, '../../docs/samples/architecture-deliverables', name);
-    for (const file of required) expect(existsSync(join(sample, file))).toBe(true);
+    for (const file of legacySampleRequired) expect(existsSync(join(sample, file))).toBe(true);
     const source = JSON.parse(readFileSync(join(sample, 'architecture.excalidraw'), 'utf8')) as { type: string; elements: unknown[] };
     expect(source.type).toBe('excalidraw');
     expect(source.elements.length).toBeGreaterThan(10); // source: docs/samples/architecture-deliverables/cloud-sim/verification.json

@@ -63,8 +63,8 @@ describe('knowledge pack auto-select simulation', () => {
       // Source: SYSTEM-DESIGN-DOMAIN-PACK completion contract requires three-line selection.
       expect(SYSTEM_ARCHITECTURE_DESIGN_REQUEST.split('\n')).toHaveLength(3);
       expect(receipt.activeTools).toContain('KnowledgeQuery');
-      expect(receipt.selectedPack?.id).toBe('pack:system-architecture-public@0.1.0');
-      expect(receipt.citations.some(ref => ref.startsWith('pack:system-architecture-public@0.1.0#'))).toBe(true);
+      expect(receipt.selectedPack?.id).toBe('pack:system-architecture-public@0.2.0');
+      expect(receipt.citations.some(ref => ref.startsWith('pack:system-architecture-public@0.2.0#'))).toBe(true);
       // Source: the acceptance path makes one KGS dispatch, which can return many cited cards.
       expect(receipt.kgsCalls).toBe(1);
       const pack = validateKnowledgePack(join(import.meta.dir, '../../packs/system-architecture-public')).pack;
@@ -80,6 +80,24 @@ describe('knowledge pack auto-select simulation', () => {
     } finally {
       stream.mockRestore();
     }
+  });
+
+  test('requested system architecture workflow exposes FE, BE, DB, test and deploy guidance', () => {
+    const store = new KgsSqliteStore(':memory:');
+    try {
+      store.writePack(validateKnowledgePack(join(import.meta.dir, '../../packs/system-architecture-public')).pack);
+      const hits = queryInstalledPack('pack:system-architecture-public@0.2.0', '요구 아키텍처 FE BE DB 시험 배포', store);
+      const workflow = hits.find(hit => hit.title.includes('요구에서 배포까지'));
+      expect(workflow?.body).toContain('frontend:');
+      expect(workflow?.body).toContain('backend:');
+      expect(workflow?.body).toContain('database:');
+      expect(workflow?.body).toContain('test:');
+      expect(workflow?.body).toContain('deploy:');
+      expect(resolveInstalledKnowledgePack('동네 도서관 대출 사이트 구조와 API DB 시험 배포 절차를 설계해줘', store)).toMatchObject({
+        kind: 'selected', pack: { id: 'pack:system-architecture-public@0.2.0' },
+      });
+      expect(resolveInstalledKnowledgePack('오늘 날씨 알려줘', store)).toEqual({ kind: 'none' });
+    } finally { store.close(); }
   });
 
   test('equal intent tags and priority ask the user to choose two packs without vault fallback', async () => {

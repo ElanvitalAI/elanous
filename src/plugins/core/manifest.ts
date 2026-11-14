@@ -1,3 +1,4 @@
+import { parseCapabilityDiscovery, parseCapabilityRequirements, type CapabilityDiscoveryMetadata } from './capability-discovery.js';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import type { Keybinding, PluginDependency, SlashCommand } from './types.js';
@@ -225,7 +226,7 @@ export interface PluginTaskContribution {
   requiresTrust?: boolean;
 }
 
-export interface PluginManifest {
+export interface PluginManifest extends Partial<CapabilityDiscoveryMetadata> {
   id: string;
   name: string;
   version: string;
@@ -355,7 +356,8 @@ export function parsePluginManifest(
       ? raw.capabilities
       : [...parseCapabilities(raw.capabilities), ...parseCapabilities(extension.capabilities)]);
   const dependencies = parseDependencies(raw.dependencies);
-  const requires = parsePluginRequires(raw.requires === undefined ? extension.requires : raw.requires);
+  const discovery = parseCapabilityDiscovery(raw);
+  const requires = parsePluginRequires(raw.requires === undefined ? extension.requires : raw.requires, discovery !== undefined);
   const description = typeof raw.description === 'string' ? raw.description : undefined;
   const allowMultiActive = typeof raw.allowMultiActive === 'boolean' ? raw.allowMultiActive : undefined;
   const activePeerCompat = parseActivePeerCompat(raw.activePeerCompat);
@@ -365,6 +367,7 @@ export function parsePluginManifest(
     name,
     version,
     ...(description ? { description } : {}),
+    ...(discovery ?? {}),
     main,
     activationEvents,
     contributes,
@@ -1188,10 +1191,11 @@ function parseCapabilities(value: unknown): PluginCapability[] {
   });
 }
 
-function parsePluginRequires(value: unknown): PluginDependency | undefined {
+function parsePluginRequires(value: unknown, strictDiscovery = false): PluginDependency | undefined {
   if (value === undefined) return undefined;
   const raw = objectOrEmpty(value, 'requires');
   return {
+    ...(strictDiscovery ? parseCapabilityRequirements(raw, true) : {}),
     ...(raw.elanous !== undefined ? { elanous: stringOr(raw.elanous) } : {}),
     ...(raw.tools !== undefined ? { tools: stringArrayOr(raw.tools, []) } : {}),
     ...(raw.optionalTools !== undefined ? { optionalTools: stringArrayOr(raw.optionalTools, []) } : {}),
