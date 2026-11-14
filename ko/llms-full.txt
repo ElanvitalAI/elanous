@@ -5200,6 +5200,23 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.21
+
+Source: https://docs.elanous.ai/releases/0-3-21/
+
+- Open the classic terminal interface directly when your provider is ready, without being sent back to optional web setup.
+- Follow tool activity in start order with tool names and safe targets; completed activity remains visible after the turn.
+
+## Known issues
+
+- Some focused validation reported an unexplained nonzero process exit; its cause remains under investigation.
+- Terminal member connection still has edge cases around slow polling, session revocation during approval, and request limits across proxy clients.
+- The full automated release gate is not part of this manual hotfix path. Complete installed demo flows and live-key integrations require separate verification.
+- Key backup needs a matching server update; production backup and restore remain unverified.
+- The test setup path can copy existing credential files. Use an explicitly isolated configuration with synthetic credentials.
+
+---
+
 # 0.3.20
 
 Source: https://docs.elanous.ai/releases/0-3-20/
