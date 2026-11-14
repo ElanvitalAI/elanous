@@ -1,3 +1,4 @@
+import { updateToolActivity, toolActivityLines, type ToolActivityRow } from './chat/tool-activity.js';
 import { initTui, initTuiPrimary, closeTui, injectKey, pendingKeyCount as tuiPendingKeyCount, readKey, setTuiAltScreen, setTuiMouseCapture, type Key } from '../tui.js';
 import { createNextTuiCompactPainter, createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiCompactFrame, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
 import { renderNextTuiEntryFrame, shellApprovalCommandViewport } from './core/entry-render.js';
@@ -246,6 +247,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   });
   const activeShellCalls = new Map<string, NextTuiActiveShellCall>();
   const activeToolCalls = new Map<string, string>();
+  let visibleToolActivity: ToolActivityRow[] = [];
   const shellActivitySnapshotRequest: { current: (() => boolean) | null } = { current: null };
   const pushNowRequest: { current: ((requestId: string) => boolean) | null } = { current: null };
   const pushNowCommit: { current: ((requestId: string) => boolean) | null } = { current: null };
@@ -622,6 +624,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     const reconciledAgents = reconcileAgentOutputStatuses(agents, messages, backgroundJobs.snapshot()?.tasks);
     const displayActivity = [
+      ...(busy ? toolActivityLines(visibleToolActivity, performance.now()) : []),
       ...(!basicChat ? [
         ...agentDisplayLines(reconciledAgents),
         ...reconciledAgents.map(agentDisplayLine),
@@ -1077,6 +1080,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     agents = [];
     activeShellCalls.clear();
     activeToolCalls.clear();
+    visibleToolActivity = [];
     stopConfirmationSelection = null;
     stopConfirmationKind = null;
     pushNowSnapshotPending = false;
@@ -1146,6 +1150,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             }
             render();
           }, (event) => {
+            if (!busy || id !== turnSessionId) return;
+            visibleToolActivity = updateToolActivity(visibleToolActivity, event, performance.now());
             if (event.phase === 'snapshot') {
               activeToolCalls.clear();
               for (const call of event.calls) activeToolCalls.set(call.id, call.name);
@@ -1159,7 +1165,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             } else if (event.phase === 'finish' && event.name !== 'Bash' && event.name !== 'RunShell') {
               status = '응답 중 · Esc 취소';
               render();
-            }
+            } else render();
           }, (event) => applyPushNowDecision(event.requestId, event.outcome, event.activeTools));
       },
       onProgress: reportTuiProgress,

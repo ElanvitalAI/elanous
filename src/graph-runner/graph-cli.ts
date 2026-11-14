@@ -1,13 +1,12 @@
 import type { Command } from 'commander';
 import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { basename, dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import type { GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { debug } from '../debug/log.js';
 import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, manageGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
-import { createDefaultMarketDataRegistry } from './capability-providers/market-data/registry.js';
+import { defaultCapabilityRegistryForGraph } from './plugin-graph-providers.js';
 import { importN8nExecuteWorkflow } from '../graph-v2/n8n-import.js';
 import { resolveGraphUnit } from '../self-implement/graph-unit-resolver.js';
 import { loadGraphPluginFromDir } from './graph-manifest-loader.js';
@@ -35,28 +34,6 @@ function findGraphFile(graphId: string, extraRoots: string[] = []): string | und
   return undefined;
 }
 
-async function defaultCapabilityRegistryForGraph(file: string) {
-  const graphPath = resolve(file);
-  const graphDir = dirname(graphPath);
-  const pluginRoot = existsSync(join(graphDir, 'plugin.json')) ? graphDir : resolve(graphDir, '..');
-  const manifestPath = join(pluginRoot, 'plugin.json');
-  if (!existsSync(manifestPath)) return createDefaultMarketDataRegistry();
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions?: { 'ai.elanous'?: {
-    graphs?: string[]; graphProviders?: Record<string, { module: string; factory: string; withPluginRoot?: boolean }> } } };
-  const extension = manifest.extensions?.['ai.elanous'];
-  const relativeGraph = relative(pluginRoot, graphPath).split(sep).join('/').replace(/^\.\//, '');
-  const declaredGraphs = (extension?.graphs ?? []).map(graph => graph.replace(/^\.\//, ''));
-  if (!declaredGraphs.includes(relativeGraph)) return createDefaultMarketDataRegistry();
-  const declaration = extension?.graphProviders?.[relativeGraph] ?? extension?.graphProviders?.[`./${relativeGraph}`];
-  if (!declaration) return createDefaultMarketDataRegistry();
-  const modulePath = realpathSync(resolve(import.meta.dir, '../..', declaration.module));
-  const providerRoot = realpathSync(resolve(import.meta.dir, '.'));
-  if (!modulePath.startsWith(providerRoot + '/')) throw new Error('plugin graph provider must use the shared graph runner');
-  const module = await import(pathToFileURL(modulePath).href) as Record<string, unknown>;
-  const factory = module[declaration.factory];
-  if (typeof factory !== 'function') throw new Error(`plugin graph provider factory missing: ${declaration.factory}`);
-  return declaration.withPluginRoot ? factory(pluginRoot) : factory();
-}
 
 export function registerGraphCommands(program: Command, runsDeps: {
   root?: string; processStartMs?: (pid: number) => number | null; graphRoots?: string[];
@@ -204,7 +181,7 @@ export function registerGraphCommands(program: Command, runsDeps: {
           input = parsed as Record<string, unknown>;
         }
         const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
-          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: runsDeps.capabilityProviders ?? await defaultCapabilityRegistryForGraph(file) } });
+          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: runsDeps.capabilityProviders ?? await defaultCapabilityRegistryForGraph(file, runsDeps.root) } });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;

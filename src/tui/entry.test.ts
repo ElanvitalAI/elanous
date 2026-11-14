@@ -667,7 +667,7 @@ test('compact Next TUI projects shell and tool activity without internal names',
     expect(screen).not.toContain('PRIVATE-tool-diagnostic');
     expect(screen).not.toContain('PRIVATE-agent-command');
     expect(screen).not.toContain('실행 중인 도구');
-    expect(screen).not.toContain('도구 실행');
+    expect(screen).toContain('활동 · 도구 ·');
   } finally {
     process.stdout.write = output;
   }
@@ -2168,4 +2168,35 @@ afterAll(async () => {
   await expectOriginalModuleExports(await import('./chat/background-job-status.js'), restoreBackgroundJobStatus);
   await expectOriginalModuleExports(await import('./chat/execution-badge.js'), restoreExecutionBadge);
   await expectOriginalModuleExports(await import('../ux-sim/world.js'), restoreUxSimWorld);
+});
+
+test('basic Next TUI renders Write target activity while the answer is still pending', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  // 출처: #47304 compact display hotfix uses the existing 80×18 screen fixture.
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  appendMessage(session.id, { role: 'user', content: 'write the ticketing page', ts: new Date().toISOString() });
+  let runningFrame = '';
+  let finishedFrame = '';
+  duringTurnHook = () => {
+    toolActivityHandler?.({ phase: 'start', id: 'write-page', name: 'Write', target: 'ticketing.html' });
+    runningFrame = transcript.join('');
+    toolActivityHandler?.({ phase: 'finish', id: 'write-page', name: 'Write' });
+    finishedFrame = transcript.join('');
+  };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('write the ticketing page');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', compactHeight: 18 });
+    expect(runningFrame).toContain('Write · ticketing.html · 실행 중');
+    expect(finishedFrame).toContain('Write · ticketing.html · 완료');
+    expect(runningFrame).not.toContain('PRIVATE-document-body');
+  } finally {
+    process.stdout.write = output;
+  }
 });

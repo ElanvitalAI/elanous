@@ -1,3 +1,4 @@
+import { safeToolTarget } from '../tui/chat/tool-activity.js';
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
@@ -71,6 +72,7 @@ interface TurnResult {
   goalComplete?: boolean;
   goalStopReason?: string;
   name?: string;
+  target?: string;
   startedAtMonotonicMs?: number;
   calls?: unknown;
   requestId?: string;
@@ -93,8 +95,8 @@ export function isMeasuredTurnUsage(value: unknown): value is MeasuredTurnUsage 
     });
 }
 export type LocalChatToolActivity =
-  | { phase: 'start' | 'finish'; id: string; name: string }
-  | { phase: 'snapshot'; calls: Array<{ id: string; name: string }> };
+  | { phase: 'start' | 'finish'; id: string; name: string; target?: string }
+  | { phase: 'snapshot'; calls: Array<{ id: string; name: string; target?: string }> };
 export type LocalChatPushNowResult = { requestId: string; outcome: 'ready' | 'interrupted' | 'deferred'; activeTools: string[] };
 interface WaitingTurn {
   turnId: string;
@@ -301,10 +303,12 @@ class LocalChatSession {
           const calls = result.calls.filter((call): call is { id: string; name: string } =>
             call !== null && typeof call === 'object' && typeof (call as { id?: unknown }).id === 'string'
             && typeof (call as { name?: unknown }).name === 'string');
-          try { waiting.onToolActivity?.({ phase: 'snapshot', calls }); } catch { /* observer cannot break a turn */ }
+          try { waiting.onToolActivity?.({ phase: 'snapshot', calls: calls.map(call => ({ ...call,
+            target: safeToolTarget((call as { target?: unknown }).target) })) }); } catch { /* observer cannot break a turn */ }
         } else if ((result.phase === 'start' || result.phase === 'finish')
           && typeof result.id === 'string' && typeof result.name === 'string') {
-          try { waiting.onToolActivity?.({ phase: result.phase, id: result.id, name: result.name }); }
+          try { waiting.onToolActivity?.({ phase: result.phase, id: result.id, name: result.name,
+            target: safeToolTarget(result.target) }); }
           catch { /* observer cannot break a turn */ }
         }
         return;

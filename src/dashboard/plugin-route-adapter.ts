@@ -12,6 +12,7 @@ import type { AcpAskPusher } from '../acp/acp-surface-channels.js';
 import { createTuiDeployConfirmChannel, type TuiDeployApproval } from './runtime/tui-deploy-confirm-channel.js';
 import type { InlineChoiceBroker } from '../tui/inline-choice.js';
 import type { GraphRunOptions } from '../graph-runner/runner.js';
+import { defaultCapabilityRegistryForGraph } from '../graph-runner/plugin-graph-providers.js';
 
 const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:firecrawl', 'native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy']);
 const NON_EXECUTABLE_NATIVE_HANDLERS = new Set(['native:release_graph_start']);
@@ -88,6 +89,8 @@ export async function dispatchVerifiedDashboardGraph(
     code: 'VERIFIED_OWNER_REQUIRED' as const,
   });
   const { runGraph } = await import('../graph-runner/runner.js');
+  const capabilityProviders = runOptions.deps?.capabilityProviders
+    ?? await defaultCapabilityRegistryForGraph(graphFile, runOptions.deps?.root);
   const graphDeclaration = parseYaml(readFileSync(graphFile, 'utf8')) as {
     graph?: { purpose?: unknown };
     nodes?: Array<{ type?: unknown }>;
@@ -102,6 +105,7 @@ export async function dispatchVerifiedDashboardGraph(
   const graphStartedAt = typeof inputContext.startedAt === 'string' ? inputContext.startedAt : new Date().toISOString();
   return runGraph(graphFile, {
     ...runOptions,
+    deps: { ...runOptions.deps, capabilityProviders },
     verifiedOwnerId: memberId,
     runId: graphRunId,
     input: { ...args, ...(needsAsk ? { ask } : {}), context: { ...inputContext, memberId, runId: graphRunId, startedAt: graphStartedAt } },
@@ -116,11 +120,16 @@ export function createDashboardGraphRouteDispatcher(
 ) {
   return async (_pluginId: string, _graphId: string, graphFile: string, args: Record<string, unknown>, context?: ToolRuntimeContext) => {
     const { decideGraphApproval, runGraph } = await import('../graph-runner/runner.js');
-  let state = await dispatchVerifiedDashboardGraph(graphFile, args, context, runOptions);
+    // An anonymous request reaches the existing owner denial before any factory is loaded.
+    const boundOptions = context?.verifiedOwner?.id ? {
+      ...runOptions, deps: { ...runOptions.deps, capabilityProviders: runOptions.deps?.capabilityProviders
+        ?? await defaultCapabilityRegistryForGraph(graphFile, runOptions.deps?.root) },
+    } : runOptions;
+    let state = await dispatchVerifiedDashboardGraph(graphFile, args, context, boundOptions);
     while (state.status === 'awaiting-approval' && state.pending) {
       const approved = await requestGraphApproval?.(state.pending.message) ?? false;
       decideGraphApproval(state.graphId, state.runId, approved ? 'approved' : 'rejected', 'classic-tui', runOptions.deps?.root);
-      const { runId: _runId, resumeRunId: _resumeRunId, resumeGraphId: _resumeGraphId, ...resumeOptions } = runOptions;
+      const { runId: _runId, resumeRunId: _resumeRunId, resumeGraphId: _resumeGraphId, ...resumeOptions } = boundOptions;
       state = await runGraph(graphFile, { ...resumeOptions, verifiedOwnerId: context?.verifiedOwner?.id,
         resumeRunId: state.runId, resumeGraphId: state.graphId });
     }

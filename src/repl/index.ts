@@ -1,3 +1,4 @@
+import { toolActivityTarget } from '../tui/chat/tool-activity.js';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 // Sticky-session REPL — multi-turn CLI conversation in one process.
 //
@@ -93,8 +94,8 @@ type ReplShellActivity =
   | { phase: 'finish'; id: string; name: 'Bash' | 'RunShell' }
   | { phase: 'snapshot'; calls: Array<{ id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }> };
 type ReplToolActivity =
-  | { phase: 'start' | 'finish'; id: string; name: string }
-  | { phase: 'snapshot'; calls: Array<{ id: string; name: string }> };
+  | { phase: 'start' | 'finish'; id: string; name: string; target?: string }
+  | { phase: 'snapshot'; calls: Array<{ id: string; name: string; target?: string }> };
 
 const shellSnapshotRouter = createShellSnapshotRouter();
 const pushNowRouter = createPushNowRouter();
@@ -523,7 +524,8 @@ export function buildReplSystemPrompt(ctx: {
     }
   }
   const card = buildSeatBootCardText(ctx);
-  const parts = [skillCatalogText, base ?? '', card].filter(part => part.length > 0);
+  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하고, 소유자 확인이 없으면 회원 연결을 안내하며 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말며 되돌리기는 해당 배포 ID·영수증 범위로만 수행하라.';
+  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card].filter(part => part.length > 0);
   return parts.length > 0 ? parts.join('\n\n') : undefined;
 }
 
@@ -634,7 +636,7 @@ async function runOneTurn(
     sessionId, runId: surfaceRunId!, emit: onJsonMessageBlock,
   }) : undefined;
   const activeShellCalls = new Map<string, { id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }>();
-  const activeToolCalls = new Map<string, { id: string; name: string }>();
+  const activeToolCalls = new Map<string, { id: string; name: string; target?: string }>();
   const onShellSnapshotSignal = (): void => {
     onJsonShellActivity?.({ phase: 'snapshot', calls: [...activeShellCalls.values()] });
     onJsonToolActivity?.({ phase: 'snapshot', calls: [...activeToolCalls.values()] });
@@ -684,7 +686,7 @@ async function runOneTurn(
     onToolCall: (call) => {
       messageBlocks?.toolCall(call);
       if (jsonOutput && onJsonToolActivity) {
-        const activeCall = { id: call.id, name: call.name };
+        const activeCall = { id: call.id, name: call.name, target: toolActivityTarget(call.name, call.args) };
         activeToolCalls.set(call.id, activeCall);
         onJsonToolActivity({ phase: 'start', ...activeCall });
       }

@@ -1083,3 +1083,31 @@ test('next TUI in a real PTY (L3): a long session compacts before the turn, then
     rmSync(dir, { recursive: true, force: true });
   }
 }, 150_000);
+
+test('tool activity carries only the safe target through a live child before the final reply', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tool-target-'));
+  const cli = join(dir, 'fake-cli.ts');
+  writeFileSync(cli, [
+    "import { createInterface } from 'node:readline';",
+    "for await (const line of createInterface({ input: process.stdin })) {",
+    "const input = JSON.parse(line);",
+    "console.log(JSON.stringify({event:'tool-activity',turnId:input.id,phase:'start',id:'write',name:'Write',target:'/private/demo/ticketing.html'}));",
+    "console.log(JSON.stringify({event:'tool-activity',turnId:'stale',phase:'start',id:'stale',name:'Write',target:'PRIVATE-stale'}));",
+    "console.log(JSON.stringify({event:'tool-activity',turnId:input.id,phase:'finish',id:'write',name:'Write'}));",
+    "console.log(JSON.stringify({turnId:input.id,reply:'done'}));",
+    "}",
+  ].join('\n'));
+  const events: import('./local-chat-turn.js').LocalChatToolActivity[] = [];
+  try {
+    await runLocalChatTurn('tool-target-session', 'write', new AbortController().signal, cli,
+      undefined, undefined, undefined, [], undefined, undefined, undefined, event => events.push(event));
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ phase: 'start', name: 'Write', target: 'ticketing.html' });
+    expect(events[1]).toMatchObject({ phase: 'finish', name: 'Write' });
+    expect(JSON.stringify(events)).not.toContain('/private/demo');
+    expect(JSON.stringify(events)).not.toContain('PRIVATE-stale');
+  } finally {
+    await closeLocalChatSession('tool-target-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
