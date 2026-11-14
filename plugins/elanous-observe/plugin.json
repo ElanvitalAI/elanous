@@ -3,7 +3,6 @@
   "name": "Elanous Observe",
   "version": "0.3.8",
   "description": "Built-in route index for read-only operational observation tools.",
-  "main": "./plugin.ts",
   "activationEvents": ["onRoute"],
   "contributes": {
     "aiTools": [

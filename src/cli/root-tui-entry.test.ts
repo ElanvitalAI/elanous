@@ -15,14 +15,14 @@ test('root TUI flag accepts either side of resume and other launch flags', () =>
   });
 });
 
-test('local root launch defaults to next; classic stays explicit', () => {
-  expect(extractRootTuiEntry([])).toEqual({ args: [], entry: 'next', explicit: false });
-  expect(extractRootTuiEntry(['--'])).toEqual({ args: ['--'], entry: 'next', explicit: false });
+test('local root launch defaults to classic; next stays explicit', () => {
+  expect(extractRootTuiEntry([])).toEqual({ args: [], entry: 'classic', explicit: false });
+  expect(extractRootTuiEntry(['--'])).toEqual({ args: ['--'], entry: 'classic', explicit: false });
   expect(extractRootTuiEntry(['--tui', 'next'])).toEqual({ args: [], entry: 'next', explicit: true });
   expect(extractRootTuiEntry(['--tui=next'])).toEqual({ args: [], entry: 'next', explicit: true });
   expect(extractRootTuiEntry(['--tui', 'classic'])).toEqual({ args: [], entry: 'classic', explicit: true });
   expect(extractRootTuiEntry(['--resume', 'session'])).toEqual({
-    args: ['--resume', 'session'], entry: 'next', explicit: false,
+    args: ['--resume', 'session'], entry: 'classic', explicit: false,
   });
   expect(extractRootTuiEntry(['--legacy'])).toEqual({ args: [], entry: 'classic', explicit: true });
   expect(extractRootTuiEntry(['--resume', 'session', '--legacy'])).toEqual({
@@ -51,7 +51,7 @@ test('bare root -r does not consume a following subcommand', () => {
 
 test('bare remote entry keeps the dashboard transport', () => {
   expect(effectiveRootTuiEntry(extractRootTuiEntry([]), true)).toBe('classic');
-  expect(effectiveRootTuiEntry(extractRootTuiEntry([]), false)).toBe('next');
+  expect(effectiveRootTuiEntry(extractRootTuiEntry([]), false)).toBe('classic');
   expect(effectiveRootTuiEntry(extractRootTuiEntry(['--tui', 'next']), false)).toBe('next');
   expect(effectiveRootTuiEntry(extractRootTuiEntry(['--tui', 'next']), true)).toBe('next');
   expect(effectiveRootTuiEntry(extractRootTuiEntry(['--legacy']), true)).toBe('classic');
@@ -68,7 +68,7 @@ test('isolated remote root explains its classic TUI before attempting a non-TTY 
         ELANOUS_SKIP_LOGIN_ENV: '1',
       },
     });
-    const notice = '로컬 기본 TUI는 next입니다. 원격 연결은 현재 classic TUI로 열립니다. 원격 next TUI는 지원하지 않습니다.';
+    const notice = '기본 TUI는 classic입니다. next는 --tui next로 열 수 있습니다. 원격 next TUI는 지원하지 않습니다.';
     expect(result.stdout).toContain(notice);
     expect(result.stdout.split(notice)).toHaveLength(2);
   } finally {

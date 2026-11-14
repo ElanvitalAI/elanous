@@ -39,7 +39,7 @@ export function compilePluginYaml(pluginDir: string): string {
   const raw = record(parseYaml(source), 'plugin.yaml');
   if (raw.apiVersion !== 'elanous.dev/plugin/v2') throw new Error('plugin.yaml apiVersion must be elanous.dev/plugin/v2');
   const allowedKeys = new Set(['apiVersion', 'id', 'name', 'version', 'description', 'graphs', 'graphProviders', 'capabilities', 'ext',
-    'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers', 'dependencies']);
+    'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers', 'dependencies', 'httpGet']);
   const unknownKeys = Object.keys(raw).filter(key => !allowedKeys.has(key));
   if (unknownKeys.length) throw new Error(`plugin.yaml has unsupported keys: ${unknownKeys.join(', ')}`);
   const id = raw.id;
@@ -49,7 +49,13 @@ export function compilePluginYaml(pluginDir: string): string {
   if (typeof name !== 'string' || !name.trim()) throw new Error('plugin.yaml name must be nonempty');
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error('plugin.yaml version is invalid');
   const graphAssets = strings(raw.graphs, 'plugin.yaml graphs');
-  if (!graphAssets.length) throw new Error('plugin.yaml must declare at least one graph');
+  const httpGet = raw.httpGet === undefined ? undefined : record(raw.httpGet, 'plugin.yaml httpGet');
+  if (httpGet && (typeof httpGet.path !== 'string' || !httpGet.path.startsWith('/v1/')
+    || /[?#\\]/.test(httpGet.path) || typeof httpGet.handler !== 'string'
+    || !Object.hasOwn(record(raw.handlers, 'plugin.yaml handlers'), httpGet.handler))) {
+    throw new Error('plugin.yaml httpGet requires a /v1/ path and a declared handler');
+  }
+  if (!graphAssets.length && !httpGet) throw new Error('plugin.yaml must declare at least one graph');
   const graphProviders = raw.graphProviders === undefined ? {} : record(raw.graphProviders, 'plugin.yaml graphProviders');
   for (const [graphAsset, value] of Object.entries(graphProviders)) {
     const normalizedGraphAsset = graphAsset.replace(/^\.\//, '');
@@ -154,6 +160,7 @@ export function compilePluginYaml(pluginDir: string): string {
       ...(packs.length ? { packs } : {}),
       ...(sims.length ? { sims } : {}),
       ...(Object.keys(handlers).length ? { handlers } : {}),
+      ...(httpGet ? { httpGet } : {}),
       ...(raw.ext === undefined ? {} : { ext: record(raw.ext, 'plugin.yaml ext') }),
     } },
   };

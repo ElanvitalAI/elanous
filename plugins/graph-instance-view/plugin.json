@@ -1,0 +1,54 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "graph-instance-view",
+  "name": "Graph Instance View",
+  "version": "0.3.10",
+  "description": "Read-only graph instance projection for terminal and PWA surfaces.",
+  "contributes": {
+    "skills": [
+      {
+        "id": "graph-instance-view/read",
+        "path": "skills/read/SKILL.md"
+      }
+    ]
+  },
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [],
+      "graphManifests": {},
+      "capabilities": [],
+      "authoredTrust": "builtin",
+      "handlers": {
+        "graphInstanceViewGet": {
+          "module": "handlers/http-get.ts",
+          "export": "handleGraphInstanceViewGet",
+          "skill": "graph-instance-view/read"
+        },
+        "graphInstanceProject": {
+          "module": "handlers/project-ledgers.ts",
+          "export": "projectView",
+          "skill": "graph-instance-view/read"
+        },
+        "richSidetabRead": {
+          "module": "handlers/project-ledgers.ts",
+          "export": "readLiveGraphInstance",
+          "skill": "graph-instance-view/read"
+        },
+        "graphInstanceTerminal": {
+          "module": "handlers/render-terminal.ts",
+          "export": "renderGraphInstanceTerminal",
+          "skill": "graph-instance-view/read"
+        },
+        "graphInstanceVersion": {
+          "module": "handlers/view-model.ts",
+          "export": "graphInstanceViewVersion",
+          "skill": "graph-instance-view/read"
+        }
+      },
+      "httpGet": {
+        "path": "/v1/graph-instance-view",
+        "handler": "graphInstanceViewGet"
+      }
+    }
+  }
+}

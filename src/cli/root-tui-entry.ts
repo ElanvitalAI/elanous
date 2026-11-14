@@ -14,7 +14,7 @@ export function effectiveRootTuiEntry(root: RootTuiEntry, hasRemote: boolean): '
 export function extractRootTuiEntry(rawArgs: readonly string[]): RootTuiEntry {
   for (let i = 0; i < rawArgs.length; i++) {
     const arg = rawArgs[i]!;
-    if (arg === '--') return { args: [...rawArgs], entry: i === rawArgs.length - 1 ? 'next' : 'classic', explicit: false };
+    if (arg === '--') return { args: [...rawArgs], entry: 'classic', explicit: false };
     if (arg === '--legacy') {
       const args = [...rawArgs.slice(0, i), ...rawArgs.slice(i + 1)];
       const other = extractRootTuiEntry(args);
@@ -43,6 +43,6 @@ export function extractRootTuiEntry(rawArgs: readonly string[]): RootTuiEntry {
     }
     if (!arg.startsWith('-')) return { args: [...rawArgs], entry: 'classic', explicit: false };
   }
-  // A local root launch opens Next; subcommands above keep their own routing.
-  return { args: [...rawArgs], entry: 'next', explicit: false };
+  // Local and remote root launches default to classic; next stays explicit.
+  return { args: [...rawArgs], entry: 'classic', explicit: false };
 }

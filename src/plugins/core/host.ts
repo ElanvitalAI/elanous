@@ -247,11 +247,13 @@ export const PACKS_DIR = resolve(import.meta.dir, '..', '..', '..', 'packs');
 export const USER_DIR = join(homedir(), '.claude', 'plugins');
 
 /** 코드 없이 스킬·그래프만 싣는 팩인가 — 진입점이 기본값(`./plugin.ts`)이고 파일이 없으며, 스킬·그래프를 선언하거나 `skills/` 폴더가 있다. */
-export function isSkillOnlyPack(pluginDir: string, manifest: { main: string; contributes?: { skills?: unknown[]; graphs?: unknown[] } }, hasLegacyEntry: boolean): boolean {
+export function isSkillOnlyPack(pluginDir: string, manifest: { main: string; contributes?: { skills?: unknown[]; graphs?: unknown[]; aiTools?: { handler?: string }[] } }, hasLegacyEntry: boolean): boolean {
   if (hasLegacyEntry) return false;
   if (manifest.main !== './plugin.ts') return false; // 명시한 진입점이 없으면 그건 결함이다 — 경고를 유지한다.
   const declares = (manifest.contributes?.skills?.length ?? 0) > 0 || (manifest.contributes?.graphs?.length ?? 0) > 0;
-  return declares || existsSync(join(pluginDir, 'skills'));
+  const nativeTools = manifest.contributes?.aiTools;
+  const declaresNativeTools = !!nativeTools?.length && nativeTools.every(tool => tool.handler?.startsWith('native:'));
+  return declares || declaresNativeTools || existsSync(join(pluginDir, 'skills'));
 }
 
 export class PluginHost {

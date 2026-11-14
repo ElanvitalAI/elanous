@@ -31,6 +31,7 @@ test('approved browser member alone creates a PKCE-bound code; foreign member, C
   expect((await api.handle(new Request(approvalUrl)))?.status).toBe(401);
   const page = await api.handle(new Request(approvalUrl, { headers: { 'x-member': 'member-a' } }));
   expect(page?.status).toBe(200);
+  expect(page?.headers.get('referrer-policy')).toBe('same-origin');
   const html = await page!.text();
   const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
   expect(csrf).toBeTruthy();
@@ -42,6 +43,10 @@ test('approved browser member alone creates a PKCE-bound code; foreign member, C
       'content-type': 'application/x-www-form-urlencoded' }, body: `csrf=${csrfValue}&userCode=${userCode}` });
   expect((await api.handle(approve('member-b', csrf!)))?.status).toBe(403);
   expect((await api.handle(approve('member-a', csrf!, 'https://evil.example')))?.status).toBe(403);
+  expect((await api.handle(approve('member-a', csrf!, 'null')))?.status).toBe(403);
+  const missingOrigin = approve('member-a', csrf!);
+  missingOrigin.headers.delete('origin');
+  expect((await api.handle(missingOrigin))?.status).toBe(403);
   expect((await api.handle(approve('member-a', 'wrong')))?.status).toBe(403);
   expect((await api.handle(new Request(approvalUrl, { method: 'POST', headers: { 'x-member': 'member-a', origin },
     body: `csrf=${csrf}&userCode=AAAA-BBBB` })))?.status).toBe(403);

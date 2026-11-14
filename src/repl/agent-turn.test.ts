@@ -196,6 +196,17 @@ describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSI
     chat: { conciseness: 'balanced', toolDeny: [] },
   } as unknown as UserConfig;
 
+  test('tool-enabled internal hint keeps local operator deployment private and reversible', () => {
+    const prompt = buildReplSystemPrompt({ cfg: fakeConfig, enabledToolNames: [], cwd: process.cwd() }) ?? '';
+    expect(prompt).toContain('127.0.0.1의 빈 31500~31599 포트');
+    expect(prompt).toContain('tailscale serve로 tailnet 전용 URL만 노출');
+    expect(prompt).toContain('공개 인터넷 노출 금지');
+    expect(prompt).toContain('HTTP 200과 앱 화면을 확인');
+    expect(prompt).toContain('로컬 운영자 배포 되돌리기');
+    const disabled = buildReplSystemPrompt({ cfg: fakeConfig, enabledToolNames: undefined, cwd: process.cwd() }) ?? '';
+    expect(disabled).not.toContain('tailscale serve');
+  });
+
   /** 홈에 자리(seat-state/OP ⊕ seats/OP/AGENTS.local.md)와 OP 앞 미읽은 우편 1통을 세운다.
    *  cwd 는 «자리가 아닌» 임시 디렉터리 — 자리 판정은 COORD_ID 로만 선다(그래서 두 호출의 base 가 같다). */
   function seatFixture(): { home: string; cwd: string; msgPath: string; store: MsgStore } {

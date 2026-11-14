@@ -396,6 +396,8 @@ export interface LLMOpts {
    *  is opt-in; providers without a serializer hook preserve their wire path. */
   requestSizeGuard?: {
     maxChars: number;
+    /** Optional proactive compaction threshold; the hard cap stays maxChars. */
+    compactAtChars?: number;
     compactMessages: (
       messages: LLMMessage[],
       info: { provider: string; requestChars: number; maxChars: number },
@@ -12426,11 +12428,15 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
           serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache, sessionCacheKey);
           let requestChars = serializedWireBody.length;
           const initialRequestChars = requestChars;
+          const compactAtChars = Number.isFinite(requestGuard.compactAtChars)
+            && requestGuard.compactAtChars! > 0
+            ? Math.min(requestGuard.maxChars, requestGuard.compactAtChars!)
+            : requestGuard.maxChars;
           let requestCompacted = false;
           let requestCompactReason = requestChars > requestGuard.maxChars
             ? 'store-threading-skipped'
             : 'under-cap';
-          if (requestChars > requestGuard.maxChars && !useStore) {
+          if (requestChars > compactAtChars && !useStore) {
             try {
               const compacted = await requestGuard.compactMessages(messages, {
                 provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
@@ -12474,7 +12480,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
               }, { level: 'warn' });
             }
             let nextIndex = 0;
-            while (requestChars > requestGuard.maxChars && requestGuard.compactNext) {
+            while (requestChars > compactAtChars && requestGuard.compactNext) {
               try {
                 const candidate = await requestGuard.compactNext(messages, nextIndex);
                 if (!candidate || candidate.nextIndex <= nextIndex) break;

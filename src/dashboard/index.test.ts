@@ -2742,3 +2742,34 @@ describe('TUI-FLICKER-DRAW-INTEGRATION — synchronized frame output seam', () =
     ]);
   });
 });
+
+test('session-scoped dashboard subscriptions reject foreign and ownerless replay, enqueue and drain', () => {
+  const queue = new TaskNotificationQueue();
+  const wakes: string[] = [], history: string[] = [];
+  let current: string | undefined;
+  const notice = (taskId: string, parentSessionId?: string) => ({
+    taskId, parentSessionId, agentName: 'child', completionDelivery: 'supplement' as const,
+    state: 'done' as const, output: 'private result', truncated: false, durationMs: 0, finishedAt: 0,
+    resultPath: '/fake/result.txt',
+  });
+  queue.enqueue(notice('foreign-restored', 'other'));
+  queue.enqueue(notice('legacy-restored'));
+  const off = subscribeDashboardAgentResults(queue, n => wakes.push(n.taskId), line => history.push(line), () => current);
+  try {
+    expect(wakes).toEqual([]);
+    current = 'owner';
+    queue.enqueue(notice('foreign-live', 'other'));
+    queue.enqueue(notice('own-live', 'owner'));
+    expect(wakes).toEqual(['own-live']);
+    queue.drainForParentSession('other');
+    expect(history).toEqual([]);
+    queue.drainForParentSession('owner');
+    expect(history).toHaveLength(1);
+    current = 'new-owner';
+    queue.enqueue(notice('old-owner', 'owner'));
+    queue.enqueue(notice('new-owner', 'new-owner'));
+    expect(wakes).toEqual(['own-live', 'new-owner']);
+    expect(queue.has('legacy-restored')).toBe(true);
+    expect(queue.has('old-owner')).toBe(true);
+  } finally { off(); }
+});

@@ -1883,8 +1883,8 @@ program
   )
   // Documentation-only — `readDashboardNameFlag` 가 Commander «전»에 argv 에서 걷어낸다.
   .option('--name <name>', '대시보드 TUI 의 PTY 행(tui:<pid>)에 별명을 달고 뜬다 — `elanous pty list` 에 보이고 `pty snapshot <name>` 으로 부른다. 뜬 뒤 바꾸려면 `elanous pty rename <ref> <name>`.')
-  .option('--legacy', '기존 대시보드 TUI로 시작한다(--tui classic 의 짧은 표기). 로컬 기본 진입은 next 다.')
-  .option('--tui <mode>', '루트 TUI를 명시한다(classic|next). 로컬 기본은 next 이고 원격 기본은 classic 이다. --legacy는 classic의 짧은 표기다.')
+  .option('--legacy', '기존 대시보드 TUI로 시작한다(--tui classic 의 짧은 표기). 기본 진입은 classic 이다.')
+  .option('--tui <mode>', '루트 TUI를 명시한다(classic|next). 로컬·원격 기본은 classic 이고 next 는 --tui next 로 연다. --legacy는 classic의 짧은 표기다.')
   .option('--help-all', '시스템 명령을 제외한 모든 최상위 명령 표시');
 program.addHelpText('after', acpServerHelpText());
 
@@ -12994,7 +12994,7 @@ async function main(): Promise<void> {
   // coexist. See 내부 문서 `REPORT-tui-observation-methodology-2026-07-24` §12.
   if (args.length === 0) {
     if (remote && tuiEntry === 'classic') {
-      console.log('로컬 기본 TUI는 next입니다. 원격 연결은 현재 classic TUI로 열립니다. 원격 next TUI는 지원하지 않습니다.');
+      console.log('기본 TUI는 classic입니다. next는 --tui next로 열 수 있습니다. 원격 next TUI는 지원하지 않습니다.');
     }
     const { isNexusDaemonLive, nexusDaemonLiveHint } = await import('./cli/nexus-daemon-hint.js');
     if (isNexusDaemonLive()) console.log(nexusDaemonLiveHint());

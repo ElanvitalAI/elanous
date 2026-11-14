@@ -240,7 +240,7 @@ describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선�
   test('task-notification onEnqueue 구독 정확히 1 · 설치 경로로만 · 주입 길 0', () => {
     // TUI-SUBAGENT-RESULT-CAP — 구독은 subscribeDashboardAgentResults 한 곳을 지난다(onEnqueue 깨움 ⊕ onDrain 이력).
     expect(src.match(/\.onEnqueue\(/g)).toHaveLength(1);
-    expect(src).toContain('const offWake = queue.onEnqueue(listener);');
+    expect(src).toContain('const offWake = queue.onEnqueue(scopedListener);');
     expect(src.match(/subscribeDashboardAgentResults\(\s*globalTaskNotificationQueue,/g)).toHaveLength(1);
     expect(src.match(/installSeatedAgentWake\(\{/g)).toHaveLength(1);
     expect(src).not.toMatch(/createAgentWake\(/);

@@ -125,3 +125,17 @@ test('bundled Absorb host-import exception still requires capability consent', a
     expect(listInstalledPlugins(root)).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('HTTP-only built-in graph instance view loads through the classic manifest loader', () => {
+  const root = join(import.meta.dir, '../../../plugins/graph-instance-view');
+  const loaded = loadPluginManifestFromDir(root, { id: 'graph-instance-view' });
+  expect(loaded.manifest.id).toBe('graph-instance-view');
+  expect(JSON.parse(compilePluginYaml(root)).extensions['ai.elanous'].httpGet).toEqual({
+    path: '/v1/graph-instance-view', handler: 'graphInstanceViewGet',
+  });
+  for (const id of ['elanous-observe', 'elanous-release']) {
+    const plugin = loadPluginManifestFromDir(join(import.meta.dir, '../../../plugins', id), { id });
+    expect(JSON.parse(readFileSync(join(import.meta.dir, '../../../plugins', id, 'plugin.json'), 'utf8')).main).toBeUndefined();
+    expect(plugin.manifest.contributes?.aiTools?.map(tool => tool.name)).toContain(id === 'elanous-observe' ? 'ObserveLogs' : 'ReleaseStatus');
+  }
+});

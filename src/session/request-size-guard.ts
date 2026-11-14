@@ -31,6 +31,8 @@ import { appendArchiveEntry, archiveReferencePath, getDefaultArchiveDir, inspect
 
 /** #32254 — the wire cap for Codex TUI requests (serialized body chars). */
 export const REQUEST_SIZE_MAX_CHARS = 400_000;
+// Source: OP48041 requests proactive compaction at 85% of the unchanged hard cap.
+const REQUEST_SIZE_COMPACT_RATIO = 0.85;
 
 export type RequestSizeGuard = NonNullable<LLMOpts['requestSizeGuard']>;
 export type RequestSizeMeasurement = Parameters<NonNullable<RequestSizeGuard['onMeasured']>>[0];
@@ -196,6 +198,7 @@ export function createRequestSizeGuard(opts: CreateRequestSizeGuardOptions): Req
   let measuredProviderRequests = 0;
   return {
     maxChars: opts.maxChars ?? REQUEST_SIZE_MAX_CHARS,
+    compactAtChars: Math.floor((opts.maxChars ?? REQUEST_SIZE_MAX_CHARS) * REQUEST_SIZE_COMPACT_RATIO),
     compactMessages: async (currentMessages, info) => {
       const hasToolResults = currentMessages.some(message => Array.isArray(message.content)
         && message.content.some(block => block.type === 'tool_result'));
@@ -224,15 +227,18 @@ export function createRequestSizeGuard(opts: CreateRequestSizeGuardOptions): Req
           const block = message.content[j]!;
           if (block.type !== 'tool_result') continue;
           const currentIndex = index++;
-          if (currentIndex < startIndex || typeof block.content !== 'string') continue;
+          if (currentIndex < startIndex) continue;
+          // Structured tool results also contribute to the wire cap.
+          // Persist their exact JSON before replacing with a reference.
+          const original = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
           if (archived.some(entry => entry.origin.kind === 'tool_result'
             && entry.origin.tool_use_id === block.tool_use_id && entry.replacement === block.content)) continue;
-          const contentHash = createHash('sha256').update(block.content, 'utf16le').digest('hex');
-          const replacement = `[Full output (${block.content.length} chars) saved to: ${archiveReferencePath(sessionId, dir)}] [tool_use_id: ${block.tool_use_id}] [sha256-utf16le: ${contentHash}]`;
+          const contentHash = createHash('sha256').update(original, 'utf16le').digest('hex');
+          const replacement = `[Full output (${original.length} chars) saved to: ${archiveReferencePath(sessionId, dir)}] [tool_use_id: ${block.tool_use_id}] [sha256-utf16le: ${contentHash}]`;
           if (!appendArchiveEntry({
             ts: Date.now(), layer: 'tool-output-budget', sessionId,
             origin: { kind: 'tool_result', tool_use_id: block.tool_use_id },
-            content: block.content, replacement,
+            content: original, replacement,
           }, dir)) continue;
           const content = message.content.slice();
           content[j] = { ...block, content: replacement };

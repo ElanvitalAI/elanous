@@ -3,7 +3,6 @@
   "name": "Elanous Release",
   "version": "0.3.8",
   "description": "Built-in route index for release status and graph entry tools.",
-  "main": "./plugin.ts",
   "activationEvents": ["onRoute"],
   "contributes": {
     "aiTools": [

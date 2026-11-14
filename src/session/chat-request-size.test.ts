@@ -479,6 +479,58 @@ describe.serial('Codex TUI request-size compact', () => {
     expect(captures).toHaveLength(0);
   });
 
+  test('structured tool output above production cap is archived before actual Codex wire send', async () => {
+    const original = [{ type: 'text' as const, text: 'synthetic-result '.repeat(40_000) }];
+    const messages: import('../llm.js').LLMMessage[] = [
+      { role: 'system', content: 'protected instruction' },
+      { role: 'user', content: 'build the ticketing site' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'structured-wire', name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'structured-wire', content: original }] },
+    ];
+    const archiveDir = join(root, 'structured-wire');
+    const guard = createRequestSizeGuard({ compactOptions: () => ({ sessionId: 'structured-wire', archiveDir }) });
+    for await (const _event of PROVIDERS['openai-codex']!.streamChat!(messages, {
+      model: 'gpt-5.6-terra', requestSizeGuard: guard,
+    })) { /* actual provider serialization with fake fetch only */ }
+    expect(captures).toHaveLength(1);
+    expect(captures[0]!.wireJson.length).toBeLessThanOrEqual(guard.maxChars);
+    expect(captures[0]!.wireJson).toContain('protected instruction');
+    expect(captures[0]!.wireJson).toContain('build the ticketing site');
+    expect(captures[0]!.wireJson).toContain('saved to:');
+    const entry = JSON.parse(readFileSync(join(archiveDir, 'structured-wire.jsonl'), 'utf8').trim());
+    expect(JSON.parse(entry.content)).toEqual(original);
+  });
+
+  test('compacts oldest results proactively at eighty-five percent without raising the hard cap', async () => {
+    const messages: import('../llm.js').LLMMessage[] = [
+      { role: 'user', content: 'protected active request' },
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 'oldest', name: 'Read', input: {} },
+        { type: 'tool_use', id: 'newest', name: 'Read', input: {} },
+      ] },
+      { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'oldest', content: 'a'.repeat(180_000) },
+        { type: 'tool_result', tool_use_id: 'newest', content: 'b'.repeat(180_000) },
+      ] },
+    ];
+    const archiveDir = join(root, 'proactive');
+    const measurements: Array<{ compacted: boolean; previousChars?: number }> = [];
+    const guard = createRequestSizeGuard({
+      compactOptions: () => ({ sessionId: 'proactive', archiveDir }),
+      onMeasured: info => measurements.push(info),
+    });
+    for await (const _event of PROVIDERS['openai-codex']!.streamChat!(messages, {
+      model: 'gpt-5.6-terra', requestSizeGuard: guard,
+    })) { /* fake fetch, actual serializer */ }
+    expect(guard.maxChars).toBe(400_000);
+    expect(measurements[0]?.compacted).toBe(true);
+    expect(measurements[0]?.previousChars).toBeLessThan(guard.maxChars);
+    expect(captures[0]!.wireJson.length).toBeLessThanOrEqual(guard.compactAtChars!);
+    const records = readFileSync(join(archiveDir, 'proactive.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(records[0].origin.tool_use_id).toBe('oldest');
+    expect(records).toHaveLength(1);
+  });
+
   test('does not send over-cap results when archive is disabled', async () => {
     const messages: import('../llm.js').LLMMessage[] = [
       { role: 'assistant', content: [{ type: 'tool_use', id: 'call_disabled', name: 'Read', input: {} }] },

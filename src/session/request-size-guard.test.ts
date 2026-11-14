@@ -138,3 +138,44 @@ describe('request-size archive candidates', () => {
     expect(messages).toEqual(before);
   });
 });
+
+test('structured output archives exact text/image JSON and preserves identity and instructions', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'structured-result-cap-'));
+  dirs.push(dir);
+  const original = [{ type: 'text' as const, text: 'synthetic output '.repeat(40_000) },
+    { type: 'image' as const, mediaType: 'image/png', base64: 'synthetic-image' }];
+  const messages: LLMMessage[] = [
+    { role: 'system', content: 'protected instruction' },
+    { role: 'user', content: 'build the ticketing site' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'structured', name: 'Read', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'structured', isError: true, content: original }] },
+  ];
+  const before = structuredClone(messages);
+  const guard = createRequestSizeGuard({ compactOptions: () => ({ sessionId: 'structured', archiveDir: dir }) });
+  const candidate = await guard.compactNext!(messages, 0);
+  expect(candidate).not.toBeNull();
+  expect(candidate!.messages.slice(0, 3)).toEqual(before.slice(0, 3));
+  expect(candidate!.messages[3]!.content).toEqual([expect.objectContaining({
+    type: 'tool_result', tool_use_id: 'structured', isError: true, content: expect.stringContaining('saved to:'),
+  })]);
+  const entry = JSON.parse(readFileSync(join(dir, 'structured.jsonl'), 'utf8').trim());
+  expect(JSON.parse(entry.content)).toEqual(original);
+  expect(messages).toEqual(before);
+  expect(await guard.compactNext!(candidate!.messages, 0)).toBeNull();
+});
+
+test('structured results remain intact when archive is disabled or cannot be written', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'structured-result-failure-'));
+  dirs.push(dir);
+  const file = join(dir, 'not-directory');
+  writeFileSync(file, 'fixture');
+  const messages: LLMMessage[] = [{ role: 'user', content: [{
+    type: 'tool_result', tool_use_id: 'structured', content: [{ type: 'text', text: 'large'.repeat(100_000) }],
+  }] }];
+  const before = structuredClone(messages);
+  for (const options of [{ archiveEnabled: false }, { archiveDir: file }]) {
+    const guard = createRequestSizeGuard({ compactOptions: () => options });
+    expect(await guard.compactNext!(messages, 0)).toBeNull();
+    expect(messages).toEqual(before);
+  }
+});

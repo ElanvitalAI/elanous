@@ -524,7 +524,7 @@ export function buildReplSystemPrompt(ctx: {
     }
   }
   const card = buildSeatBootCardText(ctx);
-  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하고, 소유자 확인이 없으면 회원 연결을 안내하며 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말며 되돌리기는 해당 배포 ID·영수증 범위로만 수행하라.';
+  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve로 tailnet 전용 URL만 노출하는 로컬 운영자 배포를 진행하라(공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 보고한 프로세스·serve 설정 범위로만 수행하라.';
   const parts = [skillCatalogText, base ?? '', appCapabilityHint, card].filter(part => part.length > 0);
   return parts.length > 0 ? parts.join('\n\n') : undefined;
 }

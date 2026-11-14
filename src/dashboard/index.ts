@@ -1307,10 +1307,20 @@ export function subscribeDashboardAgentResults(
   queue: TaskNotificationQueue,
   listener: (notification: PendingTaskNotification) => void,
   pushHistoryLine: (line: string) => void,
+  getSessionId?: () => string | null | undefined,
 ): () => void {
-  const offWake = queue.onEnqueue(listener);
+  // The live dashboard always supplies its current session. Legacy non-UI
+  // subscribers may omit this port; never deliver ownerless receipts to a TUI.
+  const owns = (notification: PendingTaskNotification) => !getSessionId
+    || !!notification.parentSessionId && notification.parentSessionId === getSessionId();
+  const scopedListener = (notification: PendingTaskNotification) => {
+    if (owns(notification)) listener(notification);
+    else debug.log('tui.agent-wake', 'session-filtered', { taskId: notification.taskId });
+  };
+  const offWake = queue.onEnqueue(scopedListener);
   const offDrain = queue.onDrain((items) => {
     for (const notification of items) {
+      if (!owns(notification)) continue;
       if (notification.resultPath) {
         pushHistoryLine(`  Agent result · full result: ${notification.resultPath} · summary: ${notification.output}`);
       } else if (notification.preservationError) {
@@ -1318,7 +1328,7 @@ export function subscribeDashboardAgentResults(
       }
     }
   });
-  queue.replayPendingWakes(listener);
+  queue.replayPendingWakes(scopedListener);
   return () => { offWake(); offDrain(); };
 }
 
@@ -12006,6 +12016,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const agentWake = installSeatedAgentWake({
       subscribe: (listener) => subscribeDashboardAgentResults(
         globalTaskNotificationQueue, listener, (line) => { pushChatLine(C.muted(line)); draw(); },
+        () => acpSessionIdRef.current ?? attachedSessionId,
       ),
       // 그리기 실패는 삼키지 않는다 — 모듈이 잡아 notified{shown:false} 로 남긴다.
       notify: createDashboardAgentWakeNotify((line) => { chatLines.push(C.muted(line)); }, () => draw()),

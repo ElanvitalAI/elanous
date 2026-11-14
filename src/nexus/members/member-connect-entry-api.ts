@@ -158,7 +158,9 @@ export function createMemberConnectEntry(options: MemberConnectEntryOptions): {
       item.previewMemberId = memberId;
       const html = `<!doctype html><html lang="ko"><meta charset="utf-8"><title>Elanous TUI 연결 승인</title><h1>이 기기의 TUI 연결을 승인하시겠습니까?</h1><p>요청은 2분 뒤 만료됩니다. 본인의 TUI 화면에 표시된 확인 코드를 직접 입력하세요. 코드를 모르면 승인하지 마세요.</p><form method="post" action="/v1/members/connect/approve?id=${id}"><input type="hidden" name="csrf" value="${item.csrf}"><label>확인 코드 <input name="userCode" required maxlength="9" autocomplete="off"></label><button type="submit">이 기기 연결 승인</button></form></html>`;
       return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'private, no-store', 'referrer-policy': 'no-referrer',
+        'cache-control': 'private, no-store',
+        // Preserve same-origin form POST Origin; keep cross-origin referrers suppressed.
+        'referrer-policy': 'same-origin',
         'content-security-policy': "default-src 'none'; style-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" } });
     }
     if (request.method !== 'POST') return response({ error: 'method-not-allowed' }, 405);
