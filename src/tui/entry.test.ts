@@ -2182,6 +2182,9 @@ test('basic Next TUI renders Write target activity while the answer is still pen
   let finishedFrame = '';
   duringTurnHook = () => {
     toolActivityHandler?.({ phase: 'start', id: 'write-page', name: 'Write', target: 'ticketing.html' });
+    toolActivityHandler?.({ phase: 'start', id: 'read-page', name: 'read_file', target: 'architecture.md' });
+    toolActivityHandler?.({ phase: 'start', id: 'build-page', name: 'Bash', target: 'bun run build' });
+    toolActivityHandler?.({ phase: 'start', id: 'publish-page', name: 'app.publish@1' });
     runningFrame = transcript.join('');
     toolActivityHandler?.({ phase: 'finish', id: 'write-page', name: 'Write' });
     finishedFrame = transcript.join('');
@@ -2195,6 +2198,10 @@ test('basic Next TUI renders Write target activity while the answer is still pen
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', compactHeight: 18 });
     expect(runningFrame).toContain('Write · ticketing.html · 실행 중');
     expect(finishedFrame).toContain('Write · ticketing.html · 완료');
+    expect(runningFrame).toContain('read_file · architecture.md');
+    expect(runningFrame).toContain('Bash · bun run build');
+    expect(runningFrame).toContain('app.publish@1');
+    expect(transcript.join('')).toContain('Write · ticketing.html · 완료');
     expect(runningFrame).not.toContain('PRIVATE-document-body');
   } finally {
     process.stdout.write = output;

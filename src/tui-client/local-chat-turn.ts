@@ -1,4 +1,4 @@
-import { safeToolTarget } from '../tui/chat/tool-activity.js';
+import { safeToolActivityTarget } from '../tui/chat/tool-activity.js';
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
@@ -304,11 +304,11 @@ class LocalChatSession {
             call !== null && typeof call === 'object' && typeof (call as { id?: unknown }).id === 'string'
             && typeof (call as { name?: unknown }).name === 'string');
           try { waiting.onToolActivity?.({ phase: 'snapshot', calls: calls.map(call => ({ ...call,
-            target: safeToolTarget((call as { target?: unknown }).target) })) }); } catch { /* observer cannot break a turn */ }
+            target: safeToolActivityTarget(call.name, (call as { target?: unknown }).target) })) }); } catch { /* observer cannot break a turn */ }
         } else if ((result.phase === 'start' || result.phase === 'finish')
           && typeof result.id === 'string' && typeof result.name === 'string') {
           try { waiting.onToolActivity?.({ phase: result.phase, id: result.id, name: result.name,
-            target: safeToolTarget(result.target) }); }
+            target: safeToolActivityTarget(result.name, result.target) }); }
           catch { /* observer cannot break a turn */ }
         }
         return;

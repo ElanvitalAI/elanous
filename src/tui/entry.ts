@@ -624,7 +624,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     const reconciledAgents = reconcileAgentOutputStatuses(agents, messages, backgroundJobs.snapshot()?.tasks);
     const displayActivity = [
-      ...(busy ? toolActivityLines(visibleToolActivity, performance.now()) : []),
+      ...toolActivityLines(visibleToolActivity, performance.now()),
       ...(!basicChat ? [
         ...agentDisplayLines(reconciledAgents),
         ...reconciledAgents.map(agentDisplayLine),

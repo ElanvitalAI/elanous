@@ -13050,10 +13050,10 @@ async function main(): Promise<void> {
   // including in a headless session. Later bare invocations keep the dashboard's read-only probe.
   const firstRunStartedAt = Date.now();
   const cfg = entryConfig;
-  // A provider-ready Next TUI is usable while optional web onboarding remains
-  // incomplete. Keep first-run setup for an unready provider and for classic.
+  // Both TUIs are usable once provider setup is ready, even while optional
+  // web onboarding remains incomplete. Keep setup for genuinely unready installs.
   if ((await import('./onboarding.js')).needsFirstRun(cfg)
-    && !(tuiEntry === 'next' && cfg.onboarding.ready === true)) {
+    && cfg.onboarding.ready !== true) {
     if (cfg.onboarding.webFirst !== false) {
       const { runWebFirstSetup } = await import('./onboarding/web-first.js');
       if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: true }) === 'link-shown') return;
