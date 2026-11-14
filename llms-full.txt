@@ -5200,6 +5200,25 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.19
+
+Source: https://docs.elanous.ai/releases/0-3-19/
+
+- Open your briefings from the web app using your signed-in member session, without needing an app-specific link.
+- Connect your member account from the terminal through browser approval, with a confirmation code and request limits.
+
+- Stop the terminal task when a tool reports that member verification is required, so you can connect your account before continuing.
+
+## Known issues
+
+- The authentication-stop repair still needs broader real-turn regression coverage; its focused validation and review follow-up are tracked separately.
+- Terminal member connection still has edge cases around slow polling, session revocation during approval, and request limits across proxy clients. These remain follow-up work.
+- The full automated release gate is not part of this manual hotfix path. Complete installed demo flows and live-key integrations require separate verification.
+- Key backup needs a matching server update; production backup and restore remain unverified.
+- The test setup path can copy existing credential files. Use an explicitly isolated configuration with synthetic credentials.
+
+---
+
 # 0.3.18
 
 Source: https://docs.elanous.ai/releases/0-3-18/
