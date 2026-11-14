@@ -5200,6 +5200,38 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.23
+
+Source: https://docs.elanous.ai/releases/0-3-23/
+
+This release makes connecting your member account clearer and sturdier, helps Elanous find the right tool for unfamiliar requests, and keeps more private details off your screen.
+
+- When you ask for something Elanous doesn't usually handle, it can now look through its installed tools to find one that fits. This works in the terminal, web chat and the web terminal. Finding a tool doesn't give it any extra permission; Elanous still asks before acting.
+- If connecting your member account fails, Elanous now tells you why: a network problem, an approval that expired, a member service that isn't set up, a rejected request, or an account that is already connected. Each case comes with what to do next.
+- Connecting your member account no longer hangs when a request stalls; it gives up after a short wait so you can try again.
+- In the web app, if a previous chat can't be restored, you now see a message instead of an empty chat with no explanation.
+- If member invites aren't available yet, the web app explains how to recover instead of showing a generic error.
+- In the terminal, the token counter now shows a live estimate of output tokens while an answer is still streaming. It is labelled as an estimate.
+- Tool activity in the terminal now hides the names of credential files such as `.netrc`, `.npmrc` and private keys, and shows "(비공개 파일)" instead.
+- Command summaries in the terminal no longer show email addresses, URLs or other argument values; only local file names are shown.
+- While an answer is still streaming in the terminal, if a private key starts to appear, the rest of that answer's live preview stays hidden. The final answer is unchanged.
+- When Elanous sets up a local preview on your tailnet, it uses a port of its own and leaves your existing Tailscale Serve settings alone. The undo step removes only what it added.
+- Monthly relay traffic now counts by Korea time, so usage resets at midnight KST on the first of the month.
+- Relay traffic limits and charges are defined as a policy in this release only. Usage warnings arrive in 0.3.24.
+
+- When you ask Elanous to design a system, the architecture diagrams it gives you can now be edited, and it draws on a built-in system design knowledge pack.
+- If you undo publishing an app, its address stays tied to you, so it can't end up attached to another member.
+- One-line deployment currently guides architecture documents and follow-up questions. Actual app generation is planned for 0.3.24.
+- Your member ID now also names your public app addresses. You can set it once, from the website or from a connected app.
+- In the terminal, web chat and web terminal, Elanous can now answer questions from its built-in knowledge packs, without searching your personal notes.
+- In the terminal, clicking a tool's header now opens its details and keeps them open, reaching the same steps and raw output as the keyboard.
+
+## Known issues
+
+- Member connection and invite flows were verified in test environments; a full sign-up with a real Google account on the release build has not been measured yet.
+
+---
+
 # 0.3.22
 
 Source: https://docs.elanous.ai/releases/0-3-22/
