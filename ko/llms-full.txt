@@ -5200,6 +5200,26 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.18
+
+Source: https://docs.elanous.ai/releases/0-3-18/
+
+- Turn verified generated app drafts into source and publish them through the existing app host after approval.
+- Improve graph bindings and recovery when an app publication is interrupted.
+- Fix member authentication when opening briefings.
+- Without a cloud connection, produce a design PDF, diagram, and connection-required approval card, with costs explicitly marked as unestimated.
+
+## Known issues
+
+- Connecting a member account directly from the terminal remains unavailable.
+- The disconnected-cloud path produces design deliverables; deploying to a cloud account requires a connection and approval.
+- The full automated release gate was waived for this release; installation checks use the manual release path.
+- Live-key integrations and the complete first-run flow from an empty configuration remain unverified.
+- Key backup needs a matching server update; production backup and restore remain unverified.
+- The test setup path can copy existing credential files. Use an explicitly isolated configuration with synthetic credentials.
+
+---
+
 # 0.3.17
 
 Source: https://docs.elanous.ai/releases/0-3-17/
