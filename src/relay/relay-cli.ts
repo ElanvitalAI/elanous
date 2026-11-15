@@ -66,9 +66,10 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
     .option('--host-owner-members <file>', 'JSON serverId-to-memberId pins for member-required mode')
     .option('--traffic-cap-config <file>', 'Owner-only JSON with byte limits or measure-only mode')
     .option('--public-listing-config <file>', 'Owner-only JSON opt-in list of searchable public app IDs (default empty)')
+    .option('--public-read-config <file>', 'Owner-only JSON apps:[{user,app}] allowed anonymous GET/HEAD (default private)')
     .option('--custom-domain-config <file>', 'Owner-only JSON routes for custom hosts with verified DNS ownership and TLS certificates')
     .action(async (opts: { trustedHostKeys: string; port: string; publicDomain?: string; publicServerId?: string; publicUserId?: string; publicDispatchConfig?: string;
-      memberRequired?: boolean; memberNexusUrl?: string; hostOwnerMembers?: string; trafficCapConfig?: string; publicListingConfig?: string; customDomainConfig?: string }) => {
+      memberRequired?: boolean; memberNexusUrl?: string; hostOwnerMembers?: string; trafficCapConfig?: string; publicListingConfig?: string; publicReadConfig?: string; customDomainConfig?: string }) => {
       const port = Number(opts.port);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid relay port');
       const { loadTrustedHostKeys, resolvePublicAppUserId, startRelayServer } = await import('./relay-server.js');
@@ -90,6 +91,8 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
       })() : {};
       const { loadRelayPublicListing, loadRelayCustomDomainRoutes } = await import('./relay-server.js');
       const publicListedApps = opts.publicListingConfig ? loadRelayPublicListing(opts.publicListingConfig) : undefined;
+      const publicReadableApps = opts.publicReadConfig
+        ? (await import('./public-app-read.js')).loadPublicAppReadConfig(opts.publicReadConfig) : undefined;
       const customDomainRoutes = opts.customDomainConfig ? loadRelayCustomDomainRoutes(opts.customDomainConfig) : undefined;
       const publicDispatchRoutes = opts.publicDispatchConfig
         ? (await import('./public-dispatch.js')).loadPublicDispatchRoutes(opts.publicDispatchConfig) : undefined;
@@ -106,6 +109,7 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
           ...(opts.publicServerId ? { publicServerId: opts.publicServerId } : {}),
           ...(publicUserId ? { publicUserId } : {}), ...(publicDispatchRoutes ? { publicDispatchRoutes } : {}),
           ...(appKillSwitch ? { appKillSwitch } : {}), ...(publicListedApps ? { publicListedApps } : {}),
+          ...(publicReadableApps ? { publicReadableApps } : {}),
           ...(customDomainRoutes ? { customDomainRoutes } : {}), ...(trafficStore ? { trafficStore } : {}), ...memberOptions });
       } catch (error) { trafficStore?.close(); appKillSwitch?.close(); throw error; }
       console.log(`relay listening on 127.0.0.1:${relay.port}${opts.publicDomain ? ' (public TLS edge required)' : ''}`);

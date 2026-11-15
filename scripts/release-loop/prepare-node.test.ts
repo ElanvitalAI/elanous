@@ -31,6 +31,14 @@ function fixture(refreshedFrom: string | null = old) {
   return { root, out };
 }
 
+function nexusProof() {
+  const publicCommit = 'e'.repeat(40);
+  return { publicCommit, e2e: { ran: true, ok: true, nexusFirstRun: {
+    ok: true, versionLine: `0.2.31 ${publicCommit}`, health: 200, healthOk: true, app: 200,
+    testUniverse: true, pid: 12345, ownPidStopped: true, forcedKill: false, exitCode: 0,
+  } } };
+}
+
 test('prepare accepts only a verified signed PWA failure and still requires a passing gate', () => {
   const context: GraphContext = { input: { version: '0.3.15', previousVersion: '0.3.14' }, outputs: {
     gate: { outcome: 'ok' }, pwa: { outcome: 'fail' },
@@ -53,7 +61,7 @@ test('first prepare reaches the command when the release output directory does n
   const result = runPrepare((command) => {
     commands.push(command);
     if (command === 'git') return { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' };
-    return { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') } }), stderr: '' };
+    return { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist'), ...nexusProof() } }), stderr: '' };
   });
   expect(result).toMatchObject({ outcome: 'ok', commit: tip });
   expect(commands).toEqual(['git', 'bun']);
@@ -67,7 +75,7 @@ test('0.2.36 resume reuses current-tip prepared output proven by this run ledger
   process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
   mkdirSync(join(out, 'dist'), { recursive: true });
   writeFileSync(join(out, 'dist', 'elanous.tgz'), 'candidate');
-  writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') }));
+  writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist'), ...nexusProof() }));
   const ledgerDir = join(root, 'graph-runs', 'release-loop');
   mkdirSync(ledgerDir, { recursive: true });
   writeFileSync(join(ledgerDir, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId, nodes: [
@@ -77,6 +85,14 @@ test('0.2.36 resume reuses current-tip prepared output proven by this run ledger
   expect(result).toMatchObject({ outcome: 'ok', commit: tip, artifactOwner: { runId, reused: true } });
   expect(readFileSync(join(out, 'dist', 'elanous.tgz'), 'utf8')).toBe('candidate');
   expect(readdirSync(root).filter((name) => name.startsWith('.prepared-cleanup-'))).toHaveLength(0);
+  // Reusing a same-run archive cannot bypass the mandatory first-boot receipt.
+  const damaged = JSON.parse(readFileSync(join(out, 'release.json'), 'utf8'));
+  damaged.e2e.nexusFirstRun.ownPidStopped = false;
+  writeFileSync(join(out, 'release.json'), JSON.stringify(damaged));
+  expect(() => runPrepare(() => { throw new Error('must not rebuild or delete the owned archive'); }))
+    .toThrow('prepared A158 Nexus first-run receipt missing or failed');
+  expect(readFileSync(join(out, 'dist', 'elanous.tgz'), 'utf8')).toBe('candidate');
+
 });
 
 test('prepare refuses a damaged resume-attempt ledger before reusing or rebuilding artifacts', () => {
@@ -107,8 +123,8 @@ test('another run current-tip prepared output is preserved beside a fresh build 
   const result = runPrepare((command) => {
     if (command === 'git') return { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' };
     mkdirSync(join(out, 'dist'), { recursive: true });
-    writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') }));
-    return { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') } }), stderr: '' };
+    writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist'), ...nexusProof() }));
+    return { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist'), ...nexusProof() } }), stderr: '' };
   });
   expect(result).toMatchObject({ outcome: 'ok', artifactOwner: { runId, attempt: 0 } });
   expect(JSON.parse(readFileSync(join(out, '.release-node-owner.json'), 'utf8')).runId).toBe(runId);
@@ -125,7 +141,7 @@ test('prepare quarantines a manifest-proven archive without deleting its bytes b
     commands.push(command);
     if (command === 'git') return { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' };
     expect(existsSync(out)).toBe(false);
-    return { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') } }), stderr: '' };
+    return { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist'), ...nexusProof() } }), stderr: '' };
   });
   expect(result).toMatchObject({ outcome: 'ok', commit: tip });
   expect(commands).toEqual(['git', 'bun']);
@@ -147,7 +163,7 @@ test('quarantine size counts symlink bytes without following an outside target',
   symlinkSync(outside, join(out, 'outside-link'));
   runPrepare((command) => command === 'git'
     ? { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' }
-    : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') } }), stderr: '' });
+    : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist'), ...nexusProof() } }), stderr: '' });
   const quarantine = join(root, readdirSync(root).find((name) => name.startsWith('.prepared-cleanup-'))!);
   const receipt = JSON.parse(readFileSync(join(quarantine, 'receipt.json'), 'utf8'));
   expect(receipt.bytes).toBeLessThan(100_000);
@@ -298,7 +314,7 @@ test('prepare keeps an initial receipt if archive size cannot be read', () => {
   let moved = '';
   const result = runPrepare((command) => command === 'git'
     ? { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' }
-    : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') } }), stderr: '' },
+    : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist'), ...nexusProof() } }), stderr: '' },
   (from, to) => {
     renameSync(from, to);
     moved = String(to);
@@ -323,4 +339,15 @@ test('prepare preserves a replacement output directory even with the old SHA man
     return { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' };
   })).toThrow('prepared output changed before cleanup');
   expect(readFileSync(join(out, 'proof'), 'utf8')).toBe('replacement survives');
+});
+
+
+test('prepare rejects a successful command that omits the mandatory Nexus receipt', () => {
+  const { out } = fixture();
+  rmSync(out, { recursive: true });
+  expect(() => runPrepare((command) => command === 'git'
+    ? { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' }
+    : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip,
+      distDir: join(out, 'dist') } }), stderr: '' }))
+    .toThrow('prepare A158 Nexus first-run receipt missing or failed');
 });

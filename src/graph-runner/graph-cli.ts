@@ -14,6 +14,7 @@ import { watchGraphRunEvents } from './graph-run-event-ledger.js';
 import { saveGraphRunMsgSubscriber } from './graph-run-msg-subscriptions.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { KNOWN_ISSUE_ROUTE } from './release-known-issue-waiver.js';
+import { resolveGraphCliVerifiedOwner } from './graph-cli-owner.js';
 
 function findGraphFile(graphId: string, extraRoots: string[] = []): string | undefined {
   const roots = [...extraRoots.map((root) => resolve(root)), resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
@@ -206,7 +207,9 @@ export function registerGraphCommands(program: Command, runsDeps: {
           if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('--input must be a JSON object');
           input = parsed as Record<string, unknown>;
         }
+        const verifiedOwnerId = opts.dryRun ? undefined : await resolveGraphCliVerifiedOwner(file, input);
         const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
+          ...(verifiedOwnerId ? { verifiedOwnerId } : {}),
           deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: runsDeps.capabilityProviders ?? await defaultCapabilityRegistryForGraph(file, runsDeps.root) } });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "name": "Solar Pro 3",
+      "id_match": ["upstage/solar-pro3", "solar/solar-pro3", "solar-pro3"],
+      "prompt": { "variant": "default", "blocks": {} },
+      "reasoning": {
+        "effort_map": { "low": "low", "medium": "medium", "high": "high" },
+        "can_disable": null,
+        "echo_reasoning_content": null
+      },
+      "sampling": {},
+      "limits": { "context": 131072 },
+      "timeouts": {},
+      "evidence": [
+        { "fields": ["limits.context", "reasoning.effort_map"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "reference-only; no live model benchmark" },
+        { "fields": ["reasoning.can_disable", "reasoning.echo_reasoning_content"], "reference": "none", "status": "unverified; null disables profile override" },
+        { "fields": ["sampling.frequency_penalty"], "reference": "none", "status": "unverified; omitted to preserve runtime default" }
+      ]
+    },
+    {
+      "name": "Grok 4.7",
+      "id_match": ["grok/grok-4.7", "grok-4.7"],
+      "prompt": {
+        "variant": "tool-enforcement",
+        "blocks": {
+          "tool_enforcement": "When an authorized task requires a tool, use the tool and inspect its result before reporting completion."
+        }
+      },
+      "reasoning": { "can_disable": null, "echo_reasoning_content": null },
+      "sampling": {},
+      "limits": {},
+      "timeouts": { "idle_chunk_s": 300 },
+      "evidence": [
+        { "fields": ["prompt.blocks.tool_enforcement", "timeouts.idle_chunk_s"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "reference-only; prompt and timeout need fake and post-demo benchmark" },
+        { "fields": ["sampling.frequency_penalty"], "reference": "none", "status": "unverified; omitted to preserve runtime default" }
+      ]
+    },
+    {
+      "name": "Qwen 3.8",
+      "id_match": ["qwen/qwen3.8-flash", "qwen/qwen3.8-max-0902"],
+      "prompt": {
+        "variant": "execution-discipline",
+        "blocks": {
+          "act_dont_ask": "Carry out authorized steps in the current turn; ask only when a required input or authorization is missing."
+        }
+      },
+      "reasoning": { "can_disable": null, "echo_reasoning_content": null },
+      "sampling": { "temperature": 0.55 },
+      "limits": {},
+      "timeouts": { "idle_chunk_s": 180 },
+      "evidence": [
+        { "fields": ["sampling.temperature", "timeouts.idle_chunk_s"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "reference-only; not a measured optimum for each Qwen 3.8 variant" },
+        { "fields": ["prompt.blocks.act_dont_ask"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "unverified model-specific effect; post-demo benchmark required" },
+        { "fields": ["sampling.frequency_penalty"], "reference": "none", "status": "unverified; omitted to preserve runtime default" }
+      ]
+    },
+    {
+      "name": "GLM 5.3",
+      "id_match": ["z-ai/glm-5.3", "glm/glm-5.3"],
+      "prompt": { "variant": "default", "blocks": {} },
+      "reasoning": { "can_disable": null, "echo_reasoning_content": null },
+      "sampling": { "temperature": 1.0 },
+      "limits": {},
+      "timeouts": {},
+      "evidence": [
+        { "fields": ["sampling.temperature"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "reference-only; no live model benchmark" },
+        { "fields": ["reasoning.can_disable"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "unverified: possible 400 on reasoning disable; actual HTTP body unavailable; null disables profile override" },
+        { "fields": ["sampling.frequency_penalty"], "reference": "none", "status": "unverified; omitted to preserve runtime default" }
+      ]
+    },
+    {
+      "name": "DeepSeek V3.2",
+      "id_match": ["deepseek/deepseek-v3.2"],
+      "prompt": { "variant": "default", "blocks": {} },
+      "reasoning": { "can_disable": null, "echo_reasoning_content": null },
+      "sampling": {},
+      "limits": {},
+      "timeouts": { "idle_chunk_s": 600 },
+      "evidence": [
+        { "fields": ["timeouts.idle_chunk_s"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "Hermes reasoning floor; reference-only, post-demo benchmark required" },
+        { "fields": ["reasoning.echo_reasoning_content"], "reference": "OP/research/MODEL-PROFILE-REFERENCES-1115.md", "status": "unverified: empty reasoning_content may yield 400; null disables profile override" },
+        { "fields": ["sampling.frequency_penalty"], "reference": "none", "status": "unverified; omitted to preserve runtime default" }
+      ]
+    }
+  ]
+}

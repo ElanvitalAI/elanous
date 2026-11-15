@@ -106,3 +106,56 @@ test('a failed remote ledger source cannot turn a partial snapshot into known id
   expect(result.utilization.idleHosts).toEqual([]);
   expect(result.utilization.hosts.find((row: { host: string }) => row.host === 'idle')).toMatchObject({ idle: null, utilizationRatio: null });
 });
+
+test('remote transport errors with a missing-file phrase do not masquerade as absent ledgers', async () => {
+  const { deps } = fixture();
+  const hosts = () => [{ host: 'idle', poolMapped: true, stateDir: '$HOME/.elanous', capacity: { gate: 2 } }];
+  const run = (status: number, stderr: string) => (command: string) => command === 'cat'
+    ? { status, stdout: '', stderr }
+    : { status: 0, stdout: command === 'ps' ? '' : JSON.stringify({ items: [] }), stderr: '' };
+  const absent = JSON.parse((await ledger({ ...deps, hosts, run: run(1,
+    'cat: /home/fake/.elanous/resource-ledger/events.jsonl: No such file or directory\n') }, ['--json']))[0]!);
+  expect(absent.utilization.readStatus).toBe('ok');
+  expect(absent.utilization.idleHosts).toEqual(['idle']);
+  const absoluteDir = JSON.parse((await ledger({ ...deps,
+    hosts: () => [{ host: 'idle', poolMapped: true, stateDir: '/srv/elanous', capacity: { gate: 2 } }],
+    run: run(1, 'cat: /srv/elanous/resource-ledger/events.jsonl: No such file or directory\n'),
+  }, ['--json']))[0]!);
+  expect(absoluteDir.utilization.readStatus).toBe('ok');
+  const wrongFile = JSON.parse((await ledger({ ...deps, hosts, run: run(1,
+    'cat: /tmp/other/resource-ledger/events.jsonl: No such file or directory\n') }, ['--json']))[0]!);
+  expect(wrongFile.utilization.readStatus).toBe('partial');
+  expect(wrongFile.utilization.idleHosts).toEqual([]);
+  const failed = JSON.parse((await ledger({ ...deps, hosts, run: run(255,
+    'ssh: connection failed: No such file or directory') }, ['--json']))[0]!);
+  expect(failed.utilization.readStatus).toBe('partial');
+  expect(failed.utilization.idleHosts).toEqual([]);
+  expect(failed.findings.some((finding: { detail: string }) => finding.detail.includes('remote resource ledger unavailable'))).toBe(true);
+});
+
+test('registered ledger command preserves six lanes and unknown stale/future idle states without writing the source', async () => {
+  const { path, deps } = fixture();
+  const lanes = ['gate', 'train', 'ta', 'hand', 'warm', 'bench'] as const;
+  const extra: ResourceLedgerEvent[] = lanes.map(lane => ({ event: 'lease-created', at,
+    lease: { id: `fp_six_${lane}`, fp: `fp_six_${lane}`, host: 'six', lane, resources: {},
+      mission: { cell: 'OTHER' }, ttlMs: 60_000, startedAt: at, heartbeatAt: at } }));
+  for (const [host, heartbeatAt] of [
+    ['stale', '2026-11-12T05:00:00.000Z'], ['future', '2026-11-12T07:00:00.000Z'],
+  ] as const) {
+    const heartbeat: HostReadinessHeartbeat = { host, at: heartbeatAt, sshAvailable: true, maintenance: false,
+      gateProtected: false, tools: {}, sample: { loadPercent: 5, load15Percent: 5,
+        memoryAvailablePercent: 50, rootDiskUsedPercent: 40, tmpDiskUsedPercent: 40 } };
+    extra.push({ event: 'host-readiness-heartbeat', at: heartbeatAt, heartbeat });
+  }
+  appendFileSync(path, extra.map(event => JSON.stringify(event)).join('\n') + '\n');
+  const before = readFileSync(path, 'utf8');
+  const result = JSON.parse((await ledger({ ...deps, hosts: () => ['busy', 'idle', 'six', 'stale', 'future'].map(host =>
+    ({ host, poolMapped: true, capacity: { gate: 2, train: 2, ta: 4, hand: 1, warm: 2, bench: 1 } })) }, ['--json']))[0]!);
+  expect(result.utilization.lanes.filter((row: { host: string; leases: number }) => row.host === 'six' && row.leases > 0)
+    .map((row: { lane: string }) => row.lane)).toEqual(lanes);
+  expect(result.utilization.hosts.find((row: { host: string }) => row.host === 'six')).toMatchObject({ leases: 6, idle: false });
+  expect(result.utilization.hosts.filter((row: { host: string }) => row.host === 'stale' || row.host === 'future')
+    .map((row: { idle: boolean | null }) => row.idle)).toEqual([null, null]);
+  expect(result.utilization.idleHosts).toEqual(['idle']);
+  expect(readFileSync(path, 'utf8')).toBe(before);
+});

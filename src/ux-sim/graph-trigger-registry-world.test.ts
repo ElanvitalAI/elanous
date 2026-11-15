@@ -65,6 +65,18 @@ test('schedule, webhook, API and event retries share the durable dispatch entry 
     expect(new Set(results.map(result => result.registration.runId)).size).toBe(5);
     expect(device.calls.map(({ ingress }) => ingress)).toEqual(graphTriggerRegistryScript.map(({ ingress }) => ingress));
     expect(device.events.filter(({ type }) => type === 'node-start')).toHaveLength(10);
+    for (const [index, firstIndex] of [[1, 0], [3, 2], [5, 4], [8, 6]] as const) {
+      expect(results[index]?.registration.runId).toBe(results[firstIndex]?.registration.runId);
+      expect(results[index]?.mode).toBeUndefined();
+    }
+    for (const result of results.filter(result => result.registration.created)) {
+      const runId = result.registration.runId;
+      expect(result.state?.runId).toBe(runId);
+      expect(device.events.filter(event => event.runId === runId && event.type === 'node-start')).toHaveLength(2);
+      const runEvents = device.events.filter(event => event.runId === runId);
+      expect(runEvents).toHaveLength(9);
+      expect(new Set(runEvents.map(event => event.eventId)).size).toBe(runEvents.length);
+    }
   } finally { device.close(); }
 });
 

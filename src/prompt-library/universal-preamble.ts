@@ -516,6 +516,28 @@ function findProjectRoot(cwd: string): string {
   }
 }
 
+/** Keep the model's idea of "here" tied to the same directory as its tools. */
+function environmentContext(cwd: string): string {
+  const absoluteCwd = resolvePath(cwd);
+  const candidateRoot = findProjectRoot(absoluteCwd);
+  const gitMarker = join(candidateRoot, '.git');
+  const gitRoot = existsSync(gitMarker) ? candidateRoot : null;
+  let branch: string | null = null;
+  if (gitRoot) {
+    let gitDir = gitMarker;
+    try {
+      const marker = readFileSync(gitMarker, 'utf8').trim();
+      const match = /^gitdir:\s*(.+)$/.exec(marker);
+      if (match) gitDir = resolvePath(gitRoot, match[1]!);
+    } catch { /* A normal .git directory is not readable as text. */ }
+    try {
+      const head = readFileSync(join(gitDir, 'HEAD'), 'utf8').trim();
+      branch = head.startsWith('ref: refs/heads/') ? head.slice('ref: refs/heads/'.length) : '(detached HEAD)';
+    } catch { /* A broken or unreadable HEAD does not hide the cwd. */ }
+  }
+  return `## Environment\n\nWorking directory: ${JSON.stringify(absoluteCwd)}\nGit root: ${gitRoot ? JSON.stringify(gitRoot) : '(none)'}\nBranch: ${branch ? JSON.stringify(branch) : gitRoot ? '(unknown)' : '(none)'}\n\n"Here" and relative file paths refer to the working directory above. The Git root may be its ancestor; do not silently treat it as the working directory.`;
+}
+
 /** Build the ordered chain from project root → cwd inclusive. Each
  *  entry is an absolute directory path. Used by the hierarchical
  *  AGENTS.md loader so per-directory fragments concatenate root-first
@@ -958,7 +980,13 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
   // before family addendum so codex (which has its own discipline
   // overlay) sees both: lifecycle (what shape) + addendum (how to behave
   // inside that shape). Other families see lifecycle alone.
-  out.push(...buildCodingLifecycleAddendum());
+  // Keep the established message order/count for callers that splice this
+  // preamble into a larger conversation; Environment is its own section.
+  const environment = environmentContext(ctx.cwd);
+  out.push(...buildCodingLifecycleAddendum().map(message => ({
+    ...message,
+    content: `${String(message.content)}\n\n${environment}`,
+  })));
   // Family-specific behavioral addendums. Append after the anchor +
   // lifecycle so the model sees project context first, then the generic
   // pipeline shape, then per-family discipline.

@@ -8,6 +8,24 @@ import { tmpdir } from 'node:os';
 import { registerMemberConnectCommands } from './member-connect-cli.js';
 import { tuiMemberSessionPath } from '../tui/member-session-contract.js';
 
+test('member connect warns about missing relay key but exits successfully with its verified session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'member-command-degraded-'));
+  const file = join(root, 'approved.json'); const output: string[] = []; const exits: number[] = [];
+  try {
+    writeFileSync(file, JSON.stringify({ code: 'synthetic', state: 'synthetic', codeVerifier: 'synthetic' }), { mode: 0o600 });
+    const program = new Command();
+    registerMemberConnectCommands(program, { configDir: () => root, output: { log: m => output.push(m), error: m => output.push(m) }, exit: code => exits.push(code),
+      fetchImpl: (async (url: RequestInfo | URL) => String(url).endsWith('/exchange')
+        ? Response.json({ sessionToken: 'aps_syntheticDegraded', expiresAt: '2099-01-01T00:00:00Z', appSlot: { appSlug: 'demo-app' } })
+        : String(url).includes('/v1/members/owner') ? Response.json({ memberId: 'synthetic-owner' })
+          : Response.json({ privateError: 'synthetic-do-not-echo' }, { status: 404 })) as typeof fetch });
+    await program.parseAsync(['member', 'connect', '--handoff-file', file], { from: 'user' });
+    expect(exits).toEqual([0]); expect(existsSync(tuiMemberSessionPath(root))).toBe(true);
+    expect(output.join(' ')).toContain('relay 키가 없습니다'); expect(output.join(' ')).toContain('elanous member key issue');
+    expect(output.join(' ')).not.toContain('aps_syntheticDegraded'); expect(output.join(' ')).not.toContain('synthetic-do-not-echo');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('real member command consumes a private handoff through exchange and owner verification', async () => {
   const root = mkdtempSync(join(tmpdir(), 'member-command-'));
   const file = join(root, 'approved.json');
@@ -23,11 +41,12 @@ test('real member command consumes a private handoff through exchange and owner 
           expect(JSON.parse(String(init?.body))).toEqual(handoff);
           return Response.json({ sessionToken: 'aps_synthetic_session', expiresAt: new Date(Date.now() + 60_000).toISOString(), appSlot: { appSlug: 'synthetic-app' } });
         }
+        if (String(url).endsWith('/v1/member/keys')) return Response.json({ id: '11111111-1111-4111-8111-111111111111', key: 'emk_syntheticOnly' }, { status: 201 });
         expect(init?.headers).toMatchObject({ authorization: 'Bearer aps_synthetic_session' });
         return Response.json({ memberId: 'synthetic-member' });
       }) as typeof fetch });
     await program.parseAsync(['member', 'connect', '--handoff-file', file], { from: 'user' });
-    expect(exits).toEqual([0]); expect(calls).toHaveLength(2);
+    expect(exits).toEqual([0]); expect(calls).toHaveLength(3);
     expect(JSON.parse(readFileSync(tuiMemberSessionPath(root), 'utf8')).sessionToken).toBe('aps_synthetic_session');
     expect(output.join(' ')).not.toContain('aps_'); expect(output.join(' ')).not.toContain('synthetic-code');
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -42,7 +61,7 @@ test('public or hard-linked handoff refuses before exchange and leaves no sessio
       if (hardlink) { chmodSync(file, 0o600); linkSync(file, join(root, 'alias')); }
       const program = new Command(); const exits: number[] = [];
       registerMemberConnectCommands(program, { configDir: () => root, output: { log: () => {}, error: () => {} }, exit: c => exits.push(c),
-        fetchImpl: (async () => { fetches++; throw new Error(); }) as typeof fetch });
+        fetchImpl: (async () => { fetches++; throw new Error(); }) as unknown as typeof fetch });
       await program.parseAsync(['member', 'connect', '--handoff-file', file], { from: 'user' });
       expect(exits).toEqual([1]); expect(existsSync(tuiMemberSessionPath(root))).toBe(false);
     }

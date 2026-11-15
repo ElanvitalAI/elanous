@@ -82,7 +82,8 @@ export async function dispatchGlob(args: Record<string, unknown>): Promise<GlobR
 
   // WD6 — default search path is the session working directory so
   // relative globs ("src/**/*.ts") resolve against the active project.
-  const searchPath = args.path ? resolve(String(args.path)) : getSessionCwd();
+  const sessionCwd = getSessionCwd();
+  const searchPath = args.path ? resolve(sessionCwd, String(args.path)) : sessionCwd;
   const head = Math.min(
     MAX_HEAD_LIMIT,
     Math.max(1, Number(args.head_limit) || DEFAULT_HEAD_LIMIT),

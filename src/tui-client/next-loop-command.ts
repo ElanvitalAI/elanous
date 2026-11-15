@@ -10,6 +10,39 @@ export interface NextLoopCommandOptions {
   schedule?: (callback: () => void, intervalMs: number) => { unsubscribe(): void };
 }
 
+export interface NextTuiLoopBranch {
+  run(input: string): string[];
+  stop(): void;
+  dispose(): void;
+}
+
+/** Own the command lifetime for the registry route across session changes and TUI exit. */
+export function createNextTuiLoopBranch(
+  gate: () => InternalTurnGate | null,
+  log: (event: 'fired' | 'rejected', data: Record<string, unknown>) => void,
+  options: NextLoopCommandOptions = {},
+): NextTuiLoopBranch {
+  let command: NextLoopCommand | null = null;
+  const stop = (): void => { command?.run('stop'); };
+  return {
+    run(input) {
+      if (!/^\/loop(?:\s|$)/u.test(input.trim())) return [];
+      const raw = input.trim().slice('/loop'.length).trim();
+      if (!command) {
+        const availableGate = gate();
+        if (!availableGate) return [
+          'usage: /loop <간격> <프롬프트> · /loop stop',
+          '간격: 30s · 5m · 1h · 맨숫자=분 — TUI가 쉴 때 프롬프트를 발사합니다',
+        ];
+        command = createNextLoopCommand(availableGate, log, options);
+      }
+      return command.run(raw);
+    },
+    stop,
+    dispose() { command?.dispose(); command = null; },
+  };
+}
+
 function parseInterval(raw: string): { intervalMs: number; label: string } | null {
   const match = /^(\d+)(s|sec|초|m|min|분|h|시간)?$/i.exec(raw.trim());
   if (!match) return null;

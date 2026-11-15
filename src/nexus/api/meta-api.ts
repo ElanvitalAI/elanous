@@ -155,6 +155,9 @@ export interface MetaApiOpts {
   resolveVerifiedOwner?: (req: Request, appSlug?: string) => ({ id: string } & Partial<VerifiedAppOwner> & { appSlug?: string }) | undefined;
   /** Bound Nexus publisher; only dispatched after resolveVerifiedOwner succeeds. */
   appDeployPublishHook?: import('../../agent/app-deploy-plugin.js').AppDeployPublishHook;
+  /** Request-bound generated app publisher; absent outside the approved test universe. */
+  dynamicAppDeployHook?: (req: Request) => import('../../agent/app-deploy-plugin.js').DynamicAppDeployHook;
+  resolveDynamicAppOwner?: (req: Request) => Promise<{ memberId: string; userSlug: string } | null>;
   /** Convenience for Tailscale-only / dogfood-loopback mode. */
   noAuth?: boolean;
   // ── PR k · runtime DI for the lifted endpoints ─────────────────
@@ -257,6 +260,11 @@ const authPeerAddresses = new WeakMap<Request, string | undefined>();
  * therefore cannot unlock the same-origin bypass. */
 export function registerAuthPeerAddress(req: Request, peerAddress: string | undefined): void {
   authPeerAddresses.set(req, peerAddress);
+}
+
+/** Transport-only address captured by server.requestIP; never trust Host/forwarded headers. */
+export function getAuthPeerAddress(req: Request): string | undefined {
+  return authPeerAddresses.get(req);
 }
 
 function setupRouteAllowed(req: Request): boolean {
@@ -861,6 +869,9 @@ export async function handlePromptPost(
         ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
         ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
         ...((owner) => owner ? { verifiedOwner: { id: owner.memberId }, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
+        ...(opts.resolveDynamicAppOwner
+          ? ((owner) => owner ? { verifiedOwner: { id: owner.memberId }, dynamicAppDeployHook: opts.dynamicAppDeployHook?.(req) } : {})(await opts.resolveDynamicAppOwner(req))
+          : {}),
         ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
         ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
         ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
@@ -1228,6 +1239,9 @@ export async function handlePromptStreamPost(
                 ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
                 ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
                 ...((owner) => owner ? { verifiedOwner: { id: owner.memberId }, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
+                ...(opts.resolveDynamicAppOwner
+                  ? ((owner) => owner ? { verifiedOwner: { id: owner.memberId }, dynamicAppDeployHook: opts.dynamicAppDeployHook?.(req) } : {})(await opts.resolveDynamicAppOwner(req))
+                  : {}),
                 ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
                 ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
                 ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),

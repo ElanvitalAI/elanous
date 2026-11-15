@@ -38,6 +38,8 @@ export class ApiHttpError extends Error {
   readonly bodyText: string;
   readonly retryAfter?: string;
   readonly provider: string;
+  readonly bodyTimedOut: boolean;
+  readonly bodyReadFailed: boolean;
   /** `decideRetry.extractErrorCode` falls back to `.code` then
    *  `.errno` then `.status`. We expose all three to keep the contract
    *  defensive against future refactors. */
@@ -50,6 +52,8 @@ export class ApiHttpError extends Error {
     provider: string;
     errorPrefix: string;
     retryAfter?: string;
+    bodyTimedOut?: boolean;
+    bodyReadFailed?: boolean;
   }) {
     const trimmed = opts.bodyText.replace(/\s+/g, ' ').slice(0, 500);
     super(`${opts.errorPrefix} ${opts.status}: ${trimmed}`);
@@ -57,6 +61,8 @@ export class ApiHttpError extends Error {
     this.status = opts.status;
     this.bodyText = opts.bodyText;
     this.provider = opts.provider;
+    this.bodyTimedOut = opts.bodyTimedOut === true;
+    this.bodyReadFailed = opts.bodyReadFailed === true;
     this.retryAfter = opts.retryAfter;
     this.code = String(opts.status);
     this.errno = String(opts.status);
@@ -66,6 +72,8 @@ export class ApiHttpError extends Error {
 export interface FetchApiWithRetryOpts {
   /** Provider name for telemetry — anthropic / openai / grok / codex. */
   provider: string;
+  /** Maximum wait for response headers on each attempt. */
+  headerTimeoutMs?: number;
   /** Prefix for the error message when the API returns non-2xx. Same
    *  shape the existing `throw new Error(...)` sites use so log
    *  archaeology stays meaningful. */
@@ -128,13 +136,14 @@ export async function fetchApiWithRetry(
   const remainingFallbacks = opts.remainingFallbacks ?? 0;
   let attempt = 0;
   let overloadStreak = 0;
+  let reasoningFormatRetried = false;
   let lastErr: unknown;
   while (attempt < maxAttempts) {
     let response: Response | null = null;
     // ⛔ try «밖» — 재서명 실패(자격 부재 등)는 재시도할 네트워크 오류가 아니다. 그대로 던진다.
     if (attempt > 0 && opts.refreshInit) init = await opts.refreshInit();
     try {
-      response = await fetch(url, init);
+      response = await fetchWithHeaderTimeout(url, init, opts.headerTimeoutMs ?? 120_000);
       if (response.ok) {
         recordLlmCallOutcome(opts.provider, response.status, 'ok');
         overloadStreak = 0;
@@ -143,7 +152,20 @@ export async function fetchApiWithRetry(
       // Drain body so the error can carry the API's explanation. We
       // don't reuse the response after this point, so consuming the
       // body is safe.
-      const text = await response.text();
+      const body = await readErrorBody(response, 4_096, opts.headerTimeoutMs ?? 120_000);
+      const text = body.text;
+      debug.log('llm.provider-error', 'http', {
+        provider: opts.provider,
+        status: response.status,
+        body: text.slice(0, 500),
+        reason: body.timedOut ? 'error-body-timeout'
+          : body.failed ? 'error-body-read-failed'
+          : response.status === 429 ? 'rate-limit'
+          : response.status === 503 ? 'provider-unavailable'
+          : response.status === 400 ? 'format-error'
+          : response.status === 401 || response.status === 403 ? 'auth-error'
+          : response.status >= 500 ? 'server-error' : 'http-error',
+      }, { level: 'error' });
       // Wave 7 (2026-05-04) — `retry-after-ms` takes priority over
       // `retry-after`. Anthropic emits `retry-after-ms` (ms-precision)
       // alongside the standard `retry-after` (seconds) on rate-limit
@@ -167,6 +189,8 @@ export async function fetchApiWithRetry(
         provider: opts.provider,
         errorPrefix: opts.errorPrefix,
         retryAfter: retryAfterRaw,
+        bodyTimedOut: body.timedOut,
+        bodyReadFailed: body.failed,
       });
     } catch (err: unknown) {
       lastErr = err;
@@ -175,10 +199,35 @@ export async function fetchApiWithRetry(
       // latter). We don't try to introspect the AbortSignal here; that
       // would couple the helper to the caller's signal.
       if (isAbortLike(err)) throw err;
-
       const status = err instanceof ApiHttpError ? err.status : 0;
       const kind = llmCallOutcomeKind(status, err instanceof Error ? err.message : String(err));
       recordLlmCallOutcome(opts.provider, status, kind);
+
+      // A few OpenRouter reasoning models reject an explicit reasoning field.
+      // Rebuild only that request once, and only when the provider says the
+      // field caused the 400. Other 400s keep the original terminal error.
+      if (!reasoningFormatRetried && !opts.refreshInit && err instanceof ApiHttpError && err.status === 400
+        && rejectsReasoningField(err.bodyText)
+        && typeof init.body === 'string') {
+        try {
+          const body = JSON.parse(init.body) as Record<string, unknown>;
+          if (Object.hasOwn(body, 'reasoning')) {
+            delete body.reasoning;
+            init = { ...init, body: JSON.stringify(body) };
+            reasoningFormatRetried = true;
+            // Reference: openai/codex@ee344ca codex-rs/codex-client/src/retry.rs:16-39,84-114.
+            // Its transport policy counts 429/5xx/transport attempts; this one-off format repair
+            // is separate and must not spend that budget.
+            debug.log('llm.retry', 'reasoning-format-retry', { provider: opts.provider, status: 400, attempt, reason: 'reasoning-field-rejected' }, { level: 'warn' });
+            continue;
+          }
+        } catch { /* malformed request body is not recoverable */ }
+      }
+      if (err instanceof ApiHttpError && err.status === 400) {
+        debug.log('llm.retry', 'abort', { provider: opts.provider, status: 400, reason: 'non-retryable-format-error' });
+        throw err;
+      }
+
       if (kind === 'overloaded' || kind === '5xx' || kind === 'rate-limit') overloadStreak += 1;
       else overloadStreak = 0;
       const fp = fingerprintError(err, `api:${opts.provider}`);
@@ -234,6 +283,136 @@ export async function fetchApiWithRetry(
   // Unreachable — the loop always either returns or throws — but
   // satisfies the type checker.
   throw lastErr ?? new Error(`${opts.errorPrefix}: retry loop terminated unexpectedly`);
+}
+
+function rejectsReasoningField(bodyText: string): boolean {
+  let message = bodyText;
+  try {
+    const parsed = JSON.parse(bodyText) as { error?: { message?: unknown; param?: unknown; parameter?: unknown; field?: unknown }; message?: unknown };
+    const error = parsed.error;
+    const param = error?.param ?? error?.parameter ?? error?.field;
+    if (typeof param === 'string') return /^reasoning(?:\.|$)/i.test(param);
+    if (typeof error?.message === 'string') message = error.message;
+    else if (typeof parsed.message === 'string') message = parsed.message;
+  } catch { /* plain-text provider error */ }
+  return /\b(?:unsupported|unknown|unrecognized|invalid)\s+(?:parameter|field|property)\s*[:'" ]*reasoning(?:\.[a-z_]+)?\b/i.test(message)
+    || /\breasoning(?:\.[a-z_]+)?\s+(?:(?:field|parameter)\s+)?(?:is\s+)?(?:unsupported|unknown|invalid|not supported|not allowed)\b/i.test(message)
+    || /\b(?:cannot|can't)\s+disable\s+reasoning\b/i.test(message)
+    || /\breasoning\s+disable(?:d)?\s+(?:is\s+)?(?:unsupported|not supported|not allowed)\b/i.test(message);
+}
+
+async function fetchWithHeaderTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) onAbort();
+  else init.signal?.addEventListener('abort', onAbort, { once: true });
+  let timedOut = false;
+  const timeoutError = new Error(`provider response header timeout after ${timeoutMs}ms`);
+  timeoutError.name = 'ProviderHeaderTimeoutError';
+  Object.assign(timeoutError, { code: 'ETIMEDOUT' });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let handedOff = false;
+  const releaseAbort = () => init.signal?.removeEventListener('abort', onAbort);
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  try {
+    const response = await Promise.race([fetch(url, { ...init, signal: controller.signal }), deadline]);
+    if (!init.signal || !response.body) {
+      releaseAbort();
+      return response;
+    }
+    const reader = response.body.getReader();
+    let closed = false;
+    const finish = () => {
+      if (closed) return;
+      closed = true;
+      releaseAbort();
+      reader.releaseLock();
+    };
+    const body = new ReadableStream<Uint8Array>({
+      async pull(sink) {
+        try {
+          const next = await reader.read();
+          if (next.done) { finish(); sink.close(); }
+          else sink.enqueue(next.value);
+        } catch (error) {
+          finish();
+          sink.error(error);
+        }
+      },
+      async cancel(reason) {
+        try { await reader.cancel(reason); } finally { finish(); }
+      },
+    });
+    handedOff = true;
+    const wrapped = new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+    // Rewrapping only the body must not erase fetch metadata callers may inspect.
+    Object.defineProperties(wrapped, {
+      url: { value: response.url },
+      redirected: { value: response.redirected },
+      type: { value: response.type },
+    });
+    return wrapped;
+  } catch (error) {
+    if (timedOut && !init.signal?.aborted) {
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (!handedOff) releaseAbort();
+  }
+}
+
+async function readErrorBody(response: Response, maxBytes: number, timeoutMs: number): Promise<{ text: string; timedOut: boolean; failed: boolean }> {
+  if (!response.body) return { text: '', timedOut: false, failed: false };
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try { reader = response.body.getReader(); }
+  catch { return { text: '', timedOut: false, failed: true }; }
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let timedOut = false;
+  let failed = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const timeout = new Error(`provider error body timeout after ${timeoutMs}ms`);
+      timeout.name = 'ProviderBodyTimeoutError';
+      Object.assign(timeout, { code: 'ETIMEDOUT' });
+      reject(timeout);
+    }, timeoutMs);
+  });
+  try {
+    while (bytes < maxBytes) {
+      let next: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        next = await Promise.race([reader.read(), deadline]);
+      } catch (error) {
+        if (error instanceof Error && error.name === 'ProviderBodyTimeoutError') {
+          timedOut = true;
+          break;
+        }
+        if (isAbortLike(error)) throw error;
+        failed = true;
+        break;
+      }
+      if (next.done) break;
+      const take = Math.min(next.value.byteLength, maxBytes - bytes);
+      chunks.push(next.value.subarray(0, take));
+      bytes += take;
+      if (take < next.value.byteLength) break;
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  return { text: new TextDecoder().decode(Buffer.concat(chunks)), timedOut, failed };
 }
 
 type OutcomeWriter = (row: { provider: string; status: number; kind: LlmCallOutcomeKind }) => void;

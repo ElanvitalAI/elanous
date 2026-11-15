@@ -42,16 +42,16 @@ describe('dashboard chat main submit route', () => {
     });
   });
 
-  test('normalizes exact bare exit words to the existing slash exit control intent', () => {
-    for (const input of ['exit', 'quit', 'EXIT', '  quit  ']) {
-      expect(resolveDashboardChatMainSubmitIntent(input, {
-        stickyBackend: 'codex',
-      })).toEqual({
-        kind: 'control-turn',
-        source: { kind: 'keyboard', surface: 'dashboard-chat-main' },
-        command: 'slash-command',
-        commandText: '/exit',
-      });
+  test('submits bare exit words as chat with and without a sticky backend', () => {
+    for (const input of ['exit', 'quit', 'EXIT', '  quit  ', '종료', '그만']) {
+      for (const stickyBackend of [null, 'codex']) {
+        expect(resolveDashboardChatMainSubmitIntent(input, { stickyBackend })).toMatchObject({
+          kind: 'submit-turn',
+          source: { kind: 'keyboard', surface: 'dashboard-chat-main' },
+          text: input.trim(),
+          route: stickyBackend ? 'sticky-acp' : 'plain',
+        });
+      }
     }
   });
 
@@ -101,12 +101,12 @@ describe('dashboard chat main submit route', () => {
     }
   });
 
-  test('wires exact bare exit through slash dispatch to the exit-only callback', async () => {
+  test('wires only explicit slash exit through slash dispatch to the exit-only callback', async () => {
     const registry = buildDashboardSlashRegistry();
-    for (const input of ['exit', 'quit', 'EXIT', '  quit  ']) {
+    for (const input of ['/exit', '  /exit  ']) {
       const intent = resolveDashboardChatMainSubmitIntent(input, { stickyBackend: 'codex' });
       expect(intent).toMatchObject({ kind: 'control-turn', commandText: '/exit' });
-      if (intent.kind !== 'control-turn') throw new Error('bare exit must be a control turn');
+      if (intent.kind !== 'control-turn') throw new Error('slash exit must be a control turn');
       const { cmdLower, args } = resolveDashboardChatMainSlashCommand(intent.commandText ?? '');
       const calls: string[] = [];
       const ctx = {

@@ -16,10 +16,10 @@ test('one goal with two marked interim iterations and a final result uses the ne
   expect([plan.get(2)?.kind, plan.get(3)?.kind, plan.get(4)]).toEqual(['folded', 'folded', undefined]);
   const lines = logViewLines(messages, 100).filter(Boolean);
   expect(lines).toEqual([
-    '나: n8n 영상 만들기', '도구: ScheduleWakeup 예약됨',
-    '엘라누스: · 진행 — 1단계 렌더했습니다. (접힘)',
-    '엘라누스: · 진행 — 2단계 렌더했습니다. (접힘)',
-    '엘라누스: 최종 영상: /tmp/final.mp4',
+    '❯ n8n 영상 만들기', '도구: ScheduleWakeup 예약됨',
+    '  · 진행 — 1단계 렌더했습니다. (접힘)',
+    '  · 진행 — 2단계 렌더했습니다. (접힘)',
+    '  최종 영상: /tmp/final.mp4',
   ]);
   const continued = [...messages.slice(0, 3), { role: 'user' as const, content: formatGoalContinuePrompt('다음 단계'), ts }];
   expect(planInterimDisplay(continued).get(2)?.kind).toBe('folded');

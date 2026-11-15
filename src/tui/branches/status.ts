@@ -64,12 +64,12 @@ function readStatusSnapshot(sessionId?: string): NextTuiStatusSnapshot {
   return { provider: provider.provider, model: provider.model, auth: provider.auth, account };
 }
 
-/** The registry resolves `/status` here; extra text is ignored because this is a fixed view. */
+/** The registry resolves `/status` and `/st` here; extra text is ignored because this is a fixed view. */
 export async function runNextTuiStatusBranchRoute(
   input: string,
   host: NextTuiStatusHost,
   readSnapshot: (sessionId?: string) => NextTuiStatusSnapshot = readStatusSnapshot,
 ): Promise<void> {
-  if (!/^\/status(?:\s|$)/u.test(input.trim())) return;
+  if (!/^\/(?:status|st)(?:\s|$)/u.test(input.trim())) return;
   host.addLines(...renderNextTuiStatus(readSnapshot(host.sessionId)));
 }

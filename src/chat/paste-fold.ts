@@ -38,7 +38,10 @@ export function shouldFoldPaste(text: string): boolean {
   return text.split('\n').length >= PASTE_FOLD_MIN_LINES || text.length >= PASTE_FOLD_MIN_CHARS;
 }
 
-export function createPasteFold(log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d)): PasteFold {
+export function createPasteFold(
+  log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d),
+  tokenFor: (id: number, text: string) => string = pasteFoldToken,
+): PasteFold {
   const held = new Map<string, string>();
   let seq = 0;
   return {
@@ -47,7 +50,7 @@ export function createPasteFold(log: (category: string, event: string, data: Rec
       //   쥐는 것·제출하는 것은 붙여넣은 원문 그대로다(r1 must-fix).
       const shown = text.replace(/\r\n?/g, '\n').replace(/\n$/, '');
       if (!shouldFoldPaste(shown)) return text;
-      const token = pasteFoldToken(++seq, shown);
+      const token = tokenFor(++seq, shown);
       held.set(token, text);
       log('tui.paste', 'folded', { id: seq, lines: shown.split('\n').length, chars: shown.length });
       return token;

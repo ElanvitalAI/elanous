@@ -17,6 +17,7 @@ import {
   SHELL_APPROVAL_CANCEL_TYPE,
 } from './next-shell-approval.js';
 import { getSessionTierOverride } from '../model-tier/session-override.js';
+import { configForSessionProviderTurn, getSessionProvider } from './session-provider.js';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawnElanousBun } from '../instance/spawn-elanous.js';
@@ -406,7 +407,10 @@ class LocalChatSession {
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
     const modelTier = getSessionTierOverride(this.sessionId)?.llm;
-    const payload = JSON.stringify({ prompt, id: turnId, ...(modelTier ? { modelTier } : {}), ...(attachments.length ? { attachments } : {}) }) + '\n';
+    const providerSelection = getSessionProvider(this.sessionId);
+    const payload = JSON.stringify({ prompt, id: turnId, ...(modelTier ? { modelTier } : {}),
+      ...(providerSelection ? { sessionProvider: providerSelection } : {}),
+      ...(attachments.length ? { attachments } : {}) }) + '\n';
     const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, onMeasuredUsage, resolve, reject }; });
     try {
       if (writePrompt) await writePrompt(payload);
@@ -502,6 +506,7 @@ export async function closeLocalChatSession(sessionId: string): Promise<void> {
   const session = sessions.get(sessionId);
   sessions.delete(sessionId);
   lastModels.delete(sessionId);
+  // The selection belongs to the TUI session, so a REPL child restart keeps it.
   await session?.close();
 }
 
@@ -540,14 +545,16 @@ export async function runLocalChatTurn(
   // Resolve the same provider auth before starting the turn, request one bounded
   // owner mirror refresh on a missing mirror, then use the normal error card.
   const cfg = (await import('../user-config.js')).getUserConfig();
-  if (cfg.llm.provider === 'openai-codex') {
+  const selection = getSessionProvider(sessionId);
+  if ((selection?.provider ?? cfg.llm.provider) === 'openai-codex') {
+    const effectiveCfg = await configForSessionProviderTurn(cfg, selection);
     const { preflightNextTuiAuth, requestOwnerMirrorOnce } = await import('./next-auth-preflight.js');
     const { loadFreshCodexAuthState, readCodexOwnerMirrorForRun } = await import('../oauth/codex.js');
     const { shouldUseCodexOwnerMirror } = await import('../oauth/codex-owner-mirror.js');
-    const remote = shouldUseCodexOwnerMirror(cfg);
-    await preflightNextTuiAuth(cfg, {
+    const remote = shouldUseCodexOwnerMirror(effectiveCfg);
+    await preflightNextTuiAuth(effectiveCfg, {
       load: async () => remote ? readCodexOwnerMirrorForRun().state : loadFreshCodexAuthState(),
-      request: () => requestOwnerMirrorOnce(cfg),
+      request: () => requestOwnerMirrorOnce(effectiveCfg),
       observe: (reason, requested) => {
         try { debug.log('llm.auth', 'next-tui-mirror-request', { reason, requested }); }
         catch { /* observation cannot block the turn */ }
@@ -562,7 +569,9 @@ export async function runLocalChatTurn(
   // turn's model call sees. Over the shared threshold only; a failure leaves the turn uncompacted.
   // Lazy like this module itself: the compaction path pulls in the LLM router, so next TUI boot stays light.
   const { compactNextTuiSession } = await import('../tui/slash/compact.js');
-  const compacted = await compactNextTuiSession(sessionId, { force: false, modelId: localChatModel(sessionId) }, compact.deps);
+  const compacted = await compactNextTuiSession(sessionId, { force: false,
+    modelId: selection?.model ?? (selection ? (await import('../user-config.js')).PROVIDER_DEFAULT_MODEL[selection.provider] : undefined)
+      ?? localChatModel(sessionId) }, compact.deps);
   if (compacted.fired) {
     try { compact.onCompact?.(compacted); } catch { /* status observers cannot break the turn */ }
   }

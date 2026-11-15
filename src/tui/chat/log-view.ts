@@ -4,6 +4,7 @@ import { planInterimDisplay, type InterimDisplay } from './goal-interim.js';
 import { parseToolResultEnvelope, toolResultBodyText, toolResultErrorText } from '../../chat/tool-render/result-text.js';
 import { agentTraceLine } from '../core/agents.js';
 import { renderMarkdown } from '../../render.js';
+import { nextTuiErrorCard } from './error-card.js';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
@@ -276,9 +277,13 @@ function messageLines(
   }
   // TUI-GOAL-INTERIM-QUIET — 내부 턴 입력은 사람 머리 없이 출처 한 줄 · 이어가기 앞 중간 보고는 한 줄로 접는다.
   if (display?.kind === 'internal-input') return [fitLogLine(`↻ 자동 재개(${display.origin})`, columns), ''];
-  if (display?.kind === 'folded') return [...wrapLine(`엘라누스: ${display.line}`, columns), ''];
+  if (display?.kind === 'folded') return [...wrapLine(`  ${display.line}`, columns), ''];
+  if (message.role === 'assistant' && message.replyFailure === true) {
+    return [...nextTuiErrorCard(message.content, message.replyFailureKind)
+      .flatMap((line) => wrapLine(line, columns)), ''];
+  }
   const lines: string[] = [];
-  const label = message.role === 'user' ? '나: ' : '엘라누스: ';
+  const label = message.role === 'user' ? '❯ ' : '  ';
   if (message.role === 'assistant') {
     lines.push(...assistantMarkdownLines(message.content, columns, label));
   } else {
@@ -398,6 +403,6 @@ export function toggleVisibleToolFold(
 
 /** Ephemeral reply preview until the persisted assistant message replaces it. */
 export function streamReplyLines(text: string, columns: number): string[] {
-  const lines = assistantMarkdownLines(text, columns, '엘라누스: ', false);
+  const lines = assistantMarkdownLines(text, columns, '  ', false);
   return lines.slice(-80);
 }

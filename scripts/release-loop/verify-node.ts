@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
+import { isNexusFirstRunPass } from './nexus-first-run.js';
 
 export function runVerify(run: CommandRunner = runCommand) {
   const context = readGraphContext();
@@ -8,10 +9,12 @@ export function runVerify(run: CommandRunner = runCommand) {
   const output = run('bun', ['bin/elanous.mjs', 'release', 'verify', '--version', context.input.version, '--json']);
   if (output.stderr) process.stderr.write(output.stderr);
   const result = lastResult(output);
-  const passed = output.status === 0 && result?.ok === true && result.notesPage === 'ok';
+  const nexusPassed = isNexusFirstRunPass(result?.nexusFirstRun)
+    && result.nexusFirstRun.versionLine.startsWith(`${context.input.version} `);
+  const passed = output.status === 0 && result?.ok === true && result.notesPage === 'ok' && nexusPassed;
   if (output.status === null || output.status === 2 || !result) throw new Error(`release verify incomplete: ${output.stderr.trim()}`);
   return { outcome: passed ? 'ok' as const : 'fail' as const, verdict: passed ? 'pass' as const : 'fail' as const,
-    summary: passed ? `verify v${context.input.version} · notes page ok` : `verify failed: ${result?.error ?? result?.notesPage ?? output.stderr.trim()}` };
+    summary: passed ? `verify v${context.input.version} · notes page ok` : `verify failed: ${result?.error ?? (!nexusPassed ? 'A158 Nexus first-run receipt missing or failed' : result?.notesPage ?? output.stderr.trim())}` };
 }
 
 if (import.meta.main) {

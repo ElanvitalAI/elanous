@@ -2,6 +2,8 @@ import type { Command } from 'commander';
 import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createMemberStore, type IssuedMemberKey } from '../nexus/members/member-store.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { readTuiMemberSession, tuiMemberSessionPath } from '../tui/member-session-contract.js';
 
 function privateFile(path: string): string {
   const stat = lstatSync(path);
@@ -28,10 +30,30 @@ export function issueToPrivateFile(path: string, issue: (deliver: (issued: Issue
   finally { closeSync(fd); }
 }
 
-export function registerMemberKeyTokenCommands(program: Command, tokenCommand: Command): void {
+export function registerMemberKeyTokenCommands(program: Command, tokenCommand: Command, deps: {
+  configDir?: () => string; fetchImpl?: typeof fetch;
+  output?: Pick<Console, 'log' | 'error'>; exit?: (code: number) => void;
+} = {}): void {
   const member = program.commands.find(command => command.name() === 'member')
     ?? program.command('member').description('Manage local Nexus member credentials');
   const key = member.command('key');
+  key.command('issue').description('Retry issuing a private relay key for the current verified member connection.')
+    .allowExcessArguments(false)
+    .action(async () => {
+      const io = deps.output ?? console;
+      const exit = deps.exit ?? ((code: number) => { process.exitCode = code; });
+      try {
+        const configDir = (deps.configDir ?? getElanousConfigDir)();
+        const session = readTuiMemberSession(tuiMemberSessionPath(configDir));
+        if (!session || session.nexusUrl !== 'https://api.elanous.ai') throw new Error();
+        // Lazy import avoids a cycle with the existing private issuance writer.
+        const { connectMemberRelay } = await import('./member-connect-relay.js');
+        await connectMemberRelay({ configDir, sessionToken: session.sessionToken, fetchImpl: deps.fetchImpl ?? fetch });
+        io.log('릴레이 회원 키를 연결했습니다.'); exit(0);
+      } catch {
+        io.error('릴레이 키를 발급하지 못했습니다. 회원 연결을 확인한 뒤 다시 시도해 주세요.'); exit(1);
+      }
+    });
   key.command('create').requiredOption('--member-id <id>').requiredOption('--name <name>').requiredOption('--out <file>')
     .action((opts: { memberId: string; name: string; out: string }) => {
       const store = createMemberStore();

@@ -27,8 +27,10 @@ export function fitFirstScreenCells(text: string, limit: number): string {
 const GUIDANCE: Record<'ko' | 'en', {
   readonly actions: readonly [string, string, string];
   readonly example: string;
+  readonly compact: string;
 }> = {
   ko: {
+    compact: '무엇이든 물어보세요',
     actions: [
       '· 대화 — 무엇이든 자연어로 물어보고 시켜보세요',
       '· 명령 — /help 로 전체 명령을 보세요',
@@ -37,6 +39,7 @@ const GUIDANCE: Record<'ko' | 'en', {
     example: '바로 입력해 보세요: 무엇을 할 수 있어?',
   },
   en: {
+    compact: 'Ask anything',
     actions: [
       '· Chat — ask for anything in plain language',
       '· Commands — /help lists every command',
@@ -49,8 +52,12 @@ const GUIDANCE: Record<'ko' | 'en', {
 export function firstScreenGuidanceLines(
   locale: 'ko' | 'en',
   width: number,
-  options: { includeSkills?: boolean } = {},
+  options: { includeSkills?: boolean; compact?: boolean } = {},
 ): string[] {
+  if (options.compact) {
+    const hint = GUIDANCE[locale].compact;
+    return firstScreenCellWidth(hint) <= width ? [hint] : [];
+  }
   // Select supported actions before fitting cells: a clipped command cannot
   // reliably identify the action it came from.
   const actions = options.includeSkills === false

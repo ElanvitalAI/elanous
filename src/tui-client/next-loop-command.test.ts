@@ -1,8 +1,30 @@
 import { describe, expect, test } from 'bun:test';
-import { createNextLoopCommand } from './next-loop-command.js';
+import { createNextLoopCommand, createNextTuiLoopBranch } from './next-loop-command.js';
+import { NEXT_TUI_INPUT_CONTEXT, resolveNextTuiRoute } from '../tui/core/registry.js';
 import type { InternalTurnGate } from '../tui/input/internal-turn.js';
 
 describe('Next TUI /loop command', () => {
+  test('registry route owns the branch, which uses the turn gate and stops at session change', () => {
+    const route = resolveNextTuiRoute('/loop 2s check mailbox', NEXT_TUI_INPUT_CONTEXT);
+    expect(route?.branchHost).toBe('loop');
+    expect(route?.branchModule).toBe('../tui-client/next-loop-command.js');
+    let tick: (() => void) | undefined;
+    let cancelled = false;
+    const calls: string[] = [];
+    const gate = { startTurnIfIdle: (input: string) => { calls.push(input); return { opened: true, turnId: 'scheduled-1' }; } } as unknown as InternalTurnGate;
+    const branch = createNextTuiLoopBranch(() => gate, () => {}, {
+      schedule(callback) { tick = callback; return { unsubscribe() { cancelled = true; } }; },
+    });
+    expect(branch.run('/loop 2s check mailbox')).toEqual(['↻ /loop 시작 — 2초마다: check mailbox']);
+    tick?.();
+    expect(calls).toEqual(['check mailbox']);
+    branch.stop();
+    expect(cancelled).toBe(true);
+    tick?.();
+    expect(calls).toEqual(['check mailbox']);
+    branch.dispose();
+  });
+
   test('fake clock retries while human input owns the turn, then fires once and stops', () => {
     let tick: (() => void) | undefined;
     let unsubscribed = false;

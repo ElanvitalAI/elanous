@@ -76,7 +76,7 @@ test('five background Agents stay listed while typing, and one can be stopped by
         { label: 'list', text: '/tasks', until: '작업 5건' },
         { label: 'cancel', text: () => `/tasks stop ${target}`, until: (screen) => screen.includes(`${target} · flood worker · aborted`), timeoutMs: 15_000 }, // Source: #36642
         { label: 'all terminal', until: '백그라운드 끝 5', timeoutMs: 30_000 }, // Source: #36642
-        { label: 'next turn receives results', text: 'collect-results', until: (screen) => screen.includes('나: collect-results') && screen.includes('응답 완료') },
+        { label: 'next turn receives results', text: 'collect-results', until: (screen) => screen.includes('❯ collect-results') && screen.includes('응답 완료') },
       ],
     });
     const requests = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line));

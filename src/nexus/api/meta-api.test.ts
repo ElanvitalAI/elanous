@@ -170,6 +170,30 @@ test('prompt dispatch carries only the server verified owner receipt selected fo
   });
 });
 
+test('generated app owner and request-bound publish hook reach the actual prompt tool dispatch', async () => {
+  let dispatch: ((name: string, args: Record<string, unknown>, ctx?: { callId: string }) => Promise<unknown>) | undefined;
+  let received: DaemonToolDispatchCtx | undefined;
+  const hook = { inspect: async () => ({ artifactDigest: 'a'.repeat(64) }),
+    publish: async () => ({ publicUrl: 'https://demo-app--test-slot.elanous.app' }) };
+  spyOn(coreTurnModule, 'runCoreTurn').mockImplementation(async ctx => {
+    dispatch = ctx.dispatchTool;
+    return { stopReason: 'end_turn', finalText: 'OK' };
+  });
+  const response = await handlePromptPost(new Request('http://test/v1/prompt', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic' },
+    body: JSON.stringify({ userText: '생성 앱 배포해 줘' }),
+  }), {
+    noAuth: true, history: new DaemonSessionHistory(), toolCwd: process.cwd(),
+    toolSurface: { kind: 'chat', specs: [], async dispatch(_name, _args, ctx) { received = ctx; return { ok: true }; } },
+    resolveDynamicAppOwner: async () => ({ memberId: 'member-a', userSlug: 'test-slot' }),
+    dynamicAppDeployHook: () => hook,
+  });
+  expect(response.status).toBe(200);
+  await dispatch!('app_deploy', { appId: 'demo-app', runId: 'run-a', requestText: '배포' });
+  expect(received?.verifiedOwner).toEqual({ id: 'member-a' });
+  expect(received?.dynamicAppDeployHook).toBe(hook);
+});
+
 test('both prompt endpoints reject JSON null with the existing bad-request response', async () => {
   const opts = { noAuth: true, history: new DaemonSessionHistory() };
   for (const [path, handler] of [

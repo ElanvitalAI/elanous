@@ -7,6 +7,22 @@ import { messageBlockDetailLines, nextMessageBlockDetailLevel, type TuiDetailLev
 const HIDDEN_INTERNAL_TOOL_NAMES = new Set(['AgentOutput', 'AgentList', 'TaskGet', 'TaskList', 'update_goal', 'UpdateGoal']);
 const HIDDEN_INTERNAL_TOOL_CALLS = new Set(['Agent', 'AgentOutput', 'AgentList', 'TaskGet', 'TaskList', 'update_goal', 'UpdateGoal']);
 
+/** A finished activity can disappear only after its result has a visible, saved detail row. */
+export function hasDisplayableCompletedToolBlock(
+  callId: string,
+  blocks: readonly MessageBlock[],
+  messages: readonly SerializedMessage[],
+): boolean {
+  return blocks.some((block) => {
+    if (block.body.kind !== 'tool-call' || block.body.toolCallId !== callId
+      || (block.body.status !== '완료' && block.body.status !== '실패')
+      || HIDDEN_INTERNAL_TOOL_CALLS.has(block.body.title)) return false;
+    const ref = block.detail?.rawRef;
+    return Boolean(ref && block.id === ref.blockId && messages.some((message) =>
+      message.role === 'tool' && message.surfaceRunId === ref.runId && message.toolCallId === callId));
+  });
+}
+
 function isHiddenInternalTool(name: string | undefined): boolean {
   return HIDDEN_INTERNAL_TOOL_NAMES.has(name ?? '');
 }
@@ -133,8 +149,18 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
     }
     return typeof result === 'string' ? result : JSON.stringify(result) ?? String(result);
   };
+  // A live detail block already owns this tool's visible summary and expandable
+  // result. Pair by run as well as call ID: an old saved trace must remain visible
+  // when a later run happens to reuse the same call ID.
+  const detailedTools = new Set((input.messageBlocks ?? []).flatMap(({ block }) =>
+    block.body.kind === 'tool-call' && block.detail?.rawRef && block.id === block.detail.rawRef.blockId
+      ? [`${block.detail.rawRef.runId}\u0000${block.body.toolCallId}`] : []));
   const historyMessages = input.messages.map((message) => {
     if (message.role !== 'tool') return message;
+    if (message.surfaceRunId && message.toolCallId
+      && detailedTools.has(`${message.surfaceRunId}\u0000${message.toolCallId}`)) {
+      return { ...message, role: 'system', content: '' } as SerializedMessage;
+    }
     if (isHiddenInternalTool(message.toolName) && hasToolError(message.toolResult)) {
       return { ...message, toolResult: normalizeStructuredToolError(message.toolResult) };
     }
@@ -218,11 +244,11 @@ export function renderNextTuiLogFrame(input: NextTuiLogFrameInput, prepared = pr
   const scroll = Math.max(0, Math.min(input.scroll, maxScroll));
   const start = Math.max(0, history.length - bodyRows - scroll);
   const visibleHistory = history.slice(start, start + bodyRows);
-  // Keep a short transcript just above the prompt. New turns then grow upward
-  // from the input area instead of starting under the header and pushing the
-  // user's point of attention down the screen.
-  const leadingBlankRows = scroll === 0 ? Math.max(0, bodyRows - visibleHistory.length) : 0;
-  const body = [...Array.from({ length: leadingBlankRows }, () => ''), ...visibleHistory];
+  // Conversation starts under the header and grows downward. Reserve unused
+  // rows after it so the footer and input remain pinned until history fills.
+  const leadingBlankRows = 0;
+  const trailingBlankRows = Math.max(0, bodyRows - visibleHistory.length);
+  const body = [...visibleHistory, ...Array.from({ length: trailingBlankRows }, () => '')];
   const lines = [...header, ...body, ...footer, ...promptLines];
   return { lines, body, promptRow: lines.length - promptLines.length + 1, scroll, maxScroll,
     logWindow: { start, rows: bodyRows, columns: input.columns, bodyTop: header.length + 1, leadingBlankRows, foldTargets } };

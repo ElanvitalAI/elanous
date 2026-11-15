@@ -15,7 +15,7 @@ test('empty next TUI shows only usable classic guidance and respects screen spac
   const lines = nextFirstScreenLines(empty);
   expect(lines.some((line) => line.includes('/help'))).toBe(true);
   expect(lines.some((line) => line.includes('/run-skill'))).toBe(false);
-  expect(nextFirstScreenLines({ ...empty, availableRows: 1 })).toEqual(lines.slice(0, 1));
+  expect(nextFirstScreenLines({ ...empty, availableRows: 1 })).toEqual(['Ask anything']);
   expect(nextFirstScreenLines({ ...empty, width: 20 }).every((line) => Bun.stringWidth(line) <= 20)).toBe(true);
 });
 
@@ -28,11 +28,19 @@ test('guidance leaves the screen when the user starts working', () => {
   }
 });
 
-test('narrow widths never reveal a clipped classic-only skill action', () => {
-  for (const width of [8, 12, 20]) {
-    const lines = nextFirstScreenLines({ ...empty, width });
-    expect(lines).toHaveLength(3);
-    expect(lines.some((line) => line.includes('스킬') || line.includes('/run-skill'))).toBe(false);
-    expect(lines.every((line) => Bun.stringWidth(line) <= width)).toBe(true);
+test('narrow welcome shows one complete hint and omits it if it cannot fit', () => {
+  for (const width of [12, 20, 40, 42]) {
+    expect(nextFirstScreenLines({ ...empty, width })).toEqual(['Ask anything']);
   }
+  expect(nextFirstScreenLines({ ...empty, width: 8 })).toEqual([]);
+});
+
+test('wide welcome retains complete actions at the exact fit boundary', () => {
+  const lines = nextFirstScreenLines({ ...empty, width: 43 });
+  expect(lines).toHaveLength(3);
+  expect(lines[0]).toBe('· Chat — ask for anything in plain language');
+});
+
+test('two available rows use the complete single-line hint instead of dropping the example', () => {
+  expect(nextFirstScreenLines({ ...empty, availableRows: 2 })).toEqual(['Ask anything']);
 });

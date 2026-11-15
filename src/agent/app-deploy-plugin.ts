@@ -25,6 +25,12 @@ export interface AppDeployPublishHook {
   verifyPublicUrl(publicUrl: string): Promise<boolean>;
 }
 
+/** Request-bound generated app publisher. The server, never tool arguments, binds the member session. */
+export interface DynamicAppDeployHook {
+  inspect(input: { appId: string; runId: string }): Promise<{ artifactDigest: string }>;
+  publish(input: { appId: string; runId: string }): Promise<{ publicUrl: string }>;
+}
+
 export interface AppDeployUpgradeInput {
   readonly appId: string;
   /** Existing application source target; the hook must edit only an isolated copy. */
@@ -97,6 +103,28 @@ export async function runAppDeploy(
     return { kind: 'site-deploy', status: 'failed', error: 'registered appId and requestText are required' };
   }
   const appId = args.appId;
+  if (args.runId !== undefined) {
+    if (typeof args.runId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/.test(args.runId)
+      || !context?.verifiedOwner?.id || context.requestOrigin === 'external-agent'
+      || !context.dynamicAppDeployHook || !context.confirmChannels?.length) {
+      return { kind: 'site-deploy', status: 'rejected', error: 'verified generated app session and runId are required' };
+    }
+    const runId = args.runId;
+    try {
+      const inspected = await context.dynamicAppDeployHook.inspect({ appId, runId });
+      if (!/^[0-9a-f]{64}$/.test(inspected.artifactDigest)) throw new Error('generated app artifact is not sealed');
+      const confirmation = await requestConfirmation({
+        prompt: '이 생성 앱을 공개 배포할까요?', detail: `검증된 산출물 ${inspected.artifactDigest.slice(0, 12)}`,
+        yesLabel: 'y', noLabel: 'N', header: '배포', channels: context.confirmChannels,
+        onTimeout: () => false, requestId: `app-deploy-generated-${runId}`,
+      });
+      if (!confirmation.answer) return { kind: 'site-deploy', status: 'rejected' };
+      const published = await context.dynamicAppDeployHook.publish({ appId, runId });
+      return { kind: 'site-deploy', status: 'published', publicUrl: published.publicUrl };
+    } catch (error) {
+      return { kind: 'site-deploy', status: 'failed', error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   let receiptId: string;
   try {
     const simulation = await (deps.simulate ?? runRegisteredAppSimulation)(appId);

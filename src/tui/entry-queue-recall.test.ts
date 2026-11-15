@@ -24,7 +24,7 @@ async function runQueueKeys(kind: 'recall' | 'push') {
         { label: 'queued', chunks: ['slow first', '\r', 'queued second', '\r'], gapMs: 350, until: (s) => s.includes('대기 1') },
         kind === 'recall'
           ? { label: 'Ctrl+Up', keys: '\x1b[1;5A', until: (s) => s.includes('❯ queued second') && s.includes('대기 1건을 입력칸으로') && s.includes('응답 중') }
-          : { label: 'empty Enter', keys: '\r', until: (s) => s.includes('나: queued second') && (s.includes('응답 완료') || s.includes('턴 완료')) },
+          : { label: 'empty Enter', keys: '\r', until: (s) => s.includes('❯ queued second') && (s.includes('응답 완료') || s.includes('턴 완료')) },
       ],
     });
   } finally {
@@ -45,6 +45,6 @@ test('empty Enter interrupts an idle model reply and sends the queued entry now'
   const elapsedMs = Date.parse(run.frames[2]!.at) - Date.parse(run.frames[1]!.at);
   // 출처: .rules/30-harness/testing-gates.md R-TST36 — 이 PTY 장치의 fake 응답 지연 8000ms보다 먼저 끝나야 한다.
   expect(elapsedMs).toBeLessThan(8_000);
-  expect(run.frames[2]?.screen).toContain('나: queued second');
+  expect(run.frames[2]?.screen).toContain('❯ queued second');
   expect(run.exitCode).toBe(0);
 }, 30_000);

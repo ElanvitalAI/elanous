@@ -33,6 +33,7 @@ import { codeRevision } from '../version/code-revision.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
+import { firstRunEnvironment, isNexusFirstRunPass, type NexusFirstRunReceipt } from '../../scripts/release-loop/nexus-first-run.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
@@ -94,6 +95,21 @@ export function runReleaseInstaller(script: string, cwd: string, env: NodeJS.Pro
   return run('bash', ['-s', '--', '--yes', '--no-modify-path', '--no-setup'], cwd, { env, input: script });
 }
 
+/** A subprocess keeps the installed daemon's lifecycle out of the synchronous release runner. */
+export function installedNexusFirstRun(binary: string, home: string, env: NodeJS.ProcessEnv, run: Runner,
+  log: (line: string) => void, expectedVersion?: string, expectedCommit?: string): NexusFirstRunReceipt {
+  const probe = run('bun', [join(import.meta.dir, '../../scripts/release-loop/nexus-first-run.ts'), '--binary', binary,
+    ...(expectedVersion ? ['--expected-version', expectedVersion] : []),
+    ...(expectedCommit ? ['--expected-commit', expectedCommit] : [])], home, { env });
+  let receipt: NexusFirstRunReceipt;
+  try { receipt = JSON.parse(probe.stdout.trim().split('\n').at(-1) ?? '') as NexusFirstRunReceipt; }
+  catch { throw new Error(`nexus first-run receipt missing (rc=${probe.status})`); }
+  const passed = probe.status === 0 && isNexusFirstRunPass(receipt);
+  receipt.ok = passed;
+  log(`A158 nexus health=${receipt.health}/ok=${receipt.healthOk} app=${receipt.app} test=${receipt.testUniverse} ownPID=${receipt.pid ?? 'none'} stopped=${receipt.ownPidStopped} ${passed ? 'PASS' : 'FAIL'}`);
+  return receipt;
+}
+
 export const defaultRunner: Runner = (command, args, cwd, opts = {}) => {
   const r = spawnSync(command, [...args], { cwd, encoding: 'utf8', env: opts.env ?? process.env, input: opts.input, maxBuffer: 256 * 1024 * 1024 });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.error ? String(r.error) : (r.stderr ?? '') };
@@ -113,7 +129,7 @@ export interface ReleaseManifest {
   distDir: string;
   files: Array<{ name: string; sha256: string; bytes: number }>;
   webUi: boolean;
-  e2e: { ran: boolean; ok?: boolean; versionLine?: string };
+  e2e: { ran: boolean; ok?: boolean; versionLine?: string; nexusFirstRun?: NexusFirstRunReceipt };
   notesDraft?: string;
   preparedAt: string;
 }
@@ -153,6 +169,7 @@ export interface PrepareOptions {
 export async function prepareRelease(opts: PrepareOptions, run: Runner = defaultRunner): Promise<ReleaseManifest> {
   const log = opts.log ?? ((l: string) => console.error(l));
   if (!isReleaseVersion(opts.version)) throw new Error(`버전 모양이 아니다: ${opts.version} (예: 0.1.1 · 0.2.0-rc.1)`);
+  if (opts.skipE2e) throw new Error('A158 Nexus first-run verification is mandatory; --skip-e2e is not supported');
   const repoRoot = resolve(opts.repoRoot ?? join(import.meta.dir, '..', '..'));
   const publicRepo = opts.publicRepo ?? DEFAULT_PUBLIC_REPO;
   const sourceRef = opts.source ?? 'origin/main';
@@ -225,16 +242,20 @@ export async function prepareRelease(opts: PrepareOptions, run: Runner = default
       const home = join(out, 'e2e-home');
       const prefix = join(out, 'e2e-prefix');
       mkdirSync(home);
-      const env = { ...process.env, HOME: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_RELEASE_BASE: `file://${join(out, 'e2e-release')}`, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: '', SHELL: '/bin/zsh' };
+      const env = { ...firstRunEnvironment(home), ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_RELEASE_BASE: `file://${join(out, 'e2e-release')}`, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: '', SHELL: '/bin/zsh' };
       const install = runReleaseInstaller(readFileSync(join(distDir, 'install.sh'), 'utf8'), home, env, run);
       const version = run(join(prefix, 'bin', 'elanous'), ['--version'], home, { env });
       const versionLine = version.stdout.trim();
-      run('bash', [join(publicDir, 'scripts', 'uninstall.sh')], home, { env });
-      const ok = install.status === 0 && versionLine.startsWith(`${opts.version} ${publicCommit}`);
-      e2e = { ran: true, ok, versionLine };
+      const versionOk = install.status === 0 && version.status === 0 && versionLine === `${opts.version} ${publicCommit}`;
+      let nexusFirstRun: NexusFirstRunReceipt | undefined;
+      try {
+        if (versionOk) nexusFirstRun = installedNexusFirstRun(join(prefix, 'bin', 'elanous'), home, env, run, log, opts.version, publicCommit);
+      } finally { run('bash', [join(publicDir, 'scripts', 'uninstall.sh')], home, { env }); }
+      const ok = versionOk && nexusFirstRun?.ok === true;
+      e2e = { ran: true, ok, versionLine, nexusFirstRun };
       if (!ok) {
         const stderrTail = install.stderr.trim().slice(-1_000) || '(empty)';
-        const detail = `설치 rc=${install.status} · 설치 stderr tail «${stderrTail}» · --version «${versionLine}» (기대 ${opts.version} ${publicCommit.slice(0, 12)}…)`;
+        const detail = `설치 rc=${install.status} · 설치 stderr tail «${stderrTail}» · --version «${versionLine}» (기대 ${opts.version} ${publicCommit.slice(0, 12)}…)${nexusFirstRun && !nexusFirstRun.ok ? ` · A158 Nexus: ${nexusFirstRun.error ?? 'health/app/PID receipt failed'}` : ''}`;
         log(`⑥ 로컬 끝까지 실패 — ${detail}`);
         throw new Error(`로컬 끝까지 실패 — ${detail}`);
       }
@@ -480,7 +501,7 @@ export function checkReleaseNotesPage(version: string | undefined, run: Runner, 
   return { notesPage: r.status === 0 && r.stdout.trim() === '200' ? 'ok' : 'missing', url };
 }
 
-export async function verifyRelease(opts: { version?: string; publicRepo?: string; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ ok: boolean; versionLine: string; installerUrl: string; steps?: { install: number | null; selfUpdate: number | null; uninstall: number | null; daemonStop: number | null }; state?: { memory: boolean; logs: LogRoundTrip }; notesPage?: NotesPage; daemonStopped?: boolean }> {
+export async function verifyRelease(opts: { version?: string; publicRepo?: string; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ ok: boolean; error?: string; versionLine: string; installerUrl: string; steps?: { install: number | null; selfUpdate: number | null; uninstall: number | null; daemonStop: number | null }; state?: { memory: boolean; logs: LogRoundTrip }; notesPage?: NotesPage; daemonStopped?: boolean; nexusFirstRun?: NexusFirstRunReceipt }> {
   const log = opts.log ?? ((l: string) => console.log(l));
   if (opts.version !== undefined && !isReleaseVersion(opts.version)) throw new Error(`버전 모양이 아니다: ${opts.version}`);
   const repo = opts.publicRepo ?? DEFAULT_PUBLIC_REPO;
@@ -495,12 +516,12 @@ export async function verifyRelease(opts: { version?: string; publicRepo?: strin
   try {
     mkdirSync(home);
     // 검증은 «빈 HOME» 에서만 쓴다 — 물려받은 ELANOUS_*(STATE_DIR 등)·XDG_* 가 있으면 상태 왕복이 운영 저장소에 쓴다.
-    const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ELANOUS_') && !key.startsWith('XDG_')));
-    const env = envLiteral({ ...inherited, HOME: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: opts.version ?? '', SHELL: '/bin/zsh' });
+    const env = envLiteral({ ...firstRunEnvironment(home), ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: opts.version ?? '', SHELL: '/bin/zsh' });
     isolatedEnv = env;
     const script = must(run('curl', ['-fsSL', installerUrl], home), `설치기 받기 ${installerUrl}`);
     const install = runReleaseInstaller(script, home, env, run);
     const versionLine = run(binary, ['--version'], home, { env }).stdout.trim();
+    const nexusFirstRun = installedNexusFirstRun(binary, home, env, run, log, opts.version);
     const state = stateRoundTrip(binary, home, env, run, startedAtMs);
     const update = run(binary, ['self-update', '--json'], home, { env });
     const daemonStop = run(binary, ['nexus', '--stop'], home, { env });
@@ -515,9 +536,10 @@ export async function verifyRelease(opts: { version?: string; publicRepo?: strin
       ? run('bash', [join(prefix, 'current', 'node_modules', 'elanous', 'scripts', 'uninstall.sh')], home, { env })
       : { status: null, stdout: '', stderr: 'uninstall.sh 없음' };
     const notes = checkReleaseNotesPage(opts.version, run, home);
-    const ok = install.status === 0 && (opts.version ? versionLine.startsWith(`${opts.version} `) : versionLine.length > 0) && update.status === 0 && daemonStopped && state.memory && state.logs !== 'fail' && notes.notesPage !== 'missing';
+    const ok = install.status === 0 && nexusFirstRun.ok && (opts.version ? versionLine.startsWith(`${opts.version} `) : versionLine.length > 0) && update.status === 0 && daemonStopped && state.memory && state.logs !== 'fail' && notes.notesPage !== 'missing';
     log(`${ok ? '✅' : '⛔'} ${installerUrl}\n  설치 rc=${install.status} · --version «${versionLine}» · 기억 왕복 ${state.memory ? 'ok' : 'FAIL'} · 로그 왕복 ${state.logs === 'ok' ? 'ok' : state.logs === 'fail' ? 'FAIL' : '안 잼(스토어 없음 — 데몬이 한 번 떠야 생긴다)'} · self-update rc=${update.status} · NEXUS 종료 ${daemonStop.status}/${daemonStatus.status} «${daemonStopped ? 'not running' : daemonStatus.stdout.trim().slice(-240)}» · 제거 rc=${uninstall.status} · 노트 페이지 ${notes.notesPage === 'ok' ? 'ok' : notes.notesPage === 'missing' ? `없음 — release/public/docs/releases/${opts.version}.md ⊕ website/pages.json ⊕ \`bun website/scripts/deploy-pages.ts\` (${notes.url})` : '해당 없음'}`);
-    return { ok, versionLine, installerUrl, steps: { install: install.status, selfUpdate: update.status, uninstall: uninstall.status, daemonStop: daemonStop.status }, state, notesPage: notes.notesPage, daemonStopped };
+    return { ok, ...(!nexusFirstRun.ok ? { error: `A158 Nexus first-run failed: ${nexusFirstRun.error ?? `health=${nexusFirstRun.health}/app=${nexusFirstRun.app}/ownPIDStopped=${nexusFirstRun.ownPidStopped}`}` } : {}),
+      versionLine, installerUrl, steps: { install: install.status, selfUpdate: update.status, uninstall: uninstall.status, daemonStop: daemonStop.status }, state, notesPage: notes.notesPage, daemonStopped, nexusFirstRun };
   } finally {
     if (!daemonStopAttempted && existsSync(binary)) {
       try { run(binary, ['nexus', '--stop'], home, { env: isolatedEnv }); }
@@ -1206,7 +1228,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--source <ref>', '원본 ref', 'origin/main')
     .option('--out <dir>', '산출 폴더(비어 있어야 한다 · 기본 임시 폴더)')
     .option('--notes-from <ref>', '변경 기록 초안의 시작 ref(직전 릴리스의 원본 커밋)')
-    .option('--skip-e2e', '로컬 끝까지를 건너뛴다(권하지 않음)')
+    .option('--skip-e2e', '지원 중단 — A158 설치/Nexus 첫 실행은 필수이며 이 옵션은 오류를 반환한다')
     .option('--public-repo <owner/name>', '공개 저장소', DEFAULT_PUBLIC_REPO)
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
     .action(async (o: { version: string; source: string; out?: string; notesFrom?: string; skipE2e?: boolean; publicRepo: string; json?: boolean }) => {

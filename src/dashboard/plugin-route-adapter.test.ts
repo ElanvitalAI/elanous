@@ -4,11 +4,11 @@ import type { CoreTurnContext } from '../core-turn/types.js';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { createDashboardGraphRouteDispatcher, createDashboardPluginRouteAdapter, createDashboardTuiConfirmContext, dispatchVerifiedDashboardGraph, graphFilesForAssets, requestDashboardGraphConfirmation, resolveDashboardVerifiedOwner } from './plugin-route-adapter.js';
 import { buildSessionRuntimeToolSpecs } from '../session-runtime/index.js';
 import { applyDeferredTools } from '../session-runtime/tier-flip.js';
-import { emptyGraphCapabilityRegistry, registerGraphCapabilityContract, registerGraphCapabilityProviderDeclaration } from '../graph-runner/capabilities.js';
-import { runGraph } from '../graph-runner/runner.js';
+import { dispatchGraphContract, emptyGraphCapabilityRegistry, registerGraphCapabilityContract, registerGraphCapabilityProviderDeclaration } from '../graph-runner/capabilities.js';
 import { InlineChoiceBroker } from '../tui/inline-choice.js';
 import { mockSeatPtySequence } from '../ux-sim/mock-seat-pty-sequence.js';
 import { ptyAvailable, startPty, unregisterPty } from '../pty-shell/registry.js';
@@ -117,32 +117,63 @@ test('graph route confirmation fails closed on N and dispatches the declared gra
 
 test('classic graph route dispatch invokes the declared Graph v2 file with a verified owner and fake capability', async () => {
   const pluginRoot = join(import.meta.dir, '..', '..', 'plugins');
-  const stateRoot = mkdtempSync(join(tmpdir(), 'classic-graph-route-rungraph-'));
+  const suggestions = new Map([['member-kaist', [{ id: 'kaist-suggestion', owner: 'member-kaist' }]],
+    ['member-other', [{ id: 'other-suggestion', owner: 'member-other' }]]]);
+  const routeCalls: Array<{ pluginId: string; graphId: string; graphFile: string; owner: string }> = [];
+  const storeReads: Array<{ owner: string | undefined; query: unknown }> = [];
+  let coreCalls = 0;
   let registry = emptyGraphCapabilityRegistry();
   registry = registerGraphCapabilityContract(registry, {
     id: 'store.read@1', input: { type: 'object' }, output: { type: 'object' },
   });
   registry = registerGraphCapabilityProviderDeclaration(registry, {
     id: 'fake-store-reader', provides: ['store.read@1'], tier: 'free',
-    invoke: () => ({ ok: true, outcome: 'done', result: { items: [{ id: 'kaist-suggestion', owner: 'member-kaist' }] }, evidence: { owner: 'member-kaist' } }),
+    invoke: ({ verifiedOwnerId, input }) => {
+      storeReads.push({ owner: verifiedOwnerId, query: input });
+      const query = input as Record<string, unknown>;
+      if (query.ownerScoped !== true || query.where !== `owner == ${verifiedOwnerId}`) {
+        return { ok: false, outcome: 'failed', error: 'unscoped fake store read' };
+      }
+      return { ok: true, outcome: 'done', result: { items: suggestions.get(verifiedOwnerId ?? '') ?? [] },
+        evidence: { owner: verifiedOwnerId } };
+    },
   });
   const routeAdapter = createDashboardPluginRouteAdapter({
     pluginRoot,
-    dispatchCore: async () => undefined,
-    dispatchGraph: async (_pluginId, _graphId, graphFile, args, context) => runGraph(graphFile, {
-      input: { ...args, context: { memberId: context?.verifiedOwner?.id } },
-      quiet: true,
-      deps: { root: join(stateRoot, 'graph-state'), capabilityProviders: registry },
-    }),
+    dispatchCore: async () => { coreCalls++; return undefined; },
+    dispatchGraph: async (pluginId, graphId, graphFile, args, context) => {
+      const owner = context?.verifiedOwner?.id;
+      if (!owner) throw new Error('verified owner required');
+      routeCalls.push({ pluginId, graphId, graphFile, owner });
+      const declaration = parseYaml(readFileSync(graphFile, 'utf8')) as {
+        apiVersion?: string; graph?: { id?: string }; entry?: string;
+        nodes?: Array<{ id?: string; type?: string; requires?: string; with?: Record<string, unknown> }>;
+      };
+      expect(declaration).toMatchObject({ apiVersion: 'elanous.dev/graph/v2',
+        graph: { id: 'absorb-suggest-list' }, entry: 'list' });
+      const node = declaration.nodes?.find((item) => item.id === 'list');
+      expect(node).toMatchObject({ type: 'store', requires: 'store.read@1',
+        with: { op: 'list', collection: 'suggestions', where: 'owner == $context.memberId', ownerScoped: true } });
+      if (!node?.with || typeof node.with.where !== 'string') throw new Error('declared store request missing');
+      const query = { ...node.with, where: node.with.where.replace('$context.memberId', owner) };
+      const read = await dispatchGraphContract('store.read@1', {
+        graphId, runId: 'in-memory-route-test', nodeId: 'list', verifiedOwnerId: owner,
+        input: { ...args, context: { memberId: owner } }, nodeInput: query, outputs: {},
+      }, registry);
+      return { graphId, status: read.ok && read.outcome === 'done' ? 'done' : 'failed', result: read.result };
+    },
   });
-  try {
-    const result = await routeAdapter.dispatch('suggest_list', {}, false, {
-      surface: 'tui', verifiedOwner: { id: 'member-kaist' },
-    });
-    expect(result).toMatchObject({ ok: true, result: { graphId: 'absorb-suggest-list', status: 'done' } });
-  } finally {
-    rmSync(stateRoot, { recursive: true, force: true });
-  }
+  const result = await routeAdapter.dispatch('suggest_list', {}, false, {
+    surface: 'tui', verifiedOwner: { id: 'member-kaist' },
+  });
+  expect(result).toMatchObject({ ok: true, result: { graphId: 'absorb-suggest-list', status: 'done',
+    result: { items: [{ id: 'kaist-suggestion', owner: 'member-kaist' }] } } });
+  expect(routeCalls).toEqual([{ pluginId: 'absorb', graphId: 'absorb-suggest-list',
+    graphFile: join(pluginRoot, 'absorb', 'graph', 'absorb-suggest-list.yaml'), owner: 'member-kaist' }]);
+  expect(storeReads).toEqual([{ owner: 'member-kaist', query: {
+    op: 'list', collection: 'suggestions', where: 'owner == member-kaist', ownerScoped: true,
+  } }]);
+  expect(coreCalls).toBe(0);
 });
 
 test('classic graph route waits for inline y and empty Enter keeps default N', async () => {

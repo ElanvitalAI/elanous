@@ -98,7 +98,7 @@ test('installed Next TUI renders authored final actions in order through public 
     expect(screen.indexOf('할 일: 공유하세요.')).toBeGreaterThan(screen.indexOf('할 일: 검토하세요.'));
     expect(screen).not.toContain('도구:');
     expect(screen).not.toContain(goldenReply.internalMarker);
-    const publicLines = screen.split('\n').map((line) => line.trim().replace(/^엘라누스: /, ''))
+    const publicLines = screen.split('\n').map((line) => line.trim())
       .filter((line) => line === goldenReply.answer || line.startsWith('할 일: '));
     expect(publicLines.join('\n')).toBe(goldenReply.expectedFinalText);
     const stored = readdirSync(join(root, 'sessions')).filter((file) => file.endsWith('.jsonl'))

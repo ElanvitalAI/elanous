@@ -22,7 +22,8 @@ export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omi
       : streamReplyFinal(turnId, message.content);
     const publicAnswer = message.replyFinal === undefined && legacyLastAnswer
       ? `이전 버전 기록 · 완료 여부 확인 안 됨\n\n${answer}` : answer;
-    if (answer) visible[candidate] = { role: 'assistant', content: publicAnswer, ts: message.ts };
+    if (answer) visible[candidate] = { role: 'assistant', content: publicAnswer, ts: message.ts,
+      ...(message.replyFailure === true ? { replyFailure: true, replyFailureKind: message.replyFailureKind } : {}) };
     candidate = -1;
   };
   for (const [index, message] of messages.entries()) {

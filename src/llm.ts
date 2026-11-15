@@ -4,8 +4,9 @@
 
 import type { LLMToolSpec } from './llm/tool-spec.js';
 import { textOnly } from './llm/stream-text.js';
+import { resolveModelProfile, type ModelProfile } from './llm-model-profiles.js';
 import { resolveRequestMaxTokens } from './llm/output-budget.js';
-import { STREAM_DISCONNECT_MAX_RETRIES, STREAM_IDLE_TIMEOUT_MAX_RETRIES, StreamIdleTimeoutError, streamDisconnectRetryDelayMs, isStreamDisconnectRetryable, sleepUnlessAborted } from './llm/stream-fallback.js';
+import { STREAM_DISCONNECT_MAX_RETRIES, STREAM_IDLE_TIMEOUT_MAX_RETRIES, StreamIdleTimeoutError, StreamTotalTimeoutError, streamDisconnectRetryDelayMs, isStreamDisconnectRetryable, sleepUnlessAborted } from './llm/stream-fallback.js';
 import { wellFormedLLMMessages } from './llm-wellformed.js';
 import { truncateOutput } from './output-truncation.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -379,6 +380,8 @@ export interface LLMOpts {
   /** Reports the provider and model actually attempted, including fallbacks. */
   onResolvedProvider?(provider: string, model: string): void;
   temperature?: number;
+  /** OpenAI-compatible frequency penalty; omitted keeps the provider default. */
+  frequencyPenalty?: number;
   maxTokens?: number;
   /** Internal: distinguishes a caller cap from a role/model default passed to a provider. */
   maxTokensExplicit?: boolean;
@@ -389,6 +392,12 @@ export interface LLMOpts {
   signal?: AbortSignal;
   /** Override the text-stream idle watchdog per request (milliseconds). */
   streamIdleTimeoutMs?: number;
+  /** Maximum wait for HTTP response headers for this request. */
+  streamHeaderTimeoutMs?: number;
+  /** Maximum wait for the first provider event; omitted preserves the family idle default. */
+  streamFirstTokenTimeoutMs?: number;
+  /** Whole stream upper bound across chunks and same-provider retries. */
+  streamTotalTimeoutMs?: number;
   /** Optional per-request usage telemetry from the provider stream. */
   onUsage?(usage: LLMUsage): void;
   /** Optional request-size policy. Providers that expose a serialized request
@@ -1111,12 +1120,41 @@ function retryOptsFor(
   provider: string,
   errorPrefix: string,
   remainingFallbacks?: number,
+  headerTimeoutMs?: number,
 ): FetchApiWithRetryOpts {
   return {
     provider,
     errorPrefix,
+    ...(headerTimeoutMs !== undefined ? { headerTimeoutMs } : {}),
     ...(remainingFallbacks !== undefined && remainingFallbacks > 0 ? { remainingFallbacks } : {}),
   };
+}
+
+export function modelProfileTimeoutMs(
+  profile: Pick<ModelProfile, 'timeouts'> | undefined,
+  field: keyof ModelProfile['timeouts'],
+): number | undefined {
+  const seconds = profile?.timeouts[field];
+  if (seconds === undefined) return undefined;
+  const ms = seconds * 1_000;
+  if (!Number.isSafeInteger(ms) || ms <= 0) throw new Error(`invalid model profile timeout ${field}`);
+  return ms;
+}
+
+export function modelProfileSampling(
+  profile: Pick<ModelProfile, 'sampling'> | undefined,
+  call: Pick<LLMOpts, 'temperature' | 'frequencyPenalty'>,
+): { temperature: number | undefined; frequencyPenalty: number | undefined } {
+  // Reference: xai-org/grok-build@2bdd1d6 crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs:79-101.
+  // It applies selected-model sampling fields to the active session; explicit call values win here.
+  return {
+    temperature: call.temperature ?? profile?.sampling.temperature,
+    frequencyPenalty: call.frequencyPenalty ?? profile?.sampling.frequency_penalty,
+  };
+}
+
+function profileTimeoutMs(model: string, field: keyof ModelProfile['timeouts']): number | undefined {
+  return modelProfileTimeoutMs(resolveModelProfile(model), field);
 }
 
 function inferOpenAIProviderName(url: string): string {
@@ -1139,6 +1177,7 @@ async function* streamOpenAIEvents(
   extraHeaders?: Record<string, string>,
   remainingFallbacks?: number,
   allowLengthContinuation = true,
+  headerTimeoutMs?: number,
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -1166,7 +1205,8 @@ async function* streamOpenAIEvents(
       body: JSON.stringify({ ...body, stream: true }),
       signal,
     },
-    retryOptsFor(inferOpenAIProviderName(url), 'LLM API', remainingFallbacks),
+    retryOptsFor(inferOpenAIProviderName(url), 'LLM API', remainingFallbacks,
+      headerTimeoutMs ?? (typeof body?.model === 'string' ? profileTimeoutMs(body.model, 'header_s') : undefined)),
   );
 
   debug.log('llm.response.status', `${response.status} ${response.statusText || ''}`.trim(), {
@@ -1213,7 +1253,7 @@ async function* streamOpenAIEvents(
         { role: 'user', content: 'Continue exactly where the answer stopped. Do not repeat earlier text.' },
       ] };
       debug.log('llm.request', 'length-continuation', { model: body?.model, textChars });
-      yield* streamOpenAIEvents(url, apiKey, continuationBody, signal, extraHeaders, remainingFallbacks, false);
+      yield* streamOpenAIEvents(url, apiKey, continuationBody, signal, extraHeaders, remainingFallbacks, false, headerTimeoutMs);
     }
   } catch (err: any) {
     if (err.name === 'AbortError') {
@@ -3332,6 +3372,7 @@ export const GrokProvider: LLMProvider = {
       })),
       temperature: opts.temperature ?? 0.3,
       max_tokens: opts.maxTokens ?? 2048,
+      ...(opts.frequencyPenalty !== undefined ? { frequency_penalty: opts.frequencyPenalty } : {}),
       ...(tools ? { tools } : {}),
       ...(toChatToolChoice(opts.toolChoice) ? { tool_choice: toChatToolChoice(opts.toolChoice) } : {}),
       ...(includeUsage ? { stream_options: { include_usage: true } } : {}),
@@ -3341,7 +3382,7 @@ export const GrokProvider: LLMProvider = {
       //   빠지면 HTTP 426(실측).
       yield* streamOpenAIEvents(
         `${grokCred.baseUrl}/chat/completions`, apiKey, grokBody, opts.signal,
-        grokCred.kind === 'subscription' ? grokCred.headers : undefined, undefined, allowAutomaticContinuation(opts),
+        grokCred.kind === 'subscription' ? grokCred.headers : undefined, undefined, allowAutomaticContinuation(opts), opts.streamHeaderTimeoutMs,
       );
     } catch (err) {
       const subscriptionExpired = grokCred.kind === 'subscription' && isGrokUnauthorized(grokHttpStatus(err));
@@ -3359,7 +3400,7 @@ export const GrokProvider: LLMProvider = {
           // ⛔ 재시도는 «정확히 1회» — 여기서 또 401 이면 아래 강등으로 안 가고 던진다.
           //   (갱신 직후에도 401 이면 갱신이 아니라 «자격 자체»의 문제다.)
           yield* streamOpenAIEvents(
-            `${renewed.baseUrl}/chat/completions`, renewed.token, grokBody, opts.signal, renewed.headers, undefined, allowAutomaticContinuation(opts),
+            `${renewed.baseUrl}/chat/completions`, renewed.token, grokBody, opts.signal, renewed.headers, undefined, allowAutomaticContinuation(opts), opts.streamHeaderTimeoutMs,
           );
           return;
         }
@@ -3378,7 +3419,7 @@ export const GrokProvider: LLMProvider = {
         from: 'subscription', to: downgraded.kind, source: downgraded.source, refreshOutcome: refreshed,
       }, { level: 'warn' });
       yield* streamOpenAIEvents(
-        `${downgraded.baseUrl}/chat/completions`, downgraded.token, grokBody, opts.signal, undefined, undefined, allowAutomaticContinuation(opts),
+        `${downgraded.baseUrl}/chat/completions`, downgraded.token, grokBody, opts.signal, undefined, undefined, allowAutomaticContinuation(opts), opts.streamHeaderTimeoutMs,
       );
     }
   },
@@ -3415,7 +3456,8 @@ export const OpenAIProvider: LLMProvider = {
       ...(tools ? { tools } : {}),
       ...(toChatToolChoice(opts.toolChoice) ? { tool_choice: toChatToolChoice(opts.toolChoice) } : {}),
       ...(includeUsage ? { stream_options: { include_usage: true } } : {}),
-    }, opts.signal, undefined, undefined, allowAutomaticContinuation(opts));
+      ...(opts.frequencyPenalty !== undefined ? { frequency_penalty: opts.frequencyPenalty } : {}),
+    }, opts.signal, undefined, undefined, allowAutomaticContinuation(opts), opts.streamHeaderTimeoutMs);
   },
   async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
 };
@@ -4722,7 +4764,7 @@ export function resolveDefaultOutputTokens(model: string, role?: ModelRole, long
   return Math.max(512, Math.min(requested, modelLimit));
 }
 
-function resolveStreamIdleTimeout(opts: LLMOpts, provider: LLMProvider, model: string): { ms: number; source: 'call' | 'config' | 'default' } {
+function resolveStreamIdleTimeout(opts: LLMOpts, provider: LLMProvider, model: string): { ms: number; source: 'call' | 'config' | 'profile' | 'default' } {
   if (opts.streamIdleTimeoutMs !== undefined
     && Number.isFinite(opts.streamIdleTimeoutMs) && opts.streamIdleTimeoutMs > 0) {
     return { ms: opts.streamIdleTimeoutMs, source: 'call' };
@@ -4732,8 +4774,23 @@ function resolveStreamIdleTimeout(opts: LLMOpts, provider: LLMProvider, model: s
     configured = (require('./user-config.js') as typeof import('./user-config.js')).getUserConfig().llm.streamIdleTimeoutMs;
   } catch { /* config lookup is fail-soft; preserve provider defaults */ }
   if (configured !== undefined) return { ms: configured, source: 'config' };
+  const profileMs = profileTimeoutMs(model, 'idle_chunk_s');
+  if (profileMs !== undefined) return { ms: profileMs, source: 'profile' };
   const longIdle = usesLongReasoningIdle(getModelFamily(model), provider.name);
-  return { ms: longIdle ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS, source: 'default' };
+  const deepSeek = /(?:^|\/)deepseek[/-]/i.test(model);
+  return { ms: deepSeek ? 600_000 : longIdle ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS, source: 'default' };
+}
+
+function positiveStreamLimit(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function resolveFirstTokenTimeoutMs(opts: LLMOpts, model: string, idleMs: number): number {
+  return positiveStreamLimit(opts.streamFirstTokenTimeoutMs, profileTimeoutMs(model, 'first_token_s') ?? idleMs);
+}
+
+function totalStreamTimeoutMs(opts: LLMOpts, model: string): number {
+  return positiveStreamLimit(opts.streamTotalTimeoutMs, profileTimeoutMs(model, 'total_s') ?? 1_800_000);
 }
 
 function accumulateUsage(usage: ObservedUsage | undefined, received: LLMUsage): ObservedUsage {
@@ -4750,25 +4807,34 @@ async function consumeProviderText(
   messages: LLMMessage[],
   opts: LLMOpts,
   onChunk: (delta: string, full: string) => void,
+  totalDeadlineAt: number,
+  totalMs: number,
 ): Promise<ProviderTextResult> {
   let iterator: AsyncIterator<string | LLMStreamEvent>;
   let full = '';
   let usage: ObservedUsage | undefined;
   let finishReason: string | undefined;
+  const attemptAbort = new AbortController();
+  const forwardAbort = () => attemptAbort.abort(opts.signal?.reason);
+  if (opts.signal?.aborted) forwardAbort();
+  else opts.signal?.addEventListener('abort', forwardAbort, { once: true });
   try {
     const wf = wellFormedLLMMessages(messages);
     if (wf.fixedMessages > 0) {
       debug.log('llm.request', 'lone-surrogate-fixed', { site: 'streamLLM', provider: provider.name, messages: wf.fixedMessages, strings: wf.fixedStrings }, { level: 'warn' });
       messages = wf.messages;
     }
+    const providerOpts = { ...opts, signal: attemptAbort.signal };
     iterator = (provider.streamChat
-      ? provider.streamChat(messages, opts)
-      : provider.chat(messages, opts))[Symbol.asyncIterator]();
+      ? provider.streamChat(messages, providerOpts)
+      : provider.chat(messages, providerOpts))[Symbol.asyncIterator]();
   } catch (error) {
+    opts.signal?.removeEventListener('abort', forwardAbort);
     return { ok: false, full, error };
   }
 
   const closeIterator = async () => {
+    attemptAbort.abort();
     try {
       await iterator.return?.();
     } catch {
@@ -4777,15 +4843,31 @@ async function consumeProviderText(
   };
   const idleTimeout = resolveStreamIdleTimeout(opts, provider, opts.model ?? provider.defaultModel);
   const idleMs = idleTimeout.ms;
+  const firstTokenMs = resolveFirstTokenTimeoutMs(opts, opts.model ?? provider.defaultModel, idleMs);
+  const startedAt = Date.now();
+  let receivedToken = false;
 
-  while (true) {
+  try { while (true) {
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     let step: { idle: true } | { idle: false; result: IteratorResult<string | LLMStreamEvent> };
     try {
+      const remainingMs = totalDeadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        void closeIterator();
+        return { ok: false, full, error: new StreamTotalTimeoutError(totalMs) };
+      }
+      const firstTokenRemainingMs = firstTokenMs - (Date.now() - startedAt);
+      // Reference: openai/codex@ee344ca codex-rs/model-provider-info/src/lib.rs:73-75,543-561
+      // bounds stream idle time separately from retries; this guard also bounds non-token progress.
+      if (!receivedToken && firstTokenRemainingMs <= 0) {
+        void closeIterator();
+        return { ok: false, full, error: new StreamIdleTimeoutError(firstTokenMs) };
+      }
+      const waitMs = Math.max(1, Math.min(receivedToken ? idleMs : firstTokenRemainingMs, remainingMs));
       step = await Promise.race([
         iterator.next().then((result) => ({ idle: false as const, result })),
         new Promise<{ idle: true }>((resolve) => {
-          idleTimer = setTimeout(() => resolve({ idle: true }), idleMs);
+          idleTimer = setTimeout(() => resolve({ idle: true }), waitMs);
         }),
       ]);
     } catch (error) {
@@ -4795,17 +4877,23 @@ async function consumeProviderText(
       if (idleTimer !== undefined) clearTimeout(idleTimer);
     }
     if (step.idle) {
+      if (Date.now() >= totalDeadlineAt) {
+        void closeIterator();
+        return { ok: false, full, error: new StreamTotalTimeoutError(totalMs) };
+      }
       debug.log('llm', 'stream-idle-timeout', {
         provider: provider.name, model: opts.model ?? provider.defaultModel,
         idleMs, idleMsSource: idleTimeout.source, receivedChars: full.length, site: 'stream-llm',
       });
-      const error = new StreamIdleTimeoutError(idleMs);
+      const error = new StreamIdleTimeoutError(receivedToken ? idleMs : firstTokenMs);
       // An async generator can leave return() pending behind a stalled next().
       void closeIterator();
       return { ok: false, full, error };
     }
     if (step.result.done) return { ok: true, full, usage: usage ?? 'unmeasured', finishReason };
     const event = typeof step.result.value === 'string' ? { type: 'text' as const, delta: step.result.value } : step.result.value;
+    if ((event.type === 'text' && event.delta.length > 0)
+      || (event.type === 'reasoning' && event.kind !== 'summary_part_added' && event.delta.length > 0)) receivedToken = true;
     if (event.type === 'usage') {
       usage = accumulateUsage(usage, event.usage);
       try {
@@ -4824,6 +4912,8 @@ async function consumeProviderText(
       await closeIterator();
       throw error;
     }
+  } } finally {
+    opts.signal?.removeEventListener('abort', forwardAbort);
   }
 }
 
@@ -4888,6 +4978,8 @@ export async function streamLLM(
   let activeProvider = fakeDefault
     ? testFakeLlmProvider
     : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
+  const totalMs = totalStreamTimeoutMs(opts, opts.model ?? activeProvider.defaultModel);
+  const totalDeadlineAt = started + totalMs;
   const attemptedProviders = new Set<string>([activeProvider.name, ...(opts.skipProviders ?? [])]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   let modelOverride = opts.model;
@@ -4935,6 +5027,8 @@ export async function streamLLM(
         remainingFallbacks: opts.provider ? 0 : remainingFallbackProviderNames(attemptedProviders, opts).length,
       },
       onChunk,
+      totalDeadlineAt,
+      totalMs,
     );
     let full = consumed.full;
     if (consumed.ok && consumed.finishReason === 'length' && full.length > 0 && !opts.signal?.aborted) {
@@ -4944,7 +5038,7 @@ export async function streamLLM(
         ...messages,
         { role: 'assistant', content: prefix },
         { role: 'user', content: 'Continue exactly where you stopped. Complete the answer without repeating earlier text.' },
-      ], { ...effectiveOpts, model: activeModel, remainingFallbacks: 0 }, (delta, retryFull) => onChunk(delta, prefix + retryFull));
+      ], { ...effectiveOpts, model: activeModel, remainingFallbacks: 0 }, (delta, retryFull) => onChunk(delta, prefix + retryFull), totalDeadlineAt, totalMs);
       // The continuation callback must retain the full combined text for streaming clients.
       if (continued.ok) {
         full = prefix + continued.full;
@@ -4981,6 +5075,7 @@ export async function streamLLM(
       ...(Number.isSafeInteger(err?.status) ? { httpStatus: err.status as number } : Number.isSafeInteger(err?.statusCode) ? { httpStatus: err.statusCode as number } : {}),
       error: err,
     });
+    if (err instanceof StreamTotalTimeoutError) throw err;
     if (err instanceof OverloadFailoverError && !opts.provider && !testFakeLlmDefaultSelected()) {
       const switched = activeProvider.name === 'openai-codex'
         ? firstAvailableFallbackProvider(attemptedProviders, opts)
@@ -8711,6 +8806,7 @@ export async function streamLLMWithTools(
     handlers.onTurnComplete?.(history.slice(initialHistoryLen));
   };
   let fullText = '';
+  let priorRoundHadToolCalls = false;
   let sawToolRound = false;
   let codexContinuationNeeded = false;
   // TUI-GOAL-LOOP-FRICTION — 종결 신호 도구(LLMOpts.terminalToolNames). 비면 아래 분기는 전부 꺼진다.
@@ -8941,6 +9037,8 @@ export async function streamLLMWithTools(
       }
     }
     let turnText = '';
+    let paragraphBoundaryPending = priorRoundHadToolCalls && fullText.length > 0;
+    let paragraphLeadingText = '';
     let turnFinishReason: string | undefined;
     let turnTextPhase: 'commentary' | 'final' | undefined;
     let turnEnd: boolean | undefined;
@@ -9084,6 +9182,9 @@ export async function streamLLMWithTools(
     // family-aware 로 상향(2026-07-19 goal-exec → 아크4 전-family). fast/mini(gpt·other)만 45s 유지.
     const idleTimeout = resolveStreamIdleTimeout(opts, activeProvider, activeModel);
     const streamIdleTimeoutMs = idleTimeout.ms;
+    const firstTokenTimeoutMs = resolveFirstTokenTimeoutMs(opts, activeModel, streamIdleTimeoutMs);
+    const totalTimeoutMs = totalStreamTimeoutMs(opts, activeModel);
+    const streamStartedAt = Date.now();
     // ⚠️ hang 진단(2026-07-17) — codex SSE 스트림이 완료 신호 없이 안 끝나는 케이스 확정용.
     // consume-start 후 consume-end 가 없으면 = for-await(streamChat SSE) hang. lastEvType 로 어느
     // 이벤트 뒤에서 멈추는지(usage/text/tool_call) 특정. 무장할 상한도 남겨 실험 런을 구별한다.
@@ -9103,6 +9204,8 @@ export async function streamLLMWithTools(
     let streamIdleTimeoutRetries = 0;
     let streamIdleRetryPartial = '';
     let streamEmittedImage = false;
+    let sawFirstToken = false;
+    let streamAttemptStartedAt = Date.now();
     // 끊긴 조각을 이력(turnText·fullText)에서 «조용히» 되감는다 — 화면엔 지우라고 알리지 않는다
     //   (TUI 의 빈 델타는 «커밋»이다). 이미 보인 글과 겹치는 재시도 본문은 `retryDisplay` 가 막는다.
     const retryDisplay = createRetryDisplayGate();
@@ -9116,16 +9219,19 @@ export async function streamLLMWithTools(
       }
     };
     const rewindDisconnectedStream = () => {
+      paragraphLeadingText = '';
       if (turnText.length > 0) {
         fullText = fullText.slice(0, fullText.length - turnText.length);
         turnText = '';
         turnTextPhase = undefined;
       }
+      paragraphBoundaryPending = priorRoundHadToolCalls && fullText.length > 0;
       turnReasoningChars = 0;
       retryDisplay.arm();
       turnReasoningDetails = undefined;
       evCount = 0;
       lastEvType = 'none';
+      sawFirstToken = false;
     };
     // ⚠️ idle watchdog(2026-07-17) — codex SSE 가 완료 신호 없이 hang 하는 간헐 케이스 방어. 각
     // 이벤트 대기를 idle timeout 과 race — STREAM_IDLE_TIMEOUT_MS 무이벤트면 스트림 정리·탈출(받은
@@ -9211,12 +9317,23 @@ export async function streamLLMWithTools(
             activeProvider.streamChat!(providerMessages, providerOpts),
             nameMap.toOriginalName,
           )[Symbol.asyncIterator]();
+          streamAttemptStartedAt = Date.now();
         }
+        const remainingMs = totalTimeoutMs - (Date.now() - streamStartedAt);
+        if (remainingMs <= 0) throw new StreamTotalTimeoutError(totalTimeoutMs);
+        const phaseTimeoutMs = sawFirstToken ? streamIdleTimeoutMs : firstTokenTimeoutMs - (Date.now() - streamAttemptStartedAt);
+        // Reference: openai/codex@ee344ca codex-rs/model-provider-info/src/lib.rs:557-561.
+        // Keep the first-token deadline absolute even when usage events arrive rapidly.
+        if (!sawFirstToken && phaseTimeoutMs <= 0) throw new StreamIdleTimeoutError(firstTokenTimeoutMs);
+        const waitMs = Math.max(1, Math.min(phaseTimeoutMs, remainingMs));
         step = await Promise.race([
           streamIter.next().then((r) => ({ idle: false as const, r })),
-          new Promise<{ idle: true }>((res) => { idleTimer = setTimeout(() => res({ idle: true }), streamIdleTimeoutMs); }),
+          new Promise<{ idle: true }>((res) => { idleTimer = setTimeout(() => res({ idle: true }), waitMs); }),
         ]);
-        if (step.idle) throw new StreamIdleTimeoutError(streamIdleTimeoutMs);
+        if (step.idle) {
+          if (Date.now() - streamStartedAt >= totalTimeoutMs) throw new StreamTotalTimeoutError(totalTimeoutMs);
+          throw new StreamIdleTimeoutError(sawFirstToken ? streamIdleTimeoutMs : firstTokenTimeoutMs);
+        }
         await recordChildFirstLlmResponse({ status: 'ok' });
       } catch (err) {
         const status = Number.isSafeInteger((err as { status?: unknown })?.status) ? (err as { status: number }).status
@@ -9225,6 +9342,16 @@ export async function streamLLMWithTools(
         if (idleTimer) clearTimeout(idleTimer);
         releaseStreamAttempt(true, err);
         if (err instanceof RequestSizeLimitError) throw err;
+        if (err instanceof StreamTotalTimeoutError) {
+          debug.log('llm.stream', 'total-timeout', { provider: activeProvider.name, model: activeModel, turn, totalMs: err.totalMs }, { level: 'warn' });
+          try { handlers.onStatus?.(`${activeProvider.name} 응답 시간 상한 초과`); } catch { /* status is fail-soft */ }
+          throw err;
+        }
+        if (err instanceof ApiHttpError) {
+          const reason = err.status === 429 ? '요청 제한' : err.status === 503 ? '공급자 혼잡'
+            : err.status === 400 ? '요청 형식 거부' : '공급자 오류';
+          try { handlers.onStatus?.(`${activeProvider.name} HTTP ${err.status} · ${reason}`); } catch { /* status is fail-soft */ }
+        }
         if (err instanceof ApiHttpError && err.status === 400 && providerToolSchemaDiagnostics) {
           debug.log('llm.tool-schema', 'provider-request-rejected', {
             provider: activeProvider.name,
@@ -9395,15 +9522,33 @@ export async function streamLLMWithTools(
       const ev = step.r.value;
       evCount++;
       lastEvType = ev.type;
+      if ((ev.type === 'text' && ev.delta.length > 0)
+        || (ev.type === 'reasoning' && ev.kind !== 'summary_part_added' && ev.delta.length > 0)
+        || ev.type === 'tool_call') sawFirstToken = true;
       // One same-provider idle retry is allowed per turn; progress clears the stale partial marker,
       // but does not reset that retry budget.
       if (streamIdleTimeoutRetries > 0) streamIdleRetryPartial = '';
       if (ev.type === 'text') {
-        turnText += ev.delta;
         if (ev.phase) turnTextPhase = ev.phase;
         if (ev.phase) turnCodexTextPhase = ev.phase === 'final' ? 'final_answer' : 'commentary';
-        fullText += ev.delta;
-        emitRetryDisplayStep(retryDisplay.onText(ev.delta, turnText));
+        let delta = ev.delta;
+        // Leading whitespace may arrive in several deltas. Decide once, only
+        // after the first visible character, preserving all provider whitespace.
+        if (paragraphBoundaryPending) {
+          paragraphLeadingText += delta;
+          if (!/\S/u.test(paragraphLeadingText)) continue;
+          const trailing = /\s*$/.exec(fullText)?.[0].match(/\n/g)?.length ?? 0;
+          const leading = /^\s*/.exec(paragraphLeadingText)?.[0].match(/\n/g)?.length ?? 0;
+          const separator = '\n'.repeat(Math.max(0, 2 - trailing - leading));
+          // The separator is ordinary turn text: retry rewind and replay must
+          // account for exactly the same bytes as the visible delta.
+          delta = separator + paragraphLeadingText;
+          paragraphLeadingText = '';
+          paragraphBoundaryPending = false;
+        }
+        turnText += delta;
+        fullText += delta;
+        emitRetryDisplayStep(retryDisplay.onText(delta, turnText));
       } else if (ev.type === 'finish') {
         turnFinishReason = ev.reason;
         opts.onFinishReason?.(ev.reason);
@@ -9514,8 +9659,16 @@ export async function streamLLMWithTools(
       }
     }
 
+    // A whitespace-only reply has no paragraph content to separate.
+    if (paragraphLeadingText) {
+      turnText += paragraphLeadingText;
+      fullText += paragraphLeadingText;
+      emitRetryDisplayStep(retryDisplay.onText(paragraphLeadingText, turnText));
+    }
+
     // hang 진단 — for-await(SSE 스트림) 정상 종료 확정. 이 로그가 없으면 codex SSE 스트림 hang.
     emitRetryDisplayStep(retryDisplay.settle(turnText));
+    priorRoundHadToolCalls = pendingCalls.length > 0;
     debug.log('llm.stream', 'consume-end', { turn, evCount, lastEvType, textChars: turnText.length, reasoningChars: turnReasoningChars, pendingCalls: pendingCalls.length });
     const turnInfo = {
       turn,
@@ -12006,6 +12159,8 @@ function makeOpenAICompatProvider(
         throw new Error(`${name} unavailable: configure apiKey via \`elanous setup\``);
       }
       const activeModel = opts.model || model;
+      const profile = resolveModelProfile(activeModel);
+      const { temperature: profiledTemperature, frequencyPenalty: profiledFrequencyPenalty } = modelProfileSampling(profile, opts);
       if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
       const wireModel = name === 'openrouter' ? openRouterWireModel(activeModel) : activeModel;
       const solar = name === 'openrouter' && solarOptimizationEnabled() && isSolarPro4Model(activeModel);
@@ -12079,11 +12234,11 @@ function makeOpenAICompatProvider(
           model: wire.model ? wire.model(activeModel) : activeModel,
           messages: wireMessages,
           ...(() => {
-            const fields = openAiCompatSamplingFields(brand, activeModel, opts.temperature ?? 0.3, opts.maxTokens ?? 2048);
+            const fields = openAiCompatSamplingFields(brand, activeModel, profiledTemperature ?? 0.3, opts.maxTokens ?? 2048);
             // ⛔ 2026-09-23 — OpenRouter 뒤의 추론 모델(kimi·glm·qwen …)은 기본 0.3 을 강제하면 안 된다:
             //   hermes 는 kimi 에 temperature 를 «아예» 안 보내고(게이트웨이가 thinking 1.0 / 비thinking 0.6 을 고름),
             //   openclaw 는 always-thinking(kimi-k3 등)에서 sampling 칸을 지운다. ⇒ 호출자가 «명시»할 때만 싣는다.
-            if (wire.omitDefaultTemperature && opts.temperature === undefined) delete (fields as Record<string, number>).temperature;
+            if (wire.omitDefaultTemperature && profiledTemperature === undefined) delete (fields as Record<string, number>).temperature;
             // Solar honors an explicit caller budget. Other OpenRouter models retain their
             // existing unbounded output behavior; absent Solar budgets remain unbounded too.
             if (wire.omitMaxTokens && !(solar && opts.maxTokens !== undefined)) {
@@ -12094,6 +12249,7 @@ function makeOpenAICompatProvider(
           })(),
           ...(tools ? { tools } : {}),
           ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
+          ...(profiledFrequencyPenalty !== undefined ? { frequency_penalty: profiledFrequencyPenalty } : {}),
           ...(wire.extraBody ?? {}),
           ...deepSeekProvider,
           ...(name === 'openrouter' && (opts.responseFormat || (solar && tools)) ? {
@@ -12114,6 +12270,7 @@ function makeOpenAICompatProvider(
         useSub ? useSub.headers : (sticky ? { ...wire.headers, 'x-session-id': sticky.key } : wire.headers),
         undefined,
         allowAutomaticContinuation(opts),
+        opts.streamHeaderTimeoutMs,
       );
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
@@ -12239,13 +12396,22 @@ function openRouterReasoningField(
   const catalogEffort = requested === undefined && configured === undefined ? openRouterDeepSeekCatalogEffort(model) : undefined;
   const source = requested !== undefined ? 'call' : configured !== undefined ? 'config' : catalogEffort ? 'catalog' : openWeight ? 'default' : 'none';
   const effort = requested ?? (configured !== undefined ? configEffort : catalogEffort ?? (openWeight ? 'medium' : undefined));
+  // The chosen semantic level still comes from call > config > catalog/default;
+  // a profile only translates that level to this model's wire vocabulary.
+  const profileMap = resolveModelProfile(model)?.reasoning.effort_map;
+  const mappedEffort = effort ? profileMap?.[effort] : undefined;
+  if (mappedEffort !== undefined && !Object.hasOwn(OPENROUTER_REASONING_EFFORT, mappedEffort)) {
+    throw new Error(`invalid model profile reasoning effort for ${model}`);
+  }
+  const effectiveEffort = mappedEffort ?? effort;
   // OR-DEEPSEEK-TUNE — DeepSeek V4 는 자기 표(xhigh·max→xhigh · off→칸 없음 · src/llm/openrouter-deepseek.ts).
-  const deepSeekEffort = openRouterDeepSeekEffort(wireModel, effort);
+  const deepSeekEffort = openRouterDeepSeekEffort(wireModel, effectiveEffort);
   const sent = deepSeekEffort !== undefined ? (deepSeekEffort ?? undefined)
-    : effort !== undefined && Object.hasOwn(OPENROUTER_REASONING_EFFORT, effort)
-      ? OPENROUTER_REASONING_EFFORT[effort] : undefined;
+    : effectiveEffort !== undefined && Object.hasOwn(OPENROUTER_REASONING_EFFORT, effectiveEffort)
+      ? OPENROUTER_REASONING_EFFORT[effectiveEffort] : undefined;
   const field = sent ? (wireModel.startsWith('anthropic/') ? 'verbosity' : 'reasoning') : 'none';
-  debug.log('llm.openrouter', 'reasoning', { model, requested: requested ?? null, sent: sent ?? null, source, field });
+  debug.log('llm.openrouter', 'reasoning', { model, requested: requested ?? null, sent: sent ?? null, source, field,
+    ...(mappedEffort !== undefined ? { profileMapped: true } : {}) });
   return field === 'verbosity' ? { verbosity: sent as 'low' | 'medium' | 'high' }
     : field === 'reasoning' ? { reasoning: { effort: sent! } } : {};
 }

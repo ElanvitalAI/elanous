@@ -10,6 +10,13 @@ export class StreamIdleTimeoutError extends Error {
     Object.assign(this, { code: 'ETIMEDOUT' });
   }
 }
+export class StreamTotalTimeoutError extends Error {
+  constructor(readonly totalMs: number) {
+    super(`stream total timeout after ${totalMs}ms`);
+    this.name = 'StreamTotalTimeoutError';
+    Object.assign(this, { code: 'ETIMEDOUT' });
+  }
+}
 export const STREAM_IDLE_TIMEOUT_MAX_RETRIES = 1;
 export let streamDisconnectRetryDelayMs: (attempt: number) => number = backoffMs;
 

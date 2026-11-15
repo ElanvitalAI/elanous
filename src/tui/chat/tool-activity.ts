@@ -101,6 +101,6 @@ export function toolActivityLines(rows: readonly ToolActivityRow[], now: number)
     const projectedTarget = safeToolActivityTarget(row.name, row.target);
     const target = shellTool(row.name) ? projectedTarget?.replace(/(^| )\.\//g, '$1') : projectedTarget;
     const seconds = Math.max(0, Math.floor(((row.finishedAt ?? now) - row.startedAt) / 1000));
-    return ['활동', name, target, row.finishedAt === undefined ? '실행 중' : '완료', seconds + '초'].filter(Boolean).join(' · ');
+    return ['활동', name, target, row.finishedAt === undefined ? '실행 중' : '완료', seconds === 0 ? '<1초' : seconds + '초'].filter(Boolean).join(' · ');
   });
 }

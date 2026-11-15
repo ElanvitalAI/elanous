@@ -1,0 +1,22 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: app-build-plan, version: 1.0.0, layer: flow, purpose: "일반 앱 생성의 검증된 가정·아키텍처·파일 계획" }
+entry: assumptions
+nodes:
+  - id: assumptions
+    type: capability
+    requires: source-planning.assumptions@1
+    with: { stage: assumptions }
+  - id: architecture
+    type: capability
+    requires: source-planning.architecture@1
+    with: { stage: architecture }
+  - id: file-plan
+    type: capability
+    requires: source-planning.file-plan@1
+    with: { stage: file-plan }
+edges:
+  - { from: assumptions, on: outcome, map: { done: architecture, failed: failed } }
+  - { from: architecture, on: outcome, map: { done: file-plan, failed: failed } }
+  - { from: file-plan, on: outcome, map: { done: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.unit] }

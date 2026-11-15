@@ -1,5 +1,11 @@
 import { loadCatalog } from '../intelligence-map/model-catalog.js';
 import { getUserConfig, PROVIDER_DEFAULT_MODEL, reloadUserConfig } from '../user-config.js';
+import { clearSessionProvider, configForSessionProviderTurn, getSessionProvider, parseSessionProvider, setSessionProvider, type SessionProviderSelection } from './session-provider.js';
+import { backupConfigPath, userConfigPath } from '../user-config.js';
+import { withFileLockSync } from '../storage/file-lock.js';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 type FetchModels = (url: string, init: RequestInit) => Promise<Response>;
 type ModelList = { ids: string[]; source: 'remote' | 'cache' | 'local'; note?: string };
@@ -112,45 +118,72 @@ function remoteModelsUrl(provider: string, baseUrl: string | undefined): string 
   return provider === 'openrouter' ? 'https://openrouter.ai/api/v1/models' : undefined;
 }
 
-async function setProviderViaCli(provider: string, model: string | undefined, signal: AbortSignal): Promise<void> {
-  const cli = process.argv[1];
-  if (!cli) throw new Error('elanous CLI entry is unavailable');
-  const child = Bun.spawn({
-    cmd: [process.execPath, cli, 'provider:set', provider, ...(model ? ['--model', model] : [])],
-    stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', env: process.env,
-  });
-  const abort = (): void => { child.kill(); };
-  signal.addEventListener('abort', abort, { once: true });
-  if (signal.aborted) abort();
-  try {
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-    ]);
+function setGlobalProvider(provider: SessionProviderSelection['provider'], model: string | undefined, signal: AbortSignal): void {
+  const path = userConfigPath();
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  withFileLockSync(`${path}.lock`, () => {
     if (signal.aborted) throw new Error('provider switch cancelled');
-    if (code !== 0) throw new Error(stderr.trim().split('\n').at(-1) || stdout.trim().split('\n').at(-1) || `provider:set exit ${code}`);
-    reloadUserConfig();
-  } finally {
-    signal.removeEventListener('abort', abort);
-  }
+    // Only ENOENT is initial absence; failed reads and malformed JSON stop without publishing.
+    let before: string | undefined;
+    try { before = readFileSync(path, 'utf8'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const parsed: unknown = before === undefined ? {} : JSON.parse(before);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('config.json 형식 오류');
+    const next = parsed as Record<string, unknown>;
+    const priorLlm = next.llm;
+    if (priorLlm !== undefined && (!priorLlm || typeof priorLlm !== 'object' || Array.isArray(priorLlm))) {
+      throw new Error('config.json llm 형식 오류');
+    }
+    const llm = { ...(priorLlm as Record<string, unknown> | undefined) };
+    const changed = llm.provider !== provider;
+    llm.provider = provider;
+    llm.model = model ?? PROVIDER_DEFAULT_MODEL[provider];
+    if (changed) {
+      delete llm.apiKey;
+      delete llm.baseUrl;
+    }
+    next.llm = llm;
+    const backup = backupConfigPath(path);
+    const suffix = `.provider-${process.pid}-${randomUUID()}.tmp`;
+    const backupTmp = `${backup}${suffix}`;
+    const nextTmp = `${path}${suffix}`;
+    if (signal.aborted) throw new Error('provider switch cancelled');
+    try {
+      if (before !== undefined) writeFileSync(backupTmp, before, { mode: 0o600, flag: 'wx' });
+      writeFileSync(nextTmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      if (signal.aborted) throw new Error('provider switch cancelled');
+      // Publish only after both files are complete. The backup preserves the old origin's credential.
+      if (before !== undefined) renameSync(backupTmp, backup);
+      renameSync(nextTmp, path);
+    } finally {
+      rmSync(backupTmp, { force: true });
+      rmSync(nextTmp, { force: true });
+    }
+  });
+  reloadUserConfig();
 }
 
 export async function runLocalProviderCommand(
   raw: string,
   signal: AbortSignal,
   onLine: (line: string) => void,
+  sessionId?: string,
 ): Promise<void> {
   if (signal.aborted) throw new Error('provider lookup cancelled');
-  const [action, providerArg, modelArg] = raw.trim() ? raw.trim().split(/\s+/) : ['list'];
-  const cfg = getUserConfig().llm;
+  const [action, providerArg, modelArg, ...flags] = raw.trim() ? raw.trim().split(/\s+/) : ['list'];
+  const selected = sessionId ? getSessionProvider(sessionId) : undefined;
+  const cfg = (await configForSessionProviderTurn(getUserConfig(), selected)).llm;
   const current = cfg.provider;
   if (action === 'list') {
-    onLine(`현재: ${current}/${cfg.model || PROVIDER_DEFAULT_MODEL[current] || '기본 모델'}`);
+    onLine(`현재: ${current}/${cfg.model || PROVIDER_DEFAULT_MODEL[current] || '기본 모델'}${selected ? ' (이 세션)' : ' (전역 기본)'}`);
     for (const [name, model] of Object.entries(PROVIDER_DEFAULT_MODEL)) {
       if (name === 'auto') continue;
       onLine(`${name === current ? '●' : '○'} ${name} · ${model || '기본 모델'}`);
     }
     onLine('모델: /provider models [provider] · /provider refresh [provider]');
-    onLine('전환: /provider use <provider> [model]');
+    onLine('세션 전환: /provider use <provider> [model] · 전역 변경: --global --yes');
     return;
   }
   if (action === 'models' || action === 'refresh') {
@@ -173,11 +206,27 @@ export async function runLocalProviderCommand(
   }
   if (action === 'use') {
     if (!providerArg || !supportedProvider(providerArg)) {
-      throw new Error('사용법: /provider use <provider> [model]');
+      throw new Error('사용법: /provider use <provider> [model] [--global --yes]');
     }
-    await setProviderViaCli(providerArg, modelArg, signal);
-    const next = getUserConfig().llm;
-    onLine(`다음 턴 provider: ${next.provider}/${next.model || '기본 모델'}`);
+    const tokens = [modelArg, ...flags].filter((token): token is string => Boolean(token));
+    const global = tokens.includes('--global');
+    const confirmed = tokens.includes('--yes');
+    const model = tokens.find((token) => !token.startsWith('--'));
+    if (tokens.some((token) => token.startsWith('--') && token !== '--global' && token !== '--yes')
+      || (model ? tokens.filter((token) => !token.startsWith('--')).length > 1 : false)
+      || (confirmed && !global)) throw new Error('사용법: /provider use <provider> [model] [--global --yes]');
+    if (global && !confirmed) throw new Error('전역 config 변경 확인: 같은 명령에 --global --yes를 붙여 주세요');
+    const next = parseSessionProvider(providerArg, model);
+    if (!global) {
+      if (!sessionId) throw new Error('현재 대화를 찾을 수 없습니다');
+      setSessionProvider(sessionId, next);
+      onLine(`이 세션 다음 턴 provider: ${next.provider}/${next.model || PROVIDER_DEFAULT_MODEL[next.provider] || '기본 모델'}`);
+      return;
+    }
+    setGlobalProvider(next.provider, next.model, signal);
+    if (sessionId) clearSessionProvider(sessionId);
+    const currentGlobal = getUserConfig().llm;
+    onLine(`전역 기본 provider: ${currentGlobal.provider}/${currentGlobal.model || '기본 모델'}`);
     return;
   }
   throw new Error('사용법: /provider · /provider models [provider] · /provider use <provider> [model]');

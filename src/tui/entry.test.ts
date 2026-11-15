@@ -645,7 +645,7 @@ test.each(['basic', 'log'] as const)('%s focus paints classified assistant text 
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-    expect(streamingFrames.some((frame) => frame.includes('엘라누스: 첫 응답 델타') && frame.includes('턴 스트리밍'))).toBe(true);
+    expect(streamingFrames.some((frame) => frame.includes('  첫 응답 델타') && frame.includes('턴 스트리밍'))).toBe(true);
     expect(transcript.join('')).not.toContain('private-fixture-value-123456');
     expect(transcript.join('')).not.toContain('PRIVATE-CLIPBOARD');
     expect(replayPaintWrites(transcript).at(-1)).not.toContain('첫 응답 델타');
@@ -1267,7 +1267,7 @@ test('basic chat hides child-agent traces and MessageBlock output', async () => 
     expect(frame).not.toContain('internal poll');
     expect(frame).not.toContain('AgentOutput');
     expect(frame).not.toContain('private goal text');
-    expect(frame).not.toContain('엘라누스: \n');
+    expect(frame).not.toContain('  \n');
   } finally {
     process.stdout.write = output;
   }
@@ -2319,6 +2319,32 @@ test('basic Next TUI renders Write target activity while the answer is still pen
     expect(runningFrame).toContain('app.publish@1');
     expect(transcript.join('')).toContain('Write · ticketing.html · 완료');
     expect(runningFrame).not.toContain('PRIVATE-document-body');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('detail view retains a completed tool activity when no matching result was saved', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  appendMessage(session.id, { role: 'user', content: 'check a missing tool result', ts: new Date().toISOString() });
+  duringTurnHook = () => {
+    toolActivityHandler?.({ phase: 'start', id: 'missing-result', name: 'Read', target: 'notes.txt' });
+    toolActivityHandler?.({ phase: 'finish', id: 'missing-result', name: 'Read' });
+  };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'pageup', ctrl: false, shift: false, raw: '\x1b[5~' },
+    { name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('check a missing tool result');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(replayPaintWrites(transcript).some((frame) => frame.includes('턴 로그')
+      && frame.includes('활동 · Read · notes.txt · 완료'))).toBe(true);
   } finally {
     process.stdout.write = output;
   }

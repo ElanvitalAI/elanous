@@ -38,11 +38,15 @@ export function registerGraphTriggerRun(input: GraphTriggerRunRegistration, opti
   stateRoot?: string;
   createRunId?: () => string;
 } = {}): RegisteredGraphTriggerRun {
-  return registerGraphTriggerDispatchBinding(input, {
+  const registration = registerGraphTriggerDispatchBinding(input, {
     ...(options.registryRoot ? { registryRoot: options.registryRoot } : {}),
     ...(options.stateRoot ? { stateRoot: options.stateRoot } : {}),
     ...(options.createRunId ? { createRunId: options.createRunId } : {}),
   });
+  debug.log('loops.registry', 'graph-trigger-registered', {
+    graphId: registration.graphId, runId: registration.runId, created: registration.created,
+  });
+  return registration;
 }
 
 export interface LoopRegistryOptions {

@@ -17,6 +17,23 @@ function handoff(fetchImpl: typeof fetch): ApprovedMemberHandoff {
     codeVerifier: 'synthetic-verifier', fetchImpl, now: () => Date.parse('2026-11-14T00:00:00.000Z') };
 }
 
+test('relay 404, outage and network failure retain the verified private member session for retry', async () => {
+  for (const failure of ['missing', 'outage', 'network'] as const) {
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith('/exchange')) return Response.json({ sessionToken: token, expiresAt, appSlot: { appSlug: 'demo-app' } });
+      if (String(url).includes('/v1/members/owner')) return Response.json({ memberId: 'synthetic-owner' });
+      if (failure === 'network') throw new Error('synthetic-private-server-error');
+      return Response.json({ error: 'synthetic-private-server-error' }, { status: failure === 'missing' ? 404 : 503 });
+    }) as typeof fetch;
+    const input = handoff(fetchImpl);
+    expect(await connectApprovedMemberSession(input)).toEqual({ expiresAt, relayKeyUnavailable: true });
+    const path = join(input.configDir, 'member-session.json');
+    expect(readTuiMemberSession(path, input.now!())?.appSlug).toBe('demo-app');
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(readdirSync(input.configDir)).toEqual(['member-session.json']);
+  }
+});
+
 test('only a server-exchanged app session with a verified owner becomes a private TUI envelope', async () => {
   const requests: Array<{ url: string; method: string; authorization: string | null; credentials?: RequestCredentials }> = [];
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -28,6 +45,7 @@ test('only a server-exchanged app session with a verified owner becomes a privat
       return Response.json({ sessionToken: token, expiresAt, appSlot: { appSlug: 'demo-app' },
         memberId: 'untrusted-exchange-body' });
     }
+    if (String(input).endsWith('/v1/member/keys')) return Response.json({ id: '11111111-1111-4111-8111-111111111111', key: 'emk_syntheticOnly' }, { status: 201 });
     return Response.json({ memberId: 'member-server-verified' });
   }) as typeof fetch;
   const input = handoff(fetchImpl);
@@ -37,6 +55,8 @@ test('only a server-exchanged app session with a verified owner becomes a privat
       authorization: null, credentials: 'omit' },
     { url: 'https://api.elanous.ai/v1/members/owner?appSlug=demo-app', method: 'GET',
       authorization: `Bearer ${token}`, credentials: 'omit' },
+    { url: 'https://api.elanous.ai/v1/member/keys', method: 'POST',
+      authorization: `Bearer ${token}`, credentials: 'omit' },
   ]);
   const file = join(input.configDir, 'member-session.json');
   expect(statSync(file).mode & 0o777).toBe(0o600);
@@ -45,7 +65,7 @@ test('only a server-exchanged app session with a verified owner becomes a privat
   expect(readFileSync(file, 'utf8')).not.toContain('member-server-verified');
   expect(readFileSync(file, 'utf8')).not.toContain('untrusted-exchange-body');
   expect(readTuiMemberSession(file, input.now!())?.appSlug).toBe('demo-app');
-  expect(readdirSync(input.configDir)).toEqual(['member-session.json']);
+  expect(readdirSync(input.configDir).filter(name => name === 'member-session.json' || name === 'config.json')).toEqual(['config.json', 'member-session.json']);
 });
 
 test('unconfigured issuer, denied owner, and untrusted origin never create a session file', async () => {
@@ -121,6 +141,7 @@ test('expiry is rechecked after owner verification at the publication boundary',
   for (const delta of [-1, expiredBoundaryDelta]) {
     let clock = expiry - 1_000;
     const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(_input).endsWith('/v1/member/keys')) return Response.json({ id: '11111111-1111-4111-8111-111111111111', key: 'emk_syntheticOnly' }, { status: 201 });
       if (init?.method === 'POST') return Response.json({ sessionToken: token,
         expiresAt: new Date(expiry).toISOString(), appSlot: { appSlug: 'demo-app' } });
       clock = expiry + delta;
@@ -131,7 +152,7 @@ test('expiry is rechecked after owner verification at the publication boundary',
     if (delta < expiredBoundaryDelta) {
       await expect(connectApprovedMemberSession(input)).resolves.toEqual({ expiresAt: new Date(expiry).toISOString() });
       expect(readTuiMemberSession(file, clock)?.appSlug).toBe('demo-app');
-      expect(readdirSync(input.configDir)).toEqual(['member-session.json']);
+      expect(readdirSync(input.configDir).includes('config.json')).toBe(true);
     } else {
       await expect(connectApprovedMemberSession(input)).rejects.toThrow('안전하게 저장하지 못했습니다');
       expect(existsSync(file)).toBe(false);

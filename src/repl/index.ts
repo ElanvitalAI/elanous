@@ -24,6 +24,7 @@ import { createInterface, type Interface as ReadlineInterface } from 'node:readl
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath, isAbsolute, basename } from 'node:path';
+import { getSessionCwd } from '../session/working-dir.js';
 import * as ui from '../ui.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
 import { runTurn } from '../session/chat.js';
@@ -217,6 +218,8 @@ export interface ScenarioTurn {
   prompt: string;
   /** Session tier carried from the Next TUI host to its persistent REPL child. */
   modelTier?: 'budget' | 'balanced' | 'best';
+  /** Next TUI process-local choice; contains no credential material. */
+  sessionProvider?: { provider: string; model?: string };
   /** Switch provider before this turn. Resolves through
    *  `rotationEntryLabel` (e.g. "opus" / "codex" / "gemini"). */
   rotate?: string;
@@ -290,7 +293,7 @@ export function buildReplTools(options: {
   const shellApprover = createReplShellApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const graphApprover = createReplGraphApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const runBash = (args: Record<string, unknown>, signal?: AbortSignal) =>
-    dispatchBash(args, { cwd: process.cwd(), ...(signal ? { signal } : {}) });
+    dispatchBash(args, { cwd: getSessionCwd(), ...(signal ? { signal } : {}) });
   dispatchByName.set('Bash', async (args) => {
     const signal = options.getSignal?.();
     const command = typeof args.command === 'string' ? args.command : '';
@@ -458,6 +461,7 @@ export function buildReplTools(options: {
 function buildAgentSystemPrompt(
   cfg: UserConfig,
   enabledToolNames: readonly string[],
+  cwd: string,
 ): string | undefined {
   try {
     const ulMod = require('../prompt-library/universal-preamble.js') as typeof import('../prompt-library/universal-preamble.js');
@@ -465,7 +469,7 @@ function buildAgentSystemPrompt(
     const modelId = cfg.llm.model;
     const modelFamily = modelId ? modelsMod.getModelFamily(modelId) : undefined;
     const universal = ulMod.buildUniversalPreamble({
-      cwd: process.cwd(),
+      cwd,
       ...(modelFamily !== undefined ? { modelFamily } : {}),
       enabledTools: [...enabledToolNames],
     });
@@ -504,7 +508,7 @@ export function buildReplSystemPrompt(ctx: {
 }): string | undefined {
   const base = ctx.enabledToolNames === undefined
     ? undefined
-    : buildAgentSystemPrompt(ctx.cfg, ctx.enabledToolNames);
+    : buildAgentSystemPrompt(ctx.cfg, ctx.enabledToolNames, ctx.cwd);
   const skillToolsEnabled = ctx.enabledToolNames?.includes('skill_exec') === true
     && ctx.enabledToolNames.includes('elanous_skills_list');
   let skillCatalogText = '';
@@ -965,11 +969,11 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       return result;
     },
   } : baseTools;
-  const systemPrompt = buildReplSystemPrompt({
+  const systemPromptForTurn = () => buildReplSystemPrompt({
     cfg,
     enabledToolNames: tools?.specs.map(s => s.name),
-    cwd: process.cwd(),
-    sessionId: session.id,
+    cwd: getSessionCwd(),
+    sessionId: sessionIdRef.current,
   });
   const pendingAttachments: PendingAttachment[] = [];
 
@@ -1045,7 +1049,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         turn.prompt,
         turnAttachments,
         tools,
-        systemPrompt,
+        systemPromptForTurn(),
         opts.jsonOutput,
         nextTuiDelivery,
       );
@@ -1100,6 +1104,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
           continue;
         }
       }
+      // The sticky child outlives /provider --global and config key rotations.
+      // Re-read before every Next TUI turn, then apply this turn's non-secret choice.
+      if (process.env.ELANOUS_NEXT_TUI_STREAM === '1') cfg = reloadUserConfig();
       if (turn.rotate) {
         const { cfg: nextCfg, entry } = jumpToRotationEntry(cfg, turn.rotate);
         if (!entry) {
@@ -1123,6 +1130,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       if (selfHealth && typeof turn.id === 'string') {
         process.stdout.write(`${JSON.stringify({ event: 'self-health', turnId: turn.id, sessionId: sessionIdRef.current, selfHealth })}\n`);
       }
+      const systemPrompt = systemPromptForTurn();
       const turnSystemPrompt = selfHealth ? `${systemPrompt}\n\n${selfHealth.line}` : systemPrompt;
       let result: Awaited<ReturnType<typeof runOneTurn>>;
       const turnAbort = new AbortController();
@@ -1133,8 +1141,14 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       activeTurnSignal = streamTurn ? turnAbort.signal : undefined;
       if (streamTurn) process.once('SIGTERM', onTerminate);
       try {
+        const sessionCfg = turn.sessionProvider && process.env.ELANOUS_NEXT_TUI_STREAM === '1'
+          ? await (async () => {
+            const { configForSessionProviderTurn, parseSessionProvider } = await import('../tui-client/session-provider.js');
+            return configForSessionProviderTurn(cfg, parseSessionProvider(turn.sessionProvider!.provider, turn.sessionProvider!.model));
+          })()
+          : cfg;
         result = await runOneTurn(
-          cfg,
+          sessionCfg,
           sessionIdRef.current,
           turn.prompt,
           turnAttachments,
@@ -1319,7 +1333,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       trimmed,
       turnAttachments,
       tools,
-      systemPrompt,
+      systemPromptForTurn(),
       opts.jsonOutput,
       nextTuiDelivery,
     );

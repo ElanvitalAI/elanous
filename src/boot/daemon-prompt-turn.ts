@@ -114,6 +114,7 @@ export async function runDaemonPromptTurn(opts: {
   /** Verified app-bound member owner proof for Nexus deployment tools. */
   appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
   appDeployPublishHook?: import('../agent/app-deploy-plugin.js').AppDeployPublishHook;
+  dynamicAppDeployHook?: import('../agent/app-deploy-plugin.js').DynamicAppDeployHook;
   appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** Optional structured-question channels for the triggering chat surface. */
   surfaceQuestionChannels?: QuestionChannel[];
@@ -240,6 +241,7 @@ export async function runDaemonPromptTurn(opts: {
             ...(opts.verifiedOwner ? { verifiedOwner: opts.verifiedOwner } : {}),
             ...(opts.appDeploymentOwner ? { appDeploymentOwner: opts.appDeploymentOwner } : {}),
             ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
+            ...(opts.dynamicAppDeployHook ? { dynamicAppDeployHook: opts.dynamicAppDeployHook } : {}),
             ...(opts.appDeploymentSession ? { appDeploymentSession: opts.appDeploymentSession } : {}),
             ...(opts.surface !== undefined || sourceResolution.surface !== 'unknown' ? { surface } : {}),
             ...(opts.surfaceHitlChannels ? { surfaceHitlChannels: opts.surfaceHitlChannels } : {}),

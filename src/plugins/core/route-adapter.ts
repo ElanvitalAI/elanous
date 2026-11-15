@@ -6,11 +6,37 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { parsePluginManifest, type PluginAIToolRoute } from './manifest.js';
 import type { LLMToolDef } from './types.js';
 import { dispatchToolRoute, type ToolRouteMatch } from '../../tool-router/index.js';
+import { writeFileArtifact } from '../../tool-runtime/file-artifact.js';
 import { runAppDeploy } from '../../agent/app-deploy-plugin.js';
 import type { ToolRuntimeContext } from '../../tool-runtime/types.js';
 
-const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:firecrawl', 'native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy']);
+const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:firecrawl', 'native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy', 'native:file_artifact_write']);
 const NON_EXECUTABLE_NATIVE_HANDLERS = new Set(['native:release_graph_start']);
+
+/** Host-issued authority, distinct from caller correlation context and tool arguments. */
+export interface FileArtifactHostContext extends Partial<ToolRuntimeContext> {
+  verifiedOwner: { id: string };
+  fileArtifactAuthority: { ownerId: string; runId: string; approved: true };
+}
+export function isValidHostContext(value: unknown): value is FileArtifactHostContext {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const host = value as Record<string, unknown>;
+    if (!Object.hasOwn(host, 'verifiedOwner') || !Object.hasOwn(host, 'fileArtifactAuthority')) return false;
+    const owner = host.verifiedOwner;
+    const authority = host.fileArtifactAuthority;
+    if (!owner || typeof owner !== 'object' || Array.isArray(owner)
+      || !authority || typeof authority !== 'object' || Array.isArray(authority)) return false;
+    const who = owner as Record<string, unknown>;
+    const grant = authority as Record<string, unknown>;
+    const nonempty = (entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0;
+    return Object.hasOwn(who, 'id') && nonempty(who.id)
+      && ['ownerId', 'runId', 'approved'].every(key => Object.hasOwn(grant, key))
+      && nonempty(grant.ownerId) && grant.ownerId === who.id
+      && nonempty(grant.runId) && grant.approved === true;
+  } catch { return false; }
+}
+
 
 interface NativePluginRouteTool extends LLMToolSpec {
   pluginId: string;
@@ -106,6 +132,18 @@ export function createPluginRouteAdapter(options: {
     }
     if (!EXECUTABLE_NATIVE_HANDLERS.has(tool.handlerRef)) {
       return { ok: false as const, error: `native plugin handler is not registered: ${tool.handlerRef}` };
+    }
+    if (tool.handlerRef === 'native:file_artifact_write') {
+      let hostContext: Partial<ToolRuntimeContext> | undefined;
+      try { hostContext = await options.getDispatchContext?.(); }
+      catch { return { ok: false as const, error: 'file artifact creation context unavailable' }; }
+      if (!isValidHostContext(hostContext)) return { ok: false as const, error: 'file artifact creation context required' };
+      // A caller cannot supply missing host authority or downgrade its approval requirement.
+      const effectiveContext = { ...hostContext, ...context };
+      const approvalRequired = hostContext?.requireApproval === true || effectiveContext.requireApproval === true;
+      if (approvalRequired && !confirmed) return { ok: false as const, error: 'file artifact creation requires approval in this context' };
+      try { return { ok: true as const, result: writeFileArtifact(args) }; }
+      catch { return { ok: false as const, error: 'file artifact creation failed: invalid input or destination unavailable' }; }
     }
     if (tool.handlerRef === 'native:app_deploy') {
       const dispatchContext: ToolRuntimeContext = {

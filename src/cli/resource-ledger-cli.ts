@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { resourceUtilizationView } from '../resource-ledger/resource-utilization.js';
 import { parse } from 'yaml';
 import { readNexusRuntime } from '../nexus/runtime.js';
 import { ensureAuthToken } from '../auth/acp-token.js';
@@ -10,7 +11,6 @@ import { getUserConfig } from '../user-config/reader.js';
 import { parsePodPool, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { activeResourceLeases, parseResourceLedgerEvents, readResourceLedger, reconcileResourceLeases, reassignResourcePools, resourceLedgerPath, resourceMatrix,
   RESOURCE_LANES, type ResourceLane, type ResourceMeasurement } from '../resource-ledger/resource-ledger.js';
-import { resourceUtilizationView } from '../resource-ledger/resource-utilization.js';
 
 export interface ResourceCommandRunner { (command: string, args: string[], host?: string): { status: number | null; stdout: string; stderr: string } }
 export interface ResourceLedgerCliDeps {
@@ -160,10 +160,15 @@ export function buildResourceLedgerSnapshot(deps: Required<Pick<ResourceLedgerCl
     }
     const ledgerFile = `${host.stateDir.replace(/\/$/, '')}/resource-ledger/events.jsonl`;
     const result = deps.run('cat', [ledgerFile], host.host);
+    const missingDiagnostic = /^cat: ([^\r\n]+): No such file or directory\r?\n?$/.exec(result.stderr);
+    const expectedTail = ledgerFile.replace(/^(?:\$HOME|~)(?=\/)/, '');
+    const confirmedMissing = result.status === 1 && missingDiagnostic !== null
+      && (expectedTail === ledgerFile ? missingDiagnostic[1] === ledgerFile
+        : missingDiagnostic[1]?.endsWith(expectedTail) === true);
     if (result.status === 0) {
       try { events.push(...parseResourceLedgerEvents(result.stdout)); }
       catch (error) { remoteLedgerErrors.push({ host: host.host, detail: error instanceof Error ? error.message : String(error) }); }
-    } else if (!/No such file or directory/i.test(result.stderr)) {
+    } else if (!confirmedMissing) {
       remoteLedgerErrors.push({ host: host.host, detail: `remote resource ledger unavailable: ${(result.stderr || `exit ${result.status ?? 'unknown'}`).trim()}` });
     }
   }

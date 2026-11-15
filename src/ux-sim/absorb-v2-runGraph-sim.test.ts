@@ -52,11 +52,36 @@ describe('absorb graph simulation confirmation boundary', () => {
     const receipt = await runAbsorbGraphSimulation({ confirmation: 'y', onAcceptedBuild: async () => {} });
     expect(receipt).toMatchObject({ ok: true, started: true, dispatch: 'dispatched',
       builds: { accepted: { status: 'done' } } });
+    expect((receipt.builds as { accepted: { path: string[] } }).accepted.path)
+      .toEqual(expect.arrayContaining(['source-draft', 'build', 'simulate', 'publish']));
     const released = (receipt.boardProgress as Array<Record<string, unknown>>)
       .find(event => event.state === 'released');
     expect(released).toMatchObject({ memberId: 'member-demo', runId: 'absorb-demo-build-pass',
       result: { publicUrl: 'https://lecture-scrap-demo.app.sim.invalid/' } });
     expect(released?.attachments).toBeUndefined();
+  }, 120_000);
+
+  test('source draft without generated HTML fails before app publication', async () => {
+    let appPublishCalls = 0;
+    await expect(runAbsorbGraphSimulation({ confirmation: 'y',
+      mutateBuildArtifact: artifact => ({ ...artifact, html: '' }),
+      onAppPublish: async () => { appPublishCalls += 1; } }))
+      .rejects.toThrow('source-draft');
+    expect(appPublishCalls).toBe(0);
+  }, 120_000);
+
+  test('new owner briefing message delivers once per brief after same-day replay', async () => {
+    const receipt = await runAbsorbGraphSimulation({ confirmation: 'y', varyNotifyTextOnRepeat: true });
+    const notificationInputs = receipt.notificationInputs as Array<{ runId: string; briefId: string; text: string }>;
+    expect(notificationInputs.slice(0, 2).map(({ briefId }) => briefId))
+      .toEqual(['brief-member-demo-2026-11-09', 'brief-member-demo-2026-11-09']);
+    expect(notificationInputs[0]?.text).not.toBe(notificationInputs[1]?.text);
+    expect(receipt.notificationDeliveries).toEqual([
+      'member-demo:brief-member-demo-2026-11-09',
+      'member-demo:brief-member-demo-2026-11-10',
+    ]);
+    expect(receipt.sameDayNotificationCount).toBe(1);
+    expect(receipt.nextDayNotificationCount).toBe(1);
   }, 120_000);
 
   test('default N leaves the graph, LLM, and app host unopened', async () => {
@@ -357,9 +382,7 @@ for (const scenario of ['member-without-app-slot', 'empty-member-sources'] as co
       expect(receipt.storeWrites).toContain('briefings:member-demo:2026-11-09');
       expect(receipt.storeWrites).not.toContainEqual(expect.stringContaining('design-packs:'));
       expect(receipt.notificationDeliveries).toEqual([
-        'brief-member-demo-2026-11-09:android',
-        'brief-member-demo-2026-11-09:tui',
-        'brief-member-demo-2026-11-09:telegram',
+        'member-demo:brief-member-demo-2026-11-09',
       ]);
       const skipped = (receipt.graphNodes as Array<{ nodeId: string; output?: string }>).find(node => node.nodeId === 'requirements');
       expect(skipped?.output).toContain(`optional-evidence-unavailable:${scenario === 'member-without-app-slot' ? 'slots' : 'sources'}`);
@@ -503,7 +526,7 @@ test('real graph rejects mismatched owner, source, citation, and slot before sug
     expect(receipt.graphStatus).toBe('failed');
     expect(receipt.graphPath).toContain('validate-suggestions');
     expect(receipt.suggestionStoreWrites).toEqual([]);
-    expect(receipt.notificationDeliveries).toHaveLength(3);
+    expect(receipt.notificationDeliveries).toEqual(['member-demo:brief-member-demo-2026-11-09']);
   }
 }, 180_000);
 
@@ -577,7 +600,7 @@ test('real graph stops when the persisted owner design is missing', async () => 
   expect(receipt.graphPath).toContain('load-design');
   expect(receipt.graphPath).not.toContain('suggest');
   expect(receipt.suggestionStoreWrites).toEqual([]);
-  expect(receipt.notificationDeliveries).toHaveLength(3);
+  expect(receipt.notificationDeliveries).toEqual(['member-demo:brief-member-demo-2026-11-09']);
 }, 120_000);
 
 test('design storage fails when the graph key or value reference is broken', async () => {

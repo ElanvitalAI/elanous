@@ -2008,7 +2008,10 @@ function parseTaskAgentConfig(raw: unknown): UserConfig['taskAgent'] {
       landQueue = { command: '', remote: '' };
     }
   }
-  const extras = { ...rejudge, ...(parentHost ? { parentHost } : {}), ...(landQueue ? { landQueue } : {}) };
+  const repoRaw = (raw as Record<string, unknown>).repoUrl;
+  // Preserve only strings; the Pod launch boundary validates or refuses without echoing the value.
+  const repoUrl = typeof repoRaw === 'string' ? repoRaw : undefined;
+  const extras = { ...rejudge, ...(repoUrl !== undefined ? { repoUrl } : {}), ...(parentHost ? { parentHost } : {}), ...(landQueue ? { landQueue } : {}) };
   const liveMoves = (raw as Record<string, unknown>).liveMoves;
   if (liveMoves === undefined) return Object.keys(extras).length ? extras : undefined;
   // 설정이 «있으면» 환경 변수로 내려가지 않는다 — 배열이 아니면 빈 목록(fail-closed), 문자열 밖 항목은 글자로 바꿔 넘겨

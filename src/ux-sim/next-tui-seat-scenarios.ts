@@ -819,7 +819,7 @@ async function runNextProactiveContinueScenario(spec: NextTuiScenarioSpec, root:
     scenario: spec.scenario, universe: root, run,
     store: { remainingUsers, humanUsers, proactiveEvents: proactive }, logs,
     checks: {
-      queuedUserInputWonBoundary: proactive.some((e) => e.event === 'yield-user-input') && nextQueueDispatched >= 0 && autoContinuedAfterQueue > nextQueueDispatched && queuedFrame.includes('나: 검증 결과를 먼저 보여줘'),
+      queuedUserInputWonBoundary: proactive.some((e) => e.event === 'yield-user-input') && nextQueueDispatched >= 0 && autoContinuedAfterQueue > nextQueueDispatched && queuedFrame.includes('❯ 검증 결과를 먼저 보여줘'),
       remainingWorkContinued: proactive.some((e) => e.event === 'continue' && e.reason === 'work-remaining') && autoFrame.includes('↻ 자동 재개(goal-continue)'),
       repeatedRemainderStopped: proactive.some((e) => e.event === 'stop-no-progress' && e.reason === 'same-remaining'),
       humanWorkStopped: proactive.some((e) => e.event === 'stop-human' && e.reason === 'human-action') && results.find((r) => r.name === 'human')?.run.frames.at(-1)?.screen.includes('로그인이 필요합니다') === true,
@@ -1164,7 +1164,7 @@ async function runNextGoalContinueScenario(spec: NextTuiScenarioSpec, root: stri
  *  same-reply stop does not end it early). The fake reply's honesty sentence, counted on screen. */
 const GOAL_INTERIM_STEP_MARK = '단계 렌더를 진행했습니다';
 const GOAL_INTERIM_NOT_DONE_MARK = '아직 못 했습니다';
-/** An internal turn drawn as if a person typed it (classic «❯ …» · next «나: …»). */
+/** An internal turn drawn as if a person typed it (classic/next «❯ …»). */
 /** The first (human) turn also calls one tool, so a folded reply must leave that turn's tool lines on screen.
  *  ScheduleWakeup an hour out: a real registered tool with no approval prompt that never fires inside the run. */
 export const INTERNAL_TURN_USER_HEADER = /(?:나:|❯)\s*\[(?:골 이어가기|자동 재개)\]/u;

@@ -406,6 +406,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         ...(ctx.appDeploymentSession ? { appDeploymentSession: ctx.appDeploymentSession } : {}),
         ...(ctx.appDeploymentOwner ? { appDeploymentOwner: ctx.appDeploymentOwner } : {}),
         ...(ctx.appDeployPublishHook ? { appDeployPublishHook: ctx.appDeployPublishHook } : {}),
+        ...(ctx.dynamicAppDeployHook ? { dynamicAppDeployHook: ctx.dynamicAppDeployHook } : {}),
         ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.surfaceHitlChannels ? { confirmChannels: ctx.surfaceHitlChannels } : {}),
         ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),

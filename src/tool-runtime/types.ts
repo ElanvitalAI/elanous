@@ -110,6 +110,8 @@ export interface ToolRuntimeContext {
   appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
   /** Nexus-owned publisher bound to this verified request; never accepted from tool arguments. */
   appDeployPublishHook?: import('../agent/app-deploy-plugin.js').AppDeployPublishHook;
+  /** Request-bound generated app publisher, installed only by the authenticated Nexus boundary. */
+  dynamicAppDeployHook?: import('../agent/app-deploy-plugin.js').DynamicAppDeployHook;
   /** Server-assigned provenance; omitted on existing owner tool paths. */
   requestOrigin?: RequestOrigin;
   /** Confirm through the originating chat's channels, not another user's global channel. */

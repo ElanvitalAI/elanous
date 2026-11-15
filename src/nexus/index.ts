@@ -123,6 +123,10 @@ import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } fr
 import { createNexusScrapsRouteOptions } from './api/scraps-web-digest.js';
 import { trustedTlsEdgeFromEnv } from './api/tls-edge.js';
 import { createGeneratedAppPublisher, createGeneratedAppPublishRoute, withGeneratedAppsPrivateIngress, type GeneratedAppPublisher } from './apps/generated-app-publish.js';
+import { createDynamicAppPublisher, createDynamicAppPublishRoute, createDynamicAppDeployHook, verifiedDynamicOwner, type DynamicAppPublisher } from './apps/dynamic-app-publish.js';
+import { createAppBuildLocalIssuerBridge } from './apps/app-build-local-bridge.js';
+import { createAppBuildRunAuthority, loadAppBuildRunAuthorityKey, relayMemberKeyFingerprint } from './apps/app-build-run-authority.js';
+import { readTuiMemberSession, tuiMemberSessionPath } from '../tui/member-session-contract.js';
 import { loadNexusAppHost, resolveVerifiedOwner as resolveVerifiedAppOwner, type NexusAppHost } from './apps/app-host.js';
 import { createMemberStore, type MemberStore } from './members/member-store.js';
 import { createVerifiedAbsorbBriefingsAppRoute } from './api/briefings-api.js';
@@ -159,7 +163,7 @@ import { createAppJobLedger, createAppJobs, createAppJobsGenerateAction, handleA
 import { createHiggsfieldAppBackend, downloadHiggsfieldResult } from './apps/higgsfield-backend.js';
 import { createObjectStore, resolveStorageConfig } from '../storage/object-store.js';
 import { APP_DB_BACKUP_HISTORY_KEY_REF, APP_DB_BACKUP_KEY_REF } from './apps/app-db-backup.js';
-import { checkAuth } from './api/meta-api.js';
+import { bearerCredential, checkAuth, getAuthPeerAddress } from './api/meta-api.js';
 import { startControlServer } from '../control-plane/server.js';
 import { startResidentMsgSseServer } from '../msg/msg-sse-server.js';
 import { nexusMemberMachine, startMemberHeartbeat } from '../control-plane/member.js';
@@ -294,6 +298,7 @@ import {
 } from '../voice/channel-adapters/pwa-voice-adapter.js';
 import { getIntakeStore } from '../intake-plane/runtime.js';
 import { join as joinPath, resolve as resolvePath } from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import type { SupervisorSpawnBackend } from './supervisor/spawn.js';
 import type { HealthProbeBackend } from './supervisor/health.js';
@@ -318,7 +323,7 @@ import { createGlobalSubagentCallable } from '../agent/subagent-callable.js';
 import { setAgentHopCap } from '../agent/registry.js';
 import type { SidebarTabSurface } from '../ui/widgets/sidebar-tab-surface.js';
 import { defaultIO, runOnboardingStep, type WizardIO } from '../onboarding.js';
-import { packageVersion } from '../version/code-revision.js';
+import { codeRevision, packageVersion } from '../version/code-revision.js';
 
 // 데몬 배너·`nexus status`·연결 라벨이 보이는 판 = 제품 판(`package.json`) — 옛 내부 상수 `0.17.0` 이 0.2.x 제품 옆에 떴다(🅞 M5 · M5c).
 export const NEXUS_VERSION = packageVersion();
@@ -1458,6 +1463,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   let deploymentOwnerAppHost: NexusAppHost | undefined;
   let deploymentOwnerMemberStore: MemberStore | undefined;
   let generatedAppPublisher: GeneratedAppPublisher | undefined;
+  let dynamicAppPublisher: DynamicAppPublisher | undefined;
   let runtimeHitlPending: HitlPendingCallbacks | undefined;
   // Identity of the AskUserQuestion resolver this boot installed (or null
   // when a prior resolver already owned the hook). release() clears only
@@ -3380,6 +3386,63 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         ? value.memberId : null;
     }, process.env.GOOGLE_OAUTH_REDIRECT_URI ? new URL(process.env.GOOGLE_OAUTH_REDIRECT_URI).origin : undefined);
 
+    const dynamicSourceRoot = joinPath(nexusRootDir(), 'dynamic-app-sources');
+    const dynamicSealRoot = joinPath(nexusRootDir(), 'dynamic-app-seals');
+    const dynamicRuntimeRoot = joinPath(nexusRootDir(), 'dynamic-app-runtime');
+    const runningRevision = codeRevision();
+    const dynamicIssuerSourceHead = /^[0-9a-f]{40}$/.test(runningRevision ?? '') ? runningRevision : undefined;
+    for (const path of [dynamicSourceRoot, dynamicSealRoot, dynamicRuntimeRoot]) mkdirSync(path, { recursive: true, mode: 0o700 });
+    dynamicAppPublisher = createDynamicAppPublisher({
+      sourceRoot: dynamicSourceRoot, sealRoot: dynamicSealRoot, runtimeRoot: dynamicRuntimeRoot, appHost,
+      testMemberId: process.env.ELANOUS_APPROVED_TEST_APP_MEMBER_ID,
+      testHandle: process.env.ELANOUS_APPROVED_TEST_APP_HANDLE,
+      testApprovalExpiresAt: process.env.ELANOUS_APPROVED_TEST_APP_UNTIL,
+      issuerSourceHead: dynamicIssuerSourceHead,
+      approveArtifact: (_owner, _runId, _appSlug, digest) =>
+        !!process.env.ELANOUS_APPROVED_TEST_APP_ARTIFACT_SHA256
+        && process.env.ELANOUS_APPROVED_TEST_APP_ARTIFACT_SHA256 === digest,
+    });
+    const localAppBuildIssuerBridge = createAppBuildLocalIssuerBridge({
+      sourceHead: dynamicIssuerSourceHead,
+      publisher: dynamicAppPublisher,
+      peerAddress: getAuthPeerAddress,
+      authorizeControl: request => !!metaApiOpts && bearerCredential(request, metaApiOpts) === 'bearer-match'
+        && checkAuth(request, metaApiOpts),
+      getSession: () => readTuiMemberSession(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE)),
+      ...(bearerToken && dynamicIssuerSourceHead ? { runAuthority: createAppBuildRunAuthority({
+        root: joinPath(getElanousConfigDir(), 'app-build', 'authority'),
+        hostKey: loadAppBuildRunAuthorityKey(joinPath(nexusRootDir(), 'app-build-authority.key')),
+        retainedSession: () => readTuiMemberSession(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE), 0),
+        relayKeyFingerprint: () => relayMemberKeyFingerprint(getElanousConfigDir()),
+      }) } : {}),
+      relayToken: process.env.ELANOUS_APPROVED_TEST_APP_RELAY_TOKEN,
+    });
+    const resolveDynamicAppOwner = async (request: Request) => {
+      if (!httpServer || !deploymentOwnerMemberStore) return null;
+      const headers = new Headers();
+      for (const name of ['cookie', 'authorization']) {
+        const value = request.headers.get(name); if (value) headers.set(name, value);
+      }
+      const response = await fetch(new URL('/v1/members/owner', httpServer.url), { headers, redirect: 'manual',
+        signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) return null;
+      const value = await response.json() as unknown;
+      return verifiedDynamicOwner(value, deploymentOwnerMemberStore);
+    };
+    const dynamicAppPublishRoute = createDynamicAppPublishRoute(dynamicAppPublisher, resolveDynamicAppOwner,
+      process.env.GOOGLE_OAUTH_REDIRECT_URI ? new URL(process.env.GOOGLE_OAUTH_REDIRECT_URI).origin : undefined);
+
+    if (metaApiOpts && process.env.ELANOUS_APPROVED_TEST_APP_MEMBER_ID
+      && process.env.ELANOUS_APPROVED_TEST_APP_HANDLE
+      && process.env.ELANOUS_APPROVED_TEST_APP_UNTIL
+      && dynamicIssuerSourceHead
+      && process.env.ELANOUS_APPROVED_TEST_APP_ARTIFACT_SHA256
+      && process.env.ELANOUS_APPROVED_TEST_APP_RELAY_TOKEN) {
+      metaApiOpts.resolveDynamicAppOwner = resolveDynamicAppOwner;
+      metaApiOpts.dynamicAppDeployHook = request => createDynamicAppDeployHook(request, dynamicAppPublishRoute,
+        process.env.ELANOUS_APPROVED_TEST_APP_RELAY_TOKEN);
+    }
+
     if (metaApiOpts && appSiteDeploymentRuntime) {
       metaApiOpts.appDeployPublishHook = createVerifiedAppSiteDeployPublisher(appSiteDeploymentRuntime);
     }
@@ -3496,7 +3559,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         return appSimulationStore.snapshot(slug);
       },
       ...(appPublicUserSlug ? { appPreviewUserSlug: appPublicUserSlug } : {}),
-      appRoutes: [generatedAppPublishRoute, ...(appPublishRoute ? [appPublishRoute] : []), ...(appSiteDeployRoute ? [appSiteDeployRoute] : []), absorbBriefingsRoute, appActionRoute, ...(appSimulationRoute ? [appSimulationRoute] : []), appPromoteRoute, appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
+      appRoutes: [generatedAppPublishRoute, dynamicAppPublishRoute, localAppBuildIssuerBridge, ...(appPublishRoute ? [appPublishRoute] : []), ...(appSiteDeployRoute ? [appSiteDeployRoute] : []), absorbBriefingsRoute, appActionRoute, ...(appSimulationRoute ? [appSimulationRoute] : []), appPromoteRoute, appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
       // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.
@@ -4000,6 +4063,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     try { appGenerationRuntime?.jobs.close(); } catch { /* best-effort shutdown */ }
     try { appLifecycleStore?.close(); } catch { /* best-effort shutdown */ }
     generatedAppPublisher?.close(); generatedAppPublisher = undefined;
+    void dynamicAppPublisher?.close(); dynamicAppPublisher = undefined;
     try { deploymentOwnerMemberStore?.close(); } catch { /* best-effort shutdown */ }
     deploymentOwnerMemberStore = undefined;
     deploymentOwnerAppHost = undefined;

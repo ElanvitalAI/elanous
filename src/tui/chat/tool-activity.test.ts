@@ -123,3 +123,14 @@ test('private file placeholder remains atomic through repeated shell projection 
     expect(JSON.stringify(rows)).not.toContain(filename);
   }
 });
+
+// Source: NEXT-TUI-FRICTION-AUDIT-1115 item6; floor-to-zero hid a real subsecond call.
+test('subsecond calls show a duration bound and completed times remain frozen', () => {
+  const running = updateToolActivity([], { phase: 'start', id: 'quick', name: 'Read' }, 0);
+  for (const elapsed of [0, 1, 999]) {
+    expect(toolActivityLines(running, elapsed)).toEqual(['활동 · Read · 실행 중 · <1초']);
+  }
+  expect(toolActivityLines(running, 1000)).toEqual(['활동 · Read · 실행 중 · 1초']);
+  const completed = updateToolActivity(running, { phase: 'finish', id: 'quick', name: 'Read' }, 999);
+  expect(toolActivityLines(completed, 20000)).toEqual(['활동 · Read · 완료 · <1초']);
+});

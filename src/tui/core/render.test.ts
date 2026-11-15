@@ -2,7 +2,24 @@ import { expect, test } from 'bun:test';
 import type { SerializedMessage } from '../../session/index.js';
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
 import { messageBlockDetailLines } from '../chat/message-block-view.js';
-import { createNextTuiHistoryCache, foldTargetAtScreenRow, isNextTuiContextCountStatus, logViewLines, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, renderNextTuiLogFrame, toggleVisibleMessageBlockDetail, toggleVisibleToolFold, wheelScroll } from './render.js';
+import { createNextTuiHistoryCache, foldTargetAtScreenRow, hasDisplayableCompletedToolBlock, isNextTuiContextCountStatus, logViewLines, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, renderNextTuiLogFrame, toggleVisibleMessageBlockDetail, toggleVisibleToolFold, wheelScroll } from './render.js';
+
+test('completed activity stays until its own result block and saved tool record can display', () => {
+  const toolBody = { kind: 'tool-call' as const, toolCallId: 'call-one', title: 'Read', status: '완료' };
+  const block: MessageBlock = { id: 'session:run-one:tool:call-one', ts: 1, source: 'tool',
+    body: toolBody,
+    detail: { level: 3, rawRef: { runId: 'run-one', blockId: 'session:run-one:tool:call-one' } } };
+  const saved: SerializedMessage = { role: 'tool', content: '', ts: '2026-11-15T00:00:00Z',
+    surfaceRunId: 'run-one', toolCallId: 'call-one', toolName: 'Read', toolResult: 'visible result' };
+  expect(hasDisplayableCompletedToolBlock('call-one', [], [saved])).toBe(false);
+  expect(hasDisplayableCompletedToolBlock('call-one', [{ ...block, body: { ...toolBody, status: '실행 중' } }], [saved])).toBe(false);
+  expect(hasDisplayableCompletedToolBlock('call-one', [block], [])).toBe(false);
+  expect(hasDisplayableCompletedToolBlock('call-one', [block], [{ ...saved, surfaceRunId: 'old-run' }])).toBe(false);
+  expect(hasDisplayableCompletedToolBlock('other-call', [block], [saved])).toBe(false);
+  expect(hasDisplayableCompletedToolBlock('call-one', [block], [saved])).toBe(true);
+  expect(hasDisplayableCompletedToolBlock('call-one', [{ ...block, body: { ...toolBody, status: '실패' } }], [saved])).toBe(true);
+  expect(hasDisplayableCompletedToolBlock('call-one', [{ ...block, body: { ...toolBody, title: 'Agent' } }], [saved])).toBe(false);
+});
 
 test('next TUI chrome helpers validate height and remove repeated hints and context counts', () => {
   expect(nextTuiCompactHeight(undefined, 20)).toBe(20);
@@ -56,7 +73,7 @@ test('core render composes folded history, bounded scroll, and prompt rows', () 
   const input = { messages: [tool], columns: 30, rows: 8, header: ['header'], footer: ['footer'],
     promptLine: '❯ ', notices: ['notice'], activity: ['activity'], expandedToolIndexes: expanded };
   const folded = renderNextTuiLogFrame({ ...input, scroll: 0 });
-  expect(folded.lines).toEqual(['header', '', '▸ 도구 Read · 20줄 (접힘)', '', 'notice', 'activity', 'footer', '❯ ']);
+  expect(folded.lines).toEqual(['header', '▸ 도구 Read · 20줄 (접힘)', '', 'notice', 'activity', '', 'footer', '❯ ']);
   expect(folded.promptRow).toBe(folded.lines.length);
   expect(folded.maxScroll).toBe(0);
   expect(toggleVisibleToolFold(expanded, input.messages, input.columns, folded.logWindow)).toBe(true);
@@ -97,7 +114,7 @@ test('multiline prompt stays bottom pinned and reduces log space within a small 
   expect(frame.logWindow.rows).toBe(2);
 });
 
-test('short transcript is bottom anchored so new conversation grows upward', () => {
+test('short transcript starts below the header and grows downward while prompt stays pinned', () => {
   const frame = renderNextTuiLogFrame({
     messages: [
       { role: 'user', content: '질문', ts: '2026-11-10T00:00:00Z' },
@@ -106,7 +123,7 @@ test('short transcript is bottom anchored so new conversation grows upward', () 
     columns: 40, rows: 10, header: ['title', 'rule'], footer: ['status'], promptLine: '❯ ',
     notices: [], activity: [], scroll: 0, expandedToolIndexes: new Set(),
   });
-  expect(frame.body).toEqual(['', '', '나: 질문', '', '엘라누스: 답변', '']);
+  expect(frame.body).toEqual(['❯ 질문', '', '  답변', '', '', '']);
   expect(frame.lines.at(-2)).toBe('status');
   expect(frame.lines.at(-1)).toBe('❯ ');
 });
@@ -253,11 +270,11 @@ test('Next history hides internal child-agent polling while classic history rema
   expect(screen).not.toContain('Agent started');
   expect(screen).not.toContain('child-2');
   expect(screen).toContain('Agent completed: 42');
-  expect(screen).not.toContain('엘라누스: \n');
+  expect(screen).not.toContain('  \n');
   expect(screen).not.toContain('private goal data');
   expect(screen).not.toContain('private alias goal');
-  expect(screen).toContain('나: run three children');
-  expect(screen).toContain('엘라누스: completed');
+  expect(screen).toContain('❯ run three children');
+  expect(screen).toContain('  completed');
 });
 
 test('fold targets include both the MessageBlock and saved tool row in transcript order', () => {
@@ -296,4 +313,26 @@ test('MessageBlocks are inserted into their own turn instead of appended after l
   expect(text.indexOf('첫 답')).toBeLessThan(text.indexOf('둘째 질문'));
   expect(text.indexOf('둘째 질문')).toBeLessThan(text.indexOf('둘째 턴 상태 요약'));
   expect(text.indexOf('둘째 턴 상태 요약')).toBeLessThan(text.indexOf('둘째 답'));
+});
+
+
+test('short activity and reply growth keeps the user at the top until the viewport fills', () => {
+  const input = { messages: [{ role: 'user' as const, content: '질문', ts: '2026-11-15T00:00:00Z' }],
+    columns: 40, rows: 10, header: ['title', 'rule'], footer: ['status'], promptLine: '❯ ',
+    notices: [], scroll: 0, expandedToolIndexes: new Set<number>() };
+  for (const activity of [[], ['first activity'], ['first activity', 'second activity'], ['first activity', 'second activity', 'reply']]) {
+    const frame = renderNextTuiLogFrame({ ...input, activity });
+    expect(frame.body[0]).toBe('❯ 질문');
+    expect(frame.logWindow.leadingBlankRows).toBe(0);
+    expect(frame.lines.at(-1)).toBe('❯ ');
+    expect(frame.lines).toHaveLength(input.rows);
+    for (const line of activity) expect(frame.body.indexOf(line)).toBeGreaterThan(frame.body.indexOf('❯ 질문'));
+  }
+  const activity = Array.from({ length: input.rows }, (_, index) => 'event-' + index);
+  const full = renderNextTuiLogFrame({ ...input, activity });
+  expect(full.body).not.toContain('❯ 질문');
+  const scrolledToTop = renderNextTuiLogFrame({ ...input, activity, scroll: full.maxScroll });
+  expect(scrolledToTop.body[0]).toBe('❯ 질문');
+  expect(full.body.at(-1)).toBe(activity.at(-1));
+  expect(full.lines.at(-1)).toBe('❯ ');
 });

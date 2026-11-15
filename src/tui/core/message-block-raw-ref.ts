@@ -1,5 +1,6 @@
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
 import type { SerializedMessage } from '../../session/index.js';
+import { toolActivityTarget } from '../chat/tool-activity.js';
 
 /** Resolve only the trace named by both coordinates; tool call ids may repeat across runs. */
 export function resolveMessageBlockRawTrace(messages: readonly SerializedMessage[], block: MessageBlock): SerializedMessage | undefined {
@@ -12,7 +13,16 @@ export function resolveMessageBlockRawTrace(messages: readonly SerializedMessage
 
 /** Format persisted tool trace fields without hiding stderr or process status. */
 export function formatMessageBlockRawTrace(trace: SerializedMessage): string {
-  const args = typeof trace.toolArgs === 'string' ? trace.toolArgs : JSON.stringify(trace.toolArgs ?? {});
+  let args: Record<string, unknown> = {};
+  if (trace.toolArgs && typeof trace.toolArgs === 'object' && !Array.isArray(trace.toolArgs)) {
+    args = trace.toolArgs as Record<string, unknown>;
+  } else if (typeof trace.toolArgs === 'string') {
+    try {
+      const value: unknown = JSON.parse(trace.toolArgs);
+      if (value && typeof value === 'object' && !Array.isArray(value)) args = value as Record<string, unknown>;
+    } catch { /* a truncated or non-JSON argument record has no safe summary */ }
+  }
+  const inputSummary = toolActivityTarget(trace.toolName ?? '', args);
   let result: unknown = trace.toolResult;
   if (typeof result === 'string') {
     try { result = JSON.parse(result) as unknown; } catch { /* plain tool output */ }
@@ -41,13 +51,28 @@ export function formatMessageBlockRawTrace(trace: SerializedMessage): string {
       if (hasCode) sections.push(`code\n${render(value.code)}`);
     }
     if (Object.hasOwn(value, 'status')) sections.push(`상태\n${render(value.status)}`);
+    // The Read envelope's transport counts are already represented by the
+    // result block. A JSON metadata row under readable output adds visual noise.
+    const readTransportEnvelope = trace.toolName === 'Read'
+      && typeof value.output === 'string'
+      && ['text', 'image', 'pdf', 'binary'].includes(String(value.kind))
+      && typeof value.linesRead === 'number' && Number.isSafeInteger(value.linesRead) && value.linesRead >= 0
+      && typeof value.totalLines === 'number' && Number.isSafeInteger(value.totalLines) && value.totalLines >= 0
+      && typeof value.totalBytes === 'number' && Number.isSafeInteger(value.totalBytes) && value.totalBytes >= 0
+      && typeof value.truncated === 'boolean';
+    const readTransportFields = readTransportEnvelope
+      ? ['linesRead', 'totalLines', 'totalBytes', 'truncated', 'kind'] : [];
+    if (readTransportEnvelope && value.truncated === true) sections.push('⚠ 일부 출력만 표시됨 (잘림)');
     const metadata = Object.fromEntries(Object.entries(value).filter(([key]) =>
-      !['stdout', 'output', 'stderr', 'exitCode', 'code', 'status'].includes(key)));
+      !['stdout', 'output', 'stderr', 'exitCode', 'code', 'status', ...readTransportFields].includes(key)));
     if (Object.keys(metadata).length) sections.push(`기타 결과 메타데이터\n${JSON.stringify(metadata)}`);
     if (Object.keys(value).length === 0) sections.push('결과\n{}');
+    else if (sections.length === 0) sections.push('결과\n(출력 없음)');
   } else {
     sections.push(`결과\n${result === undefined ? '(결과 없음)' : JSON.stringify(result, null, 2)}`);
   }
-  sections.push(`입력\n${args}`);
+  // Persisted arguments can contain command bodies, credentials, and full home
+  // paths. Show only the same vetted target used by the live activity line.
+  if (inputSummary) sections.push(`입력\n${inputSummary}`);
   return sections.join('\n');
 }

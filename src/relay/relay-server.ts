@@ -6,6 +6,7 @@ import { challengeMessage, createPhoneChannel, MAX_FRAME_BYTES, serverIdFromPubl
 export { challengeMessage } from './channel.js';
 import { MAX_MUX_FRAME_BYTES, MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
 import { buildPublicDispatchRoutes, type PublicDispatchRoute } from './public-dispatch.js';
+import { isAnonymousPublicAppRead } from './public-app-read.js';
 
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const MAX_CLIENTS_PER_SERVER = 8;
@@ -218,6 +219,8 @@ export interface RelayServerOptions {
   appKillSwitch?: Pick<AppKillSwitch, 'applyIncident' | 'isDown'> & Partial<Pick<AppKillSwitch, 'close'>>;
   /** Apps whose owner explicitly opted in to public search; the default is empty. */
   publicListedApps?: ReadonlySet<string>;
+  /** Explicit user/app pairs allowed anonymous GET/HEAD; absent means private. */
+  publicReadableApps?: ReadonlySet<string>;
   /** Opt in to the invited-app reverse proxy for exactly this public domain. */
   publicDomain?: 'elanous.app' | 'elanous.ai';
   /** Legacy single-user public host pin. */
@@ -364,6 +367,13 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     }
   } else if (options.publicServerId !== undefined || options.publicUserId !== undefined || multiUser) {
     throw new Error('publicServerId and publicUserId require publicDomain');
+  }
+  const publicReadableApps = new Set(options.publicReadableApps ?? []);
+  for (const key of publicReadableApps) {
+    const [user, app, extra] = key.split('/');
+    const parsed = parsePublicAppHost(`${app}--${user}.${options.publicDomain}`, options.publicDomain);
+    if (!options.publicDomain || extra !== undefined || !parsed || parsed.user !== user || parsed.app !== app
+      || !(publicRoutes?.has(user!) || user === options.publicUserId)) throw new Error('invalid public read binding');
   }
   const publicListedApps = new Set(options.publicListedApps ?? []);
   if (publicListedApps.size && !options.publicDomain) throw new Error('public app listing requires public relay mode');
@@ -548,7 +558,10 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       return new Response(JSON.stringify({ received: true }), { status: 202,
         headers: { ...reportHeaders, 'content-type': 'application/json' } });
     }
-    const memberGate = await memberAuthorized(req, serverId);
+    const anonymousPublicRead = isAnonymousPublicAppRead(req, publicApp.user, publicApp.app, publicReadableApps);
+    const memberGate = anonymousPublicRead
+      ? { status: 'allowed' as const, consumed: [] }
+      : await memberAuthorized(req, serverId);
     if (memberGate.status !== 'allowed') {
       debug.log('relay.auth', 'member-denied', { serverId, route: 'public' });
       // A verified member of another host must not learn whether this app is mounted.
@@ -638,6 +651,12 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         .filter(value => value && !relayProtocols.has(value));
       if (appProtocols.length) forwardedHeaders.set('sec-websocket-protocol', appProtocols.join(', '));
       else forwardedHeaders.delete('sec-websocket-protocol');
+    }
+    // An anonymous read consumes no member credential, so the consumed-only
+    // stripping above cannot protect it. Never deliver audience credentials
+    // (including cookies or protocol tokens) to a public application's host.
+    if (anonymousPublicRead) {
+      for (const name of ['authorization', 'cookie', 'sec-websocket-protocol']) forwardedHeaders.delete(name);
     }
     forwardedHeaders.set('host', internalHost);
     const requestOrigin = forwardedHeaders.get('origin');

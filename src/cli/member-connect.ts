@@ -2,6 +2,7 @@ import { linkSync, lstatSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { readTuiMemberSession, tuiMemberSessionPath } from '../tui/member-session-contract.js';
+import { connectMemberRelay } from './member-connect-relay.js';
 
 const TOKEN = /^aps_[A-Za-z0-9_-]+$/;
 const APP_SLUG = /^[a-z0-9-]{1,100}$/;
@@ -19,7 +20,7 @@ export interface ApprovedMemberHandoff {
 }
 
 /** Consume a server-issued PKCE handoff and persist only its verified app session. */
-export async function connectApprovedMemberSession(input: ApprovedMemberHandoff): Promise<{ expiresAt: string }> {
+export async function connectApprovedMemberSession(input: ApprovedMemberHandoff): Promise<{ expiresAt: string; relayKeyUnavailable?: true }> {
   let endpoint: URL;
   try {
     endpoint = new URL(input.nexusUrl);
@@ -96,6 +97,7 @@ export async function connectApprovedMemberSession(input: ApprovedMemberHandoff)
     || !(owner as { memberId: string }).memberId.trim()) throw new Error('회원 소유자 응답이 올바르지 않습니다.');
 
   const temporary = join(input.configDir, `.member-session-${randomUUID()}.json`);
+  let relayKeyUnavailable = false;
   try {
     // A hard link publishes complete bytes atomically and refuses an existing session.
     writeFileSync(temporary, JSON.stringify({ nexusUrl: origin, sessionToken, expiresAt, appSlug }),
@@ -105,6 +107,12 @@ export async function connectApprovedMemberSession(input: ApprovedMemberHandoff)
       throw new Error('invalid private envelope');
     }
     linkSync(temporary, destination);
+    try { await connectMemberRelay({ configDir: input.configDir, sessionToken, fetchImpl }); }
+    catch {
+      // Relay enrollment is optional. Its failure must not undo an already
+      // exchanged, owner-verified and privately published member session.
+      relayKeyUnavailable = true;
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST')
       throw new Error('이미 회원 연결이 있습니다. 기존 연결을 먼저 확인해 주세요.');
@@ -112,5 +120,5 @@ export async function connectApprovedMemberSession(input: ApprovedMemberHandoff)
   } finally {
     try { unlinkSync(temporary); } catch { /* temporary file may not have been created */ }
   }
-  return { expiresAt };
+  return { expiresAt, ...(relayKeyUnavailable ? { relayKeyUnavailable: true as const } : {}) };
 }

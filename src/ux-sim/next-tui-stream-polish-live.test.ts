@@ -52,7 +52,7 @@ test('next TUI echoes a sent question before the delayed model and paints stream
         onOutput: (chunk, atMs) => {
           if (submittedAt === null) return;
           raw += chunk;
-          if (echoAt === null && raw.includes('나: STREAM-POLISH-ECHO')) echoAt = atMs;
+          if (echoAt === null && raw.includes('❯ STREAM-POLISH-ECHO')) echoAt = atMs;
         },
       });
       expect(receipt.exitCode).toBe(0);

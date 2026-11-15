@@ -5,6 +5,18 @@ import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
 import { isReleaseVersion } from './release-version.js';
+import { isNexusFirstRunPass } from './nexus-first-run.js';
+
+interface PreparedManifest {
+  version?: unknown; sourceCommit?: unknown; distDir?: unknown; publicCommit?: unknown;
+  e2e?: { ran?: unknown; ok?: unknown; nexusFirstRun?: unknown };
+}
+function preparedNexusPassed(manifest: PreparedManifest, version: string): boolean {
+  const receipt = manifest.e2e?.nexusFirstRun;
+  return manifest.e2e?.ran === true && manifest.e2e.ok === true
+    && typeof manifest.publicCommit === 'string' && /^[a-f0-9]{40}$/i.test(manifest.publicCommit)
+    && isNexusFirstRunPass(receipt) && receipt.versionLine === `${version} ${manifest.publicCommit}`;
+}
 
 /** Apparent bytes of the preserved archive; never follow a symlink out of its private directory. */
 function archiveBytes(path: string): number {
@@ -80,7 +92,7 @@ export function runPrepare(run: CommandRunner = runCommand, move: typeof renameS
       throw new Error(`prepare output already exists with unverified source: ${out}`);
     if (realpathSync(out) !== join(realpathSync(root), 'release', version, 'prepared'))
       throw new Error(`prepare output escapes release root: ${out}`);
-    let manifest: { version?: unknown; sourceCommit?: unknown };
+    let manifest: PreparedManifest;
     try { staleManifestBytes = readRegularManifest(manifestPath); manifest = JSON.parse(staleManifestBytes.toString('utf8')) as typeof manifest; }
     catch { throw new Error(`prepare output already exists with unreadable manifest: ${out}`); }
     const manifestSource = manifest.sourceCommit;
@@ -96,6 +108,7 @@ export function runPrepare(run: CommandRunner = runCommand, move: typeof renameS
     const sameRun = !!context.runId && (owner?.runId === context.runId && owner.commit === manifestSource
       || !owner && preparedByRun(root, context.runId, out, manifestSource));
     if (manifestSource === commit && sameRun) {
+      if (!preparedNexusPassed(manifest, version)) throw new Error('prepared A158 Nexus first-run receipt missing or failed');
       const candidate = join(out, 'dist', 'elanous.tgz');
       if (!existsSync(candidate)) throw new Error(`prepare output incomplete for same run: ${out}`);
       return { outcome: 'ok' as const, verdict: 'pass' as const,
@@ -171,11 +184,12 @@ export function runPrepare(run: CommandRunner = runCommand, move: typeof renameS
   }
   const command = run('bun', ['bin/elanous.mjs', 'release', 'prepare', '--version', version, '--source', commit, '--notes-from', prev.stdout.trim(), '--out', out, '--json']);
   if (command.stderr) process.stderr.write(command.stderr);
-  const manifest = lastResult(command)?.manifest as { version?: string; sourceCommit?: string; distDir?: string } | undefined;
+  const manifest = lastResult(command)?.manifest as PreparedManifest | undefined;
   if (command.status === 1) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `prepare failed: ${lastResult(command)?.error ?? command.stderr.trim()}` };
   if (command.status !== 0 || manifest?.version !== version || manifest.sourceCommit !== commit || manifest.distDir !== join(out, 'dist')) {
     throw new Error(`prepare incomplete (rc=${command.status}): ${lastResult(command)?.error ?? command.stderr.trim()}`);
   }
+  if (!preparedNexusPassed(manifest, version)) throw new Error('prepare A158 Nexus first-run receipt missing or failed');
   const artifactOwner = context.runId ? { runId: context.runId, attempt, commit } : undefined;
   if (artifactOwner && existsSync(join(out, 'release.json')))
     writeFileSync(join(out, '.release-node-owner.json'), JSON.stringify(artifactOwner) + '\n', { flag: 'wx', mode: 0o600 });

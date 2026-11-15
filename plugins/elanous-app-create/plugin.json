@@ -1,0 +1,94 @@
+{
+  "id": "elanous-app-create",
+  "name": "Application Source Creator",
+  "version": "0.1.0",
+  "description": "Create model-authored frontend, backend and database application files with architecture and runtime metadata.",
+  "whenToUse": "앱을 만들고 프론트엔드 백엔드 데이터베이스를 구현할 때 사용한다. Create web application frontend backend database source and architecture for deployment. Supply application-specific code and explicit requested synthetic seed scripts; this tool writes files only and never executes or publishes.",
+  "activationEvents": [
+    "onRoute"
+  ],
+  "contributes": {
+    "aiTools": [
+      {
+        "name": "app_create",
+        "description": "Write model-authored application architecture and frontend/backend/database source as a new file artifact. Include ARCHITECTURE.md in files and runtime declarations in metadata. No execution or publication.",
+        "handler": "native:file_artifact_write",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Absolute new directory; parent must exist. Never overwrites."
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "content"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "metadata": {
+              "type": "object",
+              "description": "Application runtime declarations, not execution authority. Include runtime startCommand argv, reserved port31500..31599, healthPath, frontendRoot relative directory and apiPrefix /api."
+            }
+          },
+          "required": [
+            "root",
+            "files",
+            "metadata"
+          ],
+          "additionalProperties": false
+        },
+        "route": {
+          "triggers": [
+            "앱 만들어",
+            "앱 구현",
+            "web application deployment",
+            "database create populate",
+            "create app"
+          ],
+          "examples": [
+            "Create a web application with frontend backend database and architecture"
+          ],
+          "sideEffects": "mutating",
+          "risk": "medium",
+          "cost": "cheap",
+          "requiresConfirm": false
+        }
+      }
+    ]
+  },
+  "capabilities": [],
+  "inputs": {
+    "root": "Absolute new directory; never overwrite.",
+    "files": "Relative paths and UTF-8 contents including ARCHITECTURE.md, application code and explicitly requested seed/test scripts.",
+    "metadata": "Runtime declarations only; publisher separately validates owner, allowed argv/port and source authority."
+  },
+  "outputs": {
+    "artifact": "source-artifact@1 with root, file SHA256 map and metadata.",
+    "status": "executed:false and published:false. Runtime declarations confer no authority."
+  },
+  "examples": [
+    "Create frontend backend database source for a web application deployment.",
+    "Create database code and an explicit synthetic population script."
+  ],
+  "requires": {
+    "memberConnection": false,
+    "appKinds": [
+      "local-service"
+    ],
+    "confirmation": false
+  }
+}

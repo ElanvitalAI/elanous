@@ -29,6 +29,7 @@ import type { AppDbBackupOptions, AppDbBackupStatus } from './app-db-backup.js';
 import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 import type { MemberStore } from '../members/member-store.js';
 import { parsePublicAppHost, resolvePublicAppUserId } from '../../relay/relay-server.js';
+import type { AppServiceBinding } from './app-service-runtime.js';
 
 export type MemberOwnerStore = Pick<MemberStore, 'memberPlanForMember'>
   & Partial<Pick<MemberStore, 'publicUserSlugForMember'>>;
@@ -82,6 +83,10 @@ export interface NexusAppHost {
   handle(req: Request): Response | undefined | Promise<Response | undefined>;
   /** Private member-store lookup; never accepts request-supplied identity. */
   setPublicUserSlugResolver?(resolve: (appSlug: string) => string | null | undefined): void;
+  /** Server-only in-memory route for an approved test handle; restart requires a fresh verified publication. */
+  registerDynamicService?(binding: { appSlug: string; userSlug: string; ownerId: string; runId: string;
+    artifactDigest: string; routeNonce: string; service: AppServiceBinding; stillAuthorized: () => boolean | Promise<boolean> }): void;
+  unregisterDynamicService?(appSlug: string, ownerId: string, runId: string, artifactDigest: string): void;
   /** Trusted server-side invitation issuance. Public app-host requests cannot call this operation. */
   issueInvitation(appSlug: string, invitedBy: string, ttlMs?: number, role?: string): IssuedAppInvitation;
   /** Trusted server-side Google-member owner session issuance; never exposed as a public app-host route. */
@@ -396,6 +401,8 @@ function createNexusAppHost(
   bindGeneratedOwner?: (appSlug: string, memberId: string, fingerprint: string) => void,
 ): NexusAppHost {
   let memberPublicUserSlug: ((appSlug: string) => string | null | undefined) | undefined;
+  const dynamicServices = new Map<string, { appSlug: string; userSlug: string; ownerId: string; runId: string;
+    artifactDigest: string; routeNonce: string; service: AppServiceBinding; stillAuthorized: () => boolean | Promise<boolean> }>();
   let conceptProofResolver: ((appSlug: string) => SimReceipt | undefined) | undefined;
   const trustedGeneratedMount = (appSlug: string, mounted: MountedApp): GeneratedOwnerBinding | null | false => {
     try {
@@ -409,6 +416,20 @@ function createNexusAppHost(
     applyConceptProofBadge(html, conceptProofResolver?.(appSlug), mounted.entitlements);
   return {
     setPublicUserSlugResolver(resolve) { memberPublicUserSlug = resolve; },
+    registerDynamicService(binding) {
+      if (!parsePublicAppHost(`${binding.appSlug}--${binding.userSlug}.elanous.app`)
+        || mounts.has(binding.appSlug) || dynamicServices.has(binding.appSlug)
+        || binding.service.ownerId !== binding.ownerId || binding.service.runId !== binding.runId
+        || binding.service.artifactDigest !== binding.artifactDigest
+        || !/^[0-9a-f]{48}$/.test(binding.routeNonce)) throw new Error('dynamic app route refused');
+      dynamicServices.set(binding.appSlug, binding);
+    },
+    unregisterDynamicService(appSlug, ownerId, runId, artifactDigest) {
+      const binding = dynamicServices.get(appSlug);
+      if (!binding || binding.ownerId !== ownerId || binding.runId !== runId
+        || binding.artifactDigest !== artifactDigest) throw new Error('dynamic app route refused');
+      dynamicServices.delete(appSlug);
+    },
     get slugs() { return [...mounts.keys()]; },
     getManifest(appSlug) { return mounts.get(appSlug)?.manifest; },
     databaseBackupStatus(appSlug) { return appDb?.backupStatus?.(appSlug) ?? null; },
@@ -503,9 +524,35 @@ function createNexusAppHost(
       const slug = localHost ? hostname.slice(0, -APP_HOST_SUFFIX.length) : publicHost!.app;
       if (!localHost) {
         let canonical: string | null | undefined;
-        try { canonical = memberPublicUserSlug?.(slug) ?? publicUserSlug; }
+        try { canonical = dynamicServices.get(slug)?.userSlug ?? memberPublicUserSlug?.(slug) ?? publicUserSlug; }
         catch { return new Response(null, { status: 503, headers: { 'cache-control': 'no-store' } }); }
         if (!canonical || publicHost!.user !== canonical) return notFound();
+      }
+      const dynamic = dynamicServices.get(slug);
+      if (dynamic) {
+        // The encrypted relay validates the public label, then forwards to this local app hostname.
+        if (!localHost && (!publicHost || publicHost.user !== dynamic.userSlug)) return notFound();
+        const path = new URL(req.url).pathname;
+        if (path.startsWith('/v1/') || path.startsWith('/__') || path.startsWith('/.well-known/')) return notFound();
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          if (req.method !== 'POST' || (path !== '/api' && !path.startsWith('/api/')))
+            return new Response('Method Not Allowed', { status: 405 });
+          const expectedPublicOrigin = `https://${dynamic.appSlug}--${dynamic.userSlug}.${PUBLIC_APP_DOMAIN}`;
+          const expectedLocalOrigin = `http://${dynamic.appSlug}${APP_HOST_SUFFIX}`;
+          const origin = req.headers.get('origin');
+          if (origin !== expectedPublicOrigin && (origin !== expectedLocalOrigin || !localHost))
+            return new Response('Forbidden', { status: 403 });
+        }
+        return (async () => {
+          try {
+            if (!await dynamic.stillAuthorized() || dynamicServices.get(slug) !== dynamic) return new Response('Unavailable', { status: 503 });
+            const response = await dynamic.service.proxy(req);
+            if (response.status !== 200) return response;
+            const headers = new Headers(response.headers);
+            headers.set('x-elanous-dynamic-route', dynamic.routeNonce);
+            return new Response(response.body, { status: response.status, headers });
+          } catch { return new Response('Unavailable', { status: 503 }); }
+        })();
       }
       const mounted = mounts.get(slug);
       if (!mounted) return notFound();

@@ -2,6 +2,7 @@
 // cron/launchd 최소 PATH 에서도 내부 gh/git subprocess 를 찾도록 PATH 를 먼저 보강(무음실패 근본·2026-07-25).
 import './ensure-bin-path.js';
 import './instance/resolve.js';
+import { taskAgentPodRepoOptions } from './task-orchestrator/surfaces/ta-repo-url.js';
 import { WORKFLOW_NODE_VARIANT_KEYS } from './workflow-runtime/schema.js';
 import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -1885,6 +1886,8 @@ program
   .option('--name <name>', '대시보드 TUI 의 PTY 행(tui:<pid>)에 별명을 달고 뜬다 — `elanous pty list` 에 보이고 `pty snapshot <name>` 으로 부른다. 뜬 뒤 바꾸려면 `elanous pty rename <ref> <name>`.')
   .option('--legacy', '기존 대시보드 TUI로 시작한다(--tui classic 의 짧은 표기). 기본 진입은 classic 이다.')
   .option('--tui <mode>', '루트 TUI를 명시한다(classic|next). 로컬·원격 기본은 classic 이고 next 는 --tui next 로 연다. --legacy는 classic의 짧은 표기다.')
+  .option('--provider <name>', 'Next TUI 세션 한정 provider 선택(전역 config 불변)')
+  .option('--model <id>', '--provider와 함께 Next TUI 세션 모델 선택')
   .option('--help-all', '시스템 명령을 제외한 모든 최상위 명령 표시');
 program.addHelpText('after', acpServerHelpText());
 
@@ -5408,6 +5411,8 @@ const selfOrchestrateCmd = selfCmd
       let podSpawn: import('./task-orchestrator/surfaces/self-implement.js').SelfImplementJobSpawn | undefined;
       let podTargets: { context: string; namespace: string }[] | undefined;
       if (substrate === 'pod') {
+        // Refuse before any pool, credential or child work when the implementation destination is absent.
+        const repoOptions = taskAgentPodRepoOptions(getUserConfig());
         const { podSubstrateReady, defaultKubectl } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
         const poolMod = await import('./task-orchestrator/surfaces/pod-pool.js');
         const { harnessLaunchPolicyConfig } = await import('./harness/harness-substrate-default.js');
@@ -5809,7 +5814,7 @@ const selfOrchestrateCmd = selfCmd
           return identity;
         };
         const warmReuseEvidence = () => loadWarmReuseEvidenceByConsumer(warmReuseIdentity());
-        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence, warmReuseIdentity, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
+        const podBase = { ...repoOptions, hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence, warmReuseIdentity, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -12733,6 +12738,19 @@ async function main(): Promise<void> {
 
   let rawArgs = process.argv.slice(2);
 
+  const { extractRootProviderFlags, rootValueOptionNames } = await import('./cli/root-provider-flags.js');
+  const rootValueOptions = new Set(rootValueOptionNames(program.options));
+  // These two pre-Commander launch flags are consumed outside its root registration.
+  rootValueOptions.add('--resume');
+  rootValueOptions.add('--test-state-dir');
+  const rootProvider = extractRootProviderFlags(rawArgs, rootValueOptions);
+  if (rootProvider.error) {
+    console.error(rootProvider.error);
+    process.exitCode = 1;
+    return;
+  }
+  rawArgs = rootProvider.args;
+
   // The root flag can follow other launch options, but never a subcommand.
   const rootTui = extractRootTuiEntry(rawArgs);
   if (rootTui.error) {
@@ -12978,6 +12996,11 @@ async function main(): Promise<void> {
   // (e.g. `session watch --debug`), stripping them here would silently
   // eat that subcommand's own option before commander ever sees it.
   const args = filterDashboardArgs(rawArgs, resumeFlagIdx);
+  if (rootProvider.provider && (tuiEntry !== 'next' || args.length > 0)) {
+    console.error('elanous: --provider is for the root Next TUI session only');
+    process.exitCode = 1;
+    return;
+  }
   if (tuiEntry === 'next' && rootTui.explicit && args.length > 0) {
     console.error('elanous: --tui next is a standalone TUI entry, not a subcommand option');
     process.exitCode = 1;
@@ -13178,6 +13201,7 @@ async function main(): Promise<void> {
     const { showNextTui } = await import('./tui/entry.js');
     const tuiConfig = getUserConfig().tui;
     const nextOpts = { resumeSessionId, sidetabMode: tuiConfig?.sidetab ?? 'collapsed', compactHeight: tuiConfig?.next?.compactHeight,
+      ...(rootProvider.provider ? { initialProvider: { provider: rootProvider.provider, model: rootProvider.model } } : {}),
       getNexusMemberSession, memberBoardSession: getNexusMemberSession };
     await showNextTui(nextOpts);
     bootTimer.phase('show-next');

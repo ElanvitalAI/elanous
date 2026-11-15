@@ -412,10 +412,10 @@ export function dispatchToolSearch(
   // Only catalog-declared one-character subjects can be split from joined request wording.
   const discoveryQuery = opts.requireQueryCoverage && !/^select:/i.test(args.query)
     ? args.query
-      .replace(/([가-힣]+?)(?:으로|을|를|은|는|이|가|의|에|와|과)(?=\s*(?:만들|개발|구현|설계|배포|게시)|\s|[.!?]|$)/g, (whole, word: string) => {
-        if (declaredSubjects.has(word)) return ' ' + word + ' ';
+      .replace(/([가-힣]+?)(?:으로|을|를|은|는|이|가|의|에|와|과)(?=\s*(?:만들|만들어|개발|구현|설계|배포|게시|수정해줘)|\s|[.!?]|$)/g, (whole, word: string) => {
         // A complete declared multi-character word takes precedence over a suffix subject.
-        if (entries.some(entry => (entry.nameText + ' ' + entry.description).includes(word))) return whole;
+        if (entries.some(entry => (entry.nameText + ' ' + entry.description).includes(word))) return ' ' + word + ' ';
+        if (declaredSubjects.has(word)) return ' ' + word + ' ';
         const subject = word.slice(-1);
         return declaredSubjects.has(subject) ? word.slice(0, -1) + ' ' + subject + ' ' : whole;
       })

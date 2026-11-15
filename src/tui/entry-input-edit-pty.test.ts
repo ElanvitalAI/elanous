@@ -12,7 +12,7 @@ function latestTurnIsSettled(screen: string, reply: string, expectedReplies: num
   const tail = screen.slice(lastReply + reply.length);
   const terminal = /(?:턴 완료|응답 완료|✔ 완료)(?:\s|$)/.exec(tail);
   if (!terminal) return false;
-  const nextPrompt = tail.search(/\n(?:❯ |나: )/);
+  const nextPrompt = tail.search(/\n(?:❯ |❯ )/);
   return nextPrompt < 0 || terminal.index < nextPrompt;
 }
 

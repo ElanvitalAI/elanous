@@ -323,6 +323,11 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       const connectResponse = await connectEntry.handle(request, normalizeMemberSignupNetworkKey(networkKey));
       if (connectResponse) return connectResponse;
       const origin = request.headers.get('origin');
+      // Native PKCE consumers may issue their own connector key. This exception
+      // grants no cookie access and does not apply to key listing or management.
+      const appKeyBearer = path === '/v1/member/keys' && request.method === 'POST'
+        ? /^Bearer\s+(aps_[A-Za-z0-9_-]+)$/i.exec(request.headers.get('authorization') ?? '')?.[1]
+        : undefined;
       if (request.method === 'OPTIONS' && (path.startsWith('/v1/member/keys') || path.startsWith('/v1/member/tokens'))) {
         if (origin !== webOrigin) return new Response(null, { status: 403 });
         return withCors(request, corsPreflight('GET, POST, DELETE, OPTIONS'), webOrigin);
@@ -330,14 +335,23 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       // The native app login form is served by this API origin. Its same-origin signup
       // POST must work without granting that origin access to member cookie routes.
       const appLoginStartOrigin = path === '/v1/members' && request.method === 'POST' && origin === callback.origin;
-      if (origin && origin !== webOrigin && !appLoginStartOrigin && request.method !== 'GET') return json({ error: 'origin-not-allowed' }, 403);
+      if (origin && origin !== webOrigin && !appLoginStartOrigin && !appKeyBearer && request.method !== 'GET') return json({ error: 'origin-not-allowed' }, 403);
       if (path === '/v1/members/secret-backups' || path.startsWith('/v1/members/secret-backups/')) {
         return withCors(request, (await cloudBackupRoute.handle(request))!, webOrigin);
       }
       if (path.startsWith('/v1/member/keys') || path.startsWith('/v1/member/tokens')) {
         const respond = (response: Response) => withCors(request, response, webOrigin);
         const session = sessionFromCookie(request);
-        const member = session ? options.store.memberForSession(session, new Date(now()).toISOString()) : null;
+        const cookieMember = session ? options.store.memberForSession(session, new Date(now()).toISOString()) : null;
+        let appMemberId: string | undefined;
+        try { appMemberId = appKeyBearer ? options.resolveVerifiedMemberOwner?.(appKeyBearer, options.store)?.memberId : undefined; }
+        catch { return respond(json({ error: 'unauthorized' }, 401)); }
+        const memberCookies = (request.headers.get('cookie') ?? '').split(';')
+          .filter(part => part.trim().split('=', 1)[0]?.trim() === MEMBER_COOKIE);
+        const memberId = path === '/v1/member/keys' && request.method === 'POST' && request.headers.has('authorization')
+          ? appMemberId && (memberCookies.length === 0 || memberCookies.length === 1 && cookieMember?.id === appMemberId) ? appMemberId : null
+          : cookieMember?.id;
+        const member = memberId && options.store.activeForAuth(memberId) ? { id: memberId } : null;
         if (!member) return respond(json({ error: 'unauthorized' }, 401));
         if (path === '/v1/member/keys' && request.method === 'GET') return respond(json({
           keys: options.store.listMemberKeys(member.id).map(key => ({ ...key,
@@ -348,7 +362,8 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           let body: unknown;
           try { body = await readJson(request); } catch { return respond(json({ error: 'invalid-request' }, 400)); }
           const name = (body as { name?: unknown } | null)?.name;
-          if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(name)) return respond(json({ error: 'invalid-request' }, 400));
+          if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1
+            || typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(name)) return respond(json({ error: 'invalid-request' }, 400));
           return respond(json(options.store.createMemberKey(member.id, name), 201));
         }
         const keyPath = /^\/v1\/member\/keys\/([a-f0-9-]{36})(\/rotate)?$/.exec(path);

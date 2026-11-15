@@ -43,7 +43,7 @@ function declaredHitlNodeIds(graphFile: string): string[] {
   return Array.isArray(policy.hitl) ? policy.hitl.map(text) : [];
 }
 
-type AbsorbContractId = 'store.read@1' | 'store.write@1' | 'store.events@1' | 'extract.item@1' | 'notify.channel@1' | 'app-publish.action@1' | 'absorb.document-parse@1';
+type AbsorbContractId = 'store.read@1' | 'store.write@1' | 'store.events@1' | 'extract.item@1' | 'notify.channel@1' | 'app-publish.source@1' | 'app-publish.action@1' | 'absorb.document-parse@1';
 type AbsorbSimulationProviders = Partial<Record<AbsorbContractId, GraphCapabilityProvider>>;
 
 const ABSORB_SIMULATION_CONTRACTS: readonly GraphCapabilityContract[] = [
@@ -53,6 +53,7 @@ const ABSORB_SIMULATION_CONTRACTS: readonly GraphCapabilityContract[] = [
   { id: 'extract.item@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'absorb.document-parse@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'notify.channel@1', input: { type: 'object' }, output: { type: 'object' } },
+  { id: 'app-publish.source@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'app-publish.action@1', input: { type: 'object' }, output: { type: 'object' } },
 ];
 
@@ -244,7 +245,8 @@ function parsePromptInput(prompt: string): Row {
 
 function fakeModel(prompt: string, calls: string[], fallbackKstDay: string, mutateDesign?: (design: Row) => Row,
   designInputs?: Row[], mutateRequirements?: (requirements: Row) => Row, mutateDesignResult?: (result: Row) => Row,
-  suggestOutcome?: 'needs-human' | 'failed', mutateSuggestion?: (suggestion: Row) => Row): string {
+  suggestOutcome?: 'needs-human' | 'failed', mutateSuggestion?: (suggestion: Row) => Row,
+  mutateBuildArtifact?: (artifact: Row) => Row): string {
   const input = parsePromptInput(prompt);
   const context = object(input.context);
   const prior = object(input.prior);
@@ -306,7 +308,12 @@ function fakeModel(prompt: string, calls: string[], fallbackKstDay: string, muta
       evidence: { design: produced } });
   }
   if (prompt.includes('absorb/build')) {
-    const artifact = { id: `artifact-${text(context.suggestionId) || 'member-demo'}`, files: { '/index.html': '<main>simulated ticketing service</main>' } };
+    const appId = text(context.appId);
+    const generatedArtifact = {
+      manifestYaml: `apiVersion: elanous.app/v0\nslug: ${appId}\ntitle: Simulated ticketing service\nfrontend:\n  kind: static-export\n  out: out\n`,
+      html: '<!doctype html><html><body><main>simulated ticketing service</main></body></html>',
+    };
+    const artifact = mutateBuildArtifact ? mutateBuildArtifact(generatedArtifact) : generatedArtifact;
     // Source: 내부 문서 `DEMO-INTEGRATED-NORTH-STAR` scene 2; 300 is the declared synthetic scenario load.
     const capacityAssumption = { concurrentUsers: 300, rationale: 'North-star test scenario declares 300 concurrent ticketing users.', source: 'docs/conductor/DEMO-INTEGRATED-NORTH-STAR.md#scene-2', userSpecified: true };
     const service = 'ticketing service';
@@ -350,6 +357,8 @@ export async function runAbsorbGraphSimulation(options: {
   onAppPublish?: (event: { action: 'simulate' | 'publish'; runId: string; suggestion: Row; artifact: Row; result: Row; evidence: Row;
     readback?: { status: number; sha256: string } }) => Promise<void>;
   onAcceptedBuild?: (state: Awaited<ReturnType<typeof runGraph>>) => Promise<void>;
+  mutateBuildArtifact?: (artifact: Row) => Row;
+  varyNotifyTextOnRepeat?: boolean;
 } = {}): Promise<Row> {
   const worldPath = resolve(options.worldPath ?? join(import.meta.dir, '../../plugins/absorb/sims/absorb-demo-world.yaml'));
   const world = object(parseYaml(readFileSync(worldPath, 'utf8')));
@@ -423,7 +432,9 @@ export async function runAbsorbGraphSimulation(options: {
     const row = object(value);
     return options.memberId && row.owner === fixtureMember!.id ? { ...row, owner: member.id } : row;
   }) : [];
-  const calls = { llm: [] as string[], notifications: [] as string[], appHost: [] as string[], appHostByRun: new Map<string, string[]>(),
+  const calls = { llm: [] as string[], notifications: [] as string[],
+    notificationInputs: [] as Array<{ runId: string; briefId: string; text: string }>,
+    appHost: [] as string[], appHostByRun: new Map<string, string[]>(),
     suggestionFixtureIds: [] as string[],
     boardEvents: [] as Row[],
     llmPrompts: [] as string[],
@@ -589,20 +600,17 @@ export async function runAbsorbGraphSimulation(options: {
       return { ok: true, outcome: 'done', result,
         evidence: { extractionKinds: items.map((item) => item.kind), scrapIds: items.map((item) => item.id) } };
   };
-  const notifyProvider: GraphCapabilityProvider = async ({ outputs, nodeInput }) => {
+  const notifyProvider: GraphCapabilityProvider = async ({ outputs, nodeInput, runId }) => {
       const config = object(nodeInput);
-      const channelsValue = config.channels ?? object(config.with).channels;
-      const channels = Array.isArray(channelsValue) ? channelsValue as string[] : [];
       const brief = object(object(outputs.brief).evidence).briefing;
       const briefId = text(object(brief).id);
-      const sent = channels.filter((channel) => {
-        const key = `${briefId}:${channel}`;
-        if (!briefId || delivered.has(key)) return false;
-        delivered.add(key);
-        calls.notifications.push(key);
-        return true;
-      });
-      return { ok: true, outcome: 'done', result: { delivered: sent }, evidence: { briefingId: briefId } };
+      if (!briefId || config.refId !== briefId || !text(config.text) || config.kind !== 'notify')
+        return { ok: false, outcome: 'failed', error: 'invalid owner briefing notification' };
+      calls.notificationInputs.push({ runId, briefId, text: text(config.text) });
+      const key = `${member.id}:${briefId}`;
+      const sent = !delivered.has(key);
+      if (sent) { delivered.add(key); calls.notifications.push(`${member.id}:${briefId}`); }
+      return { ok: true, outcome: 'done', result: { delivered: sent }, evidence: { briefingId: briefId, owner: member.id } };
   };
   let durableBoardStore: MemberEventStore | undefined;
   const boardEventProvider: GraphCapabilityProvider = async ({ nodeInput }) => {
@@ -618,6 +626,21 @@ export async function runAbsorbGraphSimulation(options: {
       }
       calls.boardEvents.push(structuredClone(event));
       return { ok: true, outcome: 'ok', result: { appended: true } };
+  };
+  const appSourceProvider: GraphCapabilityProvider = async ({ input, graphInput, nodeInput }) => {
+      const context = inputContext(graphInput ?? input);
+      const config = object(nodeInput);
+      const suggestion = object(config.suggestion);
+      const draft = object(config.draft);
+      const manifest = object(parseYaml(text(draft.manifestYaml)));
+      if (config.memberId !== member.id || context.memberId !== member.id || suggestion.owner !== member.id
+        || suggestion.appId !== config.appId || object(manifest.frontend).kind !== 'static-export'
+        || object(manifest.frontend).out !== 'out' || manifest.slug !== config.appId
+        || !text(draft.html).includes('<html') || !text(draft.html).includes('</html>'))
+        return { ok: false, outcome: 'failed', error: 'verified fake app source required' };
+      const artifact = { id: `artifact-${text(suggestion.id)}`, ownerId: member.id,
+        files: { '/index.html': text(draft.html) } };
+      return { ok: true, outcome: 'done', result: { artifact }, evidence: { artifact, owner: member.id } };
   };
   const appPublishProvider: GraphCapabilityProvider = async ({ runId, input, nodeInput, graphInput, outputs }) => {
       const context = inputContext(graphInput ?? input);
@@ -671,7 +694,10 @@ export async function runAbsorbGraphSimulation(options: {
     'store.events@1': boardEventProvider,
     'extract.item@1': extractProvider,
     'absorb.document-parse@1': createDocumentParseProvider({ apiKey: '' }),
-    'notify.channel@1': notifyProvider,
+    'notify.channel@1': context => notifyProvider(options.varyNotifyTextOnRepeat && context.runId === 'absorb-demo-repeat'
+      ? { ...context, nodeInput: { ...object(context.nodeInput),
+        text: `${text(object(context.nodeInput).text)} (revised)` } } : context),
+    'app-publish.source@1': appSourceProvider,
     'app-publish.action@1': appPublishProvider,
   });
 
@@ -692,7 +718,8 @@ export async function runAbsorbGraphSimulation(options: {
         deps: { root: join(root, runId), callLLM: async (prompt: string) => {
           calls.llmPrompts.push(prompt);
           return fakeModel(prompt, calls.llm, kstDay, options.mutateDesign, calls.designInputs,
-            options.mutateRequirements, options.mutateDesignResult, options.suggestOutcome, options.mutateSuggestion);
+            options.mutateRequirements, options.mutateDesignResult, options.suggestOutcome, options.mutateSuggestion,
+            options.mutateBuildArtifact);
         }, capabilityProviders: providers } } as unknown as GraphRunOptions;
       const selectedRouteBuild = graphFile === 'absorb-build.yaml'
         && runOptions.suggestionId === (options.routeSuggestionId ?? 'suggestion-2026-11-09-1');
@@ -953,7 +980,7 @@ export async function runAbsorbGraphSimulation(options: {
       && buildHitlNodeIds.includes(acceptedBuildTwo.pending?.nodeId ?? '')
       && rejectedBuild.status === 'failed' && missingReceiptBuild.status === 'failed' && mismatchedReceiptBuild.status === 'failed'
       && foreignBuild.status === 'failed' && calls.appHost.length === (options.onAcceptedBuild ? 1 : 0)
-      && first.sameDayNotificationCount === 3 && calls.notifications.length === 6 && calls.llm.length > 0
+      && first.sameDayNotificationCount === 1 && calls.notifications.length === 2 && calls.llm.length > 0
       && actualKinds.join(',') === ['photo', 'text', 'video', 'voice', 'web', 'x', 'youtube'].join(',')
       && calls.suggestionFixtureIds.includes('suggestion-2026-11-09-1')
       && calls.suggestionFixtureIds.includes('suggestion-2026-11-09-2')
@@ -968,7 +995,8 @@ export async function runAbsorbGraphSimulation(options: {
         foreign: { status: foreignBuild.status, path: foreignBuild.path } },
       calls, actualKinds, sameDayNotificationCount: first.sameDayNotificationCount })}`);
     return { ok: true, started: true, route: acceptMatch.name, dispatch: confirmationDispatch.status,
-      handlerCalls: acceptHandlerCalls, evidence, llmCalls: calls.llm.length, notificationDeliveries: calls.notifications,
+      handlerCalls: acceptHandlerCalls, evidence, llmCalls: calls.llm.length,
+      notificationInputs: calls.notificationInputs, notificationDeliveries: calls.notifications,
       briefingSummary: text(first.firstRun.nodes.map((node) => resultFrom(node.output))
         .find((result) => typeof result.summary === 'string')?.summary),
       builds: { accepted: { status: acceptedBuild.status, path: acceptedBuild.path }, acceptedTwo: { status: acceptedBuildTwo.status, path: acceptedBuildTwo.path }, rejected: { status: rejectedBuild.status, path: rejectedBuild.path },

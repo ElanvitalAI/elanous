@@ -1,27 +1,27 @@
 import { expect, test } from 'bun:test';
 import { getProviderForConfigAsync } from './llm.js';
 import type { UserConfig } from './user-config/types.js';
-import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import { withRealProviderFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 test('setup service key resolves from SecretStore into the mocked production provider request only', async () => {
   const secret = 'fake-openrouter-secret-value';
   const config = { llm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' } } as unknown as UserConfig;
   const secretIds: string[] = [];
   const requests: Array<{ authorization?: string; body?: string }> = [];
-  await withFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: request => {
+  await withRealProviderFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST', response: request => {
     requests.push({ authorization: request.headers.authorization, body: String(request.body ?? '') });
     return new Response('data: [DONE]\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
   } }], async (device) => {
     const provider = await getProviderForConfigAsync(
       config,
       undefined,
-      async (id) => { secretIds.push(id); return id === 'OPENROUTER_API_KEY' ? secret : undefined; },
+      async (id) => { secretIds.push(id); return id === 'cred:openrouter.api_key' ? secret : undefined; },
       {},
     );
     expect(provider.name).toBe('openrouter');
     expect(provider.available()).toBe(true);
     for await (const _event of provider.streamChat!([{ role: 'user', content: 'hello' }])) { /* mock response */ }
-    expect(secretIds).toEqual(['OPENROUTER_API_KEY']);
+    expect(secretIds).toEqual(['cred:openrouter.api_key']);
     expect(requests).toHaveLength(1);
     expect(requests[0]?.authorization).toBe(`Bearer ${secret}`);
     expect(JSON.stringify(config)).not.toContain(secret);

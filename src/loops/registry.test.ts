@@ -40,8 +40,15 @@ function fixture() {
 test('graph trigger registration is idempotent per trigger and dedupe key in the dispatch SSOT', () => {
   const f = fixture();
   const identity = { triggerId: 'orders-webhook', dedupeKey: 'delivery-1', graphId: 'orders' };
-  const first = registerGraphTriggerRun(identity, { registryRoot: f.stateRoot, stateRoot: f.stateRoot,
-    createRunId: () => 'orders-run-1' });
+  const log = spyOn(debug, 'log');
+  let first: ReturnType<typeof registerGraphTriggerRun>;
+  try {
+    first = registerGraphTriggerRun(identity, { registryRoot: f.stateRoot, stateRoot: f.stateRoot,
+      createRunId: () => 'orders-run-1' });
+    expect(log).toHaveBeenCalledWith('loops.registry', 'graph-trigger-registered', {
+      graphId: 'orders', runId: 'orders-run-1', created: true,
+    });
+  } finally { log.mockRestore(); }
   const retry = registerGraphTriggerRun(identity, { registryRoot: f.stateRoot, stateRoot: f.stateRoot,
     createRunId: () => 'unused-retry-run' });
   const retryWithBrokenRunIdFactory = registerGraphTriggerRun(identity, {

@@ -250,6 +250,29 @@ describe('tool-loop followup phase rejection', () => {
     expect(String(results[5]!.content)).toContain('VERIFY ACTION REQUIRED');
   });
 
+  test('app_deploy runs only after a successful shell verification clears the edit gate', async () => {
+    const dispatched: string[] = [];
+    const args = { appId: 'demo-app', runId: 'run-a', requestText: '배포해 줘' };
+    const { provider, capturedMessagesAt } = scriptedProvider([
+      [{ type: 'tool_call', id: 'edit', name: 'Edit', args: { file_path: 'app.ts', old_string: 'a', new_string: 'b' } }],
+      [{ type: 'tool_call', id: 'early', name: 'app_deploy', args }],
+      [{ type: 'tool_call', id: 'verify', name: 'RunShell', args: { command: 'bun test app.ts' } }],
+      [{ type: 'tool_call', id: 'ready', name: 'app_deploy', args }],
+      [{ type: 'text', delta: 'verified deployment' }],
+    ]);
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'create and deploy app' }],
+      { onText() {}, dispatchTool: async name => {
+        dispatched.push(name);
+        return name === 'RunShell' ? { output: '1 pass', exitCode: 0, outcome: 'exit' } : `${name} ran`;
+      } },
+      { provider, tools: [...TOOLS, { name: 'app_deploy', description: 'Publish a verified app', parameters: { type: 'object' } }], maxTurns: 12 },
+    );
+    expect(result).toContain('verified deployment');
+    expect(dispatched).toEqual(['Edit', 'RunShell', 'app_deploy']);
+    expect(toolResults(capturedMessagesAt(4)).some(block => String(block.content).includes('app_deploy did NOT run'))).toBe(true);
+  });
+
   test('repair phase receives a delegated result via AgentOutput and still rejects Glob', async () => {
     const dispatched: string[] = [];
     const { provider, capturedMessagesAt } = scriptedProvider([

@@ -10,16 +10,17 @@ import { renderNextTuiStatus, runNextTuiStatusBranchRoute } from './status.js';
 const REPO_CLI = join(import.meta.dir, '..', '..', '..', 'bin', 'elanous.mjs');
 
 test('status slash is registered as a lazy branch module', async () => {
-  const route = resolveNextTuiRoute('/status', NEXT_TUI_INPUT_CONTEXT);
-  expect(route?.id).toBe('status');
-  expect(buildNextTuiHelpLines().join('\n')).toContain('/status — 모델 · 연결 설정 · 계정 상태');
+  for (const command of ['/status', '/st']) {
+    expect(resolveNextTuiRoute(command, NEXT_TUI_INPUT_CONTEXT)?.id).toBe('status');
+  }
+  expect(buildNextTuiHelpLines().join('\n')).toContain('/status · /st — 모델 · 연결 설정 · 계정 상태');
   const branch = await import(new URL('./status.js', import.meta.url).href);
   expect(branch.runNextTuiStatusBranchRoute).toBe(runNextTuiStatusBranchRoute);
 });
 
 test('status simulation shows model, configured connection and selected account together', async () => {
   const lines: string[] = [];
-  await runNextTuiStatusBranchRoute('/status', { addLines: (...items) => lines.push(...items) }, () => ({
+  await runNextTuiStatusBranchRoute('/st', { addLines: (...items) => lines.push(...items) }, () => ({
     provider: 'openai-codex',
     model: 'gpt-sim',
     auth: 'oauth',
@@ -68,7 +69,7 @@ test('status passes the active session to its live snapshot reader', async () =>
   expect(lines.join('\n')).toContain('gpt-live');
 });
 
-test('isolated next-TUI PTY reflects the session model tier in /status', async () => {
+test('isolated next-TUI PTY shares live model status between /st and /status', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-tui-status-'));
   try {
     writeFileSync(join(root, 'config.json'), JSON.stringify({
@@ -83,7 +84,7 @@ test('isolated next-TUI PTY reflects the session model tier in /status', async (
       ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
       steps: [{
         label: 'status-default',
-        text: '/status',
+        text: '/st',
         until: (screen) => screen.includes('모델·연결·계정 상태')
           && screen.includes('status-sim-model')
           && screen.includes('연결 설정: 미설정')

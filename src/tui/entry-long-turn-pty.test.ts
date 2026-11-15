@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mockSeatPtySequence } from '../ux-sim/mock-seat-pty-sequence.js';
@@ -20,12 +20,14 @@ const SCENARIO_TIMEOUT_MS = 90_000;
 
 test('next TUI keeps a delayed turn visible, accepts a queued request, and returns both replies', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-long-turn-'));
+  const requestCapture = join(root, 'provider-requests.jsonl');
+  const loggedUser = (screen: string, text: string) => screen.split('\n').slice(0, -1).includes(`❯ ${text}`);
   const replyTemplate = '[fake-llm] long turn reply {reply}';
   const firstReply = '[fake-llm] long turn reply 1';
   const secondReply = '[fake-llm] long turn reply 2';
   const expectedTranscript = [
-    '나: slow first', `엘라누스: ${firstReply}`,
-    '나: second request', `엘라누스: ${secondReply}`,
+    '❯ slow first', `  ${firstReply}`,
+    '❯ second request', `  ${secondReply}`,
   ];
   try {
     writeFileSync(join(root, 'config.json'), JSON.stringify({
@@ -40,21 +42,24 @@ test('next TUI keeps a delayed turn visible, accepts a queued request, and retur
         ELANOUS_SESSION_ROOT: join(root, 'sessions'),
         ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
         ELANOUS_TEST_FAKE_LLM_RESPONSE: replyTemplate,
+        ELANOUS_TEST_FAKE_LLM_CAPTURE: requestCapture,
         ELANOUS_TEST_FAKE_LLM_DELAY_MS: String(FIRST_REPLY_DELAY_MS), ELANOUS_TEST_FAKE_LLM_DELAY_WHEN: 'slow first',
       },
       ready: { label: 'ready', timeoutMs: READY_TIMEOUT_MS,
         until: (screen) => screen.includes('Ctrl+Q 종료') && screen.includes('❯') },
       steps: [
         { label: 'first turn working', text: 'slow first', timeoutMs: INPUT_TIMEOUT_MS,
-          until: (screen) => screen.includes('나: slow first') && screen.includes('턴 스트리밍') },
+          // The prompt shares ❯ with history; also wait until the provider delay actually starts.
+          until: (screen) => loggedUser(screen, 'slow first') && screen.includes('턴 스트리밍')
+            && existsSync(requestCapture) && readFileSync(requestCapture, 'utf8').includes('slow first') },
         { label: 'draft during long turn', text: 'second request', enter: false,
           timeoutMs: INPUT_TIMEOUT_MS, until: (screen) => screen.includes('❯ second request') && screen.includes('턴 스트리밍') },
         { label: 'queued during long turn', keys: '\r', timeoutMs: FRAME_TIMEOUT_MS,
           until: (screen) => screen.includes('대기 1') && screen.includes('턴 스트리밍') },
         { label: 'first reply remains visible', timeoutMs: FRAME_TIMEOUT_MS,
-          until: (screen) => screen.includes(firstReply) && screen.includes('나: slow first') },
+          until: (screen) => screen.includes(firstReply) && loggedUser(screen, 'slow first') },
         { label: 'second reply finishes', timeoutMs: FRAME_TIMEOUT_MS,
-          until: (screen) => screen.includes('나: second request') && screen.includes(secondReply)
+          until: (screen) => loggedUser(screen, 'second request') && screen.includes(secondReply)
             && screen.includes('턴 완료') },
       ],
     });
@@ -64,9 +69,13 @@ test('next TUI keeps a delayed turn visible, accepts a queued request, and retur
     expect(queued?.screen).toContain('대기 1');
     expect(Date.parse(queued!.at) - Date.parse(working!.at)).toBeLessThan(FIRST_REPLY_DELAY_MS);
     expect(first?.screen).toContain(firstReply);
-    const transcript = second?.screen.split('\n').map((line) => line.trim())
-      .filter((line) => line.startsWith('나: ') || line.startsWith('엘라누스: '));
+    const transcript = second?.screen.split('\n').map((line) => line.trimEnd())
+      .filter((line) => line.startsWith('❯ ') || line.startsWith('  '));
     expect(transcript).toEqual(expectedTranscript);
+    const requests = readFileSync(requestCapture, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(requests).toHaveLength(2); // Source: this scenario submits exactly two user turns.
+    expect(JSON.stringify(requests[0].messages)).toContain('slow first');
+    expect(JSON.stringify(requests[1].messages)).toContain('second request');
     expect(run.exitCode).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });

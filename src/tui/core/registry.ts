@@ -14,7 +14,7 @@ export interface NextTuiRoute {
   /** Optional branch module loaded only when this route is selected. */
   readonly branchModule?: string;
   /** Host capability needed by the branch. New kinds require an explicit entry adapter. */
-  readonly branchHost?: 'sidetab' | 'terminal' | 'mission' | 'context' | 'now' | 'app' | 'harness' | 'memory' | 'decide' | 'plugin-wizard';
+  readonly branchHost?: 'sidetab' | 'terminal' | 'mission' | 'context' | 'now' | 'app' | 'harness' | 'memory' | 'decide' | 'plugin-wizard' | 'loop';
   readonly slash: readonly string[];
   readonly slashPrefixes: readonly string[];
   /** Fixed phrases; ordinary conversational text continues to the model. */
@@ -99,6 +99,8 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
   {
     id: 'loop',
     action: 'command',
+    branchModule: '../tui-client/next-loop-command.js',
+    branchHost: 'loop',
     slash: [],
     slashPrefixes: ['/loop'],
     phrases: [],
@@ -121,7 +123,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
   {
     id: 'status',
     action: 'command',
-    slash: ['/status'],
+    slash: ['/status', '/st'],
     slashPrefixes: [],
     phrases: [],
     roles: ['human'],

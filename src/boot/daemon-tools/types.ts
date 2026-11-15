@@ -71,6 +71,7 @@ export interface DaemonToolDispatchCtx {
   /** App-scoped member receipt resolved by Nexus; tool arguments cannot set this. */
   appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
   appDeployPublishHook?: import('../../agent/app-deploy-plugin.js').AppDeployPublishHook;
+  dynamicAppDeployHook?: import('../../agent/app-deploy-plugin.js').DynamicAppDeployHook;
   /** Ingestion entry class. Omit for conservative external-verbatim fallback. */
   entry?: IngestionEntry;
   /** M5 PR 2 (PLAN-rich-dev-feedback-multi-surface · 2026-05-13) —

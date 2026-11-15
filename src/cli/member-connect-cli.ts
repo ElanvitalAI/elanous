@@ -80,8 +80,9 @@ export function registerMemberConnectCommands(program: Command, deps: {
       const configDir = (deps.configDir ?? getElanousConfigDir)();
       const consumeHandoff = async (path: string) => {
         const approved = readApprovedHandoff(path);
-        await connectApprovedMemberSession({ ...approved, nexusUrl: 'https://api.elanous.ai',
+        const connected = await connectApprovedMemberSession({ ...approved, nexusUrl: 'https://api.elanous.ai',
           configDir, ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}) });
+        if (connected.relayKeyUnavailable) io.error('회원 연결은 완료했지만 relay 키가 없습니다. 나중에 elanous member key issue로 다시 발급해 주세요.');
       };
       if (options.handoffFile) await consumeHandoff(options.handoffFile);
       else await startApprovedMemberConnect({ configDir, consumeHandoff, output: line => io.log(line),

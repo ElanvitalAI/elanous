@@ -1,7 +1,7 @@
 import { updateToolActivity, toolActivityLines, type ToolActivityRow } from './chat/tool-activity.js';
 import { nextAssistantPreviewText } from './chat/assistant-preview.js';
 import { initTui, initTuiPrimary, closeTui, injectKey, pendingKeyCount as tuiPendingKeyCount, readKey, setTuiAltScreen, setTuiMouseCapture, type Key } from '../tui.js';
-import { createNextTuiCompactPainter, createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiCompactFrame, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
+import { hasDisplayableCompletedToolBlock, createNextTuiCompactPainter, createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiCompactFrame, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
 import { renderNextTuiEntryFrame, shellApprovalCommandViewport } from './core/entry-render.js';
 import type { MessageBlock } from '../conv-substrate/message-block.js';
 import { nextMessageBlockDetailLevel } from './chat/message-block-view.js';
@@ -27,7 +27,7 @@ import { setCliStderrSink } from '../git-fs/cli-stderr.js';
 import { createInputLagProbe } from './input-lag-probe.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { countInterimDisplay, internalTurnOriginOfText, planInterimDisplay } from './chat/goal-interim.js';
-import type { NextLoopCommand } from '../tui-client/next-loop-command.js';
+import type { NextTuiLoopBranch } from '../tui-client/next-loop-command.js';
 import { handleSignalsSlash, type SignalsSlashContext } from './slash/signals.js';
 import { updatePtyManifestSession } from '../pty-shell/pty-manifest.js';
 import { createNextTuiCoreInput } from './core/input.js';
@@ -77,6 +77,8 @@ type NextTuiTermSession = {
 };
 
 export interface NextTuiOptions {
+  /** Root launch flags select this process's session without editing shared config. */
+  readonly initialProvider?: { readonly provider: string; readonly model?: string };
   /** Existing authenticated Nexus member session, supplied by the Next host. */
   readonly memberBoardSession?: () => { nexusUrl: string; sessionToken: string } | undefined;
   readonly resumeSessionId?: string;
@@ -131,6 +133,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   if (!id) {
     id = createSession({ source: 'tui', ...(simWorldId ? { title: `SIM-TUI ${simWorldId}` } : {}) }).id;
     setActiveSessionId(id);
+  }
+  if (options.initialProvider) {
+    const { parseSessionProvider, setSessionProvider } = await import('../tui-client/session-provider.js');
+    setSessionProvider(id, parseSessionProvider(options.initialProvider.provider, options.initialProvider.model));
   }
   let session = id ? loadSession(id) : null;
   let messages = session?.messages ?? [];
@@ -355,22 +361,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const queueWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
   const internalWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
   let wakeup: NextTuiWakeup | null = null;
-  let loopCommand: NextLoopCommand | null = null;
+  let loopBranch: NextTuiLoopBranch | null = null;
   let decideBranchRoute: ((input: string) => string) | undefined;
   let pluginWizardFlow: ReturnType<typeof import('./branches/plugin-wizard.js').createPluginWizardFlow> | null = null;
-  const runLoopCommand = async (raw: string): Promise<string[]> => {
-    if (!loopCommand) {
-      if (!wakeup?.gate) {
-        return [
-          'usage: /loop <간격> <프롬프트> · /loop stop',
-          '간격: 30s · 5m · 1h · 맨숫자=분 — TUI가 쉴 때 프롬프트를 발사합니다',
-        ];
-      }
-      const { createNextLoopCommand } = await import('../tui-client/next-loop-command.js');
-      loopCommand = createNextLoopCommand(wakeup.gate, (event, data) => debug.log('dashboard.loop', event, data));
-    }
-    return loopCommand.run(raw);
-  };
   // TURN-END-BEFORE-GOAL — 답이 약속만 하고 끝나면 깨움 문으로 한 턴 더(classic 과 같은 모듈 · 동적 로드).
   let goalContinue: ReturnType<(typeof dashboardRuntime)['createGoalContinue']> | null = null;
   /** 이번 턴이 실패·취소로 끝났나 — 그런 턴은 이어가지 않는다. */
@@ -406,11 +399,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // MISSION-FABRIC-REMOVAL(대표 11-05) — /mission 은 지웠다. 미션 패브릭(autopilot 미션 스토어)은 시뮬레이션 장치로 새로 짓는다.
   const slashHandlers = new Map<string, (args: string[], context: SignalsSlashContext) => Promise<void>>();
   slashHandlers.set('signals', handleSignalsSlash);
-  slashHandlers.set('status', async (_args, context) => (await import('./branches/status.js')).runNextTuiStatusBranchRoute('/status', { addLines: (...lines) => context.chatLines.push(...lines), sessionId: id ?? undefined }));
+  const handleStatus: NonNullable<ReturnType<typeof slashHandlers.get>> = async (_args, context) =>
+    (await import('./branches/status.js')).runNextTuiStatusBranchRoute('/status', { addLines: (...lines) => context.chatLines.push(...lines), sessionId: id ?? undefined });
+  slashHandlers.set('status', handleStatus);
+  slashHandlers.set('st', handleStatus);
   slashHandlers.set('remaining', async (args, context) => (await import('./branches/remaining.js')).handleNextTuiRemainingSlash(args, context));
-  slashHandlers.set('loop', async (args, context) => {
-    context.chatLines.push(...await runLoopCommand(args.join(' ')));
-  });
   const dispatchSlash = async (name: string, args: string[], context: SignalsSlashContext): Promise<boolean> => {
     const handler = slashHandlers.get(name);
     if (!handler) return false;
@@ -646,7 +639,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const previewText = streamPreview?.assistantText
       ? nextAssistantPreviewText(streamPreview.text) : streamPreview?.text;
     const displayActivity = [
-      ...toolActivityLines(visibleToolActivity, performance.now()),
+      // Keep a completed call until its corresponding saved result can render in detail.
+      ...toolActivityLines(basicChat ? visibleToolActivity : visibleToolActivity.filter((row) =>
+        row.finishedAt === undefined || !hasDisplayableCompletedToolBlock(row.id, messageBlocks, visibleMessages)), performance.now()),
       ...(!basicChat ? [
         ...agentDisplayLines(reconciledAgents),
         ...reconciledAgents.map(agentDisplayLine),
@@ -1266,7 +1261,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const compactNote = outcome.compacted ? `${lastCompactCount ?? '대화 압축 완료'} · ` : '';
         lastCompactCount = null;
         status = outcome.kind === 'cancelled' ? `${compactNote}응답 취소됨 · Enter 전송`
-          : outcome.kind === 'failed' ? `${compactNote}응답 실패 · ↑ 이전 입력 후 Enter 재시도`
+          : outcome.kind === 'failed' ? `${compactNote}응답 실패`
             : outcome.goalStopReason === 'max_turns' ? 'Turn cap reached — continue with your next input'
               : `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`;
         const failure = turnReplyFailureMessage(turnSessionId, outcome.kind === 'failed', outcome.authFailureKind);
@@ -2165,7 +2160,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           pluginWizardFlow = null;
           const next = await requestNewTuiSession({ busy, from: id });
           if (next.kind === 'started') {
-            (loopCommand as NextLoopCommand | null)?.run('stop');
+            loopBranch?.stop();
             const previous = id;
             backgroundSubscription.stop?.();
             backgroundSubscription.stop = undefined;
@@ -2235,7 +2230,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           const { requestResumeTuiSession, resumeCandidates } = await import('./slash/resume.js');
           const next = requestResumeTuiSession({ busy, from: id, prefix: resumeCommand.prefix, rows: lastResumeRows ?? resumeCandidates(id) });
           if (next.kind === 'started') {
-            (loopCommand as NextLoopCommand | null)?.run('stop');
+            loopBranch?.stop();
             const previous = id;
             backgroundSubscription.stop?.();
             backgroundSubscription.stop = undefined;
@@ -2292,7 +2287,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               activity.push(safeStatusText(line));
               activity = activity.slice(-80);
               render();
-            }))
+            }, id ?? undefined))
             .then(() => { status = 'provider 명령 완료 · Enter 전송'; })
             .catch((error: unknown) => {
               const message = error instanceof Error ? error.message : String(error);
@@ -2306,6 +2301,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               settle();
               render();
             });
+          render();
+          continue;
+        }
+        if (route?.branchHost === 'loop' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('../tui-client/next-loop-command.js');
+          loopBranch ??= branch.createNextTuiLoopBranch(
+            () => wakeup?.gate ?? null,
+            (event, data) => debug.log('dashboard.loop', event, data),
+          );
+          activity.push(...loopBranch.run(submitted));
+          status = 'Enter 전송';
           render();
           continue;
         }
@@ -2594,7 +2600,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     restoreTuiStderrOwner?.();
     restoreTuiStderrOwner = null;
     if (residueTimer !== null) clearTimeout(residueTimer);
-    (loopCommand as NextLoopCommand | null)?.dispose();
+    loopBranch?.dispose();
     wakeup?.dispose();
     if (wakeup) {
       const { setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');

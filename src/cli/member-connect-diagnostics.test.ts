@@ -73,6 +73,10 @@ beforeAll(async () => {
             if (name === 'owner-401') return Response.json({ error: canary }, { status: 401 });
             return Response.json({ memberId: 'mq04-synthetic-owner' });
           }
+          if (target.pathname === '/v1/member/keys') {
+            const key = 'emk_syntheticMq04'; secrets.push(key);
+            return Response.json({ id: '11111111-1111-4111-8111-111111111111', key }, { status: 201 });
+          }
           throw new Error('unexpected product request');
         }) as typeof fetch,
       });
@@ -92,7 +96,7 @@ beforeAll(async () => {
 test('registered member connect happy path exchanges, verifies and persists the actual private envelope', () => {
   const row = rows[0];
   expect(row.exits).toEqual([0]);
-  expect(row.calls).toEqual(['/v1/members/connect/start', '/v1/members/connect/poll', '/v1/members/app-slot/exchange', '/v1/members/owner']);
+  expect(row.calls).toEqual(['/v1/members/connect/start', '/v1/members/connect/poll', '/v1/members/app-slot/exchange', '/v1/members/owner', '/v1/member/keys']);
   expect(row.envelopeValid).toBe(true);
   expect(row.successPrinted).toBe(true);
 });

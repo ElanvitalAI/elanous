@@ -2,11 +2,12 @@
   "id": "elanous-app-deploy",
   "name": "Elanous App Deploy",
   "version": "0.3.9",
-  "description": "Build, simulate and publish a registered Elanous app through the shared app lifecycle.",
-  "whenToUse": "등록된 Elanous 앱의 시뮬레이션을 실행하고, 게시 hook과 회원 소유자·확인 채널이 준비된 경우 승인 후 게시할 때 사용한다. 현재 static-export와 AppManifest SQL/RPC 계약을 사용하며 임의 Bun 서버 게시를 보장하지 않는다. hook이 없으면 시뮬레이션 결과만 반환한다.",
+  "description": "Publish a registered app or a sealed generated app from a verified Nexus owner session.",
+  "whenToUse": "등록된 AppManifest Elanous 앱 또는 app_create가 작성한 source-artifact@1 생성 앱을 게시할 때 사용한다. 생성 앱은 서버가 예약한 root와 runId, 검증된 회원 세션, 정확한 산출물 승인 및 확인 채널이 필요하다. 파일 수정 뒤에는 RunShell 또는 Bash로 검증을 통과한 다음 app_deploy를 호출한다. 승인 슬롯이 없으면 게시하지 않는다.",
   "inputs": {
     "appId": "실제로 등록되고 시뮬레이션 가능한 앱 slug",
-    "requestText": "사용자가 요청한 변경 또는 게시 작업"
+    "requestText": "사용자가 요청한 변경 또는 게시 작업",
+    "runId": "생성 앱인 경우 app_create가 반환한 서버 run ID"
   },
   "outputs": {
     "status": "simulated, published, rejected 또는 failed",
@@ -20,7 +21,8 @@
   "requires": {
     "memberConnection": true,
     "appKinds": [
-      "static-export"
+      "static-export",
+      "local-service"
     ],
     "confirmation": true
   },
@@ -32,7 +34,7 @@
     "aiTools": [
       {
         "name": "app_deploy",
-        "description": "Build and simulate a registered member-owned app, confirm before deployment, and return its verified app URL.",
+        "description": "Publish a registered member-owned app, or a sealed generated app when app_create supplied runId; confirm before deployment and return only a verified public URL.",
         "handler": "native:app_deploy",
         "parameters": {
           "type": "object",
@@ -44,6 +46,10 @@
             "requestText": {
               "type": "string",
               "minLength": 1
+            },
+            "runId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,127}$"
             }
           },
           "required": [

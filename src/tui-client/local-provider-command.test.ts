@@ -1,6 +1,13 @@
 import { expect, test } from 'bun:test';
 import { ProviderModelCache, runLocalProviderCommand } from './local-provider-command.js';
-import { setUserConfigOverlay } from '../user-config.js';
+import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
+import { clearSessionProvider, getSessionProvider } from './session-provider.js';
+import { backupConfigPath, reloadUserConfig, userConfigPath } from '../user-config.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 test('provider models load on first open, then use the session cache and last good remote list', async () => {
   const cache = new ProviderModelCache();
@@ -119,5 +126,69 @@ test('prototype names are never accepted as providers', async () => {
       .rejects.toThrow(`알 수 없는 provider: ${name}`);
     await expect(runLocalProviderCommand(`use ${name}`, signal, () => {}))
       .rejects.toThrow('사용법');
+  }
+});
+
+test('provider use changes only the addressed session; global mode requires a second confirmation flag', async () => {
+  const before = getUserConfig().llm.provider;
+  const lines: string[] = [];
+  try {
+    await runLocalProviderCommand('use grok grok-4.7', new AbortController().signal, (line) => lines.push(line), 'session-grok');
+    expect(getSessionProvider('session-grok')).toEqual({ provider: 'grok', model: 'grok-4.7' });
+    expect(getSessionProvider('session-codex')).toBeUndefined();
+    expect(getUserConfig().llm.provider).toBe(before);
+    expect(lines.at(-1)).toContain('이 세션');
+    await expect(runLocalProviderCommand('use grok --global', new AbortController().signal, () => {}, 'session-grok'))
+      .rejects.toThrow('--global --yes');
+    expect(getUserConfig().llm.provider).toBe(before);
+  } finally {
+    clearSessionProvider('session-grok');
+  }
+});
+
+test('confirmed global switch backs up the old key and publishes a key-free new provider', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-session-provider-'));
+  setElanousConfigDir(root);
+  try {
+    const path = userConfigPath();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ llm: { provider: 'openai-codex', model: 'gpt-6.1-terra',
+      apiKey: 'old-provider-key', baseUrl: 'https://old.example.invalid/v1' }, customField: 'kept' }));
+    reloadUserConfig();
+    await runLocalProviderCommand('use grok grok-4.7 --global --yes', new AbortController().signal, () => {}, 'global-test-session');
+    const published = JSON.parse(readFileSync(path, 'utf8'));
+    const backup = JSON.parse(readFileSync(backupConfigPath(path), 'utf8'));
+    expect(published).toMatchObject({ customField: 'kept', llm: { provider: 'grok', model: 'grok-4.7' } });
+    expect(published.llm.apiKey).toBeUndefined();
+    expect(published.llm.baseUrl).toBeUndefined();
+    expect(backup.llm).toMatchObject({ provider: 'openai-codex', apiKey: 'old-provider-key',
+      baseUrl: 'https://old.example.invalid/v1' });
+    expect(existsSync(path)).toBe(true);
+    expect(getUserConfig().llm.provider).toBe('grok');
+  } finally {
+    resetElanousConfigDir();
+    reloadUserConfig();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('first global switch creates absent config, while malformed existing config fails closed', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-first-provider-'));
+  setElanousConfigDir(root);
+  try {
+    const path = userConfigPath();
+    expect(existsSync(path)).toBe(false);
+    await runLocalProviderCommand('use grok --global --yes', new AbortController().signal, () => {}, 'first-session');
+    expect(JSON.parse(readFileSync(path, 'utf8')).llm.provider).toBe('grok');
+    expect(existsSync(backupConfigPath(path))).toBe(false);
+    writeFileSync(path, '{not-json');
+    await expect(runLocalProviderCommand('use openai-codex --global --yes', new AbortController().signal, () => {}, 'first-session'))
+      .rejects.toThrow();
+    expect(readFileSync(path, 'utf8')).toBe('{not-json');
+    expect(existsSync(backupConfigPath(path))).toBe(false);
+  } finally {
+    resetElanousConfigDir();
+    reloadUserConfig();
+    rmSync(root, { recursive: true, force: true });
   }
 });

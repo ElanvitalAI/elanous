@@ -2421,6 +2421,9 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
 // 상태 왕복 가짜 — memory add 로 받은 nonce 를 search 가 돌려주고, logs 는 «지금» 쓰인 행을 낸다.
 let lastNonce = '';
 function stateOk(a: readonly string[]): { status: number; stdout: string; stderr: string } {
+  if (String(a[0]).endsWith('/nexus-first-run.ts')) return { status: 0, stdout: JSON.stringify({ ok: true,
+    versionLine: `0.1.1 ${'a'.repeat(40)}`, health: 200, healthOk: true, app: 200,
+    testUniverse: true, pid: 12345, ownPidStopped: true, forcedKill: false, exitCode: 0 }), stderr: '' };
   if (a[0] === 'nexus' && a[1] === '--status') return { status: 0, stdout: '  status    not running\n', stderr: '' };
   if (a[0] === 'memory' && a[1] === 'add') { lastNonce = String(a[3]).replace('release-verify-', ''); return { status: 0, stdout: 'saved', stderr: '' }; }
   if (a[0] === 'memory' && a[1] === 'search') return { status: 0, stdout: `match release-verify-${lastNonce}`, stderr: '' };
@@ -2432,6 +2435,25 @@ function stateOk(a: readonly string[]): { status: number; stdout: string; stderr
 const notesCurl = (a: readonly string[], code = '200') => (a.includes('-w') ? { status: 0, stdout: code, stderr: '' } : null);
 
 describe('release verify — 공개 주소로 끝까지', () => {
+  test('verify fails a successful installer when Nexus first-run health/app or PID receipt fails', async () => {
+    const lines: string[] = [];
+    const run: Runner = (c, a) => {
+      if (String(a[0]).endsWith('/nexus-first-run.ts')) return { status: 0, stdout: JSON.stringify({
+        ok: false, health: 200, healthOk: true, app: 404, testUniverse: true, pid: 12345,
+        ownPidStopped: true, forcedKill: false, exitCode: 0 }), stderr: '' };
+      if (c === 'curl') return notesCurl(a) ?? { status: 0, stdout: 'installer', stderr: '' };
+      if (a[0] === '--version') return { status: 0, stdout: '0.1.1 abc', stderr: '' };
+      return stateOk(a);
+    };
+    const result = await verifyRelease({ version: '0.1.1', log: line => lines.push(line) }, run);
+    expect(result.ok).toBe(false);
+    expect(result.nexusFirstRun?.app).toBe(404);
+    expect(lines.some(line => line.includes('A158 nexus health=200') && line.includes('FAIL'))).toBe(true);
+  });
+
+  test('prepare cannot skip mandatory first startup verification', async () => {
+    await expect(prepareRelease({ version: '0.3.25', skipE2e: true })).rejects.toThrow('A158');
+  });
   test('verify stops its daemon and releases the default loopback port before cleanup', async () => {
     const daemon = createServer();
     await new Promise<void>((resolve, reject) => {
