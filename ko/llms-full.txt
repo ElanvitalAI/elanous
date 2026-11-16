@@ -5200,6 +5200,25 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.26
+
+Source: https://docs.elanous.ai/releases/0-3-26/
+
+- When Elanous needs a decision before building, it asks one or two questions right in the terminal input box and shows the assumptions it will use if you skip them.
+- While a graph runs, the Next terminal shows which step is running, which finished and which failed.
+- Architecture documents now check their diagrams and repair broken ones, so the diagrams render instead of showing an error.
+- In the terminal, a faint line now separates where you type from the status line, and code in answers shows as a dimmed code block.
+
+- New app requests are routed to the build workflow before deployment.
+
+## Known issues
+
+- A full sign-up with a real Google account on the release build has not been measured yet.
+
+- The full release gate was not run; this release follows an approved manual critical path.
+
+---
+
 # 0.3.25
 
 Source: https://docs.elanous.ai/releases/0-3-25/
