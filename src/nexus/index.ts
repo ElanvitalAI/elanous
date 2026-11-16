@@ -124,8 +124,11 @@ import { createNexusScrapsRouteOptions } from './api/scraps-web-digest.js';
 import { trustedTlsEdgeFromEnv } from './api/tls-edge.js';
 import { createGeneratedAppPublisher, createGeneratedAppPublishRoute, withGeneratedAppsPrivateIngress, type GeneratedAppPublisher } from './apps/generated-app-publish.js';
 import { createDynamicAppPublisher, createDynamicAppPublishRoute, createDynamicAppDeployHook, verifiedDynamicOwner, type DynamicAppPublisher } from './apps/dynamic-app-publish.js';
+import { createAppDeploymentApprovalProvider } from './apps/app-deployment-approval-intent.js';
 import { createAppBuildLocalIssuerBridge } from './apps/app-build-local-bridge.js';
-import { createAppBuildRunAuthority, loadAppBuildRunAuthorityKey, relayMemberKeyFingerprint } from './apps/app-build-run-authority.js';
+import { createAppBuildRunAuthority, createAppDeploymentGrantProvider,
+  loadAppBuildRunAuthorityKey, relayMemberKeyFingerprint } from './apps/app-build-run-authority.js';
+import { readRelayMemberKeyId } from '../relay/member-key-binding.js';
 import { readTuiMemberSession, tuiMemberSessionPath } from '../tui/member-session-contract.js';
 import { loadNexusAppHost, resolveVerifiedOwner as resolveVerifiedAppOwner, type NexusAppHost } from './apps/app-host.js';
 import { createMemberStore, type MemberStore } from './members/member-store.js';
@@ -3398,6 +3401,14 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       testHandle: process.env.ELANOUS_APPROVED_TEST_APP_HANDLE,
       testApprovalExpiresAt: process.env.ELANOUS_APPROVED_TEST_APP_UNTIL,
       issuerSourceHead: dynamicIssuerSourceHead,
+      deploymentGrants: createAppDeploymentGrantProvider({
+        root: joinPath(getElanousConfigDir(), 'app-build', 'deployment-grants'),
+        getSession: () => readTuiMemberSession(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE)),
+      }),
+      deploymentApprovals: createAppDeploymentApprovalProvider({
+        getSession: () => readTuiMemberSession(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE)),
+      }),
+      relayKeyId: () => readRelayMemberKeyId(getElanousConfigDir()),
       approveArtifact: (_owner, _runId, _appSlug, digest) =>
         !!process.env.ELANOUS_APPROVED_TEST_APP_ARTIFACT_SHA256
         && process.env.ELANOUS_APPROVED_TEST_APP_ARTIFACT_SHA256 === digest,

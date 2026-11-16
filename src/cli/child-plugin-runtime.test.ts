@@ -1,12 +1,166 @@
 import { expect, test } from 'bun:test';
 import { createChildPluginRuntimeContract } from './child-plugin-runtime.js';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerGcpScene5FakeProvider } from '../ux-sim/gcp-architect-expand/scene5-fake-provider.js';
 import { buildCliAgentTools } from './agent-cli.js';
 import { registerToolRuntime, unregisterToolRuntime } from '../tool-runtime/registry.js';
+import type { GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
+import { emptyGraphCapabilityRegistry } from '../graph-runner/capabilities.js';
+import { createSourceBuildWithApprovalRegistry } from '../graph-runner/capability-providers/app-build-publish-approval.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+
+test('ordinary app build refuses when the trusted approval provider is absent', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'child-app-build-approval-'));
+  try {
+    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'owner-a' },
+      graphDeps: { root, capabilityProviders: emptyGraphCapabilityRegistry() },
+      requestConfirmation: async () => true });
+    const response = await bridge.dispatchPluginTool('app_build', { ask: 'Build a private ticketing app',
+      seedRequested: false, appSlug: 'ticketing', artifactMetadata: {
+        runtime: { startCommand: ['bun', 'backend/entry.ts'], healthPath: '/health' } } });
+    expect(response).toMatchObject({ ok: false });
+    expect(JSON.stringify(response)).toContain('APP_BUILD_APPROVAL_REGISTRY_REQUIRED');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ordinary app build approves after a simulated 20-minute build', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'child-app-build-approved-')));
+  const previousState = process.env.ELANOUS_STATE_DIR;
+  const originalDateNow = Date.now;
+  let buildElapsedMs = 0;
+  const url = 'https://api.elanous.ai/v1/members/deployment-approvals/8f195ad4-a4e2-4b31-a7bc-155602760279';
+  const actions: string[] = [];
+  const prompts: string[] = [];
+  let publishes = 0;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: async request => {
+    const body = await request.json() as { action: string };
+    actions.push(body.action);
+    if (body.action === 'approval-start') return Response.json({ status: 'approval-pending',
+      approvalUrl: url, pendingExpiresAt: new Date(Date.now() + 20_000).toISOString() });
+    if (body.action === 'approval-poll') return Response.json({ status: 'approval-approved' });
+    return Response.json({ error: 'unexpected' }, { status: 400 });
+  } });
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    setElanousConfigDir(root);
+    mkdirSync(join(root, 'nexus'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(root, 'acp-token'), 'synthetic-local-control', { mode: 0o600 });
+    writeFileSync(join(root, 'nexus', 'runtime.json'), JSON.stringify({
+      pid: process.pid, httpAuth: 'on', httpPort: server.port }), { mode: 0o600 });
+    const base = createSourceBuildWithApprovalRegistry();
+    const registry = { ...base, providers: base.providers.map(provider =>
+      provider.id === 'app-build-owner-publish-approval' ? provider : { ...provider,
+        invoke: async (context: { nodeId: string }) => {
+          if (context.nodeId === 'materialize') buildElapsedMs = 20 * 60_000;
+          if (context.nodeId === 'publish') publishes++;
+          return { ok: true, outcome: 'done' as const, result: { status: 'done' } };
+        } }) };
+    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'owner-a' },
+      graphDeps: { root, capabilityProviders: registry },
+      requestConfirmation: async prompt => { prompts.push(prompt); return true; } });
+    Date.now = () => originalDateNow() + buildElapsedMs;
+    const response = await bridge.dispatchPluginTool('app_build', { ask: 'Build a ticketing app',
+      seedRequested: false, appSlug: 'ticketing', artifactMetadata: {
+        runtime: { startCommand: ['bun', 'backend/entry.ts'], healthPath: '/health' } } });
+    expect(response).toMatchObject({ ok: true, result: { status: 'done' } });
+    expect(buildElapsedMs).toBe(20 * 60_000);
+    expect(actions).toEqual(['approval-start', 'approval-poll']);
+    expect(publishes).toBe(1);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(url);
+    expect(JSON.stringify(response)).not.toContain('8f195ad4');
+    if (!response.ok) throw new Error(response.error);
+    const state = response.result as { path: string[] };
+    expect(state.path).toContain('publish-approval');
+    expect(state.path.indexOf('publish-approval')).toBeLessThan(state.path.indexOf('publish'));
+  } finally {
+    Date.now = originalDateNow;
+    server.stop();
+    resetElanousConfigDir();
+    if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousState;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ordinary app build never publishes when owner approval is pending or denied', async () => {
+  for (const mode of ['pending', 'denied'] as const) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'child-app-build-refused-')));
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const actions: string[] = [];
+    let publishes = 0;
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: async request => {
+      const body = await request.json() as { action: string };
+      actions.push(body.action);
+      if (body.action === 'approval-start' && mode === 'pending') return Response.json({
+        status: 'approval-pending',
+        approvalUrl: 'https://api.elanous.ai/v1/members/deployment-approvals/8f195ad4-a4e2-4b31-a7bc-155602760279',
+        pendingExpiresAt: new Date(Date.now() + 100).toISOString() });
+      return Response.json({ status: 'approval-denied' });
+    } });
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      setElanousConfigDir(root);
+      mkdirSync(join(root, 'nexus'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, 'acp-token'), 'synthetic-local-control', { mode: 0o600 });
+      writeFileSync(join(root, 'nexus', 'runtime.json'), JSON.stringify({
+        pid: process.pid, httpAuth: 'on', httpPort: server.port }), { mode: 0o600 });
+      const base = createSourceBuildWithApprovalRegistry();
+      const registry = { ...base, providers: base.providers.map(provider =>
+        provider.id === 'app-build-owner-publish-approval' ? provider : { ...provider,
+          invoke: async (context: { nodeId: string }) => {
+            if (context.nodeId === 'publish') publishes++;
+            return { ok: true, outcome: 'done' as const, result: { status: 'done' } };
+          } }) };
+      const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'owner-a' },
+        graphDeps: { root, capabilityProviders: registry }, requestConfirmation: async () => true });
+      const response = await bridge.dispatchPluginTool('app_build', { ask: 'Build a ticketing app',
+        seedRequested: false, appSlug: 'ticketing', artifactMetadata: {
+          runtime: { startCommand: ['bun', 'backend/entry.ts'], healthPath: '/health' } } });
+      expect(response).toMatchObject({ ok: true, result: { status: 'failed' } });
+      expect(actions[0]).toBe('approval-start');
+      expect(publishes).toBe(0);
+      if (!response.ok) throw new Error(response.error);
+      const state = response.result as { path: string[] };
+      expect(state.path).toContain('publish-approval');
+      expect(state.path).not.toContain('publish');
+    } finally {
+      server.stop();
+      resetElanousConfigDir();
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('actual verified graph route sends the same bounded progress to display and supervisor input', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'child-graph-progress-'));
+  const previous = process.env.ELANOUS_STATE_DIR;
+  const displayed: GraphProgressObservation[] = [];
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'member-p5' },
+      graphDeps: { root }, observeGraphProgress: event => displayed.push(event) });
+    const response = await bridge.dispatchPluginTool('scrap_add', { kind: 'text', text: 'P5 fixture' });
+    expect(response.ok).toBe(true);
+    if (!response.ok) throw new Error(response.error);
+    const result = response.result as { graphId: string; runId: string;
+      graphObservation: { graphId: string; runId: string; events: GraphProgressObservation[] } };
+    expect(displayed.some(item => item.kind === 'started')).toBe(true);
+    expect(displayed.some(item => item.kind === 'completed')).toBe(true);
+    expect(result.graphObservation.events).toEqual(displayed);
+    expect(result.graphObservation).toMatchObject({ graphId: result.graphId, runId: result.runId });
+    expect(JSON.stringify(result.graphObservation)).not.toContain('member-p5');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('default child route supplies the declared document provider and verified owner to the actual graph', async () => {
   const root = mkdtempSync(join(tmpdir(), 'child-graph-deps-'));

@@ -6,7 +6,8 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 
 import { debug } from '../src/debug/log.js';
-import { startNexusHttpServer } from '../src/nexus/api/http-server.js';
+import { routeRequest, startNexusHttpServer } from '../src/nexus/api/http-server.js';
+import { createDevProxyRuntimeRef } from '../src/nexus/api/admin-dev-proxy.js';
 import { NexusEventBus } from '../src/nexus/api/event-bus.js';
 import { PUBLIC_ROUTES, isPublicRoute } from '../src/nexus/api/public-routes.js';
 import { createNexusState } from '../src/nexus/state/state.js';
@@ -113,11 +114,13 @@ describe('nexus /v1 default-deny', () => {
       if (route.selfVerified) {
         // The handler answers 401 itself without its own token — so the status
         // cannot tell gate from handler. The gate's own observation must stay silent.
+        const probePath = route.match === 'grant-id' || route.match === 'approval-id'
+          ? `${route.path}11111111-1111-4111-8111-111111111111${route.suffix ?? ''}` : route.path;
         const logSpy = spyOn(debug, 'log');
         try {
-          await statusOf(server, route.path, { method: route.method });
+          await statusOf(server, probePath, { method: route.method });
           const denied = logSpy.mock.calls.some(([cat, event, data]) =>
-            cat === 'nexus.auth' && event === 'default-deny' && (data as { pathname?: string } | undefined)?.pathname === route.path);
+            cat === 'nexus.auth' && event === 'default-deny' && (data as { pathname?: string } | undefined)?.pathname === probePath);
           expect(denied).toBe(false);
         } finally {
           logSpy.mockRestore();
@@ -200,4 +203,44 @@ describe('nexus /v1 default-deny', () => {
     expect(isPublicRoute('GET', '/v1/members/owner', { setupMode: false })).toBe(true);
     expect(isPublicRoute('POST', '/v1/members/owner', { setupMode: false })).toBe(false);
   });
+});
+
+test('deployment approval URLs use official HTTPS only after trusted TLS edge proof', async () => {
+  const id = '11111111-1111-4111-8111-111111111111';
+  const paths = [
+    ['POST', '/v1/members/deployment-approvals/intents'],
+    ['POST', `/v1/members/deployment-approvals/intents/${id}/poll`],
+    ['GET', `/v1/members/deployment-approvals/${id}`],
+    ['POST', `/v1/members/deployment-approvals/${id}/approve`],
+  ] as const;
+  const secret = 's'.repeat(40);
+  const observed: string[] = [];
+  const observedBodies: string[] = [];
+  const membersApi = { handle: async (request: Request) => {
+    observed.push(request.url);
+    observedBodies.push(await request.text());
+    return new Response(null, { status: 204 });
+  } };
+  const run = async (method: string, path: string, peer: string, offeredSecret: string,
+    edgeOrigin = 'https://api.elanous.ai') => {
+    const request = new Request(`http://127.0.0.1:31415${path}`, { method, headers: {
+      'x-forwarded-proto': 'https', 'x-forwarded-host': 'api.elanous.ai',
+      'x-elanous-tls-edge-secret': offeredSecret, 'sec-fetch-site': 'cross-site',
+    }, ...(method === 'POST' ? { body: 'payload=preserved' } : {}) });
+    const response = await routeRequest(request, { ...serverFixture(), membersApi,
+      trustedTlsEdge: { origin: edgeOrigin, secret } } as never,
+    { requestIP: () => ({ address: peer }) } as never, null, createDevProxyRuntimeRef());
+    expect(response?.status).toBe(204);
+    expect(observedBodies.pop()).toBe(method === 'POST' ? 'payload=preserved' : '');
+    return observed.pop();
+  };
+  for (const [method, path] of paths) {
+    expect(await run(method, path, '127.0.0.1', secret)).toBe(`https://api.elanous.ai${path}`);
+    expect(await run(method, path, '127.0.0.1', 'wrong')).toBe(`http://127.0.0.1:31415${path}`);
+    expect(await run(method, path, '203.0.113.8', secret)).toBe(`http://127.0.0.1:31415${path}`);
+    expect(await run(method, path, '127.0.0.1', secret, 'https://else.example'))
+      .toBe(`http://127.0.0.1:31415${path}`);
+  }
+  expect(await run('GET', '/v1/members/owner', '127.0.0.1', secret))
+    .toBe('http://127.0.0.1:31415/v1/members/owner');
 });

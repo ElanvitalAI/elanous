@@ -22,6 +22,8 @@ export interface GcpObserveOptions {
   listInstances?: (projectId: string) => Promise<unknown>;
   /** Isolated artifact root for tests; operating runs use the state root. */
   artifactRoot?: () => string;
+  /** Isolated external renderer for graph route tests; operating runs use the verified deliverables graph. */
+  renderDeliverables?: typeof runArchitectureDeliverables;
 }
 const projectId = /^[a-z][a-z0-9-]{4,61}[a-z0-9]$/;
 const observeContract = 'cloud-resource.observe@1';
@@ -67,7 +69,8 @@ function structuredRequirementsDesign(spec: Record<string, unknown>): Record<str
   };
 }
 
-async function deliverRequirementsDesign(context: InProcessHandlerContext, artifactRoot: () => string): Promise<InProcessHandlerResult> {
+async function deliverRequirementsDesign(context: InProcessHandlerContext, artifactRoot: () => string,
+  renderDeliverables: typeof runArchitectureDeliverables): Promise<InProcessHandlerResult> {
   const observed = context.outputs.detect as { result?: { connection?: unknown } } | undefined;
   if (observed?.result?.connection !== 'none')
     return { ok: false, outcome: 'failed', error: 'no-connection deliverables require absent connection' };
@@ -82,7 +85,7 @@ async function deliverRequirementsDesign(context: InProcessHandlerContext, artif
     const structuredDesignPath = join(work, 'requirements-design.json');
     writeFileSync(structuredDesignPath, JSON.stringify(structuredRequirementsDesign(spec as Record<string, unknown>)));
     const outDir = join(work, 'deliverables');
-    const delivered = await runArchitectureDeliverables({
+    const delivered = await renderDeliverables({
       pluginRoot: resolve(import.meta.dir, '../../../plugins/architecture-deliverables'),
       structuredDesignPath, outDir, resourceRoot: resolve(import.meta.dir, '../../..'), stateRoot: join(work, 'graph-state'),
     });
@@ -161,7 +164,8 @@ export function createGcpResourceObserveRegistry(options: GcpObserveOptions = {}
     id: 'gcp-resource-observe', provides: [observeContract, designContract, deliverablesContract], tier: 'free',
     invoke: async context => {
       if (context.requires === designContract) return designFromRequirements(context);
-      if (context.requires === deliverablesContract) return deliverRequirementsDesign(context, options.artifactRoot ?? elanousStateRoot);
+      if (context.requires === deliverablesContract) return deliverRequirementsDesign(context,
+        options.artifactRoot ?? elanousStateRoot, options.renderDeliverables ?? runArchitectureDeliverables);
       if (context.requires !== observeContract) return { ok: false, outcome: 'failed', error: 'unsupported contract' };
       const connection = (options.connection ?? configuredConnection)();
       if (!connection) return { ok: true, outcome: 'no-connection', result: {

@@ -1,10 +1,14 @@
 import { afterEach, expect, test } from 'bun:test';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, realpathSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, readdirSync, renameSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { loadNexusAppHost } from './app-host.js';
-import { createDynamicAppPublisher, createDynamicAppPublishRoute, createDynamicAppDeployHook, verifiedDynamicOwner } from './dynamic-app-publish.js';
+import { createAppDeploymentGrantProvider } from './app-build-run-authority.js';
+import type { DeploymentApprovalProvider } from './app-deployment-approval-intent.js';
+import { createDynamicAppPublisher, createDynamicAppPublishRoute, createDynamicAppDeployHook,
+  DeploymentGrantAuthorizationError, verifiedDynamicOwner,
+  type DeploymentGrantBinding, type DeploymentGrantProvider } from './dynamic-app-publish.js';
 import { buildSharedAppTools } from '../../agent/shared-app-tools.js';
 import { getToolLoopPhaseRejectedCalls } from '../../llm.js';
 
@@ -28,21 +32,140 @@ test('owner endpoint memberId binds to the current member-store handle', () => {
   expect(verifiedDynamicOwner({ memberId: 'member-a' }, store)).toBeNull();
 });
 async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expiresInMs?: number;
-  authorizationPollMsForTesting?: number; denyArtifact?: boolean; missingSourceHead?: boolean } = {}) {
+  authorizationPollMsForTesting?: number; denyArtifact?: boolean; missingSourceHead?: boolean;
+  withoutGrantProvider?: boolean; wrongGrantOwner?: boolean; failIssueOnce?: boolean;
+  tamperSealBeforeActivation?: boolean; failRevoke?: boolean; denyRevoke?: boolean;
+  failServiceStopAfterStop?: boolean; failServiceStopOnceBeforeStop?: boolean; failUnregisterOnce?: boolean;
+  providerRevokeStatus?: 403 | 429; approvalFlow?: boolean; approvedExpiryShorterMs?: number;
+  noncanonicalExpiry?: boolean } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'dynamic-publish-')));
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   for (const name of ['apps', 'sources', 'seals', 'runtime']) mkdirSync(join(root, name), { mode: 0o700 });
   const { appHost } = loadNexusAppHost(join(root, 'apps'), undefined,
     { key: randomBytes(32).toString('hex'), dir: join(root, 'sessions') });
+  let unregisterAttempts = 0;
+  if (options.failUnregisterOnce && appHost.unregisterDynamicService) {
+    const unregister = appHost.unregisterDynamicService.bind(appHost);
+    appHost.unregisterDynamicService = (...args) => {
+      unregisterAttempts++;
+      if (unregisterAttempts === 1) throw new Error('synthetic unregister refused');
+      return unregister(...args);
+    };
+  }
+  let serviceStopAttempts = 0;
+  let capturedServingAuthorization: (() => boolean | Promise<boolean>) | undefined;
+  if (options.failServiceStopAfterStop || options.failServiceStopOnceBeforeStop) {
+    const register = appHost.registerDynamicService!.bind(appHost);
+    appHost.registerDynamicService = binding => {
+      capturedServingAuthorization = binding.stillAuthorized;
+      const stop = binding.service.stop;
+      (binding.service as { stop: () => Promise<void> }).stop = async () => {
+        serviceStopAttempts++;
+        if (options.failServiceStopOnceBeforeStop && serviceStopAttempts === 1)
+          throw new Error('synthetic service stop refused before stop');
+        await stop();
+        if (options.failServiceStopAfterStop) throw new Error('synthetic service stop rejection');
+      };
+      register(binding);
+    };
+  }
   cleanup.push(() => appHost.close());
+  const grants = new Map<string, DeploymentGrantBinding>();
+  let grantCheckFails = false;
+  let heldGrantCheck: { entered: () => void; released: Promise<void> } | undefined;
+  let revokeFails = !!options.failRevoke;
+  let failIssue = !!options.failIssueOnce;
+  const issuedIds: string[] = [];
+  const issuedInputs: Array<Omit<DeploymentGrantBinding, 'grantId' | 'grantVersion'>> = [];
+  const issuedRevocations: string[] = [];
+  let relayKeyId: string | undefined = options.approvalFlow
+    ? '14bcb6e5-1338-4253-a746-e520595d5604' : 'synthetic-relay-key';
+  let browserApproved = false;
+  let approvalStarts = 0;
+  const approvalProvider: DeploymentApprovalProvider = {
+    start: async () => {
+      const approvalId = ++approvalStarts === 1
+        ? '8f195ad4-a4e2-4b31-a7bc-155602760279'
+        : '7a02f763-b20d-471a-a34c-37b62ec48692';
+      return { approvalId,
+      approvalUrl: 'https://api.elanous.ai/v1/members/deployment-approvals/' + approvalId,
+      pendingExpiresAt: new Date(Date.now() + 5 * 60_000).toISOString() };
+    },
+    poll: async binding => browserApproved
+      ? { status: 'approved', expiresAt: new Date(Date.parse(binding.expiresAt)
+        - (options.approvedExpiryShorterMs ?? 0)).toISOString() } : { status: 'pending' },
+  };
+  const deploymentGrants: DeploymentGrantProvider = {
+    issue: async input => {
+      issuedIds.push(input.deploymentId);
+      issuedInputs.push(input);
+      if (failIssue) { failIssue = false; throw new Error('synthetic issue timeout'); }
+      const grant: DeploymentGrantBinding = { ...input,
+        ownerId: options.wrongGrantOwner ? 'foreign-owner' : input.ownerId,
+        grantId: 'grant-' + randomBytes(12).toString('hex'),
+        grantVersion: 1, expiresAt: new Date(Math.min(Date.parse(input.expiresAt)
+          - (options.approvedExpiryShorterMs ?? 0), Date.now() + 24 * 60 * 60 * 1_000)).toISOString() };
+      grants.set(grant.grantId, grant);
+      return grant;
+    },
+    introspect: async grantId => {
+      const held = heldGrantCheck;
+      if (held) { heldGrantCheck = undefined; held.entered(); await held.released; }
+      return grantCheckFails ? null : grants.get(grantId) ?? null;
+    },
+    revoke: async (grantId, owner) => {
+      if (options.denyRevoke) throw new DeploymentGrantAuthorizationError();
+      if (revokeFails) throw new Error('synthetic revoke unavailable');
+      const grant = grants.get(grantId);
+      if (!grant || grant.ownerId !== owner.memberId) throw new Error('grant revoke refused');
+      grants.delete(grantId);
+    },
+    revokeIssued: async (grantId, _owner, _appSlug) => {
+      issuedRevocations.push(grantId);
+      grants.delete(grantId);
+    },
+  };
+  const credentials = new Map<string, string>();
+  const providerForPublisher = options.providerRevokeStatus === undefined ? deploymentGrants
+    : createAppDeploymentGrantProvider({ root: join(root, 'grants'),
+      getSession: () => ({ nexusUrl: 'https://api.elanous.ai', appSlug: 'demo-app', sessionToken: 'aps_synthetic_first' }),
+      fetcher: (async (url: string | URL | Request, init?: RequestInit) => {
+        const target = String(url);
+        if (init?.method === 'DELETE') return Response.json({ error: 'revoke-not-confirmed' },
+          { status: options.providerRevokeStatus });
+        if (target.endsWith('/introspect')) {
+          const credential = new Headers(init?.headers).get('authorization')?.slice('Bearer '.length) ?? '';
+          const id = credentials.get(credential);
+          const grant = id && grants.get(id);
+          if (!grant) return Response.json({ error: 'unknown' }, { status: 401 });
+          const { ownerId, ...publicGrant } = grant;
+          return Response.json({ ...publicGrant, memberId: ownerId });
+        }
+        const input = JSON.parse(String(init?.body)) as Omit<DeploymentGrantBinding, 'grantId' | 'grantVersion'>;
+        const grant: DeploymentGrantBinding = { ...input, ownerId: 'member-a',
+          grantId: 'grant-' + randomBytes(12).toString('hex'),
+          grantVersion: 1 };
+        const credential = 'dpg_' + randomBytes(32).toString('base64url');
+        grants.set(grant.grantId, grant); credentials.set(credential, grant.grantId);
+        const { ownerId, ...publicGrant } = grant;
+        return Response.json({ ...publicGrant, memberId: ownerId, credential }, { status: 201 });
+      }) as typeof fetch });
+  const expiry = new Date(Date.now() + (options.expired ? -60_000 : options.expiresInMs ?? 60_000)).toISOString();
   const publisher = createDynamicAppPublisher({ sourceRoot: join(root, 'sources'), sealRoot: join(root, 'seals'),
     runtimeRoot: join(root, 'runtime'), appHost, testMemberId: 'member-a', testHandle: 'test-slot',
-    testApprovalExpiresAt: new Date(Date.now() + (options.expired ? -60_000 : options.expiresInMs ?? 60_000)).toISOString(),
+    testApprovalExpiresAt: options.noncanonicalExpiry ? expiry.replace(/\.\d{3}Z$/u, 'Z') : expiry,
     authorizationPollMsForTesting: options.authorizationPollMsForTesting,
     issuerSourceHead: options.missingSourceHead ? undefined : 'a'.repeat(40),
+    relayKeyId: () => relayKeyId,
+    ...(options.approvalFlow ? { deploymentApprovals: approvalProvider } : {}),
+    ...(options.withoutGrantProvider ? {} : { deploymentGrants: providerForPublisher }),
     approveArtifact: () => !options.denyArtifact,
     verifyPublic: async url => {
       const response = await appHost.handle(new Request(url, { headers: { host: new URL(url).host } }));
+      if (options.tamperSealBeforeActivation) {
+        const seal = readdirSync(join(root, 'seals')).find(name => name.startsWith('source-'))!;
+        writeFileSync(join(root, 'seals', seal, 'ARCHITECTURE.md'), '# changed after public verification\n');
+      }
       return { status: response?.status ?? 404, marker: options.wrongMarker ? '0'.repeat(48)
         : response?.headers.get('x-elanous-dynamic-route') ?? null };
     } });
@@ -74,8 +197,129 @@ async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expi
       executed: false, published: false };
     writeFileSync(join(sourceRoot, 'source-artifact.json'), JSON.stringify(receipt), { mode: 0o600 });
   };
-  return { root, appHost, publisher, route, call, writeSource, revoke: () => { active = false; } };
+  return { root, appHost, publisher, route, call, writeSource,
+    grantCount: () => grants.size,
+    serviceStopAttempts: () => serviceStopAttempts,
+    checkServingAuthorization: async () => !!await capturedServingAuthorization?.(),
+    unregisterAttempts: () => unregisterAttempts,
+    holdNextGrantCheck: () => {
+      let entered!: () => void;
+      let release!: () => void;
+      const enteredPromise = new Promise<void>(resolve => { entered = resolve; });
+      const released = new Promise<void>(resolve => { release = resolve; });
+      heldGrantCheck = { entered, released };
+      return { entered: enteredPromise, release };
+    },
+    setRevokeFails: (value: boolean) => { revokeFails = value; },
+    issuedIds,
+    issuedInputs,
+    approveInBrowser: () => { browserApproved = true; },
+    issuedRevocations,
+    revoke: () => { active = false; },
+    revokeGrant: () => { grants.clear(); },
+    setRelayKeyId: (value: string | undefined) => { relayKeyId = value; },
+    failGrantCheck: () => { grantCheckFails = true; },
+    tamperGrant: (change: Partial<DeploymentGrantBinding>) => {
+      for (const [id, grant] of grants) grants.set(id, { ...grant, ...change });
+    },
+  };
 }
+
+test('native approval start pins deployment and browser-confirmed poll alone opens publish', async () => {
+  const f = await fixture({ approvalFlow: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(400);
+  const started = await f.call('approval-start');
+  expect(started).toMatchObject({ status: 200, body: {
+    status: 'approval-pending', approvalUrl: 'https://api.elanous.ai/v1/members/deployment-approvals/'
+      + '8f195ad4-a4e2-4b31-a7bc-155602760279' } });
+  expect((await f.call('approval-poll')).body.status).toBe('approval-pending');
+  expect((await f.call('publish')).status).toBe(400);
+  f.approveInBrowser();
+  expect((await f.call('approval-poll')).body.status).toBe('approval-approved');
+  const published = await f.call('publish');
+  expect(published.body.status).toBe('published');
+  expect(f.issuedIds).toEqual([String(published.body.deploymentId)]);
+  const intent = readdirSync(join(f.root, 'seals', '.deployment-state'))
+    .find(name => name.startsWith('intent-') && name.endsWith('.json'))!;
+  const pinned = JSON.parse(readFileSync(join(f.root, 'seals', '.deployment-state', intent), 'utf8'));
+  expect(pinned.deploymentId).toBe(published.body.deploymentId);
+  expect(pinned.approvalId).toBe('8f195ad4-a4e2-4b31-a7bc-155602760279');
+  expect(pinned).not.toHaveProperty('memberId');
+});
+
+test('an expired pending intent requires a fresh owner start and new deployment identity', async () => {
+  const f = await fixture({ approvalFlow: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('approval-start')).status).toBe(200);
+  const stateRoot = join(f.root, 'seals', '.deployment-state');
+  const intent = readdirSync(stateRoot).find(name => name.startsWith('intent-') && name.endsWith('.json'))!;
+  const old = JSON.parse(readFileSync(join(stateRoot, intent), 'utf8'));
+  expect((await f.call('approval-start')).body.approvalUrl).toBe(
+    'https://api.elanous.ai/v1/members/deployment-approvals/8f195ad4-a4e2-4b31-a7bc-155602760279');
+  writeFileSync(join(stateRoot, intent), JSON.stringify({ ...old,
+    pendingExpiresAt: new Date(Date.now() - 1).toISOString() }), { mode: 0o600 });
+  const renewed = await f.call('approval-start');
+  expect(renewed).toMatchObject({ status: 200, body: { status: 'approval-pending',
+    approvalUrl: 'https://api.elanous.ai/v1/members/deployment-approvals/'
+      + '7a02f763-b20d-471a-a34c-37b62ec48692' } });
+  const next = JSON.parse(readFileSync(join(stateRoot, intent), 'utf8'));
+  expect(next.deploymentId).not.toBe(old.deploymentId);
+  expect(readdirSync(stateRoot)).toContain(intent + '.retired-' + old.deploymentId);
+  expect(f.issuedIds).toHaveLength(0);
+});
+
+test('changed relay binding cannot reuse pending approval but can retire it after pending expiry', async () => {
+  const f = await fixture({ approvalFlow: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('approval-start')).status).toBe(200);
+  const stateRoot = join(f.root, 'seals', '.deployment-state');
+  const intent = readdirSync(stateRoot).find(name => name.startsWith('intent-') && name.endsWith('.json'))!;
+  const old = JSON.parse(readFileSync(join(stateRoot, intent), 'utf8'));
+  f.setRelayKeyId('451cd16a-30d1-45ba-8496-d58e9215c29e');
+  expect((await f.call('approval-start')).status).toBe(400);
+  writeFileSync(join(stateRoot, intent), JSON.stringify({ ...old,
+    pendingExpiresAt: new Date(Date.now() - 1).toISOString() }), { mode: 0o600 });
+  expect((await f.call('approval-start')).status).toBe(200);
+  const next = JSON.parse(readFileSync(join(stateRoot, intent), 'utf8'));
+  expect(next.relayKeyId).toBe('451cd16a-30d1-45ba-8496-d58e9215c29e');
+  expect(next.deploymentId).not.toBe(old.deploymentId);
+  expect(f.issuedIds).toHaveLength(0);
+});
+
+test('grant issue preserves the pending requested expiry while enforcing shorter browser approval expiry', async () => {
+  const f = await fixture({ approvalFlow: true, approvedExpiryShorterMs: 30_000 });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('approval-start')).status).toBe(200);
+  const intent = readdirSync(join(f.root, 'seals', '.deployment-state'))
+    .find(name => name.startsWith('intent-') && name.endsWith('.json'))!;
+  const pending = JSON.parse(readFileSync(join(f.root, 'seals', '.deployment-state', intent), 'utf8'));
+  f.approveInBrowser();
+  expect((await f.call('approval-poll')).body.status).toBe('approval-approved');
+  expect((await f.call('publish')).body.status).toBe('published');
+  expect(f.issuedInputs).toHaveLength(1);
+  expect(f.issuedInputs[0]!.expiresAt).toBe(pending.expiresAt);
+  expect(f.issuedInputs[0]!.approvalId).toBe(pending.approvalId);
+});
+
+test('noncanonical requested expiry bytes stay pinned through approval and grant issue', async () => {
+  const f = await fixture({ approvalFlow: true, noncanonicalExpiry: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('approval-start')).status).toBe(200);
+  const stateRoot = join(f.root, 'seals', '.deployment-state');
+  const intent = readdirSync(stateRoot).find(name => name.startsWith('intent-') && name.endsWith('.json'))!;
+  const pinned = JSON.parse(readFileSync(join(stateRoot, intent), 'utf8'));
+  expect(pinned.expiresAt).toMatch(/T\d\d:\d\d:\d\dZ$/u);
+  f.approveInBrowser();
+  expect((await f.call('approval-poll')).body.status).toBe('approval-approved');
+  expect((await f.call('publish')).body.status).toBe('published');
+  expect(f.issuedInputs[0]!.expiresAt).toBe(pinned.expiresAt);
+});
 
 test('actual reserve route -> source receipt -> service -> public host -> scoped undo', async () => {
   const f = await fixture();
@@ -106,6 +350,213 @@ test('actual reserve route -> source receipt -> service -> public host -> scoped
   expect((await f.call('undo', 'run-a', published.body.deploymentId as string)).status).toBe(200);
   expect((await f.call('undo', 'run-a', published.body.deploymentId as string)).status).toBe(400);
   expect((await fetchHost('demo-app--test-slot.elanous.app', '/'))?.status).toBe(404);
+  const records = readdirSync(join(f.root, 'seals', '.deployment-state'));
+  expect(records).toContain('active-' + published.body.deploymentId + '.json.retired');
+  const next = await f.call('publish');
+  expect(next.status).toBe(200);
+  expect(next.body.deploymentId).not.toBe(published.body.deploymentId);
+  expect((await f.call('undo', 'run-a', next.body.deploymentId as string)).status).toBe(200);
+});
+
+test('private intent retains one deployment identity across a failed issue retry; activation follows public verification', async () => {
+  const f = await fixture({ failIssueOnce: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(400);
+  const stateRoot = join(f.root, 'seals', '.deployment-state');
+  const intentName = readdirSync(stateRoot).find(name => name.startsWith('intent-'))!;
+  const intent = JSON.parse(readFileSync(join(stateRoot, intentName), 'utf8'));
+  expect(intent.deploymentId).toMatch(/^dyn-[0-9a-f-]+$/);
+  expect(readdirSync(stateRoot).filter(name => name.startsWith('active-'))).toEqual([]);
+  const published = await f.call('publish');
+  expect(published.status).toBe(200);
+  expect(published.body.deploymentId).toBe(intent.deploymentId);
+  expect(f.issuedIds).toEqual([intent.deploymentId, intent.deploymentId]);
+  const activeName = 'active-' + intent.deploymentId + '.json';
+  const active = JSON.parse(readFileSync(join(stateRoot, activeName), 'utf8'));
+  expect(active).toMatchObject({ deploymentId: intent.deploymentId, ownerId: 'member-a',
+    appSlug: 'demo-app', runId: 'run-a', artifactDigest: intent.artifactDigest });
+  expect(readFileSync(join(stateRoot, activeName), 'utf8')).not.toContain('dpg_');
+});
+
+test('undo reports incomplete retirement when server and local proofs both fail', async () => {
+  const f = await fixture({ failRevoke: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  expect(published.status).toBe(200);
+  rmSync(join(f.root, 'seals', '.deployment-state'), { recursive: true });
+  expect(await f.call('undo', 'run-a', published.body.deploymentId as string)).toMatchObject({
+    status: 409, body: { status: 'retirement-incomplete', stopped: true, durableRetirement: false },
+  });
+  expect(f.grantCount()).toBe(1);
+  expect((await f.call('undo', 'run-a', published.body.deploymentId as string, 'aps_synthetic_b')).status).toBe(400);
+  f.setRevokeFails(false);
+  expect(await f.call('undo', 'run-a', published.body.deploymentId as string)).toMatchObject({
+    status: 200, body: { status: 'undone', stopped: true, durableRetirement: true, proof: 'server' },
+  });
+  expect(f.grantCount()).toBe(0);
+  expect((await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+    headers: { host: 'demo-app--test-slot.elanous.app' },
+  })))?.status).toBe(404);
+});
+
+test('undo accepts a durable local tombstone when server revocation is unavailable', async () => {
+  const f = await fixture({ failRevoke: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  expect(await f.call('undo', 'run-a', published.body.deploymentId as string)).toMatchObject({
+    status: 200, body: { status: 'undone', stopped: true,
+      durableRetirement: true, proof: 'local-tombstone' },
+  });
+  expect(f.grantCount()).toBe(1);
+});
+
+test('incomplete undo retries local retirement after its private state directory returns', async () => {
+  const f = await fixture({ failRevoke: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  const stateRoot = join(f.root, 'seals', '.deployment-state');
+  renameSync(stateRoot, stateRoot + '.offline');
+  expect(await f.call('undo', 'run-a', published.body.deploymentId as string)).toMatchObject({
+    status: 409, body: { status: 'retirement-incomplete', durableRetirement: false },
+  });
+  renameSync(stateRoot + '.offline', stateRoot);
+  expect(await f.call('undo', 'run-a', published.body.deploymentId as string)).toMatchObject({
+    status: 200, body: { status: 'undone', durableRetirement: true, proof: 'local-tombstone' },
+  });
+  expect(f.grantCount()).toBe(1);
+});
+
+test('retirement retry must confirm service stop after an earlier stop failure', async () => {
+  const f = await fixture({ failRevoke: true, failServiceStopOnceBeforeStop: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  const deploymentId = published.body.deploymentId as string;
+  expect((await f.call('undo', 'run-a', deploymentId)).status).toBe(400);
+  expect(f.serviceStopAttempts()).toBe(1);
+  expect((await f.call('publish')).status).toBe(400);
+  expect(await f.call('undo', 'run-a', deploymentId)).toMatchObject({
+    status: 200, body: { status: 'undone', stopped: true,
+      durableRetirement: true, proof: 'local-tombstone' },
+  });
+  expect(f.serviceStopAttempts()).toBe(2);
+  expect((await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+    headers: { host: 'demo-app--test-slot.elanous.app' },
+  })))?.status).toBe(404);
+});
+
+test('failed route unregister and service stop cannot keep a public route serving', async () => {
+  const f = await fixture({ failRevoke: true, failServiceStopOnceBeforeStop: true,
+    failUnregisterOnce: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  const deploymentId = published.body.deploymentId as string;
+  expect((await f.call('undo', 'run-a', deploymentId)).status).toBe(400);
+  expect(f.unregisterAttempts()).toBe(1);
+  expect(f.serviceStopAttempts()).toBe(1);
+  const host = 'demo-app--test-slot.elanous.app';
+  expect((await f.appHost.handle(new Request('https://' + host + '/', { headers: { host } })))?.status)
+    .not.toBe(200);
+  expect((await f.call('publish')).status).toBe(400);
+  expect(await f.call('undo', 'run-a', deploymentId)).toMatchObject({
+    status: 200, body: { status: 'undone', stopped: true,
+      durableRetirement: true, proof: 'local-tombstone' },
+  });
+  expect(f.unregisterAttempts()).toBe(2);
+  expect(f.serviceStopAttempts()).toBe(2);
+});
+
+test('in-flight grant validation rechecks retirement after the server response', async () => {
+  const f = await fixture({ failRevoke: true, failServiceStopOnceBeforeStop: true,
+    failUnregisterOnce: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  const held = f.holdNextGrantCheck();
+  const serving = f.checkServingAuthorization();
+  await held.entered;
+  expect((await f.call('undo', 'run-a', published.body.deploymentId as string)).status).toBe(400);
+  held.release();
+  expect(await serving).toBe(false);
+  expect(f.serviceStopAttempts()).toBe(1);
+  expect(f.unregisterAttempts()).toBe(1);
+});
+
+test('undo accepts confirmed server revocation when the local retirement record is unavailable', async () => {
+  const f = await fixture();
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  rmSync(join(f.root, 'seals', '.deployment-state'), { recursive: true });
+  expect(await f.call('undo', 'run-a', published.body.deploymentId as string)).toMatchObject({
+    status: 200, body: { status: 'undone', stopped: true,
+      durableRetirement: true, proof: 'server' },
+  });
+  expect(f.grantCount()).toBe(0);
+});
+
+test('undo preserves authenticated server denial rather than converting local retirement into success', async () => {
+  const f = await fixture({ denyRevoke: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  expect((await f.call('undo', 'run-a', published.body.deploymentId as string)).status).toBe(400);
+  expect(f.grantCount()).toBe(1);
+});
+
+test('real HTTPS grant provider distinguishes retryable 429 from owner denial 403 during undo', async () => {
+  for (const status of [429, 403] as const) {
+    const f = await fixture({ providerRevokeStatus: status, approvalFlow: true });
+    const reserved = await f.call('reserve');
+    f.writeSource(reserved.body.sourceRoot as string);
+    expect((await f.call('approval-start')).status).toBe(200);
+    f.approveInBrowser();
+    expect((await f.call('approval-poll')).body.status).toBe('approval-approved');
+    const published = await f.call('publish');
+    expect(published.status).toBe(200);
+    const undone = await f.call('undo', 'run-a', published.body.deploymentId as string);
+    if (status === 429) expect(undone).toMatchObject({ status: 200,
+      body: { status: 'undone', durableRetirement: true, proof: 'local-tombstone' } });
+    else expect(undone.status).toBe(400);
+    expect(f.grantCount()).toBe(1);
+    expect((await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+      headers: { host: 'demo-app--test-slot.elanous.app' },
+    })))?.status).toBe(404);
+  }
+});
+
+test('sealed bytes changed during public verification cannot create an activated deployment', async () => {
+  const f = await fixture({ tamperSealBeforeActivation: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(400);
+  expect(f.grantCount()).toBe(0);
+  const records = readdirSync(join(f.root, 'seals', '.deployment-state'));
+  expect(records.some(name => name.startsWith('active-'))).toBe(false);
+  expect((await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+    headers: { host: 'demo-app--test-slot.elanous.app' },
+  })))?.status).toBe(404);
+});
+
+test('current local relay key rotation retires a live grant without resurrection', async () => {
+  const f = await fixture();
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(200);
+  const request = () => f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+    headers: { host: 'demo-app--test-slot.elanous.app' },
+  }));
+  expect((await request())?.status).toBe(200);
+  f.setRelayKeyId('rotated-relay-key');
+  expect((await request())?.status).toBe(503);
+  expect((await request())?.status).toBe(404);
+  f.setRelayKeyId('synthetic-relay-key');
+  expect((await request())?.status).toBe(404);
 });
 
 test('registered app_deploy waits for verification, then consumes a sealed generated app through the owner route', async () => {
@@ -199,7 +650,7 @@ test('prewrite attest refuses changed owner, run, root or expiry in private clai
   expect(readdirSync(join(f.root, 'runtime'))).toEqual([]);
 });
 
-test('revoked owner session stops serving an already registered public route', async () => {
+test('ordinary owner session change does not retire a server-authorized deployment', async () => {
   const f = await fixture();
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -207,7 +658,75 @@ test('revoked owner session stops serving an already registered public route', a
   f.revoke();
   const response = await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/',
     { headers: { host: 'demo-app--test-slot.elanous.app' } }));
-  expect(response?.status).toBe(503);
+  expect(response?.status).toBe(200);
+});
+
+test('build authority expiry does not retire a valid grant; failed online validation retires immediately', async () => {
+  const f = await fixture({ authorizationPollMsForTesting: 5_000 });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  let buildAuthorized = true;
+  const published = await f.publisher.publish({ memberId: 'member-a', userSlug: 'test-slot' },
+    'run-a', 'demo-app', new Request('http://localhost/'), () => buildAuthorized);
+  expect(published.status).toBe('published');
+  buildAuthorized = false;
+  const url = 'https://demo-app--test-slot.elanous.app/';
+  const request = () => f.appHost.handle(new Request(url, { headers: { host: new URL(url).host } }));
+  expect((await request())?.status).toBe(200);
+  f.failGrantCheck();
+  expect((await request())?.status).toBe(503);
+  expect((await request())?.status).toBe(404);
+  expect(readdirSync(join(f.root, 'runtime'))).toEqual([]);
+});
+
+test('missing or cross-bound deployment grant refuses before public route and service creation', async () => {
+  for (const options of [{ withoutGrantProvider: true }, { wrongGrantOwner: true }]) {
+    const f = await fixture(options);
+    const reserved = await f.call('reserve');
+    f.writeSource(reserved.body.sourceRoot as string);
+    expect((await f.call('publish')).status).toBe(400);
+    if (options.wrongGrantOwner) {
+      expect(f.issuedRevocations).toHaveLength(1);
+      expect(f.grantCount()).toBe(0);
+    }
+    expect(readdirSync(join(f.root, 'runtime'))).toEqual([]);
+    expect((await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+      headers: { host: 'demo-app--test-slot.elanous.app' },
+    })))?.status).toBe(404);
+  }
+});
+
+test('failed service stop still attempts grant revoke and reports both cleanup failures', async () => {
+  const f = await fixture({ wrongMarker: true, failRevoke: true, failServiceStopAfterStop: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  let failure: unknown;
+  try {
+    await f.publisher.publish({ memberId: 'member-a', userSlug: 'test-slot' }, 'run-a', 'demo-app',
+      new Request('https://api.elanous.ai/v1/apps/demo-app/dynamic-deployment'), () => true);
+  } catch (error) { failure = error; }
+  expect(failure).toBeInstanceOf(AggregateError);
+  const messages = (failure as AggregateError).errors.map((error: Error) => error.message);
+  expect(messages).toContain('synthetic service stop rejection');
+  expect(messages).toContain('synthetic revoke unavailable');
+  expect(f.grantCount()).toBe(1);
+  expect((await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+    headers: { host: 'demo-app--test-slot.elanous.app' },
+  })))?.status).toBe(404);
+  expect((await f.call('publish')).status).toBe(400);
+});
+
+test('artifact binding drift in server introspection stops only the live deployment', async () => {
+  const f = await fixture({ authorizationPollMsForTesting: 5_000 });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(200);
+  f.tamperGrant({ artifactDigest: '0'.repeat(64) });
+  const request = () => f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/', {
+    headers: { host: 'demo-app--test-slot.elanous.app' },
+  }));
+  expect((await request())?.status).toBe(503);
+  expect((await request())?.status).toBe(404);
 });
 
 test('expired approval permits authenticated cleanup without a publish grant', async () => {
@@ -221,14 +740,14 @@ test('expired approval permits authenticated cleanup without a publish grant', a
   expect(readdirSync(join(f.root, 'runtime'))).toEqual([]);
 });
 
-test('approval expiry and session revocation automatically stop service and free port', async () => {
+test('grant expiry and explicit revocation automatically stop service and free port', async () => {
   for (const revoked of [false, true]) {
     const f = await fixture({ expiresInMs: revoked ? 60_000 : 800, authorizationPollMsForTesting: 20 });
     const reserved = await f.call('reserve', revoked ? 'run-revoked' : 'run-expired');
     f.writeSource(reserved.body.sourceRoot as string);
     const published = await f.call('publish', revoked ? 'run-revoked' : 'run-expired');
     expect(published.status).toBe(200);
-    if (revoked) f.revoke();
+    if (revoked) f.revokeGrant();
     const deadline = Date.now() + 2_500;
     while (readdirSync(join(f.root, 'runtime')).length && Date.now() < deadline) await Bun.sleep(20);
     expect(readdirSync(join(f.root, 'runtime'))).toEqual([]);
@@ -250,6 +769,8 @@ test('expired test approval and wrong public marker cannot leave a live route or
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
   expect((await f.call('publish')).status).toBe(400);
+  expect(f.grantCount()).toBe(0);
+  expect(readdirSync(join(f.root, 'seals', '.deployment-state')).filter(name => name.startsWith('active-'))).toEqual([]);
   const response = await f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/',
     { headers: { host: 'demo-app--test-slot.elanous.app' } }));
   expect(response?.status).toBe(404);

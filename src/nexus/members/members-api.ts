@@ -23,6 +23,8 @@ import { nexusRootDir } from '../paths.js';
 import { sessionRoot } from '../../session/index.js';
 import { createMemberSessionService, MEMBER_SESSION_ID, MemberSessionAccessError, type MemberSessionService } from './member-sessions.js';
 import { createMemberCloudBackupRoute } from './member-cloud-backup-route.js';
+import { createDeploymentGrantRoute, type DeploymentGrantRouteOptions } from './deployment-grant-route.js';
+import { createDeploymentApprovalRoute, type DeploymentApprovalRouteOptions } from './deployment-approval-route.js';
 
 export const MEMBER_GOOGLE_CALLBACK_PATH = '/v1/members/oauth/google/callback';
 // Source: OP #16901, 2026-11-12 19:01 KST. Signup admission is separate from the 11/14 draw eligibility window.
@@ -100,6 +102,9 @@ export interface MembersApiOptions {
   readonly store: MemberStore;
   /** Injected only by the isolated member backup route tests; production uses the member store and Nexus state root. */
   readonly cloudBackupRoute?: ReturnType<typeof createMemberCloudBackupRoute>;
+  /** Server grant ledger and live authorization adapters; absent adapters refuse all grant operations. */
+  readonly deploymentGrants?: DeploymentGrantRouteOptions;
+  readonly deploymentApprovals?: DeploymentApprovalRouteOptions;
   readonly google: GoogleSignin;
   /** Fixed post-signup destination, never accepted from request data. */
   readonly successRedirectUri: string;
@@ -271,6 +276,8 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
   if ([...appAuthRedirectUris].some(uri => !validAppAuthRedirectUri(uri))) throw new Error('app auth redirects must be exact allowlisted elanous:// URIs');
   const now = options.now ?? Date.now;
   const cloudBackupRoute = options.cloudBackupRoute ?? createMemberCloudBackupRoute({ memberStore: options.store });
+  const deploymentGrantRoute = createDeploymentGrantRoute(options.deploymentGrants ?? {});
+  const deploymentApprovalRoute = createDeploymentApprovalRoute(options.deploymentApprovals ?? {});
   const tokens = createMemberTokenApi({ store: options.store, now });
   const connectEntry = createMemberConnectEntry({
     store: options.store, origin: callback.origin, now,
@@ -320,6 +327,10 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       const url = new URL(request.url);
       const path = url.pathname;
       if (!path.startsWith('/v1/members') && !path.startsWith('/v1/member/keys') && !path.startsWith('/v1/member/tokens')) return undefined;
+      const approvalResponse = await deploymentApprovalRoute.handle(request);
+      if (approvalResponse) return approvalResponse;
+      const grantResponse = await deploymentGrantRoute.handle(request);
+      if (grantResponse) return grantResponse;
       const connectResponse = await connectEntry.handle(request, normalizeMemberSignupNetworkKey(networkKey));
       if (connectResponse) return connectResponse;
       const origin = request.headers.get('origin');
@@ -844,7 +855,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
 }
 
 /** Builds the daemon's singleton member API only when its deployment URLs are explicitly configured. */
-export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'issueOwnerSession' | 'resolveVerifiedOwner' | 'resolveVerifiedMemberOwner' | 'publicAppUrl' | 'capabilityProviders' | 'runTryExample' | 'now'> & {
+export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'issueOwnerSession' | 'resolveVerifiedOwner' | 'resolveVerifiedMemberOwner' | 'publicAppUrl' | 'capabilityProviders' | 'runTryExample' | 'now' | 'deploymentGrants' | 'deploymentApprovals'> & {
   /** Isolated entrypoint tests supply a store and provider; production creates both. */
   store?: MemberStore;
   google?: GoogleSignin;
@@ -873,6 +884,8 @@ export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'iss
   const mobileVerifier = mobileClientIds.length > 0 ? createMobileGoogleIdTokenVerifier(mobileClientIds) : undefined;
   const appAuthRedirectUris = (process.env.MEMBER_APP_AUTH_REDIRECT_URIS ?? '').split(',').map(value => value.trim()).filter(Boolean);
   return createMembersApi({ store, google, successRedirectUri, webOrigin, getAppLifecycle,
+    ...(options.deploymentGrants ? { deploymentGrants: options.deploymentGrants } : {}),
+    ...(options.deploymentApprovals ? { deploymentApprovals: options.deploymentApprovals } : {}),
     kcbSuccessRedirectUri: process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI?.trim() || new URL('/app/board/', webOrigin).toString(),
     ...(options.now ? { now: options.now } : {}),
     getNewsletterCountToken: () => getSecretAsync('NEWSLETTER_COUNT_READ_TOKEN'),

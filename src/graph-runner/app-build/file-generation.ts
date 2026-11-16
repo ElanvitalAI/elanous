@@ -136,7 +136,16 @@ export async function generatePlannedFiles(input: Input, deps: Deps): Promise<Re
     for (let attempt = 1; attempt <= repairs + 1; attempt++) {
       if (taskSignal?.aborted) return rejected('CANCELLED', attempt - 1);
       const prompt = JSON.stringify({ instruction: 'Generate exactly this planned source file. Return only JSON {path,content}, no extra fields, questions, completion prose or placeholders. Do not execute anything.',
-        file: item, assumptions, architecture, seedRequested, dependencies, previousError: lastError || undefined });
+        file: item, assumptions, architecture, seedRequested, dependencies,
+        ...(seedRequested ? { seedRuntimeContract: item.role === 'database'
+          ? 'Export one DB_PATH constant from this database module. Resolve it under the trusted ELANOUS_APP_DATA_DIR when the host supplies that private writable directory, with an application-root fallback for local runs. The seed and startup backend must import this same constant; neither may define another default database path or rely on process cwd.'
+          : item.role === 'seed'
+          ? 'Export an idempotent initializer that inserts missing synthetic rows only and preserves user changes. Import DB_PATH from the database module and use its schema. Do not define a second path or rely on running this file as a standalone command.'
+          : item.role === 'backend'
+            ? 'If this is the declared runtime.startCommand entry, invoke the seed initializer during module or documented host startup before exporting a read handler. The host may import the exported fetch handler, so an import.meta.main-only seed is insufficient. Import DB_PATH from the database module and use the same connection configuration as the initializer; do not define a second default path.'
+            : item.role === 'test'
+              ? 'For the declared kind=seed test, execute the actual startup initialization path against a fresh database, assert the application list API returns at least one item, then restart or initialize again and assert no duplicates or overwritten user changes. Use an in-process handler when the sandbox cannot listen.'
+              : undefined } : {}), previousError: lastError || undefined });
       if (bytes(prompt) > maxContext) return rejected('CONTEXT_BUDGET', attempt - 1);
       let text: string;
       try { text = await modelReply(model, prompt, taskSignal); }

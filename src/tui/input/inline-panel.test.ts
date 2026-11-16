@@ -10,7 +10,7 @@ describe('formatInlinePanel', () => {
       hint: 'Enter 추가 · Esc 닫기',
     }, 5);
     expect(lines).toEqual([
-      '@ 파일 첨부 · ↑↓ 선택 · Enter 선택 · Esc 닫기',
+      '@ 파일 첨부 · ↑↓ select · Enter select · Esc close',
       '  file-6.ts',
       '  file-7.ts',
       '▸ file-8.ts',
@@ -20,8 +20,8 @@ describe('formatInlinePanel', () => {
 
   test('renders an empty candidate state without creating a popup', () => {
     expect(formatInlinePanel({ title: '/ 명령', rows: [], hint: '계속 입력' })).toEqual([
-      '/ 명령 · ↑↓ 선택 · Enter 선택 · Esc 닫기',
-      '  후보 없음',
+      '/ 명령 · ↑↓ select · Enter select · Esc close',
+      '  No candidates',
       '계속 입력',
     ]);
   });

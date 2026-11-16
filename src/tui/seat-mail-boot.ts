@@ -3,13 +3,15 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import type { MsgStore } from '../msg/msg-store.js';
+import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
+import type { NextTuiSelfHealthSnapshot } from './chat/self-health-status.js';
 
 export interface SeatMailSnapshot {
   seat: string;
   unread: number | null;
 }
 
-const SEAT_IN_PATH = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/;
+const SEAT_IN_PATH = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?=\/|$)/g;
 const SEAT_ID = /^[A-Z][A-Z0-9_-]{0,63}$/;
 
 /** A small, read-only snapshot for the next TUI's first frame. */
@@ -22,7 +24,10 @@ export function readSeatMailSnapshot(
   } = {},
 ): SeatMailSnapshot | null {
   const env = deps.env ?? process.env;
-  const seat = (SEAT_IN_PATH.exec(cwd)?.[1] ?? env.COORD_ID ?? '').trim().toUpperCase();
+  // A seat can run an isolated checkout whose path contains another seats/ segment.
+  // The innermost segment names the current seat, not the parent workspace.
+  const seatInPath = [...cwd.matchAll(SEAT_IN_PATH)].at(-1)?.[1];
+  const seat = (seatInPath ?? env.COORD_ID ?? '').trim().toUpperCase();
   if (!SEAT_ID.test(seat)) return null;
   const seatDir = join(deps.home ?? homedir(), 'elanous-hq', 'seat-state', seat);
   try {
@@ -56,4 +61,13 @@ export function readSeatMailSnapshot(
 
 export function seatMailLine(snapshot: SeatMailSnapshot | null): string | null {
   return snapshot ? `${snapshot.seat} · 우편 ${snapshot.unread ?? '확인 불가'}` : null;
+}
+
+/** Register the seat branch once at boot; each render projects live health and wake state. */
+export function createSeatMailHeaderHook(
+  cwd: string,
+  deps: Parameters<typeof readSeatMailSnapshot>[1] = {},
+): (health: NextTuiSelfHealthSnapshot | null, wakeup: Pick<NextTuiWakeup, 'headline'> | null) => string | null {
+  const mail = seatMailLine(readSeatMailSnapshot(cwd, deps));
+  return (health, wakeup) => mail && wakeup ? `${mail} · ${wakeup.headline(health)}` : mail;
 }

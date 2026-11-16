@@ -80,7 +80,10 @@ export default function SetupPage() {
 
   useEffect(() => {
     if (!mounted) return;
-    const local = ['127.0.0.1', 'localhost'].includes(window.location.hostname);
+    // SSH -L makes the browser URL look local even though localhost:1455 belongs to
+    // the browser host, not the Nexus host. The link marker only chooses a UI flow.
+    const remote = new URLSearchParams(window.location.search).get('remote') === '1';
+    const local = !remote && ['127.0.0.1', 'localhost'].includes(window.location.hostname);
     setCodexLocal(local);
     setCodexMode(local ? 'browser' : 'device');
   }, [mounted]);

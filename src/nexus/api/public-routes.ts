@@ -13,18 +13,33 @@
 //     returns success when the registered trigger has no `auth`, so an
 //     unauthenticated POST can still dispatch a workflow.
 
-export type PublicRouteMatch = 'exact' | 'prefix';
+export type PublicRouteMatch = 'exact' | 'prefix' | 'grant-id' | 'approval-id';
 
 export interface PublicRoute {
   method: string;
   match: PublicRouteMatch;
   path: string;
+  suffix?: '/poll' | '/approve';
   why: string;
   /** The handler verifies its own credential (not the nexus bearer) and may answer 401 itself. */
   selfVerified?: true;
 }
 
 export const PUBLIC_ROUTES: Array<PublicRoute> = [
+  { method: 'POST', match: 'exact', path: '/v1/members/deployment-approvals/intents', selfVerified: true,
+    why: 'approval intent requires a fresh verified app owner session and active binding' },
+  { method: 'POST', match: 'approval-id', path: '/v1/members/deployment-approvals/intents/', suffix: '/poll', selfVerified: true,
+    why: 'approval poll requires the same fresh app owner session and exact server record' },
+  { method: 'GET', match: 'approval-id', path: '/v1/members/deployment-approvals/', selfVerified: true,
+    why: 'approval page verifies a fresh same-owner member cookie without approving' },
+  { method: 'POST', match: 'approval-id', path: '/v1/members/deployment-approvals/', suffix: '/approve', selfVerified: true,
+    why: 'approval confirmation verifies the same-owner cookie, exact origin and server CSRF nonce' },
+  { method: 'POST', match: 'exact', path: '/v1/members/deployment-grants', selfVerified: true,
+    why: 'grant issue verifies a fresh app owner session and live member, approval and relay key binding' },
+  { method: 'POST', match: 'exact', path: '/v1/members/deployment-grants/introspect', selfVerified: true,
+    why: 'grant introspection verifies the private credential against the live server ledger and binding' },
+  { method: 'DELETE', match: 'grant-id', path: '/v1/members/deployment-grants/', selfVerified: true,
+    why: 'grant revocation verifies a fresh app owner session and the exact owned grant record' },
   { method: 'PUT', match: 'exact', path: '/v1/members/handle', selfVerified: true,
     why: 'handle registration verifies its own member web session or app owner session before claiming a name' },
   { method: 'POST', match: 'exact', path: '/v1/tokens', selfVerified: true,
@@ -261,6 +276,13 @@ export function isPublicRoute(
     if (route.path.startsWith('/v1/setup/') && route.path !== '/v1/setup/claim' && !route.selfVerified && !ctx.setupMode) continue;
     if (route.match === 'exact') {
       if (pathname === route.path) return true;
+    } else if (route.match === 'grant-id') {
+      if (pathname.startsWith(route.path)
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(pathname.slice(route.path.length))) return true;
+    } else if (route.match === 'approval-id') {
+      if (pathname.startsWith(route.path)
+        && new RegExp(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}${route.suffix ?? ''}$`)
+          .test(pathname.slice(route.path.length))) return true;
     } else if (pathname === route.path || pathname.startsWith(route.path)) {
       return true;
     }

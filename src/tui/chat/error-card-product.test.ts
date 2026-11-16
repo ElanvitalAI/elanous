@@ -20,7 +20,7 @@ test('trusted failed turn is a distinct card in the actual public history render
 test('ordinary assistant text cannot impersonate the trusted failure card', () => {
   const screen = logViewLines([{ role: 'assistant', content: '요청을 처리하지 못했습니다.',
     ts: '2026-11-15T00:00:01Z', replyFinal: true }], 80).join('\n');
-  expect(screen).toContain('  요청을 처리하지 못했습니다.');
+  expect(screen).toContain('엘라누스: 요청을 처리하지 못했습니다.');
   expect(screen).not.toContain('✘ 요청을 처리하지 못했습니다.');
 });
 

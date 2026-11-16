@@ -119,10 +119,17 @@ test('signup issues one private member key and rotation invalidates the old key'
     expect(first.key.startsWith('emk_')).toBe(true);
     expect(store.memberForGoogleSub('key-sub')).not.toHaveProperty('initialKey');
     expect(store.listMemberKeys(member.id)).toMatchObject([{ id: first.id, name: 'signup' }]);
+    expect(store.isActiveMemberKeyId(member.id, first.id)).toBe(true);
+    expect(store.isActiveMemberKeyId('other-owner', first.id)).toBe(false);
+    expect(store.isActiveMemberKeyId(member.id, 'not-a-uuid')).toBe(false);
+    expect(store.listMemberKeys(member.id)[0]?.lastUsedAt).toBeNull();
     expect(readFileSync(path).includes(first.key)).toBe(false);
     const rotated = store.rotateMemberKey(member.id, first.id);
+    expect(store.isActiveMemberKeyId(member.id, first.id)).toBe(false);
+    expect(store.isActiveMemberKeyId(member.id, rotated.id)).toBe(true);
     expect(store.listMemberKeys(member.id)).toMatchObject([{ id: rotated.id }]);
     expect(store.revokeMemberKey(member.id, rotated.id)).toBe(true);
+    expect(store.isActiveMemberKeyId(member.id, rotated.id)).toBe(false);
     expect(store.listMemberKeys(member.id)).toEqual([]);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

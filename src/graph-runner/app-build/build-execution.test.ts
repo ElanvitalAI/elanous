@@ -25,6 +25,7 @@ function setup(realSandbox = false) {
   const grant = { ownerId, userSlug, runId, appSlug, sourceRoot: join(parent, appSlug + '-' + 'b'.repeat(32)),
     issuerExpiresAt: '2099-01-01T00:00:00.000Z', sourceHead };
   let tamper: Record<string, unknown> = {};
+  let approvalStatus = 'approval-approved';
   const operations: string[] = []; const commands: Parameters<typeof runShell>[0][] = [];
   const fetcher = (async (url: URL | RequestInfo, options?: RequestInit) => {
     if (String(url).endsWith('/v1/members/owner')) return Response.json({ memberId: ownerId, userSlug });
@@ -36,6 +37,7 @@ function setup(realSandbox = false) {
     }
     if (body.action === 'attest') return Response.json({ ...grant, ...tamper });
     if (body.action === 'inspect') return Response.json({ status: 'inspected', artifactDigest: sha('synthetic-artifact') });
+    if (body.action === 'approval-poll') return Response.json({ status: approvalStatus });
     if (body.action === 'publish') return Response.json({ status: 'published', deploymentId: 'synthetic-deployment', publicUrl: 'https://synthetic-app--syntheticowner.elanous.app' });
     return Response.json({}, { status: 400 });
   }) as typeof fetch;
@@ -48,6 +50,7 @@ function setup(realSandbox = false) {
     ...(realSandbox ? {} : { shell, platform: 'darwin' as const,
       sandboxProfile: () => 'synthetic-profile-not-executed' }) };
   return { root, grant, operations, commands, options, host: createBuildExecution(options),
+    setApprovalStatus(status: string) { approvalStatus = status; },
     tamper(value: Record<string, unknown>) { tamper = value; } };
 }
 
@@ -64,7 +67,18 @@ test('C reservation is independently attested and registered app_create writes o
   expect(h.commands[0]?.command).toContain('synthetic-profile-not-executed');
   const published = await h.host.publish(grant);
   expect(published.status).toBe('published');
-  expect(h.operations.slice(-3)).toEqual(['attest', 'inspect', 'publish']);
+  expect(h.operations.slice(-4)).toEqual(['attest', 'inspect', 'approval-poll', 'publish']);
+});
+
+test('ordinary publish refuses pending or denied approval before a grant request', async () => {
+  for (const status of ['approval-pending', 'approval-denied']) {
+    const h = setup();
+    const grant = await h.host.reserve(h.grant.ownerId, h.grant.runId, h.grant.appSlug);
+    h.setApprovalStatus(status);
+    await expect(h.host.publish(grant)).rejects.toThrow('BUILD_AUTHORITY_REFUSED');
+    expect(h.operations).toContain('approval-poll');
+    expect(h.operations).not.toContain('publish');
+  }
 });
 
 test('altered issuer identity, expiry, source head or remote root cannot authorize a local write', async () => {

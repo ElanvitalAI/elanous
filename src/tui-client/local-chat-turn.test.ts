@@ -877,6 +877,137 @@ async function withStore<T>(run: (dir: string) => Promise<T>): Promise<T> {
 
 const COMPACT_DEPS = { config: { ...CHAT_DEFAULTS.autoCompact }, modelId: 'test-fake-llm' } as const;
 
+// A real JSONL pipe is required here: the claim is dispatch ordering and stream timing,
+// not model speed. The child and summary provider remain fake and network-free.
+test('empty first turns skip compaction preparation and measure only delivered text', async () => {
+  await withStore(async (dir) => {
+    const id = createSession({ source: 'tui' }).id;
+    const provider = fakeSummaryProvider();
+    const cli = join(dir, 'latency-cli.ts');
+    writeFileSync(cli, `
+      import { createInterface } from 'node:readline';
+      for await (const line of createInterface({ input: process.stdin })) {
+        const { id } = JSON.parse(line);
+        console.log(JSON.stringify({ event: 'delta', turnId: 'stale', text: 'stale', source: 'assistant-text' }));
+        console.log(JSON.stringify({ event: 'delta', turnId: id, text: '', source: 'assistant-text' }));
+        console.log(JSON.stringify({ event: 'delta', turnId: id, text: 'answer', source: 'assistant-text' }));
+        console.log(JSON.stringify({ event: 'result', turnId: id }));
+      }
+    `);
+    const log = spyOn(debug, 'log');
+    const seen: string[] = [];
+    try {
+      for (let turn = 0; turn < 2; turn++) {
+        await runLocalChatTurn(id, 'private question', new AbortController().signal, cli, undefined,
+          (delta) => seen.push(delta), { deps: { ...COMPACT_DEPS, provider } });
+      }
+      const receipts = log.mock.calls.filter((c) => c[0] === 'tui.next' && c[1] === 'turn-latency')
+        .map((c) => c[2] as {
+          compactReason: string; compactImportMs: number; compactMs: number;
+          firstAssistantTextMs: number; dispatchMs: number; totalMs: number;
+          outcome: string; reusedChild: boolean;
+        });
+      expect(receipts).toHaveLength(2);
+      expect(provider.calls).toBe(0);
+      expect(seen).toEqual(['', 'answer', '', 'answer']);
+      for (const receipt of receipts) {
+        expect(receipt.compactReason).toBe('empty-session');
+        expect(receipt.compactImportMs).toBe(0);
+        expect(receipt.compactMs).toBe(0);
+        expect(receipt.firstAssistantTextMs).toBeGreaterThanOrEqual(receipt.dispatchMs);
+        expect(receipt.totalMs).toBeGreaterThanOrEqual(receipt.firstAssistantTextMs);
+        expect(receipt.outcome).toBe('completed');
+        expect(JSON.stringify(receipt)).not.toContain('private question');
+      }
+      expect(receipts.map((r) => r.reusedChild)).toEqual([false, true]);
+    } finally {
+      log.mockRestore();
+      await closeLocalChatSession(id);
+    }
+  });
+});
+
+test('latency observation failures cannot turn a completed JSONL response into an error', async () => {
+  await withStore(async (dir) => {
+    const id = createSession({ source: 'tui' }).id;
+    const log = spyOn(debug, 'log').mockImplementation((...args) => {
+      if (args[0] === 'tui.next' && args[1] === 'turn-latency') throw new Error('observer unavailable');
+    });
+    try {
+      await expect(runLocalChatTurn(id, 'question', new AbortController().signal, storeCountingCli(dir),
+        undefined, undefined, { deps: COMPACT_DEPS })).resolves.toEqual({ goalComplete: false });
+      expect(log.mock.calls.some((c) => c[1] === 'turn-latency')).toBe(true);
+    } finally {
+      log.mockRestore();
+      await closeLocalChatSession(id);
+    }
+  });
+});
+
+test('cancellation after the route-decision import rejects and matches the terminal receipt', async () => {
+  await withStore(async (dir) => {
+    const id = createSession({ source: 'tui' }).id;
+    const abort = new AbortController();
+    // Inject cancellation at the resumed side of the actual dynamic-import boundary.
+    // This deterministically exercises the gap after the earlier result abort check,
+    // without sleeps or replacing module imports shared by other tests.
+    const log = spyOn(debug, 'log').mockImplementation((category, event) => {
+      if (category === 'llm.route-decision' && event === 'local-chat-executed') abort.abort();
+    });
+    try {
+      await expect(runLocalChatTurn(id, 'private question', abort.signal, storeCountingCli(dir),
+        undefined, undefined, { deps: COMPACT_DEPS })).rejects.toThrow('응답을 취소했습니다');
+      expect(abort.signal.aborted).toBe(true);
+      expect(log.mock.calls.filter((c) => c[0] === 'llm.route-decision'
+        && c[1] === 'local-chat-executed')).toHaveLength(1);
+      const receipts = log.mock.calls.filter((c) => c[0] === 'tui.next' && c[1] === 'turn-latency');
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]![2]).toMatchObject({ sessionId: id, outcome: 'cancelled' });
+    } finally {
+      log.mockRestore();
+      await closeLocalChatSession(id);
+    }
+  });
+});
+
+for (const failure of ['compact-prepare', 'compact-cancel', 'child-create'] as const) {
+  test(`latency has one terminal receipt for ${failure} before JSONL dispatch`, async () => {
+    await withStore(async (dir) => {
+      const id = createSession({ source: 'tui' }).id;
+      const abort = new AbortController();
+      const log = spyOn(debug, 'log');
+      // A native spawn boundary is required to prove a constructor failure without starting
+      // a child. Preparation failures/cancellation must never reach that boundary at all.
+      const spawn = spyOn(Bun, 'spawn').mockImplementation(() => { throw new Error('fake child creation failed'); });
+      const deps = {
+        get config() {
+          if (failure === 'compact-prepare') throw new Error('fake compact preparation failed');
+          if (failure === 'compact-cancel') abort.abort();
+          return COMPACT_DEPS.config;
+        },
+      };
+      try {
+        const turn = runLocalChatTurn(id, 'private question', abort.signal, join(dir, 'unused-cli.ts'),
+          undefined, undefined, { deps });
+        await expect(turn).rejects.toThrow(failure === 'compact-prepare' ? 'fake compact preparation failed'
+          : failure === 'compact-cancel' ? '응답을 취소했습니다' : 'fake child creation failed');
+        expect(spawn).toHaveBeenCalledTimes(failure === 'child-create' ? 1 : 0);
+        const receipts = log.mock.calls.filter((c) => c[0] === 'tui.next' && c[1] === 'turn-latency');
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]![2]).toMatchObject({
+          sessionId: id, outcome: failure === 'compact-cancel' ? 'cancelled' : 'error',
+          dispatchMs: null, firstDeltaMs: null, firstAssistantTextMs: null,
+        });
+        expect(JSON.stringify(receipts[0]![2])).not.toContain('private question');
+      } finally {
+        spawn.mockRestore();
+        log.mockRestore();
+        await closeLocalChatSession(id);
+      }
+    });
+  });
+}
+
 test('over the shared threshold: one compaction runs before the prompt reaches the child', async () => {
   await withStore(async (dir) => {
     // 12 × ~3k tokens ≈ 36k > 0.85 × 32k (test-fake-llm window) — over the default trigger.

@@ -1,4 +1,5 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
+import type { NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
 // ── next TUI 의 자기 예약 깨움 (TUI-NEXT-QUEUE-AND-WAKE · 0.2.36 · 2026-10-22) ──────────────────────
 //
 // 🚨 무엇을 푸는가: 클래식 대시보드엔 `ScheduleWakeup`(H5) ⊕ 내부 턴 문(H2)이 있는데 next TUI 엔 없었다 —
@@ -147,6 +148,8 @@ export interface NextTuiWakeup {
   readonly scheduler: WakeupScheduler;
   /** REPL 자식이 부를 도구(부모 handler) — 하니스 자식이면 null. */
   readonly tool: LLMToolDef | null;
+  /** Read-only header projection; no scheduler or health observation is changed. */
+  headline(health: NextTuiSelfHealthSnapshot | null): string;
   banner(request: Pick<InternalTurnRequest, 'origin' | 'reason'>): string;
   /** 키 큐에서 홉을 꺼낼 때 다시 확인한다. 판정 뒤 사람이 포커스·초안·대기 제출을 바꿀 수 있다. */
   takePendingIfIdle(): InternalTurnRequest | null;
@@ -188,6 +191,16 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     gate,
     scheduler,
     tool,
+    headline(health) {
+      const healthText = health === null ? '건강 관측 전'
+        : health.errorCount === null ? '건강 확인 불가'
+          : health.errorCount === 0 ? '건강 오류 없음' : `건강 오류 ${health.errorCount}`;
+      const next = scheduler.list()[0];
+      const wakeText = next
+        ? `깨움 ${new Date(next.dueAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false })}`
+        : '깨움 없음';
+      return `${healthText} · ${wakeText}`;
+    },
     banner: formatInternalTurnBanner,
     takePendingIfIdle() {
       if (mailWake && !mailWake.pendingDeliveryAllowed()) {

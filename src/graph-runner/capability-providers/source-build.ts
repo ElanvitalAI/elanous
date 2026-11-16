@@ -31,6 +31,32 @@ const MAX_CONTEXT_BYTES = 128 * 1024;
 const row = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const output = (context: InProcessHandlerContext, name: string) => row(row(context.outputs[name]).result);
 
+type PlannedFile = { path: string; role: string; dependsOn: string[] };
+
+/** Bind an explicitly requested seed to the actual process entry and its selected test. */
+export function seedRuntimePlanMatches(plan: PlannedFile[], startPath: string, strategy: unknown): boolean {
+  const byPath = new Map(plan.map(file => [file.path, file]));
+  const start = byPath.get(startPath);
+  if (start?.role !== 'backend') return false;
+  const databases = plan.filter(file => file.role === 'database');
+  if (databases.length !== 1) return false;
+  const ancestors = (path: string, seen = new Set<string>()): Set<string> => {
+    for (const dependency of byPath.get(path)?.dependsOn ?? []) {
+      if (!seen.has(dependency)) { seen.add(dependency); ancestors(dependency, seen); }
+    }
+    return seen;
+  };
+  const startupDependencies = ancestors(startPath);
+  const seeds = plan.filter(file => file.role === 'seed' && startupDependencies.has(file.path)
+    && ancestors(file.path).has(databases[0]!.path));
+  if (!seeds.length) return false;
+  let selected: ReturnType<typeof parseTestStrategy>;
+  try { selected = parseTestStrategy(strategy, plan); } catch { return false; }
+  return selected.some(item => item.kind === 'seed' && byPath.get(item.testFile)?.role === 'test'
+    && ancestors(item.testFile).has(startPath)
+    && seeds.some(seed => ancestors(item.testFile).has(seed.path)));
+}
+
 function configuredModel() {
   let selected: Promise<{ llm: typeof import('../../llm.js'); provider: import('../../llm.js').LLMProvider; model?: string }> | undefined;
   return async (prompt: string, signal?: AbortSignal, responseFormat?: FileFormat): Promise<PlanningModelReply> => {
@@ -189,7 +215,9 @@ export function createSourceBuildRegistry(deps: Deps = {}) {
           const metadata = row(input.artifactMetadata); const runtime = row(metadata.runtime);
           if (!Array.isArray(planInput.plan) || !planInput.plan.some(file => file.path === (runtime.startCommand as string[])[1])
             || !planInput.plan.some(file => file.role === 'test' && /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(file.path))
-            || typeof metadata.frontendRoot === 'string' && !planInput.plan.some(file => file.path === metadata.frontendRoot + '/index.html')) throw new Error('BUILD_PLAN_RUNTIME_MISMATCH');
+            || typeof metadata.frontendRoot === 'string' && !planInput.plan.some(file => file.path === metadata.frontendRoot + '/index.html')
+            || input.seedRequested === true && !seedRuntimePlanMatches(planInput.plan,
+              String((runtime.startCommand as string[])[1]), row(planned.architecture).testStrategy)) throw new Error('BUILD_PLAN_RUNTIME_MISMATCH');
           const resume = await host.load(grant, context.signal);
           let generated = await generatePlannedFiles({ ...planInput, ...(resume ? { resume } : {}) }, {
             callLLM: async (prompt, options) => (await model(prompt, options.signal, initialFilesBudget)).text,

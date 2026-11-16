@@ -68,6 +68,49 @@ test('reserve pins the owner-verified session and refuses a replacement before s
   expect(() => readFileSync(join(h.root, 'authority', 'synthetic-run.json'))).toThrow();
 });
 
+test('undo after build-seal loss requires a fresh official owner before the publisher can revoke', async () => {
+  const h = setup();
+  const runAuthority = createAppBuildRunAuthority({ root: join(h.root, 'authority'), hostKey: 'a'.repeat(64),
+    retainedSession: () => h.session, relayKeyFingerprint: () => 'b'.repeat(64) });
+  let calls = 0;
+  const publisher = { ...h.options.publisher, undo: async (_owner: typeof h.owner, _runId: string,
+    _appSlug: string, deploymentId: string) => { calls++; return { status: 'undone' as const,
+      deploymentId, stopped: true as const, durableRetirement: true as const, proof: 'server' as const }; } };
+  const bridge = createAppBuildLocalIssuerBridge({ ...h.options, publisher, runAuthority });
+  const request = () => {
+    const value = new Request(h.request('undo'), { body: JSON.stringify({ action: 'undo', runId: 'synthetic-run',
+      deploymentId: 'dyn-11111111-1111-4111-8111-111111111111' }) });
+    registerAuthPeerAddress(value, '127.0.0.1');
+    return value;
+  };
+  expect((await bridge(request()))?.status).toBe(200);
+  expect(calls).toBe(1);
+  expect(h.sent).not.toEqual([]);
+  h.receipt({ ...h.owner, memberId: 'foreign' });
+  expect((await bridge(request()))?.status).toBe(401);
+  expect(calls).toBe(1);
+});
+
+test('approval start and poll recheck fresh APS owner instead of trusting a build seal', async () => {
+  const h = setup();
+  const runAuthority = createAppBuildRunAuthority({ root: join(h.root, 'authority'), hostKey: 'a'.repeat(64),
+    retainedSession: () => h.session, relayKeyFingerprint: () => 'b'.repeat(64) });
+  const actions: string[] = [];
+  const publisher = { ...h.options.publisher,
+    startApproval: async () => { actions.push('start'); return { status: 'approval-pending' as const,
+      approvalUrl: 'https://api.elanous.ai/approval', pendingExpiresAt: '2099-01-01T00:00:00Z' }; },
+    pollApproval: async () => { actions.push('poll'); return { status: 'approval-approved' as const }; },
+  };
+  const bridge = createAppBuildLocalIssuerBridge({ ...h.options, publisher, runAuthority });
+  expect((await bridge(h.request('approval-start')))?.status).toBe(200);
+  expect((await bridge(h.request('approval-poll')))?.status).toBe(200);
+  expect(actions).toEqual(['start', 'poll']);
+  expect(h.sent).toHaveLength(4);
+  h.unavailable();
+  expect((await bridge(h.request('approval-poll')))?.status).toBe(401);
+  expect(actions).toEqual(['start', 'poll']);
+});
+
 test('remote host, browser, missing control credential and changed head refuse before official lookup or claim creation', async () => {
   for (const [headers, origin] of [
     [{ authorization: 'Bearer foreign' }, undefined], [{ cookie: 'synthetic=1' }, undefined],

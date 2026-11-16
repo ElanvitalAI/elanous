@@ -283,7 +283,7 @@ function messageLines(
       .flatMap((line) => wrapLine(line, columns)), ''];
   }
   const lines: string[] = [];
-  const label = message.role === 'user' ? '❯ ' : '  ';
+  const label = message.role === 'user' ? '나: ' : '엘라누스: ';
   if (message.role === 'assistant') {
     lines.push(...assistantMarkdownLines(message.content, columns, label));
   } else {
@@ -403,6 +403,10 @@ export function toggleVisibleToolFold(
 
 /** Ephemeral reply preview until the persisted assistant message replaces it. */
 export function streamReplyLines(text: string, columns: number): string[] {
-  const lines = assistantMarkdownLines(text, columns, '  ', false);
-  return lines.slice(-80);
+  const lines = assistantMarkdownLines(text, columns, '엘라누스: ', false);
+  // Source: #74912 retains the existing 80-row preview cap, including the speaker row.
+  const limit = 80;
+  if (lines.length <= limit) return lines;
+  // The original prefix has scrolled out; reserve one row without truncating a tail row's text.
+  return [fitLogLine('엘라누스:', columns), ...lines.slice(1 - limit)];
 }

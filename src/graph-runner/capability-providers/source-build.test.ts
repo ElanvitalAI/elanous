@@ -5,8 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runGraph } from '../runner.js';
+import type { InProcessHandlerContext } from '../in-process-registry.js';
 import { defaultCapabilityRegistryForGraph } from '../plugin-graph-providers.js';
-import { createSourceBuildRegistry } from './source-build.js';
+import { createSourceBuildRegistry, seedRuntimePlanMatches } from './source-build.js';
+import { registerAppBuildPublishApprovalProvider } from './app-build-publish-approval.js';
 import type { createBuildExecution } from '../app-build/build-execution.js';
 import { ARCHITECTURE_SECTIONS, APP_BUILD_MAX_FILES, APP_BUILD_MAX_REPAIRS } from '../app-build/contracts.js';
 import { apiSurfaceLines, readEnvironmentReceipt, writeEnvironmentReceipt, type DeploymentEnvironment } from '../app-build/deployment-environment.js';
@@ -30,7 +32,30 @@ const plan = [
   { path: 'ARCHITECTURE.md', role: 'architecture' }, { path: 'database/schema.ts', role: 'database' },
   { path: 'backend/main.ts', role: 'backend' }, { path: 'frontend/index.html', role: 'frontend' }, { path: 'tests/main.test.ts', role: 'test' },
 ].map(file => ({ ...file, purpose: 'Complete ' + file.role, dependsOn: file.role === 'architecture' ? [] : ['ARCHITECTURE.md'] }));
+
+test('seeded plan binds the runtime entry, database, and seed test', () => {
+  const seeded = [
+    { path: 'database/schema.ts', role: 'database', dependsOn: [] },
+    { path: 'backend/seed.ts', role: 'seed', dependsOn: ['database/schema.ts'] },
+    { path: 'backend/main.ts', role: 'backend', dependsOn: ['backend/seed.ts'] },
+    { path: 'tests/seed.test.ts', role: 'test', dependsOn: ['backend/main.ts', 'backend/seed.ts'] },
+  ];
+  const strategy = [{ id: 'startup-seed', kind: 'seed', target: 'Fresh list has items and restart has no duplicates',
+    testFile: 'tests/seed.test.ts', device: 'bun-test-sandbox', command: ['bun', 'test', './tests/seed.test.ts'] }];
+  expect(seedRuntimePlanMatches(seeded, 'backend/main.ts', strategy)).toBe(true);
+  expect(seedRuntimePlanMatches(seeded, 'backend/other.ts', strategy)).toBe(false);
+  expect(seedRuntimePlanMatches(seeded.map(file => file.path === 'backend/main.ts'
+    ? { ...file, dependsOn: [] } : file), 'backend/main.ts', strategy)).toBe(false);
+  expect(seedRuntimePlanMatches(seeded.map(file => file.path === 'backend/seed.ts'
+    ? { ...file, dependsOn: [] } : file), 'backend/main.ts', strategy)).toBe(false);
+  expect(seedRuntimePlanMatches([...seeded, { path: 'database/other.ts', role: 'database', dependsOn: [] }],
+    'backend/main.ts', strategy)).toBe(false);
+  expect(seedRuntimePlanMatches(seeded, 'backend/main.ts', [{ ...strategy[0], kind: 'api' }])).toBe(false);
+  expect(seedRuntimePlanMatches(seeded.map(file => file.path === 'tests/seed.test.ts'
+    ? { ...file, dependsOn: ['backend/seed.ts'] } : file), 'backend/main.ts', strategy)).toBe(false);
+});
 const input = { ask: 'Create an application with frontend backend and storage.', seedRequested: false, appSlug: 'synthetic-app',
+  context: { memberId: 'synthetic-owner' },
   artifactMetadata: { runtime: { startCommand: ['bun', 'backend/main.ts'], healthPath: '/health' }, frontendRoot: 'frontend', apiPrefix: '/api' } };
 const measuredEnvironment: DeploymentEnvironment = { runtime: { command: 'bun', version: '1.4.2', platform: 'darwin' },
   builtinModules: ['bun:sqlite', 'node:fs'], testModules: ['bun:test'], storageModules: ['bun:sqlite'],
@@ -99,6 +124,30 @@ function environment(options: { failTests?: boolean; authFails?: boolean; foreig
       return { path: '/synthetic/model-raw.raw', sha256: sha(text) }; } };
 }
 function root() { const path = mkdtempSync(join(tmpdir(), 'build-graph-')); roots.push(path); return path; }
+function approvalRegistry(e: Parameters<typeof createSourceBuildRegistry>[0], outcome: 'approved' | 'pending' | 'denied' = 'approved') {
+  const signal = AbortSignal.timeout(10_000);
+  const deadlineAtMs = Date.now() + 10_000;
+  const approvalUrl = 'https://api.elanous.ai/v1/members/deployment-approvals/8f195ad4-a4e2-4b31-a7bc-155602760279';
+  let pendingExpiresAt = '';
+  let presented = false;
+  const registry = registerAppBuildPublishApprovalProvider(createSourceBuildRegistry(e), {
+    transport: async action => {
+      if (outcome === 'denied') return { status: 'approval-denied' };
+      if (action === 'approval-start') pendingExpiresAt = new Date(Date.now() + (outcome === 'pending' ? 60 : 5_000)).toISOString();
+      return action === 'approval-poll' && outcome === 'approved' && presented
+        ? { status: 'approval-approved' }
+        : { status: 'approval-pending', approvalUrl, pendingExpiresAt };
+    },
+    presentApprovalUrl: async ownerId => { expect(ownerId).toBe('synthetic-owner'); presented = true; },
+    trustedWindow: () => ({ signal, deadlineAtMs }),
+    pollIntervalMsForTesting: 10,
+  });
+  // Direct runGraph fixtures lack the TUI context adapter. Bind its trusted
+  // signal exactly as the production child route does, without bypassing poll.
+  return { ...registry, providers: registry.providers.map(provider =>
+    provider.id === 'app-build-owner-publish-approval'
+      ? { ...provider, invoke: (context: InProcessHandlerContext) => provider.invoke({ ...context, signal }) } : provider) };
+}
 const result = (value: unknown): Record<string, unknown> => {
   const object = typeof value === 'string' ? JSON.parse(value) : value;
   return object && typeof object === 'object' ? (object as { result?: Record<string, unknown> }).result ?? {} : {};
@@ -122,7 +171,7 @@ test('default graph grounding node consumes a measured receipt and feeds B1 and 
       collectedAt: '2026-11-15T00:00:00Z', sha256: sha(sourceText), runtimeVersion: '1.4.2', excerpt: sourceText }],
     externalStatus: 'verified' as const, neededDevices: ['firecrawl-key'] };
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: graphRoot, capabilityProviders: createSourceBuildRegistry({ ...e,
+    deps: { root: graphRoot, capabilityProviders: approvalRegistry({ ...e,
       collectGrounding: async () => collected,
       recordEnvironment: (_root, runId, value) => writeEnvironmentReceipt(join(graphRoot, 'environment'), runId, value),
       readEnvironment: (_root, runId, receipt) => readEnvironmentReceipt(join(graphRoot, 'environment'), runId, receipt),
@@ -137,7 +186,7 @@ test('default graph grounding node consumes a measured receipt and feeds B1 and 
 test('default graph continues with an unavailable-source grounding receipt', async () => {
   const e = environment();
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('done');
   expect(state.path[1]).toBe('grounding');
   const grounding = result(state.nodes.find(node => node.nodeId === 'grounding')?.output);
@@ -150,9 +199,9 @@ test('default graph continues with an unavailable-source grounding receipt', asy
 test('actual graph repairs a failed sandbox then materializes and publishes only after a passing test, with code bytes kept out of the ledger', async () => {
   const e = environment();
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('done');
-  expect(state.path).toEqual(['source-reserve', 'grounding', 'assumptions', 'architecture', 'file-plan', 'files', 'verify-repair', 'materialize', 'publish', 'done']);
+  expect(state.path).toEqual(['source-reserve', 'grounding', 'assumptions', 'architecture', 'file-plan', 'files', 'verify-repair', 'materialize', 'publish-approval', 'publish', 'done']);
   expect(e.calls).toEqual(['reserve', 'verify', 'verify', 'materialize', 'publish']);
   expect(result(state.nodes.find(node => node.nodeId === 'verify-repair')?.output).repairUsed).toBe(1);
   expect(result(state.nodes.find(node => node.nodeId === 'publish')?.output).buildComplete).toBe(true);
@@ -163,7 +212,7 @@ test('actual graph repairs a failed sandbox then materializes and publishes only
 test('missing runtime method gets measured API alternatives in B2 repair prompt', async () => {
   const e = environment({ methodFailure: true });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('done');
   expect(e.prompts.some(prompt => prompt.includes('absent from measured storage API surfaces: pragma'))).toBe(true);
   expect(e.prompts.some(prompt => prompt.includes('Database.prototype methods: exec, query, run'))).toBe(true);
@@ -172,7 +221,7 @@ test('missing runtime method gets measured API alternatives in B2 repair prompt'
 test('sandbox failure exhausts two repairs without creating or publishing an app', async () => {
   const e = environment({ failTests: true });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('failed'); expect(e.calls.filter(call => call === 'verify')).toHaveLength(APP_BUILD_MAX_REPAIRS + 1);
   expect(e.calls).not.toContain('materialize'); expect(e.calls).not.toContain('publish');
 });
@@ -180,7 +229,7 @@ test('sandbox failure exhausts two repairs without creating or publishing an app
 test('unavailable package import is identified before sandbox and repaired using measured built-ins', async () => {
   const e = environment({ unavailableImport: 'once' });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('done');
   expect(e.prompts.some(prompt => prompt.includes('backend/main.ts:1 imports better-sqlite3'))).toBe(true);
   expect(e.prompts.some(prompt => prompt.includes('available storage modules: bun:sqlite'))).toBe(true);
@@ -193,7 +242,7 @@ test('unavailable package import is identified before sandbox and repaired using
 test('file response normalization retains untouched provider raw digest in graph evidence', async () => {
   const e = environment({ fencedFile: true });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('done');
   expect(e.rawOutputs[0]?.startsWith('```json')).toBe(true);
   const files = state.nodes.find(node => node.nodeId === 'files');
@@ -204,7 +253,7 @@ test('file response normalization retains untouched provider raw digest in graph
 test('repeated unavailable import fails before the sandbox and publication', async () => {
   const e = environment({ unavailableImport: 'always' });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('failed');
   expect(e.calls).toEqual(['reserve']);
   expect(JSON.stringify(state)).toContain('BUILD_IMPORTS_UNAVAILABLE');
@@ -213,7 +262,7 @@ test('repeated unavailable import fails before the sandbox and publication', asy
 test('full per-file retries cannot consume either whole-program repair round budget', async () => {
   const e = environment({ retryEveryFile: true, failedVerifications: APP_BUILD_MAX_REPAIRS });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('done');
   expect(e.calls.filter(call => call === 'verify')).toHaveLength(APP_BUILD_MAX_REPAIRS + 1);
   const generatedCalls = (APP_BUILD_MAX_FILES - 1) * (APP_BUILD_MAX_REPAIRS + 1) * (APP_BUILD_MAX_REPAIRS + 1);
@@ -226,7 +275,7 @@ test('authority failure or a foreign grant stops before any model call and hides
   for (const options of [{ authFails: true }, { foreignOwner: true }]) {
     const e = environment(options);
     const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-      deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+      deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
     expect(state.status).toBe('failed'); expect(e.prompts).toHaveLength(0); expect(e.calls).toEqual(['reserve']);
     expect(JSON.stringify(state)).not.toContain('synthetic-private-diagnostic');
   }
@@ -235,14 +284,27 @@ test('authority failure or a foreign grant stops before any model call and hides
 test('publication refusal never turns an inspected/materialized source into buildComplete', async () => {
   const e = environment({ publishFails: true });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('failed'); expect(JSON.stringify(result(state.nodes.find(node => node.nodeId === 'publish')?.output))).not.toContain('"buildComplete":true');
+});
+
+test('pending or denied owner approval cannot reach the fake publisher', async () => {
+  for (const outcome of ['pending', 'denied'] as const) {
+    const e = environment({ failedVerifications: 0 });
+    const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
+      deps: { root: root(), capabilityProviders: approvalRegistry(e, outcome) } });
+    expect(state.status).toBe('failed');
+    expect(state.path).toContain('publish-approval');
+    expect(state.path).not.toContain('publish');
+    expect(e.calls).toContain('materialize');
+    expect(e.calls).not.toContain('publish');
+  }
 });
 
  test('fake provider graph consumes strategy files and emits B2 strategy execution receipts', async () => {
   const e = environment({ failedVerifications: 0 });
   const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
-    deps: { root: root(), capabilityProviders: createSourceBuildRegistry(e) } });
+    deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('done');
   const checked = result(state.nodes.find(node => node.nodeId === 'verify-repair')?.output);
   expect(checked.testReceipts).toEqual([expect.objectContaining({ strategyId: 'roundtrip',

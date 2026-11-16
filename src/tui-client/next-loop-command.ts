@@ -23,7 +23,10 @@ export function createNextTuiLoopBranch(
   options: NextLoopCommandOptions = {},
 ): NextTuiLoopBranch {
   let command: NextLoopCommand | null = null;
-  const stop = (): void => { command?.run('stop'); };
+  const stop = (): void => {
+    command?.dispose();
+    command = null;
+  };
   return {
     run(input) {
       if (!/^\/loop(?:\s|$)/u.test(input.trim())) return [];
@@ -39,7 +42,7 @@ export function createNextTuiLoopBranch(
       return command.run(raw);
     },
     stop,
-    dispose() { command?.dispose(); command = null; },
+    dispose: stop,
   };
 }
 

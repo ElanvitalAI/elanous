@@ -402,6 +402,11 @@ import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove, handlePluginWizardList, handlePluginWizardSave } from './plugins-market.js';
 import { handlePluginsCredentialsGet, handlePluginsCredentialsPut } from './plugins-credentials-api.js';
 import { createConfiguredMembersApi, type MembersApi } from '../members/members-api.js';
+import { createMemberStore } from '../members/member-store.js';
+import { openDeploymentApprovalStore } from '../members/deployment-approval-store.js';
+import { openDeploymentGrantStore, type DeploymentGrantBinding } from '../members/deployment-grant-store.js';
+import { OFFICIAL_MEMBER_ORIGIN } from '../apps/app-build-local-bridge.js';
+import { nexusRootDir } from '../paths.js';
 import type { GraphCapabilityRegistry } from '../../graph-runner/capabilities.js';
 import type { MemberEventStore } from './member-event-store.js';
 import {
@@ -471,7 +476,47 @@ function defaultMembersApi(appHost?: object, capabilityProviders?: GraphCapabili
     resolver = createAppHostScopedResolver((candidate?: object) => {
       try {
         const nexusAppHost = candidate as NexusAppHost | undefined;
+        if (!process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim()) return null;
+        const memberStore = createMemberStore();
+        const deploymentAuthority = nexusAppHost ? (() => {
+          const path = join(nexusRootDir(), 'members', 'deployment-authority.sqlite');
+          const approvalStore = openDeploymentApprovalStore(path);
+          const grantStore = openDeploymentGrantStore(path);
+          const resolveOwner = async (appSlug: string, token: string) => {
+            if (!token.startsWith('aps_')) return null;
+            const owner = resolveVerifiedOwner(nexusAppHost, appSlug, token, memberStore);
+            const slot = owner && memberStore.appSlotForMember(owner.memberId);
+            return owner && memberStore.activeForAuth(owner.memberId)
+              && slot?.appSlug === appSlug && owner.entitlements['relay.connect'] === true
+              ? { memberId: owner.memberId } : null;
+          };
+          const activeBinding = async (binding: DeploymentGrantBinding) => {
+            const slot = memberStore.appSlotForMember(binding.memberId);
+            const plan = memberStore.memberPlanForMember(binding.memberId);
+            return memberStore.activeForAuth(binding.memberId) && slot?.appSlug === binding.appSlug
+              && nexusAppHost.slugs.includes(binding.appSlug) && plan?.entitlements['relay.connect'] === true
+              && memberStore.isActiveMemberKeyId(binding.memberId, binding.relayKeyId);
+          };
+          const resolveBrowserOwner = async (request: Request, appSlug: string) => {
+            const cookie = request.headers.get('cookie') ?? '';
+            const token = cookie.split(';').map(part => part.trim())
+              .find(part => part.startsWith('__Host-elanous_member_session='))
+              ?.slice('__Host-elanous_member_session='.length);
+            if (!token) return null;
+            const member = memberStore.memberForSession(decodeURIComponent(token));
+            const slot = member && memberStore.appSlotForMember(member.id);
+            return member && memberStore.activeForAuth(member.id) && slot?.appSlug === appSlug
+              && nexusAppHost.slugs.includes(appSlug) ? { memberId: member.id } : null;
+          };
+          return {
+            deploymentGrants: { store: grantStore, resolveOwner, activeBinding },
+            deploymentApprovals: { store: approvalStore, officialOrigin: OFFICIAL_MEMBER_ORIGIN,
+              resolveOwner, resolveBrowserOwner, activeBinding },
+          };
+        })() : undefined;
         return createConfiguredMembersApi({
+          store: memberStore,
+          ...(deploymentAuthority ?? {}),
           ...(nexusAppHost ? {
             issueOwnerSession: (appId, memberId) => nexusAppHost.issueOwnerSession(appId, memberId),
             resolveVerifiedOwner: (appSlug, credential, members) => resolveVerifiedOwner(nexusAppHost, appSlug, credential, members),
@@ -1583,7 +1628,17 @@ export async function routeRequest(
       networkKey = candidate && !candidate.includes(',') && candidate.trim() === candidate && isIP(candidate) !== 0
         && (!forwarded || !real || real === forwarded) ? candidate : 'unknown';
     }
-    const response = await membersApi.handle(req, networkKey);
+    // The trusted local TLS edge forwards an HTTP request to Bun. Only its
+    // authenticated proof may restore the public HTTPS URL for approval pages.
+    const approvalId = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+    const approvalPath = method === 'POST' && pathname === '/v1/members/deployment-approvals/intents'
+      || method === 'POST' && new RegExp(`^/v1/members/deployment-approvals/intents/${approvalId}/poll$`).test(pathname)
+      || method === 'GET' && new RegExp(`^/v1/members/deployment-approvals/${approvalId}$`).test(pathname)
+      || method === 'POST' && new RegExp(`^/v1/members/deployment-approvals/${approvalId}/approve$`).test(pathname);
+    const officialApprovalRequest = approvalPath && opts.trustedTlsEdge?.origin === OFFICIAL_MEMBER_ORIGIN
+      && new URL(req.url).protocol === 'http:' && secureMemberTransport(req, opts, server)
+      ? new Request(new URL(url.pathname + url.search, OFFICIAL_MEMBER_ORIGIN), req) : req;
+    const response = await membersApi.handle(officialApprovalRequest, networkKey);
     if (response) return response;
   }
   if (pathname === '/v1/telegram/member-enrollment') {

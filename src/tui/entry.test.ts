@@ -434,7 +434,7 @@ test('compact first screen keeps welcome state, model and background graph statu
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'collapsed', compactHeight: 6 });
     const screen = transcript.join('');
-    expect(screen).toContain('Enter 전송');
+    expect(screen).toContain("Enter send");
     expect(screen).toContain('🧠 test-model');
     expect(screen).toContain(mockBackgroundLine);
     expect(screen).not.toContain('NaN;');
@@ -513,6 +513,49 @@ test('execution model badge refreshes after the model changes during a turn', as
   }
 });
 
+test('health header observation ignores a foreign session and unsubscribes on exit', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  let accepted = false;
+  const staleListenerHolder: { current: typeof selfHealthListener } = { current: null };
+  let ownSnapshot: import('./chat/self-health-status.js').NextTuiSelfHealthSnapshot | null = null;
+  duringTurnHook = () => {
+    const listener = selfHealthListener;
+    expect(listener).not.toBeNull();
+    const snapshot = {
+      sessionId: session.id, capturedAt: Date.now(), line: 'fake health', source: 'checkout' as const,
+      runningSha: null, installedSha: null, errorCount: 0, representativeError: null,
+      creditSource: null, creditKnown: false,
+    };
+    staleListenerHolder.current = listener;
+    ownSnapshot = snapshot;
+    const beforeForeign = transcript.length;
+    listener!({ ...snapshot, sessionId: 'foreign-session' });
+    expect(transcript.length).toBe(beforeForeign);
+    listener!(snapshot);
+    accepted = transcript.length > beforeForeign;
+    const beforeStale = transcript.length;
+    listener!({ ...snapshot, capturedAt: snapshot.capturedAt - 1, errorCount: 2 });
+    expect(transcript.length).toBe(beforeStale);
+  };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('health observation');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(accepted).toBe(true);
+    expect(selfHealthListener).toBeNull();
+    const afterExit = transcript.length;
+    staleListenerHolder.current?.(ownSnapshot);
+    expect(transcript.length).toBe(afterExit);
+  } finally { process.stdout.write = output; }
+});
+
 test('model badge resolver failure does not loop renders and retries after an external input event', async () => {
   Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
@@ -558,7 +601,7 @@ test('narrow live status stays visible while the attachment page hint is active'
         `/attachments/${String.fromCharCode(97 + index).repeat(180)}.md`,
       ] as const),
     });
-    expect(replayPaintWrites(transcript).some((frame) => frame.includes('PgUp/PgDn') && frame.includes('응답 중'))).toBe(true);
+    expect(replayPaintWrites(transcript).some((frame) => frame.includes('PgUp/PgDn') && frame.includes("running"))).toBe(true);
   } finally {
     process.stdout.write = output;
   }
@@ -645,7 +688,7 @@ test.each(['basic', 'log'] as const)('%s focus paints classified assistant text 
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-    expect(streamingFrames.some((frame) => frame.includes('  첫 응답 델타') && frame.includes('턴 스트리밍'))).toBe(true);
+    expect(streamingFrames.some((frame) => frame.includes('  첫 응답 델타') && frame.includes("Turn running"))).toBe(true);
     expect(transcript.join('')).not.toContain('private-fixture-value-123456');
     expect(transcript.join('')).not.toContain('PRIVATE-CLIPBOARD');
     expect(replayPaintWrites(transcript).at(-1)).not.toContain('첫 응답 델타');
@@ -686,11 +729,11 @@ test('live assistant output estimates grow on deltas, ignore replace/diagnostics
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(turns).toBe(2);
-    expect(observed[0]).toContain('출력 토큰 추정 2');
-    expect(observed[1]).toContain('출력 토큰 추정 3');
-    expect(observed[2]).toContain('출력 토큰 추정 3');
+    expect(observed[0]).toContain("Output tokens est. 2");
+    expect(observed[1]).toContain("Output tokens est. 3");
+    expect(observed[2]).toContain("Output tokens est. 3");
     expect(observed[2]).not.toContain('PRIVATE diagnostic');
-    expect(observed[3]).toContain('출력 토큰 추정 2');
+    expect(observed[3]).toContain("Output tokens est. 2");
   } finally {
     process.stdout.write = output;
   }
@@ -721,11 +764,11 @@ test('streaming partial measured usage keeps the input count and growing output 
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-    expect(observed[0]).toContain('토큰 77/추정2');
-    expect(observed[0]).toContain('턴 스트리밍');
-    expect(observed[1]).toContain('토큰 77/추정3');
-    expect(observed[2]).toContain('토큰 77/0');
-    expect(observed[2]).not.toContain('추정');
+    expect(observed[0]).toContain("Tokens 77/est.2");
+    expect(observed[0]).toContain("Turn running");
+    expect(observed[1]).toContain("Tokens 77/est.3");
+    expect(observed[2]).toContain("Tokens 77/0");
+    expect(observed[2]).not.toContain("est.");
   } finally {
     process.stdout.write = output;
   }
@@ -955,10 +998,10 @@ test('risky Bash approval is an inline prompt and only a human y dispatch decisi
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const frame = transcript.join('');
-    expect(frame).toContain('Bash 실행 승인');
+    expect(frame).toContain("Bash approval");
     expect(frame).toContain('rm -rf /tmp/demo');
     expect(frame).toContain('NT_SW1_END');
-    expect(frame).toContain('Enter 기본 N');
+    expect(frame).toContain("Enter default N");
     expect(decisions).toEqual([true]);
   } finally {
     process.stdout.write = output;
@@ -984,8 +1027,8 @@ test('Bash approval timeout closes the prompt and resolves as denied', async () 
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', shellApprovalTimeoutMs: 5 });
     const frame = transcript.join('');
     expect(decisions).toEqual([false]);
-    expect(frame).toContain('Bash 승인 시간 초과 · 거부됨');
-    expect(frame.lastIndexOf('Bash 승인 시간 초과 · 거부됨')).toBeGreaterThan(frame.lastIndexOf('Bash 실행 승인 · 전체 명령'));
+    expect(frame).toContain("Bash approval timed out · denied");
+    expect(frame.lastIndexOf("Bash approval timed out · denied")).toBeGreaterThan(frame.lastIndexOf("Bash approval · Full command"));
   } finally {
     process.stdout.write = output;
   }
@@ -1014,8 +1057,8 @@ test('child timeout cancels its request id and overrides a delayed host approval
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const frame = transcript.join('');
     expect(decisions).toEqual([true]);
-    expect(frame).toContain('Bash 승인 시간 초과 · 거부됨');
-    expect(frame.lastIndexOf('Bash 승인 시간 초과 · 거부됨')).toBeGreaterThan(frame.lastIndexOf('Bash 명령 승인됨'));
+    expect(frame).toContain("Bash approval timed out · denied");
+    expect(frame.lastIndexOf("Bash approval timed out · denied")).toBeGreaterThan(frame.lastIndexOf("Bash command approved"));
   } finally {
     process.stdout.write = output;
   }
@@ -1051,7 +1094,7 @@ test('an empty execution-side shell snapshot preserves immediate Esc cancellatio
     const abortedTurn = turnAbortSignals.at(-1);
     expect(abortedTurn).toBeDefined();
     expect(abortedTurn?.aborted).toBe(true);
-    expect(transcript.join('')).not.toContain('응답 중단 확인 · 기본 N');
+    expect(transcript.join('')).not.toContain("Confirm stopping turn · default N");
   } finally {
     process.stdout.write = output;
   }
@@ -1069,7 +1112,7 @@ test('empty Enter keeps the queued turn while a non-shell tool is running', asyn
     mockToolSnapshot = [{ id: 'read-1', name: 'Read' }];
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
-    for (let tries = 0; tries < 100 && !transcript.join('').includes('작업 중 · 완료 뒤 대기 입력 전송'); tries++) await Bun.sleep(10);
+    for (let tries = 0; tries < 100 && !transcript.join('').includes("running · Send queued input when done"); tries++) await Bun.sleep(10);
     interruptedDuringTool = signal.aborted;
     toolActivityHandler?.({ phase: 'finish', id: 'read-1', name: 'Read' });
     enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
@@ -1081,7 +1124,7 @@ test('empty Enter keeps the queued turn while a non-shell tool is running', asyn
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(interruptedDuringTool as boolean | null).toBe(false);
-    expect(transcript.join('')).toMatch(/턴 작업 중 .*대기 1 · 배경 0/);
+    expect(transcript.join('')).toMatch(/Turn running .*Queue 1 · Bg 0/);
     expect(transcript.join('')).not.toContain('실행 중인 도구 Read');
   } finally {
     process.stdout.write = output;
@@ -1100,9 +1143,9 @@ test('Ctrl+Up recall cancels a pending empty-Enter probe before the child can ab
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
     enqueueReadKey({ name: 'up', ctrl: true, shift: false, raw: '\x1b[1;5A' });
-    for (let tries = 0; tries < 100 && (!pendingPushNowRequestId || !transcript.join('').includes('대기 1건을 입력칸으로')); tries++) await Bun.sleep(10);
+    for (let tries = 0; tries < 100 && (!pendingPushNowRequestId || !transcript.join('').includes("1 queued drafts restored")); tries++) await Bun.sleep(10);
     expect(pendingPushNowRequestId).not.toBeNull();
-    expect(transcript.join('')).toContain('대기 1건을 입력칸으로');
+    expect(transcript.join('')).toContain("1 queued drafts restored");
     pushNowResultHandler?.({ requestId: pendingPushNowRequestId!, outcome: 'ready', activeTools: [] });
     await Bun.sleep(20);
     abortedAfterRecall = signal.aborted;
@@ -1134,8 +1177,8 @@ test('empty Enter cannot reopen a probe or Ctrl+Up recall after commit until the
     for (let tries = 0; tries < 100 && !transcript.join('').includes('지금 밀어 넣기'); tries++) await Bun.sleep(10);
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
     enqueueReadKey({ name: 'up', ctrl: true, shift: false, raw: '\x1b[1;5A' });
-    for (let tries = 0; tries < 100 && !transcript.join('').includes('지금 제출 중'); tries++) await Bun.sleep(10);
-    guardedBeforeSettle = transcript.join('').includes('지금 제출 중') && !transcript.join('').includes('대기 1건을 입력칸으로');
+    for (let tries = 0; tries < 100 && !transcript.join('').includes("Submitting now"); tries++) await Bun.sleep(10);
+    guardedBeforeSettle = transcript.join('').includes("Submitting now") && !transcript.join('').includes("1 queued drafts restored");
     enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
   };
   keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
@@ -1322,8 +1365,8 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       submittedInputs.push('/side off', '/sidetab on');
       await showNextTui({ resumeSessionId: session.id, sidetabMode: 'collapsed' });
       const rendered = transcript.join('');
-      expect(rendered).toContain('사이드탭 off · /side on 으로 이 세션에서 켜기');
-      expect(rendered).toContain('사이드탭 on · /side open 으로 열기');
+      expect(rendered).toContain("Sidetab off · /side on to enable for this session");
+      expect(rendered).toContain("Sidetab on · /side open to open");
       expect(turnsSeen).toEqual([]);
     } finally {
       process.stdout.write = output;
@@ -1407,8 +1450,8 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       expect(rendered).toContain('Open here');
       expect(rendered).toContain('Rename');
       expect(rendered).toContain('Close');
-      expect(rendered).toContain('PTY 종료 확인');
-      expect(rendered).toContain('PTY 종료 취소');
+      expect(rendered).toContain("Confirm stopping PTY");
+      expect(rendered).toContain("PTY stop cancelled");
       expect(listPtyManifestRows().some((row) => row.id === 'agent:menu-target')).toBe(true);
     } finally {
       process.stdout.write = output;
@@ -1472,7 +1515,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
         },
       });
       expect(cancelled).toBe(true);
-      expect(transcript.join('')).toContain('하니스 호출 취소됨');
+      expect(transcript.join('')).toContain("Harness cancelled");
       expect(turnsSeen).toEqual([]);
     } finally {
       process.stdout.write = output;
@@ -1621,9 +1664,9 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       expect(getActiveSessionId()).toBe(target.id);
       expect(attachRequests).toContainEqual({ ptyId: 'agent:mission-member', host: null });
       expect(transcript.join('')).toContain('미션 ·');
-      expect(transcript.join('')).toContain('세션 전환됨');
+      expect(transcript.join('')).toContain("Session switched");
       const workspaceFrame = transcript.find((frame) => frame.includes('미션 ·'));
-      const allFrame = [...transcript].reverse().find((frame) => frame.includes('사이드탭 전체 목록'));
+      const allFrame = [...transcript].reverse().find((frame) => frame.includes("All sidetab entries"));
       expect(workspaceFrame).toBeDefined();
       expect(workspaceFrame).not.toContain('ALL_ONLY');
       expect(allFrame).toContain('ALL_ONLY');
@@ -1677,7 +1720,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       expect(switchResult).toEqual({ ok: true, action: 'switch', target: 'tui:81000', scheduled: 'after-turn' });
       expect(duringTurnSessionId).toBe(original.id);
       expect(getActiveSessionId()).toBe(target.id);
-      expect(transcript.join('')).toContain('세션 전환됨');
+      expect(transcript.join('')).toContain("Session switched");
       expect(transcript.join('')).toContain('NL_SWITCH_TARGET_MARKER');
       // Let the recorder's delayed close emit finish before the next test installs its capture hook.
       await Bun.sleep(450);
@@ -1957,7 +2000,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       expect(transcript.join('')).toContain('/term help는 읽기 전용');
       expect(transcript.join('')).toContain('/newly-added — 새 경로');
       expect(transcript.join('')).toContain('PgUp/PgDn');
-      expect(transcript.join('')).toContain('Ctrl+Q 종료');
+      expect(transcript.join('')).toContain("Ctrl+Q quit");
       expect(transcript.join('')).toContain('빈 입력 Enter=attach');
       expect(transcript.join('')).toContain('새 PTY: s shell · e elanous · c codex 구독 · l claude code 구독');
       expect(transcript.join('')).toContain('PTY 분리: Ctrl+\\ 후 d');
@@ -2008,7 +2051,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     submittedInputs.push('/model deep', '다음 턴');
     try {
       await showNextTui({ resumeSessionId: createSession().id });
-      expect(transcript.join('')).toContain('모델: 깊음 · 다음 턴부터 적용');
+      expect(transcript.join('')).toContain("Model: deep · applies next turn");
       expect(turnTiersSeen).toEqual([{ tier: 'best', source: 'session-override' }]);
     } finally {
       process.stdout.write = output;
@@ -2139,7 +2182,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       expect(loadSession(session.id)?.messages.filter((message) => typeof message.content === 'string' && message.content.includes('release-node · passed'))).toHaveLength(2);
       expect(loadSession(session.id)?.messages.filter((message) => typeof message.content === 'string' && message.content.includes('duplicate-node · passed'))).toHaveLength(2);
       await driveOneFrame(true);
-      expect(transcript.join('')).toContain('SIM 관측 감시 중단');
+      expect(transcript.join('')).toContain("SIM observation stopped");
     } finally {
       process.stdout.write = output;
       timerHost.setInterval = originalSetInterval;
@@ -2343,7 +2386,7 @@ test('detail view retains a completed tool activity when no matching result was 
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-    expect(replayPaintWrites(transcript).some((frame) => frame.includes('턴 로그')
+    expect(replayPaintWrites(transcript).some((frame) => frame.includes("Turn log")
       && frame.includes('활동 · Read · notes.txt · 완료'))).toBe(true);
   } finally {
     process.stdout.write = output;

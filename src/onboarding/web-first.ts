@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
+import { createInterface } from 'node:readline/promises';
 import { hostname, networkInterfaces, userInfo } from 'node:os';
 import { findNexusLifecycleState } from '../nexus/supervisor/lock.js';
 import { isLanReachableBind, isPrivateIpv4, pickLanAddress } from './lan-address.js';
@@ -39,6 +40,8 @@ export interface WebFirstSetupDeps {
   hostname?: typeof hostname;
   username?: () => string;
   print?: (line: string) => void;
+  /** Interactive first-run choice; injected only for terminal tests. */
+  chooseSetupMode?: (prompt: string) => Promise<string>;
 }
 
 // The onboarding flow waits at most twelve seconds for a daemon before falling back to terminal setup.
@@ -75,6 +78,8 @@ const WEB_FIRST_TEXT = {
     tailnetLink: (link: string) => `어디서든(Tailscale): ${link}`,
     reachability: (browser: 'available' | 'unavailable' | 'unknown', lan: 'available' | 'unavailable' | 'unknown', tailnet: boolean) => `접속 경로: 이 기기 브라우저 ${browser === 'available' ? '사용 가능' : browser === 'unknown' ? '조회 미확인' : '현재 세션에서 사용 불가'} · 같은 네트워크 ${lan === 'available' ? '주소 있음' : lan === 'unknown' ? '조회 미확인' : '주소 없음'} · Tailscale ${tailnet ? '주소 있음' : '주소 없음'} · 외부 공개 여부 미확인`,
     terminalInstead: '링크가 열리지 않으면 터미널 설정에서 계속하세요: `elanous setup --terminal`',
+    setupChoice: (recommended: '1' | '2') => `설정 방법을 고르세요 · 1) 터미널에서 설정${recommended === '1' ? ' (추천)' : ''}  2) 웹(브라우저)에서 설정${recommended === '2' ? ' (추천)' : ''}`,
+    setupPrompt: (recommended: '1' | '2') => `선택 [${recommended}]: `,
   },
   en: {
     unavailable: (reason: string) => `web setup is unavailable (${reason}); switching to terminal setup.`,
@@ -93,6 +98,8 @@ const WEB_FIRST_TEXT = {
     tailnetLink: (link: string) => `from anywhere (Tailscale): ${link}`,
     reachability: (browser: 'available' | 'unavailable' | 'unknown', lan: 'available' | 'unavailable' | 'unknown', tailnet: boolean) => `Reachability: browser on this device ${browser === 'available' ? 'available' : browser === 'unknown' ? 'not checked' : 'unavailable in this session'} · same network ${lan === 'available' ? 'address available' : lan === 'unknown' ? 'not checked' : 'no address'} · Tailscale ${tailnet ? 'address available' : 'no address'} · public access unverified`,
     terminalInstead: 'If the link does not open, continue setup in the terminal: `elanous setup --terminal`',
+    setupChoice: (recommended: '1' | '2') => `Choose setup: 1) Terminal${recommended === '1' ? ' (recommended)' : ''}  2) Web (browser)${recommended === '2' ? ' (recommended)' : ''}`,
+    setupPrompt: (recommended: '1' | '2') => `Choice [${recommended}]: `,
   },
 } as const;
 
@@ -105,8 +112,15 @@ async function probeHealth(url: string, timeoutMs: number): Promise<boolean> {
   }
 }
 
-function setupUrl(pwa: string, token: string): string {
-  return `${pwa.replace(/\/$/, '')}/setup/#t=${encodeURIComponent(token)}`;
+function setupUrl(pwa: string, token: string, remote: boolean): string {
+  // Keep the one-use token as the only fragment field: the PWA claim parser requires it.
+  return `${pwa.replace(/\/$/, '')}/setup/${remote ? '?remote=1' : ''}#t=${encodeURIComponent(token)}`;
+}
+
+async function readSetupChoice(prompt: string): Promise<string> {
+  const input = createInterface({ input: process.stdin, output: process.stdout });
+  try { return await input.question(prompt); }
+  finally { input.close(); }
 }
 
 export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-shown' | 'fallback'> {
@@ -126,6 +140,22 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   };
   if (deps.config.onboarding.webFirst === false) { observe('fallback', 'disabled'); return 'fallback'; }
   if (deps.terminal) { observe('fallback', 'terminal'); return 'fallback'; }
+
+  const env = deps.browserEnv ?? process.env;
+  const ssh = !!(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
+  const noDisplay = !!browserUnavailableReason(env, deps.browserPlatform ?? process.platform);
+  const isHeadless = (deps.isHeadless ?? (() => isHeadlessEnv(env)))();
+  const remoteSetup = ssh || noDisplay || isHeadless;
+  // A non-interactive installer cannot answer; preserve its existing web handoff.
+  if (deps.chooseSetupMode || ((deps.isTty ?? process.stdin.isTTY) === true && process.stdin.isTTY === true)) {
+    const recommended = remoteSetup ? '1' : '2';
+    print(text.setupChoice(recommended));
+    let answer: string;
+    try { answer = (await (deps.chooseSetupMode ?? readSetupChoice)(text.setupPrompt(recommended))).trim(); }
+    catch { answer = recommended; }
+    if ((answer || recommended) === '1') { observe('fallback', 'terminal-choice'); return 'fallback'; }
+    if (answer !== '' && answer !== '2') { observe('fallback', 'invalid-choice'); return 'fallback'; }
+  }
 
   const show = deps.showNexus ?? (() => runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } }));
   let shown: NexusShowResult | undefined;
@@ -217,7 +247,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     if (!token) throw new Error('issuer-missing');
   } catch { return fallback('issuer-missing'); }
 
-  const link = setupUrl(shown.urls.pwa.loopback, token);
+  const link = setupUrl(shown.urls.pwa.loopback, token, remoteSetup);
   const localUrl = new URL(shown.urls.pwa.loopback);
   const port = localUrl.port || (localUrl.protocol === 'https:' ? '443' : '80');
   let httpHost: string | undefined;
@@ -240,13 +270,9 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     }
   }
   const lan: 'shown' | 'loopback-bind' | 'no-address' | 'unknown' = lanInspectionUnknown ? 'unknown' : !reachable ? 'loopback-bind' : lanAddress ? 'shown' : 'no-address';
-  const lanLink = lanAddress ? setupUrl(`http://${lanAddress}:${port}/app/`, token) : undefined;
-  const tailnetLink = shown.urls.pwa.tailnet ? setupUrl(shown.urls.pwa.tailnet, token) : undefined;
+  const lanLink = lanAddress ? setupUrl(`http://${lanAddress}:${port}/app/`, token, remoteSetup) : undefined;
+  const tailnetLink = shown.urls.pwa.tailnet ? setupUrl(shown.urls.pwa.tailnet, token, remoteSetup) : undefined;
   const phoneLink = tailnetLink ?? lanLink;
-  const env = deps.browserEnv ?? process.env;
-  const ssh = !!(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
-  const noDisplay = !!browserUnavailableReason(env, deps.browserPlatform ?? process.platform);
-  const isHeadless = (deps.isHeadless ?? (() => isHeadlessEnv(env)))();
   const why = browserUnavailableReason(env, deps.browserPlatform ?? process.platform);
   const tunnelHint = ssh || noDisplay || isHeadless || (deps.isTty ?? (process.stdin.isTTY === true)) !== true;
   const qrLink = phoneLink ?? (tunnelHint ? link : undefined);
@@ -270,14 +296,15 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   const lanReachability = lan === 'shown' ? 'available' : lan === 'unknown' ? 'unknown' : 'unavailable';
   print(text.reachability(browserReachability, lanReachability, !!tailnetLink));
   print(text.continueInBrowser);
+  // The raw claim link is shown once for copying; secondary routes are QR-only.
   print(link);
   if (lanLink) {
-    print(text.phoneOnSameWifi(lanLink));
+    print(text.phoneOnSameWifi(lanLink.replace(/#t=.*/, '#t=••••')));
     print(text.linkSingleUse);
   } else if (lan === 'loopback-bind') {
     print(text.sameWifiRestart);
   }
-  if (tailnetLink) print(text.tailnetLink(tailnetLink));
+  if (tailnetLink) print(text.tailnetLink(tailnetLink.replace(/#t=.*/, '#t=••••')));
   const linkShownMs = now() - startedAt;
   let qr = false;
   if (qrLink) {

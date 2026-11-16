@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
-import { buildReplTools } from './index.js';
+import { buildReplTools, resolveNextTestVerifiedOwner } from './index.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CAPABILITY_SEARCH_NAME, takeHydratedTools, TOOL_SEARCH_NAME } from '../skills/tools/tool-search-spec.js';
 
 test('Next REPL advertises the routed ToolSearch exactly once so model calls pass catalog validation', async () => {
@@ -30,6 +33,30 @@ test('Next REPL keeps a failed host member session source anonymous', async () =
   const result = await tools.dispatch('brief_today', { context: { memberId: 'caller-forged' } });
   expect(result).toEqual({ error: 'graph route requires a verified owner context' });
   expect(JSON.stringify(result)).not.toContain('private-session-detail');
+});
+
+test('isolated Next session sends its app slug to the strict Nexus owner endpoint', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'next-owner-session-'));
+  const sessionFile = join(root, 'next-member-session.test.json');
+  const requests: string[] = [];
+  const nexus = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    const url = new URL(request.url);
+    requests.push(url.pathname + url.search);
+    if (url.pathname !== '/v1/members/owner' || url.searchParams.get('appSlug') !== 'concert-app'
+      || request.headers.get('authorization') !== 'Bearer aps_synthetic') {
+      return Response.json({ error: 'unauthorized' }, { status: 403 });
+    }
+    return Response.json({ memberId: 'concert-owner' });
+  } });
+  try {
+    writeFileSync(sessionFile, JSON.stringify({ nexusUrl: `http://127.0.0.1:${nexus.port}`,
+      sessionToken: 'aps_synthetic', appSlug: 'concert-app' }));
+    expect(await resolveNextTestVerifiedOwner(sessionFile)).toEqual({ id: 'concert-owner' });
+    expect(requests).toEqual(['/v1/members/owner?appSlug=concert-app']);
+  } finally {
+    nexus.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('Next REPL advertises capability_search once and routes discovery into callable surface schemas', async () => {

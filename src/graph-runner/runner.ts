@@ -58,6 +58,9 @@ import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type Adapti
 import type { AdaptiveGateHealPlan } from '../../scripts/release-loop/adaptive-gate-heal.js';
 import { resolveChildAllowance } from './arg-allowance.js';
 import { withGraphProviderContextExtensions } from './provider-context.js';
+import { createGraphProgressCollector } from './graph-progress-observation.js';
+import { SUPERVISOR_TOTAL_VISIT_LIMIT } from './app-build/supervisor-consumer.js';
+import { s2CatalogSnapshotDigest, S2_DECLARATION_RULES, S2_GRAPH_IDENTITY } from './app-build/s2-declaration-rules.js';
 import { lowerGraphV2, type LowerGraphV2Result } from '../graph-v2/lower.js';
 import { bindGraphV2NodeInput, bindGraphV2StoreWriteInput } from '../graph-v2/input-bindings.js';
 import { emitReleaseStageTransition, postReleaseStageMail, type ReleaseStageState } from '../release-loop/stage-mail.js';
@@ -68,7 +71,7 @@ import { consumeWaiverEventFromLedger, gateWaiverEvidence, hasExactWaiverEvidenc
 import { fanOutGraphSource, nextNode, planHarnessLoopRoute, releaseRouteReachesKnownIssues, topLevelTerminalStatus, type PlannedStep } from './runner-routing.js';
 import { lastJsonObject, STOPPED_NODE_ERROR } from './runner-primitives.js';
 import { declaredHealEdges, graphHealManifest, type DeclaredHealEdge } from './declared-heal-edges.js';
-import type { GraphGrowthScope, GraphLoopBudgetScope, GraphNodeLifecycleEvent, GraphNodeLifecyclePhase, GraphRun, GraphRunOptions, GraphRunState } from './runner-types.js';
+import type { GraphGrowthScope, GraphLoopBudgetScope, GraphNodeLifecycleEvent, GraphNodeLifecyclePhase, GraphRun, GraphRunOptions, GraphRunState, S2CorrectionBudget } from './runner-types.js';
 export { nextNode } from './runner-routing.js';
 export { lastJsonObject, STOPPED_NODE_ERROR } from './runner-primitives.js';
 export { RELEASE_NODE_COMMANDS } from '../../scripts/release-loop/runner-release-node-commands.js';
@@ -659,10 +662,26 @@ function applyRecordedDecision(state: GraphRunState): GraphRunState {
   return state;
 }
 
+function isS2CorrectionBudget(value: unknown): value is S2CorrectionBudget {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const budget = value as Record<string, unknown>;
+  return Object.keys(budget).sort().join() === 'catalogSnapshotDigest,deadlineAtMs,maxCorrections,maxTotalVisits'
+    && Number.isSafeInteger(budget.maxCorrections) && Number(budget.maxCorrections) > 0
+    && Number(budget.maxCorrections) <= S2_DECLARATION_RULES.limits.maxCorrections
+    && Number.isSafeInteger(budget.maxTotalVisits) && Number(budget.maxTotalVisits) > 0
+    && Number(budget.maxTotalVisits) <= S2_DECLARATION_RULES.limits.maxTotalVisits
+    && Number.isSafeInteger(budget.deadlineAtMs) && Number(budget.deadlineAtMs) > 0
+    && typeof budget.catalogSnapshotDigest === 'string' && /^[a-f0-9]{64}$/u.test(budget.catalogSnapshotDigest);
+}
+
 export function readGraphRun(graphId: string, runId: string, root: string): GraphRunState {
   const file = graphRunPath(graphId, runId, root);
   const state = JSON.parse(readFileSync(file, 'utf8')) as GraphRunState;
   if (state.graphId !== graphId || state.runId !== runId) throw new Error(`run identity mismatch: ${graphId}/${runId}`);
+  if (state.s2CorrectionBudget !== undefined && (graphId !== S2_GRAPH_IDENTITY.graphId
+    || !isS2CorrectionBudget(state.s2CorrectionBudget))) throw new Error('S2_CORRECTION_BUDGET_INVALID');
+  if (state.s2CorrectionBudget && (!state.s2CorrectionOwnerId || typeof state.s2CorrectionOwnerId !== 'string'))
+    throw new Error('S2_CORRECTION_OWNER_MISSING');
   const restored = { ...state, statePath: file };
   if (graphId === 'release-loop' && Number.isSafeInteger(restored.executed)) {
     const recordedExecuted = restored.nodes.filter((record) => record.executed).length;
@@ -1439,6 +1458,33 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     throw new Error(`run identity mismatch: ${saved.graphId}/${saved.runId}`);
   }
   const runId = safeSegment(options.resumeRunId ?? options.runId ?? randomUUID());
+  const suppliedS2Budget = options.s2CorrectionBudget;
+  const savedS2Budget = saved?.s2CorrectionBudget;
+  if (options.resumeRunId && graphId === S2_GRAPH_IDENTITY.graphId && !savedS2Budget)
+    throw new Error('S2_CORRECTION_BUDGET_MISSING');
+  if (suppliedS2Budget !== undefined && !isS2CorrectionBudget(suppliedS2Budget))
+    throw new Error('S2_CORRECTION_BUDGET_INVALID');
+  if (options.resumeRunId && suppliedS2Budget && !savedS2Budget)
+    throw new Error('S2_CORRECTION_BUDGET_CANNOT_START_ON_RESUME');
+  if (savedS2Budget && suppliedS2Budget && (savedS2Budget.maxCorrections !== suppliedS2Budget.maxCorrections
+    || savedS2Budget.maxTotalVisits !== suppliedS2Budget.maxTotalVisits
+    || savedS2Budget.catalogSnapshotDigest !== suppliedS2Budget.catalogSnapshotDigest
+    || suppliedS2Budget.deadlineAtMs > savedS2Budget.deadlineAtMs))
+    throw new Error('S2_CORRECTION_BUDGET_CANNOT_EXPAND');
+  const s2CorrectionBudget: S2CorrectionBudget | undefined = savedS2Budget
+    ? suppliedS2Budget ? { ...savedS2Budget, deadlineAtMs: suppliedS2Budget.deadlineAtMs } : savedS2Budget
+    : suppliedS2Budget;
+  if (s2CorrectionBudget) {
+    const registry = options.deps?.capabilityProviders;
+    if (graphId !== S2_GRAPH_IDENTITY.graphId || !options.verifiedOwnerId || saved?.forkedFromRunId
+      || saved && saved.s2CorrectionOwnerId !== options.verifiedOwnerId
+      || s2CorrectionBudget.deadlineAtMs <= Date.now()
+      || !registry || !('contracts' in registry)
+      || s2CorrectionBudget.catalogSnapshotDigest !== s2CatalogSnapshotDigest(registry))
+      throw new Error('S2_CORRECTION_BUDGET_UNTRUSTED');
+  }
+  const supervisorProgress = graph.nodes.some(node => node.requires === 'app-build.supervisor-correct@1')
+    ? createGraphProgressCollector({ graphId, runId }) : undefined;
   const eventSequenceBase = saved?.graphEventSequence ?? 0;
   let eventSequence = eventSequenceBase;
   let eventRunState: GraphRunState | undefined;
@@ -1766,6 +1812,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const state: GraphRunState = options.resumeRunId
     ? readGraphRun(graphId, runId, root)
     : { graphId, runId, startedAt: new Date().toISOString(), ...runnerOwner, status: 'running', path: [], nodes: [], sourceHash: approvalSourceHash,
+      ...(s2CorrectionBudget ? { s2CorrectionBudget, s2CorrectionOwnerId: options.verifiedOwnerId } : {}),
       graphSnapshot: { graphSha: createHash('sha256').update(variantSource).digest('hex'), recipesSha: createHash('sha256').update(recipeSource).digest('hex') },
       ...(units.size > 0 ? { unitPins } : {}),
       ...(graphExtensionLedger ? { graphExtensionLedger } : {}),
@@ -1773,6 +1820,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       ...(options.input === undefined ? {} : { input: options.input }),
       ...(options.unitContext?.entryNodeId === undefined ? {} : { entryNodeId: options.unitContext.entryNodeId }),
       executed: 0, dryRun: options.dryRun === true, graphRevision: 1, statePath };
+  if (options.resumeRunId && s2CorrectionBudget) state.s2CorrectionBudget = s2CorrectionBudget;
   if (state.pending?.outcome === 'waived-known-issue') {
     // This run's original graph snapshot predates the named edge. Keep every
     // other node and recipe pinned; graft only the route declared by the
@@ -2349,6 +2397,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       try { log('node-lifecycle-hook-failed', { graphId, runId, nodeId, visit, phase, error: String(error).slice(0, 300) }); }
       catch { /* lifecycle reporting must not stop graph execution */ }
     };
+    try { supervisorProgress?.observe(event); }
+    catch (error) { reportHookFailure(error); }
     const hook = options.deps?.nodeLifecycle;
     if (hook) {
       lifecycleObserverQueue = lifecycleObserverQueue.then(async () => {
@@ -2953,6 +3003,52 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       debug.log('graph.run', 'handler-dispatch', { graphId, runId, nodeId: current, recipe: node.recipe });
       try {
         const nodeSecrets = await resolveNodeSecrets(node);
+        const progressSnapshot = requiredContract === 'app-build.supervisor-correct@1'
+          ? supervisorProgress?.snapshot() : undefined;
+        const correctionRecords = requiredContract === 'app-build.supervisor-correct@1'
+          ? state.nodes.filter(record => record.nodeId === current) : [];
+        const priorFailedEventIds = correctionRecords.flatMap(record => {
+          const result = lastJsonObject(record.output)?.result;
+          if (!result || typeof result !== 'object' || Array.isArray(result)) return [];
+          const receipt = (result as Record<string, unknown>).graphCorrection;
+          if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return [];
+          const eventId = (receipt as Record<string, unknown>).eventId;
+          return typeof eventId === 'string' ? [eventId] : [];
+        });
+        const readCommittedRetirement = requiredContract === 'app-build.retire-current@1' && current.startsWith('retire-current-')
+          ? () => {
+            // Read the saved ledger on every guard call, including after the provider effect.
+            // A snapshot captured at dispatch cannot detect a competing run update.
+            const saved = readGraphRun(graphId, runId, root);
+            const supervisorRecord = saved.nodes.at(-1);
+            if (supervisorRecord?.nodeId !== S2_GRAPH_IDENTITY.supervisorNodeId || !supervisorRecord.ok
+              || !options.verifiedOwnerId || saved.s2CorrectionOwnerId !== options.verifiedOwnerId
+              || !saved.s2CorrectionBudget || saved.s2CorrectionBudget.deadlineAtMs <= Date.now()) return undefined;
+            const supervisorOutput = lastJsonObject(supervisorRecord.output);
+            const supervisorResult = supervisorOutput?.result;
+            if (!supervisorResult || typeof supervisorResult !== 'object' || Array.isArray(supervisorResult)) return undefined;
+            const receipt = (supervisorResult as Record<string, unknown>).graphCorrection;
+            if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return undefined;
+            const pinned = receipt as Record<string, unknown>;
+            if (supervisorOutput?.outcome !== pinned.correctionRole || pinned.before !== current
+              || pinned.graphId !== graphId || pinned.runId !== runId
+              || typeof pinned.failedNodeId !== 'string' || typeof pinned.eventId !== 'string'
+              || typeof pinned.sha256 !== 'string') return undefined;
+            const failedRecord = [...saved.nodes.slice(0, -1)].reverse()
+              .find(record => record.nodeId === pinned.failedNodeId);
+            if (!failedRecord || failedRecord.ok) return undefined;
+            const failedOutput = lastJsonObject(failedRecord.output);
+            if (!failedOutput || failedOutput.outcome !== 'failed') return undefined;
+            const observed = supervisorProgress?.snapshot().events.find(event => event.eventId === pinned.eventId);
+            if (!observed || observed.kind !== 'failed' || observed.nodeId !== pinned.failedNodeId
+              || observed.sequence !== pinned.sequence) return undefined;
+            const inputSha256 = stableSha256(saved.input);
+            const outputSha256 = stableSha256(failedOutput);
+            if (pinned.inputSha256 !== inputSha256 || pinned.outputSha256 !== outputSha256) return undefined;
+            return Object.freeze({ ownerId: options.verifiedOwnerId,
+              receipt: Object.freeze({ ...pinned }), sha256: pinned.sha256,
+              inputSha256, outputSha256 });
+          } : undefined;
         const handlerContext = { graphId, runId, nodeId: current, input: state.input ?? null,
           ...(options.verifiedOwnerId ? { verifiedOwnerId: options.verifiedOwnerId } : {}),
           ...(Object.keys(nodeSecrets).length ? { secrets: nodeSecrets } : {}),
@@ -2963,6 +3059,23 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
                 ? bindGraphV2StoreWriteInput(mapBinding.nodeInput, graphInputForBinding, outputs)
                 : bindGraphV2NodeInput(mapBinding.nodeInput, graphInputForBinding, outputs)
               : mapBinding.nodeInput } : {}), outputs,
+          ...(progressSnapshot ? {
+            graphObservation: Object.freeze({ ...progressSnapshot,
+              events: Object.freeze(progressSnapshot.events.map(event => Object.freeze({ ...event }))) }),
+          } : {}),
+          ...(requiredContract === 'app-build.supervisor-correct@1' ? { graphCorrection: Object.freeze({
+            correctionCount: Math.max(correctionRecords.length, (visits.get(current) ?? 1) - 1),
+            maxCorrections: state.s2CorrectionBudget?.maxCorrections ?? 0,
+            totalVisits: state.path.length,
+            maxTotalVisits: state.s2CorrectionBudget?.maxTotalVisits ?? 0,
+            remainingSteps: Math.min(effectiveRemaining, SUPERVISOR_TOTAL_VISIT_LIMIT - state.path.length),
+            nodeVisits: Object.freeze(Object.fromEntries(visits)),
+            priorFailedEventIds: Object.freeze(priorFailedEventIds), inputSha256: stableSha256(state.input),
+            requiresVisitorWrite: graph.nodes.some(node => node.nodeId === S2_GRAPH_IDENTITY.visitorPolicyNodeId),
+            nowMs: Date.now(), deadlineAtMs: state.s2CorrectionBudget?.deadlineAtMs ?? 0,
+            catalogSnapshotDigest: state.s2CorrectionBudget?.catalogSnapshotDigest ?? '',
+          }) } : {}),
+          ...(readCommittedRetirement ? { readGraphRetirement: readCommittedRetirement } : {}),
           ...(eventBus === undefined ? {} : { emitEvent: (type: string, data?: Readonly<Record<string, unknown>>) => {
             const safeDataText = data === undefined ? undefined : redactSerializedJson(data);
             const safeData = safeDataText === undefined ? undefined : JSON.parse(safeDataText) as Record<string, unknown>;

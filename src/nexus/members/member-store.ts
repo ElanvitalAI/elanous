@@ -111,6 +111,8 @@ export interface MemberStore {
   memberForPublicUserSlug(userSlug: string): string | null;
   createMemberKey(memberId: string, name: string, now?: string, deliver?: (issued: IssuedMemberKey) => void): IssuedMemberKey;
   listMemberKeys(memberId: string): MemberKeyInfo[];
+  /** Read-only owner/key ID check for server deployment authority; never touches key use time. */
+  isActiveMemberKeyId(memberId: string, keyId: string): boolean;
   revokeMemberKey(memberId: string, keyId: string, now?: string): boolean;
   rotateMemberKey(memberId: string, keyId: string, now?: string, deliver?: (issued: IssuedMemberKey) => void): IssuedMemberKey;
   memberForKey(key: string, now?: string): MemberKeyMatch | null;
@@ -818,6 +820,13 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       assertOpen();
       return (db.query(`SELECT id, name, created_at, last_used_at FROM member_keys WHERE member_id = ? AND revoked_at IS NULL ORDER BY created_at, id`)
         .all(memberId) as Record<string, unknown>[]).map(keyInfo);
+    },
+    isActiveMemberKeyId(memberId, keyId) {
+      assertOpen();
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(keyId)) return false;
+      const row = db.query('SELECT id, member_id, revoked_at FROM member_keys WHERE id = ? AND member_id = ?')
+        .get(keyId, memberId) as { id: string; member_id: string; revoked_at: string | null } | null;
+      return Boolean(row && row.revoked_at === null && row.member_id === memberId && row.id === keyId);
     },
     revokeMemberKey(memberId, keyId, at = iso(nowMs())) {
       assertOpen();

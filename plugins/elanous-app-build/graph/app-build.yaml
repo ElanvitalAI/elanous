@@ -10,6 +10,7 @@ nodes:
   - { id: files, type: capability, requires: source-build.files@1, with: { stage: files } }
   - { id: verify-repair, type: capability, requires: source-build.verify@1, with: { stage: verify } }
   - { id: materialize, type: capability, requires: source-build.materialize@1, with: { stage: materialize } }
+  - { id: publish-approval, type: capability, requires: app-build.publish-approval@1, with: { action: start, appSlug: $input.appSlug, requireOwner: $context.memberId } }
   - { id: publish, type: capability, requires: source-build.publish@1, with: { stage: publish } }
 edges:
   - { from: source-reserve, on: outcome, map: { done: grounding, failed: failed } }
@@ -19,7 +20,8 @@ edges:
   - { from: file-plan, on: outcome, map: { done: files, failed: failed } }
   - { from: files, on: outcome, map: { done: verify-repair, failed: failed } }
   - { from: verify-repair, on: outcome, map: { done: materialize, failed: failed } }
-  - { from: materialize, on: outcome, map: { done: publish, failed: failed } }
+  - { from: materialize, on: outcome, map: { done: publish-approval, failed: failed } }
+  - { from: publish-approval, on: outcome, map: { done: publish, failed: failed } }
   - { from: publish, on: outcome, map: { done: done, failed: failed } }
 terminal: [done, failed]
 observe: { categories: [graph.run, graph.unit] }

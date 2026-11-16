@@ -5,9 +5,13 @@ import { buildCoreTools } from '../domains/core-tools.js';
 import { dispatchToolByName, getToolRuntime, listToolRuntimes, registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import type { GraphRunOptions } from '../graph-runner/runner.js';
+import type { GraphCapabilityRegistry } from '../graph-runner/capabilities.js';
+import { randomUUID } from 'node:crypto';
+import { createGraphProgressCollector, type GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { withS2SupervisorProvider } from '../graph-runner/plugin-graph-providers.js';
 
 /** Resolve only a declared graph route, using the graph CLI's trusted runner boundary. */
 async function graphRouteForFile(graphFile: string, injected?: GraphRunOptions['deps']): Promise<{
@@ -18,7 +22,7 @@ async function graphRouteForFile(graphFile: string, injected?: GraphRunOptions['
   const pluginRoot = existsSync(join(graphDir, 'plugin.json')) ? graphDir : resolve(graphDir, '..');
   const manifestPath = join(pluginRoot, 'plugin.json');
   if (!existsSync(manifestPath)) return { deps: injected };
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions?: { 'ai.elanous'?: {
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { id?: string; extensions?: { 'ai.elanous'?: {
     graphs?: string[]; graphProviders?: Record<string, { module: string; factory: string; withPluginRoot?: boolean;
       withGraphRoot?: boolean;
       defaultAsk?: string }> } } };
@@ -36,8 +40,10 @@ async function graphRouteForFile(graphFile: string, injected?: GraphRunOptions['
   const module = await import(pathToFileURL(modulePath).href) as Record<string, unknown>;
   const factory = module[declaration.factory];
   if (typeof factory !== 'function') throw new Error(`plugin graph provider factory missing: ${declaration.factory}`);
-  const providerRegistry = declaration.withGraphRoot ? factory(injected?.root)
+  const baseRegistry = declaration.withGraphRoot ? factory(injected?.root)
     : declaration.withPluginRoot ? factory(pluginRoot) : factory();
+  const providerRegistry = withS2SupervisorProvider(manifest.id, relativeGraph,
+    baseRegistry as import('../graph-runner/capabilities.js').GraphCapabilityRegistry);
   return { deps: { ...injected, capabilityProviders: providerRegistry },
     defaultAsk };
 }
@@ -63,6 +69,8 @@ export interface ChildPluginRuntimeOptions {
   graphDeps?: GraphRunOptions['deps'];
   /** Fake model for the isolated default graph route; production uses the CLI model provider. */
   graphPrompt?: (prompt: string) => Promise<string>;
+  /** Safe run-scoped progress for the owning Next TUI; raw runner diagnostics stay private. */
+  observeGraphProgress?: (event: GraphProgressObservation) => void;
 }
 
 export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOptions = {}): ChildPluginRuntimeContract {
@@ -91,17 +99,64 @@ export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOpti
       const inputContext = args.context && typeof args.context === 'object' && !Array.isArray(args.context)
         ? args.context as Record<string, unknown> : {};
       const route = await graphRouteForFile(graphFile, options.graphDeps);
+      const ordinaryAppBuildFile = join(BUILTIN_DIR, 'elanous-app-build', 'graph', 'app-build.yaml');
+      let approvalRegistry: GraphCapabilityRegistry | undefined;
+      if (graphId === basename(ordinaryAppBuildFile, '.yaml')) {
+        if (realpathSync(graphFile) !== realpathSync(ordinaryAppBuildFile) || !options.requestConfirmation
+          || typeof args.appSlug !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/.test(args.appSlug))
+          throw new Error('APP_BUILD_TRUSTED_ENTRY_REQUIRED');
+        const registry = route.deps?.capabilityProviders;
+        if (!registry || !('providers' in registry) || !Array.isArray(registry.providers))
+          throw new Error('APP_BUILD_APPROVAL_REGISTRY_REQUIRED');
+        const base = registry as GraphCapabilityRegistry;
+        if (base.providers.filter(provider => provider.id === 'app-build-owner-publish-approval'
+          && provider.provides.includes('app-build.publish-approval@1')).length !== 1)
+          throw new Error('APP_BUILD_APPROVAL_REGISTRY_REQUIRED');
+        const { createAppBuildPublishApprovalProvider, createAppBuildPublishApprovalTransport } = await import('../graph-runner/capability-providers/app-build-publish-approval.js');
+        const productTransport = createAppBuildPublishApprovalTransport();
+        approvalRegistry = { ...base, providers: base.providers.map(provider =>
+          provider.id === 'app-build-owner-publish-approval' ? { ...provider,
+            invoke: context => {
+              // The owner approval window begins at this node, after build and materialize.
+              const deadlineAtMs = Date.now() + 15 * 60_000;
+              const timeout = AbortSignal.timeout(15 * 60_000);
+              const signal = context.signal ? AbortSignal.any([context.signal, timeout]) : timeout;
+              const invokeApproval = createAppBuildPublishApprovalProvider({
+                transport: productTransport,
+                trustedWindow: () => ({ signal, deadlineAtMs }),
+                presentApprovalUrl: async (ownerId, url, expiresAt, pendingSignal) => {
+                  if (ownerId !== owner.id || signal.aborted || pendingSignal?.aborted)
+                    throw new Error('APP_BUILD_OWNER_PRESENTATION_REFUSED');
+                  const acknowledged = await options.requestConfirmation!(
+                    `회원 게시 승인 링크를 본인 브라우저에서 열고 승인한 뒤 계속하세요. ${url} (만료 ${expiresAt})`);
+                  if (!acknowledged || signal.aborted || pendingSignal?.aborted)
+                    throw new Error('APP_BUILD_OWNER_PRESENTATION_REFUSED');
+                },
+              });
+              return invokeApproval({ ...context, signal });
+            } } : provider) };
+      }
+      const runId = randomUUID();
+      const progress = createGraphProgressCollector({ graphId, runId }, options.observeGraphProgress);
       const input = { ...args,
         ...(args.ask === undefined && route.defaultAsk ? { ask: route.defaultAsk } : {}),
         context: { ...inputContext, memberId: owner.id } };
-      const deps = { ...route.deps, callLLM: route.deps?.callLLM ?? options.graphPrompt ?? (async (prompt: string) => {
+      const priorNodeLifecycle = route.deps?.nodeLifecycle;
+      const deps = { ...route.deps, ...(approvalRegistry ? { capabilityProviders: approvalRegistry } : {}),
+        nodeLifecycle: async (event: import('../graph-runner/runner.js').GraphNodeLifecycleEvent) => {
+        try { await priorNodeLifecycle?.(event); }
+        finally { progress.observe(event); }
+      }, callLLM: route.deps?.callLLM ?? options.graphPrompt ?? (async (prompt: string) => {
         const { buildCliWorkflowDeps } = await import('./workflow.js');
         return buildCliWorkflowDeps().callLLM({ prompt });
       }) };
-      const state = await runGraph(graphFile, { input, verifiedOwnerId: owner.id, quiet: true, ...(deps ? { deps } : {}) });
-      if (state.status !== 'awaiting-approval' || !Object.hasOwn(args, 'ticketDesignPath')) return state;
+      const state = await runGraph(graphFile, { runId, input, verifiedOwnerId: owner.id, quiet: true,
+        ...(dispatchContext?.signal ? { signal: dispatchContext.signal } : {}), deps });
+      if (state.status !== 'awaiting-approval' || !Object.hasOwn(args, 'ticketDesignPath'))
+        return { ...state, graphObservation: progress.snapshot() };
       // A connection-needed card must remain visible and cannot authorize spending.
-      if (state.pending?.message.includes('클라우드 연결 필요')) return state;
+      if (state.pending?.message.includes('클라우드 연결 필요'))
+        return { ...state, graphObservation: progress.snapshot() };
       if (!options.requestConfirmation) throw new Error('Scene 5 approval surface is unavailable');
       const { scene5DecisionPromptFromGraph } = await import('../tui-client/scene5-decision-consumer.js');
       const prompt = scene5DecisionPromptFromGraph(state, graphId, args.ticketDesignPath);
@@ -109,8 +164,9 @@ export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOpti
       const pendingNodeId = state.pending!.nodeId;
       decideGraphApproval(state.graphId, state.runId, approved ? 'approved' : 'rejected', owner.id,
         deps?.root, { nodeId: pendingNodeId, visit: state.path.filter(node => node === pendingNodeId).length });
-      return runGraph(graphFile, { resumeRunId: state.runId, resumeGraphId: state.graphId, verifiedOwnerId: owner.id,
+      const resumed = await runGraph(graphFile, { resumeRunId: state.runId, resumeGraphId: state.graphId, verifiedOwnerId: owner.id,
         quiet: true, ...(deps ? { deps } : {}) });
+      return { ...resumed, graphObservation: progress.snapshot() };
     }),
     requestConfirmation: options.requestConfirmation,
     getDispatchContext: dispatchContext,

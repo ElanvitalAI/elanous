@@ -432,7 +432,7 @@ export function createSidetabAttachmentController(deps: {
         attachedSessionId = null;
       }
       registry.kill(session.id);
-      deps.setStatus(`${session.title} 종료 요청 완료`);
+      deps.setStatus(`${session.title} stop requested`);
       return true;
     },
     handleKey(key) {

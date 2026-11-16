@@ -1,4 +1,5 @@
 import type { GraphEvent } from './graph-events.js';
+import type { GraphSupervisorObservationInput } from './graph-progress-observation.js';
 
 /** A run-scoped registry keeps in-process graph effects out of YAML and shell recipes. */
 export interface InProcessHandlerContext {
@@ -17,6 +18,31 @@ export interface InProcessHandlerContext {
   /** Optional node-scoped payload used by dynamically appended repair steps. */
   readonly nodeInput?: unknown;
   readonly outputs: Readonly<Record<string, unknown>>;
+  /** Runner-owned snapshot for a declared supervisor node; graph input cannot set this field. */
+  readonly graphObservation?: GraphSupervisorObservationInput;
+  /** Derived from this authenticated run's ledger, never from graph/model input. */
+  readonly graphCorrection?: Readonly<{
+    correctionCount: number;
+    maxCorrections: number;
+    totalVisits: number;
+    maxTotalVisits: number;
+    remainingSteps: number;
+    nodeVisits: Readonly<Record<string, number>>;
+    priorFailedEventIds: readonly string[];
+    inputSha256: string;
+    requiresVisitorWrite: boolean;
+    nowMs: number;
+    deadlineAtMs: number;
+    catalogSnapshotDigest: string;
+  }>;
+  /** Re-read the committed supervisor receipt before and after a retirement effect. */
+  readonly readGraphRetirement?: () => Readonly<{
+    ownerId: string;
+    receipt: Readonly<Record<string, unknown>>;
+    sha256: string;
+    inputSha256: string;
+    outputSha256: string;
+  }> | undefined;
   /** Providers may stop work when a contract execution deadline is reached. */
   readonly signal?: AbortSignal;
   /** A code node may publish only the event kinds declared in its YAML `emits` allowlist. */

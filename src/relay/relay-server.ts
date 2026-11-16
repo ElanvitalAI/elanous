@@ -7,6 +7,8 @@ export { challengeMessage } from './channel.js';
 import { MAX_MUX_FRAME_BYTES, MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
 import { buildPublicDispatchRoutes, type PublicDispatchRoute } from './public-dispatch.js';
 import { isAnonymousPublicAppRead } from './public-app-read.js';
+import { createPublicAppVisitorWriteGate, validateVisitorWritePolicy,
+  type PublicAppVisitorWritePolicy, type VisitorWriteLedger } from './public-app-visitor-write.js';
 
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const MAX_CLIENTS_PER_SERVER = 8;
@@ -221,6 +223,10 @@ export interface RelayServerOptions {
   publicListedApps?: ReadonlySet<string>;
   /** Explicit user/app pairs allowed anonymous GET/HEAD; absent means private. */
   publicReadableApps?: ReadonlySet<string>;
+  /** Separate expiring app/path POST opt-in; never extends member or control authority. */
+  publicVisitorWritePolicies?: readonly PublicAppVisitorWritePolicy[];
+  /** Durable replay/rate store, required whenever visitor writes are enabled. */
+  publicVisitorWriteLedger?: VisitorWriteLedger;
   /** Opt in to the invited-app reverse proxy for exactly this public domain. */
   publicDomain?: 'elanous.app' | 'elanous.ai';
   /** Legacy single-user public host pin. */
@@ -375,6 +381,20 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     if (!options.publicDomain || extra !== undefined || !parsed || parsed.user !== user || parsed.app !== app
       || !(publicRoutes?.has(user!) || user === options.publicUserId)) throw new Error('invalid public read binding');
   }
+  const visitorPolicies = (options.publicVisitorWritePolicies ?? []).map(policy => validateVisitorWritePolicy(policy));
+  if (visitorPolicies.length && (!options.memberRequired || !options.publicVisitorWriteLedger)) {
+    throw new Error('visitor writes require pinned member hosts and a durable admission ledger');
+  }
+  for (const policy of visitorPolicies) {
+    const pinnedServer = publicRoutes?.get(policy.user)?.serverId
+      ?? (policy.user === options.publicUserId ? options.publicServerId : undefined);
+    if (!publicReadableApps.has(policy.user + '/' + policy.app) || policy.serverId !== pinnedServer) {
+      throw new Error('invalid visitor write binding');
+    }
+  }
+  const visitorGate = visitorPolicies.length
+    ? createPublicAppVisitorWriteGate(visitorPolicies, options.publicVisitorWriteLedger!) : undefined;
+  let activeVisitorChecks = 0;
   const publicListedApps = new Set(options.publicListedApps ?? []);
   if (publicListedApps.size && !options.publicDomain) throw new Error('public app listing requires public relay mode');
   if (publicListedApps.size && multiUser) throw new Error('multi-user public listing requires per-user opt-in');
@@ -559,7 +579,27 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         headers: { ...reportHeaders, 'content-type': 'application/json' } });
     }
     const anonymousPublicRead = isAnonymousPublicAppRead(req, publicApp.user, publicApp.app, publicReadableApps);
-    const memberGate = anonymousPublicRead
+    const visitorPolicy = visitorGate && !memberCredentials(req).length
+      ? visitorPolicies.find(policy => policy.user === publicApp.user && policy.app === publicApp.app
+        && policy.method === req.method && policy.paths.includes(new URL(req.url).pathname)) : undefined;
+    let visitorBody: Uint8Array | undefined;
+    if (visitorPolicy) {
+      if (options.appKillSwitch?.isDown(publicApp.user, publicApp.app)) return new Response('App unavailable', { status: 403 });
+      if (!room?.host || !room.hostPublicKey) return new Response('Host unavailable', { status: 503 });
+      // Reuse the established relay admission ceiling; slow bodies cannot create
+      // unbounded concurrent reads before the mux/public-slot gate.
+      if (activeVisitorChecks >= MAX_MEMBER_CHECKS) return new Response('busy', { status: 429 });
+      activeVisitorChecks += 1;
+      try {
+        const decision = await visitorGate!(req, publicApp.user, publicApp.app, serverId,
+          `https://${publicApp.app}--${publicApp.user}.${options.publicDomain}`);
+        if (decision.status === 'refused') return decision.response;
+        if (decision.status !== 'allowed') return new Response('unauthorized', { status: 401 });
+        visitorBody = decision.body;
+      } finally { activeVisitorChecks -= 1; }
+    }
+    const anonymousVisitorWrite = visitorBody !== undefined;
+    const memberGate = anonymousPublicRead || anonymousVisitorWrite
       ? { status: 'allowed' as const, consumed: [] }
       : await memberAuthorized(req, serverId);
     if (memberGate.status !== 'allowed') {
@@ -584,11 +624,15 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     const releaseSlot = () => { if (slotHeld) { slotHeld = false; room.publicSlots = Math.max(0, room.publicSlots - 1); trafficMeter?.forgetConnection(connectionId); } };
     try {
     if (req.signal.aborted) { releaseSlot(); return new Response('Request cancelled', { status: 499 }); }
-    const body = new Uint8Array(await req.arrayBuffer());
+    const body = visitorBody ?? new Uint8Array(await req.arrayBuffer());
     if (req.signal.aborted) { releaseSlot(); return new Response('Request cancelled', { status: 499 }); }
     if (body.byteLength > MAX_MUX_FRAME_BYTES - 1024) { releaseSlot(); return new Response('Request too large', { status: 413 }); }
     const phoneResult = await createPhoneChannel(room.hostPublicKey, room.hostPublicKey);
     if (req.signal.aborted) { releaseSlot(); return new Response('Request cancelled', { status: 499 }); }
+    if (anonymousVisitorWrite && (Date.now() >= Date.parse(visitorPolicy!.expiresAt)
+      || options.appKillSwitch?.isDown(publicApp.user, publicApp.app))) {
+      releaseSlot(); return new Response('Visitor write unavailable', { status: 403 });
+    }
     if (!phoneResult.ok) { releaseSlot(); return new Response('Host unavailable', { status: 503 }); }
     const phone = phoneResult.value;
     const clientId = room.nextId++;
@@ -655,7 +699,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     // An anonymous read consumes no member credential, so the consumed-only
     // stripping above cannot protect it. Never deliver audience credentials
     // (including cookies or protocol tokens) to a public application's host.
-    if (anonymousPublicRead) {
+    if (anonymousPublicRead || anonymousVisitorWrite) {
       for (const name of ['authorization', 'cookie', 'sec-websocket-protocol']) forwardedHeaders.delete(name);
     }
     forwardedHeaders.set('host', internalHost);
@@ -892,6 +936,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       server.stop(true);
       options.trafficStore?.close?.();
       options.appKillSwitch?.close?.();
+      options.publicVisitorWriteLedger?.close();
     },
   };
 }

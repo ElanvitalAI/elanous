@@ -3,6 +3,8 @@ import { emptyGraphCapabilityRegistry, registerGraphCapabilityContract, register
   type GraphContractId, type GraphCapabilityRegistry } from '../capabilities.js';
 import type { InProcessHandlerContext, InProcessHandlerResult } from '../in-process-registry.js';
 import { checkArchitectureDocument } from '../app-build/architecture-check.js';
+import { extractMermaidBlocks, parseMermaidBlocks, replaceFailedMermaidBlocks,
+  type MermaidReplacement } from '../app-build/mermaid-parse.js';
 import { APP_BUILD_MAX_REPAIRS, ARCHITECTURE_SECTIONS, parsePlanningStage } from '../app-build/contracts.js';
 
 type PlanningStage = 'assumptions' | 'architecture' | 'file-plan';
@@ -149,15 +151,18 @@ async function runStage(context: InProcessHandlerContext, callLLM: NonNullable<S
     const prompt = ['Complete only the named planning stage. Return JSON, never ask product clarification questions.',
       'Follow an explicit requested output language even when quoted sources or context contain another language. Otherwise write in the language of the user request. Apply this to every explanatory sentence, table cell, Mermaid diagram label, structured architecture section value, assumption content, and file-plan purpose. Preserve JSON property names, source labels user/assumed, file roles, code syntax, paths, and the eight canonical architecture heading keys. In Markdown append a title in the output language after each key with an em dash, for example ## context — 시스템 맥락 for Korean or ## context — System context for English; do not translate or remove the key. The references heading may also have a localized title. Examples in this prompt describe the schema and do not choose the output language.',
       'Choose reasonable missing product assumptions. Each statement must be one declarative line in label: content format (for example assumed: <concrete assumption in the requested output language>), never a question; the label must exactly match source (user or assumed). Do not claim code, tests or deployment completed.',
-      stage === 'architecture' ? architectureMarkdownSkeleton + '\nAlso return testStrategyTitle in the explicitly requested output language (시험 전략 for Korean; Test strategy for English) and a nonempty testStrategy (up to eight items): id, kind(unit/api/seed/fault), target in the request language, testFile, device=bun-test-sandbox, command=[bun,test,./testFile]. Choose real test files. API round trips must run in process (no network); declare only checks you will implement. The host appends the strategy document section; do not claim tests ran.' : '',
+      stage === 'architecture' ? architectureMarkdownSkeleton + '\nAlso return testStrategyTitle in the explicitly requested output language (시험 전략 for Korean; Test strategy for English) and a nonempty testStrategy (up to eight items): id, kind(unit/api/seed/fault), target in the request language, testFile, device=bun-test-sandbox, command=[bun,test,./testFile]. Choose real test files. API round trips must run in process (no network); declare only checks you will implement. The host appends the strategy document section; do not claim tests ran. In Mermaid, use ASCII identifiers for graph nodes, ERD entities and attributes, and sequence participants. Use Korean only in grammar-supported quoted display labels or comments; quote Korean ERD relationship labels, for example A ||--o{ B : "포함".' : '',
+      stage === 'architecture' && input.seedRequested === true ? 'Include one kind=seed testStrategy item that exercises the declared backend startup path against the same local database used by the seed. After initialization, the application list API must return at least one synthetic item; rerunning initialization must not duplicate items or overwrite user changes. Use an in-process handler if the test sandbox cannot listen. This is a test to implement, not a claim that it passed.' : '',
       `Stage: ${stage}. Required output shape: ${shape}`,
       stage === 'file-plan' ? `Plan frontend, backend, database, test, and config files in dependency order. For this demo target at most 12 total files: keep the implementation minimal and combine compatible modules, configuration, and tests when practical. The contract maximum remains 24; never omit a required file solely to hit the 12-file target. Include role and purpose. The role field must be exactly one of: ${filePlanRolesText}. A deployment script or Docker file has role config; a test file has role test (singular). Never use deployment or tests as role values. Each dependsOn path must appear earlier in the plan. Include every architecture.testStrategy testFile with role test. Include ARCHITECTURE.md and every exact path in architectureReferencePaths from the request context as plan entries; do not rename or omit a referenced file. Include a repeatable synthetic seed script only when requested.` : '',
+      stage === 'file-plan' && input.seedRequested === true ? 'For requested synthetic data, use one database-role module before the seed file and make the seed depend on it. Define one exported DB_PATH constant in that module: resolve under trusted ELANOUS_APP_DATA_DIR when the host supplies the private writable directory, with an app-root fallback for local runs; never rely on process cwd. Seed and backend import the same constant, with no separate default path. The exact backend file named by runtime.startCommand must depend on seed and call its idempotent initializer during module or documented host startup, before serving reads. The host may import an exported fetch handler, so an import.meta.main-only seed is insufficient. The kind=seed test file must depend on the startup backend and seed files; test a fresh startup list with at least one item and repeated initialization without duplicates or overwriting user changes. A standalone seed command is insufficient.' : '',
       `Request/context: ${request}`, repair ? `Previous output failed validation (${lastError}). ${repairInstruction || 'Correct the JSON contract and complete the requested stage.'}` : ''].join('\n');
     if (Buffer.byteLength(prompt) > MAX_MODEL_BYTES) return { ok: false, outcome: 'failed', error: 'PLANNING_CONTEXT_BUDGET_EXCEEDED' };
     let reply: PlanningModelReply;
     try { reply = await callLLM(prompt, context.signal); }
     catch { return { ok: false, outcome: 'failed', error: 'PLANNING_MODEL_CALL_FAILED' }; }
     let decoded: unknown;
+    let mermaidEvidence: Record<string, unknown> = {};
     try {
       decoded = decode(reply.text);
       const value = object(parsePlanningStage(stage, decoded, { seedRequested: input.seedRequested === true, requireTestStrategy: stage === 'architecture',
@@ -172,6 +177,71 @@ async function runStage(context: InProcessHandlerContext, callLLM: NonNullable<S
           lastError = 'ARCHITECTURE_CHECK_FAILED';
           repairInstruction = architectureIssueInstructions(checked.issues as Array<{ code: string; section?: string; reference?: string }>);
           continue;
+        }
+        const originalMarkdown = String(value.markdown);
+        const originalSha256 = createHash('sha256').update(originalMarkdown).digest('hex');
+        let blocks;
+        let failed;
+        try {
+          blocks = extractMermaidBlocks(originalMarkdown);
+          failed = await parseMermaidBlocks(blocks, context.signal);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : '';
+          return { ok: false, outcome: 'failed', error: reason === 'MERMAID_PARSE_ABORTED' ? 'PLANNING_CANCELLED'
+            : reason === 'MERMAID_PARSE_TIMEOUT' ? 'PLANNING_MERMAID_PARSE_TIMEOUT' : 'PLANNING_MERMAID_PARSE_FAILED' };
+        }
+        const failedCodes = new Map(failed.map(issue => [issue.index, issue.code]));
+        mermaidEvidence = { mermaidOriginalSha256: originalSha256, mermaidFailedBlocks: failed.length,
+          mermaidParseReceipts: blocks.map(block => ({ index: block.index, kind: block.kind,
+            sourceSha256: block.sourceSha256,
+            diagnostic: failedCodes.get(block.index) ?? null })) };
+        if (failed.length) {
+          if (repair + used >= APP_BUILD_MAX_REPAIRS) {
+            return { ok: false, outcome: 'failed', error: 'PLANNING_MERMAID_REPAIR_BUDGET_EXHAUSTED',
+              evidence: { stage, repairUsed: used + repair, ...mermaidEvidence } };
+          }
+          const failedBlocks = failed.map(issue => blocks[issue.index]!);
+          const repairPrompt = ['Repair only these Mermaid code bodies. Return JSON only: {"replacements":[{"index":0,"kind":"erDiagram","code":"erDiagram\\n..."}]}.',
+            'Return exactly one entry per listed failed block in the same order and preserve each grammar kind and index. Do not return Markdown fences, valid diagrams, surrounding prose, or architecture sections.',
+            'Keep all Mermaid identifiers ASCII and put Korean display text in double quotes or comments, including flowchart node labels, sequence aliases/messages and ERD relationship labels. Keep all other content and meaning in the requested output language.',
+            ...failedBlocks.map(block => JSON.stringify({ index: block.index, kind: block.kind,
+              sourceSha256: block.sourceSha256, diagnostic: failedCodes.get(block.index), code: block.code }))].join('\n');
+          if (Buffer.byteLength(repairPrompt) > MAX_MODEL_BYTES) return { ok: false, outcome: 'failed', error: 'PLANNING_CONTEXT_BUDGET_EXCEEDED' };
+          let repairReply: PlanningModelReply;
+          try { repairReply = await callLLM(repairPrompt, context.signal); }
+          catch { return { ok: false, outcome: 'failed', error: 'PLANNING_MODEL_CALL_FAILED' }; }
+          if (context.signal?.aborted) return { ok: false, outcome: 'failed', error: 'PLANNING_CANCELLED' };
+          let repaired: string;
+          try {
+            const replacementObject = object(decode(repairReply.text));
+            if (!Array.isArray(replacementObject.replacements)) throw new Error('MERMAID_REPLACEMENT_INVALID');
+            repaired = replaceFailedMermaidBlocks(originalMarkdown, failedBlocks,
+              replacementObject.replacements as MermaidReplacement[]);
+          } catch { return { ok: false, outcome: 'failed', error: 'PLANNING_MERMAID_REPLACEMENT_INVALID',
+            evidence: { stage, ...mermaidEvidence } }; }
+          try {
+            const after = extractMermaidBlocks(repaired);
+            if (after.length !== blocks.length) throw new Error('MERMAID_BLOCK_COUNT_CHANGED');
+            const reparsedBlocks = failed.map(issue => after[issue.index]!);
+            const stillFailed = await parseMermaidBlocks(reparsedBlocks, context.signal);
+            const stillFailedCodes = new Map(stillFailed.map(issue => [issue.index, issue.code]));
+            mermaidEvidence = { ...mermaidEvidence, mermaidReparseReceipts: reparsedBlocks.map(block => ({
+              index: block.index, kind: block.kind, sourceSha256: block.sourceSha256,
+              diagnostic: stillFailedCodes.get(block.index) ?? null })) };
+            if (stillFailed.length || !checkArchitecture({ markdown: repaired, sections: value.sections as Record<string, string> }).ok) {
+              return { ok: false, outcome: 'failed', error: 'PLANNING_MERMAID_REPAIR_FAILED',
+                evidence: { stage, ...mermaidEvidence } };
+            }
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : '';
+            return { ok: false, outcome: 'failed', error: reason === 'MERMAID_PARSE_ABORTED' ? 'PLANNING_CANCELLED'
+              : reason === 'MERMAID_PARSE_TIMEOUT' ? 'PLANNING_MERMAID_PARSE_TIMEOUT' : 'PLANNING_MERMAID_REPAIR_FAILED' };
+          }
+          value.markdown = repaired;
+          repair++;
+          mermaidEvidence = { ...mermaidEvidence,
+            mermaidRepairedSha256: createHash('sha256').update(repaired).digest('hex'),
+            mermaidRepairOutputSha256: createHash('sha256').update(repairReply.text).digest('hex') };
         }
       }
       if (stage === 'file-plan') {
@@ -191,7 +261,8 @@ async function runStage(context: InProcessHandlerContext, callLLM: NonNullable<S
         : stage === 'architecture' ? { ...common, architecture: value }
           : { ...common, ...value, assumptions: assumed.assumptions, architecture: architecture.architecture, planningComplete: true };
       return { ok: true, outcome: 'done', result, evidence: { stage, provider: reply.provider, model: reply.model,
-        outputSha256: createHash('sha256').update(reply.text).digest('hex'), repairUsed: used + repair, runId: context.runId } };
+        outputSha256: createHash('sha256').update(reply.text).digest('hex'), repairUsed: used + repair, runId: context.runId,
+        ...mermaidEvidence } };
     } catch {
       lastError = 'PLANNING_OUTPUT_INVALID';
       repairInstruction = stage === 'file-plan' && decoded !== undefined

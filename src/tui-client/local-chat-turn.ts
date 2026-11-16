@@ -1,8 +1,9 @@
 import { safeToolActivityTarget } from '../tui/chat/tool-activity.js';
+import { isGraphProgressObservation, type GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { sessionRoot } from '../session/index.js';
+import { sessionFile, sessionRoot } from '../session/index.js';
 import { NEXT_TUI_WAKEUP_IPC_ENV, answerWakeupCall, isWakeupCallMessage, nextTuiWakeupTool } from './next-wakeup.js';
 import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
 import { answerNextSidetabCall, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
@@ -16,9 +17,11 @@ import {
   NEXT_TUI_SHELL_APPROVAL_IPC_ENV,
   SHELL_APPROVAL_CANCEL_TYPE,
 } from './next-shell-approval.js';
+import { answerHarnessAskUserCall, HARNESS_ASK_USER_IPC_ENV, isHarnessAskUserCall,
+  isHarnessAskUserCancel, type HarnessAskUserCall } from './next-harness-ask-user.js';
 import { getSessionTierOverride } from '../model-tier/session-override.js';
 import { configForSessionProviderTurn, getSessionProvider } from './session-provider.js';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawnElanousBun } from '../instance/spawn-elanous.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -30,6 +33,8 @@ let nextSidetabHandler: NextSidetabHandler | null = null;
 let nextSidetabIpcEnabled = false;
 let nextTuiShellApprovalHandler: ((command: string, callId: string, kind: 'bash' | 'graph') => Promise<boolean>) | null = null;
 let nextTuiShellApprovalCancelHandler: ((callId: string, reason: 'timeout' | 'turn-cancelled' | 'host-cancelled') => void) | null = null;
+let nextTuiHarnessAskUserHandler: ((call: HarnessAskUserCall) => Promise<string | null>) | null = null;
+let nextTuiHarnessAskUserCancelHandler: ((callId: string) => void) | null = null;
 let nextMemberBoardSessionSource: MemberBoardSessionSource | null = null;
 
 /** The Next host supplies only its existing authenticated member session. */
@@ -58,8 +63,15 @@ export function setNextTuiShellApprovalCancelHandler(
   nextTuiShellApprovalCancelHandler = handler;
 }
 
+export function setNextTuiHarnessAskUserHandler(handler: ((call: HarnessAskUserCall) => Promise<string | null>) | null,
+  cancel: ((callId: string) => void) | null): void {
+  nextTuiHarnessAskUserHandler = handler;
+  nextTuiHarnessAskUserCancelHandler = cancel;
+}
+
 interface TurnResult {
   event?: string | null;
+  graphProgress?: unknown;
   turnId?: string | null;
   id?: string;
   phase?: string;
@@ -103,6 +115,7 @@ export type LocalChatToolActivity =
 export type LocalChatPushNowResult = { requestId: string; outcome: 'ready' | 'interrupted' | 'deferred'; activeTools: string[] };
 interface WaitingTurn {
   turnId: string;
+  onGraphProgress?: (event: GraphProgressObservation) => void;
   onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void;
   onStatus?: (text: string) => void;
   onAgent?: (event: AgentDisplayEvent) => void;
@@ -132,6 +145,7 @@ class LocalChatSession {
   private invalidated = false;
   private turnCount = 0;
   private readonly pendingShellApprovalIds = new Set<string>();
+  private readonly pendingHarnessAskUserIds = new Set<string>();
 
   constructor(private readonly sessionId: string, cli: string) {
     this.instanceRoot = effectiveInstanceRoot();
@@ -160,6 +174,7 @@ class LocalChatSession {
         // The child may be created before the UI callback is installed. Always
         // enable the approval boundary; an absent parent handler answers deny.
         [NEXT_TUI_SHELL_APPROVAL_IPC_ENV]: '1',
+        [HARNESS_ASK_USER_IPC_ENV]: '1',
       },
       ipc: (message: unknown, child: { send(message: unknown): unknown }) => {
           if (isMemberBoardSessionCall(message)) {
@@ -178,6 +193,15 @@ class LocalChatSession {
             this.pendingShellApprovalIds.delete(message.callId);
             try { nextTuiShellApprovalCancelHandler?.(message.callId, message.reason); }
             catch { /* cancellation bookkeeping cannot break the child */ }
+          } else if (isHarnessAskUserCancel(message) && message.sessionId === this.sessionId) {
+            this.pendingHarnessAskUserIds.delete(message.callId);
+            nextTuiHarnessAskUserCancelHandler?.(message.callId);
+          } else if (isHarnessAskUserCall(message) && message.sessionId === this.sessionId) {
+            this.pendingHarnessAskUserIds.add(message.callId);
+            void answerHarnessAskUserCall(nextTuiHarnessAskUserHandler, message).then(reply => {
+              this.pendingHarnessAskUserIds.delete(message.callId);
+              try { child.send(reply); } catch { /* child exited during interview */ }
+            });
           } else if (isShellApprovalCallMessage(message)) {
             this.pendingShellApprovalIds.add(message.callId);
             void answerShellApprovalCall(nextTuiShellApprovalHandler
@@ -257,6 +281,11 @@ class LocalChatSession {
         if (result.turnId === waiting.turnId && typeof result.text === 'string') {
           try { waiting.onStatus?.(result.text); } catch { /* renderer cannot break the turn */ }
         }
+        return;
+      }
+      if (result.event === 'graph-progress') {
+        if (result.turnId !== waiting.turnId || !isGraphProgressObservation(result.graphProgress)) return;
+        try { waiting.onGraphProgress?.(result.graphProgress); } catch { /* display cannot break the turn */ }
         return;
       }
       if (result.event === 'agent') {
@@ -402,7 +431,7 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage']): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage'], onGraphProgress?: WaitingTurn['onGraphProgress']): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
@@ -411,7 +440,7 @@ class LocalChatSession {
     const payload = JSON.stringify({ prompt, id: turnId, ...(modelTier ? { modelTier } : {}),
       ...(providerSelection ? { sessionProvider: providerSelection } : {}),
       ...(attachments.length ? { attachments } : {}) }) + '\n';
-    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, onMeasuredUsage, resolve, reject }; });
+    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, onMeasuredUsage, onGraphProgress, resolve, reject }; });
     try {
       if (writePrompt) await writePrompt(payload);
       else await this.writeInput(payload);
@@ -434,6 +463,8 @@ class LocalChatSession {
             } catch { /* the child may already be exiting */ }
           }
           this.pendingShellApprovalIds.clear();
+          for (const callId of this.pendingHarnessAskUserIds) nextTuiHarnessAskUserCancelHandler?.(callId);
+          this.pendingHarnessAskUserIds.clear();
           try { this.child.kill(); } catch { /* already exited */ }
         }
         await this.exited;
@@ -538,6 +569,7 @@ export async function runLocalChatTurn(
   onShellActivity?: WaitingTurn['onShellActivity'],
   onToolActivity?: WaitingTurn['onToolActivity'],
   onPushNowResult?: WaitingTurn['onPushNowResult'],
+  onGraphProgress?: WaitingTurn['onGraphProgress'],
 ): Promise<{ goalComplete: boolean; goalStopReason?: string }> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
@@ -565,54 +597,116 @@ export async function runLocalChatTurn(
   // child must not keep reading or writing memory in the previous universe.
   const existing = sessions.get(sessionId);
   if (existing && existing.instanceRoot !== effectiveInstanceRoot()) await closeLocalChatSession(sessionId);
-  // The REPL child reloads the session store each turn, so compacting the store here is what this
-  // turn's model call sees. Over the shared threshold only; a failure leaves the turn uncompacted.
-  // Lazy like this module itself: the compaction path pulls in the LLM router, so next TUI boot stays light.
-  const { compactNextTuiSession } = await import('../tui/slash/compact.js');
-  const compacted = await compactNextTuiSession(sessionId, { force: false,
-    modelId: selection?.model ?? (selection ? (await import('../user-config.js')).PROVIDER_DEFAULT_MODEL[selection.provider] : undefined)
-      ?? localChatModel(sessionId) }, compact.deps);
-  if (compacted.fired) {
-    try { compact.onCompact?.(compacted); } catch { /* status observers cannot break the turn */ }
-  }
-  if (signal.aborted) throw new Error('응답을 취소했습니다');
-  const session = sessions.get(sessionId) ?? new LocalChatSession(sessionId, cli);
-  sessions.set(sessionId, session);
-  const abort = (): void => { void closeLocalChatSession(sessionId); };
-  signal.addEventListener('abort', abort, { once: true });
-  if (signal.aborted) abort();
-  let result: TurnResult;
-  try {
-    result = await session.turn(text, writePrompt, (delta, replace, source) => {
-      if (!signal.aborted) onDelta?.(delta, replace, source);
-    }, attachments, (line) => { if (!signal.aborted) onStatus?.(line); }, (event) => { if (!signal.aborted) onAgent?.(event); },
-    (block) => { if (!signal.aborted) compact.onMessageBlock?.(block); },
-    (event) => { if (!signal.aborted) onShellActivity?.(event); },
-    (event) => { if (!signal.aborted) onToolActivity?.(event); },
-    (event) => { if (!signal.aborted) onPushNowResult?.(event); },
-    (usage) => { if (!signal.aborted) compact.onMeasuredUsage?.(usage); });
-  } catch (error) {
-    if (signal.aborted) throw new Error('응답을 취소했습니다');
-    await closeLocalChatSession(sessionId);
-    throw error;
-  } finally {
-    signal.removeEventListener('abort', abort);
-  }
-  if (signal.aborted) throw new Error('응답을 취소했습니다');
-  // A completed JSONL error frame is a turn failure, not a transport failure:
-  // the child still owns live tasks and buffered notifications for retry.
-  if (result.error) throw new Error(result.error);
-  if (result.model) lastModels.set(sessionId, result.model);
-  if (result.provider) {
+  const started = performance.now();
+  let compactImportMs: number | null = null;
+  let compactMs: number | null = null;
+  let compactReason = 'preparing';
+  let reusedChild: boolean | null = null;
+  let childCreateMs: number | null = null;
+  let dispatchMs: number | null = null;
+  let firstDeltaMs: number | null = null;
+  let firstAssistantTextMs: number | null = null;
+  let outcome: 'completed' | 'error' = 'error';
+  const observeLatency = (outcome: 'completed' | 'error' | 'cancelled'): void => {
     try {
-      const { debug } = await import('../debug/log.js');
-      debug.log('llm.route-decision', 'local-chat-executed', {
-        surface: 'tui-local', sessionId, provider: result.provider, model: result.model ?? null,
+      debug.log('tui.next', 'turn-latency', {
+        sessionId, scope: 'post-preflight-to-result', compactReason, compactImportMs, compactMs,
+        reusedChild, childCreateMs, dispatchMs, firstDeltaMs, firstAssistantTextMs,
+        totalMs: performance.now() - started, outcome,
       });
-    } catch { /* observation must not fail a completed turn */ }
-  }
-  return {
-    goalComplete: result.goalComplete === true,
-    ...(typeof result.goalStopReason === 'string' ? { goalStopReason: result.goalStopReason } : {}),
+    } catch { /* observation must not change transport or renderer behavior */ }
   };
+  // Once timing starts, preparation, cancellation and constructor failures also terminate here.
+  try {
+    // Empty sessions have nothing to compact. Avoid loading the summarizer/provider graph or
+    // resolving its default model on this first-answer path; populated sessions keep the same
+    // pre-turn store rewrite, threshold, failure fallback and selected model as before.
+    if ((compact.deps?.config ?? cfg.chat.autoCompact).enabled) {
+      let hasHistory = true;
+      // Stat the canonical transcript instead of parsing a populated history twice.
+      // Missing/zero-byte files are provably empty; other read failures keep the old boundary.
+      try { hasHistory = statSync(sessionFile(sessionId)).size > 0; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') hasHistory = false;
+      }
+      if (hasHistory) {
+        const importing = performance.now();
+        const { compactNextTuiSession } = await import('../tui/slash/compact.js')
+          .finally(() => { compactImportMs = performance.now() - importing; });
+        const compacting = performance.now();
+        const compacted = await compactNextTuiSession(sessionId, { force: false,
+          modelId: selection?.model ?? (selection ? (await import('../user-config.js')).PROVIDER_DEFAULT_MODEL[selection.provider] : undefined)
+            ?? localChatModel(sessionId) }, compact.deps)
+          .finally(() => { compactMs = performance.now() - compacting; });
+        compactReason = compacted.reason;
+        if (compacted.fired) {
+          try { compact.onCompact?.(compacted); } catch { /* status observers cannot break the turn */ }
+        }
+      } else {
+        compactReason = 'empty-session';
+        compactImportMs = compactMs = 0;
+      }
+    } else {
+      compactReason = 'disabled';
+      compactImportMs = compactMs = 0;
+    }
+    if (signal.aborted) throw new Error('응답을 취소했습니다');
+    const creating = performance.now();
+    reusedChild = sessions.has(sessionId);
+    let session: LocalChatSession;
+    try { session = sessions.get(sessionId) ?? new LocalChatSession(sessionId, cli); }
+    finally { childCreateMs = performance.now() - creating; }
+    sessions.set(sessionId, session);
+    dispatchMs = performance.now() - started;
+    const abort = (): void => { void closeLocalChatSession(sessionId); };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    let result: TurnResult;
+    try {
+      result = await session.turn(text, writePrompt, (delta, replace, source) => {
+        if (!signal.aborted) {
+          if (delta.length > 0) {
+            firstDeltaMs ??= performance.now() - started;
+            if (source === 'assistant-text') firstAssistantTextMs ??= performance.now() - started;
+          }
+          onDelta?.(delta, replace, source);
+        }
+      }, attachments, (line) => { if (!signal.aborted) onStatus?.(line); }, (event) => { if (!signal.aborted) onAgent?.(event); },
+      (block) => { if (!signal.aborted) compact.onMessageBlock?.(block); },
+      (event) => { if (!signal.aborted) onShellActivity?.(event); },
+      (event) => { if (!signal.aborted) onToolActivity?.(event); },
+      (event) => { if (!signal.aborted) onPushNowResult?.(event); },
+      (usage) => { if (!signal.aborted) compact.onMeasuredUsage?.(usage); },
+      (event) => { if (!signal.aborted) onGraphProgress?.(event); });
+    } catch (error) {
+      if (signal.aborted) throw new Error('응답을 취소했습니다');
+      await closeLocalChatSession(sessionId);
+      throw error;
+    } finally {
+      signal.removeEventListener('abort', abort);
+    }
+    if (signal.aborted) throw new Error('응답을 취소했습니다');
+    // A completed JSONL error frame is a turn failure, not a transport failure:
+    // the child still owns live tasks and buffered notifications for retry.
+    if (result.error) throw new Error(result.error);
+    if (result.model) lastModels.set(sessionId, result.model);
+    if (result.provider) {
+      try {
+        const { debug } = await import('../debug/log.js');
+        debug.log('llm.route-decision', 'local-chat-executed', {
+          surface: 'tui-local', sessionId, provider: result.provider, model: result.model ?? null,
+        });
+      } catch { /* observation must not fail a completed turn */ }
+    }
+    // The route observation import yields after the earlier result check.
+    // Match the caller's terminal result to a cancellation received during that await.
+    if (signal.aborted) throw new Error('응답을 취소했습니다');
+    outcome = 'completed';
+    return {
+      goalComplete: result.goalComplete === true,
+      ...(typeof result.goalStopReason === 'string' ? { goalStopReason: result.goalStopReason } : {}),
+    };
+  } finally {
+    observeLatency(signal.aborted ? 'cancelled' : outcome);
+  }
 }

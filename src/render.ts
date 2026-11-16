@@ -416,9 +416,28 @@ export function renderTable(headers: string[], rows: string[][], opts?: {
 export function renderMarkdown(text: string): string {
   const lines = text.split('\n');
   const result: string[] = [];
+  let codeFenceWidth = 0;
 
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i]!;
+
+    // A fenced block is display content, not a pair of literal delimiter lines.
+    // Keep every code-space and marker inside the block; a streaming preview may
+    // reach this function before the closing fence arrives.
+    if (codeFenceWidth > 0) {
+      const closing = /^ {0,3}(`{3,})[ \t]*$/.exec(line);
+      if (closing && closing[1]!.length >= codeFenceWidth) {
+        codeFenceWidth = 0;
+      } else {
+        result.push(chalk.dim(`    ${line}`));
+      }
+      continue;
+    }
+    const opening = /^ {0,3}(`{3,})[^`]*$/.exec(line);
+    if (opening) {
+      codeFenceWidth = opening[1]!.length;
+      continue;
+    }
 
     // Headings
     if (line.startsWith('### ')) {

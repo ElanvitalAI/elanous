@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "limits": {
+    "maxCorrections": 2,
+    "maxNodeVisits": 3,
+    "maxTotalVisits": 64,
+    "maxDeclarationBytes": 131072
+  },
+  "normalOrder": [
+    "source-reserve",
+    "document-parse",
+    "information-extract",
+    "grounding",
+    "assumptions",
+    "architecture",
+    "acceptance-checklist",
+    "file-plan",
+    "files",
+    "verify-repair",
+    "site-scenario-local",
+    "materialize",
+    "publish-approval",
+    "publish",
+    "site-scenario-public"
+  ],
+  "catalog": {
+    "source-reserve": {
+      "requires": "source-build.reserve@1",
+      "with": {
+        "stage": "reserve"
+      },
+      "maxVisits": 1
+    },
+    "document-parse": {
+      "requires": "app-build.document-parse@1",
+      "with": {},
+      "maxVisits": 1
+    },
+    "information-extract": {
+      "requires": "app-build.information-extract@1",
+      "with": {},
+      "maxVisits": 1
+    },
+    "grounding": {
+      "requires": "source-build.grounding@1",
+      "with": {
+        "stage": "grounding"
+      },
+      "maxVisits": 1
+    },
+    "assumptions": {
+      "requires": "source-planning.assumptions@1",
+      "with": {
+        "stage": "assumptions"
+      },
+      "maxVisits": 1
+    },
+    "architecture": {
+      "requires": "source-planning.architecture@1",
+      "with": {
+        "stage": "architecture"
+      },
+      "maxVisits": 3
+    },
+    "acceptance-checklist": {
+      "requires": "app-build.acceptance-checklist@1",
+      "with": {},
+      "maxVisits": 3
+    },
+    "file-plan": {
+      "requires": "source-planning.file-plan@1",
+      "with": {
+        "stage": "file-plan"
+      },
+      "maxVisits": 3
+    },
+    "files": {
+      "requires": "source-build.files@1",
+      "with": {
+        "stage": "files"
+      },
+      "maxVisits": 3
+    },
+    "verify-repair": {
+      "requires": "source-build.verify@1",
+      "with": {
+        "stage": "verify"
+      },
+      "maxVisits": 3
+    },
+    "site-scenario-local": {
+      "requires": "app-build.site-scenario@1",
+      "with": {
+        "phase": "local"
+      },
+      "maxVisits": 3
+    },
+    "materialize": {
+      "requires": "source-build.materialize@1",
+      "with": {
+        "stage": "materialize"
+      },
+      "maxVisits": 3
+    },
+    "publish-approval": {
+      "requires": "app-build.publish-approval@1",
+      "with": {},
+      "maxVisits": 3
+    },
+    "publish": {
+      "requires": "source-build.publish@1",
+      "with": {
+        "stage": "publish"
+      },
+      "maxVisits": 3
+    },
+    "site-scenario-public": {
+      "requires": "app-build.site-scenario@1",
+      "with": {
+        "phase": "public"
+      },
+      "maxVisits": 3
+    },
+    "supervisor-correct": {
+      "requires": "app-build.supervisor-correct@1",
+      "with": {},
+      "maxVisits": 3
+    },
+    "visitor-policy": {
+      "requires": "app-build.visitor-policy@1",
+      "with": {},
+      "maxVisits": 2
+    },
+    "retire-current-file-plan": {
+      "requires": "app-build.retire-current@1",
+      "with": {
+        "correctionRole": "file-plan"
+      },
+      "maxVisits": 2
+    },
+    "retire-current-seed": {
+      "requires": "app-build.retire-current@1",
+      "with": {
+        "correctionRole": "seed"
+      },
+      "maxVisits": 2
+    },
+    "retire-current-test-contract": {
+      "requires": "app-build.retire-current@1",
+      "with": {
+        "correctionRole": "test-contract"
+      },
+      "maxVisits": 2
+    },
+    "retire-current-visitor-policy": {
+      "requires": "app-build.retire-current@1",
+      "with": {
+        "correctionRole": "visitor-policy"
+      },
+      "maxVisits": 2
+    }
+  },
+  "failureRoutes": {
+    "FILE_OUTPUT_INVALID": {
+      "outcome": "file-plan",
+      "target": "file-plan",
+      "nodes": [
+        "files",
+        "verify-repair"
+      ]
+    },
+    "API_CONTRACT_MISMATCH": {
+      "outcome": "file-plan",
+      "target": "file-plan",
+      "nodes": [
+        "site-scenario-local",
+        "site-scenario-public"
+      ]
+    },
+    "SEED_NOT_STARTED": {
+      "outcome": "seed",
+      "target": "file-plan",
+      "nodes": [
+        "site-scenario-local",
+        "site-scenario-public"
+      ]
+    },
+    "DB_PATH_MISMATCH": {
+      "outcome": "seed",
+      "target": "file-plan",
+      "nodes": [
+        "site-scenario-local",
+        "site-scenario-public"
+      ]
+    },
+    "BUILD_TESTS_EXHAUSTED": {
+      "outcome": "test-contract",
+      "target": "architecture",
+      "nodes": [
+        "verify-repair"
+      ]
+    },
+    "VISITOR_WRITE_UNAUTHORIZED": {
+      "outcome": "visitor-policy",
+      "target": "visitor-policy",
+      "nodes": [
+        "site-scenario-local",
+        "site-scenario-public"
+      ]
+    }
+  },
+  "nativeDocumentContracts": [
+    "absorb.document-parse@1",
+    "document.information-extract@1"
+  ],
+  "identity": {
+    "graphId": "app-build-s2",
+    "pluginId": "elanous-app-build",
+    "relativeGraph": "graph/app-build-s2.yaml",
+    "supervisorNodeId": "supervisor-correct",
+    "visitorPolicyNodeId": "visitor-policy",
+    "filesNodeId": "files",
+    "verifyNodeId": "verify-repair"
+  }
+}

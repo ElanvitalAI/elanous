@@ -67,6 +67,7 @@ describe('REPL child ↔ next TUI wakeup hop', () => {
       log: () => {},
     });
     expect(wake.tool?.name).toBe(SCHEDULE_WAKEUP_TOOL_NAME);
+    expect(wake.headline(null)).toBe('건강 관측 전 · 깨움 없음');
     // child side: process.send → parent ipc handler → answer → child 'message'
     const listeners: ((m: unknown) => void)[] = [];
     const child = {
@@ -81,6 +82,12 @@ describe('REPL child ↔ next TUI wakeup hop', () => {
     wake.gate.noteHumanTurn();
     const result = await replTool.dispatch({ action: 'schedule', delaySeconds: 60, reason: '점검' }) as { scheduled?: { id: string } };
     expect(result.scheduled?.id).toBe('w1');
+    expect(wake.headline(null)).toContain('깨움 ');
+    expect(wake.headline({
+      sessionId: 'session', capturedAt: clock.now(), line: '', source: 'checkout',
+      runningSha: null, installedSha: null, errorCount: 2,
+      representativeError: 'fake error', creditSource: null, creditKnown: false,
+    })).toContain('건강 오류 2 · 깨움 ');
     expect(lines.some((l) => l.startsWith('⏰ 예약 깨움') && l.includes('점검'))).toBe(true);
     // Busy at the due time → the classic defer rule (NotIdle → retry a minute later), not a drop.
     busy = true;

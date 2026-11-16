@@ -1,5 +1,10 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { Database } from 'bun:sqlite';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { generatePlannedFiles } from './file-generation.js';
 import { ARCHITECTURE_SECTIONS, APP_BUILD_MAX_FILES, APP_BUILD_MAX_REPAIRS } from './contracts.js';
 
@@ -28,6 +33,90 @@ function independentFixture() {
     : file.role === 'test' ? ['database/main.ts', 'backend/main.ts', 'frontend/main.ts'] : ['ARCHITECTURE.md'] }));
   return input;
 }
+
+/** Host-owned oracle: never executes or trusts the model-generated test file. */
+function probeGeneratedEntry(root: string, entry: string, dataDir: string, expectedTitle: string): void {
+  const entryUrl = pathToFileURL(join(root, entry)).href;
+  const script = `const app = await import(${JSON.stringify(entryUrl)}); const response = app.fetch(new Request('http://local/api/items')); console.log(JSON.stringify({ status: response.status, items: await response.json() }));`;
+  const run = Bun.spawnSync([process.execPath, '-e', script], { cwd: root,
+    env: { ELANOUS_APP_DATA_DIR: dataDir }, stdout: 'pipe', stderr: 'pipe' });
+  if (run.exitCode !== 0) throw new Error('generated entry failed: ' + new TextDecoder().decode(run.stderr));
+  const response = JSON.parse(new TextDecoder().decode(run.stdout)) as { status: number; items: Array<{ title: string }> };
+  if (response.status !== 200 || !Array.isArray(response.items) || response.items.length !== 1
+    || response.items[0]?.title !== expectedTitle) throw new Error('generated GET list invalid');
+  const db = new Database(join(dataDir, 'data.sqlite'));
+  try {
+    const rows = db.query('SELECT id, title FROM items').all() as Array<{ id: string; title: string }>;
+    if (rows.length !== 1 || rows[0]?.id !== 'sample-1' || rows[0]?.title !== expectedTitle)
+      throw new Error('generated database rows invalid');
+  } finally { db.close(); }
+}
+
+for (const spec of [
+  { name: 'restaurant reservation', item: '식당 예약', ask: 'Build a restaurant reservation app with sample reservations.' },
+  { name: 'library loan', item: '도서 대출', ask: 'Build a library loan app with sample loans.' },
+]) test(`blind ${spec.name} specification starts with one database and a nonempty list after restart`, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seed-general-'));
+  const input: Parameters<typeof generatePlannedFiles>[0] = fixture(true);
+  input.assumptions = [{ statement: `user: ${spec.ask}`, source: 'user' }];
+  input.plan = [
+    { path: 'ARCHITECTURE.md', role: 'architecture', purpose: 'Architecture', dependsOn: [] },
+    { path: 'database/db.ts', role: 'database', purpose: 'Single database path', dependsOn: ['ARCHITECTURE.md'] },
+    { path: 'backend/seed.ts', role: 'seed', purpose: 'Idempotent sample rows', dependsOn: ['database/db.ts'] },
+    { path: 'backend/main.ts', role: 'backend', purpose: 'Runtime startup and list', dependsOn: ['database/db.ts', 'backend/seed.ts'] },
+    { path: 'frontend/index.html', role: 'frontend', purpose: 'List page', dependsOn: ['backend/main.ts'] },
+    { path: 'tests/seed.test.ts', role: 'test', purpose: 'Startup list and restart', dependsOn: ['backend/main.ts', 'backend/seed.ts'] },
+  ];
+  const prompts: Record<string, Record<string, unknown>> = {};
+  try {
+    const result = await generatePlannedFiles(input, { callLLM: async prompt => {
+      const request = JSON.parse(prompt) as { file: { path: string; role: string }; seedRuntimeContract?: string };
+      const { file } = request; prompts[file.role] = request as unknown as Record<string, unknown>;
+      const content = file.role === 'database'
+        ? "import { join } from 'node:path'; export const DB_PATH = join(process.env.ELANOUS_APP_DATA_DIR || join(import.meta.dir, '..'), 'data.sqlite');"
+        : file.role === 'seed'
+          ? `import { Database } from 'bun:sqlite'; import { DB_PATH } from '../database/db.js'; export function seed() { const db = new Database(DB_PATH, { create: true }); try { db.exec('CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, title TEXT NOT NULL)'); db.query('INSERT OR IGNORE INTO items VALUES (?, ?)').run('sample-1', ${JSON.stringify(spec.item)}); } finally { db.close(); } }`
+          : file.role === 'backend'
+            ? "import { Database } from 'bun:sqlite'; import { DB_PATH } from '../database/db.js'; import { seed } from './seed.js'; seed(); export function list() { const db = new Database(DB_PATH); try { return db.query('SELECT id, title FROM items').all(); } finally { db.close(); } } export function fetch(request: Request) { return new URL(request.url).pathname === '/api/items' ? Response.json(list()) : new Response('not found', { status: 404 }); }"
+            : file.role === 'frontend'
+              ? '<html><body><main id="items"></main></body></html>'
+              : `import { expect, test } from 'bun:test'; import { existsSync, mkdirSync } from 'node:fs'; import { join } from 'node:path'; import { Database } from 'bun:sqlite'; import { DB_PATH } from '../database/db.js'; import { fetch as appFetch } from '../backend/main.js'; test('host import and local restart share one path each', async () => { const first = appFetch(new Request('http://local/api/items')); expect(first.status).toBe(200); expect((await first.json()).length).toBe(1); const hostData = join(${JSON.stringify(root)}, 'private-data'); mkdirSync(hostData); const hosted = Bun.spawnSync([process.execPath, '-e', "const mod = await import('./backend/main.ts'); const response = mod.fetch(new Request('http://local/api/items')); console.log((await response.json()).length);"], { cwd: ${JSON.stringify(root)}, env: { ELANOUS_APP_DATA_DIR: hostData }, stdout: 'pipe', stderr: 'pipe' }); expect(hosted.exitCode).toBe(0); expect(new TextDecoder().decode(hosted.stdout).trim()).toBe('1'); expect(existsSync(join(hostData, 'data.sqlite'))).toBe(true); const db = new Database(DB_PATH); db.query('UPDATE items SET title = ? WHERE id = ?').run('user edit', 'sample-1'); db.close(); for (let i = 0; i < 2; i++) { const run = Bun.spawnSync([process.execPath, 'backend/main.ts'], { cwd: ${JSON.stringify(root)} }); expect(run.exitCode).toBe(0); const response = appFetch(new Request('http://local/api/items')); expect(response.status).toBe(200); const items = await response.json(); expect(items.length).toBe(1); expect(items[0].title).toBe('user edit'); } });`;
+      return JSON.stringify({ path: file.path, content });
+    } });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.code);
+    expect(String(prompts.database?.seedRuntimeContract)).toContain('one DB_PATH constant');
+    expect(String(prompts.seed?.seedRuntimeContract)).toContain('Import DB_PATH');
+    expect(String(prompts.backend?.seedRuntimeContract)).toContain('invoke the seed initializer');
+    expect(String(prompts.test?.seedRuntimeContract)).toContain('at least one item');
+    for (const file of result.files) {
+      const path = join(root, file.path);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, file.content);
+      expect(createHash('sha256').update(readFileSync(path)).digest('hex')).toBe(file.sha256);
+    }
+    const run = Bun.spawnSync([process.execPath, 'test', 'tests/seed.test.ts'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+    expect(new TextDecoder().decode(run.stderr)).toContain('1 pass');
+    expect(run.exitCode).toBe(0);
+    const dataDir = join(root, 'host-owned-data');
+    mkdirSync(dataDir);
+    const entry = input.plan.find(file => file.role === 'backend')!.path;
+    probeGeneratedEntry(root, entry, dataDir, spec.item);
+    const db = new Database(join(dataDir, 'data.sqlite'));
+    db.query('UPDATE items SET title = ? WHERE id = ?').run('owner edit', 'sample-1');
+    db.close();
+    probeGeneratedEntry(root, entry, dataDir, 'owner edit');
+
+    // A fake model can make its own test vacuous. The host oracle must still fail.
+    writeFileSync(join(root, 'tests/seed.test.ts'), "import { test } from 'bun:test'; test('vacuous', () => {});");
+    const vacuous = Bun.spawnSync([process.execPath, 'test', 'tests/seed.test.ts'],
+      { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+    expect(vacuous.exitCode).toBe(0);
+    const backend = join(root, entry);
+    writeFileSync(backend, readFileSync(backend, 'utf8').replace('Response.json(list())', 'Response.json([])'));
+    expect(() => probeGeneratedEntry(root, entry, dataDir, 'owner edit')).toThrow('generated GET list invalid');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('starts three independent files together and supplies completed dependencies before their consumer', async () => {
   const input = independentFixture(); const controller = new AbortController();

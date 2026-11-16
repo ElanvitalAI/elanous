@@ -13,15 +13,18 @@ const passed: AppSimulationResult = {
   runId: 'run-1', events: [], receipts: [{ id: 'receipt-1', appId: 'lecture-scrap', runId: 'run-1', outcome: 'passed', summary: 'PASS' }],
 };
 
-test('TUI and PWA share one manifest route and hydrate app_deploy on a Korean request', () => {
+test('shared surfaces route existing app artifacts to app_deploy', () => {
   const shared = buildSharedAppTools();
   const spec = shared.specs.find(tool => tool.name === 'app_deploy');
   expect(spec).toEqual(appDeployPluginSpec());
   expect(spec?.route).toMatchObject({ risk: 'high', sideEffects: 'external', requiresConfirm: true });
-  const turn = applyDeferredTools([{ role: 'user', content: args.requestText }], shared.specs, { userText: args.requestText });
+  const requestText = '등록된 앱 배포해줘';
+  const turn = applyDeferredTools([{ role: 'user', content: requestText }], shared.specs, { userText: requestText });
   expect(turn.stats.deferredNames).toContain('app_deploy');
-  const search = routeToolSearch({ query: `route:${args.requestText}` }, shared.specs, { surface: 'pwa' });
-  expect(takeHydratedTools(search).map(tool => tool.name)).toContain('app_deploy');
+  for (const surface of ['pwa', 'tui', 'acp']) {
+    const existing = routeToolSearch({ query: `route:${requestText}` }, shared.specs, { surface });
+    expect(takeHydratedTools(existing).map(tool => tool.name)).toEqual(['app_deploy']);
+  }
 });
 
 test('simulation returns a structured card and never invents a public URL without a publish hook', async () => {
@@ -103,7 +106,7 @@ test('ACP y/N asks once after PASS, defaults to N, and publishes only after y', 
 });
 
 test('TUI and PWA publish through the fake app host only for the verified owner and PASS receipt', async () => {
-  for (const surface of ['tui', 'pwa'] as const) {
+  for (const surface of ['tui', 'chat'] as const) {
     const host = createFakeAppHost([{ slug: 'lecture-scrap', versions: [
       { id: 'old', files: { 'index.html': '<main>old</main>' } },
     ], current: 'old' }]);
@@ -121,7 +124,7 @@ test('TUI and PWA publish through the fake app host only for the verified owner 
 
 test('a publish hook cannot report another owner origin as this owner deployment', async () => {
   const result = await runAppDeploy(args, {
-    surface: 'pwa', verifiedOwner: { id: 'member-1' }, appDeploymentSession: 'nexus-owner',
+    surface: 'chat', verifiedOwner: { id: 'member-1' }, appDeploymentSession: 'nexus-owner',
     appDeploymentOwner: { appSlug: 'lecture-scrap', memberId: 'member-1', userSlug: 'alice', plan: 'free', entitlements: {} },
     confirmChannels: [{ name: 'fake-confirm', request: async () => true, cancel: () => undefined }],
   }, { simulate: async () => passed, hook: {

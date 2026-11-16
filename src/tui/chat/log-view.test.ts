@@ -29,8 +29,8 @@ test('history renders user and assistant text within terminal width without stor
 test('resumed classic dashboard context renders only its question in Next history', () => {
   const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n  ⚠ plugin warning\n\nQuestion: 이어쓰기 1 classic 질문';
   const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-  expect(lines).toContain('❯ 이어쓰기 1 classic 질문');
-  expect(lines).not.toContain('❯ Context:');
+  expect(lines).toContain('나: 이어쓰기 1 classic 질문');
+  expect(lines).not.toContain('나: Context:');
   expect(lines).not.toContain('Dashboard mode: browse');
   expect(lines).not.toContain('plugin warning');
   expect(classicUser).toContain('Recent status output:'); // stored history stays intact
@@ -42,7 +42,7 @@ test('ordinary user-authored Context prose and similar headings stay visible', (
   const quotedStatus = 'Context:\nDashboard mode: browse\n\nRecent status output:\nmy own notes\n\nQuestion: keep this whole message and mention ✓ resumed local session: abc123';
   for (const content of [ordinary, nearMiss, quotedStatus]) {
     const lines = logViewLines([{ role: 'user', content, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-    expect(lines).toContain('❯ Context:');
+    expect(lines).toContain('나: Context:');
     expect(lines).toContain('Question: keep this whole message');
   }
 });
@@ -50,7 +50,7 @@ test('ordinary user-authored Context prose and similar headings stay visible', (
 test('resumed classic question keeps later Question headings in the actual user text', () => {
   const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n\nQuestion: 첫 문단\n\nQuestion: 두 번째 문단';
   const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-  expect(lines).toContain('❯ 첫 문단');
+  expect(lines).toContain('나: 첫 문단');
   expect(lines).toContain('Question: 두 번째 문단');
   expect(lines).not.toContain('Dashboard mode: browse');
 });
@@ -70,6 +70,53 @@ test('assistant history reuses classic markdown rendering after sanitizing raw t
   expect(text).not.toContain('`code`');
   expect(text).not.toContain('\x1b[2J');
   expect(lines.every((line) => Bun.stringWidth(line) <= 80)).toBe(true);
+});
+
+test('literal backtick fenced answer renders as dim code in history and live preview at 40 columns', () => {
+  const priorColorLevel = chalk.level;
+  chalk.level = 1;
+  try {
+    const content = '```text\n기존 원자핵 + 중성자 여러 개\n          ↓\n```';
+    const saved = logViewLines([{ role: 'assistant', content, ts: '2026-11-15T00:00:00Z' }], 40);
+    const live = streamReplyLines(content, 40);
+    expect(live).toEqual(saved.slice(0, -1));
+    for (const lines of [saved, live]) {
+      const visible = lines.join('\n').replace(/\x1b\[[0-?]*[ -/]*m/g, '');
+      expect(visible).not.toContain('```');
+      expect(visible).toContain('기존 원자핵 + 중성자 여러 개');
+      expect(visible).toContain('          ↓');
+      expect(visible.split('\n')).toContain('                ↓'); // 2 label + 4 code indent + 10 source spaces
+      expect(lines.some((line) => line.includes('\x1b[2m'))).toBe(true);
+      expect(lines.every((line) => Bun.stringWidth(line) <= 40)).toBe(true);
+    }
+    const longCode = logViewLines([
+      { role: 'assistant', content: ['```text', '가'.repeat(30), '```'].join('\n'), ts: '2026-11-15T00:00:01Z' },
+    ], 40);
+    expect(longCode.every((line) => Bun.stringWidth(line) <= 40)).toBe(true);
+    expect(longCode.join('').split('가').length - 1).toBe(30);
+  } finally {
+    chalk.level = priorColorLevel;
+  }
+});
+
+test('open code fence stays literal and dim during streaming, then resumes ordinary Markdown', () => {
+  const priorColorLevel = chalk.level;
+  chalk.level = 1;
+  try {
+    const unfinished = streamReplyLines('```text\n  x = 1\n**literal bold markers**', 40);
+    const partialVisible = unfinished.join('\n').replace(/\x1b\[[0-?]*[ -/]*m/g, '');
+    expect(partialVisible).not.toContain('```');
+    expect(partialVisible).toContain('  x = 1');
+    expect(partialVisible).toContain('**literal bold markers**');
+    expect(unfinished.some((line) => line.includes('\x1b[2m'))).toBe(true);
+    const completed = streamReplyLines('```text\n  x = 1\n```\n# After', 40).join('\n');
+    expect(completed).not.toContain('```');
+    expect(completed).toContain('After');
+    expect(completed).not.toContain('# After');
+    expect(streamReplyLines("'''text\nplain\n'''", 40).join('\n')).toContain("'''text");
+  } finally {
+    chalk.level = priorColorLevel;
+  }
 });
 
 test('assistant Markdown styles continue across wrapped PTY lines', () => {
@@ -149,7 +196,7 @@ test('untrusted error text cannot move the status line', () => {
 
 test('live reply preview keeps first text visible, wraps and strips terminal controls', () => {
   const lines = streamReplyLines('첫 토큰과 이어지는 문장\n\x1b[2J둘째 줄', 12);
-  expect(lines[0].startsWith('  ')).toBe(true);
+  expect(lines[0].startsWith('엘라누스: ')).toBe(true);
   expect(lines[0]).toContain('첫');
   expect(lines.join('\n')).toContain('토큰');
   expect(lines.join('\n')).toContain('둘째 줄');
@@ -159,8 +206,8 @@ test('live reply preview keeps first text visible, wraps and strips terminal con
 
 test('chat wraps at word boundaries and indents continuation rows', () => {
   const user = logViewLines([{ role: 'user', content: 'alpha beta gamma delta', ts: '2026-11-10T00:00:00Z' }], 14);
-  expect(user.slice(0, 2)).toEqual(['❯ alpha beta ', '  gamma delta']);
-  expect(streamReplyLines('foo bar baz quux', 14)).toEqual(['  foo bar baz ', '  quux']);
+  expect(user.slice(0, 2)).toEqual(['나: alpha beta', '  gamma delta']);
+  expect(streamReplyLines('foo bar baz quux', 14)).toEqual(['엘라누스: foo ', '  bar baz quux']);
   const longWord = logViewLines([{ role: 'user', content: 'supercalifragilistic', ts: '2026-11-10T00:00:00Z' }], 10);
   expect(longWord.every((line) => Bun.stringWidth(line) <= 10)).toBe(true);
   expect(longWord.slice(1, -1).every((line) => line.startsWith('  '))).toBe(true);
@@ -181,8 +228,9 @@ test('SGR in the middle of a word keeps the whole word together', () => {
   try {
     const lines = logViewLines([{ role: 'assistant', content: 'ab**cd** ef', ts: '2026-11-10T00:00:00Z' }], 12);
     const plain = lines.map(line => line.replace(/\x1b\[[0-?]*[ -/]*m/g, ''));
-    expect(plain[0]).toBe('  abcd ef');
-    expect(lines[0]).toContain('\x1b[1m');
+    expect(plain[0]).toBe('엘라누스: ');
+    expect(plain[1]).toBe('  abcd ef');
+    expect(lines[1]).toContain('\x1b[1m');
     expect(lines.every(line => Bun.stringWidth(line) <= 12)).toBe(true);
   } finally {
     chalk.level = previousLevel;
@@ -402,12 +450,48 @@ test('잘린 봉투(truncateForPersist 2000자 · «… (+N chars)»)도 output 
   expect(parseToolResultEnvelope('{"output":"a\\nb\\… (+9 chars)').value).toEqual({ output: 'a\nb' });
 });
 
-test('classic-style speaker markers preserve literal labels inside user and assistant content', () => {
+test('explicit Next speaker labels preserve literal labels inside user and assistant content', () => {
   const lines = logViewLines([
     { role: 'user', content: '나: 라는 문구를 설명해줘', ts: '2026-11-15T00:00:00Z' },
     { role: 'assistant', content: '엘라누스: 는 본문입니다', ts: '2026-11-15T00:00:01Z' },
   ], 80);
-  expect(lines).toContain('❯ 나: 라는 문구를 설명해줘');
-  expect(lines).toContain('  엘라누스: 는 본문입니다');
-  expect(streamReplyLines('응답 본문', 80)[0]).toBe('  응답 본문');
+  expect(lines).toContain('나: 나: 라는 문구를 설명해줘');
+  expect(lines).toContain('엘라누스: 엘라누스: 는 본문입니다');
+  expect(streamReplyLines('응답 본문', 80)[0]).toBe('엘라누스: 응답 본문');
+});
+
+test('greeting speaker labels agree between live and saved replies at narrow terminal widths', () => {
+  const messages: SerializedMessage[] = [
+    { role: 'user', content: '하이', ts: 'user' },
+    { role: 'assistant', content: '안녕하세요! 무엇을 도와드릴까요?', ts: 'reply' },
+  ];
+  const stored = JSON.stringify(messages);
+  // Source: OP73500/UNBLOCK0805 requires narrow and wide terminal observations.
+  for (const columns of [12, 40, 100]) {
+    const lines = logViewLines(messages, columns);
+    const savedReply = logViewLines([messages[1]!], columns).slice(0, -1);
+    const liveReply = streamReplyLines(messages[1]!.content, columns);
+    expect(lines[0]).toBe('나: 하이');
+    expect(savedReply[0]).toStartWith('엘라누스: ');
+    // Saved rows reset terminal attributes at wraps; live preview avoids those resets.
+    expect(liveReply.map(line => line.replace(/\x1b\[0m/g, ''))).toEqual(savedReply.map(line => line.replace(/\x1b\[0m/g, '')));
+    expect(lines.every(line => Bun.stringWidth(line) <= columns)).toBe(true);
+    expect(savedReply.map(line => line.replace(/\x1b\[0m/g, '')).join('').replace(/\s/g, '')).toContain(messages[1]!.content.replace(/\s/g, ''));
+  }
+  expect(JSON.stringify(messages)).toBe(stored);
+});
+
+
+test('long live reply keeps a visible speaker while retaining the bounded newest tail', () => {
+  // Source: #74912 requires preserving the existing streamReplyLines 80-row cap.
+  const cap = 80;
+  const content = Array.from({ length: cap + 1 }, (_, index) => `row-${index}`).join('\n');
+  for (const columns of [12, 40, 100]) {
+    const lines = streamReplyLines(content, columns);
+    expect(lines).toHaveLength(cap);
+    expect(safeLogText(lines[0]!)).toBe('엘라누스:');
+    expect(safeLogText(lines.at(-1)!)).toContain(`row-${cap}`);
+    expect(lines.map(safeLogText).join('\n')).not.toContain('row-0\n');
+    expect(lines.every(line => Bun.stringWidth(line) <= columns)).toBe(true);
+  }
 });

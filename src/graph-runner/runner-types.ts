@@ -16,6 +16,13 @@ import type { ReleaseOpEvent } from '../release-loop/op-channel.js';
 import type { MsgStore } from '../msg/msg-store.js';
 
 export type GraphGrowthScope = 'harness' | 'task-agent';
+/** Authenticated host policy; this is never read from graph input or model output. */
+export interface S2CorrectionBudget {
+  readonly maxCorrections: number;
+  readonly maxTotalVisits: number;
+  readonly deadlineAtMs: number;
+  readonly catalogSnapshotDigest: string;
+}
 type BashRun = WorkflowDeps['runBash'];
 
 /** Parent graph budgets inherited by child unit runs. Internal runGraph handoff only. */
@@ -24,6 +31,10 @@ export interface GraphLoopBudgetScope { readonly graphId: string; readonly runId
 export interface GraphRunState {
   graphId: string;
   runId: string;
+  /** Frozen at first start in the existing atomic run ledger; resume may only shorten its deadline. */
+  s2CorrectionBudget?: S2CorrectionBudget;
+  /** The first authenticated host owner; never replaced by resume input. */
+  s2CorrectionOwnerId?: string;
   startedAt?: string;
   finishedAt?: string;
   pid?: number;
@@ -135,6 +146,8 @@ export interface GraphRunOptions {
   input?: unknown;
   /** Authenticated owner from the host route; graph input cannot establish this identity. */
   verifiedOwnerId?: string;
+  /** Supplied only by the authenticated S2 host after declaration validation. */
+  s2CorrectionBudget?: S2CorrectionBudget;
   /** Merge a small compatibility repair into the saved input while holding the run's resume lock. */
   resumeInputPatch?: Record<string, unknown>;
   /** Abort an active graph command and stop before dispatching the next node. */

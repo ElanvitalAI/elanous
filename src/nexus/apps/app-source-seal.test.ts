@@ -2,8 +2,8 @@ import { afterEach, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { sealAppSource } from './app-source-seal.js';
+import { basename, join } from 'node:path';
+import { reopenSealedAppSource, sealAppSource } from './app-source-seal.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -50,6 +50,43 @@ test('verified source-artifact@1 bytes are copied into a private atomic seal wit
   expect(existsSync(join(sealed.sealPath, '.elanous', 'seal.json'))).toBe(true);
   expect(existsSync(join(sealed.sealPath, 'seal.json'))).toBe(false);
   expect(existsSync(join(sealed.sealPath, 'source-artifact.json'))).toBe(false);
+});
+
+test('sealed bytes reopen after source removal without a new build authority or reseal', async () => {
+  const { input, appRoot, sealRoot } = fixture();
+  const sealed = await sealAppSource(input);
+  const reopen = () => reopenSealedAppSource({ sealRoot, sealPath: sealed.sealPath,
+    sourceRoot: appRoot, ownerId: sealed.ownerId, runId: sealed.runId, artifactDigest: sealed.artifactDigest });
+  rmSync(appRoot, { recursive: true });
+  const restored = reopen();
+  expect(restored.artifactDigest).toBe(sealed.artifactDigest);
+  expect(restored.runtime).toEqual(sealed.runtime);
+  expect(restored.frontendAssets?.get('index.html')?.toString('utf8')).toBe('<html>synthetic frontend</html>\n');
+  expect(readdirSync(sealRoot)).toEqual([basename(sealed.sealPath)]);
+  expect(() => reopenSealedAppSource({ sealRoot, sealPath: sealed.sealPath,
+    sourceRoot: join(sealRoot, 'forged'), ownerId: sealed.ownerId, runId: sealed.runId,
+    artifactDigest: sealed.artifactDigest })).toThrow('app source seal refused');
+});
+
+test('reopen refuses changed sealed bytes, undeclared paths and missing private manifest', async () => {
+  const { input, appRoot, sealRoot } = fixture();
+  const sealed = await sealAppSource(input);
+  const reopen = () => reopenSealedAppSource({ sealRoot, sealPath: sealed.sealPath,
+    sourceRoot: appRoot, ownerId: sealed.ownerId, runId: sealed.runId, artifactDigest: sealed.artifactDigest });
+  expect(reopen().files).toBe(sealed.files);
+  const entry = join(sealed.sealPath, 'backend/server.ts');
+  const original = readFileSync(entry);
+  writeFileSync(entry, 'tampered');
+  expect(reopen).toThrow('app source seal refused');
+  writeFileSync(entry, original);
+  writeFileSync(join(sealed.sealPath, 'extra.txt'), 'extra', { mode: 0o600 });
+  expect(reopen).toThrow('app source seal refused');
+  rmSync(join(sealed.sealPath, 'extra.txt'));
+  chmodSync(join(sealed.sealPath, 'frontend'), 0o755);
+  expect(reopen).toThrow('app source seal refused');
+  chmodSync(join(sealed.sealPath, 'frontend'), 0o700);
+  rmSync(join(sealed.sealPath, '.elanous', 'source-artifact.json'));
+  expect(reopen).toThrow();
 });
 
 test('valid source seal.json is preserved beside a private noncolliding receipt', async () => {

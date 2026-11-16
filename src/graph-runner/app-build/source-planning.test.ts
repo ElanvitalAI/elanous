@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { runGraph } from '../runner.js';
 import { createSourcePlanningRegistry, type PlanningModelReply } from '../capability-providers/source-planning.js';
 import { ARCHITECTURE_SECTIONS, APP_BUILD_MAX_REPAIRS } from './contracts.js';
+import { extractMermaidBlocks } from './mermaid-parse.js';
 
 const graph = fileURLToPath(new URL('../../../plugins/elanous-app-build/graph/app-build-plan.yaml', import.meta.url));
 const roots: string[] = [];
@@ -20,6 +21,9 @@ const testStrategy = [{ id: 'roundtrip', kind: 'api', target: 'Validate a record
 const architecture = { testStrategyTitle: 'Test strategy', testStrategy, markdown: ARCHITECTURE_SECTIONS.map(key => '## ' + key + '\nConcrete synthetic ' + key
   + (diagrams[key] ? '\n' + diagrams[key] : '') + (key === 'api' ? '\n[API implementation](backend/source.ts)' : '')).join('\n'),
   sections: Object.fromEntries(ARCHITECTURE_SECTIONS.map(key => [key, 'Concrete synthetic ' + key])) };
+const invalidMermaidArchitecture = { ...architecture,
+  markdown: architecture.markdown.replace(' }\n```', ' }\n User ||--o{ Order : 포함\n```') };
+const fixedErCode = extractMermaidBlocks(invalidMermaidArchitecture.markdown)[1]!.code.replace(' : 포함', ' : "포함"');
 const roles = ['architecture', 'database', 'backend', 'frontend', 'test', 'seed'];
 const plan = { plan: roles.map((role, index) => ({ path: role === 'architecture' ? 'ARCHITECTURE.md' : role === 'test' ? 'test/source.test.ts' : role + '/source.ts', purpose: role,
   role, dependsOn: index ? ['ARCHITECTURE.md'] : [] })) };
@@ -54,13 +58,211 @@ test('actual graph runs ordered stages and repairs a clarification response with
   expect(prompts.at(-1)).toContain('Use local SQLite');
 });
 
+test('actual graph repairs only one failed ERD body and then reaches file planning', async () => {
+  let architectureCalls = 0;
+  let repairCalls = 0;
+  const prompts: string[] = [];
+  const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+    prompts.push(prompt);
+    if (prompt.startsWith('Repair only these Mermaid code bodies.')) {
+      repairCalls++;
+      return model({ replacements: [{ index: 1, kind: 'erDiagram', code: fixedErCode }] });
+    }
+    if (prompt.includes('Stage: architecture.')) { architectureCalls++; return model(invalidMermaidArchitecture); }
+    return model(valueFor(prompt));
+  } });
+  const state = await runGraph(graph, { input: { ask: 'Build an application with synthetic data.', seedRequested: true },
+    verifiedOwnerId: 'synthetic-planning-owner', quiet: true, deps: { root: root(), capabilityProviders: registry } });
+  expect(state.status).toBe('done');
+  expect(state.path).toEqual(['assumptions', 'architecture', 'file-plan', 'done']);
+  expect(architectureCalls).toBe(1);
+  expect(repairCalls).toBe(1);
+  const output = parsedOutput(state.nodes.find(node => node.nodeId === 'architecture')?.output);
+  expect(output.result?.repairUsed).toBe(1);
+  expect(output.evidence).toMatchObject({ mermaidFailedBlocks: 1,
+    mermaidParseReceipts: [
+      { index: 0, diagnostic: null },
+      { index: 1, kind: 'erDiagram', diagnostic: 'MERMAID_PARSE_ERROR' },
+      { index: 2, diagnostic: null },
+    ], mermaidReparseReceipts: [{ index: 1, kind: 'erDiagram', diagnostic: null }] });
+  const repaired = (output.result?.architecture as { markdown: string }).markdown;
+  const before = extractMermaidBlocks(invalidMermaidArchitecture.markdown);
+  const after = extractMermaidBlocks(repaired);
+  expect(output.evidence).toMatchObject({ mermaidParseReceipts: before.map(block => ({
+    index: block.index, kind: block.kind, sourceSha256: block.sourceSha256 })) });
+  expect(JSON.stringify(output.evidence)).not.toContain('User ||--o{ Order');
+  expect(after[0]!.sourceSha256).toBe(before[0]!.sourceSha256);
+  expect(after[2]!.sourceSha256).toBe(before[2]!.sourceSha256);
+  expect(repaired).toContain('## Test strategy');
+  expect(prompts.find(prompt => prompt.startsWith('Repair only'))).not.toContain(before[0]!.code);
+});
+
+test('actual graph repairs a parser-valid unquoted Korean node label before file planning', async () => {
+  const invalid = { ...architecture, markdown: architecture.markdown.replace('Browser-->API', 'Browser[관람객]-->API') };
+  const before = extractMermaidBlocks(invalid.markdown);
+  const corrected = before[0]!.code.replace('Browser[관람객]', 'Browser["관람객"]');
+  const prompts: string[] = [];
+  const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+    prompts.push(prompt);
+    if (prompt.startsWith('Repair only these Mermaid code bodies.')) return model({ replacements: [{ index: 0, kind: 'graph', code: corrected }] });
+    if (prompt.includes('Stage: architecture.')) return model(invalid);
+    return model(valueFor(prompt));
+  } });
+  const state = await runGraph(graph, { input: { ask: '콘서트 앱 생성', seedRequested: true },
+    verifiedOwnerId: 'synthetic-planning-owner', quiet: true,
+    deps: { root: root(), capabilityProviders: registry } });
+  expect(state.path).toEqual(['assumptions', 'architecture', 'file-plan', 'done']);
+  expect(prompts.filter(prompt => prompt.startsWith('Repair only'))).toHaveLength(1);
+  const output = parsedOutput(state.nodes.find(node => node.nodeId === 'architecture')?.output);
+  expect(output.evidence).toMatchObject({ mermaidFailedBlocks: 1,
+    mermaidParseReceipts: [{ index: 0, diagnostic: 'MERMAID_LABEL_POLICY_ERROR' },
+      { index: 1, diagnostic: null }, { index: 2, diagnostic: null }],
+    mermaidReparseReceipts: [{ index: 0, diagnostic: null }] });
+  const repaired = (output.result?.architecture as { markdown: string }).markdown;
+  const after = extractMermaidBlocks(repaired);
+  expect(repaired.slice(0, before[0]!.begin)).toBe(invalid.markdown.slice(0, before[0]!.begin));
+  expect(after.slice(1).map(block => block.sourceSha256)).toEqual(before.slice(1).map(block => block.sourceSha256));
+  expect(prompts.find(prompt => prompt.startsWith('Repair only'))).toContain('MERMAID_LABEL_POLICY_ERROR');
+});
+
+test('actual graph stops when the repair keeps a parser-valid unquoted Korean label', async () => {
+  const invalid = { ...architecture, markdown: architecture.markdown.replace('Browser-->API', 'Browser[관람객]-->API') };
+  const failed = extractMermaidBlocks(invalid.markdown)[0]!;
+  const prompts: string[] = [];
+  const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+    prompts.push(prompt);
+    if (prompt.startsWith('Repair only these Mermaid code bodies.')) return model({ replacements: [
+      { index: 0, kind: 'graph', code: failed.code },
+    ] });
+    if (prompt.includes('Stage: architecture.')) return model(invalid);
+    return model(valueFor(prompt));
+  } });
+  const state = await runGraph(graph, { input: { ask: '콘서트 앱 생성', seedRequested: true },
+    verifiedOwnerId: 'synthetic-planning-owner', quiet: true,
+    deps: { root: root(), capabilityProviders: registry } });
+  expect(state.path).toEqual(['assumptions', 'architecture', 'failed']);
+  expect(prompts.some(prompt => prompt.includes('Stage: file-plan.'))).toBe(false);
+});
+
+test('actual graph repairs or stops a parser-valid --x Unicode sequence endpoint before file planning', async () => {
+  const invalid = { ...architecture, markdown: architecture.markdown.replace('Browser->>API: POST record',
+    'Browser--x"관람객": POST record') };
+  const before = extractMermaidBlocks(invalid.markdown);
+  const fixed = before[2]!.code.replace('--x"관람객"', '--xAudience');
+  for (const replacement of [fixed, before[2]!.code]) {
+    const prompts: string[] = [];
+    const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+      prompts.push(prompt);
+      if (prompt.startsWith('Repair only these Mermaid code bodies.')) return model({ replacements: [
+        { index: 2, kind: 'sequenceDiagram', code: replacement },
+      ] });
+      if (prompt.includes('Stage: architecture.')) return model(invalid);
+      return model(valueFor(prompt));
+    } });
+    const state = await runGraph(graph, { input: { ask: '콘서트 앱 생성', seedRequested: true },
+      verifiedOwnerId: 'synthetic-planning-owner', quiet: true,
+      deps: { root: root(), capabilityProviders: registry } });
+    expect(prompts.filter(prompt => prompt.startsWith('Repair only'))).toHaveLength(1);
+    expect(prompts.find(prompt => prompt.startsWith('Repair only'))).toContain('MERMAID_LABEL_POLICY_ERROR');
+    if (replacement === fixed) {
+      expect(state.path).toEqual(['assumptions', 'architecture', 'file-plan', 'done']);
+      const output = parsedOutput(state.nodes.find(node => node.nodeId === 'architecture')?.output);
+      const after = extractMermaidBlocks((output.result?.architecture as { markdown: string }).markdown);
+      expect(after.slice(0, 2).map(block => block.sourceSha256)).toEqual(before.slice(0, 2).map(block => block.sourceSha256));
+    } else {
+      expect(state.path).toEqual(['assumptions', 'architecture', 'failed']);
+      expect(prompts.some(prompt => prompt.includes('Stage: file-plan.'))).toBe(false);
+    }
+  }
+});
+
+test('actual graph refuses a colon inside a quoted Unicode endpoint before file planning', async () => {
+  const invalid = { ...architecture, markdown: architecture.markdown.replace('Browser->>API: POST record',
+    'Browser--x"관람객: VIP": POST record') };
+  const failed = extractMermaidBlocks(invalid.markdown)[2]!;
+  const prompts: string[] = [];
+  const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+    prompts.push(prompt);
+    if (prompt.startsWith('Repair only these Mermaid code bodies.')) return model({ replacements: [
+      { index: 2, kind: 'sequenceDiagram', code: failed.code },
+    ] });
+    if (prompt.includes('Stage: architecture.')) return model(invalid);
+    return model(valueFor(prompt));
+  } });
+  const state = await runGraph(graph, { input: { ask: '콘서트 앱 생성', seedRequested: true },
+    verifiedOwnerId: 'synthetic-planning-owner', quiet: true,
+    deps: { root: root(), capabilityProviders: registry } });
+  expect(state.path).toEqual(['assumptions', 'architecture', 'failed']);
+  expect(prompts.find(prompt => prompt.startsWith('Repair only'))).toContain('MERMAID_LABEL_POLICY_ERROR');
+  expect(prompts.some(prompt => prompt.includes('Stage: file-plan.'))).toBe(false);
+});
+
+test('actual graph refuses wrong-index, fence escape and still-invalid Mermaid repair before file planning', async () => {
+  for (const replacement of [{ index: 0, kind: 'erDiagram', code: fixedErCode },
+    { index: 1, kind: 'erDiagram', code: 'erDiagram\n RECORD {\n string id PK\n }\n```\nInjected prose\n```text\nplaceholder' },
+    { index: 1, kind: 'erDiagram', code: extractMermaidBlocks(invalidMermaidArchitecture.markdown)[1]!.code }]) {
+    const prompts: string[] = [];
+    const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+      prompts.push(prompt);
+      if (prompt.startsWith('Repair only these Mermaid code bodies.')) return model({ replacements: [replacement] });
+      if (prompt.includes('Stage: architecture.')) return model(invalidMermaidArchitecture);
+      return model(valueFor(prompt));
+    } });
+    const state = await runGraph(graph, { input: { ask: 'Build an application with synthetic data.', seedRequested: true },
+      verifiedOwnerId: 'synthetic-planning-owner', quiet: true, deps: { root: root(), capabilityProviders: registry } });
+    expect(state.status).toBe('failed');
+    expect(state.path).toEqual(['assumptions', 'architecture', 'failed']);
+    expect(prompts.filter(prompt => prompt.startsWith('Repair only'))).toHaveLength(1);
+    expect(prompts.some(prompt => prompt.includes('Stage: file-plan.'))).toBe(false);
+  }
+});
+
+test('abort during failed-block repair never reaches file planning', async () => {
+  const controller = new AbortController();
+  const prompts: string[] = [];
+  const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+    prompts.push(prompt);
+    if (prompt.startsWith('Repair only these Mermaid code bodies.')) {
+      controller.abort();
+      return model({ replacements: [{ index: 1, kind: 'erDiagram', code: fixedErCode }] });
+    }
+    if (prompt.includes('Stage: architecture.')) return model(invalidMermaidArchitecture);
+    return model(valueFor(prompt));
+  } });
+  const state = await runGraph(graph, { input: { ask: 'Build an application with synthetic data.', seedRequested: true },
+    verifiedOwnerId: 'synthetic-planning-owner', quiet: true, signal: controller.signal,
+    deps: { root: root(), capabilityProviders: registry } });
+  expect(state.status).not.toBe('done');
+  expect(prompts.filter(prompt => prompt.startsWith('Repair only'))).toHaveLength(1);
+  expect(prompts.some(prompt => prompt.includes('Stage: file-plan.'))).toBe(false);
+});
+
+test('spent planning repair budget blocks Mermaid regeneration and file planning', async () => {
+  let assumptionCalls = 0;
+  const prompts: string[] = [];
+  const registry = createSourcePlanningRegistry({ callLLM: async prompt => {
+    prompts.push(prompt);
+    if (prompt.includes('Stage: assumptions.')) return model(++assumptionCalls <= APP_BUILD_MAX_REPAIRS
+      ? { assumptions: [{ statement: 'assumed: Which app?', source: 'assumed' }] } : assumptions);
+    if (prompt.includes('Stage: architecture.')) return model(invalidMermaidArchitecture);
+    return model(valueFor(prompt));
+  } });
+  const state = await runGraph(graph, { input: { ask: 'Build an application with synthetic data.', seedRequested: true },
+    verifiedOwnerId: 'synthetic-planning-owner', quiet: true,
+    deps: { root: root(), capabilityProviders: registry } });
+  expect(state.status).toBe('failed');
+  expect(state.path).toEqual(['assumptions', 'architecture', 'failed']);
+  expect(prompts.some(prompt => prompt.startsWith('Repair only'))).toBe(false);
+  expect(prompts.some(prompt => prompt.includes('Stage: file-plan.'))).toBe(false);
+});
+
 test('Korean request keeps canonical architecture keys and Korean planning prose across all stages', async () => {
   const titles: Record<string, string> = { context: '시스템 맥락', dataModel: '데이터 모델', api: 'API 계약',
     sequences: '핵심 흐름', deployment: '배포 구성', security: '보안', tradeOffs: '설계 대안', operations: '운영' };
   const koreanDiagrams: Record<string, string> = {
-    context: '```mermaid\ngraph TD\n 사용자-->API\n API-->데이터베이스\n```',
-    dataModel: '```mermaid\nerDiagram\n 좌석 ||--o{ 예약 : 포함\n```',
-    sequences: '```mermaid\nsequenceDiagram\n 사용자->>API: 예약 요청\n API-->>사용자: 예약 결과\n```',
+    context: '```mermaid\ngraph TD\n Browser["사용자"]-->API\n API-->Database["데이터베이스"]\n```',
+    dataModel: '```mermaid\nerDiagram\n SEAT ||--o{ BOOKING : "포함"\n```',
+    sequences: '```mermaid\nsequenceDiagram\n participant User as "사용자"\n User->>API: "예약 요청"\n API-->>User: "예약 결과"\n```',
   };
   const koreanArchitecture = { testStrategyTitle: '시험 전략', testStrategy: testStrategy.map(item => ({ ...item, target: '생성 후 조회한 값이 일치해야 한다' })), markdown: ARCHITECTURE_SECTIONS.map(key => `## ${key} — ${titles[key]}\n${titles[key]} 설계 설명`
     + (koreanDiagrams[key] ? `\n${koreanDiagrams[key]}` : '')
@@ -83,6 +285,7 @@ test('Korean request keeps canonical architecture keys and Korean planning prose
     expect(prompts).toHaveLength(3);
     expect(prompts.every(prompt => prompt.includes('language of the user request'))).toBe(true);
     expect(prompts.find(prompt => prompt.includes('Stage: architecture.'))).toContain('## context — 시스템 맥락');
+    expect(prompts.find(prompt => prompt.includes('Stage: architecture.'))).toContain('use ASCII identifiers');
     expect(prompts.find(prompt => prompt.includes('Stage: file-plan.'))).toContain('로컬 SQLite를 사용한다.');
     const output = parsedOutput(state.nodes.find(node => node.nodeId === 'file-plan')?.output);
     expect(output.result?.planningComplete).toBe(true);

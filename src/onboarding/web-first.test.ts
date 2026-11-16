@@ -46,7 +46,9 @@ test('real CLI first run waits for health before printing a claimable setup link
       const output = stdout + stderr;
       expect(exitCode).toBe(0);
       expect(events).toContain('/v1/health');
-      const link = output.match(new RegExp(`http://127\\.0\\.0\\.1:${server.port}/app/setup/#t=(els_[A-Za-z0-9_-]{43})`));
+      // This health/claim test runs as local macOS or displayless Linux. Remote
+      // marker behavior is asserted separately with an explicit SSH fixture.
+      const link = output.match(new RegExp(`http://127\\.0\\.0\\.1:${server.port}/app/setup/(?:\\?remote=1)?#t=(els_[A-Za-z0-9_-]{43})`));
       expect(link).not.toBeNull();
       expect(claimSetupLinkToken(link![1]!, { dir }).ok).toBe(true);
       expect(output).not.toContain('Choose LLM');
@@ -87,7 +89,7 @@ test('stale ready marker without a provider still enters web-first', async () =>
       const output = stdout + stderr;
       expect(exitCode).toBe(0);
       expect(events).toContain('/v1/health');
-      const link = output.match(new RegExp(`http://127\\.0\\.0\\.1:${server.port}/app/setup/#t=(els_[A-Za-z0-9_-]{43})`));
+      const link = output.match(new RegExp(`http://127\\.0\\.0\\.1:${server.port}/app/setup/(?:\\?remote=1)?#t=(els_[A-Za-z0-9_-]{43})`));
       expect(link).not.toBeNull();
       expect(claimSetupLinkToken(link![1]!, { dir }).ok).toBe(true);
       expect(output).not.toContain('daemon: absent');
@@ -208,6 +210,40 @@ function fixture(overrides: Partial<WebFirstSetupDeps> = {}) {
   return { deps, lines, qrLinks };
 }
 
+test('SSH first run recommends terminal and Enter takes that route before daemon or token work', async () => {
+  const prompts: string[] = [];
+  const { deps, lines } = fixture({
+    browserEnv: { SSH_CONNECTION: 'remote' }, browserPlatform: 'linux',
+    chooseSetupMode: async prompt => { prompts.push(prompt); return ''; },
+    showNexus: async () => { throw Error('daemon must not be inspected'); },
+    issueSetupLinkToken: async () => { throw Error('token must not be issued'); },
+  });
+  expect(await runWebFirstSetup(deps)).toBe('fallback');
+  expect(lines).toEqual(['설정 방법을 고르세요 · 1) 터미널에서 설정 (추천)  2) 웹(브라우저)에서 설정']);
+  expect(prompts).toEqual(['선택 [1]: ']);
+});
+
+test('SSH web choice marks the link remote and shows a claim token only once', async () => {
+  const { deps, lines, qrLinks } = fixture({
+    browserEnv: { SSH_CONNECTION: 'remote' }, browserPlatform: 'linux',
+    chooseSetupMode: async () => '2',
+    httpHost: () => '0.0.0.0',
+    interfaces: () => ({ en0: [{ address: '192.168.1.20', family: 'IPv4', internal: false }] } as never),
+  });
+  expect(await runWebFirstSetup(deps)).toBe('link-shown');
+  expect(lines).toContain('http://127.0.0.1:4321/app/setup/?remote=1#t=secret%2B%2F%3D');
+  expect(lines.join('\n').match(/secret%2B%2F%3D/g)).toHaveLength(1);
+  expect(lines.join('\n')).toContain('#t=••••');
+  expect(qrLinks[0]).toContain('?remote=1#t=');
+});
+
+test('local Enter keeps browser setup without a remote marker', async () => {
+  const { deps, lines } = fixture({ chooseSetupMode: async () => '' });
+  expect(await runWebFirstSetup(deps)).toBe('link-shown');
+  expect(lines[0]).toContain('2) 웹(브라우저)에서 설정 (추천)');
+  expect(lines).toContain('http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D');
+});
+
 test('disabled and --terminal never inspect daemon or issue tokens', async () => {
   for (const change of [
     { config: { onboarding: { completed: false, version: 0, webFirst: false } } },
@@ -254,10 +290,10 @@ test('headless installer opt-in starts the daemon and prints link, QR, SSH comma
   });
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
   expect({ starts, opened }).toEqual({ starts: 1, opened: 0 });
-  expect(lines).toContain('http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D');
+  expect(lines).toContain('http://127.0.0.1:4321/app/setup/?remote=1#t=secret%2B%2F%3D');
   expect(lines).toContain('QR image');
   expect(lines).toContain('ssh -L 4321:localhost:4321 operator@host.example');
-  expect(qrLinks).toEqual(['http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D']);
+  expect(qrLinks).toEqual(['http://127.0.0.1:4321/app/setup/?remote=1#t=secret%2B%2F%3D']);
   expect(debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1)?.data)
     .toMatchObject({ qr: true, browserOpened: false, ssh: true });
 });
@@ -579,7 +615,7 @@ test('SSH Mac and displayless Linux show the link and why without invoking the o
       openBrowser: url => { opened.push(url); return true; },
     });
     expect(await runWebFirstSetup(deps)).toBe('link-shown');
-    expect(lines).toContain('http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D');
+    expect(lines).toContain(`http://127.0.0.1:4321/app/setup/${expected ? '?remote=1' : ''}#t=secret%2B%2F%3D`);
     if (expected) {
       expect(opened).toEqual([]);
       expect(lines.join('\n')).toContain(expected);
@@ -600,7 +636,7 @@ test('wildcard bind prints one LAN link using the same token, QR fallback and sa
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
   expect(lines.filter(line => line.includes('/app/setup/#t='))).toEqual([
     'http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D',
-    '같은 와이파이의 폰이면: http://192.168.0.12:4321/app/setup/#t=secret%2B%2F%3D',
+    '같은 와이파이의 폰이면: http://192.168.0.12:4321/app/setup/#t=••••',
   ]);
   expect(lines).toContain('이 링크는 10분 안에 한 번만 열 수 있습니다');
   expect(qrLinks).toEqual(['http://192.168.0.12:4321/app/setup/#t=secret%2B%2F%3D']);
@@ -637,7 +673,7 @@ test('specific private bind uses its listening address rather than the default-r
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
   expect(lines.filter(line => line.includes('/app/setup/#t='))).toEqual([
     'http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D',
-    '같은 와이파이의 폰이면: http://192.168.1.20:4321/app/setup/#t=secret%2B%2F%3D',
+    '같은 와이파이의 폰이면: http://192.168.1.20:4321/app/setup/#t=••••',
   ]);
   expect(qrLinks).toEqual(['http://192.168.1.20:4321/app/setup/#t=secret%2B%2F%3D']);
   expect(debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1)?.data).toMatchObject({ lan: 'shown' });
@@ -664,7 +700,7 @@ test('confirmed empty bind is distinct from an unknown bind and can show the LAN
     interfaces: () => ({ en0: [{ address: '192.168.0.12', family: 'IPv4', internal: false } as never] }),
   });
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
-  expect(lines).toContain('같은 와이파이의 폰이면: http://192.168.0.12:4321/app/setup/#t=secret%2B%2F%3D');
+  expect(lines).toContain('같은 와이파이의 폰이면: http://192.168.0.12:4321/app/setup/#t=••••');
   expect(qrLinks).toEqual(['http://192.168.0.12:4321/app/setup/#t=secret%2B%2F%3D']);
   expect(debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1)?.data).toMatchObject({ lan: 'shown' });
 });
@@ -675,7 +711,7 @@ test('LAN route lookup exception falls back to the first private interface witho
     defaultRouteInterface: () => { throw Error('route unavailable'); },
   });
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
-  expect(lines).toContain('같은 와이파이의 폰이면: http://10.0.0.5:4321/app/setup/#t=secret%2B%2F%3D');
+  expect(lines).toContain('같은 와이파이의 폰이면: http://10.0.0.5:4321/app/setup/#t=••••');
   expect(debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1)?.data).toMatchObject({ lan: 'shown' });
 });
 
@@ -698,7 +734,7 @@ test('tailnet QR retains priority over LAN QR even when both links are available
     interfaces: () => ({ en0: [{ address: '192.168.0.12', family: 'IPv4', internal: false } as never] }),
   });
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
-  expect(lines).toContain('같은 와이파이의 폰이면: http://192.168.0.12:4321/app/setup/#t=secret%2B%2F%3D');
+  expect(lines).toContain('같은 와이파이의 폰이면: http://192.168.0.12:4321/app/setup/#t=••••');
   expect(lines).toContain('tailnet에 연결된 기기의 카메라로 스캔하세요');
   expect(qrLinks).toEqual(['https://machine.ts.net/app/setup/#t=secret%2B%2F%3D']);
 });
@@ -721,7 +757,7 @@ test('SSH user information failure does not interrupt setup or disclose identity
     hostname: () => 'host.example',
   });
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
-  expect(lines).toContain('http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D');
+  expect(lines).toContain('http://127.0.0.1:4321/app/setup/?remote=1#t=secret%2B%2F%3D');
   expect(lines.join('\n')).toContain('원격(ssh)');
   expect(lines.some(line => line.startsWith('ssh -L '))).toBe(false);
   const event = debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1);
@@ -735,7 +771,7 @@ test('SSH forwards the actual daemon port from the setup link', async () => {
     hostname: () => 'host.example', username: () => 'operator',
   });
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
-  expect(lines).toContain('http://127.0.0.1:31415/app/setup/#t=secret%2B%2F%3D');
+  expect(lines).toContain('http://127.0.0.1:31415/app/setup/?remote=1#t=secret%2B%2F%3D');
   expect(lines).toContain('ssh -L 31415:localhost:31415 operator@host.example');
   expect(debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1)?.data).toMatchObject({ ssh: true });
 });
@@ -748,7 +784,7 @@ test('SSH with DISPLAY still prints forwarding hint and preserves browser-open b
     openBrowser: link => { opened.push(link); return true; },
   });
   expect(await runWebFirstSetup(deps)).toBe('link-shown');
-  expect(opened).toEqual(['http://127.0.0.1:4321/app/setup/#t=secret%2B%2F%3D']);
+  expect(opened).toEqual(['http://127.0.0.1:4321/app/setup/?remote=1#t=secret%2B%2F%3D']);
   expect(lines).toContain('ssh -L 4321:localhost:4321 operator@host.example');
   expect(debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1)?.data).toMatchObject({ ssh: true });
 });

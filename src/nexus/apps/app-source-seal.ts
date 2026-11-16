@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, lstatSync, mkdirSync, openSync, opendirSync, readSync, realpathSync, renameSync, rmSync, closeSync, fstatSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { constants, lstatSync, mkdirSync, openSync, opendirSync, readSync, readdirSync,
+  realpathSync, renameSync, rmSync, closeSync, fstatSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
@@ -78,7 +79,7 @@ function readRegular(path: string, limit: number): Buffer {
     return data.subarray(0, length);
   } finally { closeSync(fd); }
 }
-function sourceNames(root: string): string[] {
+function sourceNames(root: string, ignorePrivateReceipt = false): string[] {
   const names: string[] = [];
   let entries = 0;
   const visit = (directory: string, depth: number): void => {
@@ -91,9 +92,14 @@ function sourceNames(root: string): string[] {
       const stat = lstatSync(path);
       if (stat.isSymbolicLink()) refuse();
       const relativePath = relative(root, path).split(sep).join('/');
-      if (relativePath === 'source-artifact.json') continue;
+      if (!ignorePrivateReceipt && relativePath === 'source-artifact.json') continue;
+      if (ignorePrivateReceipt && relativePath === '.elanous') continue;
       if (!safePath(relativePath)) refuse();
-      if (stat.isDirectory()) visit(path, depth + 1);
+      if (stat.isDirectory()) {
+        if (ignorePrivateReceipt && ((stat.mode & 0o077) !== 0
+          || process.getuid && stat.uid !== process.getuid() || realpathSync(path) !== path)) refuse();
+        visit(path, depth + 1);
+      }
       else if (stat.isFile()) names.push(relativePath);
       else refuse();
       if (names.length > MAX_FILES) refuse();
@@ -175,7 +181,8 @@ export async function sealAppSource(input: SealAppSourceInput): Promise<SealedAp
     // segments, so this private receipt directory cannot collide with the file map.
     const receiptRoot = join(staging, '.elanous');
     mkdirSync(receiptRoot, { mode: 0o700 });
-    writeFileSync(join(receiptRoot, 'seal.json'), JSON.stringify({ ...receipt, sealPath: undefined }) + '\n', { flag: 'wx', mode: 0o600 });
+    writeFileSync(join(receiptRoot, 'seal.json'), JSON.stringify({ ...receipt, sourceRoot, sealPath: undefined }) + '\n', { flag: 'wx', mode: 0o600 });
+    writeFileSync(join(receiptRoot, 'source-artifact.json'), raw, { flag: 'wx', mode: 0o600 });
     if (!await input.stillAuthorized()) refuse();
     sameIdentity(sourceRoot, sourceIdentity);
     sameIdentity(sealRoot, sealIdentity);
@@ -185,4 +192,86 @@ export async function sealAppSource(input: SealAppSourceInput): Promise<SealedAp
     rmSync(staging, { recursive: true, force: true });
     throw error;
   }
+}
+
+export interface ReopenSealedAppSourceInput {
+  readonly sealRoot: string;
+  readonly sealPath: string;
+  readonly sourceRoot: string;
+  readonly ownerId: string;
+  readonly runId: string;
+  readonly artifactDigest: string;
+}
+
+/** Reopen the original copied bytes; never invoke build authority or reseal. */
+export function reopenSealedAppSource(input: ReopenSealedAppSourceInput): SealedAppSource {
+  if (![input.sealRoot, input.sealPath, input.sourceRoot].every(isAbsolute)
+    || !ID.test(input.ownerId) || !ID.test(input.runId) || !DIGEST.test(input.artifactDigest)) refuse();
+  const sealRoot = resolve(input.sealRoot);
+  const sealPath = resolve(input.sealPath);
+  const sourceRoot = resolve(input.sourceRoot);
+  if (sealRoot !== input.sealRoot || sealPath !== input.sealPath || sourceRoot !== input.sourceRoot
+    || dirname(sealPath) !== sealRoot
+    || !/^source-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(basename(sealPath))
+    || realpathSync(sealRoot) !== sealRoot || realpathSync(sealPath) !== sealPath) refuse();
+  const sealRootIdentity = identity(sealRoot);
+  const sealRootStat = lstatSync(sealRoot);
+  if ((sealRootStat.mode & 0o077) !== 0 || process.getuid && sealRootStat.uid !== process.getuid()) refuse();
+  const sealedIdentity = identity(sealPath);
+  const sealedStat = lstatSync(sealPath);
+  if ((sealedStat.mode & 0o077) !== 0 || process.getuid && sealedStat.uid !== process.getuid()) refuse();
+  const receiptRoot = join(sealPath, '.elanous');
+  const receiptIdentity = identity(receiptRoot);
+  const receiptStat = lstatSync(receiptRoot);
+  if ((receiptStat.mode & 0o077) !== 0 || process.getuid && receiptStat.uid !== process.getuid()
+    || realpathSync(receiptRoot) !== receiptRoot
+    || readdirSync(receiptRoot).sort().join() !== 'seal.json,source-artifact.json') refuse();
+  const receipt = record(JSON.parse(readRegular(join(receiptRoot, 'seal.json'), 8192).toString('utf8')));
+  if (Object.keys(receipt).sort().join() !== (receipt.frontendRoot === undefined
+    ? 'artifactDigest,files,ownerId,runId,runtime,sourceRoot'
+    : 'artifactDigest,files,frontendRoot,ownerId,runId,runtime,sourceRoot')
+    || receipt.ownerId !== input.ownerId || receipt.runId !== input.runId
+    || receipt.sourceRoot !== sourceRoot || receipt.artifactDigest !== input.artifactDigest) refuse();
+  const manifest = record(JSON.parse(readRegular(join(receiptRoot, 'source-artifact.json'), MAX_MANIFEST_BYTES).toString('utf8')));
+  exactKeys(manifest, ['schemaVersion', 'root', 'files', 'metadata', 'executed', 'published']);
+  if (manifest.schemaVersion !== 'source-artifact@1' || manifest.root !== sourceRoot
+    || manifest.executed !== false || manifest.published !== false) refuse();
+  const files = record(manifest.files);
+  const names = Object.keys(files).sort();
+  if (!names.length || names.length > MAX_FILES || !names.includes('ARCHITECTURE.md')
+    || names.some(name => !safePath(name) || !DIGEST.test(String(files[name])))) refuse();
+  const metadata = record(manifest.metadata);
+  const runtime = record(metadata.runtime);
+  if (Object.keys(runtime).some(key => !['startCommand', 'port', 'healthPath'].includes(key))
+    || !Array.isArray(runtime.startCommand) || !runtime.startCommand.length || runtime.startCommand.length > 16
+    || runtime.startCommand.some(arg => typeof arg !== 'string' || !arg || arg.length > 256 || /[\x00-\x1f]/u.test(arg))
+    || runtime.port !== undefined && (!Number.isInteger(runtime.port) || Number(runtime.port) < 31500 || Number(runtime.port) > 31599)
+    || typeof runtime.healthPath !== 'string' || !/^\/[A-Za-z0-9/_-]*$/.test(runtime.healthPath)) refuse();
+  const frontendRoot = metadata.frontendRoot;
+  if (frontendRoot !== undefined && (typeof frontendRoot !== 'string' || !safePath(frontendRoot))) refuse();
+  if (typeof frontendRoot === 'string' && !names.includes(frontendRoot + '/index.html')) refuse();
+  if (metadata.apiPrefix !== undefined && metadata.apiPrefix !== '/api') refuse();
+  const digest = sha256(JSON.stringify({ schemaVersion: manifest.schemaVersion, root: sourceRoot,
+    files: Object.fromEntries(names.map(name => [name, files[name]])), metadata, executed: false, published: false }));
+  if (digest !== input.artifactDigest || receipt.files !== names.length
+    || JSON.stringify(receipt.runtime) !== JSON.stringify(runtime) || receipt.frontendRoot !== frontendRoot
+    || sourceNames(sealPath, true).sort().join('\0') !== names.join('\0')) refuse();
+  let total = 0;
+  const frontendAssets = new Map<string, Buffer>();
+  for (const name of names) {
+    sameIdentity(sealPath, sealedIdentity);
+    const source = join(sealPath, name);
+    if (realpathSync(dirname(source)) !== dirname(source)) refuse();
+    const bytes = readRegular(source, MAX_SOURCE_BYTES - total);
+    total += bytes.byteLength;
+    if (sha256(bytes) !== files[name]) refuse();
+    if (typeof frontendRoot === 'string' && name.startsWith(frontendRoot + '/'))
+      frontendAssets.set(name.slice(frontendRoot.length + 1), Buffer.from(bytes));
+  }
+  sameIdentity(sealRoot, sealRootIdentity);
+  sameIdentity(sealPath, sealedIdentity);
+  sameIdentity(receiptRoot, receiptIdentity);
+  return { sealPath, artifactDigest: digest, ownerId: input.ownerId, runId: input.runId, files: names.length,
+    runtime: runtime as SealedAppSource['runtime'],
+    ...(typeof frontendRoot === 'string' ? { frontendRoot, frontendAssets } : {}) };
 }

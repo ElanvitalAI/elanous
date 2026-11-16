@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decideGraphApproval, runGraph } from '../runner.js';
@@ -7,17 +7,36 @@ import { createGcpResourceObserveRegistry } from './gcp-resource-observe.js';
 import { createChildPluginRuntimeContract } from '../../cli/child-plugin-runtime.js';
 import { _setSystemGcloudPathsForTesting } from '../../cli/role-cli.js';
 import { generateStructuredDesign } from '../architecture-output/structured-design.js';
+import { runArchitectureDeliverables } from '../architecture-deliverables.js';
 
 const graph = join(import.meta.dir, '../../../plugins/gcp-architect-expand/graph.yaml');
 const ticketDesignPath = join(import.meta.dir, '../../../plugins/gcp-architect-expand/demo/fixtures/ticketing-design.json');
 
 function root() { return mkdtempSync(join(tmpdir(), 'gcp-observe-')); }
 
+/** Replace only the optional external renderer; the outer provider and graph still run. */
+const fakeRenderDeliverables: typeof runArchitectureDeliverables = async input => {
+  const design = JSON.parse(readFileSync(input.structuredDesignPath!, 'utf8')) as {
+    requirements: unknown[]; costs: Array<{ monthlyUsd: number | null }> };
+  expect(design.requirements).not.toEqual([]);
+  expect(design.costs[0]?.monthlyUsd).toBeNull();
+  const bundleDir = join(input.outDir, 'isolated-render');
+  mkdirSync(bundleDir, { recursive: true });
+  writeFileSync(join(bundleDir, 'architecture.excalidraw'), '{}');
+  writeFileSync(join(bundleDir, 'architecture.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+  writeFileSync(join(bundleDir, 'architecture.pdf'), '%PDF-1.4\n');
+  writeFileSync(join(bundleDir, 'architecture.html'), '<td>미산정</td>');
+  writeFileSync(join(input.outDir, 'verification.json'), JSON.stringify({ costStatus: 'unpriced' }));
+  return { graphId: 'architecture-deliverables', runId: 'isolated-render',
+    receipt: { status: 'verified', contract: 'system-architecture@2' }, outDir: input.outDir, bundleDir };
+};
+
 test('no cloud connection returns an explicit empty observation and continues to requirement design', async () => {
   const stateRoot = root();
   let reads = 0;
   try {
     const registry = createGcpResourceObserveRegistry({ connection: () => null, artifactRoot: () => stateRoot,
+      renderDeliverables: fakeRenderDeliverables,
       listInstances: async () => { reads++; return []; } });
     const state = await runGraph(graph, { input: { ticketDesignPath }, quiet: true,
       deps: { root: stateRoot, capabilityProviders: registry } });
@@ -54,6 +73,20 @@ test('no cloud connection returns an explicit empty observation and continues to
     expect(acknowledged.path).not.toContain('provision');
     const ledger = readFileSync(state.statePath, 'utf8');
     expect(ledger).not.toContain('fake-gcp-runs');
+  } finally { rmSync(stateRoot, { recursive: true, force: true }); }
+});
+
+test('an isolated renderer failure remains a graph failure rather than an approval card', async () => {
+  const stateRoot = root();
+  try {
+    const registry = createGcpResourceObserveRegistry({ connection: () => null,
+      artifactRoot: () => stateRoot, renderDeliverables: async () => { throw new Error('renderer unavailable'); } });
+    const state = await runGraph(graph, { input: { ticketDesignPath }, quiet: true,
+      deps: { root: stateRoot, capabilityProviders: registry } });
+    expect(state.status).toBe('failed');
+    expect(state.path).toContain('deliverables');
+    expect(state.path).not.toContain('connect-first');
+    expect(state.pending).toBeUndefined();
   } finally { rmSync(stateRoot, { recursive: true, force: true }); }
 });
 
@@ -136,27 +169,70 @@ test('a configured but unreadable connection fails as unknown, without claiming 
   } finally { rmSync(stateRoot, { recursive: true, force: true }); }
 });
 
-test('declared plugin route loads the operating provider with no connection and no fake resources', async () => {
+test('declared plugin route carries an isolated no-connection provider result and progress', async () => {
   const stateRoot = root();
   const old = process.env.ELANOUS_GCP_OBSERVE_PROJECT;
   const oldStateDir = process.env.ELANOUS_STATE_DIR;
   try {
     delete process.env.ELANOUS_GCP_OBSERVE_PROJECT;
     process.env.ELANOUS_STATE_DIR = stateRoot;
-    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'member-observe' }, graphDeps: { root: stateRoot },
+    const registry = createGcpResourceObserveRegistry({ connection: () => null,
+      artifactRoot: () => stateRoot, renderDeliverables: fakeRenderDeliverables });
+    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'member-observe' },
+      graphDeps: { root: stateRoot, capabilityProviders: registry },
       requestConfirmation: async () => true });
     const result = await bridge.dispatchPluginTool('gcp_architect_expand', { ticketDesignPath });
     if (!result.ok) throw new Error(result.error);
     expect(result.ok).toBe(true);
-    const state = result.ok ? result.result as { status: string; path: string[]; nodes: Array<{ nodeId: string; output?: string }> } : null;
+    const state = result.ok ? result.result as { status: string; path: string[]; runId: string;
+      graphObservation: { graphId: string; runId: string; events: Array<{ kind: string }> };
+      nodes: Array<{ nodeId: string; output?: string }> } : null;
     expect(state?.status).toBe('awaiting-approval');
     expect(state?.path).toEqual(['detect', 'design', 'deliverables', 'connect-first']);
+    expect(state?.graphObservation).toMatchObject({ graphId: 'gcp-architect-expand', runId: state?.runId });
+    expect(state?.graphObservation.events.some(event => event.kind === 'started')).toBe(true);
+    expect(state?.graphObservation.events.some(event => event.kind === 'completed')).toBe(true);
     expect(JSON.parse(String(state?.nodes.find(node => node.nodeId === 'detect')?.output)).result.message).toBe('연결 없음');
   } finally {
     if (old === undefined) delete process.env.ELANOUS_GCP_OBSERVE_PROJECT;
     else process.env.ELANOUS_GCP_OBSERVE_PROJECT = old;
     if (oldStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = oldStateDir;
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test('declared plugin route loads the default provider with a fake read-only cloud binary', async () => {
+  const stateRoot = root();
+  const script = join(stateRoot, 'gcloud');
+  const argsPath = join(stateRoot, 'argv');
+  const oldProject = process.env.ELANOUS_GCP_OBSERVE_PROJECT;
+  const oldArgv = process.env.MVP_B_GCLOUD_TEST_ARGV;
+  try {
+    writeFileSync(script, '#!/bin/sh\nprintf "%s\\n" "$@" > "$MVP_B_GCLOUD_TEST_ARGV"\nprintf "[]\\n"\n');
+    chmodSync(script, 0o755);
+    _setSystemGcloudPathsForTesting([script]);
+    process.env.ELANOUS_GCP_OBSERVE_PROJECT = 'member-cloud-123';
+    process.env.MVP_B_GCLOUD_TEST_ARGV = argsPath;
+    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'member-default-provider' },
+      graphDeps: { root: stateRoot }, requestConfirmation: async () => true });
+    const result = await bridge.dispatchPluginTool('gcp_architect_expand', { ticketDesignPath });
+    if (!result.ok) throw new Error(result.error);
+    const state = result.result as { status: string; path: string[]; runId: string;
+      graphObservation: { graphId: string; runId: string; events: Array<{ kind: string }> } };
+    expect(state.status).toBe('done');
+    expect(state.path).toEqual(['detect', 'design', 'done']);
+    expect(state.graphObservation).toMatchObject({ graphId: 'gcp-architect-expand', runId: state.runId });
+    expect(state.graphObservation.events.some(item => item.kind === 'completed')).toBe(true);
+    expect(readFileSync(argsPath, 'utf8').trim().split('\n')).toEqual([
+      'compute', 'instances', 'list', '--project=member-cloud-123', '--format=json',
+    ]);
+  } finally {
+    _setSystemGcloudPathsForTesting(null);
+    if (oldProject === undefined) delete process.env.ELANOUS_GCP_OBSERVE_PROJECT;
+    else process.env.ELANOUS_GCP_OBSERVE_PROJECT = oldProject;
+    if (oldArgv === undefined) delete process.env.MVP_B_GCLOUD_TEST_ARGV;
+    else process.env.MVP_B_GCLOUD_TEST_ARGV = oldArgv;
     rmSync(stateRoot, { recursive: true, force: true });
   }
 });

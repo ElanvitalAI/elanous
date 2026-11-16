@@ -66,7 +66,7 @@
       },
       {
         "name": "app_build",
-        "description": "설계와 파일 계획을 생성하고 코드를 작성·격리 시험한 뒤, 회원에게 승인된 앱을 게시한다. 권한·시험·게시 확인이 없으면 완료로 보지 않는다.",
+        "description": "새 앱이나 시스템을 생성·설계·구현·시험하고 승인 후 배포한다. Build a new application, test and publish the approved result. 기존 산출물만 배포하려면 app_deploy를 사용한다.",
         "handler": "graph:app-build",
         "parameters": {
           "type": "object",
@@ -131,11 +131,19 @@
         "route": {
           "triggers": [
             "앱 만들고 배포",
-            "프론트엔드 백엔드 배포",
+            "앱 만들어",
+            "앱을 만들어서",
+            "시스템을 만들어서",
+            "시스템을 만들어줘",
+            "build an app",
+            "create an app",
             "build test publish application"
           ],
           "examples": [
-            "Build a general application, test it and publish the approved result"
+            "시스템을 만들어서 가상 데이터로 채워 넣고 배포해줘",
+            "앱을 만들어서 시험하고 배포해줘",
+            "Build an app with frontend backend database and seed data, test it then deploy app",
+            "create an app and deploy app"
           ],
           "sideEffects": "mutating",
           "risk": "high",
@@ -157,8 +165,8 @@
           "factory": "createSourcePlanningRegistry"
         },
         "./graph/app-build.yaml": {
-          "module": "src/graph-runner/capability-providers/source-build.ts",
-          "factory": "createSourceBuildRegistry"
+          "module": "src/graph-runner/capability-providers/app-build-publish-approval.ts",
+          "factory": "createSourceBuildWithApprovalRegistry"
         }
       }
     }

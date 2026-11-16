@@ -1,9 +1,11 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
+  realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { TuiMemberSession } from '../../tui/member-session-contract.js';
 import { readRelayMemberKeyFile } from '../../relay/member-token-provider.js';
-import type { DynamicOwner } from './dynamic-app-publish.js';
+import { DeploymentGrantAuthorizationError,
+  type DeploymentGrantBinding, type DeploymentGrantProvider, type DynamicOwner } from './dynamic-app-publish.js';
 
 const RUN = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/u;
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/u;
@@ -154,3 +156,179 @@ export function createAppBuildRunAuthority(options: {
   };
 }
 export type AppBuildRunAuthority = ReturnType<typeof createAppBuildRunAuthority>;
+
+/** A server-issued deployment grant is distinct from the two-hour local build seal.
+ * Only this adapter sees the one-time dpg_ credential; the publisher sees metadata. */
+export function createAppDeploymentGrantProvider(options: {
+  root: string; getSession: () => TuiMemberSession | undefined;
+  fetcher?: typeof fetch; now?: () => number;
+}): DeploymentGrantProvider {
+  const now = options.now ?? Date.now;
+  const fetcher = options.fetcher ?? fetch;
+  const grantIdPattern = /^[A-Za-z0-9_-]{1,128}$/u;
+  const approvalIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+  const digestPattern = /^[a-f0-9]{64}$/u;
+  const relayKeyPattern = /^[A-Za-z0-9_-]{1,128}$/u;
+  const endpoint = 'https://api.elanous.ai/v1/members/deployment-grants';
+  const denied = (): never => { throw new Error('DEPLOYMENT_GRANT_REFUSED'); };
+  const authDenied = (): never => { throw new DeploymentGrantAuthorizationError(); };
+  const privateRoot = () => {
+    if (!isAbsolute(options.root)) denied();
+    mkdirSync(options.root, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(options.root);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0
+      || process.getuid && stat.uid !== process.getuid() || realpathSync(options.root) !== options.root) denied();
+  };
+  const pathFor = (grantId: string) => {
+    if (!grantIdPattern.test(grantId)) denied();
+    return join(options.root, grantId + '.json');
+  };
+  const writeCredential = (grantId: string, binding: DeploymentGrantBinding, credential: string) => {
+    const path = pathFor(grantId);
+    let file: number | undefined;
+    let created = false;
+    try {
+      file = openSync(path, 'wx', 0o600); created = true;
+      const bytes = Buffer.from(JSON.stringify({ binding, credential }) + '\n');
+      for (let offset = 0; offset < bytes.length;) {
+        const count = writeSync(file, bytes, offset, bytes.length - offset);
+        if (count <= 0) denied();
+        offset += count;
+      }
+      fsyncSync(file); closeSync(file); file = undefined;
+      const directory = openSync(options.root, 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    } catch {
+      if (file !== undefined) { try { closeSync(file); } catch { /* preserve denial */ } }
+      if (created) { try { unlinkSync(path); } catch { /* no activation receipt was written */ } }
+      denied();
+    }
+  };
+  const sessionFor = (appSlug: string) => {
+    const session = options.getSession();
+    if (session?.nexusUrl !== 'https://api.elanous.ai' || session.appSlug !== appSlug
+      || !/^aps_[A-Za-z0-9_-]+$/u.test(session.sessionToken)) return authDenied();
+    return session;
+  };
+  const revokeIssued = async (grantId: string, owner: DynamicOwner, appSlug: string): Promise<void> => {
+    if (!grantIdPattern.test(grantId) || !owner.memberId || !SLUG.test(appSlug)) denied();
+    const session = sessionFor(appSlug);
+    const response = await fetcher(endpoint + '/' + encodeURIComponent(grantId), {
+      method: 'DELETE', redirect: 'manual', credentials: 'omit', cache: 'no-store',
+      signal: AbortSignal.timeout(5_000), headers: { authorization: 'Bearer ' + session.sessionToken,
+        accept: 'application/json' },
+    });
+    if ([401, 403, 404].includes(response.status)) { await response.body?.cancel(); authDenied(); }
+    if (response.status !== 200 || (await json(response)).revoked !== true) denied();
+  };
+  const json = async (response: Response): Promise<Record<string, unknown>> => {
+    const reader = response.body?.getReader(); if (!reader) return denied();
+    const parts: Uint8Array[] = []; let size = 0;
+    try { for (;;) {
+      const part = await reader.read(); if (part.done) break;
+      size += part.value.byteLength; if (size > 8192) denied();
+      parts.push(part.value);
+    } } finally { reader.releaseLock(); }
+    const value: unknown = JSON.parse(Buffer.concat(parts).toString('utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) denied();
+    return value as Record<string, unknown>;
+  };
+  const readPrivate = (grantId: string): { binding: DeploymentGrantBinding; credential: string } | null => {
+    try {
+      privateRoot();
+      const path = pathFor(grantId);
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 8192
+        || (stat.mode & 0o077) !== 0 || process.getuid && stat.uid !== process.getuid()
+        || realpathSync(path) !== path) return null;
+      const row = JSON.parse(readFileSync(path, 'utf8')) as { binding?: DeploymentGrantBinding; credential?: unknown };
+      if (!row.binding || row.binding.grantId !== grantId
+        || typeof row.credential !== 'string' || !/^dpg_[A-Za-z0-9_-]{43,128}$/u.test(row.credential)) return null;
+      try { lstatSync(path + '.revoked'); return null; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null; }
+      return { binding: row.binding, credential: row.credential };
+    } catch { return null; }
+  };
+  return {
+    async issue(input) {
+      if (!input.ownerId || !/^dyn-[0-9a-f-]{36}$/u.test(input.deploymentId)
+        || !SLUG.test(input.appSlug) || !RUN.test(input.runId)
+        || !HEAD.test(input.sourceHead) || !digestPattern.test(input.artifactDigest)
+        || !relayKeyPattern.test(input.relayKeyId)
+        || !approvalIdPattern.test(input.approvalId ?? '')
+        || !Number.isFinite(Date.parse(input.expiresAt)) || Date.parse(input.expiresAt) <= now()) denied();
+      privateRoot();
+      const session = sessionFor(input.appSlug);
+      const response = await fetcher(endpoint, { method: 'POST', redirect: 'manual', credentials: 'omit',
+        cache: 'no-store', signal: AbortSignal.timeout(5_000), headers: {
+          authorization: 'Bearer ' + session.sessionToken, 'content-type': 'application/json', accept: 'application/json',
+        }, body: JSON.stringify({ deploymentId: input.deploymentId,
+          appSlug: input.appSlug, runId: input.runId, sourceHead: input.sourceHead,
+          artifactDigest: input.artifactDigest, relayKeyId: input.relayKeyId,
+          expiresAt: input.expiresAt, approvalId: input.approvalId }) });
+      if (response.status !== 201) { await response.body?.cancel(); denied(); }
+      const row = await json(response);
+      if (Object.hasOwn(row, 'ownerId') || typeof row.grantId !== 'string' || !grantIdPattern.test(row.grantId)
+        || row.memberId !== input.ownerId
+        || !Number.isSafeInteger(row.grantVersion) || (row.grantVersion as number) < 1
+        || typeof row.credential !== 'string' || !/^dpg_[A-Za-z0-9_-]{43,128}$/u.test(row.credential)
+        || row.deploymentId !== input.deploymentId
+        || row.appSlug !== input.appSlug || row.runId !== input.runId
+        || row.sourceHead !== input.sourceHead || row.artifactDigest !== input.artifactDigest
+        || row.relayKeyId !== input.relayKeyId || row.approvalId !== input.approvalId
+        || typeof row.expiresAt !== 'string'
+        || !Number.isFinite(Date.parse(row.expiresAt)) || Date.parse(row.expiresAt) <= now()
+        || Date.parse(row.expiresAt) > Math.min(Date.parse(input.expiresAt), now() + 24 * 60 * 60 * 1_000)) {
+        if (typeof row.grantId === 'string' && grantIdPattern.test(row.grantId)) {
+          try { await revokeIssued(row.grantId, { memberId: input.ownerId, userSlug: '' }, input.appSlug); }
+          catch (cleanupError) { throw new AggregateError([new Error('DEPLOYMENT_GRANT_BINDING_REFUSED'), cleanupError],
+            'deployment grant binding and cleanup refused'); }
+        }
+        denied();
+      }
+      const binding: DeploymentGrantBinding = { grantId: row.grantId as string, grantVersion: row.grantVersion as number,
+        deploymentId: input.deploymentId, ownerId: input.ownerId,
+        appSlug: input.appSlug, runId: input.runId,
+        sourceHead: input.sourceHead, artifactDigest: input.artifactDigest,
+        relayKeyId: input.relayKeyId, expiresAt: row.expiresAt as string, approvalId: input.approvalId };
+      // A failed private write leaves no locally usable credential. A 409 never
+      // triggers an automatic revoke or reissue of the server's active grant.
+      try { writeCredential(binding.grantId, binding, row.credential as string); }
+      catch (writeError) {
+        try { await revokeIssued(binding.grantId, { memberId: input.ownerId, userSlug: '' }, input.appSlug); }
+        catch (cleanupError) { throw new AggregateError([writeError, cleanupError],
+          'deployment grant credential persistence and cleanup refused'); }
+        throw writeError;
+      }
+      return binding;
+    },
+    async introspect(grantId) {
+      const local = readPrivate(grantId); if (!local) return null;
+      try {
+        const response = await fetcher(endpoint + '/introspect', { method: 'POST', redirect: 'manual',
+          credentials: 'omit', cache: 'no-store', signal: AbortSignal.timeout(5_000),
+          headers: { authorization: 'Bearer ' + local.credential, accept: 'application/json' } });
+        if (response.status !== 200) { await response.body?.cancel(); return null; }
+        const row = await json(response); const binding = local.binding;
+        return !Object.hasOwn(row, 'ownerId')
+          && row.grantId === binding.grantId && row.grantVersion === binding.grantVersion
+          && row.deploymentId === binding.deploymentId
+          && row.memberId === binding.ownerId && row.appSlug === binding.appSlug
+          && row.runId === binding.runId && row.sourceHead === binding.sourceHead
+          && row.artifactDigest === binding.artifactDigest && row.relayKeyId === binding.relayKeyId
+          && row.expiresAt === binding.expiresAt && row.approvalId === binding.approvalId
+          && now() < Date.parse(binding.expiresAt)
+          ? binding : null;
+      } catch { return null; }
+    },
+    async revoke(grantId, owner) {
+      const local = readPrivate(grantId);
+      if (local && local.binding.ownerId !== owner.memberId) return authDenied();
+      if (!local) return denied();
+      await revokeIssued(grantId, owner, local.binding.appSlug);
+      try { writeFileSync(pathFor(grantId) + '.revoked', 'revoked\n', { flag: 'wx', mode: 0o600 }); }
+      catch { /* authoritative server revocation already confirmed */ }
+    },
+    revokeIssued,
+  };
+}

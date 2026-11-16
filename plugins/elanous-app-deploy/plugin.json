@@ -34,7 +34,7 @@
     "aiTools": [
       {
         "name": "app_deploy",
-        "description": "Publish a registered member-owned app, or a sealed generated app when app_create supplied runId; confirm before deployment and return only a verified public URL.",
+        "description": "Deploy an existing registered member-owned app or an already sealed generated artifact with appId and runId. Does not design or create a new app; use app_build for that. Confirm before deployment and return only a verified public URL.",
         "handler": "native:app_deploy",
         "parameters": {
           "type": "object",
@@ -61,13 +61,16 @@
         "route": {
           "triggers": [
             "배포해줘",
-            "앱 만들어 배포",
-            "강의 노트 스크랩 앱",
-            "deploy app"
+            "기존 앱 배포",
+            "등록된 앱 배포",
+            "deploy app",
+            "deploy existing app",
+            "publish existing app"
           ],
           "examples": [
-            "강의 노트·스크랩 앱 만들어 배포해 줘",
-            "lecture scrap app deploy please"
+            "등록된 앱 배포해줘",
+            "기존 앱 산출물을 배포해줘",
+            "Deploy existing app using its appId and sealed runId"
           ],
           "sideEffects": "external",
           "risk": "high",

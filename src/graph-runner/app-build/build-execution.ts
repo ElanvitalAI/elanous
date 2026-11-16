@@ -241,6 +241,10 @@ export function createBuildExecution(options: Options = {}) {
       await attest(grant, signal);
       const inspected = await operation(grant.appSlug, 'inspect', grant.runId, grant.ownerId, signal);
       if (inspected.status !== 'inspected' || typeof inspected.artifactDigest !== 'string') refuse();
+      // The issuer owns the private approval ID. Recheck its exact run/app/owner
+      // binding here; the graph and model never carry the ID into publish.
+      const approval = await operation(grant.appSlug, 'approval-poll', grant.runId, grant.ownerId, signal);
+      if (approval.status !== 'approval-approved') refuse();
       const result = await operation(grant.appSlug, 'publish', grant.runId, grant.ownerId, signal);
       if (result.status !== 'published' || typeof result.publicUrl !== 'string' || result.publicUrl !== publicAppAddress({ appSlug: grant.appSlug, userSlug: grant.userSlug })
         || typeof result.deploymentId !== 'string') refuse();

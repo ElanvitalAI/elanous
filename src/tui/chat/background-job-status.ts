@@ -87,9 +87,9 @@ export class BackgroundJobStatus {
     const state = this.current;
     if (!state) return '';
     const parts: string[] = [];
-    if (state.running > 0) parts.push(`⧗ 백그라운드 ${state.running}`);
-    if (state.pending > 0) parts.push(`✓ 결과 대기 ${state.pending}`);
-    if (parts.length === 0 && state.promised) parts.push('⚠ 약속한 백그라운드 없음');
+    if (state.running > 0) parts.push(`⧗ Background ${state.running}`);
+    if (state.pending > 0) parts.push(`✓ Results ready ${state.pending}`);
+    if (parts.length === 0 && state.promised) parts.push('⚠ Promised background work missing');
     return parts.join(' · ');
   }
 }

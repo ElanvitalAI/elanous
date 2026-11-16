@@ -9,7 +9,7 @@ test('a failed real next TUI turn shows one clear receipt and a usable retry hin
   const sentTurnLabels = ['failed', 'resent'] as const;
   const [firstSendLabel, resendLabel] = sentTurnLabels;
   const expectedSentTurns = sentTurnLabels.length;
-  const sentTurnMarker = '❯ ERRORUX-FAIL';
+  const sentTurnMarker = '나: ERRORUX-FAIL';
   const root = mkdtempSync(join(tmpdir(), 'next-error-ux-'));
   try {
     writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));

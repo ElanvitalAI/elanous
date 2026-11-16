@@ -67,9 +67,10 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
     .option('--traffic-cap-config <file>', 'Owner-only JSON with byte limits or measure-only mode')
     .option('--public-listing-config <file>', 'Owner-only JSON opt-in list of searchable public app IDs (default empty)')
     .option('--public-read-config <file>', 'Owner-only JSON apps:[{user,app}] allowed anonymous GET/HEAD (default private)')
+    .option('--visitor-write-config <file>', 'Owner-only expiring per-app POST path/rate policy (default denied; public-read opt-in required)')
     .option('--custom-domain-config <file>', 'Owner-only JSON routes for custom hosts with verified DNS ownership and TLS certificates')
     .action(async (opts: { trustedHostKeys: string; port: string; publicDomain?: string; publicServerId?: string; publicUserId?: string; publicDispatchConfig?: string;
-      memberRequired?: boolean; memberNexusUrl?: string; hostOwnerMembers?: string; trafficCapConfig?: string; publicListingConfig?: string; publicReadConfig?: string; customDomainConfig?: string }) => {
+      memberRequired?: boolean; memberNexusUrl?: string; hostOwnerMembers?: string; trafficCapConfig?: string; publicListingConfig?: string; publicReadConfig?: string; visitorWriteConfig?: string; customDomainConfig?: string }) => {
       const port = Number(opts.port);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid relay port');
       const { loadTrustedHostKeys, resolvePublicAppUserId, startRelayServer } = await import('./relay-server.js');
@@ -82,6 +83,9 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
       }
       if (!opts.memberRequired && opts.trafficCapConfig) throw new Error('--traffic-cap-config requires --member-required');
       if (opts.publicListingConfig && !opts.publicDomain) throw new Error('--public-listing-config requires --public-domain');
+      if (opts.visitorWriteConfig && (!opts.publicDomain || !opts.memberRequired || !opts.publicReadConfig)) {
+        throw new Error('--visitor-write-config requires public domain, member-required and public-read config');
+      }
       const memberOptions = opts.memberRequired ? await (async () => {
         const { createNexusRelayMemberVerifier, loadRelayHostOwners } = await import('./relay-member-verifier.js');
         const { loadRelayTrafficCap } = await import('./relay-server.js');
@@ -93,6 +97,10 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
       const publicListedApps = opts.publicListingConfig ? loadRelayPublicListing(opts.publicListingConfig) : undefined;
       const publicReadableApps = opts.publicReadConfig
         ? (await import('./public-app-read.js')).loadPublicAppReadConfig(opts.publicReadConfig) : undefined;
+      const visitorPolicy = opts.visitorWriteConfig
+        ? await import('./public-app-visitor-write.js') : undefined;
+      const publicVisitorWritePolicies = opts.visitorWriteConfig
+        ? visitorPolicy!.loadPublicAppVisitorWriteConfig(opts.visitorWriteConfig) : undefined;
       const customDomainRoutes = opts.customDomainConfig ? loadRelayCustomDomainRoutes(opts.customDomainConfig) : undefined;
       const publicDispatchRoutes = opts.publicDispatchConfig
         ? (await import('./public-dispatch.js')).loadPublicDispatchRoutes(opts.publicDispatchConfig) : undefined;
@@ -101,17 +109,21 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
         ?? join(getElanousConfigDir(), 'relay', 'app-kill-switch.sqlite')) : undefined;
       const { createRelayTrafficLedger } = await import('./relay-traffic-ledger.js');
       let trafficStore: ReturnType<typeof createRelayTrafficLedger> | undefined;
+      let publicVisitorWriteLedger: import('./public-app-visitor-write.js').VisitorWriteLedger | undefined;
       let relay: ReturnType<typeof startRelayServer>;
       try {
         trafficStore = opts.trafficCapConfig ? createRelayTrafficLedger() : undefined;
+        publicVisitorWriteLedger = visitorPolicy
+          ? visitorPolicy.createVisitorWriteLedger(join(getElanousConfigDir(), 'relay', 'visitor-write.sqlite'), getElanousConfigDir()) : undefined;
         relay = startRelayServer({ port, hostname: '127.0.0.1', trustedHostKeys: loadTrustedHostKeys(opts.trustedHostKeys),
           ...(opts.publicDomain ? { publicDomain: opts.publicDomain as 'elanous.app' | 'elanous.ai' } : {}),
           ...(opts.publicServerId ? { publicServerId: opts.publicServerId } : {}),
           ...(publicUserId ? { publicUserId } : {}), ...(publicDispatchRoutes ? { publicDispatchRoutes } : {}),
           ...(appKillSwitch ? { appKillSwitch } : {}), ...(publicListedApps ? { publicListedApps } : {}),
           ...(publicReadableApps ? { publicReadableApps } : {}),
+          ...(publicVisitorWritePolicies ? { publicVisitorWritePolicies, publicVisitorWriteLedger } : {}),
           ...(customDomainRoutes ? { customDomainRoutes } : {}), ...(trafficStore ? { trafficStore } : {}), ...memberOptions });
-      } catch (error) { trafficStore?.close(); appKillSwitch?.close(); throw error; }
+      } catch (error) { trafficStore?.close(); appKillSwitch?.close(); publicVisitorWriteLedger?.close(); throw error; }
       console.log(`relay listening on 127.0.0.1:${relay.port}${opts.publicDomain ? ' (public TLS edge required)' : ''}`);
       process.once('SIGINT', () => { relay.stop(); });
       process.once('SIGTERM', () => { relay.stop(); });

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { issueToPrivateFile } from './member-key-token-cli.js';
 import type { IssuedMemberKey } from '../nexus/members/member-store.js';
+import { writeRelayMemberKeyBinding } from '../relay/member-key-binding.js';
 
 const ORIGIN = 'https://api.elanous.ai';
 const MAX_CONFIG_BYTES = 1024 * 1024;
@@ -16,6 +17,7 @@ export async function connectMemberRelay(input: {
 }): Promise<void> {
   const keyPath = join(input.configDir, 'relay-member-' + randomUUID() + '.key');
   let published = false;
+  let bindingWritten = false;
   try {
     const response = await input.fetchImpl(ORIGIN + '/v1/member/keys', {
       method: 'POST', headers: { authorization: 'Bearer ' + input.sessionToken,
@@ -31,6 +33,8 @@ export async function connectMemberRelay(input: {
     // is private in-memory delivery, never a log, shell argument or artifact.
     issueToPrivateFile(keyPath, deliver => { deliver(value as unknown as IssuedMemberKey); return value as unknown as IssuedMemberKey; });
     published = true;
+    writeRelayMemberKeyBinding(keyPath, value.id, value.key);
+    bindingWritten = true;
     const configPath = join(input.configDir, 'config.json');
     withFileLockSync(configPath + '.lock', () => {
       let config: Record<string, unknown> = {};
@@ -65,6 +69,7 @@ export async function connectMemberRelay(input: {
       } finally { try { unlinkSync(temporary); } catch { /* already committed */ } }
     });
   } catch {
+    if (bindingWritten) { try { unlinkSync(keyPath + '.binding.json'); } catch { /* report only generic failure */ } }
     if (published) { try { unlinkSync(keyPath); } catch { /* report only generic failure */ } }
     throw new Error('회원 릴레이 키를 안전하게 연결하지 못했습니다.');
   }

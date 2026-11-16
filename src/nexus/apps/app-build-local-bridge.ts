@@ -55,7 +55,7 @@ async function boundedAction(request: Request): Promise<{ action: string; runId:
   } } finally { reader.releaseLock(); }
   const item = JSON.parse(Buffer.concat(parts).toString('utf8')) as { action?: unknown; runId?: unknown };
   if (!item || typeof item !== 'object' || typeof item.action !== 'string'
-    || !['reserve', 'attest', 'inspect', 'publish', 'undo'].includes(item.action)
+    || !['reserve', 'attest', 'inspect', 'approval-start', 'approval-poll', 'publish', 'undo'].includes(item.action)
     || typeof item.runId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/u.test(item.runId)) refuse();
   return { action: item.action, runId: item.runId };
 }
@@ -85,7 +85,10 @@ export function createAppBuildLocalIssuerBridge(options: Options) {
     let verifiedReserveSession: TuiMemberSession | undefined;
     const resolveOwner = async () => {
       try {
-        if (options.runAuthority && operation.action !== 'reserve') {
+        // Cleanup remains available after the build seal expires. The publisher
+        // checks the live deployment/grant identity before revoking it.
+        if (options.runAuthority && operation.action !== 'reserve' && operation.action !== 'undo'
+          && operation.action !== 'approval-start' && operation.action !== 'approval-poll') {
           const owner = options.runAuthority.resolve(operation.runId, match[1]!, options.sourceHead!);
           return owner?.memberId === expectedOwner ? owner : null;
         }

@@ -4,6 +4,40 @@ import { NEXT_TUI_INPUT_CONTEXT, resolveNextTuiRoute } from '../tui/core/registr
 import type { InternalTurnGate } from '../tui/input/internal-turn.js';
 
 describe('Next TUI /loop command', () => {
+  test('session change releases the old gate before a new loop starts', () => {
+    const calls: string[] = [];
+    const ticks: Array<() => void> = [];
+    let cancelled = 0;
+    let gate: InternalTurnGate = {
+      startTurnIfIdle: (input: string) => {
+        calls.push(`old:${input}`);
+        return { opened: true, turnId: 'old-turn' };
+      },
+    } as unknown as InternalTurnGate;
+    const branch = createNextTuiLoopBranch(() => gate, () => {}, {
+      schedule(callback) {
+        ticks.push(callback);
+        return { unsubscribe() { cancelled++; } };
+      },
+    });
+
+    branch.run('/loop 2s old prompt');
+    branch.stop(); // entry.ts calls this after /new and /resume.
+    expect(cancelled).toBe(1);
+    gate = {
+      startTurnIfIdle: (input: string) => {
+        calls.push(`new:${input}`);
+        return { opened: true, turnId: 'new-turn' };
+      },
+    } as unknown as InternalTurnGate;
+    branch.run('/loop 2s new prompt');
+    ticks[0]?.();
+    ticks[1]?.();
+    expect(calls).toEqual(['new:new prompt']);
+    branch.dispose();
+    expect(cancelled).toBe(2);
+  });
+
   test('registry route owns the branch, which uses the turn gate and stops at session change', () => {
     const route = resolveNextTuiRoute('/loop 2s check mailbox', NEXT_TUI_INPUT_CONTEXT);
     expect(route?.branchHost).toBe('loop');

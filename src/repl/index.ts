@@ -56,9 +56,11 @@ import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
 import { buildSeatBootSystemMessages, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
+import type { GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 import { installNextTuiSelfHealthTracker } from '../tui/chat/self-health-status.js';
 import { bashApprovalFinding } from '../tool-runtime/bash-approval.js';
 import { createReplGraphApprover, createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
+import { createReplHarnessAsker, parseHarnessAskUserRound } from '../tui-client/next-harness-ask-user.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { isToolSearchCall, routeToolSearch } from '../skills/tools/tool-search-route.js';
 import { buildCapabilitySearchTool, CAPABILITY_SEARCH_NAME, buildToolSearchTool, TOOL_SEARCH_NAME } from '../skills/tools/tool-search-spec.js';
@@ -250,7 +252,22 @@ interface PendingAttachment {
 /** Build the REPL's tool catalog + dispatcher. Mirrors
  *  `buildCliAgentTools` in src/index.ts but lives here so the REPL
  *  module is self-contained when consumed in tests. */
+/** Keep the isolated Next test session bound to the same app as a member connect session. */
+export async function resolveNextTestVerifiedOwner(sessionFile: string): Promise<{ id: string } | undefined> {
+  const fixture = JSON.parse(readFileSync(sessionFile, 'utf8')) as {
+    nexusUrl?: string; sessionToken?: string; appSlug?: string;
+  };
+  const { resolveDashboardVerifiedOwner } = await import('../dashboard/plugin-route-adapter.js');
+  return resolveDashboardVerifiedOwner({
+    nexusUrl: fixture.nexusUrl ?? '', sessionToken: fixture.sessionToken, appSlug: fixture.appSlug,
+  });
+}
+
 export function buildReplTools(options: {
+  readonly onGraphProgress?: (event: GraphProgressObservation) => void;
+  readonly sessionId?: string;
+  /** One trusted user request/turn, distinct from the lifetime of the sticky REPL session. */
+  readonly getRequestId?: () => string | undefined;
   readonly shellApprovalProcess?: ShellApprovalIpcProcess;
   readonly dispatchBash?: (args: Record<string, unknown>, options: { cwd: string; signal?: AbortSignal }) => Promise<unknown>;
   readonly getSignal?: () => AbortSignal | undefined;
@@ -292,6 +309,34 @@ export function buildReplTools(options: {
   specs.push(bashMod.buildBashTool());
   const shellApprover = createReplShellApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const graphApprover = createReplGraphApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
+  const harnessAsker = options.sessionId ? createReplHarnessAsker(
+    options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess, options.sessionId) : null;
+  if (options.sessionId) {
+    specs.push({ name: 'HarnessAskUser',
+      description: 'Ask the current human one interview round per user request with one or two questions and a short assumption list. The reply comes from the Next TUI composer; no answer means stop and preserve assumptions.',
+      parameters: { type: 'object', properties: {
+        questions: { type: 'array', items: { type: 'string' } },
+        assumptions: { type: 'array', items: { type: 'string' } },
+      }, required: ['questions', 'assumptions'], additionalProperties: false },
+    });
+    let interviewRequestId: string | undefined;
+    let interviewUsed = false;
+    dispatchByName.set('HarnessAskUser', async (args) => {
+      const requestId = options.getRequestId?.();
+      if (!requestId) return { status: 'unanswered', reason: 'request-scope-unavailable' };
+      if (requestId !== interviewRequestId) {
+        interviewRequestId = requestId;
+        interviewUsed = false;
+      }
+      if (interviewUsed) return { status: 'unanswered', reason: 'interview-round-already-used' };
+      const round = parseHarnessAskUserRound(args);
+      if (!round) return { status: 'unanswered', reason: 'invalid-interview-round' };
+      interviewUsed = true;
+      const answer = harnessAsker ? await harnessAsker(round, options.getSignal?.()) : null;
+      return answer === null ? { status: 'unanswered', reason: harnessAsker ? 'human-did-not-answer' : 'host-unavailable', assumptions: round.assumptions }
+        : { status: 'answered', answer, assumptions: round.assumptions };
+    });
+  }
   const runBash = (args: Record<string, unknown>, signal?: AbortSignal) =>
     dispatchBash(args, { cwd: getSessionCwd(), ...(signal ? { signal } : {}) });
   dispatchByName.set('Bash', async (args) => {
@@ -324,6 +369,7 @@ export function buildReplTools(options: {
       .resolveInstance({ stampedStateDir }).kind === 'test';
   const pluginBridge = options.pluginRuntime ?? (require('../cli/child-plugin-runtime.js') as typeof import('../cli/child-plugin-runtime.js'))
     .createChildPluginRuntimeContract({
+      observeGraphProgress: options.onGraphProgress,
       requestConfirmation: async (prompt) => await graphApprover?.(prompt) ?? false,
       // The host supplies only a private app session. Nexus remains the authority
       // for the owner; a missing, expired or rejected session stays anonymous.
@@ -339,11 +385,7 @@ export function buildReplTools(options: {
       // still comes only from the Nexus owner endpoint, never from this file.
       ...(nextTestWorld && existsSync(nextTestSessionFile)
         ? { resolveVerifiedOwner: async () => {
-          const fixture = JSON.parse(readFileSync(nextTestSessionFile, 'utf8')) as {
-            nexusUrl?: string; sessionToken?: string;
-          };
-          const { resolveDashboardVerifiedOwner } = await import('../dashboard/plugin-route-adapter.js');
-          return resolveDashboardVerifiedOwner({ nexusUrl: fixture.nexusUrl ?? '', sessionToken: fixture.sessionToken });
+          return resolveNextTestVerifiedOwner(nextTestSessionFile);
         } } : {}),
       ...(nextTestWorld && existsSync(nextTestGraphFile)
         ? { dispatchGraph: async (_pluginId: string, graphId: string, _graphFile: string,
@@ -959,7 +1001,15 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
     ? { pending: [] as PendingTaskNotification[] } : undefined;
   const backgroundBridge = createNextTuiBackgroundBridge(session.id, () => nextTuiDelivery?.pending.length ?? 0);
   let activeTurnSignal: AbortSignal | undefined;
-  const baseTools = opts.enableTools ? buildReplTools({ getSignal: () => activeTurnSignal,
+  let activeTurnId: string | undefined;
+  let activeRequestId: string | undefined;
+  let requestSequence = 0;
+  const baseTools = opts.enableTools ? buildReplTools({ sessionId: session.id, getSignal: () => activeTurnSignal,
+    getRequestId: () => activeRequestId,
+    onGraphProgress: (event) => {
+      if (activeTurnId) process.stdout.write(`${JSON.stringify({ event: 'graph-progress', turnId: activeTurnId,
+        graphProgress: event })}\n`);
+    },
     memberBoardSession: opts.memberBoardSession }) : undefined;
   const tools = baseTools && backgroundBridge ? {
     ...baseTools,
@@ -1139,6 +1189,8 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       const onTerminate = (): void => { terminateAfterTurn = true; turnAbort.abort(); };
       const streamTurn = process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string';
       activeTurnSignal = streamTurn ? turnAbort.signal : undefined;
+      activeTurnId = streamTurn ? turn.id : undefined;
+      activeRequestId = `request-${++requestSequence}`;
       if (streamTurn) process.once('SIGTERM', onTerminate);
       try {
         const sessionCfg = turn.sessionProvider && process.env.ELANOUS_NEXT_TUI_STREAM === '1'
@@ -1214,6 +1266,8 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         continue;
       } finally {
         activeTurnSignal = undefined;
+        activeTurnId = undefined;
+        activeRequestId = undefined;
       }
       if (streamTurn) process.off('SIGTERM', onTerminate);
       if (terminateAfterTurn) {

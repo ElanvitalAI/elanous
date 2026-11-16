@@ -59,14 +59,14 @@ function mount(getLlmProviders: () => Promise<LlmProvidersResponse>) {
   );
 }
 
-function setupBrowser(hostname: string, blockPopup = false) {
+function setupBrowser(hostname: string, blockPopup = false, search = '') {
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: () => null, setItem: () => {}, removeItem: () => {} } });
   const intervals = new Map<number, () => void>();
   const tabs: Array<{ location: { href: string }; close: () => void }> = [];
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
     value: {
-      location: { hostname, protocol: 'http:', host: hostname }, addEventListener: () => {}, removeEventListener: () => {},
+      location: { hostname, protocol: 'http:', host: hostname, search }, addEventListener: () => {}, removeEventListener: () => {},
       setInterval: (callback: () => void, ms: number) => { if (ms === 2000) intervals.set(1, callback); return ms; },
       clearInterval: (id: number) => { if (id === 1) intervals.delete(1); },
       open: () => { if (blockPopup) return null; const tab = { location: { href: '' }, close: () => {} }; tabs.push(tab); return tab; },
@@ -102,6 +102,20 @@ test('loopback opens the returned browser URL in a new tab, then polls ok to the
   state = { state: 'ok', mode: 'browser' };
   await act(async () => { await intervals.get(1)!(); });
   expect(navigated).toContain('/setup/done');
+});
+
+test('remote setup marker uses device login through a localhost SSH tunnel', async () => {
+  const { tabs } = setupBrowser('localhost', false, '?remote=1');
+  const modes: string[] = [];
+  DaemonClient.prototype.startCodexLogin = async mode => {
+    modes.push(mode);
+    return { state: 'pending', mode, userCode: 'REMOTE-1234', verificationUrl: 'https://auth.openai.com/codex/device' };
+  };
+  const login = await selectCodex();
+  await act(async () => { await login.props.onClick(); });
+  expect(modes).toEqual(['device']);
+  expect(tabs).toHaveLength(0);
+  expect(tree!.root.findByProps({ 'data-testid': 'codex-user-code' }).props.children).toBe('REMOTE-1234');
 });
 
 test('blocked popup exposes the pending authorization URL as a clickable recovery link without a futile mode switch', async () => {

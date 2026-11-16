@@ -21,10 +21,10 @@ export function formatInlinePanel(spec: InlinePanelSpec, maxRows = 6): string[] 
   const start = Math.max(0, Math.min(selected - count + 1, spec.rows.length - count));
   const rows = spec.rows.slice(start, start + count);
   return [
-    `${spec.title} · ↑↓ 선택 · Enter 선택 · Esc 닫기`,
+    `${spec.title} · ↑↓ select · Enter select · Esc close`,
     ...(rows.length
       ? rows.map((row, offset) => `${start + offset === selected ? '▸' : ' '} ${row.label}${row.description ? ` — ${row.description}` : ''}`)
-      : ['  후보 없음']),
+      : ['  No candidates']),
     spec.hint,
   ];
 }
