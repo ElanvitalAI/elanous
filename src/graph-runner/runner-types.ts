@@ -49,6 +49,8 @@ export interface GraphRunState {
   cancelledAt?: string;
   /** Original named terminal when status is its canonical done/failed mapping. */
   reason?: string;
+  /** A failed pre/post dispatch barrier may only be resumed by explicitly rerunning its node. */
+  preconditionBarrier?: { nodeId: string; reason: string; effectStatus: 'none' | 'unknown' };
   path: string[];
   /** Dry-run path with each fan-out branch's planned writes expanded before its join. */
   plannedPath?: string[];
@@ -146,6 +148,10 @@ export interface GraphRunOptions {
   input?: unknown;
   /** Authenticated owner from the host route; graph input cannot establish this identity. */
   verifiedOwnerId?: string;
+  /** Host-verified app binding; graph input cannot establish this identity. */
+  verifiedAppSlug?: string;
+  /** Parent deadline inherited by precondition checks and child graph runs. */
+  preconditionDeadlineAtMs?: number;
   /** Supplied only by the authenticated S2 host after declaration validation. */
   s2CorrectionBudget?: S2CorrectionBudget;
   /** Merge a small compatibility repair into the saved input while holding the run's resume lock. */
@@ -246,6 +252,11 @@ export interface GraphRunOptions {
     inProcessHandlers?: InProcessHandlerRegistry;
     /** Generic provider bindings for the closed `cap:<name>` capability vocabulary. */
     capabilityProviders?: GraphCapabilityProviders;
+    /** Host UI data callback; never serves as owner identity or human approval. */
+    askUserForPreconditions?: (input: { readonly graphId: string; readonly runId: string;
+      readonly nodeId: string; readonly missingKeys: readonly string[];
+      readonly signal: AbortSignal; readonly deadlineAtMs: number }) =>
+      Promise<Readonly<Record<string, unknown>> | undefined>;
   };
 }
 

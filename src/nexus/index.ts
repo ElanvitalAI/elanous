@@ -3397,6 +3397,16 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     for (const path of [dynamicSourceRoot, dynamicSealRoot, dynamicRuntimeRoot]) mkdirSync(path, { recursive: true, mode: 0o700 });
     dynamicAppPublisher = createDynamicAppPublisher({
       sourceRoot: dynamicSourceRoot, sealRoot: dynamicSealRoot, runtimeRoot: dynamicRuntimeRoot, appHost,
+      relayRoutes: {
+        register: input => {
+          if (!httpServer?.registerPublicApp) return Promise.reject(new Error('relay app registration server unavailable'));
+          return httpServer.registerPublicApp(input);
+        },
+        unregister: input => {
+          if (!httpServer?.unregisterPublicApp) return Promise.reject(new Error('relay app registration server unavailable'));
+          return httpServer.unregisterPublicApp(input);
+        },
+      },
       testMemberId: process.env.ELANOUS_APPROVED_TEST_APP_MEMBER_ID,
       testHandle: process.env.ELANOUS_APPROVED_TEST_APP_HANDLE,
       testApprovalExpiresAt: process.env.ELANOUS_APPROVED_TEST_APP_UNTIL,

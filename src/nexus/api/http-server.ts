@@ -53,6 +53,7 @@ import type { AppSimulationSnapshot } from '../apps/app-simulation.js';
 import { AppVersionConflict, openAppVersionStore, type AppVersionStore, type AppVersionCheckpointInput } from '../apps/app-versions.js';
 import { consoleAddress, publicAppAddress, simulationPreviewAddress } from '../apps/console-address.js';
 import { connectRelayHost, loadOrCreateRelayHostIdentity, type RelayHostConnection } from '../../relay/host-connector.js';
+import type { AutoPublicAppRegistration } from '../../relay/public-app-auto-registration.js';
 import { createRelayMemberTokenProvider, readRelayMemberKeyFile } from '../../relay/member-token-provider.js';
 import { resolvePublicAppUserId } from '../../relay/relay-server.js';
 import { elanousConfigDir } from '../config/paths.js';
@@ -866,6 +867,8 @@ export interface NexusHttpServer {
   port: number;
   hostname: string;
   url: string;
+  registerPublicApp?(input: Omit<AutoPublicAppRegistration, 'serverId'>): Promise<void>;
+  unregisterPublicApp?(input: Pick<AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>): Promise<void>;
   stop(): void;
 }
 
@@ -1055,6 +1058,18 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
     port: resolvedPort,
     hostname,
     url,
+    registerPublicApp(input) {
+      if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('relay app registration host is offline'));
+      }
+      return relayConnection.registerPublicApp(input);
+    },
+    unregisterPublicApp(input) {
+      if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('relay app registration host is offline'));
+      }
+      return relayConnection.unregisterPublicApp(input);
+    },
     stop() {
       serverStopped = true;
       if (relayRetryTimer) clearTimeout(relayRetryTimer);

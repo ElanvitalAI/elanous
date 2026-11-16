@@ -5,6 +5,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseGraphTemplateYaml } from '../../../src/self-implement/graph-yaml.js';
 import { listGraphRuns, type GraphRunState } from '../../../src/graph-runner/runner.js';
+import { graphRunEventLedgerPath, readGraphRunEvents } from '../../../src/graph-runner/graph-run-event-ledger.js';
+import type { GraphEvent } from '../../../src/graph-runner/graph-events.js';
+import { effectiveInstanceRoot } from '../../../src/instance/resolve.js';
 import { loadRunLedger, type RunLedgerEntry } from '../../../src/self-implement/run-ledger.js';
 import { runLedgerDir } from '../../../src/self-implement/run-ledger-paths.js';
 import { readResourceLedger, resourceLedgerPath, type ResourceLedgerEvent } from '../../../src/resource-ledger/resource-ledger.js';
@@ -19,6 +22,7 @@ export type ViewSource = GraphInstanceView['instance']['source'];
 export interface ViewQuery { source: ViewSource; runId?: string; graphId?: string }
 export interface ViewLedgers {
   graphRuns(): readonly GraphRunState[];
+  graphEvents?(run: GraphRunState): readonly GraphEvent[];
   harness(runId: string): readonly RunLedgerEntry[] | null;
   resources(): readonly ResourceLedgerEvent[];
   hosts(): readonly string[];
@@ -34,7 +38,29 @@ const stateForGraph = (status: GraphRunState['status']): GraphInstanceView['inst
   status === 'done' ? 'done' : status === 'failed' || status === 'budget-exceeded' ? 'failed'
     : status === 'awaiting-approval' || status === 'paused' ? 'waiting' : status === 'running' ? 'running' : 'unknown';
 
-export function projectGraphRun(run: GraphRunState, source: 'graph' | 'release', observedAt: string): GraphInstanceView {
+function preconditionLogs(run: GraphRunState, events: readonly GraphEvent[]): GraphInstanceView['logs'] {
+  return events.flatMap(event => {
+    if (event.graphId !== run.graphId || event.runId !== run.runId
+      || !['graph.precondition.check', 'graph.precondition.fill', 'graph.precondition.blocked'].includes(event.type)) return [];
+    const nodeId = event.source.nodeId;
+    const data = event.data;
+    if (!nodeId || !safeId(nodeId) || data?.nodeId !== nodeId
+      || !Number.isSafeInteger(data.attempt) || Number(data.attempt) < 0 || Number(data.attempt) > 2) return [];
+    const keys = Array.isArray(data.missingKeys) && data.missingKeys.length <= 16
+      && data.missingKeys.every(key => typeof key === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/u.test(key))
+      ? data.missingKeys as string[] : [];
+    const source = ['host', 'manifest', 'prior', 'ask_user'].includes(String(data.source))
+      ? String(data.source) : undefined;
+    const phase = event.type.slice('graph.precondition.'.length);
+    const label = phase === 'check' ? '사전 검사' : phase === 'fill' ? '채움' : '차단';
+    const text = [label, keys.length ? keys.join(', ') : '조건', source, `${data.attempt}회`].filter(Boolean).join(' · ');
+    return [{ seq: event.sequence, at: event.emittedAt, nodeId,
+      level: phase === 'blocked' ? 'error' as const : 'info' as const, text }];
+  });
+}
+
+export function projectGraphRun(run: GraphRunState, source: 'graph' | 'release', observedAt: string,
+  events: readonly GraphEvent[] = []): GraphInstanceView {
   const template = run.graphPath && existsSync(run.graphPath)
     ? parseGraphTemplateYaml(readFileSync(run.graphPath, 'utf8'), run.graphPath).template : undefined;
   const ids = [...new Set([...(template?.nodes.map(node => node.nodeId) ?? []), ...run.path,
@@ -55,9 +81,12 @@ export function projectGraphRun(run: GraphRunState, source: 'graph' | 'release',
     : run.path.slice(1).map((to, index) => ({ id: `path-${index}`, from: run.path[index]!, to,
       kind: 'flow' as const, state: 'taken' as const }));
   const active = nodes.filter(node => node.state === 'running' || node.state === 'waiting').map(node => node.id);
-  const logs: GraphInstanceView['logs'] = run.nodes.slice(-20).map((node, index) => ({ seq: index + 1,
+  const nodeLogs: GraphInstanceView['logs'] = run.nodes.slice(-20).map((node, index) => ({ seq: index + 1,
     ...(node.endedAt ? { at: node.endedAt } : {}), nodeId: node.nodeId,
     level: node.ok ? 'info' : 'error', text: `${safeText(node.nodeId)} ${node.ok ? '완료' : '실패'}` }));
+  const logs = [...nodeLogs, ...preconditionLogs(run, events)]
+    .sort((left, right) => String(left.at ?? '').localeCompare(String(right.at ?? '')) || left.seq - right.seq)
+    .slice(-20).map((entry, index) => ({ ...entry, seq: index + 1 }));
   return { schemaVersion: 1, instance: { source, runId: run.runId, graphId: run.graphId,
     title: template?.loop?.title ?? run.graphId, observedAt, state: stateForGraph(run.status) },
     nodes, edges, progress: { completed: nodes.filter(node => node.state === 'done').length, total: nodes.length, activeNodeIds: active },
@@ -133,7 +162,7 @@ export function projectView(query: ViewQuery, ledgers: ViewLedgers): GraphInstan
   const matches = ledgers.graphRuns().filter(item => item.runId === query.runId
     && (query.graphId ? item.graphId === query.graphId : query.source === 'release' ? item.graphId === 'release-loop' : item.graphId !== 'release-loop'));
   const run = matches.length === 1 ? matches[0] : undefined;
-  return run ? projectGraphRun(run, query.source, observedAt) : null;
+  return run ? projectGraphRun(run, query.source, observedAt, ledgers.graphEvents?.(run)) : null;
 }
 
 const cloudHosts: readonly CloudVmHost[] = ['aws1', 'aws2', 'gcp2'];
@@ -171,6 +200,7 @@ function cachedCloudStates(): Readonly<Record<string, 'on' | 'off' | 'stopped' |
 
 export const liveLedgers: ViewLedgers = {
   graphRuns: () => listGraphRuns().runs,
+  graphEvents: run => readGraphRunEvents(graphRunEventLedgerPath(effectiveInstanceRoot(), run.graphId, run.runId)),
   harness: runId => loadRunLedger(runId, runLedgerDir(elanousStateRoot())),
   resources: () => readResourceLedger(resourceLedgerPath(elanousStateRoot())),
   hosts: () => {

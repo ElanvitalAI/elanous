@@ -152,6 +152,24 @@ export function createChildPluginRuntimeContract(options: ChildPluginRuntimeOpti
       }) };
       const state = await runGraph(graphFile, { runId, input, verifiedOwnerId: owner.id, quiet: true,
         ...(dispatchContext?.signal ? { signal: dispatchContext.signal } : {}), deps });
+      const ordinaryPending = state.status === 'awaiting-approval'
+        && realpathSync(graphFile) === realpathSync(ordinaryAppBuildFile);
+      if (ordinaryPending) {
+        const { APP_BUILD_REVIEW_PUBLISH_NODE } = await import('../graph-runner/capability-providers/app-build-rich-traversal.js');
+        if (state.pending?.nodeId !== APP_BUILD_REVIEW_PUBLISH_NODE)
+          return { ...state, graphObservation: progress.snapshot() };
+        if (!options.requestConfirmation || dispatchContext?.signal?.aborted)
+          throw new Error('APP_BUILD_OWNER_PRESENTATION_REFUSED');
+        const approved = await options.requestConfirmation(state.pending.message);
+        if (dispatchContext?.signal?.aborted) throw new Error('APP_BUILD_OWNER_PRESENTATION_REFUSED');
+        decideGraphApproval(state.graphId, state.runId, approved ? 'approved' : 'rejected', owner.id,
+          deps.root, { nodeId: APP_BUILD_REVIEW_PUBLISH_NODE,
+            visit: state.path.filter(node => node === APP_BUILD_REVIEW_PUBLISH_NODE).length });
+        const resumed = await runGraph(graphFile, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+          verifiedOwnerId: owner.id, quiet: true,
+          ...(dispatchContext?.signal ? { signal: dispatchContext.signal } : {}), deps });
+        return { ...resumed, graphObservation: progress.snapshot() };
+      }
       if (state.status !== 'awaiting-approval' || !Object.hasOwn(args, 'ticketDesignPath'))
         return { ...state, graphObservation: progress.snapshot() };
       // A connection-needed card must remain visible and cannot authorize spending.

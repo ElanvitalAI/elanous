@@ -1,0 +1,458 @@
+import { createHash } from 'node:crypto';
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readFileSync,
+  realpathSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { buildPublicDispatchRoutes, loadPublicDispatchRoutes, type PublicDispatchRoute } from './public-dispatch.js';
+import { loadPublicAppReadConfig } from './public-app-read.js';
+import { loadPublicAppVisitorWriteConfig, validateVisitorWritePolicy,
+  type PublicAppVisitorWritePolicy } from './public-app-visitor-write.js';
+
+/** A complete candidate is checked before the running relay swaps any policy. */
+export interface RelayPublicPolicySnapshot {
+  readonly trustedHostKeys: ReadonlyMap<string, string>;
+  readonly hostOwnerMemberIds: ReadonlyMap<string, string>;
+  readonly publicDispatchRoutes: ReadonlyMap<string, PublicDispatchRoute>;
+  readonly publicReadableApps: ReadonlySet<string>;
+  /** Request-time expiry remains effective even if a later file reload fails. */
+  readonly publicReadExpiresAt?: ReadonlyMap<string, number>;
+  readonly publicVisitorWritePolicies: readonly PublicAppVisitorWritePolicy[];
+}
+
+export interface RelayPublicPolicyFiles {
+  readonly trustedHostKeys: string;
+  readonly hostOwnerMembers: string;
+  readonly publicDispatch: string;
+  readonly publicRead: string;
+  readonly visitorWrite?: string;
+  readonly autoRegistrations?: string;
+}
+
+export interface AutoPublicAppRegistration {
+  readonly ownerId: string;
+  readonly serverId: string;
+  readonly user: string;
+  readonly app: string;
+  readonly deploymentId: string;
+  readonly grantId: string;
+  readonly expiresAt: string;
+}
+
+function validRegistration(value: unknown, now: number): AutoPublicAppRegistration | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid auto public registration');
+  const row = value as Record<string, unknown>;
+  const fields = Object.keys(row).sort().join();
+  if (fields !== 'app,deploymentId,expiresAt,grantId,ownerId,serverId,user') {
+    throw new Error('invalid auto public registration');
+  }
+  if (typeof row.ownerId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(row.ownerId)
+    || typeof row.serverId !== 'string' || !/^[a-f0-9]{64}$/.test(row.serverId)
+    || typeof row.user !== 'string' || typeof row.app !== 'string'
+    || !validPublicPair(row.user, row.app, 'elanous.app')
+    || typeof row.deploymentId !== 'string' || !/^dyn-[0-9a-f-]{36}$/.test(row.deploymentId)
+    || typeof row.grantId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(row.grantId)
+    || typeof row.expiresAt !== 'string' || !Number.isFinite(Date.parse(row.expiresAt))
+    || Date.parse(row.expiresAt) > now + 24 * 60 * 60 * 1000) {
+    throw new Error('invalid auto public registration');
+  }
+  if (Date.parse(row.expiresAt) <= now) return null;
+  return row as unknown as AutoPublicAppRegistration;
+}
+
+export function loadAutoPublicAppRegistrations(path: string, now = Date.now()): readonly AutoPublicAppRegistration[] {
+  assertNoPendingUpdate(path);
+  return parseAutoPublicAppRegistrations(privateFile(path).raw, now);
+}
+
+function parseAutoPublicAppRegistrations(raw: Buffer, now: number): readonly AutoPublicAppRegistration[] {
+  const value: unknown = JSON.parse(raw.toString('utf8'));
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).join() !== 'apps' || !Array.isArray((value as { apps?: unknown }).apps)) {
+    throw new Error('invalid auto public registration file');
+  }
+  const apps = (value as { apps: unknown[] }).apps.map(item => validRegistration(item, now))
+    .filter((item): item is AutoPublicAppRegistration => item !== null);
+  if (new Set(apps.map(item => item.user + '/' + item.app)).size !== apps.length) {
+    throw new Error('duplicate auto public registration');
+  }
+  return apps;
+}
+
+function withRegistrations(staticPolicy: RelayPublicPolicySnapshot,
+  apps: readonly AutoPublicAppRegistration[], domain: 'elanous.app' | 'elanous.ai', now: number): RelayPublicPolicySnapshot {
+  const routes = new Map(staticPolicy.publicDispatchRoutes);
+  const reads = new Set(staticPolicy.publicReadableApps);
+  const readExpiresAt = new Map(staticPolicy.publicReadExpiresAt);
+  const writes = [...staticPolicy.publicVisitorWritePolicies];
+  for (const app of apps) {
+    const existing = routes.get(app.user);
+    // A completed operator pin removal overrides a still-stored app grant.
+    // The sweep then removes its orphan record from the owner-only file.
+    if (!staticPolicy.trustedHostKeys.has(app.serverId) || !existing
+      || staticPolicy.hostOwnerMemberIds.get(app.serverId) !== app.ownerId
+      || existing.serverId !== app.serverId || existing.ownerMemberId !== app.ownerId) continue;
+    const key = app.user + '/' + app.app;
+    // A static public-read decision keeps its own lifetime. An unrelated
+    // automatic grant cannot shorten or extend the operator's static policy.
+    if (!staticPolicy.publicReadableApps.has(key)) {
+      reads.add(key);
+      readExpiresAt.set(key, Date.parse(app.expiresAt));
+    }
+  }
+  return validatedRelayPublicPolicySnapshot({ ...staticPolicy, publicDispatchRoutes: routes,
+    publicReadableApps: reads, publicReadExpiresAt: readExpiresAt,
+    publicVisitorWritePolicies: writes }, domain, now);
+}
+
+function assertNoPendingUpdate(path: string): void {
+  try { lstatSync(path + '.pending'); throw new Error('auto registration update requires recovery'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+}
+
+function pendingRecoveryRaw(marker: string, now: number): Buffer {
+  const raw = privateFile(marker, 128 * 1024).raw;
+  // A marker written by the first file format has no prior image. Retire all
+  // automatic reads instead of guessing which unacknowledged row was live.
+  if (raw.equals(Buffer.from('pending\n'))) return Buffer.from('{"apps":[]}\n');
+  const value: unknown = JSON.parse(raw.toString('utf8'));
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join() !== 'raw,version'
+    || (value as { version?: unknown }).version !== 1
+    || typeof (value as { raw?: unknown }).raw !== 'string') {
+    throw new Error('invalid auto registration recovery marker');
+  }
+  const encoded = (value as { raw: string }).raw;
+  const recovered = Buffer.from(encoded, 'base64');
+  if (recovered.length > 64 * 1024 || recovered.toString('base64') !== encoded) {
+    throw new Error('invalid auto registration recovery image');
+  }
+  parseAutoPublicAppRegistrations(recovered, now);
+  return recovered;
+}
+
+function recoverPendingUpdate(path: string, syncDirectory: (fd: number) => void = fsyncSync,
+  applyRecovered?: (raw: Buffer) => void, now = Date.now()): boolean {
+  const marker = path + '.pending';
+  try { lstatSync(marker); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+  const recovered = pendingRecoveryRaw(marker, now);
+  const finish = atomicPrivateFile(path, recovered, syncDirectory, true);
+  applyRecovered?.(recovered);
+  finish();
+  assertNoPendingUpdate(path);
+  return true;
+}
+
+function atomicPrivateFile(path: string, raw: Buffer, syncDirectory: (fd: number) => void = fsyncSync,
+  existingMarker = false, recoveryRaw?: Buffer): () => void {
+  const parent = dirname(path);
+  const marker = path + '.pending';
+  const temporary = join(parent, '.auto-apps-' + process.pid + '-' + Math.random().toString(16).slice(2));
+  const syncParent = () => {
+    const directory = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { syncDirectory(directory); } finally { closeSync(directory); }
+  };
+  // The marker is durable before rename. A persistent post-rename fsync fault
+  // therefore blocks reload and restart instead of exposing an unacknowledged row.
+  if (existingMarker) lstatSync(marker);
+  else {
+    if (!recoveryRaw || recoveryRaw.length > 64 * 1024) throw new Error('auto registration recovery image bound');
+    const markerRaw = Buffer.from(JSON.stringify({ version: 1, raw: recoveryRaw.toString('base64') }) + '\n');
+    const mark = openSync(marker, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      let offset = 0;
+      while (offset < markerRaw.length) {
+        const wrote = writeSync(mark, markerRaw, offset, markerRaw.length - offset);
+        if (wrote <= 0) throw new Error('auto registration recovery marker write failed');
+        offset += wrote;
+      }
+      fsyncSync(mark);
+    }
+    finally { closeSync(mark); }
+  }
+  let renamed = false;
+  try {
+    syncParent();
+    const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      let offset = 0;
+      while (offset < raw.length) {
+        const wrote = writeSync(fd, raw, offset, raw.length - offset);
+        if (wrote <= 0) throw new Error('auto registration write failed');
+        offset += wrote;
+      }
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(temporary, path);
+    renamed = true;
+    try { syncParent(); }
+    catch { syncParent(); } // a transient sync fault is safe to retry
+    // Keep the marker until the running snapshot has also been applied.
+    return () => {
+      try { unlinkSync(marker); }
+      catch { return; /* stale marker fails closed */ }
+      try { syncParent(); } catch { /* new file was already durably synced */ }
+    };
+  } catch (error) {
+    if (!renamed && !existingMarker) {
+      try { unlinkSync(marker); syncParent(); } catch { /* stale marker fails closed */ }
+    }
+    // A successful rename with persistent fsync failure keeps the durable
+    // marker. The caller may remove a route in memory, but cannot add one.
+    throw error;
+  }
+}
+
+/** An edge-local owner-only file. Its contents are never accepted from the public HTTP surface. */
+export function ensureRelayAutoRegistrationFile(path: string,
+  syncDirectory: (fd: number) => void = fsyncSync): void {
+  if (!isAbsolute(path) || resolve(path) !== path || realpathSync(dirname(path)) !== dirname(path)) {
+    throw new Error('auto registration path is not canonical');
+  }
+  const parent = lstatSync(dirname(path));
+  if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o022)
+    || process.getuid && parent.uid !== process.getuid()) throw new Error('auto registration parent refused');
+  recoverPendingUpdate(path, syncDirectory);
+  try { privateFile(path); return; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try { writeSync(fd, Buffer.from('{"apps":[]}\n')); fsyncSync(fd); }
+  finally { closeSync(fd); }
+  const directory = openSync(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fsyncSync(directory); } finally { closeSync(directory); }
+}
+
+/** Only an already authenticated host owner can add an app to its pinned handle. */
+export function createRelayAutoAppRegistrar(options: {
+  readonly file: string;
+  readonly domain: 'elanous.app' | 'elanous.ai';
+  readonly staticPolicy: () => RelayPublicPolicySnapshot;
+  readonly apply: (candidate: RelayPublicPolicySnapshot) => void;
+  readonly now?: () => number;
+  readonly syncDirectory?: (fd: number) => void;
+}) {
+  ensureRelayAutoRegistrationFile(options.file, options.syncDirectory);
+  const now = options.now ?? Date.now;
+  // A broken static file must not turn exact grant retirement into a no-op.
+  // Registration and the periodic sweep still require a fresh validated read.
+  let lastStaticPolicy = options.staticPolicy();
+  const loadRows = () => {
+    recoverPendingUpdate(options.file, options.syncDirectory, raw => {
+      const staticPolicy = options.staticPolicy();
+      lastStaticPolicy = staticPolicy;
+      options.apply(withRegistrations(staticPolicy,
+        parseAutoPublicAppRegistrations(raw, now()), options.domain, now()));
+    }, now());
+    return loadAutoPublicAppRegistrations(options.file, now());
+  };
+  const applyRows = (rows: readonly AutoPublicAppRegistration[], retiring = false) => {
+    let staticPolicy: RelayPublicPolicySnapshot;
+    try { staticPolicy = options.staticPolicy(); lastStaticPolicy = staticPolicy; }
+    catch (error) {
+      if (!retiring) throw error;
+      staticPolicy = lastStaticPolicy;
+    }
+    const candidate = withRegistrations(staticPolicy, rows, options.domain, now());
+    const previous = loadRows();
+    const priorRaw = privateFile(options.file).raw;
+    const nextRaw = Buffer.from(JSON.stringify({ apps: rows }) + '\n');
+    if (nextRaw.length > 64 * 1024) throw new Error('auto registration file bound');
+    let finish: () => void;
+    try { finish = atomicPrivateFile(options.file, nextRaw, options.syncDirectory, false,
+      retiring ? nextRaw : priorRaw); }
+    catch (error) {
+      if (retiring) options.apply(candidate); // never keep a withdrawn GET live
+      throw error;
+    }
+    try { options.apply(candidate); finish(); }
+    catch (error) {
+      try {
+        const finishRollback = atomicPrivateFile(options.file, priorRaw, options.syncDirectory, true);
+        options.apply(withRegistrations(staticPolicy, previous, options.domain, now()));
+        finishRollback();
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], 'auto registration rollback incomplete');
+      }
+      throw error;
+    }
+  };
+  return {
+    register(authenticatedServerId: string, authenticatedOwnerId: string, input: AutoPublicAppRegistration) {
+      const row = validRegistration(input, now());
+      if (!row || row.serverId !== authenticatedServerId || row.ownerId !== authenticatedOwnerId) {
+        throw new Error('auto registration authenticated binding refused');
+      }
+      const staticPolicy = options.staticPolicy();
+      if (staticPolicy.hostOwnerMemberIds.get(authenticatedServerId) !== authenticatedOwnerId
+        || !staticPolicy.trustedHostKeys.has(authenticatedServerId)
+        || staticPolicy.publicDispatchRoutes.get(row.user)?.serverId !== authenticatedServerId) {
+        throw new Error('auto registration host or handle is not pinned');
+      }
+      const rows = [...loadRows()];
+      const existing = rows.find(item => item.user === row.user && item.app === row.app);
+      if (existing) {
+        if (JSON.stringify(existing) === JSON.stringify(row)) return;
+        throw new Error('auto registration app collision');
+      }
+      rows.push(row);
+      applyRows(rows);
+    },
+    unregister(authenticatedServerId: string, authenticatedOwnerId: string,
+      identity: Pick<AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>) {
+      const rows = [...loadRows()];
+      const existing = rows.find(item => item.user === identity.user && item.app === identity.app);
+      if (!existing) return;
+      if (existing.serverId !== authenticatedServerId || existing.ownerId !== authenticatedOwnerId
+        || existing.deploymentId !== identity.deploymentId || existing.grantId !== identity.grantId) {
+        throw new Error('auto registration undo binding refused');
+      }
+      applyRows(rows.filter(item => item !== existing), true);
+    },
+    sweepExpired() {
+      const staticPolicy = options.staticPolicy();
+      lastStaticPolicy = staticPolicy;
+      const rows = loadRows().filter(item =>
+        staticPolicy.trustedHostKeys.has(item.serverId)
+        && staticPolicy.hostOwnerMemberIds.get(item.serverId) === item.ownerId
+        && staticPolicy.publicDispatchRoutes.get(item.user)?.serverId === item.serverId);
+      const raw = privateFile(options.file).raw;
+      if (JSON.stringify({ apps: rows }) + '\n' !== raw.toString('utf8')) applyRows(rows, true);
+    },
+  };
+}
+
+function privateFile(path: string, maxBytes = 64 * 1024): { raw: Buffer; stamp: string } {
+  if (typeof constants.O_NOFOLLOW !== 'number' || typeof constants.O_NONBLOCK !== 'number') {
+    throw new Error('relay policy safe open unavailable');
+  }
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o077) !== 0
+      || process.getuid && before.uid !== process.getuid() || before.size > maxBytes) {
+      throw new Error('relay policy file metadata refused');
+    }
+    const raw = readFileSync(fd);
+    const after = fstatSync(fd);
+    if (raw.length !== before.size || before.dev !== after.dev || before.ino !== after.ino
+      || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+      throw new Error('relay policy file changed while reading');
+    }
+    const digest = createHash('sha256').update(raw).digest('hex');
+    return { raw, stamp: `${before.dev}:${before.ino}:${before.size}:${before.mtimeMs}:${digest}` };
+  } finally { closeSync(fd); }
+}
+
+/** Double-read all private files; an incomplete multi-file update keeps the old policy. */
+export function loadRelayPublicPolicySnapshot(files: RelayPublicPolicyFiles,
+  domain: 'elanous.app' | 'elanous.ai'): RelayPublicPolicySnapshot {
+  if (files.autoRegistrations) assertNoPendingUpdate(files.autoRegistrations);
+  const names = [files.trustedHostKeys, files.hostOwnerMembers, files.publicDispatch,
+    files.publicRead, ...(files.visitorWrite ? [files.visitorWrite] : []),
+    ...(files.autoRegistrations ? [files.autoRegistrations] : [])];
+  const first = names.map(name => privateFile(name));
+  const keysValue: unknown = JSON.parse(first[0]!.raw.toString('utf8'));
+  const ownersValue: unknown = JSON.parse(first[1]!.raw.toString('utf8'));
+  if (!keysValue || typeof keysValue !== 'object' || Array.isArray(keysValue)
+    || !ownersValue || typeof ownersValue !== 'object' || Array.isArray(ownersValue)) {
+    throw new Error('invalid relay policy key or owner file');
+  }
+  const keys = new Map<string, string>();
+  const owners = new Map<string, string>();
+  for (const [id, key] of Object.entries(keysValue)) {
+    if (!/^[a-f0-9]{64}$/.test(id) || typeof key !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(key)
+      || Buffer.from(key, 'base64url').toString('base64url') !== key) throw new Error('invalid relay policy host key');
+    keys.set(id, key);
+  }
+  for (const [id, owner] of Object.entries(ownersValue)) {
+    if (!/^[a-f0-9]{64}$/.test(id) || typeof owner !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(owner)) {
+      throw new Error('invalid relay policy host owner');
+    }
+    owners.set(id, owner);
+  }
+  const staticCandidate = validatedRelayPublicPolicySnapshot({ trustedHostKeys: keys, hostOwnerMemberIds: owners,
+    publicDispatchRoutes: loadPublicDispatchRoutes(files.publicDispatch),
+    publicReadableApps: loadPublicAppReadConfig(files.publicRead),
+    publicVisitorWritePolicies: files.visitorWrite ? loadPublicAppVisitorWriteConfig(files.visitorWrite) : [] }, domain);
+  const candidate = files.autoRegistrations
+    ? withRegistrations(staticCandidate, loadAutoPublicAppRegistrations(files.autoRegistrations), domain, Date.now())
+    : staticCandidate;
+  const last = names.map(name => privateFile(name));
+  if (first.some((item, index) => item.stamp !== last[index]!.stamp)) {
+    throw new Error('relay policy files changed during candidate validation');
+  }
+  return candidate;
+}
+
+export function validatedRelayPublicPolicySnapshot(input: RelayPublicPolicySnapshot, domain: 'elanous.app' | 'elanous.ai',
+  now = Date.now()): RelayPublicPolicySnapshot {
+  if (!input.trustedHostKeys.size || !Number.isSafeInteger(now)) throw new Error('invalid relay policy snapshot');
+  const keys = new Map(input.trustedHostKeys);
+  const owners = new Map(input.hostOwnerMemberIds);
+  for (const [serverId, publicKey] of keys) {
+    if (!/^[a-f0-9]{64}$/.test(serverId) || !/^[A-Za-z0-9_-]{43}$/.test(publicKey)
+      || !owners.get(serverId)) throw new Error('invalid relay policy host binding');
+  }
+  const routes = buildPublicDispatchRoutes(new Map(input.publicDispatchRoutes), new Set(keys.keys()), owners);
+  const reads = new Set(input.publicReadableApps);
+  const readExpiresAt = new Map(input.publicReadExpiresAt);
+  for (const key of reads) {
+    const parts = key.split('/');
+    if (parts.length !== 2 || !routes.has(parts[0]!)
+      || !validPublicPair(parts[0]!, parts[1]!, domain)) throw new Error('invalid relay policy read binding');
+  }
+  for (const [key, expiry] of readExpiresAt) {
+    if (!reads.has(key) || !Number.isFinite(expiry)) throw new Error('invalid relay policy read expiry');
+  }
+  const writes = input.publicVisitorWritePolicies.map(policy => validateVisitorWritePolicy(policy, now));
+  if (new Set(writes.map(policy => policy.user + '/' + policy.app)).size !== writes.length) {
+    throw new Error('duplicate relay policy write binding');
+  }
+  for (const policy of writes) {
+    if (!reads.has(policy.user + '/' + policy.app)
+      || routes.get(policy.user)?.serverId !== policy.serverId) throw new Error('invalid relay policy write binding');
+  }
+  return { trustedHostKeys: keys, hostOwnerMemberIds: owners, publicDispatchRoutes: routes,
+    publicReadableApps: reads, publicReadExpiresAt: readExpiresAt, publicVisitorWritePolicies: writes };
+}
+
+function validPublicPair(user: string, app: string, domain: string): boolean {
+  return domain.length > 0 && user.length >= 3 && user.length <= 20 && !user.includes('--')
+    && app.length >= 1 && app.length <= 24 && !app.includes('--')
+    && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(user)
+    && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(app)
+    && !/-pr\d+$/.test(app) && !['www', 'docs', 'api', 'admin', 'relay', 'mail'].includes(app);
+}
+
+/** A private digest for change detection; neither keys nor owner IDs are logged. */
+export function relayPublicPolicyFingerprint(input: RelayPublicPolicySnapshot): string {
+  const ordered = {
+    keys: [...input.trustedHostKeys].sort(([a], [b]) => a.localeCompare(b)),
+    owners: [...input.hostOwnerMemberIds].sort(([a], [b]) => a.localeCompare(b)),
+    routes: [...input.publicDispatchRoutes].sort(([a], [b]) => a.localeCompare(b)),
+    reads: [...input.publicReadableApps].sort(),
+    readExpiries: [...(input.publicReadExpiresAt ?? [])].sort(([a], [b]) => a.localeCompare(b)),
+    writes: [...input.publicVisitorWritePolicies].sort((a, b) => (a.user + '/' + a.app).localeCompare(b.user + '/' + b.app)),
+  };
+  return createHash('sha256').update(JSON.stringify(ordered)).digest('hex');
+}
+
+/** Registrar writes and the periodic file reader share one applied fingerprint. */
+export function createRelayPublicPolicyReloader(initial: RelayPublicPolicySnapshot,
+  load: () => RelayPublicPolicySnapshot, apply: (candidate: RelayPublicPolicySnapshot) => void) {
+  let appliedFingerprint = relayPublicPolicyFingerprint(initial);
+  const applySnapshot = (candidate: RelayPublicPolicySnapshot) => {
+    const fingerprint = relayPublicPolicyFingerprint(candidate);
+    apply(candidate);
+    appliedFingerprint = fingerprint;
+  };
+  return {
+    apply: applySnapshot,
+    refresh: () => {
+      const candidate = load();
+      const fingerprint = relayPublicPolicyFingerprint(candidate);
+      if (fingerprint === appliedFingerprint) return false;
+      applySnapshot(candidate);
+      return true;
+    },
+  };
+}

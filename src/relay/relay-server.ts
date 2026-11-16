@@ -7,6 +7,8 @@ export { challengeMessage } from './channel.js';
 import { MAX_MUX_FRAME_BYTES, MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
 import { buildPublicDispatchRoutes, type PublicDispatchRoute } from './public-dispatch.js';
 import { isAnonymousPublicAppRead } from './public-app-read.js';
+import { validatedRelayPublicPolicySnapshot, type AutoPublicAppRegistration,
+  type RelayPublicPolicySnapshot } from './public-app-auto-registration.js';
 import { createPublicAppVisitorWriteGate, validateVisitorWritePolicy,
   type PublicAppVisitorWritePolicy, type VisitorWriteLedger } from './public-app-visitor-write.js';
 
@@ -223,6 +225,14 @@ export interface RelayServerOptions {
   publicListedApps?: ReadonlySet<string>;
   /** Explicit user/app pairs allowed anonymous GET/HEAD; absent means private. */
   publicReadableApps?: ReadonlySet<string>;
+  /** Dynamic public read expiry checked on each request, independent of reload health. */
+  publicReadExpiresAt?: ReadonlyMap<string, number>;
+  /** Authenticated existing host only; server-owned store verifies the pinned route. */
+  autoAppRegistration?: {
+    register(serverId: string, ownerId: string, input: AutoPublicAppRegistration): void | Promise<void>;
+    unregister(serverId: string, ownerId: string,
+      input: Pick<AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>): void | Promise<void>;
+  };
   /** Separate expiring app/path POST opt-in; never extends member or control authority. */
   publicVisitorWritePolicies?: readonly PublicAppVisitorWritePolicy[];
   /** Durable replay/rate store, required whenever visitor writes are enabled. */
@@ -341,7 +351,8 @@ function encodeClientId(id: number, payload: Uint8Array): Uint8Array {
  * four-byte big-endian clientId prefix; phone binary frames are raw ciphertext. */
 export function startRelayServer(options: RelayServerOptions = {}) {
   if (!options.trustedHostKeys?.size) throw new Error('relay trusted host keys required');
-  const trustedHostKeys = new Map(options.trustedHostKeys);
+  let trustedHostKeys = new Map(options.trustedHostKeys);
+  let hostOwnerMemberIds = options.hostOwnerMemberIds ? new Map(options.hostOwnerMemberIds) : undefined;
   for (const [id, key] of trustedHostKeys) {
     if (!/^[a-f0-9]{64}$/.test(id) || !decodeKey(key)) throw new Error('invalid relay trusted host key entry');
   }
@@ -359,7 +370,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     || !options.memberRequired || !options.hostOwnerMemberIds)) {
     throw new Error('multi-user public dispatch requires a domain and member gate without a single-user pin');
   }
-  const publicRoutes = multiUser
+  let publicRoutes = multiUser
     ? buildPublicDispatchRoutes(options.publicDispatchRoutes!, new Set(trustedHostKeys.keys()), options.hostOwnerMemberIds!)
     : undefined;
   if (options.publicDomain !== undefined) {
@@ -374,14 +385,15 @@ export function startRelayServer(options: RelayServerOptions = {}) {
   } else if (options.publicServerId !== undefined || options.publicUserId !== undefined || multiUser) {
     throw new Error('publicServerId and publicUserId require publicDomain');
   }
-  const publicReadableApps = new Set(options.publicReadableApps ?? []);
+  let publicReadableApps = new Set(options.publicReadableApps ?? []);
+  let publicReadExpiresAt = new Map(options.publicReadExpiresAt ?? []);
   for (const key of publicReadableApps) {
     const [user, app, extra] = key.split('/');
     const parsed = parsePublicAppHost(`${app}--${user}.${options.publicDomain}`, options.publicDomain);
     if (!options.publicDomain || extra !== undefined || !parsed || parsed.user !== user || parsed.app !== app
       || !(publicRoutes?.has(user!) || user === options.publicUserId)) throw new Error('invalid public read binding');
   }
-  const visitorPolicies = (options.publicVisitorWritePolicies ?? []).map(policy => validateVisitorWritePolicy(policy));
+  let visitorPolicies = (options.publicVisitorWritePolicies ?? []).map(policy => validateVisitorWritePolicy(policy));
   if (visitorPolicies.length && (!options.memberRequired || !options.publicVisitorWriteLedger)) {
     throw new Error('visitor writes require pinned member hosts and a durable admission ledger');
   }
@@ -392,7 +404,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       throw new Error('invalid visitor write binding');
     }
   }
-  const visitorGate = visitorPolicies.length
+  let visitorGate = visitorPolicies.length
     ? createPublicAppVisitorWriteGate(visitorPolicies, options.publicVisitorWriteLedger!) : undefined;
   let activeVisitorChecks = 0;
   const publicListedApps = new Set(options.publicListedApps ?? []);
@@ -419,6 +431,33 @@ export function startRelayServer(options: RelayServerOptions = {}) {
   }
   const rooms = new Map<string, Room>();
   const sockets = new Set<Socket>();
+  const reloadPublicPolicySnapshot = (input: RelayPublicPolicySnapshot): void => {
+    if (!multiUser || !options.publicDomain || !options.memberRequired) throw new Error('relay policy reload unavailable');
+    const candidate = validatedRelayPublicPolicySnapshot(input, options.publicDomain);
+    if (candidate.publicVisitorWritePolicies.length && !options.publicVisitorWriteLedger) {
+      throw new Error('visitor policy ledger unavailable');
+    }
+    for (const route of customDomainRoutes.values()) {
+      if (!candidate.publicDispatchRoutes.has(route.user)) throw new Error('custom domain route would lose owner');
+    }
+    // Build the gate before changing any request-visible map. It reuses the same
+    // durable ledger, preserving replay and rate history across policy renewal.
+    const nextVisitorGate = candidate.publicVisitorWritePolicies.length
+      ? createPublicAppVisitorWriteGate(candidate.publicVisitorWritePolicies, options.publicVisitorWriteLedger!) : undefined;
+    const nextKeys = new Map(candidate.trustedHostKeys);
+    const nextOwners = new Map(candidate.hostOwnerMemberIds);
+    const replaced = new Set([...trustedHostKeys.keys()].filter(serverId =>
+      nextKeys.get(serverId) !== trustedHostKeys.get(serverId)
+        || nextOwners.get(serverId) !== hostOwnerMemberIds?.get(serverId)));
+    trustedHostKeys = nextKeys;
+    hostOwnerMemberIds = nextOwners;
+    publicRoutes = candidate.publicDispatchRoutes;
+    publicReadableApps = new Set(candidate.publicReadableApps);
+    publicReadExpiresAt = new Map(candidate.publicReadExpiresAt);
+    visitorPolicies = [...candidate.publicVisitorWritePolicies];
+    visitorGate = nextVisitorGate;
+    for (const socket of sockets) if (replaced.has(socket.data.serverId)) socket.close(1008, 'host authority changed');
+  };
   let activeMemberChecks = 0;
   const roomFor = (id: string): Room => {
     let room = rooms.get(id);
@@ -446,7 +485,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     const consumed: MemberCredential[] = [];
     let foreignMember = false;
     try {
-      const ownerId = options.hostOwnerMemberIds!.get(serverId);
+      const ownerId = hostOwnerMemberIds!.get(serverId);
       if (!ownerId) return { status: 'denied', consumed: [] };
       for (const credential of credentials) {
         let member: { memberId: string } | null = null;
@@ -578,7 +617,10 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       return new Response(JSON.stringify({ received: true }), { status: 202,
         headers: { ...reportHeaders, 'content-type': 'application/json' } });
     }
-    const anonymousPublicRead = isAnonymousPublicAppRead(req, publicApp.user, publicApp.app, publicReadableApps);
+    const readKey = publicApp.user + '/' + publicApp.app;
+    const readExpiry = publicReadExpiresAt.get(readKey);
+    const anonymousPublicRead = (readExpiry === undefined || Date.now() < readExpiry)
+      && isAnonymousPublicAppRead(req, publicApp.user, publicApp.app, publicReadableApps);
     const visitorPolicy = visitorGate && !memberCredentials(req).length
       ? visitorPolicies.find(policy => policy.user === publicApp.user && policy.app === publicApp.app
         && policy.method === req.method && policy.paths.includes(new URL(req.url).pathname)) : undefined;
@@ -619,7 +661,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     if (room.publicSlots >= MAX_PUBLIC_REQUESTS_PER_SERVER) return new Response('Public request capacity reached', { status: 429 });
     room.publicSlots += 1;
     const connectionId = randomUUID();
-    const memberId = options.memberRequired ? options.hostOwnerMemberIds!.get(serverId) : undefined;
+    const memberId = options.memberRequired ? hostOwnerMemberIds!.get(serverId) : undefined;
     let slotHeld = true;
     const releaseSlot = () => { if (slotHeld) { slotHeld = false; room.publicSlots = Math.max(0, room.publicSlots - 1); trafficMeter?.forgetConnection(connectionId); } };
     try {
@@ -761,7 +803,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       const role = url.pathname === '/host' ? 'host' : 'client';
       const now = Date.now();
       if (!server.upgrade(req, { data: { role, serverId, authenticated: false, lastSeen: now, tokens: BURST_BYTES, refillAt: now,
-        memberId: options.memberRequired ? options.hostOwnerMemberIds!.get(serverId) : undefined, connectionId: randomUUID() } })) {
+        memberId: options.memberRequired ? hostOwnerMemberIds!.get(serverId) : undefined, connectionId: randomUUID() } })) {
         return new Response('upgrade required', { status: 426 });
       }
       return undefined;
@@ -826,12 +868,31 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         }
         if (typeof message === 'string') {
           if (data.role === 'host' && options.publicDomain) {
-            let value: { type?: unknown; publicKey?: unknown };
+            if (message.length > 4_096) { ws.close(1009, 'host control too large'); return; }
+            let value: { type?: unknown; publicKey?: unknown; requestId?: unknown; registration?: unknown };
             try { value = JSON.parse(message) as typeof value; } catch { value = {}; }
             const publicKey = typeof value.publicKey === 'string' ? decodeKey(value.publicKey) : undefined;
             if (value.type === 'host-public-key' && publicKey && serverIdFromPublicKey(publicKey) === data.serverId) {
               room.hostPublicKey = publicKey;
               sendControl(ws, { type: 'host-public-key-accepted' });
+              return;
+            }
+            if (options.autoAppRegistration && room.host === ws && room.hostPublicKey
+              && typeof value.requestId === 'string' && /^[a-f0-9-]{36}$/.test(value.requestId)
+              && (value.type === 'public-app-register' || value.type === 'public-app-unregister')) {
+              const ownerId = hostOwnerMemberIds?.get(data.serverId);
+              if (!ownerId || data.memberId !== ownerId) {
+                sendControl(ws, { type: 'public-app-rejected', requestId: value.requestId });
+                return;
+              }
+              void Promise.resolve().then(() => value.type === 'public-app-register'
+                ? options.autoAppRegistration!.register(data.serverId, ownerId, value.registration as AutoPublicAppRegistration)
+                : options.autoAppRegistration!.unregister(data.serverId, ownerId,
+                  value.registration as Pick<AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>)).then(() => {
+                sendControl(ws, { type: 'public-app-accepted', requestId: value.requestId });
+              }, () => {
+                sendControl(ws, { type: 'public-app-rejected', requestId: value.requestId });
+              });
               return;
             }
           }
@@ -914,6 +975,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
   heartbeat.unref();
   return {
     server,
+    reloadPublicPolicySnapshot,
     get port() { return server.port; },
     stats(serverId: string) {
       const room = rooms.get(serverId);

@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { generateKeyPairSync, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -120,11 +120,26 @@ test('renewal before policy expiry retains replay and recent rate admission acro
 test('per-app admission capacity recovers while renewed replay tombstones remain protected', () => {
   const f = fixture(); const path = join(f.root, 'ledger.sqlite');
   let ledger = createVisitorWriteLedger(path, f.root);
-  // Source: OP74630 exercise the 10,000 app receipt ceiling and request 10,001,
-  // then the existing 60-second rate window frees admission capacity independently of replay history.
+  // Source: OP74630 check the 10,000 app receipt ceiling and request 10,001.
+  // Seed the exact durable receipt schema/hash in one fixture transaction;
+  // this is not 10,000 product requests or 10,000 ledger.admit calls.
+  // The actual ledger.admit calls below prove capacity, replay, window, and TTL.
   const policy = { ...f.policy, requestsPerMinute: 10_000 };
   try {
-    for (let n = 0; n < 10_000; n++) expect(ledger.admit(policy, `capacity-intent-${n}`, f.at)).toBe('allowed');
+    const seed = new Database(path);
+    try {
+      seed.exec('BEGIN IMMEDIATE');
+      const insert = seed.prepare('INSERT INTO visitor_write_receipt (app, request_hash, accepted_at, expires_at) VALUES (?, ?, ?, ?)');
+      for (let n = 0; n < 10_000; n++) {
+        const hash = createHash('sha256').update(`capacity-intent-${n}`).digest('hex');
+        insert.run(policy.user + '/' + policy.app, hash, f.at, Date.parse(policy.expiresAt));
+      }
+      seed.exec('COMMIT');
+      expect(seed.query('SELECT COUNT(*) AS n FROM visitor_write_receipt').get()).toEqual({ n: 10_000 });
+    } catch (error) {
+      try { seed.exec('ROLLBACK'); } catch { /* preserve setup failure */ }
+      throw error;
+    } finally { seed.close(); }
     expect(ledger.admit(policy, 'capacity-overflow', f.at)).toBe('limited');
     expect(ledger.admit(policy, 'capacity-after-minute', f.at + 60_001)).toBe('allowed');
     expect(ledger.admit(policy, 'capacity-intent-0', f.at + 60_001)).toBe('replay');

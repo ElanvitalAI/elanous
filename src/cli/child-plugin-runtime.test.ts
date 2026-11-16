@@ -9,7 +9,7 @@ import { buildCliAgentTools } from './agent-cli.js';
 import { registerToolRuntime, unregisterToolRuntime } from '../tool-runtime/registry.js';
 import type { GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 import { emptyGraphCapabilityRegistry } from '../graph-runner/capabilities.js';
-import { createSourceBuildWithApprovalRegistry } from '../graph-runner/capability-providers/app-build-publish-approval.js';
+import { createRichSourceBuildWithApprovalRegistry } from '../graph-runner/capability-providers/app-build-rich-traversal.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 test('ordinary app build refuses when the trusted approval provider is absent', async () => {
@@ -50,10 +50,13 @@ test('ordinary app build approves after a simulated 20-minute build', async () =
     writeFileSync(join(root, 'acp-token'), 'synthetic-local-control', { mode: 0o600 });
     writeFileSync(join(root, 'nexus', 'runtime.json'), JSON.stringify({
       pid: process.pid, httpAuth: 'on', httpPort: server.port }), { mode: 0o600 });
-    const base = createSourceBuildWithApprovalRegistry();
+    const base = createRichSourceBuildWithApprovalRegistry();
     const registry = { ...base, providers: base.providers.map(provider =>
       provider.id === 'app-build-owner-publish-approval' ? provider : { ...provider,
         invoke: async (context: { nodeId: string }) => {
+          if (context.nodeId === 'source-items') return { ok: true, outcome: 'done' as const,
+            result: { items: [{ kind: 'web', requested: false }, { kind: 'document', requested: false },
+              { kind: 'aside', requested: false }] } };
           if (context.nodeId === 'materialize') buildElapsedMs = 20 * 60_000;
           if (context.nodeId === 'publish') publishes++;
           return { ok: true, outcome: 'done' as const, result: { status: 'done' } };
@@ -69,11 +72,15 @@ test('ordinary app build approves after a simulated 20-minute build', async () =
     expect(buildElapsedMs).toBe(20 * 60_000);
     expect(actions).toEqual(['approval-start', 'approval-poll']);
     expect(publishes).toBe(1);
-    expect(prompts).toHaveLength(2);
-    expect(prompts[1]).toContain(url);
+    expect(prompts).toHaveLength(3);
+    expect(prompts[1]).toContain('게시 승인을 진행합니까');
+    expect(prompts[2]).toContain(url);
     expect(JSON.stringify(response)).not.toContain('8f195ad4');
     if (!response.ok) throw new Error(response.error);
-    const state = response.result as { path: string[] };
+    const state = response.result as { runId: string; path: string[] };
+    expect(state.path.filter(node => node === 'review-publish')).toHaveLength(1);
+    const ledger = JSON.parse(readFileSync(join(root, 'graph-runs', 'app-build', `${state.runId}.json`), 'utf8'));
+    expect(ledger.nodes.find((node: { nodeId: string }) => node.nodeId === 'review-publish')?.output).toContain('approved');
     expect(state.path).toContain('publish-approval');
     expect(state.path.indexOf('publish-approval')).toBeLessThan(state.path.indexOf('publish'));
   } finally {
@@ -108,10 +115,13 @@ test('ordinary app build never publishes when owner approval is pending or denie
       writeFileSync(join(root, 'acp-token'), 'synthetic-local-control', { mode: 0o600 });
       writeFileSync(join(root, 'nexus', 'runtime.json'), JSON.stringify({
         pid: process.pid, httpAuth: 'on', httpPort: server.port }), { mode: 0o600 });
-      const base = createSourceBuildWithApprovalRegistry();
+      const base = createRichSourceBuildWithApprovalRegistry();
       const registry = { ...base, providers: base.providers.map(provider =>
         provider.id === 'app-build-owner-publish-approval' ? provider : { ...provider,
           invoke: async (context: { nodeId: string }) => {
+            if (context.nodeId === 'source-items') return { ok: true, outcome: 'done' as const,
+              result: { items: [{ kind: 'web', requested: false }, { kind: 'document', requested: false },
+                { kind: 'aside', requested: false }] } };
             if (context.nodeId === 'publish') publishes++;
             return { ok: true, outcome: 'done' as const, result: { status: 'done' } };
           } }) };
@@ -135,6 +145,43 @@ test('ordinary app build never publishes when owner approval is pending or denie
       rmSync(root, { recursive: true, force: true });
     }
   }
+});
+
+test('ordinary app build HITL rejection resumes the exact run to failed without server approval or publish', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'child-app-build-hitl-reject-')));
+  let publishes = 0;
+  let serverApprovals = 0;
+  const prompts: string[] = [];
+  try {
+    const base = createRichSourceBuildWithApprovalRegistry();
+    const registry = { ...base, providers: base.providers.map(provider => ({ ...provider,
+      invoke: async (context: { nodeId: string }) => {
+        if (context.nodeId === 'source-items') return { ok: true, outcome: 'done' as const,
+          result: { items: [{ kind: 'web', requested: false }, { kind: 'document', requested: false },
+            { kind: 'aside', requested: false }] } };
+        if (context.nodeId === 'publish-approval') serverApprovals++;
+        if (context.nodeId === 'publish') publishes++;
+        return { ok: true, outcome: 'done' as const, result: { status: 'done' } };
+      },
+    })) };
+    const bridge = createChildPluginRuntimeContract({ verifiedOwner: { id: 'owner-a' },
+      graphDeps: { root, capabilityProviders: registry },
+      requestConfirmation: async prompt => { prompts.push(prompt); return prompts.length === 1; } });
+    const response = await bridge.dispatchPluginTool('app_build', { ask: 'Build a ticketing app',
+      seedRequested: false, appSlug: 'ticketing', artifactMetadata: {
+        runtime: { startCommand: ['bun', 'backend/entry.ts'], healthPath: '/health' } } });
+    expect(response).toMatchObject({ ok: true, result: { status: 'failed' } });
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('게시 승인을 진행합니까');
+    expect(serverApprovals).toBe(0);
+    expect(publishes).toBe(0);
+    if (!response.ok) throw new Error(response.error);
+    const state = response.result as { runId: string; path: string[] };
+    expect(state.path).toContain('review-publish');
+    expect(state.path).not.toContain('publish-approval');
+    const ledger = JSON.parse(readFileSync(join(root, 'graph-runs', 'app-build', `${state.runId}.json`), 'utf8'));
+    expect(ledger.nodes.find((node: { nodeId: string }) => node.nodeId === 'review-publish')?.output).toContain('declined');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('actual verified graph route sends the same bounded progress to display and supervisor input', async () => {

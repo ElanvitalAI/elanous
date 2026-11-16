@@ -12,6 +12,11 @@ import { createDynamicAppPublisher, createDynamicAppPublishRoute, createDynamicA
 import { buildSharedAppTools } from '../../agent/shared-app-tools.js';
 import { getToolLoopPhaseRejectedCalls } from '../../llm.js';
 
+// The product service intentionally requires macOS sandbox-exec. Linux runs the
+// explicit refusal case below; service success and cleanup are measured on macOS.
+const serviceTest = process.platform === 'darwin' ? test : test.skip;
+const linuxTest = process.platform === 'darwin' ? test.skip : test;
+
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const stop of cleanup.splice(0).reverse()) await stop(); });
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -37,7 +42,8 @@ async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expi
   tamperSealBeforeActivation?: boolean; failRevoke?: boolean; denyRevoke?: boolean;
   failServiceStopAfterStop?: boolean; failServiceStopOnceBeforeStop?: boolean; failUnregisterOnce?: boolean;
   providerRevokeStatus?: 403 | 429; approvalFlow?: boolean; approvedExpiryShorterMs?: number;
-  noncanonicalExpiry?: boolean } = {}) {
+  noncanonicalExpiry?: boolean; routeRegistration?: boolean; routeRegistrationFails?: boolean;
+  routeAckLostOnce?: boolean; routeUnregisterFailsOnce?: boolean; routeUnregisterFailures?: number } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'dynamic-publish-')));
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   for (const name of ['apps', 'sources', 'seals', 'runtime']) mkdirSync(join(root, name), { mode: 0o700 });
@@ -151,8 +157,29 @@ async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expi
         return Response.json({ ...publicGrant, memberId: ownerId, credential }, { status: 201 });
       }) as typeof fetch });
   const expiry = new Date(Date.now() + (options.expired ? -60_000 : options.expiresInMs ?? 60_000)).toISOString();
+  const registeredRoutes: Array<{ ownerId: string; user: string; app: string; deploymentId: string;
+    grantId: string; expiresAt: string }> = [];
+  const unregisteredRoutes: Array<{ user: string; app: string; deploymentId: string; grantId: string }> = [];
+  let routeAckLost = !!options.routeAckLostOnce;
+  let routeUnregisterFailures = options.routeUnregisterFailures ?? (options.routeUnregisterFailsOnce ? 1 : 0);
+  let routeUnregisterAttempts = 0;
   const publisher = createDynamicAppPublisher({ sourceRoot: join(root, 'sources'), sealRoot: join(root, 'seals'),
     runtimeRoot: join(root, 'runtime'), appHost, testMemberId: 'member-a', testHandle: 'test-slot',
+    ...(options.routeRegistration ? { relayRoutes: {
+      register: async (input: (typeof registeredRoutes)[number]) => {
+        if (options.routeRegistrationFails) throw new Error('synthetic relay registration refusal');
+        registeredRoutes.push(input);
+        if (routeAckLost) { routeAckLost = false; throw new Error('synthetic relay acknowledgement lost'); }
+      },
+      unregister: async (input: (typeof unregisteredRoutes)[number]) => {
+        routeUnregisterAttempts++;
+        if (routeUnregisterFailures > 0) {
+          routeUnregisterFailures--;
+          throw new Error('synthetic relay unregister unavailable');
+        }
+        unregisteredRoutes.push(input);
+      },
+    } } : {}),
     testApprovalExpiresAt: options.noncanonicalExpiry ? expiry.replace(/\.\d{3}Z$/u, 'Z') : expiry,
     authorizationPollMsForTesting: options.authorizationPollMsForTesting,
     issuerSourceHead: options.missingSourceHead ? undefined : 'a'.repeat(40),
@@ -161,6 +188,9 @@ async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expi
     ...(options.withoutGrantProvider ? {} : { deploymentGrants: providerForPublisher }),
     approveArtifact: () => !options.denyArtifact,
     verifyPublic: async url => {
+      if (options.routeRegistration && registeredRoutes.length === unregisteredRoutes.length) {
+        return { status: 404, marker: null };
+      }
       const response = await appHost.handle(new Request(url, { headers: { host: new URL(url).host } }));
       if (options.tamperSealBeforeActivation) {
         const seal = readdirSync(join(root, 'seals')).find(name => name.startsWith('source-'))!;
@@ -197,7 +227,8 @@ async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expi
       executed: false, published: false };
     writeFileSync(join(sourceRoot, 'source-artifact.json'), JSON.stringify(receipt), { mode: 0o600 });
   };
-  return { root, appHost, publisher, route, call, writeSource,
+  return { root, appHost, publisher, route, call, writeSource, registeredRoutes, unregisteredRoutes,
+    routeUnregisterAttempts: () => routeUnregisterAttempts,
     grantCount: () => grants.size,
     serviceStopAttempts: () => serviceStopAttempts,
     checkServingAuthorization: async () => !!await capturedServingAuthorization?.(),
@@ -225,7 +256,16 @@ async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expi
   };
 }
 
-test('native approval start pins deployment and browser-confirmed poll alone opens publish', async () => {
+linuxTest('non-Darwin dynamic publish refuses service activation and leaves no live app', async () => {
+  const f = await fixture();
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(400);
+  expect(f.grantCount()).toBe(0);
+  expect(f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/'))).toBeFalsy();
+});
+
+serviceTest('native approval start pins deployment and browser-confirmed poll alone opens publish', async () => {
   const f = await fixture({ approvalFlow: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -290,7 +330,7 @@ test('changed relay binding cannot reuse pending approval but can retire it afte
   expect(f.issuedIds).toHaveLength(0);
 });
 
-test('grant issue preserves the pending requested expiry while enforcing shorter browser approval expiry', async () => {
+serviceTest('grant issue preserves the pending requested expiry while enforcing shorter browser approval expiry', async () => {
   const f = await fixture({ approvalFlow: true, approvedExpiryShorterMs: 30_000 });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -306,7 +346,7 @@ test('grant issue preserves the pending requested expiry while enforcing shorter
   expect(f.issuedInputs[0]!.approvalId).toBe(pending.approvalId);
 });
 
-test('noncanonical requested expiry bytes stay pinned through approval and grant issue', async () => {
+serviceTest('noncanonical requested expiry bytes stay pinned through approval and grant issue', async () => {
   const f = await fixture({ approvalFlow: true, noncanonicalExpiry: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -321,7 +361,7 @@ test('noncanonical requested expiry bytes stay pinned through approval and grant
   expect(f.issuedInputs[0]!.expiresAt).toBe(pinned.expiresAt);
 });
 
-test('actual reserve route -> source receipt -> service -> public host -> scoped undo', async () => {
+serviceTest('actual reserve route -> source receipt -> service -> public host -> scoped undo', async () => {
   const f = await fixture();
   const reserved = await f.call('reserve');
   expect(reserved.status).toBe(200);
@@ -358,7 +398,79 @@ test('actual reserve route -> source receipt -> service -> public host -> scoped
   expect((await f.call('undo', 'run-a', next.body.deploymentId as string)).status).toBe(200);
 });
 
-test('private intent retains one deployment identity across a failed issue retry; activation follows public verification', async () => {
+serviceTest('publisher registers the verified grant through the product relay path before URL verification and undoes it', async () => {
+  const f = await fixture({ routeRegistration: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  const published = await f.call('publish');
+  expect(published.status).toBe(200);
+  expect(f.registeredRoutes).toHaveLength(1);
+  expect(f.registeredRoutes[0]).toMatchObject({ ownerId: 'member-a', user: 'test-slot', app: 'demo-app',
+    deploymentId: published.body.deploymentId, grantId: expect.stringMatching(/^grant-/u) });
+  expect((await f.call('undo', 'run-a', published.body.deploymentId as string)).status).toBe(200);
+  expect(f.unregisteredRoutes).toEqual([{ user: 'test-slot', app: 'demo-app',
+    deploymentId: published.body.deploymentId as string, grantId: f.registeredRoutes[0]!.grantId }]);
+});
+
+serviceTest('relay registration refusal leaves no published service or active grant', async () => {
+  const f = await fixture({ routeRegistration: true, routeRegistrationFails: true });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(400);
+  expect(f.registeredRoutes).toHaveLength(0);
+  expect(f.unregisteredRoutes).toHaveLength(1);
+  expect(f.grantCount()).toBe(0);
+  expect(f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/'))).toBeFalsy();
+});
+
+serviceTest('lost relay acknowledgement and failed removal retain exact durable route for retry', async () => {
+  const f = await fixture({ routeRegistration: true, routeAckLostOnce: true,
+    routeUnregisterFailsOnce: true, authorizationPollMsForTesting: 100 });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(400);
+  const route = f.registeredRoutes[0]!;
+  expect(route).toBeDefined();
+  const path = join(f.root, 'seals', '.deployment-state', 'route-' + route.deploymentId + '.json');
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ ownerId: route.ownerId,
+    user: route.user, app: route.app, deploymentId: route.deploymentId, grantId: route.grantId });
+  expect(f.unregisteredRoutes).toEqual([]);
+  const until = Date.now() + 2_000;
+  while (f.unregisteredRoutes.length === 0 && Date.now() < until)
+    await new Promise(resolve => setTimeout(resolve, 20));
+  expect(f.unregisteredRoutes).toEqual([{ user: route.user, app: route.app,
+    deploymentId: route.deploymentId, grantId: route.grantId }]);
+  expect(f.routeUnregisterAttempts()).toBe(2);
+  expect(f.appHost.handle(new Request('https://demo-app--test-slot.elanous.app/'))).toBeFalsy();
+});
+
+serviceTest('orphan route intent is retried after publisher restart with the exact grant identity', async () => {
+  const f = await fixture({ routeRegistration: true, routeAckLostOnce: true,
+    routeUnregisterFailures: 100, authorizationPollMsForTesting: 100 });
+  const reserved = await f.call('reserve');
+  f.writeSource(reserved.body.sourceRoot as string);
+  expect((await f.call('publish')).status).toBe(400);
+  const route = f.registeredRoutes[0]!;
+  const path = join(f.root, 'seals', '.deployment-state', 'route-' + route.deploymentId + '.json');
+  expect(JSON.parse(readFileSync(path, 'utf8')).grantId).toBe(route.grantId);
+  await f.publisher.close();
+  const recovered: Array<{ user: string; app: string; deploymentId: string; grantId: string }> = [];
+  const restarted = createDynamicAppPublisher({ sourceRoot: join(f.root, 'sources'),
+    sealRoot: join(f.root, 'seals'), runtimeRoot: join(f.root, 'runtime'), appHost: f.appHost,
+    authorizationPollMsForTesting: 20, approveArtifact: () => false,
+    relayRoutes: { register: async () => { throw new Error('registration unavailable'); },
+      unregister: async input => { recovered.push(input); } } });
+  cleanup.push(() => restarted.close());
+  const until = Date.now() + 2_000;
+  while (recovered.length === 0 && Date.now() < until)
+    await new Promise(resolve => setTimeout(resolve, 20));
+  expect(recovered).toEqual([{ user: route.user, app: route.app,
+    deploymentId: route.deploymentId, grantId: route.grantId }]);
+  expect(readdirSync(join(f.root, 'seals', '.deployment-state')).some(name =>
+    name === 'route-' + route.deploymentId + '.json')).toBe(false);
+});
+
+serviceTest('private intent retains one deployment identity across a failed issue retry; activation follows public verification', async () => {
   const f = await fixture({ failIssueOnce: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -379,7 +491,7 @@ test('private intent retains one deployment identity across a failed issue retry
   expect(readFileSync(join(stateRoot, activeName), 'utf8')).not.toContain('dpg_');
 });
 
-test('undo reports incomplete retirement when server and local proofs both fail', async () => {
+serviceTest('undo reports incomplete retirement when server and local proofs both fail', async () => {
   const f = await fixture({ failRevoke: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -401,7 +513,7 @@ test('undo reports incomplete retirement when server and local proofs both fail'
   })))?.status).toBe(404);
 });
 
-test('undo accepts a durable local tombstone when server revocation is unavailable', async () => {
+serviceTest('undo accepts a durable local tombstone when server revocation is unavailable', async () => {
   const f = await fixture({ failRevoke: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -413,7 +525,7 @@ test('undo accepts a durable local tombstone when server revocation is unavailab
   expect(f.grantCount()).toBe(1);
 });
 
-test('incomplete undo retries local retirement after its private state directory returns', async () => {
+serviceTest('incomplete undo retries local retirement after its private state directory returns', async () => {
   const f = await fixture({ failRevoke: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -430,7 +542,7 @@ test('incomplete undo retries local retirement after its private state directory
   expect(f.grantCount()).toBe(1);
 });
 
-test('retirement retry must confirm service stop after an earlier stop failure', async () => {
+serviceTest('retirement retry must confirm service stop after an earlier stop failure', async () => {
   const f = await fixture({ failRevoke: true, failServiceStopOnceBeforeStop: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -449,7 +561,7 @@ test('retirement retry must confirm service stop after an earlier stop failure',
   })))?.status).toBe(404);
 });
 
-test('failed route unregister and service stop cannot keep a public route serving', async () => {
+serviceTest('failed route unregister and service stop cannot keep a public route serving', async () => {
   const f = await fixture({ failRevoke: true, failServiceStopOnceBeforeStop: true,
     failUnregisterOnce: true });
   const reserved = await f.call('reserve');
@@ -471,7 +583,7 @@ test('failed route unregister and service stop cannot keep a public route servin
   expect(f.serviceStopAttempts()).toBe(2);
 });
 
-test('in-flight grant validation rechecks retirement after the server response', async () => {
+serviceTest('in-flight grant validation rechecks retirement after the server response', async () => {
   const f = await fixture({ failRevoke: true, failServiceStopOnceBeforeStop: true,
     failUnregisterOnce: true });
   const reserved = await f.call('reserve');
@@ -487,7 +599,7 @@ test('in-flight grant validation rechecks retirement after the server response',
   expect(f.unregisterAttempts()).toBe(1);
 });
 
-test('undo accepts confirmed server revocation when the local retirement record is unavailable', async () => {
+serviceTest('undo accepts confirmed server revocation when the local retirement record is unavailable', async () => {
   const f = await fixture();
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -509,7 +621,7 @@ test('undo preserves authenticated server denial rather than converting local re
   expect(f.grantCount()).toBe(1);
 });
 
-test('real HTTPS grant provider distinguishes retryable 429 from owner denial 403 during undo', async () => {
+serviceTest('real HTTPS grant provider distinguishes retryable 429 from owner denial 403 during undo', async () => {
   for (const status of [429, 403] as const) {
     const f = await fixture({ providerRevokeStatus: status, approvalFlow: true });
     const reserved = await f.call('reserve');
@@ -543,7 +655,7 @@ test('sealed bytes changed during public verification cannot create an activated
   })))?.status).toBe(404);
 });
 
-test('current local relay key rotation retires a live grant without resurrection', async () => {
+serviceTest('current local relay key rotation retires a live grant without resurrection', async () => {
   const f = await fixture();
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -559,7 +671,7 @@ test('current local relay key rotation retires a live grant without resurrection
   expect((await request())?.status).toBe(404);
 });
 
-test('registered app_deploy waits for verification, then consumes a sealed generated app through the owner route', async () => {
+serviceTest('registered app_deploy waits for verification, then consumes a sealed generated app through the owner route', async () => {
   const f = await fixture();
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -650,7 +762,7 @@ test('prewrite attest refuses changed owner, run, root or expiry in private clai
   expect(readdirSync(join(f.root, 'runtime'))).toEqual([]);
 });
 
-test('ordinary owner session change does not retire a server-authorized deployment', async () => {
+serviceTest('ordinary owner session change does not retire a server-authorized deployment', async () => {
   const f = await fixture();
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -661,7 +773,7 @@ test('ordinary owner session change does not retire a server-authorized deployme
   expect(response?.status).toBe(200);
 });
 
-test('build authority expiry does not retire a valid grant; failed online validation retires immediately', async () => {
+serviceTest('build authority expiry does not retire a valid grant; failed online validation retires immediately', async () => {
   const f = await fixture({ authorizationPollMsForTesting: 5_000 });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -696,7 +808,7 @@ test('missing or cross-bound deployment grant refuses before public route and se
   }
 });
 
-test('failed service stop still attempts grant revoke and reports both cleanup failures', async () => {
+serviceTest('failed service stop still attempts grant revoke and reports both cleanup failures', async () => {
   const f = await fixture({ wrongMarker: true, failRevoke: true, failServiceStopAfterStop: true });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -716,7 +828,7 @@ test('failed service stop still attempts grant revoke and reports both cleanup f
   expect((await f.call('publish')).status).toBe(400);
 });
 
-test('artifact binding drift in server introspection stops only the live deployment', async () => {
+serviceTest('artifact binding drift in server introspection stops only the live deployment', async () => {
   const f = await fixture({ authorizationPollMsForTesting: 5_000 });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -729,7 +841,7 @@ test('artifact binding drift in server introspection stops only the live deploym
   expect((await request())?.status).toBe(404);
 });
 
-test('expired approval permits authenticated cleanup without a publish grant', async () => {
+serviceTest('expired approval permits authenticated cleanup without a publish grant', async () => {
   const f = await fixture({ expiresInMs: 1_500, authorizationPollMsForTesting: 5_000 });
   const reserved = await f.call('reserve');
   f.writeSource(reserved.body.sourceRoot as string);
@@ -740,7 +852,7 @@ test('expired approval permits authenticated cleanup without a publish grant', a
   expect(readdirSync(join(f.root, 'runtime'))).toEqual([]);
 });
 
-test('grant expiry and explicit revocation automatically stop service and free port', async () => {
+serviceTest('grant expiry and explicit revocation automatically stop service and free port', async () => {
   for (const revoked of [false, true]) {
     const f = await fixture({ expiresInMs: revoked ? 60_000 : 800, authorizationPollMsForTesting: 20 });
     const reserved = await f.call('reserve', revoked ? 'run-revoked' : 'run-expired');

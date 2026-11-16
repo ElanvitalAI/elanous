@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync,
   realpathSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { NexusAppHost } from './app-host.js';
@@ -9,6 +9,7 @@ import { publicAppAddress } from './console-address.js';
 import type { DynamicAppDeployHook } from '../../agent/app-deploy-plugin.js';
 import type { MemberStore } from '../members/member-store.js';
 import type { DeploymentApprovalProvider, PendingDeploymentApproval } from './app-deployment-approval-intent.js';
+import type { AutoPublicAppRegistration } from '../../relay/public-app-auto-registration.js';
 
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
 const RUN = /^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/;
@@ -54,6 +55,11 @@ export interface DynamicPublisherOptions {
   readonly sealRoot: string;
   readonly runtimeRoot: string;
   readonly appHost: NexusAppHost;
+  /** The authenticated connector to an already trusted relay host/handle. */
+  readonly relayRoutes?: {
+    register(input: Omit<AutoPublicAppRegistration, 'serverId'>): Promise<void>;
+    unregister(input: Pick<AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>): Promise<void>;
+  };
   /** Exact OP-approved test member and handle. Missing values disable publication. */
   readonly testMemberId?: string;
   readonly testHandle?: string;
@@ -116,13 +122,15 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
     'intent-' + createHash('sha256').update(ownerId + '\0' + runId + '\0' + appSlug).digest('hex') + '.json');
   const approvedPath = (path: string) => path + '.approved';
   const activePath = (deploymentId: string) => join(stateRoot, 'active-' + deploymentId + '.json');
+  const routePath = (deploymentId: string) => join(stateRoot, 'route-' + deploymentId + '.json');
   const pollMs = options.authorizationPollMsForTesting ?? 1_000;
   if (!Number.isInteger(pollMs) || pollMs < 10 || pollMs > 60_000) refuse();
   const live = new Map<string, LiveDeployment>();
+  const routesInFlight = new Set<string>();
   // A failed remote revoke and failed local tombstone must remain addressable
   // for the same authenticated owner after serving has already stopped.
   const pendingRetirement = new Map<string, LiveDeployment>();
-  const shutdownState = new Map<string, { unregistered: boolean; stopped: boolean }>();
+  const shutdownState = new Map<string, { unregistered: boolean; routeUnregistered: boolean; stopped: boolean }>();
   const retireRecord = (path: string, retiredPath: string, expected?: LiveDeployment): boolean => {
     let removed = false;
     try { renameSync(path, retiredPath); removed = true; }
@@ -142,6 +150,38 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
       return true;
     } catch { return false; }
   };
+  // The route intent is durable before the connector send. An acknowledgement
+  // can be lost after the edge applied it, so every orphan remains retryable.
+  const routeIntents = () => {
+    if (!existsSync(stateRoot)) return [];
+    return readdirSync(stateRoot).filter(name => /^route-dyn-[0-9a-f-]{36}\.json$/.test(name))
+      .map(name => ({ path: join(stateRoot, name), row: privateRecord(join(stateRoot, name)) }))
+      .map(({ path, row }) => {
+        if (Object.keys(row).sort().join() !== 'app,deploymentId,grantId,ownerId,user'
+          || typeof row.app !== 'string' || !SLUG.test(row.app)
+          || typeof row.user !== 'string' || !/^[a-z0-9-]{3,20}$/.test(row.user)
+          || typeof row.deploymentId !== 'string' || path !== routePath(row.deploymentId)
+          || typeof row.grantId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(row.grantId)
+          || typeof row.ownerId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(row.ownerId)) refuse();
+        return { path, row: row as unknown as { app: string; user: string; deploymentId: string;
+          grantId: string; ownerId: string } };
+      });
+  };
+  const retryRouteRetirements = async () => {
+    if (!options.relayRoutes) return;
+    for (const { path, row } of routeIntents()) {
+      if (routesInFlight.has(row.deploymentId) || live.get(row.app)?.id === row.deploymentId) continue;
+      try {
+        await options.relayRoutes.unregister({ user: row.user, app: row.app,
+          deploymentId: row.deploymentId, grantId: row.grantId });
+        retireRecord(path, path + '.retired');
+      } catch { /* durable intent remains for the next retry */ }
+    }
+  };
+  const routeRetryTimer = options.relayRoutes ? setInterval(() => {
+    void retryRouteRetirements().catch(() => {});
+  }, pollMs) : undefined;
+  routeRetryTimer?.unref?.();
   const retireLocal = (deployment: LiveDeployment): boolean => {
     const active = activePath(deployment.id);
     const activeDurable = retireRecord(active, active + '.retired', deployment);
@@ -152,9 +192,17 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
     return activeDurable && intentDurable;
   };
   const ensureInactive = async (deployment: LiveDeployment): Promise<void> => {
-    const state = shutdownState.get(deployment.id) ?? { unregistered: false, stopped: false };
+    const state = shutdownState.get(deployment.id) ?? { unregistered: false, routeUnregistered: false, stopped: false };
     shutdownState.set(deployment.id, state);
     const failures: unknown[] = [];
+    if (!state.routeUnregistered && options.relayRoutes) {
+      try {
+        await options.relayRoutes.unregister({ user: deployment.userSlug, app: deployment.appSlug,
+          deploymentId: deployment.id, grantId: deployment.grantId });
+        state.routeUnregistered = retireRecord(routePath(deployment.id), routePath(deployment.id) + '.retired');
+        if (!state.routeUnregistered) failures.push(new Error('route retirement not durable'));
+      } catch (error) { failures.push(error); }
+    }
     if (!state.unregistered) {
       try {
         options.appHost.unregisterDynamicService?.(deployment.appSlug, deployment.ownerId,
@@ -323,6 +371,8 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
   };
   const publish = async (owner: DynamicOwner, runId: string, appSlug: string, request: Request,
     stillAuthorized: () => boolean | Promise<boolean>, transactionActive: () => boolean = () => true) => {
+    await retryRouteRetirements();
+    if (routeIntents().some(({ row }) => row.app === appSlug && row.user === owner.userSlug)) refuse();
     if (pendingRetirement.has(appSlug)) refuse();
     const provider = options.deploymentGrants;
     const relayKeyId = currentRelayKeyId();
@@ -425,6 +475,7 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
       && (activated || await approvedArtifact()) && !publicationFailed && !deploymentRef?.retiring;
     let service: AppServiceBinding | undefined;
     let registered = false;
+    let routeAttempted = false;
     try {
       service = await startAppService({ sealed, runtimeRoot: runtime, ownerId: owner.memberId, runId,
         stillAuthorized: servingAuthorized });
@@ -433,6 +484,15 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
       options.appHost.registerDynamicService({ appSlug, userSlug: owner.userSlug, ownerId: owner.memberId,
         runId, artifactDigest: sealed.artifactDigest, routeNonce, service, stillAuthorized: servingAuthorized });
       registered = true;
+      if (options.relayRoutes) {
+        if (!await grantAuthorized() || !await during()) refuse();
+        writePrivateRecord(routePath(deploymentId), { ownerId: owner.memberId,
+          user: owner.userSlug, app: appSlug, deploymentId, grantId: grant.grantId });
+        routesInFlight.add(deploymentId);
+        routeAttempted = true;
+        await options.relayRoutes.register({ ownerId: owner.memberId, user: owner.userSlug, app: appSlug,
+          deploymentId, grantId: grant.grantId, expiresAt: grant.expiresAt });
+      }
       const url = publicAppAddress({ appSlug, userSlug: owner.userSlug });
       const verified = await verify(url, request);
       if (verified.status !== 200 || verified.marker !== routeNonce || !await during()
@@ -447,6 +507,7 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
         ownerId: owner.memberId, runId, appSlug, userSlug: owner.userSlug,
         artifactDigest: sealed.artifactDigest, service };
       live.set(appSlug, deployment);
+      routesInFlight.delete(deploymentId);
       deploymentRef = deployment;
       deployment.timer = setInterval(() => {
         void grantAuthorized().then(ok => { if (!ok) return retire(deployment); })
@@ -457,6 +518,14 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
     } catch (error) {
       publicationFailed = true;
       const failures: unknown[] = [error];
+      if (routeAttempted) {
+        try { await options.relayRoutes!.unregister({ user: owner.userSlug, app: appSlug,
+          deploymentId, grantId: grant.grantId }); }
+        catch (unregisterError) { failures.push(unregisterError); }
+        if (failures.length === 1 && !retireRecord(routePath(deploymentId), routePath(deploymentId) + '.retired'))
+          failures.push(new Error('route retirement not durable'));
+      }
+      routesInFlight.delete(deploymentId);
       if (registered) {
         try { options.appHost.unregisterDynamicService?.(appSlug, owner.memberId, runId, sealed.artifactDigest); }
         catch (unregisterError) { failures.push(unregisterError); }
@@ -505,7 +574,10 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
   };
   return { reserve, attest, inspect, startApproval, pollApproval, publish, undo,
     isApproved: approved, isPublicSlug: (slug: string) => live.has(slug),
-    close: async () => { for (const deployment of [...live.values()]) await stopDeployment(deployment, false).catch(() => {}); } };
+    close: async () => {
+      if (routeRetryTimer) clearInterval(routeRetryTimer);
+      for (const deployment of [...live.values()]) await stopDeployment(deployment, false).catch(() => {});
+    } };
 }
 export type DynamicAppPublisher = ReturnType<typeof createDynamicAppPublisher>;
 

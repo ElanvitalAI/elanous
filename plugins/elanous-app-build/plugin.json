@@ -165,8 +165,8 @@
           "factory": "createSourcePlanningRegistry"
         },
         "./graph/app-build.yaml": {
-          "module": "src/graph-runner/capability-providers/app-build-publish-approval.ts",
-          "factory": "createSourceBuildWithApprovalRegistry"
+          "module": "src/graph-runner/capability-providers/app-build-rich-traversal.ts",
+          "factory": "createRichSourceBuildWithApprovalRegistry"
         }
       }
     }

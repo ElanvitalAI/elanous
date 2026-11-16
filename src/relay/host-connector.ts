@@ -1,4 +1,4 @@
-import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyLike } from 'node:crypto';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, type KeyLike } from 'node:crypto';
 import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, writeFileSync, constants as fsConstants } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import {
@@ -13,6 +13,7 @@ import {
 } from './channel.js';
 import { MAX_MUX_FRAME_BYTES, MuxDecoder, MuxEncoder, MuxStreamState, type MuxFrame } from './mux.js';
 import { elanousConfigDir } from '../nexus/config/paths.js';
+import type { AutoPublicAppRegistration } from './public-app-auto-registration.js';
 
 const CLIENT_ID_BYTES = 4;
 const APP_RESPONSE_LIMIT = Math.floor((MAX_MUX_FRAME_BYTES - 1024) * 0.70);
@@ -50,6 +51,8 @@ export interface RelayHostIdentity {
 export interface RelayHostConnection {
   readonly serverId: string;
   readonly readyState: number;
+  registerPublicApp(input: Omit<AutoPublicAppRegistration, 'serverId'>): Promise<void>;
+  unregisterPublicApp(input: Pick<AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>): Promise<void>;
   close(code?: number, reason?: string): void;
 }
 
@@ -330,6 +333,48 @@ export async function connectRelayHost(options: RelayHostConnectorOptions): Prom
   const clientQueues = new Map<number, Promise<void>>();
   let closed = false;
   let authenticated = false;
+  let publicKeyAccepted = false;
+  const publicKeyWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout> }>();
+  const pendingAppControls = new Map<string, { resolve: () => void; reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout> }>();
+  const failPendingControls = () => {
+    for (const pending of publicKeyWaiters) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('relay public host key connection closed'));
+    }
+    publicKeyWaiters.clear();
+    for (const pending of pendingAppControls.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('relay app registration connection closed'));
+    }
+    pendingAppControls.clear();
+  };
+  const sendAppControl = async (type: 'public-app-register' | 'public-app-unregister', registration: object): Promise<void> => {
+    if (closed || !authenticated || socket.readyState !== WebSocket.OPEN) throw new Error('relay app registration is unavailable');
+    if (!publicKeyAccepted) await new Promise<void>((resolve, reject) => {
+      const pending = { resolve, reject, timer: setTimeout(() => {
+        publicKeyWaiters.delete(pending);
+        reject(new Error('relay public host key acknowledgement timed out'));
+      }, 5_000) };
+      publicKeyWaiters.add(pending);
+    });
+    if (closed || socket.readyState !== WebSocket.OPEN) throw new Error('relay app registration connection closed');
+    const requestId = randomUUID();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingAppControls.delete(requestId);
+        reject(new Error('relay app registration timed out'));
+      }, 5_000);
+      pendingAppControls.set(requestId, { resolve, reject, timer });
+      try { socket.send(JSON.stringify({ type, requestId, registration })); }
+      catch (error) {
+        clearTimeout(timer);
+        pendingAppControls.delete(requestId);
+        reject(error instanceof Error ? error : new Error('relay app registration send failed'));
+      }
+    });
+  };
   let resolveReady!: () => void;
   let rejectReady!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
@@ -494,7 +539,7 @@ export async function connectRelayHost(options: RelayHostConnectorOptions): Prom
 
   const onControl = (raw: string) => {
     if (options.signal?.aborted) return;
-    let control: { type?: unknown; nonce?: unknown; clientId?: unknown; capabilities?: unknown };
+    let control: { type?: unknown; nonce?: unknown; clientId?: unknown; capabilities?: unknown; requestId?: unknown };
     try { control = JSON.parse(raw) as typeof control; } catch { throw new Error('invalid relay control message'); }
     if (!authenticated && control.type === 'challenge' && typeof control.nonce === 'string' && control.nonce) {
       const signature = sign(null, challengeMessage(serverId, control.nonce), options.hostSigningKey);
@@ -509,6 +554,21 @@ export async function connectRelayHost(options: RelayHostConnectorOptions): Prom
         socket.send(JSON.stringify({ type: 'host-public-key', publicKey: Buffer.from(options.daemonKeys.publicKey).toString('base64url') }));
       }
       resolveReady();
+    }
+    if (control.type === 'host-public-key-accepted') {
+      publicKeyAccepted = true;
+      for (const pending of publicKeyWaiters) { clearTimeout(pending.timer); pending.resolve(); }
+      publicKeyWaiters.clear();
+    }
+    if ((control.type === 'public-app-accepted' || control.type === 'public-app-rejected')
+      && typeof control.requestId === 'string') {
+      const pending = pendingAppControls.get(control.requestId);
+      if (pending) {
+        pendingAppControls.delete(control.requestId);
+        clearTimeout(pending.timer);
+        if (control.type === 'public-app-accepted') pending.resolve();
+        else pending.reject(new Error('relay app registration rejected'));
+      }
     }
     if (control.type === 'client-disconnected' && Number.isInteger(control.clientId)) {
       const client = clients.get(control.clientId as number);
@@ -542,6 +602,7 @@ export async function connectRelayHost(options: RelayHostConnectorOptions): Prom
   });
   socket.addEventListener('close', event => {
     closed = true;
+    failPendingControls();
     clearTimeout(readyTimer);
     options.signal?.removeEventListener('abort', abortConnection);
     for (const client of clients.values()) {
@@ -567,9 +628,12 @@ export async function connectRelayHost(options: RelayHostConnectorOptions): Prom
   return {
     serverId,
     get readyState() { return socket.readyState; },
+    registerPublicApp(input) { return sendAppControl('public-app-register', { ...input, serverId }); },
+    unregisterPublicApp(input) { return sendAppControl('public-app-unregister', input); },
     close(code = 1000, reason = 'host connector stopped') {
       if (closed) return;
       closed = true;
+      failPendingControls();
       clearTimeout(readyTimer);
       options.signal?.removeEventListener('abort', abortConnection);
       for (const client of clients.values()) {

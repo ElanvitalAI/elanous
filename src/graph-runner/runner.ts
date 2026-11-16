@@ -16,6 +16,7 @@ import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
+import { installedCredentialEnvNames } from './plugin-credential-env.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { loadNodeCatalog } from '../self-implement/graph-catalog.js';
@@ -44,6 +45,7 @@ import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
 import { requireInProcessHandler, type InProcessHandlerRegistry } from './in-process-registry.js';
 import { capabilityNameFromRecipe, dispatchGraphCapability, dispatchGraphContract, graphContractValueMatches, isCapabilityRecipe } from './capabilities.js';
+import { prepareGraphPreconditions } from './graph-precondition.js';
 import { interpolate } from '../workflow-runtime/variables.js';
 import { assertGraphManifestRecipeAllowed, assertGraphManifestTemplate, loadGraphManifestForFile, type GraphManifestDeclaration } from './graph-manifest-loader.js';
 import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
@@ -94,7 +96,8 @@ export function withGraphGrowthScope<T>(scope: GraphGrowthScope, work: () => T):
 }
 const DEFAULT_BASH_TIMEOUT_MS = 5 * 60 * 1_000;
 const eventBusSequences = new WeakMap<GraphEventBus, number>();
-const GRAPH_NODE_LIFECYCLE_EVENTS = new Set(['node-arrival', 'node-start', 'node-end', 'node-leave']);
+const GRAPH_NODE_LIFECYCLE_EVENTS = new Set(['node-arrival', 'node-start', 'node-end', 'node-leave',
+  'graph.precondition.check', 'graph.precondition.fill', 'graph.precondition.blocked']);
 const fanOutDailyBudgetExemptRunIds = new Set<string>();
 
 function stableSha256(value: unknown): string {
@@ -1219,6 +1222,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     ? (currentHeader as Record<string, unknown>).graph_id : undefined);
   const saved = options.resumeRunId && typeof resumeGraphId === 'string'
     ? readGraphRun(safeSegment(resumeGraphId), safeSegment(options.resumeRunId), root) : undefined;
+  if (saved?.preconditionBarrier?.effectStatus === 'unknown')
+    throw new Error('graph precondition effect reconciliation required before retry');
+  if (saved?.preconditionBarrier && options.fromNodeId !== saved.preconditionBarrier.nodeId)
+    throw new Error(`graph precondition barrier requires --from ${saved.preconditionBarrier.nodeId}`);
   if (saved?.graphSnapshot && (!saved.graphPath || resolve(path) !== resolve(saved.graphPath))) {
     throw new Error('--file cannot change the graph path of a snapshot run (이 런은 시작 때 그래프 사본이 있다 — --file 대신 --use-current-graph)');
   }
@@ -1378,8 +1385,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     return resolved;
   };
-  const declaredEnv = [...new Set(installed.map(item => item.name))]
-    .flatMap(name => credentialStatus(name, pluginRoot).fields.map(field => field.env));
+  const declaredEnv = installedCredentialEnvNames(installed);
   const credentialFields = owner ? credentialStatus(owner.name, pluginRoot).fields.filter(field => field.set).map(field => field.name) : [];
   for (const terminal of graph.terminalNodes) {
     // Units use their declared exits. The four loop graphs also declare named
@@ -1571,6 +1577,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     (process.env.NODE_ENV !== 'test' && process.env.BUN_TEST === undefined);
   eventBus.registerType('node-arrival');
   eventBus.registerType('node-leave');
+  for (const type of ['graph.precondition.check', 'graph.precondition.fill', 'graph.precondition.blocked'])
+    if (!eventBus.hasType(type)) eventBus.registerType(type);
   eventBus.registerType(RELEASE_GATE_FAILED_EVENT);
   if (!eventBus.hasType('release.gate.progress')) eventBus.registerType('release.gate.progress');
   if (!eventBus.hasType('release.gate.heartbeat-interrupted')) eventBus.registerType('release.gate.heartbeat-interrupted');
@@ -2985,6 +2993,19 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const inProcessHandler = capabilityName || requiredContract ? undefined : requireInProcessHandler(node.recipe, current, options.deps?.inProcessHandlers);
     let handlerExecuted = false;
     let reportedNodeOutcome: unknown;
+    let blockedByPrecondition: string | undefined;
+    let blockedEffectUnknown = false;
+    let postForbidNext: readonly string[] = [];
+    const recordPostRouteBlock = async (to: string) => {
+      const data = { nodeId: current, attempt: 0, missingKeys: [], reason: 'postcondition-forbidden-next', to };
+      const event = await publishLifecycleEvent({ graphId, runId, type: 'graph.precondition.blocked',
+        source: { kind: 'runner', nodeId: current }, data });
+      try {
+        if (event) publishInsideEvent({ kind: 'graph.precondition.blocked', graphId, runId,
+          nodeId: current, eventId: event.eventId, seq: event.sequence, data });
+        log('graph.precondition.blocked', { graphId, runId, ...data });
+      } catch { /* display failure cannot weaken the saved barrier */ }
+    };
     if ((inProcessHandler || capabilityName || requiredContract) && !operatorNoGo && !waiving && !state.dryRun && !resumingCompleted) {
       const eventNodeId = node.nodeId;
       const outputs: Record<string, unknown> = Object.assign(Object.create(null), options.branchParentOutputs ?? {});
@@ -3088,15 +3109,80 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           ok = true;
           exit = 0;
         } else {
+          const capabilityRegistry = requiredContract && options.deps?.capabilityProviders
+            && 'contracts' in options.deps.capabilityProviders ? options.deps.capabilityProviders : undefined;
+          const declaredPreconditions = requiredContract && capabilityRegistry?.providers.some(provider =>
+            provider.provides.some(id => id === requiredContract) && (provider.requires?.length || provider.post?.length));
+          const preconditionDeadlineAtMs = Math.min(Date.now() + 5000,
+            options.preconditionDeadlineAtMs ?? Number.POSITIVE_INFINITY,
+            state.s2CorrectionBudget?.deadlineAtMs ?? Number.POSITIVE_INFINITY);
+          const observePrecondition = async (phase: 'check' | 'fill' | 'blocked',
+            attempt: number, missingKeys: readonly string[], source?: string, reason?: string) => {
+            const data = { nodeId: current, attempt, missingKeys: [...missingKeys],
+              ...(source ? { source } : {}), ...(reason ? { reason } : {}) };
+            const type = `graph.precondition.${phase}`;
+            const event = await publishLifecycleEvent({ graphId, runId, type,
+              source: { kind: 'runner', nodeId: current }, data });
+            try {
+              if (event) publishInsideEvent({ kind: type, graphId, runId, nodeId: current,
+                eventId: event.eventId, seq: event.sequence, data });
+              log(type, { graphId, runId, ...data });
+            } catch { /* display failure cannot change dispatch permission */ }
+          };
+          const manifestDefaults = Object.fromEntries(Object.entries(graphManifest?.policy ?? {}).flatMap(([key, definition]) =>
+            definition && typeof definition === 'object' && !Array.isArray(definition)
+              && Object.hasOwn(definition, 'default') ? [[key, (definition as Record<string, unknown>).default]] : []));
+          const priorResults = state.nodes.filter(record => record.ok).flatMap(record => {
+            const value = lastJsonObject(record.output)?.result;
+            return value && typeof value === 'object' && !Array.isArray(value)
+              ? [value as Record<string, unknown>] : [];
+          });
           const result = requiredContract
-            ? await dispatchGraphContract(requiredContract, handlerContext, options.deps?.capabilityProviders && 'contracts' in options.deps.capabilityProviders
-              ? options.deps.capabilityProviders : undefined)
+            ? await dispatchGraphContract(requiredContract, handlerContext, capabilityRegistry,
+              declaredPreconditions ? {
+                deadlineAtMs: preconditionDeadlineAtMs, signal: options.signal,
+                beforeInvoke: provider => {
+                  if (!provider.post?.length) return;
+                  state.preconditionBarrier = { nodeId: current!, reason: 'effect-invocation-unresolved', effectStatus: 'unknown' };
+                  persist();
+                },
+                prepare: (provider, context, schema) => provider.post?.some(rule =>
+                  rule.forbidNext?.some(nodeId => !graph.nodes.some(candidate => candidate.nodeId === nodeId)))
+                  ? Promise.resolve({ ok: false as const, missing: [] as string[], reason: 'postcondition-unknown-node' })
+                  : prepareGraphPreconditions(provider, context, schema, {
+                  ownerId: options.verifiedOwnerId, appSlug: options.verifiedAppSlug,
+                  manifestDefaults, priorResults, deadlineAtMs: preconditionDeadlineAtMs, signal: options.signal,
+                  ...(options.deps?.askUserForPreconditions ? { askUser: input => options.deps!.askUserForPreconditions!({
+                    ...input, graphId, runId, nodeId: current!,
+                  }) } : {}),
+                  observe: observation => observePrecondition(observation.phase, observation.attempt,
+                    observation.missingKeys, observation.source, observation.reason),
+                  }),
+              } : undefined)
             : capabilityName
               ? await dispatchGraphCapability(capabilityName, handlerContext, options.deps?.capabilityProviders)
               : await inProcessHandler!(handlerContext);
-          await eventBus?.flush({ graphId, runId });
           if (!result || typeof result.ok !== 'boolean' || typeof result.outcome !== 'string' || !result.outcome.trim())
             throw new Error(`invalid in-process handler result: ${current}`);
+          if ('hardBarrier' in result && result.hardBarrier) {
+            blockedByPrecondition = result.error ?? 'graph-precondition-blocked';
+            blockedEffectUnknown = 'effectStatus' in result && result.effectStatus === 'unknown';
+            state.preconditionBarrier = { nodeId: current, reason: blockedByPrecondition,
+              effectStatus: blockedEffectUnknown ? 'unknown' : 'none' };
+            persist();
+          }
+          if ('postForbidNext' in result && Array.isArray(result.postForbidNext)) {
+            postForbidNext = result.postForbidNext;
+            if (postForbidNext.length) {
+              state.preconditionBarrier = { nodeId: current, reason: 'postcondition-route-unresolved', effectStatus: 'unknown' };
+              persist();
+            }
+          }
+          await eventBus?.flush({ graphId, runId });
+          if ('hardBarrier' in result && result.hardBarrier) {
+            await observePrecondition('blocked', 2, [], undefined,
+              'effectStatus' in result && result.effectStatus === 'unknown' ? 'effect-unknown' : 'precondition-failed');
+          }
           reportedNodeOutcome = result.outcome;
           output = redactSerializedJson({ ...(result.result === undefined ? {} : { result: result.result }),
             ...(result.evidence === undefined ? {} : { evidence: result.evidence }), outcome: result.outcome,
@@ -3108,6 +3194,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           error = result.error ? redactCredentials(result.error) : undefined;
         }
       } catch (cause) {
+        if (state.preconditionBarrier?.nodeId === current && state.preconditionBarrier.effectStatus === 'unknown') {
+          blockedByPrecondition = 'effect-unknown: dispatch-interrupted';
+          blockedEffectUnknown = true;
+          persist();
+        }
         ok = false;
         exit = 1;
         error = redactCredentials(cause instanceof Error ? cause.message : String(cause));
@@ -3518,6 +3609,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           ...(unit.source === undefined ? {} : { graphSource: unit.source }),
           ...(baseEventBus === undefined ? {} : { eventBus: baseEventBus }),
           ...(options.signal ? { signal: options.signal } : {}),
+          ...(options.verifiedAppSlug ? { verifiedAppSlug: options.verifiedAppSlug } : {}),
+          ...(options.preconditionDeadlineAtMs === undefined ? {} : { preconditionDeadlineAtMs: options.preconditionDeadlineAtMs }),
           pinChildUniverse: options.pinChildUniverse,
           unitContext: { parentRunId: runId, ancestors: [...(options.unitContext?.ancestors ?? []), graphId],
             remainingSteps: allowance.granted,
@@ -3834,6 +3927,27 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     persist();
     if (releaseGateFailedEvent) appendGraphRunEvent(graphRunEventLedgerPath(root, graphId, runId), releaseGateFailedEvent);
     if (releaseGateFailedEvent) await publishLifecycleEvent(releaseGateFailedEvent);
+    if (!blockedByPrecondition && postForbidNext.length) {
+      const outgoingPostEdge = graph.edges.find(edge => edge.from === current);
+      const natural = nextNode(graph.edges, current, ok ? 'ok' : 'fail', namedOutcome);
+      const branch = namedOutcome && outgoingPostEdge?.branches?.[namedOutcome];
+      const forbidden = [natural, ...(branch ?? []), branch ? outgoingPostEdge?.join : undefined]
+        .find(nodeId => nodeId && postForbidNext.includes(nodeId));
+      if (forbidden) {
+        blockedByPrecondition = `postcondition-forbidden-next: ${forbidden}`;
+        blockedEffectUnknown = true;
+        await recordPostRouteBlock(forbidden);
+      }
+    }
+    if (blockedByPrecondition) {
+      state.status = 'failed';
+      state.reason = blockedByPrecondition;
+      state.preconditionBarrier = { nodeId: current, reason: blockedByPrecondition,
+        effectStatus: blockedEffectUnknown ? 'unknown' : 'none' };
+      persist();
+      await emitVisitLifecycle('leave', current, visit, { outcome: 'fail', reason: 'graph-precondition-blocked' });
+      break;
+    }
     if (options.signal?.aborted) {
       await emitVisitLifecycle('leave', current, visit, { outcome: ok ? 'ok' : 'fail', reason: 'cancelled' });
       state.status = 'failed';
@@ -3842,6 +3956,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       break;
     }
     if (graph.terminalNodes.includes(current)) {
+      if (state.preconditionBarrier?.nodeId === current) delete state.preconditionBarrier;
       state.status = !ok ? 'failed' : graph.unit ? (current === 'failed' ? 'failed' : 'done')
         : topLevelTerminalStatus(graph.graphId, current)!;
       if (!graph.unit && current !== 'done' && current !== 'failed') state.reason = current;
@@ -4042,6 +4157,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           let child: GraphRunState;
           try { child = await runGraph(path, { runId, graphSource: fanOutGraphSource(variantSource, graph, branchId), input: state.input,
             ...(options.verifiedOwnerId ? { verifiedOwnerId: options.verifiedOwnerId } : {}),
+            ...(options.verifiedAppSlug ? { verifiedAppSlug: options.verifiedAppSlug } : {}),
+            ...(options.preconditionDeadlineAtMs === undefined ? {} : { preconditionDeadlineAtMs: options.preconditionDeadlineAtMs }),
             ...(baseEventBus === undefined ? {} : { eventBus: baseEventBus }),
             dryRun: state.dryRun, quiet: true, signal: options.signal, pinChildUniverse: options.pinChildUniverse,
             releaseCommandSource: options.releaseCommandSource,
@@ -4268,10 +4385,21 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         logSubscriptionAction('handled', action);
       }
     }
+    if (scheduledNext && postForbidNext.includes(scheduledNext)) {
+      state.status = 'failed';
+      state.reason = `postcondition-forbidden-next: ${scheduledNext}`;
+      state.preconditionBarrier = { nodeId: fromNodeId, reason: state.reason, effectStatus: 'unknown' };
+      delete state.wakeContinuation;
+      persist();
+      await recordPostRouteBlock(scheduledNext);
+      await emitVisitLifecycle('leave', fromNodeId, visit, { outcome: 'fail', reason: 'graph-precondition-blocked' });
+      break;
+    }
     if (scheduledNext !== undefined) {
       const completedVisit = state.nodes.at(-1);
       if (completedVisit?.nodeId === completedNodeId) completedVisit.resumeNextNode = scheduledNext;
     }
+    if (state.preconditionBarrier?.nodeId === fromNodeId) delete state.preconditionBarrier;
     current = scheduledNext;
     persist();
     resumedGrowth = false;

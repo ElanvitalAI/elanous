@@ -1,6 +1,8 @@
 import type { Command } from 'commander';
 import { join } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { createRelayAutoAppRegistrar, ensureRelayAutoRegistrationFile,
+  createRelayPublicPolicyReloader, loadRelayPublicPolicySnapshot } from './public-app-auto-registration.js';
 
 export interface RelayPublicOptions { publicDomain?: string; publicServerId?: string; publicUserId?: string; publicDispatchConfig?: string; memberRequired?: boolean }
 
@@ -111,6 +113,16 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
       let trafficStore: ReturnType<typeof createRelayTrafficLedger> | undefined;
       let publicVisitorWriteLedger: import('./public-app-visitor-write.js').VisitorWriteLedger | undefined;
       let relay: ReturnType<typeof startRelayServer>;
+      const policyFiles = opts.publicDispatchConfig && opts.publicReadConfig && opts.hostOwnerMembers && opts.memberRequired
+        ? { trustedHostKeys: opts.trustedHostKeys, hostOwnerMembers: opts.hostOwnerMembers,
+          publicDispatch: opts.publicDispatchConfig, publicRead: opts.publicReadConfig,
+          ...(opts.visitorWriteConfig ? { visitorWrite: opts.visitorWriteConfig } : {}),
+          autoRegistrations: join(getElanousConfigDir(), 'relay', 'auto-apps.json') } : undefined;
+      if (policyFiles) ensureRelayAutoRegistrationFile(policyFiles.autoRegistrations);
+      const initialPolicy = policyFiles
+        ? loadRelayPublicPolicySnapshot(policyFiles, opts.publicDomain as 'elanous.app' | 'elanous.ai') : undefined;
+      let reloader: ReturnType<typeof createRelayPublicPolicyReloader> | undefined;
+      let registrar: ReturnType<typeof createRelayAutoAppRegistrar> | undefined;
       try {
         trafficStore = opts.trafficCapConfig ? createRelayTrafficLedger() : undefined;
         publicVisitorWriteLedger = visitorPolicy
@@ -122,11 +134,49 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
           ...(appKillSwitch ? { appKillSwitch } : {}), ...(publicListedApps ? { publicListedApps } : {}),
           ...(publicReadableApps ? { publicReadableApps } : {}),
           ...(publicVisitorWritePolicies ? { publicVisitorWritePolicies, publicVisitorWriteLedger } : {}),
-          ...(customDomainRoutes ? { customDomainRoutes } : {}), ...(trafficStore ? { trafficStore } : {}), ...memberOptions });
+          ...(customDomainRoutes ? { customDomainRoutes } : {}), ...(trafficStore ? { trafficStore } : {}), ...memberOptions,
+          ...(initialPolicy ?? {}),
+          ...(policyFiles ? { autoAppRegistration: {
+            register: (serverId: string, ownerId: string, input: import('./public-app-auto-registration.js').AutoPublicAppRegistration) => {
+              if (!registrar) throw new Error('relay app registrar unavailable');
+              registrar.register(serverId, ownerId, input);
+            },
+            unregister: (serverId: string, ownerId: string,
+              input: Pick<import('./public-app-auto-registration.js').AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>) => {
+              if (!registrar) throw new Error('relay app registrar unavailable');
+              registrar.unregister(serverId, ownerId, input);
+            },
+          } } : {}) });
+        if (policyFiles) reloader = createRelayPublicPolicyReloader(initialPolicy!,
+          () => loadRelayPublicPolicySnapshot(policyFiles, opts.publicDomain as 'elanous.app' | 'elanous.ai'),
+          candidate => relay.reloadPublicPolicySnapshot(candidate));
+        if (policyFiles) registrar = createRelayAutoAppRegistrar({
+          file: policyFiles.autoRegistrations, domain: opts.publicDomain as 'elanous.app' | 'elanous.ai',
+          staticPolicy: () => {
+            const { autoRegistrations: _autoRegistrations, ...staticFiles } = policyFiles;
+            return loadRelayPublicPolicySnapshot(staticFiles, opts.publicDomain as 'elanous.app' | 'elanous.ai');
+          },
+          apply: candidate => reloader!.apply(candidate),
+        });
       } catch (error) { trafficStore?.close(); appKillSwitch?.close(); publicVisitorWriteLedger?.close(); throw error; }
+      let policyTimer: ReturnType<typeof setInterval> | undefined;
+      if (policyFiles) {
+        let refused = false;
+        policyTimer = setInterval(() => {
+          try {
+            registrar?.sweepExpired();
+            reloader!.refresh();
+            refused = false;
+          } catch {
+            if (!refused) console.error('relay policy reload refused; previous validated policy retained');
+            refused = true;
+          }
+        }, 1_000);
+        policyTimer.unref?.();
+      }
       console.log(`relay listening on 127.0.0.1:${relay.port}${opts.publicDomain ? ' (public TLS edge required)' : ''}`);
-      process.once('SIGINT', () => { relay.stop(); });
-      process.once('SIGTERM', () => { relay.stop(); });
+      process.once('SIGINT', () => { if (policyTimer) clearInterval(policyTimer); relay.stop(); });
+      process.once('SIGTERM', () => { if (policyTimer) clearInterval(policyTimer); relay.stop(); });
     });
 
   const killSwitch = relayCmd.command('app-kill-switch').description('Stop or reactivate one tenant app and record the action');

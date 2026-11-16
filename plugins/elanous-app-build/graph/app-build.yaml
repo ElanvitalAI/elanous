@@ -1,27 +1,54 @@
 apiVersion: elanous.dev/graph/v2
-graph: { id: app-build, version: 1.0.0, layer: flow, purpose: "일반 앱 설계·파일 생성·격리 시험·승인된 게시" }
+graph: { id: app-build, version: 1.1.0, layer: flow, purpose: "출처 병렬 수집·성찰·원인별 수리·승인된 앱 게시" }
 entry: source-reserve
 nodes:
   - { id: source-reserve, type: capability, requires: source-build.reserve@1, with: { stage: reserve } }
   - { id: grounding, type: capability, requires: source-build.grounding@1, with: { stage: grounding } }
   - { id: assumptions, type: capability, requires: source-planning.assumptions@1, with: { stage: assumptions } }
-  - { id: architecture, type: capability, requires: source-planning.architecture@1, with: { stage: architecture } }
-  - { id: file-plan, type: capability, requires: source-planning.file-plan@1, with: { stage: file-plan } }
-  - { id: files, type: capability, requires: source-build.files@1, with: { stage: files } }
-  - { id: verify-repair, type: capability, requires: source-build.verify@1, with: { stage: verify } }
+  - { id: source-items, type: capability, requires: app-build.source-list@1 }
+  - id: source-read
+    type: extract
+    requires: app-build.source-read@1
+    map: { over: '$source-items.result.items', as: source, max_parallel: 3, partial: accept-with-gaps }
+  - { id: architecture, type: capability, requires: source-planning.architecture@1, with: { stage: architecture }, max_visits: 2 }
+  - { id: architecture-reflection, type: capability, requires: app-build.architecture-reflection@1, max_visits: 2 }
+  - { id: file-plan, type: capability, requires: source-planning.file-plan@1, with: { stage: file-plan }, max_visits: 2 }
+  - { id: files, type: capability, requires: source-build.files@1, with: { stage: files }, max_visits: 2 }
+  - { id: classify-files, type: capability, requires: app-build.failure-cause@1, with: { phase: files }, max_visits: 2 }
+  - { id: repair-plan, type: capability, requires: app-build.repair-note@1, with: { cause: plan } }
+  - { id: repair-generation, type: capability, requires: app-build.repair-note@1, with: { cause: generation } }
+  - { id: verify-repair, type: capability, requires: source-build.verify@1, with: { stage: verify }, max_visits: 2 }
+  - { id: classify-verify, type: capability, requires: app-build.failure-cause@1, with: { phase: verify-repair }, max_visits: 2 }
+  - { id: repair-verification, type: capability, requires: app-build.repair-note@1, with: { cause: verification } }
   - { id: materialize, type: capability, requires: source-build.materialize@1, with: { stage: materialize } }
+  - id: review-publish
+    type: hitl
+    with: { approval: "생성된 앱의 격리 시험을 확인했습니다. 게시 승인을 진행합니까?" }
+    hitl:
+      options:
+        - { key: y, exit: approved, default: false }
+        - { key: N, exit: declined, default: true }
   - { id: publish-approval, type: capability, requires: app-build.publish-approval@1, with: { action: start, appSlug: $input.appSlug, requireOwner: $context.memberId } }
   - { id: publish, type: capability, requires: source-build.publish@1, with: { stage: publish } }
 edges:
   - { from: source-reserve, on: outcome, map: { done: grounding, failed: failed } }
   - { from: grounding, on: outcome, map: { done: assumptions, failed: failed } }
-  - { from: assumptions, on: outcome, map: { done: architecture, failed: failed } }
-  - { from: architecture, on: outcome, map: { done: file-plan, failed: failed } }
+  - { from: assumptions, on: outcome, map: { done: source-items, failed: failed } }
+  - { from: source-items, on: outcome, map: { done: source-read, failed: failed } }
+  - { from: source-read, on: outcome, map: { ok: architecture, fail: failed } }
+  - { from: architecture, on: outcome, map: { done: architecture-reflection, failed: failed } }
+  - { from: architecture-reflection, on: outcome, map: { done: file-plan, rework: architecture, failed: failed } }
   - { from: file-plan, on: outcome, map: { done: files, failed: failed } }
-  - { from: files, on: outcome, map: { done: verify-repair, failed: failed } }
-  - { from: verify-repair, on: outcome, map: { done: materialize, failed: failed } }
-  - { from: materialize, on: outcome, map: { done: publish-approval, failed: failed } }
+  - { from: files, on: outcome, map: { done: verify-repair, failed: classify-files } }
+  - { from: classify-files, on: outcome, map: { plan: repair-plan, generation: repair-generation, verification: failed, acceptance: failed, fatal: failed, failed: failed } }
+  - { from: repair-plan, on: outcome, map: { done: file-plan, failed: failed } }
+  - { from: repair-generation, on: outcome, map: { done: file-plan, failed: failed } }
+  - { from: verify-repair, on: outcome, map: { done: materialize, failed: classify-verify } }
+  - { from: classify-verify, on: outcome, map: { verification: repair-verification, plan: repair-plan, generation: repair-generation, acceptance: failed, fatal: failed, failed: failed } }
+  - { from: repair-verification, on: outcome, map: { done: file-plan, failed: failed } }
+  - { from: materialize, on: outcome, map: { done: review-publish, failed: failed } }
+  - { from: review-publish, on: outcome, map: { approved: publish-approval, declined: failed } }
   - { from: publish-approval, on: outcome, map: { done: publish, failed: failed } }
   - { from: publish, on: outcome, map: { done: done, failed: failed } }
 terminal: [done, failed]
-observe: { categories: [graph.run, graph.unit] }
+observe: { categories: [graph.run, graph.unit, app-build.source, app-build.reflection, app-build.repair] }
