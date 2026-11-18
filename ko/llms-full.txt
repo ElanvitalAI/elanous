@@ -5204,8 +5204,6 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 Source: https://docs.elanous.ai/releases/0-3-28/
 
-## Behavior changes
-
 - For questions about recent events or market outlooks, Elanous now gathers sources before answering; if it finds no source it can cite, it says so instead of guessing.
 - One-line app builds now use the app address verified for your member account, so an app is not built under an address you do not own.
 - Approving an app for publication continues the same saved build, and an interrupted approval can resume without starting over.
@@ -5228,6 +5226,11 @@ Source: https://docs.elanous.ai/releases/0-3-28/
 - A side-tab mission you ask for now runs in the background, and the terminal tells you when its result arrives.
 - If your setup can already chat, the first run skips the setup chooser.
 - A one-line request to build an app now goes straight to the app builder, which fills in the app details from your sentence and your verified member app address; if you decline the build, Elanous does not deploy the app another way in the same turn.
+- In web chat on your Nexus, a one-line request to build an app now reaches the same app builder as the terminal, instead of being treated as a research question.
+- `eln chat --tools`, `eln agent` and ACP now search for sources on questions that need them, the same way the terminal does, instead of answering without sources.
+- For questions that need sources, Elanous shows a short first answer, marked as partial and with its source, as soon as the first cited source arrives; when research finishes first, it answers from those sources instead of waiting on a slower answer without them, and goes deeper only after that.
+- In the web app your Nexus serves, you can start web chat from the board and right after choosing your handle; on mobile, chat mode and the install prompt now work.
+- The web app your Nexus serves now says what is missing when the signup button is disabled or the Nexus address is not set.
 - You can move saved static API keys to another machine with an encrypted export and import, lend a stored key to another host or configuration with `eln secret lease`, and set a secret from standard input.
 - In the Next terminal, what you type while a turn is running now steers that turn at the next tool step instead of waiting for the turn to end; sending right away interrupts only while Elanous is reading or searching. Pressing Esc sends any waiting input right away, or, if nothing is waiting and no reply has started, puts your sent text back in the input box.
 - A tool that stops producing output is now stopped after a time limit instead of leaving the turn stuck, and Esc no longer hangs while the terminal checks the stopped tool.
@@ -5235,37 +5238,68 @@ Source: https://docs.elanous.ai/releases/0-3-28/
 - A turn that goes silent for a long stretch, or a model reply that stops streaming partway, is now stopped instead of hanging, so the messages you queued behind it can run.
 - Research questions start searching sooner: Elanous plans the search quickly, searches your original question at the same time, and starts on the first planned question as soon as it appears.
 - The Next terminal input box keeps your earlier prompts, including slash commands, across sessions; in a multi-line draft, Up and Down move between lines first, and a long folded paste edits as one unit.
-- In the Next terminal log, your own turns stand out on a steel-blue band, and messages sent by an agent or the system are labeled as such instead of looking like yours.
+- In the Next terminal log, your own turns stand out on a quiet grey band, and messages sent by an agent or the system are labeled as such instead of looking like yours.
 - When a long-running task reaches its turn limit after stating its next step, it now continues on its own instead of waiting for your input, shown as a calm dimmed line.
 - Research turns now set aside time to write the final answer before the turn ends, so you get a summary of what was found instead of an answer that is cut off.
-- In the Next terminal, queued messages now have controls: open the queue panel, press Tab to switch a message between steering the current turn and waiting in the queue, and cancel or edit it before it is sent.
+- Saving a secret to the macOS Keychain no longer puts the value on the command line, where other processes could see it, and `eln secret inventory` lists your stored secrets without showing their values.
+- In the Next terminal, queued messages now have controls: open the queue panel, press Tab to switch a message between steering the current turn and waiting in the queue, and cancel or edit it before it is sent. Esc on the open queue panel closes the panel instead of stopping the running turn.
 - In the Next terminal, each sub-agent shows as one row with its label and a one-line result, and its tool output stays out of your conversation.
 - Claude models used through OpenRouter no longer end a turn with an empty reply, and provider errors are now shown instead of failing silently.
 - When an app is ready to publish, the Next terminal shows the approval link with a live countdown until it expires.
 - If a terminal is still running an older version after an update, it now says so clearly and asks for a restart instead of failing without a reason.
 - `eln usage cache` shows how often a session’s requests hit the prompt cache.
-- In the side tab, each agent row shows what that agent is doing, and /side chat opens the last local tab you had open.
-- On your member home you can choose your app’s name or rename it, with clear messages when a name is invalid, reserved, taken or locked, and `eln member connect` reconnects after a rename.
-- Long app builds now keep going when your member session expires mid-build, a build waiting for your publish approval is no longer cut off by the turn limit, and resuming a build that needs approval says so clearly.
-- Long sessions are now compacted automatically at the start of a turn when they grow too large, so they keep working instead of running into the context limit.
-- If a publish approval times out or is cancelled, the build now waits at that step instead of treating it as a rejection.
-- When a seat’s turn-limit continue never actually starts, the terminal now says it stopped instead of waiting silently, a seat watching its mail picks up new mail within a second once it is idle, and mail that arrives during a turn waits and opens as the next turn once the current one finishes.
-- `eln chat --tools` now searches for sources on questions that need them, the same way the terminal does, instead of answering without sources.
-- For questions that need sources, Elanous shows a short first answer, marked as partial and with its source, as soon as the first cited source arrives; when research finishes first, it answers from those sources instead of waiting on a slower answer without them, and goes deeper only after that.
-- In web chat on your Nexus, a one-line request to build an app now reaches the same app builder as the terminal, instead of being treated as a research question.
-- In the web app your Nexus serves, you can start web chat from the board and right after choosing your handle; on mobile, chat mode and the install prompt now work.
-- The web app your Nexus serves now says what is missing when the signup button is disabled or the Nexus address is not set.
+- In the side tab, each agent row shows what that agent is doing, and /side chat opens the last local tab you had open. `/side keys` and `/side status` complete the agent tab controls.
+- If you signed up with an event code, you can choose your app’s name or rename it on your member home, with clear messages when a name is invalid, reserved, taken or locked, and `eln member connect` reconnects after a rename.
 - In web chat on your Nexus, the answer now streams onto the screen as it is written, and the agent’s working steps fold into a single «n steps» capsule you can open.
-- Web chat on your Nexus first checks whether this device is connected; if it is not, you see one connect screen instead of a red activity error.
-- The Next terminal footer shows the working folder, the version and its build stamp, and the release channel; even in a small terminal, the folder and the build (date stamp on dev, version on official) stay visible.
 - Web chat on your Nexus is simpler: a conversation list with one «new chat» button and search, the chat itself, and one attach button for files and photos. Each conversation has «info» (copy its id) and «delete»; deleting one that is already gone says so, and the menu closes on Esc or a click outside. Voice, project and seat-picker controls are no longer on the chat screen.
-- You can check your own `statusline.yaml` before the terminal reads it: `eln statusline validate`, `preview` and `schema`, which point to the line of each problem, or say the location is unknown when they cannot find it.
+- Long app builds now keep going when your member session expires mid-build, a build waiting for your publish approval is no longer cut off by the turn limit, and resuming a build that needs approval says so clearly.
+- If a publish approval times out or is cancelled, the build now waits at that step instead of treating it as a rejection.
+- Long sessions are now compacted automatically at the start of a turn when they grow too large, so they keep working instead of running into the context limit.
+- The Next terminal status line now sits under the input box as the last row, showing the working folder, the version and its build stamp, and the release channel; even in a small terminal, the folder and the build (date stamp on dev, version on official) stay visible.
+- You can check your own `statusline.yaml` before the terminal reads it: `eln statusline validate`, `preview` and `schema`, which point to the line of each problem, or say the location is unknown when they cannot find it. You can set your own width bands with rules for each band.
+- When a seat’s turn-limit continue never actually starts, the terminal now says it stopped instead of waiting silently, a seat watching its mail picks up new mail within a second once it is idle, and mail that arrives during a turn waits and opens as the next turn once the current one finishes.
+- Web chat on your Nexus first checks whether this device is connected; if it is not, you see one connect screen instead of a red activity error.
+- Android sharing can save an article to the signed-in member's collection and show it from the member home.
+- App demos can produce multiple architecture options and PDF deliverables.
+- App simulation scenarios are included with the installed package.
+- Store shared app credentials in typed slots and list slot status without exposing values.
+- Open an app tile to watch its simulation events and recent receipts.
+- Simulated app traffic with a per-app cap and an admin kill switch, so you can rehearse a traffic spike without real users.
+- Simulated app storage, DNS and certificate renewal, and a payment device, so app flows run end to end with no real provider.
+- When a merge conflict only adds lines or table rows, the merge train now keeps both sides and re-queues the change instead of stopping.
+- Manage each app's simulation and production environments from a single PWA tile, with create and trash actions.
+- Simple questions begin answering sooner in the Next TUI.
+- Google sign-in callback redirects now keep the member session connected.
+- The Android member home can reopen with its saved session after the app restarts.
+- Android URL shares can upload attached photos supplied outside Chrome previews.
+- The Next TUI now shows actionable Codex account sign-in failures instead of a generic provider error.
+- Codex account rotation and credit fallback preserve the selected account and a usable error message.
+- Concurrent graph approval decisions now keep one final result.
+- Release checks pin one verified image digest across both gate hosts before publishing.
+- Background agent work no longer fills the chat with dispatch placeholders.
+- Korean names ending in a vowel are remembered correctly.
+- Agent messages wake reliably on terminal setups without JSON pane listing support.
+- The type check passes again on a clean main, and a test fixture no longer trips the public export leak check.
+- Retired the legacy autopilot, harness mission, and ops mission CLI entrypoints.
+- Share Elanous with a link that carries only your public member ID. Sign-in sessions, app tokens and connection codes stay out of links and screens.
+- See your public member ID in the Android and iPhone apps once you are signed in, and keep it current when your session changes.
+- On iPhone, your sign-in session is now kept in the secure Keychain, and items you share are sent in order and only after the previous one is confirmed.
+- On Android, a pasted Mac connection link is hidden as you type, and drafts you share stay saved until Elanous confirms them.
+- In Telegram, an article you send to the bot is saved before it waits its turn, so it is not lost if Elanous restarts. Referral replies show your public member ID.
+- Voice notes keep their transcript and can be retried if sending a saved recording fails.
+- In the terminal, stored secrets are no longer printed to the screen unless you ask for them explicitly.
+- Ask Elanous to crawl a website and it does it in one step with Firecrawl, which now comes built in.
+- Add your Firecrawl key during setup, or any time later with a single command. If no key is set, Elanous tells you how to add one.
+- Firecrawl setup and crawling now share the same saved key, while continuing to accept existing keys.
+- Use the consent-gated Upstage Embedding 2 plugin for query and passage embeddings with your shared Upstage credential.
+- When the provider or model actually called differs from the one you chose, the terminal shows a one-line warning.
+- Elanous Side, the agent workspace (command `els`), opens one space with the side list and a live pane together, shows herdr panes and remote hosts in the same list, and can attach one pane live with input and resize.
+- Installing a package or dev build that is missing its web app output now stops with a clear error instead of installing a broken web app.
+- Building an app image on macOS no longer fails because of file extended attributes.
 
-## Security
+## Known issues
 
-- Saving a secret to the macOS Keychain no longer puts the value on the command line, where other processes could see it, and `eln secret inventory` lists your stored secrets without showing their values.
-
-Plus 243 internal changes.
+- Choosing or renaming your app on the member home is only for members who signed up with an event code. A member who signed up without one is told that an event code is required (#38347).
 
 ---
 
