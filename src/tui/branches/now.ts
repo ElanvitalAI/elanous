@@ -49,18 +49,18 @@ export async function runNextTuiNowBranchRoute(
       const answer = await queryWithDeadline(query, topic, section, host.signal, deadlineMs);
       if (host.signal?.aborted) return;
       successes++;
-      host.chatLines.push(section === 'core' ? '기본 현황' : '운영 현황', ...renderTuiNow(answer));
+      host.chatLines.push(section === 'core' ? 'Core status' : 'Ops status', ...renderTuiNow(answer));
       host.onUpdate?.();
     } catch (error) {
       if (host.signal?.aborted) return;
       const reason = error instanceof Error ? error.message : String(error);
       debug.log('tui.next', 'now-query-failed', { section, reason });
-      host.chatLines.push(`${section === 'core' ? '기본' : '운영'} 현황 ${reason === 'deadline' ? '시간 상한 도달' : '조회 실패'} · 나머지 결과는 표시됨`);
+      host.chatLines.push(`${section === 'core' ? 'core' : 'ops'} status ${reason === 'deadline' ? 'deadline reached' : 'query failed'} · remaining results shown`);
       host.onUpdate?.();
     }
   }));
-  if (host.signal?.aborted) host.chatLines.push('현재 맥락 조회 취소됨');
-  else if (successes === 0) host.chatLines.push('현재 맥락 조회 실패 · /now 다시 시도');
+  if (host.signal?.aborted) host.chatLines.push('Current-context query cancelled');
+  else if (successes === 0) host.chatLines.push('Current-context query failed · retry /now');
   if (host.signal?.aborted || successes === 0) host.onUpdate?.();
   host.setChatScrollOffset(-1);
 }

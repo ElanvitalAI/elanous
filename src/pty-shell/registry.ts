@@ -232,6 +232,8 @@ export interface PtyHandle extends PtyControlTarget {
   exitCode: number | null;
   exitSignal: number | undefined;
   isAlive(): boolean;
+  /** 프로세스 종료 통지. 이미 끝났으면 마이크로태스크로 한 번 부른다. */
+  onExit(cb: () => void): { dispose(): void };
   /** Append captured output. Trims via head/tail strategy. */
   appendOutput(chunk: string): void;
   /** Read accumulated output since last read; clears the delta
@@ -489,6 +491,7 @@ export function startPty(opts: StartOpts): PtyHandle {
    *  the alternative was a dead PTY reporting itself alive forever. Splitting
    *  the two lets `exitCode: null` honestly mean "죽었지만 모름". */
   let exited = false;
+  const exitListeners: Array<() => void> = [];
   let currentCols = opts.cols ?? 80;
   let currentRows = opts.rows ?? 24;
   let lastActivityAt = Date.now();
@@ -550,6 +553,11 @@ export function startPty(opts: StartOpts): PtyHandle {
     set exitSignal(v) { exitSignal = v; },
     isAlive(): boolean {
       return !exited;
+    },
+    onExit(cb: () => void): { dispose(): void } {
+      if (exited) { queueMicrotask(cb); return { dispose() {} }; }
+      exitListeners.push(cb);
+      return { dispose(): void { const at = exitListeners.indexOf(cb); if (at >= 0) exitListeners.splice(at, 1); } };
     },
     appendOutput(chunk: string): void {
       lastActivityAt = Date.now();
@@ -745,6 +753,9 @@ export function startPty(opts: StartOpts): PtyHandle {
     // ⭐ Mark death from the FACT that the adapter fired, never from the code
     //    (which may legitimately be null — "죽었지만 모름").
     exited = true;
+    for (const cb of exitListeners.splice(0)) {
+      try { cb(); } catch { /* 한 구독자의 실패가 종료 기록을 막지 않는다 */ }
+    }
     if (killEscalationTimer) clearTimeout(killEscalationTimer);
     killEscalationTimer = null;
     exitCode = code;
@@ -869,8 +880,15 @@ export function registerPtyControlTarget(handle: PtyControlTarget): () => void {
     tappedWrite = function (this: typeof stream, ...args: Parameters<typeof stream.write>) {
       const chunk = args[0];
       if (chunk !== undefined) {
-        try { tapPtyOutput(handle.id, typeof chunk === 'string' ? chunk : decoder.decode(chunk as Uint8Array, { stream: true })); }
-        catch (error) { debug.log('pty.record', 'tap-error', { ptyId: handle.id, error: String(error) }); }
+        try {
+          // The foreground TUI has no child adapter.onData. Count its real
+          // terminal writes here, not its self-reported frames (which may be
+          // throttled or repeated without producing any terminal output).
+          addPtyManifestOutputBytes(handle.id, typeof chunk === 'string'
+            ? Buffer.byteLength(chunk, typeof args[1] === 'string' ? args[1] as BufferEncoding : 'utf8')
+            : (chunk as Uint8Array).byteLength, Date.now());
+          tapPtyOutput(handle.id, typeof chunk === 'string' ? chunk : decoder.decode(chunk as Uint8Array, { stream: true }));
+        } catch (error) { debug.log('pty.record', 'tap-error', { ptyId: handle.id, error: String(error) }); }
       }
       return previousWrite.apply(this, args);
     } as typeof stream.write;

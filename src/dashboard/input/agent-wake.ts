@@ -65,6 +65,8 @@ export interface AgentWakeDeps {
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   /** 조각 2 — 자리 TUI 에서 H2 로 다음 턴을 연다. 없으면 알림만. */
   openTurn?: AgentWakeOpenTurnDeps;
+  /** #38031 — 하니스 자식 종료 한 줄(notice 계약). taskId당 1회 호출·던짐 무시(fail-soft)는 이 모듈이 보장한다. */
+  childFinished?: (info: { goal: string; outcome: string }) => void;
 }
 
 export interface AgentWakeController {
@@ -155,6 +157,14 @@ export function createAgentWake(deps: AgentWakeDeps): AgentWakeController {
       return false;
     }
     handled.add(n.taskId);
+    // #38031 — 종료 한 줄(notice 계약)은 taskId당 정확히 여기서 한 번 · 싱크가 던져도 무시(fail-soft).
+    if (deps.childFinished) {
+      try {
+        deps.childFinished({ goal: displayName(n), outcome: n.state });
+      } catch (error) {
+        log('tui.agent-wake', 'child-finished-error', { ...base, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     if (n.completionDelivery === 'supplement') {
       let notifyError: string | null = null;
       try { deps.notify(formatAgentSupplementNotice(n)); } catch (error) {
@@ -276,6 +286,8 @@ export interface DashboardAgentWakePorts {
   getCwd: () => string;
   /** 그 완료가 아직 어느 턴에도 안 실렸나 — `globalTaskNotificationQueue.has`. «대기» 재시도의 근거. */
   isPending: (taskId: string) => boolean;
+  /** #38031 — 하니스 자식 종료 한 줄. `showDashboard` 는 `dashboardChildNotices.harnessChildFinished` 를 넘긴다. */
+  childFinished?: AgentWakeDeps['childFinished'];
   /** 시험·주입 자리(생산은 안 넘긴다 — 기본 `homedir()`·`detectSeatTui`·`setTimeout 0`). */
   home?: string;
   detectSeat?: AgentWakeOpenTurnDeps['detectSeat'];
@@ -301,6 +313,7 @@ export function installSeatedAgentWake(ports: DashboardAgentWakePorts): AgentWak
     subscribe: ports.subscribe,
     notify: ports.notify,
     openTurn,
+    ...(ports.childFinished !== undefined ? { childFinished: ports.childFinished } : {}),
     ...(ports.log !== undefined ? { log: ports.log } : {}),
   });
 }

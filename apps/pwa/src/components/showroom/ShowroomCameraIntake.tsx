@@ -24,6 +24,7 @@ import { debugLog } from '@/lib/debug';
 import { userIntentLogger } from '@/lib/user-intent-logger';
 import { uploadCameraIntake } from '@/lib/camera-intake';
 import type { AttachmentMeta } from '@/lib/upload-attachment';
+import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
 
 export interface ShowroomCameraIntakeViewProps {
   pendingFile: File | null;
@@ -185,7 +186,7 @@ export function ShowroomCameraIntake({ onAttachToSession }: ShowroomCameraIntake
   const submit = async (route: 'session' | 'intake'): Promise<void> => {
     if (!pendingFile) return;
     if (!config.baseUrl) {
-      setError('Daemon URL 미설정 — Settings 에서 입력');
+      setError(NEXUS_URL_MISSING);
       return;
     }
     setBusy(true);

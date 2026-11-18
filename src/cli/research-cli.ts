@@ -1,12 +1,12 @@
 import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { isLiveDetailOn } from '../live/detail-switch.js';
-import { dispatchResearchOmniSearch, getAvailableResearchSearchEngineIds } from '../skills/tools/omni-search.js';
+import { dispatchResearchOmniSearch, getAvailableResearchSearchEngineIdsAsync } from '../skills/tools/omni-search.js';
 
 export interface ResearchCliDeps {
   readonly out?: { log: (line: string) => void; error: (line: string) => void };
   readonly search?: typeof dispatchResearchOmniSearch;
-  readonly availableEngines?: () => string[];
+  readonly availableEngines?: () => string[] | Promise<string[]>;
   readonly maxDetailOn?: (runId?: string) => boolean;
   readonly log?: typeof debug.log;
   readonly registerLogSink?: (surface: string) => Promise<unknown>;
@@ -23,7 +23,7 @@ export function registerResearchCommand(program: Command, deps: ResearchCliDeps 
       const query = parts.join(' ').trim();
       const limit = Number(opts.limit);
       const engines = opts.engines?.split(',').map(id => id.trim()).filter(Boolean);
-      const available = (deps.availableEngines ?? getAvailableResearchSearchEngineIds)();
+      const available = await (deps.availableEngines ?? getAvailableResearchSearchEngineIdsAsync)();
       const unknown = engines?.filter(id => !available.some(p => p.toLowerCase() === id.toLowerCase())) ?? [];
       if (!query || !Number.isInteger(limit) || limit < 1 || limit > 20 || (opts.engines !== undefined && !engines?.length) || unknown.length) {
         out.error(unknown.length ? `research: 사용할 수 없는 엔진: ${unknown.join(', ')} (사용 가능: ${available.join(', ') || '없음'})`

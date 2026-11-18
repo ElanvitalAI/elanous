@@ -207,7 +207,7 @@ async function fixture(options: { wrongMarker?: boolean; expired?: boolean; expi
     const auth = request.headers.get('authorization');
     return auth === 'Bearer aps_synthetic_a' ? owner
       : auth === 'Bearer aps_synthetic_b' ? { memberId: 'member-b', userSlug: 'other-slot' } : null;
-  });
+  }, undefined, true);
   const call = async (action: string, runId = 'run-a', deploymentId?: string, token = 'aps_synthetic_a') => {
     const response = await route(new Request('http://localhost/v1/apps/demo-app/dynamic-deployment', {
       method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },

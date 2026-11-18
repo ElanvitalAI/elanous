@@ -9,6 +9,8 @@ import { ptyWriteControlState } from '../pty-shell/pty-write-provenance.js';
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
 export type SidetabBadge = 'busy' | 'idle' | 'stale' | 'unknown' | 'exited';
+/** What an agent PTY is doing, as `elanous pty state` reports it (Next TUI src/tui/sidetab/agent-state.ts). */
+export type SidetabAgentState = 'working' | 'idle' | 'blocked' | 'waiting' | 'done';
 
 export interface SidetabControlInput {
   readonly accessMode: 'read' | 'write' | 'auto';
@@ -49,6 +51,8 @@ export interface SidetabRow {
   readonly lastActivityAt?: number;
   readonly cardId?: string;
   readonly version?: string;
+  /** Agent rows: the agent's own state; shown in place of the process badge when present. */
+  readonly agentState?: SidetabAgentState;
 }
 
 export interface SidetabState {
@@ -138,14 +142,14 @@ function sidetabControlState(input: SidetabControlInput): SidetabControlState {
     return {
       actor,
       badge: '🤖',
-      label: '🤖 엘라누스 조작 중',
-      title: input.activeMission ? '🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기' : '🤖 엘라누스 조작 중 · 입력하면 넘겨받기',
+      label: '🤖 Elanous driving',
+      title: input.activeMission ? '🤖 Elanous running a mission · type to take over' : '🤖 Elanous driving · type to take over',
       emphasized: true,
     };
   }
   return actor === 'human'
-    ? { actor, badge: '👤', label: '사람', title: '', emphasized: false }
-    : { actor, badge: '⏸', label: '대기', title: '', emphasized: false };
+    ? { actor, badge: '👤', label: 'you', title: '', emphasized: false }
+    : { actor, badge: '⏸', label: 'idle', title: '', emphasized: false };
 }
 
 export function sidetabRowsFromManifest(
@@ -300,7 +304,7 @@ export function sidetabRowsFromManifest(
     ]));
     const workspaceRows: SidetabRow[] = [...workspaceMembers].map(([spaceId, workspace]) => {
       const spaceKind = workspace.spaceKinds.size === 1 ? [...workspace.spaceKinds][0] : undefined;
-      const label = spaceKind === 'solve-mission' ? '미션' : spaceKind ? '하니스 런' : '워크스페이스';
+      const label = spaceKind === 'solve-mission' ? 'Mission' : spaceKind ? 'Harness run' : 'Workspace';
       const matchingMembers = workspaceMembersForExpansion.get(spaceId) ?? [];
       const attention = workspace.attention || workspace.members.some((row) => row.attention || row.badge === 'stale');
       const badge: SidetabRow['badge'] = attention ? 'stale' : workspace.members.some((row) => row.badge === 'busy') ? 'busy' : 'unknown';
@@ -309,8 +313,8 @@ export function sidetabRowsFromManifest(
         label: `${label} · ${spaceId}`,
         kind: 'workspace', badge,
         ...(attention ? { attention: true } : {}),
-        status: label === '미션' ? 'mission-workspace' : label === '하니스 런' ? 'harness-workspace' : 'workspace-unclassified',
-        sessionId: `${workspace.members.length} 항목`, nestDepth: 0,
+        status: label === 'Mission' ? 'mission-workspace' : label === 'Harness run' ? 'harness-workspace' : 'workspace-unclassified',
+        sessionId: `${workspace.members.length} items`, nestDepth: 0,
       };
     }).filter((row) => (workspaceMembersForExpansion.get(row.spaceId!)?.length ?? 0) > 0
       || filterRows([row]).length > 0);
@@ -323,7 +327,7 @@ export function sidetabRowsFromManifest(
     const outsideAttention = (scope.harnessRuns ?? []).filter((run) => run.attention && !runIds.has(run.runId));
     output = [
       ...(outsideAttention.length ? [{
-        id: 'attention:outside-runs', label: `${outsideAttention.length} 함대 주의 런`, kind: 'attention-badge', badge: 'stale' as const,
+        id: 'attention:outside-runs', label: `${outsideAttention.length} fleet runs need attention`, kind: 'attention-badge', badge: 'stale' as const,
         attention: true, status: 'attention',
       }] : []),
       ...basicRows.filter((row) => !row.runId || !runIds.has(row.runId)),
@@ -353,7 +357,7 @@ export function sidetabRowsFromManifest(
   const maxTabs = Math.max(1, scope.maxTabs ?? 8);
   if (mode !== 'workspaces' && expandedRows.length > maxTabs) {
     const visible = expandedRows.slice(0, Math.max(0, maxTabs - 1));
-    visible.push({ id: 'more:tabs', label: `+${expandedRows.length - visible.length} 더`, kind: 'overflow', badge: 'unknown' });
+    visible.push({ id: 'more:tabs', label: `+${expandedRows.length - visible.length} more`, kind: 'overflow', badge: 'unknown' });
     return visible;
   }
   return expandedRows;
@@ -400,17 +404,17 @@ export function formatSidetabLines(
     return result + ' '.repeat(Math.max(0, width - used));
   };
   const selectedControl = mode === 'list' ? rows[selected]?.controlState : undefined;
-  const titleLine = fit(selectedControl?.title || (rows.some((row) => row.kind === 'workspace') ? ' 워크스페이스 · PTY' : ' 세션 · PTY'));
+  const titleLine = fit(selectedControl?.title || (rows.some((row) => row.kind === 'workspace') ? ' Workspace · PTY' : ' Sessions · PTY'));
   const emphasizedTitle = selectedControl?.emphasized ? `\u001b[1;36m${titleLine}\u001b[0m` : titleLine;
   const lines = mode === 'new'
-    ? [fit(' 새 PTY'), fit(' s shell · e elanous'), fit(' c codex · l claude · Esc')]
-    : [emphasizedTitle, fit(' ↑↓ 전환 · 클릭 선택')];
+    ? [fit(' New PTY'), fit(' s shell · e elanous'), fit(' c codex · l claude · Esc')]
+    : [emphasizedTitle, fit(' ↑↓ move · click to select')];
   const rowCapacity = Math.max(0, Math.floor(height) - lines.length - (mode === 'list' ? 1 : 0));
   const visibleCount = Math.min(rows.length || 1, rowCapacity);
   const start = rows.length <= visibleCount
     ? 0
     : Math.max(0, Math.min(selected - visibleCount + 1, rows.length - visibleCount));
-  if (mode === 'list' && rows.length === 0 && visibleCount > 0) lines.push(fit(' 항목 없음'));
+  if (mode === 'list' && rows.length === 0 && visibleCount > 0) lines.push(fit(' No items'));
   for (let offset = 0; offset < visibleCount && rows.length > 0; offset++) {
     const index = start + offset;
     const row = rows[index]!;
@@ -419,7 +423,7 @@ export function formatSidetabLines(
     // `unknown` contributes no actionable state and made the pre-existing
     // classic PTY label truncate after adding the control badge. Keep the
     // known control actor and the complete selectable label visible.
-    const runBadge = row.controlState && row.badge === 'unknown' ? '' : `${row.badge} `;
+    const runBadge = row.agentState ? `${row.agentState} ` : row.controlState && row.badge === 'unknown' ? '' : `${row.badge} `;
     const attentionBadge = row.attention ? '⚠ ' : '';
     const rowLine = fit(` ${marker} ${attentionBadge}${controlBadge}${runBadge}${row.label}`);
     lines.push(row.controlState?.emphasized && index === selected ? `\u001b[1;36m${rowLine}\u001b[0m` : rowLine);
@@ -455,6 +459,9 @@ export interface NextSidetabHostDeps {
   spawn(character: 'shell' | 'elanous'): unknown;
   runMission?(agent: 'codex' | 'claude' | 'grok', mission: string): Promise<unknown>;
   runMissionPair?(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
+  /** When set, `mission` returns at once («started») and this is called when the mission settles — the model's
+   *  turn is never held open for a long visible-agent run (TUI-NO-UNREQUESTED-SIDETAB long tail). */
+  onMissionSettled?(info: { agent: 'codex' | 'claude' | 'grok'; paired: boolean; ok: boolean; path?: string; error?: string }): void;
   kill(row: SidetabRow): unknown;
 }
 export interface NextSidetabIpcProcess {
@@ -464,7 +471,7 @@ export interface NextSidetabIpcProcess {
 
 export const nextSidetabToolSpec: LLMToolSpec = {
   name: NEXT_SIDETAB_TOOL_NAME,
-  description: 'Control the Next TUI side tab: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, run one visible Codex, Claude, or Grok mission, or split one task into complementary graph branches that launch both visible agents concurrently. For a parallelMission, return both verified result files through the existing Codex + Claude pair-synthesis pipeline, with one comparison/adoption artifact and attribution table; do not create a second synthesis. Ask the user to confirm before calling kill with confirm=true.',
+  description: 'Control the Next TUI side tab ONLY when the user explicitly asked for a side tab (사이드탭 / side tab) or a visible Codex, Claude, or Grok tab in the current message; otherwise the call is refused. Never use it as a shell or delegation substitute: run shell commands with Bash. Actions: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, run one visible Codex, Claude, or Grok mission, or split one task into complementary graph branches that launch both visible agents concurrently. For a parallelMission, return both verified result files through the existing Codex + Claude pair-synthesis pipeline, with one comparison/adoption artifact and attribution table; do not create a second synthesis. Ask the user to confirm before calling kill with confirm=true.',
   parameters: {
     type: 'object',
     properties: {
@@ -494,29 +501,69 @@ export async function answerNextSidetabCall(handler: NextSidetabHandler, call: N
   }
 }
 
+/**
+ * TUI-NO-UNREQUESTED-SIDETAB: the side tab is a user-facing surface, not a
+ * tool the model may reach for on its own. A call is honoured only on a turn
+ * whose user text names the side tab or a visible agent tab.
+ */
+const SIDETAB_WORDS = /사이드\s*탭|side[\s_-]*tab|\/side\b/i;
+const AGENT_TAB_WORDS = /(?:codex|claude|grok|코덱스|클로드|그록)[^\n]{0,40}?(?:탭|tab|pty|띄우|띄워)|(?:탭|tab)[^\n]{0,40}?(?:codex|claude|grok|코덱스|클로드|그록)/i;
+export const NEXT_SIDETAB_NOT_REQUESTED_ERROR = 'NextSidetab is available only when this message explicitly asks for the side tab (or a Codex, Claude, or Grok tab). Run shell commands with Bash.';
+
+export function userRequestedNextSidetab(userText: string | null | undefined): boolean {
+  const text = userText ?? '';
+  return SIDETAB_WORDS.test(text) || AGENT_TAB_WORDS.test(text);
+}
+
+/** Refuse every side-tab action unless the current turn's user text asked for it. */
+export function gateNextSidetabHandler(handler: NextSidetabHandler, userText: string | null | undefined): NextSidetabHandler {
+  return async (request) => userRequestedNextSidetab(userText) ? handler(request) : { error: NEXT_SIDETAB_NOT_REQUESTED_ERROR };
+}
+
+/** Await the mission (legacy) or, with `onMissionSettled`, start it and answer immediately; the outcome is
+ *  reported through the callback when it arrives. A failure to even start still surfaces as an error result. */
+function launchMission(
+  deps: NextSidetabHostDeps, agent: 'codex' | 'claude' | 'grok', paired: boolean, run: () => Promise<unknown>,
+): Promise<unknown> | unknown {
+  if (!deps.onMissionSettled) return run();
+  const settled = deps.onMissionSettled.bind(deps);
+  const report = (result: unknown): void => {
+    const row = (result && typeof result === 'object' ? result : {}) as { ok?: unknown; path?: unknown; error?: unknown };
+    settled({ agent, paired, ok: row.ok !== false && !row.error,
+      ...(typeof row.path === 'string' && row.path ? { path: row.path } : {}),
+      ...(typeof row.error === 'string' && row.error ? { error: row.error } : {}) });
+  };
+  void Promise.resolve().then(run).then(report, (error) => report({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+  return { started: true, agent, paired,
+    message: 'Started the mission in the side tab. The screen will say when the result arrives — tell the user it started and end this turn; do not wait for it to finish.' };
+}
+
 export function createNextSidetabHostHandler(deps: NextSidetabHostDeps): NextSidetabHandler {
   return async (request) => {
     if (!request || !['list', 'switch', 'attach', 'detach', 'new', 'mission', 'kill'].includes(request.action)) {
-      return { error: '지원하지 않는 사이드탭 동작입니다' };
+      return { error: 'Unsupported sidetab action' };
     }
     if (request.action === 'new') {
-      if (request.character !== 'shell' && request.character !== 'elanous') return { error: 'character는 shell 또는 elanous여야 합니다' };
+      if (request.character !== 'shell' && request.character !== 'elanous') return { error: 'character must be shell or elanous' };
       return deps.spawn(request.character);
     }
     if (request.action === 'mission') {
       const mission = request.mission?.trim();
-      if (!mission) return { error: 'mission 텍스트가 필요합니다' };
-      if (!deps.runMission && !deps.runMissionPair) return { error: '사이드탭 미션 실행기가 연결되지 않았습니다' };
-      if (request.agent !== undefined && request.agent !== 'codex' && request.agent !== 'claude' && request.agent !== 'grok') return { error: 'agent는 codex, claude 또는 grok이어야 합니다' };
+      if (!mission) return { error: 'mission text is required' };
+      if (!deps.runMission && !deps.runMissionPair) return { error: 'Sidetab mission runner is not connected' };
+      if (request.agent !== undefined && request.agent !== 'codex' && request.agent !== 'claude' && request.agent !== 'grok') return { error: 'agent must be codex, claude, or grok' };
       const parallelMission = request.parallelMission?.trim();
-      if (request.parallelMission !== undefined && !parallelMission) return { error: 'parallelMission 텍스트가 비었습니다' };
+      if (request.parallelMission !== undefined && !parallelMission) return { error: 'parallelMission text is empty' };
       if (parallelMission) {
-        if (request.agent === 'grok') return { error: 'parallelMission은 Codex/Claude pair에서만 지원합니다' };
-        if (!deps.runMissionPair) return { error: 'Codex/Claude pair 실행기가 연결되지 않았습니다' };
-        return deps.runMissionPair(request.agent ?? 'codex', mission, parallelMission);
+        if (request.agent === 'grok') return { error: 'parallelMission is only supported for a Codex/Claude pair' };
+        if (!deps.runMissionPair) return { error: 'Codex/Claude pair runner is not connected' };
+        // grok is refused above; narrow the agent once so the pair runner's `codex | claude` type holds in the closure.
+        const pairAgent: 'codex' | 'claude' = request.agent === 'claude' ? 'claude' : 'codex';
+        const runPair = deps.runMissionPair;
+        return launchMission(deps, pairAgent, true, () => runPair(pairAgent, mission, parallelMission));
       }
-      if (!deps.runMission) return { error: '단일 사이드탭 미션 실행기가 연결되지 않았습니다' };
-      return deps.runMission(request.agent ?? 'codex', mission);
+      if (!deps.runMission) return { error: 'Single sidetab mission runner is not connected' };
+      return launchMission(deps, request.agent ?? 'codex', false, () => deps.runMission!(request.agent ?? 'codex', mission));
     }
     if (request.action === 'detach') return deps.detach();
     const rows = await deps.rows();
@@ -525,13 +572,13 @@ export function createNextSidetabHostHandler(deps: NextSidetabHostDeps): NextSid
     const exact = target ? rows.find((item) => item.id === target)
       ?? rows.find((item) => item.label.toLowerCase() === target.toLowerCase()) : undefined;
     const partial = target && !exact ? rows.filter((item) => item.label.toLowerCase().includes(target.toLowerCase())) : [];
-    if (partial.length > 1) return { error: `사이드탭 항목이 여러 개 일치합니다: ${target}` };
+    if (partial.length > 1) return { error: `Multiple sidetab items match: ${target}` };
     const row = exact ?? partial[0] ?? (target ? undefined : rows[deps.selected()]);
-    if (!row) return { error: target ? `사이드탭 항목을 찾지 못했습니다: ${target}` : '선택된 사이드탭 항목이 없습니다' };
-    if (request.action === 'switch') return row.kind === 'tui' ? deps.switchSession(row) : { error: 'Next TUI 세션만 전환할 수 있습니다' };
+    if (!row) return { error: target ? `Sidetab item not found: ${target}` : 'No sidetab item is selected' };
+    if (request.action === 'switch') return row.kind === 'tui' ? deps.switchSession(row) : { error: 'Only a Next TUI session can be switched' };
     if (request.action === 'attach') return deps.attach(row);
-    if (row.currentProcess) return { error: '현재 TUI 세션은 사이드탭에서 종료할 수 없습니다' };
-    if (request.confirm !== true) return { needsConfirmation: true, message: `PTY 종료 확인 필요: ${row.label}` };
+    if (row.currentProcess) return { error: 'Cannot stop this TUI session from the sidetab' };
+    if (request.confirm !== true) return { needsConfirmation: true, message: `Confirm stopping PTY: ${row.label}` };
     return deps.kill(row);
   };
 }

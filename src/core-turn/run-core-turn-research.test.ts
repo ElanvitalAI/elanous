@@ -14,6 +14,7 @@ import { routeResearchOutput } from '../research/output-router.js';
 import {
   isResearchToolAllowed,
   requestsResearchDocumentWrite,
+  RESEARCH_FORCED_SYNTHESIS_REASONING_EFFORT,
   RESEARCH_TOOL_ALLOWLIST,
   RESEARCH_TURN_DEEP_BUDGET_MS,
   RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS,
@@ -274,18 +275,22 @@ test('final synthesis receives the production source ledger and trusted claim ci
   expect(result.finalText).toContain('published 2026-10-30; checked 2026-11-01');
 });
 
-test('Q2v2 fixed-input mock exposes WebSearch on the first model call and records exclusions', async () => {
+test('Q2v2 timely request waits for research before synthesis and records exclusions', async () => {
   const request = '2026-10-31 기준 HBM4(12단)의 상태를 SK하이닉스·삼성전자·마이크론 세 회사에 한정해 조사하라. 회사마다 «발표·샘플 출하·고객 인증·양산 출하» 네 단계 중 어디까지 1차 자료(회사 발표·실적 발표)로 확인되는지를 날짜와 원문 URL로 한 줄씩 표로 제시하고, 확인되지 않는 단계는 «미확인»으로 둬라. 공급망 병목은 베이스 다이 파운드리 의존 하나만 골라 인과를 3문장으로 설명하라. 일정 지연을 뒷받침하는 가장 강한 반대 근거 1개와 2026년 말까지 확인할 관측 지표 3개를 제시하라. 보고서는 1,500자 이내로 쓴다.';
   expect(isResearchAgentIntent(request)).toBe(true);
   let firstCallTools: string[] = [];
   let capturedFirstCall = false;
+  let researchCompleted = false;
+  let evidenceInjected = false;
   let tierSplit: Record<string, unknown> | undefined;
   spyOn(debug, 'log').mockImplementation((category, event, data) => {
     if (category === 'capability.resolve' && event === 'tier-split' && data && typeof data === 'object') {
       tierSplit = data as Record<string, unknown>;
     }
   });
-  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, options) => {
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, _handlers, options) => {
+    expect(researchCompleted).toBe(true);
+    evidenceInjected = messages.some(message => typeof message.content === 'string' && message.content.includes('fixture evidence only'));
     const callTools = options?.tools?.map(spec => spec.name) ?? [];
     if (!capturedFirstCall) {
       firstCallTools = callTools;
@@ -295,17 +300,23 @@ test('Q2v2 fixed-input mock exposes WebSearch on the first model call and record
   });
   const shellTool: LLMToolSpec = { ...tool, name: 'Shell' };
 
-  await runCoreTurn({
+  const result = await runCoreTurn({
     sessionId: 'q2v2-fixed-input-mock',
     messages: [{ role: 'user', content: request }],
     tools: [tool, webSearchTool, webFetchTool, omniSearchTool, shellTool],
     dispatchTool: async () => null,
     signal,
     userText: request,
-  }, { runResearch: async () => ({ ok: true, output: 'fixture evidence only' }) });
+  }, { runResearch: async () => {
+    expect(capturedFirstCall).toBe(false);
+    researchCompleted = true;
+    return { ok: true, output: 'fixture evidence only', sourceUrls: ['https://primary.example/observed'] };
+  } });
 
-  expect(firstCallTools).toContain('WebSearch');
-  expect(firstCallTools).toContain('WebFetch');
+  expect(capturedFirstCall).toBe(true);
+  expect(evidenceInjected).toBe(true);
+  expect(result.finalText).toContain('https://primary.example/observed');
+  expect(firstCallTools).not.toContain('WebSearch');
   expect(firstCallTools).not.toContain('Shell');
   expect(tierSplit).toMatchObject({
     sessionId: 'q2v2-fixed-input-mock',
@@ -315,7 +326,23 @@ test('Q2v2 fixed-input mock exposes WebSearch on the first model call and record
   });
 });
 
-test('deep non-research prompts get Bloom without skill or search tools', async () => {
+
+test('non-timely research retains WebSearch on its provisional first model call', async () => {
+  const request = 'compare bond yields';
+  const calls: string[][] = [];
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, options) => {
+    calls.push(options?.tools?.map(spec => spec.name) ?? []);
+    return 'ordinary research answer';
+  });
+  await runCoreTurn({
+    sessionId: 'non-timely-first-websearch', messages: [{ role: 'user', content: request }],
+    tools: [tool, webSearchTool, webFetchTool, omniSearchTool], dispatchTool: async () => null,
+    signal, userText: request,
+  }, { runResearch: async () => ({ ok: true, output: 'non-timely fixture evidence' }) });
+  expect(calls[0]).toContain('WebSearch');
+});
+
+test('deep non-research prompts get Bloom without skill or search tools (plan judged local-only)', async () => {
   const request = '채권 금리 앞으로 어떻게 봐야 하나';
   expect(isResearchAgentIntent(request)).toBe(false);
   let toolsSeen: string[] = [];
@@ -334,12 +361,14 @@ test('deep non-research prompts get Bloom without skill or search tools', async 
     messages: [{ role: 'user', content: request }],
     tools: [tool, skillExecTool, webSearchTool, omniSearchTool, webFetchTool],
     dispatchTool: async () => null, signal, userText: request,
-  }, { runResearch: async () => {
+  }, { runResearch: async (_request, _signal, _admit, _routing, hooks) => {
+    // 1121 RESEARCH-ROUTING: a web-capable turn enters research by default; the plan's structured verdict takes it out.
     researchCalls += 1;
+    hooks?.onRoute?.({ needsFreshFacts: false, needsCitations: false, localOnly: true });
     return { ok: true, output: 'unexpected research evidence' };
   } });
 
-  expect(researchCalls).toBe(0);
+  expect(researchCalls).toBe(1);
   expect(researchTurn).toBe(false);
   expect(toolsSeen).toContain('Read');
   expect(toolsSeen).not.toEqual(expect.arrayContaining(['skill_exec', 'WebSearch', 'OmniSearch', 'WebFetch', 'ToolSearch']));
@@ -750,6 +779,146 @@ test('the configured research wall-clock deadline aborts tools and forces a no-t
   expect(result.finalText).toBe('Forced synthesis');
   expect(stopEvents.map(event => event.reason)).toContain('wall-clock-budget');
   expect(stopEvents.map(event => event.reason)).toContain('forced-synthesis');
+});
+
+// 1121 GLM-SYNTHESIS-ABORT — forced synthesis answers at a light effort unless the caller chose one.
+async function runForcedSynthesisTurn(options: {
+  callerEffort?: 'low' | 'high';
+  forceDeadline: boolean;
+  onSynthesis?: (handlers: Parameters<typeof llmModule.streamLLMWithTools>[1], parent: AbortController) => Promise<string>;
+}) {
+  const manual = createManualTimers();
+  const parent = new AbortController();
+  const researchEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
+  spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'research.turn' && data && typeof data === 'object' && !Array.isArray(data)) {
+      researchEvents.push({ event, data: data as Record<string, unknown> });
+    }
+  });
+  let startedResearch!: () => void;
+  const researchStarted = new Promise<void>(resolve => { startedResearch = resolve; });
+  const efforts: Array<string | undefined> = [];
+  const hadEffortKey: boolean[] = [];
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, opts) => {
+    efforts.push(opts?.reasoningEffort);
+    hadEffortKey.push(opts !== undefined && Object.prototype.hasOwnProperty.call(opts, 'reasoningEffort'));
+    if (efforts.length === 1) {
+      handlers.onText?.('Provisional answer', 'Provisional answer');
+      handlers.onTurnComplete?.([{ role: 'assistant', content: 'Provisional answer', phase: 'final_answer' }]);
+      return 'Provisional answer';
+    }
+    if (options.onSynthesis) return options.onSynthesis(handlers, parent);
+    handlers.onText?.('Synthesized answer', 'Synthesized answer');
+    handlers.onTurnComplete?.([{ role: 'assistant', content: 'Synthesized answer', phase: 'final_answer' }]);
+    return 'Synthesized answer';
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  const pending = runCoreTurn({
+    sessionId: 'research-forced-synthesis-effort',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool], dispatchTool: async () => null, signal: parent.signal, userText: request,
+    ...(options.callerEffort ? { reasoningEffort: options.callerEffort } : {}),
+  }, {
+    timers: manual.timers,
+    researchWallClockBudgetMs: 30,
+    runResearch: (_request, researchSignal) => {
+      startedResearch();
+      if (!options.forceDeadline) return Promise.resolve({ ok: true, output: 'complete source evidence' });
+      return new Promise(resolve => researchSignal.addEventListener('abort', () => resolve({
+        ok: false, output: 'partial source evidence', error: 'research stopped by its deadline',
+      }), { once: true }));
+    },
+  });
+  await researchStarted;
+  await Promise.resolve();
+  if (options.forceDeadline) manual.fire(30);
+  const result = await pending;
+  return { result, efforts, hadEffortKey, researchEvents };
+}
+
+test('forced synthesis without a caller effort asks for the light synthesis effort; the provisional pass is unchanged', async () => {
+  const { result, efforts, hadEffortKey, researchEvents } = await runForcedSynthesisTurn({ forceDeadline: true });
+
+  expect(efforts).toEqual([undefined, RESEARCH_FORCED_SYNTHESIS_REASONING_EFFORT]);
+  expect(hadEffortKey[0]).toBe(false);
+  expect(result.finalText).toContain('Synthesized answer');
+  const started = researchEvents.find(item => item.event === 'synthesis-started')?.data;
+  expect(started?.forced).toBe(true);
+  expect(started?.reasoningEffort).toBe(RESEARCH_FORCED_SYNTHESIS_REASONING_EFFORT);
+  expect(started?.evidenceChars).toBe('partial source evidence'.length);
+});
+
+test('forced synthesis keeps an explicit caller reasoning effort', async () => {
+  const { efforts } = await runForcedSynthesisTurn({ forceDeadline: true, callerEffort: 'high' });
+
+  expect(efforts).toEqual(['high', 'high']);
+});
+
+test('synthesis inside the research budget keeps the caller effort (no forced override)', async () => {
+  const { efforts, hadEffortKey, researchEvents } = await runForcedSynthesisTurn({ forceDeadline: false });
+
+  expect(efforts).toEqual([undefined, undefined]);
+  expect(hadEffortKey).toEqual([false, false]);
+  const started = researchEvents.find(item => item.event === 'synthesis-started')?.data;
+  expect(started?.forced).toBe(false);
+  expect(started?.reasoningEffort).toBeNull();
+});
+
+test('an aborted forced synthesis records how far it got and keeps the provisional answer', async () => {
+  const { result, researchEvents } = await runForcedSynthesisTurn({
+    forceDeadline: true,
+    onSynthesis: async (handlers, parent) => {
+      handlers.onText?.('partial', 'partial');
+      parent.abort(new Error('caller deadline'));
+      throw new DOMException('The operation timed out.', 'TimeoutError');
+    },
+  });
+
+  expect(result.stopReason).toBe('aborted');
+  expect(result.finalText).toContain('Provisional answer');
+  expect(result.finalText).not.toContain('partial');
+  const aborted = researchEvents.find(item => item.event === 'synthesis-aborted')?.data;
+  expect(aborted).toBeDefined();
+  expect(aborted?.forced).toBe(true);
+  expect(aborted?.reasoningEffort).toBe(RESEARCH_FORCED_SYNTHESIS_REASONING_EFFORT);
+  expect(aborted?.evidenceChars).toBe('partial source evidence'.length);
+  expect(aborted?.visibleTextChars).toBe('partial'.length);
+  expect(typeof aborted?.elapsedMs).toBe('number');
+});
+
+test('forced synthesis without usable research output also uses the light synthesis effort', async () => {
+  const manual = createManualTimers();
+  let startedResearch!: () => void;
+  const researchStarted = new Promise<void>(resolve => { startedResearch = resolve; });
+  const efforts: Array<string | undefined> = [];
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers, opts) => {
+    efforts.push(opts?.reasoningEffort);
+    const text = efforts.length === 1 ? 'Provisional answer' : 'Uncertain answer';
+    handlers.onText?.(text, text);
+    handlers.onTurnComplete?.([{ role: 'assistant', content: text, phase: 'final_answer' }]);
+    return text;
+  });
+  const request = 'Research recent battery policy updates using current sources.';
+  const pending = runCoreTurn({
+    sessionId: 'research-forced-synthesis-effort-empty',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool], dispatchTool: async () => null, signal, userText: request,
+  }, {
+    timers: manual.timers,
+    researchWallClockBudgetMs: 30,
+    runResearch: (_request, researchSignal) => {
+      startedResearch();
+      return new Promise(resolve => researchSignal.addEventListener('abort', () => resolve({
+        ok: false, output: '', error: 'research stopped by its deadline',
+      }), { once: true }));
+    },
+  });
+  await researchStarted;
+  await Promise.resolve();
+  manual.fire(30);
+  await pending;
+
+  expect(efforts).toEqual([undefined, RESEARCH_FORCED_SYNTHESIS_REASONING_EFFORT]);
 });
 
 test('empty research output keeps claim source rules during forced synthesis', async () => {

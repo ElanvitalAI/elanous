@@ -4,12 +4,12 @@ import type { ModelTier } from '../../model-tier/types.js';
 export type NextTuiModelChoice = 'fast' | 'normal' | 'deep';
 
 const CHOICES: Readonly<Record<string, { choice: NextTuiModelChoice; tier: ModelTier; label: string }>> = {
-  fast: { choice: 'fast', tier: 'budget', label: '빠름' },
-  빠름: { choice: 'fast', tier: 'budget', label: '빠름' },
-  normal: { choice: 'normal', tier: 'balanced', label: '보통' },
-  보통: { choice: 'normal', tier: 'balanced', label: '보통' },
-  deep: { choice: 'deep', tier: 'best', label: '깊음' },
-  깊음: { choice: 'deep', tier: 'best', label: '깊음' },
+  fast: { choice: 'fast', tier: 'budget', label: 'fast' },
+  빠름: { choice: 'fast', tier: 'budget', label: 'fast' },
+  normal: { choice: 'normal', tier: 'balanced', label: 'normal' },
+  보통: { choice: 'normal', tier: 'balanced', label: 'normal' },
+  deep: { choice: 'deep', tier: 'best', label: 'deep' },
+  깊음: { choice: 'deep', tier: 'best', label: 'deep' },
 };
 
 export type NextTuiModelCommand =
@@ -17,7 +17,7 @@ export type NextTuiModelCommand =
   | { readonly kind: 'provider'; readonly providerCommand: string }
   | { readonly kind: 'invalid'; readonly message: string };
 
-const MODEL_USAGE = '사용법: /model <fast|normal|deep> (빠름|보통|깊음) · /provider 별칭';
+const MODEL_USAGE = 'Usage: /model <fast|normal|deep> (Korean aliases 빠름|보통|깊음 also work) · /provider is an alias';
 
 /** Parse /model and its /provider alias; retain the older /provider subcommands. */
 export function parseNextTuiModelCommand(input: string): NextTuiModelCommand {

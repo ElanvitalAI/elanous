@@ -339,3 +339,19 @@ test('a paused HTTP reader keeps the server stream queue bounded, then receives 
     await reader.cancel();
   } finally { service.stop(); readOnly.close(); writer.close(); }
 });
+
+test('MSG-RECEIPTS-FOLLOWUP — with no /receipts subscriber the post office only moves its cursor (no receipt listing per tick)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sse-no-sub-'));
+  try {
+    const store = new MsgStore(join(dir, 'messages.db'));
+    let listed = 0;
+    const original = store.listReceipts.bind(store);
+    store.listReceipts = (query) => { listed += 1; return original(query); };
+    const server = startMsgSseServer({ store, token: 'fake-token', port: 0, pollMs: 1 });
+    try {
+      store.post({ from: 'OP', to: 'TC', body: 'x' });
+      await Bun.sleep(30);
+      expect(listed).toBe(0);
+    } finally { server.stop(); store.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

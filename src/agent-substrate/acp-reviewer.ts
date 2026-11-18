@@ -31,6 +31,9 @@ export interface AcpReviewerOpts {
   env?: Record<string, string>;
   /** 모델 tier 별칭 (opus|sonnet|haiku 등). 지정 시 session/set_model 로 고정(백엔드 CLI 기본 위임 아님). */
   model?: string;
+  // REVIEW-NO-SILENT-GLM-FALLBACK (#38337 · respondedModel was null on claude-acp results).
+  /** Called once after a completed turn: `acp:<backend>` ⊕ the session's own current model (undefined = not advertised). */
+  onResolved?: (provider: string, model: string | undefined) => void;
   /** 리뷰 1턴 최대 대기(ms). 초과 시 cancel→throw(부분 리뷰로 오판 pass 방지). 기본 300000. */
   timeoutMs?: number;
   /** One deadline for spawn → initialize → session/new → model select (ms). A child that never answers ACP must not hang the review. Default min(timeoutMs, 60000). */
@@ -197,6 +200,9 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     const directAgent = injected || Boolean(backendSpec) || backend === 'grok';
     const reviewManager = directAgent ? undefined : new AcpAgentManager();
     let agent: AcpAgent | undefined;
+    let sessionId: string | undefined;
+    let pickedModelId: string | undefined;
+    let respondedModel: string | undefined;
     let text = '';
     let timer: ReturnType<typeof setTimeout> | undefined;
     const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? Math.min(timeoutMs, 60_000);
@@ -235,9 +241,11 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
       }
       enterPhase('session-new');
       const sid = await withinHandshake(agent.newSession());
+      sessionId = sid;
       if (opts.model) {
         enterPhase('model-select');
         const picked = await withinHandshake(agent.selectSessionModel(sid, opts.model));
+        pickedModelId = picked?.modelId;
         debug.log('acp-review', 'model', { requested: opts.model, picked: picked?.name ?? null, backend });
       }
       enterPhase('prompt');
@@ -284,6 +292,10 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
           void agent!.cancel(sid).catch(() => { /* noop */ });
         }, timeoutMs);
       })]);
+      // #38337 — the session's own report of the model that answered (claude: `model` config option), read
+      //   before stop() releases the session; the picked alias is the runner's confirmation when no state is kept.
+      try { respondedModel = (sessionId ? agent.getSessionModels?.(sessionId)?.currentModelId : undefined) || pickedModelId; }
+      catch { respondedModel = pickedModelId; }
     } catch (e) {
       const message = (e as Error).message;
       const handshakeTimeout = message.startsWith('ACP handshake timeout (');
@@ -308,7 +320,8 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
         debug.log('acp-review', 'stop-fail', { backend, message: (e as Error).message }, { level: 'error' });
       }
     }
-    debug.log('acp-review', 'done', { backend, chars: text.length, allowed, denied });
+    debug.log('acp-review', 'done', { backend, chars: text.length, allowed, denied, respondedModel: respondedModel ?? null });
+    try { opts.onResolved?.(`acp:${backend}`, respondedModel); } catch { /* observation seam must not fail a completed review */ }
     return text;
   };
 }

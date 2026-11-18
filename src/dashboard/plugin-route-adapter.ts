@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { APPROVAL_APPROVED, APPROVAL_DECLINED, approvalHold, isApprovalHold, normalizeApproval, type ApprovalOutcome } from '../graph-runner/approval-outcome.js';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
@@ -8,6 +9,7 @@ import { dispatchToolRoute, type ToolRouteMatch } from '../tool-router/index.js'
 import { runAppDeploy } from '../agent/app-deploy-plugin.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import type { PluginRouteDispatchContract } from '../plugins/core/route-adapter.js';
+import { autofillAppBuildArgs, isAppBuildRoute } from '../plugins/core/app-build-autofill.js';
 import type { AcpAskPusher } from '../acp/acp-surface-channels.js';
 import { createTuiDeployConfirmChannel, type TuiDeployApproval } from './runtime/tui-deploy-confirm-channel.js';
 import type { InlineChoiceBroker } from '../tui/inline-choice.js';
@@ -39,7 +41,7 @@ export async function resolveDashboardVerifiedOwner(input: {
   appSlug?: string;
   sessionToken?: string;
   fetchImpl?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-}): Promise<{ id: string } | undefined> {
+}): Promise<{ id: string; appSlug?: string } | undefined> {
   const token = input.sessionToken?.trim();
   const appSlug = input.appSlug?.trim();
   if (!token || (input.appSlug !== undefined && !appSlug)) return undefined;
@@ -61,11 +63,25 @@ export async function resolveDashboardVerifiedOwner(input: {
     const body: unknown = await response.json();
     if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined;
     const memberId = (body as Record<string, unknown>).memberId;
-    return typeof memberId === 'string' && memberId.trim() ? { id: memberId.trim() } : undefined;
+    return typeof memberId === 'string' && memberId.trim()
+      ? { id: memberId.trim(), ...(appSlug ? { appSlug } : {}) } : undefined;
   } catch { return undefined; }
 }
 
 /** Ask for graph-route approval through the classic TUI's shared inline input slot. */
+export async function requestDashboardGraphDecision(broker: InlineChoiceBroker, prompt: string): Promise<ApprovalOutcome> {
+  const result = await broker.ask({
+    id: `plugin-route-confirm-${crypto.randomUUID()}`,
+    question: prompt,
+    options: [{ value: 'y', label: 'y' }, { value: 'N', label: 'N' }],
+    includeOther: false,
+    yesNo: true,
+  });
+  // Dismissing the question (Esc, cancelled turn) is not the owner answering «N».
+  if ('cancelled' in result) return { approved: false, reason: 'turn-cancelled' };
+  return result.selected.includes('y') ? APPROVAL_APPROVED : APPROVAL_DECLINED;
+}
+
 export async function requestDashboardGraphConfirmation(broker: InlineChoiceBroker, prompt: string): Promise<boolean> {
   const result = await broker.ask({
     id: `plugin-route-confirm-${crypto.randomUUID()}`,
@@ -116,7 +132,7 @@ export async function dispatchVerifiedDashboardGraph(
 /** Bind test-world GraphRunOptions while retaining the production graph route callback. */
 export function createDashboardGraphRouteDispatcher(
   runOptions: GraphRunOptions = {},
-  requestGraphApproval?: (prompt: string) => Promise<boolean>,
+  requestGraphApproval?: (prompt: string) => Promise<boolean | ApprovalOutcome>,
 ) {
   return async (_pluginId: string, _graphId: string, graphFile: string, args: Record<string, unknown>, context?: ToolRuntimeContext) => {
     const { decideGraphApproval, runGraph } = await import('../graph-runner/runner.js');
@@ -127,8 +143,12 @@ export function createDashboardGraphRouteDispatcher(
     } : runOptions;
     let state = await dispatchVerifiedDashboardGraph(graphFile, args, context, boundOptions);
     while (state.status === 'awaiting-approval' && state.pending) {
-      const approved = await requestGraphApproval?.(state.pending.message) ?? false;
-      decideGraphApproval(state.graphId, state.runId, approved ? 'approved' : 'rejected', 'classic-tui', runOptions.deps?.root);
+      const decision = normalizeApproval(await requestGraphApproval?.(state.pending.message) ?? { approved: false, reason: 'unavailable' });
+      if (isApprovalHold(decision)) {
+        // Nobody decided: the node keeps waiting (resumable), no rejection is recorded.
+        return { ...state, approvalHold: approvalHold(state, state.pending.nodeId, decision.reason) };
+      }
+      decideGraphApproval(state.graphId, state.runId, decision.approved ? 'approved' : 'rejected', 'classic-tui', runOptions.deps?.root);
       const { runId: _runId, resumeRunId: _resumeRunId, resumeGraphId: _resumeGraphId, ...resumeOptions } = boundOptions;
       state = await runGraph(graphFile, { ...resumeOptions, verifiedOwnerId: context?.verifiedOwner?.id,
         resumeRunId: state.runId, resumeGraphId: state.graphId });
@@ -218,6 +238,14 @@ export function createDashboardPluginRouteAdapter(options: {
         return { ok: false as const, error: `graph route is not allowlisted: ${tool.name}` };
       }
       if (!executeGraph) return { ok: false as const, error: 'graph route executor is not configured' };
+      let graphArgs = args;
+      if (isAppBuildRoute(tool.pluginId, tool.name)) {
+        // ONE-LINE-INTENT-CONTEXT-AUTOFILL: the classic/dashboard adapter reads the same manifest (required=[ask]),
+        // so it must fill slot, artifactMetadata and seedRequested exactly like the core route adapter.
+        const filled = autofillAppBuildArgs(args, context);
+        if (filled.status !== 'filled') return { ok: false as const, error: filled.error, code: filled.code };
+        graphArgs = filled.args;
+      }
       const match: ToolRouteMatch = {
         pluginId: tool.pluginId, name: tool.name, route: tool.route, handler: tool.handlerRef,
         bm25: 0, ontology: 0, ontologyTerms: [], score: 0,
@@ -231,7 +259,7 @@ export function createDashboardPluginRouteAdapter(options: {
         }
       }
       const result = dispatchToolRoute(match, approved, () => {
-        return executeGraph(tool.pluginId, graphId, graphFile, args, context);
+        return executeGraph(tool.pluginId, graphId, graphFile, graphArgs, context);
       }, { allowedGraphIds });
       if (result.status === 'confirmation-required') return { ok: false as const, error: `confirmation declined for ${tool.name}` };
       if (result.status === 'graph-not-allowlisted') return { ok: false as const, error: `graph route is not allowlisted: ${tool.name}` };

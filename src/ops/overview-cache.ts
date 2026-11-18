@@ -3,7 +3,7 @@ import { isMainThread, parentPort, workerData, Worker } from 'node:worker_thread
 import { collectOverview, type CollectOptions } from './overview-collect.js';
 import { computeVerdict, unmeasured, okCell, type Cell, type GateReservation, type OverviewSnapshot, type PodMemberRow } from './overview.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { getElanousConfigDirOverride, setElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDirOverride, getElanousConfigDirOverrideSource, setElanousConfigDir, type ConfigDirOverrideSource } from '../elanous-config-dir.js';
 
 const SNAPSHOT_MS = 10_000;
 const POD_MS = 60_000;
@@ -15,7 +15,7 @@ const OVERVIEW_WORKER_KIND = 'ops-overview-cache';
 
 type PodReading = { context: string; occupied: number | null; reason: string | null; observedAt: number; gate?: GateReservation };
 type OverviewData = OverviewSnapshot & ReturnType<typeof computeVerdict> & { cacheAgeMs: number; durationMs: number; sources: string[]; refreshFailed: string | null };
-type WorkerMessage = ({ kind: 'pods' } | { kind: 'snapshot'; options: CollectOptions }) & { configDir?: string };
+type WorkerMessage = ({ kind: 'pods' } | { kind: 'snapshot'; options: CollectOptions }) & { configDir?: string; configSource?: ConfigDirOverrideSource };
 
 /** The kubectl-capable grid reader lives in a worker, never on the HTTP event loop. */
 const port = parentPort;
@@ -23,7 +23,7 @@ if (!isMainThread && port && workerData?.kind === OVERVIEW_WORKER_KIND) {
   port.on('message', async (message: WorkerMessage) => {
     try {
       // A worker does not share the main thread's module state: carry the daemon's universe in.
-      if (message.configDir) setElanousConfigDir(message.configDir);
+      if (message.configDir) setElanousConfigDir(message.configDir, message.configSource);
       if (message.kind === 'pods') {
         const { buildGridData } = await import('../nexus/api/grid.js');
         const rows = buildGridData().members.map((m) => ({ context: m.context, occupied: m.occupied, reason: m.reason, observedAt: Date.now(), ...(m.gate ? { gate: m.gate } : {}) }));
@@ -54,7 +54,7 @@ function workerRead<T>(message: WorkerMessage, timeoutMs: number, field: 'rows' 
     });
     worker.on('error', (error) => finish(error instanceof Error ? error : new Error(String(error))));
     const configDir = getElanousConfigDirOverride();
-    worker.postMessage({ ...message, ...(configDir ? { configDir } : {}) });
+    worker.postMessage({ ...message, ...(configDir ? { configDir, configSource: getElanousConfigDirOverrideSource() } : {}) });
   });
 }
 

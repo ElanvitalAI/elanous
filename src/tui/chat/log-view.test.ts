@@ -1,7 +1,13 @@
-import { expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import chalk from 'chalk';
 import type { SerializedMessage } from '../../session/index.js';
-import { TOOL_FOLD_LINE_LIMIT, fitLogLine, isToolFoldToggleKey, logViewLines, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockRanges, toolFoldBlockStarts, toolFoldSummary, wheelScroll, wrapLogLines, WHEEL_SCROLL_LINES } from './log-view.js';
+import { breatheMarkdown, hangingIndentFor, TOOL_FOLD_LINE_LIMIT, fitLogLine, isToolFoldToggleKey, logViewLines, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockRanges, toolFoldBlockStarts, toolFoldSummary, wheelScroll, wrapLogLines, WHEEL_SCROLL_LINES } from './log-view.js';
+
+// These tests read the text of user rows (wrapping, labels, resumed context). The user-turn band is a separate
+// concern with its own tests (user-turn-band.test.ts), so this file reads the NO_COLOR rows and restores the env after.
+const previousNoColor = process.env.NO_COLOR;
+beforeAll(() => { process.env.NO_COLOR = '1'; });
+afterAll(() => { if (previousNoColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = previousNoColor; });
 
 test('rebase keeps the main attachment-area multiline export', () => {
   expect(wrapLogLines('앞 장면 영수증', 5).join('').replace(/\s/g, '')).toContain('영수증');
@@ -29,8 +35,8 @@ test('history renders user and assistant text within terminal width without stor
 test('resumed classic dashboard context renders only its question in Next history', () => {
   const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n  ⚠ plugin warning\n\nQuestion: 이어쓰기 1 classic 질문';
   const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-  expect(lines).toContain('나: 이어쓰기 1 classic 질문');
-  expect(lines).not.toContain('나: Context:');
+  expect(lines).toContain('> 이어쓰기 1 classic 질문');
+  expect(lines).not.toContain('> Context:');
   expect(lines).not.toContain('Dashboard mode: browse');
   expect(lines).not.toContain('plugin warning');
   expect(classicUser).toContain('Recent status output:'); // stored history stays intact
@@ -42,7 +48,7 @@ test('ordinary user-authored Context prose and similar headings stay visible', (
   const quotedStatus = 'Context:\nDashboard mode: browse\n\nRecent status output:\nmy own notes\n\nQuestion: keep this whole message and mention ✓ resumed local session: abc123';
   for (const content of [ordinary, nearMiss, quotedStatus]) {
     const lines = logViewLines([{ role: 'user', content, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-    expect(lines).toContain('나: Context:');
+    expect(lines).toContain('> Context:');
     expect(lines).toContain('Question: keep this whole message');
   }
 });
@@ -50,7 +56,7 @@ test('ordinary user-authored Context prose and similar headings stay visible', (
 test('resumed classic question keeps later Question headings in the actual user text', () => {
   const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n\nQuestion: 첫 문단\n\nQuestion: 두 번째 문단';
   const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
-  expect(lines).toContain('나: 첫 문단');
+  expect(lines).toContain('> 첫 문단');
   expect(lines).toContain('Question: 두 번째 문단');
   expect(lines).not.toContain('Dashboard mode: browse');
 });
@@ -85,7 +91,7 @@ test('literal backtick fenced answer renders as dim code in history and live pre
       expect(visible).not.toContain('```');
       expect(visible).toContain('기존 원자핵 + 중성자 여러 개');
       expect(visible).toContain('          ↓');
-      expect(visible.split('\n')).toContain('                ↓'); // 2 label + 4 code indent + 10 source spaces
+      expect(visible.split('\n')).toContain('              ↓'); // 4 code indent + 10 source spaces (no speaker label)
       expect(lines.some((line) => line.includes('\x1b[2m'))).toBe(true);
       expect(lines.every((line) => Bun.stringWidth(line) <= 40)).toBe(true);
     }
@@ -165,14 +171,14 @@ test('live reply preview uses the same Markdown renderer and wrapping as saved a
 });
 
 test('empty history clearly marks the first slice as read only', () => {
-  expect(logViewLines([], 20)).toEqual(['대화 기록 없음']);
+  expect(logViewLines([], 20)).toEqual(['No chat history']);
 });
 
 test('tool execution and its result appear in the bounded conversation view', () => {
   const lines = logViewLines([{
     role: 'tool', content: '⚙️ Bash', toolName: 'Bash', toolResult: 'mail list rc=0\n2 messages', ts: '2026-10-20T00:00:00Z',
   }], 20);
-  expect(lines.join('\n')).toContain('도구: Bash');
+  expect(lines.join('\n')).toContain('Tool: Bash');
   expect(lines.join('\n')).toContain('2 messages');
   expect(lines.every((line) => Bun.stringWidth(line) <= 20)).toBe(true);
 });
@@ -196,7 +202,7 @@ test('untrusted error text cannot move the status line', () => {
 
 test('live reply preview keeps first text visible, wraps and strips terminal controls', () => {
   const lines = streamReplyLines('첫 토큰과 이어지는 문장\n\x1b[2J둘째 줄', 12);
-  expect(lines[0].startsWith('엘라누스: ')).toBe(true);
+  expect(lines[0]).not.toContain('엘라누스');
   expect(lines[0]).toContain('첫');
   expect(lines.join('\n')).toContain('토큰');
   expect(lines.join('\n')).toContain('둘째 줄');
@@ -204,10 +210,10 @@ test('live reply preview keeps first text visible, wraps and strips terminal con
   expect(lines.every((line) => Bun.stringWidth(line) <= 12)).toBe(true);
 });
 
-test('chat wraps at word boundaries and indents continuation rows', () => {
+test('chat wraps at word boundaries; user rows indent continuations under the prompt mark', () => {
   const user = logViewLines([{ role: 'user', content: 'alpha beta gamma delta', ts: '2026-11-10T00:00:00Z' }], 14);
-  expect(user.slice(0, 2)).toEqual(['나: alpha beta', '  gamma delta']);
-  expect(streamReplyLines('foo bar baz quux', 14)).toEqual(['엘라누스: foo ', '  bar baz quux']);
+  expect(user.slice(0, 2)).toEqual(['> alpha beta ', '  gamma delta']);
+  expect(streamReplyLines('foo bar baz quux', 14)).toEqual(['foo bar baz ', 'quux']);
   const longWord = logViewLines([{ role: 'user', content: 'supercalifragilistic', ts: '2026-11-10T00:00:00Z' }], 10);
   expect(longWord.every((line) => Bun.stringWidth(line) <= 10)).toBe(true);
   expect(longWord.slice(1, -1).every((line) => line.startsWith('  '))).toBe(true);
@@ -228,9 +234,8 @@ test('SGR in the middle of a word keeps the whole word together', () => {
   try {
     const lines = logViewLines([{ role: 'assistant', content: 'ab**cd** ef', ts: '2026-11-10T00:00:00Z' }], 12);
     const plain = lines.map(line => line.replace(/\x1b\[[0-?]*[ -/]*m/g, ''));
-    expect(plain[0]).toBe('엘라누스: ');
-    expect(plain[1]).toBe('  abcd ef');
-    expect(lines[1]).toContain('\x1b[1m');
+    expect(plain[0]).toBe('abcd ef');
+    expect(lines[0]).toContain('\x1b[1m');
     expect(lines.every(line => Bun.stringWidth(line) <= 12)).toBe(true);
   } finally {
     chalk.level = previousLevel;
@@ -259,7 +264,7 @@ test('long tool output collapses to one summary line and expands on toggle', () 
   const collapsed = logViewLines([toolMessage], 40);
   // 30 wrapped lines + blank = 31 without folding; folding must shrink it to 2.
   expect(collapsed.length).toBe(2);
-  expect(collapsed[0]).toBe('▸ 도구 Bash · 30줄 (접힘)');
+  expect(collapsed[0]).toBe('▸ Tool Bash · 30 lines (folded)');
   expect(collapsed.join('\n')).not.toContain('line-12');
   // Toggle by the collapsed block's start line index expands it fully.
   const expanded = logViewLines([toolMessage], 40, new Set([0]));
@@ -269,14 +274,14 @@ test('long tool output collapses to one summary line and expands on toggle', () 
   const short: SerializedMessage = {
     role: 'tool', content: '⚙️ ls', toolName: 'ls', toolResult: 'a\nb\nc', ts: '2026-10-20T00:00:01Z',
   };
-  expect(logViewLines([short], 40).join('\n')).toContain('도구: ls');
+  expect(logViewLines([short], 40).join('\n')).toContain('Tool: ls');
   // A still-running tool block (no result yet) never folds.
   const running: SerializedMessage = {
     role: 'tool', content: '⚙️ Bash', toolName: 'Bash', ts: '2026-10-20T00:00:02Z',
   };
   const runningLines = logViewLines([running], 40);
-  expect(runningLines.join('\n')).toContain('도구: Bash');
-  expect(runningLines.join('\n')).not.toContain('접힘');
+  expect(runningLines.join('\n')).toContain('Tool: Bash');
+  expect(runningLines.join('\n')).not.toContain('folded');
   // Long assistant answers are out of scope for folding in this shard.
   const answer: SerializedMessage = {
     role: 'assistant', content: Array.from({ length: 30 }, (_, i) => `ans-${i}`).join('\n'), ts: '2026-10-20T00:00:03Z',
@@ -299,7 +304,7 @@ test('tool path strips ANSI and OSC control bytes in folded and expanded views',
   expect(collapsed.length).toBe(2);
   expect(collapsed.join('\n')).not.toContain('\x1b');
   expect(collapsed.join('\n')).not.toContain('0;evil');
-  expect(collapsed[0]).toBe('▸ 도구 Bash · 30줄 (접힘)');
+  expect(collapsed[0]).toBe('▸ Tool Bash · 30 lines (folded)');
   const expanded = logViewLines([toolMessage], 40, new Set([0]));
   expect(expanded.join('\n')).not.toContain('\x1b');
   expect(expanded.join('\n')).not.toContain('0;evil');
@@ -335,7 +340,7 @@ test('with two long tool blocks, scrolling up to the older one and pressing Ente
   const lines = logViewLines(messages, 40, expanded);
   const ranges = toolFoldBlockRanges(messages, 40, expanded);
   expect(ranges.map((r) => r.index)).toEqual([0, 11]);
-  expect(lines[ranges[0]!.start]).toBe('▸ 도구 Bash · 30줄 (접힘)');
+  expect(lines[ranges[0]!.start]).toBe('▸ Tool Bash · 30 lines (folded)');
   // Window of 5 rows at the very top: only the older block is on screen.
   expect(toggleVisibleToolFold(expanded, messages, 40, { start: 0, rows: 5 })).toBe(true);
   expect([...expanded]).toEqual([0]);
@@ -358,17 +363,17 @@ test('collapsed summary line stays within the terminal width for a long tool nam
     toolResult: Array.from({ length: 30 }, (_, i) => `l-${i}`).join('\n'), ts: '2026-10-20T00:00:00Z',
   };
   const lines = logViewLines([toolMessage], 20);
-  expect(lines[0]!.startsWith('▸ 도구 ')).toBe(true);
+  expect(lines[0]!.startsWith('▸ Tool ')).toBe(true);
   expect(lines.every((line) => Bun.stringWidth(line) <= 20)).toBe(true);
   // When the width allows it, the name is shortened and the line count + fold marker survive.
   const at30 = logViewLines([toolMessage], 30)[0]!;
   expect(Bun.stringWidth(at30)).toBeLessThanOrEqual(30);
-  expect(at30.startsWith('▸ 도구 mcp__')).toBe(true);
+  expect(at30.startsWith('▸ Tool m')).toBe(true);
   // N counts wrapped lines at this width (the long name itself wraps), so only its shape is fixed here.
-  expect(at30).toMatch(/ · \d+줄 \(접힘\)$/);
+  expect(at30).toMatch(/ · \d+ lines \(folded\)$/);
   expect(at30).toContain('…');
   // A name that fits is kept whole.
-  expect(logViewLines([{ ...toolMessage, toolName: 'Bash' }], 30)[0]).toBe('▸ 도구 Bash · 30줄 (접힘)');
+  expect(logViewLines([{ ...toolMessage, toolName: 'Bash' }], 34)[0]).toBe('▸ Tool Bash · 30 lines (folded)');
 });
 
 test('folding is judged by the tool output lines, not by a long tool name wrapping', () => {
@@ -376,11 +381,11 @@ test('folding is judged by the tool output lines, not by a long tool name wrappi
   const shortOutput: SerializedMessage = { role: 'tool', content: '⚙️ x', toolName: longName, toolResult: 'ok', ts: 't' };
   // The label line alone wraps past the limit at width 10, but the output is one line → never folds.
   expect(logViewLines([shortOutput], 10).length).toBeGreaterThan(TOOL_FOLD_LINE_LIMIT);
-  expect(logViewLines([shortOutput], 10).join('\n')).not.toContain('접힘');
+  expect(logViewLines([shortOutput], 10).join('\n')).not.toContain('folded');
   expect(toolFoldBlockStarts([shortOutput], 10)).toEqual([]);
   // N in the summary counts output lines.
   const out = Array.from({ length: 12 }, (_, i) => `o-${i}`).join('\n');
-  expect(logViewLines([{ ...shortOutput, toolResult: out }], 40)[0]).toMatch(/ · 12줄 \(접힘\)$/);
+  expect(logViewLines([{ ...shortOutput, toolResult: out }], 40)[0]).toMatch(/ · 12 lines \(folded\)$/);
 });
 
 // ── TUI-NEXT-TOOL-RESULT-RENDER (0.2.36 · 설치본 111c91b7 실측) — 도구 결과가 JSON 봉투 한 줄로 보이던 사고 ──
@@ -393,16 +398,16 @@ const READ_ENVELOPE = JSON.stringify({
 });
 const toolMsg = (toolName: string, toolResult: string): SerializedMessage => ({ role: 'tool', content: `⚙️ ${toolName}`, ts: '2026-10-22T00:00:00Z', toolName, toolResult });
 
-test('재현(10-22): Read 봉투는 접히면 «▸ 도구 Read · 20줄 (접힘)» 한 줄 — JSON·이스케이프 \\n 이 보이지 않는다', () => {
+test('재현(10-22): Read 봉투는 접히면 «▸ Tool Read · 20 lines (folded)» 한 줄 — JSON·이스케이프 \\n 이 보이지 않는다', () => {
   expect(READ_ENVELOPE.startsWith('{"output":"     1\\tfold-line-1\\n     2\\tfold-line-2\\n')).toBe(true);
   const lines = logViewLines([toolMsg('Read', READ_ENVELOPE)], 100);
-  expect(lines).toEqual(['▸ 도구 Read · 20줄 (접힘)', '']);
+  expect(lines).toEqual(['▸ Tool Read · 20 lines (folded)', '']);
   expect(toolFoldBlockStarts([toolMsg('Read', READ_ENVELOPE)], 100)).toEqual([0]);
 });
 
 test('재현(10-22): 펼친 Read 봉투는 파일 20줄이 제 줄로 · 머리줄에 «20줄 · 251B»', () => {
   const lines = logViewLines([toolMsg('Read', READ_ENVELOPE)], 100, new Set([0]));
-  expect(lines[0]).toBe('도구: Read · 20줄 · 251B');
+  expect(lines[0]).toBe('Tool: Read · 20 lines · 251B');
   expect(lines.slice(1, 21)).toEqual(Array.from({ length: 20 }, (_, i) => `  ${String(i + 1).padStart(6)} fold-line-${i + 1}`));
   const text = lines.join('\n');
   expect(text).not.toContain('{"output"');
@@ -413,9 +418,9 @@ test('재현(10-22): 펼친 Read 봉투는 파일 20줄이 제 줄로 · 머리�
 test('재현: RunShell/Bash 봉투는 output 줄을 보이고 exit 코드를 머리줄에 둔다', () => {
   const output = Array.from({ length: 30 }, (_, i) => `fold-line-${String(i).padStart(2, '0')}`).join('\n');
   const envelope = JSON.stringify({ output, exitCode: 0, stdout: output, stderr: '', ok: true });
-  expect(logViewLines([toolMsg('Bash', envelope)], 100)).toEqual(['▸ 도구 Bash · 30줄 (접힘)', '']);
+  expect(logViewLines([toolMsg('Bash', envelope)], 100)).toEqual(['▸ Tool Bash · 30 lines (folded)', '']);
   const open = logViewLines([toolMsg('RunShell', envelope)], 100, new Set([0]));
-  expect(open[0]).toBe('도구: RunShell · exit 0');
+  expect(open[0]).toBe('Tool: RunShell · exit 0');
   expect(open.slice(1, 31)).toEqual(output.split('\n').map((l) => `  ${l}`));
 });
 
@@ -423,17 +428,17 @@ test('Bash stdout 끝 개행은 빈 출력 줄로 세거나 그리지 않는다'
   const output = Array.from({ length: 30 }, (_, i) => `fold-line-${String(i).padStart(2, '0')}`).join('\n') + '\n';
   const envelope = JSON.stringify({ output, stdout: output, stderr: '', exitCode: 0 });
   const message = toolMsg('Bash', envelope);
-  expect(logViewLines([message], 100)[0]).toBe('▸ 도구 Bash · 30줄 (접힘)');
+  expect(logViewLines([message], 100)[0]).toBe('▸ Tool Bash · 30 lines (folded)');
   const open = logViewLines([message], 100, new Set([0]));
-  expect(open[0]).toBe('도구: Bash · exit 0');
+  expect(open[0]).toBe('Tool: Bash · exit 0');
   expect(open.slice(1, -1)).toEqual(output.trimEnd().split('\n').map((line) => `  ${line}`));
 });
 
 test('짧은 봉투는 접지 않고 펼친 그대로 · 오류 봉투는 error 문면 · 일반 문자열 결과는 옛 모양', () => {
   const short = JSON.stringify({ output: '     1\tonly', linesRead: 1, totalLines: 1, totalBytes: 5, truncated: false, kind: 'text' });
-  expect(logViewLines([toolMsg('Read', short)], 100)).toEqual(['도구: Read · 1줄 · 5B', '       1 only', '']);
-  expect(logViewLines([toolMsg('Read', JSON.stringify({ error: 'ENOENT: no such file' }))], 100)).toEqual(['도구: Read · 오류', '  ENOENT: no such file', '']);
-  expect(logViewLines([toolMsg('Echo', 'plain ok')], 100)).toEqual(['도구: Echo plain ok', '']);
+  expect(logViewLines([toolMsg('Read', short)], 100)).toEqual(['Tool: Read · 1 lines · 5B', '       1 only', '']);
+  expect(logViewLines([toolMsg('Read', JSON.stringify({ error: 'ENOENT: no such file' }))], 100)).toEqual(['Tool: Read · error', '  ENOENT: no such file', '']);
+  expect(logViewLines([toolMsg('Echo', 'plain ok')], 100)).toEqual(['Tool: Echo plain ok', '']);
 });
 
 test('잘린 봉투(truncateForPersist 2000자 · «… (+N chars)»)도 output 을 줄로 살리고 «잘림» 을 단다', () => {
@@ -443,7 +448,7 @@ test('잘린 봉투(truncateForPersist 2000자 · «… (+N chars)»)도 output 
   expect(parsed.truncated).toBe(true);
   expect(String((parsed.value as { output: string }).output).split('\n')[0]).toBe('     1\tline-1');
   const open = logViewLines([toolMsg('Read', persisted)], 100, new Set([0]));
-  expect(open[0]).toBe('도구: Read · 잘림');
+  expect(open[0]).toBe('Tool: Read · truncated');
   expect(open[1]).toBe('       1 line-1');
   expect(open.join('\n')).not.toContain('{"output"');
   // An escape cut in half at the boundary is dropped, not shown as a stray backslash.
@@ -455,9 +460,9 @@ test('explicit Next speaker labels preserve literal labels inside user and assis
     { role: 'user', content: '나: 라는 문구를 설명해줘', ts: '2026-11-15T00:00:00Z' },
     { role: 'assistant', content: '엘라누스: 는 본문입니다', ts: '2026-11-15T00:00:01Z' },
   ], 80);
-  expect(lines).toContain('나: 나: 라는 문구를 설명해줘');
-  expect(lines).toContain('엘라누스: 엘라누스: 는 본문입니다');
-  expect(streamReplyLines('응답 본문', 80)[0]).toBe('엘라누스: 응답 본문');
+  expect(lines).toContain('> 나: 라는 문구를 설명해줘');
+  expect(lines).toContain('엘라누스: 는 본문입니다');
+  expect(streamReplyLines('응답 본문', 80)[0]).toBe('응답 본문');
 });
 
 test('greeting speaker labels agree between live and saved replies at narrow terminal widths', () => {
@@ -471,8 +476,8 @@ test('greeting speaker labels agree between live and saved replies at narrow ter
     const lines = logViewLines(messages, columns);
     const savedReply = logViewLines([messages[1]!], columns).slice(0, -1);
     const liveReply = streamReplyLines(messages[1]!.content, columns);
-    expect(lines[0]).toBe('나: 하이');
-    expect(savedReply[0]).toStartWith('엘라누스: ');
+    expect(lines[0]).toBe('> 하이');
+    expect(savedReply[0]).not.toContain('엘라누스');
     // Saved rows reset terminal attributes at wraps; live preview avoids those resets.
     expect(liveReply.map(line => line.replace(/\x1b\[0m/g, ''))).toEqual(savedReply.map(line => line.replace(/\x1b\[0m/g, '')));
     expect(lines.every(line => Bun.stringWidth(line) <= columns)).toBe(true);
@@ -482,16 +487,82 @@ test('greeting speaker labels agree between live and saved replies at narrow ter
 });
 
 
-test('long live reply keeps a visible speaker while retaining the bounded newest tail', () => {
+test('long live reply retains the bounded newest tail without a speaker row', () => {
   // Source: #74912 requires preserving the existing streamReplyLines 80-row cap.
   const cap = 80;
   const content = Array.from({ length: cap + 1 }, (_, index) => `row-${index}`).join('\n');
   for (const columns of [12, 40, 100]) {
     const lines = streamReplyLines(content, columns);
     expect(lines).toHaveLength(cap);
-    expect(safeLogText(lines[0]!)).toBe('엘라누스:');
+    expect(lines.map(safeLogText).join('\n')).not.toContain('엘라누스');
     expect(safeLogText(lines.at(-1)!)).toContain(`row-${cap}`);
     expect(lines.map(safeLogText).join('\n')).not.toContain('row-0\n');
     expect(lines.every(line => Bun.stringWidth(line) <= columns)).toBe(true);
   }
+});
+
+test('READABILITY-PORT highlightLinks only styles URLs and keeps the visible text identical', async () => {
+    const { highlightLinks } = await import('./log-view.js');
+    const line = '링크 https://example.com/a?b=1 끝 (https://x.io/y) src/tui/entry.ts';
+    const visible = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
+    expect(visible(highlightLinks(line))).toBe(line);
+    expect(highlightLinks('경로 src/a.ts 만')).toBe('경로 src/a.ts 만');
+  });
+
+test('READABILITY-PORT assistant lines keep paragraph blank lines and one blank between messages', () => {
+    const lines = logViewLines([
+      { role: 'user', content: '질문' },
+      { role: 'assistant', content: '첫 단락\n\n둘째 https://example.com/a' },
+    ] as never, 70).map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''));
+    expect(lines).toEqual(['> 질문', '', '첫 단락', '', '둘째 https://example.com/a', '']);
+  });
+
+test('READABILITY-PORT breatheMarkdown spaces blocks once, never inside a fence, and is idempotent', async () => {
+  const { breatheMarkdown } = await import('./log-view.js');
+  const dense = '요약입니다\n## 제목\n- 하나\n- 둘\n설명\n```ts\n# not heading\n- not list\n```\n끝';
+  const out = breatheMarkdown(dense);
+  expect(out).toBe('요약입니다\n\n## 제목\n\n- 하나\n- 둘\n설명\n\n```ts\n# not heading\n- not list\n```\n끝');
+  expect(breatheMarkdown(out)).toBe(out);
+  expect(breatheMarkdown('a\n\n## b\n\n- c')).toBe('a\n\n## b\n\n- c');
+});
+
+test('READABILITY-PORT a reply with leading blank lines starts on its first text row', () => {
+  const lines = logViewLines([{ role: 'assistant', content: '\n\n  \n본문 시작' }] as never, 60)
+    .map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''));
+  expect(lines).toEqual(['본문 시작', '']);
+  expect(streamReplyLines('\n\n본문', 60).map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''))[0]).toBe('본문');
+});
+
+const plainRows = (rows: readonly string[]): string[] => rows.map((row) => row.replace(/\x1b\[[0-?]*[ -/]*m/g, ''));
+const assistantRows = (content: string, columns: number): string[] =>
+  plainRows(logViewLines([{ role: 'assistant', content, ts: '2026-11-17T00:00:00Z' }], columns)).slice(0, -1);
+
+test('MARKDOWN-BLOCK-SPACING list items wrap with a hanging indent under the item text, at any width', () => {
+  const bullet = '- ' + 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda';
+  const numbered = '12. ' + 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda';
+  for (const columns of [20, 36, 80]) {
+    const rows = assistantRows(`${bullet}\n${numbered}`, columns);
+    const numberedAt = rows.findIndex((row) => row.startsWith('12. '));
+    const bulletRows = rows.slice(0, numberedAt);
+    const numberedRows = rows.slice(numberedAt);
+    expect(bulletRows.slice(1).every((row) => row.startsWith('  ') && !row.startsWith('   '))).toBe(true);
+    expect(numberedRows.slice(1).every((row) => row.startsWith('    ') && !row.startsWith('     '))).toBe(true);
+    expect(rows.every((row) => Bun.stringWidth(row) <= columns)).toBe(true);
+  }
+  expect(hangingIndentFor('  - nested')).toBe(Bun.stringWidth('  - '));
+  expect(hangingIndentFor('plain paragraph')).toBe(0);
+});
+
+test('MARKDOWN-BLOCK-SPACING blocks are separated by exactly one blank row; line-internal enumerations are untouched', () => {
+  const rows = assistantRows('요약\n## 원인 정리\n본문 문장\n**수리 방향**\n- 하나 ① 먼저 ② 그다음\n\n\n\n마무리', 80);
+  expect(rows).toEqual(['요약', '', '원인 정리', '', '본문 문장', '', '수리 방향', '', '- 하나 ① 먼저 ② 그다음', '', '마무리']);
+  // The same text through the live preview agrees (modulo terminal-attribute resets at wraps).
+  expect(plainRows(streamReplyLines('요약\n## 원인 정리\n본문 문장', 80))).toEqual(['요약', '', '원인 정리', '', '본문 문장']);
+});
+
+test('MARKDOWN-BLOCK-SPACING breatheMarkdown collapses blank runs outside fences only and stays idempotent', () => {
+  const dense = '문장\n## 제목\n본문\n\n\n- 항목\n```\ncode\n\n\ncode2\n```\n끝';
+  const out = breatheMarkdown(dense);
+  expect(out).toBe('문장\n\n## 제목\n\n본문\n\n- 항목\n\n```\ncode\n\n\ncode2\n```\n끝');
+  expect(breatheMarkdown(out)).toBe(out);
 });

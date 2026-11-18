@@ -7,8 +7,11 @@
 // follow-up).
 
 import { describe, expect, test } from 'bun:test';
+import { debug } from '../../src/debug/log.js';
+import { createFakeFetchDevice } from '../../src/ux-sim/fake-fetch.js';
 import {
   buildPresetSuggestMessages,
+  createLocalLlmPresetRunner,
   parsePresetSuggestReply,
   suggestPresetForTextLLM,
   type LlmMessage,
@@ -169,5 +172,37 @@ describe('M2-4 v2 · suggestPresetForTextLLM', () => {
     );
     expect(r.preset).toBe('live_caption');
     expect(r.source).toBe('llm');
+  });
+});
+
+describe('createLocalLlmPresetRunner · network ledger', () => {
+  test('one attempt precedes the unchanged POST and reply; credentials stay out of the row', async () => {
+    const url = 'http://localhost:1234/v1/chat/completions';
+    const before = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').length;
+    /** Observation counter: no attempts yet at start of observation. */
+    const INITIAL_ATTEMPT_COUNT = 0;
+    let attemptsAtSend = INITIAL_ATTEMPT_COUNT;
+    const device = createFakeFetchDevice([{
+      url, method: 'POST',
+      response: () => {
+        attemptsAtSend = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').length - before;
+        return Response.json({ choices: [{ message: { content: '{"preset":"meeting"}' } }] });
+      },
+    }]);
+    try {
+      const runner = createLocalLlmPresetRunner({ model: 'local-preset', token: 'preset-secret' });
+      expect(await runner([{ role: 'user', content: 'hello' }])).toBe('{"preset":"meeting"}');
+      expect(device.calls()).toHaveLength(1);
+      expect(attemptsAtSend).toBe(1);
+      const call = device.calls()[0]!;
+      expect(call.headers.authorization).toBe('Bearer preset-secret');
+      expect(JSON.parse(call.body ?? '{}').model).toBe('local-preset');
+      const rows = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').slice(before);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.data).toMatchObject({ provider: 'local-llm', model: 'local-preset', host: 'localhost', requestedBy: 'model-tier.preset-suggest' });
+      expect(JSON.stringify(rows[0])).not.toContain('preset-secret');
+    } finally {
+      device.restore();
+    }
   });
 });

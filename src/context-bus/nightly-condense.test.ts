@@ -12,8 +12,14 @@ import type { CoordEvent } from './coord-events.js';
 import { runGraph, lastJsonObject } from '../graph-runner/runner.js';
 import { listLoops, setLoopEnabled } from '../loops/registry.js';
 import { registerLoopCommands } from '../loops/loop-cli.js';
-import { executeAssignment, runNightlyStage, summarize, summaryInstruction, type Assignment } from './nightly-condense.js';
-import { condenseContextWindowWithReport, type MemoryItem } from './long-term-memory.js';
+import { CONDENSE_INPUT_EMPTY, executeAssignment, nightlyDay, nightlyWindow, runNightlyStage, summarize, summaryInstruction, type Assignment } from './nightly-condense.js';
+import { condenseContextWindowWithReport, readCondenseEventsIn, type MemoryItem } from './long-term-memory.js';
+import { surfaceEventsDbPathIn } from '../domains/surface-events.js';
+import { memoryDbPathIn, mergeStrayMemoryDb, strayProdMemoryDbPath } from '../domains/memory-db-path.js';
+import { recordExternalEvent } from './external-events.js';
+import { setConfigTimeZoneSource } from '../time/time-zone.js';
+import { debug } from '../debug/log.js';
+import { homedir } from 'node:os';
 
 const root = resolve(import.meta.dir, '../..');
 const graph = join(root, 'graphs/context/nightly-condense.yaml');
@@ -28,13 +34,14 @@ test('installed nightly YAML wires each node to a real recipe and declares a hum
   };
   const recipes = parseYaml(readFileSync(join(root, 'graphs/context/recipes.yaml'), 'utf8')) as
     Record<string, { command: string; dry_run_command: string }>;
-  const stages = ['collect', 'condense', 'record', 'conflict-candidates'];
+  const stages = ['collect', 'condense', 'record', 'seat-retro', 'conflict-candidates'];
   expect(document.graph_id).toBe('nightly-condense');
   expect(document.entry_node).toBe(stages[0]);
   expect(document.loop.trigger.cron).toBe('30 3 * * *');
   for (const [index, stage] of stages.entries()) {
     expect(document.nodes[index]).toMatchObject({ node_id: stage, recipe: `cmd:${stage}` });
-    expect(recipes[stage]?.command).toContain(`nightly-condense.ts\" ${stage}`);
+    // seat-retro has its own node body (SEAT-RETRO-NIGHTLY-NODE); the other stages stay in nightly-condense.ts.
+    expect(recipes[stage]?.command).toContain(`${stage === 'seat-retro' ? 'seat-retro' : 'nightly-condense'}.ts\" ${stage}`);
     expect(recipes[stage]?.dry_run_command).toBe(recipes[stage]?.command);
     expect(document.edges[index]).toMatchObject({ from: stage, map: { ok: stages[index + 1] ?? 'done', fail: 'failed' } });
   }
@@ -73,6 +80,15 @@ async function runGraphInProcess(options: Parameters<typeof runGraph>[1] = {}) {
       ...current.deps,
       root: rootState,
       runBash: async (body, runOptions) => {
+        if (/seat-retro[.]ts["][ ]+seat-retro/.test(body) && runOptions.env?.ELANOUS_GRAPH_CONTEXT) {
+          // Shadow (default) against an empty temp seat-state: the node runs, writes no seat file.
+          const contextPath = runOptions.env.ELANOUS_GRAPH_CONTEXT;
+          const stageRoot = resolve(contextPath, '..', '..', '..', '..');
+          const { runSeatRetroStage } = await import('./seat-retro.js');
+          const output = await runSeatRetroStage(JSON.parse(readFileSync(contextPath, 'utf8')), stageRoot,
+            runOptions.env.ELANOUS_GRAPH_DRY_RUN === '1', { seatStateRoot: join(stageRoot, 'seat-state') });
+          return { stdout: JSON.stringify(output) + '\n', stderr: '', exitCode: 0 };
+        }
         const stage = body.match(/nightly-condense[.]ts["][ ]+(collect|condense|record|conflict-candidates)/)?.[1];
         const contextPath = runOptions.env?.ELANOUS_GRAPH_CONTEXT;
         if (!stage || !contextPath) return { stdout: '', stderr: 'unexpected nightly graph command', exitCode: 127 };
@@ -298,10 +314,10 @@ test('nightly graph dry-run condenses fake day into memory items and conflict ca
   const { state, input } = fixture();
   const result = await runGraphInProcess({ input, dryRun: true, deps: { root: state } });
   expect(result.status).toBe('done');
-  expect(result.path).toEqual(['collect', 'condense', 'record', 'conflict-candidates', 'done']);
+  expect(result.path).toEqual(['collect', 'condense', 'record', 'seat-retro', 'conflict-candidates', 'done']);
   expect(lastJsonObject(result.nodes[2]?.output)).toMatchObject({ items: 3, dryRun: true,
     memoryItems: [{ project: 'alpha', seat: 'TC' }, { project: 'alpha', seat: 'UX' }, { project: 'beta', seat: 'MK' }] });
-  expect(lastJsonObject(result.nodes[3]?.output)).toMatchObject({ published: 0, candidates: [
+  expect(lastJsonObject(result.nodes[4]?.output)).toMatchObject({ published: 0, candidates: [
     { project: 'alpha', topic: 'launch', owner: 'OP', status: 'candidate', sources: ['https://example.test/0', 'https://example.test/1'] },
   ] });
   expect(readdirSync(state)).toEqual(['graph-runs']);
@@ -311,7 +327,7 @@ test('live graph stores project/seat memories and conflict candidate file withou
   const { state, input } = fixture();
   const result = await runGraphInProcess({ input, deps: { root: state } });
   expect(result.status).toBe('done');
-  expect(lastJsonObject(result.nodes[3]?.output)).toMatchObject({ published: 0 });
+  expect(lastJsonObject(result.nodes[4]?.output)).toMatchObject({ published: 0 });
   const memory = (project: string, seat: string) => JSON.parse(readFileSync(join(state, 'context-memory', project, `${seat}.json`), 'utf8'));
   expect(memory('alpha', 'TC')).toMatchObject([{ project: 'alpha', seat: 'TC', summary: 'ready' }]);
   expect(memory('alpha', 'UX')).toMatchObject([{ project: 'alpha', seat: 'UX', summary: 'not ready' }]);
@@ -361,7 +377,7 @@ test('disabled nightly loop can be run once against isolated bus, channel and de
     };
     const result = await runGraphInProcess({ input: { day: input.day, summaries }, deps: { root: state } });
     expect(result.status).toBe('done');
-    expect(result.path).toEqual(['collect', 'condense', 'record', 'conflict-candidates', 'done']);
+    expect(result.path).toEqual(['collect', 'condense', 'record', 'seat-retro', 'conflict-candidates', 'done']);
     expect(loop()).toMatchObject({ enabled: false, jobs: [], nextRun: null });
     expect(lastJsonObject(result.nodes[0]?.output)).toMatchObject({ events: [
       { surface: 'coord:channel', refs: { seat: 'TC' } },
@@ -509,3 +525,186 @@ test('CLI loop list in the isolated instance shows nightly condensation disabled
     file: 'graphs/context/nightly-condense.yaml', enabled: false, trigger: { cron: '30 3 * * *' }, jobs: [],
   });
 }, 15_000);
+
+// ── NIGHTLY-CONDENSE-INPUT-PATH ─────────────────────────────────────────────
+
+const originalStateDir = process.env.ELANOUS_STATE_DIR;
+afterEach(() => {
+  if (originalStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = originalStateDir;
+});
+
+/** Points the ambient writer at `state`; the afterEach above restores the env even if the test times out. */
+function withStateDir<T>(state: string, run: () => T): T {
+  process.env.ELANOUS_STATE_DIR = state;
+  return run();
+}
+
+test('writer and nightly reader resolve the same surface-events DB under a custom state dir', () => {
+  const { state } = fixture();
+  withStateDir(state, () => {
+    // The writer is the real context hook path; the reader is the nightly collect resolver for the run's root.
+    recordExternalEvent({ origin: 'claude-code', kind: 'done', summary: 'alpha shipped', source: 'https://example.test/w', at: '2026-11-17T01:00:00.000Z' });
+    const resolved = surfaceEventsDbPathIn(state);
+    expect(resolved).toEqual({ path: join(state, 'surface_events.db') });
+    const read = readCondenseEventsIn(state, '2026-11-16T00:00:00.000Z');
+    expect(read.sources).toEqual([{ path: join(state, 'surface_events.db'), role: 'canonical', present: true, rows: 1 }]);
+    expect(read.events.map(event => event.summary)).toEqual(['alpha shipped']);
+  });
+});
+
+test('a prod-root stamp and an unstamped prod process resolve one memory file; the pre-fix stray file is named', () => {
+  const prod = join(homedir(), '.elanous');
+  expect(memoryDbPathIn(prod, 'surface_events.db')).toBe(memoryDbPathIn(undefined, 'surface_events.db'));
+  expect(memoryDbPathIn(`${prod}/`, 'surface_events.db')).toBe(join(prod, 'memory', 'surface_events.db'));
+  expect(strayProdMemoryDbPath(prod, 'surface_events.db')).toBe(join(prod, 'surface_events.db'));
+  expect(strayProdMemoryDbPath(undefined, 'surface_events.db')).toBe(join(prod, 'surface_events.db'));
+  const { state } = fixture();
+  expect(memoryDbPathIn(state, 'surface_events.db')).toBe(join(state, 'surface_events.db'));
+  expect(strayProdMemoryDbPath(state, 'surface_events.db')).toBeUndefined();
+});
+
+test('an empty input day is a loud non-success with the resolved path, window and an error event', async () => {
+  const { state, input } = fixture();
+  const logs: Array<{ category: string; event: string; data: unknown; level?: string }> = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown, opts?: { level?: string }) => {
+    logs.push({ category, event, data, level: opts?.level });
+  }) as typeof debug.log);
+  try {
+    const result = await withStateDir(state, () =>
+      runNightlyStage('collect', { input: { day: input.day }, outputs: {} }, state, false));
+    expect(result).toMatchObject({ outcome: 'fail', reason: CONDENSE_INPUT_EMPTY, code: CONDENSE_INPUT_EMPTY, day: input.day,
+      window: nightlyWindow(input.day), eventRows: 0, decisionRows: 0, source: 'surface-events',
+      sources: [{ path: join(state, 'surface_events.db'), role: 'canonical' }] });
+    expect(logs.find(entry => entry.category === 'context.condense' && entry.event === 'input-empty'))
+      .toMatchObject({ level: 'error', data: { code: CONDENSE_INPUT_EMPTY, root: state, window: nightlyWindow(input.day) } });
+    // Nothing was reserved: an empty day leaves no latest-day marker that would block a later backfill.
+    expect(existsSync(join(state, 'context-memory', 'latest-day'))).toBe(false);
+  } finally { spy.mockRestore(); }
+  const graphRun = await withStateDir(state, () => runGraphInProcess({ input: { day: input.day, summaries: {} }, deps: { root: state } }));
+  expect(graphRun.status).toBe('failed');
+  expect(graphRun.path).toEqual(['collect', 'failed']);
+  expect(lastJsonObject(graphRun.nodes[0]?.output)).toMatchObject({ outcome: 'fail', reason: CONDENSE_INPUT_EMPTY });
+// 출처: 같은 파일의 runGraphInProcess 시험들과 같은 부하 호스트 여유(90s)
+}, 90_000);
+
+test('the nightly day and window follow the configured local zone around midnight, not UTC', async () => {
+  const restoreZone = setConfigTimeZoneSource(() => 'Asia/Seoul');
+  try {
+    // Fake clock: the 03:30 KST run on 11-18 is still 11-17 in UTC.
+    const now = new Date('2026-11-17T18:30:00.000Z');
+    expect(nightlyDay(now)).toBe('2026-11-17');
+    expect(nightlyDay(now, 'UTC')).toBe('2026-11-16');
+    expect(nightlyWindow('2026-11-17')).toEqual({ since: '2026-11-16T15:00:00.000Z', until: '2026-11-17T15:00:00.000Z', timeZone: 'Asia/Seoul' });
+    expect(nightlyWindow('2026-03-08', 'America/Los_Angeles')).toEqual({ since: '2026-03-08T08:00:00.000Z', until: '2026-03-09T07:00:00.000Z', timeZone: 'America/Los_Angeles' });
+    // DST starting at midnight: 00:00 does not exist, the day starts at 01:00 (-02) = 03:00Z, not 02:00Z (23:00 the day before).
+    expect(nightlyWindow('2018-11-04', 'America/Sao_Paulo')).toEqual({ since: '2018-11-04T03:00:00.000Z', until: '2018-11-05T02:00:00.000Z', timeZone: 'America/Sao_Paulo' });
+    const { state, input } = fixture();
+    const at = (iso: string, n: number): CoordEvent => ({ ...input.events[0]!, id: `kst-${n}`, at: iso });
+    const events = [
+      at('2026-11-16T14:59:59.000Z', 0), // 23:59:59 KST 11-16 — the day before
+      at('2026-11-16T15:30:00.000Z', 1), // 00:30 KST 11-17 — a UTC-day reader drops this
+      at('2026-11-17T14:00:00.000Z', 2), // 23:00 KST 11-17
+      at('2026-11-17T15:30:00.000Z', 3), // 00:30 KST 11-18 — the run's own day
+    ];
+    const collected = await runNightlyStage('collect', { input: { events, decisions: [] }, outputs: {} }, state, false, now);
+    expect(collected).toMatchObject({ outcome: 'ok', day: '2026-11-17', window: nightlyWindow('2026-11-17'),
+      inputRead: { source: 'injected', eventRows: 2 } });
+  } finally { restoreZone(); }
+});
+
+test('restart and rerun reuse the collected local window and stay idempotent', async () => {
+  const { state, input } = fixture();
+  const restoreSeoul = setConfigTimeZoneSource(() => 'Asia/Seoul');
+  let collected: Record<string, unknown>;
+  try {
+    collected = await runNightlyStage('collect', { input: { ...input, decisions: [] }, outputs: {} }, state, false);
+    // A rerun of collect (e.g. after a crash) gives the same day and window.
+    expect(await runNightlyStage('collect', { input: { ...input, decisions: [] }, outputs: {} }, state, false))
+      .toMatchObject({ day: collected.day, window: collected.window });
+  } finally { restoreSeoul(); }
+  // A restarted stage process resolves a different zone; the persisted collect window still decides the day.
+  const restoreOther = setConfigTimeZoneSource(() => 'Pacific/Kiritimati');
+  try {
+    const outputs = { collect: collected as { day: string; window: ReturnType<typeof nightlyWindow>; events: CoordEvent[]; decisions: [] } };
+    const condensed = await runNightlyStage('condense', { input, outputs }, state, false, new Date(),
+      source => summarize(source, input.summaries, 'sleep-review'));
+    expect((condensed.items as MemoryItem[]).map(item => item.source).sort())
+      .toEqual(input.events.map(event => event.refs.url!).sort());
+  } finally { restoreOther(); }
+  // Rerunning the whole day after it completed is allowed and does not duplicate memory.
+  const first = await runGraphInProcess({ input, deps: { root: state } });
+  const second = await runGraphInProcess({ input, deps: { root: state } });
+  expect([first.status, second.status]).toEqual(['done', 'done']);
+  expect(JSON.parse(readFileSync(join(state, 'context-memory', 'alpha', 'TC.json'), 'utf8')).map((item: MemoryItem) => item.source))
+    .toEqual(['https://example.test/0']);
+// 출처: 같은 파일 «live graph … two live runs» 시험의 120s(두 번의 라이브 런이 task worker 를 띄운다)
+}, 120_000);
+
+test('canonical and stray files: the reader unions without duplicate ids and the merge folds the stray in once', () => {
+  const { state } = fixture();
+  const canonicalPath = join(state, 'memory', 'surface_events.db');
+  const strayPath = join(state, 'surface_events.db');
+  const refs = (seat: string, n: number) => JSON.stringify({ seat, url: `https://example.test/s${n}`, recipients: [], all: false, kind: '보고', slot: null, deadline: null });
+  const day = '2026-11-16';
+  // Stray: the pre-fix prod-stamped writer's file, written through the real writer schema.
+  const stray = openSurfaceEventsDb(strayPath);
+  const strayOnly = recordEvent(stray, { surface: 'context:external', direction: 'outbound', kind: '보고', text: 'stray only', summary: 'stray only', ts: `${day}T01:00:00.000Z`, refs: refs('UX', 1) });
+  const shared = recordEvent(stray, { surface: 'coord:channel', direction: 'outbound', kind: '보고', text: 'both files', summary: 'both files', ts: `${day}T02:00:00.000Z`, refs: refs('TC', 2) });
+  stray.close();
+  // Canonical: the same writer schema, sharing one id with the stray file.
+  const canonical = openSurfaceEventsDb(canonicalPath);
+  canonical.run(`INSERT INTO events(id, ts, surface, direction, kind, text, summary, refs) VALUES (?, ?, 'coord:channel', 'outbound', '보고', 'both files', 'both files', ?)`,
+    [shared, `${day}T02:00:00.000Z`, refs('TC', 2)]);
+  canonical.run(`INSERT INTO events(id, ts, surface, direction, kind, text, summary, refs) VALUES ('canonical-only', ?, 'context:session', 'outbound', '보고', 'canonical only', 'canonical only', ?)`,
+    [`${day}T03:00:00.000Z`, refs('MK', 3)]);
+
+  const read = readCondenseEventsIn(state, `${day}T00:00:00.000Z`, { path: canonicalPath, stray: strayPath });
+  expect(read.sources.map(source => [source.role, source.rows])).toEqual([['canonical', 2], ['stray', 2]]);
+  expect(read.events.map(event => event.id)).toEqual([strayOnly, shared, 'canonical-only']);
+
+  const files = { stray: strayPath, canonical: canonicalPath };
+  try {
+    expect(mergeStrayMemoryDb(canonical, 'surface_events.db', ['events', 'events_fts'], files))
+      .toEqual({ stray: strayPath, merged: { events: 1, events_fts: 2 } });
+    expect((canonical.prepare('SELECT id FROM events ORDER BY ts').all() as Array<{ id: string }>).map(row => row.id))
+      .toEqual([strayOnly, shared, 'canonical-only']);
+    expect(existsSync(`${canonicalPath}.stray-merged`)).toBe(true);
+    // Unchanged stray: skipped by the marker. A forced re-merge (marker gone) duplicates nothing.
+    expect(mergeStrayMemoryDb(canonical, 'surface_events.db', ['events', 'events_fts'], files))
+      .toEqual({ stray: strayPath, merged: {}, skipped: 'unchanged' });
+    rmSync(`${canonicalPath}.stray-merged`);
+    expect(mergeStrayMemoryDb(canonical, 'surface_events.db', ['events', 'events_fts'], files))
+      .toEqual({ stray: strayPath, merged: { events: 0, events_fts: 0 } });
+  } finally { canonical.close(); }
+});
+
+test('a day with decisions but no events is not CONDENSE_INPUT_EMPTY and its decisions are condensed', async () => {
+  const { state, input } = fixture();
+  const restoreZone = setConfigTimeZoneSource(() => 'Asia/Seoul');
+  try {
+    const ledger = new DecisionLedger({ stateDir: state, now: () => new Date(`${input.day}T09:03:00.000Z`),
+      resolveVersion: () => ({ development: '0.2.21', release: '0.2.21' }) as never });
+    const decision = ledger.raise({ title: 'beta launch route', category: 'scope',
+      scqa: { s: 'beta launch', c: 'choose route' },
+      options: [{ key: 'a', label: 'go', consequence: 'ship' }, { key: 'b', label: 'wait', consequence: 'hold' }],
+      recommendation: { skipped: true, reason: 'requires OP' }, raisedBy: { agent: 'OP', track: 'OP' },
+    });
+    // No events anywhere: the run's universe has no surface-events file at all.
+    const collected = await runNightlyStage('collect', { input: { day: input.day }, outputs: {} }, state, false);
+    expect(collected).toMatchObject({ outcome: 'ok', day: input.day,
+      inputRead: { source: 'surface-events', eventRows: 0, decisionRows: 1 } });
+    expect(collected.reason).toBeUndefined();
+    const outputs = { collect: collected as { day: string; window: ReturnType<typeof nightlyWindow>; events: CoordEvent[]; decisions: never[] } };
+    const condensed = await runNightlyStage('condense', { input: { day: input.day }, outputs }, state, false, new Date(),
+      async () => ({ project: 'beta', topic: 'launch', summary: 'route selected', promote: true }));
+    expect((condensed.items as MemoryItem[]).map(item => [item.source, item.summary]))
+      .toEqual([[`elanous://decisions/${decision.id}`, 'route selected']]);
+  } finally { restoreZone(); }
+});
+
+test('no events and no decisions in the window is CONDENSE_INPUT_EMPTY with both counts zero', async () => {
+  const { state, input } = fixture();
+  const result = await runNightlyStage('collect', { input: { day: input.day, events: [], decisions: [] }, outputs: {} }, state, false);
+  expect(result).toMatchObject({ outcome: 'fail', reason: CONDENSE_INPUT_EMPTY, eventRows: 0, decisionRows: 0, source: 'injected' });
+});

@@ -27,6 +27,11 @@ function inferContextWindow(modelId: string | undefined): number {
   return 32_000;
 }
 
+/** The window shouldAutoCompact measures against — catalog first, then the family table. */
+export function resolveAutoCompactWindow(modelId: string | undefined): number {
+  return resolveModelContextWindow(modelId) ?? inferContextWindow(modelId);
+}
+
 export function shouldAutoCompact(
   messages: MessageLike[],
   modelId: string | undefined,

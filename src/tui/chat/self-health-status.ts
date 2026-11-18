@@ -70,15 +70,15 @@ function classifyError(record: Pick<LogRecord, 'category' | 'event' | 'data' | '
     const status = typeof data.status === 'number' ? data.status : null;
     if (status === null || (status < 400 && status !== 0)) return null;
     const provider = typeof data.provider === 'string' ? data.provider : 'LLM';
-    return status === 0 ? `${provider} 연결 오류` : `${provider} HTTP ${status}`;
+    return status === 0 ? `${provider} connection error` : `${provider} HTTP ${status}`;
   }
   if (record.category === 'llm.response.status' && /^codex (response\.failed|error)$/.test(record.event)) return `Codex ${record.event}`;
-  if (record.category === 'llm.router' && record.event === 'tool-loop.max-turns.no-final-synthesis') return '도구 예산 소진';
-  if (record.category === 'llm.router' && record.event === 'tool-loop.synthesis-ignored.hard-stop') return '최종 합성 중단';
+  if (record.category === 'llm.router' && record.event === 'tool-loop.max-turns.no-final-synthesis') return 'tool budget exhausted';
+  if (record.category === 'llm.router' && record.event === 'tool-loop.synthesis-ignored.hard-stop') return 'final synthesis halted';
   if ((record.category === 'tools.search' && record.event === 'broad-search-blocked')
-    || (record.category === 'session-runtime.search' && /blocked$/.test(record.event))) return '탐색 가드 거부';
-  if (record.category === 'tui.event-loop' && record.event === 'stall' && typeof data.lagMs === 'number' && data.lagMs > 1_000) return `이벤트 루프 정지 ${Math.round(data.lagMs)}ms`;
-  if (record.level === 'error' || record.level === 'critical') return `기록된 오류 (${record.category})`;
+    || (record.category === 'session-runtime.search' && /blocked$/.test(record.event))) return 'search guard rejected';
+  if (record.category === 'tui.event-loop' && record.event === 'stall' && typeof data.lagMs === 'number' && data.lagMs > 1_000) return `event loop stalled ${Math.round(data.lagMs)}ms`;
+  if (record.level === 'error' || record.level === 'critical') return `logged error (${record.category})`;
   return null;
 }
 
@@ -88,9 +88,9 @@ function creditSource(record: Pick<LogRecord, 'category' | 'event' | 'data' | 'l
   const cost = object(data.cost);
   if (data.billing !== 'credit' && cost.kind !== 'credit') return null;
   const provider = typeof data.billingProvider === 'string' ? data.billingProvider
-    : typeof data.provider === 'string' ? data.provider : '제공자 모름';
-  const site = typeof data.site === 'string' ? data.site : '경로 모름';
-  const model = typeof data.model === 'string' ? data.model : '모델 모름';
+    : typeof data.provider === 'string' ? data.provider : 'provider unknown';
+  const site = typeof data.site === 'string' ? data.site : 'site unknown';
+  const model = typeof data.model === 'string' ? data.model : 'model unknown';
   return `${provider}/${model} · ${site} · llm.usage billing=credit`;
 }
 
@@ -98,19 +98,19 @@ function immutableSnapshot(input: Omit<NextTuiSelfHealthSnapshot, 'line'>): Next
   const build = input.runningSha
     ? input.source === 'installed'
       ? input.installedSha ? input.runningSha === input.installedSha
-        ? `실행 설치본 ${shortSha(input.runningSha)} · 최신`
-        : `실행 설치본 ${shortSha(input.runningSha)} · 설치본 ${shortSha(input.installedSha)} · 재기동 필요`
-        : `실행 설치본 ${shortSha(input.runningSha)} · 현재 설치본 모름`
+        ? `running installed ${shortSha(input.runningSha)} · up to date`
+        : `running installed ${shortSha(input.runningSha)} · installed ${shortSha(input.installedSha)} · restart required`
+        : `running installed ${shortSha(input.runningSha)} · current installed unknown`
       : input.source === 'checkout'
-        ? `실행 체크아웃 ${shortSha(input.runningSha)} · 설치본 ${shortSha(input.installedSha) ?? '대조 모름'}`
-        : `실행 판 ${shortSha(input.runningSha)} · 출처 모름`
-    : '실행 판 모름';
+        ? `running checkout ${shortSha(input.runningSha)} · installed ${shortSha(input.installedSha) ?? 'unknown'}`
+        : `running build ${shortSha(input.runningSha)} · source unknown`
+    : 'running build unknown';
   const errors = input.errorCount === null
-    ? '최근 30분 오류 모름(로그 비활성)'
-    : input.errorCount === 0 ? '최근 30분 오류 없음'
-      : `최근 30분 오류 ${input.errorCount}회 · 대표 ${input.representativeError ?? '문면 모름'}`;
-  const credit = input.creditKnown ? `크레딧 ${input.creditSource ?? '최근 30분 사용 없음'}` : '크레딧 출처 모름(로그 비활성)';
-  const line = `[자기 건강 · Next · ${input.sessionId.slice(0, 8)}] ${build} · ${errors} · ${credit}`;
+    ? 'last 30m errors unknown (logging off)'
+    : input.errorCount === 0 ? 'last 30m no errors'
+      : `last 30m errors ${input.errorCount} · representative ${input.representativeError ?? 'text unknown'}`;
+  const credit = input.creditKnown ? `credit ${input.creditSource ?? 'no usage in last 30m'}` : 'credit source unknown (logging off)';
+  const line = `[self health · Next · ${input.sessionId.slice(0, 8)}] ${build} · ${errors} · ${credit}`;
   return Object.freeze({ ...input, line });
 }
 

@@ -18,8 +18,8 @@ test('workspace terminal release uncertainty tells the operator to inspect befor
     setStatus: (message: string) => { status = message; },
   } as unknown as SidetabRouteHost;
   await runNextTuiBranchRoute('/side terminal continue', host);
-  expect(status).toContain('결과 미확인');
-  expect(status).toContain('확인하기 전 재시도 금지');
+  expect(status).toContain('send unconfirmed');
+  expect(status).toContain('do not retry before checking target screen and history');
 });
 
 test('sidetab branch handles state transitions, selection and help through host operations', async () => {
@@ -41,6 +41,8 @@ test('sidetab branch handles state transitions, selection and help through host 
     spawnSideAgent: async (agent) => { calls.push(`spawn:${agent}`); return `fake-${agent}`; },
     sendSelectedAgent: async (message) => { calls.push(`send:${message}`); return true; },
     readSelectedAgent: async () => { calls.push('read'); return 'fake screen'; },
+    sendSelectedAgentKeys: async (names) => { calls.push(`keys:${names.join(',')}`); return true; },
+    selectedAgentStatus: async () => { calls.push('status'); return 'idle'; },
     bindWorkspaceSelected: async () => { calls.push('bind'); return true; },
     submitWorkspace: async (mode, text) => { calls.push(`${mode}:${text}`); return { sent: true, reply: mode === 'sidechat' ? 'reply' : undefined }; },
     broadcastWorkspace: async (ids, text) => { calls.push(`broadcast:${ids.join(',')}:${text}`); return { sent: ids.length, total: ids.length, outcome: 'complete' }; },
@@ -62,7 +64,7 @@ test('sidetab branch handles state transitions, selection and help through host 
   await runNextTuiBranchRoute('/side broadcast a,b -- go', host);
   expect(calls).toContain('kill');
   expect(calls).toContain('new');
-  expect(calls).toContain('help:3');
+  expect(calls).toContain('help:4'); // /side keys has its own line (HERDR-REPLACE-C1)
   expect(calls).toContain('bind');
   expect(calls).toContain('sidechat:question');
   expect(calls).toContain('terminal:go');

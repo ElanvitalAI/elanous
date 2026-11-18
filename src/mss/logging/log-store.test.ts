@@ -617,6 +617,11 @@ describe('StoreSink — 종료 플러시', () => {
       '',
       'const preexisting = process.listeners(signal).slice();',
       'const before = preexisting.length;',
+      "if (mode === 'once-before') {",
+      '  process.once(signal, () => {',
+      "    writeFileSync(markerPath, 'call', { flag: 'a' });",
+      '  });',
+      '}',
       'const store = new LogStore(dbPath);',
       'const sink = new StoreSink(store, \'cli\', {',
       '  flushIntervalMs: 60_000,',
@@ -653,7 +658,7 @@ describe('StoreSink — 종료 플러시', () => {
   async function spawnStoreChild(opts: {
     dir: string;
     signal: 'SIGINT' | 'SIGTERM';
-    mode: 'other' | 'none' | 'double' | 'exit';
+    mode: 'other' | 'none' | 'double' | 'exit' | 'once-before';
     lastEvent?: string;
   }): Promise<{
     proc: ReturnType<typeof Bun.spawn>;
@@ -935,6 +940,34 @@ describe('StoreSink — 종료 플러시', () => {
         await Bun.sleep(300);
         expect(readFileSync(markerPath, 'utf8')).toBe('call');
         expect(ledgerHasEvent(dbPath, 'sigint-last')).toBe(true);
+      } finally {
+        proc.kill('SIGKILL');
+        await proc.exited;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  it('sink 보다 먼저 단 process.once 리스너가 있으면 SIGINT 를 다시 올리지 않는다(그 몸이 처리)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-storesink-once-'));
+    try {
+      const { proc, dbPath, markerPath, readyPath } = await spawnStoreChild({
+        dir,
+        signal: 'SIGINT',
+        mode: 'once-before',
+        lastEvent: 'sigint-once',
+      });
+      try {
+        await pollUntil(() => existsSync(readyPath), 5_000, 'child ready');
+        proc.kill('SIGINT');
+        await pollUntil(() => existsSync(markerPath), 5_000, 'once-handler marker');
+        await pollUntil(() => ledgerHasEvent(dbPath, 'sigint-once'), 5_000, 'flushed last log');
+        await Bun.sleep(300);
+        expect(readFileSync(markerPath, 'utf8')).toBe('call');
+        // 신호로 죽으면 exitCode 는 null 이고 signalCode 가 선다 — 둘 다 비어야 «살아 있음».
+        expect(proc.signalCode).toBeNull();
+        expect(proc.exitCode).toBeNull();
       } finally {
         proc.kill('SIGKILL');
         await proc.exited;

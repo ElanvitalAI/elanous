@@ -1,6 +1,6 @@
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { describe, expect, test } from 'bun:test';
-import { streamLLMWithTools, type LLMProvider } from '../../llm.js';
+import { streamLLMWithTools, type LLMProvider, type LLMStreamEvent } from '../../llm.js';
 import {
   answerNextSidetabCall, createNextSidetabHostHandler, registerNextSidetabReplTool,
   isNextSidetabCall, nextSidetabToolSpec, type NextSidetabCall,
@@ -47,7 +47,7 @@ describe('Next TUI side-tab NL tool', () => {
       kill: (row) => { killed.push(row.id); return { ok: true }; },
     });
     expect(await handler({ action: 'new', character: 'codex' as never })).toHaveProperty('error');
-    expect(await handler({ action: 'takeover' as never, target: 'shell' })).toEqual({ error: '지원하지 않는 사이드탭 동작입니다' });
+    expect(await handler({ action: 'takeover' as never, target: 'shell' })).toEqual({ error: 'Unsupported sidetab action' });
     expect(await handler({ action: 'new', character: 'elanous' })).toEqual({ character: 'elanous' });
     expect(await handler({ action: 'kill', target: 'pty:shell' })).toMatchObject({ needsConfirmation: true });
     expect(killed).toEqual([]);
@@ -65,7 +65,7 @@ describe('Next TUI side-tab NL tool', () => {
       kill: () => { killCalls += 1; return { ok: true }; },
     });
     expect(await handler({ action: 'kill', target: 'tui:current', confirm: true })).toEqual({
-      error: '현재 TUI 세션은 사이드탭에서 종료할 수 없습니다',
+      error: 'Cannot stop this TUI session from the sidetab',
     });
     expect(killCalls).toBe(0);
   });
@@ -99,9 +99,9 @@ describe('Next TUI side-tab NL tool', () => {
     const provider: LLMProvider = {
       name: 'local-test', defaultModel: 'local-test', available: () => true,
       async *chat() { yield 'unused'; },
-      async *streamChat(_messages, options) {
+      async *streamChat(_messages, options): AsyncGenerator<LLMStreamEvent, void, unknown> {
         sawToolSchema ||= (options?.tools ?? []).some(({ name }) => name === nextSidetabToolSpec.name);
-        if (turn++ === 0) yield { type: 'tool_call', id: 'provider-call-1', name: nextSidetabToolSpec.name, args: snapshot.request };
+        if (turn++ === 0) yield { type: 'tool_call', id: 'provider-call-1', name: nextSidetabToolSpec.name, args: { ...snapshot.request } };
         else yield { type: 'text', delta: 'switched' };
       },
     };

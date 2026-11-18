@@ -1,0 +1,9 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: bookforge-app-docs-pdf, version: 1.0.0, layer: flow, purpose: "앱 설계 원문 보존 → Bookforge 재조판 → PDF 품질 게이트" }
+entry: reflow
+nodes:
+  - { id: reflow, type: capability, requires: bookforge.app-docs-pdf@1 }
+edges:
+  - { from: reflow, on: outcome, map: { done: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.unit, bookforge.output] }

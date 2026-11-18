@@ -4,6 +4,12 @@
 #   bash scripts/backup/elanous-backup.sh --dry-run          ⛔ 처음 쓰는 창은 반드시 이것부터
 #   bash scripts/backup/elanous-backup.sh
 #   bash scripts/backup/elanous-backup.sh --install          ⭐ ~/.elanous/bin/ 에 «심는다»(크론이 이걸 부른다)
+#   bash scripts/backup/elanous-backup.sh --data-only [--dry-run]   🔒 데이터만 — 자격은 찾지도·읽지도·묶지도 않는다
+#
+# 🔒 `--data-only` (0.3.28 BACKUP-DATA-ONLY · RES79564/OP79578): 자격 이전 권한이 없는 호스트 이사용.
+#    자격 탐색·stat·tar·age·S3 단계를 «통째로» 건너뛰고, 회차에 「자격 = 권한 범위로 제외(omitted)」를 남긴다.
+#    ⛔ 「자격 백업 성공」으로도 「자격이 없었다」로도 쓰지 않는다. 자격이 실린 crontab 은 여전히 «안 담고» 실패로 센다.
+#    ⛔ 모르는 플래그는 거부한다 — 철자가 틀린 `--data-only` 가 조용히 «전체(자격 포함)»로 도는 것을 막는다.
 #
 # ⛔⭐ **왜 「심는」 단계가 있나** — 크론을 «어느 저장소 트리»에 묶으면 그 트리가 pull 하기 «전»까지
 #    백업이 «조용히 안 돈다». 이 저장소가 반복해 겪는 「설치했는데 안 돈다」가 바로 그것이다.
@@ -131,21 +137,43 @@ BUCKET="${ELANOUS_BACKUP_BUCKET:-gs://monad-backup-pearlplaygroud}"
 SECRETS_BUCKET="${ELANOUS_BACKUP_SECRETS_BUCKET:-s3://elanvital-ops-backup}"
 RECIPIENT_FILE="${ELANOUS_BACKUP_RECIPIENT_FILE:-$HOME/.elanous/backup-key/recipient.txt}"
 DRY=0
+DATA_ONLY=0
 # 🏷️ 「무인(cron)인가」 — ⛔ 안 주면 「미상」. 「손」으로 «가정하지 않는다».
 BACKUP_SOURCE=unknown
 _prev=""
 for a in "$@"; do
   case "$_prev" in
-    --source) case "$a" in cron|manual) BACKUP_SOURCE="$a" ;; *) BACKUP_SOURCE=unknown ;; esac ;;
+    --source|--bucket)
+      # ⛔ 값 자리에 «--» 로 시작하는 값이 오면 플래그를 값으로 삼킨 것이다 — 예: «--bucket --data-only» 가
+      #    --data-only 를 버킷 이름으로 먹어 DATA_ONLY=0(자격 백업 진입)이 되는 것을 막는다. 순서와 무관하게 거부.
+      case "$a" in --*) echo "⛔ $_prev 의 값 자리에 플래그 모양($a)이 왔다 — 아무것도 담지 않고 멈춘다" >&2; exit 2 ;; esac ;;
+  esac
+  case "$_prev" in
+    --source) case "$a" in cron|manual) BACKUP_SOURCE="$a" ;; *) BACKUP_SOURCE=unknown ;; esac; _prev=""; continue ;;
+    --bucket) BUCKET="$a"; _prev=""; continue ;;
   esac
   case "$a" in
     --dry-run) DRY=1 ;;
-    --bucket) shift; BUCKET="${1:-$BUCKET}" ;;
+    --data-only) DATA_ONLY=1 ;;
+    --bucket|--source) ;;
     gs://*) BUCKET="$a" ;;
     s3://*) SECRETS_BUCKET="$a" ;;
+    *) echo "⛔ 모르는 인자: $a — 아무것도 담지 않고 멈춘다 (허용: --dry-run --data-only --install --source cron|manual --bucket gs://… gs://… s3://…)" >&2; exit 2 ;;
   esac
   _prev="$a"
 done
+# ⛔ 값을 받는 옵션이 «마지막» 인자로 끝나면 값이 없다 — 루프 안에서는 그 자리를 못 보니 여기서 거부한다.
+case "$_prev" in
+  --source|--bucket) echo "⛔ $_prev 뒤에 값이 없다 — 아무것도 담지 않고 멈춘다" >&2; exit 2 ;;
+esac
+if [ "$DATA_ONLY" = "1" ]; then
+  # 🔒 제외 목록을 «먼저» 말한다 — 이름만, 경로를 stat 하지도 열지도 않는다.
+  echo "═══ 🔒 데이터만(--data-only) — 자격은 찾지도·읽지도·묶지도 않는다 ═══"
+  echo "  제외: ~/.elanous/{auth.json,acp-token,config.json,export-redactions.tsv,ssh-hosts.json} · ~/.codex*/{auth.json,config.toml}"
+  echo "  제외: ~/.grok/* · ~/.config/gh/hosts.yml · ~/.aws/* · ~/.ssh · ~/.config/gcloud/* · ~/.npmrc · ~/.cargo/credentials.toml"
+  echo "  제외: Higgsfield/Blender 자격 · ~/.aside/accounts.json · LaunchAgents com.elanous.*.plist · API 키 캐시(~/.cache/<key>) · 자격 실린 crontab 원문"
+  echo "  담음: DB 스냅샷 · 원장 · 체크포인트 · botlab · sessions · conatus · mirrors · 트리 원장/태스크 · (자격 없는) crontab"
+fi
 
 HOST="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
 STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
@@ -269,7 +297,11 @@ snap_crontab() {
   if [ -n "${hits// /}" ]; then
     # 🔐 데이터 백업(GCS)에는 «안» 담는다 — 대신 원문을 자격 묶음으로 넘겨 «암호화해서» 담는다(아래 🔐 단계).
     #    ⛔ 판정은 그대로 둔다(FAILED+1): 「평문 크론에 자격이 있다」는 사실 자체를 계속 사람에게 보인다.
-    mv -f "$out" "$SECDIR/machine-crontab.raw" 2>/dev/null || rm -f "$out"
+    if [ "$DATA_ONLY" = "1" ]; then
+      rm -f "$out"   # 🔒 데이터만: 자격 묶음 단계가 없으니 원문을 «어디로도» 넘기지 않는다
+    else
+      mv -f "$out" "$SECDIR/machine-crontab.raw" 2>/dev/null || rm -f "$out"
+    fi
     note "$name" "-" "⛔ 자격처럼 보이는 값이 있어 «안 담았다» — 줄: ${hits}(⛔ 값은 안 낸다). 크론 밖으로 옮겨라"
     FAILED=$((FAILED+1))
     return 1
@@ -338,6 +370,15 @@ echo "  (트리 태스크 $TREE_TASKS 개)"
 # ⛔ 불변식 셋: ① 평문은 $SECDIR(700) 밖에 안 쓴다 — tar 출력을 곧바로 age 로 흘려 평문 묶음 파일조차 안 만든다
 #              ② 올리는 것은 `.age` 한 파일뿐이다 ③ 출력에는 «이름과 바이트»만 — 내용은 한 줄도 안 낸다.
 # ⛔ 디렉터리를 통째로 담지 않는다 — `~/.codex` 는 4.8GB 대부분이 대화 기록이다(2026-09-26 실측).
+SECRETS_STATE=skipped      # skipped | ok | failed | omitted
+SECRETS_REASON=""
+if [ "$DATA_ONLY" = "1" ]; then
+  # 🔒 자격 단계 «전체»를 건너뛴다 — 탐색(stat)·키 캐시 목록·tar·age·S3 어느 것도 돌지 않는다.
+  SECRETS_STATE=omitted
+  SECRETS_REASON="--data-only 권한 범위로 제외(자격 탐색·읽기 0 · 자격 백업 없음)"
+  echo
+  echo "═══ 🔐 자격 묶음 — 🔒 데이터만 모드: 권한 범위로 제외 ═══"
+else
 SECRET_ITEMS=()   # $HOME 기준 상대 경로
 add_secret() { [ -e "$HOME/$1" ] && SECRET_ITEMS+=("$1"); return 0; }
 for f in auth.json acp-token export-redactions.tsv config.json ssh-hosts.json; do add_secret ".elanous/$f"; done
@@ -379,8 +420,6 @@ AWS=""
 for c in "$(command -v aws 2>/dev/null || true)" /opt/homebrew/bin/aws /usr/local/bin/aws; do
   [ -n "$c" ] && [ -x "$c" ] && { AWS="$c"; break; }
 done
-SECRETS_STATE=skipped      # skipped | ok | failed
-SECRETS_REASON=""
 SECRETS_FILE="$SECDIR/secrets.tar.age"
 SECRETS_DEST="$SECRETS_BUCKET/$HOST/$STAMP/secrets.tar.age"
 echo
@@ -416,6 +455,8 @@ else
   rm -f "$SECDIR/machine-crontab.raw"
 fi
 
+fi
+
 TOTAL="$(du -sh "$STAGE" 2>/dev/null | cut -f1)"
 echo
 STAGED=$(ls -1 "$STAGE" 2>/dev/null | wc -l | tr -d ' ')
@@ -427,6 +468,7 @@ printf "📋 계획 %s · 담김 %s · 실패 %s  %s\n" "$PLANNED" "$STAGED" "$F
 case "$SECRETS_STATE" in
   ok)      echo "🔐 자격 묶음 ✅ 암호화됨 → $SECRETS_DEST" ;;
   skipped) echo "🔐 자격 묶음 — 담을 자격이 없어 건너뛰었다" ;;
+  omitted) echo "🔐 자격 묶음 — 🔒 제외(omitted): $SECRETS_REASON — ⛔ 자격은 이 회차에 «없다»(성공 아님)" ;;
   failed)  echo "🔐 자격 묶음 ⛔ 실패 — $SECRETS_REASON" ;;
 esac
 

@@ -13,8 +13,8 @@ import type { LLMToolDef } from '../../plugins/core/types.js';
 
 const DEFAULT_MAX_RESULTS = 80;
 const MAX_RESULTS = 1000;
-const AST_GREP_TIMEOUT_MS = 30_000;
-const AST_GREP_MAX_BUFFER = 20 * 1024 * 1024;
+export const AST_GREP_TIMEOUT_MS = 30_000;
+export const AST_GREP_MAX_BUFFER = 20 * 1024 * 1024;
 
 export interface AstGrepArgs {
   pattern?: string;
@@ -256,7 +256,7 @@ function renderAstGrepOutput(
     : `Found ${matches.length}${opts.truncated ? '+' : ''} AST match${matches.length === 1 ? '' : 'es'}\n${rows.join('\n')}${footer}`;
 }
 
-function astGrepBinary(): string | null {
+export function astGrepBinary(): string | null {
   for (const name of ['ast-grep', 'sg']) {
     const proc = spawnSync(name, ['--version'], { encoding: 'utf8' });
     if (proc.status === 0) return name;

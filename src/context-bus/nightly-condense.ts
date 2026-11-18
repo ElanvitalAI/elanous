@@ -2,14 +2,19 @@ import { readFileSync, readdirSync, mkdirSync, writeFileSync, renameSync, exists
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { dirname, join, resolve } from 'node:path';
 import { streamLLM } from '../llm.js';
-import { condenseContextDay, guardianRetireAged, readCondenseEvents, type MemoryItem, type MemorySource, type MemorySummary } from './long-term-memory.js';
+import { condenseContextWindow, guardianRetireAged, readCondenseEventsIn, type MemoryItem, type MemorySource, type MemorySummary } from './long-term-memory.js';
 import type { CoordEvent } from './coord-events.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { acquireLockAsync } from '../storage/file-lock.js';
+import { debug } from '../debug/log.js';
+import { addCalendarDays, dateKey, zonedDayWindow } from '../time/calendar.js';
+import { resolveTimeZone } from '../time/time-zone.js';
 
 type Stage = 'collect' | 'condense' | 'record' | 'conflict-candidates';
 type Input = { day?: string; events?: CoordEvent[]; decisions?: DecisionEntry[]; summaries?: Record<string, MemorySummary> };
-type Context = { graphId?: string; nodeId?: string; input: Input | null; outputs: Record<string, { day?: string; events?: CoordEvent[]; decisions?: DecisionEntry[]; items?: MemoryItem[]; memoryItems?: MemoryItem[] } | null> };
+/** The local-day window `[since, until)` collect resolved; later stages reuse it instead of re-deriving. */
+export type NightlyWindow = { since: string; until: string; timeZone: string };
+type Context = { graphId?: string; nodeId?: string; input: Input | null; outputs: Record<string, { day?: string; window?: NightlyWindow; events?: CoordEvent[]; decisions?: DecisionEntry[]; items?: MemoryItem[]; memoryItems?: MemoryItem[] } | null> };
 type NightlyTask = (source: MemorySource, assignee: 'nightly-task-agent', recipe: 'sleep-review') => Promise<MemorySummary>;
 type GuardianTask = (items: readonly MemoryItem[], assignee: 'guardian', now: Date) => MemoryItem[] | Promise<MemoryItem[]>;
 type NightlyAssignment = { owner: 'coordinator'; assignee: 'nightly-task-agent'; contract: 'librarian'; recipe: 'sleep-review'; source: MemorySource; summary?: MemorySummary };
@@ -54,7 +59,18 @@ export async function executeAssignment(assignment: Assignment): Promise<MemoryS
   throw new Error('invalid nightly assignment');
 }
 
-const dayBefore = (date: Date) => new Date(date.getTime() - 86_400_000).toISOString().slice(0, 10);
+/** Yesterday in the configured local time zone (config → TZ → OS), the same resolver `dateKey` uses. */
+export function nightlyDay(now: Date, timeZone: string = resolveTimeZone().timeZone): string {
+  return addCalendarDays(dateKey(now, { timeZone }), -1);
+}
+
+/** The local-day window for `day`. A 03:30 KST run condenses the whole KST yesterday, not a UTC day. */
+export function nightlyWindow(day: string, timeZone: string = resolveTimeZone().timeZone): NightlyWindow {
+  return zonedDayWindow(day, { timeZone });
+}
+
+/** Loud failure for an empty input: a non-success outcome the graph routes to `failed`, plus an event. */
+export const CONDENSE_INPUT_EMPTY = 'CONDENSE_INPUT_EMPTY';
 const fileName = (value: string) => encodeURIComponent(value).replace(/\./g, '%2E');
 
 function snapshotPath(root: string, project: string, seat: string): string {
@@ -102,7 +118,7 @@ function guardianSave(file: string, value: unknown): void {
   }
 }
 
-async function withCurrentDay<T>(root: string, day: string, write: () => T): Promise<T> {
+async function withCurrentDay<T>(root: string, day: string, until: string, write: () => T): Promise<T> {
   const dir = join(root, 'context-memory');
   mkdirSync(dir, { recursive: true });
   const lock = await acquireLockAsync(join(dir, '.nightly-write.lock'));
@@ -110,7 +126,7 @@ async function withCurrentDay<T>(root: string, day: string, write: () => T): Pro
     const marker = join(dir, 'latest-day');
     const latest = latestDay(root);
     if ((latest && latest > day) || storedItems(root).some(item =>
-      Date.parse(item.updatedAt) >= Date.parse(`${day}T00:00:00Z`) + 86_400_000)) {
+      Date.parse(item.updatedAt) >= Date.parse(until))) {
       throw new Error(`cannot replay ${day}: later project/seat memory exists`);
     }
     if (!lock.stillHeld()) throw new Error('nightly memory write lock lost');
@@ -193,29 +209,51 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
   if (dryRun && stage !== 'collect' && (!input.events || !input.decisions || !input.summaries)) {
     throw new Error('dry-run requires fake events, decisions and summaries');
   }
-  const day = context.outputs.collect?.day ?? input.day ?? dayBefore(now);
+  const day = context.outputs.collect?.day ?? input.day ?? nightlyDay(now);
   if (!/^\d{4}-\d\d-\d\d$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) {
-    throw new Error('invalid UTC day');
+    throw new Error('invalid calendar day');
   }
+  // Collect fixes the local-day window once; later stages reuse it so a mid-run config change cannot shift it.
+  const dayWindow = context.outputs.collect?.window ?? nightlyWindow(day);
   if (stage === 'collect') {
     if (!dryRun && ((latestDay(root) ?? '') > day || storedItems(root).some(item =>
-      Date.parse(item.updatedAt) >= Date.parse(`${day}T00:00:00Z`) + 86_400_000))) {
+      Date.parse(item.updatedAt) >= Date.parse(dayWindow.until)))) {
       throw new Error(`cannot replay ${day}: later project/seat memory exists`);
     }
     if (dryRun && (!input.events || !input.decisions || !input.summaries)) {
       throw new Error('dry-run requires fake events, decisions and summaries');
     }
-    const events = input.events ?? readCondenseEvents(new Date(Date.parse(`${day}T00:00:00Z`) - 86_400_000).toISOString());
+    // Read one day before the window too: the store compares timestamp text, and harness starts fold across midnight.
+    const readSince = new Date(Date.parse(dayWindow.since) - 86_400_000).toISOString();
+    const read = input.events ? undefined : readCondenseEventsIn(root, readSince);
+    const events = input.events ?? read!.events;
     const decisions = input.decisions ?? (dryRun ? [] : new DecisionLedger({ stateDir: root }).list({ status: 'all' })
       .filter(decision => decision.raisedBy.agent !== 'context-condense'));
-    return { outcome: 'ok', day, events, decisions };
+    const inWindow = (at: string | undefined) => {
+      const time = Date.parse(at ?? '');
+      return Number.isFinite(time) && time >= Date.parse(dayWindow.since) && time < Date.parse(dayWindow.until);
+    };
+    const eventRows = events.filter(event => inWindow(event.at)).length;
+    const decisionRows = decisions.filter(decision => inWindow(decision.decidedAt ?? decision.raisedAt ?? decision.importedAt)).length;
+    const inputRead = { source: read ? 'surface-events' : 'injected', sources: read?.sources ?? [], eventRows, decisionRows };
+    if (eventRows + decisionRows === 0) {
+      // Patent ② «no silent zero»: an empty day is a finding, never a quiet `done`.
+      // A day with decisions but no events still condenses its decisions.
+      const finding = { code: CONDENSE_INPUT_EMPTY, day, window: dayWindow, root, ...inputRead };
+      try { debug.log('context.condense', 'input-empty', finding, { level: 'error' }); }
+      catch { /* The non-success outcome below still carries the finding. */ }
+      return { outcome: 'fail', reason: CONDENSE_INPUT_EMPTY, ...finding };
+    }
+    try { debug.log('context.condense', 'input-read', { day, window: dayWindow, root, ...inputRead }); }
+    catch { /* Observation must not stop condensation. */ }
+    return { outcome: 'ok', day, window: dayWindow, inputRead, events, decisions };
   }
   const collected = context.outputs.collect;
   if (!collected?.day || !collected.events || !collected.decisions) throw new Error('collect output missing');
   if (stage === 'condense') {
     const assignments: Array<{ owner: 'coordinator'; assignee: 'nightly-task-agent'; contract: 'librarian'; recipe: 'sleep-review'; workerPid: number }> = [];
     const policy = { promotion: 'sleep-review', retention: 'guardian' } as const;
-    const items = await condenseContextDay(collected.day, dryRun ? [] : storedItems(root).filter(item => Date.parse(item.updatedAt) < Date.parse(`${collected.day}T00:00:00Z`)), {
+    const items = await condenseContextWindow(dayWindow.since, dayWindow.until, dryRun ? [] : storedItems(root).filter(item => Date.parse(item.updatedAt) < Date.parse(dayWindow.since)), {
       events: () => collected.events!, decisions: () => collected.decisions!,
       summarize: async source => {
         if (dryRun) return summarize(source, input.summaries, 'sleep-review');
@@ -241,7 +279,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
       const file = snapshotPath(root, item.project, item.seat);
       grouped.set(file, [...grouped.get(file) ?? [], item]);
     }
-    if (!dryRun) await withCurrentDay(root, day, async () => {
+    if (!dryRun) await withCurrentDay(root, day, dayWindow.until, async () => {
       // The record is all-or-nothing: each guardian write rolls back its own file, and if a later group
       // fails (size budget, integrity, worker error) the files this record already wrote are restored too.
       const written: Array<{ file: string; previous: Buffer | undefined; previousBackup: Buffer | undefined }> = [];
@@ -277,7 +315,7 @@ export async function runNightlyStage(stage: Stage, context: Context, root: stri
       project: item.project, topic: item.topic, owner: item.conflict!.owner,
       sources: item.conflict!.sources, status: 'candidate' as const,
     }));
-    if (!dryRun) await withCurrentDay(root, day, async () => {
+    if (!dryRun) await withCurrentDay(root, day, dayWindow.until, async () => {
       const stored = await assignmentDispatcher<{ stored: true }>({ owner: 'guardian', assignee: 'guardian', recipe: 'store-candidates',
         root, value: candidates });
       if (!stored.result.stored) throw new Error('guardian candidates not stored');
@@ -297,6 +335,8 @@ if (import.meta.main && process.argv[2] === '--assigned-task') {
   const context = JSON.parse(readFileSync(path, 'utf8')) as Context;
   if (context.graphId !== 'nightly-condense' || context.nodeId !== stage) throw new Error('nightly graph context mismatch');
   const statePath = resolve(path, '..', '..', '..', '..');
+  // Register the configured time zone (config → TZ → OS) before the local-day window is derived.
+  await import('../user-config.js');
   const result = await runNightlyStage(stage, context, statePath, process.env.ELANOUS_GRAPH_DRY_RUN === '1',
     new Date());
   console.log(JSON.stringify(result));

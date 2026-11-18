@@ -9,8 +9,8 @@ const thought: MessageBlock = {
 
 test('non-answer MessageBlocks default to one folded line while answers remain exposed', () => {
   const folded = messageBlockDetailLines(thought, 0, 80).join('\n');
-  expect(folded).toContain('▸ 생각');
-  expect(folded).not.toContain('(접힘)');
+  expect(folded).toContain('▸ thought');
+  expect(folded).not.toContain('(folded)');
   expect(folded).toContain('\x1b[2m');
   expect(folded).not.toContain('파일을 읽고 호출 경로를 대조합니다');
 
@@ -19,9 +19,9 @@ test('non-answer MessageBlocks default to one folded line while answers remain e
 });
 
 test('Enter reveals summary, then steps, then only the raw reference target', () => {
-  expect(messageBlockDetailLines(thought, 1, 80)).toEqual(['▾ 생각 · 호출 경로와 중복 진입을 확인합니다.']);
+  expect(messageBlockDetailLines(thought, 1, 80)).toEqual(['▾ thought · 호출 경로와 중복 진입을 확인합니다.']);
   expect(messageBlockDetailLines(thought, 2, 80)).toEqual([
-    '▾ 생각 · 호출 경로와 중복 진입을 확인합니다.',
+    '▾ thought · 호출 경로와 중복 진입을 확인합니다.',
     '  · 파일 읽기',
     '  · 호출 경로 대조',
   ]);
@@ -51,7 +51,7 @@ test('tool, progress, status, and error events share the L0 summary policy', () 
   for (const block of blocks) {
     const lines = messageBlockDetailLines(block, 0, 80);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).not.toContain('(접힘)');
+    expect(lines[0]).not.toContain('(folded)');
     expect(lines[0]).not.toContain('410,000 chars');
   }
 });
@@ -60,7 +60,7 @@ test('collapsed status stays compact and a long thought summary ends in an ellip
   const status: MessageBlock = { id: 'status-compact', ts: 1, source: 'system',
     body: { kind: 'status', text: 'ctx 410,000 chars / 400,000' } };
   const foldedStatus = messageBlockDetailLines(status, 0, 80)[0]!;
-  expect(foldedStatus).toContain('▸ 상태');
+  expect(foldedStatus).toContain('▸ status');
   expect(foldedStatus).not.toContain('410,000');
 
   const longThought: MessageBlock = { ...thought, detail: { level: 1, summary: '긴 요약 '.repeat(20) } };

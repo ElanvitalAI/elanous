@@ -542,10 +542,10 @@ function asPlanState(value: unknown): PlanState | null {
       const s = asRecord(step, { fallback: 'null', allowArrays: true });
       if (!s) return null;
       if (typeof s.step !== 'string') return null;
-      if (s.status !== 'pending' && s.status !== 'in_progress' && s.status !== 'completed') return null;
+      if (s.status !== 'pending' && s.status !== 'in_progress' && s.status !== 'completed' && s.status !== 'blocked' && s.status !== 'waiting') return null;
       return { step: s.step, status: s.status };
     })
-    .filter((step): step is { step: string; status: 'pending' | 'in_progress' | 'completed' } => step !== null);
+    .filter((step): step is { step: string; status: 'pending' | 'in_progress' | 'completed' | 'blocked' | 'waiting' } => step !== null);
   if (steps.length === 0) return null;
   return {
     steps,

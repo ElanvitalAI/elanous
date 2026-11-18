@@ -2256,7 +2256,11 @@ export async function dispatchSessionRuntimeTool(
   }
 
   const res = await deps.dispatchPluginTool(name, normalizedArgs);
-  if (!res.ok) return { error: res.error };
+  if (!res.ok) {
+    // Keep structured failure fields (e.g. APP_BUILD_DECLINED code · instruction) for the model.
+    const { ok: _ok, ...failure } = res;
+    return failure;
+  }
   rememberCandidateListingResult(name, normalizedArgs, res.result, scopedAnalysis, deps.searchPlannerState);
   return res.result;
 }

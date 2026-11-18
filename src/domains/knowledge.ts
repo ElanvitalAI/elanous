@@ -22,10 +22,11 @@ import { basename, dirname, isAbsolute, join, resolve, win32 } from 'node:path';
 import { scanDocs } from '../autopilot/discovery/doc-inventory.js';
 import { KNOWN_PREFIXES } from '../autopilot/discovery/doc-lint.js';
 import { getOpenAIApiKey } from '../config.js';
+import { llmNetworkFetch } from '../session-runtime/llm-call-gateway.js';
 import { debug } from '../debug/log.js';
 import { SIGNALS_DB_PATH } from './breaking-signals.js';
 import { surfaceEventsDbPath } from './surface-events.js';
-import { memoryDbPath, migrateLegacyMemoryDb } from './memory-db-path.js';
+import { memoryDbPath, mergeStrayMemoryDbOnce, migrateLegacyMemoryDb } from './memory-db-path.js';
 import { conatusPath } from './conatus-data-dir.js';
 
 // managed memory 네임스페이스(2026-07-19 일반화) — 시맨틱 self-memory. ★scoped(Phase E · 2026-07-24):
@@ -86,6 +87,20 @@ export function openKnowledgeDb(path: string = knowledgeDbPath()): Database {
   db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
     id UNINDEXED, search_text, tokenize = 'porter'
   )`);
+  if (path === knowledgeDbPath()) {
+    // NIGHTLY-CONDENSE-INPUT-PATH: rows a pre-fix prod-stamped writer left in ~/.elanous/knowledge.db.
+    try {
+      const result = mergeStrayMemoryDbOnce(db, 'knowledge.db', ['docs', 'docs_fts'], path);
+      if (result?.skipped === 'busy') void import('../debug/log.js').then(({ debug }) =>
+        debug.log('memory.db', 'stray-merge-busy', { name: 'knowledge.db', ...result }, { level: 'warn' })).catch(() => {});
+      else if (result && !result.skipped) void import('../debug/log.js').then(({ debug }) =>
+        debug.log('memory.db', 'stray-merged', result)).catch(() => {});
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      void import('../debug/log.js').then(({ debug }) =>
+        debug.log('memory.db', 'stray-merge-failed', { name: 'knowledge.db', reason }, { level: 'warn' })).catch(() => {});
+    }
+  }
   try {
     migrateDocPathKeys(db);
     return db;
@@ -111,12 +126,12 @@ export function backfillDocsFts(db: Database): number {
 // ── 임베딩 (D2: 로컬 우선 + OpenAI 폴백 · 실패 시 throw — 호출측 fail-soft) ──
 
 async function embedLmStudio(text: string): Promise<Float32Array> {
-  const res = await fetch(LMSTUDIO_URL, {
+  const res = await llmNetworkFetch(LMSTUDIO_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: LMSTUDIO_MODEL, input: text }),
     signal: AbortSignal.timeout(15_000),
-  });
+  }, { provider: 'local', model: LMSTUDIO_MODEL, role: 'aux', requestedBy: 'knowledge-embedding' });
   if (!res.ok) throw new Error(`LM Studio embeddings HTTP ${res.status}`);
   const json = (await res.json()) as any;
   const e = json?.data?.[0]?.embedding;
@@ -127,13 +142,13 @@ async function embedLmStudio(text: string): Promise<Float32Array> {
 async function embedOpenAI(text: string): Promise<Float32Array> {
   const key = getOpenAIApiKey();
   if (!key) throw new Error('OpenAI fallback unavailable: no API key');
-  const res = await fetch('https://api.openai.com/v1/embeddings', {
+  const res = await llmNetworkFetch('https://api.openai.com/v1/embeddings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
     // dimensions:768 — nomic과 차원만 맞춤(공간은 다름 → embed_model 태그로 격리)
     body: JSON.stringify({ model: OPENAI_EMBED_MODEL, input: text, dimensions: EMBED_DIM }),
     signal: AbortSignal.timeout(20_000),
-  });
+  }, { provider: 'openai', model: OPENAI_EMBED_MODEL, role: 'aux', requestedBy: 'knowledge-embedding', selectionSource: 'fallback' });
   if (!res.ok) throw new Error(`OpenAI embeddings HTTP ${res.status}`);
   const json = (await res.json()) as any;
   const e = json?.data?.[0]?.embedding;

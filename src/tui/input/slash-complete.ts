@@ -14,14 +14,23 @@ export function nextSlashCandidates(
   resolve: (text: string, context: NextTuiRouteContext) => NextTuiRoute | null,
 ): NextSlashCandidate[] {
   if (!/^\/[\w-]*$/.test(draft)) return [];
-  const spellings = new Map<string, NextSlashCandidate>();
+  // TUI-SLASH-TEXT-KOREAN-AND-RESIDUE: one row per route; aliases (/clear, /st, /mem …) ride along.
+  const grouped: { text: string; name: string; aliases: string[]; summary: string; spellings: string[] }[] = [];
+  const seen = new Set<string>();
   for (const route of routes) {
-    for (const text of [...route.slash, ...route.slashPrefixes]) {
-      if (text.includes(' ') || resolve(text, context) !== route) continue;
-      spellings.set(text, { text, description: route.helpSummary ?? '' });
-    }
+    const spellings = [...route.slash, ...route.slashPrefixes]
+      .filter((text) => !text.includes(' ') && !seen.has(text) && resolve(text, context) === route);
+    if (spellings.length === 0) continue;
+    spellings.forEach((text) => seen.add(text));
+    grouped.push({ text: spellings[0]!, name: spellings[0]!.slice(1), aliases: spellings.slice(1).map((text) => text.slice(1)),
+      summary: route.helpSummary ?? '', spellings });
   }
-  return filterSlashCommands(draft.slice(1), [...spellings.values()].map((candidate) => ({
-    ...candidate, name: candidate.text.slice(1),
-  }))).map(({ text, description }) => ({ text, description }));
+  const query = draft.slice(1).toLowerCase();
+  return filterSlashCommands(query, grouped.map((candidate) => ({ ...candidate, description: candidate.summary })))
+    .map(({ spellings, summary }) => {
+      // Show the spelling the person is typing; the others are listed as aliases.
+      const text = spellings.find((spelling) => query && spelling.slice(1).toLowerCase().startsWith(query)) ?? spellings[0]!;
+      const others = spellings.filter((spelling) => spelling !== text);
+      return { text, description: [summary, others.length ? `alias ${others.join(' · ')}` : ''].filter(Boolean).join(' · ') };
+    });
 }

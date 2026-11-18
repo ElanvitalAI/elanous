@@ -1,3 +1,4 @@
+import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
 import { env, requireEnv } from './env.js';
 import { compactTranscript } from './util.js';
 import type { SummaryConfig } from './types.js';
@@ -242,7 +243,7 @@ async function callResponsesAPI(
   model: string,
   prompt: string,
 ): Promise<string> {
-  const res = await fetch(`${baseUrl}/v1/responses`, {
+  const res = await llmNetworkFetch(`${baseUrl}/v1/responses`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -256,7 +257,7 @@ async function callResponsesAPI(
       ],
       temperature: 0.3,
     }),
-  });
+  }, { provider: baseUrl === 'https://api.x.ai' ? 'grok' : 'openai', model, role: 'aux', requestedBy: 'youtube-master' });
   if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
   const data = await res.json();
   for (const item of data.output || []) {

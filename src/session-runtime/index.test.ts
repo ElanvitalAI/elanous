@@ -249,8 +249,15 @@ test('classic mock replay verifies tools, uses their results to redo the prior t
         ok: true, name, evidence: `verified:${name}:${String(args.name ?? args.query ?? '')}`,
       }),
       signal,
+    }, {
+      // 1121 RESEARCH-ROUTING: an OmniSearch-capable turn enters research by default; the plan judges this
+      // correction about the conversation itself local-only, and the turn runs as the ordinary replay.
+      runResearch: async (_request, _signal, _admit, _routing, hooks) => {
+        hooks?.onRoute?.({ needsFreshFacts: false, needsCitations: false, localOnly: true });
+        return { ok: false, output: '' };
+      },
     });
-    expect(deferredSpy).toHaveBeenCalledTimes(1);
+    expect(deferredSpy).toHaveBeenCalledTimes(2);
     expect(modelCalls).toBe(1);
     expect(calls).toEqual(['elanous_skills_list', 'skill_exec', 'skill_exec', 'skill_exec', 'OmniSearch']);
     expect(replayResults).toHaveLength(5);

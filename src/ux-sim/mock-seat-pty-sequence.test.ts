@@ -55,7 +55,7 @@ describe('N03 key sequence: one screen per step on a real PTY', () => {
               label: `${mode} treats ${input} as ordinary text`,
               text: input,
               until: (screen) => screen.includes(input) && screen.includes(reply)
-                && (mode === 'classic' ? screen.includes('✔ 완료') : nextTuiTurnSettled(screen)),
+                && (mode === 'classic' ? screen.includes('✔ done') : nextTuiTurnSettled(screen)),
               timeoutMs: 30_000, // Source: #36860 bounded fake-provider PTY reply deadline.
             }],
             quitKeys: '\x11',
@@ -139,7 +139,7 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
         steps: [{ label: 'three-child request', text: ask,
           until: (screen) => screen.includes(parentReply) && (next
             ? screen.includes('완료 3') && nextTuiTurnSettled(screen)
-            : screen.includes('✔ 완료')) }],
+            : screen.includes('✔ done')) }],
       });
     }
     try {
@@ -160,9 +160,9 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
       const nextTools = toolNames(nextMessages);
       expect(classic.exitCode).toBe(0);
       expect(next.exitCode).toBe(0);
-      expect(nextScreen.match(/하위 에이전트 ·/g)?.length).toBe(1);
-      expect(nextScreen).toContain('완료 3');
-      expect(nextScreen).not.toMatch(/실행 중 \d|진행 중/);
+      expect(nextScreen.match(/sub-agents ·/g)?.length).toBe(1);
+      expect(nextScreen).toContain('done 3');
+      expect(nextScreen).not.toMatch(/running \d|running in background/);
       expect(nextScreen).not.toContain('AgentOutput');
       expect(classicTools).toContain('Agent');
       expect(nextTools).toContain('Agent');
@@ -243,7 +243,7 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
       const r = await runNextTuiScenario({ scenario: 'next-seat-turn-cap', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
       expect(r.checks).toEqual({
         capRecordedInRealSeatTurn: true, capExhaustionObservedBeforeIdleInput: true, nextSubmittedHumanTurnFinished: true, nextDraftReachedIdleComposer: true,
-        escapeCanceledIdleDraft: true, onlyFakeProvider: true, exitedClean: true,
+        escapeCanceledIdleDraft: true, onlyFakeProvider: true, exitedClean: true, resumeNoticePostedOnce: true,
       });
       expect(r.logs.rc).toBe(0);
     } finally { rmSync(dir, { recursive: true, force: true }); }

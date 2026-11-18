@@ -24,6 +24,7 @@ describe('default plugin group', () => {
       'demo-browser-hand',
       'demo-video-briefing',
       'demo-plugin-wizard',
+      'bookforge',
     ];
     expect(DEFAULT_PLUGIN_GROUP.map(plugin => plugin.id)).toEqual(expectedIds);
 
@@ -39,7 +40,7 @@ describe('default plugin group', () => {
 
     const empty = defaultPluginStatuses();
     expect(empty.map(plugin => plugin.id)).toEqual(expectedIds);
-    expect(empty.every(plugin => plugin.status === 'key-needed')).toBe(true);
+    expect(empty.filter(plugin => plugin.status === 'ready').map(plugin => plugin.id)).toEqual(['bookforge']);
 
     const baseline = defaultPluginStatuses({ satisfiedPrerequisites: ['llm-provider', 'aside'] });
     expect(baseline.filter(plugin => plugin.status === 'key-needed').map(plugin => plugin.id))

@@ -43,6 +43,18 @@ export function inferRuntimeLlmModelFamily(model: string | undefined): RuntimeLl
   return 'unknown';
 }
 
+/** OPENROUTER-CLAUDE(11-17) — OpenRouter 의 «자기» 모델 id 꼴 `<vendor>/<model>`(예 `anthropic/claude-opus-5.5`).
+ *  🩸 종전엔 `--provider openrouter --model anthropic/claude-opus-5.5` 가 `anthropic/` 접두(catalog anthropic.yaml)로
+ *    anthropic 계열로 읽혀 «비호환» → anthropic 직결로 재경로됐고, OpenRouter 키가 api.anthropic.com 에 가서 401 이 났다
+ *    (TUI 는 1초 빈 «done»). ⇒ openrouter 가 명시된 자리에서는 슬래시 이름공간 id 를 OpenRouter 원어로 받는다.
+ *  ⛔ 게이트웨이 접두(`opengateway/`)·Bedrock 꼴(`bedrock/`)·`local:` 은 OpenRouter id 가 아니다. */
+export function isOpenRouterNativeModelId(model: string | undefined): boolean {
+  if (!model) return false;
+  const m = model.trim().toLowerCase();
+  if (m.startsWith('opengateway/') || m.startsWith('bedrock/') || m.startsWith('local:')) return false;
+  return /^[a-z0-9][a-z0-9._-]*\/[^/\s]+(?:\/[^/\s]+)?$/.test(m);
+}
+
 /** Cycle-safe compatibility: same-provider model overrides pass;
  *  cross-family ids fail. Unknown prefixes and `auto` stay silent.
  *  ⛔ `openai` 와 `openai-codex` 는 별개 provider — 양방향 호환으로 접지 않는다. */
@@ -52,6 +64,7 @@ export function isRuntimeLlmModelCompatibleWithProvider(
 ): boolean {
   if (!model) return true;
   if (provider === 'auto') return true;
+  if (provider === 'openrouter' && isOpenRouterNativeModelId(model)) return true;
   const family = inferRuntimeLlmModelFamily(model);
   if (family === 'unknown') return true;
   if (provider === 'local') return family === 'local';

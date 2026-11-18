@@ -5,14 +5,15 @@
     "src/ux-sim/fake-llm.ts"
   ],
   "tests": [
-    "src/ux-sim/fake-llm.test.ts"
+    "src/ux-sim/fake-llm.test.ts", "src/ux-sim/fake-llm-response-rules.test.ts"
   ],
   "target": "LLM response and streaming boundary",
   "inputs": [
     "fixed or scripted response",
     "delay",
     "error/status",
-    "ordered tool-call sequence scoped to one human prompt"
+    "ordered tool-call sequence scoped to one human prompt",
+    "per-instruction replies (ELANOUS_TEST_FAKE_LLM_RESPONSE_RULES: the newest user message carrying a marker picks the reply)"
   ],
   "observations": [
     "captured calls",

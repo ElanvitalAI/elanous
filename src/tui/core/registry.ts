@@ -50,7 +50,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '종료',
+    helpSummary: 'Quit',
   },
   {
     id: 'help.next',
@@ -61,7 +61,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '명령과 키 안내',
+    helpSummary: 'Command and key guide',
   },
   {
     id: 'session.new',
@@ -72,7 +72,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '새 대화',
+    helpSummary: 'New chat',
   },
   {
     id: 'session.compact',
@@ -83,7 +83,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '대화 정리',
+    helpSummary: 'Compact chat',
   },
   {
     id: 'session.resume',
@@ -94,7 +94,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '이전 대화 이어가기',
+    helpSummary: 'Resume a previous chat',
   },
   {
     id: 'loop',
@@ -107,7 +107,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '반복 작업',
+    helpSummary: 'Repeatable jobs',
   },
   {
     id: 'model',
@@ -118,7 +118,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: 'fast|normal|deep · /provider 별칭',
+    helpSummary: 'fast|normal|deep · /provider alias',
   },
   {
     id: 'status',
@@ -129,7 +129,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '모델 · 연결 설정 · 계정 상태',
+    helpSummary: 'Model · connection settings · account status',
   },
   {
     id: 'remaining',
@@ -140,7 +140,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '통합 사용량과 남은 할당량',
+    helpSummary: 'Combined usage and remaining quota',
   },
   {
     id: 'harness',
@@ -153,7 +153,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '하니스 명령',
+    helpSummary: 'Harness commands',
   },
   {
     id: 'memory',
@@ -166,7 +166,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '기억 목록·보기',
+    helpSummary: 'List and view memories',
   },
   {
     id: 'decide',
@@ -179,7 +179,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '열린 결정 보기·답하기',
+    helpSummary: 'View and answer open decisions',
   },
   {
     id: 'sidetab',
@@ -192,7 +192,19 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '세션/PTY 목록 · /side new · /side kill',
+    helpSummary: 'Session/PTY list · /side new · /side kill',
+  },
+  {
+    // GRAPH-VIEW-DETAIL-SIDETAB (개정 5): keyboard way into a graph loop's detail (Ctrl/Alt+click is the mouse way).
+    id: 'graph',
+    action: 'command',
+    slash: ['/graph'],
+    slashPrefixes: ['/graph'],
+    phrases: [],
+    roles: ['human'],
+    minimumMaturity: 'stable',
+    requiredFlags: [],
+    helpSummary: 'Graph loop detail · /graph [loopId[:node]] · Ctrl+G',
   },
   {
     id: 'terminal',
@@ -205,7 +217,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: 'PTY 명령 · /term help는 읽기 전용',
+    helpSummary: 'PTY commands · /term help is read-only',
   },
   {
     id: 'mission',
@@ -218,7 +230,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '미션 목록·진행·브리핑',
+    helpSummary: 'Mission list, progress, briefing',
   },
   {
     id: 'now',
@@ -231,7 +243,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '현재 맥락과 출처',
+    helpSummary: 'Current context and sources',
   },
   {
     id: 'context',
@@ -244,7 +256,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '첨부 목록·삭제',
+    helpSummary: 'Attachment list and removal',
   },
   {
     id: 'app',
@@ -257,7 +269,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '앱 계약·시뮬레이션·상태',
+    helpSummary: 'App contract, simulation, status',
   },
   {
     id: 'plugin.wizard',
@@ -281,7 +293,7 @@ export const NEXT_TUI_ROUTE_REGISTRY: readonly NextTuiRoute[] = [
     roles: ['human'],
     minimumMaturity: 'stable',
     requiredFlags: [],
-    helpSummary: '신호 확인',
+    helpSummary: 'Check signals',
   },
 ];
 
@@ -314,11 +326,11 @@ const NEXT_TUI_PHRASE_PATTERN_ROUTES = NEXT_TUI_ROUTE_REGISTRY.filter((route) =>
 
 const NEXT_TUI_KEY_HELP_LINES: readonly string[] = [
   'Keys',
-  'Enter 전송 · Esc 취소 · PgUp/PgDn 대화 스크롤 · Ctrl+Q 종료',
-  'Ctrl+\\ 토글 · ↑/↓ 선택 · 빈 입력 Enter=attach',
-  '새 PTY: s shell · e elanous · c codex 구독 · l claude code 구독',
-  'PTY 분리: Ctrl+\\ 후 d',
-  'Esc 입력으로 돌아오기',
+  'Enter send · Esc cancel · PgUp/PgDn scroll chat · Ctrl+Q quit',
+  'Ctrl+\\ toggle · ↑/↓ select · Enter on empty input=attach',
+  'New PTY: s shell · e elanous · c codex subscribe · l claude code subscribe',
+  'PTY detach: Ctrl+\\ then d',
+  'Esc returns to input',
 ];
 
 export const NEXT_TUI_INPUT_CONTEXT: NextTuiRouteContext = {
@@ -373,6 +385,7 @@ export function buildNextTuiHelpLines(
 
   // The rendered history keeps only the viewport's last rows; the separator
   // pushed the first-use heading above that window on a 24-row terminal.
+  // NEXT-TUI-UI-ENGLISH: fixed help chrome (headings, summaries, keys) is English.
   return ['Commands', ...commandLines, ...NEXT_TUI_KEY_HELP_LINES];
 }
 

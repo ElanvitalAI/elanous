@@ -16,20 +16,23 @@ describe('finalizeDashboardTurn', () => {
     finalizeDashboardTurn({
       thinking,
       finalStatus: 'completed',
+      turnStartedAt: Date.now() - 42_000,
+      backgroundRunning: 2,
+      engineBadge: '',
       chatFooterLine: footer,
       pushChatLine: (line) => { lines.push(line); },
       setChatScrollBottom: () => { events.push('scroll'); },
       consumeQuickControl: () => true,
       muted: (text) => `muted:${text}`,
+      accent: (text) => `blue:${text}`,
       draw: () => { events.push('draw'); },
     });
 
     expect(lines).toEqual([
-      '',
-      'done marker',
+      expect.stringMatching(/^blue:✻ Worked for 42s · done \d{1,2}:\d{2} (AM|PM) · 2 background running$/),
       'muted:  (quick-control consumed — back to chat)',
     ]);
-    expect(footer.current).toBeNull();
+    expect(footer.current).toBe(lines[0]);
     expect(events).toEqual([
       'stop:completed:',
       'scroll',
@@ -48,16 +51,19 @@ describe('finalizeDashboardTurn', () => {
         },
       } as any,
       finalStatus: 'failed',
+      turnStartedAt: Date.now() - 182_000,
+      engineBadge: '',
       finalError: 'boom',
       chatFooterLine: { current: null },
       pushChatLine: (line) => { lines.push(line); },
       setChatScrollBottom: () => { events.push('scroll'); },
       consumeQuickControl: () => false,
       muted: (text) => text,
+      accent: (text) => `blue:${text}`,
       draw: () => { events.push('draw'); },
     });
 
-    expect(lines).toEqual([]);
+    expect(lines).toEqual([expect.stringMatching(/^blue:✻ Stopped after 3m 2s · \d{1,2}:\d{2} (AM|PM)$/)]);
     expect(events).toEqual(['stop:failed:boom', 'scroll', 'draw']);
   });
 });

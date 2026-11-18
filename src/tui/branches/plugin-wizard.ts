@@ -10,7 +10,7 @@ export interface GraphWizardProposal {
 }
 
 /** Classic dashboard has no branch host for the next-TUI wizard yet. */
-export const CLASSIC_PLUGIN_WIZARD_NOTICE = '플러그인 마법사는 next TUI에서 지원합니다.';
+export const CLASSIC_PLUGIN_WIZARD_NOTICE = 'Plugin wizard is supported in the next TUI.';
 export interface PluginWizardDeps {
   readonly baseUrl?: string;
   readonly token?: string;
@@ -25,9 +25,9 @@ export type PluginWizardTurn =
 
 export function formatPluginWizardProposal(proposal: GraphWizardProposal): readonly string[] {
   return [
-    `초안: ${proposal.summary}`,
+    `Draft: ${proposal.summary}`,
     proposal.yaml,
-    '이 플러그인 초안을 저장할까요? “네” 또는 “아니오”로 답해 주세요.',
+    'Save this plugin draft? Answer "yes" or "no".',
   ];
 }
 
@@ -55,7 +55,7 @@ export function createPluginWizardFlow(deps: PluginWizardDeps = {}) {
     },
 
     async answer(input: string): Promise<PluginWizardFlowTurn> {
-      if (!conversation || !proposal) return { kind: 'error', message: '저장할 플러그인 초안이 없습니다.' };
+      if (!conversation || !proposal) return { kind: 'error', message: 'No plugin draft to save.' };
       const approved = parsePluginWizardConfirmation(input);
       if (approved === null) return { kind: 'confirmation-required' };
       const active = conversation;
@@ -74,7 +74,7 @@ export function createPluginWizardFlow(deps: PluginWizardDeps = {}) {
 
 function nexusAuth(deps: PluginWizardDeps): { baseUrl: string; token?: string; fetch: typeof fetch } {
   const baseUrl = deps.baseUrl ?? resolveDaemonEndpoint({ purpose: 'write' })?.baseUrl;
-  if (!baseUrl) throw new Error('넥서스가 안 떠 있습니다. test 우주 넥서스를 먼저 실행하세요.');
+  if (!baseUrl) throw new Error('Nexus is not running. Start the test-universe nexus first.');
   let token = deps.token;
   if (token === undefined) {
     try { token = readFileSync(join(getElanousConfigDir(), 'acp-token'), 'utf8').trim() || undefined; }
@@ -93,12 +93,12 @@ async function postJson(path: string, body: unknown, deps: PluginWizardDeps): Pr
       body: JSON.stringify(body),
     });
   } catch {
-    throw new Error('넥서스에 연결할 수 없습니다.');
+    throw new Error('Cannot connect to nexus.');
   }
   let parsed: unknown;
   try { parsed = await response.json(); }
-  catch { throw new Error(`넥서스 응답을 읽지 못했습니다 (HTTP ${response.status}).`); }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('넥서스 응답 형식이 올바르지 않습니다.');
+  catch { throw new Error(`Could not read nexus response (HTTP ${response.status}).`); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid nexus response format.');
   return { status: response.status, body: parsed as Record<string, unknown> };
 }
 
@@ -110,24 +110,24 @@ export function createPluginWizardConversation(deps: PluginWizardDeps = {}) {
     async propose(prompt: string): Promise<PluginWizardTurn> {
       pending = null;
       const trimmed = prompt.trim();
-      if (!trimmed) return { kind: 'error', message: '만들 플러그인 설명을 입력해 주세요.' };
+      if (!trimmed) return { kind: 'error', message: 'Enter a description of the plugin to create.' };
       try {
         const response = await postJson('/v1/graphs/wizard', { prompt: trimmed }, deps);
         const { status, body } = response;
         if (status < 200 || status >= 300 || body.ok !== true
             || typeof body.id !== 'string' || typeof body.yaml !== 'string' || typeof body.summary !== 'string') {
-          return { kind: 'error', message: '플러그인 초안을 만들지 못했습니다. 설명을 바꾸어 다시 시도해 주세요.' };
+          return { kind: 'error', message: 'Could not create the plugin draft. Try again with a different description.' };
         }
         pending = { id: body.id, yaml: body.yaml, summary: body.summary };
         return { kind: 'proposal', proposal: pending };
       } catch (error) {
-        return { kind: 'error', message: error instanceof Error ? error.message : '플러그인 초안을 만들지 못했습니다.' };
+        return { kind: 'error', message: error instanceof Error ? error.message : 'Could not create the plugin draft.' };
       }
     },
 
     async confirmSave(approved: boolean): Promise<PluginWizardTurn> {
       const proposal = pending;
-      if (!proposal) return { kind: 'error', message: '저장할 플러그인 초안이 없습니다.' };
+      if (!proposal) return { kind: 'error', message: 'No plugin draft to save.' };
       if (!approved) {
         pending = null;
         return { kind: 'declined' };
@@ -135,12 +135,12 @@ export function createPluginWizardConversation(deps: PluginWizardDeps = {}) {
       try {
         const { status, body } = await postJson('/v1/graphs', { id: proposal.id, yaml: proposal.yaml }, deps);
         if (status !== 201 || body.saved !== true || body.id !== proposal.id) {
-          return { kind: 'error', message: `저장하지 못했습니다 (HTTP ${status}). 초안을 보존했습니다. 다시 시도하거나 “아니오”로 취소하세요.` };
+          return { kind: 'error', message: `Save failed (HTTP ${status}). Draft preserved. Retry or answer "no" to cancel.` };
         }
         pending = null;
         return { kind: 'saved', id: proposal.id };
       } catch (error) {
-        return { kind: 'error', message: error instanceof Error ? error.message : '저장하지 못했습니다.' };
+        return { kind: 'error', message: error instanceof Error ? error.message : 'Save failed.' };
       }
     },
 

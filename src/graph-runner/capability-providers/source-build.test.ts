@@ -7,8 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { runGraph } from '../runner.js';
 import type { InProcessHandlerContext } from '../in-process-registry.js';
 import { defaultCapabilityRegistryForGraph } from '../plugin-graph-providers.js';
-import { createSourceBuildRegistry, seedRuntimePlanMatches } from './source-build.js';
+import { createSourceBuildRegistry, seedRuntimePlanMatches, MAX_DIAGNOSTIC_BYTES } from './source-build.js';
 import { registerAppBuildPublishApprovalProvider } from './app-build-publish-approval.js';
+import { bindRichPlanningContext, preserveBuildFailureReasons, registerAppBuildRichTraversal } from './app-build-rich-traversal.js';
 import type { createBuildExecution } from '../app-build/build-execution.js';
 import { ARCHITECTURE_SECTIONS, APP_BUILD_MAX_FILES, APP_BUILD_MAX_REPAIRS } from '../app-build/contracts.js';
 import { apiSurfaceLines, readEnvironmentReceipt, writeEnvironmentReceipt, type DeploymentEnvironment } from '../app-build/deployment-environment.js';
@@ -66,11 +67,13 @@ const measuredEnvironment: DeploymentEnvironment = { runtime: { command: 'bun', 
 type Host = ReturnType<typeof createBuildExecution>;
 function environment(options: { failTests?: boolean; authFails?: boolean; foreignOwner?: boolean; publishFails?: boolean;
   retryEveryFile?: boolean; failedVerifications?: number; unavailableImport?: 'once' | 'always'; fencedFile?: boolean;
-  methodFailure?: boolean } = {}) {
+  methodFailure?: boolean; replanAfterFailure?: boolean; corruptOnReentry?: boolean; diagnostic?: string } = {}) {
   const receiptRoot = root();
   const calls: string[] = []; const prompts: string[] = []; const rawOutputs: string[] = [];
   let checkpoint: Awaited<ReturnType<Host['load']>>;
   let verifies = 0;
+  let planCalls = 0;
+  let loads = 0;
   const attempts = new Map<string, number>();
   const activePlan = options.retryEveryFile ? [...plan, ...Array.from({ length: APP_BUILD_MAX_FILES - plan.length }, (_, index) => ({
     path: 'backend/module-' + index + '.ts', role: 'backend', purpose: 'Independent local module', dependsOn: ['ARCHITECTURE.md'],
@@ -81,11 +84,13 @@ function environment(options: { failTests?: boolean; authFails?: boolean; foreig
       return { ownerId: options.foreignOwner ? 'foreign' : ownerId, runId, appSlug, userSlug: 'syntheticowner',
         sourceRoot: '/synthetic/private-root', issuerExpiresAt: '2099-01-01T00:00:00Z', sourceHead: 'a'.repeat(40) };
     },
-    load: async () => checkpoint,
-    save: async (_grant, planDigest, files) => { checkpoint = { planDigest, files: files.map(file => ({ ...file })) };
+    load: async () => { loads++; return options.corruptOnReentry && loads === 3 && checkpoint
+      ? { ...checkpoint, files: checkpoint.files.map((file, index) => index === 0 ? { ...file, sha256: sha('corrupt') } : file) }
+      : checkpoint; },
+    save: async (_grant, planDigest, files) => { calls.push('save'); checkpoint = { planDigest, files: files.map(file => ({ ...file })) };
       return { planDigest, fileDigest: sha(JSON.stringify(files)), files: files.length }; },
     verify: async (_grant, _files, _signal, strategy) => { calls.push('verify'); verifies++; return { testStrategySha256: sha(JSON.stringify(strategy)), testReceipts: (strategy ?? []).map(item => ({ strategyId: item.id, device: item.device, testFile: item.testFile, command: item.command, selection: 'isolated-test-entry' as const, passed: !options.failTests && verifies > (options.failedVerifications ?? 1), exitCode: !options.failTests && verifies > (options.failedVerifications ?? 1) ? 0 : 1, fileSha256: sha('fixture') })), passed: !options.failTests && verifies > (options.failedVerifications ?? 1),
-      fileDigest: sha('files'), diagnostic: options.methodFailure ? 'TypeError: db.pragma is not a function' : 'synthetic test failed',
+      fileDigest: sha('files'), diagnostic: options.diagnostic ?? (options.methodFailure ? 'TypeError: db.pragma is not a function' : 'synthetic test failed'),
       sandbox: 'darwin-private-netoff-envempty', truncated: false }; },
     materialize: async grant => { calls.push('materialize'); return { sourceRoot: grant.sourceRoot, fileDigest: sha('files'), artifact: {} }; },
     publish: async () => { calls.push('publish'); if (options.publishFails) throw new Error('BUILD_APPROVAL_REQUIRED');
@@ -96,7 +101,9 @@ function environment(options: { failTests?: boolean; authFails?: boolean; foreig
     let value: unknown;
     if (prompt.includes('Stage: assumptions.')) value = { assumptions };
     else if (prompt.includes('Stage: architecture.')) value = architecture;
-    else if (prompt.includes('Stage: file-plan.')) value = { plan: activePlan };
+    else if (prompt.includes('Stage: file-plan.')) { planCalls++; value = { plan: options.replanAfterFailure && planCalls > 1
+      ? [...activePlan, { path: 'backend/replanned.ts', role: 'backend', purpose: 'Replanned module', dependsOn: ['ARCHITECTURE.md'] }]
+      : activePlan }; }
     else { const request = JSON.parse(prompt.split('\nDeployment contract:')[0]!);
       const attempt = (attempts.get(request.file.path) ?? 0) + 1; attempts.set(request.file.path, attempt);
       if (options.retryEveryFile && attempt % (APP_BUILD_MAX_REPAIRS + 1) !== 0) return {
@@ -110,7 +117,7 @@ function environment(options: { failTests?: boolean; authFails?: boolean; foreig
     return { text: options.fencedFile && value && typeof value === 'object' && 'path' in value
       ? '```json\n' + plain + '\n```' : plain, provider: 'fixture-provider', model: 'fixture-model' };
   };
-  return { host, callLLM, calls, prompts, rawOutputs,
+  return { host, callLLM, calls, prompts, rawOutputs, checkpoint: () => checkpoint,
     diagnoseEnvironment: async () => measuredEnvironment,
     recordEnvironment: () => ({ path: '/synthetic/environment.json', sha256: sha('synthetic environment') }),
     readEnvironment: () => measuredEnvironment,
@@ -147,6 +154,11 @@ function approvalRegistry(e: Parameters<typeof createSourceBuildRegistry>[0], ou
   return { ...registry, providers: registry.providers.map(provider =>
     provider.id === 'app-build-owner-publish-approval'
       ? { ...provider, invoke: (context: InProcessHandlerContext) => provider.invoke({ ...context, signal }) } : provider) };
+}
+function richApprovalRegistry(e: Parameters<typeof createSourceBuildRegistry>[0]) {
+  return bindRichPlanningContext(registerAppBuildRichTraversal(preserveBuildFailureReasons(approvalRegistry(e)), {
+    research: async item => ({ kind: item.kind, status: 'unavailable', reason: 'fixture-source-offline' }),
+  }));
 }
 const result = (value: unknown): Record<string, unknown> => {
   const object = typeof value === 'string' ? JSON.parse(value) : value;
@@ -224,6 +236,55 @@ test('sandbox failure exhausts two repairs without creating or publishing an app
     deps: { root: root(), capabilityProviders: approvalRegistry(e) } });
   expect(state.status).toBe('failed'); expect(e.calls.filter(call => call === 'verify')).toHaveLength(APP_BUILD_MAX_REPAIRS + 1);
   expect(e.calls).not.toContain('materialize'); expect(e.calls).not.toContain('publish');
+});
+
+test('verification back-edge regenerates a changed plan and keeps the new checkpoint', async () => {
+  const e = environment({ failTests: true, replanAfterFailure: true });
+  const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
+    deps: { root: root(), capabilityProviders: richApprovalRegistry(e) } });
+  const files = state.nodes.filter(node => node.nodeId === 'files');
+  expect(files).toHaveLength(2);
+  expect(result(files[0]?.output).files).toBe(plan.length);
+  expect(result(files[1]?.output).files).toBe(plan.length + 1);
+  expect(e.checkpoint()?.files).toHaveLength(plan.length + 1);
+  expect(e.calls).not.toContain('materialize');
+  expect(e.calls).not.toContain('publish');
+});
+
+test('same-plan corrupt checkpoint on a back-edge remains refused without overwrite', async () => {
+  const e = environment({ failTests: true, corruptOnReentry: true });
+  const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
+    deps: { root: root(), capabilityProviders: richApprovalRegistry(e) } });
+  const files = state.nodes.filter(node => node.nodeId === 'files');
+  expect(files).toHaveLength(2);
+  expect(result(files[1]?.output).errorCode).toBe('INVALID_RESUME');
+  expect(e.calls.filter(call => call === 'save')).toHaveLength(3);
+  expect(e.checkpoint()?.files).toHaveLength(plan.length);
+  expect(e.calls).not.toContain('materialize');
+  expect(e.calls).not.toContain('publish');
+});
+
+test('bounded masked test diagnostic survives the repair note and reaches the next file plan', async () => {
+  const secret = 'sk-or-v1-' + 'A'.repeat(20) + 'B'.repeat(20);
+  const interruptedSecret = 'sk-or-v1-' + 'A'.repeat(20) + '\x1b[31m' + 'B'.repeat(20);
+  const e = environment({ failTests: true, replanAfterFailure: true,
+    diagnostic: '가'.repeat(1000) + '\nFAIL tests/main.test.ts: expected 200, received 500; token=' + interruptedSecret });
+  const state = await runGraph(graph, { input, verifiedOwnerId: 'synthetic-owner', quiet: true,
+    deps: { root: root(), capabilityProviders: richApprovalRegistry(e) } });
+  const firstVerify = state.nodes.find(node => node.nodeId === 'verify-repair');
+  const failed = JSON.parse(String(firstVerify?.output));
+  const excerpt = failed.result.diagnosticExcerpt as string;
+  expect(Buffer.byteLength(excerpt)).toBeLessThanOrEqual(MAX_DIAGNOSTIC_BYTES);
+  expect(excerpt).toContain('FAIL tests/main.test.ts');
+  expect(excerpt).not.toContain(secret);
+  expect(excerpt).not.toContain('\uFFFD');
+  expect(excerpt).toContain('token=***');
+  const repair = result(state.nodes.find(node => node.nodeId === 'repair-verification')?.output);
+  expect(repair.diagnosticExcerpt).toBe(excerpt);
+  const replanPrompt = e.prompts.filter(prompt => prompt.includes('Stage: file-plan.'))[1];
+  expect(replanPrompt).toContain('FAIL tests/main.test.ts');
+  expect(replanPrompt).not.toContain(secret);
+  expect(JSON.stringify(state)).not.toContain(secret);
 });
 
 test('unavailable package import is identified before sandbox and repaired using measured built-ins', async () => {

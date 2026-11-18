@@ -235,6 +235,40 @@ test('replacement frame text is scanned before reset and later assistant frames 
   expect(screens.every(screen => !screen.includes('SYNTHETIC-PRIVATE-BODY'))).toBe(true);
 });
 
+test('the stream-open hook stays quiet until the first byte (A207)', async () => {
+  const opened: string[] = [];
+  let release!: () => void;
+  const turn = startNextTuiTurn({ sessionId: 's1', text: 'wait' }, {
+    run: (_input, onDelta) => new Promise<void>((resolve) => {
+      release = () => { onDelta('first'); resolve(); };
+    }),
+    onStreamOpen: () => opened.push('open'),
+  });
+  await Promise.resolve();
+  expect(opened).toEqual([]);
+  release();
+  await turn.done;
+  expect(opened).toEqual(['open']);
+});
+
+test('a turn aborted before it opens never runs, so nothing can announce it (A207)', async () => {
+  const announced: string[] = [];
+  let ran = false;
+  const hung = startNextTuiTurn({ sessionId: 's1', text: 'not yet' }, {
+    run: async () => {
+      ran = true;
+      announced.push('open');
+      return { goalComplete: false };
+    },
+  });
+  expect(announced).toEqual([]);
+  hung.abort();
+  const outcome = await hung.done;
+  expect(outcome.kind).toBe('cancelled');
+  expect(announced).toEqual([]);
+  expect(ran).toBe(false);
+});
+
 test('ordinary long responses continue showing newly streamed text beyond the preview window', async () => {
   const screens: string[] = [];
   let tick = 0;

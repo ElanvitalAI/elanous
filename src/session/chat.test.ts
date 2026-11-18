@@ -1,11 +1,12 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { afterAll, afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock, LLMMessage, LLMOpts, LLMProvider, StreamWithToolsHandlers } from '../llm.js';
 import * as actualLlm from '../llm.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
+import { needsGroundingFirst } from '../core-turn/grounding-first.js';
 import { PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../agent/terminal-surface.js';
 import * as actualMemory from '../memory.js';
 import * as actualSurfaceEvents from '../domains/surface-events.js';
@@ -14,6 +15,7 @@ import { debug } from '../debug/log.js';
 import { compactSessionHistory } from './compact-session.js';
 import { appendMessage, createSession, loadSession, rewriteSessionMessages } from './index.js';
 import { resetAutoCompactStateForTest } from '../compact/auto-state.js';
+import { TurnSilentFailureError } from './turn-silent-failure.js';
 import type { CompactProvider } from '../compact/provider.js';
 import type { ChatAutoCompactConfig } from '../user-config/chat.js';
 
@@ -276,6 +278,27 @@ describe('session chat terminal-capable turns', () => {
       chatTestSpies[0]?.mock.calls.some(([prompt]) => prompt === personalQuestion)
       || chatTestSpies[1]?.mock.calls.some(([prompt]) => prompt === personalQuestion)
     )).toBe(true);
+  });
+
+  test('MEMORY-TRIAGE ③ — real runTurn appends a usage-ledger line for an empty injection attempt; a skipped injection appends none', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-memory-usage-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    // The ledger lives under the (preload-isolated) memory root: '<root>/.triage-usage/<UTC day>.jsonl'. Literal path, not the product constant.
+    const ledgerDir = join(actualMemory.memoryRoot(), '.triage-usage');
+    const globalTurnLines = (): Array<Record<string, unknown>> => (existsSync(ledgerDir) ? readdirSync(ledgerDir) : [])
+      .filter(name => name.endsWith('.jsonl'))
+      .flatMap(name => readFileSync(join(ledgerDir, name), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>))
+      .filter(line => line.store === 'global' && line.via === 'turn');
+    const userText = 'What is the name of the user?';
+    const before = globalTurnLines().length;
+    await runToolTurn([tool('ToolSearch')], undefined, { userText, providerName: 'openai-codex', skipMemoryInjection: false });
+    const afterAttempt = globalTurnLines();
+    // The injection is empty (no block) — the attempt must still reach the ledger so «no activity» differs from «ran, nothing used».
+    expect(afterAttempt.length).toBe(before + 1);
+    expect(afterAttempt.at(-1)).toMatchObject({ v: 1, store: 'global', seat: null, via: 'turn', injected: [], used: [] });
+    expect(JSON.stringify(afterAttempt.at(-1))).not.toContain('name of the user');
+    await runToolTurn([tool('ToolSearch')], undefined, { userText, providerName: 'openai-codex', skipMemoryInjection: true });
+    expect(globalTurnLines().length).toBe(before + 1);
   });
 
   test('keeps fast-route behavior disabled when no concrete provider tier is available', async () => {
@@ -782,10 +805,14 @@ describe('Next TUI research turn routing', () => {
     const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
     const realCoreTurn = coreTurnModule.runCoreTurn;
     const core = spyOn(coreTurnModule, 'runCoreTurn').mockImplementation((ctx) => realCoreTurn(ctx));
+    // #37940: a timely market question («이번 주») waits for grounding with no model call and searched the live web here;
+    // this usage contract needs the provisional first pass plus synthesis, so the fixture is a non-timely research request.
+    const userText = '한국 시장의 구조 변화를 조사해줘';
+    expect(needsGroundingFirst(userText)).toBe(false);
     try {
       const result = await runTurn({
         userConfig: testConfig(provider, false), sessionId: session.id,
-        userText: '이번 주 한국 시장의 변화를 조사해줘', utteranceSurface: 'tui', systemPrompt: 'TUI prompt',
+        userText, utteranceSurface: 'tui', systemPrompt: 'TUI prompt',
         skipMemoryInjection: true, tools: [tool('Read')], dispatchTool: async () => 'read result', provider,
       });
       expect(core).toHaveBeenCalledTimes(1);
@@ -821,6 +848,59 @@ describe('Next TUI research turn routing', () => {
       expect(result.text).toBe('loop reply');
       expect(result.measuredUsage).toEqual({ inputTokens: 11, outputTokens: 4 });
     } finally { loop.mockRestore(); }
+  });
+
+  test('OPENROUTER-CLAUDE: goal-loop auth_rejected surfaces as a ✗ error instead of an empty done', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-or-claude-auth-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'openrouter', defaultModel: 'anthropic/claude-opus-5.5', available: () => true,
+      async *chat() { yield ''; }, async *streamChat() { /* never reached — the goal loop is stubbed */ },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    const loop = spyOn(goalLoopModule, 'runGoalLoop').mockImplementation(async () => ({
+      finalText: '', goalComplete: false, stopReason: 'auth_rejected', iterations: 1, errorMessage: 'HTTP 401 invalid x-api-key',
+    }) as never);
+    try {
+      let failure: unknown;
+      try {
+        await runTurn({
+          userConfig: testConfig(provider, false), sessionId: session.id,
+          userText: 'ok 라고만 답해', utteranceSurface: 'tui', systemPrompt: 'TUI prompt',
+          skipMemoryInjection: true, tools: [tool('Read')], dispatchTool: async () => 'unused', provider,
+          goalLoop: true, goalLoopMaxIterations: 1,
+        });
+      } catch (error) { failure = error; }
+      expect(failure).toBeInstanceOf(TurnSilentFailureError);
+      expect((failure as Error).message).toContain('provider=openrouter');
+      expect((failure as Error).message).toContain('model=anthropic/claude-opus-5.5');
+      expect((failure as Error).message).toContain('401');
+      // ⛔ the failed turn is never persisted as a final reply.
+      expect(loadSession(session.id)!.messages.some((m) => m.role === 'assistant' && m.replyFinal === true)).toBe(false);
+    } finally { loop.mockRestore(); }
+  });
+
+  test('OPENROUTER-CLAUDE: an empty tool turn (0 chars · 0 tool calls · no error) is an empty-response failure', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-or-claude-empty-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'openrouter', defaultModel: 'anthropic/claude-opus-5.5', available: () => true,
+      async *chat() { yield ''; }, async *streamChat() { /* empty stream */ },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    activeStreamScript = async () => '';
+    let failure: unknown;
+    try {
+      await runTurn({
+        userConfig: testConfig(provider), sessionId: session.id, userText: 'hello',
+        systemPrompt: 'base', skipMemoryInjection: true, tools: [tool('Read')],
+        dispatchTool: async () => 'ok', provider,
+      });
+    } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(TurnSilentFailureError);
+    expect((failure as Error).message).toContain('empty response');
   });
 
   test('uses the shared first-reply core turn with the across-turn goal loop disabled', async () => {

@@ -13,7 +13,7 @@ test('status slash is registered as a lazy branch module', async () => {
   for (const command of ['/status', '/st']) {
     expect(resolveNextTuiRoute(command, NEXT_TUI_INPUT_CONTEXT)?.id).toBe('status');
   }
-  expect(buildNextTuiHelpLines().join('\n')).toContain('/status · /st — 모델 · 연결 설정 · 계정 상태');
+  expect(buildNextTuiHelpLines().join('\n')).toContain('/status · /st — Model · connection settings · account status');
   const branch = await import(new URL('./status.js', import.meta.url).href);
   expect(branch.runNextTuiStatusBranchRoute).toBe(runNextTuiStatusBranchRoute);
 });
@@ -33,17 +33,17 @@ test('status simulation shows model, configured connection and selected account 
     auth: 'oauth',
     account: { name: 'team-sim', source: 'env' },
   })]);
-  expect(lines.join('\n')).toContain('모델: openai-codex / gpt-sim');
-  expect(lines.join('\n')).toContain('연결 설정: OAuth 자격 설정됨');
-  expect(lines.join('\n')).toContain('계정: team-sim (환경에서 선택)');
+  expect(lines.join('\n')).toContain('Model: openai-codex / gpt-sim');
+  expect(lines.join('\n')).toContain('Connection: OAuth configured · no live connection check');
+  expect(lines.join('\n')).toContain('Account: team-sim (selected by env)');
 });
 
 test('status never prints credentials and fails closed on missing account metadata', () => {
   const lines = renderNextTuiStatus({
     provider: 'openai-codex', model: 'gpt-sim', auth: 'none', account: null,
   });
-  expect(lines.join('\n')).toContain('연결 설정: 미설정');
-  expect(lines.join('\n')).toContain('계정: 이 provider의 계정 이름을 조회할 수 없음');
+  expect(lines.join('\n')).toContain('Connection: Not set');
+  expect(lines.join('\n')).toContain('Account: Cannot look up account name for this provider');
   expect(lines.join('\n')).not.toContain('token');
   expect(lines.join('\n')).not.toContain('secret');
 });
@@ -81,32 +81,33 @@ test('isolated next-TUI PTY shares live model status between /st and /status', a
       executable: process.execPath,
       args: [REPO_CLI, '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
       root,
-      ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q quit') },
       steps: [{
         label: 'status-default',
         text: '/st',
-        until: (screen) => screen.includes('모델·연결·계정 상태')
+        until: (screen) => screen.includes('Model · connection · account status')
           && screen.includes('status-sim-model')
-          && screen.includes('연결 설정: 미설정')
-          && screen.includes('계정: default'),
+          && screen.includes('Connection: Not set')
+          && screen.includes('Account: default'),
       }, {
         label: 'model-deep',
         text: '/model deep',
-        until: '모델: 깊음 · 다음 턴부터 적용',
+        // Wide footer «Turn Model: deep …» or the short clause «● Model: deep …» (narrow screen or long path).
+        until: (screen) => screen.includes('Model: deep · applies next turn'),
       }, {
         label: 'status-after-model',
         text: '/status',
-        until: (screen) => screen.includes('모델·연결·계정 상태')
-          && screen.includes('모델: openai-codex / gpt-6.1-sol')
-          && screen.includes('연결 설정: 미설정')
-          && screen.includes('계정: default'),
+        until: (screen) => screen.includes('Model · connection · account status')
+          && screen.includes('Model: openai-codex / gpt-6.1-sol')
+          && screen.includes('Connection: Not set')
+          && screen.includes('Account: default'),
       }],
     });
     const screen = evidence.frames.find((frame) => frame.label === 'status-after-model')?.screen ?? '';
     expect(evidence.exitCode).toBe(0);
-    expect(screen).toContain('모델: openai-codex / gpt-6.1-sol');
-    expect(screen).toContain('연결 설정: 미설정');
-    expect(screen).toContain('계정: default');
+    expect(screen).toContain('Model: openai-codex / gpt-6.1-sol');
+    expect(screen).toContain('Connection: Not set');
+    expect(screen).toContain('Account: default');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

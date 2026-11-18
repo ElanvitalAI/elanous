@@ -8,9 +8,11 @@ import { idPrefixCell, sessionIdPrefixes, sessionListTime } from '../../session/
 export { RESUME_BUSY_STATUS, RESUME_LIST_LIMIT, parseResumeCommand } from './resume-command.js';
 export type { ResumeCommand } from './resume-command.js';
 
-/** Recent conversations, newest first — the rows `/resume` shows (empty scratch sessions hidden, the active one kept). */
+/** Recent conversations, newest first — the rows `/resume` shows. Empty scratch sessions are hidden; the active
+ *  one stays only while it has messages (an empty current session is nothing to resume, so it was just noise). */
 export function resumeCandidates(activeId: string | null, limit = RESUME_LIST_LIMIT): SessionMeta[] {
-  return listSessions({ limit, hideEmpty: true, ...(activeId ? { keepIds: [activeId] } : {}) });
+  return listSessions({ limit, hideEmpty: true, ...(activeId ? { keepIds: [activeId] } : {}) })
+    .filter((m) => !(m.id === activeId && m.messageCount === 0));
 }
 
 /**
@@ -19,15 +21,15 @@ export function resumeCandidates(activeId: string | null, limit = RESUME_LIST_LI
  * the prefix grows past 8 characters when another stored session shares them.
  */
 export function resumeListLines(rows: readonly SessionMeta[], activeId: string | null): string[] {
-  if (rows.length === 0) return ['저장된 대화 없음'];
+  if (rows.length === 0) return ['No saved chats'];
   const prefixes = sessionIdPrefixes(rows.map((m) => m.id));
   const numberWidth = String(rows.length).length;
   return [
-    `최근 대화 ${rows.length}개 · /resume <번호> 또는 /resume <id 앞자리> 로 이어 가기`,
+    `${rows.length} recent chats · resume with /resume <number> or /resume <id prefix>`,
     ...rows.map((m, i) => {
       const marker = m.id === activeId ? '▸' : ' ';
       const when = sessionListTime(m.updatedAt);
-      const title = (m.title || '(제목 없음)').split('\n')[0]!.slice(0, 48);
+      const title = (m.title || '(untitled)').split('\n')[0]!.slice(0, 48);
       return `${String(i + 1).padStart(numberWidth)}. ${marker} ${idPrefixCell(prefixes, m.id)}  ${when}  ${String(m.messageCount).padStart(3)}t  ${title}`;
     }),
   ];
@@ -67,12 +69,12 @@ export function requestResumeTuiSession(input: {
   }
   if (!id) {
     debug.log('tui.next', 'session-resume-rejected', { from, prefix, reason: 'not-found' });
-    return { kind: 'rejected', status: `"${prefix}" 번호·앞자리에 맞는 대화 없음 · /resume 으로 목록 보기` };
+    return { kind: 'rejected', status: `No chat matches "${prefix}" · list with /resume` };
   }
   const shortId = sessionIdPrefixes([id]).get(id) ?? id;
-  if (id === from) return { kind: 'rejected', status: `이미 이 대화다 · ${shortId}` };
+  if (id === from) return { kind: 'rejected', status: `Already in this chat · ${shortId}` };
   setActiveSessionId(id);
   debug.log('tui.next', 'session-resume', { from, to: id, by: byNumber ? 'number' : 'prefix' });
-  const shortFrom = from ? (sessionIdPrefixes([from]).get(from) ?? from) : '없음';
-  return { kind: 'started', id, status: `대화 이어 가기 · ${shortId} · 이전 = ${shortFrom}` };
+  const shortFrom = from ? (sessionIdPrefixes([from]).get(from) ?? from) : 'none';
+  return { kind: 'started', id, status: `Resuming chat · ${shortId} · previous = ${shortFrom}` };
 }

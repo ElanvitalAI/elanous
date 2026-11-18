@@ -2,9 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import {
   applyShellApprovalKey,
   createReplGraphApprover,
+  createReplPublishApprover,
   createReplShellApprover,
   dispatchNextTuiBash,
   NEXT_TUI_SHELL_APPROVAL_IPC_ENV,
+  publishApprovalOf,
+  type ShellApprovalCallMessage,
   type ShellApprovalIpcProcess,
 } from './next-shell-approval.js';
 
@@ -99,8 +102,70 @@ describe('Next TUI human Bash approval', () => {
     expect(calls.map(call => call.callId)).toEqual(['s1', 'g1']);
     expect(calls.map(call => call.kind)).toEqual(['bash', 'graph']);
     ipc.receive({ type: 'elanous.shell-approval.result', callId: 'g1', approved: true });
-    expect(await pendingGraph).toBe(true);
+    expect(await pendingGraph).toEqual({ approved: true });
     ipc.receive({ type: 'elanous.shell-approval.result', callId: 's1', approved: false });
     expect(await pendingBash).toBe(false);
+  });
+
+  test('a publish request carries its URL as a structured field with its own call ids, beside a graph request', async () => {
+    const ipc = new FakeIpc();
+    const env = { [NEXT_TUI_SHELL_APPROVAL_IPC_ENV]: '1' };
+    const graph = createReplGraphApprover(ipc, env, 1000)!;
+    const publish = createReplPublishApprover(ipc, env, 1000)!;
+    const pendingGraph = graph('plain graph question');
+    const pendingPublish = publish('https://approve.example.com/a/1?t=tok', '2030-01-01T00:00:00Z', 'fallback sentence');
+    const calls = ipc.sent as ShellApprovalCallMessage[];
+    expect(calls.map(call => call.callId)).toEqual(['g1', 'p1']);
+    expect(calls[0]!.publish).toBeUndefined();
+    expect(publishApprovalOf(calls[1]!)).toEqual({ url: 'https://approve.example.com/a/1?t=tok', expiresAt: '2030-01-01T00:00:00Z' });
+    expect(calls[1]!.command).toBe('fallback sentence');
+    // The two answers do not cross.
+    ipc.receive({ type: 'elanous.shell-approval.result', callId: 'p1', approved: true });
+    expect(await pendingPublish).toBe(true);
+    ipc.receive({ type: 'elanous.shell-approval.result', callId: 'g1', approved: false });
+    expect(await pendingGraph).toEqual({ approved: false, reason: 'declined' });
+  });
+
+  test('a publish URL that is not credential-free https is not a publish call', () => {
+    const call = (url: string): ShellApprovalCallMessage => ({ type: 'elanous.shell-approval.call', callId: 'p1', command: 'x', kind: 'graph', publish: { url, expiresAt: 'later' } });
+    expect(publishApprovalOf(call('https://approve.example.com/a'))).not.toBeNull();
+    for (const bad of ['http://approve.example.com/a', 'https://user:pw@approve.example.com/a', 'javascript:alert(1)', 'not a url']) {
+      expect(publishApprovalOf(call(bad)), bad).toBeNull();
+    }
+    expect(publishApprovalOf({ type: 'elanous.shell-approval.call', callId: 'p1', command: 'x' } as ShellApprovalCallMessage)).toBeNull();
+  });
+
+  test('a graph approval reports WHY it was not approved: only an explicit no is declined', async () => {
+    const env = { [NEXT_TUI_SHELL_APPROVAL_IPC_ENV]: '1' };
+    // The owner says no.
+    const declined = new FakeIpc();
+    const pendingDeclined = createReplGraphApprover(declined, env, 1000)!('q');
+    declined.receive({ type: 'elanous.shell-approval.result', callId: 'g1', approved: false });
+    expect(await pendingDeclined).toEqual({ approved: false, reason: 'declined' });
+    // Nobody answers within the window (a per-call window overrides the default).
+    const silent = new FakeIpc();
+    const approver = createReplGraphApprover(silent, env, Number.MAX_SAFE_INTEGER)!;
+    const shortWindow = { timeoutMs: Number.EPSILON };
+    expect(await approver('q', undefined, shortWindow)).toEqual({ approved: false, reason: 'timeout' });
+    // The turn is cancelled.
+    const controller = new AbortController();
+    const cancelled = createReplGraphApprover(new FakeIpc(), env, 1000)!('q', controller.signal);
+    controller.abort();
+    expect(await cancelled).toEqual({ approved: false, reason: 'turn-cancelled' });
+    expect(await createReplGraphApprover(new FakeIpc(), env, 1000)!('q', controller.signal)).toEqual({ approved: false, reason: 'turn-cancelled' });
+    // The host cancels the request (no decision was made).
+    const hosted = new FakeIpc();
+    const pendingHosted = createReplGraphApprover(hosted, env, 1000)!('q');
+    hosted.receive({ type: 'elanous.shell-approval.cancel', callId: 'g1', reason: 'host-cancelled' });
+    expect(await pendingHosted).toEqual({ approved: false, reason: 'host-cancelled' });
+    // The channel cannot be written to.
+    const broken = new FakeIpc();
+    broken.send = () => { throw new Error('closed'); };
+    expect(await createReplGraphApprover(broken, env, 1000)!('q')).toEqual({ approved: false, reason: 'unavailable' });
+  });
+
+  test('bash and publish approvers keep their boolean answer (a timeout is still a denial there)', async () => {
+    const env = { [NEXT_TUI_SHELL_APPROVAL_IPC_ENV]: '1' };
+    expect(await createReplShellApprover(new FakeIpc(), env, Number.EPSILON)!('rm -rf /tmp/x')).toBe(false);
   });
 });

@@ -1,4 +1,4 @@
-import { TURN_INTERRUPTED_MARKER } from '../../chat/interjection.js';
+import { stripQueueModelContext, TURN_INTERRUPTED_MARKER } from '../../chat/interjection.js';
 import type { SerializedMessage } from '../../session/index.js';
 import { projectKnownAuthFailure, streamReplyFailure, streamReplyFinal } from './next-public-reply.js';
 
@@ -6,7 +6,10 @@ import { projectKnownAuthFailure, streamReplyFailure, streamReplyFinal } from '.
 export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omitLastTurnAnswer = false): SerializedMessage[] {
   const visible = messages.map((message) => message.role === 'tool' || message.role === 'assistant'
     ? { role: 'system' as const, content: '', ts: message.ts }
-    : message);
+    // A200 · ELN-QUEUE-SUPERSEDE — interrupted-on-purpose and «대체 후보» lines are model context; the bubble shows the person's words.
+    : message.role === 'user' && stripQueueModelContext(message.content) !== message.content
+      ? { ...message, content: stripQueueModelContext(message.content) }
+      : message);
   let candidate = -1;
   let turn = 0;
   const commit = (legacyLastAnswer = false): void => {

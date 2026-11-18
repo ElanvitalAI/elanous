@@ -297,3 +297,31 @@ test('real QR and completion components observe first-result SLA through fake OI
     }
   }
 });
+
+test('MEMBER-SIGNUP-UX-AUDIT: a disabled start button names what is still missing', async () => {
+  const priorWindow = globalThis.window;
+  const priorAct = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+  Object.assign(globalThis, { window: { location: { search: '?code=kcb1114', assign: () => {} } } });
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  let tree: ReturnType<typeof create> | null = null;
+  const hint = () => tree!.root.findAll((node) => node.props.id === 'signup-missing');
+  const text = () => hint()[0]?.children.join('') ?? '';
+  try {
+    await act(async () => { tree = create(<MemberSignupPage />); });
+    const button = () => tree!.root.findByType('button');
+    expect(button().props.disabled).toBe(true);
+    expect(button().props['aria-describedby']).toBe('signup-missing');
+    expect(text()).toContain('약관 동의 · 뉴스레터 수신 여부 선택');
+    await act(async () => { tree!.root.findAllByType('input').find((node) => node.props.type === 'checkbox')!.props.onChange({ target: { checked: true } }); });
+    expect(text()).not.toContain('약관 동의');
+    expect(text()).toContain('뉴스레터 수신 여부 선택');
+    await act(async () => { tree!.root.findByProps({ name: 'newsletterPreference', value: 'opted_in' }).props.onChange(); });
+    expect(hint()).toHaveLength(0);
+    expect(button().props.disabled).toBe(false);
+    expect(button().props['aria-describedby']).toBeUndefined();
+  } finally {
+    if (tree) await act(async () => tree!.unmount());
+    Object.assign(globalThis, { window: priorWindow });
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = priorAct;
+  }
+});

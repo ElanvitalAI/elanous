@@ -27,4 +27,9 @@ describe('next TUI sidetab peek', () => {
     expect(formatSidetabPeekLines('output', 4)).toEqual([]);
     expect(formatSidetabPeekLines('output', 20, 0)).toEqual([]);
   });
+
+  test('padded and rule-only lines do not become blank «↳ …» rows', () => {
+    const screen = ['                         나: 한 단어로 답해', '─'.repeat(60), '   ', '      엘라누스:      파랑   '].join('\n');
+    expect(formatSidetabPeekLines(screen, 28)).toEqual(['   ↳ 나: 한 단어로 답해', '   ↳ 엘라누스: 파랑']);
+  });
 });

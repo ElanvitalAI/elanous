@@ -390,3 +390,52 @@ export function releaseResumeGateExecutor(state: GraphRunState, opts: { from: st
     previous: { gateExecutor: saved.gateExecutor ?? null, gateRemote: saved.gateRemote ?? null },
   };
 }
+
+/** RECUT-GATE-WAIVE (대표 11-18): the gate sweep an earlier run (or this run before an append) already passed by waiver. */
+export interface GateSweepCarry {
+  /** Run whose waived gate record is inherited. */
+  runId: string;
+  version: string;
+  /** Cut commit that waived sweep covered. */
+  cut: string;
+  /** Cut commit of the run being waived now (descends from `cut`). */
+  tip: string;
+  /** Every commit in cut..tip, oldest first — the extra diff the inherited sweep did not measure. */
+  commits: string[];
+  priorWaiverReason: string;
+  priorWaiverAt?: string;
+  /** Ledger file the record was read from (live run state or its pre-append backup). */
+  source: string;
+}
+
+/** One evidence snapshot → the inherited sweep, or the reason it cannot be inherited. Pure: git answers are injected. */
+export function releaseGateSweepCarry(
+  evidence: GraphRunState,
+  current: { version: string; tip: string },
+  git: { isAncestor: (ancestor: string, descendant: string) => boolean; commitsBetween: (from: string, to: string) => string[] },
+  source: string,
+): GateSweepCarry {
+  if (evidence.graphId !== 'release-loop' || typeof evidence.runId !== 'string' || !evidence.runId) throw new Error('evidence run is not a release-loop run');
+  const cutOutput = lastJsonObject(evidence.nodes?.find((record) => record.nodeId === 'version-release')?.output);
+  const version = cutOutput?.version, cut = cutOutput?.commit;
+  if (typeof version !== 'string' || typeof cut !== 'string' || !/^[0-9a-f]{40}$/i.test(cut)) throw new Error('evidence run has no recorded release cut');
+  if (version !== current.version) throw new Error(`evidence run is release ${version}, not ${current.version}`);
+  const gates = evidence.nodes.filter((record) => record.nodeId === 'gate');
+  const gate = gates[0];
+  const reason = typeof gate?.waiver?.reason === 'string' ? gate.waiver.reason.trim() : '';
+  if (gates.length !== 1 || gate!.ok !== true || !reason) throw new Error('evidence run gate was not passed by a recorded waiver');
+  // No chaining (OP 11-18): only the run whose own gate sweep the owner accepted is evidence; a carried waiver is not.
+  if (gate!.waiver?.carriedSweep !== undefined) throw new Error('evidence run gate waiver was itself carried from another run; a carried waiver is not carried again');
+  if (!/^[0-9a-f]{40}$/i.test(current.tip)) throw new Error('current release cut is not a commit');
+  if (!git.isAncestor(cut, current.tip)) throw new Error(`current cut ${current.tip.slice(0, 12)} does not descend from the evidence cut ${cut.slice(0, 12)}`);
+  const commits = cut.toLowerCase() === current.tip.toLowerCase() ? [] : git.commitsBetween(cut, current.tip);
+  if (commits.some((sha) => !/^[0-9a-f]{40}$/i.test(sha))) throw new Error('extra diff between the evidence cut and the current cut could not be listed');
+  if (cut.toLowerCase() !== current.tip.toLowerCase() && commits.length === 0) throw new Error('extra diff between the evidence cut and the current cut could not be listed');
+  return { runId: evidence.runId, version, cut, tip: current.tip, commits, priorWaiverReason: reason,
+    ...(typeof gate!.waiver?.at === 'string' ? { priorWaiverAt: gate!.waiver.at } : {}), source };
+}
+
+/** Ledger evidence line binding the waiver event to the inherited sweep and the exact extra diff. */
+export function gateSweepCarryEvidence(carry: GateSweepCarry): string {
+  return `run:${carry.runId} cut:${carry.cut} tip:${carry.tip} commits:${carry.commits.join(',') || 'none'}`;
+}

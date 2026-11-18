@@ -22,7 +22,7 @@ test('next TUI /help shows Commands and Keys in the terminal screen', async () =
       rows: 24,
       cols: 100,
       env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20' },
-      ready: { label: 'next-tui-ready', timeoutMs: 30_000, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') }, // Source: #36661
+      ready: { label: 'next-tui-ready', timeoutMs: 30_000, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && /Ctrl\+Q (종료|quit)/.test(screen) }, // Source: #36661 · #37922 English footer
       steps: [{
         label: 'help-commands-visible',
         text: '/help',

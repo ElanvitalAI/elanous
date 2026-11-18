@@ -72,13 +72,14 @@ export async function diagnoseDeploymentEnvironment(root: string, runtimeCommand
     writeFileArtifact({ root: app, files: [{ path: 'probe.ts', content: probeSource },
       { path: 'probe.test.ts', content: "import { test } from 'bun:test'; test('module available', () => {});" }], metadata: {} });
     const runtime = realpathSync(process.execPath);
+    const home = realpathSync(app);
     const profile = macAppSandboxProfile({ readRoot: app, writeRoot: app,
       wrapper: join(app, 'source-artifact.json'), bunBinary: runtime });
-    const measured = await runShell({ command: ['/usr/bin/env', '-i', 'HOME=' + app, 'TMPDIR=' + app, 'PATH=/usr/bin:/bin',
+    const measured = await runShell({ command: ['/usr/bin/env', '-i', 'HOME=' + home, 'TMPDIR=' + home, 'PATH=/usr/bin:/bin',
       '/usr/bin/sandbox-exec', '-p', profile, runtime, 'probe.ts'],
     cwd: app, sandbox: 'off', network: 'off', approval: 'none', timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputChars: SHELL_MAX_OUTPUT });
     if (measured.outcome !== 'exit' || measured.exitCode !== 0) throw new Error('BUILD_ENVIRONMENT_UNAVAILABLE');
-    const testProbe = await runShell({ command: ['/usr/bin/env', '-i', 'HOME=' + app, 'TMPDIR=' + app, 'PATH=/usr/bin:/bin',
+    const testProbe = await runShell({ command: ['/usr/bin/env', '-i', 'HOME=' + home, 'TMPDIR=' + home, 'PATH=/usr/bin:/bin',
       '/usr/bin/sandbox-exec', '-p', profile, runtime, 'test', 'probe.test.ts'],
     cwd: app, sandbox: 'off', network: 'off', approval: 'none', timeoutMs: DEFAULT_TIMEOUT_MS, maxOutputChars: SHELL_MAX_OUTPUT });
     const row: unknown = JSON.parse(measured.stdout.trim());

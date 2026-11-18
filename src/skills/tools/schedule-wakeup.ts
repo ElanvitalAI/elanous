@@ -24,6 +24,8 @@
 //   ② 한 턴(같은 턴 id · H2 `lastTurnId`) 안 schedule·cancel 합계가 `WAKEUP_MAX_CALLS_PER_TURN` 을 넘으면
 //   거부 ⊕ debug.log('tui.wakeup','loop-capped',{turnId,count}).
 
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { debug } from '../../debug/log.js';
 import type { LLMToolDef } from '../../plugins/core/types.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../../chat/internal-turn-contract.js';
@@ -81,6 +83,120 @@ export interface WakeupEntry {
   fireCount: number;
 }
 
+/** 재기동 복원(OP O2)용 영속 인터페이스 — 실물은 이 TUI 세션의 JSON 파일 1개.
+ *  같은 세션 파일을 두 TUI 가 동시에 이어 쓰는 것은 지원하지 않는다(잠금 없음 · 마지막 쓰기 우선). */
+export interface WakeupPersistence {
+  /** 전체 목록을 저장한다. 실패하면 던지고 원본 파일은 그대로다. */
+  save(entries: WakeupEntry[]): void;
+  /** 저장된 목록. 파일이 없으면 빈 배열, 읽기·파싱 실패와 일부 항목 손상은 던진다(원본은 건드리지 않는다). */
+  load(): WakeupEntry[];
+}
+
+const SEAT_FILE = /^[A-Z][A-Z0-9_-]{0,63}$/;
+
+const SESSION_FILE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/** `seat-state/<SEAT>/wakeups/<session>.json` — one file per TUI session, never shared across processes. */
+export function seatWakeupFile(
+  seat: string,
+  sessionId: string,
+  hqRoot: string = join(process.env.HOME ?? '', 'elanous-hq'),
+): string {
+  const name = seat.trim().toUpperCase();
+  const session = sessionId.trim();
+  if (!SEAT_FILE.test(name)) throw new Error(`invalid wakeup seat ${JSON.stringify(seat)}`);
+  if (!SESSION_FILE.test(session)) throw new Error(`invalid wakeup session ${JSON.stringify(sessionId)}`);
+  return join(hqRoot, 'seat-state', name, 'wakeups', `${session}.json`);
+}
+
+function isWakeupEntry(value: unknown): value is WakeupEntry {
+  if (!value || typeof value !== 'object') return false;
+  const e = value as Partial<WakeupEntry>;
+  return typeof e.id === 'string' && /^w\d+$/.test(e.id) && typeof e.reason === 'string'
+    && typeof e.dueAt === 'number' && Number.isFinite(e.dueAt)
+    && (e.repeatMs === undefined || (typeof e.repeatMs === 'number' && Number.isFinite(e.repeatMs) && e.repeatMs >= WAKEUP_MIN_DELAY_MS))
+    && (e.fireCount === undefined || (typeof e.fireCount === 'number' && Number.isFinite(e.fireCount) && e.fireCount >= 0))
+    && (e.retried === undefined || typeof e.retried === 'boolean')
+    && (e.expiresAt === undefined || (typeof e.expiresAt === 'number' && Number.isFinite(e.expiresAt)));
+}
+
+class WakeupFileUnreadable extends Error {
+  constructor(readonly filePath: string, readonly cause: unknown) {
+    super(`wakeup file unreadable: ${filePath}`);
+  }
+}
+
+/** 없는 파일은 빈 배열. 읽기·파싱 실패는 던진다 — 빈 배열로 합치면 다음 저장이 원본을 덮는다. */
+function readWakeupEntries(filePath: string): WakeupEntry[] {
+  let text: string;
+  try { text = readFileSync(filePath, 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new WakeupFileUnreadable(filePath, error);
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); }
+  catch (error) { throw new WakeupFileUnreadable(filePath, error); }
+  if (!Array.isArray(parsed)) throw new WakeupFileUnreadable(filePath, 'not-array');
+  // 일부 항목만 깨져도 통째로 거부한다 — 걸러서 읽으면 다음 저장이 깨진 항목(원본 예약)을 영구 삭제한다.
+  if (!parsed.every(isWakeupEntry)) throw new WakeupFileUnreadable(filePath, 'invalid-entry');
+  // 같은 id 가 둘이면 복원이 하나를 덮어쓰고 다음 저장이 나머지를 영구 삭제한다 — 손상으로 본다.
+  if (new Set(parsed.map(entry => entry.id)).size !== parsed.length) throw new WakeupFileUnreadable(filePath, 'duplicate-id');
+  return parsed;
+}
+
+/** 이 TUI 세션의 파일 1개. 잠금은 없다. 쓰기는 임시 파일에 적은 뒤 rename 하고, 실패하면 임시만 지워 원본을 남긴다.
+ *  읽기에 실패한(손상) 파일은 쓰기를 거부한다 — 빈 목록으로 덮어쓰면 원본이 사라진다. 만들기는 던지지 않는다. */
+export function createFileWakeupPersistence(filePath: string): WakeupPersistence {
+  let loadFailed = false;
+  return {
+    save(entries) {
+      if (loadFailed) throw new Error(`wakeup file unreadable, write refused: ${filePath}`);
+      const tmp = `${filePath}.${process.pid}.tmp`;
+      try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        writeFileSync(tmp, JSON.stringify(entries));
+        renameSync(tmp, filePath);
+      } catch (error) {
+        try { unlinkSync(tmp); } catch { /* temp was never written, or already renamed */ }
+        throw error;
+      }
+    },
+    load(): WakeupEntry[] {
+      try { return readWakeupEntries(filePath); }
+      catch (error) { loadFailed = true; throw error; }
+    },
+  };
+}
+
+/** TUI 가 붙은 세션의 영속 위치를 고른다. 자리가 아니거나 세션이 없거나 하니스 자식이면 null(메모리만). */
+export function sessionWakeupPersistence(
+  seat: string | null | undefined,
+  sessionId: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  hqRoot?: string,
+): WakeupPersistence | null {
+  if (!seat || !sessionId || env.ELANOUS_HARNESS_ROLE?.trim()) return null;
+  try { return createFileWakeupPersistence(seatWakeupFile(seat, sessionId, hqRoot)); }
+  catch { return null; } // 쓸 수 없는 이름 — 기동은 계속하고 메모리만 쓴다
+}
+
+/** 세션이 붙거나 바뀔 때 부르는 묶개 — 같은 세션 id 를 다시 알려도 아무것도 하지 않는다(예약이 복제되지 않게). */
+export function createSessionWakeupBinder(
+  scheduler: Pick<WakeupScheduler, 'bindPersist'>,
+  seat: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  hqRoot?: string,
+): (sessionId: string | null | undefined) => void {
+  let bound: string | null = null;
+  return (sessionId) => {
+    const next = sessionId ?? null;
+    if (next === bound) return;
+    bound = next;
+    scheduler.bindPersist(sessionWakeupPersistence(seat, next, env, hqRoot));
+  };
+}
+
 export interface WakeupSchedulerDeps {
   /** H2 문 — 대시보드의 `internalTurnGate.startTurnIfIdle`. */
   startTurnIfIdle: (input: string, opts: StartTurnIfIdleOptions) => StartTurnIfIdleResult;
@@ -97,6 +213,8 @@ export interface WakeupSchedulerDeps {
   currentTurnId?: () => string | null;
   /** 한 턴 호출 상한(기본 `WAKEUP_MAX_CALLS_PER_TURN`). */
   maxCallsPerTurn?: number;
+  /** 세션 파일 영속. 없으면 메모리만(재기동 복원 없음). */
+  persist?: WakeupPersistence;
 }
 
 export type ScheduleWakeupRequest = {
@@ -116,10 +234,16 @@ export type ScheduleWakeupResult =
 
 export type CancelWakeupResult = { ok: true } | { ok: false; error: string; capped?: boolean };
 
-export interface WakeupScheduler {
-  schedule(req: ScheduleWakeupRequest, requestKey?: string): ScheduleWakeupResult;
-  list(): WakeupEntry[];
-  cancel(id: string): boolean;
+	export interface WakeupScheduler {
+	  schedule(req: ScheduleWakeupRequest, requestKey?: string): ScheduleWakeupResult;
+	  list(): WakeupEntry[];
+	  /** 이 스케줄러가 세션 파일을 실제로 쓰는지. 도구 문면이 복원을 사실처럼 적지 않게 쓴다. */
+	  persists(): boolean;
+  /** 세션 파일이 연결돼 있는가(손상으로 쓰기를 거부 중이어도 true). */
+  hasFile(): boolean;
+  /** 세션이 붙거나 바뀐 뒤 저장 위치를 묶는다(null = 메모리만). 메모리의 예약은 새 파일로 이어진다. */
+  bindPersist(next: WakeupPersistence | null): void;
+	  cancel(id: string): boolean;
   /** cancel 과 같되 거부 사유(없는 id · 턴 상한)를 값으로 낸다 — LLM 도구가 쓴다. */
   tryCancel(id: string): CancelWakeupResult;
   /** 모든 타이머를 거둔다(TUI 종료). */
@@ -176,6 +300,20 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
   let callTurnKey: string | null = null;
   let callCount = 0;
   const conflictErrors = new Map<string, string>();
+  let persist = deps.persist;
+  /** 손상된 파일을 만나 쓰기를 거부하는 중이면 그 이유. 이때 예약·취소는 거부하고 원본은 그대로 둔다. */
+  let writeRefused: string | null = null;
+  /** 영속 저장. 실패는 던진다(호출자가 정한다): 예약·취소 도구는 변경을 되돌리고 오류를 낸다. */
+  const persistSave = (): void => {
+    if (!persist) return;
+    if (writeRefused) throw new Error(writeRefused);
+    persist.save([...entries.values()].map(entry => ({ ...entry })));
+  };
+  /** 발화·만료·복원 정리 쪽 저장 — 실패해도 로그만 남기고 메모리 상태로 계속한다(다음 저장이 따라잡는다). */
+  const persistBestEffort = (): void => {
+    try { persistSave(); }
+    catch (error) { log('tui.wakeup', 'persist-save-failed', { error: String(error) }); }
+  };
 
   const readTurnId = (): string | null => deps.currentTurnId?.() ?? null;
 
@@ -202,10 +340,23 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
   const tryCancel = (id: string): CancelWakeupResult => {
     const capped = loopCapError('cancel');
     if (capped) return { ok: false, error: capped, capped: true };
-    if (!entries.has(id)) return { ok: false, error: `no pending wakeup ${JSON.stringify(id)}` };
-    drop(id);
-    log('tui.wakeup', 'cancelled', { id });
-    return { ok: true };
+    if (writeRefused) return { ok: false, error: writeRefused };
+    const entry = entries.get(id);
+    if (!entry) return { ok: false, error: `no pending wakeup ${JSON.stringify(id)}` };
+    const handle = timers.get(id);
+    if (handle !== undefined) clearTimer(handle);
+    timers.delete(id);
+    entries.delete(id);
+    try { persistSave(); }
+    catch (error) {
+      // 저장 실패 — 이 한 항목만 되돌린다(취소는 일어나지 않았다).
+      entries.set(id, entry);
+      arm(entry);
+      log('tui.wakeup', 'persist-save-failed', { error: String(error), action: 'cancel', id });
+      return { ok: false, error: `예약을 저장하지 못해 취소하지 않았다: ${error instanceof Error ? error.message : String(error)}` };
+    }
+	    log('tui.wakeup', 'cancelled', { id });
+	    return { ok: true };
   };
 
   const arm = (entry: WakeupEntry): void => {
@@ -219,10 +370,11 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     if (handle !== undefined) clearTimer(handle);
     timers.delete(id);
     entries.delete(id);
+    persistBestEffort();
   };
 
   /** 다음 회차로 — 놓친 틱은 하나로 합친다. 만료를 넘으면 소멸. */
-  const advance = (entry: WakeupEntry, t: number): void => {
+  const advance = (entry: WakeupEntry, t: number, save = true): void => {
     if (!entry.repeatMs) { drop(entry.id); return; }
     let next = entry.dueAt + entry.repeatMs;
     let coalesced = 0;
@@ -236,12 +388,21 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     entry.retried = false;
     if (coalesced > 0) log('tui.wakeup', 'skipped', { id: entry.id, reason: 'coalesced', ticks: coalesced });
     arm(entry);
+    if (save) persistBestEffort();
   };
 
-  const fire = (id: string): void => {
-    const entry = entries.get(id);
-    timers.delete(id);
-    if (!entry) return;
+	  const fire = (id: string): void => {
+	    const entry = entries.get(id);
+	    timers.delete(id);
+	    if (!entry) return;
+	    try { fireBody(id, entry); }
+	    catch (error) {
+	      log('tui.wakeup', 'fire-failed', { id, error: String(error) });
+	      deps.notify?.(`⏰ 예약 깨움 처리 실패(${id}): ${entry.reason}`);
+	    }
+	  };
+
+	  const fireBody = (id: string, entry: WakeupEntry): void => {
     const t = now();
     if (entry.expiresAt !== undefined && t > entry.expiresAt) {
       log('tui.wakeup', 'skipped', { id, reason: 'expired', fireCount: entry.fireCount });
@@ -271,17 +432,20 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     log('tui.wakeup', 'rejected', {
       id, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}), retried: entry.retried,
     });
-    const deferrable = WAKEUP_DEFERRABLE_REASONS.has(result.reason);
+    // ELN-SEAT-TURN-PACING: a minimum-interval refusal names when it may open (`retryAt`) — defer to then, never drop.
+    const pacedAt = !result.opened && result.reason === 'Cap' && result.retryAt !== undefined ? result.retryAt : null;
+    const deferrable = WAKEUP_DEFERRABLE_REASONS.has(result.reason) || pacedAt !== null;
     if (deferrable) {
       // 바쁨·사람 입력 중 — 버리지 않고 1분마다 다시 청한다(같은 회차). 상한 = 첫 예정 시각 + WAKEUP_DEFER_MAX_MS,
       // 반복이면 다음 회차 시각도 상한(그 회차가 이 깨움을 대신한다).
-      const nextTry = t + WAKEUP_RETRY_DELAY_MS;
+      const delay = pacedAt !== null ? Math.max(0, pacedAt - t) : WAKEUP_RETRY_DELAY_MS;
+      const nextTry = t + delay;
       // 상한 시각의 시도까지는 한다(<=) · 반복은 다음 회차 시각과 겹치면 그 회차에 넘긴다(<).
       const withinDeferCap = nextTry <= entry.dueAt + WAKEUP_DEFER_MAX_MS;
       const beforeNextTick = !entry.repeatMs || nextTry < entry.dueAt + entry.repeatMs;
       if (withinDeferCap && beforeNextTick) {
         entry.retried = true;
-        timers.set(id, setTimer(() => fire(id), WAKEUP_RETRY_DELAY_MS));
+        timers.set(id, setTimer(() => fire(id), delay));
         return;
       }
     } else if (!entry.retried) {
@@ -299,6 +463,75 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     log('tui.wakeup', 'skipped', { id, reason: exhausted, next: 'dropped' });
     deps.notify?.(`⏰ 예약 깨움 놓침(${id}): ${entry.reason} — ${result.reason}`);
     drop(id);
+  };
+
+  // 재기동 복원(OP O2): persist 가 있으면 이전 예약을 되살린다. 만료(expiresAt 경과)와
+  // 기한이 지난 일회성은 폐기+log. 반복만 advance 의 coalescing 으로 다음 회차에 재무장한다.
+  // 루프 안의 advance 는 저장하지 않는다 — 아직 안 읽은 뒤 항목이 파일에서 빠지지 않게, 전체를 메모리에
+  // 올린 뒤에 한 번만 저장한다.
+  const restoreFromPersist = (): void => {
+    if (!persist) return;
+    let restored = 0;
+    let discarded = 0;
+    let loaded: WakeupEntry[] = [];
+    try { loaded = persist.load(); }
+    catch (error) {
+      // 손상 파일: 목록은 비우고 쓰기를 거부한다(원본 보존). TUI 기동은 계속하고 화면에 알린다.
+      writeRefused = '예약 파일이 손상돼 예약·취소를 거부한다 — 원본은 그대로 두었으니 파일을 확인해라';
+      log('tui.wakeup', 'persist-load-failed', { error: String(error) });
+      deps.notify?.(`⏰ ${writeRefused}`);
+    }
+    for (const raw of loaded) {
+      const entry: WakeupEntry = { ...raw, retried: !!raw.retried, fireCount: raw.fireCount ?? 0 };
+      const m = /^w(\d+)$/.exec(entry.id);
+      if (m) { const n = Number(m[1]); if (n > seq) seq = n; } // id 시퀀스를 불러온 최대 이후로 이어감
+      entries.set(entry.id, entry);
+    }
+    const t = now();
+    for (const entry of [...entries.values()]) {
+      if (entry.expiresAt !== undefined && t > entry.expiresAt) {
+        log('tui.wakeup', 'restored-expired', { id: entry.id });
+        entries.delete(entry.id);
+        discarded++;
+        continue;
+      }
+      if (!entry.repeatMs && entry.dueAt <= t) {
+        log('tui.wakeup', 'restored-discarded', { id: entry.id, reason: 'one-shot-past-due' });
+        entries.delete(entry.id);
+        discarded++;
+        continue;
+      }
+      restored++;
+      if (entry.repeatMs && entry.dueAt <= t) advance(entry, t, false); else arm(entry);
+    }
+    if (discarded > 0) persistBestEffort();
+    if (restored > 0) log('tui.wakeup', 'restored', { count: restored, owner: process.pid });
+  };
+  restoreFromPersist();
+
+  /** 세션이 붙거나 바뀐 뒤에 저장 위치를 묶는다(TUI 가 스케줄러를 만들 때는 세션 id 를 아직 모를 수 있다).
+   *  예약은 «만든 세션»에 귀속한다: 세션이 바뀌면 지금 예약은 옛 파일에 이미 저장돼 있으니 메모리에서 비우고
+   *  새 세션 파일에서 불러온다(옮기지 않는다 — 옮기면 왕복 때 두 파일에서 중복 발화한다).
+   *  예외: 저장 위치가 없던 때(세션이 처음 붙기 전)에 건 예약은 어느 파일에도 없으니 첫 세션이 이어받는다. null = 메모리만. */
+  const bindPersist = (next: WakeupPersistence | null): void => {
+    const unsaved = persist && !writeRefused ? [] : [...entries.values()];
+    for (const handle of timers.values()) clearTimer(handle);
+    timers.clear();
+    entries.clear();
+    persist = next ?? undefined;
+    writeRefused = null;
+    restoreFromPersist();
+    if (writeRefused) {
+      // 새 파일이 손상 — 저장 전 예약은 메모리에서 계속 돌되 저장하지 않는다(원본 보존).
+      for (const entry of unsaved) { entries.set(entry.id, entry); arm(entry); }
+      return;
+    }
+    for (const old of unsaved) {
+      const entry = { ...old, id: `w${++seq}` };
+      entries.set(entry.id, entry);
+      arm(entry);
+    }
+    if (unsaved.length > 0 && persist) persistBestEffort();
   };
 
   return {
@@ -330,6 +563,7 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
         return reject(error);
       }
       if (!reason) return reject('reason 이 비었다 — 깨어나서 무엇을 할지 한 줄로 적어라');
+      if (writeRefused) return reject(writeRefused);
       if (entries.size >= maxEntries) return reject(`예약 상한 ${maxEntries}개 — list 로 보고 cancel 뒤 다시`);
       let repeatMs: number | undefined;
       // ⭐ 0 = 일회성(생략과 같다) — 모델이 «한 번만»을 0 으로 부른다(라이브 실측). 음수·NaN·1 미만 소수는 거부.
@@ -367,8 +601,18 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
         fireCount: 0,
         ...(repeatMs !== undefined ? { repeatMs, expiresAt: t + WAKEUP_REPEAT_TTL_MS } : {}),
       };
-      entries.set(entry.id, entry);
-      arm(entry);
+	      entries.set(entry.id, entry);
+	      arm(entry);
+      try { persistSave(); }
+      catch (error) {
+        // 저장 실패 — 방금 건 이 한 항목만 되돌린다. 예약된 것처럼 말하지 않는다.
+        const handle = timers.get(entry.id);
+        if (handle !== undefined) clearTimer(handle);
+        timers.delete(entry.id);
+        entries.delete(entry.id);
+        log('tui.wakeup', 'persist-save-failed', { error: String(error), action: 'schedule', id: entry.id });
+        return reject(`예약을 저장하지 못해 예약하지 않았다: ${error instanceof Error ? error.message : String(error)}`);
+      }
       log('tui.wakeup', 'scheduled', {
         id: entry.id, dueAt, inMs: dueAt - t, reason, ...(repeatMs ? { repeatMs, expiresAt: entry.expiresAt } : {}),
       });
@@ -376,9 +620,12 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       deps.notify?.(`⏰ 예약 깨움 ${formatWakeupClock(dueAt)}${repeat}: ${reason}`);
       return { ok: true, entry: { ...entry } };
     },
-    list() {
-      return [...entries.values()].sort((a, b) => a.dueAt - b.dueAt).map(e => ({ ...e }));
-    },
+	    list() {
+	      return [...entries.values()].sort((a, b) => a.dueAt - b.dueAt).map(e => ({ ...e }));
+	    },
+    bindPersist,
+    persists: () => !!persist && !writeRefused,
+    hasFile: () => !!persist,
     cancel(id) {
       return tryCancel(id).ok;
     },
@@ -386,7 +633,6 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     dispose() {
       for (const handle of timers.values()) clearTimer(handle);
       timers.clear();
-      entries.clear();
     },
   };
 }
@@ -404,6 +650,8 @@ const describeEntry = (e: WakeupEntry): Record<string, unknown> => ({
 
 /** 자리 TUI 의 host tool — 대시보드가 자기 스케줄러를 넘겨 등록한다(하니스 자식·비 TUI 표면엔 없다). */
 export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMToolDef {
+  // 저장 여부는 세션이 늦게 붙으면 바뀐다 — 설명(생성 시점)은 단정하지 않고, 결과(호출 시점)의 `saved` 가 사실을 말한다.
+  const durable = 'When this TUI is attached to a session file, wakeups are saved per session and restored when that session is reopened; each schedule result reports `saved` (false = memory only, gone when this TUI exits). Wakeups belong to the session that created them and do not move when you switch sessions. Two TUIs writing the same session file is not supported (last write wins). A failed save leaves the previous file untouched and schedule/cancel then report an error; a damaged file refuses scheduling and cancelling. A one-shot past its time is discarded on restore; repeats resume at their next tick. ';
   return {
     name: SCHEDULE_WAKEUP_TOOL_NAME,
     description:
@@ -412,7 +660,8 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
       + 'ONE-SHOT (wake once): give only delaySeconds or at and OMIT repeatMinutes (0 also means one-shot). Set repeatMinutes only when you really want it to repeat. '
       + `action=list shows pending wakeups; action=cancel needs id. Limits: ≥60s ahead, ≤7 days, at most 5 pending, at most ${WAKEUP_MAX_CALLS_PER_TURN} schedule/cancel calls per turn. `
       + 'If the TUI is busy or the human is typing at that time it retries once a minute later, then gives up (repeats move to the next tick). '
-      + 'In-process timer: lost when the TUI restarts. Not the same as schedule_manage — that is an OS cron job that runs a command outside this TUI and never opens a turn here.',
+      + durable
+      + 'Not the same as schedule_manage — that is an OS cron job that runs a command outside this TUI and never opens a turn here.',
     parameters: {
       type: 'object',
       properties: {
@@ -443,7 +692,7 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
         ...(typeof args.repeatMinutes === 'number' ? { repeatMinutes: args.repeatMinutes } : {}),
       };
       const result = scheduler.schedule(request, canonicalToolArgs(args));
-      return result.ok ? { scheduled: describeEntry(result.entry) } : { error: result.error };
+      return result.ok ? { scheduled: describeEntry(result.entry), saved: scheduler.persists() } : { error: result.error };
     },
   };
 }

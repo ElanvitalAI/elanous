@@ -36,9 +36,10 @@ export interface WaiverEventDecision {
   expiredBy?: WaiverEventExpiry;
 }
 
-export function gateWaiverEvidence(input: { reason: string; actor: string; unmeasured?: string }): string[] {
+export function gateWaiverEvidence(input: { reason: string; actor: string; unmeasured?: string; carried?: string }): string[] {
   return [`gate-waiver:reason:${input.reason}`, `gate-waiver:actor:${input.actor}`,
-    ...(input.unmeasured === undefined ? [] : [`gate-waiver:unmeasured:${input.unmeasured}`])];
+    ...(input.unmeasured === undefined ? [] : [`gate-waiver:unmeasured:${input.unmeasured}`]),
+    ...(input.carried === undefined ? [] : [`gate-waiver:carried:${input.carried}`])];
 }
 
 /** A one-use waiver is bound to its complete evidence set; subset matching can revive stale grants. */

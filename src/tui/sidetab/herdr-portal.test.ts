@@ -14,7 +14,7 @@ describe('Herdr sidetab portal adapter', () => {
     });
     expect(portal.enabled()).toBe(false);
     expect(await portal.refreshRows()).toEqual([]);
-    await expect(portal.readPane('w1:p1')).rejects.toThrow('Herdr 관리 pane');
+    await expect(portal.readPane('w1:p1')).rejects.toThrow('Herdr admin pane');
     expect(calls).toEqual([]);
   });
 
@@ -36,14 +36,14 @@ describe('Herdr sidetab portal adapter', () => {
     });
     const rows = await portal.refreshRows();
     expect(rows.map(({ id, badge, label }) => [id, badge, label])).toEqual([
-      ['herdr:w1:p1', 'busy', expect.stringContaining('승인 필요')],
-      ['herdr:w1:p2', 'idle', expect.stringContaining('검증 완료')],
-      ['herdr:w1:p3', 'unknown', expect.stringContaining('미검증 완료')],
-      ['herdr:w1:p4', 'exited', expect.stringContaining('멈춤')],
-      ['herdr:w1:p5', 'unknown', expect.stringContaining('미검증 완료')],
+      ['herdr:w1:p1', 'busy', expect.stringContaining('Needs approval')],
+      ['herdr:w1:p2', 'idle', expect.stringContaining('Verified done')],
+      ['herdr:w1:p3', 'unknown', expect.stringContaining('Unverified done')],
+      ['herdr:w1:p4', 'exited', expect.stringContaining('Stopped')],
+      ['herdr:w1:p5', 'unknown', expect.stringContaining('Unverified done')],
     ]);
-    expect(rows[1]?.label).toContain('비용 $1.25');
-    expect(rows[2]?.label).toContain('비용 —');
+    expect(rows[1]?.label).toContain('Cost $1.25');
+    expect(rows[2]?.label).toContain('Cost —');
   });
 
   test('uses explicit pane ids for observe and takeover input; preserves errors and existing snapshot on refresh failure', async () => {
@@ -67,11 +67,11 @@ describe('Herdr sidetab portal adapter', () => {
     snapshotMode = 'exit';
     const stale = await portal.refreshRows();
     expect(stale).toHaveLength(2);
-    expect(stale[0]?.label).toContain('오래된 스냅샷');
+    expect(stale[0]?.label).toContain('stale snapshot');
     expect(stale[1]?.label).toContain('snapshot down');
     expect(portal.rows()).toHaveLength(2);
     snapshotMode = 'bad-envelope';
-    expect((await portal.refreshRows()).at(-1)?.label).toContain('panes 배열');
+    expect((await portal.refreshRows()).at(-1)?.label).toContain('panes array');
     snapshotMode = 'bad-pane';
     expect((await portal.refreshRows()).at(-1)?.label).toContain('panes[0].pane_id');
     snapshotMode = 'ok';

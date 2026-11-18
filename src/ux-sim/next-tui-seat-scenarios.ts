@@ -172,6 +172,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       env: {
         ...base.env,
         [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: 'CAP-BOUNDARY', name: 'Bash', args: { command: 'true' } }),
+        // This scenario pins the cap boundary itself (one cap event, then a human turn); automatic continuation is off here.
+        ELANOUS_TUI_SEAT_CAP_CONTINUE: '0',
       },
       steps: [
         { label: 'seat tool cap ends the real turn', text: '목표: CAP-BOUNDARY 한 번만 실행하고 자리 턴을 닫아줘', until: (screen) => screen.includes(reply) && screen.includes('Turn cap reached') },
@@ -198,6 +200,11 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         return done(2)(screen);
       })(),
       escapeCanceledIdleDraft: run.frames.find((frame) => frame.label === 'idle Escape cancels only the draft')?.screen.includes('입력 취소됨') === true,
+      // SEAT-CAP-RESUME-NOTICE(연속 큐 미재개) — 상한 소진 직후 자리 우편함으로 재개 안내 1통이 나갔는지.
+      resumeNoticePostedOnce: (() => {
+        const notices = events.filter((event) => event.category === 'goal.loop' && event.event === 'seat-cap-resume-notice-posted');
+        return notices.length === 1;
+      })(),
       onlyFakeProvider: routes.length > 0 && routes.every((route) => route.provider === 'test-fake-llm'),
       exitedClean: run.exitCode === 0,
     };
@@ -236,7 +243,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       },
       steps: [
         { label: 'agent dispatch', text: '서브에이전트로 확인해줘', until: (screen) => screen.includes(reply)
-          && screen.includes('✓ 하위 에이전트 · 완료 1') && isSettledNextTuiScreen(screen) && screen.includes('❯ '), timeoutMs: 90_000 },
+          && screen.includes('✓ sub-agents · done 1') && isSettledNextTuiScreen(screen) && screen.includes('❯ '), timeoutMs: 90_000 },
       ],
     });
     const captured = readFileSync(capture).subarray(captureOffset).toString('utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as {
@@ -411,7 +418,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         slashCandidatesInInputArea: run.frames.find((frame) => frame.label === 'slash candidates')?.screen.includes('/ 명령') === true,
         slashPickerLivesImmediatelyAboveComposer: (() => {
           const lines = (run.frames.find((frame) => frame.label === 'slash candidates')?.screen ?? '').split('\n');
-          const firstCandidate = lines.findIndex((line) => line.includes('▸ /help — 명령과 키 안내'));
+          const firstCandidate = lines.findIndex((line) => line.includes('▸ /help — Command and key guide'));
           const hint = lines.findIndex((line) => line.includes('Enter 실행 · Esc 닫기'));
           const composer = lines.findIndex((line) => line.trimStart().startsWith('❯ /he'));
           return firstCandidate > 0 && lines[firstCandidate - 1]?.includes('/ 명령') === true
@@ -562,7 +569,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     const steps: SeatPtyStep[] = [
       { label: 'after message 1', text: '첫 메시지', until: done(1) },
       { label: 'before /new (2 messages)', text: '둘째 메시지', until: done(2) },
-      { label: `after ${newSessionCommand}`, text: newSessionCommand, until: (s) => /새 대화 · 이전 = [0-9a-f]{8}/.test(s) },
+      { label: `after ${newSessionCommand}`, text: newSessionCommand, until: (s) => /New chat · previous = [0-9a-f]{8}/.test(s) },
       { label: 'after message 3 (new session)', text: '셋째 메시지', until: done(1, '셋째 메시지') },
       // `/new` lands while the 4th turn is in flight: the TUI must refuse it and keep the session.
       { label: `busy ${newSessionCommand}`, chunks: ['넷째 메시지', '\r', `${newSessionCommand}\r`], until: (s) => s.includes('응답 중에는 /new') || done(2, '넷째 메시지')(s) },
@@ -581,8 +588,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     const routes = events.filter((e) => e.category === 'llm.route-decision' && e.event === 'local-chat-executed').map((e) => parseData<{ provider: string; sessionId: string }>(e.data));
     const afterNew = run.frames.find((f) => f.label === `after ${newSessionCommand}`)?.screen ?? '';
     const checks = {
-      screenClearedWithNewTitle: afterNew.includes('새 대화 · 이전 =') && !afterNew.includes('첫 메시지') && !afterNew.includes(reply),
-      statusNamesPrevious: Boolean(oldId) && afterNew.includes(`새 대화 · 이전 = ${oldId.slice(0, 8)}`),
+      screenClearedWithNewTitle: afterNew.includes('New chat · previous =') && !afterNew.includes('첫 메시지') && !afterNew.includes(reply),
+      statusNamesPrevious: Boolean(oldId) && afterNew.includes(`New chat · previous = ${oldId.slice(0, 8)}`),
       sessionNewObservedOnce: sessionNew.length === 1,
       nextTurnInNewSession: routes.length >= 3 && routes[2]?.sessionId === fromTo.to && routes[0]?.sessionId === oldId,
       oldSessionKept: JSON.stringify(store.oldUser) === JSON.stringify(['첫 메시지', '둘째 메시지']),
@@ -617,7 +624,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     return sid;
   });
   const steps: SeatPtyStep[] = [
-    { label: 'after turn (auto compact)', text: '긴 대화 뒤 질문', until: (s) => count(s, reply) === 1 && /턴 압축 12→\d+ 메시지 · 응답 완료/.test(s) && s.includes('❯ ') },
+    { label: 'after turn (auto compact)', text: '긴 대화 뒤 질문', until: (s) => count(s, reply) === 1 && /Compacted 12→\d+ messages/.test(s) && s.includes('❯ ') },
     { label: 'after /compact', text: '/compact', until: (s) => /압축 \d+→\d+ 메시지/.test(s) && s.includes('❯ ') },
   ];
   const run = await mockSeatPtySequence({
@@ -640,7 +647,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     autoCompactOnce: auto.length === 1 && Number(auto[0]!.before) > Number(auto[0]!.after),
     autoBeforeIsSeeded12: auto[0]?.before === 12,
     manualCompactOnce: manual.length === 1 && Number(manual[0]!.before) > Number(manual[0]!.after),
-    screenShowsAuto: /압축 12→\d+ 메시지/.test(run.frames.find((f) => f.label === 'after turn (auto compact)')?.screen ?? ''),
+    screenShowsAuto: /Compacted 12→\d+ messages/.test(run.frames.find((f) => f.label === 'after turn (auto compact)')?.screen ?? ''),
     summaryFromFakeLlm: Boolean(summary?.content.includes(reply)),
     onlyFakeProvider: routes.length > 0 && routes.every((r) => r.provider === 'test-fake-llm'),
     exitedClean: run.exitCode === 0,
@@ -661,7 +668,7 @@ async function runNextResumeScenario(spec: NextTuiScenarioSpec, root: string, ba
   });
   const steps: SeatPtyStep[] = [
     { label: 'after /resume list', text: '/resume', until: (s) => s.includes(seeded.target.slice(0, 8)) && s.includes('저장된 n8n 설명') },
-    { label: 'after /resume load', text: `/resume ${seeded.target.slice(0, 8)}`, until: (s) => s.includes(`대화 이어 가기 · ${seeded.target.slice(0, 8)}`) && s.includes('저장된 n8n 맥락') },
+    { label: 'after /resume load', text: `/resume ${seeded.target.slice(0, 8)}`, until: (s) => s.includes(`Resuming chat · ${seeded.target.slice(0, 8)}`) && s.includes('저장된 n8n 맥락') },
     { label: 'after resumed turn', text: '이어진 대화 확인', until: done(1, '이어진 대화 확인') },
   ];
   const run = await mockSeatPtySequence({ ...base, steps });

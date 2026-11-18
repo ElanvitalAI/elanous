@@ -10,6 +10,7 @@ import {
   drainTurnTypeaheadQueue,
   drainedIntoTurn,
   restoreTurnTypeaheadSubmission,
+  isTurnTypeaheadSteerable,
 } from './turn-typeahead.js';
 import { createPasteFold } from './paste-fold.js';
 import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
@@ -340,4 +341,12 @@ describe('TUI-PASTE-WHILE-STREAMING — 턴 중 붙여넣기는 버리지 않는
     expect(next.startsWith('[붙여넣음 #2 ')).toBe(true);
     expect(fold.expand(`${a.state.buffer} 끝`)).toBe(`${long} 끝`);
   });
+});
+
+test('steer excludes slash commands and ! shell lines (§6: slash and shell are always queue)', () => {
+  expect(isTurnTypeaheadSteerable('이 PR 말고 #38017 먼저')).toBe(true);
+  expect(isTurnTypeaheadSteerable('/model glm')).toBe(false);
+  expect(isTurnTypeaheadSteerable('!git status')).toBe(false);
+  expect(isTurnTypeaheadSteerable('  !ls')).toBe(false);
+  expect(isTurnTypeaheadSteerable('   ')).toBe(false);
 });

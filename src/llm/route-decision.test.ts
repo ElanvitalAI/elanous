@@ -1,5 +1,8 @@
-import { describe, expect, test } from 'bun:test';
-import { resolveRouteDecision } from './route-decision.js';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { resolveRouteDecision, clearSurfaceRouteDecision, recordCurrentRouteDecision, currentRouteExecution, routeFallbackLabel } from './route-decision.js';
+import { recordDashboardTurnExecution } from '../dashboard/acp-active-model.js';
+import { statusModelActual } from '../status/status-provider-info.js';
+import { debug } from '../debug/log.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 
 describe('resolveRouteDecision', () => {
@@ -44,5 +47,51 @@ describe('resolveRouteDecision', () => {
 
     expect(decision.model).toBe(lookupLlmTierSpec('openai-codex', 'better').model);
     expect(decision.source).toBe('codex-tier-policy');
+  });
+});
+
+describe('dashboard displayed model vs actual execution warning', () => {
+  const planned = () => resolveRouteDecision({
+    provider: 'openai-codex', text: 'hi', explicitModel: 'displayed-model',
+  });
+
+  test('a different actual model displays the fallback and emits exactly one warn with both models', () => {
+    clearSurfaceRouteDecision('dashboard');
+    const decision = planned();
+    recordCurrentRouteDecision('dashboard', decision);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      recordDashboardTurnExecution({ model: 'actual-model', routeProvider: 'grok' }, { remote: false });
+
+      expect(routeFallbackLabel('dashboard')).toBe('displayed-model → actual-model');
+      expect(statusModelActual('dashboard')).toEqual({ model: 'actual-model', provider: 'grok', fallbackFrom: 'displayed-model' });
+      expect(currentRouteExecution('dashboard')).toEqual({ model: 'actual-model', provider: 'grok' });
+      expect(log.mock.calls.filter(([, , , options]) => options?.level === 'warn')).toEqual([
+        ['llm.route-decision', 'dashboard-executed-fallback', {
+          planned: { provider: decision.provider, model: 'displayed-model' },
+          actual: { provider: 'grok', model: 'actual-model' },
+        }, { level: 'warn' }],
+      ]);
+    } finally {
+      log.mockRestore();
+      clearSurfaceRouteDecision('dashboard');
+    }
+  });
+
+  test('a matching actual model displays no fallback and emits zero warns', () => {
+    clearSurfaceRouteDecision('dashboard');
+    recordCurrentRouteDecision('dashboard', planned());
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      recordDashboardTurnExecution({ model: 'displayed-model', routeProvider: 'openai-codex' }, { remote: false });
+
+      expect(routeFallbackLabel('dashboard')).toBeNull();
+      expect(statusModelActual('dashboard')).toEqual({ model: 'displayed-model', provider: 'openai-codex' });
+      expect(currentRouteExecution('dashboard')).toEqual({ model: 'displayed-model', provider: 'openai-codex' });
+      expect(log.mock.calls.filter(([, , , options]) => options?.level === 'warn')).toHaveLength(0);
+    } finally {
+      log.mockRestore();
+      clearSurfaceRouteDecision('dashboard');
+    }
   });
 });

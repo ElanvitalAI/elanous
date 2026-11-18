@@ -7,6 +7,7 @@
 // 엔드포인트 기본 = 본머신 ⊕ ~/.elanous/ssh-hosts.json 에서 `roles: ["llm"]` 인 호스트의 :1234.
 
 import { sshHostsWithRole } from '../../ssh/ssh-hosts.js';
+import { llmNetworkFetch } from '../../session-runtime/llm-call-gateway.js';
 
 export interface LocalLlmOpts {
   endpoints?: string[];   // 기본 defaultEndpoints()
@@ -61,11 +62,11 @@ export function makeLocalLlm(opts: LocalLlmOpts = {}): LocalLlm {
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const resp = await fetch(`${base}/v1/chat/completions`, {
+      const resp = await llmNetworkFetch(`${base}/v1/chat/completions`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens, stream: false }),
         signal: ctrl.signal,
-      });
+      }, { provider: 'local', model, role: 'aux', requestedBy: 'community-buzz', selectionSource: opts.model ? 'explicit' : 'config' });
       if (!resp.ok) throw new Error(`${base} ${resp.status}`);
       const j = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
       const content = j?.choices?.[0]?.message?.content;

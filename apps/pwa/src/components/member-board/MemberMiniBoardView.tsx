@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { MiniBoardCard } from '@/lib/mini-board-projection';
 import type { MemberMiniBoardApi, VerifiedMemberOwner } from '@/lib/member-mini-board-api';
+import { MEMBER_WEBCHAT_LABEL, MEMBER_WEBCHAT_PATH } from '@/lib/member-webchat-entry';
 import {
   MINI_BOARD_COLUMNS, msUntilNextSeoulMidnight, projectMemberBoardCards, recheckedBriefing, rowsForVerifiedMember, rowsFromApi, todayInSeoul,
   type BriefingCard, type MemberBoardCard, type MemberBoardAttachment,
@@ -28,6 +29,8 @@ export function MemberMiniBoardView({
         <p className="mt-2 text-sm text-muted-foreground">내 제안부터 배포까지의 상태와 오늘의 브리핑</p>
       </div>
       <div className="flex items-center gap-3 text-sm text-muted-foreground">
+        <a href={MEMBER_WEBCHAT_PATH} data-member-webchat-entry
+          className="rounded-lg bg-primary px-3 py-2 font-medium text-primary-foreground">{MEMBER_WEBCHAT_LABEL}</a>
         <a href="/app/member/invite/" className="rounded-lg border border-border bg-card px-3 py-2 font-medium text-foreground">내 초대 링크</a>
         {refreshedAt && <span>갱신 {refreshedAt}</span>}
         <button type="button" onClick={onRefresh} disabled={loading}

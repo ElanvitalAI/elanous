@@ -44,10 +44,13 @@ import { getChannelBus } from '../terminal-matrix/index.js';
 import type { ChannelBus } from '../terminal-matrix/channel-bus.js';
 import { startChildLivenessHeartbeat } from './child-liveness-heartbeat.js';
 import {
-  SEAT_IDLE_NO_WORK_NOTICE, SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_TOOL_NOTICE,
+  OWNER_APPROVAL_TOOL_NAMES, SEAT_CAP_APPROVAL_DEFER_MAX_MS, SEAT_CAP_DEFERRED_WRAPUP_MS,
+  SEAT_IDLE_NO_WORK_NOTICE, SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_TOOL_NOTICE, SeatTurnCapAbort,
   isEmptyMailListResult, isIdleWaitCall, type SeatTurnCapConfig,
 } from './seat-turn-cap.js';
 import type { TuiChatContext } from './short-question.js';
+import { parseCompletionVerdict } from '../model-tier/escalation-rules.js';
+import type { CoreAdvisor } from '../model-tier/advisor-checkpoints.js';
 
 export {
   CHILD_LIVENESS_HEARTBEAT_ENV,
@@ -419,10 +422,18 @@ export interface GoalLoopOptions {
    *     턴이 끝나면 stopReason 을 max_turns 로 두고 다음 반복으로 잇는다(반복 하드캡 maxIterations 는 그대로).
    *  ⓑ 같은 core 턴의 «새 항목 0» 우편 조회가 연속 idleEmptyMsgListLimit 번이면 «할 일 0» 으로 goal 을 완료한다(idle-no-work). */
   seatTurnCap?: SeatTurnCapConfig & { seat: string };
+  /** SEAT-CAP-RESUME-NOTICE(연속 큐 미재개) — 상한 소진으로 자리 턴을 마감하기 직전 정확히 1회.
+   *  e3cd96b01d 설계(같은 루프 reinject 금지·«사람·다음 자리 턴이 재개»)를 존중해 재개 자체는 하지 않고
+   *  호스트가 자리 우편함에 재개 안내를 남길 수 있게 훅만 제공한다. 생략하면 동작 변화 0.
+   *  update_goal(complete)+비지 않은 evidence 로 끝나는 경로에서는 발화하지 않는다. */
+  onSeatCapExhausted?: (info: { seat: string; finalText: string; iterations: number }) => void | Promise<void>;
   /** Test seam — 벽시계(ms). 기본 Date.now. */
   now?: () => number;
   /** Test seam — accelerate the seat wall-clock cap in simulator scenarios. */
   scheduleSeatWallCap?: (callback: () => void, delayMs: number) => { dispose(): void };
+  /** HARNESS-ADVISOR-CHECKPOINTS — 모델 오케스트레이션 코어의 강 모델 조언(계획 직전 · 같은 오류 2회 · 완료 직전).
+   *  생략 = 상담·기록 없음(종전 그대로). 그림자에서는 코어가 «상담했을 것»만 적고 undefined 를 돌려준다. */
+  advisor?: CoreAdvisor;
 }
 
 /** TUI-SEAT-TURN-CAP — 상한·idle 안내 «뒤» 에도 도구 호출이 이만큼 넘게 오면 그 core 턴을 끝낸다. */
@@ -609,6 +620,10 @@ export async function runGoalLoop(
 
   // 목표 계약 주입(첫 turn 앞). caller 가 이미 넣었으면 injectPreamble:false.
   const messages: LLMMessage[] = [...ctx.messages];
+  const advisor = opts.advisor;
+  // HARNESS-ADVISOR-CHECKPOINTS — 턴 뒤 같은 오류 상담의 조언은 다음 재주입에 싣는다.
+  let pendingAdvice: string | undefined;
+  const pendingSameErrors: string[] = [];
   if (opts.injectPreamble !== false) {
     messages.unshift({ role: 'system', content: GOAL_SYSTEM_PREAMBLE });
   }
@@ -740,8 +755,11 @@ export async function runGoalLoop(
         });
       } catch { /* 관측 실패가 재주입을 막지 않는다 */ }
     }
+    const advice = pendingAdvice;
+    pendingAdvice = undefined;
     messages.push({ role: 'user', content: [
       content,
+      ...(advice ? [advice] : []),
       ...(lastIteration ? [GOAL_FINAL_ITERATION_NOTE] : []),
       ...(shouldAttachDelegateHint ? [DELEGATE_HINT] : []),
     ].join('\n') });
@@ -901,11 +919,35 @@ export async function runGoalLoop(
       const handle = setTimeout(callback, delayMs);
       return { dispose: () => clearTimeout(handle) };
     });
+    // APP-BUILD-TOOL-WALL-CAP — 승인을 쥘 수 있는 도구(app_build)가 실행 중이면 상한 abort 를 미룬다.
+    //   새 도구는 seatClosing 으로 막고, 진행 중 호출은 끊지 않는다. 그 도구가 돌아오면 요약 여유 뒤,
+    //   돌아오지 않으면 승인 창 한 벌 ⊕ 여유(SEAT_CAP_APPROVAL_DEFER_MAX_MS) 뒤 끊는다.
+    const approvalToolsInFlight: string[] = [];
+    let seatAbortDeferred: 'tools' | 'wall' | 'idle' | 'backstop' | null = null;
+    const seatDeferTimers: Array<{ dispose(): void }> = [];
+    const abortSeatTurnNow = (capReason: 'tools' | 'wall' | 'idle' | 'backstop') => {
+      if (ctx.signal.aborted || turnAbortController.signal.aborted) return;
+      seatCapAborted = true;
+      turnAbortController.abort(new SeatTurnCapAbort(capReason));
+    };
+    const requestSeatAbort = (capReason: 'tools' | 'wall' | 'idle' | 'backstop') => {
+      if (ctx.signal.aborted || turnAbortController.signal.aborted) return;
+      const holder = approvalToolsInFlight[0];
+      if (holder === undefined) { abortSeatTurnNow(capReason); return; }
+      if (seatAbortDeferred !== null) return;
+      seatAbortDeferred = capReason;
+      try {
+        debug.log('goal.loop', 'seat-turn-cap-deferred', {
+          sessionId: ctx.sessionId, ...runAttribution, seat: seatCap?.seat, tool: holder, reason: capReason,
+          iteration: iterations, wallMs: now() - seatTurnStartedAt, deferMaxMs: SEAT_CAP_APPROVAL_DEFER_MAX_MS,
+        }, { level: 'warn' });
+      } catch { /* 관측 실패가 미룸을 깨지 않는다 */ }
+      seatDeferTimers.push(scheduleSeatWallCap(() => abortSeatTurnNow(capReason), SEAT_CAP_APPROVAL_DEFER_MAX_MS));
+    };
     const seatWallTimer = seatCap ? scheduleSeatWallCap(() => {
       if (ctx.signal.aborted) return;
       seatClosing = 'wall';
-      seatCapAborted = true;
-      turnAbortController.abort(new Error('seat turn wall-clock cap reached'));
+      requestSeatAbort('wall');
     }, Math.max(1, seatCap.maxWallMs - (now() - seatTurnStartedAt))) : undefined;
     // ⛔ 상한이 없으면(사람 TUI·하니스 자식) caller dispatcher 의 Promise 를 «그대로» 돌려준다 — async 로 감싸면
     //    새 Promise 가 되어 caller-side dispatch 동일성 계약(core-turn-goal-loop.test)이 깨진다(열차 r19d 회귀).
@@ -927,16 +969,27 @@ export async function runGoalLoop(
       if (seatClosing !== null) {
         seatRefusedAfterClose += 1;
         // 받침 — 안내를 받고도 도구를 계속 부르면 현재 core 턴을 끝낸다; 자리 턴 상한 분기가 전체 loop 를 닫는다.
-        if (seatRefusedAfterClose > SEAT_CAP_REFUSAL_BACKSTOP) {
-          seatCapAborted = true;
-          turnAbortController.abort();
-        }
+        if (seatRefusedAfterClose > SEAT_CAP_REFUSAL_BACKSTOP) requestSeatAbort('backstop');
         return { error: seatClosing === 'idle'
           ? SEAT_IDLE_NO_WORK_NOTICE(cap.idleEmptyMsgListLimit)
           : SEAT_TURN_CAP_TOOL_NOTICE(seatClosing, cap) };
       }
       seatTools += 1;
-      const result = await execute(name, args, dctx);
+      const approvalHolder = OWNER_APPROVAL_TOOL_NAMES.has(name);
+      if (approvalHolder) approvalToolsInFlight.push(name);
+      let result: unknown;
+      try {
+        result = await execute(name, args, dctx);
+      } finally {
+        if (approvalHolder) {
+          approvalToolsInFlight.splice(approvalToolsInFlight.indexOf(name), 1);
+          // 미룬 상한 — 승인 도구가 돌아왔다. 결과를 읽고 요약할 여유만 주고 턴을 닫는다.
+          const deferred = seatAbortDeferred;
+          if (deferred !== null && approvalToolsInFlight.length === 0) {
+            seatDeferTimers.push(scheduleSeatWallCap(() => abortSeatTurnNow(deferred), SEAT_CAP_DEFERRED_WRAPUP_MS));
+          }
+        }
+      }
       if (isEmptyMailListResult(name, result)) {
         emptyMailStreak += 1;
         if (emptyMailStreak >= cap.idleEmptyMsgListLimit) {
@@ -995,6 +1048,13 @@ export async function runGoalLoop(
       goalRepeatWithheld = '';
       if (novel.length > 0) ctx.callbacks?.onText?.(novel, full);
     };
+    // HARNESS-ADVISOR-CHECKPOINTS ① — 계획 직전: 강 상담 한 번, 여는 사용자 턴에 붙인다.
+    if (advisor && iterations === 1) {
+      try {
+        const planAdvice = await advisor.plan(surfaceUserText ?? ctx.userText ?? '');
+        if (planAdvice) appendAdvisorToLastUser(messages, planAdvice.block);
+      } catch { /* 조언 실패는 루프를 막지 않는다 */ }
+    }
     const turnCtx: CoreTurnContext = {
       ...ctx,
       messages,
@@ -1113,6 +1173,12 @@ export async function runGoalLoop(
             ownerAuthBlocked = true;
             turnAbortController.abort(new Error('verified member connection required'));
           }
+          if (advisor && call.name !== UPDATE_GOAL_TOOL_NAME) {
+            try {
+              const repeated = advisor.noteToolResult(call.name, call.result);
+              if (repeated) pendingSameErrors.push(repeated);
+            } catch { /* 관측은 루프를 막지 않는다 */ }
+          }
           ctx.callbacks?.onToolResult?.(call); // ⚠️ 기존 콜백 체이닝(끊지 말 것).
           if (controlSpaceId && ctx.sessionId) {
             // Consume only the stop latch first: a concurrent memo stays queued for the next turn.
@@ -1191,6 +1257,7 @@ export async function runGoalLoop(
       lastResult = await runTurn(turnCtx);
     } finally {
       seatWallTimer?.dispose();
+      for (const timer of seatDeferTimers.splice(0)) timer.dispose();
       ctx.signal.removeEventListener('abort', abortForCaller);
     }
     // TUI-SEAT-TURN-CAP — 상한·idle 안내 뒤 «정상 마감» 했거나 받침이 끊은 core 턴만 고쳐 읽는다.
@@ -1202,6 +1269,7 @@ export async function runGoalLoop(
     // Read through a typed accessor because tool callbacks can set `idle` across the awaited turn;
     // TypeScript otherwise narrows the closure-mutated value to only the post-await assignments above.
     const closingAfterTurn = ((): 'tools' | 'wall' | 'idle' | null => seatClosing)();
+    const deferredAfterTurn = ((): 'tools' | 'wall' | 'idle' | 'backstop' | null => seatAbortDeferred)();
     const seatClosedTurn = seatCap !== undefined && !ctx.signal.aborted && closingAfterTurn !== null
       && (lastResult.stopReason === 'end_turn' || lastResult.stopReason === 'max_turns'
         || (lastResult.stopReason === 'aborted' && seatCapAborted));
@@ -1210,6 +1278,13 @@ export async function runGoalLoop(
     if (seatCapHit) lastResult = { ...lastResult, stopReason: 'max_turns' };
     else if (seatIdleHit && lastResult.stopReason === 'aborted') lastResult = { ...lastResult, stopReason: 'end_turn' };
     messages.push(...turnNewMessages);
+    // HARNESS-ADVISOR-CHECKPOINTS ② — 같은 오류가 두 번째로 돌아왔다: 상담 한 번, 다음 재주입이 싣는다.
+    if (advisor && pendingSameErrors.length > 0 && !ctx.signal.aborted) {
+      try {
+        const sameAdvice = await advisor.sameError(surfaceUserText ?? ctx.userText ?? '', pendingSameErrors.splice(0));
+        if (sameAdvice) pendingAdvice = pendingAdvice ? `${pendingAdvice}\n\n${sameAdvice.block}` : sameAdvice.block;
+      } catch { /* 조언 실패는 루프를 막지 않는다 */ }
+    }
 
     // A host authentication denial needs the user, not another autonomous iteration.
     // Preserve caller cancellation; never turn an auth failure into goal completion.
@@ -1283,7 +1358,7 @@ export async function runGoalLoop(
       debug.log('goal.loop', 'seat-turn-cap', {
         sessionId: ctx.sessionId, ...runAttribution, seat: seatCap.seat, reason: seatClosing, iteration: iterations,
         tools: seatTools, wallMs: now() - turnStartedAt, maxTools: seatCap.maxTools, maxWallMs: seatCap.maxWallMs,
-        backstopAborted: seatCapAborted, maxIterations,
+        backstopAborted: seatCapAborted, maxIterations, ...(deferredAfterTurn !== null ? { deferred: deferredAfterTurn } : {}),
       }, { level: 'info' });
     }
     if (seatCapHit && seatCap && !explicitCompletionWithEvidence) {
@@ -1291,6 +1366,19 @@ export async function runGoalLoop(
         sessionId: ctx.sessionId, ...runAttribution, seat: seatCap.seat,
         iterations, maxIterations, capHits: 1, notify: 'seat-op',
       }, { level: 'warn' });
+      // SEAT-CAP-RESUME-NOTICE(연속 큐 미재개) — 루프 반환 직전 정확히 1회. 같은 루프 reinject 부활 금지(e3cd96b01d):
+      // 재개 안내 우편은 호스트 콜백이 맡는다. 콜백 실패가 마감을 깨지 않게 감싼다.
+      try {
+        await opts.onSeatCapExhausted?.({
+          seat: seatCap.seat,
+          finalText: lastResult.finalText,
+          iterations,
+        });
+      } catch (error) {
+        debug.log('goal.loop', 'seat-cap-exhausted-notify-error', {
+          sessionId: ctx.sessionId, seat: seatCap.seat, error: String(error),
+        }, { level: 'warn' });
+      }
       return finish({ finalText: lastResult.finalText, iterations, stopReason: 'max_turns', goalComplete: false });
     }
 
@@ -1337,6 +1425,20 @@ export async function runGoalLoop(
           debug.log('goal.loop', 'complete-rejected-tool-call-failopen', {
             sessionId: ctx.sessionId, ...runAttribution, iterations, rejectedTools,
           }, { level: 'warn' });
+        }
+        // ①-e HARNESS-ADVISOR-CHECKPOINTS ③ — 완료 직전 강 판정 한 번. «revise» 는 남은 라운드가 있을 때만 한 라운드를 더 산다.
+        if (advisor && !ctx.signal.aborted) {
+          let verdictAdvice: Awaited<ReturnType<CoreAdvisor['beforeComplete']>>;
+          try {
+            verdictAdvice = await advisor.beforeComplete(surfaceUserText ?? ctx.userText ?? '', goalUpdate.evidence, { iteration: iterations, maxIterations });
+          } catch { verdictAdvice = undefined; }
+          if (verdictAdvice && parseCompletionVerdict(verdictAdvice.text) === 'revise') {
+            debug.log('goal.loop', 'complete-advisor-revise', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'info' });
+            blockedStreak = 0;
+            readbackStreak = 0;
+            reinject(`${verdictAdvice.block}\n\n위 판정의 빠진 항목을 실제로 채우고 확인한 뒤 update_goal 로 다시 마감하라.`);
+            continue;
+          }
         }
         let completionChangedFiles: string[] = [];
         let completionSummary = goalUpdate.evidence;
@@ -1622,4 +1724,18 @@ async function resolveIntentStallProvider(explicit: string | null | undefined): 
     }, { level: 'warn' });
     return null;
   }
+}
+
+/** 첫 턴 앞 조언은 여는 사용자 메시지에 붙인다 — 연속된 사용자 턴 두 개를 만들지 않는다. */
+function appendAdvisorToLastUser(messages: LLMMessage[], block: string): void {
+  const last = messages[messages.length - 1];
+  if (last?.role === 'user' && typeof last.content === 'string') {
+    messages[messages.length - 1] = { ...last, content: `${last.content}\n\n${block}` };
+    return;
+  }
+  if (last?.role === 'user' && Array.isArray(last.content)) {
+    messages[messages.length - 1] = { ...last, content: [...last.content, { type: 'text', text: block }] } as LLMMessage;
+    return;
+  }
+  messages.push({ role: 'user', content: block });
 }

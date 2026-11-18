@@ -15,6 +15,9 @@ test('MCP registry manifest identifies the npm stdio server at the package versi
   expect(server.description).toMatch(/^[A-Z][^\n]{0,98}\.$/);
   expect(server.description.length).toBeLessThanOrEqual(100);
   expect(server.version).toBe(pkg.version);
+  const agent = load('integrations/acp-registry/elanous/agent.json');
+  expect(agent.version).toBe(pkg.version);
+  expect(agent.distribution.npx.package).toBe(`${pkg.name}@${pkg.version}`);
   expect(server.repository).toEqual({ url: 'https://github.com/ElanvitalAI/elanous', source: 'github' });
   expect(server.packages).toHaveLength(1);
   expect(server.packages[0]).toEqual({

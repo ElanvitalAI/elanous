@@ -12,6 +12,7 @@ import {
   resolveInternalTurnSubmitIntent,
   type InternalTurnGateDeps,
 } from './internal-turn.js';
+import { DEFAULT_PACING_MAX_CONSECUTIVE, DEFAULT_PACING_MIN_INTERVAL_MS, turnPacingFromEnv } from '../../tui/input/internal-turn.js';
 
 type LogRow = { category: string; event: string; data: Record<string, unknown> };
 
@@ -41,6 +42,21 @@ function harness(over: Partial<InternalTurnGateDeps> = {}) {
 }
 
 describe('startTurnIfIdle — 내부 턴 문 판정', () => {
+  test('MSG-SOURCE: agent from 은 요청에 실리고 사람·system from 은 싣지 않는다(구조 칸만)', () => {
+    const h = harness();
+    h.mount();
+    const from = { kind: 'agent' as const, seat: 'OP', intent: 'request', due: '14:00', msgId: '83843' };
+    expect(h.gate.startTurnIfIdle('우편 확인', { origin: 'msg-wake', from }).opened).toBe(true);
+    expect(h.gate.takePending()).toEqual({ turnId: 'auto-1', input: '우편 확인', origin: 'msg-wake', from });
+    h.gate.noteTurnSettled();
+    expect(h.gate.startTurnIfIdle('우편 확인', { origin: 'msg-wake', from: { kind: 'human' } }).opened).toBe(true);
+    expect(h.gate.takePending()).toEqual({ turnId: 'auto-2', input: '우편 확인', origin: 'msg-wake' });
+    h.gate.noteTurnSettled();
+    // #38284 REVIEW ①: a system source is not carried either — only `kind: 'agent'` reaches the request.
+    expect(h.gate.startTurnIfIdle('우편 확인', { origin: 'msg-wake', from: { kind: 'system', origin: 'msg-wake' } }).opened).toBe(true);
+    expect(h.gate.takePending()).toEqual({ turnId: 'auto-3', input: '우편 확인', origin: 'msg-wake' });
+  });
+
   test('유휴 → opened ⊕ 물러남 1회 ⊕ 요청을 정확히 한 번 꺼낸다 ⊕ 입력칸 버퍼 불변', () => {
     const h = harness();
     h.mount();
@@ -327,6 +343,21 @@ describe('실물 textInput ⊕ 문 — 입력칸을 거치지 않고 물러난�
     expect(gate.takePending()).toBeNull();
     expect(logs.at(-1)).toMatchObject({ event: 'rejected', data: { reason: 'HumanTyping', detail: 'late:buffer' } });
   });
+
+  test('withdrawPendingTurn drops only the parked turn the seat-cap watch named (ELN-TURN-CAP ③)', () => {
+    const h = harness();
+    h.mount();
+    const opened = h.gate.startTurnIfIdle('이어가기', { origin: 'goal-continue' });
+    expect(opened.opened).toBe(true);
+    const turnId = opened.opened ? opened.turnId : '';
+    expect(h.gate.pendingTurnId()).toBe(turnId);
+    expect(h.gate.withdrawPendingTurn('auto-other')).toBe(false);
+    expect(h.gate.pendingTurnId()).toBe(turnId);
+    expect(h.gate.withdrawPendingTurn(turnId)).toBe(true);
+    expect(h.gate.pendingTurnId()).toBeNull();
+    expect(h.gate.takePending()).toBeNull();
+    expect(h.logs.at(-1)).toMatchObject({ event: 'rejected', data: { reason: 'HumanTyping', detail: 'late:seat-cap-not-started', turnId } });
+  });
 });
 
 describe('대시보드 배선 — 입력 루프가 «분기 함수»를 한 번 거쳐 턴 경로로 간다', () => {
@@ -344,5 +375,69 @@ describe('대시보드 배선 — 입력 루프가 «분기 함수»를 한 번 
     expect(src).toContain('const internalTurnYieldPort = wrapAgentWakePort(goalContinue.wrapPort(seatAutowake.wrapPort(internalTurnGate.port)));');
     expect(src).toContain('internalTurnYield: internalTurnYieldPort,');
     expect(src).toContain('if (postTurn.historyRecord && !internalTurn) {');
+  });
+});
+
+describe('ELN-SEAT-TURN-PACING — rest between automatic turns (one gate)', () => {
+  const MIN = DEFAULT_PACING_MIN_INTERVAL_MS;
+  const RUN = DEFAULT_PACING_MAX_CONSECUTIVE;
+  const SHORT_RUN = RUN - 3; // a short run keeps the test readable; the rule is the same for any N
+  const open = (h: ReturnType<typeof harness>, origin: Parameters<ReturnType<typeof harness>['gate']['startTurnIfIdle']>[1]['origin']) => {
+    const r = h.gate.startTurnIfIdle('계속', { origin });
+    if (r.opened) { h.gate.takePending(); h.gate.noteTurnSettled(); }
+    return r;
+  };
+
+  test('minimum interval: a second automatic open inside the gap is Cap with retryAt; at retryAt it opens', () => {
+    const h = harness({ pacing: { minIntervalMs: MIN, maxConsecutive: RUN } });
+    h.mount();
+    expect(open(h, 'goal-continue').opened).toBe(true);
+    const t0 = h.state.now;
+    h.state.now = t0 + MIN - 1;
+    expect(open(h, 'msg-wake')).toEqual({ opened: false, reason: 'Cap', detail: 'pacing:min-interval', retryAt: t0 + MIN });
+    h.state.now = t0 + MIN;
+    expect(open(h, 'msg-wake').opened).toBe(true);
+  });
+
+  test('#38210 REVIEW-2: the gap runs from when the automatic turn ENDED — a turn longer than the gap gets no free next turn', () => {
+    const h = harness({ pacing: { minIntervalMs: MIN, maxConsecutive: RUN } });
+    h.mount();
+    expect(h.gate.startTurnIfIdle('계속', { origin: 'goal-continue' }).opened).toBe(true);
+    h.gate.takePending();
+    h.state.now += MIN * 2; // the automatic turn runs longer than the gap
+    h.gate.noteTurnSettled();
+    const endedAt = h.state.now;
+    expect(h.gate.startTurnIfIdle('계속', { origin: 'goal-continue' })).toEqual({ opened: false, reason: 'Cap', detail: 'pacing:min-interval', retryAt: endedAt + MIN });
+    h.state.now = endedAt + MIN - 1;
+    expect(h.gate.startTurnIfIdle('계속', { origin: 'msg-wake' }).opened).toBe(false);
+    h.state.now = endedAt + MIN;
+    expect(h.gate.startTurnIfIdle('계속', { origin: 'msg-wake' }).opened).toBe(true);
+  });
+
+  test('run cap: self-started turns stop after N (no retryAt — rest until an event); mail breaks and resets it; an alarm breaks it without resetting; a person resets it', () => {
+    const h = harness({ pacing: { minIntervalMs: MIN - MIN, maxConsecutive: SHORT_RUN } });
+    h.mount();
+    expect(open(h, 'goal-continue').opened).toBe(true);
+    expect(open(h, 'self-pull').opened).toBe(true);
+    expect(open(h, 'autowake')).toEqual({ opened: false, reason: 'Cap', detail: `pacing:run-cap ${SHORT_RUN}/${SHORT_RUN}` });
+    // A scheduled alarm is a notification: it opens at the cap but does not reset the run.
+    expect(open(h, 'scheduled').opened).toBe(true);
+    expect(open(h, 'goal-continue')).toMatchObject({ opened: false, detail: `pacing:run-cap ${SHORT_RUN}/${SHORT_RUN}` });
+    // New mail is an outside event: it opens and starts the run over.
+    expect(open(h, 'msg-wake').opened).toBe(true);
+    expect(open(h, 'goal-continue').opened).toBe(true);
+    expect(open(h, 'goal-continue').opened).toBe(true);
+    expect(open(h, 'goal-continue')).toMatchObject({ opened: false, reason: 'Cap', detail: `pacing:run-cap ${SHORT_RUN}/${SHORT_RUN}` });
+    h.gate.noteHumanTurn();
+    expect(open(h, 'goal-continue').opened).toBe(true);
+  });
+
+  test('without pacing nothing changes; env turns production pacing off and the fake-LLM universe runs unpaced', () => {
+    const h = harness();
+    h.mount();
+    for (let i = 0; i < 8; i++) expect(open(h, 'goal-continue').opened).toBe(true);
+    expect(turnPacingFromEnv({})).toEqual({ minIntervalMs: MIN, maxConsecutive: RUN });
+    for (const off of ['0', 'off', 'false']) expect(turnPacingFromEnv({ ELANOUS_TUI_TURN_PACING: off })).toBeUndefined();
+    expect(turnPacingFromEnv({ ELANOUS_TEST_FAKE_LLM: '1' })).toBeUndefined();
   });
 });

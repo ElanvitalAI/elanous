@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GCP-ARCHITECT-EXPAND-SCENE5-FAKE-PROVIDER-TS",
+  "path": "src/ux-sim/gcp-architect-expand/scene5-fake-provider.ts",
+  "boundary": "Scripted provider for the gcp-architect-expand scene 5 graph test world: returns fixed architecture proposals instead of a model call.",
+  "deviceIds": [
+    "gcp-architect-expand-fake-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

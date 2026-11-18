@@ -29,6 +29,10 @@ import type { AgentRegistry } from './registry.js';
 import type { AgentTask, AgentState } from './types.js';
 
 export const DEFAULT_AGENT_OUTPUT_TIMEOUT_MS = 30_000;
+/** Hard cap on one blocking wait (A207). A caller-supplied timeoutMs above this is clamped:
+ *  an unbounded block holds the parent turn open with no stream progress until the 1800s
+ *  total-timeout boundary. Call again with the same taskId to keep waiting. */
+export const MAX_AGENT_OUTPUT_TIMEOUT_MS = 30_000;
 /** Hard cap on text payload returned to the LLM. Aligns with Claude Code's
  *  TaskOutput 8MB ceiling — keeps the tool result from blowing the
  *  context window when an agent emitted megabytes of streamed text. */
@@ -92,7 +96,7 @@ export function buildAgentOutputTool(): LLMToolSpec {
         timeoutMs: {
           type: 'number',
           description:
-            'Wait limit when block=true. The default is for short checks; background children commonly take longer, so use a value larger than the default when waiting for them. Ignored when block=false.',
+            'Wait limit when block=true, clamped to the hard cap. The default is for short checks; background children commonly take longer, so use a value larger than the default when waiting for them. Ignored when block=false. After the cap, call again with the same taskId.',
         },
       },
       required: ['taskId'],
@@ -192,10 +196,11 @@ export async function dispatchAgentOutput(
 ): Promise<AgentOutputResult> {
   const taskId = typeof raw.taskId === 'string' ? raw.taskId : '';
   const block = raw.block === true;
-  const timeoutMs =
+  const requestedMs =
     typeof raw.timeoutMs === 'number' && raw.timeoutMs > 0
       ? raw.timeoutMs
       : DEFAULT_AGENT_OUTPUT_TIMEOUT_MS;
+  const timeoutMs = Math.min(requestedMs, MAX_AGENT_OUTPUT_TIMEOUT_MS);
   const registry = deps.registry ?? globalAgentRegistry;
   const now = deps.now ?? Date.now;
   const setTimer =

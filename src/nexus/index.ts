@@ -123,7 +123,7 @@ import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } fr
 import { createNexusScrapsRouteOptions } from './api/scraps-web-digest.js';
 import { trustedTlsEdgeFromEnv } from './api/tls-edge.js';
 import { createGeneratedAppPublisher, createGeneratedAppPublishRoute, withGeneratedAppsPrivateIngress, type GeneratedAppPublisher } from './apps/generated-app-publish.js';
-import { createDynamicAppPublisher, createDynamicAppPublishRoute, createDynamicAppDeployHook, verifiedDynamicOwner, type DynamicAppPublisher } from './apps/dynamic-app-publish.js';
+import { createDynamicAppPublisher, createDynamicAppPublishRoute, createDynamicAppDeployHook, useVerifiedMemberIssuer, verifiedDynamicOwner, type DynamicAppPublisher } from './apps/dynamic-app-publish.js';
 import { createAppDeploymentApprovalProvider } from './apps/app-deployment-approval-intent.js';
 import { createAppBuildLocalIssuerBridge } from './apps/app-build-local-bridge.js';
 import { createAppBuildRunAuthority, createAppDeploymentGrantProvider,
@@ -1098,11 +1098,14 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   }
 
   const startedAt = new Date().toISOString();
+  // RAIL-STALE-TUI-HEAD: publish the head this nexus pinned so a TUI can see it is stale before a bridge call.
+  const runtimeSourceHead = codeRevision();
   const runtime: NexusRuntimeMeta = {
     pid: process.pid,
     startedAt,
     nexusVersion: NEXUS_VERSION,
     phase: NEXUS_PHASE,
+    ...(runtimeSourceHead && /^[0-9a-f]{40}$/.test(runtimeSourceHead) ? { sourceHead: runtimeSourceHead } : {}),
   };
   writeNexusRuntime(runtime);
   opts.onRuntimeSidecarWrite?.(runtime);
@@ -3394,6 +3397,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     const dynamicRuntimeRoot = joinPath(nexusRootDir(), 'dynamic-app-runtime');
     const runningRevision = codeRevision();
     const dynamicIssuerSourceHead = /^[0-9a-f]{40}$/.test(runningRevision ?? '') ? runningRevision : undefined;
+    const dynamicIssuerHostKey = bearerToken && dynamicIssuerSourceHead
+      ? loadAppBuildRunAuthorityKey(joinPath(nexusRootDir(), 'app-build-authority.key')) : undefined;
+    const verifiedMemberIssuer = useVerifiedMemberIssuer({
+      testMemberId: process.env.ELANOUS_APPROVED_TEST_APP_MEMBER_ID,
+      testHandle: process.env.ELANOUS_APPROVED_TEST_APP_HANDLE,
+      testApprovalExpiresAt: process.env.ELANOUS_APPROVED_TEST_APP_UNTIL,
+    });
     for (const path of [dynamicSourceRoot, dynamicSealRoot, dynamicRuntimeRoot]) mkdirSync(path, { recursive: true, mode: 0o700 });
     dynamicAppPublisher = createDynamicAppPublisher({
       sourceRoot: dynamicSourceRoot, sealRoot: dynamicSealRoot, runtimeRoot: dynamicRuntimeRoot, appHost,
@@ -3410,6 +3420,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       testMemberId: process.env.ELANOUS_APPROVED_TEST_APP_MEMBER_ID,
       testHandle: process.env.ELANOUS_APPROVED_TEST_APP_HANDLE,
       testApprovalExpiresAt: process.env.ELANOUS_APPROVED_TEST_APP_UNTIL,
+      verifiedMemberIssuer,
+      issuerClaimKey: dynamicIssuerHostKey,
       issuerSourceHead: dynamicIssuerSourceHead,
       deploymentGrants: createAppDeploymentGrantProvider({
         root: joinPath(getElanousConfigDir(), 'app-build', 'deployment-grants'),
@@ -3430,9 +3442,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       authorizeControl: request => !!metaApiOpts && bearerCredential(request, metaApiOpts) === 'bearer-match'
         && checkAuth(request, metaApiOpts),
       getSession: () => readTuiMemberSession(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE)),
-      ...(bearerToken && dynamicIssuerSourceHead ? { runAuthority: createAppBuildRunAuthority({
+      ...(dynamicIssuerHostKey ? { runAuthority: createAppBuildRunAuthority({
         root: joinPath(getElanousConfigDir(), 'app-build', 'authority'),
-        hostKey: loadAppBuildRunAuthorityKey(joinPath(nexusRootDir(), 'app-build-authority.key')),
+        hostKey: dynamicIssuerHostKey,
         retainedSession: () => readTuiMemberSession(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE), 0),
         relayKeyFingerprint: () => relayMemberKeyFingerprint(getElanousConfigDir()),
       }) } : {}),
@@ -3451,7 +3463,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       return verifiedDynamicOwner(value, deploymentOwnerMemberStore);
     };
     const dynamicAppPublishRoute = createDynamicAppPublishRoute(dynamicAppPublisher, resolveDynamicAppOwner,
-      process.env.GOOGLE_OAUTH_REDIRECT_URI ? new URL(process.env.GOOGLE_OAUTH_REDIRECT_URI).origin : undefined);
+      process.env.GOOGLE_OAUTH_REDIRECT_URI ? new URL(process.env.GOOGLE_OAUTH_REDIRECT_URI).origin : undefined,
+      !verifiedMemberIssuer);
 
     if (metaApiOpts && process.env.ELANOUS_APPROVED_TEST_APP_MEMBER_ID
       && process.env.ELANOUS_APPROVED_TEST_APP_HANDLE

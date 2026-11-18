@@ -1,10 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
+import { useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { _resetSessionsServiceSingletonForTest, getSessionsService } from '@/lib/sessions-service';
 import { ChatConversationList, conversationTime, conversationTitle } from './ChatConversationList';
-import { PROJECT_SELECTION_KEY, readPendingProjects, writePendingProjects } from './ChatProjectSwitcher';
-import { ChatCurrentProject } from './ChatCurrentProject';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let tree: ReactTestRenderer | undefined;
@@ -46,172 +45,6 @@ async function mount(list: typeof cards = cards, titleRequestFails = false) {
   return { buttons, selected, saved, requests: () => requests };
 }
 
-test('project selection filters conversations, persists on device, and assigns a new conversation exactly once after first save', async () => {
-  const saved = new Map<string, string>();
-  const all = [...cards, { ...cards[0]!, id: 'inbox', title: '받은 항목', projectId: undefined }];
-  const assigned = all.map((card) => card.id === 'old' ? { ...card, projectId: 'p' } : card);
-  const calls: Array<{ path: string; init?: RequestInit }> = [];
-  let current: Array<(typeof cards)[number] & { projectId?: string }> = assigned;
-  let projects = [{ id: 'p', name: '일', createdAt: '' }];
-  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
-    setItem: (key: string, value: string) => saved.set(key, value),
-    getItem: (key: string) => saved.get(key) ?? null,
-  } });
-  saved.set(PROJECT_SELECTION_KEY, 'p');
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage, location: { search: '' } }) });
-  const client = { fetchJson: async (path: string, init?: RequestInit) => {
-    calls.push({ path, init });
-    if (path === '/v1/projects') {
-      if (init?.method === 'POST') {
-        const project = { id: 'q', name: '새 일', createdAt: '' };
-        projects = [...projects, project];
-        return { project };
-      }
-      return { projects };
-    }
-    if (init?.method === 'PATCH') return { ok: true };
-    if (path.includes('?ifExists=1')) return { meta: current.find((card) => path.includes(card.id)) };
-    return { sessions: path.includes('?projectId=p') ? current.filter((c) => c.projectId === 'p') : current };
-  }, sessionStoreEventsUrl: () => '' };
-  const selected: string[] = [];
-  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: (id: string) => selected.push(id), setConfig: () => {} };
-  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
-  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
-  const text = () => JSON.stringify(tree!.toJSON());
-  expect(text()).toContain('프로젝트 이야기');
-  expect(text()).not.toContain('받은 항목');
-  expect(calls.some((c) => c.path === '/v1/sessions/store?projectId=p')).toBe(true);
-  const select = tree!.root.findByType('select');
-  await act(async () => select.props.onChange({ target: { value: 'none' } }));
-  expect(saved.get(PROJECT_SELECTION_KEY)).toBe('none');
-  expect(text()).toContain('받은 항목');
-  expect(text()).not.toContain('프로젝트 이야기');
-  await act(async () => select.props.onChange({ target: { value: 'all' } }));
-  expect(text()).toContain('프로젝트 이야기');
-  expect(text()).toContain('받은 항목');
-  await act(async () => select.props.onChange({ target: { value: 'create' } }));
-  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 이름' }).props.onChange({ target: { value: '새 일' } }));
-  await act(async () => tree!.root.findByType('form').props.onSubmit({ preventDefault() {} }));
-  expect(saved.get(PROJECT_SELECTION_KEY)).toBe('q');
-  await act(async () => tree!.root.findAllByType('button').find((button) => button.children.includes(' 새 대화'))!.props.onClick());
-  expect(selected).toHaveLength(1);
-  expect(readPendingProjects()[selected[0]!]).toBe('q');
-  expect(calls.filter((c) => c.init?.method === 'PATCH')).toHaveLength(0);
-  current = [...current, { ...cards[0]!, id: selected[0]!, title: '새 대화' }];
-  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
-  expect(calls.filter((c) => c.init?.method === 'PATCH')).toHaveLength(1);
-  expect(readPendingProjects()[selected[0]!]).toBeUndefined();
-  expect(calls.find((c) => c.init?.method === 'PATCH')?.init?.body).toBe('{"projectId":"q"}');
-  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
-  expect(calls.filter((c) => c.init?.method === 'PATCH')).toHaveLength(1);
-  expect(text()).toContain('새 대화');
-});
-
-test('sidebar project picker browses remote folders and passes the chosen folder to creation', async () => {
-  const saved = new Map<string, string>();
-  const storage = { setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null };
-  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage: storage, location: { search: '' } }) });
-  const calls: Array<{ path: string; init?: RequestInit }> = [];
-  const client = { fetchJson: async (path: string, init?: RequestInit) => {
-    calls.push({ path, init });
-    if (path.startsWith('/v1/projects/folders')) return path.includes('path=')
-      ? { path: '/srv/work', parent: '/srv', folders: [] }
-      : { path: '/srv', parent: '/', folders: [{ name: 'work', path: '/srv/work' }] };
-    if (path === '/v1/projects') return init?.method === 'POST'
-      ? { project: { id: 'p', name: '새 일', primaryFolder: '/srv/work', createdAt: '' } }
-      : { projects: [] };
-    return { sessions: cards };
-  }, sessionStoreEventsUrl: () => '' };
-  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: () => {}, setConfig: () => {} };
-  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
-  await act(async () => tree!.root.findAllByType('button').find(button => button.children.includes('＋ 프로젝트 만들기'))!.props.onClick());
-  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 이름' }).props.onChange({ target: { value: '새 일' } }));
-  await act(async () => tree!.root.findByProps({ 'aria-label': '원격 폴더 고르기' }).props.onClick());
-  expect(tree!.root.findByProps({ 'aria-label': '원격 폴더 목록' })).toBeDefined();
-  expect(calls.some(call => call.path === '/v1/projects/folders')).toBe(true);
-  await act(async () => tree!.root.findByProps({ 'aria-label': '원격 폴더 목록' }).findAllByType('button')[1]!.props.onClick());
-  await act(async () => tree!.root.findAllByType('button').find(button => button.children.includes('이 폴더 선택'))!.props.onClick());
-  await act(async () => tree!.root.findByType('form').props.onSubmit({ preventDefault() {} }));
-  expect(calls.filter(call => call.path.startsWith('/v1/projects/folders')).map(call => call.path))
-    .toEqual(['/v1/projects/folders', '/v1/projects/folders?path=%2Fsrv%2Fwork']);
-  expect(calls.find(call => call.init?.method === 'POST')?.init?.body).toBe('{"name":"새 일","primaryFolder":"/srv/work"}');
-  expect(saved.get(PROJECT_SELECTION_KEY)).toBe('p');
-});
-
-test('failed pending assignment restores the saved project membership in the sidebar', async () => {
-  const saved = new Map<string, string>();
-  saved.set(PROJECT_SELECTION_KEY, 'p');
-  const storage = { setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null };
-  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage: storage }) });
-  let rejectPatch: ((reason: Error) => void) | undefined;
-  const calls: string[] = [];
-  const old = { ...cards[0]!, projectId: 'p' };
-  const client = { fetchJson: async (path: string, init?: RequestInit) => {
-    if (path === '/v1/projects') return { projects: [{ id: 'p', name: '일', createdAt: '' }, { id: 'q', name: '개인', createdAt: '' }] };
-    if (init?.method === 'PATCH') {
-      calls.push(path);
-      return await new Promise((_, reject) => { rejectPatch = reject; });
-    }
-    if (path.includes('?ifExists=1')) return { meta: old };
-    return { sessions: [old] };
-  }, sessionStoreEventsUrl: () => '' };
-  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: () => {}, setConfig: () => {} };
-  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
-  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
-  const text = () => JSON.stringify(tree!.toJSON());
-  expect(text()).toContain('프로젝트 이야기');
-  await act(async () => { writePendingProjects({ old: 'q' }); });
-  expect(calls).toEqual(['/v1/sessions/store/old']);
-  expect(readPendingProjects().old).toBe('q');
-  await act(async () => { rejectPatch!(new Error('offline')); });
-  expect(readPendingProjects().old).toBeUndefined();
-  expect(text()).toContain('프로젝트 이야기');
-  const select = tree!.root.findByProps({ 'aria-label': '프로젝트 바꾸기' });
-  await act(async () => select.props.onChange({ target: { value: 'q' } }));
-  expect(text()).not.toContain('프로젝트 이야기');
-  await act(async () => select.props.onChange({ target: { value: 'p' } }));
-  expect(text()).toContain('프로젝트 이야기');
-  expect(calls).toHaveLength(1);
-});
-
-test('creating a project in the sidebar refreshes a mounted chat header and opening a conversation refreshes again', async () => {
-  const saved = new Map<string, string>();
-  const storage = { setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null };
-  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage: storage }) });
-  let projects = [{ id: 'p', name: '일', createdAt: '' }];
-  let lists = 0;
-  const client = { fetchJson: async (path: string, init?: RequestInit) => {
-    if (path === '/v1/projects') {
-      if (init?.method === 'POST') {
-        const project = { id: 'q', name: '새 일', createdAt: '' };
-        projects = [...projects, project];
-        return { project };
-      }
-      lists++;
-      return { projects };
-    }
-    if (path.includes('?ifExists=1')) return { meta: { projectId: 'q' } };
-    return { sessions: cards };
-  }, sessionStoreEventsUrl: () => '' };
-  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: () => {}, setConfig: () => {} };
-  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /><ChatCurrentProject /></DaemonContext.Provider>); });
-  const header = () => tree!.root.findByProps({ 'aria-label': '현재 대화 프로젝트' });
-  expect(header().findAllByType('option').map((option) => option.props.children)).not.toContain('새 일');
-  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 바꾸기' }).props.onChange({ target: { value: 'create' } }));
-  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 이름' }).props.onChange({ target: { value: '새 일' } }));
-  await act(async () => tree!.root.findByType('form').props.onSubmit({ preventDefault() {} }));
-  expect(header().findAllByType('option').find((option) => option.props.value === 'q')?.props.children).toBe('새 일');
-  await act(async () => tree!.root.findByProps({ 'aria-label': '프로젝트 바꾸기' }).props.onChange({ target: { value: 'all' } }));
-  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
-  const beforeOpen = lists;
-  await act(async () => tree!.root.findAllByType('button').find((button) => button.props['aria-current'] === 'page')!.props.onClick());
-  expect(lists).toBeGreaterThan(beforeOpen);
-  expect(header().findAllByType('option').find((option) => option.props.value === 'q')?.props.children).toBe('새 일');
-});
-
 test('recent conversations use title, preview fallback, relative time and current highlight', async () => {
   const { buttons } = await mount();
   const items = buttons().filter((b) => b.props['aria-current'] !== undefined || b.findAllByType('span').length > 0);
@@ -245,13 +78,326 @@ test('search filters both title and preview; choosing an item switches to its id
   expect(JSON.stringify(tree!.toJSON())).not.toContain('프로젝트 이야기');
 });
 
-test('new conversation switches to a fresh id and empty list offers the same action', async () => {
+test('one «새 대화» (no duplicate in the empty list) switches to a fresh id; no project controls', async () => {
   const { buttons, selected, saved } = await mount([]);
   expect(JSON.stringify(tree!.toJSON())).toContain('아직 대화가 없습니다');
-  await act(async () => buttons().find((b) => b.children.includes('＋ 새 대화'))!.props.onClick());
+  expect(buttons()).toHaveLength(1);
+  expect(JSON.stringify(tree!.toJSON())).not.toContain('프로젝트');
+  await act(async () => buttons()[0]!.props.onClick());
   expect(selected).toHaveLength(1);
   expect(selected[0]).not.toBe('current');
   expect(saved.get('elanous.daemon.sessionId')).toBe(selected[0]);
-  await act(async () => buttons()[0]!.props.onClick());
-  expect(selected[1]).not.toBe(selected[0]);
 });
+
+test('a conversation menu shows its full id with a copy button (정보)', async () => {
+  await mount();
+  const menus = tree!.root.findAllByProps({ 'aria-label': '대화 관리' });
+  await act(async () => menus[0]!.props.onClick());
+  const menu = tree!.root.findByProps({ role: 'menu' });
+  expect(JSON.stringify(menu.findAllByType('span').map((span) => span.children.join('')))).toContain('current');
+  expect(menu.findAllByProps({ 'aria-label': '대화 ID 복사' })).toHaveLength(1);
+});
+
+test('삭제 asks first, deletes through the session store, and an open conversation continues in a new one', async () => {
+  const calls: Array<{ path: string; method?: string }> = [];
+  let fail = true;
+  const saved = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null,
+  } });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage, location: { search: '' } }) });
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
+  try {
+    const client = { fetchJson: async (path: string, init?: RequestInit) => {
+      calls.push({ path, method: init?.method });
+      if (init?.method === 'DELETE') { if (fail) throw Error('locked'); return { ok: true, deleted: true }; }
+      return { sessions: cards };
+    }, sessionStoreEventsUrl: () => '' };
+    const selected: string[] = [];
+    const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: (id: string) => selected.push(id), setConfig: () => {} };
+    await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
+    await act(async () => { await getSessionsService(client as never).forceRefresh(); });
+    await act(async () => tree!.root.findAllByProps({ 'aria-label': '대화 관리' })[0]!.props.onClick());
+    await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
+    const confirm = () => tree!.root.findByProps({ role: 'alertdialog' }).findAllByType('button').at(-1)!;
+    // A failed delete keeps the dialog and says why; nothing switches.
+    await act(async () => confirm().props.onClick());
+    expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.path)).toEqual(['/v1/sessions/store/current']);
+    // The reason is inside the dialog (a line under the list would sit behind it).
+    const reason = tree!.root.findByProps({ role: 'alertdialog' }).findByProps({ 'data-elanous-delete-error': true });
+    expect(reason.children.join('')).toBe('지우지 못했습니다: locked');
+    expect(selected).toEqual([]);
+    fail = false;
+    await act(async () => confirm().props.onClick());
+    expect(tree!.root.findAllByProps({ role: 'alertdialog' })).toHaveLength(0);
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).not.toBe('current');
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
+    else delete (globalThis as { document?: unknown }).document;
+  }
+});
+
+test('a delete that answers after the user switched conversations keeps the switch (checked at answer time)', async () => {
+  const saved = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null,
+  } });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage, location: { search: '' } }) });
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
+  try {
+    let answer: (() => void) | undefined;
+    const client = { fetchJson: async (_path: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return await new Promise((resolve) => { answer = () => resolve({ ok: true, deleted: true }); });
+      return { sessions: cards };
+    }, sessionStoreEventsUrl: () => '' };
+    const switched: string[] = [];
+    let setActive: ((id: string) => void) | undefined;
+    function Host() {
+      const [sessionId, setSessionId] = useState('current');
+      setActive = setSessionId;
+      const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId,
+        setSessionId: (id: string) => { switched.push(id); setSessionId(id); }, setConfig: () => {} };
+      return <DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>;
+    }
+    await act(async () => { tree = create(<Host />); });
+    await act(async () => { await getSessionsService(client as never).forceRefresh(); });
+    // Delete the open conversation «current» …
+    await act(async () => tree!.root.findAllByProps({ 'aria-label': '대화 관리' })[0]!.props.onClick());
+    await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+    await act(async () => tree!.root.findByProps({ role: 'alertdialog' }).findAllByType('button').at(-1)!.props.onClick());
+    // … switch to «old» while the delete is in flight, then the answer arrives.
+    await act(async () => { setActive!('old'); });
+    await act(async () => { answer!(); });
+    expect(switched).toEqual([]);
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
+    else delete (globalThis as { document?: unknown }).document;
+  }
+});
+
+// #38183 REVIEW-1 (JUD 23:12 HOLD): the two follow-up rules, asserted.
+async function mountWithDocument(deleteAnswer: () => Promise<unknown>) {
+  const saved = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    setItem: (key: string, value: string) => saved.set(key, value), getItem: (key: string) => saved.get(key) ?? null,
+  } });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage, location: { search: '' } }) });
+  const client = { fetchJson: async (_path: string, init?: RequestInit) => (init?.method === 'DELETE' ? deleteAnswer() : { sessions: cards }),
+    sessionStoreEventsUrl: () => '' };
+  const selected: string[] = [];
+  const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: 'current', setSessionId: (id: string) => selected.push(id), setConfig: () => {} };
+  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
+  await act(async () => { await getSessionsService(client as never).forceRefresh(); });
+  return { selected };
+}
+
+function withDocument<T>(run: (doc: EventTarget) => Promise<T>): Promise<T> {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const doc = new EventTarget();
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: doc });
+  return run(doc).finally(() => {
+    if (previous) Object.defineProperty(globalThis, 'document', previous);
+    else delete (globalThis as { document?: unknown }).document;
+  });
+}
+
+const openMenu = () => act(async () => tree!.root.findAllByProps({ 'aria-label': '대화 관리' })[0]!.props.onClick());
+const menuCount = () => tree!.root.findAllByProps({ role: 'menu' }).length;
+const keydown = (key: string) => Object.assign(new Event('keydown'), { key });
+
+test('a delete that finds the conversation already gone says so (not an error, not silent) and closes the dialog', () => withDocument(async () => {
+  const { selected } = await mountWithDocument(async () => ({ ok: true, id: 'current', deleted: false }));
+  await openMenu();
+  await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+  await act(async () => tree!.root.findByProps({ role: 'alertdialog' }).findAllByType('button').at(-1)!.props.onClick());
+  expect(tree!.root.findAllByProps({ role: 'alertdialog' })).toHaveLength(0);
+  expect(tree!.root.findAllByProps({ 'data-elanous-delete-error': true })).toHaveLength(0);
+  expect(tree!.root.findByProps({ 'data-elanous-delete-notice': true }).children.join('')).toBe('이미 지워진 대화예요 · 목록을 새로 고쳤어요');
+  // It was the open conversation: it is gone either way, so a new one takes its place.
+  expect(selected).toHaveLength(1);
+}));
+
+test('a delete that removed the conversation shows no «already gone» notice', () => withDocument(async () => {
+  await mountWithDocument(async () => ({ ok: true, id: 'current', deleted: true }));
+  await openMenu();
+  await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+  await act(async () => tree!.root.findByProps({ role: 'alertdialog' }).findAllByType('button').at(-1)!.props.onClick());
+  expect(tree!.root.findAllByProps({ 'data-elanous-delete-notice': true })).toHaveLength(0);
+}));
+
+test('the conversation menu closes on Esc and on a press outside it; a press on the menu keeps it', () => withDocument(async (doc) => {
+  await mountWithDocument(async () => ({ ok: true, deleted: true }));
+  await openMenu();
+  expect(menuCount()).toBe(1);
+  await act(async () => { doc.dispatchEvent(keydown('Enter')); });
+  expect(menuCount()).toBe(1);
+  await act(async () => { doc.dispatchEvent(keydown('Escape')); });
+  expect(menuCount()).toBe(0);
+  await openMenu();
+  // A press whose target is inside the menu (or its toggle) does not close it.
+  const inside = Object.assign(new Event('pointerdown'), {});
+  Object.defineProperty(inside, 'target', { value: { closest: (selector: string) => (selector.includes('data-elanous-conversation-menu') ? {} : null) } });
+  await act(async () => { doc.dispatchEvent(inside); });
+  expect(menuCount()).toBe(1);
+  await act(async () => { doc.dispatchEvent(new Event('pointerdown')); });
+  expect(menuCount()).toBe(0);
+}));
+
+test('the delete dialog cancels on Esc and on the backdrop, not on a press inside it', () => withDocument(async (doc) => {
+  await mountWithDocument(async () => ({ ok: true, deleted: true }));
+  const openDialog = async () => {
+    await openMenu();
+    await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+  };
+  const dialogs = () => tree!.root.findAllByProps({ role: 'alertdialog' }).length;
+  await openDialog();
+  expect(dialogs()).toBe(1);
+  await act(async () => { doc.dispatchEvent(keydown('Escape')); });
+  expect(dialogs()).toBe(0);
+  await openDialog();
+  const backdrop = tree!.root.findByProps({ role: 'alertdialog' });
+  const panel = backdrop.findByProps({ 'data-elanous-delete-panel': true });
+  let stopped = false;
+  await act(async () => panel.props.onClick({ stopPropagation: () => { stopped = true; } }));
+  expect(stopped).toBe(true);
+  expect(dialogs()).toBe(1);
+  await act(async () => backdrop.props.onClick());
+  expect(dialogs()).toBe(0);
+}));
+
+// #38333 REVIEW-1 ①②: a key pressed in the page reaches document twice — capture first, then bubble — and
+// stopPropagation in capture keeps it from the bubble listeners. A bare EventTarget has no such path (the key is AT the
+// target, so every listener runs), which hid the regression. This document models exactly that path, nothing more.
+// (jsdom would too, but loading it shifted the shared debug-log flush timer into ChatLayout's PCH-12 fetch capture.)
+function pageDocument() {
+  type Entry = { type: string; fn: (event: Event) => void; capture: boolean };
+  const entries: Entry[] = [];
+  const doc = {
+    addEventListener(type: string, fn: (event: Event) => void, options?: boolean | AddEventListenerOptions) {
+      entries.push({ type, fn, capture: options === true || (typeof options === 'object' && options.capture === true) });
+    },
+    removeEventListener(type: string, fn: (event: Event) => void, options?: boolean | EventListenerOptions) {
+      const capture = options === true || (typeof options === 'object' && options.capture === true);
+      const at = entries.findIndex((entry) => entry.type === type && entry.fn === fn && entry.capture === capture);
+      if (at >= 0) entries.splice(at, 1);
+    },
+    /** A key pressed on an element inside the page: document capture listeners, then (unless stopped) bubble ones. */
+    pressInPage(key: string) {
+      doc.pressEvent(Object.assign(new Event('keydown'), { key }));
+    },
+    pressEvent(event: Event) {
+      let stopped = false;
+      Object.assign(event, { stopPropagation: () => { stopped = true; } });
+      for (const phase of [true, false]) {
+        for (const entry of entries.filter((e) => e.type === 'keydown' && e.capture === phase)) entry.fn(event);
+        if (stopped) return;
+      }
+    },
+  };
+  return doc;
+}
+
+function withPageDocument<T>(run: (doc: ReturnType<typeof pageDocument>) => Promise<T>): Promise<T> {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const doc = pageDocument();
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: doc });
+  return run(doc).finally(() => {
+    if (previous) Object.defineProperty(globalThis, 'document', previous);
+    else delete (globalThis as { document?: unknown }).document;
+  });
+}
+
+test('menu → 삭제 → one Esc pressed in the page closes the confirm dialog, and not the drawer beneath', () => withPageDocument(async (doc) => {
+  // Like ChatPanel's phone drawer: subscribed on document (bubble) before anything opens.
+  let drawerClosed = 0;
+  doc.addEventListener('keydown', (event) => { if ((event as KeyboardEvent).key === 'Escape') drawerClosed += 1; });
+  await mountWithDocument(async () => ({ ok: true, deleted: true }));
+  await openMenu();
+  await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+  expect(tree!.root.findAllByProps({ role: 'alertdialog' })).toHaveLength(1);
+  await act(async () => { doc.pressInPage('Escape'); });
+  expect(tree!.root.findAllByProps({ role: 'alertdialog' })).toHaveLength(0);
+  expect(menuCount()).toBe(0);
+  expect(drawerClosed).toBe(0);
+  await act(async () => tree!.unmount());
+  tree = undefined;
+}));
+
+test('an open menu takes the one Esc; the drawer beneath gets the next one', () => withPageDocument(async (doc) => {
+  let drawerClosed = 0;
+  doc.addEventListener('keydown', (event) => { if ((event as KeyboardEvent).key === 'Escape') drawerClosed += 1; });
+  await mountWithDocument(async () => ({ ok: true, deleted: true }));
+  await openMenu();
+  await act(async () => { doc.pressInPage('Escape'); });
+  expect(menuCount()).toBe(0);
+  expect(drawerClosed).toBe(0);
+  await act(async () => { doc.pressInPage('Escape'); });
+  expect(drawerClosed).toBe(1);
+  await act(async () => tree!.unmount());
+  tree = undefined;
+}));
+
+// #38333 re-review follow-ups (0.3.29).
+test('an Esc that ends an IME composition closes neither the menu nor the confirm dialog', () => withPageDocument(async (doc) => {
+  await mountWithDocument(async () => ({ ok: true, deleted: true }));
+  await openMenu();
+  const composingEsc = () => Object.assign(new Event('keydown'), { key: 'Escape', isComposing: true });
+  // The same capture → bubble path as pressInPage, with an event that is still composing.
+  const send = (event: Event) => doc.pressEvent(event);
+  await act(async () => { send(composingEsc()); });
+  expect(menuCount()).toBe(1);
+  await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+  await act(async () => { send(composingEsc()); });
+  expect(tree!.root.findAllByProps({ role: 'alertdialog' })).toHaveLength(1);
+  await act(async () => { doc.pressInPage('Escape'); });
+  expect(tree!.root.findAllByProps({ role: 'alertdialog' })).toHaveLength(0);
+  await act(async () => tree!.unmount());
+  tree = undefined;
+}));
+
+test('the «already gone» notice clears after 5 s, a failed next delete clears it at once, and unmount stops the timer', () => withDocument(async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = new Map<number, { fn: () => void; ms: number }>();
+  let next = 1;
+  globalThis.setTimeout = ((fn: () => void, ms?: number) => { const id = next++; timers.set(id, { fn, ms: ms ?? 0 }); return id; }) as never;
+  globalThis.clearTimeout = ((id: number) => { timers.delete(id); }) as never;
+  const fire = (ms: number) => { for (const [id, t] of [...timers]) if (t.ms === ms) { timers.delete(id); t.fn(); } };
+  try {
+    let answer: () => Promise<unknown> = async () => ({ ok: true, deleted: false });
+    await mountWithDocument(() => answer());
+    const deleteFirst = async () => {
+      await openMenu();
+      await act(async () => tree!.root.findByProps({ role: 'menu' }).findAllByType('button').find((b) => b.children.some((child) => typeof child === 'string' && child.includes('삭제')))!.props.onClick());
+      await act(async () => tree!.root.findByProps({ role: 'alertdialog' }).findAllByType('button').at(-1)!.props.onClick());
+    };
+    const notices = () => tree!.root.findAllByProps({ 'data-elanous-delete-notice': true }).length;
+    await deleteFirst();
+    expect(notices()).toBe(1);
+    // 출처: ChatConversationList notice timer (5000 ms).
+    await act(async () => { fire(5000); });
+    expect(notices()).toBe(0);
+    // Again «already gone», then a failing delete: the notice goes as the attempt starts; only the error shows.
+    await deleteFirst();
+    expect(notices()).toBe(1);
+    answer = async () => { throw Error('locked'); };
+    await deleteFirst();
+    expect(notices()).toBe(0);
+    expect(tree!.root.findAllByProps({ 'data-elanous-delete-error': true })).toHaveLength(1);
+    // Unmount while a notice timer is pending removes it.
+    await act(async () => tree!.root.findByProps({ role: 'alertdialog' }).findAllByType('button')[0]!.props.onClick());
+    answer = async () => ({ ok: true, deleted: false });
+    await deleteFirst();
+    expect([...timers.values()].filter((t) => t.ms === 5000)).toHaveLength(1);
+    await act(async () => tree!.unmount());
+    tree = undefined;
+    expect([...timers.values()].filter((t) => t.ms === 5000)).toHaveLength(0);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+}));

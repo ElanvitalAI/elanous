@@ -30,7 +30,7 @@ describe('Next TUI terminal slash', () => {
     await term(['matrix'], context);
     expect(chatLines.some((line) => line.includes('pty_87654321') && line.includes('exited'))).toBe(true);
     await term(['status'], context);
-    expect(chatLines.join('\n')).toContain('1 live · 1 exited');
+    expect(chatLines.join('\n')).toContain('live 1 · exited 1');
     await term(['spawn'], context);
     await term(['kill', 'pty_12345678'], context);
     expect(chatLines.join('\n')).toContain('Unsupported /term command in Next TUI: spawn');

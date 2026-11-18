@@ -134,6 +134,33 @@ export function fmtTime(sec: number): string {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
+/** Freeze the turn's duration and local end time at the same instant. */
+export function formatTurnEndTime(startedAt: number, endedAt: number, stopped = false, backgroundRunning = 0): string {
+  const seconds = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  const duration = hours > 0
+    ? `${hours}h ${minutes}m${remainder ? ` ${remainder}s` : ''}`
+    : minutes > 0 ? `${minutes}m${remainder ? ` ${remainder}s` : ''}` : `${remainder}s`;
+  const end = new Date(endedAt);
+  const hour = end.getHours();
+  const time = `${hour % 12 || 12}:${String(end.getMinutes()).padStart(2, '0')} ${hour < 12 ? 'AM' : 'PM'}`;
+  return stopped ? `✻ Stopped after ${duration} · ${time}`
+    : `✻ Worked for ${duration} · done ${time}${backgroundRunning > 0 ? ` · ${backgroundRunning} background running` : ''}`;
+}
+
+function stoppedDetail(metrics: ThinkingMetrics, endedAt: number, stopped = false): string {
+  const detail: string[] = [];
+  if (metrics.startedAt != null) detail.push(formatTurnEndTime(metrics.startedAt, endedAt, stopped));
+  if (metrics.outputTokens != null && metrics.outputTokens > 0) {
+    const k = metrics.outputTokens / 1000;
+    detail.push(`↓ ${k >= 1 ? k.toFixed(1) + 'k' : metrics.outputTokens} tokens`);
+  }
+  if (metrics.engine) detail.push(metrics.engine);
+  return detail.length ? '  ' + C.muted('(' + detail.join(' · ') + ')') : '';
+}
+
 function renderLine(
   glyph: string,
   message: string,
@@ -159,9 +186,9 @@ function renderLine(
 function stoppedMessage(message: string, status: ThinkingStatus): string {
   const taskName = message.replace(/^(?:Streaming|Thinking)(?=\b|…)(?:\s*…)?\s*/, '').trim();
   const task = taskName ? `${taskName} ` : '';
-  if (status === 'completed') return `${task}완료`;
-  if (status === 'interrupted') return `${task}중단됨`;
-  return `${task}실패`;
+  if (status === 'completed') return `${task}done`;
+  if (status === 'interrupted') return `${task}interrupted`;
+  return `${task}failed`;
 }
 
 export function startThinking(opts: StartThinkingOpts): ThinkingHandle {
@@ -219,16 +246,7 @@ export function startThinking(opts: StartThinkingOpts): ThinkingHandle {
       if (timer) clearInterval(timer);
 
       const status = stopOpts?.status ?? 'completed';
-      const elapsed = metrics.startedAt
-        ? fmtTime((Date.now() - metrics.startedAt) / 1000) : '';
-      const detail: string[] = [];
-      if (elapsed) detail.push(elapsed);
-      if (metrics.outputTokens && metrics.outputTokens > 0) {
-        const k = metrics.outputTokens / 1000;
-        detail.push(`↓ ${k >= 1 ? k.toFixed(1) + 'k' : metrics.outputTokens} tokens`);
-      }
-      if (metrics.engine) detail.push(metrics.engine);
-      const tail = detail.length ? '  ' + C.muted('(' + detail.join(' · ') + ')') : '';
+      const tail = stoppedDetail(metrics, Date.now(), status !== 'completed');
       let finalText: string;
       if (stopOpts?.finalText !== undefined) {
         finalText = stopOpts.finalText;
@@ -315,16 +333,7 @@ export function startPinnedThinking(opts: StartPinnedThinkingOpts): ThinkingHand
       if (timer) clearInterval(timer);
 
       const status = stopOpts?.status ?? 'completed';
-      const elapsed = metrics.startedAt
-        ? fmtTime((Date.now() - metrics.startedAt) / 1000) : '';
-      const detail: string[] = [];
-      if (elapsed) detail.push(elapsed);
-      if (metrics.outputTokens && metrics.outputTokens > 0) {
-        const k = metrics.outputTokens / 1000;
-        detail.push(`↓ ${k >= 1 ? k.toFixed(1) + 'k' : metrics.outputTokens} tokens`);
-      }
-      if (metrics.engine) detail.push(metrics.engine);
-      const tail = detail.length ? '  ' + C.muted('(' + detail.join(' · ') + ')') : '';
+      const tail = stoppedDetail(metrics, Date.now(), status !== 'completed');
       let finalText: string;
       if (stopOpts?.finalText !== undefined) {
         finalText = stopOpts.finalText;

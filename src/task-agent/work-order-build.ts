@@ -10,6 +10,12 @@ export interface BuildWorkOrderInput {
   priority?: string;
   peers?: string;
   boundary?: string;
+  /** 시간·모델 티어·Pod 자리·재작업 상한 — critical 칸(비면 hand 가 발사 거부). */
+  budget?: string;
+  /** 현재 계약 — critical 칸. */
+  contract?: string;
+  /** 막히면 누구에게 올리는지 — critical 칸. */
+  escalation?: string;
 }
 
 /** Build the normalized nine-field core from already-grounded inputs; no CLI, filesystem, or launch side effects. */
@@ -21,6 +27,9 @@ export function buildWorkOrder(input: BuildWorkOrderInput): WorkOrder {
     priority: input.priority,
     peers: input.peers,
     boundary: input.boundary,
+    budget: input.budget,
+    contract: input.contract,
+    escalation: input.escalation,
   }));
   if (!parsed.ok) throw new Error(parsed.reason);
   return parsed.order;

@@ -19,11 +19,25 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 
 
 
-export type PlanStepStatus = 'pending' | 'in_progress' | 'completed';
+export type PlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'waiting';
+
+/** What a `waiting` step waits for — language-free, so the turn-end gate can register a wake without reading prose. */
+export interface PlanWake {
+  /** e.g. `time` · `process` · `file` · `message` · `pr` — free label, non-empty. */
+  kind: string;
+  /** What is watched: a path, pid, message id, PR number, ISO time… */
+  target: string;
+  /** Optional give-up point (ISO time or duration text). */
+  until?: string;
+}
 
 export interface PlanStep {
   step: string;
   status: PlanStepStatus;
+  /** Required when `blocked`: why a person (or something outside the plan) is needed. */
+  reason?: string;
+  /** Required when `waiting`: the wake condition. */
+  wake?: PlanWake;
 }
 
 export interface UpdatePlanArgs {
@@ -92,6 +106,8 @@ export function _clearPlanListenersForTesting(): void {
 
 // ── Parse + validate ─────────────────────────────────────────────
 
+const PLAN_STATUSES: ReadonlySet<string> = new Set(['pending', 'in_progress', 'completed', 'blocked', 'waiting']);
+
 export function parseUpdatePlanArgs(
   raw: Record<string, unknown>,
 ): { ok: true; args: UpdatePlanArgs } | { ok: false; reason: string } {
@@ -106,11 +122,24 @@ export function parseUpdatePlanArgs(
     const step = typeof s.step === 'string' ? s.step.trim() : '';
     const status = typeof s.status === 'string' ? s.status : '';
     if (!step) return { ok: false, reason: `step ${i}: "step" text required` };
-    if (status !== 'pending' && status !== 'in_progress' && status !== 'completed') {
-      return { ok: false, reason: `step ${i}: status must be pending | in_progress | completed (got "${status}")` };
+    if (!PLAN_STATUSES.has(status)) {
+      return { ok: false, reason: `step ${i}: status must be pending | in_progress | completed | blocked | waiting (got "${status}")` };
     }
     if (status === 'in_progress') inProgressCount++;
-    steps.push({ step, status });
+    const reason = typeof s.reason === 'string' ? s.reason.trim() : '';
+    if (status === 'blocked' && !reason) return { ok: false, reason: `step ${i}: a blocked step needs a "reason" (what is needed, from whom)` };
+    const wakeRaw = s.wake !== null && typeof s.wake === 'object' ? s.wake as Record<string, unknown> : undefined;
+    const wakeKind = typeof wakeRaw?.kind === 'string' ? wakeRaw.kind.trim() : '';
+    const wakeTarget = typeof wakeRaw?.target === 'string' ? wakeRaw.target.trim() : '';
+    if (status === 'waiting' && (!wakeKind || !wakeTarget)) {
+      return { ok: false, reason: `step ${i}: a waiting step needs wake {kind, target} — what wakes it (no wake = nobody ever resumes)` };
+    }
+    const until = typeof wakeRaw?.until === 'string' && wakeRaw.until.trim() ? wakeRaw.until.trim() : undefined;
+    steps.push({
+      step, status: status as PlanStepStatus,
+      ...(status === 'blocked' ? { reason } : {}),
+      ...(status === 'waiting' ? { wake: { kind: wakeKind, target: wakeTarget, ...(until ? { until } : {}) } } : {}),
+    });
   }
   if (inProgressCount > 1) {
     return { ok: false, reason: `only one step may be in_progress at a time (got ${inProgressCount})` };
@@ -148,8 +177,22 @@ export function buildUpdatePlanTool(): LLMToolSpec {
               step: { type: 'string', description: 'One short sentence describing the step.' },
               status: {
                 type: 'string',
-                enum: ['pending', 'in_progress', 'completed'],
-                description: 'pending = not started, in_progress = currently working on, completed = done.',
+                enum: ['pending', 'in_progress', 'completed', 'blocked', 'waiting'],
+                description: 'pending = not started, in_progress = currently working on, completed = done, '
+                  + 'blocked = cannot go on without a person or an outside change (give `reason`), '
+                  + 'waiting = paused until something happens (give `wake`). End every turn with the plan updated.',
+              },
+              reason: { type: 'string', description: 'Required for `blocked`: what is needed and from whom.' },
+              wake: {
+                type: 'object',
+                description: 'Required for `waiting`: what resumes the step.',
+                properties: {
+                  kind: { type: 'string', description: 'time | process | file | message | pr | …' },
+                  target: { type: 'string', description: 'The path, pid, message id, PR number or time being waited for.' },
+                  until: { type: 'string', description: 'Optional give-up point.' },
+                },
+                required: ['kind', 'target'],
+                additionalProperties: false,
               },
             },
             required: ['step', 'status'],
@@ -196,7 +239,10 @@ function summarizePlan(s: PlanState): string {
   const done = s.steps.filter((x) => x.status === 'completed').length;
   const inProgress = s.steps.find((x) => x.status === 'in_progress')?.step;
   const inPart = inProgress ? ` — now: "${truncateLine(inProgress, 60)}"` : '';
-  return `${done}/${total} complete${inPart}`;
+  const blocked = s.steps.filter((x) => x.status === 'blocked').length;
+  const waiting = s.steps.filter((x) => x.status === 'waiting').length;
+  const extra = `${blocked ? ` · ${blocked} blocked` : ''}${waiting ? ` · ${waiting} waiting` : ''}`;
+  return `${done}/${total} complete${inPart}${extra}`;
 }
 
 function truncateLine(s: string, max: number): string {

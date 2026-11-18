@@ -1513,6 +1513,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--reason <text>', '면제 또는 budget-exceeded 재개 사유')
     .option('--resume-budget-exceeded', 'budget-exceeded 런을 --reason 사유와 함께 재개하고 실행 카운터를 재설정해 기록')
     .option('--approved-by <identity>', '게이트 면제 승인자 — 기본 ELANOUS_SEAT')
+    .option('--waive-evidence-run <runId>', '--waive gate 가 승계할 같은 판의 앞 런(또는 append 전 이 런) — 그 gate 가 면제 기록으로 통과했고 지금 컷이 그 컷의 자손일 때만 · 추가 커밋을 면제 원장에 기록')
     .option('--accepted-regressions <json>', '알려진 문제 추가 입력 JSON 배열 [{"id":"…","note":"…"}]')
     .option('--gate-executor <pod|host>', '다시 도는 gate 의 실행기 전환(--from gate 이전만) — 런 입력에 기록 · 면제 아님')
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 저장된 런 입력 gateRemote)')
@@ -1523,7 +1524,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout(생략 시 현재 폴더)')
     .option('--dry-run', '재개 preflight만 수행하고 런·상태 원장·시도 횟수는 변경하지 않는다')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string; resumeBudgetExceeded?: boolean; approvedBy?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string; resumeBudgetExceeded?: boolean; approvedBy?: string; waiveEvidenceRun?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1548,12 +1549,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (o.ownerWaive !== undefined && !o.reason?.trim()) throw new Error('--owner-waive requires --reason');
         if (o.ownerWaive !== undefined && !o.approvedBy?.trim()) throw new Error('--owner-waive requires --approved-by');
         if (o.ownerWaive !== undefined && o.waive !== undefined) throw new Error('--owner-waive and --waive are mutually exclusive');
+        if (o.waiveEvidenceRun !== undefined && o.waive !== 'gate' && o.ownerWaive !== 'gate') throw new Error('--waive-evidence-run requires --waive gate (or --owner-waive gate)');
         const resumeOptions = { runId: o.run, from, partial: o.partial, commandRoot: o.commandRoot,
           ...(o.resumeBudgetExceeded ? { resumeBudgetExceeded: true } : {}),
           ...(o.waive === undefined ? {} : { waive: o.waive }),
           ...(o.ownerWaive === undefined ? {} : { ownerWaive: o.ownerWaive }),
           ...(o.reason === undefined ? {} : { reason: o.reason }),
           ...(approvedBy === undefined ? {} : { approvedBy }),
+          ...(o.waiveEvidenceRun === undefined ? {} : { waiveEvidenceRun: o.waiveEvidenceRun }),
           ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }),
           ...(o.gateExecutor === undefined ? {} : { gateExecutor: o.gateExecutor }),
           ...(o.gateHost === undefined ? {} : { gateHost: o.gateHost }),

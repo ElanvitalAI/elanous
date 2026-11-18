@@ -119,7 +119,7 @@ describe('Wave 6 · /memory list', () => {
 
   test('list returns placeholder when dir missing', () => {
     const out = listMemory('/nonexistent/path/xyz');
-    expect(out).toContain('memory dir not found');
+    expect(out).toContain('no memory folder yet');
   });
 
   test('list enumerates .md files (skip MEMORY.md index)', () => {

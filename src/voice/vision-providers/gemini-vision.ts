@@ -13,6 +13,7 @@
 // fake fetch 로 검증.
 
 import type { ScreenshotPayload } from '../vision-screen-query.js';
+import { llmNetworkSend } from '../../session-runtime/llm-call-gateway.js';
 
 export interface GeminiVisionDeps {
   /** Gemini API key. Production: pull from env or user-config. */
@@ -85,11 +86,14 @@ export function createGeminiVisionProvider(
 
       let response: Response;
       try {
-        response = await fetchFn(url, {
+        const init: RequestInit = {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(body),
-        });
+        };
+        response = await llmNetworkSend(url, init,
+          { provider: 'gemini', model, role: 'aux', requestedBy: 'voice-vision' },
+          () => fetchFn(url, init));
       } catch (err) {
         log('vision.gemini.fetch-throw', '', { error: String(err) });
         return null;

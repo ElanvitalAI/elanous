@@ -35,7 +35,7 @@ import { herdrPrompt, type HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
 import { messageRouteFor, parsePaneMessageAddress, SEAT_MESSAGE_ROUTES, type MessageWake } from './msg-address.js';
 import { acquireLockSync } from '../storage/file-lock.js';
-import { readSeatRegistry, seatRegistryEntry, seatRegistryPath, type SeatRegistryEntry } from './seat-registry.js';
+	import { normalizeSeatRegistryV1Entry, readRegistryFile, readSeatRegistry, readSeatRegistryV2, seatRegistryEntry, seatRegistryPath, seatRegistryV2Entry, type SeatAgentRuntime, type SeatRegistryEntry, type SeatRegistryEntryV2 } from './seat-registry.js';
 
 export const WAKE_DEBOUNCE_MS = 5 * 60_000;
 export const WAKE_TIMEOUT_MS = 3_000;
@@ -58,12 +58,24 @@ export interface WakeResolution {
   reason?: string;
   /** For a seat-folder target: the seat opted in to injection (`<seat>/wake-inject` exists). Absent = not a seat target. */
   optIn?: boolean;
+  /** Registry v2 delivery view (protocol §2). Absent when the address is not a registry seat. */
+  runtime?: 'eln' | 'external-cli' | 'human';
+  delivery?: 'queue' | 'adapter' | 'parked' | 'none';
+  session?: string;
 }
 
 export type WakeResult = 'none-sse' | 'wake-deferred' | 'injected' | 'busy' | 'debounced' | 'skipped' | 'skipped-reply'
-  | 'skipped-self' | 'skipped-test-universe' | 'no-wake' | 'failed' | 'timeout';
+  | 'skipped-self' | 'skipped-test-universe' | 'no-wake' | 'failed' | 'timeout'
+  /** runtime=eln ⊕ autowake: the seat's own idle mail watch (#38164) delivers — no typing into its pane. */
+  | 'eln-mail-watch';
 
 export interface WakeOutcome extends WakeResolution { address: string; msgId: number; result: WakeResult }
+
+export type RegistrySnapshot = {
+  routed: ReturnType<typeof readSeatRegistry>;
+  /** v2 seats from the same file bytes as `routed`. Absent when the caller injected a v1 reader. */
+  v2Seats?: readonly SeatRegistryEntryV2[];
+};
 
 export interface WakeDeps {
   /** Seat folders (`<root>/<SEAT>/pty.ref` · `herdr.pane`). Prod: ~/elanous-hq/seat-state · test universe: <root>/seat-state. */
@@ -93,6 +105,8 @@ export interface WakeDeps {
   registryPath?: string;
   /** Test seam for the central registry reader. */
   readRegistry?: () => ReturnType<typeof readSeatRegistry>;
+  /** Already-read registry. Route uses this so wake and delivery share one snapshot, including v2. */
+  registrySnapshot?: RegistrySnapshot;
   warn?: (line: string) => void;
   /** Unread count for an address before a deferred re-knock (H4-FOLLOW ③). null = «모름» (never drops). Default: the msg ledger. */
   readUnread?: (address: string) => number | null;
@@ -184,6 +198,9 @@ function paneOptIn(row: HerdrPane, deps: WakeDeps): boolean {
   return deps.hasOptIn?.(path) ?? existsSync(path);
 }
 
+/** Real pty/herdr effects allowed (prod universe or ELANOUS_MSG_WAKE_LIVE=1) — the same gate every wake uses. */
+export function isLiveWakeUniverse(deps: WakeDeps = {}): boolean { return isLive(deps); }
+
 function isLive(deps: WakeDeps): boolean {
   if (deps.live !== undefined) return deps.live;
   return effectiveInstanceRoot() === prodInstanceRoot() || process.env.ELANOUS_MSG_WAKE_LIVE === '1';
@@ -195,18 +212,82 @@ export function resolveSeatStateRoot(deps: WakeDeps = {}): string {
   return root === prodInstanceRoot() ? join(homedir(), 'elanous-hq', 'seat-state') : join(root, 'seat-state');
 }
 
-function registryFor(deps: WakeDeps) {
-  return deps.readRegistry?.() ?? readSeatRegistry(deps.registryPath ?? seatRegistryPath(resolveSeatStateRoot(deps)));
+/** One read of the registry file. Version and seats come from the same bytes, so a v1→v2 swap between two reads cannot split them. */
+export function registrySnapshot(deps: WakeDeps): RegistrySnapshot {
+  if (deps.registrySnapshot) return deps.registrySnapshot;
+  if (deps.readRegistry) return { routed: deps.readRegistry() };
+  const path = deps.registryPath ?? seatRegistryPath(resolveSeatStateRoot(deps));
+  let contents: string;
+  try { contents = readRegistryFile(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { routed: { status: 'absent' } };
+    return { routed: { status: 'invalid', reason: error instanceof Error ? error.message : String(error) } };
+  }
+  let raw: unknown;
+  try { raw = JSON.parse(contents); }
+  catch (error) { return { routed: { status: 'invalid', reason: error instanceof Error ? error.message : String(error) } }; }
+  const version = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as { version?: unknown }).version : undefined;
+  // v1 stays on the existing reader. Only a version:2 file is projected so host, reply, and the pane target still route.
+  if (version === 2) {
+    const v2 = readSeatRegistryV2(path, contents);
+    if (v2.status === 'ready') {
+      return {
+        routed: { status: 'ready', registry: { version: 1, seats: v2.registry.seats.map(v2SeatAsV1) } },
+        v2Seats: v2.registry.seats,
+      };
+    }
+    if (v2.status === 'invalid') return { routed: { status: 'invalid', reason: v2.reason } };
+  }
+  return { routed: readSeatRegistry(path, contents) };
 }
 
-function wakeResolutionForSeat(entry: SeatRegistryEntry): WakeResolution {
-  return { wake: entry.wake, ...(entry.target ? { target: entry.target } : {}), source: 'seat-registry',
-    host: entry.host, optIn: entry.optIn, ...(entry.wake === 'none' ? { reason: 'registry-wake-disabled' } : {}) };
+function v2SeatAsV1(entry: { address: string; host: string; runtime: string; delivery: string; session?: string; replyBody: SeatRegistryEntry['replyBody']; optIn: boolean }): SeatRegistryEntry {
+  // Only an agent adapter with a session injects (herdr). A human seat never injects, even with optIn.
+  // queue/parked/none stay wake=none so they are not a deferred cron tick and not a herdr target.
+  // Host and replyBody stay on the entry; wake=none only disables injection (see wakeResolutionForSeat).
+  const inject = entry.runtime !== 'human' && entry.delivery === 'adapter' && !!entry.session;
+  return {
+    address: entry.address, host: entry.host, wake: inject ? 'herdr' : 'none', replyBody: entry.replyBody,
+    optIn: entry.runtime === 'human' ? false : entry.optIn,
+    ...(inject && entry.session ? { target: entry.session } : {}),
+  };
 }
 
-function validateRegisteredHerdrPane(entry: SeatRegistryEntry, census: () => HerdrPane[] | null): WakeResolution {
-  const registered = wakeResolutionForSeat(entry);
+function deliveryFields(entry: SeatRegistryEntryV2): Pick<WakeResolution, 'runtime' | 'delivery' | 'session'> {
+  return { runtime: entry.runtime, delivery: entry.delivery, ...(entry.session ? { session: entry.session } : {}) };
+}
+
+/** v2 delivery for `eln msg route`. Only a registry seat gets these fields. Liveness is a later card.
+ *  Uses the same snapshot as wake: an injected reader, or one read of the file. */
+export function seatDeliveryView(address: string, deps: WakeDeps = {}, snapshot: RegistrySnapshot = registrySnapshot(deps)): Pick<WakeResolution, 'runtime' | 'delivery' | 'session'> {
+  const name = address.trim().toUpperCase().replace(/^SEAT:/, '');
+  if (!/^[A-Z][A-Z0-9_-]{0,63}$/.test(name)) return {};
+  if (snapshot.v2Seats) {
+    const entry = seatRegistryV2Entry({ version: 2, seats: snapshot.v2Seats }, name);
+    return entry ? deliveryFields(entry) : {};
+  }
+  if (snapshot.routed.status !== 'ready') return {};
+  const v1 = seatRegistryEntry(snapshot.routed.registry, name);
+  return v1 ? deliveryFields(normalizeSeatRegistryV1Entry(v1)) : {};
+}
+
+function wakeResolutionForSeat(entry: SeatRegistryEntry, fromV2 = false): WakeResolution {
+  // v1 wake=none is a disabled address. A v2 no-inject seat is projected as wake=none too, but it is
+  // still a registered seat: keep host and do not mark it disabled (that drops a remote queue host).
+  const v2NoInject = fromV2 && entry.wake === 'none';
+  return { wake: v2NoInject ? 'sse' : entry.wake, ...(entry.target ? { target: entry.target } : {}), source: 'seat-registry',
+    host: entry.host, optIn: entry.optIn, ...(!v2NoInject && entry.wake === 'none' ? { reason: 'registry-wake-disabled' } : {}),
+    // A v1 row that declares its agent body (runtime) carries the v2 delivery view too — absent stays as before.
+    ...(!fromV2 && entry.runtime ? deliveryFields(normalizeSeatRegistryV1Entry(entry)) : {}) };
+}
+
+function validateRegisteredHerdrPane(entry: SeatRegistryEntry, census: () => HerdrPane[] | null, fromV2 = false): WakeResolution {
+  const registered = wakeResolutionForSeat(entry, fromV2);
   if (entry.wake !== 'herdr' || !entry.target) return registered;
+  // A remote-host pane never appears in the local herdr census; rejecting it as
+  // dead-pane-address here silently drops the downlink. The async prompt below
+  // runs a remote census (requirePaneListStatus) and is the real liveness/idle gate.
+  if (entry.host && entry.host !== 'local') return registered;
   const panes = census();
   if (panes === null) return unresolved('pane-census-unavailable:candidates=unknown');
   const matches = panes.filter(row => row.paneId === entry.target);
@@ -221,7 +302,7 @@ function validateRegisteredHerdrPane(entry: SeatRegistryEntry, census: () => Her
 export function messageReplyBodyFor(address: string, deps: WakeDeps = {}): string | null {
   const loopRoute = messageRouteFor(address);
   if (loopRoute?.wake) return loopRoute.replyBody ?? null;
-  const registry = registryFor(deps);
+  const registry = registrySnapshot(deps).routed;
   if (registry.status !== 'ready') return null;
   return seatRegistryEntry(registry.registry, address)?.replyBody ?? null;
 }
@@ -292,11 +373,13 @@ export function resolveWake(address: string, deps: WakeDeps = {}): WakeResolutio
         ? `${paneLivenessReason(matches[0]!, 'pane')}:candidates=1` : `dead-pane-address:candidates=0`);
   }
   // Explicit registry entries remain authoritative; an absent declaration can resolve by pane title/cwd.
-  const registry = registryFor(deps);
+  // fromV2 is the same snapshot as the seats, not a second read of the file.
+  const snapshot = registrySnapshot(deps);
+  const registry = snapshot.routed;
   if (registry.status === 'invalid') return { wake: 'none', source: 'unresolved', reason: `invalid-seat-registry:${registry.reason}` };
   if (registry.status === 'ready') {
     const entry = seatRegistryEntry(registry.registry, name);
-    if (entry) return validateRegisteredHerdrPane(entry, census);
+    if (entry) return validateRegisteredHerdrPane(entry, census, snapshot.v2Seats !== undefined);
   }
   const seatName = name.replace(/^SEAT:/, '');
   const panes = census();
@@ -317,6 +400,8 @@ export interface RegisterSeatPaneOptions {
   host: string;
   enableWake?: boolean;
   replace?: boolean;
+  /** The agent body in the pane (eln · claude-code · codex). Absent keeps what the registry had. */
+  runtime?: SeatAgentRuntime;
 }
 
 export interface RegisterSeatPaneResult {
@@ -378,10 +463,12 @@ export function registerSeatPaneAddress(input: RegisterSeatPaneOptions, deps: Wa
     const changed = previous?.target !== paneId || previous.host !== host || previous.wake !== 'herdr';
     const hasBinding = previous !== undefined && (previous.target !== undefined || previous.wake !== 'none');
     if (hasBinding && changed && !input.replace) throw new Error(`seat ${address} already points to ${previous.host}:${previous.target ?? '(none)'}; pass --replace to update`);
+    const runtime = input.runtime ?? previous?.runtime;
     const entry: SeatRegistryEntry = {
       address, host, target: paneId, wake: 'herdr', replyBody: previous?.replyBody ?? 'agent',
       // Rebinding revokes consent unless this command explicitly opts the new target in.
       optIn: input.enableWake === true ? true : changed ? false : previous?.optIn ?? false,
+      ...(runtime === undefined ? {} : { runtime }),
     };
     const nextSeats = [...seats.filter(row => row.address !== address), entry].sort((a, b) => a.address.localeCompare(b.address));
     const next = JSON.stringify({ version: 1, seats: nextSeats }, null, 2) + '\n';
@@ -444,17 +531,51 @@ async function defaultPtyInjector(): Promise<(ptyId: string, line: string) => Pr
   };
 }
 
+/** The 60s fallback knock (OP 11-17 21:5x): no message content, no sender — only «check your mail». */
+export function fallbackWakeLine(address: string): string {
+  return `[우편 확인] eln msg list --to ${address}`;
+}
+
 export function wakeLine(from: string, address: string, msgId: number): string {
   return `[우편 깨움] ${from} → ${address} #${msgId} — eln msg list --to ${address} 로 읽고 처리`;
 }
 
 export const NO_WAKE_NOTICE = '이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다';
+/** An eln seat whose TUI watches its own inbox while idle (ELN-EXTERNAL-EVENTS ①). */
+export const IDLE_WATCH_WAKE = 'eln-idle-watch';
+
+/**
+ * MSG-RECEIPTS-FOLLOWUP (TC ②): a wake=none post says whether the receiving body is KNOWN — registered (or watching its
+ * own inbox) but not wakeable, vs not found at all. Structural (registry source · idle-watch file), never guessed.
+ */
+export function wakeNoneNotice(outcome: Pick<WakeOutcome, 'source' | 'reason' | 'host' | 'target' | 'optIn'>, idleWatch: boolean): string {
+  // The autowake file is consent, not liveness: whether the TUI is running right now is measured elsewhere (#38314 ③).
+  if (idleWatch) return `${NO_WAKE_NOTICE} (wake=${IDLE_WATCH_WAKE} · 받는 몸: 자기 우편 감시 opt-in 확인됨 · 살아 있음은 따로 잼)`;
+  if (outcome.source === 'unresolved') return `${NO_WAKE_NOTICE} (wake=none · 받는 몸 모름: 등록부·pane 에서 못 찾음 — ${outcome.reason ?? 'unknown'})`;
+  // #38314 REVIEW ①: a placeholder row (host unknown, or no target and no opt-in — e.g. the legacy rows the first
+  // registration snapshots) is not a known body: say «모름», never a false «확인됨».
+  if (outcome.host === 'unknown' || (!outcome.target && outcome.optIn !== true)) {
+    return `${NO_WAKE_NOTICE} (wake=none · 받는 몸 모름: ${outcome.source} 자리표시 줄 — host ${outcome.host ?? '?'}${outcome.target ? '' : ' · pane 없음'})`;
+  }
+  // #38314 ②: a loop-table address is a loop's mailbox, not a seat pane — its reader is the loop's replyBody policy.
+  if (outcome.source === 'loop-table') return `${NO_WAKE_NOTICE} (wake=none · 받는 몸: 루프 주소 · 읽는 몸은 replyBody 정책)`;
+  return `${NO_WAKE_NOTICE} (wake=none · 받는 몸 확인됨: ${outcome.source}${outcome.host ? ` ${outcome.host}` : ''} · 깨울 길 없음)`;
+}
+const IDLE_WATCH_OPT_IN = 'autowake';
+
+/** True when `<seat-state>/<SEAT>/autowake` is a regular file — that seat's TUI polls mail while idle. */
+export function seatHasIdleMailWatch(address: string, deps: WakeDeps = {}): boolean {
+  const seat = address.trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9_-]*$/.test(seat)) return false;
+  const path = join(resolveSeatStateRoot(deps), seat, IDLE_WATCH_OPT_IN);
+  return deps.hasOptIn?.(path) ?? existsSync(path);
+}
 
 /**
  * Wake the reader of a just-saved message. Never throws; the caller's post outcome is already final.
  * `message.from`/`kind` decide the skips (a reply or a self-addressed note never wakes anyone).
  */
-export async function wakeRecipient(address: string, msgId: number, message: { from: string; kind?: string }, deps: WakeDeps = {}): Promise<WakeOutcome> {
+export async function wakeRecipient(address: string, msgId: number, message: { from: string; kind?: string; /** 60s safety-net knock: skips the eln mail-watch rule and types {@link fallbackWakeLine}. */ fallback?: boolean }, deps: WakeDeps = {}): Promise<WakeOutcome> {
   const timeoutMs = deps.timeoutMs ?? WAKE_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let resolution: WakeResolution = { wake: 'none', source: 'unresolved', reason: 'not-resolved' };
@@ -475,11 +596,13 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
     if (resolution.wake === 'none') return done('no-wake');
     // 사람이 앉는 pane 은 명시 opt-in 이 없으면 주입 0 — 에이전트가 idle 이어도 사람이 치는 중일 수 있다.
     if (resolution.optIn === false) return done('skipped', 'human-pane-no-opt-in');
+    // OP 11-17 21:5x — an eln body that watches its own inbox is never typed into; the 60s fallback is the only knock.
+    if (!message.fallback && resolution.runtime === 'eln' && seatHasIdleMailWatch(address, deps)) return done('eln-mail-watch', IDLE_WATCH_WAKE);
     if (!isLive(deps)) return done('skipped-test-universe');
     claim = claimWake(claimDbPath(deps), address, (deps.now ?? Date.now)());
     if (!claim) return done('debounced');
     try {
-      const line = wakeLine(message.from, address, msgId);
+      const line = message.fallback ? fallbackWakeLine(address) : wakeLine(message.from, address, msgId);
       if (resolution.wake === 'pty-inject') {
         // 모듈을 «먼저» 불러오고, 그 뒤에 턴을 읽는다 — 로드 사이 busy 로 바뀐 TUI 에 넣지 않는다.
         const inject = await (deps.ptyInjector ?? defaultPtyInjector)();
@@ -552,8 +675,10 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
   } finally { clearTimeout(timer); }
   attempt.catch(() => { /* a late failure after timeout is already reported as timeout */ });
   try {
-    if (outcome.result === 'no-wake') (deps.warn ?? (line => console.error(line)))(
-      outcome.source === 'unresolved' ? `${NO_WAKE_NOTICE} (wake=none · 모름: ${outcome.reason})` : `${NO_WAKE_NOTICE} (wake=none)`);
+    if (outcome.result === 'no-wake') {
+      const notice = wakeNoneNotice(outcome, seatHasIdleMailWatch(address, deps));
+      (deps.warn ?? (line => console.error(line)))(notice);
+    }
     debug.log('msg.wake', outcome.result === 'skipped' ? 'skipped' : outcome.wake, { address, msgId, wake: outcome.wake, result: outcome.result, reason: outcome.reason ?? outcome.source,
       ...(outcome.target ? { target: outcome.target } : {}), ...(outcome.host ? { host: outcome.host } : {}) });
   } catch { /* reporting never turns a wake outcome into a throw */ }

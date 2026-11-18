@@ -37,11 +37,11 @@ describe('createRunningBuildStatus', () => {
 
 describe('runningBuildSegment / git label', () => {
   test('renders the boot sha, and a relaunch marker when stale', () => {
-    expect(strip(runningBuildSegment({ sha: SHA_A, stale: false }))).toBe('▶ 실행 aaaaaaa');
-    expect(strip(runningBuildSegment({ sha: SHA_A, stale: true, currentSha: SHA_B }))).toBe('▶ 실행 aaaaaaa ⟳ 재기동 필요 → bbbbbbb');
-    expect(strip(runningBuildSegment({ sha: SHA_A, stale: true }))).toBe('▶ 실행 aaaaaaa ⟳ 재기동 필요');
-    expect(strip(runningBuildSegment({ sha: SHA_A, stale: null }))).toBe('▶ 실행 aaaaaaa ?');
-    expect(strip(runningBuildSegment({ sha: '', stale: null }))).toBe('▶ 실행 ?');
+    expect(strip(runningBuildSegment({ sha: SHA_A, stale: false }))).toBe('▶ running aaaaaaa');
+    expect(strip(runningBuildSegment({ sha: SHA_A, stale: true, currentSha: SHA_B }))).toBe('▶ running aaaaaaa ⟳ restart needed → bbbbbbb');
+    expect(strip(runningBuildSegment({ sha: SHA_A, stale: true }))).toBe('▶ running aaaaaaa ⟳ restart needed');
+    expect(strip(runningBuildSegment({ sha: SHA_A, stale: null }))).toBe('▶ running aaaaaaa ?');
+    expect(strip(runningBuildSegment({ sha: '', stale: null }))).toBe('▶ running ?');
     expect(runningBuildSegment(undefined)).toBe('');
   });
 
@@ -69,7 +69,7 @@ describe('status line wiring', () => {
   });
 
   test('running build sits right after the tree-labelled git pill; stale shows the relaunch marker', () => {
-    expect(strip(buildLine({ sha: SHA_A, stale: true, currentSha: SHA_B }))).toBe(' 📁 test/project  │ ⌥ 트리 HEAD@bbbbbbb │ ▶ 실행 aaaaaaa ⟳ 재기동 필요 → bbbbbbb │ gpt-5.4-mini');
+    expect(strip(buildLine({ sha: SHA_A, stale: true, currentSha: SHA_B }))).toBe(' 📁 test/project  │ ⌥ 트리 HEAD@bbbbbbb │ ▶ running aaaaaaa ⟳ restart needed → bbbbbbb │ gpt-5.4-mini');
   });
 
   test('without a running build the line is unchanged', () => {

@@ -99,7 +99,7 @@ function defaultStore(root?: string): CondenseStore {
   return {
     list: () => listMemories({}, memoryDir),
     hasMemoryDirectory: () => existsSync(memoryDir),
-    save: input => saveMemory(input, memoryDir),
+    save: input => saveMemory(input, memoryDir, { origin: 'context-condense' }),
     raise: (input, ref) => ledger.raiseOnce(input, ref).id,
     withLock: action => withMemoryLock(memoryDir, action),
   };

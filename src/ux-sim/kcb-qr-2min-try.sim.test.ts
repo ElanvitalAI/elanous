@@ -34,9 +34,9 @@ test('KCB fake Google signup → first fake LLM result through member API', asyn
       `${FAKE_MEMBER_OIDC_REDIRECT_URI}?code=${authorization.code}&state=${authorization.state}`,
       { headers: { cookie: stateCookie } },
     ));
-    // 출처: #37345 — KCB callback is a 303 to /members/ with the session cookie. The HTML continue page is gone.
+    // 출처: #37345 — KCB callback is a 303 with the session cookie (no HTML continue page); #37624 moved the default landing to /app/board/.
     expect(complete?.status).toBe(303);
-    expect(complete?.headers.get('location')).toBe('https://app.example.test/members/');
+    expect(complete?.headers.get('location')).toBe('https://app.example.test/app/board/');
     expect(await complete!.text()).toBe('');
     const sessionCookie = complete!.headers.getSetCookie().find(value => value.startsWith('__Host-elanous_member_session='));
     expect(sessionCookie?.includes('HttpOnly')).toBe(true);

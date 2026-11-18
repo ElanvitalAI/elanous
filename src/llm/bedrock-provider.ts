@@ -9,6 +9,7 @@ import type { LLMProvider } from '../llm.js';
 import type { LLMConfig as UCLLMConfig } from '../user-config/types.js';
 import { debug, redactSecrets } from '../debug/log.js';
 import { ApiHttpError, fetchApiWithRetry, type FetchApiWithRetryOpts } from '../session-runtime/retry-api.js';
+import { llmNetworkSend } from '../session-runtime/llm-call-gateway.js';
 import { isVisionCapableModel } from '../llm-vision-capability.js';
 import * as bedrock from './bedrock.js';
 import { bedrockRuntimeSseLines } from './bedrock-eventstream.js';
@@ -68,9 +69,10 @@ async function signAndSend(input: {
   let response: Response;
   try {
     response = deps.send
-      ? await deps.send(signed.url, init)
+      ? await llmNetworkSend(signed.url, init, { provider: 'bedrock', model: wireModel, billing: 'apikey' }, () => deps.send!(signed.url, init))
       : await fetchApiWithRetry(signed.url, init, {
         ...input.retryOptsFor('bedrock', 'Bedrock API', opts.remainingFallbacks),
+        callContext: { model: wireModel, billing: 'apikey' },
         refreshInit: async () => toInit(await signRequest()),
       });
   } catch (err) {

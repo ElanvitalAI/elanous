@@ -29,3 +29,23 @@ export function parseCredentialSlotId(id: string): { service: string; field: str
 export function assertCredentialSlotId(id: string): asserts id is CredentialSlotId {
   if (!parseCredentialSlotId(id)) throw new Error('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
 }
+
+/**
+ * Rotating login material (OAuth access/refresh tokens, sessions) stays with its single owner host and is
+ * never carried by an export/import bundle — 대표 11-16 cred-push decision. Every catalogued slot above is a
+ * static API key, so the transferable allowlist is exactly the catalogued slots, and these patterns are an
+ * explicit second fence in case a login slot is ever added to the schema by mistake.
+ */
+const ROTATING_LOGIN_SLOT_PATTERN = /^cred:(?:codex|claude|anthropic|chatgpt|grok)(?:[-.]|$)|oauth|refresh|session|login/i;
+
+/** Classifies a `cred:` ID for encrypted bundle transfer without reading any value. */
+export function credentialSlotTransferClass(id: string): 'static' | 'rotating-login' | 'unsupported' {
+  if (ROTATING_LOGIN_SLOT_PATTERN.test(id)) return 'rotating-login';
+  return parseCredentialSlotId(id) ? 'static' : 'unsupported';
+}
+
+export function assertTransferableStaticCredentialSlotId(id: string): asserts id is CredentialSlotId {
+  const transferClass = credentialSlotTransferClass(id);
+  if (transferClass === 'rotating-login') throw new Error('ELANOUS_CREDENTIAL_SLOT_ROTATING_LOGIN_NOT_TRANSFERABLE');
+  if (transferClass !== 'static') throw new Error('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
+}

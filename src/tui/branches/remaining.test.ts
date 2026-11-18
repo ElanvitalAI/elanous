@@ -8,7 +8,7 @@ test('/remaining dispatch reaches the shared usage report and renders account-sp
   const route = resolveNextTuiRoute('/remaining', NEXT_TUI_INPUT_CONTEXT);
   expect(route?.id).toBe('remaining');
   expect(resolveNextTuiRoute('/remaining all', NEXT_TUI_INPUT_CONTEXT)?.id).toBe('remaining');
-  expect(buildNextTuiHelpLines().join('\n')).toContain('/remaining — 통합 사용량과 남은 할당량');
+  expect(buildNextTuiHelpLines().join('\n')).toContain('/remaining — Combined usage and remaining quota');
 
   // Fixture values are data, not source bounds; parse them as one JSON string like the usage contract fixtures.
   const snapshot = JSON.parse('{"provider":"codex","windows":[{"kind":"weekly","windowMinutes":10080,"limit":100,"used":63,"remainingPercent":37,"resetsAt":1900000000000}],"credits":{"balance":0,"hasCredits":false,"unlimited":false},"fetchedAt":1700000000000,"source":"cli-rpc"}') as UsageSnapshot;
@@ -33,5 +33,5 @@ test('/remaining dispatch reaches the shared usage report and renders account-sp
 test('/remaining displays a safe message when the shared usage report is unavailable', async () => {
   const lines: string[] = [];
   await runNextTuiRemainingBranchRoute('/remaining', { addLines: (...items) => lines.push(...items) }, async () => null);
-  expect(lines).toEqual(['남은 사용량을 읽을 수 없습니다.']);
+  expect(lines).toEqual(['Could not read remaining usage.']);
 });

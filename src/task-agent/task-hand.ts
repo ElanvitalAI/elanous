@@ -35,7 +35,7 @@ import { POD_DISTRIBUTOR_ENTRY_ENV, TASK_HAND_POD_DISTRIBUTOR_ENTRY } from './po
 // Keep doctor-visit recording synchronous: updateTaskCard callers observe it before the transition returns.
 import { recordTaskAgentNeedsOwnerVisit } from '../self-implement/doctor-visit.js';
 import { applyRunIdentityTag, applyRunIdentityTags, deriveBirthIdentity, parseRunIdentityTag, runIdentityFieldText, runIdentityQueuePriority, runPriorityClass, validateRunIdentity, type RunIdentity, type RunIdentityCell, type RunIdentityOrigin } from './run-identity.js';
-import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type WorkOrder } from './work-order.js';
+import { criticalUnknownFields, parseWorkOrder, parseWorkOrderBudget, TA_BUDGET_WALL_ENV, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type WorkOrder } from './work-order.js';
 import { recordCoordinatorShadowDispatch, resolveCoordinatorShadowRoot } from '../loops/orchestrator/coordinator-shadow.js';
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
@@ -54,6 +54,7 @@ import { TASK_SEATS, TaskAgentStateError, cardPrNumber, readTaskAgentState as re
 import type { TaskAgentStateFile } from './task-card-state.js';
 export { TASK_SEATS, TaskAgentStateError, cardPrNumber, readTaskAgentState, readTaskCard, taskAgentStatePath, updateTaskCard, updateTaskCardsAtomically, writeTaskCards, TaskCardSupersededError } from './task-card-state.js';
 import { childLlmEffortProblem } from '../intelligence-map/model-catalog.js';
+import { isImageDigestPin } from '../task-orchestrator/surfaces/pod-image-digest-check.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -99,12 +100,25 @@ export function resolveHandText(text: string, deps: ResolveHandTextDeps = { cwd:
   if (workOrder) {
     const parsed = parseWorkOrder(content);
     if (!parsed.ok) return reject(parsed.reason);
+    // 발사 거부 — 경계·예산·계약·올림이 «모름» 이면 TA 가 추측한다. 지시서를 채운 뒤 다시 낸다.
+    const criticalUnknown = criticalUnknownFields(parsed.order);
+    if (criticalUnknown.length > 0) {
+      try { debug.log('task-agent.work-order', 'rejected-critical-unknown', { cellId: parsed.order.cellId, criticalUnknown }); } catch { /* fail-soft */ }
+      return { kind: 'rejected', path, reason: `critical 칸이 «모름»: ${criticalUnknown.join(', ')}` };
+    }
     try { debug.log('task-agent.work-order', 'parsed', { cellId: parsed.order.cellId, unknownFields: parsed.order.unknownFields }); } catch { /* fail-soft */ }
     return { kind: 'work-order', text: renderWorkOrderGoal(parsed.order), path, order: parsed.order };
   }
   const carried = content.trim();
   if (!carried) return { kind: 'rejected', path, reason: '비었다' };
   return { kind: 'inlined', text: content, path, chars: carried.length, sha256: createHash('sha256').update(carried).digest('hex') };
+}
+
+/** 지시서의 선언 벽시계(time)를 발사 환경으로 — Pod Job 수명 소비자가 읽는다(self-implement-pod.ts). 지시서 없음·예산 형식 오류면 비운다(발사를 막지는 않는다). */
+export function taBudgetEnv(order: WorkOrder | undefined): Record<string, string> {
+  if (order === undefined) return {};
+  const budget = parseWorkOrderBudget(order.budget);
+  return budget.ok ? { [TA_BUDGET_WALL_ENV]: String(budget.timeSec) } : {};
 }
 
 export type TaskSeat = typeof TASK_SEATS[number];
@@ -402,6 +416,10 @@ export interface TaskCard {
   taLand?: true;
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
   childLlm?: TaskChildLlm;
+  /** TA-PREFLIGHT ① — `tasks hand --source commit:<40hex>`: 자식이 받을 정확 소스. 발사 인자 `--source` 로 가고 부모가 자식 수신 HEAD 와 대조한다. */
+  source?: string;
+  /** TA-PREFLIGHT ② — `tasks hand --image-digest sha256:<64hex>`: 요청 이미지 digest pin → 발사 인자 `--image-digest` · Pod 소비 digest 와 부모가 대조. */
+  imageDigest?: string;
   /** Explicit parent role pins; the implementation child remains controlled by childLlm. */
   parentRoleLlm?: string[];
   /** Dispatch difficulty, fixed at handoff so repair uses the same judgement. */
@@ -939,13 +957,13 @@ export function readChecklistCellForBirth(checklistId: string, boardVersion?: st
 }
 
 /** 첫 수의 elanous 인자(진입점·--config-dir 앞붙임은 launcher 몫). */
-export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm' | 'identity'>): string[] {
+export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm' | 'identity' | 'source' | 'imageDigest'>): string[] {
   const child = card.childLlm
     ? ['--child-llm-provider', card.childLlm.provider, '--child-llm-model', card.childLlm.model, ...(card.childLlm.effort ? ['--child-llm-effort', card.childLlm.effort] : [])]
     : [];
   const runPriority = runIdentityQueuePriority(card.identity);
   // Exact role model pins travel in ELANOUS_ROLE_LLM_*: harness say's argv parser only accepts provider[/tier].
-  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', ...(runPriority !== undefined ? ['--run-priority', String(runPriority)] : []), ...child, card.text];
+  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', ...(card.source ? ['--source', card.source] : []), ...(card.imageDigest ? ['--image-digest', card.imageDigest] : []), ...(runPriority !== undefined ? ['--run-priority', String(runPriority)] : []), ...child, card.text];
 }
 
 /**
@@ -1012,6 +1030,10 @@ export interface HandTaskOptions {
   /** TASKS-HAND-CHILD-LLM — `<provider>/<model>`(`parseChildLlm`) ⊕ 선택 추론 노력. effort 만 주면 거부. */
   childLlm?: string;
   childLlmEffort?: string;
+  /** `commit:<40hex>` 만 받는다(정확 소스). */
+  source?: string;
+  /** `sha256:<64hex>` 만 받는다(이미지 digest pin). */
+  imageDigest?: string;
   /** Injected budget facts for a mission child; production reads the live launch-budget inputs just before launch. */
   childBudgetInputs?: () => Promise<BudgetInputs> | BudgetInputs;
   parentRoleLlm?: string[];
@@ -1168,6 +1190,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   for (const [flag, value] of [['--goal', opts.goal], ['--milestone', opts.milestone]] as const) {
     if (value !== undefined && (!value.trim() || /\p{Cc}/u.test(value))) throw new Error(`${flag} id 가 비었거나 제어 문자를 담았다: ${JSON.stringify(value)}`);
   }
+  if (opts.source !== undefined && !/^commit:[0-9a-f]{40}$/.test(opts.source)) throw new Error(`--source 는 commit:<40자 소문자 16진 sha> 만 받는다: ${JSON.stringify(opts.source)}`);
+  if (opts.imageDigest !== undefined && !isImageDigestPin(opts.imageDigest)) throw new Error(`--image-digest 는 sha256:<64자 소문자 16진> 만 받는다: ${JSON.stringify(opts.imageDigest)}`);
   if (opts.childLlmEffort !== undefined && opts.childLlm === undefined) throw new Error('--child-llm-effort 는 --child-llm <provider>/<model> 과 함께 준다');
   if (opts.tier !== undefined && !['하', '중', '상', '특'].includes(opts.tier)) throw new Error(`--tier 는 하|중|상|특 중 하나다: ${opts.tier}`);
   const tierSplitBlocked = opts.tierSplitBlocked;
@@ -1269,6 +1293,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
     ...(opts.taLand === true ? { taLand: true as const } : {}),
     ...(childLlm ? { childLlm } : {}),
+    ...(opts.source ? { source: opts.source } : {}),
+    ...(opts.imageDigest ? { imageDigest: opts.imageDigest } : {}),
     ...(parentRolePins.length ? { parentRoleLlm: parentRolePins } : {}),
     ...(opts.tier ? { tier: opts.tier } : {}),
     ...(opts.tierSplit ? { tierSplit: opts.tierSplit } : {}),
@@ -1541,7 +1567,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   });
   let inheritedLaunchDoorReceipt: string | undefined;
   if (launchDoor !== undefined && launchDoorRequestId !== undefined) {
-    const doorConsumption = launchDoor.consume(launchDoorRequestId);
+    const doorConsumption = launchDoor.consume(launchDoorRequestId, { ta: true, target: { card: card.id, ...(card.checklistId ? { cell: card.checklistId } : {}), ...(card.source?.startsWith('commit:') ? { commit: card.source.slice('commit:'.length) } : {}) } });
     if (doorConsumption.status === 'refused') {
       const at = (opts.now ?? (() => new Date()))().toISOString();
       const refused: TaskCard = { ...card, history: [...card.history, { at, event: LAUNCH_REFUSED_DUPLICATE_EVENT, detail: doorConsumption.reason }] };
@@ -1560,6 +1586,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(inheritedLaunchDoorReceipt !== undefined ? { [LAUNCH_DOOR_RECEIPT_ENV]: inheritedLaunchDoorReceipt } : {}),
     ...(cardPrNumber(card) ? { ELANOUS_TASK_BOUND_PR: String(cardPrNumber(card)) } : {}),
     ...(card.checklistId ? { ELANOUS_POD_SLOT_ID: card.checklistId } : {}),
+    ...taBudgetEnv(opts.workOrder),
     ...(card.seat ? { ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: card.seat } : {}),
     ...(podLaunch ? { [POD_DISTRIBUTOR_ENTRY_ENV]: TASK_HAND_POD_DISTRIBUTOR_ENTRY } : {}),
     ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card),

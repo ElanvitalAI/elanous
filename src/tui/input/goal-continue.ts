@@ -15,15 +15,31 @@
 //   인지 = 턴 끝 ∧ 답 끝 구절이 약속형 ∧ 질문형 아님 ∧ 상한 안
 //   힐링 = H2 로 «약속한 일을 지금 실행하라» 한 턴(화면 «↻ 자동 재개(goal-continue): …») · 상한 → 멈춤 ⊕ 'cap'
 
+import { compareTurnOutcome } from '../../dashboard/input/turn-outcome-shadow.js';
+import type { PlanTurnOutcome } from '../../code-edit/plan-outcome.js';
+import { outcomeOfPlanWire, type PlanWire } from '../../code-edit/plan-wire.js';
 import type { TextInputInternalTurnYieldPort } from '../../chat/index.js';
 import { debug } from '../../debug/log.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from './internal-turn.js';
 import { classifyReplyTail, replyTailFromLines, type GoalContinueVerdict } from '../../chat/goal-continue-verdict.js';
+import { CONTINUE_REASON } from '../chat/continue-banner.js';
 export { classifyReplyTail, replyTailFromLines } from '../../chat/goal-continue-verdict.js';
 export type { GoalContinueVerdict } from '../../chat/goal-continue-verdict.js';
 
 export const GOAL_CONTINUE_ENV = 'ELANOUS_TUI_GOAL_CONTINUE';
 export const DEFAULT_GOAL_CONTINUE_CAP = 3;
+/** ELN-CONTINUE-AFTER-DECLARED-NEXT-STEP: automatic next turns after a seat turn cap, per person's turn (resets on human input). */
+export const DEFAULT_SEAT_CAP_CONTINUE_LIMIT = 5;
+export const SEAT_CAP_CONTINUE_ENV = 'ELANOUS_TUI_SEAT_CAP_CONTINUE';
+/** Plan-driven continues in a row (no person's turn between) before a person is asked. */
+export const DEFAULT_PLAN_CONTINUE_LIMIT = 10;
+/** Language-free: the verdict came from the plan state, so the prompt only restates the contract. */
+export const PLAN_CONTINUE_PROMPT = '[plan] Open steps remain in your plan and nothing is marked blocked. Continue with the active step using tools and keep the plan current with update_plan. '
+  + 'Decide questions you can answer yourself; if you truly cannot go on without a person or an outside change, mark that step blocked with a reason instead of asking.';
+export const PLAN_NUDGE_PROMPT = '[plan] Record this turn\'s outcome with update_plan before ending a turn: finished steps completed, the active step in_progress, a step that needs a person blocked (with a reason), '
+  + 'a step that waits for something waiting (with a wake). Then continue if work remains.';
+
+export const SEAT_CAP_CONTINUE_PROMPT = '[자리 턴 상한 이어가기] 앞 자리 턴이 도구·시간 상한에 닿아 마감됐다. 위 진행 요약을 이어받아 남은 일을 계속한다 — 다 끝났다면 update_goal(status:"complete", evidence) 로 마감하고, 사람 판단·권한이 필요한 막힘이면 무엇이 필요한지 한 줄로 쓰고 멈춘다.';
 const HUMAN_ACTION = /로그인(?:이 필요|해 주세요)|결제(?:가 필요|해 주세요|해야 합니다)|(?:사람|사용자)의\s*(?:결정|승인)|(?:결정|승인)(?:이 필요|해 주세요)|권한이 필요|비밀번호를 입력해 주세요|위험\s*(?:승인|감수)(?:가 필요|를 직접)|직접\s*(?:선택|확인|승인)(?:해 주세요|이 필요)|\bhuman\s+(?:approval|decision|login|payment)\s+(?:is )?(?:required|needed)\b/iu;
 const REMAINING_WORK = /(?:남은\s*(?:일|작업|것)|remaining work).{0,80}(?:아직|미완|남아\s*있|못\s*(?:했|하)|하지\s*못|not yet|unfinished|incomplete)/iu;
 const NO_REMAINING_WORK = /(?:남은\s*(?:일|작업|것)(?:은|이)?\s*(?:없|완료|끝)|(?:모두|전부)\s*(?:완료|끝났)|\bno remaining work\b|\ball remaining work\b.{0,16}\b(?:done|complete|finished)\b)/iu;
@@ -76,9 +92,27 @@ export interface GoalContinueDeps {
   startTurnIfIdle: (input: string, opts: StartTurnIfIdleOptions) => StartTurnIfIdleResult;
   isEnabled?: () => boolean;
   consecutiveCap?: number;
+  /** When the plan was not touched, ask for its state once before the wording rules continue (the Next TUI turns this on). */
+  planNudge?: boolean;
+  /** Plan-driven automatic continues allowed in a row (default 10). */
+  planContinueLimit?: number;
+  /** The plan said something a person or the host should act on: blocked (reason), waiting (wake) or done. */
+  onPlanOutcome?: (outcome: Exclude<PlanTurnOutcome, { kind: 'continue' | 'gap' }>, plan: PlanWire) => void;
+  /** Seat name for the shadow comparison events. */
+  seat?: string;
+  /** Automatic continues allowed after seat-cap exhaustion before a person is needed (default 5; env ELANOUS_TUI_SEAT_CAP_CONTINUE overrides, 0 = off). */
+  seatCapContinueLimit?: number;
   notify?: (line: string) => void;
+  /** Clock for a paced retry (`retryAt`). Default Date.now. */
+  now?: () => number;
   /** 사람 입력 직후 거부(HumanTyping)면 다시 잴 시각까지 미룬다(기본 setTimeout · unref). */
   defer?: (fn: () => void, ms: number) => void;
+  /**
+   * ELN-TURN-CAP-CONTINUE-STALL (③): the gate only parks a pending turn. This asks, after a short
+   * wait, whether the input loop took that turn (`takePending`). A false reading withdraws it and
+   * paints the stop. Unset means the caller has no loop to watch, so opening stays synchronous.
+   */
+  confirmSeatCapTurnStarted?: (turnId: string) => Promise<boolean>;
   /** HumanTyping 재시도 간격(기본 문 조용창 10초 + 여유). */
   retryMs?: number;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
@@ -89,6 +123,11 @@ export interface GoalContinueTurnEnd {
   lines: readonly string[];
   /** 턴이 실패(✘)·취소로 끝났으면 true — 이어가지 않는다. */
   failed?: boolean;
+  /** The goal loop's stop reason; `max_turns` = the seat turn cap (tools / wall clock) was exhausted. */
+  stopReason?: string;
+  /** The plan state at turn end (DECISION-GATE v2): the structured outcome, read instead of the reply's wording. */
+  plan?: PlanWire;
+  turnId?: string;
 }
 
 export interface GoalContinueController {
@@ -113,10 +152,20 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   const isEnabled = deps.isEnabled ?? (() => isGoalContinueEnabledByEnv());
   const cap = deps.consecutiveCap ?? DEFAULT_GOAL_CONTINUE_CAP;
   const defer = deps.defer ?? defaultDefer;
-  const retryMs = deps.retryMs ?? 10_500;
+  const retryFromEnv = Number(process.env.ELANOUS_TEST_GOAL_CONTINUE_RETRY_MS);
+  const retryMs = deps.retryMs ?? (Number.isFinite(retryFromEnv) && retryFromEnv >= 0 ? retryFromEnv : 10_500);
   const log = deps.log ?? ((c, e, d) => debug.log(c, e, d));
 
-  let armed: { tail: string; phrase: string; fingerprint: string; mode: 'pledge' | 'remaining' } | null = null;
+  const seatCapLimit = (() => {
+    const raw = Number((process.env[SEAT_CAP_CONTINUE_ENV] ?? '').trim());
+    return Number.isInteger(raw) && raw >= 0 && (process.env[SEAT_CAP_CONTINUE_ENV] ?? '').trim() !== '' ? raw : (deps.seatCapContinueLimit ?? DEFAULT_SEAT_CAP_CONTINUE_LIMIT);
+  })();
+  let seatCapConsecutive = 0;
+  type Armed = { tail: string; phrase: string; fingerprint: string; mode: 'pledge' | 'remaining' | 'seat-cap' | 'plan' | 'plan-nudge' };
+  let armed: Armed | null = null;
+  let planConsecutive = 0;
+  let planNudged = false;
+  const planLimit = deps.planContinueLimit ?? DEFAULT_PLAN_CONTINUE_LIMIT;
   let consecutive = 0;
   /** 사람 턴 이후 이미 이어간 답들의 지문 — A→B→A 에서도 같은 답으로 두 번 열지 않는다(r2 must-fix). */
   const openedFingerprints = new Set<string>();
@@ -124,10 +173,77 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   let retryArmed = false;
   let completedGoal = false;
 
+  /**
+   * A refused open: busy · a person typing · or ELN-SEAT-TURN-PACING's minimum interval (`Cap` with `retryAt`) keep the
+   * arm and measure again once — at `retryAt` for pacing, else after `retryMs`. Any other refusal (incl. the pacing run cap,
+   * which has no `retryAt`: only a new event or a person opens the next turn) drops the arm.
+   */
+  const handleRejected = (result: { reason: string; retryAt?: number }): void => {
+    const pacedAt = result.reason === 'Cap' && result.retryAt !== undefined ? result.retryAt : null;
+    const transient = result.reason === 'HumanTyping' || result.reason === 'NotIdle' || pacedAt !== null;
+    if (!transient) { armed = null; return; }
+    if (retryArmed) return;
+    retryArmed = true;
+    const wait = pacedAt !== null ? Math.max(0, pacedAt - (deps.now ?? Date.now)()) : retryMs;
+    defer(() => { retryArmed = false; try { check(); } catch { /* fail-soft */ } }, wait);
+  };
+
   const check: GoalContinueController['check'] = () => {
     if (completedGoal) return { opened: false, reason: 'goal-completed' };
     if (!armed) return { opened: false, reason: 'not-armed' };
     const { tail, phrase, fingerprint, mode } = armed;
+    if (mode === 'plan' || mode === 'plan-nudge') {
+      if (mode === 'plan' && planConsecutive >= planLimit) {
+        armed = null;
+        log('tui', 'turn.auto-continue', { rejected: true, reason: 'plan-limit', n: planConsecutive, limit: planLimit });
+        deps.notify?.(`⏸ Plan still has open steps after ${planConsecutive} automatic continues — a person is needed · any key resumes`);
+        return { opened: false, reason: 'plan-limit' };
+      }
+      const planResult = deps.startTurnIfIdle(mode === 'plan' ? PLAN_CONTINUE_PROMPT : PLAN_NUDGE_PROMPT,
+        { origin: 'goal-continue', reason: mode === 'plan' ? 'plan has open steps · continuing' : 'plan not updated · asking for its state' });
+      if (planResult.opened) {
+        armed = null;
+        if (mode === 'plan') planConsecutive += 1; else planNudged = true;
+        log('tui', 'turn.auto-continue', { opened: true, reason: mode === 'plan' ? 'plan-open' : 'plan-nudge', n: planConsecutive, limit: planLimit, turnId: planResult.turnId });
+        return { opened: true, reason: mode === 'plan' ? 'plan-open' : 'plan-nudge' };
+      }
+      handleRejected(planResult);
+      return { opened: false, reason: planResult.reason };
+    }
+    if (mode === 'seat-cap') {
+      // A capped seat turn is not a repeated answer: progress is judged by the counter, not the reply fingerprint.
+      if (seatCapConsecutive >= seatCapLimit) {
+        armed = null;
+        log('tui', 'turn.auto-continue', { rejected: true, reason: 'seat-cap-limit', n: seatCapConsecutive, limit: seatCapLimit });
+        deps.notify?.(`⏸ Seat turn cap reached ${seatCapConsecutive} times in a row — a person is needed · any key resumes`);
+        return { opened: false, reason: 'seat-cap-limit' };
+      }
+      const capResult = deps.startTurnIfIdle(SEAT_CAP_CONTINUE_PROMPT, { origin: 'goal-continue', reason: CONTINUE_REASON.turnLimit(seatCapConsecutive + 1, seatCapLimit) });
+      if (capResult.opened) {
+        // The gate only parks the turn. Watch until the input loop takes it; if it never does,
+        // the confirm hook withdraws that pending turn and we stop instead of saying «continuing».
+        if (deps.confirmSeatCapTurnStarted && capResult.turnId) {
+          const turnId = capResult.turnId;
+          armed = null;
+          void deps.confirmSeatCapTurnStarted(turnId).then((started) => {
+            if (started) {
+              seatCapConsecutive += 1;
+              log('tui', 'turn.auto-continue', { opened: true, reason: 'seat-cap', n: seatCapConsecutive, limit: seatCapLimit, turnId });
+              return;
+            }
+            log('tui', 'turn.auto-continue', { rejected: true, reason: 'seat-cap-not-started', n: seatCapConsecutive, turnId });
+            deps.notify?.('⏸ 멈춤 · Enter 로 계속');
+          }).catch(() => { /* fail-soft: a thrown watch must not re-arm */ });
+          return { opened: true, reason: 'seat-cap-pending' };
+        }
+        armed = null;
+        seatCapConsecutive += 1;
+        log('tui', 'turn.auto-continue', { opened: true, reason: 'seat-cap', n: seatCapConsecutive, limit: seatCapLimit, turnId: capResult.turnId });
+        return { opened: true, reason: 'seat-cap' };
+      }
+      handleRejected(capResult);
+      return { opened: false, reason: capResult.reason };
+    }
     // 초기화는 실제 사람 턴(noteHumanTurn)에서만 — 키만 치고 안 보낸 것으로 상한을 우회하지 못한다(r2 must-fix).
     if (openedFingerprints.has(fingerprint)) {
       armed = null;
@@ -149,36 +265,33 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       log('tui.proactive', 'stop-cap', { reason: mode === 'remaining' ? 'work-remaining' : 'pledge', remainingDigest: fingerprint, autoTurn: consecutive, cap });
       return { opened: false, reason: 'cap' };
     }
-    const result = deps.startTurnIfIdle(formatGoalContinuePrompt(phrase), { origin: 'goal-continue', reason: `«${phrase}» 뒤 이어서 실행` });
+    const result = deps.startTurnIfIdle(formatGoalContinuePrompt(phrase), { origin: 'goal-continue', reason: mode === 'remaining' ? CONTINUE_REASON.remainingPlan : CONTINUE_REASON.nextStep });
     if (result.opened) {
       armed = null;
       consecutive += 1;
       openedFingerprints.add(fingerprint);
       log('tui.goal-continue', 'decided', { opened: true, reason: 'pledge-without-result', phrase, tail, consecutive, turnId: result.turnId });
+      log('tui', 'turn.auto-continue', { opened: true, reason: mode === 'remaining' ? 'remaining-work' : 'declared-next-step', n: consecutive, limit: cap, turnId: result.turnId });
       log('tui.proactive', 'continue', { reason: mode === 'remaining' ? 'work-remaining' : 'pledge-without-result', remainingDigest: fingerprint, autoTurn: consecutive, turnId: result.turnId });
       return { opened: true, reason: 'pledge-without-result' };
     }
     log('tui.goal-continue', 'decided', { rejected: true, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}), tail, consecutive });
     // 사람이 막 쳤거나(조용창) 아직 안 비켰다 — 무장은 남기고 조금 뒤 다시 잰다(그 사이 사람 턴이면 noteHumanTurn 이 푼다).
-    if ((result.reason === 'HumanTyping' || result.reason === 'NotIdle') && !retryArmed) {
-      retryArmed = true;
-      defer(() => { retryArmed = false; try { check(); } catch { /* fail-soft */ } }, retryMs);
-    } else if (result.reason !== 'HumanTyping' && result.reason !== 'NotIdle') {
-      armed = null;
-    }
+    handleRejected(result);
     return { opened: false, reason: result.reason };
   };
 
-  return {
-    noteTurnEnded(end) {
-      armed = null;
-      if (completedGoal) return;
-      if (!isEnabled()) return;
-      if (end.failed) {
-        log('tui.goal-continue', 'decided', { rejected: true, reason: 'turn-failed' });
+  const armLegacy = (end: GoalContinueTurnEnd, tail: string | null): void => {
+      if (end.stopReason === 'max_turns') {
+        // Seat cap exhausted: continue unless the reply names something only a person can give.
+        const capVerdict = classifyReplyTail(tail);
+        if (tail && (HUMAN_ACTION.test(tail) || (!capVerdict.pledge && capVerdict.reason === 'asks-human'))) {
+          log('tui', 'turn.auto-continue', { rejected: true, reason: 'blocked-needs-person', tail: tail.slice(-80) });
+          return;
+        }
+        armed = { tail: tail ?? '', phrase: 'seat turn cap', fingerprint: goalContinueFingerprint(tail ?? 'seat-cap'), mode: 'seat-cap' };
         return;
       }
-      const tail = replyTailFromLines(end.lines);
       const verdict = classifyReplyTail(tail);
       const remaining = remainingWorkTail(tail);
       if (tail && HUMAN_ACTION.test(tail)) {
@@ -193,6 +306,42 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       }
       const phrase = remaining ?? (verdict.pledge ? verdict.phrase : '');
       armed = { tail: tail!, phrase, fingerprint: goalContinueFingerprint(remaining ?? tail!), mode: remaining ? 'remaining' : 'pledge' };
+  };
+
+  return {
+    noteTurnEnded(end) {
+      armed = null;
+      if (completedGoal) return;
+      if (!isEnabled()) return;
+      if (end.failed) {
+        log('tui.goal-continue', 'decided', { rejected: true, reason: 'turn-failed' });
+        return;
+      }
+      const tail = replyTailFromLines(end.lines);
+      const planOutcome = outcomeOfPlanWire(end.plan);
+      if (planOutcome.kind !== 'gap') {
+        // The plan state is the verdict — the wording of the reply is only compared against it (shadow).
+        const legacy = classifyReplyTail(tail);
+        compareTurnOutcome({
+          seat: deps.seat ?? 'UNKNOWN', turnId: end.turnId ?? '',
+          extractedPatterns: legacy.pledge || remainingWorkTail(tail) ? ['declared-next-step'] : [],
+          plan: { items: (end.plan?.steps ?? []).map((step, index) => ({ id: `s${index}`, status: step.status === 'completed' ? 'done' as const : step.status })) },
+        }, { emit: log });
+        if (planOutcome.kind === 'continue') {
+          armed = { tail: tail ?? '', phrase: 'plan open', fingerprint: goalContinueFingerprint(planOutcome.step), mode: 'plan' };
+          return;
+        }
+        planConsecutive = 0;
+        log('tui', 'turn.plan-outcome', { kind: planOutcome.kind, ...(planOutcome.kind === 'blocked' ? { reasonChars: planOutcome.reason.length } : {}) });
+        if (planOutcome.kind === 'blocked') deps.notify?.(`⏸ Blocked: ${planOutcome.reason || planOutcome.step} — a person is needed · any key resumes`);
+        else if (planOutcome.kind === 'waiting') deps.notify?.(`⏳ Waiting for ${planOutcome.wake.kind} ${planOutcome.wake.target}`);
+        try { if (end.plan) deps.onPlanOutcome?.(planOutcome, end.plan); } catch { /* the host's reaction cannot break a turn end */ }
+        return;
+      }
+      armLegacy(end, tail);
+      // No structure: ask for the plan state once before falling back to wording — but only when the old rules would have continued anyway.
+      const armedByLegacy = armed as Armed | null; // armLegacy assigns it; TypeScript cannot see through the call
+      if (deps.planNudge === true && armedByLegacy && !planNudged) armed = { ...armedByLegacy, mode: 'plan-nudge' };
     },
     noteGoalCompleted() {
       completedGoal = true;
@@ -203,6 +352,9 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
       completedGoal = false;
       armed = null;
       consecutive = 0;
+      seatCapConsecutive = 0;
+      planConsecutive = 0;
+      planNudged = false;
       openedFingerprints.clear();
       capNotified = false;
     },

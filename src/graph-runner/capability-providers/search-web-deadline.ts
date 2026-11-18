@@ -1,6 +1,16 @@
 // Source: #38423 — the entire lookup, fetch, and body read must share one 15 s ceiling.
 export const SEARCH_REQUEST_TIMEOUT_MS = 15_000;
 
+/** Structured identity of the deadline/cancel rejection below: classify by `code`, never by message text. */
+export const SEARCH_DEADLINE_CODE = 'SEARCH_DEADLINE';
+export class SearchDeadlineError extends Error {
+  readonly code = SEARCH_DEADLINE_CODE;
+  constructor() {
+    super('search deadline exceeded or cancelled');
+    this.name = 'SearchDeadlineError';
+  }
+}
+
 /** Bounds work even when credential lookup or a response stream ignores AbortSignal. */
 export async function runSearchWithDeadline<T>(
   work: (signal: AbortSignal) => Promise<T>, outerSignal?: AbortSignal,
@@ -14,7 +24,7 @@ export async function runSearchWithDeadline<T>(
   const abort = () => {
     if (controller.signal.aborted) return;
     controller.abort();
-    rejectAbort(new Error('search deadline exceeded or cancelled'));
+    rejectAbort(new SearchDeadlineError());
   };
   outerSignal?.addEventListener('abort', abort, { once: true });
   if (outerSignal?.aborted) abort();

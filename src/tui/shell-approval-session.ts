@@ -8,7 +8,8 @@
  * Source: P0-ENTRY-TS-HOTSPOT-SEAM (TC 2순위) · behavior must stay identical to
  * the inline implementation guarded by `entry-shell-approval-pty.test.ts`.
  */
-import { applyShellApprovalKey, NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS } from '../tui-client/next-shell-approval.js';
+import { applyShellApprovalKey, NEXT_TUI_SHELL_APPROVAL_MAX_WINDOW_MS, NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS } from '../tui-client/next-shell-approval.js';
+import { APPROVAL_APPROVED, APPROVAL_DECLINED, type ApprovalOutcome } from '../graph-runner/approval-outcome.js';
 import { shellApprovalCommandViewport } from './core/entry-render.js';
 import type { Key } from '../tui.js';
 
@@ -21,7 +22,7 @@ export interface NextTuiShellApprovalPrompt {
   readonly kind: NextTuiShellApprovalKind;
   scroll: number;
   timer: ReturnType<typeof setTimeout> | null;
-  readonly resolve: (approved: boolean) => void;
+  readonly resolve: (outcome: ApprovalOutcome) => void;
 }
 
 export interface NextTuiShellApprovalViewport {
@@ -57,51 +58,75 @@ export const shellApprovalDecisionStatus = (kind: NextTuiShellApprovalKind, appr
 
 export const SHELL_APPROVAL_TIMEOUT_STATUS = 'Bash 승인 시간 초과 · 거부됨';
 
-const requestTimeoutMs = (timeoutMs: number | undefined): number =>
-  Math.max(1, Math.min(timeoutMs ?? NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS - 1_000,
-    NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS - 1_000));
+/** Bash keeps «denied»; a graph approval nobody answered is on hold, not refused. */
+export const shellApprovalTimeoutStatus = (kind: NextTuiShellApprovalKind): string =>
+  kind === 'graph' ? '플러그인 그래프 승인 시간 초과 · 보류됨(거부 아님)' : SHELL_APPROVAL_TIMEOUT_STATUS;
+export const shellApprovalCancelStatus = (kind: NextTuiShellApprovalKind): string =>
+  kind === 'graph' ? '플러그인 그래프 승인 취소됨 · 보류됨(거부 아님)' : 'Bash 승인 취소됨 · 거부됨';
+
+/** The host prompt ends one second before the child's own timer so the host answers first. A request may ask for a longer
+ *  window (review-publish waits for the owner), but never beyond the owner publish-approval window. */
+export const requestTimeoutMs = (timeoutMs: number | undefined, requestedWindowMs?: number): number => {
+  const window = typeof requestedWindowMs === 'number' && Number.isFinite(requestedWindowMs) && requestedWindowMs > NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS
+    ? Math.min(requestedWindowMs, NEXT_TUI_SHELL_APPROVAL_MAX_WINDOW_MS) : NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS;
+  const ceiling = window - 1_000;
+  return Math.max(1, Math.min(timeoutMs ?? ceiling, ceiling));
+};
 
 export function createShellApprovalSession(ports: NextTuiShellApprovalPorts) {
   let prompt: NextTuiShellApprovalPrompt | null = null;
   let lastResolvedCallId: string | null = null;
+  let lastResolvedKind: NextTuiShellApprovalKind = 'bash';
 
   const settlePrompt = (pending: NextTuiShellApprovalPrompt, approved: boolean, status: string): void => {
     prompt = null;
     if (pending.timer) clearTimeout(pending.timer);
     lastResolvedCallId = pending.callId;
+    lastResolvedKind = pending.kind;
     ports.setStatus(status);
-    pending.resolve(approved);
+    pending.resolve(approved ? APPROVAL_APPROVED : APPROVAL_DECLINED);
   };
+
+  /** Like `begin`, but says WHY when nobody decided (another prompt is up, the window ran out, the request was cancelled). */
+  const beginDecision = (command: string, callId: string, kind: NextTuiShellApprovalKind, windowMs?: number): Promise<ApprovalOutcome> =>
+    new Promise<ApprovalOutcome>((resolve) => {
+      // Busy is not a refusal: the owner has not seen this request.
+      if (prompt) { resolve({ approved: false, reason: 'unavailable' }); return; }
+      const pending: NextTuiShellApprovalPrompt = { callId, command, kind, scroll: 0, timer: null as ReturnType<typeof setTimeout> | null, resolve };
+      prompt = pending;
+      pending.timer = setTimeout(() => {
+        if (prompt !== pending) return;
+        prompt = null;
+        lastResolvedCallId = callId;
+        lastResolvedKind = kind;
+        ports.setStatus(shellApprovalTimeoutStatus(kind));
+        resolve({ approved: false, reason: 'timeout' });
+        ports.render();
+      }, requestTimeoutMs(ports.timeoutMs, windowMs));
+      ports.setStatus(shellApprovalRequestStatus(kind));
+      ports.render();
+    });
 
   return {
     /** The prompt the entry render loop should project, if any. */
     active: (): NextTuiShellApprovalPrompt | null => prompt,
-    /** Handler registered via `setNextTuiShellApprovalHandler`. */
-    begin: (command: string, callId: string, kind: NextTuiShellApprovalKind): Promise<boolean> =>
-      new Promise<boolean>((resolve) => {
-        if (prompt) { resolve(false); return; }
-        const pending: NextTuiShellApprovalPrompt = { callId, command, kind, scroll: 0, timer: null as ReturnType<typeof setTimeout> | null, resolve };
-        prompt = pending;
-        pending.timer = setTimeout(() => {
-          if (prompt !== pending) return;
-          prompt = null;
-          ports.setStatus(SHELL_APPROVAL_TIMEOUT_STATUS);
-          resolve(false);
-          ports.render();
-        }, requestTimeoutMs(ports.timeoutMs));
-        ports.setStatus(shellApprovalRequestStatus(kind));
-        ports.render();
-      }),
+    /** Handler registered via `setNextTuiShellApprovalHandler` (answers the child with the reason when nobody decided). */
+    beginDecision,
+    /** Boolean form for callers that only need yes/no: anything undecided is false. */
+    begin: async (command: string, callId: string, kind: NextTuiShellApprovalKind): Promise<boolean> =>
+      (await beginDecision(command, callId, kind)).approved,
     /** Handler registered via `setNextTuiShellApprovalCancelHandler`. */
     cancel: (callId: string, reason: NextTuiShellApprovalCancelReason): void => {
       const active = prompt;
-      const message = reason === 'timeout' ? SHELL_APPROVAL_TIMEOUT_STATUS : 'Bash 승인 취소됨 · 거부됨';
+      const kind = active?.callId === callId ? active.kind : lastResolvedKind;
+      const message = reason === 'timeout' ? shellApprovalTimeoutStatus(kind) : shellApprovalCancelStatus(kind);
       if (active?.callId === callId) {
         prompt = null;
         if (active.timer) clearTimeout(active.timer);
         lastResolvedCallId = callId;
+        lastResolvedKind = active.kind;
         ports.setStatus(message);
-        active.resolve(false);
+        active.resolve({ approved: false, reason });
         ports.render();
       } else if (lastResolvedCallId === callId) {
         // The child may time out while the host is processing a delayed reply.
@@ -133,7 +158,7 @@ export function createShellApprovalSession(ports: NextTuiShellApprovalPorts) {
       const pending = prompt;
       prompt = null;
       if (pending?.timer) clearTimeout(pending.timer);
-      pending?.resolve(false);
+      pending?.resolve({ approved: false, reason: 'host-cancelled' });
     },
   };
 }

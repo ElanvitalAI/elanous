@@ -22,6 +22,10 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 
 let override: string | undefined;
+/** RESEARCH-HARNESS-ISOLATION-STATE-DIR — 누가 override 를 걸었나. `flag` = 사람·CLI 의 `--config-dir`(우주 선택),
+ *  `programmatic` = 코드가 설정을 빌리려고 건 것. 문자열에서 추론하지 않고 setter 가 구조로 남긴다. */
+export type ConfigDirOverrideSource = 'flag' | 'programmatic';
+let overrideSource: ConfigDirOverrideSource | undefined;
 let checkedIgnoredEnv = false;
 
 function normalizedDir(dir: string): string {
@@ -74,17 +78,24 @@ export function getElanousConfigDir(): string {
  *  `src/cli/bg-launch.ts`). No env-var mirror — env vars were a
  *  shared-state footgun that masked unintended redirects (see the
  *  2026-05-13 `--test` config-dir regression). */
-export function setElanousConfigDir(dir: string): void {
+export function setElanousConfigDir(dir: string, source: ConfigDirOverrideSource = 'programmatic'): void {
   const trimmed = dir.trim();
   if (trimmed.length === 0) {
     throw new Error('setElanousConfigDir: empty directory');
   }
   override = trimmed;
+  overrideSource = source;
 }
 
 /** Clear the override (test cleanup). Idempotent. */
 export function resetElanousConfigDir(): void {
   override = undefined;
+  overrideSource = undefined;
+}
+
+/** override 를 건 출처 — override 가 없으면 undefined. */
+export function getElanousConfigDirOverrideSource(): ConfigDirOverrideSource | undefined {
+  return override === undefined ? undefined : overrideSource;
 }
 
 /** The explicit override, or undefined when running on the `~/.elanous`

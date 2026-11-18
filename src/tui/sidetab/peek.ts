@@ -42,9 +42,11 @@ export function formatSidetabPeekLines(
     .replace(ANSI_CONTROL, '')
     .replace(NON_TEXT_CONTROL, '')
     .replace(/\r\n?/g, '\n');
+  // A peek row is ~20 cells: leading indentation and column padding pushed the text past the edge, so the
+  // row showed only «↳ …». Collapse whitespace and skip rows with no letter or digit (rules, box frames).
   const recent = clean.split('\n')
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim().length > 0)
+    .map((line) => line.trim().replace(/\s{2,}/g, ' '))
+    .filter((line) => /[\p{L}\p{N}]/u.test(line))
     .slice(-Math.min(6, Math.floor(maxLines)));
   const prefix = '   ↳ ';
   const textWidth = Math.max(1, width - Bun.stringWidth(prefix));

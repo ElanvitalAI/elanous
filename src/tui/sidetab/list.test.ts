@@ -31,12 +31,12 @@ describe('next TUI sidetab', () => {
     const rows: SidetabRow[] = [{
       id: 'pty:agent', label: 'agent', kind: 'agent', badge: 'busy',
       controlState: {
-        actor: 'agent', badge: '🤖', label: '🤖 엘라누스 조작 중',
-        title: '🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기', emphasized: true,
+        actor: 'agent', badge: '🤖', label: '🤖 Elanous driving',
+        title: '🤖 Elanous running a mission · type to take over', emphasized: true,
       },
     }];
     const lines = listCompatibility.formatSidetabLines(rows, 0, 80);
-    expect(lines[0]).toContain('🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기');
+    expect(lines[0]).toContain('🤖 Elanous running a mission · type to take over');
     expect(lines[0]).toContain('\u001b[1;36m');
     expect(lines[2]).toContain('› 🤖 busy agent');
     expect(lines[2]).toContain('\u001b[1;36m');
@@ -163,7 +163,7 @@ describe('next TUI sidetab', () => {
 
   test('shows the four new PTY character choices without overflowing', () => {
     const lines = formatSidetabLines([], 0, 16, 4, 'new');
-    expect(lines).toEqual([' 새 PTY         ', ' s shell · e el…', ' c codex · l cl…']);
+    expect(lines).toEqual([' New PTY        ', ' s shell · e el…', ' c codex · l cl…']);
   });
 
   test('real PTY key-to-paint latency stays within baseline with a large selected snapshot', async () => {
@@ -223,7 +223,7 @@ describe('next TUI sidetab', () => {
         outputPending = outputPending.then(() => new Promise<void>((resolve) => terminal.write(chunk, resolve)));
       });
       appExit = app.onExit(({ exitCode: code }) => { exitCode = code; });
-      await waitForScreen((screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') && screen.includes('❯'), 'next TUI ready');
+      await waitForScreen((screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q quit') && screen.includes('❯'), 'next TUI ready');
 
       const now = Date.now();
       for (const [id, label] of [['pty:82001', 'shell-child-a']] as const) {
@@ -277,7 +277,7 @@ describe('next TUI sidetab', () => {
       app.write('\x1c');
       await waitForScreen((screen) => !screen.includes('fresh-live-99999'), 'sidetab close after snapshot update');
       app.write('\x1c');
-      await waitForScreen((screen) => screen.includes('↑↓ 전환'), 'sidetab reopen after snapshot update');
+      await waitForScreen((screen) => screen.includes('↑↓ move'), 'sidetab reopen after snapshot update');
 
       app.write('\x11');
       await waitForScreen(() => exitCode !== null, 'next TUI exit', 10_000);
@@ -325,15 +325,15 @@ describe('next TUI sidetab', () => {
         cols: 80,
         env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1', ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20' },
         ready: { label: 'chat-before-toggle', timeoutMs: 30_000, until: (screen) => {
-          const ready = screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료');
+          const ready = screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q quit');
           return ready;
         } },
         steps: [
           { label: 'sidetab-open-ctrl-backslash-default-scope', keys: '\x1c', until: (screen) => screen.includes('+ new'), timeoutMs: 8_000 }, // Source: #36690
           { label: 'sidetab-toggle-all-sessions', text: '/side all\r', until: (screen) => screen.includes('other-session'), timeoutMs: 8_000 }, // Source: #36690
-          { label: 'sidetab-focus-list', keys: '\x1cs', until: (screen) => screen.includes('사이드탭 포커스'), timeoutMs: 8_000 }, // Source: #36690
-          { label: 'sidetab-focus-escape-to-input', keys: '\x1b', until: (screen) => screen.includes('입력 포커스'), timeoutMs: 8_000 }, // Source: #36690
-          { label: 'sidetab-prefix-return-parent', keys: '\x1cp', until: (screen) => screen.includes('부모 채팅'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-focus-list', keys: '\x1cs', until: (screen) => screen.includes('Sidetab focus'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-focus-escape-to-input', keys: '\x1b', until: (screen) => screen.includes('Input focus'), timeoutMs: 8_000 }, // Source: #36690
+          { label: 'sidetab-prefix-return-parent', keys: '\x1cp', until: (screen) => screen.includes('Parent chat'), timeoutMs: 8_000 }, // Source: #36690
           { label: 'sidetab-prefix-ordinal-two', keys: '\x1c2', until: (screen) => screen.includes('SIDETAB_SECOND_SESSION_MARKER'), timeoutMs: 8_000 }, // Source: #36690
           { label: 'sidetab-click-session-row', keys: '\x1b[<0;5;4M', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER'), timeoutMs: 8_000 }, // Source: #36690 · T2 section header adds one row
           { label: 'sidetab-closed-ctrl-backslash', keys: '\x1c', until: (screen) => screen.includes('SIDETAB_TARGET_SESSION_MARKER') && !screen.includes('│'), timeoutMs: 8_000 }, // Source: #36690
@@ -348,9 +348,9 @@ describe('next TUI sidetab', () => {
       expect(run.frames[1]?.screen).toContain('+ new');
       expect(run.frames[1]?.screen).toContain('│');
       expect(run.frames[2]?.screen).toContain('other-session');
-      expect(run.frames[3]?.screen).toContain('사이드탭 포커스');
-      expect(run.frames[4]?.screen).toContain('입력 포커스');
-      expect(run.frames[5]?.screen).toContain('부모 채팅');
+      expect(run.frames[3]?.screen).toContain('Sidetab focus');
+      expect(run.frames[4]?.screen).toContain('Input focus');
+      expect(run.frames[5]?.screen).toContain('Parent chat');
       expect(run.frames[6]?.screen).toContain('SIDETAB_SECOND_SESSION_MARKER');
       expect(run.frames[7]?.screen).toContain('SIDETAB_TARGET_SESSION_MARKER');
       expect(run.frames[8]?.screen).toContain('SIDETAB_TARGET_SESSION_MARKER');
@@ -459,20 +459,20 @@ describe('next TUI sidetab', () => {
         env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1', ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20' },
         ready: { label: 'chat-ready', timeoutMs: 30_000, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) }, // Source: #36661
         steps: [
-          { label: 'open-sidetab', keys: '\x1c', timeoutMs: 15_000, until: (screen) => screen.includes('↑↓ 전환') && screen.includes('+ new') },
-          { label: 'shortcut-letters-remain-prompt-text', keys: 'nx', timeoutMs: 15_000, until: (screen) => screen.includes('❯ nx') },
-          { label: 'clear-prompt', keys: '\x15', timeoutMs: 15_000, until: (screen) => screen.includes('❯ ') && !screen.includes('❯ nx') },
-          { label: 'open-new-menu', keys: '/side new\r', timeoutMs: 15_000, until: (screen) => screen.includes('새 PTY') },
+          { label: 'open-sidetab', keys: '\x1c', timeoutMs: 15_000, until: (screen) => screen.includes('↑↓ move') && screen.includes('+ new') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
+          { label: 'shortcut-letters-remain-prompt-text', keys: 'nx', timeoutMs: 15_000, until: (screen) => screen.includes('❯ nx') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
+          { label: 'clear-prompt', keys: '\x15', timeoutMs: 15_000, until: (screen) => screen.includes('❯ ') && !screen.includes('❯ nx') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
+          { label: 'open-new-menu', keys: '/side new\r', timeoutMs: 15_000, until: (screen) => screen.includes('New PTY') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
           { label: 'spawn-shell', keys: 's', timeoutMs: 15_000, until: (screen) => screen.includes('shell ─') },
-          { label: 'detach-shell', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next TUI') },
+          { label: 'detach-shell', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY detached') && screen.includes('shell · Next TUI') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
           { label: 'attach-shell', keys: '\x1b[<0;5;8M\r', timeoutMs: 15_000, until: (screen) => screen.includes('shell ─') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
-          { label: 'detach-shell-again', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY 분리됨') && screen.includes('shell · Next TUI') && !screen.includes('╭') },
+          { label: 'detach-shell-again', keys: '\x1cd', timeoutMs: 15_000, until: (screen) => screen.includes('PTY detached') && screen.includes('shell · Next TUI') && !screen.includes('╭') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
           { label: 'kill-shell', keys: '/side kill\r', timeoutMs: 15_000, until: (screen) => !screen.includes('shell · Next TUI') }, // 출처: #36690 기존 PTY 시퀀스의 단계별 15초 상한
         ],
         quitKeys: '\x11',
       });
       expect(run.frames.some((frame) => frame.label === 'spawn-shell' && frame.screen.includes('shell'))).toBe(true);
-      expect(run.frames.some((frame) => frame.label === 'detach-shell' && frame.screen.includes('PTY 분리됨') && frame.screen.includes('shell · Next TUI'))).toBe(true);
+      expect(run.frames.some((frame) => frame.label === 'detach-shell' && frame.screen.includes('PTY detached') && frame.screen.includes('shell · Next TUI'))).toBe(true);
       expect(run.frames.some((frame) => frame.label === 'attach-shell' && frame.screen.includes('shell'))).toBe(true);
       expect(run.frames.some((frame) => frame.label === 'kill-shell' && !frame.screen.includes('shell · Next TUI'))).toBe(true);
       expect(run.exitCode).toBe(0);

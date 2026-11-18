@@ -53,7 +53,7 @@ export async function fetchRegisteredRemoteSidetabRows(
           ptyId: entry.ptyId,
           remoteHost: host,
           host,
-          label: `${host}:${entry.name} · ${entry.status ?? 'unknown'} · ${entry.lastActivityAt ? new Date(entry.lastActivityAt).toISOString() : '활동 시각 미상'}`,
+          label: `${host}:${entry.name} · ${entry.status ?? 'unknown'} · ${entry.lastActivityAt ? new Date(entry.lastActivityAt).toISOString() : 'last activity unknown'}`,
           kind: 'tui',
           badge,
           status: entry.status ?? 'unknown',
@@ -71,7 +71,7 @@ export async function fetchRegisteredRemoteSidetabRows(
 
 export function markRemoteHostUnavailable(rows: readonly SidetabRow[], host: string, reason: string): SidetabRow[] {
   return rows.map((row) => row.remoteHost === host
-    ? { ...row, badge: 'stale', label: `${row.label.replace(/ · 측정 불가.*$/, '')} · 측정 불가`, status: `측정 불가 · ${reason}` }
+    ? { ...row, badge: 'stale', label: `${row.label.replace(/ · unmeasured.*$/, '')} · unmeasured`, status: `Unmeasurable · ${reason}` }
     : row);
 }
 

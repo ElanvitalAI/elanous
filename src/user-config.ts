@@ -91,7 +91,6 @@ import {
   GEMINI_MODEL,
   KIMI_MODEL,
   QWEN_MODEL,
-  GLM_MODEL,
 } from './config.js';
 import type { SkillTier } from './skills/skill-tier.js';
 import { sharedAgentSkillRoots } from './skills/shared-agent-skill-roots.js';
@@ -729,7 +728,7 @@ function parseDesignConfig(raw: unknown): DesignConfig | undefined {
   const openDesign = parseOpenDesignConfig(r.openDesign);
   return openDesign ? { openDesign } : undefined;
 }
-function parseWebSearchConfig(raw: unknown): WebSearchConfig | undefined {
+export function parseWebSearchConfig(raw: unknown): WebSearchConfig | undefined {
   if (!isRecord(raw)) return undefined;
   const r = raw;
   const out: WebSearchConfig = {};
@@ -744,7 +743,14 @@ function parseWebSearchConfig(raw: unknown): WebSearchConfig | undefined {
       if (typeof enabled === 'boolean') out[key] = { enabled };
     }
   }
+  if (isRecord(r.routing) && (r.routing.mode === 'shadow' || r.routing.mode === 'on')) out.routing = { mode: r.routing.mode };
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** SEARCH-PROVIDER-TOPIC-BENCH-ROUTING — `on` only when explicitly set; absent or any other value = `shadow`
+ *  (routed choice recorded as `search.provider-selected`, legacy provider order still serves the call). */
+export function searchProviderRoutingMode(cfg: Pick<UserConfig, 'webSearch'> = getUserConfig()): 'shadow' | 'on' {
+  return cfg.webSearch?.routing?.mode === 'on' ? 'on' : 'shadow';
 }
 
 /** tavily 를 **상시 경로**에 쓸 것인가. ⛔ 미설정이면 **false**(부재 = 끔).
@@ -753,9 +759,10 @@ export function isTavilySearchEnabled(cfg: Pick<UserConfig, 'webSearch'> = getUs
   return cfg.webSearch?.tavily?.enabled === true;
 }
 
-/** An API key being present does not authorize metered web search. */
+/** Firecrawl is the default grounded-search service when configured; explicit opt-out wins.
+ * Grok metered API still requires explicit opt-in. */
 export function isPaidWebSearchEnabled(provider: 'grokApi' | 'firecrawl', cfg: Pick<UserConfig, 'webSearch'> = getUserConfig()): boolean {
-  return cfg.webSearch?.[provider]?.enabled === true;
+  return provider === 'firecrawl' ? cfg.webSearch?.firecrawl?.enabled !== false : cfg.webSearch?.grokApi?.enabled === true;
 }
 
 function parseSessionFabricConfig(raw: unknown): SessionFabricConfig | undefined {
@@ -2221,7 +2228,7 @@ function defaultConfig(): UserConfig {
       nativeStructure: { ...TOOLS_DEFAULTS.nativeStructure },
       selfImplement: { ...TOOLS_DEFAULTS.selfImplement },
     },
-    harness: { revertGuard: { depth: 50 }, nestedElanousMaxDepth: 2, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false, followUp: 'shadow' },
+    harness: { revertGuard: { depth: 50 }, nestedElanousMaxDepth: 2, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false, difficultyRouter: 'shadow', followUp: 'shadow' },
     grounding: { sources: [] },
     raw: {},
   };
@@ -2380,7 +2387,9 @@ function defaultModelForProvider(provider: LLMProviderName): string | undefined 
     case 'gemini': return GEMINI_MODEL;
     case 'kimi': return KIMI_MODEL;
     case 'qwen': return QWEN_MODEL;
-    case 'glm': return GLM_MODEL;
+    // TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — glm 은 Z.ai Coding Plan 직결(src/llm/zai-coding-plan.ts) · 기본 = 사다리 balanced(glm-5.3).
+    //   종전 GLM_MODEL(BigModel glm-4.7-flash)은 코딩 엔드포인트가 모르는 id 였다. env GLM_MODEL 은 그대로 이긴다.
+    case 'glm': return process.env.GLM_MODEL || lookupLlmTierSpec('glm', 'balanced').model;
     case 'bedrock': return BEDROCK_DEFAULT_MODEL;
     case 'auto': return undefined;
   }
@@ -2910,6 +2919,11 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       })() },
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
       difficultyPlacement: harness.difficultyPlacement === true,
+      difficultyRouter: harness.difficultyRouter === 'on' ? 'on' : 'shadow',
+      // HARNESS-FAILURE-ORACLE-GEN — `on` 만 싣는다(생략 = shadow · 기본 객체 모양은 그대로).
+      // COST-OPTIMIZER-WINDOW-AWARE — 같은 꼴: `on` 만 싣는다.
+      ...(harness.windowAccounts === 'on' ? { windowAccounts: 'on' as const } : {}),
+      ...(harness.failureOracle === 'on' ? { failureOracle: 'on' as const } : {}),
       exposeGate: harness.exposeGate === 'strict' ? 'strict' : 'warn',
       queue: { seatCap: Object.fromEntries(Object.entries(
         harness.queue && typeof harness.queue === 'object' && !Array.isArray(harness.queue)
@@ -3471,6 +3485,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         ? { slashMaxTurns: Math.floor(acp.slashMaxTurns) }
         : {}),
       ...(acp.editApproval === true ? { editApproval: true } : {}),
+      ...(acp.reviewClaudeGlmFallback === true ? { reviewClaudeGlmFallback: true } : {}),
     },
     lsp: parseLspConfig(lspRaw),
     plan: parsePlanConfig(rawObj.plan),
@@ -3856,7 +3871,8 @@ export const PROVIDER_DEFAULT_MODEL: Record<LLMProviderName, string> = {
   local: 'local:qwen3.8-27b-mlx',
   kimi: 'kimi-k2.6',
   qwen: 'qwen3.6-flash',
-  glm: 'glm-5.1',
+  // TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — 사다리(llm-tier-map glm balanced)와 같은 id · Coding Plan 기본 모델.
+  glm: 'glm-5.3',
   // BEDROCK-PROVIDER (2026-10-10) — Bedrock 의 Claude(`anthropic.` 접두 · 공식 «Supported models» 표).
   bedrock: BEDROCK_DEFAULT_MODEL,
 };

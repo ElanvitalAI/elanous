@@ -12,10 +12,12 @@
     "src/nexus/members/member-store.ts",
     "src/nexus/apps/app-lifecycle-ledger.ts",
     "src/nexus/api/http-server.ts",
-    "scripts/warm-pool-provider-config.ts"
+    "scripts/warm-pool-provider-config.ts",
+    "src/ux-sim/sim-cookie-jar.ts"
   ],
   "tests": [
-    "src/ux-sim/fake-member-oidc-world.test.ts"
+    "src/ux-sim/fake-member-oidc-world.test.ts",
+    "src/ux-sim/sim-cookie-jar.test.ts"
   ],
   "target": "Drive real member signup, browser OAuth callback, native PKCE app-slot exchange, owner and board Nexus HTTP routes, member-key handlers, and the public machine-scoped resource-ledger route using a fake Google OIDC edge and fake HTTPS VM transport",
   "inputs": [

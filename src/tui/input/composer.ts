@@ -147,6 +147,31 @@ export class MouseResidueGuard {
 }
 
 /** Reuse the shared editor contract; only TUI submit/cancel keys live here. */
+// NEXT-TUI-PASTE-ATOMIC (대표 11-17 · ASK-USER-TURN-COLOR-AND-HISTORY-1117 item 3): a folded paste token
+// («[Paste #n · k lines · full text]», src/tui/core/input.ts) stands for the whole paste, so it edits as one unit:
+// Backspace after it or Delete before it removes all of it; ←/→ step over it; the cursor never lands inside.
+const PASTE_TOKEN = /\[Paste #\d+ · \d+ lines · full text\]/gu;
+
+/** [start, end) of every folded paste token in `text`. */
+export function pasteTokenRanges(text: string): [number, number][] {
+  return [...text.matchAll(PASTE_TOKEN)].map((match) => [match.index!, match.index! + match[0].length]);
+}
+
+/** The atomic edit for Backspace/Delete/←/→ next to (or inside) a paste token; null when no token is involved. */
+export function applyPasteTokenKey(state: InlineEditorState, key: Key): InlineEditorState | null {
+  if (key.ctrl || key.alt || key.meta || key.shift) return null;
+  const name = key.name.toLowerCase();
+  if (name !== 'backspace' && name !== 'delete' && name !== 'left' && name !== 'right') return null;
+  const { text, cursor } = state;
+  const hit = pasteTokenRanges(text).find(([start, end]) =>
+    name === 'backspace' || name === 'left' ? start < cursor && cursor <= end : start <= cursor && cursor < end);
+  if (!hit) return null;
+  const [start, end] = hit;
+  if (name === 'left') return { text, cursor: start };
+  if (name === 'right') return { text, cursor: end };
+  return { text: text.slice(0, start) + text.slice(end), cursor: start };
+}
+
 export function applyComposerKey(state: InlineEditorState, key: Key): ComposerResult {
   const name = key.name.toLowerCase();
   // Mouse reports (wheel, click, drag) never edit the prompt.
@@ -171,6 +196,8 @@ export function applyComposerKey(state: InlineEditorState, key: Key): ComposerRe
       ? { state: inlineEditorInsert(state, key.paste), action: 'edit' }
       : { state, action: 'none' };
   }
+  const token = applyPasteTokenKey(state, key);
+  if (token) return { state: token, action: 'edit' };
   const edited = applyInlineEditorKey(state, key, { shiftEnter: 'newline', tab: null });
   return edited ? { state: edited, action: 'edit' } : { state, action: 'none' };
 }

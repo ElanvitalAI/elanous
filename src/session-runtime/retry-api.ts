@@ -21,6 +21,7 @@
 // raw `fetch`. This module is opt-in per call site.
 
 import { debug } from '../debug/log.js';
+import { llmNetworkFetch, type LlmCallContext } from './llm-call-gateway.js';
 import {
   decideRetry,
   DoomLoopTracker,
@@ -72,6 +73,8 @@ export class ApiHttpError extends Error {
 export interface FetchApiWithRetryOpts {
   /** Provider name for telemetry — anthropic / openai / grok / codex. */
   provider: string;
+  /** Optional wire identity. Context from the router fills missing attribution. */
+  callContext?: LlmCallContext;
   /** Maximum wait for response headers on each attempt. */
   headerTimeoutMs?: number;
   /** Prefix for the error message when the API returns non-2xx. Same
@@ -143,7 +146,7 @@ export async function fetchApiWithRetry(
     // ⛔ try «밖» — 재서명 실패(자격 부재 등)는 재시도할 네트워크 오류가 아니다. 그대로 던진다.
     if (attempt > 0 && opts.refreshInit) init = await opts.refreshInit();
     try {
-      response = await fetchWithHeaderTimeout(url, init, opts.headerTimeoutMs ?? 120_000);
+      response = await fetchWithHeaderTimeout(url, init, opts.headerTimeoutMs ?? 120_000, { ...opts.callContext, provider: opts.provider });
       if (response.ok) {
         recordLlmCallOutcome(opts.provider, response.status, 'ok');
         overloadStreak = 0;
@@ -301,7 +304,7 @@ function rejectsReasoningField(bodyText: string): boolean {
     || /\breasoning\s+disable(?:d)?\s+(?:is\s+)?(?:unsupported|not supported|not allowed)\b/i.test(message);
 }
 
-async function fetchWithHeaderTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithHeaderTimeout(url: string, init: RequestInit, timeoutMs: number, callContext: LlmCallContext): Promise<Response> {
   const controller = new AbortController();
   const onAbort = () => controller.abort(init.signal?.reason);
   if (init.signal?.aborted) onAbort();
@@ -321,7 +324,7 @@ async function fetchWithHeaderTimeout(url: string, init: RequestInit, timeoutMs:
     }, timeoutMs);
   });
   try {
-    const response = await Promise.race([fetch(url, { ...init, signal: controller.signal }), deadline]);
+    const response = await Promise.race([llmNetworkFetch(url, { ...init, signal: controller.signal }, callContext), deadline]);
     if (!init.signal || !response.body) {
       releaseAbort();
       return response;

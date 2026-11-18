@@ -155,7 +155,8 @@ function mutedMultiline(s: string | string[]): string[] {
 // `kind` tag so consumers can disambiguate; default 'approval' keeps
 // pre-Wave-E set() calls semantically equivalent.
 
-export type ApprovalModalKind = 'askUser' | 'planExit' | 'approval';
+export type { ApprovalModalKind } from './approval-herdr-hook.js';
+import { notifyApprovalHerdrBlocked, type ApprovalModalKind } from './approval-herdr-hook.js';
 
 let currentHandle: ApprovalModalHandle | null = null;
 let currentKind: ApprovalModalKind | null = null;
@@ -178,12 +179,15 @@ export const approvalModalRouter: ApprovalModalRouter = {
     currentHandle = handle;
     currentKind = kind ?? 'approval';
     currentOnClose = onClose;
+    const openedKind = currentKind;
+    notifyApprovalHerdrBlocked(true, openedKind);
     handle.promise.finally(() => {
       if (currentHandle === handle) {
         const cb = currentOnClose;
         currentHandle = null;
         currentKind = null;
         currentOnClose = null;
+        notifyApprovalHerdrBlocked(false, openedKind);
         try { cb?.(); } catch { /* ignore */ }
       }
     });

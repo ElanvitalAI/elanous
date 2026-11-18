@@ -12,6 +12,7 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 
 
 import { recordToolCatalog } from './tool-catalog-observability.js';
+import { daemonPluginRouteSpecs, dispatchDaemonPluginRoute, refuseBypassAfterAppBuildDecline } from './plugin-routes.js';
 import {
   buildBrowserNavigateTool,
   buildBrowserReadTool,
@@ -348,6 +349,12 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     ...shared.specs, // L2 core + L3 finance(gated) — buildSharedAppTools 단일 출처(전 서피스 공용)
     ...(ptyAvailable() ? [buildElanousHoldTool(), buildPtyControlTool()] : []),
   ];
+  // APP-BUILD-TOOLS-IN-DAEMON-TURN — the route adapter's merged host tools (app_build · app_build_plan · …),
+  // from the same bridge and merge helper as the Next TUI / agent CLI. Names already on this surface win
+  // (app_deploy stays the shared-app-tools one), so the catalog never carries a name twice.
+  const pluginRouteSpecs = daemonPluginRouteSpecs(new Set(chatSpecs.map((spec) => spec.name)));
+  const pluginRouteNames = new Set(pluginRouteSpecs.map((spec) => spec.name));
+  chatSpecs.push(...pluginRouteSpecs);
 
   /** Shared dispatcher for chat-surface tools. Reused by 'chat' AND
    *  'webterm' so the routing stays in one place. */
@@ -356,6 +363,9 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     args: Record<string, unknown>,
     ctx: DaemonToolDispatchCtx,
   ): Promise<unknown> => {
+    const bypassRefusal = refuseBypassAfterAppBuildDecline(name, args, ctx);
+    if (bypassRefusal) return bypassRefusal;
+    if (pluginRouteNames.has(name)) return dispatchDaemonPluginRoute(name, args, ctx);
     if (name === 'KnowledgeQuery') return dispatchInstalledPackQuery(args);
     if (READONLY_TOOL_NAMES.has(name)) {
       switch (name) {

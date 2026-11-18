@@ -3,6 +3,14 @@ import type { WebSearchHit, WebSearchProvider } from './provider.js';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
+export class FreeWebSearchError extends Error {
+  constructor(readonly reason: 'blocked' | 'no-results' | 'parser') {
+    super(reason === 'blocked' ? '무료 검색 차단됨 (DuckDuckGo challenge)'
+      : reason === 'no-results' ? 'No DuckDuckGo results found' : 'No DuckDuckGo results parsed');
+    this.name = 'FreeWebSearchError';
+  }
+}
+
 function decodeEntities(s: string): string {
   return s
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -44,6 +52,9 @@ export function buildFreeWebSearchProvider(deps: { fetch?: typeof fetch } = {}):
         status = response.status;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const html = await response.text();
+        if (status === 202 || /anomaly-modal|challenge-form|id=["']captcha/iu.test(html)) {
+          throw new FreeWebSearchError('blocked');
+        }
         const linkRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
         const snipRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/;
         const blockRe = /<div[^>]*class="[^"]*\bresult\b[^"]*"[^>]*>/g;
@@ -60,13 +71,16 @@ export function buildFreeWebSearchProvider(deps: { fetch?: typeof fetch } = {}):
           const title = stripTags(link[2]);
           if (url && title) hits.push({ url, title, snippet: snippet ? stripTags(snippet[1]) : '' });
         }
-        if (hits.length === 0) throw new Error('No DuckDuckGo results parsed');
+        // Classify an empty page only after parsing: a real result snippet may quote the no-results phrase.
+        if (hits.length === 0) {
+          throw new FreeWebSearchError(/class=["'][^"']*no-results|No results found|검색 결과가 없습니다/iu.test(html) ? 'no-results' : 'parser');
+        }
         const durationMs = Date.now() - startedAt;
         debug.log('web-search.free', 'search', { hits: hits.length, durationMs, status, queryLength: q.query.length });
         return { hits, providerName: 'ddg-free', durationMs };
       } catch (err) {
         debug.log('web-search.free', 'failed', {
-          ...(status !== undefined && status >= 400 ? { status } : { reason: signal?.aborted ? 'aborted' : 'request-or-parse-failed' }),
+          ...(status !== undefined && status >= 400 ? { status } : { reason: signal?.aborted ? 'aborted' : err instanceof FreeWebSearchError ? err.reason : 'request-or-parse-failed' }),
           queryLength: q.query.length,
           durationMs: Date.now() - startedAt,
         });

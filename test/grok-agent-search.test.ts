@@ -3,7 +3,32 @@
 // depend on, so it's guarded here in isolation (pure, no network).
 
 import { describe, test, expect } from 'bun:test';
-import { parseResponsesOutput } from '../src/grok/agent-search';
+import { debug } from '../src/debug/log.js';
+import { grokAgentSearch, parseResponsesOutput } from '../src/grok/agent-search';
+
+describe('grokAgentSearch · injected transport ledger', () => {
+  test('records one safe attempt while retaining the injected transport and response', async () => {
+    const before = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').length;
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const result = await grokAgentSearch('find docs', {
+      apiKey: 'grok-secret', model: 'grok-search-test', baseUrl: 'https://proxy.example/v1',
+      fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return Response.json({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Found it' }] }] });
+      },
+    });
+    expect(result).toMatchObject({ ok: true, status: 200, text: 'Found it' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe('https://proxy.example/v1/responses');
+    expect((calls[0]?.init?.headers as Record<string, string>).authorization).toBe('Bearer grok-secret');
+    expect(JSON.parse(calls[0]?.init?.body as string).model).toBe('grok-search-test');
+    const rows = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').slice(before);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.data).toMatchObject({ provider: 'grok', model: 'grok-search-test', host: 'proxy.example', requestedBy: 'grok.agent-search' });
+    expect(JSON.stringify(rows[0])).not.toContain('grok-secret');
+    expect(JSON.stringify(rows[0])).not.toContain('/responses');
+  });
+});
 
 describe('parseResponsesOutput', () => {
   test('flattens message text + annotations + search_call sources, deduped', () => {

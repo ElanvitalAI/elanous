@@ -4,9 +4,11 @@ import { homedir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PROJECT_ANCHOR_LAST_SESSION_FILE as LAST_SESSION_FILE } from '../prompt-library/universal-preamble.js';
+import { planSeatClose, readKnownSeatIds, recordSeatClose, type SeatCloseShare } from './seat-close.js';
 import { redactSecretText } from '../debug/log.js';
 import { defaultMsgStorePath, readUnreadCount } from '../msg/msg-store.js';
 import { parseKnowhowItems, splitKnowhow } from '../seat-loop/seat-knowhow.js';
+import { scopeStopWarnings } from '../seat-scope/stop-expiry.js';
 
 export const SEAT_ROLES = ['OP', 'TC', 'MK', 'UX'] as const;
 export type SeatRole = typeof SEAT_ROLES[number];
@@ -131,8 +133,27 @@ function lastSessionSection(home: string, seat: string): { source: string; updat
   }
 }
 
+/** SCOPE-STOP-EXPIRY — seats/<id>/SCOPE.md 의 STOP 은 만료 시각이 있어야 한다. 없거나 지났으면 경고, 미래면 조용. */
+export function scopeStopBootRows(home: string, seat: string, now: Date): { source: string; updated: string; rows: string[]; reason?: string } {
+  const path = join(home, 'elanous-hq', 'seats', seat, 'SCOPE.md');
+  if (!existsSync(path)) return { source: path, updated: '미상', rows: [], reason: '미관측: SCOPE.md 없음' };
+  try {
+    if (!isRegularSeatPath(home, join(home, 'elanous-hq'), path)) return { source: path, updated: '미상', rows: [], reason: '미관측: 일반 경로가 아님' };
+    const text = readFileSync(path, 'utf8').slice(0, 256_000);
+    const warnings = scopeStopWarnings([{ seat, path, text }], now);
+    const rows = warnings.map(warning => warning.reason === 'expired'
+      ? `STOP 만료 ${warning.expiresAt ?? '미상'} — 경고, 침묵 보류 아님`
+      : warning.reason === 'unrecognized-expiry'
+        ? 'STOP 만료 형식 미인식 — 경고, 침묵 보류 아님'
+        : 'STOP 만료 시각 없음 — 경고, 침묵 보류 아님');
+    return { source: path, updated: statSync(path).mtime.toISOString(), rows, ...(rows.length ? {} : { reason: 'STOP 없음 또는 미만료' }) };
+  } catch {
+    return { source: path, updated: '미상', rows: [], reason: '미관측: SCOPE.md 읽기 실패' };
+  }
+}
+
 /** 자리 카드의 파일·우편 절(동기) — `eln seat boot` 와 TUI 세션 부트(`dashboard/seat-boot-preamble.ts`)가 같이 쓴다. */
-export function collectSeatBootSections(seat: string, options: { home: string; msgPath: string }): { sections: SeatBootSection[]; unread: number | null } {
+export function collectSeatBootSections(seat: string, options: { home: string; msgPath: string; now?: Date }): { sections: SeatBootSection[]; unread: number | null } {
   const root = join(options.home, 'elanous-hq', 'seat-state');
   const seatDir = join(root, seat);
   let unread: number | null = null;
@@ -146,6 +167,7 @@ export function collectSeatBootSections(seat: string, options: { home: string; m
     { title: '수확 주장', ...metadata(options.home, root, join(seatDir, 'harvest-claims.tsv'), 'tsv') },
     { title: '예약', ...metadata(options.home, root, join(seatDir, 'scheduled.tsv'), 'tsv') },
     { title: '지난 세션', ...lastSessionSection(options.home, seat) },
+    { title: 'SCOPE STOP', ...scopeStopBootRows(options.home, seat, options.now ?? new Date()) },
     { title: '공통 메모리 색인', ...metadata(options.home, root, join(root, 'memory', 'MEMORY.md'), 'memory') },
   ];
   return { sections, unread };
@@ -298,6 +320,34 @@ export function registerSeatBootCommands(command: Command, options: { home?: () 
       const sections = collectSeatBootSections(seat, { home, msgPath: options.msgPath?.() ?? defaultMsgStorePath() }).sections;
       if (agent !== undefined) sections.push(...collectSeatLadderSections(seat, agent as SeatAgent, { home, repoRoot: options.repoRoot?.() ?? fileURLToPath(new URL('../../', import.meta.url)), now: options.now?.() ?? new Date() }));
       console.log(renderSeatBootCard(seat as SeatRole, sections, facts, contextUpdated));
+    });
+  command.command('close <seat>').description('닫기 전 몫 목록을 보이고, 받는 자리가 없으면 거부한다')
+    .option('--handoff-to <seat>', '몫을 받을 등록된 자리')
+    .option('--force', '받는 자리 없이 닫기. 사유 필수')
+    .option('--reason <text>', '--force 사유')
+    .action((rawSeat: string, flags: { handoffTo?: string; force?: boolean; reason?: string }) => {
+      const home = options.home?.() ?? homedir();
+      const repoRoot = options.repoRoot?.() ?? fileURLToPath(new URL('../../', import.meta.url));
+      const known = readKnownSeatIds(home, repoRoot);
+      const seatDir = join(home, 'elanous-hq', 'seat-state', rawSeat.toUpperCase());
+      const shares: SeatCloseShare[] = [];
+      const claims = join(seatDir, 'harvest-claims.tsv');
+      const wakeups = join(seatDir, 'scheduled.tsv');
+      if (existsSync(claims)) shares.push({ kind: 'claim', id: 'harvest-claims.tsv', detail: 'present' });
+      if (existsSync(wakeups)) shares.push({ kind: 'wakeup', id: 'scheduled.tsv', detail: 'present' });
+      const result = planSeatClose({
+        seat: rawSeat,
+        ...(flags.handoffTo ? { handoffTo: flags.handoffTo } : {}),
+        ...(flags.force ? { force: true } : {}),
+        ...(flags.reason ? { forceReason: flags.reason } : {}),
+      }, { home, knownSeats: known, shares });
+      if (!result.ok) {
+        console.error(result.reason);
+        process.exitCode = 2;
+        return;
+      }
+      for (const line of result.lines) console.log(line);
+      recordSeatClose(result, { home, knownSeats: known, shares });
     });
 }
 

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
 import { createMemberInviteApi, memberExampleKitMailto } from '@/lib/member-invite-api';
+import { MEMBER_WEBCHAT_LABEL, MEMBER_WEBCHAT_PATH } from '@/lib/member-webchat-entry';
 
 export default function MemberInvitePage() {
   const nexus = useOptionalNexusClient();
@@ -63,6 +64,8 @@ export default function MemberInvitePage() {
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
     {!api && <p role="status">Nexus 연결 후 초대 링크를 확인할 수 있습니다.</p>}
     {handle && <p className="text-sm">내 회원 ID: <strong>{handle}</strong></p>}
+    {handle && <a href={MEMBER_WEBCHAT_PATH} data-member-webchat-entry
+      className="inline-block rounded bg-primary px-4 py-3 font-medium text-primary-foreground">{MEMBER_WEBCHAT_LABEL}</a>}
     {canClaimHandle && <form className="space-y-2 rounded-xl border border-border bg-card p-4" onSubmit={event => { event.preventDefault(); void claim(); }}>
       <label htmlFor="member-public-id" className="block text-sm font-medium">읽기 쉬운 회원 ID 정하기 (1회)</label>
       <input id="member-public-id" value={requestedId} onChange={event => setRequestedId(event.currentTarget.value)}

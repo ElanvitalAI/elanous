@@ -69,7 +69,7 @@ export function applyConfigDirFlagFromArgv(): string | undefined {
   // Lazy import — avoids a circular dep when this module is pulled
   // in by tooling that itself imports the resolver.
   const { setElanousConfigDir } = require('../elanous-config-dir.js') as typeof import('../elanous-config-dir.js');
-  setElanousConfigDir(dir);
+  setElanousConfigDir(dir, 'flag');
   process.argv = argv;
   return dir;
 }

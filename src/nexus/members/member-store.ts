@@ -3,6 +3,7 @@ import { Database } from 'bun:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { nexusRootDir } from '../paths.js';
+import { checkAppSlugName, type AppSlugNameVerdict } from './app-slug-name.js';
 import { createAppLifecycleEvent, validateAppLifecycleEvent, type AppLifecycleEvent } from '../apps/app-lifecycle-ledger.js';
 
 export interface MemberSignupIntent {
@@ -73,7 +74,21 @@ export interface MemberAppSlot {
 
 export type MemberAppSlotCreation =
   | { readonly outcome: 'created' | 'already-exists'; readonly slot: MemberAppSlot }
-  | { readonly outcome: 'member-not-found' | 'event-code-required' };
+  | { readonly outcome: 'member-not-found' | 'event-code-required' | 'slug-taken' }
+  | { readonly outcome: 'slug-invalid'; readonly reason: Extract<AppSlugNameVerdict, { ok: false }>['reason'] };
+
+export type MemberAppSlugAvailability =
+  | { readonly available: true; readonly slug: string }
+  | { readonly available: false; readonly reason: Extract<AppSlugNameVerdict, { ok: false }>['reason'] | 'taken' };
+
+/** One member may hold at most this many retired names (they stay reserved to the member, so the number is bounded). */
+export const MAX_RETIRED_APP_SLUGS = 5;
+
+export type MemberAppSlotRename =
+  | { readonly outcome: 'renamed'; readonly slot: MemberAppSlot; readonly previousAppSlug: string }
+  | { readonly outcome: 'unchanged'; readonly slot: MemberAppSlot }
+  | { readonly outcome: 'member-not-found' | 'app-slot-not-found' | 'slug-taken' | 'rename-limit' }
+  | { readonly outcome: 'slug-invalid'; readonly reason: Extract<AppSlugNameVerdict, { ok: false }>['reason'] };
 
 export type MemberCodeValidation =
   | { readonly valid: true; readonly kind: 'referral' | 'event'; readonly referredReward: 'none' | null; readonly benefit?: 'non-monetary'; readonly finalizesAt?: string }
@@ -104,6 +119,7 @@ export interface MemberStore {
   publicIdForMember(memberId: string): string | null;
   memberForPublicId(publicId: string): string | null;
   handleForMember(memberId: string): string | null;
+  canClaimReservedJoosung(memberId: string): boolean;
   memberForHandle(handle: string): string | null;
   claimHandle(memberId: string, handle: string, previousPublicUserSlug?: string): string;
   publicUserSlugForMember(memberId: string): string | null;
@@ -128,7 +144,11 @@ export interface MemberStore {
   provisionPlan(input: { readonly plan: string; readonly entitlements: Readonly<Record<string, unknown>> }): void;
   assignPlan(memberId: string, plan: string): boolean;
   appSlotForMember(memberId: string): MemberAppSlot | null;
-  createAppSlotForMember(memberId: string, now?: string): MemberAppSlotCreation;
+  /** `options.appSlug` is the name the member chose; without it the slug stays the legacy member-id hash. */
+  createAppSlotForMember(memberId: string, now?: string, options?: { readonly appSlug?: string }): MemberAppSlotCreation;
+  appSlugAvailability(rawName: unknown, memberId?: string): MemberAppSlugAvailability;
+  /** Rename the member's app slot. The caller (the API) decides whether the app may still be renamed; this method keeps names unique, reserved and bounded. */
+  renameAppSlotForMember(memberId: string, rawName: unknown, now?: string): MemberAppSlotRename;
   ensureNativeAppSlotForMember(memberId: string, now?: string): MemberAppSlot | null;
   createSession(memberId: string, now?: string): { token: string; expiresAt: string };
   memberForSession(token: string, now?: string): MemberProfile | null;
@@ -187,8 +207,15 @@ function base62(bytes: Buffer): string {
 function newMemberKey(): string { return `emk_${base62(randomBytes(32))}`; }
 function keyDigest(salt: string, key: string): string { return hash(`${salt}:${key}`); }
 
+const RESERVED_MEMBER_HANDLES = new Set(['admin', 'user', 'ElanvitalAI', 'elanvital', 'monad', 'elanous']);
+
 /** Persistent private member records, short-lived OAuth replay hashes and revocable sessions. */
-export function createMemberStore(options: { readonly path?: string; readonly now?: () => number } = {}): MemberStore {
+export function createMemberStore(options: { readonly path?: string; readonly now?: () => number;
+  readonly reservedJoosungGoogleEmailSha256?: string } = {}): MemberStore {
+  const reservedOwnerHash = options.reservedJoosungGoogleEmailSha256;
+  if (reservedOwnerHash !== undefined && !/^[a-f0-9]{64}$/.test(reservedOwnerHash)) {
+    throw new Error('invalid reserved handle owner pin');
+  }
   const privateDir = join(nexusRootDir(), 'members');
   const path = options.path ?? join(privateDir, 'members.sqlite');
   if (!options.path) {
@@ -198,6 +225,12 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   const db = new Database(path, { create: true });
   if (path !== ':memory:') chmodSync(path, 0o600);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  const reservedOwnerMatches = (memberId: string): boolean => {
+    if (!reservedOwnerHash) return false;
+    const row = db.query('SELECT email FROM members WHERE id = ?').get(memberId) as { email: string } | null;
+    return Boolean(row && timingSafeEqual(
+      Buffer.from(hash(row.email.trim().toLowerCase()), 'hex'), Buffer.from(reservedOwnerHash, 'hex')));
+  };
   db.exec(`
     CREATE TABLE IF NOT EXISTS members (
       id TEXT PRIMARY KEY, google_sub TEXT NOT NULL UNIQUE, email TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -260,6 +293,9 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     CREATE TABLE IF NOT EXISTS member_app_slots (
       app_id TEXT PRIMARY KEY, member_id TEXT NOT NULL UNIQUE REFERENCES members(id),
       template_slug TEXT NOT NULL, created_at TEXT NOT NULL, lifecycle_event_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS member_app_slug_history (
+      app_slug TEXT PRIMARY KEY, member_id TEXT NOT NULL REFERENCES members(id), retired_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS member_oauth_consumed_states (
       state_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL
@@ -362,6 +398,10 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     db.exec('ALTER TABLE member_event_try_attempts ADD COLUMN reservation_expires_at TEXT');
   }
   db.exec('CREATE INDEX IF NOT EXISTS member_event_try_attempts_reservation_expiry ON member_event_try_attempts(status, reservation_expires_at)');
+  // The slug a member CHOSE. `app_id` stays the stable internal id (lifecycle ledger, auth codes); NULL here = the legacy member-id hash slug.
+  const appSlotColumns = db.query('PRAGMA table_info(member_app_slots)').all() as Array<{ name: string }>;
+  if (!appSlotColumns.some(column => column.name === 'app_slug')) db.exec('ALTER TABLE member_app_slots ADD COLUMN app_slug TEXT');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS member_app_slots_app_slug ON member_app_slots(app_slug) WHERE app_slug IS NOT NULL');
   const appAuthColumns = db.query('PRAGMA table_info(member_app_auth_codes)').all() as Array<{ name: string }>;
   if (!appAuthColumns.some(column => column.name === 'code_challenge')) {
     // Existing installations can have one-time codes from the pre-PKCE schema. A nullable
@@ -444,7 +484,11 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     try { lifecycleEvent = validateAppLifecycleEvent(JSON.parse(String(row.lifecycle_event_json))); }
     catch { throw new Error('member app slot is corrupt'); }
     const appId = String(row.app_id);
-    const appSlug = /^kaist-([a-f0-9]{24})$/.exec(appId)?.[1];
+    const legacySlug = /^kaist-([a-f0-9]{24})$/.exec(appId)?.[1];
+    const chosen = row.app_slug === null || row.app_slug === undefined ? undefined : String(row.app_slug);
+    // A stored chosen name must still pass today's rules (and is never the legacy hash space); anything else is a corrupt row.
+    const chosenVerdict = chosen === undefined ? undefined : checkAppSlugName(chosen);
+    const appSlug = chosen === undefined ? legacySlug : chosenVerdict?.ok && chosenVerdict.slug === chosen && legacySlug !== undefined ? chosen : undefined;
     const memberId = String(row.member_id);
     if (!appSlug || lifecycleEvent.appId !== appId || lifecycleEvent.action !== 'created' || lifecycleEvent.outcome !== 'succeeded') {
       throw new Error('member app slot lifecycle identity mismatch');
@@ -459,20 +503,29 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   }
 
   function readAppSlot(memberId: string): MemberAppSlot | null {
-    const row = db.query('SELECT app_id, member_id, template_slug, created_at, lifecycle_event_json FROM member_app_slots WHERE member_id = ?')
+    const row = db.query('SELECT app_id, app_slug, member_id, template_slug, created_at, lifecycle_event_json FROM member_app_slots WHERE member_id = ?')
       .get(memberId) as Record<string, unknown> | null;
     return row ? appSlot(row) : null;
   }
 
-  function insertAppSlot(memberId: string, at: string): MemberAppSlot {
+  /** Is this (already validated) name held by someone else — as a live app name, or as a name another member retired? */
+  function slugHeldByOther(slug: string, memberId: string): boolean {
+    const live = db.query('SELECT member_id FROM member_app_slots WHERE app_slug = ?').get(slug) as { member_id: string } | null;
+    if (live && live.member_id !== memberId) return true;
+    const retired = db.query('SELECT member_id FROM member_app_slug_history WHERE app_slug = ?').get(slug) as { member_id: string } | null;
+    return Boolean(retired && retired.member_id !== memberId);
+  }
+
+  /** `chosen` is an already validated, unheld name; without it the slug is the legacy member-id hash. */
+  function insertAppSlot(memberId: string, at: string, chosen?: string): MemberAppSlot {
     const existing = readAppSlot(memberId);
     if (existing) return existing;
     const appHash = hash(memberId).slice(0, 24);
     const appId = `kaist-${appHash}`;
-    const appSlug = appHash;
+    const appSlug = chosen ?? appHash;
     const lifecycleEvent = createAppLifecycleEvent({ appId, action: 'created', environment: 'live', actor: 'user', occurredAt: at });
-    db.query(`INSERT INTO member_app_slots (app_id, member_id, template_slug, created_at, lifecycle_event_json)
-      VALUES (?, ?, ?, ?, ?)`).run(appId, memberId, KAIST_APP_TEMPLATE_SLUG, at, JSON.stringify(lifecycleEvent));
+    db.query(`INSERT INTO member_app_slots (app_id, app_slug, member_id, template_slug, created_at, lifecycle_event_json)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(appId, chosen ?? null, memberId, KAIST_APP_TEMPLATE_SLUG, at, JSON.stringify(lifecycleEvent));
     return { appId, appSlug, memberId, templateSlug: KAIST_APP_TEMPLATE_SLUG, createdAt: at, lifecycleEvent };
   }
 
@@ -735,13 +788,19 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       assertOpen();
       return (db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null)?.handle ?? null;
     },
+    canClaimReservedJoosung(memberId) { assertOpen(); return activeForAuth(memberId) && reservedOwnerMatches(memberId); },
     memberForHandle(handle) { assertOpen(); return memberForHandle(handle); },
     publicUserSlugForMember(memberId) { assertOpen(); return publicUserSlugForMember(memberId); },
     publicUserSlugForApp(appSlug) {
       assertOpen();
-      if (!/^[a-f0-9]{24}$/.test(appSlug)) return null;
-      const row = db.query('SELECT member_id FROM member_app_slots WHERE app_id = ?')
-        .get('kaist-' + appSlug) as { member_id: string } | null;
+      // A chosen name is looked up by itself; the legacy hash slug by the internal id (its column stays empty).
+      let row: { member_id: string } | null = null;
+      if (/^[a-f0-9]{24}$/.test(appSlug)) {
+        row = db.query('SELECT member_id FROM member_app_slots WHERE app_id = ? AND app_slug IS NULL').get('kaist-' + appSlug) as { member_id: string } | null;
+      } else {
+        const verdict = checkAppSlugName(appSlug);
+        if (verdict.ok && verdict.slug === appSlug) row = db.query('SELECT member_id FROM member_app_slots WHERE app_slug = ?').get(appSlug) as { member_id: string } | null;
+      }
       return row ? publicUserSlugForMember(row.member_id) : null;
     },
     memberForPublicUserSlug(userSlug) {
@@ -758,6 +817,9 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       db.exec('BEGIN IMMEDIATE');
       try {
         if (!activeForAuth(memberId)) throw new Error('member is not active for handle change');
+        if (RESERVED_MEMBER_HANDLES.has(handle) && (handle !== 'user' || !reservedOwnerMatches(memberId))) {
+          throw new Error('reserved member ID');
+        }
         const current = db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null;
         const active = db.query('SELECT user_slug FROM member_public_user_slugs WHERE member_id = ? AND retired = 0')
           .get(memberId) as { user_slug: string } | null;
@@ -976,7 +1038,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         ON CONFLICT(member_id) DO UPDATE SET plan = excluded.plan`).run(memberId, plan);
       return Number(result.changes) > 0;
     },
-    createAppSlotForMember(memberId, at = iso(nowMs())) {
+    createAppSlotForMember(memberId, at = iso(nowMs()), options = {}) {
       assertOpen();
       db.exec('BEGIN IMMEDIATE');
       try {
@@ -985,9 +1047,48 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         const member = db.query('SELECT event_code FROM members WHERE id = ?').get(memberId) as { event_code: string | null } | null;
         if (!member) { db.exec('COMMIT'); return { outcome: 'member-not-found' }; }
         if (!member.event_code) { db.exec('COMMIT'); return { outcome: 'event-code-required' }; }
-        const slot = insertAppSlot(memberId, at);
+        let chosen: string | undefined;
+        if (options.appSlug !== undefined) {
+          const verdict = checkAppSlugName(options.appSlug);
+          if (!verdict.ok) { db.exec('COMMIT'); return { outcome: 'slug-invalid', reason: verdict.reason }; }
+          if (slugHeldByOther(verdict.slug, memberId)) { db.exec('COMMIT'); return { outcome: 'slug-taken' }; }
+          chosen = verdict.slug;
+        }
+        const slot = insertAppSlot(memberId, at, chosen);
         db.exec('COMMIT');
         return { outcome: 'created', slot };
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    appSlugAvailability(rawName, memberId) {
+      assertOpen();
+      const verdict = checkAppSlugName(rawName);
+      if (!verdict.ok) return { available: false, reason: verdict.reason };
+      return slugHeldByOther(verdict.slug, memberId ?? '') ? { available: false, reason: 'taken' } : { available: true, slug: verdict.slug };
+    },
+    renameAppSlotForMember(memberId, rawName, at = iso(nowMs())) {
+      assertOpen();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (!activeForAuth(memberId)) { db.exec('COMMIT'); return { outcome: 'member-not-found' }; }
+        const current = readAppSlot(memberId);
+        if (!current) { db.exec('COMMIT'); return { outcome: 'app-slot-not-found' }; }
+        const verdict = checkAppSlugName(rawName);
+        if (!verdict.ok) { db.exec('COMMIT'); return { outcome: 'slug-invalid', reason: verdict.reason }; }
+        if (verdict.slug === current.appSlug) { db.exec('COMMIT'); return { outcome: 'unchanged', slot: current }; }
+        if (slugHeldByOther(verdict.slug, memberId)) { db.exec('COMMIT'); return { outcome: 'slug-taken' }; }
+        const retiredCount = Number((db.query('SELECT COUNT(*) AS count FROM member_app_slug_history WHERE member_id = ?').get(memberId) as { count: number }).count);
+        const reclaiming = Boolean(db.query('SELECT 1 AS found FROM member_app_slug_history WHERE app_slug = ? AND member_id = ?').get(verdict.slug, memberId));
+        if (!reclaiming && retiredCount >= MAX_RETIRED_APP_SLUGS) { db.exec('COMMIT'); return { outcome: 'rename-limit' }; }
+        // The name being left stays reserved to this member, so nobody else can take over an address people may still know.
+        db.query('DELETE FROM member_app_slug_history WHERE app_slug = ?').run(verdict.slug);
+        db.query('INSERT OR REPLACE INTO member_app_slug_history (app_slug, member_id, retired_at) VALUES (?, ?, ?)').run(current.appSlug, memberId, at);
+        db.query('UPDATE member_app_slots SET app_slug = ? WHERE member_id = ?').run(verdict.slug, memberId);
+        // One-time app auth codes were minted for the old address; they must not outlive it.
+        db.query('DELETE FROM member_app_auth_codes WHERE member_id = ? AND app_id = ?').run(memberId, current.appId);
+        const slot = readAppSlot(memberId);
+        if (!slot) throw new Error('member app slot disappeared during rename');
+        db.exec('COMMIT');
+        return { outcome: 'renamed', slot, previousAppSlug: current.appSlug };
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     },
     ensureNativeAppSlotForMember(memberId, at = iso(nowMs())) {

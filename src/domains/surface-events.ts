@@ -13,7 +13,7 @@ import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
-import { memoryDbPath, migrateLegacyMemoryDb } from './memory-db-path.js';
+import { memoryDbPath, memoryDbPathIn, mergeStrayMemoryDbOnce, migrateLegacyMemoryDb, strayProdMemoryDbPath } from './memory-db-path.js';
 import { provenanceRefs, provenanceTags, elanousSelfProvenance } from './provenance.js';
 import { within } from '../time/db-window.js';
 
@@ -22,6 +22,12 @@ import { within } from '../time/db-window.js';
  *  legacy 는 open 시 `migrateLegacyMemoryDb` 가 자가치유 이전. (2026-07-19 일반화) */
 export function surfaceEventsDbPath(): string {
   return memoryDbPath('surface_events.db');
+}
+
+/** The same resolver for an explicit universe root (a graph run's state root) instead of the ambient stamp. */
+export function surfaceEventsDbPathIn(stateDir: string | undefined): { path: string; stray?: string } {
+  const stray = strayProdMemoryDbPath(stateDir, 'surface_events.db');
+  return { path: memoryDbPathIn(stateDir, 'surface_events.db'), ...(stray ? { stray } : {}) };
 }
 
 /** 기록 입력 — 발송/수신 측이 아는 만큼만 채운다 (나머지 nullable). */
@@ -110,6 +116,20 @@ export function openSurfaceEventsDb(path: string = surfaceEventsDbPath()): Datab
   db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
     id UNINDEXED, search_text, tokenize = 'porter'
   )`);
+  if (path !== ':memory:' && path === surfaceEventsDbPath()) {
+    // Pre-fix prod-stamped writers left rows in ~/.elanous/surface_events.db; fold them in for every reader.
+    try {
+      const result = mergeStrayMemoryDbOnce(db, 'surface_events.db', ['events', 'events_fts'], path);
+      if (result?.skipped === 'busy') void import('../debug/log.js').then(({ debug }) =>
+        debug.log('memory.db', 'stray-merge-busy', { name: 'surface_events.db', ...result }, { level: 'warn' })).catch(() => {});
+      else if (result && !result.skipped) void import('../debug/log.js').then(({ debug }) =>
+        debug.log('memory.db', 'stray-merged', result)).catch(() => {});
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      void import('../debug/log.js').then(({ debug }) =>
+        debug.log('memory.db', 'stray-merge-failed', { name: 'surface_events.db', reason }, { level: 'warn' })).catch(() => {});
+    }
+  }
   return db;
 }
 

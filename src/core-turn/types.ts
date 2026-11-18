@@ -89,6 +89,8 @@ export interface CoreTurnCallbacks {
   onReplaceText?(full: string): void;
   /** Transient runtime status (for example, a stream retry notice). */
   onStatus?(line: string): void;
+  /** Observation only: the research question-plan model call settled (the plan cost a research route adds). */
+  onResearchPlanSettled?(info: { outcome: string; elapsedMs: number }): void;
   /** The final answer came back enriched with a runtime verification
    *  supplement — forwarded from `StreamWithToolsHandlers.onFinalAnswerSupplement`. */
   onFinalAnswerSupplement?(info: { answer: string; supplement: string; finalText: string }): void;
@@ -187,6 +189,9 @@ export interface CoreTurnContext {
   initialProvider?: LLMProvider;
   /** 이 턴 폴백 후보에서 뺄 공급자(`streamLLMWithTools` `skipProviders`). */
   skipProviders?: readonly string[];
+  /** Per-call stream idle timeout (`streamLLMWithTools` `streamIdleTimeoutMs`). Set by `runTurn` from the caller's
+   *  llmOpts on a `coreTurn` turn so the direct tool loop's override is not dropped when the turn moves here. */
+  streamIdleTimeoutMs?: LLMOpts['streamIdleTimeoutMs'];
 }
 
 export interface CoreTurnResult {

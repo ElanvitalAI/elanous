@@ -2,9 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, renameSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
-import { readTuiMemberSession, tuiMemberSessionPath } from '../../tui/member-session-contract.js';
+import { inspectTuiMemberSessionFile, readTuiMemberSession, tuiMemberSessionPath, type TuiMemberSessionFileState } from '../../tui/member-session-contract.js';
+import { assertMemberSessionCovers } from '../../tui/member-session-budget.js';
 import { nexusRootDir, nexusRuntimePath } from '../../nexus/paths.js';
 import { OFFICIAL_MEMBER_ORIGIN, readLocalAppBuildIssuer } from '../../nexus/apps/app-build-local-bridge.js';
+import { readSourceHeadMismatch } from '../../nexus/apps/app-build-head-mismatch.js';
+import { installedCurrentHead } from '../../version/stale-install.js';
 import { publicAppAddress } from '../../nexus/apps/console-address.js';
 import { codeRevision } from '../../version/code-revision.js';
 import { createPluginRouteAdapter } from '../../plugins/core/route-adapter.js';
@@ -19,12 +22,16 @@ type SourceFile = { path: string; content: string };
 type Grant = { ownerId: string; userSlug: string; runId: string; appSlug: string; sourceRoot: string; issuerExpiresAt: string; sourceHead: string };
 type Options = {
   getSession?: () => ReturnType<typeof readTuiMemberSession>; fetcher?: typeof fetch;
+  /** Token-free expiry view of the same session; defaults to the private file only with the default reader. */
+  inspectSession?: () => TuiMemberSessionFileState;
   sourceRoot?: string; scratchRoot?: string; sourceHead?: string; now?: () => number;
   shell?: typeof runShell; platform?: NodeJS.Platform;
   sandboxProfile?: typeof macAppSandboxProfile;
   /** Trusted host configuration only; never a graph/model argument. */
   issuerBridge?: { configDir: string; runtimePath: string };
   authorityRoot?: string;
+  /** Installed `current` commit (default: this install's current/install.json) — names which side must restart. */
+  installedHead?: () => string | undefined;
 };
 const row = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
@@ -45,12 +52,19 @@ function privateDirectory(path: string): void {
  * and same-host issuer attestation. No graph argument supplies credentials or roots. */
 export function createBuildExecution(options: Options = {}) {
   const sources = resolve(options.sourceRoot ?? join(nexusRootDir(), 'dynamic-app-sources'));
-  const scratch = resolve(options.scratchRoot ?? join(nexusRootDir(), 'app-build-scratch'));
+  // APP-BUILD-SANDBOX-TMPDIR-CANONICAL: canonicalize once when the scratch is
+  // created. verify and checkpoint then share one real path, so the symlink
+  // refusal (realpath !== path) stays intact on every consumer.
+  const scratchInput = resolve(options.scratchRoot ?? join(nexusRootDir(), 'app-build-scratch'));
+  mkdirSync(scratchInput, { recursive: true, mode: 0o700 });
+  const scratch = realpathSync(scratchInput);
   const sourceHead = options.sourceHead ?? codeRevision(); // Pin once, as C does at Nexus startup.
   const authorityRoot = options.authorityRoot ?? join(getElanousConfigDir(), 'app-build', 'authority');
   const now = options.now ?? Date.now;
   const verified = new Set<string>();
   const getSession = options.getSession ?? (() => readTuiMemberSession(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE)));
+  const inspectSession = options.inspectSession ?? (options.getSession ? undefined
+    : () => inspectTuiMemberSessionFile(tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE), now()));
   const fetcher = options.fetcher ?? fetch;
   const call = async (path: string, body: Record<string, unknown> | undefined, signal?: AbortSignal,
     local?: { origin: string; token: string; ownerId: string }): Promise<Record<string, unknown>> => {
@@ -62,7 +76,12 @@ export function createBuildExecution(options: Options = {}) {
       ...(body ? { body: JSON.stringify(body) } : {}),
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(DEFAULT_TIMEOUT_MS)]) : AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
     });
-    if (!response.ok) { await response.body?.cancel(); refuse(); }
+    if (!response.ok) {
+      // RAIL-STALE-TUI-HEAD: only the local bridge carries our pinned head; its 409 names a stale process.
+      const stale = local ? await readSourceHeadMismatch(response, sourceHead!, { installedHead: options.installedHead ?? (() => installedCurrentHead()) }) : undefined;
+      if (stale) throw stale;
+      await response.body?.cancel().catch(() => {}); refuse();
+    }
     const reader = response.body?.getReader(); if (!reader) refuse();
     const parts: Uint8Array[] = []; let size = 0;
     try { for (;;) {
@@ -136,16 +155,19 @@ export function createBuildExecution(options: Options = {}) {
     const files = input.map(file => ({ path: file.path, content: file.content }));
     const selected = strategy === undefined ? [] : parseTestStrategy(strategy, files);
     if ((options.platform ?? process.platform) !== 'darwin' || !options.shell && !existsSync('/usr/bin/sandbox-exec')) throw new Error('BUILD_SANDBOX_UNAVAILABLE');
-    mkdirSync(scratch, { recursive: true, mode: 0o700 }); privateDirectory(scratch);
+    privateDirectory(scratch);
     const attempt = mkdtempSync(join(scratch, 'verify-')); const app = join(attempt, 'app');
     try {
       writeFileArtifact({ root: app, files, metadata: {} });
       const runtime = realpathSync(process.execPath);
+      // APP-BUILD-SANDBOX-TMPDIR-CANONICAL: the profile allows the real path only.
+      // macOS mkdtemp returns the /var alias; os.tmpdir() then EPERMs inside the sandbox.
+      const home = realpathSync(app);
       const profile = (options.sandboxProfile ?? macAppSandboxProfile)({ readRoot: app, writeRoot: app,
         wrapper: join(app, 'source-artifact.json'), bunBinary: runtime });
       const execute = async (testArgs: string[]) => {
         const result = await (options.shell ?? runShell)({
-          command: ['/usr/bin/env', '-i', 'HOME=' + app, 'TMPDIR=' + app, 'PATH=/usr/bin:/bin',
+          command: ['/usr/bin/env', '-i', 'HOME=' + home, 'TMPDIR=' + home, 'PATH=/usr/bin:/bin',
           '/usr/bin/sandbox-exec', '-p', profile, runtime, ...testArgs],
         // The argv already invokes sandbox-exec with the private policy. A second
         // runShell wrapper makes sandbox_apply fail on macOS; never run bare Bun.
@@ -187,6 +209,8 @@ export function createBuildExecution(options: Options = {}) {
   };
   return {
     async reserve(ownerId: string, runId: string, appSlug: string, signal?: AbortSignal): Promise<Grant> {
+      // APP-BUILD-SESSION-REFRESH: no renewal exists, so a session that cannot reach approval is refused before reserve.
+      if (inspectSession) assertMemberSessionCovers('reserve', inspectSession());
       await identity(ownerId, appSlug, signal);
       return validate(await operation(appSlug, 'reserve', runId, ownerId, signal), ownerId, runId, appSlug, true);
     },

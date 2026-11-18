@@ -15,13 +15,19 @@ export interface DifficultySignals {
 export type DifficultyLevel = 'small' | 'medium' | 'large';
 
 /** Count declared target paths and authored decision signals without counting quoted run history. */
-export function goalDifficultySignals(document: string): DifficultySignals {
+/** Declared target paths (`대상 경로:` line) or, when absent, the traced path references. Paths only — no prose. */
+export function goalTargetPaths(document: string): string[] {
   const ask = verbatimOriginalAsk(document);
   const targetLine = (ask ?? document).split(/\r?\n/)
     .map((line) => /^대상 경로:\s*(.+)$/.exec(line)?.[1])
     .find((line) => line !== undefined);
   const namedPaths = targetLine?.split(' · ').map((path) => path.trim().replace(/^`|`$/g, '')).filter(Boolean) ?? [];
-  const paths = namedPaths.length ? namedPaths : tracedPathReferences(document).map(({ path }) => path);
+  return namedPaths.length ? namedPaths : tracedPathReferences(document).map(({ path }) => path);
+}
+
+export function goalDifficultySignals(document: string): DifficultySignals {
+  const ask = verbatimOriginalAsk(document);
+  const paths = goalTargetPaths(document);
   const signals = markdownSection(document, '판정 신호') ?? '';
   const candidates = signals.split(/\r?\n/).filter((line) => /^\s*- Candidate decision signal:\s*$/.test(line)).length;
   const expectedResults = signals.split(/\r?\n/).filter((line) => /^\s*- Expected result:\s*\S/.test(line)).length;

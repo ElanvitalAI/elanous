@@ -35,6 +35,7 @@ import { InstallBanner } from '@/components/install-banner';
 import { AuthRequiredBanner } from './AuthRequiredBanner';
 import { SkillProblemsBanner } from './SkillProblemsBanner';
 import { useNavVisitLog } from './use-nav-visit-log';
+import { isPwaRoute } from '@/lib/route-path';
 
 const SIDEBAR_KEY = 'elanous.pwa.sidebarOpen';
 
@@ -48,7 +49,7 @@ export function AppShell({
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { compact, setWide } = useCompactMode();
   const pathname = usePathname();
-  const mobileChat = compact && pathname === '/chat';
+  const mobileChat = compact && isPwaRoute(pathname, '/chat');
   const wakeControl = useTopBarWakeLock();
   const polled = useShellActivity();
   const activity = activityOverride ?? polled;
@@ -80,7 +81,8 @@ export function AppShell({
 
   return (
       <div className="flex h-screen w-full flex-col bg-background text-foreground">
-        {!mobileChat && <AuthRequiredBanner />}
+        {/* On the chat the connect card says the same (WEB-CHAT-ACTIVITY-ERROR); other screens keep the banner. */}
+        {!isPwaRoute(pathname, '/chat') && <AuthRequiredBanner />}
         {!mobileChat && <SkillProblemsBanner />}
         {!mobileChat && (compact
           ? <CompactTopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} setWide={setWide} wakeControl={wakeControl} />

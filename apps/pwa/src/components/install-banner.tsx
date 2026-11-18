@@ -27,6 +27,7 @@ import {
   shouldShow,
   type InstallPlatform,
 } from '@/lib/install-banner-state';
+import { isPwaRoute } from '@/lib/route-path';
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -134,7 +135,7 @@ function InstallBannerContent() {
     }
   };
 
-  if (!visible || quietSurface || (pathname === '/chat' && compact)) return null;
+  if (!visible || quietSurface || (isPwaRoute(pathname, '/chat') && compact)) return null;
 
   // ⛔ 고정 층(`fixed bottom-0`)으로 띄우지 않는다 — AppShell 세로 띠(`h-screen flex-col`)의 마지막 칸으로
   //  자리를 차지해, 본문이 그만큼 줄고 채팅 입력칸이 띠 «위»에 남는다(10-02 0.2.9 릴리스 게이트 C2a·C2b 실측:
@@ -143,7 +144,7 @@ function InstallBannerContent() {
   return (
     <div
       role="dialog"
-      aria-label="Install elanous to home screen"
+      aria-label="elanous 홈 화면에 추가"
       data-testid="install-banner"
       className="shrink-0 border-t border-border bg-card/95 px-4 py-3 shadow-lg backdrop-blur"
     >
@@ -157,11 +158,11 @@ function InstallBannerContent() {
             <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">
               <Share className="inline-block h-3.5 w-3.5 align-text-bottom" /> 공유 버튼 →
               <span className="mx-1 rounded bg-muted px-1 font-mono text-[11px]">홈 화면에 추가</span>
-              로 PWA 로 사용. 알림 · 카메라 · 백그라운드 모두 활성화.
+              를 누르면 앱처럼 쓸 수 있습니다 · 알림·카메라를 쓰고 화면을 닫아도 대화가 이어집니다.
             </p>
           ) : (
             <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">
-              한 번의 클릭으로 PWA 설치 — 알림 · 백그라운드 turn 보장.
+              한 번 눌러 설치하면 앱처럼 열리고, 알림을 받고, 화면을 닫아도 대화가 이어집니다.
             </p>
           )}
         </div>
@@ -179,7 +180,7 @@ function InstallBannerContent() {
           <button
             type="button"
             onClick={dismiss}
-            aria-label="dismiss install banner"
+            aria-label="설치 안내 닫기"
             data-testid="install-banner-dismiss"
             className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
           >

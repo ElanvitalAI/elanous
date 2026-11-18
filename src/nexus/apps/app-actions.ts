@@ -1,4 +1,5 @@
 import { transcribeAudioFile } from '../api/audio-stt.js';
+import { llmNetworkFetch } from '../../session-runtime/llm-call-gateway.js';
 import { SERVICE_KEY_CATALOG } from '../../setup/service-key-catalog.js';
 import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 import type { AppCredentialCapability } from './app-credential-capability.js';
@@ -64,7 +65,7 @@ async function defaultTranscribe(input: { audio: Buffer; apiKey: string; mimeTyp
 }
 
 async function defaultSummarize(input: { text: string; apiKey: string }): Promise<string> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await llmNetworkFetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { authorization: `Bearer ${input.apiKey}`, 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -76,7 +77,7 @@ async function defaultSummarize(input: { text: string; apiKey: string }): Promis
       temperature: 0,
     }),
     signal: AbortSignal.timeout(30_000),
-  });
+  }, { provider: 'openai', model: 'gpt-4o-mini', role: 'aux', requestedBy: 'app-summarize' });
   if (!response.ok) throw new Error('summary provider rejected request');
   const payload: unknown = await response.json();
   if (typeof payload !== 'object' || payload === null || !('choices' in payload) || !Array.isArray(payload.choices)) {
@@ -91,7 +92,7 @@ async function defaultSummarize(input: { text: string; apiKey: string }): Promis
 }
 
 async function defaultTranslate(input: { text: string; sourceLanguage: string; targetLanguage: string; apiKey: string }): Promise<string> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await llmNetworkFetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST', headers: { authorization: `Bearer ${input.apiKey}`, 'content-type': 'application/json' },
     body: JSON.stringify({
       model: 'gpt-4o-mini',
@@ -102,7 +103,7 @@ async function defaultTranslate(input: { text: string; sourceLanguage: string; t
       temperature: 0,
     }),
     signal: AbortSignal.timeout(30_000),
-  });
+  }, { provider: 'openai', model: 'gpt-4o-mini', role: 'aux', requestedBy: 'app-translate' });
   if (!response.ok) throw new Error('translation provider rejected request');
   const payload: unknown = await response.json();
   if (typeof payload !== 'object' || payload === null || !('choices' in payload) || !Array.isArray(payload.choices)) {
@@ -117,13 +118,13 @@ async function defaultTranslate(input: { text: string; sourceLanguage: string; t
 }
 
 async function defaultSynthesize(input: { text: string; voiceId: string; modelId: string; apiKey: string }): Promise<{ audio: Uint8Array; mimeType: string }> {
-  const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(input.voiceId)}?output_format=mp3_44100_128`, {
+  const response = await llmNetworkFetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(input.voiceId)}?output_format=mp3_44100_128`, {
     method: 'POST',
     headers: { 'xi-api-key': input.apiKey, 'content-type': 'application/json' },
     body: JSON.stringify({ text: input.text, model_id: input.modelId }),
     signal: AbortSignal.timeout(30_000),
     redirect: 'error',
-  });
+  }, { provider: 'elevenlabs', model: input.modelId, role: 'aux', requestedBy: 'app-tts' });
   if (!response.ok) throw new Error('tts provider rejected request');
   const length = Number(response.headers.get('content-length'));
   if (Number.isFinite(length) && length > MAX_TTS_AUDIO_BYTES) throw new Error('tts audio exceeds limit');

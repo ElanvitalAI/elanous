@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
-import { registerUsageCommand } from './usage-cli.js';
+import { registerUsageCommand, usageHostsFromConfig } from './usage-cli.js';
 import { formatAutoLandRatio, measureAutoLandRatio, outcomeTableHasCodexGrokUnknown, queryUsageOutcomes, type UsageOutcomesReport } from '../budget/usage-outcomes.js';
 import type { collectUnifiedUsage } from '../budget/unified-usage.js';
 import { LogStore, type LogStoreRow } from '../mss/logging/log-store.js';
@@ -127,6 +127,17 @@ describe('usage runs', () => {
     expect(byModel[0]).toMatchObject({ model: 'gpt-6-sol', calls: 1, usdKnown: 0, apiEquivalentUsd: 5, rankUsd: 5 });
     expect(byModel[1]).toMatchObject({ model: 'api-model', calls: 3, usdKnown: 1.5, apiEquivalentUsd: 0, rankUsd: 1.5 });
     expect((await run(['runs', '--by', 'model'], read))[0]).toContain('rankUsd=5');
+  });
+
+  it('--by role default text has no tier-share lines (only --tier-share adds them)', async () => {
+    const read = () => [
+      row({ runId: 'r1', role: 'implement', site: 'agent-turn', model: 'm', billingProvider: 'p', billing: 'api', workTier: 'strong', inputTokens: 5, cost: { kind: 'known', usd: 1 } }),
+    ];
+    const plain = await run(['runs', '--by', 'role'], read);
+    expect(plain).toEqual(['implement  agent-turn  m  p/api  calls=1  input=5  output=0  usdKnown=1  unknownCostCalls=0  includedCalls=0  apiEquivalentUsd=0']);
+    const shared = await run(['runs', '--by', 'role', '--tier-share'], read);
+    expect(shared[0]).toContain('등급별 몫');
+    expect(shared.at(-1)).toBe(plain[0]);
   });
 
   it('rejects invalid --by values before reading logs', async () => {
@@ -343,6 +354,102 @@ describe('usage runs — pod rollup re-emit dedup', () => {
 });
 
 describe('usage runs --hosts all', () => {
+  it('uses the effective ssh -G hostname to exclude a local SSH alias', async () => {
+    const config = { raw: { release: { loop: { opsHosts: ['self-alias', 'other'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const resolved: string[] = [];
+    const identity = { currentHost: 'workstation.local', localAddresses: ['127.0.0.1', '10.0.0.4'],
+      sshHostname: async (alias: string) => alias === 'self-alias' ? 'localhost' : alias,
+      resolve: async (host: string) => { resolved.push(host); return host === 'localhost' ? ['127.0.0.1'] : ['10.0.0.8']; } };
+    const roster = await usageHostsFromConfig(config, [], identity);
+    expect(roster.duplicateCandidates).toEqual(['self-alias']);
+    expect(resolved).toEqual(['localhost', 'other']);
+  });
+
+  it('starts independent remote identity lookups in parallel', async () => {
+    const config = { raw: { release: { loop: { opsHosts: ['first', 'second'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const started: string[] = [];
+    const pending = new Map<string, (addresses: string[]) => void>();
+    const identity = { currentHost: 'workstation.local', localAddresses: ['10.0.0.4'],
+      resolve: (host: string) => new Promise<string[]>((resolve) => { started.push(host); pending.set(host, resolve); }) };
+    const rosterPromise = usageHostsFromConfig(config, [], identity);
+    await Promise.resolve();
+    expect(started).toEqual(['first', 'second']);
+    pending.get('first')!(['10.0.0.8']);
+    pending.get('second')!(['10.0.0.9']);
+    expect((await rosterPromise).duplicateCandidates).toEqual([]);
+  });
+
+  it('bounds a stalled DNS lookup and keeps its host unmeasured as a possible duplicate', async () => {
+    const config = { raw: { release: { loop: { opsHosts: ['stalled'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const identity = { currentHost: 'workstation.local', localAddresses: ['10.0.0.4'], resolveTimeoutMs: 10,
+      resolve: async (_host: string): Promise<string[]> => new Promise(() => {}) };
+    expect((await usageHostsFromConfig(config, [], identity)).duplicateCandidates).toEqual(['stalled']);
+  });
+
+  it('still queries a ProxyJump-only host when its effective hostname has no local DNS record', async () => {
+    const config = { raw: { release: { loop: { opsHosts: ['proxy-host'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const identity = { currentHost: 'workstation.local', localAddresses: ['10.0.0.4'],
+      sshHostname: async (_alias: string) => 'private.internal',
+      resolve: async (_host: string): Promise<string[]> => { throw Object.assign(new Error('no local DNS'), { code: 'ENOTFOUND' }); } };
+    const roster = await usageHostsFromConfig(config, [], identity);
+    expect(roster.duplicateCandidates).toEqual([]);
+    const queried: string[] = [];
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, { readRunLogs: () => [], usageHosts: () => roster,
+      ssh: (host) => { queried.push(host); return { status: 68, stdout: '', stderr: 'usage-store-missing' }; },
+      out: { log: (line) => lines.push(line) } });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
+    expect(queried).toEqual(['proxy-host']);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ complete: false, hosts: [
+      { host: 'workstation.local', status: 'ok' },
+      { host: 'proxy-host', status: 'unmeasured', reason: '원격 logs.db 없음' },
+    ] });
+  });
+
+  it('keeps other DNS errors uncertain and lets invalid names reach the input validator', async () => {
+    const config = { raw: { release: { loop: { opsHosts: ['temporary-failure', 'bad host'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const identity = { currentHost: 'workstation.local', localAddresses: ['10.0.0.4'],
+      resolve: async (_host: string): Promise<string[]> => { throw Object.assign(new Error('temporary'), { code: 'EAI_AGAIN' }); } };
+    const roster = await usageHostsFromConfig(config, [], identity);
+    expect(roster.remote).toEqual(['temporary-failure', 'bad host']);
+    expect(roster.duplicateCandidates).toEqual(['temporary-failure']);
+  });
+
+  it('confirms a configured local alias by address before using the operations fleet', async () => {
+    const config = { hq: { hostName: 'mshq' }, raw: {
+      release: { loop: { opsHosts: ['local', 'node-b', 'node-c', 'mshq'], gatePodPool: 'pool-aws1@aws1:12#registry' } },
+      loops: { seat: { podPool: 'pool-node-b@node-b:8' } },
+    } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const identity = { currentHost: 'Joosungui-MacStudio.local', localAddresses: ['100.94.110.47'],
+      resolve: async (host: string) => host === 'mshq' ? ['100.94.110.47'] : ['10.0.0.1'] };
+    expect(await usageHostsFromConfig(config, [{ name: 'node-c' }], identity)).toEqual({
+      local: 'mshq', remote: ['node-b', 'node-c', 'aws1'], duplicateCandidates: [], configuredLocalVerified: true,
+    });
+  });
+
+  it('uses the real current host when hq.hostName is absent and identifies only local aliases', async () => {
+    const config = { raw: { release: { loop: { opsHosts: ['mshq', 'node-b', 'node-c'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const identity = { currentHost: 'Joosungui-MacStudio.local', localAddresses: ['100.94.110.47'],
+      resolve: async (host: string) => host === 'mshq' ? ['100.94.110.47'] : ['10.0.0.1'] };
+    expect(await usageHostsFromConfig(config, [], identity)).toEqual({ local: 'Joosungui-MacStudio.local',
+      remote: ['mshq', 'node-b', 'node-c'], duplicateCandidates: ['mshq'], configuredLocalVerified: false });
+  });
+
+  it('does not trust a configured hq name that resolves to another machine', async () => {
+    const config = { hq: { hostName: 'old-hq' }, raw: { release: { loop: { opsHosts: ['node-b'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const identity = { currentHost: 'current-host.local', localAddresses: ['100.0.0.1'],
+      resolve: async (host: string) => host === 'old-hq' ? ['100.0.0.2'] : ['100.0.0.3'] };
+    expect(await usageHostsFromConfig(config, [], identity)).toEqual({ local: 'current-host.local',
+      remote: ['node-b', 'old-hq'], duplicateCandidates: ['old-hq'], configuredLocalVerified: false });
+  });
+
+  it('keeps local usage but treats every remote alias as a possible duplicate without interface addresses', async () => {
+    const config = { raw: { release: { loop: { opsHosts: ['node-b', 'node-c'] } } } } as unknown as Parameters<typeof usageHostsFromConfig>[0];
+    const identity = { currentHost: 'current-host.local', localAddresses: [], resolve: async (_host: string) => ['10.0.0.1'] };
+    expect(await usageHostsFromConfig(config, [], identity)).toMatchObject({ local: 'current-host.local',
+      duplicateCandidates: ['node-b', 'node-c'] });
+  });
   const remoteModel = {
     model: 'm', hostIds: ['pod-node-b'], calls: 2, inputTokens: 20, outputTokens: 3,
     cacheReadInputTokens: 4, cacheCreationInputTokens: 0, reasoningOutputTokens: 1,
@@ -382,11 +489,11 @@ describe('usage runs --hosts all', () => {
     await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
     const report = JSON.parse(lines[0]!);
     expect(report.hosts).toEqual([{ host: 'mbp', status: 'ok' }]);
-    expect(report).toMatchObject({ complete: false, reason: 'taskAgent.parentHost 설정 없음' });
+    expect(report).toMatchObject({ complete: false, reason: '원격 호스트 목록 없음' });
     expect(report.rows[0].inputTokens).toBe(5);
   });
 
-  it('does not count local usage twice when the local host identity is missing', async () => {
+  it('preserves the local subtotal and excludes only possible duplicate aliases when identity is missing', async () => {
     const lines: string[] = [];
     const cli = new Command();
     registerUsageCommand(cli, {
@@ -396,10 +503,29 @@ describe('usage runs --hosts all', () => {
       out: { log: (line) => lines.push(line) },
     });
     await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
-    expect(JSON.parse(lines[0]!)).toMatchObject({ rows: [], hosts: [
-      { host: 'mbp', status: 'unmeasured', reason: '로컬 식별 불가로 조회 중지' },
+    expect(JSON.parse(lines[0]!)).toMatchObject({ rows: [{ inputTokens: 5 }], hosts: [
+      { host: '(local)', status: 'ok' },
+      { host: 'mbp', status: 'unmeasured', reason: '현재 호스트와 중복 가능 — 원격 제외' },
     ], complete: false });
-    expect(JSON.parse(lines[0]!).reason).toContain('hq.hostName');
+  });
+
+  it('queries a distinct remote while leaving a possible local alias unmeasured', async () => {
+    const lines: string[] = [];
+    const queried: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => [row({ runId: 'r', model: 'm', inputTokens: 5 })],
+      usageHosts: () => ({ local: 'current-host.local', remote: ['mshq', 'node-b'], duplicateCandidates: ['mshq'] }),
+      ssh: (host) => { queried.push(host); return { status: 0, stdout: JSON.stringify([remoteModel]), stderr: '' }; },
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--by', 'model', '--json'], { from: 'user' });
+    expect(queried).toEqual(['node-b']);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ complete: false, rows: [{ inputTokens: 25 }], hosts: [
+      { host: 'current-host.local', status: 'ok' },
+      { host: 'mshq', status: 'unmeasured', reason: '현재 호스트와 중복 가능 — 원격 제외' },
+      { host: 'node-b', status: 'ok' },
+    ] });
   });
 
   it('does not treat a remote missing logs.db as zero measured usage', async () => {
@@ -488,6 +614,25 @@ describe('usage runs --hosts all', () => {
     expect(report.rows[0]).toMatchObject({ model: 'm', calls: 2, inputTokens: 20 });
   });
 
+  it('returns no numeric rows when every host store is unreadable', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, {
+      readRunLogs: () => { throw new Error('database is locked'); },
+      usageHosts: () => ({ local: 'mshq', remote: ['node-b'] }),
+      ssh: () => ({ status: 68, stdout: '', stderr: 'usage-store-missing' }),
+      out: { log: (line) => lines.push(line) },
+    });
+    await cli.parseAsync(['usage', 'runs', '--hosts', 'all', '--json'], { from: 'user' });
+    const report = JSON.parse(lines[0]!);
+    expect(report.complete).toBe(false);
+    expect(report.rows).toEqual([]);
+    expect(report.hosts).toEqual([
+      { host: 'mshq', status: 'unmeasured', reason: '로컬 logs.db 조회 실패' },
+      { host: 'node-b', status: 'unmeasured', reason: '원격 logs.db 없음' },
+    ]);
+  });
+
   it('rejects a syntactically valid but incomplete remote summary', async () => {
     const lines: string[] = [];
     const cli = new Command();
@@ -501,5 +646,129 @@ describe('usage runs --hosts all', () => {
     expect(JSON.parse(lines[0]!)).toMatchObject({ complete: false, rows: [], hosts: [
       { host: 'mbp', status: 'ok' }, { host: 'node-b', status: 'unmeasured', reason: '원격 JSON 형식 오류' },
     ] });
+  });
+});
+
+describe('usage cache (O4)', () => {
+  it('reports the session cache hit rate and compaction count from llm.usage and session.compact rows', async () => {
+    const read = () => [
+      row({ sessionId: 'seat-1', billingProvider: 'glm', model: 'glm-5.3', inputTokens: 100, cacheReadInputTokens: 300 }),
+      row({ sessionId: 'seat-1', billingProvider: 'glm', model: 'glm-5.3', inputTokens: 100, cacheReadInputTokens: 500 }),
+      row({ sessionId: 'other', billingProvider: 'glm', model: 'glm-5.3', inputTokens: 900 }),
+      row({ sessionId: 'seat-1', trigger: 'pre-turn', beforeTokens: 9, afterTokens: 3 }, 'session.compact', 'fired'),
+      row({ sessionId: 'other', trigger: 'pre-turn', beforeTokens: 9, afterTokens: 3 }, 'session.compact', 'fired'),
+    ];
+    const report = JSON.parse((await run(['cache', '--session', 'seat-1', '--json'], read))[0]!);
+    expect(report.total).toMatchObject({ calls: 2, reportedCalls: 2, inputTokens: 200, cacheReadInputTokens: 800 });
+    expect(report.total.hitRate).toBe(800 / 1000);
+    expect(report.compactions).toBe(1);
+    const text = await run(['cache', '--session', 'seat-1'], read);
+    expect(text[0]).toContain('80.0%');
+  });
+
+  it('falls back to the logs.db session column for rows without a payload session id', async () => {
+    const legacy = { ...row({ model: 'm', inputTokens: 10, cacheReadInputTokens: 30 }), session_id: 'seat-2' };
+    const report = JSON.parse((await run(['cache', '--session', 'seat-2', '--json'], () => [legacy]))[0]!);
+    expect(report.total).toMatchObject({ calls: 1, cacheReadInputTokens: 30 });
+  });
+
+  it('text output keeps the compaction count when the session has no llm.usage rows', async () => {
+    const read = () => [row({ sessionId: 'quiet', trigger: 'pre-turn', beforeTokens: 9, afterTokens: 3 }, 'session.compact', 'fired')];
+    const text = await run(['cache', '--session', 'quiet'], read);
+    expect(text[0]).toContain('압축 1회');
+  });
+});
+
+describe('usage cache --hosts all', () => {
+  const localRows = () => [row({ sessionId: 'seat-1', billingProvider: 'terra', model: 'review',
+    inputTokens: 100, cacheReadInputTokens: 100, cacheCreationInputTokens: 0 })];
+
+  it('sums remote reports and recalculates the weighted cache hit rate', async () => {
+    const remote = JSON.parse((await run(['cache', '--session', 'seat-1', '--json'], () => [
+      row({ sessionId: 'seat-1', billingProvider: 'terra', model: 'review', inputTokens: 100, cacheReadInputTokens: 300 }),
+    ]))[0]!);
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, { readRunLogs: localRows, usageHosts: () => ({ local: 'mshq', remote: ['node-b'] }),
+      ssh: (_host, script) => {
+        expect(script).toContain('test -f "$HOME"/.elanous/logs/logs.db');
+        expect(script).toContain('usage cache --json --session seat-1');
+        expect(script).not.toContain('--hosts');
+        return { status: 0, stdout: JSON.stringify(remote), stderr: '' };
+      }, out: { log: (line) => lines.push(line) } });
+    await cli.parseAsync(['usage', 'cache', '--hosts', 'all', '--session', 'seat-1', '--json'], { from: 'user' });
+    const result = JSON.parse(lines[0]!);
+    expect(result.hosts).toEqual([{ host: 'mshq', status: 'ok' }, { host: 'node-b', status: 'ok' }]);
+    expect(result.complete).toBe(true);
+    expect(result.report.total).toMatchObject({ calls: 2, inputTokens: 200, cacheReadInputTokens: 400 });
+    expect(result.report.total.hitRate).toBeCloseTo(400 / 600);
+    expect(result.report.groups[0].calls).toBe(2);
+  });
+
+  it('marks unreachable and malformed hosts unmeasured without adding zero-valued reports', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, { readRunLogs: localRows,
+      usageHosts: () => ({ local: 'mshq', remote: ['node-b', 'node-c'] }),
+      ssh: (host) => host === 'node-b'
+        ? { status: 255, stdout: '', stderr: 'unreachable' }
+        : { status: 0, stdout: JSON.stringify({ sessionId: null, total: { calls: 2 } }), stderr: '' },
+      out: { log: (line) => lines.push(line) } });
+    await cli.parseAsync(['usage', 'cache', '--hosts', 'all', '--json'], { from: 'user' });
+    const result = JSON.parse(lines[0]!);
+    expect(result.complete).toBe(false);
+    expect(result.hosts).toEqual([{ host: 'mshq', status: 'ok' },
+      { host: 'node-b', status: 'unmeasured', reason: 'SSH/원격 명령 rc=255' },
+      { host: 'node-c', status: 'unmeasured', reason: '원격 JSON 형식 오류' }]);
+    expect(result.report.total.calls).toBe(1);
+  });
+
+  it('rejects a remote cache group with reportedCalls greater than calls', async () => {
+    const remote = JSON.parse((await run(['cache', '--json'], localRows))[0]!);
+    remote.total.calls = 0;
+    remote.total.reportedCalls = 1;
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, { readRunLogs: localRows,
+      usageHosts: () => ({ local: 'mshq', remote: ['node-b'] }),
+      ssh: () => ({ status: 0, stdout: JSON.stringify(remote), stderr: '' }),
+      out: { log: (line) => lines.push(line) } });
+    await cli.parseAsync(['usage', 'cache', '--hosts', 'all', '--json'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ complete: false, report: { total: { calls: 1 } }, hosts: [
+      { host: 'mshq', status: 'ok' }, { host: 'node-b', status: 'unmeasured', reason: '원격 JSON 형식 오류' },
+    ] });
+  });
+
+  it('preserves local cache when its alias is missing and prints every host status', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, { readRunLogs: localRows,
+      usageHosts: () => ({ local: 'current-host.local', remote: ['mshq', 'node-b'], duplicateCandidates: ['mshq'] }),
+      ssh: () => ({ status: 68, stdout: '', stderr: 'usage-store-missing' }),
+      out: { log: (line) => lines.push(line) } });
+    await cli.parseAsync(['usage', 'cache', '--hosts', 'all'], { from: 'user' });
+    expect(lines.join('\n')).toContain('current-host.local: 측정');
+    expect(lines.join('\n')).toContain('mshq: 못 잼 (현재 호스트와 중복 가능');
+    expect(lines.join('\n')).toContain('node-b: 못 잼 (원격 logs.db 없음)');
+    lines.length = 0;
+    await cli.parseAsync(['usage', 'cache', '--hosts', 'all', '--json'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ complete: false, report: { total: { calls: 1 } }, hosts: [
+      { host: 'current-host.local', status: 'ok' }, { host: 'mshq', status: 'unmeasured' },
+      { host: 'node-b', status: 'unmeasured' },
+    ] });
+  });
+
+  it('does not present an unreadable local store as a measured zero', async () => {
+    const lines: string[] = [];
+    const cli = new Command();
+    registerUsageCommand(cli, { readRunLogs: () => { throw new Error('locked'); },
+      usageHosts: () => ({ local: 'mshq', remote: ['node-b'] }),
+      ssh: () => ({ status: 68, stdout: '', stderr: 'usage-store-missing' }),
+      out: { log: (line) => lines.push(line) } });
+    await cli.parseAsync(['usage', 'cache', '--hosts', 'all', '--json'], { from: 'user' });
+    const result = JSON.parse(lines[0]!);
+    expect(result.complete).toBe(false);
+    expect(result.hosts[0]).toEqual({ host: 'mshq', status: 'unmeasured', reason: '로컬 logs.db 조회 실패' });
+    expect(result.report).toBeNull();
   });
 });

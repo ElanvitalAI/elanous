@@ -6,15 +6,25 @@ const member: MemberHomePageInput = {
   name: '회원 A', email: 'a@example.test', publicId: 'elan-member-a',
   referralUrl: 'https://elanous.ai/r/ElanvitalAI',
   membership: { label: '무료 멤버', note: '유료 멤버십은 2027년 2월 시작 예정입니다' },
-  connection: { linked: false, startUrl: '/app/connect' }, startUrl: '/app',
+  connection: { linked: false, recheckUrl: '/v1/members/home' }, siteUrl: 'https://elanous.ai/', handleStepUrl: 'https://elanous.ai/members/',
+  webChatUrl: 'https://mychat--member-a.elanous.app/',
+  myElanous: { handleAddress: null },
   devices: [], nonce: 'fake-nonce',
 };
+const primaries = (page: string) => [...page.matchAll(/<a class="primary"[^>]*>([^<]+)<\/a>/g)].map(match => match[1]);
 
 test('signed-in home has one next action, public account data and no key controls', () => {
   const page = renderMemberHomePage(member);
   expect(page).toContain('로그인됨 · 회원 A');
-  expect(page).toContain('이 기기를 연결하면 바로 시작할 수 있어요');
-  expect(page.match(/class="primary"/g)).toHaveLength(1);
+  expect(page).toContain('연결 전 · 기기를 연결하면 웹채팅을 시작할 수 있어요');
+  // Not connected: the next action is the connect guide, never a chat button (the chat API would answer 401).
+  expect(primaries(page)).toEqual(['기기 연결하는 법']);
+  // No handle yet: the card offers the website's handle step instead of saying «핸들을 먼저 정해야» with nowhere to go.
+  expect(page).toContain('<a class="quiet" data-member-handle-step href="https://elanous.ai/members/">핸들 정하기</a>');
+  expect(page).not.toContain('href="/app"');
+  expect(page).toContain('href="#connect-guide"');
+  expect(page).not.toContain('mychat--member-a');
+  expect(page).not.toContain('data-member-webchat-entry');
   expect(page).toContain('내 추천 링크 복사');
   expect(page).toContain('무료 멤버');
   expect(page).toContain('2027년 2월 시작 예정');
@@ -30,7 +40,18 @@ test('linked device is read-only and public fields are escaped', () => {
     connection: { ...member.connection, linked: true },
     devices: [{ name: '내 Mac', kind: 'TUI', lastUsed: '방금' }],
   });
-  expect(page).toContain('class="primary" href="/app">엘라누스 시작하기');
+  expect(primaries(page)).toEqual(['웹채팅 시작']);
+  expect(page).toContain('data-member-webchat-entry href="https://mychat--member-a.elanous.app/">웹채팅 시작');
+  expect(page).not.toContain('data-member-start-terminal');
+  // Connected without a chat address: no button to the web /app («곧 열립니다»); start from the device.
+  const noChat = renderMemberHomePage({ ...member, webChatUrl: undefined, connection: { ...member.connection, linked: true },
+    myElanous: { handleAddress: 'member-a.elanous.app' } });
+  expect(primaries(noChat)).toEqual([]);
+  expect(noChat).toContain(`data-member-start-terminal>연결한 기기의 터미널에서 eln 을 실행하면 바로 시작할 수 있어요.</p>`);
+  expect(noChat).toContain('member-a.elanous.app');
+  expect(noChat).not.toContain('href="/app"');
+  // A handle exists: no handle step.
+  expect(noChat).not.toContain('data-member-handle-step');
   expect(page).toContain('내 Mac');
   expect(page).not.toContain('연결 해제');
   expect(page).toContain('&lt;img src=x onerror=alert(1)&gt;');
@@ -41,12 +62,13 @@ test('linked device is read-only and public fields are escaped', () => {
 
 test('unknown connection and device inventory do not claim that no device exists', () => {
   const page = renderMemberHomePage({ ...member,
-    connection: { linked: null, startUrl: 'https://app.example.test/app/connect' },
-    startUrl: 'https://app.example.test/app', devices: null,
+    connection: { linked: null, recheckUrl: 'https://api.example.test/v1/members/home' }, devices: null,
   });
   expect(page).toContain('연결 상태를 아직 확인하지 못했어요');
   expect(page).toContain('연결 기기 상태를 아직 확인하지 못했어요');
-  expect(page).toContain('href="https://app.example.test/app/connect"');
+  expect(primaries(page)).toEqual(['연결 상태 다시 확인하기']);
+  expect(page).toContain('href="https://api.example.test/v1/members/home">연결 상태 다시 확인하기');
+  expect(page).not.toContain('data-member-webchat-entry');
   expect(page).not.toContain('연결된 기기가 없어요');
 });
 
@@ -169,4 +191,29 @@ test('delayed Telegram enrollment never extends the server code lifetime', async
   expect(elements.get('telegram-command')!.textContent).toBe('');
   expect(elements.get('telegram-instructions')!.hidden).toBe(true);
   expect(elements.get('telegram-feedback')!.textContent).toBe('코드가 만료됐어요. 새 코드를 받으세요.');
+});
+
+test('app name section shows the current name, or offers to choose one when none exists', () => {
+  const named = renderMemberHomePage({ ...member, appName: { slug: 'ticketing' } });
+  expect(named).toContain('id="app-name-current">ticketing<');
+  expect(named).toContain('이름 바꾸기');
+  const none = renderMemberHomePage({ ...member, appName: { slug: null } });
+  expect(none).toContain('이름 정하기');
+  expect(none).toContain('/v1/members/app-slot/name-check');
+  expect(renderMemberHomePage({ ...member, appName: { slug: '<b>x</b>' } })).not.toContain('<b>x</b>');
+});
+
+test('app name script is valid JavaScript and uses only same-origin member routes', () => {
+  const script = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(renderMemberHomePage({ ...member, appName: { slug: null } }))?.[1] ?? '';
+  expect(() => new Function(script)).not.toThrow();
+  for (const route of ['/v1/members/app-slot/name-check', '/v1/members/app-slot/name', "'/v1/members/app-slot'"]) expect(script).toContain(route);
+  expect(script).not.toContain('http');
+});
+
+test('when the app name lookup failed the page does not offer to choose or change a name', () => {
+  const page = renderMemberHomePage({ ...member, appName: { slug: null, unknown: true } });
+  expect(page).not.toContain('아직 없음');
+  expect(page).toContain('확인하지 못했어요');
+  const controls = ['input', 'check', 'save'];
+  expect(page.match(/id="app-name-(?:input|check|save)"[^>]*disabled/g)).toHaveLength(controls.length);
 });

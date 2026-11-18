@@ -29,6 +29,7 @@ import {
   type SubstrateSignals,
 } from './doctor-readiness.js';
 import { debug, redactSecretText } from '../debug/log.js';
+import { writeStdoutJson } from './stdout-json.js';
 import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
 import { applyDoctorFixes, applyGitInstall, applyServiceRestart, applySetupBrewTools, applySudoFixes, planDoctorFixes, type DoctorFixDeps, type DoctorFixItem } from './doctor-fix.js';
 import { ADVISABLE_DOCTOR_FIX_IDS, adviseDoctorFixes, type DoctorAdvice } from './doctor-llm-assist.js';
@@ -1393,7 +1394,7 @@ async function confirmDoctorAdvice(message: string, json: boolean): Promise<bool
 }
 
 export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}): void {
-  const out = deps.out ?? { log: (value: string) => console.log(value) };
+  const out = deps.out ?? { log: (value: string) => writeStdoutJson(`${value}\n`) };
   const err = deps.err ?? { error: (value: string) => console.error(value) };
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
   const registerDoctorLogSink = deps.registerDoctorLogSink ?? (async () =>
@@ -1401,7 +1402,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
   const flushDoctorLogs = deps.flushDoctorLogs ?? (() => debug.flush());
   program.command('bootstrap')
     .description('Install safe first-run tools and add elanous to PATH')
-    .action(() => {
+    .action(async () => {
       try {
         const result = runBootstrap(deps);
         if (!result.ok) {
@@ -1409,8 +1410,8 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           setExitCode(1);
           return;
         }
-        for (const line of result.manual) out.log(`Manual (sudo may be needed): ${line}`);
-        out.log(`Bootstrap ready (${result.marker})`);
+        for (const line of result.manual) await out.log(`Manual (sudo may be needed): ${line}`);
+        await out.log(`Bootstrap ready (${result.marker})`);
       } catch (error) {
         err.error(`Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
         setExitCode(1);
@@ -1424,19 +1425,19 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
     .option('--dir <tree>', 'tree to check', process.cwd())
     .option('--all', 'also check nested package.json trees')
     .option('--json', 'structured output')
-    .action((opts: { dir: string; all?: boolean; json?: boolean }, command: Command) => {
+    .action(async (opts: { dir: string; all?: boolean; json?: boolean }, command: Command) => {
       const json = opts.json || command.parent?.opts().json === true;
       let dirs: string[];
       try { dirs = opts.all ? nodeModulesTrees(opts.dir) : [resolve(opts.dir)]; }
       catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        if (json) out.log(JSON.stringify({ status: 'unreadable', reason }));
-        else out.log(`unreadable: ${reason}`);
+        if (json) await out.log(JSON.stringify({ status: 'unreadable', reason }));
+        else await out.log(`unreadable: ${reason}`);
         setExitCode(1);
         return;
       }
       const checks = dirs.map(checkNodeModules);
-      out.log(json ? JSON.stringify(opts.all ? checks : checks[0], null, 2) : checks.map(formatNodeModulesCheck).join('\n'));
+      await out.log(json ? JSON.stringify(opts.all ? checks : checks[0], null, 2) : checks.map(formatNodeModulesCheck).join('\n'));
       if (checks.some((check) => check.status !== 'ok')) setExitCode(1);
     });
   doctor.command('host')
@@ -1473,7 +1474,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         }
       }
       const report = await runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected, membership });
-      out.log(json ? JSON.stringify(report, null, 2) : formatHostDoctorLines(report).join('\n'));
+      await out.log(json ? JSON.stringify(report, null, 2) : formatHostDoctorLines(report).join('\n'));
       if (!report.ok) setExitCode(1);
     });
   doctor.command('auto-long-run')
@@ -1488,10 +1489,10 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         const result = recordAutoLongRunVisit({ runId, startedAt: opts.startedAt,
           ...(deps.doctorAutoLongRunNow ? { now: deps.doctorAutoLongRunNow() } : {}),
           ...(deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {}) });
-        out.log(json ? JSON.stringify(result) : `doctor auto-long-run: runId=${runId} status=${result.status}`);
+        await out.log(json ? JSON.stringify(result) : `doctor auto-long-run: runId=${runId} status=${result.status}`);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        if (json) await out.log(JSON.stringify({ status: 'rejected', reason }));
         else err.error(reason);
         setExitCode(1);
       } finally {
@@ -1509,14 +1510,14 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       const json = opts.json === true || command.parent?.opts().json === true;
       if (!isDoctorSymptom(opts.symptom)) {
         const reason = `unknown symptom: ${opts.symptom} — closed list: ${DOCTOR_SYMPTOMS.join(', ')}`;
-        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        if (json) await out.log(JSON.stringify({ status: 'rejected', reason }));
         else err.error(reason);
         setExitCode(1);
         return;
       }
       if (!isDoctorVisitSource(opts.from)) {
         const reason = `unknown from: ${opts.from} — closed list: ${DOCTOR_VISIT_SOURCES.join(', ')}`;
-        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        if (json) await out.log(JSON.stringify({ status: 'rejected', reason }));
         else err.error(reason);
         setExitCode(1);
         return;
@@ -1531,10 +1532,10 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           ...(deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {}),
           ...(deps.doctorVisitIncidentRoot !== undefined ? { incidentRoot: deps.doctorVisitIncidentRoot } : {}),
         });
-        out.log(json ? JSON.stringify(visit) : `doctor visit recorded: runId=${runId} from=${opts.from} symptom=${opts.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}${visit.incidentPrecedents !== undefined ? ` incident-precedents=${visit.incidentPrecedents.length}` : ''}`);
+        await out.log(json ? JSON.stringify(visit) : `doctor visit recorded: runId=${runId} from=${opts.from} symptom=${opts.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}${visit.incidentPrecedents !== undefined ? ` incident-precedents=${visit.incidentPrecedents.length}` : ''}`);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        if (json) await out.log(JSON.stringify({ status: 'rejected', reason }));
         else err.error(reason);
         setExitCode(1);
       } finally {
@@ -1550,7 +1551,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       const pr = Number(opts.pr);
       if (!Number.isSafeInteger(pr) || pr <= 0) {
         const reason = 'PR number must be a positive integer';
-        if (json) out.log(JSON.stringify({ status: 'rejected', reason })); else err.error(reason);
+        if (json) await out.log(JSON.stringify({ status: 'rejected', reason })); else err.error(reason);
         setExitCode(1);
         return;
       }
@@ -1564,7 +1565,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           debug.log('doctor.review', 'brief-issued', event);
           debug.flush();
         }
-        out.log(json ? JSON.stringify({ ...brief, intentBlock }, null, 2) : [
+        await out.log(json ? JSON.stringify({ ...brief, intentBlock }, null, 2) : [
           `PR #${pr} · ${brief.status} · rounds=${brief.rounds} · head=${brief.head.slice(0, 12)} · verdict=${brief.reviewedVerdict} · rx=${brief.rx}`,
           ...(brief.dispositionEvidence ? [`Source: PR author disposition (current head review unmeasured) · ${brief.dispositionEvidence}`] : []),
           ...(brief.goalQuestion ? [`Original question: ${brief.goalQuestion}`] : []),
@@ -1583,7 +1584,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         ].join('\n'));
       } catch (error) {
         const reason = observationError(error);
-        if (json) out.log(JSON.stringify({ status: 'unavailable', pr, reason })); else err.error(reason);
+        if (json) await out.log(JSON.stringify({ status: 'unavailable', pr, reason })); else err.error(reason);
         setExitCode(1);
       }
     });
@@ -1591,12 +1592,12 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
     .description('Summarize recorded doctor visits by symptom with recent visit lines')
     .option('--run <runId>', 'limit the summary to one run ledger')
     .option('--json', 'structured output')
-    .action((opts: { run?: string; json?: boolean }, command: Command) => {
+    .action(async (opts: { run?: string; json?: boolean }, command: Command) => {
       const json = opts.json === true || command.parent?.opts().json === true;
       const ledgerScope = deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {};
       if (opts.run !== undefined && !doctorVisitRunExists(opts.run, ledgerScope)) {
         const reason = `없음: 런 원장이 없습니다 (runId=${opts.run})`;
-        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        if (json) await out.log(JSON.stringify({ status: 'rejected', reason }));
         else err.error(reason);
         setExitCode(1);
         return;
@@ -1607,8 +1608,8 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         reviewEvents = (deps.readReviewBriefEvents ?? ((runId?: string) => readReviewBriefEventsFromLogs(logsDbPath(), runId)))(opts.run);
       } catch (error) {
         const reason = observationError(error);
-        if (json) out.log(JSON.stringify({ status: 'unavailable', reason, recordedVisits: visits }, null, 2));
-        else out.log(`Doctor status unavailable: ${reason}\nRecorded doctor visits: ${visits.length}`);
+        if (json) await out.log(JSON.stringify({ status: 'unavailable', reason, recordedVisits: visits }, null, 2));
+        else await out.log(`Doctor status unavailable: ${reason}\nRecorded doctor visits: ${visits.length}`);
         setExitCode(1);
         return;
       }
@@ -1616,10 +1617,10 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       const counts = Object.fromEntries(DOCTOR_SYMPTOMS.map((symptom: DoctorSymptom) => [symptom, 0])) as Record<DoctorSymptom, number>;
       for (const visit of statusVisits) counts[visit.symptom] += 1;
       if (json) {
-        out.log(JSON.stringify({ total: statusVisits.length, counts, visits: statusVisits }, null, 2));
+        await out.log(JSON.stringify({ total: statusVisits.length, counts, visits: statusVisits }, null, 2));
         return;
       }
-      out.log([
+      await out.log([
         `Doctor visits: ${statusVisits.length}`,
         ...DOCTOR_SYMPTOMS.map((symptom: DoctorSymptom) => `  ${symptom}: ${counts[symptom]}`),
         'Recent visits:',
@@ -1662,7 +1663,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
             catch {
               const reason = '설정을 읽을 수 없습니다';
               debug.log('doctor.bundle', 'upload-failed', { bytes: result.bytes, reason: 'config-read-failed' });
-              if (opts.json) out.log(JSON.stringify({ path: result.path, uploaded: false, reason }));
+              if (opts.json) await out.log(JSON.stringify({ path: result.path, uploaded: false, reason }));
               else err.error(`업로드 실패 (${reason}) — 파일: ${result.path} — 다시 시도해 주세요.`);
               setExitCode(1);
               return;
@@ -1675,11 +1676,11 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
               confirm: deps.confirmBundleUpload ?? ((message) => confirmDoctorAdvice(message, opts.json === true)),
               fetch: deps.uploadFetch ?? globalThis.fetch,
             });
-            if (opts.json) out.log(JSON.stringify({ path: uploaded.path, uploaded: uploaded.uploaded, ...(uploaded.code ? { code: uploaded.code } : {}), ...(uploaded.reason ? { reason: uploaded.reason } : {}) }));
-            else out.log(uploaded.message);
+            if (opts.json) await out.log(JSON.stringify({ path: uploaded.path, uploaded: uploaded.uploaded, ...(uploaded.code ? { code: uploaded.code } : {}), ...(uploaded.reason ? { reason: uploaded.reason } : {}) }));
+            else await out.log(uploaded.message);
             if (uploaded.exitCode) setExitCode(uploaded.exitCode);
           } else {
-            out.log(opts.json ? JSON.stringify(result) : [`Diagnostics: ${result.path} (${result.bytes} bytes)`, 'Contents:', ...result.files.map((file) => `  ${file}`)].join('\n'));
+            await out.log(opts.json ? JSON.stringify(result) : [`Diagnostics: ${result.path} (${result.bytes} bytes)`, 'Contents:', ...result.files.map((file) => `  ${file}`)].join('\n'));
           }
         } catch {
           err.error('Could not create diagnostics archive.');
@@ -1725,7 +1726,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       }
       report.localLlm = await probeDoctorLocalLlm(deps.localLlmInventory);
       if (!opts.fix && !opts.advise) {
-        out.log(opts.json ? JSON.stringify(report, null, 2) : formatDoctorReport(report, { credentials: opts.credentials }));
+        await out.log(opts.json ? JSON.stringify(report, null, 2) : formatDoctorReport(report, { credentials: opts.credentials }));
         if (report.requiredMissing?.length) setExitCode(1);
         return;
       }
@@ -1778,12 +1779,12 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       // Planning never writes; existing repairs require --yes, while git alone can use affirmative TTY consent.
       const plan = planDoctorFixes(fixes);
       const advice = opts.advise ? await requestDoctorAdvice(report, plan, deps) : undefined;
-      const proposal = advice && !opts.fix ? await presentDoctorAdviceProposal(advice, report, deps, opts.json === true, (text) => {
+      const proposal = advice && !opts.fix ? await presentDoctorAdviceProposal(advice, report, deps, opts.json === true, async (text) => {
         if (opts.json) err.error(text);
-        else out.log(text);
+        else await out.log(text);
       }) : null;
       if (!opts.fix) {
-        out.log(opts.json
+        await out.log(opts.json
           ? JSON.stringify({ ...report, advise: advice, ...(proposal ? { adviceProposal: { itemId: proposal.proposal.itemId, observedValue: proposal.proposal.observedValue, response: proposal.response } } : {}) }, null, 2)
           : [
             formatDoctorReport(report, { credentials: opts.credentials }),
@@ -1802,7 +1803,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       if (advice?.ok && !opts.yes && interactive && selectedCount > 0) {
         const preview = formatDoctorAdvice(advice);
         if (opts.json) err.error(preview);
-        else out.log(preview);
+        else await out.log(preview);
       }
       const agreed = advice?.ok && !opts.yes && interactive && selectedCount > 0
         ? await (deps.confirmAdvice ?? ((message) => confirmDoctorAdvice(message, opts.json === true)))(`위 ${selectedCount}개를 실행할까요? [y/N] `)
@@ -1856,8 +1857,8 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       if (gitInstall?.ran && gitInstall.ok && currentReport.requiredMissing?.includes('git')) {
         gitInstall.detail = 'git init 성공 · 현재 doctor PATH 에서 git 을 찾지 못했습니다. 새 셸에서 다시 확인하세요.';
       }
-      if (opts.json) out.log(JSON.stringify({ report: currentReport, plan, manualCommands: manualCommandFixes(currentReport), ...(gitPlan ? { gitPlan, gitInstall } : {}), ...(sudoResult ? { sudo: sudoResult } : {}), ...(results ? { results } : {}), ...(restartResult ? { restart: restartResult } : {}), ...(advice ? { advise: advice } : {}) }, null, 2));
-      else out.log([
+      if (opts.json) await out.log(JSON.stringify({ report: currentReport, plan, manualCommands: manualCommandFixes(currentReport), ...(gitPlan ? { gitPlan, gitInstall } : {}), ...(sudoResult ? { sudo: sudoResult } : {}), ...(results ? { results } : {}), ...(restartResult ? { restart: restartResult } : {}), ...(advice ? { advise: advice } : {}) }, null, 2));
+      else await out.log([
         formatDoctorReport(currentReport, { credentials: opts.credentials }),
         ...(advice ? [formatDoctorAdvice(advice)] : []),
         'Fix plan:',

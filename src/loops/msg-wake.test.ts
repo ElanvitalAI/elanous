@@ -10,7 +10,8 @@ import { SEAT_MESSAGE_ROUTES, messageRouteFor } from './msg-address.js';
 import { spawn } from 'node:child_process';
 import type { HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { createFakeHerdr, type FakeHerdrStatus } from '../ux-sim/fake-herdr.js';
-import { claimWake, MAX_REDELIVER_ATTEMPTS, PENDING_WAKE_TTL_MS, redeliverLine, redeliverPendingWakes, registerSeatPaneAddress, resolveWake, startPendingWakePoller, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps } from './msg-wake.js';
+import { claimWake, MAX_REDELIVER_ATTEMPTS, PENDING_WAKE_TTL_MS, redeliverLine, redeliverPendingWakes, registerSeatPaneAddress, resolveWake, startPendingWakePoller, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps, fallbackWakeLine, IDLE_WATCH_WAKE, wakeNoneNotice, NO_WAKE_NOTICE } from './msg-wake.js';
+import { readSeatRegistry } from './seat-registry.js';
 
 // Real Bun subprocesses can exceed Bun's 5 s default under gate-pod load.
 setDefaultTimeout(60_000);
@@ -130,6 +131,21 @@ test('registry herdr targets require one live matching census pane', () => {
   expect(resolveWake('OPC', { ...deps, listHerdrPanes: () => [
     { paneId: 'wT:p4', status: 'idle' }, { paneId: 'wT:p4', status: 'idle' },
   ] })).toMatchObject({ wake: 'none', reason: 'ambiguous-pane:candidates=2' });
+});
+
+test('remote-host registry seats skip the local pane census; the remote prompt stays the liveness gate', () => {
+  // RES-MAIL-DOWNLINK-ROOTFIX-0820: 원격 host 자리는 로컬 herdr census 에 없다 —
+  // 로컬 census 가 dead-pane-address 를 내리면 하향선이 조용히 끊긴다(4.5일 무경보 재발).
+  // 등록부 host 가 로컬이 아니면 동기 검증은 통과시키고, 진짜 liveness/idle 관문은
+  // herdrPrompt(requirePaneListStatus) 의 원격 census 에 맡긴다.
+  const readRegistry: WakeDeps['readRegistry'] = () => ({ status: 'ready', registry: { version: 1, seats: [
+    { address: 'RES23N04', host: 'node-b', target: 'w5:p2N', wake: 'herdr', replyBody: 'agent', optIn: true },
+  ] } });
+  const deps = fixture({ readRegistry, listHerdrPanes: () => [] }).deps;
+  expect(resolveWake('RES23N04', deps)).toMatchObject({ wake: 'herdr', target: 'w5:p2N', source: 'seat-registry' });
+  // 원격 pane 이 로컬 census 에 우연히 같은 paneId 로 있어도 로컬 상태(dead/unknown)로 판정하지 않는다.
+  expect(resolveWake('RES23N04', { ...deps, listHerdrPanes: () => [{ paneId: 'w5:p2N', status: 'dead' }] }))
+    .toMatchObject({ wake: 'herdr', target: 'w5:p2N', source: 'seat-registry' });
 });
 
 test('pane title and cwd disagreement stays ambiguous instead of routing either seat', () => {
@@ -377,6 +393,16 @@ test('replies and self-addressed notes never wake; cron defers; the test univers
   const isolated = fixture({ live: false });
   expect((await wakeRecipient('OPT', 4, { from: 'OP' }, isolated.deps)).result).toBe('skipped-test-universe');
   expect([...f.injected, ...isolated.injected]).toEqual([]);
+});
+
+test('an eln seat with autowake says wake=eln-idle-watch; without the file it stays wake=none', async () => {
+  const watched = fixture({ hasOptIn: (path) => path.endsWith('/UX/autowake') });
+  expect(await wakeRecipient('UX', 1, { from: 'OP' }, watched.deps)).toMatchObject({ result: 'no-wake' });
+  expect(watched.warned.at(-1)).toContain('wake=eln-idle-watch');
+  expect(watched.warned.at(-1)).not.toContain('wake=none');
+  const plain = fixture({ hasOptIn: () => false });
+  expect(await wakeRecipient('UX', 2, { from: 'OP' }, plain.deps)).toMatchObject({ result: 'no-wake' });
+  expect(plain.warned.at(-1)).toContain('wake=none');
 });
 
 test('an unresolved seat is none plus «모름», a known none says so, and failures or hangs only return a result', async () => {
@@ -952,4 +978,61 @@ test('message wake relies on pane-list supported-agent idle status', async () =>
   const busy = await wakeRecipient('MK', 42, { from: 'OP' }, f.deps);
   expect(busy).toMatchObject({ result: 'busy', reason: 'agent_status=working' });
   expect(f.herdr).toHaveLength(1);
+});
+
+test('OP 11-17: runtime=eln ⊕ autowake → no typing into the pane; without autowake or with fallback → one knock', async () => {
+  const seat = (runtime?: 'eln' | 'claude-code' | 'codex') => ({ status: 'ready' as const, registry: { version: 1 as const, seats: [
+    { address: 'HAND-X', host: 'local', target: 'wJ:p1', wake: 'herdr' as const, replyBody: 'agent' as const, optIn: true, ...(runtime ? { runtime } : {}) },
+  ] } });
+  const autowake = (path: string) => path.endsWith(join('HAND-X', 'autowake'));
+  const eln = fixture({ readRegistry: () => seat('eln'), hasOptIn: autowake, listHerdrPanes: () => [{ paneId: 'wJ:p1', status: 'idle' }] });
+  expect(resolveWake('HAND-X', eln.deps)).toMatchObject({ wake: 'herdr', runtime: 'eln', delivery: 'adapter', session: 'wJ:p1' });
+  expect(await wakeRecipient('HAND-X', 1, { from: 'OP' }, eln.deps)).toMatchObject({ result: 'eln-mail-watch', reason: IDLE_WATCH_WAKE });
+  expect(eln.herdr).toEqual([]);
+  // 60초 안전망 — 내용 없이 «우편 확인» 한 줄.
+  expect((await wakeRecipient('HAND-X', 1, { from: 'OP', fallback: true }, eln.deps)).result).toBe('injected');
+  expect(eln.herdr).toEqual([['wJ:p1', fallbackWakeLine('HAND-X')]]);
+  expect(fallbackWakeLine('HAND-X')).not.toContain('OP');
+  // eln 이어도 autowake 가 없으면(자기 우편을 안 봄) 지금처럼 깨운다 · claude-code 는 늘 깨운다.
+  const noWatch = fixture({ readRegistry: () => seat('eln'), hasOptIn: () => false, listHerdrPanes: () => [{ paneId: 'wJ:p1', status: 'idle' }] });
+  expect((await wakeRecipient('HAND-X', 2, { from: 'OP' }, noWatch.deps)).result).not.toBe('eln-mail-watch');
+  const cc = fixture({ readRegistry: () => seat('claude-code'), hasOptIn: autowake, listHerdrPanes: () => [{ paneId: 'wJ:p1', status: 'idle' }] });
+  expect(resolveWake('HAND-X', cc.deps)).toMatchObject({ runtime: 'external-cli' });
+  expect((await wakeRecipient('HAND-X', 3, { from: 'OP' }, cc.deps)).result).toBe('injected');
+});
+
+test('registry runtime column: v1 files without it stay valid · bad value refused · register writes and keeps it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-registry-runtime-'));
+  dirs.push(root);
+  const path = join(root, 'seat-registry.json');
+  expect(readSeatRegistry(path, JSON.stringify({ version: 1, seats: [{ address: 'A', host: 'local', target: 'w:p', wake: 'herdr', replyBody: 'agent', optIn: true }] })).status).toBe('ready');
+  expect(readSeatRegistry(path, JSON.stringify({ version: 1, seats: [{ address: 'A', host: 'local', target: 'w:p', wake: 'herdr', replyBody: 'agent', optIn: true, runtime: 'gpt' }] })))
+    .toMatchObject({ status: 'invalid', reason: 'seats[0].runtime must be eln, claude-code or codex' });
+  const deps = { seatStateRoot: root, registryPath: path } as WakeDeps;
+  registerSeatPaneAddress({ address: 'HAND-X', paneId: 'w4:pB', host: 'local', enableWake: true, runtime: 'eln' }, deps);
+  registerSeatPaneAddress({ address: 'HAND-X', paneId: 'w4:pB', host: 'local' }, deps); // runtime 생략 = 유지
+  const read = readSeatRegistry(path);
+  expect(read.status === 'ready' && read.registry.seats.find(s => s.address === 'HAND-X')).toMatchObject({ runtime: 'eln', target: 'w4:pB', optIn: true });
+});
+
+test('TC ② wake=none says whether the receiving body is known: registered/not wakeable · own inbox watch · not found', () => {
+  expect(wakeNoneNotice({ source: 'seat-registry', host: 'mshq', target: 'w4:pB', optIn: true }, false)).toBe(`${NO_WAKE_NOTICE} (wake=none · 받는 몸 확인됨: seat-registry mshq · 깨울 길 없음)`);
+  expect(wakeNoneNotice({ source: 'seat-registry' }, true)).toBe(`${NO_WAKE_NOTICE} (wake=${IDLE_WATCH_WAKE} · 받는 몸: 자기 우편 감시 opt-in 확인됨 · 살아 있음은 따로 잼)`);
+  expect(wakeNoneNotice({ source: 'unresolved', reason: 'seat-registry-missing:candidates=0' }, false))
+    .toBe(`${NO_WAKE_NOTICE} (wake=none · 받는 몸 모름: 등록부·pane 에서 못 찾음 — seat-registry-missing:candidates=0)`);
+  // #38314 REVIEW ①: placeholder rows are «모름», never a false «확인됨».
+  expect(wakeNoneNotice({ source: 'seat-registry', host: 'unknown', optIn: false }, false)).toContain('받는 몸 모름: seat-registry 자리표시 줄');
+  expect(wakeNoneNotice({ source: 'seat-registry', host: 'local', optIn: false }, false)).toContain('받는 몸 모름');
+  // #38314 ②: a loop-table address names its own policy.
+  expect(wakeNoneNotice({ source: 'loop-table' , target: 'x:y', optIn: true }, false)).toContain('받는 몸: 루프 주소');
+});
+
+test('#38314 REVIEW ①④ — through wakeRecipient: a registered wake=none seat with a pane is «확인됨»; a placeholder row is «모름»', async () => {
+  const registry = (seats: unknown[]) => () => ({ status: 'ready' as const, registry: { version: 1 as const, seats: seats as never } });
+  const known = fixture({ readRegistry: registry([{ address: 'HAND-K', host: 'mshq', target: 'w4:pB', wake: 'none', replyBody: 'agent', optIn: true }]), hasOptIn: () => false });
+  expect((await wakeRecipient('HAND-K', 1, { from: 'OP' }, known.deps)).result).toBe('no-wake');
+  expect(known.warned.at(-1)).toContain('받는 몸 확인됨: seat-registry mshq');
+  const placeholder = fixture({ readRegistry: registry([{ address: 'HAND-P', host: 'unknown', wake: 'none', replyBody: 'none', optIn: false }]), hasOptIn: () => false });
+  expect((await wakeRecipient('HAND-P', 1, { from: 'OP' }, placeholder.deps)).result).toBe('no-wake');
+  expect(placeholder.warned.at(-1)).toContain('받는 몸 모름: seat-registry 자리표시 줄 — host unknown · pane 없음');
 });

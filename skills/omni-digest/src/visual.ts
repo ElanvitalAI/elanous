@@ -12,6 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
 import { env, requireEnv } from './env.js';
 import { downloadVideo, mediaEngineAvailable } from './media.js';
 import type { TweetMedia } from './types.js';
@@ -46,18 +47,18 @@ async function download(url: string, path: string): Promise<void> {
 }
 
 /** Grok 비전 — 이미지 여러 장 ⊕ 지시. 응답 텍스트(한국어). */
-async function describeImages(imageUrls: string[], instruction: string): Promise<string> {
+export async function describeImages(imageUrls: string[], instruction: string): Promise<string> {
   const apiKey = requireEnv('XAI_API_KEY');
   const model = env('GROK_VISION_MODEL', env('GROK_MODEL', 'grok-4-1-fast-reasoning'));
   const content = [
     { type: 'input_text', text: instruction },
     ...imageUrls.map((u) => ({ type: 'input_image', image_url: u, detail: 'high' })),
   ];
-  const res = await fetch('https://api.x.ai/v1/responses', {
+  const res = await llmNetworkFetch('https://api.x.ai/v1/responses', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({ model, input: [{ role: 'user', content }], temperature: 0.2 }),
-  });
+  }, { provider: 'grok', model, role: 'aux', requestedBy: 'omni-digest' });
   if (!res.ok) throw new Error(`Grok vision ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
   const data = await res.json();
   for (const item of data.output || []) for (const c of item.content || []) if ((c.type === 'output_text' || c.type === 'text') && c.text) return c.text.trim();

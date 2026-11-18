@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 
 import { DebugForwarder, deriveForwardLevel, setDebugForwardFallback } from './debug';
+import { clearAuthRequired, reportAuthRequired, resetAuthRequiredForTests } from './auth-required';
 
 function rec(category: string): { ts: string; category: string; event: string; source: { platform: 'pwa' } } {
   return {
@@ -314,4 +315,40 @@ it('a slow-flush forwarder sends one batch for a burst of keys, and flushes a fu
   for (let i = 0; i < 100; i++) f.push({ category: 'webterm.ws.frame.in', ts: Date.now(), snapshot: { i } } as never);
   await new Promise((r) => setTimeout(r, 10));
   expect(bodies).toHaveLength(2);
+});
+
+describe('DebugForwarder · WEB-FIRST-CONNECT-ONBOARDING', () => {
+  afterEach(() => { resetAuthRequiredForTests(); delete (globalThis as { window?: unknown }).window; });
+  it('holds records while the device is refused (401 seen) and sends them once it is connected again', async () => {
+    (globalThis as { window?: unknown }).window = { dispatchEvent: () => true };
+    reportAuthRequired('/v1/nexus');
+    const bodies: string[] = [];
+    const f = new DebugForwarder(async (b) => { bodies.push(b); return true; }, 'debug', 1_000, 20);
+    f.push(rec('webterm.tabs.list'));
+    await f.flush();
+    expect(bodies).toEqual([]);
+    expect(f.pending).toBe(1);
+    clearAuthRequired();
+    await f.flush();
+    expect(bodies.length).toBe(1);
+    expect(f.pending).toBe(0);
+  });
+});
+
+describe('DebugForwarder · page-leave flush (#38209 REVIEW-1 ②)', () => {
+  afterEach(() => { resetAuthRequiredForTests(); delete (globalThis as { window?: unknown }).window; });
+  it('holds while the device is refused and, once connected, hands the batch to the token-carrying sender', () => {
+    (globalThis as { window?: unknown }).window = { dispatchEvent: () => true };
+    reportAuthRequired('/v1/nexus');
+    const sent: string[] = [];
+    const f = new DebugForwarder(async () => true, 'debug', 1_000, 60_000);
+    f.push(rec('webterm.tabs.list'));
+    f.beaconFlush((body) => { sent.push(body); return true; });
+    expect(sent).toEqual([]);
+    expect(f.pending).toBe(1);
+    clearAuthRequired();
+    f.beaconFlush((body) => { sent.push(body); return true; });
+    expect(sent).toHaveLength(1);
+    expect(f.pending).toBe(0);
+  });
 });

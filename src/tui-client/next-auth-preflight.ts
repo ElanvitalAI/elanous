@@ -5,15 +5,29 @@ import type { UserConfig } from '../user-config/schema.js';
 type Reason = 'missing-file' | 'expired' | 'other';
 const HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-export type NextTuiAuthFailureKind = 'codex-auth-missing' | 'codex-auth-failed';
-/** Only this preflight may create a public Codex auth failure. */
+export type NextTuiAuthFailureKind = 'codex-auth-missing' | 'codex-auth-failed' | 'glm-auth-missing';
+/** Public, fixed text per kind — never provider error text or credential values. */
+export const NEXT_TUI_AUTH_FAILURE_TEXT: Readonly<Record<NextTuiAuthFailureKind, string>> = {
+  'codex-auth-missing': 'Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.',
+  'codex-auth-failed': 'Codex 인증에 실패했습니다. eln login openai-codex를 확인하세요.',
+  // Same text as ZAI_CREDENTIAL_MISSING_REASON (src/llm/zai-coding-plan.ts) — kept literal so the TUI core
+  // import graph does not load the Z.ai provider module; the focused test pins the two equal.
+  'glm-auth-missing': 'GLM 자격 없음: ZAI Coding Plan 키(~/.cache/zai_api_key 또는 ZAI_API_KEY)를 찾지 못했습니다',
+};
+/** Only these preflights may create a public auth failure. */
 export class NextTuiAuthError extends Error {
   constructor(readonly kind: NextTuiAuthFailureKind) {
-    super(kind === 'codex-auth-missing'
-      ? 'Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.'
-      : 'Codex 인증에 실패했습니다. eln login openai-codex를 확인하세요.');
+    super(NEXT_TUI_AUTH_FAILURE_TEXT[kind]);
     this.name = 'NextTuiAuthError';
   }
+}
+
+/** TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — a glm turn with no Z.ai Coding Plan key used to end in 0s
+ * as a generic failure. Judge with the production resolver (key cache → ZAI_API_KEY; presence only)
+ * and surface the reason before the child starts. */
+export function preflightNextTuiGlmAuth(provider: string | undefined, available: () => boolean): void {
+  if (provider !== 'glm') return;
+  if (!available()) throw new NextTuiAuthError('glm-auth-missing');
 }
 
 export function classifyNextAuthFailure(error: unknown): Reason {

@@ -1,8 +1,8 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, symlinkSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, symlinkSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { setDefaultTimeout, afterEach, describe, expect, test as bunTest } from 'bun:test';
 import { isUnprivilegedGitRepairOnlyFailure } from './install-doctor-result';
 import { INSTALL_DETERMINISTIC_SMOKE_TESTS, shouldRunInstallTest } from './lib/install-test-tier.js';
@@ -10,6 +10,7 @@ import { runReleaseInstaller, type Runner } from '../src/cli/release-cli.js';
 import { createFakeBins } from '../src/ux-sim/fake-bin.js';
 import { simCli } from '../src/ux-sim/in-process-cli.js';
 import { packageFixture as createPackageFixture, packageVersionFromSource } from './lib/install-test-package.js';
+import { packPwaOutput } from './lib/pack-pwa-output.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -22,6 +23,7 @@ const test = (name: string, fn: () => void | Promise<void>, timeout?: number): v
   else bunTest.skip(name, fn, timeout);
 };
 
+const installedDoctorTimeoutMs = 240_000;
 const repoRoot = resolve(import.meta.dir, '..');
 const installer = resolve(import.meta.dir, 'install.sh');
 const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { version: string; bin: Record<string, string> };
@@ -52,9 +54,11 @@ const hostBunCache = process.env.BUN_INSTALL_CACHE_DIR ?? join(process.env.BUN_I
 
 function checkoutVersionName(path: string): string {
   const env = { ...process.env, PATH: path };
-  const head = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8', env }).stdout.trim();
+  // install.sh resolves the checkout with pwd -P before git status, so the expected version folder must too.
+  const checkout = realpathSync(repoRoot);
+  const head = spawnSync('git', ['-C', checkout, 'rev-parse', 'HEAD'], { encoding: 'utf8', env }).stdout.trim();
   if (!/^[0-9a-f]{40}$/.test(head)) return packageJson.version;
-  const dirty = spawnSync('git', ['-C', repoRoot, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', env }).stdout.trim();
+  const dirty = spawnSync('git', ['-C', checkout, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', env }).stdout.trim();
   return `${packageJson.version}-${head.slice(0, 12)}${dirty ? '-dirty' : ''}`;
 }
 
@@ -92,8 +96,11 @@ function fakeBunBin(dir: string, archive: string, installDir: string, options: {
     '  "add --no-save")',
     '    [ "$3" = "--ignore-scripts" ] || exit 64',
     '    case "$4" in --offline) [ "$#" -eq 5 ] || exit 64; package="$5" ;; *) [ "$#" -eq 4 ] || exit 64; package="$4" ;; esac',
-    '    [ "$PWD" = "$ELANOUS_INSTALL_TEST_EXPECTED_CWD" ] || exit 65',
-    '    case "$PWD" in "$ELANOUS_INSTALL_PREFIX"/versions/*) ;; *) exit 65 ;; esac',
+    '    pwd_real=$(command -p realpath "$PWD") || exit 65',
+    '    expected_real=$(command -p realpath "$ELANOUS_INSTALL_TEST_EXPECTED_CWD") || exit 65',
+    '    [ "$pwd_real" = "$expected_real" ] || exit 65',
+    '    prefix_real=$(command -p realpath "$ELANOUS_INSTALL_PREFIX") || exit 65',
+    '    case "$pwd_real" in "$prefix_real"/versions/*) ;; *) exit 65 ;; esac',
     '    [ -f "$package" ] || exit 66',
     `    ${shellQuote(fakeBins.bin('bunAddContract'))} "$@" || exit $?`,
     '    command -p rm -rf "$PWD/node_modules/elanous"',
@@ -199,8 +206,11 @@ function run(args: string[], env: ReturnType<typeof setup> = setup(), path = hos
   if (fakeMode) {
     versionDir = source ? version : checkoutVersionName(path);
     const prefixArg = args.indexOf('--prefix');
-    installPrefix = prefixArg >= 0 ? resolve(cwd, args[prefixArg + 1] ?? env.prefix) : env.prefix;
-    installDir = join(installPrefix, 'versions', versionDir);
+    const requestedPrefix = prefixArg >= 0 ? resolve(cwd, args[prefixArg + 1] ?? env.prefix) : env.prefix;
+    mkdirSync(requestedPrefix, { recursive: true });
+    installPrefix = realpathSync(requestedPrefix);
+    mkdirSync(join(installPrefix, 'versions', versionDir), { recursive: true });
+    installDir = realpathSync(join(installPrefix, 'versions', versionDir));
     packageArchive = runtimeExtra.ELANOUS_INSTALL_TEST_PACKAGE_TGZ ?? packageFixture(fixture(), version);
     runtimeExtra.ELANOUS_INSTALL_TEST_EXPECTED_CWD = installDir;
     if (!testCustomBun) {
@@ -275,6 +285,35 @@ function packReal(destination: string): string {
   return join(destination, readdirSync(destination).find(file => file.endsWith('.tgz'))!);
 }
 
+function tarSync(args: string[]): ReturnType<typeof spawnSync> {
+  return spawnSync('tar', args, { encoding: 'utf8' });
+}
+
+function serveFile(file: string): { port: Promise<string>; stop: () => void } {
+  const server = spawn(process.execPath, ['-e', `const http=require('http');const fs=require('fs');const file=process.argv[1];http.createServer((q,s)=>{s.end(fs.readFileSync(file));}).listen(0,'127.0.0.1',function(){process.stdout.write(String(this.address().port)+'\\n');});`, file], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const port = new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('url server did not start')), 5000);
+    server.stdout!.once('data', (chunk) => { clearTimeout(timer); resolve(String(chunk).trim()); });
+    server.once('error', reject);
+  });
+  return { port, stop: () => server.kill() };
+}
+
+function packRealWithPwa(destination: string): string {
+  const source = packReal(destination);
+  const tree = join(destination, 'pwa-tree');
+  mkdirSync(tree);
+  const extracted = tarSync(['-xzf', source, '-C', tree]);
+  expect(extracted.status, `tar extract: ${extracted.stderr}`).toBe(0);
+  const pwaOut = join(tree, 'package', 'apps', 'pwa', 'out');
+  mkdirSync(pwaOut, { recursive: true });
+  writeFileSync(join(pwaOut, 'index.html'), '<html>built</html>');
+  const withPwa = join(destination, 'elanous-with-pwa.tgz');
+  const archived = tarSync(['-czf', withPwa, '-C', tree, 'package']);
+  expect(archived.status, `tar archive: ${archived.stderr}`).toBe(0);
+  return withPwa;
+}
+
 describe('scripts/install.sh', () => {
   test('fake bun add refuses a wrong working directory before recording or installing the package', () => {
     const env = setup();
@@ -294,14 +333,15 @@ describe('scripts/install.sh', () => {
 
   test('fake bun add installs the exact tarball operand', () => {
     const env = setup();
-    const installDir = join(env.prefix, 'versions', 'selected');
+    mkdirSync(join(env.prefix, 'versions', 'selected'), { recursive: true });
+    const installDir = realpathSync(join(env.prefix, 'versions', 'selected'));
     const selected = packageFixture(fixture(), '1.2.3-selected');
     const decoy = packageFixture(fixture(), '9.8.7-decoy');
     mkdirSync(installDir, { recursive: true });
     const bunShim = fakeBunBin(env.dir, decoy, installDir);
     const command = [join(bunShim.bin, 'bun'), 'add', '--no-save', '--ignore-scripts', '--offline', selected].map(shellQuote).join(' ');
     const result = run([], env, process.env.PATH ?? '', installDir,
-      { ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_INSTALL_TEST_EXPECTED_CWD: installDir }, command).result;
+      { ELANOUS_INSTALL_PREFIX: realpathSync(env.prefix), ELANOUS_INSTALL_TEST_EXPECTED_CWD: installDir }, command).result;
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(readFileSync(join(installDir, 'node_modules', 'elanous', 'package.json'), 'utf8')).version)
       .toBe('1.2.3-selected');
@@ -374,13 +414,13 @@ exec /bin/bash "$@"
 
   test('release installer uses the first-run bootstrap command', () => {
     const packed = packReal(fixture());
-    const listing = spawnSync('tar', ['-tzf', packed], { encoding: 'utf8' });
-    expect(listing.status, listing.stderr).toBe(0);
+    const listing = tarSync(['-tzf', packed]);
+    expect(listing.status, `tar list: ${listing.stderr}`).toBe(0);
     expect(readFileSync(installer, 'utf8')).toContain('"$PREFIX/bin/elanous" bootstrap');
   }, 120_000);
 
-  test('package bin exposes elanous and eln through the same entrypoint, without mda', () => {
-    expect(packageJson.bin).toEqual({ elanous: './bin/elanous.cjs', eln: './bin/elanous.cjs' });
+  test('package bin exposes elanous, eln and els through the same entrypoint, without mda', () => {
+    expect(packageJson.bin).toEqual({ elanous: './bin/elanous.cjs', eln: './bin/elanous.cjs', els: './bin/elanous.cjs' });
   });
 
   test('--help names every supported argument', () => {
@@ -518,11 +558,15 @@ exec /usr/bin/stat "$@"
     const cache = hostBunCache;
     const tempAlongsideCache = join(cache, 'elanous-tmp');
     const path = `${fakeBin}:${hostPathWithoutEln()}`;
-    const installed = run(['--no-modify-path'], env, path, repoRoot, { TMPDIR: env.dir });
+    const installed = run(['--no-modify-path'], env, path, repoRoot, { TMPDIR: env.dir, ELANOUS_INSTALL_TEST_UNAME: process.platform === 'linux' ? 'Linux' : 'Darwin' });
     expect(installed.result.status, installed.result.stderr).toBe(0);
-    expect(installed.result.stderr).toContain('Adjusted installer temp directory to match the Bun cache filesystem.');
-    expect(existsSync(tempAlongsideCache)).toBe(true);
-    expect(installed.fakeBunEnvCalls).toContain(tempAlongsideCache);
+    if (process.platform === 'linux') {
+      expect(installed.result.stderr).toContain('Adjusted installer temp directory to match the Bun cache filesystem.');
+      expect(existsSync(tempAlongsideCache)).toBe(true);
+      expect(installed.fakeBunEnvCalls).toContain(tempAlongsideCache);
+    } else {
+      expect(installed.result.stderr).not.toContain('Adjusted installer temp directory to match the Bun cache filesystem.');
+    }
   }, 120_000);
 
   test('a non-interactive SSH bash command finds the installed binary after repeat install without changing other startup files', () => {
@@ -618,7 +662,7 @@ exec /usr/bin/stat "$@"
     expect(result.stderr).not.toContain('bun executable absolute path is unavailable');
     expect(result.status).toBe(0);
     const addCall = parsedFakeBunCalls(bunShim.calls).find((call) => call[1] === 'add');
-    expect(addCall?.[0]).toBe(join(env.prefix, 'versions', versionDir));
+    expect(addCall?.[0]).toBe(realpathSync(join(env.prefix, 'versions', versionDir)));
     expect(bunShim.fakeBins.calls().find((call) => call.name === 'bunAddContract')?.argv).toEqual(addCall?.slice(1));
     const current = readlinkSync(join(env.prefix, 'current'));
     expect(current.startsWith('versions/')).toBe(true);
@@ -757,7 +801,7 @@ exec /usr/bin/stat "$@"
   test('npm-pack installer succeeds without Git or native build tools, then non-interactive setup works', async () => {
     // Use the package that ships to users so `setup` exercises the installed CLI entry point,
     // not the fake CLI used by the installer-only fixture tests.
-    const packed = packReal(fixture());
+    const packed = packRealWithPwa(fixture());
     const env = setup();
     const missingTools = ['git', 'python', 'python3', 'make', 'g++', 'gcc', 'cc'];
     const path = pathWithoutCommands(missingTools);
@@ -778,14 +822,16 @@ exec /usr/bin/stat "$@"
       stateRoot: join(env.dir, 'setup-state'),
       configRoot: join(env.home, '.elanous'),
       injectTestFlag: false,
-      env: { HOME: env.home, PATH: path, NODE_ENV: 'test' },
+      env: { HOME: env.home, PATH: path, NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: '' },
     });
     expect(setupReport.exitCode, setupReport.stderr).toBe(0);
     expect(setupReport.stdout).toContain('Setup: external command check');
     expect(setupReport.stdout).toContain('Setup: LLM credential steps');
     expect(setupReport.stdout).toContain('Non-interactive: no questions were asked and no configuration was written.');
     expect(setupReport.stdout).toContain('External commands:');
+    // make·g++·gcc·cc are off this test PATH, so the toolchain probe must say manual, not ok.
     expect(setupReport.stdout).toContain('build-toolchain: manual');
+    expect(setupReport.stdout).not.toContain('build-toolchain: ok');
     expect(existsSync(join(env.home, '.elanous', 'config.json'))).toBe(false);
   }, 180_000);
 
@@ -1118,7 +1164,8 @@ exec /usr/bin/stat "$@"
   test('installed macOS CLI repairs missing prerequisites through isolated brew and re-probes them', () => {
     if (process.platform !== 'darwin') return; // Linux static-tool install and re-probe are covered by the injected production-path doctor CLI test.
     const env = setup();
-    const installed = run(['--no-modify-path', '--no-setup'], env);
+    const checkoutArchive = packRealWithPwa(fixture());
+    const installed = run(['--source', checkoutArchive, '--no-modify-path', '--no-setup'], env, undefined, undefined, { ELANOUS_INSTALL_TEST_REAL: '1' });
     expect(installed.result.status, installed.result.stderr).toBe(0);
     const mockBin = join(env.dir, 'doctor-mock-bin');
     mkdirSync(mockBin);
@@ -1129,20 +1176,26 @@ exec /usr/bin/stat "$@"
     const path = pathWithoutCommands(['gh', 'rg', 'codex'], `${mockBin}:/usr/bin:/bin`);
     expectCommandsMissing(['gh', 'rg', 'codex'], path);
     const entry = join(env.prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs');
+    expect(realpathSync(entry)).toBe(realpathSync(join(env.prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs')));
+    expect(readlinkSync(join(env.prefix, 'current'))).toMatch(/^versions\//);
+    expect(readFileSync(entry, 'utf8')).toContain('runCli');
     const doctorEnv = { HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_FAST_ROUTER: '0', NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: mockBin, PATH: path, TMPDIR: env.dir, LANG: 'C' };
-    const before = spawnSync('/usr/bin/env', ['-i', ...Object.entries(doctorEnv).map(([name, value]) => `${name}=${value}`), process.execPath, entry, 'doctor', '--json'], { cwd: repoRoot, encoding: 'utf8', timeout: 120_000 });
-    const beforeReport = JSON.parse(before.stdout) as { externalCommands: Array<{ name: string; status: string }> };
+    const before = spawnSync('/usr/bin/env', ['-i', ...Object.entries(doctorEnv).map(([name, value]) => `${name}=${value}`), process.execPath, entry, 'doctor', '--json'], { cwd: env.prefix, encoding: 'utf8', timeout: installedDoctorTimeoutMs });
+    expect(before.status, `stdout=${JSON.stringify(before.stdout)} stderr=${JSON.stringify(before.stderr)}`).toBe(0);
+    const beforeJson = before.stdout.slice(before.stdout.indexOf('{'));
+    const beforeReport = JSON.parse(beforeJson) as { externalCommands: Array<{ name: string; status: string }> };
     expect(beforeReport.externalCommands.filter((command) => ['gh', 'rg', 'codex'].includes(command.name)).map(({ name, status }) => ({ name, status }))).toEqual(['gh', 'rg', 'codex'].map((name) => ({ name, status: 'missing' })));
     const doctor = spawnSync('/usr/bin/env', ['-i', ...Object.entries(doctorEnv).map(([name, value]) => `${name}=${value}`), process.execPath, entry, 'doctor', '--fix', '--yes', '--setup-tools', '--json'], {
-      cwd: repoRoot, encoding: 'utf8', timeout: 120_000,
+      cwd: env.prefix, encoding: 'utf8', timeout: installedDoctorTimeoutMs,
     });
     expect(doctor.status, doctor.stderr).toBe(0);
+    expect(doctor.stdout.trimStart().startsWith('{'), doctor.stdout).toBe(true);
     const result = JSON.parse(doctor.stdout) as { report: { externalCommands: Array<{ name: string; status: string }> } };
     expect(['gh', 'rg', 'codex'].every((name) => result.report.externalCommands.find((command) => command.name === name)?.status === 'found')).toBe(true);
     expect(existsSync(record), `doctor did not invoke isolated brew: ${JSON.stringify(result.report.externalCommands)}`).toBe(true);
     expect(readFileSync(record, 'utf8').trim().split('\n')).toEqual(['install gh', 'install ripgrep', 'install --cask codex']);
     expect(existsSync(join(mockBin, 'gh')) && existsSync(join(mockBin, 'rg')) && existsSync(join(mockBin, 'codex'))).toBe(true);
-  }, 240_000);
+  }, installedDoctorTimeoutMs);
 
   test('nexus boot banner has no internal phase or PR markers and keeps exit and service help', () => {
     const source = readFileSync(join(repoRoot, 'src/nexus/index.ts'), 'utf8');
@@ -1325,8 +1378,11 @@ exec /usr/bin/stat "$@"
     const copied = join(lonely, 'install.sh');
     copyFileSync(installer, copied);
     const env = setup();
+    mkdirSync(env.prefix, { recursive: true });
+    env.prefix = realpathSync(env.prefix);
     const archive = packageFixture(fixture());
-    const installDir = join(env.prefix, 'versions', packageJson.version);
+    mkdirSync(join(env.prefix, 'versions', packageJson.version), { recursive: true });
+    const installDir = realpathSync(join(env.prefix, 'versions', packageJson.version));
     const bunShim = fakeBunBin(env.dir, archive, installDir);
     if (curlShim) writeFileSync(join(bunShim.bin, 'curl'), curlShim, { mode: 0o755 });
     if (sleepShim) writeFileSync(join(bunShim.bin, 'sleep'), sleepShim, { mode: 0o755 });
@@ -1589,6 +1645,55 @@ esac
     expect(existsSync(join(mismatch.prefix, 'current'))).toBe(false);
   }, 120_000);
 
+  test('a real package without apps/pwa/out/index.html is refused before current or install metadata changes', async () => {
+    const env = setup();
+    const packed = fixture();
+    const source = packReal(packed);
+    const strippedDir = fixture();
+    const extracted = join(strippedDir, 'tree');
+    mkdirSync(extracted);
+    const tar = (args: string[]) => {
+      const done = tarSync(args);
+      expect(done.status, `tar: ${done.stderr}`).toBe(0);
+    };
+    tar(['-xzf', source, '-C', extracted]);
+    const pwaOut = join(extracted, 'package', 'apps', 'pwa', 'out');
+    mkdirSync(pwaOut, { recursive: true });
+    writeFileSync(join(pwaOut, 'index.html'), '<html>built</html>');
+    const withPwa = join(strippedDir, 'kept', 'elanous.tgz');
+    mkdirSync(join(strippedDir, 'kept'));
+    tar(['-czf', withPwa, '-C', extracted, 'package']);
+    rmSync(pwaOut, { recursive: true, force: true });
+    const stripped = join(strippedDir, 'elanous.tgz');
+    tar(['-czf', stripped, '-C', extracted, 'package']);
+    const renamed = join(strippedDir, 'release-other-name.tgz');
+    tar(['-czf', renamed, '-C', extracted, 'package']);
+    const previous = join(env.prefix, 'versions', '0.0.1-previous');
+    mkdirSync(join(previous, 'node_modules'), { recursive: true });
+    mkdirSync(join(env.prefix, 'bin'), { recursive: true });
+    symlinkSync('versions/0.0.1-previous', join(env.prefix, 'current'));
+    writeFileSync(join(env.prefix, 'install.json'), '{"version":"0.0.1-previous","versionDir":"versions/0.0.1-previous"}\\n');
+    const result = run(['--no-modify-path', '--source', stripped], env, hostPathWithoutEln(), repoRoot, { ELANOUS_INSTALL_TEST_REAL: '1', ELANOUS_INSTALL_TEST_CUSTOM_BUN: '1' }).result;
+    expect(result.status).toBe(4);
+    expect(result.stderr).toContain('apps/pwa/out/index.html');
+    expect(readlinkSync(join(env.prefix, 'current'))).toBe('versions/0.0.1-previous');
+    expect(readFileSync(join(env.prefix, 'install.json'), 'utf8')).toContain('0.0.1-previous');
+    expect(readdirSync(join(env.prefix, 'versions')).sort()).toEqual(['0.0.1-previous']);
+    const renamedResult = run(['--no-modify-path', '--source', renamed], env, hostPathWithoutEln(), repoRoot, { ELANOUS_INSTALL_TEST_REAL: '1', ELANOUS_INSTALL_TEST_CUSTOM_BUN: '1' }).result;
+    expect(renamedResult.status).toBe(4);
+    expect(renamedResult.stderr).toContain('apps/pwa/out/index.html');
+    expect(readlinkSync(join(env.prefix, 'current'))).toBe('versions/0.0.1-previous');
+    const kept = run(['--no-modify-path', '--source', withPwa], env, hostPathWithoutEln(), repoRoot, { ELANOUS_INSTALL_TEST_REAL: '1' }).result;
+    expect(kept.status, kept.stderr).not.toBe(4);
+    expect(kept.stderr).not.toContain('PWA build missing in package');
+    const server = serveFile(stripped);
+    try {
+      const port = await server.port;
+      const urlResult = run(['--no-modify-path', '--source', `http://127.0.0.1:${port}/elanous.tgz`], env, hostPathWithoutEln(), repoRoot, { ELANOUS_INSTALL_TEST_REAL: '1', ELANOUS_INSTALL_TEST_CUSTOM_BUN: '1' }).result;
+      expect(urlResult.status).toBe(4);
+      expect(urlResult.stderr).toContain('apps/pwa/out/index.html');
+    } finally { server.stop(); }
+  }, 180_000);
   test('standalone installer rejects a checksum mismatch before creating current and reports both hashes', () => {
     const release = fixture();
     const assets = join(release, 'latest', 'download');
@@ -1778,7 +1883,10 @@ describe('INST2 — finish in the same window', () => {
       '    [ "$3" = "--ignore-scripts" ] || exit 64',
       '    [ "$4" = "--offline" ] && exit 1',
       '    package="$4"',
-      '    case "$PWD" in "$ELANOUS_INSTALL_PREFIX"/versions/*) ;; *) exit 65 ;; esac',
+      '    command -p mkdir -p "$PWD" || exit 65',
+      '    pwd_real=$(command -p realpath "$PWD") || exit 65',
+      '    prefix_real=$(command -p realpath "$ELANOUS_INSTALL_PREFIX") || exit 65',
+      '    case "$pwd_real" in "$prefix_real"/versions/*) ;; *) exit 65 ;; esac',
       '    [ -f "$package" ] || exit 66',
       '    mkdir -p "$PWD/node_modules" || exit 67',
       '    command -p rm -rf "$PWD/node_modules/package" "$PWD/node_modules/elanous"',
@@ -1851,4 +1959,97 @@ describe('INST1 — one language · no silent downgrade · ask before updating',
 
 bunTest('deterministic install smoke tests remain registered', () => {
   expect(INSTALL_DETERMINISTIC_SMOKE_TESTS.filter((name) => !registeredInstallTestNames.has(name))).toEqual([]);
+});
+
+// INSTALL-PWA-OUT-SYMLINK — bun pm pack stores a symlink and drops a gitignored
+// target. The checkout pack must follow apps/pwa/out into regular files.
+describe('INSTALL-PWA-OUT-SYMLINK', () => {
+  function stage(kind: 'directory' | 'symlink' | 'missing'): { root: string; archive: string } {
+    const root = mkdtempSync(join(tmpdir(), 'pwa-out-pack-'));
+    const archive = join(root, 'package.tgz');
+    mkdirSync(join(root, 'package/apps/pwa'), { recursive: true });
+    writeFileSync(join(root, 'package/package.json'), '{"name":"elanous","version":"0.0.0"}\n');
+    tarSync(['-czf', archive, '-C', root, 'package']);
+    const pwa = join(root, 'apps/pwa');
+    mkdirSync(pwa, { recursive: true });
+    if (kind === 'directory') {
+      mkdirSync(join(pwa, 'out'));
+      writeFileSync(join(pwa, 'out/index.html'), 'directory\n');
+    } else if (kind === 'symlink') {
+      const generation = join(pwa, '.pwa-generations/gen');
+      mkdirSync(generation, { recursive: true });
+      writeFileSync(join(generation, 'index.html'), 'symlink\n');
+      symlinkSync('.pwa-generations/gen', join(pwa, 'out'));
+    }
+    return { root, archive };
+  }
+  function listed(archive: string): string {
+    const out = tarSync(['-tzf', archive]).stdout;
+    return typeof out === 'string' ? out : '';
+  }
+  test('a real directory, a generation symlink, and a missing build', () => {
+    const real = stage('directory');
+    packPwaOutput(real.root, real.archive);
+    expect(listed(real.archive)).toContain('package/apps/pwa/out/index.html');
+    const link = stage('symlink');
+    packPwaOutput(link.root, link.archive);
+    const names = listed(link.archive);
+    expect(names).toContain('package/apps/pwa/out/index.html');
+    expect(names).not.toContain('.pwa-generations');
+    const gone = stage('missing');
+    expect(() => packPwaOutput(gone.root, gone.archive)).toThrow(/PWA build missing/);
+  });
+	  test('install.sh run outside the checkout still packs the symlinked PWA into the installed copy', () => {
+	    const env = setup();
+	    const outside = join(env.dir, 'outside');
+	    mkdirSync(outside);
+	    // A clean checkout has no PWA output (gitignored). Plant the symlink this
+	    // test names, then remove it so the checkout is unchanged.
+	    const pwa = join(repoRoot, 'apps/pwa');
+	    const outLink = join(pwa, 'out');
+	    const generation = join(pwa, '.pwa-generations/install-test-gen');
+	    const planted = !existsSync(outLink);
+	    if (planted) {
+	      mkdirSync(generation, { recursive: true });
+	      writeFileSync(join(generation, 'index.html'), '<!doctype html><title>planted</title>\\n');
+	      symlinkSync('.pwa-generations/install-test-gen', outLink);
+	    }
+	    try {
+	      const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', outside, { ELANOUS_INSTALL_TEST_REAL: '1' });
+	      expect(result.status, result.stderr).toBe(0);
+	      const versionDir = checkoutVersionName(process.env.PATH ?? '');
+	      const installed = join(env.prefix, 'versions', versionDir, 'node_modules', 'elanous', 'apps/pwa/out/index.html');
+	      expect(existsSync(installed), result.stderr).toBe(true);
+	      expect(readFileSync(installed, 'utf8')).toContain('<');
+	    } finally {
+	      if (planted) {
+	        rmSync(outLink, { force: true });
+	        rmSync(join(pwa, '.pwa-generations/install-test-gen'), { recursive: true, force: true });
+	      }
+	    }
+	  }, 180_000);
+	  test('install.sh run outside the checkout packs a real-directory PWA build into the installed copy', () => {
+	    const env = setup();
+	    const outside = join(env.dir, 'outside');
+	    mkdirSync(outside);
+	    // A release prebuild can leave apps/pwa/out as a plain directory. Set the
+	    // existing output aside, plant a directory, and restore it afterwards.
+	    const outDir = join(repoRoot, 'apps/pwa/out');
+	    const aside = join(repoRoot, 'apps/pwa/.out-install-test-aside');
+	    const had = readdirSync(join(repoRoot, 'apps/pwa')).includes('out');
+	    if (had) renameSync(outDir, aside);
+	    mkdirSync(outDir);
+	    writeFileSync(join(outDir, 'index.html'), '<!doctype html><title>real-dir</title>\n');
+	    try {
+	      const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', outside, { ELANOUS_INSTALL_TEST_REAL: '1' });
+	      expect(result.status, result.stderr).toBe(0);
+	      const versionDir = checkoutVersionName(process.env.PATH ?? '');
+	      const installed = join(env.prefix, 'versions', versionDir, 'node_modules', 'elanous', 'apps/pwa/out/index.html');
+	      expect(existsSync(installed), result.stderr).toBe(true);
+	      expect(readFileSync(installed, 'utf8')).toBe('<!doctype html><title>real-dir</title>\n');
+	    } finally {
+	      rmSync(outDir, { recursive: true, force: true });
+	      if (had) renameSync(aside, outDir);
+	    }
+	  }, 180_000);
 });

@@ -4,7 +4,7 @@ import { runNextTuiMissionBranchRoute, type MissionSlashContext, type MissionWat
 
 test('/mission is generated into help and attached through its lazy branch module', async () => {
   const help = buildNextTuiHelpLines(NEXT_TUI_INPUT_CONTEXT).join('\n');
-  expect(help).toContain('/mission — 미션 목록·진행·브리핑');
+  expect(help).toContain('/mission — Mission list, progress, briefing');
   const route = resolveNextTuiRoute('/mission trace run-1', NEXT_TUI_INPUT_CONTEXT);
   expect(route?.branchHost).toBe('mission');
   expect(route?.branchModule).toBe('./slash/mission.js');
@@ -42,5 +42,5 @@ test('/mission branch forwards approve and its run watcher polls trace state', a
   expect(runPoll).toBeDefined();
   const snapshot = await runPoll!();
   expect(calls[1]).toMatchObject({ action: 'trace', id: 'apm_test' });
-  expect(snapshot).toMatchObject({ message: '미션 apm_test: running · 파생 1 · ✅0 ⏰0 ❌0 🔵1 ⏳0', outcome: 'pending' });
+  expect(snapshot).toMatchObject({ message: 'Mission apm_test: running · derived 1 · ✅0 ⏰0 ❌0 🔵1 ⏳0', outcome: 'pending' });
 });

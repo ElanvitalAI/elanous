@@ -10,6 +10,7 @@
 //   httpPort · httpHost · httpAuth     ← PR δ
 //   tailnetUrl · tailnetRecordedAt     ← daemon-owned Tailscale Serve result
 //   template                           ← PR β when --template
+//   sourceHead                         ← RAIL-STALE-TUI-HEAD (pinned code head)
 //
 // `tailnetUrl` records the URL returned while this daemon mounted Tailscale
 // Serve. The mount may later be removed independently, so consumers must not
@@ -38,6 +39,9 @@ export interface NexusRuntimeMeta {
   tailnetRecordedAt?: string;
   /** Template name when launched via `--template <name>` (PR β / N-3). */
   template?: string;
+  /** Code head (40 hex) this nexus pinned at start — the app-build bridge refuses other heads
+   *  (RAIL-STALE-TUI-HEAD). A TUI compares it to its own pinned head to show «재기동 필요». */
+  sourceHead?: string;
 }
 
 export function writeNexusRuntime(meta: NexusRuntimeMeta): void {

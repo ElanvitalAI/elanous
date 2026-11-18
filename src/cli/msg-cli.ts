@@ -1,13 +1,18 @@
 import type { Command } from 'commander';
+import { Database } from 'bun:sqlite';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
-import { mkdirSync } from 'node:fs';
+import { registerMsgWaitForCommands } from './msg-wait-for-cli.js';
+import { registerMsgReceiptsCommands } from './msg-receipts-cli.js';
+import { existsSync, mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { canonicalMessageAddress, canonicalSeatId, defaultMsgStorePath, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
+import { canonicalMessageAddress, canonicalSeatId, defaultMsgStorePath, openMsgStore, openMsgStoreReadOnly, type Message, type MessageEnvelope, type MsgStore } from '../msg/msg-store.js';
 import { buildMsgHookOutput, seatFromCwd, type MsgHookEvent, type MsgHookFormat } from '../msg/msg-hook.js';
-import { clearPostOffice, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
+import { SEAT_AGENT_RUNTIMES, type SeatAgentRuntime } from '../loops/seat-registry.js';
+import { MAIL_FALLBACK_MS, runMailFallback, spawnMailFallback } from '../msg/msg-mail-fallback.js';
+import { clearPostOffice, discoverPostOfficeUrl, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { GitHubMsgMirrorTransport } from '../msg/msg-mirror-github.js';
 import { configuredMirrorTarget, runMsgMirrorTick, type MirrorTarget, type MsgMirrorStateStore, type MsgMirrorTransport } from '../msg/msg-mirror-runner.js';
@@ -16,16 +21,26 @@ import { startMsgSseServer } from '../msg/msg-sse-server.js';
 import { debug } from '../debug/log.js';
 import type { AgentReplyAddress, AgentReplyInput, AgentReplyResult } from '../loops/agent-reply.js';
 import { noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
-import { messageReplyBodyFor, registerSeatPaneAddress, resolveWake, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
+import { messageReplyBodyFor, registerSeatPaneAddress, registrySnapshot, resolveWake, seatDeliveryView, isLiveWakeUniverse, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
 import { getUserConfig } from '../user-config/reader.js';
 import type { RoleLlmSpec } from '../user-config/types.js';
 import { postReleaseOpCommand, postReleaseOpQuestion } from '../release-loop/op-channel.js';
+
+/** Where the directive index lives. Local on purpose: `src/directives/directive-index` is not part of the public export, and
+ *  this file is — importing it only for a path broke the public build («Cannot find module»). Same path it computes. */
+const directiveDbPath = (): string => join(elanousStateRoot(), 'directives', 'directives.db');
 
 /** The loop rows whose reply body is an LLM agent: `--agent-reply` picks one of these. */
 const AGENT_REPLY_ROLES = { COORDINATOR: 'coordinator', GUARDIAN: 'guardian' } as const;
 
 export interface MsgCliDeps {
+  /** 60s eln-mail safety net launcher (default: detached `eln msg mail-fallback` in the live universe only). */
+  spawnMailFallback?: (input: { messageId: number; recipient: string; from: string }) => void;
+  /** `mail-fallback` sleep seam. */
+  fallbackSleep?: (ms: number) => Promise<void>;
   openStore?: () => MsgStore;
+  /** Clock for relative/clock-time `--deadline` (A217). */
+  now?: () => Date;
   openReadStore?: () => MsgStore;
   out?: Pick<Console, 'log' | 'error'>;
   readStdin?: () => Promise<string>;
@@ -43,7 +58,7 @@ export interface MsgCliDeps {
   /** Attach the logs.db sink so `msg.wake` reaches `elanous logs` (a short CLI otherwise writes only the file trail). */
   registerLogSink?: () => Promise<unknown>;
   /** Wake the recipient after a durable post; never changes the post outcome. */
-  wake?: (address: string, msgId: number, message: { from: string; kind?: string }, deps: WakeDeps) => Promise<WakeOutcome>;
+  wake?: (address: string, msgId: number, message: { from: string; kind?: string; fallback?: boolean }, deps: WakeDeps) => Promise<WakeOutcome>;
   /**
    * Agent auto-reply producer (`--agent-reply`). The default resolves the selected role LLM, loads its pack,
    * and calls the real `replyWithAgent`; the seams exist so a test still traverses that producer.
@@ -87,6 +102,33 @@ function messageRecipient(raw: string | undefined, flag: string): string {
   return address;
 }
 
+const PRIORITY_LEVELS: Record<string, number> = { urgent: 2, p0: 1, normal: 0 };
+
+function cliPriorityLevel(raw: string | undefined, flag: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const level = PRIORITY_LEVELS[raw.trim().toLowerCase()];
+  if (level === undefined) throw new Error(`${flag} must be one of: urgent(2), p0(1), normal(0)`);
+  return level;
+}
+
+/**
+ * mf2 §1: `--crown-directive <id>` names the crown directive this message executes. The id must
+ * resolve against the directive ledger (directives.db rowid); a missing ledger or unknown id is a
+ * human-readable rejection — the post must not silently drop the delegation link.
+ */
+function requireCrownDirective(crownDirective: string | undefined): void {
+  if (crownDirective === undefined) return;
+  const dbPath = directiveDbPath();
+  if (!existsSync(dbPath)) throw new Error(`--crown-directive: 지시 원장을 찾을 수 없습니다 (${dbPath}) — 먼저 elanous directives sync 실행`);
+  const id = Number(crownDirective);
+  if (!Number.isSafeInteger(id) || id < 1) throw new Error(`--crown-directive: 올바른 지시 ID가 아닙니다: ${crownDirective}`);
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const hit = db.query('SELECT 1 FROM directives WHERE rowid = ? LIMIT 1').get(id);
+    if (hit === null || hit === undefined) throw new Error(`--crown-directive: 존재하지 않는 지시 ID입니다: ${crownDirective} — elanous directives search 로 ID를 확인하세요`);
+  } finally { db.close(); }
+}
+
 function integer(raw: string | undefined, flag: string, fallback: number, min: number, max: number): number {
   if (raw === undefined) return fallback;
   if (!/^(0|[1-9]\d*)$/.test(raw)) throw new Error(`${flag} must be an integer between ${min} and ${max}`);
@@ -121,6 +163,35 @@ function postBodyWarnings(body: string): string[] {
   if (hasEmptyAssignment(body))
     warnings.push('빈 값 패턴: 셸 명령 치환 결과를 확인하세요');
   return warnings;
+}
+
+/**
+ * A217 due. New shorthands: local «HH:MM» (today, or tomorrow when already past) and «+<n>m» / «+<n>h» → ISO.
+ * Everything the old `--deadline` accepted (`Date.parse` · e.g. a date-only value) is kept as written, so existing
+ * callers are unchanged (#38198 REVIEW-2 ④). Only an unparsable value is refused.
+ */
+export function parseDue(raw: string, now: Date): string {
+  const value = raw.trim();
+  const relative = /^\+(\d{1,4})([mh])$/u.exec(value);
+  if (relative) return new Date(now.getTime() + Number(relative[1]) * (relative[2] === 'h' ? 3_600_000 : 60_000)).toISOString();
+  const clock = /^([01]?\d|2[0-3]):([0-5]\d)$/u.exec(value);
+  if (clock) {
+    const at = new Date(now);
+    at.setHours(Number(clock[1]), Number(clock[2]), 0, 0);
+    if (at.getTime() <= now.getTime()) at.setDate(at.getDate() + 1);
+    return at.toISOString();
+  }
+  if (value && Number.isFinite(Date.parse(raw))) return raw;
+  throw new Error(`--deadline must be a date/time Date.parse accepts, HH:MM or +<n>m|h (${raw})`);
+}
+
+/** §8 — a hand ack is a «seen» receipt (never accepted or more). Fail-open, but observed like every receipt writer. */
+function recordHandSeen(store: MsgStore, to: string, id: number): void {
+  try { store.recordReceipt({ messageId: id, recipient: to, state: 'seen', source: 'cli-ack' }); }
+  catch (error) {
+    try { debug.log('msg.receipt-writer', 'record-failed', { msgId: id, recipient: to, state: 'seen', source: 'cli-ack', error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+    catch { /* observability is fail-open */ }
+  }
 }
 
 /** Register the durable, recipient-addressed CLI. Reading never advances the acknowledgement cursor. */
@@ -347,15 +418,39 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       out.error(`msg: post office 재시작 (port ${result.port}) — 원장이 정본이라 저장된 글은 다시 밀린다`);
   };
 
+  msg.command('mail-fallback').description('(internal) 60s safety net for an eln seat: one «check your mail» knock when nothing was received')
+    .requiredOption('--msg <id>').requiredOption('--to <seat>').requiredOption('--from <seat>')
+    .option('--wait-ms <ms>', 'wait before checking', String(MAIL_FALLBACK_MS))
+    .action((opts: { msg: string; to: string; from: string; waitMs: string }) => run(async () => {
+      const result = await runMailFallback({ messageId: integer(opts.msg, '--msg', 0, 1, Number.MAX_SAFE_INTEGER), recipient: canonicalSeatId(opts.to), from: canonicalSeatId(opts.from) }, {
+        openStore: open, waitMs: integer(opts.waitMs, '--wait-ms', MAIL_FALLBACK_MS, 0, 3_600_000),
+        ...(deps.fallbackSleep ? { sleep: deps.fallbackSleep } : {}),
+        wake: (address, msgId, message) => (deps.wake ?? wakeRecipient)(address, msgId, message, deps.wakeDeps ?? {}),
+      });
+      out.log(result);
+    })());
+
   msg.command('post [body]').description('Post a message; use --body-file <path>, - or omit body to read stdin')
     .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>')
     .option('--body-file <path>', 'read the message body from a UTF-8 file; use - for stdin')
     .option('--reject-undeclared', 'reject a recipient that has no routable seat or pane instead of storing it with a warning')
     .option('--reply-to <id>', 'point this reply at a question message ID')
     .option('--agent-reply <address>', 'let this address\'s agent body (COORDINATOR · GUARDIAN) answer the saved message once')
-    .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>').option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean }) => run(async () => {
+    .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>')
+    .option('--intent <kind>', 'message intent: request | decision | info | alert')
+    .option('--ref <id>', 'message reference ID (repeatable)', (value: string, previous: string[]) => previous.concat([value]), [] as string[])
+    .option('--deadline <due>', 'deadline: ISO-8601 · local HH:MM (next occurrence) · +<n>m|h from now')
+    .option('--done <condition>', 'completion condition (A217 request contract · required with --intent request)')
+    .option('--needs-ack', 'mark the message as acknowledgement-required')
+    .option('--crown-directive <id>', 'crown directive ID this message executes')
+    .option('--priority <level>', 'priority: urgent(2) | p0(1) | normal(0)')
+    .option('--json')
+    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean; intent?: string; ref?: string[]; deadline?: string; done?: string; needsAck?: boolean; crownDirective?: string; priority?: string }) => run(async () => {
       const from = seat(opts.from, '--from');
+      // A217 — a request names when it is due and what «done» means, before anything is stored or woken.
+      if (opts.intent === 'request' && (opts.deadline === undefined || !opts.done?.trim()))
+        throw new Error('--intent request needs --deadline <due> and --done <condition> (A217 request contract)');
+      const deadlineAt = opts.deadline === undefined ? undefined : parseDue(opts.deadline, (deps.now ?? (() => new Date()))());
       const unsupported = opts.to === undefined ? null : unsupportedLoopAddressNotice(opts.to);
       if (unsupported) out.error(unsupported);
       if (opts.to === undefined) throw new Error('--to is required');
@@ -380,9 +475,18 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         : opts.bodyFile === '-' ? await readStdin() : await readFile(opts.bodyFile, 'utf8');
       for (const warning of postBodyWarnings(text))
         out.error(`msg post 경고: ${warning} — 본문을 확인하고 다음 보고는 --body-file 또는 stdin 사용`);
+      requireCrownDirective(opts.crownDirective);
+      const priority = cliPriorityLevel(opts.priority, '--priority');
       const envelope = { from, to, body: text,
         ...(opts.kind === undefined ? {} : { kind: opts.kind }),
-        ...(opts.replyTo === undefined ? {} : { replyTo: integer(opts.replyTo, '--reply-to', 0, 1, Number.MAX_SAFE_INTEGER) }) };
+        ...(opts.replyTo === undefined ? {} : { replyTo: integer(opts.replyTo, '--reply-to', 0, 1, Number.MAX_SAFE_INTEGER) }),
+        ...(priority === undefined ? {} : { priority }),
+        ...(opts.intent === undefined ? {} : { intent: opts.intent as MessageEnvelope['intent'] }),
+        ...(opts.ref === undefined || opts.ref.length === 0 ? {} : { refs: opts.ref }),
+        ...(deadlineAt === undefined ? {} : { deadlineAt }),
+        ...(opts.done === undefined ? {} : { doneWhen: opts.done }),
+        ...(opts.needsAck ? { needsAck: true } : {}),
+        ...(opts.crownDirective === undefined ? {} : { crownDirective: opts.crownDirective }) };
       const posted = withStore(store => opts.originKey === undefined
         ? store.post(envelope)
         : store.appendWithProvenance(envelope, opts.originKey));
@@ -405,8 +509,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       // 재시작도 관측도 post 의 성패를 바꾸지 않는다.
       try { await supervisePostOffice(); } catch { /* post office is fail-open */ }
       try {
-        await (deps.wake ?? wakeRecipient)(to, posted.id, { from, ...(opts.kind === undefined ? {} : { kind: opts.kind }) },
+        const woke = await (deps.wake ?? wakeRecipient)(to, posted.id, { from, ...(opts.kind === undefined ? {} : { kind: opts.kind }) },
           { ...deps.wakeDeps, warn: noBody ? () => {} : line => out.error(line) });
+        // OP 11-17 21:5x — an eln seat receives through its own mail watch; only if nothing is received in 60s, one knock.
+        if (woke?.result === 'eln-mail-watch') {
+          try {
+            (deps.spawnMailFallback ?? ((input) => { if (isLiveWakeUniverse(deps.wakeDeps)) spawnMailFallback(input); }))({ messageId: posted.id, recipient: to, from });
+          } catch { /* the safety net never fails a post */ }
+        }
       } catch { /* the wake outcome is logged by wakeRecipient; the post is already durable */ }
       if (agentAddress !== null) await autoReply(agentAddress, posted, opts.json);
     })());
@@ -415,10 +525,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--json')
     .action((address: string, opts: CommonOptions) => run(() => {
       const to = canonicalMessageAddress(address);
-      const wake = resolveWake(to, deps.wakeDeps);
-      const row = { msgAddress: to, replyBody: messageReplyBodyFor(to, deps.wakeDeps), ...wake };
+      const snapshot = registrySnapshot(deps.wakeDeps ?? {});
+      const shared = { ...deps.wakeDeps, registrySnapshot: snapshot };
+      const wake = resolveWake(to, shared);
+      const delivery = seatDeliveryView(to, shared, snapshot);
+      const row = { msgAddress: to, replyBody: messageReplyBodyFor(to, shared), ...wake, ...delivery };
       emit(row, opts.json, () => out.log(`${to}\treplyBody=${row.replyBody ?? '모름'}\twake=${wake.wake}`
         + `${wake.host ? `\thost=${wake.host}` : ''}${wake.target ? `\ttarget=${wake.target}` : ''}${wake.optIn === undefined ? '' : `\toptIn=${wake.optIn ? 'yes' : 'no(주입 0)'}`}`
+        + `${delivery.runtime ? `\truntime=${delivery.runtime}` : ''}${delivery.delivery ? `\tdelivery=${delivery.delivery}` : ''}${delivery.session ? `\tsession=${delivery.session}` : ''}`
         + `\t(${wake.source}${wake.reason ? `: ${wake.reason}` : ''})`));
     })());
 
@@ -428,11 +542,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .requiredOption('--host <host>', 'local or remote SSH alias')
     .option('--wake', 'allow this registered seat to receive message wake prompts')
     .option('--replace', 'replace an existing pane address')
+    .option('--runtime <body>', 'agent body in the pane: eln | claude-code | codex (eln ⊕ autowake = no typing, 60s fallback only)')
     .option('--json')
-    .action((rawSeat: string, opts: { herdrPane: string; host: string; wake?: boolean; replace?: boolean; json?: boolean }) => run(() => {
+    .action((rawSeat: string, opts: { herdrPane: string; host: string; wake?: boolean; replace?: boolean; runtime?: string; json?: boolean }) => run(() => {
+      if (opts.runtime !== undefined && !SEAT_AGENT_RUNTIMES.includes(opts.runtime as SeatAgentRuntime)) throw new Error('--runtime must be eln, claude-code or codex');
       const result = registerSeatPaneAddress({
         address: canonicalSeatId(rawSeat), paneId: opts.herdrPane, host: opts.host,
         ...(opts.wake ? { enableWake: true } : {}), ...(opts.replace ? { replace: true } : {}),
+        ...(opts.runtime === undefined ? {} : { runtime: opts.runtime as SeatAgentRuntime }),
       }, deps.wakeDeps);
       emit(result, opts.json, () => out.log(`${result.address}\t${result.host}:${result.paneId}\t${result.changed ? 'registered' : 'unchanged'}\twake=${result.wakeEnabled ? 'on' : 'off'}`));
     })());
@@ -479,6 +596,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     })());
 
   registerMsgListCommand(msg, { openStore: open, cacheReads: deps.openStore === undefined, out, setExitCode });
+  // ELN-SELF-TIMER-WATCH(I3) — 원장 항목에 묶인 셀프 깨우개: wait-for · wait-tick · wait-list.
+  registerMsgWaitForCommands(msg, { out, setExitCode });
+  // SEAT-INBOX B1-C — 영수증 읽기·구독(receipts --follow = 우체국 SSE) ⊕ 명시 영수증(receipt).
+  registerMsgReceiptsCommands(msg, { openStore: open, out, setExitCode, ...(deps.now === undefined ? {} : { now: deps.now }),
+    ...(deps.signal === undefined ? {} : { signal: deps.signal, handleSignals: false }),
+    ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
+    ...(deps.authToken === undefined ? {} : { authToken: deps.authToken }),
+    discoverUrl: () => discoverPostOfficeUrl(officeRoot()) });
 
   msg.command('hook').description('Emit turn-boundary inbox context for Claude or Codex hooks')
     .requiredOption('--event <event>')
@@ -510,12 +635,31 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       if (Number(Boolean(opts.id)) + Number(Boolean(opts.through)) + Number(Boolean(positional)) !== 1) throw new Error('choose exactly one of positional ID, --id, or --through');
       if (opts.id !== undefined) {
         const id = integer(opts.id, '--id', 1, 1, Number.MAX_SAFE_INTEGER);
-        withStore(store => store.ackMessage(to, id));
+        withStore(store => {
+          store.ackMessage(to, id);
+          // §8 — 손 ack 는 영수증 seen 으로 남는다(accepted 이상은 만들지 않는다). 영수증 실패는 ack 를 바꾸지 않는다.
+          recordHandSeen(store, to, id);
+        });
         emit({ recipient: to, id, status: 'acked' }, opts.json, () => out.log(`${to} acknowledged #${id}`));
         return;
       }
       const through = integer(opts.through ?? positional, opts.through === undefined ? 'message ID' : '--through', 0, 0, Number.MAX_SAFE_INTEGER);
-      const acknowledged = withStore(store => store.ack(to, through));
+      const acknowledged = withStore(store => store.db.transaction(() => {
+        // MSG-RECEIPTS-FOLLOWUP ① (#84659 A①): the positional and --through hand acks leave «seen» like --id does — for the
+        // messages this ack actually moves past (unacknowledged · after the cursor · ≤ through). One transaction, so a message
+        // landing between the list and the ack cannot slip past unmarked (#38305 REVIEW ②).
+        const HAND_ACK_SEEN_MAX = 1000; // Source: #38305 REVIEW ③ — the same bound as listByRecipient's page
+        const page = store.listByRecipient(to, store.getCursor(to), HAND_ACK_SEEN_MAX);
+        const passing = page.filter(message => message.id <= through).map(message => message.id);
+        if (page.length === HAND_ACK_SEEN_MAX && page.every(message => message.id <= through)) {
+          // More than one page is being acknowledged: the cursor moves past all of them, «seen» covers the first page only.
+          try { debug.log('msg.receipt-writer', 'hand-ack-seen-truncated', { recipient: to, through, marked: passing.length }, { level: 'warn' }); }
+          catch { /* observability is fail-open */ }
+        }
+        const moved = store.ack(to, through);
+        for (const id of passing) recordHandSeen(store, to, id);
+        return moved;
+      }).immediate());
       emit(opts.through === undefined ? { recipient: to, cursor: acknowledged } : { recipient: to, through: acknowledged }, opts.json, () => out.log(`${to} acknowledged through #${acknowledged}`));
     })());
 

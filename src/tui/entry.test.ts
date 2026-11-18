@@ -50,6 +50,7 @@ import { resolveLlmTier } from '../model-tier/tier-resolver.js';
 import { NEXT_TUI_ROUTE_REGISTRY, type NextTuiRoute } from './core/registry.js';
 import type { NextSidetabHandler } from './sidetab/nl-tool.js';
 import type { MessageBlock } from '../conv-substrate/message-block.js';
+import { TOOL_DONE_GLYPH, TOOL_RUNNING_GLYPH } from './chat/tool-activity.js';
 
 // mock.module 복구용 원본 스냅샷 — 정적 import 가 먼저 실행되므로 mock 치환 전 실물이 담긴다.
 const restoreTui = { ...tuiOriginal };
@@ -172,7 +173,12 @@ mock.module('../tui.js', () => ({
   closeTui: () => {},
   setTuiAltScreen: () => {},
   setTuiMouseCapture: () => {},
-  injectKey: () => {},
+  // Real injectKey returns false unless a readKey is waiting. A true with nobody listening opens a turn the loop never takes.
+  injectKey: (key: Key) => { if (!pendingReadKeyResolver && keys.length === 0) return false; enqueueReadKey(key); return true; },
+  // Real pendingKeyCount is the unread queue only. A blocked readKey is not an unread key.
+  pendingKeyCount: () => keys.length,
+  // The real clock stamps a human key; the door's quiet window then blocks the follow-up this file opens.
+  lastHumanKeyAt: () => 0,
   readKey: () => {
     const key = keys.shift();
     // 실물 readKey 처럼 키가 오기 전까지는 기다린다(빈 대기열이면 영원히 — 시간초과가 잡는다).
@@ -190,6 +196,7 @@ mock.module('../tui.js', () => ({
     return Promise.resolve(key);
   },
 }));
+
 
 mock.module('../tui-client/local-chat-turn.js', () => ({
   setNextSidetabHandler: (handler: NextSidetabHandler | null) => { nextSidetabHandler = handler; },
@@ -826,7 +833,7 @@ test('compact Next TUI projects shell and tool activity without internal names',
     expect(screen).not.toContain('PRIVATE-tool-diagnostic');
     expect(screen).not.toContain('PRIVATE-agent-command');
     expect(screen).not.toContain('실행 중인 도구');
-    expect(screen).toContain('활동 · 도구 ·');
+    expect(screen).toContain(`${TOOL_DONE_GLYPH} Tool`);
   } finally {
     process.stdout.write = output;
   }
@@ -850,7 +857,8 @@ test('resumed Next TUI basic chat hides saved tool output and interim prose', as
     const screen = transcript.join('');
     expect(screen).toContain('안전한 최종 답');
     expect(screen).toContain('    안전한 최종 답');
-    expect(screen).toContain('      탭 들여쓰기');
+    // Replies carry no speaker label or continuation prefix any more, so a tab-indented row sits 2 columns left.
+    expect(screen).toContain('    탭 들여쓰기');
     expect(screen).toContain('    return 42;');
     expect(screen).not.toContain('stdout SECRET');
     expect(screen).not.toContain('Bash SECRET');
@@ -1100,6 +1108,32 @@ test('an empty execution-side shell snapshot preserves immediate Esc cancellatio
   }
 });
 
+test('ELN-TURN-END-STALL: a turn that goes silent with nothing running is stopped like Esc, with a status', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  // The «provider» never answers and never ends; only the stall watchdog can end this turn.
+  duringTurnHook = (signal) => new Promise<void>((resolve) => signal.addEventListener('abort', () => {
+    enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+    resolve();
+  }, { once: true }));
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  submittedInputs.push('this turn will go silent');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', turnStallLimitMs: 1 });
+    const stalledTurn = turnAbortSignals.at(-1);
+    expect(stalledTurn?.aborted).toBe(true);
+    expect(transcript.join('')).toContain('No output for');
+    expect(transcript.join('')).toContain('turn stopped');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
 test('empty Enter keeps the queued turn while a non-shell tool is running', async () => {
   Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
@@ -1257,8 +1291,8 @@ test('late AgentOutput changes the settled child group from running to completed
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const finalFrame = transcript.at(-1) ?? '';
-    expect(finalFrame).toContain('완료 1');
-    expect(finalFrame).not.toContain('실행 중 1');
+    expect(finalFrame).toContain('done 1');
+    expect(finalFrame).not.toContain('running 1');
   } finally {
     process.stdout.write = output;
   }
@@ -1304,7 +1338,7 @@ test('basic chat hides child-agent traces and MessageBlock output', async () => 
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const frame = transcript.at(-1) ?? '';
-    expect(frame).not.toContain('하위 에이전트');
+    expect(frame).not.toContain('sub-agents');
     expect(frame).not.toContain('Agent(child');
     expect(frame).not.toContain('child answer one');
     expect(frame).not.toContain('internal poll');
@@ -1332,7 +1366,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       );
       submittedInputs.push('/help');
       await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-      expect(transcript.join('')).toContain('/side · /sidetab — 세션/PTY 목록 · /side new · /side kill');
+      expect(transcript.join('')).toContain('/side · /sidetab — Session/PTY list · /side new · /side kill');
       expect(turnsSeen).toEqual([]);
 
       transcript.length = 0;
@@ -1857,7 +1891,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       const rendered = transcript.join('');
       expect(rendered).toContain('/term help');
       expect(rendered).toContain('pty_12345678'.slice(-8));
-      expect(rendered).toContain('1 live · 1 exited');
+      expect(rendered).toContain('live 1 · exited 1');
       expect(rendered).toContain('pty_87654321');
       expect(rendered).toContain('unknown');
       expect(rendered).toContain('Unsupported /term command in Next TUI: spawn');
@@ -1992,18 +2026,18 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       await showNextTui({ resumeSessionId: createSession().id });
       expect(transcript.join('')).toContain('Commands');
       expect(transcript.join('')).toContain('Keys');
-      expect(transcript.join('')).toContain('/signals — 신호 확인');
-      expect(transcript.join('')).toContain('/help · /help next — 명령과 키 안내');
-      expect(transcript.join('')).toContain('/new · /clear · /session new — 새 대화');
-      expect(transcript.join('')).toContain('/model · /provider — fast|normal|deep · /provider 별칭');
+      expect(transcript.join('')).toContain('/signals — Check signals');
+      expect(transcript.join('')).toContain('/help · /help next — Command and key guide');
+      expect(transcript.join('')).toContain('/new · /clear · /session new — New chat');
+      expect(transcript.join('')).toContain('/model · /provider — fast|normal|deep · /provider alias');
       expect(transcript.join('')).toContain('/side new · /side kill');
-      expect(transcript.join('')).toContain('/term help는 읽기 전용');
+      expect(transcript.join('')).toContain('/term help is read-only');
       expect(transcript.join('')).toContain('/newly-added — 새 경로');
       expect(transcript.join('')).toContain('PgUp/PgDn');
       expect(transcript.join('')).toContain("Ctrl+Q quit");
-      expect(transcript.join('')).toContain('빈 입력 Enter=attach');
-      expect(transcript.join('')).toContain('새 PTY: s shell · e elanous · c codex 구독 · l claude code 구독');
-      expect(transcript.join('')).toContain('PTY 분리: Ctrl+\\ 후 d');
+      expect(transcript.join('')).toContain('Enter on empty input=attach');
+      expect(transcript.join('')).toContain('New PTY: s shell · e elanous · c codex subscribe · l claude code subscribe');
+      expect(transcript.join('')).toContain('PTY detach: Ctrl+\\ then d');
     } finally {
       mutableRegistry.pop();
       process.stdout.write = output;
@@ -2248,12 +2282,12 @@ describe('src/tui/entry.ts — /signals 관측(읽기 전용) 슬래시', () => 
       const rendered = transcript.join('');
       expect(rendered).toContain('❯ /signals help');
       expect(rendered).toContain('usage: /signals [help|status|latest|list [kind]]');
-      expect(rendered).toContain('신호 총 2건 · 종류 2종');
+      expect(rendered).toContain('2 signals total · 2 kinds');
       expect(rendered).toContain('provider-credential ×1');
       expect(rendered).toContain('user-input-failure ×1');
       expect(rendered).toContain('❯ /signals latest');
       expect(rendered).toContain('[normal] provider-credential · 22:13:21 · session seed-a');
-      expect(rendered).toContain('❯ /signals list (2건)');
+      expect(rendered).toContain('❯ /signals list (2)');
       expect(rendered).toContain('[normal] user-input-failure · 22:13:20');
     } finally {
       restore();
@@ -2269,7 +2303,7 @@ describe('src/tui/entry.ts — /signals 관측(읽기 전용) 슬래시', () => 
     try {
       await showNextTui({ resumeSessionId: createSession().id });
       const rendered = transcript.join('');
-      expect(rendered).toContain('❯ /signals list user-input-failure (1건)');
+      expect(rendered).toContain('❯ /signals list user-input-failure (1)');
       expect(rendered).toContain('[normal] user-input-failure · 22:13:20');
       expect(rendered).not.toContain('provider-credential');
     } finally {
@@ -2283,9 +2317,9 @@ describe('src/tui/entry.ts — /signals 관측(읽기 전용) 슬래시', () => 
     try {
       await showNextTui({ resumeSessionId: createSession().id });
       const rendered = transcript.join('');
-      expect(rendered).toContain('관측된 신호 없음 (총 0건)');
-      expect(rendered).toContain('최신 신호 없음');
-      expect(rendered).toContain('❯ /signals list (0건)');
+      expect(rendered).toContain('No signals observed (0 total)');
+      expect(rendered).toContain('No latest signal');
+      expect(rendered).toContain('❯ /signals list (0)');
     } finally {
       restore();
     }
@@ -2299,9 +2333,9 @@ describe('src/tui/entry.ts — /signals 관측(읽기 전용) 슬래시', () => 
     try {
       await showNextTui({ resumeSessionId: createSession().id });
       const rendered = transcript.join('');
-      expect(rendered).toContain('out of scope — /signals는 관측 전용입니다');
+      expect(rendered).toContain('out of scope — /signals is observation only');
       expect(rendered).toContain('unknown subcommand: bogus');
-      expect(rendered).toContain('❯ /signals list (1건)'); // clear·emit 시도 뒤에도 관측 기록은 불변
+      expect(rendered).toContain('❯ /signals list (1)'); // clear·emit 시도 뒤에도 관측 기록은 불변
       expect(rendered).toContain('[normal] user-input-failure · 22:13:20');
     } finally {
       restore();
@@ -2355,13 +2389,159 @@ test('basic Next TUI renders Write target activity while the answer is still pen
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', compactHeight: 18 });
-    expect(runningFrame).toContain('Write · ticketing.html · 실행 중');
-    expect(finishedFrame).toContain('Write · ticketing.html · 완료');
-    expect(runningFrame).toContain('read_file · architecture.md');
-    expect(runningFrame).toContain('Bash · bun run build');
+    expect(runningFrame).toContain('Write(ticketing.html)');
+    expect(runningFrame).toContain(`${TOOL_RUNNING_GLYPH} Write(ticketing.html)`);
+    expect(finishedFrame).toContain(`${TOOL_DONE_GLYPH} Write(ticketing.html)`);
+    expect(runningFrame).toContain('read_file(architecture.md)');
+    expect(runningFrame).toContain('Bash(bun run build)');
     expect(runningFrame).toContain('app.publish@1');
-    expect(transcript.join('')).toContain('Write · ticketing.html · 완료');
+    expect(transcript.join('')).toContain(`${TOOL_DONE_GLYPH} Write(ticketing.html)`);
     expect(runningFrame).not.toContain('PRIVATE-document-body');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('NEXT-TUI-TOOL-LOG-NOT-PINNED: tool rows stay where they happened, between streamed text and above the final answer', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  // 출처: #47304 compact display hotfix uses the existing 80×18 screen fixture.
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  appendMessage(session.id, { role: 'user', content: 'read then answer', ts: new Date().toISOString() });
+  mockAssistantTextSource = true;
+  mockDeltaText = '';
+  let liveFrame = '';
+  duringTurnHook = async (_signal, emit) => {
+    emit?.('BEFORE-TOOL\n', false, 'assistant-text');
+    toolActivityHandler?.({ phase: 'start', id: 'read-notes', name: 'Read', target: 'notes.txt' });
+    toolActivityHandler?.({ phase: 'finish', id: 'read-notes', name: 'Read' });
+    emit?.('AFTER-TOOL\n', false, 'assistant-text');
+    await Bun.sleep(100); // Let the stream frame paint.
+    liveFrame = replayPaintWrites(transcript).at(-1) ?? '';
+    appendMessage(session.id, { role: 'assistant', content: 'FINAL-ANSWER', replyFinal: true, ts: new Date().toISOString() });
+  };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('read then answer');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  const rowOf = (frame: string, needle: string) => frame.split('\n').findIndex((line) => line.includes(needle));
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', compactHeight: 18 });
+    // Live: text before the tool, the tool row, then text after it — one flow, not a tool block on top.
+    const tool = rowOf(liveFrame, `${TOOL_DONE_GLYPH} Read(notes.txt)`);
+    expect(liveFrame).toContain('BEFORE-TOOL');
+    // NEXT-TUI-WORKING-ROW: while the turn runs, a progress row sits under the streamed text; once settled it is gone.
+    expect(liveFrame).toMatch(/(?:Thinking|Responding|Working|Running \w+)[^\n]*\(\d+s • esc to interrupt\)/u);
+    expect(rowOf(liveFrame, 'BEFORE-TOOL')).toBeLessThan(tool);
+    expect(tool).toBeLessThan(rowOf(liveFrame, 'AFTER-TOOL'));
+    // Settled: the row stays after its user message and above the saved answer, not pinned below it.
+    const settled = replayPaintWrites(transcript).filter((frame) => frame.includes('FINAL-ANSWER')).at(-1) ?? '';
+    const settledTool = rowOf(settled, `${TOOL_DONE_GLYPH} Read(notes.txt)`);
+    expect(rowOf(settled, 'read then answer')).toBeLessThan(settledTool);
+    expect(settled).not.toContain('esc to interrupt');
+    expect(settledTool).toBeLessThan(rowOf(settled, 'FINAL-ANSWER'));
+    // #37966: the turn-end «Worked for» marker stays below the answer, not displaced by the tool rows.
+    expect(rowOf(settled, 'FINAL-ANSWER')).toBeLessThan(rowOf(settled, 'Worked for'));
+    // One turn, one «Worked for» row: the footer must not repeat the transcript marker at the bottom.
+    expect(settled.split('\n').filter((line) => line.includes('Worked for')).length).toBe(1);
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('Continuing is up once the turn opens, before the first tool (A207)', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  mockDeltaText = '';
+  mockAssistantTextSource = true;
+  // A pledge reply arms goal-continue; the follow-up is the internal turn that paints «↻ Continuing».
+  mockLocalChatTurnResult = { goalComplete: false };
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  submittedInputs.push('open the door');
+  const frames: string[] = [];
+  const snap = (): void => { frames.push(replayPaintWrites(transcript).at(-1) ?? ''); };
+  let sawInternal = false;
+  duringTurnHook = async (_signal, emit) => {
+    if (turnTextsSeen.at(-1) === 'open the door') {
+      appendMessage(session.id, { role: 'assistant', content: 'I will run the remaining checks now.', ts: new Date().toISOString() });
+      return;
+    }
+    const last = turnTextsSeen.at(-1) ?? '';
+    if (last.startsWith('[plan]')) {
+      appendMessage(session.id, { role: 'assistant', content: 'I will run the remaining checks now.', ts: new Date().toISOString() });
+      return;
+    }
+    if (!last.startsWith('[골 이어가기]')) return;
+    if (sawInternal) return;
+    sawInternal = true;
+    // The banner is already up: the turn opened before this hook. A byte does not have to arrive first.
+    snap();
+    toolActivityHandler?.({ phase: 'start', id: 'after-open', name: 'Read', target: 'notes.txt' });
+    snap();
+    // Quit only after the banner frames. An earlier Ctrl+Q is an unread key and the door refuses the follow-up.
+    setTimeout(() => enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\\x11' }), 80);
+  };
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(frames[0]).toContain('↻ Continuing');
+    expect(frames[0]).not.toContain('Read(notes.txt)');
+    expect(frames[1]).toContain('↻ Continuing');
+    expect(frames[1]).toContain('Read(notes.txt)');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('a tool-only turn paints Continuing on the tool start, before any text (A207)', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  mockDeltaText = '';
+  mockLocalChatTurnResult = { goalComplete: false };
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  submittedInputs.push('open the door');
+  const frames: string[] = [];
+  const snap = (): void => { frames.push(replayPaintWrites(transcript).at(-1) ?? ''); };
+  let sawInternal = false;
+  duringTurnHook = () => {
+    if (turnTextsSeen.at(-1) === 'open the door') {
+      appendMessage(session.id, { role: 'assistant', content: 'I will run the remaining checks now.', ts: new Date().toISOString() });
+      return;
+    }
+    const last = turnTextsSeen.at(-1) ?? '';
+    if (last.startsWith('[plan]')) {
+      appendMessage(session.id, { role: 'assistant', content: 'I will run the remaining checks now.', ts: new Date().toISOString() });
+      return;
+    }
+    if (!last.startsWith('[골 이어가기]')) return;
+    if (sawInternal) return;
+    sawInternal = true;
+    // The banner is already up before the tool. Starting the tool must still paint its own line.
+    snap();
+    toolActivityHandler?.({ phase: 'start', id: 'tool-only', name: 'Read', target: 'notes.txt' });
+    snap();
+    // Quit only after the banner frames. An earlier Ctrl+Q is an unread key and the door refuses the follow-up.
+    setTimeout(() => enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\\x11' }), 80);
+  };
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(frames[0]).toContain('↻ Continuing');
+    expect(frames[0]).not.toContain('Read(notes.txt)');
+    expect(frames[1]).toContain('↻ Continuing');
+    expect(frames[1]).toContain('Read(notes.txt)');
+    expect(frames[1]).not.toContain('now open');
   } finally {
     process.stdout.write = output;
   }
@@ -2387,7 +2567,7 @@ test('detail view retains a completed tool activity when no matching result was 
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(replayPaintWrites(transcript).some((frame) => frame.includes("Turn log")
-      && frame.includes('활동 · Read · notes.txt · 완료'))).toBe(true);
+      && frame.includes(`${TOOL_DONE_GLYPH} Read(notes.txt)`))).toBe(true);
   } finally {
     process.stdout.write = output;
   }

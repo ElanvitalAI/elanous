@@ -1,7 +1,7 @@
 import { formatSidetabLines as formatCoreSidetabLines, type SidetabRow } from '../../sidetab-core/model.js';
 import { formatSidetabPeekLines } from './peek.js';
 
-export type SidetabSectionId = 'sessions' | 'harness' | 'pods' | 'herdr' | 'remote';
+export type SidetabSectionId = 'sessions' | 'harness' | 'pods' | 'herdr' | 'remote' | 'els';
 export interface SidetabSection {
   readonly id: SidetabSectionId;
   readonly label: string;
@@ -9,10 +9,14 @@ export interface SidetabSection {
 }
 
 const SECTION_LABELS: Readonly<Record<SidetabSectionId, string>> = {
-  sessions: 'Sessions', harness: 'Harness runs', pods: 'Pods', herdr: 'Herdr', remote: 'Remote',
+  sessions: 'Sessions', harness: 'Harness runs', pods: 'Pods', herdr: 'Herdr', remote: 'Remote', els: 'Els',
 };
 export const DEFAULT_SIDETAB_SECTION_ORDER: readonly SidetabSectionId[] =
   ['sessions', 'harness', 'pods', 'herdr', 'remote'];
+
+/** The els section is not part of the stored, draggable order: it follows the others and exists only while the els
+ *  server lists panes, so a person without els sees the panel exactly as before. */
+const ELS_SECTION: SidetabSectionId = 'els';
 
 export function normalizeSidetabSectionOrder(value: unknown): SidetabSectionId[] {
   const requested = Array.isArray(value) ? value.filter((id): id is SidetabSectionId =>
@@ -21,6 +25,7 @@ export function normalizeSidetabSectionOrder(value: unknown): SidetabSectionId[]
 }
 
 export function sidetabSectionForRow(row: SidetabRow): SidetabSectionId {
+  if (row.kind === 'els') return 'els';
   if (row.remoteHost) return 'remote';
   if (row.kind === 'herdr') return 'herdr';
   if (row.kind === 'pod') return 'pods';
@@ -34,9 +39,9 @@ export function groupSidetabSections(
   rows: readonly SidetabRow[],
   order: readonly SidetabSectionId[] = DEFAULT_SIDETAB_SECTION_ORDER,
 ): SidetabSection[] {
-  const buckets = new Map<SidetabSectionId, SidetabRow[]>(DEFAULT_SIDETAB_SECTION_ORDER.map((id) => [id, []]));
+  const buckets = new Map<SidetabSectionId, SidetabRow[]>([...DEFAULT_SIDETAB_SECTION_ORDER, ELS_SECTION].map((id) => [id, []]));
   for (const row of rows) buckets.get(sidetabSectionForRow(row))!.push(row);
-  const ordered = normalizeSidetabSectionOrder(order);
+  const ordered = [...normalizeSidetabSectionOrder(order), ELS_SECTION];
   return ordered.filter((id) => buckets.get(id)!.length > 0).map((id) => ({
     id, label: SECTION_LABELS[id], rows: buckets.get(id)!,
   }));
@@ -95,8 +100,9 @@ export function formatSidetabSectionFrame(
   const normalized = normalizeSidetabSectionOrder(order);
   const base = formatCoreSidetabLines(rows, selected, width, 3);
   const items: SectionItem[] = [];
-  for (const id of normalized) {
+  for (const id of [...normalized, ELS_SECTION]) {
     const indexed = rows.map((row, index) => ({ row, index })).filter(({ row }) => sidetabSectionForRow(row) === id);
+    if (id === ELS_SECTION && indexed.length === 0) continue;
     items.push({ text: fit(` ${SECTION_LABELS[id]} · ${indexed.length}`, width), target: { kind: 'section', id } });
     for (const { row, index } of indexed) {
       const line = formatCoreSidetabLines([row], index === selected ? 0 : -1, width, 4)[2] ?? fit(row.label, width);
@@ -117,7 +123,7 @@ export function formatSidetabSectionFrame(
   const targets = new Map<number, SidetabSectionTarget>();
   visible.forEach((item, index) => { if (item.target) targets.set(index + 3, item.target); });
   targets.set(visible.length + 3, { kind: 'end' });
-  const lines = [base[0] ?? fit(' 세션 · PTY', width), base[1] ?? fit(' ↑↓ 전환 · 클릭 선택', width),
+  const lines = [base[0] ?? fit(' Sessions · PTY', width), base[1] ?? fit(' ↑↓ switch · click to select', width),
     ...visible.map((item) => item.text), fit(' + new · /side new', width)];
   return { lines, targets, start, maxStart };
 }

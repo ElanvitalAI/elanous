@@ -44,7 +44,7 @@ function isFoldingOrigin(origin: InternalTurnOrigin | null | undefined): boolean
 // eslint-disable-next-line no-control-regex
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 /** 답이 아닌 줄(턴 상태·도구·배너) — goal-continue 의 NON_REPLY 와 같은 뜻. */
-const NON_REPLY_LINE = /^\s*(?:✔ 완료|✘ 실패|응답 완료|응답 중|라우팅:|󰧑|⚙️|도구:|나:|↻ 자동 재개|⏰|⏸|⏹|❯|[─━]{3,})/u;
+const NON_REPLY_LINE = /^\s*(?:✔ (?:완료|done)|✘ (?:실패|failed)|응답 완료|응답 중|라우팅:|󰧑|⚙️|도구:|Tool:|나:|↻ 자동 재개|↻ auto-resume|⏰|⏸|⏹|❯|[─━]{3,})/u;
 
 /** 미완 고백 — «못 했다 / 보고할 수 없다 / 아직 안 됐다» ⊕ 영어. */
 const INCOMPLETE_RE = new RegExp([
@@ -82,7 +82,7 @@ const SUMMARY_CHARS = 60;
 export function formatInterimFoldLine(summary: string): string {
   const flat = summary.replace(/\s+/g, ' ').trim();
   const cut = [...flat].length > SUMMARY_CHARS ? `${[...flat].slice(0, SUMMARY_CHARS).join('')}…` : flat;
-  return `· 진행 — ${cut} (접힘)`;
+  return `· in progress — ${cut} (folded)`;
 }
 
 // ── next: 세션 메시지 위의 그리기 계획(순수) ─────────────────────────────────────────────

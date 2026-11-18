@@ -312,6 +312,7 @@ async function readDefaultPluginStatuses(deps: SetupCliDeps): Promise<DefaultPlu
 }
 
 export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}): void {
+  deps = { ...deps, env: deps.env ?? process.env };
   const out = deps.out ?? { log: (value: string) => console.log(value), error: (value: string) => console.error(value) };
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
   const doctorRunner = deps.runDoctor ?? runDoctor;

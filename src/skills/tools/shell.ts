@@ -35,6 +35,7 @@ import {
 import type { ShellHandle, ShellResult as RunnerResult } from '../../shell-runner/types.js';
 import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
+import { clampShellTimeoutMs } from '../../tool-runtime/shell-watchdog.js';
 import { getUserConfig } from '../../user-config/reader.js';
 import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
 import {
@@ -684,8 +685,9 @@ export async function dispatchRunShell(
 ): Promise<RunShellDispatchResult> {
   const command = asCommand(rawArgs.command);
   const cwd = typeof rawArgs.cwd === 'string' ? rawArgs.cwd : undefined;
+  // A201 — every shell path shares one cap; the runner path used to pass the model's value unclamped.
   const timeoutMs = typeof rawArgs.timeoutMs === 'number' && Number.isFinite(rawArgs.timeoutMs)
-    ? rawArgs.timeoutMs : undefined;
+    ? clampShellTimeoutMs(rawArgs.timeoutMs) : undefined;
   const approval = asApproval(rawArgs.approval);
   const sandbox = asSandbox(rawArgs.sandbox);
   const network = asNetwork(rawArgs.network);
@@ -746,8 +748,9 @@ export async function dispatchRunShell(
   });
 
   logShellDispatch(`legacy.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
-  const summary = formatSummary(result);
+  const summary = result.watchdog ? `${result.watchdog.text}\n${formatSummary(result)}` : formatSummary(result);
   return withLongSleepWarning({
+    ...(result.watchdog ? { watchdog: result.watchdog } : {}),
     output: summary,
     exitCode: result.exitCode,
     outcome: result.outcome,

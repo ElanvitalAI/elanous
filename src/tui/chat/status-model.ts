@@ -3,11 +3,13 @@ import { getUserConfig } from '../../user-config/reader.js';
 import { getSessionProvider } from '../../tui-client/session-provider.js';
 import { PROVIDER_DEFAULT_MODEL } from '../../user-config.js';
 
-/** Current configured/selected model label without reading credentials or starting a provider. */
-export function readNextTuiStatusModel(
+/** The provider/model the NEXT request will use, as the TUI knows it without reading credentials or starting a
+ *  provider. One resolver for the status bar, `/status` and `/provider` so they cannot disagree
+ *  (TUI-MODEL-DISPLAY-CONSISTENT). */
+export function resolveNextTuiSelection(
   sessionId?: string,
   session?: { readonly provider?: string; readonly model?: string } | null,
-): string {
+): { readonly provider: string; readonly model: string } {
   const config = getUserConfig();
   const selected = sessionId ? getSessionProvider(sessionId) : undefined;
   const override = sessionId ? explicitTurnTier(config, sessionId)?.model : undefined;
@@ -16,7 +18,15 @@ export function readNextTuiStatusModel(
   const model = selected?.model || override
     || (selected && selected.provider !== config.llm.provider ? PROVIDER_DEFAULT_MODEL[selected.provider] : undefined)
     || (config.llm.model === 'auto' ? session?.model : undefined)
-    || config.llm.model || session?.model || '미설정';
-  return `${provider}/${model}`;
+    || config.llm.model || session?.model || 'unset';
+  return { provider, model };
 }
 
+/** Current configured/selected model label without reading credentials or starting a provider. */
+export function readNextTuiStatusModel(
+  sessionId?: string,
+  session?: { readonly provider?: string; readonly model?: string } | null,
+): string {
+  const { provider, model } = resolveNextTuiSelection(sessionId, session);
+  return `${provider}/${model}`;
+}

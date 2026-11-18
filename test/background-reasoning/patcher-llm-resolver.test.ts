@@ -1,6 +1,7 @@
 // W9e-FU U5 · patcher-llm-resolver · fetch-based OpenAI-compatible wire.
 
 import { describe, expect, test } from 'bun:test';
+import { debug } from '../../src/debug/log.js';
 import { resolvePatcherLlmCallables } from '../../src/background-reasoning/patcher-llm-resolver';
 
 interface MockCall {
@@ -226,6 +227,29 @@ describe('embeddingCallable', () => {
     const vecs = await res.embeddingCallable(['a']);
     expect(vecs).toEqual([[]]);
     expect(errored).toBe(true);
+  });
+});
+
+describe('patcher network ledger', () => {
+  test('injected fetch still sends once per entity and embedding request; each gets one safe attempt', async () => {
+    const before = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').length;
+    const mock = mockFetch({
+      '/v1/chat/completions': () => ({ status: 200, body: { choices: [{ message: { content: '{"entities":[],"relations":[]}' } }] } }),
+      '/v1/embeddings': () => ({ status: 200, body: { data: [{ embedding: [0.5] }] } }),
+    });
+    const callables = resolvePatcherLlmCallables({ endpoint: 'https://api.example', apiKey: 'patcher-secret', entityModel: 'extract-model', embeddingModel: 'embed-model' }, { fetchImpl: mock.fetchImpl })!;
+    expect(await callables.entityExtractorCallable({ prompt: '', records: [] })).toEqual({ entities: [], relations: [] });
+    expect(await callables.embeddingCallable(['one'])).toEqual([[0.5]]);
+    expect(mock.calls).toHaveLength(2);
+    expect(mock.calls.map(c => c.headers.authorization)).toEqual(['Bearer patcher-secret', 'Bearer patcher-secret']);
+    const rows = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').slice(before);
+    expect(rows).toHaveLength(2);
+    expect(rows.map(e => e.data)).toEqual([
+      expect.objectContaining({ model: 'extract-model', provider: 'openai-compatible', host: 'api.example', requestedBy: 'background-reasoning.patcher.entity-extract' }),
+      expect.objectContaining({ model: 'embed-model', provider: 'openai-compatible', host: 'api.example', requestedBy: 'background-reasoning.patcher.embedding' }),
+    ]);
+    expect(JSON.stringify(rows)).not.toContain('patcher-secret');
+    expect(JSON.stringify(rows)).not.toContain('chat/completions');
   });
 });
 

@@ -22,6 +22,8 @@ export interface WorkspaceInputEntry {
 
 export interface WorkspaceInputState {
   readonly activeSpaceId?: string;
+  /** True only when the operator picked a workspace. The open-tabs default may refresh. */
+  readonly explicitSelection?: boolean;
   readonly entries: Readonly<Record<string, WorkspaceInputEntry>>;
 }
 
@@ -51,6 +53,9 @@ function requireWorkspace(row: SidetabRow): string {
   return row.spaceId;
 }
 
+/** Synthetic id. A real workspace cannot use it, so the automatic binding never collides. */
+export const DEFAULT_OPEN_TABS_SPACE_ID = 'open-tabs';
+
 function entry(state: WorkspaceInputState, spaceId: string): WorkspaceInputEntry {
   return Object.hasOwn(state.entries, spaceId) ? state.entries[spaceId]! : { terminalDraft: '', sidechatDraft: '' };
 }
@@ -61,7 +66,40 @@ function update(state: WorkspaceInputState, spaceId: string, value: WorkspaceInp
 
 export function selectWorkspaceInput(state: WorkspaceInputState, workspace: SidetabRow): WorkspaceInputState {
   const spaceId = requireWorkspace(workspace);
-  return { ...update(state, spaceId, entry(state, spaceId)), activeSpaceId: spaceId };
+  if (spaceId === DEFAULT_OPEN_TABS_SPACE_ID) throw new Error('select a workspace before editing its input');
+  return { ...update(state, spaceId, entry(state, spaceId)), activeSpaceId: spaceId, explicitSelection: true };
+}
+
+function liveOpenTab(row: SidetabRow): boolean {
+  return row.kind !== 'workspace' && !!row.ptyId && row.badge !== 'exited' && !row.currentProcess
+    && Number.isSafeInteger(row.ownerPid) && (row.ownerPid ?? 0) > 0
+    && Number.isSafeInteger(row.ptyStartedAt) && (row.ptyStartedAt ?? 0) > 0;
+}
+
+/**
+ * When no workspace is selected, the last open local tab is the default write target.
+ * An explicit workspace row still wins. Tabs already inside another workspace stay there.
+ * Remote tabs, member observation, unknown readings, and follow-up of other open tabs are later cards.
+ */
+export function selectDefaultOpenTabsWorkspace(state: WorkspaceInputState, rows: readonly SidetabRow[]): WorkspaceInputState {
+  if (state.explicitSelection) return state;
+  const open = rows.filter(row => liveOpenTab(row) && !row.spaceId && !row.remoteHost);
+  const spaceId = DEFAULT_OPEN_TABS_SPACE_ID;
+  const bound = state.activeSpaceId === spaceId ? state.entries[spaceId]?.target : undefined;
+  const boundLive = bound !== undefined && open.some(row => row.id === bound.rowId && row.ptyId === bound.ptyId
+    && row.ownerPid === bound.ownerPid && row.ptyStartedAt === bound.ptyStartedAt);
+  if (boundLive) return state;
+  if (open.length === 0) {
+    if (state.activeSpaceId === spaceId) return { ...state, activeSpaceId: undefined };
+    return state;
+  }
+  const chosen = open[open.length - 1]!;
+  const selected: WorkspaceInputState = {
+    ...update(state, spaceId, entry(state, spaceId)),
+    activeSpaceId: spaceId,
+    explicitSelection: false,
+  };
+  return bindWorkspacePty(selected, { ...chosen, spaceId });
 }
 
 export function setWorkspaceInputDraft(state: WorkspaceInputState, mode: WorkspaceInputMode, text: string): WorkspaceInputState {
@@ -114,7 +152,10 @@ export function prepareWorkspaceInput(
   const current = spaceId ? entry(state, spaceId) : undefined;
   if (!spaceId || !current?.target) throw new Error('workspace PTY target is not bound');
   const target = current.target;
-  const live = freshRows.find(row => row.id === target.rowId && row.spaceId === spaceId && row.ptyId === target.ptyId
+  const automatic = spaceId === DEFAULT_OPEN_TABS_SPACE_ID && state.explicitSelection !== true;
+  const live = freshRows.find(row => row.id === target.rowId
+    && (automatic ? !row.spaceId : row.spaceId === spaceId)
+    && row.ptyId === target.ptyId
     && row.remoteHost === target.remoteHost && row.ownerPid === target.ownerPid
     && row.ptyStartedAt === target.ptyStartedAt && row.badge !== 'exited' && !row.currentProcess);
   if (!live) throw new Error('workspace PTY target changed; select it again');

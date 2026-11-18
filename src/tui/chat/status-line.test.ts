@@ -284,3 +284,22 @@ test('complete fixed UI templates translate without treating their ID slots as U
   expect(englishFooterText('원격 PTY 화면 · t takeover · Ctrl+\\ 후 ↑/↓ 전환')).toBe('Remote PTY screen · t takeover · Ctrl+\\ then ↑/↓ switch');
   expect(englishFooterText('Herdr pane 관측 · t takeover · Esc / Ctrl+\\ 복귀 · Ctrl+Q 전체 종료 (Ctrl+[는 Esc로 읽힐 수 있음)')).toBe('Observing Herdr pane · t takeover · Esc / Ctrl+\\ return · Ctrl+Q quit all (Ctrl+[ may be read as Esc)');
 });
+
+test('ELN-QUEUE-ITEM-CONTROLS: the footer splits waiting input into steer and queue only when something steers', () => {
+  const base = { turnState: '응답 중 · Esc 취소', model: 'provider/model-x', backgroundTasks: 0, width: 120 };
+  const queued = 3;
+  const steering = 1;
+  expect(formatNextTuiStatusLine({ ...base, queued, steering })).toContain(`Steer ${steering} · Queue ${queued - steering}`);
+  expect(formatNextTuiStatusLine({ ...base, queued })).toContain(`Queue ${queued}`);
+  expect(formatNextTuiStatusLine({ ...base, queued })).not.toContain('Steer');
+  const narrowWidth = Bun.stringWidth(`Turn 응답 중 · S${steering}·Q${queued - steering} · B0`);
+  expect(formatNextTuiStatusLine({ ...base, queued, steering, width: narrowWidth })).toContain(`S${steering}·Q${queued - steering}`);
+  expect(nextTuiStatusLine({ state: '응답 중', queued, steering, activeChildren: 0, columns: 120 })).toContain(`Steer ${steering} · Queue ${queued - steering}`);
+});
+
+test('ELN-QUEUE-ITEM-CONTROLS: a waiting steer keeps the S/Q counter on a narrow footer', () => {
+  const steer = { turnState: '조향 대기 1건 · 다음 도구 경계에 넣음 · Esc 취소', model: 'auto/미설정', queued: 1, steering: 1,
+    backgroundTasks: 0, elapsedMs: 2800, estimatedOutputTokens: 0 };
+  for (const width of [60, 80, 120]) expect(formatNextTuiStatusLine({ ...steer, width })).toMatch(/S1·Q0|Steer 1 · Queue 0/u);
+  expect(formatNextTuiStatusLine({ ...steer, width: 60 })).toStartWith('Turn running');
+});

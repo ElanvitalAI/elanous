@@ -28,7 +28,7 @@ describe('remote sidetab discovery', () => {
       id: 'remote:aws1:tui-1', ptyId: 'tui-1', remoteHost: 'aws1', host: 'aws1',
       label: 'aws1:work · busy', kind: 'tui', badge: 'busy',
     }], 'aws1', 'connection timeout');
-    expect(stale[0]).toMatchObject({ badge: 'stale', status: '측정 불가 · connection timeout' });
-    expect(stale[0]?.label).toContain('측정 불가');
+    expect(stale[0]).toMatchObject({ badge: 'stale', status: 'Unmeasurable · connection timeout' });
+    expect(stale[0]?.label).toContain('unmeasured');
   });
 });

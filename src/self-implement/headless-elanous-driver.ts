@@ -59,6 +59,10 @@ import { childToolProfile } from '../agent/tool-profile.js';
 import { escalationAllowedForProvider } from './rework-policy.js';
 import { getUserConfig, resolveActiveProvider, resolveRoleLlm } from '../user-config.js';
 import { goalDifficultySignals, classifyGoalDifficulty, resolveImplementDifficulty } from '../llm/difficulty.js';
+import { planWorkRoute, recordLaunchRoute, resolveWorkRouteMode, windowAccountLaunch, type WindowAccountLaunch, type WorkRoutePlan } from './work-route.js';
+import { readAccountWindowSnapshot } from '../model-tier/account-window-snapshot.js';
+import type { AccountState, CoreMode } from '../model-tier/orchestration-core.js';
+import type { RunLedgerEntry } from './run-ledger.js';
 import { childNestEnv } from '../agent/nest-depth.js';
 import { childPtyIdentityEnv } from '../agent/pty-identity.js';
 import { elanousTuiSpawnOptions } from './elanous-tui-spawn.js';
@@ -924,6 +928,10 @@ export function shSingleQuote(s: string): string {
 export interface HeadlessGoalLoopPtyOptions {
   /** main repo 절대경로(bin/elanous.mjs·node_modules 해석). */
   binRoot: string;
+  /** HARNESS-DIFFICULTY-ROUTER 원장 쓰기 seam(시험용) — 생략 = 런 원장 `harness.route-decision`. */
+  recordWorkRoute?: (entry: RunLedgerEntry) => void;
+  /** COST-OPTIMIZER-WINDOW-AWARE 스냅숏 seam(시험용) — 생략 = 디스크 쿼터 신호(`readAccountWindowSnapshot`). */
+  readAccountWindows?: (provider: string) => AccountState | undefined;
   /** worktree(구현 대상 cwd). */
   cwd: string;
   /** 이미 featurePrompt() 적용된 프롬프트(범위제한·클린빌드 앵커 포함). */
@@ -1189,19 +1197,63 @@ export interface HeadlessGoalLoopPtyResult {
 }
 
 export function pickImplementRoleForGoal(document: string): ReturnType<typeof resolveRoleLlm> | undefined {
+  return pickImplementRoleWithRoute(document).role;
+}
+
+/** HARNESS-DIFFICULTY-ROUTER 판정 ⊕ 적용 여부. 원장 기록은 runId 가 정해진 뒤 호출측이 한다. */
+export interface ImplementRouteOutcome {
+  readonly plan: WorkRoutePlan;
+  readonly mode: CoreMode;
+  readonly applied: boolean;
+  /** 적용 안 한 이유 코드 — shadow · explicit-child-llm · run-env-model · non-default-role · no-tier-ladder. */
+  readonly skip: string | null;
+}
+
+/** 위험·Bloom 판정만 — 명시 자식 LLM 처럼 역할 해석을 건너뛴 발사도 그림자 기록을 남긴다. */
+export function shadowImplementRoute(document: string, provider: string | undefined, skip: string,
+  readAccountWindows: (provider: string) => AccountState | undefined = (p) => readAccountWindowSnapshot(p, { forceShadow: true })): ImplementRouteOutcome | undefined {
+  try {
+    // 명시 자식 LLM·런 env 모델 — 발사가 계정을 바꾸지 않으므로 창 선택도 shadow 로 고정(기록만).
+    return { plan: planWorkRoute(document, provider ?? '', readAccountWindows(provider ?? '')),
+      mode: resolveWorkRouteMode(getUserConfig()), applied: false, skip };
+  } catch { return undefined; }
+}
+
+function baselineImplementRole(): { role: ReturnType<typeof resolveRoleLlm>; config: ReturnType<typeof getUserConfig> } | undefined {
   try {
     const config = getUserConfig();
-    const role = resolveRoleLlm('implement', { config });
-    if (config.harness?.difficultyPlacement !== true || role.source !== 'default') return role;
-    const signals = goalDifficultySignals(document);
-    const level = classifyGoalDifficulty(signals);
-    const picked = resolveImplementDifficulty(role, level);
-    try {
-      debug.log('llm.difficulty', 'pick', { level, tier: picked.tier ?? null, signals });
-      debug.log('harness.role-llm', 'difficulty-placement', { difficulty: level, tier: picked.tier, source: role.source });
-    } catch { /* observation is fail-soft */ }
-    return picked;
+    return { role: resolveRoleLlm('implement', { config }), config };
   } catch { return undefined; }
+}
+
+export function pickImplementRoleWithRoute(document: string, readAccountWindows: (provider: string) => AccountState | undefined = (provider) => readAccountWindowSnapshot(provider)): { role: ReturnType<typeof resolveRoleLlm> | undefined; route?: ImplementRouteOutcome } {
+  const base = baselineImplementRole();
+  if (!base) return { role: undefined };
+  const { config } = base;
+  let role = base.role;
+  try {
+    if (config.harness?.difficultyPlacement === true && role.source === 'default') {
+      const signals = goalDifficultySignals(document);
+      const level = classifyGoalDifficulty(signals);
+      const source = role.source;
+      role = resolveImplementDifficulty(role, level);
+      try {
+        debug.log('llm.difficulty', 'pick', { level, tier: role.tier ?? null, signals });
+        debug.log('harness.role-llm', 'difficulty-placement', { difficulty: level, tier: role.tier, source });
+      } catch { /* observation is fail-soft */ }
+    }
+  } catch { return { role: undefined }; }
+  // ⭐ 모델 오케스트레이션 코어가 그 위에 한 겹 — 결정이 실패해도 기존 선택(role)은 그대로 간다.
+  try {
+    const mode = resolveWorkRouteMode(config);
+    const plan = planWorkRoute(document, role.provider, readAccountWindows(role.provider));
+    const { decision } = plan;
+    // 코어가 다른 provider(창 인지 계정 선택)를 고르면 이 PR 은 적용하지 않는다 — 역할 provider 안에서만 바꾼다.
+    const skip = decision.model === null ? 'no-tier-ladder' : mode !== 'on' ? 'shadow' : role.source !== 'default' ? 'non-default-role'
+      : decision.provider !== role.provider ? 'cross-provider' : null;
+    if (skip !== null || decision.model === null) return { role, route: { plan, mode, applied: false, skip: skip ?? 'no-tier-ladder' } };
+    return { role: { ...role, model: decision.model, tier: decision.cell }, route: { plan, mode, applied: true, skip: null } };
+  } catch { return { role }; }
 }
 
 export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): Promise<HeadlessGoalLoopPtyResult> {
@@ -1210,9 +1262,16 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
     throw new Error('childLlm.provider and childLlm.model must both be non-empty');
   }
   // ⭐ B14 — 명시 자식 LLM · 런 단위 모델이 없을 때 골 난이도에 따라 역할 `implement` 기본 등급을 고른다.
-  const implementRole = !childLlm && !process.env.ELANOUS_LLM_MODEL?.trim()
-    ? pickImplementRoleForGoal(opts.goalDocument ?? opts.featurePrompt)
+  const implementPick = !childLlm && !process.env.ELANOUS_LLM_MODEL?.trim()
+    ? pickImplementRoleWithRoute(opts.goalDocument ?? opts.featurePrompt, opts.readAccountWindows)
     : undefined;
+  const implementRole = implementPick?.role;
+  // ⭐ HARNESS-DIFFICULTY-ROUTER — 명시 자식 LLM·런 env 모델이면 라우터는 적용하지 않고 판정만 그림자로 남긴다.
+  const workRoute = implementPick ? implementPick.route : shadowImplementRoute(
+    opts.goalDocument ?? opts.featurePrompt,
+    childLlm?.provider ?? process.env.ELANOUS_LLM_PROVIDER?.trim(),
+    childLlm ? 'explicit-child-llm' : 'run-env-model',
+  );
   // ⭐ B9 — 승급 판정에 쓸 «유효 provider»: 명시 자식 → 역할 → 런 env → config(auto 는 실제 결정으로).
   const effectiveChildProvider = childLlm?.provider ?? implementRole?.provider ?? process.env.ELANOUS_LLM_PROVIDER?.trim()
     ?? (() => { try { return resolveActiveProvider(getUserConfig()); } catch { return undefined; } })();
@@ -1241,6 +1300,21 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
   //   env 를 그대로 읽는다). 빈 runId 는 `elanous self run <runId>` 사후 join 을 **불가능**하게 만든다(관측 계약은
   //   있는데 값이 안 실린 사례). 호출자 지정 > 상속 > canonical mint 순으로 항상 비어있지 않게 확정한다.
   const { runId } = resolveRunIdentity({ explicit: opts.runId, inherited: space.runId });
+  // COST-OPTIMIZER-WINDOW-AWARE — 자식 계정 env 와 원장 `accountApplied` 를 한 판단에서 낸다(리뷰 #38337 sf1).
+  const windowRoutePlan = implementPick?.route?.plan;
+  const windowLaunchProvider = implementRole?.provider;
+  let windowAccount: WindowAccountLaunch = { env: {}, applied: null };
+  if (windowRoutePlan && windowLaunchProvider) {
+    try { windowAccount = windowAccountLaunch(windowRoutePlan, windowLaunchProvider); } catch { /* 판단 실패 = 계정 불변(원장도 false) */ }
+  }
+  if (workRoute) {
+    try {
+      recordLaunchRoute(workRoute, runId, {
+        provider: childLlm?.provider ?? implementRole?.provider ?? (process.env.ELANOUS_LLM_PROVIDER?.trim() || null),
+        model: childLlm?.model ?? implementRole?.model ?? (process.env.ELANOUS_LLM_MODEL?.trim() || null),
+      }, opts.recordWorkRoute ? { append: opts.recordWorkRoute } : {}, undefined, windowAccount.applied);
+    } catch { /* observation is fail-soft */ }
+  }
   const controlInboxDir = resolveControlInboxDir(space.id);
   const { key: screenKey } = resolveHarnessScreenKey(space.id, opts.cwd);
   const executionId = mintPtyId('self');
@@ -1378,6 +1452,8 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
       ...(opts.documentReferences?.length ? { ELANOUS_DOCUMENT_REFERENCES: JSON.stringify(opts.documentReferences) } : {}),
       // ⭐ B14/E2 — 명시 자식 LLM·런 단위 모델이 없으면 골 난이도를 적용한 구현 역할 모델을 릴레이한다.
       ...childLlmSelectionEnv(childLlm ?? (implementRole ? { provider: implementRole.provider, model: implementRole.model, source: 'config' } : undefined)),
+      // COST-OPTIMIZER-WINDOW-AWARE — `harness.windowAccounts: on` 이고 창 선택기가 같은 provider 의 다른 계정을 골랐을 때만.
+      ...windowAccount.env,
       // 결정 2026-09-23 — 명시 childLlm 은 «같은 provider» 사다리 안에서만 한 칸 승급한다(없으면 승급 안 함).
       //   미지정 경로는 기존 티어(codex sol 등)를 그대로 쓴다.
       // 대표 2026-09-25 (B9) — 유효 provider 가 codex·anthropic 이면 승급하지 않는다.

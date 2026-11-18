@@ -15,11 +15,11 @@ import {
   currentBackend,
   currentBackendId,
 } from './registry.js';
-import { deleteAppSecretValue, deleteLegacyAppSecretValueSync, importSecretsFileRaw, setAppSecretValue } from './file-backend.js';
+import { deleteAppSecretValue, deleteLegacyAppSecretValueSync, importStaticSecretsAndCredentialSlotsRaw, setAppSecretValue } from './file-backend.js';
 import { appSecretId } from './app-secret-ledger.js';
 import { assertSharedSecretId } from './types.js';
 import { hasAppSecretEventForId } from './app-secret-ledger.js';
-import { assertCredentialSlotId } from './cred-slots.js';
+import { assertCredentialSlotId, assertTransferableStaticCredentialSlotId } from './cred-slot-schema.js';
 
 export * from './types.js';
 export {
@@ -116,8 +116,11 @@ export async function importSecretBatchAsync(
   // App-scoped credentials require their lifecycle ledger; bulk import must not
   // create or overwrite values outside that audited path.
   if (Object.keys(secrets).some((id) => id.startsWith('app/'))) throw new Error('ELANOUS_APP_SECRET_IMPORT_UNSUPPORTED');
-  if (Object.keys(secrets).some((id) => id.startsWith('cred:'))) throw new Error('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
-  return importSecretsFileRaw(secrets, overwrite, expectedConflicts);
+  // Catalogued static API key slots (cred:firecrawl.api_key …) move host-to-host in the encrypted bundle.
+  // Rotating login slots (OAuth/refresh — codex, Claude) stay owner-only and are refused with their own code;
+  // unknown cred: IDs keep ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED. Checked before any write.
+  for (const id of Object.keys(secrets)) if (id.startsWith('cred:')) assertTransferableStaticCredentialSlotId(id);
+  return importStaticSecretsAndCredentialSlotsRaw(secrets, overwrite, expectedConflicts);
 }
 
 // ---------------------------------------------------------------------------

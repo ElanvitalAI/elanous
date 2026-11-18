@@ -26,13 +26,13 @@ export type TuiDetailLevel = 0 | 1 | 2 | 3;
 
 const kindLabel = (block: MessageBlock): string => {
   switch (block.body.kind) {
-    case 'thought': return '생각';
-    case 'tool-call': return '도구';
-    case 'plan': return '진행';
-    case 'status': return '상태';
-    case 'error': return '오류';
-    case 'assistant': return '답';
-    case 'user': return '입력';
+    case 'thought': return 'thought';
+    case 'tool-call': return 'tool';
+    case 'plan': return 'progress';
+    case 'status': return 'status';
+    case 'error': return 'error';
+    case 'assistant': return 'answer';
+    case 'user': return 'input';
   }
 };
 
@@ -50,7 +50,7 @@ const blockText = (block: MessageBlock): string => {
 
 const compact = (text: string): string => safeStatusText(text).replace(/\s+/g, ' ').trim();
 const wrappedLabel = (label: string, text: string, columns: number): string[] =>
-  wrapRawLine(`${label} · ${text || '(내용 없음)'}`, columns, '');
+  wrapRawLine(`${label} · ${text || '(empty)'}`, columns, '');
 const wrappedStep = (step: string, columns: number): string[] =>
   wrapRawLine(`· ${compact(step)}`, columns, '  ');
 
@@ -101,8 +101,8 @@ export function messageBlockDetailLines(
   const reference = block.detail?.rawRef;
   if (!reference) return messageBlockDetailLines(block, 2, columns);
   const raw = rawText === undefined
-    ? `원문 참조 대기 · ${reference.runId}/${reference.blockId}`
-    : rawText.split(/\r?\n/).map(safeLogText).join('\n') || '(빈 원문)';
+    ? `awaiting raw reference · ${reference.runId}/${reference.blockId}`
+    : rawText.split(/\r?\n/).map(safeLogText).join('\n') || '(empty raw)';
   return [...wrappedLabel(`▾ ${label}`, summary, columns),
     ...(block.detail?.steps ?? []).flatMap((step) => wrappedStep(step, columns)),
     ...raw.split(/\r?\n/).flatMap((line) => wrapRawLine(safeLogText(line), columns))];

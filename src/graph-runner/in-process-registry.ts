@@ -1,5 +1,6 @@
 import type { GraphEvent } from './graph-events.js';
 import type { GraphSupervisorObservationInput } from './graph-progress-observation.js';
+import type { GraphNodeProgress } from './node-progress.js';
 
 /** A run-scoped registry keeps in-process graph effects out of YAML and shell recipes. */
 export interface InProcessHandlerContext {
@@ -47,6 +48,8 @@ export interface InProcessHandlerContext {
   readonly signal?: AbortSignal;
   /** A code node may publish only the event kinds declared in its YAML `emits` allowlist. */
   readonly emitEvent?: (type: string, data?: Readonly<Record<string, unknown>>) => Promise<GraphEvent>;
+  /** Runner-owned `node-progress` ledger event for this node (no `emits` declaration needed); never fails the node. */
+  readonly reportProgress?: (progress: GraphNodeProgress) => Promise<void>;
 }
 
 export interface InProcessHandlerResult {

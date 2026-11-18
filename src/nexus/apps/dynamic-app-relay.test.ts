@@ -10,7 +10,8 @@ import { acceptDaemonChannel, generateDaemonKeyPair, serverIdFromPublicKey } fro
 import { MuxDecoder, MuxEncoder, MuxStreamState } from '../../relay/mux.js';
 import { challengeMessage, startRelayServer } from '../../relay/relay-server.js';
 import { loadNexusAppHost } from './app-host.js';
-import { createDynamicAppPublisher, createDynamicAppPublishRoute } from './dynamic-app-publish.js';
+import { createDynamicAppPublisher, createDynamicAppPublishRoute,
+  type DeploymentGrantBinding, type DeploymentGrantProvider } from './dynamic-app-publish.js';
 
 type RelayMessage = string | Uint8Array;
 
@@ -181,23 +182,37 @@ test('reserved source reaches real encrypted relay, local service, and exact tes
   const { appHost } = loadNexusAppHost(join(root, 'apps'), undefined,
     { key: randomBytes(32).toString('hex'), dir: join(root, 'sessions') });
   const owner = { memberId: 'member-fake', userSlug: 'fake-slot' };
+  const grants = new Map<string, DeploymentGrantBinding>();
+  const deploymentGrants: DeploymentGrantProvider = {
+    issue: async input => {
+      const grant: DeploymentGrantBinding = { ...input, grantId: 'grant-' + randomBytes(12).toString('hex'), grantVersion: 1 };
+      grants.set(grant.grantId, grant);
+      return grant;
+    },
+    introspect: async grantId => grants.get(grantId) ?? null,
+    revoke: async (grantId, current) => {
+      if (grants.get(grantId)?.ownerId !== current.memberId) throw new Error('grant revoke refused');
+      grants.delete(grantId);
+    },
+    revokeIssued: async grantId => { grants.delete(grantId); },
+  };
   const publisher = createDynamicAppPublisher({ sourceRoot: join(root, 'sources'), sealRoot: join(root, 'seals'),
     runtimeRoot: join(root, 'runtime'), appHost, testMemberId: owner.memberId, testHandle: owner.userSlug,
     testApprovalExpiresAt: new Date(Date.now() + 60_000).toISOString(),
-    issuerSourceHead: 'a'.repeat(40),
+    issuerSourceHead: 'a'.repeat(40), relayKeyId: () => 'synthetic-relay-key', deploymentGrants,
     approveArtifact: () => true,
     verifyPublic: async url => {
       const response = await appHost.handle(new Request(url, { headers: { host: new URL(url).host } }));
       return { status: response?.status ?? 404, marker: response?.headers.get('x-elanous-dynamic-route') ?? null };
     } });
-  const route = createDynamicAppPublishRoute(publisher, async request =>
-    request.headers.get('authorization') === 'Bearer aps_fake_owner' ? owner : null);
+  const route = createDynamicAppPublishRoute(publisher, async request => (
+    request.headers.get('authorization') === 'Bearer aps_fake_owner' ? owner : null), undefined, true);
   const call = async (action: string, deploymentId?: string) => {
     const response = await route(new Request('http://localhost/v1/apps/demo-app/dynamic-deployment', {
       method: 'POST', headers: { authorization: 'Bearer aps_fake_owner', 'content-type': 'application/json' },
       body: JSON.stringify({ action, runId: 'run-relay', ...(deploymentId ? { deploymentId } : {}) }),
     }));
-    if (response?.status !== 200) throw new Error('dynamic product route refused');
+    if (response?.status !== 200) throw new Error('dynamic product route refused ' + action + ' ' + response?.status + ' ' + await response?.clone().text());
     return await response.json() as Record<string, string>;
   };
   try {

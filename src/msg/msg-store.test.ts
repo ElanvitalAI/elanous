@@ -502,8 +502,8 @@ describe('durable message log and cursor', () => {
         .run('TC', 'OP', 'old answer', '2026-10-01T00:01:00.000Z');
     } finally { legacy.close(); }
 
-    const oldQuestion = { id: 1, from: 'OP', to: 'TC', body: 'old question', kind: 'memo', createdAt: '2026-10-01T00:00:00.000Z' };
-    const oldAnswer = { id: 2, from: 'TC', to: 'OP', body: 'old answer', createdAt: '2026-10-01T00:01:00.000Z' };
+    const oldQuestion = { id: 1, from: 'OP', to: 'TC', body: 'old question', kind: 'memo', intent: 'info' as const, needsAck: false, origin: { kind: 'agent' as const, seat: 'OP' }, schemaVersion: 1, createdAt: '2026-10-01T00:00:00.000Z' };
+    const oldAnswer = { id: 2, from: 'TC', to: 'OP', body: 'old answer', intent: 'info' as const, needsAck: false, origin: { kind: 'agent' as const, seat: 'TC' }, schemaVersion: 1, createdAt: '2026-10-01T00:01:00.000Z' };
     const readOnly = new MsgStore(path, { readOnly: true });
     try {
       expect(readOnly.getMessage(1)).toEqual(oldQuestion);

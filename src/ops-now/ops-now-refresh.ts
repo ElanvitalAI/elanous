@@ -95,6 +95,6 @@ export async function refreshOpsNow(deps: OpsNowDeps = {}): Promise<OpsNowResult
   const saved = saveMemory({
     type: 'project', name: 'ops-now', description: existing?.description ?? '지금 운영 상태 — 채널 📌안내 갱신',
     body, id: existing?.id, priority: existing?.priority, pinned: true, staleAfterMinutes: 120,
-  }, root);
+  }, root, { origin: 'ops-now-refresh' });
   return finish('updated', notices.length, body.length, saved.id);
 }

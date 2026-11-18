@@ -89,11 +89,31 @@ describe('KeychainBackend (stubbed security CLI)', () => {
     expect(await back.get('missing')).toBeUndefined();
   });
 
+  /** `security -i` reads `add-generic-password … -s <id> -X <hex>` from stdin; read-back confirms. */
+  function statefulKeychain(): ReturnType<typeof createKeychainBackend> {
+    const items = new Map<string, string>();
+    return createKeychainBackend({
+      runCliImpl: makeStubRunCli({ security: (cmd, opts) => {
+        if (cmd[1] === '-i') {
+          const m = /-s (\S+) -X ([0-9a-f]*)/.exec(opts?.stdin ?? '');
+          if (m) items.set(m[1]!, Buffer.from(m[2]!, 'hex').toString('utf-8'));
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        const id = cmd[cmd.indexOf('-s') + 1]!;
+        if (cmd[1] === 'find-generic-password') {
+          return items.has(id) ? { stdout: `${items.get(id)}\n`, stderr: '', exitCode: 0 } : { stdout: '', stderr: '', exitCode: 44 };
+        }
+        if (cmd[1] === 'delete-generic-password') return { stdout: '', stderr: '', exitCode: items.delete(id) ? 0 : 44 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      } }),
+      indexPath: join(tmpRoot, 'kc-index.json'),
+      platformOverride: 'darwin',
+    });
+  }
+
   test('set updates index sidecar on success', async () => {
     deleteKeychainIndex({ indexPath: join(tmpRoot, 'kc-index.json') });
-    const back = makeKeychain({
-      security: (cmd) => cmd.includes('add-generic-password') ? { exitCode: 0 } : { exitCode: 0 },
-    });
+    const back = statefulKeychain();
     await back.set('alpha', 'A');
     await back.set('beta', 'B');
     expect((await back.list()).sort()).toEqual(['alpha', 'beta']);
@@ -107,10 +127,7 @@ describe('KeychainBackend (stubbed security CLI)', () => {
   });
 
   test('delete removes from index when CLI ok', async () => {
-    const back = makeKeychain({
-      security: (cmd) => cmd[0] === 'security' && cmd[1] === 'add-generic-password' ? { exitCode: 0 }
-        : cmd[1] === 'delete-generic-password' ? { exitCode: 0 } : { exitCode: 1 },
-    });
+    const back = statefulKeychain();
     await back.set('a', 'A');
     expect(await back.list()).toEqual(['a']);
     expect(await back.delete('a')).toBe(true);

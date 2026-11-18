@@ -13,7 +13,7 @@
 import { isMainThread, parentPort, workerData, Worker } from 'node:worker_threads';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { setElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDirOverrideSource, setElanousConfigDir, type ConfigDirOverrideSource } from '../elanous-config-dir.js';
 import { elanousSelfAmbientBaseParts } from './self-ambient.js';
 
 export const SELF_AMBIENT_FRESH_MS = 30_000;
@@ -147,17 +147,17 @@ function computeBasePartsInWorker(stateRoot: string | undefined, selectedRoot: s
     worker.on('error', error => finish(error instanceof Error ? error : new Error(String(error))));
     worker.on('exit', code => { if (!settled) finish(new Error(`self-ambient worker exited before answering: ${code}`)); });
     // Pin the caller's universe: a programmatic config override is not inherited by workers.
-    worker.postMessage({ stateRoot, selectedRoot });
+    worker.postMessage({ stateRoot, selectedRoot, configSource: getElanousConfigDirOverrideSource() });
   });
 }
 
 const selfAmbientWorkerPort = parentPort;
 if (!isMainThread && selfAmbientWorkerPort && workerData?.kind === 'self-ambient') {
-  selfAmbientWorkerPort.on('message', ({ stateRoot, selectedRoot }: { stateRoot?: string; selectedRoot: string }) => {
+  selfAmbientWorkerPort.on('message', ({ stateRoot, selectedRoot, configSource }: { stateRoot?: string; selectedRoot: string; configSource?: ConfigDirOverrideSource }) => {
     try {
       if (stateRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = stateRoot;
-      setElanousConfigDir(selectedRoot);
+      setElanousConfigDir(selectedRoot, configSource);
       selfAmbientWorkerPort.postMessage({ parts: elanousSelfAmbientBaseParts() });
     } catch (error) { selfAmbientWorkerPort.postMessage({ error: error instanceof Error ? error.message : String(error) }); }
   });

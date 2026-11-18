@@ -1,6 +1,6 @@
 import { currentBackend, removeCredentialSlotValue, writeCredentialSlotBatchValue, writeCredentialSlotValue } from './registry.js';
 import { assertCredentialSlotId, CREDENTIAL_SLOT_DEFINITIONS, type CredentialSlotId } from './cred-slot-schema.js';
-export { assertCredentialSlotId, CREDENTIAL_SLOT_DEFINITIONS, parseCredentialSlotId, type CredentialSlotId } from './cred-slot-schema.js';
+export { assertCredentialSlotId, assertTransferableStaticCredentialSlotId, credentialSlotTransferClass, CREDENTIAL_SLOT_DEFINITIONS, parseCredentialSlotId, type CredentialSlotId } from './cred-slot-schema.js';
 
 export interface CredentialSlotStatus {
   id: CredentialSlotId;

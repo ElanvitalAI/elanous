@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resourceUtilizationView } from '../resource-ledger/resource-utilization.js';
 import { parse } from 'yaml';
-import { readNexusRuntime } from '../nexus/runtime.js';
+import { localNexusBaseUrl } from '../nexus/local-endpoint.js';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { parseMachinePoolDeclarations, type MachinePoolDeclaration } from '../resource-ledger/machine-pool-inventory.js';
 import { assertResourceLedgerUrl } from '../../scripts/resource-ledger-url.js';
@@ -271,9 +271,8 @@ export function registerResourceLedgerCommands(resources: Command, overrides: Re
         if (expected && (expected.length !== pools.length || pools.some(pool => !expected.some(row =>
           row.purpose === pool.purpose && row.fanoutGroupId === pool.fanoutGroupId))))
           throw new Error('expected pool declarations must match replacement identities');
-        const runtime = readNexusRuntime();
-        const baseUrl = opts.url ?? process.env.ELANOUS_NEXUS_URL
-          ?? (runtime?.httpPort ? 'http://127.0.0.1:' + runtime.httpPort : undefined);
+        // Shared with the status line's fleet reader (src/nexus/local-endpoint.ts): same address, same token path.
+        const baseUrl = opts.url ?? localNexusBaseUrl();
         if (!baseUrl) throw new Error('Nexus URL unavailable');
         const bearerToken = ensureAuthToken().token;
         const results: Array<{ purpose: string; fanoutGroupId: string; created: boolean }> = [];

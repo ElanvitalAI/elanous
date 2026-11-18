@@ -96,6 +96,17 @@ describe('생성 — 자리 디렉터리에서 로컬 지시가 하나도 없을
     expect(readFileSync(path, 'utf8')).toBe(HUMAN_OPT);
   });
 
+  test('0바이트 AGENTS.local.md 는 사람 문면이 아니라 제1원칙 템플릿으로 채운다', () => {
+    const path = join(root, 'seats', 'TEST', 'AGENTS.local.md');
+    writeFileSync(path, '');
+    const r = ensureSeatLocalInstructions(join(root, 'seats', 'TEST'), { home, now });
+    expect(r).toEqual({ status: 'created', path });
+    const text = readFileSync(path, 'utf8');
+    expect(text).toContain('## 제1원칙 (요지)');
+    expect(text).toContain('**북극성**');
+    expect(text).toContain('eln msg list --to TEST');
+  });
+
   test('생성 경쟁 — 호환 파일이 나타났고 우리 파일이 그대로면 거두고, 사람이 고쳤으면 지우지 않는다', () => {
     const dir = join(root, 'seats', 'TEST');
     ensureSeatLocalInstructions(dir, { home, now, afterCreateForTest: () => writeFileSync(join(dir, 'CLAUDE.local.md'), '# 사람\n') });

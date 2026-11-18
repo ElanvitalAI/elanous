@@ -180,7 +180,7 @@ export async function runLocalProviderCommand(
     onLine(`현재: ${current}/${cfg.model || PROVIDER_DEFAULT_MODEL[current] || '기본 모델'}${selected ? ' (이 세션)' : ' (전역 기본)'}`);
     for (const [name, model] of Object.entries(PROVIDER_DEFAULT_MODEL)) {
       if (name === 'auto') continue;
-      onLine(`${name === current ? '●' : '○'} ${name} · ${model || '기본 모델'}`);
+      onLine(`${name === current ? '●' : '○'} ${name} · ${(name === current && cfg.model && cfg.model !== 'auto' ? cfg.model : model) || '기본 모델'}`);
     }
     onLine('모델: /provider models [provider] · /provider refresh [provider]');
     onLine('세션 전환: /provider use <provider> [model] · 전역 변경: --global --yes');

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  applySidetabKey, createNextSidetabHostHandler, createReplNextSidetabTool, formatSidetabLines, isNextSidetabCall, nextSidetabToolSpec,
+  applySidetabKey, createNextSidetabHostHandler, gateNextSidetabHandler, NEXT_SIDETAB_NOT_REQUESTED_ERROR, userRequestedNextSidetab, createReplNextSidetabTool, formatSidetabLines, isNextSidetabCall, nextSidetabToolSpec,
   type SidetabRow,
   sidetabRowsFromManifest,
 } from './model.js';
@@ -46,20 +46,20 @@ describe('renderer-independent sidetab model and actions', () => {
     ];
     const collapsed = sidetabRowsFromManifest(manifest, 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
     expect(collapsed.map(({ id, status }) => [id, status])).toEqual([
-      ['workspace:mission-1', 'mission-workspace'],
       ['workspace:harness-1', 'harness-workspace'],
+      ['workspace:mission-1', 'mission-workspace'],
     ]);
     const expanded = sidetabRowsFromManifest(manifest, 'project', undefined, {
       mode: 'workspaces', expandedWorkspaceIds: ['workspace:mission-1', 'workspace:harness-1'],
     });
     expect(expanded.map(({ id, kind, nestDepth }) => [id, kind, nestDepth ?? 0])).toEqual([
+      ['workspace:harness-1', 'workspace', 0],
+      ['run:agent', 'agent', 1],
       ['workspace:mission-1', 'workspace', 0],
       ['mission:agent', 'agent', 1],
       ['mission:tool', 'agent', 1],
-      ['workspace:harness-1', 'workspace', 0],
-      ['run:agent', 'agent', 1],
     ]);
-    expect(formatSidetabLines(expanded, 0, 28)[0]).toContain('워크스페이스');
+    expect(formatSidetabLines(expanded, 0, 28)[0]).toContain('Workspace');
   });
 
   test('SIDETAB-WORKSPACES-S1 gives mission and harness workspaces stable selectable rows without reordering classic sessions', () => {
@@ -79,14 +79,14 @@ describe('renderer-independent sidetab model and actions', () => {
       mode: 'workspaces', expandedWorkspaceIds: [],
     });
     expect(workspaceRows.map(({ id, label, kind }) => [id, label, kind])).toEqual([
-      ['workspace:mission-1', '미션 · mission-1', 'workspace'],
-      ['workspace:mission-2', '미션 · mission-2', 'workspace'],
-      ['workspace:harness-1', '하니스 런 · harness-1', 'workspace'],
+      ['workspace:harness-1', 'Harness run · harness-1', 'workspace'],
+      ['workspace:mission-1', 'Mission · mission-1', 'workspace'],
+      ['workspace:mission-2', 'Mission · mission-2', 'workspace'],
     ]);
     expect(new Set(workspaceRows.map(({ id }) => id)).size).toBe(workspaceRows.length);
     expect(new Set(workspaceRows.map(({ label }) => label)).size).toBe(workspaceRows.length);
     const movedSelection = applySidetabKey({ open: true, selected: 0 }, 'down', workspaceRows.length);
-    expect(workspaceRows[movedSelection.selected]?.id).toBe('workspace:mission-2');
+    expect(workspaceRows[movedSelection.selected]?.id).toBe('workspace:mission-1');
 
     const reordered = sidetabRowsFromManifest([...manifest].reverse(), 'project', undefined, {
       mode: 'workspaces', expandedWorkspaceIds: [],
@@ -101,8 +101,8 @@ describe('renderer-independent sidetab model and actions', () => {
     ];
     const grouped = sidetabRowsFromManifest(manifest, 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
     expect(grouped.map(({ id, label }) => [id, label])).toEqual([
-      ['workspace:space-a', '미션 · space-a'],
-      ['workspace:space-b', '미션 · space-b'],
+      ['workspace:space-a', 'Mission · space-a'],
+      ['workspace:space-b', 'Mission · space-b'],
     ]);
   });
 
@@ -139,13 +139,13 @@ describe('renderer-independent sidetab model and actions', () => {
       mode: 'workspaces', expandedWorkspaceIds: ['workspace:workspace-3'], filters: ['id:workspace:workspace-3'],
     });
     expect(parentMatch).toHaveLength(1);
-    expect(parentMatch[0]).toMatchObject({ id: 'workspace:workspace-3', sessionId: '40 항목', badge: 'unknown' });
+    expect(parentMatch[0]).toMatchObject({ id: 'workspace:workspace-3', sessionId: '40 items', badge: 'unknown' });
 
     const parentStatusMatch = sidetabRowsFromManifest(manifest, 'project', runState, {
       mode: 'workspaces', expandedWorkspaceIds: [], filters: ['status:harness-workspace'],
     });
     expect(parentStatusMatch.filter((row) => row.kind === 'workspace')).toHaveLength(4);
-    expect(parentStatusMatch.find((row) => row.id === 'workspace:workspace-2')).toMatchObject({ sessionId: '40 항목', badge: 'stale', attention: true });
+    expect(parentStatusMatch.find((row) => row.id === 'workspace:workspace-2')).toMatchObject({ sessionId: '40 items', badge: 'stale', attention: true });
   });
 
   test('SIDETAB-WORKSPACES does not truncate an expanded list above 256 rows', () => {
@@ -172,7 +172,7 @@ describe('renderer-independent sidetab model and actions', () => {
         id: `member:${index}:${member}`, spaceId: `space-${index}`, spaceKind, parentPtyId: 'tui:root',
       })), 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
       expect(grouped[0]).toMatchObject({
-        id: `workspace:space-${index}`, label: `워크스페이스 · space-${index}`, status: 'workspace-unclassified',
+        id: `workspace:space-${index}`, label: `Workspace · space-${index}`, status: 'workspace-unclassified',
       });
     }
   });
@@ -182,7 +182,7 @@ describe('renderer-independent sidetab model and actions', () => {
       manifestRow({ id: 'legacy:member', spaceId: 'legacy-space', spaceKind: '', parentPtyId: 'tui:root' }),
     ], 'project', undefined, { mode: 'workspaces', expandedWorkspaceIds: [] });
     expect(grouped).toEqual([expect.objectContaining({
-      id: 'workspace:legacy-space', label: '워크스페이스 · legacy-space', status: 'workspace-unclassified',
+      id: 'workspace:legacy-space', label: 'Workspace · legacy-space', status: 'workspace-unclassified',
     })]);
   });
 
@@ -208,7 +208,7 @@ describe('renderer-independent sidetab model and actions', () => {
     expect(runs).toHaveLength(8);
     expect(runs[0]).toMatchObject({ runId: 'run-17', attention: true, status: 'stuck' });
     expect(runs[1]).toMatchObject({ runId: 'run-18', attention: true, status: 'asking' });
-    expect(runs.at(-1)).toMatchObject({ kind: 'overflow', label: '+43 더' });
+    expect(runs.at(-1)).toMatchObject({ kind: 'overflow', label: '+43 more' });
 
     const filtered = sidetabRowsFromManifest(manifest, 'project', () => ({ turn: 'busy', stale: false }), {
       mode: 'runs', harnessRuns, filters: ['seat:TC', 'status:asking|stuck|failed', 'host:node-b', 'card:card-17', 'version:0.2.42'],
@@ -253,10 +253,10 @@ describe('renderer-independent sidetab model and actions', () => {
     };
 
     expect(control('agent')).toEqual({
-      actor: 'agent', badge: '🤖', label: '🤖 엘라누스 조작 중',
-      title: '🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기', emphasized: true,
+      actor: 'agent', badge: '🤖', label: '🤖 Elanous driving',
+      title: '🤖 Elanous running a mission · type to take over', emphasized: true,
     });
-    expect(control('human')).toEqual({ actor: 'human', badge: '👤', label: '사람', title: '', emphasized: false });
+    expect(control('human')).toEqual({ actor: 'human', badge: '👤', label: 'you', title: '', emphasized: false });
     const humanProvenance = ptyWriteControlState(ptyId)!;
     const humanRow = sidetabRowsFromManifest(manifest, 'test', () => ({ turn: 'busy', stale: false }), {
       all: true,
@@ -267,15 +267,15 @@ describe('renderer-independent sidetab model and actions', () => {
     expect(humanLines[2]).toContain('› 👤 busy control');
     expect(humanLines.every((line) => Bun.stringWidth(line) === 50)).toBe(true);
     expect(control('agent')).toEqual({
-      actor: 'agent', badge: '🤖', label: '🤖 엘라누스 조작 중',
-      title: '🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기', emphasized: true,
+      actor: 'agent', badge: '🤖', label: '🤖 Elanous driving',
+      title: '🤖 Elanous running a mission · type to take over', emphasized: true,
     });
     const agentRow = sidetabRowsFromManifest(manifest, 'test', () => ({ turn: 'busy', stale: false }), {
       all: true,
       controlByPtyId: { 'pty:control': { accessMode: 'auto', lastWriter: 'agent', activeMission: 'Codex task' } },
     })[0]!;
     expect(formatSidetabLines([agentRow], 0, 50)[0]).toContain('\u001b[1;36m');
-    expect(formatSidetabLines([agentRow], 0, 50)[0]).toContain('🤖 엘라누스가 미션 진행 중 · 입력하면 넘겨받기');
+    expect(formatSidetabLines([agentRow], 0, 50)[0]).toContain('🤖 Elanous running a mission · type to take over');
     expect(formatSidetabLines([agentRow], 0, 50)[2]).toContain('\u001b[1;36m');
     expect(formatSidetabLines([agentRow], 0, 50)[2]).toContain('› 🤖 busy control');
     forgetExternalWriteProvenance(ptyId);
@@ -293,7 +293,7 @@ describe('renderer-independent sidetab model and actions', () => {
     });
     const legacy = sidetabRowsFromManifest(manifest, 'test', undefined, { all: true });
 
-    expect(withControl[0]?.controlState).toEqual({ actor: 'waiting', badge: '⏸', label: '대기', title: '', emphasized: false });
+    expect(withControl[0]?.controlState).toEqual({ actor: 'waiting', badge: '⏸', label: 'idle', title: '', emphasized: false });
     expect(legacy[0]).not.toHaveProperty('controlState');
   });
 });
@@ -341,7 +341,7 @@ describe('renderer-independent sidetab model and actions', () => {
       spawn: () => ({}), kill: () => { kills++; return { ok: true }; },
     });
     expect(await currentHandler({ action: 'kill', target: 'tui:one', confirm: true })).toEqual({
-      error: '현재 TUI 세션은 사이드탭에서 종료할 수 없습니다',
+      error: 'Cannot stop this TUI session from the sidetab',
     });
     expect(kills).toBe(1);
   });
@@ -369,8 +369,8 @@ test('routes a mission through the visible Codex sidetab runner and requires mis
   });
   expect(await handler({ action: 'mission', agent: 'claude', mission: 'Review the note.' })).toMatchObject({ ok: true });
   expect(await handler({ action: 'mission', agent: 'grok', mission: 'Build the result.' })).toMatchObject({ ok: true });
-  expect(await handler({ action: 'mission', agent: 'gemini' as never, mission: 'Review the note.' })).toEqual({ error: 'agent는 codex, claude 또는 grok이어야 합니다' });
-  expect(await handler({ action: 'mission' })).toEqual({ error: 'mission 텍스트가 필요합니다' });
+  expect(await handler({ action: 'mission', agent: 'gemini' as never, mission: 'Review the note.' })).toEqual({ error: 'agent must be codex, claude, or grok' });
+  expect(await handler({ action: 'mission' })).toEqual({ error: 'mission text is required' });
   expect(missions).toEqual(['codex:Write a note.', 'claude:Review the note.', 'grok:Build the result.']);
 });
 
@@ -389,7 +389,58 @@ test('routes parallelMission to the pair runner and rejects a blank second branc
   await expect(handler({ action: 'mission', agent: 'claude', mission: 'review', parallelMission: 'implement' })).resolves.toMatchObject({
     ok: true, results: { codex: { path: '/codex.md' }, claude: { path: '/claude.md' } },
   });
-  await expect(handler({ action: 'mission', mission: 'review', parallelMission: '  ' })).resolves.toEqual({ error: 'parallelMission 텍스트가 비었습니다' });
-  await expect(handler({ action: 'mission', agent: 'grok', mission: 'review', parallelMission: 'implement' })).resolves.toEqual({ error: 'parallelMission은 Codex/Claude pair에서만 지원합니다' });
+  await expect(handler({ action: 'mission', mission: 'review', parallelMission: '  ' })).resolves.toEqual({ error: 'parallelMission text is empty' });
+  await expect(handler({ action: 'mission', agent: 'grok', mission: 'review', parallelMission: 'implement' })).resolves.toEqual({ error: 'parallelMission is only supported for a Codex/Claude pair' });
   expect(calls).toEqual(['claude:review|implement']);
+});
+
+describe('TUI-NO-UNREQUESTED-SIDETAB', () => {
+  test('an ordinary turn cannot call NextSidetab; an explicit side-tab request still can', async () => {
+    const calls: string[] = [];
+    const host = createNextSidetabHostHandler({
+      rows: () => rows, selected: () => 0,
+      switchSession: async () => { calls.push('switch'); return {}; }, attach: async () => { calls.push('attach'); return {}; },
+      detach: () => { calls.push('detach'); return {}; }, spawn: (character) => { calls.push('spawn'); return { spawned: character }; },
+      kill: () => { calls.push('kill'); return {}; },
+      runMission: async () => { calls.push('mission'); return { ok: true }; },
+    });
+    // Original HAND-TUI-D turn texts (session a3d6ccd6, 2026-11-16) that led to unrequested NextSidetab calls.
+    for (const text of [
+      '결과·변경 파일·막힌 점을 셸 명령 eln msg post --from HAND-TUI-D --to OP 로 보고.',
+      'OP 승인: push 하고 draft PR 만들어라. 셸로 gh 직접 사용 가능하면 써도 됨.',
+      undefined,
+    ]) {
+      expect(userRequestedNextSidetab(text)).toBe(false);
+      const gated = gateNextSidetabHandler(host, text);
+      expect(await gated({ action: 'mission', agent: 'codex', mission: 'push and open a PR' })).toEqual({ error: NEXT_SIDETAB_NOT_REQUESTED_ERROR });
+      expect(await gated({ action: 'new', character: 'shell' })).toEqual({ error: NEXT_SIDETAB_NOT_REQUESTED_ERROR });
+    }
+    expect(calls).toEqual([]);
+    expect(await gateNextSidetabHandler(host, '사이드탭에 셸 하나 열어줘')({ action: 'new', character: 'shell' })).toEqual({ spawned: 'shell' });
+  });
+});
+
+test('SIDETAB-MISSION-NONBLOCKING: with onMissionSettled the mission answers at once and reports when it settles', async () => {
+  let finish!: (value: unknown) => void;
+  const settled: Array<{ agent: string; paired: boolean; ok: boolean; path?: string; error?: string }> = [];
+  const handler = createNextSidetabHostHandler({
+    rows: () => rows, selected: () => 0,
+    switchSession: async () => ({}), attach: async () => ({}), detach: () => ({}),
+    spawn: () => ({}), kill: () => ({}),
+    runMission: () => new Promise((resolve) => { finish = resolve; }),
+    runMissionPair: async () => { throw new Error('pair runner crashed'); },
+    onMissionSettled: (info) => settled.push(info),
+  });
+  const started = await handler({ action: 'mission', agent: 'claude', mission: 'Long job.' }) as { started?: boolean; agent?: string; message?: string };
+  expect(started.started).toBe(true);
+  expect(started.agent).toBe('claude');
+  expect(started.message).toContain('do not wait');
+  expect(settled).toEqual([]); // the runner has not finished, yet the call already returned
+  finish({ ok: true, path: '/tmp/result.md' });
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  expect(settled).toEqual([{ agent: 'claude', paired: false, ok: true, path: '/tmp/result.md' }]);
+  // A crashing runner is reported as a failure, never thrown into the turn.
+  await handler({ action: 'mission', mission: 'A', parallelMission: 'B' });
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  expect(settled.at(-1)).toMatchObject({ paired: true, ok: false, error: 'pair runner crashed' });
 });

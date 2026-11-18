@@ -1,5 +1,6 @@
 /** Grok search — X/웹/레딧 검색 전용 (채팅은 향후 omni-llm으로 분리) */
 
+import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
 import { requireEnv, refreshKeysFromCache } from './env.js';
 import type { GrokSearchMode, CrawlResult } from './types.js';
 
@@ -54,11 +55,11 @@ export async function searchGrok(opts: GrokSearchOpts): Promise<CrawlResult> {
   //     ⓐ 키가 바뀌었다 → 낡은 env 였다. 갱신하고 **한 번만** 재시도한다.
   //     ⓑ 키가 그대로다 → 키는 최신인데 거절당한 것 = 진짜 크레딧/한도 문제.
   //   ⛔ 재시도는 **1회뿐**이다. 무한 재시도는 요금을 쓰면서 같은 답을 받는다.
-  const send = (key: string) => fetch(API_URL, {
+  const send = (key: string) => llmNetworkFetch(API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
     body: JSON.stringify(payload),
-  });
+  }, { provider: 'grok', model, role: 'aux', requestedBy: 'omni-crawl' });
   let res = await send(apiKey);
   if (res.status === 401 || res.status === 403) {
     const changed = refreshKeysFromCache('XAI_API_KEY');

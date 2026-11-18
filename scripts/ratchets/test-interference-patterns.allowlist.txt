@@ -21,7 +21,6 @@ body-dynamic-import	scripts/video-free-line.test.ts	9
 body-dynamic-import	scripts/video-pipeline.test.ts	1
 body-dynamic-import	scripts/webclone/loop/band-provenance.test.ts	2
 body-dynamic-import	src/acp/backend-registry.test.ts	1
-body-dynamic-import	src/agent-substrate/self-review-cli.test.ts	2
 body-dynamic-import	src/agent/coding-core-tools.test.ts	4
 body-dynamic-import	src/agent/run-context.test.ts	1
 body-dynamic-import	src/autopilot/discovery/doc-curation.test.ts	1

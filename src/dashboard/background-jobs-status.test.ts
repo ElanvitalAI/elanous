@@ -49,7 +49,7 @@ describe('background-jobs-status — TUI-BG-JOB-VISIBILITY (#71)', () => {
     const { logs, redraws, status, surf } = wired();
     const job = fakeHandle('job', 'bg');
     surf.track(job);
-    expect(strip(backgroundJobsSegment(status.summary()))).toBe('⧗ 백그라운드 1');
+    expect(strip(backgroundJobsSegment(status.summary()))).toBe('⧗ background 1');
     job.emitStatus('completed');
     expect(backgroundJobsSegment(status.summary())).toBe('');
     expect(redraws).toEqual([1, 0]);

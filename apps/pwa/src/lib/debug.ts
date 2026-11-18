@@ -18,6 +18,8 @@
  * HMR dev(cross-origin 404) 에서도 콘솔 출력은 불변. 페이지 이탈 시
  * sendBeacon 으로 마지막 배치 flush.
  */
+import { authRequiredNow } from './auth-required';
+import { loadDaemonConfig } from './daemon-config';
 
 let enabled = true; // PWA default on; toggleable via setDebugEnabled(false)
 
@@ -166,6 +168,13 @@ export class DebugForwarder {
   async flush(): Promise<void> {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this.inFlight || this.queue.length === 0) return;
+    // WEB-FIRST-CONNECT-ONBOARDING: a device the Nexus refuses (401 seen) holds its records instead of posting a
+    // batch that is denied every time (mshq 11-17: «nexus.auth default-deny /v1/debug-logs/batch» every 30 s). The
+    // queue (capped as before) goes out once the device is connected again.
+    if (authRequiredNow()) {
+      if (this.timer === null) this.timer = setTimeout(() => { void this.flush(); }, RETRY_MAX_MS);
+      return;
+    }
     const batch = this.queue.slice(0, MAX_BATCH);
     this.inFlight = true;
     let ok = false;
@@ -270,27 +279,40 @@ export class DebugForwarder {
     };
   }
 
-  /** 페이지 이탈 flush — sendBeacon(헤더 불가·same-origin 이라 auth 통과). */
-  beaconFlush(): void {
-    if (this.queue.length === 0) return;
+  /** 페이지 이탈 flush. WEB-FIRST-CONNECT-ONBOARDING (#38209 REVIEW-1 ②, the same shape as `flush`): a refused
+   *  device holds its records here too, and the batch goes with the stored token through a keepalive fetch — the old
+   *  sendBeacon could carry no header, so a device without a same-origin cookie posted a batch that was always denied
+   *  and dropped those records. */
+  beaconFlush(post: (body: string) => boolean = keepalivePost): void {
+    if (this.queue.length === 0 || authRequiredNow()) return;
     try {
-      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-        const batch = this.queue.slice(0, MAX_BATCH);
-        const blob = new Blob([JSON.stringify({ records: batch })], { type: 'application/json' });
-        if (navigator.sendBeacon(ENDPOINT, blob)) this.queue.splice(0, batch.length);
-      }
+      const batch = this.queue.slice(0, MAX_BATCH);
+      if (post(JSON.stringify({ records: batch }))) this.queue.splice(0, batch.length);
     } catch { /* best-effort */ }
   }
 
   get pending(): number { return this.queue.length; }
 }
 
+/** Page-leave send: a keepalive fetch outlives the page and, unlike sendBeacon, carries the token. Fire and forget. */
+function keepalivePost(body: string): boolean {
+  if (typeof fetch !== 'function') return false;
+  const { baseUrl, token } = loadDaemonConfig();
+  void fetch(`${baseUrl.replace(/\/+$/, '')}${ENDPOINT}`, {
+    method: 'POST', keepalive: true, body,
+    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+  }).catch(() => {});
+  return true;
+}
+
 async function defaultPost(body: string): Promise<boolean> {
   // 상대 URL — PWA 는 데몬 origin 에서 서빙(same-origin auth 통과). HMR
   // dev(:3210 cross-origin)에선 404 → 실패로 큐 유지(콘솔은 불변).
-  const res = await fetch(ENDPOINT, {
+  // The stored connection's token, like every other request (a tailnet device has no same-origin cookie).
+  const { baseUrl, token } = loadDaemonConfig();
+  const res = await fetch(`${baseUrl.replace(/\/+$/, '')}${ENDPOINT}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body,
     keepalive: true,
     // ⛔⭐ 상한이 «없으면» 이 await 이 영영 안 끝나고 포워더가 잠긴다(`POST_TIMEOUT_MS` 주석).

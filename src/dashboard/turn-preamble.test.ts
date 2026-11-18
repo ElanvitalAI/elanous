@@ -184,9 +184,11 @@ describe('buildDashboardTurnPreamble — L1 자리 부트 카드(TUI-SESSION-BOO
 });
 
 describe('buildDashboardTurnPreamble — 제어 표면', () => {
+  // 한 번만 만든다 — 비교하는 두 빌드의 작업 디렉터리가 달라 «Environment» 절이 갈리면 제어 표면과 무관한 차이가 난다.
+  const controllerCwd = mkdtempSync(join(tmpdir(), 'preamble-controller-'));
   const build = (controlEnv?: { controller?: string; channels?: string }) => buildDashboardTurnPreamble({
     userText: 'continue',
-    cwd: mkdtempSync(join(tmpdir(), 'preamble-controller-')),
+    cwd: controllerCwd,
     userConfig: fakeConfig,
     ...(controlEnv !== undefined ? { controlEnv } : {}),
   });

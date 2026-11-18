@@ -88,12 +88,13 @@ export function attachTurnTypeaheadPendingId(
 }
 
 /**
- * 턴 «안» 주입(steer) 대상인가. ⛔ 슬래시는 뺀다 — 명령은 턴이 끝난 뒤 FIFO 로만 실행한다
- * (모델에 `/…` 문면이 발화로 들어가면 명령이 아니라 잡음이다 · Claude Code 도 같은 경계에서 뺀다).
+ * 턴 «안» 주입(steer) 대상인가. ⛔ 슬래시 명령과 `!` 셸 줄은 뺀다 — 둘 다 턴이 끝난 뒤 FIFO 로만 실행한다
+ * (모델에 `/…`·`!…` 문면이 발화로 들어가면 명령이 아니라 잡음이다 · Claude Code 도 같은 경계에서 뺀다 ·
+ * 내부 문서 `ELN-STEER-AND-TOOL-WATCHDOG` §6 «슬래시·셸은 늘 queue»).
  */
 export function isTurnTypeaheadSteerable(text: string): boolean {
   const trimmed = text.trim();
-  return trimmed.length > 0 && !trimmed.startsWith('/');
+  return trimmed.length > 0 && !trimmed.startsWith('/') && !trimmed.startsWith('!');
 }
 
 export function createTurnTypeaheadState(): TurnTypeaheadState {

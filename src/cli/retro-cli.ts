@@ -3,6 +3,7 @@ import type { Command } from 'commander';
 import { readRunExits } from '../harness/harness-incidents.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
+import { debug } from '../debug/log.js';
 
 type RetroFact = { store: string; at: string; category: string; event: string; kind: 'draft-birth' | 'draft-death' | 'stop-reason' | 'ta-outcome' | 'incident'; data: unknown };
 
@@ -23,18 +24,29 @@ export function parseRetroSince(value: string, now = Date.now()): number {
   return now - duration;
 }
 
-export function collectRetroFacts(sinceMs: number, targets: readonly { name: string; dbPath: string }[] = [{ name: 'current', dbPath: logsDbPath() }], incidentRoot?: string): { facts: RetroFact[]; unavailable: string[] } {
+export type RetroFactsTiming = { totalMs: number; rowsScanned: number; pages: number;
+  stores: Array<{ name: string; ms: number; rows: number; pages: number }>; incidentsMs: number };
+
+export function collectRetroFacts(sinceMs: number, targets: readonly { name: string; dbPath: string }[] = [{ name: 'current', dbPath: logsDbPath() }], incidentRoot?: string,
+  clock: () => number = () => performance.now()): { facts: RetroFact[]; unavailable: string[]; timing: RetroFactsTiming } {
   const facts: RetroFact[] = [];
   const unavailable: string[] = [];
   const untilMs = Date.now();
+  const started = clock();
+  const timing: RetroFactsTiming = { totalMs: 0, rowsScanned: 0, pages: 0, stores: [], incidentsMs: 0 };
   for (const target of targets) {
     if (!existsSync(target.dbPath)) { unavailable.push(target.name); continue; }
+    const storeStarted = clock();
+    const storeTiming = { name: target.name, ms: 0, rows: 0, pages: 0 };
     try {
       const store = LogStore.openReadOnly(target.dbPath);
       try {
         let beforeId: number | undefined;
         for (;;) {
-          const rows = store.query({ sinceMs, beforeId, limit: 1000 });
+          // Only the fact events can match below; filtering in SQL avoids paging every log row in the window.
+          const rows = store.query({ sinceMs, untilMs, events: [...FACT_EVENTS.keys()], beforeId, limit: 1000 });
+          storeTiming.rows += rows.length;
+          storeTiming.pages++;
           for (const row of rows) {
             if (Date.parse(row.ts) > untilMs) continue;
             const kind = FACT_EVENTS.get(row.event);
@@ -54,7 +66,12 @@ export function collectRetroFacts(sinceMs: number, targets: readonly { name: str
         }
       } finally { store.close(); }
     } catch { unavailable.push(target.name); }
+    storeTiming.ms = Math.round(clock() - storeStarted);
+    timing.stores.push(storeTiming);
+    timing.rowsScanned += storeTiming.rows;
+    timing.pages += storeTiming.pages;
   }
+  const incidentsStarted = clock();
   try {
     for (const row of readRunExits(incidentRoot ?? effectiveInstanceRoot())) {
       if (Date.parse(row.at) < sinceMs) continue;
@@ -62,8 +79,13 @@ export function collectRetroFacts(sinceMs: number, targets: readonly { name: str
         data: { runId: row.runId, seat: row.seat, entrance: row.entrance } });
     }
   } catch { unavailable.push('incidents'); }
+  timing.incidentsMs = Math.round(clock() - incidentsStarted);
   facts.sort((a, b) => b.at.localeCompare(a.at));
-  return { facts, unavailable };
+  timing.totalMs = Math.round(clock() - started);
+  // Observation for the slow-on-mshq report: where the time went, per store, read with `elanous logs`.
+  try { debug.log('retro', 'facts-timing', { sinceMs, untilMs, facts: facts.length, unavailable, ...timing }); }
+  catch { /* A broken logger never changes the facts. */ }
+  return { facts, unavailable, timing };
 }
 
 export function registerRetroCommands(program: Command): void {

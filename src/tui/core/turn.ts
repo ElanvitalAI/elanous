@@ -2,6 +2,7 @@
 import type { AgentDisplayEvent } from './agents.js';
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
 import { NextTuiAuthError, type NextTuiAuthFailureKind } from '../../tui-client/next-auth-preflight.js';
+import type { PlanWire } from '../../code-edit/plan-wire.js';
 export interface NextTuiTurnInput {
   readonly sessionId: string;
   readonly text: string;
@@ -11,12 +12,15 @@ export interface NextTuiTurnInput {
 export interface NextTuiTurnResult {
   readonly goalComplete?: boolean;
   readonly goalStopReason?: string;
+  /** The plan state at turn end — the structured outcome the end-of-turn gate reads. */
+  readonly planOutcome?: PlanWire;
 }
 
 export interface NextTuiTurnOutcome {
   readonly kind: 'completed' | 'cancelled' | 'failed';
   readonly goalComplete: boolean;
   readonly goalStopReason?: string;
+  readonly planOutcome?: PlanWire;
   readonly compacted: boolean;
   readonly compactNote?: string;
   readonly error?: string;
@@ -44,6 +48,8 @@ export interface NextTuiTurnHandle {
   readonly controller: AbortController;
   readonly done: Promise<NextTuiTurnOutcome>;
   abort(): void;
+  /** Deliver a throttled preview now, so an ordered event (a tool start) sees all text before it. */
+  flushPreview(): void;
 }
 
 /** Run one turn; stream preview is provisional until the caller reloads canonical history on settle. */
@@ -117,6 +123,15 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
     }
   };
   const done = Promise.resolve().then(async (): Promise<NextTuiTurnOutcome> => {
+    // A turn already aborted before this microtask (Esc, or a stall that never opened) skips
+    // run() and settles cancelled, so nothing can announce a turn that never started (A207).
+    if (settled || controller.signal.aborted) {
+      settled = true;
+      clearRenderTimer();
+      const cancelled: NextTuiTurnOutcome = { kind: 'cancelled', goalComplete: false, compacted: false };
+      await deps.onSettled?.(cancelled);
+      return cancelled;
+    }
     let result: NextTuiTurnResult | void = undefined;
     let error: string | undefined;
     let authFailureKind: NextTuiAuthFailureKind | undefined;
@@ -140,6 +155,7 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
       kind: controller.signal.aborted ? 'cancelled' : error ? 'failed' : 'completed',
       goalComplete: result?.goalComplete === true,
       ...(result?.goalStopReason ? { goalStopReason: result.goalStopReason } : {}),
+      ...(result?.planOutcome ? { planOutcome: result.planOutcome } : {}),
       compacted,
       ...(compactNote ? { compactNote } : {}),
       ...(error ? { error } : {}),
@@ -148,7 +164,13 @@ export function startNextTuiTurn(input: Omit<NextTuiTurnInput, 'signal'>, deps: 
     await deps.onSettled?.(outcome);
     return outcome;
   });
-  return { controller, done, abort: () => controller.abort() };
+  const flushPreview = (): void => {
+    if (renderTimer === null || settled || controller.signal.aborted) return;
+    clearRenderTimer();
+    lastRender = now();
+    deps.onPreview?.(preview, false, previewSource);
+  };
+  return { controller, done, abort: () => controller.abort(), flushPreview };
 }
 
 /** User submissions take priority; a cancelled turn cannot open an automatic follow-up. */

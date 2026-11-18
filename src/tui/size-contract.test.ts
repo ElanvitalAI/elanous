@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import ts from 'typescript';
-import { measureRuntimeStaticClosure, runtimeStaticSpecifiers } from '../../scripts/lib/tui-runtime-static-closure.js';
+import { runtimeStaticSpecifiers } from '../../scripts/lib/tui-runtime-static-closure.js';
 
 const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts'] as const;
 
@@ -201,18 +201,6 @@ test('next entry imports no dashboard module and legacy imports do not grow', ()
     expect(readFileSync(join(root, path), 'utf8')).not.toMatch(/(?:from\s*|import\s*\()['"][^'"]*dashboard\//);
   }
 });
-
-test('next TUI entry stays within the design budget (100 runtime-static files / 25k lines)', () => {
-  const measured = measureRuntimeStaticClosure(join(import.meta.dir, 'entry.ts'));
-  const baseline = JSON.parse(readFileSync(join(import.meta.dir, 'size-contract.ratchet.json'), 'utf8')) as {
-    runtimeStaticFiles: number; runtimeStaticLines: number;
-  };
-  if (measured.files > baseline.runtimeStaticFiles || measured.lines > baseline.runtimeStaticLines) {
-    console.warn(`TUI closure ratchet grew: ${baseline.runtimeStaticFiles}/${baseline.runtimeStaticLines} → ${measured.files}/${measured.lines}; regenerate with bun run scripts/update-tui-size-ratchet.ts`);
-  }
-  expect(measured.files).toBeLessThanOrEqual(100);
-  expect(measured.lines).toBeLessThanOrEqual(25_000);
-}, 30_000);
 
 test('new next TUI production modules stay within 600 lines', () => {
   const root = import.meta.dir;

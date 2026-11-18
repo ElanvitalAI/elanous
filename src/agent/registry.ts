@@ -106,6 +106,8 @@ export class AgentRegistry {
    *  task-notification queue subscribes here for background tasks;
    *  future roster panes will too. */
   private taskDoneListeners = new Set<(task: AgentTask) => void>();
+  /** Listeners for a task starting to run (spawn's runner or runManaged). */
+  private taskStartListeners = new Set<(task: AgentTask) => void>();
 
   /** Create a task, start its run, and return handle. The generator is
    *  lazy — the run doesn't progress until the caller starts iterating
@@ -153,6 +155,7 @@ export class AgentRegistry {
     const events = runAgent(task, {
       ...opts,
       onTerminal: (t) => this.notifyTaskDone(t),
+      onStart: (t) => this.notifyTaskStart(t),
     });
     return { task, events };
   }
@@ -185,6 +188,7 @@ export class AgentRegistry {
     if (task.state !== 'pending') throw new Error(`agent task is not pending: ${id} (${task.state})`);
     task.state = 'running';
     task.startedAt = Date.now();
+    this.notifyTaskStart(task);
     try {
       const value = await runner(task.controller.signal);
       task.state = task.controller.signal.aborted ? 'aborted' : 'done';
@@ -406,6 +410,18 @@ export class AgentRegistry {
    *  responsibility — the runner fires once per task, and
    *  task-notification queue de-dups via taskId so double-fires are
    *  harmless. */
+  /** Subscribe to a task starting to run. Observer isolation like onTaskDone. */
+  onTaskStart(listener: (task: AgentTask) => void): { dispose(): void } {
+    this.taskStartListeners.add(listener);
+    return { dispose: () => { this.taskStartListeners.delete(listener); } };
+  }
+
+  notifyTaskStart(task: AgentTask): void {
+    for (const listener of this.taskStartListeners) {
+      try { listener(task); } catch { /* observer isolation */ }
+    }
+  }
+
   notifyTaskDone(task: AgentTask): void {
     if (this.taskDoneListeners.size === 0) return;
     for (const listener of this.taskDoneListeners) {

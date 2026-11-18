@@ -1,7 +1,10 @@
 import type { SerializedMessage } from '../../session/index.js';
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
+import { dimContinueBanner } from '../chat/continue-banner.js';
 import { parseToolResultEnvelope } from '../../chat/tool-render/result-text.js';
 import { fitLogLine, logViewLines, logViewLinesWithInsertions, toolFoldBlockRanges } from '../chat/log-view.js';
+import { isToolActivityLine } from '../chat/tool-activity.js';
+import { isWorkingRow } from '../chat/working-row.js';
 import { messageBlockDetailLines, nextMessageBlockDetailLevel, type TuiDetailLevel } from '../chat/message-block-view.js';
 
 const HIDDEN_INTERNAL_TOOL_NAMES = new Set(['AgentOutput', 'AgentList', 'TaskGet', 'TaskList', 'update_goal', 'UpdateGoal']);
@@ -55,6 +58,8 @@ export { fitLogLine, wrapLogLines, isToolFoldToggleKey, safeLogText, safeStatusT
 
 export interface NextTuiLogFrameInput {
   readonly messages: readonly SerializedMessage[];
+  /** Screen-only turn endings anchored to session message indexes. */
+  readonly turnEndMarkers?: readonly { readonly afterMessageIndex: number; readonly text: string }[];
   readonly messageBlocks?: readonly { readonly block: MessageBlock; readonly level?: TuiDetailLevel; readonly rawText?: string; readonly afterMessageIndex?: number }[];
   readonly columns: number;
   readonly rows: number;
@@ -62,8 +67,12 @@ export interface NextTuiLogFrameInput {
   readonly footer: readonly string[];
   readonly promptLine: string;
   readonly promptLines?: readonly string[];
+  /** Rows under the input — the last rows of the screen (the status line at `position: bottom`, DESIGN §2b). */
+  readonly belowPrompt?: readonly string[];
   readonly notices: readonly string[];
   readonly activity: readonly string[];
+  /** Plain rows shown right after a history message index (e.g. a settled turn's tool rows). */
+  readonly inlineInsertions?: ReadonlyMap<number, readonly string[]>;
   /** Lines above the bottom; zero follows new output. */
   readonly scroll: number;
   readonly expandedToolIndexes: ReadonlySet<number>;
@@ -178,6 +187,9 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
   const visibleMessageBlocks = (input.messageBlocks ?? []).filter(({ block }) =>
     block.body.kind !== 'tool-call' || !lifecycleToolCalls.has(block.body.title));
   const insertions = new Map<number, string[]>();
+  for (const [anchor, rows] of input.inlineInsertions ?? []) {
+    if (anchor >= 0 && anchor < input.messages.length && rows.length > 0) insertions.set(anchor, [...rows]);
+  }
   const blockRanges: Array<{ kind: 'message'; id: string; start: number; end: number; anchor: number }> = [];
   let priorBlockLines = 0;
   for (const { block, level, rawText, afterMessageIndex } of visibleMessageBlocks) {
@@ -185,35 +197,69 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
     const anchor = Math.min(input.messages.length - 1, Math.max(0, afterMessageIndex ?? input.messages.length - 1));
     const rows = insertions.get(anchor) ?? [];
     const rendered = messageBlockDetailLines(block, level, input.columns, rawText);
-    const prefixLines = anchor >= 0 ? logViewLines(historyMessages.slice(0, anchor + 1), input.columns, input.expandedToolIndexes).length : 0;
+    const prefixLines = (anchor >= 0 ? logViewLines(historyMessages.slice(0, anchor + 1), input.columns, input.expandedToolIndexes).length : 0)
+      + inlineRowsAt(input, anchor + 1, anchor);
     if (rendered.length > 0) blockRanges.push({ kind: 'message', id: block.id,
       start: prefixLines + priorBlockLines, end: prefixLines + priorBlockLines + rendered.length - 1, anchor });
     rows.push(...rendered);
     priorBlockLines += rendered.length;
     insertions.set(anchor, rows);
   }
+  for (const marker of input.turnEndMarkers ?? []) {
+    if (marker.afterMessageIndex < 0 || marker.afterMessageIndex >= input.messages.length) continue;
+    const rows = insertions.get(marker.afterMessageIndex) ?? [];
+    // Fit the trusted marker before applying its color; fitLogLine strips ANSI SGR.
+    rows.push(`\x1b[34m${fitLogLine(marker.text, input.columns)}\x1b[0m`);
+    // Separate the marker from the next turn's user row; the latest marker needs no trailing blank.
+    if (marker.afterMessageIndex < input.messages.length - 1) rows.push('');
+    insertions.set(marker.afterMessageIndex, rows);
+  }
   const foldTargets: Array<{ kind: 'message'; id: string; start: number; end: number } | { kind: 'tool'; index: number; start: number; end: number }> = [
     ...blockRanges.map(({ kind, id, start, end }) => ({ kind, id, start, end })),
     ...toolFoldBlockRanges(historyMessages, input.columns, input.expandedToolIndexes).map((range) => {
-      const offset = blockRanges.filter((block) => block.anchor < range.index).reduce((sum, block) => sum + block.end - block.start + 1, 0);
+      const offset = blockRanges.filter((block) => block.anchor < range.index).reduce((sum, block) => sum + block.end - block.start + 1, 0)
+        + inlineRowsAt(input, range.index);
       return { kind: 'tool' as const, index: range.index, start: range.start + offset, end: range.end + offset };
     }),
   ];
   foldTargets.sort((left, right) => left.end - right.end);
   const lines = logViewLinesWithInsertions(historyMessages, input.columns, input.expandedToolIndexes, insertions);
   // An empty transcript is normal on a new session; do not render the shared history placeholder in Next TUI.
-  return { foldTargets, lines: lines.length === 1 && lines[0] === "대화 기록 없음" ? [] : lines };
+  return { foldTargets, lines: lines.length === 1 && lines[0] === "No chat history" ? [] : lines };
+}
+
+/** Inline rows that render before history message `index` (anchors strictly below it, plus same-anchor rows first). */
+function inlineRowsAt(input: NextTuiLogFrameInput, index: number, markersBefore = index): number {
+  let sum = 0;
+  for (const [anchor, rows] of input.inlineInsertions ?? []) {
+    if (anchor >= 0 && anchor < input.messages.length && anchor < index) sum += rows.length;
+  }
+  for (const marker of input.turnEndMarkers ?? []) {
+    const anchor = marker.afterMessageIndex;
+    // Markers follow message blocks at the same anchor; count each marker row plus its separator.
+    if (anchor >= 0 && anchor < input.messages.length && anchor < markersBefore)
+      sum += 1 + Number(anchor < input.messages.length - 1);
+  }
+  return sum;
 }
 
 /** Cache the expensive history and fold ranges while only the viewport or prompt changes. */
 export function createNextTuiHistoryCache(): (input: NextTuiLogFrameInput) => PreparedHistory {
   let previous: { messages: NextTuiLogFrameInput['messages']; length: number; last: SerializedMessage | undefined;
-    columns: number; expanded: string; blocks: NonNullable<NextTuiLogFrameInput['messageBlocks']>; prepared: PreparedHistory } | null = null;
+    columns: number; expanded: string; markers: NextTuiLogFrameInput['turnEndMarkers'];
+    blocks: NonNullable<NextTuiLogFrameInput['messageBlocks']>;
+    inline: NextTuiLogFrameInput['inlineInsertions']; prepared: PreparedHistory } | null = null;
   return (input) => {
     const expanded = [...input.expandedToolIndexes].sort((a, b) => a - b).join(',');
     const blocks = input.messageBlocks ?? [];
     if (previous && previous.messages === input.messages && previous.length === input.messages.length
       && previous.last === input.messages.at(-1) && previous.columns === input.columns && previous.expanded === expanded
+      && previous.inline === input.inlineInsertions
+      && previous.markers?.length === input.turnEndMarkers?.length
+      && (input.turnEndMarkers ?? []).every((marker, index) => {
+        const prior = previous!.markers![index]!;
+        return prior.afterMessageIndex === marker.afterMessageIndex && prior.text === marker.text;
+      })
       && previous.blocks.length === blocks.length && blocks.every((entry, index) => {
         const prior = previous!.blocks[index]!;
         return prior.block === entry.block && prior.level === entry.level && prior.rawText === entry.rawText
@@ -221,9 +267,17 @@ export function createNextTuiHistoryCache(): (input: NextTuiLogFrameInput) => Pr
       })) return previous.prepared;
     const prepared = prepareHistory(input);
     previous = { messages: input.messages, length: input.messages.length, last: input.messages.at(-1),
-      columns: input.columns, expanded, blocks: blocks.map((entry) => ({ ...entry })), prepared };
+      columns: input.columns, expanded, markers: input.turnEndMarkers?.map((marker) => ({ ...marker })),
+      blocks: blocks.map((entry) => ({ ...entry })), inline: input.inlineInsertions, prepared };
     return prepared;
   };
+}
+
+/** Fit an activity row; tool rows («⏺ Read(file)» / «✓ Read(file) 3s») render dim so they read as progress, not reply text.
+ *  The color is applied after fitting because fitLogLine strips SGR (same as the turn-end marker). */
+export function nextTuiActivityRow(line: string, columns: number): string {
+  const fitted = fitLogLine(line, columns);
+  return isToolActivityLine(fitted) || isWorkingRow(fitted) ? `\x1b[2m${fitted}\x1b[22m` : fitted;
 }
 
 /** Pure Next TUI log layout. The session messages and fold state are never changed. */
@@ -232,14 +286,15 @@ export function renderNextTuiLogFrame(input: NextTuiLogFrameInput, prepared = pr
   const promptLines = (input.promptLines?.length ? input.promptLines : [input.promptLine]).slice(-Math.max(1, input.rows));
   const history = [
     ...prepared.lines,
-    ...input.notices.map((line) => fitLogLine(line, input.columns)),
-    ...input.activity.map((line) => fitLogLine(line, input.columns)),
+    ...input.notices.map((line) => dimContinueBanner(fitLogLine(line, input.columns))),
+    ...input.activity.map((line) => nextTuiActivityRow(line, input.columns)),
   ];
-  // A picker or health line may grow the header. Keep the prompt and footer visible.
-  const footer = input.footer.slice(0, Math.max(0, Math.min(input.footer.length, input.rows - promptLines.length)));
-  const headerBudget = Math.max(0, input.rows - footer.length - promptLines.length);
+  // A picker or health line may grow the header. Keep the prompt, the footer and the row(s) under the prompt visible.
+  const below = (input.belowPrompt ?? []).slice(0, Math.max(0, input.rows - promptLines.length));
+  const footer = input.footer.slice(0, Math.max(0, Math.min(input.footer.length, input.rows - promptLines.length - below.length)));
+  const headerBudget = Math.max(0, input.rows - footer.length - promptLines.length - below.length);
   const header = input.header.slice(0, headerBudget);
-  const bodyRows = Math.max(0, input.rows - header.length - footer.length - promptLines.length);
+  const bodyRows = Math.max(0, input.rows - header.length - footer.length - promptLines.length - below.length);
   const maxScroll = bodyRows > 0 ? Math.max(0, history.length - bodyRows) : 0;
   const scroll = Math.max(0, Math.min(input.scroll, maxScroll));
   const start = Math.max(0, history.length - bodyRows - scroll);
@@ -249,8 +304,8 @@ export function renderNextTuiLogFrame(input: NextTuiLogFrameInput, prepared = pr
   const leadingBlankRows = 0;
   const trailingBlankRows = Math.max(0, bodyRows - visibleHistory.length);
   const body = [...visibleHistory, ...Array.from({ length: trailingBlankRows }, () => '')];
-  const lines = [...header, ...body, ...footer, ...promptLines];
-  return { lines, body, promptRow: lines.length - promptLines.length + 1, scroll, maxScroll,
+  const lines = [...header, ...body, ...footer, ...promptLines, ...below];
+  return { lines, body, promptRow: lines.length - below.length - promptLines.length + 1, scroll, maxScroll,
     logWindow: { start, rows: bodyRows, columns: input.columns, bodyTop: header.length + 1, leadingBlankRows, foldTargets } };
 }
 
@@ -296,18 +351,19 @@ export function renderNextTuiCompactFrame(input: NextTuiLogFrameInput, prepared 
   const promptLines = (input.promptLines?.length ? input.promptLines : [input.promptLine]).slice(-Math.max(1, input.rows));
   const body = [
     ...prepared.lines,
-    ...input.notices.map((line) => fitLogLine(line, input.columns)),
-    ...input.activity.map((line) => fitLogLine(line, input.columns)),
+    ...input.notices.map((line) => dimContinueBanner(fitLogLine(line, input.columns))),
+    ...input.activity.map((line) => nextTuiActivityRow(line, input.columns)),
   ];
-  const bodyRows = Math.max(1, input.rows - input.header.length - input.footer.length - promptLines.length);
+  const below = input.belowPrompt ?? [];
+  const bodyRows = Math.max(1, input.rows - input.header.length - input.footer.length - promptLines.length - below.length);
   const maxScroll = Math.max(0, body.length - bodyRows);
   const scroll = Math.max(0, Math.min(input.scroll, maxScroll));
   const start = Math.max(0, body.length - bodyRows - scroll);
   // The tail stays full-length so the primary-screen painter can commit only
   // new history. A scrolled view is a temporary viewport, never new history.
   const visibleBody = scroll > 0 ? body.slice(start, start + bodyRows) : body;
-  const lines = [...input.header, ...visibleBody, ...input.footer, ...promptLines];
-  return { lines, body, promptRow: lines.length - promptLines.length + 1, scroll, maxScroll,
+  const lines = [...input.header, ...visibleBody, ...input.footer, ...promptLines, ...below];
+  return { lines, body, promptRow: lines.length - below.length - promptLines.length + 1, scroll, maxScroll,
     logWindow: { start, rows: Math.min(bodyRows, body.length), columns: input.columns,
       bodyTop: input.header.length + 1, leadingBlankRows: 0, foldTargets: prepared.foldTargets } };
 }

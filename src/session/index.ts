@@ -304,6 +304,32 @@ export interface SessionSubscriber {
   presence: SubscriberPresence;
 }
 
+/** MSG-SOURCE-HIERARCHY (대표 11-17 DESIGN-MESSAGE-SOURCE-AND-STATUSLINE §1): who sent a user-role message — from a
+ *  structured field, never from its wording. human = typed at the keyboard (the default when absent) · agent = another
+ *  seat or OP through the inbox · system = the harness itself (wakers, automatic continues, mail wake). */
+export interface MessageSource {
+  kind: 'human' | 'agent' | 'system';
+  /** agent: the sending seat (OP, TC, …). */
+  seat?: string;
+  /** agent: the inbox message id, for audit and search. */
+  msgId?: string;
+  /** agent: request · decision · info · alert. */
+  intent?: string;
+  /** agent: the request's due as local «HH:MM» (A217 request contract), shown in the head. */
+  due?: string;
+  /** system: the internal-turn origin (scheduled, goal-continue, msg-wake, …). */
+  origin?: string;
+}
+
+/** A structured source from untrusted JSON (the turn payload); anything malformed is dropped, never guessed. */
+export function parseMessageSource(value: unknown): MessageSource | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  if (row.kind !== 'human' && row.kind !== 'agent' && row.kind !== 'system') return undefined;
+  const text = (key: string) => typeof row[key] === 'string' && /^[\w.:#-]{1,80}$/u.test(row[key] as string) ? { [key]: row[key] as string } : {};
+  return { kind: row.kind, ...text('seat'), ...text('msgId'), ...text('intent'), ...text('due'), ...text('origin') };
+}
+
 export interface SerializedMessage {
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
@@ -322,12 +348,14 @@ export interface SerializedMessage {
   /** A fixed public failure marker persisted after a failed turn; partial reply text stays private. */
   replyFailure?: boolean;
   /** Trusted Next TUI preflight kind; arbitrary provider error text never sets this. */
-  replyFailureKind?: 'codex-auth-missing' | 'codex-auth-failed';
+  replyFailureKind?: 'codex-auth-missing' | 'codex-auth-failed' | 'glm-auth-missing';
   /** Per-turn stable identifier. Auto-populated by `appendMessage` when the
    *  caller omits it (SAM S0 seed · M1.2 narrow). The wire format stays a
    *  bare 26-char ULID; external inputs should pass through `asTurnUri()`
    *  to cross the brand boundary. */
   turn_id?: TurnUri;
+  /** MSG-SOURCE-HIERARCHY: who sent this user-role message (absent = human). */
+  from?: MessageSource;
 }
 
 /** Flatten LLM content for JSONL. Named tool-use keeps the live SSE wording (`🔧 <name>`);

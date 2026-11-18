@@ -49,8 +49,8 @@ export async function runResumePickerDevice(spec: ResumePickerSpec): Promise<Res
   const next = spec.tui === 'next';
   const steps: SeatPtyStep[] = next
     ? [
-        { label: 'after /resume (list)', text: '/resume', until: (s) => s.includes('최근 대화') && allPrefixes(s) },
-        { label: 'after /resume 2', text: '/resume 2', until: (s) => s.includes('대화 이어 가기 ·') || s.includes('맞는 대화 없음') },
+        { label: 'after /resume (list)', text: '/resume', until: (s) => s.includes('recent chats') && allPrefixes(s) },
+        { label: 'after /resume 2', text: '/resume 2', until: (s) => s.includes('Resuming chat ·') || s.includes('No chat matches') },
       ]
     : [
         { label: 'after /session list', text: '/session list', until: (s) => s.includes('/session list') && allPrefixes(s) },
@@ -93,7 +93,7 @@ export async function runResumePickerDevice(spec: ResumePickerSpec): Promise<Res
     return {
       spec, run, logs, store: { seeded, chosen: resumed[0]?.to ?? null },
       checks: {
-        listShownNotUsage: list.includes('최근 대화') && !list.includes('usage: /session load'),
+        listShownNotUsage: list.includes('recent chats') && !list.includes('usage: /session load'),
         uniquePrefixesShown: allPrefixes(list),
         rowsNumbered: /^\s*1\. /m.test(list) && row2 !== '',
         resumedRow2ByNumber: expected !== null && resumed.length === 1 && resumed[0]?.to === expected.id && resumed[0]?.by === 'number',

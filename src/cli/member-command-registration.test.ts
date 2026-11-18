@@ -13,7 +13,7 @@ for (const connectFirst of [false, true]) {
     if (connectFirst) { connect(); keys(); } else { keys(); connect(); }
     const parents = program.commands.filter(command => command.name() === 'member');
     expect(parents.map(command => command.name())).toEqual(['member']);
-    expect(parents[0]!.commands.map(command => command.name()).sort()).toEqual(['connect', 'key']);
+    expect(parents[0]!.commands.map(command => command.name()).sort()).toEqual(['connect', 'disconnect', 'key']);
     expect(token.commands.map(command => command.name())).toContain('mint');
   });
 }

@@ -3,10 +3,14 @@ import { registerGraphCapabilityContract, registerGraphCapabilityProviderDeclara
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
 import { nexusRuntimePath } from '../../nexus/paths.js';
 import { readLocalAppBuildIssuer } from '../../nexus/apps/app-build-local-bridge.js';
+import { BuildSourceHeadStaleError, readSourceHeadMismatch } from '../../nexus/apps/app-build-head-mismatch.js';
+import { installedCurrentHead } from '../../version/stale-install.js';
 import { codeRevision } from '../../version/code-revision.js';
 import { setTimeout as pause } from 'node:timers/promises';
 import type { InProcessHandlerContext } from '../in-process-registry.js';
 import { createSourceBuildRegistry } from './source-build.js';
+import { inspectTuiMemberSessionFile, tuiMemberSessionPath, type TuiMemberSessionFileState } from '../../tui/member-session-contract.js';
+import { assertMemberSessionCovers, MemberSessionExpiringError } from '../../tui/member-session-budget.js';
 
 export type ApprovalAction = 'approval-start' | 'approval-poll';
 export type ApprovalTransport = (action: ApprovalAction, appSlug: string, runId: string,
@@ -19,6 +23,15 @@ const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/u;
 const URL_PREFIX = 'https://api.elanous.ai/v1/members/deployment-approvals/';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 function refuse(): never { throw new Error('APP_BUILD_PUBLISH_APPROVAL_REFUSED'); }
+/** A registry without a trusted owner window (generic resume, dashboard default) reached approval. */
+export const APP_BUILD_APPROVAL_UNTRUSTED_RESUME = 'APP_BUILD_APPROVAL_UNTRUSTED_RESUME';
+/** Codes contract dispatch must not mask; the trusted CLI resume keys on them. */
+export const APP_BUILD_APPROVAL_PRESERVED_FAILURES = [APP_BUILD_APPROVAL_UNTRUSTED_RESUME,
+  'APP_BUILD_APPROVAL_PRESENTATION_RETRYABLE'] as const;
+export function appBuildUntrustedResumeError(runId: string): string {
+  const id = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(runId) ? runId : '<runId>';
+  return `${APP_BUILD_APPROVAL_UNTRUSTED_RESUME}: 신뢰 경로로 재개 필요: eln graph run <app-build.yaml> --resume ${id} --from publish-approval`;
+}
 async function bounded<T>(signal: AbortSignal, invoke: () => Promise<T>): Promise<T> {
   if (signal.aborted) refuse();
   let onAbort: () => void = () => {};
@@ -37,14 +50,21 @@ async function bounded<T>(signal: AbortSignal, invoke: () => Promise<T>): Promis
 /** Local bearer remains in host config; the bridge rechecks a fresh owner APS. */
 export function createAppBuildPublishApprovalTransport(options: {
   configDir?: string; runtimePath?: string; sourceHead?: string; fetcher?: typeof fetch;
+  installedHead?: () => string | undefined;
+  /** Token-free view of the member session the bridge will use (same path rule as Nexus). */
+  inspectSession?: () => TuiMemberSessionFileState;
 } = {}): ApprovalTransport {
   const configDir = options.configDir ?? getElanousConfigDir();
   const runtimePath = options.runtimePath ?? nexusRuntimePath();
   const sourceHead = options.sourceHead ?? codeRevision();
   const fetcher = options.fetcher ?? fetch;
+  const inspectSession = options.inspectSession ?? (() => inspectTuiMemberSessionFile(
+    tuiMemberSessionPath(configDir, process.env.ELANOUS_MEMBER_SESSION_FILE)));
   return async (action, appSlug, runId, ownerId, signal) => {
     if (!SLUG.test(appSlug) || !/^[A-Za-z0-9][A-Za-z0-9-]{0,127}$/u.test(runId)
       || !ownerId || typeof sourceHead !== 'string' || !/^[a-f0-9]{40}$/u.test(sourceHead)) refuse();
+    // APP-BUILD-SESSION-REFRESH: never let the session lapse inside the approval window.
+    assertMemberSessionCovers(action, inspectSession());
     const local = readLocalAppBuildIssuer(configDir, runtimePath);
     const deadline = signal ? AbortSignal.any([signal, AbortSignal.timeout(5_000)]) : AbortSignal.timeout(5_000);
     const response = await fetcher(local.origin + '/v1/apps/' + appSlug + '/dynamic-deployment-local', {
@@ -54,7 +74,13 @@ export function createAppBuildPublishApprovalTransport(options: {
         'x-elanous-app-build-owner': ownerId, 'x-elanous-app-build-head': sourceHead },
       body: JSON.stringify({ action, runId }),
     });
-    if (response.status !== 200) { await response.body?.cancel(); refuse(); }
+    if (response.status !== 200) {
+      // RAIL-STALE-TUI-HEAD: a 409 from the bridge names a stale TUI head; keep every other refusal anonymous.
+      const stale = await readSourceHeadMismatch(response, sourceHead,
+        { installedHead: options.installedHead ?? (() => installedCurrentHead()) });
+      if (stale) throw stale;
+      await response.body?.cancel().catch(() => {}); refuse();
+    }
     const reader = response.body?.getReader(); if (!reader) refuse();
     const chunks: Uint8Array[] = []; let length = 0;
     try { for (;;) {
@@ -97,6 +123,9 @@ export function createAppBuildPublishApprovalProvider(options: {
       ? (graphContext as Record<string, unknown>).memberId : undefined;
     const appSlug = row.appSlug;
     const action = row.action;
+    // No owner window is bound: this path can never present approval, so say how to resume instead of a vague refusal.
+    if (!options.trustedWindow)
+      return { ok: false, outcome: 'failed', error: appBuildUntrustedResumeError(context.runId) };
     let window: ReturnType<TrustedApprovalWindow> | undefined;
     try { window = options.trustedWindow?.(context); } catch { /* fail closed below */ }
     if (!ownerId || graphOwner !== ownerId || row.requireOwner !== ownerId
@@ -137,7 +166,11 @@ export function createAppBuildPublishApprovalProvider(options: {
           || value.pendingExpiresAt !== pendingExpiresAt) refuse();
       }
       refuse();
-    } catch { return { ok: false, outcome: 'failed', error: 'owner approval unavailable or refused' }; }
+    } catch (error) {
+      if (error instanceof BuildSourceHeadStaleError || error instanceof MemberSessionExpiringError)
+        return { ok: false, outcome: 'failed', error: `${error.code}: ${error.userMessage}` };
+      return { ok: false, outcome: 'failed', error: 'owner approval unavailable or refused' };
+    }
   };
 }
 
@@ -150,6 +183,7 @@ export function registerAppBuildPublishApprovalProvider(registry: GraphCapabilit
     } }, output: { type: 'object', required: ['status'], properties: { status: { type: 'string' } } } });
   return registerGraphCapabilityProviderDeclaration(withContract, { id: 'app-build-owner-publish-approval',
     provides: ['app-build.publish-approval@1'], tier: 'free',
+    preserveFailureCodes: APP_BUILD_APPROVAL_PRESERVED_FAILURES,
     invoke: createAppBuildPublishApprovalProvider({ transport: options.transport
       ?? createAppBuildPublishApprovalTransport(), presentApprovalUrl: options.presentApprovalUrl,
       trustedWindow: options.trustedWindow,
@@ -157,7 +191,8 @@ export function registerAppBuildPublishApprovalProvider(registry: GraphCapabilit
 }
 
 /** Manifest factory for the ordinary app-build graph. The TUI binds the trusted
- * owner presenter and deadline before running it; this default refuses approval. */
+ * owner presenter and deadline before running it; this default fails approval with
+ * APP_BUILD_APPROVAL_UNTRUSTED_RESUME so the run stays resumable on the trusted CLI path. */
 export function createSourceBuildWithApprovalRegistry(): GraphCapabilityRegistry {
   return registerAppBuildPublishApprovalProvider(createSourceBuildRegistry());
 }

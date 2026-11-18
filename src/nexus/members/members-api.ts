@@ -115,9 +115,9 @@ export interface MembersApiOptions {
   /** Exact website origin allowed to use the member cookie cross-origin. */
   readonly webOrigin?: string;
   readonly now?: () => number;
-  readonly appLifecycle?: Pick<AppLifecycleStore, 'ensureCreated'>;
+  readonly appLifecycle?: AppLifecycleReader;
   /** Lazily resolve the lifecycle store so transient startup failures can recover on a later read. */
-  readonly getAppLifecycle?: () => Pick<AppLifecycleStore, 'ensureCreated'>;
+  readonly getAppLifecycle?: () => AppLifecycleReader;
   /** Verifies a native Google ID token and returns only its provider subject. */
   readonly verifyMobileGoogleIdToken?: (idToken: string) => Promise<string | null>;
   /** Issues an app-scoped session after the member and app slot have been resolved server-side. */
@@ -165,6 +165,19 @@ function legacyMemberInviteLink(webOrigin: string, referralCode: string): string
   const invite = new URL('/app/signup', webOrigin);
   invite.searchParams.set('referralCode', referralCode);
   return invite.toString();
+}
+
+/** The lifecycle ledger as the member API uses it: it records the creation, and (when it can) tells whether an app has been used yet. */
+type AppLifecycleReader = Pick<AppLifecycleStore, 'ensureCreated'> & Partial<Pick<AppLifecycleStore, 'events'>>;
+
+/** The request body of a POST that may legitimately have none (an empty body is `undefined`; anything else must be JSON). */
+async function readOptionalJson(request: Request): Promise<unknown> {
+  const length = Number(request.headers.get('content-length') ?? '0');
+  if (Number.isFinite(length) && length > MAX_BODY_BYTES) throw new Error('body-too-large');
+  const text = await request.text();
+  if (Buffer.byteLength(text) > MAX_BODY_BYTES) throw new Error('body-too-large');
+  if (text.trim() === '') return undefined;
+  try { return JSON.parse(text); } catch { throw new Error('invalid-json'); }
 }
 
 async function readJson(request: Request): Promise<unknown> {
@@ -289,9 +302,9 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       } catch { return null; }
     },
   });
-  let resolvedAppLifecycle: Pick<AppLifecycleStore, 'ensureCreated'> | undefined;
+  let resolvedAppLifecycle: AppLifecycleReader | undefined;
   let hasResolvedAppLifecycle = false;
-  const appLifecycleStore = (): Pick<AppLifecycleStore, 'ensureCreated'> | undefined => {
+  const appLifecycleStore = (): AppLifecycleReader | undefined => {
     if (hasResolvedAppLifecycle) return resolvedAppLifecycle;
     const lifecycle = options.getAppLifecycle?.() ?? options.appLifecycle;
     if (lifecycle) {
@@ -346,7 +359,13 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       // The native app login form is served by this API origin. Its same-origin signup
       // POST must work without granting that origin access to member cookie routes.
       const appLoginStartOrigin = path === '/v1/members' && request.method === 'POST' && origin === callback.origin;
-      if (origin && origin !== webOrigin && !appLoginStartOrigin && !appKeyBearer && request.method !== 'GET') return json({ error: 'origin-not-allowed' }, 403);
+      // The member home (/v1/members/home) is served by this API origin too, and its «내 주소 두 가지» card writes the
+      // app name with same-origin POSTs. Those two writes — and only those — also accept this API origin (OP 11-18
+      // #85461: «이름 정하기» was refused 403 in production). Every other write (keys, tokens, deletion, handle…) keeps
+      // the website origin only; a foreign origin stays 403; a request without Origin keeps today's rule.
+      const memberHomeWrite = origin === callback.origin && request.method === 'POST'
+        && (path === '/v1/members/app-slot' || path === '/v1/members/app-slot/name');
+      if (origin && origin !== webOrigin && !appLoginStartOrigin && !memberHomeWrite && !appKeyBearer && request.method !== 'GET') return json({ error: 'origin-not-allowed' }, 403);
       if (path === '/v1/members/secret-backups' || path.startsWith('/v1/members/secret-backups/')) {
         return withCors(request, (await cloudBackupRoute.handle(request))!, webOrigin);
       }
@@ -393,7 +412,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         return respond(json({ error: 'method-not-allowed' }, 405));
       }
       if (request.method === 'OPTIONS' && [
-        '/v1/members', '/v1/members/referral-code', '/v1/members/handle', '/v1/members/validate-code', '/v1/members/try', '/v1/members/newsletter-preference', '/v1/members/app-slot', '/v1/members/app-slot/session', APP_SLOT_EXCHANGE_PATH, '/v1/members/owner', MEMBER_GOOGLE_CALLBACK_PATH,
+        '/v1/members', '/v1/members/referral-code', '/v1/members/handle', '/v1/members/validate-code', '/v1/members/try', '/v1/members/newsletter-preference', '/v1/members/app-slot', '/v1/members/app-slot/name', '/v1/members/app-slot/name-check', '/v1/members/app-slot/session', APP_SLOT_EXCHANGE_PATH, '/v1/members/owner', MEMBER_GOOGLE_CALLBACK_PATH,
       ].includes(path)) {
         if (origin !== webOrigin) return new Response(null, { status: 403 });
         return withCors(request, corsPreflight(path === '/v1/members/newsletter-preference' || path === '/v1/members/handle'
@@ -485,12 +504,42 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         const handle = options.store.handleForMember(member.id);
         const plan = options.store.memberPlanForMember(member.id);
         const html = renderMemberHomePage({
-          name: member.name, email: member.email, publicId: handle ?? '',
+          name: member.name, email: member.email, publicId: handle ?? options.store.publicIdForMember(member.id) ?? '',
           referralUrl: handle ? memberInviteLink(webOrigin, handle) : '',
           membership: { label: plan?.plan === 'free' ? '무료 멤버' : plan?.plan ?? '무료 멤버',
             note: '유료 멤버십은 2027년 2월 시작 예정입니다' },
-          connection: { linked: null, startUrl: new URL('/app/connect', webOrigin).toString() },
-          startUrl: new URL('/app', webOrigin).toString(), devices: null,
+          // MEMBER-HOME-AFTER-SIGNUP-DEADEND G1·G2·G4: connection/devices come from the member store's
+          // active (unrevoked) member keys. No key yet = honest «연결 전»; only a failed lookup stays null.
+          // The web chat API rejects a member cookie (401), so the home never links to /app/chat: a
+          // connected member gets the chat address served by the connected device (the app host),
+          // a member without a device gets the connect guide instead of a chat button.
+          ...(() => {
+            const homeUrl = new URL('/v1/members/home', request.url).toString();
+            try {
+              const keys = options.store.listMemberKeys(member.id);
+              let webChatUrl: string | undefined;
+              try {
+                const slot = keys.length > 0 ? options.store.appSlotForMember(member.id) : null;
+                webChatUrl = slot ? publicSlot(slot).url ?? undefined : undefined;
+              } catch { webChatUrl = undefined; }
+              return {
+                connection: { linked: keys.length > 0, recheckUrl: homeUrl },
+                devices: keys.map(key => ({ name: key.name, kind: '터미널 연결', lastUsed: key.lastUsedAt ?? '아직 사용 안 함' })),
+                ...(webChatUrl ? { webChatUrl } : {}),
+              };
+            } catch { return { connection: { linked: null, recheckUrl: homeUrl }, devices: null }; }
+          })(),
+          // The handle address <handle>.elanous.app is shown as text only: the relay serves <app>--<user>
+          // hosts, and the web /app redirects to «곧 열립니다», so neither is a button target.
+          myElanous: { handleAddress: handle ? `${handle}.elanous.app` : null },
+          siteUrl: new URL('/', webOrigin).toString(),
+          handleStepUrl: new URL('/members/', webOrigin).toString(),
+          // OP 11-18 (B): an app slot needs an event code (createAppSlotForMember → event-code-required). A member
+          // without a slot and without a code is told so, and is not offered a name it cannot save.
+          appName: (() => { try {
+            const slug = options.store.appSlotForMember(member.id)?.appSlug ?? null;
+            return { slug, ...(slug === null && !member.eventCode ? { needsEventCode: true as const } : {}) };
+          } catch { return { slug: null, unknown: true as const }; } })(),
           nonce,
         });
         return new Response(html, { headers: {
@@ -616,7 +665,8 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         const handle = options.store.handleForMember(member.id);
         const referralCount = options.store.referralsForMember(member.id).length;
         const { invitedBy, referralCode: _legacyReferralCode, ...ownProfile } = member;
-        const publicMember = { ...ownProfile, handle, canClaimHandle: handle === null,
+        const publicMember = { ...ownProfile, publicId: options.store.publicIdForMember(member.id), handle, canClaimHandle: handle === null,
+          canClaimReservedJoosung: handle === null && options.store.canClaimReservedJoosung(member.id),
           membership: options.store.memberPlanForMember(member.id)?.plan ?? 'free', invited: invitedBy !== null, referralCount };
         return withCors(request, json({ member: publicMember, inviteLink: handle ? memberInviteLink(webOrigin, handle) : null, referralCount,
           ...(slot ? { appSlot: publicSlot(slot) } : {}) }), webOrigin);
@@ -646,6 +696,9 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           const requested = (body as { handle: string }).handle;
           // Public handle must also be a safe relay DNS user label.
           if (!/^[a-z][a-z0-9]{2,19}$/.test(requested)) throw new Error('invalid member ID');
+          if (requested === 'user' && (authorization || member?.id !== memberId)) {
+            return withCors(request, json({ error: 'member-id-reserved' }, 403), webOrigin);
+          }
           const slot = options.store.appSlotForMember(memberId);
           const previousUrl = slot ? options.publicAppUrl?.(slot) : null;
           let previousUserSlug: string | undefined;
@@ -666,6 +719,8 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           const reason = error instanceof Error ? error.message : '';
           if (reason === 'member is not active for handle change')
             return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+          if (reason === 'reserved member ID')
+            return withCors(request, json({ error: 'member-id-reserved' }, 403), webOrigin);
           if (reason !== 'invalid member ID' && reason !== 'member ID already taken' && reason !== 'member ID cannot be changed')
             return withCors(request, json({ error: 'member-state-unavailable' }, 503), webOrigin);
           return withCors(request, json({ error: reason === 'member ID already taken' ? 'member-id-taken'
@@ -694,11 +749,65 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           const slot = synchronizeAppSlot(member.id);
           return withCors(request, slot ? json({ appSlot: publicSlot(slot) }) : json({ error: 'app-slot-not-found' }, 404), webOrigin);
         }
-        const created = options.store.createAppSlotForMember(member.id, new Date(now()).toISOString());
+        // The body is optional: no body = the legacy hash name; `{ appSlug }` = the name the member chose.
+        let requested: string | undefined;
+        try {
+          const body = await readOptionalJson(request);
+          if (body !== undefined) {
+            if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1
+              || typeof (body as { appSlug?: unknown }).appSlug !== 'string') {
+              return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin);
+            }
+            requested = (body as { appSlug: string }).appSlug;
+          }
+        } catch { return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin); }
+        const created = options.store.createAppSlotForMember(member.id, new Date(now()).toISOString(), requested === undefined ? {} : { appSlug: requested });
         if (created.outcome === 'already-exists') return withCors(request, json({ error: 'app-slot-already-exists' }, 409), webOrigin);
+        if (created.outcome === 'slug-invalid') return withCors(request, json({ error: 'invalid-app-slug', reason: created.reason }, 400), webOrigin);
+        if (created.outcome === 'slug-taken') return withCors(request, json({ error: 'app-slug-taken' }, 409), webOrigin);
         if (created.outcome !== 'created') return withCors(request, json({ error: 'event-code-required' }, 403), webOrigin);
         synchronizeAppSlot(member.id);
         return withCors(request, json({ appSlot: publicSlot(created.slot) }, 201), webOrigin);
+      }
+      if (path === '/v1/members/app-slot/name-check') {
+        if (request.method !== 'GET') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
+        const token = sessionFromCookie(request);
+        const member = token ? options.store.memberForSession(token, new Date(now()).toISOString()) : null;
+        if (!member) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        // Only a signed-in member can ask (the answer lets nobody list names), and only about one name at a time.
+        const result = options.store.appSlugAvailability(url.searchParams.get('name') ?? '', member.id);
+        return withCors(request, json(result.available ? { available: true, appSlug: result.slug } : { available: false, reason: result.reason }), webOrigin);
+      }
+      if (path === '/v1/members/app-slot/name') {
+        if (request.method !== 'POST') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
+        const token = sessionFromCookie(request);
+        const member = token ? options.store.memberForSession(token, new Date(now()).toISOString()) : null;
+        if (!member) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        let body: unknown;
+        try { body = await readJson(request); } catch { return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin); }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1
+          || typeof (body as { appSlug?: unknown }).appSlug !== 'string') {
+          return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin);
+        }
+        const current = options.store.appSlotForMember(member.id);
+        if (!current) return withCors(request, json({ error: 'app-slot-not-found' }, 404), webOrigin);
+        // A name can change only while the app has never been used: its address may already be known to others once it has.
+        // Without a ledger that can say so, the answer is no (fail closed), not «probably fine».
+        const lifecycle = appLifecycleStore();
+        if (!lifecycle?.events) return withCors(request, json({ error: 'rename-unavailable' }, 503), webOrigin);
+        let used: boolean;
+        try { used = lifecycle.events(current.appId).some(event => event.action !== 'created'); }
+        catch { return withCors(request, json({ error: 'rename-unavailable' }, 503), webOrigin); }
+        if (used) return withCors(request, json({ error: 'app-slug-locked' }, 409), webOrigin);
+        const renamed = options.store.renameAppSlotForMember(member.id, (body as { appSlug: string }).appSlug, new Date(now()).toISOString());
+        if (renamed.outcome === 'slug-invalid') return withCors(request, json({ error: 'invalid-app-slug', reason: renamed.reason }, 400), webOrigin);
+        if (renamed.outcome === 'slug-taken') return withCors(request, json({ error: 'app-slug-taken' }, 409), webOrigin);
+        if (renamed.outcome === 'rename-limit') return withCors(request, json({ error: 'app-slug-rename-limit' }, 409), webOrigin);
+        if (renamed.outcome === 'app-slot-not-found') return withCors(request, json({ error: 'app-slot-not-found' }, 404), webOrigin);
+        if (renamed.outcome !== 'renamed' && renamed.outcome !== 'unchanged') return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        synchronizeAppSlot(member.id);
+        debug.log('members.app-slug', renamed.outcome, { renamed: renamed.outcome === 'renamed' });
+        return withCors(request, json({ appSlot: publicSlot(renamed.slot), ...(renamed.outcome === 'renamed' ? { previousAppSlug: renamed.previousAppSlug } : {}) }), webOrigin);
       }
       if (path === '/v1/members/app-slot/session') {
         if (request.method !== 'POST') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
@@ -862,7 +971,9 @@ export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'iss
 } = {}): MembersApi | null {
   const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim();
   if (!redirectUri) return null;
-  const store = options.store ?? createMemberStore();
+  const reservedJoosungGoogleEmailSha256 = process.env.ELANOUS_RESERVED_JOOSUNG_GOOGLE_EMAIL_SHA256?.trim();
+  const store = options.store ?? createMemberStore({ ...(reservedJoosungGoogleEmailSha256
+    ? { reservedJoosungGoogleEmailSha256 } : {}) });
   let appLifecycle: AppLifecycleStore | undefined;
   const getAppLifecycle = () => appLifecycle ??= createAppLifecycleStore();
   const eventCode = process.env.KAIST_MEMBER_EVENT_CODE?.trim();

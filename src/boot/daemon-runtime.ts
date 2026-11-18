@@ -43,6 +43,7 @@ import {
   appendUserPromptBlocksAndBuildMessages,
 } from './daemon-history-helper.js';
 import { toolSurface } from './daemon-tools/index.js';
+import { clearAppBuildDeclineGuard } from './daemon-tools/plugin-routes.js';
 import { appendWebtermContext } from './daemon-tools/webterm-context.js';
 import { PTY_SHELL_TOOL_NAMES } from './daemon-tools/pty-shell.js';
 import {
@@ -478,6 +479,8 @@ export class DaemonSessionHistory {
     this.byId.delete(sessionId);
     this.lastTurnAt.delete(sessionId);
     this.origins.delete(sessionId);
+    // Session end: the daemon chat surface's app_build decline guard for this session goes with it.
+    clearAppBuildDeclineGuard(sessionId);
     const path = this.diskPathFor(sessionId);
     if (path && existsSync(path)) {
       try { unlinkSync(path); } catch { /* best-effort */ }

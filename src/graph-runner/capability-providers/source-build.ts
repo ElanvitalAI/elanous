@@ -2,11 +2,15 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { registerGraphCapabilityContract, registerGraphCapabilityProviderDeclaration, type GraphContractId } from '../capabilities.js';
 import type { InProcessHandlerContext, InProcessHandlerResult } from '../in-process-registry.js';
+import { bunTestCounts } from '../node-progress.js';
 import { createSourcePlanningRegistry, type PlanningModelReply } from './source-planning.js';
 import { generatePlannedFiles } from '../app-build/file-generation.js';
 import { createBuildExecution } from '../app-build/build-execution.js';
+import { BuildSourceHeadStaleError } from '../../nexus/apps/app-build-head-mismatch.js';
+import { MemberSessionExpiringError } from '../../tui/member-session-budget.js';
 import { parseTestStrategy, APP_BUILD_MAX_FILES, APP_BUILD_MAX_REPAIRS } from '../app-build/contracts.js';
 import { debug } from '../../debug/log.js';
+import { redactSecretText } from '../../debug/secret-redaction.js';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
 import { diagnoseDeploymentEnvironment, environmentContract, environmentSummary, missingMethodHint, readEnvironmentReceipt, unavailableImportHint,
   unavailableImports, writeEnvironmentReceipt, type DeploymentEnvironment } from '../app-build/deployment-environment.js';
@@ -28,8 +32,22 @@ const stages: Stage[] = ['reserve', 'grounding', 'files', 'verify', 'materialize
 const contract = (stage: Stage): GraphContractId => `source-build.${stage}@1`;
 // Same request/output transport ceiling as the A provider. Includes repair diagnostics.
 const MAX_CONTEXT_BYTES = 128 * 1024;
+export const MAX_DIAGNOSTIC_BYTES = 2 * 1024;
 const row = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const output = (context: InProcessHandlerContext, name: string) => row(row(context.outputs[name]).result);
+const diagnosticExcerpt = (diagnostic: string): string => {
+  // Normalize before redaction: ANSI can split one secret into two tokens.
+  const normalized = diagnostic.replace(/\x1b\[[0-9;]*m/gu, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/gu, '');
+  const masked = redactSecretText(normalized);
+  const characters = Array.from(masked);
+  let bytes = 0; let start = characters.length;
+  while (start > 0) {
+    const size = Buffer.byteLength(characters[start - 1]!);
+    if (bytes + size > MAX_DIAGNOSTIC_BYTES) break;
+    bytes += size; start--;
+  }
+  return characters.slice(start).join('');
+};
 
 type PlannedFile = { path: string; role: string; dependsOn: string[] };
 
@@ -219,11 +237,21 @@ export function createSourceBuildRegistry(deps: Deps = {}) {
             || input.seedRequested === true && !seedRuntimePlanMatches(planInput.plan,
               String((runtime.startCommand as string[])[1]), row(planned.architecture).testStrategy)) throw new Error('BUILD_PLAN_RUNTIME_MISMATCH');
           const resume = await host.load(grant, context.signal);
-          let generated = await generatePlannedFiles({ ...planInput, ...(resume ? { resume } : {}) }, {
+          const generate = (resumePrefix?: typeof resume) => generatePlannedFiles({ ...planInput,
+            ...(resumePrefix ? { resume: resumePrefix } : {}) }, {
             callLLM: async (prompt, options) => (await model(prompt, options.signal, initialFilesBudget)).text,
           });
+          let generated = await generate(resume);
+          // A graph repair back-edge may replace the plan. A checkpoint for the
+          // previous plan is then unusable; generate the new plan from its start.
+          // A corrupt checkpoint for the *same* plan must still fail closed.
+          const replanned = ['repair-plan', 'repair-generation', 'repair-verification']
+            .some(node => output(context, node).cause === node.slice('repair-'.length));
+          if (!generated.ok && generated.code === 'INVALID_RESUME' && resume && replanned
+            && generated.resume?.planDigest && generated.resume.planDigest !== resume.planDigest) generated = await generate();
           if (!generated.ok) {
-            const checkpoint = generated.resume ? await host.save(grant, generated.resume.planDigest, generated.files, context.signal) : undefined;
+            const checkpoint = generated.code !== 'INVALID_RESUME' && generated.resume
+              ? await host.save(grant, generated.resume.planDigest, generated.files, context.signal) : undefined;
             return { ok: false, outcome: 'failed', error: generated.code, evidence: { ...evidence(), checkpoint } };
           }
           if (!environment) throw new Error('BUILD_ENVIRONMENT_UNAVAILABLE');
@@ -259,22 +287,33 @@ export function createSourceBuildRegistry(deps: Deps = {}) {
             callLLM: async () => { throw new Error('BUILD_CHECKPOINT_INCOMPLETE'); },
           });
           if (!generated.ok) throw new Error('BUILD_CHECKPOINT_INVALID');
+          const report = context.reportProgress ?? (async () => undefined);
           for (let repair = 0; repair <= APP_BUILD_MAX_REPAIRS; repair++) {
+            const round = repair + 1;
+            await report({ round, phase: 'verify' });
             const testStrategy = row(planned.architecture).testStrategy;
             const selected = testStrategy === undefined ? undefined : parseTestStrategy(testStrategy, planInput.plan);
             const tested = await host.verify(grant, generated.files, context.signal, selected);
+            const counts = bunTestCounts(tested.diagnostic);
+            await report({ round, phase: 'test', ...(counts ? { result: counts } : {}), note: tested.passed ? 'passed' : 'failed' });
             if (tested.passed) return done({ passed: true, files: generated.files.length, repairUsed: repair,
               fileDigest: tested.fileDigest, sandbox: tested.sandbox, testStrategySha256: tested.testStrategySha256,
               testReceipts: tested.testReceipts, buildComplete: false });
             if (repair === APP_BUILD_MAX_REPAIRS) return { ok: false, outcome: 'failed', error: 'BUILD_TESTS_EXHAUSTED',
               evidence: { ...evidence(), repairUsed: repair, diagnosticSha256: createHash('sha256').update(tested.diagnostic).digest('hex'),
+                diagnosticExcerpt: diagnosticExcerpt(tested.diagnostic),
                 testStrategySha256: tested.testStrategySha256, testReceipts: tested.testReceipts } };
             const previous = new Map(generated.files.map(file => [file.path, file.content]));
             const methodHint = environment ? missingMethodHint(tested.diagnostic, environment) : '';
             generated = await generatePlannedFiles(planInput, { callLLM: async (prompt, options) => {
               const request = row(JSON.parse(prompt));
-              return (await model(JSON.stringify({ ...request, testFailure: tested.diagnostic + (methodHint ? '\nMeasured API surface:\n' + methodHint : ''),
-                previousContent: previous.get(String(row(request.file).path)) }), options.signal, repairBudgets[repair]!)).text;
+              const target = String(row(request.file).path);
+              const llmCallAt = new Date().toISOString();
+              await report({ round, phase: 'repair', target, llmCallAt, note: 'repair call started' });
+              try {
+                return (await model(JSON.stringify({ ...request, testFailure: tested.diagnostic + (methodHint ? '\nMeasured API surface:\n' + methodHint : ''),
+                  previousContent: previous.get(target) }), options.signal, repairBudgets[repair]!)).text;
+              } finally { await report({ round, phase: 'repair', target, llmCallAt, note: 'repair call ended' }); }
             } });
             if (generated.resume) await host.save(grant, generated.resume.planDigest, generated.files, context.signal);
             if (!generated.ok) return { ok: false, outcome: 'failed', error: generated.code, evidence: evidence() };
@@ -283,6 +322,7 @@ export function createSourceBuildRegistry(deps: Deps = {}) {
         }
         if (stage === 'materialize') {
           if (output(context, 'verify-repair').passed !== true) throw new Error('BUILD_TESTS_REQUIRED');
+          await context.reportProgress?.({ phase: 'materialize' });
           const resume = await host.load(grant, context.signal);
           if (!resume) throw new Error('BUILD_CHECKPOINT_REQUIRED');
           const checked = await generatePlannedFiles({ ...planInput, resume }, { callLLM: async () => { throw new Error('BUILD_CHECKPOINT_INCOMPLETE'); } });
@@ -291,12 +331,16 @@ export function createSourceBuildRegistry(deps: Deps = {}) {
           return done({ sourceRoot: created.sourceRoot, fileDigest: created.fileDigest, buildComplete: false });
         }
         if (!output(context, 'materialize').fileDigest) throw new Error('BUILD_ARTIFACT_REQUIRED');
+        await context.reportProgress?.({ phase: 'publish' });
         const published = await host.publish(grant, context.signal);
         return done({ ...published, buildComplete: true });
       } catch (error) {
         const message = error instanceof Error && /^BUILD_[A-Z_]+$/u.test(error.message) ? error.message : 'BUILD_EXECUTION_REFUSED';
-        debug.log('app-build.phase', 'blocked', { ...evidence(), error: message });
-        return { ok: false, outcome: 'failed', error: message, evidence: evidence() };
+        // RAIL-STALE-TUI-HEAD: carry the cause and fix (restart this TUI) to the log and the failure envelope.
+        const stale = error instanceof BuildSourceHeadStaleError || error instanceof MemberSessionExpiringError
+          ? { diagnosticExcerpt: error.userMessage } : {};
+        debug.log('app-build.phase', 'blocked', { ...evidence(), error: message, ...stale });
+        return { ok: false, outcome: 'failed', error: message, evidence: { ...evidence(), ...stale } };
       }
     },
   });

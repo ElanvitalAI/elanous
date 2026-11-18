@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from 'fs';
-import { effectiveInstanceRoot, normRoot } from './instance/resolve.js';
+import { effectiveInstanceRoot, effectiveStateRoot, normRoot, prodInstanceRoot } from './instance/resolve.js';
+import { resolveStaticLeaseCopy, StaticLeaseExpiredError, type ActiveStaticLease } from './secret/static-lease-consumer.js';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
@@ -41,7 +42,8 @@ export function resolveDataDir(
     return false;
   });
   if (isInstalledPackagePath(root) && !hasGit(root)) return stateData;   // 설치본(설치기 · npm)
-  if (normRoot((deps.instanceRoot ?? effectiveInstanceRoot)()) === normRoot(join(home, '.elanous'))) return stateData;
+  // state 축 뿌리 — 운영 config override 가 격리 스탬프의 data 를 운영으로 끌어오지 않는다(RESEARCH-HARNESS-ISOLATION-STATE-DIR).
+  if (normRoot((deps.instanceRoot ?? effectiveStateRoot)()) === normRoot(join(home, '.elanous'))) return stateData;
   return join(codeRoot, 'data');
 }
 
@@ -136,22 +138,47 @@ export const ENV_FILE_PATTERNS = [
 //    ⇒ 회전 직후 살아 있는 프로세스를 즉시 고치려면 `resetKeyCacheForTests()` 가 아니라
 //      **호출부의 401/403 경로**가 `refreshKeyFromCache()` 를 부른다(2안).
 const keyCache = new Map<string, string | null>();
+/** HQ-VAULT V3 — 메모이즈한 값이 «임대 사본»이면 그 임대 요약. 매 조회마다 만료를 다시 잰다(값만 기억하고 만료를 잊지 않는다). */
+const keyLease = new Map<string, ActiveStaticLease>();
 
-/** 캐시 파일 1개를 읽는다. 파일명 규약 = 환경변수명 **소문자**(`XAI_API_KEY` → `xai_api_key`). */
+/** 임대 뿌리 = 지금 config-dir(격리 우주면 그 집) ⊕ 운영 집 `~/.elanous`(호스트 임대 메타). 부팅 초기 실패는 운영 집만. */
+function staticLeaseRoots(): string[] {
+  const roots: string[] = [];
+  try { roots.push(effectiveInstanceRoot()); } catch { /* 부팅 초기 */ }
+  try { roots.push(prodInstanceRoot()); } catch { /* HOME 없음 */ }
+  return roots;
+}
+
+/** 캐시 파일 1개를 읽는다. 파일명 규약 = 환경변수명 **소문자**(`XAI_API_KEY` → `xai_api_key`).
+ *  🆕 HQ-VAULT V3 — 그 이름의 정적 키 «임대» 메타가 있으면 임대가 이긴다:
+ *    살아 있으면 임대 사본 값 · 만료/회수/사본 없음이면 `StaticLeaseExpiredError` 를 «던진다»(env 로 조용히 안 내려간다). */
 function readKeyCacheFile(envName: string): string | null {
   if (process.env.ELANOUS_KEEP_ENV_KEYS) return null;
+  const { readFileSync } = require('node:fs') as typeof import('node:fs');
+  const { homedir } = require('node:os') as typeof import('node:os');
+  const { resolve } = require('node:path') as typeof import('node:path');
+  // ⭐ 테스트 seam — `ELANOUS_KEY_CACHE_DIR` 로 캐시 디렉토리를 바꿀 수 있다.
+  //   ⛔ `HOME` 을 흔드는 방식은 **안 통한다**(2026-08-06 실측: `os.homedir()` 가 바뀐 `HOME` 을
+  //     안 따라와 회귀가 조용히 통과할 뻔했다) — 그래서 경로를 «명시 입력»으로 뺀다.
+  const dir = process.env.ELANOUS_KEY_CACHE_DIR?.trim() || resolve(homedir(), '.cache');
+  const cacheName = envName.toLowerCase();
+  const leased = resolveStaticLeaseCopy(cacheName, { roots: staticLeaseRoots(), cacheFilePath: resolve(dir, cacheName) });
+  if (leased) { keyLease.set(envName, leased.lease); return leased.value; }
+  keyLease.delete(envName);
   try {
-    const { readFileSync } = require('node:fs') as typeof import('node:fs');
-    const { homedir } = require('node:os') as typeof import('node:os');
-    const { resolve } = require('node:path') as typeof import('node:path');
-    // ⭐ 테스트 seam — `ELANOUS_KEY_CACHE_DIR` 로 캐시 디렉토리를 바꿀 수 있다.
-    //   ⛔ `HOME` 을 흔드는 방식은 **안 통한다**(2026-08-06 실측: `os.homedir()` 가 바뀐 `HOME` 을
-    //     안 따라와 회귀가 조용히 통과할 뻔했다) — 그래서 경로를 «명시 입력»으로 뺀다.
-    const dir = process.env.ELANOUS_KEY_CACHE_DIR?.trim() || resolve(homedir(), '.cache');
-    const v = readFileSync(resolve(dir, envName.toLowerCase()), 'utf-8')
+    const v = readFileSync(resolve(dir, cacheName), 'utf-8')
       .trim().replace(/^["']|["']$/g, '');
     return v || null;
   } catch { return null; }
+}
+
+/** 메모이즈한 임대 사본이 수명을 넘겼으면 디스크를 다시 읽는다 — 갱신됐으면 새 값, 아니면 `StaticLeaseExpiredError`. */
+function recheckKeyLease(envName: string): void {
+  const lease = keyLease.get(envName);
+  if (!lease || Date.now() < lease.expiresAtMs) return;
+  keyCache.delete(envName);
+  keyLease.delete(envName);
+  keyCache.set(envName, readKeyCacheFile(envName));
 }
 
 /** ⭐ 테스트 seam — 프로세스당 1회 메모이즈되는 키 캐시를 비운다.
@@ -163,11 +190,12 @@ function readKeyCacheFile(envName: string): string | null {
  *  📏 2026-08-25 실측(`D2`): `test/web-search.test.ts` 가 env 넷을 지우고도 빨갰다 —
  *  「맨 상자」 전제는 ***의도였고 선언도 돼 있었는데***, 지운 문이 넷이고 해석기가 보는 문이 더 많았다.
  *  📄 근거 = 내부 문서 `FINDING-the-bare-box-was-intended-but-the-isolation-named-four-doors-2026-08-25` */
-export function _resetKeyCacheForTests(): void { keyCache.clear(); }
+export function _resetKeyCacheForTests(): void { keyCache.clear(); keyLease.clear(); }
 
 /** 캐시 우선 조회(프로세스당 1회 읽고 기억). ⛔ 캐시가 없으면 `undefined` 가 아니라 env 로 내려간다. */
 export function keyFromCacheOrEnv(envName: string, ...envFallbacks: string[]): string | undefined {
   if (!keyCache.has(envName)) keyCache.set(envName, readKeyCacheFile(envName));
+  else recheckKeyLease(envName);
   const cached = keyCache.get(envName);
   if (cached) return cached;
   for (const name of [envName, ...envFallbacks]) {
@@ -201,7 +229,11 @@ export const DAEMON_KEY_ENV_NAMES = [...new Set([
 export function hydrateEnvFromKeyCache(names: readonly string[] = DAEMON_KEY_ENV_NAMES, env: NodeJS.ProcessEnv = process.env): string[] {
   const filled: string[] = [];
   for (const name of names) {
-    const cached = readKeyCacheFile(name);
+    let cached: string | null;
+    // ⛔ 부팅은 죽지 않는다 — 만료 임대는 `secret.lease.expired` 로 이미 시끄럽고, env 에 싣지 않는다.
+    //    이후 `keyFromCacheOrEnv(name)` 가 같은 오류를 던진다(조용한 env 폴백 0).
+    try { cached = readKeyCacheFile(name); }
+    catch (error) { if (error instanceof StaticLeaseExpiredError) continue; throw error; }
     if (!cached) continue;   // ⓐ 캐시가 없거나 비면 env 를 그대로 둔다
     keyCache.set(name, cached);
     if (env[name] !== cached) { env[name] = cached; filled.push(name); }

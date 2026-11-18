@@ -46,6 +46,9 @@ describe('light CLI entry routing', () => {
     expect(selectLightCliRoute(['tasks', '-h'])).toBe('tasks');
     expect(selectLightCliRoute(['tasks', 'hand', '--help'])).toBe('tasks');
     expect(selectLightCliRoute(['pty', 'list'])).toBe('pty');
+    expect(selectLightCliRoute(['side', 'ls'])).toBe('side');
+    expect(selectLightCliRoute(['side', 'new', '--ws', 'w'])).toBe('side');
+    expect(selectLightCliRoute(['side', 'attach'])).toBeUndefined();
     expect(selectLightCliRoute(['pty', 'snapshot', 'tui:1'])).toBe('pty');
     expect(selectLightCliRoute(['pty', 'text', 'tui:1', 'hello'])).toBe('pty');
     expect(selectLightCliRoute(['pty', 'state', 'tui:1'])).toBe('pty');

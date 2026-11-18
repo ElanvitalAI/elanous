@@ -1,8 +1,10 @@
 import { expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as os from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closeLocalChatSession, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, requestLocalChatShellActivitySnapshot, runLocalChatTurn, setNextSidetabHandler, setNextSidetabIpcEnabled, setNextTuiShellApprovalCancelHandler, setNextTuiShellApprovalHandler } from './local-chat-turn.js';
+import { NEXT_SIDETAB_NOT_REQUESTED_ERROR } from '../tui/sidetab/nl-tool.js';
+import { closeLocalChatSession, warmLocalChatSession, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, requestLocalChatShellActivitySnapshot, runLocalChatTurn, setNextSidetabHandler, setNextSidetabIpcEnabled, setNextTuiPublishApprovalHandler, setNextTuiShellApprovalCancelHandler, setNextTuiShellApprovalHandler } from './local-chat-turn.js';
 import { debug } from '../debug/log.js';
 import { BackgroundJobStatus } from '../tui/chat/background-job-status.js';
 import { appendMessage, createSession, loadSession, setActiveSessionId } from '../session/index.js';
@@ -15,6 +17,51 @@ import { LONG_SHELL_ESC_CONFIRMATION_MS, monotonicNowMs } from '../esc-abort-gat
 import { clearSessionTierOverride, setSessionTierOverride } from '../model-tier/session-override.js';
 import { listMemories } from '../memory.js';
 import { setUserConfigOverlay } from '../user-config.js';
+import { clearSessionProvider, setSessionProvider } from './session-provider.js';
+
+test('NEXT-TUI-DIFF-RENDER: a warmed child serves the first turn; a provider change replaces it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-prewarm-'));
+  const cli = join(dir, 'pid-cli.ts');
+  const spawns = join(dir, 'spawns.log');
+  writeFileSync(cli, `
+    import { appendFileSync } from 'node:fs';
+    import { createInterface } from 'node:readline';
+    appendFileSync(${JSON.stringify(spawns)}, process.pid + '\\n');
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: String(process.pid) }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'env' }));
+    }
+  `);
+  const pids: string[] = [];
+  // 출처: HARNESS-CHILD-PROVIDER-PASSTHROUGH test above — a glm turn preflights a synthetic Z.ai key.
+  const savedZaiKey = process.env.ZAI_API_KEY;
+  process.env.ZAI_API_KEY = 'synthetic-zai-prewarm';
+  try {
+    setSessionProvider('prewarm', { provider: 'glm', model: 'glm-5' });
+    expect(warmLocalChatSession('', cli)).toBe(false);
+    expect(warmLocalChatSession('prewarm', cli)).toBe(true);
+    expect(warmLocalChatSession('prewarm', cli)).toBe(false); // Already warm: no second child.
+    const spawned = () => existsSync(spawns) ? readFileSync(spawns, 'utf8').split('\n').filter(Boolean) : [];
+    for (let attempt = 0; attempt < 200 && spawned().length === 0; attempt++) await Bun.sleep(10);
+    expect(spawned()).toHaveLength(1); // The child started before any turn.
+    await runLocalChatTurn('prewarm', 'first', new AbortController().signal, cli, undefined, (delta) => pids.push(delta));
+    await runLocalChatTurn('prewarm', 'second', new AbortController().signal, cli, undefined, (delta) => pids.push(delta));
+    expect(pids[0]).toBe(spawned()[0]); // The first turn ran on the warmed child…
+    expect(pids[1]).toBe(pids[0]); // …which stays sticky.
+    expect(spawned()).toHaveLength(1);
+    setSessionProvider('prewarm', { provider: 'grok', model: 'grok-4.7' });
+    await runLocalChatTurn('prewarm', 'switched', new AbortController().signal, cli, undefined, (delta) => pids.push(delta));
+    expect(pids[2]).not.toBe(pids[0]); // A provider change still replaces a warmed child.
+    expect(spawned()).toHaveLength(2);
+  } finally {
+    if (savedZaiKey === undefined) delete process.env.ZAI_API_KEY;
+    else process.env.ZAI_API_KEY = savedZaiKey;
+    clearSessionProvider('prewarm');
+    await closeLocalChatSession('prewarm');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('standalone Codex login passes Next TUI preflight for two turns without an owner mirror', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'next-tui-standalone-codex-'));
@@ -24,7 +71,14 @@ test('standalone Codex login passes Next TUI preflight for two turns without an 
       console.log(JSON.stringify({ reply: 'ok', provider: 'openai-codex', model: 'gpt-6.1-terra' }));`);
   const priorCodexHome = process.env.CODEX_HOME;
   const priorAccessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+  // #38331 mshq preflight: with no store in the temp config dir, codexAccountReadStorePath (src/oauth/codex-owner-mirror.ts)
+  // fell back to the real ~/.elanous/auth.json, found the host's named Codex accounts and rotated away from CODEX_HOME.
+  // Bun caches HOME at startup, so the fake home is the os.homedir spy (same idiom as src/cli/fleet-screen-cli.test.ts).
+  const fakeHome = join(dir, 'home');
+  mkdirSync(fakeHome, { recursive: true });
+  const homeSpy = spyOn(os, 'homedir').mockReturnValue(fakeHome);
   try {
+    expect(os.homedir()).toBe(fakeHome);
     setElanousConfigDir(join(dir, 'config'));
     process.env.CODEX_HOME = join(dir, 'codex-home');
     mkdirSync(process.env.CODEX_HOME, { recursive: true });
@@ -38,6 +92,7 @@ test('standalone Codex login passes Next TUI preflight for two turns without an 
     await expect(runLocalChatTurn('standalone-codex', 'second', new AbortController().signal, cli)).resolves.toEqual({ goalComplete: false });
   } finally {
     await closeLocalChatSession('standalone-codex');
+    homeSpy.mockRestore();
     setUserConfigOverlay(null);
     resetElanousConfigDir();
     if (priorCodexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = priorCodexHome;
@@ -205,11 +260,14 @@ test('the sticky REPL resolves sidetab IPC against the current TUI handler', asy
   try {
     setNextSidetabIpcEnabled(true);
     setNextSidetabHandler(null);
-    await runLocalChatTurn('sidetab-ipc', 'first', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    await runLocalChatTurn('sidetab-ipc', '사이드탭 목록 보여줘', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
     setNextSidetabHandler(async () => [{ id: 'live-handler' }]);
-    await runLocalChatTurn('sidetab-ipc', 'second', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    await runLocalChatTurn('sidetab-ipc', 'show the side tab list', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    // TUI-NO-UNREQUESTED-SIDETAB: an ordinary turn cannot reach the live handler.
+    await runLocalChatTurn('sidetab-ipc', '결과를 셸 명령 eln msg post 로 보고해', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
     expect(JSON.parse(replies[0] ?? 'null')).toEqual({ error: 'Next TUI sidetab handler is not ready' });
     expect(JSON.parse(replies[1] ?? 'null')).toEqual([{ id: 'live-handler' }]);
+    expect(JSON.parse(replies[2] ?? 'null')).toEqual({ error: NEXT_SIDETAB_NOT_REQUESTED_ERROR });
   } finally {
     setNextSidetabHandler(null);
     setNextSidetabIpcEnabled(false);
@@ -268,8 +326,9 @@ test('a sticky REPL created before the human handler is installed still denies B
   try {
     setNextTuiShellApprovalHandler(null);
     await runLocalChatTurn('shell-approval-deny', 'test approval', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    // #38167: a missing host handler answers why nobody decided (`unavailable`), so the child holds instead of recording a refusal.
     expect(JSON.parse(replies[0] ?? 'null')).toEqual({
-      type: 'elanous.shell-approval.result', callId: 'approval-early', approved: false,
+      type: 'elanous.shell-approval.result', callId: 'approval-early', approved: false, reason: 'unavailable',
     });
   } finally {
     setNextTuiShellApprovalHandler(null);
@@ -685,7 +744,7 @@ test('child exit clears a previously visible background task before the next inp
   try {
     await runLocalChatTurn('task-exit', 'first', new AbortController().signal, cli);
     for (let i = 0; i < 100 && observed.at(-1) !== ''; i++) await Bun.sleep(10);
-    expect(observed).toContain('⧗ 백그라운드 1');
+    expect(observed).toContain('⧗ Background 1');
     expect(observed.at(-1)).toBe('');
     expect(status.snapshot()).toBeNull();
   } finally {
@@ -1026,7 +1085,7 @@ test('over the shared threshold: one compaction runs before the prompt reaches t
       const outcome = outcomes[0]!;
       expect(outcome.before).toBe(12);
       expect(outcome.after).toBeLessThan(12);
-      expect(outcome.status).toBe(`압축 12→${outcome.after} 메시지`);
+      expect(outcome.status).toBe(`Compacted 12→${outcome.after} messages`);
       // The child read the store after compaction: it saw the compacted count, not 12.
       expect(seen).toEqual([`seen=${outcome.after}`]);
       const calls = log.mock.calls.filter((c) => c[0] === 'tui.next' && c[1] === 'compact');
@@ -1098,7 +1157,7 @@ test('/compact compacts once regardless of the threshold', async () => {
       expect(outcome.before).toBe(8);
       expect(outcome.after).toBeLessThan(8);
       expect(loadSession(id)?.messages.length).toBe(outcome.after);
-      expect(outcome.status).toBe(`압축 8→${outcome.after} 메시지`);
+      expect(outcome.status).toBe(`Compacted 8→${outcome.after} messages`);
       expect(log).toHaveBeenCalledWith('tui.next', 'compact', { auto: false, before: 8, after: outcome.after, ms: expect.any(Number) });
     } finally {
       log.mockRestore();
@@ -1183,10 +1242,10 @@ test('next TUI in a real PTY (L3): a long session compacts before the turn, then
     pty.write('\r');
   };
   try {
-    await waitFor('before (12 seeded messages)', (s) => /^elanous$/m.test(s) && s.includes('Ctrl+Q 종료') && s.includes('xxxx'));
+    await waitFor('before (12 seeded messages)', (s) => /^elanous$/m.test(s) && s.includes('Ctrl+Q quit') && s.includes('xxxx'));
     await send('긴 대화 뒤 질문');
-    const after = await waitFor('after turn (auto compact)', (s) => s.includes('응답 완료') && s.includes(reply));
-    const auto = /압축 (\d+)→(\d+) 메시지/.exec(after);
+    const after = await waitFor('after turn (auto compact)', (s) => s.includes('Turn done') && s.includes(reply));
+    const auto = /Compacted (\d+)→(\d+) messages/.exec(after);
     expect(auto).not.toBeNull();
     const [autoBefore, autoAfter] = [Number(auto![1]), Number(auto![2])];
     expect(autoBefore).toBe(12);
@@ -1198,7 +1257,7 @@ test('next TUI in a real PTY (L3): a long session compacts before the turn, then
     expect(summary?.content).toContain(reply);
     expect(stored.slice(-2).map((m) => m.content)).toEqual(['긴 대화 뒤 질문', reply]);
     await send('/compact');
-    const manualPattern = new RegExp(`압축 (${autoAfter + 2})→(\\d+) 메시지`);
+    const manualPattern = new RegExp(`Compacted (${autoAfter + 2})→(\\d+) messages`);
     const manual = await waitFor('after /compact', (s) => manualPattern.test(s));
     const forced = manualPattern.exec(manual)!;
     expect(Number(forced[1])).toBe(autoAfter + 2);
@@ -1242,6 +1301,112 @@ test('tool activity carries only the safe target through a live child before the
     expect(JSON.stringify(events)).not.toContain('PRIVATE-stale');
   } finally {
     await closeLocalChatSession('tool-target-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('HARNESS-CHILD-PROVIDER-PASSTHROUGH: the session provider reaches the REPL child env and a switch respawns it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-provider-passthrough-'));
+  const cli = join(dir, 'provider-env-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      const seen = { pid: process.pid, provider: process.env.ELANOUS_LLM_PROVIDER ?? null, model: process.env.ELANOUS_LLM_MODEL ?? null };
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: JSON.stringify(seen) }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'env' }));
+    }
+  `);
+  const replies: string[] = [];
+  const logs = spyOn(debug, 'log');
+  // TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN: a glm turn now preflights the Z.ai key — give it a synthetic one.
+  const savedZaiKey = process.env.ZAI_API_KEY;
+  process.env.ZAI_API_KEY = 'synthetic-zai-passthrough';
+  try {
+    setSessionProvider('provider-passthrough', { provider: 'glm', model: 'glm-5' });
+    await runLocalChatTurn('provider-passthrough', 'hi', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    await runLocalChatTurn('provider-passthrough', 'again', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    setSessionProvider('provider-passthrough', { provider: 'grok', model: 'grok-4.7' });
+    await runLocalChatTurn('provider-passthrough', 'switched', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    const [first, second, third] = replies.map((reply) => JSON.parse(reply) as { pid: number; provider: string; model: string });
+    expect(first).toMatchObject({ provider: 'glm', model: 'glm-5' });
+    expect(second!.pid).toBe(first!.pid);
+    expect(third).toMatchObject({ provider: 'grok', model: 'grok-4.7' });
+    expect(third!.pid).not.toBe(first!.pid);
+    const resolves = logs.mock.calls.filter((call) => call[0] === 'child.provider' && call[1] === 'resolve').map((call) => call[2]);
+    expect(resolves).toContainEqual(expect.objectContaining({
+      mode: 'passthrough', kind: 'repl-child', parentProvider: 'glm', parentModel: 'glm-5', childProvider: 'glm', childModel: 'glm-5', source: 'session',
+    }));
+  } finally {
+    if (savedZaiKey === undefined) delete process.env.ZAI_API_KEY;
+    else process.env.ZAI_API_KEY = savedZaiKey;
+    logs.mockRestore();
+    clearSessionProvider('provider-passthrough');
+    await closeLocalChatSession('provider-passthrough');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Owner publish approval over the real child-process IPC: the URL arrives as a structured field and reaches the publish screen's
+// handler — never the plain text prompt. Without that handler (or with a URL that is not a public https URL) the request falls
+// back to the text confirmation, so the owner is never left without a way to answer.
+const publishCli = (dir: string, name: string, publish: string): string => {
+  const cli = join(dir, name);
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    if (process.env.ELANOUS_NEXT_TUI_SHELL_APPROVAL_IPC !== '1') process.exit(12);
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      const response = new Promise((resolve) => process.once('message', resolve));
+      process.send({ type: 'elanous.shell-approval.call', callId: 'p1', kind: 'graph', command: 'PLAIN-FALLBACK-TEXT', publish: ${publish} });
+      const result = await response;
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: JSON.stringify(result) }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'ipc' }));
+    }
+  `);
+  return cli;
+};
+
+test('a publish approval call reaches the publish screen handler with the URL, not the text prompt handler', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-publish-approval-ipc-'));
+  const cli = publishCli(dir, 'publish-cli.ts', "{ url: 'https://approve.example.com/a/1?t=tok', expiresAt: '2030-01-01T00:00:00Z' }");
+  const replies: string[] = [];
+  const textPrompts: string[] = [];
+  const calls: Array<{ url: string; expiresAt: string; callId: string }> = [];
+  try {
+    setNextTuiShellApprovalHandler(async (command) => { textPrompts.push(command); return false; });
+    setNextTuiPublishApprovalHandler(async (call, callId) => { calls.push({ ...call, callId }); return true; });
+    await runLocalChatTurn('publish-approval-ipc', 'test approval', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    expect(calls).toEqual([{ url: 'https://approve.example.com/a/1?t=tok', expiresAt: '2030-01-01T00:00:00Z', callId: 'p1' }]);
+    expect(textPrompts).toEqual([]);
+    expect(JSON.parse(replies[0] ?? 'null')).toEqual({ type: 'elanous.shell-approval.result', callId: 'p1', approved: true });
+  } finally {
+    setNextTuiPublishApprovalHandler(null);
+    setNextTuiShellApprovalHandler(null);
+    await closeLocalChatSession('publish-approval-ipc');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('without a publish screen, or with a URL that is not public https, the request falls back to the text confirmation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-publish-approval-fallback-'));
+  const noScreen = publishCli(dir, 'no-screen-cli.ts', "{ url: 'https://approve.example.com/a/1', expiresAt: '2030-01-01T00:00:00Z' }");
+  const badUrl = publishCli(dir, 'bad-url-cli.ts', "{ url: 'http://approve.example.com/a/1', expiresAt: '2030-01-01T00:00:00Z' }");
+  const textPrompts: string[] = [];
+  const replies: string[] = [];
+  try {
+    setNextTuiShellApprovalHandler(async (command) => { textPrompts.push(command); return true; });
+    setNextTuiPublishApprovalHandler(null);
+    await runLocalChatTurn('publish-approval-no-screen', 'test approval', new AbortController().signal, noScreen, undefined, (delta) => replies.push(delta));
+    setNextTuiPublishApprovalHandler(async () => { throw new Error('the publish screen must not get a non-https URL'); });
+    await runLocalChatTurn('publish-approval-bad-url', 'test approval', new AbortController().signal, badUrl, undefined, (delta) => replies.push(delta));
+    expect(textPrompts).toEqual(['PLAIN-FALLBACK-TEXT', 'PLAIN-FALLBACK-TEXT']);
+    for (const reply of replies) expect(JSON.parse(reply)).toMatchObject({ approved: true });
+  } finally {
+    setNextTuiPublishApprovalHandler(null);
+    setNextTuiShellApprovalHandler(null);
+    await closeLocalChatSession('publish-approval-no-screen');
+    await closeLocalChatSession('publish-approval-bad-url');
     rmSync(dir, { recursive: true, force: true });
   }
 });

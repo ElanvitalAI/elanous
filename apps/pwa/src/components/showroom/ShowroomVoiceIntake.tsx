@@ -27,6 +27,7 @@ import {
   startVoiceRecognition,
   type VoiceRecognitionSession,
 } from '@/lib/voice-intake';
+import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
 
 export interface ShowroomVoiceIntakeViewProps {
   /** 'idle' = button only · 'recording' = pulsing mic · 'review' =
@@ -219,7 +220,7 @@ export function ShowroomVoiceIntake(_props: ShowroomVoiceIntakeProps = {}) {
   const onConfirm = async (): Promise<void> => {
     if (transcript.trim().length === 0) return;
     if (!config.baseUrl) {
-      setError('Daemon URL 미설정 — Settings 에서 입력');
+      setError(NEXUS_URL_MISSING);
       return;
     }
     setPhase('submitting');

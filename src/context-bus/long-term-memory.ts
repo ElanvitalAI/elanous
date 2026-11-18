@@ -2,7 +2,7 @@ import { Database } from 'bun:sqlite';
 import { existsSync } from 'node:fs';
 import { debug, redactSecretText } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
-import { surfaceEventsDbPath } from '../domains/surface-events.js';
+import { surfaceEventsDbPath, surfaceEventsDbPathIn } from '../domains/surface-events.js';
 import { listCoordEvents, type CoordEvent } from './coord-events.js';
 
 export interface MemoryItem {
@@ -75,7 +75,10 @@ const oneLine = (text: string) => redactSecretText(text.split(/\r?\n/, 1)[0] ?? 
 
 /** Keep the reader's event selection unchanged; attach surfaces from the same read-only snapshot. */
 export function readCondenseEvents(since: string): CondenseEvent[] {
-  const path = surfaceEventsDbPath();
+  return readCondenseEventsFrom(since, surfaceEventsDbPath());
+}
+
+function readCondenseEventsFrom(since: string, path: string): CondenseEvent[] {
   if (!existsSync(path)) return [];
   const db = new Database(path, { readonly: true, strict: true });
   try {
@@ -85,6 +88,35 @@ export function readCondenseEvents(since: string): CondenseEvent[] {
     const byEvent = new Map(surfaces.map(row => [row.id, row.surface]));
     return listCoordEvents({ since }, { db }).map(event => ({ ...event, surface: byEvent.get(event.id) }));
   } finally { db.close(); }
+}
+
+export interface CondenseInputRead {
+  events: CondenseEvent[];
+  /** Every file the reader resolved, with whether it existed and how many rows it gave. */
+  sources: Array<{ path: string; role: 'canonical' | 'stray'; present: boolean; rows: number }>;
+}
+
+/** NIGHTLY-CONDENSE-INPUT-PATH — read the events of one universe through the writer's resolver.
+ *  The prod universe also unions the pre-fix stray file read-only (rows deduplicated by id). */
+export function readCondenseEventsIn(stateDir: string, since: string,
+  files: { path: string; stray?: string } = surfaceEventsDbPathIn(stateDir)): CondenseInputRead {
+  const { path, stray } = files;
+  const seen = new Set<string>();
+  const events: CondenseEvent[] = [];
+  const sources: CondenseInputRead['sources'] = [];
+  for (const [file, role] of [[path, 'canonical'], ...(stray ? [[stray, 'stray']] : [])] as Array<[string, 'canonical' | 'stray']>) {
+    const present = existsSync(file);
+    const rows = present ? readCondenseEventsFrom(since, file) : [];
+    sources.push({ path: file, role, present, rows: rows.length });
+    for (const event of rows) {
+      if (seen.has(event.id)) continue;
+      seen.add(event.id);
+      events.push(event);
+    }
+  }
+  // Stable sort by timestamp only: a single file keeps its reader's `ts, rowid` order unchanged.
+  events.sort((a, b) => a.at.localeCompare(b.at));
+  return { events, sources };
 }
 
 /** Condense one UTC day; callers persist the returned snapshot, not raw transcripts. Read-only ledger access. */

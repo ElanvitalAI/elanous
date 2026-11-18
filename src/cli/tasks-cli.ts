@@ -18,6 +18,9 @@ import { boundPrTerminal, cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COM
 import { recordWiringLiveVerified, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { PARENT_HOST_COMPATIBILITY_CONTRACT, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs } from '../task-agent/parent-host.js';
 import { buildWorkOrder } from '../task-agent/work-order-build.js';
+import { evaluateTaPreflight, renderTaPreflight, targetEvidenceMismatch, taPreflightReceipt, type TaPreflightEvidence } from '../task-agent/ta-preflight.js';
+import { parseWorkOrder } from '../task-agent/work-order.js';
+import { evidenceFromRunLedger, mergeCollectedEvidence } from '../task-agent/ta-preflight-collect.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
 import { ambiguousGreenSweepPrs, applyGreenSweepDecisions, decideGreenSweep, greenSweepCandidates, greenSweepEvidenceTestArgs, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
 import { mapInventory, renderMapReduceTable, type MapInventory, type MapItem, type MapPorts } from '../task-agent/map-reduce.js';
@@ -115,6 +118,8 @@ export interface TasksCliDeps {
   cardGoalDocument?: (goalId: string) => { goalFile: string; goalBody: string } | null;
   /** `tasks live-verified` 가 적는 런 원장 디렉터리(시험 주입). 기본 = `runLedgerDir()`. */
   liveVerifiedLedgerDir?: string;
+  /** `tasks preflight --from-run` 이 읽는 런 원장 디렉터리(시험 주입). 기본 = `runLedgerDir()`. */
+  preflightLedgerDir?: string;
   /** HARNESS-PARENT-ON-MSB1 — 원격 부모 카드의 원장 거울(시험 주입). 기본 = ssh 로 `<prodRoot>/remote-parents/<host>/run-ledger`. */
   remoteLedgerMirror?: (card: TaskCard) => void;
   /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
@@ -1904,7 +1909,10 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .requiredOption('--checklist <cellId>', '체크리스트 칸 id')
     .requiredOption('--version <version>', '체크리스트 판')
     .requiredOption('--out <path>', '작업 지시서 출력 파일')
-    .action((opts: { checklist: string; version: string; out: string }) => {
+    .option('--budget <text>', '예산(시간·모델 티어·Pod 자리·재작업 상한) — critical 칸, 비면 tasks hand 가 발사 거부')
+    .option('--contract <text>', '현재 계약 — critical 칸')
+    .option('--escalation <text>', '막히면 누구에게 올리는지 — critical 칸')
+    .action((opts: { checklist: string; version: string; out: string; budget?: string; contract?: string; escalation?: string }) => {
       try {
         validateVersion(opts.version);
         const item = (deps.workOrderChecklist ?? listChecklist)(opts.version).items.find((cell) => cell.id === opts.checklist);
@@ -1920,12 +1928,77 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           version: opts.version,
           priority: item.priority,
           boundary: boundary || undefined,
+          budget: opts.budget,
+          contract: opts.contract,
+          escalation: opts.escalation,
         });
         mkdirSync(dirname(opts.out), { recursive: true });
         writeFileSync(opts.out, `${JSON.stringify(order, null, 2)}\n`);
         out(opts.out);
       } catch (error) {
         out(error instanceof Error ? error.message : '작업 지시서 작성 실패');
+        process.exitCode = 1;
+      }
+    });
+
+  tasks.command('preflight')
+    .description('TA-PREFLIGHT — 발사 없이 재개 조건 6개를 증거로 검사한다 (READY 가 아니면 exit 1)')
+    .requiredOption('--evidence <path>', '증거 JSON (source·image·owner·autoMerge·limits·launch·entrance)')
+    .option('--work-order <path>', '작업 지시서 JSON (증거의 workOrder 를 덮어쓴다)')
+    .option('--out <path>', '영수증(JSON)을 쓸 파일 — sha256 은 stdout 에 출력')
+    .option('--from-run <runId>', '시범 런 원장에서 조건①②(자식 수신 HEAD·Pod 소비 digest) 실측 증거를 수집해 빈 칸에 채운다')
+    .option('--card <id>', '영수증을 박을 발사 대상 카드 id')
+    .option('--cell <id>', '영수증을 박을 발사 대상 체크리스트 칸 id')
+    .option('--commit <sha>', '영수증을 박을 발사 대상 commit(40자 hex 또는 commit:<sha>)')
+    .action(async (opts: { evidence: string; workOrder?: string; out?: string; fromRun?: string; card?: string; cell?: string; commit?: string }) => {
+      try {
+        const evidence = JSON.parse(readFileSync(resolve(opts.evidence), 'utf8')) as TaPreflightEvidence;
+        let merged: TaPreflightEvidence = evidence;
+        if (opts.fromRun) {
+          const entries = loadRunLedgerSync(opts.fromRun, deps.preflightLedgerDir ?? runLedgerDir());
+          if (entries === null) throw new Error(`run 원장을 읽지 못했다: ${opts.fromRun}`);
+          const collected = evidenceFromRunLedger(entries);
+          merged = mergeCollectedEvidence(merged, collected);
+          for (const note of collected.notes) out(`수집 메모: ${note}`);
+        }
+        if (opts.workOrder) {
+          const parsed = parseWorkOrder(readFileSync(resolve(opts.workOrder), 'utf8'));
+          if (!parsed.ok) throw new Error(`작업 지시서 거부: ${parsed.reason}`);
+          merged = { ...merged, workOrder: parsed.order };
+        }
+        // 코드 기본값은 «관측값»이 아니다 — 증거를 채우지 않고 영수증에 defaultAssumed 로 따로 남긴다(조건 ④ 판정에 쓰지 않음).
+        const [{ DEFAULT_MAX_HARD_WAIT_SEC }, { POD_JOB_DEADLINE_SECONDS }] = await Promise.all([
+          import('../self-implement/headless-elanous-driver.js'),
+          import('../task-orchestrator/surfaces/self-implement-pod.js'),
+        ]);
+        const defaultAssumed = { wallClockSec: DEFAULT_MAX_HARD_WAIT_SEC, jobDeadlineSec: POD_JOB_DEADLINE_SECONDS };
+        const commit = opts.commit?.trim().replace(/^commit:/u, '');
+        if (commit !== undefined && !/^[0-9a-f]{40}$/u.test(commit)) throw new Error(`--commit 은 40자 소문자 16진 sha 여야 한다: ${JSON.stringify(opts.commit)}`);
+        const target = { ...(opts.card?.trim() ? { card: opts.card.trim() } : {}), ...(opts.cell?.trim() ? { cell: opts.cell.trim() } : {}), ...(commit ? { commit } : {}) };
+        if (opts.out && Object.keys(target).length === 0) throw new Error('영수증은 발사 대상에 묶여야 한다 — --card/--cell/--commit 중 하나 이상');
+        const mismatch = targetEvidenceMismatch(merged, target);
+        if (mismatch) throw new Error(`영수증 대상이 검사한 증거와 다르다 — 영수증을 만들지 않는다: ${mismatch}`);
+        // ①② 정적 판정 — «어긋나면 실패시키는 코드»가 이 빌드에 있는가를 모듈 export 로 직접 확인한다(증거 파일의 주장은 덮어쓴다).
+        const [headCheck, digestCheck] = await Promise.all([
+          import('../task-orchestrator/surfaces/pod-source-head-check.js'),
+          import('../task-orchestrator/surfaces/pod-image-digest-check.js'),
+        ]);
+        merged = { ...merged, failClosed: {
+          sourceHead: typeof headCheck.podSourceHeadGate === 'function' && typeof headCheck.verifyPodSourceHead === 'function',
+          imageDigest: typeof digestCheck.podImageDigestGate === 'function' && typeof digestCheck.requestedImageDigest === 'function',
+        } };
+        const report = evaluateTaPreflight(merged);
+        out(renderTaPreflight(report));
+        out(`defaultAssumed(미측정·판정 제외) wallClockSec=${defaultAssumed.wallClockSec} jobDeadlineSec=${defaultAssumed.jobDeadlineSec}`);
+        if (opts.out) {
+          const receipt = taPreflightReceipt(merged, report, defaultAssumed, { createdAt: new Date().toISOString(), target });
+          mkdirSync(dirname(resolve(opts.out)), { recursive: true });
+          writeFileSync(resolve(opts.out), receipt.json);
+          out(`receipt ${resolve(opts.out)} sha256=${receipt.sha256}`);
+        }
+        if (report.overall !== 'READY') process.exitCode = 1;
+      } catch (error) {
+        out(error instanceof Error ? error.message : 'TA-PREFLIGHT 실패');
         process.exitCode = 1;
       }
     });
@@ -2323,12 +2396,14 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     })
     .option('--child-llm <provider/model>', 'TASKS-HAND-CHILD-LLM — 구현 자식 LLM(예: grok/grok-4.7) → 발사 인자 --child-llm-provider <provider> --child-llm-model <model> · «첫» `/` 에서만 가른다(모델 id 의 `/` 는 보존) · openrouter 는 모델 id 가 openrouter/ 접두를 포함하므로 전체를 모델로(openrouter/z-ai/glm-5.3 → --child-llm-model openrouter/z-ai/glm-5.3) · 카드 childLlm · 안 주면 명령·카드 무변경')
     .option('--child-llm-effort <level>', '구현 자식 추론 노력 → 발사 인자 --child-llm-effort(검증은 하니스 · --child-llm 과 함께)')
+    .option('--source <commit:sha>', 'TA-PREFLIGHT ① — 정확 소스 pin(commit:<40자 sha>) → 발사 인자 --source · 자식이 받은 HEAD 를 부모가 대조(불일치=발사 실패)')
+    .option('--image-digest <sha256:digest>', 'TA-PREFLIGHT ② — 요청 이미지 digest pin(sha256:<64hex>) → 발사 인자 --image-digest · Pod 소비 digest 와 대조(불일치·미관측=런 실패) · 발사 직전 실측 값을 준다')
     .option('--role-llm <role=provider[/tier]>', 'TA 부모 역할 LLM(반복 가능 · planning|classify|audit|review만). 정확한 모델은 role={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}; 자식 모델은 --child-llm', (value: string, previous: string[] = []) => [...previous, value])
     .addOption(new Option('--tier <level>', '디스패처 난이도(하|중|상|특) — 카드에 보존해 수리 모델 정책에 사용').choices(['하', '중', '상', '특']))
     .option('--tag <k=v>', 'RUN-IDENTITY-TAGS — 출생 신분을 덮는다(class|care|rights|protect 의 k=v · 반복: --tag class=gate --tag protect=true) — 카드 원장 identity 에 남는다', (value: string, previous: string[] | undefined) => [...(previous ?? []), value])
     .option('--draft-claim <pr>', 'DRAFT-CLAIM-AUTO-2-FU — PR 를 관측(gh pr view)해 draftClaim 을 조립해 넘긴다 · 관측한 PR 머리에서 `elanous self review <pr> --json` 로 손 수확을 먼저 확정한다(확정 못 하면 claim 문면을 만들지 않는다) · claim 문면을 실제 PR 댓글로 게시(gh pr comment)한다 · 같은 PR 의 살아 있는 claim 기록(카드 draftClaim)이 있으면 거부한다')
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; missingTool?: string; pluginMarketDir?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; taLandMax?: number; childLlm?: string; childLlmEffort?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; missingTool?: string; pluginMarketDir?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; taLandMax?: number; childLlm?: string; childLlmEffort?: string; source?: string; imageDigest?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
       const suppliedText = text !== undefined;
       /** RUN-IDENTITY-TAGS — 칸을 찾은 판(출생 신분이 그 판의 칸 우선순위를 읽는다 · 개발 판 밖 칸도). */
       let birthBoardVersion: string | undefined;
@@ -2410,8 +2485,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         process.exitCode = 1;
         return;
       }
-      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.childLlm !== undefined || opts.childLlmEffort !== undefined || opts.roleLlm !== undefined || opts.tier !== undefined || opts.tag !== undefined)) {
-        out('--completion/--project/--target/--goal/--milestone/--ta-land/--child-llm/--role-llm/--tier/--tag 는 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
+      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.childLlm !== undefined || opts.childLlmEffort !== undefined || opts.source !== undefined || opts.imageDigest !== undefined || opts.roleLlm !== undefined || opts.tier !== undefined || opts.tag !== undefined)) {
+        out('--completion/--project/--target/--goal/--milestone/--ta-land/--child-llm/--source/--image-digest/--role-llm/--tier/--tag 는 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
         process.exitCode = 1;
         return;
       }
@@ -2550,6 +2625,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(opts.taLand === true ? { taLand: true } : {}),
           ...(opts.childLlm !== undefined ? { childLlm: opts.childLlm } : {}),
           ...(opts.childLlmEffort !== undefined ? { childLlmEffort: opts.childLlmEffort } : {}),
+          ...(opts.source !== undefined ? { source: opts.source } : {}),
+          ...(opts.imageDigest !== undefined ? { imageDigest: opts.imageDigest } : {}),
           ...(opts.roleLlm?.length ? { parentRoleLlm: opts.roleLlm } : {}),
           ...(opts.tier !== undefined ? { tier: opts.tier } : {}),
           ...(opts.tag !== undefined ? { tags: opts.tag } : {}),

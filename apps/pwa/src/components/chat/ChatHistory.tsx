@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ChatMessageView } from './ChatMessage';
 import { ChatPendingDecision } from './ChatPendingDecision';
+import { DeviceConnectCard, useAuthRequired } from './DeviceConnectCard';
 import type { ChatMessage } from '@/lib/chat-runtime';
 import {
   createStickState, findScrollViewport, followBehavior, isScrollIntentKey, onUserScroll,
@@ -31,6 +32,7 @@ export function ChatHistory({ messages, pending, mobileSimple = false }: Props) 
   const endRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const persistKey = snapshotKey('chatScroll');
+  const authRequired = useAuthRequired();
 
   // BACKLOG #3 — restore the persisted scrollTop on first mount so an
   // LRU-frozen tab returns to the same vertical position the user left
@@ -229,6 +231,10 @@ export function ChatHistory({ messages, pending, mobileSimple = false }: Props) 
   }, []);
 
   if (messages.length === 0 && !pending) {
+    // A device that is not connected sees one card that says how to connect, not the usual prompt.
+    if (authRequired) {
+      return <div className="flex flex-1 flex-col items-center justify-center p-6"><DeviceConnectCard /></div>;
+    }
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
         <p>무엇이든 말을 걸어 보세요.</p>
@@ -240,6 +246,8 @@ export function ChatHistory({ messages, pending, mobileSimple = false }: Props) 
 
   return (
     <div ref={viewportRef} className="relative flex-1 min-h-0">
+      {/* Pinned over the history (not inside the scroll): seen wherever the reader is scrolled. */}
+      {authRequired && <div className="absolute inset-x-0 top-0 z-10 px-4 py-2"><DeviceConnectCard /></div>}
       <ScrollArea className="h-full">
         <div className={`flex flex-col gap-1 pt-2 ${COMPOSER_CLEARANCE}`}>
           {messages.map((m) => (

@@ -100,6 +100,9 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       exposeGate: cfg.harness?.exposeGate ?? rawHarness.exposeGate,
       revertGuard: cfg.harness?.revertGuard ?? rawHarness.revertGuard,
       difficultyPlacement: cfg.harness?.difficultyPlacement ?? rawHarness.difficultyPlacement,
+      difficultyRouter: cfg.harness?.difficultyRouter === 'on' ? 'on' : undefined,
+      failureOracle: cfg.harness?.failureOracle === 'on' ? 'on' : undefined,
+      windowAccounts: cfg.harness?.windowAccounts === 'on' ? 'on' : undefined,
       defaultRepo: cfg.harness?.defaultRepo ?? rawHarness.defaultRepo,
       repo: cfg.harness?.repo,
       substrate: cfg.harness?.substrate,
@@ -352,6 +355,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
         : undefined,
       slashMaxTurns: cfg.acp.slashMaxTurns,
       editApproval: cfg.acp.editApproval ? true : undefined,
+      reviewClaudeGlmFallback: cfg.acp.reviewClaudeGlmFallback ? true : undefined,
       toolApproval: acpApprovalTimeoutMs(
         (cfg.raw?.acp as { toolApproval?: { timeoutMs?: unknown } } | undefined)?.toolApproval?.timeoutMs,
       ) !== undefined || cfg.acp.toolApproval.timeoutMs !== (acpApprovalTimeoutEnv() ?? acpDefaults.toolApproval.timeoutMs)

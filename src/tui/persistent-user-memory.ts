@@ -30,7 +30,7 @@ export function rememberExplicitTuiUserFact(userText: string, root: string = mem
     try {
       if (loadMemory(id, root)?.body.trim() !== fact) {
         saveMemory({ id, type: 'user', name: '명시적 사용자 기억',
-          description: fact.slice(0, 80), body: fact, pinned: true }, root);
+          description: fact.slice(0, 80), body: fact, pinned: true }, root, { origin: 'tui.explicit-remember' });
         debug.log('memory.persist', 'saved', { id, source: 'explicit-tui-request' });
       } else {
         debug.log('memory.persist', 'unchanged', { id, source: 'explicit-tui-request' });
@@ -49,7 +49,7 @@ export function rememberExplicitTuiUserFact(userText: string, root: string = mem
       return true;
     }
     saveMemory({ id: USER_NAME_MEMORY_ID, type: 'user', name: '사용자 이름',
-      description: '사용자가 직접 알려준 이름', body, pinned: true }, root);
+      description: '사용자가 직접 알려준 이름', body, pinned: true }, root, { origin: 'tui.explicit-remember' });
     debug.log('memory.persist', 'saved', { id: USER_NAME_MEMORY_ID, source: 'explicit-tui-request' });
     return true;
   } catch (error) {

@@ -31,6 +31,8 @@ export interface InternalTurnRequest {
   input: string;
   origin: InternalTurnOrigin;
   reason?: string;
+  /** The agent seat this turn delivers for (see `StartTurnIfIdleOptions.from`). */
+  from?: import('../../session/index.js').MessageSource;
 }
 
 export interface InternalTurnGateDeps {
@@ -52,6 +54,42 @@ export interface InternalTurnGateDeps {
   /** 마지막 사람 입력 뒤 이 시간 안이면 HumanTyping. 기본 10초. */
   humanQuietMs?: number;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** ELN-SEAT-TURN-PACING — rest between automatic turns. Absent = no pacing (tests · classic). */
+  pacing?: TurnPacing;
+}
+
+/**
+ * ELN-SEAT-TURN-PACING (PLAN-ELN-SEAT-RUNTIME-1005 ③ · D #83971 interface): one place decides rest — this gate.
+ * Self-started origins (scheduled · goal-continue · autowake · self-pull) obey a run cap and a minimum interval; an external
+ * event (msg-wake · child-complete: new mail, a finished child) breaks the run cap and only waits the minimum interval.
+ * A person's turn or an external event resets the run. A paced rejection is `Cap` with `retryAt` (min-interval) or no
+ * `retryAt` (run cap — wake only on a new event); callers retry once at `retryAt`, never poll.
+ */
+export interface TurnPacing {
+  /** Minimum gap between automatic turn opens. */
+  minIntervalMs: number;
+  /** Self-started automatic turns allowed in a row before only a new event (or a person) opens one. */
+  maxConsecutive: number;
+}
+
+/** Origins that are new outside events (mail · finished child): they break the run cap and reset it. */
+export const EXTERNAL_EVENT_ORIGINS: ReadonlySet<InternalTurnOrigin> = new Set(['msg-wake', 'child-complete']);
+/**
+ * Alarms (a scheduled wakeup): a notification, so it breaks the run cap (the standing rule's 20–30 min wake must not be lost),
+ * but it neither counts toward nor resets the run — a self-armed short alarm cannot be used to dodge the cap.
+ */
+export const ALARM_ORIGINS: ReadonlySet<InternalTurnOrigin> = new Set(['scheduled']);
+
+// Source: #38096 — the classic autowake minimum gap (DEFAULT_AUTOWAKE_MIN_GAP_MS · plan «30~60s»); one value for both paths.
+export const DEFAULT_PACING_MIN_INTERVAL_MS = 45_000;
+// Source: #38049 — DEFAULT_SEAT_CAP_CONTINUE_LIMIT: automatic continues before a person is needed; the same run length.
+export const DEFAULT_PACING_MAX_CONSECUTIVE = 5;
+
+/** Production pacing from env: `ELANOUS_TUI_TURN_PACING=0|off|false` turns it off; the fake-LLM test universe runs unpaced. */
+export function turnPacingFromEnv(env: NodeJS.ProcessEnv = process.env): TurnPacing | undefined {
+  const v = (env.ELANOUS_TUI_TURN_PACING ?? '').trim().toLowerCase();
+  if (v === '0' || v === 'off' || v === 'false' || env.ELANOUS_TEST_FAKE_LLM === '1') return undefined;
+  return { minIntervalMs: DEFAULT_PACING_MIN_INTERVAL_MS, maxConsecutive: DEFAULT_PACING_MAX_CONSECUTIVE };
 }
 
 export interface InternalTurnGate {
@@ -61,6 +99,10 @@ export interface InternalTurnGate {
   readonly port: TextInputInternalTurnYieldPort;
   /** 입력 루프가 «비켜 줬다»고 돌아왔을 때 실행할 요청을 꺼낸다(정확히 한 번). */
   takePending(): InternalTurnRequest | null;
+  /** 아직 꺼내지 않은 내부 턴 id — 자리 상한 계속이 실제로 시작됐는지 비동기로 묻는다. */
+  pendingTurnId(): string | null;
+  /** 열었지만 입력 루프가 안 꺼낸 그 턴만 거둔다. 다른 턴이 그 자리를 차지했으면 건드리지 않는다. */
+  withdrawPendingTurn(turnId: string): boolean;
   /** 사람이 턴을 열었다(제출이 받아들여졌다) — Superseded 의 기준이 바뀐다. */
   noteHumanTurn(): string;
   /** 턴이 끝나 입력 루프로 돌아왔다 — 내부 턴 «진행 중» 표지를 내린다. */
@@ -93,6 +135,11 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
   /** 열린(아직 안 꺼낸) 내부 턴 «직전»의 lastId — 거둘 때 되돌린다(실행 안 된 턴이 Superseded 기준이 되지 않게). */
   let idBeforePending: string | null = null;
   let seq = 0;
+  /** Pacing state: when the last automatic turn opened / ended, and how many self-started ones in a row since a person/event. */
+  let lastAutoOpenedAt: number | null = null;
+  /** #38210 REVIEW-2: the rest is measured from when the automatic turn ENDED (classic autowake does the same). */
+  let lastAutoEndedAt: number | null = null;
+  let consecutiveSelfStarted = 0;
 
   /** 열었지만 실행되지 않은 내부 턴을 거둔다 — 사람이 먼저다. */
   const withdrawPending = (detail: string): void => {
@@ -107,9 +154,27 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
     origin: InternalTurnOrigin,
     reason: InternalTurnRejectReason,
     detail?: string,
+    retryAt?: number,
   ): StartTurnIfIdleResult => {
-    log('tui.autoturn', 'rejected', { origin, reason, turnId: null, ...(detail ? { detail } : {}) });
-    return detail ? { opened: false, reason, detail } : { opened: false, reason };
+    log('tui.autoturn', 'rejected', { origin, reason, turnId: null, ...(detail ? { detail } : {}), ...(retryAt === undefined ? {} : { retryAt }) });
+    return { opened: false, reason, ...(detail ? { detail } : {}), ...(retryAt === undefined ? {} : { retryAt }) };
+  };
+
+  /** null = may open; else the paced rejection. */
+  const pacingRejection = (origin: InternalTurnOrigin): StartTurnIfIdleResult | null => {
+    const pacing = deps.pacing;
+    if (!pacing) return null;
+    const external = EXTERNAL_EVENT_ORIGINS.has(origin);
+    if (!external && !ALARM_ORIGINS.has(origin) && consecutiveSelfStarted >= pacing.maxConsecutive) {
+      return reject(origin, 'Cap', `pacing:run-cap ${consecutiveSelfStarted}/${pacing.maxConsecutive}`);
+    }
+    // The gap runs from the end of the last automatic turn (a long turn earns no free rest); before any end, from its open.
+    const restFrom = Math.max(lastAutoOpenedAt ?? -Infinity, lastAutoEndedAt ?? -Infinity);
+    if (Number.isFinite(restFrom)) {
+      const nextAt = restFrom + pacing.minIntervalMs;
+      if (now() < nextAt) return reject(origin, 'Cap', 'pacing:min-interval', nextAt);
+    }
+    return null;
   };
 
   const humanTypingDetail = (): string | null => {
@@ -152,10 +217,13 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       if (typing) return reject(origin, 'HumanTyping', typing);
       const text = input.trim();
       if (!text) return reject(origin, 'NotIdle', 'empty-input');
+      const paced = pacingRejection(origin);
+      if (paced) return paced;
 
       const turnId = `auto-${++seq}`;
       idBeforePending = lastId;
-      pending = { turnId, input: text, origin, ...(opts.reason ? { reason: opts.reason } : {}) };
+      pending = { turnId, input: text, origin, ...(opts.reason ? { reason: opts.reason } : {}),
+        ...(opts.from?.kind === 'agent' ? { from: opts.from } : {}) };
       // ⭐ 물러남은 textInput 의 몫 — 버퍼가 비었을 때만 true 를 낸다(입력칸 무접촉).
       let yielded = false;
       try { yielded = requestYield(); } catch { yielded = false; }
@@ -164,7 +232,10 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
         return reject(origin, 'HumanTyping', 'input-declined');
       }
       lastId = turnId;
-      log('tui.autoturn', 'opened', { origin, reason: opts.reason ?? null, turnId });
+      lastAutoOpenedAt = now();
+      if (EXTERNAL_EVENT_ORIGINS.has(origin)) consecutiveSelfStarted = 0;
+      else if (!ALARM_ORIGINS.has(origin)) consecutiveSelfStarted += 1;
+      log('tui.autoturn', 'opened', { origin, reason: opts.reason ?? null, turnId, ...(deps.pacing ? { run: consecutiveSelfStarted } : {}) });
       return { opened: true, turnId };
     },
     takePending() {
@@ -173,13 +244,24 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       if (req) internalActive = true;
       return req;
     },
+    pendingTurnId() {
+      return pending?.turnId ?? null;
+    },
+    withdrawPendingTurn(turnId) {
+      if (!pending || pending.turnId !== turnId) return false;
+      withdrawPending('seat-cap-not-started');
+      return true;
+    },
     noteHumanTurn() {
+      // A person is here: the automatic run starts over.
+      consecutiveSelfStarted = 0;
       const id = `human-${++seq}`;
       lastId = id;
       internalActive = false;
       return id;
     },
     noteTurnSettled() {
+      if (internalActive) lastAutoEndedAt = now();
       internalActive = false;
     },
     isInternalTurnActive: () => internalActive,

@@ -4,7 +4,6 @@ import { DaemonContext } from '@/components/providers/DaemonProvider';
 import type { DaemonClient } from '@/lib/daemon-client';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
 import { ChatLayout } from './ChatLayout';
-import { SeatsNowStrip } from './SeatsNowStrip';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
@@ -169,18 +168,4 @@ test('switching clients hides old cards immediately and ignores a late old-clien
   expect(root.findByType('button').children.join('')).toBe('승인 대기 1');
   expect(root.findByType('button').props['aria-expanded']).toBe(false);
   expect(decisions).toEqual([]);
-});
-
-test('wide ChatLayout keeps approvals after the folded activity details', async () => {
-  const request = async (path: string) => json(path.includes('decisions') ? { decisions: [] } : { items: [] });
-  const daemon = { client: { fetchResponse: request, fetchJson: async () => ({ messages: [] }), voiceWsUrl: () => '', connectAcp: () => { throw Error('offline'); } } as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: '', setConfig: () => {}, setSessionId: () => {} };
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { innerWidth: 1024, location: { search: '' }, sessionStorage: { getItem: () => null } }) });
-  await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatLayout /></DaemonContext.Provider>); });
-  const children = tree!.root.findByType(ChatLayout).findByType('div').children.filter((child): child is ReactTestRenderer['root'] => typeof child !== 'string');
-  const details = children.findIndex(child => child.type === 'details');
-  // Source: #36166 ChatLayout renders the folded activity details before the approvals chip.
-  expect(details).toBeGreaterThanOrEqual(0);
-  expect(children[details]!.findAllByType(SeatsNowStrip)).toHaveLength(1);
-  expect(children[details]!.findByType('summary').children.join('')).toBe('자세히');
-  expect(children[details + 1]!.findAllByType(ChatApprovalsChip)).toHaveLength(1);
 });

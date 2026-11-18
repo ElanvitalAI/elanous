@@ -13,14 +13,8 @@ import { DeployConfirmCard } from './DeployConfirmCard';
 import { ChatMessageView } from './ChatMessage';
 import { ChatInput } from './ChatInput';
 import { ChatQueueChips } from './ChatQueueChips';
-import { NowSpeakButton } from './NowSpeakButton';
 import { ChatDropOverlay } from './ChatDropOverlay';
-import { BudgetPill } from './BudgetPill';
-import { VoiceCostPill } from './VoiceCostPill';
-import { SessionPill } from './SessionPill';
-import { ChatCurrentProject } from './ChatCurrentProject';
 import { MobileChatStatus } from './MobileChatStatus';
-import { SeatsNowStrip } from './SeatsNowStrip';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
 import { ChatDecisionsChip } from './ChatDecisionsChip';
 import { ChatPendingDecision } from './ChatPendingDecision';
@@ -406,66 +400,30 @@ test('pending queue caps at five and keeps overflow in composer', async () => {
   expect(streams).toHaveLength(1);
 });
 
-test('compact header fits one 44px row with navigation, session, and expandable preserved controls', async () => {
+test('compact header is one 44px row with only the conversation list control (WEB-CHAT-MINIMAL-SURFACE)', async () => {
   await mount({ acp: false, width: 412, leading: true });
   const root = tree!.root;
   const header = root.findByProps({ 'data-elanous-chat-compact-header': '' });
   expect(header.props.className).toContain('h-11 max-h-11');
-  expect(header.props.className).toContain('min-w-0');
-  expect(header.props.className).toContain('whitespace-nowrap');
   expect(header.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
-  expect(header.findAllByType(SessionPill)).toHaveLength(1);
-  expect(header.findAllByType(ChatCurrentProject)).toHaveLength(1);
-  expect(header.findByProps({ 'aria-label': '현재 대화 프로젝트' }).props.className).toContain('max-w-[24vw]');
-  expect(header.findAllByType(NowSpeakButton)).toHaveLength(1);
-  expect(header.findAllByProps({ 'data-elanous-action': 'chat-now-speak' })).toHaveLength(1);
-  expect(header.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(1);
-  expect(header.findAllByType(BudgetPill)).toHaveLength(0);
-  const pillSlot = header.findByType(SessionPill).parent!;
-  expect(pillSlot.props.className).toContain('min-w-0 flex-1');
-  expect(pillSlot.props.className).toContain('[&>div>div:first-child]:overflow-hidden');
-  expect(pillSlot.props.className).toContain('overflow-hidden');
-  expect(pillSlot.props.className).toContain('span]:truncate');
-  const more = header.findByProps({ 'aria-label': '채팅 더보기' });
-  await act(async () => more.props.onClick());
-  const popup = root.findByProps({ id: 'chat-header-more' });
-  expect(popup.findAllByType(ChatCurrentProject)).toHaveLength(0);
-  expect(popup.findAllByType(BudgetPill)).toHaveLength(1);
-  expect(popup.findAllByType(VoiceCostPill)).toHaveLength(1);
-  expect(popup.findAllByType(HideInPublicCapture)).toHaveLength(2);
-  expect(popup.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(1);
-  expect(more.props['aria-expanded']).toBe(true);
-  await act(async () => more.props.onClick());
-  expect(root.findAllByProps({ id: 'chat-header-more' })).toHaveLength(0);
-  await act(async () => more.props.onClick());
-  const outside = new Event('pointerdown');
-  Object.defineProperty(outside, 'target', { value: {} });
-  await act(async () => { document.dispatchEvent(outside); });
-  expect(root.findAllByProps({ id: 'chat-header-more' })).toHaveLength(0);
+  expect(header.findAllByType('button')).toHaveLength(1);
+  expect(root.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(0);
+  expect(root.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(0);
+  expect(root.findAllByType('details')).toHaveLength(0);
 });
 
-test('390px standalone chat folds live work into details and keeps menu controls', async () => {
+test('390px standalone chat: the top row is the menu (conversations, home, settings) — no details fold, chips or voice', async () => {
   await mount({ acp: false, width: 390, mobileSimple: true });
   const root = tree!.root;
-  const status = root.findByType(MobileChatStatus);
   expect(root.findAllByProps({ 'data-elanous-mobile-chat-status': '' })).toHaveLength(1);
-  const statusRow = root.findByProps({ 'data-elanous-mobile-chat-status': '' });
-  expect(statusRow.findByType('details').findByType('summary').children).toEqual(['자세히']);
-  expect(statusRow.findByProps({ role: 'status' }).children.join('')).toContain('구현 중');
-  expect(status.props.activity.run.progressLine).toBe('구현 중');
+  expect(root.findAllByType('details')).toHaveLength(0);
   expect(root.findAllByProps({ 'data-elanous-chat-compact-header': '' })).toHaveLength(0);
-  expect(root.findAllByType(SeatsNowStrip)).toHaveLength(0);
   expect(root.findAllByProps({ 'aria-label': '채팅 메뉴' })).toHaveLength(1);
-  expect(root.findAllByType(SessionPill)).toHaveLength(0);
-  expect(root.findAllByType(ChatCurrentProject)).toHaveLength(0);
-  expect(root.findAllByType(NowSpeakButton)).toHaveLength(0);
   await act(async () => root.findByProps({ 'aria-label': '채팅 메뉴' }).props.onClick());
   const menu = root.findByProps({ id: 'chat-mobile-menu' });
-  expect(menu.findAllByType(SessionPill)).toHaveLength(1);
-  expect(menu.findAllByType(ChatCurrentProject)).toHaveLength(1);
-  expect(menu.findAllByType(NowSpeakButton)).toHaveLength(1);
   expect(menu.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
   expect(menu.findByProps({ 'aria-label': '채팅 이동' }).findAllByType('a').map((link) => link.props.href)).toEqual(['/', '/settings']);
+  expect(menu.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(0);
   expect(root.findByType(ChatApprovalsChip).props.mobileOpen).toBe(false);
   expect(root.findByType(ChatDecisionsChip).props.mobileOpen).toBe(false);
   expect(root.findByType(ChatHistory).props.mobileSimple).toBe(true);
@@ -487,39 +445,17 @@ test('390px approval and decision share one chip; opening reveals both actionabl
   expect(root.findAllByProps({ id: 'chat-decisions-panel' })).toHaveLength(1);
 });
 
-test('public capture still hides both money pills in compact more menu', async () => {
-  await mount({ acp: false, width: 412, capture: true });
-  await act(async () => tree!.root.findByProps({ 'aria-label': '채팅 더보기' }).props.onClick());
-  const popup = tree!.root.findByProps({ id: 'chat-header-more' });
-  expect(popup.findAllByType(BudgetPill)).toHaveLength(0);
-  expect(popup.findAllByType(VoiceCostPill)).toHaveLength(0);
-  expect(popup.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(1);
-});
-
-test('390px standalone status menu still masks cost controls in public capture', async () => {
-  await mount({ acp: false, width: 390, mobileSimple: true, capture: true });
-  const root = tree!.root;
-  await act(async () => root.findByProps({ 'aria-label': '채팅 메뉴' }).props.onClick());
-  expect(root.findByProps({ id: 'chat-mobile-menu' }).findAllByType(BudgetPill)).toHaveLength(0);
-  expect(root.findByProps({ id: 'chat-mobile-menu' }).findAllByType(VoiceCostPill)).toHaveLength(0);
-});
-
-test('wide header preserves the existing session, money pills, and voice button without compact controls', async () => {
+test('wide chat has no header row: no id chip, branch, budget, voice, project or details fold (WEB-CHAT-MINIMAL-SURFACE)', async () => {
   await mount({ acp: false, width: 1200, leading: true });
   const root = tree!.root;
   expect(root.findAllByProps({ 'data-elanous-chat-compact-header': '' })).toHaveLength(0);
   expect(root.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(0);
-  expect(root.findAllByProps({ 'aria-label': '채팅 더보기' })).toHaveLength(0);
   expect(root.findByType(ChatHistory).props.mobileSimple).toBe(false);
   expect(root.findAllByType(ChatPendingDecision)).toHaveLength(1);
-  expect(root.findAllByType(SessionPill)).toHaveLength(1);
-  expect(root.findAllByType(ChatCurrentProject)).toHaveLength(1);
-  expect(root.findAllByProps({ 'aria-label': '현재 대화 프로젝트' })).toHaveLength(1);
-  expect(root.findAllByType(NowSpeakButton)).toHaveLength(1);
-  expect(root.findAllByProps({ 'data-elanous-action': 'chat-now-speak' })).toHaveLength(1);
-  expect(root.findAllByType(BudgetPill)).toHaveLength(1);
-  expect(root.findAllByType(VoiceCostPill)).toHaveLength(1);
-  expect(root.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(1);
+  expect(root.findAllByType('details')).toHaveLength(0);
+  expect(root.findAllByProps({ 'aria-label': '현재 대화 프로젝트' })).toHaveLength(0);
+  expect(root.findAllByProps({ 'data-elanous-action': 'chat-now-speak' })).toHaveLength(0);
+  expect(root.findAllByProps({ 'data-elanous-action': 'chat-voice-toggle' })).toHaveLength(0);
 });
 
 test('stale session adoption keeps the first question and streamed answer on the mounted chat', async () => {

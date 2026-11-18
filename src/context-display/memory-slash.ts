@@ -2,9 +2,10 @@
 //
 // Mirrors Gemini's memoryCommand.ts surface — `list` enumerates
 // the auto-memory index, `show <name>` prints one entry, `reload`
-// re-reads from disk. elanous's auto-memory lives at
-// ~/.claude/projects/<encoded-cwd>/memory/ with a top-level
-// `MEMORY.md` index + per-entry .md files.
+// re-reads from disk. elanous's memory lives at `memoryRoot()` (src/memory.ts,
+// ~/.local/share/elanous/memory) with a top-level `MEMORY.md` index +
+// per-entry .md files. (An earlier copy of this module pointed at Claude
+// Code's ~/.claude/projects/<cwd>/memory — a different product's store.)
 
 import {
   existsSync,
@@ -13,7 +14,7 @@ import {
   statSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { memoryRoot } from '../memory.js';
 
 export interface MemorySlashCommandDescriptor {
   name: string;
@@ -42,17 +43,12 @@ export function buildMemorySlashCommand(): MemorySlashCommandDescriptor {
 }
 
 function defaultMemoryDir(): string {
-  // Mirrors the convention used elsewhere (CLAUDE.md cites
-  // ~/.claude/projects/<encoded-cwd>/memory/MEMORY.md). The
-  // exact encoding lives outside this module — callers in test
-  // override `memoryDir`.
-  const cwd = process.cwd().replace(/\//g, '-').replace(/^-/, '-');
-  return join(homedir(), '.claude', 'projects', cwd, 'memory');
+  return memoryRoot();
 }
 
 export function listMemory(dir: string): string {
   if (!existsSync(dir)) {
-    return `── /memory list ─────────────────────────────────────────\n(memory dir not found: ${dir})`;
+    return `── /memory list ─────────────────────────────────────────\n(no memory folder yet: ${dir} — it is created as you work)`;
   }
   const entries: string[] = [];
   try {
@@ -66,7 +62,7 @@ export function listMemory(dir: string): string {
       entries.push(`  [${type.padEnd(8)}] ${f.replace(/\.md$/, '').padEnd(36)} ${formatBytes(st.size).padStart(8)} · ${desc.slice(0, 60)}`);
     }
   } catch (err) {
-    return `── /memory list ─────────────────────────────────────────\n(read failed: ${(err as Error).message})`;
+    return `── /memory list ─────────────────────────────────────────\n(cannot read: ${(err as Error).message})`;
   }
   const lines: string[] = [];
   lines.push('── /memory list ─────────────────────────────────────────');
@@ -92,7 +88,7 @@ export function showMemory(dir: string, name: string): string {
     const content = readFileSync(path, 'utf-8');
     return `── /memory show ${name} ─────────────────────────────────\n${content}`;
   } catch (err) {
-    return `── /memory show ─────────────────────────────────────────\n(read failed: ${(err as Error).message})`;
+    return `── /memory show ─────────────────────────────────────────\n(cannot read: ${(err as Error).message})`;
   }
 }
 

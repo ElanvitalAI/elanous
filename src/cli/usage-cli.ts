@@ -3,8 +3,10 @@
 // Existing `provider codex usage` and `acp usage grok` stay on their own
 // trees. This command only assembles the shared report.
 
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { lookup } from 'node:dns/promises';
+import { homedir, hostname, networkInterfaces } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { collectUnifiedUsage, formatUnifiedUsage } from '../budget/unified-usage.js';
@@ -17,8 +19,11 @@ import { LOGS_SINCE_OPTION, parseSince } from './logs-cli.js';
 import { formatCodexCreditPlan, type CodexCreditPlan } from '../budget/codex-credit-plan.js';
 import { codexCreditPlanFromDisk } from './codex-credit-plan-view.js';
 import { getUserConfig } from '../user-config/reader.js';
+import { formatCacheUsageReport, summarizeCacheUsage, type CacheUsageGroup, type CacheUsageReport, type CacheUsageRow } from '../budget/cache-usage-report.js';
+import { formatTierShareReport, summarizeTierShares, type TierShareInput } from '../model-tier/work-tier-policy.js';
 import { defaultSshRunner, type SshRunner } from '../task-agent/parent-host.js';
 import { shellQuote } from '../task-agent/task-hand.js';
+import { listSshHosts } from '../ssh/ssh-hosts.js';
 
 export interface UsageCliDeps {
   readonly collect?: typeof collectUnifiedUsage;
@@ -27,8 +32,8 @@ export interface UsageCliDeps {
   readonly out?: { log: (s: string) => void };
   /** Read-only LogStore query seam; returns stored llm-usage rows, newest first. */
   readonly readRunLogs?: (query: LogQuery) => LogStoreRow[];
-  /** Federation seams: the configured TA parent hosts plus this HQ host, and bounded SSH. */
-  readonly usageHosts?: () => { local: string; remote: string[] };
+  /** Federation seams: the configured fleet plus this HQ host, and bounded SSH. */
+  readonly usageHosts?: () => UsageHostRoster | Promise<UsageHostRoster>;
   readonly ssh?: SshRunner;
   /** 시험 심 — 실물 네트워크를 안 탄다. */
   readonly list?: typeof listCodexResetCredits;
@@ -67,16 +72,103 @@ function readRunLogs(query: LogQuery): LogStoreRow[] {
   }
 }
 
-function configuredUsageHosts(): { local: string; remote: string[] } {
-  const config = getUserConfig();
-  const local = config.hq?.hostName?.trim() || '';
+type UsageHostRoster = { local: string; remote: string[]; duplicateCandidates?: string[]; configuredLocalVerified?: boolean };
+type HostIdentity = {
+  currentHost: string;
+  localAddresses: readonly string[];
+  resolve: (host: string) => Promise<readonly string[]>;
+  sshHostname?: (alias: string) => Promise<string | null>;
+  resolveTimeoutMs?: number;
+};
+
+async function boundedIdentity<T>(request: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([request, new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('host identity timeout')), timeoutMs);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function currentHostIdentity(): HostIdentity {
+  return { currentHost: hostname(),
+    localAddresses: Object.values(networkInterfaces()).flatMap((items) => items?.map((item) => item.address) ?? []),
+    resolve: async (host) => (await lookup(host, { all: true })).map((item) => item.address),
+    sshHostname: (alias) => new Promise((resolve) => {
+      execFile('ssh', ['-G', alias], { encoding: 'utf8', timeout: 1_500, maxBuffer: 128 * 1024 }, (error, stdout) => {
+        const host = error ? undefined : /^hostname[ \t]+(\S+)/mi.exec(stdout)?.[1];
+        resolve(host && SSH_HOST.test(host) ? host : null);
+      });
+    }) };
+}
+
+export async function usageHostsFromConfig(config: ReturnType<typeof getUserConfig>, sshHosts: readonly { name: string }[],
+  identity: HostIdentity = currentHostIdentity()): Promise<UsageHostRoster> {
+  const configured = config.hq?.hostName?.trim() || '';
+  const current = identity.currentHost.trim();
+  const addresses = new Set(identity.localAddresses);
+  const timeoutMs = Math.max(1, Math.min(identity.resolveTimeoutMs ?? 1_500, 1_500));
+  const isCurrent = async (host: string): Promise<boolean | null> => {
+    if (!host) return null;
+    if (host.toLowerCase() === current.toLowerCase()) return true;
+    if (!SSH_HOST.test(host)) return false;
+    let target = host;
+    if (identity.sshHostname) {
+      try { target = await boundedIdentity(identity.sshHostname(host), timeoutMs) || host; }
+      catch { /* DNS may still identify the original name. */ }
+    }
+    if (target.toLowerCase() === current.toLowerCase()) return true;
+    try { return (await boundedIdentity(identity.resolve(target), timeoutMs)).some((address) => addresses.has(address)); }
+    catch (error) {
+      // A remote behind ProxyJump/IAP may have no local DNS record. SSH can
+      // still reach it; only stalled or otherwise uncertain lookups stay unknown.
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOTFOUND') return false;
+      return null;
+    }
+  };
+  const configuredLocalVerified = configured ? await isCurrent(configured) === true : false;
+  const local = configuredLocalVerified ? configured : current;
   const parents = config.taskAgent?.parentHost;
   const entries = Array.isArray(parents) ? parents : parents ? [parents] : [];
-  return { local, remote: [...new Set(entries.map((entry) => entry.host?.trim()).filter((host): host is string => !!host && host !== local))] };
+  // Combine explicit release, Pod pool, TA parent, and named SSH hosts.
+  const release = config.raw.release;
+  const loop = release && typeof release === 'object' && !Array.isArray(release)
+    ? (release as Record<string, unknown>).loop : undefined;
+  const opsHosts = loop && typeof loop === 'object' && !Array.isArray(loop)
+    ? (loop as Record<string, unknown>).opsHosts : undefined;
+  const listed = Array.isArray(opsHosts) ? opsHosts.filter((host): host is string => typeof host === 'string') : [];
+  const gatePodPool = loop && typeof loop === 'object' && !Array.isArray(loop)
+    ? (loop as Record<string, unknown>).gatePodPool : undefined;
+  const seatLoops = config.raw.loops;
+  const seat = seatLoops && typeof seatLoops === 'object' && !Array.isArray(seatLoops)
+    ? (seatLoops as Record<string, unknown>).seat : undefined;
+  const seatPodPool = seat && typeof seat === 'object' && !Array.isArray(seat)
+    ? (seat as Record<string, unknown>).podPool : undefined;
+  const poolHosts = [gatePodPool, seatPodPool].flatMap((pool) => {
+    if (typeof pool !== 'string') return [];
+    const host = /^\S+@([A-Za-z0-9][A-Za-z0-9._-]*):\d+/.exec(pool)?.[1];
+    return host ? [host] : [];
+  });
+  const remote = [...new Set([...listed, ...poolHosts, ...entries.map((entry) => entry.host || ''), ...sshHosts.map((host) => host.name)]
+    .map((host) => host.trim()).filter((host) => host && host !== 'local' && host !== local))];
+  const duplicateCandidates = (await Promise.all(remote.map(async (host) =>
+    addresses.size === 0 || await isCurrent(host) !== false ? host : null)))
+    .filter((host): host is string => host !== null);
+  if (configured && !configuredLocalVerified && configured !== local && !remote.includes(configured)) {
+    remote.push(configured);
+    duplicateCandidates.push(configured);
+  }
+  return { local, remote, duplicateCandidates, configuredLocalVerified };
+}
+
+function configuredUsageHosts(): Promise<UsageHostRoster> {
+  return usageHostsFromConfig(getUserConfig(), listSshHosts());
 }
 
 type UsageAxis = 'stage' | 'phase' | 'model' | 'account' | 'job';
-type ExtendedRunUsageInput = RunUsageInput & { stage?: string | null; account?: string | null; origin?: string; podJob?: string; job?: string; measured?: boolean };
+type ExtendedRunUsageInput = RunUsageInput & { stage?: string | null; account?: string | null; origin?: string; podJob?: string; job?: string; measured?: boolean; workTier?: string | null };
 type AxisUsageRow = {
   stage?: string;
   phase?: string;
@@ -158,6 +250,58 @@ function readRemoteUsage(host: string, axis: 'run' | 'role' | UsageAxis, opts: {
     const parsed: unknown = JSON.parse(result.stdout);
     return validUsageRows(parsed, axis) ? { rows: parsed } : { reason: '원격 JSON 형식 오류' };
   } catch { return { reason: '원격 JSON 또는 SSH 실행 오류' }; }
+}
+
+function validCacheGroup(value: unknown): value is CacheUsageGroup {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const group = value as Record<string, unknown>;
+  return typeof group.key === 'string'
+    && ['calls', 'reportedCalls', 'inputTokens', 'reportedInputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens']
+      .every((field) => typeof group[field] === 'number' && Number.isFinite(group[field]) && (group[field] as number) >= 0)
+    && (group.reportedCalls as number) <= (group.calls as number)
+    && (group.hitRate === null || typeof group.hitRate === 'number' && Number.isFinite(group.hitRate) && group.hitRate >= 0 && group.hitRate <= 1);
+}
+
+function validCacheReport(value: unknown): value is CacheUsageReport {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const report = value as Record<string, unknown>;
+  return (report.sessionId === null || typeof report.sessionId === 'string')
+    && validCacheGroup(report.total) && report.total.key === 'total'
+    && Array.isArray(report.groups) && report.groups.every(validCacheGroup)
+    && (report.compactions === null || typeof report.compactions === 'number' && Number.isSafeInteger(report.compactions) && report.compactions >= 0);
+}
+
+function readRemoteCache(host: string, opts: { session?: string; sinceMs?: number }, ssh: SshRunner): { report?: CacheUsageReport; reason?: string } {
+  if (!SSH_HOST.test(host)) return { reason: '호스트 이름 오류' };
+  const args = ['eln', '--config-dir', '"$HOME"/.elanous', 'usage', 'cache', '--json'];
+  if (opts.session !== undefined) args.push('--session', shellQuote(opts.session));
+  if (opts.sinceMs !== undefined) args.push('--since', shellQuote(new Date(opts.sinceMs).toISOString()));
+  try {
+    const result = ssh(host, 'test -f "$HOME"/.elanous/logs/logs.db || { echo usage-store-missing >&2; exit 68; }; ' + args.join(' '), 20_000);
+    if (result.status === 68 || result.stderr.includes('usage-store-missing')) return { reason: '원격 logs.db 없음' };
+    if (result.status !== 0) return { reason: result.status === null ? '시간 초과 또는 SSH 실패' : `SSH/원격 명령 rc=${result.status}` };
+    const parsed: unknown = JSON.parse(result.stdout);
+    if (!validCacheReport(parsed) || parsed.sessionId !== (opts.session ?? null)) return { reason: '원격 JSON 형식 오류' };
+    return { report: parsed };
+  } catch { return { reason: '원격 JSON 또는 SSH 실행 오류' }; }
+}
+
+function mergeCacheReports(reports: readonly CacheUsageReport[], sessionId?: string): CacheUsageReport {
+  const fields = ['calls', 'reportedCalls', 'inputTokens', 'reportedInputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens'] as const;
+  const sum = (groups: readonly CacheUsageGroup[], key: string): CacheUsageGroup => {
+    const group: CacheUsageGroup = { key, calls: 0, reportedCalls: 0, inputTokens: 0, reportedInputTokens: 0,
+      cacheReadInputTokens: 0, cacheCreationInputTokens: 0, hitRate: null };
+    for (const source of groups) for (const field of fields) group[field] += source[field];
+    const denominator = group.reportedInputTokens + group.cacheReadInputTokens + group.cacheCreationInputTokens;
+    group.hitRate = group.reportedCalls > 0 && denominator > 0 ? group.cacheReadInputTokens / denominator : null;
+    return group;
+  };
+  const keys = [...new Set(reports.flatMap((report) => report.groups.map((group) => group.key)))];
+  return { sessionId: sessionId ?? null, total: sum(reports.map((report) => report.total), 'total'),
+    groups: keys.map((key) => sum(reports.flatMap((report) => report.groups.filter((group) => group.key === key)), key))
+      .sort((a, b) => b.calls - a.calls || a.key.localeCompare(b.key)),
+    compactions: reports.some((report) => report.compactions === null) ? null
+      : reports.reduce((count, report) => count + (report.compactions ?? 0), 0) };
 }
 
 function usageData(row: LogStoreRow, unwrapPod = false): ExtendedRunUsageInput | null {
@@ -257,9 +401,10 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
     .option('--run <runId>', '런 ID 정확 일치')
     .option('--by <axis>', '집계 축 (run | role | stage | phase | model | account)', 'run')
     .option(...LOGS_SINCE_OPTION)
-    .option('--hosts <scope>', '호스트 연합 (all: 이 호스트 + 설정된 taskAgent.parentHost)')
+    .option('--hosts <scope>', '호스트 연합 (all: HQ + 설정된 운영·SSH·TA 호스트)')
     .option('--json', '집계 행 JSON 출력')
-    .action((opts: { run?: string; by: string; since?: string; hosts?: string; json?: boolean }, command: Command) => {
+    .option('--tier-share', '(--by role) 강·중·약 등급별 몫·비용 — 텍스트는 머리 줄, JSON 은 {rows, tierShare}. 생략 = 종전 출력 그대로')
+    .action(async (opts: { run?: string; by: string; since?: string; hosts?: string; json?: boolean; tierShare?: boolean }, command: Command) => {
       const json = opts.json || command.optsWithGlobals<{ json?: boolean }>().json;
       if (!isUsageAxis(opts.by)) {
         out.log('⛔ --by 는 run | role | stage | phase | model | account | job');
@@ -279,21 +424,20 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
       }
       const localUnavailable = opts.hosts === 'all' && !deps.readRunLogs && !existsSync(logsDbPath())
         ? '로컬 logs.db 없음' : undefined;
-      const emitFederated = (localRows: FederatedUsageRow[], localFailure?: string): void => {
-        const roster = (deps.usageHosts ?? configuredUsageHosts)();
-        if (!roster.local) {
-          const reason = 'hq.hostName 설정 없음 — 로컬 호스트와 원격 중복 여부를 확인할 수 없음';
-          const hosts = [...new Set(roster.remote)].map((host) => ({ host, status: 'unmeasured' as const, reason: '로컬 식별 불가로 조회 중지' }));
-          if (json) out.log(JSON.stringify({ rows: [], hosts, complete: false, reason }, null, 2));
-          else out.log(`호스트 연합: 못 잼 (${reason})`);
-          return;
-        }
+      const emitFederated = async (localRows: FederatedUsageRow[], localFailure?: string): Promise<void> => {
+        const roster = await (deps.usageHosts ?? configuredUsageHosts)();
+        const localHost = roster.local || '(local)';
+        const duplicateCandidates = new Set(roster.duplicateCandidates ?? (roster.local ? [] : roster.remote));
         const hosts: HostMeasurement[] = [localFailure
-          ? { host: roster.local, status: 'unmeasured', reason: localFailure }
-          : { host: roster.local, status: 'ok' }];
+          ? { host: localHost, status: 'unmeasured', reason: localFailure }
+          : { host: localHost, status: 'ok' }];
         const parts: FederatedUsageRow[][] = localFailure ? [] : [localRows];
-        const rosterReason = roster.remote.length === 0 ? 'taskAgent.parentHost 설정 없음' : undefined;
-        for (const host of [...new Set(roster.remote.filter((name) => name !== roster.local))]) {
+        const rosterReason = roster.remote.length === 0 ? '원격 호스트 목록 없음' : undefined;
+        for (const host of [...new Set(roster.remote.filter((name) => name !== localHost))]) {
+          if (duplicateCandidates.has(host)) {
+            hosts.push({ host, status: 'unmeasured', reason: '현재 호스트와 중복 가능 — 원격 제외' });
+            continue;
+          }
           const remote = readRemoteUsage(host, opts.by as 'run' | 'role' | UsageAxis,
             { run: opts.run, sinceMs }, deps.ssh ?? defaultSshRunner);
           if (remote.rows) { hosts.push({ host, status: 'ok' }); parts.push(remote.rows); }
@@ -307,6 +451,7 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         out.log(`호스트 ${hosts.filter((host) => host.status === 'ok').length}/${hosts.length} 측정 · ${complete ? '완결' : '부분 합계'}`);
         if (rosterReason) out.log(`호스트 목록: 못 잼 (${rosterReason})`);
         for (const host of hosts) if (host.status === 'unmeasured') out.log(`${host.host}: 못 잼 (${host.reason})`);
+        if (parts.length === 0) { out.log('(측정된 호스트 없음)'); return; }
         if (rows.length === 0) { out.log('(일치하는 런 사용량 없음)'); return; }
         for (const row of rows) {
           if (opts.by === 'stage' || opts.by === 'phase' || opts.by === 'model' || opts.by === 'account' || opts.by === 'job') out.log(formatAxisUsage(row as AxisUsageRow, opts.by));
@@ -336,7 +481,7 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
       const inputs = dedupePodRollupRows(unwrapPod ? excludeCoveredPodRawRows(selected) : selected);
       if (opts.by === 'stage' || opts.by === 'phase' || opts.by === 'model' || opts.by === 'account' || opts.by === 'job') {
         const report = rollupByAxis(inputs, opts.by);
-        if (opts.hosts === 'all') { emitFederated(report, localFailure); return; }
+        if (opts.hosts === 'all') { await emitFederated(report, localFailure); return; }
         if (json) {
           out.log(JSON.stringify(report, null, 2));
           return;
@@ -346,13 +491,17 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         return;
       }
       const report = rollupRunUsage(inputs, { by: opts.by });
-      if (opts.hosts === 'all') { emitFederated(report, localFailure); return; }
+      if (opts.hosts === 'all') { await emitFederated(report, localFailure); return; }
       if (opts.by === 'role') report.sort((a, b) => b.calls - a.calls);
+      // ⭐ 강·중·약 섞기 정책 v0 — 같은 입력 행에서 등급별 몫(강 >10% = 노랑). JSON 행 배열 계약(연합 조회)은 그대로 둔다.
+      // ⭐ 등급별 몫은 --tier-share 일 때만 — 생략하면 텍스트·JSON 모두 종전과 바이트 단위로 같다.
+      const tierShare = opts.by === 'role' && opts.tierShare ? summarizeTierShares(inputs as readonly TierShareInput[]) : undefined;
       if (json) {
-        out.log(JSON.stringify(report, null, 2));
+        out.log(JSON.stringify(tierShare ? { rows: report, tierShare } : report, null, 2));
         return;
       }
       if (report.length === 0) { out.log('(일치하는 런 사용량 없음)'); return; }
+      if (tierShare) for (const line of formatTierShareReport(tierShare)) out.log(line);
       for (const row of report) {
         if (opts.by === 'role') {
           out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
@@ -360,6 +509,97 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
           out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
         }
       }
+    });
+
+  // O4 OP-LONG-SESSION-COMPACT — prompt-cache hit rate over the stored per-call ledger (read-only).
+  usage
+    .command('cache')
+    .description('저장된 llm.usage 원장에서 프롬프트 캐시 적중률(cacheRead ÷ 전체 입력)과 압축 횟수를 본다 (읽기 전용)')
+    .option('--session <id>', '채팅 세션 ID 정확 일치')
+    .option(...LOGS_SINCE_OPTION)
+    .option('--hosts <scope>', '호스트 연합 (all: HQ + 설정된 운영·SSH·TA 호스트)')
+    .option('--json', '집계 JSON 출력')
+    .action(async (opts: { session?: string; since?: string; hosts?: string; json?: boolean }, command: Command) => {
+      const json = opts.json || command.optsWithGlobals<{ json?: boolean }>().json;
+      const sinceMs = opts.since === undefined ? undefined : parseSince(opts.since);
+      if (sinceMs === null) {
+        out.log(`⛔ --since 파싱 불가: '${opts.since}' (30s/15m/2h/7d 또는 ISO)`);
+        exit(2);
+        return;
+      }
+      if (opts.hosts !== undefined && opts.hosts !== 'all') {
+        out.log(`⛔ --hosts 는 all 만 지원: '${opts.hosts}'`);
+        exit(2);
+        return;
+      }
+      const localUnavailable = opts.hosts === 'all' && !deps.readRunLogs && !existsSync(logsDbPath())
+        ? '로컬 logs.db 없음' : undefined;
+      let localFailure = localUnavailable;
+      let rows: LogStoreRow[] = [];
+      if (!localFailure) try {
+        rows = (deps.readRunLogs ?? readRunLogs)({
+          exactCategories: ['llm.usage', 'session.compact'], events: ['llm-usage', 'fired'],
+          ...(sinceMs !== undefined ? { sinceMs } : {}),
+        });
+      } catch (error) {
+        if (opts.hosts !== 'all') throw error;
+        localFailure = '로컬 logs.db 조회 실패';
+      }
+      const usageRows: CacheUsageRow[] = [];
+      let compactions = 0;
+      for (const row of rows) {
+        let data: Record<string, unknown> = {};
+        try {
+          const parsed: unknown = row.data ? JSON.parse(row.data) : {};
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed as Record<string, unknown>;
+        } catch { continue; }
+        // The payload id wins; the logs.db column carries the ambient session for older rows.
+        const sessionId = typeof data.sessionId === 'string' ? data.sessionId : row.session_id;
+        if (opts.session !== undefined && sessionId !== opts.session) continue;
+        if (row.category === 'session.compact' && row.event === 'fired') { compactions += 1; continue; }
+        if (row.category !== 'llm.usage' || row.event !== 'llm-usage') continue;
+        usageRows.push({
+          sessionId,
+          ...(typeof data.model === 'string' ? { model: data.model } : {}),
+          ...(typeof data.provider === 'string' ? { provider: data.provider } : {}),
+          ...(typeof data.billingProvider === 'string' ? { billingProvider: data.billingProvider } : {}),
+          ...(typeof data.inputTokens === 'number' ? { inputTokens: data.inputTokens } : {}),
+          ...(typeof data.cacheReadInputTokens === 'number' ? { cacheReadInputTokens: data.cacheReadInputTokens } : {}),
+          ...(typeof data.cacheCreationInputTokens === 'number' ? { cacheCreationInputTokens: data.cacheCreationInputTokens } : {}),
+        });
+      }
+      const report = summarizeCacheUsage(usageRows, {
+        ...(opts.session !== undefined ? { sessionId: opts.session } : {}),
+        compactions,
+      });
+      if (opts.hosts !== 'all') {
+        out.log(json ? JSON.stringify(report, null, 2) : formatCacheUsageReport(report));
+        return;
+      }
+      const roster = await (deps.usageHosts ?? configuredUsageHosts)();
+      const localHost = roster.local || '(local)';
+      const duplicateCandidates = new Set(roster.duplicateCandidates ?? (roster.local ? [] : roster.remote));
+      const hosts: HostMeasurement[] = [localFailure
+        ? { host: localHost, status: 'unmeasured', reason: localFailure }
+        : { host: localHost, status: 'ok' }];
+      const reports: CacheUsageReport[] = localFailure ? [] : [report];
+      const rosterReason = roster.remote.length === 0 ? '원격 호스트 목록 없음' : undefined;
+      for (const host of [...new Set(roster.remote.filter((name) => name !== localHost))]) {
+        if (duplicateCandidates.has(host)) {
+          hosts.push({ host, status: 'unmeasured', reason: '현재 호스트와 중복 가능 — 원격 제외' });
+          continue;
+        }
+        const remote = readRemoteCache(host, { session: opts.session, sinceMs }, deps.ssh ?? defaultSshRunner);
+        if (remote.report) { hosts.push({ host, status: 'ok' }); reports.push(remote.report); }
+        else hosts.push({ host, status: 'unmeasured', reason: remote.reason ?? '원인 미상' });
+      }
+      const complete = !rosterReason && hosts.every((host) => host.status === 'ok');
+      const merged = reports.length > 0 ? mergeCacheReports(reports, opts.session) : null;
+      if (json) { out.log(JSON.stringify({ report: merged, hosts, complete, ...(rosterReason ? { reason: rosterReason } : {}) }, null, 2)); return; }
+      out.log(`호스트 ${hosts.filter((host) => host.status === 'ok').length}/${hosts.length} 측정 · ${complete ? '완결' : '부분 합계'}`);
+      if (rosterReason) out.log(`호스트 목록: 못 잼 (${rosterReason})`);
+      for (const host of hosts) out.log(`${host.host}: ${host.status === 'ok' ? '측정' : `못 잼 (${host.reason})`}`);
+      out.log(merged ? formatCacheUsageReport(merged) : '(측정된 호스트 없음)');
     });
 
   // ⛔⭐⭐ 리셋권 소비는 ***되돌릴 수 없다*** — 서버가 크레딧을 고르고, 그 계정의 주간 창이 새로 시작한다.

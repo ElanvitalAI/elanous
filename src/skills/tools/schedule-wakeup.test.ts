@@ -766,3 +766,20 @@ describe('LLM 도구', () => {
     expect(src).toContain('wakeupScheduler.dispose();');
   });
 });
+
+describe('ELN-SEAT-TURN-PACING — a minimum-interval refusal defers the wakeup to retryAt, never drops it', () => {
+  test('Cap with retryAt → one retry exactly at retryAt → fired', () => {
+    const clock0 = new Date(2026, 9, 17, 9, 0, 0, 0).getTime();
+    const GAP = 20_000; // Source: a gap shorter than WAKEUP_RETRY_DELAY_MS, to prove retryAt (not the 1-minute retry) is used
+    const r = rig({ results: [{ opened: false, reason: 'Cap', detail: 'pacing:min-interval', retryAt: clock0 + 60_000 + GAP }] });
+    r.s.schedule({ delaySeconds: 60, reason: 'heartbeat' });
+    r.clock.advance(60_000);
+    expect(r.calls).toHaveLength(1);
+    r.clock.advance(GAP - 1);
+    expect(r.calls).toHaveLength(1);
+    r.clock.advance(1);
+    expect(r.calls).toHaveLength(2);
+    expect(r.events()).toEqual(['scheduled:heartbeat', 'rejected:Cap', 'fired:heartbeat']);
+    expect(r.lines.some(line => line.includes('놓침'))).toBe(false);
+  });
+});

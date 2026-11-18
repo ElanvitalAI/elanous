@@ -5,7 +5,7 @@ import { createNextTuiCoreInput } from './input.js';
 test('next prompt hides paste character count while classic keeps its existing token', () => {
   const raw = 'a\nb\nc\nd';
   const next = createNextTuiCoreInput();
-  expect(next.foldPaste(raw)).toBe('[붙여넣음 #1 · 4줄 · 원문]');
+  expect(next.foldPaste(raw)).toBe('[Paste #1 · 4 lines · full text]');
   expect(createPasteFold(() => {}).fold(raw)).toBe('[붙여넣음 #1 · 4줄 · 7자]');
 });
 

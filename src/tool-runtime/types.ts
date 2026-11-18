@@ -103,7 +103,7 @@ export interface ToolRuntimeContext {
   /** Session that originated this execution when it was delegated through another runtime session. */
   originSessionId?: string;
   /** Server-verified owner principal. Never derive this from session source, tool args, or a client-declared origin. */
-  verifiedOwner?: { id: string };
+  verifiedOwner?: { id: string; appSlug?: string };
   /** Server-authenticated Nexus app session class; never supplied by tool arguments. */
   appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** Verified app-scoped member receipt resolved by Nexus at the request boundary. */

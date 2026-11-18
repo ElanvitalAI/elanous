@@ -69,6 +69,9 @@ export function getZaiApiKey(deps: ZaiKeyDeps = {}): string | undefined {
   return v && v.trim() ? v.trim() : undefined;
 }
 
+/** TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — 키가 없을 때 사람에게 보이는 이유 한 줄(값·경로 내용은 안 싣는다). */
+export const ZAI_CREDENTIAL_MISSING_REASON = 'GLM 자격 없음: ZAI Coding Plan 키(~/.cache/zai_api_key 또는 ZAI_API_KEY)를 찾지 못했습니다';
+
 /** ⭐ 직결 경로가 «서나» — 키가 없으면 false 이고 `glm` 은 종전 동작(OpenRouter 안내 오류) 그대로다. */
 export function zaiCodingPlanAvailable(deps: ZaiKeyDeps = {}): boolean {
   return getZaiApiKey(deps) !== undefined;
@@ -583,10 +586,13 @@ export function makeZaiCodingPlanProvider(cfg: UCLLMConfig, deps: ZaiProviderDep
         try {
           for await (const ev of provider.streamChat!(messages, { ...opts, model: wireModel })) {
             if (ev.type === 'usage') {
+              // ⭐ 1121 RESEARCH-OBSERVATION — a later usage event may carry only `stopReason`; it must not zero the
+              //   token counts an earlier event reported (the ledger recorded input/output 0 for every GLM call).
+              const prev = usage as { input: number; cached: number; output: number } | null;
               usage = {
-                input: ev.usage.inputTokens ?? 0,
-                cached: ev.usage.cacheReadInputTokens ?? 0,
-                output: ev.usage.outputTokens ?? 0,
+                input: ev.usage.inputTokens ?? prev?.input ?? 0,
+                cached: ev.usage.cacheReadInputTokens ?? prev?.cached ?? 0,
+                output: ev.usage.outputTokens ?? prev?.output ?? 0,
               };
             } else {
               emitted = true;

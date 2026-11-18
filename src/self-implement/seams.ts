@@ -96,7 +96,9 @@ import { countReflectFactConflicts, type MustFixRefutation, type ReflectEvidence
 import { isSupervisorDecisionSection, splitGoalSections, supervisorGoalDigest } from './goal-digest.js';
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import type { ReworkBudgetVerdict } from './run-outcome.js';
-import { pickImplementRoleForGoal, runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
+import { pickImplementRoleWithRoute, runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
+import { recordLaunchRoute, workRiskInputFromGoal } from './work-route.js';
+import { failureOracleSectionForImplement, resolveFailureOracleMode } from '../harness/failure-oracle.js';
 import { isClaudeAcpChild, runClaudeAcpImplement } from './claude-acp-implement.js';
 import { childLlmSelectionEnv } from '../agent/run-context.js';
 import { observeExternalEvent } from '../context-bus/external-events.js';
@@ -925,7 +927,9 @@ export function buildPrBody(cwd: string, body: string, conclusion?: PrBodyConclu
 /** 헤드리스 elanous 가 이 feature 를 구현하도록 주입하는 프롬프트. goal-loop 계약 + 검증된 클린-빌드
  * 앵커(측정→운영·[[REPORT-gemma-goalloop-lever-2026-07-20]])를 명시. 앵커가 gemma 를 99 로 끌어올렸고
  * 강한 모델엔 무해 — self-run 어느 provider 든 동일 규율. */
-export function featurePrompt(feature: string, cwd?: string, reviewerContext?: readonly ReviewerContextItem[]): string {
+export function featurePrompt(feature: string, cwd?: string, reviewerContext?: readonly ReviewerContextItem[],
+  /** HARNESS-FAILURE-ORACLE-GEN — 첫 구현 라운드에만 하니스가 싣는 절(`src/harness/failure-oracle.ts`). 없으면 종전과 같은 문면. */
+  preImplementSections?: readonly string[]): string {
   const worktreeNotice = cwd?.trim()
     ? `작업 디렉토리는 \`${cwd}\`다. 이 트리 안에서만 편집하고, 경로가 필요하면 추측하지 말고 이 경로를 기준으로 삼아라.`
     : '';
@@ -946,6 +950,7 @@ export function featurePrompt(feature: string, cwd?: string, reviewerContext?: r
     worktreeNotice,
     '',
     ...referenceFacts,
+    ...(preImplementSections ?? []).filter((section) => section.trim()).flatMap((section) => [section, '']),
     ...planStepsInstruction,
     CLEAN_BUILD_ANCHOR,
     '- 완료를 선언하기 전에 **네가 바꾼/추가한 테스트 파일 경로만** 지정해 `bun test <파일>`(또는 `run_tests` 툴)로 통과를 확인하라(실패하면 통과까지 고쳐라). ⚠️ **경로 없는 전체 `bun test` 스위트는 돌리지 마라** — 통합/네트워크 테스트를 포함해 격리 worktree 에서 매우 느려 시간초과로 미완 처리된다(게이트도 변경 파일만 스코프하니 전체 불요·self typecheck 스코프와 대칭).',
@@ -979,6 +984,22 @@ export function featurePrompt(feature: string, cwd?: string, reviewerContext?: r
     '',
     '완료되면(모든 요구사항이 증거로 충족) 마지막 줄에 GOAL-COMPLETE 를 단독으로 써라.',
   ].join('\n');
+}
+
+/** HARNESS-FAILURE-ORACLE-GEN — implement seam 이 첫 라운드 프롬프트에 실을 절(골 문서의 구조 칸 → work-risk-router 범주).
+ *  shadow(기본)·rework 라운드·위험 없음·오류 = `undefined`(프롬프트 종전 그대로) · 모든 분기가 이벤트를 남긴다. */
+export function implementFailureOracleSection(feature: string, round: { firstRound: boolean; runId?: string },
+  deps: { readConfig?: () => Parameters<typeof resolveFailureOracleMode>[0]; log?: (category: string, event: string, data: Record<string, unknown>) => void } = {}): string | undefined {
+  return failureOracleSectionForImplement({
+    firstRound: round.firstRound,
+    readMode: () => resolveFailureOracleMode((deps.readConfig ?? getUserConfig)()),
+    readInput: () => {
+      const input = workRiskInputFromGoal(feature);
+      return { paths: input.paths, ...(input.declaredCategories ? { declaredCategories: input.declaredCategories } : {}) };
+    },
+    ...(round.runId ? { runId: round.runId } : {}),
+    log: deps.log ?? ((category, event, data) => debug.log(category, event, data)),
+  });
 }
 
 const PTY_DEGRADED_CAPABILITIES = ['live-progress', 'registry', 'non-blocking-parent', 'pty-identity'] as const;
@@ -1911,7 +1932,9 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         omittedItems: reviewerContext.omittedItems,
         ...(runId ? { runId } : {}),
       });
-      const prompt = featurePrompt(feature, cwd, o.reviewerContext);
+      // HARNESS-FAILURE-ORACLE-GEN — 위험 경로면 실패 상황 시험 틀을 «코드 전»(첫 라운드)에만 싣는다. 기본 shadow = 개수 이벤트만.
+      const failureOracle = implementFailureOracleSection(feature, { firstRound: !roundContext, ...(runId ? { runId } : {}) });
+      const prompt = featurePrompt(feature, cwd, o.reviewerContext, failureOracle ? [failureOracle] : undefined);
       // CLAUDE-IMPL-LANE — claude-acp 는 PTY 자식(`elanous chat` → getProvider)으로 보내지 않는다:
       //   거기서는 모델 이름(claude-…)이 anthropic(API 키 provider)으로 풀려 «구독» 런이 API 로 과금된다(#26277 보류 판독).
       //   구독 ACP 구현기만 쓰고, 구독 확인이 안 되면 실패로 끝낸다(다른 공급자로 조용히 새지 않는다).
@@ -2013,8 +2036,16 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       // 폴백 — PTY 불가/cap 초과/에러. 기존 헤드리스 spawnSync 경로 보존(블로킹이지만 견고).
       const args = [`${binRoot}/bin/elanous.mjs`, 'dev', '--implement'];
       const executionId = randomUUID();
-      const fallbackImplementRole = !childLlm && !process.env.ELANOUS_LLM_MODEL?.trim()
-        ? pickImplementRoleForGoal(feature) : undefined;
+      const fallbackImplementPick = !childLlm && !process.env.ELANOUS_LLM_MODEL?.trim()
+        ? pickImplementRoleWithRoute(feature) : undefined;
+      const fallbackImplementRole = fallbackImplementPick?.role;
+      // ⭐ HARNESS-DIFFICULTY-ROUTER — 폴백 갈래도 PTY 갈래와 같은 원장 줄을 남긴다(적용 여부 포함).
+      const fallbackRoute = fallbackImplementPick?.route;
+      if (runId && fallbackRoute) {
+        try {
+          recordLaunchRoute(fallbackRoute, runId, { provider: fallbackImplementRole?.provider ?? null, model: fallbackImplementRole?.model ?? null });
+        } catch { /* observation is fail-soft */ }
+      }
       if (o.configDir) args.push('--config-dir', o.configDir);
       args.push(prompt);
       const fallbackSource = `elanous://harness/${encodeURIComponent(runId ?? 'unknown')}/${encodeURIComponent(executionId)}`;

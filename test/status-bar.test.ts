@@ -538,7 +538,7 @@ describe('SP-B — shellRollupSegment', () => {
 
 describe('TUI-BG-JOB-VISIBILITY — backgroundJobsSegment', () => {
   test('백그라운드 1 → «⧗ 백그라운드 1»', () => {
-    expect(strip(backgroundJobsSegment({ background: 1 }))).toBe('⧗ 백그라운드 1');
+    expect(strip(backgroundJobsSegment({ background: 1 }))).toBe('⧗ background 1');
   });
 
   test('0 → 세그먼트 없음 (끝나면 사라짐)', () => {
@@ -550,7 +550,7 @@ describe('TUI-BG-JOB-VISIBILITY — backgroundJobsSegment', () => {
   });
 
   test('theme option preserves content', () => {
-    expect(strip(backgroundJobsSegment({ background: 3 }, { theme: DEFAULT_THEME_TOKENS }))).toBe('⧗ 백그라운드 3');
+    expect(strip(backgroundJobsSegment({ background: 3 }, { theme: DEFAULT_THEME_TOKENS }))).toBe('⧗ background 3');
   });
 });
 
@@ -574,9 +574,9 @@ describe('TUI-BG-JOB-VISIBILITY — 상태줄 배선', () => {
 
   test('유휴여도 bg 1 → 상태줄에 «⧗ 백그라운드 1» · 기존 세그먼트 순서 그대로', () => {
     const line = strip(build({ background: 1 }));
-    expect(line).toContain('⧗ 백그라운드 1');
+    expect(line).toContain('⧗ background 1');
     expect(line.indexOf('◇ 2 agents')).toBeLessThan(line.indexOf('⛭ pty:pty_x'));
-    expect(line.indexOf('⛭ pty:pty_x')).toBeLessThan(line.indexOf('⧗ 백그라운드 1'));
+    expect(line.indexOf('⛭ pty:pty_x')).toBeLessThan(line.indexOf('⧗ background 1'));
   });
 
   test('bg 0 → 줄이 이전과 바이트 동일(ANSI 포함 원본 문자열)', () => {
@@ -614,7 +614,7 @@ describe('tf-bg-ghost — 상태줄은 프레임 폭을 넘지 않는다', () =>
   test('160칸 · bg 1 → 폭 ≤ 159 ⊕ «⧗ 백그라운드 1» 은 남는다', () => {
     const line = wiring(160).buildStatusLine(liveInput({ background: 1 }));
     expect(visibleWidth(line)).toBeLessThanOrEqual(159);
-    expect(strip(line)).toContain('⧗ 백그라운드 1');
+    expect(strip(line)).toContain('⧗ background 1');
   });
 
   test('좁은 화면(100·60·20칸)에서도 폭을 넘지 않는다', () => {
@@ -640,7 +640,7 @@ describe('tf-bg-ghost — 상태줄은 프레임 폭을 넘지 않는다', () =>
   test('실화면 꼴 · 앞 세그먼트가 길어도 «⧗ 백그라운드 1» 은 남는다(100·80칸)', () => {
     for (const cols of [100, 80]) {
       const line = strip(wiring(cols).buildStatusLine(liveInput({ background: 1 })));
-      expect(line).toContain('⧗ 백그라운드 1');
+      expect(line).toContain('⧗ background 1');
       expect(visibleWidth(line)).toBeLessThanOrEqual(cols - 1);
     }
   });

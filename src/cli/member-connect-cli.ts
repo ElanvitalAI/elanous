@@ -1,7 +1,7 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import type { Command } from 'commander';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { connectApprovedMemberSession } from './member-connect.js';
+import { connectApprovedMemberSession, disconnectMemberSession, MemberSessionOccupiedError } from './member-connect.js';
 import { MemberConnectStageError, startApprovedMemberConnect } from './member-connect-start.js';
 
 function readApprovedHandoff(path: string): { code: string; state: string; codeVerifier: string } {
@@ -25,6 +25,8 @@ function readApprovedHandoff(path: string): { code: string; state: string; codeV
 const GENERIC_CONNECT_FAILURE = '회원 연결을 완료하지 못했습니다. 승인된 private handoff와 기존 연결을 확인해 주세요.';
 
 function memberConnectDiagnostic(error: unknown): string {
+  // Built locally from the app slug and minutes only; it never carries a token or server body.
+  if (error instanceof MemberSessionOccupiedError) return error.message;
   if (!(error instanceof MemberConnectStageError)) {
     if (!(error instanceof Error)) return GENERIC_CONNECT_FAILURE;
     // The SDK currently uses plain Error. Recognize only these exact local
@@ -92,4 +94,19 @@ export function registerMemberConnectCommands(program: Command, deps: {
       exit(0);
     } catch (error) { io.error(memberConnectDiagnostic(error)); exit(1); }
   });
+  // APP-BUILD-SESSION-REFRESH: the explicit way out of a still-valid but too-short (or other-app) session.
+  member.command('disconnect').description('Remove this machine\'s private member app session so a new connect can follow.')
+    .allowExcessArguments(false)
+    .action(() => {
+      try {
+        const result = disconnectMemberSession((deps.configDir ?? getElanousConfigDir)(), deps.now?.() ?? Date.now());
+        io.log(result.removed
+          ? `회원 앱 세션 연결을 해제했습니다${result.appSlug ? ` (앱 ${result.appSlug})` : ''}. elanous member connect 로 다시 연결해 주세요.`
+          : '해제할 회원 앱 세션이 없습니다.');
+        exit(0);
+      } catch (error) {
+        io.error(error instanceof Error && error.message.startsWith('회원 연결') ? error.message : '회원 연결을 해제하지 못했습니다.');
+        exit(1);
+      }
+    });
 }

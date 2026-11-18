@@ -1450,3 +1450,74 @@ describe('runGoalLoop — run_tests evidence 대조 (OH8 후속 PR-2)', () => {
     }
   });
 });
+
+// ── SEAT-CAP-RESUME-NOTICE(연속 큐 미재개 · ELN-DOGFOOD 11-16 23:42) ──────────
+// 상한 소진 마감 직전 onSeatCapExhausted 1회 발화 · evidence 완료 경로 미발화 · 미지정 시 동작 불변.
+// seatTools 는 실제 dispatchTool 경로에서만 증가하므로 runTurn seam 안에서 scriptedToolCalls 전부를 호출해 maxTools(= scriptedToolCalls.length) 상한에 닿게 한다.
+import { SEAT_TURN_CAP_DEFAULTS } from '../src/core-turn/seat-turn-cap.js';
+describe('runGoalLoop — onSeatCapExhausted (SEAT-CAP-RESUME-NOTICE)', () => {
+  // NUMGUARD(규칙 143/1 · #38003 r3): maxTools 숫자 리터럴 금지 — 시험이 실제로 dispatch 하는
+  // 도구 호출 목록(scriptedToolCalls)의 length 에서 유도한다(목록이 1개 호출이면 상한도 1).
+  // maxWallMs · idleEmptyMsgListLimit 은 이 시험과 무관 → 제품 기본값(SEAT_TURN_CAP_DEFAULTS · src/core-turn/seat-turn-cap.ts)을 그대로 쓴다.
+  const scriptedToolCalls = [
+    { tool: 'Read', args: { path: '/tmp/x' } },
+  ];
+  const seatTurnCap = {
+    seat: 'UX',
+    maxTools: scriptedToolCalls.length,
+    maxWallMs: SEAT_TURN_CAP_DEFAULTS.maxWallMs,
+    idleEmptyMsgListLimit: SEAT_TURN_CAP_DEFAULTS.idleEmptyMsgListLimit,
+  };
+
+  async function capExhaustingTurn(ctx: CoreTurnContext): Promise<CoreTurnResult> {
+    for (const call of scriptedToolCalls) {
+      await ctx.dispatchTool(call.tool, call.args, ctx);
+    }
+    return { stopReason: 'end_turn', finalText: 'summary of capped turn' };
+  }
+
+  it('상한 소진 시 콜백을 정확히 1회 · seat·iterations·finalText 를 전달한다', async () => {
+    const calls: Array<{ seat: string; finalText: string; iterations: number }> = [];
+    const r = await runGoalLoop(baseCtx('CAP-BOUNDARY 한 번 실행'), {
+      runTurn: capExhaustingTurn,
+      seatTurnCap,
+      onSeatCapExhausted: (info) => { calls.push(info); },
+    });
+    expect(r.stopReason).toBe('max_turns');
+    expect(r.goalComplete).toBe(false);
+    expect(calls).toEqual([{ seat: 'UX', finalText: 'summary of capped turn', iterations: 1 }]);
+  });
+
+  it('evidence 있는 update_goal(complete) 경로에서는 발화하지 않는다', async () => {
+    const calls: Array<{ seat: string }> = [];
+    const runTurn = async (ctx: CoreTurnContext): Promise<CoreTurnResult> => {
+      ctx.callbacks?.onTurnComplete?.(updateGoalTurn('complete', '파일 생성 + 시험 통과'));
+      return { stopReason: 'end_turn', finalText: 'done' };
+    };
+    const r = await runGoalLoop(baseCtx('끝까지 하고 완료 보고'), {
+      runTurn,
+      seatTurnCap,
+      onSeatCapExhausted: (info) => { calls.push(info); },
+    });
+    expect(r.stopReason).toBe('goal_complete');
+    expect(r.goalComplete).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
+  it('콜백 미지정 시 상한 마감 동작은 기존 그대로다(max_turns·goalComplete false)', async () => {
+    const r = await runGoalLoop(baseCtx('CAP-BOUNDARY 한 번 실행'), {
+      runTurn: capExhaustingTurn,
+      seatTurnCap,
+    });
+    expect(r).toEqual({ finalText: 'summary of capped turn', iterations: 1, stopReason: 'max_turns', goalComplete: false });
+  });
+
+  it('콜백이 던져도 마감 반환값은 바뀌지 않는다(fail-soft)', async () => {
+    const r = await runGoalLoop(baseCtx('CAP-BOUNDARY 한 번 실행'), {
+      runTurn: capExhaustingTurn,
+      seatTurnCap,
+      onSeatCapExhausted: () => { throw new Error('ledger down'); },
+    });
+    expect(r).toEqual({ finalText: 'summary of capped turn', iterations: 1, stopReason: 'max_turns', goalComplete: false });
+  });
+});

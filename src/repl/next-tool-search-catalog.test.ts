@@ -51,7 +51,7 @@ test('isolated Next session sends its app slug to the strict Nexus owner endpoin
   try {
     writeFileSync(sessionFile, JSON.stringify({ nexusUrl: `http://127.0.0.1:${nexus.port}`,
       sessionToken: 'aps_synthetic', appSlug: 'concert-app' }));
-    expect(await resolveNextTestVerifiedOwner(sessionFile)).toEqual({ id: 'concert-owner' });
+    expect(await resolveNextTestVerifiedOwner(sessionFile)).toEqual({ id: 'concert-owner', appSlug: 'concert-app' });
     expect(requests).toEqual(['/v1/members/owner?appSlug=concert-app']);
   } finally {
     nexus.stop(true);

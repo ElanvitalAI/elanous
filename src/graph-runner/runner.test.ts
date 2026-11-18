@@ -495,6 +495,44 @@ test('a transient ledger persist exception closes the visit and resume continues
   expect(journal.at(-1)?.sequence).toBe(resumedEvents.at(-1)?.seq);
 });
 
+test('node progress only appends to the run ledger — the runner stays the one run-state writer, resume starts after the tail', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace("recipe: 'cmd:first'", 'recipe: handler:report'));
+  const runId = 'node-progress-ledger-only';
+  const writesDuringNode: string[] = [];
+  let inNode = false;
+  const deps = { root,
+    runBash: async () => ({ stdout: 'ok', stderr: '', exitCode: 0 }),
+    beforePersist: () => { if (inNode) writesDuringNode.push('run-state'); },
+    inProcessHandlers: { report: async (context: { reportProgress?: (p: { round?: number; phase: 'verify' }) => Promise<void> }) => {
+      inNode = true;
+      await context.reportProgress?.({ round: 1, phase: 'verify' });
+      await context.reportProgress?.({ round: 2, phase: 'verify' });
+      inNode = false;
+      return { ok: true, outcome: 'ok' };
+    } } };
+  const first = await runGraph(graph, { runId, deps });
+  expect(first.status).toBe('done');
+  expect(writesDuringNode).toEqual([]);
+  const journal = readGraphRunEvents(graphRunEventLedgerPath(root, 'test-graph', runId));
+  const firstNode = journal.filter((event) => event.source.nodeId === 'first').map((event) => event.type);
+  expect(firstNode).toEqual(['node-arrival', 'node-start', 'node-progress', 'node-progress', 'node-end', 'node-leave']);
+  expect(journal.map((event) => event.sequence)).toEqual([...new Set(journal.map((event) => event.sequence))].sort((a, b) => a - b));
+
+  const statePath = join(root, 'graph-runs', 'test-graph', `${runId}.json`);
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+  // A crash right after a progress append leaves run state behind the ledger tail.
+  state.graphEventSequence = journal.find((event) => event.type === 'node-progress')!.sequence;
+  state.status = 'failed';
+  state.reason = 'resume after progress';
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  const resumed = await runGraph(graph, { resumeRunId: runId, fromNodeId: 'first', deps });
+  expect(resumed.status).toBe('done');
+  const after = readGraphRunEvents(graphRunEventLedgerPath(root, 'test-graph', runId));
+  expect(after.length).toBeGreaterThan(journal.length);
+  expect(after.map((event) => event.sequence)).toEqual([...new Set(after.map((event) => event.sequence))].sort((a, b) => a - b));
+});
+
 test('runGraph publishes ordered node lifecycle events and dispatches matching node subscriptions', async () => {
   const { graph, root } = fixture('echo ok');
   const yaml = readFileSync(graph, 'utf8').replace(

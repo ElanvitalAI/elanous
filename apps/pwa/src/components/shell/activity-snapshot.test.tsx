@@ -12,6 +12,7 @@ import {
   type ShellActivitySnapshot,
 } from './activity-snapshot';
 import { fetchActivitySnapshot } from './fetch-activity-snapshot';
+import { DaemonClient } from '@/lib/daemon-client';
 import { TopBarActivityIndicator } from './TopBarActivityIndicator';
 import * as realNavigation from 'next/navigation';
 import * as realNexusContext from '@/nexus/hooks/use-nexus-context';
@@ -204,6 +205,50 @@ describe('fetchActivitySnapshot', () => {
     if (snapshot.kind === 'error') expect(snapshot.message).toContain('503');
   });
 
+  test('WEB-CHAT-ACTIVITY-ERROR: a 401 (device not connected) is quiet, not an activity error', async () => {
+    const snapshot = await fetchActivitySnapshot({
+      fetchImpl: async () => new Response('unauthorized', { status: 401 }),
+      listProgressFrames: async () => null,
+    });
+    expect(snapshot).toEqual({ kind: 'quiet' });
+  });
+
+  test('WEB-CHAT-ACTIVITY-ERROR: the default path asks through the configured connection with its token', async () => {
+    const seen: { url: string; auth: string | null }[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ url: String(input), auth: new Headers(init?.headers).get('authorization') });
+      return new Response(JSON.stringify(String(input).includes('/v1/logs') ? { logs: [] } : { subjects: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const client = new DaemonClient({ baseUrl: 'http://nexus.test', token: 'device-token', provider: '' });
+      const snapshot = await fetchActivitySnapshot({ client });
+      expect(snapshot).toEqual({ kind: 'quiet' });
+      expect(seen).toEqual([
+        { url: 'http://nexus.test/v1/terminals', auth: 'Bearer device-token' },
+        { url: 'http://nexus.test/v1/logs?event=headless.progress-frame&limit=200', auth: 'Bearer device-token' },
+      ]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('WEB-CHAT-ACTIVITY-ERROR: a progress-frame failure (5xx) is an activity error, not a silent quiet strip', async () => {
+    const client = { fetchResponse: async (path: string) => path.startsWith('/v1/terminals')
+      ? new Response(JSON.stringify({ subjects: [] }), { status: 200 })
+      : new Response('down', { status: 503 }) };
+    const snapshot = await fetchActivitySnapshot({ client });
+    expect(snapshot.kind).toBe('error');
+    if (snapshot.kind === 'error') expect(snapshot.message).toContain('progress frames');
+  });
+
+  test('WEB-CHAT-ACTIVITY-ERROR: a progress-frame 401 stays quiet like the terminals 401', async () => {
+    const client = { fetchResponse: async (path: string) => path.startsWith('/v1/terminals')
+      ? new Response(JSON.stringify({ subjects: [] }), { status: 200 })
+      : new Response('unauthorized', { status: 401 }) };
+    expect(await fetchActivitySnapshot({ client })).toEqual({ kind: 'quiet' });
+  });
+
   test('joins progress frames onto a live subject', async () => {
     const live = subject({
       id: 'subject:live',
@@ -233,9 +278,9 @@ describe('TopBarActivityIndicator render — quiet/loading/error/active', () => 
 
   test('error is an alert and is not the quiet surface', () => {
     const html = renderToStaticMarkup(<TopBarActivityIndicator snapshot={ERROR} />);
-    expect(html).toContain('role="alert"');
     expect(html).toContain('data-activity-kind="error"');
-    expect(html).toContain('activity error');
+    expect(html).toContain('data-activity-kind="error"');
+    expect(html).toContain('활동 정보를 못 불러옴 · 다시 시도 중');
     expect(html).toContain(ERROR.message);
     expect(html).not.toContain('data-activity-kind="active"');
     expect(html).not.toContain('href="/observatory');
@@ -252,7 +297,7 @@ describe('TopBarActivityIndicator render — quiet/loading/error/active', () => 
     expect(html).toContain('self_82122f50');
     expect(html).toContain(LIVE_RUN.progressLine);
     expect(html).not.toContain('role="alert"');
-    expect(html).not.toContain('activity error');
+    expect(html).not.toContain('활동 정보를 못 불러옴 · 다시 시도 중');
     expect(html).not.toContain('takeover');
   });
 
@@ -263,10 +308,10 @@ describe('TopBarActivityIndicator render — quiet/loading/error/active', () => 
     const active = renderToStaticMarkup(<TopBarActivityIndicator snapshot={ACTIVE} />);
     expect(quiet).toBe('');
     expect(loading).toBe('');
-    expect(error).toContain('activity error');
+    expect(error).toContain('활동 정보를 못 불러옴 · 다시 시도 중');
     expect(error).not.toContain('data-activity-kind="active"');
     expect(active).toContain('data-activity-kind="active"');
-    expect(active).not.toContain('activity error');
+    expect(active).not.toContain('활동 정보를 못 불러옴 · 다시 시도 중');
   });
 });
 
@@ -278,7 +323,7 @@ describe('TopBar h-9 strip + activity insertion', () => {
     expect(html).toContain('aria-label="voice"');
     expect(html).toContain('aria-label="settings"');
     expect(activitySurface(html)).toBeNull();
-    expect(html).not.toContain('activity error');
+    expect(html).not.toContain('활동 정보를 못 불러옴 · 다시 시도 중');
     expect(html).not.toContain('data-activity-kind');
   });
 
@@ -286,15 +331,15 @@ describe('TopBar h-9 strip + activity insertion', () => {
     const html = renderTopBar({ kind: 'loading' });
     expect(html).toContain('flex h-9 shrink-0 items-center');
     expect(activitySurface(html)).toBeNull();
-    expect(html).not.toContain('activity error');
+    expect(html).not.toContain('활동 정보를 못 불러옴 · 다시 시도 중');
   });
 
   test('error sits in the same h-9 row and is distinct from quiet', () => {
     const html = renderTopBar(ERROR);
     expect(html).toContain('flex h-9 shrink-0 items-center');
     expect(html).toContain('aria-label="open menu"');
-    expect(html).toContain('role="alert"');
-    expect(html).toContain('activity error');
+    expect(html).toContain('data-activity-kind="error"');
+    expect(html).toContain('활동 정보를 못 불러옴 · 다시 시도 중');
     expect(html).toContain('data-activity-kind="error"');
   });
 
@@ -323,7 +368,7 @@ describe('AppShell wiring on a non-observatory room', () => {
     expect(html).toContain('aria-label="voice"');
     expect(html).toContain('aria-label="settings"');
     expect(activitySurface(html)).toBeNull();
-    expect(html).not.toContain('activity error');
+    expect(html).not.toContain('활동 정보를 못 불러옴 · 다시 시도 중');
   });
 
   test('quiet: room content stays, activity surface stays absent', () => {
@@ -333,7 +378,7 @@ describe('AppShell wiring on a non-observatory room', () => {
     expect(html).toContain('flex h-9 shrink-0 items-center');
     expect(html).toContain('aria-label="open menu"');
     expect(activitySurface(html)).toBeNull();
-    expect(html).not.toContain('activity error');
+    expect(html).not.toContain('활동 정보를 못 불러옴 · 다시 시도 중');
   });
 
   test('loading does not shake the layout or look like a fault', () => {
@@ -341,14 +386,14 @@ describe('AppShell wiring on a non-observatory room', () => {
     expect(html).toContain('term room');
     expect(html).toContain('flex h-9 shrink-0 items-center');
     expect(activitySurface(html)).toBeNull();
-    expect(html).not.toContain('activity error');
+    expect(html).not.toContain('활동 정보를 못 불러옴 · 다시 시도 중');
   });
 
   test('error is visible on /term and is not quiet', () => {
     const html = renderShell(ERROR);
     expect(html).toContain('term room');
-    expect(html).toContain('role="alert"');
-    expect(html).toContain('activity error');
+    expect(html).toContain('data-activity-kind="error"');
+    expect(html).toContain('활동 정보를 못 불러옴 · 다시 시도 중');
     expect(html).not.toContain('data-activity-kind="active"');
   });
 

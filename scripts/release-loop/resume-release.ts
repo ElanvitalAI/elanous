@@ -25,7 +25,7 @@ import { gateLockfileHashAtCommit } from './gate-reuse-identity.js';
 import { inspectGateShardReceipts } from './gate-shard-receipts.js';
 import { stalledGateEvidence, type StalledGateEvidence } from './gate-stalled-evidence.js';
 import { gitClosureTree, testsReachingChanged, testsReachingChangedForGateReuse, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
-import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateWaiverCoverage, gateUnmeasuredDetail, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
+import { assertReleaseResumeApprovalBoundary, releaseGateSweepCarry, gateSweepCarryEvidence, type GateSweepCarry, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateWaiverCoverage, gateUnmeasuredDetail, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { assertSignedPwaBranchWaiver } from '../../src/graph-runner/release-pwa-waiver.js';
 import { publicWaiverReason } from './known-issues-node.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
@@ -118,6 +118,8 @@ export interface ResumeReleaseOptions {
   acceptedRegressions?: AcceptedRegression[]; approvedBy?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string;
   rerouteShard?: string; shardHost?: string; shardOs?: 'darwin' | 'linux';
   commandRoot?: string;
+  /** RECUT-GATE-WAIVE: run whose owner-accepted (waived) gate sweep this gate waiver inherits; may be this run before an append. */
+  waiveEvidenceRun?: string;
 }
 
 export interface ResumeReleasePlan {
@@ -126,6 +128,8 @@ export interface ResumeReleasePlan {
   /** Most recent failed gate's autoheal recommendation, carried into the resume plan for the caller. */
   autoheal?: GateAutohealDecision;
   autohealReroute?: string;
+  /** RECUT-GATE-WAIVE: the inherited owner-accepted gate sweep and the extra diff it did not measure. */
+  gateSweepCarry?: GateSweepCarry;
   nextAttempt: number; priorCountKnown: boolean; preflight: 'passed';
 }
 
@@ -239,6 +243,35 @@ function ancestorRunner(repo: string) {
     if (result.status !== 0 && result.status !== 1) throw new Error(`git merge-base failed: ${result.error || result.stderr || 'unknown'}`);
     return result.status === 0;
   };
+}
+
+/** RECUT-GATE-WAIVE (대표 11-18): read the evidence run (its live ledger, then its pre-append backups, newest first) and
+ * return the waived gate sweep this waiver inherits — same version, current cut descends from it, extra diff listed. */
+function resolveGateSweepCarry(opts: ResumeReleaseOptions, deps: ResumeReleaseDeps, version: string, tip: string): GateSweepCarry | undefined {
+  if (opts.waiveEvidenceRun === undefined) return undefined;
+  if (opts.waive !== 'gate' && opts.ownerWaive !== 'gate') throw new Error('--waive-evidence-run requires --waive gate (or --owner-waive gate)');
+  const id = safeRunId(opts.waiveEvidenceRun);
+  const dir = join(deps.root!, 'graph-runs', 'release-loop');
+  const live = join(dir, `${id}.json`);
+  const backups = existsSync(dir) ? readdirSync(dir).filter((name) => name.startsWith(`${id}.json.before-tip-`) && name.endsWith('.bak')).sort().reverse() : [];
+  const sources = [...(existsSync(live) ? [live] : []), ...backups.map((name) => join(dir, name))];
+  if (!sources.length) throw new Error(`--waive-evidence-run ${id}: no saved release run`);
+  const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
+  const isAncestor = deps.isAncestor ?? ancestorRunner(deps.repo ?? process.cwd());
+  const commitsBetween = (from: string, to: string) => git(['rev-list', '--reverse', `${from}..${to}`]).split('\n').map((line) => line.trim()).filter(Boolean);
+  let first: unknown;
+  for (const source of sources) {
+    try {
+      const state = JSON.parse(readFileSync(source, 'utf8')) as GraphRunState;
+      if (state.runId !== opts.waiveEvidenceRun) throw new Error(`run identity mismatch: ${source}`);
+      const carry = releaseGateSweepCarry(state, { version, tip }, { isAncestor, commitsBetween }, source);
+      debug.log('release-loop.gate-waive', 'carry', { evidenceRun: id, source, cut: carry.cut, tip: carry.tip, commits: carry.commits });
+      return carry;
+    } catch (error) { first ??= error; }
+  }
+  const message = first instanceof Error ? first.message : String(first);
+  debug.log('release-loop.gate-waive', 'carry-refused', { evidenceRun: id, reason: message });
+  throw new Error(`--waive-evidence-run ${id}: ${message}`);
 }
 
 function safeRunId(runId: string): string {
@@ -810,6 +843,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from);
   const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
   let waiverCommit: string | undefined;
+  let gateSweepCarry: GateSweepCarry | undefined;
   if (waiver || pwaFanOutWaiver) {
     const output = lastJsonObject(savedRun.nodes.find((node) => node.nodeId === 'version-release')?.output);
     const version = output?.version, recorded = output?.commit;
@@ -821,7 +855,9 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
       if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
     }
     waiverCommit = recorded;
+    if (waiver?.nodeId === 'gate') gateSweepCarry = resolveGateSweepCarry(opts, deps, version, recorded);
   }
+  if (opts.waiveEvidenceRun !== undefined && waiver?.nodeId !== 'gate') throw new Error('--waive-evidence-run requires --waive gate (or --owner-waive gate)');
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true);
   const fromIndex = savedRun.path.indexOf(opts.from) >= 0 ? savedRun.path.indexOf(opts.from) : releaseFanOutForkIndex(savedRun, opts.from) ?? -1;
   const gateIndex = savedRun.path.indexOf('gate');
@@ -840,7 +876,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
       : { mode: 'full' as const, reason: partial.requested ? partial.reason : opts.partial === false ? 'partial recheck disabled' : 'no partial plan applies' };
   if (autoheal) debug.log('release-loop.resume', 'gate-autoheal-plan', { runId: opts.runId, version: tip.version, appliedReroute: automaticShardReroute?.set.gateRerouteShard ?? null, ...autoheal });
   return { runId: opts.runId, version: tip.version, fromNode: opts.from, commandRoot, tip, partial,
-    gatePlan, ...(autoheal ? { autoheal } : {}), ...(automaticShardReroute ? { autohealReroute: automaticShardReroute.set.gateRerouteShard } : {}),
+    gatePlan, ...(gateSweepCarry ? { gateSweepCarry } : {}), ...(autoheal ? { autoheal } : {}), ...(automaticShardReroute ? { autohealReroute: automaticShardReroute.set.gateRerouteShard } : {}),
     nextAttempt: attempt.attempt, priorCountKnown: attempt.priorCountKnown, preflight: 'passed' };
 }
 
@@ -881,6 +917,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // A waived verdict may reuse its original commit. A moved tip still requires a full re-gate.
+  let carriedSweep: GateSweepCarry | undefined;
   if (waiver || pwaFanOutWaiver) {
     const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
     const output = lastJsonObject(versionRecord?.output);
@@ -894,7 +931,9 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
       if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
     }
     waiverCommit = recorded;
+    carriedSweep = waiver?.nodeId === 'gate' ? resolveGateSweepCarry(opts, deps, version, recorded) : undefined;
   }
+  if (opts.waiveEvidenceRun !== undefined && waiver?.nodeId !== 'gate') throw new Error('--waive-evidence-run requires --waive gate (or --owner-waive gate)');
   // The read-only tip and recipe pin preflight must pass before fetch or a saved-run rewrite.
   const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true);
   if (shardReroute && previewTip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
@@ -926,7 +965,8 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     const eventPath = join(deps.ledgerRoot ?? releaseLedgerRoot(), 'review-results', 'waiver-events.jsonl');
     const target = `run:${opts.runId}`;
     const waiverActor = waiver.approvedBy ?? process.env.ELANOUS_SEAT ?? process.env.USER ?? 'release-resume';
-    const waiverEvidence = gateWaiverEvidence({ reason: waiver.reason, actor: waiverActor, unmeasured: waiver.unmeasured });
+    const waiverEvidence = gateWaiverEvidence({ reason: waiver.reason, actor: waiverActor, unmeasured: waiver.unmeasured,
+      ...(carriedSweep ? { carried: gateSweepCarryEvidence(carriedSweep) } : {}) });
     const existing = readWaiverEvents(eventPath).filter((candidate) => candidate.kind === 'gate' && candidate.mode === 'operational'
       && candidate.target === target && candidate.head === savedCutCommit && candidate.uses === 0 && candidate.expiredBy === undefined
       && candidate.actor === waiverActor && hasExactWaiverEvidence(candidate, [`saved-run:${tip.statePath}`, ...waiverEvidence])
@@ -952,7 +992,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     waiverLedgerRoot: deps.ledgerRoot ?? releaseLedgerRoot(),
     ...(opts.resumeBudgetExceeded ? { releaseBudgetExceededResume: { reason: opts.reason!.trim() } } : {}),
     releaseCommandSource: { root: commandRoot, cutTip: tip.to, ...(sourceGit ? { git: sourceGit } : {}) },
-    ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [] } } : {}),
+    ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [], ...(carriedSweep ? { carriedSweep } : {}) } } : {}),
     ...(pwaFanOutWaiver ? { releasePwaFanOutWaiver: { reason: opts.reason!.trim() } } : {}),
     ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
     ...(gateExecutor ? { releaseGateExecutor: { executor: gateExecutor.set.gateExecutor, ...(opts.gateHost !== undefined ? { host: opts.gateHost } : {}) } } : {}),

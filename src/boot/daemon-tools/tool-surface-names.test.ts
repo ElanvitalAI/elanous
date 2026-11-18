@@ -18,6 +18,8 @@ import { toolSurface } from './index.js';
 import * as ptyRegistry from '../../pty-shell/registry.js';
 import { ptyAvailable } from '../../pty-shell/registry.js';
 import { isDevHarnessModelSurfaceEnabled } from '../../skills/tools/dev-harness.js';
+import { createChildPluginRoutes, routeOnlyHostToolSpecs } from '../../cli/child-plugin-runtime.js';
+import { DAEMON_MEMBER_ROUTE_TOOL_ALLOWLIST } from './plugin-routes.js';
 
 // finance 게이트를 결정화하는 최소 cfg(구조적 부분집합 — financeEnabled 는 finance.enabled 만 읽음).
 const financeOff = { finance: { enabled: false } } as unknown as UserConfig;
@@ -41,6 +43,18 @@ const CHAT_CORE = [
   'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'proact_meter', 'elanous_skills_list', 'skill_exec', 'app_deploy',
 ];
 const CHAT_PTY_EXTRA = ['ElanousHold', 'PtyControl'];
+// APP-BUILD-TOOLS-IN-DAEMON-TURN — the plugin route tools merged from the same bridge and helper the Next TUI
+// uses (one source, R-TST38), limited on member turns to DAEMON_MEMBER_ROUTE_TOOL_ALLOWLIST (OP security verdict
+// 11-18). app_deploy is already on the surface (shared-app-tools), so its route copy is dropped (no duplicates).
+const TUI_ROUTE_TOOLS = createChildPluginRoutes().hostTools;
+const CHAT_PLUGIN_ROUTES = routeOnlyHostToolSpecs(
+  TUI_ROUTE_TOOLS.filter((tool) => DAEMON_MEMBER_ROUTE_TOOL_ALLOWLIST.has(tool.name)), new Set(CHAT_CORE),
+).map((spec) => spec.name);
+const APP_BUILD_FAMILY = ['app_build_plan', 'app_build', 'app_deploy'];
+// Route tools with external side effects, host-filesystem writes (app_create, r2) or out-of-cell scope that a
+// member turn must never receive.
+const MEMBER_DENIED_NAMES = ['app_create', 'scrap_add', 'brief_today', 'gcp_architect_expand'];
+const MEMBER_DENIED_PREFIXES = ['bookforge_', 'Observe', 'Release', 'suggest_'];
 // webterm 이 chat 위에 항상 더하는 것(pty 무관) — 자율tool 3종(nest-cap off 전제) + 웹터미널/카메라.
 const WEBTERM_ALWAYS_EXTRA = [
   // ⭐ 2026-08-27 (#13417) — 자율(ACP) 턴이 브라우저를 «읽기»로 몰 수 있게 데몬 표면이 담는다.
@@ -102,11 +116,38 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
       const pty = spyOn(ptyRegistry, 'ptyAvailable').mockReturnValue(available);
       try {
         const names = toolSurface('chat', financeOff).specs.map((s) => s.name);
-        expect(names).toEqual([...CHAT_CORE, ...(available ? CHAT_PTY_EXTRA : [])]);
+        expect(names).toEqual([...CHAT_CORE, ...(available ? CHAT_PTY_EXTRA : []), ...CHAT_PLUGIN_ROUTES]);
       } finally {
         pty.mockRestore();
       }
     }
+  });
+
+  test("'chat' (member turn) carries exactly the three app_build tools, once each", () => {
+    const names = toolSurface('chat', financeOff).specs.map((s) => s.name);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names.filter((name) => APP_BUILD_FAMILY.includes(name)).sort()).toEqual([...APP_BUILD_FAMILY].sort());
+    expect([...DAEMON_MEMBER_ROUTE_TOOL_ALLOWLIST].sort()).toEqual([...APP_BUILD_FAMILY].sort());
+    // Every route tool the surface adds is on the allowlist; app_deploy comes from shared-app-tools, not the route.
+    for (const name of CHAT_PLUGIN_ROUTES) expect(DAEMON_MEMBER_ROUTE_TOOL_ALLOWLIST.has(name)).toBe(true);
+    expect(CHAT_PLUGIN_ROUTES).not.toContain('app_deploy');
+    // Same spec fields the TUI REPL adds, so the shared route pin can find app_build by plugin id.
+    const appBuild = toolSurface('chat', financeOff).specs.find((s) => s.name === 'app_build');
+    expect(appBuild?.pluginId).toBe('elanous-app-build');
+    expect(appBuild?.route?.requiresConfirm).toBe(true);
+  });
+
+  test("member turns (chat and webterm) receive no denied route tool; the TUI route list is unchanged", () => {
+    for (const kind of ['chat', 'webterm'] as const) {
+      const names = toolSurface(kind, financeOff).specs.map((s) => s.name);
+      for (const denied of MEMBER_DENIED_NAMES) expect(names).not.toContain(denied);
+      for (const prefix of MEMBER_DENIED_PREFIXES) {
+        expect(names.filter((name) => name.startsWith(prefix))).toEqual([]);
+      }
+    }
+    // The TUI keeps its whole merged route catalog (the allowlist is daemon-only).
+    const tuiRouteNames = routeOnlyHostToolSpecs(TUI_ROUTE_TOOLS, new Set()).map((spec) => spec.name);
+    expect(tuiRouteNames).toEqual(expect.arrayContaining([...MEMBER_DENIED_NAMES, 'app_build', 'app_build_plan', 'app_create']));
   });
 
   test("'chat' finance 게이트 — off 는 finance_ 없음 / on 은 finance_quote 노출(Phase 0 게이팅)", () => {

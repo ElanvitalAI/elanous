@@ -14,7 +14,7 @@ import { gateShardsPath, readGateShards, summarizeShards } from '../release-loop
 import { getSchedule, listSchedules } from '../release-loop/release-schedule.js';
 import { readLandingFreeze } from '../release-loop/landing-freeze.js';
 import { readSweepCertificate } from '../../scripts/release-loop/sweep-cert.js';
-import { setElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDirOverrideSource, setElanousConfigDir, type ConfigDirOverrideSource } from '../elanous-config-dir.js';
 import { seatDay, seatLedgerPath, type SeatEntry } from '../seat-loop/seat-loop.js';
 import { listCoordEvents, type CoordEvent } from './coord-events.js';
 import { filterPublicDemoContext } from './context-now-public.js';
@@ -654,17 +654,17 @@ export function scanContextNowInWorker(options: ContextNowWorkerOptions, stateRo
     worker.on('error', error => finish(error instanceof Error ? error : new Error(String(error))));
     worker.on('exit', code => { if (!settled) finish(new Error(`context_now worker exited before answering: ${code}`)); });
     // Preserve both caller roots: a programmatic config override is not inherited by workers.
-    worker.postMessage({ options: scanOptions, stateRoot, selectedRoot });
+    worker.postMessage({ options: scanOptions, stateRoot, selectedRoot, configSource: getElanousConfigDirOverrideSource() });
   });
 }
 
 const contextWorkerPort = parentPort;
 if (!isMainThread && contextWorkerPort && workerData?.kind === 'context-now') {
-  contextWorkerPort.on('message', ({ options, stateRoot, selectedRoot }: { options: Parameters<typeof contextNow>[0]; stateRoot?: string; selectedRoot: string }) => {
+  contextWorkerPort.on('message', ({ options, stateRoot, selectedRoot, configSource }: { options: Parameters<typeof contextNow>[0]; stateRoot?: string; selectedRoot: string; configSource?: ConfigDirOverrideSource }) => {
     try {
       if (stateRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = stateRoot;
-      setElanousConfigDir(selectedRoot);
+      setElanousConfigDir(selectedRoot, configSource);
       contextWorkerPort.postMessage({ answer: contextNow(options) });
     }
     catch (error) { contextWorkerPort.postMessage({ error: error instanceof Error ? error.message : String(error) }); }

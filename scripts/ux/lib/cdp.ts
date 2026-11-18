@@ -8,15 +8,38 @@ import { join } from 'node:path';
 export const CHROME = process.env.UX_CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** PIDs listening on a TCP port (lsof). Empty when nothing listens or lsof is unavailable. */
+export function listeningPids(port: number): string[] {
+  try {
+    return execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' })
+      .split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch { return []; }
+}
+
+/**
+ * Is the port served by the Chrome this run spawned? Ownership by process id — the PID listening on the port must be
+ * the spawned browser's own PID (#38268 REVIEW-2: never a command-line string match). A port nobody or somebody else
+ * listens on is not ours.
+ */
+export function portOwnedBy(port: number, pid: number | undefined, listPids: (port: number) => string[] = listeningPids): boolean {
+  if (pid === undefined) return false;
+  return listPids(port).includes(String(pid));
+}
+
 export type Cdp = {
   send: (method: string, params?: object) => Promise<any>;
   ev: <T = unknown>(expression: string) => Promise<T>;
   click: (label: string, exact?: boolean) => Promise<string>;
   png: (file: string) => Promise<void>;
   close: () => void;
+  /** The spawned Chrome's process id and its temporary profile (this run's own). */
+  pid: number | undefined;
+  profile: string;
 };
 
-export async function launch(opts: { port: number; timeoutMs: number; width: number; height: number; dpr?: number; mobile?: boolean }): Promise<Cdp> {
+export async function launch(opts: { port: number; timeoutMs: number; width: number; height: number; dpr?: number; mobile?: boolean;
+  /** Refuse unless the port is served by the Chrome this call spawned — checked before the first page connection. */
+  requireOwnPort?: boolean; listPids?: (port: number) => string[] }): Promise<Cdp> {
   const profile = mkdtempSync(join(tmpdir(), 'ux-cdp-'));
   const chrome = spawn(CHROME, ['--headless=new', '--use-mock-keychain', '--password-store=basic', `--remote-debugging-port=${opts.port}`, `--user-data-dir=${profile}`, 'about:blank'], { stdio: 'ignore' });
   const kill = () => { try { chrome.kill('SIGKILL'); } catch {} try { rmSync(profile, { recursive: true, force: true }); } catch {} };
@@ -30,6 +53,12 @@ export async function launch(opts: { port: number; timeoutMs: number; width: num
     if (!ws) await sleep(200);
   }
   if (!ws) { kill(); throw new Error(`chrome did not expose a page on port ${opts.port}`); }
+  // Before attaching to any page: a page answered on the port, but is it this run's browser? (Another Chrome already
+  // on the port makes ours fail to bind while the other one answers.)
+  if (opts.requireOwnPort && !portOwnedBy(opts.port, chrome.pid, opts.listPids)) {
+    kill();
+    throw new Error(`the browser on port ${opts.port} is not this run's Chrome (pid ${chrome.pid})`);
+  }
   const sock = new WebSocket(ws);
   await new Promise((r) => sock.addEventListener('open', r, { once: true }));
   let id = 0;
@@ -50,6 +79,8 @@ export async function launch(opts: { port: number; timeoutMs: number; width: num
     click: (label, exact = true) => ev<string>(`(()=>{const L=${JSON.stringify(label)}; const b=[...document.querySelectorAll('button,a,[role=button],summary')].find(e=>${exact ? 'e.textContent.trim()===L' : 'e.textContent.trim().includes(L)'}); if(!b) return 'missing'; b.scrollIntoView({block:'center'}); b.click(); return 'ok'})()`),
     png: async (file) => { const r = await send('Page.captureScreenshot', { format: 'png' }); writeFileSync(file, Buffer.from(r.data, 'base64')); },
     close: () => { try { sock.close(); } catch {} kill(); },
+    pid: chrome.pid,
+    profile,
   };
 }
 

@@ -13,6 +13,8 @@
 // ⛔ 왜 이것이 «필요»한가 — 리마인더가 없으면 모델이 새 발화를 「지시 교체」로 읽고
 //   돌던 작업을 통째로 버린다. 그 실패가 조용하다: 사용자는 «왜 하던 걸 안 했지» 만 본다.
 
+import { REPLACEMENT_CANDIDATE_NOTE_PREFIX } from './queue-supersede.js';
+
 /** 도는 턴 «중»에 사용자가 보낸 발화임을 알리는 머리말. */
 export const INTERJECTION_NOTE = '작업 중에 사용자가 메시지를 보냈습니다:';
 
@@ -75,4 +77,65 @@ export function buildTurnInterruptedMarker(opts?: { toolInFlight?: boolean }): s
   return opts?.toolInFlight
     ? `${TURN_INTERRUPTED_MARKER} — 진행 중이던 도구 호출도 함께 끊겼습니다.`
     : TURN_INTERRUPTED_MARKER;
+}
+
+/**
+ * A200 — 취소 뒤 «자동 제출»되는 대기 입력 앞에 붙이는 맥락 한 줄(codex `TurnAborted` 꼴).
+ * ⭐ Next TUI 는 Esc 에 자식 REPL 을 닫으므로 `TURN_INTERRUPTED_MARKER` 가 이력에 남지 않는다 —
+ *   그래서 다음 턴의 모델 입력에 이 한 줄을 싣는다(화면 말풍선은 사람 문장 그대로).
+ */
+export const INTERRUPTED_ON_PURPOSE_NOTE = '[사용자가 직전 턴을 의도적으로 중단했습니다. 중단된 도구·명령은 일부만 실행됐을 수 있으니 다시 하기 전에 현재 상태를 확인하십시오.]';
+
+/** 취소 뒤 자동 제출되는 발화에 맥락 한 줄을 앞세운다. 순수. */
+export function withInterruptedOnPurposeContext(text: string): string {
+  return `${INTERRUPTED_ON_PURPOSE_NOTE}\n\n${text}`;
+}
+
+/** 화면·앵커용 — 맥락 한 줄을 떼어 사람 문장만 돌려준다. 순수. */
+export function stripInterruptedOnPurposeContext(text: string): string {
+  const prefix = `${INTERRUPTED_ON_PURPOSE_NOTE}\n\n`;
+  return text.startsWith(prefix) ? text.slice(prefix.length) : text;
+}
+
+/**
+ * ELN-QUEUE-SUPERSEDE — 대체 후보 맥락 한 줄을 새 발화 앞에 붙인다(줄 자체는 `queue-supersede.ts` 가 만든다).
+ * 화면 말풍선은 사람 문장 그대로 — {@link stripQueueModelContext} 가 뗀다. 순수.
+ */
+export function withReplacementCandidateContext(text: string, contextLine: string): string {
+  return `${contextLine}\n\n${text}`;
+}
+
+/**
+ * 화면·앵커용 — 큐가 모델에게만 붙인 맥락 줄(중단 한 줄 · 대체 후보 한 줄)을 떼어 사람 문장만 돌려준다. 순수.
+ * 붙이는 순서는 중단 줄 → 대체 후보 줄 → 사람 문장이다.
+ */
+export function stripQueueModelContext(text: string): string {
+  let rest = stripInterruptedOnPurposeContext(text);
+  if (rest.startsWith(REPLACEMENT_CANDIDATE_NOTE_PREFIX)) {
+    const end = rest.indexOf('\n\n');
+    if (end >= 0 && !rest.slice(0, end).includes('\n')) rest = rest.slice(end + 2);
+  }
+  if (rest.startsWith(QUEUE_NOTICE_NOTE_PREFIX)) {
+    const end = rest.indexOf('\n\n');
+    if (end >= 0 && !rest.slice(0, end).includes('\n')) rest = rest.slice(end + 2);
+  }
+  return rest;
+}
+
+/**
+ * mf1(#38102 r4) — 큐 notice(sidetab · harness-child · seat-mail)가 모델에게만 앞세우는 출처 한 줄.
+ * 화면 말풍선은 notice 본문 그대로 — {@link stripQueueModelContext} 가 뗀다. 순수.
+ */
+export const QUEUE_NOTICE_NOTE_PREFIX = '[notice · ';
+
+export function withQueueNoticeContext(text: string, source: string): string {
+  return `${QUEUE_NOTICE_NOTE_PREFIX}${source}]\n\n${text}`;
+}
+
+/** 화면·앵커용 — notice 출처 줄을 떼고 본문만 돌려준다. 순수. */
+export function stripQueueNoticeContext(text: string): string {
+  if (!text.startsWith(QUEUE_NOTICE_NOTE_PREFIX)) return text;
+  const end = text.indexOf('\n\n');
+  if (end < 0 || text.slice(0, end).includes('\n')) return text;
+  return text.slice(end + 2);
 }

@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/gcp-architect-expand/architecture-input.ts",
+  "reason": "Production plugin handler that lives under src/ux-sim (plugins/gcp-architect-expand/recipes.yaml or its contract tests); it runs the real architect pipeline and is not a fake device."
+}

@@ -17,6 +17,7 @@ import type { LLMMessage } from '../llm.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { collectSeatBootSections, renderSeatBootCard } from '../cli/seat-cli.js';
 import { defaultMsgStorePath } from '../msg/msg-store.js';
+import { buildSeatMemoryIndexBlock, seatMemoryDir } from '../seat-memory/seat-memory.js';
 
 export interface SeatDetection {
   seat: string;
@@ -58,12 +59,21 @@ export interface SeatBootDeps {
   msgPath?: string;
   env?: NodeJS.ProcessEnv;
   now?: () => Date;
+  /** 자리 기억 저장소의 뿌리(시험) — 기본 `memoryRoot()`. 실제 폴더 = `<뿌리>/seats/<자리>`. */
+  seatMemoryRoot?: string;
+}
+
+/** 자리 세션의 자리 기억 저장소(OP-MEMORY-PARITY O6). 자리(무인) TUI 판정이 서야 한다 — 아니면 null. */
+export function resolveSeatMemoryContext(cwd: string, deps: SeatBootDeps = {}): { seat: string; dir: string } | null {
+  const detection = detectSeatTui(cwd, { ...(deps.home !== undefined ? { home: deps.home } : {}), ...(deps.env !== undefined ? { env: deps.env } : {}) });
+  if (!detection) return null;
+  return { seat: detection.seat, dir: seatMemoryDir(detection.seat, deps.seatMemoryRoot) };
 }
 
 // 대화마다 한 장(작업 디렉터리별). 대시보드는 한 번에 한 대화이고 ACP sessionId 가 수명 내내 같으므로
 // 세션 id 가 아니라 «대화 ⊕ cwd» 가 키다. 비우는 자리는 `startSeatBootConversation`(새 대화) 뿐 — 축출 없음.
 // 첫 화면 한 줄(`describeSeatBoot`)과 턴 카드가 «같은 스냅샷»을 본다.
-interface CardEntry { messages: LLMMessage[]; observed: Record<string, unknown> }
+interface CardEntry { messages: LLMMessage[]; observed: Record<string, unknown>; memoryIndex?: LLMMessage[] }
 const cardCache = new Map<string, CardEntry>();
 
 export function resetSeatBootCacheForTest(): void {
@@ -343,7 +353,7 @@ function buildSeatMemoryImport(cwd: string, seat: string, home: string, now: Dat
   return content;
 }
 
-function buildCardMessages(cwd: string, deps: SeatBootDeps): { messages: LLMMessage[]; observed: Record<string, unknown> } {
+function buildCardMessages(cwd: string, deps: SeatBootDeps): CardEntry {
   const detection = detectSeat(cwd, deps.env ?? process.env);
   if (!detection) return { messages: [], observed: { reason: 'no-seat' } };
   const home = deps.home ?? homedir();
@@ -377,7 +387,25 @@ function buildCardMessages(cwd: string, deps: SeatBootDeps): { messages: LLMMess
   return {
     messages: [{ role: 'system', content }],
     observed: { seat: detection.seat, source: detection.source, unread, chars: content.length },
+    memoryIndex: seatMemoryIndexMessages(detection.seat, deps),
   };
+}
+
+/** 🧠 세션 시작 자리 기억 색인(OP-MEMORY-PARITY O6) — Claude Code 가 MEMORY.md 를 세션 시작에 싣는 것과 같은 자리.
+ *  대화마다 한 번 만들어 카드 캐시에 같이 둔다 ⇒ 같은 대화 동안 바이트가 같다(캐시 접두 안정 · O4).
+ *  세션 중 새로 저장한 기억은 다음 대화부터 색인에 실린다(그 사이엔 memory_search·턴 회상이 맡는다). */
+function seatMemoryIndexMessages(seat: string, deps: SeatBootDeps): LLMMessage[] {
+  try {
+    const dir = seatMemoryDir(seat, deps.seatMemoryRoot);
+    const built = buildSeatMemoryIndexBlock(seat, dir);
+    debug.log('memory', 'index-injected', built
+      ? { seat, lines: built.lines, totalLines: built.totalLines, bytes: built.bytes, totalBytes: built.totalBytes, truncated: built.truncated }
+      : { seat, lines: 0, reason: 'empty-or-missing' });
+    return built ? [{ role: 'system', content: built.block }] : [];
+  } catch (error) {
+    debug.log('memory', 'index-injected', { seat, lines: 0, reason: 'error', error: error instanceof Error ? error.message : String(error) });
+    return [];
+  }
 }
 
 function conversationCard(cwd: string, deps: SeatBootDeps, sessionId?: string): CardEntry {
@@ -411,6 +439,11 @@ function conversationCard(cwd: string, deps: SeatBootDeps, sessionId?: string): 
 /** 이 대화의 자리 부트 카드(system 메시지 0~1개). 대화마다 «처음 한 번»만 만들고 같은 대화는 같은 문면을 돌려준다. */
 export function buildSeatBootSystemMessages(ctx: { cwd: string; sessionId?: string }, deps: SeatBootDeps = {}): LLMMessage[] {
   return conversationCard(ctx.cwd, deps, ctx.sessionId).messages;
+}
+
+/** 이 대화의 자리 기억 색인(system 메시지 0~1개) — 카드와 같은 스냅샷. 호출부는 «캐시 접두» 쪽(안정 구역)에 싣는다. */
+export function buildSeatMemoryIndexSystemMessages(ctx: { cwd: string; sessionId?: string }, deps: SeatBootDeps = {}): LLMMessage[] {
+  return conversationCard(ctx.cwd, deps, ctx.sessionId).memoryIndex ?? [];
 }
 
 /** 첫 화면 한 줄용 — 자리면 {자리, 안 읽은 우편 수}. 턴 카드와 같은 스냅샷이다. */

@@ -44,7 +44,7 @@ test('L3 input shows a safe target while hiding full paths and arbitrary argumen
     toolArgs: JSON.stringify({ file_path: '/Users/synthetic/private-key.pem', content: 'raw-private-body' }),
     toolResult: JSON.stringify({ output: 'visible result' }), content: '', ts: '' };
   const shown = formatMessageBlockRawTrace(trace);
-  expect(shown).toContain('입력\n(비공개 파일)');
+  expect(shown).toContain('입력\n(private file)');
   expect(shown).toContain('visible result');
   expect(shown).not.toContain('/Users/synthetic');
   expect(shown).not.toContain('private-key.pem');

@@ -28,7 +28,7 @@ export interface NextTuiCompactOutcome {
 }
 
 function compactStatus(before: number, after: number): string {
-  return `압축 ${before}→${after} 메시지`;
+  return `Compacted ${before}→${after} messages`;
 }
 
 async function defaultConfig(): Promise<ChatAutoCompactConfig> {
@@ -83,12 +83,12 @@ export async function compactNextTuiSession(
       before: result.before,
       after: result.after,
       ms,
-      status: auto ? null : `압축할 내용 없음 · ${result.before} 메시지`,
+      status: auto ? null : `Nothing to compact · ${result.before} messages`,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const ms = Date.now() - started;
     debug.log('tui.next', 'compact-failed', { auto, ms, error: message }, { level: 'warn' });
-    return { fired: false, reason: 'error', before: 0, after: 0, ms, status: auto ? null : `압축 실패: ${message}` };
+    return { fired: false, reason: 'error', before: 0, after: 0, ms, status: auto ? null : `Compaction failed: ${message}` };
   }
 }

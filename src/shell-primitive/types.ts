@@ -1,3 +1,4 @@
+import { SHELL_MAX_TIMEOUT_MS, type ShellWatchdogResult } from '../tool-runtime/shell-watchdog.js';
 // ── Ephemeral shell primitive — types ──
 //
 // Codex PTY port X1 (DESIGN-codex-pty-port.md §3). Defines the
@@ -101,6 +102,8 @@ export interface ShellResult {
    *  escalation prompt to decide: retry with sandbox:'off' (when the
    *  op is clearly needed) or call AskUserQuestion to confirm. */
   sandboxFailure?: boolean;
+  /** A201 — set when the watchdog stopped the process (timeout or no-output stall). */
+  watchdog?: ShellWatchdogResult;
 }
 
 /** Decision the approval modal (or cache) returns. Outer runtime
@@ -123,5 +126,6 @@ export interface ApprovalRequest {
 export type ShellApprover = (req: ApprovalRequest) => Promise<ApprovalDecision>;
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
-export const MAX_TIMEOUT_MS = 600_000;
+/** A201 — the same cap as Bash (src/tool-runtime/shell-watchdog.ts). */
+export const MAX_TIMEOUT_MS = SHELL_MAX_TIMEOUT_MS;
 export const SHELL_MAX_OUTPUT = 200_000;

@@ -19,6 +19,7 @@ import { Database } from 'bun:sqlite';
 
 import { debug } from '../debug/log.js';
 import { listMemories, loadMemory, memoryRoot, saveMemory } from '../memory.js';
+import { MemoryWriteRefusedError } from '../memory-triage/write-gate.js';
 import { runRecall, CONTEXT_NOW_SPEC, type RecallSearch } from '../tool-runtime/self-cognition-runtimes.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { SCHEDULE_MANAGE_SPEC, dispatchScheduleManage } from './schedule-manage-tool.js';
@@ -93,7 +94,7 @@ export async function dispatchMemorySave(args: Record<string, unknown>, root: st
         return { saved: true, id: 'tui-user-name', type, pinned };
       }
       saveMemory({ id: 'tui-user-name', type: 'user', name: '사용자 이름',
-        description: '사용자가 직접 알려준 이름', body, pinned }, root);
+        description: '사용자가 직접 알려준 이름', body, pinned }, root, { origin: 'tool.memory_save.global' });
       debug.log('memory.persist', 'tool-updated', { id: 'tui-user-name', type });
       return { saved: true, id: 'tui-user-name', type, pinned };
     }
@@ -101,12 +102,14 @@ export async function dispatchMemorySave(args: Record<string, unknown>, root: st
     const pinned = typeof args.pinned === 'boolean' ? args.pinned : sameFact?.pinned ?? false;
     const effectiveId = sameFact?.id ?? id;
     if (!sameFact || sameFact.pinned !== pinned) {
-      saveMemory({ id: effectiveId, type, name, description: name, body, pinned }, root);
+      saveMemory({ id: effectiveId, type, name, description: name, body, pinned }, root, { origin: 'tool.memory_save.global' });
     }
     debug.log('memory.persist', sameFact ? 'tool-already-saved' : 'tool-saved', { id: effectiveId, type, pinned });
     return { saved: true, id: effectiveId, type, pinned };
   } catch (error) {
     debug.log('memory.persist', 'tool-failed', { id, error: String(error) });
+    // 쓰기 문 거부(ELANOUS_MEMORY_WRITE_GATE=on)는 구조화 코드로 돌려준다 — 저장소 고장과 섞지 않는다.
+    if (error instanceof MemoryWriteRefusedError) return { saved: false, code: error.code, error: `쓰기 문이 거부했다(${error.code}).` };
     return { saved: false, error: '기억 저장에 실패했다.' };
   }
 }

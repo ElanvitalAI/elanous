@@ -207,12 +207,33 @@ function BlocksBody({ blocks, showCards, mobileSimple = false }: { blocks: ChatB
   );
 }
 
+/**
+ * WEB-CHAT-ENCAPSULATED-STEPS (대표 11-17): the folded details read as a capsule that says how many steps the agent took
+ * («3 steps»), with the tool running now while the answer streams. A message without tool steps keeps «자세히».
+ * Display only — the blocks, the transcript and the TUI renderer are untouched.
+ */
+function StepsSummary({ steps, running, streaming }: { steps: number; running?: string; streaming: boolean }) {
+  if (steps === 0) return <>자세히</>;
+  return <>
+    <span aria-hidden="true" className={cn('mr-1 inline-block', !streaming && 'transition-transform group-open:rotate-90')}>{streaming ? '⋯' : '▸'}</span>
+    {`${steps} ${steps === 1 ? 'step' : 'steps'}`}
+    {running && <span className="ml-1 text-muted-foreground/80">· {running}</span>}
+  </>;
+}
+
 /** Keep the transcript intact while showing only speech, final prose, and result surfaces. */
 function MinimalAssistantBody({ message, mobileSimple }: { message: ChatMessageT; mobileSimple: boolean }) {
   const blocks = message.blocks ?? [];
   const completed = !message.streaming && !message.incomplete;
-  const finalText = completed ? message.text.slice(message.finalTextStart ?? 0) : '';
-  const priorText = completed ? message.text.slice(0, message.finalTextStart ?? 0) : message.text;
+  // WEB-CHAT-ONE-SESSION-STABLE: while the answer streams, the text after the last tool call is shown as it is written
+  // (it used to sit folded in the details until the turn ended, so the answer appeared all at once). Earlier narration
+  // between tool calls stays in the capsule, the same split the finished message gets.
+  // Only when the runtime says where the current segment starts (the ACP path, from the first delta): the SSE fallback
+  // does not know whether text is narration before a tool call, so it keeps its streaming text folded as before.
+  const liveKnown = !!message.streaming && message.finalTextStart !== undefined;
+  const split = completed || liveKnown;
+  const finalText = split ? message.text.slice(message.finalTextStart ?? 0) : '';
+  const priorText = split ? message.text.slice(0, message.finalTextStart ?? 0) : message.text;
   const visible = blocks.filter((block) =>
     block.kind === 'harness_ask' || block.kind === 'image' || block.kind === 'mcp_app' || block.kind === 'deploy_result',
   );
@@ -240,6 +261,8 @@ function MinimalAssistantBody({ message, mobileSimple }: { message: ChatMessageT
     .map((block) => extractElanousCards(block.text).text)
     .filter((text) => text.trim().length > 0);
   const hasDetails = hidden.length > 0 || priorText.trim().length > 0 || hiddenResultText.length > 0 || !!message.incomplete;
+  const toolSteps = blocks.filter((block): block is Extract<ChatBlock, { kind: 'tool_use' }> => block.kind === 'tool_use');
+  const running = message.streaming ? toolSteps.filter((block) => block.status === 'running').at(-1)?.name : undefined;
   if (!finalText.trim() && visible.length === 0 && cards.length === 0 && !hasDetails) return null;
   return (
     <div className="flex flex-col gap-2">
@@ -249,15 +272,26 @@ function MinimalAssistantBody({ message, mobileSimple }: { message: ChatMessageT
       {finalText.trim() && <CardTextBody text={finalText} showCards />}
       {visible.length > 0 && <BlocksBody blocks={visible} showCards mobileSimple={mobileSimple} />}
       {cards.map((card, index) => <ElanousCard key={`stream-card-${index}`} card={card} />)}
-      {hasDetails && <details className="text-xs text-muted-foreground" data-elanous-minimal-details>
-        <summary className="cursor-pointer select-none">자세히</summary>
+      {hasDetails && <details className="group text-xs text-muted-foreground" data-elanous-minimal-details
+        {...(toolSteps.length > 0 ? { 'data-elanous-steps-capsule': '', 'data-elanous-step-count': String(toolSteps.length) } : {})}>
+        <summary className={cn('cursor-pointer select-none', toolSteps.length > 0
+          && 'inline-flex w-fit list-none items-center rounded-full border border-border bg-muted/40 px-2 py-0.5 [&::-webkit-details-marker]:hidden')}>
+          <StepsSummary steps={toolSteps.length} {...(running ? { running } : {})} streaming={!!message.streaming} />
+        </summary>
         <div className="mt-2 flex flex-col gap-2">
           {message.incomplete && message.meta?.stopReason && <p>{message.meta.stopReason}</p>}
+          {/* In the steps capsule the steps come first, in order; interim text, plan and status follow. */}
+          {toolSteps.length > 0 && <BlocksBody blocks={toolSteps} showCards={false} mobileSimple={mobileSimple} />}
           {priorText.trim() && <MarkdownBody text={priorText} />}
           {hiddenResultText.map((text, index) => <MarkdownBody key={`result-text-${index}`} text={text} />)}
-          <BlocksBody blocks={hidden.filter((block) => block.kind !== 'debug_session')} showCards={false} mobileSimple={mobileSimple} />
+          <BlocksBody blocks={hidden.filter((block) => block.kind !== 'debug_session' && block.kind !== 'tool_use')}
+            showCards={false} mobileSimple={mobileSimple} />
+          {/* The raw debug log stays one more fold away, so opening the steps shows the steps first. */}
           {hidden.filter((block): block is Extract<ChatBlock, { kind: 'debug_session' }> => block.kind === 'debug_session')
-            .map((block) => <pre key={block.blockId} className="whitespace-pre-wrap break-all">{JSON.stringify(block.lines, null, 2)}</pre>)}
+            .map((block) => <details key={block.blockId} data-elanous-debug-log>
+              <summary className="cursor-pointer select-none">Debug log ({block.lines.length})</summary>
+              <pre className="whitespace-pre-wrap break-all">{JSON.stringify(block.lines, null, 2)}</pre>
+            </details>)}
         </div>
       </details>}
     </div>
@@ -334,7 +368,8 @@ export function ChatMessageView({ message, mobileSimple = false, minimal = false
   if (minimal && !isUser) {
     const hasContent = message.text.trim().length > 0 || useBlocks || message.incomplete;
     if (!hasContent) return null;
-    return <div className="flex justify-start px-4 py-3">
+    // `data-elanous-message` / `-streaming`: stable hooks for the one-session web chat E2E (WEB-CHAT-ONE-SESSION-STABLE).
+    return <div className="flex justify-start px-4 py-3" data-elanous-message={message.role} data-elanous-streaming={message.streaming ? 'true' : 'false'} data-elanous-incomplete={message.incomplete ? 'true' : 'false'}>
       <div className="max-w-[85%] rounded-lg border border-border bg-card px-3 py-2 text-sm text-card-foreground shadow-sm">
         <MinimalAssistantBody message={message} mobileSimple={mobileSimple} />
       </div>
@@ -342,7 +377,7 @@ export function ChatMessageView({ message, mobileSimple = false, minimal = false
   }
 
   return (
-    <div className={cn('flex gap-3 px-4 py-3', isUser ? 'justify-end' : 'justify-start')}>
+    <div className={cn('flex gap-3 px-4 py-3', isUser ? 'justify-end' : 'justify-start')} data-elanous-message={message.role} data-elanous-streaming={message.streaming ? 'true' : 'false'} data-elanous-incomplete={message.incomplete ? 'true' : 'false'}>
       <div
         className={cn(
           'max-w-[85%] rounded-lg px-3 py-2 text-sm shadow-sm',

@@ -2,6 +2,8 @@ graph_id: retro-daily
 version: 1
 loop:
   title: 매일 회고
+  root: 조율자
+  owner: OP
   description: 지난 24시간 사실(retro facts)을 묶어 반복·«초록 뒤 재발»을 먼저 올리고, 사실 id 를 단 인사이트와 조치 초안(≤3)을 낸다 — 기본 shadow(체크리스트·메시지 0)
   trigger:
     cron: '40 22 * * *'

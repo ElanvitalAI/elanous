@@ -7,9 +7,24 @@ const candidates = (draft: string) => nextSlashCandidates(
 );
 
 test('suggestions come only from active next routes and rank classic-style', () => {
-  expect(candidates('/mo').map((candidate) => candidate.text)).toEqual(['/model', '/memory']);
-  expect(candidates('/si').map((candidate) => candidate.text)).toEqual(['/side', '/sidetab', '/signals', '/mission']);
+  // NEXT-TUI-UI-ENGLISH: /status's English summary «Model · …» now matches by description word (classic rank 10).
+  expect(candidates('/mo').map((candidate) => candidate.text)).toEqual(['/model', '/memory', '/status']);
+  // Aliases fold into their route's row: /sidetab under /side, /sessions under /session;
+  // /app matches its English summary word «simulation».
+  expect(candidates('/si').map((candidate) => candidate.text)).toEqual(['/side', '/signals', '/mission', '/session', '/app']);
   expect(candidates('/').some((candidate) => candidate.text === '/run-skill')).toBe(false);
   expect(candidates('/help ').length).toBe(0);
   expect(candidates('please /help').length).toBe(0);
+});
+
+test('TUI-SLASH-TEXT-KOREAN-AND-RESIDUE: alias pairs show once, with the typed spelling first', () => {
+  const all = candidates('/');
+  for (const alias of ['/clear', '/st', '/mem', '/dec', '/ctx', '/sidetab', '/terminal', '/exit'])
+    expect(all.some((candidate) => candidate.text === alias)).toBe(false);
+  expect(all.find((candidate) => candidate.text === '/new')?.description).toContain('alias /clear');
+  expect(all.find((candidate) => candidate.text === '/quit')?.description).toContain('alias /exit');
+  // Typing an alias shows that alias, with the primary listed as the other spelling.
+  const typed = candidates('/cl')[0];
+  expect(typed?.text).toBe('/clear');
+  expect(typed?.description).toContain('alias /new');
 });

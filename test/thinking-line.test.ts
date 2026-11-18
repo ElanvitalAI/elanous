@@ -11,8 +11,8 @@
 // Uses intervalMs: 0 to disable the timer and drive ticks manually
 // via metric/message updates.
 
-import { describe, test, expect } from 'bun:test';
-import { startPinnedThinking, startThinking, fmtTime } from '../src/thinking-line';
+import { describe, test, expect, setSystemTime } from 'bun:test';
+import { startPinnedThinking, startThinking, fmtTime, formatTurnEndTime } from '../src/thinking-line';
 
 function strip(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
@@ -24,6 +24,20 @@ describe('fmtTime', () => {
   test('hours', () => { expect(fmtTime(3720)).toBe('1h 2m'); });
   test('rounds non-integer', () => { expect(fmtTime(7.4)).toBe('7s'); });
   test('clamps negatives to 0', () => { expect(fmtTime(-5)).toBe('0s'); });
+});
+
+describe('formatTurnEndTime', () => {
+  test('elapsed duration and local completion time across hours and noon', () => {
+    const end = new Date(2026, 10, 16, 21, 46, 0).getTime();
+    expect(formatTurnEndTime(end - 1_035_000, end)).toBe('✻ Worked for 17m 15s · done 9:46 PM');
+    expect(formatTurnEndTime(end - 3_661_000, end)).toBe('✻ Worked for 1h 1m 1s · done 9:46 PM');
+    const midnight = new Date(2026, 10, 17, 0, 1, 0).getTime();
+    expect(formatTurnEndTime(midnight - 5000, midnight)).toBe('✻ Worked for 5s · done 12:01 AM');
+    expect(formatTurnEndTime(end - 42_000, end)).toBe('✻ Worked for 42s · done 9:46 PM');
+    expect(formatTurnEndTime(end - 42_000, end, false, 2)).toBe('✻ Worked for 42s · done 9:46 PM · 2 background running');
+    expect(formatTurnEndTime(end - 3_720_000, end)).toBe('✻ Worked for 1h 2m · done 9:46 PM');
+    expect(formatTurnEndTime(end - 182_000, end, true)).toBe('✻ Stopped after 3m 2s · 9:46 PM');
+  });
 });
 
 describe('startThinking', () => {
@@ -70,7 +84,7 @@ describe('startThinking', () => {
     expect(chatLines.length).toBe(1);
     expect(strip(chatLines[0])).toContain('✔ 완료');
     expect(strip(chatLines[0])).not.toContain('Thinking');
-    expect(strip(chatLines[0])).toMatch(/3s|4s|2s/);   // tolerate ms jitter
+    expect(strip(chatLines[0])).toMatch(/✻ Worked for [234]s · done \d{1,2}:\d{2} (AM|PM)/);   // tolerate ms jitter
   });
 
   test('stop(interrupted) freezes with cross + "중단됨"', () => {
@@ -148,42 +162,52 @@ describe('startThinking', () => {
     expect(stopped).toContain('✘ 중단됨');
     expect(stopped).not.toContain('interrupted');
     expect(stopped).not.toContain('esc 중단');
-    expect(stopped).toContain('(5s · ↓ 91 tokens · 🧠 terra)');
+    expect(stopped).toMatch(/\(✻ Stopped after 5s · \d{1,2}:\d{2} (AM|PM) · ↓ 91 tokens · 🧠 terra\)/);
   });
 
   test('in-log stopped statuses preserve task name and metrics', () => {
-    for (const [status, label] of [
-      ['completed', '✔ Compacting 완료'],
-      ['interrupted', '✘ Compacting 중단됨'],
-      ['failed', '✘ Compacting 실패 — timeout'],
-    ] as const) {
-      const chatLines: string[] = [];
-      const h = startThinking({
-        chatLines, onFrame: () => {}, intervalMs: 0, message: 'Compacting',
-        metrics: { startedAt: Date.now() - 5000, outputTokens: 28, engine: '🧠 terra' },
-      });
-      h.stop({ status, errorText: 'timeout' });
-      expect(strip(chatLines[0])).toBe(`${label}  (5s · ↓ 28 tokens · 🧠 terra)`);
+    setSystemTime(new Date(2026, 10, 16, 21, 46));
+    try {
+      for (const [status, label] of [
+        ['completed', '✔ Compacting 완료'],
+        ['interrupted', '✘ Compacting 중단됨'],
+        ['failed', '✘ Compacting 실패 — timeout'],
+      ] as const) {
+        const chatLines: string[] = [];
+        const h = startThinking({
+          chatLines, onFrame: () => {}, intervalMs: 0, message: 'Compacting',
+          metrics: { startedAt: Date.now() - 5000, outputTokens: 28, engine: '🧠 terra' },
+        });
+        h.stop({ status, errorText: 'timeout' });
+        expect(strip(chatLines[0])).toBe(`${label}  (✻ ${status === 'completed' ? 'Worked for 5s · done' : 'Stopped after 5s ·'} 9:46 PM · ↓ 28 tokens · 🧠 terra)`);
+      }
+    } finally {
+      setSystemTime();
     }
   });
 
   test('pinned stopped statuses replace progress verbs and preserve task names', () => {
-    for (const [status, message, label] of [
-      ['completed', 'Streaming', '✔ 완료'],
-      ['interrupted', 'Streaming', '✘ 중단됨'],
-      ['failed', 'Thinking', '✘ 실패 — timeout'],
-      ['completed', 'Compacting', '✔ Compacting 완료'],
-      ['interrupted', 'Compacting', '✘ Compacting 중단됨'],
-      ['failed', 'Compacting', '✘ Compacting 실패 — timeout'],
-    ] as const) {
-      const target: { current: string | null } = { current: null };
-      const h = startPinnedThinking({
-        target, onFrame: () => {}, intervalMs: 0, message,
-        metrics: { startedAt: Date.now() - 5000, outputTokens: 28, engine: '🧠 terra' },
-      });
-      if (message === 'Streaming') expect(strip(target.current!)).toContain('Streaming…');
-      h.stop({ status, errorText: 'timeout' });
-      expect(strip(target.current!)).toBe(`${label}  (5s · ↓ 28 tokens · 🧠 terra)`);
+    setSystemTime(new Date(2026, 10, 16, 21, 46));
+    try {
+      for (const [status, message, label] of [
+        ['completed', 'Streaming', '✔ 완료'],
+        ['interrupted', 'Streaming', '✘ 중단됨'],
+        ['failed', 'Thinking', '✘ 실패 — timeout'],
+        ['completed', 'Compacting', '✔ Compacting 완료'],
+        ['interrupted', 'Compacting', '✘ Compacting 중단됨'],
+        ['failed', 'Compacting', '✘ Compacting 실패 — timeout'],
+      ] as const) {
+        const target: { current: string | null } = { current: null };
+        const h = startPinnedThinking({
+          target, onFrame: () => {}, intervalMs: 0, message,
+          metrics: { startedAt: Date.now() - 5000, outputTokens: 28, engine: '🧠 terra' },
+        });
+        if (message === 'Streaming') expect(strip(target.current!)).toContain('Streaming…');
+        h.stop({ status, errorText: 'timeout' });
+        expect(strip(target.current!)).toBe(`${label}  (✻ ${status === 'completed' ? 'Worked for 5s · done' : 'Stopped after 5s ·'} 9:46 PM · ↓ 28 tokens · 🧠 terra)`);
+      }
+    } finally {
+      setSystemTime();
     }
   });
 

@@ -16,22 +16,22 @@ afterEach(() => {
 });
 
 describe('Grok subscription search default', () => {
-  test('API key presence alone cannot register metered providers', () => {
+  test('Firecrawl is the default while metered Grok remains opt-in', () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'grok', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['firecrawl', 'exa', 'grok', 'ddg-free']);
   });
 
-  test('metered providers require explicit opt-in', () => {
+  test('Grok API remains explicit opt-in alongside the default Firecrawl service', () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: { grokApi: { enabled: true }, firecrawl: { enabled: true } } }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'firecrawl', 'grok', 'grok-api', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['firecrawl', 'exa', 'grok', 'grok-api', 'ddg-free']);
   });
 
   test('X intent falls through to Firecrawl after subscription quota exhaustion', async () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'grok', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['firecrawl', 'exa', 'grok', 'ddg-free']);
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
     addWebSearchProvider({ id: 'grok', displayName: 'subscription', available: () => true, search: async () => {
@@ -49,7 +49,7 @@ describe('Grok subscription search default', () => {
   test('subscription quota exhaustion may use metered fallback after explicit opt-in', async () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: { grokApi: { enabled: true } } }));
     _resetWebSearchProvidersForTests();
-    expect(listWebSearchProviders().map(p => p.id)).toEqual(['exa', 'grok', 'grok-api', 'ddg-free']);
+    expect(listWebSearchProviders().map(p => p.id)).toEqual(['firecrawl', 'exa', 'grok', 'grok-api', 'ddg-free']);
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
     addWebSearchProvider({ id: 'grok', displayName: 'subscription', available: () => true, search: async () => {

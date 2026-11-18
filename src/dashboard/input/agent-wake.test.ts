@@ -151,6 +151,36 @@ describe('agent-wake — 배경 자식 완료를 쉬는 TUI 에 알린다(비침
   });
 });
 
+describe('#38031 childFinished — 종료 한 줄 포트(없으면 no-op · taskId당 1회 · fail-soft)', () => {
+  test('옵션을 주면 종결마다 정확히 한 번 {goal,outcome} 로 불린다 · 재enqueue 는 침묵', () => {
+    const events: Array<{ goal: string; outcome: string }> = [];
+    const queue = new TaskNotificationQueue();
+    const wake = createAgentWake({
+      subscribe: (listener) => queue.onEnqueue(listener),
+      notify: () => {},
+      childFinished: (info) => { events.push(info); },
+    });
+    queue.enqueue(pending('t-cf1'));
+    queue.enqueue(pending('t-cf1'));
+    expect(events).toEqual([{ goal: 'pr-review', outcome: 'done' }]);
+    wake.dispose();
+  });
+
+  test('싱크가 던져도 큐·알림은 산다(fail-soft) — 관측에 child-finished-error 로 남는다', () => {
+    const logs: LogRow[] = [];
+    const queue = new TaskNotificationQueue();
+    const wake = createAgentWake({
+      subscribe: (listener) => queue.onEnqueue(listener),
+      notify: () => {},
+      log: (category, event, data) => { logs.push({ category, event, data }); },
+      childFinished: () => { throw new Error('sink down'); },
+    });
+    expect(() => queue.enqueue(pending('t-cf2'))).not.toThrow();
+    expect(logs.some((row) => row.event === 'child-finished-error')).toBe(true);
+    wake.dispose();
+  });
+});
+
 describe('대시보드 수명 — 재진입·종료에도 구독은 언제나 하나 · dedupe 는 설치를 가로지른다', () => {
   const deps = (queue: TaskNotificationQueue, lines: string[], tag: string) => ({
     subscribe: (l: (n: PendingTaskNotification) => void) => queue.onEnqueue(l),

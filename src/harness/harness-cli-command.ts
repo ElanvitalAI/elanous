@@ -24,6 +24,7 @@ import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { appendRunLedgerEntry, listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerEntry, type RunLedgerMatch, type RunLedgerWriter } from '../self-implement/run-ledger.js';
 import { classifyPodExit, parsePodTermination, podFailureLedgerAxes, type PodExitClass, type PodFailureLedgerAxes, type PodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
+import { isImageDigestPin } from '../task-orchestrator/surfaces/pod-image-digest-check.js';
 import { classifyPodExitStop, readRunStopRecord, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
 import { captureStopKnowhowCandidate } from '../self-implement/stop-autoheal.js';
 import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
@@ -308,6 +309,7 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .addOption(new Option('--pod-memory <tier>', 'pod: 메모리 등급 — lite(2Gi · 문서·조사·네트워크 스킬 골 · OOM 이면 high 로 한 번 재시도) | standard(16Gi) | high(32Gi) · 없으면 골 문면 `Pod 메모리: <등급>` 한 줄 · 그것도 없으면 골이 apps/pwa/ 를 담을 때 high').choices(['lite', 'standard', 'high']))
     .option('--after <goal-or-pr>', 'pod: 선행 — 이 골 ID(16자) 또는 PR(#N) 이 병합될 때까지 Pod 발사가 큐에서 이유와 함께 기다린다(병합 없이 닫히면 blocked) · 골 문면 `선행: #N` 한 줄과 같다 · 대상 파일만 겹치면 선행이 아니다(경고만)')
     .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께')
+    .option('--image-digest <sha256:digest>', 'pod: 요청 이미지 digest pin(sha256:<64hex>) — Pod 가 실제 소비한 digest 와 대조해 불일치·미관측이면 런 실패 · `--substrate pod` 와 함께')
     .option('--repair-commit-only <expected-head>', 'pod: 기존 PR head에서 수리한 커밋을 bundle로 반환(PR 생성 없음)')
     .option('--bench <id[:sha]>', '벤치 팔 — base 를 bench/<id>/base 로 고정(없으면 sha·생략 시 origin/main 으로 만든다 · 있으면 sha 일치 확인 · 불일치 거부) · 팔 가지 bench/<id>/<arm> · PR 라벨 elanous:bench · PR 직전 main 동기화 생략 · 원장 elanous bench ls <id>');
 }
@@ -396,7 +398,7 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 }
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
-type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: 'lite' | 'standard' | 'high'; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string; repairCommitOnly?: string; seat?: QueueSeat };
+type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: 'lite' | 'standard' | 'high'; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string; imageDigest?: string; repairCommitOnly?: string; seat?: QueueSeat };
 function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubstrate {
   const resolved = resolveHarnessSubstrate({ flag: opts, config: getUserConfig(), env: process.env });
   debug.log('harness.substrate', 'resolved', resolved);
@@ -788,7 +790,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(authorOnPod && entrance === 'cli-harness-say' ? { authorOnPod: true } : {}),
     ...(child.childLlmProvider?.trim() ? { childLlmProvider: child.childLlmProvider.trim() } : {}),
     ...(child.childLlmModel?.trim() ? { childLlmModel: child.childLlmModel.trim() } : {}),
-    ...(child.childLlmEffort?.trim() ? { childLlmEffort: child.childLlmEffort.trim() } : {}), ...(authorOnPod && podAuthorGrade ? { authorGrade: podAuthorGrade.grade, authorGradeSource: podAuthorGrade.source } : {}), ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...((opts as HarnessAskSayChildLlmOptions).goalType ? { goalType: (opts as HarnessAskSayChildLlmOptions).goalType } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.repairCommitOnly ? { repairCommitOnly: o.repairCommitOnly } : {}), ...(o.seat ? { seat: o.seat } : {}) },
+    ...(child.childLlmEffort?.trim() ? { childLlmEffort: child.childLlmEffort.trim() } : {}), ...(authorOnPod && podAuthorGrade ? { authorGrade: podAuthorGrade.grade, authorGradeSource: podAuthorGrade.source } : {}), ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...((opts as HarnessAskSayChildLlmOptions).goalType ? { goalType: (opts as HarnessAskSayChildLlmOptions).goalType } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}), ...(o.imageDigest ? { imageDigest: o.imageDigest } : {}), ...(o.repairCommitOnly ? { repairCommitOnly: o.repairCommitOnly } : {}), ...(o.seat ? { seat: o.seat } : {}) },
     { onOutput: (text) => {
       runId ??= harnessPodRunId(output + text);
       output = (output + text).slice(-16_000);
@@ -1091,13 +1093,18 @@ async function dispatchHarnessAskSay(
         ['--goal-type', opts.goalType], ...(dryRunPreview.entrance === 'cli-harness-say' ? [['--author-grade', opts.authorGradeSource === 'flag' ? opts.authorGrade : undefined] as [string, string | undefined]] : []), ['--child-llm-provider', opts.childLlmProvider],
         ['--child-llm-model', opts.childLlmModel], ['--child-llm-effort', opts.childLlmEffort],
         ['--pod-pool', (opts as HarnessSubstrateOpts).podPool], ['--pod-memory', (opts as HarnessSubstrateOpts).podMemory],
-        ['--after', (opts as HarnessSubstrateOpts).after], ['--source', (opts as HarnessSubstrateOpts).source], ['--repair-commit-only', (opts as HarnessSubstrateOpts).repairCommitOnly],
+        ['--after', (opts as HarnessSubstrateOpts).after], ['--source', (opts as HarnessSubstrateOpts).source], ['--image-digest', (opts as HarnessSubstrateOpts).imageDigest], ['--repair-commit-only', (opts as HarnessSubstrateOpts).repairCommitOnly],
         // RUN-IDENTITY — 신분이 줄 우선순위로 흐른다(승인·선점이 읽는다 · 대기열 자식이 다시 상속).
         ['--run-priority', opts.runPriority !== undefined ? String(opts.runPriority) : undefined],
       ];
       for (const [flag, value] of values) if (value !== undefined) flags.push(flag, value);
       if ((opts as HarnessSubstrateOpts).source !== undefined && resolved.substrate !== 'pod') {
         console.error('`--source` 는 `--substrate pod` 와 함께');
+        process.exitCode = 2;
+        return;
+      }
+      if ((opts as HarnessSubstrateOpts).imageDigest !== undefined && (resolved.substrate !== 'pod' || !isImageDigestPin((opts as HarnessSubstrateOpts).imageDigest))) {
+        console.error('`--image-digest` 는 `--substrate pod` 와 sha256:<64자 소문자 16진> 형식이어야 한다');
         process.exitCode = 2;
         return;
       }
@@ -1243,6 +1250,12 @@ async function dispatchHarnessAskSay(
       if (gateDecision.action !== 'proceed' || launchDoor === undefined || launchDoorRequestId === undefined) return gateDecision;
       const doorConsumption = launchDoor.consume(launchDoorRequestId, {
         force: opts.forceGate === true,
+        ta: resolved.substrate === 'pod',
+        target: {
+          ...(process.env.ELANOUS_TASK_CARD_ID ? { card: process.env.ELANOUS_TASK_CARD_ID } : {}),
+          ...(process.env.ELANOUS_POD_SLOT_ID ? { cell: process.env.ELANOUS_POD_SLOT_ID } : {}),
+          ...(/^commit:[0-9a-f]{40}$/u.test((opts as HarnessSubstrateOpts).source ?? '') ? { commit: (opts as HarnessSubstrateOpts).source!.slice('commit:'.length) } : {}),
+        },
         ...(inheritedLaunchDoorReceipt !== undefined ? { inheritedReceipt: inheritedLaunchDoorReceipt } : {}),
       });
       if (doorConsumption.status === 'refused') {

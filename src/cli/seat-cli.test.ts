@@ -112,6 +112,8 @@ test('collectSeatBootSections — 안 읽은 우편 수·자리·HANDOFF·예약
     expect(card).toContain('## HANDOFF');
     expect(card).toContain('## 예약');
     expect(card).toContain('## 지난 세션');
+    expect(card).toContain('## SCOPE STOP');
+    expect(card).toContain('미관측: SCOPE.md 없음');
     expect(card).toContain('마지막 요청: 세션 정리해줘');
     expect(card).toContain('열린 일: 정리했다. 다음 점검 10:30 에 깨운다');
     expect(card).not.toContain('private-dm-body-stays-out');

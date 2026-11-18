@@ -402,12 +402,15 @@ export async function* runAgent(
      *  can observe completion without runner importing registry
      *  (avoids a circular import). */
     onTerminal?: (task: AgentTask) => void;
+    /** Called once when the task flips to running (registry.spawn injects `notifyTaskStart`). */
+    onStart?: (task: AgentTask) => void;
   },
 ): AsyncGenerator<AgentEvent, void, unknown> {
   const queue = new AsyncEventQueue<AgentEvent>();
 
   task.state = 'running';
   task.startedAt = Date.now();
+  try { opts.onStart?.(task); } catch { /* registry isolates */ }
   queue.push({ type: 'status', stage: 'thinking' });
 
   // Resolve tools BEFORE buildAgentMessages so the universal preamble
@@ -424,6 +427,16 @@ export async function* runAgent(
   // model-less spawn). `model: undefined` = inherit: the child then takes
   // the same provider/model decision path as the parent.
   const modelResolution = resolveAgentModelObserved(task.definition, opts.provider?.name);
+  // HARNESS-CHILD-PROVIDER-PASSTHROUGH: one line per Agent child launch naming the provider it inherits.
+  try {
+    const child = opts.provider ?? resolveDefaultProvider(modelResolution.model);
+    debug.log('child.provider', 'resolve', {
+      mode: 'passthrough', kind: 'agent', agent: task.definition.name,
+      parentProvider: process.env.ELANOUS_LLM_PROVIDER ?? null, parentModel: process.env.ELANOUS_LLM_MODEL ?? null,
+      childProvider: child.name, childModel: modelResolution.model ?? child.defaultModel,
+      source: opts.provider ? 'pinned' : process.env.ELANOUS_LLM_PROVIDER ? 'session-env' : 'config',
+    });
+  } catch { /* a provider lookup failure is already reported by agent.model resolved */ }
 
   // Build history on the task so callers can inspect it after the run.
   // PFC-S1 P5: pass task.cwd so the slim-context notice (when

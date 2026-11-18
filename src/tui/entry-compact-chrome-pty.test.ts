@@ -21,7 +21,7 @@ test('20-row next TUI hides informational chrome but keeps the approval panel an
       ready: { label: 'boot', until: (screen) => screen.includes('elanous') && screen.includes('Ctrl+Q 종료'), timeoutMs: 8_000 }, // Source: #36661
       steps: [
         { label: 'approval', text: 'delete fixture', until: (screen) => screen.includes('Bash 실행 승인') && screen.includes('Enter 기본 N'), timeoutMs: 15_000 }, // Source: #36690
-        { label: 'denied', keys: '\r', until: (screen) => screen.includes('엘라누스:'), timeoutMs: 12_000 }, // Source: #36690
+        { label: 'denied', keys: '\r', until: (screen) => !screen.includes('Bash 실행 승인') && screen.includes('Turn'), timeoutMs: 12_000 }, // Source: #36690
         { label: 'exit', text: 'exit', until: (screen) => screen.includes('elanous'), timeoutMs: 8_000 }, // Source: #36661
       ],
     });
@@ -66,16 +66,16 @@ test('default 24-row compact view keeps failures and corrective instructions vis
       args: [BIN, '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
       root, rows: 24, cols: 80,
       env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
-      ready: { label: 'boot', until: (screen) => screen.includes('elanous') && screen.includes('Ctrl+Q 종료'), timeoutMs: 8_000 }, // Source: #36661
+      ready: { label: 'boot', until: (screen) => screen.includes('elanous') && screen.includes('Ctrl+Q quit'), timeoutMs: 8_000 }, // Source: #36661
       steps: [
-        { label: 'no-content', text: '/compact', until: (screen) => screen.includes('압축할 내용 없음 · 0 메시지'), timeoutMs: 8_000 }, // Source: #36661
-        { label: 'how-to-correct', text: '/tasks stop x', until: (screen) => screen.includes('작업 ID를 고유한 4자 이상 앞자리로 입력하세요'), timeoutMs: 8_000 }, // Source: #36661
+        { label: 'no-content', text: '/compact', until: (screen) => screen.includes('Nothing to compact · 0 messages'), timeoutMs: 8_000 }, // Source: #36661
+        { label: 'how-to-correct', text: '/tasks stop x', until: (screen) => screen.includes('Enter a unique task ID prefix of at least 4 characters'), timeoutMs: 8_000 }, // Source: #36661
         { label: 'exit', text: 'exit', until: (screen) => screen.includes('elanous'), timeoutMs: 8_000 }, // Source: #36661
       ],
     });
-    expect(run.frames[1]?.screen).toContain('압축할 내용 없음 · 0 메시지');
-    expect(run.frames[2]?.screen).toContain('작업 ID를 고유한 4자 이상 앞자리로 입력하세요');
-    expect(run.frames[2]?.screen).not.toContain('Ctrl+Q 종료');
+    expect(run.frames[1]?.screen).toContain('Nothing to compact · 0 messages');
+    expect(run.frames[2]?.screen).toContain('Enter a unique task ID prefix of at least 4 characters');
+    expect(run.frames[2]?.screen).not.toContain('Ctrl+Q quit');
     expect(run.exitCode).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 30_000);

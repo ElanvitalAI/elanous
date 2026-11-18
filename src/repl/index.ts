@@ -1,5 +1,7 @@
 import { buildInstalledPackQueryTool, dispatchInstalledPackQuery } from '../boot/installed-pack-query.js';
-import { toolActivityTarget } from '../tui/chat/tool-activity.js';
+import { safeAgentSummary, toolActivityTarget } from '../tui/chat/tool-activity.js';
+import { getPlanState } from '../code-edit/plan-tool.js';
+import { planWireFromState } from '../code-edit/plan-wire.js';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 // Sticky-session REPL — multi-turn CLI conversation in one process.
 //
@@ -31,6 +33,9 @@ import { runTurn } from '../session/chat.js';
 import type { MeasuredTurnUsage } from '../session/turn-usage.js';
 import { createTurnIdClaim, usageCompletionFrame } from './usage-completion.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
+import { withConfiguredWebSearch } from '../core-turn/configured-web-search.js';
+import { getHarnessSpace } from '../harness/harness-space.js';
+import { decideTuiCoreTurn, logTuiCoreTurnRoute } from './tui-core-turn.js';
 import {
   ensureCliSession,
   sessionBudget,
@@ -41,6 +46,7 @@ import {
   listSessions,
   setActiveSessionId,
   getActiveSessionId,
+  parseMessageSource,
 } from '../session/index.js';
 import { getUserConfig, reloadUserConfig, saveUserConfig, jumpToRotationEntry } from '../user-config.js';
 import type { UserConfig } from '../user-config/types.js';
@@ -55,11 +61,11 @@ import { inspectActiveProvider } from '../provider-summary.js';
 import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
-import { buildSeatBootSystemMessages, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
+import { buildSeatBootSystemMessages, buildSeatMemoryIndexSystemMessages, resolveSeatMemoryContext, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
 import type { GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 import { installNextTuiSelfHealthTracker } from '../tui/chat/self-health-status.js';
 import { bashApprovalFinding } from '../tool-runtime/bash-approval.js';
-import { createReplGraphApprover, createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
+import { createReplGraphApprover, createReplPublishApprover, createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
 import { createReplHarnessAsker, parseHarnessAskUserRound } from '../tui-client/next-harness-ask-user.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { isToolSearchCall, routeToolSearch } from '../skills/tools/tool-search-route.js';
@@ -68,6 +74,8 @@ import { agentResultStatus, type AgentDisplayEvent } from '../tui/core/agents.js
 import { createNextTuiMessageBlockEmitter } from './next-tui-message-blocks.js';
 import { monotonicNowMs } from '../esc-abort-gate.js';
 import { createPushNowRouter, createShellSnapshotRouter } from './shell-snapshot-router.js';
+import { createNextTuiSteerInbox, createNextTuiSteerRouter } from './next-tui-steer.js';
+import { setShellWatchdogStatusSink } from '../tool-runtime/shell-watchdog.js';
 import { nextTuiPushNowDecision } from '../tui/core/queue.js';
 import { setSessionTierOverride } from '../model-tier/session-override.js';
 import { parseToolResultEnvelope } from '../chat/tool-render/result-text.js';
@@ -98,13 +106,14 @@ type ReplShellActivity =
   | { phase: 'finish'; id: string; name: 'Bash' | 'RunShell' }
   | { phase: 'snapshot'; calls: Array<{ id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }> };
 type ReplToolActivity =
-  | { phase: 'start' | 'finish'; id: string; name: string; target?: string }
+  | { phase: 'start' | 'finish'; id: string; name: string; target?: string; summary?: string }
   | { phase: 'snapshot'; calls: Array<{ id: string; name: string; target?: string }> };
 
 const shellSnapshotRouter = createShellSnapshotRouter();
 const pushNowRouter = createPushNowRouter();
+const steerRouter = createNextTuiSteerRouter();
 if (typeof process.send === 'function') process.on('message', (message: unknown) => {
-  if (!shellSnapshotRouter.receive(message)) pushNowRouter.receive(message);
+  if (!shellSnapshotRouter.receive(message) && !pushNowRouter.receive(message)) steerRouter.receive(message);
 });
 
 export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: () => number) {
@@ -176,7 +185,7 @@ export interface ReplOpts {
    *  or after `:provider <label>`. */
   cfg: UserConfig;
   /** Authenticated Next host session; missing identity leaves board receipts unavailable. */
-  memberBoardSession?: () => Promise<{ nexusUrl: string; sessionToken: string } | undefined> | { nexusUrl: string; sessionToken: string } | undefined;
+  memberBoardSession?: () => Promise<{ nexusUrl: string; sessionToken: string; appSlug?: string } | undefined> | { nexusUrl: string; sessionToken: string; appSlug?: string } | undefined;
   /** Resume an explicit session (id or unique prefix). When omitted,
    *  REPL creates a fresh session at boot. */
   initialSessionId: string | undefined;
@@ -210,6 +219,10 @@ export interface ReplOpts {
    *  pure scenario runs, false when stdin is a TTY (the human
    *  expects the prompt to come back). */
   exitAfterScenario: boolean;
+  /** CHAT-TOOLS-ENTRY-VIA-CORE-TURN — this REPL is the Next TUI host's child (set only by that launch:
+   *  `src/tui-client/fast-repl-child.ts` and `repl --next-tui` from `src/tui-client/local-chat-turn.ts`). A structured
+   *  caller flag: its tool turns take the core turn with the configured WebSearch. Absent = the plain REPL, unchanged. */
+  nextTui?: boolean;
 }
 
 /** One scripted turn — used by both YAML scenarios and JSONL stdin
@@ -225,6 +238,8 @@ export interface ScenarioTurn {
   /** Switch provider before this turn. Resolves through
    *  `rotationEntryLabel` (e.g. "opus" / "codex" / "gemini"). */
   rotate?: string;
+  /** MSG-SOURCE-HIERARCHY: who sent this turn (structured; parsed, never guessed from the text). */
+  from?: unknown;
   /** File paths to attach as image content blocks. Resolved
    *  relative to the scenario file (or cwd for stdin). */
   attachments?: string[];
@@ -253,7 +268,7 @@ interface PendingAttachment {
  *  `buildCliAgentTools` in src/index.ts but lives here so the REPL
  *  module is self-contained when consumed in tests. */
 /** Keep the isolated Next test session bound to the same app as a member connect session. */
-export async function resolveNextTestVerifiedOwner(sessionFile: string): Promise<{ id: string } | undefined> {
+export async function resolveNextTestVerifiedOwner(sessionFile: string): Promise<{ id: string; appSlug?: string } | undefined> {
   const fixture = JSON.parse(readFileSync(sessionFile, 'utf8')) as {
     nexusUrl?: string; sessionToken?: string; appSlug?: string;
   };
@@ -261,6 +276,35 @@ export async function resolveNextTestVerifiedOwner(sessionFile: string): Promise
   return resolveDashboardVerifiedOwner({
     nexusUrl: fixture.nexusUrl ?? '', sessionToken: fixture.sessionToken, appSlug: fixture.appSlug,
   });
+}
+
+/** 자리 memory_save 시간 상한 — 호스트 요청기(`requestMemberBoardSession`)의 자체 시간 초과(2초)보다 짧게 둔다.
+ *  그쪽이 시간 초과로 «세션 없음»(undefined)을 돌려주면 본부로 오판하므로, 그 전에 우리가 끊고 회원으로 본다. */
+// 출처: `src/tui-client/next-member-board-session.ts` requestMemberBoardSession timeoutMs 2_000
+const SEAT_MEMORY_AUDIENCE_TIMEOUT_MS = 1_500;
+
+/** 회원 세션이 있나 — 회원 세션 칸이 «하나라도» 값이 있으면 member(반쯤 묶인 세션도 반출을 막는 쪽). 세션이 아예 없을 때만 hq-seat.
+ *  던짐·시간 초과도 member. */
+export async function resolveSeatMemoryAudience(
+  memberBoardSession: ReplOpts['memberBoardSession'] | undefined,
+  timeoutMs = SEAT_MEMORY_AUDIENCE_TIMEOUT_MS,
+): Promise<'member' | 'hq-seat'> {
+  if (!memberBoardSession) return 'hq-seat';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const session = await Promise.race([
+      Promise.resolve().then(() => memberBoardSession()),
+      new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), timeoutMs); }),
+    ]);
+    if (session === 'timeout') return 'member';
+    if (!session || typeof session !== 'object') return 'hq-seat';
+    // nexusUrl 만·sessionToken 만 있는 반쯤 묶인 세션도 회원이다 — 묶임이 완전한지는 반출 판정의 근거가 아니다.
+    return Object.values(session).some(value => value !== undefined && value !== null && value !== '') ? 'member' : 'hq-seat';
+  } catch {
+    return 'member';
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export function buildReplTools(options: {
@@ -275,6 +319,10 @@ export function buildReplTools(options: {
   readonly memberBoardSession?: ReplOpts['memberBoardSession'];
   /** Injected route bridge for focused dispatcher regressions. */
   readonly pluginRuntime?: Pick<import('../cli/child-plugin-runtime.js').ChildPluginRuntimeContract, 'hostTools' | 'dispatchPluginTool'>;
+  /** Test seam: fake Jev client for the seat memory_save write gate (production resolves config and key itself). */
+  readonly seatMemoryJevDeps?: import('../memory-triage/jev-adapter.js').MemoryJevDeps;
+  /** Test seam: the seat memory store this session uses (production detects it from the cwd and seat-state). */
+  readonly seatMemoryContext?: { seat: string; dir: string };
 } = {}): {
   specs: LLMToolSpec[];
   dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
@@ -299,6 +347,35 @@ export function buildReplTools(options: {
     specs.push(memoryTool);
     dispatchByName.set(memoryTool.name, args => core.dispatch(memoryTool.name, args));
   }
+  // 🧠 OP-MEMORY-PARITY (O6) — 자리 세션이면 memory_save 를 자리 저장소 판으로 바꾸고 memory_delete·memory_search 를 붙인다.
+  //    자리가 아니면(사람 대화 TUI) 손대지 않는다 — 전역 memory_save 그대로.
+  try {
+    const seatMemory = options.seatMemoryContext ?? resolveSeatMemoryContext(getSessionCwd());
+    if (seatMemory) {
+      (require('../seat-memory/seat-memory-tools.js') as typeof import('../seat-memory/seat-memory-tools.js'))
+        .applySeatMemoryTools(specs, dispatchByName, {
+          ...seatMemory,
+          // MEMORY-TRIAGE-NO-LLM ① — 출처 = 이 세션의 신뢰된 사용자 요청(턴). 없으면 옛 쓰기(그림자)로 남는다.
+          getSourceEventId: () => {
+            const requestId = options.getRequestId?.();
+            return requestId && options.sessionId ? `repl:${options.sessionId}/${requestId}` : undefined;
+          },
+          // 회원 기억은 기본으로 Jev(외부)로 보내지 않는다. 함수가 «있는지»가 아니라 턴 시점 «실제 세션»으로 정한다
+          // (next TUI 자식은 함수를 늘 넘긴다). 조회 실패·시간 초과는 회원으로 본다.
+          getAudience: () => resolveSeatMemoryAudience(options.memberBoardSession),
+          ...(options.seatMemoryJevDeps ? { jevDeps: options.seatMemoryJevDeps } : {}),
+        });
+    }
+  } catch (error) {
+    debug.log('memory', 'tools-skipped', { error: error instanceof Error ? error.message : String(error) });
+  }
+  // DECISION-GATE v2 reads the turn outcome from the plan state, so the model needs update_plan in this child:
+  // it is registered in the tool runtime but no native family above advertises it to the REPL (self-proactive 1/4).
+  if (!specs.some(spec => spec.name === 'update_plan')) {
+    const planTool = require('../code-edit/plan-tool.js') as typeof import('../code-edit/plan-tool.js');
+    specs.push(planTool.buildUpdatePlanTool());
+    dispatchByName.set('update_plan', async args => (await planTool.dispatchUpdatePlan(args as Record<string, unknown>)).output);
+  }
   // The ops ledger is a runtime family, so the native-only catalog above
   // cannot advertise it. Keep the REPL surface limited to seat mail.
   const ledger = require('../skills/tools/ops-ledger.js') as typeof import('../skills/tools/ops-ledger.js');
@@ -309,6 +386,7 @@ export function buildReplTools(options: {
   specs.push(bashMod.buildBashTool());
   const shellApprover = createReplShellApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const graphApprover = createReplGraphApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
+  const publishApprover = createReplPublishApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const harnessAsker = options.sessionId ? createReplHarnessAsker(
     options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess, options.sessionId) : null;
   if (options.sessionId) {
@@ -370,7 +448,11 @@ export function buildReplTools(options: {
   const pluginBridge = options.pluginRuntime ?? (require('../cli/child-plugin-runtime.js') as typeof import('../cli/child-plugin-runtime.js'))
     .createChildPluginRuntimeContract({
       observeGraphProgress: options.onGraphProgress,
-      requestConfirmation: async (prompt) => await graphApprover?.(prompt) ?? false,
+      requestConfirmation: async (prompt) => (await graphApprover?.(prompt))?.approved ?? false,
+      // Timeout, a cancelled turn or a missing channel are not an owner refusal: callers hold the node instead.
+      requestDecision: async (prompt: string, signal?: AbortSignal, decisionOptions?: { readonly timeoutMs?: number }) =>
+        graphApprover ? await graphApprover(prompt, signal, decisionOptions) : { approved: false as const, reason: 'unavailable' as const },
+      ...(publishApprover ? { requestPublishApproval: async (url: string, expiresAt: string, prompt: string, signal?: AbortSignal) => await publishApprover(url, expiresAt, prompt, signal) } : {}),
       // The host supplies only a private app session. Nexus remains the authority
       // for the owner; a missing, expired or rejected session stays anonymous.
       resolveVerifiedOwner: async () => {
@@ -409,22 +491,20 @@ export function buildReplTools(options: {
             const { scene5DecisionPrompt } = await import('../tui-client/scene5-decision-consumer.js');
             const prompt = scene5DecisionPrompt(readFileSync(packetFile),
               { graphId, runId: pending.runId, designSha256: pending.designSha256, packetSha256: pending.packetSha256 });
-            const approved = await graphApprover?.(prompt) ?? false;
-            result = { graphId, runId: pending.runId, status: 'decision-recorded',
-              decision: approved ? 'approved' : 'rejected', realGcpCalls: 0 };
+            const outcome = graphApprover ? await graphApprover(prompt) : { approved: false as const, reason: 'unavailable' as const };
+            result = outcome.approved || outcome.reason === 'declined'
+              ? { graphId, runId: pending.runId, status: 'decision-recorded',
+                decision: outcome.approved ? 'approved' : 'rejected', realGcpCalls: 0 }
+              : { graphId, runId: pending.runId, status: 'awaiting-approval', approvalHeld: outcome.reason, realGcpCalls: 0 };
           }
           appendFileSync(resolvePath(nextTestRoot, 'next-graph-calls.test.jsonl'),
             `${JSON.stringify({ graphId, args, verifiedOwner: context.verifiedOwner.id, result })}\n`);
           return result;
         } } : {}),
     });
-  const exposedNames = new Set(specs.map((spec) => spec.name));
-  for (const tool of pluginBridge.hostTools) {
-    if (!tool.route || exposedNames.has(tool.name)) continue;
-    specs.push({ name: tool.name, description: tool.description, parameters: tool.parameters,
-      pluginId: tool.pluginId, route: tool.route });
-    exposedNames.add(tool.name);
-  }
+  // One merge helper for every turn that adds plugin routes (the daemon chat turn uses the same one).
+  specs.push(...(require('../cli/child-plugin-runtime.js') as typeof import('../cli/child-plugin-runtime.js'))
+    .routeOnlyHostToolSpecs(pluginBridge.hostTools, new Set(specs.map((spec) => spec.name))));
   if (!specs.some(spec => spec.name === TOOL_SEARCH_NAME)) specs.push(buildToolSearchTool());
   if (!specs.some(spec => spec.name === CAPABILITY_SEARCH_NAME)) specs.push(buildCapabilitySearchTool());
   // TUI-NEXT-QUEUE-AND-WAKE: the next TUI parent opens an IPC hop only for its own REPL children;
@@ -437,8 +517,13 @@ export function buildReplTools(options: {
   }
   (require('../tui/sidetab/nl-tool.js') as typeof import('../tui/sidetab/nl-tool.js')).registerNextSidetabReplTool(specs, dispatchByName, process as unknown as import('../tui/sidetab/nl-tool.js').NextSidetabIpcProcess);
   const planner = sr.createSearchPlannerState({ maxAutoNarrowCandidates: 2 });
+  // APP-BUILD-DECLINE-NO-BYPASS-DEPLOY: after a declined app_build, shell deploy/host exposure in the same request is refused.
+  const declineGuard = (require('../plugins/core/app-build-decline-guard.js') as typeof import('../plugins/core/app-build-decline-guard.js'))
+    .createAppBuildDeclineTurnGuard(() => options.getRequestId?.());
   const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
     try {
+      const bypassRefusal = declineGuard.refuse(name, args);
+      if (bypassRefusal) return bypassRefusal;
       if (isToolSearchCall(name)) return routeToolSearch(args, specs, { surface: 'tui-next', requireQueryCoverage: name === CAPABILITY_SEARCH_NAME });
       const direct = dispatchByName.get(name);
       if (direct) return await direct(args);
@@ -462,6 +547,7 @@ export function buildReplTools(options: {
         dispatchToolRuntime: async (n) => ({ error: `runtime unavailable in REPL: ${n}` }),
         dispatchPluginTool: async (toolName, toolArgs) => {
           const routed = await pluginBridge.dispatchPluginTool(toolName, toolArgs);
+          declineGuard.observe(routed);
           if (!routed.ok) return routed;
           if (toolName === 'brief_today') {
             const handlerRef = pluginBridge.hostTools.find(tool => tool.name === toolName)?.handlerRef;
@@ -575,8 +661,15 @@ export function buildReplSystemPrompt(ctx: {
     }
   }
   const card = buildSeatBootCardText(ctx);
-  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve status --json으로 해당 포트의 기존 매핑이 없는지 확인한 뒤 tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>로 그 포트만 tailnet에 공유하라(443의 루트 경로와 기존 Serve 설정 변경 금지, 공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 tailscale serve --tls-terminated-tcp <선택포트> off와 보고한 프로세스 종료만 수행하라(serve reset 금지).';
-  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card].filter(part => part.length > 0);
+  // 🧠 OP-MEMORY-PARITY (O6) — 세션 시작 자리 기억 색인(카드와 같은 대화 스냅샷 · 같은 대화 동안 바이트 고정).
+  let seatMemoryIndex = '';
+  try {
+    seatMemoryIndex = buildSeatMemoryIndexSystemMessages(
+      { cwd: ctx.cwd, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) }, ctx.seatBootDeps ?? {},
+    ).map((message) => (typeof message.content === 'string' ? message.content : '')).join('\n\n');
+  } catch { /* 색인만 빠진다 */ }
+  const appCapabilityHint = ctx.enabledToolNames === undefined ? '' : '사용자가 시스템 설계·만들기·배포를 요청하면 엘라누스의 등록 도구로 요구사항, 아키텍처 문서·구성도·설계 PDF/도식, 프론트엔드·백엔드 API·DB 스키마/시드 코드와 로컬 실행·시험을 진행하라. 실제 배포는 제공된 app.publish@1/app-publish.action@1 capability와 소유자 검증·게시 승인을 사용하라. 회원 연결이 없거나 app.publish를 쓸 수 없으면 생성 서버를 127.0.0.1의 빈 31500~31599 포트에서 백그라운드 실행하고 tailscale serve status --json으로 해당 포트의 기존 매핑이 없는지 확인한 뒤 tailscale serve --bg --tls-terminated-tcp <선택포트> tcp://127.0.0.1:<선택포트>로 그 포트만 tailnet에 공유하라(443의 루트 경로와 기존 Serve 설정 변경 금지, 공개 인터넷 노출 금지). 실제 URL의 HTTP 200과 앱 화면을 확인한 뒤 URL·프로세스·serve 설정과 되돌리기 명령을 보고하고, 제공되지 않은 실행 기능은 가정하지 마라. 단계별 실제 파일·시험 결과·영수증과 반환된 tailnet URL을 보여 주고, URL의 실제 동작 확인 전 배포 완료를 주장하지 말라. app.publish 되돌리기는 해당 배포 ID·영수증 범위로, 로컬 운영자 배포 되돌리기는 tailscale serve --tls-terminated-tcp <선택포트> off와 보고한 프로세스 종료만 수행하라(serve reset 금지). app_build 실행 확인을 사용자가 거절했거나 응답이 없으면(APP_BUILD_DECLINED) 그 턴에서는 Bash 빌드·tailscale serve/funnel·공개 리스너·배포 CLI 등 다른 경로로 빌드·배포하지 말고 사용자에게 다음 행동을 물어라.';
+  const parts = [skillCatalogText, base ?? '', appCapabilityHint, card, seatMemoryIndex].filter(part => part.length > 0);
   return parts.length > 0 ? parts.join('\n\n') : undefined;
 }
 
@@ -637,6 +730,8 @@ async function runOneTurn(
   tools: ReturnType<typeof buildReplTools> | undefined,
   systemPrompt: string | undefined,
   jsonOutput: boolean,
+  /** The caller's structured Next TUI flag (`ReplOpts.nextTui`) — never inferred from env. */
+  nextTui: boolean,
   nextTuiDelivery?: { pending: PendingTaskNotification[] },
   onJsonDelta?: (delta: string) => void,
   onJsonStatus?: (line: string) => void,
@@ -648,6 +743,8 @@ async function runOneTurn(
   shellSnapshotTurnId?: string,
   onJsonToolActivity?: (event: ReplToolActivity) => void,
   onPushNowRequest?: (requestId: string, phase: 'probe' | 'commit', activeTools: string[]) => void,
+  /** MSG-SOURCE-HIERARCHY: who sent this turn's text (persisted on the user message). */
+  from?: import('../session/index.js').MessageSource,
 ): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; measuredUsage?: MeasuredTurnUsage; goalComplete?: boolean; goalStopReason?: string }> {
   const startedAt = Date.now();
   let memorySaveFailed = false;
@@ -662,9 +759,25 @@ async function runOneTurn(
   if (!jsonOutput) {
     process.stdout.write('  ');
   }
+  const tuiIntent = classifyTuiChatIntent(userText, { seat: process.env.COORD_ID?.trim() !== undefined });
+  // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (JUD-B TUI clause · OP #84368) — a Next TUI tool turn takes the core turn like
+  // `chat --tools` (#38246): structured `coreTurn` flag, WebSearch added when a search provider is configured (the
+  // research route needs a web tool in the pool). Goal loop · harness child · no-tools keep their existing path.
+  //   Only the Next TUI child (the caller's structured `nextTui` flag): the plain `elanous repl` keeps its old path —
+  //   no coreTurn, no added WebSearch, no new route record (Terra #38386 r1 mustFix).
+  //   runTurn arms the goal loop on its own seat verdict (cwd seat or COORD_ID — session/chat.ts), so judge it the same way.
+  const runTurnSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1] ?? process.env.COORD_ID?.trim();
+  const coreTurnDecision = !nextTui ? undefined : decideTuiCoreTurn({
+    hasTools: (tools?.specs.length ?? 0) > 0,
+    harnessChild: getHarnessSpace() !== null,
+    goalLoop: tuiIntent.goalLoop || cfg.llm.goalLoop?.enabled === true
+      || classifyTuiChatIntent(userText, { seat: runTurnSeat !== undefined }).goalLoop,
+  });
+  const turnTools = tools && coreTurnDecision?.coreTurn ? withConfiguredWebSearch(tools, 'tui') : tools;
+  const planCalls: Array<{ outcome: string; elapsedMs: number }> = [];
   // Archon-port T1.2 (2026-05-08) — apply user-config `chat.toolDeny`
   // to the REPL tool roster. Pre-T1.2 the REPL ignored toolDeny.
-  let replToolSpecs = tools?.specs;
+  let replToolSpecs = turnTools?.specs;
   if (replToolSpecs && cfg.chat.toolDeny.length > 0) {
     const { applyToolPolicy } = require('../tool-runtime/tool-policy.js') as typeof import('../tool-runtime/tool-policy.js');
     replToolSpecs = applyToolPolicy(replToolSpecs, { deny: cfg.chat.toolDeny }) ?? replToolSpecs;
@@ -681,7 +794,13 @@ async function runOneTurn(
   // Completion output is untrusted task data. Carry it as a user-role content
   // block for this call, leaving the human prompt and system prompt intact.
   if (nextTuiNotifications) userImages.unshift({ type: 'text', text: nextTuiNotifications });
-  const tuiIntent = classifyTuiChatIntent(userText, { seat: process.env.COORD_ID?.trim() !== undefined });
+  // 🧠 OP-MEMORY-PARITY (O6) — 자리 세션 턴 회상: 이 글(사람·우편)에 맞는 자리 기억을 배경 블록으로 싣는다(추가 모델 호출 0).
+  //    시스템 프롬프트가 아니라 이번 호출의 사용자 역할 텍스트 블록 — 캐시 접두를 흔들지 않는다.
+  try {
+    const recall = (require('../seat-memory/seat-memory-layers.js') as typeof import('../seat-memory/seat-memory-layers.js'))
+      .seatMemoryRecallText({ cwd: getSessionCwd(), userText, sessionId });
+    if (recall) userImages.unshift({ type: 'text', text: recall });
+  } catch { /* 회상만 빠진다 */ }
   const surfaceRunId = onJsonMessageBlock ? randomUUID() : undefined;
   const messageBlocks = onJsonMessageBlock ? createNextTuiMessageBlockEmitter({
     sessionId, runId: surfaceRunId!, emit: onJsonMessageBlock,
@@ -698,6 +817,19 @@ async function runOneTurn(
   const stopPushNowListener = onPushNowRequest && shellSnapshotTurnId
     ? pushNowRouter.listen(shellSnapshotTurnId, ({ requestId, phase }) => onPushNowRequest(requestId, phase, [...activeToolCalls.values()].map((call) => call.name)))
     : undefined;
+  // A200 — input typed during this turn joins the next model request (tool-result boundary), not the turn end.
+  const steerTurnId = onPushNowRequest ? shellSnapshotTurnId : undefined;
+  const steerInbox = steerTurnId
+    ? createNextTuiSteerInbox(sessionId, (steerIds) => {
+      process.stdout.write(`${JSON.stringify({ event: 'steer-applied', turnId: steerTurnId, steerIds })}\n`);
+    })
+    : undefined;
+  const stopSteerListener = steerInbox && steerTurnId
+    ? steerRouter.listen(steerTurnId, (request) => {
+      if (request.kind === 'steer') steerInbox.push(request.steerId, request.text);
+      else steerInbox.retract(request.steerIds);
+    })
+    : undefined;
   let result: Awaited<ReturnType<typeof runTurn>>;
   try {
     result = await runTurn({
@@ -706,6 +838,7 @@ async function runOneTurn(
     userText,
     ...(surfaceRunId ? { surfaceRunId } : {}),
     utteranceSurface: 'tui',
+    ...(from ? { from } : {}),
     ...(tuiIntent.goalLoop ? { goalLoop: true } : {}),
     systemPrompt,
     userImages: userImages.length > 0 ? userImages : undefined,
@@ -732,7 +865,10 @@ async function runOneTurn(
     onGoalInterim: (text, iteration) => messageBlocks?.progress(text, [`목표 단계 ${iteration || 1} 완료`]),
     onReasoning: (event) => { if (event.kind === 'summary_delta') messageBlocks?.thought(event.delta, true); },
     tools: replToolSpecs,
-    dispatchTool: tools?.dispatch,
+    dispatchTool: turnTools?.dispatch,
+    ...(coreTurnDecision?.coreTurn
+      ? { coreTurn: true, onResearchPlanSettled: (info: { outcome: string; elapsedMs: number }) => { planCalls.push(info); } }
+      : {}),
     ...(signal ? { signal } : {}),
     onToolCall: (call) => {
       messageBlocks?.toolCall(call);
@@ -760,7 +896,8 @@ async function runOneTurn(
       messageBlocks?.toolResult(call);
       if (jsonOutput && onJsonToolActivity) {
         activeToolCalls.delete(call.id);
-        onJsonToolActivity({ phase: 'finish', id: call.id, name: call.name });
+        const agentSummary = call.name === 'Agent' ? safeAgentSummary(call.result) : undefined;
+        onJsonToolActivity({ phase: 'finish', id: call.id, name: call.name, ...(agentSummary ? { summary: agentSummary } : {}) });
       }
       if (call.name === 'Agent') onJsonAgent?.({ phase: 'finish', id: call.id, status: agentResultStatus(call.result) });
       if (jsonOutput && onJsonShellActivity && (call.name === 'Bash' || call.name === 'RunShell')) {
@@ -782,8 +919,12 @@ async function runOneTurn(
     },
     });
   } finally {
+    if (coreTurnDecision) logTuiCoreTurnRoute(coreTurnDecision, replToolSpecs?.some(spec => spec.name === 'WebSearch') ?? false, planCalls);
     stopShellSnapshotListener?.();
     stopPushNowListener?.();
+    stopSteerListener?.();
+    // Undelivered steer stays in the parent's queue and leaves as the next turn.
+    steerInbox?.finish();
   }
   // A failed turn keeps the buffered notifications for the next JSONL prompt.
   nextTuiDelivery?.pending.splice(0);
@@ -1101,6 +1242,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         tools,
         systemPromptForTurn(),
         opts.jsonOutput,
+        opts.nextTui === true,
         nextTuiDelivery,
       );
       backgroundBridge?.emit();
@@ -1190,7 +1332,12 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       const streamTurn = process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string';
       activeTurnSignal = streamTurn ? turnAbort.signal : undefined;
       activeTurnId = streamTurn ? turn.id : undefined;
+      const planVersionAtStart = getPlanState().version;
       activeRequestId = `request-${++requestSequence}`;
+      // A201 — a shell watchdog stop shows one status line on this turn's screen.
+      const previousWatchdogSink = streamTurn
+        ? setShellWatchdogStatusSink((text) => { process.stdout.write(`${JSON.stringify({ event: 'status', turnId: turn.id, text })}\n`); })
+        : null;
       if (streamTurn) process.once('SIGTERM', onTerminate);
       try {
         const sessionCfg = turn.sessionProvider && process.env.ELANOUS_NEXT_TUI_STREAM === '1'
@@ -1207,6 +1354,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
           tools,
           turnSystemPrompt,
           true, // JSONL stream → always JSON output
+          opts.nextTui === true,
           nextTuiDelivery,
           process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
             ? (delta) => { process.stdout.write(`${JSON.stringify({ event: 'delta', turnId: turn.id, text: delta, source: 'assistant-text' })}\n`); }
@@ -1244,6 +1392,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
               if (outcome === 'interrupted') turnAbort.abort();
             }
             : undefined,
+          parseMessageSource(turn.from),
         );
       } catch (error) {
         if (streamTurn) process.off('SIGTERM', onTerminate);
@@ -1268,6 +1417,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         activeTurnSignal = undefined;
         activeTurnId = undefined;
         activeRequestId = undefined;
+        if (streamTurn) setShellWatchdogStatusSink(previousWatchdogSink);
       }
       if (streamTurn) process.off('SIGTERM', onTerminate);
       if (terminateAfterTurn) {
@@ -1286,6 +1436,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         reply: result.reply,
         ...(result.goalComplete ? { goalComplete: true } : {}),
         ...(result.goalStopReason ? { goalStopReason: result.goalStopReason } : {}),
+        ...(() => { const planOutcome = planWireFromState(getPlanState(), planVersionAtStart); return planOutcome ? { planOutcome } : {}; })(),
         durationMs: result.durationMs,
         logPath: result.logPath,
         assertFailures: failures,
@@ -1389,6 +1540,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       tools,
       systemPromptForTurn(),
       opts.jsonOutput,
+      opts.nextTui === true,
       nextTuiDelivery,
     );
     backgroundBridge?.emit();

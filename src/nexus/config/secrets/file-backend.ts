@@ -12,7 +12,7 @@ import { acquireLockSync } from '../../../storage/file-lock.js';
 import { SECRETS_VERSION, type SecretsFile } from '../types.js';
 import { secretsPath } from '../paths.js';
 import { assertSharedSecretId, isAppSecretId, type SecretBackend, type SecretBackendAvailability, type SyncReadableBackend } from './types.js';
-import { assertCredentialSlotId } from './cred-slot-schema.js';
+import { assertCredentialSlotId, assertTransferableStaticCredentialSlotId } from './cred-slot-schema.js';
 import { appSecretId, appSecretIdForExistingApp, appSecretLockKeyForLegacyId, beginAppSecretEvent, createAppSecretEvent, finishAppSecretEvent, hasAppSecretEventForId, hasCommittedAppSecretRevoke, recoverAppSecretEvents, syncAppSecretLedgerDurability, withAppSecretLock, withAppSecretLockSync } from './app-secret-ledger.js';
 
 function defaultSecrets(): SecretsFile {
@@ -252,6 +252,32 @@ export function importSecretsFileRaw(
 ): { imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean } {
   if (Object.keys(secrets).some(isAppSecretId)) throw new Error('ELANOUS_APP_SECRET_LEDGER_REQUIRED');
   if (Object.keys(secrets).some((id) => id.startsWith('cred:'))) throw new Error('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
+  return mergeImportedSecretsLocked(secrets, overwrite, expectedConflicts);
+}
+
+/**
+ * @internal Encrypted-bundle import path: plain static names plus catalogued static-key `cred:` slots.
+ * Rotating login slots (OAuth/refresh) and unknown `cred:` IDs are refused before the lock is taken.
+ */
+export function importStaticSecretsAndCredentialSlotsRaw(
+  secrets: Readonly<Record<string, string>>,
+  overwrite: boolean,
+  expectedConflicts?: readonly string[],
+): { imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean } {
+  if (Object.keys(secrets).some(isAppSecretId)) throw new Error('ELANOUS_APP_SECRET_LEDGER_REQUIRED');
+  for (const [id, value] of Object.entries(secrets)) {
+    if (!id.startsWith('cred:')) continue;
+    assertTransferableStaticCredentialSlotId(id);
+    if (typeof value !== 'string' || !value.trim() || value.includes('\0')) throw new Error('ELANOUS_CREDENTIAL_SLOT_VALUE_INVALID');
+  }
+  return mergeImportedSecretsLocked(secrets, overwrite, expectedConflicts);
+}
+
+function mergeImportedSecretsLocked(
+  secrets: Readonly<Record<string, string>>,
+  overwrite: boolean,
+  expectedConflicts?: readonly string[],
+): { imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean } {
   const path = secretsPath();
   mkdirSync(dirname(path), { recursive: true });
   const release = acquireLockSync(`${path}.lock`);

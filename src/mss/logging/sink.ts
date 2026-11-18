@@ -338,6 +338,7 @@ export class FileSink implements LogSink {
     // listening so the default terminate action is restored; remaining
     // handlers already run in the current dispatch (re-raising would run
     // them a second time). `removeAllListeners` would wipe them.
+    // Prepend so an earlier `process.once` listener still counts (see log-store.ts).
     const install = (signal: NodeJS.Signals): void => {
       const onSig = (): void => {
         onExit();
@@ -346,7 +347,7 @@ export class FileSink implements LogSink {
           process.kill(process.pid, signal);
         }
       };
-      process.on(signal, onSig);
+      process.prependListener(signal, onSig);
     };
     install('SIGINT');
     install('SIGTERM');

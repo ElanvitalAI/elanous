@@ -10,7 +10,7 @@ import { debug } from '../debug/log.js';
 import { appendMessage, createSession, getActiveSessionId, listSessions, loadSession, setActiveSessionId } from '../session/index.js';
 import { ptyAvailable, startPty } from '../pty-shell/registry.js';
 import { spawnRealCli } from '../testing/real-cli-spawn.js';
-import { NEW_SESSION_BUSY_STATUS, isNewSessionCommand, nextTuiTitle, requestNewTuiSession } from './slash/new-session.js';
+import { NEW_CHAT_TITLE, NEW_SESSION_BUSY_STATUS, isNewSessionCommand, newChatStatus, nextTuiTitle, requestNewTuiSession } from './slash/new-session.js';
 import { NEXT_TUI_INPUT_CONTEXT, buildNextTuiHelpLines, resolveNextTuiRoute } from './core/registry.js';
 
 let dir = '';
@@ -48,10 +48,10 @@ describe('/new command shape', () => {
     expect(buildNextTuiHelpLines().join('\n')).toContain('/new · /clear · /session new');
   });
 
-  test('a fresh session shows «새 대화» rather than the store placeholder', () => {
-    expect(nextTuiTitle(null)).toBe('새 대화');
-    expect(nextTuiTitle({ title: '(new session)' })).toBe('새 대화');
-    expect(nextTuiTitle({ title: '' })).toBe('새 대화');
+  test('a fresh session shows the new-chat title rather than the store placeholder', () => {
+    expect(nextTuiTitle(null)).toBe(NEW_CHAT_TITLE);
+    expect(nextTuiTitle({ title: '(new session)' })).toBe(NEW_CHAT_TITLE);
+    expect(nextTuiTitle({ title: '' })).toBe(NEW_CHAT_TITLE);
     expect(nextTuiTitle({ title: '첫 질문\n둘째 줄' })).toBe('첫 질문');
   });
 });
@@ -69,7 +69,7 @@ describe('requestNewTuiSession', () => {
       expect(loadSession(result.id)?.meta.source).toBe('tui');
       expect(loadSession(result.id)?.messages).toEqual([]);
       expect(loadSession(from)?.messages.map((m) => m.content)).toEqual(['첫 질문', '첫 답']);
-      expect(result.status).toBe(`새 대화 · 이전 = ${from.slice(0, 8)}`);
+      expect(result.status).toBe(newChatStatus(from.slice(0, 8)));
       expect(log).toHaveBeenCalledWith('tui.next', 'session-new', { from, to: result.id });
     } finally {
       log.mockRestore();
@@ -81,7 +81,7 @@ describe('requestNewTuiSession', () => {
     expect(result.kind).toBe('started');
     if (result.kind !== 'started') return;
     expect(getActiveSessionId()).toBe(result.id);
-    expect(result.status).toBe('새 대화 · 이전 = 없음');
+    expect(result.status).toBe(newChatStatus(null));
   });
 
   test('busy: refuses without creating a session or moving the active marker', async () => {
@@ -167,6 +167,8 @@ describe('next TUI /new in a real PTY (L3)', () => {
       }
       throw new Error(`timed out waiting for ${label}\n${screen}`);
     };
+    // The footer is English now («Turn done»); the Korean wording is kept for older screens.
+    const TURN_DONE = /Turn done|○ done|턴 완료/; // wide footer or the short clause
     const count = (screen: string, text: string) => screen.split(text).length - 1;
     const send = async (text: string) => {
       pty.write(text);
@@ -174,20 +176,20 @@ describe('next TUI /new in a real PTY (L3)', () => {
       pty.write('\r');
     };
     try {
-      await waitFor('boot', (s) => s.split('\n').includes(NEXT_TUI_TITLE) && s.includes('Ctrl+Q 종료'));
+      await waitFor('boot', (s) => s.split('\n').includes(NEXT_TUI_TITLE) && /Ctrl\+Q (종료|quit)/.test(s));
       await send('첫 메시지');
-      await waitFor('after message 1', (s) => count(s, reply) === 1 && s.includes('턴 완료'));
+      await waitFor('after message 1', (s) => count(s, reply) === 1 && TURN_DONE.test(s));
       await send('둘째 메시지');
-      const before = await waitFor('before /new (2 messages)', (s) => count(s, reply) === 2 && s.includes('턴 완료'));
+      const before = await waitFor('before /new (2 messages)', (s) => count(s, reply) === 2 && TURN_DONE.test(s));
       expect(before).toContain('첫 메시지');
       const oldId = getActiveSessionId() ?? '';
       await send('/new');
-      const after = await waitFor('after /new', (s) => s.includes(`새 대화 · 이전 = ${oldId.slice(0, 8)}`));
+      const after = await waitFor('after /new', (s) => s.includes(newChatStatus(oldId.slice(0, 8))));
       expect(after).toContain(NEXT_TUI_TITLE);
       expect(after).not.toContain('첫 메시지');
       expect(after).not.toContain(reply);
       await send('셋째 메시지');
-      await waitFor('after message 3 (new session)', (s) => count(s, reply) === 1 && s.includes('턴 완료') && s.includes('셋째 메시지'));
+      await waitFor('after message 3 (new session)', (s) => count(s, reply) === 1 && TURN_DONE.test(s) && s.includes('셋째 메시지'));
       const newId = getActiveSessionId() ?? '';
       expect(newId).not.toBe(oldId);
       expect(loadSession(oldId)?.messages.filter((m) => m.role === 'user').map((m) => m.content)).toEqual(['첫 메시지', '둘째 메시지']);
@@ -248,7 +250,7 @@ describe('bare next TUI launch after CLI automation (L3)', () => {
       let screen = '';
       while (Date.now() < deadline) {
         screen = await pty.renderScreen();
-        if (screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료')) break;
+        if (screen.split('\n').includes(NEXT_TUI_TITLE) && /Ctrl\+Q (종료|quit)/.test(screen)) break;
         await sleep(200);
       }
       screens.push(`===== automation seed =====\n${seed.stdout}\n===== bare next boot =====\n${screen}`);
@@ -280,7 +282,7 @@ describe('bare next TUI launch after CLI automation (L3)', () => {
       let continued = '';
       while (Date.now() < continueDeadline) {
         continued = await pty.renderScreen();
-        if (continued.split('\n').includes(NEXT_TUI_TITLE) && continued.includes('Ctrl+Q 종료')) break;
+        if (continued.split('\n').includes(NEXT_TUI_TITLE) && /Ctrl\+Q (종료|quit)/.test(continued)) break;
         await sleep(200);
       }
       screens.push(`===== --continue after automation seed =====\n${continued}`);

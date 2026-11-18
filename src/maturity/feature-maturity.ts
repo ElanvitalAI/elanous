@@ -35,7 +35,7 @@ export const FEATURE_MATURITY = {
   },
   // Canonical CLI command names only; aliases inherit their command's grade.
   cliRoot: {
-    preview: 'beta', pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta', catalog: 'beta', app: 'beta',
+    preview: 'beta', pty: 'beta', side: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta', catalog: 'beta', app: 'beta',
     where: 'stable', bench: 'beta', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
     pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', runs: 'beta', live: 'beta',
     research: 'beta', release: 'beta', rfc: 'beta', know: 'beta', life: 'beta', freeze: 'beta', herdr: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',
@@ -50,7 +50,7 @@ export const FEATURE_MATURITY = {
     decide: 'beta', 'ax-screen': 'beta', 'decide-recipe': 'beta', signals: 'beta',
     loops: 'beta', buzz: 'beta', harness: 'stable', self: 'beta', factcheck: 'beta',
     provider: 'stable', 'provider:set': 'beta', 'provider:restore': 'beta',
-    'provider:rotate': 'beta', 'provider:use': 'beta', 'status-bar': 'beta',
+    'provider:rotate': 'beta', 'provider:use': 'beta', 'status-bar': 'beta', statusline: 'beta',
     schedule: 'beta', guardian: 'beta', intake: 'beta', logs: 'stable', retro: 'beta', ad: 'beta', docs: 'beta', secret: 'beta',
     decisions: 'beta', directives: 'beta', claims: 'beta', lesson: 'beta', fleet: 'beta', ops: 'stable', outputs: 'beta', publish: 'beta', cred: 'beta', credentials: 'beta',
     env: 'beta', 'agent-mission': 'beta', mission: 'beta', dev: 'beta', keys: 'beta', finance: 'beta',

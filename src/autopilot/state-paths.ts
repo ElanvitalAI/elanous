@@ -21,8 +21,9 @@ export function elanousStateRoot(): string {
   // ⚠️ env 값도 **리졸버를 거쳐 정규화**한다 — 여기서만 raw 로 돌려주면 상대경로·후행 슬래시에서
   //    config-dir(정규화됨)과 두 축이 실제로 갈라진다(이 트랙의 근본과 같은 결함).
   try {
-    const { effectiveInstanceRoot } = require('../instance/resolve.js') as typeof import('../instance/resolve.js');
-    return effectiveInstanceRoot();
+    // 운영 config override ⊕ 격리 스탬프면 state 는 스탬프로 간다(RESEARCH-HARNESS-ISOLATION-STATE-DIR).
+    const { effectiveStateRoot } = require('../instance/resolve.js') as typeof import('../instance/resolve.js');
+    return effectiveStateRoot();
   } catch (e) {
     // ⚠️ 조용한 prod 폴백은 '격리 해석 실패 → 운영을 만짐' 이라는 fail-open 경로다.
     //    부팅 불침몰은 유지하되 **반드시 관측을 남긴다**(제1원칙).

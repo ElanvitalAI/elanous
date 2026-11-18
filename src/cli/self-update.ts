@@ -561,9 +561,10 @@ export function procStatHoldsNothing(stat: string): boolean {
 
 type ProcessListing = () => { status: number | null; stdout: string; stderr: string; error?: Error };
 type ProcessScan = (pid: string) => { status: number | null; stdout: string; stderr: string; error?: Error };
+type ProcessState = (pid: string) => { status: number | null; stdout: string; stderr: string; error?: Error };
 
 /** Inspect live cwd and executable references before deleting any candidate; an unavailable scan must not authorize deletion. */
-function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProcesses: ProcessListing = () => spawnSync('ps', ['-axww', '-o', 'pid=,uid=,args='], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER }), scanProcess?: ProcessScan): VersionPruneOutcome {
+function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProcesses: ProcessListing = () => spawnSync('ps', ['-axww', '-o', 'pid=,uid=,args='], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER }), scanProcess?: ProcessScan, processState?: ProcessState): VersionPruneOutcome {
   if (!outcome.removed.length) return outcome;
   const probe = scanProcess ?? ((pid: string) => spawnSync('lsof', ['-nP', '-F', 'pfn', '-p', pid], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER }));
   const candidates = outcome.removed.map((name) => ({ name, path: realpathSync(join(dir, name)) }));
@@ -625,7 +626,7 @@ function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProc
       const listing = listProcesses();
       const rows = listing.stdout.trim().split('\n').filter(Boolean);
       const parsed = rows.map((row) => /^\s*(\d+)\s+(-?\d+)(?:\s+(.*?))?\s*$/.exec(row));
-      if (listing.error || listing.status !== 0 || !rows.length || parsed.some((match) => !match)) {
+      if (listing.error || listing.status !== 0 || !listing.stdout.trim() || parsed.some((match) => !match)) {
         scanError = `lsof scope incomplete (ps unavailable: ${listing.error?.message || listing.stderr.trim() || listing.status})`;
       } else {
         const sections = new Map<string, string>();
@@ -653,13 +654,18 @@ function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProc
         for (const match of parsed) {
           const id = match![1]!;
           // Compare against the complete ps list; lsof may omit even our own UID.
+          // An injected scan is the test stand-in for that own-UID probe only.
+          // Other UIDs stay argv-only — never a per-process lsof of every UID.
           if (Number(match![2]) !== process.getuid?.()) { otherUid(id, match![3]); continue; }
-          if (complete(sections.get(id) ?? '')) continue;
-          const state = spawnSync('ps', ['-p', id, '-o', 'stat='], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER });
+          if (!scanProcess && complete(sections.get(id) ?? '')) continue;
+          const state = (processState ?? ((pid: string) => spawnSync('ps', ['-p', pid, '-o', 'stat='], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER })))(id);
           if (state.error || (state.status !== 0 && state.status !== 1) || (state.status === 0 && !state.stdout.trim())) {
             scanError = `lsof scope incomplete (pid=${id} state unavailable: ${state.error?.message || state.stderr?.trim() || state.status})`;
             break;
           }
+          // A zombie has no cwd or executable. Only ps stat Z proves that; a parenthesized
+          // name is also how macOS prints a live process whose arguments could not be read.
+          if (state.stdout.trim().startsWith('Z')) continue;
           if (state.status === 1) {
             // ps can fail to show another UID as well as a process that exited.
             // Only ESRCH proves the latter; EPERM/unknown must hold candidates.
@@ -672,7 +678,6 @@ function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProc
             scanError = `lsof scope incomplete (pid=${id} still alive but ps unavailable)`;
             break;
           }
-          if (state.stdout.trim().startsWith('Z')) continue;
           const scan = probe(id);
           if (scan.error || scan.status !== 0 || !scan.stdout.startsWith(`p${id}\n`) || !complete(scan.stdout)) {
             scanError = `lsof scope incomplete (pid=${id} cwd/executable unavailable: ${scan.error?.message || scan.stderr?.trim() || scan.status})`;
@@ -702,11 +707,11 @@ function pruneUnusedVersions(dir: string, outcome: VersionPruneOutcome, listProc
   return { ...outcome, removed, kept };
 }
 
-export function defaultPruneVersions(plan: { current: string; daemonSha: string; keep: number }, dir: string = VERSIONS_DIR(), listProcesses?: ProcessListing, scanProcess?: ProcessScan): VersionPruneOutcome {
+export function defaultPruneVersions(plan: { current: string; daemonSha: string; keep: number }, dir: string = VERSIONS_DIR(), listProcesses?: ProcessListing, scanProcess?: ProcessScan, processState?: ProcessState): VersionPruneOutcome {
   const entries = readdirSync(dir, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => ({ name: d.name, mtimeMs: statSync(join(dir, d.name)).mtimeMs }));
-  return pruneUnusedVersions(dir, planVersionPrune(entries, plan.current, plan.daemonSha, plan.keep), listProcesses, scanProcess);
+  return pruneUnusedVersions(dir, planVersionPrune(entries, plan.current, plan.daemonSha, plan.keep), listProcesses, scanProcess, processState);
 }
 
 /**
@@ -1238,6 +1243,27 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
     if (dirty.status !== 0) return reject(dirty.status === 1 ? '추적 파일 변경: 체크아웃이 더러움' : `git diff 실패: ${dirty.stderr}`);
 
     if (options.dev) {
+      if (!options.skipPwaBuild && !existsSync(join(checkout, 'apps/pwa/out/index.html'))) {
+        const commit = head.stdout.trim().slice(0, 12);
+        const started = Date.now();
+        let ok = false;
+        let tail = '';
+        try {
+          const build = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 15 * 60_000 });
+          ok = build.status === 0;
+          const output = build.stderr?.trim() || build.stdout?.trim() || '';
+          tail = ok ? output.split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim().slice(0, 500) ?? '' : selfUpdateOutputTail(output);
+        } catch (error) {
+          tail = selfUpdateOutputTail(String(error));
+        }
+        try {
+          debug.log('self-update', 'pwa-build', { ok, commit, ms: Date.now() - started, rail: 'dev' });
+          if (!ok) debug.log('self-update', 'build-failed', { stage: 'pwa-build', commit, tail: tail || '출력 없음' });
+        } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+        if (!ok || !existsSync(join(checkout, 'apps/pwa/out/index.html'))) {
+          return emit({ exitCode: 1, installedVersion: null, decision: null, restarted: false, reason: `PWA 빌드 실패: ${selfUpdateReasonTail(tail) || 'apps/pwa/out/index.html 없음'} — current 를 바꾸지 않음` });
+        }
+      }
       try {
         const installed = installDevBuild(checkout, head.stdout.trim(), { ...deps, runInstaller: () => run('bash', [join(checkout, 'scripts/install.sh'), '--no-modify-path', '--yes', ...(deps.installRoot ? ['--prefix', deps.installRoot] : [])], checkout) });
         return emit({

@@ -292,3 +292,44 @@ test('actual Bun runs the selected entry without its colliding test while retain
   expect(report.testReceipts?.[0]).toEqual(expect.objectContaining({ strategyId: 'fixture-check',
     passed: true, exitCode: 0, fileSha256: sha(target.content), selection: 'isolated-test-entry' }));
 });
+
+test('verify sets HOME and TMPDIR to the real path so an alias temp root can mkdtemp', async () => {
+  if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return;
+  const alias = mkdtempSync(join(tmpdir(), 'tmpdir-alias-'));
+  const real = realpathSync(alias);
+  if (alias === real) return;
+  roots.push(real);
+  const h = setup();
+  const grant = await h.host.reserve(h.grant.ownerId, h.grant.runId, h.grant.appSlug);
+  const probe = [
+    'import { mkdtempSync } from "node:fs";',
+    'import { tmpdir } from "node:os";',
+    'import { join } from "node:path";',
+    'const dir = mkdtempSync(join(tmpdir(), "p-"));',
+    'if (!dir.startsWith("/private/")) throw new Error("alias tmpdir");',
+  ].join('\n');
+  const host = createBuildExecution({ ...h.options, shell: undefined, scratchRoot: alias, sandboxProfile: undefined });
+  const report = await host.verify(grant, [{ path: 'probe.test.ts', content: probe }]);
+  expect(report.passed).toBe(true);
+  expect(report.diagnostic).not.toContain('EPERM');
+});
+
+test('alias scratch root gives verify, save, and load the same canonical verdict', async () => {
+  const alias = mkdtempSync(join(tmpdir(), 'scratch-alias-'));
+  const real = realpathSync(alias);
+  if (alias === real) return;
+  roots.push(real);
+  const h = setup();
+  const grant = await h.host.reserve(h.grant.ownerId, h.grant.runId, h.grant.appSlug);
+  const host = createBuildExecution({ ...h.options, scratchRoot: alias });
+  const files = [{ path: 'backend/main.ts', content: 'export const fetch = () => new Response("ok");' }];
+  const report = await host.verify(grant, files);
+  const saved = await host.save(grant, 'c'.repeat(64), files.map(file => ({ ...file, sha256: sha(file.content) })));
+  const loaded = await host.load(grant);
+  const checkpoint = join(real, 'checkpoints', sha(grant.ownerId), grant.runId, grant.appSlug, 'latest.json');
+  expect(report.passed).toBe(true);
+  expect(saved.files).toBe(1);
+  expect(loaded?.files).toEqual(files.map(file => ({ ...file, sha256: sha(file.content) })));
+  expect(existsSync(checkpoint)).toBe(true);
+  expect(existsSync(join(alias, 'checkpoints', sha(grant.ownerId), grant.runId, grant.appSlug, 'latest.json'))).toBe(true);
+});

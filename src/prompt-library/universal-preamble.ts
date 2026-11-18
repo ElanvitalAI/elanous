@@ -19,7 +19,9 @@
 // sandbox, conciseness, impl-discipline) move here as they're verified
 // surface-agnostic.
 
+import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, basename, dirname, relative, resolve as resolvePath } from 'node:path';
 import type { LLMMessage } from '../llm.js';
 import type { ModelFamily } from '../models/prompts.js';
@@ -506,6 +508,26 @@ export function loadProjectTree(cwd: string): ProjectTreeResult {
  *  root (in which case `cwd` itself is treated as root). Mirrors
  *  ref/codex's `agents_md_paths` walk in `core/src/agents_md.rs:213`
  *  with the default `project_root_markers = ['.git']`. */
+/** git 밖 자리의 0바이트 `AGENTS.md` 대체. 자리로 감지될 때만 베어 저장소 `origin/main:AGENTS.md` 를 읽는다.
+ *  읽기 실패·자리 아님·내용 있는 파일은 null — 호출부는 디스크의 빈 파일을 그대로 둔다. */
+let repositoryAgentsShowForTest: ((repo: string) => string) | null = null;
+export function setRepositoryAgentsShowForTest(show: ((repo: string) => string) | null): void {
+  repositoryAgentsShowForTest = show;
+}
+export function repositoryAgentsFallback(cwd: string, deps: { home?: string; show?: (repo: string) => string } = {}): string | null {
+  if (!/\/seats\/[A-Za-z][A-Za-z0-9_-]{0,63}(?:\/|$)/.test(cwd)) return null;
+  const repo = join(deps.home ?? homedir(), 'elanous-hq', 'repo.git');
+  try {
+    const show = deps.show ?? repositoryAgentsShowForTest ?? ((bare: string) => execFileSync('git', ['--git-dir', bare, 'show', 'origin/main:AGENTS.md'], {
+      encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+    }));
+    const text = show(repo);
+    return text.trim().length > 0 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
 function findProjectRoot(cwd: string): string {
   let dir = cwd;
   for (;;) {
@@ -586,6 +608,10 @@ export function loadProjectAnchorWithMeta(cwd: string): ProjectAnchorResult {
     try {
       const raw = readFileSync(path, 'utf8');
       projectAnchorReadObserverForTest?.(path);
+      if (basename(path) === 'AGENTS.md' && raw.trim().length === 0) {
+        const fallback = repositoryAgentsFallback(cwd);
+        if (fallback) return fallback;
+      }
       return raw;
     } catch {
       return null;

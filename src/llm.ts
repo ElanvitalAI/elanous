@@ -2,6 +2,7 @@
 // Unified streaming interface for Grok (xAI), OpenAI, Anthropic, Local (OpenAI-compatible).
 // Auto-routes based on model name prefix, or picks the first available provider.
 
+import { modelOrchestrationCore } from './model-tier/model-orchestration.js';
 import type { LLMToolSpec } from './llm/tool-spec.js';
 import { textOnly } from './llm/stream-text.js';
 import { resolveModelProfile, type ModelProfile } from './llm-model-profiles.js';
@@ -32,7 +33,8 @@ import {
   getGeminiApiKey, GEMINI_MODEL,
   DEFAULT_PROVIDER,
 } from './config.js';
-import { debug, redactSecrets, redactSecretText } from './debug/log.js';
+import { debug, getAmbientSessionId, redactSecrets, redactSecretText } from './debug/log.js';
+import { llmObserveSend, withLlmCallContext } from './session-runtime/llm-call-gateway.js';
 import { estimateMessagesTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
 import { codexAccountReadStorePath } from './oauth/codex-owner-mirror.js';
@@ -67,12 +69,13 @@ import { isShapeRelevantRejection, summarizeCodexRequestShape } from './llm-requ
 import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from './llm/bedrock-provider.js';
 import { HarmonyChannelFilter, type HarmonyToolCall } from './llm/wire/harmony.js';
 import { OPEN_WEIGHT_TOOL_DISCIPLINE } from './llm/open-weight-discipline.js';
-import { makeZaiCodingPlanProvider, zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
+import { makeZaiCodingPlanProvider, ZAI_CREDENTIAL_MISSING_REASON, zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
 import { makeHqProxyProvider } from './llm/hq-proxy-provider.js';
 import { isOpenRouterDeepSeekWireModel, nonEmptyReasoningDetails, openRouterDeepSeekCatalogEffort, openRouterDeepSeekEffort, openRouterDeepSeekRequestExtras, openRouterNeedsKimiToolSchema } from './llm/openrouter-deepseek.js';
 import { resolveModelAlias } from './intelligence-map/model-alias.js';
 import { BUILTIN_CATALOG, reasoningEffortCeiling as reasoningEffortCeilingOf } from './intelligence-map/model-catalog.js';
 import { inferProviderFromModel as registryInferProviderFromModel } from './registry/normalize.js';
+import { isOpenRouterNativeModelId } from './llm/runtime-model-family.js';
 import { closestMatches } from './tool-name-suggest.js';
 import { createProviderToolNameMap } from './llm-tool-name.js';
 import { assertNoTopLevelToolSchemaCombinators, isOpenRouterGrokModel, sanitizeToolSchemaForGrok } from './llm-tool-schema.js';
@@ -437,6 +440,8 @@ export interface LLMOpts {
   usageJobKind?: string;
   /** Optional streamLLM usage-ledger site override (defaults to "stream-llm"). */
   usageSite?: string;
+  /** Source of the model actually sent (observation only; never changes routing). */
+  llmCallSelectionSource?: import('./session-runtime/llm-call-gateway.js').LlmCallSelectionSource;
   /**
    * ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — ***턴 «안»으로 들어오는 사용자 발화의 배수구.***
    *
@@ -953,12 +958,15 @@ export async function* parseOpenAISSELines(
     // The final chunk (when stream_options.include_usage:true is set)
     // carries `usage` alongside an empty `choices` array or no
     // choices at all. Extract before the choice-required path below.
+    // ⭐ 1121 RESEARCH-OBSERVATION — Z.ai(GLM) puts `finish_reason` and `usage` in the SAME final chunk. Report the stop
+    //   reason first so the caller stamps it onto this usage event; otherwise the caller later emits a token-less
+    //   `{stopReason}` usage event and a last-wins consumer (the Z.ai ledger) recorded input/output 0.
+    const choice = parsed.choices?.[0];
+    if (choice && typeof choice.finish_reason === 'string') parseOpts.onStopReason?.(choice.finish_reason);
     const usage = parseOpenAIUsage(parsed);
     if (usage) yield { type: 'usage', usage };
 
-    const choice = parsed.choices?.[0];
     if (!choice) continue;
-    if (typeof choice.finish_reason === 'string') parseOpts.onStopReason?.(choice.finish_reason);
 
     const textDelta = choice.delta?.content;
     if (textDelta) {
@@ -1205,8 +1213,12 @@ async function* streamOpenAIEvents(
       body: JSON.stringify({ ...body, stream: true }),
       signal,
     },
-    retryOptsFor(inferOpenAIProviderName(url), 'LLM API', remainingFallbacks,
-      headerTimeoutMs ?? (typeof body?.model === 'string' ? profileTimeoutMs(body.model, 'header_s') : undefined)),
+    {
+      ...retryOptsFor(inferOpenAIProviderName(url), 'LLM API', remainingFallbacks,
+        headerTimeoutMs ?? (typeof body?.model === 'string' ? profileTimeoutMs(body.model, 'header_s') : undefined)),
+      callContext: { model: typeof body?.model === 'string' ? body.model : undefined,
+        ...(inferOpenAIProviderName(url) === 'grok' && extraHeaders ? { billing: 'subscription' as const } : {}) },
+    },
   );
 
   debug.log('llm.response.status', `${response.status} ${response.statusText || ''}`.trim(), {
@@ -2190,7 +2202,7 @@ export async function* streamCodexResponsesEvents(
       body: wireJson,
       signal,
     },
-    retryOptsFor('codex', 'Codex API', extra.remainingFallbacks),
+    { ...retryOptsFor('codex', 'Codex API', extra.remainingFallbacks), callContext: { model: body.model, billing: 'subscription' } },
   ).catch((err: unknown) => {
     observeCodexRequestRejection(err, wireBody, wireJson);
     throw err;
@@ -2997,11 +3009,13 @@ export async function* streamGeminiEvents(
   // duck-type the chunk fields below (candidates / parts / usage).
   let stream: AsyncIterable<unknown>;
   try {
-    stream = await client.models.generateContentStream({
-      model: body.model,
-      contents: body.contents,
-      config,
-    });
+    stream = await llmObserveSend('https://generativelanguage.googleapis.com',
+      { provider: 'gemini', model: body.model, billing: 'apikey' },
+      () => client.models.generateContentStream({
+        model: body.model,
+        contents: body.contents,
+        config,
+      }));
   } catch (err) {
     // Dual-emit: keep llm.response.status for backward-compat dashboards,
     // add llm.response.error so a `grep llm.response.error` finds gemini
@@ -3296,7 +3310,7 @@ async function* streamAnthropicEvents(
       body: JSON.stringify({ ...body, stream: true }),
       signal,
     },
-    retryOptsFor('anthropic', 'Anthropic API', remainingFallbacks),
+    { ...retryOptsFor('anthropic', 'Anthropic API', remainingFallbacks), callContext: { model: body.model } },
   );
 
   try {
@@ -4865,7 +4879,11 @@ async function consumeProviderText(
       }
       const waitMs = Math.max(1, Math.min(receivedToken ? idleMs : firstTokenRemainingMs, remainingMs));
       step = await Promise.race([
-        iterator.next().then((result) => ({ idle: false as const, result })),
+        withLlmCallContext({
+          provider: provider.name, model: opts.model ?? provider.defaultModel,
+          sessionId: opts.sessionId, requestedBy: opts.usageSite ?? 'stream-llm',
+          selectionSource: opts.llmCallSelectionSource ?? (opts.sessionId ? 'session' : 'config'),
+        }, () => iterator.next()).then((result) => ({ idle: false as const, result })),
         new Promise<{ idle: true }>((resolve) => {
           idleTimer = setTimeout(() => resolve({ idle: true }), waitMs);
         }),
@@ -5003,7 +5021,10 @@ export async function streamLLM(
     if (!opts.usageRole) debug.log('llm.role', 'outside-role', {
       provider: activeProvider.name, model: activeModel, site: opts.usageSite ?? 'stream-llm',
     }, { level: 'warn' });
-    const effectiveOpts = { ...opts, ...(maxTokens !== undefined ? { maxTokens } : {}) };
+    const effectiveOpts = { ...opts, ...(maxTokens !== undefined ? { maxTokens } : {}),
+      llmCallSelectionSource: opts.llmCallSelectionSource ?? (modelOverride === undefined && attemptedProviders.size > 1 ? 'fallback'
+        : opts.preferExplicitProvider || opts.initialProvider || opts.sessionId ? 'session'
+        : opts.provider || opts.model ? 'explicit' : 'config') as import('./session-runtime/llm-call-gateway.js').LlmCallSelectionSource };
     debug.log('llm.router', 'streamLLM', {
       provider: activeProvider.name,
       model: activeModel,
@@ -5023,7 +5044,9 @@ export async function streamLLM(
         ...effectiveOpts,
         model: activeModel,
         maxTokens,
-        maxTokensExplicit: opts.maxTokensExplicit ?? opts.maxTokens !== undefined,
+        // Provider layer: any caller-passed number is a cap (no in-provider continuation) — a role default marked
+        // `maxTokensExplicit: false` continues once at THIS layer only, never twice (#38293 review r1).
+        maxTokensExplicit: opts.maxTokens !== undefined || opts.maxTokensExplicit === true,
         remainingFallbacks: opts.provider ? 0 : remainingFallbackProviderNames(attemptedProviders, opts).length,
       },
       onChunk,
@@ -5031,14 +5054,21 @@ export async function streamLLM(
       totalMs,
     );
     let full = consumed.full;
-    if (consumed.ok && consumed.finishReason === 'length' && full.length > 0 && !opts.signal?.aborted) {
+    // #36714 contract: a CALLER output cap bounds the whole logical request — only a role default (no caller cap, or one
+    // marked `maxTokensExplicit: false` by its source, e.g. session chat) continues once. #36838 had dropped this gate.
+    const lengthCut = consumed.ok && consumed.finishReason === 'length' && full.length > 0 && !opts.signal?.aborted;
+    if (lengthCut && !allowAutomaticContinuation(opts)) {
+      // Not silent: the caller still receives finishReason 'length' (onFinishReason below) and this event records the stop.
+      debug.log('llm', 'output-limit-stopped', { provider: activeProvider.name, model: activeModel, maxTokens: effectiveOpts.maxTokens, chars: full.length, reason: 'caller-cap' });
+    }
+    if (consumed.ok && lengthCut && allowAutomaticContinuation(opts)) {
       debug.log('llm', 'output-limit-continue', { provider: activeProvider.name, model: activeModel, maxTokens: effectiveOpts.maxTokens, firstChars: full.length });
       const prefix = full;
       const continued = await consumeProviderText(activeProvider, [
         ...messages,
         { role: 'assistant', content: prefix },
         { role: 'user', content: 'Continue exactly where you stopped. Complete the answer without repeating earlier text.' },
-      ], { ...effectiveOpts, model: activeModel, remainingFallbacks: 0 }, (delta, retryFull) => onChunk(delta, prefix + retryFull), totalDeadlineAt, totalMs);
+      ], { ...effectiveOpts, model: activeModel, remainingFallbacks: 0, maxTokensExplicit: true }, (delta, retryFull) => onChunk(delta, prefix + retryFull), totalDeadlineAt, totalMs);
       // The continuation callback must retain the full combined text for streaming clients.
       if (continued.ok) {
         full = prefix + continued.full;
@@ -5053,7 +5083,7 @@ export async function streamLLM(
       await recordChildFirstLlmResponse({ status: 'ok' });
       if (consumed.usage !== 'unmeasured') {
         try {
-          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind });
+          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind, ...(opts.sessionId ? { sessionId: opts.sessionId } : {}) });
         } catch { /* best-effort observation */ }
       }
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', finishReason: consumed.finishReason ?? null, durationMs: Date.now() - started });
@@ -8389,19 +8419,24 @@ export function billingRouteForProvider(provider: string | undefined, model: str
 }
 
 /** Observe usage with optional site/role metadata; a provider-name string remains supported. */
-export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole; phase?: string; jobKind?: string }): void {
+export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole; phase?: string; jobKind?: string; sessionId?: string }): void {
   try {
     const providerName = typeof providerNameOrOptions === 'string' ? providerNameOrOptions : providerNameOrOptions?.providerName;
     const site = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.site) ?? 'agent-turn';
     const role = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.role;
     const phase = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.phase;
     const jobKind = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.jobKind;
+    // O4 — the chat session this call served, so `eln usage cache --session` can join per-call cache
+    //   tokens even on paths that run outside an ambient session scope (logs.db session_id column).
+    const sessionId = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.sessionId)
+      ?? getAmbientSessionId() ?? undefined;
     const billing = billingRouteForProvider(providerName, model);
     debug.log('llm.usage', 'llm-usage', {
       site,
       ...(role !== undefined ? { role } : {}),
       ...(phase !== undefined ? { phase } : {}),
       ...(jobKind !== undefined ? { jobKind } : {}),
+      ...(sessionId ? { sessionId } : {}),
       model,
       ...(usage.provider !== undefined && { provider: usage.provider }),
       // ⭐ `provider` 는 «선 어댑터»(openai/anthropic)다 — 과금 주체는 별칭 칸으로(BACKLOG B10).
@@ -8412,6 +8447,8 @@ export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOr
       ...(usage.cacheReadInputTokens !== undefined && { cacheReadInputTokens: usage.cacheReadInputTokens }),
       ...(usage.cacheCreationInputTokens !== undefined && { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
       ...llmUsageCostFields(model, usage, undefined, billing),
+      // ⭐ 모델 오케스트레이션 코어 — 호출마다 {등급·계기}(토큰·비용·계정은 위 칸). 문면 0 · 사다리에 없으면 칸 없음.
+      ...(() => { try { return modelOrchestrationCore().callFields({ provider: providerName, model }); } catch { return {}; } })(),
     });
     if (usage.stopReason !== undefined) debug.log('llm.request', 'completed', {
       model, provider: providerName ?? usage.provider ?? null, site, stopReason: usage.stopReason,
@@ -9168,7 +9205,9 @@ export async function streamLLMWithTools(
         ...opts,
         model: activeModel,
         maxTokens: requestMaxTokens(activeProvider, activeModel, opts),
-        maxTokensExplicit: opts.maxTokensExplicit ?? opts.maxTokens !== undefined,
+        // Provider layer: any caller-passed number is a cap (no in-provider continuation) — a role default marked
+        // `maxTokensExplicit: false` continues once at THIS layer only, never twice (#38293 review r1).
+        maxTokensExplicit: opts.maxTokens !== undefined || opts.maxTokensExplicit === true,
         tools: completionNeedsFinalTurn && !keepToolsNoCall
           ? []
           : turn === 0 && opts.firstTurnTools ? opts.firstTurnTools : activeTools,
@@ -9327,7 +9366,13 @@ export async function streamLLMWithTools(
         if (!sawFirstToken && phaseTimeoutMs <= 0) throw new StreamIdleTimeoutError(firstTokenTimeoutMs);
         const waitMs = Math.max(1, Math.min(phaseTimeoutMs, remainingMs));
         step = await Promise.race([
-          streamIter.next().then((r) => ({ idle: false as const, r })),
+          withLlmCallContext({
+            provider: activeProvider.name, model: activeModel, sessionId: opts.sessionId,
+            requestedProvider: provider.name, requestedModel: opts.model ?? provider.defaultModel,
+            requestedBy: opts.usageSite ?? 'stream-llm-with-tools',
+            selectionSource: opts.llmCallSelectionSource ?? (activeProvider.name !== provider.name ? 'fallback'
+              : opts.initialProvider || opts.sessionId ? 'session' : opts.provider || opts.model ? 'explicit' : 'config'),
+          }, () => streamIter!.next()).then((r) => ({ idle: false as const, r })),
           new Promise<{ idle: true }>((res) => { idleTimer = setTimeout(() => res({ idle: true }), waitMs); }),
         ]);
         if (step.idle) {
@@ -9344,6 +9389,14 @@ export async function streamLLMWithTools(
         if (err instanceof RequestSizeLimitError) throw err;
         if (err instanceof StreamTotalTimeoutError) {
           debug.log('llm.stream', 'total-timeout', { provider: activeProvider.name, model: activeModel, turn, totalMs: err.totalMs }, { level: 'warn' });
+          // Same detached cleanup as the idle-timeout path below: the race win leaves a
+          // pending next() on the provider iterator. At the 1800s boundary a half-closed
+          // provider socket (A207: GLM stalls at ≈1790-1805s) keeps that abandoned read
+          // alive, so the throw alone never reaches the caller. return() detaches it.
+          const timedOutIterator = streamIter;
+          if (timedOutIterator?.return) {
+            try { void Promise.resolve(timedOutIterator.return(undefined)).catch(() => {}); } catch { /* fail-soft cleanup */ }
+          }
           try { handlers.onStatus?.(`${activeProvider.name} 응답 시간 상한 초과`); } catch { /* status is fail-soft */ }
           throw err;
         }
@@ -9399,7 +9452,16 @@ export async function streamLLMWithTools(
             debug.log('llm.stream', 'idle-timeout-pinned-partial-preserved', { turn, evCount, lastEvType, textChars: turnText.length }, { level: 'warn' });
             break;
           }
-          if (opts.provider) throw err;
+          // A207 — a pinned provider has nowhere to fall back, so this throw is the
+          // stop path. Say Blocked before it leaves, same as the unpinned terminal.
+          if (opts.provider) {
+            try { handlers.onStatus?.('⏸ Blocked · 스트림 무진행'); } catch { /* status is fail-soft */ }
+            debug.log('llm.stream', 'idle-timeout-blocked', {
+              provider: activeProvider.name, model: activeModel, turn, retries: streamIdleTimeoutRetries,
+              action: 'stop',
+            }, { level: 'warn' });
+            throw err;
+          }
           rewindDisconnectedStream();
           streamIter = undefined;
         }
@@ -9423,14 +9485,15 @@ export async function streamLLMWithTools(
             activeProvider = finalized.provider;
             activeModel = finalized.model;
             attemptedProviders.add(activeProvider.name);
-            streamDisconnectRetries = 0;
-            streamIdleTimeoutRetries = 0;
-            turnOpts = buildTurnOpts();
-            streamIter = undefined;
-            continue;
-          }
-        }
-        if (!(err instanceof StreamIdleTimeoutError) && evCount > 0 && isStreamDisconnectRetryable(err, pendingCalls.length, streamEmittedImage) && !opts.signal?.aborted) {
+        streamDisconnectRetries = 0;
+        // A207 — the one no-progress retry is per turn, not per provider. Resetting it here
+        // re-announces «재시도 1/1» on every fallback while the stream is still dead.
+        turnOpts = buildTurnOpts();
+        streamIter = undefined;
+        continue;
+      }
+    }
+    if (!(err instanceof StreamIdleTimeoutError) && evCount > 0 && isStreamDisconnectRetryable(err, pendingCalls.length, streamEmittedImage) && !opts.signal?.aborted) {
           const retryData = {
             provider: activeProvider.name,
             model: activeModel,
@@ -9489,6 +9552,16 @@ export async function streamLLMWithTools(
             category: terminal.category,
             reason: terminal.reason,
           }, { level: 'error' });
+          // A207 — no provider left after the one no-progress retry. Say Blocked before either
+          // terminal throw (stop rethrows err; exhaust wraps it), so the turn stops instead of
+          // sitting on a dead stream.
+          if (err instanceof StreamIdleTimeoutError) {
+            try { handlers.onStatus?.('⏸ Blocked · 스트림 무진행'); } catch { /* status is fail-soft */ }
+            debug.log('llm.stream', 'idle-timeout-blocked', {
+              provider: activeProvider.name, model: activeModel, turn, retries: streamIdleTimeoutRetries,
+              action: terminal.action,
+            }, { level: 'warn' });
+          }
           if (terminal.action === 'stop') throw err;
           throw new ProviderFallbackError(terminal, err);
         }
@@ -9508,7 +9581,8 @@ export async function streamLLMWithTools(
         attemptedProviders.add(activeProvider.name);
         // 재시도 상한은 «공급자마다» — 넘어간 공급자도 스트림 도중 끊김이면 다시 5회까지 건다.
         streamDisconnectRetries = 0;
-        streamIdleTimeoutRetries = 0;
+        // A207 — keep the spent no-progress retry across the fallback. A fresh provider still
+        // gets its own disconnect retries; it does not get another silent-stream retry.
         turnOpts = buildTurnOpts();
         streamIter = undefined;
         continue;
@@ -9618,7 +9692,7 @@ export async function streamLLMWithTools(
         // ⭐ 주 에이전트 턴의 토큰·비용을 «게이트 없이» 남긴다(2026-09-24 실측: 이 줄이 없어 3시간 `llm.usage`
         //   18행이 전부 곁가지 두 자리였고, 하니스 런 비용의 거의 전부가 관측 밖이었다). 곁가지와 같은 모양 ·
         //   모르는 모델은 금액 대신 `cost.kind='unknown'`. runId 는 debug.log 가 붙인다. 실패해도 턴은 계속.
-        logAgentTurnUsage(activeModel, ev.usage, { providerName: activeProvider.name, role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind });
+        logAgentTurnUsage(activeModel, ev.usage, { providerName: activeProvider.name, role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind, ...(opts.sessionId ? { sessionId: opts.sessionId } : {}) });
         // Wave A1 (2026-05-04) — turn-level cache hit rate forensic.
         // Each provider's usage event carries inputTokens / outputTokens
         // / cacheReadInputTokens (when cache hit). Emit the per-turn
@@ -9720,7 +9794,14 @@ export async function streamLLMWithTools(
       if (turn >= maxTurns) break;
       continue;
     }
-    if (pendingCalls.length === 0 && turnFinishReason === 'length' && turnText.length > 0 && !lengthContinuationUsed && !opts.signal?.aborted) {
+    // #36714 contract (see streamLLM): a CALLER output cap gets no automatic continuation; a role default does, once.
+    const turnLengthCut = pendingCalls.length === 0 && turnFinishReason === 'length' && turnText.length > 0 && !lengthContinuationUsed
+      && !opts.signal?.aborted;
+    if (turnLengthCut && !allowAutomaticContinuation(opts)) {
+      // Not silent: onFinishReason already carried 'length' for this turn; this event records why it was not continued.
+      debug.log('llm.stream', 'output-limit-stopped', { provider: activeProvider.name, model: activeModel, turn, maxTokens: turnOpts.maxTokens ?? null, reason: 'caller-cap' });
+    }
+    if (turnLengthCut && allowAutomaticContinuation(opts)) {
       lengthContinuationUsed = true;
       lengthContinuationNeeded = true;
       history.push({ role: 'assistant', content: turnText });
@@ -12906,6 +12987,9 @@ export function inferProviderFromModel(model: string | undefined): string | null
 export function isModelCompatible(providerName: string, model: string | undefined): boolean {
   if (!model) return true;
   if (providerName === 'bedrock') return isBedrockCompatibleModel(model, inferProviderFromModel);
+  // OPENROUTER-CLAUDE(11-17) — `anthropic/claude-…`·`openai/gpt-…` 는 OpenRouter 원어 id 다. 접두가 다른 계열을
+  //   가리켜도 openrouter 가 명시됐으면 그대로 OpenRouter 로 보낸다(종전: anthropic 직결 재경로 → 401 · 1초 빈 done).
+  if (providerName === 'openrouter' && isOpenRouterNativeModelId(model)) return true;
   const implied = inferProviderFromModel(model);
   if (implied === null) return true;  // unknown prefix — let provider handle
   // openai-codex and openai accept each other's model families (gpt-*, codex-*).
@@ -12966,6 +13050,18 @@ export function resolveReviewModelAlias(model: string): string {
   return OPENROUTER_ROUTE_FOR_WIP_PROVIDER[resolved.toLowerCase() as keyof typeof OPENROUTER_ROUTE_FOR_WIP_PROVIDER] ?? resolved;
 }
 
+/** 교차 계열 재경로 때 «그 공급자 자신의» API 키(캐시 → env). 모르는 공급자는 undefined(키를 싣지 않는다). */
+function ownApiKeyForProvider(provider: string): string | undefined {
+  switch (provider) {
+    case 'anthropic': return getAnthropicApiKey();
+    case 'openai': return getOpenAIApiKey();
+    case 'gemini': return getGeminiApiKey();
+    case 'openrouter': return getOpenRouterApiKey();
+    case 'opengateway': return getOpenGatewayApiKey();
+    default: return undefined;
+  }
+}
+
 /** Top-level resolver. Honors user-config first; falls through to
  *  env-var / auto-detect when provider is 'auto'. */
 export function getProviderForConfig(
@@ -12990,7 +13086,9 @@ export function getProviderForConfig(
   const direct = OPENROUTER_ROUTE_FOR_WIP_PROVIDER[provider as keyof typeof OPENROUTER_ROUTE_FOR_WIP_PROVIDER];
   if (direct) {
     throw new Error(
-      `${provider} 직결 provider 는 아직 배선되지 않았다 — OpenRouter 로 쓰라: `
+      // TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — glm 은 «키가 없어서» 여기 온다. 이유를 앞에 싣는다(종전 안내는 뒤에 그대로).
+      `${provider === 'glm' ? `${ZAI_CREDENTIAL_MISSING_REASON} — ` : ''}`
+      + `${provider} 직결 provider 는 아직 배선되지 않았다 — OpenRouter 로 쓰라: `
       + `\`elanous config set llm.provider openrouter\` · \`elanous config set llm.model ${direct}\` `
       + `(키: \`bash scripts/add-api-key.sh OPENROUTER_API_KEY\`) · 또는 \`--role-llm <role>=openrouter[/<tier>]\``,
     );
@@ -13026,10 +13124,13 @@ export function getProviderForConfig(
     throw new Error(`unknown provider: ${resolvedProviderName}`);
   }
   const crossFamilyModel = (model || userConfig.llm.model) && resolvedProviderName !== provider;
+  let foreignKeyDropped = false;
   if (crossFamilyModel) {
     const key = userConfig.llm.apiKey || '';
     const keyImplies = key.startsWith('sk-ant')
       ? 'anthropic'
+      : key.startsWith('sk-or-')
+        ? 'openrouter'
       : key.startsWith('xai-')
         ? 'grok'
         : key.startsWith('sk-')
@@ -13048,8 +13149,17 @@ export function getProviderForConfig(
       keyImplies,
       keyMismatch,
     }, { level: 'info' });
+    foreignKeyDropped = keyMismatch;
   }
   const llm = { ...userConfig.llm, provider: resolvedProviderName, model: decision.model };
+  // OPENROUTER-CLAUDE(11-17) — 다른 계열로 바뀌었는데 config 키가 원래 공급자 것이면 «가져가지 않는다».
+  //   🩸 종전엔 OpenRouter 키가 그대로 api.anthropic.com 에 실렸다(401 invalid x-api-key · 키가 다른 회사로 나감).
+  //   새 공급자는 자기 자격(캐시·env)으로 푼다 — 없으면 그 공급자의 «키 없음» 오류가 시끄럽게 난다.
+  if (foreignKeyDropped) {
+    const ownKey = ownApiKeyForProvider(resolvedProviderName);
+    if (ownKey) llm.apiKey = ownKey;
+    else delete llm.apiKey;
+  }
   switch (resolvedProviderName) {
     case 'grok':
       return makeOpenAICompatProvider('grok', GROK_MODEL, GROK_API_URL, llm);
@@ -13101,6 +13211,10 @@ export async function getProviderForConfigAsync(
   onSecretStoreCredential?: () => void,
 ): Promise<LLMProvider> {
   if (testFakeLlmDefaultSelected()) return testFakeLlmProvider;
+  // TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — `glm` 은 isKnownProviderName 밖이라 아래 finalize 가
+  //   «unknown provider "glm"» 으로 던졌다(REPL 턴 = session/chat.ts runTurn 이 이 길) → TUI 0초 실패.
+  //   glm 의 자격(키 캐시 ~/.cache/zai_api_key → env ZAI_API_KEY)·코딩 엔드포인트는 동기 해석기가 고른다.
+  if (userConfig.llm.provider === 'glm') return getProviderForConfig(userConfig, model);
   const { resolveProviderCredentialAsync } = await import('./llm/provider-credentials.js');
   const decision = finalizeProviderModelCompatibility(decideProviderForConfig(userConfig, model));
   let target = decision.provider.startsWith('auto:')

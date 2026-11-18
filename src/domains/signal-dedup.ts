@@ -16,6 +16,7 @@
 // 확신 있을 때만·속보 유실 방지가 우선).
 
 import { tierModel } from '../llm/model-defaults.js';
+import { llmNetworkFetch } from '../session-runtime/llm-call-gateway.js';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -105,12 +106,13 @@ export async function llmOnce(prompt: string): Promise<string | null> {
   const xaiKey = process.env.XAI_API_KEY || skillEnv().XAI_API_KEY || '';
   if (xaiKey) {
     try {
-      const res = await fetch('https://api.x.ai/v1/chat/completions', {
+      const model = tierModel('budget', 'grok');
+      const res = await llmNetworkFetch('https://api.x.ai/v1/chat/completions', {
         method: 'POST',
         headers: { Authorization: `Bearer ${xaiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: tierModel('budget', 'grok'), temperature: 0, messages: [{ role: 'user', content: prompt }] }),
+        body: JSON.stringify({ model, temperature: 0, messages: [{ role: 'user', content: prompt }] }),
         signal: AbortSignal.timeout(30_000),
-      });
+      }, { provider: 'grok', model, role: 'aux', requestedBy: 'signal-dedup' });
       if (res.ok) {
         const d = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
         const c = d?.choices?.[0]?.message?.content;
@@ -130,12 +132,12 @@ export async function llmOnce(prompt: string): Promise<string | null> {
     const ids = (models?.data ?? []).map(m => m.id);
     if (!ids.length) return null;
     const model = ids.find(id => /gemma/i.test(id)) ?? ids[0];
-    const res = await fetch(`${base}/chat/completions`, {
+    const res = await llmNetworkFetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, temperature: 0, messages: [{ role: 'user', content: prompt }] }),
       signal: AbortSignal.timeout(120_000),
-    });
+    }, { provider: 'local', model, role: 'aux', requestedBy: 'signal-dedup', selectionSource: 'fallback' });
     if (!res.ok) return null;
     const d = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
     return d?.choices?.[0]?.message?.content ?? null;

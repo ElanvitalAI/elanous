@@ -59,3 +59,25 @@ export async function configForSessionProviderTurn(
     },
   };
 }
+
+/** HARNESS-CHILD-PROVIDER-PASSTHROUGH: the session's --provider/--model choice must reach every LLM
+ * call the session's REPL child makes — the main turn (goal-loop/research core path resolves the
+ * provider from user config, not from the per-turn cfg) and in-process Agent children — plus any
+ * harness/CLI child that process spawns. The existing per-run env override does exactly that:
+ * user-config resolves ELANOUS_LLM_PROVIDER/ELANOUS_LLM_MODEL with the matching credential.
+ */
+export interface SessionProviderChildEnv {
+  /** Env entries to add to the REPL child; empty when the session has no explicit choice. */
+  readonly env: Record<string, string>;
+  /** Identity of the choice the child was started with; a different key needs a fresh child. */
+  readonly key: string;
+}
+
+export function sessionProviderChildEnv(selection: SessionProviderSelection | undefined): SessionProviderChildEnv {
+  if (!selection) return { env: {}, key: '' };
+  const model = selection.model ?? PROVIDER_DEFAULT_MODEL[selection.provider];
+  return {
+    env: { ELANOUS_LLM_PROVIDER: selection.provider, ...(model ? { ELANOUS_LLM_MODEL: model } : {}) },
+    key: `${selection.provider}/${model ?? ''}`,
+  };
+}

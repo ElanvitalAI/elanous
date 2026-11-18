@@ -18,7 +18,9 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 //
 //   - Default 120s timeout, cap 600s — matches claude-code's
 //     `DEFAULT_TIMEOUT_MS` / `MAX_TIMEOUT_MS`. Skill frontmatter can
-//     override within the cap.
+//     override within the cap. A201: the values live in
+//     src/tool-runtime/shell-watchdog.ts (shared with RunShell) together
+//     with the no-output stall line (내부 문서 `ELN-STEER-AND-TOOL-WATCHDOG`).
 //
 //   - Output cap 200KB. If exceeded, keep head + tail with a truncation
 //     marker so the model can still reason about shape of output
@@ -38,7 +40,12 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 
 import { spawn } from 'node:child_process';
 
+import { debug } from '../../debug/log.js';
 import { harnessCommandWriteReject, notifyHarnessCommandStart } from '../../harness/harness-write-boundary.js';
+import {
+  SHELL_DEFAULT_TIMEOUT_MS, SHELL_KILL_GRACE_MS, SHELL_MAX_TIMEOUT_MS, SHELL_MIN_TIMEOUT_MS,
+  createShellWatchdog, reportShellWatchdog, resolveShellStallMs, type ShellWatchdogResult,
+} from '../../tool-runtime/shell-watchdog.js';
 import {
   createSeqTracker,
   makeEnvelope,
@@ -61,6 +68,9 @@ export interface BashToolOpts {
   /** Upper bound — even if the model asks for longer, we cap here.
    *  Clamped to [1000, 600000]. Default 600000 (10 min). */
   maxTimeoutMs?: number;
+  /** A201 — no-output stall line (ms). Default SHELL_STALL_NO_OUTPUT_MS or env
+   *  ELANOUS_SHELL_STALL_MS; non-positive disables. */
+  stallMs?: number;
   /** Max chars of combined stdout+stderr we hand back to the model.
    *  Past this we keep head + tail with a truncation marker. Default
    *  200_000. */
@@ -89,8 +99,9 @@ export interface BashToolOpts {
 
 const DEFAULTS = {
   shell: 'bash',
-  defaultTimeoutMs: 120_000,
-  maxTimeoutMs: 600_000,
+  // A201 — the shared shell constants (src/tool-runtime/shell-watchdog.ts) so Bash and RunShell cap alike.
+  defaultTimeoutMs: SHELL_DEFAULT_TIMEOUT_MS,
+  maxTimeoutMs: SHELL_MAX_TIMEOUT_MS,
   maxOutputChars: 200_000,
 };
 
@@ -112,6 +123,8 @@ export interface BashResult {
   timedOut: boolean;
   /** True when the user-supplied AbortSignal fired (dashboard Esc). */
   aborted: boolean;
+  /** A201 — set when the watchdog stopped the process (timeout or no-output stall). */
+  watchdog?: ShellWatchdogResult;
   durationMs: number;
   /** Track G: mirrors ShellResult.sandboxed — true when argv went
    *  through sandbox-exec (or equivalent) wrapper. False when
@@ -188,10 +201,11 @@ export async function dispatchBash(
   if (boundaryReject) return rejectedResult(boundaryReject);
 
   const shell = opts.shell && ALLOWED_SHELLS.has(opts.shell) ? opts.shell : DEFAULTS.shell;
-  const defaultTimeout = clamp(opts.defaultTimeoutMs ?? DEFAULTS.defaultTimeoutMs, 1000, DEFAULTS.maxTimeoutMs);
-  const maxTimeout = clamp(opts.maxTimeoutMs ?? DEFAULTS.maxTimeoutMs, 1000, DEFAULTS.maxTimeoutMs);
+  const defaultTimeout = clamp(opts.defaultTimeoutMs ?? DEFAULTS.defaultTimeoutMs, SHELL_MIN_TIMEOUT_MS, DEFAULTS.maxTimeoutMs);
+  const maxTimeout = clamp(opts.maxTimeoutMs ?? DEFAULTS.maxTimeoutMs, SHELL_MIN_TIMEOUT_MS, DEFAULTS.maxTimeoutMs);
   const requested = typeof args.timeout === 'number' && Number.isFinite(args.timeout) ? args.timeout : defaultTimeout;
-  const timeout = clamp(requested, 1000, maxTimeout);
+  const timeout = clamp(requested, SHELL_MIN_TIMEOUT_MS, maxTimeout);
+  const stallMs = resolveShellStallMs(opts.stallMs);
   const maxOutput = opts.maxOutputChars ?? DEFAULTS.maxOutputChars;
   // Per-call overrides win over opts (LLM-supplied sandbox/network
   // on the tool call take priority over the dashboard-default).
@@ -343,19 +357,43 @@ export async function dispatchBash(
       }
     };
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    // Stop the exact child's own process group: SIGTERM → SIGKILL after the grace. If an
+    // escaped grandchild (setsid/daemon) still holds the output pipe, 'close' never comes —
+    // force the result after a second grace so the tool cannot hang past its limit (A201).
+    const stopChild = (): void => {
+      // Observation: each step of the stop path is a tool.watchdog event, in order.
+      debug.log('tool.watchdog', 'kill', { tool: 'Bash', signal: 'SIGTERM', pid: child.pid ?? null });
       killTree('SIGTERM');
-      // Escalate if SIGTERM doesn't land within 2s — skills that
-      // swallow SIGTERM get SIGKILLed.
-      setTimeout(() => killTree('SIGKILL'), 2000).unref();
-    }, timeout);
+      setTimeout(() => {
+        if (settled) return;
+        debug.log('tool.watchdog', 'kill', { tool: 'Bash', signal: 'SIGKILL', pid: child.pid ?? null });
+        killTree('SIGKILL');
+      }, SHELL_KILL_GRACE_MS).unref();
+      setTimeout(() => {
+        if (settled) return;
+        debug.log('tool.watchdog', 'forced-close', { tool: 'Bash', pid: child.pid ?? null });
+        try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* already closed */ }
+        finish(null);
+      }, SHELL_KILL_GRACE_MS * 2).unref();
+    };
+
+    // A201 — wall-clock timeout ⊕ no-output stall line, one watchdog per process.
+    const watchdog = createShellWatchdog({
+      tool: 'Bash',
+      timeoutMs: timeout,
+      stallMs,
+      onFire: (result) => {
+        if (settled) return;
+        if (result.status === 'timeout') timedOut = true;
+        reportShellWatchdog(result, { pid: child.pid ?? null });
+        stopChild();
+      },
+    });
 
     const onAbort = () => {
       aborted = true;
-      killTree('SIGTERM');
-      // Escalate to SIGKILL for the whole group if SIGTERM is swallowed.
-      setTimeout(() => killTree('SIGKILL'), 2000).unref();
+      watchdog.stop();
+      stopChild();
     };
     if (opts.signal) {
       if (opts.signal.aborted) onAbort();
@@ -363,6 +401,7 @@ export async function dispatchBash(
     }
 
     child.stdout?.on('data', (c: Buffer) => {
+      watchdog.touch();
       const s = c.toString('utf8');
       stdout += s;
       if (emitEnabled) {
@@ -380,6 +419,7 @@ export async function dispatchBash(
       }
     });
     child.stderr?.on('data', (c: Buffer) => {
+      watchdog.touch();
       const s = c.toString('utf8');
       stderr += s;
       if (emitEnabled) {
@@ -398,7 +438,8 @@ export async function dispatchBash(
     const finish = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      watchdog.stop();
+      const fired = watchdog.fired;
       if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
 
       // Flush any pending coalesced lines + leftover (no trailing \n).
@@ -417,7 +458,8 @@ export async function dispatchBash(
         // stderr wins when present (errors are louder UX-wise).
         const endStream: 'stdout' | 'stderr' | 'generic' = stderr.length > 0 ? 'stderr' : 'stdout';
         const tailSummary: string[] = [];
-        if (timedOut) tailSummary.push(`[timed out after ${timeout}ms]`);
+        if (fired) tailSummary.push(fired.text);
+        else if (timedOut) tailSummary.push(`[timed out after ${timeout}ms]`);
         else if (aborted) tailSummary.push('[aborted]');
         else tailSummary.push(`[exit ${exitCode ?? '?'}]`);
         emitProgress('end', endStream, tailSummary, exitCode);
@@ -427,12 +469,14 @@ export async function dispatchBash(
       const combined = joinStreams(stdout, stderr);
       const { text: truncated, wasTruncated } = truncate(combined, maxOutput);
       let output = truncated;
-      if (timedOut) output = `[timed out after ${timeout}ms]\n${output}`;
+      if (fired) output = `${fired.text}\n${output}`;
+      else if (timedOut) output = `[timed out after ${timeout}ms]\n${output}`;
       else if (aborted) output = `[aborted]\n${output}`;
       else if (exitCode !== 0 && exitCode !== null) output = `[exit ${exitCode}]\n${output}`;
       if (wasTruncated) output += `\n[... output truncated at ${maxOutput} chars ...]`;
 
-      resolve({ stdout, stderr, output, exitCode, timedOut, aborted, durationMs, sandboxed, sandboxTool });
+      resolve({ stdout, stderr, output, exitCode, timedOut, aborted, durationMs, sandboxed, sandboxTool,
+        ...(fired ? { watchdog: fired } : {}) });
     };
 
     child.on('error', (err) => {

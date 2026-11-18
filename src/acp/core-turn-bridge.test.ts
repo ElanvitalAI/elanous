@@ -13,7 +13,7 @@ import type { AcpTurnContext } from './server.js';
 import { bridgeCoreTurnToAcp, toolsForTuiRoute } from './core-turn-bridge.js';
 import { buildWebSearchTool } from '../boot/daemon-tools/web-search.js';
 import { buildUserConfig } from '../user-config.js';
-import { RESEARCH_TURN_MAX_TOOL_TURNS } from '../core-turn/research-policy.js';
+import * as researchTurnModule from '../auto-research/research-turn.js';
 
 const question = 'OpenAI 최근 모델이 뭐야?';
 const search = { name: 'WebSearch', description: '', parameters: { type: 'object' as const } };
@@ -116,11 +116,13 @@ test('fact question adds one-turn instruction, six-turn cap and search evidence 
   expect(buildWebSearchTool().description).toContain('answer directly from the snippets and URLs');
 });
 
-test('explanatory research uses the bounded research budget while a simple price lookup keeps the fact cap', async () => {
+test('explanatory research leaves the research budget to the core route while a simple price lookup keeps the fact cap', async () => {
   const research = fixture('현재 채권 금리가 왜 올라가나요?');
   await research.runTurn();
   expect(research.calls[0]!.surfaceProfile?.domain).toBe('research');
-  expect(research.calls[0]!.maxToolTurns).toBe(RESEARCH_TURN_MAX_TOOL_TURNS);
+  // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (R-SIG): no sentence-regex budget at the bridge; runCoreTurn caps a research turn at
+  // RESEARCH_TURN_MAX_TOOL_TURNS once its structured route enters (src/acp/core-turn-bridge-core-route.test.ts).
+  expect(research.calls[0]!.maxToolTurns).toBeUndefined();
   expect(research.calls[0]!.messages[0]).toEqual({ role: 'system', content: 'base' });
   mock.restore();
   const fact = fixture('현재 채권 금리 얼마야?');
@@ -147,6 +149,12 @@ test('a configured budget is read, explicit resolver wins even with zero', async
 
 test('real core turn caps repeated search requests and synthesizes from returned URL', async () => {
   mock.restore();
+  // 1121 RESEARCH-ROUTING: a WebSearch-capable turn enters the research ladder by default. This test pins the ordinary
+  // fact-question tool loop, i.e. the path a turn takes once the plan's structured route skips research.
+  spyOn(researchTurnModule, 'runResearchQuestionLadder').mockImplementation(async (request, options) => {
+    options?.onRoute?.({ needsFreshFacts: false, needsCitations: false, localOnly: true });
+    return { ok: false, ladder: { request, questions: [], evidence: [] }, output: '', error: 'route skipped' };
+  });
   const base = config.getUserConfig();
   spyOn(config, 'getUserConfig').mockReturnValue({
     ...base,

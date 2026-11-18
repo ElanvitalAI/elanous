@@ -1,6 +1,6 @@
 import { decisionListSince } from './decision-list-since.js';
 
-export type LightCliRoute = 'msg' | 'decisions' | 'release' | 'release-set' | 'release-landed' | 'tasks' | 'tasks-read' | 'tasks-advance' | 'pr-land' | 'pty' | 'logs' | 'config' | 'q';
+export type LightCliRoute = 'msg' | 'decisions' | 'release' | 'release-set' | 'release-landed' | 'tasks' | 'tasks-read' | 'tasks-advance' | 'pr-land' | 'pty' | 'logs' | 'config' | 'q' | 'side';
 
 const VALUE_FLAGS = new Set(['--config-dir', '--test-state-dir']);
 const HOT_ROOTS = new Set(['msg', 'decisions', 'pty', 'logs', 'tasks']);
@@ -98,6 +98,7 @@ export function selectLightCliRoute(args: readonly string[]): LightCliRoute | un
     || (command.length === 1 && args.length === 2 && (args[1] === '--help' || args[1] === '-h')))) return 'tasks';
   if (command[0] === 'pr' && command[1] === 'land') return 'pr-land';
   if (command[0] === 'pty' && ['list', 'snapshot', 'text', 'state'].includes(command[1] ?? '')) return 'pty';
+  if (command[0] === 'side' && ['serve', 'ls', 'new', 'read', 'send'].includes(command[1] ?? '')) return 'side';
   if (command[0] === 'logs' && isSupportedLogsShape(args)) return 'logs';
   return undefined;
 }

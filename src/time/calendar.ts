@@ -9,6 +9,39 @@ export function dateKey(ts: string | number | Date = new Date(), opts?: TimeForm
   return `${p.year}-${p.month}-${p.day}`;
 }
 
+/** 달력 날짜 `YYYY-MM-DD` 에 일수를 더한다(시간대 무관 — 순수 달력 산술). */
+export function addCalendarDays(day: string, days: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!m) throw new Error(`invalid calendar day: ${day}`);
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + days)).toISOString().slice(0, 10);
+}
+
+/** 그 시간대에서 `day` 가 시작되는 첫 순간(ms) — 보통은 자정(00:00), 자정에 DST 가 시작되는 날은 전환 순간
+ *  (예: America/Sao_Paulo 2018-11-04 는 00:00 이 없고 01:00 = 03:00Z 에 시작). `dateKey` 와 같은 시간대
+ *  해석(`zoneOf`)으로, 지역 날짜가 처음 `day` 이상이 되는 초를 이분 탐색한다(지역 날짜는 시각에 단조).
+ *  탐색 폭 ±15h 는 실재 UTC 편차(-12h ~ +14h)를 덮는다. */
+export function zonedDayStartMs(day: string, opts?: TimeFormatOpts): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!m) throw new Error(`invalid calendar day: ${day}`);
+  const target = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const timeZone = zoneOf(opts);
+  const second = 1000;
+  let before = target - 15 * 3_600_000; // 지역 날짜 < day
+  let atOrAfter = target + 15 * 3_600_000; // 지역 날짜 ≥ day
+  while (atOrAfter - before > second) {
+    const mid = before + Math.floor((atOrAfter - before) / (2 * second)) * second;
+    if (dateKey(mid, { timeZone }) >= day) atOrAfter = mid;
+    else before = mid;
+  }
+  return atOrAfter;
+}
+
+/** 그 시간대의 하루 창 `[자정, 다음 자정)` — ISO(UTC) 두 끝. 집계를 UTC 날짜로 자르지 않기 위해. */
+export function zonedDayWindow(day: string, opts?: TimeFormatOpts): { since: string; until: string; timeZone: string } {
+  return { since: new Date(zonedDayStartMs(day, opts)).toISOString(),
+    until: new Date(zonedDayStartMs(addCalendarDays(day, 1), opts)).toISOString(), timeZone: zoneOf(opts) };
+}
+
 /** 날짜+시각 `YYYY-MM-DD HH:MM` (기본) 또는 초까지. */
 export function formatDateTime(
   ts: string | number | Date,

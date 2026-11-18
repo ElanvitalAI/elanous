@@ -27,7 +27,7 @@ import {
   estimateMessagesTokens, estimateTokens, trimToBudget, budget, formatBudget,
   DEFAULT_TOKEN_BUDGET,
 } from '../tokens.js';
-import { buildMemoryInjection, buildMemoryInjectionLLM } from '../memory.js';
+import { buildMemoryInjection, buildMemoryInjectionLLM, recordMemoryTurnUsage } from '../memory.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { budgetModel } from '../llm/model-defaults.js';
 import { explicitTurnTier } from '../model-tier/turn-tier.js';
@@ -35,6 +35,10 @@ import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { isSimpleQuestionFastRoute } from '../model-tier/simple-question-fast-route.js';
 import { recordTurn } from '../status/metrics.js';
 import { createMeasuredTurnUsage, type MeasuredTurnUsage } from './turn-usage.js';
+import { resolveTurnCompactTrigger, trimKeepingAnchorAndLatestTurn } from './long-session-compact.js';
+import { compactSessionHistory } from './compact-session.js';
+import { CHAT_DEFAULTS } from '../user-config/chat.js';
+import type { CompactProvider } from '../compact/provider.js';
 import {
   buildTerminalCapableTurn,
   isTerminalCapableTurn,
@@ -45,9 +49,13 @@ import {
 // chat 툴루프를 canonical 엔진(runGoalLoop→runCoreTurn→streamLLMWithTools)으로 라우팅.
 // ACP bridge(core-turn-bridge.ts)·dashboard(runGoalLoopHook)와 동일 엔진 재사용(재발명 제거).
 import { runCoreTurn } from '../core-turn/run-core-turn.js';
+import { drainPendingUserInput } from './pending-input.js';
 import { runGoalLoop } from '../core-turn/run-goal-loop.js';
+import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
+import { assertTurnNotSilentFailure } from './turn-silent-failure.js';
 import type { CoreTurnCallbacks, CoreTurnContext, CoreTurnDispatchTool } from '../core-turn/types.js';
 import { resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
+import { postSeatCapResumeNotice } from '../core-turn/seat-cap-resume-notice.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
@@ -68,6 +76,8 @@ export interface RunTurnOpts {
   systemPrompt?: string;
   /** Token budget (rough); defaults to DEFAULT_TOKEN_BUDGET. */
   maxTokens?: number;
+  /** Summarizer for turn-start compaction (test seam for the external LLM). Default = getDefaultCompactProvider(). */
+  compactProvider?: CompactProvider;
   /** Per-call LLM opts (model override, temperature, etc.). */
   llmOpts?: LLMOpts;
   /** Optional callback for each streamed text delta — telegram uses this to
@@ -85,6 +95,14 @@ export interface RunTurnOpts {
   /** Originating utterance surface. Omit only when the caller cannot
    *  identify its surface; emitted intent records then use `unknown`. */
   utteranceSurface?: import('../user-intent/types.js').UserIntentSurface;
+  /** CHAT-TOOLS-ENTRY-VIA-CORE-TURN — run this tool turn through the single core turn (runCoreTurn: research
+   *  route · grounding-first) instead of the direct tool loop. Set by `chat --tools` / `elanous agent`. A structural
+   *  caller flag, not a sentence classifier (R-SIG). Ignored when the turn has no tools. */
+  coreTurn?: boolean;
+  /** Observation only (core-turn path): the research question-plan model call settled. */
+  onResearchPlanSettled?: (info: { outcome: string; elapsedMs: number }) => void;
+  /** MSG-SOURCE-HIERARCHY: who sent this turn's text (persisted on the user message; absent = human). */
+  from?: import('./index.js').MessageSource;
   /** Multimodal image blocks to prepend before the user text (e.g.
    *  photos received via Telegram). When non-empty, the LLMMessage
    *  content is sent as ContentBlock[] instead of a plain string, and
@@ -205,10 +223,15 @@ export interface CreateRunTurnSessionOpts extends Partial<CreateSessionOpts> {
 /** Convert stored session messages → LLM wire messages. System and tool
  *  entries are passed through as text-only; multi-part content blocks
  *  stored in `toolResult` are collapsed into string form for simplicity. */
-function toLLM(messages: SerializedMessage[], systemPrompt?: string): LLMMessage[] {
+export function toLLM(messages: SerializedMessage[], systemPrompt?: string): LLMMessage[] {
   const out: LLMMessage[] = [];
-  const hasSystem = messages.some(m => m.role === 'system');
-  if (systemPrompt && !hasSystem) out.push({ role: 'system', content: systemPrompt });
+  // OP-LONG-SESSION-COMPACT (D2) — the turn's system prompt is never dropped. A stored head row only
+  // stands in for it when it IS that prompt (identical text, no duplicate). The old
+  // `messages.some(role === 'system')` dropped the prompt as soon as the session compactor wrote its
+  // summary row (a system row), i.e. right after the first compaction.
+  const head = messages.find(m => m.role !== 'tool' && m.goalInterim !== true);
+  const storedPrompt = head?.role === 'system' && head.content === systemPrompt;
+  if (systemPrompt && !storedPrompt) out.push({ role: 'system', content: systemPrompt });
   for (const m of messages) {
     // 'tool' = durable tool-telemetry (추적성·audit-only). Excluded from replay
     // so persisted tool rounds don't pollute the next turn's conversation context.
@@ -221,6 +244,21 @@ function toLLM(messages: SerializedMessage[], systemPrompt?: string): LLMMessage
     out.push({ role, content: m.content });
   }
   return out;
+}
+
+/** O4 prompt-cache prefix — insert this turn's volatile context as one `cacheVolatile` system
+ *  message immediately BEFORE the current (last) user message. Exported for tests.
+ *
+ *  Trade-off: request N is [...history, V_n, U_n] and request N+1 is
+ *  [...history, U_n, A_n, V_n+1, U_n+1]. Their common byte prefix ends right before V_n, so every
+ *  turn but the last is cache-reusable, while the per-turn context stays next to the request it
+ *  belongs to (the spec'd position). Putting V after U_n would extend the shared prefix by one user
+ *  message but leave the volatile context as the final instruction-like message, after the request. */
+export function withTurnVolatileContext(wire: LLMMessage[], blocks: readonly string[]): LLMMessage[] {
+  const text = blocks.filter(block => block.trim().length > 0).join('\n\n');
+  if (!text) return wire;
+  const at = wire.length > 0 && wire[wire.length - 1]!.role === 'user' ? wire.length - 1 : wire.length;
+  return [...wire.slice(0, at), { role: 'system', content: text, cacheVolatile: true }, ...wire.slice(at)];
 }
 
 /** Truncate any value to a bounded string for durable tool-telemetry storage —
@@ -341,6 +379,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // just skip and continue.
   let memoryIds: string[] = [];
   let effectiveSystemPrompt = opts.systemPrompt;
+  // ⭐ O4 prompt-cache prefix — per-turn context (memory recall · self-log recall with timestamps ·
+  //   last turn's tool digest · per-utterance reconciliation) changes every turn. Folding it into the
+  //   leading system prompt rewrote the very first message of every request, so no provider could
+  //   reuse the cached prefix (system prompt + history). It now travels as ONE `cacheVolatile` system
+  //   message placed right before the current user message (withTurnVolatileContext): everything
+  //   before it is a byte prefix of the next turn's request.
+  const turnVolatileBlocks: string[] = [];
   // The Next TUI runs through this shared session adapter rather than the classic dashboard
   // preamble. Give research turns the same verified-reconciliation instruction on this path.
   if (meta.source === 'tui' && !effectiveSystemPrompt?.includes('## Proactive Reconciliation')) {
@@ -355,8 +400,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     const reconciliation = buildSessionRuntimeTurnSystemMessages(turnProfile, opts.userText)
       .filter(message => String(message.content).includes('## Proactive Reconciliation'));
     if (reconciliation.length > 0) {
-      const block = reconciliation.map(message => String(message.content)).join('\n\n');
-      effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${block}` : block;
+      turnVolatileBlocks.push(reconciliation.map(message => String(message.content)).join('\n\n'));
     }
   }
   if (!opts.skipMemoryInjection && !simpleQuestionFastRoute) {
@@ -369,12 +413,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       const inj = memCfg?.enabled !== false
         ? await buildMemoryInjectionLLM(opts.userText, { maxTokens: budget, model: memCfg?.model || budgetModel() })
         : buildMemoryInjection(opts.userText, { maxTokens: budget });
+      // MEMORY-TRIAGE-NO-LLM ③ 생산자 — 주입 «시도»마다 한 줄(빈 주입 포함 · `no-activity` 와 «활동했는데 안 쓰임»을 가른다).
+      // 실패는 원장이 사건 ⊕ 구멍 표식으로 남긴다.
+      try { recordMemoryTurnUsage(opts.userText, inj); } catch { /* 원장 실패가 턴을 막지 않는다 */ }
       if (inj.block) {
         memoryIds = inj.injectedIds;
         debug.log('chat.memory-layer', 'injected', { session: opts.sessionId, ids: inj.injectedIds, tokens: inj.tokens });
-        effectiveSystemPrompt = effectiveSystemPrompt
-          ? `${effectiveSystemPrompt}\n\n${inj.block}`
-          : inj.block;
+        turnVolatileBlocks.push(inj.block);
       }
       // 크로스 회상(2026-07-19) — 파일메모리(①·큐레이션) 옆에 self-log(②·surface_events) 관련
       // top-K 를 같은 턴에 함께 주입(한 쿼리로 두 시스템). query-adaptive rerank(relevance 우선)·
@@ -388,7 +433,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           if (evs.length > 0) {
             const block = '## 최근 관련 활동 (self-log)\n\n' +
               evs.map(e => `- [${(e.ts || '').slice(0, 16)}·${e.surface}] ${(e.summary || e.text || '').replace(/\s+/g, ' ').slice(0, 160)}`).join('\n');
-            effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${block}` : block;
+            turnVolatileBlocks.push(block);
           }
         } catch { /* self-log 크로스 회상 best-effort */ }
       }
@@ -400,11 +445,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // what the last turn's tools returned. Bounded + fail-soft.
   try {
     const obs = buildRecentToolObservations(messages);
-    if (obs) {
-      effectiveSystemPrompt = effectiveSystemPrompt
-        ? `${effectiveSystemPrompt}\n\n${obs}`
-        : obs;
-    }
+    if (obs) turnVolatileBlocks.push(obs);
   } catch { /* reflection digest is best-effort — never break the turn */ }
 
   // Cascade-zyu U1 — capture utterance intent at submission boundary.
@@ -433,6 +474,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     content: recordedText,
     ts: userTs,
     tokenEstimate: estimateTokens(recordedText),
+    ...(opts.from ? { from: opts.from } : {}),
   };
   appendMessage(opts.sessionId, userMsg);
 
@@ -456,6 +498,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       sessionId: opts.sessionId, model: fastTier.model, reasoningEffort: 'low', tools: 'omitted',
     }, { level: 'info' });
     effectiveSystemPrompt = 'Answer this stable factual question directly and briefly in the user’s language. If uncertain, say so; do not invent.';
+    turnVolatileBlocks.length = 0;
   }
   const longAnswer = /설계|아키텍처|RFC|상세|자세히|보고서|design|architecture|detailed|comprehensive/i.test(opts.userText);
   const outputTokens = llmOpts?.maxTokens ?? resolveDefaultOutputTokens(llmOpts?.model ?? provider.defaultModel, llmOpts?.usageRole, longAnswer);
@@ -464,19 +507,79 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // 2) Assemble, trim, call. When images are attached for THIS turn,
   //    swap the string content of the latest user message for
   //    ContentBlock[] so the provider adapter sends them multimodally.
-  const assembleTurnMessages = (systemPrompt?: string, history = messages): { kept: LLMMessage[]; dropped: number; used: number } => {
-    const wire = toLLM([...history, userMsg], systemPrompt);
+  // The request as it is actually sent (per-turn volatile context and images attached), before any trim.
+  const buildTurnWire = (systemPrompt?: string, history = messages): LLMMessage[] => {
+    const wire = withTurnVolatileContext(toLLM([...history, userMsg], systemPrompt), turnVolatileBlocks);
     if (opts.userImages && opts.userImages.length > 0) {
-      const last = wire[wire.length - 1];
+      // The current user message is the last `user` row.
+      const lastUser = wire.map(message => message.role).lastIndexOf('user');
+      const last = wire[lastUser];
       if (last && last.role === 'user') {
         const blocks: ContentBlock[] = [
           ...opts.userImages,
           { type: 'text', text: opts.userText },
         ];
-        wire[wire.length - 1] = { role: 'user', content: blocks };
+        wire[lastUser] = { role: 'user', content: blocks };
       }
     }
-    return trimToBudget(wire, opts.maxTokens ?? DEFAULT_TOKEN_BUDGET);
+    return wire;
+  };
+  const turnInputCap = opts.maxTokens ?? DEFAULT_TOKEN_BUDGET;
+  // ⭐ OP-LONG-SESSION-COMPACT (D1) — turn-start auto-compaction fires before the trim. The existing
+  //   threshold is clamped to the input cap (long-session-compact.ts), and it is measured on the
+  //   request as sent (images included). A caller with an explicit opts.maxTokens keeps its
+  //   trim-only contract (no storage rewrite).
+  const autoCompactCfg = opts.userConfig.chat?.autoCompact ?? CHAT_DEFAULTS.autoCompact;
+  let compactedThisTurn = false;
+  if (autoCompactCfg.enabled && opts.maxTokens === undefined) {
+    const turnModelId = llmOpts?.model ?? provider.defaultModel;
+    const trigger = resolveTurnCompactTrigger(turnModelId, autoCompactCfg, turnInputCap);
+    const used = estimateMessagesTokens(buildTurnWire(effectiveSystemPrompt));
+    if (trigger > 0 && used >= trigger) {
+      try {
+        const result = await compactSessionHistory(opts.sessionId, {
+          config: autoCompactCfg,
+          force: true,
+          modelId: turnModelId,
+          ...(opts.compactProvider ? { provider: opts.compactProvider } : {}),
+        });
+        debug.log('compact.session', 'turn-start', {
+          sessionId: opts.sessionId, usedTokens: used, triggerTokens: trigger, fired: result.fired, reason: result.reason,
+        }, { level: 'info' });
+        if (result.fired) {
+          compactedThisTurn = true;
+          // The rewritten store holds this turn's user row (rows appended meanwhile may follow it).
+          // Take that row out wherever it sits; the wire adds it back once, last.
+          const stored = loadSession(opts.sessionId)?.messages ?? messages;
+          let own = -1;
+          for (let i = stored.length - 1; i >= 0 && own < 0; i--) {
+            if (stored[i]!.role === 'user' && stored[i]!.content === userMsg.content) own = i;
+          }
+          messages = own >= 0 ? [...stored.slice(0, own), ...stored.slice(own + 1)] : stored;
+        }
+      } catch (error) {
+        debug.log('compact.session', 'turn-start-error', {
+          sessionId: opts.sessionId, error: error instanceof Error ? error.message : String(error),
+        }, { level: 'warn' });
+      }
+    }
+  }
+  // After a compaction the request is measured again: if it is still over the cap the oldest rows go
+  // first, but the system rows, the anchor and the latest user turn always stay; if even those do not
+  // fit, the turn fails with ✗ before any provider call.
+  const assembleTurnMessages = (systemPrompt?: string, history = messages): { kept: LLMMessage[]; dropped: number; used: number } => {
+    const wire = buildTurnWire(systemPrompt, history);
+    if (!compactedThisTurn) return trimToBudget(wire, turnInputCap);
+    const trimmed = trimKeepingAnchorAndLatestTurn(wire, turnInputCap, estimateMessagesTokens);
+    if (trimmed.overBudget) {
+      debug.log('session.compact', 'over-budget', {
+        sessionId: opts.sessionId, usedTokens: trimmed.used, capTokens: turnInputCap,
+      }, { level: 'error' });
+      const line = `✗ 문맥 예산 초과 — 압축 뒤에도 보존 항목만 ${trimmed.used.toLocaleString('en-US')} 토큰 > 상한 ${turnInputCap.toLocaleString('en-US')} · 이 턴을 멈춤`;
+      opts.onStatusLine?.(line);
+      throw new Error(line);
+    }
+    return trimmed;
   };
 
   const requestSizeGuard: RequestSizeGuard | undefined =
@@ -528,6 +631,10 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   let goalComplete = false;
   let goalStopReason: string | undefined;
   let turnFailed = false;
+  // OPENROUTER-CLAUDE(11-17) — 조용한 실패 판정 재료(턴 끝 assertTurnNotSilentFailure).
+  let toolCallsSeen = 0;
+  let turnStopReason: string | undefined;
+  let turnErrorMessage: string | undefined;
   // Branch — tool-loop path when caller supplies a non-empty tool
   // catalog (CLI agent surface), legacy text-only stream otherwise
   // (telegram, discord, scheduler, etc — all unchanged).
@@ -576,8 +683,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       ? classifyTuiChatIntent(opts.userText, { seat: seat !== undefined })
       : undefined;
     const armGoalLoop = opts.goalLoop === true || goalLoopCfg?.enabled === true || tuiIntent?.goalLoop === true;
-    const armResearchTurn = (opts.utteranceSurface === 'tui' || opts.utteranceSurface === 'ask')
-      && turnTools.length > 0 && isResearchAgentIntent(opts.userText);
+    const armResearchTurn = turnTools.length > 0 && (opts.coreTurn === true
+      || ((opts.utteranceSurface === 'tui' || opts.utteranceSurface === 'ask') && isResearchAgentIntent(opts.userText)));
     if (armGoalLoop || armResearchTurn) {
       // ⭐ CHILD-CONTEXT-BUDGET(0.2.35 칸) — 구현 자식(self-implement 공간)의 첫 goal-loop
       //    턴에서 실제 effectiveSystemPrompt·turnTools 스키마·userText(골)의 구성 바이트를
@@ -622,7 +729,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
               tokenEstimate: estimateTokens(interimText), goalInterim: true,
             });
           },
-          onToolCall: (call) => { toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
+          onToolCall: (call) => { toolCallsSeen += 1; toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
           onToolResult: (call) => {
             try {
               appendMessage(opts.sessionId, { ...buildToolTraceMessage(call.name, toolCallArgs.get(call.id), call.result), toolCallId: call.id,
@@ -631,8 +738,19 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
             opts.onToolResult?.(call);
           },
           onReasoning: (event) => { opts.onReasoning?.(event); },
+          ...(opts.onResearchPlanSettled ? { onResearchPlanSettled: opts.onResearchPlanSettled } : {}),
+          // CHAT-TOOLS-ENTRY-VIA-CORE-TURN field parity (JUD-B TUI clause): the direct loop showed stream retry and
+          // grounding status lines (Next TUI status events · message-block status); keep them on a coreTurn turn.
+          ...(opts.coreTurn === true && opts.onStatusLine ? { onStatus: (line: string) => { opts.onStatusLine?.(line); } } : {}),
           onUsage,
         },
+        // CHAT-TOOLS-ENTRY-VIA-CORE-TURN field parity: the direct loop ran on the provider this turn resolved from
+        // opts.userConfig (a Next TUI session provider choice is a per-turn config, not the global one). Pin it as the
+        // core turn's first provider; a tier model override keeps the existing modelOverride route (types.ts: the two
+        // are exclusive so a provider never receives another provider's model name).
+        ...(opts.coreTurn === true && !turnLlmOpts?.model ? { initialProvider: provider } : {}),
+        ...(opts.coreTurn === true && turnLlmOpts?.streamIdleTimeoutMs !== undefined
+          ? { streamIdleTimeoutMs: turnLlmOpts.streamIdleTimeoutMs } : {}),
         ...(turnLlmOpts?.model ? { modelOverride: turnLlmOpts.model } : {}),
         ...(turnLlmOpts?.reasoningEffort ? { reasoningEffort: turnLlmOpts.reasoningEffort } : {}),
         ...(turnLlmOpts?.budgetGrant ? { budgetGrant: turnLlmOpts.budgetGrant } : {}),
@@ -647,18 +765,33 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         const seatTurnCap = seat
           ? { ...resolveSeatTurnCap(opts.userConfig.chat.seatTurnCap), seat }
           : undefined;
+        // HARNESS-ADVISOR-CHECKPOINTS — 하니스 런에서만 코어 ADVISOR(그림자 기본).
+        const advisor = coreAdvisorForGoalLoop({ userText: coreCtx.userText ?? '', signal: coreCtx.signal });
         const gl = await runGoalLoop(coreCtx, {
           ...(maxIterations !== undefined ? { maxIterations } : {}),
+          ...(advisor ? { advisor } : {}),
           ...(seatTurnCap ? { seatTurnCap } : {}),
+          // SEAT-CAP-RESUME-NOTICE(연속 큐 미재개) — 상한 소진 마감 직전 자리 우편함에 재개 안내 1통.
+          ...(seatTurnCap ? { onSeatCapExhausted: postSeatCapResumeNotice() } : {}),
         });
         text = gl.finalText;
         goalComplete = gl.goalComplete;
         goalStopReason = gl.stopReason;
         turnFailed = gl.stopReason === 'aborted' || gl.stopReason === 'error' || gl.stopReason === 'auth_rejected';
+        turnStopReason = gl.stopReason;
+        turnErrorMessage = gl.errorMessage;
       } else {
         const coreResult = await runCoreTurn(coreCtx);
         text = coreResult.finalText;
+        // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (OP REVIEW-1 #38246): the direct loop reported the provider's finish reason
+        // (`length` → CLI `incomplete` · exit 1 · JSON finishReason); the core turn returns it as providerFinishReason.
+        if (coreResult.providerFinishReason) {
+          finishReason = coreResult.providerFinishReason;
+          llmOpts?.onFinishReason?.(coreResult.providerFinishReason);
+        }
         turnFailed = coreResult.stopReason === 'aborted' || coreResult.stopReason === 'error' || coreResult.stopReason === 'auth_rejected';
+        turnStopReason = coreResult.stopReason;
+        turnErrorMessage = coreResult.errorMessage;
         if (coreResult.stopReason === 'auth_rejected') throw new Error(coreResult.errorMessage ?? 'Authentication was rejected');
       }
     } else {
@@ -671,7 +804,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         onStatus: (line) => { opts.onStatusLine?.(line); },
         onReasoning: (event) => { opts.onReasoning?.(event); },
         dispatchTool: async (name, args, ctx) => dispatchTool(name, args, ctx),
-        onToolCall: (call) => { toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
+        onToolCall: (call) => { toolCallsSeen += 1; toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
         onToolResult: (call) => {
           try {
             appendMessage(opts.sessionId, { ...buildToolTraceMessage(call.name, toolCallArgs.get(call.id), call.result), toolCallId: call.id,
@@ -684,6 +817,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       {
         ...(guardedTurnLlmOpts ?? {}),
         maxTokens: guardedTurnLlmOpts?.maxTokens ?? outputTokens,
+        // Source of the cap, not its value: a role default may continue once on length; a caller cap may not (#36714).
+        maxTokensExplicit: guardedTurnLlmOpts?.maxTokensExplicit ?? guardedTurnLlmOpts?.maxTokens !== undefined,
         longAnswer,
         onFinishReason: (reason: string) => { finishReason = reason; llmOpts?.onFinishReason?.(reason); },
         tools: turnTools,
@@ -697,6 +832,14 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         // ★ C1(문맥관리 트랙) — 미션 walker 압축 관측(mission.walker.compact)에 미션 좌표를 실어줌.
         //   missionContext 있을 때만(미션 페이즈 실행) threading — 일반 채팅은 무영향.
         ...(opts.missionContext ? { missionContext: opts.missionContext } : {}),
+        // A200 ELN-MIDTURN-STEER — the plain tool turn drains this session's pending input right before
+        // the next model request, the same boundary `runCoreTurn` wires (run-core-turn.ts). Without it a
+        // steer typed during a Next TUI tool turn sat in the registry until the turn ended and left again
+        // as a separate turn.
+        drainPendingUserInput: guardedTurnLlmOpts?.drainPendingUserInput ?? (() => drainPendingUserInput(opts.sessionId)),
+        // O4 — session-derived cache affinity (codex prompt_cache_key · OpenRouter sticky routing) and
+        // the llm.usage row's session join. The core-turn path already threads ctx.sessionId.
+        sessionId: guardedTurnLlmOpts?.sessionId ?? opts.sessionId,
       },
     );
     }
@@ -705,14 +848,28 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     const plainOpts = {
       ...(llmOpts ?? {}),
       maxTokens: outputTokens,
+      maxTokensExplicit: llmOpts?.maxTokensExplicit ?? llmOpts?.maxTokens !== undefined,
       longAnswer,
       onFinishReason: (reason: string) => { finishReason = reason; llmOpts?.onFinishReason?.(reason); },
       ...(requestSizeGuard ? { requestSizeGuard: llmOpts?.requestSizeGuard ?? requestSizeGuard } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
       onUsage,
+      sessionId: llmOpts?.sessionId ?? opts.sessionId,
     };
     text = await streamLLM(kept, (delta) => { opts.onDelta?.(delta); }, { ...plainOpts, provider, preferExplicitProvider: true });
   }
+  // OPENROUTER-CLAUDE(대표 11-17 · P0) — 공급자 실패·빈 응답을 «완료»로 넘기지 않는다(화면 ✗ ⊕ turn.* 사건).
+  //   🩸 골 루프 갈래는 auth_rejected 를 turnFailed 로만 접어 1초 빈 «Turn done» 을 냈다.
+  assertTurnNotSilentFailure({
+    sessionId: opts.sessionId,
+    provider: provider.name,
+    model: llmOpts?.model ?? provider.defaultModel,
+    text,
+    toolCalls: toolCallsSeen,
+    aborted: opts.signal?.aborted === true,
+    ...(turnStopReason !== undefined ? { stopReason: turnStopReason } : {}),
+    ...(turnErrorMessage !== undefined ? { errorMessage: turnErrorMessage } : {}),
+  });
   const turnSeconds = (Date.now() - turnStartedAt) / 1000;
 
   // 3) Persist assistant response.

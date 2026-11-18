@@ -24,6 +24,7 @@ import { getSessionCwd } from '../../session/working-dir.js';
 import { startPty, unregisterPty, type PtyHandle } from '../../pty-shell/registry.js';
 import { CodingAgentBinaryMissing } from '../../terminal/coding-agent.js';
 import { wrapCommandForKeychainUnlock, shouldWrapForKeychainUnlock } from '../../terminal/keychain-unlock.js';
+import { observeCodingAgentSubmit, registerCodingAgentPty } from './pty-coding-agent-observation.js';
 export type CodingAgentBrand = 'claude-code' | 'codex';
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
@@ -105,6 +106,7 @@ function resolveAndSpawn(
   const handle = wrap
     ? startPty({ cmd: wrapCommand([binary, ...extraArgs.map(shq)].join(' ')), workdir: cwd, cols, rows })
     : startPty({ cmd: binary, args: extraArgs, workdir: cwd, cols, rows });
+  registerCodingAgentPty(handle, brand, extraArgs);
   return { handle, brand, binary, cwd, cols, rows };
 }
 
@@ -194,7 +196,7 @@ export async function dispatchDriveCodingAgentHeadless(
     // 2. Send the task + Enter (raw bytes — no shell quoting of the prompt).
     handle.write(prompt);
     await sleep(120);
-    handle.write('\r');
+    observeCodingAgentSubmit(handle, () => handle.write('\r'));
     // 3. Wait until the agent finishes working (sustained quiet) or timeout.
     const status = await waitForQuiet(handle, {
       quietMs: t.doneQuietMs ?? 4000,

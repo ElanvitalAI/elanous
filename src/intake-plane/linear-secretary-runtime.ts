@@ -3,7 +3,8 @@ import { resolve, relative } from 'node:path';
 import { createLinearSecretaryBreakdown, type LinearSecretaryPlan } from './linear-wish.js';
 import { resolveLinearProjectId, resolveLinearViewerId } from '../connectors/linear.js';
 import { extractJsonBlock } from './decompose.js';
-import { extractKeywords, searchMemories } from '../memory.js';
+import { extractKeywords, memoryRoot, searchMemories } from '../memory.js';
+import { recordMemoryUsage } from '../memory-triage/usage-ledger.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { createRepositoryReferencedFileReader } from '../self-implement/goal-file-reader.js';
@@ -79,7 +80,10 @@ async function collectRepositoryEvidence(request: string, root: string): Promise
 
 async function collectEvidence(request: string, root: string): Promise<LinearSecretaryEvidence[]> {
   const evidence = await collectRepositoryEvidence(request, root);
-  for (const hit of searchMemories(request, { limit: 4 }).filter(item => item.score >= 2)) {
+  const memoryHits = searchMemories(request, { limit: 4 }).filter(item => item.score >= 2);
+  // MEMORY-TRIAGE-NO-LLM ③ 생산자 — 근거로 꺼낸 전역 기억은 «쓰임»이다(id 해시만).
+  recordMemoryUsage({ store: 'global', via: 'search', usedIds: memoryHits.map(hit => hit.entry.id) }, memoryRoot());
+  for (const hit of memoryHits) {
     evidence.push({ source: `memory:${hit.entry.name}`, link: `memory://${hit.entry.id}`,
       excerpt: `${hit.entry.description}\n${hit.entry.body}`.trim().slice(0, 700) });
   }

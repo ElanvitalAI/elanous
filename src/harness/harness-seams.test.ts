@@ -1,5 +1,5 @@
 // 하니스 실 seam 팩토리(H1) — fake SelfImplementSeams 로 배선·fail-closed deploy·하니스 통합 검증.
-import { test, expect, describe, spyOn } from 'bun:test';
+import { test, expect, describe, spyOn, beforeAll, afterAll } from 'bun:test';
 import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -13,6 +13,16 @@ import { buildHarnessSeams, classifyHeft, adversarialThreshold, ADVERSARIAL_AUTO
 import { runStagedHarness, type StagedHarnessSeams } from './staged-harness.js';
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
 import { realWorktreeSeams as fakeSeams } from './harness-test-seams.js';
+import { NEIGHBOR_SWEEP_DEADLINE_MS, NEIGHBOR_SWEEP_SHADOW_BUDGET_MS, sweepWorktreeNeighbors, type BoundedRunner } from './neighbor-sweep.js';
+
+// HARNESS-NEIGHBOR-SWEEP — 이 파일의 rework 시험이 실제 git·ast-grep 을 띄우지 않도록 기본을 off 로 둔다.
+//   스윕 자체를 보는 describe 는 모드·sweep 을 명시로 주입한다.
+let previousNeighborSweepEnv: string | undefined;
+beforeAll(() => { previousNeighborSweepEnv = process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP; process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP = 'off'; });
+afterAll(() => {
+  if (previousNeighborSweepEnv === undefined) delete process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP;
+  else process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP = previousNeighborSweepEnv;
+});
 
 describe('buildHarnessSeams — 실 인프라 배선(fake)', () => {
   test('plan → worktree 생성 + heuristic 스텝(마커 없으면 objective 1스텝)', async () => {
@@ -1161,5 +1171,198 @@ describe('harness review acceptance plumbing', () => {
   test('postPrReview fail-soft — 골 파싱 예외는 reject 하지 않는다', async () => {
     const exploding = { trim() { throw new Error('goal-parse'); } } as unknown as string;
     await expect(postPrReview('.', 42, 'feat X', async () => 'VERDICT: PASS', ghDiffSpawn(), exploding)).resolves.toBeUndefined();
+  });
+});
+
+describe('HARNESS-NEIGHBOR-SWEEP — 수정 라운드 같은 꼴 이웃 주입', () => {
+  const site = { file: 'src/b.ts', line: 3, endLine: 3, callee: 'loadLedger', text: "loadLedger('c')" };
+  const okSweep = async () => ({ outcome: 'ok' as const, engine: 'ast-grep' as const, hunks: 1, callees: 1, sites: [site], totalSites: 1, truncated: false });
+  const failReview = { verdict: 'fail' as const, findings: ['블로커 A'], mustFix: ['블로커 A'] };
+
+  async function runRounds(neighborSweep: Parameters<typeof buildHarnessSeams>[0]['neighborSweep'], priorReview = failReview) {
+    const features: string[] = [];
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: unknown) => {
+      if (category === 'harness.seams' && event === 'neighbor-sweep') events.push({ event, data: data as Record<string, unknown> });
+    });
+    const previous = process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP;
+    delete process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP;
+    try {
+      const seams = buildHarnessSeams({
+        seams: fakeSeams({ async implement({ feature, cwd }) { features.push(feature); writeFileSync(join(cwd, 'x.ts'), 'x'); return { ok: true, summary: 'ok' }; } }),
+        ...(neighborSweep ? { neighborSweep } : {}),
+      });
+      await seams.plan({ objective: 'feat N' });
+      await seams.execute({ objective: 'feat N', steps: [], round: 1 });
+      await seams.execute({ objective: 'feat N', steps: [], round: 2, priorReview });
+    } finally {
+      log.mockRestore();
+      if (previous === undefined) delete process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP; else process.env.ELANOUS_HARNESS_NEIGHBOR_SWEEP = previous;
+    }
+    return { features, events };
+  }
+
+  test('shadow(기본) — 계산해 개수 사건만 남기고 프롬프트에는 싣지 않는다', async () => {
+    let calls = 0;
+    const { features, events } = await runRounds({ sweep: async () => { calls++; return okSweep(); } });
+    expect(calls).toBe(1);
+    expect(features[1]).not.toContain('같은 꼴 이웃');
+    expect(events).toHaveLength(1);
+    expect(events[0]!.data).toMatchObject({ mode: 'shadow', trigger: 'review-mustfix', outcome: 'ok', sites: 1, totalSites: 1, injected: false });
+    // 사건은 개수뿐 — 호출 원문·경로가 실리지 않는다.
+    expect(JSON.stringify(events[0]!.data)).not.toContain('loadLedger');
+    expect(JSON.stringify(events[0]!.data)).not.toContain('src/b.ts');
+  });
+
+  test('on — 수정 라운드 프롬프트에만 file:line 목록을 싣고 첫 라운드에는 부르지 않는다', async () => {
+    let calls = 0;
+    const { features, events } = await runRounds({ mode: 'on', sweep: async () => { calls++; return okSweep(); } });
+    expect(calls).toBe(1);
+    expect(features[0]).not.toContain('같은 꼴 이웃');
+    expect(features[1]).toContain('같은 꼴 이웃');
+    expect(features[1]).toContain("- src/b.ts:3 — loadLedger('c')");
+    expect(features[1]).toContain('블로커 A');
+    expect(events[0]!.data).toMatchObject({ mode: 'on', injected: true });
+  });
+
+  test('결정론 게이트 실패 뒤 라운드는 래칫 편집 계기로 기록한다', async () => {
+    const { events } = await runRounds({ mode: 'on', sweep: okSweep }, { ...failReview, gateFailed: true } as typeof failReview);
+    expect(events[0]!.data).toMatchObject({ trigger: 'ratchet-edit' });
+  });
+
+  // JUD-B 20261118-AM-REST-HOLD «래칫 편집 직후 맥락 주입 미측정» — 바깥 문(runStagedHarness ∘ buildHarnessSeams)으로 잰다.
+  //   gate 는 운영 SelfImplementGateResult 꼴 그대로(steps 없음 · passed:false) — gateFailed 는 운영 review seam
+  //   (review-adapter.ts combineReview) 이 쓰고, 시험은 손으로 넣지 않는다.
+  async function runRatchetLap(neighborSweep: NonNullable<Parameters<typeof buildHarnessSeams>[0]['neighborSweep']>) {
+    const features: string[] = [];
+    const sweepEvents: Record<string, unknown>[] = [];
+    const skipEvents: Record<string, unknown>[] = [];
+    const verdicts: Record<string, unknown>[] = [];
+    const sweptBeforeImplement: number[] = [];
+    let gateCalls = 0;
+    const inner = neighborSweep.sweep;
+    const wrapped: typeof neighborSweep = inner
+      ? { ...neighborSweep, sweep: async (cwd, opts) => { sweptBeforeImplement.push(features.length); return inner(cwd, opts); } }
+      : neighborSweep;
+    const log = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: unknown) => {
+      if (category === 'harness.seams' && event === 'neighbor-sweep') sweepEvents.push(data as Record<string, unknown>);
+      if (category === 'harness.seams' && event === 'neighbor-sweep-skipped') skipEvents.push(data as Record<string, unknown>);
+      if (category === 'harness.review' && event === 'verdict') verdicts.push(data as Record<string, unknown>);
+    });
+    try {
+      const seams = buildHarnessSeams({
+        seams: fakeSeams({
+          async implement({ feature, cwd }) {
+            features.push(feature);
+            writeFileSync(join(cwd, `round-${features.length}.ts`), 'export const n = 1;\n');
+            return { ok: true, summary: 'ok' };
+          },
+          async gate() { gateCalls++; return gateCalls === 1 ? { passed: false, log: 'typecheck-ratchet: new error' } : { passed: true }; },
+        }),
+        neighborSweep: wrapped,
+      });
+      // 출처: #38276 — 게이트 실패 1 ⊕ 통과 1 = 두 라운드로 끝난다. 상한은 여유 한 칸이며 판정은 rounds 로 한다.
+      const result = await runStagedHarness({ objective: 'feat R', seams, maxReviewRounds: 3, autoDrive: 'safe' });
+      return { result, features, sweepEvents, skipEvents, verdicts, sweptBeforeImplement, gateCalls };
+    } finally {
+      log.mockRestore();
+    }
+  }
+
+  test('래칫 편집 직후(바깥 문) — on: 게이트 실패 바로 다음 라운드 프롬프트에 이웃 절 · 사건 trigger ratchet-edit', async () => {
+    const lap = await runRatchetLap({ mode: 'on', sweep: okSweep });
+    expect(lap.gateCalls).toBe(2);
+    expect(lap.result.rounds).toBe(2);
+    expect(lap.verdicts[0]).toMatchObject({ gatePassed: false, verdict: 'fail' });
+    expect(lap.verdicts[1]).toMatchObject({ gatePassed: true, verdict: 'pass' });
+    // 스윕은 라운드 1 구현 뒤 · 라운드 2 구현 전에 한 번.
+    expect(lap.sweptBeforeImplement).toEqual([1]);
+    expect(lap.features[0]).not.toContain('같은 꼴 이웃');
+    expect(lap.features[1]).toContain('계기 ratchet-edit');
+    expect(lap.features[1]).toContain("- src/b.ts:3 — loadLedger('c')");
+    expect(lap.features[1]).toContain('무결성 게이트 실패');
+    expect(lap.sweepEvents).toHaveLength(1);
+    expect(lap.sweepEvents[0]).toMatchObject({ round: 2, mode: 'on', trigger: 'ratchet-edit', outcome: 'ok', injected: true });
+    expect(lap.skipEvents).toEqual([]);
+  });
+
+  test('래칫 편집 직후(바깥 문) — shadow: 계산해 ratchet-edit 사건만 · 프롬프트 무변화', async () => {
+    const lap = await runRatchetLap({ mode: 'shadow', sweep: okSweep });
+    expect(lap.sweptBeforeImplement).toEqual([1]);
+    expect(lap.features[1]).not.toContain('같은 꼴 이웃');
+    expect(lap.sweepEvents[0]).toMatchObject({ round: 2, mode: 'shadow', trigger: 'ratchet-edit', injected: false });
+  });
+
+  test('래칫 편집 직후(바깥 문) — off: 스윕 0 · 그래도 neighbor-sweep-skipped 사건에 ratchet-edit', async () => {
+    let calls = 0;
+    const lap = await runRatchetLap({ mode: 'off', sweep: async () => { calls++; return okSweep(); } });
+    expect(calls).toBe(0);
+    expect(lap.features[1]).not.toContain('같은 꼴 이웃');
+    expect(lap.sweepEvents).toEqual([]);
+    expect(lap.skipEvents).toHaveLength(1);
+    expect(lap.skipEvents[0]).toMatchObject({ round: 2, mode: 'off', trigger: 'ratchet-edit', reason: 'off' });
+  });
+
+  test('래칫 편집 직후(바깥 문) — on 인데 스윕이 시한 초과면 주입 0 · 사건에 ratchet-edit ⊕ timeout', async () => {
+    const lap = await runRatchetLap({ mode: 'on', sweep: async () => ({ outcome: 'timeout' as const, engine: 'none' as const, hunks: 1, callees: 0, sites: [], totalSites: 0, truncated: false }) });
+    expect(lap.result.rounds).toBe(2);
+    expect(lap.features[1]).not.toContain('같은 꼴 이웃');
+    expect(lap.sweepEvents[0]).toMatchObject({ round: 2, trigger: 'ratchet-edit', outcome: 'timeout', injected: false });
+  });
+
+  test('스윕이 던져도 수정 라운드는 그대로 돈다 — 사건만 남긴다', async () => {
+    const { features, events } = await runRounds({ mode: 'on', sweep: async () => { throw new RangeError('boom'); } });
+    expect(features).toHaveLength(2);
+    expect(features[1]).toContain('블로커 A');
+    expect(features[1]).not.toContain('같은 꼴 이웃');
+    expect(events[0]!.data).toMatchObject({ outcome: 'error', reason: 'RangeError', injected: false });
+  });
+
+  test('도구 없음·시한 초과 outcome 도 주입 없이 사건만', async () => {
+    for (const outcome of ['tool-missing', 'timeout'] as const) {
+      const { features, events } = await runRounds({ mode: 'on', sweep: async () => ({ outcome, engine: 'none' as const, hunks: 1, callees: 0, sites: [], totalSites: 0, truncated: false }) });
+      expect(features[1]).not.toContain('같은 꼴 이웃');
+      expect(events[0]!.data).toMatchObject({ outcome, injected: false });
+    }
+  });
+
+  test('shadow — 늦는 엔진도 예산을 넘겨 라운드를 붙잡지 못하고 걸린 시간을 사건에 싣는다', async () => {
+    let seen: { deadlineMs: number; allowFallback: boolean } | undefined;
+    // 출처: R-TST40 — 벽시계로 판정하지 않는다. 끝나지 않는 sweep 에 경쟁 타이머가 이기는지만 보므로 값의 크기는 판정과 무관하다.
+    const budgetMs = 1;
+    const { features, events } = await runRounds({ budgetMs, sweep: (_cwd, opts) => { seen = opts; return new Promise<never>(() => {}); } });
+    expect(features).toHaveLength(2);
+    expect(features[1]).not.toContain('같은 꼴 이웃');
+    expect(seen).toEqual({ deadlineMs: budgetMs, allowFallback: false });
+    expect(events[0]!.data).toMatchObject({ mode: 'shadow', budgetMs, outcome: 'timeout', reason: 'round-budget', injected: false });
+    expect(typeof events[0]!.data.elapsedMs).toBe('number');
+  });
+
+  test('shadow — 기본 스윕 경로에서 git 이 끝나지 않아도 라운드는 예산 안에 timeout 사건으로 넘어간다', async () => {
+    const hangingGit: BoundedRunner = (command) => command === 'git' ? new Promise(() => {}) : Promise.resolve({ code: 1, stdout: '', timedOut: false });
+    // 출처: R-TST40 — 벽시계로 판정하지 않는다. 끝나지 않는 git 에 경쟁 타이머가 이기는지만 보므로 값의 크기는 판정과 무관하다.
+    const budgetMs = 1;
+    const { features, events } = await runRounds({ budgetMs, sweep: (cwd, opts) => sweepWorktreeNeighbors(cwd, { ...opts, allowFallback: true }, { run: hangingGit }) });
+    expect(features).toHaveLength(2);
+    expect(events[0]!.data).toMatchObject({ mode: 'shadow', outcome: 'timeout', injected: false });
+    // 출처: R-TST40 — 넉넉한 상한으로만 본다(shadow 기본 예산). 판정의 본체는 위 timeout 이다.
+    expect(events[0]!.data.elapsedMs as number).toBeLessThan(NEIGHBOR_SWEEP_SHADOW_BUDGET_MS);
+  });
+
+  test('예산 기본값 — shadow 는 작은 예산·TS 폴백 없음 · on 은 전체 시한·폴백 허용', async () => {
+    const seen: Array<{ deadlineMs: number; allowFallback: boolean }> = [];
+    await runRounds({ sweep: async (_cwd, opts) => { seen.push(opts); return okSweep(); } });
+    await runRounds({ mode: 'on', sweep: async (_cwd, opts) => { seen.push(opts); return okSweep(); } });
+    expect(seen).toEqual([
+      { deadlineMs: NEIGHBOR_SWEEP_SHADOW_BUDGET_MS, allowFallback: false },
+      { deadlineMs: NEIGHBOR_SWEEP_DEADLINE_MS, allowFallback: true },
+    ]);
+  });
+
+  test('off — 부르지도 않고 사건도 없다', async () => {
+    let calls = 0;
+    const { events } = await runRounds({ mode: 'off', sweep: async () => { calls++; return okSweep(); } });
+    expect(calls).toBe(0);
+    expect(events).toHaveLength(0);
   });
 });

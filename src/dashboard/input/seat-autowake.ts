@@ -34,6 +34,9 @@ import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from './internal-t
 export const SEAT_AUTOWAKE_FILE = 'autowake';
 export const DEFAULT_AUTOWAKE_CONSECUTIVE_CAP = 5;
 export const DEFAULT_AUTOWAKE_HUMAN_QUIET_MS = 30_000;
+// ELN-SEAT-TURN-PACING(PLAN-ELN-SEAT-RUNTIME-1005 칸 3): 자동 턴 사이 최소 간격 — 계획 «기본 30~60s»의
+// 대표값 45s. 사람 턴에는 적용하지 않는다(autowake 가 연 턴만 잰다).
+export const DEFAULT_AUTOWAKE_MIN_GAP_MS = 45_000;
 
 // ── 큐 파서 ──────────────────────────────────────────────────────────────────────────
 
@@ -93,6 +96,8 @@ export type SeatAutowakeSkipReason =
   | 'human-recent'
   | 'same-order'
   | 'cap'
+  | 'min-gap'
+  | 'token-budget'
   | 'terminal-codex-400';
 
 /** The rendered error line is captured before the turn footer shortens it. */
@@ -122,6 +127,14 @@ export interface SeatAutowakeInput {
   /** 사람 입력 없이 연속으로 연 자동 턴 수. */
   consecutive: number;
   consecutiveCap?: number;
+  /** 자동 턴 사이 최소 간격(ms). 0/생략 = 제한 없음. */
+  minGapMs?: number | null;
+  /** 마지막 «자동» 턴이 끝난 시각(ms · 0 = 자동 턴 아직 없음). */
+  lastAutoTurnEndAt: number;
+  /** 하루 토큰 예산(입·출력 합). null/생략 = 예산 없음(제한 안 함). */
+  tokenBudget?: number | null;
+  /** 오늘 이미 쓴 토큰(입·출력 합). null = 모름(제한 안 함). */
+  tokensUsed?: number | null;
 }
 
 export type SeatAutowakeDecision =
@@ -161,6 +174,13 @@ export function decideSeatAutowake(input: SeatAutowakeInput): SeatAutowakeDecisi
   const quiet = input.humanQuietMs ?? DEFAULT_AUTOWAKE_HUMAN_QUIET_MS;
   if (input.lastHumanKeyAt > 0 && input.now - input.lastHumanKeyAt < quiet) return skip('human-recent', fingerprint);
   if (input.consecutive >= (input.consecutiveCap ?? DEFAULT_AUTOWAKE_CONSECUTIVE_CAP)) return skip('cap', fingerprint);
+  // 턴 사이 쉼(칸 3): 직전 «자동» 턴이 끝난 뒤 최소 간격이 지나기 전엔 새 자동 턴을 열지 않는다.
+  // lastAutoTurnEndAt=0(자동 턴 이력 없음 — 첫 기상 등)은 간격을 재지 않는다.
+  if (input.minGapMs && input.minGapMs > 0 && input.lastAutoTurnEndAt > 0
+    && input.now - input.lastAutoTurnEndAt < input.minGapMs) return skip('min-gap', fingerprint);
+  // 하루 토큰 예산(칸 3): 쓴 양을 알 수 있고 예산을 넘었으면 새 자동 턴을 열지 않는다.
+  if (input.tokenBudget != null && input.tokenBudget > 0 && input.tokensUsed != null
+    && input.tokensUsed >= input.tokenBudget) return skip('token-budget', fingerprint);
   if (input.lastFingerprint === fingerprint) return skip('same-order', fingerprint);
   return {
     action: 'start-turn',
@@ -187,11 +207,20 @@ export interface SeatAutowakeDeps {
   now?: () => number;
   humanQuietMs?: number;
   consecutiveCap?: number;
+  /** 턴 사이 최소 간격(ms). 생략 = DEFAULT_AUTOWAKE_MIN_GAP_MS · null/0 = 게이트 끔(레거시 시험 배선). */
+  minGapMs?: number | null;
+  /** 하루 토큰 예산(입·출력 합). 호출 시점 값 — null/생략 = 예산 없음. */
+  tokenBudget?: () => number | null;
+  /** 오늘 이미 쓴 토큰(입·출력 합). null = 모름 → 제한 안 함. */
+  tokensUsed?: () => number | null;
   /** 상한 도달 때 화면 한 줄(«사람 확인 필요»). */
   notify?: (line: string) => void;
   /** 입력칸이 마운트된 뒤 판정을 미루는 자리(기본 setTimeout 0 · unref). 시험은 즉시 실행을 넘긴다. */
   defer?: (fn: () => void, ms: number) => void;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** SEAT-SELF-PULL 이음매: 턴 끝 판정이 «남은 일 없음(nothing-pending)»일 때 한 번 부른다(실패는 삼킨다).
+   *  생략 = 기본 self-pull(자리 `self-pull` 파일 opt-in 일 때만 재료를 읽는다 · seat-self-pull-sources.ts). */
+  onNoWorkLeft?: (ctx: { seat: string; unread: number | null; queue: number | null }) => void;
 }
 
 export interface SeatAutowakeController {
@@ -218,6 +247,13 @@ function defaultDefer(fn: () => void, ms: number): void {
 
 export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeController {
   const home = deps.home ?? homedir();
+  // SEAT-SELF-PULL 기본 훅은 처음 «남은 일 없음»에서야 싣는다(순환 import 회피 · 부팅 비용 0).
+  let defaultNoWork: ((ctx: { seat: string; unread: number | null; queue: number | null }) => void) | null = null;
+  const onNoWorkLeft = deps.onNoWorkLeft ?? ((ctx: { seat: string; unread: number | null; queue: number | null }) => {
+    defaultNoWork ??= (require('./seat-self-pull-sources.js') as typeof import('./seat-self-pull-sources.js'))
+      .createAutowakeSelfPullHook({ startTurnIfIdle: deps.startTurnIfIdle, home });
+    defaultNoWork(ctx);
+  });
   const detect = deps.detectSeat ?? ((cwd: string) => {
     try { return detectSeatTui(cwd, { home }); } catch { return null; }
   });
@@ -231,16 +267,26 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
   const log = deps.log ?? ((c, e, d) => debug.log(c, e, d));
   const defer = deps.defer ?? defaultDefer;
   const quietMs = deps.humanQuietMs ?? DEFAULT_AUTOWAKE_HUMAN_QUIET_MS;
+  // 칸 3 토큰 예산: 판정 게이트는 있으나 «기본 소스»는 없다(기본 off — deps 주입이 있을 때만 켠다).
+  // 자리 기준 사용량 배선(예산 파일·원장 읽기)은 후속 칸 ELN-SEAT-AUTOWAKE-BUDGET 이 가져간다
+  // (D-38013-SPLIT-1117 §2·§3 — r6 mustFix 2·3·4 쪼개기).
+  const readBudget = deps.tokenBudget ?? ((): number | null => null);
+  const readTokensUsed = deps.tokensUsed ?? ((): number | null => null);
 
   let turnEnded = false;
   let lastFingerprint: string | null = null;
   let consecutive = 0;
   let lastOpenedAt = 0;
   let capNotified = false;
+  let budgetNotified = false;
   let recheckArmed = false;
   let activeSessionId: string | null = null;
   let lastOrphanFailure: { callId: string; count: number } | null = null;
   let terminalCallId: string | null = null;
+  // 칸 3(턴 사이 쉼): 마지막 «자동» 턴이 끝난 시각 — noteTurnEnded 에서 찍는다(사람 턴은 잊는다).
+  let lastAutoTurnEndAt = 0;
+  // «지금 돌고 있는» 턴이 autowake 가 열 것인가 — check() 가 열 때 true, noteTurnEnded 에서 소비 후 즉시 false.
+  let autoOpenedThisTurn = false;
 
   const check: SeatAutowakeController['check'] = () => {
     const detection = detect(deps.getCwd());
@@ -255,7 +301,7 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
       turnEnded = false;
       return decideSeatAutowake({
         seat, enabled, turnEnded: false, unread: null, queue: { known: false, reason: 'absent' },
-        now: 0, lastHumanKeyAt: 0, lastFingerprint, consecutive,
+        now: 0, lastHumanKeyAt: 0, lastFingerprint, consecutive, lastAutoTurnEndAt,
       });
     }
     const humanAt = humanKeyAt();
@@ -267,6 +313,10 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
     const decision = decideSeatAutowake({
       seat, enabled, turnEnded, unread, queue, now: t, lastHumanKeyAt: humanAt,
       humanQuietMs: quietMs, lastFingerprint, consecutive, consecutiveCap: deps.consecutiveCap,
+      minGapMs: deps.minGapMs === undefined ? DEFAULT_AUTOWAKE_MIN_GAP_MS : deps.minGapMs,
+      lastAutoTurnEndAt,
+      tokenBudget: readBudget(),
+      tokensUsed: readTokensUsed(),
     });
     if (terminalCallId && activeSessionId) {
       turnEnded = false;
@@ -295,6 +345,29 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
         log('tui.autowake', 'decided', { ...base, rejected: true, reason: 'human-recent' });
         return decision;
       }
+      if (decision.reason === 'min-gap') {
+        // 칸 3(턴 사이 쉼): 최소 간격 이내 — 무장은 그대로(쉼이 지나면 다음 check() 에서 재개).
+        // 이 분기에 왔다는 것은 decide 가 minGapMs>0 를 본 것 — null/undefined 일 수 없어 기본값으로 흘려도 안전.
+        const gap = deps.minGapMs ?? DEFAULT_AUTOWAKE_MIN_GAP_MS;
+        if (!recheckArmed) {
+          recheckArmed = true;
+          defer(() => { recheckArmed = false; check(); }, Math.max(0, gap - (t - lastAutoTurnEndAt)) + 50);
+        }
+        log('tui.autowake', 'decided', { ...base, rejected: true, reason: 'min-gap' });
+        return decision;
+      }
+      if (decision.reason === 'token-budget') {
+        // 칸 3: 하루 예산 소진 — 무장은 유지(예산이 돌아오면 재개). 다음 사람 키에서 알림 리셋.
+        if (!budgetNotified) {
+          budgetNotified = true;
+          log('tui.autowake', 'budget', { ...base });
+          const used = readTokensUsed();
+          const budget = readBudget();
+          deps.notify?.(`⏸ 하루 토큰 예산 도달(${used ?? '?'}/${budget ?? '?'}) — 사람 확인 필요 · 키 하나면 다시 이어간다`);
+        }
+        log('tui.autowake', 'decided', { ...base, rejected: true, reason: 'token-budget' });
+        return decision;
+      }
       turnEnded = false;
       if (decision.reason === 'cap') {
         if (!capNotified) {
@@ -304,6 +377,10 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
         }
       }
       log('tui.autowake', 'decided', { ...base, rejected: true, reason: decision.reason });
+      if (decision.reason === 'nothing-pending') {
+        try { onNoWorkLeft({ seat, unread: decision.unread, queue: decision.queue }); }
+        catch (error) { log('tui.autowake', 'no-work-hook-error', { seat, error: String(error).slice(0, 200) }); }
+      }
       return decision;
     }
     const result = deps.startTurnIfIdle(decision.prompt, { origin: 'autowake', reason: decision.reason });
@@ -312,6 +389,7 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
       lastFingerprint = decision.fingerprint;
       consecutive += 1;
       lastOpenedAt = t;
+      autoOpenedThisTurn = true; // noteTurnEnded 가 lastAutoTurnEndAt 를 찍는 근거.
       log('tui.autowake', 'decided', { ...base, consecutive, opened: true, reason: decision.reason, turnId: result.turnId });
       return { ...decision, opened: true };
     }
@@ -323,6 +401,19 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
   return {
     noteTurnEnded(result) {
       turnEnded = true;
+      // 칸 3(턴 사이 쉼) ⊕ MF1(r6 mustFix 1): 종료된 턴이 autowake 가 열 턴이었는지는 «이 순간에만»
+      // 알 수 있다 — 소비하자마자 되돌린다(false). 그래야 다음 턴이 사람 턴일 때 아래 else 가 맞게 돈다.
+      const endedAutoTurn = autoOpenedThisTurn;
+      autoOpenedThisTurn = false;
+      if (endedAutoTurn) {
+        // 자동 턴의 종료 시각 — min-gap 판정의 기준. deps.now() 로 찍는다(Date.now() 직접 금지 —
+        // 시험 가짜 시계와 어긋나 min-gap 이 항상 걸린다).
+        lastAutoTurnEndAt = now();
+      } else {
+        // 사람 턴 종료 — 자동 턴 사이 쉼의 기준이 아니다: lastAutoTurnEndAt 를 지운다(0 = 기록 없음).
+        // 사람이 직접 마무리한 뒤 남은 일이 있으면 간격 없이 곧바로 이어붙인다(사람 턴 뒤 즉시 재개).
+        lastAutoTurnEndAt = 0;
+      }
       if (!result) return;
       if (result.sessionId !== activeSessionId) {
         activeSessionId = result.sessionId;

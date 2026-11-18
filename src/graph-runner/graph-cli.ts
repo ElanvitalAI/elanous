@@ -5,35 +5,20 @@ import { parse as parseYaml } from 'yaml';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import type { GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { debug } from '../debug/log.js';
-import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, manageGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
+import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, manageGraphRun, readGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
 import { defaultCapabilityRegistryForGraph } from './plugin-graph-providers.js';
 import { importN8nExecuteWorkflow } from '../graph-v2/n8n-import.js';
 import { resolveGraphUnit } from '../self-implement/graph-unit-resolver.js';
+import { findGraphFile } from './graph-file-lookup.js';
 import { loadGraphPluginFromDir } from './graph-manifest-loader.js';
 import { watchGraphRunEvents } from './graph-run-event-ledger.js';
 import { saveGraphRunMsgSubscriber } from './graph-run-msg-subscriptions.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { KNOWN_ISSUE_ROUTE } from './release-known-issue-waiver.js';
 import { resolveGraphCliVerifiedOwner } from './graph-cli-owner.js';
+import { ApprovalPresentationUnavailableError, withCliAppBuildApprovalProvider } from './app-build/cli-publish-approval-provider.js';
+import { genericResumeApprovalRefusal, savedAppBuildApprovalResumeInput, savedAppBuildApprovalStartInput } from './app-build/cli-publish-approval-resume.js';
 
-function findGraphFile(graphId: string, extraRoots: string[] = []): string | undefined {
-  const roots = [...extraRoots.map((root) => resolve(root)), resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
-  for (const root of roots) {
-    for (const dir of [root, ...['release', 'ops'].map((part) => join(root, part))]) {
-      if (!existsSync(dir)) continue;
-      for (const name of readdirSync(dir)) {
-        if (!name.endsWith('.yaml') || name === 'recipes.yaml') continue;
-        const file = join(dir, name);
-        if (!existsSync(join(dir, 'recipes.yaml'))) continue;
-        try {
-          const parsed: unknown = parseYaml(readFileSync(file, 'utf8'));
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed as Record<string, unknown>).graph_id === graphId) return file;
-        } catch { continue; }
-      }
-    }
-  }
-  return undefined;
-}
 
 
 export function registerGraphCommands(program: Command, runsDeps: {
@@ -207,10 +192,57 @@ export function registerGraphCommands(program: Command, runsDeps: {
           if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('--input must be a JSON object');
           input = parsed as Record<string, unknown>;
         }
-        const verifiedOwnerId = opts.dryRun ? undefined : await resolveGraphCliVerifiedOwner(file, input);
-        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
+        const graphHeader: unknown = opts.resume ? parseYaml(readFileSync(file, 'utf8')) : undefined;
+        const header = graphHeader && typeof graphHeader === 'object' && !Array.isArray(graphHeader)
+          ? graphHeader as { graph?: { id?: unknown } } : undefined;
+        const appBuildResume = Boolean(opts.resume && header?.graph?.id === 'app-build');
+        if (appBuildResume && (opts.input !== undefined || opts.useCurrentGraph))
+          throw new Error('app-build resume uses only the saved input and graph snapshot');
+        const saved = appBuildResume ? readGraphRun('app-build', opts.resume!, runsDeps.root ?? effectiveInstanceRoot()) : undefined;
+        const savedInput = saved?.input && typeof saved.input === 'object' && !Array.isArray(saved.input)
+          ? saved.input as Record<string, unknown> : undefined;
+        const verifiedOwnerId = opts.dryRun ? undefined : await resolveGraphCliVerifiedOwner(file, savedInput ?? input);
+        if (appBuildResume && !verifiedOwnerId) {
+          // APP-BUILD-SESSION-REFRESH: name an expired/short session instead of the generic owner refusal.
+          const [{ inspectTuiMemberSessionFile, tuiMemberSessionPath }, budget, { getElanousConfigDir }] = await Promise.all([
+            import('../tui/member-session-contract.js'), import('../tui/member-session-budget.js'), import('../elanous-config-dir.js')]);
+          try {
+            budget.assertMemberSessionCovers('approval-start', inspectTuiMemberSessionFile(
+              tuiMemberSessionPath(getElanousConfigDir(), process.env.ELANOUS_MEMBER_SESSION_FILE)));
+          } catch (error) {
+            if (error instanceof budget.MemberSessionExpiringError) throw new Error(error.userMessage);
+            throw error;
+          }
+        }
+        if (appBuildResume && (!verifiedOwnerId || verifiedOwnerId !== (savedInput?.context as { memberId?: unknown } | undefined)?.memberId))
+          throw new Error('app-build resume requires the fresh saved member and app slot');
+        const pendingResume = saved && opts.from === 'publish-approval'
+          ? savedAppBuildApprovalResumeInput(saved, file) : undefined;
+        const approvedStart = saved && !opts.from && !opts.fromVisit && saved.status === 'awaiting-approval'
+          && saved.pending?.decision === 'approved'
+          ? savedAppBuildApprovalStartInput(saved, file) : undefined;
+        const formalApproval = pendingResume ?? approvedStart;
+        if (formalApproval && (!process.stdin.isTTY || !process.stderr.isTTY))
+          throw new Error('formal app-build approval requires an authenticated local terminal');
+        // The graph keeps its parent signal after approval; only the approval provider owns its four-minute window.
+        const approvalSignal = formalApproval ? new AbortController().signal : undefined;
+        const capabilityProviders = runsDeps.capabilityProviders ?? await defaultCapabilityRegistryForGraph(file, runsDeps.root);
+        if (formalApproval && !('contracts' in capabilityProviders))
+          throw new Error('formal app-build approval needs a declared capability registry');
+        const approvalRegistry = formalApproval && approvalSignal && 'contracts' in capabilityProviders
+          ? withCliAppBuildApprovalProvider(capabilityProviders, { ownerId: verifiedOwnerId!,
+            runId: saved!.runId, appSlug: (pendingResume?.input ?? approvedStart)!.appSlug as string,
+            signal: approvalSignal, ...(pendingResume?.pendingExpiresAt ? { resumePendingExpiresAt: pendingResume.pendingExpiresAt } : {}),
+            presentUrl: (url, expiresAt) => new Promise<void>((done, fail) => {
+              process.stderr.write(`Owner approval: ${url}\nExpires: ${expiresAt}\n`, error => {
+                if (error) fail(new ApprovalPresentationUnavailableError('owner terminal write failed'));
+                else done();
+              });
+            }) }) : capabilityProviders;
+        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from && !pendingResume ? { fromNodeId: opts.from } : {}), ...(pendingResume ? { fromVisitId: pendingResume.executionId } : opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
           ...(verifiedOwnerId ? { verifiedOwnerId } : {}),
-          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: runsDeps.capabilityProviders ?? await defaultCapabilityRegistryForGraph(file, runsDeps.root) } });
+          ...(approvalSignal ? { signal: approvalSignal } : {}),
+          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: approvalRegistry } });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;
@@ -634,6 +666,10 @@ export function registerGraphCommands(program: Command, runsDeps: {
           throw new Error('--file cannot change the graph path of a snapshot run (이 런은 시작 때 그래프 사본이 있다 — --file 대신 --use-current-graph)');
         }
         const from = opts.fromVisit ? undefined : opts.from ?? (saved.status === 'failed' ? [...saved.nodes].reverse().find((node) => !node.ok)?.nodeId : undefined);
+        // The generic resume has no owner window: a restart that would reach owner approval is refused.
+        const trustedOnly = genericResumeApprovalRefusal(saved, opts.fromVisit
+          ? saved.nodes.find(node => node.executionId === opts.fromVisit)?.nodeId : from);
+        if (trustedOnly) throw new Error(trustedOnly);
         const file = saved.graphSnapshot
           ? saved.graphPath
           : opts.file ?? (saved.graphPath && existsSync(saved.graphPath) ? saved.graphPath : undefined) ?? findGraphFile(saved.graphId);

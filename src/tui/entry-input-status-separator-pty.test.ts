@@ -57,7 +57,8 @@ test('actual entry keeps the minimum-height prompt and omits decoration for a cr
   ]);
   const minimum = frames.find(frame => frame.label === 'minimum height')!.screen;
   expect(rowsOf(minimum)).toHaveLength(height);
-  expect(promptRow(minimum)).toBe(height - 1);
+  // DESIGN §2b (#38392): the status line is the last row; the input sits right above it.
+  expect(promptRow(minimum)).toBe(height - 2);
   expect(separator(minimum)).toBe('─'.repeat(40));
   const crowded = frames.find(frame => frame.label === 'crowded command footer')!.screen;
   // At six rows the command title clips; the actual first menu item still renders.
@@ -89,6 +90,7 @@ test('actual entry sizes the separator to the chat pane through sidebar and widt
       expect(chatPart(line)).toBe('─'.repeat(width - Bun.stringWidth(left) - Bun.stringWidth('│')));
       expect(chatPart(line)).not.toBe('─'.repeat(width));
     }
-    expect(promptRow(frame.screen)).toBe(24 - 1);
+    // DESIGN §2b (#38392): the status line is the last row; the input sits right above it.
+    expect(promptRow(frame.screen)).toBe(24 - 2);
   }
 }, 30_000);

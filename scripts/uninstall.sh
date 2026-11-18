@@ -61,6 +61,10 @@ ELN="$PREFIX/bin/eln"
 if [ -f "$ELN" ] && [ ! -L "$ELN" ] && [ "$(sed -n '2p' "$ELN")" = '# elanous-wrapper' ]; then
   rm -f -- "$ELN"
 fi
+ELS="$PREFIX/bin/els"
+if [ -f "$ELS" ] && [ ! -L "$ELS" ] && [ "$(sed -n '2p' "$ELS")" = '# elanous-wrapper' ]; then
+  rm -f -- "$ELS"
+fi
 rm -f -- "$PREFIX/bin/elanous" "$PREFIX/bin/bun"
 rmdir -- "$PREFIX/bin" 2>/dev/null || true
 KEPT=""

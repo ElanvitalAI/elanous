@@ -4,6 +4,7 @@ import { afterAll, beforeEach, describe, expect, setDefaultTimeout, test } from 
 // manifest 저장소가 이 격리 환경에서 한 op 당 수 초가 걸린다(실측 27s/2 tests) — 기본 5s 로는 판정선과 무관한
 // 시간초과가 나므로 파일 기본 상한을 올려 «단언 실패»와 «환경 지연» 을 구분한다.
 setDefaultTimeout(60_000);
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,13 +15,14 @@ process.env.ELANOUS_STATE_DIR = stateDir;
 
 const { upsertPtyManifest, getPtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestBuild, updatePtyManifestProgress, updatePtyManifestTurn, markPtyManifestClosed } = await import('./pty-manifest.js');
 const {
-  buildSelfHealthLine, describePtyRunState, describeTurnCell, formatTurnCell, judgeBuildStaleness, judgeTurnProgress, ptyTurnViewOfRow, readCurrentInstallRecord, reportTuiAbortRequested, reportTuiProgress, reportTuiTurn, resetTuiRunStateForTesting,
+  buildSelfHealthLine, describePtyRunState, describeTurnCell, formatTurnCell, judgeBuildStaleness, judgeTurnProgress, ptyTurnViewOfRow, readCurrentInstallRecord, reportTuiAbortRequested, reportTuiHerdrBlocked, reportTuiProgress, reportTuiTurn, resetTuiRunStateForTesting,
   resolveRunningBuild, startTuiRunStateRecorder, DEFAULT_ABORT_IGNORE_MS, DEFAULT_SLOW_TURN_MS, DEFAULT_TURN_STALL_MS,
   DEFAULT_SELF_RESTART_IDLE_MS, decideSelfRestart,
   setTuiRelaunchSpawnForTesting, TUI_RELAUNCH_FLAG,
 } = await import('./tui-run-state.js');
 const { createHerdrAgentReporter } = await import('./herdr-agent-report.js');
-const { startTuiSelfReport } = await import('../capture/tui-self-report.js');
+const { startTuiSelfReport, tuiHerdrModel } = await import('../capture/tui-self-report.js');
+const { notifyApprovalHerdrBlocked } = await import('../approval-herdr-hook.js');
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
@@ -230,23 +232,175 @@ describe('herdr agent report wiring', () => {
     expect(events).toContain('herdr-turn-threw');
   });
 
+  test('herdr 소켓: 기동 idle · 턴 working · 승인 blocked · 끝 idle · 종료 release', () => {
+    const states: string[] = [];
+    let released = 0;
+    const herdrSocket = {
+      state: (next: string, message?: string) => { states.push(message ? `${next}:${message}` : next); },
+      metadata: () => {},
+      settled: async () => {},
+      release: () => { released += 1; },
+    };
+    const stop = startTuiRunStateRecorder('tui:herdr-socket', {
+      now: () => 1,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true,
+      writeTurn: () => true,
+      herdr: null,
+      herdrSocket,
+    });
+    reportTuiTurn('busy');
+    reportTuiHerdrBlocked(true, 'askUser');
+    reportTuiHerdrBlocked(false);
+    reportTuiTurn('idle');
+    stop();
+    expect(states).toEqual(['idle', 'working', 'blocked:askUser', 'working', 'idle']);
+    expect(released).toBe(1);
+  });
+
+  test('승인 모달 훅이 열리면 blocked, 닫히면 턴 working 으로 돌아온다', () => {
+    const states: string[] = [];
+    const herdrSocket = {
+      state: (next: string, message?: string) => { states.push(message ? `${next}:${message}` : next); },
+      metadata: () => {},
+      settled: async () => {},
+      release: () => {},
+    };
+    const stop = startTuiRunStateRecorder('tui:herdr-socket-hook', {
+      now: () => 1,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true,
+      writeTurn: () => true,
+      herdr: null,
+      herdrSocket,
+    });
+    reportTuiTurn('busy');
+    notifyApprovalHerdrBlocked(true, 'askUser');
+    notifyApprovalHerdrBlocked(false, 'askUser');
+    stop();
+    expect(states).toEqual(['idle', 'working', 'blocked:askUser', 'working']);
+  });
+
+  test('먼저 시작한 녹음기의 stop 은 뒤 녹음기의 승인 훅을 지우지 않는다 (r6 mf1)', () => {
+    const socketFor = (states: string[]) => ({
+      state: (next: string, message?: string) => { states.push(message ? `${next}:${message}` : next); },
+      metadata: () => {},
+      settled: async () => {},
+      release: () => {},
+    });
+    const deps = {
+      now: () => 1,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' as const }),
+      writeBuild: () => true,
+      writeTurn: () => true,
+      herdr: null,
+    };
+    const first: string[] = [];
+    const second: string[] = [];
+    const stopFirst = startTuiRunStateRecorder('tui:hook-owner-1', { ...deps, herdrSocket: socketFor(first) });
+    const stopSecond = startTuiRunStateRecorder('tui:hook-owner-2', { ...deps, herdrSocket: socketFor(second) });
+    stopFirst();
+    notifyApprovalHerdrBlocked(true, 'approval');
+    notifyApprovalHerdrBlocked(false, 'approval');
+    stopSecond();
+    notifyApprovalHerdrBlocked(true, 'approval');
+    expect(second).toEqual(['idle', 'blocked:approval', 'idle']);
+    expect(first).toEqual(['idle']);
+  });
+
+  test('모달이 열린 동안 턴 보고는 blocked 를 덮지 않고, 닫히면 그 사이 마지막 턴으로 돌아간다 (r5 mf1)', () => {
+    const states: string[] = [];
+    const herdrSocket = {
+      state: (next: string, message?: string) => { states.push(message ? `${next}:${message}` : next); },
+      metadata: () => {},
+      settled: async () => {},
+      release: () => {},
+    };
+    const stop = startTuiRunStateRecorder('tui:herdr-socket-modal-turn', {
+      now: () => 1,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true,
+      writeTurn: () => true,
+      herdr: null,
+      herdrSocket,
+      signals: null,
+    });
+    notifyApprovalHerdrBlocked(true, 'askUser');
+    reportTuiTurn('busy');
+    notifyApprovalHerdrBlocked(false, 'askUser');
+    notifyApprovalHerdrBlocked(true, 'approval');
+    reportTuiTurn('idle');
+    notifyApprovalHerdrBlocked(false, 'approval');
+    stop();
+    expect(states).toEqual(['idle', 'blocked:askUser', 'working', 'blocked:approval', 'idle']);
+  });
+
+  test('SIGINT·SIGTERM 죽음에도 소켓 권위를 반납하고, release 응답 뒤에 기본 죽음을 잇는다 (r5 mf2)', async () => {
+    const order: string[] = [];
+    let finishRelease: () => void = () => {};
+    const herdrSocket = {
+      state: () => {},
+      metadata: () => {},
+      release: () => { order.push('release'); },
+      settled: () => new Promise<void>((resolve) => { finishRelease = () => { order.push('release-acked'); resolve(); }; }),
+    };
+    const ls = new Map<string, Array<(s: NodeJS.Signals) => void>>();
+    const signals = {
+      pid: process.pid,
+      on(sig: NodeJS.Signals, fn: (s: NodeJS.Signals) => void) { ls.set(sig, [...(ls.get(sig) ?? []), fn]); return signals; },
+      removeListener(sig: NodeJS.Signals, fn: (s: NodeJS.Signals) => void) { ls.set(sig, (ls.get(sig) ?? []).filter((f) => f !== fn)); return signals; },
+      listenerCount: (sig: NodeJS.Signals) => (ls.get(sig) ?? []).length,
+      kill: (_pid: number, sig?: string | number) => { order.push(`kill:${String(sig)}`); return true; },
+    };
+    const herdr = { start: () => {}, turn: () => {}, release: () => order.push('legacy-release') };
+    const stop = startTuiRunStateRecorder('tui:herdr-socket-sig', {
+      now: () => 1, build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true, writeTurn: () => true, herdr, herdrSocket, signals,
+    });
+    for (const fn of [...(ls.get('SIGTERM') ?? [])]) fn('SIGTERM');
+    await Promise.resolve();
+    // 반납 프레임 응답 전에는 아무 지킴이도 죽이지 않는다.
+    expect(order).toEqual(['legacy-release', 'release']);
+    finishRelease();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(order).toEqual(['legacy-release', 'release', 'release-acked', 'kill:SIGTERM']);
+    expect([signals.listenerCount('SIGINT'), signals.listenerCount('SIGTERM')]).toEqual([0, 0]);
+    stop();
+  });
+
+  test('herdr 배지 모델은 상태줄과 같은 해석기 · unset·실패는 모름', () => {
+    const seen: Array<string | undefined> = [];
+    const resolve = (sessionId?: string) => { seen.push(sessionId); return { model: ' claude-opus-5.5 ' }; };
+    expect(tuiHerdrModel(() => 'sess-1', resolve)).toBe('claude-opus-5.5');
+    expect(seen).toEqual(['sess-1']);
+    expect(tuiHerdrModel(() => null, () => ({ model: 'unset' }))).toBeUndefined();
+    expect(tuiHerdrModel(() => null, () => { throw new Error('no config'); })).toBeUndefined();
+  });
+
   test('writeTurn injected without herdr never runs the herdr binary (spy call count 0, with a positive control)', async () => {
     // 프로세스 실행 스파이 = 호출마다 한 줄 적는 가짜 herdr. 대조군(실 신고기)이 같은 스파이에 잡히는지 먼저 본다.
     const dir = mkdtempSync(join(tmpdir(), 'herdr-spy-'));
     const spyLog = join(dir, 'calls.log');
     const spyBin = join(dir, 'herdr');
-    writeFileSync(spyBin, `#!/bin/sh\necho "$*" >> '${spyLog}'\n`, { mode: 0o755 });
+    // 즉시 종료 — startup prune 은 동기 ≤300ms 라 sleep 이 있으면 호출이 잘려 로그가 안 남는다.
+    writeFileSync(spyBin, `#!/bin/sh\necho "$*" >> '${spyLog}'\nexit 0\n`, { mode: 0o755 });
     const spyLines = (): string[] => (existsSync(spyLog) ? readFileSync(spyLog, 'utf8').split('\n').filter(Boolean) : []);
+    // 새로 쓴 실행 파일의 첫 실행은 OS 검사로 300ms 동기 상한을 넘길 수 있다 — 상한 없이 한 번 데워 두고 로그를 비운다.
+    spawnSync(spyBin, ['warmup']);
+    rmSync(spyLog, { force: true });
     const env = { HERDR_ENV: '1', HERDR_PANE_ID: 'wM:p1', HERDR_BIN_PATH: spyBin };
-    const keys = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'ELANOUS_HERDR_REPORT'] as const;
+    // HERDR_SOCKET_PATH 가 남아 있으면 대조군 반납이 CLI 스파이가 아니라 소켓으로 간다.
+    const keys = ['HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_BIN_PATH', 'HERDR_SOCKET_PATH', 'ELANOUS_HERDR_REPORT'] as const;
     const previous = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
     Object.assign(process.env, env);
     delete process.env.ELANOUS_HERDR_REPORT;
+    delete process.env.HERDR_SOCKET_PATH;
     try {
-      // 대조군 — herdr 가 있는 경로는 startup prune 을 동기로 부르고 등록 둘을 비동기로 보낸다.
-      // 총 호출 수를 기대하지 말고 두 등록 완료를 확인해, 늦은 대조군 호출이 herdr 없는 경로를 오염시키지 않게 한다.
+      // 대조군 — herdr 가 있는 경로는 startup prune(동기 release-agent)을 먼저 부르고 등록 둘을 비동기로 보낸다.
+      // 총 호출 수를 기대하지 말고 prune 과 두 등록 완료를 확인해, 늦은 대조군 호출이 herdr 없는 경로를 오염시키지 않게 한다.
       const control = createHerdrAgentReporter({ env, sessionId: 'control', seqStore: { read: () => undefined, write: () => {} } })!;
       control.start();
+      expect(spyLines().some((line) => /^pane release-agent wM:p1 --source custom:elanous --agent elanous --seq \d+$/.test(line))).toBe(true);
       const registrationsComplete = () => {
         const lines = spyLines();
         return lines.some((line) => line.includes('pane report-agent --source'))
@@ -254,7 +408,6 @@ describe('herdr agent report wiring', () => {
       };
       for (let i = 0; i < 100 && !registrationsComplete(); i++) await new Promise((r) => setTimeout(r, 20));
       expect(registrationsComplete()).toBe(true);
-      expect(spyLines().some((line) => /^pane release-agent wM:p1 --source custom:elanous --agent elanous --seq \d+$/.test(line))).toBe(true);
       control.release();
       rmSync(spyLog, { force: true });
 

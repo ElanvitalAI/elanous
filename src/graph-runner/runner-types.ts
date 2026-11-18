@@ -35,6 +35,8 @@ export interface GraphRunState {
   s2CorrectionBudget?: S2CorrectionBudget;
   /** The first authenticated host owner; never replaced by resume input. */
   s2CorrectionOwnerId?: string;
+  /** Owner of an S2 run started without a budget; resume must present the same owner (#38309 REVIEW-1). */
+  s2RunOwnerId?: string;
   startedAt?: string;
   finishedAt?: string;
   pid?: number;
@@ -64,7 +66,7 @@ export interface GraphRunState {
     invalidatedByEvent?: string;
     failure?: { errorCode: string; message: string; stage: string }; decidedBy?: string; decidedAt?: string;
     startedAt?: string; endedAt?: string; seconds?: number;
-    waiver?: { reason: string; at: string; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
+    waiver?: { reason: string; at: string; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; /** RECUT-GATE-WAIVE — the earlier owner-accepted sweep this waiver inherits, with the unmeasured extra diff. */ carriedSweep?: { runId: string; version: string; cut: string; tip: string; commits: string[]; priorWaiverReason: string; priorWaiverAt?: string; source: string }; original: { exit: number | null; output?: unknown; error?: string } } }>;
   /** The node now running and when it started; cleared when its record is written. */
   currentNode?: { nodeId: string; executionId?: string; startedAt: string };
   input?: unknown;
@@ -177,7 +179,7 @@ export interface GraphRunOptions {
   /** Embedded runs (a classify verdict inside self-implement) keep the per-node `[graph]` stderr lines off the caller's terminal; debug.log still records every node. */
   quiet?: boolean;
   /** Release-only: accept the recorded failed node without executing it, and expose its regression to known-issues. */
-  releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[]; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; unmeasured?: string };
+  releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[]; approvedBy?: string; introducedIds?: string[]; ownerWaived?: boolean; unmeasured?: string; carriedSweep?: { runId: string; version: string; cut: string; tip: string; commits: string[]; priorWaiverReason: string; priorWaiverAt?: string; source: string } };
   releasePwaFanOutWaiver?: { reason: string };
   /** Release-only: durable authorization ledger from which a waived graph transition must be consumed. */
   waiverLedgerRoot?: string;

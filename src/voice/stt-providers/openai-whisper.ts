@@ -13,6 +13,7 @@
 //     (not portable) — elanous takes the public REST path instead.
 
 import { debug } from '../../debug/log.js';
+import { llmNetworkFetch } from '../../session-runtime/llm-call-gateway.js';
 import {
   type OpenAIWhisperConfig,
   type STTOpts,
@@ -111,11 +112,11 @@ export class OpenAIWhisperProvider implements STTProvider {
       });
 
     const t0 = Date.now();
-    const response = await fetch(url, {
+    const response = await llmNetworkFetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}` },
       body: form,
-    });
+    }, { provider: 'openai', model: this.model, role: 'aux', requestedBy: 'voice-stt' });
     const latencyMs = Date.now() - t0;
 
     if (!response.ok) {
@@ -199,11 +200,11 @@ export class OpenAIWhisperProvider implements STTProvider {
     }
     const url = `${this.baseUrl}/v1/audio/transcriptions`;
     const t0 = Date.now();
-    const response = await fetch(url, {
+    const response = await llmNetworkFetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}` },
       body: form,
-    });
+    }, { provider: 'openai', model: this.model, role: 'aux', requestedBy: 'voice-stt' });
     const latencyMs = Date.now() - t0;
     if (!response.ok) {
       const body = await response.text().catch(() => '');

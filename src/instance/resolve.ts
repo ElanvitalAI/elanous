@@ -128,3 +128,46 @@ export function effectiveInstanceRoot(): string {
   memoRoot = resolveInstance().root;
   return memoRoot;
 }
+
+/** RESEARCH-HARNESS-ISOLATION-STATE-DIR — state 축만의 뿌리 규칙(순수 함수).
+ *  코드가 운영 루트로 건 config override(`programmatic`)는 격리 스탬프(`ELANOUS_STATE_DIR`)의 state 를 운영으로 끌어오지 않는다.
+ *  측정 러너가 운영 설정을 읽으려고 `setElanousConfigDir(~/.elanous)` 를 걸자 logs.db 가 운영으로 갔다(RES 08:0x 발견).
+ *  사람·CLI 의 `--config-dir`(`flag`)은 우주 선택이라 종전대로 이긴다 — `where` 와 state 가 같은 운영을 가리킨다.
+ *  격리 override(운영이 아닌 루트)도 종전대로 이긴다 — 의도된 별개 우주(매뉴얼 §3 B)를 지킨다. */
+export function stateRootOverStamp(instanceRoot: string, stamp: string | undefined, prodRoot: string,
+  overrideSource: 'flag' | 'programmatic' | undefined): string {
+  const s = stamp?.trim();
+  if (!s || overrideSource !== 'programmatic') return instanceRoot;
+  const prod = normRoot(prodRoot);
+  const stampRoot = normRoot(s);
+  return normRoot(instanceRoot) === prod && stampRoot !== prod ? stampRoot : instanceRoot;
+}
+
+const reportedStateRootSplits = new Set<string>();
+
+/** state 축 실효 뿌리 — `effectiveInstanceRoot()` 에 위 규칙만 더한다. config 축(`getElanousConfigDir`)은 바꾸지 않는다.
+ *  두 축이 갈리면 `instance.identity/state-root-split` 관측을 뿌리 쌍마다 한 번 남긴다(로그 저장소가 이 함수를 다시 불러도 한 번). */
+export function effectiveStateRoot(): string {
+  const instanceRoot = effectiveInstanceRoot();
+  let source: 'flag' | 'programmatic' | undefined;
+  try {
+    const { getElanousConfigDirOverrideSource } = require('../elanous-config-dir.js') as typeof import('../elanous-config-dir.js');
+    source = getElanousConfigDirOverrideSource();
+  } catch { /* 부팅 초기 — override 없음으로 본다 */ }
+  const stateRoot = stateRootOverStamp(instanceRoot, process.env.ELANOUS_STATE_DIR, prodInstanceRoot(), source);
+  if (stateRoot !== instanceRoot) {
+    const key = `${instanceRoot}\0${stateRoot}`;
+    if (!reportedStateRootSplits.has(key)) {
+      reportedStateRootSplits.add(key);
+      try {
+        const { logDiagnostic } = require('../mss/logging/diagnostic-sink.js') as typeof import('../mss/logging/diagnostic-sink.js');
+        logDiagnostic('instance.identity', 'state-root-split', { configRoot: instanceRoot, stateRoot, overrideSource: source ?? null,
+          why: '코드가 건 운영 config override ⊕ 격리 스탬프 — config 는 운영, state 는 스탬프' }, { level: 'warn' });
+      } catch { /* 관측 실패가 해석을 바꾸지 않는다 */ }
+    }
+  }
+  return stateRoot;
+}
+
+/** 시험 전용 — 한 번만 남기는 split 관측 기억을 지운다. */
+export function resetStateRootSplitReportsForTesting(): void { reportedStateRootSplits.clear(); }

@@ -3,10 +3,12 @@
   "name": "GCP architect expansion fake lifecycle",
   "audience": "internal",
   "implementation": [
-    "src/ux-sim/gcp-architect-expand-fake-world.ts"
+    "src/ux-sim/gcp-architect-expand-fake-world.ts",
+    "src/ux-sim/gcp-architect-expand/scene5-fake-provider.ts"
   ],
   "tests": [
-    "src/ux-sim/gcp-architect-expand-fake-world.test.ts"
+    "src/ux-sim/gcp-architect-expand-fake-world.test.ts",
+    "src/ux-sim/gcp-architect-expand/scene5-fake-provider.test.ts"
   ],
   "target": "Simulates shortage detection, priced proposal shape, approval, fake project lifecycle, idle stop, and cost ledger without live GCP calls.",
   "inputs": [

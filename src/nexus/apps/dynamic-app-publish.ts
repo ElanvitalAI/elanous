@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync,
   realpathSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -64,6 +64,10 @@ export interface DynamicPublisherOptions {
   readonly testMemberId?: string;
   readonly testHandle?: string;
   readonly testApprovalExpiresAt?: string;
+  /** Local issuer only: the bridge must verify the current official member and app slot. */
+  readonly verifiedMemberIssuer?: boolean;
+  /** Persistent Nexus-only key; signs the private member issuer claim, never graph input. */
+  readonly issuerClaimKey?: string;
   /** Server-pinned producer revision; never accepted from an agent or request body. */
   readonly issuerSourceHead?: string;
   /** Trusted exact-artifact approval; model metadata and HTTP bodies never provide this value. */
@@ -76,13 +80,20 @@ export interface DynamicPublisherOptions {
   readonly relayKeyId?: string | (() => string | undefined);
   /** Short interval only for deterministic revocation tests; production checks once per second. */
   readonly authorizationPollMsForTesting?: number;
+  readonly now?: () => number;
   readonly verifyPublic?: (url: string, request: Request) => Promise<{ status: number; marker: string | null }>;
+}
+/** An expiry value alone never selects the test issuer or opens the direct member route. */
+export function useVerifiedMemberIssuer(input: Pick<DynamicPublisherOptions,
+  'testMemberId' | 'testHandle' | 'testApprovalExpiresAt'>): boolean {
+  return !input.testMemberId && !input.testHandle;
 }
 interface LiveDeployment { id: string; ownerId: string; runId: string; appSlug: string; userSlug: string;
   artifactDigest: string; grantId: string; service: AppServiceBinding; retiring?: boolean;
   timer?: ReturnType<typeof setInterval> }
 
 export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
+  const now = options.now ?? Date.now;
   const sources = resolve(options.sourceRoot);
   const seals = resolve(options.sealRoot);
   const runtime = resolve(options.runtimeRoot);
@@ -234,13 +245,23 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
     return localRetirementDurable;
   };
   const retire = (deployment: LiveDeployment) => stopDeployment(deployment, true);
-  const approved = (owner: DynamicOwner) => !!options.testMemberId && !!options.testHandle
-    && !!options.testApprovalExpiresAt && Number.isFinite(Date.parse(options.testApprovalExpiresAt))
-    && Date.now() < Date.parse(options.testApprovalExpiresAt)
-    && owner.memberId === options.testMemberId && owner.userSlug === options.testHandle;
+  const signClaim = (claim: Record<string, unknown>) => {
+    if (!/^[a-f0-9]{64}$/u.test(options.issuerClaimKey ?? '')) refuse();
+    return createHmac('sha256', Buffer.from(options.issuerClaimKey!, 'hex'))
+      .update('elanous-dynamic-issuer-claim-v1\0')
+      .update(JSON.stringify([claim.ownerId, claim.userSlug, claim.runId, claim.appSlug,
+        claim.root, claim.sourceHead, claim.issuedAt, claim.issuerExpiresAt])).digest('hex');
+  };
+  const approved = (owner: DynamicOwner) => options.verifiedMemberIssuer === true
+    ? typeof owner.memberId === 'string' && owner.memberId.length > 0 && SLUG.test(owner.userSlug)
+    : !!options.testMemberId && !!options.testHandle && !!options.testApprovalExpiresAt
+      && Number.isFinite(Date.parse(options.testApprovalExpiresAt))
+      && now() < Date.parse(options.testApprovalExpiresAt)
+      && owner.memberId === options.testMemberId && owner.userSlug === options.testHandle;
   const slot = (owner: DynamicOwner, runId: string, appSlug: string) => {
     if (!approved(owner) || !RUN.test(runId) || !SLUG.test(appSlug)
-      || !/^[0-9a-f]{40}$/.test(options.issuerSourceHead ?? '')) refuse();
+      || !/^[0-9a-f]{40}$/.test(options.issuerSourceHead ?? '')
+      || options.verifiedMemberIssuer === true && !/^[a-f0-9]{64}$/u.test(options.issuerClaimKey ?? '')) refuse();
     const hash = createHash('sha256').update(owner.memberId).digest('hex');
     const parent = join(sources, hash, runId);
     return { parent, claim: join(parent, appSlug + '.claim.json') };
@@ -255,37 +276,52 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
   });
   const reserve = (owner: DynamicOwner, runId: string, appSlug: string) => {
     const item = slot(owner, runId, appSlug);
+    const issuedAt = new Date(now()).toISOString();
+    const issuerExpiresAt = options.verifiedMemberIssuer === true
+      ? new Date(Date.parse(issuedAt) + 2 * 60 * 60 * 1_000).toISOString() : options.testApprovalExpiresAt!;
     mkdirSync(item.parent, { recursive: true, mode: 0o700 });
     privateDirectory(item.parent);
     const sourceRoot = join(item.parent, appSlug + '-' + randomBytes(16).toString('hex'));
     if (existsSync(sourceRoot) || existsSync(item.claim)) refuse();
-    writeFileSync(item.claim, JSON.stringify({ ownerId: owner.memberId, userSlug: owner.userSlug, runId, appSlug,
-      root: sourceRoot, issuerExpiresAt: options.testApprovalExpiresAt, sourceHead: options.issuerSourceHead }),
+    const claim = { ownerId: owner.memberId, userSlug: owner.userSlug, runId, appSlug,
+      root: sourceRoot, issuedAt, issuerExpiresAt, sourceHead: options.issuerSourceHead };
+    writeFileSync(item.claim, JSON.stringify(options.verifiedMemberIssuer === true
+      ? { ...claim, signature: signClaim(claim) } : claim),
       { flag: 'wx', mode: 0o600 });
     return { sourceRoot, ownerId: owner.memberId, userSlug: owner.userSlug, runId, appSlug,
-      issuerExpiresAt: options.testApprovalExpiresAt, sourceHead: options.issuerSourceHead };
+      issuerExpiresAt, sourceHead: options.issuerSourceHead };
   };
-  const sourceFor = (owner: DynamicOwner, runId: string, appSlug: string): string => {
+  const sourceFor = (owner: DynamicOwner, runId: string, appSlug: string): { sourceRoot: string; issuerExpiresAt: string } => {
     const item = slot(owner, runId, appSlug);
     const stat = lstatSync(item.claim);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 2048 || (stat.mode & 0o077) !== 0) refuse();
     const claim = JSON.parse(readFileSync(item.claim, 'utf8')) as Record<string, unknown>;
     const sourceRoot = claim.root;
     if (claim.ownerId !== owner.memberId || claim.userSlug !== owner.userSlug || claim.runId !== runId
-      || claim.issuerExpiresAt !== options.testApprovalExpiresAt || claim.sourceHead !== options.issuerSourceHead
+      || typeof claim.issuerExpiresAt !== 'string'
+      || !Number.isFinite(Date.parse(claim.issuerExpiresAt)) || Date.parse(claim.issuerExpiresAt) <= now()
+      || options.verifiedMemberIssuer === true && (typeof claim.issuedAt !== 'string'
+        || !Number.isFinite(Date.parse(claim.issuedAt))
+        || Date.parse(claim.issuerExpiresAt) - Date.parse(claim.issuedAt) !== 2 * 60 * 60 * 1_000)
+      || options.verifiedMemberIssuer !== true && claim.issuerExpiresAt !== options.testApprovalExpiresAt
+      || claim.sourceHead !== options.issuerSourceHead
       || claim.appSlug !== appSlug || typeof sourceRoot !== 'string'
       || !new RegExp('^' + appSlug + '-[0-9a-f]{32}$').test(sourceRoot.slice(item.parent.length + 1))
       || !sourceRoot.startsWith(item.parent + '/')) refuse();
-    return sourceRoot;
+    if (options.verifiedMemberIssuer === true) {
+      if (typeof claim.signature !== 'string' || !/^[a-f0-9]{64}$/u.test(claim.signature)
+        || !timingSafeEqual(Buffer.from(claim.signature, 'hex'), Buffer.from(signClaim(claim), 'hex'))) refuse();
+    }
+    return { sourceRoot, issuerExpiresAt: claim.issuerExpiresAt };
   };
   /** Reopen the server-held claim before a trusted materializer writes any source bytes. */
   const attest = (owner: DynamicOwner, runId: string, appSlug: string) => ({
-    sourceRoot: sourceFor(owner, runId, appSlug), ownerId: owner.memberId, userSlug: owner.userSlug,
-    runId, appSlug, issuerExpiresAt: options.testApprovalExpiresAt, sourceHead: options.issuerSourceHead,
+    ...sourceFor(owner, runId, appSlug), ownerId: owner.memberId, userSlug: owner.userSlug,
+    runId, appSlug, sourceHead: options.issuerSourceHead,
   });
   const sealFor = async (owner: DynamicOwner, runId: string, appSlug: string,
     stillAuthorized: () => boolean | Promise<boolean>) =>
-    await sealAppSource({ sourceRoot: sourceFor(owner, runId, appSlug), sealRoot: seals,
+    await sealAppSource({ sourceRoot: sourceFor(owner, runId, appSlug).sourceRoot, sealRoot: seals,
       ownerId: owner.memberId, runId, stillAuthorized });
   const inspect = async (owner: DynamicOwner, runId: string, appSlug: string,
     stillAuthorized: () => boolean | Promise<boolean>) => {
@@ -497,7 +533,7 @@ export function createDynamicAppPublisher(options: DynamicPublisherOptions) {
       const verified = await verify(url, request);
       if (verified.status !== 200 || verified.marker !== routeNonce || !await during()
         || !await approvedArtifact() || !await grantAuthorized()) refuse();
-      const sourceRoot = sourceFor(owner, runId, appSlug);
+      const sourceRoot = sourceFor(owner, runId, appSlug).sourceRoot;
       reopenSealedAppSource({ sealRoot: seals, sealPath: sealed.sealPath, sourceRoot,
         ownerId: owner.memberId, runId, artifactDigest: sealed.artifactDigest });
       writePrivateRecord(activePath(deploymentId), { ...grant, userSlug: owner.userSlug,
@@ -617,10 +653,12 @@ export function createDynamicAppDeployHook(
 
 /** Authenticated product route; source root is derived from the reservation, never from a request body. */
 export function createDynamicAppPublishRoute(publisher: DynamicAppPublisher,
-  resolveOwner: (request: Request) => Promise<DynamicOwner | null>, webOrigin?: string) {
+  resolveOwner: (request: Request) => Promise<DynamicOwner | null>, webOrigin?: string,
+  allowDirectRoute = false) {
   return async (request: Request): Promise<Response | undefined> => {
     const match = /^\/v1\/apps\/([a-z0-9][a-z0-9-]*)\/dynamic-deployment$/.exec(new URL(request.url).pathname);
     if (!match) return undefined;
+    if (!allowDirectRoute) return Response.json({ error: 'local-issuer-only' }, { status: 403 });
     if (request.method !== 'POST') return Response.json({ error: 'method-not-allowed' }, { status: 405 });
     if (!request.headers.has('authorization') && !request.headers.has('cookie')) return Response.json({ error: 'unauthorized' }, { status: 401 });
     const origin = request.headers.get('origin');

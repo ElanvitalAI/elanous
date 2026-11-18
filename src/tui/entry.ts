@@ -1,10 +1,13 @@
-import { updateToolActivity, toolActivityLines, type ToolActivityRow } from './chat/tool-activity.js';
+import { updateToolActivity, toolActivityLines, interleavedTurnLines, runningToolLabel, TOOL_RUNNING_GLYPH, type ToolActivityRow } from './chat/tool-activity.js';
+import { keepBottomStatus } from './core/bottom-status.js';
+import { workingRowLine } from './chat/working-row.js';
 import { nextAssistantPreviewText } from './chat/assistant-preview.js';
 import { C, initTui, initTuiPrimary, closeTui, injectKey, pendingKeyCount as tuiPendingKeyCount, readKey, setTuiAltScreen, setTuiMouseCapture, type Key } from '../tui.js';
-import { hasDisplayableCompletedToolBlock, createNextTuiCompactPainter, createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiCompactFrame, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
+import { hasDisplayableCompletedToolBlock, nextTuiActivityRow, createNextTuiCompactPainter, createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiCompactFrame, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
 import { renderNextTuiEntryFrame, shellApprovalCommandViewport } from './core/entry-render.js';
 import type { MessageBlock } from '../conv-substrate/message-block.js';
 import { nextMessageBlockDetailLevel } from './chat/message-block-view.js';
+import { addTranscriptMarker, missionArrivalText } from './chat/mission-arrival.js';
 import { createMessageBlockSessionStore, upsertMessageBlock } from './core/message-block-session.js';
 import { formatMessageBlockRawTrace, resolveMessageBlockRawTrace } from './core/message-block-raw-ref.js';
 import { BackgroundJobStatus } from './chat/background-job-status.js';
@@ -14,37 +17,66 @@ import { createContextRegistry } from '../context.js';
 import { hasClipboardImage, readClipboardText } from '../clipboard/index.js';
 import { registerClipboardImageAttachment } from '../clipboard/image-attachment.js';
 import { readClipboardPaste } from '../clipboard/paste.js';
-import { requestNewTuiSession } from './slash/new-session.js';
+import { carrySessionProvider, requestNewTuiSession } from './slash/new-session.js';
 import { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS } from './slash/compact-command.js';
 import { RESUME_BUSY_STATUS, parseResumeCommand } from './slash/resume-command.js';
 import { reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
-import { createNextTuiQueue } from './core/queue.js';
+import { createNextTuiQueue, type NextTuiSettledTurn } from './core/queue.js';
+import { stripQueueModelContext, withInterruptedOnPurposeContext, withQueueNoticeContext, withReplacementCandidateContext } from '../chat/interjection.js';
+import { replacementCandidateContextLine, replacementCandidateScreenLine } from '../chat/queue-supersede.js';
+import { isTurnTypeaheadSteerable } from '../chat/turn-typeahead.js';
 import { agentDisplayLine, agentDisplayLines, applyAgentEvent, reconcileAgentOutputStatuses, reconcileNestedAgentSnapshot, type AgentDisplay } from './core/agents.js';
-import { englishFooterText, formatNextTuiStatusLine, nextTuiElapsedMs } from './chat/status-line.js';
+import { englishFooterText, nextTuiElapsedMs, nextTuiTurnIsPhase } from './chat/status-line.js';
 import { decideNextTuiAutoContinue, startNextTuiTurn } from './core/turn.js';
+import { createTurnStallWatch, stallMinutes } from './core/turn-stall.js';
 import { debug } from '../debug/log.js';
 import { setCliStderrSink } from '../git-fs/cli-stderr.js';
 import { createInputLagProbe } from './input-lag-probe.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
+import { detectSeat } from '../seat/seat-boot-preamble.js';
+import { readUnreadSummary } from '../msg/msg-store.js';
+import { pullSeatAfterGoal, releaseBusyAfterSettle, settleSeatPullTurnEnd, type SeatPullAfterGoalDeps } from './seat-pull-after-goal.js';
+import { createSessionWakeupBinder } from '../skills/tools/schedule-wakeup.js';
 import { countInterimDisplay, internalTurnOriginOfText, planInterimDisplay } from './chat/goal-interim.js';
 import type { NextTuiLoopBranch } from '../tui-client/next-loop-command.js';
 import { handleSignalsSlash, type SignalsSlashContext } from './slash/signals.js';
 import { updatePtyManifestSession } from '../pty-shell/pty-manifest.js';
+import { agentTurnBanner, continueBanner } from './chat/continue-banner.js';
 import { createNextTuiCoreInput } from './core/input.js';
 import { formatInlinePanel } from './input/inline-panel.js';
+import { QUEUE_PANEL_HINT, queuePanelKey, queuePanelMove, queuePanelOrder, queuePanelSpec } from './input/queue-panel.js';
+import { NextTuiQueueConflictError } from './core/queue.js';
 import { startMissionWatch as startMissionWatchLoop } from './mission-watch.js';
+import { createChildNoticeProducers } from './core/notice-producers.js'; // #38031 CHILD-NOTICE
+import { createSeatMailArrivalWatcher } from './seat-mail-arrival.js'; // #38031 자리 우편 도착 감시
+import { createIdleEventWake, graphNodeEndNotice, graphRunIdleNotice, idleChildLabel } from './idle-event-wake.js';
+import { createIdleWakeDoor } from './idle-wake-door.js';
+import { seatMailOnArrived } from './seat-mail-on-arrived.js';
+// OP-EVENT-WATCH-WAKE: event-watch-runner 는 동적 import (entry 는 훅만).
+import { createLedgerReceiptWriter, readSeatMailMessages } from './seat-message-receipts.js'; // SEAT-INBOX B1-C 메시지 단위 notice ⊕ 영수증
 import { nextSlashCandidates } from './input/slash-complete.js';
+import { createPromptHistoryStore, mergePromptHistory, moveEditorLine, upDownTarget } from './input/prompt-history.js';
 import { nextFirstScreenLines } from './branches/first-screen.js';
 import type { NextTuiHarnessRunner } from './branches/harness.js';
 import type { GraphInstanceView } from '../../plugins/graph-instance-view/handlers/view-model.js';
 import { monotonicNowMs, requiresLongShellEscConfirmation } from '../esc-shell-timing.js';
 import { graphProgressStatus } from '../graph-runner/graph-progress-observation.js';
+import { projectGraphLoopViews, type GraphLoopView, type GraphViewEvent } from '../graph-view/model.js';
+import { createGraphDetailController } from './graph-detail/controller.js';
+import { createRunnerProgressProjector } from '../graph-view/runner-progress.js';
+import { createNodeLivenessTui, nodeLivenessFooterLine, nodeLivenessProgressRow, withNodeLivenessToolRow } from '../graph-view/node-liveness-tui.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { graphViewShowsBlock, graphViewShowsHint, graphViewSurfaceMode, graphViewTurnLines } from '../graph-view/surface.js';
 import { createShellApprovalSession, shellApprovalPromptHelp, shellApprovalPromptTitle } from './shell-approval-session.js';
+import { createPublishApprovalHost } from './publish-approval-session.js';
+import { openPublishApprovalUrl } from './publish-approval-open.js';
 import { createHarnessAskUserSession, harnessAskUserComposerLines } from './harness-ask-user-session.js';
 import { SYNCHRONIZED_OUTPUT_BEGIN, SYNCHRONIZED_OUTPUT_END, openSynchronizedOutputRegion, synchronizedOutputDisabledByEnv } from '../display/synchronized-output-region.js';
 import { remoteFrameRows, ScreenPaintCache } from './core/screen-paint-cache.js';
+import { newPtyPickerKey } from './sidetab/new-pty-picker.js';
 import { formatSidetabSectionFrame, normalizeSidetabSectionOrder, reorderSidetabSections, sidetabSectionTargetAt, type SidetabSectionFrame, type SidetabSectionId } from './sidetab/sections.js';
 import type { SerializedMessage } from '../session/index.js';
+import { formatTurnEndTime } from '../thinking-line.js';
 import { displayNextPublicReplyText, projectUserReplyStatus, streamReplyProgress, turnReplyFailureMessage } from './core/next-public-reply.js';
 import { nextTuiPublicHistory } from './core/public-history.js';
 
@@ -88,6 +120,8 @@ export interface NextTuiOptions {
   readonly compactHeight?: number;
   /** Test seam for the approval panel deadline; production uses the REPL timeout. */
   readonly shellApprovalTimeoutMs?: number;
+  /** Test seam: silence (ms) with nothing running after which a turn is judged stalled (default 15 min). */
+  readonly turnStallLimitMs?: number;
   /** Read-only terminal session source; injectable so the Next slash stays testable without PTYs. */
   readonly termSessions?: {
     list(): readonly NextTuiTermSession[] | Promise<readonly NextTuiTermSession[]>;
@@ -105,6 +139,8 @@ interface SlashPickerCandidate { readonly value: string; readonly description: s
 /** Local chat entry: history and input are TUI-owned; turn execution stays shared. */
 export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   if (!process.stdin.isTTY) throw new Error('elanous --tui next requires stdin TTY');
+  try { (await import('../dashboard/seat-local-instructions.js')).ensureSeatLocalInstructions(process.cwd()); }
+  catch (error) { debug.log('tui.local-instructions', 'next-start-skipped', { error: error instanceof Error ? error.message : String(error) }); }
   if ((process.stdout.columns || 0) < 20 || (process.stdout.rows || 0) < 6) {
     throw new Error('elanous --tui next requires at least 20 columns and 6 rows');
   }
@@ -134,10 +170,32 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // optional seat directory exists. The one dashboard module below is the
   // turn-start segments recorder wired over the shared turn delegation.
   const { createSeatMailHeaderHook } = await import('./seat-mail-boot.js');
-  const seatMailHeader = createSeatMailHeaderHook(process.cwd());
+  // ELN-PLAN-WIRE-SEAT: rebuilt below once the prompt queue exists, so the header can show «계획 k/m».
+  let seatMailHeader = createSeatMailHeaderHook(process.cwd());
+  let seatPlan: import('./seat-mail-boot.js').SeatPlanRuntime | null = null;
+  let seatPlanLink: ReturnType<typeof import('./seat-mail-boot.js').createSeatPlanTurnLink> | null = null;
   const input = createNextTuiCoreInput();
   let status = 'Enter 전송 · Esc 취소 · Ctrl+Q 종료';
   let graphProgressLine: string | null = null;
+  // NEXT-TUI-INPUT-HISTORY: prompts survive sessions per working directory (slash commands included, secrets never).
+  const promptHistory = createPromptHistoryStore(process.cwd());
+  let savedPrompts = promptHistory.load();
+  const rememberPrompt = (text: string): void => {
+    const trimmed = text.trim();
+    // A folded paste token cannot be expanded again later; such a prompt is not recalled.
+    if (!trimmed || /\[Paste #\d+ · /u.test(trimmed)) return;
+    promptHistory.record(trimmed);
+    savedPrompts = [...savedPrompts.filter((item) => item !== trimmed), trimmed];
+  };
+  const historyPrompts = (): string[] => mergePromptHistory(savedPrompts,
+    messages.filter((message) => message.role === 'user').map((message) => message.content));
+  // GRAPH-VIEW-TRIGGER (개정 4): the turn's graph loops as an inline block in the conversation stream.
+  const graphViewMode = graphViewSurfaceMode(process.env.ELANOUS_NEXT_TUI_GRAPH_VIEW);
+  let graphView = createRunnerProgressProjector();
+  // NODE-INNER-PROGRESS «추가» 4): the run ledger drives the tool row and progress row without a sidetab; a stalled
+  // node queues its notice (childNotices exists by the time a turn observes a graph run).
+  const nodeLivenessTui = createNodeLivenessTui({ root: effectiveInstanceRoot(),
+    onStalled: (text) => { childNotices.graphNodeStalled(text); } });
   let executionModelBadge: string | undefined;
   let resolveExecutionModelBadge: (() => string | undefined) | undefined;
   let executionModelBadgeLoading = false;
@@ -150,6 +208,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const missionWatchCancellation: { cancel?: () => void } = {};
   let busy = false;
   let turnElapsedMs: number | undefined;
+  /** ELN-TURN-END-STALL: signs of life from the running turn; a long silence with nothing running ends it. */
+  let turnStallWatch = createTurnStallWatch({ now: () => performance.now(), limitMs: options.turnStallLimitMs });
+  let turnStallHandled = false;
   let measuredUsage: { inputTokens?: number; outputTokens?: number } | undefined;
   let streamedOutputChars: number | undefined;
   let telemetrySessionId: string | null = null;
@@ -198,6 +259,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let herdrSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
   let remoteSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
   let remoteSidetabRefreshPending = false;
+  let elsSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
+  let elsSidetabRefreshPending = false;
   let herdrSidetabRefreshPending = false;
   let herdrSidetabPortal: import('./sidetab/herdr-portal.js').HerdrSidetabPortal | null = null;
   let sidetabApi: typeof import('./sidetab/list.js') | null = null;
@@ -208,6 +271,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // ⚠️ `as` 단언은 «null 로 좁혀지는» 흐름 분석을 푸는 것 — 값은 클로저(ensureSidetabAttachments) 안에서만 바뀐다.
   let sidetabAttachments: import('./sidetab/attach.js').SidetabAttachmentController | null = null as import('./sidetab/attach.js').SidetabAttachmentController | null;
   let workspaceInput: ReturnType<typeof import('./sidetab/workspace-input-controller.js').createWorkspaceInputController> | null = null;
+  let refreshWorkspaceInputRows: typeof import('./sidetab/workspace-input-controller.js').refreshWorkspaceInputRows | null = null;
   let workspaceBroadcast: ReturnType<typeof import('./sidetab/workspace-broadcast.js').createWorkspaceBroadcast> | null = null;
   let pendingSidetabSwitch: string | null = null;
   let sidetabRefreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -227,6 +291,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let lastResumeRows: import('../session/index.js').SessionMeta[] | null = null;
   // The async refresh callback fills this holder; its declared property type stays valid in the input loop.
   const atFileInput: { current: ReturnType<typeof import('./input/at-picker.js').createAtPickerPanel> | null } = { current: null };
+  // ELN-QUEUE-ITEM-CONTROLS: per-item queue panel (Up on an empty composer while items wait).
+  let queuePanel: { selected: number } | null = null;
+  // NEXT-TUI-PROVIDER-PICKER-PLACEMENT: bare /provider opens this popup above the composer.
+  let providerPicker: ReturnType<typeof import('./input/provider-picker.js').createProviderPickerPanel> | null = null;
   const isInternalWakeForeground = (): boolean => focus === 'input' && !sidetabFocused && !atFileInput.current?.isOpen
     && !sidetabAttachments?.hasModal() && !sidetabAttachments?.hasRemoteView();
   let slashPicker: { query: string; candidates: SlashPickerCandidate[]; selected: number } | null = null;
@@ -248,6 +316,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       };
     },
   });
+  // Owner publish approval (public URL screen): the child sends the URL as a structured field; Enter hands «acknowledged» back and the
+  // screen closes — the owner's decision itself is polled in the child. Logic and tests live in ./publish-approval-session.js.
+  const publishApproval = createPublishApprovalHost({
+    setStatus: (line) => { status = line; },
+    render: () => render(),
+    openUrl: (url) => openPublishApprovalUrl(url),
+    columns: () => Math.max(1, (process.stdout.columns || 80) - (sidetabOpen && sidetabApi ? sidetabApi.sidetabWidthForTerminal(Math.max(1, process.stdout.columns || 1)) : 0)),
+  });
   let interviewPreviousEditor: InlineEditorState | null = null;
   const interviewDraftText = () => interviewPreviousEditor?.text ?? '';
   const harnessAskUser = createHarnessAskUserSession({
@@ -261,6 +337,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const activeShellCalls = new Map<string, NextTuiActiveShellCall>();
   const activeToolCalls = new Map<string, string>();
   let visibleToolActivity: ToolActivityRow[] = [];
+  // NEXT-TUI-TOOL-LOG-NOT-PINNED: reply-text offset at each tool start, and the settled turn's
+  // tool rows anchored after its user message so they stay above the final answer.
+  const toolTextOffsets = new Map<string, number>();
+  // Every settled turn keeps its tool rows after its own user message, like classic's transcript.
+  const settledTurnTools = new Map<string, { anchor: number; userContent: string; rows: ToolActivityRow[]; graph?: readonly GraphViewEvent[] }[]>();
+  /** Every graph loop this session showed: settled turns first, then the running turn. */
+  const sessionGraphViews = (): GraphLoopView[] => [...projectGraphLoopViews([
+    ...(settledTurnTools.get(id ?? '') ?? []).flatMap((entry) => entry.graph ?? []), ...graphView.events]).values()];
+  // GRAPH-VIEW-DETAIL-SIDETAB (개정 5): the detail panel lives in its own module; entry forwards keys and frames.
+  const graphDetail = createGraphDetailController({ views: sessionGraphViews, render: () => render(), setStatus: (text) => { status = text; } });
+  let settledInline: { key: string; map: Map<number, string[]> } | null = null;
   const shellActivitySnapshotRequest: { current: (() => boolean) | null } = { current: null };
   const pushNowRequest: { current: ((requestId: string) => boolean) | null } = { current: null };
   const pushNowCommit: { current: ((requestId: string) => boolean) | null } = { current: null };
@@ -297,6 +384,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const expandedToolBlocks = new Set<number>();
   const messageBlockSessions = createMessageBlockSessionStore();
   let messageBlocks: MessageBlock[] = [];
+  const turnEndMarkers = new Map<string, { afterMessageIndex: number; text: string }[]>();
+  let lastTurnEndStatus: { sessionId: string; text: string } | null = null;
   let messageBlockLevels = new Map<string, 0 | 1 | 2 | 3>();
   let messageBlockRawTexts = new Map<string, string>();
   let messageBlockAfterMessageIndexes = new Map<string, number>();
@@ -352,22 +441,124 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let healthSnapshot: import('./chat/self-health-status.js').NextTuiSelfHealthSnapshot | null = null;
   let observedSessionId: string | null = null;
   // TUI-NEXT-QUEUE-AND-WAKE — what is submitted while busy waits here (the classic FIFO state) and
-  // leaves one item per settle; Esc returns it all to the prompt (classic «interrupted» drain).
+  // leaves one item per settle. A200: a chat line is also handed to the running turn as a steer (joins the
+  // next model request); Esc leaves what is still queued as the next turn by itself, not back in the prompt.
   const queue = createNextTuiQueue();
+  // Distinct sentinels: the loop owns them, nothing else reads them as keys.
+  // queueWake is declared here, before the seat-mail watcher closes over it.
+  const queueWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
+  // IDLE-WAKE-SINGLE-DOOR — self-pull, graph, mail, and the event bundle knock here.
+  const idleWakeDoor = createIdleWakeDoor({
+    busy: () => busy,
+    injectKey: (key) => { injectKey(key as Key); },
+    queueWake,
+  });
+  idleWakeDoor.register({ id: 'self-pull' });
+  idleWakeDoor.register({ id: 'graph-node' });
+  idleWakeDoor.register({ id: 'seat-mail' });
+  idleWakeDoor.register({ id: 'external-event' });
+  // Mail → decomposition → plan: the active plan item is a seat-mail notice in this queue (banner-less internal turn).
+  try {
+    const { createSeatMailPlanRuntime, createSeatPlanTurnLink, seatTaskQueueFromPromptQueue } = await import('./seat-mail-boot.js');
+    const booted = createSeatMailPlanRuntime({ cwd: process.cwd(), queue: seatTaskQueueFromPromptQueue(queue) });
+    if (booted.runtime) { seatPlan = booted.runtime; seatPlanLink = createSeatPlanTurnLink(booted.runtime); seatMailHeader = booted.header; }
+  } catch { /* boot goes on without a plan */ }
+  // #38031 (ELN-CHILD-NOTICE) — 사이드탭 미션 종결 알림 생산자(같은 (source,text) 중복 적입 억제).
+  const childNotices = createChildNoticeProducers(queue);
+  // #38031 — 자리 우편 도착 감시(기본 15초 폴링 · 첫 관측은 기준선만). notice 는 이 큐에 그대로.
+  // MF(r3): 핸들을 변수로 보존해야 showNextTui 종료(finally)에서 stop() 할 수 있다 — 버리면 TUI 를 닫아도 15초 폴링이 남는다.
+  // Seat mail that lands during a turn stays a queued notice. The idle door (queueWake after settle)
+  // opens it as the next turn; it is not offered to the running turn as a steer (#38193).
+  // SEAT-INBOX B1-C — one notice per message (msgId) · receipts delivered (enqueue) · seen (queue delivered).
+  const seatMailWatcher = createSeatMailArrivalWatcher(process.cwd(), queue, {
+    onArrived: seatMailOnArrived({ busy: () => busy, injectKey: () => { idleWakeDoor.knock('seat-mail'); }, queueWake }),
+    messages: { read: (cwd, afterId) => readSeatMailMessages(cwd, afterId), receipts: createLedgerReceiptWriter() },
+  });
+  seatMailWatcher.start();
+  // ELN-EXTERNAL-EVENTS-BETWEEN-TURNS — a harness child finishing, or a graph
+  // node ending, stays a queued notice. The idle door opens only when nothing
+  // is running; a running turn is never steered.
+  const idleEventWake = createIdleEventWake({
+    busy: () => busy,
+    injectKey: () => { /* the single door knocks; this leaf only queues */ },
+    queueWake,
+    enqueueChild: (info) => childNotices.harnessChildFinished(info),
+    enqueueGraphNode: (text) => childNotices.graphNodeStalled(text),
+    enqueueGraphRun: (text) => childNotices.graphNodeStalled(text),
+    childLabel: idleChildLabel,
+    graphNodeText: graphNodeEndNotice,
+    graphRunText: graphRunIdleNotice,
+  });
+  const { globalTaskNotificationQueue } = await import('../agent/task-notification.js');
+  const offIdleChildWake = globalTaskNotificationQueue.onEnqueue((n) => {
+    if (idleEventWake.onChild(n)) idleWakeDoor.knock('graph-node');
+  });
+  const { onGraphNodeLifecycle, onGraphRunIdleWake } = await import('../graph-runner/runner.js');
+  const { graphProgressObservation } = await import('../graph-runner/graph-progress-observation.js');
+  // A node end only queues. The knock is the run-level wake below (once).
+  const offIdleGraphNode = onGraphNodeLifecycle((event) => {
+    const observed = graphProgressObservation(event);
+    if (observed) idleEventWake.onGraphNode(observed);
+  });
+  const offIdleGraphWake = onGraphRunIdleWake((wake) => {
+    if (idleEventWake.onGraphRun(wake)) idleWakeDoor.knock('graph-node');
+  });
+  // OP-EVENT-WATCH-WAKE: 감시 줄이 큐에 들어가면 queueWake. spawn·줄 버퍼는 runner.
+  const eventWatchWake: { current: (() => void) | null } = { current: null };
+  // Read through a local so a literal-empty test env does not narrow the command to "".
+  const eventWatchEnv = process.env.ELANOUS_EVENT_WATCH;
+  const eventWatchCommand = (eventWatchEnv ?? '').trim();
+  // ELANOUS_EVENT_WATCH_DEADLINE_MS is a duration. 600000 means ten minutes from now,
+  // not an absolute epoch (that comparison expires the watch on the first tick).
+  const { eventWatchDeadlineMs } = await import('./event-watch-deadline.js');
+  const eventWatchDeadline = eventWatchDeadlineMs(process.env.ELANOUS_EVENT_WATCH_DEADLINE_MS, Date.now());
+  const eventWatchStop: { current: (() => void) | null } = { current: null };
+  const steerRequest: { current: ((steerId: string, text: string) => boolean) | null } = { current: null };
+  const steerRetract: { current: ((steerIds: readonly string[]) => void) | null } = { current: null };
+  let steerSerial = 0;
+  /** The queued text that leaves right after an Esc cancel — its turn carries the interrupted-on-purpose line. */
+  let interruptContextFor: string | null = null;
+  /** mf1(#38102 r4): the notice dispatchQueued is about to open — consumed (and cleared) by startChatTurn. */
+  let pendingNoticeTurn: {
+    id: string;
+    source: string;
+    text: string;
+    /** Poll time. The leaf records this as receivedAt, separate from injectedAt. */
+    receivedAt: number;
+    occurredAt?: number;
+    /** The leaf's turn-end step. Entry does not import the receipt. */
+    finish: (turnOk: boolean) => Promise<unknown>;
+  } | null = null;
+  /** ELN-QUEUE-SUPERSEDE — the queued text leaving now and the «대체 후보» model-context line its turn carries. */
+  let replacementContextFor: { text: string; line: string } | null = null;
   /** The prompt text a queued submission displaced; it comes back once that submission is sent. */
   let restoreDraft: string | null = null;
   /** ⏰/↻ lines from the wakeup scheduler and the internal-turn door (newest last, at most three). */
   let notices: string[] = [];
   let internalNotices: string[] = [];
-  // Distinct sentinels: the loop owns them, nothing else reads them as keys.
-  const queueWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
+  eventWatchWake.current = () => { idleWakeDoor.knock('external-event'); };
+  if (eventWatchCommand.length > 0) {
+    void import('./event-watch-runner.js').then(({ startEventWatchRunner, attachEventWatchProcess }) => {
+      const runner = startEventWatchRunner(queue, {
+        command: eventWatchCommand,
+        deadlineMs: eventWatchDeadline,
+        onQueued: () => { eventWatchWake.current?.(); },
+      });
+      const attached = attachEventWatchProcess(runner, eventWatchCommand, { deadlineMs: eventWatchDeadline });
+      eventWatchStop.current = () => { attached.stop(); };
+    });
+  }
   const internalWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
   let wakeup: NextTuiWakeup | null = null;
+  /** Binds the wakeup file to the current conversation; call after every `id` change (same id is ignored). */
+  let bindWakeupSession: ((sessionId: string | null) => void) | null = null;
   let loopBranch: NextTuiLoopBranch | null = null;
   let decideBranchRoute: ((input: string) => string) | undefined;
   let pluginWizardFlow: ReturnType<typeof import('./branches/plugin-wizard.js').createPluginWizardFlow> | null = null;
   // TURN-END-BEFORE-GOAL — 답이 약속만 하고 끝나면 깨움 문으로 한 턴 더(classic 과 같은 모듈 · 동적 로드).
   let goalContinue: ReturnType<(typeof dashboardRuntime)['createGoalContinue']> | null = null;
+  /** SEAT-PULL-ON-IDLE-LIVE — 골이 다음 턴을 안 열었을 때만, opt-in 자리의 빈 계획에서 칸 하나를 집는다. */
+  let seatSelfPull: SeatPullAfterGoalDeps['hook'] = null;
   /** 이번 턴이 실패·취소로 끝났나 — 그런 턴은 이어가지 않는다. */
   /** 마지막으로 관측에 남긴 접힌 중간 답 수(next · 바뀔 때만 'folded' 한 줄). */
   let interimFoldedShown = 0;
@@ -377,6 +568,24 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const pushInternalNotice = (line: string): void => {
     internalNotices = [...internalNotices, safeStatusText(line)].slice(-3);
   };
+  // STATUSLINE-WIRE: the footer is the declarative status line (src/statusline/next-tui.ts); a broken user
+  // statusline.yaml falls back to the default with one notice.
+  const { createNextTuiStatusline, compactFooterTurn } = await import('../statusline/next-tui.js');
+  const { runningBuild } = await import('../pty-shell/tui-run-state.js');
+  const footerBuild = runningBuild();
+  const { createFleetSegment } = await import('../statusline/sources/machines.js');
+  // STATUSLINE-SOURCES-RESPONSIVE: the fleet segment (sources/machines.ts) — polled after the first paint.
+  // The build stamp needs a git call: it too is looked up after the first footer has been painted, not on the boot path.
+  const fleetSegment = createFleetSegment({ onChange: () => render() });
+  const footerStatusline = createNextTuiStatusline({ build: footerBuild, cwd: () => process.cwd(), fleet: fleetSegment.value,
+    afterFirstPaint: () => {
+      void import('../version/build-stamp.js').then(({ buildCommitTime }) => {
+        // Paint again when the stamp arrived: an idle screen has no other event that would show it.
+        if (footerStatusline.setCommitTime(buildCommitTime(footerBuild))) render();
+      }).catch(() => { /* no stamp */ });
+      fleetSegment.start();
+    } });
+  if (footerStatusline.warning) pushNotice(footerStatusline.warning);
   const observeSession = (
     sessionId: string,
     onBackground: typeof import('../tui-client/local-chat-turn.js').onLocalChatBackgroundStatus,
@@ -433,7 +642,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     info: (text) => text,
   };
   // Load the presentation leaf before rendering without adding to the audited static entry imports.
-  const { nextTuiStatusLine } = await import('./chat/status-line.js');
+  const { nextTuiShortStatus } = await import('./chat/status-line.js');
+  // RAIL-STALE-TUI-HEAD: after a rail update this process may still run the old version dir; show
+  // «⟳ 재기동 필요» before app_build hits the bridge head check. Checked at boot and on turn start only.
+  const { codeRevision } = await import('../version/code-revision.js');
+  const { createStaleInstallWatch, detectStaleInstall } = await import('../version/stale-install.js');
+  const bootHead = codeRevision();
+  const staleInstall = createStaleInstallWatch({ detect: () => detectStaleInstall({ runningHead: bootHead }) });
+  staleInstall.check();
 
   // TURN-START-BLOCK-REST — 턴 경계 recorder: showNextTui → runLocalChatTurn 위임 턴의
   // 시작 경계(begin)와 첫 응답 경계(end · stream-open)를 세션 키로 열고 닫아
@@ -472,6 +688,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       paintScreen([fitLogLine('Terminal too small · q quit', Math.max(1, columns))], 1, 1, columns, rows);
       return;
     }
+    // A narrow or short terminal has no room beside the chat: the requested detail covers the screen until Esc.
+    const graphOverlay = graphDetail.overlay(columns, rows, compactMode);
+    if (graphOverlay) {
+      const footer = fitLogLine(` ${englishFooterText(status)} `, Math.max(1, columns));
+      paintScreen([...graphOverlay, `\x1b[7m${footer}\x1b[0m`], rows, 1, columns, rows);
+      return;
+    }
     if (sidetabOpen && columns < 34) {
       sidetabOpen = false;
       sidetabMode = 'list';
@@ -483,8 +706,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     if (compactMode) setTuiMouseCapture(sidetabOpen);
     const sidetabWidth = sidetabOpen ? sidetabApi!.sidetabWidthForTerminal(columns) : 0;
-    const chatColumns = columns - sidetabWidth - (sidetabOpen ? 1 : 0);
+    // GRAPH-VIEW-DETAIL-SIDETAB: the requested detail is a panel to the right of the chat.
+    const graphDetailColumns = graphDetail.columns(columns);
+    const chatColumns = columns - sidetabWidth - (sidetabOpen ? 1 : 0) - graphDetailColumns - (graphDetailColumns > 0 ? 1 : 0);
     const backgroundLine = backgroundJobs.line();
+    const staleInstallLine = staleInstall.marker();
     let modelBadgeResolutionFailed = false;
     const resolveModelBadgeSafely = (): string | undefined => {
       try {
@@ -537,7 +763,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const approvalScroll = approvalViewport?.scroll ?? 0;
     const attachmentLines = contextAttachmentArea.flatMap((line) => wrapLogLines(safeStatusText(line), chatColumns));
     const attachmentContent = attachmentLines.slice(1);
-    const statusRowCount = backgroundLine ? 2 : 1;
+    const statusRowCount = 1 + (backgroundLine ? 1 : 0) + (staleInstallLine ? 1 : 0);
     const attachmentRowLimit = Math.max(1, Math.min(6, rows - header.length - statusRowCount - 1));
     const attachmentBodyRows = Math.max(1, attachmentRowLimit - 1);
     contextAttachmentScrollStep = attachmentBodyRows;
@@ -561,10 +787,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         ].find((candidate) => Bun.stringWidth(candidate) <= hintWidth) ?? null
       : null;
     const statusWidth = Math.max(1, chatColumns - (attachmentHint ? Bun.stringWidth(`${attachmentHint} · `) : 0));
-    const statusLine = formatNextTuiStatusLine({
+    const statusInput = {
       turnState: turnStatusBase,
       model: readNextTuiStatusModel(id ?? undefined, session?.meta),
       queued: queue.count,
+      steering: queue.steerCount,
       backgroundTasks,
       width: statusWidth,
       elapsedMs: id === telemetrySessionId ? turnElapsedMs : undefined,
@@ -572,33 +799,68 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       // 출처: #37786 — classic의 본문 문자/4 추정과 공급자 실측 값을 구분한다.
       estimatedOutputTokens: busy && id === telemetrySessionId && streamedOutputChars !== undefined
         ? Math.ceil(streamedOutputChars / 4) : undefined,
-    });
-    const turnStatus = [statusLine, attachmentHint].filter(Boolean).join(' · ');
-    const compactActionStatus = nextTuiCompactActionStatus(turnStatus);
+    };
+    const statusLineDrawn = footerStatusline.render(statusInput);
+    // Logic below reads the old footer text (facts); the screen shows the whole declarative line.
+    const statusLine = statusLineDrawn.facts;
+    // The turn-end summary replaces only the idle input status; log navigation keeps its own guide.
+    // While the log is at the bottom the same text is already the transcript's turn-end marker, so the
+    // footer repeats it only when the marker has scrolled out of view (no duplicate «Worked for» rows).
+    const showTurnEnd = !busy && focus !== 'log' && scroll > 0 && lastTurnEndStatus?.sessionId === id;
+    const turnStatus = showTurnEnd
+      ? lastTurnEndStatus!.text : [statusLine, attachmentHint].filter(Boolean).join(' · ');
     const attachmentFooter = attachmentLines.length
       ? [attachmentLines[0]!, ...attachmentContent.slice(contextAttachmentScroll, contextAttachmentScroll + attachmentBodyRows)]
       : [];
     const withAttachmentFooter = (lines: string[]): string[] => [...attachmentFooter, ...lines];
-    const statusFooter = rows <= compactHeight
-      ? [
-          ...(backgroundLine ? [fitLogLine(backgroundLine, chatColumns)] : []),
-          ...(busy && graphProgressLine ? [fitLogLine(englishFooterText(graphProgressLine), chatColumns)] : []),
-          nextTuiStatusLine({
-            state: welcomePending ? 'Enter send · Esc cancel · Ctrl+Q quit'
-              : (compactActionStatus ?? turnStatusBase) || (busy ? '응답 중' : '대기'),
-            ...(executionModelBadge ? { model: executionModelBadge } : {}),
-            queued: queue.count,
-            activeChildren: agents.filter(({ status: agentStatus }) => agentStatus === 'running' || agentStatus === 'background').length,
-            columns: chatColumns,
-          }),
-        ]
-      : [
-          ...(backgroundLine ? [fitLogLine(backgroundLine, chatColumns)] : []),
-          ...(busy && graphProgressLine ? [fitLogLine(englishFooterText(graphProgressLine), chatColumns)] : []),
-          ...(welcomePending ? [fitLogLine('Enter send · Esc cancel · Ctrl+Q quit', chatColumns)] : []),
-          ...(turnStatus ? [fitLogLine(turnStatus, chatColumns)] : []),
-        ];
-    const panelSpec = atFileInput.current?.panel
+    const livenessView = busy && id === telemetrySessionId ? nodeLivenessTui.view(Date.now()) : null;
+    const graphFooterLine = nodeLivenessFooterLine(livenessView, graphProgressLine, chatColumns);
+    const compactStatusInput = { ...statusInput, ...(executionModelBadge ? { model: executionModelBadge } : {}), width: chatColumns };
+    // DESIGN §2b (대표 11-18): the status line sits under the input, the last row, by default (`position: bottom`); the
+    // progress row above the input says the turn, so while one runs the bottom line drops its turn clause.
+    const statusAtBottom = footerStatusline.position === 'bottom';
+    // Only a plain phase is dropped (the progress row says it); an action answer in the turn slot stays.
+    const omitTurn = statusAtBottom && busy && nextTuiTurnIsPhase(statusInput.turnState);
+    const compactTurn = showTurnEnd ? lastTurnEndStatus!.text : compactFooterTurn({
+      welcomePending,
+      // The attachment hint on its own (#38292 REVIEW-1 ①): glued after the footer sentence it was the first thing
+      // cut on an 80-column line. (The old nextTuiCompactActionStatus passed the whole English sentence through —
+      // «Turn Turn done …» — so the compact branch no longer uses it.)
+      attachmentHint,
+      // At the bottom during a turn the progress row says the turn; the compact facts (children, hints) stay (#38392 REVIEW-1 ①).
+      shortTurn: omitTurn ? '' : nextTuiShortStatus(compactStatusInput).turn,
+      activeChildren: agents.filter(({ status: agentStatus }) => agentStatus === 'running' || agentStatus === 'background').length,
+    });
+    // NEXT-TUI-FOOTER-24-ROWS: the declarative line on compact screens too (cwd · version stay on an 80×24 terminal);
+    // the compact-only facts take the turn's place (statusline/next-tui.ts compactFooterTurn). The compact line keeps
+    // its model: the execution badge (the model the next turn will use) when known.
+    const statusRow: string | undefined = rows <= compactHeight
+      // While a turn runs the bottom line drops the turn's own fields; a replacement in the turn slot (children, a hint)
+      // stays (#38392 r2 ②).
+      ? footerStatusline.render(compactStatusInput, compactTurn, omitTurn).shown
+      // The turn-end summary or the attachment hint replaces only the turn part; the cwd, the version and a user
+      // layout's other segments stay (the declarative line is drawn again with that text in the turn's place).
+      : turnStatus
+        ? (turnStatus === statusLine
+          ? (omitTurn ? footerStatusline.render({ ...statusInput, width: chatColumns }, undefined, true).shown : statusLineDrawn.shown)
+          // During a turn at the bottom, a hint replaces the slot on its own (the sentence it was glued to is the turn).
+          : footerStatusline.render({ ...statusInput, width: chatColumns },
+            omitTurn && attachmentHint && !showTurnEnd ? attachmentHint : turnStatus, omitTurn).shown)
+        : undefined;
+    const statusFooter = [
+      ...(staleInstallLine ? [fitLogLine(staleInstallLine, chatColumns)] : []),
+      ...(backgroundLine ? [fitLogLine(backgroundLine, chatColumns)] : []),
+      ...(busy && graphFooterLine && graphViewShowsHint(graphViewMode) ? [fitLogLine(englishFooterText(graphFooterLine), chatColumns)] : []),
+      ...(rows > compactHeight && welcomePending ? [fitLogLine('Enter send · Esc cancel · Ctrl+Q quit', chatColumns)] : []),
+      ...(statusRow !== undefined && !statusAtBottom ? [statusRow] : []),
+    ];
+    const bottomStatusRow = statusRow !== undefined && statusAtBottom ? statusRow : undefined;
+    if (queuePanel && queue.count === 0) queuePanel = null;
+    const panelSpec = queuePanel
+      ? queuePanelSpec(queue.items, queuePanel.selected)
+      : providerPicker?.panel
+      ? providerPicker.panel
+      : atFileInput.current?.panel
       ? atFileInput.current.panel
       : slashPicker
         ? {
@@ -626,18 +888,22 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       : panelSpec
       ? formatInlinePanel({ ...panelSpec, title: englishFooterText(panelSpec.title), hint: englishFooterText(panelSpec.hint) }).map((line) => fitLogLine(line, chatColumns))
       : statusFooter);
+    // The status line under the input stays with any panel open; only a screen too short for header · footer · input ·
+    // status · one conversation row drops it (#38392 r2 ①, core/bottom-status.ts).
+    const belowPrompt = bottomStatusRow !== undefined && keepBottomStatus({ rows, headerRows: header.length, footerRows: footer.length })
+      ? [bottomStatusRow] : [];
     // Reserve a transcript row and a prompt row before adding this decoration.
     // Use the current chat width so resizing and an open sidetab stay aligned.
-    if (rows - header.length - footer.length >= 3) {
+    if (rows - header.length - footer.length - belowPrompt.length >= 3) {
       footer.push(C.dim('─'.repeat(chatColumns)));
     }
     // Keep title, status and at least one log row visible on ordinary small terminals.
     const interviewCall = harnessAskUser.active();
     const interviewLines = interviewCall ? harnessAskUserComposerLines(interviewCall)
       .flatMap(line => wrapLogLines(line, chatColumns)) : [];
-    const interviewRows = Math.min(interviewLines.length, Math.max(0, rows - header.length - footer.length - 2));
+    const interviewRows = Math.min(interviewLines.length, Math.max(0, rows - header.length - footer.length - belowPrompt.length - 2));
     const visibleInterviewLines = harnessAskUser.viewport(interviewLines, interviewRows);
-    const promptMaxRows = Math.max(1, Math.min(6, rows - header.length - footer.length - visibleInterviewLines.length - 1)); // Source: #36682
+    const promptMaxRows = Math.max(1, Math.min(6, rows - header.length - footer.length - belowPrompt.length - visibleInterviewLines.length - 1)); // Source: #36682
     const prompt = composerViewport(input.editor, { columns: chatColumns, maxRows: promptMaxRows });
     const promptLines = [...visibleInterviewLines, ...prompt.lines];
     const promptCursorRow = visibleInterviewLines.length + prompt.cursorRow;
@@ -660,35 +926,80 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const reconciledAgents = reconcileAgentOutputStatuses(agents, messages, backgroundJobs.snapshot()?.tasks);
     const previewText = streamPreview?.assistantText
       ? nextAssistantPreviewText(streamPreview.text) : streamPreview?.text;
-    const displayActivity = [
-      // Keep a completed call until its corresponding saved result can render in detail.
-      ...toolActivityLines(basicChat ? visibleToolActivity : visibleToolActivity.filter((row) =>
-        row.finishedAt === undefined || !hasDisplayableCompletedToolBlock(row.id, messageBlocks, visibleMessages)), performance.now()),
-      ...(!basicChat ? [
-        ...agentDisplayLines(reconciledAgents),
-        ...reconciledAgents.map(agentDisplayLine),
-        ...(backgroundJobs.taskLines?.() ?? []).map(safeStatusText),
-      ] : []),
-      ...(busy && streamPreview?.sessionId === id && previewText
-        && (!basicChat || streamPreview.assistantText)
-        ? streamReplyLines(previewText, chatColumns) : activity),
-    ];
+    // Keep a completed call until its corresponding saved result can render in detail.
+    const shownToolRows = (rows: readonly ToolActivityRow[]) => basicChat ? rows : rows.filter((row) =>
+      row.finishedAt === undefined || !hasDisplayableCompletedToolBlock(row.id, messageBlocks, visibleMessages));
+    const liveToolRows = shownToolRows(visibleToolActivity);
+    const streamingReply = busy && streamPreview?.sessionId === id && previewText
+      && (!basicChat || streamPreview.assistantText);
+    const agentLines = !basicChat ? [
+      ...agentDisplayLines(reconciledAgents),
+      ...reconciledAgents.map(agentDisplayLine),
+      ...(backgroundJobs.taskLines?.() ?? []).map(safeStatusText),
+    ] : [];
+    // NEXT-TUI-TOOL-LOG-NOT-PINNED: tool rows and streamed text form one chronological flow.
+    const displayActivity = withNodeLivenessToolRow(streamingReply
+      ? [...agentLines, ...interleavedTurnLines(liveToolRows, toolTextOffsets, previewText!, performance.now(),
+        (chunk) => streamReplyLines(chunk, chatColumns))]
+      : [...toolActivityLines(liveToolRows, performance.now()), ...agentLines, ...activity],
+    TOOL_RUNNING_GLYPH, livenessView, Date.now());
+    // GRAPH-VIEW-TRIGGER: the live block sits under the turn's flow and above the working row, updated in place.
+    if (busy && id === telemetrySessionId && graphViewShowsBlock(graphViewMode) && graphView.events.length > 0) {
+      // 출처: 개정 4 «화면 높이 상한 넘으면 오래된 실행 블록부터 접음» — the chat area's upper half.
+      const graphRows = Math.max(1, Math.floor(rows / 2));
+      displayActivity.push(...graphViewTurnLines(graphView.events, chatColumns, graphRows, Date.now()));
+    }
+    // The footer hint already carries the liveness row in the hint modes; inline-only shows it under the block.
+    const livenessRow = graphViewShowsHint(graphViewMode) ? undefined : nodeLivenessProgressRow(livenessView, chatColumns);
+    if (livenessRow) displayActivity.push(livenessRow);
+    // NEXT-TUI-WORKING-ROW: right under the streamed text, above the prompt — the turn is running.
+    if (busy && id === telemetrySessionId) {
+      const runningTool = runningToolLabel(liveToolRows);
+      displayActivity.push(workingRowLine({
+        phase: runningTool ? { kind: 'tool', ...runningTool } : streamingReply ? { kind: 'responding' }
+          : (streamedOutputChars ?? 0) > 0 ? { kind: 'responding' } : { kind: 'thinking' },
+        elapsedMs: turnElapsedMs ?? 0, queued: queue.count, columns: chatColumns,
+      }));
+    }
+    let inlineInsertions: Map<number, string[]> | undefined;
+    // nextTuiPublicHistory keeps saved indexes, so a raw user-message index anchors the displayed row.
+    const settledEntries: [number, string[]][] = [];
+    for (const { anchor, userContent, rows, graph } of settledTurnTools.get(id ?? '') ?? []) {
+      const toolLines = toolActivityLines(shownToolRows(rows), performance.now());
+      // A finished loop stays in the transcript as its folded line (a failed one keeps the failed node open).
+      const graphLines = graph && graphViewShowsBlock(graphViewMode)
+        ? graphViewTurnLines(graph, chatColumns, Number.POSITIVE_INFINITY, Date.now()) : [];
+      const lines = [...toolLines, ...graphLines];
+      // Compaction reloads and may re-index messages: attach only to the same user turn, never a neighbour.
+      const anchored = displayedMessages[anchor];
+      if (lines.length === 0 || anchored?.role !== 'user' || anchored.content !== userContent) continue;
+      // Blank row before the answer, like after a user message; rows dim as in the live flow.
+      settledEntries.push([anchor, [...toolLines.map((line) => nextTuiActivityRow(line, chatColumns)), ...graphLines, '']]);
+    }
+    if (settledEntries.length > 0) {
+      const key = settledEntries.map(([anchor, lines]) => anchor + '\u0000' + lines.join('\n')).join('\u0001');
+      if (settledInline?.key !== key) settledInline = { key, map: new Map(settledEntries) };
+      inlineInsertions = settledInline.map;
+    }
     // Source: renderNextTuiLogFrame reserves one prompt row after header and footer.
     const firstScreen = nextFirstScreenLines({
       width: chatColumns,
-      availableRows: Math.max(0, rows - header.length - footer.length - promptLines.length),
+      availableRows: Math.max(0, rows - header.length - footer.length - belowPrompt.length - promptLines.length),
       hasMessages: displayedMessages.length > 0,
       hasActivity: displayActivity.length > 0,
       hasNotices: notices.length > 0,
       hasDraft: input.editor.text.length > 0,
       busy,
     });
-    const frameInput = { messages: displayedMessages, messageBlocks: (basicChat ? [] : messageBlocks).map((block) => ({
+    const frameInput = { messages: displayedMessages,
+      turnEndMarkers: turnEndMarkers.get(id ?? '') ?? [],
+      messageBlocks: (basicChat ? [] : messageBlocks).map((block) => ({
       block, level: messageBlockLevels.get(block.id) ?? 0, rawText: messageBlockRawTexts.get(block.id),
       afterMessageIndex: messageBlockAfterMessageIndexes.get(block.id),
     })), columns: chatColumns, rows,
-      header, footer,
-      promptLine: prompt.line, promptLines, notices: basicChat ? notices : [...notices, ...internalNotices], activity: [...firstScreen, ...displayActivity], scroll,
+      header, footer, belowPrompt,
+      promptLine: prompt.line, promptLines, notices: basicChat ? notices : [...notices, ...internalNotices], activity: [...publishApproval.session.lines(), ...firstScreen, ...displayActivity], scroll,
+      inlineInsertions,
       expandedToolIndexes: basicChat ? new Set<number>() : expandedToolBlocks };
     const prepared = prepareHistory(frameInput);
     const frame = compactMode
@@ -711,10 +1022,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         : sidetabRich ? [fitLogLine('원장 조회 불가 · g 목록', sidetabWidth)]
           : sidetabSectionFrame?.lines ?? sidetabApi!.formatSidetabLines(sidetabRows, sidetabSelected, sidetabWidth, Math.max(1, rows - 1), sidetabMode)
       : [];
-    const screenLines = sidetabOpen && !compactMode
+    graphDetail.noteChatFrame(lines, chatColumns, sidetabOpen && !compactMode ? sidetabWidth + 1 : 0);
+    const chatScreenLines = sidetabOpen && !compactMode
       ? Array.from({ length: Math.max(lines.length, sidetabLines.length) }, (_, index) =>
           `${sidetabLines[index] ?? ' '.repeat(sidetabWidth)}│${lines[index] ?? ''}`)
       : lines;
+    const screenLines = graphDetail.compose(chatScreenLines, columns, rows);
     if (compactMode) {
       const sources = displayedMessages.map((message) => JSON.stringify(message));
       const geometry = compactGeometry;
@@ -785,6 +1098,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (!isActive()) return;
         status = kind === 'ready' ? `미션 준비 완료 · ${missionId}` : `미션 종결 · ${missionId}`;
         render();
+        // #38031 — 실행('run') 관찰 종결을 입력 큐 notice 로: 종결 상태 줄이 대기열에 남는다.
+        if (kind === 'run') childNotices.sidetabResult({ mission: missionId, status: '완료' });
       },
     });
     missionWatchCancellation.cancel = watcher.cancel;
@@ -819,7 +1134,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       rows: () => sidetabRows,
       attachments: sidetabAttachments,
     });
-    workspaceInput = (await import('./sidetab/workspace-input-controller.js')).createWorkspaceInputController(ports);
+    const workspaceInputModule = await import('./sidetab/workspace-input-controller.js');
+    refreshWorkspaceInputRows = workspaceInputModule.refreshWorkspaceInputRows;
+    workspaceInput = workspaceInputModule.createWorkspaceInputController(ports);
     workspaceBroadcast = (await import('./sidetab/workspace-broadcast.js')).createWorkspaceBroadcast({
       rows: () => sidetabRows,
       sendTerminal: ports.sendTerminal,
@@ -846,12 +1163,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabMode = 'list';
     if (sidetabOpen && sidetabRefreshTimer === null) {
       void refreshHerdrSidetabRows();
+      void refreshElsSidetabRows();
       if (process.env.ELANOUS_REMOTE_SIDETAB === '1') void refreshRemoteSidetabRows();
       sidetabRefreshTimer = setInterval(() => {
         if (!sidetabOpen || !sidetabApi) return;
         refreshSidetabRows();
         refreshRichView();
         void refreshHerdrSidetabRows();
+        void refreshElsSidetabRows();
         if (process.env.ELANOUS_REMOTE_SIDETAB === '1') void refreshRemoteSidetabRows();
         render();
       }, 1000);
@@ -862,13 +1181,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   };
 
   const refreshSidetabRows = (): void => {
-    if (!sidetabApi) return;
-    const selectedId = sidetabRows[sidetabSelected]?.id;
-    sidetabRows = [...sidetabApi.loadSidetabRows(getSidetabViewMode() === 'all', undefined, sidetabScope()), ...herdrSidetabRows, ...remoteSidetabRows];
-    const preservedIndex = selectedId ? sidetabRows.findIndex((row) => row.id === selectedId) : -1;
-    sidetabSelected = preservedIndex >= 0
-      ? preservedIndex
-      : Math.min(sidetabSelected, Math.max(0, sidetabRows.length - 1));
+    if (sidetabApi) {
+      const selectedId = sidetabRows[sidetabSelected]?.id;
+      sidetabRows = [...sidetabApi.loadSidetabRows(getSidetabViewMode() === 'all', undefined, sidetabScope()), ...herdrSidetabRows, ...remoteSidetabRows, ...elsSidetabRows];
+      const preservedIndex = selectedId ? sidetabRows.findIndex((row) => row.id === selectedId) : -1;
+      sidetabSelected = preservedIndex >= 0
+        ? preservedIndex
+        : Math.min(sidetabSelected, Math.max(0, sidetabRows.length - 1));
+    }
+    // Follow the row list. No local tab clears an automatic binding and returns.
+    if (workspaceInput && refreshWorkspaceInputRows) refreshWorkspaceInputRows(workspaceInput);
     refreshRichView();
   };
   const toggleWorkspaceRow = (row: { id: string; kind: string }): boolean => {
@@ -890,6 +1212,21 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       refreshSidetabRows();
     } catch { /* Herdr is optional; TUI rows remain available. */ }
     finally { herdrSidetabRefreshPending = false; }
+  };
+  // The els server's spaces (ws/tab/pane, status words, ⇄host). Read-only: no server is started and none is stopped
+  // when the panel closes; no answer means no rows.
+  const refreshElsSidetabRows = async (): Promise<void> => {
+    if (elsSidetabRefreshPending) return;
+    elsSidetabRefreshPending = true;
+    try {
+      const subscribe = await import('./sidetab/els-subscribe.js');
+      const next = await subscribe.fetchElsSidetabRows(subscribe.realElsSubscribeDeps());
+      if (JSON.stringify(next) !== JSON.stringify(elsSidetabRows)) {
+        elsSidetabRows = next;
+        refreshSidetabRows();
+      }
+    } catch { /* els is optional; the other sections remain. */ }
+    finally { elsSidetabRefreshPending = false; }
   };
   const refreshRemoteSidetabRows = async (): Promise<void> => {
     if (remoteSidetabRefreshPending) return;
@@ -933,6 +1270,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     saveMessageBlockSession();
     id = targetId;
+    bindWakeupSession?.(id);
     restoreMessageBlockSession(targetId);
     lastFoldTargetKey = null;
     session = target;
@@ -1030,14 +1368,23 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   };
 
   /** Every busy path ends here: the door learns the turn is over, then the queue moves or returns to the prompt. */
-  const settle = (): void => {
+  const settle = (turn?: NextTuiSettledTurn): void => {
+    // A path that ends without onSettled (never started) is «no answer»: a pending mail turn wakes again, never marked seen
+    // by a later turn. After onSettled already reported, this is a no-op.
+    wakeup?.noteTurnFinished(false);
     wakeup?.gate.noteTurnSettled();
-    const result = queue.settle(input.editor.text);
-    if (result.kind === 'restore') {
-      input.setText(result.text);
+    try { seatPlan?.absorb(); } catch { /* mail absorption never blocks a turn end */ }
+    const result = queue.settle(input.editor.text, turn);
+    if (result.kind === 'restore-original') {
+      const draft = input.editor.text;
+      input.setText(draft ? `${result.text}\n${draft}` : result.text);
       input.clearHistory();
-      status = `응답 취소됨 · 대기 ${result.count}건을 입력칸으로 · Enter 전송`;
-      debug.log('tui.next', 'queue-restored', { count: result.count });
+      status = 'Response cancelled · sent text restored to the prompt · Enter to send';
+      debug.log('tui.next', 'cancel-restore-original', { chars: result.text.length });
+    } else if (result.kind === 'resubmit') {
+      status = `응답 취소됨 · 대기 ${result.count}건 다음 턴으로 자동 제출`;
+      debug.log('tui.next', 'queue-resubmit-after-interrupt', { count: result.count });
+      injectKey(queueWake);
     } else if (result.kind === 'wake') injectKey(queueWake);
   };
 
@@ -1045,8 +1392,47 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const dispatchQueued = (): void => {
     const handoff = queue.dequeue();
     if (handoff.kind !== 'submit') return;
+    // mf1(#38102 r4): a notice is not the person — it opens its own turn through the internal-turn door.
+    // The composer, the draft and the person-turn fingerprint (noteHumanTurn) are untouched; the model
+    // alone sees the one-line source head («[notice · seat-mail]») on the turn it answers.
+    if (handoff.itemKind === 'notice') {
+      // One notice, one turn. Entry calls the leaf once. The leaf injects only
+      // when the note is new, and it posts the receipt when this turn ends.
+      const oneId = handoff.id;
+      const oneText = handoff.text;
+      const oneSource = handoff.source;
+      const oneOccurredAt = handoff.occurredAt;
+      const oneReceivedAt = Date.now();
+      const oneRemaining = handoff.remaining;
+      // A plan item travels as a seat-mail notice: tell the plan link which turn belongs to it, or the finished plan can never close the item.
+      if (oneSource === 'seat-mail') seatPlanLink?.noticeDispatched(oneId, oneText);
+      void import('./external-event-one-wire.js').then(({ openExternalEventOne }) => {
+        const opened = openExternalEventOne({
+          id: oneId,
+          text: oneText,
+          source: oneSource,
+          ...(oneOccurredAt === undefined ? {} : { occurredAt: oneOccurredAt }),
+          receivedAt: oneReceivedAt,
+        });
+        // A duplicate or a refusal is not a turn. The leaf already posted the failed receipt.
+        if (!opened.injected) return;
+        pendingNoticeTurn = opened;
+        debug.log('tui.next', 'queue-dispatched-notice', { source: oneSource, remaining: oneRemaining });
+        startChatTurn(oneText, `[notice · ${oneSource ?? 'queue'}] auto-submitted`);
+        render();
+      }).catch(() => { /* a receipt note never blocks the notice turn */ });
+      return;
+    }
     // 대기열에서 나가는 것도 사람이 쳐 둔 턴이다 — 골 이어가기의 연속·지문을 비운다(r3 must-fix).
     goalContinue?.noteHumanTurn();
+    interruptContextFor = handoff.afterInterrupt ? handoff.text.trim() : null;
+    const candidate = queue.replacementCandidate(handoff.id);
+    const candidateOld = candidate ? queue.get(candidate.candidateFor) : undefined;
+    // The old item's status at dispatch decides the wording (queued vs already delivered); cancelled → no line.
+    const candidateLine = candidate && candidateOld
+      ? replacementCandidateContextLine(candidate, candidateOld.text, candidateOld.status)
+      : null;
+    replacementContextFor = candidateLine ? { text: handoff.text.trim(), line: candidateLine } : null;
     restoreDraft = input.editor.text;
     input.setText(handoff.text);
     focus = 'input';
@@ -1107,13 +1493,21 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   };
 
   /** One chat turn on the shared REPL child — a person's submit, or an internal turn the door opened (banner). */
-  const startChatTurn = (turnText: string, banner?: string): void => {
+  // MSG-SOURCE-HIERARCHY: who sent the running turn (absent = a person at the keyboard).
+  let turnFrom: import('../session/index.js').MessageSource | undefined;
+  const startChatTurn = (turnText: string, banner?: string, from?: import('../session/index.js').MessageSource): void => {
+    turnFrom = from;
+    // Which plan item (if any) this turn works for: a dispatched plan notice, or an automatic follow-up of one.
+    const planChainNotice = seatPlanLink?.turnStarted(turnText, banner !== undefined) ?? null;
     activity = [];
     graphProgressLine = null;
+    graphView = createRunnerProgressProjector();
+    nodeLivenessTui.reset();
     agents = [];
     activeShellCalls.clear();
     activeToolCalls.clear();
     visibleToolActivity = [];
+    toolTextOffsets.clear();
     stopConfirmationSelection = null;
     stopConfirmationKind = null;
     pushNowSnapshotPending = false;
@@ -1122,22 +1516,50 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const attachments = [...atAttachmentTokens].filter(([token]) => turnText.includes(token)).map(([, path]) => path);
     if (!id) {
       id = createSession({ source: 'tui' }).id;
+      bindWakeupSession?.(id);
       restoreMessageBlockSession(id);
       setActiveSessionId(id);
       session = loadSession(id);
       backgroundJobs.setSessionId(id);
     }
     const turnSessionId = id;
+    const carriesInterruptContext = interruptContextFor !== null && turnText.trim() === interruptContextFor;
+    interruptContextFor = null;
+    // mf1(#38102 r4): only the exact notice text dispatched a moment ago claims the source head.
+    const noticeTurn = pendingNoticeTurn !== null && pendingNoticeTurn.text === turnText ? pendingNoticeTurn : null;
+    const noticeSource = noticeTurn?.source ?? null;
+    pendingNoticeTurn = null;
+    const replacementContextLine = replacementContextFor !== null && turnText.trim() === replacementContextFor.text
+      ? replacementContextFor.line
+      : null;
+    replacementContextFor = null;
+    let stopSteerApplied: (() => void) | null = null;
+    staleInstall.check();
     busy = true;
+    lastTurnEndStatus = null;
     telemetrySessionId = turnSessionId;
     const turnStartedAt = performance.now();
+    const turnStartedWallAt = Date.now();
     turnElapsedMs = 0;
     measuredUsage = undefined;
     streamedOutputChars = 0;
     if (turnElapsedTimer !== null) clearInterval(turnElapsedTimer);
+    turnStallWatch = createTurnStallWatch({ now: () => performance.now(), limitMs: options.turnStallLimitMs });
+    turnStallHandled = false;
     turnElapsedTimer = setInterval(() => {
       if (tuiClosed || !busy || id !== turnSessionId) return;
       turnElapsedMs = nextTuiElapsedMs(turnStartedAt, performance.now(), turnElapsedMs);
+      // A silent turn that never ends keeps queued input waiting forever (E/D stall evidence): stop it like Esc.
+      const verdict = turnStallWatch.check({ running: activeShellCalls.size + activeToolCalls.size
+        + agents.filter((agent) => agent.status === 'running').length });
+      if (verdict.stalled && !turnStallHandled && turnAbort && !turnAbort.signal.aborted) {
+        turnStallHandled = true;
+        debug.log('tui.next', 'turn.stalled', { sessionId: turnSessionId, idleMs: Math.round(verdict.idleMs), queued: queue.count,
+          streamedChars: streamedOutputChars ?? 0, elapsedMs: Math.round(turnElapsedMs ?? 0) }, { level: 'warn' });
+        queue.markInterrupted();
+        turnAbort.abort();
+        status = `No output for ${stallMinutes(verdict.idleMs)} min · turn stopped${queue.count > 0 ? ' · queued input is sent next' : ''}`;
+      }
       render();
     }, 250);
     // herdr pane 이면 턴 시작·끝을 working → idle 로 신고한다(`eln herdr prompt --wait` 가 이것을 기다린다).
@@ -1148,20 +1570,63 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // An internal turn says where it came from (classic «↻ 자동 재개(<origin>): <이유>») instead of looking typed.
     // TUI-GOAL-INTERIM-QUIET — the log draws a recognized internal input in place («↻ 자동 재개(<origin>)»), so the
     // notice list would only repeat it under the last reply; the status line still names it while the turn runs.
-    if (banner && !internalTurnOriginOfText(turnText)) pushNotice(banner);
-    status = banner ? `${safeStatusText(banner)} · running · Esc cancel` : '응답 중 · Esc 취소';
+    // A207 — the running status is immediate (a turn that never opens must still say it is
+    // running). Only «↻ Continuing» waits until the turn handle has actually returned.
+    status = '응답 중 · Esc 취소';
+    render();
     dashboardRuntime.beginTurnStartSegments(turnSessionId);
     // 이번 턴이 만든 답만 골 이어가기 판정에 쓴다 — 시작 때 세션 길이를 잡아 둔다.
     const messagesAtTurnStart = messages.length;
     const turn = startNextTuiTurn({ sessionId: turnSessionId, text: turnText }, {
       run: async ({ sessionId, text, signal }, onDelta, onCompact, onNotice, onAgent, onStatus, onMessageBlock) => {
-        const { runLocalChatTurn, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, requestLocalChatShellActivitySnapshot, requestLocalChatPushNow, commitLocalChatPushNow } = await import('../tui-client/local-chat-turn.js');
+        const { runLocalChatTurn, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, requestLocalChatShellActivitySnapshot, requestLocalChatPushNow, commitLocalChatPushNow,
+          requestLocalChatSteer, retractLocalChatSteer, onLocalChatSteerApplied } = await import('../tui-client/local-chat-turn.js');
+        // A207 — a cancel that lands while the module is loading never starts the chat turn,
+        // and never paints «↻ Continuing». The running status was already drawn above.
+        if (signal.aborted || id !== turnSessionId) return { goalComplete: false };
         shellActivitySnapshotRequest.current = () => requestLocalChatShellActivitySnapshot(sessionId);
         pushNowRequest.current = (requestId) => requestLocalChatPushNow(sessionId, requestId);
         pushNowCommit.current = (requestId) => commitLocalChatPushNow(sessionId, requestId);
+        // A200 — steer IPC (absent in older module doubles: input then simply waits for the turn end).
+        if (typeof requestLocalChatSteer === 'function' && typeof onLocalChatSteerApplied === 'function') {
+          steerRequest.current = (steerId, steerText) => !signal.aborted && requestLocalChatSteer(sessionId, steerId, steerText);
+          steerRetract.current = (steerIds) => { if (typeof retractLocalChatSteer === 'function') retractLocalChatSteer(sessionId, steerIds); };
+          stopSteerApplied?.();
+          stopSteerApplied = onLocalChatSteerApplied(sessionId, (steerIds) => {
+            if (!busy || id !== turnSessionId) return;
+            const applied = queue.markSteered(steerIds);
+            if (applied === 0) return;
+            pushNotice('Steer applied');
+            status = '조향 반영 · 응답 중 · Esc 취소';
+            debug.log('tui.next', 'steer-applied', { count: applied, remaining: queue.count });
+            render();
+          });
+        }
         observeSession(sessionId, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus);
-        return runLocalChatTurn(sessionId, text, signal, undefined, undefined, (...args) => {
+        // Model-context lines, outermost first: interrupted-on-purpose → «대체 후보» → the person's words.
+        const withCandidate = replacementContextLine ? withReplacementCandidateContext(text, replacementContextLine) : text;
+        // mf1(#38102 r4): the notice turn carries the one-line source head for the model only; the person's
+        // view is stripped back to the notice text (public-history, like the interrupt/candidate heads).
+        const childText = noticeSource !== null
+          ? withQueueNoticeContext(withCandidate, noticeSource)
+          : carriesInterruptContext ? withInterruptedOnPurposeContext(withCandidate) : withCandidate;
+        if (noticeSource !== null) debug.log('tui.next', 'turn-notice-context', { source: noticeSource, chars: text.length });
+        if (replacementContextLine) debug.log('tui.next', 'turn-replacement-candidate-context', { chars: text.length });
+        if (carriesInterruptContext) debug.log('tui.next', 'turn-after-interrupt', { chars: text.length });
+        if (signal.aborted || id !== turnSessionId) return { goalComplete: false };
+        // A207 — «↻ Continuing» only after runLocalChatTurn has returned its handle. A throw
+        // during that open never paints the banner. The running status is already on screen.
+        let turnOpenPainted = false;
+        const paintTurnOpen = (): void => {
+          if (turnOpenPainted || signal.aborted || id !== turnSessionId) return;
+          turnOpenPainted = true;
+          if (!banner || internalTurnOriginOfText(turnText)) return;
+          pushNotice(banner);
+          render();
+        };
+        const opened = runLocalChatTurn(sessionId, childText, signal, undefined, undefined, (...args) => {
           const [delta, replace, source] = args;
+          turnStallWatch.touch();
           if (!signal.aborted && id === sessionId && !replace && source === 'assistant-text') {
             streamedOutputChars = Math.min(Number.MAX_SAFE_INTEGER, (streamedOutputChars ?? 0) + delta.length);
           }
@@ -1174,6 +1639,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               render();
             } }, attachments, onStatus, onAgent,
           (event) => {
+            turnStallWatch.touch();
             if (event.phase === 'snapshot') {
               activeShellCalls.clear();
               for (const call of event.calls) activeShellCalls.set(call.id, { name: call.name, startedAtMonotonicMs: call.startedAtMonotonicMs });
@@ -1190,8 +1656,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             }
             render();
           }, (event) => {
+            turnStallWatch.touch();
             if (!busy || id !== turnSessionId) return;
+            // Child stdout orders deltas and tool events; flush the throttled preview so the offset matches.
+            if (event.phase !== 'finish') turn.flushPreview();
             visibleToolActivity = updateToolActivity(visibleToolActivity, event, performance.now());
+            const textAt = streamPreview?.sessionId === turnSessionId ? streamPreview.text.length : 0;
+            for (const callId of event.phase === 'snapshot' ? event.calls.map((call) => call.id) : event.phase === 'start' ? [event.id] : [])
+              if (!toolTextOffsets.has(callId)) toolTextOffsets.set(callId, textAt);
             if (event.phase === 'snapshot') {
               activeToolCalls.clear();
               for (const call of event.calls) activeToolCalls.set(call.id, call.name);
@@ -1210,13 +1682,21 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           (event) => {
             if (!busy || id !== turnSessionId) return;
             graphProgressLine = graphProgressStatus(event);
+            graphView.observe(event);
+            nodeLivenessTui.observe(event, runningToolLabel(visibleToolActivity)?.name);
             reportTuiProgress();
             render();
-          });
+          }, turnFrom);
+        paintTurnOpen();
+        return opened;
       },
       onProgress: reportTuiProgress,
+      // A207 — the banner is painted in run() after the turn handle returns. This still
+      // closes the turn-start timing segment on the first stream byte, not before it.
       onStreamOpen: () => dashboardRuntime.endTurnStartSegments(turnSessionId, 'stream-open'),
-      onPreview: (preview, _replace, source) => {
+      onPreview: (preview, replace, source) => {
+        // A replaced reply restarts the text; earlier tools now precede all of it.
+        if (replace) for (const callId of toolTextOffsets.keys()) toolTextOffsets.set(callId, 0);
         // The REPL tags only session/chat onText; tool, reasoning and diagnostic frames stay separate.
         streamPreview = { sessionId: turnSessionId, text: preview, assistantText: source === 'assistant-text' };
         const progress = preview ? streamReplyProgress(turnSessionId) : null;
@@ -1224,28 +1704,32 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
       },
       onCompact: (compactStatus) => {
+        turnStallWatch.touch();
         // Compaction details may include child diagnostics; the basic chat shows only the state.
-        // Settlement still reports the count. A head of 대화 압축 완료 folds to 완료 and
-        // drops both the count and 응답 완료 from the 24-row footer.
-        if (/^압축 \d+→\d+ 메시지$/.test(compactStatus)) lastCompactCount = compactStatus;
+        // Settlement still reports the count. A head of Compacted folds to done and
+        // drops both the count and Turn done from the 24-row footer.
+        if (/^Compacted \d+→\d+ messages$/.test(compactStatus)) lastCompactCount = compactStatus;
         status = projectUserReplyStatus(compactStatus);
         session = loadSession(turnSessionId);
         messages = session?.messages ?? [];
         expandedToolBlocks.clear();
         render();
       },
-      onNotice: (line) => { pushNotice(line); render(); },
+      onNotice: (line) => { turnStallWatch.touch(); pushNotice(line); render(); },
       onStatus: (line) => {
         if (isNextTuiContextCountStatus(line)) return;
+        turnStallWatch.touch();
         status = projectUserReplyStatus(line);
         render();
       },
       onAgent: (event) => {
+        turnStallWatch.touch();
         agents = applyAgentEvent(agents, event);
         reportTuiProgress();
         render();
       },
       onMessageBlock: (block) => {
+        turnStallWatch.touch();
         const state = messageBlockSessions.restore(turnSessionId);
         upsertMessageBlock(state, block, Math.max(0, messagesAtTurnStart));
         messageBlockSessions.save(turnSessionId, state);
@@ -1264,6 +1748,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (turnElapsedTimer !== null) clearInterval(turnElapsedTimer);
         turnElapsedTimer = null;
         turnElapsedMs = nextTuiElapsedMs(turnStartedAt, performance.now(), turnElapsedMs);
+        // Read before the per-turn counters are cleared: did anything answer at all (reply text or a tool)?
+        const turnResponded = (streamedOutputChars ?? 0) > 0 || visibleToolActivity.length > 0;
         streamedOutputChars = undefined;
         if (outcome.kind !== 'completed') measuredUsage = undefined;
         pendingEcho = null;
@@ -1274,30 +1760,62 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         shellActivitySnapshotRequest.current = null;
         pushNowCommit.current = null;
         pushNowRequest.current = null;
+        steerRequest.current = null;
+        steerRetract.current = null;
+        stopSteerApplied?.();
+        stopSteerApplied = null;
         shellEscSnapshotPending = false;
         pushNowSnapshotPending = false;
         pushNowRequestId = null;
         pushNowPhase = null;
-        const compactNote = outcome.compacted ? `${lastCompactCount ?? '대화 압축 완료'} · ` : '';
+        const compactNote = outcome.compacted ? `${lastCompactCount ?? 'Compacted'} · ` : '';
         lastCompactCount = null;
-        status = outcome.kind === 'cancelled' ? `${compactNote}응답 취소됨 · Enter 전송`
-          : outcome.kind === 'failed' ? `${compactNote}응답 실패`
-            : outcome.goalStopReason === 'max_turns' ? 'Turn cap reached — continue with your next input'
-              : `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`;
-        const failure = turnReplyFailureMessage(turnSessionId, outcome.kind === 'failed', outcome.authFailureKind);
+        status = outcome.kind === 'cancelled' ? `${compactNote}cancelled · Enter send`
+          : outcome.kind === 'failed' ? `${compactNote}reply failed`
+            : outcome.goalStopReason === 'max_turns' ? 'Turn cap reached — continuing automatically · or send your next input'
+              : `${compactNote}Turn done · Enter send · Ctrl+Q quit`;
+        const failure = turnReplyFailureMessage(turnSessionId, outcome.kind === 'failed', outcome.authFailureKind, outcome.error);
         if (failure) appendMessage(turnSessionId, {
           role: 'assistant', content: failure, ts: new Date().toISOString(), replyFinal: false, replyFailure: true,
           ...(outcome.authFailureKind ? { replyFailureKind: outcome.authFailureKind } : {}),
         });
         session = loadSession(turnSessionId);
         messages = session?.messages ?? [];
+        const turnEndText = formatTurnEndTime(turnStartedWallAt, Date.now(), outcome.kind !== 'completed', backgroundJobs.snapshot()?.running ?? 0);
+        // Keep a non-ordinary outcome (cap reached, failed, cancelled, compacted) visible after the
+        // turn-end summary; an ordinary completion shows the summary alone (#37966).
+        const ordinaryCompletion = outcome.kind === 'completed' && outcome.goalStopReason !== 'max_turns' && !outcome.compacted;
+        lastTurnEndStatus = { sessionId: turnSessionId, text: ordinaryCompletion ? turnEndText : `${turnEndText} · ${status}` };
+        if (messages.length > 0) {
+          const markers = turnEndMarkers.get(turnSessionId) ?? [];
+          markers.push({ afterMessageIndex: messages.length - 1, text: turnEndText });
+          turnEndMarkers.set(turnSessionId, markers);
+        }
         activity = [];
         streamPreview = null;
-        // Keep the completed tree visible after settlement; a new turn resets it.
-        busy = false;
+        // Keep the completed tree visible after settlement, now inline after the turn's user
+        // message (above the saved answer) instead of a tail below it; a new turn resets it.
+        graphView.settle(Date.now());
+        if (visibleToolActivity.length > 0 || graphView.events.length > 0) {
+          let anchor = -1;
+          for (let index = messages.length - 1; index >= 0 && anchor < 0; index -= 1)
+            if (messages[index]!.role === 'user' && stripQueueModelContext(messages[index]!.content) === turnText) anchor = index;
+          if (anchor >= 0) settledTurnTools.set(turnSessionId, [...(settledTurnTools.get(turnSessionId) ?? [])
+            .filter((entry) => entry.anchor !== anchor), { anchor, userContent: turnText, rows: visibleToolActivity,
+              ...(graphView.events.length > 0 ? { graph: [...graphView.events] } : {}) }]);
+        }
+        visibleToolActivity = [];
         turnAbort = null;
         scroll = 0;
-        settle();
+        // A mail turn marks its mail seen only once it answered; a turn that failed or was cancelled right away wakes again.
+        wakeup?.noteTurnFinished(turnResponded);
+        if (noticeTurn) {
+          const finishNotice = noticeTurn.finish;
+          const noticeTurnOk = outcome.kind === 'completed';
+          void finishNotice(noticeTurnOk).catch(() => { /* a receipt never blocks the turn end */ });
+        }
+        // Only a person's own turn can give its text back; an internal turn (banner) never touches the prompt.
+        settle(banner === undefined ? { text: turnText, responded: turnResponded } : undefined);
         // TUI-GOAL-INTERIM-QUIET 관측 — 그리기 계획(log-view 와 같은 함수)의 접힘 수가 바뀐 턴 끝에 한 줄.
         try {
           const shown = countInterimDisplay(planInterimDisplay(messages));
@@ -1306,21 +1824,55 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             debug.log('tui.goal-interim', 'folded', { surface: 'next', ...shown });
           }
         } catch { /* fail-soft: 관측은 턴 정리를 막지 않는다 */ }
+        // A finished plan closes its mail item whatever the auto-continue decision is below (a queued input or a draft makes that yield).
+        try {
+          if (seatPlanLink?.turnEnded(planChainNotice, outcome.kind === 'completed', outcome.planOutcome) && queue.count > 0) injectKey(queueWake);
+        } catch { /* plan bookkeeping never blocks a turn end */ }
         const auto = decideNextTuiAutoContinue(outcome, queue.count, input.editor.text);
         if (goalContinue && auto === 'complete') goalContinue.noteGoalCompleted();
-        if (goalContinue && auto === 'check') {
-          try {
-            goalContinue.noteTurnEnded({ lines: dashboardRuntime.replyLinesOfThisTurn(messages, outcome.compacted ? 'after-last-user' : messagesAtTurnStart), failed: outcome.kind === 'failed' });
-            goalContinue.check();
-          } catch { /* fail-soft: 골 이어가기는 턴 정리를 막지 않는다 */ }
-        } else if (goalContinue && auto === 'yield') {
+        if (goalContinue && auto === 'yield') {
           debug.log('tui.proactive', 'yield-user-input', { queued: queue.count, bufferedChars: input.editor.text.length });
         }
-        const switchAfterTurn = pendingSidetabSwitch;
-        pendingSidetabSwitch = null;
+        // Stay busy through settle. A sidetab switch requested in that window stays
+        // pending (switchSession sees busy) and runs only after this release.
         try {
-          if (switchAfterTurn) await switchSidetabSession(switchAfterTurn);
+          await releaseBusyAfterSettle({
+            settle: async () => {
+              if (!(auto === 'check' && goalContinue && wakeup)) return;
+              // One branch: the goal controller is created with the wakeup door, so it is always here.
+              // Self-pull runs in this same branch only when goalContinue.check() opened nothing.
+              try {
+                goalContinue.noteTurnEnded({ lines: dashboardRuntime.replyLinesOfThisTurn(messages, outcome.compacted ? 'after-last-user' : messagesAtTurnStart), failed: outcome.kind === 'failed', ...(outcome.goalStopReason ? { stopReason: outcome.goalStopReason } : {}), ...(outcome.planOutcome ? { plan: outcome.planOutcome } : {}) });
+                const settled = await settleSeatPullTurnEnd({
+                  auto,
+                  goal: {
+                    check: () => {
+                      try { return goalContinue!.check(); }
+                      catch { return { opened: true, reason: 'goal-check-threw' }; }
+                    },
+                  },
+                  pull: () => pullSeatAfterGoal({
+                    goal: null,
+                    startTurnIfIdle: (text, opts) => wakeup!.gate.startTurnIfIdle(text, opts),
+                    seat: detectSeat(process.cwd())?.seat ?? null,
+                    queueCount: queue.count,
+                    draftLength: input.editor.text.length,
+                    readUnread: readUnreadSummary,
+                    hook: seatSelfPull,
+                    startTurnIfIdleForHook: (text, opts) => wakeup!.gate.startTurnIfIdle(text, opts),
+                  }),
+                });
+                if (settled) seatSelfPull = settled.hook;
+              } catch { /* a goal check or a pull never blocks turn settlement */ }
+            },
+            pendingSwitch: () => pendingSidetabSwitch,
+            queueCount: () => queue.count,
+            release: () => { busy = false; },
+            applySwitch: async (sessionId) => { await switchSidetabSession(sessionId); },
+            wakeQueue: () => { idleWakeDoor.knock('self-pull'); },
+          });
         } finally {
+          pendingSidetabSwitch = null;
           try {
             render();
           } finally {
@@ -1377,12 +1929,25 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   try {
     {
       const { createNextTuiWakeup, setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');
-      const { setNextSidetabHandler, setNextSidetabIpcEnabled, setNextTuiShellApprovalHandler, setNextTuiShellApprovalCancelHandler, setNextTuiHarnessAskUserHandler, setNextMemberBoardSessionSource } = await import('../tui-client/local-chat-turn.js');
+      const { turnPacingFromEnv } = await import('./input/internal-turn.js');
+      const pacing = turnPacingFromEnv();
+      const { setNextSidetabHandler, setNextSidetabIpcEnabled, setNextTuiPublishApprovalHandler, setNextTuiShellApprovalHandler, setNextTuiShellApprovalCancelHandler, setNextTuiHarnessAskUserHandler, setNextMemberBoardSessionSource } = await import('../tui-client/local-chat-turn.js');
       setNextMemberBoardSessionSource(options.memberBoardSession ?? null);
       const { createNextSidetabHostHandler } = await import('./sidetab/nl-tool.js');
       setNextSidetabIpcEnabled(true);
+      // The retro modules load here, in the same lazy block as the wake-up factory (nothing of it is on the boot path).
+      const retroDep = await (async () => {
+        const [{ createFileSeatRetroStateStore, parseSeatRetroIntervalMin, seatRetroStateFile }, { resolveSeatRetroSeat }] =
+          await Promise.all([import('../seat/seat-retro.js'), import('../seat/seat-retro-seat.js')]);
+        const seatName = resolveSeatRetroSeat(process.cwd());
+        const intervalMin = parseSeatRetroIntervalMin(process.env.ELANOUS_SEAT_RETRO_INTERVAL_MIN);
+        if (!seatName || intervalMin <= 0) return {};
+        try { return { retro: { seat: seatName, intervalMin, store: createFileSeatRetroStateStore(seatRetroStateFile(seatName)) } }; }
+        catch { return {}; }
+      })();
       wakeup = createNextTuiWakeup({
         isTurnRunning: () => busy,
+        ...(pacing ? { pacing } : {}),
         isInputForeground: isInternalWakeForeground,
         enableSeatMailWake: true,
         getBufferText: () => input.editor.text,
@@ -1390,10 +1955,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         pendingKeyCount: tuiPendingKeyCount,
         requestYield: () => injectKey(internalWake),
         notify: (line) => { pushNotice(line); render(); },
+        // SEAT-ROLE-CARD device 2 — a seat's built-in self-retro (ELANOUS_SEAT_RETRO_INTERVAL_MIN, minutes; 0 = off).
+        ...retroDep,
       });
+      // ⭐ OP-CRON-PROMPTS O2 — TUI 재기동해도 예약 깨움이 살게 파일에 저장·시작 복원한다(대화가 바뀌면 다시 묶는다).
+      bindWakeupSession = createSessionWakeupBinder(wakeup.scheduler, detectSeat(process.cwd())?.seat);
+      bindWakeupSession(id);
       setNextTuiWakeupTool(wakeup.tool);
-      setNextTuiShellApprovalHandler(shellApproval.begin);
-      setNextTuiShellApprovalCancelHandler(shellApproval.cancel);
+      setNextTuiShellApprovalHandler(shellApproval.beginDecision);
+      setNextTuiPublishApprovalHandler(publishApproval.begin);
+      setNextTuiShellApprovalCancelHandler((callId, reason) => {
+        if (!publishApproval.cancel(callId)) shellApproval.cancel(callId, reason);
+      });
       setNextTuiHarnessAskUserHandler(harnessAskUser.begin, harnessAskUser.cancel);
       setNextSidetabHandler(createNextSidetabHostHandler({
         rows: async () => { if (!sidetabApi) sidetabApi = await import('./sidetab/list.js'); refreshSidetabRows(); return sidetabRows; },
@@ -1425,11 +1998,23 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         runMission: async (agent, mission) => { await ensureSidetabAttachments(); const result = await sidetabAttachments!.runMission(agent, mission); refreshSidetabRows(); render(); return result; },
         runMissionPair: async (agent, mission, parallelMission) => { await ensureSidetabAttachments(); const result = await sidetabAttachments!.runMissionPair(agent, mission, parallelMission); refreshSidetabRows(); render(); return result; },
         kill: async (row) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.kill(row); refreshSidetabRows(); render(); return { ok, action: 'kill', target: row.id }; },
+        // The mission runs without holding the turn; its arrival is announced in the transcript.
+        onMissionSettled: (info) => {
+          const line = missionArrivalText(info);
+          // Turn-independent: a transcript marker survives the activity reset of whatever turn is running.
+          if (!addTranscriptMarker(turnEndMarkers, id ?? '', messages.length, line)) activity.push(line);
+          status = info.ok ? '미션 결과 도착' : '미션 실패';
+          refreshSidetabRows();
+          render();
+        },
       }));
       const gate = wakeup.gate;
       goalContinue = dashboardRuntime.createGoalContinue({
         startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
         notify: (line) => { pushNotice(line); render(); },
+        planNudge: true,
+        // The gate only parks the turn. Watch until this loop takes it; otherwise withdraw and say stop.
+        confirmSeatCapTurnStarted: (turnId) => wakeup!.confirmSeatCapTurnStarted(turnId),
       });
     }
     render();
@@ -1478,6 +2063,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
       }
     }, 250) : null;
+    // NEXT-TUI-DIFF-RENDER (2/2): the first frame is painted; warm the chat child now (first answer ~1.8 s sooner).
+    if (id) {
+      const warmId = id;
+      void import('../tui-client/local-chat-turn.js').then((module) => {
+        if (!tuiClosed && id === warmId && typeof module.warmLocalChatSession === 'function') module.warmLocalChatSession(warmId);
+      }).catch(() => { /* the first turn spawns as before */ });
+    }
     while (true) {
       const replayed = replay.shift();
       const rawKey = replayed ?? await readKey();
@@ -1527,7 +2119,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       if (key === internalWake) {
         // The door rechecks focus and human input after the yield key reaches this loop.
         const request = wakeup?.takePendingIfIdle();
-        if (request) startChatTurn(request.input, wakeup!.banner(request));
+        // A calm English line (turn limit · next step · remaining plan · scheduled …), not the internal origin name.
+        // MSG-SOURCE-HIERARCHY: a turn that delivers another seat's mail says that seat («⇢ OP · request · due 14:00 · #id»).
+        if (request) startChatTurn(request.input, request.from ? agentTurnBanner(request.from) : continueBanner(request.origin, request.reason),
+          request.from ?? { kind: 'system', origin: request.origin });
         render();
         continue;
       }
@@ -1672,6 +2267,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
+      // GRAPH-VIEW-DETAIL-SIDETAB: Ctrl/Alt+click, Ctrl+G and the open detail's keys.
+      if (graphDetail.handleKey(key, input.editor.text.length === 0)) {
+        render();
+        continue;
+      }
       if (sidetabContextMenu) {
         // A terminal can emit a release after right-click; the parser may
         // normalize right-button release to an empty key. Keep the menu open.
@@ -1786,6 +2386,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
+      if (publishApproval.session.handleKey(key)) {
+        render();
+        continue;
+      }
       if (shellApproval.handleKey(key)) {
         render();
         continue;
@@ -1868,19 +2472,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         continue;
       }
       if (sidetabOpen && (sidetabMode as 'list' | 'new') === 'new') {
-        if (key.name === 'escape') {
-          sidetabMode = 'list';
-        } else {
-          const character = ({ s: 'shell', e: 'elanous', c: 'codex', l: 'claude' } as const)[key.name.toLowerCase() as 's' | 'e' | 'c' | 'l'];
-          if (character) {
-            await ensureSidetabAttachments();
-            sidetabAttachments?.spawn(character);
-            sidetabMode = 'list';
-            refreshSidetabRows();
-          }
+        const action = newPtyPickerKey(key);
+        sidetabMode = 'list';
+        if (action.kind === 'spawn') {
+          await ensureSidetabAttachments();
+          sidetabAttachments?.spawn(action.character);
+          refreshSidetabRows();
         }
-        render();
-        continue;
+        // Only a choice letter or Esc belongs to the picker; anything else closes it and is typed as usual.
+        if (action.kind !== 'pass') {
+          render();
+          continue;
+        }
       }
       if (sidetabOpen && (key.name === 'up' || key.name === 'down')) {
         const next = sidetabApi!.applySidetabKey({ open: sidetabOpen, selected: sidetabSelected }, key.name, sidetabRows.length);
@@ -1913,7 +2516,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
-      if (busy && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {
+      // An open queue panel is the top layer: its Esc closes it (the panel branch below) and never interrupts the
+      // running turn. Ctrl+C still interrupts (ELN-QUEUE-ITEM-CONTROLS live check 11-18: Esc stopped the turn).
+      if (busy && ((key.name === 'escape' && !queuePanel) || (key.ctrl && key.name === 'c'))) {
         if (key.name === 'escape') {
           if (shellEscSnapshotPending) continue;
           shellEscSnapshotPending = true;
@@ -1982,6 +2587,29 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
+      if (!busy && focus === 'input' && providerPicker?.isOpen) {
+        const action = providerPicker.handleKey(key);
+        if (action) {
+          if (action.kind === 'dismissed') { providerPicker = null; status = 'provider 선택 닫힘 · Enter 전송'; }
+          if (action.kind === 'selected') {
+            providerPicker = null;
+            const sessionId = id;
+            if (!sessionId) status = '현재 대화를 찾을 수 없어 provider를 바꾸지 못했습니다';
+            else {
+              // Same validated session-switch path as typing /provider use <provider>; its lines are not shown.
+              try {
+                const { runLocalProviderCommand } = await import('../tui-client/local-provider-command.js');
+                await runLocalProviderCommand(`use ${action.provider}`, new AbortController().signal, () => {}, sessionId);
+                status = `이 세션 provider: ${action.provider} · 다음 턴부터 적용`;
+              } catch (error) {
+                status = `provider 실패: ${safeStatusText(error instanceof Error ? error.message : String(error))}`;
+              }
+            }
+          }
+          render();
+          continue;
+        }
+      }
       if (!busy && focus === 'input') {
         const action = atFileInput.current?.handleKey(key, input.editor.text);
         if (action) {
@@ -2005,6 +2633,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           dismissedSlashDraft = input.editor.text;
           slashPicker = null;
           slashNavigated = false;
+          // TUI-SLASH-TEXT-KOREAN-AND-RESIDUE: the picker guide must not outlive the picker.
+          if (status.startsWith('슬래시 명령')) status = 'Enter 전송 · Esc 취소 · Ctrl+Q 종료';
           render();
           continue;
         }
@@ -2028,6 +2658,67 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           slashNavigated = false;
         }
       }
+      if (queuePanel) {
+        const items = queue.items;
+        const action = items.length > 0 ? queuePanelKey(key, items, queuePanel.selected) : { kind: 'closed' as const };
+        // Typing while the panel is open closes it and goes to the composer (same rule as the /side new picker):
+        // Backspace and Enter can no longer cancel an item or overwrite the draft by accident (#38095 r1).
+        if (action?.kind === 'pass') {
+          queuePanel = null;
+          status = 'Queue closed';
+        } else if (action) {
+          const row = action.kind === 'toggle-delivery' || action.kind === 'cancel' || action.kind === 'edit' ? queue.get(action.id) : undefined;
+          try {
+            if (action.kind === 'moved') queuePanel.selected = queuePanelMove(items, queuePanel.selected, key.name === 'up' ? 'up' : 'down');
+            else if (action.kind === 'closed') { queuePanel = null; status = 'Queue closed'; }
+            else if (action.kind === 'refused') status = action.reason;
+            else if (action.kind === 'toggle-delivery' && action.to === 'queue') {
+              if (row?.steerId) steerRetract.current?.([row.steerId]);
+              queue.changeDelivery(action.id, 'queue');
+              status = 'Moved to queue · sends after the turn';
+            } else if (action.kind === 'toggle-delivery') {
+              // Offer the text to the running turn like a freshly typed steer; without a running turn it stays queued.
+              const candidate = `steer-${++steerSerial}`;
+              const steerText = row ? input.expandSubmission(row.text, [input.editor.text, ...queue.pendingTexts]).trim() : '';
+              if (busy && steerText && steerRequest.current?.(candidate, steerText)) {
+                queue.changeDelivery(action.id, 'steer', candidate);
+                status = 'Moved to steer · joins at the next tool boundary';
+              } else status = 'No running turn to steer · kept in queue';
+            } else if (action.kind === 'cancel') {
+              if (row?.steerId) steerRetract.current?.([row.steerId]);
+              queue.cancel(action.id, 'user');
+              status = 'Queued item cancelled';
+            } else if (action.kind === 'edit') {
+              // Out of the queue while edited, so no drain can send it; Enter sends the edited text again.
+              if (row?.steerId) steerRetract.current?.([row.steerId]);
+              queue.cancel(action.id, 'edited');
+              input.setText(action.text);
+              queuePanel = null;
+              status = 'Editing queued item · Enter sends it again';
+            }
+          } catch (error) {
+            if (!(error instanceof NextTuiQueueConflictError)) throw error;
+            status = 'Item was already delivered or changed';
+          }
+          if (queuePanel) {
+            // Keep the selection on the moved row (order re-sorts steer before queue); clamp after a cancel.
+            const order = queuePanelOrder(queue.items);
+            const followed = action.kind === 'toggle-delivery' ? order.findIndex((entry) => entry.id === action.id) : -1;
+            queuePanel.selected = followed >= 0 ? followed : Math.min(queuePanel.selected, Math.max(0, order.length - 1));
+          }
+          debug.log('tui.next', 'queue-panel', { action: action.kind, count: queue.count });
+          render();
+          continue;
+        }
+      }
+      // One ↑ rule (upDownTarget): waiting items and an empty composer open the queue panel; history never takes over.
+      if (focus === 'input' && key.name === 'up' && !key.ctrl && !key.alt && !key.shift && !key.meta && !slashPickerVisible
+        && upDownTarget({ key: 'up', editor: input.editor, busy, queued: queue.count }) === 'queue-panel') {
+        queuePanel = { selected: 0 };
+        status = `Queue · ${QUEUE_PANEL_HINT}`;
+        render();
+        continue;
+      }
       if (busy) {
         if (key.name === 'up' && key.ctrl && !key.alt && !key.shift && !key.meta) {
           if (pushNowCommitting()) {
@@ -2040,6 +2731,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           pushNowRequestId = null;
           pushNowPhase = null;
           const recalled = queue.recall(input.editor.text);
+          if (recalled && recalled.steerIds.length > 0) steerRetract.current?.(recalled.steerIds);
           if (recalled) {
             input.setText(recalled.text);
             input.clearHistory();
@@ -2067,7 +2759,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
+        // ↑/↓ while a turn runs: line moves in a multi-line draft; the queue-panel case opened its panel above;
+        // otherwise prompt history.
+        if ((key.name === 'up' || key.name === 'down') && !key.ctrl && !key.alt && !key.shift && !key.meta) {
+          const target = upDownTarget({ key: key.name, editor: input.editor, busy: true, queued: queue.count });
+          if (target === 'line') input.setEditor(moveEditorLine(input.editor, key.name));
+          else if (target === 'history') input.browseHistory(key.name, historyPrompts());
+          render();
+          continue;
+        }
         const pending = input.applyKey(key, queue.pendingTexts);
+        if (pending.action === 'submit' && pending.submitted) rememberPrompt(pending.submitted);
         if (pending.action === 'submit' && pending.submitted) {
           const routeRegistry = await loadNextTuiRouteRegistry();
           const pendingRoute = routeRegistry.resolveNextTuiRoute(pending.submitted, routeRegistry.NEXT_TUI_INPUT_CONTEXT);
@@ -2096,16 +2798,42 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           }
           // Queued, not put back: it leaves on its own after this turn settles (herdr `pane run` and msg-wake
           // pastes arrive here too, so an outside prompt during a turn is kept, not lost).
-          queue.enqueue(pending.submitted);
-          status = '응답 중 · 완료 뒤 순서대로 전송 · Esc 취소';
-          debug.log('tui.next', 'queue-enqueued', { length: pending.submitted.length, count: queue.count });
+          // A200: a chat line also goes to the running turn as a steer — it joins the next model request
+          // (after the current tool results); the queue row stays as «조향 대기» until the child confirms.
+          // ELN-QUEUE-SUPERSEDE: same target ⊕ correction word → a «대체 후보» hint (no status change, §6 inv. 10).
+          // The steer carries its one model-context line; the queue records the hint at enqueue.
+          const replacementPreview = queue.previewReplacementCandidate(pending.submitted);
+          const replacementOld = replacementPreview.kind === 'candidate' ? queue.get(replacementPreview.candidateFor) : undefined;
+          let steerId: string | undefined;
+          if (steerRequest.current && isTurnTypeaheadSteerable(pending.submitted)) {
+            const candidate = `steer-${++steerSerial}`;
+            const expanded = input.expandSubmission(pending.submitted,
+              [input.editor.text, ...queue.pendingTexts, pending.submitted]).trim();
+            const steerLine = replacementPreview.kind === 'candidate' && replacementOld
+              ? replacementCandidateContextLine(replacementPreview, replacementOld.text, replacementOld.status)
+              : null;
+            const steerText = expanded && steerLine ? withReplacementCandidateContext(expanded, steerLine) : expanded;
+            if (steerText && steerRequest.current(candidate, steerText)) steerId = candidate;
+          }
+          const enqueued = queue.enqueue(pending.submitted, steerId);
+          const detected = queue.replacementCandidate(enqueued.id);
+          const detectedOld = detected ? queue.get(detected.candidateFor) : undefined;
+          if (detected && detectedOld) {
+            pushNotice(replacementCandidateScreenLine(detected, detectedOld.text));
+            debug.log('tui.next', 'queue-replacement-candidate', { id: enqueued.id, candidateFor: detected.candidateFor, targets: detected.targets });
+          }
+          status = steerId
+            ? `조향 대기 ${queue.steerCount}건 · 다음 도구 경계에 넣음 · Esc 취소`
+            : '응답 중 · 완료 뒤 순서대로 전송 · Esc 취소';
+          debug.log('tui.next', steerId ? 'steer-sent' : 'queue-enqueued', { length: pending.submitted.length, count: queue.count });
         }
         render();
         continue;
       }
       if (key.name === 'up' || key.name === 'down') {
-        const prompts = messages.filter((message) => message.role === 'user').map((message) => message.content);
-        input.browseHistory(key.name, prompts);
+        if (upDownTarget({ key: key.name, editor: input.editor, busy: false, queued: queue.count }) === 'line')
+          input.setEditor(moveEditorLine(input.editor, key.name));
+        else input.browseHistory(key.name, historyPrompts());
         slashPicker = null;
         render();
         continue;
@@ -2137,20 +2865,23 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         // 지운 붙여넣기의 원문은 놓는다 — 입력칸·대기열에 남은 토큰만 쥔다(r3 must-fix).
         input.retainLivePasteTokens([input.editor.text, ...queue.pendingTexts]);
         const submitted = submittedFull.trim();
+        rememberPrompt(submitted);
+        // A submitted command replaces the picker guide; commands that set no status leave the default.
+        if (status.startsWith('슬래시 명령')) status = 'Enter 전송 · Esc 취소 · Ctrl+Q 종료';
         if (submitted === '/tasks') {
           const lines = backgroundJobs.taskLines();
-          activity = lines.length > 0 ? [`작업 ${lines.length}건 · /tasks stop <id 앞자리> 로 취소`] : ['배경 Agent 작업 없음'];
-          status = '작업 목록 · Enter 전송';
+          activity = lines.length > 0 ? [`${lines.length} tasks · /tasks stop <id prefix> to cancel`] : ['No background Agent tasks'];
+          status = 'Task list · Enter to send';
           render();
           continue;
         }
         if (submitted.startsWith('/tasks stop ')) {
           const prefix = submitted.slice('/tasks stop '.length).trim();
           const taskId = prefix.length >= 4 ? backgroundJobs.resolveTask(prefix) : null;
-          if (!taskId || !id) status = '작업 ID를 고유한 4자 이상 앞자리로 입력하세요';
+          if (!taskId || !id) status = 'Enter a unique task ID prefix of at least 4 characters';
           else {
             const { requestLocalChatTaskStop } = await import('../tui-client/local-chat-turn.js');
-            status = requestLocalChatTaskStop(id, taskId) ? `작업 ${backgroundJobs.displayTaskId(taskId)} 중단 요청` : '작업 중단 요청 실패';
+            status = requestLocalChatTaskStop(id, taskId) ? `Stop requested for task ${backgroundJobs.displayTaskId(taskId)}` : 'Task stop request failed';
           }
           render();
           continue;
@@ -2195,7 +2926,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               await closeLocalChatSession(previous);
             }
             saveMessageBlockSession();
+            // The new conversation inherits the TUI's session provider (TUI-NEW-SESSION-KEEPS-PROVIDER).
+            await carrySessionProvider(previous, next.id);
             id = next.id;
+            bindWakeupSession?.(id);
             restoreMessageBlockSession(id);
             lastFoldTargetKey = null;
             lastResumeRows = null;
@@ -2221,14 +2955,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           }
           const compactSessionId = id;
           busy = true;
-          status = '압축 중';
+          status = 'Compacting';
           turnAbort = null;
           turnDone = Promise.all([import('./slash/compact.js'), import('../tui-client/local-chat-turn.js')])
             .then(([{ compactNextTuiSession }, { localChatModel }]) =>
               compactNextTuiSession(compactSessionId, { force: true, modelId: localChatModel(compactSessionId) }))
-            .then((outcome) => { status = `${outcome.status ?? '압축 완료'} · Enter send`; })
+            .then((outcome) => { status = `${outcome.status ?? 'Compacted'} · Enter send`; })
             .catch((error: unknown) => {
-              status = `압축 실패: ${safeStatusText(error instanceof Error ? error.message : String(error))}`;
+              status = `Compaction failed: ${safeStatusText(error instanceof Error ? error.message : String(error))}`;
             })
             .finally(() => {
               session = loadSession(compactSessionId);
@@ -2266,6 +3000,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             }
             saveMessageBlockSession();
             id = next.id;
+            bindWakeupSession?.(id);
             restoreMessageBlockSession(id);
             lastFoldTargetKey = null;
             lastResumeRows = null;
@@ -2303,6 +3038,25 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             continue;
           }
           const command = parsed.providerCommand;
+          if (!command.trim() || command.trim() === 'list') {
+            status = 'provider 목록 확인 중';
+            render();
+            const [{ getUserConfig, PROVIDER_DEFAULT_MODEL }, { configForSessionProviderTurn, getSessionProvider }, { detectProviders }, picker] = await Promise.all([
+              import('../user-config.js'), import('../tui-client/session-provider.js'),
+              import('../llm/provider-detect.js'), import('./input/provider-picker.js'),
+            ]);
+            const llm = (await configForSessionProviderTurn(getUserConfig(), id ? getSessionProvider(id) : undefined)).llm;
+            // Availability flags only; agent-cli logins (claude/agy) are not LLM providers here.
+            const detected = await detectProviders().catch(() => []);
+            const credentialed = new Set(detected.filter((entry) => entry.available && entry.auth !== 'agent-cli').map((entry) => entry.provider));
+            providerPicker = picker.createProviderPickerPanel(picker.providerPickerEntries({
+              current: llm.provider, currentModel: llm.model, defaults: PROVIDER_DEFAULT_MODEL, credentialed,
+              rotation: (llm.rotation ?? []).map((item) => item.provider),
+            }));
+            status = 'provider 선택 · ↑↓ · Enter 적용 · Esc 닫기';
+            render();
+            continue;
+          }
           activity = ['provider 목록 조회 중'];
           busy = true;
           status = 'provider 조회 중 · Esc 취소';
@@ -2403,9 +3157,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
+        if (route?.id === 'graph') {
+          graphDetail.runCommand(submitted);
+          render();
+          continue;
+        }
         if (route?.action === 'help') {
           const helpLines = (await loadNextTuiRouteRegistry()).buildNextTuiHelpLines();
-          activity.push(...helpLines);
+          // Replace, not append: repeated /help shows one help block, not a growing stack.
+          activity = [...helpLines];
           // A 24-row terminal cannot show every command and the Keys section at once.
           // Start at this help block's first line; PgDn reaches the remaining commands and keys.
           scroll = Math.max(0, helpLines.length - logWindow.rows);
@@ -2512,6 +3272,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               await ensureSidetabAttachments();
               return sidetabAttachments!.readSideAgent(row);
             },
+            sendSelectedAgentKeys: async (names) => {
+              const row = sidetabRows[sidetabSelected];
+              if (!row) return false;
+              await ensureSidetabAttachments();
+              return sidetabAttachments!.sendSideAgentKeys(row, names);
+            },
+            selectedAgentStatus: async () => {
+              const row = sidetabRows[sidetabSelected];
+              if (!row) return undefined;
+              await ensureSidetabAttachments();
+              return sidetabAttachments!.sideAgentStatus(row);
+            },
             bindWorkspaceSelected: async () => {
               refreshSidetabRows();
               const row = sidetabRows[sidetabSelected];
@@ -2524,6 +3296,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             },
             submitWorkspace: async (mode, text) => {
               await ensureSidetabAttachments();
+              if (mode === 'sidechat') refreshSidetabRows();
               workspaceInput!.edit(mode, text);
               const sent = await workspaceInput!.submit(mode);
               const spaceId = workspaceInput!.state().activeSpaceId;
@@ -2599,10 +3372,22 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           slashContext.chatLines = activity;
           const [command = '', ...args] = submitted.slice('/'.length).trim().split(/\s+/);
           const dispatched = await dispatchSlash(command, args, slashContext);
-          if (!dispatched) activity.push('알 수 없는 슬래시 명령');
+          if (!dispatched) activity.push('Unknown slash command');
           status = 'Enter 전송';
           render();
           continue;
+        }
+        if (!route) {
+          // TUI-UNKNOWN-SLASH-NOT-SENT: a mistyped «/명령» is answered here, never sent as a paid model turn.
+          const { unknownSlashNotice } = await import('./slash/unknown-slash.js');
+          const known = routeRegistry.NEXT_TUI_ROUTE_REGISTRY.flatMap((entry) => [...entry.slash, ...entry.slashPrefixes]);
+          const notice = unknownSlashNotice(submitted, known);
+          if (notice) {
+            activity.push(...notice);
+            status = 'Enter 전송';
+            render();
+            continue;
+          }
         }
         // A person's turn: an internal turn opened but not yet run gives way, and the door's «last turn» moves.
         wakeup?.gate.port.declined?.('human-turn');
@@ -2615,6 +3400,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   } finally {
     tuiClosed = true;
     if (turnElapsedTimer !== null) clearInterval(turnElapsedTimer);
+    // MF(r3): TUI 닫힘 → 자리 우편 감시 폴링도 정지(핸들 보존으로 가능). 남으면 messages.db 를 계속 열고 죽은 큐에 notice 를 넣는다.
+    seatMailWatcher.stop();
+    offIdleChildWake();
+    offIdleGraphNode();
+    offIdleGraphWake();
+    eventWatchStop.current?.();
+    // #38260 REVIEW-2 ②: the fleet poller ends with this TUI (a re-entry creates its own; no second poller keeps asking).
+    fleetSegment.stop();
     missionWatchCancellation.cancel?.();
     delete missionWatchCancellation.cancel;
     if (simWatchTimer !== null) clearInterval(simWatchTimer);
@@ -2633,9 +3426,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       setNextTuiWakeupTool(null);
     }
     const { setNextSidetabHandler, setNextSidetabIpcEnabled } = await import('../tui-client/local-chat-turn.js');
+    publishApproval.dispose();
     shellApproval.dispose();
     harnessAskUser.dispose();
-    const { setNextTuiShellApprovalHandler, setNextTuiShellApprovalCancelHandler, setNextTuiHarnessAskUserHandler } = await import('../tui-client/local-chat-turn.js');
+    const { setNextTuiPublishApprovalHandler, setNextTuiShellApprovalHandler, setNextTuiShellApprovalCancelHandler, setNextTuiHarnessAskUserHandler } = await import('../tui-client/local-chat-turn.js');
+    setNextTuiPublishApprovalHandler(null);
     setNextTuiShellApprovalHandler(null);
     setNextTuiShellApprovalCancelHandler(null);
     setNextTuiHarnessAskUserHandler(null, null);

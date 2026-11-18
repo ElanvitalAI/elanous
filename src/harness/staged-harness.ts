@@ -47,6 +47,8 @@ export interface ReviewVerdict {
   reviewed?: boolean;
   /** reviewed=false인 fail-soft 리뷰가 실행되지 못한 원인. */
   failureReason?: string;
+  /** 결정론 게이트(타입 래칫·시험)가 fail 의 출처일 때만 true — 다음 라운드는 래칫 편집(HARNESS-NEIGHBOR-SWEEP 계기). */
+  gateFailed?: boolean;
 }
 
 /** 스테이지 핸드오프(§15c #2 — 재발명 말고 계약 재사용·WorkingMemoryEntry 동형 subset). */

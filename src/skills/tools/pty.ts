@@ -29,6 +29,7 @@ import { debug } from '../../debug/log.js';
 import { harnessCommandWriteReject, resolveHarnessBoundary } from '../../harness/harness-write-boundary.js';
 import { getHarnessSpace } from '../../harness/harness-space.js';
 import { writePtyWithOutcome } from '../../pty-shell/pty-write-outcome.js';
+import { observeCodingAgentSubmit, registerDirectCodingAgentPty } from './pty-coding-agent-observation.js';
 import { findSshHost, listSshHosts, type SshHost } from '../../ssh/ssh-hosts.js';
 
 const ptyBoundaryWorkdirs = new Map<string, string>();
@@ -183,6 +184,7 @@ export async function dispatchPtyShellStart(
     term: args.term,
     accessMode: 'auto',
   });
+  registerDirectCodingAgentPty(handle, args.cmd, args.args);
   const yieldMs = Math.min(args.yield_time_ms ?? DEFAULT_YIELD_MS, MAX_YIELD_MS);
   await sleep(yieldMs);
   const initial = handle.drainDelta(DEFAULT_MAX_BYTES);
@@ -269,7 +271,9 @@ export async function dispatchPtyShellSend(rawArgs: Record<string, unknown>): Pr
     if (boundaryReject) return { output: boundaryReject, submitNormalized: false };
   }
   const { input, trailingNewline, submitNormalized } = normalizePtySubmit(args.input);
-  const outcome = writePtyWithOutcome(handle, input, 'agent');
+  const outcome = /[\r\n]$/.test(input) && handle.canWrite('agent')
+    ? observeCodingAgentSubmit(handle, () => writePtyWithOutcome(handle, input, 'agent'))
+    : writePtyWithOutcome(handle, input, 'agent');
   debug.log('pty.arbiter', 'control-settled', {
     id: handle.id,
     action: 'input-text',

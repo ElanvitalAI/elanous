@@ -18,6 +18,7 @@ import { debug, redactSecretText } from '../debug/log.js';
 import type { NativeToolCatalogEntry } from '../native-tool-catalog.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
 import { buildSeatBootSystemMessages, type SeatBootDeps } from './seat-boot-preamble.js';
+import { buildSeatMemoryLayers } from '../seat-memory/seat-memory-layers.js';
 import { buildPlanModeSystemMessages } from '../plan-mode/system-prompt.js';
 import { buildImplDisciplineSystemMessages } from '../impl-discipline/index.js';
 import { buildConcisenessSystemMessages } from '../prompt-library/chat-conciseness.js';
@@ -217,6 +218,13 @@ function buildDashboardTurnPreambleUnmeasured(
       seatBoot === true ? {} : seatBoot,
     ))
     : [];
+  // 🧠 OP-MEMORY-PARITY (O6) — 자리 기억: 색인(대화마다 한 번 · 바이트 고정 → 캐시 접두 안정 구역) ⊕ 턴 회상(매 턴 · 휘발 구역).
+  const seatMemory = seatBoot
+    ? timed(builderMs, 'seatMemory', () => buildSeatMemoryLayers(
+      { cwd: ctx.cwd, userText: ctx.userText, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) },
+      seatBoot === true ? {} : seatBoot,
+    ))
+    : { index: [] as LLMMessage[], recall: [] as LLMMessage[] };
   const planModeSystemMsgs = timed(builderMs, 'planMode', () => buildPlanModeSystemMessages());
   const askSystemMsgs = timed(builderMs, 'ask', () => buildExecutionAskSystemMessages() as LLMMessage[]);
   const approvalSystemMsgs = timed(builderMs, 'approval', () => buildApprovalPolicySystemMessages() as LLMMessage[]);
@@ -329,8 +337,10 @@ function buildDashboardTurnPreambleUnmeasured(
     ...skillCatalogSystemMsgs,
     ...universalPreamble,
     { role: 'system', content: TUI_INTEGRATION_TOOL_SELECTION_GUIDANCE },
+    ...seatMemory.index,
     ...markCacheVolatile([
       ...seatBootSystemMsgs,
+      ...seatMemory.recall,
       ...planModeSystemMsgs,
       ...askSystemMsgs,
       ...approvalSystemMsgs,
@@ -413,6 +423,7 @@ function buildDashboardTurnPreambleUnmeasured(
         universal: universalPreamble.length,
         ...(ctx.skillCatalog ? { skillCatalog: skillCatalogSystemMsgs.length } : {}),
         seatBoot: seatBootSystemMsgs.length,
+        ...(seatBoot ? { seatMemory: seatMemory.index.length + seatMemory.recall.length } : {}),
         planMode: planModeSystemMsgs.length,
         ask: askSystemMsgs.length,
         approval: approvalSystemMsgs.length,

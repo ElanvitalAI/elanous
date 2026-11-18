@@ -31,8 +31,8 @@ function resolveByLinearScan(input: string, context: typeof NEXT_TUI_INPUT_CONTE
 describe('nextTuiSlashCandidates', () => {
   test('filters built-in aliases by the typed prefix and exposes descriptions', () => {
     const candidates = nextTuiSlashCandidates('he');
-    expect(candidates).toContainEqual({ value: '/help', description: '명령과 키 안내' });
-    expect(candidates).toContainEqual({ value: '/help next', description: '명령과 키 안내' });
+    expect(candidates).toContainEqual({ value: '/help', description: 'Command and key guide' });
+    expect(candidates).toContainEqual({ value: '/help next', description: 'Command and key guide' });
     expect(nextTuiSlashCandidates('mem').map((item) => item.value)).toContain('/memory');
   });
 

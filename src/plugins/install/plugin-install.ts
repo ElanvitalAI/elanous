@@ -29,6 +29,7 @@ export const DEFAULT_PLUGIN_GROUP = [
   { id: 'demo-browser-hand', label: '브라우저 손', requiredServiceKeys: [], optionalServiceKeys: ['linear'], requiredPrerequisites: ['llm-provider', 'aside'], optionalPrerequisites: [] },
   { id: 'demo-video-briefing', label: '영상 브리핑', requiredServiceKeys: [], optionalServiceKeys: ['elevenlabs', 'telegram', 'telegram-chat'], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: [] },
   { id: 'demo-plugin-wizard', label: '플러그인 마법사', requiredServiceKeys: [], optionalServiceKeys: [], requiredPrerequisites: ['llm-provider'], optionalPrerequisites: ['claude-cli', 'github-cli'] },
+  { id: 'bookforge', label: 'Bookforge PDF', requiredServiceKeys: [], optionalServiceKeys: [], requiredPrerequisites: [], optionalPrerequisites: [] },
 ] as const;
 
 /** Packages used by first-run onboarding and the 11-14 walkthrough, in dependency order. */

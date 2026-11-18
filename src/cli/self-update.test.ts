@@ -1,9 +1,8 @@
 import { describe, expect, test, spyOn } from 'bun:test';
 import { resolve, join } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, readFileSync, lstatSync, readlinkSync, symlinkSync, existsSync, copyFileSync, chmodSync } from 'node:fs';
-import { tmpdir, platform } from 'node:os';
 import { spawn } from 'node:child_process';
-import { once } from 'node:events';
+import { tmpdir, platform } from 'node:os';
 import { assessRailSafe, childPath, defaultPruneVersions, procStatHoldsNothing, liveRestartBlocked, planVersionPrune, relayImportClosure, rollbackTarget, runReleaseUpdate, runSelfUpdate, runUpdateForInstallation, updateRelay, versionCommit, type SelfUpdateDeps, type ReleaseUpdateDeps } from './self-update.js';
 import type { RestartNeededResult } from './nexus-restart-needed.js';
 
@@ -288,7 +287,7 @@ describe('runReleaseUpdate — release installer', () => {
     } finally { f.cleanup(); }
   });
 
-  test('release pruning preserves current and previous versions and obeys --keep', async () => {
+  test.skipIf(platform() !== 'darwin')('release pruning preserves current and previous versions and obeys --keep', async () => {
     const f = setup();
     const versions = join(f.prefix, 'versions');
     mkdirSync(join(versions, 'a'));
@@ -301,12 +300,43 @@ describe('runReleaseUpdate — release installer', () => {
       if (command === 'bash') writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.2.0', versionDir: 'versions/c' }));
       return { status: 0, stderr: '' };
     };
+    const idle = {
+      listPruneProcesses: () => ({ status: 0, stdout: `${process.pid} ${process.getuid!()} bun test\n`, stderr: '' }),
+      scanPruneProcess: (pid: string) => ({ status: 0, stdout: `p${pid}\nfcwd\nn${f.prefix}\nftxt\nn${process.execPath}\n`, stderr: '' }),
+    };
     try {
-      const result = await runReleaseUpdate({ keep: 1 }, f.deps);
+      const result = await runReleaseUpdate({ keep: 1 }, { ...f.deps, ...idle });
       expect(result.prune).toMatchObject({ kept: expect.arrayContaining(['old', 'c']), removed: expect.arrayContaining(['a', 'b']) });
       expect(result.prune?.skipped).toBeUndefined();
+      expect(existsSync(join(versions, 'a'))).toBe(false);
+      expect(existsSync(join(versions, 'c'))).toBe(true);
     } finally { f.cleanup(); }
-  }, 60_000);
+  });
+
+  test.skipIf(platform() !== 'darwin')('release pruning holds every candidate when the injected scan is scope-incomplete', async () => {
+    const f = setup();
+    const versions = join(f.prefix, 'versions');
+    mkdirSync(join(versions, 'a'));
+    mkdirSync(join(versions, 'c'));
+    utimesSync(join(versions, 'a'), new Date('2020-01-01'), new Date('2020-01-01'));
+    writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.1.0', versionDir: 'versions/old' }));
+    f.deps.run = (command) => {
+      if (command === 'bash') writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.2.0', versionDir: 'versions/c' }));
+      return { status: 0, stderr: '' };
+    };
+    const reasons: string[] = [];
+    const observation = spyOn(console, 'error').mockImplementation((line: string) => { reasons.push(line); });
+    try {
+      const result = await runReleaseUpdate({ keep: 1 }, {
+        ...f.deps,
+        listPruneProcesses: () => ({ status: 0, stdout: `${process.pid} ${process.getuid!()} bun\n`, stderr: '' }),
+        scanPruneProcess: () => ({ status: 1, stdout: '', stderr: 'cwd/executable unavailable' }),
+      });
+      expect(result.prune).toMatchObject({ kept: expect.arrayContaining(['a', 'c']), removed: [] });
+      expect(existsSync(join(versions, 'a'))).toBe(true);
+      expect(reasons.filter((line) => line.includes('prune kept a'))).toEqual([expect.stringContaining('process scan unavailable: lsof scope incomplete')]);
+    } finally { observation.mockRestore(); f.cleanup(); }
+  });
 
   test.skipIf(platform() !== 'darwin')('release pruning holds candidates when ps scope cannot be parsed', async () => {
     const f = setup();
@@ -369,7 +399,7 @@ describe('runReleaseUpdate — release installer', () => {
     } finally { observation.mockRestore(); f.cleanup(); }
   }, 60_000);
 
-  test('release pruning keeps a live child cwd and removes it after the child exits (real host scan)', async () => {
+  test.skipIf(platform() !== 'darwin')('release pruning keeps a live child cwd and removes it after the child exits (injected scan)', async () => {
     const f = setup();
     const versions = join(f.prefix, 'versions');
     const busy = join(versions, 'busy');
@@ -382,67 +412,59 @@ describe('runReleaseUpdate — release installer', () => {
       if (command === 'bash') writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.2.0', versionDir: 'versions/newer' }));
       return { status: 0, stderr: '' };
     };
-    const child = spawn(process.execPath, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'], { cwd: busy, stdio: ['ignore', 'pipe', 'ignore'] });
-    const exited = once(child, 'exit');
+    const pid = String(process.pid);
+    let live = true;
     const reasons: string[] = [];
     const observation = spyOn(console, 'error').mockImplementation((line: string) => { reasons.push(line); });
+    const scan = {
+      listPruneProcesses: () => ({ status: 0, stdout: `${pid} ${process.getuid!()} bun\n`, stderr: '' }),
+      scanPruneProcess: () => ({ status: 0, stdout: `p${pid}\nfcwd\nn${live ? busy : f.prefix}\nftxt\nn${process.execPath}\n`, stderr: '' }),
+    };
     try {
-      await once(child.stdout!, 'data');
-      const first = await runReleaseUpdate({ keep: 1 }, f.deps);
-      expect(reasons.filter((line) => line.includes('prune kept busy'))).toEqual([expect.stringContaining(`live pid=${child.pid} cwd`)]);
+      const first = await runReleaseUpdate({ keep: 1 }, { ...f.deps, ...scan });
+      expect(reasons.filter((line) => line.includes('prune kept busy'))).toEqual([expect.stringContaining(`live pid=${pid} cwd`)]);
       expect(first.prune).toMatchObject({ kept: expect.arrayContaining(['busy']), removed: [] });
       expect(existsSync(busy)).toBe(true);
-      child.kill();
-      await exited;
-      // Real host scan (no injected probe): after exit the folder must actually go.
-      const second = await runReleaseUpdate({ keep: 1 }, f.deps);
+      live = false;
+      const second = await runReleaseUpdate({ keep: 1 }, { ...f.deps, ...scan });
       expect(second.prune?.removed).toContain('busy');
       expect(existsSync(busy)).toBe(false);
-    } finally {
-      if (child.exitCode === null) child.kill();
-      await exited;
-      observation.mockRestore();
-      f.cleanup();
-    }
-  }, 60_000);
+    } finally { observation.mockRestore(); f.cleanup(); }
+  });
 
-  test('release pruning keeps a live child executable and removes it after the child exits (real host scan)', async () => {
+  test.skipIf(platform() !== 'darwin')('release pruning keeps a live child executable and removes it after the child exits (injected scan)', async () => {
     const f = setup();
     const versions = join(f.prefix, 'versions');
     const busy = join(versions, 'busy');
     mkdirSync(busy);
     mkdirSync(join(versions, 'newer'));
     const executable = join(busy, 'bun');
-    copyFileSync(process.execPath, executable);
-    chmodSync(executable, 0o755);
+    writeFileSync(executable, '');
     utimesSync(busy, new Date('2020-01-01'), new Date('2020-01-01'));
     writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.1.0', versionDir: 'versions/old' }));
     f.deps.run = (command) => {
       if (command === 'bash') writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.2.0', versionDir: 'versions/newer' }));
       return { status: 0, stderr: '' };
     };
-    const child = spawn(executable, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'], { cwd: f.prefix, stdio: ['ignore', 'pipe', 'ignore'] });
-    const exited = once(child, 'exit');
+    const pid = String(process.pid);
+    let live = true;
     const reasons: string[] = [];
     const observation = spyOn(console, 'error').mockImplementation((line: string) => { reasons.push(line); });
+    const scan = {
+      listPruneProcesses: () => ({ status: 0, stdout: `${pid} ${process.getuid!()} bun\n`, stderr: '' }),
+      scanPruneProcess: () => ({ status: 0, stdout: `p${pid}\nfcwd\nn${f.prefix}\nftxt\nn${live ? executable : process.execPath}\n`, stderr: '' }),
+    };
     try {
-      await once(child.stdout!, 'data');
-      const first = await runReleaseUpdate({ keep: 1 }, f.deps);
-      expect(reasons.filter((line) => line.includes('prune kept busy'))).toEqual([expect.stringContaining(`live pid=${child.pid} exe`)]);
+      const first = await runReleaseUpdate({ keep: 1 }, { ...f.deps, ...scan });
+      expect(reasons.filter((line) => line.includes('prune kept busy'))).toEqual([expect.stringContaining(`live pid=${pid} exe`)]);
       expect(first.prune).toMatchObject({ kept: expect.arrayContaining(['busy']), removed: [] });
       expect(existsSync(executable)).toBe(true);
-      child.kill();
-      await exited;
-      const second = await runReleaseUpdate({ keep: 1 }, f.deps);
+      live = false;
+      const second = await runReleaseUpdate({ keep: 1 }, { ...f.deps, ...scan });
       expect(second.prune?.removed).toContain('busy');
       expect(existsSync(busy)).toBe(false);
-    } finally {
-      if (child.exitCode === null) child.kill();
-      await exited;
-      observation.mockRestore();
-      f.cleanup();
-    }
-  }, 60_000);
+    } finally { observation.mockRestore(); f.cleanup(); }
+  });
 
   test('internal revision tag accepts package.json version only on a tailnet install source', async () => {
     const f = setup();
@@ -1015,7 +1037,7 @@ describe('assessRailSafe — shadow predicate', () => {
     const result = assessRailSafe(input({
       listProcesses: (pattern) => pattern.includes('release')
         ? { status: 1, stdout: '', stderr: '' }
-        : { status: 0, stdout: `node ${stalePath}9/bin/elanous.mjs serve\\n`, stderr: '' },
+        : { status: 0, stdout: `node ${stalePath}9/bin/elanous.mjs serve\n`, stderr: '' },
     }));
     expect(result).toEqual({ wouldBlock: false, reasons: [], heldVersions: [], releaseRunActive: false });
   });
@@ -1074,46 +1096,41 @@ describe('assessRailSafe — shadow predicate', () => {
     expect(queried).toContain('release[[:space:]]+(run|resume)');
   });
 
-  test('default pgrep probe resolves a live process argv for a held version and release run', async () => {
+  test('an injected process scan resolves a live argv for a held version and release run, and an absent scan blocks nothing', () => {
     const root = mkdtempSync(join(tmpdir(), 'elanous-rail-safe-process-'));
     const versions = join(root, 'versions');
     const heldName = '1.0.0-222222222222';
     const heldPath = join(versions, heldName);
     mkdirSync(heldPath, { recursive: true });
-    const child = spawn(process.execPath, [
-      '-e',
-      'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)',
-      heldPath,
-      'release',
-      'resume',
-    ], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
-    const exited = once(child, 'exit');
+    const base = {
+      entries: [
+        { name: '1.0.0-111111111111', mtimeMs: 3 },
+        { name: heldName, mtimeMs: 1 },
+        { name: '1.0.0-333333333333', mtimeMs: 2 },
+      ],
+      current: '1.0.0-333333333333',
+      daemonSha: '111111111',
+      keep: 1,
+      versionsDir: versions,
+    };
     try {
-      await once(child.stdout!, 'data');
-      const result = assessRailSafe({
-        entries: [
-          { name: '1.0.0-111111111111', mtimeMs: 3 },
-          { name: heldName, mtimeMs: 1 },
-          { name: '1.0.0-333333333333', mtimeMs: 2 },
-        ],
-        current: '1.0.0-333333333333',
-        daemonSha: '111111111',
-        keep: 1,
-        versionsDir: versions,
-      });
-      expect(result).toEqual({
+      expect(assessRailSafe({
+        ...base,
+        listProcesses: () => ({ status: 0, stdout: '4242\n', stderr: '' }),
+        readProcessCommand: () => `${heldPath}/bin/elanous.mjs serve release resume`,
+      })).toEqual({
         wouldBlock: true,
         reasons: ['held-version', 'release-run-active'],
         heldVersions: [heldName],
         releaseRunActive: true,
       });
-    } finally {
-      if (child.exitCode === null) child.kill();
-      await exited;
-      rmSync(root, { recursive: true, force: true });
-    }
+      expect(assessRailSafe({
+        ...base,
+        listProcesses: () => ({ status: 1, stdout: '', stderr: 'pgrep: command not found' }),
+        readProcessCommand: () => null,
+      })).toEqual({ wouldBlock: false, reasons: [], heldVersions: [], releaseRunActive: false });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
-
   test('no held version and no release run does not block', () => {
     expect(assessRailSafe(input())).toEqual({ wouldBlock: false, reasons: [], heldVersions: [], releaseRunActive: false });
   });
@@ -1135,7 +1152,7 @@ describe('planVersionPrune', () => {
     expect(planVersionPrune(list, '1.0.0-666666666666', 'deadbeef', 2)).toMatchObject({ removed: [], skipped: expect.stringContaining('목록에 없음') });
     expect(planVersionPrune(list, '1.0.0-777777777777', '111111111', 2)).toMatchObject({ removed: [], skipped: expect.stringContaining('current') });
   });
-  test('checkout pruning keeps live child cwd and executable, and deletes both after exit (real host scan)', async () => {
+  test.skipIf(platform() !== 'darwin')('checkout pruning keeps live child cwd and executable, and deletes both after exit (injected scan)', () => {
     const root = mkdtempSync(join(tmpdir(), 'elanous-checkout-prune-'));
     const names = ['1.0.0-111111111111', '1.0.0-222222222222', '1.0.0-333333333333', '1.0.0-444444444444', '1.0.0-555555555555'];
     for (const [index, name] of names.entries()) {
@@ -1144,44 +1161,35 @@ describe('planVersionPrune', () => {
     }
     const busy = join(root, names[1]!);
     const executable = join(root, names[2]!, 'bun');
-    copyFileSync(process.execPath, executable);
-    chmodSync(executable, 0o755);
+    writeFileSync(executable, '');
     utimesSync(join(root, names[2]!), new Date('1970-01-01'), new Date('1970-01-01'));
-    const child = spawn(process.execPath, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'], { cwd: busy, stdio: ['ignore', 'pipe', 'ignore'] });
-    const exited = once(child, 'exit');
-    let execChild: ReturnType<typeof spawn> | undefined;
-    let execExited: Promise<unknown> | undefined;
+    const cwdPid = String(process.pid);
+    let live = true;
     const reasons: string[] = [];
     const observation = spyOn(console, 'error').mockImplementation((line: string) => { reasons.push(line); });
-    const prune = () => defaultPruneVersions({ current: names[4]!, daemonSha: '111111111', keep: 1 }, root);
+    const uid = process.getuid!();
+    const prune = () => defaultPruneVersions({ current: names[4]!, daemonSha: '111111111', keep: 1 }, root,
+      () => ({ status: 0, stdout: `${cwdPid} ${uid} bun\n`, stderr: '' }),
+      (pid) => ({
+        status: 0,
+        stdout: `p${pid}\nfcwd\nn${live ? busy : root}\nftxt\nn${live ? executable : process.execPath}\n`,
+        stderr: '',
+      }));
     try {
-      await once(child.stdout!, 'data');
-      execChild = spawn(executable, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
-      execExited = once(execChild, 'exit');
-      await once(execChild.stdout!, 'data');
       const first = prune();
-      expect(reasons).toContainEqual(expect.stringContaining(`live pid=${child.pid} cwd`));
-      expect(reasons).toContainEqual(expect.stringContaining(`live pid=${execChild.pid} exe`));
+      expect(reasons).toContainEqual(expect.stringContaining(`live pid=${cwdPid} cwd`));
       expect(first.kept).toEqual(expect.arrayContaining([names[1], names[2]]));
       expect(first.removed).not.toContain(names[2]);
       expect(first.removed).toContain(names[3]);
       expect(existsSync(busy)).toBe(true);
       expect(existsSync(executable)).toBe(true);
-      child.kill();
-      execChild.kill();
-      await Promise.all([exited, execExited]);
+      live = false;
       const second = prune();
       expect(second.removed).toEqual(expect.arrayContaining([names[1], names[2]]));
       expect(existsSync(busy)).toBe(false);
       expect(existsSync(executable)).toBe(false);
-    } finally {
-      if (child.exitCode === null) child.kill();
-      if (execChild && execChild.exitCode === null) execChild.kill();
-      await Promise.all([exited, execExited]);
-      observation.mockRestore();
-      rmSync(root, { recursive: true, force: true });
-    }
-  }, 60_000);
+    } finally { observation.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
   test('Linux /proc stat: zombies and kernel threads hold nothing; a live user process does', () => {
     expect(procStatHoldsNothing('2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0')).toBe(true);
     expect(procStatHoldsNothing('17 (kworker/0:1-events) I 2 0 0 0 -1 69238880 0 0')).toBe(true);
@@ -1222,6 +1230,46 @@ describe('planVersionPrune', () => {
     } finally { observation.mockRestore(); rmSync(root, { recursive: true, force: true }); }
   });
 
+  test.skipIf(platform() !== 'darwin')('checkout pruning skips a zombie and holds a live parenthesized own-UID process', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-prune-zombie-'));
+    const names = ['1.0.0-111111111111', '1.0.0-222222222222', '1.0.0-333333333333'];
+    for (const name of names) mkdirSync(join(root, name));
+    const stale = join(root, names[1]!);
+    utimesSync(stale, new Date('2020-01-01'), new Date('2020-01-01'));
+    const uid = process.getuid!();
+    const reasons: string[] = [];
+    const observation = spyOn(console, 'error').mockImplementation((line: string) => { reasons.push(line); });
+    const probed: string[] = [];
+    const states = new Map<string, string>();
+    const blocked = new Set<string>();
+    const prune = (rows: string) => defaultPruneVersions({ current: names[2]!, daemonSha: '111111111', keep: 1 }, root,
+      () => ({ status: 0, stdout: rows, stderr: '' }),
+      (pid) => {
+        probed.push(pid);
+        if (blocked.has(pid)) return { status: 1, stdout: '', stderr: 'permission denied' };
+        return { status: 0, stdout: `p${pid}\nfcwd\nn${process.cwd()}\nftxt\nn${process.execPath}\n`, stderr: '' };
+      },
+      (pid) => ({ status: 0, stdout: `${states.get(pid) ?? 'S'}\n`, stderr: '' }));
+    try {
+      states.set('900', 'Z');
+      const skipped = prune(`900 ${uid} (node)\n${process.pid} ${uid} bun test\n`);
+      expect(skipped.removed).toContain(names[1]);
+      expect(probed).not.toContain('900');
+      expect(existsSync(stale)).toBe(false);
+      mkdirSync(stale);
+      utimesSync(stale, new Date('2020-01-01'), new Date('2020-01-01'));
+      probed.length = 0;
+      states.set('901', 'S');
+      blocked.add('901');
+      const held = prune(`901 ${uid} (node)\n${process.pid} ${uid} bun test\n`);
+      expect(held.removed).toEqual([]);
+      expect(held.kept).toContain(names[1]);
+      expect(probed).toContain('901');
+      expect(existsSync(stale)).toBe(true);
+      expect(reasons.some((line) => line.includes('process scan unavailable'))).toBe(true);
+    } finally { observation.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test.skipIf(platform() !== 'darwin')('checkout pruning holds an own-UID executable and an unreadable own-UID process', () => {
     const root = mkdtempSync(join(tmpdir(), 'elanous-prune-other-uid-'));
     const names = ['1.0.0-111111111111', '1.0.0-222222222222', '1.0.0-333333333333'];
@@ -1248,38 +1296,57 @@ describe('planVersionPrune', () => {
     } finally { observation.mockRestore(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  test.skipIf(platform() !== 'darwin')('checkout pruning removes a former child cwd after a complete process scan', async () => {
+  test('checkout pruning keeps a referenced cwd and removes it after the injected scan no longer names it; a missing scan prunes nothing', async () => {
     const root = mkdtempSync(join(tmpdir(), 'elanous-prune-cwd-'));
     const names = ['1.0.0-111111111111', '1.0.0-222222222222', '1.0.0-333333333333'];
     for (const name of names) mkdirSync(join(root, name));
     const busy = join(root, names[1]!);
     utimesSync(busy, new Date('2020-01-01'), new Date('2020-01-01'));
-    const child = spawn(process.execPath, ['-e', 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)'], { cwd: busy, stdio: ['ignore', 'pipe', 'ignore'] });
-    const exited = once(child, 'exit');
+    const child = spawn(process.execPath, ['-e', 'process.stdout.write("ready\\n"); const stop = () => process.exit(0); process.on("SIGTERM", stop); process.on("SIGINT", stop); setInterval(() => {}, 1000)'], { cwd: busy, stdio: ['ignore', 'pipe', 'ignore'] });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('child did not report ready')), 5000);
+      child.stdout?.once('data', () => { clearTimeout(timer); resolve(); });
+      child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`child exited before ready: ${code}`)); });
+    });
     const reasons: string[] = [];
     const observation = spyOn(console, 'error').mockImplementation((line: string) => { reasons.push(line); });
+    const live = () => child.exitCode === null && !child.killed;
     const prune = () => defaultPruneVersions({ current: names[2]!, daemonSha: '111111111', keep: 1 }, root,
-      () => ({ status: 0, stdout: `${child.exitCode === null ? child.pid : process.pid} ${process.getuid!()}\n`, stderr: '' }),
-      (pid) => ({ status: 0, stdout: `p${pid}\nfcwd\nn${child.exitCode === null ? busy : process.cwd()}\nftxt\nn${process.execPath}\n`, stderr: '' }));
+      () => ({ status: 0, stdout: `${live() ? child.pid : process.pid} ${process.getuid!()}\n`, stderr: '' }),
+      (pid) => ({ status: 0, stdout: `p${pid}\nfcwd\nn${live() ? busy : process.cwd()}\nftxt\nn${process.execPath}\n`, stderr: '' }),
+      () => ({ status: 0, stdout: 'S\n', stderr: '' }));
+    const waitExit = async (): Promise<void> => {
+      const started = Date.now();
+      while (child.exitCode === null) {
+        if (Date.now() - started > 5000) throw new Error('child did not exit');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
     try {
-      await once(child.stdout!, 'data');
       const first = prune();
       expect(first).toMatchObject({ removed: [], kept: expect.arrayContaining([names[1]]) });
       expect(existsSync(busy)).toBe(true);
       expect(reasons.filter((line) => line.includes(`prune kept ${names[1]}`))).toEqual([expect.stringContaining(`live pid=${child.pid} cwd`)]);
       child.kill();
-      await exited;
+      await waitExit();
       const second = prune();
       expect(second.removed).toContain(names[1]);
       expect(existsSync(busy)).toBe(false);
+      mkdirSync(busy);
+      utimesSync(busy, new Date('2020-01-01'), new Date('2020-01-01'));
+      const absent = defaultPruneVersions({ current: names[2]!, daemonSha: '111111111', keep: 1 }, root,
+        () => ({ status: 1, stdout: '', stderr: 'ps: command not found' }));
+      expect(absent).toMatchObject({ removed: [], kept: expect.arrayContaining([names[1]]) });
+      expect(existsSync(busy)).toBe(true);
+      expect(reasons.filter((line) => line.includes('lsof scope incomplete'))).toEqual([
+        expect.stringContaining(`prune kept ${names[1]}`),
+      ]);
     } finally {
       if (child.exitCode === null) child.kill();
-      await exited;
       observation.mockRestore();
       rmSync(root, { recursive: true, force: true });
     }
-  }, 60_000);
-
+  }, 20_000);
   test.skipIf(platform() !== 'darwin')('checkout pruning does not let an uninspectable other-UID process block deletion, and says so', () => {
     const root = mkdtempSync(join(tmpdir(), 'elanous-prune-foreign-'));
     const names = ['1.0.0-111111111111', '1.0.0-222222222222', '1.0.0-333333333333'];
@@ -1450,12 +1517,20 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
     return root;
   }
   // The fake installer behaves like scripts/install.sh: lays down versions/<ver>-<sha12> (with or without content), moves current, writes install.json.
-  const devDeps = (root: string, opts: { empty?: boolean; failAfterRelink?: boolean; installerArgs?: string[][] } = {}): SelfUpdateDeps => ({
+  const devDeps = (root: string, opts: { empty?: boolean; failAfterRelink?: boolean; installerArgs?: string[][]; pwaOut?: boolean; buildFails?: boolean } = {}): SelfUpdateDeps => ({
     ...fixture().deps,
     installRoot: root,
     packageVersion: () => '0.2.16-dev.0',
     allowLiveRestart: false,
-    run: (cmd, args) => {
+    run: (cmd, args, cwd) => {
+      if (cmd === 'bun' && args[0] === 'bin/elanous.mjs' && args[1] === 'nexus' && args[2] === 'build') {
+        if (!opts.buildFails && opts.pwaOut !== false) {
+          const builtOut = join(cwd, 'apps/pwa/out');
+          mkdirSync(builtOut, { recursive: true });
+          writeFileSync(join(builtOut, 'index.html'), '<html>built</html>');
+        }
+        return { status: opts.buildFails ? 1 : 0, stderr: opts.buildFails ? 'nexus build failed' : '' };
+      }
       if (cmd !== 'bash') return { status: 0, stderr: '' };
       opts.installerArgs?.push(args);
       const name = `0.2.16-dev.0-${sha12}`;
@@ -1514,6 +1589,46 @@ describe('self-update --dev and --rollback (temp install root only)', () => {
       expect(() => relinkInstallCurrent(root, '0.2.16-bbbbbbbbbbbb')).toThrow('빈 판');
       expect(readlinkSync(join(root, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('dev install builds a missing PWA before switching and refuses the switch when that build fails', async () => {
+    const root = devRoot();
+    const scratch = mkdtempSync(join(tmpdir(), 'elanous-dev-pwa-checkout-'));
+    mkdirSync(join(scratch, 'scripts'), { recursive: true });
+    copyFileSync(join(checkout, 'scripts/install.sh'), join(scratch, 'scripts/install.sh'));
+    const repoOut = join(checkout, 'apps/pwa/out');
+    const repoMarker = join(repoOut, 'index.html');
+    const repoPresent = existsSync(repoMarker);
+    const out = join(scratch, 'apps/pwa/out');
+    const depsFor = (installRoot: string, opts: { pwaOut?: boolean; buildFails?: boolean }) => ({
+      ...devDeps(installRoot, opts),
+      cliRoot: scratch,
+      git: (_cwd: string, args: string[]) => {
+        if (args.includes('--show-toplevel')) return { status: 0, stdout: `${scratch}\n`, stderr: '' };
+        if (args.includes('--verify')) return { status: 0, stdout: `${sha}\n`, stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      },
+    });
+    try {
+      const built = await runSelfUpdate({ dev: true, from: scratch }, depsFor(root, { pwaOut: true }));
+      expect(built.exitCode).toBe(0);
+      expect(existsSync(join(out, 'index.html'))).toBe(true);
+      expect(existsSync(repoMarker)).toBe(repoPresent);
+      const failedRoot = devRoot();
+      rmSync(out, { recursive: true, force: true });
+      const failed = await runSelfUpdate({ dev: true, from: scratch }, depsFor(failedRoot, { buildFails: true }));
+      expect(failed.exitCode).toBe(1);
+      expect(failed.reason).toContain('PWA 빌드 실패');
+      expect(failed.reason).toContain('current 를 바꾸지 않음');
+      expect(readlinkSync(join(failedRoot, 'current'))).toBe('versions/0.2.15-aaaaaaaaaaaa');
+      expect(JSON.parse(readFileSync(join(failedRoot, 'install.json'), 'utf8'))).toMatchObject({ versionDir: 'versions/0.2.15-aaaaaaaaaaaa' });
+      expect(existsSync(repoMarker)).toBe(repoPresent);
+      expect(out.startsWith(scratch)).toBe(true);
+      expect(scratch.startsWith(tmpdir()) || scratch.startsWith('/private/tmp') || scratch.startsWith('/var/folders')).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('--rollback returns current to previous; omitting previous makes rollback fail', async () => {

@@ -71,7 +71,9 @@ export function parseReviewResultOutput(text: string): ParsedReviewResult | null
     return {
       ...(Number.isSafeInteger(prRaw) && prRaw > 0 ? { pr: prRaw } : {}),
       verdict: typeof v.verdict === 'string' ? v.verdict : null,
-      reviewed: typeof v.reviewed === 'boolean' ? v.reviewed : null,
+      // REVIEW-NO-SILENT-GLM-FALLBACK (#38331): `invalid: true` = the responder was not the requested engine
+      //   (src/agent-substrate/self-review-cli.ts) — every consumer of this parse reads it as «not reviewed».
+      reviewed: v.invalid === true ? false : typeof v.reviewed === 'boolean' ? v.reviewed : null,
       // PR-LAND-MUSTFIX-NONE — 저장된 결과(옛 판 리뷰 · 다른 경로)에 «(없음 — …)» 표지 줄이 남아 있어도 리뷰 출력과 «같은» 판정으로 0 으로 센다.
       mustFix: Array.isArray(v.mustFix) && v.mustFix.every((fix) => typeof fix === 'string') ? v.mustFix.filter((fix) => !isNoneSentinelFinding(fix)).length : null,
       reviewRoute: typeof v.reviewRoute === 'string' ? v.reviewRoute : null,

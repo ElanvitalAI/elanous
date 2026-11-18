@@ -2,7 +2,13 @@ import { expect, test } from 'bun:test';
 import type { SerializedMessage } from '../../session/index.js';
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
 import { messageBlockDetailLines } from '../chat/message-block-view.js';
-import { createNextTuiHistoryCache, foldTargetAtScreenRow, hasDisplayableCompletedToolBlock, isNextTuiContextCountStatus, logViewLines, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, renderNextTuiLogFrame, toggleVisibleMessageBlockDetail, toggleVisibleToolFold, wheelScroll } from './render.js';
+import { TOOL_DONE_GLYPH } from '../chat/tool-activity.js';
+
+function visibleRow(row: string): string {
+  return row.replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+import { createNextTuiHistoryCache, fitLogLine, nextTuiActivityRow, foldTargetAtScreenRow, hasDisplayableCompletedToolBlock, isNextTuiContextCountStatus, logViewLines, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, renderNextTuiLogFrame, toggleVisibleMessageBlockDetail, toggleVisibleToolFold, wheelScroll } from './render.js';
 
 test('completed activity stays until its own result block and saved tool record can display', () => {
   const toolBody = { kind: 'tool-call' as const, toolCallId: 'call-one', title: 'Read', status: '완료' };
@@ -30,13 +36,36 @@ test('next TUI chrome helpers validate height and remove repeated hints and cont
   expect(nextTuiCompactActionStatus('응답 중')).toBe('');
   expect(nextTuiCompactActionStatus('응답 완료')).toBe('');
   expect(nextTuiCompactActionStatus('응답 실패 · ↑ 이전 입력 후 Enter 재시도')).toContain('재시도');
-  expect(nextTuiCompactActionStatus('압축 실패: provider unavailable')).toContain('압축 실패');
+  expect(nextTuiCompactActionStatus('Compaction failed: provider unavailable')).toContain('Compaction failed');
 });
 
 const tool: SerializedMessage = {
   role: 'tool', content: '⚙️ Read', toolName: 'Read',
   toolResult: Array.from({ length: 20 }, (_, i) => `line-${i}`).join('\n'), ts: '2026-11-09T00:00:00Z',
 };
+
+test('finished turn markers stay blue in scrollback across another turn and refresh the history cache', () => {
+  const messages: SerializedMessage[] = [
+    { role: 'user', content: 'first prompt', ts: '2026-11-15T00:00:00Z' },
+    { role: 'assistant', content: 'first reply', ts: '2026-11-15T00:00:01Z' },
+  ];
+  const markers = [{ afterMessageIndex: 1, text: '✻ Worked for 17s · done 9:50 PM' }];
+  const input = { messages, turnEndMarkers: markers, columns: 80, rows: 15, header: ['header'],
+    footer: ['status'], promptLine: '❯ ', notices: [], activity: [], scroll: 0, expandedToolIndexes: new Set<number>() };
+  const cache = createNextTuiHistoryCache();
+  const first = cache(input);
+  expect(first.lines.join('\n')).toContain('\x1b[34m✻ Worked for 17s · done 9:50 PM\x1b[0m');
+  messages.push({ role: 'user', content: 'next prompt', ts: '2026-11-15T00:00:02Z' });
+  const next = renderNextTuiLogFrame(input, cache(input));
+  const screen = next.lines.join('\n');
+  expect(screen.indexOf('✻ Worked for 17s')).toBeLessThan(screen.indexOf('next prompt'));
+  // The marker is followed by a blank row once another turn starts, so it never touches the next user row.
+  expect(next.lines.some((line, index) => line.includes('✻ Worked for 17s') && next.lines[index + 1] === ''
+    && next.lines.slice(index + 1).some((later) => later.includes('next prompt')))).toBe(true);
+  expect(screen).toContain('\x1b[34m✻ Worked for 17s · done 9:50 PM\x1b[0m');
+  markers.push({ afterMessageIndex: 2, text: '✻ Stopped after 3m 2s · 9:51 PM' });
+  expect(cache(input).lines.join('\n')).toContain('\x1b[34m✻ Stopped after 3m 2s · 9:51 PM\x1b[0m');
+});
 
 test('history cache keeps scroll cheap and refreshes for turns, width, and fold state', () => {
   const messages: SerializedMessage[] = [tool];
@@ -73,7 +102,7 @@ test('core render composes folded history, bounded scroll, and prompt rows', () 
   const input = { messages: [tool], columns: 30, rows: 8, header: ['header'], footer: ['footer'],
     promptLine: '❯ ', notices: ['notice'], activity: ['activity'], expandedToolIndexes: expanded };
   const folded = renderNextTuiLogFrame({ ...input, scroll: 0 });
-  expect(folded.lines).toEqual(['header', '▸ 도구 Read · 20줄 (접힘)', '', 'notice', 'activity', '', 'footer', '❯ ']);
+  expect(folded.lines).toEqual(['header', '▸ Tool Re… · 20 lines (folded)', '', 'notice', 'activity', '', 'footer', '❯ ']);
   expect(folded.promptRow).toBe(folded.lines.length);
   expect(folded.maxScroll).toBe(0);
   expect(toggleVisibleToolFold(expanded, input.messages, input.columns, folded.logWindow)).toBe(true);
@@ -90,7 +119,7 @@ test("empty transcript hides the shared history placeholder in the Next TUI fram
   const frame = renderNextTuiLogFrame({ messages: [], columns: 40, rows: 8,
     header: ["title"], footer: ["status"], promptLine: "❯ ", notices: [], activity: [], scroll: 0,
     expandedToolIndexes: new Set() });
-  expect(frame.lines.join("|")).not.toContain("대화 기록 없음");
+  expect(frame.lines.join("|")).not.toContain("No chat history");
   expect(frame.lines.at(-1)).toBe("❯ ");
 });
 
@@ -123,7 +152,10 @@ test('short transcript starts below the header and grows downward while prompt s
     columns: 40, rows: 10, header: ['title', 'rule'], footer: ['status'], promptLine: '❯ ',
     notices: [], activity: [], scroll: 0, expandedToolIndexes: new Set(),
   });
-  expect(frame.body).toEqual(['❯ 질문', '', '  답변', '', '', '']);
+  expect(frame.body[1]).toBe('');
+  expect(frame.body[2]).toBe('답변');
+  expect(visibleRow(frame.body[0]!)).toContain('> 질문');
+  expect(Bun.stringWidth(visibleRow(frame.body[0]!))).toBe(40);
   expect(frame.lines.at(-2)).toBe('status');
   expect(frame.lines.at(-1)).toBe('❯ ');
 });
@@ -138,7 +170,7 @@ test('MessageBlock events default folded and Enter reveals one tier without hidi
     messageBlocks: [{ block: thought, level: 0 as const }], columns: 80, rows: 10, header: [], footer: [],
     promptLine: '❯ ', notices: [], activity: [], scroll: 0, expandedToolIndexes: new Set<number>() };
   const folded = renderNextTuiLogFrame(input);
-  expect(folded.body.join('\n')).toContain('▸ 생각');
+  expect(folded.body.join('\n')).toContain('▸ thought');
   expect(folded.body.join('\n')).not.toContain('(접힘)');
   expect(folded.body.join('\n')).toContain('최종 답변');
   expect(folded.body.join('\n')).not.toContain('긴 사고 원문');
@@ -273,8 +305,8 @@ test('Next history hides internal child-agent polling while classic history rema
   expect(screen).not.toContain('  \n');
   expect(screen).not.toContain('private goal data');
   expect(screen).not.toContain('private alias goal');
-  expect(screen).toContain('❯ run three children');
-  expect(screen).toContain('  completed');
+  expect(screen.replace(/\x1b\[[0-9;]*m/g, '')).toContain('> run three children');
+  expect(screen).toContain('\ncompleted\n');
 });
 
 test('fold targets include both the MessageBlock and saved tool row in transcript order', () => {
@@ -322,17 +354,26 @@ test('short activity and reply growth keeps the user at the top until the viewpo
     notices: [], scroll: 0, expandedToolIndexes: new Set<number>() };
   for (const activity of [[], ['first activity'], ['first activity', 'second activity'], ['first activity', 'second activity', 'reply']]) {
     const frame = renderNextTuiLogFrame({ ...input, activity });
-    expect(frame.body[0]).toBe('❯ 질문');
+    expect(visibleRow(frame.body[0]!)).toContain('> 질문');
     expect(frame.logWindow.leadingBlankRows).toBe(0);
     expect(frame.lines.at(-1)).toBe('❯ ');
     expect(frame.lines).toHaveLength(input.rows);
-    for (const line of activity) expect(frame.body.indexOf(line)).toBeGreaterThan(frame.body.indexOf('❯ 질문'));
+    const userAt = frame.body.indexOf(frame.body[0]!);
+    for (const line of activity) expect(frame.body.indexOf(line) > userAt).toBe(true);
   }
   const activity = Array.from({ length: input.rows }, (_, index) => 'event-' + index);
   const full = renderNextTuiLogFrame({ ...input, activity });
-  expect(full.body).not.toContain('❯ 질문');
+  expect(visibleRow(full.body.join('\n'))).not.toContain('> 질문');
   const scrolledToTop = renderNextTuiLogFrame({ ...input, activity, scroll: full.maxScroll });
-  expect(scrolledToTop.body[0]).toBe('❯ 질문');
+  expect(visibleRow(scrolledToTop.body[0]!)).toContain('> 질문');
   expect(full.body.at(-1)).toBe(activity.at(-1));
   expect(full.lines.at(-1)).toBe('❯ ');
+});
+
+test('tool activity rows render dim after fitting; other activity rows stay plain', () => {
+  expect(nextTuiActivityRow(`${TOOL_DONE_GLYPH} Read(notes.txt)`, 80)).toBe(`\x1b[2m${TOOL_DONE_GLYPH} Read(notes.txt)\x1b[22m`);
+  expect(nextTuiActivityRow('엘라누스: 답', 80)).toBe('엘라누스: 답');
+  // Fitting happens first, so the cut matches a plain fit and the escape codes stay intact.
+  const long = `${TOOL_DONE_GLYPH} Read(` + 'x'.repeat(200);
+  expect(nextTuiActivityRow(long, 40)).toBe(`\x1b[2m${fitLogLine(long, 40)}\x1b[22m`);
 });

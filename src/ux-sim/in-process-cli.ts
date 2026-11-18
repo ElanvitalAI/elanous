@@ -223,6 +223,8 @@ function isolatedEnvironment(
 ): NodeJS.ProcessEnv {
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith('ELANOUS_')) delete env[key];
+  // A caller that names PATH means that PATH, not the parent process PATH plus the override.
+  if (overrides?.PATH !== undefined) delete env.PATH;
   for (const [key, value] of Object.entries(overrides ?? {})) {
     if (value === undefined) delete env[key];
     else env[key] = value;

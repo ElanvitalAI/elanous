@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { buildWebSearchTool, dispatchWebSearch } from '../boot/daemon-tools/web-search.js';
 import { ToolSafetyError } from '../boot/daemon-tools/types.js';
@@ -85,11 +85,11 @@ describe('keyless DuckDuckGo provider', () => {
     await expect(buildFreeWebSearchProvider({ fetch: fakeFetch('unavailable', 503) }).search(query)).rejects.toThrow('HTTP 503');
     expect(debug.events().at(-1)).toMatchObject({ category: 'web-search.free', event: 'failed', data: { status: 503, queryLength: query.query.length } });
     await expect(buildFreeWebSearchProvider({ fetch: fakeFetch('<html>no results</html>') }).search(query)).rejects.toThrow('No DuckDuckGo results parsed');
-    expect(debug.events().at(-1)).toMatchObject({ category: 'web-search.free', event: 'failed', data: { reason: 'request-or-parse-failed' } });
+    expect(debug.events().at(-1)).toMatchObject({ category: 'web-search.free', event: 'failed', data: { reason: 'parser' } });
     expect(JSON.stringify(debug.events().slice(-2))).not.toContain(query.query);
   });
 
-  test('DDG stays available for explicit selection but is excluded from default general routing', async () => {
+  test('DDG stays available for explicit selection and last-resort general fallback', async () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: { tavily: { enabled: false }, grokApi: { enabled: false }, firecrawl: { enabled: false } } }));
     _resetWebSearchProvidersForTests();
     const builtins = listWebSearchProviders();
@@ -123,12 +123,15 @@ describe('keyless DuckDuckGo provider', () => {
     await expect(searchWeb(query)).rejects.toBeInstanceOf(WebSearchUnavailableError);
   });
 
-  test('daemon dispatch does not use DDG as an implicit general-search fallback', async () => {
+  test('daemon dispatch uses DDG after configured providers are unavailable', async () => {
     _resetWebSearchProvidersForTests(false);
     addWebSearchProvider({ id: 'grok', displayName: 'grok', available: () => false, search: async () => { throw new Error('should not run'); } });
     addWebSearchProvider(buildFreeWebSearchProvider({ fetch: fakeFetch(html) }));
     const ctx = { cwd: process.cwd(), signal: new AbortController().signal };
-    await expect(dispatchWebSearch({ query: query.query, limit: 2 }, ctx)).rejects.toBeInstanceOf(ToolSafetyError);
+    // The request cap, not the fixture size, decides numHits: ask for one fewer than the fixture holds.
+    const fixtureHits = html.match(/class="result__a"/g)?.length ?? 0;
+    const requestedHits = fixtureHits - 1;
+    expect(await dispatchWebSearch({ query: query.query, limit: requestedHits }, ctx)).toMatchObject({ providerName: 'ddg-free', numHits: requestedHits });
     _resetWebSearchProvidersForTests(false);
     addWebSearchProvider(buildFreeWebSearchProvider({ fetch: fakeFetch('unavailable', 503) }));
     await expect(dispatchWebSearch({ query: query.query }, ctx)).rejects.toMatchObject({
@@ -142,4 +145,51 @@ describe('keyless DuckDuckGo provider', () => {
     expect(entry?.description).toContain('Exa then Firecrawl');
     expect(entry?.promptSummary).toContain('Exa then Firecrawl');
   });
+});
+
+
+test('keyless search distinguishes challenge, confirmed no-results and unexpected markup without pretending evidence', async () => {
+  for (const status of [200, 202]) {
+    await expect(buildFreeWebSearchProvider({ fetch: fakeFetch('<form id="challenge-form"><div class="anomaly-modal">private challenge</div></form>', status) })
+      .search(query)).rejects.toThrow('무료 검색 차단됨');
+    expect(debug.events().at(-1)?.data).toMatchObject({ reason: 'blocked' });
+  }
+  await expect(buildFreeWebSearchProvider({ fetch: fakeFetch('<div class="no-results">No results found</div>') })
+    .search(query)).rejects.toThrow('No DuckDuckGo results found');
+  expect(debug.events().at(-1)?.data).toMatchObject({ reason: 'no-results' });
+  await expect(buildFreeWebSearchProvider({ fetch: fakeFetch('<html>Unexpected changed markup</html>') })
+    .search(query)).rejects.toThrow('No DuckDuckGo results parsed');
+  expect(debug.events().at(-1)?.data).toMatchObject({ reason: 'parser' });
+  expect(JSON.stringify(debug.events().slice(-4))).not.toContain(query.query);
+  expect(JSON.stringify(debug.events().slice(-4))).not.toContain('private challenge');
+});
+
+test('a real result page that quotes the no-results phrase still returns its hits', async () => {
+  const quoting = `<div class="result"><a class="result__a" href="https://example.org/faq">Why DDG says No results found</a>
+<a class="result__snippet">The page shows No results found when the index is empty.</a></div>`;
+  const result = await buildFreeWebSearchProvider({ fetch: fakeFetch(quoting) }).search(query);
+  expect(result.hits.map(hit => hit.url)).toEqual(['https://example.org/faq']);
+  await expect(buildFreeWebSearchProvider({ fetch: fakeFetch('<div class="no-results">No results found</div>') }).search(query))
+    .rejects.toMatchObject({ reason: 'no-results' });
+});
+
+test('a stalled first provider leaves fallback time for DDG inside the shared deadline', async () => {
+  _resetWebSearchProvidersForTests(false);
+  const realNow = Date.now.bind(Date);
+  const startedAt = realNow();
+  let calls = 0;
+  // First read fixes the shared deadline; later reads sit just before it, so each provider's slice is tiny.
+  const nowSpy = spyOn(Date, 'now').mockImplementation(() => (calls++ === 0 ? startedAt : startedAt + 14_980));
+  const order: string[] = [];
+  try {
+    addWebSearchProvider({ id: 'firecrawl', displayName: 'stalled', available: () => true, search: (_q, signal) => {
+      order.push('firecrawl');
+      return new Promise<never>((_resolve, reject) => signal?.addEventListener('abort', () => reject(new Error('stalled provider aborted')), { once: true }));
+    } });
+    addWebSearchProvider(buildFreeWebSearchProvider({ fetch: fakeFetch(html) }));
+    calls = 0;
+    const result = await searchWeb(query);
+    expect(order).toEqual(['firecrawl']);
+    expect(result.providerName).toBe('ddg-free');
+  } finally { nowSpy.mockRestore(); }
 });

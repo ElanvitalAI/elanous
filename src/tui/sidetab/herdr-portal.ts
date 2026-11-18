@@ -45,15 +45,15 @@ export interface HerdrSidetabPortal {
 function paneRowsFromSnapshot(value: unknown): HerdrPaneSnapshot[] {
   const root = asRecord(value, { fallback: 'undefined' });
   const result = asRecord(root?.result, { fallback: 'undefined' });
-  if (!result) throw new Error('Herdr snapshot 형식 오류 · result 객체가 없습니다');
+  if (!result) throw new Error('Herdr snapshot format error · no result object');
   const session = asRecord(result?.session_snapshot, { fallback: 'undefined' });
   const panes = result?.panes ?? session?.panes;
-  if (!Array.isArray(panes)) throw new Error('Herdr snapshot 형식 오류 · panes 배열이 없습니다');
+  if (!Array.isArray(panes)) throw new Error('Herdr snapshot format error · no panes array');
   const invalidPane = panes.findIndex((candidate) => {
     const pane = asRecord(candidate, { fallback: 'undefined' });
     return typeof pane?.pane_id !== 'string' || pane.pane_id.length === 0;
   });
-  if (invalidPane >= 0) throw new Error(`Herdr snapshot 형식 오류 · panes[${invalidPane}].pane_id가 없습니다`);
+  if (invalidPane >= 0) throw new Error(`Herdr snapshot format error · panes[${invalidPane}].pane_id missing`);
   return panes as HerdrPaneSnapshot[];
 }
 
@@ -71,13 +71,13 @@ function statusOf(pane: HerdrPaneSnapshot, verified: boolean): HerdrSidetabStatu
 
 function displayState(status: HerdrSidetabStatus): { badge: SidetabRow['badge']; label: string } {
   switch (status) {
-    case 'working': return { badge: 'busy', label: '실행 중' };
-    case 'idle': return { badge: 'idle', label: '대기' };
-    case 'needs-approval': return { badge: 'busy', label: '승인 필요' };
-    case 'done-verified': return { badge: 'idle', label: '검증 완료' };
-    case 'done-unverified': return { badge: 'unknown', label: '미검증 완료' };
-    case 'stopped': return { badge: 'exited', label: '멈춤' };
-    case 'unknown': return { badge: 'unknown', label: '상태 미상' };
+    case 'working': return { badge: 'busy', label: 'Running' };
+    case 'idle': return { badge: 'idle', label: 'Idle' };
+    case 'needs-approval': return { badge: 'busy', label: 'Needs approval' };
+    case 'done-verified': return { badge: 'idle', label: 'Verified done' };
+    case 'done-unverified': return { badge: 'unknown', label: 'Unverified done' };
+    case 'stopped': return { badge: 'exited', label: 'Stopped' };
+    case 'unknown': return { badge: 'unknown', label: 'Unknown state' };
   }
 }
 
@@ -93,7 +93,7 @@ function rowFromPane(pane: HerdrPaneSnapshot, verified: boolean): SidetabRow {
   const display = displayState(status);
   const title = pane.terminal_title_stripped || pane.terminal_title || pane.agent || pane.pane_id;
   const cost = finiteCost(pane);
-  const costText = cost === undefined ? '비용 —' : `비용 $${cost.toFixed(2)}`;
+  const costText = cost === undefined ? 'Cost —' : `Cost $${cost.toFixed(2)}`;
   return {
     id: `${HERDR_ROW_PREFIX}${pane.pane_id}`,
     label: `Herdr · ${display.label} · ${title} · ${costText}`,
@@ -139,7 +139,7 @@ function logicalKey(key: string): string {
   };
   const mapped = aliases[key];
   if (mapped) return mapped;
-  if (key.startsWith('\x1b')) throw new Error('지원되지 않는 Herdr escape key입니다');
+  if (key.startsWith('\x1b')) throw new Error('Unsupported Herdr escape key');
   return key;
 }
 
@@ -154,12 +154,12 @@ export function createHerdrSidetabPortal(options: HerdrSidetabPortalOptions = {}
 
   const visibleRows = (): SidetabRow[] => {
     const rows = snapshotError
-      ? cachedRows.map((row) => ({ ...row, label: `${row.label} · 오래된 스냅샷` }))
+      ? cachedRows.map((row) => ({ ...row, label: `${row.label} · stale snapshot` }))
       : [...cachedRows];
     if (snapshotError) {
       rows.push({
         id: 'herdr:snapshot-status',
-        label: `Herdr · snapshot 갱신 실패 · ${snapshotError}`,
+        label: `Herdr · snapshot refresh failed · ${snapshotError}`,
         kind: 'status',
         badge: 'unknown',
       });
@@ -168,8 +168,8 @@ export function createHerdrSidetabPortal(options: HerdrSidetabPortalOptions = {}
   };
 
   const requireEnabledPane = (paneId: string): void => {
-    if (env.HERDR_ENV !== '1') throw new Error('Herdr 포털은 Herdr 관리 pane 안에서만 사용할 수 있습니다');
-    if (!/^w[A-Za-z0-9_-]+:p[A-Za-z0-9_-]+$/.test(paneId)) throw new Error('Herdr pane id가 올바르지 않습니다');
+    if (env.HERDR_ENV !== '1') throw new Error('Herdr portal only works inside a Herdr admin pane');
+    if (!/^w[A-Za-z0-9_-]+:p[A-Za-z0-9_-]+$/.test(paneId)) throw new Error('Invalid Herdr pane id');
   };
 
   return {
@@ -182,7 +182,7 @@ export function createHerdrSidetabPortal(options: HerdrSidetabPortalOptions = {}
         const output = commandOutput(result);
         let snapshot: unknown;
         try { snapshot = JSON.parse(output); }
-        catch { throw new Error('Herdr snapshot 형식 오류 · JSON을 읽을 수 없습니다'); }
+        catch { throw new Error('Herdr snapshot format error · cannot read JSON'); }
         const panes = paneRowsFromSnapshot(snapshot);
         cachedRows = panes.map((pane) => rowFromPane(pane, isVerified(pane)));
         snapshotError = null;

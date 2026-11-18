@@ -35,10 +35,10 @@ function signalSummary(signal: ControlSignal): string {
 function signalsHelp(ctx: SignalsSlashContext): void {
   ctx.chatLines.push(ctx.accent('❯ /signals help'));
   ctx.chatLines.push(ctx.warning(`  ${SIGNALS_USAGE}`));
-  ctx.chatLines.push(ctx.muted('  · status — 종류별 관측 신호 수 요약'));
-  ctx.chatLines.push(ctx.muted('  · latest — 최신 신호 1건'));
-  ctx.chatLines.push(ctx.muted('  · list [kind] — 신호 목록(선택 kind 필터)'));
-  ctx.chatLines.push(ctx.muted('  · clear·emit 은 관측 전용 경계상 이 명령 범위 밖입니다'));
+  ctx.chatLines.push(ctx.muted('  · status — observed signal counts by kind'));
+  ctx.chatLines.push(ctx.muted('  · latest — the newest signal'));
+  ctx.chatLines.push(ctx.muted('  · list [kind] — signal list (optional kind filter)'));
+  ctx.chatLines.push(ctx.muted('  · clear and emit are outside this command (observation only)'));
   ctx.setChatScrollOffset(-1);
 }
 
@@ -48,11 +48,11 @@ function signalsStatus(ctx: SignalsSlashContext): void {
   const kinds = Object.keys(counts).sort();
   const total = kinds.reduce((sum, kind) => sum + (counts[kind] ?? 0), 0);
   if (total === 0) {
-    ctx.chatLines.push(ctx.muted('  관측된 신호 없음 (총 0건)'));
+    ctx.chatLines.push(ctx.muted('  No signals observed (0 total)'));
     ctx.setChatScrollOffset(-1);
     return;
   }
-  ctx.chatLines.push(ctx.text(`  신호 총 ${total}건 · 종류 ${kinds.length}종`));
+  ctx.chatLines.push(ctx.text(`  ${total} signals total · ${kinds.length} kinds`));
   for (const kind of kinds) {
     ctx.chatLines.push(ctx.muted(`  · ${kind} ×${counts[kind] ?? 0}`));
   }
@@ -63,7 +63,7 @@ function signalsLatest(ctx: SignalsSlashContext): void {
   ctx.chatLines.push(ctx.accent('❯ /signals latest'));
   const latest = defaultControlSignalObserver().latest();
   if (!latest) {
-    ctx.chatLines.push(ctx.muted('  최신 신호 없음 — 아직 관측된 control-signal 이 없습니다'));
+    ctx.chatLines.push(ctx.muted('  No latest signal — no control-signal has been observed yet'));
   } else {
     ctx.chatLines.push(`  ${ctx.info(signalSummary(latest))}`);
   }
@@ -73,9 +73,9 @@ function signalsLatest(ctx: SignalsSlashContext): void {
 function signalsList(args: string[], ctx: SignalsSlashContext): void {
   const kind = (args[1] ?? '').trim();
   const signals = defaultControlSignalObserver().list(kind ? { kind } : undefined);
-  ctx.chatLines.push(ctx.accent(`❯ /signals list${kind ? ` ${kind}` : ''} (${signals.length}건)`));
+  ctx.chatLines.push(ctx.accent(`❯ /signals list${kind ? ` ${kind}` : ''} (${signals.length})`));
   if (signals.length === 0) {
-    ctx.chatLines.push(ctx.muted('  관측된 신호 없음'));
+    ctx.chatLines.push(ctx.muted('  No signals observed'));
   }
   for (const [index, signal] of signals.entries()) {
     ctx.chatLines.push(`  ${ctx.muted(`${index + 1}. ${signalSummary(signal)}`)}`);
@@ -105,7 +105,7 @@ export async function handleSignalsSlash(args: string[], ctx: SignalsSlashContex
   }
   ctx.chatLines.push(ctx.accent(`❯ /signals ${sub}`));
   if (sub === 'clear' || sub === 'emit') {
-    ctx.chatLines.push(ctx.error(`  ✗ out of scope — /signals는 관측 전용입니다 (${sub} 미지원)`));
+    ctx.chatLines.push(ctx.error(`  ✗ out of scope — /signals is observation only (${sub} is not supported)`));
   } else {
     ctx.chatLines.push(ctx.warning(`  unknown subcommand: ${sub}`));
   }

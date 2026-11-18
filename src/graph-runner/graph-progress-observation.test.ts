@@ -4,7 +4,7 @@ import type { GraphNodeLifecycleEvent } from './runner-types.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGraph } from './runner.js';
+import { onGraphRunIdleWake, runGraph, type GraphRunIdleWake } from './runner.js';
 
 const event = (phase: GraphNodeLifecycleEvent['phase'], seq: number, attempt = 1,
   outcome?: GraphNodeLifecycleEvent['outcome']): GraphNodeLifecycleEvent => ({
@@ -127,4 +127,32 @@ test('real runner successful loop revisit is a start rather than a retry', async
     expect(collector.snapshot().events.filter(item => item.nodeId === 'verify' && item.kind === 'started')).toHaveLength(2);
     expect(collector.snapshot().events.some(item => item.kind === 'retrying')).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a real run knocks the idle door once on the way out, never per node and never for a dry run', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-idle-wake-'));
+  const wakes: GraphRunIdleWake[] = [];
+  const off = onGraphRunIdleWake((wake) => { wakes.push(wake); });
+  try {
+    const graph = join(root, 'graph.yaml');
+    writeFileSync(join(root, 'recipes.yaml'), 'verify:\n  command: "fixture"\n');
+    writeFileSync(graph, [
+      'graph_id: graph-idle', 'version: 1', 'entry_node: verify', 'terminal_nodes: [done, failed]',
+      'nodes:',
+      "  - { node_id: verify, kind: agent, recipe: 'cmd:verify', max_visits: 1 }",
+      '  - { node_id: done, kind: gate, max_visits: 1 }',
+      '  - { node_id: failed, kind: gate, max_visits: 1 }',
+      'edges:',
+      '  - { from: verify, on: outcome, map: { ok: done, fail: failed } }', '',
+    ].join('\n'));
+    const dry = await runGraph(graph, { runId: 'idle-dry', dryRun: true, quiet: true, deps: { root } });
+    expect(dry.dryRun).toBe(true);
+    expect(wakes).toEqual([]);
+    const done = await runGraph(graph, { runId: 'idle-done', quiet: true, deps: { root,
+      runBash: async () => ({ stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 }),
+    } });
+    expect(done.status).toBe('done');
+    expect(done.path).toEqual(['verify', 'done']);
+    expect(wakes).toEqual([{ graphId: 'graph-idle', runId: 'idle-done', status: 'done', dryRun: false }]);
+  } finally { off(); rmSync(root, { recursive: true, force: true }); }
 });

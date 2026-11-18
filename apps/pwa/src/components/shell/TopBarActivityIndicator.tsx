@@ -11,15 +11,16 @@ export function TopBarActivityIndicator({
   if (snapshot.kind === 'quiet' || snapshot.kind === 'loading') return null;
 
   if (snapshot.kind === 'error') {
+    // One line that says what and that it retries (the poll asks again) — not a bare red word (WEB-CHAT-ACTIVITY-ERROR).
     return (
       <span
-        role="alert"
+        role="status"
         data-elanous-component="topbar-activity"
         data-activity-kind="error"
         title={snapshot.message}
-        className="max-w-[9rem] shrink-0 truncate rounded px-1.5 py-0.5 text-[10px] text-rose-500 sm:max-w-[16rem]"
+        className="max-w-[9rem] shrink-0 truncate rounded px-1.5 py-0.5 text-[10px] text-amber-600 sm:max-w-[16rem]"
       >
-        activity error
+        활동 정보를 못 불러옴 · 다시 시도 중
       </span>
     );
   }

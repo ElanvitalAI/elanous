@@ -20,6 +20,22 @@ function adapter(calls: Array<{ name: string; args: Record<string, unknown> }> =
   });
 }
 
+test('member app slug is carried only after the Nexus owner endpoint verifies that exact slot', async () => {
+  const requests: string[] = [];
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    requests.push(url.searchParams.get('appSlug') ?? 'none');
+    return url.searchParams.get('appSlug') === 'bound-slot'
+      ? Response.json({ memberId: 'member-a' })
+      : Response.json({ error: 'unauthorized' }, { status: 401 });
+  };
+  const base = { nexusUrl: 'https://api.elanous.ai', sessionToken: 'aps_private_fixture', fetchImpl };
+  expect(await resolveDashboardVerifiedOwner({ ...base, appSlug: 'bound-slot' }))
+    .toEqual({ id: 'member-a', appSlug: 'bound-slot' });
+  expect(await resolveDashboardVerifiedOwner({ ...base, appSlug: 'foreign-slot' })).toBeUndefined();
+  expect(requests).toEqual(['bound-slot', 'foreign-slot']);
+});
+
 function briefingOwnerMapping(briefing: (Record<string, unknown> & { owner?: unknown }) | undefined) {
   return typeof briefing?.owner === 'string' && briefing.owner.trim()
     ? { status: 'present' as const, value: briefing.owner }
@@ -942,4 +958,27 @@ test('production graph owner denial keeps a structured user-action code through 
   expect(result.finalText).toContain('회원 연결');
   expect(turns).toBe(1);
   expect(delegated).toBe(0);
+});
+
+test('ONE-LINE-INTENT-CONTEXT-AUTOFILL: the dashboard adapter fills app_build like the core adapter, and an unbound member never reaches the graph', async () => {
+  const pluginRoot = join(import.meta.dir, '..', '..', 'plugins');
+  const slot = 'a1b2c3d4e5f6a1b2c3d4e5f6';
+  const graphArgs: Array<Record<string, unknown>> = [];
+  const routeAdapter = createDashboardPluginRouteAdapter({
+    pluginRoot,
+    dispatchCore: async () => undefined,
+    requestConfirmation: async () => true,
+    dispatchGraph: async (_pluginId, graphId, _graphFile, args) => { graphArgs.push(args); return { ok: true, graphId }; },
+  });
+  const filled = await routeAdapter.dispatch('app_build', { ask: '용평 스키 강습 예약 앱 만들어줘' }, false,
+    { surface: 'tui', verifiedOwner: { id: 'member-a', appSlug: slot } });
+  expect(filled).toMatchObject({ ok: true });
+  expect(graphArgs).toHaveLength(1);
+  expect(graphArgs[0]).toMatchObject({ appSlug: slot, seedRequested: expect.any(Boolean) });
+  expect(graphArgs[0]?.artifactMetadata).toBeDefined();
+
+  const unbound = await routeAdapter.dispatch('app_build', { ask: '용평 스키 강습 예약 앱 만들어줘' }, false,
+    { surface: 'tui', verifiedOwner: { id: 'member-a' } });
+  expect(unbound).toMatchObject({ ok: false, code: 'MEMBER_APP_SLOT_REQUIRED' });
+  expect(graphArgs).toHaveLength(1);
 });

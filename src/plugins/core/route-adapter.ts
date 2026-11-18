@@ -1,4 +1,5 @@
 import { withCapabilityDiscoveryDescription } from './capability-discovery.js';
+import { APP_BUILD_PLUGIN_ID, appBuildDeclinedFailure } from './app-build-decline-guard.js';
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -9,6 +10,7 @@ import { dispatchToolRoute, type ToolRouteMatch } from '../../tool-router/index.
 import { writeFileArtifact } from '../../tool-runtime/file-artifact.js';
 import { runAppDeploy } from '../../agent/app-deploy-plugin.js';
 import type { ToolRuntimeContext } from '../../tool-runtime/types.js';
+import { autofillAppBuildArgs, isAppBuildRoute } from './app-build-autofill.js';
 
 const EXECUTABLE_NATIVE_HANDLERS = new Set(['native:firecrawl', 'native:logs_query', 'native:ops_status', 'native:release_status', 'native:app_deploy', 'native:file_artifact_write']);
 const NON_EXECUTABLE_NATIVE_HANDLERS = new Set(['native:release_graph_start']);
@@ -48,7 +50,7 @@ interface NativePluginRouteTool extends LLMToolSpec {
 
 export interface PluginRouteDispatchContract {
   dispatch(name: string, args: Record<string, unknown>, confirmed?: boolean, context?: ToolRuntimeContext): Promise<
-    { ok: true; result: unknown } | { ok: false; error: string } | null
+    { ok: true; result: unknown } | { ok: false; error: string; code?: string } | null
   >;
 }
 
@@ -78,7 +80,7 @@ export function createPluginRouteAdapter(options: {
     handler: async (args) => {
       const context = await options.getDispatchContext?.() as ToolRuntimeContext | undefined;
       const result = await dispatch(tool, args as Record<string, unknown>, false, context);
-      return result.ok ? result.result : { error: result.error };
+      return result.ok ? result.result : { error: result.error, ...(result.code ? { code: result.code } : {}) };
     },
     pluginId: tool.pluginId,
     route: tool.route,
@@ -93,7 +95,8 @@ export function createPluginRouteAdapter(options: {
     return [...hostTools, ...routeTools.filter((tool) => !names.has(tool.name))];
   };
 
-  async function dispatch(tool: NativePluginRouteTool, args: Record<string, unknown>, confirmed = false, context?: ToolRuntimeContext) {
+  async function dispatch(tool: NativePluginRouteTool, args: Record<string, unknown>, confirmed = false,
+    context?: ToolRuntimeContext): Promise<{ ok: true; result: unknown } | { ok: false; error: string; code?: string }> {
     if (NON_EXECUTABLE_NATIVE_HANDLERS.has(tool.handlerRef)) {
       return { ok: false as const, error: 'release graph start is disabled in this TUI adapter; approval boundary is OP-only' };
     }
@@ -106,6 +109,14 @@ export function createPluginRouteAdapter(options: {
         return { ok: false as const, error: `graph route is not allowlisted: ${tool.name}` };
       }
       if (!executeGraph) return { ok: false as const, error: 'graph route executor is not configured' };
+      let graphArgs = args;
+      if (isAppBuildRoute(tool.pluginId, tool.name)) {
+        // ONE-LINE-INTENT-CONTEXT-AUTOFILL: slot, handle source and data needs come from the verified
+        // member context and the line, before any confirmation; a missing binding stays needs_connection.
+        const filled = autofillAppBuildArgs(args, context);
+        if (filled.status !== 'filled') return { ok: false as const, error: filled.error, code: filled.code };
+        graphArgs = filled.args;
+      }
       if (!context?.verifiedOwner?.id) {
         return { ok: false as const, error: 'graph route requires a verified owner context' };
       }
@@ -123,7 +134,7 @@ export function createPluginRouteAdapter(options: {
         }
       }
       const result = dispatchToolRoute(match, approved, () => {
-        return executeGraph(tool.pluginId, graphId, graphFile, args, context);
+        return executeGraph(tool.pluginId, graphId, graphFile, graphArgs, context);
       }, { allowedGraphIds });
       if (result.status === 'confirmation-required') return { ok: false as const, error: `confirmation declined for ${tool.name}` };
       if (result.status === 'graph-not-allowlisted') return { ok: false as const, error: `graph route is not allowlisted: ${tool.name}` };
@@ -178,7 +189,18 @@ export function createPluginRouteAdapter(options: {
     async dispatch(name, args, confirmed = false, context) {
       if (shadowedNames.has(name)) return null;
       const tool = byName.get(name);
-      return tool ? dispatch(tool, args, confirmed, context) : null;
+      if (!tool) return null;
+      const result = await dispatch(tool, args, confirmed, context);
+      // APP-BUILD-DECLINE-NO-BYPASS-DEPLOY: a declined or unanswered app_build confirmation is an
+      // owner decision; the model gets an explicit structured result, not a bare error string.
+      if (!result.ok && tool.pluginId === APP_BUILD_PLUGIN_ID && tool.route.requiresConfirm
+        && (result.error === `confirmation declined for ${tool.name}`
+          || result.error.startsWith(`confirmation failed closed for ${tool.name}:`))) {
+        const declined = appBuildDeclinedFailure(tool.name,
+          result.error.startsWith('confirmation failed closed') ? 'confirmation-failed' : 'declined');
+        return declined;
+      }
+      return result;
     },
   };
 }

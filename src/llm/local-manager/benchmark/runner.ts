@@ -5,6 +5,7 @@
 // 관측: 결과를 debug.log('llm.bench', ...) 로 남겨 `elanous logs --category llm.bench` 조회(제1원칙).
 
 import { debug } from '../../../debug/log.js';
+import { llmNetworkFetch } from '../../../session-runtime/llm-call-gateway.js';
 import { runPython } from './code-exec.js';
 import { BENCH_TASKS, categoryMaxes, type BenchCategory, type BenchTask, type CodeExecutor } from './tasks.js';
 
@@ -87,7 +88,7 @@ export function makeOpenAiCompatChat(endpoint: string, model: string, timeoutMs:
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const resp = await fetch(`${base}/v1/chat/completions`, {
+      const resp = await llmNetworkFetch(`${base}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -98,7 +99,7 @@ export function makeOpenAiCompatChat(endpoint: string, model: string, timeoutMs:
           stream: false,
         }),
         signal: ctrl.signal,
-      });
+      }, { provider: 'local', model, role: 'aux', requestedBy: 'local-benchmark', selectionSource: 'explicit' });
       if (!resp.ok) throw new Error(`HTTP ${resp.status} ${(await resp.text()).slice(0, 160)}`);
       const j = (await resp.json()) as {
         choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;

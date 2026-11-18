@@ -83,8 +83,8 @@ export function reconcileAgentOutputStatuses(
 export function agentDisplayLine(item: Pick<AgentDisplay, 'description' | 'status'>): string {
   const head = item.description ? `Agent(${item.description})` : 'Agent';
   const status = item.status === 'failed' ? '✗' : item.status === 'done' ? '✓' : '◐';
-  const tail = item.status === 'failed' ? '실패' : item.status === 'done' ? '완료'
-    : item.status === 'background' ? '백그라운드 실행 중' : '진행 중';
+  const tail = item.status === 'failed' ? 'failed' : item.status === 'done' ? 'done'
+    : item.status === 'background' ? 'running in background' : 'running';
   return `${status} ${head} · ${tail}`;
 }
 
@@ -96,12 +96,12 @@ export function agentDisplayLines(items: readonly AgentDisplay[]): string[] {
   const failed = items.filter(({ status }) => status === 'failed').length;
   const active = running + background;
   const parts = [
-    ...(active ? [`실행 중 ${active}`] : []),
-    ...(done ? [`완료 ${done}`] : []),
-    ...(failed ? [`실패 ${failed}`] : []),
+    ...(active ? [`running ${active}`] : []),
+    ...(done ? [`done ${done}`] : []),
+    ...(failed ? [`failed ${failed}`] : []),
   ];
   const marker = active ? '◐' : failed ? '✗' : '✓';
-  return [`${marker} 하위 에이전트 · ${parts.join(' · ')}`];
+  return [`${marker} sub-agents · ${parts.join(' · ')}`];
 }
 
 /** Persisted Agent tool results use the same one-line shape after the turn settles. */

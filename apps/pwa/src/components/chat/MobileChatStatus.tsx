@@ -14,11 +14,8 @@ export function MobileChatStatus({ activity, decisions, menu, minimal = false }:
     ? activity.run.progressLine || activity.run.runId
     : activity.kind === 'quiet' ? '없음' : activity.kind === 'loading' ? '확인 중' : '확인 불가';
   if (minimal) return (
-    <div data-elanous-mobile-chat-status="" className="flex min-h-10 items-center justify-between border-b border-border bg-background px-3 text-xs">
-      <details className="min-w-0 text-muted-foreground">
-        <summary className="cursor-pointer select-none">자세히</summary>
-        <div role="status">지금 도는 일 · {running} · 대기 결정 {decisions ?? '—'}</div>
-      </details>
+    // WEB-CHAT-MINIMAL-SURFACE (대표 11-17): the «자세히» fold was removed; the phone chat's top row is its menu alone.
+    <div data-elanous-mobile-chat-status="" className="flex min-h-10 items-center justify-end border-b border-border bg-background px-3 text-xs">
       {menu}
     </div>
   );

@@ -1,13 +1,10 @@
 'use client';
 
-import { HideInPublicCapture } from '@/lib/public-capture';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type ReactNode } from 'react';
-import { Mic, MicOff, MoreHorizontal } from 'lucide-react';
+import { MoreHorizontal } from 'lucide-react';
 import Link from 'next/link';
 import { useCompactMode } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
-import { SeatsNowStrip } from './SeatsNowStrip';
-import { NowSpeakButton } from './NowSpeakButton';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
 import { MemberProposalCard } from './MemberProposalCard';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
@@ -22,16 +19,10 @@ import { ChatQueueChips } from './ChatQueueChips';
 import { clearChatQueue, dequeueChat, enqueueChat, removeChat, type ChatQueueEntry } from '@/lib/chat-queue';
 import { ChatDropOverlay } from './ChatDropOverlay';
 import { nextDropOverlay, type DropOverlayState } from '@/lib/drop-overlay';
-import { SessionPill } from './SessionPill';
-import { ChatCurrentProject } from './ChatCurrentProject';
-import { ChatHud } from './blocks/ChatHud';
 import { dispatchHudSegmentEnvelope } from '@/lib/chat-runtime';
 import { restorableChatMessages } from '@/lib/session-restore';
 import { generateSessionId } from '@/lib/daemon-session';
 import { writeSharePrefill } from '@/lib/share-prefill';
-import { BudgetPill } from './BudgetPill';
-import { VoiceCostPill } from './VoiceCostPill';
-import { VoiceOverlay } from './VoiceOverlay';
 import { DebugTapDrawer, type DebugTapLine } from './blocks/DebugTapDrawer';
 import { applyFeedbackEnvelope } from '@/lib/feedback-block-accumulator';
 import {
@@ -47,15 +38,12 @@ import {
   type ChatMessage,
   type ChatRuntimeContext,
 } from '@/lib/chat-runtime';
-import { useVoiceController } from '@/voice/use-voice-controller';
-import { useVoiceTts } from '@/voice/use-voice-tts';
 import { AskQuestionSheet } from '@/components/ask-user-question/AskQuestionSheet';
 import { useAskQuestion } from '@/components/ask-user-question/use-ask-question';
 import { ToolApprovalSheet } from '@/components/tool-approval/ToolApprovalSheet';
 import { useToolApproval } from '@/components/tool-approval/use-tool-approval';
 import { deployConfirmation } from '@/lib/chat-deploy';
 import type { AcpConnection } from '@/lib/daemon-client';
-import { VOICE_DOT_COLOR, VOICE_PHASE_LABEL } from '@/voice/voice-phase-styles';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import { debugLog, setDebugForwardFallback } from '@/lib/debug';
@@ -69,6 +57,7 @@ import {
   isImageAttachment,
   isProviderUserMessageVisionCapable,
 } from '@/lib/attachment-content';
+import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
 
 // A route remount can create a new ChatLayout while the previous instance is
 // still uploading the same Share Target payload. Keep one handoff active per
@@ -400,57 +389,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     return out;
   }, [messages]);
 
-  // Phase 1 (PWA chat ↔ voice 일원화 · 2026-05-07) — voice controller
-  // wires the daemon STT WS to the chat layout. Q2=B2 = auto-send: each
-  // STT `final` transcript fires `handleSubmit` immediately (TUI voice
-  // mode mirror). Two refs keep the closures honest:
-  //   • handleSubmitRef — `handleSubmit` is recreated each render
-  //     (closes over latest pending/messages); the ref captures the
-  //     latest reference so the long-lived socket callback always
-  //     reaches the current handler.
-  //   • pendingRef — drops voice transcripts that arrive while a turn
-  //     is already streaming (B2 risk mitigation: STT misfire during
-  //     LLM thinking should not double-submit).
+  // handleSubmitRef — `handleSubmit` is recreated each render; the queue drain reads the latest one through this ref.
   const handleSubmitRef = useRef<(text: string, queued?: boolean) => Promise<void>>(async () => {});
-  const pendingRef = useRef(false);
-  pendingRef.current = pending;
-  // FU PP-V-1 — voice.toggle 의 latest closure 를 보관할 ref. 본 ref
-  // 는 useVoiceController 호출 직후 (= line 119) sync 되고, global
-  // keydown 리스너 (Cmd+Shift+M) 가 호출. 양쪽이 분리된 useEffect /
-  // useVoiceController 사이에 선언이 들어가야 TS scope 가 정합.
-  const voiceToggleRef = useRef<() => Promise<void>>(async () => {});
-
-  const wsUrl = client.voiceWsUrl();
-  const handleVoiceTranscript = useCallback((text: string): void => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    if (pendingRef.current) {
-      debugLog('chat.voice.skip-pending', { len: trimmed.length });
-      return;
-    }
-    debugLog('chat.voice.auto-send', { len: trimmed.length });
-    void handleSubmitRef.current(trimmed);
-  }, []);
-  const voice = useVoiceController({
-    wsUrl,
-    ...(config.token ? { token: config.token } : {}),
-    onTranscript: handleVoiceTranscript,
-  });
-  const voiceConfigured = Boolean(config.baseUrl);
-  // FU PP-V-1 — sync latest voice.toggle into the long-lived ref so
-  // the global keyboard shortcut listener calls the current closure.
-  voiceToggleRef.current = () => voice.toggle();
-
-  // Phase 5 (PWA chat ↔ voice 일원화 · 2026-05-07) — assistant
-  // streaming 텍스트 → Web Speech API 음성 출력. mute toggle 상태가
-  // false (= 음소거 OFF) AND voice 가 active 일 때만 발화. Q6=F2-lite
-  // (server-side bridge wire 는 BACKLOG · 본 phase 의 use-voice-tts.ts
-  // header note 참고).
-  const [ttsMuted, setTtsMuted] = useState(false);
-  const voiceTts = useVoiceTts({
-    enabled: voice.active && !ttsMuted,
-    language: 'ko-KR',
-  });
 
   const handleStop = useCallback((): void => {
     abortController?.abort();
@@ -477,28 +417,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     return () => window.removeEventListener('keydown', onKey);
   }, [abortController, handleStop]);
 
-  // Voice 일원화 FU PP-V-1 (2026-05-07) — 외장 키보드 push-to-toggle.
-  // Q5=E3 deferred 후속. **Cmd/Ctrl + Shift + M** = mic toggle (Mac
-  // Cmd · Win/Linux Ctrl 둘 다 받음). modifier 동반 chord 라 textarea
-  // 안에서도 충돌 없음 (e.g. "M" 입력은 modifier 없이 가능). webterm
-  // 트랙은 별도 세션이 같은 chord 를 dock 안에서 매핑할 예정.
-  // ttsToggle (Volume2) 도 동일 chord 의 자연 확장으로 남겨두지 않음 —
-  // 본 phase 는 mic 한 가지만, 사용자 dogfood 후 chord 확장 결정.
-  // voiceToggleRef 는 위 (handleSubmitRef/pendingRef 옆) 에서 선언.
-  useEffect(() => {
-    const onKey = (ev: KeyboardEvent): void => {
-      if (ev.key.toLowerCase() !== 'm') return;
-      if (!ev.shiftKey) return;
-      if (!ev.metaKey && !ev.ctrlKey) return;
-      // Browser default — Chrome/Safari Cmd+Shift+M opens window menu
-      // on macOS; we own the chord here for mic toggle.
-      ev.preventDefault();
-      debugLog('chat.voice.shortcut.toggle');
-      void voiceToggleRef.current();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, []);
 
   const handleAttached = useCallback((entries: AttachmentMeta[]): void => {
     setPendingAttachments((prev) => [...prev, ...entries]);
@@ -513,7 +431,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     if (tooMany) toast.error(`${tooMany} files exceed the 10-file attachment limit`);
     if (files.length === 0) return;
     if (!config.baseUrl) {
-      toast.error('Daemon URL 미설정 — Settings 에서 입력');
+      toast.error(NEXUS_URL_MISSING);
       return;
     }
     const results = await uploadAttachments(files, {
@@ -866,10 +784,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     // the per-turn LLM controller server-side once the fetch closes.
     const ac = new AbortController();
     setAbortController(ac);
-    // Phase 5 (voice 일원화) — TTS delta tracker. onPartial 콜백이
-    // cumulative text 를 주므로 pushText 에는 직전 호출 이후의
-    // delta 만 보내야 sentence boundary 가 중복 계산되지 않는다.
-    let lastTtsLen = 0;
     // CV-1b (PLAN v1.2 §5 · 2026-05-07) — chat self-turn path selection.
     //   • ACP path (preferred · runChatTurnAcp): chat 의 자기 turn 이 ACP
     //     `session/prompt` RPC + chunks listener. webterm dock 과 같은
@@ -884,16 +798,12 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     // The handshake may replace a stale stored id before session/prompt starts.
     let turnAcp: AcpConnection | null = null;
     debugLog('webterm.chat.runturn.path', { useAcpPath, hasAcp: !!acpInst, hasSession: !!sessionId });
-    const onPartial = (full: string): void => {
+    const onPartial = (full: string, segmentStart?: number): void => {
       setMessages((prev) =>
-        prev.map((m) => (m.id === placeholderId ? { ...m, text: full } : m)),
+        prev.map((m) => (m.id === placeholderId
+          ? { ...m, text: full, ...(segmentStart !== undefined ? { finalTextStart: segmentStart } : {}) }
+          : m)),
       );
-      // Phase 5 — assistant streaming 텍스트 delta 를 TTS 큐에 추가.
-      // enabled 가 false (voice off / mute on) 일 때 hook 내부에서 no-op.
-      if (full.length > lastTtsLen) {
-        voiceTts.pushText(full.slice(lastTtsLen));
-        lastTtsLen = full.length;
-      }
     };
     const onPartialBlocks = (blocks: ChatBlock[]): void => {
       // Phase B-2/B-3 — mid-stream blocks (image · tool_use pill) attach
@@ -939,16 +849,10 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         currentSessionRef.current = newSessionId;
         setSessionId(newSessionId);
       }
-      // Phase 5 — turn 종료 시 buffer 잔여 텍스트를 마지막 sentence
-      // 로 flush. 사용자가 마지막 한 문장을 못 듣고 끊기는 회귀 회피.
-      voiceTts.flush();
     } catch (err) {
       setPendingAttachments((prev) => restoreStagedShareAttachments(prev, attached));
       const aborted = ac.signal.aborted;
       const msg = err instanceof Error ? err.message : String(err);
-      // Phase 5 — turn 중단 (사용자 Stop / 네트워크 오류) 시 진행 중
-      // 발화 + 큐 모두 취소. 다음 turn 으로 이전 잔여물이 새지 않게.
-      voiceTts.cancel();
       if (aborted) {
         // User-driven cancel — preserve whatever streamed so far +
         // tag the bubble with a stopReason so the meta line shows
@@ -1021,8 +925,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     void handleSubmitRef.current(entry.text, true);
   }, [turnCompleted]);
 
-  // Phase 1 (voice 일원화) — sync the latest handleSubmit reference
-  // into the long-lived ref the voice controller's onTranscript reads.
+  // Keep the latest handleSubmit for the queue drain.
   // Runs every render to track the closure of pending / messages /
   // pendingAttachments etc.
   handleSubmitRef.current = handleSubmit;
@@ -1321,37 +1224,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   const toolApproval = useToolApproval({ acp: acpForAsk, sessionId });
   const deployConfirm = deployConfirmation(askQuestion.pendingRequest);
 
-  const voiceButton = (
-    <button
-      type="button"
-      onClick={() => void voice.toggle()}
-      disabled={!voiceConfigured}
-      title={
-        !voiceConfigured
-          ? 'daemon URL 미설정 — Settings 에서 Base URL 입력'
-          : voice.errorMsg ?? VOICE_PHASE_LABEL[voice.phase]
-      }
-      data-elanous-action="chat-voice-toggle"
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
-        voice.active
-          ? 'border-rose-500/40 bg-rose-500/10 text-rose-600 hover:bg-rose-500/20'
-          : 'border-border bg-background text-foreground hover:bg-muted',
-        !voiceConfigured && 'cursor-not-allowed opacity-50',
-      )}
-    >
-      <span
-        className={cn(
-          'h-2 w-2 rounded-full',
-          VOICE_DOT_COLOR[voice.phase],
-          (voice.phase === 'listening' || voice.phase === 'speaking') && 'animate-pulse',
-        )}
-        aria-hidden
-      />
-      {voice.active ? <Mic className="h-3.5 w-3.5" /> : <MicOff className="h-3.5 w-3.5" />}
-      <span className="hidden sm:inline">{VOICE_PHASE_LABEL[voice.phase]}</span>
-    </button>
-  );
 
   return (
     <div className="relative flex h-full flex-col" onPaste={handlePaste} onDragEnter={handleDragEnter} onDragLeave={handleDragLeave} onDragOver={handleDragOver} onDrop={handleDrop}>
@@ -1371,55 +1243,16 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
               <Link href="/settings" className="rounded px-2 py-1 hover:bg-muted">설정</Link>
             </nav>
             {props.conversationButton}
-            <SessionPill sessionId={sessionId} />
-            <ChatCurrentProject compact />
-            <NowSpeakButton />
-            <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
-            <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
-            {voiceButton}
           </div>}
         </div>
       } />}
-      {compact && !props.mobileSimple ? (
+      {/* WEB-CHAT-MINIMAL-SURFACE (대표 11-17): the chat header is gone (id chip, branch, budget, voice, project removed;
+          backup tag archive/pwa-pre-minimal-20261117). A compact screen keeps only its leading control (the list). */}
+      {compact && !props.mobileSimple && props.leading && (
         <div data-elanous-chat-compact-header="" className="flex h-11 max-h-11 min-w-0 shrink-0 items-center gap-2 border-b border-border bg-background px-3 whitespace-nowrap">
-          {props.leading && <div className="shrink-0">{props.leading}</div>}
-          <div className="min-w-0 flex-1 [&>div]:min-w-0 [&>div]:max-w-full [&>div>div:first-child]:min-w-0 [&>div>div:first-child]:max-w-full [&>div>div:first-child]:overflow-hidden [&>div>div:first-child>span:last-child]:shrink-0 [&>div>div:first-child_span]:min-w-0 [&>div>div:first-child_span]:truncate [&>div>div[role=menu]]:max-w-[calc(100vw-4rem)]">
-            <SessionPill
-              sessionId={sessionId}
-            />
-          </div>
-          <div className="min-w-0 shrink-0"><ChatCurrentProject compact /></div>
-          <NowSpeakButton />
-          <div ref={moreRef} className="relative shrink-0">
-            <button type="button" aria-label="채팅 더보기" aria-expanded={moreOpen} aria-controls="chat-header-more" onClick={() => setMoreOpen((open) => !open)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-muted">
-              <MoreHorizontal className="h-5 w-5" aria-hidden="true" />
-            </button>
-            {moreOpen && (
-              <div id="chat-header-more" className="absolute right-0 top-full z-50 mt-1 flex max-w-[calc(100vw-1.5rem)] flex-col gap-2 rounded-lg border border-border bg-popover p-3 shadow-lg">
-                <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
-                <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
-                {voiceButton}
-              </div>
-            )}
-          </div>
+          <div className="shrink-0">{props.leading}</div>
         </div>
-      ) : !(props.mobileSimple && compact) ? (
-        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-4 py-2">
-          <div className="flex items-center gap-2">
-            <SessionPill
-              sessionId={sessionId}
-            />
-            <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
-            <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
-          </div>
-          <div className="flex min-w-0 items-center gap-2"><ChatCurrentProject /><NowSpeakButton />{voiceButton}</div>
-        </div>
-      ) : null}
-      {!(props.mobileSimple && compact) && <details className="shrink-0 border-b border-border px-3 py-1 text-xs text-muted-foreground">
-        <summary className="cursor-pointer select-none">자세히</summary>
-        <SeatsNowStrip />
-        <ChatHud />
-      </details>}
+      )}
       {props.mobileSimple && compact && (approvalCount + decisionCount > 0) && (
         <div className="shrink-0 px-3 py-1.5">
           <button type="button" aria-expanded={actionsOpen} aria-controls="chat-mobile-actions" onClick={() => setActionsOpen((open) => !open)} className="rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium">
@@ -1436,9 +1269,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       {/* PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M4 — HUD strip.
           Empty-state renders nothing, so this row is invisible until the
           daemon mirror (M3) pushes its first segment. */}
-      {/* Phase 3 (voice 일원화) — relative + flex column wrapper 가
-          VoiceOverlay 의 absolute positioning 컨텍스트 + ChatHistory 의
-          flex-1 sizing 을 동시에 만족. voice 활성 시 overlay 가 fade-in. */}
       <div className="relative flex flex-1 min-h-0 flex-col">
         <ChatHistory messages={messages} pending={pending} mobileSimple={!!(props.mobileSimple && compact)} />
         <MemberProposalCard api={memberBoardApi} />
@@ -1470,23 +1300,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             </button>
           </div>
         )}
-        <VoiceOverlay
-          active={voice.active}
-          phase={voice.phase}
-          errorMsg={voice.errorMsg}
-          onToggle={() => void voice.toggle()}
-          ttsSupported={voiceTts.supported}
-          ttsMuted={ttsMuted}
-          onTtsToggle={() => setTtsMuted((m) => !m)}
-          onInterrupt={() => {
-            // BI-1 manual barge-in (Phase D · 2026-05-09) — local TTS
-            // playback cancel + UPSTREAM_INTERRUPT to daemon. Also clear
-            // the chat-side voiceTts queue so a sentence-stream that
-            // started rendering doesn't keep playing.
-            try { voiceTts.cancel(); } catch { /* swallow */ }
-            voice.interrupt();
-          }}
-        />
       </div>
       {pending && abortController && (
         <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border bg-muted/30 px-4 py-1.5 text-xs">
@@ -1512,14 +1325,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         attachments={pendingAttachments}
         onAttached={handleAttached}
         onRemoveAttachment={handleRemoveAttachment}
-        voice={{
-          active: voice.active,
-          phase: voice.phase,
-          dotColor: VOICE_DOT_COLOR[voice.phase],
-          phaseLabel: VOICE_PHASE_LABEL[voice.phase],
-          disabled: !voiceConfigured,
-          onToggle: () => void voice.toggle(),
-        }}
         onListFiles={acpForAsk && sessionId
           ? async (query) => {
               // PWA Phase 2·A — daemon ACP `elanous/fs/list` 호출.

@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/demo-1114-root-run.ts",
+  "reason": "Retire candidate: the 11-14 KAIST demo root-run driver (scripts/demo1114-root-run.ts). One-off for that demo record; not a reusable device."
+}

@@ -50,7 +50,7 @@ function safeFilePart(value: string): string {
 }
 
 function resultFileLabel(workspaceDir: string, result: ClassicSidetabPairOutcome): string {
-  if (!result.path) return '없음';
+  if (!result.path) return 'none';
   const rel = relative(workspaceDir, result.path);
   return rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`) ? rel : basename(result.path);
 }
@@ -69,20 +69,20 @@ function buildPairSynthesis(
   const table = rows.map(({ agent, job, result }) => {
     const accepted = result.ok && Boolean(result.content?.trim());
     const decision = accepted
-      ? '채택 — 별도 기여로 보존; 두 결과 간 우열을 임의 판정하지 않음'
-      : `미채택 — ${result.error ?? (result.ok ? '빈 결과' : '실패')}`;
+      ? 'Adopted — kept as its own contribution; no ranking between the two results'
+      : `Not adopted — ${result.error ?? (result.ok ? 'empty result' : 'failed')}`;
     const task = job.mission.length > 240 ? `${job.mission.slice(0, 240)}…` : job.mission;
-    return `| ${cell(agent)} | ${cell(task)} | ${cell(resultFileLabel(job.workspaceDir, result))} | ${accepted ? '성공' : '실패/빈 결과'} | ${cell(decision)} |`;
+    return `| ${cell(agent)} | ${cell(task)} | ${cell(resultFileLabel(job.workspaceDir, result))} | ${accepted ? 'ok' : 'failed/empty'} | ${cell(decision)} |`;
   }).join('\n');
   const contributions = rows.flatMap(({ agent, result }) => {
     const content = result.ok ? result.content?.trim() : '';
     if (!content) return [];
-    return [`## ${agent} 기여`, redactMissionResultPath(content, result.path)];
+    return [`## ${agent} contribution`, redactMissionResultPath(content, result.path)];
   });
   const failedCandidates = rows.flatMap(({ agent, result }) => {
     if (result.ok) return [];
     const block = preservedFailedCandidateBlock(result.content);
-    return block ? [`## ${agent} 실패 결과의 후보 패치 (보존만 · 병합 대상 아님)`, block] : [];
+    return block ? [`## ${agent} failed-result candidate patch (kept only · not a merge target)`, block] : [];
   });
   const patchSection = [
     '## Isolated candidate patch reconciliation', '',
@@ -101,10 +101,10 @@ function buildPairSynthesis(
     '# Codex + Claude mission pair synthesis', '',
     `- Codex mission: ${pair.codex.missionId ?? 'unavailable'}`,
     `- Claude mission: ${pair.claude.missionId ?? 'unavailable'}`, '',
-    '## 비교·채택 표', '',
-    '| 손 | 맡은 작업 | 결과 파일 | 판정 | 채택 근거 |',
+    '## Comparison and adoption', '',
+    '| Hand | Task | Result file | Verdict | Adoption basis |',
     '|---|---|---|---|---|', table, '',
-    '채택 기준: 성공하고 비어 있지 않은 결과를 각자 독립 기여로 보존한다. 두 손의 답이 서로 다른 작업 분담에서 나온 경우 품질 순위를 추정하지 않으며, 실패·빈 결과는 채택하지 않고 사유를 남긴다.', '',
+    'Adoption rule: a successful, non-empty result is kept as its own contribution. When the two hands answered different shares of the work, do not invent a quality ranking. Failed or empty results are not adopted, and the reason is recorded.', '',
     ...patchSection,
     ...contributions.flatMap((section) => [section, '']),
     ...failedCandidates.flatMap((section) => [section, '']),

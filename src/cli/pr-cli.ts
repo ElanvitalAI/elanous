@@ -89,6 +89,7 @@ import { createMacrophageRuntime } from '../release-loop/macrophage-heal-node.js
 import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, sharedCensusDiffCache, type Seat } from '../pr-tool/census.js';
 import { guardHotspotStart, hotspotApprovalCommentId, type HotspotApproval, type HotspotApprovalSource } from './open-guard.js';
 import { recordHotspotStartForecast, type HotspotStartForecastRow } from './hotspot-start-forecast.js';
+import { registerRestackPlanCommand } from './pr-land-restack.js';
 
 export { branchLineageSlug, findSiblingPrs };
 
@@ -3306,6 +3307,7 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
       prToolOut.log(JSON.stringify(result));
       if (result.status === 'unknown') prToolExit(1);
     });
+  registerRestackPlanCommand(pr, { out: prToolOut, setExitCode: prToolExit });
   pr.command('open-guard')
     .description('착수·새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
     .option('--cwd <path>', '작업 트리 경로')

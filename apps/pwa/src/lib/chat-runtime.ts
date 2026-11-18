@@ -1340,8 +1340,9 @@ export function runChatTurnObserver(
  *  Stop button / Esc shortcut both wire here. */
 export interface RunChatTurnAcpHandlers {
   signal?: AbortSignal;
-  /** Cumulative assistant text per delta (chat REST `onPartial` mirror). */
-  onPartial?: (full: string) => void;
+  /** Cumulative assistant text per delta (chat REST `onPartial` mirror). `segmentStart`: where the text after the
+   *  last tool call begins — the part a reader is watching being written (WEB-CHAT-ONE-SESSION-STABLE stream). */
+  onPartial?: (full: string, segmentStart?: number) => void;
   /** Block-list snapshot after every text-delta / image / tool_use event. */
   onPartialBlocks?: (blocks: ChatBlock[]) => void;
   /** P-3 §6.9 multi-part user content (image / resource_link blocks). When
@@ -1421,7 +1422,7 @@ export async function runChatTurnAcp(
         } else {
           blocks[textIdx] = { kind: 'text', text: cumulativeText };
         }
-        handlers.onPartial?.(cumulativeText);
+        handlers.onPartial?.(cumulativeText, finalTextStart);
         handlers.onPartialBlocks?.(snapshot());
       } else if (
         content?.type === 'image'

@@ -56,12 +56,12 @@ export async function handleNextTuiTermSlash(args: string[], context: NextTuiTer
     const sessions = await context.sessions.list();
     const live = sessions.filter(isLive).length;
     const exited = sessions.length - live;
-    context.chatLines.push(`  Terminal sessions: ${live} live · ${exited} exited.`);
+    context.chatLines.push(`  Terminal sessions: live ${live} · exited ${exited}`);
   } else if (command === 'list' || command === 'matrix') {
     const sessions = await context.sessions.list();
     context.chatLines.push(...(command === 'list' ? sessionLines(sessions) : matrixLines(sessions)));
   } else {
-    context.chatLines.push(`  Unsupported /term command in Next TUI: ${command}. Try /term help.`);
+    context.chatLines.push(`  Unsupported /term command in Next TUI: ${command} · see /term help`);
   }
   context.setChatScrollOffset(-1);
 }

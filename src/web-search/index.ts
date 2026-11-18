@@ -17,8 +17,12 @@ import {
   type WebSearchProvider,
   type WebSearchQuery,
   type WebSearchResult,
-  WebSearchUnavailableError,
+  WebSearchUnavailableError, webSearchProviderReady,
 } from './provider.js';
+import {
+  type SearchProviderAvailability,
+  SEARCH_PROVIDER_ROUTES, probeSearchProviderAvailability, probeSearchProviderReadiness,
+} from './routing.js';
 
 export type { WebSearchProvider, WebSearchQuery, WebSearchResult, WebSearchHit } from './provider.js';
 export { WebSearchUnavailableError } from './provider.js';
@@ -31,11 +35,11 @@ const providers: WebSearchProvider[] = [];
 let includeEnvironmentResearchExa = true;
 
 function registerBuiltins(): void {
-  // General web cascade is Exa → Firecrawl; Grok is reserved for explicit X/Twitter intent.
+  // Firecrawl is the configured general default; DDG is the last keyless fallback. Grok stays explicit.
   // Other providers remain registered for explicit provider selection only.
   // Provider registration snapshots config at module load; changing these gates requires a process restart.
-  providers.push(buildExaWebSearchProvider());
   if (isPaidWebSearchEnabled('firecrawl')) providers.push(buildFirecrawlWebSearchProvider());
+  providers.push(buildExaWebSearchProvider());
   if (isTavilySearchEnabled()) providers.push(buildTavilyWebSearchProvider());
   providers.push(buildGrokSubscriptionWebSearchProvider());
   if (isPaidWebSearchEnabled('grokApi')) providers.push(buildGrokWebSearchProvider({ id: 'grok-api' }));
@@ -71,12 +75,18 @@ export async function searchWeb(
   opts: { providerId?: string; signal?: AbortSignal } = {},
 ): Promise<WebSearchResult> {
   const xIntent = !opts.providerId && wantsXSearch(q.query);
+  const explicitGrok = opts.providerId === 'grok' || opts.providerId === 'grok-api' || (!opts.providerId && wantsGrokSearch(q.query));
+  // 출처: #37946 — ordinary (non-Grok) web search keeps one 15s caller-facing deadline.
+  const ordinaryDeadlineMs = 15_000;
+  const deadlineAt = explicitGrok ? undefined : Date.now() + ordinaryDeadlineMs;
+  const searchSignal = explicitGrok ? opts.signal : opts.signal
+    ? AbortSignal.any([opts.signal, AbortSignal.timeout(ordinaryDeadlineMs)]) : AbortSignal.timeout(ordinaryDeadlineMs);
   const grokIntent = !opts.providerId && wantsGrokSearch(q.query);
   const candidates = opts.providerId
     ? providers.filter(p => p.id === opts.providerId || (opts.providerId === 'grok' && p.id === 'grok-api'))
-    : providers.filter(p => p.available() && (grokIntent
+    : providers.filter(p => (grokIntent
       ? p.id === 'grok' || p.id === 'grok-api' || p.id === 'exa' || p.id === 'firecrawl'
-      : p.id === 'exa' || p.id === 'firecrawl'));
+      : ['firecrawl', 'exa', 'tavily', 'ddg-free'].includes(p.id)));
   if (grokIntent) {
     const grokIndex = candidates.findIndex(p => p.id === 'grok' || p.id === 'grok-api');
     if (grokIndex > 0) candidates.unshift(...candidates.splice(grokIndex, 1));
@@ -93,13 +103,15 @@ export async function searchWeb(
     );
   }
 
+  const readiness = await Promise.all(candidates.map(provider => webSearchProviderReady(provider, searchSignal)));
+  const readyCandidates = candidates.filter((_provider, index) => readiness[index]);
+  searchSignal?.throwIfAborted();
   const tried: string[] = [];
   const reasons: string[] = [];
-  for (const provider of candidates) {
-    if (!provider.available()) continue;
+  for (const [index, provider] of readyCandidates.entries()) {
     tried.push(provider.id);
     try {
-      const result = await provider.search(q, opts.signal);
+      const result = await provider.search(q, attemptSignal(searchSignal, deadlineAt, readyCandidates.length - index));
       if (!xIntent) return result;
       if (provider.id === 'grok' || provider.id === 'grok-api') {
         const isXUrl = (raw: string): boolean => {
@@ -127,6 +139,15 @@ export async function searchWeb(
   throw new WebSearchUnavailableError(tried, reasons);
 }
 
+/** Split what is left of the shared deadline evenly over the providers still queued, so a stalled
+ *  earlier provider (e.g. Firecrawl) cannot starve the later fallbacks (DDG last). The final provider
+ *  gets all remaining time; explicit Grok searches carry no shared deadline and are not sliced. */
+function attemptSignal(searchSignal: AbortSignal | undefined, deadlineAt: number | undefined, providersLeft: number): AbortSignal | undefined {
+  if (!searchSignal || deadlineAt === undefined || providersLeft <= 1) return searchSignal;
+  const share = Math.floor((deadlineAt - Date.now()) / providersLeft);
+  return share > 0 ? AbortSignal.any([searchSignal, AbortSignal.timeout(share)]) : searchSignal;
+}
+
 /** Test-only reset — clears every registered provider and normally re-runs
  *  built-in registration. Pass false to isolate tests from credential-backed
  *  providers. Kept separate from the public API. */
@@ -152,4 +173,49 @@ export function getAvailableResearchWebSearchProviders(): WebSearchProvider[] {
   if (!includeEnvironmentResearchExa) return available;
   const exa = buildExaWebSearchProvider();
   return exa.available() ? [...available, exa] : available;
+}
+
+
+/** Registered provider ids that only an async typed-store check can confirm (sync `available()` says no). */
+export function webSearchProvidersPendingAsyncReadiness(): string[] {
+  return providers.filter(p => p.availableAsync && !p.available()).map(p => p.id);
+}
+
+/** Research preflight resolves typed stores before deciding which services can run. */
+export async function getAvailableResearchWebSearchProvidersAsync(signal?: AbortSignal, timeoutMs = 15_000): Promise<WebSearchProvider[]> {
+  return (await probeResearchWebSearchProvidersAsync(signal, timeoutMs)).providers;
+}
+
+/** Structured config gates for routed providers that the registry only registers when enabled. */
+function routedProviderEnabled(providerId: string): boolean | undefined {
+  if (providerId === 'tavily') return isTavilySearchEnabled();
+  if (providerId === 'firecrawl') return isPaidWebSearchEnabled('firecrawl');
+  return undefined;
+}
+
+/** SEARCH-PROVIDER-TOPIC-BENCH-ROUTING ① — one readiness pass yields both the ready snapshot (unchanged contract of
+ * getAvailableResearchWebSearchProvidersAsync) and a per-provider availability with a fixed reason for every routed id. */
+export async function probeResearchWebSearchProvidersAsync(signal?: AbortSignal, timeoutMs = 15_000): Promise<{
+  providers: WebSearchProvider[];
+  availability: SearchProviderAvailability[];
+}> {
+  const snapshot = [...providers];
+  if (includeEnvironmentResearchExa && !snapshot.some(provider => provider.id === 'exa')) snapshot.push(buildExaWebSearchProvider());
+  const probed = await Promise.all(snapshot.map(provider => probeSearchProviderReadiness(provider, signal, timeoutMs)));
+  signal?.throwIfAborted();
+  const ready = probed.map(entry => entry.available);
+  debug.log('web-search', 'service-preflight', { services: snapshot.map((provider, index) => ({
+    id: provider.id, credentialReady: ready[index], quota: 'unmeasured',
+  })) });
+  const routedIds = [...new Set(Object.values(SEARCH_PROVIDER_ROUTES).flat())];
+  const availability = await probeSearchProviderAvailability(routedIds, {
+    registered: [], isEnabled: routedProviderEnabled,
+  });
+  return {
+    providers: snapshot.filter((_provider, index) => ready[index]),
+    availability: [
+      ...probed,
+      ...availability.filter(entry => !probed.some(known => known.provider === entry.provider)),
+    ],
+  };
 }

@@ -10,6 +10,8 @@ import {
   buildUniversalPreamble,
   loadProjectAnchor,
   loadProjectAnchorWithMeta,
+  repositoryAgentsFallback,
+  setRepositoryAgentsShowForTest,
   resetUniversalPreambleCache,
   globalAnchorPath,
   setGlobalAnchorPathForTest,
@@ -231,6 +233,32 @@ describe('관측·캐시', () => {
       ['root', join(root, 'AGENTS.md'), false],
       ['local', join(root, 'AGENTS.local.md'), false],
     ]);
+  });
+
+  test('git 밖 자리의 0바이트 AGENTS.md 는 저장소 정본으로 대체된다', () => {
+    const seat = join(base, 'seats', 'REL');
+    mkdirSync(join(seat, '.git'), { recursive: true });
+    writeFileSync(join(seat, 'AGENTS.md'), '');
+    setRepositoryAgentsShowForTest(() => '# 저장소 정본\n');
+    try {
+      const shown = repositoryAgentsFallback(seat);
+      expect(shown).toContain('저장소 정본');
+      const loaded = loadProjectAnchorWithMeta(seat);
+      expect(loaded.content).toContain('저장소 정본');
+      expect(loaded.content).not.toMatch(/=== Project canonical collaboration guide \(AGENTS\.md\) ===\n\n=== end/);
+    } finally {
+      setRepositoryAgentsShowForTest(null);
+    }
+  });
+
+  test('자리 밖이거나 내용이 있으면 대체하지 않는다', () => {
+    writeFileSync(join(root, 'AGENTS.md'), '');
+    expect(repositoryAgentsFallback(root, { show: () => '# 저장소\n' })).toBeNull();
+    const seat = join(base, 'seats', 'JUD');
+    mkdirSync(seat, { recursive: true });
+    writeFileSync(join(seat, 'AGENTS.md'), '# 자리 고유\n');
+    expect(loadProjectAnchorWithMeta(seat).content).toContain('자리 고유');
+    expect(loadProjectAnchorWithMeta(seat).content).not.toContain('저장소 정본');
   });
 
   test('캐시 — 전역 파일을 새로 만들면 다음 조회에 반영된다', () => {

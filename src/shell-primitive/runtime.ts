@@ -27,6 +27,9 @@ import { getSessionCwd } from '../session/working-dir.js';
 import { classifyDestructive, type GuardianFinding } from '../ask-user-question/guardian.js';
 import { detectSandboxFailure } from './escalation-prompt.js';
 import {
+  SHELL_KILL_GRACE_MS, SHELL_MIN_TIMEOUT_MS, createShellWatchdog, reportShellWatchdog, resolveShellStallMs,
+} from '../tool-runtime/shell-watchdog.js';
+import {
   DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, SHELL_MAX_OUTPUT,
   type ShellRequest, type ShellResult, type ShellApprover,
   type ApprovalDecision,
@@ -46,7 +49,7 @@ export function _getShellApproverForTesting(): ShellApprover | null {
   return approverRef;
 }
 
-const KILL_ESCALATE_MS = 2_000;
+const KILL_ESCALATE_MS = SHELL_KILL_GRACE_MS;
 
 export async function runShell(req: ShellRequest): Promise<ShellResult> {
   if (!Array.isArray(req.command) || req.command.length === 0) {
@@ -144,7 +147,7 @@ export async function runShell(req: ShellRequest): Promise<ShellResult> {
   // ─── Spawn ──────────────────────────────────────────────────
   const started = Date.now();
   const timeoutMs = Math.min(
-    Math.max(1_000, req.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+    Math.max(SHELL_MIN_TIMEOUT_MS, req.timeoutMs ?? DEFAULT_TIMEOUT_MS),
     MAX_TIMEOUT_MS,
   );
   const maxOutput = req.maxOutputChars ?? SHELL_MAX_OUTPUT;
@@ -293,14 +296,28 @@ function collectOutput(
       }
     };
 
-    child.stdout?.on('data', (c: Buffer) => append('stdout', c.toString('utf8')));
-    child.stderr?.on('data', (c: Buffer) => append('stderr', c.toString('utf8')));
-
-    const timer = setTimeout(() => {
-      outcome = 'timeout';
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ok */ } }, KILL_ESCALATE_MS).unref();
-    }, timeoutMs);
+    // A201 — wall-clock timeout ⊕ no-output stall line. Kills the exact child; a stall
+    // reports outcome 'timeout' (existing union) with the structured `watchdog` field.
+    const watchdog = createShellWatchdog({
+      tool: 'RunShell',
+      timeoutMs,
+      stallMs: resolveShellStallMs(),
+      onFire: (fired) => {
+        if (settled) return;
+        outcome = 'timeout';
+        reportShellWatchdog(fired, { pid: child.pid ?? null });
+        try { child.kill('SIGTERM'); } catch { /* already gone */ }
+        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ok */ } }, KILL_ESCALATE_MS).unref();
+        // An escaped grandchild can hold the pipe open past the kill; force the result.
+        setTimeout(() => {
+          if (settled) return;
+          try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* closed */ }
+          finish(null);
+        }, KILL_ESCALATE_MS * 2).unref();
+      },
+    });
+    child.stdout?.on('data', (c: Buffer) => { watchdog.touch(); append('stdout', c.toString('utf8')); });
+    child.stderr?.on('data', (c: Buffer) => { watchdog.touch(); append('stderr', c.toString('utf8')); });
 
     const onAbort = () => {
       if (outcome === 'exit') outcome = 'aborted';
@@ -328,9 +345,10 @@ function collectOutput(
     const finish = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      watchdog.stop();
       outerDisposer?.();
       resolve({
+        ...(watchdog.fired ? { watchdog: watchdog.fired } : {}),
         exitCode,
         stdout,
         stderr,

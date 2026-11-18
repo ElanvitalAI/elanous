@@ -12,6 +12,6 @@ describe('Next TUI compact command surface', () => {
 
   test('keeps the compact command status copy available from the lightweight module', () => {
     expect(COMPACT_BUSY_STATUS).toContain('/compact');
-    expect(COMPACT_NO_SESSION_STATUS).toContain('압축');
+    expect(COMPACT_NO_SESSION_STATUS).toContain('compact');
   });
 });

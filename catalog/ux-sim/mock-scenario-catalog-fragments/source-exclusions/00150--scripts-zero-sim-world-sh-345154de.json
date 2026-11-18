@@ -1,0 +1,4 @@
+{
+  "path": "scripts/zero-sim-world.sh",
+  "reason": "Orchestrates registered ux-sim fakes and zero-* tools into one onboarding check; the fakes it calls are the devices."
+}

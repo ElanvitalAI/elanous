@@ -5,6 +5,7 @@ import { dirname, join, relative, sep } from 'node:path';
 /** Bun omits symlinks. Materialize the active generation only in a private archive. */
 export function packPwaOutput(root: string, archive: string): void {
   const pwa = realpathSync(join(root, 'apps/pwa'));
+  if (!existsSync(join(pwa, 'out'))) throw new Error('PWA build missing: apps/pwa/out/index.html');
   const source = realpathSync(join(pwa, 'out'));
   const inside = relative(pwa, source);
   if (inside === '..' || inside.startsWith('..' + sep) || inside.startsWith(sep)) throw new Error('PWA output escapes package');

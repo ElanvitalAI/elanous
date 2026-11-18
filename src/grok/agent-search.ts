@@ -23,6 +23,7 @@
 //
 // Reference: https://docs.x.ai/docs/guides/tools/overview
 
+import { llmNetworkSend } from '../session-runtime/llm-call-gateway.js';
 import { getGrokApiKey, refreshKeyFromCache } from '../config.js';
 import { resolveFreshGrokCredential } from './credential.js';
 import { debug } from '../debug/log.js';
@@ -122,7 +123,7 @@ export async function grokAgentSearch(
     const endpoint = baseUrl
       ? `${baseUrl.replace(/\/$/, '').replace(/\/responses$/, '')}/responses`
       : GROK_RESPONSES_URL;
-    res = await fetchImpl(endpoint, {
+    const init: RequestInit = {
       method: 'POST',
       signal: ac.signal,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}`, ...credential?.headers, ...opts.headers },
@@ -132,7 +133,10 @@ export async function grokAgentSearch(
         tools,
         max_output_tokens: opts.maxOutputTokens ?? 4000,
       }),
-    });
+    };
+    res = await llmNetworkSend(endpoint, init,
+      { provider: 'grok', model, role: 'aux', requestedBy: 'grok.agent-search' },
+      () => fetchImpl(endpoint, init));
   } catch (err) {
     return { ok: false, status: 0, text: '', citations: [], error: `threw: ${err instanceof Error ? err.message : String(err)}` };
   } finally {

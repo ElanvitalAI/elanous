@@ -134,8 +134,20 @@ export function ensureSeatLocalInstructions(cwd: string, deps: SeatLocalDeps = {
       // ⛔ «링크 자체»의 존재로 판정한다(lstat) — 대상이 없는 링크도 «있음»이다(existsSync 는 그것을 «없음»으로 본다).
       if (entryPresent(existing)) {
         // ⛔ 덮어쓰기 0 — 제1원칙 절이 없으면 «제안»만 한다(읽을 수 없는 링크면 제안도 안 한다).
+        // 0바이트는 사람 문면이 아니다. 그 파일만 제1원칙 템플릿으로 채운다.
         let body = '';
-        try { body = readFileSync(existing, 'utf8'); } catch { body = '제1원칙'; }
+        let readable = true;
+        try { body = readFileSync(existing, 'utf8'); } catch { body = '제1원칙'; readable = false; }
+        if (readable && body.trim().length === 0 && name === LOCAL_INSTRUCTIONS_FILE) {
+          const home = deps.home ?? homedir();
+          const readmeHead = readHead(join(home, 'elanous-hq', 'seat-state', seatDir.seat, 'README.md'), README_HEAD_MAX);
+          const agentsPath = findAncestorFile(seatDir.dir, 'AGENTS.md');
+          const principle = agentsPath ? extractFirstPrinciple(readFileSync(agentsPath, 'utf8')) : null;
+          const text = renderLocalInstructionsTemplate({ seat: seatDir.seat, readmeHead, principle, at: (deps.now?.() ?? new Date()).toISOString() });
+          writeFileSync(existing, text);
+          debug.log('tui.local-instructions', 'empty-filled', { seat: seatDir.seat, path: existing, chars: text.length, hasPrinciple: principle !== null });
+          return { status: 'created', path: existing };
+        }
         const missingPrinciple = !/제1원칙/.test(body);
         debug.log('tui.local-instructions', 'create-skipped', { seat: seatDir.seat, path: existing, reason: 'exists', missingPrinciple });
         return { status: 'exists', path: existing, missingPrinciple };

@@ -226,7 +226,7 @@ export function remoteParentArgs(args: readonly string[], podPool?: string): str
   // ordering cannot accidentally re-enable auto-merge on the remote host.
   const valueOptions = new Set([
     '--config-dir', '--test-state-dir', '--base', '--target', '--correlation', '--seat', '--run-priority', '--goal-type', '--child-llm-provider',
-    '--child-llm-model', '--child-llm-effort', '--substrate', '--pod-pool', '--pod-memory', '--after', '--source',
+    '--child-llm-model', '--child-llm-effort', '--substrate', '--pod-pool', '--pod-memory', '--after', '--source', '--image-digest',
     '--repair-commit-only', '--bench', '--author-grade', '--move-id', '--goal-file', '--concurrency', '--resume',
     '--max-tasks', '--supervise-rounds', '--pod-source', '--pod-account', '--pod-pass-env', '--bench-arms',
   ]);

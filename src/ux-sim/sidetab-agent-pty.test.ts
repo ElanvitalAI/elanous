@@ -51,6 +51,8 @@ test('fake codex, claude and hermes PTYs launch in sidetab, receive input and ex
     spawnSideAgent: async (agent) => { selectedId = controller.spawnSideAgent(agent) ?? ''; return selectedId; },
     sendSelectedAgent: async (input) => controller.sendSideAgent(row(), input),
     readSelectedAgent: async () => controller.readSideAgent(row()),
+    sendSelectedAgentKeys: async (names) => controller.sendSideAgentKeys(row(), names),
+    selectedAgentStatus: async () => controller.sideAgentStatus(row()),
     bindWorkspaceSelected: async () => false,
     submitWorkspace: async () => ({ sent: false }),
     broadcastWorkspace: async () => ({ sent: 0, total: 0, outcome: 'rejected' }),
@@ -79,7 +81,7 @@ test('fake codex, claude and hermes PTYs launch in sidetab, receive input and ex
     expect(await host.sendSelectedAgent('\0')).toBe(false);
     sessions.get(selectedId)!.state = 'exited';
     expect(await host.sendSelectedAgent('after exit')).toBe(false);
-    expect(statuses.some((status) => status.includes('입력 전송'))).toBe(true);
+    expect(statuses.some((status) => status.includes('Input sent to selected agent'))).toBe(true);
   } finally { controller.close(); }
 });
 

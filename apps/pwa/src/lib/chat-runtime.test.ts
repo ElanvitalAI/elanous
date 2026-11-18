@@ -606,6 +606,31 @@ describe('runChatTurnAcp — CV-1b chat self-turn ACP path', () => {
     expect(message.incomplete).toBeUndefined();
   });
 
+  it('WEB-CHAT-ONE-SESSION-STABLE: onPartial carries the live segment start, and a tool_call moves it to the new segment', async () => {
+    const handle = makeProgrammableAcp();
+    handle.programNext('session/prompt', [
+      chunkUpdate('sess-live', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '파일을 ' } }),
+      chunkUpdate('sess-live', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '찾아볼게요.' } }),
+      chunkUpdate('sess-live', { sessionUpdate: 'tool_call', toolCallId: 'ls', title: 'list_files' }),
+      chunkUpdate('sess-live', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '세 개' } }),
+      chunkUpdate('sess-live', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' 있습니다.' } }),
+    ], { stopReason: 'end_turn' });
+    const partials: Array<[string, number | undefined]> = [];
+    const { message } = await runChatTurnAcp(handle.acp, '파일 몇 개?', makeAcpCtx('sess-live'), {
+      onPartial: (full, segmentStart) => partials.push([full, segmentStart]),
+    });
+    const narration = '파일을 찾아볼게요.';
+    expect(partials).toEqual([
+      ['파일을 ', 0],
+      [narration, 0],
+      // After the tool call the live segment starts where the narration ended.
+      [`${narration}세 개`, narration.length],
+      [`${narration}세 개 있습니다.`, narration.length],
+    ]);
+    // The finished message keeps the same split.
+    expect(message.finalTextStart).toBe(narration.length);
+  });
+
   it('dispatches session/prompt with sessionId + text prompt block, accumulates text deltas via onPartial', async () => {
     const handle = makeProgrammableAcp();
     handle.programNext(

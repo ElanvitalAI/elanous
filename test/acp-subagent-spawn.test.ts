@@ -15,9 +15,11 @@ import {
 } from '../src/acp/dual-role-manager.js';
 import {
   dispatchAcpSessionSpawnSub,
+  dispatchAcpSessionSend,
   dispatchAcpSessionCreate,
   buildAcpSessionSpawnSubTool,
 } from '../src/skills/tools/acp-session.js';
+import { debug } from '../src/debug/log.js';
 
 // Minimal AcpAgent shape the DualRoleManager touches during
 // create/send/close. The real class has many more methods we don't
@@ -248,6 +250,75 @@ describe('dispatchAcpSessionCreate with parentSessionId', () => {
     const root = await dispatchAcpSessionCreate({ brand: 'claude', parentSessionId: '' });
     expect(root.parentSessionId).toBeUndefined();
     expect(root.chainDepth).toBe(0);
+  });
+});
+
+describe('ACP client prompt call ledger', () => {
+  beforeEach(() => globalDualRoleManager().__clearForTest());
+  afterEach(() => {
+    globalDualRoleManager().__setAgentFactoryForTest(null);
+    globalDualRoleManager().__clearForTest();
+  });
+
+  test('one ACP prompt row per Send/SpawnSub, with peer model and child linkage, no synthetic HTTP host', async () => {
+    const m = globalDualRoleManager();
+    m.__setAgentFactoryForTest(async () => ({
+      ...makeFakeAgent(),
+      getSessionModels: () => ({ currentModelId: 'claude-sonnet-4', availableModels: [] }),
+    }) as any);
+    const root = await dispatchAcpSessionCreate({ brand: 'claude' });
+    const child = await dispatchAcpSessionCreate({ brand: 'claude', parentSessionId: root.sessionId });
+    const secret = 'private prompt sk-test-do-not-log';
+    await dispatchAcpSessionSend({ sessionId: child.sessionId, message: secret });
+    const oneShot = await dispatchAcpSessionSpawnSub({
+      parentSessionId: root.sessionId, brand: 'claude', initialMessage: secret,
+    });
+    for (const sessionId of [child.sessionId, oneShot.sessionId]) {
+      const rows = debug.events(500).filter(e => e.category === 'llm.delegate'
+        && e.event === 'prompt' && (e.data as any)?.sessionId === sessionId);
+      expect(rows).toHaveLength(1);
+      expect(debug.events(500).filter(e => e.category === 'llm.call'
+        && (e.data as any)?.sessionId === sessionId)).toHaveLength(0);
+      expect(rows[0]?.data).toMatchObject({
+        provider: 'claude', model: 'claude-sonnet-4', host: null,
+        sessionId, parentSessionId: root.sessionId, role: 'child',
+        requestedBy: 'acp.session/prompt', selectionSource: 'session', billing: 'subscription',
+      });
+      expect(JSON.stringify(rows[0])).not.toContain(secret);
+    }
+  });
+
+  test('unknown peer model stays null and failed ACP prompt still counts once', async () => {
+    const m = globalDualRoleManager();
+    m.__setAgentFactoryForTest(async () => makeFakeAgent({
+      promptImpl: async () => { throw new Error('ACP prompt failed'); },
+    }) as any);
+    const root = await dispatchAcpSessionCreate({ brand: 'claude' });
+    const child = await dispatchAcpSessionCreate({ brand: 'claude', parentSessionId: root.sessionId });
+    await expect(dispatchAcpSessionSend({ sessionId: child.sessionId, message: 'private failure prompt' }))
+      .rejects.toThrow('ACP prompt failed');
+    const rows = debug.events(500).filter(e => e.category === 'llm.delegate'
+      && e.event === 'prompt' && (e.data as any)?.sessionId === child.sessionId);
+    expect(rows).toHaveLength(1);
+    expect(debug.events(500).filter(e => e.category === 'llm.call'
+      && (e.data as any)?.sessionId === child.sessionId)).toHaveLength(0);
+    expect(rows[0]?.data).toMatchObject({ model: null, host: null, selectionSource: 'explicit' });
+    expect(JSON.stringify(rows[0])).not.toContain('private failure prompt');
+  });
+  test('peer model probe failure is fail-soft: prompt still dispatches with unknown model', async () => {
+    const m = globalDualRoleManager();
+    const agent = { ...makeFakeAgent(), getSessionModels: () => { throw new Error('model probe unavailable'); } };
+    m.__setAgentFactoryForTest(async () => agent as any);
+    const child = await dispatchAcpSessionCreate({ brand: 'claude' });
+    await dispatchAcpSessionSend({ sessionId: child.sessionId, message: 'PRIVATE_PROBE_PROMPT' });
+    expect(agent.prompt).toHaveBeenCalledTimes(1);
+    const rows = debug.events(500).filter(e => e.category === 'llm.delegate'
+      && e.event === 'prompt' && (e.data as any)?.sessionId === child.sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.data).toMatchObject({ model: null, host: null });
+    expect(JSON.stringify(rows[0])).not.toContain('PRIVATE_PROBE_PROMPT');
+    expect(debug.events(500).filter(e => e.category === 'llm.call'
+      && (e.data as any)?.sessionId === child.sessionId)).toHaveLength(0);
   });
 });
 

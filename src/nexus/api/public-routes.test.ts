@@ -31,3 +31,14 @@ test('deployment approval routes admit only exact UUIDv4 paths and methods', () 
   expect(isPublicRoute('GET', base + '/not-a-uuid', context)).toBe(false);
   expect(isPublicRoute('GET', base + '/11111111-1111-1111-8111-111111111111', context)).toBe(false);
 });
+
+test('the member app-name routes are on the allowlist with exactly their methods, and only these two paths', () => {
+  const context = { setupMode: false };
+  expect(isPublicRoute('POST', '/v1/members/app-slot/name', context)).toBe(true);
+  expect(isPublicRoute('GET', '/v1/members/app-slot/name-check', context)).toBe(true);
+  for (const [method, path] of [['GET', '/v1/members/app-slot/name'], ['DELETE', '/v1/members/app-slot/name'], ['PUT', '/v1/members/app-slot/name'],
+    ['POST', '/v1/members/app-slot/name-check'], ['DELETE', '/v1/members/app-slot/name-check'], ['POST', '/v1/members/app-slot/name/extra'],
+    ['GET', '/v1/members/app-slot/name-checks'], ['POST', '/v1/members/app-slot/names']] as const) {
+    expect(isPublicRoute(method, path, context), `${method} ${path}`).toBe(false);
+  }
+});

@@ -2,6 +2,7 @@ import type { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { getUserConfig, reloadUserConfig } from '../user-config.js';
+import { withConfiguredWebSearch as withConfiguredWebSearchForSurface } from '../core-turn/configured-web-search.js';
 import { handleOnboardingRefusal, needsOnboarding, runOnboarding } from '../onboarding.js';
 import { runTurn, ensureCliSession, sessionBudget } from '../session/chat.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
@@ -100,6 +101,18 @@ function armAgentCliExitSafetyNet(): void {
   timer.unref();
 }
 
+/** CHAT-TOOLS-ENTRY-VIA-CORE-TURN (R2 0.3.28) — the same «ready» door as `chat` (`firstChatGate`): a non-TTY run whose
+ *  config already has a ready provider (`onboarding.ready`) runs even before detailed onboarding completes. Without it a
+ *  test universe set up unattended answered `chat` but refused `agent` with the setup wizard. */
+export function agentNeedsOnboarding(cfg: ReturnType<typeof getUserConfig>, isTTY: boolean): boolean {
+  if (!needsOnboarding(cfg)) return false;
+  if (!isTTY && cfg.onboarding.ready === true) {
+    debug.log('onboarding.first-chat', 'continue', { isTTY, outcome: 'already-ready', surface: 'agent' });
+    return false;
+  }
+  return true;
+}
+
 export function registerAgentCommands(program: Command): void {
   const agentCommand = program
   .command('agent')
@@ -138,7 +151,7 @@ export function registerAgentCommands(program: Command): void {
       } catch { /* diagnostics are best-effort */ }
     }
     const cfg = getUserConfig();
-    if (needsOnboarding(cfg)) {
+    if (agentNeedsOnboarding(cfg, process.stdin.isTTY === true)) {
       ui.info('No config yet — launching setup wizard first.');
       try {
         await runOnboarding();
@@ -551,6 +564,14 @@ export async function runChatTurnCli(opts: {
   // and adds Bash so the LLM can shell out for self-debugging.
   // Scheduler/plugin/runtime tools are deliberately excluded — they
   // depend on dashboard wiring that isn't available in the CLI.
+  // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (R2 0.3.28) — `chat --tools` / `agent` tool turns run through the single core turn
+  // (research route · grounding-first) like the daemon. Harness children, goal-loop runs, `ask` and purpose-built
+  // allowlisted surfaces keep their existing path.
+  const routeThroughCoreTurn = opts.enableTools === true && !harnessSpace && opts.goalLoop !== true
+    && opts.surface !== 'ask' && opts.allowedToolNames === undefined;
+  // Cost axis (rifle-not-tank): whether this tool turn paid a research question-plan model call, and how long it took.
+  // Logged after the turn as `chat.tools core-turn-route`. No new sentence classifier decides anything here.
+  const planCalls: Array<{ outcome: string; elapsedMs: number }> = [];
   let tools: ReturnType<typeof buildCliAgentTools> | undefined;
   let dispatchTool: ((name: string, args: Record<string, unknown>) => Promise<unknown>) | undefined;
   let enabledToolNames: string[] | undefined;
@@ -566,10 +587,13 @@ export async function runChatTurnCli(opts: {
       try { return await dispatch(); }
       finally { release(); }
     };
-    const built = buildCliAgentTools(opts.cfg, harnessSpace ? {
+    const cliTools = buildCliAgentTools(opts.cfg, harnessSpace ? {
       sessionId: session.id,
       emitFeedback: emitHarnessFeedbackProgress,
     } : undefined);   // ★ cfg 전달 → financeEnabled 시 finance 팩 노출(서피스 게이팅 정리)
+    // CHAT-TOOLS-ENTRY-VIA-CORE-TURN — the core turn's research route needs a web tool in the pool to decide on the
+    // structured route; add WebSearch when a search provider is configured (continuation-turn-runner.ts parity).
+    const built = routeThroughCoreTurn ? withConfiguredWebSearch(cliTools, opts.surface === 'agent' ? 'agent' : 'chat') : cliTools;
     tools = built;
     enabledToolNames = opts.allowedToolNames
       ? built.specs.filter(spec => opts.allowedToolNames!.includes(spec.name)).map(spec => spec.name)
@@ -658,9 +682,12 @@ export async function runChatTurnCli(opts: {
         segmentChunks.push(d);
         if (!opts.json && !opts.enableTools) process.stdout.write(d);
       },
+      // The core turn's citation guard rewrites the final answer (unfetched URLs dropped) — print that version.
+      onReplaceText: (fullText) => { segmentChunks = [fullText]; },
       tools: cliToolSpecs,
       dispatchTool,
       ...(opts.goalLoop ? { goalLoop: true } : {}),
+      ...(routeThroughCoreTurn ? { coreTurn: true, onResearchPlanSettled: (info: { outcome: string; elapsedMs: number }) => { planCalls.push(info); } } : {}),
       onToolCall: (call) => {
         // The next delta belongs to the next assistant message.
         sawToolCall = true;
@@ -695,6 +722,13 @@ export async function runChatTurnCli(opts: {
     throw err;
   } finally {
     if (opts.enableTools) process.removeListener('SIGINT', abortToolsOnSigint);
+    if (opts.enableTools) {
+      debug.log('chat.tools', 'core-turn-route', {
+        surface: opts.surface ?? 'chat', coreTurn: routeThroughCoreTurn,
+        planCalled: planCalls.length > 0,
+        ...(planCalls.length > 0 ? { planLatencyMs: planCalls.reduce((sum, call) => sum + call.elapsedMs, 0), planOutcome: planCalls.at(-1)!.outcome } : {}),
+      });
+    }
   }
   if (!sawToolCall && replyChunks.length === 0 && result.text) {
     replyChunks.push(result.text);
@@ -934,6 +968,14 @@ export function buildCliAgentTools(
     }
   };
   return { specs, dispatch, workingDirectory };
+}
+
+type CliToolCatalog = ReturnType<typeof buildCliAgentTools>;
+
+/** Add WebSearch to a CLI tool catalog when a search provider is configured (sync-ready or typed-store pending).
+ *  One rule with the Next TUI (src/core-turn/configured-web-search.ts). */
+export function withConfiguredWebSearch(built: CliToolCatalog, surface: 'chat' | 'agent' = 'chat'): CliToolCatalog {
+  return withConfiguredWebSearchForSurface(built, surface);
 }
 
 function truncateArgsForLog(args: Record<string, unknown>): string {

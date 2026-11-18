@@ -1002,6 +1002,9 @@ export class StoreSink implements LogSink {
     // listening so the default terminate action is restored; remaining
     // handlers already run in the current dispatch (re-raising would run
     // them a second time). `removeAllListeners` would wipe them.
+    // Prepend so this listener runs first in the dispatch: a `process.once`
+    // listener registered earlier has not yet removed itself, so it still
+    // counts as «someone else is listening» and no re-raise kills it.
     const install = (signal: 'SIGINT' | 'SIGTERM'): void => {
       const onSig = (): void => {
         onExit();
@@ -1014,7 +1017,7 @@ export class StoreSink implements LogSink {
       };
       if (signal === 'SIGINT') this.onSigInt = onSig;
       else this.onSigTerm = onSig;
-      process.on(signal, onSig);
+      process.prependListener(signal, onSig);
     };
     install('SIGINT');
     install('SIGTERM');

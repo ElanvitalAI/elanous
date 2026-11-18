@@ -155,6 +155,36 @@ test('FATAL-REPORT-AUTO: crash records flush once through ER1 with secrets scrub
   expect(calls).toHaveLength(1);
 });
 
+test('a declined crash is acknowledged once, even across CLI starts and later consent changes', async () => {
+  const d = dir();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const configDir = () => d;
+  const now = () => 1_800_000_000_000;
+  const enabledByEnvironment = () => true;
+  captureFatal(new Error('declined'), { surface: 'cli', configDir, now, enabledByEnvironment,
+    settings: () => ({ enabled: false, identity: false, consented: false }) });
+  const disabled = deps({ calls, configDir, now, settings: () => ({ enabled: false, identity: false, consented: false }) });
+  expect(await flushCrashQueue(disabled)).toMatchObject({ sent: 0, disabledSkipped: 1 });
+  expect(await flushCrashQueue(disabled)).toMatchObject({ sent: 0, disabledSkipped: 0 });
+  expect(readdirSync(join(d, 'crash'))).toHaveLength(0);
+  expect(await flushCrashQueue(deps({ calls, configDir, now }))).toMatchObject({ sent: 0, skipped: 0 });
+  expect(calls).toHaveLength(0);
+});
+
+test('revoked consent acknowledges an older consented crash without sending it', async () => {
+  const d = dir();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const configDir = () => d;
+  const now = () => 1_800_000_000_000;
+  captureFatal(new Error('prior consent'), { surface: 'cli', configDir, now,
+    enabledByEnvironment: () => true, settings: () => ({ enabled: true, identity: false, consented: true }) });
+  const revoked = deps({ calls, configDir, now, settings: () => ({ enabled: true, identity: false, consented: false }) });
+  expect(await flushCrashQueue(revoked)).toMatchObject({ sent: 0, consentSkipped: 1 });
+  expect(await flushCrashQueue(revoked)).toMatchObject({ sent: 0, consentSkipped: 0 });
+  expect(readdirSync(join(d, 'crash'))).toHaveLength(0);
+  expect(calls).toHaveLength(0);
+});
+
 test('FATAL-REPORT-AUTO: an actual fatal child exit is delivered once on the next startup', async () => {
   const d = dir();
   writeFileSync(join(d, 'config.json'), JSON.stringify({ errorReports: { enabled: true, noticeShown: true } }), { mode: 0o600 });
@@ -225,6 +255,22 @@ test('FATAL-REPORT-AUTO: the production CLI crash then restart uses its config, 
   expect(declined.status).toBe(0);
   expect(declined.stderr).toContain('동의가 없어 전송하지 않았습니다.');
   expect(existsSync(declinedSentFile)).toBe(false);
+  const declinedAgain = runCliRestart(declinedDir, declinedSentFile);
+  expect(declinedAgain.status).toBe(0);
+  expect(declinedAgain.stderr).not.toContain('이전 실행의 치명 오류 기록');
+
+  const disabledDir = dir();
+  writeFileSync(join(disabledDir, 'config.json'), JSON.stringify({ errorReports: { enabled: false, noticeShown: false } }), { mode: 0o600 });
+  captureFatal(new Error('disabled crash'), { surface: 'cli', configDir: () => disabledDir,
+    settings: () => ({ enabled: false, identity: false, consented: false }), enabledByEnvironment: () => true });
+  const disabledSentFile = join(disabledDir, 'fake-receiver.json');
+  const disabled = runCliRestart(disabledDir, disabledSentFile);
+  expect(disabled.status).toBe(0);
+  expect(disabled.stderr).toContain('오류 보고가 꺼져 있어 전송하지 않았습니다.');
+  const disabledAgain = runCliRestart(disabledDir, disabledSentFile);
+  expect(disabledAgain.status).toBe(0);
+  expect(disabledAgain.stderr).not.toContain('이전 실행의 치명 오류 기록');
+  expect(existsSync(disabledSentFile)).toBe(false);
 }, 60_000);
 
 test('FATAL-REPORT-AUTO: crash spool expires records older than seven days', async () => {

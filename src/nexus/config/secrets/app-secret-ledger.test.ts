@@ -29,7 +29,10 @@ test('credential slots use a typed writer and generic secret APIs cannot bypass 
   await setCredentialSlotAsync('cred:openai.api_key', 'credential-slot-secret');
   expect(await getSecretAsync('cred:openai.api_key')).toBe('credential-slot-secret');
   await expect(setSecretAsync('cred:openai.api_key', 'bypass')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
-  await expect(importSecretBatchAsync({ 'cred:openai.api_key': 'bypass' }, true)).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
+  // Bulk import is the encrypted-bundle path: unknown and rotating-login cred: IDs stay refused (CRED-TYPED-SLOT-MOVE-PATH).
+  await expect(importSecretBatchAsync({ 'cred:unknown.api_key': 'bypass' }, true)).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
+  await expect(importSecretBatchAsync({ 'cred:codex-login': 'bypass' }, true)).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_ROTATING_LOGIN_NOT_TRANSFERABLE');
+  expect(await getSecretAsync('cred:openai.api_key')).toBe('credential-slot-secret');
   expect(() => importSecretsFileRaw({ 'cred:openai.api_key': 'bypass' }, true)).toThrow('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
   expect(() => currentBackend().set('cred:openai.api_key', 'backend-bypass')).toThrow('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
   await expect(currentBackend().delete('cred:openai.api_key')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
@@ -48,7 +51,7 @@ test('credential slots use a typed writer and generic secret APIs cannot bypass 
   await expect(setCredentialSlotAsync('cred:unknown.api_key', 'unsupported')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
 });
 
-test('typed credential batch stores multi-field slots in one operation while generic imports stay blocked', async () => {
+test('typed credential batch stores multi-field slots in one operation while unknown slot imports stay blocked', async () => {
   useBackend('file');
   await setCredentialSlotBatchAsync({
     'cred:higgsfield.key_id': 'key-id-private',
@@ -57,7 +60,7 @@ test('typed credential batch stores multi-field slots in one operation while gen
   expect(await getSecretAsync('cred:higgsfield.key_id')).toBe('key-id-private');
   expect(await getSecretAsync('cred:higgsfield.secret')).toBe('secret-private');
   await expect(importSecretBatchAsync({
-    'cred:higgsfield.key_id': 'other-id', 'cred:higgsfield.secret': 'other-secret',
+    'cred:higgsfield.key_id': 'other-id', 'cred:unknown.secret': 'other-secret',
   }, true)).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
   await expect(setCredentialSlotBatchAsync({
     'cred:higgsfield.key_id': 'partial', 'cred:unknown.secret': 'invalid',

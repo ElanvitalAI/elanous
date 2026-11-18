@@ -27,7 +27,8 @@ for (const mode of ['classic', 'next'] as const) {
           },
           ready: {
             label: `${mode} prompt`,
-            until: screen => mode === 'classic' ? screen.includes('ChatLog') && screen.includes('❯') : screen.includes('Enter 전송'),
+            // #37922 이후 next TUI 환영 푸터는 영어로 렌더링된다(출처: src/tui/entry.ts welcomePending 푸터).
+            until: screen => mode === 'classic' ? screen.includes('ChatLog') && screen.includes('❯') : screen.includes('Enter send'),
             timeoutMs: 30_000, // 출처: #37081 가짜 프로바이더 TUI 프롬프트 준비 상한 — 4fc386a 도입값 재배치, 수치 불변
           },
           steps: [{ label: `bare ${word}`, text: word, until: fakeReply, timeoutMs: 30_000 }], // 출처: #37081 bare 단어 가짜 응답 대기 상한 — 4fc386a 도입값 재배치, 수치 불변

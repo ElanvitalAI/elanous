@@ -85,6 +85,11 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
       registerPtyTakeoverCommands(program);
       break;
     }
+    case 'side': {
+      const { registerElsCommands } = await import('./cli/els-cli.js');
+      registerElsCommands(program);
+      break;
+    }
     case 'pr-land': {
       const pr = program.command('pr').description('PR landing commands');
       const land = pr.command('land');

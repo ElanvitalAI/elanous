@@ -31,6 +31,7 @@ import { createGridDataSource, type GridDataSource, type GridDeps } from './grid
 import { createDraftMetricsSource, type DraftMetricsSource } from './draft-metrics.js';
 import { DECISIONS_PATH, handleDecisions, type DecisionsRouteDeps } from './decisions-route.js';
 import { OPS_BOARD_PATH, handleOpsBoard, type OpsBoardDeps } from './ops-board-route.js';
+import { GRAPH_RUNS_PATH, handleGraphRunsRoute, type GraphRunsRouteDeps } from './graph-runs-route.js';
 import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } from './card-followup-route.js';
 import { SKILL_EXEC_PATH, createSkillExecJobs, type SkillExecJobs } from './skill-exec-route.js';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
@@ -619,6 +620,8 @@ export interface NexusHttpServerOpts {
   /** `GET /api/task-agent/board` 의 원장 경로 — 생략하면 인스턴스의 task-agent-actions.json. */
   taskAgentStatePath?: string;
   cardFollowup?: CardFollowupJobs;
+  /** GRAPH-RUN-DETACHED stage 1a: start a graph run owned by this process, outside any turn (bearer only). */
+  graphRuns?: Pick<GraphRunsRouteDeps, 'host'>;
   skillExec?: SkillExecJobs;
   execRequests?: ExecRequestRunner;
   seatRequests?: SeatRequestsDeps;
@@ -1217,6 +1220,12 @@ function execRequestRunner(): ExecRequestRunner {
 }
 
 let cardFollowupJobs: CardFollowupJobs | undefined;
+/** Starting a graph run needs a real bearer: same-origin, noAuth and loopback peers are not credentials for it (default-allow is refused). */
+function graphRunBearer(req: Request, opts: NexusHttpServerOpts): boolean {
+  if (!opts.metaApi) return false;
+  const kind = bearerCredential(req, opts.metaApi);
+  return kind === 'bearer-match' || kind === 'temp-token';
+}
 function defaultCardFollowupJobs(): CardFollowupJobs {
   return cardFollowupJobs ??= createCardFollowupJobs();
 }
@@ -2316,6 +2325,9 @@ export async function routeRequest(
     if (method === 'POST' && pathname === SKILL_EXEC_PATH) {
       if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       return (opts.skillExec ?? defaultSkillExecJobs()).post(req);
+    }
+    if (method === 'POST' && pathname === GRAPH_RUNS_PATH) {
+      return (await handleGraphRunsRoute(req, pathname, { ...opts.graphRuns, trusted: graphRunBearer(req, opts) }))!;
     }
     if (method === 'POST' && pathname === CARD_FOLLOWUP_PATH) {
       if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);

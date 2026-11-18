@@ -34,3 +34,22 @@ test('AUTHOR-REVIEWER-SUPERVISOR-DIALOG observations are allowlisted', () => {
     'author.reviewer-precheck.failed-soft',
   ])));
 });
+
+test('ELN-COMMITMENT-LEDGER: commitment ledger observations are allowlisted', () => {
+  expect(KNOWN_LOG_EVENT_NAMES).toEqual(expect.objectContaining(new Set([
+    'commitment.recorded',
+    'commitment.closed',
+    'commitment.state',
+    'commitment.waker-attached',
+  ])));
+});
+
+test('ELN-SELF-TIMER-WATCH: self wake observations are allowlisted', () => {
+  expect(KNOWN_LOG_EVENT_NAMES).toEqual(expect.objectContaining(new Set([
+    'self-timer.armed',
+    'self-timer.merged',
+    'self-timer.fired',
+    'self-timer.expired',
+    'self-timer.probe-error',
+  ])));
+});

@@ -20,7 +20,7 @@ test('/now and its fixed phrase use the shared context query and source-labelled
   expect(chatLines.join('\n')).toContain('원장');
   expect(chatLines.join('\n')).toContain('0.3.8');
   await runNextTuiNowBranchRoute('/now', host, async () => { throw new Error('unavailable'); });
-  expect(chatLines.at(-1)).toBe('현재 맥락 조회 실패 · /now 다시 시도');
+  expect(chatLines.at(-1)).toBe('Current-context query failed · retry /now');
 });
 
 test('/now shows a fast section while a slow source reaches its deadline', async () => {
@@ -45,7 +45,7 @@ test('/now shows a fast section while a slow source reaches its deadline', async
   expect(updates[0]).not.toContain('시간 상한');
   await pending;
   expect(slowSignal?.aborted).toBe(true);
-  expect(chatLines.join('\n')).toContain('기본 현황 시간 상한 도달');
+  expect(chatLines.join('\n')).toContain('core status deadline reached');
   expect(chatLines.join('\n')).toContain('run://one');
 });
 
@@ -57,10 +57,10 @@ test('/now cancellation leaves the slow query result out of the visible transcri
   const pending = runNextTuiNowBranchRoute('/now', { chatLines, setChatScrollOffset: () => {}, signal: abort.signal }, query);
   abort.abort();
   await pending;
-  expect(chatLines).toEqual(['현재 맥락 조회 취소됨']);
+  expect(chatLines).toEqual(['Current-context query cancelled']);
   finishQuery({ at: '2026-11-10T00:00:00.000Z', topic: null, facts: [], events: [], guide: [] });
   await Promise.resolve();
-  expect(chatLines).toEqual(['현재 맥락 조회 취소됨']);
+  expect(chatLines).toEqual(['Current-context query cancelled']);
 });
 
 test('/now forwards each cancellation to its query', async () => {
@@ -78,5 +78,5 @@ test('/now forwards each cancellation to its query', async () => {
     await pending;
     expect(active.size).toBe(0); // Source: #36701 cancellation acceptance, no active query remains
   }
-  expect(chatLines).toEqual(['현재 맥락 조회 취소됨', '현재 맥락 조회 취소됨', '현재 맥락 조회 취소됨']);
+  expect(chatLines).toEqual(['Current-context query cancelled', 'Current-context query cancelled', 'Current-context query cancelled']);
 });

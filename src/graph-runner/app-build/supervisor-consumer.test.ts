@@ -304,9 +304,10 @@ test('an approved resume keeps the same-run correction cap after the collector r
   });
   const providers = registerAppBuildSupervisorProvider(base);
   const policy = correctionBudget(providers);
+  const budgetLog: string[] = [];
   let state = await runGraph(graph, { input: { ask: 'build' }, verifiedOwnerId: 'owner-1', quiet: true,
     s2CorrectionBudget: policy,
-    deps: { root, capabilityProviders: providers } });
+    deps: { root, capabilityProviders: providers, log: event => { budgetLog.push(event); } } });
   expect(state.status).toBe('awaiting-approval');
   expect(state.nodes.filter(node => node.nodeId === 'supervisor-correct')).toHaveLength(1);
   await expect(runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
@@ -337,6 +338,140 @@ test('an approved resume keeps the same-run correction cap after the collector r
   expect(state.nodes.filter(node => node.nodeId === 'publish-approval' && node.ok)).toHaveLength(2);
   expect(calls.filter(node => node === 'publish')).toHaveLength(2);
   expect(retired).toBe(1);
+  // S2-RESUME-CORRECTION-BUDGET-POLICY: a budgeted run never reports the absent-budget policy.
+  expect(budgetLog).not.toContain('s2-correction-budget-absent');
+});
+
+function unbudgetedApprovalFixture() {
+  const { root, graph } = graphFixture();
+  let source = readFileSync(graph, 'utf8');
+  source = source.replace('edges:\n', [
+    '  - { id: publish-approval, type: hitl, hitl: { options: [{ key: y, exit: approved }, { key: N, exit: rejected, default: true }] }, max_visits: 3 }',
+    'edges:',
+  ].join('\n') + '\n');
+  source = source.replace('from: materialize, on: outcome, map: { done: publish, failed: failed }',
+    'from: materialize, on: outcome, map: { done: publish-approval, failed: failed }');
+  source = source.replace('from: publish, on: outcome, map: { done: done, failed: failed }', [
+    'from: publish, on: outcome, map: { done: done, failed: supervisor-correct } }',
+    '  - { from: publish-approval, on: outcome, map: { approved: publish, rejected: failed }',
+  ].join('\n'));
+  writeFileSync(graph, source);
+  const calls: string[] = [];
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const log = (event: string, data: Record<string, unknown>) => { events.push({ event, data }); };
+  const phases = (name: string) => events.filter(item => item.event === name).map(item => item.data.phase ?? item.data.code);
+  // A fresh registry per call stands in for a restarted host: only the saved ledger carries over.
+  const freshProviders = (publishFails: boolean) => {
+    let base = registerGraphCapabilityContract(emptyGraphCapabilityRegistry(), {
+      id: 'fake.step@1', input: { type: 'object' }, output: { type: 'object' },
+    });
+    base = registerGraphCapabilityProviderDeclaration(base, {
+      id: 'fake-s2-steps', provides: ['fake.step@1'], tier: 'free',
+      invoke: async context => {
+        calls.push(context.nodeId);
+        if (publishFails && context.nodeId === 'publish')
+          return { ok: false, outcome: 'failed', error: 'API_CONTRACT_MISMATCH' };
+        return { ok: true, outcome: 'done', result: { stage: context.nodeId } };
+      },
+    });
+    return registerAppBuildSupervisorProvider(base);
+  };
+  return { root, graph, calls, events, log, phases, freshProviders };
+}
+
+test('S2 run started without a budget resumes after approval under the same zero-correction policy', async () => {
+  // S2-RESUME-CORRECTION-BUDGET-POLICY (#37896 r3 MF): start allowed no budget, resume used to refuse it.
+  for (const mode of ['done', 'refused'] as const) {
+    const { root, graph, calls, events, log, phases, freshProviders } = unbudgetedApprovalFixture();
+    const absentPhases = () => phases('s2-correction-budget-absent');
+    const started = freshProviders(false);
+    let state = await runGraph(graph, { input: { ask: 'build' }, verifiedOwnerId: 'owner-1', quiet: true,
+      deps: { root, capabilityProviders: started, log } });
+    expect(state.status).toBe('awaiting-approval');
+    expect(state.s2CorrectionBudget).toBeUndefined();
+    expect(state.s2CorrectionOwnerId).toBeUndefined();
+    expect(state.s2RunOwnerId).toBe('owner-1');
+    expect(absentPhases()).toEqual(['start']);
+    await expect(runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+      verifiedOwnerId: 'owner-1', quiet: true, s2CorrectionBudget: correctionBudget(started),
+      deps: { root, capabilityProviders: started, log } }))
+      .rejects.toThrow('S2_CORRECTION_BUDGET_CANNOT_START_ON_RESUME');
+    // #38309 REVIEW-1 ③: a different or missing owner cannot resume the run, and the refusal is reported.
+    await expect(runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+      verifiedOwnerId: 'other-owner', quiet: true, deps: { root, capabilityProviders: started, log } }))
+      .rejects.toThrow('S2_RUN_OWNER_MISMATCH');
+    await expect(runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+      quiet: true, deps: { root, capabilityProviders: started, log } }))
+      .rejects.toThrow('S2_RUN_OWNER_MISMATCH');
+    expect(events.filter(item => item.event === 's2-resume-owner-refused').map(item => item.data)).toEqual([
+      { graphId: state.graphId, runId: state.runId, code: 'S2_RUN_OWNER_MISMATCH', startedWithOwner: true, resumedWithOwner: true },
+      { graphId: state.graphId, runId: state.runId, code: 'S2_RUN_OWNER_MISMATCH', startedWithOwner: true, resumedWithOwner: false },
+    ]);
+    expect(absentPhases()).toEqual(['start']);
+    expect(readGraphRun(state.graphId, state.runId, root).status).toBe('awaiting-approval');
+    decideGraphApproval(state.graphId, state.runId, 'approved', 'owner-1', root);
+    state = await runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+      verifiedOwnerId: 'owner-1', quiet: true,
+      deps: { root, capabilityProviders: freshProviders(mode === 'refused'), log } });
+    expect(absentPhases()).toEqual(['start', 'resume']);
+    const resumeEvent = events.find(item => item.event === 's2-correction-budget-absent' && item.data.phase === 'resume')?.data;
+    // 출처: #37896 r3 MF — no budget means zero corrections (runner.ts s2-correction-budget-absent).
+    expect(resumeEvent).toMatchObject({ graphId: state.graphId, runId: state.runId, maxCorrections: 0, expectedRefusal: 'TRUSTED_BUDGET_MISSING' });
+    expect(state.s2CorrectionBudget).toBeUndefined();
+    expect(state.s2RunOwnerId).toBe('owner-1');
+    expect(calls.filter(node => node === 'publish')).toHaveLength(1);
+    if (mode === 'done') {
+      expect(state.status).toBe('done');
+      expect(state.nodes.some(node => node.nodeId === 'supervisor-correct')).toBe(false);
+    } else {
+      expect(state.status).toBe('failed');
+      expect(state.nodes.find(node => node.nodeId === 'supervisor-correct')?.output).toContain('TRUSTED_BUDGET_MISSING');
+      expect(calls.filter(node => node === 'file-plan')).toHaveLength(1);
+    }
+  }
+});
+
+test('S2 run started without a budget or owner resumes only without an owner, as start allowed', async () => {
+  // #38309 REVIEW-1 ③: an absent start owner stays absent; corrections stay refused (VERIFIED_OWNER_REQUIRED).
+  const { root, graph, calls, events, log, freshProviders } = unbudgetedApprovalFixture();
+  let state = await runGraph(graph, { input: { ask: 'build' }, quiet: true,
+    deps: { root, capabilityProviders: freshProviders(false), log } });
+  expect(state.status).toBe('awaiting-approval');
+  expect(state.s2RunOwnerId).toBeUndefined();
+  await expect(runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+    verifiedOwnerId: 'owner-1', quiet: true, deps: { root, capabilityProviders: freshProviders(false), log } }))
+    .rejects.toThrow('S2_RUN_OWNER_MISMATCH');
+  expect(events.filter(item => item.event === 's2-resume-owner-refused').map(item => item.data)).toEqual([
+    { graphId: state.graphId, runId: state.runId, code: 'S2_RUN_OWNER_MISMATCH', startedWithOwner: false, resumedWithOwner: true },
+  ]);
+  decideGraphApproval(state.graphId, state.runId, 'approved', undefined, root);
+  state = await runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+    quiet: true, deps: { root, capabilityProviders: freshProviders(true), log } });
+  expect(state.status).toBe('failed');
+  expect(state.nodes.find(node => node.nodeId === 'supervisor-correct')?.output).toContain('VERIFIED_OWNER_REQUIRED');
+  expect(calls.filter(node => node === 'file-plan')).toHaveLength(1);
+  expect(calls.filter(node => node === 'publish')).toHaveLength(1);
+});
+
+test('an S2 ledger whose budget was stripped stays refused while an unbudgeted ledger resumes', async () => {
+  const { root, graph } = graphFixture();
+  const calls: string[] = [];
+  const providers = registry(0, calls);
+  const state = await runGraph(graph, { input: { ask: 'build' }, verifiedOwnerId: 'owner-1', quiet: true,
+    s2CorrectionBudget: correctionBudget(providers), deps: { root, capabilityProviders: providers } });
+  const stripped = JSON.parse(readFileSync(state.statePath, 'utf8')) as Record<string, unknown>;
+  delete stripped.s2CorrectionBudget;
+  writeFileSync(state.statePath, JSON.stringify(stripped));
+  const events: string[] = [];
+  await expect(runGraph(graph, { resumeRunId: state.runId, resumeGraphId: state.graphId,
+    verifiedOwnerId: 'owner-1', quiet: true,
+    deps: { root, capabilityProviders: providers, log: event => { events.push(event); } } }))
+    .rejects.toThrow('S2_CORRECTION_BUDGET_MISSING');
+  expect(events).not.toContain('s2-correction-budget-absent');
+  const mixed = JSON.parse(readFileSync(state.statePath, 'utf8')) as Record<string, unknown>;
+  mixed.s2RunOwnerId = 'owner-1';
+  writeFileSync(state.statePath, JSON.stringify(mixed));
+  expect(() => readGraphRun(state.graphId, state.runId, root)).toThrow('S2_RUN_OWNER_INVALID');
 });
 
 

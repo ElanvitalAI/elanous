@@ -16,6 +16,17 @@ import { runCli, type RunCli } from './cli-helper.js';
 import { elanousConfigDir } from '../paths.js';
 
 const ACCOUNT = 'elanous';
+/** IDs written through `security -i` stdin must not need quoting inside the command line. */
+const KEYCHAIN_STDIN_ID = /^[A-Za-z0-9][A-Za-z0-9._:@\/+-]{0,255}$/; // no whitespace or quotes
+
+/** Scrub the value (raw and hex) from CLI diagnostics before they reach an Error message. */
+export function redactKeychainOutput(text: string, value: string, hex: string): string {
+  let out = text.trim();
+  for (const needle of [value, hex, hex.toUpperCase()]) {
+    if (needle.length > 0) out = out.split(needle).join('[redacted]');
+  }
+  return out.slice(0, 200);
+}
 
 export interface KeychainBackendOpts {
   /** Test seam — defaults to the real spawn-based runCli. */
@@ -45,6 +56,13 @@ export function createKeychainBackend(opts: KeychainBackendOpts = {}): SecretBac
     writeFileSync(indexPath, JSON.stringify({ ids: [...new Set(ids)].sort() }, null, 2), { mode: 0o600 });
   }
 
+  async function getValue(id: string): Promise<string | undefined> {
+    const result = await cli(['security', 'find-generic-password', '-a', ACCOUNT, '-s', id, '-w']);
+    if (result.exitCode !== 0) return undefined;
+    // -w prints value followed by trailing newline
+    return result.stdout.replace(/\n$/, '');
+  }
+
   return {
     id: 'keychain',
     async isAvailable(): Promise<SecretBackendAvailability> {
@@ -55,20 +73,23 @@ export function createKeychainBackend(opts: KeychainBackendOpts = {}): SecretBac
       if (result.exitCode === 127) return { ok: false, reason: '`security` CLI not in PATH' };
       return { ok: true };
     },
-    async get(id) {
-      const result = await cli(['security', 'find-generic-password', '-a', ACCOUNT, '-s', id, '-w']);
-      if (result.exitCode !== 0) return undefined;
-      // -w prints value followed by trailing newline
-      return result.stdout.replace(/\n$/, '');
-    },
+    async get(id) { return getValue(id); },
     async set(id, value) {
-      // -U updates if it exists; -w supplies the value.
-      const result = await cli([
-        'security', 'add-generic-password',
-        '-a', ACCOUNT, '-s', id, '-w', value, '-U',
-      ]);
-      if (result.exitCode !== 0) {
-        throw new Error(`keychain set failed (${result.exitCode}): ${result.stderr.trim()}`);
+      // HQ-VAULT V1: the value never rides argv (visible to `ps`). `security -i` reads the
+      // command from stdin; the value is hex-encoded (`-X`) so no quoting can split it.
+      if (!KEYCHAIN_STDIN_ID.test(id)) throw new Error('keychain set refused: secret id is not stdin-safe');
+      const hex = Buffer.from(value, 'utf-8').toString('hex');
+      const result = await cli(['security', '-i'], {
+        stdin: `add-generic-password -U -a ${ACCOUNT} -s ${id} -X ${hex}\n`,
+      });
+      // Interactive mode may exit 0 even when the inner command failed: read back to confirm.
+      const stored = result.exitCode === 0 ? await getValue(id) : undefined;
+      // `-w` prints non-printable data as hex; a trailing newline is trimmed by getValue.
+      const confirmed = stored !== undefined
+        && (stored === value.replace(/\n$/, '') || stored.toLowerCase() === hex);
+      if (!confirmed) {
+        const stderr = redactKeychainOutput(result.stderr, value, hex);
+        throw new Error(`keychain set failed (${result.exitCode}): ${stderr}`);
       }
       const ids = readIndex();
       if (!ids.includes(id)) writeIndex([...ids, id]);

@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -67,7 +67,7 @@ test('retro facts reads the requested event families within the time window with
     expect(() => parseRetroSince('0h', now)).toThrow('--since');
     const result = collectRetroFacts(parseRetroSince('24h', now), [{ name: 'fixture', dbPath: path }], dir);
     expect(result.unavailable).toEqual([]);
-    expect(collectRetroFacts(parseRetroSince('24h', now), [{ name: 'missing', dbPath: join(dir, 'missing.db') }], dir)).toEqual({ facts: [], unavailable: ['missing'] });
+    expect(collectRetroFacts(parseRetroSince('24h', now), [{ name: 'missing', dbPath: join(dir, 'missing.db') }], dir)).toMatchObject({ facts: [], unavailable: ['missing'] });
     expect(result.facts.map(f => f.kind)).toEqual(['stop-reason', 'ta-outcome', 'ta-outcome', 'stop-reason', 'draft-death', 'draft-birth']);
     expect(result.facts.at(-1)?.data).toEqual({ number: 2 });
     expect(result.facts.find(f => f.event === 'decision')?.data).toEqual({ action: 'stop', stopReason: 'provider-exhausted' });
@@ -111,7 +111,7 @@ test('retro facts reads run incidents newer than --since and keeps the four exis
 test('retro facts: missing incidents dir yields no incident facts and nothing unavailable', () => {
   const dir = mkdtempSync(join(tmpdir(), 'retro-incidents-missing-'));
   try {
-    expect(collectRetroFacts(Date.now() - 3600000, [], dir)).toEqual({ facts: [], unavailable: [] });
+    expect(collectRetroFacts(Date.now() - 3600000, [], dir)).toMatchObject({ facts: [], unavailable: [] });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -242,4 +242,30 @@ test('retro facts command is registered and produces JSON', async () => {
   expect(parsed).toHaveProperty('facts');
   expect(parsed).toHaveProperty('since');
   expect(Array.isArray(parsed.unavailable)).toBe(true);
+});
+
+test('retro facts reads only fact events in SQL and emits a timing observation from an injected clock', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'retro-timing-'));
+  const logs: Array<{ category: string; event: string; data: unknown }> = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    logs.push({ category, event, data });
+  }) as typeof debug.log);
+  try {
+    const now = Date.now();
+    const path = join(dir, 'logs.db');
+    const store = new LogStore(path);
+    store.insertBatch([
+      { rec: { ts: new Date(now - 500).toISOString(), category: 'self-dev.supervisor', event: 'resolved', data: { stopReason: 'no-progress' } }, surface: 'test' },
+      ...['tick', 'frame', 'poll'].map(event => ({ rec: { ts: new Date(now - 400).toISOString(), category: 'noise', event, data: {} }, surface: 'test' })),
+    ]);
+    store.close();
+    let tick = 0;
+    const result = collectRetroFacts(now - 3600000, [{ name: 'fixture', dbPath: path }], dir, () => (tick += 10));
+    expect(result.facts.map(fact => fact.kind)).toEqual(['stop-reason']);
+    // The noise rows never leave SQLite: only the one fact-event row is scanned.
+    expect(result.timing).toEqual({ totalMs: 50, rowsScanned: 1, pages: 1, incidentsMs: 10,
+      stores: [{ name: 'fixture', ms: 10, rows: 1, pages: 1 }] });
+    expect(logs.find(entry => entry.category === 'retro' && entry.event === 'facts-timing'))
+      .toMatchObject({ data: { facts: 1, rowsScanned: 1, totalMs: 50, stores: [{ name: 'fixture' }] } });
+  } finally { spy.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
 });

@@ -15,6 +15,7 @@
 // local model never blocks dispatch — the caller's keyword classifier
 // already produced a baseline answer; this call just refines it.
 
+import { llmNetworkFetch } from '../../session-runtime/llm-call-gateway.js';
 import { buildJudgePromptMessages, parseJudgeReply, type RoleLabel } from './prompt-template.js';
 
 export interface LocalJudgeOpts {
@@ -131,12 +132,12 @@ export async function classifyWithLocalLlm(
   try {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (opts.token) headers['authorization'] = `Bearer ${opts.token}`;
-    const res = await fetch(`${endpoint}/chat/completions`, {
+    const res = await llmNetworkFetch(`${endpoint}/chat/completions`, {
       method: 'POST',
       headers,
       body,
       signal: ac.signal,
-    });
+    }, { provider: 'local-llm', model: opts.model, role: 'aux', requestedBy: 'showroom.role-judge' });
     clearTimeout(timer);
     const latencyMs = Date.now() - startedAt;
     if (!res.ok) {

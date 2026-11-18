@@ -276,18 +276,18 @@ export interface RunningBuildState {
 
 /** Running-build pill.
  *
- *     ▶ 실행 5c0f98f                         — boot build matches current code (overlay)
- *     ▶ 실행 5c0f98f ⟳ 재기동 필요 → 1a2b3c4  — code moved after boot (yellow, bold)
- *     ▶ 실행 5c0f98f ?                        — could not compare (overlay)
- *     ▶ 실행 ?                                — boot build unknown (overlay) */
+ *     ▶ running 5c0f98f                         — boot build matches current code (overlay)
+ *     ▶ running 5c0f98f ⟳ restart needed → 1a2b3c4  — code moved after boot (yellow, bold)
+ *     ▶ running 5c0f98f ?                        — could not compare (overlay)
+ *     ▶ running ?                                — boot build unknown (overlay) */
 export function runningBuildSegment(state: RunningBuildState | null | undefined, opts: StatusBarRenderOptions = {}): string {
   if (!state) return '';
-  if (!state.sha) return text('▶ 실행 ?', 'overlay', opts);
-  const label = `▶ 실행 ${state.sha.slice(0, 7)}`;
+  if (!state.sha) return text('▶ running ?', 'overlay', opts);
+  const label = `▶ running ${state.sha.slice(0, 7)}`;
   if (state.stale === null) return text(`${label} ?`, 'overlay', opts);
   if (!state.stale) return text(label, 'overlay', opts);
   const target = state.currentSha ? ` → ${state.currentSha.slice(0, 7)}` : '';
-  return strongText(`${label} ⟳ 재기동 필요${target}`, 'yellow', opts);
+  return strongText(`${label} ⟳ restart needed${target}`, 'yellow', opts);
 }
 
 /** 이번 턴 «실제로» 응답한 공급자·모델 (TUI-MODEL-BADGE-ACTUAL · 10-16 · #24·#66).
@@ -648,7 +648,7 @@ export function shellRollupSegment(
  *  🚨 10-16 07:3x OPT 가 «남은 리뷰 4건 실행 중 · 다음 점검 = …» 로 턴을 «✔ 완료» 로 끝내자
  *     바깥에선 «12분 유휴» 로 보였다.
  *
- *      ⧗ 백그라운드 2   — 등록된(ShellRegistry) 백그라운드 일 2개가 돈다
+ *      ⧗ background 2   — 등록된(ShellRegistry) 백그라운드 일 2개가 돈다
  *      (빈 문자열)       — 0 · 끝나면 사라진다
  *
  *  `background` = 살아 있는 bg 모드 핸들 ⊕ backgrounded(인라인 전경 실행은 안 셈 — 그건 🐚 몫).
@@ -666,7 +666,7 @@ export function backgroundJobsSegment(
   if (!summary) return '';
   const live = Number.isFinite(summary.background) ? Math.max(0, Math.floor(summary.background)) : 0;
   if (live <= 0) return '';
-  return text(`⧗ 백그라운드 ${live}`, 'peach', opts);
+  return text(`⧗ background ${live}`, 'peach', opts);
 }
 
 export type DockStripDensity = 'full' | 'compact' | 'count-only';

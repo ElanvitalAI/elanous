@@ -275,7 +275,13 @@ function packedVersion() {
   return `${version} ${commit}`;
 }
 
+function aliasElsArgv(args, argv1 = process.argv[1] || '') {
+  const invokedAsEls = argv1.split(/[\\/]/).pop().replace(/\.(mjs|cjs|js)$/, '') === 'els';
+  return invokedAsEls && args[0] !== 'side' ? ['side', ...args] : args;
+}
+
 async function main(args = process.argv.slice(2), env = process.env) {
+  args = aliasElsArgv(args);
   if (compareVersions(process.versions.node, '18.0.0') < 0) {
     process.stderr.write('elanous npm launcher requires Node.js >= 18.0.0 (global fetch is required).\n');
     process.exit(1);

@@ -33,6 +33,68 @@ export const WORK_ORDER_FIELDS = [
 ] as const;
 export type WorkOrderField = typeof WORK_ORDER_FIELDS[number];
 
+/**
+ * 발사 전에 «모름» 이면 안 되는 칸 — 경계(건드릴 곳)·예산(시간·모델·Pod·재작업)·계약(현재 계약)·올림(막히면 누구에게).
+ * 이 칸들이 비면 TA 가 추측하게 되므로 hand 가 지시서 발사를 거부한다(resolveHandText · ta-preflight 조건 3 도 같은 목록).
+ */
+export const WORK_ORDER_CRITICAL_FIELDS = ['boundary', 'budget', 'contract', 'escalation'] as const;
+
+/** 시범 발사의 벽시계 상한(초) — 부모 구현 상한 2시간에서 5분 먼저 끝나는 자식 기본 하드 대기와 같다(시험이 고정). */
+export const TA_PILOT_MAX_WALL_SEC = 6_900;
+/** hand 가 선언된 벽시계를 발사 환경에 싣는 키 — 소비자: self-implement-pod.ts(Job 수명). */
+export const TA_BUDGET_WALL_ENV = 'ELANOUS_TA_WALL_SEC';
+/** 선언 벽시계 뒤에 Job 이 더 사는 여유(초) — 자식이 결과·PR 을 남기고 스스로 끝낼 시간. */
+export const TA_POD_DEADLINE_GRACE_SEC = 300;
+
+export type ParseWorkOrderBudgetResult = { ok: true; timeSec: number } | { ok: false; reason: string };
+
+/**
+ * 예산 칸 `time=6900s usd=5` (공백·`·`·`,`·`;` 구분)를 읽는다. 키는 time·usd 둘뿐 — 중복·여분 키·`key = value`·대소문자 변형·빈 값은 거부(무시하지 않는다).
+ * time 은 «선언된 값 그대로» 정수 초(s·m·h 소문자 단위)이고 1..TA_PILOT_MAX_WALL_SEC 여야 한다 — 부동소수·허용오차 없이 BigInt 10진 산술로 판정한다.
+ * usd 는 센트 단위 정수로 환산되는 양의 10진수(소수 둘째 자리까지)여야 한다. usd 는 형식만 검증하며 강제 소비자는 아직 없다(후속 칸).
+ */
+export function parseWorkOrderBudget(text: string): ParseWorkOrderBudgetResult {
+  const pairs = new Map<string, string>();
+  for (const token of text.split(/[\s·,;]+/u).filter(Boolean)) {
+    const match = /^([a-z]+)=(.+)$/u.exec(token);
+    if (!match) return { ok: false, reason: `예산 토큰 «${token.slice(0, 40)}» 는 소문자 key=value 형식이 아니다` };
+    const [, key, value] = match as unknown as [string, string, string];
+    if (key !== 'time' && key !== 'usd') return { ok: false, reason: `예산에 허용되지 않은 키 «${key}» (허용: time·usd)` };
+    if (pairs.has(key)) return { ok: false, reason: `예산 키 «${key}» 가 중복 선언됐다` };
+    pairs.set(key, value);
+  }
+  const rawTime = pairs.get('time');
+  if (rawTime === undefined) return { ok: false, reason: '예산에 time=<초|분m|시간h> 가 없다' };
+  const time = /^(\d{1,6})(?:\.(\d{1,12}))?([smh]?)$/u.exec(rawTime);
+  if (!time) return { ok: false, reason: `time=${rawTime.slice(0, 20)} 형식 오류(숫자+s|m|h 소문자 단위)` };
+  const fraction = time[2] ?? '';
+  const scaled = BigInt(`${time[1]}${fraction}`) * BigInt(time[3] === 'h' ? 3600 : time[3] === 'm' ? 60 : 1);
+  const divisor = 10n ** BigInt(fraction.length);
+  if (scaled % divisor !== 0n) return { ok: false, reason: `time ${rawTime} 는 정수 초가 아니다` };
+  const seconds = scaled / divisor;
+  if (seconds < 1n || seconds > BigInt(TA_PILOT_MAX_WALL_SEC)) return { ok: false, reason: `time ${seconds}s 는 1..${TA_PILOT_MAX_WALL_SEC}s 밖이다` };
+  const rawUsd = pairs.get('usd');
+  if (rawUsd === undefined) return { ok: false, reason: '예산에 usd=<양수·소수 둘째 자리까지> 상한이 없다' };
+  const usd = /^(\d{1,9})(?:\.(\d{1,2}))?$/u.exec(rawUsd);
+  if (!usd) return { ok: false, reason: `usd=${rawUsd.slice(0, 20)} 는 센트 단위 양수(최대 소수 둘째 자리)가 아니다` };
+  const cents = BigInt(usd[1]!) * 100n + BigInt((usd[2] ?? '').padEnd(2, '0') || '0');
+  if (cents <= 0n) return { ok: false, reason: 'usd 상한은 0보다 커야 한다' };
+  return { ok: true, timeSec: Number(seconds) };
+}
+
+/** 선언된 벽시계(env)에서 Pod Job 수명 상한(초)을 구한다 — 1..6900 정수 초가 아니면 undefined(적용 안 함). */
+export function taPodDeadlineSeconds(env: Readonly<Record<string, string | undefined>>): number | undefined {
+  const raw = env[TA_BUDGET_WALL_ENV];
+  if (raw === undefined || !/^\d{1,4}$/u.test(raw)) return undefined;
+  const wall = Number(raw);
+  return wall >= 1 && wall <= TA_PILOT_MAX_WALL_SEC ? wall + TA_POD_DEADLINE_GRACE_SEC : undefined;
+}
+
+/** 지시서에서 «모름» 인 critical 칸 — 비어 있으면 발사해도 된다. */
+export function criticalUnknownFields(order: Pick<WorkOrder, 'unknownFields' | 'boundary' | 'budget' | 'contract' | 'escalation'>): string[] {
+  return WORK_ORDER_CRITICAL_FIELDS.filter((field) => order.unknownFields.includes(field) || !order[field].trim() || order[field] === WORK_ORDER_UNKNOWN);
+}
+
 /** 검증을 통과한 작업 지시서 — 모든 칸이 문자열로 채워져 있다(빠진 칸은 «모름»). */
 export interface WorkOrder {
   lifeId: string;

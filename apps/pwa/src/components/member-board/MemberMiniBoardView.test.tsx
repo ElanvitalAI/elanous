@@ -118,4 +118,12 @@ describe('member mini board surface', () => {
     expect(html).toContain('href="/app/member/invite/"');
     expect(html).not.toContain('운영자 전용');
   });
+
+  test('MEMBER-BOARD-WEBCHAT-ENTRY: the board header leads with one same-origin web-chat entry', () => {
+    const html = renderToStaticMarkup(<MemberMiniBoardView briefings={[]} cards={[]}
+      refreshedAt={null} loading={false} error={null} onRefresh={() => {}} />);
+    const links = [...html.matchAll(/<a [^>]*href="([^"]+)"[^>]*>([^<]*)</g)].map(match => [match[1], match[2]]);
+    expect(links[0]).toEqual(['/app/chat/', '웹채팅 시작']); // Primary entry first, before the invite link.
+    expect(html.match(/data-member-webchat-entry/g)).toHaveLength(1);
+  });
 });

@@ -11,6 +11,7 @@ import { createRunningBuildStatus } from './running-build-status.js';
 import { reportTuiAbortRequested, reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
 import { installTuiStderrOwner } from '../surface/tui-stderr-owner.js';
 import { logTurnThrew, runTurnTeardownStep } from './turn-busy-teardown.js';
+import { createChildNoticeLineSink, createChildNoticeProducers } from '../tui/core/notice-producers.js'; // #38031 CHILD-NOTICE
 import { createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { $ } from 'bun';
@@ -1127,7 +1128,7 @@ import { renderRestoredTranscriptLines } from './replay-preview.js';
 import {
   buildDashboardTurnPreamble,
 } from './turn-preamble.js';
-import { describeSeatBoot, startSeatBootConversation } from './seat-boot-preamble.js';
+import { describeSeatBoot, detectSeat, startSeatBootConversation } from './seat-boot-preamble.js';
 import { ensureSeatLocalInstructions, installSeatSessionRecorder } from './seat-local-instructions.js';
 import type { DashboardSession } from '../tui-client/dashboard-session.js';
 import type { SessionTurnProfile } from '../session-runtime/index.js';
@@ -1187,8 +1188,9 @@ import { abortAndKillChildren, abortTurnOnly } from '../turn-abort-scope.js';
 import { consumeInternalTurnYield, createInternalTurnGate, formatInternalTurnBanner, resolveInternalTurnSubmitIntent, type InternalTurnRequest } from './input/internal-turn.js';
 import { createClassicInterimFold } from './input/goal-interim.js';
 import { createSeatAutowake } from './input/seat-autowake.js';
+import { createSeatMailInboxWiring } from './seat-mail-inbox-wiring.js';
 import { createGoalContinue } from './input/goal-continue.js';
-import { createDashboardWakeupScheduler, registerScheduleWakeupHostTool } from '../skills/tools/schedule-wakeup.js';
+import { createDashboardWakeupScheduler, createSessionWakeupBinder, registerScheduleWakeupHostTool } from '../skills/tools/schedule-wakeup.js';
 import { createAttachmentRowMap } from '../log-pane/attachment-row-map.js';
 import { createAttachmentPopup, type AttachmentPopupAction } from '../log-pane/attachment-popup.js';
 import { findLogMatches, findVisibleLogMatches, type LogSearchResult } from '../log-pane/search.js';
@@ -1229,7 +1231,7 @@ import {
 } from '../ssh/remote-browser.js';
 import { editRemoteFile } from '../ssh/remote-edit.js';
 import { createFolderPickerModal } from '../finder/finder-modal.js';
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
 import { type TransferTarget } from '../transfer/transfer-targets.js';
 import { createInputPickers } from '../tui/input/pickers.js';
 import { sshTransfer, type SshTransferProgress } from '../transfer/ssh-transfer.js';
@@ -1256,6 +1258,8 @@ import {
   findLiveSessionByPaneId,
   listLiveEmbodiedSessions,
 } from '../agent/spawn-embodied-agent-in-vw.js';
+import { wireElsChildProducer } from '../els/child-producer.js';
+import { elsSocketPath } from '../els/server.js';
 import { findSessionObserver } from '../agent/observer-registry.js';
 import {
   conversationModalTitle,
@@ -1298,7 +1302,7 @@ import { buildDebugCallStack } from '../debug/call-stack.js';
 import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
 import { buildLspHostTool } from '../skills/tools/lsp/index.js';
 import { BUILTIN_DIR, PluginHost } from '../plugins/core/host.js';
-import { createDashboardPluginRouteAdapter, createDashboardTuiConfirmContext, createDashboardGraphRouteDispatcher, requestDashboardGraphConfirmation, resolveDashboardVerifiedOwner, type DashboardPluginRouteAdapter, type DashboardPluginRouteBridge } from './plugin-route-adapter.js';
+import { createDashboardPluginRouteAdapter, createDashboardTuiConfirmContext, createDashboardGraphRouteDispatcher, requestDashboardGraphConfirmation, requestDashboardGraphDecision, resolveDashboardVerifiedOwner, type DashboardPluginRouteAdapter, type DashboardPluginRouteBridge } from './plugin-route-adapter.js';
 import type { GraphRunOptions } from '../graph-runner/runner.js';
 import { getActiveAcpAskPusher } from '../acp/server.js';
 
@@ -3070,6 +3074,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const prev = attachedSessionId;
     const selectedPersona = chatPersonaSelection.get(currentChatPersonaSessionId());
     attachedSessionId = forked.meta.id;
+    bindAttachedWakeupSession();
     if (selectedPersona) chatPersonaSelection.set(forked.meta.id, selectedPersona);
     try { _setActive(forked.meta.id); } catch { /* best-effort */ }
     chatLines.push('');
@@ -3112,6 +3117,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const prev = attachedSessionId;
     const selectedPersona = chatPersonaSelection.get(currentChatPersonaSessionId());
     attachedSessionId = forked.meta.id;
+    bindAttachedWakeupSession();
     if (selectedPersona) chatPersonaSelection.set(forked.meta.id, selectedPersona);
     try { setActiveForTimetravel(forked.meta.id); } catch { /* best-effort */ }
     // in-memory 히스토리도 동일 경계로 절단 — 스토어와 문맥 일치 보장.
@@ -3227,10 +3233,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getCwd: () => workingDir.cwd,
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
   });
-  // Set only by the failed-turn callback and consumed by that turn's streaming cleanup.
-  let autowakeTurnFailureRaw: string | null = null;
-  // ⭐ TURN-END-BEFORE-GOAL 골 이어가기 — 답이 «…하겠습니다/해야 합니다» 로 끝났는데 결과물이 없으면 H2 문으로 한 턴 더.
-  //   판정·상한은 모듈(goal-continue.ts), 여기선 배선만(입력칸 무접촉).
+  const seatMailInbox = createSeatMailInboxWiring({ getCwd: () => workingDir.cwd, startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts), log: (category, event, data) => { debug.log(category, event, data); } }); // ⭐ ELN-SEAT-INBOX-TURN-BOUNDARY — 턴 경계 우편 수신·주입·ack(배선 본체: seat-mail-inbox-wiring.ts)
+  let autowakeTurnFailureRaw: string | null = null; // failed-turn 콜백이 설정, 그 턴의 스트리밍 정리에서 소비
+  // ⭐ TURN-END-BEFORE-GOAL 골 이어가기 — «…하겠습니다» 로 끝났는데 결과물 없으면 H2 문으로 한 턴 더(판정·상한: goal-continue.ts · 여기선 배선만).
   const goalContinue = createGoalContinue({
     startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts),
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
@@ -3249,6 +3254,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const wakeupScheduler = createDashboardWakeupScheduler(internalTurnGate, {
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
   });
+  // ⭐ OP-CRON-PROMPTS O2 — 재기동해도 예약이 살게 파일에 저장·시작 복원한다. 스케줄러를 만들 때는 대화 세션이 아직
+  //   안 붙어 있다(attachedSessionId=null) — 세션이 붙거나 바뀔 때마다 저장 위치를 묶는다(같은 id 는 무시).
+  const bindWakeupSession = createSessionWakeupBinder(wakeupScheduler, detectSeat(process.cwd())?.seat);
+  const bindAttachedWakeupSession = (): void => bindWakeupSession(attachedSessionId);
+  bindAttachedWakeupSession();
   // ⭐ `B3` — 큐를 «도는 턴»에 넣으려면 그 턴이 도는 ***ACP 세션 id*** 가 필요하다.
   //   ⛔ `attachedSessionId`(대화 세션)와 «다른 축»이다 — 루프는 ACP 세션으로 스코프를 연다.
   //   ⚠️ 세션은 이 함수 «뒤»에서 만들어지므로 참조로 둔다(호출 시점엔 채워져 있다).
@@ -6000,7 +6010,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             debug.log('agent.task-routing', 'handoff-to-background-on-turn-abort', {
               count: moved.length, taskIds: moved.slice(0, 6), reason: 'turn-aborted-children-survive',
             });
-            pushChatLine(`  ⏳ 자식 ${moved.length}개는 백그라운드에서 계속됩니다 — 끝나면 알려 드립니다.`);
+            pushChatLine(`  ⏳ ${moved.length} child${moved.length === 1 ? '' : 'ren'} keep running in the background — I'll tell you when they finish.`);
           }
         } catch { /* 관측·핸드오프가 중단을 막지 않는다 */ }
       },
@@ -6237,8 +6247,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 count: moved.length, taskIds: moved.slice(0, 6), key: 'ctrl+b',
               });
               pushChatLine(moved.length > 0
-                ? `  ⏳ 자식 ${moved.length}개를 백그라운드로 옮겼습니다 — 끝나면 알려 드립니다.`
-                : '  (지금 백그라운드로 옮길 자식이 없습니다)');
+                ? `  ⏳ moved ${moved.length} child${moved.length === 1 ? '' : 'ren'} to the background — I'll tell you when they finish.`
+                : '  (no child to move to the background)');
               draw();
             } catch { /* 승격 실패가 스트리밍을 막지 않는다 */ }
             return 'consumed';
@@ -6564,7 +6574,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         reportTuiTurn('idle');
         const failedTurnRaw = autowakeTurnFailureRaw;
         autowakeTurnFailureRaw = null;
-        if (phase.turnEnd !== false) seatAutowake.noteTurnEnded({ sessionId: currentChatPersonaSessionId(), lastLine: chatLines.at(-1) ?? '', errorDetail: failedTurnRaw ?? undefined });
+        if (phase.turnEnd !== false) { seatAutowake.noteTurnEnded({ sessionId: currentChatPersonaSessionId(), lastLine: chatLines.at(-1) ?? '', errorDetail: failedTurnRaw ?? undefined }); seatMailInbox?.noteTurnEnded(); }
         try {
           // «이번 턴»이 그린 줄만 본다 — 앞 턴의 ✘·취소 표시가 이번 턴 판정에 새지 않게(r1 must-fix).
           const turnLines = chatLines.slice(chatLinesStartIndex);
@@ -9080,7 +9090,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     dispatchCore,
     dispatchPlugin: (name, args) => pluginHost.dispatchTool(name, args),
     dispatchGraph: createDashboardGraphRouteDispatcher(opts.graphRunOptions,
-      (prompt) => requestDashboardGraphConfirmation(inlineChoiceBroker, prompt)),
+      (prompt) => requestDashboardGraphDecision(inlineChoiceBroker, prompt)),
     requestConfirmation: (prompt) => requestDashboardGraphConfirmation(inlineChoiceBroker, prompt),
     getTuiDispatchContext: async () => {
       const nexusSession = opts.getNexusMemberSession?.();
@@ -12010,9 +12020,21 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       try { draw(); } catch { /* TUI torn down */ }
     });
     process.once('beforeExit', () => agentDoneRedraw.dispose());
+    // ELS-AUTO-CHILD-TABS — when els launched this eln (ELANOUS_ELS_WS names its workspace), sub-agent start/end
+    // become child tabs in that workspace (els also sets ELANOUS_ELS_SOCKET). Fail-soft; nothing is wired outside els.
+    const elsChildWs = process.env.ELANOUS_ELS_WS?.trim();
+    if (elsChildWs) {
+      const elsChildProducer = wireElsChildProducer({ registry: globalAgentRegistry, ws: elsChildWs, socketPath: process.env.ELANOUS_ELS_SOCKET?.trim() || elsSocketPath(), cwd: process.cwd() });
+      process.once('beforeExit', () => elsChildProducer.dispose());
+    }
     // ⭐ TUI-AGENT-IDLE-WAKE — 배경 자식(⊕ RunShell bg) 완료 큐의 «유일한» 구독(onEnqueue 구독 0 → 1).
     //   채팅 한 줄 «✓ 위임 끝: <이름> — 다음 턴에 결과» · 결과는 다음 턴 preamble 이 싣는다.
     //   ⛔ 입력칸·injectKey·pty 주입 0(대표 비침투). dedupe·수명은 모듈, 여기선 배선만.
+    // #38031 CHILD-NOTICE — 하니스 자식 종료 한 줄(notice 계약). 클래식 대시보드에는 Next 입력
+    // 큐가 없으므로 싱크가 곧 표시다(적입 → 채팅 줄 push) · taskId당 1회 판정은 agent-wake 모듈 소유.
+    const dashboardChildNotices = createChildNoticeProducers(
+      createChildNoticeLineSink((text) => { chatLines.push(C.muted(text)); draw(); }),
+    );
     const agentWake = installSeatedAgentWake({
       subscribe: (listener) => subscribeDashboardAgentResults(
         globalTaskNotificationQueue, listener, (line) => { pushChatLine(C.muted(line)); draw(); },
@@ -12024,6 +12046,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts),
       getCwd: () => workingDir.cwd,
       isPending: (taskId) => globalTaskNotificationQueue.has(taskId),
+      // #38031 — 하니스 자식 종료를 notice 로(위임 종료 줄과 별개로 큐 계약 문구로 남는다).
+      childFinished: (info) => { dashboardChildNotices.harnessChildFinished(info); },
     });
     disposeDashboardAgentWake = () => agentWake.dispose();
 
@@ -14440,7 +14464,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         resolveSessionId,
         historyFromSession,
         chatHistory: chat.history,
-        setAttachedSessionId: (sessionId) => { attachedSessionId = sessionId; },
+        setAttachedSessionId: (sessionId) => { attachedSessionId = sessionId; bindAttachedWakeupSession(); },
         setActiveSessionId,
       });
       if (!resume.resumed) {
@@ -16335,7 +16359,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 openDetailViewer: (title, lines) => { setDetailViewer(title, lines); },
               },
               getAttachedSessionId: () => attachedSessionId,
-              setAttachedSessionId: (id) => { attachedSessionId = id; },
+              setAttachedSessionId: (id) => { attachedSessionId = id; bindAttachedWakeupSession(); },
               chatPersona: {
                 sessionId: currentChatPersonaSessionId,
                 selection: chatPersonaSelection,
@@ -17537,11 +17561,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 thinking,
                 finalStatus,
                 finalError,
+                turnStartedAt,
+                backgroundRunning: backgroundJobsStatus.summary().background,
                 chatFooterLine,
                 pushChatLine: (line) => { chatLines.push(line); },
                 setChatScrollBottom: () => { chatScrollOffset = -1; },
                 consumeQuickControl: () => consumeSessionQuickControl(chatModeState),
                 muted: C.muted,
+                accent: C.accent,
                 draw,
               });
             },
@@ -17751,7 +17778,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     throw err;
   } finally {
     setSelfImplementSoftStopSpaceObserver(null);
-    if (tuiSeatAskTimer) clearInterval(tuiSeatAskTimer);
+    if (tuiSeatAskTimer) clearInterval(tuiSeatAskTimer); seatMailInbox?.stop();
     wakeupScheduler.dispose();
   }
 }

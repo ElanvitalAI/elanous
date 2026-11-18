@@ -9,6 +9,7 @@ import { getUserConfig } from '../user-config/reader.js';
 import { CODEX_CREDENTIAL_SLOT, credentialOwnerLedgerPath, normalizeCredentialHost, readCredentialOwner, recordCredentialMirror, resolveCodexCredentialOwnerHost, type CredentialOwnerRecord } from '../nexus/config/secrets/cred-owner.js';
 import { loadTokens, type ProviderAuthState } from './store.js';
 import { decodeJWTPayload } from './jwt.js';
+import { assertCodexLeaseUsable, isCodexLeaseEntry } from '../secret/codex-lease-guard.js';
 
 export const CODEX_OWNER_MIRROR_RELATIVE_PATH = join('remote-parent-credentials', 'cli-mirror', 'auth.json');
 export const CODEX_OWNER_MIRROR_REQUIRED = 'Codex owner access mirror rejected — inspect llm.codex/owner-mirror-rejected for the precise reason';
@@ -160,6 +161,8 @@ export function readCodexOwnerAccessMirror(
   if (!readFailure) {
     try { state = loadTokens(storeKey, path) ?? codexHomeAccessState(parsed); } catch { /* classify safely below */ }
   }
+  // HQ-VAULT V2: a leased mirror entry is judged by its lease (typed «expired»/«revoked» error, no refresh).
+  if (state && isCodexLeaseEntry(state)) return assertCodexLeaseUsable(state, { now, storeKey });
   const tokenFields = state?.tokens as (ProviderAuthState['tokens'] & { refresh_token?: unknown }) | undefined;
   const expiresAt = state?.tokens.expiresAt;
   const reason = readFailure ?? (!state || !state.tokens ? 'no-access'

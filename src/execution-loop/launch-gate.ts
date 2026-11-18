@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -322,8 +323,73 @@ function decidePreLaunch(input: PreLaunchGateInput, deps: PreLaunchGateDeps): Pr
 /** Env contract: hand 가 소비한 requestId 를 자식 say 가 물려받아 같은 문을 다시 두드리지 않게 한다(한 번만 상속). */
 export const LAUNCH_DOOR_RECEIPT_ENV = 'ELANOUS_LAUNCH_DOOR_RECEIPT';
 
+/** OP hold 파일 — 이 파일이 있으면 TA 발사 입구는 force 포함 모든 발사를 거부한다(내용은 사유 한 줄). */
+export const LAUNCH_HOLD_FILE_ENV = 'ELANOUS_LAUNCH_HOLD_FILE';
+/** 발사 승인 증거 — `tasks preflight --out` 영수증 경로와 그 sha256(OP 승인 한 줄에 실려 온다). */
+export const TA_PREFLIGHT_RECEIPT_ENV = 'ELANOUS_TA_PREFLIGHT_RECEIPT';
+export const TA_PREFLIGHT_SHA_ENV = 'ELANOUS_TA_PREFLIGHT_SHA256';
+export const TA_PREFLIGHT_MAX_AGE_MS = 60 * 60 * 1000;
+
+export interface LaunchAdmissionDeps {
+  readonly holdFile?: string;
+  readonly receiptPath?: string;
+  readonly receiptSha256?: string;
+  readonly maxAgeMs?: number;
+}
+
+export function defaultLaunchHoldFile(env: Readonly<Record<string, string | undefined>> = process.env): string {
+  return env[LAUNCH_HOLD_FILE_ENV]?.trim() || join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'LAUNCH-HOLD');
+}
+
+function holdReason(file: string): string | null {
+  try {
+    if (!statSync(file).isFile()) return null;
+  } catch (error) {
+    // 파일이 없으면 hold 없음. 그 밖의 읽기 오류는 보수적으로 hold 로 본다.
+    return (error as NodeJS.ErrnoException)?.code === 'ENOENT' || (error as NodeJS.ErrnoException)?.code === 'ENOTDIR' ? null : `hold 파일을 읽지 못했다(${(error as NodeJS.ErrnoException)?.code ?? 'error'})`;
+  }
+  try { return readFileSync(file, 'utf8').split(/\r?\n/, 1)[0]!.trim().slice(0, 200) || '사유 없음'; } catch { return '사유 읽기 실패'; }
+}
+
+/**
+ * TA 발사 입구 승인 — OP hold 가 있으면 거부, TA 발사(`ta`)는 READY 인 TA-PREFLIGHT 영수증이 없으면 거부.
+ * force 도 이 판정을 건너뛰지 못한다(호출 쪽이 consume 안에서 force 처리보다 먼저 부른다).
+ */
+export interface LaunchTarget { readonly card?: string; readonly cell?: string; readonly commit?: string }
+
+export function decideLaunchAdmission(input: { readonly ta: boolean; readonly now: Date; readonly skipReceipt?: boolean; readonly target?: LaunchTarget }, deps: LaunchAdmissionDeps = {}): { readonly allowed: boolean; readonly reason: string } {
+  const hold = holdReason(deps.holdFile ?? defaultLaunchHoldFile());
+  if (hold !== null) return { allowed: false, reason: `OP hold 활성 — 발사 거부(force 포함): ${hold}` };
+  if (!input.ta || input.skipReceipt === true) return { allowed: true, reason: input.ta ? 'hold 없음 · 부모가 이미 승인한 발사' : 'hold 없음' };
+  const path = deps.receiptPath ?? process.env[TA_PREFLIGHT_RECEIPT_ENV]?.trim();
+  const expectedSha = deps.receiptSha256 ?? process.env[TA_PREFLIGHT_SHA_ENV]?.trim();
+  if (!path || !expectedSha) return { allowed: false, reason: `TA-PREFLIGHT 영수증 없음 — 발사 거부(force 포함). ${TA_PREFLIGHT_RECEIPT_ENV}·${TA_PREFLIGHT_SHA_ENV} 필요` };
+  let body: string;
+  try { body = readFileSync(path, 'utf8'); } catch { return { allowed: false, reason: `TA-PREFLIGHT 영수증을 읽지 못했다: ${path}` }; }
+  if (createHash('sha256').update(body).digest('hex') !== expectedSha.toLowerCase()) return { allowed: false, reason: 'TA-PREFLIGHT 영수증 sha256 불일치' };
+  let parsed: { kind?: unknown; createdAt?: unknown; target?: unknown; report?: { overall?: unknown } };
+  try { parsed = JSON.parse(body) as typeof parsed; } catch { return { allowed: false, reason: 'TA-PREFLIGHT 영수증 형식 오류' }; }
+  const overall = parsed.kind === 'ta-preflight' ? parsed.report?.overall : undefined;
+  if (overall !== 'READY') return { allowed: false, reason: `TA-PREFLIGHT 영수증이 READY 가 아님(${typeof overall === 'string' ? overall : '형식 오류'})` };
+  // 새것 판정은 영수증 «안» 생성 시각 — 파일 mtime 은 복사·touch 로 새것처럼 만들 수 있어 쓰지 않는다.
+  const createdMs = typeof parsed.createdAt === 'string' ? Date.parse(parsed.createdAt) : Number.NaN;
+  if (!Number.isFinite(createdMs)) return { allowed: false, reason: 'TA-PREFLIGHT 영수증에 생성 시각(createdAt)이 없다' };
+  const age = input.now.getTime() - createdMs;
+  if (age < -5 * 60_000) return { allowed: false, reason: 'TA-PREFLIGHT 영수증 생성 시각이 미래다' };
+  if (age > (deps.maxAgeMs ?? TA_PREFLIGHT_MAX_AGE_MS)) return { allowed: false, reason: `TA-PREFLIGHT 영수증이 오래됨(${Math.round(age / 60000)}분) — 다시 검사` };
+  // 발사 대상 대조 — 영수증에 박힌 카드/칸/commit 은 이 발사의 값과 같아야 하고, 하나도 안 박혔으면 무효다.
+  const bound = parsed.target && typeof parsed.target === 'object' ? parsed.target as Record<string, unknown> : {};
+  const keys = (['card', 'cell', 'commit'] as const).filter((key) => typeof bound[key] === 'string' && (bound[key] as string).length > 0);
+  if (keys.length === 0) return { allowed: false, reason: 'TA-PREFLIGHT 영수증이 발사 대상(card/cell/commit)에 묶이지 않았다' };
+  for (const key of keys) {
+    const actual = input.target?.[key];
+    if (actual === undefined || actual !== bound[key]) return { allowed: false, reason: `TA-PREFLIGHT 영수증은 다른 발사용이다(${key}: 영수증 ${String(bound[key])} ≠ 발사 ${actual ?? '미상'})` };
+  }
+  return { allowed: true, reason: 'hold 없음 · PREFLIGHT READY' };
+}
+
 /** append 전용 요청 원장의 행 종류 — 요청(중복 포함)·소비·거절·강제·실패·단일문 사용 불가 관측. */
-export type LaunchRequestLedgerEvent = 'requested' | 'consumed' | 'refused-duplicate' | 'forced-duplicate' | 'launch-failed' | 'door-unavailable';
+export type LaunchRequestLedgerEvent = 'requested' | 'consumed' | 'refused-duplicate' | 'forced-duplicate' | 'launch-failed' | 'door-unavailable' | 'refused-admission';
 
 /** append 전용 요청 원장의 한 행 — 행은 지우거나 고치지 않는다(관측 전용). */
 export interface LaunchRequestLedgerRow {
@@ -361,7 +427,7 @@ export interface LaunchRequestDoor {
   /** 요청 한 건을 원장에 append 하고 그 requestId 를 돌려준다(중복 재요청도 매번 append 된다). */
   requestId(ask: string, context?: { readonly seat?: string; readonly cell?: string; readonly originalRef?: string; readonly retryGroup?: string; readonly reason?: string }): string;
   /** requestId 단위 단일 소비 — 영수증은 최초 1회만 발급된다(두 번째는 기존 영수증과 사유로 거절). */
-  consume(requestId: string, opts?: { readonly force?: boolean; readonly inheritedReceipt?: string }): LaunchRequestConsumption;
+  consume(requestId: string, opts?: { readonly force?: boolean; readonly inheritedReceipt?: string; /** TA(자식 발사) 입구면 true — PREFLIGHT 영수증을 요구한다. */ readonly ta?: boolean; /** 이 발사의 카드/칸/commit — 영수증 target 과 대조한다. */ readonly target?: LaunchTarget }): LaunchRequestConsumption;
   /** 발사 실패 사유를 원장에 append 한다(관측 — 발사를 막지 않는다). */
   fail(requestId: string, reason: string): void;
   /** 원장 조회 — 중복 거절·실패·재시도 사유를 읽는다(인자를 주면 그 requestId 의 행만). */
@@ -411,7 +477,7 @@ export function summarizeLaunchRequestRows(all: readonly LaunchRequestLedgerRow[
     if (request.events.has('consumed')) consumed += 1;
     else if (request.events.has('requested')) unconsumed += 1;
     if (request.events.has('launch-failed')) failed += 1;
-    if (request.events.has('refused-duplicate')) refused += 1;
+    if (request.events.has('refused-duplicate') || request.events.has('refused-admission')) refused += 1;
     if (request.events.has('door-unavailable')) doorUnavailable += 1;
     const requestRow = request.firstRequest;
     if (requestRow) {
@@ -431,6 +497,8 @@ export interface LaunchRequestDoorDeps {
   readonly root?: string;
   readonly now?: () => Date;
   readonly source?: string;
+  /** 시험·운영 주입: hold 파일·PREFLIGHT 영수증 위치. */
+  readonly admission?: LaunchAdmissionDeps;
 }
 
 const LAUNCH_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -491,11 +559,18 @@ export function openLaunchRequestDoor(deps: LaunchRequestDoorDeps = {}): LaunchR
     return id;
   };
 
-  const consume = (id: string, opts: { readonly force?: boolean; readonly inheritedReceipt?: string } = {}): LaunchRequestConsumption => {
+  const consume = (id: string, opts: { readonly force?: boolean; readonly inheritedReceipt?: string; readonly ta?: boolean; readonly target?: LaunchTarget } = {}): LaunchRequestConsumption => {
     if (!LAUNCH_REQUEST_ID_PATTERN.test(id)) {
       return { status: 'unavailable', requestId: id, reason: `requestId 가 원장 키로 쓸 수 없다: ${JSON.stringify(id)}` };
     }
     const at = now().toISOString();
+    // OP hold / PREFLIGHT 영수증 — force 보다 먼저 판정한다. 거절은 영수증을 소비하지 않아 승인 뒤 재시도할 수 있다.
+    const inheritedOk = opts.inheritedReceipt !== undefined && opts.inheritedReceipt === id && readReceipt(id) !== null;
+    const admission = decideLaunchAdmission({ ta: opts.ta === true, now: now(), skipReceipt: inheritedOk, ...(opts.target ? { target: opts.target } : {}) }, deps.admission);
+    if (!admission.allowed) {
+      appendRow({ event: 'refused-admission', requestId: id, at, ...(source ? { source } : {}), reason: admission.reason });
+      return { status: 'refused', requestId: id, receiptId: null, receiptAt: null, reason: admission.reason };
+    }
     // 부모(hand)가 같은 requestId 를 이미 소비했다면 상속 영수증으로 지나간다 — 새 영수증을 만들지 않는다.
     if (opts.inheritedReceipt !== undefined && opts.inheritedReceipt === id) {
       const inherited = readReceipt(id);

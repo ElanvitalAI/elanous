@@ -6,7 +6,7 @@ export type NextTuiHarnessCommand = { readonly command: 'ask'; readonly goal: st
 
 export type NextTuiHarnessRunner = typeof runLocalHarnessCommand;
 
-export const NEXT_TUI_HARNESS_USAGE = '사용법: /harness ask <목표> · /harness runs';
+export const NEXT_TUI_HARNESS_USAGE = 'Usage: /harness ask <goal> · /harness runs';
 
 /** Parse only the two supported Next TUI harness commands. */
 export function parseNextTuiHarnessCommand(input: string): NextTuiHarnessCommand | null {
@@ -19,7 +19,7 @@ export function parseNextTuiHarnessCommand(input: string): NextTuiHarnessCommand
 }
 
 export function nextTuiHarnessStartLine(request: NextTuiHarnessCommand): string {
-  return `하니스 ${request.command === 'ask' ? '시작' : '진행 조회'}: ${request.goal || 'runs'}`;
+  return `Harness ${request.command === 'ask' ? 'start' : 'progress'}: ${request.goal || 'runs'}`;
 }
 
 /** The registry-loaded branch reuses the established local harness CLI adapter. */

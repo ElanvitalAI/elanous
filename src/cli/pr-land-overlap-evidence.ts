@@ -796,6 +796,14 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
       if (mismatch) console.warn(`⚠ overlap-evidence: review provider mismatch — requestedModel=${requested} actualBackend=${actualBackend || 'unmeasured'} model=${model || 'unmeasured'} reviewRoute=${route || 'unmeasured'} respondedProvider=${respondedProvider || 'unmeasured'} respondedModel=${respondedModel || 'unmeasured'} (${e.reviewResult})`);
     }
   }
+  // REVIEW-NO-SILENT-GLM-FALLBACK (#38331): the producer marks requested engine ≠ responded engine as
+  //   `invalid: true` (src/agent-substrate/self-review-cli.ts). Such a verdict is not this PR's review.
+  //   Files written before the field existed carry no `invalid` and keep today's contract.
+  if (raw?.invalid === true) {
+    const invalidReason = typeof raw.invalidReason === 'string' && /^[a-z0-9-]{1,64}$/.test(raw.invalidReason) ? raw.invalidReason : 'unspecified';
+    debug.log('pr.land', 'review-invalid-refused', { pr: input.pr, invalidReason, reviewResult: e.reviewResult });
+    return { ok: false, reason: `review-invalid-${invalidReason}`, baseTip };
+  }
   if (review.error) return { ok: false, reason: 'review-error', baseTip };
   if (review.reviewed !== true) return { ok: false, reason: 'review-not-reviewed', baseTip };
   if (review.verdict === null || !ACCEPTED_REVIEW_VERDICTS.has(review.verdict)) return { ok: false, reason: `review-verdict-${review.verdict ?? 'null'}`, baseTip };

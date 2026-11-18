@@ -16,6 +16,7 @@
 // Reference: PLAN §3.3 (preset catalog) + §3.5 (NL tier switch · M3-3
 // dependency).
 
+import { llmNetworkFetch } from '../session-runtime/llm-call-gateway.js';
 import {
   PRESETS,
   type PresetId,
@@ -185,7 +186,7 @@ export function createLocalLlmPresetRunner(opts: LocalLlmRunnerOpts): LlmRunner 
   return async (messages) => {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (opts.token) headers.authorization = `Bearer ${opts.token}`;
-    const res = await fetch(`${endpoint}/chat/completions`, {
+    const res = await llmNetworkFetch(`${endpoint}/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -196,7 +197,7 @@ export function createLocalLlmPresetRunner(opts: LocalLlmRunnerOpts): LlmRunner 
         stream: false,
       }),
       ...(opts.signal ? { signal: opts.signal } : {}),
-    });
+    }, { provider: 'local-llm', model: opts.model, role: 'aux', requestedBy: 'model-tier.preset-suggest' });
     if (!res.ok) throw new Error(`local-llm ${res.status}`);
     const json = (await res.json()) as {
       choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;

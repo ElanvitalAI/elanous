@@ -129,7 +129,7 @@ interface RotationInput {
  * ⛔ 후보 선택은 «결정론»이다(이름 오름차순). 무작위면 같은 상황에서 다른 답이 나와
  *   「왜 이 계정인가」를 사후에 못 재구성한다.
  */
-const DEFAULT_ROTATION_THRESHOLD_PERCENT = 85;
+export const DEFAULT_ROTATION_THRESHOLD_PERCENT = 85;
 
 function balancedCandidate(
   candidates: readonly RotationCandidate[], key: string, weights: Readonly<Record<string, number>> | undefined,

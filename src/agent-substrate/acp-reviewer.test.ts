@@ -614,3 +614,33 @@ describe('ACP claude review routes through teamclaude', () => {
     } finally { rmSync(empty, { recursive: true, force: true }); }
   });
 });
+
+// REVIEW-NO-SILENT-GLM-FALLBACK (#38337) — claude-acp results carried `respondedModel: null`.
+describe('ACP reviewer reports the responding model', () => {
+  it('after a completed turn: the session current model, else the picked alias; never on failure', async () => {
+    // 출처: #38337 — fixture deadline only; every fake agent below answers (or refuses) immediately.
+    const turn = { timeoutMs: 1_000 };
+    const seen: Array<[string, string | undefined]> = [];
+    const onResolved = (provider: string, model: string | undefined) => { seen.push([provider, model]); };
+    const withState = reviewAgent({ backendId: 'claude' });
+    (withState as unknown as { getSessionModels: () => unknown }).getSessionModels = () => ({ currentModelId: 'claude-opus-4-5', availableModels: [] });
+    await makeAcpReviewLLM({ cwd: '.', backend: 'claude', model: 'opus', ...turn, createAgent: () => withState, onResolved })('review');
+    expect(seen).toEqual([['acp:claude', 'claude-opus-4-5']]);
+
+    const pickedOnly = reviewAgent({ backendId: 'claude' });
+    pickedOnly.selectSessionModel = (async () => ({ modelId: 'opus', name: 'Opus' })) as AcpAgent['selectSessionModel'];
+    await makeAcpReviewLLM({ cwd: '.', backend: 'claude', model: 'opus', ...turn, createAgent: () => pickedOnly, onResolved })('review');
+    expect(seen.at(-1)).toEqual(['acp:claude', 'opus']);
+
+    const silent = reviewAgent({ backendId: 'claude' });
+    await makeAcpReviewLLM({ cwd: '.', backend: 'claude', ...turn, createAgent: () => silent, onResolved })('review');
+    expect(seen.at(-1)).toEqual(['acp:claude', undefined]);
+
+    const refused = reviewAgent({ backendId: 'claude' });
+    refused.start = (async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:443'); }) as AcpAgent['start'];
+    const before = seen.length;
+    await expect(makeAcpReviewLLM({ cwd: '.', backend: 'claude', ...turn, createAgent: () => refused, onResolved })('review'))
+      .rejects.toThrow('ECONNREFUSED');
+    expect(seen).toHaveLength(before);
+  });
+});

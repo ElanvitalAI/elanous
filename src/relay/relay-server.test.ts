@@ -138,6 +138,26 @@ describe('Bun encrypted-frame relay', () => {
     expect(correctUserOffline.status).toBe(503);
   });
 
+  test('bare member host redirects only one pinned public app and refuses ambiguous or write routes', async () => {
+    const key = signing();
+    const server = startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]),
+      publicDomain: 'elanous.app', publicServerId: key.id, publicUserId: 'user',
+      publicReadableApps: new Set(['user/notes']) });
+    servers.push(server);
+    const base = `http://127.0.0.1:${server.port}/hello?part=2`;
+    const good = await fetch(base, { headers: { host: 'user.elanous.app' }, redirect: 'manual' });
+    expect(good.status).toBe(308);
+    expect(good.headers.get('location')).toBe('https://notes--user.elanous.app/hello?part=2');
+    expect((await fetch(base, { method: 'POST', headers: { host: 'user.elanous.app' } })).status).toBe(404);
+    expect((await fetch(base, { headers: { host: 'other.elanous.app' } })).status).toBe(404);
+    const ambiguous = startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]),
+      publicDomain: 'elanous.app', publicServerId: key.id, publicUserId: 'user',
+      publicReadableApps: new Set(['user/notes', 'user/tasks']) });
+    servers.push(ambiguous);
+    expect((await fetch(`http://127.0.0.1:${ambiguous.port}/`,
+      { headers: { host: 'user.elanous.app' } })).status).toBe(404);
+  });
+
   test('custom relay hosts require verified ownership, pinned user, and a ready certificate', () => {
     const key = signing();
     expect(() => startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app',

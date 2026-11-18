@@ -11,9 +11,12 @@
 // ⛔ worktreePath 는 Pod 안 경로라 호스트에서 쓸 수 없다 → disposition 에서 지운다.
 // 부작용(kubectl·파일)은 주입받는다 — 시험은 가짜 kubectl 로 누른다.
 
+import { taPodDeadlineSeconds } from '../../task-agent/work-order.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { emitPodLifecycle, parseSiTaskDepsSkipped, parseSiTaskPodStages, siTaskPodK8sTiming, siTaskPodLifecycleEvent, siTaskPodStageShell } from './pod-lifecycle-stages.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
+import { podImageDigestGate, requestedImageDigest, verifyPodImageDigest, type PodImageDigestVerdict } from './pod-image-digest-check.js';
+import { verifyPodSourceHead, podSourceHeadGate, type PodSourceHeadVerdict } from './pod-source-head-check.js';
 import { GROUNDING_TOKEN_ENV, GROUNDING_URL_ENV, mintGroundingToken, revokeGroundingRun, type GroundingTokenScope } from '../../grounding/token.js';
 import { POD_CREDENTIAL_GROK_PATH, POD_CREDENTIAL_GITHUB_PATH, POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV, installationRepositories } from '../../nexus/api/pod-credential-api.js';
 import { coalescedInstallationCredential } from '../../auth/github-app-token.js';
@@ -242,6 +245,8 @@ export interface PodSpawnOptions {
   siWarmLedger?: (entry: RunLedgerEntry) => void;
   /** 이미지 판(라벨 elanous.commit) — 주입(시험·감독기가 이미 잰 값). 없으면 docker 로 잰다. */
   imageCommit?: string | null;
+  /** TA-PREFLIGHT ② — 요청 이미지 digest pin(sha256:<64hex>). 없으면 이미지 ref 의 @sha256 를 쓴다. 둘 다 없으면 대조 없음(no-pin). */
+  imageDigestPin?: string;
   /** codex 계정 이름(`~/.elanous/auth.json` 의 `openai-codex:<이름>`). 기본 team. */
   account?: string;
   /** Job 마다 계정을 고른다(pod-account-broker) — 있으면 `account` 보다 먼저. */
@@ -2442,10 +2447,19 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       let repairArtifactReady = false;
       let hostOriginCalls: number | null = 0;
       let sourceBaseSha: string | undefined;
+      let sourceHeadCheck: PodSourceHeadVerdict = { verdict: 'not-applicable', pinned: null, received: null };
       const recordSourceAttemptOutcome = (logs: string | null, captureStatus: 'captured' | 'logs-unavailable', observedChildRunId?: string) => {
         const optionBaseSha = options.source && 'baseSha' in options.source ? options.source.baseSha : undefined;
         const outcome = parsePodSourceAttemptOutcome(logs, { sourceKind: options.source?.kind ?? 'default', baseSha: sourceBaseSha ?? optionBaseSha });
         const data = { job: name, childRunId: observedChildRunId ?? childRunId ?? null, attempt: oomRetried ? 2 : 1, captureStatus, ...outcome };
+        // TA-PREFLIGHT ① — commit 핀이면 자식이 실제 받은 HEAD 를 대조해 원장에 남긴다(결손도 «missing» 으로 — 조용한 0 금지).
+        sourceHeadCheck = verifyPodSourceHead(logs, options.source);
+        if (sourceHeadCheck.verdict !== 'not-applicable') {
+          const headData = { job: name, childRunId: observedChildRunId ?? childRunId ?? null, captureStatus, ...sourceHeadCheck };
+          debug.log('pod.source', 'head-check', headData, sourceHeadCheck.verdict === 'match' ? undefined : { level: 'warn' });
+          try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-source-head-check', data: headData }, ledgerDir); }
+          catch (error) { debug.log('pod.source', 'head-check-ledger-unavailable', { job: name, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+        }
         debug.log('pod.source', 'attempt-outcome', data, outcome.classification === 'status-not-recorded' ? { level: 'warn' } : undefined);
         try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-source-attempt-outcome', data }, ledgerDir); }
         catch (error) { debug.log('pod.source', 'attempt-outcome-ledger-unavailable', { job: name, childRunId: childRunId ?? null, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
@@ -2682,7 +2696,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           bedrockSpec = checked.spec;
         }
-        let jobDeadlineSeconds = options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS;
+        // TA 시범: hand 가 지시서 예산(time=)을 env 로 실어 보냈으면 Job 수명을 선언 벽시계+여유로 조인다(명시 옵션이 우선).
+        let jobDeadlineSeconds = options.deadlineSeconds ?? taPodDeadlineSeconds(env) ?? POD_JOB_DEADLINE_SECONDS;
         const creds = grok
           ? (options.grokCredentials ?? (() => hostGrokCredentials({ env, apiKeyOptIn: options.grokApiKeyOptIn })))()
           : apiKeyChild ? { ghToken: (options.openrouterGhToken ?? defaultGhToken)() }
@@ -2989,6 +3004,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         // The local Docker label cannot prove that member image's commit.
         const localImageCommit = options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit;
         const jobImageCommit = jobImage === image ? localImageCommit : null;
+        const imageDigestPin = requestedImageDigest(jobImage, options.imageDigestPin);
+        let imageDigestCheck: PodImageDigestVerdict = verifyPodImageDigest(imageDigestPin, { digest: null, digestUnavailable: 'not-observed-yet' });
         const launchRunId = retryAccount || oomRetried || ghLoginRetried ? mintRunId() : childRunId;
         let liveChildRunId = launchRunId;
         // TA-POD-WARMBOOT-PARITY — the id the followed Job prints in its result marker (null = wait on the condition only).
@@ -3236,6 +3253,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           cleanupSecret();
           return { exitCode: 1, output: '', error: { code: 'pod-provenance', message } };
         }
+        // 시도마다 대조 상태를 되돌린다 — 이전 시도의 match 가 이번 시도에 새어 통과하지 않게(commit 핀이면 missing 에서 시작).
+        sourceHeadCheck = verifyPodSourceHead(null, options.source);
         const job = podJobManifest({ provenance, name, namespace, fallbackChain, configSnapshotHash: configSnapshot.hash, ...(resultMarkerLine ? { resultMarkerLine } : {}), image: jobImage, workIdentity, ...(env.ELANOUS_TASK_BOUND_PR && /^[1-9]\d*$/.test(env.ELANOUS_TASK_BOUND_PR) && Number.isSafeInteger(Number(env.ELANOUS_TASK_BOUND_PR)) ? { boundPrNumber: Number(env.ELANOUS_TASK_BOUND_PR) } : {}), ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...((seedSource.kind === 'default' && sourceBaseSha) ? { source: { ...seedSource, baseSha: sourceBaseSha } } : options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: jobDeadlineSeconds, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: jobImageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(roleCodexCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}), ...(zaiFallbackSpec ? { zaiFallback: zaiFallbackSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const carriedBranch = goalDoc ? 'goal-doc' as const : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'author' as const : undefined;
         const carriedChildLlm = carriedBranch ? podDelegatedChildLlm(jobArgs) : undefined;
@@ -3382,8 +3401,11 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           const observed = readJobPodImage(kubectl, namespace, name, lifecycleJobUid);
           if (!final && !observed.podName) return;
           const append = (isFinal: boolean): void => {
+            // TA-PREFLIGHT ② — 요청 pin 대조 결과를 같은 원장 줄에 결속한다(run 원장 = 카드의 runId 로 이어진다).
+            const check = verifyPodImageDigest(imageDigestPin, observed);
+            if (isFinal) imageDigestCheck = check;
             const data = { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1,
-              image: jobImage, imageCommit: jobImageCommit, context, ...observed, final: isFinal };
+              image: jobImage, imageCommit: jobImageCommit, context, ...observed, digestPin: imageDigestPin, digestVerdict: check.verdict, final: isFinal };
             try {
               appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-image-digest', data }, ledgerDir);
               if (isFinal) terminalImageRecorded = true;
@@ -3688,6 +3710,16 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           usageLimitRetried = true;
           continue;
         }
+        // TA-PREFLIGHT ① — 대조 실패는 abort·로그인/usage 재시도·OOM 처리(아래)가 «먼저» 본 뒤, 정상 종료(complete)인데
+        // 영수증이 없거나 불일치일 때만 실패로 만든다. 자식이 소스 영수증 전에 죽은 경우(OOM 등)는 기존 처리가 우선이다.
+        const sourceHeadFailureReason = podSourceHeadGate(sourceHeadCheck, { state, aborted: input.signal?.aborted === true });
+        if (sourceHeadFailureReason) {
+          // 잘못된 소스로 이미 PR 을 열었다면 고아가 되지 않게 번호·가지를 사유에 남긴다.
+          const orphan = parsed ? [parsed.prNumber !== undefined ? `PR #${parsed.prNumber}` : '', parsed.branch ? `branch ${parsed.branch}` : ''].filter(Boolean).join(' · ') : '';
+          return { exitCode: 1, output: logs.slice(-4096), error: { code: 'pod-source-head-mismatch', message: orphan ? `${sourceHeadFailureReason} · 자식이 남긴 산출 ${orphan}` : sourceHeadFailureReason } };
+        }
+        const imageDigestFailureReason = podImageDigestGate(imageDigestCheck, { state, aborted: input.signal?.aborted === true });
+        if (imageDigestFailureReason) return { exitCode: 1, output: logs.slice(-4096), error: { code: 'pod-image-digest-mismatch', message: imageDigestFailureReason } };
         // Pod 안 경로는 호스트에서 쓸 수 없다.
         let disposition: SelfImplementDisposition | undefined = parsed ? { ...parsed, worktreePath: undefined } : deadlineMarker
           ? { stage: 'deadline', ok: false, ...(deadlineMarker.pr ? { prNumber: deadlineMarker.pr } : {}), ...(deadlineMarker.branch ? { branch: deadlineMarker.branch } : {}) }

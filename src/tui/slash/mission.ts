@@ -53,19 +53,19 @@ function missionWatchPoll(
       rollup?: { total: number; ok: number; stale: number; error: number; active: number; pending: number };
     };
     if (result.error || !result.mission) {
-      return { message: result.error ?? `미션 상태를 읽지 못했습니다: ${id}`, outcome: 'error' };
+      return { message: result.error ?? `Could not read mission status: ${id}`, outcome: 'error' };
     }
     const status = result.mission.status ?? 'unknown';
     sawBuilding ||= status === 'building';
     stableReadySamples = status === 'building' ? 0 : stableReadySamples + 1;
     const rollup = result.rollup;
     const progress = rollup
-      ? ` · 파생 ${rollup.total} · ✅${rollup.ok} ⏰${rollup.stale} ❌${rollup.error} 🔵${rollup.active} ⏳${rollup.pending}`
+      ? ` · derived ${rollup.total} · ✅${rollup.ok} ⏰${rollup.stale} ❌${rollup.error} 🔵${rollup.active} ⏳${rollup.pending}`
       : '';
     const readyDone = mode === 'ready' && status !== 'building'
       && (sawBuilding || stableReadySamples >= 4 || status === 'armed' || status === 'running');
     const runDone = mode === 'run' && ['done', 'failed', 'disarmed', 'rejected'].includes(status);
-    return { message: `미션 ${id}: ${status}${progress}`, outcome: readyDone || runDone ? 'complete' : 'pending' };
+    return { message: `Mission ${id}: ${status}${progress}`, outcome: readyDone || runDone ? 'complete' : 'pending' };
   };
 }
 
@@ -83,7 +83,7 @@ async function pushPhaseBoard(
   if (!isActive()) return;
   if (r.error) { ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`)); return; }
   if (!r.phases || r.phases.length === 0) {
-    ctx.chatLines.push(ctx.muted('  (페이즈 없음 — 단일/미분해 미션)'));
+    ctx.chatLines.push(ctx.muted('  (no phases — single or undivided mission)'));
     return;
   }
   for (const p of r.phases) {
@@ -103,7 +103,7 @@ async function missionNew(sub: string, args: string[], ctx: MissionSlashContext,
   const goal = args.slice(1).join(' ').replace(/^["'“]|["'”]$/g, '').trim();
   ctx.chatLines.push(ctx.accent(`❯ /mission new`));
   if (!goal) {
-    ctx.chatLines.push(ctx.warning('  usage: /mission new <goal 문장>'));
+    ctx.chatLines.push(ctx.warning('  usage: /mission new <goal sentence>'));
     ctx.setChatScrollOffset(-1);
     return;
   }
@@ -113,11 +113,11 @@ async function missionNew(sub: string, args: string[], ctx: MissionSlashContext,
     origin: { channel: 'tui' },
   });
   if (gate.route !== 'mission') {
-    ctx.chatLines.push(ctx.error('  ✗ 미션 등록 실패(게이트 passthrough)'));
+    ctx.chatLines.push(ctx.error('  ✗ Mission registration failed (gate passthrough)'));
     ctx.setChatScrollOffset(-1);
     return;
   }
-  ctx.chatLines.push(ctx.success(`  🎯 미션 등록: ${gate.goal.slice(0, 72)}`));
+  ctx.chatLines.push(ctx.success(`  🎯 Mission registered: ${gate.goal.slice(0, 72)}`));
   // R2: preparation board shows a prediction only. It is deliberately
   // not persisted as a pin; arming/execution re-resolves capability and
   // explicit selection at the later authority boundary.
@@ -128,15 +128,15 @@ async function missionNew(sub: string, args: string[], ctx: MissionSlashContext,
     text: goal,
     routePolicy: cfg.llm.routePolicy,
   });
-  ctx.chatLines.push(ctx.muted(`  · 예상 실행 레인 ${formatRouteDecisionSummary(expectedRoute)} (승인 시 재확인)`));
-  ctx.chatLines.push(ctx.muted(`  · 실행모델 ${gate.executionModel} (${gate.tier === 'heavy' ? '무거움' : '가벼움'})`));
-  ctx.chatLines.push(ctx.muted(`  · 🔎 외부조사 보강${gate.heavy ? ' + 멀티페이즈 분해' : ''} 준비 중 (백그라운드·수십초~분)`));
+  ctx.chatLines.push(ctx.muted(`  · Expected lane ${formatRouteDecisionSummary(expectedRoute)} (rechecked on approval)`));
+  ctx.chatLines.push(ctx.muted(`  · Model ${gate.executionModel} (${gate.tier === 'heavy' ? 'heavy' : 'light'})`));
+  ctx.chatLines.push(ctx.muted(`  · 🔎 Preparing research${gate.heavy ? ' + multi-phase breakdown' : ''} (background, tens of seconds to minutes)`));
   ctx.chatLines.push(ctx.muted(`  · id ${gate.missionId}`));
-  ctx.chatLines.push(ctx.muted('  ⏳ 준비되면 페이즈 보드 + 승인 선택이 이 채팅에 뜨집니다 (진행 확인: /mission trace)'));
+  ctx.chatLines.push(ctx.muted('  ⏳ When ready, the phase board and approval choice appear in this chat (progress: /mission trace)'));
   ctx.missionTui.startReadyWatch(gate.missionId, missionWatchPoll(gate.missionId, 'ready', dispatchAutopilotMissions), async (isActive) => {
     await pushPhaseBoard(ctx, dispatchAutopilotMissions, gate.missionId, isActive);
     if (!isActive()) return;
-    ctx.chatLines.push(ctx.muted(`  승인: /mission approve ${gate.missionId} · 보류: /mission hold ${gate.missionId}`));
+    ctx.chatLines.push(ctx.muted(`  Approve: /mission approve ${gate.missionId} · Hold: /mission hold ${gate.missionId}`));
     ctx.setChatScrollOffset(-1);
   });
   ctx.setChatScrollOffset(-1);
@@ -150,18 +150,18 @@ async function missionRevise(sub: string, args: string[], ctx: MissionSlashConte
   const comment = args.slice(2).join(' ').trim();
   ctx.chatLines.push(ctx.accent(`❯ /mission revise ${id}`));
   if (!id || !comment) {
-    ctx.chatLines.push(ctx.warning('  usage: /mission revise <apm_id> <정정 코멘트>'));
+    ctx.chatLines.push(ctx.warning('  usage: /mission revise <apm_id> <correction comment>'));
     ctx.setChatScrollOffset(-1);
     return;
   }
   const { spawnMissionPrepare } = await import('../../autopilot/mission-prepare-spawn.js');
   try { spawnMissionPrepare(id, { comment }); } catch { /* fail-soft */ }
-  ctx.chatLines.push(ctx.success(`  🔧 정정 반영 중: "${comment.slice(0, 60)}"`));
-  ctx.chatLines.push(ctx.muted('  재분해 후 새 페이즈 보드 + 승인 선택을 다시 보여드립니다'));
+  ctx.chatLines.push(ctx.success(`  🔧 Applying correction: "${comment.slice(0, 60)}"`));
+  ctx.chatLines.push(ctx.muted('  After re-planning, a new phase board and approval choice will appear'));
   ctx.missionTui.startReadyWatch(id, missionWatchPoll(id, 'ready', dispatchAutopilotMissions), async (isActive) => {
     await pushPhaseBoard(ctx, dispatchAutopilotMissions, id, isActive);
     if (!isActive()) return;
-    ctx.chatLines.push(ctx.muted(`  승인: /mission approve ${id} · 보류: /mission hold ${id}`));
+    ctx.chatLines.push(ctx.muted(`  Approve: /mission approve ${id} · Hold: /mission hold ${id}`));
     ctx.setChatScrollOffset(-1);
   });
   ctx.setChatScrollOffset(-1);
@@ -177,7 +177,7 @@ async function missionPhases(sub: string, args: string[], ctx: MissionSlashConte
     return;
   }
   await pushPhaseBoard(ctx, dispatchAutopilotMissions, id);
-  ctx.chatLines.push(ctx.muted('  조정: /mission trim|defer <id> <n> · edit <id> <n> <새 제목> · rebuild <id> <n>'));
+  ctx.chatLines.push(ctx.muted('  Adjust: /mission trim|defer <id> <n> · edit <id> <n> <new title> · rebuild <id> <n>'));
   ctx.setChatScrollOffset(-1);
   return;
 }
@@ -194,7 +194,7 @@ async function missionTrimOrDefer(sub: string, args: string[], ctx: MissionSlash
   const r = await dispatchAutopilotMissions({ action: sub, id, phase }) as { error?: string; note?: string };
   if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
   else {
-    ctx.chatLines.push(ctx.success(`  ✓ ${r.note ?? `${sub} 완료`}`));
+    ctx.chatLines.push(ctx.success(`  ✓ ${r.note ?? `${sub} done`}`));
     await pushPhaseBoard(ctx, dispatchAutopilotMissions, id); // 조정 결과를 새 보드로 즉시 확인.
   }
   ctx.setChatScrollOffset(-1);
@@ -207,14 +207,14 @@ async function missionEdit(sub: string, args: string[], ctx: MissionSlashContext
   const title = args.slice(3).join(' ').trim();
   ctx.chatLines.push(ctx.accent(`❯ /mission edit ${id} ${phase}`));
   if (!id || !phase || !title) {
-    ctx.chatLines.push(ctx.warning('  usage: /mission edit <apm_id> <phase> <새 제목> (설명 교정은 CLI/tool 의 description)'));
+    ctx.chatLines.push(ctx.warning('  usage: /mission edit <apm_id> <phase> <new title> (edit descriptions via the CLI/tool description)'));
     ctx.setChatScrollOffset(-1);
     return;
   }
   const r = await dispatchAutopilotMissions({ action: 'edit', id, phase, title }) as { error?: string; note?: string };
   if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
   else {
-    ctx.chatLines.push(ctx.success(`  ✓ ${r.note ?? '교정 완료'}`));
+    ctx.chatLines.push(ctx.success(`  ✓ ${r.note ?? 'Correction done'}`));
     await pushPhaseBoard(ctx, dispatchAutopilotMissions, id);
   }
   ctx.setChatScrollOffset(-1);
@@ -227,7 +227,7 @@ async function missionApproveOrHold(sub: string, args: string[], ctx: MissionSla
   const id = (args[1] ?? '').trim();
   ctx.chatLines.push(ctx.accent(`❯ /mission ${sub} ${id}`));
   if (!id) {
-    ctx.chatLines.push(ctx.warning(`  usage: /mission ${sub} <apm_id>${sub === 'hold' ? ' — 보류(기록 유지·실행 안 함)' : ' — 승인·집행 시작'}`));
+    ctx.chatLines.push(ctx.warning(`  usage: /mission ${sub} <apm_id>${sub === 'hold' ? ' — hold (keep the record, do not run)' : ' — approve and start execution'}`));
     ctx.setChatScrollOffset(-1);
     return;
   }
@@ -238,9 +238,9 @@ async function missionApproveOrHold(sub: string, args: string[], ctx: MissionSla
   ) as { error?: string; note?: string; scheduledCron?: string };
   if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
   else if (sub === 'approve') {
-    ctx.chatLines.push(ctx.success(`  ✅ 승인 — ${r.note ?? '실행 시작'}`));
+    ctx.chatLines.push(ctx.success(`  ✅ Approved — ${r.note ?? 'execution started'}`));
     if (!r.scheduledCron) ctx.missionTui.startRunWatch(id, missionWatchPoll(id, 'run', dispatchAutopilotMissions));
-  } else ctx.chatLines.push(ctx.warning(`  ⏸️ 보류 — ${r.note ?? '기록 유지'}`));
+  } else ctx.chatLines.push(ctx.warning(`  ⏸️ Held — ${r.note ?? 'record kept'}`));
   ctx.setChatScrollOffset(-1);
   return;
 }
@@ -253,14 +253,14 @@ async function missionRerunFamily(sub: string, args: string[], ctx: MissionSlash
   ctx.chatLines.push(ctx.accent(`❯ /mission ${sub} ${id}${phase ? ` ${phase}` : ''}`));
   if (!id || (needsPhase && !phase)) {
     ctx.chatLines.push(ctx.warning(sub === 'rerun'
-      ? '  usage: /mission rerun <apm_id> — 처음부터 재실행(세대+1·이전 PR close)'
+      ? '  usage: /mission rerun <apm_id> — rerun from the start (generation+1, closes the previous PR)'
       : sub === 'rereflect'
-        ? '  usage: /mission rereflect <apm_id> — 비평 지적 페이즈만 자동 재구현(머지는 HITL)'
+        ? '  usage: /mission rereflect <apm_id> — auto re-implement only the phases the critique flagged (merge stays HITL)'
         : sub === 'split'
-          ? '  usage: /mission split <apm_id> <phase index> — 과대 페이즈를 단일책임 서브페이즈로 재분해'
+          ? '  usage: /mission split <apm_id> <phase index> — split an oversized phase into single-responsibility sub-phases'
           : sub === 'skip'
-            ? '  usage: /mission skip <apm_id> <phase index> — 페이즈 건너뛰기(기능 제외·부분 완주)'
-            : '  usage: /mission rebuild <apm_id> <phase index|task id> — 그 페이즈부터 재구현'));
+            ? '  usage: /mission skip <apm_id> <phase index> — skip a phase (drops the feature, partial completion)'
+            : '  usage: /mission rebuild <apm_id> <phase index|task id> — re-implement from that phase'));
     ctx.setChatScrollOffset(-1);
     return;
   }
@@ -269,7 +269,7 @@ async function missionRerunFamily(sub: string, args: string[], ctx: MissionSlash
   }) as { error?: string; note?: string };
   if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
   else {
-    ctx.chatLines.push(ctx.success(`  🔄 ${r.note ?? `${sub} 시작`}`));
+    ctx.chatLines.push(ctx.success(`  🔄 ${r.note ?? `${sub} started`}`));
     ctx.missionTui.startRunWatch(id, missionWatchPoll(id, 'run', dispatchAutopilotMissions)); // 재실행 진행을 즉시 관찰.
   }
   ctx.setChatScrollOffset(-1);
@@ -282,7 +282,7 @@ async function missionLog(sub: string, args: string[], ctx: MissionSlashContext,
   const n = (args[2] ?? '').trim();
   ctx.chatLines.push(ctx.accent(`❯ /mission log ${id}${n ? ` ${n}` : ''}`));
   if (!id) {
-    ctx.chatLines.push(ctx.warning('  usage: /mission log <apm_id> [줄수(기본 40)] — 미션 실행 로그 tail'));
+    ctx.chatLines.push(ctx.warning('  usage: /mission log <apm_id> [lines (default 40)] — mission run log tail'));
     ctx.setChatScrollOffset(-1);
     return;
   }
@@ -290,7 +290,7 @@ async function missionLog(sub: string, args: string[], ctx: MissionSlashContext,
     action: 'log', id, ...(n ? { tail: Number(n) } : {}),
   }) as { error?: string; exists?: boolean; lines?: string[]; runLogPath?: string; note?: string };
   if (r.error) ctx.chatLines.push(ctx.error(`  ✗ ${r.error}`));
-  else if (!r.exists) ctx.chatLines.push(ctx.muted(`  ${r.note ?? '로그 없음'}`));
+  else if (!r.exists) ctx.chatLines.push(ctx.muted(`  ${r.note ?? 'No log'}`));
   else {
     for (const line of r.lines ?? []) ctx.chatLines.push(ctx.muted(`  │ ${line}`));
     ctx.chatLines.push(ctx.subtext(`  ${r.note ?? r.runLogPath ?? ''}`));
@@ -309,7 +309,7 @@ async function missionWatch(sub: string, args: string[], ctx: MissionSlashContex
     ctx.setChatScrollOffset(-1);
     return;
   }
-  ctx.chatLines.push(ctx.muted('  ⏳ 실행 워처 attach — 페이즈 전이·진행바·종결 리포트가 이 채팅에 뜹니다'));
+  ctx.chatLines.push(ctx.muted('  ⏳ Run watcher attached — phase changes, progress and the final report appear in this chat'));
   ctx.missionTui.startRunWatch(id, missionWatchPoll(id, 'run', dispatchAutopilotMissions));
   ctx.setChatScrollOffset(-1);
   return;
@@ -342,7 +342,7 @@ async function missionList(sub: string, args: string[], ctx: MissionSlashContext
     ctx.chatLines.push(ctx.subtext(`            ${String(m.goal ?? '').slice(0, 72)}`));
   }
   if (result.note) ctx.chatLines.push(ctx.muted(`  ${result.note}`));
-  ctx.chatLines.push(ctx.muted('  /mission new <goal> \u2014 \uc0dd\uc131 \u00b7 trace <id> \u2014 \uacc4\ubcf4 \u00b7 briefing <id> \u2014 \uc2e4\uc9d1\ud589 \uc804 \uc885\ud569 \ube0c\ub9ac\ud551 \u00b7 arm <id> \u2014 \uc2b9\uc778 \u00b7 \uad6c\uccb4\ud654/\uc885\ub8cc\ub294 `elanous autopilot` CLI'));
+  ctx.chatLines.push(ctx.muted('  /mission new <goal> — create · trace <id> — lineage · briefing <id> — pre-run summary · arm <id> — approve · materialize/close via the `elanous autopilot` CLI'));
   ctx.setChatScrollOffset(-1);
   return;
 }
@@ -378,7 +378,7 @@ async function missionTrace(sub: string, args: string[], ctx: MissionSlashContex
     for (const dl of descLines.slice(0, 40)) {
       ctx.chatLines.push(dl.startsWith('## ') ? ctx.subtext(`  ${dl.slice(3)}`) : ctx.muted(`  ${dl}`));
     }
-    if (descLines.length > 40) ctx.chatLines.push(ctx.muted(`  \u2026 \uc678 ${descLines.length - 40}\uc904`));
+    if (descLines.length > 40) ctx.chatLines.push(ctx.muted(`  … and ${descLines.length - 40} more lines`));
   }
   for (const dv of result.derived ?? []) {
     const mark = dv.status === 'ok' ? ctx.success('\u2705')
@@ -400,11 +400,11 @@ async function missionBriefing(sub: string, args: string[], ctx: MissionSlashCon
   const grounded = (args[2] ?? '').toLowerCase() === 'grounded';
   ctx.chatLines.push(ctx.accent(`\u276f /mission briefing ${id}${grounded ? ' grounded' : ''}`));
   if (!id) {
-    ctx.chatLines.push(ctx.warning('  usage: /mission briefing <apm_id> [grounded] \u2014 \uc2e4\uc9d1\ud589 \uc804 \uc885\ud569 \ube0c\ub9ac\ud551(\uace8 \uc9c4\ud654\u00b7\uc5ec\uc815\u00b7\uc0b0\ucd9c\ubb3c\u00b7\uc815\ucc29). grounded=PR merge \ud604\uc2e4 \ub300\uc870(\ub290\ub9bc)'));
+    ctx.chatLines.push(ctx.warning('  usage: /mission briefing <apm_id> [grounded] — pre-run summary (goal evolution, journey, deliverables, settlement). grounded = check PR merge reality (slow)'));
     ctx.setChatScrollOffset(-1);
     return;
   }
-  if (grounded) ctx.chatLines.push(ctx.muted('  \u23f3 grounded \ud604\uc2e4 \ub300\uc870(gh/git) \uc911\u2026 (\uc218\ucd08 \uc18c\uc694)'));
+  if (grounded) ctx.chatLines.push(ctx.muted('  ⏳ grounded check (gh/git) running… (a few seconds)'));
   const r = await dispatchAutopilotMissions({ action: 'briefing', id, ...(grounded ? {} : { grounded: false }) }) as {
     error?: string;
     briefing?: {
@@ -419,26 +419,26 @@ async function missionBriefing(sub: string, args: string[], ctx: MissionSlashCon
   };
   if (r.error) { ctx.chatLines.push(ctx.error(`  \u2717 ${r.error}`)); ctx.setChatScrollOffset(-1); return; }
   const b = r.briefing;
-  if (!b) { ctx.chatLines.push(ctx.muted('  (\ube0c\ub9ac\ud551 \uc5c6\uc74c)')); ctx.setChatScrollOffset(-1); return; }
-  ctx.chatLines.push(`  ${ctx.text('\uace8')} ${ctx.muted(String(b.currentGoal).replace(/\s+/g, ' ').slice(0, 72))}`);
-  if (b.routeDecision) ctx.chatLines.push(ctx.muted(`  \uc2e4\ud589 \ub808\uc778: ${b.routeDecision.provider}/${b.routeDecision.model}${b.routeDecision.effort ? `\u00b7${b.routeDecision.effort}` : ''} (${b.routeDecision.source})`));
+  if (!b) { ctx.chatLines.push(ctx.muted('  (no briefing)')); ctx.setChatScrollOffset(-1); return; }
+  ctx.chatLines.push(`  ${ctx.text('Goal')} ${ctx.muted(String(b.currentGoal).replace(/\s+/g, ' ').slice(0, 72))}`);
+  if (b.routeDecision) ctx.chatLines.push(ctx.muted(`  Run lane: ${b.routeDecision.provider}/${b.routeDecision.model}${b.routeDecision.effort ? `·${b.routeDecision.effort}` : ''} (${b.routeDecision.source})`));
   // \u2460 \uace8 \uc9c4\ud654(\ucd5c\ucd08\u2192\uc911\uac04\u2192\ucd5c\uc885)
-  ctx.chatLines.push(ctx.subtext(`  \u2460 \uace8 \uc9c4\ud654 (${b.goalEvolution.length}\uc138\ub300 \uad6c\uc870 \uc804\uc774)`));
-  for (const g of b.goalEvolution) ctx.chatLines.push(ctx.muted(`    gen${g.generation} [${g.reason ?? ''}] ${g.phaseCount}\ud398\uc774\uc988`));
+  ctx.chatLines.push(ctx.subtext(`  ① Goal evolution (${b.goalEvolution.length} structural generations)`));
+  for (const g of b.goalEvolution) ctx.chatLines.push(ctx.muted(`    gen${g.generation} [${g.reason ?? ''}] ${g.phaseCount} phases`));
   // \u2461 \uc5ec\uc815
-  ctx.chatLines.push(ctx.subtext(`  \u2461 \uc5ec\uc815 \u2014 split ${b.journey.splits}\u00b7\ud3b8\uc9d1 ${b.journey.edits}\u00b7\uacb0\uc815 ${b.journey.decisions}(\uc678\ubd80 ${b.journey.externalInterventions})\u00b7drift ${b.journey.drifts}`));
+  ctx.chatLines.push(ctx.subtext(`  ② Journey — split ${b.journey.splits}·edits ${b.journey.edits}·decisions ${b.journey.decisions}(external ${b.journey.externalInterventions})·drift ${b.journey.drifts}`));
   for (const n of b.journey.notable.slice(-4)) ctx.chatLines.push(ctx.muted(`    \u00b7 ${String(n).slice(0, 68)}`));
   // \u2462 \uc0b0\ucd9c\ubb3c grounded \uc810\uac80
   const dv = b.deliverables;
-  const gmark = dv.driftWarnings.length ? ctx.error(`\u26a0\ufe0f \ubbf8\ud655\uc815 ${dv.driftWarnings.length}`) : (dv.groundedChecked ? ctx.success('\u2713 grounded') : ctx.muted('\ud734\ub9ac\uc2a4\ud2f1'));
-  ctx.chatLines.push(ctx.subtext(`  \u2462 \uc0b0\ucd9c\ubb3c \u2014 \ub85c\uc9c1 ${dv.logicPhases.length}\u00b7PR ${dv.prUrls.length}\u00b7\ub9ac\uc18c\uc2a4 ${dv.resourceCount} \u00b7 ${gmark}`));
+  const gmark = dv.driftWarnings.length ? ctx.error(`⚠️ unconfirmed ${dv.driftWarnings.length}`) : (dv.groundedChecked ? ctx.success('✓ grounded') : ctx.muted('heuristic'));
+  ctx.chatLines.push(ctx.subtext(`  ③ Deliverables — logic ${dv.logicPhases.length}·PR ${dv.prUrls.length}·resources ${dv.resourceCount} · ${gmark}`));
   for (const w of dv.driftWarnings.slice(0, 8)) ctx.chatLines.push(`    ${ctx.error('\u26a0\ufe0f')} ${ctx.text(String(w.phase).slice(0, 26))} ${ctx.muted('\u2014 ' + String(w.issue).slice(0, 52))}`);
   // \u2463 \uc815\ucc29
   const arcStr = b.settlement.arcs.map((a) => `${a.name.slice(0, 8)}[${a.status}]`).join('\u00b7') || 'flat';
-  ctx.chatLines.push(ctx.subtext(`  \u2463 \uc815\ucc29 \u2014 ${arcStr} \u00b7 ${b.settlement.phasesDone}/${b.settlement.phasesTotal} done \u00b7 ${b.settlement.missionStatus}`));
-  if (b.pendingArming) ctx.chatLines.push(ctx.warning(`  \ud83d\udd12 \uc2e4\uc9d1\ud589 \uc2b9\uc778 \ub300\uc0c1: ${b.pendingArming.title.slice(0, 48)}`));
-  if (!grounded) ctx.chatLines.push(ctx.muted('  \u00b7 grounded \uc2e4\uce21(PR merge \ud604\uc2e4 \ub300\uc870): /mission briefing <id> grounded \u00b7 \ube60\ub978 \ubbf8\uba38\uc9c0 \uc2a4\uce94: /mission landing <id>'));
-  ctx.chatLines.push(ctx.muted('  \u00b7 \ud154\ub808\uadf8\ub7a8 \uce74\ub4dc \ubc1c\uc1a1: elanous autopilot briefing <id> --send'));
+  ctx.chatLines.push(ctx.subtext(`  ④ Settlement — ${arcStr} · ${b.settlement.phasesDone}/${b.settlement.phasesTotal} done · ${b.settlement.missionStatus}`));
+  if (b.pendingArming) ctx.chatLines.push(ctx.warning(`  🔒 Pending approval to run: ${b.pendingArming.title.slice(0, 48)}`));
+  if (!grounded) ctx.chatLines.push(ctx.muted('  · grounded check (PR merge reality): /mission briefing <id> grounded · quick unmerged scan: /mission landing <id>'));
+  ctx.chatLines.push(ctx.muted('  · send the Telegram card: elanous autopilot briefing <id> --send'));
   ctx.setChatScrollOffset(-1);
   return;
 }
@@ -449,27 +449,27 @@ async function missionLanding(sub: string, args: string[], ctx: MissionSlashCont
   const id = (args[1] ?? '').trim();
   ctx.chatLines.push(ctx.accent(`\u276f /mission landing ${id}`));
   if (!id) {
-    ctx.chatLines.push(ctx.warning('  usage: /mission landing <apm_id> \u2014 \uc644\uc8fc \uc804 \ubbf8\uba38\uc9c0 PR \ube60\ub978 \uc2a4\uce94'));
+    ctx.chatLines.push(ctx.warning('  usage: /mission landing <apm_id> — quick scan for unmerged PRs before completion'));
     ctx.setChatScrollOffset(-1);
     return;
   }
-  ctx.chatLines.push(ctx.muted('  \u23f3 \uae30\ub85d PR merge \uc0c1\ud0dc \uc2a4\uce94 \uc911\u2026 (gh\u00b7\uc218\ucd08)'));
+  ctx.chatLines.push(ctx.muted('  ⏳ scanning recorded PR merge status… (gh, a few seconds)'));
   const r = await dispatchAutopilotMissions({ action: 'landing', id }) as {
     error?: string; summary?: string;
     scan?: { total: number; merged: number; open: number; closed: number; none: number; blocking: number; needsRecheck: number; phases: Array<{ phaseTitle: string; pr: number | null; state: string }> };
   };
   if (r.error) { ctx.chatLines.push(ctx.error(`  \u2717 ${r.error}`)); ctx.setChatScrollOffset(-1); return; }
   const s = r.scan;
-  if (!s) { ctx.chatLines.push(ctx.muted('  (\uc2a4\uce94 \uc5c6\uc74c)')); ctx.setChatScrollOffset(-1); return; }
+  if (!s) { ctx.chatLines.push(ctx.muted('  (no scan)')); ctx.setChatScrollOffset(-1); return; }
   const line = s.blocking > 0 ? ctx.error(r.summary ?? '') : s.needsRecheck > 0 ? ctx.warning(r.summary ?? '') : ctx.success(r.summary ?? '');
   ctx.chatLines.push(`  ${line}`);
-  ctx.chatLines.push(ctx.muted(`  \ucd1d ${s.total} \u00b7 merged ${s.merged} \u00b7 open ${s.open} \u00b7 closed ${s.closed} \u00b7 none ${s.none}`));
+  ctx.chatLines.push(ctx.muted(`  total ${s.total} · merged ${s.merged} · open ${s.open} · closed ${s.closed} · none ${s.none}`));
   for (const p of s.phases) {
     if (p.state === 'none') continue;
     const mk = p.state === 'merged' ? ctx.success('\u2705') : p.state === 'open' ? ctx.error('\u26d4') : ctx.warning('\u26a0\ufe0f');
     ctx.chatLines.push(`    ${mk} ${ctx.muted(`[${p.state}]${p.pr ? ` #${p.pr}` : ''}`)} ${ctx.text(p.phaseTitle.slice(0, 42))}`);
   }
-  if (s.needsRecheck > 0) ctx.chatLines.push(ctx.muted('  \u00b7 \ub2eb\ud78c PR \ub300\uccb4 \ub79c\ub529 \ud655\uc778: /mission briefing <id> grounded'));
+  if (s.needsRecheck > 0) ctx.chatLines.push(ctx.muted('  · check replacement landings for closed PRs: /mission briefing <id> grounded'));
   ctx.setChatScrollOffset(-1);
   return;
 }
@@ -488,7 +488,7 @@ async function missionArm(sub: string, args: string[], ctx: MissionSlashContext,
     ctx.setChatScrollOffset(-1);
     return;
   }
-  ctx.chatLines.push(ctx.success(`  \u2713 armed \u2014 ${id} (materialize spec \uc800\uc7a5 \u00b7 \uc2e4\ud589\uc740 materialize \uc2dc)`));
+  ctx.chatLines.push(ctx.success(`  \u2713 armed \u2014 ${id} (materialize spec saved \u00b7 runs at materialize)`));
   ctx.setChatScrollOffset(-1);
   return;
 }
@@ -531,7 +531,7 @@ export async function handleMissionSlash(
 
   ctx.chatLines.push(ctx.accent('\u276f /mission'));
   ctx.chatLines.push(ctx.warning(`  unknown subcommand: ${sub}`));
-  ctx.chatLines.push(ctx.muted('  usage: /mission [list [status]] | new <goal> | approve|hold <id> | phases <id> | trim|defer <id> <n> | edit <id> <n> <\uc81c\ubaa9> | rerun <id> | rebuild <id> <n> | rereflect <id> | watch <id> | trace <id> | briefing <id> [grounded] | landing <id> | arm <id> | revise <id> <\ucf54\uba58\ud2b8>'));
+  ctx.chatLines.push(ctx.muted('  usage: /mission [list [status]] | new <goal> | approve|hold <id> | phases <id> | trim|defer <id> <n> | edit <id> <n> <title> | rerun <id> | rebuild <id> <n> | rereflect <id> | watch <id> | trace <id> | briefing <id> [grounded] | landing <id> | arm <id> | revise <id> <comment>'));
   ctx.setChatScrollOffset(-1);
 }
 

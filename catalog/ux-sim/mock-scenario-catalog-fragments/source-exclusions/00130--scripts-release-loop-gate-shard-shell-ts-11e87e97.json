@@ -1,0 +1,4 @@
+{
+  "path": "scripts/release-loop/gate-shard-shell.ts",
+  "reason": "Pins the shared fake-LLM switch (device fake-llm) so gate shards and measurements stay offline; a consumer of a registered device, not a device."
+}

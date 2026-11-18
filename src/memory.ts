@@ -36,6 +36,11 @@ import { debug } from './debug/log.js';
 import { estimateTokens } from './tokens.js';
 import { budgetModel } from './llm/model-defaults.js';
 import { getAppliedGlobalTestRoot } from './cli/test-flag.js';
+import {
+  MemoryWriteRefusedError, applyMemoryWriteGate, emitMemoryTriage, fileDailyLedger, memoryTextHash, parseTriageRecord, renderTriageRecord,
+  type MemoryGateOutcome, type MemoryGateRow, type MemoryTriageRecord, type MemoryWriteGateMode, type MemoryWriteMeta,
+} from './memory-triage/write-gate.js';
+import { recordMemoryUsage } from './memory-triage/usage-ledger.js';
 
 /**
  * 임시 파일 → fsync → rename → 폴더 fsync. rename 만으로는 «원자적»이지만 «내구적»이 아니다.
@@ -100,6 +105,8 @@ export interface MemoryEntry {
   /** Optional pinned-memory freshness window; absent memories retain their original injection text. */
   staleAfterMinutes?: number;
   contextCard?: ContextMemoryCard;
+  /** MEMORY-TRIAGE-NO-LLM 문 ① — 종류·범위·출처·이유·횟수(쓰기 문을 지난 줄에만 있다). */
+  triage?: MemoryTriageRecord;
 }
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -210,13 +217,54 @@ export interface SaveMemoryOpts {
   contextCard?: ContextMemoryCard;
 }
 
-export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): MemoryEntry {
-  ensureRoot(root);
-  const now = new Date().toISOString();
+/** 쓰기 문(`src/memory-triage/write-gate.ts`)에 넘기는 칸. 없으면 «출처 없는 옛 쓰기»로 그림자 판정된다. */
+export interface SaveMemoryGateOpts {
+  meta?: MemoryWriteMeta;
+  seat?: string | null;
+  /** 호출부 라벨(관측) — 예: memory-cli.add · tool.memory_save. */
+  origin?: string;
+  mode?: MemoryWriteGateMode;
+  now?: Date;
+}
+
+/**
+ * 모든 전역 기억 쓰기가 지나는 자리. 쓰기 문이 «새 줄 / 고침 / 횟수 +1 / 거부»를 정한다.
+ * 강제 거부면 `MemoryWriteRefusedError`(code)를 던진다 — 기본(그림자)에서는 옛 호출부가 그대로 쓴다.
+ */
+export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot(), gate: SaveMemoryGateOpts = {}): MemoryEntry {
   const id = opts.id ?? randomUUID();
   const slug = slugify(opts.name);
   const filename = `${id}-${slug}.md`;
   const path = join(root, filename);
+  const byId = new Map<string, MemoryEntry>();
+  // 고침 = 같은 id 의 줄이 이미 있다(이름이 바뀌어 파일 이름이 달라도) — 새 기억이 아니다.
+  const sameIdFile = existsSync(path) ? filename : (opts.id !== undefined ? findMemoryFileById(opts.id, root) : null);
+  let outcome: MemoryGateOutcome;
+  try {
+    outcome = applyMemoryWriteGate({
+      store: 'global', origin: gate.origin ?? 'unlabelled', text: opts.body,
+      ...(gate.meta ? { meta: gate.meta } : {}), seat: gate.seat ?? null,
+      updateTargetId: sameIdFile ? id : null,
+      ...(gate.mode ? { mode: gate.mode } : {}), ...(gate.now ? { now: gate.now } : {}),
+    }, {
+      rows: (): MemoryGateRow[] => listMemories({}, root).map(entry => {
+        byId.set(entry.id, entry);
+        return { id: entry.id, text: entry.body, ...(entry.triage ? { triage: entry.triage } : {}) };
+      }),
+      dailyLedger: fileDailyLedger(root),
+    });
+  } catch (error) {
+    if (error instanceof MemoryWriteRefusedError) throw error;
+    // 문 자체의 결함은 옛 쓰기를 막지 않는다(그림자 원칙) — 대신 사건을 남긴다.
+    emitMemoryTriage('refused', { store: 'global', origin: gate.origin ?? 'unlabelled', cause: 'gate-error', would: 'refuse' });
+    outcome = { action: 'create', enforced: false };
+  }
+  if (outcome.action === 'increment') {
+    const target = byId.get(outcome.target.id);
+    if (target) return bumpMemoryTriage(target, outcome.triage, root);
+  }
+  ensureRoot(root);
+  const now = new Date().toISOString();
 
   // Preserve createdAt + priority/pinned if the file already exists (update path).
   let createdAt = now;
@@ -224,6 +272,7 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
   let existingPinned: boolean | undefined;
   let existingStaleAfterMinutes: number | undefined;
   let existingContextCard: ContextMemoryCard | undefined;
+  let existingTriage: MemoryTriageRecord | undefined;
   if (existsSync(path)) {
     try {
       const parsed = parseFrontmatter(readFileSync(path, 'utf-8'));
@@ -232,7 +281,12 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
       if (parsed.fm.pinned) existingPinned = parsed.fm.pinned === 'true';
       existingStaleAfterMinutes = parseStaleAfterMinutes(parsed.fm['stale-after-minutes']);
       existingContextCard = parseContextCard(parsed.fm['context-card']);
+      existingTriage = parseTriageRecord(parsed.fm.triage);
     } catch { /* keep new createdAt */ }
+  } else if (sameIdFile) {
+    // 같은 id 의 이름 변경 — 옛 파일의 트리아지 기록(횟수·출처)을 새 파일로 잇는다.
+    try { existingTriage = parseTriageRecord(parseFrontmatter(readFileSync(join(root, sameIdFile), 'utf-8')).fm.triage); }
+    catch { /* 기록 없이 쓴다 */ }
   }
   const priority = opts.priority ?? existingPriority ?? 0;
   const pinned = opts.pinned ?? existingPinned ?? false;
@@ -249,8 +303,16 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
   if (staleAfterMinutes !== undefined) frontmatter['stale-after-minutes'] = String(staleAfterMinutes);
   const contextCard = opts.contextCard ?? existingContextCard;
   if (contextCard) frontmatter['context-card'] = JSON.stringify(contextCard);
+  const triage = (outcome.action === 'create' || outcome.action === 'supersede' ? outcome.triage : undefined)
+    ?? (existingTriage ? { ...existingTriage, hash: memoryTextHash(opts.body) } : undefined);
+  if (triage) frontmatter.triage = renderTriageRecord(triage);
   const raw = renderFrontmatter(frontmatter, opts.body);
   writeFileDurable(path, raw);
+  if (outcome.action === 'supersede') {
+    const old = byId.get(outcome.target.id);
+    // Jev 만의 근거(match jev)면 옛 줄은 손대지 않는다 — 오판 하나로 고정·색인이 사라지지 않게(새 줄의 supersedes 링크만).
+    if (outcome.demote && old && old.id !== id) demoteMemory(old, { ...outcome.demoted, supersededBy: id }, root);
+  }
 
   // Rebuild MEMORY.md after any write.
   rebuildIndex(root);
@@ -269,7 +331,33 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
     pinned,
     staleAfterMinutes,
     ...(contextCard ? { contextCard } : {}),
+    ...(triage ? { triage } : {}),
   };
+}
+
+/** `<id>-*.md` — 이름이 바뀐 같은 id 의 줄. 없거나 못 읽으면 null. */
+function findMemoryFileById(id: string, root: string): string | null {
+  try { return readdirSync(root).find(name => name.startsWith(`${id}-`) && name.endsWith('.md')) ?? null; }
+  catch { return null; }
+}
+
+/** 대신된 옛 줄 — 본문은 그대로 두고 `triage.supersededBy` 를 남기며 고정(pinned)을 푼다(항상 주입되지 않게). */
+function demoteMemory(target: MemoryEntry, triage: MemoryTriageRecord, root: string): void {
+  const path = join(root, target.filename);
+  const parsed = parseFrontmatter(readFileSync(path, 'utf-8'));
+  const fm: Record<string, string> = { ...parsed.fm };
+  delete fm.pinned;
+  writeFileDurable(path, renderFrontmatter({ ...fm, updated: new Date().toISOString(), triage: renderTriageRecord(triage) }, parsed.body));
+}
+
+/** 중복으로 접힌 쓰기 — 대상 줄의 `triage:` 한 줄만 바꿔 같은 파일에 다시 쓴다(본문·이름·만든 때는 그대로). */
+function bumpMemoryTriage(target: MemoryEntry, triage: MemoryTriageRecord, root: string): MemoryEntry {
+  const path = join(root, target.filename);
+  const parsed = parseFrontmatter(readFileSync(path, 'utf-8'));
+  const now = new Date().toISOString();
+  writeFileDurable(path, renderFrontmatter({ ...parsed.fm, updated: now, triage: renderTriageRecord(triage) }, parsed.body));
+  rebuildIndex(root);
+  return { ...target, updatedAt: now, triage };
 }
 
 function parseContextCard(raw: string | undefined): ContextMemoryCard | undefined {
@@ -296,6 +384,7 @@ function parseMemoryFile(path: string): MemoryEntry | null {
   const match = basename.match(/^([0-9a-f-]{36})-(.+)\.md$/i);
   const id = match ? match[1] : createHash('sha1').update(basename).digest('hex').slice(0, 36);
   const contextCard = parseContextCard(fm['context-card']);
+  const triage = parseTriageRecord(fm.triage);
   return {
     id,
     filename: basename,
@@ -310,6 +399,7 @@ function parseMemoryFile(path: string): MemoryEntry | null {
     pinned: fm.pinned === 'true',
     staleAfterMinutes: parseStaleAfterMinutes(fm['stale-after-minutes']),
     ...(contextCard ? { contextCard } : {}),
+    ...(triage ? { triage } : {}),
   };
 }
 
@@ -510,6 +600,8 @@ export interface InjectionResult {
   /** Which memory IDs were injected — useful for access tracking in
    *  the future. Caller can log / audit. */
   injectedIds: string[];
+  /** 그중 고정(pinned·alwaysInject)으로 실린 id — 글과 맞아서 실린 것이 아니다. 쓰임 원장(MEMORY-TRIAGE-NO-LLM ③)이 가른다. */
+  pinnedIds?: string[];
 }
 
 export interface InjectOpts {
@@ -608,6 +700,7 @@ export function buildMemoryInjection(
     block: '## Memory\n\n' + parts.join('\n\n'),
     tokens: usedTokens,
     injectedIds: injected,
+    pinnedIds: injected.filter(id => pinnedMems.some(m => m.id === id)),
   };
 }
 
@@ -769,5 +862,23 @@ export async function buildMemoryInjectionLLM(
   if (bodyParts.length > 0) parts.push('## Retrieved memories (LLM-judged)\n\n' + bodyParts.join('\n\n'));
 
   if (parts.length === 0) return { block: '', tokens: 0, injectedIds: [] };
-  return { block: '## Memory\n\n' + parts.join('\n\n'), tokens: usedTokens, injectedIds: injected };
+  return { block: '## Memory\n\n' + parts.join('\n\n'), tokens: usedTokens, injectedIds: injected,
+    pinnedIds: injected.filter(id => pinnedMems.some(m => m.id === id)) };
+}
+
+/** 낱말 맞음으로 «쓰임»을 칠 점수 하한 — buildMemoryInjection 의 기본 minScore 와 같다(2026-07-19 오차용 억제 상향). */
+const MEMORY_USE_MIN_SCORE = 2;
+
+/**
+ * MEMORY-TRIAGE-NO-LLM 문 ③ 생산자 — 이 턴의 전역 기억 주입을 쓰임 원장(`memory-triage/usage-ledger.ts`)에 한 줄로 남긴다.
+ * used = 글과 맞아서 실린 줄 ⊕ 고정 줄 중 이 글에 낱말이 맞은 줄(고정은 매번 실리니 맞았는지를 따로 잰다) · injected = 나머지 고정 줄.
+ * id 해시·자리만 남긴다(본문·이름 0). 실패는 원장 쪽이 사건 ⊕ 구멍 표식으로 남기고 턴은 막지 않는다.
+ */
+export function recordMemoryTurnUsage(userText: string, inj: InjectionResult, root: string = memoryRoot()): void {
+  const pinned = new Set(inj.pinnedIds ?? []);
+  const used = inj.injectedIds.filter(id => !pinned.has(id));
+  if (pinned.size > 0 && extractKeywords(userText).length >= 2) {
+    for (const hit of searchMemories(userText, {}, root)) if (hit.score >= MEMORY_USE_MIN_SCORE && pinned.has(hit.entry.id)) used.push(hit.entry.id);
+  }
+  recordMemoryUsage({ store: 'global', via: 'turn', injectedIds: [...pinned], usedIds: used }, root);
 }

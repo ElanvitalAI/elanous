@@ -39,6 +39,7 @@ import {
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { debugLog } from '@/lib/debug';
 import { loadOcrPrefs } from '@/lib/ocr-prefs';
+import { NEXUS_URL_MISSING, NEXUS_URL_MISSING_SHORT } from '@/lib/nexus-url-missing';
 
 export type NoteFromImagePhase =
   | 'idle' | 'ocr' | 'review' | 'saving' | 'saved' | 'error';
@@ -152,7 +153,7 @@ export function NoteFromImageModal({
   ): Promise<void> {
     if (!image) return;
     if (!config.baseUrl) {
-      setErrorMsg('Daemon URL 미설정 — Settings 에서 입력');
+      setErrorMsg(NEXUS_URL_MISSING);
       setPhase('error');
       return;
     }
@@ -237,7 +238,7 @@ export function NoteFromImageModal({
 
   async function runSave(): Promise<void> {
     if (!config.baseUrl) {
-      setErrorMsg('Daemon URL 미설정');
+      setErrorMsg(NEXUS_URL_MISSING_SHORT);
       setPhase('error');
       return;
     }

@@ -44,6 +44,9 @@ export default function MemberSignupPage() {
       setBusy(false);
     }
   }
+  // MEMBER-SIGNUP-UX-AUDIT: a disabled button must say what is still missing (QR journey has ~2 minutes).
+  const missing = [...(consented ? [] : ['약관 동의']), ...(newsletterChoice ? [] : ['뉴스레터 수신 여부 선택'])];
+  const showMissing = Boolean(intent) && !busy && missing.length > 0;
   return <main className="mx-auto flex w-full max-w-lg flex-col gap-5 px-5 py-12">
     {intent?.eventCode === KCB_EVENT_CODE && <p className="text-sm text-muted-foreground">KCB 행사 체험</p>}
     <h1 className="text-3xl font-semibold">{intent?.eventCode === KCB_EVENT_CODE ? 'QR로 시작해 바로 해 보기' : 'Elanous 회원 가입'}</h1>
@@ -64,9 +67,12 @@ export default function MemberSignupPage() {
         checked={newsletterChoice === 'declined'} onChange={() => setNewsletterChoice('declined')} />뉴스레터를 받지 않겠습니다</label>
     </fieldset>
     <button type="button" disabled={!consented || !newsletterChoice || !intent || busy} onClick={() => void start()}
+      aria-describedby={showMissing ? 'signup-missing' : undefined}
       className="rounded-md bg-primary px-4 py-3 text-primary-foreground disabled:opacity-50">
       {busy ? 'Google 로그인으로 이동 중…' : 'Google로 가입하고 시작'}
     </button>
+    {showMissing && <p id="signup-missing" role="status" className="text-sm text-muted-foreground">
+      시작 전에 남은 항목: {missing.join(' · ')}</p>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
   </main>;
 }

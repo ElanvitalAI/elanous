@@ -33,6 +33,7 @@ import type {
 import { globalAcpAgentManager } from './agent-manager.js';
 import type { AcpSessionStub, AgentKind } from '../session/card.js';
 import { debug } from '../debug/log.js';
+import { llmObserveDelegation } from '../session-runtime/llm-call-gateway.js';
 import type { SessionUri } from '../mss/uri/brand.js';
 import { unsafeBrandSessionUri } from '../mss/uri/brand.js';
 
@@ -534,12 +535,29 @@ export class DualRoleManager {
 
     record.activeHops += 1;
     try {
-      const result = await record.agent.prompt(
+      // One delegated prompt row per ACP session/prompt invocation, not per HTTP request
+      // inside the external agent subprocess. The HTTP host is not observable here.
+      // The peer's active model can change after session/new; probing it is best-effort
+      // telemetry and must never prevent the prompt from being sent.
+      let activeModel: string | undefined;
+      try { activeModel = record.agent.getSessionModels?.(record.backendSessionId)?.currentModelId; }
+      catch { /* peer model unavailable — still dispatch the prompt */ }
+      const result = await llmObserveDelegation({
+        provider: record.backendId,
+        ...(activeModel ? { model: activeModel } : {}),
+        sessionId: record.id,
+        ...(record.parentSessionId ? { parentSessionId: record.parentSessionId } : {}),
+        role: 'child',
+        requestedBy: 'acp.session/prompt',
+        selectionSource: activeModel ? 'session' : 'explicit',
+        ...(record.backendId === 'claude' || record.backendId === 'codex-app-server'
+          ? { billing: 'subscription' as const } : {}),
+      }, () => record.agent.prompt(
         record.backendSessionId,
         blocks,
         onUpdate,
         opts.meta,
-      );
+      ));
       // Final lastSeen bump on turn resolution — mirrors sessionUpdate
       // arrival so clients that receive no updates still see an
       // activity stamp on completion.

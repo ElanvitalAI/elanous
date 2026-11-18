@@ -11,6 +11,10 @@ import { debug } from '../debug/log.js';
 
 export const TEST_FAKE_LLM_ENV = 'ELANOUS_TEST_FAKE_LLM';
 export const TEST_FAKE_LLM_RESPONSE_ENV = 'ELANOUS_TEST_FAKE_LLM_RESPONSE';
+/** UX pack self-proactive — `[{"when":"<marker>","text":"<reply>"}, …]`: the newest user message (person's or an internal
+ *  turn's prompt) that carries any marker picks the first matching rule's reply, so a tool result in between keeps the
+ *  turn's reply; no match falls back to ELANOUS_TEST_FAKE_LLM_RESPONSE. One isolated session, one reply per instruction. */
+export const TEST_FAKE_LLM_RESPONSE_RULES_ENV = 'ELANOUS_TEST_FAKE_LLM_RESPONSE_RULES';
 /** PTY task-state fixture: fail only a request whose last human prompt contains this marker. */
 export const TEST_FAKE_LLM_FAIL_WHEN_ENV = 'ELANOUS_TEST_FAKE_LLM_FAIL_WHEN';
 /** Optional maximum Unicode code points per emitted text delta (unset = one delta). */
@@ -43,8 +47,37 @@ const TEST_FAKE_LLM_STEP_TOKEN = '{step}';
 const TEST_FAKE_LLM_REPLY_TOKEN = '{reply}';
 let responseSequence = 0;
 
+/** User-message texts, newest first (tool results excluded when they are typed blocks). */
+function userTextsNewestFirst(messages: readonly LLMMessage[]): string[] {
+  const texts: string[] = [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role !== 'user') continue;
+    if (typeof message.content === 'string') texts.push(message.content);
+    else if (!message.content.some((block) => block.type === 'tool_result'))
+      texts.push(message.content.map((block) => (block.type === 'text' ? block.text : '')).join(''));
+  }
+  return texts;
+}
+
+/** The newest user message that carries any rule marker decides (a tool result in between is skipped). */
+function ruledResponse(messages: readonly LLMMessage[] | undefined): string | undefined {
+  const raw = process.env[TEST_FAKE_LLM_RESPONSE_RULES_ENV];
+  if (!raw || !messages) return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return undefined; }
+  if (!Array.isArray(parsed)) return undefined;
+  const rules = parsed.map((rule) => (rule ?? {}) as { when?: unknown; text?: unknown })
+    .filter((rule): rule is { when: string; text: string } => typeof rule.when === 'string' && rule.when !== '' && typeof rule.text === 'string');
+  for (const text of userTextsNewestFirst(messages)) {
+    const hit = rules.find((rule) => text.includes(rule.when));
+    if (hit) return hit.text;
+  }
+  return undefined;
+}
+
 export function testFakeLlmResponse(messages?: readonly LLMMessage[]): string {
-  const text = process.env[TEST_FAKE_LLM_RESPONSE_ENV] ?? '[test-fake-llm] OK';
+  const text = ruledResponse(messages) ?? process.env[TEST_FAKE_LLM_RESPONSE_ENV] ?? '[test-fake-llm] OK';
   if (text.includes(TEST_FAKE_LLM_REPLY_TOKEN)) return text.split(TEST_FAKE_LLM_REPLY_TOKEN).join(String(++responseSequence));
   if (!text.includes(TEST_FAKE_LLM_STEP_TOKEN)) return text;
   // Person/internal-turn text only — a tool result travels as a user-role message and must not count as a step.
@@ -128,6 +161,30 @@ function lastHumanText(messages: LLMMessage[]): string | null {
   if (typeof last.content === 'string') return last.content;
   if (last.content.some((block) => block.type === 'tool_result')) return null;
   return last.content.map((block) => (block.type === 'text' ? block.text : '')).join('');
+}
+
+/** `[{"when":"<marker>","parallel":[{"name":…,"args":…}, …]}]` — several tool calls in ONE assistant message (a real parallel batch),
+ *  answered for a person's message that carries the marker. Results come back as the next turn's tool results, then the fixed reply. */
+function scriptedParallelCalls(messages: LLMMessage[]): LLMStreamEvent[] | null {
+  const raw = process.env[TEST_FAKE_LLM_TOOL_CALL_ENV];
+  if (!raw) return null;
+  let rules: Array<{ when?: unknown; parallel?: unknown }>;
+  try {
+    const parsed = JSON.parse(raw) as typeof rules[number] | typeof rules;
+    rules = Array.isArray(parsed) ? parsed : [parsed];
+  } catch { return null; }
+  const text = lastHumanText(messages);
+  if (text === null) return null;
+  for (const rule of rules) {
+    if (typeof rule?.when !== 'string' || !Array.isArray(rule.parallel) || !text.includes(rule.when)) continue;
+    const calls = rule.parallel.filter((call): call is { name: string; args?: unknown } => typeof (call as { name?: unknown })?.name === 'string');
+    if (calls.length === 0) continue;
+    return calls.map((call) => ({
+      type: 'tool_call' as const, id: `call_fake_llm_tool_${++toolCallSeq}_parallel`, name: call.name,
+      args: call.args && typeof call.args === 'object' ? call.args as Record<string, unknown> : {},
+    }));
+  }
+  return null;
 }
 
 function scriptedToolCall(messages: LLMMessage[]): LLMStreamEvent | null {
@@ -257,6 +314,8 @@ export const testFakeLlmProvider: LLMProvider = {
       else if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
       return;
     }
+    const parallelBatch = scriptedParallelCalls(messages);
+    if (parallelBatch) { for (const batchCall of parallelBatch) yield batchCall; return; }
     const call = scriptedToolCall(messages);
     if (call) { yield call; return; }
     for (const delta of responseChunks(testFakeLlmResponse(messages))) yield { type: 'text', delta };

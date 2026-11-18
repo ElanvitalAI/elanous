@@ -1,0 +1,159 @@
+// 증거 수집기 시험 — 기대값을 수집기·제품 상수로 만들지 않는다. 원장은 «실제 생산자»(podSelfImplementSpawn · kubectl 가짜 클러스터)가
+// 쓴 것을 읽고, 기대값은 이 파일의 독립 리터럴(sha·digest)이다.
+import { expect, test } from 'bun:test';
+import { Command } from 'commander';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { registerTasksCommands } from '../cli/tasks-cli.js';
+import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { evidenceFromRunLedger, mergeCollectedEvidence } from './ta-preflight-collect.js';
+import { evaluateTaPreflight } from './ta-preflight.js';
+import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
+
+const PIN_SHA = 'a'.repeat(40);
+const OTHER_SHA = 'b'.repeat(40);
+const PIN_DIGEST = `sha256:${'c'.repeat(64)}`;
+const OTHER_DIGEST = `sha256:${'d'.repeat(64)}`;
+
+interface CanaryOptions { logs: string; imageID: string | null; tag: string }
+
+/** 실제 생산자 경로로 canary 런을 돌려 run 원장을 만든다. */
+async function canary(root: string, o: CanaryOptions): Promise<string> {
+  const runId = `run-collect-${o.tag}`;
+  const spaceId = `collect-${o.tag}`;
+  const job = podJobName(spaceId);
+  const kubectl: Kubectl = (args) => {
+    if (args.includes('current-context')) return { status: 0, stdout: 'test-context', stderr: '' };
+    if (args.some((arg) => arg.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: '' };
+    if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
+    if (args.some((arg) => arg.includes('conditions[?(@.type=="Failed")].reason'))) return { status: 0, stdout: '', stderr: '' };
+    if (args.includes('get') && args.includes('pods') && args.includes('json')) {
+      const items = [{ metadata: { name: `${job}-x`, uid: 'u1', creationTimestamp: '2026-11-18T00:00:00Z', ownerReferences: [{ kind: 'Job', name: job }] },
+        status: { containerStatuses: [{ name: 'child', ...(o.imageID ? { imageID: o.imageID } : {}) }] } }];
+      return { status: 0, stdout: JSON.stringify({ items }), stderr: '' };
+    }
+    if (args.includes('logs')) return { status: 0, stdout: o.logs, stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  await podSelfImplementSpawn({ kubectl, source: { kind: 'commit', sha: PIN_SHA }, imageDigestPin: PIN_DIGEST,
+    credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }),
+    env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: runId } })({ feature: 'x', spaceId }).done;
+  return runId;
+}
+
+async function withRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), 'ta-collect-'));
+  try { return await fn(root); } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+test('a matching canary run: the real ledger yields the child HEAD and the consumed digest', () => withRoot(async (root) => {
+  const runId = await canary(root, { tag: 'ok', logs: `ELANOUS_POD_SOURCE commit ${PIN_SHA}\nchild done\n`, imageID: `docker://reg/x@${PIN_DIGEST}` });
+  const entries = loadRunLedger(runId, runLedgerDir(root));
+  expect(entries).not.toBeNull();
+  const collected = evidenceFromRunLedger(entries!);
+  expect(collected.source).toEqual({ requestedPin: PIN_SHA, childHead: PIN_SHA });
+  expect(collected.image).toEqual({ expectedDigest: PIN_DIGEST, observedDigest: PIN_DIGEST });
+  expect(collected.notes).toEqual([]);
+}), 30_000);
+
+test('a mismatching canary run is passed through as-is (the checker FAILs it); missing observations stay null', () => withRoot(async (root) => {
+  const bad = await canary(root, { tag: 'bad', logs: `ELANOUS_POD_SOURCE commit ${OTHER_SHA}\n`, imageID: `docker://reg/x@${OTHER_DIGEST}` });
+  const collected = evidenceFromRunLedger(loadRunLedger(bad, runLedgerDir(root))!);
+  expect(collected.source).toEqual({ requestedPin: PIN_SHA, childHead: OTHER_SHA });
+  expect(collected.image).toEqual({ expectedDigest: PIN_DIGEST, observedDigest: OTHER_DIGEST });
+  const none = await canary(root, { tag: 'none', logs: 'child done\n', imageID: null });
+  const missing = evidenceFromRunLedger(loadRunLedger(none, runLedgerDir(root))!);
+  expect(missing.source).toEqual({ requestedPin: PIN_SHA, childHead: null });
+  expect(missing.image).toEqual({ expectedDigest: PIN_DIGEST, observedDigest: null });
+}), 30_000);
+
+test('an empty ledger collects nothing and says so; explicit evidence wins over collected values', () => {
+  const empty = evidenceFromRunLedger([]);
+  expect(empty.source).toBeUndefined();
+  expect(empty.image).toBeUndefined();
+  expect(empty.notes.join('\n')).toMatch(/pod-source-head-check[\s\S]*pod-image-digest/u);
+  const merged = mergeCollectedEvidence({ source: { privateRepo: true, childHead: PIN_SHA } }, { source: { requestedPin: PIN_SHA, childHead: OTHER_SHA }, malformed: [], notes: [] });
+  expect(merged.source).toEqual({ requestedPin: PIN_SHA, childHead: PIN_SHA, privateRepo: true });
+});
+
+test('tasks preflight --from-run reads a real canary ledger: ① ② measured, the rest UNMEASURED; a missing ledger is refused', () => withRoot(async (root) => {
+  const runId = await canary(root, { tag: 'cli', logs: `ELANOUS_POD_SOURCE commit ${PIN_SHA}\n`, imageID: `docker://reg/x@${PIN_DIGEST}` });
+  const evidencePath = join(root, 'evidence.json');
+  writeFileSync(evidencePath, JSON.stringify({ source: { privateRepo: true } }));
+  const lines: string[] = [];
+  const program = new Command().name('elanous').exitOverride();
+  registerTasksCommands(program, { output: (line) => lines.push(line), preflightLedgerDir: runLedgerDir(root) });
+  const prevCode = process.exitCode;
+  try {
+    process.exitCode = undefined;
+    await program.parseAsync(['node', 'elanous', 'tasks', 'preflight', '--evidence', evidencePath, '--from-run', runId]);
+    expect(lines.join('\n')).toMatch(/PASS +1\./u);
+    expect(lines.join('\n')).toMatch(/PASS +2\./u);
+    expect(lines.join('\n')).toMatch(/UNMEASURED +3\./u);
+    expect(Number(process.exitCode)).toBe(1);
+    lines.length = 0;
+    process.exitCode = undefined;
+    await program.parseAsync(['node', 'elanous', 'tasks', 'preflight', '--evidence', evidencePath, '--from-run', 'run-no-such']);
+    expect(lines.join('\n')).toContain('run 원장을 읽지 못했다');
+    expect(Number(process.exitCode)).toBe(1);
+  } finally { process.exitCode = prevCode ?? 0; }
+}), 30_000);
+
+// ── 판정 표(#38394 와 같은 용어): 칸 × (있음 · 없음 · 형식 오류) — 기대값은 아래 독립 리터럴 ──
+// 형식 오류는 «미관측»과 섞이지 않는다: 원값 일부가 증거에 실려 검사기가 FAIL, 미관측만 null → UNMEASURED.
+test('a real canary whose child HEAD / imageID are malformed is flagged malformed (FAIL), not collapsed into unobserved (UNMEASURED)', () => withRoot(async (root) => {
+  const longSha = 'e'.repeat(64);
+  const run = await canary(root, { tag: 'mal', logs: `ELANOUS_POD_SOURCE commit ${longSha}\n`, imageID: 'docker://reg/x@sha256:not-a-digest' });
+  const collected = evidenceFromRunLedger(loadRunLedger(run, runLedgerDir(root))!);
+  expect(collected.malformed).toEqual(['source.childHead', 'image.observedDigest']);
+  expect(collected.source?.childHead).toBe(longSha);
+  expect(collected.image?.observedDigest).toBe('docker://reg/x@sha256:not-a-digest');
+  expect(collected.notes.join('\n')).toMatch(/형식 오류\(malformed\): source\.childHead=/u);
+  expect(collected.notes.join('\n')).toMatch(/형식 오류\(malformed\): image\.observedDigest=/u);
+  const report = evaluateTaPreflight(mergeCollectedEvidence({ source: { privateRepo: true } }, collected));
+  expect(report.conditions[0]!.status).toBe('FAIL');
+  expect(report.conditions[1]!.status).toBe('FAIL');
+  // 같은 canary 에서 값이 «없는» 경우는 UNMEASURED — 형식 오류와 갈린다
+  const none = await canary(root, { tag: 'abs', logs: 'child done\n', imageID: null });
+  const absent = evidenceFromRunLedger(loadRunLedger(none, runLedgerDir(root))!);
+  expect(absent.malformed).toEqual([]);
+  expect(absent.notes.join('\n')).toMatch(/미관측: source\.childHead/u);
+  expect(absent.notes.join('\n')).toMatch(/미관측: image\.observedDigest/u);
+  const absentReport = evaluateTaPreflight(mergeCollectedEvidence({ source: { privateRepo: true } }, absent));
+  expect(absentReport.conditions[0]!.status).toBe('UNMEASURED');
+  expect(absentReport.conditions[1]!.status).toBe('UNMEASURED');
+}), 30_000);
+
+// 원장 오염·구버전 행 같은 «생산자가 만들지 않는» 입력은 방어용으로 행을 직접 넣는다(입력 픽스처일 뿐 기대값은 독립 리터럴).
+const row = (event: string, data: Record<string, unknown>): RunLedgerEntry => ({ runId: 'run-table', event, data });
+const P = PIN_SHA;
+const D = PIN_DIGEST;
+const cases: Array<{ name: string; entries: RunLedgerEntry[]; source?: { requestedPin: string; childHead: string | null }; image?: { expectedDigest: string; observedDigest: string | null }; malformed: string[]; status: ['PASS' | 'FAIL' | 'UNMEASURED', 'PASS' | 'FAIL' | 'UNMEASURED'] }> = [
+  { name: '①② 값 있음·일치', entries: [row('pod-source-head-check', { pinned: P, received: P }), row('pod-image-digest', { digestPin: D, digest: D, final: true })], source: { requestedPin: P, childHead: P }, image: { expectedDigest: D, observedDigest: D }, malformed: [], status: ['PASS', 'PASS'] },
+  { name: '① received 없음(null)', entries: [row('pod-source-head-check', { pinned: P, received: null })], source: { requestedPin: P, childHead: null }, malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
+  { name: '① received 빈 문자열 = 없음', entries: [row('pod-source-head-check', { pinned: P, received: '  ' })], source: { requestedPin: P, childHead: null }, malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
+  { name: '① received 형식 오류(짧은 hex)', entries: [row('pod-source-head-check', { pinned: P, received: 'abc123' })], source: { requestedPin: P, childHead: 'abc123' }, malformed: ['source.childHead'], status: ['FAIL', 'UNMEASURED'] },
+  { name: '① received 형식 오류(숫자)', entries: [row('pod-source-head-check', { pinned: P, received: 12345 })], source: { requestedPin: P, childHead: 'number:12345' }, malformed: ['source.childHead'], status: ['FAIL', 'UNMEASURED'] },
+  { name: '① received 대문자 hex = 정규화돼 있음', entries: [row('pod-source-head-check', { pinned: P, received: P.toUpperCase() })], source: { requestedPin: P, childHead: P }, malformed: [], status: ['PASS', 'UNMEASURED'] },
+  { name: '① pinned 없음 → 수집 안 함', entries: [row('pod-source-head-check', { pinned: null, received: P })], malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
+  { name: '① pinned 형식 오류', entries: [row('pod-source-head-check', { pinned: 'zz', received: P })], source: { requestedPin: 'zz', childHead: P }, malformed: ['source.requestedPin'], status: ['FAIL', 'UNMEASURED'] },
+  { name: '② digest 없음(null)·nonstandard 사유 없음', entries: [row('pod-image-digest', { digestPin: D, digest: null, final: true })], image: { expectedDigest: D, observedDigest: null }, malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
+  { name: '② digest 형식 오류(문자열)', entries: [row('pod-image-digest', { digestPin: D, digest: 'sha256:xyz', final: true })], image: { expectedDigest: D, observedDigest: 'sha256:xyz' }, malformed: ['image.observedDigest'], status: ['UNMEASURED', 'FAIL'] },
+  { name: '② digest null + nonstandard-image-id + imageID 원값 = 형식 오류', entries: [row('pod-image-digest', { digestPin: D, digest: null, digestUnavailable: 'nonstandard-image-id', imageID: 'weird-id', final: true })], image: { expectedDigest: D, observedDigest: 'weird-id' }, malformed: ['image.observedDigest'], status: ['UNMEASURED', 'FAIL'] },
+  { name: '② digestPin 없음 → 수집 안 함', entries: [row('pod-image-digest', { digestPin: null, digest: D, final: true })], malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
+  { name: '② digestPin 형식 오류', entries: [row('pod-image-digest', { digestPin: 'sha256:short', digest: D, final: true })], image: { expectedDigest: 'sha256:short', observedDigest: D }, malformed: ['image.expectedDigest'], status: ['UNMEASURED', 'FAIL'] },
+];
+for (const c of cases) {
+  test(`판정 표 · ${c.name}`, () => {
+    const collected = evidenceFromRunLedger(c.entries);
+    expect(collected.source).toEqual(c.source);
+    expect(collected.image).toEqual(c.image);
+    expect(collected.malformed).toEqual(c.malformed);
+    // 형식 오류는 반드시 수집 메모에도 나온다
+    for (const field of c.malformed) expect(collected.notes.join('\n')).toContain(`형식 오류(malformed): ${field}=`);
+    const report = evaluateTaPreflight(mergeCollectedEvidence({ source: { privateRepo: true } }, collected));
+    expect([report.conditions[0]!.status, report.conditions[1]!.status]).toEqual(c.status);
+  });
+}

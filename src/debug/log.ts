@@ -707,6 +707,7 @@ class DebugLog {
 // (`grep '"session_id":"abc12345"' log/latest`).
 let ambientSessionId: string | null = null;
 const ambientSessionStorage = new AsyncLocalStorage<string>();
+const ambientParentSessionStorage = new AsyncLocalStorage<string | null>();
 
 export function setAmbientSessionId(id: string | null): void {
   ambientSessionId = id || null;
@@ -735,7 +736,13 @@ export function withAmbientSessionScope<T>(sessionId: string, fn: () => T): T {
     //    부모 조회에 안 걸리고, 이 수리가 고치려는 바로 그 결함을 반복한다.
     debug.log('session.link', 'child-scope', { parentSessionId: parent, childSessionId: sessionId });
   }
-  return ambientSessionStorage.run(sessionId, fn);
+  return ambientParentSessionStorage.run(parent && parent !== sessionId ? parent : null,
+    () => ambientSessionStorage.run(sessionId, fn));
+}
+
+/** Immediate outer session of the current async session scope, if any. */
+export function getAmbientParentSessionId(): string | null {
+  return ambientParentSessionStorage.getStore() ?? null;
 }
 
 export function getAmbientSessionId(): string | null {

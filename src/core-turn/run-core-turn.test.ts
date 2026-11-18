@@ -158,10 +158,12 @@ describe('named installed skill research routing', () => {
     ].join('\n');
     let guidance: string | undefined;
     let researchCalls = 0;
-    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages) => {
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, handlers) => {
       guidance = messages.find((message) => message.role === 'system'
         && typeof message.content === 'string'
         && message.content.includes('<research-answer-guidance>'))?.content as string | undefined;
+      // The cited docs URL comes from the skill's fetched result, so the citation guard keeps it.
+      handlers.onToolResult?.({ id: 'skill-1', name: 'skill_exec', result: 'fetched https://example.test/docs' });
       return answer;
     });
     const result = await runCoreTurn({
@@ -461,7 +463,8 @@ function turnCtx(signal = new AbortController().signal) {
 describe('runCoreTurn dispatch completion observation', () => {
   test('logs a matching successful completion with injected duration', async () => {
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
-    const times = [1_000, 1_100];
+    // The first clock read is the turn entry (`turnEnteredAt`, 1121 SYNTHESIS-RESERVE); the dispatch reads the next two.
+    const times = [900, 1_000, 1_100];
     spyOn(debug, 'log').mockImplementation((category, event, data) => {
       if (category === 'core.turn') events.push({ category, event, data: data as Record<string, unknown> });
     });

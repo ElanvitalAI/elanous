@@ -18,7 +18,7 @@ test('self health counts only this session recent structured errors and credit u
   expect(snapshot.errorCount).toBe(1);
   expect(snapshot.representativeError).toBe('openrouter HTTP 429');
   expect(snapshot.creditSource).toContain('openrouter/glm-5.3 · review · llm.usage billing=credit');
-  expect(snapshot.line).toContain('설치본 bbbbbbb');
+  expect(snapshot.line).toContain('installed bbbbbbb');
   expect(snapshot.line).not.toContain('secret-provider');
   expect(Object.isFrozen(snapshot)).toBe(true);
   now += 31 * 60_000;
@@ -31,7 +31,7 @@ test('self health reports unknown dimensions when observations are unavailable',
   const snapshot = tracker.snapshot('session-123456');
   expect(snapshot.errorCount).toBeNull();
   expect(snapshot.creditKnown).toBe(false);
-  expect(snapshot.line).toContain('오류 모름');
-  expect(snapshot.line).toContain('크레딧 출처 모름');
+  expect(snapshot.line).toContain('errors unknown');
+  expect(snapshot.line).toContain('credit source unknown');
   tracker.dispose();
 });

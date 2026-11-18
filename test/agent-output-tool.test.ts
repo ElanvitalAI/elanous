@@ -9,6 +9,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import {
   AGENT_OUTPUT_TEXT_CAP_BYTES,
   DEFAULT_AGENT_OUTPUT_TIMEOUT_MS,
+  MAX_AGENT_OUTPUT_TIMEOUT_MS,
   buildAgentOutputTool,
   dispatchAgentOutput,
 } from '../src/agent/agent-output-tool.ts';
@@ -41,6 +42,8 @@ function markError(task: AgentTask, message: string, registry: AgentRegistry): v
 }
 
 describe('AgentOutput tool', () => {
+  /** The 1800s stream-total boundary a caller might pass; the tool must clamp it (A207). */
+  const STREAM_TOTAL_TIMEOUT_MS = 30 * 60_000; // 출처: #38137 stream total-timeout boundary
   test('buildAgentOutputTool returns a well-formed LLMToolSpec', () => {
     const spec = buildAgentOutputTool();
     expect(spec.name).toBe('AgentOutput');
@@ -347,5 +350,67 @@ describe('AgentOutput tool', () => {
 
   test('default timeout constant matches the public contract', () => {
     expect(DEFAULT_AGENT_OUTPUT_TIMEOUT_MS).toBe(30_000);
+  });
+
+  test('a blocking wait above the hard cap is clamped so one call cannot hold the turn to the stream total timeout (A207)', async () => {
+    const registry = reg();
+    const t = registry.register(def(), 'prompt');
+    t.state = 'running';
+    const waits: number[] = [];
+    const pending = dispatchAgentOutput(
+      { taskId: t.id, block: true, timeoutMs: STREAM_TOTAL_TIMEOUT_MS },
+      {
+        registry,
+        setTimer: (cb, ms) => {
+          waits.push(ms);
+          return { dispose: () => undefined };
+        },
+      },
+    );
+    expect(waits).toEqual([MAX_AGENT_OUTPUT_TIMEOUT_MS]);
+    expect(MAX_AGENT_OUTPUT_TIMEOUT_MS).toBe(30_000);
+    markDone(t, 'still running after the cap', registry);
+    const r = await pending;
+    expect(r.retrievalStatus).toBe('success');
+    expect(r.text).toBe('still running after the cap');
+  });
+
+  test('the clamped wait times out, then the same taskId can be read again (A207)', async () => {
+    const registry = reg();
+    const t = registry.register(def(), 'prompt');
+    t.state = 'running';
+    t.startedAt = 10_000;
+    const callbacks: Array<() => void> = [];
+    const waits: number[] = [];
+    const timer = {
+      setTimer(cb: () => void, ms: number) {
+        waits.push(ms);
+        callbacks.push(cb);
+        return { dispose: () => undefined };
+      },
+    };
+    const first = dispatchAgentOutput(
+      { taskId: t.id, block: true, timeoutMs: STREAM_TOTAL_TIMEOUT_MS },
+      { registry, setTimer: timer.setTimer, now: () => 40_000 },
+    );
+    expect(waits).toEqual([MAX_AGENT_OUTPUT_TIMEOUT_MS]);
+    callbacks.shift()!();
+    const timedOut = await first;
+    expect(timedOut.retrievalStatus).toBe('timeout');
+    expect(timedOut.state).toBe('running');
+    expect(timedOut.taskElapsedMs).toBe(30_000);
+    expect(timedOut.output).toContain('timeout after 0ms');
+    expect(timedOut.output).toContain('task elapsed 30000ms');
+    expect(timedOut.output).toContain('same taskId to continue waiting');
+
+    const second = dispatchAgentOutput(
+      { taskId: t.id, block: true, timeoutMs: STREAM_TOTAL_TIMEOUT_MS },
+      { registry, setTimer: timer.setTimer, now: () => 50_000 },
+    );
+    markDone(t, 'retrieved after the cap', registry);
+    const again = await second;
+    expect(again.retrievalStatus).toBe('success');
+    expect(again.text).toBe('retrieved after the cap');
+    expect(waits).toEqual([MAX_AGENT_OUTPUT_TIMEOUT_MS, MAX_AGENT_OUTPUT_TIMEOUT_MS]);
   });
 });

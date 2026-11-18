@@ -1,6 +1,7 @@
 import type { LLMMessage, LLMOpts, LLMProvider, LLMStreamEvent } from '../llm.js';
 import type { LLMConfig } from '../user-config/types.js';
 import { isIP } from 'node:net';
+import { llmNetworkFetch } from '../session-runtime/llm-call-gateway.js';
 
 /** Remote transport only. HQ provider credentials are never read here. */
 export function makeHqProxyProvider(config: LLMConfig): LLMProvider {
@@ -25,14 +26,14 @@ export function makeHqProxyProvider(config: LLMConfig): LLMProvider {
   async function* streamChat(messages: LLMMessage[], opts: LLMOpts = {}): AsyncGenerator<LLMStreamEvent> {
     if (!available()) throw new Error('HQ proxy requires a tailnet HTTPS llm.baseUrl, bearer token, ELANOUS_SEAT, and ELANOUS_LLM_PURPOSE');
     const url = new URL('/v1/llm/proxy', endpoint);
-    const response = await fetch(url, {
+    const response = await llmNetworkFetch(url, {
       method: 'POST', signal: opts.signal, redirect: 'error',
       headers: { authorization: `Bearer ${bearerToken}`, ...(memberToken ? {} : { 'x-elanous-machine-token': machineToken! }), 'content-type': 'application/json' },
       body: JSON.stringify({ seat, purpose, ...(pr && /^\d+$/.test(pr) ? { pr: Number(pr) } : {}),
         model: opts.model ?? defaultModel, messages,
         options: { tools: opts.tools, toolChoice: opts.toolChoice, maxTokens: opts.maxTokens,
           temperature: opts.temperature, reasoningEffort: opts.reasoningEffort, sessionId: opts.sessionId } }),
-    });
+    }, { provider: 'hq-proxy', model: opts.model ?? defaultModel, sessionId: opts.sessionId, billing: 'credits' });
     if (!response.ok) throw new Error(`HQ proxy request failed (${response.status})`);
     if (response.headers.get('content-type')?.includes('application/x-ndjson')) {
       if (!response.body) throw new Error('HQ proxy returned an empty stream');

@@ -4,6 +4,7 @@ import type { TuiMemberSession } from '../../tui/member-session-contract.js';
 import { createDynamicAppPublishRoute, type DynamicAppPublisher } from './dynamic-app-publish.js';
 import { publicAppAddress } from './console-address.js';
 import type { AppBuildRunAuthority } from './app-build-run-authority.js';
+import { sourceHeadMismatchResponse } from './app-build-head-mismatch.js';
 
 export const OFFICIAL_MEMBER_ORIGIN = 'https://api.elanous.ai';
 // Same bounded control envelope as C's dynamic-deployment route.
@@ -78,8 +79,12 @@ export function createAppBuildLocalIssuerBridge(options: Options) {
       || request.headers.has('sec-fetch-site') && request.headers.get('sec-fetch-site') !== 'none') return denied(403);
     if (!options.authorizeControl(request)) return denied(401);
     const expectedOwner = request.headers.get('x-elanous-app-build-owner');
-    const expectedHead = request.headers.get('x-elanous-app-build-head');
-    if (!expectedOwner || !/^[0-9a-f]{40}$/u.test(options.sourceHead ?? '') || expectedHead !== options.sourceHead) return denied(403);
+    const requestHead = request.headers.get('x-elanous-app-build-head');
+    if (!expectedOwner || !/^[0-9a-f]{40}$/u.test(options.sourceHead ?? '')) return denied(403);
+    // RAIL-STALE-TUI-HEAD: an authenticated caller pinned to another well-formed head is a
+    // stale process (rail restarted nexus, not the TUI) — name it instead of a bare 403.
+    if (requestHead !== options.sourceHead) return requestHead && /^[0-9a-f]{40}$/u.test(requestHead)
+      ? sourceHeadMismatchResponse(options.sourceHead!, requestHead) : denied(403);
     let operation: { action: string; runId: string };
     try { operation = await boundedAction(request); } catch { return denied(400); }
     let verifiedReserveSession: TuiMemberSession | undefined;
@@ -127,7 +132,7 @@ export function createAppBuildLocalIssuerBridge(options: Options) {
     const forwarded = new Request(target, request);
     for (const key of [...forwarded.headers.keys()]) forwarded.headers.delete(key);
     for (const [key, value] of headers) forwarded.headers.set(key, value);
-    const route = createDynamicAppPublishRoute(options.publisher, resolveOwner);
+    const route = createDynamicAppPublishRoute(options.publisher, resolveOwner, undefined, true);
     const response = await route(forwarded);
     if (response?.ok && operation.action === 'reserve' && options.runAuthority) {
       try {

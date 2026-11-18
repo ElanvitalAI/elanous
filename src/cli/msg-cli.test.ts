@@ -285,7 +285,7 @@ test('post with the real wake warns once for an unresolved seat and stays quiet 
   const f = fixture('', () => ({ wake: undefined, wakeDeps: { listPtys: () => [], listHerdrPanes: () => [], readPane: () => null, live: false } }));
   await f.run('post', 'hello', '--from', 'OP', '--to', 'UX');
   expect(f.exits).toEqual([]);
-  expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 모름: seat-registry-missing:candidates=0)']);
+  expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 받는 몸 모름: 등록부·pane 에서 못 찾음 — seat-registry-missing:candidates=0)']);
   await f.run('post', 'hello', '--from', 'OP', '--to', 'GUARDIAN');
   expect(f.stderr.at(-1)).toBe('이 주소는 읽는 몸이 없다 — 지금은 OP');
   expect(f.stderr).toHaveLength(2);
@@ -762,8 +762,8 @@ test('CLI list, thread and post --reply-to leave a pre-threading ledger undamage
     legacy.query('INSERT INTO msg_messages(sender, recipient, body, created_at) VALUES (?, ?, ?, ?)')
       .run('TC', 'OP', 'old answer', '2026-10-01T00:01:00.000Z');
   } finally { legacy.close(); }
-  const oldQuestion = { id: 1, from: 'OP', to: 'TC', body: 'old question', kind: 'memo', createdAt: '2026-10-01T00:00:00.000Z' };
-  const oldAnswer = { id: 2, from: 'TC', to: 'OP', body: 'old answer', createdAt: '2026-10-01T00:01:00.000Z' };
+  const oldQuestion: Message = { id: 1, from: 'OP', to: 'TC', body: 'old question', kind: 'memo', intent: 'info', needsAck: false, origin: { kind: 'agent', seat: 'OP' }, schemaVersion: 1, createdAt: '2026-10-01T00:00:00.000Z' };
+  const oldAnswer: Message = { id: 2, from: 'TC', to: 'OP', body: 'old answer', intent: 'info', needsAck: false, origin: { kind: 'agent', seat: 'TC' }, schemaVersion: 1, createdAt: '2026-10-01T00:01:00.000Z' };
   await f.run('list', '--to', 'TC', '--after', '0', '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toEqual([oldQuestion]);
   await f.run('thread', '1', '--json');
@@ -1508,4 +1508,21 @@ test('msg serve --sse publishes its port for the restart path and clears it when
   expect(stdout.at(-1)).toBe(`msg SSE listening on 127.0.0.1:${info!.port}`);
   process.emit('SIGINT');
   expect(readPostOffice(dir)).toBeNull();
+});
+
+test('MSG-RECEIPTS-FOLLOWUP ① — positional and --through hand acks leave «seen» like --id, for the messages they move past', async () => {
+  const f = fixture();
+  const writer = f.store();
+  const a = writer.post({ from: 'OP', to: 'TC', body: 'a' });
+  const b = writer.post({ from: 'OP', to: 'TC', body: 'b' });
+  const c = writer.post({ from: 'OP', to: 'TC', body: 'c' });
+  const d = writer.post({ from: 'OP', to: 'TC', body: 'd' });
+  writer.close();
+  await f.run('ack', String(b.id), '--to', 'TC'); // positional = through
+  await f.run('ack', '--through', String(c.id), '--to', 'TC');
+  const store = f.store();
+  try {
+    for (const id of [a.id, b.id, c.id]) expect(store.listReceipts({ messageId: id }).map(r => `${r.state}:${r.source}`)).toEqual(['posted:ledger', 'seen:cli-ack']);
+    expect(store.listReceipts({ messageId: d.id }).map(r => r.state)).toEqual(['posted']);
+  } finally { store.close(); }
 });

@@ -408,6 +408,77 @@ describe('wire 본문 — 실제 호환 공급자로 보낸 HTTP 요청', () => 
   });
 });
 
+describe('1121 RESEARCH-OBSERVATION · PLAN-LATENCY — 실제 호환 공급자 경로(가짜 fetch)', () => {
+  // Z.ai 문서(guides__capabilities__streaming.md)의 마지막 청크 = finish_reason 과 usage 가 «같은» 청크에 온다.
+  const usageChunk = { prompt_tokens: 1200, completion_tokens: 300, total_tokens: 1500, prompt_tokens_details: { cached_tokens: 200 } };
+  const sse = [
+    'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]}',
+    `data: ${JSON.stringify({ choices: [{ index: 0, finish_reason: 'stop', delta: { role: 'assistant', content: '' } }], usage: usageChunk })}`,
+    'data: [DONE]',
+  ].join('\n\n') + '\n\n';
+
+  test('usage 와 finish_reason 이 같은 청크여도 원장에 실제 토큰이 적힌다(입력·출력 0 금지)', async () => {
+    const ledgerPath = join(tmp('zai-usage-'), 'l.jsonl');
+    let evs: LLMStreamEvent[] = [];
+    await withFakeFetchDevice([{
+      url: ZAI_CODING_PLAN_URL, method: 'POST',
+      response: () => new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    }], async () => {
+      const p = makeZaiCodingPlanProvider({ provider: 'glm' } as never, {
+        key: () => SECRET, ledgerPath, now: () => OFF_PEAK, gate: new ZaiConcurrencyGate(() => 3), quotaSnapshot: () => null,
+      });
+      evs = await drain(p.streamChat!([{ role: 'user', content: 'hi' }], {}));
+    });
+    const usageEvents = evs.filter((e) => e.type === 'usage');
+    expect(usageEvents).toEqual([{ type: 'usage', usage: expect.objectContaining({
+      inputTokens: usageChunk.prompt_tokens - usageChunk.prompt_tokens_details.cached_tokens,
+      cacheReadInputTokens: usageChunk.prompt_tokens_details.cached_tokens,
+      outputTokens: usageChunk.completion_tokens,
+      stopReason: 'stop',
+    }) }]);
+    expect(readZaiLedger({ ledgerPath, now: () => OFF_PEAK })).toEqual([expect.objectContaining({
+      kind: 'call', model: 'glm-5.3',
+      input: usageChunk.prompt_tokens - usageChunk.prompt_tokens_details.cached_tokens,
+      cached: usageChunk.prompt_tokens_details.cached_tokens,
+      output: usageChunk.completion_tokens,
+    })]);
+  });
+
+  test('뒤따르는 토큰 없는 usage(stopReason 만)가 앞선 토큰을 0 으로 덮지 않는다', async () => {
+    const ledgerPath = join(tmp('zai-usage-merge-'), 'l.jsonl');
+    const provider = makeZaiCodingPlanProvider({ provider: 'glm' } as never, {
+      key: () => SECRET, ledgerPath, now: () => OFF_PEAK, gate: new ZaiConcurrencyGate(() => 3), quotaSnapshot: () => null,
+      makeCompat: fakeCompat(async function* () {
+        yield { type: 'text', delta: 'ok' };
+        yield { type: 'usage', usage: { provider: 'openai', inputTokens: 40, cacheReadInputTokens: 2, outputTokens: 7 } };
+        yield { type: 'usage', usage: { provider: 'openai', stopReason: 'stop' } };
+      }, []) as never,
+    });
+    await drain(provider.streamChat!([{ role: 'user', content: 'hi' }], {}));
+    expect(readZaiLedger({ ledgerPath, now: () => OFF_PEAK })).toEqual([expect.objectContaining({ input: 40, cached: 2, output: 7 })]);
+  });
+
+  test('호출별 reasoningEffort low(조사 질문 계획)는 설정 high 를 이기고, 지정 없는 호출은 설정 그대로다', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    await withFakeFetchDevice([{
+      url: ZAI_CODING_PLAN_URL, method: 'POST',
+      response: (request) => {
+        bodies.push(JSON.parse(request.body ?? '{}') as Record<string, unknown>);
+        return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      },
+    }], async () => {
+      const p = makeZaiCodingPlanProvider({ provider: 'glm', reasoningLevel: 'high' } as never, {
+        key: () => SECRET, ledgerPath: join(tmp('zai-effort-'), 'l.jsonl'), gate: new ZaiConcurrencyGate(() => 3), quotaSnapshot: () => null,
+      });
+      await drain(p.streamChat!([{ role: 'user', content: 'plan' }], { reasoningEffort: 'low' }));
+      await drain(p.streamChat!([{ role: 'user', content: 'answer' }], {}));
+    });
+    expect(bodies.map((body) => body.reasoning_effort)).toEqual(['low', 'high']);
+    // GLM-5.3 은 thinking 을 끌 수 없다(문서) — 이 경로는 thinking 칸을 만들지 않는다.
+    expect(bodies.every((body) => !('thinking' in body))).toBe(true);
+  });
+});
+
 describe('동시 상한', () => {
   test('상한 3 — 다섯을 동시에 띄워도 최대 3 · 끝나면 다음이 들어간다', async () => {
     const gate = new ZaiConcurrencyGate(() => 3);

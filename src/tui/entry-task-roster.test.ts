@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { mockSeatPtySequence } from '../ux-sim/mock-seat-pty-sequence.js';
 import { simAgentRegistry } from '../ux-sim/interaction.js';
 
+// The footer says «Turn done» where the wide sentence fits, else the short clause «○ done»; either means settled.
+const TURN_DONE = (screen: string): boolean => /Turn done|○ done/.test(screen);
+
 test('Next PTY groups background Agents without raw dispatch rows and settles the card', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-agent-noise-'));
   const args = { description: 'noise worker', prompt: 'slow-child task', run_in_background: true, max_turns: 1 }; // Source: #36642 background Agent fixture.
@@ -21,10 +24,11 @@ test('Next PTY groups background Agents without raw dispatch rows and settles th
         ELANOUS_TEST_FAKE_LLM_DELAY_MS: '2500', ELANOUS_TEST_FAKE_LLM_DELAY_WHEN: 'slow-child',
         ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'noise-parent', name: 'Agent', args, after: { name: 'Agent', args } }),
       },
-      ready: { label: 'boot', until: 'Ctrl+Q 종료' },
+      ready: { label: 'boot', until: 'Ctrl+Q quit' },
       steps: [
-        { label: 'running', text: 'noise-parent', until: (screen) => screen.includes('◐ 하위 에이전트 · 실행 중 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture.
-        { label: 'settled', until: (screen) => screen.includes('✓ 결과 대기 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture and BackgroundJobStatus pending-result state.
+        { label: 'log focus', text: 'noise-parent', until: TURN_DONE, timeoutMs: 30_000 }, // Source: #36642. Basic chat hides the roster until the parent turn settles.
+        { label: 'running', keys: '\x1b[5~', until: (screen) => screen.includes('◐ sub-agents · running 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture. PageUp leaves basic chat so the roster is visible.
+        { label: 'settled', until: (screen) => screen.includes('✓ Results ready 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture and BackgroundJobStatus pending-result state.
       ],
     });
     if (process.env.ELANOUS_TUI_EVIDENCE_PATH) {
@@ -32,12 +36,12 @@ test('Next PTY groups background Agents without raw dispatch rows and settles th
     }
     expect(run.exitCode).toBe(0);
     const runningFrame = run.frames.find((frame) => frame.label === 'running')!.screen;
-    expect(runningFrame.match(/하위 에이전트/g)?.length).toBe(1); // Source: one grouped card in the captured running frame.
+    expect(runningFrame.match(/sub-agents/g)?.length).toBe(1); // Source: one grouped card in the captured running frame.
     expect(runningFrame).not.toContain('(running in background — taskId=');
     expect(runningFrame).not.toContain('도구: Agent result');
     const settledFrame = run.frames.find((frame) => frame.label === 'settled')!.screen;
-    expect(settledFrame).toContain('✓ 하위 에이전트 · 완료 5'); // Source: five terminal tasks in the captured PTY frame.
-    expect(settledFrame).not.toContain('하위 에이전트 · 실행 중');
+    expect(settledFrame).toContain('✓ sub-agents · done 5'); // Source: five terminal tasks in the captured PTY frame.
+    expect(settledFrame).not.toContain('sub-agents · running');
     expect(settledFrame).not.toContain('(running in background — taskId=');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -63,9 +67,10 @@ test('five background Agents stay listed while typing, and one can be stopped by
         ELANOUS_TEST_FAKE_LLM_DELAY_MS: '12000', ELANOUS_TEST_FAKE_LLM_DELAY_WHEN: 'slow-child',
         ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'flood-parent', name: 'Agent', args, after: { name: 'Agent', args } }),
       },
-      ready: { label: 'boot', until: 'Ctrl+Q 종료' },
+      ready: { label: 'boot', until: 'Ctrl+Q quit' },
       steps: [
-        { label: 'five running', text: 'flood-parent', until: (screen) => {
+        { label: 'turn settled', text: 'flood-parent', until: TURN_DONE, timeoutMs: 35_000 }, // Source: #36642. Basic chat hides the roster until the parent turn settles.
+        { label: 'five running', keys: '\x1b[5~', until: (screen) => {
           const rows = [...screen.matchAll(/([0-9a-f]{8}) · flood worker · running/g)];
           if (rows.length < 5) return false;
           target = rows[4]![1]!;
@@ -73,10 +78,11 @@ test('five background Agents stay listed while typing, and one can be stopped by
         }, timeoutMs: 35_000 }, // Source: #36642
         { label: 'composer responsive', text: 'still-typing', enter: false, until: '❯ still-typing' },
         { label: 'clear draft', keys: '\x15', until: (screen) => !screen.includes('❯ still-typing') },
-        { label: 'list', text: '/tasks', until: '작업 5건' },
-        { label: 'cancel', text: () => `/tasks stop ${target}`, until: (screen) => screen.includes(`${target} · flood worker · aborted`), timeoutMs: 15_000 }, // Source: #36642
-        { label: 'all terminal', until: '백그라운드 끝 5', timeoutMs: 30_000 }, // Source: #36642
-        { label: 'next turn receives results', text: 'collect-results', until: (screen) => screen.includes('❯ collect-results') && screen.includes('응답 완료') },
+        { label: 'list', text: '/tasks', until: '5 tasks' },
+        { label: 'cancel', text: () => `/tasks stop ${target}`, until: 'Stop requested', timeoutMs: 15_000 }, // Source: #36642. Stop acknowledgement is the visible basic-chat line.
+        { label: 'aborted row', keys: '\x1b[5~', until: (screen) => screen.includes(`${target} · flood worker · aborted`), timeoutMs: 15_000 }, // Source: #36642. PageUp leaves basic chat so the roster row is visible.
+        { label: 'all terminal', until: 'Results ready 5', timeoutMs: 30_000 }, // Source: #36642
+        { label: 'next turn receives results', text: 'collect-results', until: (screen) => screen.includes('> collect-results') && TURN_DONE(screen), timeoutMs: 30_000 }, // Source: #36642. The next turn must finish before result delivery is asserted.
       ],
     });
     const requests = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
@@ -107,10 +113,10 @@ test('a failed background Agent has an ID and failed state in the real PTY', asy
         ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'fail-parent', name: 'Agent',
           args: { description: 'failing worker', prompt: 'child-failure', run_in_background: true, max_turns: 1 } }), // Source: #36642
       },
-      ready: { label: 'boot', until: 'Ctrl+Q 종료' },
+      ready: { label: 'boot', until: 'Ctrl+Q quit' },
       steps: [
-        { label: 'submit', text: 'fail-parent', until: (screen) => screen.includes('failing worker') },
-        { label: 'failed', until: (screen) => /[0-9a-f]{8} · failing worker · failed/.test(screen), timeoutMs: 20_000 }, // Source: #36642
+        { label: 'submit', text: 'fail-parent', until: TURN_DONE, timeoutMs: 20_000 }, // Source: #36642. Basic chat hides the failed roster row until the parent turn settles.
+        { label: 'failed', keys: '\x1b[5~', until: (screen) => /[0-9a-f]{8} · failing worker · failed/.test(screen), timeoutMs: 20_000 }, // Source: #36642. PageUp leaves basic chat so the roster is visible.
       ],
     });
     expect(run.exitCode).toBe(0);

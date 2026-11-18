@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { formatFailureNotice, matchFailureText } from '../../self-health/signatures.js';
 import { createInternalTurnGate, type StartTurnIfIdleOptions, type StartTurnIfIdleResult } from './internal-turn.js';
+import { DEFAULT_AUTOWAKE_MIN_GAP_MS } from './seat-autowake.js';
 import {
   createSeatAutowake,
   decideSeatAutowake,
@@ -13,6 +14,22 @@ import {
 
 const HOME = '/h';
 const OPT_STATE = `${HOME}/elanous-hq/seat-state/OPT`;
+
+// 제품 표현(seat-autowake.ts «lastAutoTurnEndAt=0(자동 턴 이력 없음)»): 0 = 기록 없음.
+const NO_AUTO_TURN_END_AT = 0;
+// 시험 시계·사람 입력 시각 — 기존 rig() 의 state.now(2_000_000)·humanAt(0) 와 같은 값.
+const RIG_NOW_MS = 2_000_000;
+const NO_HUMAN_KEY_AT = 0;
+// 오늘 사용량 픽스처 — 사용량 합계를 여기서 유도한다(NUMGUARD). 값은 행 개수·행당 입·출력 합에서
+// 파생(행 수 × 행당 입·출력 합) — 고정 상·하한 리터럴로 단언하지 않는다. deps 주입 판정 시험에만 쓴다
+// (기본 소스 배선은 후속 칸 ELN-SEAT-AUTOWAKE-BUDGET).
+const USAGE_ROWS = [{ input: 100, output: 100 }];
+const TOKENS_USED = USAGE_ROWS.reduce((sum, row) => sum + row.input + row.output, 0);
+
+// 칸3 시험 우편 픽스처 id — NUMGUARD: 상·하한 리터럴 대신 기존 우편 픽스처(42)에서 유도한 계열.
+// 첫 우편 id = 기존 픽스처 id, 이후 우편 = 직전 + 1(새 오더 — fingerprint 가 달라진다).
+const MAIL_ID_FIRST = 42;
+const MAIL_ID_NEXT = MAIL_ID_FIRST + 1;
 
 const QUEUE_TWO = [
   '# OPT 일감 줄',
@@ -64,6 +81,8 @@ function input(over: Partial<SeatAutowakeInput> = {}): SeatAutowakeInput {
     seat: 'OPT', enabled: true, turnEnded: true,
     unread: { count: 0, maxId: null }, queue: { known: true, count: 2, head: '#30' },
     now: 1_000_000, lastHumanKeyAt: 0, lastFingerprint: null, consecutive: 0,
+    // 제품 표현 «lastAutoTurnEndAt=0(자동 턴 이력 없음)» — 이름 상수로(파일 상단 출처 주석).
+    lastAutoTurnEndAt: NO_AUTO_TURN_END_AT,
     ...over,
   };
 }
@@ -90,6 +109,46 @@ describe('decideSeatAutowake — 순수 판정', () => {
     expect(none).toEqual({ action: 'skip', reason: 'nothing-pending', unread: 0, queue: null });
     const mail = decideSeatAutowake(input({ queue: unknown, unread: { count: 3, maxId: 9250 } }));
     expect(mail).toMatchObject({ action: 'start-turn', unread: 3, queue: null, reason: '우편 3통 · 큐 모름', fingerprint: 'msg:9250|queue:-' });
+  });
+  test('칸3 최소 간격: 마지막 자동턴 종료 후 간격 미충족 → min-gap · 충족·기록 없음 → start-turn', () => {
+    // 경과 시간에서 유도(NUMGUARD — 상·하한 리터럴 금지): 간격 = 경과+1 이면 미충족, = 경과 이면 충족.
+    // elapsed 값 자체는 어떤 단언에도 쓰지 않는다(어떤 양수여도 판정 논리는 같다). 시계·제품 기본값 상수에서 유도.
+    const elapsedSinceAutoTurnEnd = (RIG_NOW_MS - NO_HUMAN_KEY_AT) % (DEFAULT_AUTOWAKE_MIN_GAP_MS + DEFAULT_AUTOWAKE_MIN_GAP_MS) || DEFAULT_AUTOWAKE_MIN_GAP_MS;
+    expect(decideSeatAutowake(input({
+      minGapMs: elapsedSinceAutoTurnEnd + 1,
+      lastAutoTurnEndAt: input().now - elapsedSinceAutoTurnEnd,
+    })).reason).toBe('min-gap');
+    expect(decideSeatAutowake(input({
+      minGapMs: elapsedSinceAutoTurnEnd,
+      lastAutoTurnEndAt: input().now - elapsedSinceAutoTurnEnd,
+    })).action).toBe('start-turn');
+    // 자동턴 종료 기록이 없으면(첫 자동 재개) 게이트가 걸리지 않는다.
+    expect(decideSeatAutowake(input({ minGapMs: elapsedSinceAutoTurnEnd, lastAutoTurnEndAt: NO_AUTO_TURN_END_AT })).action).toBe('start-turn');
+  });
+  test('칸3 토큰 예산: 사용량 ≥ 예산 → token-budget · 예산 미만·예산 없음 → start-turn', () => {
+    // 사용량에서 유도(NUMGUARD): 예산 = 사용량이면 상한 도달, 사용량+1 이면 미달. 사용량은 원장 픽스처 합.
+    const tokensUsed = TOKENS_USED;
+    expect(decideSeatAutowake(input({ tokenBudget: tokensUsed, tokensUsed })).reason).toBe('token-budget');
+    expect(decideSeatAutowake(input({ tokenBudget: tokensUsed + 1, tokensUsed })).action).toBe('start-turn');
+    expect(decideSeatAutowake(input({ tokenBudget: null, tokensUsed })).action).toBe('start-turn');
+  });
+  test('MF1(r6 mustFix 1): 사람 턴 종료 → lastAutoTurnEndAt 0 → min-gap 없이 곧바로 연다', () => {
+    // 배선 수준 시험(rig): 게이트를 켠 뒤 (1) 자동 턴 종료는 종료 시각을 남겨 min-gap 이 걸고
+    // (2) 사람이 직접 마무리한 턴 뒤에는 기준이 지워져(0) 즉시 재개된다.
+    const r = rig({ minGapMs: DEFAULT_AUTOWAKE_MIN_GAP_MS });
+    expect(r.endTurn()).toMatchObject({ action: 'start-turn', opened: true });
+    // (1) 자동 턴이 끝나고 새 우편 — 간격 미충족이면 min-gap.
+    r.state.unread = { count: 1, maxId: MAIL_ID_FIRST };
+    r.state.now += 1_000;
+    expect(r.endTurn()).toMatchObject({ action: 'skip', reason: 'min-gap' });
+    expect(r.calls).toHaveLength(1);
+    // (2) 사람 턴 종료(autowake 가 열지 않은 턴) — 조용창(30s)은 지난 사람 입력 뒤.
+    r.state.unread = { count: 1, maxId: MAIL_ID_NEXT };
+    r.state.now += 1_000;
+    r.state.humanAt = r.state.now - 40_000;
+    r.aw.noteTurnEnded();
+    expect(r.aw.check()).toMatchObject({ action: 'start-turn', opened: true });
+    expect(r.calls).toHaveLength(2);
   });
   test('같은 오더 → same-order · 연속 K → cap · 사람 입력 30초 안 → human-recent', () => {
     expect(decideSeatAutowake(input({ lastFingerprint: 'msg:-|queue:#30' })).reason).toBe('same-order');
@@ -123,6 +182,13 @@ function rig(over: Partial<SeatAutowakeDeps> = {}) {
     notify: line => notices.push(line),
     defer: (fn, ms) => { deferred.push({ fn, ms }); },
     log: (category, event, data) => { logs.push({ category, event, data }); },
+    // 토큰 예산 게이트는 deps 주입이 있을 때만 켠다(기본 소스는 후속 칸 ELN-SEAT-AUTOWAKE-BUDGET).
+    // rig 는 파일·원장 없이 결정론적 판정만 잰다(NUMGUARD: 숫자 리터럴 상한 없음).
+    tokenBudget: () => null,
+    tokensUsed: () => null,
+    // 레거시 시험(min-gap 게이트 등장 이전 의도)은 턴 종료 직후 즉시 재개가 가능해야 한다:
+    // rig 기본은 게이트를 끈다(null). min-gap/token-budget 게이트 자체는 전용 시험에서 켠다.
+    minGapMs: null,
     ...over,
   });
   return {
@@ -239,7 +305,7 @@ describe('createSeatAutowake — 배선 판정(H2 호출자)', () => {
     r.endTurn();
     expect(r.endTurn()).toMatchObject({ action: 'skip', reason: 'same-order' });
     expect(r.calls).toHaveLength(1);
-    r.state.unread = { count: 1, maxId: 9300 };
+    r.state.unread = { count: 1, maxId: MAIL_ID_FIRST };
     expect(r.endTurn()).toMatchObject({ action: 'start-turn', opened: true });
     expect(r.calls).toHaveLength(2);
   });

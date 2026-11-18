@@ -694,3 +694,10 @@ describe('child LLM selection reaches the Pod orchestrator (10-05 PODPROVIDER)',
     expect(args.some((arg) => arg.startsWith('--child-llm'))).toBe(false);
   });
 });
+
+test('TA-PREFLIGHT ② --image-digest 는 --pod-image-digest 로 orchestrate 에 전달되고, 없으면 인자 자체가 없다', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const withPin = podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'x', podPool: 'pool-node-b@node-b:4', imageDigest: digest }, 'x');
+  expect(withPin.slice(withPin.indexOf('--pod-image-digest'), withPin.indexOf('--pod-image-digest') + 2)).toEqual(['--pod-image-digest', digest]);
+  expect(podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'x', podPool: 'pool-node-b@node-b:4' }, 'x')).not.toContain('--pod-image-digest');
+});

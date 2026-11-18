@@ -1,3 +1,4 @@
+import { runSearchWithDeadline } from '../graph-runner/capability-providers/search-web-deadline.js';
 // ── Web-search provider interface ──
 //
 // Single contract that the native `web_search` tool routes through.
@@ -91,8 +92,21 @@ export interface WebSearchProvider {
   /** Is the provider usable right now? (keys present, binary on PATH,
    *  network reachable are all fair grounds to return false). */
   available(): boolean;
+  /** Optional typed-store readiness; resolution is bounded by the caller budget. */
+  availableAsync?(signal?: AbortSignal): Promise<boolean>;
   /** Actually run the search. Throws on provider-level errors so the
    *  registry can fall through to the next provider. Implementations
    *  MUST respect AbortSignal when supplied. */
   search(q: WebSearchQuery, signal?: AbortSignal): Promise<WebSearchResult>;
+}
+
+
+/** Readiness is metadata only: never log keys or assume that a key proves quota. */
+export async function webSearchProviderReady(provider: WebSearchProvider, signal?: AbortSignal, timeoutMs = 15_000): Promise<boolean> {
+  try {
+    return await runSearchWithDeadline(async scope => {
+      scope.throwIfAborted();
+      return provider.availableAsync ? provider.availableAsync(scope) : provider.available();
+    }, signal, timeoutMs);
+  } catch { return false; }
 }

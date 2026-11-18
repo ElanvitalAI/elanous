@@ -100,7 +100,7 @@ export function applyIsolatedRoot(dir: string): void {
         // bg-launch 가 운영 config-dir 를 관성으로 물려준 경우 등 — 격리가 이긴다.
         console.error(`[test-isolation] --config-dir ${current} 는 --test 격리와 충돌 — ${dir} 로 강제`);
       }
-      cfgDir.setElanousConfigDir(dir);
+      cfgDir.setElanousConfigDir(dir, 'flag');
     }
     // config 사본이 없고 운영 원본이 있으면 물질화하고, 있으면 drift 경고만
     // (자동 덮어쓰기 금지 — 명시적 sync 원칙). 유닛 테스트(NODE_ENV=test)는

@@ -4,6 +4,7 @@
 // the parser / hybrid composer / endpoint dispatch all run in-process.
 
 import { afterEach, describe, expect, test } from 'bun:test';
+import { debug } from '../src/debug/log.js';
 import {
   buildJudgePromptMessages,
   parseJudgeReply,
@@ -179,6 +180,21 @@ describe('hybridClassify · keyword tier short-circuits', () => {
 });
 
 describe('classifyWithLocalLlm · transport branches', () => {
+  test('one safe attempt for the same local classification request', async () => {
+    const before = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').length;
+    const stub = (async (_url: unknown, init?: RequestInit) => {
+      expect((init?.headers as Record<string, string>).authorization).toBe('Bearer judge-secret');
+      return Response.json({ choices: [{ message: { content: '{"role":"plan"}' } }] });
+    }) as unknown as FetchFn;
+    installFetch(stub);
+    const result = await classifyWithLocalLlm('ambiguous prompt', { model: 'gemma', token: 'judge-secret' });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.role).toBe('plan');
+    const rows = debug.events(500).filter(e => e.category === 'llm.call' && e.event === 'attempt').slice(before);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.data).toMatchObject({ provider: 'local-llm', model: 'gemma', host: 'localhost', requestedBy: 'showroom.role-judge' });
+    expect(JSON.stringify(rows[0])).not.toContain('judge-secret');
+  });
   test('non-2xx → http reason', async () => {
     const stub = (async () => new Response('rate limited', { status: 429 })) as unknown as FetchFn;
     installFetch(stub);

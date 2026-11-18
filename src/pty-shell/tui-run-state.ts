@@ -19,6 +19,8 @@ import { fileURLToPath } from 'node:url';
 
 import { debug } from '../debug/log.js';
 import { createHerdrAgentReporter, guardHerdrReleaseOnSignal, type HerdrAgentReporterLike, type HerdrSignalTarget } from './herdr-agent-report.js';
+import { clearApprovalHerdrBlockedHook, setApprovalHerdrBlockedHook, type ApprovalHerdrBlockedHook } from '../approval-herdr-hook.js';
+import { createHerdrSocketReporter, guardHerdrSocketReleaseOnSignal, type HerdrSocketReporter, type HerdrSocketState } from './herdr-socket-report.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { codeRevision, packageVersion, readInstallMetadataCommit } from '../version/code-revision.js';
 import {
@@ -649,6 +651,16 @@ export interface TuiRunStateRecorderDeps {
    */
   readonly herdr?: HerdrAgentReporterLike | null;
   /**
+   * herdr 소켓 권위 보고(ELN-HERDR-AGENT-STATE). 생략 시 HERDR_ENV=1 이면 만든다.
+   * `null` 이면 소켓을 안 연다(시험).
+   */
+  readonly herdrSocket?: HerdrSocketReporter | null;
+  /**
+   * 기본 소켓 신고기에 줄 «지금 선택된 모델». 메타를 보낼 때마다 다시 읽는다.
+   * 생략하면 모델을 모른다 — display_agent·model 토큰을 만들지 않는다.
+   */
+  readonly herdrModel?: () => string | undefined;
+  /**
    * SIGINT·SIGTERM 기본 죽음에도 herdr 를 반납하는 신호 지킴이의 대상(TUI-HERDR-EXIT-RACE).
    * 생략 시: 기본 신고기(herdr 미주입)일 때만 실 `process` · 주입 herdr 는 지킴이 0. `null` 이면 안 건다.
    */
@@ -673,12 +685,18 @@ interface ActiveRecorder {
   readonly writeAbortRequested: (id: string, at: number) => boolean;
   readonly log: (event: string, data: Record<string, unknown>) => void;
   readonly herdr: HerdrAgentReporterLike | null;
+  /** 상태·메타 전송·재시도·같은 상태 억제의 주인은 신고기 하나 — 녹음기는 원하는 상태만 넘긴다. */
+  readonly herdrSocket: HerdrSocketReporter | null;
   /** manifest 에 실제로 적힌 마지막 턴. 실패면 안 바뀐다(재시도). */
   last?: PtyTurnState;
   /** idle 로 «바뀐» 시각 — 유휴 경과의 0초. busy 로 가면 다시 모른다. */
   idleSince?: number;
   /** herdr 에 마지막으로 알린 턴. manifest 성패와 따로 둔다. */
   herdrLast?: PtyTurnState;
+  /** 소켓 신고가 따를 턴 — manifest 성패와 무관하게 마지막으로 보고된 턴. */
+  socketTurn?: PtyTurnState;
+  /** 승인/질문 모달이 열려 있다. 열린 동안 턴 보고는 blocked 를 덮지 않는다. */
+  blocked?: boolean;
 }
 
 let active: ActiveRecorder | null = null;
@@ -716,6 +734,9 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
   const herdr = deps.herdr !== undefined
     ? deps.herdr
     : (deps.writeTurn ? null : createHerdrAgentReporter({ sessionId: surfaceId }));
+  const herdrSocket = deps.herdrSocket !== undefined
+    ? deps.herdrSocket
+    : (deps.writeTurn ? null : createHerdrSocketReporter({ model: deps.herdrModel }));
   let build: PtyBuildIdentity | undefined;
   try { build = (deps.build ?? runningBuild)(); } catch (error) {
     log('build-resolve-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
@@ -726,9 +747,25 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
     if (!ok) seatCompareWriteFailures += 1;
   }
   // 기동 순서: 판 → manifest 초기 idle → herdr 신고. herdr start 가 idle 을 신고하므로 초기 idle 을 turn 으로 다시 안 보낸다.
-  const recorder: ActiveRecorder = { surfaceId, now, writeTurn, writeProgress, writeAbortRequested, log, herdr, herdrLast: herdr ? 'idle' : undefined };
+  const recorder: ActiveRecorder = {
+    surfaceId, now, writeTurn, writeProgress, writeAbortRequested, log, herdr,
+    herdrLast: herdr ? 'idle' : undefined,
+    herdrSocket,
+  };
   active = recorder;
   writeTurnState(recorder, 'idle');
+  // 승인/질문 모달 ↔ herdr blocked. 순환 import 를 피하려 모달 쪽이 훅을 부르고, 여기가 등록한다.
+  let blockedHook: ApprovalHerdrBlockedHook | null = null;
+  if (herdrSocket) {
+    try {
+      blockedHook = (blocked, kind) => {
+        reportTuiHerdrBlocked(blocked, kind);
+      };
+      setApprovalHerdrBlockedHook(blockedHook);
+    } catch (error) {
+      log('herdr-blocked-hook-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
   if (herdr) { try { herdr.start(); } catch { /* 신고 실패가 녹음기를 깨지 않는다 */ } }
   // H9 유휴 감시: 판·턴·사람 입력을 매 틱 다시 재고, 재기동 성공 뒤에만 좌석을 양도한다.
   const selfRestart = deps.selfRestart;
@@ -818,10 +855,21 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
   if (herdr && signals) {
     try { unguard = guardHerdrReleaseOnSignal(() => herdr.release(), signals); } catch { /* 지킴이 실패가 녹음기를 깨지 않는다 */ }
   }
+  // 소켓 반납은 비동기 프레임 — 신호에서도 release_agent 응답(상한 있음)을 기다린 뒤 기본 죽음을 잇는다.
+  const socketSignals = deps.signals !== undefined ? deps.signals : (deps.herdrSocket === undefined ? process : null);
+  let unguardSocket: () => void = () => {};
+  if (herdrSocket && socketSignals) {
+    try { unguardSocket = guardHerdrSocketReleaseOnSignal(herdrSocket, socketSignals); } catch { /* 지킴이 실패가 녹음기를 깨지 않는다 */ }
+  }
   return () => {
     try { unwatch(); } catch { /* 종료 경로를 깨지 않는다 */ }
     try { unguard(); } catch { /* 종료 경로를 깨지 않는다 */ }
+    try { unguardSocket(); } catch { /* 종료 경로를 깨지 않는다 */ }
     if (herdr) { try { herdr.release(); } catch { /* 종료 경로를 깨지 않는다 */ } }
+    if (recorder.herdrSocket) {
+      if (blockedHook) { try { clearApprovalHerdrBlockedHook(blockedHook); } catch { /* 종료 경로를 깨지 않는다 */ } }
+      try { recorder.herdrSocket.release(); } catch { /* 종료 경로를 깨지 않는다 */ }
+    }
     // 좌석 대조 판정 신호 — 두 표면의 원장 행을 «여기서» 읽어 한 줄로 남긴다.
     if (seatCompare) {
       try {
@@ -898,6 +946,26 @@ function writeTurnState(recorder: ActiveRecorder, turn: PtyTurnState): void {
     } catch (error) {
       recorder.log('herdr-turn-threw', { turn, error: error instanceof Error ? error.message : String(error) });
     }
+  }
+  recorder.socketTurn = turn;
+  // 모달이 열린 동안의 턴 보고는 blocked 를 덮지 않는다 — 닫힐 때 이 턴으로 돌아간다.
+  if (!recorder.blocked) publishHerdrSocket(recorder, turn === 'busy' ? 'working' : 'idle');
+}
+
+/** 승인/질문 모달이 열리면 blocked, 닫히면 그 사이 마지막 턴(busy→working · idle)으로 되돌린다. 녹음기 없으면 0. */
+export function reportTuiHerdrBlocked(blocked: boolean, message?: string): void {
+  if (!active) return;
+  active.blocked = blocked;
+  if (blocked) publishHerdrSocket(active, 'blocked', message);
+  else publishHerdrSocket(active, (active.socketTurn ?? active.last) === 'busy' ? 'working' : 'idle');
+}
+
+function publishHerdrSocket(recorder: ActiveRecorder, state: HerdrSocketState, message?: string): void {
+  if (!recorder.herdrSocket) return;
+  try {
+    recorder.herdrSocket.state(state, message);
+  } catch (error) {
+    recorder.log('herdr-socket-threw', { state, error: error instanceof Error ? error.message : String(error) });
   }
 }
 

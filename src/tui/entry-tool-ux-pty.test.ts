@@ -29,7 +29,7 @@ test('a real isolated Read turn shows one detailed tool row and a safe input tar
     expect(run.exitCode).toBe(0);
     expect(detail.match(/▸ 도구 · Read 결과/g)).toHaveLength(1);
     expect(detail).not.toContain('도구: Read');
-    expect(detail).not.toContain('활동 · Read');
+    expect(detail).not.toContain('Read(');
     expect(expanded).toContain('first visible line');
     expect(expanded).toContain('project-notes.txt');
     expect(expanded).not.toContain(root);

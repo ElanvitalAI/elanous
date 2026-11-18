@@ -51,6 +51,39 @@ test('two isolated Next TUI PTYs each keep a selected provider for their own fak
   }
 }, { timeout: PTY_PARALLEL_TEST_TIMEOUT_MS });
 
+test('Next PTY snapshot retains a finished turn marker after the next prompt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'next-turn-end-marker-'));
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true },
+      errorReports: { enabled: false }, llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } } }));
+    const turnPrompts = ['first marker prompt', 'second marker prompt'];
+    const evidence = await mockSeatPtySequence({
+      runId: 'next-turn-end-marker', executable: process.execPath,
+      args: [join(import.meta.dir, '../bin/elanous.mjs'), '--test={root}', '--config-dir', '{root}',
+        '--test-state-dir', '{root}', '--tui', 'next'],
+      root, rows: 30, cols: 100,
+      env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1',
+        ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1', ELANOUS_TEST_FAKE_LLM_RESPONSE: 'MARKER_REPLY' },
+      ready: { label: 'marker ready', until: 'Enter send', timeoutMs: PTY_STEP_TIMEOUT_MS },
+      steps: [
+        { label: 'first turn', text: turnPrompts[0],
+          until: (screen: string) => screen.includes('MARKER_REPLY') && /✻ Worked for \d+s · done \d{1,2}:\d{2} (AM|PM)/.test(screen),
+          timeoutMs: PTY_STEP_TIMEOUT_MS },
+        { label: 'second turn', text: turnPrompts[1],
+          until: (screen: string) => (screen.match(/✻ Worked for \d+s · done \d{1,2}:\d{2} (AM|PM)/g) ?? []).length > turnPrompts.length,
+          timeoutMs: PTY_STEP_TIMEOUT_MS },
+      ], quitKeys: '/quit\r', exitTimeoutMs: 10_000,
+    });
+    expect(evidence.exitCode).toBe(0);
+    const screen = evidence.frames.at(-1)!.screen;
+    // One history marker per sent turn, plus the current status-line marker.
+    expect((screen.match(/✻ Worked for \d+s · done \d{1,2}:\d{2} (AM|PM)/g) ?? [])).toHaveLength(turnPrompts.length + 1);
+    expect(screen.slice(0, screen.indexOf(turnPrompts[1]!))).toContain('✻ Worked for');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, { timeout: PTY_PARALLEL_TEST_TIMEOUT_MS });
+
 test('config-dir before root provider reaches a real Grok Next TUI turn', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-provider-root-order-'));
   try {

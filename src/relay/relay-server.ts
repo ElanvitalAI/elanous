@@ -546,6 +546,27 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     const publicApp = parsePublicAppHost(hostHeader, options.publicDomain)
       ?? (customRoute ? { app: customRoute.app, user: customRoute.user } : undefined);
     if (!publicApp) {
+      // A bare member host can point only to one explicitly public app on a pinned host.
+      // A second app makes the destination ambiguous, so the route stays closed.
+      const suffix = `.${options.publicDomain}`;
+      const bareUser = options.publicDomain && normalizedHost.endsWith(suffix)
+        ? normalizedHost.slice(0, -suffix.length) : '';
+      if ((req.method === 'GET' || req.method === 'HEAD') && bareUser
+        && /^[a-z][a-z0-9]{2,19}$/.test(bareUser)
+        && !['www', 'docs', 'api', 'admin', 'relay', 'mail'].includes(bareUser)
+        && (publicRoutes?.has(bareUser) || bareUser === options.publicUserId)) {
+        const apps = [...publicReadableApps].filter(binding => binding.startsWith(bareUser + '/'));
+        if (apps.length === 1) {
+          const app = apps[0]!.slice(bareUser.length + 1);
+          const targetHost = `${app}--${bareUser}.${options.publicDomain}`;
+          if (parsePublicAppHost(targetHost, options.publicDomain)?.app === app) {
+            const url = new URL(req.url);
+            return new Response(null, { status: 308, headers: {
+              location: `https://${targetHost}${url.pathname}${url.search}`, 'cache-control': 'no-store',
+            } });
+          }
+        }
+      }
       const legacyRoom = options.publicServerId ? rooms.get(options.publicServerId) : undefined;
       if (legacyRoom) fail(legacyRoom, 'public-invalid-host');
       return publicNotFound();

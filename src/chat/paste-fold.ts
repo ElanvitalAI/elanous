@@ -79,7 +79,7 @@ export function createPasteFold(
     adopt(pairs) {
       for (const [token, raw] of pairs) {
         held.set(token, raw);
-        const id = Number(/^\[붙여넣음 #(\d+) /.exec(token)?.[1] ?? 0);
+        const id = Number(/^\[(?:붙여넣음|Paste) #(\d+) /.exec(token)?.[1] ?? 0);
         if (id > seq) seq = id;
       }
       if (pairs.length > 0) log('tui.paste', 'adopted', { count: pairs.length, held: held.size });

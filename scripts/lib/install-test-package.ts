@@ -5,8 +5,10 @@ import { join } from 'node:path';
 export function packageFixture(destination: string, version: string): string {
   const pkg = join(destination, 'package');
   mkdirSync(join(pkg, 'bin'), { recursive: true });
+  mkdirSync(join(pkg, 'apps', 'pwa', 'out'), { recursive: true });
   writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'elanous', version, bin: { elanous: './bin/elanous.cjs', eln: './bin/elanous.cjs' } }));
   writeFileSync(join(pkg, 'bin', 'elanous.mjs'), fakeCliSource());
+  writeFileSync(join(pkg, 'apps', 'pwa', 'out', 'index.html'), '<!doctype html><title>elanous</title>\n');
   const archive = join(destination, 'elanous-fixture.tgz');
   const packed = spawnSync('tar', ['-czf', archive, '-C', destination, 'package'], { encoding: 'utf8' });
   if (packed.status !== 0) throw new Error(`could not create fake installer package: ${packed.stderr}`);

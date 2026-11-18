@@ -27,7 +27,7 @@ export function createNextTuiCoreInput(): NextTuiCoreInput {
   let historyIndex = 0;
   let draft = '';
   // The sequence ID keeps multiple pastes distinct; say that the full text remains for submission.
-  const pasteFold = createPasteFold(undefined, (id, text) => `[붙여넣음 #${id} · ${text.split('\n').length}줄 · 원문]`);
+  const pasteFold = createPasteFold(undefined, (id, text) => `[Paste #${id} · ${text.split('\n').length} lines · full text]`);
 
   return {
     get editor() { return editor; },

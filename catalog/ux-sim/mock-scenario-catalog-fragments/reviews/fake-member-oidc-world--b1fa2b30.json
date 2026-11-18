@@ -1,0 +1,4 @@
+{
+  "deviceKey": "fake-member-oidc-world",
+  "review": "# 📅 2026-11-17 재검토 (UX · 장치 정비 2) — 회원 가입 → 핸들 → 웹채팅 랩이 쓰는 sim-cookie-jar(Set-Cookie 저장·credentials:include 처럼 첨부)를 이 장치의 구현·source-module 로 등록했다. 손으로 쿠키를 넣지 않는 경계는 그대로다."
+}

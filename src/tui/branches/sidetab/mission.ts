@@ -123,12 +123,12 @@ export function createSidetabMissionBranch(deps: {
         let detection: AgentCliDetection;
         try { detection = await deps.detectAgentCli(agent); }
         catch (error) {
-          const message = `${agent} CLI 확인에 실패했습니다: ${error instanceof Error ? error.message : String(error)}`;
+          const message = `${agent} CLI check failed: ${error instanceof Error ? error.message : String(error)}`;
           deps.setStatus(message);
           return { ok: false, path: '', promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, error: message };
         }
         if (!detection.installed) {
-          const message = `${detection.message} · 설치 확인 후 미션을 다시 요청하세요`;
+          const message = `${detection.message} · verify install and request the mission again`;
           deps.setStatus(message);
           return { ok: false, path: '', promptReady: false, missionVisible: false, promptReturned: false, completionMarker: false, error: message };
         }
@@ -166,7 +166,7 @@ export function createSidetabMissionBranch(deps: {
       const failureLog = sidetabMissionFailureLog(agent, result);
       if (failureLog) deps.logEvent?.('agent-mission.sidetab', failureLog.event, failureLog.data);
       deps.showMain();
-      deps.setStatus(result.ok ? `미션 결과 확인 · ${result.path}` : `미션 확인 실패 · ${result.promptReady ? agent : result.startupScreen ?? agent} · ${result.error}`);
+      deps.setStatus(result.ok ? `Mission result check · ${result.path}` : `Mission check failed · ${result.promptReady ? agent : result.startupScreen ?? agent} · ${result.error}`);
       return result;
     },
     async runMissionPair(agent: 'codex' | 'claude', mission: string, parallelMission: string) {
@@ -178,12 +178,12 @@ export function createSidetabMissionBranch(deps: {
           try { return await deps.detectAgentCli!(member); }
           catch (error) {
             return { agent: member, installed: false, version: null, login: 'unknown' as const,
-              message: `${member} CLI 확인에 실패했습니다: ${error instanceof Error ? error.message : String(error)}` };
+              message: `${member} CLI check failed: ${error instanceof Error ? error.message : String(error)}` };
           }
         }));
         const unavailable = detections.find(({ installed }) => !installed);
         if (unavailable) {
-          const message = `${unavailable.message} · pair 미션은 두 CLI 모두 준비돼야 시작합니다`;
+          const message = `${unavailable.message} · pair mission needs both CLIs ready`;
           deps.setStatus(message);
           return { ok: false, error: message, codex: null, claude: null };
         }
@@ -243,7 +243,7 @@ export function createSidetabMissionBranch(deps: {
       const claudeWorkspace = workspaces.get('claude');
       if (!codexWorkspace || !claudeWorkspace || codexWorkspace !== claudeWorkspace) {
         deps.showMain();
-        const error = '두 사이드탭이 같은 작업 디렉터리를 쓰지 않아 pair 합성을 안전하게 저장할 수 없습니다';
+        const error = 'two sidetabs do not share a working directory; cannot safely save the pair composite';
         deps.setStatus(error);
         return { ...pair, ok: false, error };
       }
@@ -267,8 +267,8 @@ export function createSidetabMissionBranch(deps: {
       });
       deps.showMain();
       deps.setStatus(finalFile
-        ? `그래프 두 갈래·비교 합성 완료 · ${finalFile}`
-        : '그래프 두 갈래 완료 · 기존 pair 합성 파일 저장 실패');
+        ? `Graph two-branch compare composite done · ${finalFile}`
+        : 'Graph two-branch done · failed to save existing pair composite file');
       return {
         ...pair,
         ok: pair.ok && completion.status === 'done' && Boolean(finalFile),

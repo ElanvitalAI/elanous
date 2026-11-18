@@ -24,10 +24,11 @@ test('open side tab first PTY frame retains pre-TUI shell history across repaint
     const session = createSession({ source: 'tui' }, sessionsRoot);
     updateSessionMeta(session.id, (meta) => { meta.uiState = { ...meta.uiState, sidetabOpen: true }; }, sessionsRoot);
     const command = `printf '\n${marker}\n'; exec ${quote(process.execPath)} ${quote(BIN)} ${quote(`--test=${root}`)} --config-dir ${quote(root)} --test-state-dir ${quote(root)} --resume ${quote(session.id)} --tui next`;
+    const sidetabOpen = (screen: string): boolean => /Sessions · [1-9]/.test(screen);
     const repainted = (screen: string): boolean => {
       const afterResize = raw.slice(repaintStart).join('');
-      return afterResize.includes('세션') && afterResize.includes('❯')
-        && screen.includes('항목 없음') && promptAtBottom(screen);
+      return afterResize.includes('Sessions') && afterResize.includes('❯')
+        && sidetabOpen(screen) && promptAtBottom(screen);
     };
     const captureAt = (label: string, predicate: (screen: string) => boolean) => (screen: string): boolean => {
       if (!predicate(screen)) return false;
@@ -38,12 +39,12 @@ test('open side tab first PTY frame retains pre-TUI shell history across repaint
       executable: '/bin/sh', args: ['-c', command], root, rows: 8, cols: 40,
       env: { ELANOUS_SESSION_ROOT: sessionsRoot, ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '8',
         ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
-      ready: { label: 'first compact open', until: captureAt('first compact open', (screen) => screen.includes('항목 없음') && promptAtBottom(screen)) },
+      ready: { label: 'first compact open', until: captureAt('first compact open', (screen) => sidetabOpen(screen) && promptAtBottom(screen)) },
       steps: [
         { label: 'general open', resize: { cols: 80, rows: 24 }, until: captureAt('general open', repainted) },
         { label: 'compact again open', resize: { cols: 40, rows: 8 }, until: captureAt('compact again open', repainted) },
-        { label: 'side tab closed', keys: '\x1c', until: captureAt('side tab closed', (screen) => !screen.includes('항목 없음') && promptAtBottom(screen)) },
-        { label: 'side tab reopened', keys: '\x1c', until: captureAt('side tab reopened', (screen) => screen.includes('항목 없음') && promptAtBottom(screen)) },
+        { label: 'side tab closed', keys: '\x1c', until: captureAt('side tab closed', (screen) => !sidetabOpen(screen) && promptAtBottom(screen)) },
+        { label: 'side tab reopened', keys: '\x1c', until: captureAt('side tab reopened', (screen) => sidetabOpen(screen) && promptAtBottom(screen)) },
       ],
       quitKeys: '\x11',
       onOutput: (chunk) => { raw.push(chunk); events.push({ kind: 'output', chunk }); },
@@ -54,11 +55,11 @@ test('open side tab first PTY frame retains pre-TUI shell history across repaint
       'first compact open', 'general open', 'compact again open', 'side tab closed', 'side tab reopened',
     ]);
     for (const frame of run.frames) expect(promptAtBottom(frame.screen)).toBe(true);
-    expect(run.frames[0]!.screen).toContain('항목 없음');
-    expect(run.frames[1]!.screen).toContain('항목 없음');
-    expect(run.frames[2]!.screen).toContain('항목 없음');
-    expect(run.frames[3]!.screen).not.toContain('항목 없음');
-    expect(run.frames[4]!.screen).toContain('항목 없음');
+    expect(run.frames[0]!.screen).toMatch(/Sessions · [1-9]/);
+    expect(run.frames[1]!.screen).toMatch(/Sessions · [1-9]/);
+    expect(run.frames[2]!.screen).toMatch(/Sessions · [1-9]/);
+    expect(run.frames[3]!.screen).not.toMatch(/Sessions · [1-9]/);
+    expect(run.frames[4]!.screen).toMatch(/Sessions · [1-9]/);
     expect(captures.map(({ label }) => label)).toEqual(run.frames.map(({ label }) => label));
     for (const capture of captures) {
       const terminal = new Terminal({ cols: 40, rows: 8, scrollback: 200, allowProposedApi: true });

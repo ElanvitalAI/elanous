@@ -59,13 +59,23 @@ describe('TUI-RESUME-PICKER incident — next TUI sent «/resume» to the model'
     const n8n = seed('n8n 특강 단계별 영상');
     const other = seed('다른 대화');
     const lines = resumeListLines(resumeCandidates(other), other);
-    expect(lines[0]).toContain('최근 대화 2개');
+    expect(lines[0]).toContain('2 recent chats');
     expect(lines.some((l) => l.includes(n8n.slice(0, 8)) && l.includes('n8n 특강 단계별 영상'))).toBe(true);
     expect(lines.find((l) => l.includes(other.slice(0, 8)))).toContain(`▸ ${other.slice(0, 8)}`);
   });
 
+  test('an empty current session is not listed, but a current session with messages still is', () => {
+    const saved1 = seed('이전 대화');
+    const emptyCurrent = createSession({ source: 'tui' }).id;
+    const rows = resumeCandidates(emptyCurrent);
+    expect(rows.map((m) => m.id)).toContain(saved1);
+    expect(rows.map((m) => m.id)).not.toContain(emptyCurrent);
+    expect(resumeListLines(rows, emptyCurrent).join('\n')).not.toContain('(new session)');
+    expect(resumeCandidates(saved1).map((m) => m.id)).toContain(saved1);
+  });
+
   test('an empty store says so instead of showing nothing', () => {
-    expect(resumeListLines(resumeCandidates(null), null)).toEqual(['저장된 대화 없음']);
+    expect(resumeListLines(resumeCandidates(null), null)).toEqual(['No saved chats']);
   });
 });
 
@@ -103,7 +113,7 @@ describe('TUI-RESUME-PICKER — pick by number · ids that share their first 8 c
     setActiveSessionId(from);
     const rows = resumeCandidates(from);
     const lines = resumeListLines(rows, from);
-    expect(lines[0]).toContain('/resume <번호>');
+    expect(lines[0]).toContain('/resume <number>');
     rows.forEach((m, i) => expect(lines[i + 1]).toMatch(new RegExp(`^${i + 1}\\. [ ▸] ${m.id.slice(0, 8)}`)));
     const pick = rows.findIndex((m) => m.id === a) + 1;
     const log = spyOn(debug, 'log');
@@ -149,7 +159,7 @@ describe('TUI-RESUME-PICKER — pick by number · ids that share their first 8 c
     setActiveSessionId(from);
     const r = requestResumeTuiSession({ busy: false, from, prefix: 'elanous-session-h' });
     expect(r).toMatchObject({ kind: 'started', id: to });
-    expect(r.status).toBe('대화 이어 가기 · elanous-session-h · 이전 = elanous-session-c');
+    expect(r.status).toBe('Resuming chat · elanous-session-h · previous = elanous-session-c');
   });
 });
 

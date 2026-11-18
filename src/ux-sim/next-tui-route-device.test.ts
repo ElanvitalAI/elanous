@@ -36,7 +36,7 @@ describe('next TUI route device', () => {
       slashPrefixes: ['/harness'],
     });
     expect(simulateNextTuiRoute('/harness runs')).toBe(harness);
-    expect(simulateNextTuiHelp().join('\n')).toContain('/harness — 하니스 명령');
+    expect(simulateNextTuiHelp().join('\n')).toContain('/harness — Harness commands');
   });
 
   test('projects enabled registry commands into help, including a newly plugged route', () => {
@@ -46,7 +46,7 @@ describe('next TUI route device', () => {
     } as const;
     const help = simulateNextTuiHelp(NEXT_TUI_INPUT_CONTEXT, [...NEXT_TUI_ROUTE_REGISTRY, pluggedRoute]).join('\n');
     expect(help).toContain('/new-feature');
-    expect(help).toContain('/signals — 신호 확인');
+    expect(help).toContain('/signals — Check signals');
     expect(help).toContain('Keys');
   });
 

@@ -1,7 +1,7 @@
 import type { SidetabRow } from '../../sidetab-core/model.js';
 import {
   bindWorkspacePty, createWorkspaceInputState,
-  prepareWorkspaceInput, selectWorkspaceInput, setWorkspaceInputDraft,
+  prepareWorkspaceInput, selectDefaultOpenTabsWorkspace, selectWorkspaceInput, setWorkspaceInputDraft,
   type CompleteTerminalObservation, type WorkspaceInputMode, type WorkspaceInputState,
   type WorkspacePtyTarget,
 } from '../../sidetab-core/workspace-input.js';
@@ -27,6 +27,17 @@ export interface WorkspaceSidechatMessage {
   readonly text: string;
 }
 
+/**
+ * What the sidetab row-list refresh runs after it replaces the rows.
+ * entry.ts calls this name. The row-refresh test calls this same function,
+ * so deleting that call from the refresh no longer has a tested path.
+ */
+export function refreshWorkspaceInputRows(
+  controller: { ensureDefaultWorkspace(): void },
+): void {
+  controller.ensureDefaultWorkspace();
+}
+
 /** Keeps workspace drafts and targets independent while the TUI switches tabs. */
 export function createWorkspaceInputController(ports: WorkspaceInputPorts) {
   let state: WorkspaceInputState = createWorkspaceInputState();
@@ -37,6 +48,10 @@ export function createWorkspaceInputController(ports: WorkspaceInputPorts) {
     conversation: (spaceId: string) => conversations.get(spaceId) ?? [],
     select(row: SidetabRow) { state = selectWorkspaceInput(state, row); },
     bind(row: SidetabRow) { state = bindWorkspacePty(state, row); },
+    /** No explicit workspace: the last open local tab is the default, refreshed when that target exits. */
+    ensureDefaultWorkspace() {
+      state = selectDefaultOpenTabsWorkspace(state, ports.rows());
+    },
     edit(mode: WorkspaceInputMode, text: string) { state = setWorkspaceInputDraft(state, mode, text); },
     async submit(mode: WorkspaceInputMode): Promise<boolean> {
       if (submitting) throw new Error('workspace input is already submitting');

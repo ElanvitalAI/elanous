@@ -44,6 +44,39 @@ export function resolveSeatTurnCap(override: Partial<SeatTurnCapConfig> | undefi
   return { ...SEAT_TURN_CAP_DEFAULTS, ...(override ?? {}) };
 }
 
+// APP-BUILD-TOOL-WALL-CAP(11-17 run d2eab21a) — 자리 턴 벽시계 상한이 회원 게시 승인 창을 쥔 app_build 를 끊었다.
+//   승인을 쥘 수 있는 도구가 실행 중이면 상한은 «미룬다»: 새 도구는 막되 진행 중 호출은 끊지 않고,
+//   그 도구가 돌아오거나 승인 창 마감이 지나면 턴을 닫는다.
+
+/** 회원 게시 승인 창을 쥘 수 있는 도구. 출처: src/plugins/core/app-build-autofill.ts APP_BUILD_TOOL_NAME(이 모듈은 import 0 이라 문자열로 둔다). */
+export const OWNER_APPROVAL_TOOL_NAMES: ReadonlySet<string> = new Set(['app_build']);
+
+/** 게시 승인 노드에서 여는 신뢰 승인 창 길이. 출처: src/cli/child-plugin-runtime.ts app-build-owner-publish-approval invoke(종전 리터럴 15 * 60_000). */
+export const APP_BUILD_OWNER_APPROVAL_WINDOW_MS = 15 * 60_000;
+
+/** 창 마감 뒤 승인 노드가 실패를 기록하고 도구가 돌아올 여유. 출처: 승인 transport 1회 상한 5s(capability-providers/app-build-publish-approval.ts) 의 12배. */
+export const SEAT_CAP_APPROVAL_DEFER_GRACE_MS = 60_000;
+
+/** 상한이 승인 도구 때문에 미룰 수 있는 최장 시간 — 상한 시각부터 승인 창 한 벌 ⊕ 여유. 이 뒤엔 미룸 없이 턴을 끊는다. */
+export const SEAT_CAP_APPROVAL_DEFER_MAX_MS = APP_BUILD_OWNER_APPROVAL_WINDOW_MS + SEAT_CAP_APPROVAL_DEFER_GRACE_MS;
+
+/** 미룬 상한에서 승인 도구가 돌아온 뒤 모델이 결과를 읽고 한 줄 요약으로 마감할 여유. 출처: 상한 안내(SEAT_TURN_CAP_TOOL_NOTICE) 뒤 요약 1회 응답 — 기본 벽시계 상한(20분)의 1/10. */
+export const SEAT_CAP_DEFERRED_WRAPUP_MS = 2 * 60_000;
+
+/** 자리 턴 상한이 core 턴을 끊을 때 쓰는 abort reason. 하위 승인 노드는 이 reason 으로 «상한에 끊김» 을 사람 거절과 가른다. */
+export const SEAT_TURN_CAP_ABORT_CODE = 'SEAT_TURN_CAP_ABORT';
+export class SeatTurnCapAbort extends Error {
+  readonly code = SEAT_TURN_CAP_ABORT_CODE;
+  constructor(readonly capReason: 'tools' | 'wall' | 'idle' | 'backstop') {
+    super(`seat turn cap reached (${capReason})`);
+    this.name = 'SeatTurnCapAbort';
+  }
+}
+
+export function isSeatTurnCapAbort(reason: unknown): boolean {
+  return !!reason && typeof reason === 'object' && (reason as { code?: unknown }).code === SEAT_TURN_CAP_ABORT_CODE;
+}
+
 /** 우편 조회 도구 이름(카탈로그 aliases). */
 export const MAIL_LIST_TOOL_NAMES: ReadonlySet<string> = new Set(['MsgList', 'msg_list']);
 

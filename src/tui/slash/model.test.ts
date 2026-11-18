@@ -15,9 +15,9 @@ describe('NEXT-TUI-SLASH-MODEL', () => {
   });
 
   test('fast, normal, and deep map to the shared model-tier ladder', () => {
-    expect(parseNextTuiModelCommand('/model fast')).toMatchObject({ kind: 'tier', choice: 'fast', tier: 'budget', label: '빠름' });
-    expect(parseNextTuiModelCommand('/model normal')).toMatchObject({ kind: 'tier', choice: 'normal', tier: 'balanced', label: '보통' });
-    expect(parseNextTuiModelCommand('/model deep')).toMatchObject({ kind: 'tier', choice: 'deep', tier: 'best', label: '깊음' });
+    expect(parseNextTuiModelCommand('/model fast')).toMatchObject({ kind: 'tier', choice: 'fast', tier: 'budget', label: 'fast' });
+    expect(parseNextTuiModelCommand('/model normal')).toMatchObject({ kind: 'tier', choice: 'normal', tier: 'balanced', label: 'normal' });
+    expect(parseNextTuiModelCommand('/model deep')).toMatchObject({ kind: 'tier', choice: 'deep', tier: 'best', label: 'deep' });
     expect(parseNextTuiModelCommand('/provider 보통')).toMatchObject({ kind: 'tier', choice: 'normal', tier: 'balanced' });
   });
 

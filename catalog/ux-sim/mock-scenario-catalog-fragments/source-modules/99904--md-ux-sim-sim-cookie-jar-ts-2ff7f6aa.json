@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-COOKIE-JAR-TS",
+  "path": "src/ux-sim/sim-cookie-jar.ts",
+  "boundary": "Browser-like cookie jar for member-flow simulations: stores Set-Cookie and attaches matching cookies to later requests (credentials: include), so the signup → handle → webchat lap never hand-injects cookies.",
+  "deviceIds": [
+    "fake-member-oidc-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

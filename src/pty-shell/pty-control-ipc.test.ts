@@ -261,6 +261,25 @@ describe('pty-control-ipc round-trip', () => {
     }
   });
 
+  test('foreground TUI mints a run anchor for its manifest when launched without one', () => {
+    withRunId(undefined, () => {
+      const id = `tui:${process.pid}`;
+      const stop = startTuiSelfReport({
+        surfaceId: id, register: () => {}, createMirror: () => null,
+        startControlPoller: () => () => {}, startRunState: () => () => {},
+        heartbeatMs: 60_000,
+      });
+      try {
+        const row = getPtyManifest(id);
+        expect(row?.runId).toMatch(/^run-/);
+        expect(row?.runIdSource).toBe('minted');
+        expect(process.env.ELANOUS_RUN_ID).toBe(row?.runId);
+      } finally {
+        stop();
+      }
+    });
+  });
+
   test('foreground TUI owner starts remotely, records stdout and auto-stops on unregister', async () => {
     const id = `tui:${process.pid}`;
     const target = createTuiControlTarget(id, { dims: () => ({ cols: 120, rows: 40 }) });
@@ -268,6 +287,7 @@ describe('pty-control-ipc round-trip', () => {
     const unregister = registerPtyControlTarget(target);
     try {
       register(id);
+      expect(getPtyManifest(id)?.outputBytesTotal).toBe(0);
       const start = requestRemotePtyControl(id, 'record-start', undefined, { timeoutMs: 2000 });
       await Bun.sleep(60);
       await processPtyControlRequests(getPtyControlTarget, () => false);
@@ -291,6 +311,9 @@ describe('pty-control-ipc round-trip', () => {
       expect(readFileSync(castPath, 'utf8')).toContain('"o","hello"');
       expect(readFileSync(castPath, 'utf8')).toContain('한');
       expect(readFileSync(castPath, 'utf8')).not.toContain('\ufffd');
+      // Foreground TUI writes must count actual bytes even without a child
+      // adapter.onData; fragmented UTF-8 is three bytes, not one character.
+      expect(getPtyManifest(id)?.outputBytesTotal).toBe(Buffer.byteLength('hello한'));
       expect(JSON.parse(readFileSync(castPath, 'utf8').split('\n')[0]!)).toMatchObject({ width: 120, height: 40 });
       expect(stopPtyRecording(id)).toEqual({ ok: false, reason: 'not-recording' });
     } finally {

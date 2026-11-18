@@ -323,6 +323,18 @@ test('cron_entry only matches the executed script, not a similarly named script 
   } finally { db.close(); }
 });
 
+test('retro-daily graph declares 조율자 root and OP owner so a new cron can be registered', async () => {
+  const f = fixture();
+  mkdirSync(join(f.root, 'graphs', 'retro'));
+  writeFileSync(join(f.root, 'graphs', 'retro', 'daily.yaml'),
+    readFileSync(join(import.meta.dir, '..', '..', 'graphs', 'retro', 'daily.yaml'), 'utf8'));
+  const opts: LoopRegistryOptions = { ...f.opts, schedules: [], scheduleAction: async () => { throw new Error('dry run must not register'); } };
+  expect(loopStatus('retro-daily', opts)).toMatchObject({ root: '조율자', owner: 'OP', ownerSource: 'header', enabled: false, jobs: [] });
+  expect(await setLoopEnabled('retro-daily', true, false, opts)).toMatchObject({
+    dryRun: true, changes: [{ action: 'create', cron: '40 22 * * *' }],
+  });
+});
+
 test('legacy loop without root stays readable without CLI stderr but cannot create a new cron', async () => {
   const f = fixture();
   const warnings: string[] = [];

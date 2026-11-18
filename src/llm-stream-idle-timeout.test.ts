@@ -1,6 +1,7 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import { debug } from './debug/log.js';
 import { PROVIDERS, streamLLMWithTools, type LLMProvider, type LLMStreamEvent } from './llm.js';
+import { StreamTotalTimeoutError } from './llm/stream-fallback.js';
 import { setUserConfigOverlay } from './user-config.js';
 
 const realTimeout = globalThis.setTimeout;
@@ -52,6 +53,10 @@ function providerForTimeout(retryEvents: LLMStreamEvent[] | null): {
 }
 
 describe('LLM stream idle timeout recovery', () => {
+  /** One stream attempt — the idle path, not a second turn, decides (A207). */
+  const ONE_TURN = 1; // 출처: #38137 one stream attempt
+  /** indexOf sentinel: Blocked is present when this lower bound holds (A207). */
+  const BLOCKED_PRESENT = 0; // 출처: #38137 Blocked must be in the status list
   it('does not await a stalled iterator return and retries the same provider once', async () => {
     const fake = providerForTimeout([{ type: 'text', delta: 'partial answer' }]);
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
@@ -86,6 +91,84 @@ describe('LLM stream idle timeout recovery', () => {
       log.mockRestore();
     }
   }, 500);
+
+  it('detaches the stalled iterator when the total stream timeout fires (A207)', async () => {
+    const fake = providerForTimeout(null);
+    const statuses: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      let caught: unknown = null;
+      try {
+        await streamLLMWithTools(
+          [{ role: 'user', content: 'total timeout must detach the socket' }],
+          { onText: () => {}, onStatus: (line) => statuses.push(line), dispatchTool: async () => ({}) },
+          {
+            provider: fake.provider,
+            model: 'idle-timeout-test-model',
+            streamIdleTimeoutMs: 10_000, // keep the idle path dormant; total fires first
+            streamTotalTimeoutMs: 10,
+            tools: [{ name: 'probe', description: 'keeps tool streaming enabled', parameters: { type: 'object' } }],
+            maxTurns: ONE_TURN,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      // The total-timeout error must surface to the caller…
+      expect(caught).toBeInstanceOf(StreamTotalTimeoutError);
+      expect((caught as StreamTotalTimeoutError).totalMs).toBe(10);
+      // …while the abandoned provider iterator is detached without being awaited…
+      expect(fake.getReturns()).toBe(1);
+      expect(fake.returnSettled()).toBe(false);
+      // …and the attempt abort signal fires so the provider socket tears down.
+      expect(fake.getSignals()[0]?.aborted).toBe(true);
+      expect(statuses.some((line) => line.includes('응답 시간 상한 초과'))).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  }, 500);
+
+  it('says Blocked after the one no-progress retry when no provider is left (A207)', async () => {
+    const fake = providerForTimeout(null);
+    const statuses: string[] = [];
+    const events: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event) => {
+      if (category === 'llm.stream' || category === 'llm.retry') events.push(event);
+    });
+    setUserConfigOverlay((config) => ({
+      ...config,
+      llm: { ...config.llm, provider: 'auto', fallbackChain: [] },
+    }));
+    try {
+      let caught: unknown = null;
+      try {
+        await streamLLMWithTools(
+          [{ role: 'user', content: 'no progress and nowhere to fall back' }],
+          { onText: () => {}, onStatus: (line) => statuses.push(line), dispatchTool: async () => ({}) },
+          {
+            initialProvider: fake.provider,
+            model: 'idle-timeout-test-model',
+            streamIdleTimeoutMs: 10,
+            tools: [{ name: 'probe', description: 'keeps tool streaming enabled', parameters: { type: 'object' } }],
+            maxTurns: ONE_TURN,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(fake.getCalls()).toBe(2);
+      expect(statuses).toContain('스트림 무응답 · 재시도 1/1');
+      expect(statuses.filter((line) => line.startsWith('스트림 무응답 · 재시도'))).toHaveLength(1);
+      expect(statuses).toContain('⏸ Blocked · 스트림 무진행');
+      expect(events.filter((event) => event === 'idle-timeout-retry')).toHaveLength(1);
+      expect(events).toContain('idle-timeout-blocked');
+    } finally {
+      log.mockRestore();
+      setUserConfigOverlay(null);
+    }
+  }, 1000);
 
   it('caps idle retries at one and preserves pinned-provider partial text', async () => {
     const fake = providerForTimeout(null);
@@ -151,6 +234,9 @@ describe('LLM stream idle timeout recovery', () => {
       expect(stalled.getReturns()).toBe(2);
       expect(fallbackCalls).toBe(1);
       expect(statuses).toContain('스트림 무응답 · 재시도 1/1');
+      // A207 — the one no-progress retry is per turn. Crossing to the fallback must not
+      // announce a second «재시도 1/1».
+      expect(statuses.filter((line) => line.startsWith('스트림 무응답 · 재시도'))).toHaveLength(1);
       expect(statuses.some((line) => line.startsWith('⚠ 공급자 전환: idle-timeout-test-provider → grok ('))).toBe(true);
     } finally {
       log.mockRestore();
@@ -274,5 +360,55 @@ describe('LLM stream idle timeout recovery', () => {
       message: 'stream idle timeout after 10ms',
     });
   }, 500);
+
+  it('says Blocked before the pinned-provider stop throw (A207)', async () => {
+    const never = new Promise<IteratorResult<LLMStreamEvent, void>>(() => {});
+    let calls = 0;
+    const provider: LLMProvider = {
+      name: 'idle-timeout-stop-provider',
+      defaultModel: 'idle-timeout-stop-model',
+      available: () => true,
+      async *chat() {},
+      streamChat() {
+        calls++;
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          next: () => never,
+          async return() { return { done: true, value: undefined }; },
+        } as AsyncGenerator<LLMStreamEvent, void, unknown>;
+      },
+    };
+    const statuses: string[] = [];
+    const events: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event) => {
+      if (category === 'llm.stream') events.push(event);
+    });
+    try {
+      let caught: unknown = null;
+      try {
+        await streamLLMWithTools(
+          [{ role: 'user', content: 'pinned stop must say Blocked first' }],
+          { onText: () => {}, onStatus: (line) => statuses.push(line), dispatchTool: async () => ({}) },
+          {
+            provider,
+            model: provider.defaultModel,
+            streamIdleTimeoutMs: 10,
+            tools: [{ name: 'probe', description: 'probe', parameters: { type: 'object' } }],
+            maxTurns: ONE_TURN,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toMatchObject({ name: 'StreamIdleTimeoutError' });
+      expect(calls).toBe(2);
+      expect(statuses).toContain('스트림 무응답 · 재시도 1/1');
+      const blockedAt = statuses.indexOf('⏸ Blocked · 스트림 무진행');
+      expect(blockedAt).toBeGreaterThanOrEqual(BLOCKED_PRESENT);
+      expect(events).toContain('idle-timeout-blocked');
+    } finally {
+      log.mockRestore();
+    }
+  }, 1000);
 
 });

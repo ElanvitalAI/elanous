@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { isatty } from 'node:tty';
 import {
   currentBackendId,
   deleteSecretAsync,
@@ -23,10 +24,13 @@ import { registerCredCommands } from './cred-cli.js';
 import { registerCredentialsMigrationCommands } from './credentials-migration-cli.js';
 import { registerSealedMoveCommand } from './credentials-migration-sealed-move.js';
 import { registerSecretBackupCommands } from './secret-backup-cli.js';
+import { registerSecretInventoryCommand } from './secret-inventory-cli.js';
+import { registerSecretOauthLeaseCommands } from './secret-oauth-lease-cli.js';
+import { registerSecretLeaseCommands } from './secret-lease-cli.js';
 import { appSecretId, appSecretIdForExistingApp } from '../nexus/config/secrets/app-secret-ledger.js';
 import type { SecretBackendId } from '../nexus/config/secrets/types.js';
 import { revokeAppSecretValues, setAppSecretValue, type AppSecretRevokeResult } from '../nexus/config/secrets/file-backend.js';
-import { deleteCredentialSlotAsync, listCredentialSlotsAsync, parseCredentialSlotId, setCredentialSlotAsync, setCredentialSlotBatchAsync } from '../nexus/config/secrets/cred-slots.js';
+import { credentialSlotTransferClass, deleteCredentialSlotAsync, listCredentialSlotsAsync, parseCredentialSlotId, setCredentialSlotAsync, setCredentialSlotBatchAsync } from '../nexus/config/secrets/cred-slots.js';
 import { credentialSlotWizardPlan, runCredentialSlotWizard } from '../nexus/config/secrets/cred-slot-wizard.js';
 
 export interface SecretCliDeps {
@@ -54,6 +58,10 @@ export interface SecretCliDeps {
   saveCredentialSlotBatch?: (values: Readonly<Record<string, string>>) => Promise<void>;
   removeCredentialSlot?: (id: string) => Promise<boolean>;
   listCredentialSlots?: typeof listCredentialSlotsAsync;
+  /** Non-interactive `secret set` input: whole contents of an already-open descriptor (0 = stdin pipe). */
+  readValueFd?: (fd: number) => Promise<string>;
+  /** True when the descriptor is a terminal; typed input there would echo, so the hidden prompt is required. */
+  isTerminalFd?: (fd: number) => boolean;
 }
 
 const SECRET_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -158,7 +166,16 @@ function resolveDeps(deps: SecretCliDeps) {
     }),
     syncBundle: deps.syncBundle ?? defaultSyncBundle,
     importSecrets: deps.importSecrets ?? importSecretBatchAsync,
+    readValueFd: deps.readValueFd ?? (async (fd: number) => readFileSync(fd, 'utf8')),
+    isTerminalFd: deps.isTerminalFd ?? ((fd: number) => isatty(fd)),
   };
+}
+
+/** One value per descriptor: a single trailing newline (from echo/printf pipes) is dropped, nothing else is trimmed. */
+function parsePipedSecretValue(raw: string): string | undefined {
+  const value = raw.replace(/\r?\n$/, '');
+  if (!value.trim() || value.includes('\0') || /[\r\n]/.test(value)) return undefined;
+  return value;
 }
 
 export function registerSecretCommands(program: Command, deps: SecretCliDeps = {}): Command {
@@ -174,9 +191,13 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
     output: cli.output,
     setExitCode: cli.setExitCode,
   });
+  // Catalogued static API keys, including their typed `cred:` store slots (cred:firecrawl.api_key …).
+  // A `cred:` ID is kept only when the slot schema classes it as a static key: rotating login slots
+  // (OAuth/refresh — codex, Claude) never enter a bundle, even if a catalog row named one by mistake.
   const exportableSecretIds = new Set(SERVICE_KEY_CATALOG
     .filter((entry) => entry.kind === 'api-key')
-    .flatMap((entry) => [entry.id, ...entry.envNames, ...(entry.storeIds ?? [])]));
+    .flatMap((entry) => [entry.id, ...entry.envNames, ...(entry.storeIds ?? [])])
+    .filter((id) => !id.startsWith('cred:') || credentialSlotTransferClass(id) === 'static'));
   const importableEnvNames = new Set(SERVICE_KEY_CATALOG
     .filter((entry) => entry.kind === 'api-key')
     .flatMap((entry) => entry.envNames));
@@ -186,6 +207,11 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
   redactParserErrors(secret);
   registerSealedMoveCommand(secret);
   registerSecretBackupCommands(secret);
+  registerSecretInventoryCommand(secret);
+  // HQ-VAULT V2 — Codex OAuth mirror lease. V3 (#38086) owns `secret lease <id>`; its `oauthLease` seam calls runCodexOauthLease.
+  registerSecretOauthLeaseCommands(secret);
+  // HQ-VAULT V3 — 정적 키 임대(`secret lease`). V2 OAuth 임대는 같은 명령의 `oauthLease` 이음매로 합류한다.
+  registerSecretLeaseCommands(secret);
 
   const slots = secret.command('slot').description('Inspect shared credential slots without displaying their values.');
   slots.command('list')
@@ -334,6 +360,12 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
             return;
           }
           const bundle = await decryptSecretBundle(await cli.readBundleFile(file), passphrase);
+          const rotatingLoginIds = Object.keys(bundle.secrets).filter((id) => credentialSlotTransferClass(id) === 'rotating-login');
+          if (rotatingLoginIds.length) {
+            cli.output.error(`bundle contains rotating login credentials that stay with their owner host: ${rotatingLoginIds.join(', ')}`);
+            cli.setExitCode(1);
+            return;
+          }
           const unsupportedIds = Object.keys(bundle.secrets).filter((id) => !exportableSecretIds.has(id));
           if (unsupportedIds.length) {
             cli.output.error(`bundle contains unsupported secret names: ${unsupportedIds.join(', ')}`);
@@ -382,21 +414,56 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
   registerEncryptedImport(cred, 'credential');
 
   const setCommand = secret.command('set <id>')
-    .description('Prompt for a secret without echo; the value is never accepted as an argument.')
+    .description('Prompt for a secret without echo; the value is never accepted as an argument. Scripts pipe it with --stdin or --value-fd.')
+    .option('--stdin', 'Read the value from a piped standard input (never a terminal); nothing is echoed')
+    .option('--value-fd <fd>', 'Read the value from an already-open file descriptor (never a terminal); nothing is echoed')
     .allowExcessArguments(false)
-    .action(async (id: string) => {
+    .action(async (id: string, options: { stdin?: boolean; valueFd?: string }) => {
       if (!validId(id)) {
         cli.output.error('invalid secret identifier');
         cli.setExitCode(1);
         return;
       }
-      if (!cli.isInteractive()) {
-        cli.output.error('secret set requires an interactive terminal');
+      let pipedFd: number | undefined;
+      if (options.stdin && options.valueFd !== undefined) {
+        cli.output.error('secret set takes either --stdin or --value-fd, not both');
+        cli.setExitCode(1);
+        return;
+      }
+      if (options.stdin) pipedFd = 0;
+      else if (options.valueFd !== undefined) {
+        pipedFd = /^[0-9]+$/.test(options.valueFd) ? Number(options.valueFd) : Number.NaN;
+        if (!Number.isSafeInteger(pipedFd)) {
+          cli.output.error('secret set --value-fd needs a file descriptor number');
+          cli.setExitCode(1);
+          return;
+        }
+      }
+      if (pipedFd !== undefined && cli.isTerminalFd(pipedFd)) {
+        // Typing into a terminal descriptor would echo the value; that case keeps the hidden prompt.
+        cli.output.error('secret set refuses terminal input on --stdin/--value-fd; omit the flag for the hidden prompt');
+        cli.setExitCode(1);
+        return;
+      }
+      if (pipedFd === undefined && !cli.isInteractive()) {
+        cli.output.error('secret set requires an interactive terminal, or pipe the value with --stdin or --value-fd');
         cli.setExitCode(1);
         return;
       }
       try {
-        const value = await cli.promptSecret('Secret value: ');
+        let value: string | undefined;
+        if (pipedFd === undefined) value = await cli.promptSecret('Secret value: ');
+        else {
+          let raw: string;
+          try { raw = await cli.readValueFd(pipedFd); }
+          catch { cli.output.error('secret input could not be read'); cli.setExitCode(1); return; }
+          value = parsePipedSecretValue(raw);
+          if (value === undefined) {
+            cli.output.error('secret value is empty or invalid');
+            cli.setExitCode(1);
+            return;
+          }
+        }
         if (value === undefined) {
           cli.output.error('secret input cancelled');
           cli.setExitCode(1);

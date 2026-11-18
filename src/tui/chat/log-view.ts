@@ -1,13 +1,55 @@
 import type { SerializedMessage } from '../../session/index.js';
 import { redactSecretText } from '../../debug/log.js';
+import { continueBanner, dimContinueBanner } from './continue-banner.js';
 import { planInterimDisplay, type InterimDisplay } from './goal-interim.js';
 import { parseToolResultEnvelope, toolResultBodyText, toolResultErrorText } from '../../chat/tool-render/result-text.js';
 import { agentTraceLine } from '../core/agents.js';
+import chalk from 'chalk';
 import { renderMarkdown } from '../../render.js';
 import { nextTuiErrorCard } from './error-card.js';
+import { userTurnBandSgr } from './turn-band-theme.js';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
+
+/** The user's own turn reads like the classic prompt line. */
+export const USER_PROMPT_MARK = '> ';
+
+// NEXT-TUI-USER-TURN-COLOR (대표 11-17): a person's turn is a band across the whole row so it stands apart from
+// answers and tool rows. 대표 11-18: toned down to a neutral grey just off the terminal background — the colours are the
+// theme tokens in turn-band-theme.ts (dark/light), never written here. USER_TURN_BAND_SGR is the dark token's SGR.
+export const USER_TURN_BAND_SGR = userTurnBandSgr({} as NodeJS.ProcessEnv);
+/** NO_COLOR keeps «> » plus the two-column indent as the only separation. */
+export const userTurnBandEnabled = (env: NodeJS.ProcessEnv = process.env): boolean => !('NO_COLOR' in env) || env.NO_COLOR === '';
+
+// MSG-SOURCE-HIERARCHY: another seat's message (from.kind agent) is a paler grey-violet band under a «⇢ SEAT · intent»
+// head — clearly not the person's own turn, still readable. 출처: xterm 256-color 60 = #5f5f87; bright white on it ≈ 6:1.
+export const AGENT_TURN_BAND_SGR = '48;5;60;97';
+export const AGENT_MARK = '⇢';
+
+function agentBandRow(row: string, columns: number): string {
+  const pad = ' '.repeat(Math.max(0, columns - Bun.stringWidth(row)));
+  const body = row.startsWith(`${AGENT_MARK} `) ? `\x1b[1m${AGENT_MARK}\x1b[22m${row.slice(AGENT_MARK.length)}` : row;
+  return `\x1b[${AGENT_TURN_BAND_SGR}m${body}${pad}\x1b[0m`;
+}
+
+/** Rows for a user-role message by its structured source (never by its wording); null = the person's own turn. */
+function sourcedUserLines(message: SerializedMessage, columns: number): string[] | null {
+  const from = message.from;
+  if (!from || from.kind === 'human') return null;
+  // The harness's own turn (waker, automatic continue, mail wake): one dim line, the internal instruction stays hidden.
+  if (from.kind === 'system') return [dimContinueBanner(fitLogLine(continueBanner(from.origin ?? 'internal'), columns)), ''];
+  const head = [`${AGENT_MARK} ${from.seat ?? 'agent'}`, from.intent, from.due ? `due ${from.due}` : undefined, from.msgId ? `#${from.msgId}` : undefined].filter(Boolean).join(' · ');
+  const rows = [...wrapLine(head, columns), ...safeLogText(message.content).split('\n').flatMap((part) => wrapLine(`  ${part}`, columns))];
+  return [...(userTurnBandEnabled() ? rows.map((row) => agentBandRow(row, columns)) : rows), ''];
+}
+
+/** Paint one wrapped user row as a band to `columns`; «>» is bold, the body keeps normal weight. */
+export function userTurnBandRow(row: string, columns: number): string {
+  const pad = ' '.repeat(Math.max(0, columns - Bun.stringWidth(row)));
+  const body = row.startsWith(USER_PROMPT_MARK) ? `\x1b[1m>\x1b[22m${row.slice(1)}` : row;
+  return `\x1b[${userTurnBandSgr()}m${body}${pad}\x1b[0m`;
+}
 
 export function safeLogText(text: string): string {
   const plain = text
@@ -17,7 +59,7 @@ export function safeLogText(text: string): string {
   return redactSecretText(plain);
 }
 
-function wrapText(text: string, columns: number, styled: boolean, resetOnWrap = true): string[] {
+function wrapText(text: string, columns: number, styled: boolean, resetOnWrap = true, hang = 2): string[] {
   const width = Math.max(1, columns);
   const lines: string[] = [];
   let line = '';
@@ -27,7 +69,7 @@ function wrapText(text: string, columns: number, styled: boolean, resetOnWrap = 
   let continuation = false;
   const nextLine = (nextCells: number): void => {
     lines.push(line + (styled && (activeSgr.length > 0 || resetOnWrap) ? '\x1b[0m' : ''));
-    lineIndentWidth = Math.min(2, Math.max(0, width - nextCells));
+    lineIndentWidth = Math.min(hang, Math.max(0, width - nextCells));
     line = ' '.repeat(lineIndentWidth) + (styled ? activeSgr.join('') : '');
     used = lineIndentWidth;
     continuation = true;
@@ -114,14 +156,61 @@ function wrapLine(text: string, columns: number): string[] {
 }
 
 /** Only trusted classic-renderer SGR escapes pass through after sanitizing raw text. */
-function wrapRenderedLine(text: string, columns: number, resetOnWrap = true): string[] {
-  return wrapText(text, columns, true, resetOnWrap);
+function wrapRenderedLine(text: string, columns: number, resetOnWrap = true, hang = 2): string[] {
+  return wrapText(text, columns, true, resetOnWrap, hang);
 }
 
-function assistantMarkdownLines(text: string, columns: number, label: string, resetOnWrap = true): string[] {
-  const rendered = renderMarkdown(safeLogText(text));
-  return rendered.split('\n').flatMap((part, index) =>
-    wrapRenderedLine(`${index === 0 ? label : '  '}${part}`, columns, resetOnWrap));
+/** READABILITY-PORT: bare URLs read as links (underlined accent) in the Next transcript only. Style-only —
+ *  plain text and line count are unchanged; with colors off (`chalk.level === 0`) this is the identity. */
+export function highlightLinks(line: string): string {
+  return line.replace(/https?:\/\/[^\s)\]>"'`\x1b]+/g, (url) => chalk.underline(chalk.cyan(url)));
+}
+
+const LIST_ITEM = /^\s*(?:[-*]|\d+\.)\s/;
+const FENCE = /^ {0,3}(?:`{3,}|~{3,})/;
+const HEADING = /^#{1,3}\s/;
+/** A line that is only bold text (optionally ending in a colon) is a sub-heading in model output. */
+const BOLD_SUBHEADING = /^\s*\*\*[^*]+\*\*\s*:?\s*$/;
+const isHeadingLike = (line: string): boolean => HEADING.test(line) || BOLD_SUBHEADING.test(line);
+
+/** MARKDOWN-BLOCK-SPACING: one blank line between blocks, like classic. Dense model output
+ *  («문장\n## 제목\n본문\n- 항목») gets a blank before a heading / bold sub-heading, after it, before a list
+ *  that follows prose and before a code fence; runs of blank lines collapse to one. Nothing is added inside a
+ *  fence, and text inside a line («① … ② …») is never touched. Display-only: the stored message is untouched
+ *  and the live preview and the saved reply share this so they stay identical. */
+export function breatheMarkdown(text: string): string {
+  const out: string[] = [];
+  let inFence = false;
+  let prev = '';
+  for (const line of text.split('\n')) {
+    const blank = line.trim() === '';
+    if (!inFence && blank && out.length > 0 && out[out.length - 1]!.trim() === '') continue; // collapse blank runs
+    const fence = FENCE.test(line);
+    const opensBlock = !inFence && (fence || isHeadingLike(line)
+      || LIST_ITEM.test(line) && prev.trim() !== '' && !LIST_ITEM.test(prev));
+    const afterHeading = !inFence && !blank && prev.trim() !== '' && isHeadingLike(prev);
+    if ((opensBlock || afterHeading) && prev.trim() !== '' && out.length > 0) out.push('');
+    out.push(line);
+    if (fence) inFence = !inFence;
+    prev = line;
+  }
+  return out.join('\n');
+}
+
+/** Hanging indent for a wrapped list item: continuation rows align under the item text, not under the marker.
+ *  Paragraphs wrap flush-left (classic). Measured on the rendered row with colors stripped. */
+export function hangingIndentFor(renderedRow: string): number {
+  const plain = renderedRow.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  const marker = /^(\s*)(?:[-*•]|\d+[.)])\s+/u.exec(plain);
+  return marker ? Bun.stringWidth(marker[0]) : 0;
+}
+
+/** Leading blank lines are dropped so a reply starts on its first text row. Replies carry no speaker label
+ *  (classic TUI: the user's input is the «>» prompt line, the answer stands alone). */
+function assistantMarkdownLines(text: string, columns: number, resetOnWrap = true): string[] {
+  const rendered = renderMarkdown(breatheMarkdown(safeLogText(text).replace(/^(?:[ \t]*\n)+/, '')));
+  return rendered.split('\n').flatMap((part) =>
+    wrapRenderedLine(highlightLinks(part), columns, resetOnWrap, hangingIndentFor(part)));
 }
 
 export function fitLogLine(text: string, columns: number): string {
@@ -168,8 +257,8 @@ export const TOOL_FOLD_LINE_LIMIT = 9;
  * visible; if even that cannot fit, the whole line is cut to the width.
  */
 export function toolFoldSummary(toolName: string, totalLines: number, columns?: number): string {
-  const prefix = '▸ 도구 ';
-  const suffix = ` · ${totalLines}줄 (접힘)`;
+  const prefix = '▸ Tool ';
+  const suffix = ` · ${totalLines} lines (folded)`;
   const name = safeStatusText(toolName);
   const full = `${prefix}${name}${suffix}`;
   if (columns === undefined || Bun.stringWidth(full) <= columns) return full;
@@ -217,11 +306,11 @@ function toolDisplay(message: SerializedMessage): ToolDisplay {
   const record = parsed.value as Record<string, unknown>;
   const error = toolResultErrorText(record);
   const status: string[] = [];
-  if (error !== null) status.push('오류');
-  if (typeof record.totalLines === 'number') status.push(`${record.totalLines}줄`);
+  if (error !== null) status.push('error');
+  if (typeof record.totalLines === 'number') status.push(`${record.totalLines} lines`);
   if (typeof record.totalBytes === 'number') status.push(formatToolBytes(record.totalBytes));
   if (typeof record.exitCode === 'number') status.push(`exit ${record.exitCode}`);
-  if (record.truncated === true || parsed.truncated) status.push('잘림');
+  if (record.truncated === true || parsed.truncated) status.push('truncated');
   const text = error ?? toolResultBodyText(record) ?? '';
   // Tabs (Read's «     1\tline» gutter) would be dropped as control characters — keep them as a space.
   return { envelope: true, status: status.join(' · '), body: safeLogText(text.replace(/\t/g, ' ')) };
@@ -229,17 +318,17 @@ function toolDisplay(message: SerializedMessage): ToolDisplay {
 
 /** Tool output that is not finished yet (no result) must never fold. */
 function toolLinesUnfolded(message: SerializedMessage, columns: number): string[] {
-  const label = safeLogText(message.toolName || '실행');
+  const label = safeLogText(message.toolName || 'run');
   const display = toolDisplay(message);
   const lines: string[] = [];
   if (display.envelope) {
-    lines.push(...wrapLine(`도구: ${label}${display.status ? ` · ${display.status}` : ''}`, columns));
+    lines.push(...wrapLine(`Tool: ${label}${display.status ? ` · ${display.status}` : ''}`, columns));
     for (const part of toolOutputParts(display.body)) lines.push(...wrapLine(`  ${part}`, columns));
     return lines;
   }
   const parts = toolOutputParts(`${label} ${display.body}`);
   for (let i = 0; i < parts.length; i++) {
-    const prefix = i === 0 ? '도구: ' : '  ';
+    const prefix = i === 0 ? 'Tool: ' : '  ';
     lines.push(...wrapLine(prefix + parts[i], columns));
   }
   return lines;
@@ -273,24 +362,30 @@ function messageLines(
     if (running || outputLines <= TOOL_FOLD_LINE_LIMIT || expandedToolIndexes?.has(index)) {
       return [...toolLinesUnfolded(message, columns), ''];
     }
-    return [toolFoldSummary(message.toolName || '실행', outputLines, columns), ''];
+    return [toolFoldSummary(message.toolName || 'run', outputLines, columns), ''];
   }
   // TUI-GOAL-INTERIM-QUIET — 내부 턴 입력은 사람 머리 없이 출처 한 줄 · 이어가기 앞 중간 보고는 한 줄로 접는다.
-  if (display?.kind === 'internal-input') return [fitLogLine(`↻ 자동 재개(${display.origin})`, columns), ''];
+  if (message.role === 'user') {
+    const sourced = sourcedUserLines(message, columns);
+    if (sourced) return sourced;
+  }
+  if (display?.kind === 'internal-input') return [dimContinueBanner(fitLogLine(continueBanner(display.origin), columns)), ''];
   if (display?.kind === 'folded') return [...wrapLine(`  ${display.line}`, columns), ''];
   if (message.role === 'assistant' && message.replyFailure === true) {
     return [...nextTuiErrorCard(message.content, message.replyFailureKind)
       .flatMap((line) => wrapLine(line, columns)), ''];
   }
   const lines: string[] = [];
-  const label = message.role === 'user' ? '나: ' : '엘라누스: ';
   if (message.role === 'assistant') {
-    lines.push(...assistantMarkdownLines(message.content, columns, label));
+    lines.push(...assistantMarkdownLines(message.content, columns));
   } else {
     const content = safeLogText(visibleUserText(message.content));
     const parts = content.split('\n');
+    const band = userTurnBandEnabled();
     for (let i = 0; i < parts.length; i++) {
-      lines.push(...wrapLine(`${i === 0 ? label : '  '}${parts[i]}`, columns));
+      const rows = wrapLine(`${i === 0 ? USER_PROMPT_MARK : '  '}${parts[i]}`, columns);
+      // A multi-line turn keeps one continuous band.
+      lines.push(...(band ? rows.map((row) => userTurnBandRow(row, columns)) : rows));
     }
   }
   lines.push('');
@@ -332,7 +427,7 @@ export function logViewLinesWithInsertions(
     lines.push(...messageLines(message, index, columns, expandedToolIndexes, plan.get(index)));
     lines.push(...(afterMessageIndex.get(index) ?? []));
   }
-  return lines.length > 0 ? lines : ['대화 기록 없음'];
+  return lines.length > 0 ? lines : ['No chat history'];
 }
 
 /** Message indexes of tool blocks that would render collapsed (long + finished). */
@@ -403,10 +498,8 @@ export function toggleVisibleToolFold(
 
 /** Ephemeral reply preview until the persisted assistant message replaces it. */
 export function streamReplyLines(text: string, columns: number): string[] {
-  const lines = assistantMarkdownLines(text, columns, '엘라누스: ', false);
-  // Source: #74912 retains the existing 80-row preview cap, including the speaker row.
+  const lines = assistantMarkdownLines(text, columns, false);
+  // Source: #74912 retains the existing 80-row preview cap.
   const limit = 80;
-  if (lines.length <= limit) return lines;
-  // The original prefix has scrolled out; reserve one row without truncating a tail row's text.
-  return [fitLogLine('엘라누스:', columns), ...lines.slice(1 - limit)];
+  return lines.length <= limit ? lines : lines.slice(-limit);
 }

@@ -12,11 +12,13 @@ nodes:
   - { node_id: collect, kind: agent, recipe: 'cmd:collect', max_visits: 1 }
   - { node_id: condense, kind: agent, recipe: 'cmd:condense', max_visits: 1 }
   - { node_id: record, kind: agent, recipe: 'cmd:record', max_visits: 1 }
+  - { node_id: seat-retro, kind: agent, recipe: 'cmd:seat-retro', max_visits: 1 }
   - { node_id: conflict-candidates, kind: agent, recipe: 'cmd:conflict-candidates', max_visits: 1 }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
   - { from: collect, on: outcome, map: { ok: condense, fail: failed } }
   - { from: condense, on: outcome, map: { ok: record, fail: failed } }
-  - { from: record, on: outcome, map: { ok: conflict-candidates, fail: failed } }
+  - { from: record, on: outcome, map: { ok: seat-retro, fail: failed } }
+  - { from: seat-retro, on: outcome, map: { ok: conflict-candidates, fail: failed } }
   - { from: conflict-candidates, on: outcome, map: { ok: done, fail: failed } }

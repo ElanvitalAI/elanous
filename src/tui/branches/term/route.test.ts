@@ -20,5 +20,5 @@ test('term branch keeps read-only list routing for both aliases', async () => {
   await runNextTuiTermBranchRoute('/term list', host);
   await runNextTuiTermBranchRoute('/terminal status', host);
   expect(chatLines.join('\n')).toContain('pty_12345678'.slice(-8));
-  expect(chatLines.join('\n')).toContain('1 live · 0 exited');
+  expect(chatLines.join('\n')).toContain('Terminal sessions: live 1 · exited 0');
 });

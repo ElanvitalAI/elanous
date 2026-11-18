@@ -6,6 +6,8 @@ export interface NextTuiStatusLineInput {
   readonly turnState: string;
   readonly model: string;
   readonly queued: number;
+  /** ELN-QUEUE-ITEM-CONTROLS: how many of `queued` wait as steers (shown as «Steer n · Queue n»). */
+  readonly steering?: number;
   readonly backgroundTasks: number;
   readonly width: number;
   readonly elapsedMs?: number;
@@ -17,6 +19,8 @@ export interface NextTuiCompactStatusLineInput {
   readonly state: string;
   readonly model?: string;
   readonly queued: number;
+  /** How many of `queued` wait as steers. */
+  readonly steering?: number;
   readonly activeChildren: number;
   readonly columns: number;
   readonly elapsedMs?: number;
@@ -76,17 +80,30 @@ function clean(value: string): string {
     .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+const TURN_PHASES: Readonly<Record<string, string>> = {
+  'Bash 실행': 'tools', 'Bash 실행 중': 'tools', '도구 실행': 'tools',
+  '실행 중인 도구': 'tools', '응답 중': 'running', '실행 중': 'running',
+  '작업 중': 'running', '로그 탐색': 'log', '조회 중': 'loading',
+  '현재 맥락 조회 중': 'loading', '응답 완료': 'done', '완료': 'done',
+  'Enter 전송': 'idle', '입력 대기': 'idle', '대기': 'idle',
+};
+/** English heads the short clause also reads as phases (the old formatter keeps them as text). */
+const ENGLISH_PHASES: Readonly<Record<string, string>> = { running: 'running', idle: 'idle', done: 'done', tools: 'tools' };
+
+/**
+ * #38392: whether a turn state is only a phase word (running · thinking · tools …) — what the progress row above the
+ * input already says while a turn runs. Anything else (an action answer such as «Editing queued item», «Queue closed»)
+ * is information the bottom status line must keep.
+ */
+export function nextTuiTurnIsPhase(turnState: string): boolean {
+  const head = (clean(turnState) || 'idle').split(' · ')[0] ?? '';
+  return Object.hasOwn(TURN_PHASES, head) || Object.hasOwn(ENGLISH_PHASES, head);
+}
+
 function compactState(value: string): string {
   const cleaned = clean(value);
   const head = cleaned.split(' · ')[0] ?? '';
-  const phases: Readonly<Record<string, string>> = {
-    'Bash 실행': 'tools', 'Bash 실행 중': 'tools', '도구 실행': 'tools',
-    '실행 중인 도구': 'tools', '응답 중': 'running', '실행 중': 'running',
-    '작업 중': 'running', '로그 탐색': 'log', '조회 중': 'loading',
-    '현재 맥락 조회 중': 'loading', '응답 완료': 'done', '완료': 'done',
-    'Enter 전송': 'idle', '입력 대기': 'idle', '대기': 'idle',
-  };
-  return Object.hasOwn(phases, head) ? phases[head]! : englishFooterText(cleaned) || 'idle';
+  return Object.hasOwn(TURN_PHASES, head) ? TURN_PHASES[head]! : englishFooterText(cleaned) || 'idle';
 }
 
 /** Translate only known UI clauses. Names, commands, candidates and unknown text stay untouched. */
@@ -198,6 +215,8 @@ const FOOTER_ENGLISH: Readonly<Record<string, string>> = {
   '플러그인 그래프 승인됨': 'Plugin graph approved', '플러그인 그래프 거부됨': 'Plugin graph denied',
   'Bash 명령 승인됨': 'Bash command approved', 'Bash 명령 거부됨': 'Bash command denied',
   'Bash 승인 시간 초과': 'Bash approval timed out', 'Bash 승인 취소됨': 'Bash approval cancelled', '거부됨': 'denied',
+  '플러그인 그래프 승인 시간 초과': 'Plugin graph approval timed out', '플러그인 그래프 승인 취소됨': 'Plugin graph approval cancelled',
+  '보류됨(거부 아님)': 'on hold (not denied)',
   '터미널 폭이 줄어 사이드탭을 닫았습니다': 'Terminal narrowed; sidetab closed',
   '사이드탭 off': 'Sidetab off', '/side on 으로 이 세션에서 켜기': '/side on to enable for this session',
   '사이드탭은 터미널 폭 34칸 이상에서 열 수 있습니다': 'Sidetab requires at least 34 columns',
@@ -265,6 +284,10 @@ export function englishFooterText(value: string): string {
     if (/^모델: /.test(part)) return part.replace('모델: ', 'Model: ');
     if (/^압축 \d+→\d+ 메시지$/.test(part)) return part.replace('압축 ', 'Compacted ').replace(' 메시지', ' messages');
     if (/^대기 \d+건을 입력칸으로$/.test(part)) return part.replace('대기 ', '').replace('건을 입력칸으로', ' queued drafts restored');
+    // A200 ELN-MIDTURN-STEER footer clauses (English chrome · NEXT-TUI-UI-ENGLISH).
+    if (/^조향 대기 \d+건$/.test(part)) return part.replace('조향 대기 ', '').replace('건', ' steer pending');
+    if (part === '다음 도구 경계에 넣음') return 'joins at next tool boundary';
+    if (part === '조향 반영') return 'Steer applied';
     if (/^작업 [\w-]+ 중단 요청$/.test(part)) return part.replace('작업 ', 'Task ').replace(' 중단 요청', ' stop requested');
     if (/^사이드탭 \d+번 항목 없음$/.test(part)) return part.replace('사이드탭 ', 'Sidetab item ').replace('번 항목 없음', ' not found');
     if (/^이전 = /.test(part)) return part === '이전 = 없음' ? 'previous = none' : part.replace('이전 = ', 'previous = ');
@@ -336,34 +359,81 @@ function modelWithoutProvider(value: string): string {
   return slash >= 0 ? cleanValue.slice(slash + 1) || '?' : cleanValue;
 }
 
-/** One-line status with compact labels and failure/cancellation meaning preserved. */
-export function formatNextTuiStatusLine(input: NextTuiStatusLineInput): string {
-  const width = Math.max(1, Math.floor(input.width));
-  const state = clean(input.turnState) || '대기';
-  const shortState = width <= 32 && state.split(' · ')[0] === '응답 중' ? 'running' : compactState(state);
-  const modelValue = clean(input.model) || '?';
-  const model = modelValue === 'auto/미설정' ? 'auto/unset' : modelValue;
-  const shortModel = modelWithoutProvider(model);
-  const queued = Math.max(0, Math.floor(input.queued));
-  const backgroundTasks = Math.max(0, Math.floor(input.backgroundTasks));
-  const telemetry = turnTelemetry(input.elapsedMs, input.measuredUsage, false, input.estimatedOutputTokens);
-  const shortTelemetry = turnTelemetry(input.elapsedMs, input.measuredUsage, true, input.estimatedOutputTokens);
-  const minimum = minimumTelemetry(input.elapsedMs, input.measuredUsage, input.estimatedOutputTokens);
+/** Did the turn state say it failed or was cancelled (the meaning every footer form keeps)? */
+function turnOutcome(state: string): { readonly failed: boolean; readonly cancelled: boolean } {
   const stateHead = state.split(' · ')[0] ?? '';
   const knownLabel = Object.hasOwn(FOOTER_ENGLISH, stateHead) ? FOOTER_ENGLISH[stateHead] ?? '' : '';
   const failed = /\bfailed\b/i.test(knownLabel) || /^(?:실패|fail|failed)$/i.test(stateHead)
     || /^(?:압축|provider|하니스) 실패: /.test(stateHead)
     || /^(?:shell|elanous|codex|claude|claude-code|hermes|grok|grok-build) 실행 실패: /.test(stateHead);
   const cancelled = /\bcancell?ed\b|\bcancelling\b/i.test(knownLabel) || /^(?:취소|cancel|cancelled|canceled)$/i.test(stateHead);
+  return { failed, cancelled };
+}
+
+function shortDuration(elapsedMs: number): string {
+  const seconds = Math.floor(Math.max(0, elapsedMs) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+}
+
+/**
+ * The short footer pieces (STATUSLINE-WIRE · OP 11-17 priority): the turn as one glyph-led clause
+ * (`● running 3m` · `○ idle` · `✗ failed` · `■ cancelled`), whether it is an exception (failed), the model without its
+ * provider, and the rest as counters with the tokens (`Q0·B0` · `S1·Q2·B0·14/6t`). The full sentence stays for wide
+ * footers and /status.
+ */
+export function nextTuiShortStatus(input: NextTuiStatusLineInput): { readonly turn: string; readonly exception: boolean; readonly model: string; readonly rest: string } {
+  const state = clean(input.turnState) || 'idle';
+  const { failed, cancelled } = turnOutcome(state);
+  const head = state.split(' · ')[0] ?? state;
+  // A known phase becomes one word (+ how long); any other state is information (an approval outcome, a new chat id)
+  // and stays whole, in English — the footer cuts it at its end only when the cwd and the version need the room.
+  const phase = Object.hasOwn(TURN_PHASES, head) ? TURN_PHASES[head]! : Object.hasOwn(ENGLISH_PHASES, head) ? ENGLISH_PHASES[head]! : undefined;
+  const idle = phase === 'idle' || phase === 'done';
+  const elapsed = input.elapsedMs !== undefined && phase !== undefined && !idle ? ` ${shortDuration(input.elapsedMs)}` : '';
+  // A bare outcome word is said in English; an outcome with its detail keeps the detail (in English where known).
+  const bareOutcome = /^(?:실패|fail|failed|취소|cancel|cancelled|canceled)$/i.test(head);
+  const text = phase ?? (bareOutcome ? (failed ? 'failed' : 'cancelled') : (englishFooterText(state) || state));
+  const turn = `${failed ? '✗' : cancelled ? '■' : idle ? '○' : '●'} ${text}${elapsed}`;
+  const modelValue = clean(input.model) || '?';
+  const queued = Math.max(0, Math.floor(input.queued));
+  const steering = Math.min(queued, Math.max(0, Math.floor(input.steering ?? 0)));
+  const queue = steering > 0 ? `S${steering}·Q${queued - steering}` : `Q${queued}`;
+  // Tokens join the counters whenever the old footer would show them (a turn with telemetry), in its compact form.
+  const tokens = input.elapsedMs !== undefined ? `·${tokenTelemetry(input.measuredUsage, input.estimatedOutputTokens, true)}` : '';
+  return { turn, exception: failed, model: modelWithoutProvider(modelValue === 'auto/미설정' ? 'auto/unset' : modelValue),
+    rest: `${queue}·B${Math.max(0, Math.floor(input.backgroundTasks))}${tokens}` };
+}
+
+/** One-line status with compact labels and failure/cancellation meaning preserved. */
+export function formatNextTuiStatusLine(input: NextTuiStatusLineInput): string {
+  const width = Math.max(1, Math.floor(input.width));
+  const state = clean(input.turnState) || 'idle';
+  const shortState = width <= 32 && state.split(' · ')[0] === '응답 중' ? 'running' : compactState(state);
+  const modelValue = clean(input.model) || '?';
+  const model = modelValue === 'auto/미설정' ? 'auto/unset' : modelValue;
+  const shortModel = modelWithoutProvider(model);
+  const queued = Math.max(0, Math.floor(input.queued));
+  const steering = Math.min(queued, Math.max(0, Math.floor(input.steering ?? 0)));
+  // Contract «조향 n · 대기 n» in the English footer (#37922); unchanged «Queue n» while nothing steers.
+  const queueLong = steering > 0 ? `Steer ${steering} · Queue ${queued - steering}` : `Queue ${queued}`;
+  const queueShort = steering > 0 ? `S${steering}·Q${queued - steering}` : `Q${queued}`;
+  const backgroundTasks = Math.max(0, Math.floor(input.backgroundTasks));
+  const telemetry = turnTelemetry(input.elapsedMs, input.measuredUsage, false, input.estimatedOutputTokens);
+  const shortTelemetry = turnTelemetry(input.elapsedMs, input.measuredUsage, true, input.estimatedOutputTokens);
+  const minimum = minimumTelemetry(input.elapsedMs, input.measuredUsage, input.estimatedOutputTokens);
+  const stateHead = state.split(' · ')[0] ?? '';
+  const { failed, cancelled } = turnOutcome(state);
   const metricState = failed ? 'fail' : cancelled ? 'cancel' : shortState;
   const candidates = [
     ...(telemetry ? [
-      `Turn ${shortState} · Model ${model} · ${telemetry} · Queue ${queued} · Bg ${backgroundTasks}`,
-      `Turn ${shortState} · ${shortModel} · ${telemetry} · Q${queued} · B${backgroundTasks}`,
-      `Turn ${shortState} · ${shortTelemetry} · Q${queued} · B${backgroundTasks}`,
-      `${shortState} · ${shortTelemetry} · Q${queued} · B${backgroundTasks}`,
-      `Turn ${metricState} · ${minimum} · Q${queued} · B${backgroundTasks}`,
-      `${metricState}·${minimum}·Q${queued}·B${backgroundTasks}`,
+      `Turn ${shortState} · Model ${model} · ${telemetry} · ${queueLong} · Bg ${backgroundTasks}`,
+      `Turn ${shortState} · ${shortModel} · ${telemetry} · ${queueShort} · B${backgroundTasks}`,
+      `Turn ${shortState} · ${shortTelemetry} · ${queueShort} · B${backgroundTasks}`,
+      `${shortState} · ${shortTelemetry} · ${queueShort} · B${backgroundTasks}`,
+      `Turn ${metricState} · ${minimum} · ${queueShort} · B${backgroundTasks}`,
+      `${metricState}·${minimum}·${queueShort}·B${backgroundTasks}`,
       ...(input.measuredUsage?.inputTokens !== undefined && input.measuredUsage?.outputTokens !== undefined
         ? [`${input.measuredUsage.inputTokens}/${input.measuredUsage.outputTokens}t${smallestElapsed(input.elapsedMs!)}`,
           `${metricState}·${input.measuredUsage.inputTokens}/${input.measuredUsage.outputTokens}t`]
@@ -375,16 +445,20 @@ export function formatNextTuiStatusLine(input: NextTuiStatusLineInput): string {
           tokenTelemetry(input.measuredUsage, input.estimatedOutputTokens, true)]
         : []),
     ] : []),
-    `Turn ${shortState} · Model ${model} · Queue ${queued} · Bg ${backgroundTasks}`,
-    `Turn ${shortState} · Model ${shortModel} · Queue ${queued} · Bg ${backgroundTasks}`,
-    `Turn ${shortState} · ${shortModel} · Q${queued} · B${backgroundTasks}`,
-    `${shortState} · ${shortModel} · Q${queued} · B${backgroundTasks}`,
-    `${shortState} · ${shortModel} · Q${queued} · B${backgroundTasks}`,
+    `Turn ${shortState} · Model ${model} · ${queueLong} · Bg ${backgroundTasks}`,
+    `Turn ${shortState} · Model ${shortModel} · ${queueLong} · Bg ${backgroundTasks}`,
+    `Turn ${shortState} · ${shortModel} · ${queueShort} · B${backgroundTasks}`,
+    `${shortState} · ${shortModel} · ${queueShort} · B${backgroundTasks}`,
+    `${shortState} · ${shortModel} · ${queueShort} · B${backgroundTasks}`,
   ];
   const fits = candidates.find((candidate) => Bun.stringWidth(candidate) <= width);
+  // ELN-QUEUE-ITEM-CONTROLS: «조향 대기 n건 · 다음 도구 경계에 넣음» reads in full where it fits. Where only a counter-less
+  // line would fit, the turn is simply running and the S/Q counter carries the steer, so the counter is kept instead.
+  if (steering > 0 && /^조향 대기 \d+건$/u.test(stateHead) && !(fits ?? '').includes(queueShort) && !(fits ?? '').includes(queueLong))
+    return formatNextTuiStatusLine({ ...input, turnState: '응답 중' });
   if (fits) return fits;
 
-  const suffix = `·Q${queued}·B${backgroundTasks}`;
+  const suffix = `·${queueShort}·B${backgroundTasks}`;
   const fallbackState = failed ? 'fail' : cancelled ? 'cancel' : shortState;
   const firstModel = [...segmenter.segment(shortModel)][0]?.segment ?? '?';
   const stateWithModelInitial = `${fallbackState}·${firstModel}${suffix}`;
@@ -432,7 +506,9 @@ export function nextTuiStatusLine(input: NextTuiCompactStatusLineInput): string 
     state,
     turnTelemetry(input.elapsedMs, input.measuredUsage, true, input.estimatedOutputTokens),
     model,
-    input.queued > 0 ? `Queue ${input.queued}` : '',
+    input.queued > 0 ? ((input.steering ?? 0) > 0
+      ? `Steer ${Math.min(input.queued, input.steering!)} · Queue ${input.queued - Math.min(input.queued, input.steering!)}`
+      : `Queue ${input.queued}`) : '',
     input.activeChildren > 0 ? `Children ${input.activeChildren}` : '',
   ].filter(Boolean);
   const fits = (value: string) => Bun.stringWidth(value) <= Math.max(1, input.columns);

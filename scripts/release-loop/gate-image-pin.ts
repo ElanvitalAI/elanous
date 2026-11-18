@@ -74,7 +74,7 @@ export async function prebuildGateImagePinAtCut(input: {
   root: string; version: string; runId: string; commit: string; image: string;
   members: readonly GateImagePrebuildMember[];
   probe: (member: GateImagePrebuildMember) => string | null;
-  sync: () => Promise<ReadonlyMap<string, { ok: boolean }>>;
+  sync: () => Promise<ReadonlyMap<string, { ok: boolean; detail?: string }>>;
 }): Promise<GateImagePrebuildResult> {
   if (!/^[0-9a-f]{40}$/i.test(input.commit) || !input.members.length) throw new Error('invalid cut image prebuild identity');
   const pinPath = gateImagePinPath(input.root, input.version, input.runId);
@@ -89,7 +89,7 @@ export async function prebuildGateImagePinAtCut(input: {
   if (!digest) {
     const synced = await input.sync();
     const failed = input.members.filter((member) => !synced.get(member.context)?.ok);
-    if (failed.length) throw new Error(`cut gate image prebuild failed: ${failed.map((member) => member.context).join(', ')}`);
+    if (failed.length) throw new Error(`cut gate image prebuild failed: ${failed.map((member) => { const detail = synced.get(member.context)?.detail?.trim(); return detail ? `${member.context} (${detail.slice(0, 400)})` : member.context; }).join(', ')}`);
     observed = digests();
     digest = [...observed.values()].find((value): value is string => Boolean(value));
     if (!digest) throw new Error('cut gate image prebuild produced no immutable image digest');

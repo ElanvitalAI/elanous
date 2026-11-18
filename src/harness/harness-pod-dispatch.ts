@@ -48,6 +48,8 @@ export interface HarnessPodDispatchInput {
   readonly json?: boolean;
   /** 사람이 고른 원천 spec — `commit:` · `pr:` · `worktree:` · `files:`. 검증은 발사 전. */
   readonly source?: string;
+  /** 요청 이미지 digest pin(sha256:<64hex>) — Pod 가 소비한 digest 와 부모가 대조한다. */
+  readonly imageDigest?: string;
   /** Existing PR head for a commit-only repair. Requires source pr:N. */
   readonly repairCommitOnly?: string;
   /** `--child-llm-provider/--child-llm-model/--child-llm-effort` — carried to `self orchestrate` so the Pod child uses them (10-05 PODPROVIDER). */
@@ -100,6 +102,7 @@ export function podOrchestrateArgs(input: HarnessPodDispatchInput, goalFile: str
     ...(input.repairCommitOnly && input.source ? ['--base', `pr-${input.source.slice(3)}`] : input.base ? ['--base', input.base] : []),
     ...(input.json ? ['--json'] : []),
     ...(input.source ? ['--pod-source', input.source] : []),
+    ...(input.imageDigest ? ['--pod-image-digest', input.imageDigest] : []),
     ...(input.repairCommitOnly ? ['--repair-commit-only', input.repairCommitOnly] : []),
     ...(input.childLlmProvider?.trim() ? ['--child-llm-provider', input.childLlmProvider.trim()] : []),
     ...(input.childLlmModel?.trim() ? ['--child-llm-model', input.childLlmModel.trim()] : []),

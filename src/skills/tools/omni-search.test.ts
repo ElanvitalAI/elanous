@@ -1,13 +1,22 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { addWebSearchProvider, _resetWebSearchProvidersForTests, type WebSearchProvider } from '../../web-search/index.js';
 import { buildExaWebSearchProvider } from '../../web-search/exa.js';
-import { dispatchOmniSearch, dispatchResearchOmniSearch, getAvailableResearchSearchEngineIds, omniSearchAvailable, researchOmniSearchAvailable } from './omni-search.js';
+import {
+  _resetResearchOmniSearchReadinessForTests,
+  dispatchOmniSearch,
+  dispatchResearchOmniSearch,
+  getAvailableResearchSearchEngineIds,
+  getAvailableResearchSearchEngineIdsAsync,
+  omniSearchAvailable,
+  primeResearchOmniSearchReadiness,
+  researchOmniSearchAvailable,
+} from './omni-search.js';
 
 function provider(id: string, search: WebSearchProvider['search']): WebSearchProvider {
   return { id, displayName: id, available: () => true, search };
 }
 
-afterEach(() => _resetWebSearchProvidersForTests());
+afterEach(() => { _resetWebSearchProvidersForTests(); _resetResearchOmniSearchReadinessForTests(); });
 
 test('research dispatch selects Exa and Firecrawl, excluding Grok, Tavily and DDG', async () => {
   _resetWebSearchProvidersForTests(false);
@@ -309,3 +318,71 @@ test('research Exa redacts a fake credential from provider errors, output, and o
   expect(result.metadata.perEngine.exa?.error).toContain('[redacted]');
 });
 
+
+test('typed-store-only Firecrawl is seen by research dispatch, the async engine list and, once primed, the sync probe', async () => {
+  _resetWebSearchProvidersForTests(false);
+  const calls: string[] = [];
+  addWebSearchProvider({
+    ...provider('firecrawl', async () => {
+      calls.push('firecrawl');
+      return { providerName: 'firecrawl', durationMs: 1, hits: [{ url: 'https://typed.example', title: 'Typed', snippet: 'store' }] };
+    }),
+    available: () => false,
+    availableAsync: async () => true,
+  });
+  expect(researchOmniSearchAvailable()).toBe(false);
+  await primeResearchOmniSearchReadiness();
+  expect(researchOmniSearchAvailable()).toBe(true);
+  expect(getAvailableResearchSearchEngineIds()).toEqual(['firecrawl']);
+  expect(await getAvailableResearchSearchEngineIdsAsync()).toEqual(['firecrawl']);
+  _resetResearchOmniSearchReadinessForTests();
+  const result = await dispatchResearchOmniSearch({ query: 'topic' });
+  expect(calls).toEqual(['firecrawl']);
+  expect(result.metadata.perEngine.firecrawl?.hits).toBe(1);
+});
+
+test('a not-ready typed-store result is refreshed by the next async resolve', async () => {
+  _resetWebSearchProvidersForTests(false);
+  let ready = false;
+  addWebSearchProvider({
+    ...provider('firecrawl', async () => ({ providerName: 'firecrawl', durationMs: 1, hits: [] })),
+    available: () => false,
+    availableAsync: async () => ready,
+  });
+  await primeResearchOmniSearchReadiness();
+  expect(researchOmniSearchAvailable()).toBe(false);
+  ready = true;
+  expect(await getAvailableResearchSearchEngineIdsAsync()).toEqual(['firecrawl']);
+  expect(researchOmniSearchAvailable()).toBe(true);
+});
+
+test('cancellation during typed-store readiness still returns a per-engine error envelope', async () => {
+  _resetWebSearchProvidersForTests(false);
+  const controller = new AbortController();
+  addWebSearchProvider({
+    ...provider('exa', async (_query, signal) => new Promise<never>((_resolve, reject) => {
+      if (signal?.aborted) reject(signal.reason);
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    })),
+    availableAsync: signal => new Promise<boolean>((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })),
+  });
+  const pending = dispatchResearchOmniSearch({ query: 'cancel during readiness', engines: ['exa'] }, { signal: controller.signal });
+  await Promise.resolve();
+  controller.abort(new Error('parent research cancelled'));
+  const result = await pending;
+  expect(result.metadata.perEngine.exa?.error).toContain('parent research cancelled');
+});
+
+test('a caller cancelled before dispatch still hands the provider an aborted signal and is reported per engine', async () => {
+  _resetWebSearchProvidersForTests(false);
+  const controller = new AbortController();
+  controller.abort(new Error('parent research cancelled'));
+  let providerSignal: AbortSignal | undefined;
+  addWebSearchProvider(provider('exa', async (_query, signal) => {
+    providerSignal = signal;
+    return new Promise<never>(() => {});
+  }));
+  const result = await dispatchResearchOmniSearch({ query: 'cancelled before dispatch', engines: ['exa'] }, { signal: controller.signal });
+  expect(providerSignal?.aborted).toBe(true);
+  expect(result.metadata.perEngine.exa?.error).toContain('parent research cancelled');
+});

@@ -18,6 +18,8 @@
 // to avoid pulling in the heavier src/llm.ts SSE parser just for a
 // compat check.
 
+import { llmNetworkFetch } from './session-runtime/llm-call-gateway.js';
+
 export type CompatStatus = 'pass' | 'fail' | 'skip';
 
 export interface CompatResult {
@@ -593,7 +595,12 @@ async function fetchWithTimeout(
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ac.signal });
+    const request = { ...init, signal: ac.signal };
+    if (init.method !== 'POST') return await fetch(url, request); // model discovery is not inference
+    let model: string | undefined;
+    try { model = (JSON.parse(String(init.body)) as { model?: string }).model; } catch { /* preserve malformed request behavior */ }
+    return await llmNetworkFetch(url, request,
+      { provider: 'local', model, role: 'aux', requestedBy: 'local-llm-compat', selectionSource: 'explicit' });
   } finally {
     clearTimeout(timer);
   }

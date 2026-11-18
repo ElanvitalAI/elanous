@@ -1,4 +1,7 @@
-import { safeToolActivityTarget } from '../tui/chat/tool-activity.js';
+import type { ApprovalOutcome } from '../graph-runner/approval-outcome.js';
+import type { MessageSource } from '../session/index.js';
+import { safeAgentSummary, safeToolActivityTarget } from '../tui/chat/tool-activity.js';
+import { parsePlanWire, type PlanWire } from '../code-edit/plan-wire.js';
 import { isGraphProgressObservation, type GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
@@ -6,7 +9,7 @@ import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { sessionFile, sessionRoot } from '../session/index.js';
 import { NEXT_TUI_WAKEUP_IPC_ENV, answerWakeupCall, isWakeupCallMessage, nextTuiWakeupTool } from './next-wakeup.js';
 import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
-import { answerNextSidetabCall, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
+import { answerNextSidetabCall, gateNextSidetabHandler, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
 import type { AgentDisplayEvent } from '../tui/core/agents.js';
 import type { MessageBlock } from '../conv-substrate/message-block.js';
 import type { MeasuredTurnUsage } from '../session/turn-usage.js';
@@ -15,23 +18,26 @@ import {
   isShellApprovalCallMessage,
   isShellApprovalCancelMessage,
   NEXT_TUI_SHELL_APPROVAL_IPC_ENV,
+  publishApprovalOf,
+  type PublishApprovalCall,
   SHELL_APPROVAL_CANCEL_TYPE,
 } from './next-shell-approval.js';
 import { answerHarnessAskUserCall, HARNESS_ASK_USER_IPC_ENV, isHarnessAskUserCall,
   isHarnessAskUserCancel, type HarnessAskUserCall } from './next-harness-ask-user.js';
 import { getSessionTierOverride } from '../model-tier/session-override.js';
-import { configForSessionProviderTurn, getSessionProvider } from './session-provider.js';
+import { configForSessionProviderTurn, getSessionProvider, sessionProviderChildEnv } from './session-provider.js';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawnElanousBun } from '../instance/spawn-elanous.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import { SHELL_KILL_GRACE_MS, SHELL_SNAPSHOT_REPLY_TIMEOUT_MS } from '../tool-runtime/shell-watchdog.js';
 import { answerMemberBoardSessionCall, isMemberBoardSessionCall, type MemberBoardSessionSource } from './next-member-board-session.js';
 
 const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
 let nextSidetabHandler: NextSidetabHandler | null = null;
 let nextSidetabIpcEnabled = false;
-let nextTuiShellApprovalHandler: ((command: string, callId: string, kind: 'bash' | 'graph') => Promise<boolean>) | null = null;
+let nextTuiShellApprovalHandler: ((command: string, callId: string, kind: 'bash' | 'graph', windowMs?: number) => Promise<boolean | ApprovalOutcome>) | null = null;
 let nextTuiShellApprovalCancelHandler: ((callId: string, reason: 'timeout' | 'turn-cancelled' | 'host-cancelled') => void) | null = null;
 let nextTuiHarnessAskUserHandler: ((call: HarnessAskUserCall) => Promise<string | null>) | null = null;
 let nextTuiHarnessAskUserCancelHandler: ((callId: string) => void) | null = null;
@@ -52,7 +58,13 @@ export function setNextSidetabIpcEnabled(enabled: boolean): void {
 }
 
 /** Installs the human-facing approval prompt before a sticky REPL child is created. */
-export function setNextTuiShellApprovalHandler(handler: ((command: string, callId: string, kind: 'bash' | 'graph') => Promise<boolean>) | null): void {
+let nextTuiPublishApprovalHandler: ((call: PublishApprovalCall, callId: string) => Promise<boolean>) | null = null;
+/** The host's owner publish-approval screen; without one the same request falls back to the plain text confirmation. */
+export function setNextTuiPublishApprovalHandler(handler: ((call: PublishApprovalCall, callId: string) => Promise<boolean>) | null): void {
+  nextTuiPublishApprovalHandler = handler;
+}
+
+export function setNextTuiShellApprovalHandler(handler: ((command: string, callId: string, kind: 'bash' | 'graph', windowMs?: number) => Promise<boolean | ApprovalOutcome>) | null): void {
   nextTuiShellApprovalHandler = handler;
 }
 
@@ -86,6 +98,8 @@ interface TurnResult {
   model?: string | null;
   goalComplete?: boolean;
   goalStopReason?: string;
+  /** The turn's plan state as the REPL child sees it (untrusted until parsePlanWire). */
+  planOutcome?: unknown;
   name?: string;
   target?: string;
   startedAtMonotonicMs?: number;
@@ -93,6 +107,7 @@ interface TurnResult {
   requestId?: string;
   outcome?: string;
   activeTools?: unknown;
+  steerIds?: unknown;
   selfHealth?: NextTuiSelfHealthSnapshot | null;
   usage?: MeasuredTurnUsage;
   block?: MessageBlock;
@@ -110,11 +125,13 @@ export function isMeasuredTurnUsage(value: unknown): value is MeasuredTurnUsage 
     });
 }
 export type LocalChatToolActivity =
-  | { phase: 'start' | 'finish'; id: string; name: string; target?: string }
+  | { phase: 'start' | 'finish'; id: string; name: string; target?: string; summary?: string }
   | { phase: 'snapshot'; calls: Array<{ id: string; name: string; target?: string }> };
 export type LocalChatPushNowResult = { requestId: string; outcome: 'ready' | 'interrupted' | 'deferred'; activeTools: string[] };
 interface WaitingTurn {
   turnId: string;
+  /** The user's text for this turn; side-tab calls are honoured only when it asks for one. */
+  userText?: string;
   onGraphProgress?: (event: GraphProgressObservation) => void;
   onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void;
   onStatus?: (text: string) => void;
@@ -129,6 +146,8 @@ interface WaitingTurn {
   onPushNowResult?: (event: LocalChatPushNowResult) => void;
   onMeasuredUsage?: (usage: MeasuredTurnUsage) => void;
   usageSeen?: boolean;
+  /** A201 — Esc snapshot request still waiting for the child's reply. */
+  snapshotDeadline?: ReturnType<typeof setTimeout>;
   resolve: (result: TurnResult) => void;
   reject: (error: Error) => void;
 }
@@ -137,6 +156,8 @@ class LocalChatSession {
   readonly child: ReturnType<typeof Bun.spawn>;
   readonly exited: Promise<number>;
   readonly instanceRoot: string;
+  /** Session provider choice baked into the child env (HARNESS-CHILD-PROVIDER-PASSTHROUGH). */
+  readonly providerKey: string;
   private readonly writeInput: (payload: string) => Promise<void>;
   private waiting: WaitingTurn | null = null;
   private stderrTail = '';
@@ -154,16 +175,29 @@ class LocalChatSession {
     const wakeupTool = nextTuiWakeupTool();
     const fastChild = fileURLToPath(new URL('./fast-repl-child.ts', import.meta.url));
     const useFastChild = cli.endsWith('/bin/elanous.mjs') && existsSync(fastChild);
+    const sessionSelection = getSessionProvider(sessionId);
+    const providerPassthrough = sessionProviderChildEnv(sessionSelection);
+    this.providerKey = providerPassthrough.key;
+    try {
+      debug.log('child.provider', 'resolve', {
+        mode: 'passthrough', kind: 'repl-child', sessionId,
+        parentProvider: sessionSelection?.provider ?? null, parentModel: sessionSelection?.model ?? null,
+        childProvider: providerPassthrough.env.ELANOUS_LLM_PROVIDER ?? process.env.ELANOUS_LLM_PROVIDER ?? null,
+        childModel: providerPassthrough.env.ELANOUS_LLM_MODEL ?? process.env.ELANOUS_LLM_MODEL ?? null,
+        source: sessionSelection ? 'session' : process.env.ELANOUS_LLM_PROVIDER ? 'env' : 'config',
+      });
+    } catch { /* observation cannot block the child */ }
     this.child = spawnElanousBun(
       useFastChild
         ? [sessionId, getElanousConfigDir()]
-        : ['--config-dir', getElanousConfigDir(), 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
+        // `--next-tui`: the structured Next TUI flag (CHAT-TOOLS-ENTRY-VIA-CORE-TURN) — the plain REPL never sets it.
+        : ['--config-dir', getElanousConfigDir(), 'repl', '--session', sessionId, '--json', '--stdin-jsonl', '--next-tui'],
       {
       bin: useFastChild ? fastChild : cli,
       stateDir: this.instanceRoot,
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
       env: {
-        ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
+        ...process.env, ...providerPassthrough.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
         ...(process.env.NODE_ENV === 'test' ? { ELANOUS_SESSION_ROOT: sessionRoot() } : {}),
         ELANOUS_NEXT_TUI_SELF_HEALTH: '1',
         ...(wakeupTool ? { [NEXT_TUI_WAKEUP_IPC_ENV]: '1' } : {}),
@@ -186,7 +220,8 @@ class LocalChatSession {
             });
           } else if (isNextSidetabCall(message)) {
             const handler = nextSidetabHandler ?? (async () => ({ error: 'Next TUI sidetab handler is not ready' }));
-            void answerNextSidetabCall(handler, message).then((reply) => {
+            // TUI-NO-UNREQUESTED-SIDETAB: the model may not open side tabs the user never asked for.
+            void answerNextSidetabCall(gateNextSidetabHandler(handler, this.waiting?.userText), message).then((reply) => {
               try { child.send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
             });
           } else if (isShellApprovalCancelMessage(message)) {
@@ -204,9 +239,12 @@ class LocalChatSession {
             });
           } else if (isShellApprovalCallMessage(message)) {
             this.pendingShellApprovalIds.add(message.callId);
-            void answerShellApprovalCall(nextTuiShellApprovalHandler
-              ? (command, callId) => nextTuiShellApprovalHandler!(command, callId, message.kind === 'graph' ? 'graph' : 'bash')
-              : null, message).then((reply) => {
+            const publish = publishApprovalOf(message);
+            void answerShellApprovalCall(publish && nextTuiPublishApprovalHandler
+              ? (_command, callId) => nextTuiPublishApprovalHandler!(publish, callId)
+              : nextTuiShellApprovalHandler
+                ? (command, callId) => nextTuiShellApprovalHandler!(command, callId, message.kind === 'graph' ? 'graph' : 'bash', message.windowMs)
+                : null, message).then((reply) => {
               this.pendingShellApprovalIds.delete(message.callId);
               try { child.send(reply); } catch { /* the child exited mid-approval; its request times out */ }
             });
@@ -308,6 +346,7 @@ class LocalChatSession {
           || (result.phase !== 'start' && result.phase !== 'finish' && result.phase !== 'snapshot')) return;
         if (result.phase === 'snapshot') {
           if (!Array.isArray(result.calls)) return;
+          if (waiting.snapshotDeadline) { clearTimeout(waiting.snapshotDeadline); waiting.snapshotDeadline = undefined; }
           const calls = result.calls.filter((call): call is { id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number } =>
             call !== null && typeof call === 'object' && typeof (call as { id?: unknown }).id === 'string'
             && ((call as { name?: unknown }).name === 'Bash' || (call as { name?: unknown }).name === 'RunShell')
@@ -339,9 +378,18 @@ class LocalChatSession {
             target: safeToolActivityTarget(call.name, (call as { target?: unknown }).target) })) }); } catch { /* observer cannot break a turn */ }
         } else if ((result.phase === 'start' || result.phase === 'finish')
           && typeof result.id === 'string' && typeof result.name === 'string') {
+          const summary = result.phase === 'finish' && result.name === 'Agent' ? safeAgentSummary((result as { summary?: unknown }).summary) : undefined;
           try { waiting.onToolActivity?.({ phase: result.phase, id: result.id, name: result.name,
-            target: safeToolActivityTarget(result.name, result.target) }); }
+            target: safeToolActivityTarget(result.name, result.target), ...(summary ? { summary } : {}) }); }
           catch { /* observer cannot break a turn */ }
+        }
+        return;
+      }
+      if (result.event === 'steer-applied') {
+        if (result.turnId !== waiting.turnId || !Array.isArray(result.steerIds)
+          || !result.steerIds.every((steerId) => typeof steerId === 'string')) return;
+        for (const listener of steerAppliedListeners.get(this.sessionId) ?? []) {
+          try { listener(result.steerIds as string[]); } catch { /* observers cannot break a turn */ }
         }
         return;
       }
@@ -431,7 +479,7 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage'], onGraphProgress?: WaitingTurn['onGraphProgress']): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage'], onGraphProgress?: WaitingTurn['onGraphProgress'], from?: MessageSource): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
@@ -439,8 +487,10 @@ class LocalChatSession {
     const providerSelection = getSessionProvider(this.sessionId);
     const payload = JSON.stringify({ prompt, id: turnId, ...(modelTier ? { modelTier } : {}),
       ...(providerSelection ? { sessionProvider: providerSelection } : {}),
-      ...(attachments.length ? { attachments } : {}) }) + '\n';
-    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, onMeasuredUsage, onGraphProgress, resolve, reject }; });
+      ...(attachments.length ? { attachments } : {}),
+      // MSG-SOURCE-HIERARCHY: the child persists who sent the turn; a human turn sends nothing (human is the default).
+      ...(from && from.kind !== 'human' ? { from } : {}) }) + '\n';
+    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, userText: prompt, onDelta, onStatus, onAgent, onMessageBlock, onShellActivity, onToolActivity, onPushNowResult, onMeasuredUsage, onGraphProgress, resolve, reject }; });
     try {
       if (writePrompt) await writePrompt(payload);
       else await this.writeInput(payload);
@@ -466,6 +516,11 @@ class LocalChatSession {
           for (const callId of this.pendingHarnessAskUserIds) nextTuiHarnessAskUserCancelHandler?.(callId);
           this.pendingHarnessAskUserIds.clear();
           try { this.child.kill(); } catch { /* already exited */ }
+          // A201 — a wedged child (blocked loop or a SIGTERM handler that never runs) must not
+          // hold «응답 취소 중» forever: escalate to SIGKILL on this exact child after the grace.
+          const escalate = setTimeout(() => { try { this.child.kill('SIGKILL'); } catch { /* already exited */ } }, SHELL_KILL_GRACE_MS);
+          escalate.unref?.();
+          void this.exited.finally(() => clearTimeout(escalate));
         }
         await this.exited;
       })();
@@ -475,8 +530,27 @@ class LocalChatSession {
 
   requestShellActivitySnapshot(): boolean {
     if (this.closed || !this.waiting) return false;
-    try { this.child.send({ type: 'elanous.next-tui.shell-snapshot', turnId: this.waiting.turnId }); return true; }
+    const waiting = this.waiting;
+    try { this.child.send({ type: 'elanous.next-tui.shell-snapshot', turnId: waiting.turnId }); }
     catch { return false; }
+    // A201 — the 63-minute «셸 실행 상태 확인 중 · Esc» stall: the child never answered and Esc was
+    // swallowed while the request stayed pending. Bound the wait; a silent child counts as stalled,
+    // so hand the host an empty snapshot and its Esc path cancels the turn (and closes this child).
+    if (waiting.snapshotDeadline) clearTimeout(waiting.snapshotDeadline);
+    waiting.snapshotDeadline = setTimeout(() => {
+      waiting.snapshotDeadline = undefined;
+      if (this.waiting !== waiting) return;
+      try {
+        debug.log('tool.watchdog', 'snapshot-timeout', { sessionId: this.sessionId, turnId: waiting.turnId,
+          limitMs: SHELL_SNAPSHOT_REPLY_TIMEOUT_MS, pid: this.child.pid ?? null });
+      } catch { /* observation cannot block cancellation */ }
+      try { waiting.onStatus?.(`셸 상태 응답 없음 — ${Math.round(SHELL_SNAPSHOT_REPLY_TIMEOUT_MS / 1000)}초 → 중단`); }
+      catch { /* display cannot block cancellation */ }
+      try { waiting.onShellActivity?.({ phase: 'snapshot', calls: [] }); }
+      catch { /* cancellation bookkeeping cannot break a turn */ }
+    }, SHELL_SNAPSHOT_REPLY_TIMEOUT_MS);
+    waiting.snapshotDeadline.unref?.();
+    return true;
   }
   requestPushNow(requestId: string): boolean {
     if (this.closed || !this.waiting) return false;
@@ -486,6 +560,17 @@ class LocalChatSession {
   commitPushNow(requestId: string): boolean {
     if (this.closed || !this.waiting) return false;
     try { this.child.send({ type: 'elanous.next-tui.push-now-commit', turnId: this.waiting.turnId, requestId }); return true; }
+    catch { return false; }
+  }
+  /** A200 — hand input typed during this turn to the child; it joins the next model request. */
+  requestSteer(steerId: string, text: string): boolean {
+    if (this.closed || !this.waiting) return false;
+    try { this.child.send({ type: 'elanous.next-tui.steer', turnId: this.waiting.turnId, steerId, text }); return true; }
+    catch { return false; }
+  }
+  retractSteer(steerIds: readonly string[]): boolean {
+    if (this.closed || !this.waiting || steerIds.length === 0) return false;
+    try { this.child.send({ type: 'elanous.next-tui.steer-retract', turnId: this.waiting.turnId, steerIds: [...steerIds] }); return true; }
     catch { return false; }
   }
   requestTaskStop(taskId: string): boolean {
@@ -511,6 +596,18 @@ export interface LocalChatTurnCompact {
   readonly onMeasuredUsage?: (usage: MeasuredTurnUsage) => void;
 }
 const statusListeners = new Map<string, Set<(json: string | null) => void>>();
+const steerAppliedListeners = new Map<string, Set<(steerIds: string[]) => void>>();
+
+/** A200 — the child drained these steer ids into a model request (one screen line «조향 반영»). */
+export function onLocalChatSteerApplied(sessionId: string, listener: (steerIds: string[]) => void): () => void {
+  const listeners = steerAppliedListeners.get(sessionId) ?? new Set();
+  listeners.add(listener);
+  steerAppliedListeners.set(sessionId, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) steerAppliedListeners.delete(sessionId);
+  };
+}
 const selfHealthListeners = new Map<string, Set<(snapshot: NextTuiSelfHealthSnapshot | null) => void>>();
 
 export function onLocalChatBackgroundStatus(sessionId: string, listener: (json: string | null) => void): () => void {
@@ -533,6 +630,24 @@ export function onLocalChatSelfHealthStatus(sessionId: string, listener: (snapsh
   };
 }
 
+/**
+ * NEXT-TUI-DIFF-RENDER (2/2): start the sticky chat child right after the first paint, while the
+ * person reads and types, so its bootstrap is not paid after the first Enter. runLocalChatTurn
+ * reuses it, or closes and replaces it when the universe or session provider changed meanwhile.
+ */
+export function warmLocalChatSession(sessionId: string, cli = process.argv[1]): boolean {
+  if (!sessionId || !cli || sessions.has(sessionId)) return false;
+  try {
+    sessions.set(sessionId, new LocalChatSession(sessionId, cli));
+    debug.log('tui.next', 'child-prewarm', { sessionId });
+    return true;
+  } catch (error) {
+    // A failed warm-up leaves the normal first-turn spawn path in place.
+    debug.log('tui.next', 'child-prewarm-failed', { sessionId, error: error instanceof Error ? error.message : String(error) });
+    return false;
+  }
+}
+
 export async function closeLocalChatSession(sessionId: string): Promise<void> {
   const session = sessions.get(sessionId);
   sessions.delete(sessionId);
@@ -549,6 +664,12 @@ export function requestLocalChatPushNow(sessionId: string, requestId: string): b
 }
 export function commitLocalChatPushNow(sessionId: string, requestId: string): boolean {
   return sessions.get(sessionId)?.commitPushNow(requestId) ?? false;
+}
+export function requestLocalChatSteer(sessionId: string, steerId: string, text: string): boolean {
+  return sessions.get(sessionId)?.requestSteer(steerId, text) ?? false;
+}
+export function retractLocalChatSteer(sessionId: string, steerIds: readonly string[]): boolean {
+  return sessions.get(sessionId)?.retractSteer(steerIds) ?? false;
 }
 export function requestLocalChatTaskStop(sessionId: string, taskId: string): boolean {
   return sessions.get(sessionId)?.requestTaskStop(taskId) ?? false;
@@ -570,7 +691,8 @@ export async function runLocalChatTurn(
   onToolActivity?: WaitingTurn['onToolActivity'],
   onPushNowResult?: WaitingTurn['onPushNowResult'],
   onGraphProgress?: WaitingTurn['onGraphProgress'],
-): Promise<{ goalComplete: boolean; goalStopReason?: string }> {
+  from?: MessageSource,
+): Promise<{ goalComplete: boolean; goalStopReason?: string; planOutcome?: PlanWire }> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
   // An auth refusal in the child can leave the Next TUI waiting indefinitely.
@@ -593,10 +715,18 @@ export async function runLocalChatTurn(
       },
     });
   }
+  // TUI-GLM-PROVIDER-USES-ZAI-CODING-PLAN — a glm turn without a Z.ai Coding Plan key shows that reason
+  // on the normal error card instead of a 0s generic failure from the child.
+  if ((selection?.provider ?? cfg.llm.provider) === 'glm') {
+    const { zaiCodingPlanAvailable } = await import('../llm/zai-coding-plan.js');
+    (await import('./next-auth-preflight.js')).preflightNextTuiGlmAuth('glm', () => zaiCodingPlanAvailable());
+  }
   // A resumed session id may be selected in another test universe. Its sticky
   // child must not keep reading or writing memory in the previous universe.
   const existing = sessions.get(sessionId);
   if (existing && existing.instanceRoot !== effectiveInstanceRoot()) await closeLocalChatSession(sessionId);
+  // A /provider switch after the child started must not leave the child on the old provider.
+  else if (existing && existing.providerKey !== sessionProviderChildEnv(getSessionProvider(sessionId)).key) await closeLocalChatSession(sessionId);
   const started = performance.now();
   let compactImportMs: number | null = null;
   let compactMs: number | null = null;
@@ -677,7 +807,7 @@ export async function runLocalChatTurn(
       (event) => { if (!signal.aborted) onToolActivity?.(event); },
       (event) => { if (!signal.aborted) onPushNowResult?.(event); },
       (usage) => { if (!signal.aborted) compact.onMeasuredUsage?.(usage); },
-      (event) => { if (!signal.aborted) onGraphProgress?.(event); });
+      (event) => { if (!signal.aborted) onGraphProgress?.(event); }, from);
     } catch (error) {
       if (signal.aborted) throw new Error('응답을 취소했습니다');
       await closeLocalChatSession(sessionId);
@@ -705,6 +835,7 @@ export async function runLocalChatTurn(
     return {
       goalComplete: result.goalComplete === true,
       ...(typeof result.goalStopReason === 'string' ? { goalStopReason: result.goalStopReason } : {}),
+      ...(() => { const planOutcome = parsePlanWire(result.planOutcome); return planOutcome ? { planOutcome } : {}; })(),
     };
   } finally {
     observeLatency(signal.aborted ? 'cancelled' : outcome);

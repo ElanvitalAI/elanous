@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { SidetabRow } from '../../sidetab-core/model.js';
 import type { CompleteTerminalObservation, WorkspacePtyTarget } from '../../sidetab-core/workspace-input.js';
 import { createWorkspaceInputController } from './workspace-input-controller.js';
@@ -119,4 +122,92 @@ test('terminal submission keeps its lock until a delayed takeover writer settles
   release(true);
   expect(await next).toBe(true);
   expect(writes).toBe(2);
+});
+
+test('the sidetab row refresh rebinds a dead automatic target without submitting', async () => {
+  const open = (id: string): SidetabRow => ({ id, kind: 'shell', label: id, badge: 'idle', ptyId: id, ownerPid: 7, ptyStartedAt: 100, lastActivityAt: 10 });
+  let rows = [open('pty:a'), open('pty:b')];
+  let submits = 0;
+  const controller = createWorkspaceInputController({
+    rows: () => rows,
+    observe: async () => undefined,
+    sendTerminal: async () => false,
+    sendSidechat: async () => { submits += 1; return { sessionId: 'unused' }; },
+  });
+  const entryPath = new URL('../entry.ts', import.meta.url);
+  const entry = await Bun.file(entryPath).text();
+  const refreshBody = entry.slice(entry.indexOf('const refreshSidetabRows'), entry.indexOf('const toggleWorkspaceRow'));
+  const call = 'refreshWorkspaceInputRows(workspaceInput)';
+  expect(refreshBody.includes(call)).toBe(true);
+  const dir = mkdtempSync(join(tmpdir(), 'sidetab-refresh-'));
+  const file = join(dir, 'refresh.ts');
+  const writeHarness = (body: string) => writeFileSync(file, [
+    'let current = []; let workspaceInput = null; let refreshWorkspaceInputRows = () => {};',
+    'export function install(next) { current = next.rows; workspaceInput = next.workspaceInput; refreshWorkspaceInputRows = next.refreshWorkspaceInputRows; }',
+    'const sidetabApi = { loadSidetabRows() { return current(); } };',
+    'let sidetabRows = []; let sidetabSelected = 0; const herdrSidetabRows = []; const remoteSidetabRows = []; const elsSidetabRows = [];',
+    'const getSidetabViewMode = () => "all"; const sidetabScope = () => undefined; const refreshRichView = () => {};',
+    body.replace(/: void/g, ''),
+    'export function refresh() { refreshSidetabRows(); }',
+  ].join('\n'));
+  try {
+    writeHarness(refreshBody.replace(call, '/* refresh call removed */'));
+    const detached = await import(`${file}?detached=${Date.now()}`);
+    detached.install({ rows: () => rows, workspaceInput: controller, refreshWorkspaceInputRows: () => {} });
+    detached.refresh();
+    expect(controller.state().entries['open-tabs']?.target?.ptyId).toBeUndefined();
+    writeHarness(refreshBody);
+    const { refreshWorkspaceInputRows } = await import('./workspace-input-controller.js');
+    const attached = await import(`${file}?attached=${Date.now()}`);
+    attached.install({ rows: () => rows, workspaceInput: controller, refreshWorkspaceInputRows });
+    attached.refresh();
+    expect(controller.state().entries['open-tabs']?.target?.ptyId).toBe('pty:b');
+    rows = [open('pty:a')];
+    attached.refresh();
+    expect(controller.state().entries['open-tabs']?.target?.ptyId).toBe('pty:a');
+    expect(submits).toBe(0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+  expect(entryPath.pathname.endsWith('/src/tui/entry.ts')).toBe(true);
+});
+
+test('automatic open tabs bind the last local tab and rebind after the target exits', async () => {
+  const open = (id: string): SidetabRow => ({ id, kind: 'shell', label: id, badge: 'idle', ptyId: id, ownerPid: 7, ptyStartedAt: 100, lastActivityAt: 10 });
+  let rows = [open('pty:a'), open('pty:b')];
+  const controller = createWorkspaceInputController({
+    rows: () => rows,
+    observe: async () => undefined,
+    sendTerminal: async () => false,
+    sendSidechat: async () => ({ sessionId: 'unused' }),
+  });
+  controller.ensureDefaultWorkspace();
+  expect(controller.state().entries['open-tabs']?.target?.ptyId).toBe('pty:b');
+  rows = [];
+  controller.ensureDefaultWorkspace();
+  expect(controller.state().activeSpaceId).toBeUndefined();
+  rows = [open('pty:a')];
+  controller.ensureDefaultWorkspace();
+  expect(controller.state().entries['open-tabs']?.target?.ptyId).toBe('pty:a');
+  controller.select(workspace('kept'));
+  rows = [open('pty:a'), open('pty:c')];
+  controller.ensureDefaultWorkspace();
+  expect(controller.state().activeSpaceId).toBe('kept');
+});
+
+test('sidechat with no workspace submits against the original open-tab row', async () => {
+  const open = { id: 'pty:open', kind: 'shell' as const, label: 'open', badge: 'idle' as const, ptyId: 'pty:open', ownerPid: 7, ptyStartedAt: 100, lastActivityAt: 10 };
+  const chats: string[] = [];
+  const controller = createWorkspaceInputController({
+    rows: () => [open],
+    observe: async (target) => ({
+      target, screen: 'open screen', transcript: 'open transcript',
+      observedAt: new Date().toISOString(), activityAt: 10, coverage: 'full',
+    }),
+    sendTerminal: async () => false,
+    sendSidechat: async ({ spaceId, text }) => { chats.push(`${spaceId}:${text}`); return { sessionId: 'chat-open', reply: 'seen' }; },
+  });
+  controller.ensureDefaultWorkspace();
+  controller.edit('sidechat', 'watch the tabs');
+  expect(await controller.submit('sidechat')).toBe(true);
+  expect(chats).toEqual(['open-tabs:watch the tabs']);
+  expect(controller.conversation('open-tabs').at(-1)?.text).toBe('seen');
 });

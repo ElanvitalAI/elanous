@@ -1,0 +1,15 @@
+{
+  "id": "next-tui-ux-pack",
+  "name": "Next TUI UX scenario pack: scripted fake LLM through the real TUI in a PTY, judged per frame",
+  "audience": "internal",
+  "checklistCells": ["NEXT-TUI-UX-SIM-PACK"],
+  "implementation": ["src/ux-sim/next-tui-ux-pack.ts", "scripts/ux-sim/next-tui-ux-pack.ts", "src/graph-view/sim-scripts.ts", "src/ux-sim/mock-seat-pty-sequence.ts", "src/ux-sim/fake-llm.ts"],
+  "tests": ["src/ux-sim/next-tui-ux-pack.test.ts", "src/graph-view/graph-view.test.ts", "src/graph-view/detail.test.ts"],
+  "target": "One command renders scripted turns (tool burst, markdown, speaker labels, worked-for, provider picker, slash sweep, long-turn steer, narrow panel, user-turn color with and without NO_COLOR, composer prompt history, atomic folded-paste editing, self-proactive turn ends in Korean and English) in the real Next TUI, plus render-only scenarios such as graph-live (the GRAPH-LOOP-VIEW renderer on fake event scripts), at chosen widths, optionally beside classic, and judges each final frame with rules declared in the scenario.",
+  "inputs": ["--scenario ids (default all)", "--width column list", "--compare classic", "--out directory", "ELANOUS_TEST_FAKE_LLM=1 scripted tool calls and answers per scenario", "Isolated --test root per run"],
+  "observations": ["<scenario>-<tui>-<cols>.txt frames per step and .ansi raw PTY bytes", "summary.md table with ✓/✗ per judge and the expectation for each failure", "Real model calls zero"],
+  "entryCommands": ["bun scripts/ux-sim/next-tui-ux-pack.ts", "bun scripts/ux-sim/next-tui-ux-pack.ts --scenario tool-burst,markdown-blocks --width 120,60 --compare classic"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

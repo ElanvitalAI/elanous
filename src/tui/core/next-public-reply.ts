@@ -1,3 +1,5 @@
+import { classifyTurnFailure } from '../chat/error-card.js';
+import { NEXT_TUI_AUTH_FAILURE_TEXT, type NextTuiAuthFailureKind } from '../../tui-client/next-auth-preflight.js';
 /** Next basic chat projects public turn text without transport or tool payloads. */
 const clean = (text: string): string => text.replace(/\r\n?/g, '\n')
   .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, ' ');
@@ -8,10 +10,8 @@ export function projectUserReplyStatus(status: string): string {
 
 export function streamReplyProgress(_turnId: string): string { return '응답을 준비하고 있습니다.'; }
 /** Only known, actionable auth failures may pass through the public failure projection. */
-export function projectKnownAuthFailure(kind?: 'codex-auth-missing' | 'codex-auth-failed'): string | null {
-  if (kind === 'codex-auth-missing') return 'Codex 인증이 준비되지 않았습니다. 주인 호스트에서 접근 미러를 갱신하세요.';
-  if (kind === 'codex-auth-failed') return 'Codex 인증에 실패했습니다. eln login openai-codex를 확인하세요.';
-  return null;
+export function projectKnownAuthFailure(kind?: NextTuiAuthFailureKind): string | null {
+  return kind ? NEXT_TUI_AUTH_FAILURE_TEXT[kind] ?? null : null;
 }
 export function streamReplyFailure(_turnId: string): string { return '요청을 처리하지 못했습니다.'; }
 
@@ -25,10 +25,15 @@ export function streamReplyFailure(_turnId: string): string { return '요청을 
 export function turnReplyFailureMessage(
   turnId: string,
   failed: boolean,
-  authFailureKind?: 'codex-auth-missing' | 'codex-auth-failed',
+  authFailureKind?: NextTuiAuthFailureKind,
+  error?: string,
 ): string | null {
   if (!failed) return null;
-  return projectKnownAuthFailure(authFailureKind) ?? streamReplyFailure(turnId);
+  const known = projectKnownAuthFailure(authFailureKind);
+  if (known) return known;
+  // Class of cause only (never the raw error text): provider failure vs cut stream vs timeout, etc.
+  const cause = classifyTurnFailure(error);
+  return cause ? `${streamReplyFailure(turnId)} (${cause})` : streamReplyFailure(turnId);
 }
 
 /** A trailing action-shaped line inside an open code fence remains answer text. */

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "bookforge",
+  "version": "0.1.0",
+  "description": "Reflow an app architecture manuscript into a Korean PDF with the bundled Gongnyang Bookforge engine.",
+  "whenToUse": "앱 설계 문서나 원고를 PDF로 조판해 달라고 할 때 사용한다. 원문 내용을 보존하고 Bookforge 품질 게이트 결과를 보고한다.",
+  "inputs": {
+    "designPath": "Existing absolute path to the application architecture Markdown manuscript",
+    "outDir": "Fresh absolute output directory for the isolated Bookforge project",
+    "title": "One-line title for the design PDF"
+  },
+  "outputs": {
+    "pdfPath": "Final PDF path only after the Bookforge QC gate passes",
+    "sourceSha256": "SHA-256 of the unchanged input manuscript",
+    "visualReviewRequired": "True until the generated contact sheet has been inspected"
+  },
+  "examples": ["이 앱의 ARCHITECTURE.md를 Bookforge로 PDF 조판해줘", "Reflow this app design Markdown into a PDF"],
+  "requires": { "tools": ["python3", "typst 0.14.x", "PyMuPDF", "markdown-it-py"], "confirmation": false },
+  "contributes": {
+    "skills": [{ "id": "bookforge/bookforge", "name": "Bookforge PDF", "path": "./skills/bookforge/SKILL.md" }],
+    "aiTools": [{
+      "name": "bookforge_app_docs_pdf",
+      "description": "Reflow an existing app architecture Markdown manuscript into a PDF with bundled Bookforge. Returns a final path only after its QC gate passes; does not publish.",
+      "handler": "graph:bookforge-app-docs-pdf",
+      "parameters": {
+        "type": "object",
+        "properties": { "designPath": { "type": "string" }, "outDir": { "type": "string" }, "title": { "type": "string" } },
+        "required": ["designPath", "outDir", "title"],
+        "additionalProperties": false
+      },
+      "route": {
+        "triggers": ["앱 설계 PDF", "Bookforge PDF", "bookforge app docs"],
+        "examples": ["ARCHITECTURE.md를 Bookforge PDF로 만들어줘"],
+        "sideEffects": "mutating", "risk": "low", "cost": "spawns-run", "requiresConfirm": false
+      }
+    }]
+  },
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/app-docs-pdf.yaml"],
+      "graphManifests": {
+        "bookforge-app-docs-pdf": {
+          "purpose": "Reflow an existing app architecture Markdown into a QC-checked Bookforge PDF",
+          "allow": { "recipes": [], "maxSideEffects": "spawn" },
+          "hitl": []
+        }
+      },
+      "graphProviders": {
+        "./graphs/app-docs-pdf.yaml": {
+          "module": "src/graph-runner/capability-providers/bookforge-app-docs.ts",
+          "factory": "createBookforgeAppDocsRegistry",
+          "withPluginRoot": true
+        }
+      },
+      "capabilities": ["bookforge", "fs:workdir", "proc:python3", "proc:typst"],
+      "connectors": [],
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

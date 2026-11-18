@@ -19,6 +19,8 @@ test('claiming a public member ID updates the share link and closes the one-time
     await act(async () => { root = create(createElement(NexusProvider, { client: { baseUrl: 'https://api.example.test' } as never, children: createElement(MemberInvitePage) })); });
     expect(resolveRead).toBeDefined();
     await act(async () => { resolveRead!(Response.json(oldProfile)); });
+    // MEMBER-BOARD-WEBCHAT-ENTRY: no web-chat entry before a handle exists.
+    expect(root!.root.findAll(node => node.props['data-member-webchat-entry'] === true)).toHaveLength(0);
     const field = root!.root.findByProps({ id: 'member-public-id' });
     await act(async () => { field.props.onChange({ currentTarget: { value: 'ElanvitalAI' } }); });
     // The form submits the claim; the old public ID remains a server alias.
@@ -26,6 +28,9 @@ test('claiming a public member ID updates the share link and closes the one-time
     await act(async () => { form.props.onSubmit({ preventDefault() {} }); });
     expect(root!.root.findByProps({ id: 'member-invite-link' }).props.value).toBe('https://app.example.test/r/ElanvitalAI');
     expect(root!.root.findAllByProps({ id: 'member-public-id' })).toHaveLength(0);
+    // Right after the claim the primary web-chat entry appears, same-origin and token-free.
+    const [entry] = root!.root.findAll(node => node.type === 'a' && node.props['data-member-webchat-entry'] === true);
+    expect(entry?.props.href).toBe('/app/chat/');
   } finally {
     if (root) await act(async () => root!.unmount());
     globalThis.fetch = priorFetch;

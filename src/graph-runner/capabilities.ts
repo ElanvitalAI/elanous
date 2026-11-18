@@ -55,6 +55,8 @@ export interface GraphCapabilityProviderDeclaration {
   readonly fill?: Readonly<Record<string, readonly GraphPreconditionFillSource[]>>;
   /** A declared effectful provider stops fallback after invocation. */
   readonly post?: readonly GraphCapabilityPostCondition[];
+  /** Typed failure codes this provider owns; dispatch surfaces them instead of contract-exhausted. */
+  readonly preserveFailureCodes?: readonly string[];
   readonly invoke: GraphCapabilityProvider;
 }
 
@@ -137,6 +139,9 @@ export function registerGraphCapabilityProviderDeclaration(
     || ['owner', 'ownerId', 'memberId', 'requireOwner', 'appSlug'].includes(item)
       && (sources.length !== 1 || sources[0] !== 'host')))
     throw new Error(`invalid provider fill: ${provider.id}`);
+  if (provider.preserveFailureCodes && (provider.preserveFailureCodes.length === 0 || provider.preserveFailureCodes.length > 8
+    || provider.preserveFailureCodes.some(code => typeof code !== 'string' || !/^[A-Z][A-Z0-9_]{2,63}$/u.test(code))))
+    throw new Error(`invalid provider preserveFailureCodes: ${provider.id}`);
   const safePath = /^(?:outcome|result(?:\.[A-Za-z][A-Za-z0-9_]{0,63}){0,3}|evidence(?:\.[A-Za-z][A-Za-z0-9_]{0,63}){0,3})$/u;
   const validPredicate = (predicate: GraphCapabilityPostPredicate): boolean =>
     !!predicate && safePath.test(predicate.path) && !predicate.path.split('.').some(part =>
@@ -392,6 +397,7 @@ export async function dispatchGraphContract(
   let invocationSpentMs = 0;
   const attempts: Array<{ provider: string; reason: string }> = [];
   let anyAvailable = false;
+  let preservedFailure: string | undefined;
   for (const provider of candidates) {
     if (hooks?.signal?.aborted || hooks?.deadlineAtMs !== undefined && hooks.deadlineAtMs <= Date.now())
       return { ok: false, outcome: 'failed', error: 'precondition-deadline', hardBarrier: true };
@@ -500,7 +506,11 @@ export async function dispatchGraphContract(
     if (!result.ok) {
       if (provider.post) return { ok: false, outcome: 'unknown', error: 'effect-unknown: provider-failed',
         hardBarrier: true, effectStatus: 'unknown' };
-      attempts.push({ provider: provider.id, reason: result.error || 'provider-failed' }); continue;
+      attempts.push({ provider: provider.id, reason: result.error || 'provider-failed' });
+      // A provider-owned typed code (e.g. a resume instruction) must reach the node record unmasked.
+      const code = typeof result.error === 'string' ? /^([A-Z][A-Z0-9_]{2,63})(?::|$)/u.exec(result.error)?.[1] : undefined;
+      if (!preservedFailure && code && provider.preserveFailureCodes?.includes(code)) preservedFailure = result.error;
+      continue;
     }
     let outputValid = false;
     try {
@@ -528,7 +538,7 @@ export async function dispatchGraphContract(
       error: 'effect-unknown: postcondition-route-unverified', hardBarrier: true, effectStatus: 'unknown' };
     return postForbidNext.length ? { ...result, postForbidNext } : result;
   }
-  return { ok: false, outcome: 'failed', error: anyAvailable ? 'contract-exhausted' : 'unprovided',
+  return { ok: false, outcome: 'failed', error: preservedFailure ?? (anyAvailable ? 'contract-exhausted' : 'unprovided'),
     evidence: { contractId, attempts } };
 }
 

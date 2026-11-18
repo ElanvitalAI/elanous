@@ -33,3 +33,17 @@ test('install prompt stays hidden on 390px chat across re-evaluation, but shows 
   await act(async () => { win.dispatchEvent(new Event('resize')); });
   expect(tree!.root.findAllByProps({ 'data-testid': 'install-banner' })).toHaveLength(1);
 });
+
+test('the built PWA path /chat/ (trailingSlash) hides the prompt on a narrow chat too', async () => {
+  const storage = { getItem: () => null, setItem: () => {} };
+  const win = Object.assign(new EventTarget(), { innerWidth: 375, localStorage: storage, location: { href: 'https://example.test/app/chat/' },
+    navigator: { standalone: false }, matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }) });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: win });
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { userAgent: 'iPhone Safari' } });
+  const render = (path: string) => <PathnameContext.Provider value={path}><SearchParamsContext.Provider value={new URLSearchParams()}><InstallBanner /></SearchParamsContext.Provider></PathnameContext.Provider>;
+  await act(async () => { tree = create(render('/chat/')); });
+  await act(async () => { win.dispatchEvent(new Event('beforeinstallprompt')); });
+  expect(tree!.root.findAllByProps({ 'data-testid': 'install-banner' })).toHaveLength(0);
+  await act(async () => tree!.update(render('/term/')));
+  expect(tree!.root.findAllByProps({ 'data-testid': 'install-banner' })).toHaveLength(1);
+});

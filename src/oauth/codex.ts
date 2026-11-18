@@ -37,6 +37,7 @@ import { resolveCodexCredentialOwnerHost } from '../nexus/config/secrets/cred-ow
 import { codexHealthCredential, recordCodexUnauthorized } from './codex-account-health.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
+import { assertCodexLeaseUsable, isCodexLeaseEntry } from '../secret/codex-lease-guard.js';
 import { platform, release, arch } from 'node:os';
 import {
   saveTokens, loadTokens, expiresAtFromSeconds,
@@ -487,6 +488,14 @@ export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: P
         const stat = lstatSync(path);
         if (!stat.isFile() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) continue;
       } catch { continue; }
+      // HQ-VAULT V2: a leased config dir is authoritative for this universe — before expiry it is used, at/after
+      // expiry the guard throws «expired». It never falls through to the host mirror or the default root.
+      const leased = source === 'config-dir' ? loadTokens(account.storeKey, path) ?? loadTokens('openai-codex', path) : null;
+      if (leased && isCodexLeaseEntry(leased)) {
+        assertCodexLeaseUsable(leased, { storeKey: account.storeKey });
+        observeCodexAuth('fresh', { storeKey: account.storeKey, source: 'lease', remainingSeconds: remainingSeconds(leased), refreshed: false });
+        return { state: leased, storeKey: account.storeKey, storePath: path };
+      }
       const state = loadTokens(account.storeKey, path);
       if (!state?.tokens.accessToken || typeof state.tokens.expiresAt !== 'number'
         || state.tokens.expiresAt <= Date.now() + CODEX_REFRESH_BUFFER_MS) continue;
@@ -534,6 +543,14 @@ export async function loadFreshCodexAuthState(
   const account = resolveCodexAccountForRun();
   opts.onSelectedAccount?.(account.storeKey, authStorePath());
   const stored = loadTokens(account.storeKey);
+  // HQ-VAULT V2 mirror lease: an access-only entry with lease metadata. Use it before expiry; at/after expiry (or once
+  // revoked) the guard throws a typed «expired» error and logs `secret.lease.expired`. Never refresh, never fall back.
+  const leased = stored ?? loadTokens('openai-codex');
+  if (leased && isCodexLeaseEntry(leased)) {
+    assertCodexLeaseUsable(leased, { storeKey: account.storeKey });
+    observeCodexAuth('fresh', { storeKey: account.storeKey, source: 'lease', remainingSeconds: remainingSeconds(leased), refreshed: false });
+    return leased;
+  }
   if (!stored && authStorePath() !== join(homedir(), '.elanous', 'auth.json')) {
     const defaultPath = join(homedir(), '.elanous', 'auth.json');
     try {

@@ -27,7 +27,7 @@ export async function runNextTuiRemainingBranchRoute(
     ...(host.width === undefined ? {} : { width: host.width }),
   }, deps);
   if (!result?.ok) {
-    host.addLines(result?.message ?? '남은 사용량을 읽을 수 없습니다.');
+    host.addLines(result?.message ?? 'Could not read remaining usage.');
     return;
   }
   host.addLines(...(result.logLines ?? []));

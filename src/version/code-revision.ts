@@ -206,6 +206,38 @@ export function installMetadataSource(root: string = REPOSITORY_ROOT): string | 
   return undefined;
 }
 
+/**
+ * The commit time (epoch seconds) a rail install recorded next to its commit (`commitTime` seconds · `committedAt`
+ * ISO) — only when that record's commit is `sha` (another commit's time is never borrowed).
+ */
+export function installMetadataCommitTime(root: string = REPOSITORY_ROOT, sha?: string): number | undefined {
+  for (const metadataPath of installMetadataCandidates(root)) {
+    try {
+      const parsed = JSON.parse(readFileSync(metadataPath, 'utf8')) as { commit?: unknown; commitTime?: unknown; committedAt?: unknown };
+      if (sha !== undefined && (typeof parsed.commit !== 'string' || parsed.commit.trim() !== sha)) continue;
+      if (typeof parsed.commitTime === 'number' && Number.isFinite(parsed.commitTime)) return parsed.commitTime;
+      if (typeof parsed.committedAt === 'string') {
+        const at = Date.parse(parsed.committedAt);
+        if (Number.isFinite(at)) return Math.floor(at / 1000);
+      }
+    } catch { /* Try the next candidate. */ }
+  }
+  return undefined;
+}
+
+/** Does this code run from a source checkout (git HEAD at the code root) rather than an installed copy? */
+export function runsFromCheckout(): boolean {
+  return checkoutRevision(testCodeRevisionRoot ?? REPOSITORY_ROOT) !== 'unknown';
+}
+
+/** `git log -1 --format=%ct <sha>` in `cwd` — undefined when that repository does not have the commit. */
+export function gitCommitTime(cwd: string, sha: string): number | undefined {
+  if (!/^[0-9a-f]{7,40}$/.test(sha)) return undefined;
+  const result = runGitCommand(cwd, ['log', '-1', '--format=%ct', sha], { encoding: 'utf8' });
+  const seconds = result.status === 0 ? Number(result.stdout.trim()) : NaN;
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+}
+
 export function cliVersion(): string {
   return `${packageVersion()} ${codeRevision() ?? 'unknown'}`;
 }

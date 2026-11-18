@@ -19,6 +19,7 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import { toast } from 'sonner';
 import { debugLog } from '@/lib/debug';
 import { uploadAttachment, type AttachmentMeta } from '@/lib/upload-attachment';
+import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
 
 interface Props {
   /** Optional callback when upload succeeds. Caller can promote the
@@ -39,7 +40,7 @@ export function CameraAttachButton({ onAttached }: Props) {
     ev.target.value = '';
     if (!file) return;
     if (!config.baseUrl) {
-      toast.error('Daemon URL 미설정 — Settings 에서 입력');
+      toast.error(NEXUS_URL_MISSING);
       return;
     }
     setBusy(true);

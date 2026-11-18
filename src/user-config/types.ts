@@ -988,6 +988,10 @@ export interface AcpConfig {
   reviewBackend?: string;
   /** Rework agent backend. Absent defers to the driver default (codex). */
   reworkBackend?: string;
+  // REVIEW-NO-SILENT-GLM-FALLBACK (#38331) — 내부 문서 `MANUAL-user-config`.
+  /** Opt-in: a failed claude ACP review may hop once to OpenRouter GLM. The result is still marked
+   *  `respondedEngine: glm` ⊕ `invalid: true` — never passed off as claude. Absent/false = no hop. */
+  reviewClaudeGlmFallback?: boolean;
   /** Optional executable override keyed by canonical ACP backend id.
    *  When present, this path wins over the normal project-local and PATH
    *  lookup sequence. */
@@ -1145,6 +1149,8 @@ export interface WebSearchConfig {
   tavily?: { enabled?: boolean };
   grokApi?: { enabled?: boolean };
   firecrawl?: { enabled?: boolean };
+  /** SEARCH-PROVIDER-TOPIC-BENCH-ROUTING — topic route for research search. Absent = `shadow` (record only). */
+  routing?: { mode?: 'shadow' | 'on' };
 }
 
 /** OpenDesign 데몬 접속. url 이 없으면 시안 생성은 꺼진 것이다. tokenFile 은 토큰 «경로»만 담는다. */

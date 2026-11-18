@@ -19,7 +19,7 @@ test('wizard proposal can be rendered and confirmation is explicit', async () =>
   expect(proposed.kind).toBe('proposal');
   if (proposed.kind !== 'proposal') return;
   expect(formatPluginWizardProposal(proposed.proposal).join('\n')).toContain('graph_id: csv-export');
-  expect(formatPluginWizardProposal(proposed.proposal).join('\n')).toContain('이 플러그인 초안을 저장할까요?');
+  expect(formatPluginWizardProposal(proposed.proposal).join('\n')).toContain('Save this plugin draft?');
   expect(nexus.saved).toHaveLength(0);
   expect(parsePluginWizardConfirmation('아마 나중에')).toBeNull();
   expect(parsePluginWizardConfirmation('네')).toBe(true);
@@ -69,7 +69,7 @@ test('save failure keeps the approved draft available for retry or cancellation'
   expect((await flow.start('CSV를 내보내는 플러그인')).kind).toBe('proposal');
 
   const failed = await flow.answer('네');
-  expect(failed).toMatchObject({ kind: 'error', message: expect.stringContaining('초안을 보존했습니다') });
+  expect(failed).toMatchObject({ kind: 'error', message: expect.stringContaining('Draft preserved') });
   expect(flow.proposal?.id).toBe('csv-export');
   expect(await flow.answer('네')).toEqual({ kind: 'saved', id: 'csv-export' });
   expect(flow.proposal).toBeNull();

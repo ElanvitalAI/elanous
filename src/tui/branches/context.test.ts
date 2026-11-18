@@ -10,13 +10,13 @@ import { projectNextTuiContextArea, runNextTuiContextBranchRoute } from './conte
 test('context projection reflects attachments added after its page was opened', () => {
   const attachments = new Map([['[attached 1: a.txt]', '/a.txt'], ['[attached 2: b.txt]', '/b.txt']]);
   const secondPage = projectNextTuiContextArea(attachments, 1, 1);
-  expect(secondPage.lines[0]).toBe('첨부 2건 · 2/2쪽');
+  expect(secondPage.lines[0]).toBe('Attachments 2 · page 2/2');
   attachments.set('[attached 3: c.txt]', '/c.txt');
   const refreshedSecondPage = projectNextTuiContextArea(attachments, secondPage.page, 1);
-  expect(refreshedSecondPage.lines[0]).toBe('첨부 3건 · 2/3쪽');
+  expect(refreshedSecondPage.lines[0]).toBe('Attachments 3 · page 2/3');
   expect(refreshedSecondPage.lines[1]).toContain('/b.txt');
   const thirdPage = projectNextTuiContextArea(attachments, 2, 1);
-  expect(thirdPage.lines[0]).toBe('첨부 3건 · 3/3쪽');
+  expect(thirdPage.lines[0]).toBe('Attachments 3 · page 3/3');
   expect(thirdPage.lines[1]).toContain('/c.txt');
 });
 
@@ -45,7 +45,7 @@ test('/context and /ctx edit the same attachment tokens used by Next turns', () 
     expect(attachmentArea.join('\n')).not.toContain(largeToken);
     runNextTuiContextBranchRoute('/context page 2', host);
     expect(attachmentArea.join('\n')).toContain(largeToken);
-    expect(attachmentArea[0]).toContain('2/2쪽');
+    expect(attachmentArea[0]).toContain('page 2/2');
     runNextTuiContextBranchRoute('/context page 1', host);
     runNextTuiContextBranchRoute('/context clear bg', host);
     expect([...attachments.keys()]).toEqual([smallToken, largeToken]);
@@ -61,6 +61,6 @@ test('/context and /ctx edit the same attachment tokens used by Next turns', () 
     expect(attachments.size).toBe(0);
     expect(attachmentArea).toEqual([]);
     runNextTuiContextBranchRoute('/ctx clear', host);
-    expect(chatLines.at(-1)).toBe('첨부 0건 삭제');
+    expect(chatLines.at(-1)).toBe('0 attachment(s) removed');
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

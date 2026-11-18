@@ -116,7 +116,7 @@ export function readFreshAvailabilityState(nowMs: number = Date.now(), homePath?
 //   ⛔ 판정 경로에서 네트워크를 치지 않는다(실측: 그 호출이 2분 15초 매달린 적이 있다).
 //   ⛔ 그리고 «낡은 것»을 「지금 사실」로 읽지 않는다 — 나이 상한을 넘으면 undefined(모른다)다.
 
-const QUOTA_SIGNAL_MAX_AGE_MS = 60 * 60 * 1000;   // 1시간 — 주간 창(10080분)에 비해 충분히 짧다
+export const QUOTA_SIGNAL_MAX_AGE_MS = 60 * 60 * 1000;   // 1시간 — 주간 창(10080분)에 비해 충분히 짧다
 
 interface QuotaSignalState {
   rateLimitReached?: string | null;

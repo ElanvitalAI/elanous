@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
+import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
 import { env } from './env.js';
 import type { SttEngine, TranscribeResult } from './types.js';
 
@@ -16,7 +17,10 @@ async function uploadFormData(
     form.append(k, v);
   }
   form.append('file', blob, basename(filePath));
-  return fetch(url, { method: 'POST', headers, body: form });
+  return llmNetworkFetch(url, { method: 'POST', headers, body: form }, {
+    provider: url.includes('elevenlabs.io') ? 'elevenlabs' : 'openai',
+    model: fields.model_id ?? fields.model, role: 'aux', requestedBy: 'youtube-master',
+  });
 }
 
 // ── ElevenLabs ──
@@ -117,7 +121,7 @@ async function transcribeGemini(chunk: string, lang: string, model: string): Pro
     `The spoken language is primarily ${langName}. ` +
     'Preserve meaningful line breaks when helpful.';
   try {
-    const res = await fetch(
+    const res = await llmNetworkFetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
       {
         method: 'POST',
@@ -131,6 +135,7 @@ async function transcribeGemini(chunk: string, lang: string, model: string): Pro
           }],
         }),
       },
+      { provider: 'gemini', model, role: 'aux', requestedBy: 'youtube-master' },
     );
     const data = await res.json();
     const texts: string[] = [];

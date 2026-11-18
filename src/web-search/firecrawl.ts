@@ -10,6 +10,8 @@
 // dropped.
 
 import { getFirecrawlConfig } from '../registry/discovery/config.js';
+import { getSecretAsync, selectBackendFromConfig } from '../nexus/config/secrets/index.js';
+import { readSearchJson, runSearchWithDeadline } from '../graph-runner/capability-providers/search-web-deadline.js';
 import {
   type WebSearchHit,
   type WebSearchProvider,
@@ -23,31 +25,46 @@ type FirecrawlConfigResolver = () => { apiKey: string };
 
 export function buildFirecrawlWebSearchProvider(
   resolveConfig: FirecrawlConfigResolver = getFirecrawlConfig,
+  deps: { keyLookup?: (slot: string) => Promise<string | undefined>; fetch?: typeof fetch } = {},
 ): WebSearchProvider {
+  const lookup = deps.keyLookup ?? (async slot => { selectBackendFromConfig(); return getSecretAsync(slot); });
+  const keyForRequest = async () => {
+    let stored: string | undefined;
+    try { stored = await lookup('cred:firecrawl.api_key'); }
+    catch { throw new Error('Firecrawl credential unavailable'); }
+    return stored === undefined ? resolveConfig().apiKey.trim() : stored.trim();
+  };
   return {
     id: 'firecrawl',
     displayName: 'Firecrawl',
     available: () => !!resolveConfig().apiKey,
+    availableAsync: signal => runSearchWithDeadline(async scope => {
+      scope.throwIfAborted();
+      const key = await keyForRequest(); scope.throwIfAborted(); return !!key;
+    }, signal),
     async search(q: WebSearchQuery, signal?: AbortSignal): Promise<WebSearchResult> {
-      const key = resolveConfig().apiKey;
+      return runSearchWithDeadline(async scope => {
+      scope.throwIfAborted();
+      const key = await keyForRequest();
+      scope.throwIfAborted();
       if (!key) throw new Error('Firecrawl API key not configured');
       const limit = Math.max(1, Math.min(q.limit ?? 5, 20));
       const body: Record<string, unknown> = { query: q.query, limit };
       // Firecrawl supports "tbs" hints for recency but not direct
       // domain filtering on /v1/search; we pre-/post-filter.
-      const resp = await fetch(FIRECRAWL_API, {
+      const resp = await (deps.fetch ?? fetch)(FIRECRAWL_API, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${key}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
-        signal,
+        signal: scope, redirect: 'error',
       });
       if (!resp.ok) {
         throw new Error(`Firecrawl search HTTP ${resp.status}`);
       }
-      const json = await resp.json() as { data?: Array<Record<string, unknown>> };
+      const json = await readSearchJson(resp, scope, 1_000_000) as { data?: Array<Record<string, unknown>> };
       const items = Array.isArray(json.data) ? json.data : [];
       let hits: WebSearchHit[] = items.map(it => ({
         url: String(it.url ?? ''),
@@ -66,6 +83,7 @@ export function buildFirecrawlWebSearchProvider(
       }
 
       return { hits, providerName: 'firecrawl', durationMs: 0 };
+      }, signal);
     },
   };
 }

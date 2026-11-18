@@ -23,7 +23,7 @@ for (const boundary of BOUNDARY_CASES) {
       writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
       const steps: SeatPtyStep[] = [];
       if (boundary.sidetab === 'open') steps.push({ label: 'sidetab open', chunks: ['\x1c', 'x'], gapMs: 100,
-        until: (screen) => screen.includes('항목 없음') });
+        until: (screen) => screen.includes('No items') });
       steps.push({ label: 'reply', text: 'boundary output probe',
         until: (screen) => screen.includes(boundary.lines.at(-1)!) });
       const run = await mockSeatPtySequence({
@@ -46,7 +46,7 @@ for (const boundary of BOUNDARY_CASES) {
       }
       expect(run.exitCode).toBe(0);
       expect(run.frames.at(-1)?.screen).toContain('❯');
-      if (boundary.sidetab === 'open') expect(run.frames.at(-1)?.screen).toContain('항목 없음');
+      if (boundary.sidetab === 'open') expect(run.frames.at(-1)?.screen).toContain('No items');
       const history = Array.from({ length: terminal.buffer.normal.length }, (_, index) =>
         terminal.buffer.normal.getLine(index)?.translateToString(true) ?? '');
       const oldest = boundary.lines[0]!;

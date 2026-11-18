@@ -55,6 +55,16 @@ afterAll(() => {
   if (savedKeep !== undefined) process.env.ELANOUS_KEEP_ENV_KEYS = savedKeep;
 });
 
+/** #36422 — under NODE_ENV=test getProviderForConfig/getProvider hand out the test-universe fake LLM unless the
+ *  documented escape hatch pins the real provider wiring (same pin as llm-openrouter-reasoning.test.ts). */
+async function withRealLlmMode<T>(run: () => T | Promise<T>): Promise<T> {
+  const previous = process.env.ELANOUS_LLM_MODE;
+  process.env.ELANOUS_LLM_MODE = 'real';
+  try { return await run(); } finally {
+    if (previous === undefined) delete process.env.ELANOUS_LLM_MODE; else process.env.ELANOUS_LLM_MODE = previous;
+  }
+}
+
 function cfg(llmPatch: Record<string, unknown>) {
   const base = uc.getUserConfig();
   return { ...base, llm: { ...base.llm, apiKey: undefined, baseUrl: undefined, ...llmPatch } } as never;
@@ -156,19 +166,19 @@ describe('OpenRouter provider wire', () => {
   });
 
   test('⛔ 교차 경로 — config 가 grok 이면 그 키·baseUrl 을 OpenRouter 로 «안» 보낸다', async () => {
-    const p = llm.getProviderForConfig(
+    const p = await withRealLlmMode(() => llm.getProviderForConfig(
       cfg({ provider: 'grok', model: 'grok-4.7', apiKey: 'xai-SECRET', baseUrl: 'https://proxy.example/v1' }),
       'openrouter/z-ai/glm-5.3',
-    );
+    ));
     expect(p.name).toBe('openrouter');
-    await drain(p);
+    await withRealLlmMode(() => drain(p));
     expect(calls[0]!.url).toBe(OPENROUTER_API_URL);
     expect(calls[0]!.headers.authorization).toBe('Bearer sk-or-from-cache');
     expect(calls[0]!.body.model).toBe('z-ai/glm-5.3');
   });
 
-  test('레거시 getProvider(model) — `openrouter/` 는 openrouter 로 간다(기본 provider 로 새지 않는다)', () => {
-    expect(llm.getProvider('openrouter/qwen/qwen3.8-flash').name).toBe('openrouter');
+  test('레거시 getProvider(model) — `openrouter/` 는 openrouter 로 간다(기본 provider 로 새지 않는다)', async () => {
+    expect((await withRealLlmMode(() => llm.getProvider('openrouter/qwen/qwen3.8-flash'))).name).toBe('openrouter');
   });
 
   test('openRouterWireModel — 접두만 뗀다', () => {

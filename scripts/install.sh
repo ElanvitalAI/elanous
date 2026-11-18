@@ -74,7 +74,9 @@ t() { if [ "$INSTALL_LANG" = ko ]; then printf '%s' "$2"; else printf '%s' "$1";
 # a separate tmpfs (common in WSL and containers). Keep installer temp files on
 # the cache filesystem so Bun does not silently skip optional packages with EXDEV.
 align_tmpdir_with_bun_cache() {
-  [ "$(uname -s 2>/dev/null)" = Linux ] || return 0
+  # ELANOUS_INSTALL_TEST_UNAME lets the split-TMPDIR test exercise this Linux
+  # path on Darwin. A real install leaves it unset and uses uname.
+  [ "${ELANOUS_INSTALL_TEST_UNAME:-$(uname -s 2>/dev/null)}" = Linux ] || return 0
   local cache_dir="${BUN_INSTALL_CACHE_DIR:-${BUN_INSTALL:-$HOME/.bun}/install/cache}"
   local current_tmp="${TMPDIR:-/tmp}"
   [ -d "$current_tmp" ] || return 0
@@ -508,6 +510,16 @@ if [ -z "$SOURCE" ] && [ "$IS_CHECKOUT" -eq 0 ]; then
   METADATA_SOURCE="$PACKAGE_URL"
   INSTALL_TARBALL="$TMP/package.tgz"
   DOWNLOADED=1
+	  # A real package contains package/src/cli/self-update.ts. The file name
+	  # is not the signal: a renamed release tarball is still a real package.
+	  # Install fixtures do not contain that file, so they still install.
+	  # A missing PWA build refuses before bun add and before current or
+	  # install.json moves.
+	  if tar -tzf "$INSTALL_TARBALL" package/src/cli/self-update.ts >/dev/null 2>&1 \
+	    && ! tar -tzf "$INSTALL_TARBALL" package/apps/pwa/out/index.html >/dev/null 2>&1; then
+	    echo "⛔ PWA build missing in package (apps/pwa/out/index.html) — current and install metadata were not changed. Build it first: bun bin/elanous.mjs nexus build" >&2
+	    exit 4
+	  fi
 fi
 
 case "$SOURCE" in
@@ -519,6 +531,13 @@ case "$SOURCE" in
     INSTALL_TARBALL="$TMP/package.tgz"
     SOURCE=""
     DOWNLOADED=1
+    # A URL source is a package, not a checkout. Refuse a real package that
+    # has no PWA build before the version directory exists.
+    if tar -tzf "$INSTALL_TARBALL" package/src/cli/self-update.ts >/dev/null 2>&1 \
+      && ! tar -tzf "$INSTALL_TARBALL" package/apps/pwa/out/index.html >/dev/null 2>&1; then
+      echo "⛔ PWA build missing in package (apps/pwa/out/index.html) — current and install metadata were not changed. Build it first: bun bin/elanous.mjs nexus build" >&2
+      exit 4
+    fi
     ;;
 esac
 
@@ -531,15 +550,50 @@ elif [ -n "$SOURCE" ]; then
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/elanous-install.XXXXXX")" || { echo "⛔ mktemp failed" >&2; exit 1; }
   INSTALL_TARBALL="$TMP/package.tgz"
   cp "$TARBALL" "$INSTALL_TARBALL"
+	  # A real package contains package/src/cli/self-update.ts, whatever the
+	  # --source file is named. Install fixtures do not contain that file,
+	  # so they still install. A missing PWA build refuses before the version
+	  # directory exists, so the install test's fake bun never sees a wrong
+	  # cwd. A checkout install only warns.
+	  if tar -tzf "$INSTALL_TARBALL" package/src/cli/self-update.ts >/dev/null 2>&1 \
+	    && ! tar -tzf "$INSTALL_TARBALL" package/apps/pwa/out/index.html >/dev/null 2>&1; then
+	    echo "⛔ PWA build missing in package (apps/pwa/out/index.html) — current and install metadata were not changed. Build it first: bun bin/elanous.mjs nexus build" >&2
+	    exit 4
+	  fi
 else
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/elanous-install.XXXXXX")" || { echo "⛔ mktemp failed" >&2; exit 1; }
   # 🆕 2026-09-24: 패키지가 PWA 빌드(apps/pwa/out/)를 싣는다 — 체크아웃에 빌드가 없으면 설치본에 웹 화면이 없다. 막지 않고 말한다.
-  if [ ! -f "$REPO_ROOT/apps/pwa/out/index.html" ]; then
+  # The warning follows the package that will actually be installed. A checkout
+  # without apps/pwa/out stays quiet when the test package already has the PWA,
+  # so the installer's own stderr (temp-dir move, doctor) is not buried.
+  if [ -n "${ELANOUS_INSTALL_TEST_PACKAGE_TGZ:-}" ]; then
+    if ! tar -tzf "$ELANOUS_INSTALL_TEST_PACKAGE_TGZ" package/apps/pwa/out/index.html >/dev/null 2>&1; then
+      echo "⚠ PWA build not found (apps/pwa/out/index.html) — the installed copy will have no web UI. Build it first: bun bin/elanous.mjs nexus build" >&2
+    fi
+  elif [ ! -f "$REPO_ROOT/apps/pwa/out/index.html" ]; then
     echo "⚠ PWA build not found (apps/pwa/out/index.html) — the installed copy will have no web UI. Build it first: bun bin/elanous.mjs nexus build" >&2
   fi
+  # prepack's relative import resolves from the caller's cwd, and `cd` does
+  # not move bun's cwd. A checkout install started outside the repo rewrites
+  # those two hooks to $REPO_ROOT, packs, then puts package.json back.
+  PACK_JSON="$REPO_ROOT/package.json"
+  PACK_SAVED="$TMP/package.json.saved"
+  cp "$PACK_JSON" "$PACK_SAVED"
+  bun -e 'const {readFileSync,writeFileSync}=require("node:fs"); const [file,root]=process.argv.slice(1); const pkg=JSON.parse(readFileSync(file,"utf8")); const prefix=root.endsWith("/") ? root : root + "/"; for (const name of ["prepack","postpack"]) { const hook=pkg.scripts?.[name]; if (typeof hook==="string") pkg.scripts[name]=hook.split("./").join(prefix); } writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");' "$PACK_JSON" "$REPO_ROOT"
+  set +e
   (cd "$REPO_ROOT" && bun pm pack --destination "$TMP" >/dev/null)
+  PACK_RC=$?
+  set -e
+  cp "$PACK_SAVED" "$PACK_JSON"
+  [ "$PACK_RC" -eq 0 ] || { echo "⛔ package tarball was not created" >&2; exit "$PACK_RC"; }
   TARBALL="$(find "$TMP" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
   [ -n "$TARBALL" ] || { echo "⛔ package tarball was not created" >&2; exit 1; }
+  # bun pm pack drops a gitignored apps/pwa/out — as a real directory and as a
+  # symlink to .pwa-generations. Put its regular files in the tarball before
+  # the missing-PWA check, whichever form the build left.
+  if [ -f "$REPO_ROOT/apps/pwa/out/index.html" ]; then
+    (cd "$REPO_ROOT" && bun -e 'import { packPwaOutput } from "./scripts/lib/pack-pwa-output.ts"; packPwaOutput(process.argv[1], process.argv[2]);' "$REPO_ROOT" "$TARBALL")
+  fi
   INSTALL_TARBALL="$TARBALL"
   METADATA_SOURCE="$REPO_ROOT"
   # Only a checkout install is this repo. A missing git or a failed
@@ -619,6 +673,17 @@ if { [ -n "$ELN_ON_PATH" ] && [ "$ELN_ON_PATH" != "$ELN" ]; } ||
 else
   cp "$PREFIX/bin/elanous" "$ELN"
   ELN_AVAILABLE=1
+fi
+# els = `elanous side …` 바로가기. eln 과 같은 방식: 다른 프로그램이 els 를 쓰면 만들지 않는다.
+ELS="$PREFIX/bin/els"
+ELS_ON_PATH="$(command -v els 2>/dev/null || true)"
+if { [ -n "$ELS_ON_PATH" ] && [ "$ELS_ON_PATH" != "$ELS" ]; } ||
+   { { [ -e "$ELS" ] || [ -L "$ELS" ]; } &&
+     { [ -L "$ELS" ] || [ ! -f "$ELS" ] || [ "$(sed -n '2p' "$ELS")" != '# elanous-wrapper' ]; }; }; then
+  echo "⚠ els: $(t 'already used by another program, so it was not created — run elanous side instead.' '이미 다른 프로그램이 els 를 써서 만들지 않았습니다 — elanous side 로 실행하세요.')"
+else
+  printf '#!/bin/sh\n# elanous-wrapper\nexec "$(dirname "$0")/elanous" side "$@"\n' > "$ELS"
+  chmod +x "$ELS"
 fi
 # 대화형 셸은 bun 도 같은 bin 에서 찾는다(래퍼 자체는 이 링크나 PATH 에 의존하지 않는다).
 case "$BUN_EXEC" in

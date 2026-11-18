@@ -1,5 +1,6 @@
 /** Grok summarization — unified prompts for all source types + X-specific prompts absorbed from x-to-obsidian */
 
+import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
 import { env, requireEnv } from './env.js';
 import { compactText } from './util.js';
 import type { SummaryFormat, TweetMeta, Reply } from './types.js';
@@ -50,11 +51,11 @@ async function callGrok(prompt: string): Promise<string> {
   const apiKey = requireEnv('XAI_API_KEY');
   const model = env('GROK_MODEL', 'grok-4-1-fast-reasoning');
   console.log(`  xAI 모델: ${model}`);
-  const res = await fetch('https://api.x.ai/v1/responses', {
+  const res = await llmNetworkFetch('https://api.x.ai/v1/responses', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({ model, input: [{ role: 'system', content: '콘텐츠를 심층 분석해 구조화된 한국어 요약을 생성하는 AI.' }, { role: 'user', content: prompt }], temperature: 0.3 }),
-  });
+  }, { provider: 'grok', model, role: 'aux', requestedBy: 'omni-digest' });
   if (!res.ok) throw new Error(`Grok API ${res.status}: ${await res.text().catch(() => '')}`);
   const data = await res.json();
   for (const item of data.output || []) for (const c of item.content || []) if ((c.type === 'output_text' || c.type === 'text') && c.text) return c.text.trim();

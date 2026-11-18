@@ -365,3 +365,107 @@ describe('elanous-backup secrets bundle', () => {
     expect(output).toContain('🔐 자격 묶음 — 담을 자격이 없어 건너뛰었다');
   });
 });
+
+/** 🔒 BACKUP-DATA-ONLY (0.3.28 · RES79564/OP79578): host moves that may not copy credentials. */
+async function runWithCredentials(args: string[], crontab = '#!/bin/sh\nexit 0\n') {
+  const root = await mkdtemp(join(tmpdir(), 'elanous-backup-data-only-'));
+  const home = join(root, 'home');
+  const bin = join(root, 'bin');
+  await mkdir(join(home, '.elanous', 'mirrors'), { recursive: true });
+  await mkdir(join(home, '.codex'), { recursive: true });
+  await mkdir(join(home, '.aws'), { recursive: true });
+  await mkdir(join(home, '.elanous', 'backup-key'), { recursive: true });
+  // Synthetic sentinels only — never real credentials.
+  await writeFile(join(home, '.elanous', 'auth.json'), '{"sentinel":"elanous-auth"}');
+  await writeFile(join(home, '.codex', 'auth.json'), '{"sentinel":"codex-auth"}');
+  await writeFile(join(home, '.aws', 'credentials'), '[sentinel]\n');
+  await writeFile(join(home, '.elanous', 'backup-key', 'recipient.txt'), 'age1fixturerecipient\n');
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, 'crontab'), crontab);
+  await writeFile(join(bin, 'gcloud'), '#!/bin/sh\necho "gcloud must not run" >&2\nexit 99\n');
+  for (const name of ['crontab', 'gcloud']) await chmod(join(bin, name), 0o755);
+  try {
+    const result = spawnSync('bash', [backup, ...args], {
+      encoding: 'utf8',
+      // 출처: R-TST17 — same child ceiling as runBackup above; a timeout is «unmeasured», never a pass.
+      timeout: 30_000,
+      env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ''}`, ELANOUS_STATE_DIR: join(root, 'state') },
+    });
+    return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+describe('elanous-backup --data-only', () => {
+  test('lists exclusions first, never discovers or encrypts credentials, and reports them omitted (not success)', async () => {
+    const { status, output } = await runWithCredentials(['--data-only', '--dry-run']);
+    expect(status).toBe(0);
+    expect(output).toContain('데이터만(--data-only)');
+    expect(output.split('═══ 담을 것을')[0]).toContain('데이터만(--data-only)');
+    expect(output).toContain('elanous-mirrors');
+    expect(output).not.toContain('secret:');
+    expect(output).not.toContain('sentinel');
+    expect(output).toContain('🔐 자격 묶음 — 🔒 제외(omitted)');
+    expect(output).not.toContain('자격 묶음 ✅');
+    expect(output).not.toContain('═══ 🔐 자격 묶음 (암호화');
+  });
+
+  test('a credential-bearing crontab is still a hole and its raw text goes nowhere', async () => {
+    const secret = 'AKIA' + 'QRSTUVWXYZABCDEF';
+    const { status, output } = await runWithCredentials(
+      ['--data-only', '--dry-run'],
+      `#!/bin/sh\nprintf '20 4 * * * AWS_ACCESS_KEY_ID=${secret} /opt/run\\n'\n`,
+    );
+    expect(status).not.toBe(0);
+    expect(output).toContain('자격처럼 보이는 값이 있어 «안 담았다»');
+    expect(output).toContain('⛔ 구멍이 있다');
+    expect(output).not.toContain(secret);
+    expect(output).not.toContain('secret:machine-crontab.raw');
+    expect(output).not.toContain('═══ 🔐 자격 묶음 (암호화');
+  });
+
+  test('an unknown flag stops before staging anything instead of silently running a full backup', async () => {
+    const { status, output } = await runWithCredentials(['--skip-credentials', '--dry-run']);
+    expect(status).toBe(2);
+    expect(output).toContain('모르는 인자: --skip-credentials');
+    expect(output).not.toContain('═══ 담을 것을');
+  });
+
+  test('a flag in the value slot of --bucket/--source is refused in both orders, never swallowing --data-only', async () => {
+    for (const args of [
+      ['--bucket', '--data-only', '--dry-run'],
+      ['--data-only', '--bucket', '--dry-run'],
+      ['--source', '--data-only', '--dry-run'],
+      ['--dry-run', '--data-only', '--source'],
+    ]) {
+      const { status, output } = await runWithCredentials(args);
+      // Orders where the flag is consumed as a value must stop (rc=2); a trailing option without a value
+      // must never reach the credential bundle either.
+      if (args.join(' ').match(/--(bucket|source) --data-only/)) {
+        expect(status).toBe(2);
+        expect(output).toContain('값 자리에 플래그 모양');
+      }
+      expect(output).not.toContain('secret:.elanous/auth.json');
+      expect(output).not.toContain('═══ 🔐 자격 묶음 (암호화');
+    }
+  });
+
+  test('a trailing --bucket or --source with no value stops before staging anything', async () => {
+    for (const args of [['--data-only', '--dry-run', '--bucket'], ['--dry-run', '--data-only', '--source']]) {
+      const { status, output } = await runWithCredentials(args);
+      expect(status).toBe(2);
+      expect(output).toContain(`${args.at(-1)} 뒤에 값이 없다`);
+      expect(output).not.toContain('═══ 담을 것을');
+      expect(output).not.toContain('═══ 🔐 자격 묶음 (암호화');
+    }
+  });
+
+  test('without --data-only the full encrypted-credential path is unchanged', async () => {
+    const { output } = await runWithCredentials(['--dry-run']);
+    expect(output).toContain('secret:.elanous/auth.json');
+    expect(output).toContain('secret:.codex/auth.json');
+    expect(output).not.toContain('sentinel');
+    expect(output).toContain('═══ 🔐 자격 묶음 (암호화');
+  });
+});

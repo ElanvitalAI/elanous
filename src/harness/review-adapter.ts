@@ -151,6 +151,7 @@ export function combineReview(gate: GateLike, critique?: CritiqueLike): ReviewVe
       verdict: 'fail',
       findings: [`무결성 게이트 실패: ${failed.join(', ') || '테스트'}`],
       mustFix: failed.length ? failed : ['테스트 통과'],
+      gateFailed: true,
       ...(critique?.failureReason !== undefined ? { failureReason: critique.failureReason } : {}),
     };
   }

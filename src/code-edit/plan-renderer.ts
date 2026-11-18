@@ -48,6 +48,8 @@ function glyphFor(status: PlanStep['status'], noColor: boolean): string {
   const glyph =
     status === 'completed' ? icon('done')
     : status === 'in_progress' ? icon('running')
+    : status === 'blocked' ? icon('error')
+    : status === 'waiting' ? icon('warning')
     : icon('backlog');
   if (noColor) return glyph;
   return colourFor(status)(glyph);
@@ -56,6 +58,8 @@ function glyphFor(status: PlanStep['status'], noColor: boolean): string {
 function colourFor(status: PlanStep['status']) {
   return status === 'completed' ? C.success
     : status === 'in_progress' ? C.accent
+    : status === 'blocked' ? C.error
+    : status === 'waiting' ? C.warning
     : C.muted;
 }
 

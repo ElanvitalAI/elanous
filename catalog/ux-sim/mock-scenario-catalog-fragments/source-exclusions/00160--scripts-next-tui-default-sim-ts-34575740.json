@@ -1,0 +1,4 @@
+{
+  "path": "scripts/next-tui-default-sim.ts",
+  "reason": "Absorbed: the paired Next/classic first-screen receipt is covered by next-tui-ux-pack --compare classic. Kept only to reproduce docs/measurements/next-tui-default-sim-2026-11-12.md; new receipts use the pack."
+}

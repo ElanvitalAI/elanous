@@ -8,16 +8,24 @@ import {
 } from '../../sidetab-core/model.js';
 import { listPtyManifestRows } from '../../pty-shell/pty-manifest.js';
 import { formatSidetabPeekLines } from './peek.js';
+import { isAgentSidetabRow, withAgentStates } from './agent-state.js';
 
 type PreviewSidetabRow = SidetabRow & { readonly previewSource?: string };
 
 /** Attach the latest manifest snapshot without changing the shared row contract. */
 export function loadSidetabRows(all = false, currentSessionId?: string, scopeOverrides?: Partial<SidetabScope>): SidetabRow[] {
-  const snapshots = new Map<string, string>(listPtyManifestRows().map((row) => [row.id, row.snapshot || row.frame] as const));
-  const rows = loadCoreSidetabRows(all, currentSessionId, scopeOverrides);
+  const manifest = new Map(listPtyManifestRows().map((row) => [row.id, row] as const));
+  const snapshots = new Map<string, string>([...manifest].map(([id, row]) => [id, row.snapshot || row.frame] as const));
+  // Agent rows also say what the agent is doing (working · idle · blocked · waiting · done), like `pty state`.
+  return withAgentStates(withSidetabPreviewSources(loadCoreSidetabRows(all, currentSessionId, scopeOverrides), snapshots), manifest);
+}
+
+/** Pair rows with their PTY snapshot tail. */
+export function withSidetabPreviewSources(rows: readonly SidetabRow[], snapshots: ReadonlyMap<string, string>): PreviewSidetabRow[] {
   return rows.map((row) => ({
     ...row,
-    previewSource: snapshots.get(row.id) ?? '',
+    // The current TUI's own snapshot is this screen, sidetab included: peeking it only mirrors the sidebar.
+    previewSource: row.currentProcess ? '' : snapshots.get(row.id) ?? '',
   }));
 }
 
@@ -32,8 +40,7 @@ export function formatSidetabLines(
   const selectedRow = rows[selected] as PreviewSidetabRow | undefined;
   // Agent PTYs are conversations. Give their selected row a longer live tail
   // while keeping the parent chat on screen and one selectable row visible.
-  const agentSidechat = selectedRow !== undefined
-    && ['agent', 'coding-agent', 'codex', 'claude', 'claude-code', 'grok', 'hermes'].includes(selectedRow.kind);
+  const agentSidechat = selectedRow !== undefined && isAgentSidetabRow(selectedRow);
   const previewLimit = agentSidechat
     ? Number.isFinite(height) ? Math.min(6, Math.max(0, Math.floor(height) - 6)) : 6
     : 3;

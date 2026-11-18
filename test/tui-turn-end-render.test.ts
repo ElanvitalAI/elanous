@@ -52,6 +52,7 @@ function harness(send: DashboardChatMainPlainTurnRuntimeDeps['acpSession']['send
     pushErrorLine: (m: string) => { errorLines.push(m); },
     finalizeTurn: (status: 'completed' | 'interrupted' | 'failed', error?: string) => finalizeDashboardTurn({
       thinking, finalStatus: status, ...(error !== undefined ? { finalError: error } : {}), engineBadge: '',
+      turnStartedAt: Date.now(), accent: (t) => t,
       chatFooterLine: footer, pushChatLine: (l) => { chatLines.push(l); }, setChatScrollBottom: noop,
       consumeQuickControl: () => false, muted: (t) => t, draw: noop,
     }),
@@ -61,25 +62,26 @@ function harness(send: DashboardChatMainPlainTurnRuntimeDeps['acpSession']['send
 
 describe('턴 마감 갈래마다 진행 표시를 거둔다 (#5)', () => {
   const branches: Array<[string, DashboardChatMainPlainTurnRuntimeDeps['acpSession']['send'], RegExp]> = [
-    ['성공', async ({ onText }) => { onText('답'); }, /완료/],
-    ['오류(400)', async () => { throw new Error('Codex API 400: {"detail":"Bad Request"}'); }, /실패/],
-    ['인증 거절(401)', async () => { throw new CoreTurnAuthRejectedError('Codex API 401: unauthorized'); }, /실패/],
-    ['중단(Esc)', async ({ onText }) => { onText('부분'); abortRef.current!.abort(); }, /중단/],
+    ['성공', async ({ onText }) => { onText('답'); }, /Worked for/],
+    ['오류(400)', async () => { throw new Error('Codex API 400: {"detail":"Bad Request"}'); }, /Stopped after/],
+    ['인증 거절(401)', async () => { throw new CoreTurnAuthRejectedError('Codex API 401: unauthorized'); }, /Stopped after/],
+    ['중단(Esc)', async ({ onText }) => { onText('부분'); abortRef.current!.abort(); }, /Stopped after/],
   ];
   for (const [name, send, marker] of branches) {
     test(`${name} — footer 는 비고, 마감 줄 하나, 늦은 update 는 다시 칠하지 않는다`, async () => {
       const h = harness(send);
       await runDashboardChatMainPlainTurn(h.deps);
-      expect(h.footer.current).toBeNull();
-      const markers = h.chatLines.map(strip).filter((l) => /완료|실패|중단/.test(l));
+      expect(h.footer.current).not.toBeNull();
+      const markers = h.chatLines.map(strip).filter((l) => /Worked for|Stopped after/.test(l));
       expect(markers).toHaveLength(1);
       expect(markers[0]).toMatch(marker);
       expect(h.chatLines.map(strip).some((l) => /Thinking…|Streaming…/.test(l))).toBe(false);
       // 턴 마감 뒤 도착한 이벤트(같은 손잡이 재사용·늦은 usage)가 멈춘 프레임을 footer 에 다시 쓰면 안 된다.
+      const markerAfterFinalize = h.footer.current;
       h.thinking.update('Streaming');
       h.thinking.updateMetrics({ outputTokens: 10 });
       h.thinking.updateAnimated(() => 'Thinking');
-      expect(h.footer.current).toBeNull();
+      expect(h.footer.current).toBe(markerAfterFinalize);
     });
   }
 
@@ -88,7 +90,7 @@ describe('턴 마감 갈래마다 진행 표시를 거둔다 (#5)', () => {
     await runDashboardChatMainPlainTurn(h.deps);
     await runDashboardChatMainPlainTurn(h.deps);
     expect(h.chatLines.map(strip).some((l) => /Thinking…|Streaming…/.test(l))).toBe(false);
-    expect(h.footer.current).toBeNull();
+    expect(h.footer.current).not.toBeNull();
   });
 });
 
@@ -101,8 +103,8 @@ describe('401 은 처방 한 줄로 끝난다 (#22)', () => {
     expect(h.errorLines[0]).toContain('원문: Codex API 401');
     expect(h.errorLines[0]).not.toContain('\n');
     const lines = h.chatLines.map(strip);
-    expect(lines.some((l) => /완료/.test(l))).toBe(false);
-    expect(lines.some((l) => /실패 — ⚠ 모델 공급자가 인증을 거절/.test(l))).toBe(true);
+    expect(lines.some((l) => /Worked for/.test(l))).toBe(false);
+    expect(lines.some((l) => /Stopped after/.test(l))).toBe(true);
   });
 });
 
@@ -127,6 +129,7 @@ describe('/goal 반복 진행 표시 (#5 · 리뷰 r1 지적: 루프가 끝난 �
       (h.deps as { pushChatLine: (l: string) => void }).pushChatLine = (l) => { chatLines.push(l); };
       (h.deps as { finalizeTurn: DashboardChatMainPlainTurnRuntimeDeps['finalizeTurn'] }).finalizeTurn = (status, error) => finalizeDashboardTurn({
         thinking: live, finalStatus: status, ...(error !== undefined ? { finalError: error } : {}), engineBadge: '',
+        turnStartedAt: Date.now(), accent: (t) => t,
         chatFooterLine: footer, pushChatLine: (l) => { chatLines.push(l); }, setChatScrollBottom: () => {},
         consumeQuickControl: () => false, muted: (t) => t, draw: () => {},
       });
@@ -143,8 +146,8 @@ describe('/goal 반복 진행 표시 (#5 · 리뷰 r1 지적: 루프가 끝난 �
       expect(r.started).toBe(actions.length - 1);
       expect(r.footerDuringSend).toHaveLength(actions.length);
       for (const shown of r.footerDuringSend) expect(strip(shown)).toMatch(/(Routing|Thinking|Streaming)…/);
-      expect(r.footer.current).toBeNull();
-      expect(r.chatLines.map(strip).filter((l) => /완료/.test(l))).toHaveLength(actions.length);
+      expect(r.footer.current).not.toBeNull();
+      expect(r.chatLines.map(strip).filter((l) => /Worked for/.test(l))).toHaveLength(actions.length);
       expect(r.chatLines.map(strip).some((l) => /Thinking…|Streaming…|Routing…/.test(l))).toBe(false);
     });
   }

@@ -19,6 +19,7 @@ import type { NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.j
 
 import { createInternalTurnGate, formatInternalTurnBanner, isInternalTurnEnabledByEnv, type InternalTurnGate, type InternalTurnRequest } from '../tui/input/internal-turn.js';
 import { createNextMailWake, type NextMailWakeDeps } from './next-mail-wake.js';
+import { createSeatRetroScheduler, type SeatRetroScheduler, type SeatRetroStateStore } from '../seat/seat-retro.js';
 
 import type { LLMToolDef, PluginContext } from '../plugins/core/types.js';
 import {
@@ -26,6 +27,7 @@ import {
   buildScheduleWakeupHostTool,
   createDashboardWakeupScheduler,
   createWakeupScheduler,
+  type WakeupPersistence,
   type WakeupScheduler,
   type WakeupTimerHandle,
 } from '../skills/tools/schedule-wakeup.js';
@@ -117,9 +119,14 @@ export function createReplWakeupTool(
   };
 }
 
+/** How long a parked turn waits for the input loop to take it before it is withdrawn. */
+export const SEAT_CAP_START_WAIT_MS = 2_000;
+
 export interface NextTuiWakeupDeps {
   /** next 의 `busy`(채팅 턴·압축·provider·harness 명령 중). */
   isTurnRunning: () => boolean;
+  /** ELN-SEAT-TURN-PACING — rest between automatic turns (entry passes `turnPacingFromEnv()`; absent = unpaced). */
+  pacing?: import('../tui/input/internal-turn.js').TurnPacing;
   /** 입력칸이 실제로 앞에 있는가; 로그·파일 선택·사이드탭 위로 자동 턴이 끼어들지 않는다. */
   isInputForeground?: () => boolean;
   /** 자리 opt-in(`autowake`) 우편은 외부 pane 입력 대신 이 H2 문으로 받는다. */
@@ -141,11 +148,17 @@ export interface NextTuiWakeupDeps {
   lastHumanKeyAt?: () => number;
   pendingKeyCount?: () => number;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** 세션 파일 영속(재기동 복원). 하니스 자식(무인 런)은 받아도 쓰지 않는다 — 도구도 싣지 않는다. */
+  persist?: WakeupPersistence;
+  /** Built-in self-retro (SEAT-ROLE-CARD device 2): opens an origin-'retro' turn on this same door every `intervalMin` minutes. 0 = off. */
+  retro?: { readonly seat: string; readonly intervalMin: number; readonly store: SeatRetroStateStore };
 }
 
 export interface NextTuiWakeup {
   readonly gate: InternalTurnGate;
   readonly scheduler: WakeupScheduler;
+  /** The retro scheduler when one was requested for this seat (state is readable for supervision). */
+  readonly retro: SeatRetroScheduler | null;
   /** REPL 자식이 부를 도구(부모 handler) — 하니스 자식이면 null. */
   readonly tool: LLMToolDef | null;
   /** Read-only header projection; no scheduler or health observation is changed. */
@@ -153,6 +166,13 @@ export interface NextTuiWakeup {
   banner(request: Pick<InternalTurnRequest, 'origin' | 'reason'>): string;
   /** 키 큐에서 홉을 꺼낼 때 다시 확인한다. 판정 뒤 사람이 포커스·초안·대기 제출을 바꿀 수 있다. */
   takePendingIfIdle(): InternalTurnRequest | null;
+  /**
+   * ELN-TURN-CAP-CONTINUE-STALL (③): the seat-cap continue parked `turnId`. Resolve true once the
+   * input loop takes it, false (and withdraw it) if it is still pending when the wait ends.
+   */
+  confirmSeatCapTurnStarted(turnId: string): Promise<boolean>;
+  /** A turn ended: whether it produced any answer. Lets a mail turn mark seen only after it answered (#38203 REVIEW-1 ①). */
+  noteTurnFinished(responded: boolean): void;
   dispose(): void;
 }
 
@@ -174,6 +194,7 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     ...(deps.lastHumanKeyAt ? { lastHumanKeyAt: deps.lastHumanKeyAt } : {}),
     ...(deps.pendingKeyCount ? { pendingKeyCount: deps.pendingKeyCount } : {}),
     ...(deps.log ? { log: deps.log } : {}),
+    ...(deps.pacing ? { pacing: deps.pacing } : {}),
   });
   gate.port.attach(deps.requestYield);
   const scheduler = createDashboardWakeupScheduler(gate, {
@@ -182,14 +203,50 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     ...(deps.setTimer ? { setTimer: deps.setTimer } : {}),
     ...(deps.clearTimer ? { clearTimer: deps.clearTimer } : {}),
     ...(deps.log ? { log: deps.log } : {}),
+    ...(deps.persist && !env.ELANOUS_HARNESS_ROLE?.trim() ? { persist: deps.persist } : {}),
   });
   const tool = env.ELANOUS_HARNESS_ROLE?.trim() ? null : buildScheduleWakeupHostTool(scheduler);
+  const seatCapWaiters = new Map<string, (started: boolean) => void>();
+  const settleSeatCap = (turnId: string, started: boolean): void => {
+    const resolve = seatCapWaiters.get(turnId);
+    if (!resolve) return;
+    seatCapWaiters.delete(turnId);
+    resolve(started);
+  };
+  /** True once the input loop took the parked turn; a turn it never takes within the wait is withdrawn and reported false. */
+  const confirmTurnStarted = (turnId: string): Promise<boolean> => {
+    if (gate.pendingTurnId() !== turnId) return Promise.resolve(true);
+    // The wait uses the injected clock (a fake clock in tests), like the retro timer itself.
+    const setT = deps.setTimer ?? ((fn: () => void, ms: number): WakeupTimerHandle => { const t = setTimeout(fn, ms); (t as { unref?: () => void }).unref?.(); return t; });
+    const clearT = deps.clearTimer ?? ((handle: WakeupTimerHandle): void => clearTimeout(handle as ReturnType<typeof setTimeout>));
+    return new Promise<boolean>((resolve) => {
+      const timer = setT(() => {
+        seatCapWaiters.delete(turnId);
+        if (gate.pendingTurnId() === turnId) gate.withdrawPendingTurn(turnId);
+        resolve(false);
+      }, SEAT_CAP_START_WAIT_MS);
+      seatCapWaiters.set(turnId, (started) => { clearT(timer); resolve(started); });
+    });
+  };
+  const retro = deps.retro && deps.retro.intervalMin > 0 && !env.ELANOUS_HARNESS_ROLE?.trim()
+    ? createSeatRetroScheduler({
+      seat: deps.retro.seat, intervalMin: deps.retro.intervalMin, store: deps.retro.store,
+      now: deps.now ?? Date.now,
+      setTimer: deps.setTimer ?? ((fn, ms) => { const t = setTimeout(fn, ms); (t as { unref?: () => void }).unref?.(); return t; }),
+      clearTimer: deps.clearTimer ?? (handle => clearTimeout(handle as ReturnType<typeof setTimeout>)),
+      startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
+      confirmStarted: confirmTurnStarted,
+      notify: deps.notify,
+      ...(deps.log ? { log: (event: string, data: Record<string, unknown>) => deps.log!('tui.retro', event, data) } : {}),
+    }) : null;
+  retro?.start();
   const mailWake = deps.enableSeatMailWake && !env.ELANOUS_HARNESS_ROLE?.trim()
     ? createNextMailWake({ ...deps.mailWakeOptions, startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
       intervalMs: deps.mailWakeOptions?.intervalMs ?? (acceleratedTestClock ? 1_000 : undefined) }) : null;
   return {
     gate,
     scheduler,
+    retro,
     tool,
     headline(health) {
       const healthText = health === null ? '건강 관측 전'
@@ -220,10 +277,16 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
       }
       const request = gate.takePending();
       if (request?.origin === 'msg-wake') mailWake?.confirmDelivery();
+      if (request) settleSeatCap(request.turnId, true);
       return request;
+    },
+    confirmSeatCapTurnStarted: confirmTurnStarted,
+    noteTurnFinished(responded) {
+      mailWake?.noteTurnFinished(responded);
     },
     dispose() {
       mailWake?.dispose();
+      retro?.dispose();
       scheduler.dispose();
       gate.port.detach({ yielded: true });
     },

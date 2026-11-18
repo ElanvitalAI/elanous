@@ -365,7 +365,7 @@ describe('next TUI sidetab attachments', () => {
         data: { agent: 'codex', screen: 'none', error: 'mission-or-result-failed' },
       });
       expect(events.some(entry => entry.data.error === 'known-startup-screen-blocked')).toBe(false);
-      expect(status).toContain('미션 확인 실패 · codex · Mission text was not visible');
+      expect(status).toContain('Mission check failed · codex · Mission text was not visible');
       expect(status).not.toContain('codex-update-choice');
     } finally { controller.close(); }
   });
@@ -388,7 +388,7 @@ describe('next TUI sidetab attachments', () => {
       const result = await controller.runMission('codex', 'write a short result file');
       expect(checks).toEqual(['codex']);
       expect(result.ok).toBe(false);
-      expect(result.error).toContain('설치 확인 후 미션을 다시 요청하세요');
+      expect(result.error).toContain('verify install and request the mission again');
       expect(status).toContain('Codex CLI가 설치되지 않았습니다');
       expect(controller.hasModal()).toBe(false);
     } finally {
@@ -454,7 +454,7 @@ describe('next TUI sidetab attachments', () => {
       ] });
       expect(result.finalFile).toContain(join(cwd, '.elanous', 'mission-results', 'classic-pair-synthesis-'));
       const synthesis = readFileSync(result.finalFile, 'utf8');
-      expect(synthesis).toContain('## 비교·채택 표');
+      expect(synthesis).toContain('## Comparison and adoption');
       expect(synthesis).toContain('| Codex | implement |');
       expect(synthesis).toContain('| Claude Code | review |');
       expect(synthesis).toContain('# codex');
@@ -475,7 +475,7 @@ describe('next TUI sidetab attachments', () => {
     });
 
     expect(controller.kill({ id: 'tui:current', label: 'current', kind: 'tui', badge: 'idle', currentProcess: true })).toBe(false);
-    expect(status).toContain('현재 TUI 세션');
+    expect(status).toContain('Current TUI session cannot be killed from sidetab');
     controller.close();
   });
 
@@ -742,7 +742,7 @@ describe('next TUI sidetab attachments', () => {
       failText();
       for (let attempt = 0; attempt < 100 && !events.some((event) => event.event === 'send-failed'); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
       expect(events.find((event) => event.event === 'send-failed')?.data).toMatchObject({ ptyId: 'pty-error', attachmentChanged: true, outcome: 'unknown' });
-      expect(statuses.some((status) => status.includes('결과 불명') && status.includes('pty-error'))).toBe(true);
+      expect(statuses.some((status) => status.includes('outcome unknown') && status.includes('pty-error'))).toBe(true);
     } finally { failText(); controller.close(); }
   });
 
@@ -814,9 +814,9 @@ describe('next TUI sidetab attachments', () => {
       await firstStarted;
       controller.select(other);
       finishFirst();
-      for (let attempt = 0; attempt < 100 && !statuses.some((status) => status.includes('입력 취소')); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      for (let attempt = 0; attempt < 100 && !statuses.some((status) => status.includes('input cancelled')); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
       expect(calls.map((args) => args[3])).toEqual(['a']);
-      expect(statuses.some((status) => status.includes('대상 전환') && status.includes('pty-cancel'))).toBe(true);
+      expect(statuses.some((status) => status.includes('target switch') && status.includes('pty-cancel'))).toBe(true);
     } finally { finishFirst(); controller.close(); }
   });
 

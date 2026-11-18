@@ -54,8 +54,8 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/graph-resume-any-entry.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/graph-resume-any-entry.test.ts' }));
   expect(catalog.candidateAudit.candidates.every((candidate) => existsSync(join(REPO, candidate.path)))).toBe(true);
-  expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
-  expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
+  // Every exclusion names a file that exists and says why (the MK-MS-01 row pointed at closed PR #34039 and was retired).
+  expect(catalog.candidateAudit.sourceExclusions.filter((row) => !existsSync(join(REPO, row.path)) || !row.reason.trim())).toEqual([]);
   for (const candidate of catalog.candidateAudit.candidates) {
     expect(candidate.entryCommand.length).toBeGreaterThan(0);
     expect(candidate.logsDetail.length).toBeGreaterThan(0);
@@ -133,7 +133,8 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   const unindexed = readdirSync(import.meta.dir)
     .filter((file) => file.endsWith('.ts') && !file.endsWith('.test.ts'))
     .map((file) => `src/ux-sim/${file}`)
-    .filter((path) => !implementation.has(path));
+    // A runtime module that is not a device is accounted for by a source exclusion with its reason.
+    .filter((path) => !implementation.has(path) && !catalog.candidateAudit.sourceExclusions.some((row) => row.path === path));
   expect(unindexed).toEqual([]);
 });
 

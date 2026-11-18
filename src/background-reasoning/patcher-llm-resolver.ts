@@ -16,6 +16,7 @@
 // surface in the KGS card row as a "low-confidence patcher_card" the
 // future Thinker (Y4) can re-process).
 
+import { llmNetworkSend } from '../session-runtime/llm-call-gateway.js';
 import type { EmbeddingCallable } from './patcher-extractors/embedding-generator.js';
 import type {
   EntityExtractorCallable,
@@ -90,7 +91,8 @@ function createEntityCallable(opts: EntityCallableOpts): EntityExtractorCallable
   return async (input: EntityExtractInput): Promise<EntityExtractOutput> => {
     const prompt = buildEntityPrompt(input);
     try {
-      const res = await opts.fetchImpl(`${opts.endpoint}/v1/chat/completions`, {
+      const url = `${opts.endpoint}/v1/chat/completions`;
+      const init: RequestInit = {
         method: 'POST',
         ...(input.signal ? { signal: input.signal } : {}),
         headers: buildHeaders(opts.apiKey),
@@ -102,7 +104,10 @@ function createEntityCallable(opts: EntityCallableOpts): EntityExtractorCallable
           ],
           temperature: 0,
         }),
-      });
+      };
+      const res = await llmNetworkSend(url, init,
+        { provider: 'openai-compatible', model: opts.model, role: 'aux', requestedBy: 'background-reasoning.patcher.entity-extract' },
+        () => opts.fetchImpl(url, init));
       if (!res.ok) {
         opts.onError('entity-extract', new Error(`HTTP ${res.status}`));
         return { entities: [], relations: [] };
@@ -182,14 +187,18 @@ function createEmbeddingCallable(opts: EmbeddingCallableOpts): EmbeddingCallable
   return async (texts: string[]): Promise<number[][]> => {
     if (texts.length === 0) return [];
     try {
-      const res = await opts.fetchImpl(`${opts.endpoint}/v1/embeddings`, {
+      const url = `${opts.endpoint}/v1/embeddings`;
+      const init: RequestInit = {
         method: 'POST',
         headers: buildHeaders(opts.apiKey),
         body: JSON.stringify({
           model: opts.model,
           input: texts,
         }),
-      });
+      };
+      const res = await llmNetworkSend(url, init,
+        { provider: 'openai-compatible', model: opts.model, role: 'aux', requestedBy: 'background-reasoning.patcher.embedding' },
+        () => opts.fetchImpl(url, init));
       if (!res.ok) {
         opts.onError('embedding', new Error(`HTTP ${res.status}`));
         return texts.map(() => []);

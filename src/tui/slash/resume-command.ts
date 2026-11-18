@@ -1,5 +1,5 @@
 /** Lightweight `/resume` and `/session` command parsing for Next TUI startup. */
-export const RESUME_BUSY_STATUS = '응답 중에는 /resume 을 받지 않습니다 · 완료(또는 Esc 취소) 뒤 다시';
+export const RESUME_BUSY_STATUS = '/resume is not accepted while a reply is running · retry when done (or Esc cancel)';
 /** Rows shown by `/resume` and `/session list`. */
 export const RESUME_LIST_LIMIT = 12;
 

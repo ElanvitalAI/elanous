@@ -297,8 +297,19 @@ async function flushCrashQueueUnlocked(configDir: string, deps: ErrorReportDeps)
     if (!existsSync(dir)) return emptyCrashQueueFlush();
     const files = pruneCrashQueue(dir, (deps.now ?? Date.now)());
     const settings = (deps.settings ?? defaultSettings)();
-    if (!settings.enabled) return { sent, skipped: files.length, consentSkipped, disabledSkipped: files.length };
-    if (settings.consented !== true) return { sent, skipped: files.length, consentSkipped: files.length, disabledSkipped };
+    if (!settings.enabled || settings.consented !== true) {
+      // A declined report must not be retried on every CLI start (or sent if consent is later
+      // enabled). Only count records actually removed so a failed acknowledgement can retry.
+      for (const name of files) {
+        try {
+          rmSync(join(dir, name));
+          skipped++;
+          if (!settings.enabled) disabledSkipped++;
+          else consentSkipped++;
+        } catch { /* keep the record for a later acknowledgement */ }
+      }
+      return { sent, skipped, consentSkipped, disabledSkipped };
+    }
     for (const name of files) {
       const file = join(dir, name);
       try {

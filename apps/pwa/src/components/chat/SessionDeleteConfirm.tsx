@@ -14,6 +14,8 @@ export interface SessionDeleteConfirmProps {
   onCancel: () => void;
   onConfirm: () => void;
   busy?: boolean;
+  /** Why the last attempt failed — shown inside the dialog, which stays open (nothing was removed). */
+  error?: string | null;
 }
 
 export function SessionDeleteConfirm({
@@ -22,14 +24,21 @@ export function SessionDeleteConfirm({
   onCancel,
   onConfirm,
   busy,
+  error,
 }: SessionDeleteConfirmProps) {
   useEffect(() => {
     if (!open) return;
+    // The dialog is the top layer: it takes Esc in the capture phase and stops it, so a layer beneath that also
+    // listens on document (the phone list drawer) is not closed by the same key (#38333 REVIEW-1).
+    const doc = document;
     const onEsc = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onCancel();
+      // An Esc that ends an IME composition is the composition's, not the dialog's.
+      if (e.key !== 'Escape' || e.isComposing) return;
+      e.stopPropagation();
+      onCancel();
     };
-    document.addEventListener('keydown', onEsc);
-    return () => document.removeEventListener('keydown', onEsc);
+    doc.addEventListener('keydown', onEsc, true);
+    return () => doc.removeEventListener('keydown', onEsc, true);
   }, [open, onCancel]);
 
   if (!open || !session) return null;
@@ -44,6 +53,7 @@ export function SessionDeleteConfirm({
       onClick={onCancel}
     >
       <div
+        data-elanous-delete-panel
         onClick={(e) => e.stopPropagation()}
         className="w-[min(420px,calc(100vw-2rem))] rounded-lg border border-border bg-card p-5 shadow-lg"
       >
@@ -67,6 +77,11 @@ export function SessionDeleteConfirm({
             </p>
           </div>
         </div>
+        {error && (
+          <p role="status" data-elanous-delete-error className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+            지우지 못했습니다: {error}
+          </p>
+        )}
         <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"

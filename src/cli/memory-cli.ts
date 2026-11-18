@@ -5,6 +5,7 @@
 import type { Command } from 'commander';
 import * as ui from '../ui.js';
 import { readPipedStdin } from './piped-stdin.js';
+import { recordMemoryUsage } from '../memory-triage/usage-ledger.js';
 import {
   saveMemory, loadMemory, listMemories, deleteMemory, searchMemories,
   readIndex, memoryRoot, memoryIndexPath,
@@ -12,6 +13,8 @@ import {
 } from '../memory.js';
 import { applyClaudeMemoryImport, claudeMemoryRoot, collectClaudeMemoryFiles } from '../context-bus/claude-memory-import.js';
 import { importClaudeMemories } from '../context-bus/long-term-memory.js';
+import { buildSeatMemoryIndexBlock, normalizeSeat, rebuildSeatMemoryIndex, seatMemoryDir } from '../seat-memory/seat-memory.js';
+import { applySeatMemoryImport, planSeatMemoryImport, summarizeSeatMemoryImport, type SeatMemoryImportPlan } from '../seat-memory/seat-memory-import.js';
 
 export function registerMemoryCommands(program: Command): void {
   const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
@@ -47,7 +50,7 @@ export function registerMemoryCommands(program: Command): void {
     let body = description;
     const pipedBody = await readPipedStdin();   // ★ OBS-T3 — 비-TTY 는 파이프를 뜻하지 않는다(소켓이면 EOF 가 안 온다)
     if (pipedBody) body = pipedBody;
-    const e = saveMemory({ type: type as MemoryType, name, description, body });
+    const e = saveMemory({ type: type as MemoryType, name, description, body }, undefined, { origin: 'memory-cli.add' });
     ui.info(`saved ${e.id.slice(0, 8)} [${e.type}] "${e.name}"`);
   });
 
@@ -146,6 +149,8 @@ export function registerMemoryCommands(program: Command): void {
       type: opts.type as MemoryType | undefined,
       limit: parseInt(opts.limit, 10),
     });
+    // MEMORY-TRIAGE-NO-LLM ③ 생산자 — 사람이 찾아 꺼낸 기억도 «쓰임»이다(id 해시만 · 빈 결과도 시도로 남는다).
+    recordMemoryUsage({ store: 'global', via: 'search', usedIds: hits.map(h => h.entry.id) }, memoryRoot());
     if (hits.length === 0) { ui.info('No matches.'); return; }
     ui.header(`matches (${hits.length})`);
     for (const h of hits) {
@@ -182,6 +187,45 @@ export function registerMemoryCommands(program: Command): void {
     console.log(`index file   ${memoryIndexPath()}`);
   });
 
+  // 🧠 OP-MEMORY-PARITY (O6 · 대표 11-17) — Claude Code 기억 폴더 하나 → eln 자리 기억 저장소(`<memoryRoot>/seats/<SEAT>`).
+  //    원본 읽기 전용 · 기본 미리보기(쓰기 0) · `--apply` 일 때만 쓴다 · 비밀처럼 보이는 파일은 거부하고 이름만 출력한다.
+  memCmd
+  .command('import')
+  .description('Import one Claude Code memory dir into an eln seat memory store (dry-run unless --apply; source is read-only)')
+  .requiredOption('--from <dir>', 'Claude Code memory dir (…/.claude/projects/<project>/memory)')
+  .requiredOption('--seat <SEAT>', 'target seat id (e.g. OP)')
+  .option('--to <dir>', 'override target dir (default <memoryRoot>/seats/<SEAT>)')
+  .option('--apply', 'write the files (default: dry-run preview)')
+  .action((opts: { from: string; seat: string; to?: string; apply?: boolean }) => {
+    const seat = normalizeSeat(opts.seat);
+    if (!seat) { ui.error(`invalid seat "${opts.seat}"`); process.exit(1); }
+    let plan: SeatMemoryImportPlan;
+    try { plan = planSeatMemoryImport({ from: opts.from, to: opts.to ?? seatMemoryDir(seat), seat }); }
+    catch (error) { ui.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
+    const summary = opts.apply ? applySeatMemoryImport(plan) : summarizeSeatMemoryImport(plan, false);
+    ui.header(`seat memory import ${opts.apply ? '(applied)' : '(dry-run — nothing written)'} → ${plan.to}`);
+    console.log(`  create ${summary.create} · update ${summary.update} · same ${summary.same} · skipped ${summary.skipped} · index lines dropped ${plan.indexDroppedLines}`);
+    for (const [reason, count] of Object.entries(summary.skippedByReason)) console.log(`  skipped ${reason}: ${count}`);
+    // 비밀처럼 보인 파일은 이름만(본문·일치 값 0).
+    for (const name of summary.refusedNames) console.log(`  refused (secret-pattern): ${name}`);
+    if (!opts.apply) console.log('  re-run with --apply to write');
+  });
+
+  memCmd
+  .command('seat-index <seat>')
+  .description('Print the session-start memory index block an eln seat session injects (or --rebuild it from the files)')
+  .option('--rebuild', 'regenerate MEMORY.md from the memory files (loses hand-curated order)')
+  .action((seatArg: string, opts: { rebuild?: boolean }) => {
+    const seat = normalizeSeat(seatArg);
+    if (!seat) { ui.error(`invalid seat "${seatArg}"`); process.exit(1); }
+    const dir = seatMemoryDir(seat);
+    if (opts.rebuild) ui.info(`rebuilt ${rebuildSeatMemoryIndex(dir).lines} lines → ${dir}`);
+    const built = buildSeatMemoryIndexBlock(seat, dir);
+    if (!built) { ui.info(`empty (no index at ${dir})`); return; }
+    console.log(built.block);
+    ui.info(`lines ${built.lines}/${built.totalLines} · bytes ${built.bytes}/${built.totalBytes} · truncated ${built.truncated}`);
+  });
+
   // 대표 10-12 MEMORY-IMPORT-CLAUDE — Claude 자동 기억(~/.claude/projects/*/memory)을 엘라누스
   // 장기 기억으로 가져온다. 에이전트 무관 — codex·elanous TUI 가 같은 기억을 바로 읽는다.
   memCmd
@@ -203,7 +247,7 @@ export function registerMemoryCommands(program: Command): void {
     }
     const result = applyClaudeMemoryImport(files, { asOf }, {
       list: () => listMemories().map(entry => ({ id: entry.id, name: entry.name })),
-      save: record => { saveMemory(record); },
+      save: record => { saveMemory(record, undefined, { origin: 'memory-cli.import-claude' }); },
     });
     ui.info(`claude-memory: ${result.saved} new · ${result.updated} overwritten · ${result.items.length} imported (${files.length} files from ${opts.root})`);
     for (const [reason, count] of Object.entries(result.skipped)) ui.info(`  skipped ${reason}:${count}`);

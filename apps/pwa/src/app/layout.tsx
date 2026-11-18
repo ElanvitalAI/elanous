@@ -9,6 +9,7 @@ import { ThemeProvider } from '@/components/providers/ThemeProvider';
 import { ToastProvider } from '@/components/providers/ToastProvider';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { AppShell } from '@/components/shell/AppShell';
+import { DeviceConnectGate } from '@/components/shell/DeviceConnectGate';
 import { MaturityBanner } from '@/components/shell/MaturityBanner';
 import { ServiceWorkerRegister } from '@/components/providers/ServiceWorkerRegister';
 import { NewBuildBanner } from '@/components/providers/NewBuildBanner';
@@ -60,16 +61,19 @@ export default function RootLayout({
         <ServiceWorkerRegister />
         <NewBuildBanner />
         <DaemonProvider>
-          <OperatorRoleDefault />
-          <NexusClientProvider>
-            <ThemeProvider>
-              <TooltipProvider>
-                <ToastProvider>
-                  <AppShell><MaturityBanner />{children}</AppShell>
-                </ToastProvider>
-              </TooltipProvider>
-            </ThemeProvider>
-          </NexusClientProvider>
+          {/* WEB-FIRST-CONNECT-ONBOARDING: nothing below asks the Nexus until this device is known to be connected. */}
+          <DeviceConnectGate>
+            <OperatorRoleDefault />
+            <NexusClientProvider>
+              <ThemeProvider>
+                <TooltipProvider>
+                  <ToastProvider>
+                    <AppShell><MaturityBanner />{children}</AppShell>
+                  </ToastProvider>
+                </TooltipProvider>
+              </ThemeProvider>
+            </NexusClientProvider>
+          </DeviceConnectGate>
         </DaemonProvider>
       </body>
     </html>

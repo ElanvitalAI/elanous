@@ -112,6 +112,23 @@ const FIRST_RUN_TEXT = {
   },
 } as const;
 
+/** The provider this config already uses with a credential that resolves (a member session's proxy token, a saved
+ *  key, an env key, Z.ai coding plan), or undefined. Shared by first-run and the bare-entry gate so both judge the
+ *  same thing: a session that can already chat must not be sent through setup (TUI-FIRSTRUN-BLOCKS-MEMBER-SESSION). */
+export async function configuredFirstRunProvider(
+  cfg: UserConfig,
+  deps: Pick<FirstRunDeps, 'env' | 'getSecretAsync'> = {},
+): Promise<UserConfig['llm']['provider'] | undefined> {
+  const existing = cfg.llm.provider !== 'auto'
+    ? await resolveProviderCredentialAsync({ provider: cfg.llm.provider, rotation: cfg.llm.rotation,
+        baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey, env: deps.env }, deps.getSecretAsync)
+    : undefined;
+  return existing && existing.source !== 'none'
+    ? cfg.llm.provider
+    // Z.ai's coding-plan credential is stored in its dedicated cache/env, not llm.apiKey.
+    : cfg.llm.provider === 'glm' && zaiCodingPlanAvailable() ? 'glm' : undefined;
+}
+
 export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   outcome: 'ready' | 'needs-llm' | 'cancelled'; provider?: string; inputs: number;
 }> {
@@ -123,14 +140,7 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
     `${provider === 'openai-codex' ? 'codex' : provider}${text.subscription}`;
   // An incomplete onboarding marker does not mean the user's LLM is unconfigured.
   // Keep an already usable provider, key and model rather than replacing it with a detected subscription.
-  const existing = cfg.llm.provider !== 'auto'
-    ? await resolveProviderCredentialAsync({ provider: cfg.llm.provider, rotation: cfg.llm.rotation,
-        baseProvider: cfg.llm.provider, baseApiKey: cfg.llm.apiKey, env: deps.env }, deps.getSecretAsync)
-    : undefined;
-  const configured = existing && existing.source !== 'none'
-    ? cfg.llm.provider
-    // Z.ai's coding-plan credential is stored in its dedicated cache/env, not llm.apiKey.
-    : cfg.llm.provider === 'glm' && zaiCodingPlanAvailable() ? 'glm' : undefined;
+  const configured = await configuredFirstRunProvider(cfg, deps);
   let detected: DetectedProvider[] = [];
   // This read-only scan is unconditional, even with an incomplete existing config;
   // provider availability must not depend on the setup marker/config being absent.

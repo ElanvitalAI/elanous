@@ -10,7 +10,7 @@ import { defaultTaskLauncher, registerTasksCommands, spawnDetachedConfirmed, typ
 import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { abandonedDraftReleaseNote, cardsTouchingPaths, closeTaskCard, draftTaskOwner, handDraftClaim, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, updateTaskCard, writeTaskCards, TaskAgentStateError, TaskDraftClaimRejectedError, type DraftClaimGhPorts, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { abandonedDraftReleaseNote, cardsTouchingPaths, taBudgetEnv, closeTaskCard, draftTaskOwner, handDraftClaim, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, updateTaskCard, writeTaskCards, TaskAgentStateError, TaskDraftClaimRejectedError, type DraftClaimGhPorts, type TaskCard, type TaskLaunchContext } from './task-hand.js';
 import { advanceMission } from './mission.js';
 import { remoteLaunchScript } from './parent-host.js';
 import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
@@ -1754,7 +1754,8 @@ test('COORD-ENTRANCE-FOLD: 실제 tasks hand work-order 발사가 원문 hash �
   const repoRoot = join(root, 'repo');
   const state = join(root, 'task-agent-actions.json');
   const file = join(root, 'coord.work-order.json');
-  const order = buildWorkOrder({ cellId: 'COORD-ENTRANCE-FOLD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts' });
+  const order = buildWorkOrder({ cellId: 'COORD-ENTRANCE-FOLD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts',
+    budget: 'time=6900s tier=low pod=aws1 rework=1', contract: 'coordinator-shadow 원문 hash 행', escalation: 'OP' });
   writeFileSync(file, `${JSON.stringify(order)}\n`);
   const savedAgent = process.env.ELANOUS_SEAT;
   const savedAiAgent = process.env.AI_AGENT;
@@ -1868,16 +1869,50 @@ test('TA-WORK-ORDER ① 칸 아홉이 찬 지시서는 work-order 로 펼쳐지�
 });
 
 test('TA-WORK-ORDER ② 칸 셋이 빠진 지시서는 거부하지 않고 «모름»으로 채워 unknownFields 3 에 적는다', () => {
-  const { budget: _budget, peers: _peers, precedents: _precedents, ...partial } = fullWorkOrder;
+  const { identityTags: _identityTags, peers: _peers, precedents: _precedents, ...partial } = fullWorkOrder;
   const resolved = resolveHandText(workOrderFile(JSON.stringify(partial)));
   expect(resolved.kind).toBe('work-order');
   if (resolved.kind !== 'work-order') return;
-  expect(resolved.order.unknownFields).toEqual(['budget', 'peers', 'precedents']);
-  expect(resolved.order.budget).toBe('모름');
+  expect(resolved.order.unknownFields).toEqual(['identityTags', 'peers', 'precedents']);
+  expect(resolved.order.peers).toBe('모름');
   const lines = resolved.text.split('\n');
   expect(lines[0]).toBe(`대상 경로: ${partial.boundary}`);
   expect(lines[1]).toBe(`현재 계약: ${partial.contract}`);
   expect(lines.filter((line) => line.includes('모름'))).toHaveLength(3);
+});
+
+test('TA-WORK-ORDER 경계·예산·계약·올림 중 하나라도 «모름» 이면 발사를 거부한다', () => {
+  for (const field of ['boundary', 'budget', 'contract', 'escalation'] as const) {
+    const { [field]: _dropped, ...partial } = fullWorkOrder;
+    expect(resolveHandText(workOrderFile(JSON.stringify(partial)))).toMatchObject({ kind: 'rejected', reason: expect.stringContaining(field) });
+    expect(resolveHandText(workOrderFile(JSON.stringify({ ...fullWorkOrder, [field]: '  ' })))).toMatchObject({ kind: 'rejected' });
+    expect(resolveHandText(workOrderFile(JSON.stringify({ ...fullWorkOrder, [field]: '모름' })))).toMatchObject({ kind: 'rejected', reason: expect.stringContaining(field) });
+  }
+  expect(resolveHandText(workOrderFile(JSON.stringify(fullWorkOrder))).kind).toBe('work-order');
+});
+
+test('TA-BUDGET: tasks hand 가 지시서 예산의 time 을 발사 환경으로 싣는다 — Pod Job 수명 소비자가 읽는 키(usd 는 싣지 않는다)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ta-budget-env-'));
+  const file = join(root, 'budget.work-order.json');
+  writeFileSync(file, JSON.stringify({ ...fullWorkOrder, budget: 'time=1800s usd=2.5' }));
+  const envs: Array<Record<string, string>> = [];
+  try {
+    const response = await cli(['tasks', 'hand', file, '--seat', 'UX', '--live', '--json'], {
+      taskStatePath: join(root, 'task-agent-actions.json'),
+      coordinatorShadowRoot: join(root, 'repo'),
+      taskLauncher: (_args, _cwd, context) => { envs.push({ ...context!.env } as Record<string, string>); return { runId: context!.runId }; },
+    });
+    if (response.code !== 0) throw new Error(response.lines.join('\n'));
+    expect(envs).toHaveLength(1);
+    expect(envs[0]!.ELANOUS_TA_WALL_SEC).toBe('1800');
+    expect(Object.keys(envs[0]!).filter((key) => key.startsWith('ELANOUS_TA_'))).toEqual(['ELANOUS_TA_WALL_SEC']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+  // 지시서가 없거나 예산 형식이 틀리면 키를 싣지 않는다(발사를 막지도 않는다 — 거부는 후속 칸).
+  expect(taBudgetEnv(undefined)).toEqual({});
+  const parsed = parseWorkOrder(JSON.stringify(fullWorkOrder));
+  if (!parsed.ok) throw new Error(parsed.reason);
+  expect(taBudgetEnv({ ...parsed.order, budget: 'time=7200s usd=1' })).toEqual({});
+  expect(taBudgetEnv({ ...parsed.order, budget: '시간 4h' })).toEqual({});
 });
 
 test('TA-WORK-ORDER ③ 깨진 JSON 과 칸 id 없음은 kind rejected 와 사유를 돌려준다', () => {
@@ -2937,4 +2972,43 @@ test('TIER-SPLIT 조각 카드는 부모 칸(checklistId)을 그대로 잇고 �
     expect(out.slices.map((s) => [s.result?.card.checklistId, s.result?.card.tier, s.result?.launched])).toEqual([['TIER-CELL', '중', true], ['TIER-CELL', '하', true]]);
     expect(h.records[0]).toMatchObject({ cid: 'TIER-CELL', outcome: 'split' });
   } finally { h.off(); }
+});
+
+test('TA-PREFLIGHT ① launchArgs 는 정확 소스 pin 을 --source 로 싣는다', () => {
+  const sha = 'a'.repeat(40);
+  expect(launchArgs({ text: 'x', source: `commit:${sha}` })).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', '--source', `commit:${sha}`, 'x']);
+});
+
+test('TA-PREFLIGHT ① handTask 는 commit:<40hex> 아닌 --source 를 거부한다', async () => {
+  for (const bad of ['main', 'commit:abc', 'pr:12', `commit:${'A'.repeat(40)}`]) {
+    await expect(handTask({ text: 'x', source: bad } as never)).rejects.toThrow(/--source/);
+  }
+});
+
+test('tasks hand --mission 과 --source 를 같이 주면 거부 문구에 --source 가 보인다', async () => {
+  const path = statePath();
+  const r = await cli(['task', 'hand', '--mission', '- a\n- b', '--source', `commit:${'a'.repeat(40)}`], { taskStatePath: path });
+  expect(r.code).toBe(1);
+  expect(r.lines.join('\n')).toContain('--source');
+  expect(r.lines.join('\n')).toContain('과제 한 줄에만 준다');
+});
+
+test('TA-PREFLIGHT ② launchArgs 는 이미지 digest pin 을 --image-digest 로 싣는다(source 와 함께)', () => {
+  const dg = `sha256:${'a'.repeat(64)}`;
+  const sha = 'b'.repeat(40);
+  expect(launchArgs({ text: 'x', source: `commit:${sha}`, imageDigest: dg })).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', '--source', `commit:${sha}`, '--image-digest', dg, 'x']);
+  expect(launchArgs({ text: 'x' })).not.toContain('--image-digest');
+});
+
+test('TA-PREFLIGHT ② handTask 는 sha256:<64hex> 아닌 --image-digest 를 거부한다', async () => {
+  for (const bad of ['latest', 'sha256:abc', `sha256:${'A'.repeat(64)}`, `docker://x@sha256:${'a'.repeat(64)}`, `sha256:${'a'.repeat(64)}\n`, `sha256:${'a'.repeat(64)}\r\n`, ` sha256:${'a'.repeat(64)}`, `sha256:${'a'.repeat(64)} `]) {
+    await expect(handTask({ text: 'x', imageDigest: bad } as never)).rejects.toThrow(/--image-digest/);
+  }
+});
+
+test('TA-PREFLIGHT ② tasks hand --mission 과 --image-digest 를 같이 주면 거부 문구에 --image-digest 가 보인다', async () => {
+  const path = statePath();
+  const r = await cli(['task', 'hand', '--mission', '- a\n- b', '--image-digest', `sha256:${'a'.repeat(64)}`], { taskStatePath: path });
+  expect(r.code).toBe(1);
+  expect(r.lines.join('\n')).toContain('--image-digest');
 });

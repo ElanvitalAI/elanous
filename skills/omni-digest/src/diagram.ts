@@ -1,5 +1,6 @@
 /** Diagram generation — Mermaid inline (no external deps) + Excalidraw stub */
 
+import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
 import { env } from './env.js';
 import { compactText } from './util.js';
 
@@ -28,7 +29,7 @@ ${opts?.title ? `제목: ${opts.title}` : ''}
 콘텐츠:
 ${compactText(content, 6000)}`;
 
-  const res = await fetch('https://api.x.ai/v1/responses', {
+  const res = await llmNetworkFetch('https://api.x.ai/v1/responses', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
@@ -36,7 +37,7 @@ ${compactText(content, 6000)}`;
       input: [{ role: 'user', content: prompt }],
       temperature: 0.2,
     }),
-  });
+  }, { provider: 'grok', model, role: 'aux', requestedBy: 'omni-digest' });
   if (!res.ok) throw new Error(`Diagram generation failed: ${res.status}`);
   const data = await res.json();
   for (const item of data.output || [])

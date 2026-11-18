@@ -14,7 +14,7 @@ import type { Key } from '../../tui.js';
 import type { SidetabRow } from './list.js';
 import { createHerdrSidetabPortal, herdrPaneIdFromSidetabRow, type HerdrSidetabPortal } from './herdr-portal.js';
 import { createSidetabMissionBranch, type AgentCliDetection } from '../branches/sidetab/mission.js';
-import { readSidetabAgent, sendSidetabAgent, sidetabAgentLaunch, type SidetabAgent } from '../../tui-client/sidetab-agent-pty.js';
+import { readSidetabAgent, sendSidetabAgent, sendSidetabAgentKeys, sidetabAgentLaunch, sidetabAgentStatus, type SidetabAgent } from '../../tui-client/sidetab-agent-pty.js';
 import type { CompleteTerminalObservation, WorkspacePtyTarget } from '../../sidetab-core/workspace-input.js';
 import { createFullTranscriptCapture } from './full-transcript.js';
 
@@ -28,6 +28,8 @@ export interface SidetabAttachmentController {
   spawnSideAgent(agent: SidetabAgent): string | undefined;
   readSideAgent(row: SidetabRow): string | undefined;
   sendSideAgent(row: SidetabRow, input: string): Promise<boolean>;
+  sendSideAgentKeys(row: SidetabRow, names: readonly string[]): boolean;
+  sideAgentStatus(row: SidetabRow): ReturnType<typeof sidetabAgentStatus>;
   observeSidechat(target: WorkspacePtyTarget): CompleteTerminalObservation | undefined;
   runMission(agent: VisibleAgentCli, mission: string): Promise<Awaited<ReturnType<typeof runVisibleAgentMission>>>;
   runMissionPair(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
@@ -109,14 +111,14 @@ export function createSidetabAttachmentController(deps: {
   const releaseRemotePty = (host: string | null, id: string): void => {
     void enqueueRemoteOperation(host, id, () => runRemotePtyControl(host, id, 'release')).catch((error: unknown) => {
       deps.logEvent?.('sidetab.remote', 'release-failed', { host, ptyId: id, error: error instanceof Error ? error.message : String(error) });
-      deps.setStatus('PTY 해제 실패 · ' + (host ?? 'local') + ':' + id);
+      deps.setStatus('PTY detach failed · ' + (host ?? 'local') + ':' + id);
     });
   };
   const enqueueRemoteInput = (host: string | null, id: string, token: number, send: () => Promise<void>): void => {
     void enqueueRemoteOperation(host, id, async () => {
       if (remotePtyId !== id || remoteHost !== host || remoteAttachmentToken !== token || !remoteTakenOver) {
         deps.logEvent?.('sidetab.remote', 'send-cancelled', { host, ptyId: id, reason: 'attachment-changed-before-send' });
-        deps.setStatus('PTY 입력 취소 · 대상 전환으로 ' + (host ?? 'local') + ':' + id + '에 보내지 않았습니다');
+        deps.setStatus('PTY input cancelled · not sent to ' + (host ?? 'local') + ':' + id + ' on target switch');
         return;
       }
       try {
@@ -126,12 +128,12 @@ export function createSidetabAttachmentController(deps: {
         const attachmentChanged = remotePtyId !== id || remoteHost !== host || remoteAttachmentToken !== token;
         const reason = error instanceof Error ? error.message : String(error);
         deps.logEvent?.('sidetab.remote', 'send-failed', { host, ptyId: id, reason, attachmentChanged, outcome: 'unknown', userVisible: true });
-        deps.setStatus('PTY 입력 결과 불명(전송 여부 확인 불가) · ' + (host ?? 'local') + ':' + id + ' · ' + reason);
+        deps.setStatus('PTY input outcome unknown · ' + (host ?? 'local') + ':' + id + ' · ' + reason);
       }
     }).catch((error: unknown) => {
       const reason = error instanceof Error ? error.message : String(error);
       deps.logEvent?.('sidetab.remote', 'operation-failed', { host, ptyId: id, reason });
-      deps.setStatus('PTY 원격 작업 실패 · ' + (host ?? 'local') + ':' + id + ' · ' + reason);
+      deps.setStatus('PTY remote op failed · ' + (host ?? 'local') + ':' + id + ' · ' + reason);
     });
   };
 
@@ -139,7 +141,7 @@ export function createSidetabAttachmentController(deps: {
     const previous = herdrInputQueues.get(paneId) ?? Promise.resolve();
     let current: Promise<void>;
     current = previous.catch(() => {}).then(send).catch((error: unknown) => {
-      if (herdrPaneId === paneId) deps.setStatus(`Herdr 입력 실패 · ${error instanceof Error ? error.message : String(error)}`);
+      if (herdrPaneId === paneId) deps.setStatus(`Herdr input failed · ${error instanceof Error ? error.message : String(error)}`);
     }).finally(() => {
       if (herdrInputQueues.get(paneId) === current) herdrInputQueues.delete(paneId);
     });
@@ -172,7 +174,7 @@ export function createSidetabAttachmentController(deps: {
   const startHerdr = (row: SidetabRow): boolean => {
     const paneId = herdrPaneIdFromSidetabRow(row);
     if (!paneId || !herdrPortal.enabled()) {
-      deps.setStatus('Herdr 연결은 HERDR_ENV=1인 관리 세션에서만 사용할 수 있습니다');
+      deps.setStatus('Herdr connect requires an admin session with HERDR_ENV=1');
       return false;
     }
     stopRemote();
@@ -185,12 +187,12 @@ export function createSidetabAttachmentController(deps: {
         const frame = await herdrPortal.readPane(paneId);
         if (herdrPaneId === paneId) deps.drawRemoteFrame(frame);
       } catch (error) {
-        if (herdrPaneId === paneId) deps.setStatus(`Herdr pane 읽기 실패 · ${error instanceof Error ? error.message : String(error)}`);
+        if (herdrPaneId === paneId) deps.setStatus(`Herdr pane read failed · ${error instanceof Error ? error.message : String(error)}`);
       } finally { herdrFramePending = false; }
     };
     void refresh();
     herdrFrameTimer = setInterval(() => { void refresh(); }, 250);
-    deps.setStatus('Herdr pane 관측 · t takeover · Esc / Ctrl+\\ 복귀 · Ctrl+Q 전체 종료 (Ctrl+[는 Esc로 읽힐 수 있음)');
+    deps.setStatus('Herdr pane observe · t takeover · Esc / Ctrl+\\ back · Ctrl+Q quit all (Ctrl+[ may read as Esc)');
     return true;
   };
 
@@ -216,7 +218,7 @@ export function createSidetabAttachmentController(deps: {
         if (isCurrentAttachment() && result.status === 'success') {
           if (!result.screen?.trim()) {
             stopRemote();
-            deps.setStatus('PTY 화면이 비어 있어 채팅 화면을 유지합니다');
+            deps.setStatus('PTY screen empty · keeping chat view');
             return;
           }
           remoteHasFrame = true;
@@ -224,13 +226,13 @@ export function createSidetabAttachmentController(deps: {
         }
         else if (isCurrentAttachment() && result.status !== 'success') {
           if (!remoteHasFrame) stopRemote();
-          deps.setStatus(`PTY 화면 읽기 실패 · ${result.status}`);
+          deps.setStatus(`PTY screen read failed · ${result.status}`);
         }
       } catch (error) {
         if (isCurrentAttachment()) {
           if (host) debug.log('sidetab.remote', 'host-unreachable', { host, ptyId: id, reason: error instanceof Error ? error.message : String(error) });
           if (!remoteHasFrame) stopRemote();
-          deps.setStatus(`PTY 화면 읽기 오류 · ${error instanceof Error ? error.message : String(error)}`);
+          deps.setStatus(`PTY screen read error · ${error instanceof Error ? error.message : String(error)}`);
         }
       } finally {
         remoteFramePending = false;
@@ -238,7 +240,7 @@ export function createSidetabAttachmentController(deps: {
     };
     void refresh();
     remoteFrameTimer = setInterval(() => { void refresh(); }, host ? 1_000 : 75);
-    deps.setStatus('원격 PTY 화면 · t takeover · Ctrl+\\ 후 ↑/↓ 전환');
+    deps.setStatus('Remote PTY screen · t takeover · Ctrl+\\ then ↑/↓ switch');
     return true;
   };
 
@@ -252,11 +254,11 @@ export function createSidetabAttachmentController(deps: {
       onClose: () => {
         registry.detach(session.id);
         attachedSessionId = null;
-        deps.setStatus('PTY 분리됨 · 사이드탭에서 다시 선택 가능');
+        deps.setStatus('PTY detached · reselect in sidetab');
         deps.drawBase();
       },
     });
-    deps.setStatus('PTY 입력 중 · Ctrl+\\ d 분리 · Ctrl+Q는 PTY에 전달');
+    deps.setStatus('PTY input · Ctrl+\\ d detach · Ctrl+Q passes to PTY');
     coordinator.requestRenderNow({ force: true });
     return true;
   };
@@ -264,7 +266,7 @@ export function createSidetabAttachmentController(deps: {
   const spawn = (character: SidetabCharacter, background = false): boolean => {
     const { cols, rows } = deps.termSize();
     if (cols < 40 || rows < 8) {
-      deps.setStatus('PTY 모달은 최소 40칸 × 8줄이 필요합니다');
+      deps.setStatus('PTY modal needs at least 40 cols × 8 rows');
       return false;
     }
     const id = `next-sidetab-${randomUUID()}`;
@@ -313,7 +315,7 @@ export function createSidetabAttachmentController(deps: {
           if (attachedSessionId === id) {
             modalRouter.set(null);
             attachedSessionId = null;
-            deps.setStatus(`${title} 종료됨 · 사이드탭으로 돌아옴`);
+            deps.setStatus(`${title} exited · back to sidetab`);
             deps.drawBase();
           }
         },
@@ -321,16 +323,16 @@ export function createSidetabAttachmentController(deps: {
       lastSpawnedSession = session;
       transcripts.set(session.id, transcript);
       if (character === 'codex' || character === 'claude' || character === 'hermes') {
-        deps.setStatus(`${character} 실행 · agent-mission 구독 경로 scrub 적용(${unsetEnv?.length ?? 0}개 env 제거)`);
+        deps.setStatus(`${character} started · agent-mission subscribe path scrub (${unsetEnv?.length ?? 0} env removed)`);
       }
       if (background) {
         registry.detach(session.id);
-        deps.setStatus(`${character} 사이드탭 PTY 실행 · ${session.id}`);
+        deps.setStatus(`${character} sidetab PTY started · ${session.id}`);
         return true;
       }
       return setModal(session);
     } catch (error) {
-      deps.setStatus(`${character} 실행 실패: ${error instanceof Error ? error.message : String(error)}`);
+      deps.setStatus(`${character} start failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
   };
@@ -378,11 +380,11 @@ export function createSidetabAttachmentController(deps: {
       }
       const session = sessionForRow(row);
       if (!session) {
-        deps.setStatus('이 항목은 Next TUI에서 만든 세션이 아닙니다 · shell/agent 세션만 attach할 수 있습니다');
+        deps.setStatus('Not a Next TUI session · only shell/agent sessions can attach');
         return false;
       }
       if (session.state === 'exited') {
-        deps.setStatus('종료된 PTY는 attach할 수 없습니다');
+        deps.setStatus('Cannot attach an exited PTY');
         return false;
       }
       const { cols, rows } = deps.termSize();
@@ -409,22 +411,28 @@ export function createSidetabAttachmentController(deps: {
     sendSideAgent(row, input) {
       return row.sessionId ? sendSidetabAgent(registry, row.sessionId, input) : Promise.resolve(false);
     },
+    sendSideAgentKeys(row, names) {
+      return row.sessionId ? sendSidetabAgentKeys(registry, row.sessionId, names) : false;
+    },
+    sideAgentStatus(row) {
+      return row.sessionId ? sidetabAgentStatus(registry, row.sessionId) : undefined;
+    },
     runMission: missionBranch.runMission,
     runMissionPair: missionBranch.runMissionPair,
     kill(row) {
       if (row.currentProcess) {
-        deps.setStatus('현재 TUI 세션은 사이드탭에서 종료할 수 없습니다');
+        deps.setStatus('Current TUI session cannot be killed from sidetab');
         return false;
       }
       const session = sessionForRow(row);
       if (!session) {
         if (row.ptyId) {
           void requestRemotePtyControl(row.ptyId, 'terminate', undefined, { timeoutMs: 1_000 }).then((result) => {
-            deps.setStatus(result.status === 'success' ? 'PTY 종료 요청 완료' : `PTY 종료 거부 · ${result.status}`);
-          }).catch((error: unknown) => deps.setStatus(`PTY 종료 오류 · ${error instanceof Error ? error.message : String(error)}`));
+            deps.setStatus(result.status === 'success' ? 'PTY kill requested' : `PTY kill refused · ${result.status}`);
+          }).catch((error: unknown) => deps.setStatus(`PTY kill error · ${error instanceof Error ? error.message : String(error)}`));
           return true;
         }
-        deps.setStatus('이 항목은 이 Next TUI에서 종료할 수 없습니다');
+        deps.setStatus('This item cannot be killed from this Next TUI');
         return false;
       }
       if (attachedSessionId === session.id) {
@@ -439,29 +447,29 @@ export function createSidetabAttachmentController(deps: {
       if (herdrPaneId) {
         if (key.name.toLowerCase() === 'escape') {
           stopHerdr();
-          deps.setStatus('Herdr pane에서 복귀');
+          deps.setStatus('Back from Herdr pane');
           return true;
         }
         if (key.ctrl && key.name.toLowerCase() === 'q') {
           stopHerdr();
-          deps.setStatus('Herdr pane에서 복귀');
+          deps.setStatus('Back from Herdr pane');
           return false;
         }
         if (key.ctrl && (key.name === '\\' || key.raw === '\x1c')) {
           stopHerdr();
-          deps.setStatus('Herdr pane에서 복귀');
+          deps.setStatus('Back from Herdr pane');
           return false;
         }
         if (key.name.toLowerCase() === 't' && !herdrTakenOver) {
           herdrTakenOver = true;
-          deps.setStatus('Herdr pane takeover · Esc로 복귀');
+          deps.setStatus('Herdr pane takeover · Esc to return');
           return true;
         }
         const raw = key.raw;
         if (herdrTakenOver && raw) {
           const paneId = herdrPaneId;
           if (raw.includes('\x00')) {
-            deps.setStatus('NUL 입력은 Herdr pane에 보낼 수 없습니다');
+            deps.setStatus('Cannot send NUL input to Herdr pane');
             return true;
           }
           const send = (raw.length === 1 && (raw.charCodeAt(0) < 32 || raw.charCodeAt(0) === 0x7f)) || raw.startsWith('\x1b')
@@ -489,9 +497,9 @@ export function createSidetabAttachmentController(deps: {
               return;
             }
             remoteTakenOver = true;
-            deps.setStatus('사람 입력 takeover 완료 · 전환 때 release');
+            deps.setStatus('Human input takeover done · release on switch');
           }).catch((error: unknown) => {
-            if (remotePtyId === id && remoteHost === host && remoteAttachmentToken === token) deps.setStatus(`takeover 오류 · ${error instanceof Error ? error.message : String(error)}`);
+            if (remotePtyId === id && remoteHost === host && remoteAttachmentToken === token) deps.setStatus(`takeover error · ${error instanceof Error ? error.message : String(error)}`);
           });
           return true;
         }
@@ -524,13 +532,13 @@ export function createSidetabAttachmentController(deps: {
           coordinator.requestRenderNow({ force: true });
           return true;
         }
-        deps.setStatus('분리 취소 · Ctrl+\\ d 를 눌러 분리');
+        deps.setStatus('Detach cancelled · press Ctrl+\\ d to detach');
         coordinator.requestRenderNow({ force: true });
         return true;
       }
       if (key.ctrl && key.name === '\\') {
         detachPrefixPending = true;
-        deps.setStatus('분리 키 대기 · d');
+        deps.setStatus('Waiting for detach key · d');
         return true;
       }
       const routed = modalRouter.handleKey({

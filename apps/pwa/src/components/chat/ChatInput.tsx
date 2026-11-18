@@ -1,31 +1,23 @@
 'use client';
 
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
-import { Send, Paperclip, X, Mic, MicOff } from 'lucide-react';
+import { Send, Paperclip, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { isMetaCommand, META_COMMANDS } from '@/lib/chat-runtime';
 import { SHARE_PREFILL_EVENT, takeSharePrefill } from '@/lib/share-prefill';
 import { cn } from '@/lib/utils';
-import { CameraAttachButton } from '@/components/terminal/CameraAttachButton';
 import { FileAttachButton } from '@/components/terminal/FileAttachButton';
-import { SaveAsNoteButton } from '@/components/notes/SaveAsNoteButton';
-import { ShowroomVoiceIntake } from '@/components/showroom/ShowroomVoiceIntake';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import type { AttachmentMeta } from '@/lib/upload-attachment';
-import type { VoicePhase } from '@/voice/use-voice-controller';
 import {
   clearSnapshot,
   loadSnapshot,
   saveSnapshot,
   snapshotKey,
 } from '@/lib/snapshot';
-import { ElanousProviderChip } from '@/components/chat/ElanousProviderChip';
-import { useMissionRouter } from '@/lib/use-mission-router';
-import { DEFAULT_CHAT_ROUTING, getChatRouting, subscribeChatRouting } from '@/lib/chat-routing-storage';
 import { SeatRequestError, type SeatRequestReceipt, type SeatSummary } from '@/lib/daemon-client';
 import { debugLog } from '@/lib/debug';
-import { SeatPicker } from './SeatPicker';
 
 const INPUT_PERSIST_DEBOUNCE_MS = 300;
 const EMPTY_ATTACHMENTS: AttachmentMeta[] = [];
@@ -134,23 +126,6 @@ function detectTrailingToken(value: string, trigger: '@' | '$'): string | null {
   return after;
 }
 
-/** Phase 1 (PWA chat ↔ voice 일원화 · 2026-05-07) — voice mirror props
- *  passed from ChatLayout. The header mic toggle and the inline mic
- *  inside ChatInput share one controller: pressing either flips the
- *  same active state and the same phase indicator. ChatLayout owns the
- *  controller; ChatInput just renders + emits toggle. */
-interface ChatInputVoiceProps {
-  active: boolean;
-  phase: VoicePhase;
-  /** Pre-resolved tailwind bg-* class for the phase dot, so ChatInput
-   *  doesn't need its own VoicePhase → color map (single source of truth
-   *  in ChatLayout). */
-  dotColor: string;
-  phaseLabel: string;
-  disabled?: boolean;
-  onToggle: () => void;
-}
-
 interface Props {
   onSubmit: (text: string) => void;
   disabled?: boolean;
@@ -160,10 +135,6 @@ interface Props {
   attachments?: AttachmentMeta[];
   onAttached?: (entries: AttachmentMeta[]) => void;
   onRemoveAttachment?: (id: string) => void;
-  /** Phase 1 — voice controller state mirror (optional · falls back to
-   *  no mic button when ChatInput is mounted outside ChatLayout, e.g.
-   *  legacy callsites). */
-  voice?: ChatInputVoiceProps;
   /** PWA Phase 2·A — `@` file picker fetcher. parent (ChatLayout) 가
    *  AcpConnection.send('elanous/fs/list', ...) 으로 wire. nil 시 picker
    *  disabled (no overlay). */
@@ -199,14 +170,12 @@ export function ChatInput({
   attachments = EMPTY_ATTACHMENTS,
   onAttached,
   onRemoveAttachment,
-  voice,
   onListFiles,
   onListSkills,
   prefill,
 }: Props) {
   const { client, config } = useDaemon();
   const [seats, setSeats] = useState<SeatSummary[]>([]);
-  const [selectedSeat, setSelectedSeat] = useState<string | null>(null);
   const [seatReceipts, setSeatReceipts] = useState<SeatRequestReceipt[]>([]);
   const [seatAskMessages, setSeatAskMessages] = useState<Array<{ id: string; text: string }>>([]);
   const seatAskClientId = useRef<string | null>(null);
@@ -349,25 +318,6 @@ export function ChatInput({
   const skillQuery = onListSkills ? detectTrailingToken(value, '$') : null;
   const [skillEntries, setSkillEntries] = useState<SkillPickerEntry[]>([]);
   const [skillSelectedIndex, setSkillSelectedIndex] = useState<number>(0);
-  const [routing, setRouting] = useState(DEFAULT_CHAT_ROUTING);
-  useEffect(() => {
-    setRouting(getChatRouting());
-    return subscribeChatRouting(setRouting);
-  }, []);
-  const { prediction, predict, clear } = useMissionRouter({
-    baseUrl: config.baseUrl,
-    token: config.token,
-    enabled: routing.autoRouting,
-  });
-  useEffect(() => {
-    if (!routing.autoRouting) {
-      clear();
-      return;
-    }
-    const attachmentKinds = attachments.map((a): 'image' | 'document' =>
-      a.mediaType?.startsWith('image/') ? 'image' : 'document');
-    predict(value, attachmentKinds);
-  }, [value, routing.autoRouting, attachments, predict, clear]);
   useEffect(() => {
     if (skillQuery === null || !onListSkills) return;
     setSkillSelectedIndex(0);
@@ -465,12 +415,6 @@ export function ChatInput({
       retryRef.current = request;
       if (error instanceof SeatRequestError && error.code === 'unknown-seat') {
         setSeats(error.seats);
-        // 고른 자리가 서버 목록에서 사라졌으면 선택을 풀어 일반 채팅으로 돌아간다 — 숨은 선택이 남으면
-        // 해제할 칩도 없이 다음 글까지 없는 자리로 간다(리뷰 3라운드 must-fix).
-        if (selectedSeat && !error.seats.some((seat) => seat.id === selectedSeat)) {
-          setSelectedSeat(null);
-          retryRef.current = null;
-        }
         setSeatError(`그 자리를 찾지 못했습니다 — ${error.seats.map((seat) => seat.title).join(', ')}`);
       } else if (error instanceof SeatRequestError && error.code === 'attachments-unsupported') {
         setSeatError('이 자리는 첨부를 받지 않습니다');
@@ -493,18 +437,13 @@ export function ChatInput({
       return;
     }
     const addressed = /^@\S+\s+[\s\S]*\S$/.test(text.trimEnd());
-    if ((addressed || selectedSeat) && attachments.length > 4) {
+    // WEB-CHAT-MINIMAL-SURFACE: the seat chips (COO·CMO·CTO·CXO) were removed; «@seat text» still addresses a seat.
+    if (addressed && attachments.length > 4) {
       setSeatError('자리 요청 첨부는 4개까지');
       return;
     }
-    if (selectedSeat && !trimmed && attachments.length) {
-      setSeatError('자리 요청 내용을 입력해 주세요');
-      return;
-    }
-    if ((addressed || selectedSeat) && trimmed) {
-      const request = addressed
-        ? { text: trimmed, attachments: [...attachments], key: crypto.randomUUID() }
-        : { seat: selectedSeat!, text: trimmed, attachments: [...attachments], key: crypto.randomUUID() };
+    if (addressed && trimmed) {
+      const request: { seat?: string; text: string; attachments: AttachmentMeta[]; key: string } = { text: trimmed, attachments: [...attachments], key: crypto.randomUUID() };
       const retry = retryRef.current;
       const same = retry && retry.seat === request.seat && retry.text === request.text
         && retry.attachments.length === request.attachments.length
@@ -789,7 +728,6 @@ export function ChatInput({
       </div>)}
       {seatAskMessages.map((message) => <p key={message.id} role="status" className="mb-2 rounded-md border border-border px-3 py-2 text-sm">{message.text}</p>)}
       {seatError && <p role="alert" className="mb-2 text-sm text-destructive">{seatError}</p>}
-      <SeatPicker seats={seats} selected={selectedSeat} onSelect={(seat) => { setSelectedSeat(seat); setSeatError(''); }} disabled={disabled || seatPending} />
       {/* PWA Phase 4·F — reverse history search overlay (priority 최상위). */}
       {reverseSearchActive && (
         <div className="mb-2 overflow-hidden rounded-md border border-border bg-card shadow-md">
@@ -1002,34 +940,11 @@ export function ChatInput({
       {/* 폰 폭(2026-09-30 실측 390px): 도구 묶음이 한 줄을 다 먹어 입력칸이 손가락 폭으로 줄었다 →
           좁은 화면에선 도구를 윗줄 전체 폭으로, 입력칸·보내기를 아랫줄로. */}
       <div className="relative flex flex-wrap items-end gap-2 sm:flex-nowrap">
-        {/* Attach buttons — same Camera/File widgets as /term toolbar.
-            onAttached bubbles each upload to ChatLayout's pending queue.
-            R2 (BACKLOG-pwa-mobile-readiness §2.3 · 2026-05-09) — voice
-            intake mic next to file/camera so /chat absorbs the same
-            "long-press → STT → POST /v1/intake" affordance the showroom
-            shipped at #2069. Distinct from the chat-voice-toggle-inline
-            mic on the right (which auto-broadcasts captured text via
-            the daemon WS); the intake mic stores the memo on the intake
-            plane (separate destination · review modal before commit).
-            Component is named "Showroom*" for historical reasons but is
-            surface-agnostic — uses useDaemon + Web Speech + intake REST. */}
-        <div className="flex shrink-0 basis-full items-center gap-0.5 pb-1 sm:basis-auto" data-elanous-composer-tools>
-          <CameraAttachButton onAttached={onAttached ? (entry) => onAttached([entry]) : undefined} />
+        {/* WEB-CHAT-MINIMAL-SURFACE (대표 11-17): one attach button (files and photos; the phone offers its camera
+            from the same picker). Camera, note, voice memo and provider chips were removed
+            (backup tag archive/pwa-pre-minimal-20261117). */}
+        <div className="flex shrink-0 items-center gap-0.5 pb-1" data-elanous-composer-tools>
           <FileAttachButton onAttached={onAttached} />
-          {/* R-OCR.2.1 (2026-05-09) — separate button from CameraAttach
-              because the intent is offline note capture, NOT a chat
-              attachment. Long-press dispatch was the alt; a sibling
-              icon is more discoverable + avoids gesture collisions on
-              touch devices where long-press already disambiguates a
-              text-selection menu. */}
-          <SaveAsNoteButton />
-          <ShowroomVoiceIntake />
-          <ElanousProviderChip />
-          {routing.autoRouting && prediction && (
-            <span className="text-xs text-muted-foreground" title="입력 의도 분류 · ACP 송신 경로는 변경하지 않습니다">
-              {prediction.mission}
-            </span>
-          )}
         </div>
         <textarea
           value={value}
@@ -1044,39 +959,6 @@ export function ChatInput({
             disabled && 'opacity-60',
           )}
         />
-        {/* Phase 1 (voice 일원화) — inline mic mirror. State source-of-
-            truth lives in ChatLayout's useVoiceController; this button
-            just toggles it. Auto-send (Q2=B2) means STT final goes
-            through `onSubmit` from the controller's onTranscript wire,
-            not through this button click. */}
-        {voice && (
-          <button
-            type="button"
-            onClick={voice.onToggle}
-            disabled={voice.disabled}
-            title={voice.disabled ? 'daemon URL 미설정' : voice.phaseLabel}
-            data-elanous-action="chat-voice-toggle-inline"
-            className={cn(
-              'inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border transition-colors',
-              voice.active
-                ? 'border-rose-500/40 bg-rose-500/10 text-rose-600 hover:bg-rose-500/20'
-                : 'border-input bg-background text-foreground hover:bg-muted',
-              voice.disabled && 'cursor-not-allowed opacity-50',
-            )}
-          >
-            <span className="relative inline-flex">
-              {voice.active ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
-              <span
-                aria-hidden
-                className={cn(
-                  'absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full',
-                  voice.dotColor,
-                  (voice.phase === 'listening' || voice.phase === 'speaking') && 'animate-pulse',
-                )}
-              />
-            </span>
-          </button>
-        )}
         <Button onClick={submit} disabled={disabled || seatPending || (!value.trim() && attachments.length === 0)} size="sm">
           <Send className="h-4 w-4" />
         </Button>

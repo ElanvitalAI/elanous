@@ -1200,6 +1200,24 @@ describe('all same-head reviews decide together (already-ancestor-auto)', () => 
     expect(decide([full], () => passBody())).toEqual({ ok: true, reviewResult: `${STD_DIR}/${full}` });
   });
 
+  // REVIEW-NO-SILENT-GLM-FALLBACK (#38331): the producer marks requested engine ≠ responded engine `invalid: true`.
+  test('refuses an invalid (requested ≠ responded engine) review; old and valid new result files still parse', () => {
+    const name = `pr-${PR}-${HEAD.slice(0, 12)}.json`;
+    const glmAsClaude = passBody({ model: 'openrouter/z-ai/glm-5.3', respondedModel: 'openrouter/z-ai/glm-5.3', reviewRoute: 'api',
+      fallbackAttempted: true, claudeFallbackGlm: { model: 'openrouter/z-ai/glm-5.3', glmReviewed: true },
+      invalid: true, invalidReason: 'responded-model-mismatch', requestedEngine: 'claude', respondedEngine: 'glm' });
+    expect(decide([name], () => glmAsClaude)).toEqual({ ok: false, reason: 'review-invalid-responded-model-mismatch' });
+    // An unrecognised reason text is not echoed into the refusal code.
+    expect(decide([name], () => passBody({ invalid: true, invalidReason: 'Bad Reason!' })))
+      .toEqual({ ok: false, reason: 'review-invalid-unspecified' });
+    // Old files (no `invalid`) and new valid files (`invalid: false` ⊕ ACP respondedModel) keep today's contract.
+    expect(decide([name], () => passBody({ model: 'acp:claude/opus', respondedModel: null })))
+      .toEqual({ ok: true, reviewResult: `${STD_DIR}/${name}` });
+    expect(decide([name], () => passBody({ model: 'acp:claude/opus', respondedProvider: 'acp:claude',
+      respondedModel: 'claude-opus-4-5', invalid: false, requestedEngine: 'claude', respondedEngine: 'claude' })))
+      .toEqual({ ok: true, reviewResult: `${STD_DIR}/${name}` });
+  });
+
   test('ignores head prefixes shorter than 10, longer than 40 and other PRs', () => {
     expect(decide([
       `card-${PR}-${HEAD.slice(0, 9)}.json`,

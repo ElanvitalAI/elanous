@@ -18,7 +18,7 @@ test('/app resolves to the optional app branch and validates the existing app co
   try {
     writeFileSync(join(directory, 'app.yaml'), 'apiVersion: elanous.app/v0\nslug: example\ntitle: Example\nfrontend: { kind: static-export }\n');
     await runNextTuiAppBranchRoute('/app check', host);
-    expect(chatLines.join('\n')).toContain('example · Example · app.yaml 유효');
+    expect(chatLines.join('\n')).toContain('example · Example · app.yaml valid');
     writeFileSync(join(directory, 'app.yaml'), 'not: an app\n');
     await runNextTuiAppBranchRoute('/app check', host);
     expect(chatLines.at(-1)).toContain('app.yaml:');
@@ -34,7 +34,7 @@ test('/app simulate sends the real service argv through the isolated CLI boundar
     seen.cwd = options.cwd;
     const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
     queueMicrotask(() => { child.stdout.end('시나리오 | passed\n영수증 | isolated-receipt\n'); child.emit('close', 0); });
-    return child as ChildProcess;
+    return child as unknown as ChildProcess;
   }) as typeof import('../../../instance/spawn-elanous.js').spawnElanous;
   try {
     writeFileSync(join(directory, 'app.yaml'), 'apiVersion: elanous.app/v0\nslug: example\ntitle: Example\nfrontend: { kind: static-export }\n');
@@ -67,15 +67,15 @@ test('/app uses the existing simulation, lifecycle and secret services without e
     await runNextTuiAppBranchRoute('/app secrets .', host, services);
     expect(calls).toEqual([`simulate:${directory}:happy`, 'lifecycle:example', 'lifecycle:example']);
     expect(chatLines.join('\n')).toContain('영수증 | test-receipt');
-    expect(chatLines.join('\n')).toContain('cred:openai.api_key · 있음');
-    expect(chatLines.join('\n')).toContain('cred:higgsfield.secret · 비어 있음');
-    expect(chatLines.join('\n')).toContain('앱 전용 비밀 있음: KEY');
+    expect(chatLines.join('\n')).toContain('cred:openai.api_key · set');
+    expect(chatLines.join('\n')).toContain('cred:higgsfield.secret · empty');
+    expect(chatLines.join('\n')).toContain('App-only secrets: KEY');
     expect(chatLines.join('\n')).not.toContain('OTHER');
     writeFileSync(join(directory, 'app.yaml'), 'apiVersion: elanous.app/v0\nslug: example\ntitle: Example\nfrontend: { kind: static-export }\n');
     chatLines.length = 0;
     await runNextTuiAppBranchRoute('/app secrets .', host, services);
-    expect(chatLines).toContain('선언된 공통 자격 슬롯 없음');
-    expect(chatLines).toContain('앱 전용 비밀 있음: KEY');
+    expect(chatLines).toContain('No declared shared credential slots');
+    expect(chatLines).toContain('App-only secrets: KEY');
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -94,11 +94,11 @@ test('/app history offers older pages instead of silently discarding events', as
   try {
     writeFileSync(join(directory, 'app.yaml'), 'apiVersion: elanous.app/v0\nslug: example\ntitle: Example\nfrontend: { kind: static-export }\n');
     await runNextTuiAppBranchRoute('/app history .', host, services);
-    expect(chatLines.join('\n')).toContain('이전 기록 1건 · /app history . 2');
+    expect(chatLines.join('\n')).toContain('Older history 1 · /app history . 2');
     expect(chatLines.join('\n')).not.toContain('event-0');
     chatLines.length = 0;
     await runNextTuiAppBranchRoute('/app history . 2', host, services);
     expect(chatLines.join('\n')).toContain('event-0');
-    expect(chatLines.join('\n')).toContain('최신 기록 · /app history . 1');
+    expect(chatLines.join('\n')).toContain('Newer history · /app history . 1');
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

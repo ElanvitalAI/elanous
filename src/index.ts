@@ -65,7 +65,7 @@ applyConfigDirFlagFromArgv();
 
 // Only unambiguous root commands take the small registrar path. Root help,
 // unknown commands and unrecognized global flags keep the complete tree.
-const INDEX_FAST_ROOTS = new Set(['a2a', 'agent-env', 'away', 'bench', 'brief', 'card', 'connect', 'control', 'docs', 'doctor', 'fleet', 'flow', 'freeze', 'graph', 'guardian', 'import', 'intake', 'know', 'labels', 'launch-head', 'leader', 'live', 'llm', 'loop', 'machine', 'make', 'memory', 'msg', 'notify', 'ops', 'outputs', 'plugin', 'pod', 'provider', 'pty', 'publish', 'questions', 'relay', 'release', 'repo', 'research', 'resource', 'retro', 'role', 'runs', 'schedule', 'seat', 'shadow', 'skills', 'start', 'storage', 'tasks', 'where']);
+const INDEX_FAST_ROOTS = new Set(['a2a', 'agent-env', 'away', 'bench', 'brief', 'card', 'connect', 'control', 'docs', 'doctor', 'fleet', 'flow', 'freeze', 'graph', 'guardian', 'import', 'intake', 'know', 'labels', 'launch-head', 'leader', 'live', 'llm', 'loop', 'machine', 'make', 'memory', 'msg', 'notify', 'ops', 'outputs', 'plugin', 'pod', 'provider', 'pty', 'publish', 'questions', 'relay', 'release', 'repo', 'research', 'resource', 'retro', 'role', 'runs', 'schedule', 'seat', 'shadow', 'skills', 'start', 'statusline', 'storage', 'tasks', 'where']);
 function selectedIndexFastRoot(args: readonly string[]): string | undefined {
   if (process.env.ELANOUS_TEST_FLAG_AUDIT === '1') return undefined;
   let index = 0;
@@ -174,6 +174,10 @@ const registerSeatBootCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'seat'
 const registerPtyTakeoverCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'pty'
   ? (() => undefined)
   : (require('./cli/pty-takeover-cli.js') as typeof import('./cli/pty-takeover-cli.js')).registerPtyTakeoverCommands) as typeof import('./cli/pty-takeover-cli.js').registerPtyTakeoverCommands;
+// `side` is not an INDEX_FAST_ROOT: its options (--ws/--cwd) must stay on the full parser.
+const registerElsCommands = (INDEX_FAST_ROOT
+  ? (() => undefined)
+  : (require('./cli/els-cli.js') as typeof import('./cli/els-cli.js')).registerElsCommands) as typeof import('./cli/els-cli.js').registerElsCommands;
 const registerPtyRecordCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'pty'
   ? (() => undefined)
   : (require('./cli/pty-record-cli.js') as typeof import('./cli/pty-record-cli.js')).registerPtyRecordCommand) as typeof import('./cli/pty-record-cli.js').registerPtyRecordCommand;
@@ -299,6 +303,9 @@ const registerAppCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'app'
 const registerAgentCommands = (INDEX_FAST_ROOT
   ? (() => undefined)
   : (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).registerAgentCommands) as typeof import('./cli/agent-cli.js').registerAgentCommands;
+const registerStatuslineCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'statusline'
+  ? (() => undefined)
+  : (require('./cli/statusline-cli.js') as typeof import('./cli/statusline-cli.js')).registerStatuslineCommands) as typeof import('./cli/statusline-cli.js').registerStatuslineCommands;
 const registerControlCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'control'
   ? (() => undefined)
   : (require('./cli/control-cli.js') as typeof import('./cli/control-cli.js')).registerControlCommands) as typeof import('./cli/control-cli.js').registerControlCommands;
@@ -1142,6 +1149,7 @@ async function runDevSayFromWords(
 
 registerPtyTakeoverCommands(program);
 registerPtyRecordCommand(program.commands.find((command) => command.name() === 'pty')!);
+registerElsCommands(program);
 program.command('tui')
   .description('test-universe TUI helpers')
   .command('test')
@@ -1506,6 +1514,7 @@ hqCmd.command('fence').description('이 호스트가 임대를 쥐었을 때만 
 const seatCmd = program.command('seat').description('분배된 자리의 하루 루프와 보고');
 registerSeatBootCommands(seatCmd);
 registerSeatRequestsCommands(seatCmd);
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'seat') (require('./cli/seat-say-cli.js') as typeof import('./cli/seat-say-cli.js')).registerSeatSayCommand(seatCmd);
 seatCmd.command('asks').description('최근 CTO 되묻기 왕복과 10분 판정')
   .option('--since <duration>', '조회 창 (예: 24h)', '24h')
   .option('--json', 'JSON 출력')
@@ -5797,6 +5806,9 @@ const selfOrchestrateCmd = selfCmd
             ...(podSource.kind === 'bundle' ? { headCommit: podSource.headCommit, sizeBytes: podSource.sizeBytes } : {}),
           });
         }
+        const podImageDigest = (opts as { podImageDigest?: string }).podImageDigest;
+        const { isImageDigestPin } = await import('./task-orchestrator/surfaces/pod-image-digest-check.js');
+        if (podImageDigest !== undefined && !isImageDigestPin(podImageDigest)) { ui.error('--pod-image-digest: sha256:<64자 소문자 16진> 형식이어야 합니다'); process.exit(2); }
         const childFlags = opts as { childLlmProvider?: string; childLlmModel?: string; childLlmEffort?: string };
         const podChildLlm = childFlags.childLlmProvider?.trim() ? { childProviderExplicit: true, ...(childFlags.childLlmModel?.trim() ? { childModel: childFlags.childLlmModel.trim() } : {}), ...(childFlags.childLlmEffort?.trim() ? { childEffort: childFlags.childLlmEffort.trim() } : {}) } : {};
         if (childFlags.childLlmProvider?.trim()) debug.log('self-implement.pod', 'child-provider-named', { provider: childFlags.childLlmProvider.trim(), model: childFlags.childLlmModel ?? null, podProvider });
@@ -5814,7 +5826,7 @@ const selfOrchestrateCmd = selfCmd
           return identity;
         };
         const warmReuseEvidence = () => loadWarmReuseEvidenceByConsumer(warmReuseIdentity());
-        const podBase = { ...repoOptions, hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence, warmReuseIdentity, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
+        const podBase = { ...repoOptions, hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence, warmReuseIdentity, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(podImageDigest ? { imageDigestPin: podImageDigest } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -5925,6 +5937,7 @@ selfOrchestrateCmd
   .addOption(new Option('--no-supervise', '⛔ 런 슈퍼바이저를 «끈다»(대표 2026-08-22 ***기본 ON***) — 켜져 있으면 런이 끝나면 실패를 «트리아지»해서 다시 걸 것이 있으면 «스스로» 재개한다(골루프처럼 끝까지). 정지 사유는 converged|needs-human|max-rounds|no-progress 로 각각 «다른 값»으로 말한다. 관측=elanous logs --category self-dev.supervisor').hideHelp())
   .addOption(new Option('--supervise-rounds <n>', '슈퍼바이저 재개 라운드 상한 (기본 3 · 끄려면 --no-supervise)').hideHelp())
   .addOption(new Option('--json', '구조화 출력 [{taskId, feature, status, stage?, prUrl?, merged?, error?}]').hideHelp())
+  .addOption(new Option('--pod-image-digest <sha256:digest>', 'pod: 요청 이미지 digest pin — 소비 digest 와 대조(불일치·미관측이면 런 실패)').hideHelp())
   .addOption(new Option('--pod-source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · 없으면 기본 clone').hideHelp())
   .addOption(new Option('--repair-commit-only <expected-head>', 'pod: 기존 PR head에서 재작업하고 PR 생성 없이 커밋 bundle을 돌려준다').hideHelp());
 
@@ -6506,6 +6519,8 @@ selfCmd
       ...(configuredReviewModel ? { configuredReviewModel } : {}),
       ...(configuredReviewModel && reviewRoleSpec?.provider ? { configuredReviewProvider: reviewRoleSpec.provider } : {}),
       ...(configuredAcpBackend ? { configuredAcpBackend } : {}),
+      // REVIEW-NO-SILENT-GLM-FALLBACK — 내부 문서 `MANUAL-user-config` `acp.reviewClaudeGlmFallback` (default off).
+      ...(reviewConfig.acp.reviewClaudeGlmFallback === true ? { claudeGlmFallback: true } : {}),
       ...(roleReviewerSelection ? { roleReviewer: roleReviewerSelection.spec } : {}),
       ...(contextOrder.length > 0 ? { contextOrder } : {}),
     }, {
@@ -6561,7 +6576,8 @@ selfCmd
         return async (prompt: string, images?: readonly ReviewImage[]) => {
           if (!made) {
             const { makeLazyAcpReviewLLM } = await import('./agent-substrate/acp-reviewer.js');
-            made = makeLazyAcpReviewLLM({ cwd: o.cwd ?? process.cwd(), backend: o.backend, model: o.model, timeoutMs: o.timeoutMs });
+            made = makeLazyAcpReviewLLM({ cwd: o.cwd ?? process.cwd(), backend: o.backend, model: o.model, timeoutMs: o.timeoutMs,
+              ...(o.onResolved ? { onResolved: o.onResolved } : {}) });
           }
           return made(prompt, images);
         };
@@ -6577,7 +6593,8 @@ selfCmd
         // handshakeTimeoutMs left to the adapter default (min(timeoutMs, 60s)) — the harness lane passes none either.
         return {
           backend: 'claude',
-          llm: makeRoleAcpReviewLLM({ cwd: o.cwd ?? process.cwd(), backend: 'claude', backendSpec: spawn.backendSpec, env: spawn.env, timeoutMs: o.timeoutMs }),
+          llm: makeRoleAcpReviewLLM({ cwd: o.cwd ?? process.cwd(), backend: 'claude', backendSpec: spawn.backendSpec, env: spawn.env, timeoutMs: o.timeoutMs,
+            ...(o.onResolved ? { onResolved: o.onResolved } : {}) }),
         };
       },
       // SUBSCRIPTION-EXHAUST-REROUTE — role reviewer unavailable ⇒ GLM on OpenRouter (the review policy's first
@@ -9065,6 +9082,7 @@ registerTasksCommands(program);
 registerBriefCommands(program);
 registerLabelsCommands(program);
 registerMsgCommands(program);
+registerStatuslineCommands(program);
 
 if (!INDEX_FAST_ROOT) {
   const { registerQCommands } = require('./cli/q-cli.js') as typeof import('./cli/q-cli.js');
@@ -10078,6 +10096,8 @@ program
   .option('--json', 'Emit one JSON line per turn (sessionId/provider/model/reply/...) instead of streaming text')
   .option('--no-tools', 'Disable the tool loop and run a text-only chat REPL (parity with telegram/discord callers)')
   .option('--stdin-jsonl', 'Force JSONL-on-stdin mode even when stdin is a TTY (useful for testing automation paths)')
+  // CHAT-TOOLS-ENTRY-VIA-CORE-TURN — set only by the Next TUI host's child launch (src/tui-client/local-chat-turn.ts).
+  .addOption(new Option('--next-tui', 'internal: this REPL is the Next TUI child (tool turns take the core turn)').hideHelp())
   .action(async (opts: {
     new?: boolean;
     continue?: boolean;
@@ -10089,6 +10109,7 @@ program
     json?: boolean;
     tools?: boolean;
     stdinJsonl?: boolean;
+    nextTui?: boolean;
   }) => {
     if (opts.scenario && opts.replay) {
       ui.error('--scenario and --replay are mutually exclusive');
@@ -10130,6 +10151,7 @@ program
       scriptedFromStdin: opts.stdinJsonl === true,
       jsonOutput: opts.json === true,
       exitAfterScenario,
+      ...(opts.nextTui === true ? { nextTui: true } : {}),
     });
     if (code !== 0) process.exit(code);
   });
@@ -13077,7 +13099,10 @@ async function main(): Promise<void> {
   // web onboarding remains incomplete. Keep setup for genuinely unready installs.
   if ((await import('./onboarding.js')).needsFirstRun(cfg)
     && cfg.onboarding.ready !== true) {
-    if (cfg.onboarding.webFirst !== false) {
+    // A config that already chats (member session's proxy token, saved or env key) is not «unready»: it skips the
+    // web/terminal setup chooser and goes straight to first-run, which keeps that provider and persists `ready`.
+    const alreadyChats = (await (await import('./onboarding/first-run.js')).configuredFirstRunProvider(cfg)) !== undefined;
+    if (cfg.onboarding.webFirst !== false && !alreadyChats) {
       const { runWebFirstSetup } = await import('./onboarding/web-first.js');
       if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: true }) === 'link-shown') return;
     }
@@ -13415,7 +13440,7 @@ async function defaultTuiSelfRestartSpawn(command: string, argv: readonly string
  *   - `import { program } from './index.js'`(테스트) → 둘 다 안 걸려 조용하다
  * 회귀 방어 = `src/cli-entry.test.ts`(실물 `bin/elanous.mjs` 를 spawn 한다).
  */
-export function runCli(): void {
+export function runCli(): Promise<void> | void {
   if (process.env.NODE_ENV === 'test' && process.env.ELANOUS_TEST_FIRSTRUN_DOCTOR_PROBE === '1') {
     void import('./onboarding/first-run-doctor-test-control.js').then(({ runFirstRunDoctorTestControl }) => {
       runFirstRunDoctorTestControl();
@@ -13425,7 +13450,7 @@ export function runCli(): void {
     });
     return;
   }
-  main().catch(async (err) => {
+  return main().catch(async (err) => {
     closeTui();
     if (isCliUserError(err)) {
       console.error(formatCliUserError(err));

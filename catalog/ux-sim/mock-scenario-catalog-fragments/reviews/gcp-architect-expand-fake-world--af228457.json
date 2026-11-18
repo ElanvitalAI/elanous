@@ -1,0 +1,4 @@
+{
+  "deviceKey": "gcp-architect-expand-fake-world",
+  "review": "# 📅 2026-11-17 재검토 (UX · 장치 정비 2) — scene 5 그래프 시험 세계의 대본 공급자(scene5-fake-provider)를 이 장치의 구현·source-module 로 등록했다. 같은 폴더의 나머지 파일은 실제 architect 플러그인 핸들러라 사유를 적어 제외했다."
+}

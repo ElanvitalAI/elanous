@@ -171,6 +171,14 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'creating the one event-coded member app slot verifies its own member session',
   },
   {
+    method: 'POST', match: 'exact', path: '/v1/members/app-slot/name', selfVerified: true,
+    why: 'renaming the member app verifies the revocable member-session cookie, the member origin and that the app was never used',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/app-slot/name-check', selfVerified: true,
+    why: 'app-name availability answers only a signed-in member (revocable member-session cookie), one name at a time',
+  },
+  {
     method: 'POST', match: 'exact', path: '/v1/members/app-slot/session', selfVerified: true,
     why: 'mobile owner session verifies a Google ID token against the configured native audiences and resolves subject, member, and app slot server-side',
   },

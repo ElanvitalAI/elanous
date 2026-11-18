@@ -21,7 +21,7 @@ export function projectNextTuiContextArea(
   return {
     page,
     lines: entries.length
-      ? [`첨부 ${entries.length}건 · ${page + 1}/${pageCount}쪽`, ...entries.slice(page * pageSize, (page + 1) * pageSize)
+      ? [`Attachments ${entries.length} · page ${page + 1}/${pageCount}`, ...entries.slice(page * pageSize, (page + 1) * pageSize)
           .map(([token, path]) => `  ${token} · ${path}`)]
       : [],
   };
@@ -50,7 +50,7 @@ export function runNextTuiContextBranchRoute(input: string, host: NextTuiContext
   };
   if (!action) {
     refreshAttachmentArea();
-    if (!attachments.size) host.chatLines.push('  /context: (없음)');
+    if (!attachments.size) host.chatLines.push('  /context: (none)');
   } else if (action === 'clear') {
     if (extra.length || (rawId !== undefined && rawId.toLowerCase() !== 'big')) {
       host.chatLines.push('Usage: /context clear [big]');
@@ -64,13 +64,13 @@ export function runNextTuiContextBranchRoute(input: string, host: NextTuiContext
           }
         } catch { /* A missing file is retained until the person drops it explicitly. */ }
       }
-      host.chatLines.push(`큰 첨부 ${removed}건 삭제`);
+      host.chatLines.push(`${removed} large attachment(s) removed`);
       setAttachmentPage(0);
       refreshAttachmentArea();
     } else {
       const removed = attachments.size;
       attachments.clear();
-      host.chatLines.push(`첨부 ${removed}건 삭제`);
+      host.chatLines.push(`${removed} attachment(s) removed`);
       setAttachmentPage(0);
       refreshAttachmentArea();
     }
@@ -81,7 +81,7 @@ export function runNextTuiContextBranchRoute(input: string, host: NextTuiContext
     else {
       const token = [...attachments.keys()].find((candidate) => attachmentId(candidate) === id);
       if (token) attachments.delete(token);
-      host.chatLines.push(token ? `첨부 #${id} 삭제` : `첨부 #${id} 없음`);
+      host.chatLines.push(token ? `Attachment #${id} removed` : `Attachment #${id} not found`);
       if (token) setAttachmentPage(0);
       refreshAttachmentArea();
     }

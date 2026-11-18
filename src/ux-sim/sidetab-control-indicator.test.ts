@@ -28,9 +28,9 @@ describe('SIDETAB-AGENT-CONTROL-INDICATOR ux-sim', () => {
     const terminal = { cols: 90, rows: 28 };
     const width = sidetabWidthForTerminal(terminal.cols);
     const changes = [
-      { accessMode: 'auto' as const, actor: 'agent' as const, badge: '🤖', title: '엘라누스 조작 중' },
-      { accessMode: 'write' as const, actor: 'human' as const, badge: '👤', title: '세션 · PTY' },
-      { accessMode: 'auto' as const, actor: 'agent' as const, badge: '🤖', title: '엘라누스 조작 중' },
+      { accessMode: 'auto' as const, actor: 'agent' as const, badge: '🤖', title: 'Elanous driving' },
+      { accessMode: 'write' as const, actor: 'human' as const, badge: '👤', title: 'Sessions · PTY' },
+      { accessMode: 'auto' as const, actor: 'agent' as const, badge: '🤖', title: 'Elanous driving' },
     ];
 
     const frames = changes.map((change) => {
@@ -42,11 +42,11 @@ describe('SIDETAB-AGENT-CONTROL-INDICATOR ux-sim', () => {
     });
 
     expect(frames.map((frame) => frame.state?.actor)).toEqual(['agent', 'human', 'agent']);
-    expect(frames[0]?.lines[0]).toContain('🤖 엘라누스 조작 중');
-    expect(frames[1]?.lines[0]).toContain('세션 · PTY');
-    expect(frames[2]?.lines[0]).toContain('🤖 엘라누스 조작 중');
-    expect(frames[0]?.lines[0]).not.toContain('미션 진행 중');
-    expect(frames[2]?.lines[0]).not.toContain('미션 진행 중');
+    expect(frames[0]?.lines[0]).toContain('🤖 Elanous driving');
+    expect(frames[1]?.lines[0]).toContain('Sessions · PTY');
+    expect(frames[2]?.lines[0]).toContain('🤖 Elanous driving');
+    expect(frames[0]?.lines[0]).not.toContain('running a mission');
+    expect(frames[2]?.lines[0]).not.toContain('running a mission');
     expect(frames[0]?.lines[2]).toContain('› 🤖 busy Codex');
     expect(frames[1]?.lines[2]).toContain('› 👤 busy Codex');
     expect(frames[2]?.lines[2]).toContain('› 🤖 busy Codex');

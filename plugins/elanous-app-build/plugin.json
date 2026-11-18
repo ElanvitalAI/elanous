@@ -72,16 +72,15 @@
           "type": "object",
           "properties": {
             "ask": {
-              "type": "string"
+              "type": "string",
+              "description": "The member's one-line request, verbatim. The host fills the app slot, handle, data needs and default runtime from the verified member session and this line."
             },
             "seedRequested": {
-              "type": "boolean"
-            },
-            "appSlug": {
-              "type": "string",
-              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$"
+              "type": "boolean",
+              "description": "Optional. The host sets it when the line asks for sample or synthetic data."
             },
             "artifactMetadata": {
+              "description": "Optional. Omit to use the host default runtime [bun, backend/entry.ts] with /health.",
               "type": "object",
               "properties": {
                 "runtime": {
@@ -121,10 +120,7 @@
             }
           },
           "required": [
-            "ask",
-            "seedRequested",
-            "appSlug",
-            "artifactMetadata"
+            "ask"
           ],
           "additionalProperties": false
         },

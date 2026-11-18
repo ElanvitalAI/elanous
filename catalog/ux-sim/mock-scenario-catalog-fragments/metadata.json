@@ -29,7 +29,7 @@
   "candidateAudit": {
     "source": "~/elanous-hq/seat-state/OP/MOCK-DEVICES-INVENTORY-1031.md §3 + targeted fake-Telegram consumer scan",
     "baseCommit": "533845484cf2c901cfee902a3586354278e7cae8",
-    "sourceRows": 36,
+    "sourceRows": 51,
     "existingPaths": 35,
     "excludedPaths": 27
   }

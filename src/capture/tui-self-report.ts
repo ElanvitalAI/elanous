@@ -30,7 +30,7 @@
 
 import type { SelfReportFrame } from './self-report-frame.js';
 import { resolveInstanceName } from '../instance-identity.js';
-import { getHarnessRunId } from '../harness/harness-space.js';
+import { ensureRunIdentity } from '../harness/harness-space.js';
 import { injectKey, routeExternalTuiKey, setFrameObserver, splitKeys, termSize as tuiTermSize, type Key } from '../tui.js';
 import { canTransitionAccessMode, type PtyAccessMode, type PtyTransitionPolicy } from '../pty-shell/pty-ref.js';
 import { resolveWriteDecision, type PtyWriteActor } from '../pty-shell/pty-write-arbiter.js';
@@ -49,6 +49,7 @@ import { lastHumanKeyAt } from '../tui.js';
 import { debug } from '../debug/log.js';
 import { setTuiLogName, setTuiLogSession } from '../debug/tui-log-tag.js';
 import { getActiveSessionId } from '../session/index.js';
+import { resolveNextTuiSelection } from '../tui/chat/status-model.js';
 import { routeExternalInput, type ExternalInputRoute } from '../input/external-input-queue.js';
 
 /**
@@ -395,10 +396,10 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   const heartbeatMs = deps.heartbeatMs ?? 15_000;
   let instance = 'prod';
   try { instance = resolveInstanceName(); } catch { /* fail-soft default */ }
-  // ★ K4 run-identity(2026-07-25·[[PLAN §K/K4]]) — 이 서피스 프레임을 run 에 join. K1/K2 가 env 로 전파한
-  //   ELANOUS_RUN_ID(없으면 ''=run 밖·생략). 발행 프레임(emitText)+observer 둘 다 스탬프.
+  // The foreground TUI is an outermost process, not a child PTY. Mint once
+  // before registering its row so both the manifest and frames share an anchor.
   let runId = '';
-  try { runId = getHarnessRunId(); } catch { /* fail-soft */ }
+  try { runId = ensureRunIdentity().runId; } catch { /* fail-soft */ }
 
   const register = deps.register ?? defaultRegister;
   const publishFrame = deps.publishFrame ?? defaultPublishFrame;
@@ -461,6 +462,7 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
         return startTuiRunStateRecorder(id, {
           selfRestart: deps.selfRestart === null ? undefined : (deps.selfRestart ?? productionTuiSelfRestart(readActiveSessionId)),
           ...(seatCompare ? { seatCompare } : {}),
+          herdrModel: () => tuiHerdrModel(readActiveSessionId),
         });
       });
   try { stopRunState = startRunState(surfaceId); } catch { /* fail-soft — recorder logs its own write failures */ }
@@ -705,4 +707,17 @@ function defaultHeartbeat(surfaceId: string, now: number): void {
 
 function defaultMarkClosed(surfaceId: string, now: number): void {
   markPtyManifestClosed(surfaceId, 0, now);
+}
+
+/** herdr 배지용 «다음 요청이 쓸 모델» — 상태줄·/status 와 같은 해석기. 모르면 undefined(«unset» 을 배지로 안 올린다). */
+export function tuiHerdrModel(
+  readActiveSessionId: () => string | null,
+  resolve: (sessionId?: string) => { readonly model: string } = resolveNextTuiSelection,
+): string | undefined {
+  try {
+    const model = resolve(readActiveSessionId() ?? undefined).model.trim();
+    return model && model !== 'unset' ? model : undefined;
+  } catch {
+    return undefined;
+  }
 }

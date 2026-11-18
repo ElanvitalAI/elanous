@@ -10,7 +10,7 @@ test('five live section headings and mouse targets survive selection scrolling',
   const rows = [row('session-a'), row('run-a', { runId: 'run-a' }), row('pod-a', { kind: 'pod' }),
     row('herdr-a', { kind: 'herdr' }), row('remote-a', { remoteHost: 'minim5' })];
   const full = formatSidetabSectionFrame(rows, 0, 28, 20);
-  expect(full.lines.filter((line) => /Sessions|Harness runs|Pods|Herdr|Remote/.test(line))).toHaveLength(5);
+  expect(full.lines.filter((line) => /^ (Sessions|Harness runs|Pods|Herdr|Remote) · \d+/.test(line))).toHaveLength(5);
   expect(sidetabSectionTargetAt(full, 3, 1, 28)).toEqual({ kind: 'section', id: 'sessions' });
   expect(sidetabSectionTargetAt(full, 4, 1, 28)).toEqual({ kind: 'row', index: 0 });
   expect(sidetabSectionTargetAt(full, 4, 29, 28)).toBeUndefined();

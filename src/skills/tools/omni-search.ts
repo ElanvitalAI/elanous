@@ -14,7 +14,13 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 //   by-engine   — group hits under per-provider headings
 
 
-import { getAvailableResearchWebSearchProviders, getAvailableWebSearchProviders } from '../../web-search/index.js';
+import {
+  getAvailableResearchWebSearchProviders,
+  getAvailableResearchWebSearchProvidersAsync,
+  getAvailableWebSearchProviders,
+  listWebSearchProviders,
+  webSearchProvidersPendingAsyncReadiness,
+} from '../../web-search/index.js';
 import type { WebSearchHit } from '../../web-search/provider.js';
 
 export interface OmniSearchArgs {
@@ -87,7 +93,7 @@ export async function dispatchOmniSearch(
   opts: OmniSearchDispatchOpts = {},
 ): Promise<OmniSearchResult> {
   const args = validate(rawArgs);
-  const allowed = getAvailableResearchProviders();
+  const allowed = await resolveResearchProvidersForDispatch(opts.signal);
   const requested = args.engines === undefined ? undefined : new Set(args.engines.map(id => id.toLowerCase()));
   const providers = requested === undefined
     ? allowed
@@ -102,7 +108,8 @@ export async function dispatchResearchOmniSearch(
   const args = validate(rawArgs);
   const now = opts.now ?? Date.now;
   const deadlineAt = now() + RESEARCH_SEARCH_BUDGET_MS;
-  const selected = getAvailableResearchProviders();
+  // Typed-store credentials (e.g. Firecrawl key only in the secret store) need async readiness, inside the research budget.
+  const selected = await resolveResearchProvidersForDispatch(opts.signal, Math.max(1, Math.min(RESEARCH_SEARCH_BUDGET_MS, deadlineAt - now())));
   const requested = args.engines === undefined ? undefined : new Set(args.engines.map(id => id.toLowerCase()));
   const providers = requested === undefined
     ? selected
@@ -243,9 +250,19 @@ async function dispatchWithProviders(
         const controller = new AbortController();
         const signal = opts.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal;
         let timer: ReturnType<typeof setTimeout> | undefined;
+        // Caller cancellation (before, during readiness, or during the call) still reaches the provider through
+        // `signal`, and is reported per engine at once even if the provider ignores an already-aborted signal.
+        const parent = opts.signal;
+        const cancelled = new Promise<never>((_, reject) => {
+          if (!parent) return;
+          if (parent.aborted) reject(parent.reason);
+          else parent.addEventListener('abort', () => reject(parent.reason), { once: true });
+        });
+        cancelled.catch(() => {});
         try {
           result = await Promise.race([
             p.search(query, signal),
+            cancelled,
             new Promise<never>((_, reject) => {
               timer = setTimeout(() => {
                 controller.abort();
@@ -328,9 +345,61 @@ export function getAvailableResearchSearchEngineIds(): string[] {
   return getAvailableResearchProviders().map(provider => provider.id);
 }
 
-function getAvailableResearchProviders(): ReturnType<typeof getAvailableWebSearchProviders> {
-  const available = getAvailableResearchWebSearchProviders();
+type ResearchProviders = ReturnType<typeof getAvailableWebSearchProviders>;
+
+/** Last successful async readiness (typed stores included). A rejection is never cached. */
+let lastAsyncReadyResearch: ResearchProviders | undefined;
+let researchReadinessInFlight: Promise<unknown> | undefined;
+
+function researchOrder(available: ResearchProviders): ResearchProviders {
   return RESEARCH_WEB_FALLBACK_IDS.flatMap(id => available.filter(provider => provider.id === id));
+}
+
+async function resolveResearchProviders(signal?: AbortSignal, timeoutMs?: number): Promise<ResearchProviders> {
+  const ready = await getAvailableResearchWebSearchProvidersAsync(signal, timeoutMs);
+  lastAsyncReadyResearch = ready;
+  return researchOrder(ready);
+}
+
+/** Dispatch keeps its envelope contract: if the caller cancels while readiness is resolving, fall back to the
+ *  synchronous snapshot so the cancellation reaches the provider calls and is reported per engine, not thrown. */
+async function resolveResearchProvidersForDispatch(signal?: AbortSignal, timeoutMs?: number): Promise<ResearchProviders> {
+  try { return await resolveResearchProviders(signal, timeoutMs); }
+  catch (error) {
+    if (!signal?.aborted) throw error;
+    return researchOrder(getAvailableResearchWebSearchProviders());
+  }
+}
+
+/** Start (once at a time) the async typed-store readiness check so later synchronous probes can see it. */
+export function primeResearchOmniSearchReadiness(): Promise<unknown> {
+  researchReadinessInFlight ??= resolveResearchProviders()
+    .catch(() => undefined)
+    .finally(() => { researchReadinessInFlight = undefined; });
+  return researchReadinessInFlight;
+}
+
+/** Synchronous probe: env/config availability plus the last async readiness result. Until that result
+ *  exists, kick it off in the background; dispatch itself always re-resolves readiness asynchronously. */
+function getAvailableResearchProviders(): ResearchProviders {
+  const available = getAvailableResearchWebSearchProviders();
+  const pending = webSearchProvidersPendingAsyncReadiness().filter(id => RESEARCH_WEB_FALLBACK_IDS.includes(id));
+  if (lastAsyncReadyResearch === undefined && pending.length > 0) void primeResearchOmniSearchReadiness();
+  const registered = new Set(listWebSearchProviders().map(provider => provider.id));
+  const extra = (lastAsyncReadyResearch ?? []).filter(provider =>
+    registered.has(provider.id) && !available.some(known => known.id === provider.id));
+  return researchOrder([...available, ...extra]);
+}
+
+/** Async engine ids for callers that can await (CLI): resolves typed-store readiness directly. */
+export async function getAvailableResearchSearchEngineIdsAsync(signal?: AbortSignal): Promise<string[]> {
+  return (await resolveResearchProviders(signal)).map(provider => provider.id);
+}
+
+/** Test-only: forget cached async readiness. */
+export function _resetResearchOmniSearchReadinessForTests(): void {
+  lastAsyncReadyResearch = undefined;
+  researchReadinessInFlight = undefined;
 }
 
 function interleaveHits(perEngine: Record<string, { hits: WebSearchHit[] }>): WebSearchHit[] {

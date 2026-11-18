@@ -84,10 +84,10 @@ test('one-time readable handle rejects duplicates while legacy public IDs and co
     const other = store.register({ sub: 'b', email: 'b@example.test', emailVerified: true, name: 'B' },
       { consents: { privacy: 'v1', terms: 'v1' } });
     const oldPublicId = store.publicIdForMember(owner.id)!;
-    expect(store.claimHandle(owner.id, 'ElanvitalAI')).toBe('ElanvitalAI');
+    expect(store.claimHandle(owner.id, 'owner80')).toBe('owner80');
     expect(store.memberForPublicId(oldPublicId)).toBe(owner.id);
-    expect(store.memberForHandle('ElanvitalAI')).toBe(owner.id);
-    expect(() => store.claimHandle(other.id, 'ElanvitalAI')).toThrow('already taken');
+    expect(store.memberForHandle('owner80')).toBe(owner.id);
+    expect(() => store.claimHandle(other.id, 'owner80')).toThrow('already taken');
     expect(() => store.claimHandle(owner.id, 'anotherid')).toThrow('cannot be changed');
     expect(() => store.claimHandle(other.id, 'Joosung80')).toThrow('invalid member ID');
     expect(() => store.claimHandle(other.id, 'user-80')).toThrow('invalid member ID');
@@ -106,7 +106,7 @@ test('member ID validation and signup intent use the public handle contract with
   try {
     const owner = store.register({ sub: 'owner-public', email: 'public@example.test', emailVerified: true, name: 'Owner' },
       { consents: { privacy: 'v1', terms: 'v1' } });
-    const handle = store.claimHandle(owner.id, 'ElanvitalAI');
+    const handle = store.claimHandle(owner.id, 'owner80');
     const fakeOAuthAge = 1;
     let captured: unknown;
     const api = createMembersApi({ store, google: {
@@ -140,13 +140,13 @@ test('authenticated one-time handle claim returns a public link, keeps an alias,
     const api = createMembersApi({ store, google: { redirectUri: 'https://api.example.test/v1/members/oauth/google/callback' } as never,
       successRedirectUri: 'https://app.example.test/signup/complete', webOrigin: 'https://app.example.test' });
     const endpoint = 'https://api.example.test/v1/members/handle';
-    const body = JSON.stringify({ handle: 'ElanvitalAI' });
+    const body = JSON.stringify({ handle: 'owner80' });
     expect((await api.handle(new Request(endpoint, { method: 'PUT', body })))?.status).toBe(401);
     const ownerHeaders = { origin: 'https://app.example.test', 'content-type': 'application/json',
       cookie: `__Host-elanous_member_session=${owner.session.token}` };
     const claimed = await api.handle(new Request(endpoint, { method: 'PUT', headers: ownerHeaders, body }));
     expect(claimed?.status).toBe(200);
-    expect(await claimed?.json()).toEqual({ handle: 'ElanvitalAI', inviteLink: 'https://app.example.test/r/ElanvitalAI' });
+    expect(await claimed?.json()).toEqual({ handle: 'owner80', inviteLink: 'https://app.example.test/r/owner80' });
     expect(store.memberForPublicId(previous)).toBe(owner.id);
     const otherHeaders = { ...ownerHeaders, cookie: `__Host-elanous_member_session=${other.session.token}` };
     expect((await api.handle(new Request(endpoint, { method: 'PUT', headers: otherHeaders, body })))?.status).toBe(409);

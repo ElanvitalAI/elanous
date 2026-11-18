@@ -36,5 +36,7 @@ const code = await runRepl({
   scriptedFromStdin: true,
   jsonOutput: true,
   exitAfterScenario: true,
+  // CHAT-TOOLS-ENTRY-VIA-CORE-TURN — this child is the Next TUI's: its tool turns take the core turn.
+  nextTui: true,
 });
 if (code !== 0) process.exit(code);

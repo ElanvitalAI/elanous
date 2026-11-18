@@ -21,7 +21,8 @@ import { verifiedNonCodeOutcome, type DomainExecute, type DomainExecuteResult } 
 import { reviewDiffBudgetObservation, reviewPullRequest, renderReview } from '../agent-substrate/pr-reviewer.js';
 import { buildReviewSeam, gateEvidenceNote, reviewResultToCritiqueLike, type GateLike, type CritiqueLike } from './review-adapter.js';
 import { buildExecuteProgressJudge } from './execute-progress-judge.js';
-import type { StagedHarnessSeams } from './staged-harness.js';
+import { NEIGHBOR_SWEEP_DEADLINE_MS, NEIGHBOR_SWEEP_ENV, NEIGHBOR_SWEEP_SHADOW_BUDGET_MS, renderNeighborSection, resolveNeighborSweepMode, sweepWorktreeNeighbors, type NeighborSweepMode, type NeighborSweepResult, type NeighborSweepRunOptions, type NeighborSweepTrigger } from './neighbor-sweep.js';
+import type { ReviewVerdict, StagedHarnessSeams } from './staged-harness.js';
 import { debug } from '../debug/log.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { setEventLoopActivity } from '../debug/event-loop-watchdog.js';
@@ -129,6 +130,11 @@ export interface HarnessSeamsDeps {
   goalDocument?: string;
   /** postPrReview 의 gh 호출 주입(opt-in). 미지정 시 node:child_process spawnSync. */
   spawnSyncFn?: typeof spawnSync;
+  /** HARNESS-NEIGHBOR-SWEEP — 수정 라운드(리뷰 must-fix·래칫 게이트 실패 뒤)에 같은 callee 이웃 목록을 만든다.
+   *  mode 생략 = env `ELANOUS_HARNESS_NEIGHBOR_SWEEP` · 그것도 없거나 무효 = shadow(계산·개수 사건만 · 주입 0) ·
+   *  on = rework 프롬프트에 주입 · off = 계산도 안 함. sweep 생략 = 작업 트리 diff ⊕ ast-grep/TypeScript 엔진.
+   *  budgetMs 생략 = shadow 는 NEIGHBOR_SWEEP_SHADOW_BUDGET_MS(TS 폴백 없음) · on 은 NEIGHBOR_SWEEP_DEADLINE_MS. */
+  neighborSweep?: { mode?: NeighborSweepMode; budgetMs?: number; sweep?: (cwd: string, opts: NeighborSweepRunOptions) => Promise<NeighborSweepResult> };
 }
 
 /** adversarial 자동 발동 임계 — 이 스텝 수 이상이면 명시 요청 없이도 레드팀(복잡할수록 결함 위험↑). */
@@ -323,6 +329,42 @@ export function buildHarnessSeams(deps: HarnessSeamsDeps): StagedHarnessSeams {
   //      env 와 공간 객체의 출처가 동일(`getHarnessRunId`)이라 하중을 지지 않는 중복 인자이고,
   //      "배선돼 있다"는 인상만 만든다(#5484 리뷰 2R). 재발명 0 = SSOT 를 그대로 부른다.
   const { runId, source: runIdSource } = resolveRunIdentity();
+  const neighborSweepMode = resolveNeighborSweepMode(deps.neighborSweep?.mode ?? process.env[NEIGHBOR_SWEEP_ENV]);
+  // HARNESS-NEIGHBOR-SWEEP — 수정 라운드에서만 부른다. 실패(도구 없음·시한 초과·예외)는 사건만 남기고 '' 를 돌려
+  //   수정 라운드를 막지 않는다. 사건은 개수뿐이다(호출 원문·경로 없음). shadow 는 계산하되 주입하지 않는다.
+  const neighborSweepSection = async (round: number, review: ReviewVerdict, worktree: string): Promise<string> => {
+    // 계기 — 결정론 게이트 실패(review-adapter.ts combineReview 의 `gateFailed: true`)면 래칫 편집 직후 라운드다.
+    const trigger: NeighborSweepTrigger = review.gateFailed ? 'ratchet-edit' : 'review-mustfix';
+    // off 도 조용히 넘지 않는다 — 수정 라운드마다 «안 잼» 사건 하나(JUD-B 20261118-AM-REST-HOLD «래칫 직후 미측정» 절).
+    if (neighborSweepMode === 'off') { observe('neighbor-sweep-skipped', { round, mode: neighborSweepMode, trigger, reason: 'off' }); return ''; }
+    setEventLoopActivity(`harness:execute:round-${round}:neighbor-sweep`);
+    // shadow 는 «동작 변화 0» — 작은 예산 · TS 폴백 없음. 예산은 스윕에 넘기고(자식 ast-grep 도 그 시한에 죽는다),
+    //   여기서도 경쟁 타이머로 한 번 더 묶어 어떤 sweep 구현이 늦어도 라운드는 예산 안에 넘어간다.
+    const budgetMs = deps.neighborSweep?.budgetMs ?? (neighborSweepMode === 'shadow' ? NEIGHBOR_SWEEP_SHADOW_BUDGET_MS : NEIGHBOR_SWEEP_DEADLINE_MS);
+    const failed = (outcome: 'error' | 'timeout', reason: string): NeighborSweepResult => ({ outcome, engine: 'none', hunks: 0, callees: 0, sites: [], totalSites: 0, truncated: false, reason });
+    const startedAt = Date.now();
+    const sweeping = Promise.resolve()
+      .then(() => (deps.neighborSweep?.sweep ?? sweepWorktreeNeighbors)(worktree, { deadlineMs: budgetMs, allowFallback: neighborSweepMode === 'on' }))
+      .catch((error: unknown) => failed('error', error instanceof Error ? error.name : 'unknown'));
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+    const overBudget = new Promise<NeighborSweepResult>((resolveBudget) => {
+      budgetTimer = setTimeout(() => resolveBudget(failed('timeout', 'round-budget')), budgetMs);
+    });
+    let result: NeighborSweepResult;
+    try {
+      result = await Promise.race([sweeping, overBudget]);
+    } finally {
+      clearTimeout(budgetTimer);
+    }
+    const elapsedMs = Date.now() - startedAt;
+    const section = neighborSweepMode === 'on' ? renderNeighborSection(result, trigger) : '';
+    observe('neighbor-sweep', {
+      round, mode: neighborSweepMode, trigger, budgetMs, elapsedMs, outcome: result.outcome, engine: result.engine,
+      hunks: result.hunks, callees: result.callees, sites: result.sites.length, totalSites: result.totalSites,
+      truncated: result.truncated, injected: section.length > 0, ...(result.reason ? { reason: result.reason } : {}),
+    });
+    return section;
+  };
   try {
     debug.log('run-identity', 'own', {
       runId, source: runIdSource, owner: 'harness-seams', nestDepth: nestInfo().depth, ...originObservationFields(),
@@ -582,6 +624,8 @@ export function buildHarnessSeams(deps: HarnessSeamsDeps): StagedHarnessSeams {
       const base = rework
         ? `${objective}\n\n[이전 리뷰 지적 — 반드시 반영해 수정하라]\n${priorReview!.findings.map((f) => `- ${f}`).join('\n')}`
         : objective;
+      // HARNESS-NEIGHBOR-SWEEP — 수정 라운드(rework = verdict fail)에서만. 첫 라운드·통과 뒤에는 부르지 않는다.
+      const neighborBlock = rework ? await neighborSweepSection(round, priorReview!, cwd) : '';
       // ★ Q1(plan.steps 전달 갭 수리·2026-07-22) — plan seam 이 산출한 계획 스텝(휴리스틱/LLM decompose/
       //   adversarial-revised 로 richer 해진)을 executor 프롬프트에 실어, 플래너 노고가 유실되지 않게 한다.
       //   종전엔 execute seam 이 steps 를 구조분해에서 누락해 objective+grounding 만 전달 → 플래너 스텝이 executor
@@ -597,7 +641,7 @@ export function buildHarnessSeams(deps: HarnessSeamsDeps): StagedHarnessSeams {
       if (capsuleDigest) observe('capsule-carried', { round });
       // ★ 이식(§3.1) — plan 에서 산출한 grounding 팩트 + 계획 스텝을 자식 프롬프트 앞에 실어 재조사·재구현 환각 차단.
       //   빈 블록은 filter 로 제거되므로 capsule/groundBlock/planBlock 모두 없으면 종전(base 단독)과 동일 = 무회귀.
-      const feature = [capsuleDigest, groundBlock, planBlock, base].filter(Boolean).join('\n\n---\n\n');
+      const feature = [capsuleDigest, groundBlock, planBlock, base, neighborBlock].filter(Boolean).join('\n\n---\n\n');
       if (rework) observe('rework', { round, verdict: priorReview!.verdict, findings: priorReview!.findings.length });
       // ★ part2-B(M-UX 2·3차) — execute 내부 goal-loop 델타를 judge 로 debounce 해 마일스톤/stall 카드 emit.
       //   판단 결과는 관측(execute-milestone·제1원칙: 왜 떴나/안 떴나). 미주입 시 페이즈 카드만.

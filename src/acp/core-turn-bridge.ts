@@ -45,9 +45,11 @@ import {
 } from '../core-turn/run-core-turn.js';
 import type { CoreTurnContext } from '../core-turn/types.js';
 import { runGoalLoop } from '../core-turn/run-goal-loop.js';
+import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { stripGoalRepeatReadbackPreface } from '../core-turn/run-goal-loop.js';
 import { parseSeatTurnCapConfig, resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
+import { postSeatCapResumeNotice } from '../core-turn/seat-cap-resume-notice.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { getModelFamily } from '../models/prompts.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
@@ -337,7 +339,6 @@ export function bridgeCoreTurnToAcp(
       // (10-14 13:48 운영 TUI OP: route short-question·goalLoop ⊕ factQuestion → 소진 뒤 헛호출 7회).
       const surfaceProfile = resolveSessionSurfaceProfile({ userText: turnCtx.userText });
       const factShaped = isFactQuestion(turnCtx.userText);
-      const researchTurn = isResearchAgentIntent(turnCtx.userText);
       // A quick research/turn lookup still keeps the fact budget. Only the
       // multi-source research/agent route needs enough rounds to compare axes.
       const factQuestion = factShaped && !armGoalLoop && surfaceProfile.id !== 'research/agent';
@@ -346,10 +347,16 @@ export function bridgeCoreTurnToAcp(
         catch { /* observation cannot interrupt a turn */ }
       }
       const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
+      // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (JUD-B ACP clause · R-SIG): a single core turn no longer gets its research tool
+      // budget from the `isResearchAgentIntent` sentence regex. runCoreTurn applies RESEARCH_TURN_MAX_TOOL_TURNS itself
+      // once its research route enters (run-core-turn.ts `maxToolTurns`) — the structured route on a web-tool pool, the
+      // same decision the CLI and the Next TUI reach; the legacy verdict survives there only as the route-mismatch
+      // shadow. A goal-loop turn is an excluded path (#38246 exclusions) and keeps its pre-existing budget verdict.
+      const goalLoopResearchBudget = armGoalLoop && isResearchAgentIntent(turnCtx.userText);
       const resolvedMaxToolTurns = explicitMaxToolTurns ?? (factQuestion
         ? getUserConfig().chat.factQuestion.maxToolTurns
-        : researchTurn ? RESEARCH_TURN_MAX_TOOL_TURNS : undefined);
-      const maxToolTurns = researchTurn && resolvedMaxToolTurns !== undefined
+        : goalLoopResearchBudget ? RESEARCH_TURN_MAX_TOOL_TURNS : undefined);
+      const maxToolTurns = goalLoopResearchBudget && resolvedMaxToolTurns !== undefined
         ? Math.min(resolvedMaxToolTurns, RESEARCH_TURN_MAX_TOOL_TURNS)
         : resolvedMaxToolTurns;
       const withFactInstruction = (seed: LLMMessage[]): LLMMessage[] => factQuestion
@@ -492,9 +499,13 @@ export function bridgeCoreTurnToAcp(
                 return xml ? [{ role: 'user', content: xml }] : [];
               },
               ...(goalLoopCfg?.maxIterations !== undefined ? { maxIterations: goalLoopCfg.maxIterations } : {}),
+              // HARNESS-ADVISOR-CHECKPOINTS — 하니스 런에서만 코어 ADVISOR(그림자 기본).
+              ...((advisor) => advisor ? { advisor } : {})(coreAdvisorForGoalLoop({ userText: c.userText ?? '', signal: c.signal })),
               // #29 처방 — 자리 판정으로 goal loop 에 «되돌아온» 턴만 빈 evidence 완료를 답으로 받는다.
               ...(route.reason.startsWith('seat-') ? { lenientCompletionEvidence: true } : {}),
               ...(seatTurnCap !== undefined ? { seatTurnCap } : {}),
+              // SEAT-CAP-RESUME-NOTICE(연속 큐 미재개) — 상한 소진 마감 직전 자리 우편함에 재개 안내 1통.
+              ...(seatTurnCap !== undefined ? { onSeatCapExhausted: postSeatCapResumeNotice() } : {}),
               ...(goalCtxWindow > 0 ? { contextTokenLimit: goalCtxWindow } : {}),
             })
           : runCoreTurn(c);
