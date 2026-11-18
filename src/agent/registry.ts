@@ -121,8 +121,12 @@ export class AgentRegistry {
     if (depth > currentHopCap) {
       throw new AgentHopCapExceededError(depth, currentHopCap, opts.parentTaskId);
     }
+    const queued = opts.queuedTaskId ? this.tasks.get(opts.queuedTaskId) : undefined;
+    if (opts.queuedTaskId && (!queued || queued.state !== 'pending')) {
+      throw new Error(`pending agent queue ticket not found: ${opts.queuedTaskId}`);
+    }
     const task: AgentTask = {
-      id: randomUUID(),
+      id: queued?.id ?? randomUUID(),
       definition: opts.definition,
       prompt: opts.prompt,
       ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
@@ -146,7 +150,7 @@ export class AgentRegistry {
       agentUri: opts.agentUri ?? mintAgentUri(),
       state: 'pending',
       messages: [],
-      controller: new AbortController(),
+      controller: queued?.controller ?? new AbortController(),
     };
     this.tasks.set(task.id, task);
     // PFC-S1 P2: hand the runner a terminal-state callback so the

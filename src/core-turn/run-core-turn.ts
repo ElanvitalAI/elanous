@@ -24,6 +24,7 @@ import { isAuthRejectionError, streamLLMWithTools } from '../llm.js';
 import { drainPendingUserInput } from '../session/pending-input.js';
 import type { LLMMessage, StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
+import { emitTurnLife } from '../debug/turn-life.js';
 import { applyDeferredTools } from '../session-runtime/tier-flip.js';
 import { resolveTurnRoutePin } from '../plugins/core/turn-route-pin.js';
 import { isOrderedLinearIssueStep, isOrderedLinearResearchWorkflow, isOrderedNonResearchWorkflow, isResearchAgentIntent } from '../tool-hints/signals.js';
@@ -36,6 +37,8 @@ import {
 } from './research-route.js';
 import { CitationLedger, countVerifiedCitations, createCitationStreamFilter, sanitizeCitations } from './citation-guard.js';
 import { coreStopReasonFromProvider } from './provider-stop-reason.js';
+import type { TurnNoProgressFire } from '../llm/turn-progress.js';
+import { TURN_STALL_DEFAULT_RECIPIENTS, createTurnStallReporter, defaultTurnStallMailer, type TurnStallMailer } from './turn-stall-report.js';
 import {
   isResearchToolAllowed,
   RESEARCH_DOCUMENT_WRITE_TOOLS,
@@ -205,6 +208,10 @@ export interface RunCoreTurnOptions {
   ) => Promise<{ ok: boolean; output: string; sourceUrls?: string[]; error?: string; axisCount?: number }>;
   /** Internal: the structured route already took this turn out of research; re-run it as an ordinary turn. */
   researchRouteOverride?: ResearchRouteDecision;
+  /** ELN-TURN-STALL-WATCHDOG seams: the mail sender (default: msg ledger + wake) and the seat it sends from
+   *  (default: `detectSeat(process.cwd())`). Tests pass a fake mailer — never the real ledger. */
+  stallMailer?: TurnStallMailer;
+  stallSeat?: string | null;
 }
 
 /** Evidence gathered so far while research is still running; never a completed result. */
@@ -384,7 +391,39 @@ export async function runCoreTurn(
     researchSynthesisStarted = true;
     researchRunObserver.event({ type: 'enter', node: 'synthesis' });
   };
-  return withAmbientSessionScope(ctx.sessionId, async () => {
+  // ELN-TURN-STALL-WATCHDOG — the tool loop fires on «no output progress»; this turn reports it once at its end.
+  let stallSeat: string | null;
+  if (options.stallSeat !== undefined) stallSeat = options.stallSeat;
+  else {
+    try { stallSeat = (await import('../seat/seat-boot-preamble.js')).detectSeat(process.cwd())?.seat ?? null; }
+    catch { stallSeat = null; }
+  }
+  let stallRecipients: readonly string[] = TURN_STALL_DEFAULT_RECIPIENTS;
+  try {
+    const extra = (await import('../user-config.js')).getUserConfig().llm.turnNoProgressMailTo ?? [];
+    stallRecipients = [...TURN_STALL_DEFAULT_RECIPIENTS, ...extra];
+  } catch { /* config lookup is fail-soft; OP still gets the line */ }
+  const stallReport = createTurnStallReporter({
+    seat: stallSeat, sessionId: ctx.sessionId, recipients: stallRecipients, mailer: options.stallMailer ?? defaultTurnStallMailer,
+  });
+  let lastResolvedProvider: string | null = null;
+  if (ctx.signal.aborted) return { stopReason: 'aborted', finalText: '' };
+  let turnResult: CoreTurnResult;
+  try {
+    turnResult = await runCoreTurnScoped();
+  } catch (error) {
+    await stallReport.finish(ctx.signal.aborted ? { kind: 'aborted' }
+      : { kind: 'exhausted', error: redactSecretText(error instanceof Error ? error.message : String(error)) });
+    throw error;
+  }
+  await stallReport.finish(turnResult.stopReason === 'aborted' ? { kind: 'aborted' }
+    : turnResult.stopReason === 'error' || turnResult.stopReason === 'auth_rejected'
+      ? { kind: 'exhausted', error: redactSecretText(turnResult.errorMessage ?? turnResult.stopReason) }
+      : { kind: 'recovered', provider: lastResolvedProvider });
+  return turnResult;
+
+  function runCoreTurnScoped(): Promise<CoreTurnResult> {
+  return withAmbientSessionScope(ctx.sessionId, async (): Promise<CoreTurnResult> => {
     if (ctx.signal.aborted) {
       return { stopReason: 'aborted', finalText: '' };
     }
@@ -488,6 +527,16 @@ export async function runCoreTurn(
       } catch {
         // Observability must not prevent the selected tool from dispatching.
       }
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 캡슐 진입(Agent/Task=agent · mcp__=mcp · Bash/Shell/Terminal=bash · 나머지=other).
+      try {
+        emitTurnLife('turn-life:capsule-enter', {
+          tool: name,
+          callId: c?.callId ?? '',
+          capsule: name === 'Agent' || name === 'Task' ? 'agent'
+            : name.startsWith('mcp__') ? 'mcp'
+            : /^(Bash|Shell|WebTerminal|Terminal)/.test(name) ? 'bash' : 'other',
+        });
+      } catch { /* observability is fail-open */ }
 
       let success = false;
       try {
@@ -551,6 +600,8 @@ export async function runCoreTurn(
         } catch {
           // Observability must not prevent the tool result or error from propagating.
         }
+        // OBSERVE-TURN-EVENT-LIFECYCLE — 캡슐 퇴장(TUI 대기 큐 수는 여기서 모른다 → pendingEvents 생략).
+        try { emitTurnLife('turn-life:capsule-exit', { tool: name, callId: c?.callId ?? '', durationMs: now() - startedAt, success }); } catch { /* observability is fail-open */ }
       }
     },
   };
@@ -1050,7 +1101,11 @@ export async function runCoreTurn(
       ...(ctx.initialProvider !== undefined
         ? { initialProvider: ctx.initialProvider, ...(ctx.skipProviders ? { skipProviders: ctx.skipProviders } : {}) }
         : ctx.modelOverride !== undefined ? { model: ctx.modelOverride } : {}),
-      ...(ctx.callbacks?.onResolvedProvider !== undefined ? { onResolvedProvider: ctx.callbacks.onResolvedProvider } : {}),
+      onResolvedProvider: (provider: string, model: string) => {
+        lastResolvedProvider = provider;
+        ctx.callbacks?.onResolvedProvider?.(provider, model);
+      },
+      onNoProgress: (fire: TurnNoProgressFire) => { stallReport.note(fire); },
       ...(ctx.budgetGrant !== undefined ? { budgetGrant: ctx.budgetGrant } : {}),
       ...(ctx.terminalToolNames !== undefined ? { terminalToolNames: ctx.terminalToolNames } : {}),
       ...(ctx.terminalPriorAnswerVisible !== undefined ? { terminalPriorAnswerVisible: ctx.terminalPriorAnswerVisible } : {}),
@@ -1621,4 +1676,5 @@ export async function runCoreTurn(
       }
     }
   });
+  }
 }

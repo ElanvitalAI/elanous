@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { decideGraphApproval, type GraphRunState } from './runner.js';
+import { decideGraphApproval, hitlChoiceDecision, type GraphRunState } from './runner.js';
 
 export interface GraphApprovalCardDeps {
   root?: string;
@@ -46,8 +46,11 @@ export function raiseApprovalCard(state: GraphRunState, pending: Pending, deps: 
   const title = publish && firstLine ? firstLine : `${state.graphId} ${version} — ${nodeId} 승인`;
   const entry = ledger.raise({ title, category: publish ? 'publish' : 'scope',
     scqa: { s: `${state.graphId} / ${state.runId} 런이 ${nodeId} 승인에서 대기 중이다.`, c: pending.message.slice(0, 220) || '승인 대기 중이다.' },
-    options: [{ key: 'a', label: '승인', consequence: `${nodeId} 승인 후 런을 계속할 수 있다` },
-      { key: 'b', label: '거절', consequence: `${nodeId} 거절로 기록한다` }],
+    // N-way HITL (3+ declared options): one ledger letter per option, in declared order; yes/no cards are unchanged.
+    options: pending.choices?.length ? pending.choices.map((option, index) => ({ key: String.fromCharCode(97 + index), label: option.key,
+      consequence: `${nodeId} → ${option.exit}${option.default === true ? ' (거절로 기록)' : ''}` }))
+      : [{ key: 'a', label: '승인', consequence: `${nodeId} 승인 후 런을 계속할 수 있다` },
+        { key: 'b', label: '거절', consequence: `${nodeId} 거절로 기록한다` }],
     recommendation: { skipped: true, reason: '사람 판단' }, raisedBy: { agent: 'graph-runner' }, refs: [ref] });
   observation('raised', identity, entry.id);
   return entry;
@@ -76,7 +79,7 @@ export function applyDecidedApprovals(deps: GraphApprovalCardDeps = {}): number 
 function applyOne(entry: DecisionEntry, identity: { graphId: string; runId: string; nodeId: string }, visit: number, root: string, approvalNonce?: string): boolean {
   const { graphId, runId, nodeId } = identity;
   // Graph approvals gate irreversible steps (publish) — only a person's answer approves or rejects, never a delegated auto decision.
-  if ((entry.choice !== 'a' && entry.choice !== 'b') || entry.decidedBy?.kind !== 'human' || !Number.isSafeInteger(visit)) {
+  if (typeof entry.choice !== 'string' || !/^[a-i]$/.test(entry.choice) || entry.decidedBy?.kind !== 'human' || !Number.isSafeInteger(visit)) {
     observation('skipped', identity, entry.id, entry.choice);
     return false;
   }
@@ -96,9 +99,15 @@ function applyOne(entry: DecisionEntry, identity: { graphId: string; runId: stri
     observation('skipped', identity, entry.id, entry.choice);
     return false;
   }
-  const outcome = entry.choice === 'a' ? 'approved' : 'rejected';
-  try { decideGraphApproval(graphId, runId, outcome, `owner:${entry.decidedBy.kind}`, root,
-    { nodeId, visit: visit }); }
+  const choices = state.pending.choices;
+  const option = choices ? choices[entry.choice.charCodeAt(0) - 97] : undefined;
+  if (choices ? !option : entry.choice !== 'a' && entry.choice !== 'b') {
+    observation('skipped', identity, entry.id, entry.choice, choices ? 'choice-out-of-range' : undefined);
+    return false;
+  }
+  const outcome = option ? hitlChoiceDecision(option) : entry.choice === 'a' ? 'approved' : 'rejected';
+  try { decideGraphApproval(graphId, runId, outcome, `owner:${entry.decidedBy!.kind}`, root,
+    { nodeId, visit: visit }, option?.key); }
   catch (error) {
     // A CLI approver (or another notifier) may win the atomic hard-link claim.
     // A resumed run may also have left this visit before the writer reads it.

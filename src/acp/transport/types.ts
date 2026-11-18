@@ -7,6 +7,9 @@
 /** An inbound ACP connection. Each connection is a single bidirectional
  *  byte stream — the ACP SDK's `ndJsonStream()` wraps it into the
  *  JSON-RPC layer. */
+/** Caller class of an ACP connection. Only 'operator' may open operator-only taps (debug envelope). */
+export type AcpAudience = 'operator' | 'member' | 'unknown';
+
 export interface AcpTransportConnection {
   /** Bytes from the client to elanous. */
   readable: ReadableStream<Uint8Array>;
@@ -16,6 +19,8 @@ export interface AcpTransportConnection {
    *  metric tagging. Socket transports fill in a peer address, stdio
    *  uses 'stdio', ssh uses the remote hostname. */
   peerId: string;
+  /** Who opened this connection, decided once by the server at the upgrade. Absent = 'unknown' (fail-closed). */
+  audience?: AcpAudience;
   /** Close the connection. Safe to call more than once. */
   close(): Promise<void>;
 }

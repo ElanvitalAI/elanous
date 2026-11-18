@@ -89,8 +89,11 @@ describe('headless-core guard — ACP server side stays TUI-free', () => {
       'src/core-turn/run-core-turn.ts',
       'src/core-turn/index.ts',
     ];
+    // 2026-11-18 TURN-ROUTE-PIN #38006 — 코어 턴은 core 단위테스트 소유의 순수 핀 모듈만 참조한다
+    // (플러그인 의존성 주입 지점 · TUI/dashboard 렌더러 아님 · findForbiddenImports 화이트리스트 밖 신규 계층).
+    const allowed = new Set(['../plugins/core/turn-route-pin.js']);
     for (const rel of modules) {
-      const hits = findForbiddenImports(readModule(rel));
+      const hits = findForbiddenImports(readModule(rel)).filter((hit) => !allowed.has(hit));
       expect([rel, hits]).toEqual([rel, []]);
     }
   });
@@ -172,8 +175,8 @@ describe('findForbiddenImports — unit', () => {
   test('passes benign imports', () => {
     const src = `
       import { foo } from 'node:path';
-      import { bar } from '../acp/client.js';
-      import { baz } from '../session-store/index.js';
+      import { bar } from '../src/acp/client.js';
+      import { baz } from '../src/session-store/index.js';
     `;
     expect(findForbiddenImports(src)).toEqual([]);
   });

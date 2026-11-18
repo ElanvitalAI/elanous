@@ -17,6 +17,8 @@ test('approval implementation types remain private to the handler module', () =>
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
+const INPUT_SHA256 = 'f08694eca6870c7c40c4944026b8e76ff441c127f80d885a776131f70f760da4';
+
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'graph-approvals-'));
   roots.push(root);
@@ -25,7 +27,10 @@ function fixture() {
   const pending = {
     graphId: 'release-loop', runId: 'waiting', status: 'awaiting-approval', path: ['prepare', 'approve-publish'],
     nodes: [{ nodeId: 'prepare', ok: true, output: 'raw secret stdout\n{"outcome":"ready","summary":"Ready"}' }],
-    pending: { nodeId: 'approve-publish', message: 'Publish?', since: '2026-09-29T00:00:00Z' },
+    // #36491: a card binds the input it showed; a fresh runner pending always carries this pin.
+    // Literal = sha256 of the bytes {"version":"0.3.30"} (computed outside the product).
+    input: { version: '0.3.30' },
+    pending: { nodeId: 'approve-publish', message: 'Publish?', since: '2026-09-29T00:00:00Z', inputSha256: INPUT_SHA256 },
   };
   writeFileSync(join(dir, 'waiting.json'), JSON.stringify(pending));
   writeFileSync(join(dir, 'done.json'), JSON.stringify({ ...pending, runId: 'done', pending: { ...pending.pending, decision: 'approved' } }));
@@ -86,7 +91,8 @@ test('POST decides with runner claim, hides the run on next GET; 404/409/400 and
   const approved = await call(url, 'POST', { decision: 'approved' });
   expect(approved.status).toBe(200);
   expect(await approved.json()).toEqual({ graphId: 'release-loop', runId: 'waiting', decision: 'approved' });
-  expect(JSON.parse(readFileSync(join(dir, 'waiting.json.2.decision.json'), 'utf8'))).toMatchObject({ nodeId: 'approve-publish', decision: 'approved', decidedBy: 'pwa:bearer-match' });
+  expect(JSON.parse(readFileSync(join(dir, 'waiting.json.2.decision.json'), 'utf8'))).toMatchObject({ nodeId: 'approve-publish', decision: 'approved', decidedBy: 'pwa:bearer-match',
+    inputSha256: 'f08694eca6870c7c40c4944026b8e76ff441c127f80d885a776131f70f760da4' });
   expect(JSON.parse(readFileSync(join(dir, 'waiting.json'), 'utf8')).pending.decision).toBeUndefined();
   await expect((await call('http://localhost/v1/graph-approvals')).json()).resolves.toEqual({
     items: [],

@@ -7,6 +7,7 @@
 // the drafted plan into a fresh session.
 
 import { streamLLM, type LLMMessage } from '../llm.js';
+import { redactSecretText, redactSecrets } from '../debug/secret-redaction.js';
 
 const COMPACT_SYSTEM_PROMPT = `
 You are performing a CONTEXT CHECKPOINT COMPACTION for another agent
@@ -30,6 +31,13 @@ Write the final summary in plain text with exactly these sections:
 
 ## Accomplished
 - concrete work already completed, including files edited or decisions made
+
+## In progress / next steps
+- the work underway when the transcript ends, and the very next concrete step
+
+## Commitments
+- promises still open: what · to whom (the user, a seat, a PR) · by when — scheduled wakeups, reports owed,
+  replies promised. Write "- none" when there are none.
 
 ## Relevant files / directories
 - short path-oriented list with why each matters
@@ -70,6 +78,27 @@ export function getCompactSystemPrompt(): string {
   return COMPACT_SYSTEM_PROMPT;
 }
 
+/**
+ * OP-LONG-SESSION-COMPACT (O4) — longest rendering of one tool call's arguments in the transcript. A promise often lives
+ * only in a call (ScheduleWakeup reason · `eln msg post …`); dropping calls dropped it from the summary.
+ * Source: one wakeup reason or one msg post command fits; tool results stay out (they are the bloat).
+ */
+export const COMPACT_TOOL_CALL_ARGS_MAX = 200;
+
+function renderToolCall(block: { name?: unknown; input?: unknown }): string {
+  let args = '';
+  // JUD #38613 ⓒ-2: redact the STRUCTURE first — after JSON.stringify a newline is the two characters `\n`, so a secret
+  // at the start of the second line of a multi-line command (`\nSERVICE_TOKEN=…` · `\nsk-…`) was no longer at a word
+  // boundary and slipped past the text rules.
+  try { args = JSON.stringify(redactSecrets(block.input ?? {})) ?? ''; } catch { args = ''; }
+  // JUD #38613 ⓒ: tool arguments carry tokens (a Bash `curl -H "Authorization: Bearer …"`, `GH_TOKEN=…`, a URL with
+  // user:password@) and the summary is written to disk (plan-mode handoff → MEMORY.md). Redact BEFORE the cut, so a
+  // secret split by the cap is not left half-visible.
+  args = redactSecretText(args).replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s\/@:"]+:[^\s\/@"]+@/gi, '$1***@');
+  if (args.length > COMPACT_TOOL_CALL_ARGS_MAX) args = `${args.slice(0, COMPACT_TOOL_CALL_ARGS_MAX)}…`;
+  return `[tool ${String(block.name ?? '?')}] ${args}`;
+}
+
 export function buildCompactTranscript(
   history: readonly LLMMessage[],
 ): string {
@@ -79,8 +108,8 @@ export function buildCompactTranscript(
       const content = typeof m.content === 'string'
         ? m.content
         : (m.content as any[])
-          .filter((b) => b?.type === 'text')
-          .map((b) => (b as any).text)
+          .filter((b) => b?.type === 'text' || b?.type === 'tool_use')
+          .map((b) => (b?.type === 'tool_use' ? renderToolCall(b) : (b as any).text))
           .join('\n');
       return `${m.role.toUpperCase()}: ${content}`;
     })

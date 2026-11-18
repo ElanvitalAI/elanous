@@ -46,6 +46,11 @@ import {
   SHELL_DEFAULT_TIMEOUT_MS, SHELL_KILL_GRACE_MS, SHELL_MAX_TIMEOUT_MS, SHELL_MIN_TIMEOUT_MS,
   createShellWatchdog, reportShellWatchdog, resolveShellStallMs, type ShellWatchdogResult,
 } from '../../tool-runtime/shell-watchdog.js';
+import { createCapsulePolicy } from '../../core-turn/capsule-policy.js';
+import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.js';
+import { runShellCapsule, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
+import { readUserConfigObject } from '../../user-config/read.js';
+import { userConfigPath } from '../../user-config.js';
 import {
   createSeqTracker,
   makeEnvelope,
@@ -487,6 +492,44 @@ export async function dispatchBash(
     });
     child.on('close', (code) => finish(code));
   });
+}
+
+/** CAPSULE-A2 — the Bash result's capsule status: a watchdog stop is a timeout, an Esc/stop is cancelled. */
+export function bashCapsuleStatus(result: BashResult): CapsuleStatus {
+  if (result.timedOut || result.watchdog) return 'timeout';
+  if (result.aborted) return 'cancelled';
+  return result.exitCode === 0 ? 'ok' : 'failed';
+}
+
+/** CAPSULE-A2 — what the turn reads when its Bash call moved to the background. Wording is the model contract (A5 owns
+ *  the tool descriptions): do not wait, do not poll, the completion opens a new turn. */
+export function bashCapsuleStartedResult(capsuleId: string, syncCapMs: number): BashResult {
+  const output = `[capsule shell ${capsuleId} started] Still running after ${Math.round(syncCapMs / 1000)}s, so it moved to the `
+    + 'background (same process, same timeout). Do not wait or poll for it: finish this turn. Its result arrives as a new '
+    + `turn event (capsule-done ${capsuleId}).`;
+  return { stdout: '', stderr: '', output, exitCode: null, timedOut: false, aborted: false, durationMs: syncCapMs };
+}
+
+/** CAPSULE-A2-BASH-DETACH — `dispatchBash` under the capsule policy: past `syncCapMs` (10s) the same process continues
+ *  as a shell capsule (no switch since CAPSULE-FLAGS-REMOVE-DEFAULT). */
+export function dispatchBashCapsule(
+  args: Record<string, unknown>,
+  opts: BashToolOpts,
+  deps: Omit<ShellCapsuleDeps, 'policy'> & { readonly policy?: CapsulePolicy } = {},
+): Promise<BashResult> {
+  const policy = deps.policy ?? createCapsulePolicy({
+    turnConfig: () => readUserConfigObject(userConfigPath())?.turn,
+    ...(deps.correlation?.turnId ? { correlation: { turnId: deps.correlation.turnId } } : {}),
+  });
+  const { signal, ...rest } = opts;
+  return runShellCapsule<BashResult>({
+    tool: 'Bash',
+    command: typeof args.command === 'string' ? args.command : '',
+    ...(signal ? { turnSignal: signal } : {}),
+    start: (own) => dispatchBash(args, own ? { ...rest, signal: own } : rest),
+    describe: (result) => ({ status: bashCapsuleStatus(result), output: result.output }),
+    started: bashCapsuleStartedResult,
+  }, { ...deps, policy });
 }
 
 // ── internals ──

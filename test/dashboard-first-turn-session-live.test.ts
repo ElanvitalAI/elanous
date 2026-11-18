@@ -120,7 +120,7 @@ describe('first TUI turn session (in-process devices)', () => {
     expect(emptyComposer(boot!.lines)).toBe(true);
     expect(turn!.lines.join('\n')).toContain('esc 중단');
     expect(emptyComposer(turn!.lines)).toBe(true);
-    expect(after!.lines.join('\n')).toContain('✔ 완료');
+    expect(after!.lines.join('\n')).toContain('✔ done'); // Source: main 11ec8c7d9e (#38144) — thinking-line.ts:189 turn-end label 영어화; 실측 화면 `✔ done  (✻ Worked for 1s · done 1:43 PM)`  // 출처: #38144 (11ec8c7d9e) — thinking-line.ts:189 stoppedMessage 영어화
     expect(after!.lines.join('\n')).not.toContain('Streaming…');
     expect(after!.lines.filter((line) => line.includes('❯ 안녕'))).toHaveLength(1);
     expect(emptyComposer(after!.lines)).toBe(true);

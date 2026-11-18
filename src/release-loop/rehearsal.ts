@@ -21,6 +21,7 @@ import { preflightGateExecutionIdentity, type GatePodExecutionIdentity } from '.
 import { gateShardLedgerBatchComplete, gateShardLedgerPath, readGateShardLedger } from './gate-shard-ledger.js';
 import { gateShardsPath, readGateShards } from './gate-shards.js';
 import { createCommandCloudVmAdapter, type CloudVmAdapter } from './cloud-vm-adapter.js';
+import { realpathProbeSummary, runRealpathProbe, type RealpathProbeReceipt } from '../../scripts/release-loop/realpath-probe.js';
 
 export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
 export type RehearsalOutcome = 'ok' | 'regression' | 'unmeasured' | 'error' | 'no-checkout' | 'checkout-dirty' | 'superseded' | 'interrupted';
@@ -102,6 +103,8 @@ export interface RehearsalStamp {
   /** B6: an unmeasured hard gate always retains a cause, run id and durable local evidence path. */
   measurementGap?: { cause: string; runId: string; evidence: string };
   shardPlan?: RehearsalShardPlan;
+  /** RELEASE-REALPATH-PROBE per-stage receipt of the real cut image prebuild (push probed, never performed). */
+  realpathProbe?: RealpathProbeReceipt;
   leakCheck?: { outcome: 'ok' | 'fail'; sha: string; exitCode: number | null; detail?: string };
   selection?: { shards?: number; remote?: string; fullFallback?: { reason: string; plannedShards?: number } };
   notifiedAt?: string;
@@ -136,6 +139,7 @@ export interface RehearsalDeps {
   notify?: (text: string) => void | boolean | Promise<void | boolean>;
   git?: (args: string[], cwd: string) => { rc: number | null; stdout: string; stderr?: string };
   leakCheck?: (checkout: string) => { status: number | null; detail?: string };
+  realpathProbe?: typeof runRealpathProbe;
   resumeGate?: (runId: string, checkout: string) => Promise<{ files: number; durationMs: number; poolOverwriteApplied: boolean; ok: boolean }>;
 }
 
@@ -682,10 +686,16 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               const hardGateRunId = stamp.hardGateRunId;
               const hardGateLog = stamp.hardGateLog;
               if (!hardGateRunId || !hardGateLog) throw new Error('hard rehearsal claim has no evidence identity');
+              // Boot aws1 before any probe/clone touches the checkout: the stopped-VM base pull
+              // failure must postpone the step here, not after a wasted probe run.
               if (plan.run === 'hard-mid') {
                 try { await ensureCloudVmReady(); }
                 catch (error) { return await postponeCloudStep(error); }
               }
+              // RELEASE-REALPATH-PROBE: walk the real cut image prebuild (clone→push probe) before the Pod gate.
+              const probe = (deps.realpathProbe ?? runRealpathProbe)({ checkout, commit: stamp.sha, version: plan.version,
+                runId: hardGateRunId, pool: opts.podPool ?? releaseLoopConfig().gatePodPool });
+              stamp.realpathProbe = probe;
               const hard = await (deps.hardGate ?? ((version, cwd, sha, ledger, id, host) =>
                 runHardGate(version, cwd, sha, ledger, id, host, deps.hardGateGraphPins, deps.hardGateIdentity, deps.hardGateSpawn, opts.podPool)))
                 (plan.version, checkout, stamp.sha, root, hardGateRunId, targetHost, opts.podPool);
@@ -704,11 +714,15 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
                 ? measuredHard.error?.trim() || 'hard rehearsal execution identity unavailable' : 'regression verdict has no introduced IDs'))
                 : measuredHard.outcome === 'error' ? measuredHard.error?.trim() || 'gate returned error without a cause' : undefined;
               if (cause) stamp.measurementGap = { cause, runId: hardGateRunId, evidence: hardGateLog };
+              if (probe?.outcome === 'failed' && stamp.outcome === 'ok') {
+                stamp.outcome = 'error';
+                stamp.measurementGap = { cause: realpathProbeSummary(probe), runId: hardGateRunId, evidence: hardGateLog };
+              }
               const introducedCount: number | null = stamp.outcome === 'unmeasured' || stamp.outcome === 'error' ? null : hard.introduced.length;
               const preexistingCount: number | null = introducedCount === null ? null : hard.preexisting;
               const totalFailures: number | null = introducedCount === null || preexistingCount === null ? null : introducedCount + preexistingCount;
               const receiptStatus = gateReceiptFailure ? ` · HQ 원장 영수증 실패: ${gateReceiptFailure}` : '';
-              stamp.summary = oneLine(`hard gate ${measuredHard.outcome} · introduced ${introducedCount ?? 'UNKNOWN'} · preexisting ${preexistingCount ?? 'UNKNOWN'} · total failures ${totalFailures ?? 'UNKNOWN'} · 원격 Pod ${targetHost} · 12 shards · runId ${hardGateRunId} · evidence ${hardGateLog}${cause ? ` · ${cause}` : ''}${receiptStatus}`);
+              stamp.summary = oneLine(`hard gate ${measuredHard.outcome} · introduced ${introducedCount ?? 'UNKNOWN'} · preexisting ${preexistingCount ?? 'UNKNOWN'} · total failures ${totalFailures ?? 'UNKNOWN'} · 원격 Pod ${targetHost} · 12 shards · runId ${hardGateRunId} · evidence ${hardGateLog}${cause ? ` · ${cause}` : ''}${receiptStatus} · ${realpathProbeSummary(probe)}`);
             } else {
             const shardPlan = opts.shards === undefined ? (deps.shardPlan ?? planRehearsalShards)(plan.version, root, checkout, { ...deps.shardPlanDeps, remoteGate: true }) : undefined;
             if (shardPlan) stamp.shardPlan = shardPlan;

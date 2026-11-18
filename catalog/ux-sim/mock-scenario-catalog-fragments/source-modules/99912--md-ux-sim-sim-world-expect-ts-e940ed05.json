@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-EXPECT-TS",
+  "path": "src/ux-sim/sim-world/expect.ts",
+  "boundary": "Parses sim-world-expect.json and maps expected red/green, actual, previous green, same-PR promote and the declared red reason onto the xfail/promote/regression verdict, splitting absent and malformed outcomes first.",
+  "deviceIds": [
+    "sim-world-kernel"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

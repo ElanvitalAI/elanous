@@ -1242,6 +1242,22 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(result.get('pool-node-c')!.detail).toContain('pack failed');
   });
 
+  test('RELEASE-REALPATH-PROBE: a node-side build.sh that exits 7 surfaces buildExit 7 on the failed sync row', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pool-build-exit-'));
+    try {
+      const script = join(dir, 'build.sh');
+      writeFileSync(script, 'echo "layer broke" >&2\nexit 7\n');
+      const run: RemoteRun = (_host, cmd) => (cmd.includes('docker inspect k3d-elanous-registry') || cmd.includes('/tags/list')
+        ? { status: 1, stdout: '', stderr: '' } : { status: 0, stdout: 'old', stderr: '' });
+      const result = await syncPoolImages(parsePodPool('pool-node-c@node-c:1'), 'img', 'target', {
+        run, remoteBuild: () => runBuildScript(script, { ...process.env }), waitMaxMs: 0,
+        inspect: () => ({ status: 0, stdout: 'target' }),
+        transfer: () => ({ status: 1, stderr: 'ship refused' }),
+      });
+      expect(result.get('pool-node-c')).toMatchObject({ ok: false, buildExit: 7 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   // 🩸 2026-10-06 MINIH-PACK: 멤버마다 build.sh 가 같은 트리에서 pack 을 동시에 돌려 한쪽이 «⛔ pack» 으로 빠졌다.
   test('two remote members share one pack; its failure reason reaches the detail; single and fresh members do not pack', async () => {
     const labels = new Map<string, string>([['node-b', 'old'], ['node-c', 'old']]);

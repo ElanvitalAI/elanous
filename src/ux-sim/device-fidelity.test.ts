@@ -5,7 +5,8 @@ import { constants as fsConstants, closeSync, mkdirSync, mkdtempSync, openSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
-import { applyDeviceFidelity, canonicalizeDeviceResponse, compareDeviceRecording, compareLlmCassetteRecording, deviceFidelityStatus } from './device-fidelity.js';
+import { applyDeviceFidelity, canonicalizeDeviceResponse, compareDeviceRecording, compareDeviceResponseShapes, compareLlmCassetteRecording, deviceFidelityStatus,
+  deviceResponseShapeProblems } from './device-fidelity.js';
 
 const previousRoot = getTestStateRoot();
 const roots: string[] = [];
@@ -162,4 +163,36 @@ test('lossless JSON normalization does not collapse integers above the safe rang
     .toBe(canonicalizeDeviceResponse('{"y":[2],"x":1}'));
   expect(canonicalizeDeviceResponse('{"count":1}')).toBe(canonicalizeDeviceResponse('{"count":1.0}'));
   expect(canonicalizeDeviceResponse('{"count":1}')).toBe(canonicalizeDeviceResponse('{"count":1e0}'));
+});
+
+// SIM-WORLD 대표 quality bar 3: shape fidelity. The real sample is a literal redacted `GET /pulls` reply, not product code.
+const REAL_PULL = { number: 1, state: 'open', head: { ref: 'x', sha: 'y' }, labels: [{ name: 'x' }], merged_at: null };
+
+test('shape fidelity: the real shape passes and values are not compared', () => {
+  expect(deviceResponseShapeProblems(REAL_PULL, { number: 38422, state: 'closed', head: { ref: 'a', sha: 'b' }, labels: [], merged_at: null })).toEqual([]);
+});
+
+test('shape fidelity: a missing key, an extra key, a type change and a bad array element are each reported', () => {
+  expect(deviceResponseShapeProblems(REAL_PULL, { number: '1', state: 'open', labels: [{ name: 'x' }, { title: 'y' }], merged_at: null, fakeOnly: true })).toEqual([
+    '$.head: missing in fake',
+    '$.labels[1].name: missing in fake',
+    '$.labels[1].title: not in real output',
+    '$.number: real is number, fake is string',
+    '$.fakeOnly: not in real output',
+  ]);
+  expect(deviceResponseShapeProblems([], {})).toEqual(['$: real is array, fake is object']);
+});
+
+test('shape fidelity is persisted in the fidelity store: a lenient fake turns the device yellow, no output is not green', () => {
+  withFidelityRoot();
+  const pulls = recording(realPullResponse);
+  const ok = compareDeviceResponseShapes({ recording: pulls, call: 0, label: 'K01', responses: [realPullResponse] }, new Date('2026-11-18T00:00:00.000Z'));
+  expect([ok.recordingId, ok.passed, ok.problems]).toEqual(['shape.github-pulls-open.0.K01', true, []]);
+  expect(deviceFidelityStatus('fake-github', ['shape.github-pulls-open.0.K01']).verdict).toBe('green');
+  const loose = compareDeviceResponseShapes({ recording: pulls, call: 0, label: 'K09', responses: ['[{"number":7,"title":"t"}]'] });
+  expect(loose.problems.slice(0, 2)).toEqual(['#0 $[0].base: missing in fake', '#0 $[0].body: missing in fake']);
+  expect(deviceFidelityStatus('fake-github', ['shape.github-pulls-open.0.K09'])).toEqual({ verdict: 'yellow', failedRecordingIds: ['shape.github-pulls-open.0.K09'] });
+  const none = compareDeviceResponseShapes({ recording: pulls, call: 0, label: 'K10', responses: [] });
+  expect([none.passed, none.problems]).toEqual([false, ['no fake responses to check']]);
+  expect(() => compareDeviceResponseShapes({ recording: pulls, call: 3, label: 'K11', responses: ['[]'] })).toThrow('recording github-pulls-open has no call 3');
 });

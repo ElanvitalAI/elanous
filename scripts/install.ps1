@@ -409,6 +409,15 @@ try {
     $packed = Get-ChildItem -LiteralPath $tempDirectory -Filter '*.tgz' | Where-Object { $_.Name -ne 'package.tgz' } | Select-Object -First 1 -ExpandProperty FullName
     if (-not $packed) { Fail 'package tarball was not created' 1 }
     Move-Item -LiteralPath $packed -Destination $installTarball
+    # bun pm pack drops a gitignored apps/pwa/out (a real directory or a symlink to .pwa-generations) - put its files in the tarball, as install.sh does.
+    if (Test-Path -LiteralPath (Join-Path $repoRoot 'apps\pwa\out\index.html')) {
+      Push-Location $repoRoot
+      try {
+        # Single quotes inside the script: Windows PowerShell 5.1 mangles embedded double quotes in native arguments.
+        & bun -e 'import { packPwaOutput } from ''./scripts/lib/pack-pwa-output.ts''; packPwaOutput(process.argv[1], process.argv[2]);' $repoRoot $installTarball
+        if ($LASTEXITCODE -ne 0) { Fail 'PWA output could not be added to the package tarball' 1 }
+      } finally { Pop-Location }
+    }
     $metadataSource = $repoRoot
     # Only a checkout install is this repo. A missing git or a failed rev-parse stays empty - the install does not die.
     $head = Invoke-Quiet { git -C $repoRoot rev-parse HEAD }

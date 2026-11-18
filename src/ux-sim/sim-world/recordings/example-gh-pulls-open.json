@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "id": "example-gh-pulls-open",
+  "deviceId": "fake-github",
+  "repository": "acme/widget",
+  "recordedAt": "2026-11-04T10:00:00.000Z",
+  "prs": [
+    { "number": 7, "title": "Recorded PR", "branch": "feature/recorded", "createdAt": "2026-11-03T00:00:00.000Z", "updatedAt": "2026-11-04T09:00:00.000Z" }
+  ],
+  "calls": [
+    {
+      "args": ["api", "/repos/acme/widget/pulls?state=open"],
+      "realResponse": "[{\"number\":7,\"title\":\"Recorded PR\",\"draft\":false,\"state\":\"open\",\"head\":{\"ref\":\"feature/recorded\",\"sha\":\"head7\"},\"base\":{\"ref\":\"main\"},\"labels\":[],\"created_at\":\"2026-11-03T00:00:00.000Z\",\"updated_at\":\"2026-11-04T09:00:00.000Z\",\"merged_at\":null,\"body\":null,\"merge_commit_sha\":null}]"
+    }
+  ]
+}

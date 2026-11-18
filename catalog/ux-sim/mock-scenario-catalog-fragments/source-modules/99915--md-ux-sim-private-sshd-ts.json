@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-PRIVATE-SSHD-TS",
+  "path": "src/ux-sim/private-sshd.ts",
+  "boundary": "Starts the current user's own sshd on a free loopback port with throw-away keys in a temp folder so tests can do real public-key logins as the current user; it never touches ~/.ssh or the system sshd and stop() tears it down",
+  "deviceIds": ["private-sshd"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

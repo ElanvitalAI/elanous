@@ -356,7 +356,8 @@ test('historical Markdown imports recorded D/E decisions with unknown alternativ
     expect(item.options).toEqual([]);
   }
   expect(entries.filter(e => e.decidedBy?.kind === 'auto')).toHaveLength(5);
-  expect(entries.filter(e => e.decidedBy?.kind === 'human')).toHaveLength(5);
+  expect(entries.filter(e => e.decidedBy?.kind === 'human')).toHaveLength(0);
+  expect(entries.filter(e => e.decidedBy?.kind === 'imported')).toHaveLength(5);
   for (const code of ['D1', 'D2', 'D3', 'D4', 'D5', 'E1', 'E2', 'E3', 'E4']) {
     const item = entries.find(e => e.refs?.some(r => r.endsWith(`#${code}`)))!;
     expect(item.options).toEqual([]);
@@ -370,14 +371,14 @@ test('historical Markdown imports recorded D/E decisions with unknown alternativ
   expect(c4.choice).toBe('b');
   expect(entries.find(e => e.refs?.some(r => r.endsWith('#A1')))?.recommendation).toMatchObject({ skipped: true });
   expect(entries.find(e => e.refs?.some(r => r.endsWith('#D3')))?.decidedBy).toMatchObject({ kind: 'auto', delegation: '대표 09-30 01:4x 결정사항 S 에게' });
-  expect(c4.decidedBy).toEqual({ kind: 'human' });
+  expect(c4.decidedBy).toEqual({ kind: 'imported', source: 'markdown C4' });
   expect(c4.decidedAt).toBeUndefined();
   expect(c4.versionAtDecision).toBeUndefined();
   expect(c4.history[1]?.at).toBeUndefined();
   expect(formatDecisionDetail(c4)).toContain('결정: 시각 미상');
   expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(33);
   const c4Events = readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { type: string; id?: string; at?: string; by?: unknown; choice?: string; note?: string });
-  expect(c4Events.filter(event => event.id === c4.id)).toEqual([{ type: 'decided', id: c4.id, by: { kind: 'human' }, choice: 'b', note: c4.note }]);
+  expect(c4Events.filter(event => event.id === c4.id)).toEqual([{ type: 'decided', id: c4.id, by: { kind: 'imported', source: 'markdown C4' }, choice: 'b', note: c4.note }]);
   const rerun = importDecisionMarkdown(store, 'docs/DECISIONS-for-ceo-pending-2026-09-30.md');
   expect(rerun.existing).toEqual(result.imported);
   expect(rerun.unread).toEqual(result.unread);
@@ -752,4 +753,13 @@ test('raise and auto-decide accept seat names (OP·MK·TC·UX) as track while ol
   expect(decided.decidedBy).toEqual({ kind: 'auto', agent: 'claude', track: 'TC', delegation: 'seat delegation' });
   expect(store.raise({ ...base, raisedBy: { agent: 'codex', track: 'S' } }).raisedBy.track).toBe('S');
   expect(() => store.raise({ ...base, raisedBy: { agent: 'codex', track: 'XX' as never } })).toThrow('invalid track');
+});
+
+test('DECISION-LEDGER-HUMAN-AUTH PR-1 — human via/platformUserId are kept only in their known shapes', () => {
+  const store = new DecisionLedger({ stateDir: mkdtempSync(join(tmpdir(), 'decisions-via-')), resolveVersion: () => ({ released: null, dev: null, codename: null }) });
+  const raise = (title: string) => store.raise({ title, category: 'scope', scqa: { s: 'S.', c: 'C.' }, options: [{ key: 'a', label: 'A', consequence: 'x' }, { key: 'b', label: 'B', consequence: 'y' }],
+    recommendation: { skipped: true, reason: 'n/a' }, raisedBy: { agent: 'codex' } });
+  expect(store.decide(raise('tg').id, 'a', { kind: 'human', via: 'telegram', platformUserId: '111' }).decidedBy).toEqual({ kind: 'human', via: 'telegram', platformUserId: '111' });
+  expect(store.decide(raise('junk').id, 'a', { kind: 'human', via: 'carrier-pigeon', platformUserId: 'bot123:SECRET/x' } as never).decidedBy).toEqual({ kind: 'human' });
+  expect(() => store.decide(raise('imp').id, 'a', { kind: 'imported', source: 'x' } as never)).toThrow('decidedBy is required');
 });

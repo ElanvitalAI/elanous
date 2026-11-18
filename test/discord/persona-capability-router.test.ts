@@ -46,6 +46,16 @@ describe('createPersonaCapabilityRouter — role-based grants', () => {
 });
 
 describe('createPersonaCapabilityRouter — explicit grants', () => {
+  test('expired grant gives an explicit denial reason', () => {
+    let now = 1000;
+    const store = createCapabilityGrantStore({ now: () => new Date(now) });
+    const router = createPersonaCapabilityRouter({ grantStore: store });
+    router.setPersona({ persona: 'visitor', role: 'guest' });
+    store.grant({ persona: 'visitor', action: 'write', grantedAt: new Date(now).toISOString(), expiresAt: new Date(2000).toISOString() });
+    now = 3000;
+    expect(router.decide({ persona: 'visitor', action: 'write' })).toEqual({ allowed: false, reason: 'expired' });
+  });
+
   test('guest with explicit grant via store → allowed', () => {
     const store = createCapabilityGrantStore();
     const router = createPersonaCapabilityRouter({ grantStore: store });

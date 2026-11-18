@@ -5,6 +5,7 @@ import { join, isAbsolute } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandResult, type CommandRunner } from './node-verdict.js';
 import { prereleaseKind } from './release-version.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string; restart?: 'no-service' }
 /** Where the internal feed is packed from: a checkout of the release tag, never the run's working tree. */
@@ -109,7 +110,7 @@ export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeD
     let source: FeedSource | undefined;
     try {
       source = (deps.feedSource ?? tagFeedSource(run))(version);
-      const released = context.outputs['version-release']?.commit;
+      const released = releaseCutRecord(context)?.commit;
       if (typeof released === 'string' && released && released !== source.commit) {
         feedError = `내부 피드 발행 실패: 태그 v${version}(${source.commit.slice(0, 12)})가 컷(${released.slice(0, 12)})과 다르다`;
       } else {

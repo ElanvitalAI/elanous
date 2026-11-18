@@ -123,10 +123,15 @@ function failedAfterGate(state: GraphRunState, index: number): boolean {
  * This recognizes an error message, never authorizes a waiver or bypasses the runner's approval boundary.
  */
 function canonicalPreGatePrefix(prefix: string[]): boolean {
-  const expected = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
+  const legacy = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
     'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep'];
-  const withApproval = [...expected.slice(0, 6), 'approve-cloud-elastic', ...expected.slice(6)];
-  return [expected, withApproval].some((path) => path.length === prefix.length
+  const expected = ['cut-branch', 'gate-image-prebuild', ...legacy.slice(1)];
+  const withApproval = (path: string[]) => {
+    const anchor = path.indexOf('cloud-approval-check');
+    const at = anchor >= 0 ? anchor + 1 : 6;
+    return [...path.slice(0, at), 'approve-cloud-elastic', ...path.slice(at)];
+  };
+  return [legacy, withApproval(legacy), expected, withApproval(expected)].some((path) => path.length === prefix.length
     && path.every((nodeId, index) => prefix[index] === nodeId));
 }
 
@@ -136,7 +141,7 @@ function rejectedHealRequiresNewRun(state: GraphRunState, gateIndex: number): bo
   const gate = state.nodes[gateIndex];
   if (state.status !== 'failed' || state.path.length !== state.nodes.length
     || gate?.nodeId !== 'gate' || gate.ok !== false || gate.executed !== true
-    || state.path[0] !== 'version-release' || state.nodes[0]?.nodeId !== 'version-release'
+    || (state.path[0] !== 'version-release' && state.path[0] !== 'cut-branch') || state.nodes[0]?.nodeId !== state.path[0]
     || state.nodes[0]?.ok !== true || state.nodes[0]?.executed !== true
     || !canonicalPreGatePrefix(state.path.slice(0, gateIndex))
     || state.path.slice(0, gateIndex).some((nodeId, index) => state.nodes[index]?.nodeId !== nodeId)
@@ -416,7 +421,7 @@ export function releaseGateSweepCarry(
   source: string,
 ): GateSweepCarry {
   if (evidence.graphId !== 'release-loop' || typeof evidence.runId !== 'string' || !evidence.runId) throw new Error('evidence run is not a release-loop run');
-  const cutOutput = lastJsonObject(evidence.nodes?.find((record) => record.nodeId === 'version-release')?.output);
+  const cutOutput = lastJsonObject(evidence.nodes?.find((record) => record.nodeId === 'cut-branch' || record.nodeId === 'version-release')?.output);
   const version = cutOutput?.version, cut = cutOutput?.commit;
   if (typeof version !== 'string' || typeof cut !== 'string' || !/^[0-9a-f]{40}$/i.test(cut)) throw new Error('evidence run has no recorded release cut');
   if (version !== current.version) throw new Error(`evidence run is release ${version}, not ${current.version}`);

@@ -146,7 +146,9 @@ describe('http-server.ts wiring · source-level grep guard', () => {
     // `handleLlmRoutePredict(req,` (the wire call · unique) rather
     // than the path literal which also appears in the JSDoc above
     // the opts interface.
-    const muteIdx = src.indexOf("if (method !== 'GET') {");
+    // Quote-agnostic (#38766 reformatted http-server.ts to double quotes);
+    // the brace anchor still pins the mutation BLOCK, not a one-line method-not-allowed guard.
+    const muteIdx = src.search(/if \(method !== ['"]GET['"]\) \{/);
     const wireIdx = src.indexOf("handleLlmRoutePredict(req,");
     expect(muteIdx).toBeGreaterThan(0);
     expect(wireIdx).toBeGreaterThan(muteIdx);

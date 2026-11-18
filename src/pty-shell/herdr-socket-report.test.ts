@@ -10,6 +10,7 @@ import {
   createHerdrSocketReporter as createReporterWithDefaultStore,
   formatElapsed,
   seatTitleFromCwd,
+  writeHerdrSocketSync,
   type HerdrSocketFrame,
   type HerdrSocketSchedule,
 } from './herdr-socket-report.js';
@@ -431,6 +432,74 @@ describe('createHerdrSocketReporter', () => {
       expect(got[2]!.params).toMatchObject({ display_agent: 'eln·grok-4.7', ttl_ms: 60_000 });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('releaseNow — exit 훅의 동기 반납', () => {
+  test('이벤트 루프 없이 release_agent 한 프레임 · 뒤 상태는 안 보낸다', async () => {
+    const c = collecting();
+    const sync: HerdrSocketFrame[] = [];
+    const reporter = createHerdrSocketReporter({ env: activeEnv, send: c.send, log: c.log, sendSync: (f) => { sync.push(f); return true; } })!;
+    reporter.state('working');
+    await reporter.settled();
+    reporter.releaseNow();
+    expect(sync.map((f) => f.method)).toEqual(['pane.release_agent']);
+    expect(sync[0]!.params).toMatchObject({ pane_id: 'w4:pM', source: 'elanous', agent: 'elanous' });
+    reporter.state('idle');
+    reporter.releaseNow();
+    reporter.release();
+    await reporter.settled();
+    expect(sync).toHaveLength(1);
+    expect(c.frames.map((f) => f.method)).toEqual(['pane.report_agent', 'pane.report_metadata']);
+    const seqs = [...c.frames, ...sync].map((f) => f.params.seq as number);
+    expect([...seqs].sort((x, y) => x - y)).toEqual(seqs);
+    expect(new Set(seqs).size).toBe(seqs.length);
+  });
+
+  test('신호 지킴이가 이미 반납을 청했으면 아무것도 안 한다', async () => {
+    const c = collecting();
+    const sync: HerdrSocketFrame[] = [];
+    const reporter = createHerdrSocketReporter({ env: activeEnv, send: c.send, log: c.log, sendSync: (f) => { sync.push(f); return true; } })!;
+    reporter.release();
+    reporter.releaseNow();
+    await reporter.settled();
+    expect(sync).toEqual([]);
+    expect(c.frames.map((f) => f.method)).toEqual(['pane.release_agent']);
+  });
+
+  test('동기 전송 실패는 던지지 않고 한 줄', () => {
+    const c = collecting();
+    const reporter = createHerdrSocketReporter({ env: activeEnv, send: c.send, log: c.log, sendSync: () => { throw new Error('boom'); } })!;
+    reporter.releaseNow();
+    expect(c.logs.map(([e]) => e)).toContain('release-sync-failed');
+  });
+
+  test('writeHerdrSocketSync: 다른 프로세스의 유닉스 소켓에 보내고 result 를 기다린다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'herdr-sync-'));
+    const sock = join(dir, 'h.sock');
+    const server = Bun.spawn([process.execPath, '-e', [
+      "const fs=require('node:fs');",
+      "require('node:net').createServer(c=>{let b='';c.on('data',d=>{b+=d;if(!b.includes('\\n'))return;",
+      "const f=JSON.parse(b.slice(0,b.indexOf('\\n')));console.log(JSON.stringify(f));",
+      "c.end(JSON.stringify(f.params.fail?{id:f.id,error:{code:'x'}}:{id:f.id,result:{}})+'\\n')})})",
+      ".listen(process.argv.at(-1),()=>console.log('ready'));",
+    ].join(''), sock], { stdout: 'pipe', stderr: 'ignore' });
+    try {
+      const reader = server.stdout.getReader();
+      let out = '';
+      while (!out.includes('ready')) out += new TextDecoder().decode((await reader.read()).value);
+      const frame: HerdrSocketFrame = { id: 'eln-9', method: 'pane.release_agent', params: { pane_id: 'p', seq: 7 } };
+      expect(writeHerdrSocketSync(sock, frame, () => {})).toBe(true);
+      const logs: string[] = [];
+      expect(writeHerdrSocketSync(sock, { ...frame, params: { fail: true } }, (e) => logs.push(e))).toBe(false);
+      expect(logs).toEqual(['send-sync-failed']);
+      expect(writeHerdrSocketSync(join(dir, 'none.sock'), frame, () => {})).toBe(false);
+      while (out.split('\n').filter((l) => l.startsWith('{')).length < 2) out += new TextDecoder().decode((await reader.read()).value);
+      expect(JSON.parse(out.split('\n').find((l) => l.startsWith('{'))!)).toEqual(frame);
+    } finally {
+      server.kill();
       rmSync(dir, { recursive: true, force: true });
     }
   });

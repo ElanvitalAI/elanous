@@ -48,6 +48,8 @@ export interface GraphNodeSubscription {
 }
 
 export interface GraphHitlOption { readonly key: string; readonly exit: string; readonly default?: boolean }
+/** Upper bound for declared HITL choices (TUI 1-9 jump keys · one ledger letter each). Empty lists are refused separately. */
+export const GRAPH_HITL_MAX_OPTIONS = 9;
 
 export interface GraphUnitShape {
   readonly skip?: readonly string[];
@@ -471,6 +473,8 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
           options.push({ key: option.key, exit: option.exit, ...(option.default === true ? { default: true } : {}) });
         }
         if (defaults > 1) errors.push({ path: `${at}/hitl/options`, message: 'HITL 기본 선택지는 하나만 허용한다' });
+        if (declaration.options.length > GRAPH_HITL_MAX_OPTIONS)
+          errors.push({ path: `${at}/hitl/options`, message: `HITL 선택지는 최대 ${GRAPH_HITL_MAX_OPTIONS}개까지 허용한다` });
         if (options.length === declaration.options.length) hitl = { options };
       }
       if (kind !== 'hitl') errors.push({ path: `${at}/hitl`, message: 'hitl 선언은 kind: hitl 에서만 허용된다' });

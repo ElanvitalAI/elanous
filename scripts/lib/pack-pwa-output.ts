@@ -18,7 +18,8 @@ export function packPwaOutput(root: string, archive: string): void {
   assertRegularTree(source);
   const staging = mkdtempSync(join(dirname(archive), '.pwa-pack-'));
   const run = (args: string[]): void => {
-    const result = spawnSync('tar', args, { encoding: 'utf8' });
+    // macOS bsdtar writes AppleDouble `._*` members for xattrs unless COPYFILE_DISABLE is set; GNU tar ignores it.
+    const result = spawnSync('tar', args, { encoding: 'utf8', env: { ...process.env, COPYFILE_DISABLE: '1' } });
     if (result.status !== 0) throw new Error('PWA archive operation failed: ' + result.stderr);
   };
   try {

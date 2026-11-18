@@ -132,7 +132,7 @@ describe('pullSeatAfterGoal', () => {
     const branch = entry.slice(start, entry.indexOf('reportTuiTurn', start));
     const releaseAt = branch.indexOf('releaseBusyAfterSettle');
     const settleAt = branch.indexOf('settleSeatPullTurnEnd');
-    const busyAt = branch.indexOf('busy = false');
+    const busyAt = branch.indexOf('setBusy(false)');
     expect(releaseAt).not.toBe(-1);
     expect(settleAt).toBeGreaterThan(releaseAt);
     expect(busyAt).toBeGreaterThan(settleAt);

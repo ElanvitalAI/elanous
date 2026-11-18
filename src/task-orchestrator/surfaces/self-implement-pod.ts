@@ -247,7 +247,7 @@ export interface PodSpawnOptions {
   imageCommit?: string | null;
   /** TA-PREFLIGHT ② — 요청 이미지 digest pin(sha256:<64hex>). 없으면 이미지 ref 의 @sha256 를 쓴다. 둘 다 없으면 대조 없음(no-pin). */
   imageDigestPin?: string;
-  /** codex 계정 이름(`~/.elanous/auth.json` 의 `openai-codex:<이름>`). 기본 team. */
+  /** codex 계정 이름(`~/.elanous/auth.json` 의 `openai-codex:<이름>`). 기본 default. */
   account?: string;
   /** Job 마다 계정을 고른다(pod-account-broker) — 있으면 `account` 보다 먼저. */
   accountBroker?: () => string;
@@ -2621,7 +2621,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const openrouterCredentialNeeded = openrouterCredentialRequired || reviewProvider === 'openrouter';
         /** API 키 자식 — codex 계정·자격 파일을 안 쓴다(키는 작업별 creds Secret 의 `env-<KEY>` · bedrock·glm 은 이름 있는 Secret 으로만). */
         const apiKeyChild = openrouter || openGateway || anthropic || bedrockChild || zaiChild;
-        const plannedAccount = retryAccount ?? (grok ? 'grok' : openrouter ? 'openrouter' : openGateway ? 'opengateway' : anthropic ? 'anthropic' : bedrockChild ? 'bedrock' : zaiChild ? 'glm' : options.accountBroker?.() ?? options.account ?? 'team');
+        const plannedAccount = retryAccount ?? (grok ? 'grok' : openrouter ? 'openrouter' : openGateway ? 'opengateway' : anthropic ? 'anthropic' : bedrockChild ? 'bedrock' : zaiChild ? 'glm' : options.accountBroker?.() ?? options.account ?? 'default');
         debug.log('self-implement.pod', 'account', { spaceId: input.spaceId, account: plannedAccount, brokered: Boolean(options.accountBroker) });
         const plannedCodexAccounts = grok || apiKeyChild || !options.accountBroker || !options.rotationAccounts ? undefined : [plannedAccount, ...options.rotationAccounts.filter((candidate) => candidate !== plannedAccount && candidate !== failedAccount)];
         if (plannedCodexAccounts && !options.rotationAccounts!.includes(plannedAccount)) throw new Error(`pod: 배분 계정 ${plannedAccount} 이 회전 계획에 없다`);
@@ -2704,7 +2704,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           : codexCredentials?.[0] ?? usable[0]!.credential;
         // POD-ROLE-LLM — OpenRouter 자식의 Codex 역할(리뷰·저작 grounding)은 별도 access 자격을 검증해 싣는다.
         //   ⛔ kubectl 주입(=시험)이면 호스트 자격 스토어를 읽지 않는다 — 시험은 credentials 를 명시한다.
-        const roleCodexAccount = options.account ?? 'team';
+        const roleCodexAccount = options.account ?? 'default';
         const loadRoleCodexCredential = async (): Promise<{ credential?: { elanousAuth: string; codexAuth: string }; skipped?: string }> => {
           const credentialSource = options.credentials ?? (options.kubectl ? undefined : (account: string) => hostCredentials(account, authStorePath(), () => ''));
           if (!credentialSource) return { skipped: 'no-credential-source' };

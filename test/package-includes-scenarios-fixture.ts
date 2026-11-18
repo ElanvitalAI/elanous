@@ -1,5 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { SPAWN_SYNC_MAX_BUFFER } from '../src/util/spawn-sync-output.js';
@@ -80,7 +80,9 @@ export function createDirtySourceProof(): DirtySourceProof {
   } catch (error) { rmSync(scratch, { recursive: true, force: true }); throw error; }
 }
 export function createInstalledPackageFixture(repoRoot: string, mutateSnapshot?: (snapshot: string) => void): InstalledPackageFixture {
-  const scratch = mkdtempSync(join(tmpdir(), 'elanous-package-scenarios-'));
+  // macOS tmpdir() lives under /var (a symlink to /private/var); the scenario evidence
+  // guard rejects state roots with symlink components, so resolve the scratch root once.
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-package-scenarios-')));
   try {
     const packDir = join(scratch, 'pack'), packSource = join(scratch, 'pack-source');
     const installRoot = join(scratch, 'install'), configRoot = join(scratch, 'config');

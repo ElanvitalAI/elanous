@@ -1,4 +1,5 @@
-import { hostname, homedir } from 'node:os';
+import { hostname } from 'node:os';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -23,7 +24,7 @@ export function shouldPreferHostCodexMirror(): boolean {
     || (process.env.NODE_ENV === 'test' && basename(stateRoot) === '.elanous-test');
   return process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1'
     && testUniverse
-    && stateRoot !== join(homedir(), '.elanous')
+    && stateRoot !== prodInstanceRoot()
     && shouldUseCodexOwnerMirror();
 }
 
@@ -31,7 +32,7 @@ export function codexOwnerMirrorAuthPath(): string {
   const stateRoot = getElanousConfigDir();
   // A --test child has its own config root. The access snapshot belongs to the
   // host, so a fleet nonowner must resolve it outside that isolated universe.
-  const mirrorRoot = shouldPreferHostCodexMirror() ? join(homedir(), '.elanous') : stateRoot;
+  const mirrorRoot = shouldPreferHostCodexMirror() ? prodInstanceRoot() : stateRoot;
   const derivedPath = join(mirrorRoot, CODEX_OWNER_MIRROR_RELATIVE_PATH);
   const accessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1';
   const explicitCodexHome = accessOnly ? process.env.CODEX_HOME?.trim() : undefined;
@@ -106,7 +107,7 @@ export function codexAccountReadStorePath(ownerStorePath: string): string {
   if (shouldPreferHostCodexMirror()) return codexOwnerMirrorAuthPath();
   const candidates = [
     ['config-dir', ownerStorePath],
-    ['default-root', join(homedir(), '.elanous', 'auth.json')],
+    ['default-root', join(prodInstanceRoot(), 'auth.json')],
     ['owner-mirror', codexOwnerMirrorAuthPath()],
   ] as const;
   for (const [source, path] of candidates) {

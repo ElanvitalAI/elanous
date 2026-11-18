@@ -24,6 +24,11 @@ export function harnessChildNotice(info: { goal: string; outcome: string }): str
   return `하니스 자식 종료: ${info.goal} — ${info.outcome}`;
 }
 
+/** CAPSULE-B1 — 배경 캡슐 완료 한 줄(초인종). 결과 본문은 자식의 task-notification 배수가 그 턴에 싣는다. */
+export function capsuleDoneNotice(event: { capsuleId: string; kind: string; status: string; summary: string }): string {
+  return `캡슐 완료: ${event.kind} ${event.summary} — ${event.status} · capsule:${event.capsuleId}`;
+}
+
 /** 자리 우편 도착 한 줄 — 안 읽은 수는 도착 시점 스냅숏. */
 export function seatMailNotice(info: { seat: string; unread: number }): string {
   return `${info.seat} 우편 도착 · 안 읽은 ${info.unread}건`;
@@ -104,6 +109,9 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
     },
     harnessChildFinished(info: Parameters<typeof harnessChildNotice>[0], occurredAt?: number): NextTuiQueueItem | null {
       return enqueueOnce(harnessChildNotice(info), 'harness-child', occurredAt);
+    },
+    capsuleDone(event: Parameters<typeof capsuleDoneNotice>[0], occurredAt?: number): NextTuiQueueItem | null {
+      return enqueueOnce(capsuleDoneNotice(event), 'capsule-done', occurredAt);
     },
     seatMailArrived(info: Parameters<typeof seatMailNotice>[0], occurredAt?: number): NextTuiQueueItem | null {
       return enqueueOnce(seatMailNotice(info), 'seat-mail', occurredAt);

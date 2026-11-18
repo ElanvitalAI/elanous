@@ -1943,14 +1943,15 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
 
   tasks.command('preflight')
     .description('TA-PREFLIGHT — 발사 없이 재개 조건 6개를 증거로 검사한다 (READY 가 아니면 exit 1)')
-    .requiredOption('--evidence <path>', '증거 JSON (source·image·owner·autoMerge·limits·launch·entrance)')
+    .requiredOption('--evidence <path>', '증거 JSON (source·image·owner·launchArgv·limits·launch·entrance)')
     .option('--work-order <path>', '작업 지시서 JSON (증거의 workOrder 를 덮어쓴다)')
     .option('--out <path>', '영수증(JSON)을 쓸 파일 — sha256 은 stdout 에 출력')
     .option('--from-run <runId>', '시범 런 원장에서 조건①②(자식 수신 HEAD·Pod 소비 digest) 실측 증거를 수집해 빈 칸에 채운다')
+    .option('--hand-shadow <path>', '`tasks hand`(--live 없이) 출력을 저장한 파일 — 거기서 실제 발사 argv(`harness say …`)를 읽어 조건③ merge 경로를 판정한다(선언값 autoMerge 는 쓰지 않음)')
     .option('--card <id>', '영수증을 박을 발사 대상 카드 id')
     .option('--cell <id>', '영수증을 박을 발사 대상 체크리스트 칸 id')
     .option('--commit <sha>', '영수증을 박을 발사 대상 commit(40자 hex 또는 commit:<sha>)')
-    .action(async (opts: { evidence: string; workOrder?: string; out?: string; fromRun?: string; card?: string; cell?: string; commit?: string }) => {
+    .action(async (opts: { evidence: string; workOrder?: string; out?: string; fromRun?: string; handShadow?: string; card?: string; cell?: string; commit?: string }) => {
       try {
         const evidence = JSON.parse(readFileSync(resolve(opts.evidence), 'utf8')) as TaPreflightEvidence;
         let merged: TaPreflightEvidence = evidence;
@@ -1965,6 +1966,15 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           const parsed = parseWorkOrder(readFileSync(resolve(opts.workOrder), 'utf8'));
           if (!parsed.ok) throw new Error(`작업 지시서 거부: ${parsed.reason}`);
           merged = { ...merged, workOrder: parsed.order };
+        }
+        if (opts.handShadow) {
+          // hand shadow 출력의 `elanous harness say …` 줄에서 플래그 토큰만 읽는다(첫 작은따옴표 인자 = 골 문면 앞까지).
+          const shadow = readFileSync(resolve(opts.handShadow), 'utf8');
+          const line = shadow.split(/\r?\n/u).find((l) => /^(?:elanous|eln)\s+harness\s+say\b/u.test(l));
+          const argv = line ? line.slice(0, line.includes(" '") ? line.indexOf(" '") : undefined).trim().split(/\s+/u) : null;
+          const { getUserConfig } = await import('../user-config.js');
+          const liveMoves = (getUserConfig() as { taskAgent?: { liveMoves?: unknown } }).taskAgent?.liveMoves;
+          merged = { ...merged, launchArgv: argv, mergePolicy: { ...merged.mergePolicy, liveMovesProposeLand: Array.isArray(liveMoves) && liveMoves.includes('propose-land') } };
         }
         // 코드 기본값은 «관측값»이 아니다 — 증거를 채우지 않고 영수증에 defaultAssumed 로 따로 남긴다(조건 ④ 판정에 쓰지 않음).
         const [{ DEFAULT_MAX_HARD_WAIT_SEC }, { POD_JOB_DEADLINE_SECONDS }] = await Promise.all([
@@ -2388,6 +2398,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--missing-tool <capability>', '능동 비서가 감지한 빠진 도구 — 마켓/스마트 플러그인 마법사를 같은 task-hand 조합 경로에서 실행')
     .option('--plugin-market-dir <dir>', '스마트 플러그인 마법사가 읽을 신뢰 마켓 인덱스 디렉터리')
     .option('--live', '실제로 발사한다(기본은 shadow — 명령만 출력)')
+    .option('--no-auto-merge', '자동 병합을 끈다 — 발사 인자 --no-auto-merge(PR 까지 · 호스트 재게이트 병합 --merge-by-host 를 싣지 않는다) · 카드 noAutoMerge · 첫 시범 PR 은 사람이 병합 · --ta-land 와 함께 못 준다')
     .option('--ta-land', 'TA-LIVE-LAND-2 — 호스트는 재게이트만 하고 병합은 TASK-AGENT 의 propose-land(`pr land --expected-head`)에 맡긴다 · 카드 taLand ⊕ 발사 env ELANOUS_TA_LAND=1 · taskAgent.liveMoves 에 propose-land 가 없으면 종전대로 호스트가 병합')
     .option('--ta-land-max <n>', 'TA 착지 동시 상한 — --ta-land --live 와 함께 필수', (value: string) => {
       const parsed = Number(value);
@@ -2403,7 +2414,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--tag <k=v>', 'RUN-IDENTITY-TAGS — 출생 신분을 덮는다(class|care|rights|protect 의 k=v · 반복: --tag class=gate --tag protect=true) — 카드 원장 identity 에 남는다', (value: string, previous: string[] | undefined) => [...(previous ?? []), value])
     .option('--draft-claim <pr>', 'DRAFT-CLAIM-AUTO-2-FU — PR 를 관측(gh pr view)해 draftClaim 을 조립해 넘긴다 · 관측한 PR 머리에서 `elanous self review <pr> --json` 로 손 수확을 먼저 확정한다(확정 못 하면 claim 문면을 만들지 않는다) · claim 문면을 실제 PR 댓글로 게시(gh pr comment)한다 · 같은 PR 의 살아 있는 claim 기록(카드 draftClaim)이 있으면 거부한다')
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; missingTool?: string; pluginMarketDir?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; taLandMax?: number; childLlm?: string; childLlmEffort?: string; source?: string; imageDigest?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; missingTool?: string; pluginMarketDir?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; autoMerge?: boolean; taLandMax?: number; childLlm?: string; childLlmEffort?: string; source?: string; imageDigest?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
       const suppliedText = text !== undefined;
       /** RUN-IDENTITY-TAGS — 칸을 찾은 판(출생 신분이 그 판의 칸 우선순위를 읽는다 · 개발 판 밖 칸도). */
       let birthBoardVersion: string | undefined;
@@ -2485,8 +2496,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         process.exitCode = 1;
         return;
       }
-      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.childLlm !== undefined || opts.childLlmEffort !== undefined || opts.source !== undefined || opts.imageDigest !== undefined || opts.roleLlm !== undefined || opts.tier !== undefined || opts.tag !== undefined)) {
-        out('--completion/--project/--target/--goal/--milestone/--ta-land/--child-llm/--source/--image-digest/--role-llm/--tier/--tag 는 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
+      if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.autoMerge === false || opts.childLlm !== undefined || opts.childLlmEffort !== undefined || opts.source !== undefined || opts.imageDigest !== undefined || opts.roleLlm !== undefined || opts.tier !== undefined || opts.tag !== undefined)) {
+        out('--completion/--project/--target/--goal/--milestone/--ta-land/--no-auto-merge/--child-llm/--source/--image-digest/--role-llm/--tier/--tag 는 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
         process.exitCode = 1;
         return;
       }
@@ -2623,6 +2634,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           live: opts.live === true,
           preflightGoalDoneBoundary: opts.live === true && deps.taskLauncher === undefined,
           ...(opts.taLand === true ? { taLand: true } : {}),
+          ...(opts.autoMerge === false ? { noAutoMerge: true } : {}),
           ...(opts.childLlm !== undefined ? { childLlm: opts.childLlm } : {}),
           ...(opts.childLlmEffort !== undefined ? { childLlmEffort: opts.childLlmEffort } : {}),
           ...(opts.source !== undefined ? { source: opts.source } : {}),

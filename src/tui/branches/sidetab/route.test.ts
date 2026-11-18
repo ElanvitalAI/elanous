@@ -70,3 +70,26 @@ test('sidetab branch handles state transitions, selection and help through host 
   expect(calls).toContain('terminal:go');
   expect(calls).toContain('broadcast:a,b:go');
 });
+
+test('/side send words each els outcome as itself: delivered, queued, unknown (never sent/queued), refused; a PTY row keeps the two old lines', async () => {
+  const statuses: string[] = [];
+  const answers: (boolean | { ok: boolean; message: string; outcome?: 'delivered' | 'queued' | 'refused' | 'unknown' })[] = [
+    { ok: true, outcome: 'delivered', message: 'els do: sent to p1 (5 chars)' },
+    { ok: true, outcome: 'queued', message: 'els do: queued 2 for p1 (turn running)' },
+    { ok: false, outcome: 'unknown', message: 'no answer in time — the line may or may not have reached the pane; check its screen before sending again' },
+    { ok: false, outcome: 'refused', message: 'els do: herdr refused: herdr:w2/t1/p2 is working, not sent' },
+    true, false];
+  const host = {
+    sendSelectedAgent: async () => answers.shift()!,
+    setStatus: (message: string) => { statuses.push(message); },
+  } as unknown as SidetabRouteHost;
+  for (let i = 0; i < 6; i++) await runNextTuiBranchRoute('/side send hello', host);
+  expect(statuses).toEqual([
+    'Input sent to selected agent · els do: sent to p1 (5 chars)',
+    'Input queued in the pane · els do: queued 2 for p1 (turn running)',
+    'Input status unknown · no answer in time — the line may or may not have reached the pane; check its screen before sending again',
+    'Input not sent · els do: herdr refused: herdr:w2/t1/p2 is working, not sent',
+    'Input sent to selected agent',
+    'Agent PTY input failed · check selection/run state',
+  ]);
+});

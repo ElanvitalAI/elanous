@@ -1,4 +1,3 @@
-import { NEXT_TUI_TITLE } from './core/render.js';
 import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -39,20 +38,21 @@ test('Next TUI real PTY denies rm -rf on default Enter and runs it only after di
           ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'delete fixture', name: 'Bash', args: { command } }),
           ELANOUS_TEST_FAKE_LLM_RESPONSE: 'Approval fixture complete.',
         },
-        ready: { label: `${label}-boot`, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료'), timeoutMs: PTY_APPROVAL_STEP_TIMEOUT_MS },
+        // MAIN-RED-SHELL-APPROVAL-PTY: the idle line was translated to English ('Ctrl+Q quit') — independent literals (rule 11).
+        ready: { label: `${label}-boot`, until: (screen) => screen.split('\n').includes('elanous') && screen.includes('Ctrl+Q quit'), timeoutMs: PTY_APPROVAL_STEP_TIMEOUT_MS },
         steps: [
-          { label: `${label}-approval-prompt`, text: 'delete fixture', until: (screen) => screen.includes('Bash 실행 승인 · 전체 명령') && screen.includes('Enter 기본 N') && screen.includes(command.slice(0, 45)) },
-          { label: `${label}-decision`, keys: answer, until: (screen) => screen.includes('응답 완료') || screen.includes('턴 완료'), timeoutMs: PTY_APPROVAL_STEP_TIMEOUT_MS },
+          { label: `${label}-approval-prompt`, text: 'delete fixture', until: (screen) => screen.includes('Bash approval · Full command') && screen.includes('Enter default N') && screen.includes(command.slice(0, 45)) },
+          { label: `${label}-decision`, keys: answer, until: (screen) => screen.includes('Turn done'), timeoutMs: PTY_APPROVAL_STEP_TIMEOUT_MS },
         ],
       }).then((evidence) => ({ evidence, target }));
     };
 
     const denied = await runCase('default-deny', deniedRoot, deniedTarget, '\r');
-    expect(denied.evidence.frames.find((frame) => frame.label === 'default-deny-approval-prompt')?.screen).toContain('Enter 기본 N');
+    expect(denied.evidence.frames.find((frame) => frame.label === 'default-deny-approval-prompt')?.screen).toContain('Enter default N');
     expect(existsSync(denied.target)).toBe(true);
 
     const approved = await runCase('explicit-y', approvedRoot, approvedTarget, 'y');
-    expect(approved.evidence.frames.find((frame) => frame.label === 'explicit-y-approval-prompt')?.screen).toContain('y 실행 · n 거부');
+    expect(approved.evidence.frames.find((frame) => frame.label === 'explicit-y-approval-prompt')?.screen).toContain('y run · n deny');
     expect(existsSync(approved.target)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });

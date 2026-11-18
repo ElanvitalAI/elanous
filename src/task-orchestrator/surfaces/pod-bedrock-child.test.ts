@@ -171,7 +171,7 @@ describe('BEDROCK-POD-PROVIDER-DROP — the launch hands bedrock to the Pod as p
     expect(podLaunchProviderOptions('grok', { grokApiKeyOptIn: true })).toEqual({ account: 'grok', provider: 'grok', grokApiKeyOptIn: true });
     expect(podLaunchProviderOptions('openrouter', { grokApiKeyOptIn: true })).toEqual({ account: 'openrouter', provider: 'openrouter' });
     expect(podLaunchProviderOptions('anthropic', { grokApiKeyOptIn: true })).toEqual({ account: 'anthropic', provider: 'anthropic' });
-    expect(podLaunchProviderOptions('openai-codex', { grokApiKeyOptIn: true })).toEqual({ account: 'team', provider: 'openai-codex' });
+    expect(podLaunchProviderOptions('openai-codex', { grokApiKeyOptIn: true })).toEqual({ account: 'default', provider: 'openai-codex' });
     expect(podLaunchProviderOptions('openai-codex', { explicitPodAccount: 'ops', grokApiKeyOptIn: false })).toEqual({ account: 'ops', provider: 'openai-codex' });
   });
 

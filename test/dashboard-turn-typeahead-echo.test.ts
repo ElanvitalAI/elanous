@@ -117,7 +117,7 @@ describe('dashboard real user echo wiring', () => {
         const q3Echo = screen.indexOf('❯ Q3MARK 라고만 답해');
         const q3Answer = screen.indexOf('Q3MARK\n', q3Echo + '❯ Q3MARK 라고만 답해'.length);
         fifoInputReady = q3Echo >= 0 && q3Answer > q3Echo
-          && screen.indexOf('✔ 완료', q3Answer) > q3Answer
+          && screen.indexOf('✔ done', q3Answer) > q3Answer // Source: main 11ec8c7d9e (#38144) — thinking-line.ts:189 turn-end label 영어화; 실측 `✔ done  (✻ Worked for 2s · done 1:43 PM)`  // 출처: #38144 (11ec8c7d9e) — thinking-line.ts:189 stoppedMessage 영어화
           && emptyComposer(screen);
         if (fifoInputReady) break;
       }
@@ -177,7 +177,7 @@ describe('dashboard real user echo wiring', () => {
         screen = await handle.renderScreen();
         events = await observed(beforeLive);
         nextInputReady = screen.includes('LIVEQMARK\n')
-          && screen.includes('✔ 완료')
+          && screen.includes('✔ done') // Source: main 11ec8c7d9e (#38144) — thinking-line.ts:189 turn-end label 영어화; 실측 `✔ done  (✻ Worked for 2s · done 1:43 PM)`  // 출처: #38144 (11ec8c7d9e) — thinking-line.ts:189 stoppedMessage 영어화
           && emptyComposer(screen)
           && !/⏳ 대기|다음 도구 경계에 넣음/.test(screen);
         if (nextInputReady) break;
@@ -348,7 +348,7 @@ describe('dashboard typeahead echo on the headless terminal (ux-sim)', () => {
       expect(a2).toBeGreaterThan(q2);
       expect(q3).toBeGreaterThan(a2);
       expect(a3).toBeGreaterThan(q3);
-      expect(screen.indexOf('✔ 완료', a3)).toBeGreaterThan(a3);
+      expect(screen.indexOf('✔ done', a3)).toBeGreaterThan(a3); // Source: main 11ec8c7d9e (#38144) — thinking-line.ts:189 turn-end label 영어화; 실측 `✔ done  (✻ Worked for 2s · done 1:43 PM)`  // 출처: #38144 (11ec8c7d9e) — thinking-line.ts:189 stoppedMessage 영어화
       expect(count(screen, `❯ ${Q2}`)).toBe(1);
       expect(count(screen, `❯ ${Q3}`)).toBe(1);
       expect(screen).not.toMatch(/⏳ 대기|다음 도구 경계에 넣음/);
@@ -397,7 +397,7 @@ describe('dashboard typeahead echo on the headless terminal (ux-sim)', () => {
       expect(injected).toHaveLength(0);
       const screen = screenText(done!.lines);
       expect(screen.indexOf('LIVEQMARK\n', screen.indexOf(`❯ ${LIVEQ}`))).toBeGreaterThan(screen.indexOf(`❯ ${LIVEQ}`));
-      expect(screen).toContain('✔ 완료');
+      expect(screen).toContain('✔ done'); // Source: main 11ec8c7d9e (#38144) — thinking-line.ts:189 turn-end label 영어화; 실측 화면 `✔ done  (✻ Worked for 2s · done 1:43 PM)`  // 출처: #38144 (11ec8c7d9e) — thinking-line.ts:189 stoppedMessage 영어화
       expect(count(screen, `❯ ${LIVEQ}`)).toBe(1);
       expect(screen).not.toMatch(/⏳ 대기|다음 도구 경계에 넣음/);
       expect(composerEmpty(done!.lines)).toBe(true);

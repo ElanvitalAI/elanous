@@ -1,3 +1,4 @@
+import { a5Wordings } from '../../turn-capsule/a5-wording.js';
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Agent tool (Claude Code-compatible Task spawn) ──
 //
@@ -33,6 +34,8 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
+import { emitTurnLife } from '../../debug/turn-life.js';
+import { CAPSULE_SYNC_CAP_MS } from '../../turn-capsule/contract.js';
 import type { LLMProvider } from '../../llm.js';
 import {
   globalAgentRegistry, collectAgentText,
@@ -84,11 +87,11 @@ export function stripAgentToolForOneLevelNesting<T extends { name: string }>(
  *  enforces the per-session ceiling over its own reservation ledger
  *  (`backgroundFanoutSlots`) instead — see that field's doc. */
 export function countLiveBackgroundFanout(
-  tasks: ReadonlyArray<{ background?: boolean; state?: string }>,
+  tasks: ReadonlyArray<{ background?: boolean; queued?: boolean; state?: string }>,
 ): number {
   let n = 0;
   for (const task of tasks) {
-    if (!task.background) continue;
+    if (!task.background || task.queued) continue;
     if (task.state === 'done' || task.state === 'error' || task.state === 'aborted') continue;
     n++;
   }
@@ -340,6 +343,7 @@ export interface AgentToolResult {
 }
 
 export function buildAgentTool(): LLMToolSpec {
+  const w = a5Wordings();
   return {
     name: 'Agent',
     description:
@@ -350,13 +354,7 @@ export function buildAgentTool(): LLMToolSpec {
       '  • A SKILL.md instructs you to "spawn N expert agents" / "use the Agent tool" — that is exactly this tool.\n' +
       '\n' +
       'Delegate heavy multistep work that would overflow your context, fan out independent units in parallel, ' +
-      'and hand off long investigations; use run_in_background for long-running work so you can keep coordinating ' +
-      'and finish after the results arrive.\n' +
-      'For parallel research, prefer completion_delivery="supplement" and budget_minutes=8: ask each child for its best verified evidence within the budget; late results appear as one chat line without reopening a TUI turn.\n' +
-      '\n' +
-      'The sub-agent inherits the parent-provided tool catalog by default (Agent recursion is removed) and its own ' +
-      'turn budget (default 20). It returns ONE final message which becomes your tool_result. ' +
-      'Pass everything the worker needs (data, persona, framing) inside `prompt` — the worker ' +
+      w.agentLaunchContract +
       'starts with no memory of your conversation.',
     parameters: {
       type: 'object',
@@ -379,7 +377,7 @@ export function buildAgentTool(): LLMToolSpec {
         },
         run_in_background: {
           type: 'boolean',
-          description: 'When true, returns the spawn handle immediately instead of waiting for completion. The child keeps running; its final message arrives in your next turn as a <task-notification> user message. Use for long-running explorations (multi-minute research, 10+ tool calls) so you can keep working in parallel.',
+          description: w.agentRunInBackground,
         },
         completion_delivery: {
           type: 'string',
@@ -506,10 +504,40 @@ export interface DispatchAgentOpts {
 
 const BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS = ['Bash', 'Read', 'Edit', 'Grep', 'WebFetch'] as const;
 
-export async function dispatchAgent(
+export function dispatchAgent(
   args: Record<string, unknown>,
   opts: DispatchAgentOpts = {},
 ): Promise<AgentToolResult> {
+  return new Promise((resolve, reject) => {
+    let queuedId: string | undefined;
+    void dispatchAgentCore(args, opts, (taskId, receipt) => {
+      queuedId = taskId;
+      resolve(receipt);
+    }).then(result => {
+      if (!queuedId) resolve(result);
+      else if (result.taskId === 'background-fanout-limit') finishQueued('aborted', 'Cancelled while queued');
+    }, error => {
+      if (!queuedId) reject(error);
+      else finishQueued('error', error instanceof Error ? error.message : String(error));
+    });
+    function finishQueued(state: 'aborted' | 'error', message: string): void {
+      const task = queuedId ? globalAgentRegistry.get(queuedId) : undefined;
+      if (!task || task.state !== 'pending') return;
+      task.state = state;
+      task.error = message;
+      task.result = message;
+      task.finishedAt = Date.now();
+      globalAgentRegistry.notifyTaskDone(task);
+    }
+  });
+}
+
+async function dispatchAgentCore(
+  args: Record<string, unknown>,
+  opts: DispatchAgentOpts,
+  onQueued: (taskId: string, receipt: AgentToolResult) => void,
+): Promise<AgentToolResult> {
+  const dispatchStartedAt = Date.now();
   const description = typeof args.description === 'string' ? args.description.trim() : '';
   const prompt      = typeof args.prompt === 'string' ? args.prompt : '';
   const requestedType = typeof args.subagent_type === 'string' && args.subagent_type.trim()
@@ -529,12 +557,13 @@ export async function dispatchAgent(
   const requestedMaxTurns = resolveAgentToolMaxTurns(args.max_turns);
 
   // PFC-S1 P1: new optional fields.
-  const runInBackground = args.run_in_background === true;
+  let runInBackground = args.run_in_background !== false;
   const completionDelivery = args.completion_delivery === 'supplement' ? 'supplement' : 'follow-up';
   const requestedBudgetMinutes = typeof args.budget_minutes === 'number' && Number.isFinite(args.budget_minutes)
     ? Math.max(1, Math.min(60, Math.floor(args.budget_minutes)))
     : (completionDelivery === 'supplement' ? 8 : undefined);
-  const waitsForSlot = args.wait_for_slot === true;
+  const waitsForSlot = args.wait_for_slot !== false;
+  let queuedTaskId: string | undefined;
   const spawnName = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : undefined;
   const teamName = typeof args.team_name === 'string' && args.team_name.trim() ? args.team_name.trim() : undefined;
   const isolation = args.isolation === 'worktree' || args.isolation === 'cwd'
@@ -654,7 +683,8 @@ export async function dispatchAgent(
   // waited (see `admitNextBackgroundAdmission`) — the reservation block below
   // must then not take a second one.
   let fanoutSlotReserved = false;
-  if (runInBackground) {
+  {
+    // Every child can detach, so reserve a slot before either mode starts.
     // Per-session scope: slots count against THIS session's cache
     // identity (shared fallback bucket for cache-less callers), so a
     // busy OTHER session cannot starve this one's first launch.
@@ -678,9 +708,8 @@ export async function dispatchAgent(
             `NOT SPAWNED — ${liveBackground} background agents are already live and the ` +
             `fan-out ceiling is ${AGENT_TOOL_BACKGROUND_FANOUT_CEILING}. A slot reopens as ` +
             `soon as one of them reaches a terminal state (done/error/aborted); its result ` +
-            `then arrives as a task-notification. Either wait for one to finish, fold this ` +
-            `work into an existing background spawn, or re-issue it without ` +
-            `run_in_background so it runs in the foreground.`,
+            `then arrives as a task-notification. Wait for one to finish or fold this ` +
+            `work into an existing background spawn.`,
           agent: requestedType,
           cid: debugCorrelationId,
           durationMs: 0,
@@ -702,7 +731,39 @@ export async function dispatchAgent(
         liveBackground: countSessionBackgroundFanout(fanoutSession),
         ceiling: AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
       }, { level: 'warn' });
-      const admitted = await waitForBackgroundFanoutSlot(fanoutSession, admissionPriority, opts.signal);
+      // Default admission detaches immediately. Explicit waiters retain their
+      // short synchronous wait, but detach when the shared 10-second cap expires.
+      const queueController = new AbortController();
+      const forwardAbort = () => queueController.abort();
+      if (opts.signal?.aborted) forwardAbort();
+      else opts.signal?.addEventListener('abort', forwardAbort, { once: true });
+      const publishTicket = () => {
+        runInBackground = true;
+        const task = globalAgentRegistry.register(FALLBACK_GENERAL_PURPOSE, prompt);
+        task.controller = queueController;
+        task.background = true;
+        task.queued = true;
+        task.label = description;
+        if (opts.parentSessionId) task.parentSessionId = opts.parentSessionId;
+        if (opts.parentTaskId) task.parentTaskId = opts.parentTaskId;
+        task.correlationId = debugCorrelationId;
+        queuedTaskId = task.id;
+        onQueued(task.id, {
+          output: `(queued for background — taskId=${task.id})`, agent: requestedType,
+          cid: debugCorrelationId, durationMs: Date.now() - dispatchStartedAt,
+          maxTurns: requestedMaxTurns, taskId: task.id, background: true,
+        });
+        emitTurnLife('turn-life:capsule-detached', {
+          capsuleId: task.id, eventId: randomUUID(), correlationId: debugCorrelationId,
+          reason: 'agent-queue', ...(opts.parentSessionId ? { sessionId: opts.parentSessionId } : {}),
+        });
+      };
+      let queueTimer: ReturnType<typeof setTimeout> | undefined;
+      if (args.wait_for_slot === undefined) publishTicket();
+      else queueTimer = setTimeout(publishTicket, Math.max(0, CAPSULE_SYNC_CAP_MS - (Date.now() - dispatchStartedAt)));
+      const admitted = await waitForBackgroundFanoutSlot(fanoutSession, admissionPriority, queueController.signal);
+      if (queueTimer) clearTimeout(queueTimer);
+      opts.signal?.removeEventListener('abort', forwardAbort);
       if (!admitted) {
         debug.log('agent.spawn', 'background-queue-abandoned', {
           cid: debugCorrelationId,
@@ -1009,6 +1070,7 @@ export async function dispatchAgent(
   const handle = globalAgentRegistry.spawn({
     definition: spawnDefinition,
     prompt: childPrompt,
+    ...(queuedTaskId ? { queuedTaskId } : {}),
     ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
     ...(opts.parentTaskId ? { parentTaskId: opts.parentTaskId } : {}),
     label: spawnName ?? description,   // PFC-S1 P1: explicit `name`
@@ -1059,6 +1121,13 @@ export async function dispatchAgent(
     );
   }
 
+  if (runInBackground) {
+    emitTurnLife('turn-life:capsule-detached', {
+      capsuleId: handle.task.id, eventId: randomUUID(), correlationId: debugCorrelationId,
+      ...(opts.parentSessionId ? { sessionId: opts.parentSessionId } : {}),
+    });
+  }
+
   // PFC-S1 P1: background spawn — kick the event stream off-thread
   // and return a stub result immediately. The drain still advances
   // the task state (running → done/error/aborted); completion is
@@ -1075,10 +1144,16 @@ export async function dispatchAgent(
     });
     void (async () => {
       try {
-        // Drain silently — events keep the task state moving. P2
-        // listens via registry.onTaskDone to emit task-notification.
-        for await (const _ev of handle.events) {
-          void _ev;
+        // A capsule publishes only the tool name and ordinal, never arguments
+        // or output. The bridge can fold these into a single progress line.
+        let toolCount = 0;
+        for await (const ev of handle.events) {
+          if (ev.type === 'tool_call') {
+            toolCount++;
+            debug.log('turn-life', 'capsule-tool-start', { capsuleId: handle.task.id, callIdx: toolCount, tool: ev.name });
+            globalAgentRegistry.emitToolCall({ agentId: handle.task.id, correlationId: debugCorrelationId,
+              callIdx: toolCount, tool: ev.name, args: {}, phase: 'start', ts: Date.now() });
+          }
         }
         // ⭐ A0 (#7333) — the drain used to succeed with NO log at all, so a
         // backgrounded spawn NEVER produced an `agent.done` record. Terminal
@@ -1117,6 +1192,7 @@ export async function dispatchAgent(
     };
   }
 
+  const foreground = (async (): Promise<AgentToolResult> => {
   // Per-tool-call mirror so /debug tail shows the worker's activity
   // inline. Done by intercepting the event stream — collectAgentText
   // is too coarse for this, so we drain manually.
@@ -1276,6 +1352,31 @@ export async function dispatchAgent(
     ...(childCwd ? { cwd: childCwd } : {}),
     ...(appliedIsolation ? { isolation: appliedIsolation } : {}),
   };
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const detached = new Promise<AgentToolResult>(resolve => {
+    timer = setTimeout(() => {
+      globalAgentRegistry.markBackground(handle.task.id);
+      emitTurnLife('turn-life:capsule-detached', {
+        capsuleId: handle.task.id, eventId: randomUUID(), correlationId: debugCorrelationId,
+        reason: 'capsule-sync-cap', syncCapMs: CAPSULE_SYNC_CAP_MS,
+        ...(opts.parentSessionId ? { sessionId: opts.parentSessionId } : {}),
+      });
+      resolve({
+        output: `(running in background — taskId=${handle.task.id})`,
+        agent: definition.name, cid: debugCorrelationId,
+        durationMs: Date.now() - startedAt, maxTurns: requestedMaxTurns,
+        taskId: handle.task.id, background: true,
+        ...(childCwd ? { cwd: childCwd } : {}),
+        ...(appliedIsolation ? { isolation: appliedIsolation } : {}),
+      });
+    }, Math.max(0, CAPSULE_SYNC_CAP_MS - (Date.now() - dispatchStartedAt)));
+  });
+  try {
+    return await Promise.race([foreground, detached]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   } finally {
     // The registered task owns its slot after the handoff above. Every
     // pre-registration throw leaves fanoutSession set and releases it here.

@@ -98,16 +98,18 @@ describe('ScheduleWakeup 재기동 영속화(OP O2) — 파일 저장 → 시작
     rb.s2.dispose();
   });
 
-  test('(b) 과거 dueAt 일회성 → 복원 시 폐기(발화하지 않음)', () => {
+  test('(b) 과거 dueAt 일회성 → 재기동 복원 시 «늦은 깨움»으로 즉시 발화(폐기하지 않는다)', () => {
     const dir = tmp();
     const start = new Date(2026, 9, 17, 9, 0, 0, 0).getTime();
     writeFileSync(join(dir, 'w.json'), JSON.stringify([
       { id: 'w7', reason: '지난 예약', dueAt: start - 60_000, fireCount: 0, retried: false },
     ]));
     const r = rig({ filePath: join(dir, 'w.json'), start });
-    expect(r.calls).toHaveLength(0);
-    expect(r.s1.list()).toHaveLength(0);
-    expect(r.events()).toContain('restored-discarded:one-shot-past-due');
+    expect(r.calls).toHaveLength(1); // 복원 직후 바로 1회(늦은 깨움 — 60초 늦음)
+    expect(r.calls[0]!.input).toContain('[예약 깨움 w7]');
+    expect(r.events()).toContain('restored-late:w7');
+    expect(r.events()).not.toContain('restored-discarded:one-shot-past-due');
+    expect(r.s1.list()).toHaveLength(0); // 일회성은 늦은 깨움 1회 뒤 정리
     const onDisk = JSON.parse(readFileSync(join(dir, 'w.json'), 'utf8')) as Array<{ id: string }>;
     expect(onDisk.map(e => e.id)).toEqual([]);
     r.s1.dispose();

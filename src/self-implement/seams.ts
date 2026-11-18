@@ -1146,6 +1146,11 @@ export interface DefaultSeamsOptions {
   llmReview?: (prompt: string) => Promise<string>;
   /** Optional independent reviewer for reviewDiff only; other judgment calls retain llmReview. */
   subscriptionReviewLLM?: (prompt: string) => Promise<string>;
+  /** TA-POD-REVIEW-PROVIDER-ALLOW — recovery-planning calls only (escalation triage before the next implementation
+   *  round). The Pod passes the `recovery` role chain (glm allowed); review and judgement stay on `llmReview`. */
+  recoveryLLM?: (prompt: string) => Promise<string>;
+  /** The provider and model that produced the latest review text; recorded on `review.done` and the review decision. */
+  reviewerRan?: () => { provider: string; model: string } | undefined;
   /**
    * 이 리뷰 심이 파일을 스스로 읽을 수 있나. **선택 선언** — 안 주면 reviewDiff 가 칸을 만들지 않고
    * 오케스트레이터 관측은 `'unknown'` 이다(`false` 와 같은 값으로 접지 않는다).
@@ -1275,13 +1280,45 @@ export function toReviewIntentInput(ctx?: ReviewDiffContext): ReviewIntentInput 
   };
 }
 
-/** Returns the same fork-point ref that makes committed and uncommitted changes visible to the gate. */
-function gateComparisonBase(cwd: string): string | null {
+/** Where the gate's comparison base came from, or why none could be resolved. */
+export type GateComparisonBaseResolution =
+  | { ref: string; source: 'merge-base' | 'worktree-base' }
+  | {
+    ref: null;
+    /** Why the default-branch fork point was not usable. */
+    reason: 'default-branch-missing' | 'merge-base-failed';
+    /** Why the base recorded when this worktree was cut (exact pin or explicit base) was not usable either. */
+    worktreeBase: 'not-recorded' | 'missing-locally' | 'not-ancestor';
+  };
+
+/**
+ * TA-GATE-BASE-EXACT-SOURCE — the gate's comparison base.
+ *
+ * 1. The fork point with the default branch (`merge-base HEAD <default>`) — unchanged for ordinary runs, so
+ *    commits made by earlier rounds stay visible.
+ * 2. When that is unavailable — an exact source pin (`--source commit:<sha>`) checks out a detached HEAD in a
+ *    shallow Pod clone with no default-branch ref, or one whose history does not reach it — the commit this
+ *    worktree was cut from (`recordedBase`: the explicit `--base`, else the pin/HEAD tip) is the base. It is a
+ *    local object by construction and an ancestor of every later round commit.
+ * 3. Otherwise an explicit `{ ref: null, reason, worktreeBase }`. The caller fails the gate with
+ *    `comparison-base-unavailable`; it never treats the run as «every file changed».
+ */
+export function resolveGateComparisonBase(cwd: string, recordedBase?: string): GateComparisonBaseResolution {
+  const sha = (value: string): string | null => /^[0-9a-f]{7,64}$/.test(value) ? value : null;
   const base = defaultBranchRef(cwd);
-  if (!base) return null;
-  const fork = git(cwd, ['merge-base', 'HEAD', base]);
-  const ref = fork.ok ? fork.out.trim().split('\n')[0] ?? '' : '';
-  return /^[0-9a-f]{7,64}$/.test(ref) ? ref : null;
+  if (base) {
+    const fork = git(cwd, ['merge-base', 'HEAD', base]);
+    const ref = sha(fork.ok ? fork.out.trim().split('\n')[0] ?? '' : '');
+    if (ref) return { ref, source: 'merge-base' };
+  }
+  const reason = base ? 'merge-base-failed' as const : 'default-branch-missing' as const;
+  const recorded = recordedBase?.trim() ?? '';
+  if (!recorded) return { ref: null, reason, worktreeBase: 'not-recorded' };
+  const commit = git(cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${recorded}^{commit}`]);
+  const resolved = sha(commit.ok ? commit.out.trim() : '');
+  if (!resolved) return { ref: null, reason, worktreeBase: 'missing-locally' };
+  if (!git(cwd, ['merge-base', '--is-ancestor', resolved, 'HEAD']).ok) return { ref: null, reason, worktreeBase: 'not-ancestor' };
+  return { ref: resolved, source: 'worktree-base' };
 }
 
 type GateComparisonBaseStatus = 'unavailable' | 'comparison-failed' | 'no-tracked-changes' | 'tracked-changes';
@@ -2148,7 +2185,15 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       // 가 hang) 그 폴백은 **항상 실패 = 정보량 0** 이고, 무관한 실패를 이 변경에 **오귀속**한다.
       // ⇒ 이제 **연관 테스트를 유도**한다(`gate-scope.ts` · 순수 · 근거·트레이드오프는 그 헤더가 SSOT).
       //   풀 폴백 경로는 **제거**했다. 유도 실패 시엔 test 스텝을 건너뛰고 tsc 게이트만 남는다.
-      const comparisonBase = gateComparisonBase(cwd);
+      const comparisonResolution = resolveGateComparisonBase(cwd, baselineRefs.get(cwd));
+      const comparisonBase = comparisonResolution.ref;
+      // Every route is visible: fallback and refusal are warnings, so a pinned run never fails or narrows silently.
+      debug.log('self-implement', 'gate.comparison-base', {
+        ...(ctx?.runId ? { runId: ctx.runId } : {}),
+        ...(comparisonResolution.ref === null
+          ? { source: 'unavailable', reason: comparisonResolution.reason, worktreeBase: comparisonResolution.worktreeBase }
+          : { source: comparisonResolution.source, ref: comparisonResolution.ref }),
+      }, comparisonResolution.ref !== null && comparisonResolution.source === 'merge-base' ? undefined : { level: 'warn' });
       const observationChanges = gateChangedFiles(cwd, comparisonBase);
       const observationChangedFiles = observationChanges.files;
       const postsync = ctx?.mode === 'postsync';
@@ -2265,7 +2310,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const testStep = r.steps.find((step) => step.name === 'test');
       const failedTest = r.steps.find((step) => step.name === 'test' && !step.ok);
       const comparisonFailureLog = comparisonFailureReason
-        ? `\n\n[gate-scope] ${comparisonFailureReason} — comparison status=${observationChanges.comparisonBaseStatus}; test 스텝을 실행하지 않고 gate를 실패 처리했다.`
+        ? `\n\n[gate-scope] ${comparisonFailureReason} — comparison status=${observationChanges.comparisonBaseStatus}${comparisonResolution.ref === null ? `; reason=${comparisonResolution.reason}; worktreeBase=${comparisonResolution.worktreeBase}` : ''}; test 스텝을 실행하지 않고 gate를 실패 처리했다.`
         : unmeasuredPostsync
           ? `\n\n[gate-scope] unmeasured — postsync 실행 범위가 비어 측정하지 못했다. 「깨끗하다」가 아니라 「못 쟀다」이므로 passed를 참으로 내지 않는다.`
           : '';
@@ -2935,7 +2980,10 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             },
           } : {}),
         }, o.subscriptionReviewLLM ?? o.llmReview!);
+        // Only a completed review names its reviewer; an unreviewed round must not inherit an earlier caller.
+        const reviewer = rr.reviewed ? o.reviewerRan?.() : undefined;
         debug.log('self-implement', 'review.done', {
+          ...(reviewer ? { reviewerProvider: reviewer.provider, reviewerModel: reviewer.model } : {}),
           verdict: rr.verdict, reviewed: rr.reviewed ?? false, mustFix: rr.mustFix.length, shouldFix: rr.shouldFix.length,
           gateEvidenceLines: evidenceNote?.split(/\r?\n/).length ?? 0,
           reviewerContextLoaded: o.reviewerContext?.length ?? 0,
@@ -2948,7 +2996,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           ...(rr.failureReason !== undefined ? { failureReason: rr.failureReason } : {}),
           ...reviewDiffBudgetObservation(rr),
         });
-        try { emitDecision(reviewDecision({ runId: ctx?.runId, verdict: rr.verdict, reviewed: rr.reviewed ?? false, mustFix: rr.mustFix.length, shouldFix: rr.shouldFix.length, topFinding: rr.mustFix[0], reason: rr.failureReason })); } catch { /* observation must not change the review result */ }
+        try { emitDecision(reviewDecision({ runId: ctx?.runId, verdict: rr.verdict, reviewed: rr.reviewed ?? false, mustFix: rr.mustFix.length, shouldFix: rr.shouldFix.length, topFinding: rr.mustFix[0], reason: rr.failureReason, ...(reviewer ? { reviewer } : {}) })); } catch { /* observation must not change the review result */ }
         return {
           verdict: rr.verdict,
           mustFix: rr.mustFix,
@@ -3129,7 +3177,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             '이전 라운드 이력:', tailWithOmissionMarker(history.map((item, index) => `[${index + 1}] ${item}`).join('\n'), 2400),
           ].join('\n');
           try {
-            const out = await o.llmReview!(prompt);
+            const out = await (o.recoveryLLM ?? o.llmReview!)(prompt);
             const judgement = out.trim().startsWith('TRIAGE:') ? out.slice(0, 2500) : '';
             debug.log('self-implement', 'diagnose.done', { runId, kind, round, purpose, chars: judgement.length, goalChars: goal.length, digestChars: goalDigest.text.length });
             return judgement;

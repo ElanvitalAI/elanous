@@ -1,4 +1,5 @@
 import type { GraphContext } from './node-verdict.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 /** A reduced emergency gate can replace the failed normal gate only when every receipt is bound to this run. */
 export function hasPassingEmergencyPublishGate(context: GraphContext): boolean {
@@ -6,11 +7,11 @@ export function hasPassingEmergencyPublishGate(context: GraphContext): boolean {
   const request = context.input.emergencyPublish;
   const switched = context.outputs['emergency-switch'];
   const gate = context.outputs['emergency-gate'];
-  const releaseCommit = context.outputs['version-release']?.commit;
-  if (!runId || !request || typeof request !== 'object' || Array.isArray(request)
-    || !Array.isArray((request as Record<string, unknown>).hotfixCommits)
-    || (request as Record<string, unknown>).hotfixCommits.length !== 1) return false;
-  const hotfixCommit = (request as { hotfixCommits: unknown[] }).hotfixCommits[0];
+  const releaseCommit = releaseCutRecord(context)?.commit;
+  if (!runId || !request || typeof request !== 'object' || Array.isArray(request)) return false;
+  const hotfixCommits = (request as Record<string, unknown>).hotfixCommits;
+  if (!Array.isArray(hotfixCommits) || hotfixCommits.length !== 1) return false;
+  const hotfixCommit = hotfixCommits[0];
   return typeof hotfixCommit === 'string' && /^[0-9a-f]{40}$/i.test(hotfixCommit)
     && switched?.action === 'switch' && switched.eligible === true && switched.promoted === true
     && switched.normalRunId === runId && typeof switched.hotfixCommit === 'string'

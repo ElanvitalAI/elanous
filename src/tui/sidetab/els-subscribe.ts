@@ -15,19 +15,31 @@ export { fetchElsSidetabRows };
 const LOCAL_TIMEOUT_MS = 2_000;
 const REMOTE_TIMEOUT_MS = 2_000;
 
-export function realElsSubscribeDeps(): ElsSubscribeDeps {
+// 출처: the receiving owner renders the pane's screen to check it is not busy before it answers (≤ the 10 s local request);
+// same bound as `els do` in src/cli/els-cli.ts.
+const DO_TIMEOUT_MS = 8_000;
+
+/** This host's els federation as the sidetab sees it: the list, a read and a `do` — the same three the CLI has. */
+export function realElsFederation(): { federation: ReturnType<typeof createFederation>; localHost: string } {
   const stateRoot = elanousStateRoot();
   const localHost = elsHostName();
-  // ELS-ONE-SPACE ④ — the herdr panes of this machine appear as the `herdr` host in the same list (read-only here).
+  // ELS-ONE-SPACE ④ — the herdr panes of this machine appear as the `herdr` host in the same list.
   const hosts = withHerdrHost({
     registry: loadHostRegistry(elsHostsPath(stateRoot)),
     fetchJson: (host, path) => fetchHostJson(host, path, REMOTE_TIMEOUT_MS),
+    postJson: (host, path, payload) => fetchHostJson(host, path, DO_TIMEOUT_MS, payload),
   });
   const federation = createFederation({
     localHost,
     askLocal: (request) => requestEls(elsSocketPath(stateRoot), request, LOCAL_TIMEOUT_MS),
     registry: hosts.registry,
     fetchJson: hosts.fetchJson,
+    postJson: hosts.postJson,
   });
+  return { federation, localHost };
+}
+
+export function realElsSubscribeDeps(): ElsSubscribeDeps {
+  const { federation, localHost } = realElsFederation();
   return { list: () => federation.list(), localHost };
 }

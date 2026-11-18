@@ -64,8 +64,9 @@ export interface DaemonToolDispatchCtx {
   runId?: string;
   /** Trusted server-side classification of the current turn, never supplied as a tool argument. */
   requestOrigin?: RequestOrigin;
-  /** Owner principal verified at the server request boundary, not from input source metadata. */
-  verifiedOwner?: { id: string };
+  /** Owner principal verified at the server request boundary, not from input source metadata; `appSlug` = that
+   *  member's own app slot from the server member store (WEBCHAT-OWNER-APPSLUG-WIRING). */
+  verifiedOwner?: { id: string; appSlug?: string };
   /** Server-authenticated Nexus app session class for public app deployment. */
   appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** App-scoped member receipt resolved by Nexus; tool arguments cannot set this. */

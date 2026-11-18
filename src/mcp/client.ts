@@ -30,7 +30,7 @@
 //     that the child wedged and we kill it after the grace window.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { MCP_PROTOCOL_VERSION_LATEST } from './server.js';
+import { MCP_PROTOCOL_VERSION_LATEST } from './protocol.js';
 import { MCP_APP_HTML_MIME } from '../tool-runtime/mcp-app-mime.js';
 import {
   recoverAccessToken,

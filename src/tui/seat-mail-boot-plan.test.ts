@@ -415,7 +415,7 @@ describe('ELN-SEAT-WORK-QUEUE supersede rule (OP decision on #38288)', () => {
 });
 
 describe('plan path receipts (G1 — live eln-main 9e078bba: a plan-item turn left its mail «unseen» → false A217 overdue)', () => {
-  test('boot absorb → delivered(plan) · unanswered turn → no seen · answered turn → seen(plan) · a 0-item mail stays delivered', () => {
+  test('boot absorb → delivered(plan) · unanswered turn → no seen · answered turn → seen(plan) · a 0-item mail is not the plan\'s (TURN-FIELD-BUG-3: the watcher carries it)', () => {
     const root = mkdtempSync(join(tmpdir(), 'tui-seat-plan-receipts-'));
     const home = join(root, 'home');
     const msgPath = join(root, 'messages.db');
@@ -429,9 +429,9 @@ describe('plan path receipts (G1 — live eln-main 9e078bba: a plan-item turn le
       const link = createSeatPlanTurnLink(booted.runtime!);
       const states = (id: number) => store.listReceipts({ messageId: id }).map(r => `${r.state}:${r.source}`);
       expect(states(work.id)).toEqual(['posted:ledger', 'delivered:plan']);
-      expect(states(chatter.id)).toEqual(['posted:ledger', 'delivered:plan']);
+      expect(states(chatter.id)).toEqual(['posted:ledger']); // 0 items: no plan receipt — the watcher still sees it
       const unseen = () => store.listUnseenRequests({ postedBefore: new Date(Date.now() + 60_000), postedAfter: new Date(0) }).map(row => `${row.message.id}:${row.current}`);
-      expect(unseen().sort()).toEqual([`${chatter.id}:delivered`, `${work.id}:delivered`].sort());
+      expect(unseen().sort()).toEqual([`${chatter.id}:posted`, `${work.id}:delivered`].sort());
 
       const notice = queue.items.find(item => item.kind === 'notice')!;
       link.noticeDispatched(notice.id, notice.text);
@@ -442,10 +442,10 @@ describe('plan path receipts (G1 — live eln-main 9e078bba: a plan-item turn le
       link.turnEnded(link.turnStarted('계속', true), true, undefined); // the item's chain answered
       expect(states(work.id)).toEqual(['posted:ledger', 'delivered:plan', 'seen:plan']);
       expect(store.listReceipts({ messageId: work.id }).at(-1)!.queueItemId).toBe(notice.id);
-      expect(unseen()).toEqual([`${chatter.id}:delivered`]); // nobody worked the 0-item mail: still overdue-able
+      expect(unseen()).toEqual([`${chatter.id}:posted`]); // nobody worked the 0-item mail: still overdue-able
       // A person's own turn is not the item's: no receipt.
       link.turnEnded(link.turnStarted('사람이 친 질문', false), true, undefined);
-      expect(states(chatter.id)).toEqual(['posted:ledger', 'delivered:plan']);
+      expect(states(chatter.id)).toEqual(['posted:ledger']);
     } finally {
       store.close();
       rmSync(root, { recursive: true, force: true });

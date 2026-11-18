@@ -58,7 +58,6 @@ import { childRunContextEnv, childProviderKeyEnv, childLlmSelectionEnv, type Chi
 import { childToolProfile } from '../agent/tool-profile.js';
 import { escalationAllowedForProvider } from './rework-policy.js';
 import { getUserConfig, resolveActiveProvider, resolveRoleLlm } from '../user-config.js';
-import { goalDifficultySignals, classifyGoalDifficulty, resolveImplementDifficulty } from '../llm/difficulty.js';
 import { planWorkRoute, recordLaunchRoute, resolveWorkRouteMode, windowAccountLaunch, type WindowAccountLaunch, type WorkRoutePlan } from './work-route.js';
 import { readAccountWindowSnapshot } from '../model-tier/account-window-snapshot.js';
 import type { AccountState, CoreMode } from '../model-tier/orchestration-core.js';
@@ -1230,19 +1229,7 @@ export function pickImplementRoleWithRoute(document: string, readAccountWindows:
   const base = baselineImplementRole();
   if (!base) return { role: undefined };
   const { config } = base;
-  let role = base.role;
-  try {
-    if (config.harness?.difficultyPlacement === true && role.source === 'default') {
-      const signals = goalDifficultySignals(document);
-      const level = classifyGoalDifficulty(signals);
-      const source = role.source;
-      role = resolveImplementDifficulty(role, level);
-      try {
-        debug.log('llm.difficulty', 'pick', { level, tier: role.tier ?? null, signals });
-        debug.log('harness.role-llm', 'difficulty-placement', { difficulty: level, tier: role.tier, source });
-      } catch { /* observation is fail-soft */ }
-    }
-  } catch { return { role: undefined }; }
+  const role = base.role;
   // ⭐ 모델 오케스트레이션 코어가 그 위에 한 겹 — 결정이 실패해도 기존 선택(role)은 그대로 간다.
   try {
     const mode = resolveWorkRouteMode(config);
@@ -1261,7 +1248,6 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
   if (childLlm && (typeof childLlm.provider !== 'string' || typeof childLlm.model !== 'string' || !childLlm.provider.trim() || !childLlm.model.trim())) {
     throw new Error('childLlm.provider and childLlm.model must both be non-empty');
   }
-  // ⭐ B14 — 명시 자식 LLM · 런 단위 모델이 없을 때 골 난이도에 따라 역할 `implement` 기본 등급을 고른다.
   const implementPick = !childLlm && !process.env.ELANOUS_LLM_MODEL?.trim()
     ? pickImplementRoleWithRoute(opts.goalDocument ?? opts.featurePrompt, opts.readAccountWindows)
     : undefined;

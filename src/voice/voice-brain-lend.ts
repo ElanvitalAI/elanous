@@ -104,8 +104,8 @@ export const VOICE_BRAIN_RPC_METHODS = {
 } as const;
 
 export class VoiceBrainDeniedError extends Error {
-  constructor(public readonly action: VoiceBrainAction) {
-    super(`Voice brain action denied: ${action}`);
+  constructor(public readonly action: VoiceBrainAction, public readonly reason?: 'expired' | 'revoked' | 'absent') {
+    super(`Voice brain action denied: ${action}${reason === 'expired' ? ' (expired)' : ''}`);
     this.name = 'VoiceBrainDeniedError';
   }
 }
@@ -121,9 +121,10 @@ export function createVoiceBrainHandlers(
 
   const checkGrant = (clientId: string, action: VoiceBrainAction): void => {
     if (!deps.grantStore) return; // No store = open
-    if (!deps.grantStore.isGranted(clientId, action as never)) {
-      log('voice-brain.denied', action, { clientId });
-      throw new VoiceBrainDeniedError(action);
+    const grant = deps.grantStore.checkGrant(clientId, action as never);
+    if (!grant.granted) {
+      log('voice-brain.denied', action, { clientId, reason: grant.reason });
+      throw new VoiceBrainDeniedError(action, grant.reason);
     }
   };
 

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-KERNEL-TS",
+  "path": "src/ux-sim/sim-world/kernel.ts",
+  "boundary": "Loads the reserved world packs, runs each scenario per engine in its own test universe (one network-zero sandbox process per non-empty pack), judges it against the expectation table, and writes summary.json with wall time and replay diffs.",
+  "deviceIds": [
+    "sim-world-kernel"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

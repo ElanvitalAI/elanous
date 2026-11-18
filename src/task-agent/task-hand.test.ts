@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
+import { simCli } from '../ux-sim/in-process-cli.js';
 import { defaultTaskLauncher, registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
 import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
@@ -207,7 +208,7 @@ test('DRAFT-WIP-LIMIT-1: live hand refuses observed needsOwner 16 before card cr
   let launches = 0;
   const draftMetrics = fakeDraftMetrics({ MK: 16 });
   await expect(handTask({ id: 'ta-draft-cap', text: liveGoal('ship it'), seat: 'MK', live: true,
-    statePath: path, draftMetrics, launcher: () => { launches++; } }))
+    statePath: path, draftMetrics, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } }))
     .rejects.toThrow('needs-owner MK: 16 > 15');
   expect(readTaskCard('ta-draft-cap', path)).toBeUndefined();
   expect(launches).toBe(0);
@@ -223,7 +224,7 @@ test('DRAFT-WIP-LIMIT-1: boundary, seat isolation and unobserved census allow li
     const path = statePath();
     let launches = 0;
     const result = await handTask({ id: `ta-draft-${name}`, text: liveGoal('ship it'), seat: 'MK', live: true,
-      statePath: path, draftMetrics, launcher: () => { launches++; } });
+      statePath: path, draftMetrics, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } });
     expect(result.launched).toBe(true);
     expect(readTaskCard(`ta-draft-${name}`, path)?.status).toBe('launched');
     expect(launches).toBe(1);
@@ -236,7 +237,7 @@ test('DRAFT-WIP-LIMIT-1: shadow does not observe or block drafts', async () => {
   let launches = 0;
   const result = await handTask({ id: 'ta-draft-shadow', text: liveGoal('ship it'), seat: 'MK', statePath: path,
     draftMetrics: async () => { observations++; return { needsOwnerBySeat: { MK: 16 } }; },
-    launcher: () => { launches++; } });
+    launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } });
   expect(result).toMatchObject({ mode: 'shadow', launched: false });
   expect(readTaskCard('ta-draft-shadow', path)).toBeDefined();
   expect(observations).toBe(0);
@@ -255,12 +256,13 @@ function fakeGraphRunState(status: GraphRunState['status'], runId: string): Grap
   return { graphId: 'work-research-report', runId, status, path: [], nodes: [], executed: 0, dryRun: false, statePath: join(mkdtempSync(join(tmpdir(), 'graph-run-state-')), 'run.json') };
 }
 
-test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say 인자로 발사한다', async () => {
+test('2판 조합(MAKE-CODE-UNIT-THIN): code-pr 는 make-code@1 graph run 안에서 기존 harness say 인자 그대로 발사한다', async () => {
   const config = mkdtempSync(join(tmpdir(), 'task-graph-config-'));
   setElanousConfigDir(config);
   try {
   const selected = selectTaskComposition('code-pr');
-  expect(selected).toMatchObject({ composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, launcher: 'harness-say' });
+  expect(selected).toMatchObject({ composition: { file: 'graphs/work/code-pr.yaml', version: 2 }, launcher: 'graph-run',
+    unitsResolved: true, missingUnits: [] });
   const path = statePath();
   const calls: string[][] = [];
   const events: Array<{ category: string; event: string; data?: unknown }> = [];
@@ -269,14 +271,15 @@ test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say �
   try {
     const text = 'ship code\n완료 경계 코드: src/task-agent/task-hand.ts 변경\n완료 경계 실물: code-pr 카드 발사\n완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts';
     result = await handTask({ text, seat: 'MK', statePath: path, live: true, preflightGoalDoneBoundary: true,
-      launcher: (args) => { calls.push(args); } });
+      launcher: (args, _cwd, launchContext) => { calls.push(args); return { runId: launchContext?.runId }; } });
     expect(result).toMatchObject({ mode: 'live', launched: true, card: { status: 'launched' } });
     expect(calls[0]?.at(-1)).toBe(text);
   } finally { off(); }
   expect(calls).toEqual([['harness', 'say', '--seat', 'MK', '--substrate', 'pod', '--merge-by-host', result.card.text]]);
   expect(calls).toHaveLength(1);
-  expect(readTaskCard(result.card.id, path)).toMatchObject({ composition: selected.composition,
-    graphSelectedBy: 'completion', unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits });
+  expect(readTaskCard(result.card.id, path)).toMatchObject({ composition: { file: 'graphs/work/code-pr.yaml', version: 2 },
+    graphSelectedBy: 'completion', unitsResolved: true, missingUnits: [],
+    compositionRun: { graphId: 'work-code-pr', status: 'done', exit: 'launched' } });
   expect(events).toContainEqual(expect.objectContaining({ event: 'composition-selected', data: expect.objectContaining({
     completion: 'code-pr', file: 'graphs/work/code-pr.yaml', unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
   }) }));
@@ -293,7 +296,7 @@ test('live hand 완료 경계 누락은 범위 기반 초안을 카드와 발사
   try {
     result = await handTask({ id: 'ta-20261018-boundary', text: '대상 경로: src/task-agent/task-hand.ts',
       checklistId: 'AUT-AC-BOUNDARY-MISSING', live: true, statePath: path,
-      preflightGoalDoneBoundary: true, launcher: (args) => { launches++; launchedGoal = args.at(-1) ?? ''; } });
+      preflightGoalDoneBoundary: true, launcher: (args, _cwd, launchContext) => { launches++; launchedGoal = args.at(-1) ?? ''; return { runId: launchContext?.runId }; } });
   } finally { off(); }
   expect(launches).toBe(1);
   expect(result!.launched).toBe(true);
@@ -311,7 +314,7 @@ test('live hand 완료 경계 증거 명령의 결과 장식을 지우고 정규
   let plainLaunches = 0;
   const plain = await handTask({ id: 'ta-20261021-evidence-plain', text: liveGoal('ship it'),
     live: true, preflightGoalDoneBoundary: true, statePath: plainPath,
-    launcher: () => { plainLaunches++; } });
+    launcher: (_args, _cwd, launchContext) => { plainLaunches++; return { runId: launchContext?.runId }; } });
   expect(plain).toMatchObject({ mode: 'live', launched: true });
   expect(plainLaunches).toBe(1);
 
@@ -326,7 +329,7 @@ test('live hand 완료 경계 증거 명령의 결과 장식을 지우고 정규
     let launches = 0;
     const text = [...boundaryLines, `- 완료 경계 증거 명령: ${value}`].join('\n');
     const result = await handTask({ id: `ta-20261021-evidence-${index}`, text, live: true, preflightGoalDoneBoundary: true,
-      statePath: path, launcher: () => { launches++; } });
+      statePath: path, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } });
     expect(result.launched).toBe(true);
     expect(launches).toBe(1);
     expect(readTaskCard(`ta-20261021-evidence-${index}`, path)?.text).toContain('완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts');
@@ -338,7 +341,7 @@ test('알 수 없는 증거 명령 접미는 정규 명령으로 추측하지 �
   let launches = 0;
   const text = `${liveGoal('ship it')} → arbitrary result`;
   await expect(handTask({ id: 'ta-20261025-evidence-unknown', text, live: true,
-    preflightGoalDoneBoundary: true, statePath: path, launcher: () => { launches++; } }))
+    preflightGoalDoneBoundary: true, statePath: path, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } }))
     .rejects.toThrow('goal-revision-required');
   expect(launches).toBe(0);
   expect(readTaskCard('ta-20261025-evidence-unknown', path)).toBeUndefined();
@@ -349,7 +352,7 @@ test('중복 증거 명령 중 하나라도 위험한 연산자면 goal author�
   let launches = 0;
   const text = `${liveGoal('ship it')}\n완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts; rm -rf target`;
   await expect(handTask({ id: 'ta-20261101-evidence-duplicate-unsafe', text, live: true,
-    preflightGoalDoneBoundary: true, statePath: path, launcher: () => { launches++; } }))
+    preflightGoalDoneBoundary: true, statePath: path, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } }))
     .rejects.toThrow('goal-revision-required');
   expect(launches).toBe(0);
   expect(readTaskCard('ta-20261101-evidence-duplicate-unsafe', path)).toBeUndefined();
@@ -361,7 +364,7 @@ test('live hand 골 첫 줄은 «대상 경로:» 뒤 경로 목록만 받는다
   const plain = await handTask({ id: 'ta-20261024-first-line-plain',
     text: liveGoal('대상 경로: src/task-agent/task-hand.ts · src/task-agent/task-hand.test.ts'),
     live: true, preflightGoalDoneBoundary: true, statePath: plainPath,
-    launcher: () => { plainLaunches++; } });
+    launcher: (_args, _cwd, launchContext) => { plainLaunches++; return { runId: launchContext?.runId }; } });
   expect(plain).toMatchObject({ mode: 'live', launched: true });
   expect(plainLaunches).toBe(1);
 
@@ -370,7 +373,7 @@ test('live hand 골 첫 줄은 «대상 경로:» 뒤 경로 목록만 받는다
   let spacedLaunches = 0;
   const spaced = await handTask({ id: 'ta-20261024-first-line-spaced-path',
     text: liveGoal('대상 경로: docs/MANUAL session start.md'), live: true, preflightGoalDoneBoundary: true,
-    statePath: spacedPath, launcher: () => { spacedLaunches++; } });
+    statePath: spacedPath, launcher: (_args, _cwd, launchContext) => { spacedLaunches++; return { runId: launchContext?.runId }; } });
   expect(spaced).toMatchObject({ mode: 'live', launched: true });
   expect(spacedLaunches).toBe(1);
 
@@ -385,7 +388,7 @@ test('live hand 골 첫 줄은 «대상 경로:» 뒤 경로 목록만 받는다
     let launches = 0;
     const id = `ta-20261024-first-line-${index}`;
     await expect(handTask({ id, text: liveGoal(`대상 경로: ${value}`), live: true, preflightGoalDoneBoundary: true,
-      statePath: path, launcher: () => { launches++; } }))
+      statePath: path, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } }))
       .rejects.toThrow(`goal-revision-required: 골 첫 줄은 «대상 경로:» 뒤에 경로 목록만 적어야 한다 ${reason}:`);
     expect(launches).toBe(0);
     expect(readTaskCard(id, path)).toBeUndefined();
@@ -396,7 +399,7 @@ test('shadow hand는 완료 경계 없는 문면도 카드로만 기록하고 �
   const path = statePath();
   let launches = 0;
   const result = await handTask({ id: 'ta-20261018-boundary-shadow', text: '대상 경로: src/task-agent/task-hand.ts',
-    statePath: path, launcher: () => { launches++; } });
+    statePath: path, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } });
   expect(result).toMatchObject({ mode: 'shadow', launched: false });
   expect(launches).toBe(0);
   expect(readTaskCard(result.card.id, path)).toMatchObject({ status: 'handed' });
@@ -426,14 +429,14 @@ test('단위 해석은 러너 resolveUnit 규칙으로 id·판을 확인하고 �
 });
 
 test('cardFields의 런타임 추가 필드는 선택된 조합과 종결 종류를 덮어쓰지 못한다', async () => {
-  const root = compositionFixture('code-pr');
   const injectedFields = { goalId: 'goal-1', completion: 'artifact' as const,
     composition: { file: 'graphs/work/artifact.yaml', version: 99 }, graphSelectedBy: 'completion' as const,
     unitsResolved: false, missingUnits: ['fake@1'], status: 'failed' as const };
-  const result = await handTask({ text: 'ship code', compositionRoot: root, statePath: statePath(),
+  // MAKE-CODE-UNIT-THIN — code-pr 의 harness-say 조합 fixture 는 이제 거부되므로 저장소의 실제 code-pr 조합을 쓴다.
+  const result = await handTask({ text: 'ship code', statePath: statePath(),
     cardFields: injectedFields });
   expect(result.card).toMatchObject({ goalId: 'goal-1', status: 'handed',
-    composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, unitsResolved: true, missingUnits: [] });
+    composition: { file: 'graphs/work/code-pr.yaml', version: 2 }, unitsResolved: true, missingUnits: [] });
   expect(result.card.completion).toBeUndefined();
 });
 
@@ -447,7 +450,7 @@ test('깨진 조합 YAML과 단위 해석 오류는 실패 카드·선택 관측
   const off = debug.registerSink({ name: 'graph-select-invalid-test', emit: (rec) => { if (rec.category === 'task-agent.graph-select') events.push(rec); } });
   try {
     await expect(handTask({ id: 'ta-bad-composition', text: 'artifact', completion: 'artifact',
-      compositionRoot: root, statePath: path, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 오류');
+      compositionRoot: root, statePath: path, live: true, launcher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; } })).rejects.toThrow('조합 오류');
   } finally { off(); }
   expect(launched).toBe(0);
   expect(readTaskCard('ta-bad-composition', path)).toMatchObject({ status: 'failed',
@@ -460,7 +463,7 @@ test('깨진 조합 YAML과 단위 해석 오류는 실패 카드·선택 관측
   mkdirSync(units);
   writeFileSync(join(units, 'worker.yaml'), 'graph_id: worker\nversion: 1\nentry_node: absent\nterminal_nodes: []\nnodes: []\nedges: []\nunit: { inputs: [], outputs: [], exits: [done] }\n');
   await expect(handTask({ id: 'ta-bad-unit', text: 'artifact', completion: 'artifact',
-    compositionRoot: root, statePath: path, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 단위 해석 오류');
+    compositionRoot: root, statePath: path, live: true, launcher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; } })).rejects.toThrow('조합 단위 해석 오류');
   expect(launched).toBe(0);
   expect(readTaskCard('ta-bad-unit', path)).toMatchObject({ status: 'failed',
     composition: { file: 'graphs/work/artifact.yaml', version: 1 }, unitsResolved: false, missingUnits: [],
@@ -501,7 +504,7 @@ test('없는 조합은 발사 전 거부하고 카드·관측에 이유를 남�
   const off = debug.registerSink({ name: 'graph-select-missing-test', emit: (rec) => { if (rec.category === 'task-agent.graph-select') events.push(rec); } });
   try {
     await expect(handTask({ id: 'ta-missing-composition', text: 'watch', completion: 'watch-brief',
-      statePath: path, compositionRoot: root, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 없음');
+      statePath: path, compositionRoot: root, live: true, launcher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; } })).rejects.toThrow('조합 없음');
   } finally { off(); }
   expect(launched).toBe(0);
   expect(readTaskCard('ta-missing-composition', path)).toMatchObject({ status: 'failed', completion: 'watch-brief',
@@ -522,7 +525,7 @@ test('2판 graph-run 조합(research-report)은 선택된 조합 경로로 실�
   let sayLaunches = 0;
   const result = await handTask({ id: 'ta-graph-run-live', text: 'report', completion: 'research-report',
     compositionRoot: root, statePath: path, live: true, project: { id: 'fixture-project', target: root },
-    launcher: () => { sayLaunches++; },   // harness say 발사기는 graph-run 조합에 불리지 않는다
+    launcher: (_args, _cwd, launchContext) => { sayLaunches++; return { runId: launchContext?.runId }; },   // harness say 발사기는 graph-run 조합에 불리지 않는다
     graphRunner: async (launchedPath, options) => {
       calls.push({ path: launchedPath, options });
       return fakeGraphRunState('done', options.runId!);
@@ -595,7 +598,7 @@ test('tasks hand --completion research-report cli 배선은 graph-run 조합을 
   let launched = 0;
   const { lines, code } = await cli(['task', 'hand', '보고서', '--completion', 'research-report', '--json'], {
     taskStatePath: path, taskCompositionRoot: root,
-    taskLauncher: () => { launched++; },
+    taskLauncher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; },
   });
   expect(code).toBe(0);
   expect(launched).toBe(0);
@@ -766,7 +769,7 @@ test('shadow hand → 카드 1장 · 명령에 --merge-by-host · launcher 안 �
   const text = '대상 경로: src/task-agent/task-hand.ts\nfix the widget';
   const { lines, code } = await cli(['task', 'hand', text, '--seat', 'TC', '--checklist', 'CELL-1'], {
     taskStatePath: path,
-    taskLauncher: () => { launched++; },
+    taskLauncher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; },
     releaseBoard: () => [{ level: 'task', id: 'CELL-1', title: 'fix the widget', status: 'open' }],
   });
   expect(code).toBeFalsy();
@@ -786,7 +789,7 @@ test('--live 는 주입한 launcher 를 한 번 부르고 카드를 launched 로
   const path = statePath();
   const calls: string[][] = [];
   const text = liveGoal('ship it');
-  const { lines } = await cli(['task', 'hand', text, '--live', '--json'], { taskStatePath: path, taskLauncher: (args) => { calls.push(args); } });
+  const { lines } = await cli(['task', 'hand', text, '--live', '--json'], { taskStatePath: path, taskLauncher: (args, _cwd, launchContext) => { calls.push(args); return { runId: launchContext?.runId }; } });
   expect(calls).toEqual([['harness', 'say', '--substrate', 'pod', '--merge-by-host', text]]);
   const out = JSON.parse(lines[0]!);
   expect(Object.hasOwn(out, 'cwd')).toBe(false);
@@ -816,7 +819,7 @@ test('live hand은 빠진 경계 행만 초안하고 명시 행을 보존하며 
     let launches = 0;
     const text = ['work', ...boundaryLines.filter((_, line) => line !== index)].join('\n');
     const result = await handTask({ id: `ta-live-partial-boundary-${index}`, text, live: true, preflightGoalDoneBoundary: true, statePath: path,
-      launcher: () => { launches++; } });
+      launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } });
     expect(launches).toBe(1);
     expect(result.card.text).toContain(`${missingLabel}:`);
     expect(inspectGoalDoneBoundary(result.card.text).missing).toEqual([]);
@@ -828,7 +831,7 @@ test('live hand은 빠진 경계 행만 초안하고 명시 행을 보존하며 
   const root = compositionFixture('artifact');
   let launches = 0;
   await expect(handTask({ id: 'ta-live-artifact-boundary', text: 'work', completion: 'artifact',
-    compositionRoot: root, live: true, statePath: path, launcher: () => { launches++; } }))
+    compositionRoot: root, live: true, statePath: path, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } }))
     .rejects.toThrow('조합 실행기 없음');
   expect(launches).toBe(0);
   expect(readTaskCard('ta-live-artifact-boundary', path)).toMatchObject({ status: 'failed', completion: 'artifact',
@@ -913,7 +916,7 @@ test('손상된 상태 파일 → task hand 는 실패하고 파일을 덮어쓰
     const path = statePath();
     writeFileSync(path, corrupted);
     let launched = 0;
-    const { lines, code } = await cli(['task', 'hand', 'fix it', '--live'], { taskStatePath: path, taskLauncher: () => { launched++; } });
+    const { lines, code } = await cli(['task', 'hand', 'fix it', '--live'], { taskStatePath: path, taskLauncher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; } });
     expect(code).toBe(1);
     expect(launched).toBe(0);
     expect(lines.join('\n')).toContain('덮어쓰지 않고 멈춘다');
@@ -1065,10 +1068,10 @@ test('TASKS-HAND-CHILD-LLM: without --child-llm the live command and card contai
     .replaceAll(card.id, '<ID>').replaceAll(stored.runId!, '<RUN>').replaceAll(stored.launchId!, '<LAUNCH>')
     .replaceAll(stored.createdAt, '<T>').replaceAll(stored.history[0]!.at, '<T>');
   expect(normalized).toBe(JSON.stringify({
-    id: '<ID>', text, seat: 'UX', composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, graphSelectedBy: 'completion', unitsResolved: false, missingUnits: ['make-code@1'], createdAt: '<T>', status: 'launched', history: [
+    id: '<ID>', text, seat: 'UX', composition: { file: 'graphs/work/code-pr.yaml', version: 2 }, graphSelectedBy: 'completion', unitsResolved: true, missingUnits: [], createdAt: '<T>', status: 'launched', history: [
       { at: '<T>', event: 'launch', detail: `harness say --seat UX --substrate pod --merge-by-host ${text}` },
       { at: '<T>', event: 'run-bound', detail: '<RUN>', runId: '<RUN>' },
-    ], runId: '<RUN>', launchId: '<LAUNCH>',
+    ], compositionRun: { graphId: 'work-code-pr', runId: 'code-pr-<RUN>', status: 'done', exit: 'launched' }, runId: '<RUN>', launchId: '<LAUNCH>',
   }));
   expect(launchArgs({ text: 'x' })).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'x']);
 });
@@ -1222,7 +1225,7 @@ test('TASKS-HAND-CHILD-LLM: bad values are rejected and nothing is launched or w
   for (const bad of ['', ' high', 'high\n']) expect(() => parseChildLlm('grok/grok-4.7', bad)).toThrow('--child-llm-effort');
   const path = statePath();
   const calls: string[][] = [];
-  const launcher = (args: string[]) => { calls.push(args); };
+  const launcher = (args: string[], _cwd?: string, launchContext?: { runId: string }) => { calls.push(args); return { runId: launchContext?.runId }; };
   for (const args of [['--child-llm', 'grok'], ['--child-llm', 'grok/'], ['--child-llm-effort', 'high'], ['--child-llm', 'grok/grok-4.7', '--child-llm-effort', ' '], ['--child-llm', 'openrouter/z-ai/glm-5.3', '--child-llm-effort', 'high']]) {
     const { lines, code } = await cli(['task', 'hand', 'ship it', ...args, '--live'], { taskStatePath: path, taskLauncher: launcher });
     expect(code).toBe(1);
@@ -1807,7 +1810,8 @@ test('COORD-ENTRANCE-FOLD: 실제 tasks hand work-order 발사가 원문 hash �
     if (savedAiAgent === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = savedAiAgent;
     rmSync(root, { recursive: true, force: true });
   }
-}, 20000);
+// MAKE-CODE-UNIT-THIN — 다섯 번의 live hand 가 각각 make-code graph run 을 돈다. origin/main 도 minim5 부하(load 10)에서 18.99s 로 20s 한도에 붙어 있었다.
+}, 40000);
 
 test('COORD-ENTRANCE-FOLD: 중첩 cwd의 실제 tasks hand 진입은 주입 없이 checkout 루트에 기록한다', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'coord-shadow-nested-cwd-'));
@@ -3012,3 +3016,27 @@ test('TA-PREFLIGHT ② tasks hand --mission 과 --image-digest 를 같이 주면
   expect(r.code).toBe(1);
   expect(r.lines.join('\n')).toContain('--image-digest');
 });
+
+test('TA-LIVE hand --no-auto-merge: launchArgs 는 --no-auto-merge 를 싣고 --merge-by-host 를 싣지 않는다', () => {
+  expect(launchArgs({ text: 'x', noAutoMerge: true })).toEqual(['harness', 'say', '--substrate', 'pod', '--no-auto-merge', 'x']);
+  expect(launchArgs({ text: 'x' })).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'x']);
+  expect(launchArgs({ text: 'x', noAutoMerge: true })).not.toContain('--merge-by-host');
+});
+
+test('TA-LIVE hand --no-auto-merge 와 --ta-land 는 함께 못 준다(handTask 거부)', async () => {
+  await expect(handTask({ text: 'x', noAutoMerge: true, taLand: true } as never)).rejects.toThrow(/--no-auto-merge 는 --ta-land 와 함께/);
+});
+
+test('실프로세스: tasks hand --no-auto-merge shadow 출력에 --no-auto-merge 가 있고 --merge-by-host 는 없다', async () => {
+  const r = await simCli(['tasks', 'hand', 'ship it', '--no-auto-merge'], { mode: 'spawn', allowPaths: [['tasks', 'hand']], timeoutMs: 120_000 });
+  expect(r.exitCode).toBe(0);
+  expect(r.stdout).toContain('harness say --substrate pod --no-auto-merge');
+  expect(r.stdout).not.toContain('--merge-by-host');
+}, 150_000);
+
+test('실프로세스: tasks hand (옵션 없음) 은 종전대로 --merge-by-host — 회귀 없음', async () => {
+  const r = await simCli(['tasks', 'hand', 'ship it'], { mode: 'spawn', allowPaths: [['tasks', 'hand']], timeoutMs: 120_000 });
+  expect(r.exitCode).toBe(0);
+  expect(r.stdout).toContain('harness say --substrate pod --merge-by-host');
+  expect(r.stdout).not.toContain('--no-auto-merge');
+}, 150_000);

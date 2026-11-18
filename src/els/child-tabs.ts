@@ -92,7 +92,11 @@ export function createChildTabs(deps: ChildTabsDeps) {
   const title = (child: Child): string => `${indent(depth(child))}${glyph(child)}${kindName(child)} · ${child.label} ${STATUS[child.status].mark}`;
   const nodeLine = (node: Child, level: number): string => {
     const note = node.status === 'blocked' && !node.note ? '승인 대기' : node.note;
-    return `${'  '.repeat(level)}${STATUS[node.status].mark} ${node.label}${note ? ` · ${note}` : ''}`;
+    // A node's start/progress/status is its last observed event, not proof that it is still active forever.
+    const quietMs = Math.max(0, now() - node.lastAt);
+    const mark = node.status !== 'working' ? STATUS[node.status].mark
+      : quietMs <= 300_000 ? '●' : quietMs <= 1_500_000 ? '◐' : '✕';
+    return `${'  '.repeat(level)}${mark} ${node.label}${note ? ` · ${note}` : ''}`;
   };
   /** A graph run's tab text: its own lines, then its nodes one level in (siblings in start order). */
   const tabText = (child: Child): string => {

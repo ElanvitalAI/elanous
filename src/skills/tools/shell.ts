@@ -1,3 +1,4 @@
+import { a5Wordings } from '../../turn-capsule/a5-wording.js';
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── RunShell LLM tool ──
 //
@@ -42,11 +43,17 @@ import {
   globalTaskNotificationQueue,
   type TaskNotificationQueue,
 } from '../../agent/task-notification.js';
+import {
+  shellLineWatchSpecFromArgs,
+  startShellLineWatch,
+  type ShellLineWatchSpec,
+} from './shell-line-watch.js';
 
 /** LLMToolSpec — the shape surfaced to the model. Kept narrow so
  *  accidental misuse is hard: no env override, no cwd outside the
  *  workspace (caller's runtime can enforce this). */
 export function buildRunShellTool(): LLMToolSpec {
+  const w = a5Wordings();
   return {
     name: 'RunShell',
     description:
@@ -91,11 +98,22 @@ export function buildRunShellTool(): LLMToolSpec {
         mode: {
           type: 'string',
           enum: ['inline', 'bg'],
-          description: "Shell-runner mode. Omit for the legacy argv-only path. 'inline' captures command output; 'bg' registers it for later ShellPoll.",
+          description: w.runShellMode,
         },
         description: {
           type: 'string',
           description: 'Free-form label shown in shell logs and status.',
+        },
+        watchPattern: {
+          type: 'string',
+          description:
+            "Requires mode='bg'. JS regex source: each complete output line matching it enqueues a <task-notification> (taskId prefix 'shell-watch:') — agent-wake opens the next turn on an idle seat TUI and the turn preamble drains it. Mid-run line events, not just completion.",
+        },
+        watchMinLines: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            "Requires mode='bg'. Enqueue one <task-notification> once this many complete output lines have been seen.",
         },
       },
       required: ['command'],
@@ -113,6 +131,8 @@ export interface RunShellDispatchArgs {
   network?: ShellRequest['network'];
   mode?: 'inline' | 'bg';
   description?: string;
+  /** Parsed bg line-watch request (watchPattern/watchMinLines). mode='bg' only. */
+  watch?: ShellLineWatchSpec;
 }
 
 export interface RunShellDispatchResult extends Record<string, unknown> {
@@ -693,6 +713,10 @@ export async function dispatchRunShell(
   const network = asNetwork(rawArgs.network);
   const mode = asMode(rawArgs.mode);
   const description = typeof rawArgs.description === 'string' ? rawArgs.description : undefined;
+  const watch = shellLineWatchSpecFromArgs(rawArgs);
+  if (watch && mode !== 'bg') {
+    debug.log('shell.run', 'line-watch-ignored-non-bg', { mode: mode ?? 'inline' });
+  }
   const argsTrace = boundedShellArgsText(rawArgs);
   if (command[0] === 'cd') {
     logShellDispatch('cd.rejected', { reason: 'argv-state-does-not-persist' }, argsTrace);
@@ -730,6 +754,7 @@ export async function dispatchRunShell(
   if (mode && deps) {
     const result = await dispatchViaRunner({
       command, cwd, timeoutMs, mode, description,
+      ...(watch ? { watch } : {}),
       signal: opts.signal,
       deps,
     });
@@ -773,6 +798,7 @@ async function dispatchViaRunner(args: {
   timeoutMs?: number;
   mode: 'inline' | 'bg';
   description?: string;
+  watch?: ShellLineWatchSpec;
   signal?: AbortSignal;
   deps: NonNullable<ReturnType<typeof getShellRunnerDeps>>;
 }): Promise<RunShellDispatchResult> {
@@ -786,6 +812,13 @@ async function dispatchViaRunner(args: {
   };
   const handle = runnerDispatch(req, args.deps);
   if (args.mode === 'bg') {
+    if (args.watch) {
+      startShellLineWatch({
+        handle,
+        spec: args.watch,
+        ...(args.description !== undefined ? { label: args.description } : {}),
+      });
+    }
     const bgStartedAt = Date.now();
     void handle.result.then(
       (result) => {

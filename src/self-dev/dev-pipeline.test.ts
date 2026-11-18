@@ -3838,6 +3838,19 @@ describe('무인 경로 도구 리뷰어 고르기', () => {
     expect(picked.review.canSelfRead).not.toBe(skipped.review.canSelfRead);
   });
 
+  it('POD-CANSELFREAD-OVERRIDE: 파드 안에서 구독 리뷰어 없이 apiReview 로 덮이면 뽑힌 도구 리뷰어 기록도 false 로 정정된다(JUD-B #90187 ②)', async () => {
+    const prior = process.env.ELANOUS_SUBSTRATE;
+    process.env.ELANOUS_SUBSTRATE = 'pod';
+    try {
+      const prepared = await prepareUnmannedReview({ toolReviewerRate: 1, toolReviewerSample: 0 });
+      expect(prepared.events).toEqual([expect.objectContaining({ picked: true, rate: 1, sample: 0 })]);
+      expect(prepared.review.canSelfRead).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.ELANOUS_SUBSTRATE;
+      else process.env.ELANOUS_SUBSTRATE = prior;
+    }
+  });
+
   it('TOOL-REVIEWER-ROLE-PIN: ELANOUS_ROLE_LLM_REVIEW 고정이면 추첨이 뽑음을 내도 도구 리뷰어로 안 바꾸고 role-pinned 를 남긴다', async () => {
     const previous = process.env.ELANOUS_ROLE_LLM_REVIEW;
     process.env.ELANOUS_ROLE_LLM_REVIEW = JSON.stringify({ provider: 'openrouter', model: 'z-ai/glm-5.3' });

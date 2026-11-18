@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-SEAT-MAIL-SCENARIOS-TS",
+  "path": "src/ux-sim/sim-world/seat-mail/scenarios.ts",
+  "boundary": "The seat-mail world pack: simWorldScenarios rows that replay live-seat mail-exchange defects on the kernel contract inside throw-away universes with the real MsgStore, queue, watcher and msg post; the clock, LLM, herdr and post-commit lock stay faked and no real seat data is touched",
+  "deviceIds": ["sim-world-seat-mail"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

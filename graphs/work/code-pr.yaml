@@ -1,8 +1,9 @@
-# 1판: tasks hand 가 이 조합을 고르되 러너로 실행하지 않는다.
-# make-code 단위가 준비되고 실물 code-pr 완주·재개 시험이 끝날 때까지 harness say 가 실행 주인이다.
+# 2판(MAKE-CODE-UNIT-THIN): tasks hand 가 이 조합을 실제 graph run(runGraph)으로 발사한다.
+# make-code@1(graphs/units/verbs/make-code.yaml)은 노드 하나 = 네이티브 harness say 인 얇은 감싸기다.
+# 단위가 없거나 판이 다르면 발사 전 거부한다(composition-launcher-unavailable) — harness say 로 조용히 새지 않는다.
 graph_id: work-code-pr
-version: 1
-launcher: harness-say
+version: 2
+launcher: graph-run
 entry_node: make-code
 terminal_nodes: [done, needs-human, failed]
 nodes:
@@ -20,4 +21,4 @@ nodes:
 edges:
   - from: make-code
     on: outcome
-    map: { done: done, rework: needs-human, needs-human: needs-human, failed: needs-human }
+    map: { launched: done, needs-human: needs-human, failed: failed }

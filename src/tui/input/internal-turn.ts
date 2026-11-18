@@ -17,6 +17,7 @@
 
 import type { InputResult, TextInputInternalTurnYieldPort } from '../../chat/index.js';
 import { debug } from '../../debug/log.js';
+import { emitTurnLife } from '../../debug/turn-life.js';
 import type { SubmitTurnIntent } from '../../input/input-intent.js';
 import type { InternalTurnOrigin } from '../../chat/internal-turn-origin.js';
 export type { InternalTurnOrigin } from '../../chat/internal-turn-origin.js';
@@ -54,6 +55,8 @@ export interface InternalTurnGateDeps {
   /** 마지막 사람 입력 뒤 이 시간 안이면 HumanTyping. 기본 10초. */
   humanQuietMs?: number;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** OBSERVE-TURN-EVENT-LIFECYCLE — turn-life observation hook (fail-open). */
+  turnLifeLog?: (event: string, data: Record<string, unknown>) => void;
   /** ELN-SEAT-TURN-PACING — rest between automatic turns. Absent = no pacing (tests · classic). */
   pacing?: TurnPacing;
 }
@@ -121,6 +124,8 @@ export function isInternalTurnEnabledByEnv(env: NodeJS.ProcessEnv = process.env)
 }
 
 export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurnGate {
+  // OBSERVE-TURN-EVENT-LIFECYCLE — 문 관측 주입(기본: debug 직접 방출).
+  const turnLifeLog = deps.turnLifeLog ?? emitTurnLife;
   const isEnabled = deps.isEnabled ?? (() => isInternalTurnEnabledByEnv());
   const pendingKeys = deps.pendingKeyCount ?? tuiPendingKeyCount;
   const lastHumanKeyAt = deps.lastHumanKeyAt ?? tuiLastHumanKeyAt;
@@ -206,7 +211,11 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       const { origin } = opts;
       if (!isEnabled()) return reject(origin, 'Disabled');
       if (opts.capReached) return reject(origin, 'Cap');
-      if (deps.isTurnRunning()) return reject(origin, 'NotIdle', 'turn-running');
+      if (deps.isTurnRunning()) {
+        // OBSERVE-TURN-EVENT-LIFECYCLE — 턴 중 요청: 문은 거부하고 호출자가 다음 idle 에 다시 부른다.
+        try { turnLifeLog('turn-life:event-while-busy', { source: origin, action: 'defer' }); } catch { /* observability is fail-open */ }
+        return reject(origin, 'NotIdle', 'turn-running');
+      }
       if (pending) return reject(origin, 'NotIdle', 'internal-turn-pending');
       if (!requestYield) return reject(origin, 'NotIdle', 'input-not-mounted');
       if (deps.isInputForeground && !deps.isInputForeground()) return reject(origin, 'NotIdle', 'input-not-foreground');
@@ -231,6 +240,8 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
         pending = null;
         return reject(origin, 'HumanTyping', 'input-declined');
       }
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 문이 잡은 내부 턴(pending 은 최대 1 → queuedCount 1).
+      try { turnLifeLog('turn-life:event-queued', { itemId: turnId, eventId: turnId, kind: 'internal', source: origin, delivery: 'queue', queuedCount: 1 }); } catch { /* observability is fail-open */ }
       lastId = turnId;
       lastAutoOpenedAt = now();
       if (EXTERNAL_EVENT_ORIGINS.has(origin)) consecutiveSelfStarted = 0;

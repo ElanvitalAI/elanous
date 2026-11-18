@@ -71,6 +71,8 @@ describe('dispatchRead + SessionCache', () => {
   });
 });
 
+// #38772: an Agent call without run_in_background runs in the background. The tests
+// below check a completed run, so they ask for the blocking call explicitly.
 describe('dispatchAgent + SessionCache', () => {
   let previousLlmMode: string | undefined;
   beforeEach(() => {
@@ -104,14 +106,14 @@ describe('dispatchAgent + SessionCache', () => {
   test('first Agent spawn runs; identical second call returns stub', async () => {
     const cache = new SessionCache();
     const first = await dispatchAgent(
-      { description: 'analyze samsung', prompt: 'collect facts' },
+      { description: 'analyze samsung', prompt: 'collect facts', run_in_background: false },
       { provider: fakeProvider(), resolveAgentDef: () => def, sessionCache: cache },
     );
     expect(first.output).toBe('done');
     expect(first.taskId).not.toBe('dedup');
 
     const second = await dispatchAgent(
-      { description: 'analyze samsung', prompt: 'collect facts' },
+      { description: 'analyze samsung', prompt: 'collect facts', run_in_background: false },
       { provider: fakeProvider(), resolveAgentDef: () => def, sessionCache: cache },
     );
     expect(second.output).toContain('DUPLICATE CALL');
@@ -122,11 +124,11 @@ describe('dispatchAgent + SessionCache', () => {
   test('different prompt bypasses dedup even if description matches', async () => {
     const cache = new SessionCache();
     await dispatchAgent(
-      { description: 'analyze', prompt: 'prompt A' },
+      { description: 'analyze', prompt: 'prompt A', run_in_background: false },
       { provider: fakeProvider(), resolveAgentDef: () => def, sessionCache: cache },
     );
     const second = await dispatchAgent(
-      { description: 'analyze', prompt: 'prompt B — totally different work' },
+      { description: 'analyze', prompt: 'prompt B — totally different work', run_in_background: false },
       { provider: fakeProvider(), resolveAgentDef: () => def, sessionCache: cache },
     );
     expect(second.output).toBe('done');
@@ -135,11 +137,11 @@ describe('dispatchAgent + SessionCache', () => {
 
   test('without sessionCache, repeat Agent spawns normally', async () => {
     const a = await dispatchAgent(
-      { description: 'x', prompt: 'p' },
+      { description: 'x', prompt: 'p', run_in_background: false },
       { provider: fakeProvider(), resolveAgentDef: () => def },
     );
     const b = await dispatchAgent(
-      { description: 'x', prompt: 'p' },
+      { description: 'x', prompt: 'p', run_in_background: false },
       { provider: fakeProvider(), resolveAgentDef: () => def },
     );
     expect(a.output).toBe('done');

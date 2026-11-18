@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { debug } from '../debug/log.js';
+import { setSeatStopHandler } from '../tui/seat-stop-port.js';
 import ts from 'typescript';
 
 // ⚠️ manifest/ipc DB 는 ELANOUS_STATE_DIR 스코프 — 실 데이터 오염 방지로 tmp 로 격리(import 前 설정).
@@ -1771,4 +1772,24 @@ describe('PTY-HUMAN-TYPING-REMOTE: ref 해석·bookmark 캡처는 타이핑 前 
       .resolves.toEqual({ status: 'denied', reason: 'typing-bookmark-unavailable' });
     expect(ledgerRows().length).toBe(before);
   });
+});
+
+test('seat-stop admits only an allowed local seat and a valid mode through the owner queue', async () => {
+  const id = `tui:${process.pid}`;
+  const calls: string[] = [];
+  const target = { id, ...fakeHandle() };
+  const unregister = registerPtyControlTarget(target);
+  upsertPtyManifest({ id, kind: 'tui', cmd: 'eln', seat: 'TC', startedAt: Date.now(), now: Date.now() });
+  const unbind = setSeatStopHandler(async (request) => { calls.push(request.mode); return 'waiting'; });
+  async function send(payload: unknown) {
+    const result = requestRemotePtyControl(id, 'seat-stop' as never, payload as never);
+    await Bun.sleep(60); await processPtyControlRequests(getPtyControlTarget, () => false);
+    return result;
+  }
+  try {
+    expect(await send({ mode: 'quit', sender: 'OTHER' })).toEqual({ status: 'denied', reason: 'seat-control-not-authorized' });
+    expect(await send({ mode: 'bogus', sender: 'OP' })).toEqual({ status: 'denied', reason: 'invalid-seat-stop' });
+    expect(await send({ mode: 'quit', sender: 'OP' })).toEqual({ status: 'success', reason: 'waiting' });
+    expect(calls).toEqual(['quit']);
+  } finally { unbind(); unregister(); }
 });

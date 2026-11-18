@@ -11,7 +11,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/install.sh [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--no-bootstrap-bun] [--no-install-deps] [--no-setup] [--yes] [--allow-downgrade] [--help]
+Usage: bash scripts/install.sh [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--no-bootstrap-bun] [--no-install-deps] [--no-setup] [--yes] [--allow-downgrade] [--pwa-optional] [--help]
        curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 
 Install elanous without contacting a package registry.
@@ -27,6 +27,8 @@ Install elanous without contacting a package registry.
   --no-setup          do not start first-time setup in this window after installing
   --yes               consent to installation and automatic doctor repairs without prompting
   --allow-downgrade   allow installing a version older than the one already installed
+  --pwa-optional      with --source PATH.tgz only: install a package without the PWA build (gate image build;
+                      without this flag such a package is refused with exit 4)
   --help, -h          show this help
 EOF
 }
@@ -43,6 +45,7 @@ INSTALL_DEPS=1
 RUN_SETUP=1
 ASSUME_YES=0
 ALLOW_DOWNGRADE=0
+PWA_OPTIONAL=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -59,9 +62,18 @@ while [ "$#" -gt 0 ]; do
     --no-setup) RUN_SETUP=0; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
+    --pwa-optional) PWA_OPTIONAL=1; shift ;;
     *) echo "⛔ unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# OP #87487: --pwa-optional is the gate image's explicit opt-out (docker/harness/Dockerfile, set only by build.sh's gate
+# layer). It is a CLI flag, never an environment variable, and it only covers a local package file.
+if [ "$PWA_OPTIONAL" -eq 1 ]; then
+  case "$SOURCE" in
+    ''|http://*|https://*) echo "⛔ --pwa-optional needs --source PATH.tgz (a local package file)" >&2; exit 2 ;;
+  esac
+fi
 
 # INST1 — one language per run: English by default, Korean when the locale is Korean (override: ELANOUS_INSTALL_LANG=en|ko).
 case "${ELANOUS_INSTALL_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}" in
@@ -557,8 +569,12 @@ elif [ -n "$SOURCE" ]; then
 	  # cwd. A checkout install only warns.
 	  if tar -tzf "$INSTALL_TARBALL" package/src/cli/self-update.ts >/dev/null 2>&1 \
 	    && ! tar -tzf "$INSTALL_TARBALL" package/apps/pwa/out/index.html >/dev/null 2>&1; then
-	    echo "⛔ PWA build missing in package (apps/pwa/out/index.html) — current and install metadata were not changed. Build it first: bun bin/elanous.mjs nexus build" >&2
-	    exit 4
+	    if [ "$PWA_OPTIONAL" -eq 1 ]; then
+	      echo "ℹ PWA build not in package (apps/pwa/out/index.html) — --pwa-optional: installing without the web UI" >&2
+	    else
+	      echo "⛔ PWA build missing in package (apps/pwa/out/index.html) — current and install metadata were not changed. Build it first: bun bin/elanous.mjs nexus build" >&2
+	      exit 4
+	    fi
 	  fi
 else
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/elanous-install.XXXXXX")" || { echo "⛔ mktemp failed" >&2; exit 1; }

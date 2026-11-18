@@ -29,6 +29,7 @@
 // which already gives cross-process live visibility of the dashboard.
 
 import type { SelfReportFrame } from './self-report-frame.js';
+import { detectSeatTui } from '../seat/seat-boot-preamble.js';
 import { resolveInstanceName } from '../instance-identity.js';
 import { ensureRunIdentity } from '../harness/harness-space.js';
 import { injectKey, routeExternalTuiKey, setFrameObserver, splitKeys, termSize as tuiTermSize, type Key } from '../tui.js';
@@ -234,16 +235,16 @@ export function getTuiOwnedSession(): TuiOwnedSession | null {
 
 // 재기동 «요청» — 사용자가 q 로 끄는 것은 재기동이 아니다(기본 동작 보존). 재기동은 누군가(H9 유휴
 // 재기동 방아쇠 등)가 «다시 뜨려고» TUI 를 닫을 때만 일어난다 — 그 쪽이 닫기 전에 이것을 부른다.
-let restartRequest: { readonly reason: string; readonly at: number } | null = null;
+let restartRequest: { readonly reason: string; readonly at: number; readonly requestId?: string } | null = null;
 
 /** TUI 를 «다시 뜨려고» 닫는다고 적는다 — 종료 경계(`exitTuiRun`)가 한 번 읽고 지운다. */
-export function requestTuiSelfRestart(reason: string, at: number = Date.now()): void {
+export function requestTuiSelfRestart(reason: string, at: number = Date.now(), meta?: { readonly requestId: string }): void {
   const why = reason.trim();
-  restartRequest = { reason: why || 'unspecified', at };
+  restartRequest = { reason: why || 'unspecified', at, ...(meta?.requestId ? { requestId: meta.requestId } : {}) };
 }
 
 /** 재기동 요청을 꺼낸다(꺼내면 사라진다) — 없으면 null = 사용자 종료. */
-export function takeTuiSelfRestartRequest(): { readonly reason: string; readonly at: number } | null {
+export function takeTuiSelfRestartRequest(): { readonly reason: string; readonly at: number; readonly requestId?: string } | null {
   const request = restartRequest;
   restartRequest = null;
   return request;
@@ -690,7 +691,9 @@ function defaultPublishFrame(frame: SelfReportFrame): void {
 }
 
 function defaultRegisterRow(surfaceId: string, now: number, nickname?: string): void {
-  upsertPtyManifest({ id: surfaceId, kind: 'tui', ...(nickname ? { nickname } : {}), cmd: 'elanous', startedAt: now, now });
+  let seat: string | undefined;
+  try { seat = detectSeatTui(process.cwd())?.seat; } catch { /* Unverified seats stay unavailable to seat control. */ }
+  upsertPtyManifest({ id: surfaceId, kind: 'tui', ...(nickname ? { nickname } : {}), cmd: 'elanous', workdir: process.cwd(), ...(seat ? { seat } : {}), startedAt: now, now });
 }
 
 function defaultWriteFrame(surfaceId: string, text: string, now: number): void {

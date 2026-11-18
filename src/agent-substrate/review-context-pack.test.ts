@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   REVIEW_CONTEXT_PACK_CAP_BYTES,
   buildReviewContextPack,
+  deadExportWarningLines,
   renderReviewContextPack,
   spawnReviewContextPackGh,
 } from './review-context-pack';
@@ -216,6 +217,28 @@ describe('REVIEW-CONTEXT-PACK', () => {
     expect(byId.get('decisions')?.status).toBe('unmeasured');
   });
 
+  it('죽은 export 경고 JSON 은 파일:줄로 팩에 붙고, 없으면 생략한다', () => {
+    const report = join(stage.root, 'dead-export-warn.json');
+    writeFileSync(report, JSON.stringify({
+      status: 'WARN',
+      warnings: [{ file: 'src/a.ts', line: 12, name: 'chooseSeatPull' }],
+    }));
+    const lines = deadExportWarningLines({ pr: '1', deadExportReportPath: report });
+    expect(lines).toEqual(['src/a.ts:12 chooseSeatPull']);
+    const built = buildReviewContextPack({
+      pr: '42',
+      prTitle: '칸 경고',
+      prBody: '칸: DEAD-EXPORT\n완료 경계: 경고만',
+      files: [],
+      rootDir: stage.root,
+      deadExportReportPath: report,
+      gh: () => ({ ok: true, stdout: '[]' }),
+    });
+    expect(built.text).toContain('죽은 export 경고');
+    expect(built.text).toContain('src/a.ts:12 chooseSeatPull');
+    expect(deadExportWarningLines({ pr: '1' })).toEqual([]);
+  });
+
   it('갈래는 문서·gh 순서와 무관하게 독립 실패한다(gh 실행 파일이 없어도 팩은 나온다)', () => {
     process.env.PATH = join(stage.root, 'empty-bin');
     const built = pack();
@@ -225,3 +248,25 @@ describe('REVIEW-CONTEXT-PACK', () => {
     expect(byId.get('overlap')?.status).toBe('unmeasured');
   });
 });
+
+  it('#38412 r5 — head·pr 키가 다른 낡은 경고 리포트는 재사용 오염으로 버린다', () => {
+    const report = join(stage.root, 'dead-export-warn.json');
+    const full = '0123456789abcdef0123456789abcdef01234567';
+    const warn = [{ file: 'src/a.ts', line: 12, name: 'chooseSeatPull' }];
+    writeFileSync(report, JSON.stringify({ status: 'WARN', head: 'f'.repeat(40), warnings: warn }));
+    expect(deadExportWarningLines({ pr: '1', deadExportReportPath: report, reviewHead: full })).toEqual([]);
+    writeFileSync(report, JSON.stringify({ status: 'WARN', head: full.slice(0, 12), warnings: warn }));
+    expect(deadExportWarningLines({ pr: '1', deadExportReportPath: report, reviewHead: full })).toEqual(['src/a.ts:12 chooseSeatPull']);
+    writeFileSync(report, JSON.stringify({ status: 'WARN', warnings: warn }));
+    expect(deadExportWarningLines({ pr: '1', deadExportReportPath: report, reviewHead: full })).toEqual([]);
+    writeFileSync(report, JSON.stringify({ status: 'WARN', head: full, pr: '9', warnings: warn }));
+    expect(deadExportWarningLines({ pr: '1', deadExportReportPath: report, reviewHead: full })).toEqual([]);
+    const built = buildReviewContextPack({
+      pr: '42', prTitle: '칸 경고', prBody: '칸: DEAD-EXPORT\n완료 경계: 경고만', files: [],
+      rootDir: stage.root, deadExportReportPath: report, reviewHead: 'e'.repeat(40),
+      gh: () => ({ ok: true, stdout: '[]' }),
+    });
+    expect(built.text).not.toContain('src/a.ts:12 chooseSeatPull');
+    writeFileSync(report, JSON.stringify({ status: 'WARN', warnings: warn }));
+    expect(deadExportWarningLines({ pr: '1', deadExportReportPath: report })).toEqual(['src/a.ts:12 chooseSeatPull']);
+  });

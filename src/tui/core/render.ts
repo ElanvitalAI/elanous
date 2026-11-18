@@ -2,7 +2,7 @@ import type { SerializedMessage } from '../../session/index.js';
 import type { MessageBlock } from '../../conv-substrate/message-block.js';
 import { dimContinueBanner } from '../chat/continue-banner.js';
 import { parseToolResultEnvelope } from '../../chat/tool-render/result-text.js';
-import { fitLogLine, logViewLines, logViewLinesWithInsertions, toolFoldBlockRanges } from '../chat/log-view.js';
+import { fitLogLine, logViewLines, logViewLinesWithInsertions, toolFoldBlockRanges, wrapLogLines } from '../chat/log-view.js';
 import { isToolActivityLine } from '../chat/tool-activity.js';
 import { isWorkingRow } from '../chat/working-row.js';
 import { messageBlockDetailLines, nextMessageBlockDetailLevel, type TuiDetailLevel } from '../chat/message-block-view.js';
@@ -280,14 +280,23 @@ export function nextTuiActivityRow(line: string, columns: number): string {
   return isToolActivityLine(fitted) || isWorkingRow(fitted) ? `\x1b[2m${fitted}\x1b[22m` : fitted;
 }
 
+/** Activity as screen rows: a tool or working row stays one fitted row (it is progress); any other line is information
+ *  (a slash command's answer such as «/memory list») and wraps to the width, never cut at the edge. */
+export function nextTuiActivityRows(line: string, columns: number): string[] {
+  const fitted = fitLogLine(line, columns);
+  if (isToolActivityLine(fitted) || isWorkingRow(fitted)) return [nextTuiActivityRow(line, columns)];
+  return wrapLogLines(line, columns);
+}
+
 /** Pure Next TUI log layout. The session messages and fold state are never changed. */
 export function renderNextTuiLogFrame(input: NextTuiLogFrameInput, prepared = prepareHistory(input)): NextTuiLogFrame {
   const { foldTargets } = prepared;
   const promptLines = (input.promptLines?.length ? input.promptLines : [input.promptLine]).slice(-Math.max(1, input.rows));
   const history = [
     ...prepared.lines,
-    ...input.notices.map((line) => dimContinueBanner(fitLogLine(line, input.columns))),
-    ...input.activity.map((line) => nextTuiActivityRow(line, input.columns)),
+    // A notice (slash command output, a refusal) is information: wrapped to the width, never cut off at the edge.
+    ...input.notices.flatMap((line) => wrapLogLines(line, input.columns).map((row) => dimContinueBanner(row))),
+    ...input.activity.flatMap((line) => nextTuiActivityRows(line, input.columns)),
   ];
   // A picker or health line may grow the header. Keep the prompt, the footer and the row(s) under the prompt visible.
   const below = (input.belowPrompt ?? []).slice(0, Math.max(0, input.rows - promptLines.length));
@@ -351,8 +360,9 @@ export function renderNextTuiCompactFrame(input: NextTuiLogFrameInput, prepared 
   const promptLines = (input.promptLines?.length ? input.promptLines : [input.promptLine]).slice(-Math.max(1, input.rows));
   const body = [
     ...prepared.lines,
-    ...input.notices.map((line) => dimContinueBanner(fitLogLine(line, input.columns))),
-    ...input.activity.map((line) => nextTuiActivityRow(line, input.columns)),
+    // A notice (slash command output, a refusal) is information: wrapped to the width, never cut off at the edge.
+    ...input.notices.flatMap((line) => wrapLogLines(line, input.columns).map((row) => dimContinueBanner(row))),
+    ...input.activity.flatMap((line) => nextTuiActivityRows(line, input.columns)),
   ];
   const below = input.belowPrompt ?? [];
   const bodyRows = Math.max(1, input.rows - input.header.length - input.footer.length - promptLines.length - below.length);

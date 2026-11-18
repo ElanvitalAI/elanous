@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "entries": {
+    "capsule-events/C1": {
+      "expect": "red",
+      "reason": "C1 background Agent axis: real Next TUI idle wake, PR #38565",
+      "redReason": "background agent end never wakes the turn"
+    },
+    "capsule-events/C3": {
+      "expect": "green",
+      "reason": "C3 shell axis: a real Next TUI Bash past the 10s cap detaches and its capsule-done opens exactly one next turn; Esc, mail/person and three-at-once axes unmeasured",
+      "greenSince": "#38673 (main with R1 #38713 no switch · B1 wiring #38676)"
+    },
+    "capsule-events/C7": {
+      "expect": "red",
+      "reason": "C7 partial MCP axis; provider, harness, and deadline event remain unmeasured",
+      "redReason": "silent MCP holds the main turn"
+    },
+    "capsule-events/C1-MAIL": {
+      "expect": "red",
+      "reason": "C1 mail axis (원천 1a·1b) partial: watcher and plan compete for one unseen mail — scenario id renamed from C3 (sim-owner adjudication · TC-H-CC-3 #90220 → #90474): 정본 §3.6 C3 는 10분 Bash·우편·사람·Esc 축(#38673 이 측정) · 생산 단계 토큰 C3(C3-b 우편 어댑터)는 그대로",
+      "redReason": "C3 remaining mail routes unmeasured"
+    },
+    "capsule-events/C2": {
+      "expect": "red",
+      "reason": "C2 partial: mail during a short real tool",
+      "redReason": "mail not delivered after short tool"
+    }
+  }
+}

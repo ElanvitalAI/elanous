@@ -140,12 +140,16 @@ describe('dispatchAgent — input validation', () => {
 });
 
 // ── Resolution ──
+//
+// #38772: an Agent call without run_in_background runs in the background and returns
+// a ticket. The dispatch tests below are about resolution, tool_filter, abort, result
+// shape and callbacks of a completed run, so they ask for the blocking call explicitly.
 
 describe('dispatchAgent — agent resolution', () => {
   test('uses requested agent when resolver returns it', async () => {
     const provider = fakeProvider([[{ type: 'text', delta: 'OK Margaret here.' }]]);
     const result = await dispatchAgent(
-      { description: 'analyze', prompt: 'What about Samsung?', subagent_type: 'value-investor' },
+      { description: 'analyze', prompt: 'What about Samsung?', subagent_type: 'value-investor', run_in_background: false },
       { provider, resolveAgentDef: (n) => (n === 'value-investor' ? stubDef : undefined) },
     );
     expect(result.agent).toBe('value-investor');
@@ -156,7 +160,7 @@ describe('dispatchAgent — agent resolution', () => {
     const gp: AgentDefinition = { name: 'general-purpose', systemPrompt: 'GP system' };
     const provider = fakeProvider([[{ type: 'text', delta: 'gp result' }]]);
     const result = await dispatchAgent(
-      { description: 'do', prompt: 'p', subagent_type: 'nonexistent-agent-xyz' },
+      { description: 'do', prompt: 'p', subagent_type: 'nonexistent-agent-xyz', run_in_background: false },
       { provider, resolveAgentDef: (n) => (n === 'general-purpose' ? gp : undefined) },
     );
     expect(result.agent).toBe('general-purpose');
@@ -166,7 +170,7 @@ describe('dispatchAgent — agent resolution', () => {
   test('uses inline FALLBACK_GENERAL_PURPOSE when both resolves miss', async () => {
     const provider = fakeProvider([[{ type: 'text', delta: 'inline fallback' }]]);
     const result = await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       { provider, resolveAgentDef: () => undefined },
     );
     expect(result.agent).toBe('general-purpose');
@@ -305,7 +309,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
   test('deny removes specific tools from the child tool set', async () => {
     const cap = captureProvider();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'WebFetch'] } },
+      { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'WebFetch'] }, run_in_background: false },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(cap.names().sort()).toEqual(['Agent', 'Edit', 'Read']);
@@ -318,6 +322,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
         description: 'd',
         prompt: 'p',
         tool_filter: { allow: ['Read', 'Edit', 'Bash'], deny: ['Bash'] },
+        run_in_background: false,
       },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
@@ -328,7 +333,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
   test('empty allow array = no narrowing — the child inherits every tool', async () => {
     const cap = captureProvider();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { allow: [] } },
+      { description: 'd', prompt: 'p', tool_filter: { allow: [] }, run_in_background: false },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(cap.names().sort()).toEqual(['Agent', 'Bash', 'Edit', 'Read', 'WebFetch']);
@@ -339,7 +344,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     debug.enable();
     debug.clear();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { allow: ['read_file', 'shell', 'grep'] } },
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['read_file', 'shell', 'grep'] }, run_in_background: false },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(cap.names().sort()).toEqual(['Agent', 'Bash', 'Edit', 'Read', 'WebFetch']);
@@ -353,7 +358,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     debug.enable();
     debug.clear();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { deny: ['bash_tool'] } },
+      { description: 'd', prompt: 'p', tool_filter: { deny: ['bash_tool'] }, run_in_background: false },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(cap.names().sort()).toEqual(['Agent', 'Bash', 'Edit', 'Read', 'WebFetch']);
@@ -365,7 +370,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
   test('allow mixing known and unknown names narrows to the known ones only', async () => {
     const cap = captureProvider();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'read_file'] } },
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'read_file'] }, run_in_background: false },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(cap.names()).toEqual(['Read']);
@@ -379,7 +384,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       async *chat() {},
     };
     const r = await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'Read', 'Edit', 'WebFetch', 'Agent'] } },
+      { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'Read', 'Edit', 'WebFetch', 'Agent'] }, run_in_background: false },
       { provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(called).toBe(false);
@@ -397,12 +402,12 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       { name: 'Agent', description: '', parameters: { type: 'object' } },
     ];
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'Bash'] } },
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'Bash'] }, run_in_background: false },
       { provider: cap.provider, hostTools: host, resolveAgentDef: () => ({ ...stubDef, tools: ['Read', 'RunShell', 'Grep', 'Agent'] }) },
     );
     expect(cap.names()).toEqual(['Read']);
     await dispatchAgent(
-      { description: 'd2', prompt: 'p2' },
+      { description: 'd2', prompt: 'p2', run_in_background: false },
       { provider: cap.provider, hostTools: host, resolveAgentDef: () => ({ ...stubDef, tools: ['Read', 'RunShell', 'Grep', 'Agent'] }) },
     );
     expect(cap.names()).toEqual(expect.arrayContaining(['Read', 'RunShell']));
@@ -411,7 +416,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
   test('omitted tool_filter preserves the first-level child tool catalog', async () => {
     const cap = captureProvider();
     await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(cap.names()).toContain('Bash');
@@ -438,7 +443,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
       })),
     ];
     const result = await dispatchAgent(
-      { description: 'verify inherited tools', prompt: 'use research tools' },
+      { description: 'verify inherited tools', prompt: 'use research tools', run_in_background: false },
       {
         provider,
         hostTools: parentCatalog,
@@ -486,7 +491,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
     };
 
     const result = await dispatchAgent(
-      { description: 'text-only fallback', prompt: 'Summarize the task.' },
+      { description: 'text-only fallback', prompt: 'Summarize the task.', run_in_background: false },
       {
         provider,
         hostTools: [{ name: 'Read', description: '', parameters: { type: 'object' as const } }],
@@ -513,7 +518,7 @@ describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠
   test('malformed tool_filter (non-object) is ignored — graceful', async () => {
     const cap = captureProvider();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: 'oops' as unknown as never },
+      { description: 'd', prompt: 'p', tool_filter: 'oops' as unknown as never, run_in_background: false },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
     expect(cap.names()).toContain('Read'); // no narrowing applied
@@ -567,7 +572,7 @@ describe('dispatchAgent — abort propagation', () => {
     const provider = hangingProvider();
     const ctrl = new AbortController();
     const promise = dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       { provider, signal: ctrl.signal, resolveAgentDef: () => stubDef },
     );
     // Give the runner a tick to register the abort listener.
@@ -582,7 +587,7 @@ describe('dispatchAgent — abort propagation', () => {
     ctrl.abort();
     await expect(
       dispatchAgent(
-        { description: 'd', prompt: 'p' },
+        { description: 'd', prompt: 'p', run_in_background: false },
         { provider, signal: ctrl.signal, resolveAgentDef: () => stubDef },
       ),
     ).rejects.toThrow(/aborted/);
@@ -595,7 +600,7 @@ describe('dispatchAgent — result shape', () => {
   test('returns AgentToolResult fields', async () => {
     const provider = fakeProvider([[{ type: 'text', delta: 'hello world' }]]);
     const r = await dispatchAgent(
-      { description: 'salutation', prompt: 'say hi' },
+      { description: 'salutation', prompt: 'say hi', run_in_background: false },
       { provider, resolveAgentDef: () => stubDef },
     );
     expect(r.output).toBe('hello world');
@@ -615,7 +620,7 @@ describe('dispatchAgent — debug events', () => {
     debug.enable();
     debug.clear();
     await dispatchAgent(
-      { description: 'span', prompt: 'p' },
+      { description: 'span', prompt: 'p', run_in_background: false },
       { provider, resolveAgentDef: () => stubDef },
     );
     const lines = debug.tail(20);
@@ -639,7 +644,7 @@ describe('dispatchAgent — debug events', () => {
     debug.clear();
     await expect(
       dispatchAgent(
-        { description: 'd', prompt: 'p' },
+        { description: 'd', prompt: 'p', run_in_background: false },
         { provider: failingProvider, resolveAgentDef: () => stubDef },
       ),
     ).rejects.toThrow();
@@ -657,7 +662,7 @@ describe('dispatchAgent — debug events', () => {
     debug.enable();
     debug.clear();
     await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       {
         provider,
         resolveAgentDef: () => def,
@@ -689,7 +694,7 @@ describe('dispatchAgent — onChildToolCall callback', () => {
     ]);
     const def: AgentDefinition = { ...stubDef, tools: ['Bash', 'Read'] };
     await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       {
         provider,
         resolveAgentDef: () => def,
@@ -716,7 +721,7 @@ describe('dispatchAgent — onChildToolCall callback', () => {
     ]);
     const def: AgentDefinition = { ...stubDef, tools: ['Bash'] };
     const r = await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       {
         provider,
         resolveAgentDef: () => def,
@@ -735,7 +740,7 @@ describe('dispatchAgent — onChildToolCall callback', () => {
     ]);
     const def: AgentDefinition = { ...stubDef, tools: ['Bash'] };
     const r = await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       {
         provider,
         resolveAgentDef: () => def,
@@ -765,7 +770,7 @@ describe('dispatchAgent — onDone callback', () => {
     ]);
     const def: AgentDefinition = { ...stubDef, tools: ['Bash'] };
     await dispatchAgent(
-      { description: 'd', prompt: 'my-prompt' },
+      { description: 'd', prompt: 'my-prompt', run_in_background: false },
       {
         provider,
         resolveAgentDef: () => def,
@@ -784,7 +789,7 @@ describe('dispatchAgent — onDone callback', () => {
   test('renderer errors in onDone do not kill the return value', async () => {
     const provider = fakeProvider([[{ type: 'text', delta: 'ok' }]]);
     const r = await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       {
         provider,
         resolveAgentDef: () => stubDef,
@@ -805,7 +810,7 @@ describe('dispatchAgent — onDone callback', () => {
     const provider = fakeProvider([[{ type: 'text', delta: 'first' }]]);
 
     await dispatchAgent(
-      { description: 'd', prompt: 'same-prompt' },
+      { description: 'd', prompt: 'same-prompt', run_in_background: false },
       { provider, resolveAgentDef: () => stubDef, sessionCache, onDone: () => called++ },
     );
     // First call ran normally → onDone fired.
@@ -814,7 +819,7 @@ describe('dispatchAgent — onDone callback', () => {
     // Second call with identical prompt → dedup hit → stub returned.
     // onDone should NOT fire again.
     await dispatchAgent(
-      { description: 'd', prompt: 'same-prompt' },
+      { description: 'd', prompt: 'same-prompt', run_in_background: false },
       { provider, resolveAgentDef: () => stubDef, sessionCache, onDone: () => called++ },
     );
     expect(called).toBe(1);
@@ -1007,7 +1012,7 @@ describe('SUBAGENT-NO-NARROWING — 기본은 모델이 넘긴 allow 를 무시�
   test('반례(10-22 n8n 실물 49→9): 아는 이름 allow 를 줘도 자식은 메인 도구 전부를 받는다 · 관측 model-allow-ignored', async () => {
     const cap = capture();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'Bash'] } },
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'Bash'] }, run_in_background: false },
       { provider: cap.provider, hostTools: host, resolveAgentDef: () => def },
     );
     expect(cap.names().sort()).toEqual(host.map((t) => t.name).sort());
@@ -1019,7 +1024,7 @@ describe('SUBAGENT-NO-NARROWING — 기본은 모델이 넘긴 allow 를 무시�
   test('deny 는 그대로 반영된다(allow 와 함께 와도)', async () => {
     const cap = capture();
     await dispatchAgent(
-      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read'], deny: ['WebFetch', 'Write'] } },
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read'], deny: ['WebFetch', 'Write'] }, run_in_background: false },
       { provider: cap.provider, hostTools: host, resolveAgentDef: () => def },
     );
     expect(cap.names()).not.toContain('WebFetch');

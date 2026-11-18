@@ -29,7 +29,7 @@ export interface NpmPublishDeps {
 
 const exec: Exec = (command, args, env) => {
   const startedAt = performance.now();
-  const result = spawnSync(command, args, { encoding: 'utf8', env: env ?? process.env, maxBuffer: 1024 * 1024, timeout: 300_000 });
+  const result = spawnSync(command, args, { encoding: 'utf8', env: env ?? process.env, maxBuffer: 64 * 1024 * 1024, timeout: 900_000 });
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? String(result.error ?? ''), durationMs: Math.ceil(performance.now() - startedAt), signal: result.signal };
 };
 export async function fetchNpmRegistry(url: string, timeoutMs = REGISTRY_FETCH_TIMEOUT_MS): Promise<{ status: number; body: unknown }> {
@@ -142,7 +142,7 @@ export async function runNpmPublish(context: GraphContext = readGraphContext(), 
         mkdirSync(logDir, { recursive: true, mode: 0o700 });
         chmodSync(logDir, 0o700);
         const publishStartedAt = performance.now();
-        published = run('npm', ['publish', candidate, '--ignore-scripts', '--tag', distTag, '--access', 'public', '--logs-dir', logDir], { ...process.env, NPM_CONFIG_USERCONFIG: npmrc });
+        published = run('npm', ['publish', candidate, '--ignore-scripts', '--tag', distTag, '--access', 'public', '--loglevel', 'warn', '--logs-dir', logDir], { ...process.env, NPM_CONFIG_USERCONFIG: npmrc });
         const durationMs = published.durationMs ?? Math.ceil(performance.now() - publishStartedAt);
         try { (deps.publishSpawn ?? ((event) => debug.log('release-loop.npm', 'publish-spawn', event)))({ version, durationMs, status: published.status, signal: published.signal ?? null }); } catch { /* telemetry must not mask publish result */ }
       } finally { rmSync(dir, { recursive: true, force: true }); }

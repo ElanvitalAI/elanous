@@ -77,7 +77,8 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
   delete rawRest.watch;
   delete rawRest.guardian;
   const rawHarness = rawRest.harness && typeof rawRest.harness === 'object' && !Array.isArray(rawRest.harness)
-    ? rawRest.harness as Record<string, unknown> : {};
+    ? { ...rawRest.harness as Record<string, unknown> } : {};
+  delete rawHarness.difficultyPlacement;
   delete rawRest.harness;
   const rawAutopilot = rawRest.autopilot && typeof rawRest.autopilot === 'object' && !Array.isArray(rawRest.autopilot)
     ? rawRest.autopilot as Record<string, unknown> : {};
@@ -99,7 +100,6 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       budgetGate: cfg.harness?.budgetGate ?? rawHarness.budgetGate,
       exposeGate: cfg.harness?.exposeGate ?? rawHarness.exposeGate,
       revertGuard: cfg.harness?.revertGuard ?? rawHarness.revertGuard,
-      difficultyPlacement: cfg.harness?.difficultyPlacement ?? rawHarness.difficultyPlacement,
       difficultyRouter: cfg.harness?.difficultyRouter === 'on' ? 'on' : undefined,
       failureOracle: cfg.harness?.failureOracle === 'on' ? 'on' : undefined,
       windowAccounts: cfg.harness?.windowAccounts === 'on' ? 'on' : undefined,
@@ -157,6 +157,8 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       model: cfg.llm.model,
       baseUrl: cfg.llm.baseUrl,
       streamIdleTimeoutMs: cfg.llm.streamIdleTimeoutMs,
+      turnNoProgressMs: cfg.llm.turnNoProgressMs,
+      turnNoProgressMailTo: cfg.llm.turnNoProgressMailTo,
       // Persist the rotation exactly as held in memory — each entry
       // stripped of its own undefined fields so the on-disk JSON
       // stays minimal. Omit the key entirely when no rotation is

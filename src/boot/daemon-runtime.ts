@@ -756,13 +756,11 @@ export function createDaemonRunTurn(
   // saw 0 debug.line events because `createDebugBridge` was only
   // instantiated on the PWA path.
   //
-  // Activation policy: always-on. Drawer visibility + per-event
-  // visibility are controlled client-side (iOS Settings toggle filters
-  // displayed rows; non-iOS peers harmlessly ignore unfamiliar
-  // envelope kinds). The bridge already category-whitelists `^(chat|
-  // tool|agent|acp)\.` and caps the in-memory ring at 200 to bound
-  // bandwidth. If dogfood surfaces noise we can flip to opt-in via
-  // `_meta.elanous.debugTap` in a follow-up.
+  // Activation policy (CONTEXT-OWNER-ISOLATION-AUDIT H-1 · 2026-11-18): OFF by default. The
+  // bridge exists only when the turn asked for it (`_meta.elanous.debugTap === true`, the ACP twin
+  // of SSE `?debug-tap=on`) AND the connection was authorized as operator at the upgrade
+  // (`turnCtx.audience`, set in http-server). Member or unknown callers never get it. The old
+  // always-on wire shipped every daemon conversation's `chat.*` previews into this response.
   //
   // Per-turn lifecycle: instantiate when the broadcaster is available
   // (post `runAcpServer` boot), dispose in finally so a misbehaving
@@ -774,9 +772,16 @@ export function createDaemonRunTurn(
       const { getActiveAcpFeedbackBroadcaster } = require('../acp/server.js') as
         typeof import('../acp/server.js');
       const broadcast = getActiveAcpFeedbackBroadcaster();
-      if (broadcast) {
-        const { createDebugBridge } = require('../feedback/debug-bridge.js') as
-          typeof import('../feedback/debug-bridge.js');
+      const { createDebugBridge, debugEnvelopeAllowed, normalizeDebugAudience, readDebugTapRequest } =
+        require('../feedback/debug-bridge.js') as typeof import('../feedback/debug-bridge.js');
+      const debugRequested = readDebugTapRequest(turnCtx.promptMeta);
+      const debugAllowed = debugEnvelopeAllowed(turnCtx.audience, debugRequested);
+      if (debugRequested) {
+        debug.log('feedback.debug-gate', debugAllowed ? 'opened' : 'refused', {
+          sessionId: turnCtx.sessionId, audience: normalizeDebugAudience(turnCtx.audience),
+        }, { level: debugAllowed ? 'info' : 'warn' });
+      }
+      if (broadcast && debugAllowed) {
         const sid = turnCtx.sessionId;
         debugBridge = createDebugBridge({
           emit: (env) => { void broadcast(sid, env); },

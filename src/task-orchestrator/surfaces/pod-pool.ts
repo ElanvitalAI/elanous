@@ -139,6 +139,26 @@ function registryLabelValue(raw: unknown): string | null {
 }
 
 /**
+ * TA-IMAGE-PIN-OVERRIDES-COMMIT — 명시 digest 로 이 멤버 레지스트리에 이미지가 있는지 본다(`GET /v2/<이미지>/manifests/sha256:…`).
+ * 있으면 이미지의 `elanous.commit` 라벨(커밋)을 같이 읽는다 — 라벨을 못 읽어도 «있다» 는 사실은 돌려준다(commit=null). 없거나 HTTP 오류면 null.
+ */
+export function registryManifestByDigest(member: PodPoolMember, image: string, digest: string, run: RemoteRun = defaultRemoteRun): { commit: string | null } | null {
+  if (!member.sshHost || !/^sha256:[0-9a-f]{64}$/u.test(digest)) return null;
+  const imageName = podRegistryImageName(image);
+  const manifest = registryHttpGet(member, `${imageName}/manifests/${digest}`, run, 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json');
+  if (!manifest) return null;
+  let configDigest: string | undefined;
+  try { configDigest = (JSON.parse(manifest) as { config?: { digest?: string } }).config?.digest; } catch { return { commit: null }; }
+  if (!configDigest || !/^sha256:[0-9a-f]{64}$/u.test(configDigest)) return { commit: null };
+  const blob = registryHttpGet(member, `${imageName}/blobs/${configDigest}`, run);
+  if (!blob) return { commit: null };
+  try {
+    const labels = (JSON.parse(blob) as { config?: { Labels?: Record<string, unknown> } }).config?.Labels;
+    return { commit: labels && typeof labels === 'object' ? registryLabelValue(labels['elanous.commit']) : null };
+  } catch { return { commit: null }; }
+}
+
+/**
  * GATE-REGISTRY-IMAGE-FASTPATH (0.2.36): 레지스트리 HTTP 만으로 이 커밋 태그 이미지의 config label 을 읽는다 —
  * 노드 Docker 데몬(`docker image inspect`)을 부르지 않는다. 태그 결손 · HTTP 오류 · manifest list(단일 config 없음) ·
  * 비JSON 은 null 이다(판정하지 않고 종전 경로로 떨어진다).
@@ -999,7 +1019,7 @@ export function checkPodPool(members: readonly PodPoolMember[], kubectl: PoolKub
   return { ok: ready.length > 0, ready, dropped };
 }
 
-export type PoolImageSync = { ok: boolean; action: 'local' | 'fresh' | 'built' | 'shipped' | 'failed'; detail: string; ms: number; /** 노드 레지스트리의 이 판 이미지(있으면 Pod 가 pull). */ imageRef?: string };
+export type PoolImageSync = { ok: boolean; action: 'local' | 'fresh' | 'built' | 'shipped' | 'failed'; detail: string; ms: number; /** RELEASE-REALPATH-PROBE: the node-side build.sh exit when that build failed (null = killed/no code). */ buildExit?: number | null; /** 노드 레지스트리의 이 판 이미지(있으면 Pod 가 pull). */ imageRef?: string };
 
 /** 이미지 빌드 스크립트 — 발사한 트리의 것(판이 HEAD 와 같다). 없으면 null(통째 전송으로 떨어진다). */
 export function podImageBuildScript(cwd: string = process.cwd(),
@@ -1015,7 +1035,7 @@ export function podImageBuildScript(cwd: string = process.cwd(),
 }
 
 /** packedTgz = 풀 동기화가 한 번 만든 패키지 묶음(있으면 build.sh 가 pack 을 다시 하지 않는다). */
-type RemoteBuild = (host: string, cluster: string, registry?: string, packedTgz?: string, sharedBuildId?: string) => Promise<{ ok: boolean; detail: string }>;
+type RemoteBuild = (host: string, cluster: string, registry?: string, packedTgz?: string, sharedBuildId?: string) => Promise<{ ok: boolean; detail: string; exit?: number | null }>;
 
 /** 같은 트리의 패키지 묶음(tgz)을 «한 번» 만든다 — 멤버들이 같이 쓴다. cleanup 은 동기화가 끝나면 부른다. */
 type PoolPack = () => Promise<{ ok: boolean; tgz?: string; detail: string; cleanup?: () => void }>;
@@ -1066,7 +1086,7 @@ function buildErrorLine(line: string): boolean {
   return /(?:\berr(?:or)?\b|\bfatal\b|\bfail(?:ed|ure)?\b|\bcannot\b|\bunable\b|\bno space left\b)/i.test(line);
 }
 
-export function runBuildScript(script: string, env: NodeJS.ProcessEnv): Promise<{ ok: boolean; detail: string }> {
+export function runBuildScript(script: string, env: NodeJS.ProcessEnv): Promise<{ ok: boolean; detail: string; exit: number | null }> {
   return new Promise((done) => {
     const child = spawn('bash', [script], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
@@ -1127,7 +1147,7 @@ export function runBuildScript(script: string, env: NodeJS.ProcessEnv): Promise<
           stderrTruncated: stderrLongLine || stderrLineCount > stderrTail.length || fullTail.length > remaining,
         }, { compact: { stringMax: BUILD_STDERR_LOG_LIMIT, maxDepth: 4 } });
       }
-      done({ ok: code === 0, detail: out.trim().split('\n').slice(-2).join(' \u00b7 ').slice(0, 300) });
+      done({ ok: code === 0, exit: code, detail: out.trim().split('\n').slice(-2).join(' \u00b7 ').slice(0, 300) });
     });
   });
 }
@@ -1222,7 +1242,7 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
       const retryMs = lockOpts.retryMs ?? 2_000;
       const staleMs = lockOpts.staleMs ?? IMAGE_SHIP_TIMEOUT_MS + REMOTE_RUN_TIMEOUT_MS + 120_000;
       const lockStarted = Date.now();
-      let b: { ok: boolean; detail: string };
+      let b: { ok: boolean; detail: string; exit?: number | null };
       try {
         mkdirSync(lockDir, { recursive: true });
         // Probe atomically rather than testing path existence: another process can acquire between that test and us.
@@ -1275,7 +1295,7 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
         }
       }
       const fallback = ship(m, image, localCommit, run);
-      results.set(m.context, { ...fallback, detail: `노드 쪽 빌드 실패(${b.detail}) → ${fallback.detail}`, ms: Date.now() - t0 });
+      results.set(m.context, { ...fallback, ...(b.exit !== undefined ? { buildExit: b.exit } : {}), detail: `노드 쪽 빌드 실패(${b.detail}) → ${fallback.detail}`, ms: Date.now() - t0 });
       return;
     }
     results.set(m.context, { ...ship(m, image, localCommit, run), ms: Date.now() - t0 });

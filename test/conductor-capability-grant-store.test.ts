@@ -1,6 +1,6 @@
 // ── T6 (Phase 3 Bundle 1) — capability-grant-store + slash tests ──
 
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import {
   createCapabilityGrantStore,
   executeGrantSlash,
@@ -88,6 +88,104 @@ describe('createCapabilityGrantStore — basic', () => {
 });
 
 describe('createCapabilityGrantStore — expiry', () => {
+  test('warns once within one hour, and not outside the window', () => {
+    const now = new Date('2026-11-18T00:00:00Z').getTime();
+    const warned: string[] = [];
+    const s = createCapabilityGrantStore({
+      now: () => new Date(now),
+      onExpiring: (grant) => warned.push(grant.persona),
+    });
+    s.grant(makeGrant({ persona: 'outside', expiresAt: new Date(now + 61 * 60_000).toISOString() }));
+    expect(warned).toEqual([]);
+    s.grant(makeGrant({ persona: 'boundary', expiresAt: new Date(now + 60 * 60_000).toISOString() }));
+    s.grant(makeGrant({ persona: 'inside', expiresAt: new Date(now + 59 * 60_000).toISOString() }));
+    s.isGranted('inside', 'read');
+    expect(warned).toEqual(['boundary', 'inside']);
+  });
+
+  test('an injected clock does not silence the default warning channel', () => {
+    const now = Date.parse('2026-11-18T00:00:00Z');
+    const warning = spyOn(process, 'emitWarning').mockImplementation(() => {});
+    try {
+      const s = createCapabilityGrantStore({ now: () => new Date(now) });
+      s.grant(makeGrant({ persona: 'alice\nforged', expiresAt: new Date(now + 30 * 60_000).toISOString() }));
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(String(warning.mock.calls[0]?.[0])).toContain('capability grant expires within 1 hour');
+      expect(String(warning.mock.calls[0]?.[0])).toContain('alice\\nforged');
+      expect(String(warning.mock.calls[0]?.[0])).not.toContain('alice\nforged');
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  test('schedules the warning before a grant reaches its one-hour window', async () => {
+    const warned: string[] = [];
+    const s = createCapabilityGrantStore({ onExpiring: (grant) => warned.push(grant.persona) });
+    s.grant(makeGrant({ persona: 'scheduled', expiresAt: new Date(Date.now() + 60 * 60_000 + 200).toISOString() }));
+    expect(warned).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(warned).toEqual(['scheduled']);
+    expect(s.isGranted('scheduled', 'read')).toBe(true);
+  });
+
+  test('checkGrant retains expired and revoked denial reasons', () => {
+    let now = 1000;
+    const s = createCapabilityGrantStore({ now: () => new Date(now) });
+    const expiresAt = new Date(2000).toISOString();
+    s.grant(makeGrant({ persona: 'expired', expiresAt }));
+    s.grant(makeGrant({ persona: 'revoked' }));
+    s.revoke({ persona: 'revoked' });
+    now = 3000;
+    expect(s.checkGrant('expired', 'read')).toEqual({ granted: false, reason: 'expired', expiresAt });
+    expect(s.checkGrant('revoked', 'read')).toEqual({ granted: false, reason: 'revoked' });
+    expect(s.checkGrant('missing', 'read')).toEqual({ granted: false, reason: 'absent' });
+  });
+
+  test('denial reasons survive audit rotation and a new grant clears its old reason', () => {
+    let now = 1000;
+    const s = createCapabilityGrantStore({ now: () => new Date(now), auditCap: 1 });
+    const expiresAt = new Date(2000).toISOString();
+    s.grant(makeGrant({ persona: 'expired', expiresAt }));
+    s.grant(makeGrant({ persona: 'revoked' }));
+    s.revoke({ persona: 'revoked' });
+    now = 3000;
+    s.pruneExpired();
+    s.grant(makeGrant({ persona: 'unrelated' }));
+    expect(s.audit()).toHaveLength(1);
+    expect(s.checkGrant('expired', 'read')).toEqual({ granted: false, reason: 'expired', expiresAt });
+    expect(s.checkGrant('revoked', 'read')).toEqual({ granted: false, reason: 'revoked' });
+    s.grant(makeGrant({ persona: 'expired' }));
+    expect(s.checkGrant('expired', 'read')).toEqual({ granted: true });
+    s.revoke({ persona: 'expired' });
+    expect(s.checkGrant('expired', 'read')).toEqual({ granted: false, reason: 'revoked' });
+  });
+
+  test('denial history is bounded independently from the audit log', () => {
+    const s = createCapabilityGrantStore({ auditCap: 1, denialCap: 2 });
+    for (const persona of ['old', 'recent-a', 'recent-b']) {
+      s.grant(makeGrant({ persona }));
+      s.revoke({ persona });
+    }
+    expect(s.audit()).toHaveLength(1);
+    expect(s.checkGrant('old', 'read')).toEqual({ granted: false, reason: 'absent' });
+    expect(s.checkGrant('recent-a', 'read')).toEqual({ granted: false, reason: 'revoked' });
+    expect(s.checkGrant('recent-b', 'read')).toEqual({ granted: false, reason: 'revoked' });
+  });
+
+  test('non-finite denial caps cannot disable the memory bound', () => {
+    expect(() => createCapabilityGrantStore({ denialCap: Number.NaN })).toThrow('invalid denialCap');
+    expect(() => createCapabilityGrantStore({ denialCap: Number.POSITIVE_INFINITY })).toThrow('invalid denialCap');
+  });
+
+  test('an active global grant still authorizes a scoped request after scoped expiry', () => {
+    let now = 1000;
+    const s = createCapabilityGrantStore({ now: () => new Date(now) });
+    s.grant(makeGrant({ persona: 'a', action: 'read' }));
+    s.grant(makeGrant({ persona: 'a', action: 'read', shellId: 'shell-x', expiresAt: new Date(2000).toISOString() }));
+    now = 3000;
+    expect(s.checkGrant('a', 'read', 'shell-x')).toEqual({ granted: true });
+  });
+
   test('expired grant returns false on isGranted + auto-prunes', () => {
     let nowMs = 1000;
     const s = createCapabilityGrantStore({

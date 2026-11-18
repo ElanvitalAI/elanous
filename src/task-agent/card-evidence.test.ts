@@ -75,11 +75,15 @@ test('live hand: 발사기가 받은 런 id 를 카드에 한 번 적고 env 로
   } finally { (debug as { log: typeof debug.log }).log = original; }
 });
 
-test('발사기가 영수증을 안 주면 런 id 를 적지 않는다 · shadow 는 아무것도 묶지 않는다', async () => {
+test('발사기가 영수증을 안 주면 launched 로 적지 않는다(MAKE-CODE MF2 fail-closed) · shadow 는 아무것도 묶지 않는다', async () => {
   const path = statePath();
-  const silent = await handTask({ text: 'ship it', live: true, statePath: path, launcher: () => {} });
-  expect(readTaskCard(silent.card.id, path)?.runId).toBeUndefined();
-  expect(readTaskCard(silent.card.id, path)?.history.map((event) => event.event)).toEqual(['launch']);
+  await expect(handTask({ id: 'ta-silent-receipt', text: 'ship it', live: true, statePath: path, launcher: () => {} }))
+    .rejects.toThrow('make-code 발사 영수증 없음');
+  const silent = readTaskCard('ta-silent-receipt', path)!;
+  expect(silent.runId).toBeUndefined();
+  expect(silent.status).toBe('launch-failed');
+  expect(silent.history.map((event) => event.event)).toEqual(['launch-failed']);
+  expect(silent.history[0]?.runId).toMatch(/^run-[0-9a-f-]{36}$/);
   const { launcher, contexts } = fakeLauncher();
   const shadow = await handTask({ text: 'just look', statePath: path, launcher });
   expect(contexts).toHaveLength(0);
@@ -508,10 +512,12 @@ test('수동 --pr 이 Pod 묶음을 교체하면 자식 런 연결도 지운다 
   expect(shown.lines).toContain(`런: ${runId} · 골: - · PR: #5`);
 });
 
-test('영수증 런 id 가 넘긴 id 와 다르면 묶지 않는다', async () => {
+test('영수증 런 id 가 넘긴 id 와 다르면 묶지 않고 launched 로 적지 않는다(MAKE-CODE MF2)', async () => {
   const path = statePath();
-  const { card } = await handTask({ text: 'ship it', live: true, statePath: path, launcher: () => ({ runId: 'run-someone-else-1234' }) });
-  expect(readTaskCard(card.id, path)?.runId).toBeUndefined();
+  await expect(handTask({ id: 'ta-other-receipt', text: 'ship it', live: true, statePath: path,
+    launcher: () => ({ runId: 'run-someone-else-1234' }) })).rejects.toThrow('make-code 발사 영수증 없음');
+  expect(readTaskCard('ta-other-receipt', path)?.runId).toBeUndefined();
+  expect(readTaskCard('ta-other-receipt', path)?.status).toBe('launch-failed');
 });
 
 test('미션 ②: PR 이 먼저 묶이고 골 id 가 나중에 생기면 advance 가 골 id 도 묶는다', async () => {

@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gateImageReadinessSignalPath, readGateImageReadinessSignal, releaseReadiness, waitForGateImageT60,
+import { gateImageReadinessPendingPath, gateImageReadinessSignalPath, readGateImageReadinessSignal, releaseReadiness, waitForGateImageT60,
   type ReleaseReadinessDeps } from './release-readiness.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { setSchedule } from '../../src/release-loop/release-schedule.js';
@@ -130,6 +130,61 @@ test('image T-60 readiness signal is run- and cut-bound; absent or mismatched ev
     .toEqual({ status: 'unknown', reason: 'commit-mismatch' });
 }));
 
+test('RC-READINESS-PATH: a prerelease version gets the literal image-readiness paths; anything else is still rejected', () => {
+  expect(gateImageReadinessSignalPath('/ledger', '0.3.29-rc.0')).toBe('/ledger/release/0.3.29-rc.0/image-readiness.json');
+  expect(gateImageReadinessPendingPath('/ledger', '0.3.29-rc.0')).toBe('/ledger/release/0.3.29-rc.0/image-readiness.pending');
+  expect(gateImageReadinessSignalPath('/ledger', '0.3.29')).toBe('/ledger/release/0.3.29/image-readiness.json');
+  for (const garbage of ['../0.3.29', '0.3.29-rc.0/../x', '0.3.29-rc', '0.3.29-evil.0', '0.3.29-rc.01', 'v0.3.29', '']) {
+    expect(() => gateImageReadinessSignalPath('/ledger', garbage)).toThrow('release version must be x.y.z');
+    expect(() => gateImageReadinessPendingPath('/ledger', garbage)).toThrow('release version must be x.y.z');
+  }
+});
+
+test('RC-READINESS-COUNTDOWN: an rc without a schedule row is past its cut — ready at once, no wait', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-image-rc-'));
+  const rcVersion = '0.3.29-rc.0';
+  const runId = 'run-rc';
+  const cutCommit = 'abcdef0123456789abcdef0123456789abcdef01';
+  const digest = 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const signalPath = gateImageReadinessSignalPath(root, rcVersion);
+  const instant = new Date('2026-11-18T16:15:00.000Z');
+  try {
+    mkdirSync(join(root, 'release', rcVersion), { recursive: true });
+    writeFileSync(signalPath, JSON.stringify({ schemaVersion: 1, status: 'ready', runId, cutCommit, imageDigest: digest,
+      eligiblePools: ['gate-pool-a'], checkedAt: '2026-11-18T16:10:00.000Z' }));
+    const result = await waitForGateImageT60({ runId, input: { version: rcVersion }, outputs: { 'version-release': {
+      commit: cutCommit, gateImagePrebuild: { outcome: 'built', runId, cutCommit, digest, eligiblePools: ['gate-pool-a'] },
+    } } }, { ledgerRoot: root, now: () => instant, sleep: async () => { throw new Error('rc countdown must not wait'); } });
+    expect(result).toEqual({ version: '0.3.29-rc.0', runId: 'run-rc', cutCommit, eta: '2026-11-18T16:15:00.000Z',
+      signalPath: join(root, 'release', '0.3.29-rc.0', 'image-readiness.json') });
+    expect(JSON.parse(readFileSync(join(root, 'release', rcVersion, 'readiness-countdown.json'), 'utf8')))
+      .toMatchObject({ phase: 'ready', eta: '2026-11-18T16:15:00.000Z', holdReason: null, runId: 'run-rc' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RC-READINESS-COUNTDOWN: an rc without a schedule row still holds on a missing image signal', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-image-rc-hold-'));
+  let sleeps = 0;
+  try {
+    await expect(waitForGateImageT60({ runId: 'run-rc', input: { version: '0.3.29-rc.0' },
+      outputs: { 'version-release': { commit: 'abcdef0123456789abcdef0123456789abcdef01' } } }, { ledgerRoot: root,
+      now: () => new Date('2026-11-18T16:15:00.000Z'),
+      sleep: async () => { sleeps++; throw new Error('held'); } })).rejects.toThrow('held');
+    expect(sleeps === 1).toBe(true);
+    expect(JSON.parse(readFileSync(join(root, 'release', '0.3.29-rc.0', 'readiness-countdown.json'), 'utf8')))
+      .toMatchObject({ phase: 'hold', eta: null, holdReason: 'image-t60:signal-missing' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RC-READINESS-COUNTDOWN: a stable version without a schedule row still throws the same message', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-image-stable-'));
+  try {
+    await expect(waitForGateImageT60({ runId: 'run-stable', input: { version: '0.3.29' },
+      outputs: { 'version-release': { commit: 'abcdef0123456789abcdef0123456789abcdef01' } } }, { ledgerRoot: root,
+      sleep: async () => { throw new Error('not reached'); } })).rejects.toThrow('readiness countdown requires a release schedule: 0.3.29');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('T-minus image hold reads the real signal contract, waits through cutAt, then releases', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-image-t60-'));
   const countdownVersion = '0.3.7';
@@ -152,10 +207,11 @@ test('T-minus image hold reads the real signal contract, waits through cutAt, th
     runId: signalRunId, cutCommit, imageDigest: `sha256:${'b'.repeat(64)}`, eligiblePools: ['gate-pool-a'], checkedAt: instant.toISOString() }));
   try {
     setSchedule(countdownVersion, { cutAt }, 'OP', root);
-    const result = await waitForGateImageT60({ runId, input: { version: countdownVersion }, outputs: { 'version-release': {
-      commit: cutCommit, gateImagePrebuild: { outcome: 'built', runId, cutCommit,
-        digest: `sha256:${'b'.repeat(64)}`, eligiblePools: ['gate-pool-a'] },
-    } } }, {
+    const result = await waitForGateImageT60({ runId, input: { version: countdownVersion }, outputs: {
+      'cut-branch': { outcome: 'ok', commit: cutCommit },
+      'gate-image-prebuild': { outcome: 'ok', commit: cutCommit, gateImagePrebuild: { outcome: 'built', runId, cutCommit,
+        digest: `sha256:${'b'.repeat(64)}`, eligiblePools: ['gate-pool-a'] } },
+    } }, {
       ledgerRoot: root, now: () => instant,
       sleep: async () => {
         sleeps++;
@@ -226,7 +282,10 @@ test('the production release graph routes every version through the cut-time rea
     edges: Array<{ from: string; map?: Record<string, string> }>;
   };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
-  expect(graph.edges.find((edge) => edge.from === 'version-release')?.map).toEqual({
+  expect(graph.edges.find((edge) => edge.from === 'cut-branch')?.map).toEqual({
+    ok: 'gate-image-prebuild', fail: 'failed', error: 'failed',
+  });
+  expect(graph.edges.find((edge) => edge.from === 'gate-image-prebuild')?.map).toEqual({
     ok: 'readiness-countdown', fail: 'failed', error: 'failed',
   });
   expect(graph.edges.find((edge) => edge.from === 'readiness-countdown')?.map?.ok).toBe('traffic-cut-start');

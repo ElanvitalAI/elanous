@@ -5,6 +5,7 @@ import { debug } from '../../debug/log.js';
 import { listSessions, resolveSessionId, setActiveSessionId, type SessionMeta } from '../../session/index.js';
 import { RESUME_BUSY_STATUS, RESUME_LIST_LIMIT } from './resume-command.js';
 import { idPrefixCell, sessionIdPrefixes, sessionListTime } from '../../session/id-prefix.js';
+import { nextTuiTitle } from './new-session.js';
 export { RESUME_BUSY_STATUS, RESUME_LIST_LIMIT, parseResumeCommand } from './resume-command.js';
 export type { ResumeCommand } from './resume-command.js';
 
@@ -29,7 +30,8 @@ export function resumeListLines(rows: readonly SessionMeta[], activeId: string |
     ...rows.map((m, i) => {
       const marker = m.id === activeId ? '▸' : ' ';
       const when = sessionListTime(m.updatedAt);
-      const title = (m.title || '(untitled)').split('\n')[0]!.slice(0, 48);
+      // Same label as the header (nextTuiTitle): the store placeholder «(new session)» reads «New chat», never raw.
+      const title = nextTuiTitle(m).slice(0, 48);
       return `${String(i + 1).padStart(numberWidth)}. ${marker} ${idPrefixCell(prefixes, m.id)}  ${when}  ${String(m.messageCount).padStart(3)}t  ${title}`;
     }),
   ];

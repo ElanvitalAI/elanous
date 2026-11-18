@@ -19,12 +19,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
-import { memberHasRegistry, registryImageRef, syncPoolImages, parsePodPool, type PodPoolMember, type RemoteRun } from './pod-pool.js';
+import { memberHasRegistry, registryImageRef, registryManifestByDigest, syncPoolImages, parsePodPool, type PodPoolMember, type RemoteRun } from './pod-pool.js';
+import { isImageDigestPin } from './pod-image-digest-check.js';
 
 const POD_IMAGE = 'elanous-harness';
 
 export type PodImageSource =
-  | { readonly kind: 'pinned'; readonly ref: string; readonly commit: string; readonly registry: string }
+  | { readonly kind: 'pinned'; readonly ref: string; readonly registry: string;
+      /** 기준 이미지의 커밋 — config `harness.imageCommit` 경로는 그 값 · 명시 digest 경로는 이미지 라벨에서 읽은 값(못 읽으면 null). */
+      readonly commit: string | null;
+      /** TA-IMAGE-PIN-OVERRIDES-COMMIT — 발사가 «명시한» 이미지 digest(sha256:…). 있으면 config imageCommit 보다 우선한다. */
+      readonly digest?: string }
   | { readonly kind: 'head' };
 
 export type PodImageSourceOutcome = 'pinned-ready' | 'pinned-waited' | 'pinned-missing' | 'head';
@@ -32,6 +37,8 @@ export type PodImageSourceOutcome = 'pinned-ready' | 'pinned-waited' | 'pinned-m
 /** 기준 이미지가 레지스트리에 올라오기를 기다리는 기본 한도(초). */
 export const POD_IMAGE_PIN_WAIT_SEC = 600;
 const POD_IMAGE_PIN_POLL_MS = 15_000;
+/** 명시 digest 는 «이미 올라가 있어야 하는» 값이다 — 태그처럼 레일이 굽기를 10분 기다리지 않는다(짧은 한도 뒤 즉시 실패). */
+export const POD_IMAGE_DIGEST_WAIT_SEC = 30; // Source: #38358 digest pin 은 발사 전에 실측한 값
 
 const COMMIT = /^[0-9a-f]{12,40}$/u;
 
@@ -51,10 +58,21 @@ export function podImageRef(registry: string, commit: string): string {
   return `${registry}/${POD_IMAGE}:${commit.slice(0, 12)}`;
 }
 
+/** 명시 digest 로 이미지를 가리키는 ref — `<registry>/elanous-harness@sha256:…`. */
+export function podImageDigestRef(registry: string, digest: string): string {
+  return `${registry}/${POD_IMAGE}@${digest}`;
+}
+
 export function resolvePodImageSource(
   cfg: { harness?: { imageCommit?: unknown } } | null | undefined,
-  deps: { env?: NodeJS.ProcessEnv } = {},
+  deps: { env?: NodeJS.ProcessEnv; explicitDigest?: string } = {},
 ): PodImageSource {
+  // TA-IMAGE-PIN-OVERRIDES-COMMIT — 발사가 명시한 digest 는 config 의 전역 imageCommit 보다 «먼저». 형식 불량은 조용히 무시하지 않고 던진다.
+  if (deps.explicitDigest !== undefined) {
+    if (!isImageDigestPin(deps.explicitDigest)) throw new Error(`명시 이미지 digest 형식 불량: ${JSON.stringify(deps.explicitDigest)} (sha256:<소문자 64hex> 전체 일치)`);
+    const registry = podImageRegistry(deps.env ?? process.env);
+    return { kind: 'pinned', ref: podImageDigestRef(registry, deps.explicitDigest), commit: null, registry, digest: deps.explicitDigest };
+  }
   const raw = cfg?.harness?.imageCommit;
   if (!isPodImageCommit(raw)) return { kind: 'head' };
   const commit = raw.trim().toLowerCase();
@@ -163,6 +181,7 @@ export function listPodShelfImages(pool: string, run: RemoteRun): string[] {
 }
 
 export function podImageMissingMessage(ref: string): string {
+  if (ref.includes('@sha256:')) return `지정한 digest 이미지 ${ref} 가 레지스트리에 없다 — digest 를 확인하거나 그 이미지를 먼저 올려야 한다(config imageCommit 은 이 발사에서 쓰지 않는다)`;
   return `기준 이미지 ${ref} 가 레지스트리에 없다 — 레일이 굽기 전이다`;
 }
 
@@ -180,12 +199,26 @@ export function podPoolImageLookup(run?: RemoteRun, localRun: (cmd: string, args
 }): {
   hasRegistry: (member: PodImageMember & { context: string }, registry: string) => boolean;
   lookupTag: (member: PodImageMember & { context: string }, registry: string, commit: string) => string | null;
+  /** 명시 digest — 그 멤버 레지스트리에 그 digest 이미지가 있으면 Pod 가 당길 ref 와 이미지 라벨의 커밋. */
+  lookupDigest: (member: PodImageMember & { context: string }, registry: string, digest: string) => { ref: string; commit: string | null } | null;
 } {
   return {
     hasRegistry: (member, registry) => {
       if (member.sshHost) return memberHasRegistry({ capacity: 0, k3dCluster: '', ...member, registry }, run);
       try { return localRun('docker', ['inspect', registry.split(':')[0]!]).status === 0; }
       catch { return false; }
+    },
+    lookupDigest: (member, registry, digest) => {
+      const ref = podImageDigestRef(registry, digest);
+      if (member.sshHost) {
+        const found = registryManifestByDigest({ capacity: 0, k3dCluster: '', ...member, registry }, `${POD_IMAGE}:local`, digest, run);
+        return found ? { ref, commit: found.commit } : null;
+      }
+      const port = registry.slice(registry.lastIndexOf(':') + 1);
+      try {
+        const r = localRun('curl', ['-fsS', '--max-time', '5', '-o', '/dev/null', '-H', 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json', `http://localhost:${port}/v2/${POD_IMAGE}/manifests/${digest}`]);
+        return r.status === 0 ? { ref, commit: null } : null;
+      } catch { return null; }
     },
     lookupTag: (member, registry, commit) => {
       if (member.sshHost) return registryImageRef({ capacity: 0, k3dCluster: '', ...member, registry }, commit, run, `${POD_IMAGE}:local`);
@@ -212,6 +245,11 @@ export interface PreparePodImageDeps<M extends PodImageMember, H> {
   readonly hasRegistry: (member: M, registry: string) => boolean;
   /** 이 멤버의 그 레지스트리에 그 커밋 태그가 있으면 Pod 가 당길 ref, 없으면 null. */
   readonly lookupTag: (member: M, registry: string, commit: string) => string | null;
+  /** TA-IMAGE-PIN-OVERRIDES-COMMIT — 발사가 명시한 이미지 digest(있으면 config imageCommit 을 덮어쓴다). */
+  readonly explicitDigest?: string;
+  readonly lookupDigest?: (member: M, registry: string, digest: string) => { ref: string; commit: string | null } | null;
+  /** 명시 digest 가 config imageCommit 을 덮어썼을 때(둘이 다를 수 있다) 한 번 부른다 — 사건 기록용. */
+  readonly onOverride?: (info: { digest: string; configCommit: string | null }) => void;
   readonly maxWaitMs?: number;
   readonly pollMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -238,18 +276,61 @@ export interface PreparedPodImage<M extends PodImageMember, H> {
  * 기준값이 있으면: 레지스트리가 있는 멤버는 태그를 기다려 당기고(굽지 않는다), 나머지 멤버만 종전 경로로 보낸다.
  * 원격 레지스트리 멤버 «전부» 태그가 끝내 없으면 outcome `pinned-missing` — 종전 경로도 부르지 않는다(호출부가 exit 2).
  */
+async function preparePodImageByDigest<M extends PodImageMember, H>(deps: PreparePodImageDeps<M, H>, source: Extract<PodImageSource, { kind: 'pinned' }>): Promise<PreparedPodImage<M, H>> {
+  if (!deps.lookupDigest) throw new Error('명시 이미지 digest 를 조회할 lookupDigest 가 없다');
+  const lookupDigest = deps.lookupDigest;
+  const digest = source.digest!;
+  // 명시 pin 은 «그 이미지로만» — 레지스트리가 없는 멤버는 종전 굽기 경로(HEAD)로 보내지 않고 뺀다(pin 을 지킬 수 없다).
+  const registryMembers = deps.members.filter((m) => deps.hasRegistry(m, memberPinRegistry(m, source)));
+  const unpinned = deps.members.filter((m) => !registryMembers.includes(m));
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  const maxWaitMs = Math.max(0, deps.maxWaitMs ?? POD_IMAGE_DIGEST_WAIT_SEC * 1000);
+  const pollMs = Math.max(1, deps.pollMs ?? POD_IMAGE_PIN_POLL_MS);
+  const found = new Map<string, { ref: string; commit: string | null }>();
+  const t0 = now();
+  let pending = registryMembers;
+  let slept = false;
+  for (;;) {
+    pending = pending.filter((m) => {
+      const hit = lookupDigest(m, memberPinRegistry(m, source), digest);
+      if (hit) found.set(m.context, hit);
+      return !hit;
+    });
+    const waited = now() - t0;
+    if (pending.length === 0 || waited >= maxWaitMs) break;
+    deps.onWait?.(pending, waited);
+    slept = true;
+    await sleep(Math.min(pollMs, maxWaitMs - waited));
+  }
+  const waitedMs = now() - t0;
+  const pinned = registryMembers.filter((m) => found.has(m.context)).map((m) => ({ ...m, imageRef: found.get(m.context)!.ref }));
+  // 레지스트리가 없는 멤버도 «못 찾은 멤버»로 적는다 — 명시 pin 은 그 멤버에서 지킬 수 없다(굽지 않는다). 메시지가 비지 않게.
+  const missing = [...pending, ...unpinned].map((member) => ({ member, ref: podImageDigestRef(memberPinRegistry(member, source), digest) }));
+  const commit = [...found.values()].map((hit) => hit.commit).find((c): c is string => c !== null) ?? null;
+  const resolved: PodImageSource = { ...source, commit };
+  if (pinned.length === 0) return { source: resolved, outcome: 'pinned-missing', pinned, missing, unpinned, head: null, waitedMs };
+  return { source: resolved, outcome: slept ? 'pinned-waited' : 'pinned-ready', pinned, missing, unpinned, head: null, waitedMs };
+}
+
 export async function preparePodImage<M extends PodImageMember, H>(deps: PreparePodImageDeps<M, H>): Promise<PreparedPodImage<M, H>> {
-  const source = resolvePodImageSource(deps.cfg, { env: deps.env });
+  const source = resolvePodImageSource(deps.cfg, { env: deps.env, ...(deps.explicitDigest !== undefined ? { explicitDigest: deps.explicitDigest } : {}) });
+  if (source.kind === 'pinned' && source.digest !== undefined) {
+    const configCommit = (() => { const raw = deps.cfg?.harness?.imageCommit; return isPodImageCommit(raw) ? raw.trim().toLowerCase() : null; })();
+    deps.onOverride?.({ digest: source.digest, configCommit });
+    return preparePodImageByDigest(deps, source);
+  }
   if (source.kind === 'head') {
     return { source, outcome: 'head', pinned: [], missing: [], unpinned: deps.members, head: await deps.headPath(deps.members), waitedMs: 0 };
   }
+  const tagCommit = source.kind === 'pinned' ? source.commit as string : '';
   const localRefs = new Map<string, string>();
   const registryMembers = deps.members.filter((m) => {
     const registry = memberPinRegistry(m, source);
     if (!deps.hasRegistry(m, registry)) return false;
     if (m.sshHost) return true;
     // A local registry without the requested tag (or an unreadable one) can still use the old build path.
-    const ref = deps.lookupTag(m, registry, source.commit);
+    const ref = deps.lookupTag(m, registry, tagCommit);
     if (!ref) return false;
     localRefs.set(m.context, ref);
     return true;
@@ -269,7 +350,7 @@ export async function preparePodImage<M extends PodImageMember, H>(deps: Prepare
   let slept = false;
   for (;;) {
     pending = pending.filter((m) => {
-      const ref = localRefs.get(m.context) ?? deps.lookupTag(m, memberPinRegistry(m, source), source.commit);
+      const ref = localRefs.get(m.context) ?? deps.lookupTag(m, memberPinRegistry(m, source), tagCommit);
       if (ref) found.set(m.context, ref);
       return !ref;
     });
@@ -281,7 +362,7 @@ export async function preparePodImage<M extends PodImageMember, H>(deps: Prepare
   }
   const waitedMs = now() - t0;
   const pinned = registryMembers.filter((m) => found.has(m.context)).map((m) => ({ ...m, imageRef: found.get(m.context)! }));
-  const missing = pending.map((member) => ({ member, ref: podImageRef(memberPinRegistry(member, source), source.commit) }));
+  const missing = pending.map((member) => ({ member, ref: podImageRef(memberPinRegistry(member, source), tagCommit) }));
   if (pinned.length === 0) {
     return { source, outcome: 'pinned-missing', pinned, missing, unpinned, head: null, waitedMs };
   }
@@ -307,7 +388,8 @@ export function logPinnedImageSource<M extends PodImageMember, H>(
   if (prepared.source.kind !== 'pinned') return;
   const local = prepared.pinned.some((m) => !m.sshHost);
   debug.log('self-implement.pod', 'image-source', {
-    kind: prepared.source.kind, ref: ctx.ref, pinRef: prepared.source.ref, headCommit: ctx.headCommit, waitedMs: prepared.waitedMs, outcome: prepared.outcome,
+    kind: prepared.source.kind, ref: ctx.ref, pinRef: prepared.source.ref, headCommit: ctx.headCommit,
+    ...(prepared.source.digest !== undefined ? { digest: prepared.source.digest, imageCommit: prepared.source.commit } : {}), waitedMs: prepared.waitedMs, outcome: prepared.outcome,
     ...(local ? { local: true } : {}),
     pinned: prepared.pinned.map((m) => ({ context: m.context, imageRef: m.imageRef })),
     missing: prepared.missing.map((x) => ({ context: x.member.context, ref: x.ref })),

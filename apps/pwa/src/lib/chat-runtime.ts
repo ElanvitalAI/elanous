@@ -168,6 +168,12 @@ export interface McpAppPayload {
  *  유효한 payload만 기존 블록 누산기로 보낸다. 봉투 모양이지만 깨진 입력은 생각 렌더러에
  *  전달하지 않아 원시 마커가 새지 않는다. */
 const FEEDBACK_ENVELOPE_HEAD = /^\[elanous\/feedback\/[a-zA-Z]+\] /;
+/** H-1 (CONTEXT-OWNER-ISOLATION-AUDIT 2026-11-18) — the daemon also rides terminal envelopes on this
+ *  channel; `terminalFrame` is an all-sessions fan-out of every TUI screen (`src/acp/server.ts`
+ *  all-sessions term-frame broadcaster). They belong to the TUI mirror, never to a chat transcript. */
+const TERM_ENVELOPE_HEAD = /^\[elanous\/term\/[a-zA-Z]+\]/;
+/** H-1 — provisional per-turn cap on thought text kept in the transcript (64 KiB of UTF-16 units). */
+const ACP_THOUGHT_MAX_CHARS = 65536;
 
 /** REL9p — a tool answer's ```elanous-card``` blocks become their own text block (rendered as cards).
  *  Every place that finishes a tool block calls this, like `mcpResultImages` — the pill never shows output. */
@@ -531,6 +537,7 @@ export const META_COMMANDS: readonly { name: string; description: string }[] = [
   { name: 'remaining', description: '계정별 남은 양과 초기화 시각 보기' },
   { name: 'status', description: '현재 대화·모델·데몬 판·남은 양 보기' },
   { name: 'fork', description: '현재 대화를 복사해 새 대화로 분기' },
+  { name: 'new', description: '빈 새 대화 열기 (이전 대화는 그대로)' },
   { name: 'rewind', description: 'N개 사용자 턴 이전으로 분기 (/rewind N)' },
   { name: 'undo', description: '마지막 사용자 턴 이전으로 분기' },
   { name: 'budget', description: '이번 달 지출과 알림 기준 보기' },
@@ -558,7 +565,7 @@ const TUI_SLASH_NAMES = new Set([
   'help', '?', 'resume', 'clear', 'cls', 'status', 'st', 'now', 'wish',
   'remaining', 'setup', 'quit', 'q', 'exit', 'run-skill', 'rs', 'run',
   'ad', 'design', 'design-check', 'decide', 'dec',
-  'local', 'll', 'session', 'sess', 'persona', 'fork', 'rewind',
+  'local', 'll', 'session', 'sess', 'persona', 'fork', 'new', 'rewind',
   'resume-turn', 'context', 'ctx', 'paste', 'sync', 's', 'plugin',
   'plugins', 'widget', 'widgets', 'log', 'loops', 'board', 'memory', 'mem', 'export',
   'delta', 'diffs', 'theme', 'debug', 'api-allow', 'api',
@@ -656,6 +663,10 @@ export const META_HANDLERS: Record<
   ':fork': async () => {
     const id = forkSession();
     return { text: `forked → new session ${id}`, newSessionId: id };
+  },
+  ':new': async () => {
+    const id = forkSession();
+    return { text: '', newSessionId: id };
   },
   ':rewind': async (args, ctx) => forkFromCommand('rewind', args, ctx),
   ':undo': async (args, ctx) => forkFromCommand('undo', args, ctx),
@@ -1348,6 +1359,8 @@ export interface RunChatTurnAcpHandlers {
   /** P-3 §6.9 multi-part user content (image / resource_link blocks). When
    *  present, replaces the default `[{type:'text', text: userText}]`. */
   userContent?: PromptUserContentBlock[];
+  /** Opt-in debug envelope (`_meta.elanous.debugTap`) — ACP twin of `?debug-tap=on`; the daemon still requires an operator. */
+  debugTap?: boolean;
 }
 
 export async function runChatTurnAcp(
@@ -1388,6 +1401,10 @@ export async function runChatTurnAcp(
   /** ⭐ 「생각 채널로 왔지만 생각이 아닌 것」의 수 — 아래 봉투 주석이 이유의 canonical.
    *  ⛔ 세면 «반드시» 내보낸다(자 `turn-end-observation` 이 강제한다). */
   let feedbackEnvelopeChunks = 0;
+  /** H-1 — terminal envelopes dropped from the thought channel · thought chunks cut by the cap. Both emitted at the end. */
+  let termEnvelopeChunks = 0;
+  let thoughtTruncatedChunks = 0;
+  let thoughtCut = false;
   /** ⛔ 어시스턴트 본문이 시작되면 진행 중인 생각을 «닫는다». 없으면 no-op.
    *  @returns 이번 호출이 «실제로» 닫았으면 true — 화면 갱신이 필요한지 부르는 쪽이 안다. */
   const closeActiveThought = (): boolean => {
@@ -1471,7 +1488,24 @@ export async function runChatTurnAcp(
           feedbackEnvelopeChunks += 1;
           return;
         }
-        cumulativeThought += content.text;
+        if (TERM_ENVELOPE_HEAD.test(content.text)) {
+          termEnvelopeChunks += 1;
+          return;
+        }
+        // The marker is already visible once anything was cut — later chunks are only counted.
+        if (thoughtCut) {
+          thoughtTruncatedChunks += 1;
+          return;
+        }
+        const room = ACP_THOUGHT_MAX_CHARS - cumulativeThought.length;
+        if (content.text.length > room) {
+          // Also the exact-fill case (room 0): the first chunk that does not fit shows the marker.
+          thoughtTruncatedChunks += 1;
+          thoughtCut = true;
+          cumulativeThought += `${content.text.slice(0, room)}\n[… thought truncated at ${ACP_THOUGHT_MAX_CHARS} chars]`;
+        } else {
+          cumulativeThought += content.text;
+        }
         if (thoughtIdx === -1) {
           thoughtCount += 1;
           thoughtIdx = blocks.length;
@@ -1616,6 +1650,8 @@ export async function runChatTurnAcp(
       thoughts: thoughtCount,
       // ⭐ 「생각 채널로 왔지만 생각이 아닌 것」 — 봉투 배선이 붙기 «전»까지 이 수가 그 크기를 말한다.
       feedbackEnvelopes: feedbackEnvelopeChunks,
+      termEnvelopes: termEnvelopeChunks,
+      thoughtTruncated: thoughtTruncatedChunks,
     });
   };
 
@@ -1624,7 +1660,10 @@ export async function runChatTurnAcp(
     const res = (await acp.send('session/prompt', {
       sessionId,
       prompt: promptBlocks,
-      ...(personaId ? { _meta: { elanous: { pwaPersonaId: personaId } } } : {}),
+      // H-1 — the ACP debug envelope is opt-in like SSE `?debug-tap=on` (daemon still requires an operator).
+      ...(personaId || handlers.debugTap === true
+        ? { _meta: { elanous: { ...(personaId ? { pwaPersonaId: personaId } : {}), ...(handlers.debugTap === true ? { debugTap: true } : {}) } } }
+        : {}),
     })) as { stopReason?: string } | undefined;
     const stopReason = res?.stopReason ?? 'end_turn';
     // ⛔⭐ 턴이 끝났는데 생각이 «열린 채»면 닫는다 — 본문 없이 끝나는 턴(툴만 돈 경우)이 있다.

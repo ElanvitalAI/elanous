@@ -28,8 +28,14 @@ export function normRoot(p: string): string {
   return resolve(p.trim().replace(/\/+$/, ''));
 }
 
-export function prodInstanceRoot(): string {
-  return normRoot(join(homedir(), '.elanous'));
+/** 운영 집 `~/.elanous`. `home` 은 «그 집의 주인 HOME» 을 주입받는 호출부(임대 대상 검사 등)용 — 기본은 이 프로세스의 HOME. */
+export function prodInstanceRoot(home: string = homedir()): string {
+  return normRoot(join(home, '.elanous'));
+}
+
+/** 그 HOME 아래 시험 우주 `~/.elanous-test` — 경로를 손으로 짓지 않게 하는 단일 통로(격리 하드코딩 게이트). */
+export function homeTestInstanceRoot(home: string = homedir()): string {
+  return normRoot(join(home, '.elanous-test'));
 }
 
 /** Release records are machine-wide except in an explicitly selected config universe. */

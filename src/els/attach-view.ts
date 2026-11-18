@@ -101,7 +101,11 @@ export const SIDEBAR_COLS = 28;
 // 출처: seat-state/HAND-CLAUDE-ELS/DESIGN-ELS-ATTACH-VIEW.md §6 «좁은 터미널(<60칸) → 사이드바 자동 접힘»
 export const MIN_COLS_FOR_SIDEBAR = 60;
 
-export interface PaneRow { readonly pane: string; readonly wsId: string; readonly workspace: string; readonly title: string; readonly state: string }
+export interface PaneRow {
+  readonly pane: string; readonly wsId: string; readonly workspace: string; readonly title: string; readonly state: string;
+  /** Set on a pane of another host (a registered els host or `herdr`): `pane` is then its full address `host:ws/tab/pane`. */
+  readonly remote?: string;
+}
 
 /** The rows of an `els ls` answer, in the server's order. Anything that is not a list gives no rows. */
 export function parsePaneRows(listJson: string): PaneRow[] {
@@ -115,6 +119,30 @@ export function parsePaneRows(listJson: string): PaneRow[] {
     const row = raw as Record<string, unknown>;
     if (typeof row.pane !== 'string' || typeof row.address !== 'string') continue;
     rows.push({ pane: row.pane, wsId: row.address.split('/')[0] ?? '', workspace: String(row.workspace ?? ''), title: String(row.title ?? row.pane), state: String(row.state ?? '') });
+  }
+  return rows;
+}
+
+/**
+ * The panes of OTHER hosts in a federated `els ls` answer (reach «up»), as list rows: `pane` is the address, the workspace
+ * line reads «⇄host label» (herdr titles are «workspace · name» — split there; any other host groups by its workspace id).
+ * The local host's own panes are not taken from here (the local list comes from the owner, fast and without waiting on hosts).
+ */
+export function parseRemoteRows(listJson: string): PaneRow[] {
+  let parsed: unknown;
+  try { parsed = JSON.parse(listJson); } catch { return []; }
+  const panes = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as { panes?: unknown }).panes : undefined;
+  if (!Array.isArray(panes)) return [];
+  const rows: PaneRow[] = [];
+  for (const raw of panes) {
+    if (!raw || typeof raw !== 'object') continue;
+    const row = raw as Record<string, unknown>;
+    if (row.reach !== 'up' || typeof row.host !== 'string' || typeof row.address !== 'string' || typeof row.ws !== 'string') continue;
+    const title = String(row.title ?? '');
+    const split = row.host === 'herdr' ? title.indexOf(' · ') : -1;
+    const label = split > 0 ? title.slice(0, split) : row.ws;
+    rows.push({ pane: row.address, wsId: `${row.host}:${row.ws}`, workspace: `⇄${row.host} ${label}`, title: split > 0 ? title.slice(split + 3) : title || String(row.pane ?? row.address),
+      state: String(row.state ?? ''), remote: row.host });
   }
   return rows;
 }
@@ -161,7 +189,12 @@ export const sidebarWidthFor = (cols: number, open: boolean): number => open && 
 
 const CURSOR_HEADER = /^\[screen \d+x\d+ cursor=\(row (\d+), col (\d+), visible (true|false)\)\]\n/;
 
-export interface ComposeInput { readonly cols: number; readonly rows: number; readonly sidebar: readonly string[] | null; readonly frame: string; readonly status: string }
+export interface ComposeInput {
+  readonly cols: number; readonly rows: number; readonly sidebar: readonly string[] | null; readonly frame: string; readonly status: string;
+  /** ELS-ONE-SPACE: the selected space's tab row (space-tabs-view buildTabRow), drawn as the centre's first line; the pane
+   *  sits under it. Absent = no row (the pane starts at the top). */
+  readonly tabRow?: string;
+}
 
 /** One full repaint: sidebar (when it fits) | pane, the status line last, and the terminal cursor put where the pane's is. */
 export function composeView(view: ComposeInput): string {
@@ -170,12 +203,14 @@ export function composeView(view: ComposeInput): string {
   const centre = view.cols - left;
   const header = CURSOR_HEADER.exec(view.frame);
   const body = view.frame.replace(CURSOR_HEADER, '').replace(/^\[screen [^\]]*\]\n/, '').replace(/\n+$/, '').split('\n');
+  const top = view.tabRow !== undefined ? 1 : 0;
   const lines: string[] = [];
   for (let row = 0; row < view.rows - 1; row++) {
-    lines.push(`${sidebar ? `${fitAnsi(sidebar[row] ?? '', SIDEBAR_COLS)}│` : ''}${fitAnsi(body[row] ?? '', centre)}`);
+    const centreText = row < top ? fitCells(view.tabRow!, centre) : fitAnsi(body[row - top] ?? '', centre);
+    lines.push(`${sidebar ? `${fitAnsi(sidebar[row] ?? '', SIDEBAR_COLS)}│` : ''}${centreText}`);
   }
   lines.push(`${REVERSE}${fitCells(view.status, view.cols)}${ESC}[0m`);
-  const cursorRow = header ? Number(header[1]) : -1;
+  const cursorRow = header ? Number(header[1]) + top : -1;
   const cursorCol = header ? Number(header[2]) : -1;
   const showCursor = header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;
   const place = showCursor ? `${ESC}[${cursorRow + 1};${left + cursorCol + 1}H${ESC}[?25h` : `${ESC}[?25l`;

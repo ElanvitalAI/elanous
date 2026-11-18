@@ -63,6 +63,7 @@ import { collectOrchestrateUnionDiff, type UnionDiffFileReader } from './orchest
 import { debug } from '../debug/log.js';
 import { parseGoalReleaseNoteSection, type ReleaseNoteSection } from '../release-loop/release-note.js';
 import { readHarnessScreen, readHarnessScreenTail, resolveHarnessScreenKey } from '../harness/harness-screen.js';
+import { repairRetryVerdict } from './repair-retry-policy.js';
 import {
   dedupWorkingMemory,
   normList,
@@ -834,6 +835,11 @@ export interface OrchestrateSelfDevOptions {
   stopAfterFailure?: (result: SelfDevJobResult) => string | null;
   /** Observes a stop decision after pending siblings have been cancelled. */
   onStopAfterFailure?: (decision: { reason: string; remainingGoals: number }) => void;
+  /**
+   * TA-RETRY-VISIBLE-NO-AUTO — one line on the task card's history for the automatic repair (`repair-retry`) or its
+   * skip (`repair-skipped`). Default: the card state file (no card there = nothing written · fail-soft).
+   */
+  recordCardEvent?: (cardId: string, event: { event: 'repair-retry' | 'repair-skipped'; detail: string; runId?: string }) => void;
   /** ⭐ 둘째 자도 «같이» 주입할 수 있어야 한다 — 첫째만 열어 두면 호출자가 「첫째가 죽은 상황」을
    *  재현할 수 없다(무인 리뷰 지적 2026-08-21). 생략하면 실제 `os.cpus().length` 를 쓴다. */
   cpuCount?: () => number;
@@ -1847,10 +1853,24 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           const failedTask = graph.getTask(ev.taskId);
           const failedResult = results.get(ev.taskId)!;
           const stopReason = opts.stopAfterFailure?.(failedResult) ?? null;
+          // TA-RETRY-VISIBLE-NO-AUTO: a failure decided by configuration (no usable provider) fails the same way again —
+          // no automatic repair Job for it; the failure stays on the card as it is, and the skip is logged.
+          const repairVerdict = repairRetryVerdict(ev.errorCode, ev.errorMessage);
+          const repairEligible = stopReason === null && taskCardId?.trim() && failedGoal && failedTask?.surface.kind === 'self-implement'
+            && !repairedGoals.has(failedGoal) && !fDisp?.prUrl && fDisp?.merged !== true && fDisp?.harvestable !== true;
+          const cardEvent = (event: 'repair-retry' | 'repair-skipped', detail: string): void => {
+            if (!taskCardId?.trim()) return;
+            try { (opts.recordCardEvent ?? recordRepairOnCard)(taskCardId, { event, detail }); } catch { /* the card line never blocks the run */ }
+          };
+          if (repairEligible && !repairVerdict.retry) {
+            cardEvent('repair-skipped', `${repairVerdict.failureClass} — deterministic, a retry fails the same way · failed ${ev.taskId}`);
+            try { debug.log('self-dev.slice', 'repair-skipped', { slice: failedGoal?.id ?? ev.taskId, failedTaskId: ev.taskId,
+              failureClass: repairVerdict.failureClass, reason: 'deterministic-failure' }, { level: 'warn' }); } catch { /* observation is fail-soft */ }
+          }
           // A child without a PR gets one supervised, narrower attempt. Keep the original
           // failure in the checkpoint; redirect only its actual dependents to the replacement.
           if (stopReason === null && taskCardId?.trim() && failedGoal && failedTask?.surface.kind === 'self-implement' && !repairedGoals.has(failedGoal)
-            && !fDisp?.prUrl && fDisp?.merged !== true && fDisp?.harvestable !== true) {
+            && !fDisp?.prUrl && fDisp?.merged !== true && fDisp?.harvestable !== true && repairVerdict.retry) {
             repairedGoals.add(failedGoal);
             const reason = `${ev.errorCode}: ${ev.errorMessage}`.slice(0, FAILURE_MESSAGE_MAX_LENGTH);
             const repairFeature = `${failedGoal.feature.trimEnd()}\n\n## 자동 수복 1회\n앞선 조각 실패: ${reason}\n실패 범위만 좁혀 재시도하고 원래 완료 경계를 보존한다.`;
@@ -1872,6 +1892,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
             results.set(ev.taskId, { ...results.get(ev.taskId)!, status: 'superseded' });
             try { debug.log('self-dev.slice', 'repair-retry', { slice: failedGoal.id ?? ev.taskId, failedTaskId: ev.taskId,
               replacementTaskId: replacement.id, reason, attempt: 1 }); } catch { /* observation is fail-soft */ }
+            cardEvent('repair-retry', `attempt 1 · ${ev.taskId} → ${replacement.id} · ${reason}`);
             scheduleTick();
             break;
           }
@@ -1973,4 +1994,12 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       if (openCount() === 0 || (blockedByParent.size > 0 && dispatched.length === 0 && graph.listRunning().length === 0)) finishOrReject();
     }
   });
+}
+
+/** TA-RETRY-VISIBLE-NO-AUTO — the default card writer: one history line on the card, if this machine has it. */
+function recordRepairOnCard(cardId: string, event: { event: 'repair-retry' | 'repair-skipped'; detail: string; runId?: string }): void {
+  const { taskAgentStatePath, updateTaskCard } = require('../task-agent/task-card-state.js') as typeof import('../task-agent/task-card-state.js');
+  updateTaskCard(taskAgentStatePath(), cardId, (card) => card
+    ? { ...card, history: [...card.history, { at: new Date().toISOString(), ...event }] }
+    : undefined);
 }

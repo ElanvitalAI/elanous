@@ -25,4 +25,26 @@ describe('formatInlinePanel', () => {
       '계속 입력',
     ]);
   });
+
+  // TUI-COMPACT-CROWDED-FOOTER: with fewer than three rows the decoration (title · hint) is omitted and only candidate rows remain.
+  const rows = ['quit', 'help', 'new', 'compact', 'session'].map((label) => ({ label }));
+  test('crowded: one row shows only the selected candidate, two rows show a window with the selection visible', () => {
+    expect(formatInlinePanel({ title: 't', rows, selected: 0, hint: 'h' }, 1)).toEqual(['▸ quit']);
+    expect(formatInlinePanel({ title: 't', rows, selected: 3, hint: 'h' }, 1)).toEqual(['▸ compact']);
+    expect(formatInlinePanel({ title: 't', rows, selected: 0, hint: 'h' }, 2)).toEqual(['▸ quit', '  help']);
+    expect(formatInlinePanel({ title: 't', rows, selected: 4, hint: 'h' }, 2)).toEqual(['  compact', '▸ session']);
+    expect(formatInlinePanel({ title: 't', rows: [], hint: 'h' }, 1)).toEqual(['  No candidates']);
+    expect(formatInlinePanel({ title: 't', rows: [], hint: 'h' }, 2)).toEqual(['  No candidates']);
+  });
+
+  test('three rows keep the chrome: title, one candidate, hint', () => {
+    expect(formatInlinePanel({ title: 't', rows, selected: 2, hint: 'h' }, 3)).toEqual(['t · ↑↓ select · Enter select · Esc close', '▸ new', 'h']);
+  });
+});
+
+test('the header says what Enter does in this panel — the queue panel edits (header and hint agree)', () => {
+  const rows = [{ label: 'steer · queued one' }];
+  expect(formatInlinePanel({ title: 'Queue', rows, hint: 'Tab steer↔queue · Delete cancel · Enter edit · Esc close', enterAction: 'edit' }))
+    .toEqual(['Queue · ↑↓ select · Enter edit · Esc close', '▸ steer · queued one', 'Tab steer↔queue · Delete cancel · Enter edit · Esc close']);
+  expect(formatInlinePanel({ title: 'Model', rows, hint: 'h' })[0]).toBe('Model · ↑↓ select · Enter select · Esc close');
 });

@@ -4,8 +4,9 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { createGateRunner, judgeGate, type GateOptions, type GateRunner } from './gate-node.js';
 import { preflightGateExecutionIdentity, preflightGateImageDigest } from './gate-radius-live.js';
-import { readGraphContext, finishNode, errorResult, type GraphContext } from './node-verdict.js';
+import { readGraphContext, finishNode, errorResult, type GraphContext, type NodeOutcome, type NodeVerdict } from './node-verdict.js';
 import { syncPoolImages } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 export interface GateImageRepairDeps {
   runner?: GateRunner;
@@ -19,7 +20,7 @@ function repairInput(context: GraphContext): { version: string; runId: string; c
   const node = context.nodeInput;
   const input = context.input;
   const triage = context.outputs['gate-triage'];
-  const cut = context.outputs['version-release'];
+  const cut = releaseCutRecord(context);
   const invalidContextKeys = [
     ...(!node || typeof node !== 'object' || Array.isArray(node) ? ['nodeInput'] : []),
     ...(!input || typeof input !== 'object' || Array.isArray(input) ? ['releaseInput'] : []),
@@ -77,16 +78,21 @@ export async function runGateImageRepairNode(context: GraphContext, deps: GateIm
       resultCommit: result.commit, digestPresent: Boolean(result.imagePinDigest), error: result.error ?? null })}`);
   }
   debug.log('release-loop.gate-image-repair', 'image-pinned', { runId, version, commit, digest: result.imagePinDigest });
-  return result;
+  const { outcome, commit: resultCommit, imagePin, imagePinRunId, imagePinDigest, summary } = result;
+  // finishNode -> emitNodeResult reads verdict and requires a real summary (it normalizes the text).
+  return { outcome, verdict: 'pass', commit: resultCommit, imagePin, imagePinRunId, imagePinDigest,
+    summary: summary ?? `cut image pinned: ${imagePinDigest}` };
 }
 
 interface GateResultOutput {
-  outcome: 'ok';
+  outcome: NodeOutcome;
+  verdict: NodeVerdict;
   commit: string;
   imagePin: 'cut-commit';
   imagePinRunId: string;
   imagePinDigest: string;
-  summary?: string;
+  summary: string;
+  [key: string]: unknown;
 }
 
 if (import.meta.main) {

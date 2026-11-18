@@ -1,3 +1,4 @@
+import { RELEASE_CUT_NODE_IDS, RELEASE_RECEIPT_COMMIT_NODE_IDS } from '../../scripts/release-loop/release-node-ids.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile, spawnSync } from 'node:child_process';
@@ -28,7 +29,7 @@ import type { ResearchEdgeDecisionRegistry } from '../research/edge-decision.js'
 import { graphVersionHash, parseGraphTemplateYaml, type GraphNodeSpec, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
 import { evaluateOverlayCondition } from '../self-implement/graph-overlay-condition.js';
 import { createGraphUnitResolver, resolveGraphUnit, UnitNotFoundError, type ResolvedGraphUnit } from '../self-implement/graph-unit-resolver.js';
-import { flattenGraphUnits } from '../self-implement/graph-unit-flatten.js';
+import { assertGraphUnitDepth, flattenGraphUnits } from '../self-implement/graph-unit-flatten.js';
 import { shapeGraphUnit } from './unit-shape.js';
 import { createGraphEventBus, createScopedGraphEventBus, publishNodeGraphEvent, type GraphEvent, type GraphEventBus } from './graph-events.js';
 import { appendGraphRunEvent, graphRunEventLedgerPath, readGraphRunEvents } from './graph-run-event-ledger.js';
@@ -76,6 +77,11 @@ import { fanOutGraphSource, nextNode, planHarnessLoopRoute, releaseRouteReachesK
 import { lastJsonObject, STOPPED_NODE_ERROR } from './runner-primitives.js';
 import { declaredHealEdges, graphHealManifest, type DeclaredHealEdge } from './declared-heal-edges.js';
 import type { GraphGrowthScope, GraphLoopBudgetScope, GraphNodeLifecycleEvent, GraphNodeLifecyclePhase, GraphRun, GraphRunOptions, GraphRunState, S2CorrectionBudget } from './runner-types.js';
+
+/** RELEASE-RESUME-AFTER-CUT-PUSHED: cut node ids live in scripts/release-loop/release-node-ids.ts (plugin layer). */
+function findReleaseCutNode<T extends { nodeId: string }>(nodes: readonly T[]): T | undefined {
+  return nodes.find((node) => RELEASE_CUT_NODE_IDS.includes(node.nodeId));
+}
 export { nextNode } from './runner-routing.js';
 export { lastJsonObject, STOPPED_NODE_ERROR } from './runner-primitives.js';
 export { RELEASE_NODE_COMMANDS } from '../../scripts/release-loop/runner-release-node-commands.js';
@@ -192,7 +198,7 @@ export function bindGraphV2StaticMapItem(nodeInput: unknown, outputs: Readonly<R
   return { nodeInput: { ...declaredInput, [as]: structuredClone(items[index as number]), mapIndex: index, mapCount: items.length } };
 }
 function completionCommit(state: GraphRunState): string | undefined {
-  const releaseCommit = state.nodes.find((record) => record.nodeId === 'version-release')?.output;
+  const releaseCommit = findReleaseCutNode(state.nodes)?.output;
   const commit = lastJsonObject(releaseCommit)?.commit;
   return typeof commit === 'string' && /^[a-f0-9]{40}$/i.test(commit) ? commit : undefined;
 }
@@ -496,6 +502,31 @@ function safeSegment(value: string): string {
   return value;
 }
 
+/** N-way HITL: options pinned into `pending` only for 3+ declared choices, so 2-option records stay byte-identical. */
+function pendingHitlChoices(node: GraphNodeSpec | undefined): Pick<NonNullable<GraphRunState['pending']>, 'choices'> {
+  return node?.kind === 'hitl' && node.hitl && node.hitl.options.length >= 3
+    ? { choices: node.hitl.options.map(option => ({ key: option.key, exit: option.exit, ...(option.default === true ? { default: true } : {}) })) }
+    : {};
+}
+
+/** Declared HITL option count of the pending node in the run's own graph snapshot (0 when unknown). */
+function snapshotHitlOptionCount(state: GraphRunState): number {
+  let raw: unknown;
+  try { raw = parseYaml(readFileSync(join(`${state.statePath}.graph`, 'graph.yaml'), 'utf8')); }
+  catch { return 0; }
+  const nodes = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>).nodes : undefined;
+  const node = Array.isArray(nodes) ? nodes.find((candidate: unknown) => candidate && typeof candidate === 'object'
+    && ((candidate as Record<string, unknown>).node_id ?? (candidate as Record<string, unknown>).id) === state.pending?.nodeId) : undefined;
+  const hitl = node && typeof node === 'object' ? (node as Record<string, unknown>).hitl : undefined;
+  const options = hitl && typeof hitl === 'object' ? (hitl as Record<string, unknown>).options : undefined;
+  return Array.isArray(options) ? options.length : 0;
+}
+
+export function hitlChoiceDecision(option: { default?: boolean }): 'approved' | 'rejected' {
+  // Same rule as the 2-option map: the declared default is the refusal exit.
+  return option.default === true ? 'rejected' : 'approved';
+}
+
 type CommandRecipe = { command: string; dry_run_command?: string; timeout_ms?: number };
 type PromptRecipe = { prompt: string };
 type Recipe = CommandRecipe | PromptRecipe | ({ approval: string } & Partial<CommandRecipe>);
@@ -520,16 +551,23 @@ function resolveNodeRecipe(node: GraphNodeSpec, recipes: Record<string, Recipe>,
       throw new Error(`invalid HITL approval prompt: ${node.nodeId}`);
     const prompt = typeof input?.approval === 'string'
       ? input.approval : `Approve graph action ${node.recipe.slice('hitl:'.length)}?`;
-    const choices = node.hitl?.options.length === 2
+    const choices = node.hitl && node.hitl.options.length >= 2
       ? ` Choose one graph option: ${node.hitl.options.map(option => `${option.key} → ${option.exit}${option.default ? ' (default)' : ''}`).join(', ')}` : '';
     return { approval: { approval: prompt + choices } };
   }
-  if (node.kind === 'hitl' && node.hitl?.options.length === 2) {
+  if (node.kind === 'hitl' && node.hitl && node.hitl.options.length >= 2) {
     const choices = node.hitl.options.map(option => `${option.key} → ${option.exit}${option.default ? ' (default)' : ''}`).join(', ');
     const input = node.input && typeof node.input === 'object' && !Array.isArray(node.input)
       ? node.input as Record<string, unknown> : undefined;
-    const prompt = typeof input?.approval === 'string' && input.approval.trim() ? input.approval : 'Choose one graph option:';
-    return { approval: { approval: `${prompt} ${choices}` } };
+    // 3+ options keep an `approval:` recipe's prompt and command (2-option resolution stays byte-identical).
+    const entry = node.hitl.options.length >= 3 && node.recipe.startsWith('approval:') ? recipes[node.recipe.slice(9)] : undefined;
+    const approvalEntry = entry && 'approval' in entry ? entry : undefined;
+    const prompt = typeof input?.approval === 'string' && input.approval.trim() ? input.approval
+      : approvalEntry?.approval.trim() ? approvalEntry.approval : 'Choose one graph option:';
+    return { approval: { approval: `${prompt} ${choices}` },
+      ...(approvalEntry && typeof approvalEntry.command === 'string' ? { command: { command: approvalEntry.command,
+        ...(approvalEntry.dry_run_command ? { dry_run_command: approvalEntry.dry_run_command } : {}),
+        ...(approvalEntry.timeout_ms !== undefined ? { timeout_ms: approvalEntry.timeout_ms } : {}) } } : {}) };
   }
   if (node.recipe === 'none') return {};
   if (node.recipe === 'cmd:gate-repair' && /^gate-repair-[a-f0-9]{12}$/.test(node.nodeId))
@@ -650,7 +688,7 @@ function applyRecordedDecision(state: GraphRunState): GraphRunState {
   if (!state.pending) return state;
   // A legacy card had no pinned input. Its claim is archived and a fresh card is issued on resume.
   if (!state.pending.inputSha256) return state;
-  let recorded: { nodeId: string; decision: 'approved' | 'rejected'; outcome?: string; decidedBy?: string; decidedAt: string; inputSha256?: string };
+  let recorded: { nodeId: string; decision: 'approved' | 'rejected'; outcome?: string; choice?: string; decidedBy?: string; decidedAt: string; inputSha256?: string };
   try { recorded = JSON.parse(readFileSync(approvalDecisionPath(state), 'utf8')); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return state;
@@ -662,6 +700,9 @@ function applyRecordedDecision(state: GraphRunState): GraphRunState {
       state.graphId !== KNOWN_ISSUE_ROUTE.graph || state.pending.nodeId !== KNOWN_ISSUE_ROUTE.approval)) ||
     (state.pending.decision && state.pending.decision !== recorded.decision) ||
     (state.pending.outcome && state.pending.outcome !== recorded.outcome) ||
+    (recorded.choice !== undefined && !state.pending.choices?.some(option => option.key === recorded.choice && hitlChoiceDecision(option) === recorded.decision)) ||
+    (state.pending.choices !== undefined && recorded.choice === undefined) ||
+    (state.pending.choice !== undefined && state.pending.choice !== recorded.choice) ||
     (state.pending.inputSha256 !== undefined && state.pending.inputSha256 !== stableSha256(state.input)) ||
     (recorded.inputSha256 !== undefined && (recorded.inputSha256 !== stableSha256(state.input) ||
       recorded.inputSha256 !== state.pending.inputSha256))) {
@@ -995,7 +1036,7 @@ function persistOwnedRun(state: GraphRunState, expected: Partial<Pick<GraphRunSt
 
 export interface ExpectedGraphApprovalVisit { nodeId: string; visit: number; outcome?: string }
 
-export function decideGraphApproval(graphId: string, runId: string, decision: 'approved' | 'rejected', by?: string, root = effectiveInstanceRoot(), expected?: ExpectedGraphApprovalVisit): GraphRunState {
+export function decideGraphApproval(graphId: string, runId: string, decision: 'approved' | 'rejected', by?: string, root = effectiveInstanceRoot(), expected?: ExpectedGraphApprovalVisit, choice?: string): GraphRunState {
   const state = readGraphRun(graphId, runId, root);
   if (state.status !== 'awaiting-approval' || !state.pending || state.growthPark || state.pending.decision ||
       (expected && (state.dryRun || state.pending.nodeId !== expected.nodeId || state.path.at(-1) !== expected.nodeId ||
@@ -1007,13 +1048,35 @@ export function decideGraphApproval(graphId: string, runId: string, decision: 'a
   if (!state.pending.inputSha256 || state.pending.inputSha256 !== stableSha256(state.input))
     throw new Error(`approval input changed since card was shown: ${graphId}/${runId}`);
   const outcome = expected?.outcome;
+  const choices = state.pending.choices;
+  const pendingNodeId = state.pending.nodeId;
+  if (!choices && snapshotHitlOptionCount(state) >= 3) {
+    debug.log('graph.approval', 'choice-refused', { graphId, runId, nodeId: pendingNodeId, reason: 'choices-unpinned', decision }, { level: 'warn' });
+    throw new Error(`HITL node ${pendingNodeId} paused before its choices were pinned; resume the run once to pin them, then answer with --choice`);
+  }
+  const refuseChoice = (reason: string, message: string): never => {
+    debug.log('graph.approval', 'choice-refused', { graphId, runId, nodeId: pendingNodeId, reason, decision,
+      ...(choice === undefined ? {} : { choice }), options: choices?.length ?? 0 }, { level: 'warn' });
+    throw new Error(message);
+  };
+  let chosen: { key: string; exit: string; default?: boolean } | undefined;
+  if (choice !== undefined) {
+    if (!choices) refuseChoice('no-choices', `HITL choice applies only to nodes with 3+ declared options: ${pendingNodeId}`);
+    if (outcome !== undefined) refuseChoice('outcome-conflict', 'a HITL choice cannot be combined with a named approval outcome');
+    chosen = choices!.find(option => option.key === choice);
+    if (!chosen) refuseChoice('unknown-choice', `unknown HITL choice '${choice}' at ${pendingNodeId}; choose one of: ${choices!.map(option => option.key).join(', ')}`);
+    if (hitlChoiceDecision(chosen!) !== decision)
+      refuseChoice('decision-conflict', `HITL choice '${choice}' records ${hitlChoiceDecision(chosen!)}, not ${decision}`);
+  } else if (choices) {
+    refuseChoice('choice-required', `HITL node ${pendingNodeId} has ${choices.length} options; choose one with --choice <key>: ${choices.map(option => option.key).join(', ')}`);
+  }
   if (outcome !== undefined) {
     if (decision !== 'approved' || outcome !== KNOWN_ISSUE_ROUTE.outcome || graphId !== KNOWN_ISSUE_ROUTE.graph ||
       state.pending.nodeId !== KNOWN_ISSUE_ROUTE.approval || by !== 'OP')
       throw new Error('named approval outcome is unavailable for this graph, node, or approver');
     assertReleaseKnownIssueWaiverApproval(state, root);
   }
-  const recorded = { nodeId: state.pending.nodeId, decision, ...(outcome === undefined ? {} : { outcome }), ...(by === undefined ? {} : { decidedBy: by }),
+  const recorded = { nodeId: state.pending.nodeId, decision, ...(outcome === undefined ? {} : { outcome }), ...(chosen === undefined ? {} : { choice: chosen.key }), ...(by === undefined ? {} : { decidedBy: by }),
     decidedAt: new Date().toISOString(), inputSha256: state.pending.inputSha256 };
   // A card can claim only the visit it names; never derive a later visit's claim path from a fresh read.
   const decisionPath = approvalDecisionPath(state);
@@ -1160,7 +1223,7 @@ export function validateUnitCalls(graph: GraphTemplateSpec, path: string, ancest
 function validateUnitCallsWithResolver(graph: GraphTemplateSpec, path: string, ancestors: readonly string[], onMissing: ((call: string) => void) | undefined,
   resolve: typeof resolveGraphUnit): Map<string, ResolvedUnit> {
   if (ancestors.includes(graph.graphId)) throw new Error(`unit cycle: ${[...ancestors, graph.graphId].join(' -> ')}`);
-  if (ancestors.length > 3) throw new Error('unit nesting exceeds depth 3');
+  assertGraphUnitDepth(graph.graphId, ancestors, 'runner');
   const result = new Map<string, ResolvedUnit>();
   for (const node of graph.nodes) {
     if (node.kind !== 'subgraph' || node.call === undefined) continue;
@@ -1933,7 +1996,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const verifyReleaseSource = (): string | undefined => {
     const source = options.releaseCommandSource;
     if (!source) return undefined;
-    const savedCutTip = lastJsonObject(state.nodes.find((node) => node.nodeId === 'version-release')?.output)?.commit ?? options.branchCutTip;
+    const savedCutTip = lastJsonObject(findReleaseCutNode(state.nodes)?.output)?.commit ?? options.branchCutTip;
     if (graphId !== 'release-loop' || (!options.resumeRunId && !options.branchCutTip) || typeof savedCutTip !== 'string' || source.cutTip !== savedCutTip) {
       throw new Error('release command source differs from the saved cut tip');
     }
@@ -2252,8 +2315,18 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const approvalNonce = randomUUID();
     if (existsSync(oldClaim)) renameSync(oldClaim, `${oldClaim}.legacy-${approvalNonce}`);
     state.pending = { nodeId: state.pending.nodeId, message: approvalMessage(template, state.input, isReleaseLoop),
-      since: new Date().toISOString(), inputSha256: stableSha256(state.input), approvalNonce };
+      since: new Date().toISOString(), inputSha256: stableSha256(state.input), approvalNonce, ...pendingHitlChoices(pendingNode) };
     persistOwnedRun(state, saved!);
+  }
+  if (options.resumeRunId && state.status === 'awaiting-approval' && state.pending && !state.pending.decision && !state.pending.choices) {
+    // A 3+ option node paused before choices were pinned: the approval source hash already matched above, so pin the
+    // node's declared options now; until then decideGraphApproval refuses a plain approve/reject for it.
+    const pinned = pendingHitlChoices(graph.nodes.find(node => node.nodeId === state.pending!.nodeId));
+    if (pinned.choices) {
+      state.pending = { ...state.pending, ...pinned };
+      debug.log('graph.approval', 'choices-pinned-on-resume', { graphId, runId, nodeId: state.pending.nodeId, options: pinned.choices.length });
+      persistOwnedRun(state, saved!);
+    }
   }
   if (options.resumeRunId && state.status === 'awaiting-approval' && state.pending?.inputSha256 !== undefined &&
     state.pending.inputSha256 !== stableSha256(state.input))
@@ -2927,7 +3000,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (approval && (!state.dryRun || document.dry_run_await_approval === true) && !state.pending?.decision) {
       if (!state.pending) {
         state.pending = { nodeId: current, message: approval.approval, since: new Date().toISOString(),
-          inputSha256: stableSha256(state.input) };
+          inputSha256: stableSha256(state.input), ...pendingHitlChoices(node) };
         state.approvalSourceHash = approvalSourceHash;
       }
       state.status = 'awaiting-approval';
@@ -3026,7 +3099,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         throw new Error('saved gate unmeasured evidence changed before waiver event consumption');
       }
       const gateOutput = lastJsonObject(waivedRecord!.output);
-      const cutOutput = lastJsonObject(state.nodes.find((record) => record.nodeId === 'version-release')?.output);
+      const cutOutput = lastJsonObject(findReleaseCutNode(state.nodes)?.output);
       const head = typeof cutOutput?.commit === 'string' && /^[0-9a-f]{40}$/i.test(cutOutput.commit) ? cutOutput.commit : '';
       const target = `run:${runId}`;
       const eventPath = join(options.waiverLedgerRoot ?? options.deps?.root ?? effectiveInstanceRoot(), 'review-results', 'waiver-events.jsonl');
@@ -3679,6 +3752,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           ...(unit.source === undefined ? {} : { graphSource: unit.source }),
           ...(baseEventBus === undefined ? {} : { eventBus: baseEventBus }),
           ...(options.signal ? { signal: options.signal } : {}),
+          // A quiet caller (tasks hand --json) stays quiet inside its unit calls too.
+          ...(options.quiet ? { quiet: true } : {}),
           ...(options.verifiedAppSlug ? { verifiedAppSlug: options.verifiedAppSlug } : {}),
           ...(options.preconditionDeadlineAtMs === undefined ? {} : { preconditionDeadlineAtMs: options.preconditionDeadlineAtMs }),
           pinChildUniverse: options.pinChildUniverse,
@@ -3875,14 +3950,48 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (approval && !state.dryRun && !command) {
         const rejectionReason = state.pending?.decision === 'rejected'
           ? `approval rejected${state.pending.decidedBy ? ` by ${state.pending.decidedBy}` : ''}` : undefined;
-        const selected = node.hitl?.options.length === 2
-          ? node.hitl.options.find(option => (option.default === true) === !ok)
-          : undefined;
+        const pendingChoice = state.pending?.choice;
+        const selected = pendingChoice !== undefined
+          ? state.pending?.choices?.find(option => option.key === pendingChoice)
+          : node.hitl?.options.length === 2
+            ? node.hitl.options.find(option => (option.default === true) === !ok)
+            : undefined;
+        if (pendingChoice !== undefined && !selected) {
+          debug.log('graph.approval', 'choice-refused', { graphId, runId, nodeId: current, reason: 'undeclared-recorded-choice', choice: pendingChoice }, { level: 'warn' });
+          throw new Error(`recorded HITL choice is not declared: ${current}`);
+        }
         output = JSON.stringify({ outcome: state.pending?.outcome ?? selected?.exit ?? (ok ? 'approved' : 'rejected'),
           ...(selected ? { choice: selected.key } : {}), graphId, runId, nodeId: current,
           ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null,
           ...(rejectionReason ? { error: rejectionReason } : {}) });
         if (rejectionReason) error = rejectionReason;
+      }
+      // N-way HITL with a command: the chosen option routes. A default (rejected) choice never runs the command; an
+      // approved choice runs it and routes to the chosen exit only when the command succeeded.
+      if (approval && !state.dryRun && command && state.pending?.choice !== undefined) {
+        const pendingChoice = state.pending.choice;
+        const selected = state.pending.choices?.find(option => option.key === pendingChoice);
+        if (!selected) {
+          debug.log('graph.approval', 'choice-refused', { graphId, runId, nodeId: current, reason: 'undeclared-recorded-choice', choice: pendingChoice }, { level: 'warn' });
+          throw new Error(`recorded HITL choice is not declared: ${current}`);
+        }
+        const rejected = state.pending.decision === 'rejected';
+        const decidedFields = { graphId, runId, nodeId: current,
+          ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt ?? null };
+        if (rejected) {
+          const rejectionReason = `approval rejected${state.pending.decidedBy ? ` by ${state.pending.decidedBy}` : ''}`;
+          output = JSON.stringify({ outcome: selected.exit, choice: selected.key, ...decidedFields, error: rejectionReason });
+          error = rejectionReason;
+          commandReportedOutcome = selected.exit;
+        } else if (ok) {
+          const commandJson = lastJsonObject(output);
+          output = JSON.stringify({ ...(commandJson ?? {}), outcome: selected.exit, choice: selected.key, ...decidedFields,
+            ...(typeof commandReportedOutcome === 'string' ? { commandOutcome: commandReportedOutcome } : {}) });
+          commandReportedOutcome = selected.exit;
+        } else {
+          // The chosen command failed: keep its failure output and route as a command failure, not as the choice.
+          debug.log('graph.approval', 'choice-command-failed', { graphId, runId, nodeId: current, choice: selected.key }, { level: 'warn' });
+        }
       }
       const joinFailureMessage = branchDiagnostics.length
         ? `join failed: ${JSON.stringify({ failedBranches: branchDiagnostics })}` : undefined;
@@ -3908,7 +4017,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const hasOutput = waiving || harnessLoopRoute || units.has(current) || handlerExecuted || !!joinedFanout ||
         ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command));
       const storedOutput = hasOutput ? output : undefined;
-      const rawReceiptCommit = current === 'version-release' ? lastJsonObject(output)?.commit : completionCommit(state) ?? options.branchCutTip;
+      const rawReceiptCommit = RELEASE_RECEIPT_COMMIT_NODE_IDS.includes(current)
+        ? lastJsonObject(output)?.commit : completionCommit(state) ?? options.branchCutTip;
       const receiptCommit = typeof rawReceiptCommit === 'string' && /^[a-f0-9]{40}$/i.test(rawReceiptCommit) ? rawReceiptCommit : undefined;
       const artifactSnapshot = completionArtifactSnapshot(storedOutput ?? null, options.deps?.root ?? process.cwd());
       const completionReceipt = ok && receiptCommit !== undefined && artifactSnapshot.valid
@@ -4233,7 +4343,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
             ...(baseEventBus === undefined ? {} : { eventBus: baseEventBus }),
             dryRun: state.dryRun, quiet: true, signal: options.signal, pinChildUniverse: options.pinChildUniverse,
             releaseCommandSource: options.releaseCommandSource,
-            branchCutTip: lastJsonObject(state.nodes.find((record) => record.nodeId === 'version-release')?.output)?.commit as string | undefined,
+            branchCutTip: lastJsonObject(findReleaseCutNode(state.nodes)?.output)?.commit as string | undefined,
             branchGraphSnapshot: state.graphSnapshot,
             branchParentOutputs: Object.fromEntries(state.nodes.map((record) => [record.nodeId, lastJsonObject(record.output) ?? record.output ?? null])),
             ...(signedT6PostGate ? { branchWaiverParentRunId: state.runId } : {}),
@@ -4664,7 +4774,7 @@ export function forkGraphRun(graphId: string, runId: string, forkRunId: string, 
   const input = source.input && typeof source.input === 'object' && !Array.isArray(source.input)
     ? source.input as Record<string, unknown> : undefined;
   const releaseCommit = graphId === 'release-loop'
-    ? lastJsonObject(source.nodes.find((node) => node.nodeId === 'version-release')?.output)?.commit : undefined;
+    ? lastJsonObject(findReleaseCutNode(source.nodes)?.output)?.commit : undefined;
   const sourceCommit = input?.commit ?? input?.cutCommit ?? releaseCommit;
   if (typeof sourceCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(sourceCommit)) throw new Error('fork source run has no full source commit');
   if (!options.isAncestor(sourceCommit, targetCommit)) throw new Error(`fork commit is outside source lineage: ${sourceCommit} -> ${targetCommit}`);
@@ -4672,7 +4782,7 @@ export function forkGraphRun(graphId: string, runId: string, forkRunId: string, 
   if (existsSync(forkPath)) throw new Error(`fork run already exists: ${graphId}/${forkRunId}`);
   const forkInput = { ...input, ...(input?.cutCommit === undefined ? { commit: targetCommit } : { cutCommit: targetCommit }), forkedFrom: runId };
   const forkNodes = source.nodes.map((node) => {
-    if (graphId !== 'release-loop' || node.nodeId !== 'version-release') return { ...node };
+    if (graphId !== 'release-loop' || !RELEASE_RECEIPT_COMMIT_NODE_IDS.includes(node.nodeId)) return { ...node };
     const output = lastJsonObject(node.output);
     return output ? { ...node, output: { ...output, commit: targetCommit } } : { ...node };
   });

@@ -120,10 +120,10 @@ function wrapText(text: string, columns: number, styled: boolean, resetOnWrap = 
       return;
     }
     const cells = Bun.stringWidth(word);
-    const firstGrapheme = segmenter.segment(word)[Symbol.iterator]().next().value?.segment ?? word;
-    const firstCells = Bun.stringWidth(firstGrapheme);
     if (used + cells > width && used > lineIndentWidth) {
-      nextLine(cells <= width ? cells : firstCells);
+      // TUI-IDLE-CPU-SPIN: the first grapheme matters only for an over-wide word — no segment iterator per word.
+      nextLine(cells <= width ? cells
+        : Bun.stringWidth(segmenter.segment(word)[Symbol.iterator]().next().value?.segment ?? word));
       if (whitespace) {
         emitSkippedStyles(start, start + word.length);
         return;

@@ -2,7 +2,7 @@ import { afterAll, afterEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { parse as parseYaml } from 'yaml';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
@@ -16,6 +16,7 @@ import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { partialPlanPath } from './gate-partial.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
 import { runGraph, verifyReleaseCommandRoot } from '../../src/graph-runner/runner.js';
+import { main as versionNodeMain } from './version-node.js';
 import { createGateRunner, gateReceiptReuseKey, judgeGate, runGateNode, type GateRunner } from './gate-node.js';
 import { gateEnvFingerprint, gateSourcePins } from './gate-baseline-receipt.js';
 import { inspectGateShardReceipts, markGateShardUnmeasured, saveGateShardResult } from './gate-shard-receipts.js';
@@ -381,9 +382,9 @@ test('host-down from runGateNode is preserved through resume and switches the sa
     state.input.gateImagePin = 'cut-commit';
     state.input.previousVersion = '0.2.18';
     // Source: release-loop.yaml routes pre-gate-join through cloud approval/join and pod reuse before gate.
-    state.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
+    state.path = ['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
     state.nodes = state.path.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true,
-      output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
+      output: nodeId === 'cut-branch' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
         : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: nodeId === 'pod-reuse-prep' ? 'skip' : 'ok' }) }));
     const gateRecord = state.nodes.at(-1)!;
     gateRecord.ok = false;
@@ -471,9 +472,9 @@ test('interference partial-resume rechecks only affected files at the same cut',
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
   // Source: release-loop.yaml routes pre-gate-join through cloud approval/join and pod reuse before gate.
-  runState.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
+  runState.path = ['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
-    output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
+    output: nodeId === 'cut-branch' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'cutoff' ? JSON.stringify({ baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: SHA } })
         : nodeId === 'gate' ? JSON.stringify(gateOutput)
         : JSON.stringify({ outcome: nodeId === 'pod-reuse-prep' ? 'skip' : 'ok' }) }));
@@ -545,9 +546,9 @@ test('load-flaky autoheal without explicit interference evidence falls back inst
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
   // Source: the current graph adds readiness-countdown before traffic-cut-start.
-  runState.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+  runState.path = ['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
-    output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
+    output: nodeId === 'cut-branch' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
   runState.executed = runState.nodes.length;
   writeFileSync(saved.statePath, JSON.stringify(runState));
@@ -1598,7 +1599,7 @@ test('a moved command checkout stops a resumed Bash node before its runner is ca
   const runBash = async (body: string) => {
     commands++;
     // Source: the current graph runs readiness-countdown and traffic-cut-start before the test's failing cutoff node.
-    if (body.includes('version-node.ts release') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
+    if (body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
       return { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) };
     return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' };
   };
@@ -1636,7 +1637,7 @@ test('a clean cut checkout with different recipes is rejected before resumed Bas
   let calls = 0;
   const runBash = async (body: string) => {
     calls++;
-    return body.includes('version-node.ts release')
+    return body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild')
       ? { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) }
       : { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' };
   };
@@ -1750,7 +1751,7 @@ test('the resumed Bash process reads from the verified command checkout', async 
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   try {
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true }, deps: { root,
-      runBash: async (body) => body.includes('version-node.ts release') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start')
+      runBash: async (body) => body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start')
         ? { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) }
         : { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' } } });
     expect(first.status).toBe('failed');
@@ -2069,7 +2070,7 @@ test('RELEASE-RECOVER-ONE-CMD: one recover appends the repair with the real cutR
       const commandHead = options?.cwd ? seatGit(options.cwd, 'rev-parse', 'HEAD') : undefined;
       graphCalls.push({ ...context, ...(commandHead ? { commandHead } : {}) });
     }
-    if (context.nodeId === 'version-release') return { exitCode: 0,
+    if (context.nodeId === 'version-release' || context.nodeId === 'cut-branch') return { exitCode: 0,
       stdout: `${JSON.stringify({ outcome: 'ok', version: RECOVER_VERSION, commit: seat.cut, branch: `release/${RECOVER_VERSION}` })}\n`, stderr: '' };
     if (context.nodeId === 'gate' && failInitialGate)
       return { exitCode: 1, stdout: '{"outcome":"fail","introduced":["tests/changed.test.ts > prior failure"]}\n', stderr: '' };
@@ -2122,7 +2123,7 @@ test('RELEASE-RECOVER-ONE-CMD: one recover appends the repair with the real cutR
     expect(parentDispatches.every((call) => call.runId === 'r')).toBe(true);
     expect(parentDispatches.every((call) => call.commandHead === tip)).toBe(true);
     // The saved run names the repaired commit and keeps the previous one as refreshedFrom.
-    expect(JSON.parse(run.nodes.find((node) => node.nodeId === 'version-release')!.output.trim().split('\n').at(-1)!))
+    expect(JSON.parse(run.nodes.find((node) => node.nodeId === 'cut-branch')!.output.trim().split('\n').at(-1)!))
       .toMatchObject({ commit: tip, refreshedFrom: seat.cut });
     // The attempt ledger keeps its format (attempts of timestamps) and gains the per-stage results.
     const ledger = JSON.parse(readFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), 'utf8')) as
@@ -2570,4 +2571,259 @@ test('E11 c159bb8d ledger replay carries completed same-run shards before train 
     }
     expect(sameIdentitySelection).toEqual([files[17]]);
   } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120_000);
+
+// ── RELEASE-RESUME-SAME-RUN: `--cut-commit` 고정 런을 수리 커밋을 얹은 새 컷으로 «같은 runId» 에서 재개 ──
+// 실제 git 저장소·실제 resumeReleaseRun(그래프 러너). 기대값은 이 시험의 독립 리터럴(노드 순서·상태·입력 칸).
+async function pinnedFailedRun(label: string): Promise<{ root: string; checkout: string; git: (args: string[]) => string; cut: string; runId: string;
+  nodeCalls: string[]; runBash: NonNullable<NonNullable<Parameters<typeof runGraph>[1]>['deps']>['runBash']; statePath: string }> {
+  const root = mkdtempSync(join(tmpdir(), `release-repin-${label}-`));
+  const checkout = join(root, 'cut-checkout');
+  mkdirSync(join(checkout, 'node_modules'), { recursive: true });
+  mkdirSync(join(checkout, 'apps', 'pwa', 'node_modules'), { recursive: true });
+  const graphPath = installCutCommitResumeSimulation(checkout);
+  seatGit(checkout, 'init', '-q');
+  seatGit(checkout, 'config', 'user.name', 'Release repin simulation');
+  seatGit(checkout, 'config', 'user.email', 'release-repin-simulation@example.invalid');
+  seatGit(checkout, 'add', 'graphs');
+  seatGit(checkout, 'commit', '-q', '-m', 'cut simulation graph');
+  const cut = seatGit(checkout, 'rev-parse', 'HEAD');
+  const remote = join(root, 'origin.git');
+  mkdirSync(remote, { recursive: true });
+  seatGit(remote, 'init', '--bare', '-q');
+  seatGit(checkout, 'remote', 'add', 'origin', remote);
+  setElanousConfigDir(root);
+  configureTraffic(root);
+  let tuiFails = true;
+  const nodeCalls: string[] = [];
+  const runBash: NonNullable<NonNullable<Parameters<typeof runGraph>[1]>['deps']>['runBash'] = async (_body, runOptions) => {
+    const contextPath = runOptions.env?.ELANOUS_GRAPH_CONTEXT;
+    const context = contextPath ? JSON.parse(readFileSync(contextPath, 'utf8')) as { nodeId?: string } : {};
+    const nodeId = String(context.nodeId ?? 'unknown');
+    nodeCalls.push(nodeId);
+    if (nodeId === 'tui' && tuiFails) { tuiFails = false; return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail' }), stderr: '' }; }
+    return { exitCode: 0, stdout: JSON.stringify(nodeId === 'version-release' ? { outcome: 'ok', version: VERSION, commit: cut } : { outcome: 'ok', nodeId }), stderr: '' };
+  };
+  const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: false, cutCommit: cut }, deps: { root, runBash } });
+  expect(first.status).toBe('failed');
+  expect(nodeCalls).toEqual(['version-release', 'cutoff', 'gate', 'tui']);
+  nodeCalls.length = 0;
+  const git = (args: string[]) => {
+    const result = spawnSync('git', args, { cwd: checkout, encoding: 'utf8' });
+    if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed: ${result.stderr || result.error}`);
+    return result.stdout.trim();
+  };
+  return { root, checkout, git, cut, runId: first.runId, nodeCalls, runBash, statePath: first.statePath! };
+}
+
+function appendRepairCommit(checkout: string, path: string): string {
+  mkdirSync(join(checkout, dirname(path)), { recursive: true });
+  writeFileSync(join(checkout, path), `repair ${path}\n`);
+  seatGit(checkout, 'add', path);
+  seatGit(checkout, 'commit', '-q', '-m', `repair ${path}`);
+  return seatGit(checkout, 'rev-parse', 'HEAD');
+}
+
+test('RELEASE-RESUME-SAME-RUN: a code repair appended to a --cut-commit run resumes the SAME runId from the first cut consumer, keeping earlier results', async () => {
+  const run = await pinnedFailedRun('code');
+  try {
+    const repaired = appendRepairCommit(run.checkout, 'src/repair.ts');
+    expect(repaired).not.toBe(run.cut);
+    const resumed = await resumeReleaseRun({ runId: run.runId, from: 'gate', repinCutCommit: repaired, commandRoot: run.checkout },
+      { root: run.root, git: run.git, repo: run.checkout, runBash: run.runBash });
+    expect(resumed.state.runId).toBe(run.runId);
+    expect(resumed.state.status).toBe('done');
+    // version-release 와 cutoff 는 다시 돌지 않는다(앞 성공 노드 승계) — 컷을 쓴 gate 부터 새 컷으로.
+    expect(run.nodeCalls).toEqual(['gate', 'tui', 'known-issues']);
+    expect(resumed.tip).toEqual({ version: VERSION, branch: 'cut-commit', from: run.cut, to: repaired, changed: true,
+      statePath: run.statePath, backup: expect.stringContaining('.before-tip-') });
+    // 바뀐 컷은 기록된다: 런 입력(새 sha · 옛 sha)과 version-release 출력(refreshedFrom), 그리고 되돌릴 백업 파일.
+    const saved = JSON.parse(readFileSync(run.statePath, 'utf8')) as { input: Record<string, unknown>; nodes: Array<{ nodeId: string; output?: string }> };
+    expect(saved.input).toMatchObject({ cutCommit: repaired, cutCommitRepinnedFrom: run.cut, branchCut: false });
+    const cutOutput = saved.nodes.find((node) => node.nodeId === 'version-release')!.output!.trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>).at(-1)!;
+    expect(cutOutput).toMatchObject({ commit: repaired, refreshedFrom: run.cut });
+    expect(existsSync(resumed.tip.backup!)).toBe(true);
+  } finally { resetElanousConfigDir(); rmSync(run.root, { recursive: true, force: true }); }
+}, 120_000);
+
+test('RELEASE-RESUME-SAME-RUN: a code repair may not skip the cut consumers — refused before any change to the saved run', async () => {
+  const run = await pinnedFailedRun('skip');
+  try {
+    const before = readFileSync(run.statePath, 'utf8');
+    const codeFix = appendRepairCommit(run.checkout, 'src/repair.ts');
+    await expect(resumeReleaseRun({ runId: run.runId, from: 'tui', repinCutCommit: codeFix, commandRoot: run.checkout },
+      { root: run.root, git: run.git, repo: run.checkout, runBash: run.runBash })).rejects.toThrow('pinned cut of');
+    await expect(resumeReleaseRun({ runId: run.runId, from: 'tui', repinCutCommit: codeFix, commandRoot: run.checkout },
+      { root: run.root, git: run.git, repo: run.checkout, runBash: run.runBash })).rejects.toThrow('resume at gate or earlier');
+    expect(readFileSync(run.statePath, 'utf8')).toBe(before); // 거부는 저장된 런을 건드리지 않는다
+    expect(run.nodeCalls).toEqual([]);
+  } finally { resetElanousConfigDir(); rmSync(run.root, { recursive: true, force: true }); }
+}, 120_000);
+
+test('RELEASE-RESUME-SAME-RUN: a tooling-only repair resumes at the failed node itself on the same runId', async () => {
+  const run = await pinnedFailedRun('tooling');
+  try {
+    const toolingFix = appendRepairCommit(run.checkout, 'docs/release-note-fix.md');
+    const resumed = await resumeReleaseRun({ runId: run.runId, from: 'tui', repinCutCommit: toolingFix, commandRoot: run.checkout },
+      { root: run.root, git: run.git, repo: run.checkout, runBash: run.runBash });
+    expect(resumed.state.runId).toBe(run.runId);
+    expect(run.nodeCalls).toEqual(['tui', 'known-issues']);
+    expect(resumed.tip).toMatchObject({ from: run.cut, to: toolingFix, changed: true, branch: 'cut-commit' });
+  } finally { resetElanousConfigDir(); rmSync(run.root, { recursive: true, force: true }); }
+}, 120_000);
+
+test('RELEASE-RESUME-SAME-RUN: refused re-pins — not a descendant, absent commit, malformed sha, and a branch-cut run — leave the saved run byte-identical', async () => {
+  const run = await pinnedFailedRun('refuse');
+  try {
+    const before = readFileSync(run.statePath, 'utf8');
+    const deps = { root: run.root, git: run.git, repo: run.checkout, runBash: run.runBash };
+    const base = { runId: run.runId, from: 'gate', commandRoot: run.checkout };
+    // 기록된 컷의 자손이 아닌 커밋(부모 없는 별도 가지)
+    seatGit(run.checkout, 'checkout', '-q', '--orphan', 'unrelated');
+    writeFileSync(join(run.checkout, 'unrelated.txt'), 'x\n');
+    seatGit(run.checkout, 'add', 'unrelated.txt');
+    seatGit(run.checkout, 'commit', '-q', '-m', 'unrelated root');
+    const unrelated = seatGit(run.checkout, 'rev-parse', 'HEAD');
+    await expect(resumeReleaseRun({ ...base, repinCutCommit: unrelated }, deps)).rejects.toThrow('does not descend from the recorded release commit');
+    await expect(resumeReleaseRun({ ...base, repinCutCommit: 'a'.repeat(40) }, deps)).rejects.toThrow('git rev-parse failed');
+    for (const bad of ['abc1234', 'not-a-sha', `${run.cut.slice(0, 39)}`]) {
+      await expect(resumeReleaseRun({ ...base, repinCutCommit: bad }, deps)).rejects.toThrow('must be a full 40-hex commit');
+    }
+    expect(readFileSync(run.statePath, 'utf8')).toBe(before);
+    expect(run.nodeCalls).toEqual([]);
+  } finally { resetElanousConfigDir(); rmSync(run.root, { recursive: true, force: true }); }
+}, 120_000);
+
+test('RELEASE-RESUME-SAME-RUN: --repin-cut-commit on a branch-cut (release/<v>) run is refused with the cut-branch --append remedy', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-repin-branchcut-'));
+  setElanousConfigDir(root);
+  const saved = writeFailedRun(root);
+  try {
+    const commandRoot = createPreflightCommandRoot(root);
+    await expect(planResumeReleaseRun({ runId: 'r', from: 'tui', commandRoot, repinCutCommit: 'b'.repeat(40) }, { root, git: gitStub }))
+      .rejects.toThrow('is for --cut-commit pinned runs');
+    expect(readFileSync(saved.statePath, 'utf8')).toBe(saved.original);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-RESUME-AFTER-CUT-PUSHED: --from cut-branch refuses a re-cut and --from gate-image-prebuild resumes the saved run', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-prebuild-'));
+  setElanousConfigDir(root);
+  const commandRoot = createPreflightCommandRoot(root);
+  try {
+    // New-format failed run: the cut landed (cut-branch ok, branch pushed) and the pod prebuild failed.
+    const saved = writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', error: 'cut gate image prebuild failed: pool-a image build timed out' }));
+    const state = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { input: Record<string, unknown>; path: string[]; nodes: Array<Record<string, unknown>>; executed: number };
+    state.input.gatePodPool = 'pool-a';
+    state.input.gateImagePin = 'cut-commit';
+    state.input.previousVersion = '0.2.18';
+    state.path = ['cut-branch', 'gate-image-prebuild', 'failed'];
+    state.nodes = [
+      { nodeId: 'cut-branch', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) },
+      { nodeId: 'gate-image-prebuild', ok: false, exit: 1, executed: true, output: JSON.stringify({ outcome: 'error', error: 'cut gate image prebuild failed: pool-a image build timed out' }) },
+      { nodeId: 'failed', ok: true, exit: null, executed: false },
+    ];
+    state.executed = 2;
+    writeFileSync(saved.statePath, JSON.stringify(state));
+    mkdirSync(join(root, 'release', VERSION), { recursive: true });
+    // Re-cutting the already-pushed branch stays refused under the new node id.
+    await expect(resumeReleaseRun({ runId: 'r', from: 'cut-branch', commandRoot }, { root, git: gitStub, isAncestor: () => true }))
+      .rejects.toThrow('would cut again');
+    // The prebuild failure resumes at its own node and reaches the graph without re-cutting.
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate-image-prebuild', commandRoot }, {
+      root, git: gitStub, isAncestor: () => true,
+      graph: async () => ({ status: 'done', runId: 'r' }) as never,
+    });
+    expect(resumed.state.status).toBe('done');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-RESUME-AFTER-CUT-PUSHED: real production commands and a real resume prove prebuild fail→ok with the cut kept to one', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-prebuild-live-'));
+  setElanousConfigDir(root);
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout);
+  seatGit(checkout, 'init', '-q');
+  // package.json at the fork point already carries the release version: the real cut is an empty
+  // owner commit ("Cut from main <sha>."), so no lockfile install runs inside the test.
+  writeFileSync(join(checkout, 'package.json'), `${JSON.stringify({ name: 'release-prebuild-live', version: VERSION }, null, 2)}\n`);
+  writeFileSync(join(checkout, 'file'), 'cut\n');
+  installReleaseRecipes(checkout);
+  // The resume preflight requires the installed-package layout at the command root.
+  mkdirSync(join(checkout, 'node_modules'));
+  mkdirSync(join(checkout, 'apps', 'pwa', 'node_modules'), { recursive: true });
+  seatGit(checkout, 'add', '.');
+  seatGit(checkout, 'commit', '-q', '-m', 'main');
+  const mainTip = seatGit(checkout, 'rev-parse', 'HEAD');
+  const origin = join(root, 'origin.git');
+  seatGit(root, 'init', '-q', '--bare', origin);
+  seatGit(checkout, 'remote', 'add', 'origin', origin);
+  seatGit(checkout, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+  writeFileSync(join(root, 'traffic.jsonl'), '');
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  let cutCommands = 0;
+  let prebuildBuilt = false;
+  // Only the pod image build (the prebuild child process — the external build boundary) and the
+  // downstream node plumbing are fakes. The cut and the prebuild production commands
+  // (version-node.ts main) run for real against this repo, so the stored node records hold the
+  // real command outputs, and resumeReleaseRun re-drives the real graph through them.
+  const runProduction = (args: string[], deps: Parameters<typeof versionNodeMain>[2], contextLocation: string | undefined) => {
+    const previousContext = process.env.ELANOUS_GRAPH_CONTEXT;
+    if (contextLocation !== undefined) process.env.ELANOUS_GRAPH_CONTEXT = contextLocation;
+    try { return versionNodeMain(args, checkout, deps); }
+    finally {
+      if (previousContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = previousContext;
+    }
+  };
+  const runBash = async (body: string, opts?: { env?: Record<string, string | undefined> }) => {
+    const contextLocation = opts?.env?.ELANOUS_GRAPH_CONTEXT;
+    if (body.includes('version-node.ts release')) {
+      cutCommands++;
+      const output = runProduction(['release', '--no-prebuild', '--json'], {}, contextLocation);
+      return { exitCode: output.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(output)}\n`, stderr: '' };
+    }
+    if (body.includes('version-node.ts gate-image-prebuild')) {
+      const output = runProduction(['gate-image-prebuild', '--json'], {
+        prebuildGateImage: (input) => prebuildBuilt
+          ? { outcome: 'built', runId: input.runId, cutCommit: input.commit, digest: `sha256:${'d'.repeat(64)}`, eligiblePools: ['pool-a'] }
+          : { outcome: 'failed', reason: 'pool-a image build timed out' },
+      }, contextLocation);
+      return { exitCode: output.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(output)}\n`, stderr: '' };
+    }
+    // Downstream scenario plumbing: readiness/traffic run as pass-through so the resume proceeds
+    // past the prebuild; the failing cutoff ends the run. Only the prebuild claim is under test.
+    if (body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
+      return { exitCode: 0, stderr: '', stdout: `${JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}` })}\n` };
+    return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
+  };
+  try {
+    const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, branchCutBaseCommit: mainTip,
+      gateExecutor: 'pod', gateImagePin: 'cut-commit', gatePodPool: 'pool-a' }, deps: { root, runBash } });
+    expect(first.status).toBe('failed');
+    expect(first.path).toEqual(['cut-branch', 'gate-image-prebuild', 'failed']);
+    expect(cutCommands).toBe(1);
+    const firstCut = JSON.parse(String(first.nodes.find((node) => node.nodeId === 'cut-branch')?.output));
+    expect(firstCut).toMatchObject({ outcome: 'ok', kind: 'release', version: VERSION, branch: `release/${VERSION}` });
+    // The cut record is real: the branch exists on the real origin at exactly that commit.
+    const advertised = seatGit(checkout, 'ls-remote', '--heads', 'origin', `refs/heads/release/${VERSION}`).split(/\s+/)[0] ?? '';
+    expect(advertised.toLowerCase()).toBe(String(firstCut.commit).toLowerCase());
+    const firstPrebuild = JSON.parse(String(first.nodes.find((node) => node.nodeId === 'gate-image-prebuild')?.output));
+    expect(firstPrebuild).toMatchObject({ outcome: 'error' });
+    expect(String(firstPrebuild.error)).toContain('cut gate image prebuild failed: pool-a image build timed out');
+    // The external build is repaired between attempts (the only fake boundary flips to built) and
+    // the command root moves to the cut tip, as the real resume preflight requires.
+    prebuildBuilt = true;
+    seatGit(checkout, 'fetch', '-q', 'origin');
+    seatGit(checkout, 'checkout', '-q', `release/${VERSION}`);
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'gate-image-prebuild', commandRoot: checkout },
+      { root, runBash, repo: checkout, trafficFile: join(root, 'traffic.jsonl') });
+    // The stored records prove the claim: the cut never re-ran, the prebuild failed then passed.
+    expect(cutCommands).toBe(1);
+    const resumedCut = JSON.parse(String(resumed.state.nodes.find((node) => node.nodeId === 'cut-branch')?.output));
+    expect(resumedCut.commit).toBe(firstCut.commit);
+    const resumedPrebuild = JSON.parse(String(resumed.state.nodes.find((node) => node.nodeId === 'gate-image-prebuild')?.output));
+    expect(resumedPrebuild).toMatchObject({ outcome: 'ok', commit: firstCut.commit, gateImagePrebuild: { outcome: 'built' } });
+    expect(resumed.state.path.slice(0, 3)).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown']);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 }, 120_000);

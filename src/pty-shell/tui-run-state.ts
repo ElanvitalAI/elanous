@@ -868,7 +868,7 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
     if (herdr) { try { herdr.release(); } catch { /* 종료 경로를 깨지 않는다 */ } }
     if (recorder.herdrSocket) {
       if (blockedHook) { try { clearApprovalHerdrBlockedHook(blockedHook); } catch { /* 종료 경로를 깨지 않는다 */ } }
-      try { recorder.herdrSocket.release(); } catch { /* 종료 경로를 깨지 않는다 */ }
+      try { recorder.herdrSocket.releaseNow(); } catch { /* 종료 경로를 깨지 않는다 */ }
     }
     // 좌석 대조 판정 신호 — 두 표면의 원장 행을 «여기서» 읽어 한 줄로 남긴다.
     if (seatCompare) {

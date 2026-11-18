@@ -81,6 +81,7 @@ import {
 import type { AskUserQuestionResult } from '../ask-user-question/types.js';
 import type { FeedbackEnvelope } from '../feedback/envelope.js';
 import type {
+  AcpAudience,
   AcpConnectionHandler,
   AcpTransportConnection,
   AcpTransportServer,
@@ -792,6 +793,8 @@ export interface AcpTurnContext {
    *  daemon boundaries without coupling `AcpTurnContext` to any one
    *  surface's payload vocabulary. */
   promptMeta?: Readonly<Record<string, unknown>>;
+  /** Caller class of the connection this turn arrived on (decided at the upgrade · absent = 'unknown'). */
+  audience?: AcpAudience;
   /** Resolve-check; stop early if the parent cancelled the turn. */
   isAborted: () => boolean;
   /** Push a text chunk back to the client. The server wraps this in
@@ -1049,6 +1052,9 @@ interface SessionPeer {
    *  socket 이 같은 process — agent_message_chunk 가 N번 yield 되는
    *  echo 차단). Mutated by the prompt handler. */
   peerId: string | null;
+  /** H-1 — this connection's own caller class (decided at its upgrade). Operator-only envelopes
+   *  (`debug.line`) are delivered per peer on this, never on the requester's class. */
+  audience: AcpAudience;
 }
 
 function isFeedbackTextUpdate(update: unknown): boolean {
@@ -1089,6 +1095,7 @@ async function acquireWebtermAgentTurn(sessionId: string): Promise<() => void> {
 function wireAcpConnection(
   stream: ReturnType<typeof ndJsonStream>,
   ctx: AcpServerContext,
+  audience: AcpAudience = 'unknown',
 ): AgentSideConnection {
   const { sessions, sessionPeers, awarePeers, plainEnvelopeLogged, dualRole, approvalPolicy, opts } = ctx;
   // 2026-05-13 (M2 of AskUserQuestion cross-surface) — bound connection
@@ -1126,6 +1133,7 @@ function wireAcpConnection(
       return boundConnection.extNotification(method, params);
     },
     peerId: null,
+    audience,
   };
   const ownedSessionIds = new Set<string>();
   const advertisedSessionModels = new Map<string, SessionModelState>();
@@ -2026,6 +2034,7 @@ function wireAcpConnection(
         userText,
         promptBlocks,
         promptMeta: (req as PromptRequest & { _meta?: Record<string, unknown> })._meta,
+        audience,
         isAborted: () => s.aborted,
         push,
         pushWithMeta,
@@ -3645,18 +3654,22 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
       return { delivered: 0 };
     }
     let delivered = 0;
+    let withheld = 0;
     const tasks: Promise<unknown>[] = [];
     for (const peer of peers) {
       if (!awarePeers.isPeerAware(peer)) {
         logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
         continue;
       }
+      // H-1 — debug lines go only to peers that are themselves operators; member/unknown = nothing.
+      if (env.kind === 'debug.line' && peer.audience !== 'operator') { withheld += 1; continue; }
       delivered += 1;
       tasks.push(peer.sessionUpdate({
         sessionId,
         update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } },
       }));
     }
+    if (withheld > 0) debug.log('feedback.debug-gate', 'peer-withheld', { sessionId, withheld });
     await Promise.allSettled(tasks);
     return { delivered };
   };
@@ -3751,7 +3764,7 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
     const liveConnections = new Set<AgentSideConnection>();
     const onConnection: AcpConnectionHandler = async (connection) => {
       const stream = streamFromTransportConnection(connection);
-      const agentConn = wireAcpConnection(stream, ctx);
+      const agentConn = wireAcpConnection(stream, ctx, connection.audience);
       liveConnections.add(agentConn);
       try {
         await agentConn.closed;

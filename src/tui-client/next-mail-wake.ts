@@ -3,6 +3,7 @@ import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { emitTurnLife } from '../debug/turn-life.js';
 import { detectSeatTui } from '../dashboard/seat-boot-preamble.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../dashboard/input/internal-turn.js';
 import { defaultMsgStorePath, MsgStore, readUnreadSource, readUnreadSummary, type UnreadSource } from '../msg/msg-store.js';
@@ -50,6 +51,8 @@ export interface NextMailWakeDeps {
   /** Test seam for the refusal retry timer. */
   scheduleRetry?: (fn: () => void, ms: number) => { cancel: () => void };
   log?: (event: string, data: Record<string, unknown>) => void;
+  /** OBSERVE-TURN-EVENT-LIFECYCLE — turn-life observation hook (fail-open). */
+  turnLifeLog?: (event: string, data: Record<string, unknown>) => void;
 }
 
 export interface NextMailWake {
@@ -161,6 +164,8 @@ export function createNextMailWake(deps: NextMailWakeDeps): NextMailWake {
   ));
   const read = deps.readUnread ?? readUnreadSummary;
   const log = deps.log ?? ((event: string, data: Record<string, unknown>) => debug.log('tui.msg-wake', event, data));
+  // OBSERVE-TURN-EVENT-LIFECYCLE — 우편 깨움 관측 주입(기본: debug 직접 방출).
+  const turnLifeLog = deps.turnLifeLog ?? emitTurnLife;
   let lastOpenedId = 0;
   let pendingId = 0;
   /** Messages whose bodies the pending turn carries (agent-sourced turns only). */
@@ -203,6 +208,8 @@ export function createNextMailWake(deps: NextMailWakeDeps): NextMailWake {
     // The two reads must describe the same batch; a message that landed in between → no agent attribution (system).
     if (source && source.latestId === unread.maxId && source.messages.length > 0) from = mailWakeSource(source, deps.formatDue);
     else source = null;
+    // OBSERVE-TURN-EVENT-LIFECYCLE — 자리 opt-in 우편 깨움 도착(msgId = 이 묶음의 최신 id; busy 는 문이 판정).
+    try { turnLifeLog('turn-life:event-arrived', { source: 'mail-wake', msgId: unread.maxId, arrivedAt: nowMs() }); } catch { /* observability is fail-open */ }
     const result = deps.startTurnIfIdle(
       source ? agentMailTurnText(source) : `[우편 깨움] ${seat} 미읽음 ${unread.count}통 — eln msg list --to ${seat} 로 읽고 처리`,
       { origin: 'msg-wake', reason: `⇢ 우편 ${unread.count}통`, ...(from ? { from } : {}) },

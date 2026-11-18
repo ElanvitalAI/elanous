@@ -5,10 +5,11 @@
 // hook returns — never an exception. LLM consumers read `ok:false`
 // from the dispatch result and self-recover on the next turn.
 //
-// Scope-cut (coding-first lane): 2 active policy kinds (`plugin-
-// capability`, `trust-store`). 2 forward-compat slots (`hitl-delivery`,
-// `mutating-default`) are declared in the union but currently short-
-// circuit to `allow` — vision-ready lane adds the builtins.
+// Scope-cut (coding-first lane): 3 active policy kinds (`plugin-
+// capability`, `trust-store`, `shell-argv`). 2 forward-compat slots
+// (`hitl-delivery`, `mutating-default`) are declared in the union but
+// currently short-circuit to `allow` — vision-ready lane adds the
+// builtins.
 //
 // PLAN: 내부 문서 `PLAN-harness-arc-b-guardian`
 // Track: harness-engineering meta · Phase 4 (coding-first lane)
@@ -31,6 +32,13 @@ export type GuardianSpec =
   /** Wraps `src/plugins/core/trust-store.ts` — checks the plugin
    *  source is trusted. Only meaningful when `ctx.plugin` is set. */
   | { kind: 'trust-store' }
+  /** TC #92362 — wraps `src/security/shell-argv-policy.ts`, the same
+   *  argv-exact classifier the seat approval flow uses. Reads
+   *  `ctx.shellCommand` (raw, untruncated). Vocabulary maps 1:1:
+   *  allow→allow · deny→deny · ask-op→needs-approval (demoted to deny
+   *  while the HITL slot is unmanned). Missing/unparseable command →
+   *  deny (fail-closed). */
+  | { kind: 'shell-argv' }
   /** Forward-compat slot (vision-ready). Currently short-circuits to
    *  `allow` with a debug-log warning; HITL 4-channel race builtin
    *  lands in the vision-ready lane. */
@@ -70,4 +78,10 @@ export interface GuardianContext {
   /** Arbitrary extra fields a policy may inspect (e.g. the file path
    *  being written). Loose shape — each policy reads what it needs. */
   argsSummary?: Record<string, unknown>;
+  /** Raw, UNTRUNCATED shell command string (Bash `args.command`) for
+   *  the shell-argv policy. Deliberately separate from `argsSummary` —
+   *  its 200-char truncation would break classifyShellArgv's command/
+   *  argv consistency re-parse (long commands would mis-deny) and
+   *  skew the audit sha. */
+  shellCommand?: string;
 }

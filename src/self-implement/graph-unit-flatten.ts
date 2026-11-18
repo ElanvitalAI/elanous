@@ -1,6 +1,18 @@
 import type { GraphEdgeSpec, GraphTemplateSpec } from './graph-yaml.js';
 import { readFileSync } from 'node:fs';
 import { shapeGraphUnit } from '../graph-runner/unit-shape.js';
+import { debug } from '../debug/log.js';
+
+/** Nested unit levels allowed below a root graph (author → decompose → child fan_out needs 5). Not configurable. */
+export const GRAPH_UNIT_MAX_DEPTH = 5;
+
+/** Shared depth guard for the runner (validate) and static readers (flatten): an honest failure with an event, never a truncation. */
+export function assertGraphUnitDepth(graphId: string, ancestors: readonly string[], reader: 'runner' | 'static'): void {
+  if (ancestors.length <= GRAPH_UNIT_MAX_DEPTH) return;
+  debug.log('graph.unit', 'depth-exceeded', { graphId, reader, depth: ancestors.length, limit: GRAPH_UNIT_MAX_DEPTH,
+    chain: [...ancestors, graphId] }, { level: 'warn' });
+  throw new Error(`unit nesting exceeds depth ${GRAPH_UNIT_MAX_DEPTH}: ${[...ancestors, graphId].join(' -> ')}`);
+}
 
 export interface StaticGraphUnit {
   readonly path: string;
@@ -19,7 +31,7 @@ export function flattenGraphUnits(
   ancestors: readonly string[] = [],
 ): GraphTemplateSpec {
   if (ancestors.includes(graph.graphId)) throw new Error(`unit cycle: ${[...ancestors, graph.graphId].join(' -> ')}`);
-  if (ancestors.length > 3) throw new Error('unit nesting exceeds depth 3');
+  assertGraphUnitDepth(graph.graphId, ancestors, 'static');
 
   let nodes = [...graph.nodes];
   let edges = [...graph.edges];

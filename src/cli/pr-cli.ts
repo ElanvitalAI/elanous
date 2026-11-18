@@ -629,10 +629,14 @@ export function runPrLandIsolationGate(
   out: { log: (message: string) => void; error: (message: string) => void },
   cwd: string = process.cwd(),
   gate: typeof runIsolationHardcodeGate = runIsolationHardcodeGate,
+  /** PR-LAND-ISOLATION-GATE-WHOLE-TREE — this landing's files: a drift in a file the landing does not touch is not its
+   *  own and must not block it. Unknown or empty = the whole tree (never a silent skip). */
+  changedFiles?: readonly string[],
 ): boolean {
   const top = runGitCommand(cwd, ['rev-parse', '--show-toplevel'], { encoding: 'utf-8' });
   const root = top.status === 0 && String(top.stdout ?? '').trim() ? String(top.stdout).trim() : cwd;
-  return gate({ args: [], cwd: root, log: out.log, error: out.error }) === 0;
+  const args = changedFiles && changedFiles.length > 0 ? ['--changed-files', ...changedFiles] : [];
+  return gate({ args, cwd: root, log: out.log, error: out.error }) === 0;
 }
 
 /** ⭐ 2026-09-24 — 공개 유출 래칫은 «경고만» 낸다(착지를 막지 않는다 · 막는 것은 공개 결정 뒤 · 채널 합의).
@@ -2580,7 +2584,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     return 1;
   }
 
-  const isolation = gateVerdict('isolation-gate', deps.runIsolationGate ?? ((o) => runPrLandIsolationGate(o, cwd)), out);
+  const isolation = gateVerdict('isolation-gate', deps.runIsolationGate ?? ((o) => runPrLandIsolationGate(o, cwd, runIsolationHardcodeGate, changedPaths)), out);
   // ⭐ 관측에 «잰 것»과 «못 잰 것»을 다른 값으로 남긴다 — 둘이 같은 모양이면 그 자는 거짓을 낸다.
   record('isolation-gate', isolation.ok, { measured: isolation.measured });
   if (!isolation.ok) {

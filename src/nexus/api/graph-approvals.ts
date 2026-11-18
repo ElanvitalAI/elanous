@@ -18,6 +18,8 @@ interface GraphApprovalItem {
   since: string;
   path: string[];
   recent: Array<{ nodeId: string; ok: boolean; outcome?: string; summary?: string }>;
+  /** N-way HITL (3+ declared options) — allowlisted key/exit/default only; answer with `{ decision, choice }`. */
+  choices?: Array<{ key: string; exit: string; default?: true }>;
   /** EV10d — present only for a `{"kind":"feed-preview"}` approval whose run folder holds a valid draft. */
   feed?: Omit<FeedDraft, 'folder'>;
 }
@@ -140,6 +142,8 @@ function list(root: string, configDir: string): GraphApprovalItem[] {
             ...(typeof output?.summary === 'string' ? { summary: output.summary } : {}),
           };
         }),
+        ...(pending.choices?.length ? { choices: pending.choices.map(option => ({ key: option.key, exit: option.exit,
+          ...(option.default === true ? { default: true as const } : {}) })) } : {}),
         ...(feed ? { feed } : {}),
       });
     }
@@ -176,15 +180,27 @@ export async function handleGraphApprovals(req: Request, deps: GraphApprovalsDep
   catch { return jsonResponse({ error: 'bad_request' }, 400); }
   const decision = body && typeof body === 'object' && !Array.isArray(body) && 'decision' in body ? body.decision : undefined;
   if (decision !== 'approved' && decision !== 'rejected') return jsonResponse({ error: 'bad_request' }, 400);
+  const rawChoice: unknown = body && typeof body === 'object' && 'choice' in body ? (body as { choice: unknown }).choice : undefined;
+  if (rawChoice !== undefined && (typeof rawChoice !== 'string' || !rawChoice)) {
+    debug.log('approvals.graph', 'refused', { reason: 'bad-choice', graphId, runId, choiceType: typeof rawChoice });
+    return jsonResponse({ error: 'bad_request' }, 400);
+  }
+  const choice = typeof rawChoice === 'string' ? rawChoice : undefined;
   const root = deps.root ?? effectiveInstanceRoot();
   const state = readRun(root, graphId, runId);
   if (!state) return jsonResponse({ error: 'not-found' }, 404);
   if (!undecided(state, root)) return jsonResponse({ error: 'already-decided' }, 409);
   const nodeId = state.pending!.nodeId;
   try {
-    decideGraphApproval(graphId, runId, decision, `pwa:${authReason}`, root);
+    decideGraphApproval(graphId, runId, decision, `pwa:${authReason}`, root, undefined, choice);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return jsonResponse({ error: 'not-found' }, 404);
+    // The runner already logged graph.approval/choice-refused; the run stays undecided.
+    if (error instanceof Error && /^(HITL |unknown HITL choice|a HITL choice)/.test(error.message)) {
+      debug.log('approvals.graph', 'refused', { reason: 'invalid-choice', graphId, runId, nodeId, decision,
+        ...(choice === undefined ? {} : { choice }), by: `pwa:${authReason}` });
+      return jsonResponse({ error: 'invalid-choice', message: error.message }, 409);
+    }
     if (error instanceof Error && error.message.startsWith('run is not awaiting an undecided approval:')) return jsonResponse({ error: 'already-decided' }, 409);
     throw error;
   }

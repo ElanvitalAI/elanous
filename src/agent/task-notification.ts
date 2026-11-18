@@ -52,7 +52,7 @@ export interface PendingTaskNotification {
   /** Parent-selected route; supplemental results never reopen a TUI turn. */
   completionDelivery?: 'follow-up' | 'supplement';
   /** Final state of the task — parent LLM sees this to choose follow-up. */
-  state: 'done' | 'error' | 'aborted';
+  state: 'done' | 'error' | 'aborted' | 'running'; // line-watch 중간 알림용 진행 상태 — JUD #38537 must ⓑ
   /** Child's final text (capped at TASK_NOTIFICATION_OUTPUT_CAP). */
   output: string;
   /** Whether output was truncated (for XML `truncated` attribute). */

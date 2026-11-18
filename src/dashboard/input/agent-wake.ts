@@ -80,6 +80,19 @@ function displayName(n: Pick<PendingTaskNotification, 'label' | 'agentName'>): s
   return ((n.label ?? '').trim() || n.agentName).replace(/\s+/g, ' ').slice(0, 60);
 }
 
+/** JUD #38537 must ⓑ — line-watch 중간 알림(진행) 판정: state 'running' ⊕ taskId `shell-watch:` 접두(완료 `shell:` · state done 와 구분). */
+function isProgressWake(n: Pick<PendingTaskNotification, 'state'> & { taskId?: string }): boolean {
+  return n.state === 'running' || n.taskId?.startsWith('shell-watch:') === true;
+}
+
+/** 진행 중간 줄 요약 — payload 의 line="…" 값을 우선, 없으면 output 전체를 한 줄로 접는다(보강 서식과 같은 180자 캡). */
+function progressExcerpt(n: { output?: string }): string {
+  const flat = (n.output ?? '').replace(/\s+/gu, ' ').trim();
+  const at = /\bline="((?:[^"\\]|\\.)*)"/.exec(flat);
+  const raw = at ? at[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\') : flat;
+  return raw.length > 180 ? `${raw.slice(0, 177)}…` : raw;
+}
+
 /** Late research results remain visible as one compact line without opening a turn. */
 export function formatAgentSupplementNotice(
   n: Pick<PendingTaskNotification, 'label' | 'agentName' | 'state' | 'output'>,
@@ -90,16 +103,28 @@ export function formatAgentSupplementNotice(
   return `↳ 보강: ${displayName(n)}${status}${excerpt ? ` — ${excerpt}` : ' — 결과 없음'}`;
 }
 
-/** 채팅 한 줄 — «✓ 위임 끝: <이름> — 다음 턴에 결과»(실패·중단이면 ✗ ⊕ 상태). */
-export function formatAgentWakeNotice(n: Pick<PendingTaskNotification, 'label' | 'agentName' | 'state'>): string {
+/** 채팅 한 줄 — «✓ 위임 끝: <이름> — 다음 턴에 결과»(실패·중단이면 ✗ ⊕ 상태).
+ *  진행 알림(running · `shell-watch:`)은 «▸ <이름> 진행: <줄 요약>» — «위임 끝»·✓/✗ 글리프 없음 — JUD #38537 must ⓑ. */
+export function formatAgentWakeNotice(
+  n: Pick<PendingTaskNotification, 'label' | 'agentName' | 'state'> & Partial<Pick<PendingTaskNotification, 'taskId' | 'output'>>,
+): string {
+  if (isProgressWake(n)) {
+    return `▸ ${displayName(n)} 진행: ${progressExcerpt(n) || '실행 중'}`;
+  }
   const name = displayName(n);
   const glyph = n.state === 'done' ? '✓' : '✗';
   const state = n.state === 'done' ? '' : ` (${n.state})`;
   return `${glyph} 위임 끝: ${name}${state} — 다음 턴에 결과`;
 }
 
-/** 자리 TUI 에서 여는 내부 턴의 입력 — 결과 본문은 turn-preamble 이 `<task-notification>` 으로 싣는다. */
-export function formatAgentWakePrompt(n: Pick<PendingTaskNotification, 'taskId' | 'label' | 'agentName' | 'state'>): string {
+/** 자리 TUI 에서 여는 내부 턴의 입력 — 결과 본문은 turn-preamble 이 `<task-notification>` 으로 싣는다.
+ *  진행 알림(running · `shell-watch:`)은 «실행 중 명령의 중간 줄»임을 문면으로 밝힌다 — JUD #38537 must ⓑ. */
+export function formatAgentWakePrompt(
+  n: Pick<PendingTaskNotification, 'taskId' | 'label' | 'agentName' | 'state'> & Partial<Pick<PendingTaskNotification, 'output'>>,
+): string {
+  if (isProgressWake(n)) {
+    return `[자연 재개] RunShell 진행 알림: ${progressExcerpt(n)} — 실행 중 명령의 중간 줄이고 명령은 아직 끝나지 않았음 · 완료는 별도 알림(state 'done' · taskId shell:)으로 오니 그때 결과를 마무리`;
+  }
   if (n.label === CLASSIC_SIDETAB_MISSION_LABEL) {
     return `[자동 재개] 사이드탭 미션 완료: ${n.taskId} (${n.state}) — <task-notification> 결과를 원래 요청과 대조해 수용·부분 수용·기각을 판단하고, 필요하면 원래 대화를 계속 진행`;
   }
@@ -158,7 +183,8 @@ export function createAgentWake(deps: AgentWakeDeps): AgentWakeController {
     }
     handled.add(n.taskId);
     // #38031 — 종료 한 줄(notice 계약)은 taskId당 정확히 여기서 한 번 · 싱크가 던져도 무시(fail-soft).
-    if (deps.childFinished) {
+    // JUD #38537 must ⓑ — line-watch 진행 알림(running · shell-watch:)은 종료가 아니다: childFinished 를 부르지 않는다(완료 shell: · done 만).
+    if (!isProgressWake(n) && deps.childFinished) {
       try {
         deps.childFinished({ goal: displayName(n), outcome: n.state });
       } catch (error) {

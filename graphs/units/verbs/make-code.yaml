@@ -1,0 +1,27 @@
+# MAKE-CODE-UNIT-THIN (0.3.29) — make-code@1 은 얇은 감싸기다(RFC-verbs-as-subgraph-units K5 1판).
+# 노드 하나(harness-say)가 네이티브 `harness say` 발사를 부른다 — 재구현 아님. 발사 인자·env·cwd 는
+# 호출자(tasks hand · src/task-agent/task-hand.ts)가 이 런에만 등록하는 처리기(handler:make-code-harness-say)가 쥔다.
+# 처리기가 없는 입구(손 `graph run` 등)는 러너가 «unknown in-process handler» 로 거부한다 — 발사 0(K5 중복 PR 방지).
+# 출구 `launched` = 자식 하니스 런이 받아들여졌다(PR 병합이 아니다). 병합 판정은 카드 runId 의 런 원장(완료 훅) 몫이고,
+# 자식 원장을 기다려 `done` 을 내는 것은 2판이다.
+graph_id: make-code
+version: 1
+entry_node: harness-say
+terminal_nodes: [launched, needs-human, failed]
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [launched, needs-human, failed]
+nodes:
+  - node_id: harness-say
+    kind: agent
+    recipe: 'handler:make-code-harness-say'
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [outcome, result, evidence] }
+  - { node_id: launched, kind: gate, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+edges:
+  - from: harness-say
+    on: outcome
+    map: { launched: launched, needs-human: needs-human, failed: failed }

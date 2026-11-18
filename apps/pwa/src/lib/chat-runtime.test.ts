@@ -1260,6 +1260,18 @@ describe(':budget · :history · :help', () => {
     expect(forked?.text).toContain('forked → new session');
   });
 
+  it("input '/new' opens a new session id and keeps the previous conversation at 0 lines", async () => {
+    const ctx = ctxWith();
+    ctx.messages = [
+      { id: 'u1', role: 'user', text: 'one' },
+      { id: 'a1', role: 'assistant', text: 'two' },
+    ];
+    const opened = await dispatchMeta('/new', ctx);
+    expect(opened?.newSessionId).toBeTruthy();
+    expect(opened?.newSessionId).not.toBe(ctx.sessionId);
+    expect(opened?.text).toBe('');
+    expect(ctx.messages).toHaveLength(2);
+  });
   it('dispatches /help locally and explains unsupported TUI commands without prompting', async () => {
     const ctx = ctxWith();
     expect((await dispatchMeta('/help', ctx))?.text).toContain(':help');
@@ -1975,5 +1987,48 @@ describe('⛔ 실패한 턴도 「끝」을 낸다 — 시작만 남기지 않�
     }
     expect(cap.seen).toHaveLength(1);
     expect(Object.keys(cap.seen[0]!)).not.toContain('error');
+  });
+});
+
+/** H-1 (CONTEXT-OWNER-ISOLATION-AUDIT 2026-11-18) — MOB-1 measured 280KB–1.85MB of other seats' TUI screens
+ *  inside the operator chat's hidden «자세히»: the daemon's all-sessions `terminalFrame` fan-out rode the
+ *  thought channel and was accumulated as thought text. Key check: 0 strings from the other screen. */
+describe('runChatTurnAcp — terminal envelopes and thought size (H-1)', () => {
+  const frame = [
+    '[elanous/term/terminalFrame] tui:41414',
+    JSON.stringify({ terminalId: 'tui:41414', frame: 'OTHER-SEAT-SCREEN-8e8e · Turn running', instance: 'syn', at: 1 }),
+    '<<elanous-term-end tui:41414>>',
+  ].join('\n');
+
+  it('drops terminalFrame envelopes from the transcript and keeps the turn\'s own thought', async () => {
+    const handle = makeProgrammableAcp();
+    handle.programNext('session/prompt', [
+      chunkUpdate('sess-T', { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'OWN-THOUGHT-1a1a' } }),
+      chunkUpdate('sess-T', { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: frame } }),
+    ], { stopReason: 'end_turn' });
+    const { message } = await runChatTurnAcp(handle.acp, 'hi', makeAcpCtx('sess-T'));
+    const wire = JSON.stringify(message);
+    expect(wire).toContain('OWN-THOUGHT-1a1a');
+    expect(wire).not.toContain('OTHER-SEAT-SCREEN-8e8e');
+    expect(wire).not.toContain('elanous/term/');
+  });
+
+  const MARK = '\n[… thought truncated at 65536 chars]';
+  const thoughtOf = async (chunks: string[]): Promise<string | undefined> => {
+    const handle = makeProgrammableAcp();
+    handle.programNext('session/prompt', chunks.map((text) =>
+      chunkUpdate('sess-T', { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } })), { stopReason: 'end_turn' });
+    const { message } = await runChatTurnAcp(handle.acp, 'hi', makeAcpCtx('sess-T'));
+    return ((message.blocks ?? []).find((b) => b.kind === 'agent_thinking') as { msg: string } | undefined)?.msg;
+  };
+
+  it.each([
+    ['65535 then 2 more', ['q'.repeat(65535), 'ab'], 'q'.repeat(65535) + 'a' + MARK],
+    ['exactly 65536', ['q'.repeat(65536)], 'q'.repeat(65536)],
+    ['65537 in one chunk', ['q'.repeat(65537)], 'q'.repeat(65536) + MARK],
+    ['exact fill, then a chunk', ['q'.repeat(65536), 'LATE-CHUNK-7b7b'], 'q'.repeat(65536) + MARK],
+    ['cut, then two more chunks', ['q'.repeat(60000), 'r'.repeat(10000), 'LATE-CHUNK-7b7b', 'LATE-2'], 'q'.repeat(60000) + 'r'.repeat(5536) + MARK],
+  ])('thought cap — %s', async (_name, chunks, expected) => {
+    expect(await thoughtOf(chunks as string[])).toBe(expected as string);
   });
 });

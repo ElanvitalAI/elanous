@@ -226,7 +226,11 @@ export async function fetchApiWithRetry(
           }
         } catch { /* malformed request body is not recoverable */ }
       }
-      if (err instanceof ApiHttpError && err.status === 400) {
+      // ux-sim pins «Codex 400 → one speculative retry» (provider-4xx-no-provider.yaml:
+      // expectedCount 2): a codex 400 must still reach decideRetry's unknown-error
+      // single retry (retry-policy.ts — attempt 0 → retry, attempt ≥1 → abort).
+      // Other providers keep the terminal format-error classification.
+      if (err instanceof ApiHttpError && err.status === 400 && opts.provider !== 'codex') {
         debug.log('llm.retry', 'abort', { provider: opts.provider, status: 400, reason: 'non-retryable-format-error' });
         throw err;
       }

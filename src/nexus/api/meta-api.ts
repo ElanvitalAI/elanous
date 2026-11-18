@@ -29,7 +29,8 @@ import {
 import { debug } from '../../debug/log.js';
 import type { VerifiedAppOwner } from '../apps/app-host.js';
 import { createThinkingBridge } from '../../feedback/agent-bridge.js';
-import { createDebugBridge, type DebugBridge } from '../../feedback/debug-bridge.js';
+import { createDebugBridge, debugEnvelopeAllowed, type DebugBridge } from '../../feedback/debug-bridge.js';
+import { requestDebugAudience } from './debug-audience.js';
 import { createPerfTicker, type PerfTicker } from '../../feedback/perf-ticker.js';
 import type { FeedbackEnvelope, HudSegmentPayload } from '../../feedback/envelope.js';
 import { pushTokenGaugeFromTurn } from './daemon-hud-writer.js';
@@ -153,6 +154,9 @@ export interface MetaApiOpts {
    *  Never derive this result from request body, claimed source, or bearer possession alone.
    *  Without a verifier, prompt tool mutations remain unavailable. */
   resolveVerifiedOwner?: (req: Request, appSlug?: string) => ({ id: string } & Partial<VerifiedAppOwner> & { appSlug?: string }) | undefined;
+  /** WEBCHAT-OWNER-APPSLUG-WIRING: the verified member's own app slot, read from the server member store by the member
+   *  id a verifier already produced — never from the request, a cookie string or a model argument. */
+  memberAppSlot?: (memberId: string) => string | undefined;
   /** Bound Nexus publisher; only dispatched after resolveVerifiedOwner succeeds. */
   appDeployPublishHook?: import('../../agent/app-deploy-plugin.js').AppDeployPublishHook;
   /** Request-bound generated app publisher; absent outside the approved test universe. */
@@ -811,6 +815,22 @@ export function promptVerifiedOwner(req: Request, opts: MetaApiOpts): { id: stri
   return typeof owner?.id === 'string' && owner.id.trim() ? { id: owner.id.trim() } : undefined;
 }
 
+/**
+ * The owner a prompt turn hands its tools: the verified id, plus that member's app slot when the server member store
+ * has one (app_build fills its slot from it — app-build-autofill.ts). No owner → nothing; no slot → the id alone, so
+ * app_build still answers «needs_connection». A failing store read is logged and treated as «no slot».
+ */
+export function ownerWithAppSlot(owner: { id: string } | undefined, opts: Pick<MetaApiOpts, 'memberAppSlot'>): { id: string; appSlug?: string } | undefined {
+  if (!owner) return undefined;
+  let slot: string | undefined;
+  try { slot = opts.memberAppSlot?.(owner.id); }
+  catch (error) {
+    try { debug.log('nexus.prompt', 'member-app-slot-read-failed', { error: error instanceof Error ? error.message : String(error) }); }
+    catch { /* observability is fail-open */ }
+  }
+  return typeof slot === 'string' && slot.trim() ? { id: owner.id, appSlug: slot.trim() } : { id: owner.id };
+}
+
 export function promptVerifiedAppDeploymentOwner(req: Request, opts: MetaApiOpts): (VerifiedAppOwner & { appSlug: string }) | undefined {
   const owner = opts.resolveVerifiedOwner?.(req, 'lecture-scrap');
   if (!owner || owner.appSlug !== 'lecture-scrap' || typeof owner.memberId !== 'string' || !owner.memberId.trim()
@@ -867,10 +887,10 @@ export async function handlePromptPost(
         surface: surfaceResolution.surface,
         surfaceResolutionReason: surfaceResolution.reason,
         ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
-        ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
-        ...((owner) => owner ? { verifiedOwner: { id: owner.memberId }, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
+        ...((owner) => owner ? { verifiedOwner: owner } : {})(ownerWithAppSlot(promptVerifiedOwner(req, opts), opts)),
+        ...((owner) => owner ? { verifiedOwner: ownerWithAppSlot({ id: owner.memberId }, opts)!, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
         ...(opts.resolveDynamicAppOwner
-          ? ((owner) => owner ? { verifiedOwner: { id: owner.memberId }, dynamicAppDeployHook: opts.dynamicAppDeployHook?.(req) } : {})(await opts.resolveDynamicAppOwner(req))
+          ? ((owner) => owner ? { verifiedOwner: ownerWithAppSlot({ id: owner.memberId }, opts)!, dynamicAppDeployHook: opts.dynamicAppDeployHook?.(req) } : {})(await opts.resolveDynamicAppOwner(req))
           : {}),
         ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
         ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
@@ -1131,7 +1151,14 @@ export async function handlePromptStreamPost(
               emit: dualEmitFeedback,
               sessionId: turnSessionId,
             });
-            if (debugTapEnabled) debugBridge.activate();
+            // H-1 — requested is not enough: only an operator credential opens it (member/unknown = OFF).
+            if (debugTapEnabled) {
+              const audience = requestDebugAudience(req, opts);
+              const allowed = debugEnvelopeAllowed(audience, true);
+              debug.log('feedback.debug-gate', allowed ? 'opened' : 'refused', { sessionId: turnSessionId, audience },
+                { level: allowed ? 'info' : 'warn' });
+              if (allowed) debugBridge.activate();
+            }
             // Opportunistic followup §6.2 #6 — `perf.tick` source.
             // Same dual-emit wire as ThinkingBridge / debug-bridge;
             // 1Hz coalesced sample rate for the built-in
@@ -1237,10 +1264,10 @@ export async function handlePromptStreamPost(
                 surface: surfaceResolution.surface,
                 surfaceResolutionReason: surfaceResolution.reason,
                 ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
-                ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
-                ...((owner) => owner ? { verifiedOwner: { id: owner.memberId }, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
+                ...((owner) => owner ? { verifiedOwner: owner } : {})(ownerWithAppSlot(promptVerifiedOwner(req, opts), opts)),
+                ...((owner) => owner ? { verifiedOwner: ownerWithAppSlot({ id: owner.memberId }, opts)!, appDeploymentSession: 'nexus-owner' as const, appDeploymentOwner: owner } : {})(promptVerifiedAppDeploymentOwner(req, opts)),
                 ...(opts.resolveDynamicAppOwner
-                  ? ((owner) => owner ? { verifiedOwner: { id: owner.memberId }, dynamicAppDeployHook: opts.dynamicAppDeployHook?.(req) } : {})(await opts.resolveDynamicAppOwner(req))
+                  ? ((owner) => owner ? { verifiedOwner: ownerWithAppSlot({ id: owner.memberId }, opts)!, dynamicAppDeployHook: opts.dynamicAppDeployHook?.(req) } : {})(await opts.resolveDynamicAppOwner(req))
                   : {}),
                 ...(opts.appDeployPublishHook ? { appDeployPublishHook: opts.appDeployPublishHook } : {}),
                 ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),

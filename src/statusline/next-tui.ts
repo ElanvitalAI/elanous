@@ -192,13 +192,33 @@ export function chooseFooterLine(definition: StatuslineDefinition, snapshot: Sta
 
 /** When the line is still too wide, the turn clause is cut at its end (`…`) so the segments after it keep their room. */
 function cutTurnToFit(line: readonly StatuslineRenderedSegment[], width: number): readonly StatuslineRenderedSegment[] {
-  const total = Bun.stringWidth(line.map((segment) => segment.text).join(STATUSLINE_SEPARATOR));
+  const widthOf = (segments: readonly StatuslineRenderedSegment[]) => Bun.stringWidth(segments.map((segment) => segment.text).join(STATUSLINE_SEPARATOR));
+  const total = widthOf(line);
   const turn = line.find((segment) => segment.id === 'turn_short');
   if (!turn || total <= width) return line;
-  const room = Bun.stringWidth(turn.text) - (total - width) - 1;
+  // 출처: main known-fail 2026-11-18 (entry-compact-chrome-pty test 3 · #36661 origin) — the turn slot carries the
+  // footer's information (a corrective instruction, an approval outcome); the cwd and then the version give up their
+  // room before the clause is cut. Only a clause that cannot fit alone is cut.
+  const survivors = (prefixes: readonly string[]) => line.filter((segment) => !prefixes.some((prefix) => segment.id.startsWith(prefix)));
+  const withoutCwd = survivors(['cwd']);
+  const bare = survivors(['cwd', 'version']);
+  const fitted = widthOf(withoutCwd) <= width ? withoutCwd : bare;
+  const fittedTotal = widthOf(fitted);
+  if (fittedTotal <= width) return fitted;
+  const room = Bun.stringWidth(turn.text) - (fittedTotal - width) - 1;
   // 출처: below this the clause says nothing (glyph, space, one letter); the caller's end cut handles that case.
   const MIN_TURN_CELLS = 3;
   if (room < MIN_TURN_CELLS) return line;
+  // 출처: #38163/#38292 followup — the welcome hint in the turn slot ends with the exit route (`· Ctrl+Q quit`);
+  // a plain end cut at 60 cols drops it. Keep the tail: fit the head into `room - tail - 2` cells and re-attach
+  // `…` + ` ` + the tail. When even the tail cannot fit (extremely narrow terminals) the end cut below stays.
+  const EXIT_TAIL = 'Ctrl+Q quit';
+  const tailCells = Bun.stringWidth(EXIT_TAIL);
+  if (turn.text.endsWith(`· ${EXIT_TAIL}`) && room < Bun.stringWidth(turn.text) && room - tailCells - 2 >= MIN_TURN_CELLS) {
+    const head = fitLogLine(turn.text.slice(0, -Bun.stringWidth(`· ${EXIT_TAIL}`)), room - tailCells - 2);
+    const kept = `${head}… ${EXIT_TAIL}`;
+    return line.map((segment) => segment === turn ? { ...segment, text: kept } : segment);
+  }
   const cut = `${fitLogLine(turn.text, room)}…`;
   return line.map((segment) => segment === turn ? { ...segment, text: cut } : segment);
 }

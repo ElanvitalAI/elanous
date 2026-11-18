@@ -10,6 +10,7 @@
  * running. This path never steers the running turn.
  */
 
+import { emitTurnLife } from '../debug/turn-life.js';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import type { GraphProgressObservation } from '../graph-runner/graph-progress-observation.js';
 import type { GraphRunIdleWake } from '../graph-runner/runner.js';
@@ -47,16 +48,22 @@ function knock(deps: IdleEventWakeDeps, queued: unknown): boolean {
 export function createIdleEventWake(deps: IdleEventWakeDeps): IdleEventWake {
   return {
     onChild(n) {
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 하니스 자식 종결 도착(busy 판정은 문 너머에서).
+      try { emitTurnLife('turn-life:event-arrived', { source: 'harness-child', arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       const queued = deps.enqueueChild({ goal: deps.childLabel(n), outcome: n.state });
       return knock(deps, queued);
     },
     onGraphNode(event) {
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 그래프 노드 종결 도착(큐행, 노크 없음).
+      try { emitTurnLife('turn-life:event-arrived', { source: 'graph-node', arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       const text = deps.graphNodeText(event);
       if (text === null) return false;
       deps.enqueueGraphNode(text);
       return false;
     },
     onGraphRun(wake) {
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 그래프 런 종결/승인 대기 도착(런당 노크 1회).
+      try { emitTurnLife('turn-life:event-arrived', { source: 'graph-node', arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       const text = deps.graphRunText(wake);
       if (text === null) return false;
       return knock(deps, deps.enqueueGraphRun(text));

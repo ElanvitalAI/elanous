@@ -239,7 +239,8 @@ describe('herdr agent report wiring', () => {
       state: (next: string, message?: string) => { states.push(message ? `${next}:${message}` : next); },
       metadata: () => {},
       settled: async () => {},
-      release: () => { released += 1; },
+      release: () => { released += 10; },
+      releaseNow: () => { released += 1; },
     };
     const stop = startTuiRunStateRecorder('tui:herdr-socket', {
       now: () => 1,
@@ -265,6 +266,7 @@ describe('herdr agent report wiring', () => {
       metadata: () => {},
       settled: async () => {},
       release: () => {},
+      releaseNow: () => {},
     };
     const stop = startTuiRunStateRecorder('tui:herdr-socket-hook', {
       now: () => 1,
@@ -287,6 +289,7 @@ describe('herdr agent report wiring', () => {
       metadata: () => {},
       settled: async () => {},
       release: () => {},
+      releaseNow: () => {},
     });
     const deps = {
       now: () => 1,
@@ -315,6 +318,7 @@ describe('herdr agent report wiring', () => {
       metadata: () => {},
       settled: async () => {},
       release: () => {},
+      releaseNow: () => {},
     };
     const stop = startTuiRunStateRecorder('tui:herdr-socket-modal-turn', {
       now: () => 1,
@@ -342,6 +346,7 @@ describe('herdr agent report wiring', () => {
       state: () => {},
       metadata: () => {},
       release: () => { order.push('release'); },
+      releaseNow: () => {},
       settled: () => new Promise<void>((resolve) => { finishRelease = () => { order.push('release-acked'); resolve(); }; }),
     };
     const ls = new Map<string, Array<(s: NodeJS.Signals) => void>>();

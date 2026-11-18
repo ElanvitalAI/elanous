@@ -458,12 +458,16 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
       const contextPath = opts.env!.ELANOUS_GRAPH_CONTEXT!;
       const raw = readFileSync(contextPath, 'utf8');
       const context = JSON.parse(raw) as { nodeId: string; outputs: Record<string, { commit?: unknown } | null> };
-      if (context.nodeId === 'version-release') {
+      if (context.nodeId === 'version-release' || context.nodeId === 'cut-branch') {
         return { exitCode: 0, stderr: '', stdout: `${JSON.stringify(cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => {}, freeze: () => null }))}\n` };
+      }
+      // The pod prebuild node is outside this branch-repair contract: pass without recording.
+      if (context.nodeId === 'gate-image-prebuild') {
+        return { exitCode: 0, stderr: '', stdout: '{"outcome":"ok","verdict":"pass"}\n' };
       }
       const copy = join(f.root, `ctx-${seen.length}.json`);
       writeFileSync(copy, raw);
-      seen.push({ nodeId: context.nodeId, commit: context.outputs['version-release']?.commit, context: copy, command: body });
+      seen.push({ nodeId: context.nodeId, commit: (context.outputs['cut-branch'] ?? context.outputs['version-release'])?.commit, context: copy, command: body });
       // gate-cutover-switch routes on legacy/audit, not the generic ok outcome.
       if (context.nodeId === 'gate-cutover-switch') return { exitCode: 0, stderr: '', stdout: '{"outcome":"legacy"}\n' };
       if (context.nodeId === failNode) return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
@@ -482,7 +486,7 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     expect(first.executed).toBe(first.nodes.filter((record) => record.executed).length);
     expectPersistedExecutionCount();
     // The declared cloud (#35378) and Pod preparation (#36653) nodes precede the gate.
-    expect(first.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
+    expect(first.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
       'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate',
       'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');

@@ -71,7 +71,11 @@ export interface GraphRunState {
   currentNode?: { nodeId: string; executionId?: string; startedAt: string };
   input?: unknown;
   kstDayFallback?: { reason: 'missing-calendar-day' | 'invalid-calendar-day'; selected: string };
-  pending?: { nodeId: string; message: string; since: string; inputSha256?: string; approvalNonce?: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; outcome?: string; decidedBy?: string; decidedAt?: string };
+  pending?: { nodeId: string; message: string; since: string; inputSha256?: string; approvalNonce?: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; outcome?: string; decidedBy?: string; decidedAt?: string;
+    /** Declared HITL options, pinned at pause only when a node declares 3+ (2-option nodes keep the yes/no record unchanged). */
+    choices?: Array<{ key: string; exit: string; default?: boolean }>;
+    /** The option key a person chose among `choices`; absent for yes/no approvals. */
+    choice?: string };
   approvalSourceHash?: string;
   /** Hash of the graph and recipes used for this run; required to safely restart a failed path. */
   sourceHash?: string;

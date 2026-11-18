@@ -1,7 +1,7 @@
 # 격리 하드코딩 baseline (homedir()+.elanous 라인 수 · 파일별) — Phase C ratchet 게이트.
 # 신규/증가만 CI 실패. 위반 수복(resolver 이동) 후 `--update` 로 ratchet down.
 # 정당한 resolver 정의(memory-db-path·session/index·state-paths·fleet·pty-manifest 등)는 영구 잔류.
-# total=82 · files=66
+# total=78 · files=64
 1	src/acp/codex-app-server-thread-index.ts
 1	src/agent/definition-registry.ts
 1	src/auth/token-store.ts
@@ -24,18 +24,17 @@
 1	src/discord-test-runner.ts
 1	src/domains/community-buzz/parse-reddit.ts
 1	src/domains/conatus-env.ts
+1	src/domains/elanous-data-dir.ts
 5	src/domains/fleet.ts
 2	src/domains/memory-db-path.ts
-1	src/domains/elanous-data-dir.ts
-1	src/domains/schedule-registry.ts
 1	src/domains/session-query-tool.ts
 1	src/domains/signal-dedup.ts
 1	src/expression/config/answer-file.ts
 1	src/hitl/audit-log.ts
 1	src/input-core/user-config-loader.ts
-2	src/instance/leader.ts
+1	src/instance/leader.ts
 1	src/instance/nexus-run-refusal.ts
-4	src/instance/resolve.ts
+3	src/instance/resolve.ts
 2	src/intelligence-map/cost-meter.ts
 1	src/intelligence-map/model-catalog.ts
 1	src/intelligence-map/model-watch-mission.ts
@@ -47,7 +46,6 @@
 1	src/nexus/api/connect-info.ts
 1	src/nexus/api/dist.ts
 3	src/nexus/api/log-fabric.ts
-1	src/nexus/api/personas.ts
 1	src/nexus/api/showroom-layouts.ts
 1	src/nexus/index.ts
 1	src/oauth/store.ts

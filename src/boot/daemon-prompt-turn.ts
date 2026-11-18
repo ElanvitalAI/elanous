@@ -110,7 +110,7 @@ export async function runDaemonPromptTurn(opts: {
   /** Optional confirm channels for the triggering chat surface. */
   surfaceHitlChannels?: ConfirmChannel[];
   /** Server-authenticated human owner for this request; absent for delegated or unverified callers. */
-  verifiedOwner?: { id: string };
+  verifiedOwner?: { id: string; appSlug?: string };
   /** Verified app-bound member owner proof for Nexus deployment tools. */
   appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
   appDeployPublishHook?: import('../agent/app-deploy-plugin.js').AppDeployPublishHook;

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-RATCHET-TS",
+  "path": "src/ux-sim/sim-world/ratchet.ts",
+  "boundary": "Compares base and head expectation tables and reports deleted rows, green-to-red flips and rewritten greenSince stamps.",
+  "deviceIds": [
+    "sim-world-kernel"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

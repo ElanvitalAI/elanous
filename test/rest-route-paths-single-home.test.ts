@@ -24,6 +24,18 @@ const read = (rel: string): string => readFileSync(resolve(REPO, rel), 'utf8');
 const codeLinesOf = (rel: string): string[] =>
   read(rel).split('\n').filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line));
 
+/** 잎에서 오는 `import { … } from '…rest-route-paths…'` 문(여러 줄 포함) — 포맷 무관.
+ *  📏 #38766 이 `http-server.ts` 의 import 를 여러 줄 + 큰따옴표로 재포맷했다 ⇒ «한 줄에 이름과 경로가 같이 있다»는
+ *  가정은 포맷이지 계약이 아니었다. 계약(ⓐ 잎에서 import · ⓑ import 밖에서 사용)은 그대로 문다. */
+const LEAF_IMPORT = /import\s+(?:type\s+)?\{(?<specs>[^}]*)\}\s*from\s*['"][^'"]*rest-route-paths(?:\.js)?['"]/g;
+const leafImportsOf = (rel: string): { readonly names: readonly string[]; readonly body: string } => {
+  const code = codeLinesOf(rel).join('\n');
+  const names = [...code.matchAll(LEAF_IMPORT)].flatMap((m) =>
+    (m.groups?.specs ?? '').split(',').map((spec) => spec.trim().replace(/^type\s+/, '').split(/\s+as\s+/).pop()!.trim()).filter(Boolean),
+  );
+  return { names, body: code.replace(LEAF_IMPORT, '') };
+};
+
 /** 이 잎의 값을 «쓰는» 쪽 — 그리고 ⭐ **각자 어느 상수를 쓰기로 했는지**.
  *
  *  ⛔📏 무인 리뷰 must-fix(2026-08-22 · PR #11096): 1차판은 소비자를 «파일 목록»으로만 두고
@@ -115,14 +127,12 @@ describe('shared REST route paths live in one home', () => {
     //   ***주석 한 줄이나 안 쓰는 import 만으로 통과***했다. 그것이야말로 「공허한 통과」다.
     const offenders: string[] = [];
     for (const { file, uses } of CONSUMERS) {
-      const codeLines = codeLinesOf(file);
-      const importLines = codeLines.filter((line) => line.includes('rest-route-paths'));
-      const bodyLines = codeLines.filter((line) => !line.includes('rest-route-paths'));
+      const { names, body } = leafImportsOf(file);
       for (const name of uses) {
-        // ⓐ 잎에서 «가져오는가»
-        if (!importLines.some((line) => line.includes(name))) offenders.push(`${file} ⇒ ${name} not imported from leaf`);
-        // ⓑ import 줄 «밖»에서 «쓰는가» — 안 쓰는 import 는 계약을 안 지킨다.
-        else if (!bodyLines.some((line) => new RegExp(`\\b${name}\\b`).test(line))) {
+        // ⓐ 잎에서 «가져오는가» — import 문(여러 줄 포함)의 지정자 목록에 그 이름이 있는가
+        if (!names.includes(name)) offenders.push(`${file} ⇒ ${name} not imported from leaf`);
+        // ⓑ import 문 «밖»에서 «쓰는가» — 안 쓰는 import 는 계약을 안 지킨다.
+        else if (!new RegExp(`\\b${name}\\b`).test(body)) {
           offenders.push(`${file} ⇒ ${name} imported but never used`);
         }
       }

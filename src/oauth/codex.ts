@@ -26,7 +26,7 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { createHash } from 'node:crypto';
 import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
@@ -483,7 +483,7 @@ export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: P
   // On a fleet nonowner, an isolated store can contain an expired credential
   // with refresh authority. Select the host access mirror before reading it.
   if (!ownerMirrorPath && !shouldPreferHostCodexMirror()) {
-    for (const [source, path] of [['config-dir', authStorePath()], ['default-root', join(homedir(), '.elanous', 'auth.json')]] as const) {
+    for (const [source, path] of [['config-dir', authStorePath()], ['default-root', join(prodInstanceRoot(), 'auth.json')]] as const) {
       try {
         const stat = lstatSync(path);
         if (!stat.isFile() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) continue;
@@ -551,8 +551,8 @@ export async function loadFreshCodexAuthState(
     observeCodexAuth('fresh', { storeKey: account.storeKey, source: 'lease', remainingSeconds: remainingSeconds(leased), refreshed: false });
     return leased;
   }
-  if (!stored && authStorePath() !== join(homedir(), '.elanous', 'auth.json')) {
-    const defaultPath = join(homedir(), '.elanous', 'auth.json');
+  if (!stored && authStorePath() !== join(prodInstanceRoot(), 'auth.json')) {
+    const defaultPath = join(prodInstanceRoot(), 'auth.json');
     try {
       const stat = lstatSync(defaultPath);
       if (stat.isFile() && !stat.isSymbolicLink() && (!process.getuid || stat.uid === process.getuid())) {

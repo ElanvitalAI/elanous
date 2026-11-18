@@ -81,7 +81,8 @@ describe('dispatchAgent worktree isolation', () => {
     setSessionCwd(sessionCwd, 'tool');
 
     try {
-      const result = await dispatchAgent(args(), opts());
+      // #38772: blocking, so this run does not finish in the background into the next test's debug tail.
+      const result = await dispatchAgent({ ...args(), run_in_background: false }, opts());
       const task = globalAgentRegistry.get(result.taskId);
 
       expect(result.cwd).toBe(sessionCwd);
@@ -101,7 +102,8 @@ describe('dispatchAgent worktree isolation', () => {
     };
 
     try {
-      const result = await dispatchAgent(args('worktree'), opts());
+      // #38772: the default is background; the completed output needs the blocking call.
+      const result = await dispatchAgent({ ...args('worktree'), run_in_background: false }, opts());
       const task = globalAgentRegistry.get(result.taskId);
 
       expect(result.output).toBe('completed');

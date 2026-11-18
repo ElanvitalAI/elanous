@@ -312,7 +312,7 @@ export class DecisionCardService {
     let answerDelivery: ReturnType<DecisionLedger['decideWithDelivery']>['delivery'] = null;
     try {
       // Same ledger method the CLI `decide` uses — one record path.
-      const recorded = this.ledger.decideWithDelivery(entry.id, parsed.key, { kind: 'human' }, card?.note);
+      const recorded = this.ledger.decideWithDelivery(entry.id, parsed.key, { kind: 'human', via: platform, platformUserId: userId }, card?.note);
       decided = recorded.entry;
       answerDelivery = recorded.delivery;
     } catch (error) {

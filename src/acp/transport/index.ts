@@ -1,6 +1,7 @@
 // UI-Core arc Phase U4 — transport module public surface.
 
 export type {
+  AcpAudience,
   AcpConnectionHandler,
   AcpTransportConnection,
   AcpTransportServer,

@@ -14,8 +14,11 @@ import { debug } from '../debug/log.js';
 import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from './pty-mouse.js';
 import { startPtyRecording, stopPtyRecording } from './pty-recording.js';
 import { withExternalKeyCommand } from '../input/external-input-queue.js';
+import { authorizeSeatControl, type SeatControlMode } from '../seat/seat-control.js';
+import { requestSeatStop } from '../tui/seat-stop-port.js';
+import { emitTurnLife } from '../debug/turn-life.js';
 
-const OWNER_PTY_CONTROL_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'input-mouse', 'resize', 'snapshot', 'rename', 'terminate', 'stop-turn', 'capabilities', 'record-start', 'record-stop'] as const;
+const OWNER_PTY_CONTROL_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'input-mouse', 'resize', 'snapshot', 'rename', 'terminate', 'stop-turn', 'capabilities', 'record-start', 'record-stop', 'seat-stop'] as const;
 export type PtyControlAction = typeof OWNER_PTY_CONTROL_ACTIONS[number];
 type PtyControlStatus = 'success' | 'unknown-pty' | 'denied' | 'failed' | 'write-failed' | 'owner-unreachable';
 
@@ -43,7 +46,8 @@ export type PtyControlPayload =
   | { readonly ansi: boolean }
   | { readonly nickname: string }
   | { readonly cols: number; readonly rows: number; readonly title?: string }
-  | { readonly force: true; readonly actorIdentity: string; readonly reason: string };
+  | { readonly force: true; readonly actorIdentity: string; readonly reason: string }
+  | { readonly mode: SeatControlMode; readonly sender: string };
 
 export interface PtyControlRequestOptions {
   /** 요청자가 주장하는 쓰기 주체. `'agent'` 는 run-identity 일치를 요구한다(`resolveRemoteControlActor`). */
@@ -613,6 +617,22 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
       else if (!isOwnerPtyControlAction(row.action)) result = { status: 'denied', reason: 'unsupported-action' };
       else if (row.action === 'capabilities') result = { status: 'success', actions: OWNER_PTY_CONTROL_ACTIONS };
       else if (row.action === 'terminate') result = await terminatePty(handle);
+      else if (row.action === 'seat-stop') {
+        const payload = parsePayload(row);
+        const target = getPtyManifest(row.pty_id);
+        const mode = payload && typeof payload === 'object' && 'mode' in payload ? payload.mode : undefined;
+        const sender = payload && typeof payload === 'object' && 'sender' in payload ? payload.sender : undefined;
+        if ((mode !== 'quit' && mode !== 'migrate' && mode !== 'force') || typeof sender !== 'string') {
+          result = { status: 'denied', reason: 'invalid-seat-stop' };
+        } else if (row.pty_id !== `tui:${process.pid}` || target?.kind !== 'tui' || !target.seat || !authorizeSeatControl({ sender, target: target.seat, sameHost: true })) {
+          result = { status: 'denied', reason: 'seat-control-not-authorized' };
+        } else {
+          const outcome = await requestSeatStop({ requestId: row.request_id, mode });
+          result = outcome === 'waiting' || outcome === 'accepted'
+            ? { status: 'success', reason: outcome } : { status: 'denied', reason: outcome };
+        }
+        emitTurnLife('turn-life:seat-control-request', { eventId: row.request_id, mode: mode ?? null, outcome: result.reason });
+      }
       else if (row.action === 'stop-turn') {
         const payload = parsePayload(row);
         const targetRunId = getPtyManifest(row.pty_id)?.runId?.trim() ?? '';

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Command } from 'commander';
 import { Database } from 'bun:sqlite';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
@@ -290,8 +291,25 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   };
   const withStore = <T>(action: (store: MsgStore) => T): T => {
     const store = open();
-    try { return action(store); }
-    finally { store.close(); }
+    let result: T;
+    try { result = action(store); }
+    catch (error) { try { store.close(); } catch { /* the action's own error is the one to report */ } throw error; }
+    // ELN-MSG-POST-IDEMPOTENT: the action already committed — a lock or I/O error while closing must not turn a stored
+    // write into a reported failure (the caller would retry and duplicate it).
+    try { store.close(); }
+    catch (error) {
+      try { debug.log('msg.post', 'close-after-commit-failed', { error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+      catch { /* observability is fail-open */ }
+    }
+    return result;
+  };
+  /** `#id time FROM → TO [kind] · N bytes` (+ the dedupe note) — the stored message without its body. */
+  const postedLine = (message: Message): string => {
+    const head = formatMessage({ ...message, body: '' }).replace(/: $/, '');
+    const bytes = Buffer.byteLength(message.body, 'utf8');
+    return message.deduped
+      ? `${head} · ${bytes} bytes · deduped: already stored within the dedupe window (no new row; --no-dedupe to store again)`
+      : `${head} · ${bytes} bytes`;
   };
   const emit = (value: unknown, json: boolean | undefined, human: () => void) => {
     if (json) out.log(JSON.stringify(value));
@@ -444,8 +462,9 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--needs-ack', 'mark the message as acknowledgement-required')
     .option('--crown-directive <id>', 'crown directive ID this message executes')
     .option('--priority <level>', 'priority: urgent(2) | p0(1) | normal(0)')
+    .option('--no-dedupe', 'store even when the same from/to/body was posted within the dedupe window (default 10 min)')
     .option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean; intent?: string; ref?: string[]; deadline?: string; done?: string; needsAck?: boolean; crownDirective?: string; priority?: string }) => run(async () => {
+    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean; intent?: string; ref?: string[]; deadline?: string; done?: string; needsAck?: boolean; crownDirective?: string; priority?: string; dedupe?: boolean }) => run(async () => {
       const from = seat(opts.from, '--from');
       // A217 — a request names when it is due and what «done» means, before anything is stored or woken.
       if (opts.intent === 'request' && (opts.deadline === undefined || !opts.done?.trim()))
@@ -487,14 +506,59 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         ...(opts.done === undefined ? {} : { doneWhen: opts.done }),
         ...(opts.needsAck ? { needsAck: true } : {}),
         ...(opts.crownDirective === undefined ? {} : { crownDirective: opts.crownDirective }) };
-      const posted = withStore(store => opts.originKey === undefined
-        ? store.post(envelope)
-        : store.appendWithProvenance(envelope, opts.originKey));
-      emit(posted, opts.json, () => out.log(formatMessage(posted)));
-      await handleTaMessage(posted); // msg post: process the durable TA request (including pending retry).
-      const replyBody = messageReplyBodyFor(to, deps.wakeDeps);
-      const noBody = replyBody === 'none' ? noReplyBodyNotice(to) ?? '이 주소는 읽는 몸이 없다 — 지금은 OP' : null;
-      if (noBody) out.error(noBody);
+      // #38516 r2 MF3: a per-attempt token goes into this INSERT, so recovery after an ambiguous write can name THIS
+      // attempt's commit — an older identical row (`--no-dedupe`, or outside the window) never stands in for a send that
+      // was not stored. MF4: the `--origin-key` path is idempotent by its provenance key instead (explicit contract:
+      // the key names one logical message, so the stored row under it is this message whichever attempt wrote it;
+      // the body-hash window does not apply there).
+      const attemptToken = randomUUID();
+      let posted: Message;
+      try {
+        posted = withStore(store => opts.originKey === undefined
+          ? store.post(envelope, { dedupe: opts.dedupe !== false, attemptToken })
+          : store.appendWithProvenance(envelope, opts.originKey));
+      } catch (error) {
+        // Only an ambiguous STORAGE error (lock / busy / I-O around COMMIT) can hide a commit. A validation refusal
+        // (bad origin key, recipient mismatch, unknown group) stored nothing by definition — report it as is.
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/database is locked|SQLITE_BUSY|SQLITE_IOERR|disk I\/O|database is busy/i.test(message)) throw error;
+        let landed: Message | null = null;
+        try {
+          landed = withStore(store => opts.originKey === undefined
+            ? store.findPostByAttempt(attemptToken)
+            : store.findByProvenanceKeyFor(opts.originKey, envelope)); // r3 MF2: same sender → recipient only
+        } catch { /* still unknown: report the write error */ }
+        if (landed === null) throw error;
+        debug.log('msg.post', 'recovered-after-error', { msgId: landed.id, from, to, by: opts.originKey === undefined ? 'attempt' : 'origin-key',
+          error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        posted = landed;
+      }
+      // The human line names the stored id without echoing the body: a caller that scans the output for an error word
+      // must not find it inside its own message (11-18: a report quoting «database is locked» was re-sent 13 times).
+      emit(posted, opts.json, () => out.log(postedLine(posted)));
+      // #38516 r2 MF2: TA handling runs after the commit and is separated from it — a TA failure is a warning with the
+      // stored id, never exit 2 (exit 2 = «not stored», which makes callers resend). A retry with the same --origin-key
+      // stays safe: it finds the stored request and re-drives the pending delivery (provenance + linked reply).
+      try { await handleTaMessage(posted); } // msg post: process the durable TA request (including pending retry).
+      catch (error) {
+        debug.log('msg.post', 'after-commit-step-failed', { msgId: posted.id, step: 'ta', error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        // #38516 r3 MF3: the recovery advice matches how this send was made. Only a keyed send is idempotent on retry;
+        // an unkeyed resend (or adding a new key) would store a second message next to #id.
+        const advice = opts.originKey === undefined
+          ? `do not resend — it would be a second message; the request is #${posted.id}`
+          : 'retry with the same --origin-key is safe';
+        out.error(`msg post: #${posted.id} stored; the TA follow-up failed: ${error instanceof Error ? error.message : String(error)} (${advice})`);
+      }
+      // Everything below runs after the message is durable: a failure here is a warning, never a failed post.
+      let noBody: string | null = null;
+      try {
+        const replyBody = messageReplyBodyFor(to, deps.wakeDeps);
+        noBody = replyBody === 'none' ? noReplyBodyNotice(to) ?? '이 주소는 읽는 몸이 없다 — 지금은 OP' : null;
+        if (noBody) out.error(noBody);
+      } catch (error) {
+        debug.log('msg.post', 'after-commit-step-failed', { msgId: posted.id, step: 'route', error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        out.error(`msg post: #${posted.id} stored; a follow-up step failed (not resent)`);
+      }
       // 저장 «뒤» 한 번 — 읽는 몸이 없다는 안내가 이미 나갔으면 깨움 경고는 겹쳐 내지 않는다.
       // 깨움은 post 의 성패를 바꾸지 않는다 — 동기 예외까지 여기서 막는다.
       // 로그 싱크 등록이 멈춰도 깨움·post 완료를 붙잡지 않는다(1초 상한).
@@ -518,7 +582,13 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
           } catch { /* the safety net never fails a post */ }
         }
       } catch { /* the wake outcome is logged by wakeRecipient; the post is already durable */ }
-      if (agentAddress !== null) await autoReply(agentAddress, posted, opts.json);
+      if (agentAddress !== null) {
+        try { await autoReply(agentAddress, posted, opts.json); }
+        catch (error) {
+          debug.log('msg.post', 'after-commit-step-failed', { msgId: posted.id, step: 'agent-reply', error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+          out.error(`msg post: #${posted.id} stored; the agent reply failed (not resent)`);
+        }
+      }
     })());
 
   msg.command('route <address>').description('Show how a post to this address is read (replyBody) and woken (wake)')
@@ -644,22 +714,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         return;
       }
       const through = integer(opts.through ?? positional, opts.through === undefined ? 'message ID' : '--through', 0, 0, Number.MAX_SAFE_INTEGER);
-      const acknowledged = withStore(store => store.db.transaction(() => {
-        // MSG-RECEIPTS-FOLLOWUP ① (#84659 A①): the positional and --through hand acks leave «seen» like --id does — for the
-        // messages this ack actually moves past (unacknowledged · after the cursor · ≤ through). One transaction, so a message
-        // landing between the list and the ack cannot slip past unmarked (#38305 REVIEW ②).
-        const HAND_ACK_SEEN_MAX = 1000; // Source: #38305 REVIEW ③ — the same bound as listByRecipient's page
-        const page = store.listByRecipient(to, store.getCursor(to), HAND_ACK_SEEN_MAX);
-        const passing = page.filter(message => message.id <= through).map(message => message.id);
-        if (page.length === HAND_ACK_SEEN_MAX && page.every(message => message.id <= through)) {
-          // More than one page is being acknowledged: the cursor moves past all of them, «seen» covers the first page only.
-          try { debug.log('msg.receipt-writer', 'hand-ack-seen-truncated', { recipient: to, through, marked: passing.length }, { level: 'warn' }); }
-          catch { /* observability is fail-open */ }
-        }
-        const moved = store.ack(to, through);
-        for (const id of passing) recordHandSeen(store, to, id);
-        return moved;
-      }).immediate());
+      // MSG-RECEIPTS-FOLLOWUP ① (#84659 A①): positional and --through leave «seen» like --id — same store path as the MsgAck tool.
+      const acknowledged = withStore(store => store.ackThroughSeen(to, through, 'cli-ack'));
       emit(opts.through === undefined ? { recipient: to, cursor: acknowledged } : { recipient: to, through: acknowledged }, opts.json, () => out.log(`${to} acknowledged through #${acknowledged}`));
     })());
 

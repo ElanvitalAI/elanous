@@ -11,6 +11,7 @@ import type { ReleaseManifest } from '../../src/release-loop/manifest.js';
 import { flipNextReleaseMarkers, foldPreLandedNotes, renderReleaseNotes } from './release-docs.js';
 import { emitNodeResult, lastResult, nodeOutput, readGraphContext, type GraphContext } from './node-verdict.js';
 import { reusableTui, withTuiOutcome } from './tui-node-checks.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 interface DocsResult {
   outcome: 'ok' | 'error';
@@ -481,7 +482,7 @@ export function joinTui(context: GraphContext, env: NodeJS.ProcessEnv, repo: str
   const reused = cut && cached?.tui && reusableTui(cached.tui, cut.commit);
   if (reused) return { ...reused, outcome: 'ok', summary: `tui ${reused.verdict}` };
   // Preserve node-verdict.ts's exit convention and last-JSON output on a cache miss.
-  const output = fallback(cut?.commit ?? String(context.outputs['version-release']?.commit ?? ''));
+  const output = fallback(cut?.commit ?? String(releaseCutRecord(context)?.commit ?? ''));
   const data = lastResult(output);
   if (!data) throw new Error(`tui fallback returned no verdict: ${output.stderr}`);
   // A timed-out or crashed fallback never passes on an earlier success line: exit status, outcome and verdict must agree.

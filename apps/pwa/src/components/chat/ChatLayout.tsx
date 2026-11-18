@@ -823,6 +823,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           }, {
             signal: ac.signal,
             ...(userContentBlocks ? { userContent: userContentBlocks } : {}),
+            ...(drawerOpen ? { debugTap: true } : {}),
             onPartial,
             onPartialBlocks,
           })

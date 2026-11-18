@@ -26,7 +26,7 @@ test('passed main evidence writes candidate and waits without issuing launch ide
   const path = join(mkdtempSync(join(tmpdir(), 'ta-already-done-')), 'state.json');
   let launches = 0;
   const result = await handTask({ id: 'ta-already-done-sample', text: request, statePath: path, live: true,
-    launcher: () => { launches++; },
+    launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; },
     prelaunchInspector: () => ({ reason: 'evidence-passed-on-main', candidate: {
       mainSha: 'a'.repeat(40), repository: 'https://github.com/example/repo.git',
       command: 'test -f src/task-agent/sample.ts', exitCode: 0,
@@ -47,7 +47,7 @@ test('absent or failed evidence retains the normal live launcher', async () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ta-already-done-fallback-')), 'state.json');
     let launches = 0;
     const result = await handTask({ text: request, statePath: path, live: true,
-      launcher: () => { launches++; }, prelaunchInspector: () => ({ reason }) });
+      launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; }, prelaunchInspector: () => ({ reason }) });
     expect(launches).toBe(1);
     expect(result.launched).toBe(true);
     expect(result.card.alreadyDoneCandidate).toBeUndefined();
@@ -95,7 +95,7 @@ test('live hand uses the production verifier against a temporary bare remote and
   // and routes ls-remote to the real temporary bare repository; all tree/path checks run through git.
   let launchesWithoutRunner = 0;
   const rejected = await handTask({ id: 'ta-already-done-local-rejected', text: request, project: { id: 'temp', target: repo },
-    completion: 'code-pr', live: true, statePath: join(root, 'rejected.json'), launcher: () => { launchesWithoutRunner++; } });
+    completion: 'code-pr', live: true, statePath: join(root, 'rejected.json'), launcher: (_args, _cwd, launchContext) => { launchesWithoutRunner++; return { runId: launchContext?.runId }; } });
   expect(launchesWithoutRunner).toBe(1);
   expect(rejected.card.alreadyDoneCandidate).toBeUndefined();
 
@@ -108,7 +108,7 @@ test('live hand uses the production verifier against a temporary bare remote and
   let launches = 0;
   const result = await handTask({ id: 'ta-already-done-local-verified', text: request,
     project: { id: 'temp', target: repo }, completion: 'code-pr', live: true,
-    statePath: join(root, 'verified.json'), launcher: () => { launches++; }, prelaunchGitRunnerForTest: runner });
+    statePath: join(root, 'verified.json'), launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; }, prelaunchGitRunnerForTest: runner });
   expect(launches).toBe(0);
   expect(result.launched).toBe(false);
   expect(result.card.alreadyDoneCandidate).toMatchObject({ mainSha: sha, command: 'test -f src/task-agent/sample.ts', exitCode: 0 });

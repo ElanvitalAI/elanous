@@ -15,6 +15,7 @@
 import { closeSync, existsSync, fchmodSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
+import { homeTestInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { decodeJWTPayload } from '../oauth/jwt.js';
@@ -63,7 +64,7 @@ export const CODEX_LEASE_WATCH_MAX_MS = 7 * 24 * 60 * 60_000;
 /** Default config-dir roots (beside `ELANOUS_SECRET_LEASE_ROOTS`, ':'-separated absolute paths). */
 export function defaultCodexLeaseRoots(home: string = homedir(), env: NodeJS.ProcessEnv = process.env): string[] {
   const extra = (env.ELANOUS_SECRET_LEASE_ROOTS ?? '').split(':').map((p) => p.trim()).filter((p) => p && isAbsolute(p));
-  return [join(home, 'elanous-hq'), join(home, '.elanous-test'), join(home, '.elanous-universes'), ...extra].map((p) => resolve(p));
+  return [join(home, 'elanous-hq'), homeTestInstanceRoot(home), join(home, '.elanous-universes'), ...extra].map((p) => resolve(p));
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ export function parseLeaseTarget(raw: string, deps: Pick<CodexLeaseDeps, 'allowe
     const path = resolve(value.startsWith('~') ? join(home, value.slice(1)) : value);
     if (!isAbsolute(value) && !value.startsWith('~')) throw new CodexLeaseRefusedError('target-not-allowed', 'config dir must be absolute');
     const ownerDir = resolve(dirname(deps.ownerStorePath()));
-    const forbidden = [ownerDir, resolve(join(home, '.elanous')), resolve(join(home, '.codex'))];
+    const forbidden = [ownerDir, prodInstanceRoot(home), resolve(join(home, '.codex'))];
     if (forbidden.some((f) => path === f || within(f, path)) || /(^|\/)\.codex[^/]*(\/|$)/.test(path))
       throw new CodexLeaseRefusedError('target-is-owner-store');
     if (!deps.allowedRoots().some((root) => within(resolve(root), path))) throw new CodexLeaseRefusedError('target-not-allowed', 'config dir outside known roots');

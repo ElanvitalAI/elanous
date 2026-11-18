@@ -41,6 +41,7 @@ import { hostname, loadavg } from 'node:os';
 import { resolveHostId } from '../platform/host-id.js';
 import { resolveInstanceName } from '../instance-identity.js';
 import { ghAutomationEnv } from '../autopilot/pr-manager.js';
+import type { RunSink } from './stages/context.js';
 import { citedReviewSymbols, MAX_CITED_REVIEW_SYMBOL_CHARS, measureReviewFindingKeyOverlap, normalizeReviewFindingKey, REVIEW_FINDING_KEY_VERSION, reviewFindingKey, shortNormalizedReviewFindingHash, type CitedReviewSymbol } from '../agent-substrate/review-finding-key.js';
 export { citedReviewSymbols, MAX_CITED_REVIEW_SYMBOL_CHARS, normalizeReviewFindingKey, REVIEW_FINDING_KEY_VERSION, reviewFindingKey, shortNormalizedReviewFindingHash, type CitedReviewSymbol } from '../agent-substrate/review-finding-key.js';
 
@@ -4480,62 +4481,61 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     /** ⭐ 「달성 근사값」을 결과에 «한 자리»에서 붙인다 — terminalResult 가 두 자리에서 서므로 각각에 붙이면 누락난다. */
     const withEvidenceCoverage = (r: SelfImplementResult): SelfImplementResult =>
       evidenceCoverageSummary ? { ...r, evidenceCoverageSummary } : r;
+    // ⭐ 0b — 옛 위치 콜백·observe 를 «같은 순서»로 RunSink(키 34 · stages/context.ts) 하나에 싣는다(평가 순서 불변).
+    //   옛 hasProviderError·hasCredentialFailure 자리는 아래 hasCurrent* 와 «같은 함수»였다 → 키 하나로 합쳤다.
     const result = await runSelfImplementInner(
-      instrumentedOpts,
-      identity,
-      attemptOrdinal,
-      shardIdentity,
-      observeNodeEntry,
-      observeRoundClassification,
-      (path) => {
+      instrumentedOpts, identity,
+      attemptOrdinal, shardIdentity, {
+      onNodeEntry: observeNodeEntry,
+      onRoundClassification: observeRoundClassification,
+      onWorktreeCreated: (path) => {
         worktreePath = path;
         registerRunLoop('active');
         loopRegistered = true;
       },
-      observeRoundExecution,
-      observeReviewFindings,
-      (rework) => { measuredRework = rework; },
-      setRunGraphIdentity,
-      (template) => { runGraphTemplate = template; },
+      onRoundExecution: observeRoundExecution,
+      onReviewFindings: observeReviewFindings,
+      onReworkMeasured: (rework) => { measuredRework = rework; },
+      onGraphResolved: setRunGraphIdentity,
+      onGraphTemplateResolved: (template) => { runGraphTemplate = template; },
       // ⭐ 「요구 증거 충족」을 받아 결과에 실어 원장까지 나른다(`JDG-T60`)
-      (summary) => { evidenceCoverageSummary = summary; },
-      () => ({
+      onEvidenceCoverage: (summary) => { evidenceCoverageSummary = summary; },
+      reviewFindingTelemetry: () => ({
         citedReviewSymbolOccurrences: [...citedReviewSymbolOccurrences.values()],
         normalizedReviewFindingRepeatCounts: [...normalizedRepeatedReviewFindingOccurrences],
         symbolKeyedReviewFindingCount,
         proseFallbackReviewFindingCount,
       }),
-      instrumentedOpts.seams.reworkBudgetReviewFindingRecurrence ?? (() => null),
-      () => { mergeApprovalReceived = true; },
-      () => { autoMergeAuthorizedBeforeSync = true; },
-      (verdict) => { lastParsedSupervisorVerdict = verdict; },
-      (reason) => { lastParsedSupervisorReason = reason; },
-      (base) => { resolvedBase = base ?? undefined; },
-      (basis) => { observationMeasurementBasis = basis; },
-      (timeout) => { clarificationTimeout = timeout; },
-      hasCurrentProviderError,
-      hasCurrentCredentialFailure,
-      () => hasCurrentProviderError() ? providerErrorsForResult().providerErrors?.category : undefined,
-      (rejectedCount) => { reviewReflectRejectedCount = (reviewReflectRejectedCount ?? 0) + rejectedCount; },
-      observeOuter,
-      (active) => { runActiveProvider = active; },
-      (sessionId) => { terminalSessionId = sessionId; },
-      (contract) => { runContract = contract; },
-      recordFailureVerdict,
-      () => {
+      reworkBudgetReviewFindingRecurrence: instrumentedOpts.seams.reworkBudgetReviewFindingRecurrence ?? (() => null),
+      onMergeApprovalReceived: () => { mergeApprovalReceived = true; },
+      onAutoMergeAuthorizedBeforeSync: () => { autoMergeAuthorizedBeforeSync = true; },
+      onSupervisorVerdictParsed: (verdict) => { lastParsedSupervisorVerdict = verdict; },
+      onSupervisorReasonParsed: (reason) => { lastParsedSupervisorReason = reason; },
+      onResolvedBase: (base) => { resolvedBase = base ?? undefined; },
+      onObservationMeasurementBasis: (basis) => { observationMeasurementBasis = basis; },
+      onClarificationTimeout: (timeout) => { clarificationTimeout = timeout; },
+      providerErrorCategory: () => hasCurrentProviderError() ? providerErrorsForResult().providerErrors?.category : undefined,
+      onReviewReflectRejected: (rejectedCount) => { reviewReflectRejectedCount = (reviewReflectRejectedCount ?? 0) + rejectedCount; },
+      observe: observeOuter,
+      onActiveProvider: (active) => { runActiveProvider = active; },
+      onSessionCreated: (sessionId) => { terminalSessionId = sessionId; },
+      onRunContractResolved: (contract) => { runContract = contract; },
+      onFailureVerdict: recordFailureVerdict,
+      providerErrorAtLastGate: () => {
         const error = providerErrorAtLastGate;
         providerErrorAtLastGate = undefined;
         return error;
       },
-      () => providerErrorCount > 0,
-      () => credentialFailureCount > 0,
+      hasObservedProviderError: () => providerErrorCount > 0,
+      hasObservedCredentialFailure: () => credentialFailureCount > 0,
       hasCurrentProviderError,
       hasCurrentCredentialFailure,
-      (commit: string | undefined) => { finishedImplementationAtMainSync = true; preSyncCommit = commit; },
+      onMainSyncStarted: (commit: string | undefined) => { finishedImplementationAtMainSync = true; preSyncCommit = commit; },
       preserveMergeHarvest,
+      onPrAttributed: (number) => { capturedPrNumber = number; },
+      onPrAttributionMismatch: () => { prAttributionMismatch = true; },
+    },
       startedAtMs,
-      (number) => { capturedPrNumber = number; },
-      () => { prAttributionMismatch = true; },
     );
     terminalNode = result.node;
     await mergeChildProviderErrors();
@@ -5251,58 +5251,58 @@ export function resolveRunStageNodeContext(input: {
 /** 라운드마다 같은 부품이 «그 파일·그 판»인지 — 도는 중에 바뀌면 걸음과 신원이 갈린다. */
 async function runSelfImplementInner(
   opts: SelfImplementOptions,
-  identity?: { runId: string; source: ReturnType<typeof resolveRunIdentity>['source'] },
+  identity: { runId: string; source: ReturnType<typeof resolveRunIdentity>['source'] } | undefined,
   attemptOrdinal: AttemptOrdinal = UNMEASURED_ATTEMPT_ORDINAL,
   shardIdentity: RunShardIdentity = { pieceTotal: 1 },
-  onNodeEntry: (node: PipelineNodeId, round: number) => void = () => {},
-  onRoundClassification: (classification: LifecycleScreenComparison) => void = () => {},
-  onWorktreeCreated: (path: string) => void = () => {},
-  onRoundExecution: (tier: EscalateTier) => void = () => {},
-  onReviewFindings: (round: number, mustFix: readonly string[]) => void = () => {},
-  onReworkMeasured: (rework: ReviewRework) => void = () => {},
-  /** ⭐ 이 런이 «따르는» 그래프 신원 — 맥락이 정해진 «직후» 한 번 불린다.
-   *  ⛔ 이것이 없으면 걸음은 YAML 을 따르고 «신원은 옛 TS 상수»를 따라 둘이 갈린다. */
-  onGraphResolved: (identity: { graphId: string; graphVersion: string }) => void = () => {},
-  /** ⛔ 신원과 «별개»다 — 예산은 노드 목록을 봐야 하고 신원은 두 문자열이다. */
-  onGraphTemplateResolved: (template: GraphTemplate) => void = () => {},
-  /**
-   * ⭐ 「요구 증거 충족」을 바깥으로 나른다 — ⛔ return 지점이 «열다섯»이라 각각에 실으면 누락이 난다.
-   *   📍 이 파일이 이미 쓰는 콜백 인자 패턴(onNodeEntry·onReviewFindings …)을 그대로 따른다(재발명 0).
-   */
-  onEvidenceCoverage: (summary: { required: number; covered: number; uncovered: number }) => void = () => {},
-  reviewFindingTelemetry: () => NonNullable<Parameters<NonNullable<SelfImplementSeams['diagnose']>>[0]['reviewFindingTelemetry']> = () => ({ citedReviewSymbolOccurrences: [], normalizedReviewFindingRepeatCounts: [], symbolKeyedReviewFindingCount: 0, proseFallbackReviewFindingCount: 0 }),
-  /** ⛔ 테스트 주입 심. ⭐ 기본이 «null 을 내는 것»이라 종전엔 이 축이 영영 안 떴다 —
-   *  이제 null 이면 measureReviewFindingRecurrence 가 «실제로» 잰다. */
-  reworkBudgetReviewFindingRecurrence: () => ReviewFindingRecurrence | null = () => null,
-  onMergeApprovalReceived: () => void = () => {},
-  onAutoMergeAuthorizedBeforeSync: () => void = () => {},
-  onSupervisorVerdictParsed: (verdict: ReworkBudgetVerdict) => void = () => {},
-  onSupervisorReasonParsed: (reason: string | undefined) => void = () => {},
-  onResolvedBase: (base: string | null) => void = () => {},
-  onObservationMeasurementBasis: (basis: ObservationMeasurementBasis) => void = () => {},
-  onClarificationTimeout: (timeout: Pick<GoalExecutionRecord, 'clarificationTimeoutUnanswered' | 'clarificationTimeoutQuestionIds' | 'clarificationUnansweredOutcome'>) => void = () => {},
-  hasProviderError: () => boolean = () => false,
-  hasCredentialFailure: () => boolean = () => false,
-  providerErrorCategory: () => NonNullable<SelfImplementResult['providerErrors']>['category'] | undefined = () => undefined,
-  onReviewReflectRejected: (rejectedCount: number) => void = () => {},
-  observe?: ReturnType<typeof makeRunObserver>,
-  /** ⭐ 「이 런이 «실제로» 어느 두뇌로 돌았나」를 원장까지 나른다 — ⛔ 기록 «시점»에 다시 읽지 않는다
-   *  (그러면 「런이 끝날 무렵의 provider」가 되어 `F45` 를 그대로 밟는다). 시작 시점 값을 넘긴다. */
-  onActiveProvider: (active: { provider?: string; model?: string; auth?: string }) => void = () => {},
-  onSessionCreated: (sessionId: string) => void = () => {},
-  onRunContractResolved: (contract: RunContract) => void = () => {},
-  onFailureVerdict: (kind: 'gate' | 'review') => Promise<void> = async () => {},
-  providerErrorAtLastGate: () => string | undefined = () => undefined,
-  hasObservedProviderError: () => boolean = hasProviderError,
-  hasObservedCredentialFailure: () => boolean = hasCredentialFailure,
-  hasCurrentProviderError: () => boolean = hasProviderError,
-  hasCurrentCredentialFailure: () => boolean = hasCredentialFailure,
-  onMainSyncStarted: (commit: string | undefined) => void = () => {},
-  preserveMergeHarvest: (reason: string, inputChars?: number) => Promise<boolean> = async () => false,
+  sink: RunSink, // ⭐ 0b — 옛 위치 인자를 «같은 이름·같은 기본값(undefined 일 때만)·같은 순서»로 푼다 · 맨 이름 호출이라 this 도 옛과 같다
   startedAtMs = Date.now(),
-  onPrAttributed: (number: number) => void = () => {},
-  onPrAttributionMismatch: () => void = () => {},
 ): Promise<Omit<SelfImplementResult, 'runId'>> {
+  const {
+    onNodeEntry = () => {},
+    onRoundClassification = () => {},
+    onWorktreeCreated = () => {},
+    onRoundExecution = () => {},
+    onReviewFindings = () => {},
+    onReworkMeasured = () => {},
+    /** ⭐ 이 런이 «따르는» 그래프 신원 — 맥락이 정해진 «직후» 한 번 불린다.
+     *  ⛔ 이것이 없으면 걸음은 YAML 을 따르고 «신원은 옛 TS 상수»를 따라 둘이 갈린다. */
+    onGraphResolved = () => {},
+    /** ⛔ 신원과 «별개»다 — 예산은 노드 목록을 봐야 하고 신원은 두 문자열이다. */
+    onGraphTemplateResolved = () => {},
+    /** ⭐ 「요구 증거 충족」을 바깥으로 나른다 — ⛔ return 지점이 «열다섯»이라 각각에 실으면 누락이 난다.
+     *   📍 이 파일이 이미 쓰는 콜백 인자 패턴(onNodeEntry·onReviewFindings …)을 그대로 따른다(재발명 0). */
+    onEvidenceCoverage = () => {},
+    reviewFindingTelemetry = () => ({ citedReviewSymbolOccurrences: [], normalizedReviewFindingRepeatCounts: [], symbolKeyedReviewFindingCount: 0, proseFallbackReviewFindingCount: 0 }),
+    /** ⛔ 테스트 주입 심. ⭐ 기본이 «null 을 내는 것»이라 종전엔 이 축이 영영 안 떴다 —
+     *  이제 null 이면 measureReviewFindingRecurrence 가 «실제로» 잰다. */
+    reworkBudgetReviewFindingRecurrence = () => null,
+    onMergeApprovalReceived = () => {},
+    onAutoMergeAuthorizedBeforeSync = () => {},
+    onSupervisorVerdictParsed = () => {},
+    onSupervisorReasonParsed = () => {},
+    onResolvedBase = () => {},
+    onObservationMeasurementBasis = () => {},
+    onClarificationTimeout = () => {},
+    providerErrorCategory = () => undefined,
+    onReviewReflectRejected = () => {},
+    /** ⭐ 「이 런이 «실제로» 어느 두뇌로 돌았나」를 원장까지 나른다 — ⛔ 기록 «시점»에 다시 읽지 않는다
+     *  (그러면 「런이 끝날 무렵의 provider」가 되어 `F45` 를 그대로 밟는다). 시작 시점 값을 넘긴다. */
+    onActiveProvider = () => {},
+    onSessionCreated = () => {},
+    onRunContractResolved = () => {},
+    onFailureVerdict = async () => {},
+    providerErrorAtLastGate = () => undefined,
+    hasObservedProviderError = () => false,
+    hasObservedCredentialFailure = () => false,
+    // 옛 hasProviderError·hasCredentialFailure(기본 () => false)는 아래 둘과 위 둘의 기본값으로만 쓰였다 → 키에서 빠지고 같은 기본값.
+    hasCurrentProviderError = () => false,
+    hasCurrentCredentialFailure = () => false,
+    onMainSyncStarted = () => {},
+    preserveMergeHarvest = async () => false,
+    onPrAttributed = () => {},
+    onPrAttributionMismatch = () => {},
+  } = sink;
+  let { observe } = sink;
   const runIdentity = identity ?? resolveRunIdentity({ explicit: opts.runId });
   observe ??= makeRunObserver(runIdentity.runId, opts.goalId, debug.log.bind(debug), opts.seams.writeRunLedger, shardIdentity);
   const s = opts.seams;

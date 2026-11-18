@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { parseMessageSource, type SerializedMessage } from '../../session/index.js';
-import { AGENT_TURN_BAND_SGR, logViewLines, USER_TURN_BAND_SGR } from './log-view.js';
+import { logViewLines } from './log-view.js';
 
 // The band colour follows COLORFGBG (turn-band-theme.ts); pin it so the expectation never depends on the terminal
 // the tests run in (#38379 REVIEW-1). '15;0' = light text on a dark background → the dark token.
@@ -20,13 +20,13 @@ test('the source comes from the structured field: the same wording draws three w
   const system = logViewLines([user(text, { kind: 'system', origin: 'scheduled' })], 60);
   const agent = logViewLines([user('#38031 리뷰 결과 반영해 줘', { kind: 'agent', seat: 'OP', intent: 'request', msgId: '82543' })], 60);
   // human: the person's band, as before.
-  expect(human[0]).toStartWith(`\x1b[${USER_TURN_BAND_SGR}m`);
+  expect(human[0]).toStartWith('\x1b[48;5;235;38;5;252m'); // the person's band, dark token (literal — rule 11)
   // system: one dim line naming what woke the turn; the internal instruction is not shown.
   expect(system.slice(0, -1)).toEqual(['\x1b[2m↻ Resuming (scheduled check)\x1b[22m']);
   // agent: a paler band under «⇢ SEAT · intent · #id», never the person's «>» band.
   expect(plain(agent.slice(0, 2))).toEqual(['⇢ OP · request · #82543', '  #38031 리뷰 결과 반영해 줘']);
-  expect(agent.slice(0, 2).every((row) => row.startsWith(`\x1b[${AGENT_TURN_BAND_SGR}m`))).toBe(true);
-  expect(agent.some((row) => row.includes(USER_TURN_BAND_SGR))).toBe(false);
+  expect(agent.slice(0, 2).every((row) => row.startsWith('\x1b[48;5;60;97m'))).toBe(true);
+  expect(agent.some((row) => row.includes('48;5;235;38;5;252'))).toBe(false);
 });
 
 test('NO_COLOR keeps the glyphs: «>» for a person, «⇢ SEAT» and an indent for an agent, «↻» for the system', () => {

@@ -313,7 +313,7 @@ function releaseResumeBoundary(run: GraphRunState): string {
 }
 
 function assertReleaseCutCompatible(run: GraphRunState, requested: ReleaseRunInput): void {
-  const cut = run.nodes.find((node) => node.nodeId === 'version-release' && node.ok);
+  const cut = run.nodes.find((node) => (node.nodeId === 'cut-branch' || node.nodeId === 'version-release') && node.ok);
   const output = cut?.output && typeof cut.output === 'object' && !Array.isArray(cut.output)
     ? cut.output as Record<string, unknown> : lastJsonObject(cut?.output);
   if (!output || output.version !== requested.version || typeof output.commit !== 'string' || !/^[0-9a-f]{40}$/i.test(output.commit) ||
@@ -387,8 +387,8 @@ async function runUnattendedReleaseLocked(
   // Only a root — entry is version-release, no parent — may block or satisfy this launch.
   const priorRuns = runInventory.runs.filter((run) => run.graphId === 'release-loop'
     && run.parentRunId === undefined
-    && (run.entryNodeId === undefined || run.entryNodeId === 'version-release')
-    && run.path[0] === 'version-release'
+    && (run.entryNodeId === undefined || run.entryNodeId === 'version-release' || run.entryNodeId === 'cut-branch')
+    && (run.path[0] === 'version-release' || run.path[0] === 'cut-branch')
     && !!run.input && typeof run.input === 'object' && !Array.isArray(run.input)
     && (run.input as Record<string, unknown>).version === version);
   const completed = priorRuns.find((run) => run.status === 'done' || run.status === 'awaiting-approval');

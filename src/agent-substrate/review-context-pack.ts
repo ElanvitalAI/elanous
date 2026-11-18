@@ -63,6 +63,11 @@ export interface ReviewContextPackInput {
   rootDir?: string;
   decisionsDoc?: string;
   releaseDoc?: string;
+  /** DEAD-EXPORT-PREGATE 경고 JSON. 있으면 팩 본문 끝에 파일:줄로 붙인다. 없으면 생략. */
+  deadExportReportPath?: string;
+  /** 리뷰 대상 PR 의 head 커밋 OID(#38412 r5 — 전체 또는 단축). 주어지면 경고 리포트의 head 키와
+   *  대조해 다른 PR/head 의 낡은 리포트 재사용 오염을 막는다(레포 루트 고정 파일 문제). */
+  reviewHead?: string;
   gh?: ReviewContextPackGh;
   readFile?: (path: string) => string | undefined;
   now?: () => number;
@@ -126,6 +131,34 @@ export function spawnReviewContextPackGh(bin = 'gh'): ReviewContextPackGh {
       return { ok: false, stdout: '', error: reasonOf(error) };
     }
   };
+}
+
+/** 경고 JSON의 warnings[] 를 «파일:줄 이름» 으로. 파일이 없거나 깨지면 빈 목록(팩은 계속). */
+export function deadExportWarningLines(input: ReviewContextPackInput): string[] {
+  if (!input.deadExportReportPath) return [];
+  const text = makeReader(input)(input.deadExportReportPath);
+  if (!text) return [];
+  const parsed = parseJson(text) as { warnings?: unknown; head?: unknown; pr?: unknown } | undefined;
+  if (!parsed || !Array.isArray(parsed.warnings)) return [];
+  if (!deadExportReportMatches(parsed, input)) return [];
+  return parsed.warnings.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const row = item as { file?: unknown; line?: unknown; name?: unknown };
+    if (typeof row.file !== 'string' || typeof row.name !== 'string' || typeof row.line !== 'number') return [];
+    return [`${row.file}:${row.line} ${row.name}`];
+  });
+}
+
+/** 출처 키 대조(#38412 r5): 리포트에 박힌 head·pr 가 현재 리뷰와 다르거나 증명이 없으면
+ *  낡은 재사용으로 보고 경고를 버린다. head 는 단축/전체 OID 양쪽을 접두사로 비교한다. */
+function deadExportReportMatches(report: { head?: unknown; pr?: unknown }, input: ReviewContextPackInput): boolean {
+  if (typeof input.reviewHead === 'string' && input.reviewHead.length >= 7) {
+    const head = typeof report.head === 'string' ? report.head.toLowerCase() : '';
+    const expected = input.reviewHead.toLowerCase();
+    if (!head || !(expected.startsWith(head) || head.startsWith(expected))) return false;
+  }
+  if (typeof report.pr === 'string' && report.pr !== '' && input.pr !== report.pr) return false;
+  return true;
 }
 
 function makeReader(input: ReviewContextPackInput): (path: string) => string | undefined {
@@ -351,7 +384,14 @@ export function buildReviewContextPack(input: ReviewContextPackInput): ReviewCon
       return unmeasured(id, reasonOf(error));
     }
   });
+  const deadExportLines = deadExportWarningLines(input);
   const rendered = renderReviewContextPack(branches, input.capBytes ?? REVIEW_CONTEXT_PACK_CAP_BYTES);
+  if (deadExportLines.length > 0) {
+    const block = `\n### 죽은 export 경고\n${deadExportLines.join('\n')}\n`;
+    if (Buffer.byteLength(rendered.text + block, 'utf8') <= (input.capBytes ?? REVIEW_CONTEXT_PACK_CAP_BYTES)) {
+      rendered.text += block;
+    }
+  }
   const unmeasuredIds = new Set(rendered.unmeasuredBranchIds);
   const finalBranches = branches.map((branch) => unmeasuredIds.has(branch.id)
     ? unmeasuredBranch(branch, '6KB 상한 초과로 본문에 싣지 못함')

@@ -32,7 +32,7 @@ describe('podLaunchProviderOptions', () => {
   });
 
   test('only codex decides an account, and only grok carries the api-key opt-in', () => {
-    expect(podLaunchProviderOptions('openai-codex', { grokApiKeyOptIn: false })).toEqual({ account: 'team', provider: 'openai-codex' });
+    expect(podLaunchProviderOptions('openai-codex', { grokApiKeyOptIn: false })).toEqual({ account: 'default', provider: 'openai-codex' });
     expect(podLaunchProviderOptions('openai-codex', { explicitPodAccount: 'acct-2', grokApiKeyOptIn: false }))
       .toEqual({ account: 'acct-2', provider: 'openai-codex' });
     expect(podLaunchProviderOptions('grok', { grokApiKeyOptIn: true })).toEqual({ account: 'grok', provider: 'grok', grokApiKeyOptIn: true });

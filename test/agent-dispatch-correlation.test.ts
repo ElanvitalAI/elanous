@@ -80,6 +80,8 @@ function tailText(lines: number): string {
   return debug.tail(lines).join('\n');
 }
 
+// #38772: an Agent call without run_in_background runs in the background. The tests
+// below check a completed run, so they ask for the blocking call explicitly.
 describe('#7333 A0 — dispatch is pairable from the call site', () => {
   test('the returned cid is the SAME id stamped on the spawn record', async () => {
     const provider = fakeProvider([[{ type: 'text', delta: 'ok' }]]);
@@ -87,7 +89,7 @@ describe('#7333 A0 — dispatch is pairable from the call site', () => {
     debug.clear();
 
     const r = await dispatchAgent(
-      { description: 'pairing probe', prompt: 'p' },
+      { description: 'pairing probe', prompt: 'p', run_in_background: false },
       { provider, resolveAgentDef: () => stubDef },
     );
 
@@ -235,6 +237,7 @@ describe('#7333 A0 — dispatch is pairable from the call site', () => {
         subagent_type: 'value-investor',
         isolation: 'worktree',
         ...(name ? { name } : {}),
+        run_in_background: false,
       },
       { provider: fakeProvider([[{ type: 'text', delta: 'ok' }]]), resolveAgentDef: () => stubDef },
     );

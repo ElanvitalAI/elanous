@@ -43,12 +43,11 @@ describe('daemon-runtime ACP-path debug-bridge wire (M5 · 2026-05-14)', () => {
     expect(src).toMatch(/getActiveAcpFeedbackBroadcaster\s*\(/);
   });
 
-  test('always activates the bridge (no opt-in gate · per M5 decision)', () => {
-    // The PWA path gates on `?debug-tap=on`. iOS controls visibility
-    // client-side (Settings toggle + drawer) so we ship envelopes
-    // unconditionally and let the client filter. If this changes to
-    // an opt-in `_meta.elanous.debugTap` flag in a follow-up, update
-    // this test alongside the wire.
+  test('activates only for an explicit request from an operator (H-1 · 2026-11-18)', () => {
+    // Was always-on: every ACP response carried every daemon conversation's chat.* lines.
+    expect(src).toMatch(/readDebugTapRequest\s*\(\s*turnCtx\.promptMeta\s*\)/);
+    expect(src).toMatch(/debugEnvelopeAllowed\s*\(\s*turnCtx\.audience\s*,/);
+    expect(src).toMatch(/if\s*\(\s*broadcast\s*&&\s*debugAllowed\s*\)\s*{/);
     expect(src).toMatch(/debugBridge\??\.activate\s*\(\s*\)/);
   });
 
@@ -63,7 +62,7 @@ describe('daemon-runtime ACP-path debug-bridge wire (M5 · 2026-05-14)', () => {
     // Mirrors the M1-S guard at line 519 (`if (broadcast)`). Without
     // this guard, headless tests that construct a runtime without
     // booting `runAcpServer` would throw on every turn.
-    expect(src).toMatch(/if\s*\(\s*broadcast\s*\)\s*{/);
+    expect(src).toMatch(/if\s*\(\s*broadcast\s*&&\s*debugAllowed\s*\)\s*{/);
   });
 });
 

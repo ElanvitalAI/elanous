@@ -1694,6 +1694,45 @@ esac
       expect(urlResult.stderr).toContain('apps/pwa/out/index.html');
     } finally { server.stop(); }
   }, 180_000);
+  // OP #87487: the gate image's install.sh gets --pwa-optional (docker/harness/Dockerfile, set only by build.sh's gate
+  // layer). Same real package without apps/pwa/out, same real install.sh — only the flag differs.
+  test('OP-87487: --pwa-optional lets a real package without apps/pwa/out past the PWA check to bun add; without the flag it is exit 4 before bun add', () => {
+    const packed = fixture();
+    const source = packReal(packed);
+    const strippedDir = fixture();
+    const extracted = join(strippedDir, 'tree');
+    mkdirSync(extracted);
+    expect(tarSync(['-xzf', source, '-C', extracted]).status).toBe(0);
+    rmSync(join(extracted, 'package', 'apps', 'pwa', 'out'), { recursive: true, force: true });
+    const stripped = join(strippedDir, 'elanous.tgz');
+    expect(tarSync(['-czf', stripped, '-C', extracted, 'package']).status).toBe(0);
+    expect(tarSync(['-tzf', stripped, 'package/src/cli/self-update.ts']).status).toBe(0);
+    expect(tarSync(['-tzf', stripped, 'package/apps/pwa/out/index.html']).status).not.toBe(0);
+    const notice = 'ℹ PWA build not in package (apps/pwa/out/index.html) — --pwa-optional: installing without the web UI';
+    const refusal = '⛔ PWA build missing in package (apps/pwa/out/index.html) — current and install metadata were not changed. Build it first: bun bin/elanous.mjs nexus build';
+    const refused = run(['--no-modify-path', '--no-setup', '--source', stripped]);
+    expect(refused.result.status).toBe(4);
+    expect(refused.result.stderr).toContain(refusal);
+    expect(refused.result.stderr).not.toContain(notice);
+    expect(existsSync(join(refused.prefix, 'current'))).toBe(false);
+    expect(refused.fakeBunCalls.filter((call) => call[1] === 'add')).toEqual([]);
+    // The PWA check sits before bun add, so reaching bun add is the observation that the check passed. What follows
+    // (bootstrap of this fixture's install) is outside this flag and is not asserted.
+    const allowed = run(['--no-modify-path', '--no-setup', '--pwa-optional', '--source', stripped]);
+    expect(allowed.result.status, allowed.result.stderr).not.toBe(4);
+    expect(allowed.result.stderr).toContain(`${notice}\n`);
+    expect(allowed.result.stderr).not.toContain(refusal);
+    expect(allowed.fakeBunCalls.filter((call) => call[1] === 'add').map((call) => call.slice(1, 4))).toEqual([['add', '--no-save', '--ignore-scripts']]);
+  }, 180_000);
+
+  test('OP-87487: --pwa-optional is refused without a local --source package (URL · release download · checkout)', () => {
+    const message = '⛔ --pwa-optional needs --source PATH.tgz (a local package file)';
+    for (const args of [['--pwa-optional'], ['--pwa-optional', '--source', 'https://example.invalid/elanous.tgz']]) {
+      const done = run(['--no-modify-path', ...args], setup(), hostPathWithoutEln(), repoRoot,
+        { ELANOUS_INSTALL_SOURCE: '', ELANOUS_INSTALL_LANG: 'en' }).result;
+      expect(`${done.status}: ${done.stderr.trim()}`).toBe(`2: ${message}`);
+    }
+  });
   test('standalone installer rejects a checksum mismatch before creating current and reports both hashes', () => {
     const release = fixture();
     const assets = join(release, 'latest', 'download');

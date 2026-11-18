@@ -14,6 +14,7 @@ import { publishAtError } from './publish-at.js';
 import { validatedTuiRegress } from './tui-node-checks.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, signedT6KnownIssueGatePassed, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
 import { T6_PWA_WAIVER } from '../../src/graph-runner/release-pwa-known-issue.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 /** The approval output alone is not authority: the runner also stores a one-winner decision claim for this visit. */
 export function hasRecordedPublishApproval(context: GraphContext, root: string): boolean {
@@ -141,7 +142,7 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
   if (gate?.outcome !== 'ok' && !ownerWaivedGate && !signedT6KnownIssueGatePassed(context) && !emergencyGate)
     return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: gate outcome is not ok, explicitly owner-waived, or replaced by a same-run emergency gate' };
   const exactT6Pwa = context.runId === T6_PWA_WAIVER.runId && context.input.version === '0.3.15'
-    && context.outputs['version-release']?.commit === T6_PWA_WAIVER.cut;
+    && releaseCutRecord(context)?.commit === T6_PWA_WAIVER.cut;
   const pwaWaiverGate = hasRecordedPwaWaiver(context, approvalRoot) || exactT6Pwa;
   const signedPwa = pwaWaiverGate && signedT6PwaKnownIssue(context, approvalRoot);
   if (pwaWaiverGate && !signedPwa)

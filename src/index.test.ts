@@ -683,7 +683,8 @@ describe('agent-mission backend help', () => {
     const mission = agentMission.commands.find((command) => command.name() === 'mission')!;
     const backendOption = mission.options.find((option) => option.long === '--backend')!;
     const codexMirror = agentMission.commands.find((command) => command.name() === 'mirror')!;
-    expect(codexMirror.commands.map((command) => command.name())).toEqual(['push']);
+    // 2026-11-17 CRED-OWNER-RELOCATABLE d6a9bc53b42(#36853)가 mirror 아래 transfer-owner 를 더했다.
+    expect(codexMirror.commands.map((command) => command.name())).toEqual(['push', 'transfer-owner']);
     expect(codexMirror.commands[0]!.helpInformation()).toContain('<host>');
 
     for (const backend of agentBackendNames()) {
@@ -3091,11 +3092,13 @@ describe('self orchestrate CLI help tiers', () => {
     // 2026-10-05 PODPROVIDER — the harness child LLM choice reaches the Pod orchestrator (`--help-all` only).
     '--child-llm-provider', '--child-llm-model', '--child-llm-effort',
     '--repair-commit-only', '--parent-host-worker',
+    // 2026-11-17 TA-IMAGE-PIN-OVERRIDES-COMMIT 238fc407fe1(#38469)가 더한 하나 — pod 이미지 digest 핀.
+    '--pod-image-digest',
   ]);
 
   test('option contract set itself does not silently shrink', () => {
     // ⛔ 위 집합을 줄이면 `toEqual` 이 여전히 통과하므로 계약이 «조용히» 좁아진다. 수를 못 박는다.
-    expect(existingOptionNames.size).toBe(29);
+    expect(existingOptionNames.size).toBe(30);
   });
 
   async function help(...args: string[]): Promise<string> {

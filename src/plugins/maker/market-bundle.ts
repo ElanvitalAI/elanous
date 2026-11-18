@@ -80,7 +80,7 @@ export function bundleInstalledWizardPlugin(installedPath: string, outputDir: st
   try {
     const artifactKey = `${manifest.id}-${manifest.version}.tgz`;
     const artifact = join(target, artifactKey);
-    const tar = spawnSync('tar', ['-czf', artifact, '-C', source, '--', ...files], { encoding: 'utf8' });
+    const tar = spawnSync('tar', ['-czf', artifact, '-C', source, '--', ...files], { encoding: 'utf8', env: { ...process.env, COPYFILE_DISABLE: '1' } });
     if (tar.status !== 0 || tar.error) throw new Error(`market archive failed: ${tar.error?.message ?? tar.stderr}`);
     const bytes = readFileSync(artifact);
     const index: MarketplaceIndex = { name: 'elanous', interface: { displayName: 'Elanous' }, sequence: 1, plugins: [{

@@ -60,7 +60,8 @@ test('collects opted-in node and pending approval from persisted runs without ch
 
 async function runGraphNotifyCommand(root: string, dryRun = false) {
   return simCli(['graph', 'notify', ...(dryRun ? ['--dry-run'] : []), '--graphs-dir', join(root, 'graphs')], {
-    allowPaths: [['graph', 'notify']], stateRoot: root,
+    // A non-repository cwd: the CLI's real decision ledger would otherwise walk the host repo's origin/main reflog.
+    allowPaths: [['graph', 'notify']], stateRoot: root, cwd: root,
   });
 }
 

@@ -6,10 +6,11 @@
  * approval included), one input row, the status line and at least one conversation row must all fit. A panel alone
  * never removes it (#38392 r2 ①) — only a lack of rows does, and then the status line is the first thing to go.
  */
-export function keepBottomStatus(input: { readonly rows: number; readonly headerRows: number; readonly footerRows: number }): boolean {
+export function keepBottomStatus(input: { readonly rows: number; readonly headerRows: number; readonly footerRows: number; readonly statusRows?: number }): boolean {
   // 출처: #38392 r2 — one input row, the status row itself, and one row of conversation.
   const INPUT_ROWS = 1;
-  const STATUS_ROWS = 1;
+  // The status block is one row; the breathing separator above it adds a second (TUI-FOOTER-BREATHING-ROOM ①).
+  const STATUS_ROWS = input.statusRows ?? 1;
   const MIN_BODY_ROWS = 1;
   return input.rows - input.headerRows - input.footerRows - INPUT_ROWS - STATUS_ROWS >= MIN_BODY_ROWS;
 }

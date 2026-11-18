@@ -268,6 +268,33 @@ describe('createMcpProxyRuntime', () => {
     expect(authorizer.isGranted('remote', 'pay')).toBe(false);
   });
 
+  test('authorization checks remain valid when passed as callbacks', () => {
+    const authorizer = createMcpToolAuthorizer();
+    authorizer.grant({ serverId: 'remote', toolName: 'pay' });
+    const { isGranted, checkGrant } = authorizer;
+    expect(isGranted('remote', 'pay')).toBe(true);
+    expect(checkGrant('remote', 'pay')).toEqual({ granted: true });
+    expect(isGranted('remote', 'missing')).toBe(false);
+  });
+
+  test('expired authorization names the reason and never calls the remote tool', async () => {
+    let now = 1000;
+    const authorizer = createMcpToolAuthorizer({ now: () => new Date(now) });
+    authorizer.grant({ serverId: 'remote', toolName: 'pay', expiresAt: new Date(2000).toISOString() });
+    now = 3000;
+    let calls = 0;
+    const runtime = createMcpProxyRuntime({
+      serverId: 'remote',
+      mcpTool: { name: 'pay' },
+      client: { callTool: async () => { calls += 1; return { content: [] }; } },
+      authorizer,
+    });
+    const result = await runtime.run({}, { surface: 'mcp' });
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('expired');
+    expect(calls).toBe(0);
+  });
+
   test('authorization denial, transport failure, and server error have distinct classifications', async () => {
     const authorizer = createMcpToolAuthorizer();
     const denied = createMcpProxyRuntime({

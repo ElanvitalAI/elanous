@@ -12,8 +12,9 @@
  * Without --port a free port is taken; a --port that is already listening stops the run, and before the first page
  * connection the process listening on the port must be the Chrome this run spawned (same PID) — never another browser.
  *
- * Steps (screenshot + one line each): home → sign-up form → consent → «Google 로 가입» → fake Google → the member
- * home the API renders (/v1/members/home) → its status line, its handle step, and whether its buttons lead anywhere →
+ * Steps (screenshot + one line each): home → sign-up form → consent → «Google 로 가입» → fake Google → the site page
+ * the callback 303 lands on for a member with no handle yet (/members/): its handle step and the claim through its
+ * form → the member home the API renders (/v1/members/home): its status line and whether its buttons lead anywhere →
  * a device key ISSUED DIRECTLY IN THE WORLD'S MEMBER STORE (not through any HTTP route and not through
  * `eln member connect`'s browser approval — this sim proves neither) → the home again: connected status, the device
  * row, and the web chat entry. Only what the home shows for a member who has a key is measured.
@@ -186,45 +187,22 @@ try {
   await cdp.ev(`(() => { const c = document.querySelector('#signup input[type=checkbox]'); if (c && !c.checked) c.click(); return true; })()`);
   await cdp.ev(`(() => { const b = [...document.querySelectorAll('#signup button')].find((n) => /Google/.test(n.textContent)); b?.click(); return !!b; })()`);
   let at = await screen();
-  for (let i = 0; i < 30 && !at.url.includes('/v1/members/home'); i++) { await sleep(500); at = await screen(); }
-  // Production destination after a non-KCB sign-up (members-api.ts callback): the API-rendered member home.
-  await record('google-round-trip', at.url === `${API}/v1/members/home`, `landed on ${at.url}`);
+  // After a non-KCB sign-up whose member has no handle yet (members-api.ts callback), the 303 lands on the success
+  // redirect — the site page with the handle step. A member who already has a handle lands on the API home.
+  for (let i = 0; i < 30 && at.url !== `${SITE}/members/`; i++) { await sleep(500); at = await screen(); }
+  await record('google-round-trip', at.url === `${SITE}/members/`, `landed on ${at.url}`);
 
-  const home = await homeFacts();
-  const knows = home.status !== '' && !/확인하지 못했어요/.test(home.status);
-  await record('home-status', knows, `«${home.status}» · button «${home.primary}» → ${home.primaryHref} · cards ${home.cards.join(' · ')}`);
-  const hasHandleStep = home.cards.some((t) => /핸들/.test(t));
-  await record('handle-step', hasHandleStep, hasHandleStep ? 'handle step on the home page' : 'no handle step on this path (the site /members/ «가입 2/2» is not reached); an «내 앱 이름» card instead');
+  // The handle step on the site page the callback landed on: the page's own JS reads the member (no handle yet) and
+  // unhides its «핸들» section. Matched by the heading's own words, never the product's constant.
+  await sleep(3000);
+  const landing = await homeFacts();
+  const hasHandleStep = landing.cards.some((t) => /핸들/.test(t));
+  await record('handle-step', hasHandleStep, hasHandleStep
+    ? `handle step on the site page the callback landed on («${landing.cards.find((t) => /핸들/.test(t))}»)`
+    : 'no handle step heading on the site page the callback landed on');
 
-  for (const [name, target] of [['primary-target', home.primaryHref], ['brand-target', home.brandHref]] as const) {
-    await record(name, ...(await leadsSomewhere(target)));
-  }
-
-  // Device key: issued directly in the world's member store (createMemberKey). No HTTP route and no browser approval is
-  // exercised here — a real device gets its key from `eln member connect`'s PKCE approval (its own tests). The receipt
-  // says «store direct issue». The key value is never read.
+  // The handle claim through the site page's form (#handle-input → submit → PUT /v1/members/handle, in-process API).
   const member = [1, 0, 2].map((n) => world.memberStore.memberForGoogleSub(`fake-google-member-${n}`)).find(Boolean);
-  let connected = false;
-  if (member) { world.memberStore.createMemberKey(member.id, 'sim-terminal', undefined, () => {}); connected = true; }
-  await record('device-key-store-direct', connected, connected ? 'store direct issue (createMemberKey in the world store · no HTTP route · no browser approval · value not read)' : 'signed-up member not found in the store');
-  await cdp.send('Page.reload', {});
-  await sleep(2500);
-  const after = await homeFacts();
-  const linkedOk = /연결했어요/.test(after.status) && after.devices.some((row) => row.includes('sim-terminal'));
-  await record('home-linked', linkedOk, `«${after.status}» · button «${after.primary}» → ${after.primaryHref} · devices ${after.devices.join(' / ') || '-'}`);
-  const chat = after.links.find((link) => /웹채팅|채팅/.test(link.text));
-  await record('webchat-entry', chat !== undefined, chat ? `«${chat.text}» → ${chat.href}` : `no web chat link on the connected home (links: ${after.links.map((l) => l.text).join(' · ')})`);
-  if (chat) await record('webchat-target', ...(await leadsSomewhere(chat.href)));
-  // Where «엘라누스 시작하기» lands (the public site, read-only): is it a chat a member can type into?
-  if (after.primaryHref.startsWith(SITE)) {
-    await cdp.send('Page.navigate', { url: after.primaryHref });
-    await sleep(5000);
-    const landed = await cdp.ev<{ url: string; title: string; text: string; composer: boolean }>(`({ url: location.href, title: document.title,
-      text: document.body.innerText.replace(/\\s+/g, ' ').slice(0, 220), composer: !!document.querySelector('textarea, [contenteditable=true], input[type=text]') })`);
-    await record('start-lands', landed.composer, `${landed.url} · «${landed.title}» · composer ${landed.composer ? 'yes' : 'no'} · «${landed.text}»`);
-  }
-
-  // The handle step on the page «시작하기» led to (the public site's form; its PUT goes to the in-process API).
   const handleForm = await cdp.ev<boolean>(`!!document.getElementById('handle-form')`);
   if (handleForm) {
     await cdp.ev(`(() => { const i = document.getElementById('handle-input'); const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -235,7 +213,45 @@ try {
     const said = await cdp.ev<string>(`document.body.innerText.replace(/\\s+/g, ' ').slice(0, 240)`);
     await record('handle-claim', claimed === handle, `store handle = ${claimed ?? '-'} · page «${said}»`);
   } else {
-    await record('handle-claim', false, 'no #handle-form on the page «시작하기» led to');
+    await record('handle-claim', false, 'no #handle-form on the site page the callback landed on');
+  }
+
+  // The member home the API renders, after the claim: its status line and whether its buttons lead anywhere.
+  await cdp.send('Page.navigate', { url: `${API}/v1/members/home` });
+  await sleep(3000);
+  const home = await homeFacts();
+  const knows = home.status !== '' && !/확인하지 못했어요/.test(home.status);
+  await record('home-status', knows, `«${home.status}» · button «${home.primary}» → ${home.primaryHref} · cards ${home.cards.join(' · ')}`);
+
+  for (const [name, target] of [['primary-target', home.primaryHref], ['brand-target', home.brandHref]] as const) {
+    await record(name, ...(await leadsSomewhere(target)));
+  }
+
+  // Device key: issued directly in the world's member store (createMemberKey). No HTTP route and no browser approval is
+  // exercised here — a real device gets its key from `eln member connect`'s PKCE approval (its own tests). The receipt
+  // says «store direct issue». The key value is never read.
+  let connected = false;
+  if (member) { world.memberStore.createMemberKey(member.id, 'sim-terminal', undefined, () => {}); connected = true; }
+  await record('device-key-store-direct', connected, connected ? 'store direct issue (createMemberKey in the world store · no HTTP route · no browser approval · value not read)' : 'signed-up member not found in the store');
+  await cdp.send('Page.reload', {});
+  await sleep(2500);
+  const after = await homeFacts();
+  const linkedOk = /연결했어요/.test(after.status) && after.devices.some((row) => row.includes('sim-terminal'));
+  await record('home-linked', linkedOk, `«${after.status}» · button «${after.primary}» → ${after.primaryHref} · devices ${after.devices.join(' / ') || '-'}`);
+  const chat = after.links.find((link) => /웹채팅|채팅/.test(link.text));
+  // MEMBER-HOME-WEBCHAT-SERVING-GATE (#38799 · OP #92258): a linked member without a serving signal has no slot-host
+  // link to click — the entry is the member's own address with «곧 열림» (the retired terminal hint is gone).
+  const soonHint = await cdp.ev<boolean>(`(() => { const n = document.querySelector('[data-member-webchat-soon]'); return !!n && n.getClientRects().length > 0 && /내 주소: [^ ]+ \\(곧 열림\\)/.test((n.textContent ?? '').replace(/\\s+/g, ' ')); })()`);
+  await record('webchat-entry', linkedOk && !chat && soonHint,
+    `연결됐으나 웹채팅 미연동·«곧 열림» 주소 줄 노출 (chat ${chat ? `«${chat.text}» → ${chat.href}` : 'none'} · soon hint ${soonHint ? 'shown' : 'NOT shown'} · linked ${linkedOk ? 'yes' : 'no'})`);
+  if (chat) await record('webchat-target', ...(await leadsSomewhere(chat.href)));
+  // Where «엘라누스 시작하기» lands (the public site, read-only): is it a chat a member can type into?
+  if (after.primaryHref.startsWith(SITE)) {
+    await cdp.send('Page.navigate', { url: after.primaryHref });
+    await sleep(5000);
+    const landed = await cdp.ev<{ url: string; title: string; text: string; composer: boolean }>(`({ url: location.href, title: document.title,
+      text: document.body.innerText.replace(/\\s+/g, ' ').slice(0, 220), composer: !!document.querySelector('textarea, [contenteditable=true], input[type=text]') })`);
+    await record('start-lands', landed.composer, `${landed.url} · «${landed.title}» · composer ${landed.composer ? 'yes' : 'no'} · «${landed.text}»`);
   }
 
   // Back home: the app-name card and, once a slot exists, the web chat link.
@@ -269,7 +285,8 @@ try {
     const wordingOk = /이벤트\s*코드/.test(eventCodeLine.text) && /앱\s*주소/.test(eventCodeLine.text) && /가입/.test(eventCodeLine.text);
     await record('app-name-states-rule', wordingOk && eventCodeLine.visible && !formShown,
       `card «${eventCodeLine.text}» (${wordingOk ? 'names event code · app address · joining' : 'does NOT name event code · app address · joining'} · ${eventCodeLine.visible ? 'visible' : 'NOT visible'}) · name form ${formShown ? 'still shown' : 'hidden'}`);
-    await record('app-slot', false, 'no slot: this member joined without an event code (the product rule the card states)');
+    const noSlot = member ? world.memberStore.appSlotForMember(member.id) === null : false;
+    await record('app-slot', eventCodeLine.visible && !formShown && noSlot, `store slot = ${noSlot ? 'null' : 'not null'} · card rule shown · form hidden (card «${eventCodeLine.text}» · form ${formShown ? 'shown' : 'hidden'})`);
   } else if (appNameControls.length > 0) {
     await record('app-slot', false, `no app-name card control on the home: missing #${appNameControls.join(', #')}`);
   } else {
@@ -285,12 +302,15 @@ try {
     await record('app-slot', slot !== null, `store slot = ${slot ? slot.appSlug : '-'} · card «${cardSaid}»`);
   }
 
-  // The home once handle, device and slot all exist: is there a web chat link now, and where does it go?
+  // The home once handle and device exist (this member has no app slot, per «app-slot» above): the «곧 열림» address
+  // line — not a web chat link — stays the entry, the same rule as «webchat-entry» (MEMBER-HOME-WEBCHAT-SERVING-GATE #38799).
   await cdp.send('Page.reload', {});
   await sleep(2500);
   const ready = await homeFacts();
   const chatNow = ready.links.find((link) => /웹채팅|채팅/.test(link.text));
-  await record('webchat-entry-after-slot', chatNow !== undefined, chatNow ? `«${chatNow.text}» → ${chatNow.href}` : `no web chat link (links: ${ready.links.map((l) => `${l.text}→${l.href}`).join(' · ')})`);
+  const soonHintNow = await cdp.ev<boolean>(`(() => { const n = document.querySelector('[data-member-webchat-soon]'); return !!n && n.getClientRects().length > 0 && /내 주소: [^ ]+ \\(곧 열림\\)/.test((n.textContent ?? '').replace(/\\s+/g, ' ')); })()`);
+  await record('webchat-entry-after-slot', !chatNow && soonHintNow,
+    `연결·핸들 후에도 웹채팅 미연동·«곧 열림» 주소 줄 유지 (chat ${chatNow ? `«${chatNow.text}» → ${chatNow.href}` : 'none'} · soon hint ${soonHintNow ? 'shown' : 'NOT shown'})`);
   if (chatNow) await record('webchat-after-slot-target', ...(await leadsSomewhere(chatNow.href)));
 } catch (error) {
   steps.push({ step: 'aborted', pass: false, detail: String(error), url: '', shot: '' });

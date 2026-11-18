@@ -59,6 +59,8 @@ function harness(now: Date, result: LightRcResult = rc(), dirty = false) {
     shardPlan: () => ({ shards: 4, testFiles: 30, gatePlanShards: 4, resources: { cpus: 16, freeBytes: 12e9, totalBytes: 24e9 }, unmeasured: null }),
     git: (args) => { gitCalls.push(args.join(' ')); return { rc: 0, stdout: args[0] === 'status' ? dirty ? ' M file.ts\n' : '' : args[0] === 'rev-parse' ? '1234567890abcdef\n' : '' }; },
     leakCheck: () => ({ status: 0 }),
+    // Gate-path tests do not walk the real image prebuild; the RELEASE-REALPATH-PROBE test overrides this.
+    realpathProbe: () => ({ outcome: 'skipped', reason: 'probe not under test', stages: [] }),
     lightRc: async (version, checkout) => { expect(checkout).toBe('/fake/checkout'); calls.push(version); return result; },
     hardGate: async (version, checkout, sha) => {
       expect(checkout).toBe('/fake/checkout'); hardCalls.push(version);
@@ -114,6 +116,22 @@ test('cut minus five hours launches one pinned full Pod gate with twelve shards 
     hardGate: { outcome: 'regression', executor: 'pod', introduced: ['test/new.test.ts > new case'] } });
   expect(stamp(root, 'hard-5h')).toMatchObject({ hardGateRunId: runId, hardGateLog: join(root, 'release', schedule.version, 'rehearsal', `${runId}.log`) });
   expect(h.notifications.some(text => text.includes('hard gate regression') && text.includes('원격 Pod node-b · 12 shards'))).toBe(true);
+});
+
+test('RELEASE-REALPATH-PROBE: the hard-5h rehearsal walks the image-prebuild probe and a failed stage turns an ok gate into error', async () => {
+  const root = newRoot(), h = harness(at(300));
+  const seen: unknown[] = [];
+  h.deps.realpathProbe = (input) => {
+    seen.push(input);
+    return { outcome: 'failed', reason: 'build.sh exited 7: dependency layer broke', failedStage: 'build',
+      stages: [{ stage: 'clone', exit: 0, ok: true, reason: 'ok' }, { stage: 'build', exit: 7, ok: false, reason: 'build.sh exited 7: dependency layer broke' }] };
+  };
+  await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, podPool: 'k3d-probe:1' }, h.deps);
+  const runId = stamp(root, 'hard-5h').hardGateRunId;
+  expect(seen).toEqual([{ checkout: '/fake/checkout', commit: '1234567890abcdef', version: schedule.version, runId, pool: 'k3d-probe:1' }]);
+  expect(stamp(root, 'hard-5h')).toMatchObject({ outcome: 'error', hardGate: { outcome: 'ok' },
+    realpathProbe: { outcome: 'failed', failedStage: 'build', stages: [{ stage: 'clone', exit: 0 }, { stage: 'build', exit: 7 }] },
+    measurementGap: { cause: 'realpath probe failed at build · clone=0 build=7 · build.sh exited 7: dependency layer broke' } });
 });
 
 test('invalid pinned Pod result fails closed', async () => {
@@ -477,6 +495,19 @@ test('default twelve-hour mid-cycle hard gate uses the same pinned Pod path and 
   expect(second.hardCalls).toEqual([schedule.version]);
   expect(stamp(root, 'hard-5h')).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'node-b' } });
   expect(stamp(root, 'rc-7h').outcome).toBe('superseded');
+});
+
+test('hard-mid boots the VM before the realpath probe touches the checkout', async () => {
+  const root = newRoot(false), h = harness(at(720));
+  h.deps.hardIntervalHours = 12;
+  h.deps.realpathProbe = () => { h.cloudCalls.push('realpath-probe'); return { outcome: 'skipped', reason: 'probe not under test', stages: [] }; };
+  await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+  expect(stamp(root, 'hard-mid')).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'aws1' } });
+  const probeAt = h.cloudCalls.indexOf('realpath-probe');
+  expect(probeAt > -1).toBe(true);
+  const bootAt = h.cloudCalls.findIndex(call => call.startsWith('start:'));
+  expect(bootAt > -1).toBe(true);
+  expect(bootAt).toBeLessThan(probeAt);
 });
 
 test('hard rehearsal refuses a host result or wrong commit before it can mark a gate green', async () => {

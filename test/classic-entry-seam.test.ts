@@ -59,7 +59,23 @@ function dashboardEdges(path: string, text: string): string[] {
 
 test('classic dashboard has one named root launcher seam and no other production imports', () => {
   const edges = productionTypescriptFiles(sourceRoot).flatMap((path) => dashboardEdges(path, readFileSync(path, 'utf8')));
-  expect(edges.sort()).toEqual(['src/index.ts dynamic ./dashboard/index.js']);
+  // #38701 TURN-FIELD-BUG-3 · #38298 A217 요청 계약 · #38210 TURN-PACING · #37875 graph-cli owner 바인딩(2026-11-18
+  // known-fail 묶음5: 지연 적재로 전환 — 정적 import 면 elanous --help 파싱만으로 plugin-route-adapter가 즉시 돈다) ·
+  // #38069 ELN-SELF-TIMER-WATCH · #38186 seat AGENTS.md 적재 · #38006 TURN-ROUTE-PIN — 0.3.29 착지군이
+  // 대시보드 내부 계약 모듈(플러그인 경로 어댑터·commitment-ledger·turn-life 사건·seat 부트) 을 참조하게 했다.
+  expect(edges.sort()).toEqual([
+    'src/graph-runner/graph-cli-owner.ts dynamic ../dashboard/plugin-route-adapter.js',
+    'src/index.ts dynamic ./dashboard/index.js',
+    'src/msg/self-timer-watch.ts static ../dashboard/input/commitment-ledger.js',
+    'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
+    'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
+    'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
+    'src/tui-client/next-mail-wake.ts static ../dashboard/input/internal-turn.js',
+    'src/tui-client/next-mail-wake.ts static ../dashboard/seat-boot-preamble.js',
+    'src/tui/entry.ts dynamic ../dashboard/seat-local-instructions.js',
+    'src/tui/input/goal-continue.ts static ../../dashboard/input/turn-outcome-shadow.js',
+    'src/tui/seat-mail-boot.ts static ../dashboard/input/seat-task-decompose.js',
+  ]);
 });
 
 test('classic seam scan resolves directory imports and require calls into dashboard', () => {

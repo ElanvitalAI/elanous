@@ -25,6 +25,7 @@ import {
   type TurnStartSegments,
 } from './turn-start-segments.js';
 import type { Key } from '../tui.js';
+import type { ApprovalOutcome } from '../graph-runner/approval-outcome.js';
 import * as tuiOriginal from '../tui.js';
 import * as localChatTurnOriginal from '../tui-client/local-chat-turn.js';
 import * as localProviderCommandOriginal from '../tui-client/local-provider-command.js';
@@ -51,6 +52,9 @@ import { NEXT_TUI_ROUTE_REGISTRY, type NextTuiRoute } from './core/registry.js';
 import type { NextSidetabHandler } from './sidetab/nl-tool.js';
 import type { MessageBlock } from '../conv-substrate/message-block.js';
 import { TOOL_DONE_GLYPH, TOOL_RUNNING_GLYPH } from './chat/tool-activity.js';
+import { noteExternalEventOne, resetExternalEventOneWire } from './external-event-one-wire.js';
+import { globalTaskNotificationQueue } from '../agent/task-notification.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 
 // mock.module 복구용 원본 스냅샷 — 정적 import 가 먼저 실행되므로 mock 치환 전 실물이 담긴다.
 const restoreTui = { ...tuiOriginal };
@@ -136,7 +140,7 @@ let mockExecutionBadge: string | Error = '🧠 test-model';
 let messageBlocksForTurn: MessageBlock[] = [];
 let selfHealthListener: ((snapshot: import('../tui/chat/self-health-status.js').NextTuiSelfHealthSnapshot | null) => void) | null = null;
 let nextSidetabHandler: NextSidetabHandler | null = null;
-let shellApprovalHandler: ((command: string, callId: string) => Promise<boolean>) | null = null;
+let shellApprovalHandler: ((command: string, callId: string) => Promise<boolean | ApprovalOutcome>) | null = null;
 let shellApprovalCancelHandler: ((callId: string, reason: 'timeout' | 'turn-cancelled' | 'host-cancelled') => void) | null = null;
 const cliStderrEvents: Array<{ data: { source: string; exitCode: number; text: string; rawBase64: string; byteLength: number } }> = [];
 let isolatedTestStateRoot: string | undefined;
@@ -200,7 +204,7 @@ mock.module('../tui.js', () => ({
 
 mock.module('../tui-client/local-chat-turn.js', () => ({
   setNextSidetabHandler: (handler: NextSidetabHandler | null) => { nextSidetabHandler = handler; },
-  setNextTuiShellApprovalHandler: (handler: ((command: string, callId: string) => Promise<boolean>) | null) => { shellApprovalHandler = handler; },
+  setNextTuiShellApprovalHandler: (handler: ((command: string, callId: string) => Promise<boolean | ApprovalOutcome>) | null) => { shellApprovalHandler = handler; },
   setNextTuiShellApprovalCancelHandler: (handler: typeof shellApprovalCancelHandler) => { shellApprovalCancelHandler = handler; },
   runLocalChatTurn: async (
     sessionId: string,
@@ -608,7 +612,7 @@ test('narrow live status stays visible while the attachment page hint is active'
         `/attachments/${String.fromCharCode(97 + index).repeat(180)}.md`,
       ] as const),
     });
-    expect(replayPaintWrites(transcript).some((frame) => frame.includes('PgUp/PgDn') && frame.includes("running"))).toBe(true);
+    expect(replayPaintWrites(transcript).some((frame) => frame.includes('PgUp/PgDn') && frame.includes('Thinking'))).toBe(true);
   } finally {
     process.stdout.write = output;
   }
@@ -631,7 +635,7 @@ test('unrelated provider error containing Codex auth words stays generic on scre
     const screen = transcript.join('');
     expect(screen).toContain('요청을 처리하지 못했습니다.');
     expect(screen).not.toContain('Codex 인증이 준비되지 않았습니다');
-    expect(screen).toContain('↑ 이전 입력 후 Enter');
+    expect(screen).toContain('↑ recall input → Enter resend');
     expect(loadSession(session.id)?.messages.some((message) => message.replyFailure === true)).toBe(true);
     transcript.length = 0;
     mockLocalChatTurnError = undefined;
@@ -695,7 +699,7 @@ test.each(['basic', 'log'] as const)('%s focus paints classified assistant text 
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-    expect(streamingFrames.some((frame) => frame.includes('  첫 응답 델타') && frame.includes("Turn running"))).toBe(true);
+    expect(streamingFrames.some((frame) => frame.includes('첫 응답 델타') && frame.includes('Responding'))).toBe(true);
     expect(transcript.join('')).not.toContain('private-fixture-value-123456');
     expect(transcript.join('')).not.toContain('PRIVATE-CLIPBOARD');
     expect(replayPaintWrites(transcript).at(-1)).not.toContain('첫 응답 델타');
@@ -736,11 +740,11 @@ test('live assistant output estimates grow on deltas, ignore replace/diagnostics
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(turns).toBe(2);
-    expect(observed[0]).toContain("Output tokens est. 2");
-    expect(observed[1]).toContain("Output tokens est. 3");
-    expect(observed[2]).toContain("Output tokens est. 3");
+    expect(observed[0]).toContain('est.2t');
+    expect(observed[1]).toContain('est.3t');
+    expect(observed[2]).toContain('est.3t');
     expect(observed[2]).not.toContain('PRIVATE diagnostic');
-    expect(observed[3]).toContain("Output tokens est. 2");
+    expect(observed[3]).toContain('est.2t');
   } finally {
     process.stdout.write = output;
   }
@@ -771,10 +775,10 @@ test('streaming partial measured usage keeps the input count and growing output 
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-    expect(observed[0]).toContain("Tokens 77/est.2");
-    expect(observed[0]).toContain("Turn running");
-    expect(observed[1]).toContain("Tokens 77/est.3");
-    expect(observed[2]).toContain("Tokens 77/0");
+    expect(observed[0]).toContain('77/est.2t');
+    expect(observed[0]).toContain('Responding');
+    expect(observed[1]).toContain('77/est.3t');
+    expect(observed[2]).toContain('77/0t');
     expect(observed[2]).not.toContain("est.");
   } finally {
     process.stdout.write = output;
@@ -990,7 +994,7 @@ test('risky Bash approval is an inline prompt and only a human y dispatch decisi
   const session = createSession({ source: 'tui' });
   setActiveSessionId(session.id);
   const riskyCommand = `rm -rf /tmp/demo && printf '${'x'.repeat(2_000)}' && echo NT_SW1_END`;
-  const decisions: boolean[] = [];
+  const decisions: Array<boolean | ApprovalOutcome> = [];
   duringTurnHook = async () => {
     const pending = shellApprovalHandler?.(riskyCommand, 'pty-approval-1') ?? Promise.resolve(false);
     await Promise.resolve();
@@ -1010,7 +1014,7 @@ test('risky Bash approval is an inline prompt and only a human y dispatch decisi
     expect(frame).toContain('rm -rf /tmp/demo');
     expect(frame).toContain('NT_SW1_END');
     expect(frame).toContain("Enter default N");
-    expect(decisions).toEqual([true]);
+    expect(decisions).toEqual([{ approved: true }]);
   } finally {
     process.stdout.write = output;
   }
@@ -1022,7 +1026,7 @@ test('Bash approval timeout closes the prompt and resolves as denied', async () 
   Object.defineProperty(process.stdout, 'rows', { value: 30, configurable: true });
   const session = createSession({ source: 'tui' });
   setActiveSessionId(session.id);
-  const decisions: boolean[] = [];
+  const decisions: Array<boolean | ApprovalOutcome> = [];
   duringTurnHook = async () => {
     decisions.push(await (shellApprovalHandler?.('rm -rf /tmp/timeout', 'pty-timeout-1') ?? Promise.resolve(false)));
     enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
@@ -1034,7 +1038,7 @@ test('Bash approval timeout closes the prompt and resolves as denied', async () 
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', shellApprovalTimeoutMs: 5 });
     const frame = transcript.join('');
-    expect(decisions).toEqual([false]);
+    expect(decisions).toEqual([{ approved: false, reason: 'timeout' }]);
     expect(frame).toContain("Bash approval timed out · denied");
     expect(frame.lastIndexOf("Bash approval timed out · denied")).toBeGreaterThan(frame.lastIndexOf("Bash approval · Full command"));
   } finally {
@@ -1048,7 +1052,7 @@ test('child timeout cancels its request id and overrides a delayed host approval
   Object.defineProperty(process.stdout, 'rows', { value: 30, configurable: true });
   const session = createSession({ source: 'tui' });
   setActiveSessionId(session.id);
-  const decisions: boolean[] = [];
+  const decisions: Array<boolean | ApprovalOutcome> = [];
   duringTurnHook = async () => {
     const pending = shellApprovalHandler?.('rm -rf /tmp/late-reply', 'pty-race-1') ?? Promise.resolve(false);
     await Promise.resolve();
@@ -1064,7 +1068,7 @@ test('child timeout cancels its request id and overrides a delayed host approval
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const frame = transcript.join('');
-    expect(decisions).toEqual([true]);
+    expect(decisions).toEqual([{ approved: true }]);
     expect(frame).toContain("Bash approval timed out · denied");
     expect(frame.lastIndexOf("Bash approval timed out · denied")).toBeGreaterThan(frame.lastIndexOf("Bash command approved"));
   } finally {
@@ -1146,7 +1150,7 @@ test('empty Enter keeps the queued turn while a non-shell tool is running', asyn
     mockToolSnapshot = [{ id: 'read-1', name: 'Read' }];
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
     enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
-    for (let tries = 0; tries < 100 && !transcript.join('').includes("running · Send queued input when done"); tries++) await Bun.sleep(10);
+    for (let tries = 0; tries < 100 && !transcript.join('').includes('1 queued'); tries++) await Bun.sleep(10);
     interruptedDuringTool = signal.aborted;
     toolActivityHandler?.({ phase: 'finish', id: 'read-1', name: 'Read' });
     enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
@@ -1158,7 +1162,7 @@ test('empty Enter keeps the queued turn while a non-shell tool is running', asyn
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(interruptedDuringTool as boolean | null).toBe(false);
-    expect(transcript.join('')).toMatch(/Turn running .*Queue 1 · Bg 0/);
+    expect(transcript.join('')).toContain('1 queued');
     expect(transcript.join('')).not.toContain('실행 중인 도구 Read');
   } finally {
     process.stdout.write = output;
@@ -1256,10 +1260,10 @@ test('Enter and Space cycle every available MessageBlock detail tier through the
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     const frame = transcript.join('');
-    expect(frame).toContain('▸ 생각 · fold cycle summary');
-    expect(frame).toContain('▾ 생각 · fold cycle summary');
+    expect(frame).toContain('▸ thought · fold cycle summary');
+    expect(frame).toContain('▾ thought · fold cycle summary');
     expect(frame).toContain('detail step');
-    expect(frame).toContain('원문 참조 대기');
+    expect(frame).toContain('awaiting raw reference');
   } finally {
     process.stdout.write = output;
   }
@@ -1513,7 +1517,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
         sidetabMode: 'off',
         harnessRunner: async () => { runnerCalls += 1; },
       });
-      expect(transcript.join('')).toContain('사용법: /harness ask <목표> · /harness runs');
+      expect(transcript.join('')).toContain('Usage: /harness ask <goal> · /harness runs');
       expect(runnerCalls).toBe(0);
       expect(turnsSeen).toEqual([]);
     } finally {
@@ -1637,10 +1641,10 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     submittedInputs.push('/side workspaces');
     try {
       await showNextTui({ resumeSessionId: original.id });
-      const workspaceFrames = replayPaintWrites(transcript).filter((frame) => frame.includes('미션 ·'));
+      const workspaceFrames = replayPaintWrites(transcript).filter((frame) => frame.includes('Mission ·'));
       expect(workspaceFrames.some((frame) => !frame.includes('WORKSPACE_CHILD'))).toBe(true);
       expect(workspaceFrames.some((frame) => frame.includes('WORKSPACE_CHILD'))).toBe(true);
-      expect([...workspaceFrames].reverse().find((frame) => frame.includes('미션 ·'))).not.toContain('WORKSPACE_CHILD');
+      expect([...workspaceFrames].reverse().find((frame) => frame.includes('Mission ·'))).not.toContain('WORKSPACE_CHILD');
       expect(attachRequests).toEqual([]);
     } finally {
       debug.log = originalLog;
@@ -1943,10 +1947,10 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     try {
       await showNextTui({ resumeSessionId: createSession().id });
       const rendered = transcript.join('');
-      expect(rendered).toContain('초안: CSV 내보내기');
+      expect(rendered).toContain('Draft: CSV 내보내기');
       expect(rendered).toContain('name: fixture');
       expect(rendered).toContain('저장 여부를 “네” 또는 “아니오”로 답해 주세요.');
-      expect(rendered).toContain('초안을 보존했습니다.');
+      expect(rendered).toContain('Draft preserved.');
       expect(rendered).toContain('플러그인 저장 완료: plugin-fixture');
       expect(requests).toEqual([
         { path: '/v1/graphs/wizard', body: { prompt: 'CSV를 내보내는 플러그인' } },
@@ -2061,7 +2065,7 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     try {
       await showNextTui({ resumeSessionId: createSession().id, sidetabMode: 'off' });
       expect(transcript.join('')).toContain('현재 맥락 조회 중');
-      expect(transcript.join('')).toContain('현재 맥락 조회 취소됨');
+      expect(transcript.join('')).toContain('Current-context query cancelled');
       expect(turnsSeen).toEqual([]);
     } finally {
       process.stdout.write = output;
@@ -2566,9 +2570,134 @@ test('detail view retains a completed tool activity when no matching result was 
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
-    expect(replayPaintWrites(transcript).some((frame) => frame.includes("Turn log")
+    expect(replayPaintWrites(transcript).some((frame) => frame.includes('● log ')
       && frame.includes(`${TOOL_DONE_GLYPH} Read(notes.txt)`))).toBe(true);
   } finally {
     process.stdout.write = output;
   }
+});
+
+describe('ELN-SEAT-IDLE-QUEUE-STALL — idle ∧ queued drains through the real input loop', () => {
+  const CTRL_Q: Key = { name: 'q', ctrl: true, shift: false, raw: '\x11' };
+  const ENTER: Key = { name: 'enter', ctrl: false, shift: false, raw: '\r' };
+
+  /** Runs showNextTui with queue events captured; ends the TUI once `turns` chat turns have run. */
+  async function runLoop(turns: number, body: () => void, options: Parameters<typeof showNextTui>[0] = {}) {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const session = createSession({ source: 'tui' });
+    setActiveSessionId(session.id);
+    const queueEvents: string[] = [];
+    const savedLog = debug.log;
+    debug.log = ((category: string, event: string, data?: unknown, extra?: unknown) => {
+      if (category === 'queue') queueEvents.push(event);
+      return (savedLog as (...args: unknown[]) => void).call(debug, category, event, data, extra);
+    }) as typeof debug.log;
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    const outerHook = duringTurnHook;
+    duringTurnHook = async (signal, emit, onUsage) => {
+      await outerHook?.(signal, emit, onUsage);
+      if (turnTextsSeen.length >= turns) keysAfterTurn = [CTRL_Q];
+    };
+    // Safety net: a stalled queue never opens the expected turns — close the TUI so the assertion (not a hang) reports it.
+    const guard = setTimeout(() => enqueueReadKey(CTRL_Q), 6_000);
+    try {
+      body();
+      await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off', queueIdleStallMs: 50, ...options });
+    } finally {
+      clearTimeout(guard);
+      debug.log = savedLog;
+      process.stdout.write = output;
+    }
+    return { queueEvents };
+  }
+
+  test('a plan item saved before the restart opens its own turn with no key pressed (boot · existing state)', async () => {
+    resetExternalEventOneWire();
+    const root = isolatedTestStateRoot!;
+    const home = join(root, 'home');
+    mkdirSync(join(home, 'elanous-hq', 'seat-state', 'QSTALL'), { recursive: true });
+    const seatCwd = join(root, 'seats', 'QSTALL');
+    mkdirSync(seatCwd, { recursive: true });
+    const planDir = join(elanousStateRoot(), 'seat-plans');
+    mkdirSync(planDir, { recursive: true });
+    writeFileSync(join(planDir, 'QSTALL.json'), JSON.stringify({ absorbedUpTo: 0, items: [{
+      id: 'task-1', seq: 1, title: '재시작 전에 저장된 항목', priority: 'normal', deps: [], sourceRequestId: 'mail#41',
+      sourceText: '재시작 전에 저장된 항목', status: 'active',
+    }] }));
+    const { queueEvents } = await runLoop(1, () => {}, { seatPlanBootForTest: { cwd: seatCwd, home } });
+    expect(turnTextsSeen).toHaveLength(1);
+    expect(turnTextsSeen[0]).toContain('[계획] 재시작 전에 저장된 항목');
+    // Either the boot kick reached the loop, or (this test terminal refuses a key nobody reads yet) it was refused,
+    // said so, and the watchdog woke the loop one window later.
+    expect(queueEvents.includes('boot-wake')
+      || (queueEvents.includes('boot-wake-refused') && queueEvents.includes('idle-stall-wake'))).toBe(true);
+  }, 10_000);
+
+  test('a refused notice (already in the event ledger) does not strand the item behind it', async () => {
+    resetExternalEventOneWire();
+    // The first notice this queue makes is q1 — the ledger already holds q1, so its dispatch is refused as a duplicate.
+    noteExternalEventOne({ id: 'q1', text: '이미 받은 알림', source: 'harness-child' });
+    duringTurnHook = () => {
+      if (turnTextsSeen.length !== 1) return;
+      for (const label of ['거부될-자식', '뒤에-선-자식']) {
+        globalTaskNotificationQueue.enqueue({ taskId: `qstall-${label}`, agentName: 'worker', label, state: 'done', output: 'ok', truncated: false, durationMs: 1, finishedAt: 1_700_000_000_000 });
+      }
+    };
+    try {
+      keys.push(ENTER);
+      submittedInputs.push('first typed turn');
+      const { queueEvents } = await runLoop(2, () => {});
+      expect(turnTextsSeen).toHaveLength(2);
+      expect(turnTextsSeen[0]).toBe('first typed turn');
+      expect(turnTextsSeen[1]).toContain('뒤에-선-자식');
+      expect(turnTextsSeen.join('\n')).not.toContain('거부될-자식');
+      expect(queueEvents).toContain('idle-stall-wake');
+    } finally {
+      globalTaskNotificationQueue.clear();
+      resetExternalEventOneWire();
+    }
+  }, 10_000);
+
+  test('two notices landing at the same instant just before the turn ends both open, in order', async () => {
+    resetExternalEventOneWire();
+    duringTurnHook = () => {
+      if (turnTextsSeen.length !== 1) return;
+      for (const label of ['동시-첫째', '동시-둘째']) {
+        globalTaskNotificationQueue.enqueue({ taskId: `qstall-${label}`, agentName: 'worker', label, state: 'done', output: 'ok', truncated: false, durationMs: 1, finishedAt: 1_700_000_000_000 });
+      }
+    };
+    try {
+      keys.push(ENTER);
+      submittedInputs.push('typed turn before two notices');
+      await runLoop(3, () => {});
+      expect(turnTextsSeen).toHaveLength(3);
+      expect(turnTextsSeen[1]).toContain('동시-첫째');
+      expect(turnTextsSeen[2]).toContain('동시-둘째');
+    } finally {
+      globalTaskNotificationQueue.clear();
+      resetExternalEventOneWire();
+    }
+  }, 10_000);
+
+  test('a failed turn still lets the notice that arrived during it open next', async () => {
+    resetExternalEventOneWire();
+    mockLocalChatTurnError = 'provider refused the request';
+    duringTurnHook = () => {
+      if (turnTextsSeen.length !== 1) return;
+      globalTaskNotificationQueue.enqueue({ taskId: 'qstall-after-failure', agentName: 'worker', label: '실패-뒤-알림', state: 'done', output: 'ok', truncated: false, durationMs: 1, finishedAt: 1_700_000_000_000 });
+    };
+    try {
+      keys.push(ENTER);
+      submittedInputs.push('this turn fails');
+      await runLoop(2, () => {});
+      expect(turnTextsSeen).toHaveLength(2);
+      expect(turnTextsSeen[1]).toContain('실패-뒤-알림');
+    } finally {
+      globalTaskNotificationQueue.clear();
+      resetExternalEventOneWire();
+    }
+  }, 10_000);
 });

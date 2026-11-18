@@ -46,7 +46,7 @@ function classify(row: LogStoreRow): { kind: 'host'; data: Record<string, unknow
 
 export interface DailyUsageRow extends Metrics {
   day: string; hour: string; role: string; stage: string; account: string; model: string;
-  billingProvider: string; billing: string; site: string; hostId: string;
+  billingProvider: string; billing: string; site: string; hostId: string; seat: string;
 }
 export interface UsageDailyRead {
   rows: DailyUsageRow[];
@@ -78,13 +78,13 @@ export function readUsageDaily(path = logsDbPath(), sinceDay?: string): UsageDai
         const hour = new Date(row.ts_ms).toISOString().slice(0, 13);
         const day = hour.slice(0, 10);
         const dimensions = [label(data.role), label(data.stage), label(data.account), label(data.model),
-          label(data.billingProvider ?? data.provider), label(data.billing), label(data.site), label(data.hostId ?? row.host_id)];
+          label(data.billingProvider ?? data.provider), label(data.billing), label(data.site), label(data.hostId ?? row.host_id), label(data.seat)];
         const key = JSON.stringify([hour, ...dimensions]);
         let value = groups.get(key);
         if (!value) {
-          const [role, stage, account, model, billingProvider, billing, site, hostId] = dimensions;
+          const [role, stage, account, model, billingProvider, billing, site, hostId, seat] = dimensions;
           value = { day, hour, role: role!, stage: stage!, account: account!, model: model!, billingProvider: billingProvider!,
-            billing: billing!, site: site!, hostId: hostId!, ...ZERO };
+            billing: billing!, site: site!, hostId: hostId!, seat: seat!, ...ZERO };
           groups.set(key, value);
         }
         const delta = metrics(data);

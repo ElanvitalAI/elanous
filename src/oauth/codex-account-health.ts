@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { loadTokens } from './store.js';
 
 function recordPath(storePath: string, storeKey: string, credentialFingerprint: string): string {
@@ -36,7 +36,7 @@ export function recordCodexUnauthorized(storePath: string, storeKey: string, ref
 
 export function isCodexUnauthorized(
   storePath: string, storeKey: string, refreshToken: string,
-  defaultStorePath = join(homedir(), '.elanous', 'auth.json'),
+  defaultStorePath = join(prodInstanceRoot(), 'auth.json'),
 ): boolean {
   if (!refreshToken) return false;
   // The selected credential may live in the default auth root while the caller uses a config root.

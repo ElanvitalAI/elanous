@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
+import { llmNetworkFetch } from './llm-network-fetch.js';
 import { env } from './env.js';
 import type { SttEngine, TranscribeResult } from './types.js';
 

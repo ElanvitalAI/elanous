@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Ops-ledger native tools — 우편(msg) · 판(release checklist) ──
 //
@@ -251,7 +252,9 @@ export async function dispatchMsgList(rawArgs: Record<string, unknown>, deps: Ms
   const store = deps.openStore?.() ?? openMsgStore();
   try {
     const start = after ?? (rawArgs.includeAcknowledged === true ? 0 : store.getCursor(to));
-    const messages = store.list(to, start, limit);
+    // includeAcknowledged or an explicit `after` reads history: per-message acks — now also written by MsgAck's «seen» (§4c) —
+    // must not hide it. The default (from the cursor) still shows only what is not acknowledged.
+    const messages = store.list(to, start, limit, { includeAcked: rawArgs.includeAcknowledged === true || after !== undefined });
     return {
       output: `MsgList ${to}: ${messages.length} message(s) after #${start}`,
       ok: true,
@@ -303,17 +306,29 @@ export async function dispatchMsgPost(rawArgs: Record<string, unknown>, deps: Ms
     ...(rawArgs.replyTo === undefined || rawArgs.replyTo === null || rawArgs.replyTo === 0
       ? {} : { replyTo: integerArg(rawArgs.replyTo, 'replyTo', 1, Number.MAX_SAFE_INTEGER) }),
   });
+  // #38516 r2 MF3: recovery names THIS attempt's commit by its token — never an older identical row.
+  const attemptToken = randomUUID();
   const store = deps.openStore?.() ?? openMsgStore();
+  let posted: Message;
   try {
-    const posted = store.post(envelope);
-    return {
-      output: `MsgPost #${posted.id} ${posted.from} → ${posted.to}`,
-      ok: true,
-      message: posted,
-    };
+    // ELN-MSG-POST-IDEMPOTENT: the sender idempotency key — a retried identical post returns the stored message.
+    try { posted = store.post(envelope, { dedupe: true, attemptToken }); }
+    catch (error) {
+      // Ambiguous write (lock/I-O around COMMIT): read by the key before calling it a failure. A validation refusal
+      // stored nothing — rethrow it unread.
+      if (!/database is locked|SQLITE_BUSY|SQLITE_IOERR|disk I\/O|database is busy/i.test(error instanceof Error ? error.message : String(error))) throw error;
+      const landed = (() => { try { return store.findPostByAttempt(attemptToken); } catch { return null; } })();
+      if (landed === null) throw error;
+      posted = landed;
+    }
   } finally {
-    store.close();
+    try { store.close(); } catch { /* the write already committed or already failed; closing never changes that */ }
   }
+  return {
+    output: `MsgPost #${posted.id} ${posted.from} → ${posted.to}${posted.deduped ? ' · deduped: already stored, no new row' : ''}`,
+    ok: true,
+    message: posted,
+  };
 }
 
 // ── MsgAck ──────────────────────────────────────────────────────────────────
@@ -348,7 +363,8 @@ export async function dispatchMsgAck(rawArgs: Record<string, unknown>, deps: Msg
   const cursor = integerArg(rawArgs.id, 'id', 0, Number.MAX_SAFE_INTEGER);
   const store = deps.openStore?.() ?? openMsgStore();
   try {
-    const acknowledged = store.ack(to, cursor);
+    // ELN-SEAT-LIVE 11-18: the tool's ack leaves «seen» like the CLI's (#38305) — it used to move the cursor only.
+    const acknowledged = store.ackThroughSeen(to, cursor, 'tool-ack');
     return {
       output: `MsgAck ${to} acknowledged through #${acknowledged}`,
       ok: true,

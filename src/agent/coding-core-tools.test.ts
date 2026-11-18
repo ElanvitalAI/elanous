@@ -241,12 +241,13 @@ describe('tool profile invariants on the real CLI tool list', () => {
     expect(coding.removed.length).toBeGreaterThan(0);
   });
 
-  // CHILD-TOOL-PROFILE-TRIM — 10-10 실측 27개(스키마 26,742자) → 코딩 도구 9개만 남는다.
-  test('coding on the real CLI list (Plan on) leaves exactly the nine coding tools', async () => {
+  // CHILD-TOOL-PROFILE-TRIM — 10-10 실측 27개(스키마 26,742자) → 코딩 도구만 남는다.
+  // 2026-11-18 FIRECRAWL #38324가 코딩 프로필에 firecrawl 을 더했다(9→10).
+  test('coding on the real CLI list (Plan on) leaves exactly the ten coding tools', async () => {
     const { applyToolProfile, parseToolProfile } = await import('./tool-profile.js');
     const all = buildCliAgentTools(undefined, { sessionId: 'trim-probe', emitFeedback: () => {} }, process.cwd()).specs;
     const coding = applyToolProfile(all, parseToolProfile('coding'));
-    expect(coding.tools!.map((t) => t.name).sort()).toEqual(['Bash', 'Edit', 'Glob', 'Grep', 'ListDir', 'MarkStepDone', 'Plan', 'Read', 'Write']);
+    expect(coding.tools!.map((t) => t.name).sort()).toEqual(['Bash', 'Edit', 'Glob', 'Grep', 'ListDir', 'MarkStepDone', 'Plan', 'Read', 'Write', 'firecrawl']);
     expect([...coding.tools!.map((t) => t.name), ...coding.removed].sort()).toEqual(all.map((s) => s.name).sort());
   });
 });

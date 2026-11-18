@@ -1,5 +1,5 @@
 import { basename, join } from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { expect, test } from 'bun:test';
 import { requestEls } from '../els/client.js';
@@ -20,13 +20,13 @@ test('real terminal: bare els on an empty state dir → server started, first sc
       args: [BIN, '--test-state-dir', '{root}', 'side'],
       root, rows: 24, cols: 100,
       env: { SHELL: '/bin/sh', NODE_ENV: 'development' },
-      ready: { label: 'first-screen', timeoutMs: 30_000, until: (screen) => screen.split('\n').some((line) => line.includes('▾') && line.includes(folder) && line.includes('│') && line.includes('$')) }, // 출처: #37153 live PTY readiness bound
+      ready: { label: 'first-screen', timeoutMs: 30_000, until: (screen) => screen.includes(`${folder} · 1`) && screen.includes('+ new · ≡ menu') && screen.split('\n').some((line) => line.includes('│') && line.includes('$')) }, // 출처: #37153 live PTY readiness bound
       steps: [
         { label: 'typed-into-pane', text: 'echo APP_$((6*7))_OK', until: (screen) => screen.split('\n').some((line) => line.includes('│APP_42_OK')), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
-        { label: 'second-pane', keys: '\u0002c', until: (screen) => screen.split('\n').filter((line) => /^ {4}[●○] /.test(line)).length === 2, timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
+        { label: 'second-pane', keys: '\u0002c', until: (screen) => screen.includes(`${folder} · 2`), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
         { label: 'back-to-first', keys: '\u0002k', until: (screen) => screen.split('\n').some((line) => line.includes('│APP_42_OK')), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
         { label: 'close-asks', keys: '\u0002x', until: (screen) => screen.includes('닫기?'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
-        { label: 'close-yes', keys: 'y', until: (screen) => screen.split('\n').filter((line) => /^ {4}[●○] /.test(line)).length === 1, timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
+        { label: 'close-yes', keys: 'y', until: (screen) => screen.includes(`${folder} · 1`), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
       ],
       quitKeys: '\u0002q',
     });
@@ -52,7 +52,8 @@ test('real terminal: an elanous chat pane survives the side-list toggle and a fu
   writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
   let pid = 0;
   const env = { SHELL: '/bin/sh', NODE_ENV: 'development', ELANOUS_CONFIG_DIR: root, ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' };
-  const sideListShown = (screen: string): boolean => screen.split('\n').some((line) => line.includes('▾'));
+  // ELS-ONE-SPACE: the open list is the folded space list, which always ends with «+ new · ≡ menu».
+  const sideListShown = (screen: string): boolean => screen.includes('+ new · ≡ menu');
   try {
     const first = await mockSeatPtySequence({
       executable: process.execPath,
@@ -91,3 +92,41 @@ test('real terminal: an elanous chat pane survives the side-list toggle and a fu
     rmSync(root, { recursive: true, force: true });
   }
 }, 240_000);
+
+// ELS-ONE-SPACE ① (OP 11-18 live measure): the herdr panes are in the full-screen list too — «⇄herdr <workspace>» under this host's
+// own — and a selected one shows its screen read-only; typing into it is refused with the way in (`els do`).
+test('real terminal: bare els lists the herdr panes under ⇄herdr, shows a selected one read-only and refuses typing into it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'els-fed-'));
+  let pid = 0;
+  try {
+    // A fake `herdr`: `api snapshot` answers in herdr 0.9.1's real shape, `pane read` prints a marker screen.
+    const fakeHerdr = join(root, 'herdr');
+    const snapshot = { id: 'cli:api:snapshot', result: { snapshot: { workspaces: [{ workspace_id: 'w1', label: 'HERDR_WS' }], tabs: [],
+      panes: [{ pane_id: 'w1:p2', tab_id: 'w1:t2', workspace_id: 'w1', agent_status: 'idle', display_agent: 'HERDR_PANE', cwd: '/h' }] } } };
+    writeFileSync(fakeHerdr, `#!/bin/sh\nif [ "$1" = "api" ]; then cat <<'JSON'\n${JSON.stringify(snapshot)}\nJSON\nelse echo HERDR_READ_SCREEN; fi\n`);
+    chmodSync(fakeHerdr, 0o755);
+    const run = await mockSeatPtySequence({
+      executable: process.execPath,
+      args: [BIN, '--test-state-dir', '{root}', 'side'],
+      root, rows: 24, cols: 100,
+      env: { SHELL: '/bin/sh', NODE_ENV: 'development', HERDR_ENV: '1', HERDR_BIN_PATH: fakeHerdr },
+      ready: { label: 'first-screen', timeoutMs: 30_000, until: (screen) => screen.split('\n').some((line) => line.includes('│') && line.includes('$')) }, // 출처: #37153 live PTY readiness bound
+      steps: [
+        { label: 'herdr-in-list', text: '', until: (screen) => screen.includes('⇄herdr HERDR_WS · 1'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
+        { label: 'select-herdr', keys: '\u0002w', until: (screen) => screen.includes('HERDR_READ_SCREEN') && screen.includes('읽기 전용'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls
+        { label: 'typing-refused', keys: 'rm -rf x', until: (screen) => screen.includes('pane 은 읽기 전용 — 입력은 els do'), timeoutMs: 15_000 }, // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «맨 els 전체 화면» — 15 one-second list polls (the status line is clipped to 100 columns: the way in is shown up to «els do»)
+      ],
+      quitKeys: '\u0002q',
+    });
+    expect(run.exitCode).toBe(0);
+    const list = run.frames[1]!.screen;
+    expect(list).toContain('⇄herdr HERDR_WS · 1');                   // the herdr workspace is a space on the left
+    expect(list).not.toContain('HERDR_PANE');                        // its pane is not a left line (spaces only)
+    expect(run.frames.at(-1)!.screen).toContain('HERDR_READ_SCREEN');
+    expect(run.frames.at(-1)!.screen).toContain('🌐 HERDR_PANE');    // once selected, the pane is the tab
+    pid = Number((await requestEls(elsSocketPath(root), { op: 'ping' })).message.match(/pid (\d+)/)?.[1]);
+  } finally {
+    if (pid > 0) { try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ } }
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);

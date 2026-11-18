@@ -712,8 +712,8 @@ test('chosen commit from version-release reaches cutoff, gate and prepare contex
       const node = body.includes('version-node.ts release') ? 'version-release' : body.includes('node-verdict.ts cutoff') ? 'cutoff'
         : body.includes('gate-node.ts') ? 'gate' : body.includes('prepare-node.ts') ? 'prepare' : 'other';
       if (node === 'version-release') seen.input = context.input.cutCommit;
-      if (node === 'cutoff') seen.cutoff = context.outputs['version-release']?.commit ?? '';
-      if (node === 'gate' || node === 'prepare') seen[node] = context.outputs['version-release']?.commit ?? '';
+      if (node === 'cutoff') seen.cutoff = context.outputs['cut-branch']?.commit ?? '';
+      if (node === 'gate' || node === 'prepare') seen[node] = context.outputs['cut-branch']?.commit ?? '';
       return { exitCode: node === 'prepare' ? 1 : 0, stdout: JSON.stringify({ outcome: node === 'prepare' ? 'fail' : 'ok', verdict: node === 'prepare' ? 'fail' : 'pass', ...(node === 'version-release' ? { commit: released.output.commit } : {}) }) + '\n', stderr: '' };
     } } });
   expect(result.status).toBe('failed');
@@ -1700,3 +1700,55 @@ test('RELEASE-APPEND-BASE-AUTO: cut-branch without --append still requires --bas
   expect(status).toBe(1);
   expect(output.error).toContain('--base is required without --append');
 }, 60_000);
+
+test('cut-branch --no-prebuild skips the pod image prebuild', () => {
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const commit = 'c'.repeat(40);
+  const calls: unknown[] = [];
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId: 'no-prebuild-run', input: { version: '0.3.6', gateExecutor: 'pod',
+    gateImagePin: 'cut-commit', gatePodPool: 'pool-a@aws1:1' }, outputs: {} });
+  try {
+    const output = versionNodeMain(['cut-branch', '--version', '0.3.6', '--base', 'a'.repeat(40), '--pick', 'b'.repeat(40), '--no-prebuild'], process.cwd(), {
+      cutBranch: () => ({ branch: 'release/0.3.6', commit, dryRun: false }),
+      prebuildGateImage: (input) => { calls.push(input); return { outcome: 'built', runId: input.runId, cutCommit: input.commit, digest: `sha256:${'d'.repeat(64)}`, eligiblePools: ['pool-a'] }; },
+    });
+    expect(calls).toEqual([]);
+    expect(output).toMatchObject({ outcome: 'ok', commit });
+    expect((output as Record<string, unknown>).gateImagePrebuild).toBeUndefined();
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('gate-image-prebuild consumes the pinned run input cutCommit as its cut source', () => {
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const commit = 'c'.repeat(40);
+  const calls: unknown[] = [];
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId: 'pinned-prebuild-run', input: { version: '0.3.6', gateExecutor: 'pod',
+    gateImagePin: 'cut-commit', gatePodPool: 'pool-a@aws1:1', cutCommit: commit }, outputs: { 'cut-branch': { outcome: 'ok', commit } } });
+  try {
+    const output = versionNodeMain(['gate-image-prebuild', '--version', '0.3.6'], process.cwd(), {
+      prebuildGateImage: (input) => { calls.push(input); return { outcome: 'built', runId: input.runId, cutCommit: input.commit, digest: `sha256:${'d'.repeat(64)}`, eligiblePools: ['pool-a'] }; },
+    });
+    expect(calls).toEqual([{ root: expect.any(String), repo: process.cwd(), runId: 'pinned-prebuild-run', version: '0.3.6', commit, pool: 'pool-a@aws1:1' }]);
+    expect(output).toMatchObject({ outcome: 'ok', commit, gateImagePrebuild: { outcome: 'built', eligiblePools: ['pool-a'] } });
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('gate-image-prebuild still refuses an explicit CLI --cut-commit', () => {
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId: 'cli-cutcommit-refused', input: { version: '0.3.6', gateExecutor: 'pod',
+    gateImagePin: 'cut-commit', gatePodPool: 'pool-a@aws1:1' }, outputs: { 'cut-branch': { outcome: 'ok', commit: 'c'.repeat(40) } } });
+  try {
+    const output = versionNodeMain(['gate-image-prebuild', '--version', '0.3.6', '--cut-commit', 'a'.repeat(40)], process.cwd(), {});
+    expect(output).toMatchObject({ outcome: 'error' });
+    expect(JSON.stringify(output)).toContain('gate-image-prebuild');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});

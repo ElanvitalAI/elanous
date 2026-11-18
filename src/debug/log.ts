@@ -745,6 +745,12 @@ export function getAmbientParentSessionId(): string | null {
   return ambientParentSessionStorage.getStore() ?? null;
 }
 
+/** Session of the current async scope only — never the process-wide REPL fallback. The debug bridge needs
+ *  this: a line stamped from the global fallback did not come from the subscribing turn's own call chain. */
+export function getScopedAmbientSessionId(): string | null {
+  return ambientSessionStorage.getStore() ?? null;
+}
+
 export function getAmbientSessionId(): string | null {
   return ambientSessionStorage.getStore() ?? ambientSessionId;
 }
@@ -968,5 +974,17 @@ try {
 // diagnostics are visible to the same sinks as later events.
 const diagnosticHooks = globalThis as unknown as Record<string, unknown>;
 diagnosticHooks['__elanous_mss_diagnostic_logger__'] = debug;
+// SKILL-LITE1 bridge — vendored skill copies (skills/*/src/llm-network-fetch.ts)
+// emit their `llm.call` ledger rows through `globalThis.__elanousDebugLog`. The
+// host installs it here (same category/event/data shape as DebugLog.log) so
+// in-repository skill runs keep producing ledger rows through the production
+// tracer instead of silently no-oping when the hook is missing.
+diagnosticHooks['__elanousDebugLog'] = (
+  category: string,
+  event: string,
+  data?: unknown,
+): void => {
+  debug.log(category, event, data);
+};
 const registerDiagnosticSink = diagnosticHooks['__elanous_mss_diagnostic_register__'];
 if (typeof registerDiagnosticSink === 'function') registerDiagnosticSink(debug);

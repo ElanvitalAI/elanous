@@ -22,13 +22,14 @@ export function gateDecision(input: { runId?: string; reason: string; testStepSk
   };
 }
 
-export function reviewDecision(input: { runId?: string; verdict: string; reviewed: boolean; mustFix?: number; shouldFix?: number; topFinding?: string; reason?: string }): DecisionEvent {
+export function reviewDecision(input: { runId?: string; verdict: string; reviewed: boolean; mustFix?: number; shouldFix?: number; topFinding?: string; reason?: string; reviewer?: { provider: string; model: string } }): DecisionEvent {
   const fallback = input.mustFix !== undefined && input.mustFix > 0 && input.topFinding?.trim()
     ? `must-fix ${input.mustFix} · ${redactSecretText(input.topFinding)}`
     : `${input.verdict} · 실제 리뷰 ${input.reviewed ? '완료' : '미실행'} · must-fix ${input.mustFix ?? 0} · should-fix ${input.shouldFix ?? 0}`;
   return {
     kind: 'VERIFY', phase: 'review',
-    refs: { ...(input.mustFix !== undefined ? { mustFix: input.mustFix } : {}), ...(input.shouldFix !== undefined ? { shouldFix: input.shouldFix } : {}) },
+    refs: { ...(input.mustFix !== undefined ? { mustFix: input.mustFix } : {}), ...(input.shouldFix !== undefined ? { shouldFix: input.shouldFix } : {}),
+      ...(input.reviewer ? { reviewerProvider: input.reviewer.provider, reviewerModel: input.reviewer.model } : {}) },
     what: '구현물 리뷰 결과',
     reason: line(redactSecretText(input.reason ?? fallback)),
     purpose: '병합 전에 변경을 검토한다',

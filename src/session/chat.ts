@@ -54,7 +54,8 @@ import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
 import { assertTurnNotSilentFailure } from './turn-silent-failure.js';
 import type { CoreTurnCallbacks, CoreTurnContext, CoreTurnDispatchTool } from '../core-turn/types.js';
-import { resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
+import { resolveSeatTurnCapForRole, seatRegistryRuntime } from '../core-turn/seat-turn-cap.js';
+import { readSeatRuntime } from '../core-turn/seat-registry-runtime.js';
 import { postSeatCapResumeNotice } from '../core-turn/seat-cap-resume-notice.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
@@ -345,6 +346,28 @@ export function buildRecentToolObservations(
  * 원장·세션 저장소 형식은 무변경). 키: runTurn sessionId. */
 const childContextComposedSessions = new Set<string>();
 
+/**
+ * TURN-FIELD-BUG-2 (OP #90723 · RES wake-miss 11-18): a TUI session resumed after a restart still carries its old person
+ * inputs — and an interrupted turn («[사용자가 이 턴을 중단했습니다]») — at the end of the history; the new process's
+ * first turn took them as unfinished orders and redid them (JUD-B «상태줄 261117_2055·dev 확인» on every restart · busy
+ * seats ran the cut-off work for 3 min+ while new mail waited 180s). The first turn of a session in a process with prior
+ * person input gets this boundary line.
+ */
+export const RESUME_BOUNDARY_BLOCK = [
+  '## Resumed session boundary',
+  'This session was resumed after a restart. Everything said above this point — earlier requests and any turn that was',
+  'interrupted — is already finished or superseded: do not redo it or continue it on your own. Act on the current message;',
+  'continue earlier work only if the current message asks for it.',
+].join('\n');
+const resumeBoundaryShownSessions = new Set<string>();
+
+/** True once per session per process, and only when the loaded history already holds a person input. */
+export function takeResumeBoundary(sessionId: string, priorUserTurns: number): boolean {
+  if (resumeBoundaryShownSessions.has(sessionId)) return false;
+  resumeBoundaryShownSessions.add(sessionId);
+  return priorUserTurns > 0;
+}
+
 /** Run one conversational turn, persisting both sides to the session
  *  JSONL. Never throws on LLM failure — reraises with context. */
 export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
@@ -386,6 +409,10 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   //   message placed right before the current user message (withTurnVolatileContext): everything
   //   before it is a byte prefix of the next turn's request.
   const turnVolatileBlocks: string[] = [];
+  if (meta.source === 'tui' && takeResumeBoundary(opts.sessionId, priorUserTurns)) {
+    turnVolatileBlocks.push(RESUME_BOUNDARY_BLOCK);
+    try { debug.log('session', 'resume-boundary', { sessionId: opts.sessionId, priorUserTurns }); } catch { /* observability is fail-open */ }
+  }
   // The Next TUI runs through this shared session adapter rather than the classic dashboard
   // preamble. Give research turns the same verified-reconciliation instruction on this path.
   if (meta.source === 'tui' && !effectiveSystemPrompt?.includes('## Proactive Reconciliation')) {
@@ -762,8 +789,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         const cwdSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1];
         const envSeat = process.env.COORD_ID?.trim();
         const seat = opts.utteranceSurface === 'tui' ? (cwdSeat ?? envSeat)?.toUpperCase() : undefined;
+        const seatRuntime = seat ? seatRegistryRuntime(seat, readSeatRuntime) : undefined;
         const seatTurnCap = seat
-          ? { ...resolveSeatTurnCap(opts.userConfig.chat.seatTurnCap), seat }
+          ? { ...resolveSeatTurnCapForRole(seatRuntime, opts.userConfig.chat.seatTurnCap), seat }
           : undefined;
         // HARNESS-ADVISOR-CHECKPOINTS — 하니스 런에서만 코어 ADVISOR(그림자 기본).
         const advisor = coreAdvisorForGoalLoop({ userText: coreCtx.userText ?? '', signal: coreCtx.signal });

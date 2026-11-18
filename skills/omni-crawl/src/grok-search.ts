@@ -1,6 +1,6 @@
 /** Grok search — X/웹/레딧 검색 전용 (채팅은 향후 omni-llm으로 분리) */
 
-import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
+import { llmNetworkFetch } from './llm-network-fetch.js';
 import { requireEnv, refreshKeysFromCache } from './env.js';
 import type { GrokSearchMode, CrawlResult } from './types.js';
 

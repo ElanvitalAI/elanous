@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import {
-  issueStaticLease, parseTailnetIdentities, readStaticLeaseRecords, REMOTE_STATIC_LEASE_COMMAND, renewStaticLease, resolveStaticLeaseItem,
+  issueStaticLease, parseTailnetIdentities, readStaticLeaseRecords, REMOTE_STATIC_LEASE_COMMAND, REMOTE_STATIC_LEASE_SCRIPT, renewStaticLease, resolveStaticLeaseItem,
   revokeStaticLeases, runStaticLeaseRenewUntil, leaseStaticKeysForCredPush, STATIC_LEASE_DEFAULT_TTL_MS, writeLocalStaticLeaseCopy,
   type StaticLeaseDeps, type StaticLeaseRecord, type StaticLeaseSshRunner,
 } from './static-lease.js';
@@ -444,5 +444,12 @@ describe('HQ-VAULT V3 static lease — CLI · events · remote script', () => {
     expect(existsSync(copy)).toBe(false);
     expect(JSON.parse(readFileSync(metaPath, 'utf8')).revokedAt).toBeString();
     assertNoCanaryOutsideCopy();
+  });
+});
+
+describe('remote static lease script — meta area relative to the remote HOME', () => {
+  test('the remote script still writes meta under <remote HOME>/.elanous/secrets-lease/meta', () => {
+    expect(REMOTE_STATIC_LEASE_SCRIPT).toContain('area=path.join(home,".elanous","secrets-lease","meta")');
+    expect(REMOTE_STATIC_LEASE_SCRIPT).toContain('const home=os.homedir(),cacheDir=path.join(home,".cache")');
   });
 });

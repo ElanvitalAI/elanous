@@ -6,6 +6,7 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
 import { isReleaseVersion } from './release-version.js';
 import { isNexusFirstRunPass } from './nexus-first-run.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 interface PreparedManifest {
   version?: unknown; sourceCommit?: unknown; distDir?: unknown; publicCommit?: unknown;
@@ -86,7 +87,7 @@ export function runPrepare(run: CommandRunner = runCommand, move: typeof renameS
   if (occupied) {
     // Only a tip refresh can prove that this archive belongs to the prior commit. An incomplete or unknown
     // archive is left untouched for investigation; never erase it merely because the path is occupied.
-    const old = context.outputs['version-release']?.refreshedFrom;
+    const old = releaseCutRecord(context)?.refreshedFrom;
     const manifestPath = join(out, 'release.json');
     if (!occupied.isDirectory() || !existsSync(manifestPath) || !lstatSync(manifestPath).isFile())
       throw new Error(`prepare output already exists with unverified source: ${out}`);

@@ -1,4 +1,5 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
+import { a5Wordings } from '../turn-capsule/a5-wording.js';
 // ── AgentOutput LLM tool (ROADMAP-agent-surface-deferred-tools Wave 1 · W1.1) ──
 //
 // Reads the final result of an AgentTask owned by the global agent
@@ -76,10 +77,10 @@ export interface AgentOutputResult extends Record<string, unknown> {
 }
 
 export function buildAgentOutputTool(): LLMToolSpec {
+  const w = a5Wordings();
   return {
     name: 'AgentOutput',
-    description:
-      "Retrieve the final result of a background AgentTask by id. Pairs with Agent(run_in_background=true). When `block` is true, waits up to `timeoutMs` for terminal state; when false (default), returns immediately with retrievalStatus='not_ready' if still running. After a timeout, call again with the same taskId to continue waiting.",
+    description: w.agentOutputDescription,
     parameters: {
       type: 'object',
       properties: {
@@ -95,8 +96,7 @@ export function buildAgentOutputTool(): LLMToolSpec {
         },
         timeoutMs: {
           type: 'number',
-          description:
-            'Wait limit when block=true, clamped to the hard cap. The default is for short checks; background children commonly take longer, so use a value larger than the default when waiting for them. Ignored when block=false. After the cap, call again with the same taskId.',
+          description: w.agentOutputTimeoutParam,
         },
       },
       required: ['taskId'],
@@ -123,6 +123,7 @@ function describeStatus(
   task: AgentTask | undefined,
   waitedMs?: number,
   taskElapsedMs?: number,
+  waitHint: string = a5Wordings().agentOutputWaitHint,
 ): string {
   switch (status) {
     case 'not_found':
@@ -133,10 +134,10 @@ function describeStatus(
       const elapsed = taskElapsedMs === undefined
         ? 'task elapsed unavailable (start time unavailable)'
         : `task elapsed ${taskElapsedMs}ms`;
-      return `AgentOutput: timeout after ${waitedMs ?? 0}ms · ${elapsed} · still ${task?.state ?? 'running'} · call again with the same taskId to continue waiting`;
+      return `AgentOutput: timeout after ${waitedMs ?? 0}ms · ${elapsed} · still ${task?.state ?? 'running'} · ${waitHint}`;
     }
     case 'interrupted':
-      return `AgentOutput: wait interrupted · still ${task?.state ?? 'running'} · call again with the same taskId to continue waiting`;
+      return `AgentOutput: wait interrupted · still ${task?.state ?? 'running'} · ${waitHint}`;
     case 'success': {
       if (!task) return 'AgentOutput: success';
       if (task.state === 'done') {

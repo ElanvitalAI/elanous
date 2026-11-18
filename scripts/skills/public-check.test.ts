@@ -239,12 +239,13 @@ describe('public skill structural check', () => {
     expect(checkPublicSkills(root, boundary).skills[0]!.checks.entry).toBe(true);
   }));
 
-  test('production scope keeps the confirmed 14 core skills distinct from 15 claimed deployments and personal addons', () => {
+  test('production scope keeps the confirmed 16 core skills distinct from 15 claimed deployments and personal addons', () => {
     const root = join(import.meta.dir, '..', '..');
     const report = checkPublicSkills(root);
     const names = report.skills.map((row) => row.skill);
+    // 2026-11-18 스킬 2개 착지 — bookforge · general-app-build-recipe (#37945 계열) 이 14 → 16 이다.
     expect(names).toEqual([
-      'diagram-master', 'explainer-video', 'google-workspace', 'grill-me',
+      'bookforge', 'diagram-master', 'explainer-video', 'general-app-build-recipe', 'google-workspace', 'grill-me',
       'lecture-note-digitizer', 'motion-broll', 'omni-crawl', 'omni-digest',
       'omni-market', 'photo-intake-ocr', 'pitch-deck', 'project-onboarding',
       'video-builder', 'youtube-master',
@@ -256,7 +257,7 @@ describe('public skill structural check', () => {
     const table = runPublicCheck(root, []);
     expect(JSON.parse(json.output)).toEqual(report);
     expect(table.output).toBe(formatPublicCheck(report));
-    expect(table.output).toContain('PUBLIC-CHECK FAIL (14 public skills)');
+    expect(table.output).toContain('PUBLIC-CHECK FAIL (16 public skills)');
     expect(json.exitCode).toBe(report.ok ? 0 : 1);
     expect(table.exitCode).toBe(json.exitCode);
   });

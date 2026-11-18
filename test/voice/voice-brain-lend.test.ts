@@ -124,6 +124,15 @@ describe('ask — HITL', () => {
 });
 
 describe('grantStore policy', () => {
+  test('expired grant is denied with an explicit reason', async () => {
+    let now = 1000;
+    const store = createCapabilityGrantStore({ now: () => new Date(now) });
+    store.grant({ persona: 'codex', action: 'speak' as never, grantedAt: new Date(now).toISOString(), expiresAt: new Date(2000).toISOString() });
+    now = 3000;
+    const h = createVoiceBrainHandlers(defaultDeps({ grantStore: store }));
+    await expect(h.speak({ clientId: 'codex', sentence: 'x' })).rejects.toThrow('expired');
+  });
+
   test('without store → all clients allowed', async () => {
     const h = createVoiceBrainHandlers(defaultDeps());
     expect((await h.speak({ clientId: 'unknown', sentence: 'x' })).ok).toBe(true);

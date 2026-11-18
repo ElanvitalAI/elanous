@@ -1,6 +1,6 @@
 /** Diagram generation — Mermaid inline (no external deps) + Excalidraw stub */
 
-import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
+import { llmNetworkFetch } from './llm-network-fetch.js';
 import { env } from './env.js';
 import { compactText } from './util.js';
 

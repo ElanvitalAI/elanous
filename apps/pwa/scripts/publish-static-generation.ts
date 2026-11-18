@@ -1,4 +1,4 @@
-import { cp, lstat, mkdir, readdir, rename, rm, stat, symlink } from 'node:fs/promises';
+import { cp, lstat, mkdir, readFile, readdir, rename, rm, stat, symlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
@@ -16,8 +16,15 @@ async function copyDirectory(source: string, destination: string): Promise<void>
 }
 
 export async function validateStaticGeneration(generation: string): Promise<void> {
-  const index = await lstat(path.join(generation, 'index.html'));
+  const indexPath = path.join(generation, 'index.html');
+  const index = await lstat(indexPath);
   if (!index.isFile()) throw new Error(`Static generation is missing a regular index.html: ${generation}`);
+
+  // A prerender failure still emits a shell; refuse to publish or serve it
+  // (PWA-APP-ROOT-EXPORT-CRASH).
+  if ((await readFile(indexPath, 'utf8')).includes('__next_error__')) {
+    throw new Error(`Static generation index.html is the Next.js prerender fallback shell (__next_error__): ${generation}`);
+  }
 
   const assets = await lstat(path.join(generation, '_next'));
   if (!assets.isDirectory() || (await readdir(path.join(generation, '_next'))).length === 0) {

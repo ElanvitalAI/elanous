@@ -8,7 +8,7 @@ import type { DailyUsageRow, UsageDailyRead } from '../budget/usage-daily-store.
 import { LogStore } from '../mss/logging/log-store.js';
 
 const base: DailyUsageRow = { day: '2026-10-14', hour: '2026-10-14T12', role: 'implement', stage: 'implement', account: '(none)',
-  model: 'gpt-6-sol', billingProvider: 'openai-codex', billing: 'subscription', site: 'agent-turn', hostId: 'h1',
+  model: 'gpt-6-sol', billingProvider: 'openai-codex', billing: 'subscription', site: 'agent-turn', hostId: 'h1', seat: '(none)',
   calls: 2, inputTokens: 10, outputTokens: 3, cacheReadInputTokens: 1, cacheCreationInputTokens: 0,
   reasoningOutputTokens: 0, usdKnown: 0, unknownCostCalls: 0, includedCalls: 2, apiEquivalentUsd: 0.5 };
 

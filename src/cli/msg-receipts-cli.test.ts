@@ -405,3 +405,20 @@ test('#38361 follow-up ① — help never claims the age alert runs by itself (n
   expect(help).toContain('one-shot');
   expect(help).toContain('nothing runs it on a schedule');
 });
+
+test('ACK SLA scheduled five-minute ticks notify once and stop after acceptance', async () => {
+  const f = fixture();
+  const req = f.writer.post({ from: 'RES', to: 'TC', body: 'private', intent: 'request' });
+  const alertRefs = (recipient: string) => f.writer.listByRecipient(recipient).filter(m => m.from === 'MSG-SLA').map(m => m.refs);
+  await f.run('overdue', '--after', '15', '--stage', 'ack', '--mark', '--notify');
+  expect(alertRefs('RES')).toEqual([[`msg#${req.id}`]]);
+  expect(alertRefs('OP')).toEqual([[`msg#${req.id}`]]);
+  await f.run('overdue', '--after', '15', '--stage', 'ack', '--mark', '--notify');
+  expect(alertRefs('RES')).toEqual([[`msg#${req.id}`]]);
+  expect(alertRefs('OP')).toEqual([[`msg#${req.id}`]]);
+  f.writer.recordReceipt({ messageId: req.id, recipient: 'TC', state: 'accepted', source: 'cli' });
+  await f.run('overdue', '--after', '15', '--stage', 'ack', '--mark', '--notify');
+  expect(alertRefs('RES')).toEqual([[`msg#${req.id}`]]);
+  expect(alertRefs('OP')).toEqual([[`msg#${req.id}`]]);
+  expect(f.exits).toEqual([]);
+});

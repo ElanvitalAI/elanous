@@ -2,6 +2,7 @@
 import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 /** The receipt-audit producer must report the complete file universe, including opaque files. */
 export interface SkipEvidenceAudit {
@@ -64,7 +65,7 @@ export function skipGateFromContext(context: GraphContext): SkipEvidenceDecision
       && typeof output.commit === 'string' && SHA.test(output.commit))
     .at(-1)?.[1]?.commit;
   return decideGateSkipByEvidence(context.outputs['receipt-audit'], typeof repairedCommit === 'string' ? repairedCommit
-    : context.outputs.cutoff?.commit ?? context.outputs['version-release']?.commit);
+    : context.outputs.cutoff?.commit ?? releaseCutRecord(context)?.commit);
 }
 
 if (import.meta.main) {

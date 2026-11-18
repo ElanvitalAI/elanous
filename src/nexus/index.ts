@@ -2309,6 +2309,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
 
       metaApiOpts = {
         voiceRest,
+        // WEBCHAT-OWNER-APPSLUG-WIRING: a verified member's own app slot, from the server member store only.
+        memberAppSlot: (memberId) => deploymentOwnerMemberStore?.appSlotForMember(memberId)?.appSlug,
         resolveVerifiedOwner: (req, appSlug) => {
           const host = deploymentOwnerAppHost;
           const members = deploymentOwnerMemberStore;

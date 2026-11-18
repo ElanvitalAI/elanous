@@ -1,0 +1,279 @@
+{
+  "normal-merge": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "open-pr@0",
+      "merge@0"
+    ],
+    "stage": "merged",
+    "node": "merge",
+    "ok": true,
+    "merged": true,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "openPr",
+      "mergePr"
+    ]
+  },
+  "gate-fail-rework-pass": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "rework@1",
+      "implement@1",
+      "gate@1",
+      "review@1",
+      "open-pr@1",
+      "merge@1"
+    ],
+    "stage": "merged",
+    "node": "merge",
+    "ok": true,
+    "merged": true,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "implement",
+      "gate",
+      "review",
+      "openPr",
+      "mergePr"
+    ]
+  },
+  "must-fix-twice": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "rework@1",
+      "implement@1",
+      "gate@1",
+      "review@1",
+      "rework@2",
+      "implement@2",
+      "gate@2",
+      "review@2",
+      "open-pr@2",
+      "merge@2"
+    ],
+    "stage": "merged",
+    "node": "merge",
+    "ok": true,
+    "merged": true,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "implement",
+      "gate",
+      "review",
+      "implement",
+      "gate",
+      "review",
+      "openPr",
+      "mergePr"
+    ]
+  },
+  "empty-change": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "rework@1"
+    ],
+    "stage": "no-changes",
+    "node": "rework",
+    "ok": false,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review"
+    ]
+  },
+  "merge-conflict": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "main-sync@0"
+    ],
+    "stage": "merge-conflict",
+    "node": "main-sync",
+    "ok": false,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "commitWork",
+      "mergeMain"
+    ]
+  },
+  "regate-fail": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "main-sync@0",
+      "regate@0"
+    ],
+    "stage": "gate-failed",
+    "node": "regate",
+    "ok": false,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "commitWork",
+      "mergeMain",
+      "gate:postsync",
+      "openPr"
+    ]
+  },
+  "pr-open-failure": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "open-pr@0"
+    ],
+    "stage": "threw:draft PR 생성 실패",
+    "node": "-",
+    "ok": false,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "openPr"
+    ]
+  },
+  "pr-declined": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0"
+    ],
+    "stage": "pr-declined",
+    "node": "open-pr",
+    "ok": false,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "approvePr"
+    ]
+  },
+  "freeze-hold": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "open-pr@0"
+    ],
+    "stage": "pr-opened",
+    "node": "open-pr",
+    "ok": true,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "openPr"
+    ]
+  },
+  "pod-merge-ready": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0",
+      "open-pr@0"
+    ],
+    "stage": "merge-ready",
+    "node": "open-pr",
+    "ok": true,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review",
+      "openPr"
+    ]
+  },
+  "soft-stop": {
+    "walk": [
+      "implement@0"
+    ],
+    "stage": "soft-stopped",
+    "node": "gate",
+    "ok": false,
+    "merged": false,
+    "seamCalls": [
+      "implement"
+    ]
+  },
+  "timeout": {
+    "walk": [
+      "implement@0"
+    ],
+    "stage": "timed-out",
+    "node": "implement",
+    "ok": false,
+    "merged": false,
+    "seamCalls": [
+      "implement"
+    ]
+  },
+  "pod-worktree-completed": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "review@0"
+    ],
+    "stage": "worktree-completed",
+    "node": "open-pr",
+    "ok": true,
+    "merged": false,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "review"
+    ]
+  },
+  "rework-child-rebind": {
+    "walk": [
+      "implement@0",
+      "gate@0",
+      "rework@1",
+      "implement@1",
+      "gate@1",
+      "review@1",
+      "open-pr@1",
+      "merge@1"
+    ],
+    "stage": "merged",
+    "node": "merge",
+    "ok": true,
+    "merged": true,
+    "seamCalls": [
+      "implement",
+      "gate",
+      "implement",
+      "gate",
+      "review",
+      "openPr",
+      "mergePr"
+    ],
+    "childProviders": [
+      "grok",
+      "openai-codex"
+    ]
+  }
+}

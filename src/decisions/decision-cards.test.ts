@@ -110,6 +110,7 @@ describe('DEC-TG decision cards', () => {
     expect(ledger.show(ab.id).status).toBe('open');
     // ② Telegram: A/B decided by the owner
     expect((await tgService.tap('111', `dec:${ab.id}:a`)).kind).toBe('decided');
+    expect(ledger.show(ab.id).decidedBy).toEqual({ kind: 'human', via: 'telegram', platformUserId: '111' });
     // ③ Discord: yes/no decided
     expect((await dcService.tap('999', `dec:${yn.id}:y`)).kind).toBe('decided');
     // ④ /decisions re-sends what is still open (the irreversible one) → confirm twice
@@ -378,7 +379,7 @@ describe('HITL1 H3 card bridge — pending questions become decision cards', () 
         ...ids.map((id) => ({ ...pending({ impact: 'high', id })().questions[0]!, testOrigin: true as const })),
         pending({ impact: 'high', id: 'goal-clarification:/tmp/clarification-lease-e2e-operational/GOAL.txt:scope' })().questions[0]!,
         pending({ impact: 'high', id: 'auq:h3:norma' })().questions[0]!,
-        pending({ id: 'goal-clarification:/home/ubuntu/goals/GOAL.txt:delivery_scope' })().questions[0]!,
+        pending({ id: 'goal-clarification:/srv/goals/GOAL.txt:delivery_scope' })().questions[0]!,
       ],
     });
     const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -396,7 +397,7 @@ describe('HITL1 H3 card bridge — pending questions become decision cards', () 
       })));
       expect(logs.filter(({ event, data }) => event === 'skipped' && data.questionId === 'goal-clarification:/tmp/clarification-lease-e2e-operational/GOAL.txt:scope' && data.reason === 'Error')).toHaveLength(3);
       expect(logs.filter(({ event, data }) => event === 'raised' && data.questionId === 'auq:h3:norma')).toHaveLength(1);
-      expect(logs.filter(({ event, data }) => event === 'skipped' && data.questionId === 'goal-clarification:/home/ubuntu/goals/GOAL.txt:delivery_scope' && data.reason === 'impact')).toHaveLength(3);
+      expect(logs.filter(({ event, data }) => event === 'skipped' && data.questionId === 'goal-clarification:/srv/goals/GOAL.txt:delivery_scope' && data.reason === 'impact')).toHaveLength(3);
       expect(ledger.list({ status: 'all' }).map((entry) => entry.resume?.questionId)).toEqual(['auq:h3:norma']);
       expect(transport.sent).toHaveLength(1);
     } finally { spy.mockRestore(); }

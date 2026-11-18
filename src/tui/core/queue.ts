@@ -1,4 +1,5 @@
 import { debug } from '../../debug/log.js';
+import { emitTurnLife } from '../../debug/turn-life.js';
 import { detectReplacementCandidate, type ReplacementCandidate, type ReplacementDetection } from '../../chat/queue-supersede.js';
 import { pushNowToolDecision } from './tool-interrupt-class.js';
 
@@ -31,7 +32,7 @@ export type NextTuiQueueBoundary = 'tool-result' | 'idle';
  * ELN-CHILD-NOTICE-INTO-QUEUE; this file only owns their place in the order.
  */
 export type NextTuiQueueItemKind = 'user' | 'notice';
-export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'graph-node' | 'event-watch';
+export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'graph-node' | 'event-watch' | 'capsule-done';
 /** Input mode decides batching: a slash command or `!` shell line never travels with ordinary chat. */
 export type NextTuiQueueMode = 'chat' | 'command' | 'shell';
 
@@ -145,8 +146,10 @@ export type NextTuiQueueDrain =
   | { kind: 'batch'; mode: NextTuiQueueMode; itemKind: NextTuiQueueItemKind; items: readonly NextTuiQueueBatchItem[]; remaining: number };
 
 /** Owns submissions made while a Next TUI turn is running. The input layer owns key interpretation. */
-export function createNextTuiQueue(options: { log?: NextTuiQueueLog } = {}) {
+export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog?: (event: string, data: Record<string, unknown>) => void } = {}) {
   const log = options.log ?? defaultQueueLog;
+  // OBSERVE-TURN-EVENT-LIFECYCLE — 주입 없이도 기본 경로(debug) 로 방출된다(fail-open).
+  const turnLifeLog = options.turnLifeLog ?? emitTurnLife;
   /** Every item ever enqueued, by id — terminal items stay so a late op is a conflict, not a silent no-op. */
   const byId = new Map<string, MutableItem>();
   let lastSeq = 0;
@@ -157,6 +160,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog } = {}) {
   /** Waiting items in seq order (display / recall order); render reads `count` every frame, so it is kept, not scanned. */
   let waiting: MutableItem[] = [];
   const transitionListeners = new Set<NextTuiQueueTransitionListener>();
+  /** #38510 r1 MF2: observers of the queued-count rising (the idle watchdog starts its clock at the real transition). */
+  const enqueueListeners = new Set<() => void>();
   /** A listener never breaks the queue — it runs after the state change and its throw is logged, not raised. */
   const notifyTransition = (item: MutableItem): void => {
     for (const listener of transitionListeners) {
@@ -178,11 +183,16 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog } = {}) {
     const item: MutableItem = { id: `q${seq}`, seq, status: 'queued', ...fields };
     byId.set(item.id, item);
     waiting = [...waiting, item];
+    // OBSERVE-TURN-EVENT-LIFECYCLE — accepted(=queued). busy 는 큐가 모른다(entry 의 몫) → 생략.
+    try { turnLifeLog('turn-life:event-queued', { itemId: item.id, eventId: item.msgId ?? item.id, kind: item.kind, source: item.source ?? null, delivery: item.delivery, queuedCount: waiting.length }); } catch { /* observability is fail-open */ }
     log('enqueued', {
       id: item.id, seq, kind: item.kind, mode: item.mode, delivery: item.delivery, length: item.text.length,
       ...(item.source === undefined ? {} : { source: item.source }),
       ...(item.msgId === undefined ? {} : { msgId: item.msgId }),
     });
+    for (const listener of enqueueListeners) {
+      try { listener(); } catch (error) { log('enqueue-listener-failed', { id: item.id, error: error instanceof Error ? error.message : String(error) }); }
+    }
     return snapshot(item);
   };
 
@@ -199,6 +209,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog } = {}) {
   const deliver = (item: MutableItem, boundary: NextTuiQueueBoundary): void => {
     item.status = 'delivered';
     leave(item);
+    // OBSERVE-TURN-EVENT-LIFECYCLE — item 이 enqueue 시각을 안 가지므로 waitMs 는 생략(r1 확정).
+    try { turnLifeLog('turn-life:event-dequeued', { itemId: item.id, eventId: item.msgId ?? item.id, source: item.source ?? null, boundary }); } catch { /* observability is fail-open */ }
     log('delivered', { id: item.id, seq: item.seq, delivery: item.delivery, boundary });
     notifyTransition(item);
   };
@@ -279,6 +291,11 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog } = {}) {
         ...(meta.msgId === undefined ? {} : { msgId: meta.msgId }),
         ...(meta.occurredAt === undefined ? {} : { occurredAt: meta.occurredAt }),
       });
+    },
+    /** #38510 r1 MF2: observe an item entering the queue (after it is stored). Returns the unsubscribe. */
+    onEnqueued(listener: () => void): () => void {
+      enqueueListeners.add(listener);
+      return () => { enqueueListeners.delete(listener); };
     },
     /** SEAT-INBOX B1-C: observe items leaving `queued` (the receipt «seen» source). Returns the unsubscribe. */
     onTransition(listener: NextTuiQueueTransitionListener): () => void {
@@ -391,6 +408,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog } = {}) {
       }
       return pending.length > 0 ? { kind: 'wake' } : { kind: 'none' };
     },
+    /** CAPSULE-C2-FU: the kind {@link dequeue} would hand out next — read only, nothing leaves. */
+    peekKind(): NextTuiQueueItemKind | null { return ordered()[0]?.kind ?? null; },
     /** Idle boundary: one item leaves, in {@link deliveryOrder} (user > notice · steer > queue · seq). */
     dequeue(): NextTuiQueueDequeue {
       const next = ordered()[0];

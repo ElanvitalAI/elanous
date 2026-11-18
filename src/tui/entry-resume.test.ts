@@ -74,6 +74,14 @@ describe('TUI-RESUME-PICKER incident — next TUI sent «/resume» to the model'
     expect(resumeCandidates(saved1).map((m) => m.id)).toContain(saved1);
   });
 
+  test('a saved chat still on the store placeholder title shows «New chat», like the header — never «(new session)»', () => {
+    const untitled = createSession({ source: 'tui' }).id;
+    appendMessage(untitled, { role: 'assistant', content: 'an answer without a user line first', ts: new Date().toISOString() });
+    const line = resumeListLines(resumeCandidates(null), null).find((l) => l.includes(untitled.slice(0, 8)));
+    expect(line).toMatch(/ New chat$/);
+    expect(line).not.toContain('(new session)');
+  });
+
   test('an empty store says so instead of showing nothing', () => {
     expect(resumeListLines(resumeCandidates(null), null)).toEqual(['No saved chats']);
   });
@@ -162,4 +170,3 @@ describe('TUI-RESUME-PICKER — pick by number · ids that share their first 8 c
     expect(r.status).toBe('Resuming chat · elanous-session-h · previous = elanous-session-c');
   });
 });
-

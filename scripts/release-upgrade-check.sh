@@ -33,6 +33,8 @@ else
   echo "▶ packing this checkout (internal) → $CTX" >&2
   (cd "$ROOT" && bun pm pack --destination "$CTX" >/dev/null 2>&1) || { echo "⛔ bun pm pack failed" >&2; exit 1; }
   mv "$(ls "$CTX"/*.tgz | head -1)" "$CTX/elanous.tgz"
+  # bun pm pack drops the gitignored apps/pwa/out — materialize it (install.sh exits 4 without it).
+  (cd "$ROOT" && bun -e 'import { packPwaOutput } from "./scripts/lib/pack-pwa-output.ts"; packPwaOutput(process.argv[1], process.argv[2]);' "$ROOT" "$CTX/elanous.tgz") || { echo "⛔ PWA build missing: apps/pwa/out/index.html (build it first: bun bin/elanous.mjs nexus build)" >&2; exit 1; }
 fi
 cp "$ROOT/scripts/install.sh" "$ROOT/docker/upgrade/Dockerfile" "$ROOT/docker/upgrade/upgrade-probe.sh" "$CTX/"
 

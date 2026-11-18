@@ -5,6 +5,10 @@ import { join } from 'node:path';
 import * as llmOriginal from '../../llm.js';
 import * as crawlOriginal from '../../../skills/omni-crawl/src/free.js';
 
+// R-TST23: afterAll 의 mock.module 원본 반환으로 레지스트리를 복구한다.
+const llmSnapshot = { ...llmOriginal };
+const crawlSnapshot = { ...crawlOriginal };
+
 type CapturedCall = { messages: Array<{ role: string; content: string }>; options: unknown };
 const calls: CapturedCall[] = [];
 let streamReply: () => Promise<string> = async () => '실제 KCB 시험 결과';
@@ -30,8 +34,8 @@ const { createMembersApi } = await import('./members-api.js');
 const { runKcbTryExample } = await import('./kcb-try.js');
 
 afterAll(() => {
-  mock.module('../../llm.js', () => llmOriginal);
-  mock.module('../../../skills/omni-crawl/src/free.js', () => crawlOriginal);
+  mock.module('../../llm.js', () => llmSnapshot);
+  mock.module('../../../skills/omni-crawl/src/free.js', () => crawlSnapshot);
 });
 
 function setup() {

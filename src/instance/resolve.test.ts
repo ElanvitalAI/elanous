@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { resolveInstance } from './resolve.js';
+import { homeTestInstanceRoot, prodInstanceRoot, resolveInstance } from './resolve.js';
 
 const prodRoot = '/tmp/elanous-prod';
 const sourceRoot = '/tmp/elanous-source/.elanous-test';
@@ -82,4 +82,17 @@ describe('leader-independent universe selection', () => {
       expect(readFileSync(sentinel, 'utf8')).toBe('operating-house-unchanged');
     } finally { rmSync(temp, { recursive: true, force: true }); }
   }, 120_000);
+});
+
+describe('home-scoped instance roots (isolation gate single passage)', () => {
+  test('prodInstanceRoot and homeTestInstanceRoot build under an injected HOME', () => {
+    expect(prodInstanceRoot('/Users/someone')).toBe('/Users/someone/.elanous');
+    expect(prodInstanceRoot('/Users/someone/')).toBe('/Users/someone/.elanous');
+    expect(homeTestInstanceRoot('/Users/someone')).toBe('/Users/someone/.elanous-test');
+  });
+
+  test('without an argument both follow this process HOME', () => {
+    expect(prodInstanceRoot()).toBe(join(homedir(), '.elanous'));
+    expect(homeTestInstanceRoot()).toBe(join(homedir(), '.elanous-test'));
+  });
 });

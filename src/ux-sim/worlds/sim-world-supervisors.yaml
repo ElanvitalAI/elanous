@@ -1,0 +1,4 @@
+# SIM-WORLD supervisors pack — rows { id, module } filled by the supervisors hand (SIM-WORLD §2 · contract seat-state/TC/SIM-KERNEL-API.md).
+schema: 1
+world: supervisors
+scenarios: []

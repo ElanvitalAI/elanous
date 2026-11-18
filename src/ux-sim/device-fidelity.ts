@@ -289,3 +289,62 @@ export function applyDeviceFidelity<T extends { pass: boolean; devices: string[]
   const hasMismatch = fidelity.some((row) => row.verdict === 'yellow');
   return { ...result, pass: result.pass && !hasMismatch, verdict: hasMismatch ? 'yellow' : result.pass ? 'green' : 'red', fidelity };
 }
+
+/**
+ * Shape-only fidelity (SIM-WORLD 대표 quality bar 3): a fake may never be more lenient than the real tool.
+ * Values are not compared. Same JSON kind; every key of a real object present in the fake; a fake key the real
+ * object lacks is reported too; arrays are checked element-wise against the real array's first element (an empty
+ * real array accepts any). Returns "<json path>: <what>" lines; [] means the shapes agree.
+ */
+export function deviceResponseShapeProblems(real: unknown, fake: unknown, path = '$'): string[] {
+  const kind = (value: unknown) => value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+  if (kind(real) !== kind(fake)) return [`${path}: real is ${kind(real)}, fake is ${kind(fake)}`];
+  if (Array.isArray(real)) {
+    if (real.length === 0) return [];
+    return (fake as unknown[]).flatMap((item, index) => deviceResponseShapeProblems(real[0], item, `${path}[${index}]`));
+  }
+  if (kind(real) !== 'object') return [];
+  const realObject = real as Record<string, unknown>;
+  const fakeObject = fake as Record<string, unknown>;
+  const problems: string[] = [];
+  for (const key of Object.keys(realObject).sort()) {
+    if (!Object.hasOwn(fakeObject, key)) problems.push(`${path}.${key}: missing in fake`);
+    else problems.push(...deviceResponseShapeProblems(realObject[key], fakeObject[key], `${path}.${key}`));
+  }
+  for (const key of Object.keys(fakeObject).sort()) if (!Object.hasOwn(realObject, key)) problems.push(`${path}.${key}: not in real output`);
+  return problems;
+}
+
+/**
+ * Check fake device outputs against the real response of one recorded call by shape, and persist the result in the
+ * same fidelity store as compareDeviceRecording — so deviceFidelityStatus(recording.deviceId) turns yellow on a
+ * mismatch. Zero outputs is a problem (nothing was measured), never a pass.
+ */
+export function compareDeviceResponseShapes(input: { readonly recording: unknown; readonly call: number; readonly label: string;
+  readonly responses: readonly unknown[] }, now = new Date()): DeviceFidelityComparison & { readonly problems: readonly string[] } {
+  const recording = parseRecording(input.recording);
+  const call = recording.calls[input.call];
+  if (!call) throw new Error(`recording ${recording.id} has no call ${input.call}`);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/.test(input.label)) throw new Error('shape comparison label is invalid');
+  const parse = (text: string): { ok: true; value: unknown } | { ok: false } => { try { return { ok: true, value: JSON.parse(text) }; } catch { return { ok: false }; } };
+  const real = parse(call.realResponse);
+  const problems: string[] = [];
+  if (!real.ok) problems.push(`recording ${recording.id} call ${input.call}: real response is not JSON`);
+  if (input.responses.length === 0) problems.push('no fake responses to check');
+  const comparisons = input.responses.map((response, index) => {
+    const text = typeof response === 'string' ? response : JSON.stringify(response) ?? 'undefined';
+    const fake = parse(text);
+    const found = !fake.ok ? [`#${index} $: fake response is not JSON`]
+      : real.ok ? deviceResponseShapeProblems(real.value, fake.value).map((line) => `#${index} ${line}`) : [];
+    problems.push(...found);
+    return { index, passed: found.length === 0, expectedSha256: sha(call.realResponse), actualSha256: sha(text) };
+  });
+  const recordingId = `shape.${recording.id}.${input.call}.${input.label}`;
+  const result = { recordingId, deviceId: recording.deviceId, passed: problems.length === 0, comparisons, comparedAt: now.toISOString(), problems };
+  withStateDatabase((db) => {
+    db.query(`INSERT INTO recordings(recording_id, device_id, passed, recording_sha256, payload) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(recording_id) DO UPDATE SET device_id = excluded.device_id, passed = excluded.passed, recording_sha256 = excluded.recording_sha256, payload = excluded.payload`)
+      .run(recordingId, recording.deviceId, result.passed ? 1 : 0, sha(JSON.stringify(recording)), JSON.stringify(result));
+  });
+  return result;
+}

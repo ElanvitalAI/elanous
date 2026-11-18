@@ -246,16 +246,60 @@ export function createElsCore(deps: ElsCoreDeps) {
     },
 
     list(): ElsResult {
-      const panes = journal.panes.flatMap((pane) => {
-        const tab = journal.tabs.find((row) => row.id === pane.tabId);
-        const ws = tab ? journal.workspaces.find((row) => row.id === tab.workspaceId) : undefined;
-        if (!tab || !ws) return [];
+      // Panes come out in the order a person set: workspaces in journal order, tabs in journal order inside each, panes by
+      // journal order inside a tab — so every client (els, the eln side tab) draws the same list from the same answer.
+      const wsAt = (id: string): number => journal.workspaces.findIndex((row) => row.id === id);
+      const tabAt = (id: string): number => journal.tabs.findIndex((row) => row.id === id);
+      const ordered = journal.panes.map((pane, index) => ({ pane, index, tab: journal.tabs.find((row) => row.id === pane.tabId) }))
+        .filter((row): row is { pane: Pane; index: number; tab: Tab } => row.tab !== undefined)
+        .sort((a, b) => wsAt(a.tab.workspaceId) - wsAt(b.tab.workspaceId) || tabAt(a.tab.id) - tabAt(b.tab.id) || a.index - b.index);
+      const panes = ordered.flatMap(({ pane, tab }) => {
+        const ws = journal.workspaces.find((row) => row.id === tab.workspaceId);
+        if (!ws) return [];
         const live = livePty(pane);
-        return [{ address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title,
+        return [{ address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
           cwd: pane.cwd, command: pane.command, state: pane.state === 'exited' ? 'exited' : live ? pane.state : 'idle',
           ptyId: live ? pane.ptyId : '', restore: pane.restore }];
       });
       return { exitCode: 0, message: JSON.stringify({ workspaces: journal.workspaces, tabs: journal.tabs, panes }, null, 2) };
+    },
+
+    /**
+     * Move a workspace (before another workspace, or to the end) or a tab (before another tab of the SAME workspace, or to
+     * the end of its workspace). The order is the journal's own array order, saved with the journal: it survives a restart
+     * and every client reads the same one. A failed save leaves the order as it was.
+     */
+    reorder(input: { kind: string; id: string; before?: string }): ElsResult {
+      if (input.kind !== 'workspace' && input.kind !== 'tab') return { exitCode: 2, message: 'els reorder: kind must be workspace or tab' };
+      if (typeof input.id !== 'string' || (input.before !== undefined && typeof input.before !== 'string')) return { exitCode: 2, message: 'els reorder: id and before must be strings' };
+      // The end is spelled three ways — omitted, "" or "end" — and means the same (a caller with an empty --before must not
+      // be refused or, worse, move something else). Any other text must name an existing workspace/tab.
+      const before = input.before === undefined || input.before === '' || input.before === 'end' ? undefined : input.before;
+      if (input.kind === 'workspace') {
+        const moving = findWorkspace(journal, input.id);
+        if (!moving) return { exitCode: 1, message: `els reorder: unknown workspace ${input.id}` };
+        const target = before === undefined ? undefined : findWorkspace(journal, before);
+        if (before !== undefined && !target) return { exitCode: 1, message: `els reorder: unknown workspace ${before}` };
+        if (target?.id === moving.id) return { exitCode: 0, message: `els reorder: ${moving.id} stays` };
+        const rest = journal.workspaces.filter((row) => row.id !== moving.id);
+        const at = target ? rest.findIndex((row) => row.id === target.id) : rest.length;
+        const workspaces = [...rest.slice(0, at), moving, ...rest.slice(at)];
+        try { commit({ ...journal, workspaces }); } catch (error) { return { exitCode: 1, message: `els reorder: not saved: ${message(error)}` }; }
+        return { exitCode: 0, message: `els reorder: workspace ${moving.id} moved` };
+      }
+      const moving = journal.tabs.find((row) => row.id === input.id);
+      if (!moving) return { exitCode: 1, message: `els reorder: unknown tab ${input.id}` };
+      const target = before === undefined ? undefined : journal.tabs.find((row) => row.id === before);
+      if (before !== undefined && !target) return { exitCode: 1, message: `els reorder: unknown tab ${before}` };
+      if (target && target.workspaceId !== moving.workspaceId) return { exitCode: 2, message: 'els reorder: a tab moves inside its own workspace' };
+      if (target?.id === moving.id) return { exitCode: 0, message: `els reorder: ${moving.id} stays` };
+      const rest = journal.tabs.filter((row) => row.id !== moving.id);
+      const at = target
+        ? rest.findIndex((row) => row.id === target.id)
+        : rest.reduce((last, row, index) => row.workspaceId === moving.workspaceId ? index + 1 : last, rest.length);
+      const tabs = [...rest.slice(0, at), moving, ...rest.slice(at)];
+      try { commit({ ...journal, tabs }); } catch (error) { return { exitCode: 1, message: `els reorder: not saved: ${message(error)}` }; }
+      return { exitCode: 0, message: `els reorder: tab ${moving.id} moved` };
     },
 
     /** A person typing in an attached view: raw bytes to the pane's PTY, no queue and no «⇢» line. The settle clock starts,

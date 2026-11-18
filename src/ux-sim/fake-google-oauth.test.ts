@@ -138,11 +138,11 @@ describe('fake Google OAuth member boundary', () => {
         })))!;
         expect(callback.status).toBe(303);
         const location = callback.headers.get('location') ?? '';
-        expect(new URL(location).pathname).toBe('/v1/members/home');
+        expect(new URL(location).pathname).toBe('/signup/complete');
         expect(await callback.text()).not.toContain('Save your member key');
         const sessionCookie = callback.headers.get('set-cookie')!.split(';', 1)[0]!;
         expect(sessionCookie.startsWith('__Host-elanous_member_session=')).toBe(true);
-        const home = (await api.handle(new Request(location, { headers: { cookie: sessionCookie } })))!;
+        const home = (await api.handle(new Request('https://api.example.test/v1/members/home', { headers: { cookie: sessionCookie } })))!;
         expect(home.status).toBe(200);
         const profile = (await api.handle(new Request('https://api.example.test/v1/members', {
           headers: { cookie: sessionCookie },
@@ -373,7 +373,7 @@ describe('fake Google OAuth member boundary', () => {
     const completed = await routeRequest(new Request(callbackUrl, { headers: { cookie: stateCookie.split(';')[0]! } }),
       { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
     expect(completed?.status).toBe(303);
-    expect(completed?.headers.get('location')).toBe('https://api.example.test/v1/members/home');
+    expect(completed?.headers.get('location')).toBe('https://app.example.test/signup/complete');
     expect(await completed!.text()).toBe('');
     const setCookie = completed?.headers.get('set-cookie') ?? '';
     expect(setCookie.startsWith('__Host-elanous_member_session=')).toBe(true);

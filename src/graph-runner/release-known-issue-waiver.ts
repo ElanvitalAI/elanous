@@ -1,6 +1,8 @@
+import { RELEASE_CUT_NODE_IDS } from '../../scripts/release-loop/release-node-ids.js';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { join } from 'node:path';
 import { lastJsonObject } from './runner-primitives.js';
 import type { GraphRunState } from './runner-types.js';
@@ -55,7 +57,7 @@ export function validateReleaseKnownIssueWaiverApproval(
   const gateIndex = state.path.indexOf(KNOWN_ISSUE_ROUTE.gate);
   const gate = state.nodes[gateIndex];
   const gateOutput = lastJsonObject(gate?.output);
-  const cut = lastJsonObject(state.nodes.find((record) => record.nodeId === KNOWN_ISSUE_ROUTE.cut)?.output)?.commit;
+  const cut = lastJsonObject(state.nodes.find((record) => RELEASE_CUT_NODE_IDS.includes(record.nodeId) || record.nodeId === KNOWN_ISSUE_ROUTE.cut)?.output)?.commit;
   if (gateIndex < 0 || state.path.lastIndexOf(KNOWN_ISSUE_ROUTE.gate) !== gateIndex || gate?.nodeId !== KNOWN_ISSUE_ROUTE.gate ||
       gate.ok !== false || gate.executed !== true || gate.waiver !== undefined ||
       gateOutput?.outcome !== 'error' || !Array.isArray(gateOutput.introduced) ||
@@ -96,7 +98,7 @@ export function validateReleaseKnownIssueWaiverApproval(
 export function assertReleaseKnownIssueWaiverApproval(state: GraphRunState, root: string, allowRecordedDecision = false): void {
   // Isolated --test universes may carry fixture evidence under their own root.
   // The live instance reads the pinned JUD adjudication from the HQ seat state.
-  const evidenceRoot = root === join(homedir(), '.elanous')
+  const evidenceRoot = root === prodInstanceRoot()
     ? join(homedir(), 'elanous-hq', 'seat-state') : join(root, 'seat-state');
   const document = readFileSync(join(evidenceRoot, T6_WAIVER_DOCUMENT));
   const doc = JSON.parse(document.toString()) as { unmeasuredShards: string[] };
@@ -112,7 +114,7 @@ function assertT6RawUnmeasuredEvidence(state: GraphRunState, root: string, evide
   const lines = supplement.toString().trimEnd().split(/\r?\n/);
   if (lines[0] !== 'table_row\tshard\tattempt_id\texact_test\treference\tsha256\tstatus\tnote')
     throw new Error('T6 raw supplement schema differs');
-  const cut = lastJsonObject(state.nodes.find((record) => record.nodeId === KNOWN_ISSUE_ROUTE.cut)?.output)?.commit;
+  const cut = lastJsonObject(state.nodes.find((record) => RELEASE_CUT_NODE_IDS.includes(record.nodeId) || record.nodeId === KNOWN_ISSUE_ROUTE.cut)?.output)?.commit;
   const corroborated = lines.slice(1).flatMap((line) => {
     const cells = line.split('\t');
     if (cells[6] !== 'unmeasured-receipt') return [];

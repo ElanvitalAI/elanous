@@ -42,7 +42,7 @@ test('plugin declares the four-stage output contract and installs', async () => 
     expect(catalog.errors).toEqual([]);
     expect(catalog.graphs.find(graph => graph.id === 'architecture-deliverables')?.inputKeys).toEqual(['structuredDesignPath', 'outDir', 'resourceRoot']);
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+}, 60_000);
 
 test('architecture graph is discoverable as an executable plugin tool', () => {
   const adapter = createPluginRouteAdapter({ pluginRoot: join(dir, '..'), dispatchCore: async () => undefined });

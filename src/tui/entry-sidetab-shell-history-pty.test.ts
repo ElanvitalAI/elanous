@@ -74,7 +74,16 @@ test('open side tab first PTY frame retains pre-TUI shell history across repaint
         const viewportContainsMarker = (): boolean => Array.from({ length: terminal.rows }, (_, row) =>
           terminal.buffer.normal.getLine(terminal.buffer.normal.viewportY + row)?.translateToString(true) ?? '').join('\n').includes(marker);
         let markerReachable = viewportContainsMarker();
-        while (terminal.buffer.normal.viewportY > 0 && !markerReachable) {
+        if (terminal.buffer.active.type === 'alternate') {
+          // A tall screen draws on the alternate screen (setTuiAltScreen); scrollPages moves that buffer, never the
+          // primary one, so scrolling cannot reach the shell history from here. What must hold is that the primary
+          // buffer still keeps it (checked above, exactly once) — the user scrolls to it once the TUI is back on it.
+          markerReachable = history.some((line) => line.includes(marker));
+        }
+        // Bounded: a page up that does not move the viewport ends the search (a failure, never a hang).
+        let lastViewportY = -1;
+        while (terminal.buffer.normal.viewportY > 0 && !markerReachable && terminal.buffer.normal.viewportY !== lastViewportY) {
+          lastViewportY = terminal.buffer.normal.viewportY;
           terminal.scrollPages(-1);
           markerReachable = viewportContainsMarker();
         }

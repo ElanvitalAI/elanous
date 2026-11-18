@@ -12,9 +12,9 @@ import {
   MAX_AGENT_OUTPUT_TIMEOUT_MS,
   buildAgentOutputTool,
   dispatchAgentOutput,
-} from '../src/agent/agent-output-tool.ts';
-import { AgentRegistry, globalAgentRegistry } from '../src/agent/registry.ts';
-import type { AgentDefinition, AgentTask } from '../src/agent/types.ts';
+} from '../src/agent/agent-output-tool.js';
+import { AgentRegistry, globalAgentRegistry } from '../src/agent/registry.js';
+import type { AgentDefinition, AgentTask } from '../src/agent/types.js';
 import { debug } from '../src/debug/log.js';
 import { agentOutputRuntime } from '../src/tool-runtime/agent-output-runtime.js';
 import { streamLLMWithTools, type LLMProvider } from '../src/llm.js';
@@ -45,6 +45,7 @@ describe('AgentOutput tool', () => {
   /** The 1800s stream-total boundary a caller might pass; the tool must clamp it (A207). */
   const STREAM_TOTAL_TIMEOUT_MS = 30 * 60_000; // 출처: #38137 stream total-timeout boundary
   test('buildAgentOutputTool returns a well-formed LLMToolSpec', () => {
+    // A5 계약 문구(20261118-92460 한 갈래): 신규 단일 문구를 독립 리터럴로 단언 — 7필드 전체 대조는 a5-model-contract.test.ts 담당.
     const spec = buildAgentOutputTool();
     expect(spec.name).toBe('AgentOutput');
     expect(spec.description).toContain('background AgentTask');
@@ -56,10 +57,10 @@ describe('AgentOutput tool', () => {
     expect(props['taskId']?.type).toBe('string');
     expect(props['block']?.type).toBe('boolean');
     expect(props['timeoutMs']?.type).toBe('number');
-    expect(spec.description).toContain('same taskId to continue waiting');
-    expect(props['timeoutMs']?.description).toContain('short checks');
-    expect(props['timeoutMs']?.description).toContain('commonly take longer');
-    expect(props['timeoutMs']?.description).toContain('larger than the default');
+    expect(spec.description).toContain('finish this turn — the result arrives on its own as a new turn event (<task-notification> for follow-up, one chat line for supplement)');
+    expect(spec.description).toContain('Do not loop on this tool waiting for completion');
+    expect(props['timeoutMs']?.description).toContain('Upper bound on one blocking peek when block=true');
+    expect(props['timeoutMs']?.description).toContain('this is a status check, not a wait for the result');
     expect(spec.description).not.toMatch(/\d+ms/);
     expect(props['timeoutMs']?.description).not.toMatch(/\d+ms/);
   });
@@ -280,7 +281,8 @@ describe('AgentOutput tool', () => {
     expect(r.durationMs).toBeUndefined();
     expect(r.output).toContain('timeout after 0ms');
     expect(r.output).toContain('task elapsed 90000ms');
-    expect(r.output).toContain('same taskId to continue waiting');
+    // 20261118-92460 한 갈래: 폴링 재호출 힌트 → 신규 waitHint 리터럴(스펙 우선).
+    expect(r.output).toContain('end your turn — the result arrives on its own as a new turn event (<task-notification>)');
   });
 
   test('timeout leaves task elapsed time absent when start time is unavailable', async () => {
@@ -401,7 +403,8 @@ describe('AgentOutput tool', () => {
     expect(timedOut.taskElapsedMs).toBe(30_000);
     expect(timedOut.output).toContain('timeout after 0ms');
     expect(timedOut.output).toContain('task elapsed 30000ms');
-    expect(timedOut.output).toContain('same taskId to continue waiting');
+    // 20261118-92460 한 갈래: waitHint 교체로 신규 리터럴로 갱신(스펙 우선) — 시험명의 «같은 taskId 재독기» 동작 자체는 그대로 아래에서 증명.
+    expect(timedOut.output).toContain('end your turn — the result arrives on its own as a new turn event (<task-notification>)');
 
     const second = dispatchAgentOutput(
       { taskId: t.id, block: true, timeoutMs: STREAM_TOTAL_TIMEOUT_MS },

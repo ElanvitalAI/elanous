@@ -1951,23 +1951,23 @@ test('unit source changed after validation has no enter/exit or child ledger', a
   expect(existsSync(join(root, 'graph-runs', 'worker'))).toBe(false);
 });
 
-test('nested units reject a fourth level before any command, and child failure keeps both ledgers linked', async () => {
+test('nested units reject a sixth level before any command, and child failure keeps both ledgers linked', async () => {
   const { graph, root, unit } = unitFixture();
   const source = readFileSync(unit, 'utf8');
   const unitDir = join(root, 'units');
-  for (const [id, next] of [['worker', 'level-2'], ['level-2', 'level-3'], ['level-3', 'level-4']] as const) {
+  for (const [id, next] of [['worker', 'level-2'], ['level-2', 'level-3'], ['level-3', 'level-4'], ['level-4', 'level-5'], ['level-5', 'level-6']] as const) {
     const content = source.replace('graph_id: worker', `graph_id: ${id}`)
       .replace('  - { node_id: produce, kind: agent, recipe: \'cmd:produce\', max_visits: 1 }',
         `  - { node_id: produce, kind: subgraph, recipe: none, max_visits: 1, call: ${next}@1, budget: { inner_steps: 20 }, contract: { inputs: [request], tools: read-only, outputs: [answer] } }`)
       .replace('map: { ok: done, fail: failed }', 'map: { done: done, failed: failed }');
     writeFileSync(join(unitDir, `${id}.yaml`), content);
   }
-  writeFileSync(join(unitDir, 'level-4.yaml'), source.replace('graph_id: worker', 'graph_id: level-4'));
+  writeFileSync(join(unitDir, 'level-6.yaml'), source.replace('graph_id: worker', 'graph_id: level-6'));
   let calls = 0;
   await expect(runGraph(graph, { input: { request: 'hello' }, deps: { root, runBash: async () => {
     calls++;
     return { stdout: '', stderr: '', exitCode: 0 };
-  } } })).rejects.toThrow('unit nesting exceeds depth 3');
+  } } })).rejects.toThrow('unit nesting exceeds depth 5: parent -> worker -> level-2 -> level-3 -> level-4 -> level-5 -> level-6');
   expect(calls).toBe(0);
   writeFileSync(unit, source);
   const failed = await runGraph(graph, { input: { request: 'hello' }, deps: { root,

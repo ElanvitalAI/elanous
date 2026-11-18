@@ -1,0 +1,24 @@
+// CAPSULE-A5 — 모델 계약 문구(OP 결정 #89815 · 내부 문서 `TURN-CAPSULE-EVENTS` §3.2-A5):
+// 20261118-92460 한 갈래 문구(A3 #38772~#38779 착지 반영) — 스위치 없는 단일 A5 상수.
+// 배경 실행이 기본: 띄웠으면 턴을 끝낸다 — 결과는 새 턴 사건으로 저절로 오고, 폴링 도구는 즉시 상태만.
+
+export interface A5Wordings {
+  readonly agentOutputDescription: string;
+  readonly agentOutputTimeoutParam: string;
+  readonly agentOutputWaitHint: string;
+  readonly agentLaunchContract: string;
+  readonly agentRunInBackground: string;
+  readonly shellPollDescription: string;
+  readonly runShellMode: string;
+}
+
+export const A5: A5Wordings = {
+  agentOutputDescription: "Peek at the current state of a background AgentTask by id. Pairs with Agent background launches. block=false (default) returns immediately: retrievalStatus='not_ready' while the task is still pending/running, else the terminal result. block=true waits up to timeoutMs for terminal state and returns retrievalStatus='timeout' if the wait elapses — a completed task always returns its result. The default flow is fire-and-forget: once a background task is launched, finish this turn — the result arrives on its own as a new turn event (<task-notification> for follow-up, one chat line for supplement). Do not loop on this tool waiting for completion.",
+  agentOutputTimeoutParam: "Upper bound on one blocking peek when block=true, clamped to the hard cap. Keep it short: this is a status check, not a wait for the result — the result arrives on its own as a new turn event. Ignored when block=false.",
+  agentOutputWaitHint: "end your turn — the result arrives on its own as a new turn event (<task-notification>)",
+  agentLaunchContract: "and hand off long investigations; launches run in the background by default — the spawn returns immediately and the worker's final message arrives on the next turn as a <task-notification>. Contract: once launched, finish this turn — do not poll for the child. Delivery differs by completion_delivery: \"follow-up\" (default) results arrive as a new turn event (<task-notification>); \"supplement\" results arrive as one concise chat line and never reopen a TUI turn.\nFor parallel research, prefer completion_delivery=\"supplement\" and budget_minutes=8: ask each child for its best verified evidence within the budget; late results appear as one chat line without reopening a TUI turn.\n\nThe sub-agent inherits the parent-provided tool catalog by default (Agent recursion is removed) and its own turn budget (default 20). It returns ONE final message which is delivered to you as a <task-notification> user message (or one supplement chat line). Pass everything the worker needs (data, persona, framing) inside `prompt` — the worker ",
+  agentRunInBackground: "Default true: returns the spawn handle immediately instead of waiting for completion. The child keeps running; its final message arrives in your next turn as a <task-notification> user message. When false, the call waits for the child only up to a cap, then detaches it — the detached child's result still arrives as a <task-notification>. Use for long-running explorations (multi-minute research, 10+ tool calls) so you can keep working in parallel.",
+  shellPollDescription: "Read the current state of a shell-runner handle by id — immediate status only. Returns status, elapsed, and exit code if the command has resolved. Does not block. A backgrounded command finishes on its own and its completion arrives as a new turn event — do not poll in a loop waiting for it to finish.",
+  runShellMode: "Shell-runner mode. Omit for the legacy argv-only path. 'inline' captures command output; 'bg' registers it for later ShellPoll (completion also arrives on its own as a turn event — do not poll in a loop).",
+};
+export function a5Wordings(): A5Wordings { return A5; }

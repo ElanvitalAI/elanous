@@ -19,7 +19,7 @@ test('production decisions CLI sends one notice to the raised track; retry adds 
   const stateDir = mkdtempSync(join(tmpdir(), 'decided-notify-cli-'));
   const output: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, options(stateDir), { log: line => output.push(line) });
+  registerDecisionsCommands(program, { ...options(stateDir), humanTerminal: () => true }, { log: line => output.push(line) });
   const run = (...args: string[]) => {
     output.length = 0;
     program.parse(['decisions', ...args], { from: 'user' });
@@ -55,7 +55,7 @@ test('production decisions CLI reports a skipped notice when no track was raised
   const stateDir = mkdtempSync(join(tmpdir(), 'decided-notify-cli-skipped-'));
   const output: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, options(stateDir), { log: line => output.push(line) });
+  registerDecisionsCommands(program, { ...options(stateDir), humanTerminal: () => true }, { log: line => output.push(line) });
   const run = (...args: string[]) => {
     output.length = 0;
     program.parse(['decisions', ...args], { from: 'user' });
@@ -108,7 +108,7 @@ test('untracked decision sends no notice; failed post preserves decision and ret
     expect(failing.show(raised.id).status).toBe('decided');
     const output: string[] = [];
     const program = new Command();
-    registerDecisionsCommands(program, options(stateDir), { log: line => output.push(line) });
+    registerDecisionsCommands(program, { ...options(stateDir), humanTerminal: () => true }, { log: line => output.push(line) });
     program.parse(['decisions', 'retry-notify', raised.id, '--json'], { from: 'user' });
     expect(JSON.parse(output[0]!)).toMatchObject({ status: 'sent', seat: 'UX' });
     const store = openMsgStore(join(stateDir, 'msg', 'messages.db'));

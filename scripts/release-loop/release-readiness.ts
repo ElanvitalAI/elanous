@@ -7,6 +7,7 @@ import { cutChecklistGate, type ChecklistGate } from '../../src/release-loop/che
 export type ReadinessChecklist = Pick<ChecklistGate, 'ok' | 'red' | 'undecided' | 'blocked'>;
 import { getSchedule, formatKst } from '../../src/release-loop/release-schedule.js';
 import { debug } from '../../src/debug/log.js';
+import { baseVersion, isReleaseVersion, prereleaseKind } from './release-version.js';
 
 export type ReleaseReadiness =
   | { ready: false; reason: 'already-published'; details: string }
@@ -39,7 +40,8 @@ export type GateImageReadiness =
   | { status: 'unknown'; reason: 'signal-missing' | 'signal-invalid' | 'run-mismatch' | 'commit-mismatch' | 'prebuild-pending' | 'prebuild-unconfirmed' };
 
 export function gateImageReadinessSignalPath(root: string, version: string): string {
-  if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(version)) throw new Error(`release version must be x.y.z: ${version}`);
+  // x.y.z or a prerelease x.y.z-(rc|alpha|beta).N; anything else (e.g. `../0.2.6`) never reaches a ledger path.
+  if (!isReleaseVersion(version)) throw new Error(`release version must be x.y.z: ${version}`);
   return join(root, 'release', version, 'image-readiness.json');
 }
 
@@ -98,7 +100,7 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
 }> {
   const version = context.input?.version;
   const runId = context.runId;
-  const versionOutput = context.outputs?.['version-release'];
+  const versionOutput = context.outputs?.['cut-branch'] ?? context.outputs?.['version-release'];
   const cutCommit = versionOutput && typeof versionOutput === 'object' && !Array.isArray(versionOutput)
     ? (versionOutput as { commit?: unknown }).commit : undefined;
   if (typeof version !== 'string' || typeof runId !== 'string' || typeof cutCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(cutCommit)) {
@@ -108,11 +110,14 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
   const schedule = getSchedule(version, root);
   // 0.3.6 skips the new image signal contract, but every scheduled graph still
   // waits for its cut before progressing beyond this node.
-  const versionParts = version.split('.').map(Number);
+  const versionParts = (isReleaseVersion(version) ? baseVersion(version) : version).split('.').map(Number);
   const before037 = versionParts[0]! === 0 && (versionParts[1]! < 3 || (versionParts[1]! === 3 && versionParts[2]! < 7));
+  // A prerelease (rehearsal) run has no schedule row of its own: its cut is treated as already reached,
+  // while the image T-60 signal contract below still applies. Stable versions keep requiring a schedule.
+  const prerelease = isReleaseVersion(version) && prereleaseKind(version) !== null;
   if (!schedule && before037) return { version, runId, cutCommit, eta: (deps.now ?? (() => new Date()))().toISOString(), signalPath: '' };
-  if (!schedule) throw new Error(`readiness countdown requires a release schedule: ${version}`);
-  if (!Number.isFinite(Date.parse(schedule.cutAt))) throw new Error(`readiness countdown has invalid cutAt: ${schedule.cutAt}`);
+  if (!schedule && !prerelease) throw new Error(`readiness countdown requires a release schedule: ${version}`);
+  if (schedule && !Number.isFinite(Date.parse(schedule.cutAt))) throw new Error(`readiness countdown has invalid cutAt: ${schedule.cutAt}`);
   const now = deps.now ?? (() => new Date());
   const sleep = deps.sleep ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const pollMilliseconds = deps.pollMilliseconds ?? 30_000;
@@ -132,8 +137,11 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
   const signalPath = gateImageReadinessSignalPath(root, version);
   const statePath = join(root, 'release', version, 'readiness-countdown.json');
   const readSignal = deps.readSignal ?? readGateImageReadinessSignal;
-  const prebuild = versionOutput && typeof versionOutput === 'object' && !Array.isArray(versionOutput)
-    ? (versionOutput as { gateImagePrebuild?: unknown }).gateImagePrebuild : undefined;
+  const prebuildSource = context.outputs?.['gate-image-prebuild'];
+  const prebuild = (prebuildSource && typeof prebuildSource === 'object' && !Array.isArray(prebuildSource)
+    ? (prebuildSource as { gateImagePrebuild?: unknown }).gateImagePrebuild : undefined)
+    ?? (versionOutput && typeof versionOutput === 'object' && !Array.isArray(versionOutput)
+      ? (versionOutput as { gateImagePrebuild?: unknown }).gateImagePrebuild : undefined);
   const attestation = prebuild && typeof prebuild === 'object' && !Array.isArray(prebuild)
     ? prebuild as { outcome?: unknown; runId?: unknown; cutCommit?: unknown; digest?: unknown; eligiblePools?: unknown } : null;
   const prebuildSucceeded = (attestation?.outcome === 'built' || attestation?.outcome === 'reused')
@@ -143,37 +151,38 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
     && Array.isArray(attestation.eligiblePools) && attestation.eligiblePools.length > 0
     && attestation.eligiblePools.every((pool) => typeof pool === 'string' && pool.trim());
   let lastReason = '';
-  let lastCutAt: string | undefined;
+  let lastCutAt: string | null | undefined;
   while (true) {
     const currentSchedule = getSchedule(version, root);
-    if (!currentSchedule || !Number.isFinite(Date.parse(currentSchedule.cutAt))) throw new Error(`readiness countdown schedule unavailable or invalid: ${version}`);
+    if (currentSchedule ? !Number.isFinite(Date.parse(currentSchedule.cutAt)) : !prerelease) throw new Error(`readiness countdown schedule unavailable or invalid: ${version}`);
+    const cutAt = currentSchedule?.cutAt ?? null;
     const instant = now();
     const observedAt = instant.toISOString();
-    const fromCutAt = lastCutAt !== undefined && lastCutAt !== currentSchedule.cutAt ? lastCutAt : undefined;
+    const fromCutAt = lastCutAt !== undefined && lastCutAt !== cutAt ? lastCutAt : undefined;
     const observed = readSignal(signalPath, { runId, cutCommit });
     const image: GateImageReadiness = observed.status === 'unknown' ? observed
       : prebuildSucceeded && String(attestation!.digest).toLowerCase() === observed.signal.imageDigest.toLowerCase()
         && [...attestation!.eligiblePools as string[]].sort().join('\n') === [...observed.signal.eligiblePools].sort().join('\n')
         ? observed : { status: 'unknown', reason: 'prebuild-unconfirmed' };
-    const cutReached = instant.getTime() >= Date.parse(currentSchedule.cutAt);
+    const cutReached = cutAt === null || instant.getTime() >= Date.parse(cutAt);
     const ready = image.status === 'ready' && cutReached;
     const holdReason = image.status === 'ready' ? (cutReached ? null : 'cut-time-constraint') : `image-t60:${image.reason}`;
-    const eta = ready ? observedAt : image.status === 'ready' ? currentSchedule.cutAt : null;
+    const eta = ready ? observedAt : image.status === 'ready' ? cutAt : null;
     const state = { version, runId, cutCommit, phase: ready ? 'ready' : image.status === 'ready' ? 'countdown' : 'hold',
       eta, holdReason, signalPath, updatedAt: observedAt };
     writeCountdownState(statePath, state);
     if (fromCutAt !== undefined) {
       debug.log('release.schedule', 'countdown-cut-time-changed', { version, runId, fromCutAt,
-        cutAt: currentSchedule.cutAt, observedAt, eta, phase: state.phase, holdReason });
+        cutAt, observedAt, eta, phase: state.phase, holdReason });
     }
-    lastCutAt = currentSchedule.cutAt;
+    lastCutAt = cutAt;
     if (ready) {
       debug.log('release.schedule', 'countdown-ready', { version, runId, cutCommit, eta: observedAt, signalPath });
       return { version, runId, cutCommit, eta: observedAt, signalPath };
     }
     const reason = holdReason!;
     if (lastReason !== reason) {
-      debug.log('release.schedule', 'countdown-hold', { version, runId, cutCommit, eta, reason, signalPath, cutAt: currentSchedule.cutAt });
+      debug.log('release.schedule', 'countdown-hold', { version, runId, cutCommit, eta, reason, signalPath, cutAt });
       lastReason = reason;
     }
     await sleep(pollMilliseconds);

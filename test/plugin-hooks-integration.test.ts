@@ -99,8 +99,10 @@ describe('SubagentSpawn hook', () => {
     // No registrations at all.
     const def = simpleDef();
     const provider = fakeProvider([[{ type: 'text', delta: 'done' }]]);
+    // #38772: Agent calls run in the background by default; this test is about
+    // the hook-free flow, so it asks for the blocking call explicitly.
     const result = await dispatchAgent(
-      { description: 'x', prompt: 'y', subagent_type: 'px3-test' },
+      { description: 'x', prompt: 'y', subagent_type: 'px3-test', run_in_background: false },
       { resolveAgentDef: (n) => (n === 'px3-test' ? def : undefined), provider },
     );
     expect(result.output).toBe('done');

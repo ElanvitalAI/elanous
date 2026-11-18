@@ -1,0 +1,13 @@
+schema: 1
+world: capsule-events
+scenarios:
+  - id: C1
+    module: src/ux-sim/sim-world/capsule-events/scenarios.ts
+  - id: C7
+    module: src/ux-sim/sim-world/capsule-events/c7-mcp.ts
+  - id: C3
+    module: src/ux-sim/sim-world/capsule-events/c3-shell.ts
+  - id: C1-MAIL
+    module: src/ux-sim/sim-world/capsule-events/c3-mail.ts
+  - id: C2
+    module: src/ux-sim/sim-world/capsule-events/c2-mail-tool.ts

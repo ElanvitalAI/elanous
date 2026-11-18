@@ -99,7 +99,7 @@ test('production tasks land-count receipt drives the live tasks hand admission a
     status: 'launched', taLand: true, runId, history: [] });
   const launches: string[][] = [];
   const deps: TasksCliDeps = { taskStatePath: statePath, registerSink: async () => true,
-    taskLauncher: (args) => { launches.push([...args]); } };
+    taskLauncher: (args, _cwd, launchContext) => { launches.push([...args]); return { runId: launchContext?.runId }; } };
   try {
     writeTaskCards(statePath, [card('ta-active', 'run-active'), card('ta-orphan', 'run-orphan')]);
     appendRunLedgerEntry({ runId: 'run-active', event: 'node-enter', data: { node: 'implementation' } }, ledgerDir);

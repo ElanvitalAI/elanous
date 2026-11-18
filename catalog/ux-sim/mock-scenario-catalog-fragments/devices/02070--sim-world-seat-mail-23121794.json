@@ -1,0 +1,23 @@
+{
+  "id": "sim-world-seat-mail",
+  "name": "SIM-WORLD-SEAT-MAIL pack",
+  "implementation": ["src/ux-sim/sim-world/seat-mail/scenarios.ts"],
+  "tests": ["src/ux-sim/sim-world/seat-mail/scenarios.test.ts"],
+  "target": "replays the seat-mail world pack scenarios (mail-exchange defects first seen on live seats 11-18) in isolated universes and judges each against seat-mail/expect.json until the kernel CLI (#38487) lands",
+  "inputs": [
+    "simWorldScenarios rows",
+    "seat-mail/expect.json verdicts",
+    "a throw-away universe per scenario"
+  ],
+  "observations": [
+    "the universe runs the real MsgStore, queue, watcher and msg post",
+    "only the outside is faked: clock, LLM, herdr, post-commit lock",
+    "each verdict goes through the kernel expectation ratchet"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/sim-world/seat-mail/scenarios.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

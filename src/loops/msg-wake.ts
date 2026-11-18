@@ -543,6 +543,8 @@ export function wakeLine(from: string, address: string, msgId: number): string {
 export const NO_WAKE_NOTICE = '이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다';
 /** An eln seat whose TUI watches its own inbox while idle (ELN-EXTERNAL-EVENTS ①). */
 export const IDLE_WATCH_WAKE = 'eln-idle-watch';
+/** The eln TUI's seat-mail notice queue (always on for a seat cwd) — the receiver when no autowake file exists. */
+export const ELN_SEAT_MAIL_QUEUE = 'eln-seat-mail-queue';
 
 /**
  * MSG-RECEIPTS-FOLLOWUP (TC ②): a wake=none post says whether the receiving body is KNOWN — registered (or watching its
@@ -597,7 +599,10 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
     // 사람이 앉는 pane 은 명시 opt-in 이 없으면 주입 0 — 에이전트가 idle 이어도 사람이 치는 중일 수 있다.
     if (resolution.optIn === false) return done('skipped', 'human-pane-no-opt-in');
     // OP 11-17 21:5x — an eln body that watches its own inbox is never typed into; the 60s fallback is the only knock.
-    if (!message.fallback && resolution.runtime === 'eln' && seatHasIdleMailWatch(address, deps)) return done('eln-mail-watch', IDLE_WATCH_WAKE);
+    // ELN-SEAT-LIVE 11-18: every eln seat TUI watches its inbox (seat-mail notice queue, #38031/#38193) whether or not the
+    // `autowake` opt-in file exists — typing into it as well made ONE mail two turns (HAND-ELN-ELS-API #87012: herdr turn,
+    // then the queued notice; the duplicate read-only work hit the 60-tool turn cap twice). runtime=eln alone now decides.
+    if (!message.fallback && resolution.runtime === 'eln') return done('eln-mail-watch', seatHasIdleMailWatch(address, deps) ? IDLE_WATCH_WAKE : ELN_SEAT_MAIL_QUEUE);
     if (!isLive(deps)) return done('skipped-test-universe');
     claim = claimWake(claimDbPath(deps), address, (deps.now ?? Date.now)());
     if (!claim) return done('debounced');

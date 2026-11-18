@@ -102,6 +102,7 @@ export { readShardArtifacts, type ShardArtifacts } from './gate-shard-artifacts.
 import { decideAndRecordGateAutoheal, gateAutohealCause, type GateAutohealDecision } from './gate-autoheal.js';
 import { gateEnvBaselineLine, gateShardShell, gateBeatScript, gateShardAbortScript, shellQuoteArgument as quote, asPath } from './gate-shard-shell.js';
 import { GATE_NIGHTLY_AUDITS } from './gate-nightly-audits.js';
+import { releaseCutRecord } from './release-cut-record.js';
 export { GATE_NIGHTLY_AUDITS } from './gate-nightly-audits.js';
 export { gateEnvBaselineLine, gateShardShell, gateBeatScript, gateShardAbortScript, GATE_SHARD_ABORT_GRACE_SECONDS } from './gate-shard-shell.js';
 
@@ -5738,7 +5739,7 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
     .filter(([nodeId, output]) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId) && output.outcome === 'ok'
       && typeof output.commit === 'string' && /^[0-9a-f]{40}$/i.test(output.commit))
     .at(-1)?.[1]?.commit;
-  const graphCommit = typeof landedRepair === 'string' ? landedRepair : context?.outputs['version-release']?.commit;
+  const graphCommit = typeof landedRepair === 'string' ? landedRepair : releaseCutRecord(context)?.commit;
   if (typeof graphCommit === 'string') fromGraph.commit = graphCommit;
   const imagePinRepair = context && Object.entries(context.outputs).some(([nodeId, output]) =>
     /^gate-image-repair-[a-f0-9]{12}$/.test(nodeId) && output.outcome === 'ok' && output.imagePin === 'cut-commit'

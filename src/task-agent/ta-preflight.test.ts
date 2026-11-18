@@ -9,11 +9,15 @@ import { evaluateTaPreflight, renderTaPreflight, targetEvidenceMismatch, taPrefl
 
 const sha = 'a'.repeat(40);
 const dg = `sha256:${'b'.repeat(64)}`;
+// 실제 발사 argv 리터럴(hand shadow 출력의 `harness say` 플래그) — 기대값은 제품 상수가 아니라 이 독립 리터럴.
+const ARGV_CLOSED = ['harness', 'say', '--substrate', 'pod', '--no-auto-merge'];
+const ARGV_MERGE_BY_HOST = ['harness', 'say', '--substrate', 'pod', '--merge-by-host'];
 const good: TaPreflightEvidence = {
   source: { requestedPin: sha, childHead: sha, privateRepo: true },
   image: { expectedDigest: dg, observedDigest: dg },
   workOrder: { cellId: 'X', boundary: 'src/a.ts', budget: '6900s', contract: 'c', escalation: 'OP', unknownFields: [] },
-  autoMerge: false,
+  launchArgv: ARGV_CLOSED,
+  mergePolicy: { taLandEnv: false, liveMovesProposeLand: false },
   owner: { card: 'TC', lease: 'TC', pod: 'TC' },
   limits: { wallClockSec: 6900, jobDeadlineSec: 10800, usdCap: 5 },
   launch: { requestConsumed: false, activeSameGoalRuns: 0, opHoldActive: false },
@@ -73,8 +77,8 @@ test('malformed evidence JSON never counts as measured', () => {
     expect(bad({ launch: { requestConsumed: false, activeSameGoalRuns, opHoldActive: false } }).conditions[4]!.status).toBe('UNMEASURED');
   }
   expect(bad({ launch: { requestConsumed: false, activeSameGoalRuns: 2, opHoldActive: false } }).conditions[4]!.status).toBe('FAIL');
-  expect(bad({ autoMerge: 0 }).conditions[2]!.status).toBe('UNMEASURED');
-  expect(bad({ autoMerge: 'false' }).conditions[2]!.status).toBe('UNMEASURED');
+  expect(bad({ launchArgv: 'harness say --no-auto-merge' }).conditions[2]!.status).toBe('UNMEASURED');
+  expect(bad({ launchArgv: [1, 2] }).conditions[2]!.status).toBe('UNMEASURED');
   // groundingConfigured 가 불리언 true 가 아니면(1) «URL 설정»으로 읽지 않는다 → URL·정책 모두 없음 = FAIL(측정값으로 인정 안 함).
   expect(bad({ entrance: { name: 'hand', groundingConfigured: 1 } }).conditions[5]!.status).toBe('FAIL');
   expect(bad({ source: { requestedPin: sha, childHead: sha, privateRepo: 1 } }).conditions[0]!.status).toBe('UNMEASURED');
@@ -84,7 +88,7 @@ test('malformed evidence JSON never counts as measured', () => {
 
 test('owner mismatch and auto-merge on fail condition 3', () => {
   expect(evaluateTaPreflight({ ...good, owner: { card: 'MVP-B', lease: 'TC', pod: 'TC' } }).conditions[2]!.detail).toContain('owner 불일치');
-  expect(evaluateTaPreflight({ ...good, autoMerge: true }).conditions[2]!.status).toBe('FAIL');
+  expect(evaluateTaPreflight({ ...good, launchArgv: ARGV_MERGE_BY_HOST }).conditions[2]!.status).toBe('FAIL');
 });
 
 test('receipt hash is stable for equal evidence', () => {
@@ -135,7 +139,8 @@ const staticBase: TaPreflightEvidence = {
   source: { requestedPin: sha, childHead: null, privateRepo: true },
   image: { expectedDigest: dg, observedDigest: null },
   workOrder: good.workOrder,
-  autoMerge: false,
+  launchArgv: ARGV_CLOSED,
+  mergePolicy: { taLandEnv: false, liveMovesProposeLand: false },
   owner: { card: 'TC', lease: 'TC', pod: 'TC' },
   limits: { wallClockSec: 6900, jobDeadlineSec: 10800, usdCap: 5 },
   launch: { requestConsumed: false, activeSameGoalRuns: 0, opHoldActive: false },
@@ -306,11 +311,11 @@ const cells: Cell[] = [
   { id: 'O06', cond: 3, desc: 'escalation = 모름 상수', evidence: ordEv({ workOrder: { ...good.workOrder!, escalation: '모름' } }), expect: 'FAIL', detail: 'escalation' },
   { id: 'O07', cond: 3, desc: 'unknownFields 비배열(문자열)', evidence: ordEv({ workOrder: { ...good.workOrder!, unknownFields: 'budget' as unknown as string[] } }), expect: 'FAIL' },
   { id: 'O08', cond: 3, desc: 'unknownFields 누락', evidence: ordEv({ workOrder: { ...good.workOrder!, unknownFields: undefined as unknown as string[] } }), expect: 'FAIL' },
-  { id: 'O09', cond: 3, desc: 'autoMerge true', evidence: ordEv({ autoMerge: true }), expect: 'FAIL', detail: '자동 merge 켜짐' },
-  { id: 'O10', cond: 3, desc: 'autoMerge true + 지시서 없음 (나쁨 우선)', evidence: ordEv({ autoMerge: true, workOrder: null }), expect: 'FAIL' },
-  { id: 'O11', cond: 3, desc: 'autoMerge null', evidence: ordEv({ autoMerge: null }), expect: 'UNMEASURED' },
-  { id: 'O12', cond: 3, desc: 'autoMerge 누락', evidence: ordEv({ autoMerge: undefined }), expect: 'UNMEASURED' },
-  { id: 'O13', cond: 3, desc: "autoMerge 'false' 문자열", evidence: ordEv({ autoMerge: 'false' as unknown as boolean }), expect: 'UNMEASURED' },
+  { id: 'O09', cond: 3, desc: 'argv: --merge-by-host(호스트 재게이트 병합)', evidence: ordEv({ launchArgv: ARGV_MERGE_BY_HOST }), expect: 'FAIL', detail: '자동 병합 가능' },
+  { id: 'O10', cond: 3, desc: 'argv: --merge-by-host + 지시서 없음 (나쁨 우선)', evidence: ordEv({ launchArgv: ARGV_MERGE_BY_HOST, workOrder: null }), expect: 'FAIL' },
+  { id: 'O11', cond: 3, desc: 'argv null', evidence: ordEv({ launchArgv: null }), expect: 'UNMEASURED', detail: 'argv 없음' },
+  { id: 'O12', cond: 3, desc: 'argv 누락', evidence: ordEv({ launchArgv: undefined }), expect: 'UNMEASURED' },
+  { id: 'O13', cond: 3, desc: "argv 가 문자열(배열 아님)", evidence: ordEv({ launchArgv: 'harness say --no-auto-merge' as unknown as string[] }), expect: 'UNMEASURED' },
   { id: 'O14', cond: 3, desc: 'owner 전부 없음({})', evidence: ordEv({ owner: {} }), expect: 'UNMEASURED', detail: 'owner 증거 부족' },
   { id: 'O15', cond: 3, desc: 'owner 누락', evidence: ordEv({ owner: undefined }), expect: 'UNMEASURED' },
   { id: 'O16', cond: 3, desc: 'owner card 만', evidence: ordEv({ owner: { card: 'TC' } }), expect: 'UNMEASURED' },
@@ -397,7 +402,8 @@ const laws: ReadonlyArray<{ cond: 1 | 2 | 3 | 4 | 5 | 6; fields: Field[] }> = [
   ] },
   { cond: 3, fields: [
     { name: 'workOrder', variants: [{ label: '정상', cls: 'ok', patch: keep }, { label: '없음', cls: 'missing', patch: (ev) => ({ ...ev, workOrder: null }) }, { label: 'critical 모름', cls: 'bad', patch: (ev) => ({ ...ev, workOrder: { ...good.workOrder!, unknownFields: ['budget'] } }) }] },
-    { name: 'autoMerge', variants: [{ label: 'false', cls: 'ok', patch: keep }, { label: 'true', cls: 'bad', patch: (ev) => ({ ...ev, autoMerge: true }) }, { label: 'null', cls: 'missing', patch: (ev) => ({ ...ev, autoMerge: null }) }, { label: "'false' 문자열", cls: 'missing', patch: (ev) => ({ ...ev, autoMerge: 'false' as unknown as boolean }) }] },
+    { name: '발사 argv', variants: [{ label: '--no-auto-merge', cls: 'ok', patch: keep }, { label: '--merge-by-host', cls: 'bad', patch: (ev) => ({ ...ev, launchArgv: ARGV_MERGE_BY_HOST }) }, { label: '플래그 없음(기본 자동 병합)', cls: 'bad', patch: (ev) => ({ ...ev, launchArgv: ['harness', 'say', '--substrate', 'pod'] }) }, { label: 'null', cls: 'missing', patch: (ev) => ({ ...ev, launchArgv: null }) }, { label: 'harness say 아님', cls: 'missing', patch: (ev) => ({ ...ev, launchArgv: ['ls', '-la'] }) }, { label: '명령 중간에 끼인 harness say', cls: 'missing', patch: (ev) => ({ ...ev, launchArgv: ['echo', 'harness', 'say', '--no-auto-merge'] }) }, { label: '-- 뒤의 --no-auto-merge', cls: 'bad', patch: (ev) => ({ ...ev, launchArgv: ['harness', 'say', '--', '--no-auto-merge'] }) }, { label: '문자열 토큰 아님', cls: 'missing', patch: (ev) => ({ ...ev, launchArgv: ['harness', 1 as unknown as string, 'say'] }) }] },
+    { name: 'taLandEnv', variants: [{ label: 'false', cls: 'ok', patch: keep }, { label: 'true', cls: 'bad', patch: (ev) => ({ ...ev, mergePolicy: { ...ev.mergePolicy, taLandEnv: true } }) }, { label: '누락', cls: 'missing', patch: (ev) => ({ ...ev, mergePolicy: { liveMovesProposeLand: false } }) }, { label: 'null', cls: 'missing', patch: (ev) => ({ ...ev, mergePolicy: { ...ev.mergePolicy, taLandEnv: null } }) }, { label: "'false' 문자열", cls: 'missing', patch: (ev) => ({ ...ev, mergePolicy: { ...ev.mergePolicy, taLandEnv: 'false' as unknown as boolean } }) }] },
     { name: 'owner', variants: [{ label: '셋 같음', cls: 'ok', patch: keep }, { label: '있는 칸끼리 다름(pod 없음)', cls: 'bad', patch: withOwner({ card: 'A', lease: 'B' }) }, { label: '일부 없음', cls: 'missing', patch: withOwner({ card: 'TC', lease: 'TC' }) }, { label: '전부 없음', cls: 'missing', patch: withOwner({}) }, { label: '공백', cls: 'missing', patch: withOwner({ card: 'TC', lease: 'TC', pod: '  ' }) }] },
   ] },
   { cond: 4, fields: [
@@ -454,8 +460,8 @@ for (const law of laws) {
 test('법칙표 명시 — pin 누락 × privateRepo false → FAIL (알려진 private 위반을 숨기지 않는다)', () => {
   expect(evaluateTaPreflight(srcEv({ requestedPin: null, childHead: null, privateRepo: false })).conditions[idx(1)]!.status).toBe('FAIL');
 });
-test('법칙표 명시 — owner card≠lease(pod 없음) × autoMerge 증거 없음 → FAIL', () => {
-  expect(evaluateTaPreflight({ ...staticBase, autoMerge: null, owner: { card: 'A', lease: 'B' } }).conditions[idx(3)]!.status).toBe('FAIL');
+test('법칙표 명시 — owner card≠lease(pod 없음) × 발사 argv 없음 → FAIL', () => {
+  expect(evaluateTaPreflight({ ...staticBase, launchArgv: null, owner: { card: 'A', lease: 'B' } }).conditions[idx(3)]!.status).toBe('FAIL');
 });
 test('법칙표 명시 — jobDeadline 0 × wallClock 없음 → FAIL', () => {
   expect(evaluateTaPreflight(limEv({ jobDeadlineSec: 0, usdCap: 5 })).conditions[idx(4)]!.status).toBe('FAIL');
@@ -466,6 +472,84 @@ for (const [id, url, expected] of [['U01', 'garbage', 'FAIL'], ['U02', 'ftp://ho
     expect(evaluateTaPreflight(ev).conditions[idx(6)]!.status).toBe(expected);
   });
 }
+
+// ══ ③ merge 경로 판정표 — 발사 argv 플래그 × liveMoves(propose-land) 설정/미설정 (OP 요청 리터럴 표) ══
+// 자동 병합이 «가능»하면 FAIL · 닫힘(--no-auto-merge 만)이면 PASS(이 칸) · argv 없음/명령 아님은 UNMEASURED. 사유는 병합 주체(호스트/TA).
+type MergeCell = { id: string; argv: unknown; taLandEnv: unknown; liveMoves: boolean; expect: Expect; detail?: string };
+const OMIT = Symbol('omit');
+const mergeCells: MergeCell[] = [
+  { id: 'M01', argv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge'], taLandEnv: false, liveMoves: false, expect: 'PASS' },
+  { id: 'M02', argv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge'], taLandEnv: false, liveMoves: true, expect: 'PASS' },
+  { id: 'M03', argv: ['harness', 'say', '--substrate', 'pod', '--merge-by-host'], taLandEnv: false, liveMoves: false, expect: 'FAIL', detail: 'liveMoves propose-land 미설정' },
+  { id: 'M04', argv: ['harness', 'say', '--substrate', 'pod', '--merge-by-host'], taLandEnv: false, liveMoves: true, expect: 'FAIL', detail: '호스트가 재게이트 뒤 병합' },
+  { id: 'M05', argv: ['harness', 'say', '--substrate', 'pod', '--merge-by-host'], taLandEnv: true, liveMoves: true, expect: 'FAIL', detail: 'TA propose-land 이 병합' },
+  { id: 'M06', argv: ['harness', 'say', '--substrate', 'pod', '--merge-by-host'], taLandEnv: true, liveMoves: false, expect: 'FAIL', detail: 'liveMoves propose-land 미설정' },
+  { id: 'M07', argv: ['harness', 'say', '--substrate', 'pod'], taLandEnv: false, liveMoves: false, expect: 'FAIL', detail: '--no-auto-merge 없음' },
+  { id: 'M08', argv: ['harness', 'say', '--substrate', 'pod'], taLandEnv: false, liveMoves: true, expect: 'FAIL', detail: '--no-auto-merge 없음' },
+  { id: 'M09', argv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge', '--merge-by-host'], taLandEnv: false, liveMoves: false, expect: 'FAIL', detail: '병합 인자가 우선' },
+  { id: 'M10', argv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge', '--auto-merge'], taLandEnv: false, liveMoves: true, expect: 'FAIL', detail: '자동 병합(--auto-merge)' },
+  { id: 'M11', argv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge'], taLandEnv: true, liveMoves: true, expect: 'FAIL', detail: 'TA propose-land 이 병합' },
+  { id: 'M12', argv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge'], taLandEnv: true, liveMoves: false, expect: 'FAIL', detail: 'liveMoves propose-land 미설정이면 호스트가 병합' },
+  { id: 'M13', argv: null, taLandEnv: false, liveMoves: false, expect: 'UNMEASURED', detail: 'argv 없음' },
+  { id: 'M14', argv: [], taLandEnv: false, liveMoves: true, expect: 'UNMEASURED' },
+  { id: 'M15', argv: ['ls', '-la'], taLandEnv: false, liveMoves: false, expect: 'UNMEASURED', detail: '시작하는 명령이 아님' },
+  { id: 'M16', argv: ['elanous', 'harness', 'say', '--substrate', 'pod', '--no-auto-merge'], taLandEnv: false, liveMoves: false, expect: 'PASS' },
+  // 없음·형식 오류 행(r3 리뷰) — taLandEnv: 불리언만 값 · argv: 명령 위치·옵션 경계
+  { id: 'M17', argv: ARGV_CLOSED, taLandEnv: OMIT, liveMoves: false, expect: 'UNMEASURED', detail: '--ta-land(발사 env) 여부 증거 없음' },
+  { id: 'M18', argv: ARGV_CLOSED, taLandEnv: null, liveMoves: false, expect: 'UNMEASURED' },
+  { id: 'M19', argv: ARGV_CLOSED, taLandEnv: 'false', liveMoves: false, expect: 'UNMEASURED', detail: '불리언 아님' },
+  { id: 'M20', argv: ARGV_CLOSED, taLandEnv: 0, liveMoves: true, expect: 'UNMEASURED' },
+  { id: 'M21', argv: ARGV_MERGE_BY_HOST, taLandEnv: OMIT, liveMoves: false, expect: 'FAIL', detail: '자동 병합 가능' },
+  { id: 'M22', argv: ['harness', 'say', '--substrate', 'pod'], taLandEnv: null, liveMoves: false, expect: 'FAIL', detail: '--no-auto-merge 없음' },
+  { id: 'M23', argv: ['echo', 'harness', 'say', '--no-auto-merge'], taLandEnv: false, liveMoves: false, expect: 'UNMEASURED', detail: '시작하는 명령이 아님' },
+  { id: 'M24', argv: ['harness', 'say', '--', '--no-auto-merge'], taLandEnv: false, liveMoves: false, expect: 'FAIL', detail: '--no-auto-merge 없음' },
+  { id: 'M25', argv: ['harness', 'say', '--no-auto-merge', '--', '--merge-by-host'], taLandEnv: false, liveMoves: false, expect: 'PASS' },
+  { id: 'M26', argv: ['harness', 1, 'say'], taLandEnv: false, liveMoves: false, expect: 'UNMEASURED', detail: '형식 오류' },
+  { id: 'M27', argv: 'harness say --no-auto-merge', taLandEnv: false, liveMoves: false, expect: 'UNMEASURED', detail: '형식 오류' },
+  { id: 'M28', argv: ['sh', '-c', 'harness say --no-auto-merge'], taLandEnv: false, liveMoves: false, expect: 'UNMEASURED', detail: '시작하는 명령이 아님' },
+  { id: 'M29', argv: ['elanous', 'harness', 'say', '--merge-by-host'], taLandEnv: false, liveMoves: true, expect: 'FAIL', detail: '자동 병합 가능' },
+  { id: 'M30', argv: ARGV_CLOSED, taLandEnv: true, liveMoves: true, expect: 'FAIL', detail: '--ta-land' },
+  { id: 'M31', argv: undefined, taLandEnv: true, liveMoves: true, expect: 'FAIL', detail: '--ta-land' },
+  { id: 'M32', argv: undefined, taLandEnv: OMIT, liveMoves: false, expect: 'UNMEASURED', detail: 'argv 없음' },
+];
+for (const cell of mergeCells) {
+  test(`merge판정표 ${cell.id}: ${JSON.stringify(cell.argv) ?? '(argv 없음)'} · ta-land=${cell.taLandEnv === OMIT ? '(누락)' : JSON.stringify(cell.taLandEnv)} · liveMoves=${cell.liveMoves} → ${cell.expect}`, () => {
+    const mergePolicy = (cell.taLandEnv === OMIT ? { liveMovesProposeLand: cell.liveMoves } : { taLandEnv: cell.taLandEnv, liveMovesProposeLand: cell.liveMoves }) as TaPreflightEvidence['mergePolicy'];
+    const ev: TaPreflightEvidence = { ...staticBase, launchArgv: cell.argv as TaPreflightEvidence['launchArgv'], mergePolicy };
+    const c = evaluateTaPreflight(ev).conditions[idx(3)]!;
+    expect(c.status).toBe(cell.expect);
+    if (cell.detail) expect(c.detail).toContain(cell.detail);
+  });
+}
+
+// 실프로세스 — hand shadow 를 실제로 띄워 출력을 파일로 저장하고, 그 파일로 preflight 를 실제로 띄운다(simCli spawn).
+async function shadowThenPreflight(handArgs: string[]): Promise<{ handOut: string; preflightOut: string; code: number }> {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-preflight-shadow-'));
+  try {
+    const hand = await simCli(['tasks', 'hand', ...handArgs], { mode: 'spawn', allowPaths: [['tasks', 'hand']], timeoutMs: 120_000 });
+    const shadowPath = join(dir, 'shadow.txt');
+    writeFileSync(shadowPath, hand.stdout);
+    const evidencePath = join(dir, 'e.json');
+    const { launchArgv: _omit, ...rest } = staticBase;
+    writeFileSync(evidencePath, JSON.stringify(rest));
+    const pre = await simCli(['tasks', 'preflight', '--evidence', evidencePath, '--hand-shadow', shadowPath], { mode: 'spawn', allowPaths: [['tasks', 'preflight']], timeoutMs: 120_000 });
+    return { handOut: hand.stdout, preflightOut: pre.stdout, code: pre.exitCode };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('실프로세스: hand shadow(--no-auto-merge) → preflight --hand-shadow 는 ③ PASS(merge 경로 닫힘)', async () => {
+  const r = await shadowThenPreflight(['ship it', '--no-auto-merge']);
+  expect(r.handOut).toContain('harness say --substrate pod --no-auto-merge');
+  expect(r.preflightOut).toMatch(/PASS {7}3\. 작업 지시서 · 귀속 · 자동 merge 0 — owner=TC/);
+  expect(r.code).toBe(0);
+}, 400_000);
+
+test('실프로세스: hand shadow(옵션 없음 = --merge-by-host) → preflight --hand-shadow 는 ③ FAIL(자동 병합 가능)', async () => {
+  const r = await shadowThenPreflight(['ship it']);
+  expect(r.handOut).toContain('harness say --substrate pod --merge-by-host');
+  expect(r.preflightOut).toMatch(/FAIL {7}3\. 작업 지시서 · 귀속 · 자동 merge 0 — .*자동 병합 가능 — 호스트가 재게이트 뒤 병합/);
+  expect(r.code).toBe(1);
+}, 400_000);
 
 test('축곱 표 마크다운 내보내기(TA_AXES_MD)', () => {
   const out = process.env.TA_AXES_MD;

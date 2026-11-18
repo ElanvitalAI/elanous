@@ -92,7 +92,8 @@ describe('L2 배선 가드 (서피스 무관 코어 노출)', () => {
   });
   test('POST /v1/self-event 가 method 블록 안에서 라우팅된다(외부 주입 HTTP 진입점)', () => {
     const src = read('../nexus/api/http-server.ts');
-    expect(src).toContain("pathname === '/v1/self-event' && method === 'POST'");
+    // 따옴표 무관(#38766 이 http-server.ts 를 큰따옴표로 재포맷) — 계약은 «경로+메서드 분기»지 따옴표가 아니다.
+    expect(src).toMatch(/pathname === ['"]\/v1\/self-event['"] && method === ['"]POST['"]/);
     expect(src).toContain('handleSelfEvent(req, opts.metaApi)');
   });
 });

@@ -55,11 +55,16 @@ describe('NEXUS http-server.ts — POST /v1/mcp route registration', () => {
   });
 
   test('a POST branch moved outside the mutation block is rejected even when closing braces are disguised', () => {
-    const branch = /    if \(pathname === '\/v1\/mcp' && method === 'POST'\) \{[\s\S]*?\n    \}/;
+    // Quote-agnostic (#38766 reformatted http-server.ts to double quotes).
+    const branch = /    if \(pathname === ['"]\/v1\/mcp['"] && method === ['"]POST['"]\) \{[\s\S]*?\n    \}/;
     const match = src.match(branch);
     expect(match).not.toBeNull();
     const withoutBranch = src.replace(branch, '');
-    const guardEnd = withoutBranch.indexOf('\n  }\n', withoutBranch.indexOf("if (method !== 'GET')"));
+    // Anchor on the mutation BLOCK opener (with brace) so a one-line `if (method !== "GET") return …method-not-allowed` guard is not mistaken for it.
+    const mutationBlock = /if \(method !== ['"]GET['"]\) \{/;
+    expect(withoutBranch).toMatch(mutationBlock);
+    const guardStart = withoutBranch.search(mutationBlock);
+    const guardEnd = withoutBranch.indexOf('\n  }\n', guardStart);
     expect(guardEnd).toBeGreaterThan(-1);
     const moved = withoutBranch.slice(0, guardEnd + '\n  }'.length)
       + '\n  // displaced POST branch\n' + match![0]

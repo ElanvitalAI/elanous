@@ -7,6 +7,7 @@ import {
   runIsolationHardcodeGate,
   scanHardcodeCandidates,
 } from './ci-isolation-hardcode-gate.js';
+import { join } from 'node:path';
 
 describe('ci-isolation-hardcode-gate violation reporting', () => {
   test('scan retains every line matching the unchanged homedir()+.elanous criterion', () => {
@@ -241,5 +242,16 @@ describe('ci-isolation-hardcode-gate — two-line homedir alias (2026-09-24 · T
       "const plist = join(home, 'Library', 'LaunchAgents', 'com.elanous.nexus.plist');",
     ].join('\n');
     expect(scanHardcodeCandidates(source)).toEqual([]);
+  });
+});
+
+describe('ci-isolation-hardcode-gate on the real tree (pr land full-tree mode)', () => {
+  // 🩸 2026-11-18: main 이 전체 트리 모드에서 빨강이었다(8 파일 · 15줄 · src/oauth/codex*·src/secret/*-lease·els-cli·release-*-known-issue*).
+  //   pr land 는 args=[] 로 전체 트리를 재므로 그 빨강이 모든 착지를 막았다. 착지 경로와 같은 인자로 이 트리를 잰다.
+  test('the repository tree passes with no arguments, exactly as pr land runs it', () => {
+    const errors: string[] = [];
+    const code = runIsolationHardcodeGate({ args: [], cwd: join(import.meta.dir, '..'), log: () => {}, error: (m) => errors.push(m) });
+    expect(errors).toEqual([]);
+    expect(code).toBe(0);
   });
 });

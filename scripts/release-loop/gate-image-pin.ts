@@ -361,11 +361,35 @@ export function runCutGateImagePrebuild(input: CutGateImagePrebuildInput, deps: 
   } catch { return { outcome: 'failed', reason: `prebuild child returned invalid JSON: ${line.slice(0, 300)}` }; }
 }
 
-async function prebuildFromArgs(args: string[]): Promise<ChildGateImagePrebuildOutcome> {
+/** RELEASE-REALPATH-PROBE: the prebuild child's stages, in order. A failure names one of these, not «bash exit 1». */
+export const PREBUILD_STAGES = ['clone', 'deps', 'skills', 'base-pull', 'build', 'pack-pwa', 'push'] as const;
+export type PrebuildStage = typeof PREBUILD_STAGES[number];
+/** `exit` is the stage child's own exit code (null = none measured); `ok` is the stage verdict — a child can exit 0 and still fail its stage. */
+export interface PrebuildStageReceipt { stage: PrebuildStage; exit: number | null; ok: boolean; reason: string }
+interface PrebuildProgress { current: PrebuildStage; stages: PrebuildStageReceipt[] }
+
+/** Main-run build stage verdict from a pool sync: the first failed member, with its node-side build.sh exit (null = no build child ran). */
+export function poolSyncBuildFailure(members: readonly { context: string }[],
+  results: ReadonlyMap<string, { ok: boolean; detail: string; buildExit?: number | null }>): { exit: number | null; reason: string } | null {
+  const failed = members.find((member) => !results.get(member.context)?.ok);
+  if (!failed) return null;
+  const row = results.get(failed.context);
+  return { exit: row?.buildExit ?? null, reason: `cut gate image build failed on ${failed.context}: ${row?.detail ?? 'no sync result'}` };
+}
+
+async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Promise<ChildGateImagePrebuildOutcome> {
+  const enter = (stage: PrebuildStage) => { progress.current = stage; };
+  const passed = (stage: PrebuildStage, reason = 'ok') => { progress.stages.push({ stage, exit: 0, ok: true, reason }); };
+  const failStage = (stage: PrebuildStage, exit: number | null, reason: string): never => {
+    progress.stages.push({ stage, exit, ok: false, reason: reason.trim().slice(-300) });
+    throw new Error(reason);
+  };
   const values = new Map<string, string>();
+  // Hard rehearsal only: walk clone→push on the real build.sh, stop before the registry push (no ledger/pin writes).
+  const rehearsalProbe = args.includes('--rehearsal-probe');
   for (let i = 0; i < args.length; i++) {
     const key = args[i]!;
-    if (key === '--prebuild') continue;
+    if (key === '--prebuild' || key === '--rehearsal-probe') continue;
     const value = args[++i];
     if (!value || !['--root', '--repo', '--run-id', '--version', '--commit', '--pool'].includes(key)) throw new Error(`invalid prebuild argument: ${key}`);
     values.set(key, value);
@@ -394,50 +418,94 @@ async function prebuildFromArgs(args: string[]): Promise<ChildGateImagePrebuildO
     const clone = spawnSync('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, sourceTree], {
       cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (clone.status !== 0) throw new Error(`cut image source clone failed: ${clone.stderr || clone.error || clone.status}`);
+    if (clone.status !== 0) failStage('clone', clone.status, `cut image source clone failed: ${clone.stderr || clone.error || clone.status}`);
     const checkout = spawnSync('git', ['checkout', '--quiet', '--detach', commit], {
       cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (checkout.status !== 0) throw new Error(`cut image source checkout failed: ${checkout.stderr || checkout.error || checkout.status}`);
+    if (checkout.status !== 0) failStage('clone', checkout.status, `cut image source checkout failed: ${checkout.stderr || checkout.error || checkout.status}`);
     const lockHash = createHash('sha256').update(readFileSync(pathJoin(sourceTree, 'bun.lock'))).digest('hex');
     const bunVersion = readFileSync(pathJoin(sourceTree, '.bun-version'), 'utf8').trim();
+    passed('clone');
+    enter('deps');
     const depsStage = pathJoin(sourceRoot, 'gate-deps');
     const stagedDeps = spawnSync('bun', [pathJoin(sourceTree, 'src/task-orchestrator/surfaces/pod-gate-deps.ts'), 'stage', depsStage], {
       cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (stagedDeps.status !== 0 || stagedDeps.error) throw new Error(`gate image dependency inputs could not be measured: ${stagedDeps.stderr || stagedDeps.error || stagedDeps.status}`);
+    if (stagedDeps.status !== 0 || stagedDeps.error) failStage('deps', stagedDeps.status, `gate image dependency inputs could not be measured: ${stagedDeps.stderr || stagedDeps.error || stagedDeps.status}`);
     const gateDepsDigest = /(?:^|\s)digest=([a-f0-9]{12})(?:\s|$)/i.exec(stagedDeps.stdout)?.[1]?.toLowerCase();
-    if (!gateDepsDigest) throw new Error('gate image dependency digest is unmeasured');
+    if (!gateDepsDigest) failStage('deps', stagedDeps.status, 'gate image dependency digest is unmeasured');
+    passed('deps');
+    enter('skills');
     const skillsStage = pathJoin(sourceRoot, 'skills-extra');
     const stagedSkills = spawnSync('bun', [pathJoin(sourceTree, 'src/task-orchestrator/surfaces/pod-skills.ts'), 'stage', skillsStage], {
       cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (stagedSkills.status !== 0 || stagedSkills.error) throw new Error(`gate image skill inputs could not be measured: ${stagedSkills.stderr || stagedSkills.error || stagedSkills.status}`);
+    if (stagedSkills.status !== 0 || stagedSkills.error) failStage('skills', stagedSkills.status, `gate image skill inputs could not be measured: ${stagedSkills.stderr || stagedSkills.error || stagedSkills.status}`);
     const skillsDigest = /(?:^|\s)digest=([a-f0-9]{16}|none)(?:\s|$)/i.exec(stagedSkills.stdout)?.[1]?.toLowerCase();
-    if (!skillsDigest) throw new Error('gate image skill digest is unmeasured');
+    if (!skillsDigest) failStage('skills', stagedSkills.status, 'gate image skill digest is unmeasured');
+    passed('skills');
     const recipeHash = createHash('sha256');
     for (const relative of ['docker/harness/Dockerfile', 'docker/harness/build.sh', 'scripts/install.sh',
       'src/task-orchestrator/surfaces/pod-gate-deps.ts', 'src/task-orchestrator/surfaces/pod-skills.ts']) {
       recipeHash.update(relative).update('\0').update(readFileSync(pathJoin(sourceTree, relative))).update('\0');
     }
+    enter('base-pull');
+    let basePullFailure: { exit: number | null; reason: string } | null = null;
     const layerIdentities = members.map((member) => {
       const probe = member.sshHost ? defaultRemoteRun(member.sshHost,
         "docker pull ubuntu:24.04 >/dev/null && docker image inspect --format '{{index .RepoDigests 0}}' ubuntu:24.04 && uname -m")
         : spawnSync('sh', ['-c', "docker pull ubuntu:24.04 >/dev/null && docker image inspect --format '{{index .RepoDigests 0}}' ubuntu:24.04 && uname -m"],
           { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
-      if (probe.status !== 0) return null;
+      if (probe.status !== 0) {
+        basePullFailure ??= { exit: probe.status, reason: `gate runtime base pull failed on ${member.context}: ${probe.stderr || probe.status}` };
+        return null;
+      }
       const lines = probe.stdout.trim().split(/\r?\n/);
-      const digest = /@?(sha256:[a-f0-9]{64})$/i.exec(lines[0] ?? '')?.[1]?.toLowerCase();
+      const digest = /@?(sha256:[a-f0-9]{64})$/i.exec(lines[0]?.trim() ?? '')?.[1]?.toLowerCase();
       const architecture = normalizeGateRuntimeArchitecture(lines.at(-1)?.trim() ?? '');
-      return digest && architecture ? { digest, architecture } : null;
+      if (digest && architecture) return { digest, architecture };
+      // The child exited 0 but its output is not «<repo>@sha256:<64 hex>» then a known `uname -m`: a stage failure with exit 0.
+      basePullFailure ??= { exit: probe.status, reason: `gate runtime base output unparsed on ${member.context}: ${lines.join(' / ').slice(0, 200)}` };
+      return null;
     });
-    if (layerIdentities.some((identity) => !identity))
-      throw new Error('gate runtime base digest or architecture could not be measured consistently across pools');
+    if (basePullFailure) failStage('base-pull', (basePullFailure as { exit: number | null }).exit, (basePullFailure as { reason: string }).reason);
+    passed('base-pull');
     const layerIdentity = layerIdentities[0]!;
     const runtimeKey = gateImageLayerRuntimeKey({ baseImageDigest: layerIdentity.digest, lockHash,
-      architecture: layerIdentity.architecture, bunVersion, buildRecipeHash: recipeHash.digest('hex'), gateDepsDigest, skillsDigest });
+      architecture: layerIdentity.architecture, bunVersion, buildRecipeHash: recipeHash.digest('hex'), gateDepsDigest: gateDepsDigest!, skillsDigest: skillsDigest! });
     const image = `${imageRepository(baseImage)}:${runtimeKey.slice(0, 12)}`;
-    return await prebuildGateImagePinForRuntimeBases({ root, version, runId, commit, image, members, runtimeBases: layerIdentities,
+    enter('build');
+    if (rehearsalProbe) {
+      // The real cut build.sh, in its pack-only mode: the docker build+push half is the externally visible side effect.
+      const archive = pathJoin(sourceRoot, 'rehearsal-pack.tgz');
+      const built = spawnSync('bash', [pathJoin(sourceTree, 'docker', 'harness', 'build.sh')], {
+        cwd: sourceTree, encoding: 'utf8', timeout: 15 * 60_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+        env: { ...process.env, ELANOUS_BUILD_PACK_ONLY: archive, ELANOUS_BUILD_GATE_LAYER_ONLY: '1',
+          ELANOUS_BUILD_IMAGE_KEY: runtimeKey, ELANOUS_BUILD_EXPECTED_BASE_IMAGE_DIGEST: layerIdentity.digest },
+      });
+      if (built.status !== 0 || built.error)
+        failStage('build', built.status, `build.sh exited ${built.status ?? 'spawn'}: ${`${built.stderr || ''}${built.stdout || ''}` || built.error}`);
+      passed('build');
+      enter('pack-pwa');
+      const listing = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (listing.status !== 0) failStage('pack-pwa', listing.status, `package archive unreadable: ${listing.stderr || listing.error}`);
+      if (!listing.stdout.split(/\r?\n/).some((entry) => entry.replace(/^\.\//, '') === 'package/apps/pwa/out/index.html'))
+        failStage('pack-pwa', 1, 'package archive has no package/apps/pwa/out/index.html');
+      passed('pack-pwa');
+      enter('push');
+      for (const member of members) {
+        const registry = member.registry ?? `k3d-elanous-registry:${process.env.ELANOUS_FLEET_REGISTRY_PORT || '5050'}`;
+        const command = `docker inspect ${registry.split(':')[0]} >/dev/null`;
+        const reach = member.sshHost ? defaultRemoteRun(member.sshHost, command)
+          : spawnSync('sh', ['-c', command], { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+        if (reach.status !== 0) failStage('push', reach.status, `registry ${registry} not reachable on ${member.context}: ${reach.stderr || ''}`);
+      }
+      passed('push', 'probed: registry container present on every pool member (docker inspect), push not performed');
+      return { outcome: 'skipped', reason: `rehearsal probe: push not performed (image ${image})` };
+    }
+    // Main run: build.sh builds and pushes inside syncPoolImages; the post-build digest probe is the push receipt.
+    let synced = false;
+    const prebuilt = await prebuildGateImagePinForRuntimeBases({ root, version, runId, commit, image, members, runtimeBases: layerIdentities,
       probe: (member) => preflightGateImageDigest(specFor.get(member.context) ?? member.context, runtimeKey),
       sync: () => {
         const priorLayerOnly = process.env.ELANOUS_BUILD_GATE_LAYER_ONLY;
@@ -447,7 +515,14 @@ async function prebuildFromArgs(args: string[]): Promise<ChildGateImagePrebuildO
         process.env.ELANOUS_BUILD_IMAGE_KEY = runtimeKey;
         process.env.ELANOUS_BUILD_EXPECTED_BASE_IMAGE_DIGEST = layerIdentity.digest;
         return syncPoolImages(members, baseImage, runtimeKey,
-          { buildScript: pathJoin(sourceTree, 'docker', 'harness', 'build.sh') }).finally(() => {
+          { buildScript: pathJoin(sourceTree, 'docker', 'harness', 'build.sh') }).then((results) => {
+            synced = true;
+            const failure = poolSyncBuildFailure(members, results);
+            if (failure) failStage('build', failure.exit, failure.reason);
+            passed('build', members.map((member) => `${member.context}=${results.get(member.context)!.action}`).join(' '));
+            enter('push');
+            return results;
+          }).finally(() => {
             if (priorLayerOnly === undefined) delete process.env.ELANOUS_BUILD_GATE_LAYER_ONLY;
             else process.env.ELANOUS_BUILD_GATE_LAYER_ONLY = priorLayerOnly;
             if (priorImageKey === undefined) delete process.env.ELANOUS_BUILD_IMAGE_KEY;
@@ -457,10 +532,20 @@ async function prebuildFromArgs(args: string[]): Promise<ChildGateImagePrebuildO
           });
       },
     });
+    if (!synced) passed('build', `reused: cut image ${prebuilt.digest} already present, nothing built`);
+    passed('push', `${prebuilt.outcome}: ${prebuilt.digest} on ${prebuilt.eligiblePools.join(',')}`);
+    return prebuilt;
   } finally { rmSync(sourceRoot, { recursive: true, force: true }); }
 }
 
 if (import.meta.main && process.argv.includes('--prebuild')) {
-  try { console.log(JSON.stringify(await prebuildFromArgs(process.argv.slice(2)))); }
-  catch (error) { console.log(JSON.stringify({ outcome: 'failed', reason: error instanceof Error ? error.message : String(error) })); process.exitCode = 1; }
+  const progress: PrebuildProgress = { current: 'clone', stages: [] };
+  try { console.log(JSON.stringify({ ...await prebuildFromArgs(process.argv.slice(2), progress), receipt: progress.stages })); }
+  catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    // One abnormal row per failure: failStage already wrote it; anything else (a throw with no child exit) gets exit null here.
+    if (progress.stages.every((row) => row.ok)) progress.stages.push({ stage: progress.current, exit: null, ok: false, reason: reason.trim().slice(-300) });
+    console.log(JSON.stringify({ outcome: 'failed', reason, stage: progress.stages.at(-1)!.stage, receipt: progress.stages }));
+    process.exitCode = 1;
+  }
 }

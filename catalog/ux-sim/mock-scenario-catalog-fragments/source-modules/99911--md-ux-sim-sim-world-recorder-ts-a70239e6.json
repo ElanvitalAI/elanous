@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-RECORDER-TS",
+  "path": "src/ux-sim/sim-world/recorder.ts",
+  "boundary": "D10 recorder: buffers events, node-entry walk, wrapped seam calls and wrapped IncidentClaimStore ops, then writes five canonical sorted files with UUIDs normalised.",
+  "deviceIds": [
+    "sim-world-kernel"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

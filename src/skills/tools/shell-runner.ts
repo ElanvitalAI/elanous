@@ -1,3 +1,4 @@
+import { a5Wordings } from '../../turn-capsule/a5-wording.js';
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── ShellList / ShellPoll / ShellKill LLM tools (NT-C2) ──
 //
@@ -54,12 +55,10 @@ export function buildShellListTool(): LLMToolSpec {
 }
 
 export function buildShellPollTool(): LLMToolSpec {
+  const w = a5Wordings();
   return {
     name: 'ShellPoll',
-    description:
-      'Read the current state of a shell-runner handle by id — useful to ' +
-      'check if a backgrounded command has finished. Returns status, ' +
-      'elapsed, and exit code if the command has resolved. Does not block.',
+    description: w.shellPollDescription,
     parameters: {
       type: 'object',
       properties: {

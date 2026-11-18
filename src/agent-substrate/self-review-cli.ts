@@ -2801,6 +2801,9 @@ async function runSelfReviewCliCommandPinned(
       prBody: body ?? '',
       files: diffFilePaths(diff.stdout),
       rootDir: deps.reviewRepositoryPath,
+      deadExportReportPath: deps.reviewRepositoryPath ? join(deps.reviewRepositoryPath, 'dead-export-warn.json') : undefined,
+      // ⭐ #38412 r5 — 리포트 출처 키 대조: 낡은 dead-export-warn.json 재사용 오염을 여기서 끊는다.
+      reviewHead: diffRead.headCommit,
       gh: (args) => {
         const result = deps.gh([...args], 15_000);
         return result.status === 0

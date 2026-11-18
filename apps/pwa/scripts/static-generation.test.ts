@@ -2,12 +2,30 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runStaticBuild } from './static-generation';
+import { runStaticBuild, validateStaticExport } from './static-generation';
 import ts from 'typescript';
 
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe('validateStaticExport', () => {
+  test('accepts a real exported shell and rejects the Next.js prerender fallback shell', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pwa-validate-export-test-'));
+    roots.push(root);
+    const good = join(root, 'good');
+    mkdirSync(join(good, '_next'), { recursive: true });
+    writeFileSync(join(good, 'index.html'), '<html lang="en"><body>chat</body></html>');
+    writeFileSync(join(good, '_next', 'asset.js'), 'fixture');
+    expect(() => validateStaticExport(good)).not.toThrow();
+
+    const fallback = join(root, 'fallback');
+    mkdirSync(join(fallback, '_next'), { recursive: true });
+    writeFileSync(join(fallback, 'index.html'), '<html id="__next_error__"><head></head><body></body></html>');
+    writeFileSync(join(fallback, '_next', 'asset.js'), 'fixture');
+    expect(() => validateStaticExport(fallback)).toThrow('__next_error__');
+  });
 });
 
 describe('PWA staged repository inputs', () => {

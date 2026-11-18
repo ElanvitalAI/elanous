@@ -195,14 +195,14 @@ describe('dispatchAgent — helpers on the existing path', () => {
     ];
     const def: AgentDefinition = { ...stubDef, tools: ['Bash', 'Read', 'Agent'] };
     await dispatchAgent(
-      { description: 'd', prompt: 'p' },
+      { description: 'd', prompt: 'p', run_in_background: false },
       { provider, hostTools, dispatchTool: async () => 'ok', resolveAgentDef: () => def },
     );
     expect(childToolNames).toContain('Bash');
     expect(childToolNames).toContain('Read');
     expect(childToolNames).toContain('Agent');
     await dispatchAgent(
-      { description: 'grandchild', prompt: 'p' },
+      { description: 'grandchild', prompt: 'p', run_in_background: false },
       { provider, hostTools, dispatchTool: async () => 'ok', resolveAgentDef: () => def, parentTaskId: 'parent-task' },
     );
     expect(childToolNames).not.toContain('Agent');
@@ -222,7 +222,7 @@ describe('dispatchAgent — helpers on the existing path', () => {
     const priorMode = process.env.ELANOUS_LLM_MODE;
     process.env.ELANOUS_LLM_MODE = 'real';
     try {
-      await dispatchAgent({ description: 'parent task', prompt: 'parent prompt', subagent_type: 'custom-parent' }, {
+      await dispatchAgent({ description: 'parent task', prompt: 'parent prompt', subagent_type: 'custom-parent', run_in_background: false }, {
         provider, hostTools: [{ name: 'Agent', description: 'spawn', parameters: { type: 'object' } }],
         resolveAgentDef: (name) => { resolved.push(name); return name === 'custom-parent' ? parent
           : name === 'custom-grandchild' ? grandchild : undefined; },
@@ -269,6 +269,68 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     }
   });
 
+  test('a ninth default Agent returns a queued receipt and launches after a slot opens', async () => {
+    const calls = { count: 0 };
+    const releases: Array<() => void> = [];
+    const sessionCache = new SessionCache();
+    const opts = { provider: gatedProvider(calls, releases), sessionCache, resolveAgentDef: () => stubDef };
+    try {
+      for (let i = 0; i < AGENT_TOOL_BACKGROUND_FANOUT_CEILING; i++) {
+        await dispatchAgent({ description: `queued setup ${i}`, prompt: `queued setup ${i}` }, opts);
+      }
+      await waitFor(() => calls.count === 8, 'eight workers started');
+      const ninth = await Promise.race([
+        dispatchAgent({ description: 'queued ninth', prompt: 'queued ninth' }, opts),
+        new Promise<'blocked'>(resolve => setTimeout(() => resolve('blocked'), 100)),
+      ]);
+      expect(ninth).not.toBe('blocked');
+      if (ninth === 'blocked') return;
+      expect(ninth.background).toBe(true);
+      expect(ninth.taskId).not.toBe('background-fanout-limit');
+      expect(calls.count).toBe(8);
+      expect(globalAgentRegistry.get(ninth.taskId)?.state).toBe('pending');
+      expect(countLiveBackgroundFanout(globalAgentRegistry.list())).toBe(8);
+      releases[0]!();
+      await waitFor(() => calls.count === 9, 'queued worker started');
+      expect(globalAgentRegistry.get(ninth.taskId)?.state).toBe('running');
+      releases[releases.length - 1]!();
+      await waitFor(() => globalAgentRegistry.get(ninth.taskId)?.state === 'done', 'queued ticket completed');
+      expect(globalAgentRegistry.get(ninth.taskId)?.result).toBe('worker done');
+    } finally {
+      for (const release of releases) release();
+      await waitFor(() => countSessionBackgroundFanout(sessionCache) === 0, 'queue workers drained');
+    }
+  });
+
+  test('cancelling a queued ticket never starts it and reports its terminal state', async () => {
+    const calls = { count: 0 };
+    const releases: Array<() => void> = [];
+    const sessionCache = new SessionCache();
+    const opts = { provider: gatedProvider(calls, releases), sessionCache, resolveAgentDef: () => stubDef };
+    try {
+      for (let i = 0; i < AGENT_TOOL_BACKGROUND_FANOUT_CEILING; i++) {
+        await dispatchAgent({ description: `cancel setup ${i}`, prompt: `cancel setup ${i}` }, opts);
+      }
+      await waitFor(() => calls.count === 8, 'eight workers started');
+      const queued = await dispatchAgent({ description: 'cancel queued', prompt: 'cancel queued' }, opts);
+      const terminal: string[] = [];
+      const subscription = globalAgentRegistry.onTaskDone(task => {
+        if (task.id === queued.taskId) terminal.push(task.state);
+      });
+      expect(globalAgentRegistry.abort(queued.taskId)).toBe(true);
+      await waitFor(() => terminal.length === 1, 'queued cancellation reported');
+      expect(terminal).toEqual(['aborted']);
+      expect(globalAgentRegistry.get(queued.taskId)?.state).toBe('aborted');
+      releases[0]!();
+      await waitFor(() => countSessionBackgroundFanout(sessionCache) === 7, 'cancelled ticket left queue');
+      expect(calls.count).toBe(8);
+      subscription.dispose();
+    } finally {
+      for (const release of releases) release();
+      await waitFor(() => countSessionBackgroundFanout(sessionCache) === 0, 'workers drained');
+    }
+  });
+
   test('8 backgrounds spawn, the 9th is refused with spawn 0 + noteSeen 0, and a terminal slot re-opens it', async () => {
     const providerCalls = { count: 0 };
     const releases: Array<() => void> = [];
@@ -293,12 +355,12 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     expect(liveAtCeiling).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
     for (const launch of launches) expect(launch.background).toBe(true);
 
-    // Foreground dispatch is NOT gated by the background ceiling — unchanged behaviour.
+    // A synchronous child also needs a slot because it may detach later.
     const foreground = await dispatchAgent(
-      { description: 'foreground work', prompt: 'foreground work' },
-      { provider: fakeProvider([[{ type: 'text', delta: 'fg-answer' }]]), sessionCache, resolveAgentDef: () => stubDef },
+      { description: 'foreground work', prompt: 'foreground work', run_in_background: false, wait_for_slot: false },
+      opts,
     );
-    expect(foreground.output).toContain('fg-answer');
+    expect(foreground.taskId).toBe('background-fanout-limit');
     expect(providerCalls.count).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
 
     // ── the 9th background launch is refused: spawn 0, noteSeen 0 ──
@@ -306,7 +368,7 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     const tasksBeforeNinth = globalAgentRegistry.size;
     const cacheBeforeNinth = sessionCache.size;
     const ninth = await dispatchAgent(
-      { description: 'bg worker 8', prompt: 'background work 8', run_in_background: true },
+      { description: 'bg worker 8', prompt: 'background work 8', run_in_background: true, wait_for_slot: false },
       opts,
     );
     const ninthSpawn = providerCalls.count - spawnsBeforeNinth;
@@ -329,7 +391,7 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     // Same description + prompt as the refused call: if the refusal had written
     // the cache entry, this retry would come back as taskId 'dedup' with no spawn.
     const reentry = await dispatchAgent(
-      { description: 'bg worker 8', prompt: 'background work 8', run_in_background: true },
+      { description: 'bg worker 8', prompt: 'background work 8', run_in_background: true, wait_for_slot: false },
       opts,
     );
     await waitFor(() => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING + 1, 're-entry spawn reached the provider');
@@ -378,11 +440,11 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     // the other is refused — never 9 live in this session.
     const results = await Promise.all([
       dispatchAgent(
-        { description: 'race winner', prompt: 'race winner work', run_in_background: true },
+        { description: 'race winner', prompt: 'race winner work', run_in_background: true, wait_for_slot: false },
         opts,
       ),
       dispatchAgent(
-        { description: 'race loser', prompt: 'race loser work', run_in_background: true },
+        { description: 'race loser', prompt: 'race loser work', run_in_background: true, wait_for_slot: false },
         opts,
       ),
     ]);
@@ -431,7 +493,7 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
 
     // The boundary did not leak slots: session A's own 9th stays refused.
     const ninthA = await dispatchAgent(
-      { description: 'session A ninth', prompt: 'session A ninth background', run_in_background: true },
+      { description: 'session A ninth', prompt: 'session A ninth background', run_in_background: true, wait_for_slot: false },
       optsA,
     );
     expect(ninthA.taskId).toBe('background-fanout-limit');

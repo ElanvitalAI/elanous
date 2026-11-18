@@ -484,3 +484,73 @@ test('input: the limit is UTF-8 bytes, not characters — a Korean paste over 64
   expect(core.input(pane, '한'.repeat(21_845)).exitCode).toBe(0);   // 65,535 bytes
   expect(ptys[0]!.writes).toHaveLength(1);
 });
+
+/** Three workspaces with ids, and a second tab in the first, so order questions have an answer. */
+function ordered() {
+  const o = owner();
+  o.core.start();
+  const a = paneOf(o.core.newPane({ ws: 'A', cwd: '/a', command: ['sh'] }));
+  const b = paneOf(o.core.newPane({ ws: 'B', cwd: '/b', command: ['sh'] }));
+  const c = paneOf(o.core.newPane({ ws: 'C', cwd: '/c', command: ['sh'] }));
+  const a2 = paneOf(o.core.newPane({ ws: 'A', cwd: '/a2', command: ['sh'] }));
+  const rows = () => (JSON.parse(o.core.list().message) as { panes: { workspace: string; tab: string; pane: string }[] }).panes;
+  return { ...o, a, b, c, a2, rows, order: () => rows().map((row) => `${row.workspace}:${row.pane}`) };
+}
+
+test('reorder workspace: before another, to the end, by name or id; ls follows; a no-op and bad input change nothing', () => {
+  const t = ordered();
+  expect(t.order()).toEqual([`A:${t.a}`, `A:${t.a2}`, `B:${t.b}`, `C:${t.c}`]);
+  expect(t.core.reorder({ kind: 'workspace', id: 'C', before: 'A' }).exitCode).toBe(0);
+  expect(t.order()).toEqual([`C:${t.c}`, `A:${t.a}`, `A:${t.a2}`, `B:${t.b}`]);
+  expect(t.core.reorder({ kind: 'workspace', id: 'A' }).exitCode).toBe(0);               // no before = the end
+  expect(t.order()).toEqual([`C:${t.c}`, `B:${t.b}`, `A:${t.a}`, `A:${t.a2}`]);
+  const before = t.order();
+  expect(t.core.reorder({ kind: 'workspace', id: 'B', before: 'B' }).message).toContain('stays');
+  expect(t.core.reorder({ kind: 'workspace', id: 'nope' }).exitCode).toBe(1);
+  expect(t.core.reorder({ kind: 'workspace', id: 'B', before: 'nope' }).exitCode).toBe(1);
+  expect(t.core.reorder({ kind: 'pane', id: 'B' }).exitCode).toBe(2);
+  expect(t.core.reorder({ kind: 'workspace', id: 7 as never }).exitCode).toBe(2);
+  expect(t.order()).toEqual(before);
+});
+
+test('reorder tab: inside its own workspace only; before a sibling or to the end of the workspace; another workspace is refused', () => {
+  const t = ordered();
+  const tabOf = (pane: string) => t.rows().find((row) => row.pane === pane)!.tab;
+  expect(t.core.reorder({ kind: 'tab', id: tabOf(t.a2), before: tabOf(t.a) }).exitCode).toBe(0);
+  expect(t.order()).toEqual([`A:${t.a2}`, `A:${t.a}`, `B:${t.b}`, `C:${t.c}`]);
+  expect(t.core.reorder({ kind: 'tab', id: tabOf(t.a2) }).exitCode).toBe(0);               // to the end of A, not of the journal
+  expect(t.order()).toEqual([`A:${t.a}`, `A:${t.a2}`, `B:${t.b}`, `C:${t.c}`]);
+  const before = t.order();
+  expect(t.core.reorder({ kind: 'tab', id: tabOf(t.a), before: tabOf(t.b) }).exitCode).toBe(2);
+  expect(t.core.reorder({ kind: 'tab', id: 'tnope' }).exitCode).toBe(1);
+  expect(t.order()).toEqual(before);
+});
+
+test('reorder is saved with the journal: a new owner over the same file lists the same order; a failed save changes nothing', () => {
+  const t = ordered();
+  t.core.reorder({ kind: 'workspace', id: 'B', before: 'A' });
+  const saved = t.stored();
+  expect(saved.workspaces.map((ws) => ws.name)).toEqual(['B', 'A', 'C']);
+  const again = createElsCore({ load: () => saved, save: () => {}, spawn: () => fakePty('x').pty });
+  again.start();
+  expect((JSON.parse(again.list().message) as { panes: { workspace: string }[] }).panes.map((row) => row.workspace)).toEqual(['B', 'A', 'A', 'C']);
+  t.failSaves(true);
+  const refused = t.core.reorder({ kind: 'workspace', id: 'C', before: 'B' });
+  expect([refused.exitCode, refused.message]).toEqual([1, expect.stringContaining('not saved')]);
+  t.failSaves(false);
+  expect(t.order().map((entry) => entry.split(':')[0])).toEqual(['B', 'A', 'A', 'C']);
+});
+
+test('reorder: an empty `before` means the end, exactly like omitting it or «end»; a blank or unknown name is still refused', () => {
+  const spellings: [string, { before?: string }][] = [['omitted', {}], ['empty', { before: '' }], ['end', { before: 'end' }]];
+  for (const [label, extra] of spellings) {
+    const t = ordered();
+    expect([label, t.core.reorder({ kind: 'workspace', id: 'A', ...extra }).exitCode]).toEqual([label, 0]);
+    expect([label, t.order()]).toEqual([label, [`B:${t.b}`, `C:${t.c}`, `A:${t.a}`, `A:${t.a2}`]]);
+  }
+  const t = ordered();
+  const unchanged = t.order();
+  expect(t.core.reorder({ kind: 'workspace', id: 'A', before: ' ' }).exitCode).toBe(1);
+  expect(t.core.reorder({ kind: 'tab', id: 'tnope', before: '' }).exitCode).toBe(1);
+  expect(t.order()).toEqual(unchanged);
+});

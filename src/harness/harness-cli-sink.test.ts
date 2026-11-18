@@ -99,11 +99,14 @@ function harnessHelpCommandRows(help: string): string[] {
   const unparsedCommandRows: string[] = [];
   const commandRowPattern = /^  (?<signature>\S+(?:\s+(?:\[[^\]]+\]|<[^>]+>))*)(?:\s{2,}.+)?$/;
   const wrappedDescriptionPattern = /^ {4,}\S/;
+  // 2026-11-18 계정 회전·[outbound] 경보 로그(codex-account-store.ts:860 · outbound-alert.ts:796)가
+  // spawn 된 CLI 의 stdout 에 섞여 들어온다 — 도움말 명령 행이 아니므로 잡음으로 무시한다.
+  const nonHelpNoisePattern = /^\[outbound\]|^\u{1F504}|^account rotated|^(from|to|reason|accountCount|usage):|daemon-path unreachable|토큰\/chat 미설정|못 보냄\(alert\)/u;
   for (const line of lines.slice(start + 1)) {
     if (line.trim() === '') break;
     if (commandRowPattern.test(line)) {
       rows.push(line);
-    } else if (!wrappedDescriptionPattern.test(line)) {
+    } else if (!wrappedDescriptionPattern.test(line) && !nonHelpNoisePattern.test(line)) {
       unparsedCommandRows.push(line);
     }
   }
@@ -275,6 +278,8 @@ describe('harness CLI sink hook', () => {
       '--pod-memory',
       '--after',
       '--source',
+      // 2026-11-17 TA-IMAGE-PIN-OVERRIDES-COMMIT 238fc407fe1(#38469)가 더한 하나 — 이미지 digest 핀.
+      '--image-digest',
       '--repair-commit-only',
       '--bench',
     ]);
@@ -372,6 +377,8 @@ describe('harness CLI sink hook', () => {
       '--pod-memory',
       '--after',
       '--source',
+      // 2026-11-17 TA-IMAGE-PIN-OVERRIDES-COMMIT 238fc407fe1(#38469)가 더한 하나 — 이미지 digest 핀.
+      '--image-digest',
       '--repair-commit-only',
       '--bench',
       '--author-grade',

@@ -33,7 +33,7 @@ const PLAIN_GOAL = goal(['src/tui/chat/status-line.ts']);
 function overlay(mode: 'shadow' | 'on' | undefined): void {
   setUserConfigOverlay((c) => ({
     ...c, llm: { ...c.llm, provider: PROVIDER },
-    harness: { ...c.harness, difficultyPlacement: false, difficultyRouter: mode },
+    harness: { ...c.harness, difficultyRouter: mode },
     roleLlm: undefined, roleModels: undefined, roleModelTiers: undefined,
   }));
 }
@@ -243,7 +243,7 @@ describe('COST-OPTIMIZER-WINDOW-AWARE — launch wiring through the core', () =>
     try {
       setUserConfigOverlay((c) => ({
         ...c, llm: { ...c.llm, provider: PROVIDER },
-        harness: { ...c.harness, difficultyPlacement: false, difficultyRouter: undefined },
+        harness: { ...c.harness, difficultyRouter: undefined },
         roleLlm: { implement: { provider: PROVIDER, model: lookupLlmTierSpec(PROVIDER, 'balanced').model } },
         roleModels: undefined, roleModelTiers: undefined,
       }));

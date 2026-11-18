@@ -122,12 +122,12 @@ test('SIM-MOBILE-OWNER-SESSION resolves Google subject to its app slot and issue
     ));
     expect(completed?.status).toBe(303);
     const callbackLocation = completed!.headers.get('location');
-    expect(callbackLocation).toBe('https://api.example.test/v1/members/home');
+    expect(callbackLocation).toBe('https://app.example.test/signup/complete');
     expect(await completed!.text()).toBe('');
     const memberCookie = completed!.headers.get('set-cookie')!.split(';', 1)[0]!;
     expect(memberCookie).toContain('__Host-elanous_member_session=');
     expect(completed!.headers.get('set-cookie')).toContain('HttpOnly; Secure; SameSite=Lax');
-    expect((await membersApi.handle(new Request(callbackLocation!, { headers: { cookie: memberCookie } })))?.status).toBe(200);
+    expect((await membersApi.handle(new Request('https://api.example.test/v1/members/home', { headers: { cookie: memberCookie } })))?.status).toBe(200);
     const profile = await membersApi.handle(new Request('https://api.example.test/v1/members', {
       headers: { cookie: memberCookie },
     }));
@@ -316,12 +316,12 @@ test('SIM-APP-GOOGLE-OAUTH-APP-DB-E2E follows Google callback into isolated app 
     );
     expect(completed?.status).toBe(303);
     const location = completed!.headers.get('location');
-    expect(location).toBe('https://api.example.test/v1/members/home');
+    expect(location).toBe('https://app.example.test/signup/complete');
     expect(await completed!.text()).toBe('');
     const memberCookie = completed!.headers.get('set-cookie')!.split(';', 1)[0]!;
     expect(memberCookie).toContain('__Host-elanous_member_session=');
     expect(completed!.headers.get('set-cookie')).toContain('HttpOnly; Secure; SameSite=Lax');
-    const home = await membersApi.handle(new Request(location!, { headers: { cookie: memberCookie } }));
+    const home = await membersApi.handle(new Request('https://api.example.test/v1/members/home', { headers: { cookie: memberCookie } }));
     expect(home?.status).toBe(200);
 
     const profile = await membersApi.handle(new Request('https://api.example.test/v1/members', {

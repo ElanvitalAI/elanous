@@ -9,14 +9,14 @@
 // ⛔ 조각 1 범위: 프로세스 안 타이머뿐 — TUI 가 재기동되면 예약은 사라진다(영속·재기동 복원은 후속).
 //
 // 규칙(grok-build scheduler 꼴): 최소 60초 · TUI 당 예약 상한 5 · 반복 7일 만료 · 직전 회차가 아직 돌면 건너뜀 ·
-//   놓친 반복 틱은 하나로 합친다 · 발화 때 H2 가 거부하면(바쁨·사람 입력 중) 1분 뒤 «한 번» 다시 청하고,
-//   그래도 거부면 반복은 다음 회차로, 일회성은 놓침으로 접는다.
+//   놓친 반복 틱은 하나로 합친다 · 발화 때 H2 가 거부하면(바쁨·사람 입력 중) 1분 뒤 다시 청하고(상한 30분),
+//   그래도 거부하면 «턴 끝 배출» 대기 큐로 간다 — 입력칸이 다시 뜨는 순간(마운트) 반드시 1회 깨운다(소실 0).
 //
 // 세 얼굴:
-//   관측 = debug.log('tui.wakeup', 'scheduled' | 'fired' | 'skipped' | 'rejected' | 'cancelled', { id, ... })
+//   관측 = debug.log('tui.wakeup', 'scheduled' | 'fired' | 'skipped' | 'rejected' | 'queued' | 'cancelled', { id, ... })
 //   인지 = 예약 시각 도래 ∧ (직전 회차 진행 중 → 건너뜀 · 만료 → 소멸 · H2 거부 사유)
 //   힐링 = H2 로 내부 턴(화면은 H2 의 «↻ 자동 재개(scheduled): …» 한 줄 · 예약 순간엔 «⏰ 예약 깨움 …» 한 줄) ·
-//          거부 → 1분 뒤 1회 재시도 → 그래도 거부면 «⏰ 예약 깨움 놓침» 한 줄 ⊕ 로그(TF 가 본다)
+//          거부 → 1분 뒤 재시도(상한 30분) → 그래도 거부하면 «⏰ 예약 깨움 대기» 한 줄 ⊕ «턴 끝 배출» 대기 큐(ELN-SEAT-WAKEUP-SCHEDULE-FAIL · OP #88346)
 //
 // 🩹 TUI-H5-ONESHOT-SCHEMA(0.2.32 · 라이브 실측 두 번): 모델이 «한 번만»을 `repeatMinutes:0` 으로 불렀다 →
 //   «1 이상» 거부 → 1분 반복으로 재예약 → 취소 → 또 … 한 턴에 26회. ⇒ ① `repeatMinutes:0` = 일회성으로 받는다 ·
@@ -29,6 +29,8 @@ import { dirname, join } from 'node:path';
 import { debug } from '../../debug/log.js';
 import type { LLMToolDef } from '../../plugins/core/types.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../../chat/internal-turn-contract.js';
+import type { TextInputInternalTurnYieldPort } from '../../chat/index.js';
+import type { TurnEvent } from '../../turn-capsule/contract.js';
 
 interface WakeupTurnGate {
   startTurnIfIdle(input: string, opts: StartTurnIfIdleOptions): StartTurnIfIdleResult;
@@ -42,7 +44,8 @@ export const WAKEUP_MAX_ENTRIES = 5;
 export const WAKEUP_REPEAT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const WAKEUP_RETRY_DELAY_MS = 60_000;
 /** 바쁨(NotIdle)·사람 입력 중(HumanTyping)으로 못 연 깨움을 «버리지 않고» 미루는 상한 — 첫 예정 시각부터.
- *  TUI-WAKEUP-DEFER-NOT-DROP(10-22 OPT w7: 02:38·02:39 NotIdle → dropped · codex 는 idle 때 골을 이어가고 바쁘면 미룬다). */
+ *  TUI-WAKEUP-DEFER-NOT-DROP(10-22 OPT w7: 02:38·02:39 NotIdle → dropped · codex 는 idle 때 골을 이어가고 바쁘면 미룬다).
+ *  상한을 넘겨도 여전히 버리지 않는다(OP #88346): «턴 끝 배출» 대기 큐 + 마운트 배출 · fired 사건에 delaySec. */
 export const WAKEUP_DEFER_MAX_MS = 30 * 60_000;
 /** 미룸 대상인 거부 이유 — 곧 풀리는 «지금 바쁨» 뿐이다(Disabled·Cap·Superseded 는 미뤄도 안 풀린다). */
 const WAKEUP_DEFERRABLE_REASONS: ReadonlySet<string> = new Set(['NotIdle', 'HumanTyping']);
@@ -208,6 +211,12 @@ export interface WakeupSchedulerDeps {
   /** 화면 한 줄(입력칸 무접촉 — 채팅 줄에만). */
   notify?: (line: string) => void;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** OBSERVE-TURN-EVENT-LIFECYCLE — turn-life observation hook (fail-open). */
+  turnLifeLog?: (event: string, data: Record<string, unknown>) => void;
+  /** TURN-CAPSULE-EVENTS R1(C4) — 버스 원천 어댑터. 예약 시각 도래·거부 미룸·재기동 복원의 늦은
+   *  깨움이 모두 버스 항목(source 'wakeup')으로 들어간다. 없으면 옛길(스케줄러 자체 타이머) 그대로 —
+   *  순수 모듈 시험은 이 포트만 주입한다. 생산 배선은 CC-2(entry.ts) 몫이다. */
+  publishEvent?: (event: TurnEvent) => { duplicate: boolean } | void;
   maxEntries?: number;
   /** 지금 도는 턴 id(사람·내부 · H2 `lastTurnId`). 주면 그 턴 안 schedule·cancel 합계에 상한을 건다. */
   currentTurnId?: () => string | null;
@@ -248,6 +257,10 @@ export type CancelWakeupResult = { ok: true } | { ok: false; error: string; capp
   tryCancel(id: string): CancelWakeupResult;
   /** 모든 타이머를 거둔다(TUI 종료). */
   dispose(): void;
+  /** «턴 끝 배출»(ELN-SEAT-WAKEUP-SCHEDULE-FAIL · OP #88346): H2 의 yield port 를 감싸 «입력칸이
+   *  다시 뜨는 순간(턴 끝 · idle) = 대기 큐 배출 시점» 으로 잇는다 — agent-wake wrapAgentWakePort 와
+   *  같은 길. 대시보드가 포장 사슬에 낀다. */
+  wrapPort(port: TextInputInternalTurnYieldPort): TextInputInternalTurnYieldPort;
 }
 
 function defaultSetTimer(fn: () => void, ms: number): WakeupTimerHandle {
@@ -282,6 +295,8 @@ export function formatWakeupClock(ms: number): string {
 }
 
 /** 내부 턴에 실을 글 — 사람 발화처럼 보이지 않게 머리표를 단다. */
+import { emitTurnLife } from '../../debug/turn-life.js';
+
 export function formatWakeupPrompt(entry: Pick<WakeupEntry, 'id' | 'reason' | 'repeatMs'>): string {
   const repeat = entry.repeatMs ? ` · 반복 ${Math.round(entry.repeatMs / 60_000)}분` : '';
   return `[예약 깨움 ${entry.id}${repeat}] ${entry.reason} — 스스로 예약한 점검 시각이다. 남은 일을 이어서 처리하라.`;
@@ -292,9 +307,15 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
   const setTimer = deps.setTimer ?? defaultSetTimer;
   const clearTimer = deps.clearTimer ?? defaultClearTimer;
   const log = deps.log ?? ((c, e, d) => debug.log(c, e, d));
+  // OBSERVE-TURN-EVENT-LIFECYCLE — 예약 관측 주입(기본: debug 직접 방출).
+  const turnLifeLog = deps.turnLifeLog ?? emitTurnLife;
   const maxEntries = deps.maxEntries ?? WAKEUP_MAX_ENTRIES;
   const entries = new Map<string, WakeupEntry>();
   const timers = new Map<string, WakeupTimerHandle>();
+  /** «턴 끝 배출» 대기 큐(ELN-SEAT-WAKEUP-SCHEDULE-FAIL · OP #88346): 턴 중(NotIdle)·사람 입력 중
+   *  (HumanTyping) 거부로 못 연 발화를 버리지 않고 여기 싣는다. Map(id → 이번 대기 구간에 «대기» 한 줄을
+   *  냈는가) — 같은 예약 id 두 번은 하나로. 배출 = wrapPort 의 입력칸 마운트(턴 끝 · idle)에서 1회씩. */
+  const queuedForTurnEnd = new Map<string, boolean>();
   let seq = 0;
   const maxCallsPerTurn = deps.maxCallsPerTurn ?? WAKEUP_MAX_CALLS_PER_TURN;
   let callTurnKey: string | null = null;
@@ -316,6 +337,12 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
   };
 
   const readTurnId = (): string | null => deps.currentTurnId?.() ?? null;
+
+  /** R1(C4) — 버스 원천 어댑터(선택). 버스는 보조 경로다: 발화 주체는 여전히 이 스케줄러(문)이고,
+   *  게시 실패·중복(duplicate)은 무시한다(fail-open — 버스가 죽어도 예약 깨움은 산다). */
+  const publish = (event: TurnEvent): void => {
+    try { deps.publishEvent?.(event); } catch { /* secondary path — fail-open */ }
+  };
 
   /** 한 턴 호출 상한 — 넘었으면 거부 문구, 아니면 null. 턴 경계가 unknown 이면 cap·dedupe 상태를 버린다. */
   const loopCapError = (action: 'schedule' | 'cancel', observedTurnId = readTurnId()): string | null => {
@@ -355,6 +382,7 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       log('tui.wakeup', 'persist-save-failed', { error: String(error), action: 'cancel', id });
       return { ok: false, error: `예약을 저장하지 못해 취소하지 않았다: ${error instanceof Error ? error.message : String(error)}` };
     }
+    queuedForTurnEnd.delete(id);
 	    log('tui.wakeup', 'cancelled', { id });
 	    return { ok: true };
   };
@@ -370,11 +398,13 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     if (handle !== undefined) clearTimer(handle);
     timers.delete(id);
     entries.delete(id);
+    queuedForTurnEnd.delete(id); // 예약이 끝났다(발화·만료·실패) — 대기 큐에 두 번 남지 않는다
     persistBestEffort();
   };
 
   /** 다음 회차로 — 놓친 틱은 하나로 합친다. 만료를 넘으면 소멸. */
   const advance = (entry: WakeupEntry, t: number, save = true): void => {
+    queuedForTurnEnd.delete(entry.id); // 이번 틱은 성공·스킵으로 끝났다 — 다음 틱은 자기 거부 때 다시 싣는다
     if (!entry.repeatMs) { drop(entry.id); return; }
     let next = entry.dueAt + entry.repeatMs;
     let coalesced = 0;
@@ -402,6 +432,24 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
 	    }
 	  };
 
+	  /** 입력칸이 다시 떴다(턴 끝 · idle) — «턴 끝 배출» 대기 큐를 1회씩 비운다(ELN-SEAT-WAKEUP-SCHEDULE-FAIL · OP #88346).
+	   *  agent-wake onInputMounted 와 같은 길: 마운트 «중»에 물러남을 청하지 않게 0ms 미루고,
+	   *  이미 발화·취소·만료된 id 는 건너뛴다(같은 예약 두 번 배출 없음). 남은 재청 타이머는 치운다. */
+	  const drainQueuedWakeups = (): void => {
+	    if (queuedForTurnEnd.size === 0) return;
+	    const ids = [...queuedForTurnEnd.keys()];
+	    queuedForTurnEnd.clear();
+	    setTimer(() => {
+	      for (const id of ids) {
+	        const entry = entries.get(id);
+	        if (!entry) continue;
+	        const handle = timers.get(id);
+	        if (handle !== undefined) { clearTimer(handle); timers.delete(id); }
+	        fire(id);
+	      }
+	    }, 0);
+	  };
+
 	  const fireBody = (id: string, entry: WakeupEntry): void => {
     const t = now();
     if (entry.expiresAt !== undefined && t > entry.expiresAt) {
@@ -414,6 +462,13 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       advance(entry, t);
       return;
     }
+    // OBSERVE-TURN-EVENT-LIFECYCLE — 예약 시각 도래(busy 여부·거부 사유는 문이 판정한다).
+    try { turnLifeLog('turn-life:event-arrived', { source: 'scheduled', wakeupId: id, arrivedAt: t }); } catch { /* observability is fail-open */ }
+    // R1(C4) — 원천 어댑터: 도래를 버스 항목으로도 낸다(source 'wakeup' · dedupeKey wakeup:<id>:<fireCount>).
+    // 발화는 여전히 이 스케줄러가 직접 청하고, 버스 항목은 문이 열어주는 길(백업·순서 보증)이 된다.
+    // duplicate 는 정상이다(같은 회차를 마운트 배출·버스가 다시 낼 때) — 무시한다.
+    publish({ id: `wakeup-${id}-${entry.fireCount}`, source: 'wakeup', dedupeKey: `wakeup:${id}:${entry.fireCount}`,
+      arrivedAt: t, deliverBy: entry.dueAt + (entry.repeatMs ?? WAKEUP_DEFER_MAX_MS), text: formatWakeupPrompt(entry) });
     let result: StartTurnIfIdleResult;
     try {
       result = deps.startTurnIfIdle(formatWakeupPrompt(entry), { origin: 'scheduled', reason: entry.reason });
@@ -423,8 +478,10 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     if (result.opened) {
       entry.lastTurnId = result.turnId;
       entry.fireCount += 1;
+      queuedForTurnEnd.delete(id); // 두 번 배출 없음 — 발화됐으니 대기 큐에서 뺀다
       log('tui.wakeup', 'fired', {
         id, turnId: result.turnId, reason: entry.reason, retried: entry.retried, repeat: !!entry.repeatMs,
+        delaySec: Math.max(0, Math.round((t - entry.dueAt) / 1000)), // 늦게 깬 시간(지연 초) — 첫 예정부터 실제 발화까지(OP #88346)
       });
       advance(entry, t);
       return;
@@ -436,8 +493,11 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     const pacedAt = !result.opened && result.reason === 'Cap' && result.retryAt !== undefined ? result.retryAt : null;
     const deferrable = WAKEUP_DEFERRABLE_REASONS.has(result.reason) || pacedAt !== null;
     if (deferrable) {
-      // 바쁨·사람 입력 중 — 버리지 않고 1분마다 다시 청한다(같은 회차). 상한 = 첫 예정 시각 + WAKEUP_DEFER_MAX_MS,
-      // 반복이면 다음 회차 시각도 상한(그 회차가 이 깨움을 대신한다).
+      // 바쁨·사람 입력 중 — 버리지 않는다(ELN-SEAT-WAKEUP-SCHEDULE-FAIL · OP #88346): 이 발화를 «턴 끝 배출»
+      // 대기 큐에 싣는다(Map — 같은 예약 id 두 번은 하나로). 배출 시점 = wrapPort 의 입력칸 마운트(턴 끝 ·
+      // idle) — agent-wake 의 idle 감시와 같은 길. 소실 0.
+      const announced = queuedForTurnEnd.get(id) ?? false;
+      queuedForTurnEnd.set(id, announced);
       const delay = pacedAt !== null ? Math.max(0, pacedAt - t) : WAKEUP_RETRY_DELAY_MS;
       const nextTry = t + delay;
       // 상한 시각의 시도까지는 한다(<=) · 반복은 다음 회차 시각과 겹치면 그 회차에 넘긴다(<).
@@ -445,12 +505,28 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       const beforeNextTick = !entry.repeatMs || nextTry < entry.dueAt + entry.repeatMs;
       if (withinDeferCap && beforeNextTick) {
         entry.retried = true;
+        // OBSERVE-TURN-EVENT-LIFECYCLE — 바쁨/거부 미룸: delay 후 같은 회차 재시도(상한 = 첫 예정 + DEFER_MAX).
+        try { turnLifeLog('turn-life:event-while-busy', { source: 'scheduled', action: 'defer', wakeupId: id, retryMs: delay, deferCapAt: entry.dueAt + WAKEUP_DEFER_MAX_MS }); } catch { /* observability is fail-open */ }
         timers.set(id, setTimer(() => fire(id), delay));
         return;
       }
+      // 미루기 상한·다음 회차 시각을 넘었다 — 예전엔 여기서 «놓침» 한 줄과 함께 소리 없이 소실(반복은 회차
+      // 접기) 했다. 이제 큐에 남아 턴이 끝나면 반드시 1회 배출된다(반복은 그 뒤 advance 가 놓친 회차를
+      // 하나로 합친다). 재청 고리는 30분 간격으로 흐리게 남는다 — 마운트 배출이 먼저 이기고, 마운트 없는
+      // 표면의 소실 0 보증이 된다. «대기» 한 줄은 구간마다 한 번만 띄운다.
+      if (!announced) {
+        log('tui.wakeup', 'queued', { id, reason: result.reason, next: 'turn-end' });
+        deps.notify?.(`⏰ 예약 깨움 대기(${id}): ${entry.reason} — ${result.reason} · 턴이 끝나면 즉시 깨운다`);
+        queuedForTurnEnd.set(id, true); // «대기» 고지는 구간마다 한 번(발화·취소·회차 진행 때 큐가 비워진다)
+      }
+      const safetyDelay = pacedAt !== null ? Math.max(WAKEUP_DEFER_MAX_MS, pacedAt - t) : WAKEUP_DEFER_MAX_MS;
+      timers.set(id, setTimer(() => fire(id), safetyDelay));
+      return;
     } else if (!entry.retried) {
       // 바쁨이 아닌 거부 — 1분 뒤 한 번만 다시 청한다(기존 계약).
       entry.retried = true;
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 바쁨 아닌 거부(사람 입력 중 등): 1분 뒤 한 번 더.
+      try { turnLifeLog('turn-life:event-while-busy', { source: 'scheduled', action: 'defer', wakeupId: id, retryMs: WAKEUP_RETRY_DELAY_MS }); } catch { /* observability is fail-open */ }
       timers.set(id, setTimer(() => fire(id), WAKEUP_RETRY_DELAY_MS));
       return;
     }
@@ -460,9 +536,20 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       advance(entry, t);
       return;
     }
-    log('tui.wakeup', 'skipped', { id, reason: exhausted, next: 'dropped' });
-    deps.notify?.(`⏰ 예약 깨움 놓침(${id}): ${entry.reason} — ${result.reason}`);
-    drop(id);
+    // K10(턴 근본 C4) — 일회성도 버리지 않는다: 예전의 «놓침 한 줄 ⊕ 소멸» 폐기. 소진 뒤에는
+    // «턴 끝 배출» 대기 큐(마운트 배출에서 1회) + 버스 항목으로 남는다(소실 0). Disabled 같은
+    // 사유는 미뤄도 곧 풀리지 않으니 30분 흐린 재청만 돌고, «대기» 고지는 구간마다 한 번.
+    log('tui.wakeup', 'queued', { id, reason: result.reason, next: 'turn-end', exhausted });
+    // OBSERVE-TURN-EVENT-LIFECYCLE — 재청 소진(일회성): 버스에 «늦은 깨움» 항목으로도 낸다(drop 아님).
+    try { turnLifeLog('turn-life:event-while-busy', { source: 'scheduled', action: 'queue', wakeupId: id, exhausted }); } catch { /* observability is fail-open */ }
+    publish({ id: `wakeup-${id}-${entry.fireCount}-late`, source: 'wakeup', dedupeKey: `wakeup:${id}:${entry.fireCount}:late`,
+      arrivedAt: t, deliverBy: entry.dueAt + WAKEUP_DEFER_MAX_MS, text: formatWakeupPrompt(entry) });
+    const announcedLate = queuedForTurnEnd.get(id) ?? false;
+    if (!announcedLate) {
+      deps.notify?.(`⏰ 예약 깨움 대기(${id}): ${entry.reason} — ${result.reason} · 턴이 끝나면 즉시 깨운다`);
+      queuedForTurnEnd.set(id, true);
+    }
+    timers.set(id, setTimer(() => fire(id), WAKEUP_DEFER_MAX_MS));
   };
 
   // 재기동 복원(OP O2): persist 가 있으면 이전 예약을 되살린다. 만료(expiresAt 경과)와
@@ -496,9 +583,12 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
         continue;
       }
       if (!entry.repeatMs && entry.dueAt <= t) {
-        log('tui.wakeup', 'restored-discarded', { id: entry.id, reason: 'one-shot-past-due' });
-        entries.delete(entry.id);
-        discarded++;
+        // 턴 근본 C4(설계 §3 ③4) — 재기동 복원의 지난 일회성은 폐기하지 않고 «늦은 깨움»으로 즉시
+        // 발화한다: arm 의 지연은 Math.max(0, dueAt-now)=0 → 다음 틱에 fire. 버스 항목은 fire 안에서
+        // 같은 회차(dedupeKey)로 난다 — 중복 없음.
+        log('tui.wakeup', 'restored-late', { id: entry.id, lateSec: Math.max(0, Math.round((t - entry.dueAt) / 1000)) });
+        restored++;
+        arm(entry);
         continue;
       }
       restored++;
@@ -518,6 +608,7 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     for (const handle of timers.values()) clearTimer(handle);
     timers.clear();
     entries.clear();
+    queuedForTurnEnd.clear(); // 세션이 바뀌면 대기 큐도 비운다 — 복원된 예약은 자기 거부 때 다시 싣는다
     persist = next ?? undefined;
     writeRefused = null;
     restoreFromPersist();
@@ -633,6 +724,20 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     dispose() {
       for (const handle of timers.values()) clearTimer(handle);
       timers.clear();
+      queuedForTurnEnd.clear();
+    },
+    wrapPort(port: TextInputInternalTurnYieldPort): TextInputInternalTurnYieldPort {
+      // attach 를 먼저 이어준 뒤 배출한다 — 마운트 «중»에 물러남을 청하지 않게 배출 본체는 0ms 미룬다
+      // (drainQueuedWakeups). 배출이 실패해도 입력 마운트를 막지 않는다(fail-soft — agent-wake 관례).
+      return {
+        attach: (requestYield: () => boolean) => {
+          port.attach(requestYield);
+          try { drainQueuedWakeups(); }
+          catch (error) { log('tui.wakeup', 'queued-drain-failed', { error: String(error) }); }
+        },
+        detach: (opts?: { yielded?: boolean }) => { port.detach(opts); },
+        declined: (detail: string) => { port.declined?.(detail); },
+      };
     },
   };
 }
@@ -651,7 +756,7 @@ const describeEntry = (e: WakeupEntry): Record<string, unknown> => ({
 /** 자리 TUI 의 host tool — 대시보드가 자기 스케줄러를 넘겨 등록한다(하니스 자식·비 TUI 표면엔 없다). */
 export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMToolDef {
   // 저장 여부는 세션이 늦게 붙으면 바뀐다 — 설명(생성 시점)은 단정하지 않고, 결과(호출 시점)의 `saved` 가 사실을 말한다.
-  const durable = 'When this TUI is attached to a session file, wakeups are saved per session and restored when that session is reopened; each schedule result reports `saved` (false = memory only, gone when this TUI exits). Wakeups belong to the session that created them and do not move when you switch sessions. Two TUIs writing the same session file is not supported (last write wins). A failed save leaves the previous file untouched and schedule/cancel then report an error; a damaged file refuses scheduling and cancelling. A one-shot past its time is discarded on restore; repeats resume at their next tick. ';
+  const durable = 'When this TUI is attached to a session file, wakeups are saved per session and restored when that session is reopened; each schedule result reports `saved` (false = memory only, gone when this TUI exits). Wakeups belong to the session that created them and do not move when you switch sessions. Two TUIs writing the same session file is not supported (last write wins). A failed save leaves the previous file untouched and schedule/cancel then report an error; a damaged file refuses scheduling and cancelling. A one-shot past its time wakes late (immediately) on restore instead of being discarded; repeats resume at their next tick. ';
   return {
     name: SCHEDULE_WAKEUP_TOOL_NAME,
     description:
@@ -659,7 +764,7 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
       + 'action=schedule (default) needs reason plus one of at ("HH:MM" local, past → tomorrow) / delaySeconds (≥60) / repeatMinutes (≥1; repeats expire after 7 days). Never provide both at and delaySeconds; the scheduler validates the timing choice. '
       + 'ONE-SHOT (wake once): give only delaySeconds or at and OMIT repeatMinutes (0 also means one-shot). Set repeatMinutes only when you really want it to repeat. '
       + `action=list shows pending wakeups; action=cancel needs id. Limits: ≥60s ahead, ≤7 days, at most 5 pending, at most ${WAKEUP_MAX_CALLS_PER_TURN} schedule/cancel calls per turn. `
-      + 'If the TUI is busy or the human is typing at that time it retries once a minute later, then gives up (repeats move to the next tick). '
+      + 'If the TUI is busy or the human is typing at that time it retries once a minute (up to 30 minutes), then stays queued and wakes exactly once the moment the current turn ends — a scheduled wakeup is never silently lost. '
       + durable
       + 'Not the same as schedule_manage — that is an OS cron job that runs a command outside this TUI and never opens a turn here.',
     parameters: {

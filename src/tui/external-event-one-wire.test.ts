@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { createExternalEventLedger } from './external-event-ledger.js';
 import { createNextTuiQueue } from './core/queue.js';
+import { dispatchQueuedExternalEventOne } from './entry.js';
 import {
+  dispatchExternalEventOne,
   finishExternalEventOne,
   noteExternalEventOne,
+  noticeOneDispatch,
   openExternalEventOne,
   resetExternalEventOneWire,
 } from './external-event-one-wire.js';
@@ -227,11 +230,230 @@ describe('one external event receipt is not better than the real steps', () => {
     expect(book.rows()).toHaveLength(1);
   });
 
+  test('dispatch table: a new row starts the turn, a refusal wakes only a later item', () => {
+    expect([
+      ['new, more queued', noticeOneDispatch({ injected: true, remaining: 2 })],
+      ['new, queue empty', noticeOneDispatch({ injected: true, remaining: 0 })],
+      ['refused, more queued', noticeOneDispatch({ injected: false, remaining: 2 })],
+      ['refused, queue empty', noticeOneDispatch({ injected: false, remaining: 0 })],
+    ]).toEqual([
+      ['new, more queued', { startTurn: true, wakeQueue: false }],
+      ['new, queue empty', { startTurn: true, wakeQueue: false }],
+      ['refused, more queued', { startTurn: false, wakeQueue: true }],
+      ['refused, queue empty', { startTurn: false, wakeQueue: false }],
+    ]);
+  });
+
   test('two notices stay two rows, not one bundle', () => {
     const book = resetExternalEventOneWire();
     noteExternalEventOne({ id: 'a', text: 'one', source: 'seat-mail', occurredAt: 1 }, 10);
     noteExternalEventOne({ id: 'b', text: 'two', source: 'wakeup', occurredAt: 2 }, 20);
     expect(book.rows().map((row) => row.id)).toEqual(['a', 'b']);
     expect(book.rows().map((row) => row.kind)).toEqual(['mail', 'wakeup']);
+  });
+
+  test('entry follows the dispatch verdict: a refusal wakes a later item, a new row starts the turn', () => {
+    resetExternalEventOneWire();
+    const opened = {
+      id: 'wire-1',
+      text: 'one notice',
+      source: 'seat-mail',
+      occurredAt: 1,
+      receivedAt: 10,
+      injected: true,
+      // This test never finishes the notice turn; entry keeps the finisher.
+      finish: (): Promise<never> => Promise.reject(new Error('not finished in this test')),
+    };
+    const run = (injected: boolean, remaining: number) => {
+      const calls: Array<[string, string]> = [];
+      const keepOpenIds: string[] = [];
+      dispatchExternalEventOne({
+        opened,
+        dispatch: noticeOneDispatch({ injected, remaining }),
+        remaining,
+        injectKey: () => { calls.push(['injectKey', opened.id]); },
+        keepOpen: (one) => { keepOpenIds.push(one.id); },
+        startChatTurn: (text, status) => { calls.push(['startChatTurn', `${text}|${status}`]); },
+        log: (event) => { calls.push(['log', event]); },
+      });
+      return { calls, keepOpenIds };
+    };
+    expect(run(true, 2).calls).toEqual([
+      ['log', 'queue-dispatched-notice'],
+      ['startChatTurn', 'one notice|[notice · seat-mail] auto-submitted'],
+    ]);
+    expect(run(false, 2).calls).toEqual([
+      ['log', 'queue-notice-not-injected'],
+      ['injectKey', 'wire-1'],
+    ]);
+    expect(run(false, 0).calls).toEqual([['log', 'queue-notice-not-injected']]);
+    const started = run(true, 0);
+    expect(started.keepOpenIds).toEqual(['wire-1']);
+    expect(started.calls).toEqual([
+      ['log', 'queue-dispatched-notice'],
+      ['startChatTurn', 'one notice|[notice · seat-mail] auto-submitted'],
+    ]);
+  });
+});
+
+/**
+ * The real entry chain (dispatchQueuedExternalEventOne from entry.js): the
+ * import failure alone is recovered through the common verdict, and the
+ * dispatch verdict is followed through the leaf on the same chain. A
+ * duplicate or an import failure wakes a later item; a new row starts the
+ * notice turn; an exception after the import is not swallowed into a wake.
+ */
+describe('the real entry chain: one chain, import failure recovered, verdict followed', () => {
+  const recorder = () => {
+    const calls: string[] = [];
+    return {
+      calls,
+      onSeatMail: (id: string) => { calls.push(`plan:${id}`); },
+      injectKey: () => { calls.push('injectKey'); },
+      keepOpen: (opened: { readonly id: string }) => { calls.push(`keepOpen:${opened.id}`); },
+      startChatTurn: (text: string, status: string) => { calls.push(`startChatTurn:${text}|${status}`); },
+      log: (event: string) => { calls.push(`log:${event}`); },
+    };
+  };
+
+  test('leaf import failure: no turn, a later item still wakes (the common verdict)', async () => {
+    const r = recorder();
+    const failedFields: Array<Record<string, unknown>> = [];
+    await dispatchQueuedExternalEventOne({
+      notice: { id: 'import-1', text: 'OP: one', source: 'seat-mail', occurredAt: 1_000, remaining: 2 },
+      wire: Promise.reject(new Error('leaf did not load')),
+      ...r,
+      log: (event, fields) => { r.log(event); failedFields.push(fields); },
+    });
+    expect(r.calls).toEqual([
+      'plan:import-1',
+      'log:queue-notice-open-failed',
+      'injectKey',
+    ]);
+    expect(failedFields).toEqual([{ source: 'seat-mail', id: 'import-1', remaining: 2, receipt: 'failed', error: 'Error: leaf did not load' }]);
+  });
+
+  test('leaf import failure with an empty queue behind: no turn, no wake', async () => {
+    const r = recorder();
+    await dispatchQueuedExternalEventOne({
+      notice: { id: 'import-2', text: 'OP: one', remaining: 0 },
+      wire: Promise.reject(new Error('leaf did not load')),
+      ...r,
+    });
+    expect(r.calls).toEqual(['log:queue-notice-open-failed']);
+  });
+
+  test('real leaf, a new row: entry keeps the opened notice and starts the turn', async () => {
+    resetExternalEventOneWire();
+    const r = recorder();
+    await dispatchQueuedExternalEventOne({
+      notice: { id: 'entry-new-1', text: 'OP: one', source: 'seat-mail', occurredAt: 1_000, remaining: 0 },
+      ...r,
+    });
+    expect(r.calls).toEqual([
+      'plan:entry-new-1',
+      'keepOpen:entry-new-1',
+      'log:queue-dispatched-notice',
+      'startChatTurn:OP: one|[notice · seat-mail] auto-submitted',
+    ]);
+  });
+
+  test('real leaf, a duplicate: no turn, a later item wakes through the same verdict', async () => {
+    const book = resetExternalEventOneWire();
+    noteExternalEventOne({ id: 'entry-dup-1', text: 'OP: first', source: 'seat-mail', occurredAt: 1_000 }, 16_000);
+    const r = recorder();
+    await dispatchQueuedExternalEventOne({
+      notice: { id: 'entry-dup-1', text: 'OP: again', source: 'seat-mail', occurredAt: 1_000, remaining: 3 },
+      ...r,
+    });
+    expect(r.calls).toEqual([
+      'plan:entry-dup-1',
+      'log:queue-notice-not-injected',
+      'injectKey',
+    ]);
+    // The duplicate did not borrow the first row: still one row, and it stays unhandled.
+    expect(book.rows()).toHaveLength(1);
+    expect(book.rows()[0]?.id).toBe('entry-dup-1');
+    expect(book.rows()[0]?.handledAt).toBeNull();
+  });
+
+  test('CAPSULE-C2: a person took the door during the import — the notice is kept, the ledger never sees it', async () => {
+    const book = resetExternalEventOneWire();
+    const r = recorder();
+    const kept: string[] = [];
+    await dispatchQueuedExternalEventOne({
+      notice: { id: 'door-held-1', text: 'OP: one', source: 'seat-mail', occurredAt: 1_000, remaining: 0 },
+      ...r,
+      held: () => false,
+      onSuperseded: () => { kept.push('door-held-1'); },
+      afterDispatch: () => { r.calls.push('afterDispatch'); },
+    });
+    expect(r.calls).toEqual(['plan:door-held-1', 'log:queue-notice-superseded']);
+    expect(kept).toEqual(['door-held-1']);
+    expect(book.rows()).toHaveLength(0);
+  });
+
+  test('CAPSULE-C2: the door still held — the turn starts, then the chain reports it is over', async () => {
+    resetExternalEventOneWire();
+    const r = recorder();
+    await dispatchQueuedExternalEventOne({
+      notice: { id: 'door-held-2', text: 'OP: two', source: 'seat-mail', occurredAt: 1_000, remaining: 0 },
+      ...r,
+      held: () => true,
+      afterDispatch: () => { r.calls.push('afterDispatch'); },
+    });
+    expect(r.calls).toEqual([
+      'plan:door-held-2',
+      'keepOpen:door-held-2',
+      'log:queue-dispatched-notice',
+      'startChatTurn:OP: two|[notice · seat-mail] auto-submitted',
+      'afterDispatch',
+    ]);
+  });
+
+  test('CAPSULE-C2: import failure frees the door before the wake', async () => {
+    const r = recorder();
+    await dispatchQueuedExternalEventOne({
+      notice: { id: 'door-held-3', text: 'OP: three', remaining: 1 },
+      wire: Promise.reject(new Error('leaf did not load')),
+      ...r,
+      afterDispatch: () => { r.calls.push('afterDispatch'); },
+    });
+    expect(r.calls).toEqual(['log:queue-notice-open-failed', 'afterDispatch', 'injectKey']);
+  });
+
+  test('an exception after the import rejects the chain instead of becoming a wake', async () => {
+    resetExternalEventOneWire();
+    const calls: string[] = [];
+    await expect(dispatchQueuedExternalEventOne({
+      notice: { id: 'entry-crash-1', text: 'OP: one', source: 'seat-mail', occurredAt: 1_000, remaining: 2 },
+      injectKey: () => { calls.push('injectKey'); },
+      keepOpen: () => { calls.push('keepOpen'); },
+      startChatTurn: () => { throw new Error('render defect'); },
+      log: (event) => { calls.push(`log:${event}`); },
+    })).rejects.toThrow('render defect');
+    expect(calls).toEqual([
+      'keepOpen',
+      'log:queue-dispatched-notice',
+    ]);
+  });
+
+  test('CAPSULE-C2-FU: startChatTurn throws — the chain rejects and afterDispatch still runs exactly once', async () => {
+    resetExternalEventOneWire();
+    const calls: string[] = [];
+    await expect(dispatchQueuedExternalEventOne({
+      notice: { id: 'entry-crash-2', text: 'OP: two', source: 'seat-mail', occurredAt: 1_000, remaining: 2 },
+      injectKey: () => { calls.push('injectKey'); },
+      keepOpen: () => { calls.push('keepOpen'); },
+      startChatTurn: () => { throw new Error('render defect'); },
+      log: (event) => { calls.push(`log:${event}`); },
+      held: () => true,
+      afterDispatch: () => { calls.push('afterDispatch'); },
+    })).rejects.toThrow('render defect');
+    expect(calls).toEqual([
+      'keepOpen',
+      'log:queue-dispatched-notice',
+      'afterDispatch',
+    ]);
   });
 });

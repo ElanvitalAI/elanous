@@ -81,17 +81,22 @@ test('five background Agents stay listed while typing, and one can be stopped by
         { label: 'list', text: '/tasks', until: '5 tasks' },
         { label: 'cancel', text: () => `/tasks stop ${target}`, until: 'Stop requested', timeoutMs: 15_000 }, // Source: #36642. Stop acknowledgement is the visible basic-chat line.
         { label: 'aborted row', keys: '\x1b[5~', until: (screen) => screen.includes(`${target} · flood worker · aborted`), timeoutMs: 15_000 }, // Source: #36642. PageUp leaves basic chat so the roster row is visible.
-        { label: 'all terminal', until: 'Results ready 5', timeoutMs: 30_000 }, // Source: #36642
+        // Source: #38650 — capsule-done now auto-submits its own turn and that turn consumes
+        // each pending result at once, so the footer never sits on «Results ready 5» anymore.
+        // The roster rows are the terminal surface: nothing running, the four non-stopped done.
+        { label: 'all terminal', until: (screen) => [...screen.matchAll(/flood worker · running/g)].length === 0 && [...screen.matchAll(/flood worker · done/g)].length >= 4, timeoutMs: 30_000 }, // Source: #36642 five-child fixture, surface per #38650
         { label: 'next turn receives results', text: 'collect-results', until: (screen) => screen.includes('> collect-results') && TURN_DONE(screen), timeoutMs: 30_000 }, // Source: #36642. The next turn must finish before result delivery is asserted.
       ],
     });
     const requests = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-    const delivery = requests.find((request) => JSON.stringify(request.messages).includes('collect-results'));
-    const delivered = JSON.stringify(delivery?.messages ?? []);
+    // Source: #38650 — the capsule-done auto-submitted turns consume the pending results one by
+    // one (measured: 2+1+1+1 across four notice turns, zero in the collect-results turn), so
+    // delivery is asserted over every captured request instead of the collect-results turn only.
+    const delivered = requests.map((request) => JSON.stringify(request.messages)).join('');
     expect(run.actualHost).toBeTruthy();
     expect(run.exitCode).toBe(0);
     expect(Date.parse(run.frames[2]!.at) - Date.parse(run.frames[1]!.at)).toBeLessThan(1500); // Source: #36642
-    expect(delivered.match(/<task id=/g)).toHaveLength(5); // Source: #36642
+    expect(delivered.match(/<task id=/g)).toHaveLength(5); // Source: #36642 five-child fixture; delivery vehicle changed to capsule-done auto turns by #38650
     expect(delivered).toContain('status=\\"aborted\\"');
   } finally {
     rmSync(root, { recursive: true, force: true });

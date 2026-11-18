@@ -107,7 +107,7 @@ test('shadow --mission → 미션 카드 1 ⊕ 조각 카드 4 · 같은 상태 
   const path = statePath();
   let launched = 0;
   const { lines, code } = await cli(['task', 'hand', '--mission', LISTED, '--seat', 'OP', '--checklist', 'CELL-X'], {
-    taskStatePath: path, taskLauncher: () => { launched++; }, missionDecompose: noLlm,
+    taskStatePath: path, taskLauncher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; }, missionDecompose: noLlm,
     releaseBoard: () => [{ level: 'task', id: 'CELL-X', title: '가상 미션 칸', status: 'open' }],
   });
   expect(code).toBeFalsy();
@@ -150,7 +150,7 @@ test('shadow --mission → 미션 카드 1 ⊕ 조각 카드 4 · 같은 상태 
 test('--live --mission 은 선행 없는 조각만 발사한다 · 발사 실패는 그 조각만 launch-failed · exit 1', async () => {
   const path = statePath();
   const calls: string[][] = [];
-  const ok = await cli(['task', 'hand', '--mission', '- one\n- two\n- three (after: 1, 2)', '--live', '--json'], { taskStatePath: path, taskLauncher: (args) => { calls.push(args); } });
+  const ok = await cli(['task', 'hand', '--mission', '- one\n- two\n- three (after: 1, 2)', '--live', '--json'], { taskStatePath: path, taskLauncher: (args, _cwd, launchContext) => { calls.push(args); return { runId: launchContext?.runId }; } });
   expect(ok.code).toBeFalsy();
   expect(calls.map((args) => args.at(-1))).toEqual(['one', 'two']);
   const result = JSON.parse(ok.lines[0]!);
@@ -159,7 +159,7 @@ test('--live --mission 은 선행 없는 조각만 발사한다 · 발사 실패
   expect(readTaskCard(result.pieces[2].card.id, path)?.status).toBe('handed');
 
   const failPath = statePath();
-  const live = await cli(['task', 'hand', '--mission', '- one\n- two', '--live'], { taskStatePath: failPath, taskLauncher: (args) => { if (args.at(-1) === 'two') throw new Error('boom'); } });
+  const live = await cli(['task', 'hand', '--mission', '- one\n- two', '--live'], { taskStatePath: failPath, taskLauncher: (args, _cwd, launchContext) => { if (args.at(-1) === 'two') throw new Error('boom'); return { runId: launchContext?.runId }; } });
   expect(live.code).toBe(1);
   expect(live.lines.join('\n')).toContain('boom');
   const cards = Object.values(JSON.parse(readFileSync(failPath, 'utf8')).tasks) as Array<{ text: string; status: string; mission?: string }>;

@@ -26,16 +26,23 @@ const WCAG_AA_TEXT = 4.5;
 const QUIET_BAND_MAX = 1.5;
 const contrast = (a: number, b: number) => { const [x, y] = [luminance(a), luminance(b)].sort((p, q) => q - p); return (x! + 0.05) / (y! + 0.05); };
 
+// The band colours as literals (대표 11-18 toned-down band): the checks below measure these, and the product must equal them.
+const BAND = { dark: { bg: 235, fg: 252 }, light: { bg: 255, fg: 235 } } as const;
+
+test('the product tokens are the literal band colours', () => {
+  expect(TURN_BAND_TOKENS).toEqual(BAND);
+});
+
 test('both themes: text on the band reads at WCAG ≥ 4.5:1', () => {
   for (const theme of ['dark', 'light'] as const) {
-    const { bg, fg } = TURN_BAND_TOKENS[theme];
+    const { bg, fg } = BAND[theme];
     expect(contrast(fg, bg)).toBeGreaterThanOrEqual(WCAG_AA_TEXT);
   }
 });
 
 test('the band is a neutral grey that sits close to the terminal background (symmetric for dark and light)', () => {
   // A typical dark terminal ≈ black (xterm 16), a light one ≈ white (231).
-  const [dark, light] = [TURN_BAND_TOKENS.dark.bg, TURN_BAND_TOKENS.light.bg];
+  const [dark, light] = [BAND.dark.bg, BAND.light.bg];
   for (const n of [dark, light]) { const [r, g, b] = rgb(n); expect(r === g && g === b).toBe(true); }
   expect(contrast(dark, 16)).toBeLessThan(QUIET_BAND_MAX);
   expect(contrast(light, 231)).toBeLessThan(QUIET_BAND_MAX);
@@ -48,5 +55,5 @@ test('theme follows COLORFGBG (light only when the terminal says so); the row pa
   expect(turnBandTheme({ COLORFGBG: '15;0' })).toBe('dark');
   expect(userTurnBandSgr({ COLORFGBG: '0;15' })).toBe('48;5;255;38;5;235');
   expect(USER_TURN_BAND_SGR).toBe('48;5;235;38;5;252');
-  expect(userTurnBandRow('> hi', 10)).toStartWith(`\x1b[${userTurnBandSgr()}m`);
+  expect(userTurnBandRow('> hi', 10)).toStartWith('\x1b[48;5;235;38;5;252m'); // dark (COLORFGBG pinned to dark)
 });

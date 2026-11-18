@@ -112,3 +112,28 @@ test('a pane started by `els new` carries the workspace and socket in its env, a
   release();
   await running;
 });
+
+test('reorder over the socket survives a restart of the owner: workspaces and tabs come back in the order a person left them', async () => {
+  const root = state();
+  const fake = (): ElsPty => ({ id: `pty_${Math.random().toString(16).slice(2)}`, isAlive: () => true, write: () => {}, renderScreen: async () => '', onExit: () => {}, kill: () => {} });
+  const first = await startElsServer({ stateRoot: root, spawn: fake });
+  if ('exitCode' in first) throw new Error(first.message);
+  const made: { address: string; pane: string }[] = [];
+  for (const ws of ['one', 'two', 'three', 'two']) made.push(JSON.parse((await ask(root, { op: 'new', ws, cwd: '/w', command: ['sh'], title: `${ws}-${made.length}` })).message));
+  const listed = async () => (JSON.parse((await ask(root, { op: 'ls' })).message) as { panes: { title: string; tab: string }[] }).panes;
+  expect((await listed()).map((p) => p.title)).toEqual(['one-0', 'two-1', 'two-3', 'three-2']);
+  expect((await ask(root, { op: 'reorder', kind: 'workspace', id: 'three', before: 'one' })).exitCode).toBe(0);
+  const lastTwo = (await listed()).find((p) => p.title === 'two-3')!.tab;
+  const firstTwo = (await listed()).find((p) => p.title === 'two-1')!.tab;
+  expect((await ask(root, { op: 'reorder', kind: 'tab', id: lastTwo, before: firstTwo })).exitCode).toBe(0);
+  expect((await ask(root, { op: 'reorder', kind: 'tab', id: lastTwo, before: 'nothing' })).exitCode).toBe(1);
+  expect((await ask(root, { op: 'reorder', kind: 'workspace', id: 'one', before: '' })).exitCode).toBe(0);      // empty = the end, over the socket too
+  expect((await listed()).map((p) => p.title)).toEqual(['three-2', 'two-3', 'two-1', 'one-0']);
+  expect((await ask(root, { op: 'reorder', kind: 'workspace', id: 'one', before: 'two' })).exitCode).toBe(0);
+  expect((await listed()).map((p) => p.title)).toEqual(['three-2', 'one-0', 'two-3', 'two-1']);
+  await first.close();
+  const second = await startElsServer({ stateRoot: root, spawn: fake });
+  if ('exitCode' in second) throw new Error(second.message);
+  cleanups.push(() => second.close());
+  expect((await listed()).map((p) => p.title)).toEqual(['three-2', 'one-0', 'two-3', 'two-1']);
+});

@@ -8,7 +8,7 @@
 
 import { debug } from '../debug/log.js';
 import { dispatchMsgPost, type MsgLedgerDeps } from '../skills/tools/ops-ledger.js';
-import { SEAT_TURN_CAP_CONTINUE_PROMPT } from './seat-turn-cap.js';
+import { SEAT_TURN_CAP_CONTINUE_PROMPT, seatCapCheckpoint } from './seat-turn-cap.js';
 
 export interface SeatCapResumeNoticeDeps extends MsgLedgerDeps {
   /** Observation sink override for tests. */
@@ -20,8 +20,10 @@ export interface SeatCapResumeNoticeDeps extends MsgLedgerDeps {
 export function postSeatCapResumeNotice(deps: SeatCapResumeNoticeDeps = {}): (info: { seat: string; finalText: string; iterations: number }) => Promise<void> {
   const log = deps.log ?? ((category: string, event: string, data: Record<string, unknown>, opts?: { level: 'info' | 'warn' }) => debug.log(category, event, data, opts));
   return async (info) => {
+    // 진행 요약(finalText)을 본문에 넣는다. 재개 깨움은 우편 번호만 치고, 다음 턴이 msg list 로 이 본문을 읽는다.
     const body = `[SEAT TURN CAP] ${info.seat} 자리 턴이 상한(도구 수 또는 벽시계)에 닿아 마감됐다(반복 ${info.iterations}회). `
-      + SEAT_TURN_CAP_CONTINUE_PROMPT;
+      + SEAT_TURN_CAP_CONTINUE_PROMPT
+      + seatCapCheckpoint(info.finalText);
     try {
       // dispatchMsgPost 는 async(SQLite 원장)다 — 완료를 기다린 뒤 관측 로그를 남긴다.
       const posted = await dispatchMsgPost({ from: 'OP', to: info.seat, body, kind: 'seat-cap-resume' }, deps);

@@ -7,7 +7,7 @@ import { isGraphProgressObservation, type GraphProgressObservation } from '../gr
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { sessionFile, sessionRoot } from '../session/index.js';
-import { NEXT_TUI_WAKEUP_IPC_ENV, answerWakeupCall, isWakeupCallMessage, nextTuiWakeupTool } from './next-wakeup.js';
+import { NEXT_TUI_WAKEUP_IPC_ENV, isWakeupCallMessage, nextTuiWakeupTool, replyToWakeupCall } from './next-wakeup.js';
 import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
 import { answerNextSidetabCall, gateNextSidetabHandler, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
 import type { AgentDisplayEvent } from '../tui/core/agents.js';
@@ -32,9 +32,14 @@ import { spawnElanousBun } from '../instance/spawn-elanous.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { SHELL_KILL_GRACE_MS, SHELL_SNAPSHOT_REPLY_TIMEOUT_MS } from '../tool-runtime/shell-watchdog.js';
+import { CAPSULE_FRAME_PREFIX, parseCapsuleFrame } from '../turn-capsule/capsule-frame.js';
+import { TURN_CANCEL_GRACE_MS, TURN_CANCEL_TYPE } from '../turn-capsule/turn-cancel.js';
+import { emitTurnLife } from '../debug/turn-life.js';
+import type { CapsuleEvent } from '../turn-capsule/contract.js';
 import { answerMemberBoardSessionCall, isMemberBoardSessionCall, type MemberBoardSessionSource } from './next-member-board-session.js';
 
 const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
+const capsuleListeners = new Map<string, Set<(event: CapsuleEvent) => void>>();
 let nextSidetabHandler: NextSidetabHandler | null = null;
 let nextSidetabIpcEnabled = false;
 let nextTuiShellApprovalHandler: ((command: string, callId: string, kind: 'bash' | 'graph', windowMs?: number) => Promise<boolean | ApprovalOutcome>) | null = null;
@@ -215,9 +220,8 @@ class LocalChatSession {
             try { child.send(answerMemberBoardSessionCall(nextMemberBoardSessionSource, message)); }
             catch { /* the child exited before the reply */ }
           } else if (wakeupTool && isWakeupCallMessage(message)) {
-            void answerWakeupCall(wakeupTool, message).then((reply) => {
-              try { child.send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
-            });
+            // TURN-FIELD-BUG-1: every path answers (throw · rejection · slow handler → error reply within the cap).
+            void replyToWakeupCall(wakeupTool, message, (reply) => child.send(reply));
           } else if (isNextSidetabCall(message)) {
             const handler = nextSidetabHandler ?? (async () => ({ error: 'Next TUI sidetab handler is not ready' }));
             // TUI-NO-UNREQUESTED-SIDETAB: the model may not open side tabs the user never asked for.
@@ -261,7 +265,17 @@ class LocalChatSession {
     let stdoutClosedWhileAlive = false;
     let stderrReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     const stderrDrained = this.readLines(errors, (line) => {
-      if (line.startsWith(STATUS_PREFIX)) {
+      if (line.startsWith(CAPSULE_FRAME_PREFIX)) {
+        // CAPSULE-B1 — read for the whole session (idle too): a finished capsule can knock without a turn running.
+        const event = parseCapsuleFrame(line.slice(CAPSULE_FRAME_PREFIX.length), sessionId);
+        if (event?.type === 'capsule-done') {
+          emitTurnLife('turn-life:capsule-done-received', { sessionId, capsuleId: event.capsuleId, kind: event.kind,
+            status: event.status, listeners: capsuleListeners.get(sessionId)?.size ?? 0 });
+        }
+        if (event) for (const listener of capsuleListeners.get(sessionId) ?? []) {
+          try { listener(event); } catch { /* capsule observers cannot break the child */ }
+        }
+      } else if (line.startsWith(STATUS_PREFIX)) {
         for (const listener of statusListeners.get(sessionId) ?? []) {
           try { listener(line.slice(STATUS_PREFIX.length)); } catch { /* status observers cannot break the turn */ }
         }
@@ -573,6 +587,26 @@ class LocalChatSession {
     try { this.child.send({ type: 'elanous.next-tui.steer-retract', turnId: this.waiting.turnId, steerIds: [...steerIds] }); return true; }
     catch { return false; }
   }
+  /** CAPSULE-B2 — cancel the running turn over IPC; the child (and the capsules it hosts) keeps living.
+   *  Pending approvals of this turn are withdrawn as close() does. False = nothing sent (caller falls back to close). */
+  cancelTurn(): boolean {
+    if (this.closed || !this.waiting) return false;
+    try { this.child.send({ type: TURN_CANCEL_TYPE, sessionId: this.sessionId, turnId: this.waiting.turnId }); }
+    catch { return false; }
+    for (const callId of this.pendingShellApprovalIds) {
+      try {
+        this.child.send({ type: SHELL_APPROVAL_CANCEL_TYPE, callId, reason: 'turn-cancelled' });
+        nextTuiShellApprovalCancelHandler?.(callId, 'turn-cancelled');
+      } catch { /* the child may be exiting; the fallback close covers it */ }
+    }
+    const approvalsWithdrawn = this.pendingShellApprovalIds.size + this.pendingHarnessAskUserIds.size;
+    this.pendingShellApprovalIds.clear();
+    for (const callId of this.pendingHarnessAskUserIds) nextTuiHarnessAskUserCancelHandler?.(callId);
+    this.pendingHarnessAskUserIds.clear();
+    emitTurnLife('turn-life:turn-cancel-sent', { sessionId: this.sessionId, turnId: this.waiting.turnId, approvalsWithdrawn });
+    return true;
+  }
+
   requestTaskStop(taskId: string): boolean {
     if (this.closed) return false;
     try { this.child.send({ type: 'elanous.next-tui.task-stop', sessionId: this.sessionId, taskId }); return true; }
@@ -617,6 +651,17 @@ export function onLocalChatBackgroundStatus(sessionId: string, listener: (json: 
   return () => {
     listeners.delete(listener);
     if (listeners.size === 0) statusListeners.delete(sessionId);
+  };
+}
+
+/** CAPSULE-B1 — `capsule-done` / `capsule-progress` frames of this session's chat child. */
+export function onLocalChatCapsuleEvent(sessionId: string, listener: (event: CapsuleEvent) => void): () => void {
+  const listeners = capsuleListeners.get(sessionId) ?? new Set();
+  listeners.add(listener);
+  capsuleListeners.set(sessionId, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) capsuleListeners.delete(sessionId);
   };
 }
 
@@ -788,7 +833,16 @@ export async function runLocalChatTurn(
     finally { childCreateMs = performance.now() - creating; }
     sessions.set(sessionId, session);
     dispatchMs = performance.now() - started;
-    const abort = (): void => { void closeLocalChatSession(sessionId); };
+    // CAPSULE-B2 — Esc cancels the turn, not the child; the child gets a grace to settle, then the old close.
+    let cancelFallback: ReturnType<typeof setTimeout> | undefined;
+    const abort = (): void => {
+      if (!session.cancelTurn()) { void closeLocalChatSession(sessionId); return; }
+      cancelFallback = setTimeout(() => {
+        emitTurnLife('turn-life:turn-cancel-fallback-close', { sessionId, graceMs: TURN_CANCEL_GRACE_MS });
+        void closeLocalChatSession(sessionId);
+      }, TURN_CANCEL_GRACE_MS);
+      cancelFallback.unref?.();
+    };
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
     let result: TurnResult;
@@ -813,6 +867,7 @@ export async function runLocalChatTurn(
       await closeLocalChatSession(sessionId);
       throw error;
     } finally {
+      if (cancelFallback) clearTimeout(cancelFallback);
       signal.removeEventListener('abort', abort);
     }
     if (signal.aborted) throw new Error('응답을 취소했습니다');

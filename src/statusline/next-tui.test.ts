@@ -128,7 +128,7 @@ const footer = (input: Partial<typeof INPUT> & Record<string, unknown>, width: n
   renderNextTuiStatusline(defaultStatuslineDefinition(), nextTuiStatuslineSnapshot({ ...INPUT, ...input, width } as typeof INPUT,
     '/Users/me/elanous-hq/worktrees/UX', { ...DEV, commitTime: STAMP }, '/Users/me'), width, false);
 
-test('footer snapshots: wide keeps the old sentence; below 120 the short line; cwd and version are never pushed out', () => {
+test('footer snapshots: wide keeps the old sentence; below 120 the short line; a long turn outranks cwd and version', () => {
   const busy = { turnState: '응답 중', model: 'openai-codex/gpt-sim', queued: 2, backgroundTasks: 1, elapsedMs: 185_000, measuredUsage: { inputTokens: 14, outputTokens: 6 } };
   // ≥120 with room: the old sentence, then the cwd and the version.
   expect(footer(busy, 200)).toBe('Turn running · Model openai-codex/gpt-sim · Elapsed 185.0s · Tokens 14/6 · Queue 2 · Bg 1 · ~/elanous-hq/worktrees/UX · 0.3.28-dev.0 · 261117_1925 · dev');
@@ -141,11 +141,10 @@ test('footer snapshots: wide keeps the old sentence; below 120 the short line; c
   expect(footer(busy, 100)).toBe('● running 3m · UX · 261117_1925·dev · gpt-sim · Q2·B1·14/6t');
   expect(footer(busy, 80)).toBe('● running 3m · UX · 261117_1925·dev · gpt-sim · Q2·B1·14/6t');
   expect(footer({ turnState: '대기' }, 80)).toBe('○ idle · UX · 261117_1925·dev · gpt-sim · Q0·B0');
-  // A long informative state is cut at its end; the cwd and the version keep their room.
+  // #38797: a long informative state outranks the cwd and the version — they give up their room first, and only
+  // a clause that still cannot fit is cut at its end.
   const long = footer({ turnState: 'Task list · Enter to send · Esc closes the list and keeps the draft' }, 60);
-  expect(long.endsWith(' · UX · 261117_1925·dev')).toBe(true);
-  expect(long.startsWith('● Task list · Enter to send')).toBe(true);
-  expect(long).toContain('…');
+  expect(long).toBe('● Task list · Enter to send · Esc closes the list and keeps…');
 });
 
 test('the short turn clause: phases with how long, failures first, information kept whole', () => {
@@ -210,7 +209,8 @@ describe('NEXT-TUI-FOOTER-24-ROWS · compact turn slot', () => {
     const turn = compactFooterTurn({ welcomePending: false, attachmentHint: 'Attachments 2/4', shortTurn: nextTuiShortStatus(input).turn, activeChildren: 1 });
     const line = footer.render(input, turn).plain;
     expect(line).toContain('Attachments 2/4');
-    expect(line).toContain('ticketing-app');
+    // #38797: the turn slot outranks the cwd, so at 80 columns the long turn keeps the room the cwd gave up.
+    expect(line).toBe('Attachments 2/4 · ● 도구 실행 중 · 아주 긴 단계 설명이 붙은 상태 문장 · Childre…');
     expect(line).not.toContain('Steer');
     // Where the counters fit, the queue appears exactly once — in them («S1·Q2»), never again in the turn place.
     const known = { ...input, turnState: 'running', width: 110 };

@@ -35,7 +35,7 @@ export const FEATURE_MATURITY = {
   },
   // Canonical CLI command names only; aliases inherit their command's grade.
   cliRoot: {
-    preview: 'beta', pty: 'beta', side: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta', catalog: 'beta', app: 'beta',
+    preview: 'beta', pty: 'beta', pane: 'beta', side: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta', catalog: 'beta', app: 'beta',
     where: 'stable', bench: 'beta', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
     pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', runs: 'beta', live: 'beta',
     research: 'beta', release: 'beta', rfc: 'beta', know: 'beta', life: 'beta', freeze: 'beta', herdr: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',

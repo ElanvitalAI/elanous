@@ -52,7 +52,8 @@ test('post reads piped stdin, accepts literal body and kind; human and JSON outp
   const f = fixture('  stdin with\nnew line  ');
   await f.run('post', '--from', 's', '--to', 't', '--kind', 'memo');
   expect(f.stderr).toEqual([]);
-  expect(f.stdout[0]).toContain('OP → MK [memo]:   stdin with\nnew line  ');
+  // ELN-MSG-POST-IDEMPOTENT: the human line names the stored message without echoing its body.
+  expect(f.stdout[0]).toMatch(/^#1 \S+ OP → MK \[memo\] · 23 bytes$/);
   const store = f.store();
   try { expect(store.list('MK')[0]).toMatchObject({ id: 1, from: 'OP', to: 'MK', body: '  stdin with\nnew line  ', kind: 'memo' }); }
   finally { store.close(); }
@@ -1255,7 +1256,8 @@ test('a failed TA reply insert cannot dispatch a memo; retry of the same origin 
   }));
   const args = ['post', `memo ${card.id} once only`, '--from', 'OP', '--to', 'TA', '--origin-key', 'coord:7:TA'];
   await f.run(...args);
-  expect(f.stderr.at(-1)).toBe('msg: reply insert failed');
+  // #38516 r2 MF2: the TA follow-up failure is a warning with the stored id — the request itself is durable (not exit 2).
+  expect(f.stderr.at(-1)).toBe('msg post: #1 stored; the TA follow-up failed: reply insert failed (retry with the same --origin-key is safe)');
   expect(sent).toHaveLength(0);
   await f.run(...args);
   const store = f.store();
@@ -1525,4 +1527,26 @@ test('MSG-RECEIPTS-FOLLOWUP ① — positional and --through hand acks leave «s
     for (const id of [a.id, b.id, c.id]) expect(store.listReceipts({ messageId: id }).map(r => `${r.state}:${r.source}`)).toEqual(['posted:ledger', 'seen:cli-ack']);
     expect(store.listReceipts({ messageId: d.id }).map(r => r.state)).toEqual(['posted']);
   } finally { store.close(); }
+});
+
+test('ELN-SEAT-LIVE 11-18 — msg post to a runtime=eln seat WITHOUT autowake: no herdr typing (one mail, one turn) · the 60s safety net is armed', async () => {
+  const typed: Array<{ argv: string[] }> = [];
+  const fallbacks: Array<{ messageId: number; recipient: string; from: string }> = [];
+  const f = fixture('', ({ path }) => ({
+    wake: undefined,
+    spawnMailFallback: (input: { messageId: number; recipient: string; from: string }) => { fallbacks.push(input); },
+    wakeDeps: {
+      stateRoot: dirname(path), seatStateRoot: join(dirname(path), 'seats'), live: true,
+      listPtys: () => [], readPane: () => null, hasOptIn: () => false,
+      listHerdrPanes: () => [{ paneId: 'wX:p1', status: 'idle' }],
+      herdrRun: async (argv: string[]) => { typed.push({ argv }); return { code: 0, stdout: '{}', stderr: '' }; },
+      readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [
+        { address: 'HAND-ELN-ELS-API', host: 'local', target: 'wX:p1', wake: 'herdr', replyBody: 'agent', optIn: true, runtime: 'eln' },
+      ] } }),
+    },
+  } as unknown as Partial<MsgCliDeps>));
+  await f.run('post', '기동 확인', '--from', 'RES-INFRA', '--to', 'HAND-ELN-ELS-API');
+  expect(f.exits).toEqual([]);
+  expect(typed).toEqual([]);
+  expect(fallbacks).toEqual([{ messageId: 1, recipient: 'HAND-ELN-ELS-API', from: 'RES-INFRA' }]);
 });

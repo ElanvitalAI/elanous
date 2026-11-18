@@ -48,10 +48,10 @@ test('KAIST-SIGNUP-APP-SLOT: fake Google signup creates one isolated app slot an
       ));
       expect(callback?.status).toBe(303);
       const location = callback!.headers.get('location') ?? '';
-      expect(new URL(location).pathname).toBe('/v1/members/home');
+      expect(new URL(location).pathname).toBe('/signup/complete');
       const sessionCookie = callback!.headers.get('set-cookie')!.split(';', 1)[0]!;
       expect(sessionCookie.startsWith('__Host-elanous_member_session=')).toBe(true);
-      const home = await world.membersApi.handle(new Request(location, { headers: { cookie: sessionCookie } }));
+      const home = await world.membersApi.handle(new Request('https://members.example.test/v1/members/home', { headers: { cookie: sessionCookie } }));
       expect(home?.status).toBe(200);
       return sessionCookie;
     }));

@@ -18,6 +18,7 @@ import type {
   AcpAuthVerifier,
 } from '../acp/transport/auth.js';
 import type {
+  AcpAudience,
   AcpConnectionHandler,
   AcpTransportConnection,
 } from '../acp/transport/types.js';
@@ -61,6 +62,7 @@ export type WsHandlers = {
 interface AcpPerSocketState {
   kind: 'acp';
   authed: boolean;
+  audience: AcpAudience;
   controller?: ReadableStreamDefaultController<Uint8Array>;
 }
 
@@ -84,6 +86,8 @@ export interface WsBridgeOpts {
    *  ACP/voice paths are open. Presence of this verifier is the ACP
    *  auth gate — callers pass it only when a bearer token is configured. */
   wsAuthVerifier?: AcpAuthVerifier;
+  /** Classify the ACP upgrade request once (operator-only taps read it). Absent or throwing = 'unknown'. */
+  acpAudienceForUpgrade?: (req: Request) => AcpAudience;
   /** PWA voice adapter. When omitted or `available=false`, /v1/voice/ws
    *  returns 404. */
   voiceAdapter?: PwaVoiceAdapter;
@@ -184,6 +188,7 @@ export function createWsBridge(opts: WsBridgeOpts): WsBridge {
       readable,
       writable,
       peerId: `ws:${opts.hostname}:${opts.port}#${Math.random().toString(36).slice(2, 10)}`,
+      audience: state.audience,
       async close() { ws.close(1000); },
     };
     Promise.resolve(opts.acpOnConnection!(conn)).catch(() => { /* swallow */ });
@@ -259,9 +264,12 @@ export function createWsBridge(opts: WsBridgeOpts): WsBridge {
           trace('acp.ws.same-origin', { path: url.pathname });
         }
       }
+      let audience: AcpAudience = 'unknown';
+      try { audience = opts.acpAudienceForUpgrade?.(req) ?? 'unknown'; } catch { audience = 'unknown'; }
       const acpState: AcpPerSocketState = {
         kind: 'acp',
         authed,
+        audience,
       };
       // ⚠️ 실측(2026-09-01 · 격리 데몬 raw 101):
       //     요청  Sec-WebSocket-Protocol: bearer.<token>
@@ -361,7 +369,7 @@ export function createWsBridge(opts: WsBridgeOpts): WsBridge {
   const websocket: WsHandlers = {
     open(ws) {
       const data = (ws as unknown as { data?: { state?: PerSocketState } }).data;
-      const state: PerSocketState = data?.state ?? { kind: 'acp', authed: !opts.wsAuthVerifier };
+      const state: PerSocketState = data?.state ?? { kind: 'acp', authed: !opts.wsAuthVerifier, audience: 'unknown' };
       states.set(ws, state);
       if (state.kind === 'voice') {
         trace('[voice-ws-trace] socket-open', { authed: state.authed });

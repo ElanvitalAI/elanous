@@ -1,7 +1,7 @@
 // NEXUS · subsystem registry / bindings tests (Phase N-3.5 PR τ)
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -34,7 +34,10 @@ const NEXUS_BOOT_TIMEOUT_MS = 60_000;
 let tmpRoot: string;
 let prevNexus: string | undefined;
 beforeEach(() => {
-  tmpRoot = mkdtempSync(join(tmpdir(), 'elanous-nexus-n35-reg-'));
+  // macOS tmpdir() is /var/folders/…, which realpathSync rewrites to /private/var/…;
+  // runNexus key material (app-build-run-authority) refuses non-canonical roots, so
+  // normalize the fixture root once up front instead of hard-coding any platform path.
+  tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-nexus-n35-reg-')));
   prevNexus = process.env.ELANOUS_NEXUS_DIR;
   process.env.ELANOUS_NEXUS_DIR = tmpRoot;
   setElanousConfigDir(tmpRoot);

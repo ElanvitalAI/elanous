@@ -48,6 +48,7 @@ export function queuePanelSpec(items: readonly QueuePanelItem[], selected: numbe
     })),
     selected: rows.length ? Math.max(0, Math.min(selected, rows.length - 1)) : 0,
     hint: QUEUE_PANEL_HINT,
+    enterAction: 'edit',
   };
 }
 

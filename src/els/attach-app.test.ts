@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import type { AttachHandlers, Attached } from './attach-client.js';
 import { createAttachApp } from './attach-app.js';
 import { createKeyRouter, type KeyAction } from './attach-keys.js';
-import { buildSidebar, composeView, parsePaneRows, wordOfState } from './attach-view.js';
+import { buildSidebar, composeView, parsePaneRows, parseRemoteRows, wordOfState } from './attach-view.js';
 import type { ElsResult } from './core.js';
 import type { ElsRequest } from './server.js';
 
@@ -101,7 +101,7 @@ test('app: an empty server gets one new shell (defaults: $SHELL, this folder, fo
   await h.app.start();
   expect(h.requests.find((r) => r.op === 'new')).toEqual({ op: 'new', ws: 'proj', cwd: '/work/proj', command: ['/bin/zsh'] });
   expect(h.attachments.map((a) => a.pane)).toEqual(['pnew1']);
-  expect(h.attachments[0]!.size).toEqual({ cols: 51, rows: 23 });      // 80 - 28 sidebar - 1 separator; 24 - 1 status line
+  expect(h.attachments[0]!.size).toEqual({ cols: 51, rows: 22 });      // 80 - 28 sidebar - 1 separator; 24 - 1 status line - 1 tab row
 });
 
 test('app: starts on the first pane that is still running; exited leftovers are closed, the list re-read', async () => {
@@ -112,29 +112,33 @@ test('app: starts on the first pane that is still running; exited leftovers are 
   expect(h.lastScreen()).not.toContain('dead');
 });
 
-test('app: keys — input goes to the pane, ctrl+b j/k/w/3 switch panes (old attach released), b hides the sidebar and resizes the pane', async () => {
+test('app: keys — input goes to the pane; ctrl+b j/k and 1-9 move between the tabs of the space, w to the next space (old attach released); b hides the list', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle'), row('w2', 'p3', 'three', 'idle')));
   await h.app.start();
   h.app.key('ls\r');
   expect(h.attachments[0]!.typed).toEqual(['ls\r']);
-  h.app.key('\u0002j');
+  h.app.key('\u0002w');
   expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p2']);
   expect(h.attachments[0]!.detached).toBe(true);
+  h.app.key('\u0002w');                                           // wraps inside w1, never into w2
+  expect(h.attachments.at(-1)!.pane).toBe('p1');
   h.app.key('\u0002w');
   expect(h.attachments.at(-1)!.pane).toBe('p3');
-  h.app.key('\u0002k');
+  h.app.key('\u0002k');                                           // w2 has one tab: stays
+  expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p2', 'p1', 'p3']);
+  h.app.key('\u0002w');
+  h.app.key('\u00022');                                           // the second tab of w1
   expect(h.attachments.at(-1)!.pane).toBe('p2');
-  h.app.key('\u00021');
-  expect(h.attachments.at(-1)!.pane).toBe('p1');
+  expect(h.lastScreen().split('\r\n')[0]).toContain(' 🛠 one ○ │▸🛠 two ○ │');
   h.app.key('\u0002b');
-  expect(h.attachments.at(-1)!.resizes.at(-1)).toEqual([80, 23]);
-  expect(h.lastScreen().split('\r\n')[0]).not.toContain('▾');
+  expect(h.attachments.at(-1)!.resizes.at(-1)).toEqual([80, 22]);
+  expect(h.lastScreen()).not.toContain('+ new · ≡ menu');
 });
 
 test('app: frames from a stale attach are ignored after a switch; the current frame is painted next to the list', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle')));
   await h.app.start();
-  h.app.key('\u0002j');
+  h.app.key('\u0002w');
   h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 23, screen: '[screen 51x23 cursor=(row 0, col 0, visible true)]\nSTALE' });
   h.attachments[1]!.handlers.onFrame({ pane: 'p2', seq: 1, cols: 51, rows: 23, screen: '[screen 51x23 cursor=(row 0, col 2, visible true)]\nfresh$ ' });
   const screen = h.lastScreen();
@@ -193,7 +197,7 @@ test('app: the selected pane exits → «pane 종료됨», its last screen stays
   expect(h.lastScreen()).toContain('LAST WORDS');
   h.attachments[0]!.handlers.onEnd(1, 'els: the els server closed the connection');
   // (the first attach already ended; a live one losing the server finishes the app)
-  h.app.key('\u0002j');
+  h.app.key('\u0002w');
   h.attachments.at(-1)!.handlers.onEnd(1, 'els: the els server closed the connection');
   expect(await h.app.done).toEqual({ code: 1, message: 'els: the els server closed the connection' });
 });
@@ -201,20 +205,20 @@ test('app: the selected pane exits → «pane 종료됨», its last screen stays
 test('toggle: ctrl+b s hides and shows the list (the pane is resized each time) and the choice is remembered', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
   await h.app.start();
-  expect(h.lastScreen().split('\r\n')[0]).toContain('▾');
+  expect(h.lastScreen()).toContain('+ new · ≡ menu');
   h.app.key('\u0002s');
-  expect(h.lastScreen().split('\r\n')[0]).not.toContain('▾');
-  expect(h.attachments[0]!.resizes.at(-1)).toEqual([80, 23]);
+  expect(h.lastScreen()).not.toContain('+ new · ≡ menu');
+  expect(h.attachments[0]!.resizes.at(-1)).toEqual([80, 22]);
   expect(h.saved.at(-1)).toEqual({ sidebar: false, lastPane: 'p1' });
   h.app.key('\u0002s');
-  expect(h.lastScreen().split('\r\n')[0]).toContain('▾');
-  expect(h.attachments[0]!.resizes.at(-1)).toEqual([51, 23]);
+  expect(h.lastScreen()).toContain('+ new · ≡ menu');
+  expect(h.attachments[0]!.resizes.at(-1)).toEqual([51, 22]);
   expect(h.saved.at(-1)).toEqual({ sidebar: true, lastPane: 'p1' });
 });
 
 test('start state: --no-side beats a remembered open list, a remembered closed list stays closed, nothing remembered = open (els)', async () => {
   const listing = listOf(row('w1', 'p1', 'one', 'idle'));
-  const first = (h: ReturnType<typeof harness>) => h.lastScreen().split('\r\n')[0]!.includes('▾');
+  const first = (h: ReturnType<typeof harness>) => h.lastScreen().includes('+ new · ≡ menu');
   const a = harness(listing, undefined, { sidebar: true }, false); await a.app.start(); expect(first(a)).toBe(false);
   const b = harness(listing, undefined, { sidebar: false }); await b.app.start(); expect(first(b)).toBe(false);
   const c = harness(listing, undefined, { sidebar: false }, true); await c.app.start(); expect(first(c)).toBe(true);
@@ -275,4 +279,165 @@ test('quit while a request is in flight: a pane created / a close answered after
     expect([key, attachments]).toEqual([key, ['p1']]);
     expect([key, saved.length, writes.length]).toEqual([key, savedBefore, writesBefore]);
   }
+});
+
+// ---- ELS-ONE-SPACE ①: the other hosts' panes (herdr, registered els hosts) in the same list, read-only -------------------
+const fedRow = (host: string, ws: string, tab: string, pane: string, title: string, state: string, reach = 'up') =>
+  ({ ws, tab, pane, title, cwd: '/x', state, host, reach, address: `${host}:${ws}/${tab}/${pane}` });
+const fedList = (...panes: object[]): string => JSON.stringify({ hosts: [], workspaces: [], tabs: [], panes });
+
+test('remote rows: only panes of other hosts that answered, grouped «⇄host label» (herdr titles split at « · »), the address is the pane', () => {
+  const rows = parseRemoteRows(fedList(
+    fedRow('Mac', 'w9', 't1', 'p1', 'local one', 'idle', 'local'),
+    fedRow('herdr', 'w1', 't2', 'p2', 'OP · mshq 주 OP', 'idle'),
+    fedRow('herdr', 'w1', 't2', 'p3', 'OP · zsh', 'working'),
+    fedRow('node-b', 'wa', 'tb', 'pc', 'review', 'blocked'),
+    fedRow('down1', 'wz', 'tz', 'pz', 'gone', 'idle', 'down')));
+  expect(rows.map((r) => `${r.pane} | ${r.wsId} | ${r.workspace} | ${r.title} | ${r.state} | ${r.remote}`)).toEqual([
+    'herdr:w1/t2/p2 | herdr:w1 | ⇄herdr OP | mshq 주 OP | idle | herdr',
+    'herdr:w1/t2/p3 | herdr:w1 | ⇄herdr OP | zsh | working | herdr',
+    'node-b:wa/tb/pc | node-b:wa | ⇄node-b wa | review | blocked | node-b',
+  ]);
+  for (const body of ['null', '7', '[]', '{"panes":3}', 'nope']) expect(parseRemoteRows(body)).toEqual([]);
+});
+
+test('app: herdr panes join the left list under «⇄herdr …»; selecting one paints its read screen, read-only; typing and closing are refused with the reason', async () => {
+  const reads: string[] = [];
+  const federated = fedList(fedRow('herdr', 'w1', 't2', 'p2', 'OP · mshq 주 OP', 'idle'));
+  const base = harness(listOf(row('w1', 'p1', 'mine', 'idle')));
+  const attachments = base.attachments;
+  let tick: () => void = () => {};
+  const app = createAttachApp({
+    request: async (request): Promise<ElsResult> => request.op === 'ls' ? { exitCode: 0, message: listOf(row('w1', 'p1', 'mine', 'idle')) } : { exitCode: 0, message: '' },
+    attach: (pane, size, handlers): Attached => { const a = { pane, typed: [] as string[] }; attachments.push({ ...a, size, handlers, resizes: [], detached: false }); return { input: (b) => { a.typed.push(b); attachments.at(-1)!.typed.push(b); }, resize: () => {}, detach: () => {} }; },
+    write: (text) => { screens.push(plain(text)); },
+    size: () => ({ cols: 100, rows: 12 }), cwd: '/work/proj', env: {},
+    setInterval: (callback) => { tick = callback; return 0; }, clearInterval: () => {}, pollMs: 1000, chatCommand: ['x'],
+    memory: { load: () => ({}), save: () => {} },
+    remote: { list: async () => ({ exitCode: 0, message: federated }), read: async (address) => { reads.push(address); return { exitCode: 0, message: `HERDR SCREEN of ${address}` }; } },
+  });
+  const screens: string[] = [];
+  await app.start();
+  await Bun.sleep(20);
+  expect(screens.at(-1)!).toContain(' ○ ⇄herdr OP · 1');           // a space on the left; its pane is a tab once selected
+  app.key('\u0002w');                                             // next space: the herdr one
+  await Bun.sleep(20);
+  expect(reads).toEqual(['herdr:w1/t2/p2']);
+  expect(screens.at(-1)!).toContain('HERDR SCREEN of herdr:w1/t2/p2');
+  expect(screens.at(-1)!).toContain('▸🌐 mshq 주 OP ○ │');           // the remote pane's tab
+  expect(screens.at(-1)!).toContain('읽기 전용');
+  app.key('rm -rf x\r');
+  await Bun.sleep(5);
+  expect(screens.at(-1)!).toContain('읽기 전용 — 입력은 els do herdr:w1/t2/p2');
+  expect(attachments.map((a) => a.pane)).toEqual(['p1']);        // nothing was attached for the herdr pane
+  expect(attachments[0]!.typed).toEqual([]);                      // and the keys went nowhere
+  app.key('\u0002x');
+  await Bun.sleep(5);
+  expect(screens.at(-1)!).toContain('여기서 닫을 수 없음');
+  tick(); await Bun.sleep(20);
+  expect(reads).toEqual(['herdr:w1/t2/p2', 'herdr:w1/t2/p2']);    // the poll re-reads the selected remote pane
+  expect(screens.at(-1)!).toContain('여기서 닫을 수 없음');          // ...and does not wipe the note the person was reading
+});
+
+test('app: a failing or empty federated list leaves the local list as it was; a remote pane that disappears moves the selection to a local one', async () => {
+  const screens: string[] = [];
+  let answer: ElsResult = { exitCode: 0, message: fedList(fedRow('herdr', 'w1', 't2', 'p2', 'OP · a', 'idle')) };
+  let tick: () => void = () => {};
+  const app = createAttachApp({
+    request: async (request): Promise<ElsResult> => request.op === 'ls' ? { exitCode: 0, message: listOf(row('w1', 'p1', 'mine', 'idle')) } : { exitCode: 0, message: '' },
+    attach: (): Attached => ({ input: () => {}, resize: () => {}, detach: () => {} }),
+    write: (text) => { screens.push(plain(text)); }, size: () => ({ cols: 100, rows: 12 }), cwd: '/w', env: {},
+    setInterval: (callback) => { tick = callback; return 0; }, clearInterval: () => {}, pollMs: 1000, chatCommand: ['x'],
+    memory: { load: () => ({}), save: () => {} },
+    remote: { list: async () => answer, read: async () => ({ exitCode: 0, message: 'SCREEN' }) },
+  });
+  await app.start(); await Bun.sleep(20);
+  app.key('\u0002w'); await Bun.sleep(20);                       // the herdr space
+  expect(screens.at(-1)!).toContain('SCREEN');
+  answer = { exitCode: 1, message: 'herdr down' };                // the other hosts stop answering
+  tick(); await Bun.sleep(30);
+  expect(screens.at(-1)!).toContain('mine');                      // the local row is still there
+  expect(screens.at(-1)!).not.toContain('⇄herdr');                // the herdr rows are gone, not stale
+  expect(screens.at(-1)!).toContain('name-w1 ▸ mine');            // and the selection moved back to the local pane
+});
+
+// ---- #38431 review: the other hosts failing in every way the transport can fail ---------------------------------------------
+function remoteApp(remote: { list: () => Promise<ElsResult>; read: (address: string) => Promise<ElsResult> }, cols = 120) {
+  const screens: string[] = [];
+  let tick: () => void = () => {};
+  const app = createAttachApp({
+    request: async (request): Promise<ElsResult> => request.op === 'ls' ? { exitCode: 0, message: listOf(row('w1', 'p1', 'mine', 'idle')) } : { exitCode: 0, message: '' },
+    attach: (): Attached => ({ input: () => {}, resize: () => {}, detach: () => {} }),
+    write: (text) => { screens.push(plain(text)); }, size: () => ({ cols, rows: 12 }), cwd: '/w', env: {},
+    setInterval: (callback) => { tick = callback; return 0; }, clearInterval: () => {}, pollMs: 1000, chatCommand: ['x'],
+    memory: { load: () => ({}), save: () => {} }, remote,
+  });
+  return { app, screens, tick: () => tick() };
+}
+const herdrList = fedList(fedRow('herdr', 'w1', 't2', 'p2', 'OP · a', 'idle'));
+
+test('app: a THROWING federated list removes the other hosts\' rows like a failing one and moves a remote selection to a local pane', async () => {
+  let throws = false;
+  const { app, screens, tick } = remoteApp({ list: async () => { if (throws) throw new Error('boom'); return { exitCode: 0, message: herdrList }; }, read: async () => ({ exitCode: 0, message: 'SCREEN' }) });
+  await app.start(); await Bun.sleep(20);
+  app.key('\u0002w'); await Bun.sleep(20);
+  expect(screens.at(-1)!).toContain('SCREEN');
+  throws = true; tick(); await Bun.sleep(30);
+  expect(screens.at(-1)!).not.toContain('⇄herdr');
+  expect(screens.at(-1)!).toContain('name-w1 ▸ mine');
+});
+
+test('app: a THROWING read shows a blank screen and the reason, with no unhandled rejection; the poll\'s read error never wipes the «read-only» note', async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    let mode: 'throw' | 'refuse' = 'throw';
+    const { app, screens, tick } = remoteApp({ list: async () => ({ exitCode: 0, message: herdrList }),
+      read: async () => { if (mode === 'throw') throw new Error('socket reset'); return { exitCode: 1, message: 'read failed' }; } });
+    await app.start(); await Bun.sleep(20);
+    app.key('\u0002w'); await Bun.sleep(30);
+    expect(screens.at(-1)!).toContain('els: socket reset');
+    app.key('hello'); await Bun.sleep(10);                       // the person types: the refusal note appears
+    expect(screens.at(-1)!).toContain('읽기 전용 — 입력은 els do');
+    mode = 'refuse'; tick(); await Bun.sleep(40);                // a poll with a (different) read failure
+    expect(screens.at(-1)!).toContain('읽기 전용 — 입력은 els do');   // the person's note is still there
+    expect(screens.at(-1)!).toContain('read failed');   // and so is the new reason, in its own place
+    expect(unhandled).toEqual([]);
+  } finally { process.off('unhandledRejection', onUnhandled); }
+});
+
+test('app: two reads of the same pane that finish out of order — the older answer never paints over the newer one', async () => {
+  const resolvers: ((r: ElsResult) => void)[] = [];
+  const { app, screens, tick } = remoteApp({ list: async () => ({ exitCode: 0, message: herdrList }),
+    read: () => new Promise<ElsResult>((resolve) => { resolvers.push(resolve); }) });
+  await app.start(); await Bun.sleep(20);
+  app.key('\u0002w'); await Bun.sleep(10);                       // read #1 starts (never answered yet)
+  tick(); await Bun.sleep(30);                                   // the poll starts read #2
+  expect(resolvers).toHaveLength(2);
+  resolvers[1]!({ exitCode: 0, message: 'NEWER' }); await Bun.sleep(10);
+  resolvers[0]!({ exitCode: 0, message: 'OLDER' }); await Bun.sleep(10);
+  expect(screens.at(-1)!).toContain('NEWER');
+  expect(screens.at(-1)!).not.toContain('OLDER');
+});
+
+test('federation status shows unreachable host and clears it after reconnection', async () => {
+  let down = true;
+  const { app, screens, tick } = remoteApp({
+    list: async () => ({ exitCode: 0, message: JSON.stringify({ hosts: [{ name: 'node-b', reach: down ? 'down' : 'up' }], panes: [] }) }),
+    read: async () => ({ exitCode: 1, message: 'unreachable' }),
+  });
+  await app.start(); await Bun.sleep(20);
+  expect(screens.at(-1)!).toContain('⇄node-b ?');
+  down = false; tick(); await Bun.sleep(30);
+  expect(screens.at(-1)!).not.toContain('⇄node-b ?');
+});
+
+test('unreachable host stays visible in a narrow terminal', async () => {
+  const { app, screens } = remoteApp({
+    list: async () => ({ exitCode: 0, message: JSON.stringify({ hosts: [{ name: 'node-b', reach: 'down' }], panes: [] }) }),
+    read: async () => ({ exitCode: 1, message: 'unreachable' }),
+  }, 40);
+  await app.start(); await Bun.sleep(20);
+  expect(screens.at(-1)!).toContain('⇄node-b ?');
 });

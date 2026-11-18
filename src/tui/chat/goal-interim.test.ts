@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { formatGoalContinuePrompt } from '../input/goal-continue.js';
-import { logViewLines, USER_TURN_BAND_SGR } from './log-view.js';
-import { userTurnBandSgr } from './turn-band-theme.js';
+import { logViewLines } from './log-view.js';
 import { classifyInterimReply, planInterimDisplay } from './goal-interim.js';
 
 // The band colour follows COLORFGBG (turn-band-theme.ts); pin it so the expectation never depends on the terminal
@@ -22,7 +21,8 @@ test('one goal with two marked interim iterations and a final result uses the ne
   const plan = planInterimDisplay(messages);
   expect([plan.get(2)?.kind, plan.get(3)?.kind, plan.get(4)]).toEqual(['folded', 'folded', undefined]);
   const lines = logViewLines(messages, 100).filter(Boolean);
-  const band = `\u001b[${USER_TURN_BAND_SGR}m\u001b[1m>\u001b[22m n8n 영상 만들기` + ' '.repeat(83) + '\u001b[0m';
+  // Dark token: grey 235 band, grey 252 text (literal — rule 11).
+  const band = '\u001b[48;5;235;38;5;252m\u001b[1m>\u001b[22m n8n 영상 만들기' + ' '.repeat(83) + '\u001b[0m';
   expect(lines).toEqual([
     band, 'Tool: ScheduleWakeup 예약됨',
     '  · in progress — 1단계 렌더했습니다. (folded)',
@@ -38,6 +38,6 @@ test('one goal with two marked interim iterations and a final result uses the ne
 test('on a light terminal (COLORFGBG says light) the user row uses the light band token', () => {
   process.env.COLORFGBG = '0;15';
   const rows = logViewLines([{ role: 'user', content: 'n8n 영상 만들기', ts: '2026-11-17T00:00:00Z' }], 100);
-  expect(rows[0]).toStartWith(`\u001b[${userTurnBandSgr({ COLORFGBG: '0;15' } as NodeJS.ProcessEnv)}m`);
-  expect(rows[0]).not.toStartWith(`\u001b[${USER_TURN_BAND_SGR}m`);
+  expect(rows[0]).toStartWith('\u001b[48;5;255;38;5;235m'); // light token: grey 255 band, grey 235 text
+  expect(rows[0]).not.toStartWith('\u001b[48;5;235;38;5;252m');
 });

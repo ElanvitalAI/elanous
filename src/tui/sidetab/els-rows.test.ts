@@ -87,3 +87,8 @@ test('no els server: the panel gets no rows and nothing is started', async () =>
   expect(rows).toEqual([]);
   expect((await requestEls(elsSocketPath(root), { op: 'ping' })).exitCode).toBe(1);
 });
+
+test('rows keep the order the els server listed: the eln side tab and els draw the same order from the same answer', () => {
+  const rows = elsRowsFromList(list([pane({ address: 'node-b:w2/t2/p2', pane: 'p2', title: 'second-ws' }), pane({ address: 'node-b:w1/t1/p1', title: 'first-ws' })]), 'node-b');
+  expect(rows.map((row) => row.label)).toEqual(['second-ws', 'first-ws']);
+});

@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
+import { llmNetworkFetch } from './llm-network-fetch.js';
 import { env, requireEnv } from './env.js';
 import { downloadVideo, mediaEngineAvailable } from './media.js';
 import type { TweetMedia } from './types.js';

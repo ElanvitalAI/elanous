@@ -118,6 +118,8 @@ export interface ResumeReleaseOptions {
   acceptedRegressions?: AcceptedRegression[]; approvedBy?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string;
   rerouteShard?: string; shardHost?: string; shardOs?: 'darwin' | 'linux';
   commandRoot?: string;
+  /** RELEASE-RESUME-SAME-RUN: `--cut-commit` 로 고정된 런을 «수리 커밋을 얹은 새 컷 sha(40자)» 로 같은 runId 에서 재개한다. 기록된 컷의 자손일 때만(빨리감기), 컷을 쓴 노드는 무효화된다. */
+  repinCutCommit?: string;
   /** RECUT-GATE-WAIVE: run whose owner-accepted (waived) gate sweep this gate waiver inherits; may be this run before an append. */
   waiveEvidenceRun?: string;
 }
@@ -324,7 +326,7 @@ export function forkReleaseRun(runId: string, forkRunId: string, targetCommit: s
   const matches = listGraphRuns(root).runs.filter((state) => state.graphId === 'release-loop' && state.runId === runId);
   if (matches.length !== 1) throw new Error(matches.length ? `ambiguous release run: ${runId}` : `no release run: ${runId}`);
   const source = matches[0]!;
-  const recordedCommit = lastJsonObject(source.nodes.find((node) => node.nodeId === 'version-release')?.output)?.commit;
+  const recordedCommit = lastJsonObject(source.nodes.find((node) => node.nodeId === 'cut-branch' || node.nodeId === 'version-release')?.output)?.commit;
   if (typeof recordedCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(recordedCommit)) {
     throw new Error(`release run ${runId} has no full version-release commit to fork`);
   }
@@ -333,7 +335,7 @@ export function forkReleaseRun(runId: string, forkRunId: string, targetCommit: s
   });
 }
 
-function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps, from: string | undefined, waiverCommit: string | undefined, dryRun: boolean, expectedTip?: string, allowBudgetExceeded = false): TipRefresh {
+function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps, from: string | undefined, waiverCommit: string | undefined, dryRun: boolean, expectedTip?: string, allowBudgetExceeded = false, repinCutCommit?: string): TipRefresh {
   const root = deps.root ?? effectiveInstanceRoot();
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(runId)}.json`);
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
@@ -345,37 +347,49 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   // Repeated nodes restart at their latest visit (matches the runner), never across an earlier approval.
   const restartAt = from === undefined ? -1 : state.path.lastIndexOf(from) >= 0 ? state.path.lastIndexOf(from) : branchFork ?? -1;
   if (from !== undefined && restartAt < 0) throw new Error(`--from ${from} is not a node on the saved path of ${runId}`);
-  const index = state.nodes.findIndex((node) => node.nodeId === 'version-release');
+  const index = state.nodes.findIndex((node) => node.nodeId === 'cut-branch' || node.nodeId === 'version-release');
   const record = index >= 0 ? state.nodes[index]! : undefined;
   const output = record ? lastJsonObject(record.output) : undefined;
-  if (!record?.ok || !output) throw new Error(`release run ${runId} has no successful version-release record`);
+  if (!record?.ok || !output) throw new Error(`release run ${runId} has no successful ${record?.nodeId ?? 'cut-branch'} record`);
   const version = typeof output.version === 'string' ? output.version : '';
   const recorded = typeof output.commit === 'string' ? output.commit : '';
   if (!isReleaseVersion(version) || !/^[0-9a-f]{40}$/i.test(recorded)) throw new Error(`release run ${runId} version-release output is not a release commit`);
   const branch = `release/${version}`;
   const input = (state.input ?? {}) as { branchCut?: unknown; cutCommit?: unknown; version?: unknown };
-  if (input.branchCut !== true) {
+  const pinnedRun = input.branchCut !== true;
+  const tipLabel = pinnedRun ? `pinned cut of ${version}` : branch; // 오류 문구에서 «release/<v>» 가 아닌 고정 컷을 가리키게
+  const repin = repinCutCommit?.trim().toLowerCase();
+  if (repin !== undefined && !pinnedRun) throw new Error(`--repin-cut-commit is for --cut-commit pinned runs; ${runId} was cut as ${branch} (use cut-branch --append)`);
+  if (repin !== undefined && !/^[0-9a-f]{40}$/.test(repin)) throw new Error(`--repin-cut-commit must be a full 40-hex commit: ${repinCutCommit}`);
+  if (pinnedRun) {
     const cutCommit = typeof input.cutCommit === 'string' ? input.cutCommit.trim().toLowerCase() : '';
     if (input.version !== version || !/^[0-9a-f]{7,40}$/i.test(cutCommit) || !recorded.toLowerCase().startsWith(cutCommit)) {
       throw new Error(`release run ${runId} was not cut as ${branch} or pinned with --cut-commit (input version/cutCommit differ) — refusing to resume`);
     }
-    // `--cut-commit` has no release/<v> ref to refresh. Keep the recorded commit as the run's immutable tip.
-    return { version, branch: 'cut-commit', from: recorded, to: recorded, changed: false, statePath };
-  }
-  if (input.version !== version || output.branch !== branch) {
+    // `--cut-commit` has no release/<v> ref to refresh. Without an explicit re-pin the recorded commit stays the run's immutable tip.
+    if (repin === undefined) return { version, branch: 'cut-commit', from: recorded, to: recorded, changed: false, statePath };
+  } else if (input.version !== version || output.branch !== branch) {
     throw new Error(`release run ${runId} was not cut as ${branch} (input.branchCut/version or version-release branch differ) — refusing to resume`);
   }
   const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
-  const advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0] ?? '';
-  if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} is not on origin — this run was not cut as a release branch`);
-  if (expectedTip && advertised.toLowerCase() !== expectedTip.toLowerCase()) throw new Error(`${branch} moved during pin preflight (${expectedTip} → ${advertised}) — retry resume`);
+  let advertised: string;
   let to: string;
-  if (dryRun) {
-    // Use the advertised object id directly: a preflight must not create/update local remote-tracking refs.
-    to = advertised;
+  if (pinnedRun) {
+    // The repair commit is an explicit operator-supplied object, not a ref we can ask origin about: it must exist locally as a commit.
+    advertised = repin!;
+    to = git(['rev-parse', '--verify', `${repin}^{commit}`]).trim().toLowerCase();
+    if (to !== repin) throw new Error(`--repin-cut-commit ${repin} is not a commit in this checkout (resolved ${to || 'nothing'}) — fetch it first`);
   } else {
-    git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
-    to = git(['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
+    advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0] ?? '';
+    if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} is not on origin — this run was not cut as a release branch`);
+    if (expectedTip && advertised.toLowerCase() !== expectedTip.toLowerCase()) throw new Error(`${branch} moved during pin preflight (${expectedTip} → ${advertised}) — retry resume`);
+    if (dryRun) {
+      // Use the advertised object id directly: a preflight must not create/update local remote-tracking refs.
+      to = advertised;
+    } else {
+      git(['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+      to = git(['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
+    }
   }
   if (waiverCommit && (recorded.toLowerCase() !== waiverCommit.toLowerCase() || to.toLowerCase() !== waiverCommit.toLowerCase() || advertised.toLowerCase() !== waiverCommit.toLowerCase())) {
     throw new Error('release branch moved — re-gate the new tip before waiving a node');
@@ -387,7 +401,7 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   }
   // A repair only appends (`cut-branch --append`): anything but a fast-forward is a different release.
   if (!(deps.isAncestor ?? ancestorRunner(deps.repo ?? process.cwd()))(recorded, to)) {
-    throw new Error(`${branch} tip ${to} does not descend from the recorded release commit ${recorded} — refusing to resume; remedy: inspect both commits and create a new release run from the intended pinned tip`);
+    throw new Error(`${tipLabel} tip ${to} does not descend from the recorded release commit ${recorded} — refusing to resume; remedy: inspect both commits and create a new release run from the intended pinned tip`);
   }
   // A new tip invalidates everything built from the old one (gate verdict, prepared archive, …): restart no later
   // than the first node that consumed the commit, so each of them runs again on the new tip.
@@ -406,21 +420,24 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   const toolingOnly = changedPaths.length > 0 && changedPaths.every(isReleaseToolingPath);
   if (toolingOnly) debug.log('release-loop.resume', 'tip-moved-tooling-only', { runId, version, from: recorded, to, paths: changedPaths });
   if (!toolingOnly && restartAt >= 0 && firstConsumer >= 0 && restartAt > firstConsumer) {
-    throw new Error(`${branch} moved (${recorded.slice(0, 12)} → ${to.slice(0, 12)}): resume at ${state.path[firstConsumer]} or earlier — later nodes were built from the old tip`);
+    throw new Error(`${tipLabel} moved (${recorded.slice(0, 12)} → ${to.slice(0, 12)}): resume at ${state.path[firstConsumer]} or earlier — later nodes were built from the old tip`);
   }
   const stamp = (deps.now?.() ?? new Date()).toISOString().replace(/[:.]/g, '-');
   const backup = `${statePath}.before-tip-${stamp}-${process.pid}-${to.slice(0, 12)}.bak`;
-  if (dryRun) return { version, branch, from: recorded, to, changed: true, statePath };
+  const tipBranch = pinnedRun ? 'cut-commit' : branch;
+  if (dryRun) return { version, branch: tipBranch, from: recorded, to, changed: true, statePath };
   // Exclusive: a retry never overwrites an earlier backup.
   copyFileSync(statePath, backup, constants.COPYFILE_EXCL);
   const refreshed = { ...output, commit: to, refreshedFrom: recorded };
   const text = typeof record.output === 'string' ? record.output.replace(/\s*$/, '') : '';
   state.nodes[index] = { ...record, output: `${text}\n${JSON.stringify(refreshed)}\n` };
+  // RELEASE-RESUME-SAME-RUN: a re-pinned `--cut-commit` run records the new cut and where it came from (same runId, the old sha stays auditable).
+  if (pinnedRun) state.input = { ...input, cutCommit: to, cutCommitRepinnedFrom: recorded } as typeof state.input;
   const temporary = `${statePath}.${process.pid}.tip.tmp`;
   writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(temporary, statePath);
-  debug.log('release-loop.resume', 'tip-refreshed', { runId, version, branch, from: recorded, to, backup });
-  return { version, branch, from: recorded, to, changed: true, statePath, backup };
+  debug.log('release-loop.resume', 'tip-refreshed', { runId, version, branch: tipBranch, from: recorded, to, backup, ...(pinnedRun ? { repinned: true } : {}) });
+  return { version, branch: tipBranch, from: recorded, to, changed: true, statePath, backup };
 }
 
 /** Check the saved graph and recipes before fetch, backup, or run-ledger writes. */
@@ -542,12 +559,15 @@ function verifyResumePreflight(run: GraphRunState, opts: ResumeReleaseOptions, d
     }
   }
 
-  const recorded = nodeOutput('version-release');
+  const recorded = nodeOutput('cut-branch') ?? nodeOutput('version-release');
   const cutInput = (run.input ?? {}) as { branchCut?: unknown; cutCommit?: unknown };
   const cutCommit = typeof cutInput.cutCommit === 'string' ? cutInput.cutCommit.trim().toLowerCase() : '';
+  // A re-pin (opts.repinCutCommit) moves the pinned tip on purpose: the new tip must be exactly the supplied commit.
+  const repinned = opts.repinCutCommit !== undefined && currentTip.toLowerCase() === opts.repinCutCommit.trim().toLowerCase();
   const pinnedCutCommit = cutInput.branchCut !== true && /^[0-9a-f]{7,40}$/i.test(cutCommit)
     && typeof recorded?.commit === 'string' && recorded.commit.toLowerCase().startsWith(cutCommit)
-    && recorded.commit.toLowerCase() === recordedCommit.toLowerCase() && currentTip.toLowerCase() === recordedCommit.toLowerCase();
+    && recorded.commit.toLowerCase() === recordedCommit.toLowerCase()
+    && (currentTip.toLowerCase() === recordedCommit.toLowerCase() || repinned);
   const releaseBranchMatches = cutInput.branchCut === true && recorded?.branch === `release/${version}`
     && recorded.commit === recordedCommit && /^[0-9a-f]{40}$/i.test(currentTip);
   if (!pinnedCutCommit && !releaseBranchMatches) {
@@ -821,6 +841,7 @@ export async function planResumeReleaseRun(opts: ResumeReleaseOptions, deps: Res
 
 async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeReleaseDeps): Promise<ResumeReleasePlan> {
   if (opts.from === 'version-release') throw new Error('--from version-release would cut again — resume at a later node');
+  if (opts.from === 'cut-branch') throw new Error('--from cut-branch would cut again — resume at gate-image-prebuild or a later node');
   deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
@@ -845,7 +866,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   let waiverCommit: string | undefined;
   let gateSweepCarry: GateSweepCarry | undefined;
   if (waiver || pwaFanOutWaiver) {
-    const output = lastJsonObject(savedRun.nodes.find((node) => node.nodeId === 'version-release')?.output);
+    const output = lastJsonObject(savedRun.nodes.find((node) => node.nodeId === 'cut-branch' || node.nodeId === 'version-release')?.output);
     const version = output?.version, recorded = output?.commit;
     if (typeof version !== 'string' || typeof recorded !== 'string' || !isReleaseVersion(version) || !/^[0-9a-f]{40}$/i.test(recorded)) throw new Error('release waiver requires a recorded release commit');
     if (!pwaFanOutWaiver || (savedRun.input as { branchCut?: boolean } | undefined)?.branchCut === true) {
@@ -858,7 +879,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     if (waiver?.nodeId === 'gate') gateSweepCarry = resolveGateSweepCarry(opts, deps, version, recorded);
   }
   if (opts.waiveEvidenceRun !== undefined && waiver?.nodeId !== 'gate') throw new Error('--waive-evidence-run requires --waive gate (or --owner-waive gate)');
-  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true);
+  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true, opts.repinCutCommit);
   const fromIndex = savedRun.path.indexOf(opts.from) >= 0 ? savedRun.path.indexOf(opts.from) : releaseFanOutForkIndex(savedRun, opts.from) ?? -1;
   const gateIndex = savedRun.path.indexOf('gate');
   const gateWillRun = fromIndex >= 0 && gateIndex >= fromIndex;
@@ -882,6 +903,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
 
 async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeReleaseDeps): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
   if (opts.from === 'version-release') throw new Error('--from version-release would cut again — resume at a later node');
+  if (opts.from === 'cut-branch') throw new Error('--from cut-branch would cut again — resume at gate-image-prebuild or a later node');
   // RELEASE-LEDGER-UNIVERSE: decide the universe once; the run lookup and every resumed node use it.
   deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
@@ -919,7 +941,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   // A waived verdict may reuse its original commit. A moved tip still requires a full re-gate.
   let carriedSweep: GateSweepCarry | undefined;
   if (waiver || pwaFanOutWaiver) {
-    const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
+    const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'cut-branch' || node.nodeId === 'version-release');
     const output = lastJsonObject(versionRecord?.output);
     const version = output?.version;
     const recorded = output?.commit;
@@ -935,12 +957,12 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   }
   if (opts.waiveEvidenceRun !== undefined && waiver?.nodeId !== 'gate') throw new Error('--waive-evidence-run requires --waive gate (or --owner-waive gate)');
   // The read-only tip and recipe pin preflight must pass before fetch or a saved-run rewrite.
-  const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true);
+  const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true, opts.repinCutCommit);
   if (shardReroute && previewTip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, previewTip.version);
   const commandRoot = verifyResumeCommandRoot(opts.commandRoot ?? process.cwd(), previewTip.to, deps.git, deps.commandRootGit, opts.commandRoot !== undefined);
   verifyResumePreflight(savedRun, opts, deps, previewTip.version, previewTip.from, previewTip.to, commandRoot);
-  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to, opts.resumeBudgetExceeded === true);
+  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to, opts.resumeBudgetExceeded === true, opts.repinCutCommit);
   const autoheal = priorGateAutoheal(savedRun);
   const autoReroute = !shardReroute ? automaticReroute(savedRun, autoheal, tip.changed, opts.from) : undefined;
   const automaticShardReroute = autoReroute ? releaseResumeGateShardReroute(savedRun, { from: opts.from, shard: autoReroute }) : undefined;
@@ -954,7 +976,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   // Resume the graph at the path it was started from (its snapshot is used); only tests inject another path.
   const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
   const savedSource = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
-  const savedCutCommit = lastJsonObject(savedSource.nodes.find((record) => record.nodeId === 'version-release')?.output)?.commit;
+  const savedCutCommit = lastJsonObject(savedSource.nodes.find((record) => record.nodeId === 'cut-branch' || record.nodeId === 'version-release')?.output)?.commit;
   if (waiver?.nodeId === 'gate' && (typeof savedCutCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(savedCutCommit)
     || savedCutCommit.toLowerCase() !== tip.to.toLowerCase())) {
     throw new Error('release gate waiver head differs from the saved version-release cut; refusing to issue waiver event');
@@ -1136,7 +1158,7 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
   const savedRun = readRecoverJson(statePath, 'release run 상태') as GraphRunState;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // The saved version-release record names what to repair: the release branch and the commit the run cut.
-  const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
+  const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'cut-branch' || node.nodeId === 'version-release');
   const recorded = lastJsonObject(versionRecord?.output);
   const version = typeof recorded?.version === 'string' ? recorded.version : '';
   // RELEASE-RECOVER-BASE: a first recover that reached the resume left refreshed-tip lines in the
@@ -1175,6 +1197,9 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
   }
   if (fromNode === 'version-release') {
     throw new Error(`--from version-release would cut again — recover at a later node; ${branch} was not moved`);
+  }
+  if (fromNode === 'cut-branch') {
+    throw new Error(`--from cut-branch would cut again — recover at gate-image-prebuild or a later node; ${branch} was not moved`);
   }
   const branchFork = savedRun.path.includes(fromNode) ? undefined : releaseFanOutForkIndex(savedRun, fromNode);
   const restartAt = savedRun.path.indexOf(fromNode) >= 0 ? savedRun.path.indexOf(fromNode) : branchFork ?? -1;
@@ -1369,7 +1394,7 @@ async function recoverReleaseRunFromLandingLocked(opts: RecoverReleaseLandingOpt
   const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
   if (existsSync(statePath)) {
     const savedRun = readRecoverJson(statePath, 'release run 상태') as GraphRunState;
-    const versionNode = savedRun.nodes.find((node) => node.nodeId === 'version-release');
+    const versionNode = savedRun.nodes.find((node) => node.nodeId === 'cut-branch' || node.nodeId === 'version-release');
     const recorded = lastJsonObject(versionNode?.output);
     const version = typeof recorded?.version === 'string' ? recorded.version : '';
     if (savedRun.graphId === 'release-loop' && savedRun.runId === runId && isReleaseVersion(version)) {

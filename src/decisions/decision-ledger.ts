@@ -15,7 +15,14 @@ export type DecisionCategory = 'secret' | 'publish' | 'money' | 'security' | 'sc
 export type DecisionTrack = 'S' | 'T' | 'F' | 'O' | 'OP' | 'MK' | 'TC' | 'UX';
 export interface DecisionOption { key: string; label: string; consequence: string }
 export type Recommendation = { option: string; why: string } | { skipped: true; reason: string };
-export type DecisionActor = { kind: 'human' } | { kind: 'auto'; agent: string; track?: DecisionTrack; delegation: string };
+/** DECISION-LEDGER-HUMAN-AUTH PR-1 — where a human decision came in. A provenance tag, not a proof (see the design). */
+export const HUMAN_DECISION_VIA = ['telegram', 'discord', 'webpush', 'slash', 'pwa', 'cli'] as const;
+export type HumanDecisionVia = (typeof HUMAN_DECISION_VIA)[number];
+export type DecisionActor =
+  | { kind: 'human'; via?: HumanDecisionVia; /** platform user id that tapped (Telegram/Discord) — an id, never a token */ platformUserId?: string }
+  | { kind: 'auto'; agent: string; track?: DecisionTrack; delegation: string }
+  /** Recorded from a document, not decided here: never passes a human gate. */
+  | { kind: 'imported'; source: string };
 export interface DecisionEntry {
   id: string; title: string; category: DecisionCategory; scqa: { s: string; c: string; q?: string; a?: string };
   options: DecisionOption[]; recommendation: Recommendation; raisedAt?: string; importedAt?: string;
@@ -402,6 +409,7 @@ export class DecisionLedger {
   }
   private decideLocked(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery; notice: DecisionNotice } {
     if (!by || (by.kind !== 'human' && by.kind !== 'auto')) throw new Error('decidedBy is required');
+    if (by.kind === 'human') by = cleanHuman(by);
     if (by.kind === 'auto') {
       single(by.delegation, 'delegation'); single(by.agent, 'agent');
       if (by.track && !isDecisionTrack(by.track)) throw new Error('invalid track');
@@ -549,7 +557,8 @@ export class DecisionLedger {
       single(by.agent, 'agent'); single(by.delegation, 'delegation');
       if (by.track && !isDecisionTrack(by.track)) throw new Error('invalid track');
       by = { ...by, agent: safe(single(by.agent, 'agent')), delegation: safe(single(by.delegation, 'delegation')) };
-    }
+    } else if (by.kind === 'imported') by = { kind: 'imported', source: safe(single(by.source, 'source')) };
+    else by = cleanHuman(by);
     const cleanNote = safe(single(note, 'note'));
     return this.locked(() => {
       const existing = this.list({ status: 'all' });
@@ -574,7 +583,8 @@ export class DecisionLedger {
       single(by.agent, 'agent'); single(by.delegation, 'delegation');
       if (by.track && !isDecisionTrack(by.track)) throw new Error('invalid track');
       by = { ...by, agent: safe(single(by.agent, 'agent')), delegation: safe(single(by.delegation, 'delegation')) };
-    }
+    } else if (by.kind === 'imported') by = { kind: 'imported', source: safe(single(by.source, 'source')) };
+    else by = cleanHuman(by);
     const cleanNote = safe(single(note, 'note'));
     return this.locked(() => {
       const entry = this.show(id);
@@ -658,7 +668,8 @@ export function importDecisionMarkdown(ledger: DecisionLedger, path: string): Ma
         // Only C4 states both alternatives and a chosen key; D/E record decisions without fabricating options or timestamps.
         const choice = code === 'C4' && /L16\s*→\s*\*\*0\.2\.7 N1\*\*/.test(line) && options.some(o => o.key === 'b' && /0\.2\.7/.test(o.label)) ? 'b' : undefined;
         if (code === 'C4' && !choice) throw new Error('source does not identify a documented option and chosen key');
-        const by: DecisionActor = code.startsWith('D') ? { kind: 'auto', agent: 'unknown', track: 'S', delegation: '대표 09-30 01:4x 결정사항 S 에게' } : { kind: 'human' };
+        // PR-1: a document says a person decided — recorded as imported, so no human gate trusts it.
+        const by: DecisionActor = code.startsWith('D') ? { kind: 'auto', agent: 'unknown', track: 'S', delegation: '대표 09-30 01:4x 결정사항 S 에게' } : { kind: 'imported', source: `markdown ${code}` };
         if (previous) { ledger.completeRecorded(previous.id, choice, by, `문서 ${code}: ${text}`, options); existing.push(code); }
         else { ledger.importRecorded(input, choice, by, `문서 ${code}: ${text}`); imported.push(code); }
       } else if (!options.length) { ledger.importPending(input); imported.push(code); }
@@ -680,4 +691,11 @@ export function importDecisionMarkdown(ledger: DecisionLedger, path: string): Ma
     if (!seen.has(code)) unread.push(`${code}: source item not found`);
   }
   return { imported, existing, unread, incomplete };
+}
+
+/** PR-1 — only the known `via` values and a short id-shaped platform user id survive; anything else is dropped. */
+function cleanHuman(by: { kind: 'human'; via?: unknown; platformUserId?: unknown }): DecisionActor {
+  const via = (HUMAN_DECISION_VIA as readonly unknown[]).includes(by.via) ? by.via as HumanDecisionVia : undefined;
+  const platformUserId = typeof by.platformUserId === 'string' && /^[0-9A-Za-z_-]{1,64}$/.test(by.platformUserId) ? by.platformUserId : undefined;
+  return { kind: 'human', ...(via ? { via } : {}), ...(platformUserId ? { platformUserId } : {}) };
 }

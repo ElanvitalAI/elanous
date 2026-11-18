@@ -1521,10 +1521,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--reroute-shard <pod-N|auto>', '같은 컷의 조각 한 개를 새로 측정하고 나머지 완전 영수증은 승계(--from gate)')
     .option('--shard-host <pool-context>', '재지정 조각의 호스트 수동 지정(생략 시 가용 능력 기반 배치)')
     .option('--shard-os <darwin|linux>', '재지정 pod-N 조각에 필요한 OS 능력')
+    .option('--repin-cut-commit <sha>', '--cut-commit 로 고정된 런을 수리 커밋을 얹은 새 컷(40자 · 기록된 컷의 자손)으로 «같은 runId» 에서 재개 — 컷을 쓴 노드부터 다시, 바뀐 컷은 런 입력에 기록')
     .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout(생략 시 현재 폴더)')
     .option('--dry-run', '재개 preflight만 수행하고 런·상태 원장·시도 횟수는 변경하지 않는다')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string; resumeBudgetExceeded?: boolean; approvedBy?: string; waiveEvidenceRun?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { run: string; repinCutCommit?: string; from?: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string; resumeBudgetExceeded?: boolean; approvedBy?: string; waiveEvidenceRun?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1557,6 +1558,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           ...(o.reason === undefined ? {} : { reason: o.reason }),
           ...(approvedBy === undefined ? {} : { approvedBy }),
           ...(o.waiveEvidenceRun === undefined ? {} : { waiveEvidenceRun: o.waiveEvidenceRun }),
+          ...(o.repinCutCommit === undefined ? {} : { repinCutCommit: o.repinCutCommit }),
           ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }),
           ...(o.gateExecutor === undefined ? {} : { gateExecutor: o.gateExecutor }),
           ...(o.gateHost === undefined ? {} : { gateHost: o.gateHost }),

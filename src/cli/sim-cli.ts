@@ -20,6 +20,8 @@ import { readSimWorldWatchEvents, renderSimWorldWatchEvent } from '../ux-sim/wor
 import { assertNetworkZeroSandboxAvailable } from '../ux-sim/network-sandbox.js';
 import { assertRealTargetGuards, assertScenarioTargetAllowed, resolveScenarioTarget, type ScenarioTargetDeclaration } from '../ux-sim/scenario-target.js';
 import { registerSimSuggestCommand } from './sim-suggest-cli.js';
+import { isReservedSimWorldId, runSimWorlds, simWorldReplayOptions } from '../ux-sim/sim-world/kernel.js';
+import type { SimWorldReservedId } from '../ux-sim/sim-world/types.js';
 
 type UserSimulationProfile = { credentials: string; network: string; storage: string };
 type SimAppCliCommand = (args: string[], allowedStatus?: readonly number[]) => Promise<{ status: number; stdout: string; stderr?: string }>;
@@ -41,6 +43,51 @@ export function createUserSimulationEnvironment(
   const allowedEnv = new Set(['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TMP', 'TEMP', 'NODE_ENV',
     'ELANOUS_STATE_DIR', 'ELANOUS_CONFIG_DIR', 'LANG', 'LC_ALL', 'TZ']);
   return { ...Object.fromEntries(Object.entries(sourceEnv).filter(([key]) => allowedEnv.has(key))), NODE_ENV: sourceEnv.NODE_ENV ?? 'test', ELANOUS_STATE_DIR: testStateRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(testStateRoot, sourceEnv) };
+}
+
+// Reserved-world options take OPTIONAL values so Commander never fails on a bare `--seed` before dispatch: a
+// non-reserved world id must keep its old errors byte-for-byte (`error: unknown option '--seed'`), and a reserved id
+// gets an explicit "requires a value" refusal here instead.
+type SimWorldKernelCliOptions = { seed?: string | true; engine?: string | true; only?: string | true; expectBase?: string | true; runId?: string | true; replay?: string | true };
+const SIM_WORLD_KERNEL_FLAGS = new Set(['--seed', '--engine', '--only', '--expect-base', '--run-id', '--replay']);
+function kernelOptionValues(opts: SimWorldKernelCliOptions): { seed?: string; engine?: string; only?: string; expectBase?: string; runId?: string; replay?: string } {
+  const flags = { seed: '--seed', engine: '--engine', only: '--only', expectBase: '--expect-base', runId: '--run-id', replay: '--replay' } as const;
+  for (const [key, flag] of Object.entries(flags) as [keyof typeof flags, string][])
+    if (opts[key] === true) throw new Error(`option '${flag}' requires a value`);
+  return opts as { seed?: string; engine?: string; only?: string; expectBase?: string; runId?: string; replay?: string };
+}
+function printSimWorldSummary(summary: Awaited<ReturnType<typeof runSimWorlds>>): void {
+  console.log(JSON.stringify({ ok: summary.ok, summaryPath: summary.summaryPath, counts: summary.counts, scenarios: summary.scenarios.length,
+    worldWallMs: summary.worldWallMs, replay: summary.replay, events: summary.events }));
+  if (!summary.ok) process.exitCode = 1;
+}
+/** `sim world run <reserved-id>` — SIM-WORLD-KERNEL (src/ux-sim/sim-world/kernel.ts). Exit 0 ok · 1 red verdicts · 2 refused. */
+async function runReservedSimWorld(worldId: SimWorldReservedId, scenarioFile: string | undefined, rawOpts: SimWorldKernelCliOptions): Promise<void> {
+  try {
+    const opts = kernelOptionValues(rawOpts);
+    const stateRoot = getTestStateRoot();
+    if (!stateRoot) throw new Error('sim worlds require an explicit --test universe');
+    if (scenarioFile !== undefined) throw new Error(`reserved world id ${worldId} takes no scenario file (packs live in src/ux-sim/worlds)`);
+    if (opts.replay !== undefined) {
+      if (opts.seed !== undefined || opts.only !== undefined || opts.engine !== undefined || opts.expectBase !== undefined)
+        throw new Error('--replay takes seed, engine, only and the expect-base table from the recorded run');
+      const replayed = simWorldReplayOptions(resolve(stateRoot), opts.replay);
+      if (replayed.worldId !== worldId) throw new Error(`--replay ${opts.replay} recorded world id ${replayed.worldId}, not ${worldId}`);
+      const runId = opts.runId ?? `replay-${opts.replay}-${process.pid}`;
+      return printSimWorldSummary(await runSimWorlds({ ...replayed, stateRoot: resolve(stateRoot), runId, replayOf: opts.replay }));
+    }
+    if (opts.seed === undefined || !/^\d+$/u.test(opts.seed)) throw new Error('reserved world run requires --seed <non-negative integer>');
+    const engine = opts.engine ?? 'legacy';
+    if (engine !== 'legacy' && engine !== 'graph' && engine !== 'both') throw new Error(`--engine must be legacy, graph or both: ${engine}`);
+    const seed = Number(opts.seed);
+    const runId = opts.runId ?? `seed-${seed}-${new Date().toISOString().replace(/[-:.]/gu, '')}-${process.pid}`;
+    const summary = await runSimWorlds({ worldId, seed, engine, only: opts.only ?? null, stateRoot: resolve(stateRoot), runId,
+      expectBaseFile: opts.expectBase ? resolve(opts.expectBase) : null });
+    printSimWorldSummary(summary);
+  } catch (error) {
+    console.error(`sim world run: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 2;
+  }
 }
 
 export function registerSimCommands(program: Command, simAppRuntime: SimAppRuntime = {}): void {
@@ -393,9 +440,25 @@ export function registerSimCommands(program: Command, simAppRuntime: SimAppRunti
         process.exitCode = 2;
       }
     });
-  world.command('run <world-id> <scenario-file>')
-    .description('생성된 세계에서 YAML 사건 주입 시나리오를 실행한다')
-    .action(async (worldId: string, scenarioFile: string) => {
+  world.command('run <world-id> [scenario-file]')
+    .description('생성된 세계에서 YAML 사건 주입 시나리오를 실행한다 · 예약 id memory|ta|graph|supervisors|all 은 내장 팩을 돈다')
+    .option('--seed [n]', '예약 id: 결정적 seed(필수)')
+    .option('--engine [engine]', '예약 id: legacy|graph|both (기본 legacy)')
+    .option('--only [scenario]', '예약 id: 이 시나리오 id 하나만')
+    .option('--expect-base [file]', '예약 id: 기준(main) 기대표 — promote·래칫 판정용')
+    .option('--run-id [id]', '예약 id: 산출 디렉터리 이름')
+    .option('--replay [run-id]', '예약 id: 기록된 런을 같은 seed·engine·only 로 다시 돌려 다섯 파일을 바이트 대조')
+    .action(async (worldId: string, scenarioFile: string | undefined, opts: SimWorldKernelCliOptions, command: Command) => {
+      if (isReservedSimWorldId(worldId)) return runReservedSimWorld(worldId, scenarioFile, opts);
+      // Non-reserved ids never had these options: report the first one in argv exactly as Commander did before.
+      let root: Command = command;
+      while (root.parent) root = root.parent;
+      const raw = (root as Command & { rawArgs?: string[] }).rawArgs ?? process.argv;
+      // Tokens after the `--` terminator are operands (a scenario file may be named `--seed`), never options.
+      const terminator = raw.indexOf('--');
+      const flag = (terminator < 0 ? raw : raw.slice(0, terminator)).find((token) => SIM_WORLD_KERNEL_FLAGS.has(token.split('=')[0]!));
+      if (flag) return command.error(`error: unknown option '${flag}'`, { code: 'commander.unknownOption', exitCode: 1 });
+      if (scenarioFile === undefined) return command.error("error: missing required argument 'scenario-file'", { code: 'commander.missingArgument', exitCode: 1 });
       try {
         const current = loadWorld(worldId);
         const result = await runWorldScenario(current, scenarioFile);

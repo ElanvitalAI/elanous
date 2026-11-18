@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "entries": {
+    "seat-mail/M1": {
+      "expect": "red",
+      "reason": "ELN-SEAT-IDLE-QUEUE-STALL · fix #38510 (TC) · live 12:44 HAND-ELN-MSG Turn idle · Queue 1",
+      "redReason": "refused knock reported as delivered"
+    },
+    "seat-mail/M1b": {
+      "expect": "green",
+      "reason": "ELN-SEAT-LIVE 11-18 10:20 HAND-TUI-D · fixed by #38501 (MERGED · split of #38443) · regression lock (OP #87874)",
+      "greenSince": "2026-11-18"
+    },
+    "seat-mail/M2": {
+      "expect": "green",
+      "reason": "ELN-SEAT-IDLE-QUEUE-STALL A2 · fixed by #38517 (MERGED 3e4ba72b06) · live 12:44 JUD Queue 10 · was red on 8203aa9ba2: unacknowledged mail not queued",
+      "greenSince": "2026-11-18"
+    },
+    "seat-mail/M3": {
+      "expect": "red",
+      "reason": "ELN-TURN-STALL-WATCHDOG · fix #38515 (TC) · live 12:44 JUD-B Responding 1h03m",
+      "redReason": "silent stream never ended the turn"
+    },
+    "seat-mail/M4": {
+      "expect": "red",
+      "reason": "ELN-MSG-POST-IDEMPOTENT · fix #38516 (TC) · live 13:11 JUD 9+ copies",
+      "redReason": "committed post reported as failure"
+    },
+    "seat-mail/M5": {
+      "expect": "green",
+      "reason": "ELN-SEAT-LIVE 11-18 11:48 eln-main · fixed by #38483 (MERGED) · regression lock",
+      "greenSince": "2026-11-18"
+    },
+    "seat-mail/M6": {
+      "expect": "green",
+      "reason": "ELN-SEAT-LIVE 11-18 10:22 HAND-ELN-ELS-API · fixed by #38446 (MERGED) · regression lock",
+      "greenSince": "2026-11-18"
+    },
+    "seat-mail/M7": {
+      "expect": "green",
+      "reason": "ELN-SEAT-LIVE 11-18 10:36 HAND-ELN-ELS-API · fixed by #38449 (MERGED) · regression lock",
+      "greenSince": "2026-11-18"
+    }
+  }
+}

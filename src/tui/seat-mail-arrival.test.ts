@@ -181,3 +181,62 @@ test('defaults the idle mail poll to the one 15 second period', () => {
   watcher.stop();
   expect(scheduled).toEqual([DEFAULT_SEAT_MAIL_POLL_MS]);
 });
+
+// ── TC #91989 — 관측 사건 eventId 결속 리터럴(SEAT-INBOX B1-C per-message 경로) ─────
+// 우편 1통이 만드는 turn-life 사건 4지점(arrived·queued·dequeued·acked)이 같은
+// eventId(=msgId)를 내놓는지 turnLifeLog 캡처로 증명한다. turn-start 지점(entry.ts)은
+// 핫파일 임대 때문에 이 조각 범위 밖이라 5지점 완결은 임대 ③ 착지 뒤 시험에 합류한다.
+const turnLifeCapture = () => {
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  return {
+    events,
+    log: (event: string, data: Record<string, unknown>) => { events.push({ event, data }); },
+  };
+};
+
+test('TC #91989 리터럴: 우편 1통 → arrived·queued·dequeued·acked 모두 같은 eventId', () => {
+  const { events, log } = turnLifeCapture();
+  const queue = createNextTuiQueue({ log: () => {}, turnLifeLog: log });
+  const watcher = createSeatMailArrivalWatcher('/h', queue, {
+    // 출처: TC #91989 — 시험 리터럴(우편 1통 → 다섯 사건 같은 eventId)
+    messages: { read: () => ({ seat: SEAT, messages: [{ id: 7, from: 'REL', body: 'TC #91989 리터럴 우편' }] }) },
+    turnLifeLog: log,
+  });
+  // 1) 도착 — poll 1회 → event-arrived (eventId === msgId === 7)
+  expect(watcher.poll()).toEqual({ kind: 'messages', msgIds: [7] });
+  const arrived = events.filter((e) => e.event === 'turn-life:event-arrived');
+  expect(arrived).toHaveLength(1);
+  expect(arrived[0]!.data).toMatchObject({ eventId: 7, msgId: 7 });
+  // 2) 인도 — settle+dequeue 로 경계를 넘기면 event-dequeued 가 같은 eventId 로 이어진다.
+  expect(queue.settle('draft')).toEqual({ kind: 'wake' });
+  queue.dequeue();
+  const dequeued = events.filter((e) => e.event === 'turn-life:event-dequeued');
+  expect(dequeued).toHaveLength(1);
+  expect(dequeued[0]!.data).toMatchObject({ eventId: 7 });
+  // 3) 종료 — noteTurnFinished(true) → event-acked 가 사슬을 닫는다.
+  watcher.noteTurnFinished(true);
+  const acked = events.filter((e) => e.event === 'turn-life:event-acked');
+  expect(acked).toHaveLength(1);
+  expect(acked[0]!.data).toMatchObject({ eventId: 7, msgId: 7, outcome: 'responded', state: 'seen' });
+  // 4) 캡처된 turn-life 사건 전부(4지점)의 eventId 가 7 로 같다(turn-start 는 범위 밖).
+  expect(events).toHaveLength(4);
+  expect([...new Set(events.map((e) => e.event))].sort()).toEqual([
+    'turn-life:event-acked', 'turn-life:event-arrived', 'turn-life:event-dequeued', 'turn-life:event-queued',
+  ]);
+  expect(events.map((e) => e.data.eventId)).toEqual([7, 7, 7, 7]);
+});
+
+test('TC #91989 리터럴: 중복 도착 2 → 사슬 1개(dedupe) — arrived 1회', () => {
+  // 출처: TC #91989 — 중복 도착 2 → turn-start 1(turn-start 반쪽은 임대 ③ 착지 뒤 완결)
+  const { events, log } = turnLifeCapture();
+  const queue = createNextTuiQueue({ log: () => {}, turnLifeLog: log });
+  const watcher = createSeatMailArrivalWatcher('/h', queue, {
+    messages: { read: () => ({ seat: SEAT, messages: [{ id: 7, from: 'REL', body: 'TC #91989 리터럴 우편' }] }) },
+    turnLifeLog: log,
+  });
+  watcher.poll();
+  watcher.poll(); // 같은 우편 id 7 이 다시 도착해도 사슬은 1개다.
+  expect(events.filter((e) => e.event === 'turn-life:event-arrived')).toHaveLength(1);
+  expect(events.find((e) => e.event === 'turn-life:event-arrived')?.data).toMatchObject({ eventId: 7 });
+  expect(events.filter((e) => e.event === 'turn-life:event-queued')).toHaveLength(1);
+});

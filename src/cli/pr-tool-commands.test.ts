@@ -10,7 +10,8 @@ test('pr command list snapshot keeps queue, land, and granularity beside the new
   const root = new Command();
   registerPrCommands(root);
   const pr = root.commands.find(command => command.name() === 'pr');
-  expect(pr?.commands.map(command => command.name())).toEqual(['supersede-drafts', 'lineage', 'census', 'open-guard', 'queue', 'land', 'granularity']);
+  // 2026-11-18 PR-RESTACK-PLAN #38404가 census 와 open-guard 사이에 restack-plan 를 더했다.
+  expect(pr?.commands.map(command => command.name())).toEqual(['supersede-drafts', 'lineage', 'census', 'restack-plan', 'open-guard', 'queue', 'land', 'granularity']);
   expect(pr?.commands.find(command => command.name() === 'queue')?.commands.map(command => command.name()))
     .toEqual(['status', 'enqueue', 'train-event', 'run']);
 });

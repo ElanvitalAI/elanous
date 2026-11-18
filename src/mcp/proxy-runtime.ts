@@ -69,6 +69,7 @@ export interface McpToolGrant {
 export interface McpToolAuthorizer {
   grant(grant: McpToolGrant): void;
   isGranted(serverId: string, toolName: string): boolean;
+  checkGrant(serverId: string, toolName: string): ReturnType<CapabilityGrantStore['checkGrant']>;
   revokeServer(serverId: string): number;
 }
 
@@ -93,6 +94,24 @@ export function createMcpToolAuthorizer(
     });
   };
 
+  const checkGrant = (serverId: string, toolName: string): ReturnType<CapabilityGrantStore['checkGrant']> => {
+    const decision = store.checkGrant(serverId, MCP_GRANT_ACTION, toolName);
+    if (!decision.granted) {
+      const denials = denialsByServer.get(serverId) ?? { count: 0, toolNames: new Set<string>() };
+      denials.count += 1;
+      denials.toolNames.add(toolName);
+      denialsByServer.set(serverId, denials);
+      debug.log('mcp.authorization', 'denied', {
+        serverId,
+        toolName,
+        deniedCount: denials.count,
+        deniedToolCount: denials.toolNames.size,
+        ...(decision.reason === 'absent' ? {} : { reason: decision.reason }),
+      });
+    }
+    return decision;
+  };
+
   return {
     grant(grant) {
       if (grant.expiresAt !== undefined && !Number.isFinite(new Date(grant.expiresAt).getTime())) {
@@ -108,21 +127,9 @@ export function createMcpToolAuthorizer(
       log('grant', grant);
     },
     isGranted(serverId, toolName) {
-      const granted = store.isGranted(serverId, MCP_GRANT_ACTION, toolName);
-      if (!granted) {
-        const denials = denialsByServer.get(serverId) ?? { count: 0, toolNames: new Set<string>() };
-        denials.count += 1;
-        denials.toolNames.add(toolName);
-        denialsByServer.set(serverId, denials);
-        debug.log('mcp.authorization', 'denied', {
-          serverId,
-          toolName,
-          deniedCount: denials.count,
-          deniedToolCount: denials.toolNames.size,
-        });
-      }
-      return granted;
+      return checkGrant(serverId, toolName).granted;
     },
+    checkGrant,
     revokeServer(serverId) {
       const grants = store.list({ persona: serverId, action: MCP_GRANT_ACTION });
       const removed = store.revoke({ persona: serverId, action: MCP_GRANT_ACTION });
@@ -145,7 +152,7 @@ export interface McpProxyRuntimeOpts {
    *  `tools/call` through this instance. */
   client: Pick<McpClient, 'callTool'>;
   /** Shared authorization ledger. Every outbound MCP proxy is fail-closed. */
-  authorizer: Pick<McpToolAuthorizer, 'isGranted'>;
+  authorizer: Pick<McpToolAuthorizer, 'isGranted'> & Partial<Pick<McpToolAuthorizer, 'checkGrant'>>;
   /** ⛔ **Test seam only** — 이 저장소 관례(`_clientForTesting` · `_threadIndexForTesting`)를 따라
    *  이름에 `ForTest` 를 박았다. ***사용자 손잡이가 아니다.***
    *  프로덕션 호출자는 없다(`registerMcpClients` 는 안 넘긴다) — 상한이 실제로 «무는지»를
@@ -271,11 +278,15 @@ export function createMcpProxyRuntime(
       req: Record<string, unknown>,
       ctx: ToolRuntimeContext,
     ): Promise<McpProxyResult> {
-      if (!opts.authorizer.isGranted(opts.serverId, opts.mcpTool.name)) {
+      const decision = opts.authorizer.checkGrant?.(opts.serverId, opts.mcpTool.name)
+        ?? (opts.authorizer.isGranted(opts.serverId, opts.mcpTool.name)
+          ? { granted: true as const }
+          : { granted: false as const, reason: 'absent' as const });
+      if (!decision.granted) {
         return {
           ok: false,
           classification: 'mcp-authorization-denied',
-          output: `mcp authorization denied: ${id}`,
+          output: `mcp authorization denied${decision.reason === 'expired' ? ' (expired)' : ''}: ${id}`,
         };
       }
       try {

@@ -89,18 +89,19 @@ test('the general-only switch updates beta entries in the six-screen desktop and
   expect(sheet().findAllByType('a').find((link) => link.props.href === '/board')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
   close();
   open('더보기');
-  expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/vault', '/settings']);
+  expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/vault', '/voice-notes', '/settings']);  // Source: #37485 (dbd5fd960c) adds /voice-notes beta route — sidebar-nav-items.ts:121.
   expect(sheet().findAllByType('a').find((link) => link.props.href === '/vault')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
+  expect(sheet().findAllByType('a').find((link) => link.props.href === '/voice-notes')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);  // Source: beta routes render 실험 badge — feature-maturity.ts:19 (#37485).
   close();
   act(() => root.findByProps({ role: 'switch' }).props.onChange({ currentTarget: { checked: false } }));
   expect(hrefs()).toEqual(['/chat', '/board', '/term', '/editor', '/settings']);
   act(() => { store.set(PWA_ROLE_KEY, 'contributor'); window.dispatchEvent(new Event(PWA_ROLE_EVENT)); });
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(0);
-  expect(hrefs()).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings']);
+  expect(hrefs()).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/voice-notes', '/settings']);  // Source: nav order + /voice-notes in files group — sidebar-nav-items.ts (#37485).
   expect(sidebar().findAllByType('a').find((link) => link.props.href === '/live-run')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
   act(() => { store.set(PWA_ROLE_KEY, 'owner'); window.dispatchEvent(new Event(PWA_ROLE_EVENT)); });
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(0);
-  expect(hrefs()).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings', '/credentials']);
+  expect(hrefs()).toEqual(['/chat', '/live-run', '/board', '/term', '/editor', '/apps', '/design-check', '/vault', '/voice-notes', '/settings', '/credentials']);  // Source: /voice-notes added to files group — sidebar-nav-items.ts:121 (#37485).
 });
 
 test('defaults off, synchronizes every mounted hook and remembers opt-in across mounts', () => {

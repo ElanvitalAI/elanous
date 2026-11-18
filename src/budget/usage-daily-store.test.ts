@@ -45,6 +45,19 @@ test('reports a missing source, and since filters retained rows without modifyin
   } finally { f.close(); }
 });
 
+test('keeps same-hour usage for different seats and untagged usage in separate buckets', () => {
+  const f = fixture();
+  try {
+    f.put('usage', { seat: 'TC', role: 'agent', site: 'agent-turn', inputTokens: 7 });
+    f.put('usage', { seat: 'OP', role: 'agent', site: 'agent-turn', inputTokens: 11 });
+    f.put('usage', { role: 'agent', site: 'agent-turn', inputTokens: 13 });
+    const rows = readUsageDaily(f.path, '2026-10-01')!.rows;
+    expect(rows.map(row => [row.seat, row.inputTokens]).sort()).toEqual([
+      ['(none)', 13], ['OP', 11], ['TC', 7],
+    ]);
+  } finally { f.close(); }
+});
+
 test('preserves explicit zero counts and reads beyond the first 1,000-row page', () => {
   const f = fixture();
   try {

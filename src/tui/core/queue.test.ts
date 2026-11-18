@@ -208,6 +208,18 @@ describe('ELN-QUEUE-ITEM-STATE — CROWN addendum B·C (kind · drain · invaria
     expect(order).toEqual([userSteer.id, userQueued.id, userLater.id, mail.id, child.id]);
   });
 
+  test('CAPSULE-C2-FU: peekKind reads the dequeue head kind without taking it', () => {
+    const { queue } = recordingQueue();
+    expect(queue.peekKind()).toBeNull();
+    queue.enqueueNotice('seat mail arrived', 'seat-mail');
+    expect(queue.peekKind()).toBe('notice');
+    queue.enqueue('line A');
+    expect(queue.peekKind()).toBe('user');
+    expect(queue.count).toBe(2);
+    expect(queue.dequeue()).toMatchObject({ kind: 'submit', itemKind: 'user', text: 'line A' });
+    expect(queue.peekKind()).toBe('notice');
+  });
+
   test('drain hands each utterance back as its own message — texts are never merged', () => {
     const { queue } = recordingQueue();
     const texts = ['first line', 'second line', 'third line'];

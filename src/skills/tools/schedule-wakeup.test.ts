@@ -26,6 +26,12 @@ import {
   type WakeupSchedulerDeps,
 } from './schedule-wakeup.js';
 
+/** 입력칸이 다시 떴다(턴 끝 · idle) — 스케줄러의 wrapPort 를 대시보드처럼 흔든다(가짜 port 는 아무것도 안 한다). */
+function attachMounted(s: ReturnType<typeof createWakeupScheduler>): void {
+  const port = { attach: (_requestYield: () => boolean) => {}, detach: (_opts?: { yielded?: boolean }) => {}, declined: (_detail: string) => {} };
+  s.wrapPort(port).attach(() => true);
+}
+
 /** 가짜 시계 — 타이머를 손으로 돌린다(실시간 대기 0). */
 function fakeClock(start = new Date(2026, 9, 17, 9, 0, 0, 0).getTime()) {
   let t = start;
@@ -59,6 +65,7 @@ function rig(opts: {
   active?: (id: string) => boolean;
   maxEntries?: number;
   currentTurnId?: () => string | null;
+  bus?: (e: { id: string; source: string; dedupeKey: string; arrivedAt: number; text: string }) => void;
 } = {}) {
   const clock = fakeClock();
   const calls: Call[] = [];
@@ -73,6 +80,7 @@ function rig(opts: {
     },
     isTurnActive: opts.active,
     ...(opts.currentTurnId ? { currentTurnId: opts.currentTurnId } : {}),
+    ...(opts.bus ? { publishEvent: opts.bus as WakeupSchedulerDeps['publishEvent'] } : {}),
     now: clock.now,
     setTimer: clock.setTimer,
     clearTimer: clock.clearTimer,
@@ -153,7 +161,7 @@ describe('바쁨 → rejected ⊕ 버리지 않고 미룬다(TUI-WAKEUP-DEFER-NO
     expect(r.calls).toHaveLength(1);
     r.clock.advance(1_000);
     expect(r.calls).toHaveLength(2);
-    expect(r.logs.at(-1)).toMatchObject({ event: 'fired', data: { retried: true } });
+    expect(r.logs.at(-1)).toMatchObject({ event: 'fired', data: { retried: true, delaySec: 60 } }); // 늦게 깬 시간(지연 초) — 첫 예정(09:01)에서 60초
   });
 
   test('일회성: 턴이 길게 돌아도 버리지 않는다 — 바쁨이 끝난 뒤 첫 시도에 연다(10-22 OPT w7 02:38·02:39 NotIdle → dropped 사건)', () => {
@@ -168,19 +176,31 @@ describe('바쁨 → rejected ⊕ 버리지 않고 미룬다(TUI-WAKEUP-DEFER-NO
     expect(r.s.list()).toHaveLength(0);
   });
 
-  test('일회성: 미룸 상한(WAKEUP_DEFER_MAX_MS)을 넘도록 계속 바쁘면 그때 놓침 한 줄 ⊕ 소멸', () => {
-    const busy: StartTurnIfIdleResult = { opened: false, reason: 'HumanTyping', detail: 'buffer' };
-    const r = rig({ results: Array.from({ length: 200 }, () => busy) });
+  test('② 상한 초과(장기 턴) — «대기» 한 줄 · 예약 생존(소실 0) · 턴 끝 배출 1회 ⊕ delaySec', () => {
+    const busy: StartTurnIfIdleResult = { opened: false, reason: 'NotIdle', detail: 'turn-running' };
+    const tries = WAKEUP_DEFER_MAX_MS / WAKEUP_RETRY_DELAY_MS;
+    const r = rig({ results: Array.from({ length: tries + 1 }, () => busy) });
     r.s.schedule({ delaySeconds: 60, reason: '점검' });
-    r.clock.advance(60_000 + WAKEUP_DEFER_MAX_MS + 60_000);
-    expect(r.calls.length).toBeGreaterThan(2);
+    r.clock.advance(60_000 + WAKEUP_DEFER_MAX_MS + 60_000); // 장기 턴 — 미루기 상한을 훌쩍 넘는다
+    expect(r.calls).toHaveLength(tries + 1);
     expect(r.calls.length).toBeLessThanOrEqual(WAKEUP_DEFER_MAX_MS / WAKEUP_RETRY_DELAY_MS + 2);
-    expect(r.events().at(-1)).toBe('skipped:defer-exhausted');
-    expect(r.lines.at(-1)).toBe('⏰ 예약 깨움 놓침(w1): 점검 — HumanTyping');
-    expect(r.s.list()).toHaveLength(0);
+    // ⛔ 이전 계약(«놓침» 한 줄 ⊕ 소멸) 폐기(OP #88346) — 상한을 넘어도 drop 하지 않는다.
+    expect(r.events().at(-1)).toBe('queued:NotIdle');
+    expect(r.lines.at(-1)).toBe('⏰ 예약 깨움 대기(w1): 점검 — NotIdle · 턴이 끝나면 즉시 깨운다');
+    expect(r.s.list()).toHaveLength(1); // 소실 0 — 예약이 살아 있다
     const before = r.calls.length;
-    r.clock.advance(60 * 60_000);
+    r.clock.advance(10 * 60_000); // 1분 재청 고리는 멈췄다 — 흐린(30분) 재청 전엔 더 안 청한다
     expect(r.calls).toHaveLength(before);
+    attachMounted(r.s); // 장기 턴 끝 — 입력칸이 다시 떴다(마운트)
+    r.clock.advance(1); // 0ms 미룬 배출
+    expect(r.calls).toHaveLength(before + 1); // 정확히 1회 더
+    const fired = r.logs.filter((l) => l.event === 'fired');
+    expect(fired).toHaveLength(1);
+    expect(fired[0]!.data.delaySec).toBeGreaterThanOrEqual(WAKEUP_DEFER_MAX_MS / 1000); // 출처: R-TST36 — 늦게 깬 시간(지연 초) 기록
+    expect(r.s.list()).toHaveLength(0);
+    attachMounted(r.s); // 다음 마운트 — 두 번째 배출은 없다
+    r.clock.advance(1);
+    expect(r.calls).toHaveLength(before + 1);
   });
 
   test('일회성: 상한 경계 — 30분 시점의 시도는 한다(그때 열리면 fired)', () => {
@@ -197,39 +217,56 @@ describe('바쁨 → rejected ⊕ 버리지 않고 미룬다(TUI-WAKEUP-DEFER-NO
     expect(r.lines.some((l) => l.includes('놓침'))).toBe(false);
   });
 
-  test('일회성: 상한 경계 — 30분 시점에도 바쁘면 그 뒤에 놓침(그 전엔 아님)', () => {
+  test('일회성: 상한 경계 — 30분 시점에도 바쁘면 «대기» 로 넘어간다(그 전엔 아님) · 소실 없음', () => {
     const busy: StartTurnIfIdleResult = { opened: false, reason: 'NotIdle', detail: 'turn-running' };
     const tries = WAKEUP_DEFER_MAX_MS / WAKEUP_RETRY_DELAY_MS;
     const r = rig({ results: Array.from({ length: tries + 5 }, () => busy) });
     r.s.schedule({ delaySeconds: 60, reason: '점검' });
     r.clock.advance(60_000 + WAKEUP_DEFER_MAX_MS - 1);
-    expect(r.events()).not.toContain('skipped:defer-exhausted');
+    expect(r.events()).not.toContain('queued:NotIdle'); // 그 전엔 대기 아님 — 아직 1분 재청 중
     r.clock.advance(1);
     expect(r.calls).toHaveLength(tries + 1);
-    expect(r.events().at(-1)).toBe('skipped:defer-exhausted');
-    expect(r.s.list()).toHaveLength(0);
+    expect(r.events().at(-1)).toBe('queued:NotIdle');
+    expect(r.lines.at(-1)).toBe('⏰ 예약 깨움 대기(w1): 점검 — NotIdle · 턴이 끝나면 즉시 깨운다');
+    expect(r.s.list()).toHaveLength(1); // ⛔ 이전 계약(놓침 ⊕ 소멸) 폐기 — 상한을 넘겨도 살아 있다
   });
 
-  test('일회성: 바쁨이 아닌 거부(Disabled)는 미루지 않는다 — 재시도 1회 뒤 소멸(기존 계약)', () => {
+  test('일회성: 바쁨이 아닌 거부(Disabled)도 버리지 않는다 — 재청 1회 뒤 «턴 끝 배출» 대기(소실 0)', () => {
     const off: StartTurnIfIdleResult = { opened: false, reason: 'Disabled' };
-    const r = rig({ results: [off, off, off] });
+    const r = rig({ results: [off, off, off] }); // 3번(60s 최초·120s 재청·1920s 흐린 재청)만 거부 — 4번째(마운트 배출)는 열림
     r.s.schedule({ delaySeconds: 60, reason: '점검' });
-    r.clock.advance(60 * 60_000);
-    expect(r.calls).toHaveLength(2);
-    expect(r.events().slice(-2)).toEqual(['rejected:Disabled', 'skipped:retry-exhausted']);
+    r.clock.advance(60 * 60_000); // 60s 최초 → 120s 1분 재청(소진) → 1920s 흐린(30분) 재청 — 셋 다 거부
+    expect(r.calls).toHaveLength(3);
+    expect(r.events().filter(e => e === 'rejected:Disabled')).toHaveLength(3);
+    expect(r.events().at(-1)).toBe('queued:Disabled'); // K10 — 예전의 skipped:retry-exhausted ⊕ 소멸 폐기
+    expect(r.events()).not.toContain('skipped:retry-exhausted');
+    expect(r.s.list()).toHaveLength(1); // 소실 0
+    expect(r.lines.filter(l => l.includes('대기'))).toHaveLength(1); // «대기» 고지는 구간마다 한 번
+    attachMounted(r.s); // 턴 끝 — 마운트 배출 1회
+    r.clock.advance(1);
+    expect(r.calls).toHaveLength(4);
+    expect(r.logs.filter(l => l.event === 'fired')).toHaveLength(1);
     expect(r.s.list()).toHaveLength(0);
   });
 
-  test('반복: 바쁨이면 다음 회차 전까지 미루고, 회차가 오면 그 회차로 넘어간다', () => {
+  test('반복: 바쁨이면 다음 회차 전까지 미루고, 회차와 겹치면 «턴 끝 배출» 대기 — 이후 원래 박자', () => {
     const busy: StartTurnIfIdleResult = { opened: false, reason: 'NotIdle', detail: 'turn-running' };
-    const r = rig({ results: Array.from({ length: 20 }, () => busy) });
+    const r = rig({ results: Array.from({ length: 10 }, () => busy) });
     r.s.schedule({ repeatMinutes: 10, reason: '10분 점검' });
-    r.clock.advance(10 * 60_000 + 9 * 60_000);
+    r.clock.advance(10 * 60_000 + 9 * 60_000); // 09:10 틱 → 1분 재청으로 버티다 다음 회차(09:20) 와 겹친다
     expect(r.s.list()).toHaveLength(1);
     expect(r.events()).not.toContain('skipped:retry-exhausted');
-    r.clock.advance(2 * 60_000);
-    expect(r.s.list()).toHaveLength(1);
-    expect(r.events()).toContain('skipped:defer-exhausted');
+    expect(r.events().at(-1)).toBe('queued:NotIdle'); // 예전엔 이 틱을 다음 회차로 접었다 — 이제 대기 큐로 간다(소실 0)
+    r.clock.advance(2 * 60_000); // 턴이 아직 돈다 — 흐린(30분) 재청 외엔 조용
+    expect(r.calls).toHaveLength(10);
+    attachMounted(r.s); // 턴 끝 — 입력칸 마운트에 이번 회차를 마저 1회
+    r.clock.advance(1);
+    expect(r.logs.filter((l) => l.event === 'fired')).toHaveLength(1);
+    expect(r.calls).toHaveLength(11);
+    r.clock.advance(8 * 60_000);
+    expect(r.calls).toHaveLength(11); // 다음 회차 전엔 조용
+    r.clock.advance(1 * 60_000);
+    expect(r.calls).toHaveLength(12); // 놓친 틱은 09:30 로 합쳐 원래 박자로 돌아간다
   });
 
   test('반복: 미룬 뒤 열리면 fired ⊕ 다음 회차는 원래 박자', () => {
@@ -241,6 +278,89 @@ describe('바쁨 → rejected ⊕ 버리지 않고 미룬다(TUI-WAKEUP-DEFER-NO
     expect(r.logs.at(-1)!.event).toBe('fired');
     r.clock.advance(8 * 60_000);
     expect(r.calls).toHaveLength(4);
+  });
+
+  describe('«턴 끝 배출» 대기 큐(ELN-SEAT-WAKEUP-SCHEDULE-FAIL · OP #88346 — 소실 0)', () => {
+    test('① 턴 중 발화 → 입력칸 마운트(턴 끝)에 1회 배출 — 1분 재청을 기다리지 않는다 ⊕ delaySec', () => {
+      const busy: StartTurnIfIdleResult = { opened: false, reason: 'NotIdle', detail: 'turn-running' };
+      const r = rig({ results: [busy] });
+      r.s.schedule({ delaySeconds: 60, reason: '점검' });
+      r.clock.advance(60_000); // 09:01 발화 — 턴이 돌아 거부
+      expect(r.calls).toHaveLength(1);
+      expect(r.events().at(-1)).toBe('rejected:NotIdle');
+      r.clock.advance(30_000); // 아직 턴 중(09:02 재청 전)
+      attachMounted(r.s); // 턴 끝 — 입력칸이 다시 떴다(agent-wake idle 감시와 같은 길)
+      r.clock.advance(1); // 0ms 미룬 배출
+      expect(r.calls).toHaveLength(2); // 재청 타이머를 기다리지 않고 곧바로 1회
+      const fired = r.logs.filter((l) => l.event === 'fired');
+      expect(fired).toHaveLength(1);
+      expect(fired[0]!.data).toMatchObject({ delaySec: 30, retried: true }); // 늦게 깬 시간(지연 초) 기록
+      expect(r.s.list()).toHaveLength(0); // 발화 뒤 소멸(일회성)
+      attachMounted(r.s); // 다음 마운트 — 배출할 것 없음(1회 보장)
+      r.clock.advance(1);
+      expect(r.calls).toHaveLength(2);
+    });
+
+    test('③ 중복 — 재거부로 다시 실어도 · 마운트가 겹쳐도 배출은 1회', () => {
+      const busy: StartTurnIfIdleResult = { opened: false, reason: 'NotIdle', detail: 'turn-running' };
+      const r = rig({ results: [busy, busy] });
+      r.s.schedule({ delaySeconds: 60, reason: '점검' });
+      r.clock.advance(60_000); // 09:01 발화 거부 → 큐 적재 + 09:02 재청
+      expect(r.calls).toHaveLength(1);
+      attachMounted(r.s); attachMounted(r.s); // 마운트 겹침 — 첫 attach 가 배출을 예약, 둘째는 빈 큐를 본다
+      r.clock.advance(1);
+      expect(r.calls).toHaveLength(2); // 배출 시도 — 아직 턴 중이어서 재거부(큐 재적재: 하나로)
+      expect(r.logs.filter((l) => l.event === 'fired')).toHaveLength(0);
+      attachMounted(r.s); // 그 턴도 끝났다 — 재적재된 큐 배출
+      r.clock.advance(1);
+      expect(r.calls).toHaveLength(3);
+      expect(r.logs.filter((l) => l.event === 'fired')).toHaveLength(1); // 두 번 겹쳐 실려도 fired 는 1회
+      expect(r.s.list()).toHaveLength(0);
+    });
+  });
+
+  describe('R1(턴 근본 C4) — 도래·늦은 깨움이 버스 항목으로도 나온다(source wakeup)', () => {
+    test('도래 → 버스 항목 1개: id·dedupeKey·deliverBy·text 원문 그대로(fail-open)', () => {
+      const bus: Array<{ id: string; source: string; dedupeKey: string; arrivedAt: number; deliverBy?: number; text: string }> = [];
+      const r = rig({ bus: e => bus.push(e) });
+      r.s.schedule({ delaySeconds: 60, reason: '점검' });
+      expect(bus).toHaveLength(0); // 예약 시점엔 버스 항목이 없다
+      r.clock.advance(60_000);
+      expect(bus).toHaveLength(1); // 도래 1회 = 항목 1개
+      expect(bus[0]!.source).toBe('wakeup');
+      expect(bus[0]!.id).toBe('wakeup-w1-0');
+      expect(bus[0]!.dedupeKey).toBe('wakeup:w1:0');
+      expect(bus[0]!.arrivedAt).toBe(new Date(2026, 9, 17, 9, 1, 0, 0).getTime());
+      expect(bus[0]!.deliverBy).toBe(new Date(2026, 9, 17, 9, 31, 0, 0).getTime()); // dueAt + 30분(일회성)
+      expect(bus[0]!.text).toContain('[예약 깨움 w1]');
+      expect(bus[0]!.text).toContain('점검');
+      expect(r.logs.filter(l => l.event === 'fired')).toHaveLength(1); // 문은 그대로 열렸다(버스는 보조)
+    });
+
+    test('반복 회차마다 dedupeKey 가 달라진다(회차별 항목) ⊕ publishEvent 가 throw 해도 발화는 산다(fail-open)', () => {
+      const keys: string[] = [];
+      const r = rig({ bus: e => { keys.push(e.dedupeKey); throw new Error('bus down'); } });
+      r.s.schedule({ repeatMinutes: 1, reason: '1분 점검' });
+      r.clock.advance(61_000); // 09:01 첫 회차
+      expect(keys).toEqual(['wakeup:w1:0']);
+      r.clock.advance(60_000); // 09:02 둘째 회차
+      expect(keys).toEqual(['wakeup:w1:0', 'wakeup:w1:1']); // fireCount 로 회차가 갈린다
+      expect(r.logs.filter(l => l.event === 'fired')).toHaveLength(2); // 버스가 죽어도 깨움은 열린다
+    });
+
+    test('재청 소진(일회성) → «늦은 깨움» 항목(dedupeKey :late) ⊕ 버스 없어도 대기·배출은 그대로', () => {
+      const bus: Array<{ id: string; dedupeKey: string }> = [];
+      const off: StartTurnIfIdleResult = { opened: false, reason: 'Disabled' };
+      const r = rig({ results: [off, off, off], bus: e => bus.push({ id: e.id, dedupeKey: e.dedupeKey }) });
+      r.s.schedule({ delaySeconds: 60, reason: '점검' });
+      r.clock.advance(60 * 60_000); // 최초·재청·흐린 재청 — 셋 다 거부 → 소진
+      // 도래 항목은 시도마다 같은 dedupeKey 로 나간다(버스가 중복으로 접는다) — 유니크로 판정.
+      expect([...new Set(bus.map(e => e.dedupeKey))]).toEqual(['wakeup:w1:0', 'wakeup:w1:0:late']); // 도래 + 늦은 깨움
+      expect(r.s.list()).toHaveLength(1); // 버스 항목과 무관 — 예약은 대기 큐에 살아 있다(소실 0)
+      attachMounted(r.s);
+      r.clock.advance(1);
+      expect(r.logs.filter(l => l.event === 'fired')).toHaveLength(1);
+    });
   });
 });
 

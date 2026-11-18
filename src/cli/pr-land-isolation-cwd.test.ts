@@ -25,6 +25,20 @@ test('the gate judges the tree being landed (cwd), not the tree the CLI binary l
   expect(runPrLandIsolationGate(quiet, repo(false))).toBe(true);
 });
 
+test('PR-LAND-ISOLATION-GATE-WHOLE-TREE: a drift in a file this landing does not touch does not block it', () => {
+  const dir = repo(true);
+  writeFileSync(join(dir, 'src', 'b.ts'), 'export const b = 1;\n');
+  expect(runPrLandIsolationGate(quiet, dir, undefined, ['src/b.ts'])).toBe(true);
+  expect(runPrLandIsolationGate(quiet, dir, undefined, ['src/a.ts'])).toBe(false);
+  expect(runPrLandIsolationGate(quiet, dir, undefined, ['src/b.ts', 'src/a.ts'])).toBe(false);
+});
+
+test('unknown or empty changed files = the whole tree (never a silent skip)', () => {
+  const dir = repo(true);
+  expect(runPrLandIsolationGate(quiet, dir, undefined, [])).toBe(false);
+  expect(runPrLandIsolationGate(quiet, dir, undefined, undefined)).toBe(false);
+});
+
 test('a subdirectory resolves to the repository top level', () => {
   const dir = repo(true);
   expect(runPrLandIsolationGate(quiet, join(dir, 'src'))).toBe(false);

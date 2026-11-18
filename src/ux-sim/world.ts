@@ -2210,23 +2210,21 @@ function linuxNetworkSandbox(testRoot: string, cwd: string): { command: string; 
   throw new Error('network-zero simulation requires a usable Linux unshare -rn or bwrap --unshare-net; refusing to execute without OS network isolation');
 }
 
+/** OS network-zero wrapper for scripts/sim-world-runner.ts; the caller appends the runner path. Shared with the sim-world kernel. */
+export function sandboxedRunnerCommand(testRoot: string, cwd: string): { command: string; args: string[] } {
+  if (process.platform === 'darwin') return { command: '/usr/bin/sandbox-exec', args: ['-p', '(version 1)(allow default)(deny network*)', process.execPath] };
+  if (process.platform === 'linux') return linuxNetworkSandbox(testRoot, cwd);
+  throw new Error(`network-zero simulation has no supported OS sandbox for ${process.platform}; refusing to execute without network isolation`);
+}
+
 function invokeSandboxedWorldRunner(world: SimWorld, scenarioFile: string, networkProbe = false): string {
   const testRoot = getTestStateRoot();
   if (!testRoot) throw new Error('sim worlds require an explicit --test universe');
   const cwd = process.cwd();
   const runner = resolve(import.meta.dir, '../../scripts/sim-world-runner.ts');
-  let command: string;
-  let args: string[];
-  if (process.platform === 'darwin') {
-    command = '/usr/bin/sandbox-exec';
-    args = ['-p', '(version 1)(allow default)(deny network*)', process.execPath, runner];
-  } else if (process.platform === 'linux') {
-    const sandbox = linuxNetworkSandbox(testRoot, cwd);
-    command = sandbox.command;
-    args = [...sandbox.args, runner];
-  } else {
-    throw new Error(`network-zero simulation has no supported OS sandbox for ${process.platform}; refusing to execute without network isolation`);
-  }
+  const sandbox = sandboxedRunnerCommand(testRoot, cwd);
+  const command = sandbox.command;
+  const args = [...sandbox.args, runner];
   const child = childProcess.spawnSync(command, args, {
     cwd, encoding: 'utf8',
     env: { ...process.env, ELANOUS_SIM_WORLD_STATE_ROOT: testRoot, ELANOUS_SIM_WORLD_ID: world.id,

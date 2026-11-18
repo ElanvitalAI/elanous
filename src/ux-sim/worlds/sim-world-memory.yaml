@@ -1,0 +1,4 @@
+# SIM-WORLD memory pack — rows { id, module } filled by the memory hand (SIM-WORLD §2 · contract seat-state/TC/SIM-KERNEL-API.md).
+schema: 1
+world: memory
+scenarios: []

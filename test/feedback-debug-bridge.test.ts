@@ -26,7 +26,7 @@
 
 import { describe, expect, test } from 'bun:test';
 
-import { debug } from '../src/debug/log.js';
+import { debug, withAmbientSessionScope } from '../src/debug/log.js';
 import {
   createDebugBridge,
   DEFAULT_DEBUG_CATEGORY_FILTER,
@@ -35,6 +35,12 @@ import {
   type DebugBridgeOpts,
 } from '../src/feedback/debug-bridge.js';
 import type { FeedbackEnvelope } from '../src/feedback/envelope.js';
+
+/** H-1: the bridge keeps only lines produced inside its own session scope, so these
+ *  legacy cases log from inside the rig's default session 's-1'. */
+function slog(category: string, event: string, data?: unknown, sessionId = 's-1'): void {
+  withAmbientSessionScope(sessionId, () => debug.log(category, event, data));
+}
 
 interface TestRig {
   emitted: FeedbackEnvelope[];
@@ -69,7 +75,7 @@ describe('createDebugBridge · gate semantics', () => {
   test('gate OFF default — matching debug.log emits 0 envelopes', () => {
     const { emitted, bridge } = rig();
     try {
-      debug.log('chat.test', 'no-gate', { sample: 1 });
+      slog('chat.test', 'no-gate', { sample: 1 });
       expect(emitted).toHaveLength(0);
     } finally {
       bridge.dispose();
@@ -80,7 +86,7 @@ describe('createDebugBridge · gate semantics', () => {
     const { emitted, bridge, blockId } = rig();
     try {
       bridge.activate();
-      debug.log('chat.test', 'first-event', { x: 1 });
+      slog('chat.test', 'first-event', { x: 1 });
       expect(emitted).toHaveLength(1);
       const env = emitted[0]!;
       expect(env.kind).toBe('debug.line');
@@ -106,8 +112,8 @@ describe('createDebugBridge · gate semantics', () => {
       bridge.activate();
       // Default filter is /^(chat|tool|agent|acp)\./ — `input.*` is
       // outside the whitelist so the sink rejects it before the ring.
-      debug.log('input.key', 'press', { keysym: 'Enter' });
-      debug.log('window.layout', 'resize', { w: 80 });
+      slog('input.key', 'press', { keysym: 'Enter' });
+      slog('window.layout', 'resize', { w: 80 });
       expect(emitted).toHaveLength(0);
       // Ring also stays empty for non-matching categories.
       expect(bridge.getRing()).toHaveLength(0);
@@ -120,10 +126,10 @@ describe('createDebugBridge · gate semantics', () => {
     const { emitted, bridge } = rig();
     try {
       bridge.activate();
-      debug.log('tool.spawn', 'first', { id: 'a' });
+      slog('tool.spawn', 'first', { id: 'a' });
       bridge.deactivate();
-      debug.log('tool.spawn', 'second', { id: 'b' });
-      debug.log('tool.spawn', 'third', { id: 'c' });
+      slog('tool.spawn', 'second', { id: 'b' });
+      slog('tool.spawn', 'third', { id: 'c' });
       expect(emitted).toHaveLength(1);
       expect(bridge.getRing()).toHaveLength(3);
     } finally {
@@ -136,7 +142,7 @@ describe('createDebugBridge · gate semantics', () => {
     try {
       bridge.activate();
       for (let i = 0; i < 5; i++) {
-        debug.log('agent.status', `e-${i}`, { i });
+        slog('agent.status', `e-${i}`, { i });
       }
       expect(emitted).toHaveLength(5);
       expect(emitted.every((e) => e.blockId === blockId)).toBe(true);
@@ -152,10 +158,10 @@ describe('createDebugBridge · ring buffer', () => {
     const { bridge } = rig({ ringBufferCap: 3 });
     try {
       // Gate OFF — ring grows even without emit.
-      debug.log('chat.test', '1', undefined);
-      debug.log('chat.test', '2', undefined);
-      debug.log('chat.test', '3', undefined);
-      debug.log('chat.test', '4', undefined);
+      slog('chat.test', '1', undefined);
+      slog('chat.test', '2', undefined);
+      slog('chat.test', '3', undefined);
+      slog('chat.test', '4', undefined);
       const ring = bridge.getRing();
       expect(ring).toHaveLength(3);
       expect(ring.map((e) => e.event)).toEqual(['2', '3', '4']);
@@ -173,7 +179,7 @@ describe('createDebugBridge · ring buffer', () => {
       // 2026-05-14 to break the bridge's own re-entrant feedback
       // loop (`acp.broadcast.fanout` → envelope → broadcast →
       // another `acp.broadcast.fanout` → ...).
-      debug.log('chat.handshake', 'hello', { v: 1 });
+      slog('chat.handshake', 'hello', { v: 1 });
       const env = emitted[0]!;
       expect(Array.isArray(env.asciiFallback)).toBe(true);
       expect(env.asciiFallback.length).toBe(1);
@@ -191,9 +197,9 @@ describe('createDebugBridge · resilience', () => {
       bridge.activate();
       emitThrows.value = true;
       // Should not throw despite the wire writer rejecting.
-      expect(() => debug.log('chat.test', 'broken', { ok: 0 })).not.toThrow();
+      expect(() => slog('chat.test', 'broken', { ok: 0 })).not.toThrow();
       emitThrows.value = false;
-      debug.log('chat.test', 'healthy', { ok: 1 });
+      slog('chat.test', 'healthy', { ok: 1 });
       // First emit was discarded by the wire (and we never push when
       // the throw fires); second emit succeeded.
       expect(emitted).toHaveLength(1);
@@ -206,10 +212,10 @@ describe('createDebugBridge · resilience', () => {
   test('dispose unregisters sink — subsequent debug.log emits 0', () => {
     const { emitted, bridge } = rig();
     bridge.activate();
-    debug.log('chat.test', 'before-dispose', undefined);
+    slog('chat.test', 'before-dispose', undefined);
     expect(emitted).toHaveLength(1);
     bridge.dispose();
-    debug.log('chat.test', 'after-dispose', undefined);
+    slog('chat.test', 'after-dispose', undefined);
     expect(emitted).toHaveLength(1);
     // getRing on a disposed bridge returns an empty snapshot.
     expect(bridge.getRing()).toHaveLength(0);
@@ -224,15 +230,13 @@ describe('createDebugBridge · resilience', () => {
     try {
       a.bridge.activate();
       b.bridge.activate();
-      debug.log('chat.turn', 'one', { who: 'either' });
-      // Both bridges saw the same debug.log — each emits an envelope
-      // stamped with its own sessionId/blockId.
+      // H-1 (2026-11-18): one line, produced in s-A's scope, reaches only s-A.
+      slog('chat.turn', 'one', { who: 'a-only-line' }, 's-A');
       expect(a.emitted).toHaveLength(1);
-      expect(b.emitted).toHaveLength(1);
+      expect(b.emitted).toHaveLength(0);
       expect(a.emitted[0]!.sessionId).toBe('s-A');
-      expect(b.emitted[0]!.sessionId).toBe('s-B');
       expect(a.emitted[0]!.blockId).toBe(makeDebugSessionBlockId('s-A'));
-      expect(b.emitted[0]!.blockId).toBe(makeDebugSessionBlockId('s-B'));
+      expect(JSON.stringify(b.bridge.getRing())).not.toContain('a-only-line');
     } finally {
       a.bridge.dispose();
       b.bridge.dispose();

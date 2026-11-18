@@ -1,4 +1,5 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
+import { emitTurnLife } from '../debug/turn-life.js';
 import type { NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
 // ── next TUI 의 자기 예약 깨움 (TUI-NEXT-QUEUE-AND-WAKE · 0.2.36 · 2026-10-22) ──────────────────────
 //
@@ -29,6 +30,7 @@ import {
   createWakeupScheduler,
   type WakeupPersistence,
   type WakeupScheduler,
+  type WakeupSchedulerDeps,
   type WakeupTimerHandle,
 } from '../skills/tools/schedule-wakeup.js';
 
@@ -37,8 +39,17 @@ export const NEXT_TUI_WAKEUP_IPC_ENV = 'ELANOUS_NEXT_TUI_WAKEUP_IPC';
 const CALL_TYPE = 'elanous.wakeup.call';
 const RESULT_TYPE = 'elanous.wakeup.result';
 const DEFAULT_CALL_TIMEOUT_MS = 15_000;
+/**
+ * TURN-FIELD-BUG-1: the parent answers within this, always — a slow handler gets an error answer while the child is
+ * still waiting (its own wait is {@link DEFAULT_CALL_TIMEOUT_MS}). Source: child wait 15s − 5s margin for IPC delivery.
+ */
+export const WAKEUP_ANSWER_CAP_MS = 10_000;
 
-export interface WakeupCallMessage { type: typeof CALL_TYPE; callId: string; args: Record<string, unknown> }
+export interface WakeupCallMessage {
+  type: typeof CALL_TYPE; callId: string; args: Record<string, unknown>;
+  /** Child clock when sent (ms) — the parent's `lagMs` (delivery + parent event-loop delay). */
+  sentAt?: number;
+}
 export interface WakeupResultMessage { type: typeof RESULT_TYPE; callId: string; result: unknown }
 
 export function isWakeupCallMessage(message: unknown): message is WakeupCallMessage {
@@ -51,16 +62,61 @@ function isWakeupResultMessage(message: unknown): message is WakeupResultMessage
   return !!m && m.type === RESULT_TYPE && typeof m.callId === 'string';
 }
 
-/** 부모 쪽: 자식의 호출 한 건을 클래식 도구 handler 로 풀어 답 메시지를 만든다(던지면 오류 결과). */
-export async function answerWakeupCall(tool: LLMToolDef, message: WakeupCallMessage): Promise<WakeupResultMessage> {
+export interface WakeupAnswerOptions {
+  readonly capMs?: number;
+  readonly now?: () => number;
+  /** `turn-life:wakeup-call-received` · `:wakeup-call-answered` (default emitTurnLife · fail-open). */
+  readonly turnLifeLog?: (event: string, data: Record<string, unknown>) => void;
+}
+
+/**
+ * 부모 쪽: 자식의 호출 한 건을 클래식 도구 handler 로 풀어 답 메시지를 만든다. Never rejects: a throw, a rejection or a
+ * handler slower than `capMs` is an error result (TURN-FIELD-BUG-1 — an unanswered call left the child waiting 15s).
+ */
+export async function answerWakeupCall(tool: LLMToolDef, message: WakeupCallMessage, opts: WakeupAnswerOptions = {}): Promise<WakeupResultMessage> {
+  const now = opts.now ?? Date.now;
+  const life = (event: string, data: Record<string, unknown>): void => {
+    try { (opts.turnLifeLog ?? emitTurnLife)(event, data); } catch { /* observability is fail-open */ }
+  };
+  const receivedAt = now();
+  const lagMs = typeof message.sentAt === 'number' ? Math.max(0, receivedAt - message.sentAt) : null;
+  const action = typeof message.args?.action === 'string' ? message.args.action : 'schedule';
+  life('turn-life:wakeup-call-received', { callId: message.callId, action, lagMs });
+  const capMs = opts.capMs ?? WAKEUP_ANSWER_CAP_MS;
+  let outcome: 'ok' | 'error' | 'timeout' = 'ok';
   let result: unknown;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // 클래식 handler 는 ctx 를 안 본다 — 대시보드도 같은 handler 를 플러그인 문맥 없이 부른다.
-    result = await tool.handler(message.args, {} as PluginContext);
+    const capped = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), capMs); });
+    const raced = await Promise.race([Promise.resolve().then(() => tool.handler(message.args, {} as PluginContext)), capped]);
+    if (raced === 'timeout') {
+      outcome = 'timeout';
+      result = { error: `${SCHEDULE_WAKEUP_TOOL_NAME}: the TUI did not finish within ${capMs}ms — run action:'list' before retrying (it may still be scheduled)` };
+    } else {
+      result = raced;
+      if (result && typeof result === 'object' && 'error' in result) outcome = 'error';
+    }
   } catch (error) {
+    outcome = 'error';
     result = { error: `ScheduleWakeup failed: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
+  life('turn-life:wakeup-call-answered', { callId: message.callId, action, result: outcome, ms: now() - receivedAt, lagMs });
   return { type: RESULT_TYPE, callId: message.callId, result };
+}
+
+/** The parent's IPC branch: answer, and send — every path sends exactly one reply (a send failure = the child exited). */
+export function replyToWakeupCall(tool: LLMToolDef, message: WakeupCallMessage, send: (reply: WakeupResultMessage) => unknown,
+  opts: WakeupAnswerOptions = {}): Promise<void> {
+  const fallback = (error: unknown): WakeupResultMessage => ({ type: RESULT_TYPE, callId: message.callId,
+    result: { error: `ScheduleWakeup failed: ${error instanceof Error ? error.message : String(error)}` } });
+  let answered: Promise<WakeupResultMessage>;
+  try { answered = answerWakeupCall(tool, message, opts); } catch (error) { answered = Promise.resolve(fallback(error)); }
+  return answered.catch(fallback).then((reply) => {
+    try { send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
+  });
 }
 
 /** 자식이 쓰는 IPC 구멍 — `process` 의 그 부분만(시험이 같은 함수에 가짜를 넘긴다). */
@@ -90,11 +146,21 @@ export function createReplWakeupTool(
   const { name, description, parameters } = buildScheduleWakeupHostTool(SPEC_ONLY_SCHEDULER);
   const timeoutMs = opts.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
   const waiting = new Map<string, (result: unknown) => void>();
+  /** callId → when it timed out: a reply after that is late (the wakeup may exist although the model saw an error). */
+  const timedOut = new Map<string, number>();
   let seq = 0;
   const listener = (message: unknown): void => {
     if (!isWakeupResultMessage(message)) return;
     const resolve = waiting.get(message.callId);
-    if (!resolve) return;
+    if (!resolve) {
+      const at = timedOut.get(message.callId);
+      if (at !== undefined) {
+        timedOut.delete(message.callId);
+        emitTurnLife('turn-life:wakeup-call-late', { callId: message.callId, lateMs: Date.now() - at,
+          result: message.result && typeof message.result === 'object' && 'error' in message.result ? 'error' : 'ok' });
+      }
+      return;
+    }
     waiting.delete(message.callId);
     resolve(message.result);
   };
@@ -105,11 +171,12 @@ export function createReplWakeupTool(
       const callId = `c${++seq}`;
       const timer = setTimeout(() => {
         if (!waiting.delete(callId)) return;
-        resolve({ error: `${SCHEDULE_WAKEUP_TOOL_NAME}: next TUI did not answer` });
+        timedOut.set(callId, Date.now());
+        resolve({ error: `${SCHEDULE_WAKEUP_TOOL_NAME}: next TUI did not answer within ${timeoutMs}ms — it may still schedule this; run action:'list' before retrying` });
       }, timeoutMs);
       waiting.set(callId, (result) => { clearTimeout(timer); resolve(result); });
       try {
-        send({ type: CALL_TYPE, callId, args } satisfies WakeupCallMessage);
+        send({ type: CALL_TYPE, callId, args, sentAt: Date.now() } satisfies WakeupCallMessage);
       } catch (error) {
         waiting.delete(callId);
         clearTimeout(timer);
@@ -148,8 +215,12 @@ export interface NextTuiWakeupDeps {
   lastHumanKeyAt?: () => number;
   pendingKeyCount?: () => number;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  /** OBSERVE-TURN-EVENT-LIFECYCLE — turn-life observation hook (fail-open). */
+  turnLifeLog?: (event: string, data: Record<string, unknown>) => void;
   /** 세션 파일 영속(재기동 복원). 하니스 자식(무인 런)은 받아도 쓰지 않는다 — 도구도 싣지 않는다. */
   persist?: WakeupPersistence;
+  /** TURN-CAPSULE-EVENTS R1(C4) — 버스 원천 어댑터(schedule-wakeup.ts:219) 포워드. 없으면 옛길(스케줄러 자체 큐) 그대로. 생산 배선은 entry.ts 몫. */
+  publishEvent?: WakeupSchedulerDeps['publishEvent'];
   /** Built-in self-retro (SEAT-ROLE-CARD device 2): opens an origin-'retro' turn on this same door every `intervalMin` minutes. 0 = off. */
   retro?: { readonly seat: string; readonly intervalMin: number; readonly store: SeatRetroStateStore };
 }
@@ -181,6 +252,8 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
   const env = deps.env ?? process.env;
   const acceleratedTestClock = env.ELANOUS_TEST_FAKE_LLM === '1'
     && env.ELANOUS_TEST_FAST_WAKEUP_CLOCK === '1';
+  // OBSERVE-TURN-EVENT-LIFECYCLE — next 문·스케줄러 관측 주입(기본: debug 직접 방출).
+  const turnLifeLog = deps.turnLifeLog ?? emitTurnLife;
   const gate = createInternalTurnGate({
     isTurnRunning: deps.isTurnRunning,
     ...(deps.isInputForeground ? { isInputForeground: deps.isInputForeground } : {}),
@@ -194,6 +267,7 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     ...(deps.lastHumanKeyAt ? { lastHumanKeyAt: deps.lastHumanKeyAt } : {}),
     ...(deps.pendingKeyCount ? { pendingKeyCount: deps.pendingKeyCount } : {}),
     ...(deps.log ? { log: deps.log } : {}),
+    turnLifeLog,
     ...(deps.pacing ? { pacing: deps.pacing } : {}),
   });
   gate.port.attach(deps.requestYield);
@@ -203,6 +277,7 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
     ...(deps.setTimer ? { setTimer: deps.setTimer } : {}),
     ...(deps.clearTimer ? { clearTimer: deps.clearTimer } : {}),
     ...(deps.log ? { log: deps.log } : {}),
+    ...(deps.publishEvent ? { publishEvent: deps.publishEvent } : {}),
     ...(deps.persist && !env.ELANOUS_HARNESS_ROLE?.trim() ? { persist: deps.persist } : {}),
   });
   const tool = env.ELANOUS_HARNESS_ROLE?.trim() ? null : buildScheduleWakeupHostTool(scheduler);
@@ -276,6 +351,8 @@ export function createNextTuiWakeup(deps: NextTuiWakeupDeps): NextTuiWakeup {
         return null;
       }
       const request = gate.takePending();
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 문에서 꺼낸 내부 턴(enqueue 시각이 없어 waitMs 생략 · boundary idle).
+      if (request !== null) { try { turnLifeLog('turn-life:event-dequeued', { itemId: request.turnId, source: request.origin, boundary: 'idle' }); } catch { /* observability is fail-open */ } }
       if (request?.origin === 'msg-wake') mailWake?.confirmDelivery();
       if (request) settleSeatCap(request.turnId, true);
       return request;

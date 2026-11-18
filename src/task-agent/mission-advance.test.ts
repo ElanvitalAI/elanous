@@ -75,7 +75,7 @@ test('postland auto advance rechecks MERGED evidence and launches successor exac
   prepareLiveDiamond(path, id);
   recordPieceRef(`${id}-1`, { pr: 101 }, path);
   const calls: string[][] = [];
-  const launcher = (args: string[]) => { calls.push(args); };
+  const launcher = (args: string[], _cwd?: string, launchContext?: { runId: string }) => { calls.push(args); return { runId: launchContext?.runId }; };
   const pending = await advanceLandedPieceMission(`${id}-1`, { statePath: path, launcher, readEvidence: fakePrs({ 101: 'open' }) });
   expect(pending?.handed).toEqual([]);
   expect(calls).toHaveLength(0);
@@ -96,7 +96,7 @@ test('verified train receipt advances successors even when component PR is CLOSE
   } }));
   const calls: string[][] = [];
   const result = await advanceLandedPieceMission(`${id}-1`, { statePath: path,
-    launcher: (args) => { calls.push(args); }, readEvidence: fakePrs({ 101: 'closed' }) });
+    launcher: (args, _cwd, launchContext) => { calls.push(args); return { runId: launchContext?.runId }; }, readEvidence: fakePrs({ 101: 'closed' }) });
   expect(result?.evidence[`${id}-1`]).toBe('merged');
   expect(calls).toHaveLength(2);
 });
@@ -127,11 +127,11 @@ test('--live — 새로 준비된 조각만 발사기 한 번 · shadow 로 넘�
   const prs = fakePrs({ 101: 'merged' });
   await advanceMission(id, { statePath: path, readEvidence: prs }); // shadow 먼저
   const calls: string[][] = [];
-  const live = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args) => { calls.push(args); } });
+  const live = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args, _cwd, launchContext) => { calls.push(args); return { runId: launchContext?.runId }; } });
   expect(calls.map((args) => args.at(-1))).toEqual([`two${doneBoundary}`, `three${doneBoundary}`]);
   expect(live.handed.every((piece) => piece.launched)).toBe(true);
   expect(readTaskCard(`${id}-2`, path)).toMatchObject({ status: 'launched', handed: { mode: 'live' }, mission: id, after: [`${id}-1`] });
-  const again = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args) => { calls.push(args); } });
+  const again = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (args, _cwd, launchContext) => { calls.push(args); return { runId: launchContext?.runId }; } });
   expect(again.handed).toEqual([]);
   expect(calls).toHaveLength(2);
 });
@@ -146,7 +146,7 @@ test('발사 실패 — 그 조각은 launch-failed ⊕ 표지에 사유 · 다�
   expect(failed.handed.find((piece) => piece.pieceId === `${id}-2`)?.error).toContain('boom');
   expect(readTaskCard(`${id}-2`, path)).toMatchObject({ status: 'launch-failed', handed: { mode: 'live', error: expect.stringContaining('boom') } });
   let calls = 0;
-  const again = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: () => { calls++; } });
+  const again = await advanceMission(id, { statePath: path, readEvidence: prs, live: true, launcher: (_args, _cwd, launchContext) => { calls++; return { runId: launchContext?.runId }; } });
   expect(again.handed).toEqual([]);
   expect(calls).toBe(0);
 });
@@ -194,7 +194,7 @@ test('모두 착지 → green 제안을 미션 카드에 한 번 · 체크리스
   try {
     const prs = fakePrs({ 1: 'merged', 2: 'merged', 3: 'merged', 4: 'merged' });
     let launches = 0;
-    const done = await advanceMission(id, { statePath: path, readEvidence: prs, launcher: () => { launches++; } });
+    const done = await advanceMission(id, { statePath: path, readEvidence: prs, launcher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } });
     expect(done.green).toBe('proposed');
     expect(done.handed).toEqual([]); // 이미 착지한 조각은 넘기지 않는다
     expect(launches).toBe(0);
@@ -284,7 +284,7 @@ test('늦게 끝난 shadow 넘김은 live 표지를 덮지 않는다 — claim �
   // 그 뒤 live advance 는 다시 발사하지 않는다.
   recordPieceRef(`${id}-1`, { pr: 9 }, path);
   let calls = 0;
-  const live = await advanceMission(id, { statePath: path, readEvidence: fakePrs({ 9: 'merged' }), live: true, launcher: () => { calls++; } });
+  const live = await advanceMission(id, { statePath: path, readEvidence: fakePrs({ 9: 'merged' }), live: true, launcher: (_args, _cwd, launchContext) => { calls++; return { runId: launchContext?.runId }; } });
   expect(live.handed.map((piece) => piece.pieceId)).toEqual([`${id}-3`]);
   expect(calls).toBe(1);
 });
@@ -321,7 +321,7 @@ test('조회 도중 근거가 바뀌면 green 을 제안하지 않는다 · clai
   recordPieceRef(`${two.mission.id}-1`, { pr: 1 }, path2);
   await advanceMission(two.mission.id, {
     statePath: path2, readEvidence: fakePrs({ 1: 'merged' }), live: true,
-    launcher: () => { recordPieceRef(`${two.mission.id}-2`, { pr: 77 }, path2); },
+    launcher: (_args, _cwd, launchContext) => { recordPieceRef(`${two.mission.id}-2`, { pr: 77 }, path2); return { runId: launchContext?.runId }; },
   });
   expect(readTaskCard(`${two.mission.id}-2`, path2)).toMatchObject({ status: 'launched', pr: 77, handed: { mode: 'live' } });
 });
@@ -352,7 +352,7 @@ test('발사 중 근거 정정(PR → 골 id) — 넘김 쓰기가 옛 PR 을 �
     text: 'b', id: b, mission: mission.id, after: [a], landed: new Set([a]), statePath: path, live: true,
     cardFields: { pr: 50, handed: { at: 't', mode: 'live', claim: 'c1' } },
     writeGuard: () => true,
-    launcher: () => { updateTaskCard(path, b, (current) => { const { pr: _p, ...rest } = current!; return { ...rest, goalId: 'abcdef0123456789' }; }); },
+    launcher: (_args, _cwd, launchContext) => { updateTaskCard(path, b, (current) => { const { pr: _p, ...rest } = current!; return { ...rest, goalId: 'abcdef0123456789' }; }); return { runId: launchContext?.runId }; },
   });
   const card = readTaskCard(b, path)!;
   expect(card.status).toBe('launched');
@@ -369,7 +369,7 @@ test('green 제안 뒤 재조회 실패에도 넘김 0 · 자기 근거가 있�
   expect((await advanceMission(mission.id, { statePath: path, readEvidence: fakePrs({ 1: 'merged', 2: 'merged' }) })).green).toBe('proposed');
   let calls = 0;
   const flaky = fakePrs({ 1: 'merged' }); // 2 는 조회 실패(pending)
-  const after = await advanceMission(mission.id, { statePath: path, readEvidence: flaky, live: true, launcher: () => { calls++; } });
+  const after = await advanceMission(mission.id, { statePath: path, readEvidence: flaky, live: true, launcher: (_args, _cwd, launchContext) => { calls++; return { runId: launchContext?.runId }; } });
   expect(after).toMatchObject({ green: 'already-proposed', handed: [] });
   expect(calls).toBe(0);
   expect(flaky.calls).toEqual([]); // 조회도 안 한다
@@ -379,7 +379,7 @@ test('green 제안 뒤 재조회 실패에도 넘김 0 · 자기 근거가 있�
   const two = await handMission({ text: '- a\n- b (after: 1)', statePath: path2 });
   recordPieceRef(`${two.mission.id}-1`, { pr: 1 }, path2);
   recordPieceRef(`${two.mission.id}-2`, { pr: 2 }, path2);
-  const pending = await advanceMission(two.mission.id, { statePath: path2, readEvidence: fakePrs({ 1: 'merged' }), live: true, launcher: () => { calls++; } });
+  const pending = await advanceMission(two.mission.id, { statePath: path2, readEvidence: fakePrs({ 1: 'merged' }), live: true, launcher: (_args, _cwd, launchContext) => { calls++; return { runId: launchContext?.runId }; } });
   expect(pending.handed).toEqual([]);
   expect(pending.skipped).toContain(`${two.mission.id}-2`);
   expect(calls).toBe(0);

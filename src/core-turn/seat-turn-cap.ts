@@ -22,6 +22,50 @@ export const SEAT_TURN_CAP_DEFAULTS: SeatTurnCapConfig = {
   idleEmptyMsgListLimit: 2,
 };
 
+// ELN-SEAT-TURN-CAP-CONTINUE — 구현 손(eln 자리)은 같은 일을 여러 턴에 걸쳐 잇는다.
+// 운영 자리(claude-code·codex·미선언)는 기본 상한 그대로. idle «할 일 0» 판정은 역할과 무관하게 유지.
+export type SeatTurnCapRole = 'implementer' | 'operator';
+
+export const IMPLEMENTER_SEAT_TURN_CAP: Pick<SeatTurnCapConfig, 'maxTools' | 'maxWallMs'> = {
+  maxTools: 180,
+  maxWallMs: 45 * 60_000,
+};
+
+/** 레지스트리 runtime. eln 만 구현 손. 없거나 다른 값이면 운영 자리. */
+export function seatTurnCapRole(runtime: string | undefined): SeatTurnCapRole {
+  return runtime === 'eln' ? 'implementer' : 'operator';
+}
+
+/** 자리 이름의 레지스트리 runtime. 읽기 실패·없음은 undefined(= 운영 상한). 파일 읽기는 호출자가 넘긴다. */
+export function seatRegistryRuntime(
+  seat: string,
+  read: (seat: string) => string | undefined,
+): string | undefined {
+  try { return read(seat); }
+  catch { return undefined; }
+}
+
+/** 역할 상한을 override 보다 먼저 깔고, 명시 override 가 있으면 그 칸만 이긴다. idle 칸은 역할이 안 바꾼다. */
+export function resolveSeatTurnCapForRole(
+  runtime: string | undefined,
+  override: Partial<SeatTurnCapConfig> | undefined,
+): SeatTurnCapConfig {
+  const roleCap = seatTurnCapRole(runtime) === 'implementer' ? IMPLEMENTER_SEAT_TURN_CAP : {};
+  return resolveSeatTurnCap({ ...roleCap, ...(override ?? {}) });
+}
+
+/** 재개 우편에 실을 체크포인트. 빈 요약은 넣지 않는다(다음 턴이 «처음부터»로 읽지 않게). */
+export const SEAT_CAP_CHECKPOINT_MAX_CHARS = 1500;
+
+export function seatCapCheckpoint(finalText: string): string {
+  const trimmed = finalText.trim();
+  if (!trimmed) return '';
+  const clipped = trimmed.length > SEAT_CAP_CHECKPOINT_MAX_CHARS
+    ? `${trimmed.slice(0, SEAT_CAP_CHECKPOINT_MAX_CHARS)}…`
+    : trimmed;
+  return `\n[CHECKPOINT]\n${clipped}`;
+}
+
 function positiveInt(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }

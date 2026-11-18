@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { join } from 'node:path';
 import type { GraphRunState } from './runner-types.js';
 import { KNOWN_ISSUE_ROUTE } from './release-known-issue-waiver.js';
@@ -58,7 +59,7 @@ export function assertSignedT6PwaBranchWaiver(state: GraphRunState, root: string
       JSON.stringify(output.cells?.filter((cell) => cell.final === 'fail').map((cell) => cell.id).sort()) !== JSON.stringify(['N1', 'N5a', 'N6a']) ||
       output.cells?.filter((cell) => cell.final === 'fail').some((cell) => JSON.stringify(cell.reruns) !== JSON.stringify(['fail', 'fail'])))
     throw new Error('PWA known-issue waiver requires the exact saved failed cells and retries');
-  const seatState = root === join(homedir(), '.elanous') ? join(homedir(), 'elanous-hq', 'seat-state') : join(root, 'seat-state');
+  const seatState = root === prodInstanceRoot() ? join(homedir(), 'elanous-hq', 'seat-state') : join(root, 'seat-state');
   const document = readFileSync(join(seatState, 'OP/evidence/20261113/T6-PWA-KNOWN-ISSUE-OP.md'));
   const signature = readFileSync(join(seatState, 'JUD/evidence/doorbell-30984/T6-PWA-JUD-confirmation.json'));
   const paired = readFileSync(join(seatState, 'REL/evidence/T6-PWA-PAIR-0314-1335/paired.log'));

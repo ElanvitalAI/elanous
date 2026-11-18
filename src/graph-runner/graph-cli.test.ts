@@ -515,19 +515,31 @@ publish:
     const program = new Command();
     program.exitOverride();
     registerGraphCommands(program, { root: stateRoot, graphRoots: [graphRoot], runBash });
-    await program.parseAsync(['node', 'test', 'graph', 'approve', 'release-loop', waiting.runId,
-      ...(reject ? ['--reject'] : [])]);
+    // The registered action reports a rejection through process.exitCode; capture it and restore
+    // (`?? 0`: Bun keeps a set exit code when undefined is assigned) so it cannot fail the whole file.
+    const previousExitCode = process.exitCode;
+    let exitCode: number | string | undefined;
+    process.exitCode = 0;
+    try {
+      await program.parseAsync(['node', 'test', 'graph', 'approve', 'release-loop', waiting.runId,
+        ...(reject ? ['--reject'] : [])]);
+    } finally {
+      exitCode = process.exitCode;
+      process.exitCode = previousExitCode ?? 0;
+    }
     const final = JSON.parse(readFileSync(waiting.statePath, 'utf8'));
     const laterFinal = JSON.parse(readFileSync(laterWaiting.statePath, 'utf8'));
-    return { final, laterFinal, commands };
+    return { final, laterFinal, commands, exitCode };
   };
 
   const approved = await exercise(false);
+  expect(approved.exitCode).toBe(0);
   expect(approved.final).toMatchObject({ status: 'done', path: expect.arrayContaining(['approve-publish', 'publish']) });
   expect(approved.laterFinal.status).toBe('awaiting-approval');
   expect(approved.commands).toContain('bun scripts/release-loop/publish-node.ts');
 
   const rejected = await exercise(true);
+  expect(rejected.exitCode).toBe(1);
   expect(rejected.final).toMatchObject({ status: 'failed', path: expect.arrayContaining(['approve-publish', 'traffic-failed-restore']) });
   expect(rejected.laterFinal.status).toBe('awaiting-approval');
   expect(rejected.commands).toContain('bun scripts/release-loop/traffic-node.ts traffic-failed-restore');

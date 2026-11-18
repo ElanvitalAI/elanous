@@ -17,7 +17,10 @@ export function nextSlashCandidates(
   // TUI-SLASH-TEXT-KOREAN-AND-RESIDUE: one row per route; aliases (/clear, /st, /mem …) ride along.
   const grouped: { text: string; name: string; aliases: string[]; summary: string; spellings: string[] }[] = [];
   const seen = new Set<string>();
-  for (const route of routes) {
+  // An empty query lists everything in registry order, and the first row is what Enter runs. Quit must not be that default:
+  // routes whose action is 'quit' come last (structural `action`, not a command name). A typed query still ranks by score.
+  const ordered = [...routes.filter((route) => route.action !== 'quit'), ...routes.filter((route) => route.action === 'quit')];
+  for (const route of ordered) {
     const spellings = [...route.slash, ...route.slashPrefixes]
       .filter((text) => !text.includes(' ') && !seen.has(text) && resolve(text, context) === route);
     if (spellings.length === 0) continue;

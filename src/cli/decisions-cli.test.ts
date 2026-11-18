@@ -13,7 +13,7 @@ import type { HqDeps } from '../hq/hq.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPendingQuestion, writePendingQuestion } from '../ask-user-question/pending-questions.js';
-import { registerDecisionsCommands } from './decisions-cli.js';
+import { HUMAN_DECIDE_REFUSED, isHumanTerminal, registerDecisionsCommands } from './decisions-cli.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
 
@@ -31,7 +31,7 @@ test('seat-loop CLI raise retains full judgment material, Q/A and recommendation
   const stateDir = root();
   const lines: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const base = ['raise', '--agent', 'seat-loop', '--title', '반복 정지', '--category', 'other', '--s', '칸 반복', '--c', '착지 없음',
     '--q', '계속할까?', '--a', '멈춘다', '--pending-question', '무엇: 칸 반복\n근거: 원장\n무엇이 바뀌나: 선택한 경로가 적용됨\n기본값 시 결과: 멈춘 상태 유지\n지금까지: 3회\n지금 상태 재측: yellow\n그냥 두면: 중복',
@@ -61,7 +61,7 @@ test('CLI records delegated decisions and the owner reads overnight seat report 
   const stateDir = root();
   const lines: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, now: () => new Date('2026-10-04T23:00:00Z'), resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, now: () => new Date('2026-10-04T23:00:00Z'), resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   try {
     const first = JSON.parse(run('record-seat', '--seat', 'OP', '--title', '예산 막힘', '--decision', '크레딧으로 풀기',
@@ -98,7 +98,7 @@ test('CLI cross-check, shadow warning, strict config and alternative validation'
   console.error = (line: string) => { errors.push(line); };
   setElanousConfigDir(stateDir);
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
   expect(program.commands.find(command => command.name() === 'decisions')!.commands.find(command => command.name() === 'raise')!
     .options.find(option => option.long === '--no-xcheck')!.negate).toBe(false);
   const flags = ['raise', '--agent', 'OP', '--title', '피치', '--category', 'scope', '--s', '상황', '--c', '문제', '--q', '질문', '--a', '제안', ...judgmentArgs,
@@ -147,7 +147,7 @@ test('isolated decisions CLI skips adjudication and records the write target', (
   const raise = ['raise', '--agent', 'codex', '--title', 'Isolated?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
   try {
     setElanousConfigDir(stateDir);
-    registerDecisionsCommands(cli, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
+    registerDecisionsCommands(cli, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
     cli.parse(['decisions', ...withJudgment(raise), '--hq-override'], { from: 'user' });
     const entry = JSON.parse(lines.at(-1)!);
     cli.parse(['decisions', 'decide', entry.id, 'a', '--json'], { from: 'user' });
@@ -173,7 +173,7 @@ test('decision ledger outside the instance universe retains the HQ fence and obs
   const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
   try {
     setElanousConfigDir(instanceRoot);
-    registerDecisionsCommands(cli, { stateDir: outsideRoot, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
+    registerDecisionsCommands(cli, { humanTerminal: () => true, stateDir: outsideRoot, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
     expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
     process.exitCode = 0;
     cli.parse(['decisions', ...withJudgment(raise)], { from: 'user' });
@@ -196,7 +196,7 @@ test('raise requires all judgment fields and routes seat proposals to the OP inb
   const errors: string[] = [];
   const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
   const cli = new Command();
-  registerDecisionsCommands(cli, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  registerDecisionsCommands(cli, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
   const base = ['raise', '--agent', 'UX', '--title', 'Recommend a path', '--category', 'scope', '--s', 'Situation', '--c', 'Complication',
     '--q', 'Which path?', '--a', 'Use path A', '--option', 'a=Proceed:Apply', '--option', 'b=Wait:Pause', '--recommend', 'a', '--why', 'Safer', '--json'];
   const oldSeat = process.env.ELANOUS_SEAT;
@@ -286,7 +286,7 @@ test('decisions CLI fences raise/decide at generation, permits observed override
   const oldError = console.error;
   console.error = (line: string) => { errors.push(line); };
   const cli = new Command();
-  registerDecisionsCommands(cli, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot }, { log: (s) => lines.push(s) }, hq);
+  registerDecisionsCommands(cli, { humanTerminal: () => true, stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot }, { log: (s) => lines.push(s) }, hq);
   const run = (...args: string[]) => { lines.length = 0; cli.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]; };
   const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
   try {
@@ -320,7 +320,7 @@ test('CLI raises, filters, shows and records human/AUTO decisions; validation er
   const repoRoot = emptyGitRepo(join(stateDir, 'repo'));
   const lines: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot }, { log: s => lines.push(s) });
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, releaseRoot: join(stateDir, 'missing'), repoRoot }, { log: s => lines.push(s) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const raise = ['raise', '--agent', 'codex', '--title', 'Publish?', '--category', 'publish', '--s', 'Draft exists.', '--c', 'Decision needed.', '--option', 'a=Publish:Public', '--option', 'b=Hold:Private', '--skip-recommend', 'Research takes time', '--json'];
   const entry = JSON.parse(run(...raise));
@@ -340,7 +340,7 @@ test('CLI resume flags round-trip and decide invokes the injected writer; run al
   const lines: string[] = [];
   const calls: unknown[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }),
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }),
     writeAnswer: answer => { calls.push(answer); } }, { log: value => lines.push(value) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const flags = ['raise', '--agent', 'codex', '--title', 'Publish?', '--category', 'publish', '--s', 'Draft.', '--c', 'Decision.',
@@ -365,7 +365,7 @@ test('CLI reports durable decision with failed delivery and can retry only the a
   const calls: unknown[] = [];
   let available = false;
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }),
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }),
     writeAnswer: answer => { if (!available) throw new Error('temporary'); calls.push(answer); } }, { log: value => lines.push(value) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const entry = JSON.parse(run('raise', '--agent', 'codex', '--title', 'Publish?', '--category', 'publish', '--s', 'Draft.', '--c', 'Decision.',
@@ -393,7 +393,7 @@ test('unknown actor is never silently attributed to elanous; historical options 
   const stateDir = root();
   const lines: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: '0.2.5', dev: '0.2.6-dev.0', codename: null }) }, { log: s => lines.push(s) });
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: '0.2.5', dev: '0.2.6-dev.0', codename: null }) }, { log: s => lines.push(s) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const oldAgent = process.env.AI_AGENT;
   try {
@@ -422,7 +422,11 @@ test('isolated CLI helper raises and decides a pending question', async () => {
     { label: 'Accept', description: 'Expand' }, { label: 'Decline', description: 'Keep' },
   ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
   expect(readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8')).toContain(id);
-  const decided = await simCli(['--test', stateDir, 'decisions', 'decide', id, 'a', '--json'], {
+  // PR-1: a child process is not a person's terminal — the human decide is refused; the delegated decide still delivers.
+  const refused = await simCli(['--test', stateDir, 'decisions', 'decide', id, 'a', '--json'], { allowPaths: [['decisions']], stateRoot: stateDir });
+  expect(refused.exitCode).not.toBe(0);
+  expect(refused.stderr).toContain('사람 결정은 사람의 터미널에서만 기록한다');
+  const decided = await simCli(['--test', stateDir, 'decisions', 'decide', id, 'a', '--auto', '--agent', 'codex', '--delegation', 'CLI child test', '--json'], {
     allowPaths: [['decisions']], stateRoot: stateDir,
   });
   expect(decided.exitCode, decided.stderr.slice(0, 500)).toBe(0);
@@ -478,7 +482,7 @@ test('CLI decide with no pending question at all reports the failed delivery and
   const stateDir = root();
   const lines: string[] = [];
   const program = new Command();
-  registerDecisionsCommands(program, { stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: value => lines.push(value) });
+  registerDecisionsCommands(program, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: value => lines.push(value) });
   const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
   const entry = JSON.parse(run('raise', '--agent', 'codex', '--title', 'Scope?', '--category', 'scope', '--s', 'S.', '--c', 'C.',
     '--option', 'a=Small:Less', '--option', 'b=Large:More', '--recommend', 'a', '--why', 'safer', '--resume-question', 'auq:qmissing:abcde', '--run', 'run-x', '--json'));
@@ -489,4 +493,24 @@ test('CLI decide with no pending question at all reports the failed delivery and
   expect(out).toMatchObject({ status: 'decided', choice: 'b', delivery: { ok: false, questionId: 'auq:qmissing:abcde' } });
   const events = readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   expect(events.filter((event: { type: string }) => event.type === 'decided')).toHaveLength(1);
+});
+
+test('DECISION-LEDGER-HUMAN-AUTH PR-1 — CLI human decide only from a person\'s terminal; --auto still works; via=cli', () => {
+  expect([isHumanTerminal({}, true), isHumanTerminal({ ELANOUS_SEAT: 'TC-H-CC-3' }, true), isHumanTerminal({}, false), isHumanTerminal({ ELANOUS_SEAT: '  ' }, true)])
+    .toEqual([true, false, false, true]);
+  const stateDir = root();
+  let terminal = false;
+  const lines: string[] = [];
+  const program = new Command();
+  registerDecisionsCommands(program, { humanTerminal: () => terminal, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: line => lines.push(line) });
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['decisions', ...withJudgment(args)], { from: 'user' }); return lines[0]!; };
+  try {
+    const raise = (title: string) => JSON.parse(run('raise', '--agent', 'codex', '--title', title, '--category', 'scope', '--s', 'S.', '--c', 'C.', '--option', 'a=Yes:Go', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json')).id;
+    const seatSide = raise('seat side');
+    expect(() => run('decide', seatSide, 'a', '--json')).toThrow(HUMAN_DECIDE_REFUSED);
+    expect(new DecisionLedger({ stateDir }).show(seatSide).status).toBe('open');
+    expect(JSON.parse(run('decide', seatSide, 'a', '--auto', '--agent', 'codex', '--delegation', 'TC 위임', '--json')).decidedBy).toMatchObject({ kind: 'auto', agent: 'codex' });
+    terminal = true;
+    expect(JSON.parse(run('decide', raise('person'), 'b', '--json')).decidedBy).toEqual({ kind: 'human', via: 'cli' });
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });

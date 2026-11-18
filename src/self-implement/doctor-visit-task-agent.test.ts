@@ -28,8 +28,8 @@ test('TA card transition writes a visit after the card update, then retries do n
   const { card } = await handTask({ text: 'repair run', live: true, statePath: path,
     launcher: (_args, _cwd, context) => ({ runId: context!.runId }) });
   const runId = card.runId!;
-  const fail = (current: typeof card | undefined) => current?.status === 'launched' && ({ ...current, status: 'failed' as const,
-    history: [...current.history, { at: transition.at, event: 'failed', detail: transition.reason, runId }] });
+  const fail = (current: typeof card | undefined) => current?.status === 'launched' ? ({ ...current, status: 'failed' as const,
+    history: [...current.history, { at: transition.at, event: 'failed', detail: transition.reason, runId }] }) : undefined;
   updateTaskCard(path, card.id, fail, { doctorLedgerDir: dir });
   expect(loadRunLedger(runId, dir)).toBeNull();
   appendRunLedgerEntry({ runId, timestamp: transition.at, event: 'start', data: {} }, dir);

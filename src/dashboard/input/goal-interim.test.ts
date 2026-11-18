@@ -12,7 +12,7 @@ const NOT_DONE = '1단계 렌더를 진행했습니다.\n완료 영상 경로는
 describe('goal-interim: internal turn text', () => {
   test('the three internal-turn formatters are recognized by their prefix (drift guard)', () => {
     expect(internalTurnOriginOfText(formatGoalContinuePrompt('하겠습니다'))).toBe('goal-continue');
-    expect(internalTurnOriginOfText(formatAgentWakePrompt({ agentName: 'general-purpose', label: 'pr-review', state: 'done' }))).toBe('child-complete');
+    expect(internalTurnOriginOfText(formatAgentWakePrompt({ taskId: 't1', agentName: 'general-purpose', label: 'pr-review', state: 'done' }))).toBe('child-complete');
     expect(internalTurnOriginOfText(formatSeatAutowakePrompt('OPC', 1, 0))).toBe('autowake');
   });
 
@@ -36,9 +36,9 @@ describe('goal-interim: interim reply verdict', () => {
   });
 
   test('the fold line is one line and cut to 60 characters', () => {
-    expect(formatInterimFoldLine('짧은 첫 줄')).toBe('· 진행 — 짧은 첫 줄 (접힘)');
+    expect(formatInterimFoldLine('짧은 첫 줄')).toBe('· in progress — 짧은 첫 줄 (folded)');
     const long = formatInterimFoldLine('가'.repeat(100));
-    expect(long).toBe(`· 진행 — ${'가'.repeat(60)}… (접힘)`);
+    expect(long).toBe(`· in progress — ${'가'.repeat(60)}… (folded)`);
   });
 });
 
@@ -53,7 +53,7 @@ describe('goal-interim: next plan', () => {
 
   test('the reply before a continuation folds, the last one stays, the internal input is its origin line', () => {
     const plan = planInterimDisplay(msgs);
-    expect(plan.get(1)).toEqual({ kind: 'folded', line: '· 진행 — 1단계 렌더를 진행했습니다. (접힘)' });
+    expect(plan.get(1)).toEqual({ kind: 'folded', line: '· in progress — 1단계 렌더를 진행했습니다. (folded)' });
     expect(plan.get(2)).toEqual({ kind: 'internal-input', origin: 'goal-continue' });
     expect(plan.has(3)).toBe(false);
     expect(countInterimDisplay(plan)).toEqual({ folded: 1, internal: 1 });
@@ -62,7 +62,7 @@ describe('goal-interim: next plan', () => {
   test('log view: no «나: [골 이어가기]», «not done» once, each step visible', () => {
     const screen = logViewLines(msgs, 100).join('\n');
     expect(screen).not.toContain('나: [골 이어가기]');
-    expect(screen).toContain('↻ 자동 재개(goal-continue)');
+    expect(screen).toContain('↻ Continuing');
     expect(screen.split('보고할 수 없습니다').length - 1).toBe(1);
     expect(screen.split('단계 렌더를 진행했습니다').length - 1).toBe(2);
   });
@@ -73,10 +73,10 @@ describe('goal-interim: next plan', () => {
       { role: 'assistant' as const, content: NOT_DONE.replace('1단계', '2단계'), goalInterim: true, ts },
       { role: 'assistant' as const, content: '완료 영상: /tmp/final.mp4', ts }];
     const screen = logViewLines(sequence, 100).join('\n');
-    expect(screen.match(/· 진행 —/g)).toHaveLength(2);
+    expect(screen.match(/· in progress —/g)).toHaveLength(2);
     expect(screen).not.toContain('보고할 수 없습니다');
     expect(screen).toContain('완료 영상: /tmp/final.mp4');
-    expect(screen).toContain('도구: ScheduleWakeup');
+    expect(screen).toContain('Tool: ScheduleWakeup');
   });
 
   test('unrelated assistant replies without an internal continuation remain visible', () => {
@@ -100,7 +100,7 @@ describe('goal-interim: next plan', () => {
     const withTool = [...msgs, tool];
     const lines = logViewLines(withTool, 100);
     const [range] = toolFoldBlockRanges(withTool, 100);
-    expect(lines[range!.start]).toContain('▸ 도구 Bash');
+    expect(lines[range!.start]).toContain('▸ Tool Bash');
   });
 });
 
@@ -115,7 +115,7 @@ describe('goal-interim: classic fold', () => {
     fold.noteTurnEnded(chat, 1);
     chat.push('---');
     expect(fold.foldBeforeInternalTurn(chat, 'goal-continue')).toEqual({ folded: true, reason: 'incomplete' });
-    expect(chat).toEqual(['  ↻ 자동 재개(goal-continue)', '  · 진행 — 1단계 렌더를 진행했습니다. (접힘)', '---']);
+    expect(chat).toEqual(['  ↻ 자동 재개(goal-continue)', '  · in progress — 1단계 렌더를 진행했습니다. (folded)', '---']);
     expect(logs).toEqual([{ event: 'folded', data: { surface: 'classic', origin: 'goal-continue', reason: 'incomplete', lines: 3 } }]);
   });
 
@@ -129,7 +129,7 @@ describe('goal-interim: classic fold', () => {
     expect(fold.foldBeforeInternalTurn(chat, 'goal-continue').folded).toBe(true);
     chat.push('  최종 영상: /tmp/final.mp4');
     expect(chat).toEqual(['  ❯ n8n 영상 만들어줘', '  도구: ScheduleWakeup',
-      '  · 진행 — 1단계 렌더했습니다. (접힘)', '  · 진행 — 2단계 렌더했습니다. (접힘)', '  최종 영상: /tmp/final.mp4']);
+      '  · in progress — 1단계 렌더했습니다. (folded)', '  · in progress — 2단계 렌더했습니다. (folded)', '  최종 영상: /tmp/final.mp4']);
   });
 
   test('tool lines before the reply block stay — only the range from the reply start folds', () => {
@@ -137,7 +137,7 @@ describe('goal-interim: classic fold', () => {
     const chat = ['  ❯ 영상 만들어줘', '  ⏺ Bash(ls)', '    └ out.mp4 없음', '  1단계를 해 봤습니다.', '  아직 못 했습니다.'];
     fold.noteTurnEnded(chat, 3);
     expect(fold.foldBeforeInternalTurn(chat, 'goal-continue').folded).toBe(true);
-    expect(chat).toEqual(['  ❯ 영상 만들어줘', '  ⏺ Bash(ls)', '    └ out.mp4 없음', '  · 진행 — 1단계를 해 봤습니다. (접힘)']);
+    expect(chat).toEqual(['  ❯ 영상 만들어줘', '  ⏺ Bash(ls)', '    └ out.mp4 없음', '  · in progress — 1단계를 해 봤습니다. (folded)']);
   });
 
   test('real order: the «✔ 완료» line is pushed after the snapshot — the reply still folds and the done line stays', () => {
@@ -146,7 +146,7 @@ describe('goal-interim: classic fold', () => {
     fold.noteTurnEnded(chat, 1);
     chat.push('  ✔ 완료  (2s)', '  ⏸ 다른 알림');
     expect(fold.foldBeforeInternalTurn(chat, 'goal-continue')).toEqual({ folded: true, reason: 'incomplete' });
-    expect(chat).toEqual(['  ❯ 영상 만들어줘', '  · 진행 — 1단계 렌더를 진행했습니다. (접힘)', '  ✔ 완료  (2s)', '  ⏸ 다른 알림']);
+    expect(chat).toEqual(['  ❯ 영상 만들어줘', '  · in progress — 1단계 렌더를 진행했습니다. (folded)', '  ✔ 완료  (2s)', '  ⏸ 다른 알림']);
   });
 
   test('not folded: human turn between · scheduled origin · lines moved · unstable · final reply', () => {

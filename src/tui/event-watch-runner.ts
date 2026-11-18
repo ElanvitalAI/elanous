@@ -1,5 +1,6 @@
 import { createEventWatch, type EventWatch, type EventWatchLineOutcome } from './event-watch.js';
 import type { ChildNoticeQueue } from './core/notice-producers.js';
+import { emitTurnLife } from '../debug/turn-life.js';
 
 /**
  * OP-EVENT-WATCH-WAKE 필수분 — createEventWatch 를 실제 큐·wake 경로에 붙인다.
@@ -134,6 +135,8 @@ export function attachEventWatchProcess(
     child = spawned;
     const onData = (stream: 'stdout' | 'stderr') => (chunk?: Buffer | string): void => {
       runner.feed(stream, String(chunk ?? ''), now());
+      // OBSERVE-TURN-EVENT-LIFECYCLE — 감시줄 출력 도착(한 청크; busy 여부는 큐 적입 뒤 문이 판정).
+      try { emitTurnLife('turn-life:event-arrived', { source: 'event-watch', arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       if (runner.stopped) stop();
     };
     spawned.stdout?.on('data', onData('stdout'));

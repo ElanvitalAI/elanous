@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-EXAMPLE-SCENARIOS-TS",
+  "path": "src/ux-sim/sim-world/example-scenarios.ts",
+  "boundary": "Reference world module in no built-in pack: nine example scenarios and two gh-shaped devices that exercise every kernel verdict for the kernel tests and as the template for world hands.",
+  "deviceIds": [
+    "sim-world-kernel"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

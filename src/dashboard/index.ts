@@ -3240,7 +3240,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts),
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
   });
-  const internalTurnYieldPort = wrapAgentWakePort(goalContinue.wrapPort(seatAutowake.wrapPort(internalTurnGate.port)));
   // ⭐ TUI-GOAL-INTERIM-QUIET — 이어가기 내부 턴이 열리면 «바로 앞» 중간 보고(못 했다·약속) 문단을 한 줄로 접는다.
   //   끼워 넣은 사람 에코가 있으면 줄 위치를 믿지 않고 접지 않는다(판정·관측은 goal-interim.ts).
   const goalInterimFold = createClassicInterimFold({ canFold: () => liveTypeaheadEchoes.length === 0 });
@@ -3254,6 +3253,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const wakeupScheduler = createDashboardWakeupScheduler(internalTurnGate, {
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
   });
+  // ⭐ ELN-SEAT-WAKEUP-SCHEDULE-FAIL(OP #88346) — 턴 중(NotIdle) 거부된 예약 깨움이 소리 없이 소실되던 길을
+  //   막는다: 스케줄러가 yield port 를 감싸, 입력칸이 «다시 뜨는» 순간(턴 끝 · idle) 대기 큐를 반드시 배출한다
+  //   (agent-wake 의 idle 감시와 같은 길 · wrapPort 는 스케줄러 생성 뒤에 묶는다).
+  const internalTurnYieldPort = wrapAgentWakePort(goalContinue.wrapPort(seatAutowake.wrapPort(wakeupScheduler.wrapPort(internalTurnGate.port))));
   // ⭐ OP-CRON-PROMPTS O2 — 재기동해도 예약이 살게 파일에 저장·시작 복원한다. 스케줄러를 만들 때는 대화 세션이 아직
   //   안 붙어 있다(attachedSessionId=null) — 세션이 붙거나 바뀔 때마다 저장 위치를 묶는다(같은 id 는 무시).
   const bindWakeupSession = createSessionWakeupBinder(wakeupScheduler, detectSeat(process.cwd())?.seat);

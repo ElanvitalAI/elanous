@@ -187,7 +187,7 @@ function priorRunOwnsTip(version: string, tip: string, owner: { runId: string; a
     nodes?: Array<{ nodeId?: unknown; ok?: unknown; output?: unknown }> };
   if (state.graphId !== 'release-loop' || state.runId !== owner.runId || state.input?.version !== version || state.input?.branchCut !== true) return false;
   return state.nodes?.some((node) => {
-    if (node.nodeId !== 'version-release' || node.ok !== true || typeof node.output !== 'string') return false;
+    if ((node.nodeId !== 'version-release' && node.nodeId !== 'cut-branch') || node.ok !== true || typeof node.output !== 'string') return false;
     try {
       const result = JSON.parse(node.output.trim().split('\n').at(-1)!) as { commit?: unknown; branch?: unknown };
       return result.commit === tip && result.branch === `release/${version}`;
@@ -204,7 +204,7 @@ function completedRunOwnsTip(version: string, tip: string, owner: { runId: strin
   if (state.graphId !== 'release-loop' || state.runId !== owner.runId || (state.status !== 'done' && state.status !== 'failed')
     || state.input?.version !== version || state.input?.branchCut !== true) return false;
   return state.nodes?.some((node) => {
-    if (node.nodeId !== 'version-release' || node.ok !== true || typeof node.output !== 'string') return false;
+    if ((node.nodeId !== 'version-release' && node.nodeId !== 'cut-branch') || node.ok !== true || typeof node.output !== 'string') return false;
     try {
       const result = JSON.parse(node.output.trim().split('\n').at(-1)!) as { commit?: unknown; branch?: unknown };
       return result.commit === tip && result.branch === `release/${version}`;
@@ -527,13 +527,14 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
   let gateExecutor: string | undefined;
   let gateImagePin: string | undefined;
   try {
-    if (args[0] !== 'release' && args[0] !== 'dev-bump' && args[0] !== 'cut-branch')
-      throw new Error('usage: version-node.ts <release|dev-bump|cut-branch> [--version <v>] [--cut <sha>] [--cut-commit <sha>] [--pick <sha>] [--base <sha>] [--append] [--dry-run] --json');
-    kind = args[0] === 'cut-branch' ? 'release' : args[0];
+    if (args[0] !== 'release' && args[0] !== 'dev-bump' && args[0] !== 'cut-branch' && args[0] !== 'gate-image-prebuild')
+      throw new Error('usage: version-node.ts <release|dev-bump|cut-branch|gate-image-prebuild> [--version <v>] [--cut <sha>] [--cut-commit <sha>] [--pick <sha>] [--base <sha>] [--append] [--dry-run] [--no-prebuild] --json');
+    kind = args[0] === 'cut-branch' || args[0] === 'gate-image-prebuild' ? 'release' : args[0];
     const picks: string[] = [];
     let base: string | undefined;
     let append = false;
     let dryRun = false;
+    let noPrebuild = false;
     let versionRelease: { commit?: unknown; base?: unknown; branch?: unknown } | undefined;
     for (let i = 1; i < args.length; i++) {
       if (args[i] === '--json') continue;
@@ -544,6 +545,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
       if (args[i] === '--base' && args[i + 1]) { base = args[++i]!; continue; }
       if (args[i] === '--append') { append = true; continue; }
       if (args[i] === '--dry-run') { dryRun = true; continue; }
+      if (args[i] === '--no-prebuild') { noPrebuild = true; continue; }
       throw new Error(`unknown or incomplete argument: ${args[i]}`);
     }
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
@@ -566,28 +568,33 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
           throw new Error('branchCutBaseCommit must be a full commit SHA');
         branchCutBaseCommit = context.input.branchCutBaseCommit;
       }
-      const releasedBranch = context.outputs?.['version-release']?.branch;
+      const cutRecord = context.outputs?.['cut-branch'] ?? context.outputs?.['version-release'];
+      const releasedBranch = cutRecord?.branch;
       branchCut = context.input?.branchCut === true
         || (kind === 'dev-bump'
-          && context.outputs?.['version-release']?.outcome === 'ok'
+          && cutRecord?.outcome === 'ok'
           && typeof version === 'string'
           && releasedBranch === `release/${version}`);
-      if (kind === 'release' && cutCommit === undefined && context.input?.cutCommit !== undefined) {
+      if (kind === 'release' && args[0] !== 'cut-branch' && cutCommit === undefined && context.input?.cutCommit !== undefined) {
         if (typeof context.input.cutCommit !== 'string') throw new Error('cutCommit must be a commit SHA');
-        cutCommit = context.input.cutCommit;
+        // RELEASE-RESUME-AFTER-CUT-PUSHED: gate-image-prebuild consumes the pinned run input as its cut
+        // source; the machine-injected input.cutCommit is not a CLI --cut-commit, so it must not trip the
+        // forbidden-argument guard below (a pinned cut run resumes instead of throwing).
+        if (args[0] === 'gate-image-prebuild') { if (cut === undefined) cut = context.input.cutCommit; }
+        else cutCommit = context.input.cutCommit;
       }
       // The cut = the commit version-release landed (what cutoff and the gate measured).
       // RELEASE-APPEND-BASE-AUTO: cut-branch consumes that same record as its ledger seam
       // (ledger: () => versionRelease), so it must not also see it injected as --cut.
-      const releasedCommit = context.outputs?.['version-release']?.commit;
+      const releasedCommit = cutRecord?.commit;
       if (args[0] !== 'cut-branch' && !cut && typeof releasedCommit === 'string' && releasedCommit) cut = releasedCommit;
-      // RELEASE-APPEND-BASE-AUTO: the version-release node's record is the ledger seam cut-branch consults.
-      versionRelease = context.outputs?.['version-release'];
+      // RELEASE-APPEND-BASE-AUTO: the cut node's record is the ledger seam cut-branch consults.
+      versionRelease = cutRecord;
     }
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
     const prebuildGateImage = (commit: string | null): CutGateImagePrebuildOutcome | undefined => {
-      if (typeof commit !== 'string' || !commit || dryRun || gateExecutor !== 'pod' || gateImagePin !== 'cut-commit' || !gatePodPool || !runId) return undefined;
+      if (typeof commit !== 'string' || !commit || dryRun || noPrebuild || gateExecutor !== 'pod' || gateImagePin !== 'cut-commit' || !gatePodPool || !runId) return undefined;
       const result = (deps.prebuildGateImage ?? runCutGateImagePrebuild)({ root: effectiveInstanceRoot(), repo: resolve(repo), runId, version: version!, commit, pool: gatePodPool });
       debug.log('release-loop.cut-image', 'prebuild', { runId, version, commit, outcome: result.outcome,
         ...(result.outcome === 'failed' ? { reason: result.reason } : {}),
@@ -605,6 +612,14 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
       const gateImagePrebuild = prebuildGateImage(result.commit);
       return { outcome: 'ok', kind: 'release', version, commit: result.commit, pr: null, branch: result.branch,
         ...(gateImagePrebuild ? { gateImagePrebuild } : {}), ...(dryRun ? { skipped: 'dry-run' } : {}) };
+    }
+    if (args[0] === 'gate-image-prebuild') {
+      if (picks.length || base !== undefined || append || cutCommit !== undefined) throw new Error('--pick/--base/--append/--cut-commit are not valid for gate-image-prebuild');
+      if (!cut) throw new Error('cut commit required: --cut <sha> or the cut-branch record via ELANOUS_GRAPH_CONTEXT');
+      if (dryRun) return { outcome: 'ok', kind: 'release', version, commit: cut, pr: null, skipped: 'dry-run' };
+      const gateImagePrebuild = prebuildGateImage(cut);
+      return { outcome: 'ok', kind: 'release', version, commit: cut, pr: null,
+        ...(gateImagePrebuild ? { gateImagePrebuild } : { skipped: 'prebuild-not-applicable' }) };
     }
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
     const output = landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId, branchCutBaseCommit);

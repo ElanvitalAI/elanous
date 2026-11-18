@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import type { SpawnSyncOptions } from 'node:child_process';
@@ -10,6 +10,7 @@ import { PassThrough } from 'node:stream';
 import { Command } from 'commander';
 import { debug } from '../../src/debug/log.js';
 import { runLandingPodShadowJob } from '../../src/cli/pr-land-pod-shadow-job.js';
+import { realGateRemoteRunner } from '../../src/self-implement/gate-remote.js';
 import { setGitCommandRunnerForTesting } from '../../src/git-fs/runner.js';
 import { parseNumstat, parsePorcelainStatus, registerPrCommands as realRegisterPrCommands, runPrGranularity, runPrLand as realRunPrLand, decideOverlapLanding, overlapDecisionFromConfirm, publicLeakWarning, exportLeakBlock, runPrLandExportLeakCheck, docsCliWarning, publicDocPaths, OVERLAP_DECISION_PROMPT, createOverlapConfirmChannel, formatCommitMessageFallbackNotice, formatLandReasonNotice, codePointLength, branchLineageSlug, findSiblingPrs } from '../../src/cli/pr-cli.js';
 import type { ConfirmOpts, ConfirmResult } from '../../src/hitl/confirm.js';
@@ -89,7 +90,8 @@ describe('production CLI launch-goal filesystem isolation', () => {
     const observedRealWrites: string[] = [];
     const expectGoalRoute = (goalPath: string | undefined, expectedDirectory: string): void => {
       expect(goalPath).toBeTruthy();
-      expect(resolve(goalPath!)).toBe(join(expectedDirectory, basename(goalPath!)));
+      // macOS tmpdirs may be symlinked (/tmp -> /private/tmp): compare the real locations, not the spelling.
+      expect(fs.realpathSync(resolve(goalPath!))).toBe(join(fs.realpathSync(expectedDirectory), basename(goalPath!)));
     };
     const expectNoLaunchGoalWrites = (directory: string, before: Array<{ path: string; kind: string; content?: string }>): void => {
       expect(snapshotDirectory(directory)).toEqual(before);
@@ -189,13 +191,64 @@ const baseLookupRun = (cmd: string, args: readonly string[]) =>
         : cmd === 'git' && args.join(' ') === numstatArgs
           ? { ok: true, out: '' }
           : cmd === 'gh' && args.join(' ').includes('pr view')
-            ? { ok: true, out: 'main' }
+            ? (args.includes('--json') && /headRefOid|headRepository|url/u.test(args.join(' '))
+              // Fail loud: a JSON-field query this fake does not answer must not get the plain 'main' reply.
+              ? (() => { throw new Error(`baseLookupRun: unanswered ${cmd} ${args.join(' ')}`); })()
+              : { ok: true, out: 'main' })
             : { ok: false, out: '' };
+// Total fake for the heavy-remote Git worker: `runPrLandRemoteGit` otherwise ssh-es to the selected gate host for real.
+// ⭐ It is a remote with its OWN expectations, not a mirror: the receipt it returns is built from test-owned literals
+// (below), never from the identity the product sent. A request whose repository, ref, head, main or host differs from
+// those literals, or whose script is not exactly one of the four phase shapes or the cleanup shape, throws with the
+// script shown — so a product that sends wrong values is refused here instead of being echoed back as "verified".
+const remoteExpect: { head: string; mains: string[]; hosts: string[]; receipt: Record<string, unknown> } = {
+  head: 'a'.repeat(40), mains: [], hosts: ['node-b', 'node-c'], receipt: {},
+};
+const resetRemoteExpect = (): void => {
+  remoteExpect.head = 'a'.repeat(40);
+  remoteExpect.mains = ['b'.repeat(40), 'e'.repeat(40), 'f'.repeat(40), '9'.repeat(40)];
+  remoteExpect.receipt = {};
+};
+const PHASE_MARKER: Record<string, string> = {
+  fetch: 'git init --bare "$R/repo"',
+  worktree: 'worktree add --detach "$R/worktree" "$head"',
+  rebase: 'rebase "$main"',
+  push: 'push --quiet --force-with-lease="$ref:$head" origin "$head:$ref"',
+};
+const realRemoteSsh = realGateRemoteRunner.ssh;
+const fakeRemoteSsh: typeof realGateRemoteRunner.ssh = (host, script) => {
+  const refuse = (why: string): never => { throw new Error(`fakeRemoteSsh: ${why} (host=${host}): ${script.slice(0, 240)}`); };
+  if (!remoteExpect.hosts.includes(host)) refuse('unexpected host');
+  const empty = Buffer.alloc(0);
+  if (/^set -eu\nR='\/tmp\/elanous-pr-land-git-[0-9a-f]{32}'\nif test -d "\$R\/repo"; then git -C "\$R\/repo" worktree remove --force "\$R\/worktree" >\/dev\/null 2>&1 \|\| :; fi\nrm -rf -- "\$R"\ntest ! -e "\$R"\n$/u.test(script)) {
+    return { rc: 0, stdout: empty, stderr: empty };
+  }
+  const identity = /emit\(\) \{ printf '%s,"resultHead":"%s","mergeSha":"%s"\}\\n' '(\{"schema":2[^']*)' "\$1" "\$main"; \}/u.exec(script)?.[1];
+  const phase = identity ? /"phase":"(fetch|worktree|rebase|push)"/u.exec(identity)?.[1] : undefined;
+  if (!phase) return refuse('unrecognised script');
+  if (!script.startsWith("set -eu\nexport GIT_TERMINAL_PROMPT=0\nexport GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10'\n")) refuse('unexpected script header');
+  const lines = new Map(script.split('\n').filter((line) => /^(url|base_url|ref|head|main|R)='/u.test(line)).map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+  const main = /^'([0-9a-f]{40})'$/u.exec(lines.get('main') ?? '')?.[1];
+  if (lines.get('url') !== "'git@github.com:example/repo.git'") refuse('unexpected source url');
+  if (lines.get('base_url') !== "'https://github.com/example/repo.git'") refuse('unexpected base url');
+  if (lines.get('ref') !== "'refs/heads/feat/land'") refuse('unexpected head ref');
+  if (lines.get('head') !== `'${remoteExpect.head}'`) refuse('unexpected head');
+  if (!main || !remoteExpect.mains.includes(main)) refuse('unexpected main');
+  if (!script.includes(PHASE_MARKER[phase]!)) refuse(`phase ${phase} script lacks its own command`);
+  const receipt = {
+    schema: 2, pr: 51, repository: 'example/repo', baseRepository: 'example/repo', headRef: 'refs/heads/feat/land',
+    head: remoteExpect.head, main, host, phase, ok: true, resultHead: remoteExpect.head, mergeSha: main,
+    ...remoteExpect.receipt,
+  };
+  return { rc: 0, stdout: Buffer.from(`${JSON.stringify(receipt)}\n`), stderr: empty };
+};
 let prodFreezeRoot: string;
 let isolatedStateDir: string;
 let savedStateDir: string | undefined;
 // Both freeze authorities are isolated: the operational root (injected) and the local universe (ELANOUS_STATE_DIR).
 beforeEach(() => {
+  realGateRemoteRunner.ssh = fakeRemoteSsh;
+  resetRemoteExpect();
   prodFreezeRoot = mkdtempSync(join(tmpdir(), 'pr-cli-freeze-'));
   isolatedStateDir = mkdtempSync(join(tmpdir(), 'pr-cli-state-'));
   savedStateDir = process.env.ELANOUS_STATE_DIR;
@@ -204,13 +257,27 @@ beforeEach(() => {
   expect(effectiveInstanceRoot()).not.toBe(prodInstanceRoot());
 });
 afterEach(() => {
+  realGateRemoteRunner.ssh = realRemoteSsh;
   if (savedStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedStateDir;
   resetEffectiveInstanceRoot();
   rmSync(prodFreezeRoot, { recursive: true, force: true });
   rmSync(isolatedStateDir, { recursive: true, force: true });
 });
 
+// Production spawns real `git` in `opts.cwd` for virtual-rebase/restack measurements. Defaulting to the repository under
+// test makes those calls lazy-fetch fake SHAs from github.com on a partial clone (seconds per call, network-dependent).
+// An empty local repository with no remote answers them offline and identically on every host.
+let isolatedGitCwd: string | undefined;
+const emptyGitCwd = (): string => {
+  if (!isolatedGitCwd) {
+    isolatedGitCwd = mkdtempSync(join(tmpdir(), 'pr-cli-empty-git-'));
+    git(isolatedGitCwd, 'init', '-q', '-b', 'main');
+  }
+  return isolatedGitCwd;
+};
+afterAll(() => { if (isolatedGitCwd) rmSync(isolatedGitCwd, { recursive: true, force: true }); });
 const runPrLand = (opts: PrLandOpts = {}, deps: PrLandDeps = {}) => realRunPrLand(opts, { ...deps, prodFreezeRoot });
+const runPrLandFileScope = runPrLand;
 const registerPrCommands = (program: Command, deps: PrLandDeps = {}) => realRegisterPrCommands(program, { ...deps, prodFreezeRoot });
 
 const baseDeps = {
@@ -1176,6 +1243,8 @@ describe('elanous pr land', () => {
         resolveBase: () => 'origin/main',
         manager: populatedManager.manager,
         out: populated.out,
+        // Same as baseDeps: run as a remote worker, so the HQ-only local-heavy guard does not depend on the host running the test.
+        hostName: () => 'node-b',
         run: baseLookupRun,
         listUnfinishedRuns: () => [],
         queryRunningRuns: () => runningRuns([]),
@@ -1325,6 +1394,13 @@ describe('elanous pr land', () => {
     const WINDOW_A = 'e'.repeat(40);
     const WINDOW_B = 'f'.repeat(40);
     const FORK = '9'.repeat(40);
+    // Every test in this group lands a pinned PR with fake SHAs: any real `git` the production spawns in `cwd` must hit an empty
+    // local repository, never this checkout (a partial clone lazy-fetches the fake SHA from github.com, seconds per call).
+    const runPrLand = (opts: PrLandOpts = {}, deps: PrLandDeps = {}) => runPrLandFileScope({ cwd: emptyGitCwd(), ...opts }, deps);
+    // Heavy-remote production reads main through the base repository's API ref; the tests script main's moves once for both reads.
+    const isMainRead = (cmd: string, args: readonly string[]): boolean =>
+      (cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main')
+      || (cmd === 'gh' && args.join(' ') === 'api repos/example/repo/git/ref/heads/main --jq .object.sha');
     type WindowOpts = { gateBaseInHead?: boolean; gateBaseInTip?: boolean; tipLocal?: boolean; windowLog?: string; windowLogOk?: boolean };
     function conflictingRepo(path: string) {
       const repo = mkdtempSync(join(tmpdir(), 'pr-land-live-conflict-'));
@@ -1412,6 +1488,10 @@ describe('elanous pr land', () => {
           return { ok: true, out: JSON.stringify({ headRefOid: HEAD, state: 'OPEN', isDraft: false }) };
         }
         if (cmd === 'gh' && command === 'pr view 51 --json url') return { ok: true, out: JSON.stringify({ url: URL }) };
+        if (cmd === 'gh' && command === 'pr view 51 --json headRefOid,headRefName,headRepository,headRepositoryOwner') {
+          return { ok: true, out: JSON.stringify({ headRefOid: HEAD, headRefName: 'feat/land', headRepository: { name: 'repo' }, headRepositoryOwner: { login: 'example' } }) };
+        }
+        if (cmd === 'gh' && command === 'api repos/example/repo/git/ref/heads/feat/land --jq .object.sha') return { ok: true, out: `${HEAD}\n` };
         if (cmd === 'gh' && command === 'api repos/example/repo/git/ref/heads/main --jq .object.sha') return { ok: true, out: `${TIP}\n` };
         if (cmd === 'git' && command === 'rev-parse HEAD') return { ok: true, out: `${HEAD}\n` };
         if (cmd === 'git' && command === 'status --porcelain') return { ok: true, out: '' };
@@ -1605,7 +1685,7 @@ describe('elanous pr land', () => {
             if (command === 'git rev-parse --verify origin/main') return { ok: true, out: `${TIP}\n` };
             return run(cmd, args);
           },
-          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
           runTypecheckGate: () => { localTypecheckCalls += 1; return true; },
         })).toBe(1);
         expect(sink.errors.join('\n')).toContain('ancestor-auto-not-ancestor:');
@@ -1634,12 +1714,12 @@ describe('elanous pr land', () => {
           ...baseDeps, manager, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main'
             ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+            : isMainRead(cmd, args)
             ? { ok: true, out: `${mainReads++ === 0 ? TIP : WINDOW_A}\n` }
             : cmd === 'git' && args[0] === 'log' && args.includes('--name-only') && heavyCalls >= 1
             ? { ok: true, out: `${overlapLog}\n${newLanding}` }
             : inner(cmd, args),
-          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
         })).toBe(1);
         expect(heavyCalls).toBe(1);
         expect(sink.errors.join('\n')).toContain('ancestor-auto-not-ancestor:');
@@ -1657,7 +1737,7 @@ describe('elanous pr land', () => {
       try {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD }, {
           ...baseDeps, manager, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
-          run: (cmd, args) => cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+          run: (cmd, args) => isMainRead(cmd, args)
             ? { ok: true, out: `${localTypecheckCalls === 0 ? TIP : WINDOW_A}\n` }
             : cmd === 'git' && args[0] === 'log' && args.includes('--name-only') && localTypecheckCalls > 0
             ? { ok: true, out: `${overlapLog}\n${newLanding}` }
@@ -1890,9 +1970,20 @@ describe('elanous pr land', () => {
         const sink = output();
         const landing = pinnedManager();
         const gatedBases: string[] = [];
+        // This fixture's own commits are what the remote worker must be asked about (literals owned by the fixture, not the product).
+        remoteExpect.head = head;
+        remoteExpect.mains.push(firstMain, laterMain);
         const run: CmdRunner = (command, args, options) => {
           if (command === 'gh' && args[1] === 'view' && args.includes('mergeCommit,state')) {
             return { ok: true, out: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: 'd'.repeat(40) } }) };
+          }
+          // Heavy-remote production reads main and the source ref through the GitHub API; serve them from this fixture's refs.
+          if (command === 'gh' && args.join(' ') === 'api repos/example/repo/git/ref/heads/main --jq .object.sha') {
+            return { ok: true, out: `${git(repo, 'rev-parse', 'refs/remotes/origin/main')}\n` };
+          }
+          if (command === 'gh' && args.join(' ') === 'api repos/example/repo/git/ref/heads/feat/land --jq .object.sha') return { ok: true, out: `${head}\n` };
+          if (command === 'gh' && args.join(' ') === 'pr view 51 --json headRefOid,headRefName,headRepository,headRepositoryOwner') {
+            return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', headRepository: { name: 'repo' }, headRepositoryOwner: { login: 'example' } }) };
           }
           if (command === 'gh') return { ok: true, out: JSON.stringify({ headRefOid: head, headRefName: 'feat/land', baseRefName: 'main', state: 'OPEN', isDraft: false, url: URL }) };
           if (command === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'git@github.com:example/repo.git\n' };
@@ -2046,7 +2137,7 @@ describe('elanous pr land', () => {
           loadavg: () => samples[Math.min(sample++, samples.length - 1)]!,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main'
             ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+            : isMainRead(cmd, args)
             ? { ok: true, out: `${mainReads++ === 0 ? TIP : WINDOW_A}\n` }
             : cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('mergeCommit,state')
             ? { ok: true, out: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: 'd'.repeat(40) } }) }
@@ -2077,8 +2168,8 @@ describe('elanous pr land', () => {
           runTestInterferenceGate: async () => { throw new Error('local interference gate ran'); },
         });
         expect(code).toBe(0);
-        // initial read, moved read, post-gate confirm that WINDOW_A is still main
-        expect(mainReads).toBe(3);
+        // API main reads: preflight (TIP), pre-merge freshness (moved), stability loop (moved), post-gate confirm (moved)
+        expect(mainReads).toBe(4);
         expect(pairs).toEqual([{ head: HEAD, main: TIP }, { head: HEAD, main: WINDOW_A }]);
         expect(shadowPairs).toEqual([{ head: HEAD, main: TIP }]);
         expect(loads.some((call) => Array.isArray(call) && call[0] === 'pr.land' && call[1] === 'heavy-on-pod-shadow'
@@ -2127,7 +2218,7 @@ describe('elanous pr land', () => {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           loadavg: () => samples[Math.min(sample++, samples.length - 1)]!,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+            : isMainRead(cmd, args)
             ? { ok: true, out: `${heavyCalls === 0 ? TIP : WINDOW_A}\n` }
             : inner(cmd, args),
           runHeavyRemote: ({ main }) => {
@@ -2176,7 +2267,7 @@ describe('elanous pr land', () => {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           loadavg: () => samples[Math.min(sample++, samples.length - 1)]!,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main' ? { ok: true, out: `${TIP}\n` }
+            : isMainRead(cmd, args) ? { ok: true, out: `${TIP}\n` }
             : cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('mergeCommit,state')
             ? { ok: true, out: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: squash } }) }
             : cmd === 'git' && args.join(' ') === `fetch --quiet origin ${squash}` ? { ok: true, out: '' }
@@ -2218,7 +2309,7 @@ describe('elanous pr land', () => {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+            : isMainRead(cmd, args)
             ? { ok: true, out: `${[TIP, WINDOW_A, moved][mainReads++] ?? moved}\n` }
             : inner(cmd, args),
           runHeavyRemote: ({ main }) => {
@@ -2247,7 +2338,7 @@ describe('elanous pr land', () => {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+            : isMainRead(cmd, args)
             ? { ok: true, out: `${mainReads++ === 0 ? TIP : WINDOW_A}\n` }
             : inner(cmd, args),
           runHeavyRemote: () => {
@@ -2304,6 +2395,30 @@ describe('elanous pr land', () => {
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
+    // Proves the remote-receipt check is real: the fake remote answers with a literal that disagrees with what the test expects,
+    // and the product must refuse instead of merging. (If the fake merely echoed the request this could never fail.)
+    it.each([
+      ['a different result head', { resultHead: 'd'.repeat(40) }],
+      ['a different source ref', { headRef: 'refs/heads/other' }],
+      ['a different base repository', { baseRepository: 'other/repo' }],
+      ['a different main', { main: 'c'.repeat(40) }],
+    ] as const)('refuses to land when the remote worker answers with %s', async (_label, wrong) => {
+      const { run } = pinnedRun();
+      const { manager, calls } = pinnedManager();
+      const sink = output();
+      const { dir, evidence } = evidenceFiles();
+      remoteExpect.receipt = { ...wrong };
+      try {
+        expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
+          ...baseDeps, reviewResultsDir: join(dir, 'review-results'), run, manager, out: sink.out,
+          runHeavyRemote: () => ({ ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }),
+        })).toBe(1);
+        expect(sink.errors.join('\n')).toContain('✗ remote-git:');
+        expect(sink.logs.join('\n')).not.toContain('✓ remote-git');
+        expect(calls).not.toContain('merge');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it('does not retry merge when the PR is retargeted during the UNKNOWN wait', async () => {
       let premergeViews = 0;
       const { run: inner } = pinnedRun({ baseRefName: () => (premergeViews++ < 2 ? 'main' : 'release') });
@@ -2325,7 +2440,7 @@ describe('elanous pr land', () => {
           sleep: async () => { slept += 1; },
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? (sink.logs.push('FETCH-HIT'), { ok: true, out: '' })
             : cmd === 'git' && args[0] === 'fetch' ? (sink.logs.push(`FETCH-MISS ${JSON.stringify(args)}`), { ok: false, out: '' })
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main' ? (sink.logs.push('REV-HIT'), { ok: true, out: `${TIP}\n` })
+            : isMainRead(cmd, args) ? (sink.logs.push('REV-HIT'), { ok: true, out: `${TIP}\n` })
             : cmd === 'git' && args[0] === 'rev-parse' && args.includes('origin/main') ? (sink.logs.push(`REV-MISS ${JSON.stringify(args)}`), { ok: false, out: '' })
             : cmd === 'gh' && args.includes('mergeable') ? { ok: true, out: 'UNKNOWN\n' }
             : inner(cmd, args),
@@ -2359,9 +2474,9 @@ describe('elanous pr land', () => {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           sleep: async () => { slept += 1; },
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
-            // initial, pre-merge confirm, then the read after the UNKNOWN wait
-            ? { ok: true, out: `${mainReads++ < 2 ? TIP : moved}\n` }
+            : isMainRead(cmd, args)
+            // preflight, post-gate confirm, pre-merge confirm, then the read after the UNKNOWN wait
+            ? { ok: true, out: `${mainReads++ < 3 ? TIP : moved}\n` }
             : cmd === 'gh' && args.includes('mergeable') ? { ok: true, out: 'UNKNOWN\n' }
             : inner(cmd, args),
           runHeavyRemote: ({ main }) => {
@@ -2398,13 +2513,13 @@ describe('elanous pr land', () => {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD, heavyRemote: true }, {
           ...baseDeps, manager, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
           sleep: async () => { slept += 1; },
-          run: (cmd, args) => cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
-            ? { ok: true, out: `${mainReads++ < 2 ? TIP : WINDOW_A}\n` }
+          run: (cmd, args) => isMainRead(cmd, args)
+            ? { ok: true, out: `${mainReads++ < 3 ? TIP : WINDOW_A}\n` }
             : cmd === 'git' && args[0] === 'log' && args.includes('--name-only') && slept > 0
             ? { ok: true, out: `${overlapLog}\ncommit ${WINDOW_B}\nsrc/land.ts\n` }
             : cmd === 'gh' && args.includes('mergeable') ? { ok: true, out: 'UNKNOWN\n' }
             : inner(cmd, args),
-          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
         })).toBe(1);
         expect(slept).toBe(1);
         expect(merges).toEqual(['merge']);
@@ -2425,7 +2540,7 @@ describe('elanous pr land', () => {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+            : isMainRead(cmd, args)
             ? { ok: true, out: `${tips[Math.min(mainReads++, tips.length - 1)]}\n` }
             : inner(cmd, args),
           runHeavyRemote: ({ main }) => {
@@ -2454,7 +2569,7 @@ describe('elanous pr land', () => {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main' ? { ok: true, out: `${TIP}\n` }
+            : isMainRead(cmd, args) ? { ok: true, out: `${TIP}\n` }
             : cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('mergeCommit,state')
             ? { ok: false, out: '' }
             : inner(cmd, args),
@@ -2497,7 +2612,7 @@ describe('elanous pr land', () => {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           loadavg: () => samples[Math.min(sample++, samples.length - 1)]!,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main' ? { ok: true, out: `${TIP}\n` }
+            : isMainRead(cmd, args) ? { ok: true, out: `${TIP}\n` }
             : cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('mergeCommit,state')
             ? { ok: true, out: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: squash } }) }
             : cmd === 'git' && args.join(' ') === `fetch --quiet origin ${squash}` ? { ok: true, out: '' }
@@ -2534,7 +2649,7 @@ describe('elanous pr land', () => {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main' ? { ok: true, out: `${TIP}\n` } : inner(cmd, args),
+            : isMainRead(cmd, args) ? { ok: true, out: `${TIP}\n` } : inner(cmd, args),
           runHeavyRemote: () => ({ ok: false, source: 'unmeasured', reason: 'ssh-down', elapsedMs: 1, evidencePath: '/tmp/injected-heavy.json' }),
           runTypecheckGate: () => { throw new Error('local tsc ran'); },
         })).toBe(1);
@@ -2561,7 +2676,7 @@ describe('elanous pr land', () => {
           expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
             ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
             run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-              : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main' ? { ok: true, out: `${TIP}\n` } : inner(cmd, args),
+              : isMainRead(cmd, args) ? { ok: true, out: `${TIP}\n` } : inner(cmd, args),
             runHeavyRemote: () => ({ ok: false, source: 'unmeasured', reason, elapsedMs: 1, evidencePath: '/tmp/injected-heavy.json' }),
             runTypecheckGate: () => { throw new Error('local tsc ran'); },
           })).toBe(1);
@@ -2592,7 +2707,7 @@ describe('elanous pr land', () => {
         expect(await runPrLand({ pr: '51', expectedHead: HEAD, overlapEvidence: evidence, heavyRemote: true }, {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), manager, out: sink.out,
           run: (cmd, args) => cmd === 'git' && args.join(' ') === 'fetch --quiet origin main' ? { ok: true, out: '' }
-            : cmd === 'git' && args.join(' ') === 'rev-parse --verify origin/main'
+            : isMainRead(cmd, args)
             ? { ok: true, out: `${mainReads++ === 0 ? TIP : WINDOW_A}\n` } : inner(cmd, args),
           runHeavyRemote: ({ main }) => main === TIP
             ? { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/injected-heavy.json' }
@@ -2637,7 +2752,7 @@ describe('elanous pr land', () => {
           ...baseDeps, reviewResultsDir: join(dir, 'review-results'), run, manager, out: sink.out,
           runTypecheckGate: () => { typecheckCalls += 1; return true; },
           runIsolationGate: () => { isolationCalls += 1; return true; },
-          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+          runHeavyRemote: () => { heavyCalls += 1; return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
         })).toBe(1);
         expect(typecheckCalls).toBe(0);
         expect(isolationCalls).toBe(0);
@@ -2677,7 +2792,7 @@ describe('elanous pr land', () => {
             ...baseDeps, run, manager, out: sink.out, reviewResultsDir: join(dir, 'review-results'),
             runTypecheckGate: () => { gateCalls.push('typecheck'); return true; },
             runIsolationGate: () => { gateCalls.push('isolation'); return true; },
-            runHeavyRemote: () => { gateCalls.push('heavy-remote'); return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+            runHeavyRemote: () => { gateCalls.push('heavy-remote'); return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
           })).toBe(1);
           expect(sink.errors.join('\n')).toContain(`✗ overlap-evidence: ${reason}`);
           expect(gateCalls).toEqual([]);
@@ -2698,7 +2813,7 @@ describe('elanous pr land', () => {
           : inner(cmd, args),
         runTypecheckGate: () => { gateCalls.push('typecheck'); return true; },
         runIsolationGate: () => { gateCalls.push('isolation'); return true; },
-        runHeavyRemote: () => { gateCalls.push('heavy-remote'); return { ok: true, source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
+        runHeavyRemote: () => { gateCalls.push('heavy-remote'); return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/unused.json' }; },
       })).toBe(1);
       expect(sink.errors.join('\n')).toContain('✗ overlap-preflight: PR 변경 파일을 읽지 못했다');
       expect(gateCalls).toEqual([]);

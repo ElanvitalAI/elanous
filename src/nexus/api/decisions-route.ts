@@ -82,7 +82,7 @@ export async function handleDecisions(req: Request, deps: DecisionsRouteDeps = {
   }
   const { choice, note } = body as { choice: string; note?: string };
   try {
-    const entry: DecisionEntry = ledger.decide(id, choice, { kind: 'human' }, note);
+    const entry: DecisionEntry = ledger.decide(id, choice, { kind: 'human', via: 'pwa' }, note);
     debug.log('decisions.api', 'decided', { id });
     return jsonResponse(entry);
   } catch (error) {

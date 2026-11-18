@@ -23,6 +23,8 @@ echo "▶ packing this checkout → $CTX" >&2
 TGZ="$(ls "$CTX"/*.tgz 2>/dev/null | head -1)"
 [ -n "$TGZ" ] || { echo "⛔ no tarball produced in $CTX" >&2; exit 1; }
 mv "$TGZ" "$CTX/elanous.tgz"
+# bun pm pack drops the gitignored apps/pwa/out — materialize it (install.sh exits 4 without it).
+(cd "$ROOT" && bun -e 'import { packPwaOutput } from "./scripts/lib/pack-pwa-output.ts"; packPwaOutput(process.argv[1], process.argv[2]);' "$ROOT" "$CTX/elanous.tgz") || { echo "⛔ PWA build missing: apps/pwa/out/index.html (build it first: bun bin/elanous.mjs nexus build)" >&2; exit 1; }
 cp "$ROOT/scripts/install.sh" "$ROOT/docker/verify/Dockerfile" "$CTX/"
 
 for base in "$@"; do

@@ -78,6 +78,11 @@ export interface LLMConfig {
   codexTokenOwnerHost?: string;
   /** Override the text stream idle watchdog in milliseconds. Omitted keeps provider/family defaults. */
   streamIdleTimeoutMs?: number;
+  /** ELN-TURN-STALL-WATCHDOG: no output progress (text · tool call · image) for this many ms while a stream is open →
+   *  the attempt moves to the next provider. Omitted keeps the 10 min default (src/llm/turn-progress.ts). */
+  turnNoProgressMs?: number;
+  /** Seats that receive the one turn-stall mail line besides OP (the seat registry names no owner). */
+  turnNoProgressMailTo?: string[];
   /** OpenRouter 설정 한 곳(두 골이 같은 키를 쓴다):
    *  - `providerPreferences` — 상류 라우팅 선호; 도구 가능 기본값(require_parameters·allow_fallbacks)을 얕게 덮는다(OR-LLM-ROUTING-1).
    *  - `fallbackModel` — 유료 OpenRouter 폴백 모델; 체인에 openrouter 를 명시하고 모델·키를 모두 줄 때만 선택된다(OR-FALLBACK-TIER-1).
@@ -159,6 +164,9 @@ export interface LLMConfig {
   fallbackChain?: string[];
   /** Ordered model ids to try when the primary review provider is unavailable. */
   reviewFallbackModels?: string[];
+  /** TA-POD-REVIEW-PROVIDER-ALLOW — Pod per-role model chains (`review` · `judgement` · `recovery`), in order.
+   *  Unset roles use `DEFAULT_ROLE_PROVIDER_CHAINS` (`src/self-dev/role-provider-chain.ts`). GLM is refused for review/judgement. */
+  roleProviderChains?: Record<string, string[]>;
   /** Provider-agnostic reasoning level — primary control. Mapped per
    *  provider:
    *  - codex: low={effort:low, summary:concise}, medium={medium,detailed},
@@ -794,17 +802,6 @@ export interface DebugConfig {
    *    Adds `key.trace.*` firehose on top of diag's hot-path gates.
    *    Use when reproducing a chord miss / wrong-surface keypress. */
   level: 'off' | 'trail' | 'diag' | 'normal' | 'verbose' | 'detail' | 'keytrace';
-  /** Gate the runtime-debug host-tool family exposed to the LLM.
-   *  Default `true` keeps the historical 9-tool surface
-   *  (debug_getState/debug_getCallStack/debug_getAgentState/
-   *  debug_getLastLlm/input_history_search/input_history_list/
-   *  debug_setLevel/debug_openView/debug_selectEvent). Set to `false`
-   *  during chatlog-only debugging sessions — only the single most
-   *  essential tool (`debug_getLastLlm`) stays exposed so the LLM
-   *  doesn't get distracted by self-introspection during a focused
-   *  triage. Incident 2026-05-04 — Opus mis-recognized its catalog
-   *  partly because half the slots were debug_*. */
-  exposeFullLlmTools: boolean;
   /** OH9(2026-07-24) — 렌더 카테고리(dashboard·key·mouse·cursor 계열)
    *  발화 여부. 진단 강도 축(`level`)과 **직교**한 별도 스위치 —
    *  대표는 상시 diag+ 라 "진단은 켜두고 렌더만 끄는" 축이 필요하다.
@@ -812,7 +809,7 @@ export interface DebugConfig {
    *  `true` 로 명시하면 렌더 로그를 살린다
    *  (override). 런타임 영속은 config 가 아니라 `<stateRoot>/logs/level.json`
    *  의 `render` 필드(overlay 오염 방지) — 이 config 값은 부팅 시드일 뿐.
-   *  선례: `exposeFullLlmTools`(계열 통째 죽이는 불린). */
+   */
   renderLogs: boolean;
 }
 

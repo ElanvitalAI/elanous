@@ -114,7 +114,7 @@ describe('REPL child ↔ next TUI wakeup hop', () => {
 
   test('an unanswered call resolves to an error instead of hanging the child turn', async () => {
     const replTool = createReplWakeupTool({ send: () => true, on: () => {}, off: () => {} }, { [NEXT_TUI_WAKEUP_IPC_ENV]: '1' }, { timeoutMs: 20 })!;
-    expect(await replTool.dispatch({ action: 'list' })).toEqual({ error: 'ScheduleWakeup: next TUI did not answer' });
+    expect(await replTool.dispatch({ action: 'list' })).toEqual({ error: "ScheduleWakeup: next TUI did not answer within 20ms — it may still schedule this; run action:'list' before retrying" });
   });
 
   test('the accelerated fake clock skips only the wall-clock quiet window', () => {

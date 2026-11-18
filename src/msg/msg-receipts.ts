@@ -18,7 +18,7 @@ export const RECEIPT_STATES = ['posted', 'delivered', 'seen', 'accepted', 'rejec
 export type ReceiptState = typeof RECEIPT_STATES[number];
 
 /** Who wrote the row — a structural actor name, never derived from message text. */
-export type ReceiptSource = 'ledger' | 'tui-queue' | 'tui-mail-wake' | 'dashboard-inbox' | 'cli' | 'cli-ack' | 'plan';
+export type ReceiptSource = 'ledger' | 'tui-queue' | 'tui-mail-wake' | 'dashboard-inbox' | 'cli' | 'cli-ack' | 'tool-ack' | 'plan';
 
 export interface ReceiptInput {
   messageId: number;

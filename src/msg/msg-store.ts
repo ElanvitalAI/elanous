@@ -1,11 +1,11 @@
 import { Database } from 'bun:sqlite';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { validateProvenance, type Provenance } from '../provenance/provenance.js';
-import { hasReceiptTable, latestReceiptIdOn, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptState } from './msg-receipts.js';
+import { hasReceiptTable, latestReceiptIdOn, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptSource, type ReceiptState } from './msg-receipts.js';
 
 export interface MessageEnvelope {
   from: string;
@@ -47,7 +47,32 @@ export interface Message extends MessageEnvelope {
   /** Populated by every read path when the kind is known. Absent when the sender matches no
    *  known kind and the caller did not supply origin (unknown is not asserted as system). */
   origin?: MessageOrigin;
+  /** ELN-MSG-POST-IDEMPOTENT: this post matched a stored one (same sender · recipient · body within the dedupe window);
+   *  no row was written and this is the stored message. Only ever set on a `post` result. */
+  deduped?: true;
 }
+
+/** ELN-MSG-POST-IDEMPOTENT — default dedupe window. Justification: the 11-18 JUD retry loop re-sent one report 13 times
+ *  over 5 min 16 s (#87715…#87739); the shortest legitimate repeat cadence on the seats is a 20-30 min standing report.
+ *  10 min covers the retry storm with margin and stays well under that cadence. `ELANOUS_MSG_DEDUPE_WINDOW_MS` (0 = off)
+ *  or the store option overrides it. Only sender entrances opt in (`msg post` — `--no-dedupe` skips it — and the MsgPost
+ *  tool); programmatic producers keep exact append. */
+export const MSG_DEDUPE_WINDOW_MS = 10 * 60_000;
+
+function resolveDedupeWindowMs(option: number | undefined): number {
+  if (option !== undefined && Number.isFinite(option) && option >= 0) return option;
+  const raw = process.env.ELANOUS_MSG_DEDUPE_WINDOW_MS;
+  const parsed = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : MSG_DEDUPE_WINDOW_MS;
+}
+
+/** The idempotency key's body part — hex sha256 of the exact UTF-8 body. */
+export function messageBodySha256(body: string): string {
+  return createHash('sha256').update(body, 'utf8').digest('hex');
+}
+
+/** Busy wait for every connection this module opens (writers and read-only readers alike). */
+export const MSG_BUSY_TIMEOUT_MS = 5_000;
 
 export interface UnreadRecipient {
   recipient: string;
@@ -378,6 +403,7 @@ function parseStoredProvenance(json: string | null | undefined): Provenance | un
 export class MsgStore {
   readonly db: Database;
   private readonly clock: () => Date;
+  private readonly dedupeWindowMs: number;
   /** posted-receipt events held until the outermost write transaction commits (dropped on rollback). */
   private pendingPostedEvents: Array<() => void> = [];
   private postedEventDepth = 0;
@@ -433,12 +459,13 @@ export class MsgStore {
     return this.db.transaction(() => read(this.hasReplyTo, this.hasGroupMemberships, this.hasProvenance, this.hasFromKind)).deferred();
   }
 
-  constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date } = {}) {
+  constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date; dedupeWindowMs?: number; busyTimeoutMs?: number } = {}) {
     this.clock = options.now ?? (() => new Date());
+    this.dedupeWindowMs = resolveDedupeWindowMs(options.dedupeWindowMs);
     if (options.readOnly && (path === ':memory:' || !existsSync(path))) throw new Error('message ledger unavailable for read-only SSE service');
     if (!options.readOnly && path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = options.readOnly ? new Database(path, { readonly: true }) : new Database(path);
-    this.db.exec('PRAGMA busy_timeout = 5000');
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? MSG_BUSY_TIMEOUT_MS))}`);
     if (!options.readOnly) this.db.exec(`CREATE TABLE IF NOT EXISTS msg_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       sender TEXT NOT NULL,
@@ -488,8 +515,10 @@ export class MsgStore {
       summary_id INTEGER REFERENCES msg_messages(id),
       PRIMARY KEY(sender, hour_start)
     );`);
-    // Serialize the schema check and ALTER across processes opening an old ledger at once.
-    if (!options.readOnly) this.db.transaction(() => {
+    // Serialize the schema check and ALTER across processes opening an old ledger at once. ELN-MSG-POST-IDEMPOTENT busy
+    // review: every writable open used to take this IMMEDIATE (RESERVED) lock even when nothing was missing — one extra
+    // writer per `msg post` / receipt write against ~30 polling seats. A current ledger now skips it after one read.
+    if (!options.readOnly && this.needsMigration()) this.db.transaction(() => {
       const replyToColumn = (this.db.query(`SELECT COUNT(*) AS count FROM pragma_table_info('msg_messages') WHERE name = 'reply_to'`)
         .get() as { count: number }).count;
       if (replyToColumn === 0) this.db.exec('ALTER TABLE msg_messages ADD COLUMN reply_to INTEGER');
@@ -515,8 +544,46 @@ export class MsgStore {
       if (!columns.has('origin_delegated')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN origin_delegated INTEGER');
       // A217 — request completion condition (additive · old binaries ignore it).
       if (!columns.has('done_when')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN done_when TEXT');
+      // ELN-MSG-POST-IDEMPOTENT — the body part of the sender idempotency key. Rows written before it stay NULL;
+      // the dedupe lookup compares their body directly, so a retry that straddles the upgrade still collapses.
+      if (!columns.has('body_sha256')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN body_sha256 TEXT');
+      // MF3: the per-attempt token a sender writes with its INSERT, so recovery can identify its own commit.
+      if (!columns.has('post_attempt')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN post_attempt TEXT');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_dedupe ON msg_messages(sender, recipient, created_at)');
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_post_attempt ON msg_messages(post_attempt)');
     }).immediate();
+  }
+
+  /** Columns and indexes the IMMEDIATE migration block above adds; when all exist, opening needs no write lock. */
+  private needsMigration(): boolean {
+    const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
+    const wanted = ['reply_to', 'expires_at', 'priority', 'supersedes', 'provenance_json', 'from_kind', 'crown_directive', 'intent',
+      'refs_json', 'body_ref_json', 'deadline_at', 'needs_ack', 'schema_version', 'origin_seat', 'origin_delegated', 'done_when', 'body_sha256',
+      'post_attempt'];
+    if (wanted.some(name => !columns.has(name))) return true;
+    const indexes = new Set((this.db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'msg_messages'").all() as { name: string }[])
+      .map(row => row.name));
+    return !indexes.has('idx_msg_messages_reply_to') || !indexes.has('idx_msg_messages_dedupe') || !indexes.has('idx_msg_messages_post_attempt');
+  }
+
+  /**
+   * ELN-MSG-POST-IDEMPOTENT — the newest stored message with the same sender, recipient, reply target and body posted at
+   * or after `sinceIso`. Pre-key rows (body_sha256 NULL) match on the body itself. Runs inside the caller's IMMEDIATE
+   * transaction when called from `post`, so two concurrent identical posts serialize and the second finds the first.
+   */
+  findRecentPost(input: Pick<MessageEnvelope, 'from' | 'to' | 'body' | 'replyTo'>, sinceIso: string): Message | null {
+    const from = canonicalMessageAddress(input.from);
+    const to = canonicalMessageAddress(input.to);
+    const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
+    const keyed = columns.has('body_sha256');
+    const replyClause = columns.has('reply_to') ? 'AND reply_to IS ?' : '';
+    const bodyClause = keyed ? '(body_sha256 = ? OR (body_sha256 IS NULL AND body = ?))' : 'body = ?';
+    const params: Array<string | number | null> = [from, to, sinceIso, ...(columns.has('reply_to') ? [input.replyTo ?? null] : []),
+      ...(keyed ? [messageBodySha256(input.body), input.body] : [input.body])];
+    const row = this.db.query(`SELECT id FROM msg_messages WHERE sender = ? AND recipient = ? AND created_at >= ? ${replyClause}
+      AND ${bodyClause} ORDER BY id DESC LIMIT 1`).get(...params) as { id: number } | null;
+    return row === null ? null : this.getMessage(row.id);
   }
 
   append(input: MessageEnvelope): Message { return this.post(input); }
@@ -555,7 +622,7 @@ export class MsgStore {
     });
   }
 
-  private insertMessage(input: MessageEnvelope): Message {
+  private insertMessage(input: MessageEnvelope, attemptToken?: string): Message {
     const msg = validateMessageEnvelope(input);
     if (msg.replyTo !== undefined && this.db.query('SELECT 1 FROM msg_messages WHERE id = ?').get(msg.replyTo) === null) {
       throw new Error(`reply target not found: #${msg.replyTo}`);
@@ -573,8 +640,8 @@ export class MsgStore {
       ? { ...baseOrigin, delegatedByCrown: true as const }
       : baseOrigin;
     const fromKind = origin?.kind ?? null;
-    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes, provenance_json, from_kind, intent, refs_json, deadline_at, needs_ack, crown_directive, schema_version, body_ref_json, origin_seat, origin_delegated, done_when)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null, msg.provenance ? JSON.stringify(msg.provenance) : null, fromKind, intent, msg.refs ? JSON.stringify(msg.refs) : null, msg.deadlineAt ?? null, needsAck ? 1 : 0, msg.crownDirective ?? null, 2, null, origin?.seat ?? null, origin?.delegatedByCrown === undefined ? null : (origin.delegatedByCrown ? 1 : 0), msg.doneWhen ?? null);
+    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes, provenance_json, from_kind, intent, refs_json, deadline_at, needs_ack, crown_directive, schema_version, body_ref_json, origin_seat, origin_delegated, done_when, body_sha256, post_attempt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null, msg.provenance ? JSON.stringify(msg.provenance) : null, fromKind, intent, msg.refs ? JSON.stringify(msg.refs) : null, msg.deadlineAt ?? null, needsAck ? 1 : 0, msg.crownDirective ?? null, 2, null, origin?.seat ?? null, origin?.delegatedByCrown === undefined ? null : (origin.delegatedByCrown ? 1 : 0), msg.doneWhen ?? null, messageBodySha256(msg.body), attemptToken ?? null);
     const id = Number(result.lastInsertRowid);
     // SEAT-INBOX B1-C §4a — posted = 원장 커밋. 수신자 칸은 주소 그대로(ALL · group 포함).
     recordReceiptOn(this.db, { messageId: id, recipient: msg.to, state: 'posted', source: 'ledger' }, () => new Date(createdAt),
@@ -654,35 +721,89 @@ export class MsgStore {
     return listReceiptsOn(this.db, { ...query, ...(query.from === undefined ? {} : { from: canonicalSeatId(query.from) }) });
   }
 
-  post(input: MessageEnvelope): Message {
+  /** `dedupe: true` = the sender idempotency key applies (see {@link MSG_DEDUPE_WINDOW_MS}). */
+  post(input: MessageEnvelope, options: { dedupe?: boolean; attemptToken?: string } = {}): Message {
     const message = validateMessageEnvelope(input);
-    if (message.to.startsWith('group:')) return this.withPostedEvents(() => {
-      if (!this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(message.to)) throw new Error(`group not found: ${message.to}`);
-      return this.insertMessage(message);
-    });
-    if (message.to !== 'ALL') return this.withPostedEvents(() => this.insertMessage(message));
-    const now = this.clock();
-    const hourStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours())).toISOString();
-    return this.withPostedEvents(() => {
+    // ELN-MSG-POST-IDEMPOTENT — the lookup and the insert share one IMMEDIATE transaction on EVERY branch (a seat,
+    // `group:`, `ALL`): a concurrent identical post waits for this one and then finds it (no unique index can express
+    // «within N minutes»). Sender entrances (`msg post`, MsgPost) opt in; programmatic producers keep exact append.
+    const windowMs = options.dedupe === true ? this.dedupeWindowMs : 0;
+    const recent = (): Message | null => windowMs > 0
+      ? this.findRecentPost(message, new Date(Date.now() - windowMs).toISOString())
+      : null;
+    const insert = (envelope: MessageEnvelope): Message => this.insertMessage(envelope, options.attemptToken);
+    const posted: Message = this.withPostedEvents((): Message => {
+      if (message.to.startsWith('group:')) {
+        if (!this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(message.to)) throw new Error(`group not found: ${message.to}`);
+        const existing = recent();
+        return existing === null ? insert(message) : { ...existing, deduped: true as const };
+      }
+      if (message.to !== 'ALL') {
+        const existing = recent();
+        return existing === null ? insert(message) : { ...existing, deduped: true as const };
+      }
+      // ALL: a retried identical broadcast is the same logical send — it returns the stored row and spends no budget.
+      const existing = recent();
+      if (existing !== null) return { ...existing, deduped: true as const };
+      const now = this.clock();
+      const hourStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours())).toISOString();
       const row = this.db.query(`SELECT broadcast_count, summary_id FROM msg_group_all_budget
         WHERE sender = ? AND hour_start = ?`).get(message.from, hourStart) as { broadcast_count: number; summary_id: number | null } | null;
       if (row && row.broadcast_count >= 2) {
         if (row.summary_id !== null) {
           return this.getMessage(row.summary_id)!;
         }
-        const summary = this.insertMessage({ from: message.from, to: 'ALL', kind: 'summary',
+        const summary = insert({ from: message.from, to: 'ALL', kind: 'summary',
           body: 'group:all 시간당 상한(2건)을 초과한 방송은 이 요약 한 건으로 접었습니다.' });
         this.db.query('UPDATE msg_group_all_budget SET summary_id = ? WHERE sender = ? AND hour_start = ?')
           .run(summary.id, message.from, hourStart);
         return summary;
       }
-      const posted = this.insertMessage(message);
+      const stored = insert(message);
       this.db.query(`INSERT INTO msg_group_all_budget(sender, hour_start, broadcast_count, summary_id)
         VALUES (?, ?, 1, NULL) ON CONFLICT(sender, hour_start)
         DO UPDATE SET broadcast_count = msg_group_all_budget.broadcast_count + 1`)
         .run(message.from, hourStart);
-      return posted;
+      return stored;
     });
+    if (posted.deduped) {
+      try { debug.log('msg', 'msg.post.deduped', { msgId: posted.id, from: posted.from, to: posted.to, windowMs }, { level: 'warn' }); }
+      catch { /* observability is fail-open */ }
+    }
+    return posted;
+  }
+
+  /**
+   * ELN-MSG-POST-IDEMPOTENT MF4 — the message stored under a provenance (origin) key, or null. The `--origin-key` path is
+   * idempotent BY THAT KEY (appendWithProvenance returns the existing row), so recovery after an ambiguous write may
+   * claim success through it: the key names one logical message by contract, whichever attempt stored it.
+   */
+  findByProvenanceKey(provenanceKey: string): Message | null {
+    const row = this.db.query('SELECT message_id FROM msg_provenance WHERE provenance_key = ?').get(provenanceKey) as { message_id: number } | null;
+    return row === null ? null : this.getMessage(row.message_id);
+  }
+
+  /**
+   * #38516 r3 MF2 — recovery on the `--origin-key` path. The write may have failed BEFORE its own validation ran, so the
+   * stored row under the key is this send only if it is the same sender → recipient; otherwise null (the caller reports
+   * the original write error — never another recipient's row as this send's success).
+   */
+  findByProvenanceKeyFor(provenanceKey: string, input: Pick<MessageEnvelope, 'from' | 'to'>): Message | null {
+    const found = this.findByProvenanceKey(provenanceKey);
+    if (found === null) return null;
+    return found.from === canonicalSeatId(input.from) && found.to === canonicalSeatId(input.to) ? found : null;
+  }
+
+  /**
+   * ELN-MSG-POST-IDEMPOTENT MF3 — the row THIS attempt committed, by the token written in the same INSERT. Recovery after
+   * an ambiguous write error only claims success through this: an older identical row never stands in for a send that
+   * was not stored.
+   */
+  findPostByAttempt(attemptToken: string): Message | null {
+    const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
+    if (!columns.has('post_attempt')) return null;
+    const row = this.db.query('SELECT id FROM msg_messages WHERE post_attempt = ? ORDER BY id DESC LIMIT 1').get(attemptToken) as { id: number } | null;
+    return row === null ? null : this.getMessage(row.id);
   }
 
   createGroup(name: string, owner: string): string {
@@ -791,7 +912,8 @@ export class MsgStore {
   }
 
   /** Messages strictly after the supplied cursor, ordered by durable insertion ID. */
-  listByRecipient(recipient: string, after: number = 0, limit: number = 100): Message[] {
+  /** `includeAcked`: history reading — messages acknowledged one by one (or marked seen, §4c compat ack) stay in the list. */
+  listByRecipient(recipient: string, after: number = 0, limit: number = 100, opts: { includeAcked?: boolean } = {}): Message[] {
     const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(after);
@@ -804,7 +926,7 @@ export class MsgStore {
           AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
       )` : '';
       const acksJoin = hasAcks ? 'LEFT JOIN msg_message_acks a ON a.message_id=m.id AND a.recipient=?' : '';
-      const ackFilter = hasAcks ? 'AND a.message_id IS NULL' : '';
+      const ackFilter = hasAcks && !opts.includeAcked ? 'AND a.message_id IS NULL' : '';
       const expiryFilter = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
       const metadata = hasMetadata ? 'm.expires_at, m.priority, m.supersedes' : 'NULL AS expires_at, NULL AS priority, NULL AS supersedes';
       const provenance = hasProvenance ? 'm.provenance_json' : 'NULL AS provenance_json';
@@ -871,8 +993,8 @@ export class MsgStore {
     });
   }
 
-  list(recipient: string, after: number = 0, limit: number = 100): Message[] {
-    return this.listByRecipient(recipient, after, limit);
+  list(recipient: string, after: number = 0, limit: number = 100, opts: { includeAcked?: boolean } = {}): Message[] {
+    return this.listByRecipient(recipient, after, limit, opts);
   }
 
   /** One ordered scan for every SSE subscriber; recipient filtering happens in the server. */
@@ -917,6 +1039,33 @@ export class MsgStore {
   }
 
   ack(recipient: string, cursor: number): number { return this.advanceCursor(recipient, cursor); }
+
+  /**
+   * Cursor ack that leaves «seen» for every message it moves past (unacknowledged · after the cursor · ≤ through), in one
+   * transaction — the hand-ack rule of #38305, shared by the CLI and the agent's MsgAck tool. Without it the tool path moved
+   * the cursor silently: HAND-ELN-ELS-API acked #87012 at 10:16 and the ledger still showed it «delivered», never seen
+   * (11-18 ELN-SEAT-LIVE). A failed receipt is a warn and never changes the ack.
+   */
+  ackThroughSeen(recipient: string, through: number, source: Extract<ReceiptSource, 'cli-ack' | 'tool-ack'>): number {
+    return this.db.transaction(() => {
+      const HAND_ACK_SEEN_MAX = 1000; // Source: #38305 REVIEW ③ — the same bound as listByRecipient's page
+      const page = this.listByRecipient(recipient, this.getCursor(recipient), HAND_ACK_SEEN_MAX);
+      const passing = page.filter(message => message.id <= through).map(message => message.id);
+      if (page.length === HAND_ACK_SEEN_MAX && page.every(message => message.id <= through)) {
+        try { debug.log('msg.receipt-writer', 'hand-ack-seen-truncated', { recipient, through, marked: passing.length, source }, { level: 'warn' }); }
+        catch { /* observability is fail-open */ }
+      }
+      const moved = this.ack(recipient, through);
+      for (const id of passing) {
+        try { this.recordReceipt({ messageId: id, recipient, state: 'seen', source }); }
+        catch (error) {
+          try { debug.log('msg.receipt-writer', 'record-failed', { msgId: id, recipient, state: 'seen', source, error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+          catch { /* observability is fail-open */ }
+        }
+      }
+      return moved;
+    }).immediate();
+  }
 
   /** Acknowledge exactly one delivered message for its recipient without moving past siblings. */
   ackMessage(recipient: string, messageId: number, status: 'acked' | 'done' = 'acked'): boolean {
@@ -986,6 +1135,8 @@ export function readUnreadCount(recipient: string, path: string = defaultMsgStor
   if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
   if (!existsSync(path)) return null;
   const db = new Database(path, { readonly: true });
+  // Without a busy wait a reader fails at once while any writer commits (11-18: «database is locked» every few seconds).
+  db.exec(`PRAGMA busy_timeout = ${MSG_BUSY_TIMEOUT_MS}`);
   try { return unreadCountOn(db, to); }
   finally { db.close(); }
 }
@@ -996,6 +1147,7 @@ export function readUnreadSummary(recipient: string, path: string = defaultMsgSt
   if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
   if (!existsSync(path)) return null;
   const db = new Database(path, { readonly: true });
+  db.exec(`PRAGMA busy_timeout = ${MSG_BUSY_TIMEOUT_MS}`);
   try { return unreadSummaryOn(db, to); }
   finally { db.close(); }
 }
@@ -1006,6 +1158,7 @@ export function readUnreadSource(recipient: string, path: string = defaultMsgSto
   if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
   if (!existsSync(path)) return null;
   const db = new Database(path, { readonly: true });
+  db.exec(`PRAGMA busy_timeout = ${MSG_BUSY_TIMEOUT_MS}`);
   try { return unreadSourceOn(db, to); }
   finally { db.close(); }
 }

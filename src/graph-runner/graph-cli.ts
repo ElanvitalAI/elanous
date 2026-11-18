@@ -486,9 +486,11 @@ export function registerGraphCommands(program: Command, runsDeps: {
   graph.command('approve <graph_id> <run_id>')
     .option('--reject', 'Reject instead of approving')
     .option('--outcome <name>', 'Choose a declared named approval outcome (release gate waiver only)')
+    .option('--choice <key>', 'Choose one declared HITL option key (nodes with 3+ options); the default option records a rejection')
     .option('--by <name>', 'Record the approver name')
-    .action(async (graphId: string, runId: string, opts: { reject?: boolean; outcome?: string; by?: string }) => {
+    .action(async (graphId: string, runId: string, opts: { reject?: boolean; outcome?: string; choice?: string; by?: string }) => {
       try {
+        if (opts.choice !== undefined && opts.reject) throw new Error('--choice cannot be combined with --reject (the chosen option decides)');
         // A release approval is the decision point for a live publish run. Resume its
         // saved graph immediately so approval does not depend on a later manual tick.
         // Resolve the release graph before recording the irreversible decision; if it
@@ -501,19 +503,23 @@ export function registerGraphCommands(program: Command, runsDeps: {
           if (installed.edges?.find((edge) => edge.from === KNOWN_ISSUE_ROUTE.approval)?.map?.[KNOWN_ISSUE_ROUTE.outcome] !== KNOWN_ISSUE_ROUTE.passed)
             throw new Error('installed release graph lacks the known-issue waiver edge');
         }
-        const state = decideGraphApproval(graphId, runId, opts.reject ? 'rejected' : 'approved', opts.by, runsDeps.root,
-          opts.outcome === undefined ? undefined : { nodeId: KNOWN_ISSUE_ROUTE.approval, visit: 1, outcome: opts.outcome });
+        const chosen = opts.choice === undefined ? undefined
+          : readGraphRun(graphId, runId, runsDeps.root ?? effectiveInstanceRoot()).pending?.choices?.find(option => option.key === opts.choice);
+        // An undeclared key falls through as 'approved' so decideGraphApproval refuses it with its own event.
+        const decision = opts.reject || chosen?.default === true ? 'rejected' : 'approved';
+        const state = decideGraphApproval(graphId, runId, decision, opts.by, runsDeps.root,
+          opts.outcome === undefined ? undefined : { nodeId: KNOWN_ISSUE_ROUTE.approval, visit: 1, outcome: opts.outcome }, opts.choice);
         if (releaseGraph) {
           await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
           const { graphTick } = await import('./graph-tick.js');
           const result = await graphTick(releaseGraph, { resumeRunId: runId, deps: { root: runsDeps.root, runBash: runsDeps.runBash } });
-          console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision} · ${result.action} ${result.status ?? ''}`.trim());
+          console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision}${state.pending?.choice === undefined ? '' : ` (${state.pending.choice})`} · ${result.action} ${result.status ?? ''}`.trim());
           if (opts.reject) {
             console.error(`${state.graphId} ${state.runId}: approval rejected${opts.by ? ` by ${opts.by}` : ''}`);
             process.exitCode = 1;
           }
         } else {
-          console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision}`);
+          console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision}${state.pending?.choice === undefined ? '' : ` (${state.pending.choice})`}`);
           if (opts.reject) {
             console.error(`${state.graphId} ${state.runId}: approval rejected${opts.by ? ` by ${opts.by}` : ''}`);
             process.exitCode = 1;

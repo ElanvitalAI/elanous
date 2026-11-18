@@ -28,3 +28,13 @@ test('TUI-SLASH-TEXT-KOREAN-AND-RESIDUE: alias pairs show once, with the typed s
   expect(typed?.text).toBe('/clear');
   expect(typed?.description).toContain('alias /new');
 });
+
+test('TUI-COMPACT-CROWDED-FOOTER: the first candidate of an empty query is /help, never /quit (Enter runs the first row)', () => {
+  const all = candidates('/').map((candidate) => candidate.text);
+  expect(all[0]).toBe('/help');
+  expect(all.at(-1)).toBe('/quit');
+  expect(all).toContain('/quit');
+  // A typed query still ranks by classic score: /q finds /quit first.
+  expect(candidates('/q')[0]?.text).toBe('/quit');
+  expect(candidates('/qu').map((candidate) => candidate.text)).toEqual(['/quit', '/remaining']);
+});

@@ -25,7 +25,13 @@ export interface TaPreflightEvidence {
   readonly image?: { readonly expectedDigest?: string | null; readonly observedDigest?: string | null };
   /** ③ 작업 지시서 · 자동 merge 끔 · 귀속(owner 가 카드·lease 와 같은지). */
   readonly workOrder?: Pick<WorkOrder, 'cellId' | 'boundary' | 'budget' | 'contract' | 'escalation' | 'unknownFields'> | null;
-  readonly autoMerge?: boolean | null;
+  /**
+   * 실제 발사 argv — `tasks hand` shadow 가 만드는 명령(`harness say …` 의 플래그들). 선언값(autoMerge:false)이 아니라 이 argv 로 merge 경로를 판정한다.
+   * 자동 병합이 가능한 argv(`--merge-by-host`·`--auto-merge`·`--no-auto-merge` 없음)면 FAIL · argv 가 없거나 `harness say` 명령이 아니면 UNMEASURED.
+   */
+  readonly launchArgv?: readonly string[] | null;
+  /** merge 경로 사유용 — `--ta-land`(발사 env ELANOUS_TA_LAND) 여부 · config taskAgent.liveMoves 에 propose-land 가 설정돼 있는지. */
+  readonly mergePolicy?: { readonly taLandEnv?: boolean | null; readonly liveMovesProposeLand?: boolean | null };
   readonly owner?: { readonly card?: string | null; readonly lease?: string | null; readonly pod?: string | null };
   /** ④ 시간·비용: 벽시계 상한과 Job 상한(초), USD 상한. 벽시계 < Job 이어야 하고 USD 상한이 양수여야 한다. */
   readonly limits?: { readonly wallClockSec?: number | null; readonly jobDeadlineSec?: number | null; readonly usdCap?: number | null };
@@ -116,6 +122,41 @@ function checkImage(e: TaPreflightEvidence['image'], fc: TaPreflightEvidence['fa
     : '소비 digest == 요청 pin');
 }
 
+/**
+ * 실제 발사 argv 에서 «사람 리뷰 없이 병합될 수 있는가». 판정 함수는 입력마다 «없음 · 형식 오류 · 값» 세 갈래를 먼저 고정한다:
+ *  - argv: 없음(null/undefined/빈 배열)·형식 오류(배열 아님·문자열 아닌 토큰)·명령 아님(`harness say` 로 시작하지 않음) → unknown · 값 → 옵션 토큰만(첫 `--` 앞) 읽는다.
+ *  - taLandEnv: 불리언이 아니면(없음·null·문자열·숫자) unknown — «--ta-land 아님»을 모름에서 지어내지 않는다.
+ * 순서: 알려진 나쁨(병합 인자 있음·--no-auto-merge 없음)은 모름보다 먼저 open · 닫힘(closed)은 `--no-auto-merge` ∧ 병합 인자 없음 ∧ taLandEnv===false 일 때만.
+ */
+type MergePath = { readonly state: 'closed' } | { readonly state: 'open' | 'unknown'; readonly reason: string };
+function mergePathOf(argv: TaPreflightEvidence['launchArgv'], policy: TaPreflightEvidence['mergePolicy']): MergePath {
+  const fails: string[] = [];
+  const unknowns: string[] = [];
+  // taLandEnv — 불리언만 값이다(없음·null·문자열·숫자 = 모름). true 면 TA 가 병합을 맡는다 = 자동 병합 경로(argv 를 몰라도 확정).
+  const taLand = typeof policy?.taLandEnv === 'boolean' ? policy.taLandEnv : null;
+  if (taLand === true) fails.push(policy?.liveMovesProposeLand === true ? '--ta-land: TA propose-land 이 병합' : '--ta-land: liveMoves propose-land 미설정이면 호스트가 병합');
+  else if (taLand === null) unknowns.push('--ta-land(발사 env) 여부 증거 없음 또는 불리언 아님 — «아님»을 모름에서 지어내지 않음');
+  // argv — 없음 / 형식 오류 / 명령 아님 → 모름 · 값이면 옵션 토큰만(첫 `--` 앞) 읽는다.
+  if (argv === null || argv === undefined || (Array.isArray(argv) && argv.length === 0)) unknowns.push('실제 발사 argv 없음(hand shadow 출력 필요) — 선언값은 쓰지 않음');
+  else if (!Array.isArray(argv) || argv.some((a) => typeof a !== 'string')) unknowns.push('발사 argv 형식 오류(문자열 배열 아님)');
+  else {
+    const tokens = argv as readonly string[];
+    const head = tokens[0] === 'harness' ? 0 : (tokens[0] === 'elanous' || tokens[0] === 'eln') && tokens[1] === 'harness' ? 1 : -1;
+    if (head < 0 || tokens[head + 1] !== 'say') unknowns.push('발사 argv 가 `harness say` 로 시작하는 명령이 아님');
+    else {
+      const end = tokens.indexOf('--');
+      const options = tokens.slice(head + 2, end < 0 ? undefined : end);
+      const noAuto = options.includes('--no-auto-merge');
+      if (options.includes('--merge-by-host')) fails.push(`자동 병합 가능 — ${policy?.liveMovesProposeLand === true ? '호스트가 재게이트 뒤 병합(--ta-land 아니면 propose-land 설정은 무관)' : '호스트가 재게이트 뒤 병합(liveMoves propose-land 미설정)'}${noAuto ? ' · --no-auto-merge 가 있어도 병합 인자가 우선' : ''}`);
+      if (options.includes('--auto-merge')) fails.push(`자동 병합 가능 — 자동 병합(--auto-merge)${noAuto ? ' · --no-auto-merge 가 있어도 병합 인자가 우선' : ''}`);
+      if (!noAuto) fails.push('자동 병합 가능 — --no-auto-merge 없음(하니스 기본은 자동 병합)');
+    }
+  }
+  if (fails.length) return { state: 'open', reason: fails.join(' · ') };
+  if (unknowns.length) return { state: 'unknown', reason: unknowns.join(' · ') };
+  return { state: 'closed' };
+}
+
 function checkOrder(e: TaPreflightEvidence): PreflightCondition {
   const name = '작업 지시서 · 귀속 · 자동 merge 0';
   const fails: string[] = [];
@@ -127,8 +168,9 @@ function checkOrder(e: TaPreflightEvidence): PreflightCondition {
     const unknown = PREFLIGHT_CRITICAL_ORDER_FIELDS.filter((field) => (Array.isArray(unknownFields) ? unknownFields.includes(field) : true) || !present(order[field]) || order[field] === WORK_ORDER_UNKNOWN);
     if (unknown.length) fails.push(`critical 모름: ${unknown.join(', ')}`);
   }
-  if (e.autoMerge === true) fails.push('자동 merge 켜짐');
-  else if (!isBool(e.autoMerge)) unknowns.push('--no-auto-merge 증거 없음 또는 불리언 아님');
+  const merge = mergePathOf(e.launchArgv, e.mergePolicy);
+  if (merge.state === 'open') fails.push(merge.reason);
+  else if (merge.state === 'unknown') unknowns.push(merge.reason);
   // owner 귀속은 «모름 지시서 거부» 코드로 대신할 수 없다 — 세 칸이 모두 있고 같아야 PASS. 있는 칸끼리 다르면 빈 칸이 있어도 불일치는 확정(FAIL).
   const { card, lease, pod } = e.owner ?? {};
   const owners = [card, lease, pod].filter(present);

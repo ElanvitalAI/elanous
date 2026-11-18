@@ -121,7 +121,7 @@ test('web slot retry preserves the session while response construction retains i
     }, google, successRedirectUri: 'https://app.example.test/signup/complete' });
     const slotResponse = await slotApi.handle(new Request(callbackUrl, { headers: { cookie: stateCookie } }));
     expect(slotResponse?.status).toBe(303);
-    expect(slotResponse?.headers.get('location')).toBe('https://api.example.test/v1/members/home');
+    expect(slotResponse?.headers.get('location')).toBe('https://app.example.test/signup/complete');
     expect(slotResponse?.headers.get('set-cookie')).toContain('__Host-elanous_member_session=');
 
     const responseApi = createMembersApi({ store: { ...responseStore,

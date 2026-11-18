@@ -20,6 +20,7 @@ import {
   chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { dirname, join, resolve, sep } from 'node:path';
 import { SERVICE_KEY_CATALOG } from '../setup/service-key-catalog.js';
 import {
@@ -149,7 +150,7 @@ export function parseStaticLeaseTarget(raw: string): { type: StaticLeaseTargetTy
 
 export function defaultKnownConfigRoots(): string[] {
   const home = homedir();
-  const roots = [join(home, '.elanous'), join(home, 'elanous-hq')];
+  const roots = [prodInstanceRoot(home), join(home, 'elanous-hq')];
   try {
     for (const name of readdirSync(home)) if (name.startsWith('.elanous-')) roots.push(join(home, name));
   } catch { /* HOME 못 읽음 — 기본 둘만 */ }
@@ -254,7 +255,7 @@ async function defaultReadSourceValue(item: StaticLeaseItem): Promise<string | u
   const cacheDir = process.env.ELANOUS_KEY_CACHE_DIR?.trim() || join(homedir(), '.cache');
   const cacheFile = join(cacheDir, item.cacheName);
   try {
-    const leased = resolveStaticLeaseCopy(item.cacheName, { roots: [defaultConfigDir(), join(homedir(), '.elanous')], cacheFilePath: cacheFile });
+    const leased = resolveStaticLeaseCopy(item.cacheName, { roots: [defaultConfigDir(), prodInstanceRoot()], cacheFilePath: cacheFile });
     if (leased) return { refused: 'source-is-lease' };
   } catch { return { refused: 'source-is-lease' }; }
   try {
@@ -363,11 +364,16 @@ export function revokeLocalStaticLeaseCopy(root: string, record: StaticLeaseReco
 
 /** 원격 설치 스크립트 — 고정 문자열(값 0). 입력은 stdin JSON 하나. 사본 = ~/.cache/<name>(과도기 호환 · 설계 §3.2) · 메타 = ~/.elanous/secrets-lease/meta.
  *  EXPIRES(~/.cache 사본 위치): 소비자 resolver 이주 칸마다 — HQ-CREDENTIAL-VAULT.md §6 «호스트별 ~/.cache/*_api_key» 줄. 이주 뒤 사본은 임대 영역(copies/)으로만. */
+/** 원격 메타 영역 — «원격 호스트의 $HOME» 기준 상대 조각(이 프로세스의 집이 아니다 · `CODEX_LEASE_REMOTE_DIR` 과 같은 꼴).
+ *  원격 스크립트 문자열 안에 `.elanous` 를 손으로 박지 않고 이 상수 하나에서 짓는다(격리 하드코딩 게이트). */
+const STATIC_LEASE_REMOTE_META_SEGMENTS = ['.elanous', 'secrets-lease', 'meta'] as const;
+const REMOTE_META_JOIN_ARGS = STATIC_LEASE_REMOTE_META_SEGMENTS.map((segment) => JSON.stringify(segment)).join(',');
+
 export const REMOTE_STATIC_LEASE_SCRIPT = [
   'const fs=require("node:fs"),path=require("node:path"),os=require("node:os");',
   'const p=JSON.parse(fs.readFileSync(0,"utf8"));',
   'if(!p||!/^[a-z0-9][a-z0-9_]{0,63}$/.test(p.cacheName)||!/^[A-Za-z0-9_-]{4,64}$/.test(p.leaseId))process.exit(2);',
-  'const home=os.homedir(),cacheDir=path.join(home,".cache"),area=path.join(home,".elanous","secrets-lease","meta"),copy=path.join(cacheDir,p.cacheName),metaPath=path.join(area,p.cacheName+".json");',
+  `const home=os.homedir(),cacheDir=path.join(home,".cache"),area=path.join(home,${REMOTE_META_JOIN_ARGS}),copy=path.join(cacheDir,p.cacheName),metaPath=path.join(area,p.cacheName+".json");`,
   'const w=(f,s)=>{fs.mkdirSync(path.dirname(f),{recursive:true,mode:0o700});const t=f+"."+process.pid+".tmp";try{fs.writeFileSync(t,s,{mode:0o600,flag:"wx"});fs.chmodSync(t,0o600);fs.renameSync(t,f)}finally{try{fs.unlinkSync(t)}catch{}}};',
   'fs.mkdirSync(area,{recursive:true,mode:0o700});fs.chmodSync(path.dirname(area),0o700);fs.chmodSync(area,0o700);',
   'if(p.op==="install"){if(typeof p.value!=="string"||!p.value||/[\\r\\n\\0]/.test(p.value)||!p.meta||p.meta.leaseId!==p.leaseId)process.exit(2);',

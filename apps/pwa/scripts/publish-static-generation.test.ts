@@ -122,6 +122,16 @@ describe('publishStaticGeneration', () => {
     await expectOld(out, old);
   });
 
+  test('rejects the Next.js prerender fallback shell and leaves the active generation untouched', async () => {
+    const { source, publishRoot, out } = await fixture();
+    const old = await installOld(out);
+    await writeFile(path.join(source, 'index.html'), '<html id="__next_error__"><head></head><body></body></html>');
+
+    await expect(publishStaticGeneration(source, publishRoot)).rejects.toThrow('__next_error__');
+
+    await expectOld(out, old);
+  });
+
   test('rename failure leaves the active generation untouched', async () => {
     const { source, publishRoot, out } = await fixture();
     const old = await installOld(out);

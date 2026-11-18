@@ -1,0 +1,20 @@
+{
+  "id": "private-sshd",
+  "name": "Private sshd",
+  "implementation": ["src/ux-sim/private-sshd.ts"],
+  "tests": ["src/cli/els-ssh-pty.test.ts"],
+  "target": "a real ssh login for ELS-SSH-ATTACH-ANYWHERE PTY tests: the current user's own sshd on a free loopback port with throw-away keys in a temp folder, never touching ~/.ssh or the system sshd",
+  "inputs": [
+    "a free loopback port",
+    "throw-away host and user keys in a temp folder"
+  ],
+  "observations": [
+    "the current user logs in over a real ssh channel with public-key auth",
+    "els-ssh-pty opens a real PTY through it",
+    "stop() kills the sshd and removes the temp folder"
+  ],
+  "entryCommands": ["bun test src/cli/els-ssh-pty.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

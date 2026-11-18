@@ -73,7 +73,7 @@ test('TA-LAND-COUNT-FROM-LEDGER guards the live ta-land CLI launch from its meas
   const card = (id: string, runId: string): TaskCard => ({ id, text: id, createdAt: '2026-11-08T00:00:00Z',
     status: 'launched', taLand: true, runId, history: [] });
   const deps = (statePath: string): TasksCliDeps => ({ taskStatePath: statePath, registerSink: async () => true,
-    taskLauncher: (args) => { launches.push([...args]); } });
+    taskLauncher: (args, _cwd, launchContext) => { launches.push([...args]); return { runId: launchContext?.runId }; } });
   try {
     const missingTarget = await run(['tasks', 'hand', 'new task', '--ta-land', '--live'], deps(join(root, 'missing/cards.json')));
     expect(missingTarget.code).toBe(1);
@@ -210,7 +210,7 @@ test('TA-LAND-COUNT-FROM-LEDGER preserves draft-claim single-launch bypass for h
   let launches = 0;
   try {
     const result = await run(['tasks', 'hand', 'claim one draft', '--draft-claim', '123', '--ta-land', '--ta-land-max', '1', '--tier', '상', '--live'], {
-      taskStatePath: statePath, registerSink: async () => true, taskLauncher: () => { launches++; },
+      taskStatePath: statePath, registerSink: async () => true, taskLauncher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; },
       draftClaimGh: { observePr: async () => ({ labels: [], updatedAt: new Date().toISOString() }), postComment: async () => 'comment' },
     });
     expect(result.code ?? 0).toBe(0);
@@ -339,7 +339,7 @@ test('tasks adopt-pr binds an existing OPEN PR once without relaunch and queues 
     writeTaskCards(path, [card]);
     let launched = 0;
     const deps: TasksCliDeps = {
-      taskStatePath: path, registerSink: async () => {}, taskLauncher: async () => { launched++; },
+      taskStatePath: path, registerSink: async () => {}, taskLauncher: async (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; },
       releaseVersions: () => ['0.2.26'],
       adoptRunTerminal: () => true,
       adoptChecklist: (version) => ({ version, released: '', dev: '', items: version === '0.2.26' ? [{ id: card.checklistId!, title: 'work', status: 'yellow', updatedAt: '', updatedBy: '' }] : [], history: [] }),
@@ -456,7 +456,7 @@ test('tasks adopt-pr --rebind atomically moves a failed old-version PR to a new 
     writeTaskCards(path, [old]);
     let launches = 0;
     const deps: TasksCliDeps = {
-      taskStatePath: path, registerSink: async () => {}, taskLauncher: async () => { launches++; },
+      taskStatePath: path, registerSink: async () => {}, taskLauncher: async (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; },
       adoptPrView: () => ({ number: 31230, url, state: 'OPEN', baseRefName: 'main', headRefOid: 'b'.repeat(40) }),
       adoptChecklist: (version) => ({ version, released: '', dev: '', items: version === '0.2.39'
         ? [{ id: 'ADOPT-PR-CROSS-VERSION', title: 'new target', status: 'yellow', updatedAt: '', updatedBy: '' }] : [], history: [] }),
@@ -641,7 +641,7 @@ test('MAPREDUCE-FANOUT 첫 조각으로 읽기 전용 tasks map dry-run CLI 뼈�
   try {
     writeFileSync(inventoryPath, JSON.stringify(items));
     const full = await run(['tasks', 'map', 'dry-run', '--inventory', inventoryPath, '--json'], {
-      taskStatePath: statePath, taskLauncher: () => { launches++; },
+      taskStatePath: statePath, taskLauncher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; },
       greenSweepWrite: (() => { checklistWrites++; throw new Error('dry-run wrote checklist'); }) as unknown as TasksCliDeps['greenSweepWrite'],
     });
     expect(full.code ?? 0).toBe(0);
@@ -658,7 +658,7 @@ test('MAPREDUCE-FANOUT 첫 조각으로 읽기 전용 tasks map dry-run CLI 뼈�
     for (const invalid of [items.slice(0, 2), [items[0], items[1], { id: 'task-a', text: 'duplicate' }]]) {
       writeFileSync(inventoryPath, JSON.stringify(invalid));
       const held = await run(['tasks', 'map', 'dry-run', '--inventory', inventoryPath, '--json'], {
-        taskStatePath: statePath, taskLauncher: () => { launches++; },
+        taskStatePath: statePath, taskLauncher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; },
         greenSweepWrite: (() => { checklistWrites++; }) as unknown as TasksCliDeps['greenSweepWrite'],
       });
       expect(held.code).toBe(1);
@@ -686,7 +686,7 @@ test('tasks map parent command uses the map-run backend and --reduce reads five 
         recipeSha: sha, mainSha: sha, checklistSnapshotPath: join(dir, 'checklist.json'),
         requestedPool: 'cold-job', selectedPool: null, imageCommit: null };
     },
-    taskLauncher: () => { launches++; },
+    taskLauncher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; },
     greenSweepWrite: (() => { checklistWrites++; }) as unknown as TasksCliDeps['greenSweepWrite'],
   };
   try {
@@ -1499,7 +1499,7 @@ test('task hand rejects missing, directory, unreadable and empty goal files with
     for (const [index, path] of paths.entries()) {
       const state = join(dir, `cards-${index}.json`);
       let launches = 0;
-      const result = await run(['task', 'hand', path, '--live'], { taskStatePath: state, registerSink: async () => true, taskLauncher: () => { launches++; } });
+      const result = await run(['task', 'hand', path, '--live'], { taskStatePath: state, registerSink: async () => true, taskLauncher: (_args, _cwd, launchContext) => { launches++; return { runId: launchContext?.runId }; } });
       expect(result.code).toBe(1);
       expect(result.lines.join('\n')).toContain(path);
       expect(result.lines.join('\n')).toContain(reasons[index]!);
@@ -1519,7 +1519,7 @@ test('task hand --checklist uses the unchanged cell title when text is omitted a
   const launcherCalls: string[][] = [];
   const deps: TasksCliDeps = {
     taskStatePath: join(dir, 'cards.json'), registerSink: async () => true, releaseBoard: () => releaseBoard,
-    taskLauncher: (args) => { launcherCalls.push(args); },
+    taskLauncher: (args, _cwd, launchContext) => { launcherCalls.push(args); return { runId: launchContext?.runId }; },
   };
 
   const omitted = await run(['tasks', 'hand', '--checklist', 'CELL-1', '--live', '--json'], deps);
@@ -1569,7 +1569,7 @@ test('tasks hand reuses one OPEN PR for its release cell and fails closed on an 
     ] }],
     adoptChecklist: (foundVersion) => ({ version: foundVersion, released: '', dev: '', items: [{ id: cell, title, status: 'yellow', updatedAt: '', updatedBy: '' }], history: [] }),
     adoptPrView: () => ({ number: 30262, url: 'https://github.com/ElanvitalAI/elanous/pull/30262', state: 'OPEN', baseRefName: 'main', headRefOid: 'a'.repeat(40) }),
-    taskLauncher: () => { launched++; },
+    taskLauncher: (_args, _cwd, launchContext) => { launched++; return { runId: launchContext?.runId }; },
     handOriginRepo: () => 'https://github.com/ElanvitalAI/elanous',
   };
   try {
@@ -1635,7 +1635,7 @@ test('task hand --checklist reads the current release cell through the default b
     const launcherCalls: string[][] = [];
     const result = await run(['tasks', 'hand', '--checklist', 'MK-DEFAULT-BOARD', '--live', '--json'], {
       taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
-      taskLauncher: (args) => { launcherCalls.push(args); },
+      taskLauncher: (args, _cwd, launchContext) => { launcherCalls.push(args); return { runId: launchContext?.runId }; },
     });
     expect(result.code ?? 0).toBe(0);
     expect(launcherCalls).toHaveLength(1);
@@ -1655,7 +1655,7 @@ test('task hand default board finds an unreleased later version from the isolate
     const launches: string[][] = [];
     const result = await run(['tasks', 'hand', '--checklist', 'MK-LATER-BOARD', '--live', '--json'], {
       taskStatePath: join(dir, 'cards.json'), registerSink: async () => true,
-      taskLauncher: (args) => { launches.push(args); },
+      taskLauncher: (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; },
     });
     expect(result.code ?? 0).toBe(0);
     expect(JSON.parse(result.lines[0]!).card.text).toBe(title);
@@ -1679,7 +1679,7 @@ test('task hand finds a later open release cell, prefers the nearest duplicate, 
     releaseBoard: (version) => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
       ...(version === later || version === latest ? [{ id: 'NEXT', level: 'task' as const, title: withDoneBoundary(`대상 경로: src/${version}.ts`), status: 'open' as const }] : []),
     ] }],
-    taskLauncher: (args) => { launches.push(args); },
+    taskLauncher: (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; },
   };
   try {
     const next = await run(['tasks', 'hand', '--checklist', 'NEXT', '--live', '--json'], deps);
@@ -1718,7 +1718,7 @@ test('task hand prefers the current release cell over an older unreleased duplic
       releaseBoard: (version) => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
         { id: 'DUP', level: 'task', title: withDoneBoundary(`대상 경로: src/${version}.ts`), status: 'open' },
       ] }],
-      taskLauncher: () => {},
+      taskLauncher: (_args, _cwd, launchContext) => { return { runId: launchContext?.runId }; },
     });
     expect(result.code ?? 0).toBe(0);
     expect(JSON.parse(result.lines[0]!).card.text).toBe(withDoneBoundary(`대상 경로: src/${current}.ts`));
@@ -1745,14 +1745,14 @@ test('task hand keeps the current board available and ignores a broken unrelated
           { id: 'CURRENT', level: 'task', title, status: 'open' },
         ] }];
       },
-      taskLauncher: () => {},
+      taskLauncher: (_args, _cwd, launchContext) => { return { runId: launchContext?.runId }; },
     });
     expect(result.code ?? 0).toBe(0);
     expect(JSON.parse(result.lines[0]!).card.text).toBe(title);
     expect(warnings.some((line) => line.includes(`${unrelated} 읽기 실패`))).toBe(true);
     const pinned = await run(['tasks', 'hand', '--checklist', 'CURRENT', '--version', unrelated, '--live'], {
       taskStatePath: join(dir, 'other-cards.json'), registerSink: async () => true,
-      releaseBoard: () => { throw new Error('broken ledger'); }, taskLauncher: () => {},
+      releaseBoard: () => { throw new Error('broken ledger'); }, taskLauncher: (_args, _cwd, launchContext) => { return { runId: launchContext?.runId }; },
     });
     expect(pinned.code).toBe(1);
     expect(pinned.lines).toEqual([`체크리스트 판 읽기 실패: ${unrelated}`]);
@@ -1768,7 +1768,7 @@ test('task hand --checklist passes a non-path cell title unchanged when text is 
     releaseBoard: () => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
       { id: 'CELL-NO-PATH', level: 'task', title, status: 'open' },
     ] }],
-    taskLauncher: (args) => { launcherCalls.push(args); },
+    taskLauncher: (args, _cwd, launchContext) => { launcherCalls.push(args); return { runId: launchContext?.runId }; },
   });
   expect(result.code ?? 0).toBe(0);
   expect(launcherCalls).toHaveLength(1);
@@ -2233,7 +2233,7 @@ test('TASK-HAND-RETRY: live launch refusal prints its reason instead of the shad
   let launches = 0;
   const result = await run(['tasks', 'hand', '대상 경로: src/task-agent/task-hand.ts\n재시도 카드', '--live'], {
     taskStatePath,
-    taskLauncher: () => { launches += 1; },
+    taskLauncher: (_args, _cwd, launchContext) => { launches += 1; return { runId: launchContext?.runId }; },
     taskLaunchRequestDoor: {
       requestId: () => 'request-test-card-attempt',
       consume: () => ({ status: 'refused', requestId: 'request-test-card-attempt', receiptId: 'receipt-old', receiptAt: '2026-10-30T00:00:00.000Z', reason: '이미 소비된 카드 넘김 시도' }),

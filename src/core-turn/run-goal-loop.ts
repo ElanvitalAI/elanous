@@ -1483,7 +1483,8 @@ export async function runGoalLoop(
           });
         }
         return finish(
-          { finalText: duplicateAnswer ? previousFinalText : lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+          // A209: progress 억제 후 합성 턴의 문단 구분자('\n\n') 잔류가 최종 답 앞에 남는 결함 가드.
+          { finalText: (duplicateAnswer ? previousFinalText : lastResult.finalText).replace(/^\n{1,2}(?=\S)/, ''), iterations, stopReason: 'goal_complete', goalComplete: true },
           { summary: completionSummary, changedFiles: completionChangedFiles },
         );
       }
@@ -1515,7 +1516,7 @@ export async function runGoalLoop(
         tools: seatTools, wallMs: now() - turnStartedAt, emptyMailStreak,
       }, { level: 'info' });
       return finish(
-        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+        { finalText: lastResult.finalText.replace(/^\n{1,2}(?=\S)/, ''), iterations, stopReason: 'goal_complete', goalComplete: true },
         { summary: `idle-no-work — ${emptyMailStreak} consecutive empty mailbox checks (seat ${seatCap.seat})`, changedFiles: [] },
       );
     }

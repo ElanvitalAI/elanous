@@ -181,6 +181,52 @@ describe('#38031 childFinished — 종료 한 줄 포트(없으면 no-op · task
   });
 });
 
+// ── JUD #38537 must ⓑ — line-watch 진행 알림(running · shell-watch:)은 종료가 아니다 ──────────────────────
+describe('JUD #38537 — 진행 알림(running · shell-watch:)은 «진행» 한 줄 · childFinished 0 · 완료(shell: · done)는 기존 계약 그대로', () => {
+  test('진행(running · shell-watch:) 알림 → 서식에 «진행» 포함·«위임 끝» 부재·childFinished 호출 0', () => {
+    const events: Array<{ goal: string; outcome: string }> = [];
+    const lines: string[] = [];
+    const queue = new TaskNotificationQueue();
+    const wake = createAgentWake({
+      subscribe: (listener) => queue.onEnqueue(listener),
+      notify: (line) => { lines.push(line); },
+      childFinished: (info) => { events.push(info); },
+    });
+    const progress = pending('shell-watch:run-1:1', {
+      agentName: 'RunShell',
+      state: 'running',
+      output: 'RunShell bg line-watch handle=run-1 match taskId=shell-watch:run-1:1 lineIndex=2 line="please WAKE up" elapsed=5ms',
+    });
+    delete progress.label;
+    queue.enqueue(progress);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('진행');
+    expect(lines[0]).not.toContain('위임 끝');
+    expect(lines[0]).not.toMatch(/[✓✗]/);
+    expect(lines[0]).toContain('please WAKE up');
+    expect(events).toHaveLength(0); // 진행은 종료가 아니다 — childFinished 0회
+    expect(queue.size).toBe(1); // 진행 알림도 결과를 먹지 않는다(완료 아님 · 큐 그대로)
+    expect(formatAgentWakePrompt(progress)).toContain('RunShell 진행 알림');
+    expect(formatAgentWakePrompt(progress)).toContain('아직 끝나지 않았음');
+    wake.dispose();
+  });
+
+  test('완료(done · shell:) 알림 → «위임 끝» 1회·childFinished 1회(기존 done 계약 유지)', () => {
+    const events: Array<{ goal: string; outcome: string }> = [];
+    const lines: string[] = [];
+    const queue = new TaskNotificationQueue();
+    const wake = createAgentWake({
+      subscribe: (listener) => queue.onEnqueue(listener),
+      notify: (line) => { lines.push(line); },
+      childFinished: (info) => { events.push(info); },
+    });
+    queue.enqueue(pending('shell:run-1', { agentName: 'RunShell', state: 'done' }));
+    expect(lines).toEqual(['✓ 위임 끝: pr-review — 다음 턴에 결과']);
+    expect(events).toEqual([{ goal: 'pr-review', outcome: 'done' }]);
+    wake.dispose();
+  });
+});
+
 describe('대시보드 수명 — 재진입·종료에도 구독은 언제나 하나 · dedupe 는 설치를 가로지른다', () => {
   const deps = (queue: TaskNotificationQueue, lines: string[], tag: string) => ({
     subscribe: (l: (n: PendingTaskNotification) => void) => queue.onEnqueue(l),
@@ -289,7 +335,7 @@ describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선�
   });
   test('입력칸 문은 깨움 감싸기를 거친다(«대기» 재시도의 근거) · 감싸기는 정확히 1', () => {
     expect(src.match(/wrapAgentWakePort\(/g)).toHaveLength(1);
-    expect(src).toContain('const internalTurnYieldPort = wrapAgentWakePort(goalContinue.wrapPort(seatAutowake.wrapPort(internalTurnGate.port)));');
+    expect(src).toContain('const internalTurnYieldPort = wrapAgentWakePort(goalContinue.wrapPort(seatAutowake.wrapPort(wakeupScheduler.wrapPort(internalTurnGate.port))));');
   });
   test('대시보드 종료(closeDashboardTui)가 «자기» 구독을 푼다', () => {
     const at = src.indexOf('const closeDashboardTui = (): void => {');

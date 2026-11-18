@@ -1,3 +1,4 @@
+import { RELEASE_CUT_NODE_IDS } from '../../scripts/release-loop/release-node-ids.js';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Command } from 'commander';
@@ -12,7 +13,7 @@ const object = (value: unknown): Row => value && typeof value === 'object' && !A
 const json = (text: string): Row | null => { try { return object(JSON.parse(text)); } catch { return null; } };
 function selectReleaseRun(version: string, runs: readonly Row[]): Row | undefined {
   const matchingRuns = runs.filter((r) => object(r.input).version === version);
-  const fullRuns = matchingRuns.filter((r) => Array.isArray(r.nodes) && r.nodes.some((n) => object(n).nodeId === 'version-release'));
+  const fullRuns = matchingRuns.filter((r) => Array.isArray(r.nodes) && r.nodes.some((n) => RELEASE_CUT_NODE_IDS.includes(String(object(n).nodeId))));
   return [...fullRuns].sort((a, b) => {
     const aStarted = Date.parse(String(a.startedAt ?? ''));
     const bStarted = Date.parse(String(b.startedAt ?? ''));

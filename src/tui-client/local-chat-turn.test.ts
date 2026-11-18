@@ -682,7 +682,7 @@ test('replace frames atomically replace the provisional answer for the active tu
   }
 });
 
-test('cancelling on the first delta reaps the child without showing later deltas', async () => {
+test('cancelling on the first delta hides later deltas and keeps the child (Esc cancels the turn, not the child)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'next-tui-delta-cancel-'));
   const cli = join(dir, 'delta-cli.ts');
   const pidFile = join(dir, 'pid');
@@ -706,17 +706,10 @@ test('cancelling on the first delta reaps the child without showing later deltas
       abort.abort();
     })).rejects.toThrow('응답을 취소했습니다');
     expect(deltas).toEqual(['first']);
+    // CAPSULE-FLAGS-REMOVE-DEFAULT (B2 always): the child that hosts the seat's capsules outlives the cancelled turn.
     const pid = Number(readFileSync(pidFile, 'utf8'));
-    let alive = true;
-    for (let i = 0; i < 100 && alive; i++) {
-      try { process.kill(pid, 0); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
-        alive = false;
-      }
-      if (alive) await Bun.sleep(10);
-    }
-    expect(alive).toBe(false);
+    await Bun.sleep(100);
+    expect(() => process.kill(pid, 0)).not.toThrow();
   } finally {
     await closeLocalChatSession('delta-cancel');
     rmSync(dir, { recursive: true, force: true });

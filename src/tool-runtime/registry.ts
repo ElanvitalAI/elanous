@@ -82,10 +82,18 @@ export async function dispatchToolByName(
   if (entryPre?.guardian && isGuardianEnabled()) {
     try {
       const summary = summarizeArgs(args);
+      // TC #92362 — raw, untruncated `command` for the shell-argv
+      // policy. `summary.command` is 200-char truncated; reusing it
+      // would break classifyShellArgv's command/argv consistency
+      // re-parse (long commands would mis-deny) and skew the audit
+      // sha. Only a string counts — anything else stays undefined and
+      // the policy fail-closes.
+      const shellCommand = typeof args['command'] === 'string' ? args['command'] : undefined;
       const guardianContext: GuardianContext = {
         toolId: entryPre.id,
         surface: ctx.surface,
         argsSummary: summary,
+        ...(shellCommand !== undefined ? { shellCommand } : {}),
       };
       const verdict = runGuardian(entryPre.guardian, guardianContext);
       if (verdict.decision === 'deny') {

@@ -1,7 +1,7 @@
 // ── User config loader tests ──
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CHAT_DEFAULTS } from '../src/user-config/chat';
@@ -964,7 +964,7 @@ describe('user-config extended schema', () => {
     cfg.skills = { activeSet: 'hermes', dirs: ['/tmp/s1', '/tmp/s2'] };
     cfg.telegram = { enabled: true, botToken: 'xxx:yyy', allowedUsers: [111], homeChannel: -1001 };
     cfg.obsidian = { vault: '/tmp/vault' };
-    cfg.debug = { file: true, level: 'diag', exposeFullLlmTools: true };
+    cfg.debug = { file: true, level: 'diag' };
     cfg.chat = {
       conciseness: {
         enabled: false,
@@ -1036,7 +1036,7 @@ describe('user-config extended schema', () => {
     expect(reloaded.telegram.allowedUsers).toEqual([111]);
     expect(reloaded.telegram.homeChannel).toBe(-1001);
     expect(reloaded.obsidian.vault).toBe('/tmp/vault');
-    expect(reloaded.debug).toEqual({ file: true, level: 'diag', exposeFullLlmTools: true, renderLogs: false });
+    expect(reloaded.debug).toEqual({ file: true, level: 'diag', renderLogs: false });
     expect(reloaded.chat.conciseness).toEqual({
       enabled: false,
       finalMessageMaxLines: 6,
@@ -1064,20 +1064,31 @@ describe('user-config extended schema', () => {
     expect(reloaded.chat.rendering).toEqual(CHAT_DEFAULTS.rendering);
   });
 
+  test('retired debug tool option is removed on read and save', () => {
+    write({ debug: { file: false, level: 'diag', exposeFullLlmTools: false } });
+    const cfg = buildUserConfig(cfgPath);
+    expect(cfg.debug).not.toHaveProperty('exposeFullLlmTools');
+    saveUserConfig(cfg, cfgPath);
+    const saved = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    expect(saved.debug).not.toHaveProperty('exposeFullLlmTools');
+    expect(saved.debug.file).toBe(false);
+    expect(saved.debug.level).toBe('diag');
+  });
+
   test('debug.level stays on historical default when omitted on disk', () => {
     write({ debug: { file: true } });
     const cfg = buildUserConfig(cfgPath);
-    expect(cfg.debug).toEqual({ file: true, level: 'trail', exposeFullLlmTools: true, renderLogs: false });
+    expect(cfg.debug).toEqual({ file: true, level: 'trail', renderLogs: false });
     saveUserConfig(cfg, cfgPath);
-    expect(buildUserConfig(cfgPath).debug).toEqual({ file: true, level: 'trail', exposeFullLlmTools: true, renderLogs: false });
+    expect(buildUserConfig(cfgPath).debug).toEqual({ file: true, level: 'trail', renderLogs: false });
   });
 
   test('debug.level honors explicit config override', () => {
     write({ debug: { file: true, level: 'diag' } });
     const cfg = buildUserConfig(cfgPath);
-    expect(cfg.debug).toEqual({ file: true, level: 'diag', exposeFullLlmTools: true, renderLogs: false });
+    expect(cfg.debug).toEqual({ file: true, level: 'diag', renderLogs: false });
     saveUserConfig(cfg, cfgPath);
-    expect(buildUserConfig(cfgPath).debug).toEqual({ file: true, level: 'diag', exposeFullLlmTools: true, renderLogs: false });
+    expect(buildUserConfig(cfgPath).debug).toEqual({ file: true, level: 'diag', renderLogs: false });
   });
 
   test('saveUserConfig preserves unknown raw keys', () => {

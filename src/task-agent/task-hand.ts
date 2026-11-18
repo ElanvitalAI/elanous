@@ -14,6 +14,7 @@ import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { runGraph, validateUnitCalls, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
+import type { InProcessHandler } from '../graph-runner/in-process-registry.js';
 import type { GraphWizardDeps } from '../graph-wizard/generate.js';
 import type { PluginWizardDeps, PluginWizardInput } from '../graph-wizard/mission-compose.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
@@ -389,6 +390,12 @@ export interface TaskCard {
   runChildId?: string;
   /** HARNESS-PARENT-ON-MSB1 — 부모가 도는 원격 호스트(없으면 HQ 로컬). 원격 부모는 PR 까지만 간다(병합은 HQ). */
   parentHost?: { host: string; configDir?: string; pid?: number; log?: string };
+  /**
+   * MAKE-CODE-UNIT-THIN — code-pr 발사를 감싼 조합 graph run(`graphs/work/code-pr.yaml` → make-code@1).
+   * 원장 = `<인스턴스 루트>/graph-runs/<graphId>/<runId>.{json,events.jsonl}`. `runId` 칸(자식 하니스 런)과 다른 id 다.
+   * `exit` 은 make-code 단위 출구(`launched` = 자식이 받아들여졌다 · PR 병합 아님). 생산 = handTask 한 곳.
+   */
+  compositionRun?: { graphId: string; runId: string; status: string; exit?: string };
   /** 미션 카드만 — 모든 조각 착지 → 칸 green «제안»(체크리스트는 손대지 않는다 · OP/주인이 뒤집는다). */
   greenProposal?: { at: string; checklistId: string | null; evidence: Record<string, string> };
   /** A passed explicit evidence command on current main only proposes green to an owner. No run or checklist change. */
@@ -414,6 +421,8 @@ export interface TaskCard {
   landAttempts?: Array<{ pr: number; head: string; at: string; ok?: boolean; detail?: string; class?: 'infra' | 'judgement' | 'base-stale' | 'recovery'; reason?: string }>;
   /** TA-LIVE-LAND-2 — `tasks hand --ta-land`: this card's run leaves the merge to the task agent (propose-land). */
   taLand?: true;
+  /** `tasks hand --no-auto-merge` — 자동 병합을 끈다: 발사 인자 `--no-auto-merge`(PR 까지) · `--merge-by-host`(호스트 재게이트 뒤 병합)는 싣지 않는다. 첫 시범 PR 은 사람이 병합한다. */
+  noAutoMerge?: true;
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
   childLlm?: TaskChildLlm;
   /** TA-PREFLIGHT ① — `tasks hand --source commit:<40hex>`: 자식이 받을 정확 소스. 발사 인자 `--source` 로 가고 부모가 자식 수신 HEAD 와 대조한다. */
@@ -957,13 +966,13 @@ export function readChecklistCellForBirth(checklistId: string, boardVersion?: st
 }
 
 /** 첫 수의 elanous 인자(진입점·--config-dir 앞붙임은 launcher 몫). */
-export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm' | 'identity' | 'source' | 'imageDigest'>): string[] {
+export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm' | 'identity' | 'source' | 'imageDigest' | 'noAutoMerge'>): string[] {
   const child = card.childLlm
     ? ['--child-llm-provider', card.childLlm.provider, '--child-llm-model', card.childLlm.model, ...(card.childLlm.effort ? ['--child-llm-effort', card.childLlm.effort] : [])]
     : [];
   const runPriority = runIdentityQueuePriority(card.identity);
   // Exact role model pins travel in ELANOUS_ROLE_LLM_*: harness say's argv parser only accepts provider[/tier].
-  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', ...(card.source ? ['--source', card.source] : []), ...(card.imageDigest ? ['--image-digest', card.imageDigest] : []), ...(runPriority !== undefined ? ['--run-priority', String(runPriority)] : []), ...child, card.text];
+  return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', ...(card.noAutoMerge ? ['--no-auto-merge'] : ['--merge-by-host']), ...(card.source ? ['--source', card.source] : []), ...(card.imageDigest ? ['--image-digest', card.imageDigest] : []), ...(runPriority !== undefined ? ['--run-priority', String(runPriority)] : []), ...child, card.text];
 }
 
 /**
@@ -1027,6 +1036,8 @@ export interface HandTaskOptions {
   preflightGoalDoneBoundary?: boolean;
   /** TA-LIVE-LAND-2 — `--ta-land`: card field `taLand` ⊕ launch env `ELANOUS_TA_LAND=1`. */
   taLand?: boolean;
+  /** `--no-auto-merge` — 자동 병합 끔(--ta-land 와 함께 못 준다: TA 가 병합을 맡는 경로와 모순). */
+  noAutoMerge?: boolean;
   /** TASKS-HAND-CHILD-LLM — `<provider>/<model>`(`parseChildLlm`) ⊕ 선택 추론 노력. effort 만 주면 거부. */
   childLlm?: string;
   childLlmEffort?: string;
@@ -1101,6 +1112,148 @@ export interface HandTaskOptions {
    * 생산은 기본 문(이 우주의 인스턴스 루트)을 쓰고, 시험은 격리 루트의 문을 주입해 같은 생산 경로로 검증한다.
    */
   launchRequestDoor?: LaunchRequestDoor;
+}
+
+/** MAKE-CODE-UNIT-THIN — make-code@1 의 노드 처리기 이름(`graphs/units/verbs/make-code.yaml` `handler:make-code-harness-say`). */
+export const MAKE_CODE_HANDLER = 'make-code-harness-say';
+/** 자식은 떴는데 조합 graph run 원장이 실패했다 — 카드 줄 이름(시끄러운 표지 · 재발사 금지). */
+export const MAKE_CODE_LEDGER_FAILED_EVENT = 'graph-run-ledger-failed';
+
+/** 같은 발사 키의 두 번째 처리기 호출을 발사 전에 거부했다 — 카드 줄 이름. */
+export const MAKE_CODE_DUPLICATE_REFUSED_EVENT = 'make-code-duplicate-refused';
+/** 발사 키 claim 디렉터리(카드 원장 옆) — 키마다 하위 디렉터리 하나를 배타 생성(mkdir)한다. */
+export const MAKE_CODE_CLAIM_DIR = 'make-code-launch-claims';
+
+/**
+ * make-code 발사 키 — #38422 K5 키와 같은 모양(`k5:` ⊕ sha256(JSON [runId, nodeId, attempt, inputSha256])).
+ * 여기서는 runId = 조합 graph run id · nodeId = 조합에서 make-code 를 부르는 노드 id(조합 파일에서 읽는다) · attempt = 이 발사의 자식 하니스 런 id ·
+ * inputSha256 = 발사 인자(argv ⊕ cwd) 다. #38422 착지 뒤 러너의 graphLaunchKey 로 수렴한다(그 코드를 import 하지 않는다).
+ */
+export function makeCodeLaunchKey(parts: { runId: string; nodeId: string; attempt: string; inputSha256: string }): string {
+  return `k5:${createHash('sha256').update(JSON.stringify([parts.runId, parts.nodeId, parts.attempt, parts.inputSha256])).digest('hex')}`;
+}
+
+/** make-code graph run 이 자식을 띄우지 못했다 — 실은 조합 런(있으면)을 실패 카드에 함께 남긴다.
+ *  `orphanRunId` = 발사기는 불렸는데 영수증이 없었다: 자식이 떴을 수 있는 런 id(detected-orphan 조회 키). */
+export class MakeCodeLaunchError extends Error {
+  constructor(message: string, readonly compositionRun?: TaskCard['compositionRun'], readonly orphanRunId?: string) {
+    super(message);
+    this.name = 'MakeCodeLaunchError';
+  }
+}
+
+/** code-pr graph-run 조합이 make-code 단위를 정확히 한 번 부르는지 — 그 노드 id(발사 키의 nodeId) 또는 발사 전 거부 사유. */
+export function inspectMakeCodeComposition(path: string): { callerNodeId?: string; problem?: string } {
+  let source: string;
+  try { source = readFileSync(path, 'utf8'); } catch (error) {
+    return { problem: `make-code 조합 읽기 실패: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const parsed = parseGraphTemplateYaml(source, path);
+  if (!parsed.template) return { problem: 'make-code 조합 파싱 실패' };
+  const calls = parsed.template.nodes.filter(node => node.kind === 'subgraph' && node.call?.split('@')[0] === 'make-code');
+  return calls.length === 1 ? { callerNodeId: calls[0]!.nodeId }
+    : { problem: `code-pr graph-run 조합은 make-code 단위 호출 노드가 정확히 하나여야 한다(지금 ${calls.length}개)` };
+}
+
+/**
+ * MAKE-CODE-UNIT-THIN — code-pr 발사를 조합 graph run 안에서 한다. 노드 처리기는 호출자가 이미 조립한
+ * harness say 인자·cwd·발사 연결(env)을 «그대로» 발사기에 넘긴다 — 필드는 그래프 입력에서 다시 만들지 않는다(동등 = 구성상).
+ * 처리기는 이 런에만 등록된다: 손 `graph run`·재개는 처리기가 없어 러너가 발사 전에 거부한다(중복 PR 방지 · K5).
+ */
+async function launchThroughMakeCode(input: {
+  graph: TaskComposition & { path: string; callerNodeId: string }; card: TaskCard; runId: string; launchId: string; argv: string[];
+  cwd?: string; context: TaskLaunchContext; launcher: TaskLauncher; claimRoot: string;
+  graphRunner?: (path: string, options: GraphRunOptions) => Promise<GraphRunState>;
+}): Promise<{ receipt: void | TaskLaunchReceipt; compositionRun?: TaskCard['compositionRun']; ledgerFailure?: string; duplicateRefused: number }> {
+  const graphRunId = `code-pr-${input.runId}`;
+  const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
+  const launchKey = makeCodeLaunchKey({ runId: graphRunId, nodeId: input.graph.callerNodeId, attempt: input.runId,
+    inputSha256: createHash('sha256').update(JSON.stringify([input.argv, input.cwd ?? null])).digest('hex') });
+  const claimPath = join(input.claimRoot, MAKE_CODE_CLAIM_DIR, launchKey.replace(':', '-'));
+  let dispatched = false;
+  let duplicateRefused = 0;
+  let receiptMissing = false;
+  let receipt: void | TaskLaunchReceipt = undefined;
+  let launchError: unknown;
+  const evidence = (extra: Record<string, unknown>) => ({ launcher: 'harness-say', cardId: input.card.id, launchKey, ...extra });
+  const handler: InProcessHandler = async (handlerContext) => {
+    // MF1 — 발사 키 claim 은 배타 생성(mkdir · EEXIST = 이미 누가 쥐었다) 하나로 한다. 확인-후-생성 금지.
+    try {
+      mkdirSync(join(input.claimRoot, MAKE_CODE_CLAIM_DIR), { recursive: true });
+      mkdirSync(claimPath);
+    } catch (error) {
+      const duplicate = (error as NodeJS.ErrnoException)?.code === 'EEXIST';
+      if (duplicate) duplicateRefused++;
+      try { debug.log('task-agent.make-code', duplicate ? 'duplicate-refused' : 'claim-failed', { taskId: input.card.id, graphRunId,
+        unitRunId: handlerContext.runId, nodeId: handlerContext.nodeId, launchKey, ...(duplicate ? {} : { error: message(error).slice(0, 300) }) },
+      { level: 'warn' }); } catch { /* fail-soft */ }
+      return { ok: true, outcome: duplicate ? 'needs-human' : 'failed',
+        result: { reason: duplicate ? 'make-code-duplicate-refused' : `make-code-claim-failed: ${message(error)}` },
+        evidence: evidence({ dispatched: false, duplicate }) };
+    }
+    try { writeFileSync(join(claimPath, 'claim.json'), `${JSON.stringify({ cardId: input.card.id, harnessRunId: input.runId,
+      graphRunId, unitRunId: handlerContext.runId, nodeId: handlerContext.nodeId, launchKey })}\n`); }
+    catch { /* the directory itself is the claim; its note is observation only */ }
+    try { receipt = await input.launcher(input.argv, input.cwd, input.context); }
+    catch (error) {
+      launchError = error;
+      return { ok: true, outcome: 'failed', result: { reason: message(error) }, evidence: evidence({ dispatched: false }) };
+    }
+    const received = receipt && typeof receipt.runId === 'string' ? receipt.runId.trim() : '';
+    const bound = received && received === input.runId && normalizeRunId(received) === received ? received : null;
+    // MF2 — `launched` = 받아들여졌고 «그리고» 자식 런 id 가 묶였다. 영수증·id 가 없으면 닫힌 쪽(failed)으로 간다.
+    if (!bound) {
+      receiptMissing = true;
+      return { ok: true, outcome: 'failed',
+        result: { reason: 'make-code-receipt-missing', harnessRunId: null, orphanRunId: input.runId, launchId: input.launchId,
+          ...(received ? { receivedRunId: received } : {}) },
+        evidence: evidence({ dispatched: 'unknown' }) };
+    }
+    dispatched = true;
+    return { ok: true, outcome: 'launched',
+      result: { harnessRunId: bound, launchId: input.launchId, ...(receipt && receipt.parentHost ? { parentHost: receipt.parentHost.host } : {}) },
+      evidence: evidence({ dispatched: true }) };
+  };
+  let state: GraphRunState | undefined;
+  let graphError: unknown;
+  try {
+    state = await (input.graphRunner ?? runGraph)(input.graph.path, {
+      runId: graphRunId,
+      input: { ask: input.card.text, prior: {},
+        context: { cardId: input.card.id, harnessRunId: input.runId, launchId: input.launchId, ...(input.cwd ? { worktree: input.cwd } : {}) } },
+      quiet: true,
+      deps: { growthScope: 'task-agent', inProcessHandlers: { [MAKE_CODE_HANDLER]: handler } },
+    });
+  } catch (error) { graphError = error; }
+  const exit = state?.unitCalls?.find(call => call.unit === 'make-code')?.exit;
+  const compositionRun = state ? { graphId: state.graphId, runId: state.runId, status: state.status, ...(exit ? { exit } : {}) } : undefined;
+  try { debug.log('task-agent.make-code', 'graph-run', { taskId: input.card.id, graphRunId, harnessRunId: input.runId,
+    status: state?.status ?? null, exit: exit ?? null, dispatched, ...(graphError !== undefined ? { error: message(graphError).slice(0, 300) } : {}) }); }
+  catch { /* fail-soft */ }
+  if (launchError !== undefined) throw new MakeCodeLaunchError(message(launchError), compositionRun);
+  if (receiptMissing) {
+    const reason = `make-code 발사 영수증 없음: 발사기가 자식 런 id(${input.runId})를 돌려주지 않았다 — launched 로 적지 않는다. `
+      + `자식이 떴을 수 있다(detected-orphan 조회: 카드 ${input.card.id} · 런 ${input.runId} · launchId ${input.launchId})`;
+    try { debug.log('task-agent.make-code', 'receipt-missing', { taskId: input.card.id, graphRunId, harnessRunId: input.runId,
+      launchId: input.launchId }, { level: 'warn' }); } catch { /* fail-soft */ }
+    throw new MakeCodeLaunchError(reason, compositionRun, input.runId);
+  }
+  if (!dispatched) {
+    const last = state?.nodes.at(-1);
+    const reason = graphError !== undefined ? `graph run 실패: ${message(graphError)}`
+      : `make-code 미발사: graph run ${state?.status ?? 'unknown'}${state?.reason ? ` — ${state.reason}` : ''}`
+        + `${last?.error ?? last?.reason ? ` — 마지막 node ${last.nodeId}: ${last.error ?? last.reason}` : ''}`;
+    try { debug.log('task-agent.make-code', 'not-dispatched', { taskId: input.card.id, graphRunId, reason: reason.slice(0, 300) }, { level: 'warn' }); }
+    catch { /* fail-soft */ }
+    throw new MakeCodeLaunchError(reason, compositionRun);
+  }
+  if (graphError !== undefined) {
+    const ledgerFailure = `graph run ${graphRunId} 원장 실패(자식 발사됨 · 재발사 금지): ${message(graphError)}`;
+    try { debug.log('task-agent.make-code', 'ledger-failed', { taskId: input.card.id, graphRunId, harnessRunId: input.runId,
+      error: message(graphError).slice(0, 300) }, { level: 'warn' }); } catch { /* fail-soft */ }
+    return { receipt, ledgerFailure, duplicateRefused };
+  }
+  return { receipt, ...(compositionRun ? { compositionRun } : {}), duplicateRefused };
 }
 
 /** `--live` 발사가 실패했다 — 카드는 launch-failed 로 남았다. */
@@ -1191,6 +1344,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (value !== undefined && (!value.trim() || /\p{Cc}/u.test(value))) throw new Error(`${flag} id 가 비었거나 제어 문자를 담았다: ${JSON.stringify(value)}`);
   }
   if (opts.source !== undefined && !/^commit:[0-9a-f]{40}$/.test(opts.source)) throw new Error(`--source 는 commit:<40자 소문자 16진 sha> 만 받는다: ${JSON.stringify(opts.source)}`);
+  if (opts.noAutoMerge === true && opts.taLand === true) throw new Error('--no-auto-merge 는 --ta-land 와 함께 줄 수 없다 — TA 가 병합을 맡는 경로와 모순');
   if (opts.imageDigest !== undefined && !isImageDigestPin(opts.imageDigest)) throw new Error(`--image-digest 는 sha256:<64자 소문자 16진> 만 받는다: ${JSON.stringify(opts.imageDigest)}`);
   if (opts.childLlmEffort !== undefined && opts.childLlm === undefined) throw new Error('--child-llm-effort 는 --child-llm <provider>/<model> 과 함께 준다');
   if (opts.tier !== undefined && !['하', '중', '상', '특'].includes(opts.tier)) throw new Error(`--tier 는 하|중|상|특 중 하나다: ${opts.tier}`);
@@ -1267,7 +1421,15 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const graphRun = selected.composition && selected.launcher === 'graph-run' && !selected.error && selected.unitsResolved
     ? selected.composition : undefined;
   const graphRunPath = graphRun ? resolve(opts.compositionRoot ?? COMPOSITION_ROOT, graphRun.file) : undefined;
-  const selectionFailure = graphRun ? undefined
+  // MAKE-CODE-UNIT-THIN — 코드 하니스 손(code-pr)의 graph-run 조합은 harness say 준비(사전 검사·발사 문·env·cwd)를
+  // 그대로 쓰고, 발사 한 번만 make-code@1 노드 처리기 안에서 한다(makeCodeHandler). 일반 graph-run 갈래로 보내지 않는다.
+  const makeCodeGraph = graphRun && graphRunPath && DEFAULT_HANDS[completion].codeHarness ? { ...graphRun, path: graphRunPath } : undefined;
+  const makeCodeInspection = makeCodeGraph ? inspectMakeCodeComposition(makeCodeGraph.path) : undefined;
+  const makeCodeShape = makeCodeInspection?.problem;
+  const selectionFailure = graphRun ? (makeCodeShape ? `조합 오류: ${graphRun.file}: ${makeCodeShape}` : undefined)
+    // MAKE-CODE-UNIT-THIN — code-pr 의 harness-say 직접 발사(옛 새는 길)는 닫혔다. 조용히 새지 않고 발사 전 거부한다.
+    : DEFAULT_HANDS[completion].codeHarness && selected.composition && !selected.error && selected.launcher === 'harness-say'
+      ? `조합 실행기 은퇴: ${selected.composition.file} — ${completion} 은 make-code@1 graph run 으로만 발사한다(launcher: harness-say 직접 발사는 닫힘)`
     : !selected.composition ? `조합 없음: graphs/work/${completion}.yaml`
     : selected.error ?? (selected.launcher === 'graph-run' && !selected.unitsResolved
       ? `조합 단위 미해석: ${selected.composition.file} — 대상 unit: ${selected.missingUnits.length ? selected.missingUnits.join(', ') : '해석 실패'} (graph-run 발사는 단위 해석이 필요하다)`
@@ -1292,6 +1454,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.goal ? { goal: opts.goal } : {}),
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
     ...(opts.taLand === true ? { taLand: true as const } : {}),
+    ...(opts.noAutoMerge === true ? { noAutoMerge: true as const } : {}),
     ...(childLlm ? { childLlm } : {}),
     ...(opts.source ? { source: opts.source } : {}),
     ...(opts.imageDigest ? { imageDigest: opts.imageDigest } : {}),
@@ -1303,7 +1466,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     status: selectionFailure || tierSplitBlocked !== undefined ? 'failed' : 'handed',
     history: [
       ...(selectionFailure ? [{ at: now.toISOString(), event: !selected.composition ? 'composition-missing'
-        : selected.error ? 'composition-invalid' : 'composition-launcher-unavailable', detail: selectionFailure }] : []),
+        : selected.error || makeCodeShape ? 'composition-invalid' : 'composition-launcher-unavailable', detail: selectionFailure }] : []),
       ...(tierSplitBlocked !== undefined ? [{ at: now.toISOString(), event: 'tier-split-failed', detail: `tier-split-failed: ${tierSplitBlocked}` }] : []),
     ],
     ...(opts.mission ? { mission: opts.mission, after: [...(opts.after ?? [])] } : {}),
@@ -1313,7 +1476,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(draftClaim ? { draftClaim } : {}),
   };
   // 2판 graph-run 조합의 다음 수는 실제 graph run — harness say 인자를 조립하지 않는다.
-  let move = graphRun && graphRunPath ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } satisfies TaskCardMove
+  // MAKE-CODE-UNIT-THIN — code-pr 의 다음 수는 여전히 harness say 인자다: 그 인자를 make-code 노드 처리기가 그대로 발사한다.
+  let move = graphRun && graphRunPath && !makeCodeGraph ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } satisfies TaskCardMove
     : selectionFailure ? undefined : nextMoveFor(card, opts.landed);
   // 분해 실패로 막은 카드는 wait(failed 사유)가 정답이다 — 던지지 않고 카드를 적은 뒤 발사 0 으로 돌아간다.
   if (move && move.kind !== 'launch' && tierSplitBlocked === undefined) throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
@@ -1374,7 +1538,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       metadataText = drafted.document;
       text = `${text}${drafted.document.slice(metadataBeforeDraft.length)}`;
       card = { ...card, text };
-      move = graphRun && graphRunPath ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } : nextMoveFor(card, opts.landed);
+      move = graphRun && graphRunPath && !makeCodeGraph ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } : nextMoveFor(card, opts.landed);
       try { debug.log('task-agent.hand', 'boundary-autodrafted', { taskId: id, labels: drafted.added, targetPathCount: targetPaths.length }); } catch { /* fail-soft */ }
     }
     const { missing } = inspectGoalDoneBoundary(metadataText);
@@ -1417,6 +1581,14 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
     ...(selected.error ? { error: selected.error } : {}),
   }); } catch { /* fail-soft */ }
+  // MAKE-CODE-UNIT-THIN — 코드 하니스 손이 graph run 으로 못 나가는 모든 거부는 이 범주 한 줄로 시끄럽게 남는다(옛 harness say 로 새지 않는다).
+  if (selectionFailure && DEFAULT_HANDS[completion].codeHarness) {
+    try { debug.log('task-agent.make-code', selected.launcher === 'graph-run' && !selected.unitsResolved && !selected.error ? 'unit-unresolved'
+      : selected.launcher === 'harness-say' && !selected.error ? 'launcher-retired' : 'composition-refused', {
+      taskId: id, completion, file: selected.composition?.file ?? `graphs/work/${completion}.yaml`, launcher: selected.launcher ?? null,
+      missingUnits: selected.missingUnits, reason: selectionFailure.slice(0, 300),
+    }, { level: 'warn' }); } catch { /* fail-soft */ }
+  }
   if (tierSplitBlocked !== undefined) return { card, move: move ?? nextMoveFor(card), mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (selectionFailure) throw new Error(`${selectionFailure} (카드 ${id})`);
   if (!move || move.kind !== 'launch') throw new Error('조합 선택 뒤 발사 수가 없다');
@@ -1443,7 +1615,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   }
   if (mode === 'shadow') return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   // 2판 — launcher 'graph-run' 조합은 launcher(harness say 발사기) 대신 실제 graph run 진입점(runGraph)으로 발사한다.
-  if (graphRun && graphRunPath) {
+  if (graphRun && graphRunPath && !makeCodeGraph) {
     const runId = mintRunId();
     const launchId = newLaunchUtteranceId();
     recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
@@ -1535,7 +1707,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     }
   }
   // Only the code-PR harness Pod consumes podGoal. Keep the card and other launchers unchanged.
-  const podLaunch = completion === 'code-pr' && selected.launcher === 'harness-say';
+  // MAKE-CODE-UNIT-THIN — make-code graph run 도 같은 Pod 발사다(옛 harness-say 조건은 선택에서 이미 거부된다).
+  const podLaunch = completion === 'code-pr' && (selected.launcher === 'harness-say' || makeCodeGraph !== undefined);
   let childGoal = card.text;
   if (podLaunch) {
     const configuredRepo = project ? undefined : getUserConfig().harness?.defaultRepo;
@@ -1595,15 +1768,34 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     effectiveChildProvider: card.childLlm?.provider ?? 'openai-codex',
     ...(podLaunch ? { substrate: 'pod' as const, podGoal: childGoal } : {}) };
   let receipt: void | TaskLaunchReceipt;
+  const launchArgv = podLaunch ? [...move.command!.slice(0, -1), childGoal] : move.command!;
+  let makeCodeLedgerFailure: string | undefined;
+  let makeCodeDuplicates = 0;
   try {
-    receipt = await opts.launcher(podLaunch ? [...move.command!.slice(0, -1), childGoal] : move.command!, project?.target, context);
+    if (makeCodeGraph) {
+      const ran = await launchThroughMakeCode({ graph: { ...makeCodeGraph, callerNodeId: makeCodeInspection!.callerNodeId! }, card, runId, launchId, argv: launchArgv,
+        cwd: project?.target, context, launcher: opts.launcher, graphRunner: opts.graphRunner, claimRoot: dirname(path) });
+      card = { ...card, ...(ran.compositionRun ? { compositionRun: ran.compositionRun } : {}) };
+      receipt = ran.receipt;
+      makeCodeLedgerFailure = ran.ledgerFailure;
+      makeCodeDuplicates = ran.duplicateRefused;
+    } else {
+      // LEGACY-LEAK (MAKE-CODE-UNIT-THIN) — 옛 «harness say 직접 발사» 길. code-pr 는 선택에서 launcher: harness-say 를
+      // 거부하고(조합 실행기 은퇴), 다른 종결은 codeHarness=false 로 거부되므로 지금은 어느 종결도 여기 닿지 않는다.
+      // REMOVE-AFTER: make-code@1 로 실물 code-pr 한 건 착지 완주 ⊕ 재개 시험 통과(RFC-verbs K5 · ⛔ 그 전엔 지우지 않는다).
+      receipt = await opts.launcher(launchArgv, project?.target, context);
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     // LAUNCH-SINGLE-DOOR-1C — 발사 실패 사유를 원장에 append 한다(관측 — 소비된 영수증은 그대로다).
     if (launchDoor !== undefined && launchDoorRequestId !== undefined) launchDoor.fail(launchDoorRequestId, reason);
-    const failed: TaskCard = { ...card, status: 'launch-failed', history: [
+    const failed: TaskCard = { ...card, status: 'launch-failed',
+      ...(error instanceof MakeCodeLaunchError && error.compositionRun ? { compositionRun: error.compositionRun } : {}),
+      history: [
       ...card.history.filter((entry) => entry.event === 'child-model-reselected'),
-      { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason },
+      { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason,
+        // MF2 detected-orphan — 영수증 없는 발사는 자식 런 id 를 실패 줄에 남겨 그 런 원장으로 고아를 찾게 한다.
+        ...(error instanceof MakeCodeLaunchError && error.orphanRunId ? { runId: error.orphanRunId } : {}) },
     ] };
     writeCard(path, failed);
     try { debug.log('task-agent', 'launch-failed', { taskId: id, seat: card.seat ?? null, reason }); } catch { /* fail-soft */ }
@@ -1644,6 +1836,11 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       ...card.history.filter((entry) => entry.event === 'child-model-reselected'),
       { at: launchedAt, event: 'launch', detail: `${receipt && receipt.parentHost ? `[parent@${receipt.parentHost.host} · PR 까지만] ` : ''}${move.command!.join(' ')}` },
       ...(boundRunId ? [{ at: launchedAt, event: 'run-bound', detail: boundRunId, runId: boundRunId }] : []),
+      // MAKE-CODE-UNIT-THIN — 자식은 떴는데 조합 graph run 원장을 못 남겼다: 시끄럽게(카드 줄 ⊕ warn) 남긴다. 재발사하지 않는다.
+      ...(makeCodeLedgerFailure !== undefined ? [{ at: launchedAt, event: MAKE_CODE_LEDGER_FAILED_EVENT, detail: makeCodeLedgerFailure }] : []),
+      // MF1 — 같은 발사 키의 재호출(두 노드·재방문)은 발사 전에 거부됐다: 카드에도 남긴다.
+      ...(makeCodeDuplicates > 0 ? [{ at: launchedAt, event: MAKE_CODE_DUPLICATE_REFUSED_EVENT,
+        detail: `make-code 재호출 ${makeCodeDuplicates}회 발사 전 거부(발사는 첫 호출 1회)` }] : []),
     ],
   };
   writeCard(path, launched);

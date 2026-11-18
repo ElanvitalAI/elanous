@@ -1,4 +1,4 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -11,6 +11,11 @@ export function validateStaticExport(candidate: string): void {
   const assets = join(candidate, '_next');
   if (!existsSync(assets) || !lstatSync(assets).isDirectory() || readdirSync(assets).length === 0) {
     throw new Error(`invalid static export: missing Next.js assets in _next for ${candidate}`);
+  }
+  // Next.js writes this fallback shell when prerendering the root page throws;
+  // it is a build failure, not a publishable export (PWA-APP-ROOT-EXPORT-CRASH).
+  if (readFileSync(index, 'utf8').includes('__next_error__')) {
+    throw new Error(`invalid static export: index.html is the Next.js prerender fallback shell (__next_error__) in ${candidate}`);
   }
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -474,7 +474,7 @@ test('member credential prefers the joined member scope, with a read-only local 
 });
 
 test('missing member token keeps Nexus registration off despite an HTTP listener', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'control-member-missing-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'control-member-missing-')));
   roots.push(root);
   setTestStateRoot(root);
   setElanousConfigDir(root);
@@ -494,7 +494,7 @@ test('missing member token keeps Nexus registration off despite an HTTP listener
 });
 
 test('Nexus registers to the joined Primary with its member credential', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'control-member-joined-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'control-member-joined-')));
   roots.push(root);
   setTestStateRoot(root);
   setElanousConfigDir(root);
@@ -521,7 +521,7 @@ test('Nexus registers to the joined Primary with its member credential', async (
 });
 
 test('Nexus does not send a local member credential to a joined Primary without member scope', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'control-member-scoped-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'control-member-scoped-')));
   roots.push(root);
   setTestStateRoot(root);
   setElanousConfigDir(root);
@@ -539,7 +539,7 @@ test('Nexus does not send a local member credential to a joined Primary without 
 });
 
 test('Nexus registers after binding the actual port without waiting for an unresponsive coordinator, and stops on release', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'control-member-bound-'));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'control-member-bound-')));
   roots.push(root);
   setTestStateRoot(root);
   setElanousConfigDir(root);

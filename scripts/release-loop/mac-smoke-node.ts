@@ -9,6 +9,7 @@ import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
 import { baselineCommit } from './gate-baseline-manifest.js';
 import { diffFailures, junitFailures } from './gate-diff.js';
 import { finishNode, readGraphContext, runCommand, type CommandResult, type CommandRunner, type GraphContext } from './node-verdict.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 const sha = /^[a-f0-9]{7,40}$/i;
 const testFile = /\.test\.tsx?$/;
@@ -129,7 +130,7 @@ export function runMacSmoke(run: CommandRunner = runCommand, deps: MacSmokeDeps 
     } else {
       if (typeof configured !== 'string' || !hostName.test(configured)) throw new Error('macSmokeHost 호스트 이름이 유효하지 않음');
       host = configured;
-      const commit = context.input.commit ?? context.outputs['version-release']?.commit;
+      const commit = context.input.commit ?? releaseCutRecord(context)?.commit;
       if (typeof commit !== 'string' || !sha.test(commit)) throw new Error('컷 커밋 없음 또는 유효하지 않음 — 측정 불가');
       const platform = host === 'local' ? run('uname', ['-s'], repo) : run('ssh', [host, 'uname -s'], repo);
       if (requireOk(platform, '호스트 플랫폼 확인').trim() !== 'Darwin') throw new Error('macOS 호스트 아님 — 측정 불가');

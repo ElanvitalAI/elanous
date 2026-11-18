@@ -51,7 +51,7 @@ export function formatDecisionDetail(e: DecisionEntry): string {
     `올림: ${e.raisedAt ? kst(e.raisedAt) : '시각 미상'} · ${e.raisedBy.agent} · ${version(e.version)}`,
     ...(e.dueAt ? [`기한: ${kst(e.dueAt)}`] : []),
     ...(e.importedAt ? [`가져옴: ${kst(e.importedAt)}`] : []),
-    ...(e.status === 'decided' ? [`결정: ${e.decidedAt ? kst(e.decidedAt) : '시각 미상'} · ${e.decidedBy?.kind === 'auto' ? `AUTO ${e.decidedBy.agent} (${e.decidedBy.delegation})` : e.decidedBy?.kind === 'human' ? 'human' : '주체 미상'} · ${e.choice ?? '선택 키 미상'} · ${e.versionAtDecision ? version(e.versionAtDecision) : '결정 당시 판 미상'}`,
+    ...(e.status === 'decided' ? [`결정: ${e.decidedAt ? kst(e.decidedAt) : '시각 미상'} · ${e.decidedBy?.kind === 'auto' ? `AUTO ${e.decidedBy.agent} (${e.decidedBy.delegation})` : e.decidedBy?.kind === 'human' ? `human${e.decidedBy.via ? ` · ${e.decidedBy.via}` : ''}` : e.decidedBy?.kind === 'imported' ? `IMPORTED ${e.decidedBy.source}` : '주체 미상'} · ${e.choice ?? '선택 키 미상'} · ${e.versionAtDecision ? version(e.versionAtDecision) : '결정 당시 판 미상'}`,
       ...(e.note ? [`메모: ${e.note}`] : [])] : []),
     ...(e.withdrawnAt ? [`철회: ${kst(e.withdrawnAt)} · ${e.withdrawReason}`] : []),
     '이력:', ...e.history.map(h => `  ${h.type} · ${h.at ? kst(h.at) : '시각 미상'} · ${h.by}${h.choice ? ` · ${h.choice}` : ''}${h.reason ? ` · ${h.reason}` : ''} · ${h.version ? version(h.version) : '판 미상'}`),
@@ -71,7 +71,14 @@ export function formatCrownCardRow(c: CrownCard): string {
   return `${c.id} · ${CROWN_MARK} ${c.reason === 'disagreement' ? '불합의' : '임계 승인'} · 제안 ${c.proposalId} · 조율자 주장: ${c.coordinatorClaim} | 수호자 주장: ${c.guardianClaim}${c.decisionId ? ` · 결정 카드 ${c.decisionId}` : ''}`;
 }
 
-export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions = {}, out: Pick<Console, 'log'> = console, hqDeps: HqDeps = {}): void {
+/** DECISION-LEDGER-HUMAN-AUTH PR-1 — a person's own terminal: not inside a seat (`ELANOUS_SEAT`) and an interactive TTY. */
+export function isHumanTerminal(env: Readonly<Record<string, string | undefined>> = process.env, tty = process.stdin.isTTY === true): boolean {
+  return !env.ELANOUS_SEAT?.trim() && tty;
+}
+
+export const HUMAN_DECIDE_REFUSED = '사람 결정은 사람의 터미널에서만 기록한다 (자리 안·비대화형 셸 거절) — 위임 결정이면 --auto --delegation <근거>';
+
+export function registerDecisionsCommands(program: Command, config: DecisionLedgerOptions & { humanTerminal?: () => boolean } = {}, out: Pick<Console, 'log'> = console, hqDeps: HqDeps = {}): void {
   const noXcheck = new Option('--no-xcheck <이유>', '교차 확인 생략 이유');
   // This flag takes a reason, not Commander's negated boolean default.
   noXcheck.negate = false;
@@ -242,7 +249,8 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .action((id: string, choice: string, o: { note?: string; auto?: boolean; delegation?: string; track?: DecisionTrack; agent?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (o.auto && !o.delegation?.trim()) throw new Error('--auto requires --delegation');
       if (!o.auto && (o.delegation || o.track || o.agent)) throw new Error('delegation/track/agent require --auto');
-      const by = o.auto ? { kind: 'auto' as const, agent: agent(o.agent), delegation: o.delegation!, ...(o.track ? { track: o.track } : {}) } : { kind: 'human' as const };
+      if (!o.auto && !(config.humanTerminal ?? isHumanTerminal)()) throw new Error(HUMAN_DECIDE_REFUSED);
+      const by = o.auto ? { kind: 'auto' as const, agent: agent(o.agent), delegation: o.delegation!, ...(o.track ? { track: o.track } : {}) } : { kind: 'human' as const, via: 'cli' as const };
       if (!mayWrite('decide', o.hqOverride)) return;
       const { entry, delivery, notice } = new DecisionLedger(config).decideWithDelivery(id, choice, by, o.note);
       const failures = [

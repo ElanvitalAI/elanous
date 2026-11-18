@@ -28,7 +28,18 @@ NODES = ['source-reserve', 'grounding', 'assumptions', 'architecture', 'file-pla
          'files', 'verify-repair', 'materialize', 'publish-approval', 'publish']
 REGRESSIONS = ['idle-heartbeat', 'first-run', 'normal-installed-entry',
                'account-home', 'confirmation-and-no-bypass', 'natural-route',
-               'plugin-credential-isolation', 'client-issuer-head', 'owner-publish-resume']
+               'plugin-credential-isolation', 'client-issuer-head', 'owner-publish-resume',
+               'cross-run-binding']
+# Product strings this smoke reacts to (SF6: checked against the product source by the test file).
+#   ready: the idle footer — the old sentence «Turn idle» (≥120 columns), the short form «○ idle» (the 100-column TUI
+#   this smoke opens), or the Korean «턴 대기» of older builds.
+READY_SIGNS = re.compile(r'Turn idle|턴 대기|○ idle')
+#   route-adapter.ts: `Run ${tool.name}? (y/N)` (app_build declares no confirmationPrompt of its own).
+APPROVAL_PROMPT = 'Run app_build? (y/N)'
+#   child-plugin-runtime.ts: the owner browser-approval link line.
+OWNER_APPROVAL_LINK = '회원 게시 승인 링크'
+# 출처: SF6 — a heartbeat report every 2 s is enough for a watcher and avoids rewriting it four times a second.
+REPORT_EVERY_SECONDS = 2.0
 NOT_BEFORE = dt.datetime.fromisoformat('2026-11-16T18:00:00+09:00').timestamp()
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)')
 
@@ -106,17 +117,44 @@ def preflight(m, now=None, hostname=None):
         raise ValueError('SESSION_SHORTER_THAN_RUN_BUDGET')
 
 
+class BindingRefused(ValueError):
+    """A graph state bound to another run, owner or app. `reasons` are enums only (never ids or digests)."""
+    def __init__(self, reasons):
+        super().__init__('CROSS_RUN_OWNER_OR_APP_BINDING')
+        self.reasons = reasons
+
+
 def graph_summary(state, manifest, started):
     """Never borrow old runs, different owners/slugs, or skipped terminal nodes."""
-    if (state.get('graphId') != 'app-build'
-            or dt.datetime.fromisoformat(state['startedAt']).timestamp() < started
-            or state.get('input', {}).get('appSlug') != manifest['app_slug']
-            or digest(str(state.get('input', {}).get('context', {}).get('memberId', '')).encode())
-            != manifest['owner_sha256']):
-        raise ValueError('CROSS_RUN_OWNER_OR_APP_BINDING')
+    try:
+        state_started = dt.datetime.fromisoformat(str(state.get('startedAt'))).timestamp()
+    except ValueError:
+        raise BindingRefused(['started-at-unreadable'])
+    run_input = state.get('input')
+    context = run_input.get('context') if isinstance(run_input, dict) else None
+    # #38306 REVIEW-2 ①: a state written before its binding keys is incomplete — skipped this round (KeyError), never
+    # recorded as another run's binding.
+    if not isinstance(context, dict) or 'appSlug' not in run_input or 'memberId' not in context:
+        raise KeyError('binding-keys-not-written-yet')
+    reasons = []
+    if state.get('graphId') != 'app-build':
+        reasons.append('graph-id-mismatch')
+    if state_started < started:
+        reasons.append('started-before-this-run')
+    if run_input.get('appSlug') != manifest['app_slug']:
+        reasons.append('app-slug-mismatch')
+    if digest(str(context['memberId']).encode()) != manifest['owner_sha256']:
+        reasons.append('owner-mismatch')
+    if reasons:
+        raise BindingRefused(reasons)
+    # #38306 REVIEW-2 r2 ②: a state without its node list yet is incomplete (next round), never «a graph with no nodes».
+    if not isinstance(state.get('nodes'), list):
+        raise KeyError('nodes-not-written-yet')
     nodes = []
     passed = set()
-    for n in state.get('nodes', []):
+    for n in state['nodes']:
+        if not isinstance(n, dict):
+            continue
         row = {k: n[k] for k in ['nodeId', 'executed', 'ok', 'seconds'] if k in n}
         # Error messages and generated code can contain secrets. Export enums only.
         if not n.get('ok'):
@@ -125,11 +163,20 @@ def graph_summary(state, manifest, started):
                 'BUILD_AUTHORITY_REFUSED', 'BUILD_TESTS_EXHAUSTED',
                 'PLANNING_OUTPUT_REPAIR_EXHAUSTED', 'APP_BUILD_OWNER_PRESENTATION_REFUSED'] if code in raw]
         if n.get('nodeId') == 'verify-repair' and n.get('ok'):
-            result = json.loads(n.get('output', '{}')).get('result', {})
+            # #38306 REVIEW-2 ②: a partial write is not «verified with no detail» — the whole state waits a round
+            # (KeyError), so a terminal graph never reports an incomplete verify as passed.
+            try:
+                parsed = json.loads(n.get('output', ''))
+            except (ValueError, TypeError):
+                raise KeyError('verify-output-incomplete')
+            result = parsed.get('result') if isinstance(parsed, dict) else None
+            # r2 ①: an object is not enough — the verify verdict itself (passed: true/false) must be there.
+            if not isinstance(result, dict) or not isinstance(result.get('passed'), bool):
+                raise KeyError('verify-output-incomplete')
             row['verify'] = {k: result[k] for k in ['passed', 'files', 'repairUsed', 'fileDigest'] if k in result}
             row['test_strategies'] = [
                 {'id': t.get('strategyId'), 'passed': t.get('passed'), 'exitCode': t.get('exitCode')}
-                for t in result.get('testReceipts', [])]
+                for t in result.get('testReceipts', []) if isinstance(t, dict)]
         nodes.append(row)
         if n.get('executed') is True and n.get('ok') is True:
             passed.add(n.get('nodeId'))
@@ -166,6 +213,80 @@ def known_tool_failure(messages):
     return None
 
 
+def load_graphs(root, manifest, started, report, private_names=None):
+    """This run's app-build graph states. A file mid-write, a non-object, or a missing key is skipped this round; a
+    state bound to another run/owner/app is refused and recorded (SF6: never a runner crash, never borrowed).
+    A private graph file's name is not a public identifier (OP 11-18): the report names it by a short hash id and
+    `private_names` (id → name) is what goes to the local private evidence file."""
+    graphs = []
+    for p in (Path(root) / 'graph-runs' / 'app-build').glob('*.json'):
+        try:
+            state = json.loads(p.read_text())
+        except (ValueError, OSError):
+            continue
+        if not isinstance(state, dict) or state.get('graphId') != 'app-build':
+            continue
+        try:
+            if dt.datetime.fromisoformat(str(state.get('startedAt'))).timestamp() < started:
+                continue
+        except ValueError:
+            continue
+        try:
+            graphs.append((state, graph_summary(state, manifest, started)))
+        except BindingRefused as refused:
+            report['regressions']['cross-run-binding'] = 'refused-other-binding'
+            # #38306 REVIEW-1: keep which file and why, so the run's end is named by it (binding-failed), not «deadline».
+            seen = report.setdefault('binding_refusals', [])
+            file_id = digest(p.name.encode())[:12]
+            if private_names is not None:
+                private_names[file_id] = p.name
+            entry = {'file_id': file_id, 'reasons': refused.reasons}
+            if entry not in seen:
+                seen.append(entry)
+        except (KeyError, TypeError):
+            continue  # Incomplete state: next round.
+    return graphs
+
+
+def deadline_status(report):
+    """How a run that reached its deadline ends: «binding-failed» when the only graph states seen were refused for their
+    binding (another run, owner or app — the causes are in report['binding_refusals']); otherwise «deadline»."""
+    if report.get('binding_refusals') and not report.get('run'):
+        report['binding_cause'] = sorted({reason for row in report['binding_refusals'] for reason in row['reasons']})
+        return 'binding-failed'
+    return 'deadline'
+
+
+class MessageReader:
+    """Session lines since `started`, read incrementally (SF6): each file is read from where the last round stopped
+    and only complete lines count, so the watcher never re-parses whole transcripts four times a second."""
+    def __init__(self, root, started):
+        self.root, self.started, self.offsets, self.messages = Path(root), started, {}, []
+
+    def read(self):
+        for p in (self.root / 'sessions').glob('*.jsonl'):
+            try:
+                if p.stat().st_mtime < self.started:
+                    continue
+                with p.open('rb') as stream:
+                    stream.seek(self.offsets.get(p, 0))
+                    chunk = stream.read()
+            except OSError:
+                continue
+            end = chunk.rfind(b'\n')
+            if end < 0:
+                continue  # Only a partial line so far.
+            self.offsets[p] = self.offsets.get(p, 0) + end + 1
+            for line in chunk[:end].decode('utf-8', 'replace').splitlines():
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict) and dt.datetime.fromisoformat(item['ts']).timestamp() >= self.started:
+                        self.messages.append(item)
+                except (ValueError, KeyError, TypeError):
+                    continue
+        return self.messages
+
+
 def read_messages(root, started):
     messages = []
     for p in (Path(root) / 'sessions').glob('*.jsonl'):
@@ -174,9 +295,9 @@ def read_messages(root, started):
         for line in p.read_text().splitlines():
             try:
                 item = json.loads(line)
-                if dt.datetime.fromisoformat(item['ts']).timestamp() >= started:
+                if isinstance(item, dict) and dt.datetime.fromisoformat(item['ts']).timestamp() >= started:
                     messages.append(item)
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 continue  # The writer may be appending a final line.
     return messages
 
@@ -198,6 +319,7 @@ def run(manifest_path, output):
     if m['version'] not in version.stdout.decode() or m['head'] not in version.stdout.decode():
         raise ValueError('LIVE_INSTALLED_VERSION_MISMATCH')
     started = time.time()
+    refused_names = {}
     report = {'schema': 1, 'kind': 'live-zero-vm', 'started_at': utc(),
               'manifest_sha256': digest(Path(manifest_path).read_bytes()), 'version': m['version'],
               'head': m['head'], 'regressions': {k: 'unmeasured' for k in REGRESSIONS},
@@ -205,20 +327,36 @@ def run(manifest_path, output):
               'status': 'running', 'run': None, 'public_url': None}
     report['regressions'].update({'normal-installed-entry': 'pass', 'account-home': 'preflight-receipt',
                                   'client-issuer-head': 'preflight-receipt'})
+    # Everything that can fail before the product starts happens first (SF6): once the child exists, the very next
+    # statement is inside the try whose finally ends its session group.
+    raw_fd = os.open(output / 'terminal.private.raw', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 100, 0, 0))
-    child = subprocess.Popen(command + ['--tui', 'next'], cwd=m['workspace'], env=env,
-                             stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
-    os.close(slave)
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
     prior_term = signal.signal(signal.SIGTERM, interrupted)
     tail = ''
     owner_pending = False
     public_checked = False
-    raw_fd = os.open(output / 'terminal.private.raw', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    messages_reader = MessageReader(m['config'], started)
+    last_report_write = 0.0
+    # #38306 REVIEW-2 ③: the spawn is inside the same try whose finally ends the child's session group and closes the
+    # descriptors — a SIGTERM between «child exists» and «cleanup armed» cannot exist.
+    child = None
     try:
-        with os.fdopen(raw_fd, 'wb') as raw:
+        # r2 ③: SIGTERM is held while Popen runs — a child that exists but is not yet in `child` cannot be left behind.
+        # The held signal arrives right after the assignment, inside this try, and the finally ends the child.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        try:
+            child = subprocess.Popen(command + ['--tui', 'next'], cwd=m['workspace'], env=env,
+                                     stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        os.close(slave)
+        slave = None
+        raw = os.fdopen(raw_fd, 'wb')
+        raw_fd = None
+        with raw:
             while time.time() - started < m['timeout_seconds']:
                 if child.poll() is not None:
                     report['status'] = 'product-exited'
@@ -232,16 +370,20 @@ def run(manifest_path, output):
                     try:
                         data = os.read(master, 65536)
                     except OSError:
+                        data = b''  # EIO on macOS/Linux once the product side of the PTY is gone.
+                    if not data:
+                        # PTY EOF: the product closed its terminal — a named end, never a report left «running».
+                        report['status'] = 'product-exited' if child.poll() is not None else 'pty-eof'
                         break
                     raw.write(data)
                     raw.flush()
                     tail = (tail + ANSI.sub('', data.decode('utf-8', 'replace')))[-50000:]
-                    if not report['prompt_count'] and re.search(r'Turn idle|턴 대기', tail) and '❯' in tail:
+                    if not report['prompt_count'] and READY_SIGNS.search(tail) and '❯' in tail:
                         os.write(master, (PROMPT + '\r').encode())
                         report['prompt_count'] = 1
                         report['regressions']['first-run'] = 'pass'
                         tail = ''
-                    if 'Run app_build? (y/N)' in tail:
+                    if APPROVAL_PROMPT in tail:
                         # Redraws may repeat the same question before the key is consumed.
                         # At most one graph approval key in the entire smoke.
                         if not report['graph_approval_keys']:
@@ -249,7 +391,7 @@ def run(manifest_path, output):
                             report['graph_approval_keys'] = 1
                             report['regressions']['confirmation-and-no-bypass'] = 'approval-sent'
                         tail = ''
-                    if '회원 게시 승인 링크' in tail and not owner_pending:
+                    if OWNER_APPROVAL_LINK in tail and not owner_pending:
                         urls = re.findall(r'https://[^\s()]+', tail)
                         private_json(output / 'owner-approval.private.json', {
                             'observed_at': utc(), 'displayed_url_fragments': urls,
@@ -265,7 +407,7 @@ def run(manifest_path, output):
                         os.write(master, b'y')
                         report['owner_continuations'] += 1
                         owner_pending = False
-                messages = read_messages(m['config'], started)
+                messages = messages_reader.read()
                 tool_failure = known_tool_failure(messages)
                 if tool_failure:
                     report['status'] = tool_failure
@@ -276,14 +418,7 @@ def run(manifest_path, output):
                     report['regressions']['confirmation-and-no-bypass'] = 'fail-bypass-observed'
                     report['status'] = 'bypass-observed'
                     break
-                graphs = []
-                for p in (Path(m['config']) / 'graph-runs' / 'app-build').glob('*.json'):
-                    try:
-                        state = json.loads(p.read_text())
-                        if dt.datetime.fromisoformat(state['startedAt']).timestamp() >= started:
-                            graphs.append((state, graph_summary(state, m, started)))
-                    except json.JSONDecodeError:
-                        continue
+                graphs = load_graphs(m['config'], m, started, report, refused_names)
                 if len(graphs) > 1:
                     report['status'] = 'multiple-graph-runs'
                     break
@@ -291,12 +426,12 @@ def run(manifest_path, output):
                     state, report['run'] = graphs[0]
                     report['regressions']['natural-route'] = 'pass'
                     report['regressions']['plugin-credential-isolation'] = 'graph-entered'
-                    if state['status'] in ['failed', 'done', 'cancelled']:
+                    if state.get('status') in ['failed', 'done', 'cancelled']:
                         report['status'] = 'graph-' + state['status']
                         if report['run']['reached'] == 'publish' and not public_checked:
                             public_checked = True
                             url = f"https://{m['app_slug']}--{m['handle']}.elanous.app/"
-                            publish = next(n for n in state['nodes'] if n['nodeId'] == 'publish' and n.get('ok'))
+                            publish = next(n for n in state.get('nodes', []) if isinstance(n, dict) and n.get('nodeId') == 'publish' and n.get('ok'))
                             if url.rstrip('/') not in str(publish.get('output', '')):
                                 raise ValueError('RETURNED_PUBLIC_URL_MISMATCH')
                             with urllib.request.urlopen(url, timeout=15) as response:
@@ -308,9 +443,11 @@ def run(manifest_path, output):
                         break
                 report['heartbeat_at'] = utc()
                 report['regressions']['idle-heartbeat'] = 'watcher-alive'
-                private_json(output / 'report.json', report)
+                if time.time() - last_report_write >= REPORT_EVERY_SECONDS:
+                    private_json(output / 'report.json', report)
+                    last_report_write = time.time()
             else:
-                report['status'] = 'deadline'
+                report['status'] = deadline_status(report)
     except KeyboardInterrupt:
         report['status'] = 'operator-cancelled'
     except Exception as error:
@@ -321,20 +458,38 @@ def run(manifest_path, output):
         raise
     finally:
         # Only our session group; never tmux kill-server, pkill, or reserved-host cleanup.
-        os.killpg(child.pid, signal.SIGTERM) if child.poll() is None else None
-        try:
-            child.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=5)
-        os.close(master)
+        if child is not None:
+            os.killpg(child.pid, signal.SIGTERM) if child.poll() is None else None
+            try:
+                child.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=5)
+        for fd in (raw_fd, slave, master):
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         signal.signal(signal.SIGTERM, prior_term)
         report['finished_at'] = utc()
-        report['product_exit'] = child.returncode
+        report['product_exit'] = child.returncode if child is not None else None
         report['background_cleanup_proved'] = False
         report['booking_e2e_proved'] = False
-        private_json(output / 'report.json', report)
+        write_final(output, report, refused_names)
     return 0 if (report.get('public_url') or {}).get('status') == 200 else 2
+
+
+def write_final(output, report, refused_names):
+    """The run's last writes. The refused graph names are local evidence only (0600, beside the private PTY evidence);
+    report.json carries their ids. r2 ④: a failed side-evidence write is recorded in the report and never stops it."""
+    if refused_names:
+        try:
+            private_json(output / 'binding-refusals.private.json', refused_names)
+        except OSError as error:
+            report['binding_refusals_private'] = f'write-failed:{type(error).__name__}'
+    private_json(output / 'report.json', report)
 
 
 def main():

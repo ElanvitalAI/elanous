@@ -33,10 +33,10 @@ export function podChildProviderRefusal(named: string | undefined): string | und
 /**
  * BEDROCK-POD-PROVIDER-DROP (0.2.24) — 발사(`index.ts`)가 고른 Pod provider 를 Pod 옵션(`provider` · `account`)으로 옮기는 «한 곳».
  * 🩸 10-11: podBase 가 grok·openrouter·anthropic 만 손으로 나열해 `bedrock` 이 떨어졌다 — Pod 자식은 codex(team) 로 돌았다.
- * ⭐ codex 가 아닌 provider 는 «그 이름»이 곧 account 다(Pod 표면 `plannedAccount` 와 같은 규칙) · codex 만 명시 계정 ?? team.
+ * ⭐ codex 가 아닌 provider 는 «그 이름»이 곧 account 다(Pod 표면 `plannedAccount` 와 같은 규칙) · codex 만 명시 계정 ?? default(OP #88985 — 크레딧 계정 금지 · default 리셋 게이트).
  */
 export function podLaunchProviderOptions(podProvider: PodChildProvider, o: { explicitPodAccount?: string; grokApiKeyOptIn: boolean }): { account: string; provider: PodChildProvider; grokApiKeyOptIn?: boolean } {
   // provider 는 여섯 전부 싣는다 — Pod 의 podChildLlmArgs 는 명시 발사에 provider 가 비면 거부한다(조용한 codex 금지).
-  if (podProvider === 'openai-codex') return { account: o.explicitPodAccount ?? 'team', provider: 'openai-codex' };
+  if (podProvider === 'openai-codex') return { account: o.explicitPodAccount ?? 'default', provider: 'openai-codex' };
   return { account: podProvider, provider: podProvider, ...(podProvider === 'grok' ? { grokApiKeyOptIn: o.grokApiKeyOptIn } : {}) };
 }

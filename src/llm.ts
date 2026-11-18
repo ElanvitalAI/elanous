@@ -8,10 +8,11 @@ import { textOnly } from './llm/stream-text.js';
 import { resolveModelProfile, type ModelProfile } from './llm-model-profiles.js';
 import { resolveRequestMaxTokens } from './llm/output-budget.js';
 import { STREAM_DISCONNECT_MAX_RETRIES, STREAM_IDLE_TIMEOUT_MAX_RETRIES, StreamIdleTimeoutError, StreamTotalTimeoutError, streamDisconnectRetryDelayMs, isStreamDisconnectRetryable, sleepUnlessAborted } from './llm/stream-fallback.js';
+import { StreamNoProgressError, isTurnProgressEvent, resolveTurnNoProgressMs, type TurnNoProgressFire } from './llm/turn-progress.js';
 import { wellFormedLLMMessages } from './llm-wellformed.js';
 import { truncateOutput } from './output-truncation.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { testFakeLlmDefaultSelected, testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
+import { isTestUniverseFakeProviderName, testFakeLlmDefaultSelected, testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { globalAnchorPath } from './prompt-library/universal-preamble.js';
@@ -34,6 +35,7 @@ import {
   DEFAULT_PROVIDER,
 } from './config.js';
 import { debug, getAmbientSessionId, redactSecrets, redactSecretText } from './debug/log.js';
+import { emitTurnLife } from './debug/turn-life.js';
 import { llmObserveSend, withLlmCallContext } from './session-runtime/llm-call-gateway.js';
 import { estimateMessagesTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
@@ -395,6 +397,11 @@ export interface LLMOpts {
   signal?: AbortSignal;
   /** Override the text-stream idle watchdog per request (milliseconds). */
   streamIdleTimeoutMs?: number;
+  /** ELN-TURN-STALL-WATCHDOG: no output progress (text · tool call · image) for this long while the stream stays open →
+   *  abort the attempt and move to the next provider in the chain. Omitted: `llm.turnNoProgressMs` or 10 min. */
+  turnNoProgressMs?: number;
+  /** Told each time that watchdog fires, before the retry (or the give-up). Observation only — a throw is ignored. */
+  onNoProgress?(fire: TurnNoProgressFire): void;
   /** Maximum wait for HTTP response headers for this request. */
   streamHeaderTimeoutMs?: number;
   /** Maximum wait for the first provider event; omitted preserves the family idle default. */
@@ -4109,6 +4116,9 @@ export function finalizeProviderModelCompatibility(decision: ProviderDecision): 
     ? decision.provider.slice('auto:'.length)
     : decision.provider;
   if (configuredProvider === 'auto') return decision;
+  // SIM-FAKE-LLM-REGISTRY — `test-fake-llm` 은 시험·시뮬 우주에서만 아는 공급자다(외부 endpoint 가 없어 짝 검사가 필요 없다).
+  //   생산 우주에서는 아래 isKnownProviderName 이 그대로 «unknown provider» 로 거부한다.
+  if (isTestUniverseFakeProviderName(configuredProvider)) return decision;
   if (!isKnownProviderName(configuredProvider)) {
     throw new Error(`Cannot establish provider-model compatibility: unknown provider "${configuredProvider}" for model "${decision.model}"`);
   }
@@ -4502,6 +4512,21 @@ function firstAvailableFallbackProvider(attempted: ReadonlySet<string>, opts: LL
 function overloadFallbackStillAvailable(failedProvider: string, candidate: LLMProvider): boolean {
   if (failedProvider === 'openai-codex' && process.env.ELANOUS_SUBSTRATE !== 'pod') return true;
   return candidate.available();
+}
+
+/**
+ * ELN-SEAT-TURN-HARD-CAP ③ — the OpenRouter model to try once on the SAME provider before the turn leaves OpenRouter.
+ * decision 11-18 19:0x: inside OpenRouter only the pair glm-5.3 ⇄ gpt-6-luna, each the other's fallback. `configured` =
+ * `llm.openrouter.fallbackModel` (`openrouter/<vendor>/<model>`); when the turn already runs on that model, the pair's
+ * other half is the provider default (`providerDefault`). null = not configured, malformed, or nothing different to try.
+ */
+export function openrouterSameProviderFallbackModel(currentModel: string, configured: unknown, providerDefault?: string): string | null {
+  if (typeof configured !== 'string') return null;
+  const match = /^openrouter\/([^/\s]+\/\S+)$/.exec(configured.trim());
+  if (match === null) return null;
+  const model = match[1]!;
+  if (model !== currentModel) return model;
+  return providerDefault !== undefined && providerDefault !== currentModel ? providerDefault : null;
 }
 
 function finalizeStreamingProviderModel(provider: LLMProvider, model: string): { provider: LLMProvider; model: string } {
@@ -8601,6 +8626,8 @@ export async function streamLLMWithTools(
   const initial = finalizeStreamingProviderModel(provider, opts.model ?? provider.defaultModel);
   let activeProvider = initial.provider;
   let activeModel = initial.model;
+  /** ELN-SEAT-TURN-HARD-CAP ③ — the same-provider OpenRouter model step is taken at most once per call. */
+  let openrouterModelFallbackUsed = false;
   let circuitBlockedInitialProvider: string | undefined;
   // SURVIVAL-PROVIDER-CIRCUIT (S2): 명시·고정 공급자(`provider`·`initialProvider`)가 없고
   // 회로가 열려(open) 있으면, 체인 해석(`remainingFallbackProviderNames` 순서)의 첫
@@ -9024,9 +9051,13 @@ export async function streamLLMWithTools(
   //   breaker open 시 압축 스킵 + 관측(자기인지) + 힐 신호(관측이 후속 힐 입력). orchestrator 무관(루프 로컬).
   const { createCircuitBreaker: _makeBreaker } = require('./agent-substrate/circuit-breaker.js') as typeof import('./agent-substrate/circuit-breaker.js');
   const compactBreaker = _makeBreaker({ threshold: 3 });
+  // OP-LONG-SESSION-COMPACT (O4 PR2): history size when the breaker opened — an open breaker used to skip compaction
+  // for the rest of the turn (live p50 19 · max 159 rounds); once history has grown past COMPACT_REARM_GROWTH × that,
+  // the breaker gets one more try (half-open).
+  let compactOpenedAtTokens: number | undefined;
   // ★ agent-loop-substrate 조각2 — pluggable context 전략(기본=2-tier compaction). 주입(opts.contextStrategy)으로
   //   read-time projection 등 교체. 문맥관리를 substrate 프리미티브로 통일(streamLLMWithTools 인라인 산재 해소).
-  const { createDefaultContextStrategy: _makeContextStrategy } = require('./agent-substrate/context-strategy.js') as typeof import('./agent-substrate/context-strategy.js');
+  const { createDefaultContextStrategy: _makeContextStrategy, shouldRearmCompaction } = require('./agent-substrate/context-strategy.js') as typeof import('./agent-substrate/context-strategy.js');
   const _contextStrategy = opts.contextStrategy ?? _makeContextStrategy();
   // Latest provider prompt usage is the trigger baseline. Add estimated growth
   // appended to history after that request (usually tool output) at the next loop.
@@ -9064,6 +9095,8 @@ export async function streamLLMWithTools(
             debug.log('llm.interjection', 'drained-mid-turn', {
               turn, count: pending.length, chars: message.length,
             }, { level: 'info' });
+            // OBSERVE-TURN-EVENT-LIFECYCLE — 조향 배달(같은 자리·같은 필드의 turn-life 사본).
+            try { emitTurnLife('turn-life:steer-delivered', { turn, count: pending.length, chars: message.length }); } catch { /* observability is fail-open */ }
           }
         }
       } catch (error) {
@@ -9121,6 +9154,14 @@ export async function streamLLMWithTools(
         const acCfg = getUserConfig().chat?.autoCompact;
         if (acCfg?.enabled) {
           // ★ 조각1 breaker — 압축이 이미 무력 판정(open)이면 압축 워크 자체 스킵(폭주 차단·자기수복). 관측만.
+          if (compactBreaker.state.open && compactOpenedAtTokens !== undefined
+            && shouldRearmCompaction(compactOpenedAtTokens, estimateMessagesTokens(history))) {
+            debug.log('llm.router', 'tool-loop.midloop-compact.breaker-rearm', { turn, openedAtTokens: compactOpenedAtTokens, nowTokens: estimateMessagesTokens(history) });
+            // Half-open: exactly one more try — the next no-reduce opens it again (reset, then threshold − 1 failures).
+            compactBreaker.reset();
+            for (let i = 1; i < compactBreaker.state.threshold; i += 1) compactBreaker.record('failure', 'half-open');
+            compactOpenedAtTokens = undefined;
+          }
           if (compactBreaker.state.open) {
             debug.log('llm.router', 'tool-loop.midloop-compact.breaker-skip', { turn, consecutiveFailures: compactBreaker.state.consecutiveFailures });
             if (opts.missionContext) debug.log('mission.walker', 'compact-breaker-skip', { ...opts.missionContext, turn, consecutiveFailures: compactBreaker.state.consecutiveFailures });
@@ -9162,6 +9203,7 @@ export async function streamLLMWithTools(
               debug.log('llm.router', 'tool-loop.midloop-compact.no-reduce', { turn, beforeTokens: outcome.beforeTokens, afterTokens: outcome.afterTokens, escalated: outcome.escalated });
               const brk = compactBreaker.record('failure', 'compaction-no-reduce');
               if (brk.tripped) {
+                compactOpenedAtTokens = outcome.beforeTokens;
                 debug.log('llm.router', 'tool-loop.midloop-compact.breaker-open', { turn, consecutiveFailures: brk.state.consecutiveFailures, threshold: brk.state.threshold, beforeTokens: outcome.beforeTokens, afterTokens: outcome.afterTokens });
                 if (opts.missionContext) debug.log('mission.walker', 'compact-breaker-open', { ...opts.missionContext, turn, consecutiveFailures: brk.state.consecutiveFailures, reason: 'compaction-no-reduce', beforeTokens: outcome.beforeTokens, afterTokens: outcome.afterTokens });
                 // ★ 과부하 신호 배선(2026-07-21) — breaker-open(mid-turn 컨텍스트 폭발)을 walker 래퍼로 흘려
@@ -9175,6 +9217,9 @@ export async function streamLLMWithTools(
         const errMsg = err instanceof Error ? err.message : String(err);
         debug.log('llm.router', 'tool-loop.midloop-compact.error', { turn, error: errMsg }, { level: 'error' });
         const brk = compactBreaker.record('failure', 'compaction-error'); // ★ 조각1 — 에러도 failure 누적
+        // O4 PR2 · JUD #38659 ⓑ: an error that trips the breaker (a half-open try that throws trips at once) must also
+        // remember the size, or the re-arm condition never holds again and compaction stays off for the rest of the turn.
+        if (brk.tripped) compactOpenedAtTokens = estimateMessagesTokens(history);
         if (opts.missionContext) {
           debug.log('mission.walker', 'compact-error', { ...opts.missionContext, turn, error: errMsg }, { level: 'error' });
           if (brk.tripped) {
@@ -9223,6 +9268,14 @@ export async function streamLLMWithTools(
     const streamIdleTimeoutMs = idleTimeout.ms;
     const firstTokenTimeoutMs = resolveFirstTokenTimeoutMs(opts, activeModel, streamIdleTimeoutMs);
     const totalTimeoutMs = totalStreamTimeoutMs(opts, activeModel);
+    // ELN-TURN-STALL-WATCHDOG — events can keep flowing (reasoning · usage) with no output at all; the idle watchdog
+    // above only sees silence. `progressAt` moves only on output progress (llm/turn-progress.ts) and restarts per attempt.
+    let configuredNoProgressMs: number | undefined;
+    try {
+      configuredNoProgressMs = (require('./user-config.js') as typeof import('./user-config.js')).getUserConfig().llm.turnNoProgressMs;
+    } catch { /* config lookup is fail-soft; the default applies */ }
+    const noProgress = resolveTurnNoProgressMs(opts.turnNoProgressMs, configuredNoProgressMs);
+    let progressAt = Date.now();
     const streamStartedAt = Date.now();
     // ⚠️ hang 진단(2026-07-17) — codex SSE 스트림이 완료 신호 없이 안 끝나는 케이스 확정용.
     // consume-start 후 consume-end 가 없으면 = for-await(streamChat SSE) hang. lastEvType 로 어느
@@ -9357,6 +9410,7 @@ export async function streamLLMWithTools(
             nameMap.toOriginalName,
           )[Symbol.asyncIterator]();
           streamAttemptStartedAt = Date.now();
+          progressAt = streamAttemptStartedAt;
         }
         const remainingMs = totalTimeoutMs - (Date.now() - streamStartedAt);
         if (remainingMs <= 0) throw new StreamTotalTimeoutError(totalTimeoutMs);
@@ -9364,7 +9418,9 @@ export async function streamLLMWithTools(
         // Reference: openai/codex@ee344ca codex-rs/model-provider-info/src/lib.rs:557-561.
         // Keep the first-token deadline absolute even when usage events arrive rapidly.
         if (!sawFirstToken && phaseTimeoutMs <= 0) throw new StreamIdleTimeoutError(firstTokenTimeoutMs);
-        const waitMs = Math.max(1, Math.min(phaseTimeoutMs, remainingMs));
+        const quietMs = Date.now() - progressAt;
+        if (quietMs >= noProgress.ms) throw new StreamNoProgressError(noProgress.ms, quietMs);
+        const waitMs = Math.max(1, Math.min(phaseTimeoutMs, remainingMs, noProgress.ms - quietMs));
         step = await Promise.race([
           withLlmCallContext({
             provider: activeProvider.name, model: activeModel, sessionId: opts.sessionId,
@@ -9377,6 +9433,9 @@ export async function streamLLMWithTools(
         ]);
         if (step.idle) {
           if (Date.now() - streamStartedAt >= totalTimeoutMs) throw new StreamTotalTimeoutError(totalTimeoutMs);
+          // The timer may have been the no-progress deadline (the shortest of the three), not the idle one.
+          const quietAtWake = Date.now() - progressAt;
+          if (quietAtWake >= noProgress.ms) throw new StreamNoProgressError(noProgress.ms, quietAtWake);
           throw new StreamIdleTimeoutError(sawFirstToken ? streamIdleTimeoutMs : firstTokenTimeoutMs);
         }
         await recordChildFirstLlmResponse({ status: 'ok' });
@@ -9413,6 +9472,42 @@ export async function streamLLMWithTools(
             status: err.status,
             tools: providerToolSchemaDiagnostics,
           }, { level: 'warn' });
+        }
+        if (err instanceof StreamNoProgressError) {
+          debug.log('llm.stream', 'no-progress', {
+            provider: activeProvider.name, model: activeModel, turn, quietMs: err.quietMs, limitMs: err.limitMs,
+            limitSource: noProgress.source, evCount, lastEvType, textChars: turnText.length, reasoningChars: turnReasoningChars,
+            pendingCalls: pendingCalls.length,
+          }, { level: 'warn' });
+          try {
+            opts.onNoProgress?.({ provider: activeProvider.name, model: activeModel, quietMs: err.quietMs, limitMs: err.limitMs });
+          } catch { /* observation never changes recovery */ }
+          // #38515 r1 MF1: this attempt's request signal is already aborted at the top of this catch
+          // (releaseStreamAttempt(true, err)) — the iterator return() below is only cleanup, never the cancel itself.
+          // Same detached cleanup as the idle path: the provider iterator may hold a pending next().
+          const stalledIterator = streamIter;
+          if (stalledIterator?.return) {
+            try { void Promise.resolve(stalledIterator.return(undefined)).catch(() => {}); } catch { /* fail-soft cleanup */ }
+          }
+          // #38515 r1 MF2: a user cancel wins over everything the watchdog would do (keep-pending · fallback).
+          if (opts.signal?.aborted) throw err;
+          // A tool call or an image already escaped: never replay them elsewhere — run what the model asked for.
+          if (pendingCalls.length > 0 || streamEmittedImage) {
+            debug.log('llm.stream', 'no-progress-keep-pending', { provider: activeProvider.name, turn, pendingCalls: pendingCalls.length }, { level: 'warn' });
+            break;
+          }
+          // Same context, next provider: drop this attempt's partial text (the retry display gate keeps the screen honest).
+          rewindDisconnectedStream();
+          streamIter = undefined;
+          if (opts.provider) {
+            // A pinned provider has no chain: the turn ends with this error, said out loud.
+            try { handlers.onStatus?.('⏸ Blocked · no output progress'); } catch { /* status is fail-soft */ }
+            debug.log('llm.stream', 'no-progress-exhausted', {
+              provider: activeProvider.name, model: activeModel, turn, reason: 'pinned-provider', blockedProviders: [activeProvider.name],
+            }, { level: 'error' });
+            throw err;
+          }
+          try { handlers.onStatus?.(`No output for ${Math.max(1, Math.round(err.quietMs / 60_000))} min · trying the next provider`); } catch { /* status is fail-soft */ }
         }
         if (err instanceof StreamIdleTimeoutError) {
           debug.log('llm.stream', 'idle-timeout', {
@@ -9539,6 +9634,29 @@ export async function streamLLMWithTools(
         });
         (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, verdict.category, Date.now());
         blockedProviders = [...verdict.attempts];
+        // ELN-SEAT-TURN-HARD-CAP ③ — before leaving OpenRouter (the chain's next stop was spent codex), try the configured
+        // other OpenRouter model once, with nothing streamed yet. A non-provider error (verdict stop) is not retried here.
+        if (verdict.action !== 'stop' && evCount === 0 && activeProvider.name === 'openrouter' && !openrouterModelFallbackUsed) {
+          let configuredFallbackModel: unknown;
+          try {
+            configuredFallbackModel = (require('./user-config.js') as typeof import('./user-config.js')).getUserConfig().llm.openrouter?.fallbackModel;
+          } catch { /* config lookup is fail-soft; the provider chain below applies */ }
+          const sameProviderModel = openrouterSameProviderFallbackModel(activeModel, configuredFallbackModel, activeProvider.defaultModel);
+          if (sameProviderModel !== null) {
+            openrouterModelFallbackUsed = true;
+            debug.log('llm.router', 'provider-fallback', {
+              turn, blockedProvider: activeProvider.name, fallbackProvider: activeProvider.name, blockedModel: activeModel,
+              fallbackModel: sameProviderModel, sameProvider: true,
+              reason: sanitizeProviderFailureReason(err instanceof Error ? err.message : String(err)), category: verdict.category,
+            }, { level: 'warn' });
+            handlers.onStatus?.(`⚠ 모델 전환: ${activeModel} → ${sameProviderModel} (${verdict.category})`);
+            activeModel = sameProviderModel;
+            streamDisconnectRetries = 0;
+            turnOpts = buildTurnOpts();
+            streamIter = undefined;
+            continue;
+          }
+        }
         const fallback = verdict.action === 'advance' ? providerByName(verdict.nextProvider) : undefined;
         if (!fallback) {
           const terminal = terminalFallbackVerdict(
@@ -9561,6 +9679,12 @@ export async function streamLLMWithTools(
               provider: activeProvider.name, model: activeModel, turn, retries: streamIdleTimeoutRetries,
               action: terminal.action,
             }, { level: 'warn' });
+          }
+          if (err instanceof StreamNoProgressError) {
+            try { handlers.onStatus?.('⏸ Blocked · no output progress'); } catch { /* status is fail-soft */ }
+            debug.log('llm.stream', 'no-progress-exhausted', {
+              provider: activeProvider.name, model: activeModel, turn, reason: terminal.reason, action: terminal.action, blockedProviders,
+            }, { level: 'error' });
           }
           if (terminal.action === 'stop') throw err;
           throw new ProviderFallbackError(terminal, err);
@@ -9596,6 +9720,7 @@ export async function streamLLMWithTools(
       const ev = step.r.value;
       evCount++;
       lastEvType = ev.type;
+      if (isTurnProgressEvent(ev)) progressAt = Date.now();
       if ((ev.type === 'text' && ev.delta.length > 0)
         || (ev.type === 'reasoning' && ev.kind !== 'summary_part_added' && ev.delta.length > 0)
         || ev.type === 'tool_call') sawFirstToken = true;
@@ -13103,6 +13228,8 @@ export function getProviderForConfig(
   const resolvedProviderName = decision.provider.startsWith('auto:')
     ? decision.provider.slice('auto:'.length)
     : decision.provider;
+  // SIM-FAKE-LLM-REGISTRY — 시험·시뮬 우주에서 결정이 `test-fake-llm` 이면 그 fake 공급자다(생산은 아래 unknown provider 그대로).
+  if (isTestUniverseFakeProviderName(resolvedProviderName)) return testFakeLlmProvider;
   if (provider === 'auto') {
     if (resolvedProviderName === 'auto') {
       if (testFakeLlmEnabled()) return testFakeLlmProvider;

@@ -1,5 +1,10 @@
 /** Release-specific command bindings live outside the generic graph runner. */
 export const RELEASE_NODE_COMMANDS: Readonly<Record<string, Readonly<{ recipe: string; command?: string }>>> = {
+  // RELEASE-RESUME-AFTER-CUT-PUSHED: the cut is now the `cut-branch` node (no inline prebuild) and
+  // `gate-image-prebuild` runs the pod prebuild as its own resumable node. Legacy runs keep
+  // `version-release` (cut + inline prebuild) so old run states resume unchanged.
+  'cut-branch': { recipe: 'cmd:cut-branch', command: 'bun scripts/release-loop/version-node.ts release --no-prebuild --json' },
+  'gate-image-prebuild': { recipe: 'cmd:gate-image-prebuild', command: 'bun scripts/release-loop/version-node.ts gate-image-prebuild --json' },
   'version-release': { recipe: 'cmd:version-release', command: 'bun scripts/release-loop/version-node.ts release --json' },
   'readiness-countdown': { recipe: 'cmd:readiness-countdown', command: 'bun scripts/release-loop/release-readiness.ts --image-t60-hold' },
   'traffic-cut-start': { recipe: 'cmd:traffic-cut-start', command: 'bun scripts/release-loop/traffic-node.ts traffic-cut-start' },

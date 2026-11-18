@@ -1,4 +1,5 @@
 import { buildInstalledPackQueryTool, dispatchInstalledPackQuery } from '../boot/installed-pack-query.js';
+import { emitTurnLife } from '../debug/turn-life.js';
 import { safeAgentSummary, toolActivityTarget } from '../tui/chat/tool-activity.js';
 import { getPlanState } from '../code-edit/plan-tool.js';
 import { planWireFromState } from '../code-edit/plan-wire.js';
@@ -80,6 +81,8 @@ import { nextTuiPushNowDecision } from '../tui/core/queue.js';
 import { setSessionTierOverride } from '../model-tier/session-override.js';
 import { parseToolResultEnvelope } from '../chat/tool-render/result-text.js';
 import type { AgentTask } from '../agent/types.js';
+import { capsuleDoneFromAgentTask, encodeCapsuleFrame } from '../turn-capsule/capsule-frame.js';
+import { createTurnCancelRouter } from '../turn-capsule/turn-cancel.js';
 
 /** Private side channel for the next TUI. Ordinary REPL JSONL stdout is unchanged. */
 const NEXT_TUI_BG_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
@@ -112,7 +115,15 @@ type ReplToolActivity =
 const shellSnapshotRouter = createShellSnapshotRouter();
 const pushNowRouter = createPushNowRouter();
 const steerRouter = createNextTuiSteerRouter();
+// CAPSULE-B2 — the host cancels a turn without killing this child.
+const turnCancelRouter = createTurnCancelRouter();
 if (typeof process.send === 'function') process.on('message', (message: unknown) => {
+  const heldBefore = turnCancelRouter.heldCount();
+  if (turnCancelRouter.receive(message)) {
+    // JUD #38560 ⓑ — a cancel before its turn listens (cold boot) is held, not lost.
+    if (turnCancelRouter.heldCount() > heldBefore) emitTurnLife('turn-life:turn-cancel-held', { turnId: (message as { turnId: string }).turnId });
+    return;
+  }
   if (!shellSnapshotRouter.receive(message) && !pushNowRouter.receive(message)) steerRouter.receive(message);
 });
 
@@ -142,7 +153,17 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
     last = frame;
     process.stderr.write(`${NEXT_TUI_BG_PREFIX}${frame}\n`);
   };
-  const done = globalAgentRegistry.onTaskDone(emit);
+  // OBSERVE-TURN-EVENT-LIFECYCLE — 하위(배경) Agent 종결 알림 도착: 관측만 남기고 방출은 그대로 emit 로.
+  const done = globalAgentRegistry.onTaskDone(() => {
+    try { emitTurnLife('turn-life:event-arrived', { source: 'subagent', arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
+    emit();
+  });
+  // CAPSULE-B1-DONE-EVENT — each finished background root task also leaves as one `capsule-done` frame
+  // (D12: the TUI can open a turn while idle). The notification drain below stays as is.
+  const capsuleDone = watchCapsuleDone(sessionId, globalAgentRegistry, backgroundTaskIds);
+  // CAPSULE-A2 — a Bash call detached past its sync cap leaves through the same frame wire.
+  const shellCapsules = (require('../turn-capsule/shell-capsule.js') as typeof import('../turn-capsule/shell-capsule.js'))
+    .installShellCapsuleSink(sessionId, (event) => { process.stderr.write(encodeCapsuleFrame(event)); });
   const onTaskStop = (message: unknown): void => {
     if (!message || typeof message !== 'object') return;
     const request = message as { type?: unknown; sessionId?: unknown; taskId?: unknown };
@@ -169,12 +190,52 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
       const spawned = parsed as { taskId?: unknown; background?: unknown };
       if (typeof spawned.taskId !== 'string') return;
       ownedRootTaskIds.add(spawned.taskId);
+      if (spawned.background === true) backgroundTaskIds.add(spawned.taskId);
       if (args.run_in_background === true && spawned.background === true) unregisteredPromises.add(spawned.taskId);
       emit();
     },
     emit,
-    dispose() { clearInterval(timer); done.dispose(); process.off('message', onTaskStop); },
+    dispose() { clearInterval(timer); done.dispose(); capsuleDone.dispose(); shellCapsules?.dispose(); process.off('message', onTaskStop); },
   };
+}
+
+type CapsuleRegistry = Pick<import('../agent/registry.js').AgentRegistry, 'onTaskDone' | 'onTaskStart' | 'onToolCall' | 'get'>;
+
+/** CAPSULE-B1 — one `capsule-done` frame per background root task of this session (start: one progress line).
+ *  `background` is flipped back to foreground on completion (task-notification), so membership is also read from
+ *  `knownBackground` (filled by the status bridge and the Agent tool result). Supplements never reopen a turn. */
+export function watchCapsuleDone(
+  sessionId: string, registry: CapsuleRegistry, knownBackground: ReadonlySet<string>,
+  write: (line: string) => void = (line) => { process.stderr.write(line); },
+): { dispose(): void } {
+  const emitted = new Set<string>();
+  const ours = (task: AgentTask): boolean => !task.parentTaskId && task.completionDelivery !== 'supplement'
+    && (task.parentSessionId === undefined || task.parentSessionId === sessionId)
+    && (task.background === true || knownBackground.has(task.id));
+  const started = registry.onTaskStart((task) => {
+    if (!task.background || !ours(task)) return;
+    write(encodeCapsuleFrame({ type: 'capsule-progress', capsuleId: task.id, kind: 'agent', sessionId, at: Date.now(),
+      line: `${task.label ?? task.definition.name} · started` }));
+  });
+  const finished = registry.onTaskDone((task) => {
+    if (emitted.has(task.id) || !ours(task)) return;
+    const event = capsuleDoneFromAgentTask(task, sessionId);
+    if (!event) return;
+    emitted.add(task.id);
+    write(encodeCapsuleFrame(event));
+    emitTurnLife('turn-life:capsule-done-emitted', { sessionId, capsuleId: event.capsuleId, kind: event.kind, status: event.status,
+      durationMs: event.endedAt - event.startedAt });
+  });
+  // B3 ask (#88867): a running background capsule's tool starts become its folded progress line — tool name and
+  // sequence only; raw args and results never enter the frame.
+  const toolCalls = registry.onToolCall((call) => {
+    if (call.phase !== 'start' || emitted.has(call.agentId)) return;
+    const task = registry.get(call.agentId);
+    if (!task || !ours(task)) return;
+    write(encodeCapsuleFrame({ type: 'capsule-progress', capsuleId: task.id, kind: 'agent', sessionId, at: call.ts,
+      line: `${task.label ?? task.definition.name} · #${call.callIdx} ${call.tool}` }));
+  });
+  return { dispose() { started.dispose(); finished.dispose(); toolCalls.dispose(); } };
 }
 
 /** REPL public entry — wires whichever input source the caller chose
@@ -312,6 +373,8 @@ export function buildReplTools(options: {
   readonly sessionId?: string;
   /** One trusted user request/turn, distinct from the lifetime of the sticky REPL session. */
   readonly getRequestId?: () => string | undefined;
+  /** CAPSULE-A2 — the TUI turn id, for turn-life correlation of shell capsules. */
+  readonly getTurnId?: () => string | undefined;
   readonly shellApprovalProcess?: ShellApprovalIpcProcess;
   readonly dispatchBash?: (args: Record<string, unknown>, options: { cwd: string; signal?: AbortSignal }) => Promise<unknown>;
   readonly getSignal?: () => AbortSignal | undefined;
@@ -328,7 +391,10 @@ export function buildReplTools(options: {
   dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 } {
   const specs: LLMToolSpec[] = [];
-  const dispatchByName = new Map<string, (args: Record<string, unknown>) => Promise<unknown>>();
+  /** Either signal aborts; undefined when neither exists (callers keep their «no signal» path). */
+  const combineSignals = (a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined =>
+    a && b ? AbortSignal.any([a, b]) : (a ?? b);
+  const dispatchByName = new Map<string, (args: Record<string, unknown>, callSignal?: AbortSignal) => Promise<unknown>>();
   const packQuery = buildInstalledPackQueryTool();
   specs.push(packQuery);
   dispatchByName.set(packQuery.name, args => dispatchInstalledPackQuery(args));
@@ -382,7 +448,11 @@ export function buildReplTools(options: {
   const ask = require('../skills/tools/msg-ask.js') as typeof import('../skills/tools/msg-ask.js');
   specs.push(ledger.buildMsgListTool(), ledger.buildMsgPostTool(), ask.buildMsgAskTool(), ledger.buildMsgAckTool());
   const bashMod = require('../skills/tools/index.js') as typeof import('../skills/tools/index.js');
-  const dispatchBash = options.dispatchBash ?? bashMod.dispatchBash;
+  // CAPSULE-A2 — the chat child's Bash runs under the capsule policy.
+  const dispatchBash = options.dispatchBash ?? ((args: Record<string, unknown>, opts: { cwd: string; signal?: AbortSignal }) => {
+    const turnId = options.getTurnId?.();
+    return bashMod.dispatchBashCapsule(args, opts, turnId ? { correlation: { turnId } } : {});
+  });
   specs.push(bashMod.buildBashTool());
   const shellApprover = createReplShellApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const graphApprover = createReplGraphApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
@@ -417,8 +487,10 @@ export function buildReplTools(options: {
   }
   const runBash = (args: Record<string, unknown>, signal?: AbortSignal) =>
     dispatchBash(args, { cwd: getSessionCwd(), ...(signal ? { signal } : {}) });
-  dispatchByName.set('Bash', async (args) => {
-    const signal = options.getSignal?.();
+  dispatchByName.set('Bash', async (args, callSignal) => {
+    // ELN-SEAT-TURN-HARD-CAP ④: the seat turn cap aborts through the call's own signal (dctx.signal); the person's Esc
+    // signal stays too — either one stops the shell child (11-18: the cap never reached a running Bash, +247 s).
+    const signal = combineSignals(options.getSignal?.(), callSignal);
     const command = typeof args.command === 'string' ? args.command : '';
     const approvalFinding = bashApprovalFinding(command, getUserConfig().shell.bashApproval);
     if (approvalFinding) {
@@ -520,16 +592,18 @@ export function buildReplTools(options: {
   // APP-BUILD-DECLINE-NO-BYPASS-DEPLOY: after a declined app_build, shell deploy/host exposure in the same request is refused.
   const declineGuard = (require('../plugins/core/app-build-decline-guard.js') as typeof import('../plugins/core/app-build-decline-guard.js'))
     .createAppBuildDeclineTurnGuard(() => options.getRequestId?.());
-  const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+  const dispatch = async (name: string, args: Record<string, unknown>, dctx?: { signal?: AbortSignal }): Promise<unknown> => {
+    const callSignal = combineSignals(options.getSignal?.(), dctx?.signal);
     try {
       const bypassRefusal = declineGuard.refuse(name, args);
       if (bypassRefusal) return bypassRefusal;
       if (isToolSearchCall(name)) return routeToolSearch(args, specs, { surface: 'tui-next', requireQueryCoverage: name === CAPABILITY_SEARCH_NAME });
       const direct = dispatchByName.get(name);
-      if (direct) return await direct(args);
+      if (direct) return await direct(args, dctx?.signal);
       if (isReplMessageTool(name)) return await dispatchReplMessageTool(name, args);
       return await sr.dispatchSessionRuntimeTool(name, args, {
-        signal: undefined,
+        // ELN-SEAT-TURN-HARD-CAP ④: Agent and the other session tools stop on the cap or Esc (was undefined).
+        signal: callSignal,
         userText: '',
         modelFamily: undefined,
         searchPlannerState: planner,
@@ -788,7 +862,9 @@ async function runOneTurn(
   if (nextTuiDelivery) {
     const { globalTaskNotificationQueue, renderTaskNotificationsXml } =
       require('../agent/task-notification.js') as typeof import('../agent/task-notification.js');
-    nextTuiDelivery.pending.push(...globalTaskNotificationQueue.drain());
+    // CAPSULE-K3-d — only this session's receipts (+ unscoped legacy), never a sibling session's.
+    const { drainNextTuiNotifications } = require('../turn-capsule/session-drain.js') as typeof import('../turn-capsule/session-drain.js');
+    nextTuiDelivery.pending.push(...drainNextTuiNotifications(globalTaskNotificationQueue, sessionId));
     nextTuiNotifications = renderTaskNotificationsXml(nextTuiDelivery.pending);
   }
   // Completion output is untrusted task data. Carry it as a user-role content
@@ -1147,6 +1223,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
   let requestSequence = 0;
   const baseTools = opts.enableTools ? buildReplTools({ sessionId: session.id, getSignal: () => activeTurnSignal,
     getRequestId: () => activeRequestId,
+    getTurnId: () => activeTurnId,
     onGraphProgress: (event) => {
       if (activeTurnId) process.stdout.write(`${JSON.stringify({ event: 'graph-progress', turnId: activeTurnId,
         graphProgress: event })}\n`);
@@ -1339,6 +1416,10 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         ? setShellWatchdogStatusSink((text) => { process.stdout.write(`${JSON.stringify({ event: 'status', turnId: turn.id, text })}\n`); })
         : null;
       if (streamTurn) process.once('SIGTERM', onTerminate);
+      const stopTurnCancel = streamTurn ? turnCancelRouter.listen(turn.id!, () => {
+        emitTurnLife('turn-life:turn-cancel-received', { sessionId: sessionIdRef.current, turnId: turn.id });
+        turnAbort.abort();
+      }) : undefined;
       try {
         const sessionCfg = turn.sessionProvider && process.env.ELANOUS_NEXT_TUI_STREAM === '1'
           ? await (async () => {
@@ -1414,6 +1495,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         console.log(JSON.stringify({ sessionId: sessionIdRef.current, error: error instanceof Error ? error.message : String(error) }));
         continue;
       } finally {
+        stopTurnCancel?.();
         activeTurnSignal = undefined;
         activeTurnId = undefined;
         activeRequestId = undefined;

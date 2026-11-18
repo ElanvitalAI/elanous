@@ -28,6 +28,17 @@ export interface SeatMailMessage extends StructuredMessageFields {
 export interface SeatMailMessageRead {
   seat: string;
   messages: SeatMailMessage[];
+  /**
+   * ELN-SEAT-MAIL-REPLAY (11-18 live: REL «Queue 3641», JUD «Queue 3225» with 8 and 2 unread): taken in the SAME
+   * snapshot as `messages`. `latestId` = newest ledger id (the watcher's next floor, so it never pages history);
+   * `cursor` = the recipient's ack cursor (`msg ack` — nothing at or below it is offered); `seenSkipped` = rows above the
+   * cursor dropped because this seat already has a `seen`-or-later receipt (survives a restart); `truncated` = the page
+   * hit {@link SEAT_MESSAGE_READ_LIMIT}. Absent on reads that predate these fields (tests' fakes).
+   */
+  latestId?: number;
+  cursor?: number;
+  seenSkipped?: number;
+  truncated?: boolean;
 }
 
 export interface SeatReceiptWrite {
@@ -75,9 +86,52 @@ export function readSeatMailMessages(
   const mod = require('../msg/msg-store.js') as typeof import('../msg/msg-store.js');
   const store: MsgStore = new mod.MsgStore(msgPath, { readOnly: true });
   try {
-    const messages = store.listByRecipient(seat, afterId, SEAT_MESSAGE_READ_LIMIT).map(seatMailMessageOf);
-    return { seat, messages };
+    // One read snapshot: a mail committed between the list and `latestId` would otherwise sit below the next floor unseen.
+    return store.db.transaction((): SeatMailMessageRead => {
+      // The ack cursor is a floor: `listByRecipient` alone only hides rows with a per-message ack, so every message
+      // acknowledged by `msg ack --id N` (cursor) came back from id 0 — the whole history, 1000 rows per poll.
+      const cursor = store.getCursor(seat);
+      const floor = Math.max(afterId, cursor);
+      // #38517 r2 MF1: exclusions apply BEFORE the read limit. Filtering a 1000-row page after the fact dropped every
+      // unseen mail behind a page of already-seen rows (the watcher then moved its floor past them). Page on until
+      // the limit is filled with offerable rows, the ledger runs out, or the scan bound is hit (then `truncated`).
+      const excluded = takenMessageIds(store, seat, floor);
+      const messages: SeatMailMessage[] = [];
+      let skipped = 0;
+      let after = floor;
+      let truncated = false;
+      for (let page = 0; ; page += 1) {
+        const rows = store.listByRecipient(seat, after, SEAT_MESSAGE_READ_LIMIT);
+        for (const row of rows) {
+          if (excluded.has(row.id)) { skipped += 1; continue; }
+          if (messages.length >= SEAT_MESSAGE_READ_LIMIT) { truncated = true; break; }
+          messages.push(seatMailMessageOf(row));
+        }
+        if (truncated || rows.length < SEAT_MESSAGE_READ_LIMIT) break;
+        after = rows.at(-1)!.id;
+        if (page + 1 >= SEAT_MESSAGE_SCAN_PAGES) { truncated = true; break; }
+      }
+      return { seat, messages, latestId: store.latestId(), cursor, seenSkipped: skipped, truncated };
+    }).deferred();
   } finally { store.close(); }
+}
+
+/** How many pages a single read may scan for offerable rows before it reports `truncated` (bounds a seat with a huge seen backlog). */
+export const SEAT_MESSAGE_SCAN_PAGES = 20;
+
+/**
+ * Messages above `afterId` this seat already took in — never offered again, across restarts:
+ * - `seen` or a later receipt (any source), and
+ * - #38517 r2 (boot plan + per-message double notice): anything the seat plan absorbed (`source = 'plan'`, any state).
+ *   The plan boots before the watcher (entry.ts), writes `delivered`/`plan` for the mail it consumed, and its active
+ *   item is already in the queue as the plan notice — a second per-message notice for the same mail is the double.
+ */
+function takenMessageIds(store: MsgStore, seat: string, afterId: number): Set<number> {
+  const table = store.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'msg_receipts'").get();
+  if (!table) return new Set();
+  const rows = store.db.query(`SELECT DISTINCT message_id FROM msg_receipts WHERE recipient = ? AND message_id > ?
+    AND (state IN ('seen', 'accepted', 'rejected', 'done', 'expired') OR source = 'plan')`).all(seat, afterId) as Array<{ message_id: number }>;
+  return new Set(rows.map(row => row.message_id));
 }
 
 /** Writer that opens the ledger per write (the TUI holds no long-lived write handle). */

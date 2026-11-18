@@ -11,7 +11,8 @@ export interface SidetabRouteHost {
   refreshRows(): void;
   killSelected(): Promise<boolean>;
   spawnSideAgent(agent: SidetabAgent): Promise<string | undefined>;
-  sendSelectedAgent(input: string): Promise<boolean>;
+  /** A boolean for PTY rows; an els row answers with the reason (queued · busy · refused) so it is shown, not swallowed. */
+  sendSelectedAgent(input: string): Promise<boolean | { readonly ok: boolean; readonly message: string; readonly outcome?: 'delivered' | 'queued' | 'refused' | 'unknown' }>;
   readSelectedAgent(): Promise<string | undefined>;
   /** herdr «keys»: named keys (enter esc tab backspace up down left right ctrl-c ctrl-d) to the selected agent PTY. */
   sendSelectedAgentKeys(names: readonly string[]): Promise<boolean>;
@@ -67,7 +68,14 @@ export async function runNextTuiBranchRoute(input: string, host: SidetabRouteHos
     host.setStatus(id ? `${agent} sidetab PTY started · ${id}` : `${agent} PTY start failed`);
   } else if (action === 'send') {
     const message = input.trim().replace(/^\/[\w-]+\s+send\s*/i, '');
-    host.setStatus(message && await host.sendSelectedAgent(message) ? 'Input sent to selected agent' : 'Agent PTY input failed · check selection/run state');
+    const sent = message ? await host.sendSelectedAgent(message) : false;
+    if (typeof sent === 'object') {
+      // «unknown» is neither a success nor a failure: it is never worded as sent or queued.
+      host.setStatus(sent.outcome === 'unknown' ? `Input status unknown · ${sent.message}`
+        : sent.outcome === 'queued' ? `Input queued in the pane · ${sent.message}`
+        : sent.ok ? `Input sent to selected agent · ${sent.message}` : `Input not sent · ${sent.message}`);
+    }
+    else host.setStatus(sent ? 'Input sent to selected agent' : 'Agent PTY input failed · check selection/run state');
   } else if (action === 'read') {
     const screen = await host.readSelectedAgent();
     if (screen === undefined) host.setStatus('No agent PTY to read');

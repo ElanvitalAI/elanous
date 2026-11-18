@@ -50,6 +50,7 @@ import { applyGlmCredentialFallback, GlmChildCredentialError } from './glm-crede
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
 import { getProvider, getProviderForConfig, inferProviderFromModel } from '../llm.js';
+import { resolveRoleProviderChain, type ProviderChainRole } from './role-provider-chain.js';
 import { noUsableReviewProviderError, planReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
 import { loadLlmPolicy, resolveSubscriptionReviewer } from '../policy/llm-policy.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
@@ -1183,11 +1184,42 @@ export async function buildDefaultSelfImplementSeams(
     primaryReviewAttempt,
     [...reviewFallbackModels, defaultReviewFallbackModel(primaryReviewAttempt.provider?.name)]
       .map((model) => reviewAttemptForModel(model, model)),
-    process.env.ELANOUS_SUBSTRATE === 'pod'
-      ? { skipUnavailableProviders: true, allowedProviderNames: ['openai-codex'] }
-      : {},
+    // TA-POD-REVIEW-PROVIDER-ALLOW — the Pod no longer narrows this plan with a literal `['openai-codex']`;
+    // Pod calls go through the config role chains below (`chainLLM`) and never reach this plan.
+    {},
   );
   const reviewAttempts = reviewPlan.attempts;
+  /** The reviewer that actually produced the latest review text, per role (TA-POD-REVIEW-PROVIDER-ALLOW record). */
+  const reviewerRan: Partial<Record<ProviderChainRole, { provider: string; model: string }>> = {};
+  const callAttempt = (prompt: string) => (attempt: (typeof reviewAttempts)[number], observeResolvedProvider: (provider?: string) => void) =>
+    streamLLM([{ role: 'user', content: prompt }], () => {}, {
+      model: attempt.model,
+      provider: attempt.provider,
+      // ⛔⭐ 하드코딩 금지 — 모델을 고른 «같은 티어»에서 effort 도 온다(`reviewReasoningEffort`).
+      //   🩸 2026-09-23 실측: 여기 `'medium'` 이 박혀 있어, 티어를 best(sol·high)로 올린 뒤에도
+      //   ***wire 에는 `effort:"medium"` 이 나갔다***(per-call override 가 티어를 이긴다).
+      ...(reviewEffort ? { reasoningEffort: reviewEffort } : {}),
+      onResolvedProvider: (provider) => observeResolvedProvider(provider),
+    });
+  const observeFallback = (role?: ProviderChainRole) => (event: string, data: object) => {
+    try { debug.log('self-dev.review-fallback', event, { ...(role ? { role } : {}), ...data }); } catch { /* fail-soft */ }
+  };
+  // Pod: each role resolves its chain from `llm.roleProviderChains` at call time (credentials and grok usage are live).
+  // An exhausted chain throws its role-and-candidates reason; there is no silent fallback to another role's chain.
+  const chainLLM = (role: ProviderChainRole) => async (prompt: string): Promise<string> => {
+    const chain = resolveRoleProviderChain(role, {
+      config: getUserConfig(),
+      isAvailable: ({ model, provider }) => reviewAttemptForModel(model, model, provider).provider?.available() ?? false,
+      ...(deps.reviewGrokQuota ? { grokQuota: deps.reviewGrokQuota } : {}),
+    });
+    if (chain.candidates.length === 0) throw new Error(chain.exhaustedReason);
+    const r = await runReviewWithFallback(
+      chain.candidates.map((candidate) => reviewAttemptForModel(candidate.model, `${role}:${candidate.model}`, candidate.provider)),
+      callAttempt(prompt), observeFallback(role), { maxCalls: 2 },
+    );
+    reviewerRan[role] = { provider: r.used.provider?.name ?? 'unknown', model: r.used.model };
+    return r.text;
+  };
   const defaultApiReview = async (prompt: string): Promise<string> => {
     if (reviewAttempts.length === 0) {
       const error = noUsableReviewProviderError(reviewPlan.skipped);
@@ -1196,16 +1228,8 @@ export async function buildDefaultSelfImplementSeams(
     }
     const r = await runReviewWithFallback(
       reviewAttempts,
-      (attempt, observeResolvedProvider) => streamLLM([{ role: 'user', content: prompt }], () => {}, {
-        model: attempt.model,
-        provider: attempt.provider,
-        // ⛔⭐ 하드코딩 금지 — 모델을 고른 «같은 티어»에서 effort 도 온다(`reviewReasoningEffort`).
-        //   🩸 2026-09-23 실측: 여기 `'medium'` 이 박혀 있어, 티어를 best(sol·high)로 올린 뒤에도
-        //   ***wire 에는 `effort:"medium"` 이 나갔다***(per-call override 가 티어를 이긴다).
-        ...(reviewEffort ? { reasoningEffort: reviewEffort } : {}),
-        onResolvedProvider: (provider) => observeResolvedProvider(provider),
-      }),
-      (event, data) => { try { debug.log('self-dev.review-fallback', event, { ...data }); } catch { /* fail-soft */ } },
+      callAttempt(prompt),
+      observeFallback(),
       {
         skipUnavailable: (attempt: (typeof reviewAttempts)[number]) => {
           if (attempt.label !== 'primary' && inferProviderFromModel(attempt.model) === 'grok') {
@@ -1231,15 +1255,18 @@ export async function buildDefaultSelfImplementSeams(
         maxCalls: 2,
       },
     );
+    reviewerRan.review = { provider: r.used.provider?.name ?? 'unknown', model: r.used.model };
     return r.text;
   };
+  const inPod = process.env.ELANOUS_SUBSTRATE === 'pod';
+  const apiReview = inPod ? chainLLM('review') : defaultApiReview;
   // ⛔⭐ 「이 리뷰어가 파일을 스스로 읽을 수 있나」는 ***만든 쪽만*** 안다.
   //   ⑴ 기본 구현은 streamLLM 한 번이다 — 도구 채널이 «없다» ⇒ 사실로 `false` 를 선언한다
   //   ⑵ 무인 고르기가 도구 리뷰어를 뽑으면 그 공장은 파일을 읽는다 ⇒ `true`
   //   ⑶ 호출자가 자기 llmReview 를 «주입»하면 그 안에서 무엇을 하는지 우리는 «모른다»
   //      ⇒ 그때는 «선언하지 않는다». 관측이 `'unknown'` 으로 남고, 그것이 `'no'` 와 «다른 값»이다
   const reviewerIsDefaultApiCall = deps.llmReview === undefined;
-  let llmReview = deps.llmReview ?? defaultApiReview;
+  let llmReview = deps.llmReview ?? (inPod ? chainLLM('judgement') : defaultApiReview);
   let reviewerCanSelfRead: boolean | undefined;
   if (reviewerIsDefaultApiCall) {
     const rate = parseUnmannedToolReviewerRate(deps.toolReviewerRate) ?? unmannedToolReviewerRateFromConfig();
@@ -1263,12 +1290,20 @@ export async function buildDefaultSelfImplementSeams(
     const reviewer = resolveSubscriptionReviewer(loadLlmPolicy(), getUserConfig().roleLlm);
     if (reviewer) {
       const { spec, cap } = reviewer;
-      subscriptionReviewLLM = (prompt) => runSubscriptionReviewer(spec, cap, prompt, defaultApiReview, async (text, spawn) => {
-        if (deps.makeSubscriptionReviewLLM) return deps.makeSubscriptionReviewLLM(spawn)(text);
-        const { makeAcpReviewLLM } = await import('../agent-substrate/acp-reviewer.js');
-        return makeAcpReviewLLM({ cwd: targetOptions?.repoRoot ?? childScope.elanousBinRoot, backend: 'claude', backendSpec: spawn.backendSpec, env: spawn.env })(text);
-      }, process.env, deps.subscriptionReviewerDeps);
+      subscriptionReviewLLM = (prompt) => {
+        delete reviewerRan.review;
+        return runSubscriptionReviewer(spec, cap, prompt, apiReview, async (text, spawn) => {
+          const acpText = deps.makeSubscriptionReviewLLM ? await deps.makeSubscriptionReviewLLM(spawn)(text)
+            : await (await import('../agent-substrate/acp-reviewer.js')).makeAcpReviewLLM({ cwd: targetOptions?.repoRoot ?? childScope.elanousBinRoot, backend: 'claude', backendSpec: spawn.backendSpec, env: spawn.env })(text);
+          if (acpText.trim()) reviewerRan.review = { provider: spec.provider, model: `${spec.provider}:${spec.executor ?? 'cct'}` };
+          return acpText;
+        }, process.env, deps.subscriptionReviewerDeps);
+      };
       reviewerCanSelfRead = undefined;
+    } else if (inPod) {
+      // 파드에서 리뷰가 apiReview(사슬 API 호출)로 실제 수행되면 도구 리뷰어 기록(true)은 거짓이 된다 — false 로 정정한다(JUD-B #90187 ②).
+      subscriptionReviewLLM = apiReview;
+      reviewerCanSelfRead = false;
     }
   }
   // REVIEW-ACP-POD ②-b — 발사 호스트가 Claude ACP 로 리뷰할 때만 실린다. 리뷰 심이 api 리뷰어를 부르지 않는다(판정은 호스트).
@@ -1293,6 +1328,8 @@ export async function buildDefaultSelfImplementSeams(
     ...(plan.self?.activityGraceSec !== undefined ? { implementActivityGraceSec: plan.self.activityGraceSec } : {}),
     llmReview,
     ...(subscriptionReviewLLM ? { subscriptionReviewLLM } : {}),
+    ...(inPod && reviewerIsDefaultApiCall ? { recoveryLLM: chainLLM('recovery') } : {}),
+    ...(reviewerIsDefaultApiCall ? { reviewerRan: () => reviewerRan.review } : {}),
     ...(reviewDeferredToHost ? { reviewDeferredToHost: true } : {}),
     ...(reviewerCanSelfRead !== undefined ? { reviewerCanSelfRead } : {}),
     ...(deps.reviewScopeDiff ? { reviewScopeDiff: deps.reviewScopeDiff } : {}),

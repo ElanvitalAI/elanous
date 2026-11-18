@@ -8,6 +8,7 @@ import { assertSignedPwaBranchWaiver } from '../../src/graph-runner/release-pwa-
 import type { GraphRunState } from '../../src/graph-runner/runner-types.js';
 import { debug } from '../../src/debug/log.js';
 import { runWithReleasePwaTraffic } from './gate-traffic-mode.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 export type NodeOutcome = 'ok' | 'fail' | 'error' | 'partial' | 'unknown' | 'recovery-required' | 'switch' | 'stay-normal' | 'legacy' | 'audit';
 export type NodeVerdict = 'pass' | 'flaky' | 'fail';
@@ -54,7 +55,7 @@ export function signedT6KnownIssueGatePassed(context: GraphContext): boolean {
     && (context.runId === '636f9e96-0aae-4cb0-babd-b509c44e2f34'
       || context.parentRunId === '636f9e96-0aae-4cb0-babd-b509c44e2f34')
     && context.input.version === '0.3.15'
-    && context.outputs['version-release']?.commit === cut
+    && releaseCutRecord(context)?.commit === cut
     && gate?.outcome === 'error' && gate.commit === cut
     && Array.isArray(gate.introduced) && gate.introduced.length === 0
     && gate.error === 'Error: remote gate refused: HQ shard result batch is incomplete (pod-68)'
@@ -72,14 +73,14 @@ export function gatePassedForRelease(context: GraphContext): boolean {
 /** Recheck the persisted fan-out waiver and its pinned OP/JUD receipts before publication. */
 export function signedT6PwaKnownIssue(context: GraphContext, root = effectiveInstanceRoot()): boolean {
   const runId = context.runId;
-  const cut = context.outputs['version-release']?.commit;
+  const cut = releaseCutRecord(context)?.commit;
   if (context.graphId !== 'release-loop' || typeof runId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(runId)
     || !isReleaseVersion(context.input.version) || typeof cut !== 'string' || !/^[a-f0-9]{40}$/.test(cut)
     || context.outputs.pwa?.outcome !== 'fail' || context.outputs.pwa?.commit !== cut) return false;
   try {
     const state = JSON.parse(readFileSync(join(root, 'graph-runs/release-loop', `${runId}.json`), 'utf8')) as GraphRunState;
     if (state.runId !== runId || (state.input as { version?: string } | undefined)?.version !== context.input.version
-      || JSON.parse(String(state.nodes.find(node => node.nodeId === 'version-release')?.output ?? '{}')).commit !== cut) return false;
+      || JSON.parse(String(state.nodes.find(node => node.nodeId === 'cut-branch' || node.nodeId === 'version-release')?.output ?? '{}')).commit !== cut) return false;
     assertSignedPwaBranchWaiver(state, root, true);
     return state.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa?.output === JSON.stringify(context.outputs.pwa);
   } catch { return false; }
@@ -108,7 +109,9 @@ export function readGraphContext(env: NodeJS.ProcessEnv = process.env): GraphCon
 }
 
 export function nodeOutput(context: GraphContext, node: string, key: string): string {
-  const value = context.outputs[node]?.[key];
+  // RELEASE-RESUME-AFTER-CUT-PUSHED: the cut node is `cut-branch`; legacy runs carry `version-release`.
+  const record = node === 'version-release' ? context.outputs['cut-branch'] ?? context.outputs[node] : context.outputs[node];
+  const value = record?.[key];
   if (typeof value !== 'string' || !value) throw new Error(`${node}.${key} required`);
   return value;
 }
@@ -177,7 +180,8 @@ export async function runNodeVerdict(argv: string[], env: NodeJS.ProcessEnv = pr
       version = context.input.version;
       const commit = nodeOutput(context, 'version-release', 'commit');
       const predecessor = node === 'pwa' ? 'gate' : node === 'tui' ? 'upgrade' : 'version-release';
-      if (predecessor === 'gate' ? !gatePassedForRelease(context) : context.outputs[predecessor]?.outcome !== 'ok')
+      if (predecessor === 'gate' ? !gatePassedForRelease(context)
+        : (context.outputs[predecessor] ?? (predecessor === 'version-release' ? context.outputs['cut-branch'] : undefined))?.outcome !== 'ok')
         throw new Error(`${predecessor} did not pass`);
       const args = node === 'cutoff' ? ['scripts/release-loop/cutoff.ts', '--version', version, '--cutoff', commit, '--baseline', `v${context.input.previousVersion}`, '--json']
         : node === 'pwa' ? pwaNodeArgs(commit, context.input)

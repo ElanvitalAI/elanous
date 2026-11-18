@@ -1,4 +1,4 @@
-import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
+import { llmNetworkFetch } from './llm-network-fetch.js';
 import { env, requireEnv } from './env.js';
 import { compactTranscript } from './util.js';
 import type { SummaryConfig } from './types.js';

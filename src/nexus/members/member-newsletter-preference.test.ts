@@ -181,7 +181,7 @@ test('OAuth state cookie preserves newsletter choice through callback and member
     const stateCookie = start!.headers.get('set-cookie')!.split(';', 1)[0]!;
     const callback = await api.handle(new Request(`${redirectUri}?code=${authorization.code}&state=${authorization.state}`, { headers: { cookie: stateCookie } }));
     expect(callback?.status).toBe(303);
-    expect(callback?.headers.get('location')).toBe('https://api.example.test/v1/members/home');
+    expect(callback?.headers.get('location')).toBe('https://app.example.test/signup/complete');
     const member = store.memberForGoogleSub('oauth-newsletter');
     expect(member).not.toBeNull();
     expect(store.newsletterPreference(member!.id)?.choice).toBe('declined');

@@ -104,8 +104,8 @@ test('release graph CLI dry-run previews automatic route without executing comma
     expect(run.exitCode).toBe(0);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; plannedPath?: string[]; executed: number; pending?: { nodeId: string; message: string } };
     expect(output.status).toBe('done');
-    expect(output.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
-    expect(output.plannedPath).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'pwa', 'mac-smoke', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(output.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(output.plannedPath).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'pwa', 'mac-smoke', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     expect(output.pending).toBeUndefined();
     expect(output.executed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -118,8 +118,8 @@ test('graph dry-run previews automatic path without executing commands', async (
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
     });
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
-    expect(state.plannedPath).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'pwa', 'mac-smoke', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(state.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(state.plannedPath).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'pwa', 'mac-smoke', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     expect(state.pending).toBeUndefined();
     expect(state.executed).toBe(0);
     expect(state.nodes.every((node) => !node.executed)).toBe(true);
@@ -239,7 +239,7 @@ test('RELEASE-GRAPH-RECEIPT-AUDIT: missing file receipts run a residual gate and
         return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fixture"}\n', stderr: '' };
       } },
     });
-    expect(state.path.slice(0, 14)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok',
+    expect(state.path.slice(0, 15)).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok',
       'gate-cutover-switch', 'receipt-audit', 'residual-run', 'receipt-audit-recheck']);
     expect(state.status).toBe('done');
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -274,7 +274,7 @@ test('RELEASE-GRAPH-FANOUT: checklist gate overlaps prefetch and its failure res
   });
   nodeTimes.clear();
   const failed = await run(true);
-  expect(failed.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'traffic-failed-restore', 'failed']);
+  expect(failed.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'traffic-failed-restore', 'failed']);
   expect(failed.fanOuts?.['cutoff:ok']?.branches['checklist-gate']).toMatchObject({ status: 'failed' });
   expect(failed.path).not.toContain('gate');
 }, 15_000);
@@ -320,7 +320,7 @@ test('mac-smoke fail and error are warning-only: the graph continues to pwa and 
         stdout: JSON.stringify(body.includes('mac-smoke-node.ts') ? { outcome, verdict: 'fail', summary: '측정 불가' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
       }) } });
       expect(state.status).toBe('done');
-      expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+      expect(state.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
@@ -335,7 +335,7 @@ test('GATE-NODES-PARALLEL: a crashed or failed prefetch node never stops the rel
         return prefetch ? { exitCode: outcome === 'fail' ? 1 : 2, stdout: '', stderr: 'worker spawn error' }
           : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '' };
       } } });
-      expect(state.path.slice(0, 12)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit']);
+      expect(state.path.slice(0, 13)).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit']);
       expect(state.status).toBe('done');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
@@ -810,7 +810,7 @@ test('4/7 TUI result reaches HITL in the same graph run and cannot publish befor
           else process.env.ELANOUS_GRAPH_CONTEXT = prior;
         }
       }
-      const fields = context.nodeId === 'version-release' ? { commit: 'a'.repeat(40) }
+      const fields = context.nodeId === 'version-release' || context.nodeId === 'cut-branch' ? { commit: 'a'.repeat(40) }
         : context.nodeId === 'gate' ? { introduced: [] }
         : context.nodeId === 'prepare' ? { out, commit: 'a'.repeat(40) }
         : context.nodeId === 'docs' ? { notes: join(root, 'notes.md'), branch: 'release-docs/0.2.5' }
@@ -859,10 +859,10 @@ test('real graph commands stop at approval before publish', async () => {
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body) => ({ exitCode: body.includes('auto-approve-node.ts') ? 1 : 0, stdout: body.includes('auto-approve-node.ts') ? '{"outcome":"fail","verdict":"fail","summary":"unmeasured"}\n' : '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' }) },
     });
     expect(state.status).toBe('awaiting-approval');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
+    expect(state.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
     expect(state.pending?.nodeId).toBe('approve-publish');
     // Source: the release graph now runs pod-reuse-prep before its regression suite node and hard gate.
-    expect(state.executed).toBe(21);
+    expect(state.executed).toBe(22);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -888,10 +888,10 @@ test('real checklist gate stops the graph before the costly gate when a red item
       } },
     });
     expect(state.status).toBe('failed');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'traffic-failed-restore', 'failed']);
+    expect(state.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'traffic-failed-restore', 'failed']);
     expect(JSON.parse(String(state.fanOuts?.['cutoff:ok']?.branches['checklist-gate']?.output))).toMatchObject({ outcome: 'fail', red: ['K13'] });
     // Source: the regression suite is one additional command before the existing checklist join.
-    expect(commands).toHaveLength(8);
+    expect(commands).toHaveLength(9);
     expect(commands.some((command) => command.includes('/gate-node.ts') && !command.includes('checklist-gate-node.ts'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -931,9 +931,9 @@ test('gate regression routes to failed before preparing or publishing', async ()
       } },
     });
     expect(state.status).toBe('failed');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed']);
+    expect(state.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed']);
     // Source: the regression suite command runs in the cutoff fan-out before this failing hard gate.
-    expect(commands).toHaveLength(14);
+    expect(commands).toHaveLength(15);
     expect(commands.some((command) => command.includes('gate-triage-node.ts'))).toBe(true);
     expect(commands.some((command) => command.includes('publish-node.ts'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -951,7 +951,7 @@ test('shadow triage error cannot turn a failed gate into a passing release', asy
           : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' } },
     });
     expect(state.status).toBe('awaiting-approval');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'gate-heal-decision']);
+    expect(state.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'gate-heal-decision']);
     expect(state.pending?.nodeId).toBe('gate-heal-decision');
     expect(state.path).not.toContain('publish');
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -1086,7 +1086,7 @@ test('actual docs output reaches the real notes checker and B11 blocks approval'
 
 describe('RELEASE-GRAPH-SELFHEAL: TDD 무대: 같은 production graph runner를 통과하는 mock', () => {
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
-  const fullPassPath = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed',
+  const fullPassPath = ['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed',
     'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish',
     'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done'];
 
@@ -1215,13 +1215,13 @@ test('approval resumes through publish, docs land, verify and dev bump with fake
     const first = await runGraph(graph, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: fake } });
     expect(first.status).toBe('awaiting-approval');
     // Source: the regression suite adds one command to the existing preapproval release path.
-    expect(commands).toHaveLength(23);
+    expect(commands).toHaveLength(24);
     decideGraphApproval(first.graphId, first.runId, 'approved', 'fake-approver', root);
     const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: fake } });
     expect(resumed.status).toBe('done');
     expect(resumed.path.slice(-12)).toEqual(['approve-publish', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     // Source: the same regression suite command remains in the resumed release history.
-    expect(commands).toHaveLength(34);
+    expect(commands).toHaveLength(35);
     expect(commands.some((command) => command.includes('publish-node.ts'))).toBe(true);
     expect(commands.some((command) => command.includes('npm-publish-node.ts'))).toBe(true);
     expect(commands.some((command) => command.includes('version-node.ts dev-bump'))).toBe(true);

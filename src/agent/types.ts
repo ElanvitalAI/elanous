@@ -155,6 +155,8 @@ export interface AgentTask {
    *  the runner drains events in the background; completion emits
    *  a task-notification (PFC-S1 P2). */
   background?: boolean;
+  /** Waiting for an admission slot; the worker has not started. */
+  queued?: boolean;
   /** How a background completion reaches an idle parent TUI. */
   completionDelivery?: 'follow-up' | 'supplement';
   /** MSS M1.2: branded URI form of this spawn's identity. The
@@ -183,6 +185,8 @@ export type AgentStage = 'queued' | 'thinking' | 'tool' | 'aborted' | 'done' | '
 /** Options accepted by registry.spawn(). Everything optional so tests
  *  can pass just `{ definition, prompt }` and rely on defaults. */
 export interface AgentSpawnOpts {
+  /** Reuse a pending queue ticket when admission starts its worker. */
+  queuedTaskId?: string;
   definition: AgentDefinition;
   /** User message / query the agent should answer. */
   prompt: string;

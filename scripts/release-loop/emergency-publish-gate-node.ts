@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { LIGHT_RC_ALWAYS_FILE, parseAlwaysIncludeList, runLightRc, type LightRcResult } from '../../src/release-loop/light-rc.js';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/i;
 
@@ -84,7 +85,7 @@ export async function runEmergencyPublishGateNode(env: NodeJS.ProcessEnv = proce
     const commits = emergency.hotfixCommits;
     const rawHotfixCommit = Array.isArray(commits) && commits.length === 1 && typeof commits[0] === 'string' ? commits[0] : '';
     const hotfixCommit = COMMIT_SHA.test(rawHotfixCommit) ? rawHotfixCommit.toLowerCase() : '';
-    const releaseCommit = context.outputs['version-release']?.commit;
+    const releaseCommit = releaseCutRecord(context)?.commit;
     const remote = emergency.remote;
     const previousVersion = context.input.previousVersion;
     if (switched?.action !== 'switch' || switched.promoted !== true || switched.normalRunId !== context.runId

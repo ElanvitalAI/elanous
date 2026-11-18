@@ -18,11 +18,12 @@ triggers:
 version: 1
 # The runner's real node-arrival hook reads OP commands addressed to RLA before each release node.
 max_parallel_nodes: 3
-entry_node: version-release
+entry_node: cut-branch
 dry_run_await_approval: true
 terminal_nodes: [done, failed]
 nodes:
-  - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
+  - { node_id: cut-branch, kind: git, recipe: 'cmd:cut-branch', max_visits: 1 }
+  - { node_id: gate-image-prebuild, kind: git, recipe: 'cmd:gate-image-prebuild', max_visits: 1 }
   - { node_id: readiness-countdown, kind: gate, recipe: 'cmd:readiness-countdown', max_visits: 1 }
   - { node_id: traffic-cut-start, kind: gate, recipe: 'cmd:traffic-cut-start', max_visits: 1 }
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
@@ -110,7 +111,8 @@ nodes:
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
 edges:
-  - { from: version-release, on: outcome, map: { ok: readiness-countdown, fail: failed, error: failed } }
+  - { from: cut-branch, on: outcome, map: { ok: gate-image-prebuild, fail: failed, error: failed } }
+  - { from: gate-image-prebuild, on: outcome, map: { ok: readiness-countdown, fail: failed, error: failed } }
   - { from: readiness-countdown, on: outcome, map: { ok: traffic-cut-start, fail: failed, error: failed } }
   # Advisory traffic writes report failure to OP; release steps still proceed on fail/error.
   - { from: traffic-cut-start, on: outcome, map: { ok: cutoff, fail: cutoff, error: cutoff } }

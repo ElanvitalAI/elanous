@@ -46,6 +46,9 @@ const COUNTER_TO_FIELD: ReadonlyArray<readonly [string, string]> = [
   ['thoughtCount', 'thoughts'],
   // ⭐ 「생각 채널로 왔지만 생각이 아닌 것」(FeedbackEnvelope) — 세면 반드시 내보낸다.
   ['feedbackEnvelopeChunks', 'feedbackEnvelopes'],
+  // H-1 — terminal envelopes dropped from the thought channel · thought chunks cut by the size cap.
+  ['termEnvelopeChunks', 'termEnvelopes'],
+  ['thoughtTruncatedChunks', 'thoughtTruncated'],
 ];
 
 /** ⛔⭐⭐⭐ 턴 경로를 ***손으로 적지 않는다 — 소스에서 「찾는다」.***

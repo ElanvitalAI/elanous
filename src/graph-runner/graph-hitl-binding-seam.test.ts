@@ -91,7 +91,8 @@ test.each([false, true])('legacy unpinned card is retired before a fresh approva
     const saved = JSON.parse(readFileSync(first.statePath, 'utf8'));
     delete saved.pending.inputSha256;
     writeFileSync(first.statePath, JSON.stringify(saved));
-    const ledger = new DecisionLedger({ stateDir: root });
+    // Pin version metadata: the default resolver walks the host repo's origin/main reflog (one git spawn per entry).
+    const ledger = new DecisionLedger({ stateDir: root, resolveVersion: () => ({ released: null, dev: null, codename: null }) });
     const oldCard = raiseApprovalCard(saved, saved.pending, { root, ledger })!;
     ledger.decide(oldCard.id, 'a', { kind: 'human' });
     const oldClaim = `${first.statePath}.1.decision.json`;

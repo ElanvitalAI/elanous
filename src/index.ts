@@ -171,6 +171,8 @@ const registerSeatRequestsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'se
 const registerSeatBootCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'seat'
   ? (() => undefined)
   : (require('./cli/seat-cli.js') as typeof import('./cli/seat-cli.js')).registerSeatBootCommands) as typeof import('./cli/seat-cli.js').registerSeatBootCommands;
+const registerPaneCommands = (INDEX_FAST_ROOT ? (() => undefined)
+  : (require('./cli/pane-cli.js') as typeof import('./cli/pane-cli.js')).registerPaneCommands) as typeof import('./cli/pane-cli.js').registerPaneCommands;
 const registerPtyTakeoverCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'pty'
   ? (() => undefined)
   : (require('./cli/pty-takeover-cli.js') as typeof import('./cli/pty-takeover-cli.js')).registerPtyTakeoverCommands) as typeof import('./cli/pty-takeover-cli.js').registerPtyTakeoverCommands;
@@ -1148,6 +1150,7 @@ async function runDevSayFromWords(
 }
 
 registerPtyTakeoverCommands(program);
+registerPaneCommands(program);
 registerPtyRecordCommand(program.commands.find((command) => command.name() === 'pty')!);
 registerElsCommands(program);
 program.command('tui')
@@ -1179,6 +1182,14 @@ prShell.command('lineage <pr>').description('PR 계보의 관측 사실만 JSON�
   .requiredOption('--json', 'JSON 관측 결과 출력')
   .option('--cwd <path>', '저장소 경로');
 prShell.command('census').description('열린 PR 전체·골 문서만·2일 무커밋 draft·미닫힌 superseded 집계').option('--cwd <path>', '저장소 경로');
+// #38404 PR-RESTACK-PLAN — 등록부(src/cli/pr-land-restack.ts)와 같은 순서·같은 스펙의 경량 선언.
+// 누락하면 deferPrSubtreeParse 의 위치 매핑이 어긋나 land 파싱이 queue 로 오매핑된다(pr-lazy-registration 2fail).
+prShell.command('restack-plan').description('착지 전 충돌 측정·분류(읽기 전용) — exit 0 충돌 없음 · 3 텍스트(양쪽 유지 가능) · 4 의미(작성자) · 5 스택 squash · 6 측정 불가')
+  .requiredOption('--head <rev>', '측정할 PR head(커밋 sha 또는 ref)')
+  .option('--main <rev>', '착지 대상 main 끝', 'origin/main')
+  .option('--stack-base <rev>', 'PR 이 쌓여 있던 아래 PR 의 옛 head — 주면 스택 squash 를 판정한다')
+  .option('--cwd <path>', '저장소 경로')
+  .option('--json', '구조화 출력');
 prShell.command('open-guard').description('착수·새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
   .option('--cwd <path>', '작업 트리 경로').option('--base <ref>', '비교 base ref', 'origin/main')
   .option('--seat <seat>', 'PR 소유 자리(OP|TC|MK|UX)').option('--cell <id>', '릴리스 칸 id (같은 칸 OPEN PR 검사)')
@@ -1513,6 +1524,7 @@ hqCmd.command('fence').description('이 호스트가 임대를 쥐었을 때만 
   });
 const seatCmd = program.command('seat').description('분배된 자리의 하루 루프와 보고');
 registerSeatBootCommands(seatCmd);
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'seat') (require('./cli/seat-control-cli.js') as typeof import('./cli/seat-control-cli.js')).registerSeatControlCommand(seatCmd);
 registerSeatRequestsCommands(seatCmd);
 if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'seat') (require('./cli/seat-say-cli.js') as typeof import('./cli/seat-say-cli.js')).registerSeatSayCommand(seatCmd);
 seatCmd.command('asks').description('최근 CTO 되묻기 왕복과 10분 판정')
@@ -5494,12 +5506,22 @@ const selfOrchestrateCmd = selfCmd
           debug.log('self-implement.pod', 'image-source', { kind: null, ref: null, headCommit: null, waitedMs: 0, outcome: 'config-unreadable', error: (e as Error).message });
           process.exit(2);
         }
+        // TA-IMAGE-PIN-OVERRIDES-COMMIT — 발사가 명시한 이미지 digest(--pod-image-digest)는 config 의 전역 harness.imageCommit 보다 우선한다.
+        const explicitImageDigest = (opts as { podImageDigest?: string }).podImageDigest;
+        if (explicitImageDigest !== undefined && !(await import('./task-orchestrator/surfaces/pod-image-digest-check.js')).isImageDigestPin(explicitImageDigest)) {
+          ui.error('--pod-image-digest: sha256:<64자 소문자 16진> 형식이어야 합니다'); process.exit(2);
+        }
         const pinWaitSec = process.env.ELANOUS_POD_IMAGE_PIN_WAIT_SEC?.trim() ? Number(process.env.ELANOUS_POD_IMAGE_PIN_WAIT_SEC) : Number.NaN;
         const preparedImage = await imageSourceMod.preparePodImage({
           cfg: podImageCfg,
           members: poolMembers,
           headPath: podHeadImagePath,
           ...imageSourceMod.podPoolImageLookup(),
+          ...(explicitImageDigest !== undefined ? { explicitDigest: explicitImageDigest } : {}),
+          onOverride: ({ digest, configCommit }) => {
+            debug.log('self-implement.pod', 'image-pin-override', { digest, configCommit, rule: 'explicit --image-digest overrides harness.imageCommit' });
+            if (!opts.json) ui.info(`[pod] 이미지 pin — 명시 digest ${digest.slice(0, 19)}… 가 config imageCommit${configCommit ? ` ${configCommit}` : ''} 보다 우선`);
+          },
           ...(Number.isFinite(pinWaitSec) && pinWaitSec >= 0 ? { maxWaitMs: pinWaitSec * 1000 } : {}),
           onWait: (pending, waitedMs) => { if (!opts.json) ui.info(`[pod] 기준 이미지 대기 — ${pending.map((m) => m.context).join(',')} 레지스트리에 아직 없다 (${Math.round(waitedMs / 1000)}초)`); },
         });
@@ -13272,7 +13294,7 @@ export async function exitTuiRun(
   deps: TuiSelfRestartDeps & {
     readonly exit?: (code: number) => never;
     /** 재기동 요청 — 기본 = `takeTuiSelfRestartRequest()`(한 번 읽고 지운다). */
-    readonly takeRestartRequest?: () => { readonly reason: string } | null;
+    readonly takeRestartRequest?: () => { readonly reason: string; readonly requestId?: string } | null;
   } = {},
 ): Promise<void> {
   const exit = deps.exit ?? ((code: number): never => process.exit(code));
@@ -13287,12 +13309,14 @@ export async function exitTuiRun(
     } catch { /* 관측 실패가 종료를 막지 않는다 */ }
     exit(0);
   }
-  const selfRestart = await runTuiSelfRestartOnStaleBuild(deps);
+  const migratePrefix = 'seat-stop:migrate:';
+  const migrateSessionId = request?.reason.startsWith(migratePrefix) ? request.reason.slice(migratePrefix.length) : undefined;
+  const selfRestart = await runTuiSelfRestartOnStaleBuild({ ...deps, ...(migrateSessionId !== undefined ? { migrateSessionId } : {}), ...(request?.requestId ? { migrateRequestId: request.requestId } : {}) });
   if (selfRestart.outcome === 'relaunch') {
     // 자식이 화면을 이어받았다 — 부모는 자식 종료 코드로 끝난다.
     exit(selfRestart.exitCode ?? 0);
   }
-  exit(0);
+  exit(migrateSessionId === undefined ? 0 : 1);
 }
 
 export interface TuiSelfRestartResult {
@@ -13306,6 +13330,12 @@ export interface TuiSelfRestartResult {
 export interface TuiSelfRestartDeps {
   /** 재기동 자식의 스크립트 경로 — 기본 = `process.argv[1]`(배포 엔트리). */
   readonly scriptPath?: string;
+  /** Explicit seat migration must resume this exact owned session, including when the build is current. */
+  readonly migrateSessionId?: string;
+  readonly migrateRequestId?: string;
+  readonly turnLifeLog?: (event: string, data: Record<string, unknown>) => void;
+  /** Installed root override for migration testing. */
+  readonly currentInstallRoot?: string;
   /** 사용자 인자 — 기본 = `process.argv.slice(2)`. 이전 `--resume`/`--continue` 는 걷어내고 우리 id 만 싣는다. */
   readonly args?: readonly string[];
   /** 낡음 판정 — 기본 = `judgeBuildStaleness(runningBuild ⊕ readCurrentInstallRecord ⊕ readCheckoutHead)`. */
@@ -13352,13 +13382,13 @@ export function planTuiRestartArgv(input: {
  */
 export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {}): Promise<TuiSelfRestartResult> {
   const report = deps.log ?? ((event: string, detail: Record<string, unknown>) => debug.log('tui.self-restart', event, detail));
-  const { judgeBuildStaleness, readCheckoutHead, readCurrentInstallRecord, runningBuild } = await import('./pty-shell/tui-run-state.js');
+  const { defaultInstallRoot, judgeBuildStaleness, readCheckoutHead, readCurrentInstallRecord, runningBuild } = await import('./pty-shell/tui-run-state.js');
   const staleness = (deps.stale ?? (() => {
     const build = runningBuild();
     const checkoutHead = build.source === 'checkout' && build.codeRoot ? readCheckoutHead(build.codeRoot) : undefined;
     return judgeBuildStaleness({ build, installed: readCurrentInstallRecord(), ...(checkoutHead ? { checkoutHead } : {}) });
   }))();
-  if (staleness.stale !== true) {
+  if (staleness.stale !== true && deps.migrateSessionId === undefined) {
     report('skip', { reason: staleness.reason });
     return { outcome: 'skip', reason: staleness.reason };
   }
@@ -13391,8 +13421,17 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
     console.error(`elanous: 설치본이 바뀌었지만 이 TUI 의 활성 대화를 확인하지 못해 다시 뜨지 않았다(${decision.reason}) — 다시 열면 지금 화면의 대화로 이어진다.`);
     return { outcome: 'blocked', reason: decision.reason };
   }
+  if (deps.migrateSessionId !== undefined && decision.sessionId !== deps.migrateSessionId) {
+    report('blocked', { reason: 'migration-session-mismatch' });
+    return { outcome: 'blocked', reason: 'migration-session-mismatch' };
+  }
+  const currentScript = _joinPath(deps.currentInstallRoot ?? defaultInstallRoot(), 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs');
+  if (deps.migrateSessionId !== undefined && deps.scriptPath === undefined && !existsSync(currentScript)) {
+    report('blocked', { reason: 'migration-current-missing' });
+    return { outcome: 'blocked', reason: 'migration-current-missing' };
+  }
   const argv = planTuiRestartArgv({
-    scriptPath: deps.scriptPath ?? process.argv[1] ?? '',
+    scriptPath: deps.scriptPath ?? (deps.migrateSessionId !== undefined ? currentScript : process.argv[1] ?? ''),
     args: deps.args ?? process.argv.slice(2),
     sessionId: decision.sessionId,
   });
@@ -13407,7 +13446,13 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
     argv,
     globalLatestSessionId,
   });
-  console.error(`elanous: 설치본이 바뀌어 이 TUI 의 대화(${decision.sessionId})로 다시 뜬다${globalLatestSessionId && globalLatestSessionId !== decision.sessionId ? ` — 전역 최신 ${globalLatestSessionId} 은 싣지 않는다` : ''}.`);
+  console.error(`elanous: ${deps.migrateSessionId !== undefined ? '자리 이전으로' : '설치본이 바뀌어'} 이 TUI 의 대화(${decision.sessionId})로 다시 뜬다${globalLatestSessionId && globalLatestSessionId !== decision.sessionId ? ` — 전역 최신 ${globalLatestSessionId} 은 싣지 않는다` : ''}.`);
+  if (deps.migrateRequestId && deps.migrateSessionId !== undefined) {
+    try {
+      const turnLife = deps.turnLifeLog ?? (await import('./debug/turn-life.js')).emitTurnLife;
+      turnLife('turn-life:seat-control-relaunch', { eventId: deps.migrateRequestId, sessionId: decision.sessionId, outcome: 'starting' });
+    } catch { /* observation must not alter the restart */ }
+  }
   const exitCode = await (deps.spawnChild ?? defaultTuiSelfRestartSpawn)(process.execPath, argv, env);
   return { outcome: 'relaunch', reason: staleness.reason, sessionId: decision.sessionId, argv, exitCode };
 }

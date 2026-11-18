@@ -68,7 +68,7 @@ test('waive the failed tui node on the saved release path; record the original f
     };
     seen.push(ctx);
     if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+    if (ctx.nodeId === 'version-release' || ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     if (ctx.nodeId === 'tui') return { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}\n', stderr: '' };
     if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
     if (ctx.nodeId === 'known-issues') {
@@ -160,7 +160,7 @@ test('a waived tui whose recorded failure has exit null (killed or timed out) st
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; outputs?: { gate?: { outcome?: string } } };
     if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+    if (ctx.nodeId === 'version-release' || ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     if (ctx.nodeId === 'tui') return { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}\n', stderr: '' };
     if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
     if (ctx.nodeId === 'known-issues') {
@@ -224,7 +224,7 @@ test('accepted regressions without a waiver are persisted and delivered to the g
     };
     seen.push(ctx);
     if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
+    if (ctx.nodeId === 'version-release' || ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui' && ++tuiVisits === 1) return { exitCode: 1, stdout: '{"outcome":"fail"}', stderr: '' };
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}', stderr: '' };
   };
@@ -260,7 +260,7 @@ test('a waived tui keeps its recorded issue while failed publish waits at approv
     };
     seen.push(ctx);
     if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
+    if (ctx.nodeId === 'version-release' || ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui') return ++tuiVisits === 1
       ? { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}', stderr: '' }
       : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}', stderr: '' };
@@ -317,7 +317,7 @@ test('restarting before a waived tui (from mac-smoke) keeps its issue while publ
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }> };
     seen.push(ctx);
     if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
+    if (ctx.nodeId === 'version-release' || ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui') return ++tuiVisits === 1
       ? { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}', stderr: '' }
       : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}', stderr: '' };
@@ -370,7 +370,7 @@ test.each(['partial', 'unknown'] as const)('real publish entrypoint routes %s pu
       nodeId: string; runId: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown>>;
     };
     if (context.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-    if (context.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version, commit, branch: `release/${version}` }), stderr: '' };
+    if (context.nodeId === 'version-release' || context.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version, commit, branch: `release/${version}` }), stderr: '' };
     if (context.nodeId === 'prepare') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit, out: root }), stderr: '' };
     if (context.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${version}` }), stderr: '' };
     if (context.nodeId === 'tui') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', regress: { pass: 7, fail: 0,
@@ -506,7 +506,7 @@ test('release resume --gate-pod-pool updates the saved run input before re-runni
         stdout: JSON.stringify({ outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: 'fixture receipt audit' }) + '\n', stderr: '' };
     }
     if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+    if (ctx.nodeId === 'version-release' || ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
   };
   const git = (args: string[]) => args[0] === 'ls-remote' ? `${SHA}\trefs/heads/release/${VERSION}` : args[0] === 'rev-parse' ? SHA : '';
@@ -622,7 +622,7 @@ test('release resume graph consumes the exact gate-waiver event and routes its n
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; outputs?: { gate?: { outcome?: string } } };
     if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"audit"}\n', stderr: '' };
-    if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutTip, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+    if (ctx.nodeId === 'version-release' || ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutTip, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     // The gate output may not carry a commit; the event remains bound to the saved release cut.
     if (ctx.nodeId === 'gate') return { exitCode: 1, stdout: JSON.stringify({ outcome: 'error', commit: cutTip, introduced: [], introducedIds: [], error: 'pod sweep incomplete: worker interrupted' }) + '\n', stderr: '' };
     if (ctx.nodeId === 'receipt-audit') receiptAuditRuns++;

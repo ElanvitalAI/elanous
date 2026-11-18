@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
+import type { SearchModalHandle } from '../src/chat/search/modal.js';
 import { openDashboardFolderAttachModal } from '../src/dashboard/folder-attach-modal-runtime.js';
 
 describe('openDashboardFolderAttachModal', () => {
   test('accept path attaches token and settles once', async () => {
     const tokens: string[] = [];
-    let accepted: ((item: { absPath: string }) => void) | null = null;
+    let accepted!: (item: { absPath: string }) => void;
     let disposed = 0;
     let draws = 0;
 
@@ -13,7 +14,7 @@ describe('openDashboardFolderAttachModal', () => {
       termSize: () => ({ cols: 120, rows: 40 }),
       createFolderPickerModal: async (opts) => {
         accepted = opts.onAccept;
-        return { surface: { id: 'picker-1' } as any };
+        return { surface: { id: 'picker-1' } } as unknown as SearchModalHandle;
       },
       attachFilePathToken: async (absPath) => `[picked:${absPath}] `,
       pushModal: () => ({ dispose: () => { disposed += 1; } }),
@@ -33,14 +34,14 @@ describe('openDashboardFolderAttachModal', () => {
 
   test('cancel settles empty token and create failure also settles empty token', async () => {
     const first: string[] = [];
-    let cancel: (() => void) | null = null;
+    let cancel!: () => void;
     let disposed = 0;
 
     openDashboardFolderAttachModal('/tmp/folder', (token) => { first.push(token); }, {
       termSize: () => ({ cols: 80, rows: 24 }),
       createFolderPickerModal: async (opts) => {
         cancel = opts.onCancel;
-        return { surface: { id: 'picker-2' } as any };
+        return { surface: { id: 'picker-2' } } as unknown as SearchModalHandle;
       },
       attachFilePathToken: async () => '[unused] ',
       pushModal: () => ({ dispose: () => { disposed += 1; } }),

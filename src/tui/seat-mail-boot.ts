@@ -19,6 +19,7 @@ import { outcomeOfPlanWire, type PlanWire } from '../code-edit/plan-wire.js';
 import type { ReceiptInput, ReceiptRecordOutcome } from '../msg/msg-receipts.js';
 import { headerFieldsOf, seatMessageContextBlock, type StructuredMessageFields } from '../msg/msg-context-header.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
+import { createSeatMailAdapter, type SeatMailAdapter } from './turn-events/mail-adapter.js';
 import type { NextTuiSelfHealthSnapshot } from './chat/self-health-status.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../chat/internal-turn-contract.js';
 // size-contract: src/tui 는 dashboard 모듈을 import 하지 않는다(chat 계약 import 는 허용 —
@@ -283,6 +284,12 @@ export type SeatMailPlanWireOptions = Readonly<{
    * the seat had actually worked (live 11-18, eln-main 9e078bba). Writes are fail-soft: a failure is a log line, never a plan change.
    */
   recordReceipts?: (inputs: readonly ReceiptInput[]) => void;
+  /**
+   * The seat's one mail owner (CAPSULE-C3 · always on since CAPSULE-FLAGS-REMOVE-DEFAULT R4). The TUI passes ONE
+   * adapter to the plan and to the notice watcher (entry.ts); absent = a private one. absorb plans only mail granted to the plan — mail the
+   * watcher already carries is not planned a second time (D9) — and an answered item settles its mail.
+   */
+  mailAdapter?: Pick<SeatMailAdapter, 'claim' | 'settle' | 'release'>;
 }>;
 
 /** One item as the plan ledger sees it — ids and states only, never the mail text. */
@@ -370,6 +377,7 @@ function promoteNextActive(tasks: SeatPlanItem[]): SeatPlanItem[] {
 
 export function wireSeatMailToPlan(queue: SeatPlanQueuePort, options: SeatMailPlanWireOptions): SeatPlanRuntime {
   const { seat, ledger, store } = options;
+  const mailAdapter = options.mailAdapter ?? createSeatMailAdapter();
   const saved = store?.load() ?? null;
   const enqueuedIds = new Set<string>();
   let items: SeatPlanItem[] = saved?.items ?? [];
@@ -417,12 +425,13 @@ export function wireSeatMailToPlan(queue: SeatPlanQueuePort, options: SeatMailPl
   };
 
   const absorb = (): SeatPlanStatus => {
-    const messages = ledger.list(seat, absorbedUpTo);
-    if (messages.length === 0) return status();
+    const listed = ledger.list(seat, absorbedUpTo);
+    if (listed.length === 0) return status();
     const before = snapshot();
-    absorbedUpTo = messages.reduce((max, message) => Math.max(max, message.id), absorbedUpTo);
-    // The mail reached this seat's plan — delivered, whether or not it decomposed into items (0 items stays delivered, not seen).
-    receipts(messages.map(message => ({ messageId: message.id, recipient: seat, state: 'delivered' as const, source: 'plan' as const })));
+    absorbedUpTo = listed.reduce((max, message) => Math.max(max, message.id), absorbedUpTo);
+    const granted = new Set(mailAdapter.claim('plan', listed.map(message => message.id)).granted);
+    const messages = listed.filter(message => granted.has(message.id));
+    if (messages.length === 0) { persist(); return status(); }
     // ELN-SEAT-WORK-QUEUE «낡은 정기 보고 생략»: a message that names an older one in `supersedes` replaces it —
     // the older is not decomposed in this batch, and its still-open items close as superseded. Structural field only.
     const replaced = new Map<number, number>();
@@ -468,6 +477,19 @@ export function wireSeatMailToPlan(queue: SeatPlanQueuePort, options: SeatMailPl
       });
     }
     items = promoteNextActive(orderPlanTasks(merged));
+    // TURN-FIELD-BUG-3: the plan carries only mail that became an item (any status · folded = superseded item) or was
+    // replaced in this batch. A `source: plan` receipt hides mail from the per-message watcher (seat-message-receipts.ts
+    // takenMessageIds), so mail that decomposed into NOTHING must not get one — and its claim goes back — or it never
+    // opens a turn (live 11-18 capsule test universe s1: a second idle mail absorbed at a turn end, 0 items, lost).
+    const carried = new Set<number>([...replaced.keys()]);
+    for (const task of items) if (Number.isSafeInteger(mailIdOf(task))) carried.add(mailIdOf(task));
+    // JUD #38701 ⓑ: a request folded into an existing host (reconcilePlan → revision.superseded) is carried by that host
+    // too — it is not in `items`, but without the plan's receipt and claim the watcher would open a second turn for it.
+    for (const task of revision.superseded) if (Number.isSafeInteger(mailIdOf(task))) carried.add(mailIdOf(task));
+    const notCarried = messages.filter(message => !carried.has(message.id)).map(message => message.id);
+    receipts(messages.filter(message => carried.has(message.id))
+      .map(message => ({ messageId: message.id, recipient: seat, state: 'delivered' as const, source: 'plan' as const })));
+    if (notCarried.length > 0) mailAdapter.release('plan', notCarried);
     syncQueueWithPlan();
     persist();
     revised(before, 'mail-absorbed', { reportLine: revision.reportLine, msgIds: messages.map(message => message.id),
@@ -499,6 +521,7 @@ export function wireSeatMailToPlan(queue: SeatPlanQueuePort, options: SeatMailPl
     const mailId = task === undefined ? NaN : Number(task.sourceRequestId.replace(/^mail#/, ''));
     if (!Number.isSafeInteger(mailId) || mailId <= 0) return;
     receipts([{ messageId: mailId, recipient: seat, state: 'seen', source: 'plan', queueItemId: noticeItemId }]);
+    mailAdapter.settle('plan', [mailId], 'responded');
   };
 
   // A restart starts with an empty prompt queue: the saved active item is queued again, nothing else.
@@ -594,6 +617,8 @@ export function createSeatMailPlanRuntime(
     queue: SeatPlanQueuePort;
     /** Plan file directory (default: the state root's `seat-plans`). */
     planDir?: string;
+    /** The seat's one mail owner — the same instance the notice watcher gets (entry.ts). */
+    mailAdapter?: SeatMailPlanWireOptions['mailAdapter'];
   }>,
 ): { header: ReturnType<typeof createSeatMailHeaderHook>; runtime: SeatPlanRuntime | null } {
   const snapshot = readSeatMailSnapshot(options.cwd, options.deps ?? {});
@@ -628,7 +653,8 @@ export function createSeatMailPlanRuntime(
         }
       } finally { store.close(); }
     };
-    runtime = wireSeatMailToPlan(options.queue, { seat: snapshot.seat, ledger, store: createSeatPlanFileStore(planFile), recordReceipts });
+    runtime = wireSeatMailToPlan(options.queue, { seat: snapshot.seat, ledger, store: createSeatPlanFileStore(planFile), recordReceipts,
+      ...(options.mailAdapter ? { mailAdapter: options.mailAdapter } : {}) });
     runtime.absorb();
   } catch {
     runtime = null; // boot continues without a plan (ledger missing or damaged)

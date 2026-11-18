@@ -38,7 +38,8 @@ test('release graph uses the same-run emergency gate to publish after normal gat
     const context = JSON.parse(text) as GraphContext;
     const result = (value: Record<string, unknown>, exitCode = 0) => ({ exitCode, stdout: `${JSON.stringify(value)}\n`, stderr: '' });
 
-    if (context.nodeId === 'version-release') return result({ outcome: 'ok', commit: releaseCommit });
+    // RELEASE-RESUME-AFTER-CUT-PUSHED: the release graph cut is split into cut-branch ⊕ gate-image-prebuild.
+    if (context.nodeId === 'cut-branch' || context.nodeId === 'gate-image-prebuild') return result({ outcome: 'ok', commit: releaseCommit });
     if (context.nodeId === 'gate') {
       normalGateRuns++;
       return result({ outcome: 'regression', verdict: 'fail', commit: releaseCommit,
@@ -80,7 +81,7 @@ test('release graph uses the same-run emergency gate to publish after normal gat
               return { rc: 1, stdout: '' };
             },
             dispatch: async (_dispatchOptions, dispatchDeps) => {
-              dispatchDeps?.write.out(Buffer.from(`${JSON.stringify(gateResult)}\n`));
+              dispatchDeps?.write?.out(Buffer.from(`${JSON.stringify(gateResult)}\n`));
               return 0;
             },
           }),

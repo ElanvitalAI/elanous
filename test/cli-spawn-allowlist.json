@@ -26,7 +26,7 @@
   "src/agent-mission/mission-out.test.ts": 2,
   "src/agent-mission/plan-cli.test.ts": 1,
   "src/agent-mission/supervisor-metrics.test.ts": 1,
-  "src/agent-substrate/self-review-cli.test.ts": 21,
+  "src/agent-substrate/self-review-cli.test.ts": 2,
   "src/boot/acp-server-stdio-cwd.test.ts": 1,
   "src/cli/a2a-cli.test.ts": 1,
   "src/cli/agent-cli.test.ts": 9,

@@ -47,6 +47,7 @@ export type ElsRequest =
   | { readonly op: 'attach'; readonly pane: string; readonly cols?: number; readonly rows?: number }
   | { readonly op: 'input'; readonly bytes: string }
   | { readonly op: 'resize'; readonly cols: number; readonly rows: number }
+  | { readonly op: 'reorder'; readonly kind: string; readonly id: string; readonly before?: string }
   | { readonly op: 'close'; readonly pane: string }
   | { readonly op: 'close-workspace'; readonly ws: string }
   | { readonly op: 'do'; readonly pane: string; readonly text: string; readonly from: string; readonly at?: { readonly ws: string; readonly tab: string } }
@@ -104,6 +105,7 @@ async function dispatch(core: ElsCore, request: ElsRequest): Promise<ElsResult> 
       return paneId ? core.read(paneId) : { exitCode: 1, message: `els read: unknown pane ${request.at.ws}/${request.at.tab}/${request.pane}` };
     }
     case 'send': return core.send(request.pane, request.text);
+    case 'reorder': return core.reorder({ kind: request.kind, id: request.id, ...(request.before === undefined ? {} : { before: request.before }) });
     case 'close': return core.close(request.pane);
     case 'close-workspace': return core.closeWorkspace(request.ws);
     case 'do': {

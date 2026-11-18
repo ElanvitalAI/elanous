@@ -4,6 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { applyDecidedApprovals, raiseApprovalCard, type GraphApprovalCardDeps } from './graph-approval-card.js';
+import { shellQuote } from './approval-outcome.js';
 import type { GraphRunState } from './runner-types.js';
 
 export interface GraphNotificationEvent {
@@ -76,8 +77,12 @@ function matches(value: string, kind: 'approval' | 'node', status?: 'ok' | 'fail
     (kind === 'node' && (value === status || value === (status === 'ok' ? 'success' : 'failure')));
 }
 
-export function formatApprovalMessage(event: Pick<GraphNotificationEvent, 'graphId' | 'runId' | 'nodeId' | 'message'>): string {
-  return `Graph ${event.graphId} / run ${event.runId} — approval required at ${event.nodeId}\n${event.message}\nApprove: elanous graph approve ${event.graphId} ${event.runId}\nReject: elanous graph approve ${event.graphId} ${event.runId} --reject`;
+export function formatApprovalMessage(event: Pick<GraphNotificationEvent, 'graphId' | 'runId' | 'nodeId' | 'message'>,
+  choices?: readonly { key: string; exit: string }[]): string {
+  const head = `Graph ${event.graphId} / run ${event.runId} — approval required at ${event.nodeId}\n${event.message}`;
+  // N-way HITL (3+ declared options): one command per option; yes/no text stays unchanged.
+  if (choices?.length) return `${head}\n${choices.map(option => `${option.key} → ${option.exit}: elanous graph approve ${event.graphId} ${event.runId} --choice ${shellQuote(option.key)}`).join('\n')}`;
+  return `${head}\nApprove: elanous graph approve ${event.graphId} ${event.runId}\nReject: elanous graph approve ${event.graphId} ${event.runId} --reject`;
 }
 
 /** Observe persisted runs only. Notification progress lives exclusively in the JSONL ledger. */
@@ -125,7 +130,7 @@ export function collectGraphEvents(options: Pick<GraphNotifyOptions, 'root' | 'g
         const visit = state.path.filter((nodeId) => nodeId === pending.nodeId).length;
         const event = { id: JSON.stringify([state.graphId, state.runId, 'approval', pending.nodeId, visit]),
           graphId: state.graphId, runId: state.runId, kind: 'approval' as const, nodeId: pending.nodeId, visit, message: pending.message };
-        events.push({ ...event, message: formatApprovalMessage(event) });
+        events.push({ ...event, message: formatApprovalMessage(event, pending.choices) });
       }
     }
   }

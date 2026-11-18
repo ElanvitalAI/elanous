@@ -138,10 +138,12 @@ test('active group follows retained direct and nested routes, including more', (
 test('retained more sheet groups files and settings without retired operations routes', () => {
   mount();
   const more = open('더보기');
-  expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);
+  expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);  // Source: section aria-labels = sidebar groups (자료 files · 설정 settings) — sidebar-nav-items.ts (#37485). // 출처: sidebar-nav-items.ts files 그룹 — /vault + /voice-notes(베타 · feature-maturity.ts:19) 2항목
   const settings = more.findByProps({ 'aria-label': '설정' });
   expect(settings.findAllByType('a').map((node) => node.props.href)).toEqual(['/settings', '/credentials']);
-  expect(more.findAllByType('h2').map((node) => node.children.join(''))).toEqual(['설정']);
+  const files = more.findByProps({ 'aria-label': '자료' });
+  expect(files.findAllByType('a').map((node) => node.props.href)).toEqual(['/vault', '/voice-notes']);  // Source: files group = /vault + /voice-notes — sidebar-nav-items.ts:121 (#37485).
+  expect(more.findAllByType('h2').map((node) => node.children.join(''))).toEqual(['자료', '설정']);  // Source: group headings render when files group has 2 visible items — MobileBottomTabs.tsx:115 (#37485).
   expect(more.findAllByType('a').map((node) => node.props.href)).not.toContain('/ops/release');
   act(() => tree!.unmount());
   operator = true;
@@ -180,12 +182,12 @@ test('single visible item navigates directly without a sheet, and role/Labs hide
   expect(open('더보기').findAllByType('a').map((node) => node.props.href)).not.toContain('/control');
 });
 
-test('sidebar renders a single visible item without the duplicate group heading', () => {
+test('sidebar renders the files group heading and collapse toggle for two visible items', () => {
   mount(createElement(SidebarNav));
   const files = tree!.root.findByProps({ 'aria-label': '자료' });
-  expect(files.findAllByType('button')).toHaveLength(0);
-  expect(files.findAllByType('a').map((node) => node.props.href)).toEqual(['/vault']);
+  expect(files.findAllByType('button')).toHaveLength(1);  // Source: collapse toggle appears when group has >1 visible item — SidebarNav.tsx:151 (#37485).
+  expect(files.findAllByType('a').map((node) => node.props.href)).toEqual(['/vault', '/voice-notes']);  // Source: files group = /vault + /voice-notes — sidebar-nav-items.ts:121 (#37485).
   expect(files.findAllByType('a')[0]!.children.filter((child) => child === 'Obsidian 노트')).toHaveLength(1);
   expect(files.findAllByType('a')[0]!.findAllByType('svg')).toHaveLength(1);
-  expect(files.findAll((node) => node.children.includes('자료'))).toHaveLength(0);
+  expect(files.findAll((node) => node.children.includes('자료')).length).toBeGreaterThan(0); // 출처: #37485 — sidebar-nav-items.ts files 그룹(/vault + /voice-notes) 라벨 '자료'
 });

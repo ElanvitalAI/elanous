@@ -46,6 +46,28 @@ describe('postSeatCapResumeNotice — 우편 원장 실착', () => {
     await expect(notice({ seat: 'UX', finalText: '', iterations: 1 })).resolves.toBeUndefined();
     expect(observed).toEqual([{ event: 'seat-cap-resume-notice-failed' }]);
   });
+
+  // ELN-SEAT-TURN-CAP-CONTINUE ① — 재개 우편은 진행 요약(finalText)을 체크포인트로 실어 다음 턴에 넘긴다.
+  // 규칙 11: 기대값은 독립 리터럴. 행 = 요약 유무(빈 · 있음).
+  it('체크포인트 유무 표: 빈 요약은 표식 없이, 요약이 있으면 [CHECKPOINT] 표식과 함께 실린다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seat-cap-resume-checkpoint-'));
+    try {
+      const db = join(dir, 'messages.db');
+      const notice = postSeatCapResumeNotice({ openStore: () => openMsgStore(db) });
+      await notice({ seat: 'UX', finalText: '   ', iterations: 2 });
+      await notice({ seat: 'UX', finalText: '남은 일: readSeatRuntime 배선과 판정표 시험', iterations: 3 });
+      const store = openMsgStoreReadOnlyForList(db);
+      try {
+        const list = store.list('UX', 0, 10);
+        expect(list.length).toBe(2);
+        const empty = list.find(m => m.body?.includes('반복 2회'));
+        const full = list.find(m => m.body?.includes('반복 3회'));
+        expect(empty?.body?.includes('[CHECKPOINT]')).toBe(false);
+        expect(full?.body?.includes('[CHECKPOINT]')).toBe(true);
+        expect(full?.body?.includes('남은 일: readSeatRuntime 배선과 판정표 시험')).toBe(true);
+      } finally { store.close(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 function openMsgStoreReadOnlyForList(path: string) {

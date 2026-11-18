@@ -1,5 +1,5 @@
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
-import { describe, expect, spyOn, test } from 'bun:test';
+import { describe, expect, spyOn, test, afterAll } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,11 +10,20 @@ import { buildDefaultSelfImplementSeams, planDevPipeline } from './dev-pipeline.
 import { clearLaunchRoleLlmOverrides, getUserConfig, parseSubscriptionReviewerSpec, setUserConfigOverlay } from '../user-config.js';
 import { parseReviewResult, renderReview } from '../agent-substrate/pr-reviewer.js';
 import { defaultLlmPolicy, validateLlmPolicy } from '../policy/llm-policy.js';
+import { grokQuotaFromUsageSnapshot } from '../oauth/fallback-chain.js';
+import { resolveRoleProviderChain, type ChainCandidate } from './role-provider-chain.js';
 import {
   classifyReviewProviderFailure, buildReviewProviderAttempts, planReviewProviderAttempts, noUsableReviewProviderError, defaultReviewFallbackModel, runReviewWithFallback,
   type ReviewFallbackObservation, subscriptionReviewerSpawn, runSubscriptionReviewer,
   subscriptionReviewerAvailability, parseTeamclaudeStatusJson, parseTeamclaudeBaseUrl,
 } from './review-provider-fallback.js';
+
+// #38463(SIM-FAKE-LLM-REGISTRY) 이후 시험 우주(bun test)의 getProvider 는 test-fake-llm 로 매핑되어
+// 이 파일의 12 기대값이 main 에서 빨갛다(JUD #88170 실측). 이 파일은 provider 라우팅(glm→openrouter 등)을
+// 문면으로 검증하므로 «fixture 리터럴 고정» 대신 파일 단위로 real 모드를 고정·복원한다(생산 코드 불별).
+const __originalLlmMode = process.env.ELANOUS_LLM_MODE;
+process.env.ELANOUS_LLM_MODE = 'real'; // fixture 상수가 모듈 평가 시점에 getProvider 를 부르므로 여기서 고정.
+afterAll(() => { if (__originalLlmMode === undefined) delete process.env.ELANOUS_LLM_MODE; else process.env.ELANOUS_LLM_MODE = __originalLlmMode; });
 
 const A = { model: 'gpt-5.6-sol', provider: getProvider('gpt-5.6-sol')!, label: 'codex' };
 const B = { model: 'grok-4', provider: getProvider('grok-4')!, label: 'grok' };
@@ -722,5 +731,169 @@ describe('reviewFallbackModelsFromConfig — config 노브', () => {
   test('⛔ 읽기가 던져도 «막지» 않는다 — 폴백 없이 종전대로 돈다', async () => {
     const { reviewFallbackModelsFromConfig } = await import('./review-provider-fallback.js');
     expect(reviewFallbackModelsFromConfig(() => { throw new Error('config down'); })).toEqual([]);
+  });
+});
+
+// TA-POD-REVIEW-PROVIDER-ALLOW — decision table: role × available candidates × grok usage × GLM attempted for review.
+// Expected values are independent literals (rule 11); grok usage goes through the production 70% reader.
+describe('TA-POD-REVIEW-PROVIDER-ALLOW — per-role provider chains', () => {
+  const TERRA = 'gpt-6.1-terra';
+  const GROK = 'grok-4.7';
+  const QWEN = 'openrouter/openai/gpt-6-luna';
+  const GLM = 'openrouter/z-ai/glm-5.3';
+  const grokAt = (usedPercent: number | null) => () => grokQuotaFromUsageSnapshot(usedPercent === null ? null : { windows: [{ kind: 'weekly', remainingPercent: 100 - usedPercent }] });
+  const only = (...providers: string[]) => (candidate: ChainCandidate) => providers.includes(candidate.provider);
+  const ALL = only('openai-codex', 'grok', 'openrouter');
+
+  function captureChainEvents() {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: `role-chain-${Math.random()}`, emit: ({ category, event, data }) => {
+      if (category === 'self-dev.role-chain') events.push({ event, data: data as Record<string, unknown> });
+    } });
+    return { events, off };
+  }
+
+  const table: Array<[string, Parameters<typeof resolveRoleProviderChain>[0], Parameters<typeof resolveRoleProviderChain>[1], string[], Array<[string, string]>]> = [
+    ['review · all available · grok 69% → Terra, grok, luna', 'review', { isAvailable: ALL, grokQuota: grokAt(69) }, [TERRA, GROK, QWEN], []],
+    ['review · grok at 70% → grok skipped', 'review', { isAvailable: ALL, grokQuota: grokAt(70) }, [TERRA, QWEN], [[GROK, 'grok-usage-at-or-above-70']]],
+    ['review · grok unmeasured → fails closed, grok skipped', 'review', { isAvailable: ALL, grokQuota: grokAt(null) }, [TERRA, QWEN], [[GROK, 'grok-usage-unmeasured']]],
+    ['review · no codex credential → grok then luna', 'review', { isAvailable: only('grok', 'openrouter'), grokQuota: grokAt(10) }, [GROK, QWEN], [[TERRA, 'no-credential']]],
+    ['judgement · codex only → Terra', 'judgement', { isAvailable: only('openai-codex'), grokQuota: grokAt(10) }, [TERRA], [[GROK, 'no-credential'], [QWEN, 'no-credential']]],
+    ['recovery · openrouter child → glm first, codex stays', 'recovery', { isAvailable: ALL }, [GLM, TERRA], []],
+    ['recovery · no codex → glm only', 'recovery', { isAvailable: only('openrouter') }, [GLM], [[TERRA, 'no-credential']]],
+    ['recovery · other child (no openrouter) → codex', 'recovery', { isAvailable: only('openai-codex') }, [TERRA], [[GLM, 'no-credential']]],
+    ['review · availability check throws → availability-check-failed', 'review', { isAvailable: () => { throw new Error('probe down'); }, grokQuota: grokAt(10) }, [],
+      [[TERRA, 'availability-check-failed'], [GROK, 'availability-check-failed'], [QWEN, 'availability-check-failed']]],
+  ];
+  for (const [name, role, deps, candidates, skipped] of table) {
+    test(name, () => {
+      const r = resolveRoleProviderChain(role, { config: { llm: {} }, ...deps });
+      expect(r.source).toBe('default');
+      expect(r.candidates.map((c) => c.model)).toEqual(candidates);
+      expect(r.skipped.map((s) => [s.model, s.why])).toEqual(skipped);
+    });
+  }
+
+  test('review · nothing usable → exhausted reason names the role and every candidate, with an event', () => {
+    const { events, off } = captureChainEvents();
+    try {
+      const r = resolveRoleProviderChain('review', { config: { llm: {} }, isAvailable: only(), grokQuota: grokAt(70) });
+      expect(r.candidates).toEqual([]);
+      expect(r.exhaustedReason).toBe('role-chain-exhausted: review: openai-codex(gpt-6.1-terra)=no-credential, grok(grok-4.7)=grok-usage-at-or-above-70, openrouter(openrouter/openai/gpt-6-luna)=no-credential');
+      expect(events.map((e) => [e.event, e.data.role])).toEqual([['exhausted', 'review']]);
+    } finally { off(); }
+  });
+
+  test('GLM configured for review or judgement is refused with an event; recovery may use it', () => {
+    const { events, off } = captureChainEvents();
+    try {
+      const config = { llm: { roleProviderChains: { review: ['glm-5.3', QWEN], judgement: [GLM], recovery: [GLM] } } };
+      const review = resolveRoleProviderChain('review', { config, isAvailable: ALL });
+      expect(review.source).toBe('config');
+      expect(review.candidates.map((c) => c.model)).toEqual([QWEN]);
+      expect(review.skipped.map((s) => [s.model, s.why])).toEqual([['glm-5.3', 'not-in-review-allowlist']]);
+      const judgement = resolveRoleProviderChain('judgement', { config, isAvailable: ALL });
+      expect(judgement.exhaustedReason).toBe('role-chain-exhausted: judgement: openrouter(openrouter/z-ai/glm-5.3)=not-in-review-allowlist');
+      expect(resolveRoleProviderChain('recovery', { config, isAvailable: ALL }).candidates.map((c) => c.model)).toEqual([GLM]);
+      expect(events.map((e) => [e.event, e.data.role, e.data.model ?? null])).toEqual([
+        ['review-not-allowed', 'review', 'glm-5.3'],
+        ['review-not-allowed', 'judgement', 'openrouter/z-ai/glm-5.3'],
+        ['exhausted', 'judgement', null],
+      ]);
+    } finally { off(); }
+  });
+
+  test('review · judgement allowlist refuses every non-allowed spelling — prefix, path, and suffix bypass forms (JUD-B #90187 ③)', () => {
+    const { events, off } = captureChainEvents();
+    try {
+      const config = { llm: { roleProviderChains: {
+        review: ['z-ai-glm-5.3', 'openrouter/z-ai/glm-5.3:free', 'anthropic/claude-opus-5.5', TERRA],
+        judgement: [GLM],
+        recovery: [GLM],
+      } } };
+      const review = resolveRoleProviderChain('review', { config, isAvailable: ALL });
+      expect(review.candidates.map((c) => c.model)).toEqual([TERRA]);
+      expect(review.skipped.map((s) => [s.model, s.why])).toEqual([
+        ['z-ai-glm-5.3', 'not-in-review-allowlist'],
+        ['openrouter/z-ai/glm-5.3:free', 'not-in-review-allowlist'],
+        ['anthropic/claude-opus-5.5', 'not-in-review-allowlist'],
+      ]);
+      const judgement = resolveRoleProviderChain('judgement', { config, isAvailable: ALL });
+      expect(judgement.exhaustedReason).toBe('role-chain-exhausted: judgement: openrouter(openrouter/z-ai/glm-5.3)=not-in-review-allowlist');
+      expect(resolveRoleProviderChain('recovery', { config, isAvailable: ALL }).candidates.map((c) => c.model)).toEqual([GLM]);
+      expect(events.map((e) => [e.event, e.data.role, e.data.model ?? null])).toEqual([
+        ['review-not-allowed', 'review', 'z-ai-glm-5.3'],
+        ['review-not-allowed', 'review', 'openrouter/z-ai/glm-5.3:free'],
+        ['review-not-allowed', 'review', 'anthropic/claude-opus-5.5'],
+        ['review-not-allowed', 'judgement', 'openrouter/z-ai/glm-5.3'],
+        ['exhausted', 'judgement', null],
+      ]);
+    } finally { off(); }
+  });
+
+  test('a role answered only through the config prototype is not read (own keys only)', () => {
+    const inherited = Object.create({ review: [GROK] }) as Record<string, string[]>;
+    const review = resolveRoleProviderChain('review', { config: { llm: { roleProviderChains: inherited } }, isAvailable: ALL, grokQuota: grokAt(10) });
+    expect([review.source, review.candidates.map((c) => c.model)]).toEqual(['default', [TERRA, GROK, QWEN]]);
+    const constructorKey = resolveRoleProviderChain('review', { config: { llm: { roleProviderChains: JSON.parse('{"constructor":["grok-4.7"]}') } }, isAvailable: ALL, grokQuota: grokAt(10) });
+    expect(constructorKey.source).toBe('default');
+  });
+
+  test('config override replaces the default chain for that role only', () => {
+    const config = { llm: { roleProviderChains: { review: [GROK] } } };
+    const review = resolveRoleProviderChain('review', { config, isAvailable: ALL, grokQuota: grokAt(10) });
+    expect([review.source, review.candidates.map((c) => c.model)]).toEqual(['config', [GROK]]);
+    const judgement = resolveRoleProviderChain('judgement', { config, isAvailable: ALL, grokQuota: grokAt(10) });
+    expect([judgement.source, judgement.candidates.map((c) => c.model)]).toEqual(['default', [TERRA, GROK, QWEN]]);
+  });
+
+  test('outermost Pod seams: review skips configured GLM and records qwen, recovery runs glm, an all-GLM judgement chain refuses', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'elanous-pod-role-chain-'));
+    const prior = { substrate: process.env.ELANOUS_SUBSTRATE, openrouter: process.env.OPENROUTER_API_KEY };
+    const calls: string[] = [];
+    const reviewDone: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: `pod-role-chain-${repo}`, emit: ({ category, event, data }) => {
+      if (category === 'self-implement' && event === 'review.done') reviewDone.push(data as Record<string, unknown>);
+    } });
+    try {
+      clearLaunchRoleLlmOverrides();
+      process.env.ELANOUS_SUBSTRATE = 'pod';
+      process.env.OPENROUTER_API_KEY = 'test-pod-openrouter-key';
+      setUserConfigOverlay((config) => ({ ...config, roleLlm: {},
+        llm: { ...config.llm, roleProviderChains: { review: [GLM, QWEN], judgement: [GLM], recovery: [GLM] } },
+      }));
+      const fakeStream = (async (_messages: unknown, _onChunk: unknown, opts: { model?: string }) => {
+        calls.push(opts.model ?? 'none');
+        return opts.model === GLM ? 'TRIAGE: gate fixture lacks the base file' : 'VERDICT: PASS';
+      }) as unknown as typeof streamLLM;
+      const seams = await buildDefaultSelfImplementSeams(planDevPipeline({ input: { text: 'pod role chain' } }), {
+        toolReviewerRate: 0,
+        streamLLM: fakeStream,
+        reviewScopeDiff: async () => 'diff --git a/changed.ts b/changed.ts\n+export const changed = true;\n',
+      });
+      const review = await seams.reviewDiff!(repo, { goal: 'pod role chain' });
+      expect(review.reviewed).toBe(true);
+      expect([...new Set(calls)]).toEqual([QWEN]);
+      const reviewCalls = calls.length;
+      expect(reviewDone.at(-1)).toMatchObject({ reviewerProvider: 'openrouter', reviewerModel: QWEN });
+      const triage = await seams.diagnose!({
+        runId: 'run-pod-role-chain', note: 'gate failed', kind: 'gate', round: 1, cwd: repo,
+        goal: 'goal acceptance', history: [], effectiveMax: 1, purpose: 'escalation-triage',
+      });
+      expect(triage).toBe('TRIAGE: gate fixture lacks the base file');
+      expect(calls.slice(reviewCalls)).toEqual([GLM]);
+      await expect(seams.judgmentCallLLM!({ prompt: 'BUDGET?' } as never)).rejects.toThrow(
+        'role-chain-exhausted: judgement: openrouter(openrouter/z-ai/glm-5.3)=not-in-review-allowlist');
+      expect(calls.slice(reviewCalls)).toEqual([GLM]);
+    } finally {
+      off();
+      for (const [key, value] of [['ELANOUS_SUBSTRATE', prior.substrate], ['OPENROUTER_API_KEY', prior.openrouter]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      setUserConfigOverlay(null);
+      clearLaunchRoleLlmOverrides();
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

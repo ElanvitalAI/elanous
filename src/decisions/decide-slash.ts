@@ -50,7 +50,7 @@ export function createDecideSlashHandler(ledger: DecisionLedger = new DecisionLe
     }
     let acknowledgement: string;
     try {
-      const { delivery } = ledger.decideWithDelivery(entry.id, option.key, { kind: 'human' });
+      const { delivery } = ledger.decideWithDelivery(entry.id, option.key, { kind: 'human', via: 'slash' });
       acknowledgement = `✓ ${entry.title} → ${option.label}${delivery && !delivery.ok ? ` · 런 답 전달 실패: decisions retry-answer ${entry.id}` : ''}`;
     } catch {
       return `결정을 기록하지 못했습니다 (${args[0]}) — /decide 로 목록을 다시 여세요`;

@@ -32,6 +32,21 @@ export function testFakeLlmEnabled(): boolean {
   return process.env[TEST_FAKE_LLM_ENV] === '1';
 }
 
+/** SIM-FAKE-LLM-REGISTRY — 시험·시뮬 우주에서만 «아는 공급자»로 등록되는 fake 공급자 이름. */
+export const TEST_FAKE_LLM_PROVIDER_NAME = 'test-fake-llm';
+
+/** SIM-FAKE-LLM-REGISTRY — 시험·시뮬 우주인가(gate 시험 env · `bun test` · ux-sim 런 · sim 우주). 생산(아무 표지 없음)은 false.
+ *  ⛔ `ELANOUS_LLM_MODE=fake`(`--fake-llm`)는 우주가 아니라 «모드»라 여기 넣지 않는다 — 생산에서 그 이름을 등록하지 않는다. */
+export function testFakeLlmUniverse(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[TEST_FAKE_LLM_ENV] === '1' || env.NODE_ENV === 'test'
+    || Boolean(env.ELANOUS_UX_SIM_RUN_ID?.trim()) || env.ELANOUS_SIM_UNIVERSE === '1';
+}
+
+/** `test-fake-llm` 은 시험·시뮬 우주에서만 «아는 공급자»다(llm.ts 등록 관문이 이것을 먼저 본다). */
+export function isTestUniverseFakeProviderName(name: string, env: NodeJS.ProcessEnv = process.env): name is typeof TEST_FAKE_LLM_PROVIDER_NAME {
+  return name === TEST_FAKE_LLM_PROVIDER_NAME && testFakeLlmUniverse(env);
+}
+
 /** Test and simulated code default to the fake provider. A live `--test` CLI
  *  run is pinned to real by the global flag adapter unless explicitly faked. */
 export function testFakeLlmDefaultSelected(env: NodeJS.ProcessEnv = process.env): boolean {

@@ -11,6 +11,7 @@ import { gitClosureTree } from './gate-closure.js';
 import { gateImagePinPath, readGateImagePin } from './gate-image-pin.js';
 import { readGateFileReceipt } from './gate-shard-receipts.js';
 import { finishNode, latestGateOutput, readGraphContext, type GraphContext } from './node-verdict.js';
+import { releaseCutRecord } from './release-cut-record.js';
 
 export interface GateFileReceiptAudit {
   outcome: 'ok' | 'fail' | 'error';
@@ -48,7 +49,7 @@ export function auditGateFileReceipts(context: GraphContext, deps: GateFileRecei
       && typeof output.commit === 'string' && SHA40.test(output.commit))
     .at(-1)?.[1]?.commit;
   const commit = typeof repairedCommit === 'string' ? repairedCommit
-    : context.outputs.cutoff?.commit ?? context.outputs['version-release']?.commit;
+    : context.outputs.cutoff?.commit ?? releaseCutRecord(context)?.commit;
   const denied = (reason: string): GateFileReceiptAudit => ({ outcome: 'error', verdict: 'fail',
     commit: typeof commit === 'string' && SHA40.test(commit) ? commit : null,
     measurement: { complete: false, totalFiles: 0, coveredFiles: 0, unmeasuredFiles: 0 }, introduced: [], ledgerDefects: [],

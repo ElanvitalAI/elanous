@@ -102,7 +102,7 @@ test('published version becomes visible with latest tag and removes 0600 npmrc',
   f.context.input.npmWaitMinutes = 1;
   try {
     expect(await runNpmPublish(f.context, f.deps)).toMatchObject({ outcome: 'ok', npm: 'published' });
-    expect(f.commands[1]).toBe(`npm publish ${join(f.root, 'release', VERSION, 'prepared', 'dist', 'elanous.tgz')} --ignore-scripts --tag latest --access public --logs-dir ${join(f.root, 'graph-runs', 'release-loop', 'run-npm-publish-test.json.contexts', 'npm-publish')}`);
+    expect(f.commands[1]).toBe(`npm publish ${join(f.root, 'release', VERSION, 'prepared', 'dist', 'elanous.tgz')} --ignore-scripts --tag latest --access public --loglevel warn --logs-dir ${join(f.root, 'graph-runs', 'release-loop', 'run-npm-publish-test.json.contexts', 'npm-publish')}`);
     expect(f.spawnEvents).toHaveLength(1);
     expect(f.spawnEvents[0]).toMatchObject({ version: VERSION, status: 0, signal: null });
     expect(f.spawnEvents[0]?.durationMs).toBeGreaterThan(0);
@@ -416,7 +416,7 @@ exec "$TEST_REAL_NPM" "\${original_args[@]}" --dry-run --offline --registry http
     expect(wrapperLines[0]).toBe(expectedLogDir);
     expect(wrapperLines[1]?.startsWith(join(temp, 'release-npmrc-'))).toBe(true);
     expect(readFileSync(wrapperArgs, 'utf8').trim().split('\n')).toEqual([
-      'publish', archive, '--ignore-scripts', '--tag', 'next', '--access', 'public', '--logs-dir', expectedLogDir,
+      'publish', archive, '--ignore-scripts', '--tag', 'next', '--access', 'public', '--loglevel', 'warn', '--logs-dir', expectedLogDir,
     ]);
     const debugLogs = readdirSync(expectedLogDir).filter((name) => name.endsWith('-debug-0.log'));
     expect(debugLogs.length).toBeGreaterThan(0);
@@ -503,4 +503,41 @@ test('RELEASE-REHEARSAL-RC: a prerelease publishes to dist-tag next and waits fo
     expect(f.commands[1]).toContain('--tag next');
     expect(f.commands.join('\n')).not.toContain('--tag latest');
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+// 0.3.28 regression: npm printed one notice line per file (>1 MB); the old 1 MB spawnSync maxBuffer killed npm → rc=null.
+// The default exec seam does not expose its spawn options, so maxBuffer (64 MiB = 67108864) is proven behaviourally:
+// a fake npm on PATH emits 2 MiB of notice output and must still be read to completion with rc=0.
+test('default exec publishes with --loglevel warn and survives >1 MB npm output (maxBuffer 64 MiB)', async () => {
+  const f = fixture({ visible: false });
+  const bin = join(f.root, 'bin');
+  const argsFile = join(f.root, 'npm-args.txt');
+  const archiveRoot = join(f.root, 'archive');
+  const archive = join(f.root, 'release', VERSION, 'prepared', 'dist', 'elanous.tgz');
+  const originalPath = process.env.PATH;
+  try {
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(join(archiveRoot, 'package'), { recursive: true });
+    mkdirSync(dirname(archive), { recursive: true });
+    writeFileSync(join(archiveRoot, 'package', 'package.json'), JSON.stringify({ name: 'elanous', version: VERSION }));
+    expect(spawnSync('tar', ['-czf', archive, '-C', archiveRoot, 'package'], { encoding: 'utf8' }).status).toBe(0);
+    writeFileSync(join(bin, 'npm'), `#!/bin/bash\nprintf '%s\\n' "$@" > ${JSON.stringify(argsFile)}\nhead -c 2097152 /dev/zero | tr '\\\\0' 'n' >&2\nexit 0\n`);
+    chmodSync(join(bin, 'npm'), 0o755);
+    delete f.deps.exec;
+    let polls = 0;
+    f.deps.registry = async (url) => url.endsWith(`/${VERSION}`)
+      ? { status: polls++ > 0 ? 200 : 404, body: { name: 'elanous', version: VERSION } }
+      : { status: 200, body: { 'dist-tags': { latest: polls > 1 ? VERSION : '0.2.5' } } };
+    process.env.PATH = [bin, originalPath ?? ''].join(delimiter);
+    expect(await runNpmPublish(f.context, f.deps)).toMatchObject({ outcome: 'ok', npm: 'published' });
+    const argv = readFileSync(argsFile, 'utf8').trim().split('\n');
+    const at = argv.indexOf('--loglevel');
+    expect(argv.includes('--loglevel')).toBe(true);
+    expect(argv.slice(at, at + 2)).toEqual(['--loglevel', 'warn']);
+    expect(argv.slice(argv.indexOf('--access'), argv.indexOf('--logs-dir'))).toEqual(['--access', 'public', '--loglevel', 'warn']);
+    expect(f.spawnEvents).toEqual([expect.objectContaining({ version: VERSION, status: 0, signal: null })]);
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(f.root, { recursive: true, force: true });
+  }
 });

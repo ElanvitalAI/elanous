@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
   gateImageLayerRuntimeKey, gateRuntimeBaseReuseMode, prebuildGateImagePinAtCut, prebuildGateImagePinForRuntimeBases,
-  runCutGateImagePrebuild, writeGateImagePin } from './gate-image-pin.js';
+  runCutGateImagePrebuild, writeGateImagePin, poolSyncBuildFailure } from './gate-image-pin.js';
+import { parsePodPool, runBuildScript, syncPoolImages } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { gateImageReadinessPendingPath, gateImageReadinessSignalPath,
   readGateImageReadinessSignal, waitForGateImageT60 } from './release-readiness.js';
@@ -35,6 +36,25 @@ it('image prebuild result sim publishes built and reused readiness that releases
         sleep: async () => { throw new Error('unexpected image hold'); } })).toMatchObject({ signalPath: path, runId: input.runId });
     }
     expect(readdirSync(join(root, 'release', input.version)).filter((name) => name.includes('pending'))).toEqual([]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('RC-READINESS-PATH: an rc cut prebuild publishes readiness at the rc ledger path and T-60 releases without a schedule', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'image-readiness-rc-'));
+  const input = { root, repo: root, runId: 'cut-run-rc', version: '0.3.29-rc.0', commit: 'abcdef0123456789abcdef0123456789abcdef01', pool: 'pool-a' };
+  const now = new Date('2026-11-18T16:15:00.000Z');
+  try {
+    const result = runCutGateImagePrebuild(input, { now: () => now,
+      runPrebuild: () => ({ status: 0, stdout: JSON.stringify({ outcome: 'built', digest: digestA, eligiblePools: ['pool-a'] }) }) });
+    expect(result).toEqual({ outcome: 'built', runId: 'cut-run-rc', cutCommit: 'abcdef0123456789abcdef0123456789abcdef01', digest: digestA, eligiblePools: ['pool-a'] });
+    const path = join(root, 'release', '0.3.29-rc.0', 'image-readiness.json');
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ schemaVersion: 1, status: 'ready', runId: 'cut-run-rc',
+      cutCommit: 'abcdef0123456789abcdef0123456789abcdef01', imageDigest: digestA, eligiblePools: ['pool-a'], checkedAt: '2026-11-18T16:15:00.000Z' });
+    expect(existsSync(join(root, 'release', '0.3.29-rc.0', 'image-readiness.pending'))).toBe(false);
+    expect(await waitForGateImageT60({ runId: input.runId, input: { version: input.version },
+      outputs: { 'version-release': attestedCut(input.commit, input.runId) } }, { ledgerRoot: root, now: () => now,
+      sleep: async () => { throw new Error('unexpected image hold'); } })).toEqual({ version: '0.3.29-rc.0', runId: 'cut-run-rc',
+      cutCommit: 'abcdef0123456789abcdef0123456789abcdef01', eta: '2026-11-18T16:15:00.000Z', signalPath: path });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -212,6 +232,14 @@ esac
       expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toMatchObject({ status: 0 });
       expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'reused', digest: digestC,
         eligiblePools: pool!.split(',').map((part) => part.split('@')[0]) });
+      // Terra must 1: the main run (no --rehearsal-probe) records a success row for every stage it walked.
+      const contexts = pool!.split(',').map((part) => part.split('@')[0]).join(',');
+      expect(JSON.parse(result.stdout.trim()).receipt.map((row: { stage: string; exit: number; ok: boolean; reason: string }) =>
+        [row.stage, row.exit, row.ok, row.stage === 'build' || row.stage === 'push' ? row.reason : ''])).toEqual([
+        ['clone', 0, true, ''], ['deps', 0, true, ''], ['skills', 0, true, ''], ['base-pull', 0, true, ''],
+        ['build', 0, true, `reused: cut image ${digestC} already present, nothing built`],
+        ['push', 0, true, `reused: ${digestC} on ${contexts}`],
+      ]);
       const probes = readFileSync(calls, 'utf8').split('\n').filter((line) => line.includes('/manifests/'));
       expect(probes).toHaveLength(2);
       const tags = probes.map((line) => /\/manifests\/([a-f0-9]{12})/.exec(line)?.[1]);
@@ -459,4 +487,24 @@ it('retries an interrupted tip replacement while the previous active pin remains
     expect(readGateImagePin(path, runId, newImage, newCommit)?.digest).toBe(digestB);
     expect(JSON.parse(readFileSync(archivePath, 'utf8'))).toMatchObject({ commit: oldCommit, digest: digestA });
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('Terra must 1: a main-run pool sync whose real build.sh exits 7 becomes a build failure with exit 7, not null', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-build-exit-'));
+  try {
+    const script = join(dir, 'build.sh');
+    writeFileSync(script, 'echo "layer broke" >&2\nexit 7\n');
+    const members = parsePodPool('pool-node-c@node-c:1');
+    const results = await syncPoolImages(members, 'img', 'target', {
+      run: (_host, cmd) => (cmd.includes('docker inspect k3d-elanous-registry') || cmd.includes('/tags/list')
+        ? { status: 1, stdout: '', stderr: '' } : { status: 0, stdout: 'old', stderr: '' }),
+      remoteBuild: () => runBuildScript(script, { ...process.env }), waitMaxMs: 0,
+      inspect: () => ({ status: 0, stdout: 'target' }), transfer: () => ({ status: 1, stderr: 'ship refused' }),
+      lock: { dir: join(dir, 'locks') },
+    });
+    const failure = poolSyncBuildFailure(members, results);
+    expect(failure?.exit).toBe(7);
+    expect(failure?.reason).toStartWith('cut gate image build failed on pool-node-c: ');
+    expect(poolSyncBuildFailure(members, new Map([['pool-node-c', { ok: true, detail: 'built' }]]))).toBeNull();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

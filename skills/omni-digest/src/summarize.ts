@@ -1,6 +1,6 @@
 /** Grok summarization — unified prompts for all source types + X-specific prompts absorbed from x-to-obsidian */
 
-import { llmNetworkFetch } from '../../../src/session-runtime/llm-call-gateway.js';
+import { llmNetworkFetch } from './llm-network-fetch.js';
 import { env, requireEnv } from './env.js';
 import { compactText } from './util.js';
 import type { SummaryFormat, TweetMeta, Reply } from './types.js';

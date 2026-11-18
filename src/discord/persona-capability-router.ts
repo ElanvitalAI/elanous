@@ -93,10 +93,11 @@ export function createPersonaCapabilityRouter(
       return { allowed: true, via: 'role' };
     }
     // Explicit grant via store
-    if (deps.grantStore.isGranted(ctx.persona, ctx.action, ctx.shellId)) {
+    const grant = deps.grantStore.checkGrant(ctx.persona, ctx.action, ctx.shellId);
+    if (grant.granted) {
       return { allowed: true, via: 'grant' };
     }
-    return { allowed: false, reason: 'no-grant-for-action' };
+    return { allowed: false, reason: grant.reason === 'absent' ? 'no-grant-for-action' : grant.reason };
   };
 
   return {

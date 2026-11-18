@@ -37,6 +37,10 @@ export interface CapabilityGrantStore {
   /** Check if `persona` is granted `action` for optional `shellId`.
    *  Honors expiry and shellId scope. */
   isGranted(persona: string, action: GrantedAction, shellId?: string): boolean;
+  /** Preserve the denial cause after the lazy expiry prune. */
+  checkGrant(persona: string, action: GrantedAction, shellId?: string):
+    | { readonly granted: true }
+    | { readonly granted: false; readonly reason: 'expired' | 'revoked' | 'absent'; readonly expiresAt?: string };
   /** Snapshot of all current (unexpired) grants. */
   list(filter?: { persona?: string; action?: GrantedAction; shellId?: string }): readonly CapabilityGrant[];
   /** Audit log — all events since store creation. */
@@ -52,9 +56,14 @@ export interface CapabilityGrantStoreOpts {
   now?: () => Date;
   /** Optional max audit log size (drops oldest beyond). Default 1000. */
   auditCap?: number;
+  /** Max recent denial causes kept after audit rotation. Default 10000. */
+  denialCap?: number;
+  /** Called once per grant, one hour before expiry; defaults to a process warning. */
+  onExpiring?: (grant: CapabilityGrant) => void;
 }
 
 const DEFAULT_AUDIT_CAP = 1000;
+const DEFAULT_DENIAL_CAP = 10_000;
 
 function nowIso(opts: CapabilityGrantStoreOpts): string {
   return (opts.now ? opts.now() : new Date()).toISOString();
@@ -77,11 +86,61 @@ export function createCapabilityGrantStore(
 ): CapabilityGrantStore {
   const grants = new Map<string, CapabilityGrant>();
   const audit: GrantAuditEvent[] = [];
+  // Denial causes must outlive the bounded audit log. Keep only the latest
+  // terminal event per grant identity; a new grant clears that identity.
+  const denials = new Map<string, { reason: 'expired' | 'revoked'; expiresAt?: string; order: number }>();
+  let denialOrder = 0;
   const auditCap = opts.auditCap ?? DEFAULT_AUDIT_CAP;
+  const denialCap = opts.denialCap ?? DEFAULT_DENIAL_CAP;
+  if (!Number.isSafeInteger(denialCap) || denialCap < 0) throw new RangeError('invalid denialCap');
+  const expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const warned = new Set<string>();
+
+  const clearExpiryTimer = (key: string): void => {
+    const timer = expiryTimers.get(key);
+    if (timer) clearTimeout(timer);
+    expiryTimers.delete(key);
+    warned.delete(key);
+  };
+
+  const scheduleExpiryWarning = (key: string, grant: CapabilityGrant): void => {
+    clearExpiryTimer(key);
+    if (!grant.expiresAt) return;
+    const expiry = new Date(grant.expiresAt).getTime();
+    if (!Number.isFinite(expiry) || expiry <= nowMs(opts)) return;
+    const warnAt = expiry - 60 * 60 * 1000;
+    const emit = (): void => {
+      expiryTimers.delete(key);
+      if (grants.get(key) !== grant || warned.has(key)) return;
+      const current = nowMs(opts);
+      if (current >= expiry) return;
+      if (current < warnAt) {
+        arm();
+        return;
+      }
+      warned.add(key);
+      if (opts.onExpiring) opts.onExpiring(grant);
+      else process.emitWarning(`capability grant expires within 1 hour: ${JSON.stringify(grant.persona)}/${grant.action}`);
+    };
+    const arm = (): void => {
+      const delay = Math.max(0, Math.min(warnAt - nowMs(opts), 2_147_000_000));
+      const timer = setTimeout(emit, delay);
+      (timer as { unref?: () => void }).unref?.();
+      expiryTimers.set(key, timer);
+    };
+    if (warnAt <= nowMs(opts)) emit();
+    else arm();
+  };
 
   const pushAudit = (event: GrantAuditEvent): void => {
     audit.push(event);
     while (audit.length > auditCap) audit.shift();
+  };
+
+  const rememberDenial = (key: string, reason: 'expired' | 'revoked', expiresAt?: string): void => {
+    denials.delete(key);
+    denials.set(key, { reason, expiresAt, order: ++denialOrder });
+    while (denials.size > denialCap) denials.delete(denials.keys().next().value!);
   };
 
   const lazyPrune = (): GrantAuditEvent[] => {
@@ -89,7 +148,9 @@ export function createCapabilityGrantStore(
     const now = nowMs(opts);
     for (const [key, g] of grants) {
       if (isExpired(g, now)) {
+        clearExpiryTimer(key);
         grants.delete(key);
+        rememberDenial(key, 'expired', g.expiresAt);
         const ev: GrantAuditEvent = { kind: 'expired', grant: g, at: nowIso(opts) };
         pushAudit(ev);
         events.push(ev);
@@ -102,7 +163,9 @@ export function createCapabilityGrantStore(
     grant(grant) {
       const key = grantKey(grant);
       grants.set(key, grant);
+      denials.delete(key);
       pushAudit({ kind: 'granted', grant, at: nowIso(opts), by: grant.grantedBy });
+      scheduleExpiryWarning(key, grant);
     },
     revoke(predicate) {
       let count = 0;
@@ -110,7 +173,9 @@ export function createCapabilityGrantStore(
         if (g.persona !== predicate.persona) continue;
         if (predicate.action && g.action !== predicate.action) continue;
         if (predicate.shellId && g.shellId !== predicate.shellId) continue;
+        clearExpiryTimer(key);
         grants.delete(key);
+        rememberDenial(key, 'revoked');
         count += 1;
         pushAudit({ kind: 'revoked', grant: g, at: nowIso(opts), by: predicate.by });
       }
@@ -118,14 +183,25 @@ export function createCapabilityGrantStore(
     },
     isGranted(persona, action, shellId) {
       lazyPrune();
+      const exactKey = grantKey({ persona, action, shellId });
+      return grants.has(exactKey) || Boolean(shellId && grants.has(grantKey({ persona, action })));
+    },
+    checkGrant(persona, action, shellId) {
+      lazyPrune();
       // Try exact match first (shellId-scoped), then global.
       const exactKey = grantKey({ persona, action, shellId });
-      if (grants.has(exactKey)) return true;
+      if (grants.has(exactKey)) return { granted: true };
       if (shellId) {
         const globalKey = grantKey({ persona, action });
-        if (grants.has(globalKey)) return true;
+        if (grants.has(globalKey)) return { granted: true };
       }
-      return false;
+      const keys = new Set([exactKey, ...(shellId ? [grantKey({ persona, action })] : [])]);
+      const latest = [...keys].map((key) => denials.get(key)).filter((value) => value !== undefined)
+        .sort((a, b) => b.order - a.order)[0];
+      if (latest) return latest.reason === 'expired'
+        ? { granted: false, reason: 'expired', expiresAt: latest.expiresAt }
+        : { granted: false, reason: 'revoked' };
+      return { granted: false, reason: 'absent' };
     },
     list(filter) {
       lazyPrune();
@@ -147,7 +223,9 @@ export function createCapabilityGrantStore(
       const events: GrantAuditEvent[] = [];
       for (const [key, g] of grants) {
         if (g.expiresAt && new Date(g.expiresAt).getTime() <= _ms) {
+          clearExpiryTimer(key);
           grants.delete(key);
+          rememberDenial(key, 'expired', g.expiresAt);
           const ev: GrantAuditEvent = { kind: 'expired', grant: g, at: nowIso(opts) };
           pushAudit(ev);
           events.push(ev);

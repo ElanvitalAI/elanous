@@ -49,7 +49,13 @@ export interface ContextStrategy {
  * cheap 패스(L1/L2) → 여전히 임계 초과면 L3(LLM 요약) 에스컬레이션 → 축소분만 반환. runCompactPipeline
  * (검증된 5레이어)를 그대로 소비. fired=false 면 원본 그대로(무비용). fail-soft(예외는 caller catch).
  */
-export function createDefaultContextStrategy(): ContextStrategy {
+/** Test seams for the pipeline and the L3 summarizer (default: the real modules). */
+export interface DefaultContextStrategyDeps {
+  readonly runCompactPipeline?: typeof import('../compact/pipeline.js').runCompactPipeline;
+  readonly getDefaultCompactProvider?: typeof import('../compact/provider.js').getDefaultCompactProvider;
+}
+
+export function createDefaultContextStrategy(deps: DefaultContextStrategyDeps = {}): ContextStrategy {
   return {
     async compact(messages, ctx): Promise<CompactionOutcome> {
       const { shouldAutoCompact } = require('../compact/auto.js') as typeof import('../compact/auto.js');
@@ -59,15 +65,24 @@ export function createDefaultContextStrategy(): ContextStrategy {
       if (!decision.fire) {
         return { fired: false, messages, reduced: false, escalated: false, ratio: decision.ratio, usedTokens: decision.usedTokens, beforeTokens, afterTokens: beforeTokens };
       }
-      const { runCompactPipeline } = require('../compact/pipeline.js') as typeof import('../compact/pipeline.js');
+      const runCompactPipeline = deps.runCompactPipeline
+        ?? (require('../compact/pipeline.js') as typeof import('../compact/pipeline.js')).runCompactPipeline;
       // ★ 핵심 앵커 pin — config.preserveFirstN(기본 1). 0 이면 앵커 보존 비활성(롤백 seam).
       const preserveFirst = Math.max(0, (acCfg as AutoCompactCfgWithAnchor).preserveFirstN ?? 1);
       const compactOpts = { activeModelId: ctx.model, policy: { preserveFirst }, ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}) };
       let compacted = await runCompactPipeline(messages, compactOpts);
       let escalated = false;
       // cheap 패스로 부족하면 L3(LLM 요약) 에스컬레이션(정상 tool-bloat 턴은 여기 안 옴 → LLM 비용 0).
-      if (shouldAutoCompact(compacted.messages, ctx.model, acCfg).fire) {
-        const { getDefaultCompactProvider } = require('../compact/provider.js') as typeof import('../compact/provider.js');
+      // OP-LONG-SESSION-COMPACT (O4 · 24h 실측 no-reduce 1972건 전부 escalated=false): the first decision fires on the
+      // provider-reported input (system prompt + tool schemas + history), but this re-check used to measure history alone
+      // — so it said «under threshold», L3 never ran, the turn counted a failure and the breaker shut compaction off for
+      // the rest of the turn. The overhead compaction cannot remove is carried into the re-check.
+      const overheadTokens = typeof ctx.observedInputTokens === 'number' && Number.isFinite(ctx.observedInputTokens)
+        ? Math.max(0, ctx.observedInputTokens - beforeTokens) : 0;
+      const recheckObserved = overheadTokens > 0 ? estimateMessagesTokens(compacted.messages) + overheadTokens : undefined;
+      if (shouldAutoCompact(compacted.messages, ctx.model, acCfg, recheckObserved).fire) {
+        const getDefaultCompactProvider = deps.getDefaultCompactProvider
+          ?? (require('../compact/provider.js') as typeof import('../compact/provider.js')).getDefaultCompactProvider;
         const deep = await runCompactPipeline(messages, { ...compactOpts, provider: getDefaultCompactProvider() });
         // ★ 에스컬레이션 채택도 **토큰** 기준(개수 아님) — L3 요약이 개수는 늘려도 토큰은 더 줄 수 있다.
         if (estimateMessagesTokens(deep.messages) < estimateMessagesTokens(compacted.messages)) { compacted = deep; escalated = true; }
@@ -87,4 +102,15 @@ export function createDefaultContextStrategy(): ContextStrategy {
       };
     },
   };
+}
+
+/**
+ * OP-LONG-SESSION-COMPACT (O4 PR2) — an open compaction breaker gets one more try once history has grown this much
+ * since it opened. Source: live 11-18 — breaker opened at p50 ≈ 25k tokens and turns kept growing (p90 94k) for
+ * 19–159 rounds with no compaction; 1.25 = one more try per quarter of growth, never on every round.
+ */
+export const COMPACT_REARM_GROWTH = 1.25;
+
+export function shouldRearmCompaction(openedAtTokens: number, nowTokens: number, growth: number = COMPACT_REARM_GROWTH): boolean {
+  return openedAtTokens > 0 && nowTokens >= openedAtTokens * growth;
 }

@@ -182,17 +182,21 @@ export function siWarmEligible(input: ChildInput, options: PodSpawnOptions, conf
 export async function postprocessSiWarmChild(input: ChildInput, result: SelfImplementJobDone,
   attempt: SiWarmChildAttempt, options: PodSpawnOptions,
   record: (terminal: PrTerminalRecord) => Promise<void> = async terminal => {
-    await applyPodTerminal(terminal, { ledgerRunId: attempt.command.runId,
+    const runId = attempt.command?.runId;
+    if (runId === undefined) throw new Error('si-v1 attempt command receipt missing');
+    await applyPodTerminal(terminal, { ledgerRunId: runId,
       ledgerDir: runLedgerDir() });
   }): Promise<SelfImplementJobDone> {
   const disposition = result.disposition;
   if (!disposition) throw new Error('si-v1 host terminal disposition missing');
-  const terminal = classifyPodTerminal({ childRunId: disposition.childRunId ?? attempt.command.runId,
+  const command = attempt.command;
+  if (!command) throw new Error('si-v1 attempt command receipt missing');
+  const terminal = classifyPodTerminal({ childRunId: disposition.childRunId ?? command.runId,
     state: result.exitCode === 0 ? 'complete' : 'failed', disposition,
     env: process.env, prBody: options.draftResidue ? undefined : podTerminalPrBody(disposition),
     goalText: input.feature, at: new Date().toISOString() });
   if (options.draftResidue) await options.draftResidue(terminal,
-    { ledgerRunId: attempt.command.runId, ledgerDir: runLedgerDir() });
+    { ledgerRunId: command.runId, ledgerDir: runLedgerDir() });
   else await record(terminal);
   return result;
 }
@@ -272,7 +276,7 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
     const attemptId = `attempt-${randomUUID()}`;
     const pinnedInput = { ...input, base: sourceSha };
     const executionKey = siWarmExecutionKey(pinnedInput, runId);
-    const plannedAccount = options.accountBroker?.() ?? options.account ?? 'team';
+    const plannedAccount = options.accountBroker?.() ?? options.account ?? 'default';
     const rotation = options.rotationAccounts;
     if (options.accountBroker && (!rotation?.includes(plannedAccount)
       || new Set(rotation).size !== rotation.length))

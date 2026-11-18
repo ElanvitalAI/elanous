@@ -993,9 +993,13 @@ test('OP 11-17: runtime=eln ⊕ autowake → no typing into the pane; without au
   expect((await wakeRecipient('HAND-X', 1, { from: 'OP', fallback: true }, eln.deps)).result).toBe('injected');
   expect(eln.herdr).toEqual([['wJ:p1', fallbackWakeLine('HAND-X')]]);
   expect(fallbackWakeLine('HAND-X')).not.toContain('OP');
-  // eln 이어도 autowake 가 없으면(자기 우편을 안 봄) 지금처럼 깨운다 · claude-code 는 늘 깨운다.
+  // ELN-SEAT-LIVE 11-18: autowake 가 없어도 eln TUI 는 자리 우편 알림 큐로 받는다 → 타이핑 0(한 우편 두 턴 금지) · 안전망은 그대로.
   const noWatch = fixture({ readRegistry: () => seat('eln'), hasOptIn: () => false, listHerdrPanes: () => [{ paneId: 'wJ:p1', status: 'idle' }] });
-  expect((await wakeRecipient('HAND-X', 2, { from: 'OP' }, noWatch.deps)).result).not.toBe('eln-mail-watch');
+  expect(await wakeRecipient('HAND-X', 2, { from: 'OP' }, noWatch.deps)).toMatchObject({ result: 'eln-mail-watch', reason: 'eln-seat-mail-queue' });
+  expect(noWatch.herdr).toEqual([]);
+  expect((await wakeRecipient('HAND-X', 2, { from: 'OP', fallback: true }, noWatch.deps)).result).toBe('injected');
+  expect(noWatch.herdr).toHaveLength(1);
+  // claude-code 는 늘 깨운다.
   const cc = fixture({ readRegistry: () => seat('claude-code'), hasOptIn: autowake, listHerdrPanes: () => [{ paneId: 'wJ:p1', status: 'idle' }] });
   expect(resolveWake('HAND-X', cc.deps)).toMatchObject({ runtime: 'external-cli' });
   expect((await wakeRecipient('HAND-X', 3, { from: 'OP' }, cc.deps)).result).toBe('injected');

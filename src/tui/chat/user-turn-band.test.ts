@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import type { SerializedMessage } from '../../session/index.js';
-import { logViewLines, USER_PROMPT_MARK, USER_TURN_BAND_SGR, userTurnBandEnabled, userTurnBandRow } from './log-view.js';
+import { logViewLines, userTurnBandEnabled, userTurnBandRow } from './log-view.js';
 
 // The band colour follows COLORFGBG (turn-band-theme.ts); pin it so the expectation never depends on the terminal
 // the tests run in (#38379 REVIEW-1). '15;0' = light text on a dark background → the dark token.
@@ -12,7 +12,8 @@ const previousNoColor = process.env.NO_COLOR;
 afterEach(() => { if (previousNoColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = previousNoColor; });
 
 const turn = (role: 'user' | 'assistant', content: string): SerializedMessage => ({ role, content, ts: '2026-11-17T00:00:00Z' });
-const BAND = `\x1b[${USER_TURN_BAND_SGR}m`;
+// The dark token (COLORFGBG pinned to dark): grey 235 band, grey 252 text — a literal (rule 11).
+const BAND = '\x1b[48;5;235;38;5;252m';
 
 test('a user turn is one band per row across the full width; «>» bold, the body normal weight; answers are not banded', () => {
   delete process.env.NO_COLOR;
@@ -34,7 +35,7 @@ test('a user turn is one band per row across the full width; «>» bold, the bod
 test('NO_COLOR keeps «> » and the two-column indent with no escape codes', () => {
   process.env.NO_COLOR = '1';
   const lines = logViewLines([turn('user', 'hello\nworld')], 30);
-  expect(lines.slice(0, 2)).toEqual([`${USER_PROMPT_MARK}hello`, '  world']);
+  expect(lines.slice(0, 2)).toEqual(['> hello', '  world']);
   expect(lines.join('').includes('\x1b[')).toBe(false);
 });
 

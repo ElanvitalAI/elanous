@@ -127,7 +127,8 @@ function publishedPreviousRun(dir: string, root: string, previousVersion: string
 }
 
 function ledgerOutput(run: LedgerRun, nodeId: string): Record<string, unknown> | undefined {
-  const node = run.nodes?.filter((entry) => entry.nodeId === nodeId && entry.ok).at(-1);
+  const ids = nodeId === 'version-release' ? ['cut-branch', nodeId] : [nodeId];
+  const node = run.nodes?.filter((entry) => ids.includes(entry.nodeId) && entry.ok).at(-1);
   try {
     const raw = node?.output?.trim().split(/\r?\n/).at(-1);
     const value: unknown = JSON.parse(raw ?? '');

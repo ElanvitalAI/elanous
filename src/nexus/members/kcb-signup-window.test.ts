@@ -64,7 +64,7 @@ test('configured daemon admits KCB signup now, closes December 1 KST, and refuse
   }
 });
 
-test('configured KCB callback defaults to /app/board/, honors same-origin override, and leaves ordinary callback unchanged', async () => {
+test('configured KCB callback defaults to /app/board/, honors same-origin override, and routes unset handle-less callbacks to the site handle step', async () => {
   const previous = {
     redirect: process.env.GOOGLE_OAUTH_REDIRECT_URI,
     success: process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI,
@@ -74,7 +74,10 @@ test('configured KCB callback defaults to /app/board/, honors same-origin overri
   process.env.GOOGLE_OAUTH_REDIRECT_URI = redirectUri;
   process.env.MEMBER_SIGNUP_WEB_ORIGIN = 'https://app.example.test';
   const now = () => Date.parse('2026-11-12T10:05:00Z');
-  const complete = async (eventCode?: string): Promise<string | null> => {
+  const complete = async (
+    eventCode?: string,
+    startOrigin = 'https://app.example.test',
+  ): Promise<string | null> => {
     const store = createMemberStore({ path: ':memory:', now });
     const googleWorld = createFakeGoogleOAuthWorld({ clientId: 'client-test', redirectUri, identity: {
       sub: 'test-member', email: 'member@example.test', emailVerified: true, name: 'Member',
@@ -87,7 +90,7 @@ test('configured KCB callback defaults to /app/board/, honors same-origin overri
       const api = createConfiguredMembersApi({ store, google, now });
       expect(api).not.toBeNull();
       const started = await api!.handle(new Request('https://api.example.test/v1/members', {
-        method: 'POST', headers: { origin: 'https://app.example.test', 'content-type': 'application/json' },
+        method: 'POST', headers: { origin: startOrigin, 'content-type': 'application/json' },
         body: JSON.stringify({ consents, ...(eventCode ? { eventCode } : {}) }),
       }));
       expect(started?.status).toBe(201);
@@ -105,7 +108,7 @@ test('configured KCB callback defaults to /app/board/, honors same-origin overri
   try {
     delete process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI;
     expect(await complete('KCB1114')).toBe('https://app.example.test/app/board/');
-    expect(await complete()).toBe('https://api.example.test/v1/members/home');
+    expect(await complete()).toBe('https://elanous.ai/members/');
     process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI = 'https://app.example.test/custom-success';
     expect(await complete('KCB1114')).toBe('https://app.example.test/custom-success');
     process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI = 'https://attacker.example.test/escape';
@@ -114,6 +117,13 @@ test('configured KCB callback defaults to /app/board/, honors same-origin overri
       expect(() => createConfiguredMembersApi({ store: rejectedStore,
         google: { redirectUri } as never, now })).toThrow('KCB success redirect must share the member web origin');
     } finally { rejectedStore.close(); }
+
+    // SIGNUP-CALLBACK-HANDLE-STEP, both redirect envs unset: the default is the site handle step
+    // (independent literal — MK #88395: elanous.ai/members serves the handle step to handle-less
+    // members) and webOrigin derives from it, so the site-origin start request is allowed.
+    delete process.env.MEMBER_SIGNUP_SUCCESS_REDIRECT_URI;
+    delete process.env.MEMBER_SIGNUP_WEB_ORIGIN;
+    expect(await complete(undefined, 'https://elanous.ai')).toBe('https://elanous.ai/members/');
   } finally {
     for (const [key, value] of [
       ['GOOGLE_OAUTH_REDIRECT_URI', previous.redirect],

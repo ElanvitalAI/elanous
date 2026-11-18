@@ -13,6 +13,11 @@
 import { createExternalEventLedger, type ExternalEventKind, type ExternalEventLedger } from './external-event-ledger.js';
 import { externalEventZeroMissReceipt, type ExternalEventZeroMissReceipt } from './external-event-receipt.js';
 
+// The verdict is the one definition in its own leaf: the entry chain's
+// import-failure branch uses the same predicate without loading this module.
+import { noticeOneDispatch } from './external-event-one-verdict.js';
+export { noticeOneDispatch };
+
 export interface ExternalEventOneNotice {
   readonly id: string;
   readonly text: string;
@@ -25,6 +30,33 @@ export interface ExternalEventOneNotice {
 }
 
 export type ExternalEventOnePhase = 'received' | 'injected' | 'handled' | 'duplicate' | 'refused';
+
+/**
+ * Entry's follow-up on the dispatch verdict, as one leaf. Entry hands its
+ * own callbacks in; the leaf decides nothing on its own. A refusal or a
+ * duplicate is not a turn, and the item is already off the queue, so a
+ * later item is woken here. A new row starts the notice turn.
+ */
+export function dispatchExternalEventOne(input: {
+  readonly opened: ExternalEventOneOpened;
+  readonly dispatch: ReturnType<typeof noticeOneDispatch>;
+  readonly remaining: number;
+  /** Entry's key inject: wakes the idle door for a later queued item. */
+  readonly injectKey: () => void;
+  /** Entry keeps the opened notice for the turn that answers it. */
+  readonly keepOpen: (opened: ExternalEventOneOpened) => void;
+  readonly startChatTurn: (text: string, status: string) => void;
+  readonly log: (event: string, fields: Record<string, unknown>) => void;
+}): void {
+  if (!input.dispatch.startTurn) {
+    input.log('queue-notice-not-injected', { source: input.opened.source, remaining: input.remaining });
+    if (input.dispatch.wakeQueue) input.injectKey();
+    return;
+  }
+  input.keepOpen(input.opened);
+  input.log('queue-dispatched-notice', { source: input.opened.source, remaining: input.remaining });
+  input.startChatTurn(input.opened.text, `[notice · ${input.opened.source ?? 'queue'}] auto-submitted`);
+}
 
 export interface ExternalEventOneNote {
   readonly noted: boolean;
@@ -49,7 +81,7 @@ export interface ExternalEventOneOpened {
 
 function kindOf(source: string | undefined): ExternalEventKind {
   if (source === 'wakeup') return 'wakeup';
-  if (source === 'harness-child' || source === 'graph-node') return 'child-exit';
+  if (source === 'harness-child' || source === 'graph-node' || source === 'capsule-done') return 'child-exit';
   if (source === 'graph-end') return 'graph-end';
   return 'mail';
 }

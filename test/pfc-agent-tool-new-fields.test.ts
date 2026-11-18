@@ -248,13 +248,27 @@ describe('dispatchAgent — run_in_background', () => {
     expect(['aborted', 'error', 'done']).toContain(task.state);
   });
 
-  test('foreground (default) waits for completion', async () => {
+  // #38772: an Agent call without run_in_background runs in the background.
+  test('default (no run_in_background) returns a background ticket', async () => {
+    const def = stubDef('explore');
+    const provider = fakeProvider([[
+      { type: 'text', delta: 'background done' },
+    ]]);
+    const result = await dispatchAgent(
+      { description: 'default-bg', prompt: 'hello', subagent_type: 'explore' },
+      { resolveAgentDef: (n) => (n === 'explore' ? def : undefined), provider },
+    );
+    expect(result.background).toBe(true);
+    expect(result.output).toBe(`(running in background — taskId=${result.taskId})`);
+  });
+
+  test('foreground (run_in_background: false) waits for completion', async () => {
     const def = stubDef('explore');
     const provider = fakeProvider([[
       { type: 'text', delta: 'synchronous done' },
     ]]);
     const result = await dispatchAgent(
-      { description: 'sync', prompt: 'hello', subagent_type: 'explore' },
+      { description: 'sync', prompt: 'hello', subagent_type: 'explore', run_in_background: false },
       { resolveAgentDef: (n) => (n === 'explore' ? def : undefined), provider },
     );
     expect(result.background).toBeUndefined();
@@ -395,7 +409,8 @@ describe('dispatchAgent — result shape', () => {
     const def = stubDef('explore');
     const provider = fakeProvider([[{ type: 'text', delta: 'answer' }]]);
     const result = await dispatchAgent(
-      { description: 'scout', prompt: 'x', subagent_type: 'explore' },
+      // #38772: the default is background; the shape of a completed result needs the blocking call.
+      { description: 'scout', prompt: 'x', subagent_type: 'explore', run_in_background: false },
       { resolveAgentDef: (n) => (n === 'explore' ? def : undefined), provider },
     );
     expect(result.output).toBe('answer');

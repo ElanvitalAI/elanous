@@ -15,75 +15,160 @@
 // Port policy (N1-2 decision): auto-pick from 31415 upward. Actual port
 // is recorded in runtime.json + printed in boot banner.
 
-import { setInProcessOutbound } from '../../domains/outbound-alert.js';
-import { hasDeclaredPluginHttpGet, loadDeclaredPluginHttpGet } from '../../plugins/core/declared-handler.js';
-import { BUILTIN_DIR } from '../../plugins/core/host.js';
-import { getUserConfig, resolveNexusRelayConfig } from '../../user-config.js';
-import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
-import { spawnSync } from 'node:child_process';
-import { isIP } from 'node:net';
-import { isAbsolute, join, dirname, relative, resolve } from 'node:path';
-import { homedir } from 'node:os';
-import { readdirSync, realpathSync, statSync } from 'node:fs';
-import { createProject, listProjects } from '../../project/project-store.js';
-import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
-import { createGridDataSource, type GridDataSource, type GridDeps } from './grid.js';
-import { createDraftMetricsSource, type DraftMetricsSource } from './draft-metrics.js';
-import { DECISIONS_PATH, handleDecisions, type DecisionsRouteDeps } from './decisions-route.js';
-import { OPS_BOARD_PATH, handleOpsBoard, type OpsBoardDeps } from './ops-board-route.js';
-import { GRAPH_RUNS_PATH, handleGraphRunsRoute, type GraphRunsRouteDeps } from './graph-runs-route.js';
-import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } from './card-followup-route.js';
-import { SKILL_EXEC_PATH, createSkillExecJobs, type SkillExecJobs } from './skill-exec-route.js';
-import { compareTokenConstTime } from '../../acp/transport/auth.js';
-import type { TrustedTlsEdge } from './tls-edge.js';
-import { ensureAuthToken } from '../../auth/acp-token.js';
-import { listChecklist, type Checklist } from '../../release-loop/checklist.js';
-import { pushEvent, type NexusState } from '../state/state.js';
-import { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
-import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { machineForToken, machineForExpiringToken } from '../../control-plane/member-tokens.js';
-import { handleHqLlmProxy, HQ_LLM_PROXY_PATH, type HqLlmProxyDeps } from './hq-llm-proxy.js';
-import { recordLlmProxyCall } from '../../resource-ledger/resource-ledger.js';
-import { codexOAuthAvailable, getProviderForConfigAsync } from '../../llm.js';
-import { getSecretAsync } from '../config/secrets/index.js';
-import { handleResourceLedgerHostReadinessPost, handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
-import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
-import { resolveVerifiedMemberOwner as resolveVerifiedAppMemberOwner, resolveVerifiedOwner, type NexusAppHost } from '../apps/app-host.js';
-import type { AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
-import type { AppSimulationSnapshot } from '../apps/app-simulation.js';
-import { AppVersionConflict, openAppVersionStore, type AppVersionStore, type AppVersionCheckpointInput } from '../apps/app-versions.js';
-import { consoleAddress, publicAppAddress, simulationPreviewAddress } from '../apps/console-address.js';
-import { connectRelayHost, loadOrCreateRelayHostIdentity, type RelayHostConnection } from '../../relay/host-connector.js';
-import type { AutoPublicAppRegistration } from '../../relay/public-app-auto-registration.js';
-import { createRelayMemberTokenProvider, readRelayMemberKeyFile } from '../../relay/member-token-provider.js';
-import { resolvePublicAppUserId } from '../../relay/relay-server.js';
-import { elanousConfigDir } from '../config/paths.js';
+import { setInProcessOutbound } from "../../domains/outbound-alert.js";
+import {
+  hasDeclaredPluginHttpGet,
+  loadDeclaredPluginHttpGet,
+} from "../../plugins/core/declared-handler.js";
+import { BUILTIN_DIR } from "../../plugins/core/host.js";
+import { getUserConfig, resolveNexusRelayConfig } from "../../user-config.js";
+import type { TelegramEvent } from "../../workflow-runtime/triggers/telegram-source.js";
+import { spawnSync } from "node:child_process";
+import { isIP } from "node:net";
+import { isAbsolute, join, dirname, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { readdirSync, realpathSync, statSync } from "node:fs";
+import { createProject, listProjects } from "../../project/project-store.js";
+import { handleOutputsGet, type OutputsDeps } from "./outputs-route.js";
+import {
+  createGridDataSource,
+  type GridDataSource,
+  type GridDeps,
+} from "./grid.js";
+import {
+  createDraftMetricsSource,
+  type DraftMetricsSource,
+} from "./draft-metrics.js";
+import {
+  DECISIONS_PATH,
+  handleDecisions,
+  type DecisionsRouteDeps,
+} from "./decisions-route.js";
+import {
+  OPS_BOARD_PATH,
+  handleOpsBoard,
+  type OpsBoardDeps,
+} from "./ops-board-route.js";
+import {
+  GRAPH_RUNS_PATH,
+  handleGraphRunsRoute,
+  type GraphRunsRouteDeps,
+} from "./graph-runs-route.js";
+import {
+  CARD_FOLLOWUP_PATH,
+  createCardFollowupJobs,
+  type CardFollowupJobs,
+} from "./card-followup-route.js";
+import {
+  SKILL_EXEC_PATH,
+  createSkillExecJobs,
+  type SkillExecJobs,
+} from "./skill-exec-route.js";
+import { compareTokenConstTime } from "../../acp/transport/auth.js";
+import type { TrustedTlsEdge } from "./tls-edge.js";
+import { ensureAuthToken } from "../../auth/acp-token.js";
+import { listChecklist, type Checklist } from "../../release-loop/checklist.js";
+import { pushEvent, type NexusState } from "../state/state.js";
+import { DEFAULT_NEXUS_HTTP_PORT } from "../default-port.js";
+import { effectiveInstanceRoot } from "../../instance/resolve.js";
+import {
+  machineForToken,
+  machineForExpiringToken,
+} from "../../control-plane/member-tokens.js";
+import {
+  handleHqLlmProxy,
+  HQ_LLM_PROXY_PATH,
+  type HqLlmProxyDeps,
+} from "./hq-llm-proxy.js";
+import { recordLlmProxyCall } from "../../resource-ledger/resource-ledger.js";
+import { codexOAuthAvailable, getProviderForConfigAsync } from "../../llm.js";
+import { getSecretAsync } from "../config/secrets/index.js";
+import {
+  handleResourceLedgerHostReadinessPost,
+  handleResourceLedgerPoolDeclarationPost,
+  handleResourceLedgerPoolsApi,
+} from "./resource-ledger.js";
+import {
+  handleMissionLineRequest,
+  MissionLineHttpError,
+} from "../../agent-mission/mission-line.js";
+import {
+  resolveVerifiedMemberOwner as resolveVerifiedAppMemberOwner,
+  resolveVerifiedOwner,
+  type NexusAppHost,
+} from "../apps/app-host.js";
+import type { AppLifecycleSnapshot } from "../apps/app-lifecycle-ledger.js";
+import type { AppSimulationSnapshot } from "../apps/app-simulation.js";
+import {
+  AppVersionConflict,
+  openAppVersionStore,
+  type AppVersionStore,
+  type AppVersionCheckpointInput,
+} from "../apps/app-versions.js";
+import {
+  consoleAddress,
+  publicAppAddress,
+  simulationPreviewAddress,
+} from "../apps/console-address.js";
+import {
+  connectRelayHost,
+  loadOrCreateRelayHostIdentity,
+  type RelayHostConnection,
+} from "../../relay/host-connector.js";
+import type { AutoPublicAppRegistration } from "../../relay/public-app-auto-registration.js";
+import {
+  createRelayMemberTokenProvider,
+  readRelayMemberKeyFile,
+} from "../../relay/member-token-provider.js";
+import { resolvePublicAppUserId } from "../../relay/relay-server.js";
+import { elanousConfigDir } from "../config/paths.js";
 
-export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
-import type { TabRegistry } from '../state/tab-registry.js';
-import type { FeedbackEnvelope } from '../../feedback/envelope.js';
-import type { Supervisor } from '../supervisor/index.js';
-import { debug } from '../../debug/log.js';
-import { NexusEventBus } from './event-bus.js';
-import { tryHandleAdminMcpReload, type McpReloadOutcome } from './admin-mcp-reload.js';
+export { DEFAULT_NEXUS_HTTP_PORT } from "../default-port.js";
+import type { TabRegistry } from "../state/tab-registry.js";
+import type { FeedbackEnvelope } from "../../feedback/envelope.js";
+import type { Supervisor } from "../supervisor/index.js";
+import { debug } from "../../debug/log.js";
+import { NexusEventBus } from "./event-bus.js";
+import {
+  tryHandleAdminMcpReload,
+  type McpReloadOutcome,
+} from "./admin-mcp-reload.js";
 import {
   createDevProxyRuntimeRef,
   tryHandleAdminDevProxy,
   type DevProxyRuntimeRef,
-} from './admin-dev-proxy.js';
-import { handleDevProxyHttpRequest, pathMatchesDevProxy } from './dev-proxy.js';
-import { OPENAI_RELAY_PATH, tryHandleOpenAiRelay } from './openai-relay.js';
-import { handleHealth, type HealthSetupContext } from './health.js';
-import { handleTabsList, handleTabDetail, handleNexusSnapshot } from './tabs.js';
-import { handleSseEvents, isPluginEventDeviceId, requestsPluginEvents } from './events.js';
-import { handleGraphRunEvents } from './graph-run-events.js';
-import { handleInsideEvents, INSIDE_EVENTS_PATH, startInsideEventRelay } from './inside-events.js';
-import { dispatchIntentPredictionRoute } from './intent-prediction.js';
-import { handleNotificationAction } from './notification-action.js';
-import { handleUserIntentEmit, handleUserIntentBatch } from './user-intents.js';
-import { handleDebugLogsBatch } from './debug-logs.js';
-import { handleLogFederationBatch, handleLogFederationRevoke } from '../../mss/logging/log-federation.js';
-import { handleOutboundTokens, type OutboundTokenRouteOpts } from './outbound-tokens.js';
+} from "./admin-dev-proxy.js";
+import { handleDevProxyHttpRequest, pathMatchesDevProxy } from "./dev-proxy.js";
+import { OPENAI_RELAY_PATH, tryHandleOpenAiRelay } from "./openai-relay.js";
+import { handleHealth, type HealthSetupContext } from "./health.js";
+import {
+  handleTabsList,
+  handleTabDetail,
+  handleNexusSnapshot,
+} from "./tabs.js";
+import {
+  handleSseEvents,
+  isPluginEventDeviceId,
+  requestsPluginEvents,
+} from "./events.js";
+import { handleGraphRunEvents } from "./graph-run-events.js";
+import {
+  handleInsideEvents,
+  INSIDE_EVENTS_PATH,
+  startInsideEventRelay,
+} from "./inside-events.js";
+import { dispatchIntentPredictionRoute } from "./intent-prediction.js";
+import { handleNotificationAction } from "./notification-action.js";
+import { handleUserIntentEmit, handleUserIntentBatch } from "./user-intents.js";
+import { handleDebugLogsBatch } from "./debug-logs.js";
+import {
+  handleLogFederationBatch,
+  handleLogFederationRevoke,
+} from "../../mss/logging/log-federation.js";
+import {
+  handleOutboundTokens,
+  type OutboundTokenRouteOpts,
+} from "./outbound-tokens.js";
 // Cascade-zyu W9 / W9b / W9c endpoint dispatch — added by W9d-FU (2026-05-12).
 // Each handler does its own method check internally; the dispatch block
 // only verifies the pathname pattern + opts.<field> presence (returns
@@ -92,176 +177,263 @@ import {
   handleApprovalShowroom,
   parseApprovalShowroomPath,
   type ApprovalShowroomRouteOpts,
-} from './approval-showroom.js';
+} from "./approval-showroom.js";
 import {
   handleWorkflowDesign,
   parseWorkflowDesignPath,
   type WorkflowDesignRouteOpts,
-} from './workflow-design.js';
+} from "./workflow-design.js";
 import {
   handleDevices,
   handleTemplateCapabilityPreview,
   isDevicesPath,
   isTemplateCapabilityPreviewPath,
   type DevicesRouteOpts,
-} from './devices.js';
-import { handleUxSimDevices, isUxSimDevicesPath } from './ux-sim-devices.js';
+} from "./devices.js";
+import { handleUxSimDevices, isUxSimDevicesPath } from "./ux-sim-devices.js";
 import {
   handleConversationStats,
   isConversationStatsPath,
-} from './agent-cli-conversation-stats.js';
+} from "./agent-cli-conversation-stats.js";
 import {
   handleNextFluentPreview,
   handleNextFluentDispatch,
   isNextFluentPreviewPath,
   isNextFluentDispatchPath,
   type NextFluentRouteOpts,
-} from './next-fluent.js';
+} from "./next-fluent.js";
 import {
   handleMorningShowroom,
   isMorningShowroomPath,
   type MorningShowroomRouteOpts,
-} from './morning-showroom.js';
+} from "./morning-showroom.js";
 import {
   handleIdleNudge,
   isIdleNudgePath,
   type IdleNudgeRouteOpts,
-} from './idle-nudge.js';
+} from "./idle-nudge.js";
 import {
   handleNotesFromImage,
   type NotesFromImageOpts,
-} from './notes-from-image.js';
+} from "./notes-from-image.js";
 import {
   handleNotesFromImages,
   type NotesFromImagesOpts,
-} from './notes-from-images.js';
-import {
-  handleNotesSave,
-  type NotesSaveOpts,
-} from './notes-save.js';
+} from "./notes-from-images.js";
+import { handleNotesSave, type NotesSaveOpts } from "./notes-save.js";
 import {
   handleImageGenerate,
   handleImageEdit,
   type ImageGenerateOpts,
-} from './image-generate.js';
+} from "./image-generate.js";
 import {
   handleNotesMetricsSnapshot,
   handleNotesMetricsEvent,
   type NotesMetricsRouteOpts,
-} from './metrics-notes.js';
+} from "./metrics-notes.js";
 import {
   handleSessionsActive,
   type SessionsActiveOpts,
-} from './sessions-active.js';
+} from "./sessions-active.js";
 import {
   handleSessionsDecision,
   parseSessionDecisionPath,
   type SessionsDecisionOpts,
-} from './sessions-decision.js';
+} from "./sessions-decision.js";
 import {
   handleReflection,
   parseReflectionPath,
   type ReflectionRouteOpts,
-} from './reflection.js';
-import { handleSignalBoard } from './signal-board-api.js';
-import { handleUsageGet } from './usage-api.js';
+} from "./reflection.js";
+import { handleSignalBoard } from "./signal-board-api.js";
+import { handleUsageGet } from "./usage-api.js";
 import {
   handleDashboard,
   handleDashboardRefreshLive,
   parseDashboardPath,
   type DashboardRouteOpts,
-} from './dashboard.js';
-import {
-  handleAutopilotGet,
-  parseAutopilotPath,
-} from './autopilot-api.js';
+} from "./dashboard.js";
+import { handleAutopilotGet, parseAutopilotPath } from "./autopilot-api.js";
 import {
   handleVaultGet,
   handleVaultFilePut,
   handleTemplateExpand,
   parseVaultPath,
-} from './vault-api.js';
-import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
-import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
-import { handleHarnessRunTraversalGet } from './harness-traversal.js';
-import { createLoopEdgesDataSource, type LoopEdgesDataSource } from './loop-edges.js';
-import { handleLoopResourcesGet } from './loop-resources.js';
-import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js';
-import { dispatchPersonaRoute } from './personas.js';
-import { handleMe, operatorSignal } from './operator.js';
-import { handleGraphRunRoute } from '../../graph-runner/graph-run-api.js';
-import { handlePluginGraphApiRun } from '../../graph-runner/plugin-graph-entry.js';
-import { isSelfVerifiedGraphWebhookRequest } from './graph-route-allowlist.js';
-import { handleOpsApi } from './ops-api.js';
-import { handleProjectAutopsy } from './project-autopsy.js';
-import { handleRoleJudge } from './role-judge.js';
-import { handleAudioStt } from './audio-stt.js';
-import { handleScraps, type ScrapsRouteOptions } from './scraps.js';
-import { issueTelegramMemberCode } from '../../telegram-member-scrap.js';
-import { createAbsorbShareSummaryRequestApi, publishAbsorbShareSummaryResults, resolveVerifiedShareSummaryOwner, shareSummaryNexusEvent } from './share-summary-requests.js';
-import { handleLlmModels } from './llm-models.js';
-import { handleLlmHostsConfig } from './llm-hosts-config.js';
-import { handleLlmRotationGet, handleLlmRotationNext } from './llm-rotation.js';
-import { handleSetupClaim } from './setup-claim.js';
-import { handleCredentialRegistrationClaim, handleCredentialRegistrationLinkCreate, handleCredentialRegistrationLinkRevoke, handleCredentialRegistrationSubmit, handleCredentialSlotsGet } from './setup-credentials.js';
-import { handleOpenRouterImportCandidates, handleOpenRouterImportConfirm, handleOpenRouterOAuthCallback, handleOpenRouterOAuthStart } from './openrouter-oauth.js';
-import { handleSetupCodexLoginGet, handleSetupCodexLoginPost } from './setup-codex-login.js';
+} from "./vault-api.js";
+import { handleBuildsGet, parseBuildsPath } from "./builds-api.js";
+import {
+  handleHarnessAskPost,
+  handleHarnessAskStatusGet,
+  handleHarnessRunEventsGet,
+  handleHarnessRunScreenGet,
+  handleHarnessRunsGet,
+  handleHarnessStopPost,
+} from "./harness-api.js";
+import { handleHarnessRunTraversalGet } from "./harness-traversal.js";
+import {
+  createLoopEdgesDataSource,
+  type LoopEdgesDataSource,
+} from "./loop-edges.js";
+import { handleLoopResourcesGet } from "./loop-resources.js";
+import {
+  handleFabricPlans,
+  type FabricPlansRouteOpts,
+} from "./fabric-plans.js";
+import { dispatchPersonaRoute } from "./personas.js";
+import { handleMe, operatorSignal } from "./operator.js";
+import { requestDebugAudience } from "./debug-audience.js";
+import { handleGraphRunRoute } from "../../graph-runner/graph-run-api.js";
+import { handlePluginGraphApiRun } from "../../graph-runner/plugin-graph-entry.js";
+import { isSelfVerifiedGraphWebhookRequest } from "./graph-route-allowlist.js";
+import { handleOpsApi } from "./ops-api.js";
+import { handleProjectAutopsy } from "./project-autopsy.js";
+import { handleRoleJudge } from "./role-judge.js";
+import { handleAudioStt } from "./audio-stt.js";
+import { handleScraps, type ScrapsRouteOptions } from "./scraps.js";
+import { issueTelegramMemberCode } from "../../telegram-member-scrap.js";
+import {
+  createAbsorbShareSummaryRequestApi,
+  publishAbsorbShareSummaryResults,
+  resolveVerifiedShareSummaryOwner,
+  shareSummaryNexusEvent,
+} from "./share-summary-requests.js";
+import { handleLlmModels } from "./llm-models.js";
+import { handleLlmHostsConfig } from "./llm-hosts-config.js";
+import { handleLlmRotationGet, handleLlmRotationNext } from "./llm-rotation.js";
+import { handleSetupClaim } from "./setup-claim.js";
+import {
+  handleCredentialRegistrationClaim,
+  handleCredentialRegistrationLinkCreate,
+  handleCredentialRegistrationLinkRevoke,
+  handleCredentialRegistrationSubmit,
+  handleCredentialSlotsGet,
+} from "./setup-credentials.js";
+import {
+  handleOpenRouterImportCandidates,
+  handleOpenRouterImportConfirm,
+  handleOpenRouterOAuthCallback,
+  handleOpenRouterOAuthStart,
+} from "./openrouter-oauth.js";
+import {
+  handleSetupCodexLoginGet,
+  handleSetupCodexLoginPost,
+} from "./setup-codex-login.js";
 import {
   handleLlmProvidersList,
   handleLlmProviderSet,
-} from './setup-llm-provider.js';
-import { handleObsidianSkillsGet, handleObsidianSet, handleSkillsSet } from './setup-obsidian-skills.js';
-import { handleChildLlmGet, handleChildLlmSet } from './setup-child-llm.js';
-import { handleAnswerPriorityGet, handleAnswerPrioritySet } from './setup-answer-priority.js';
-import { handleChannelBotsGet, handleChannelBotSet } from './setup-channel-bot.js';
-import { handleLlmRoutePredict } from './llm-route-predict.js';
-import type { MissionRouter } from '../../llm/mission-router.js';
-import { handleContextFetchUrl } from './context-url.js';
-import { contextNow, type ContextNowDeps } from '../../context-bus/context-now.js';
-import type { ContextNowAudience } from '../../context-bus/context-now-surfaces.js';
-import { renderVoiceNow } from '../../context-bus/context-now-surfaces.js';
-import type { IntentPredictionService } from '../../intent-prediction/index.js';
-import type { NotificationActionLoopback } from '../../web-push/notification-action-loopback.js';
-import { handlePlatforms } from './platforms.js';
-import { handleRegistryCatalog } from './registry-catalog.js';
+} from "./setup-llm-provider.js";
+import {
+  handleObsidianSkillsGet,
+  handleObsidianSet,
+  handleSkillsSet,
+} from "./setup-obsidian-skills.js";
+import { handleChildLlmGet, handleChildLlmSet } from "./setup-child-llm.js";
+import {
+  handleAnswerPriorityGet,
+  handleAnswerPrioritySet,
+} from "./setup-answer-priority.js";
+import {
+  handleChannelBotsGet,
+  handleChannelBotSet,
+} from "./setup-channel-bot.js";
+import { handleLlmRoutePredict } from "./llm-route-predict.js";
+import type { MissionRouter } from "../../llm/mission-router.js";
+import { handleContextFetchUrl } from "./context-url.js";
+import {
+  contextNow,
+  type ContextNowDeps,
+} from "../../context-bus/context-now.js";
+import type { ContextNowAudience } from "../../context-bus/context-now-surfaces.js";
+import { renderVoiceNow } from "../../context-bus/context-now-surfaces.js";
+import type { IntentPredictionService } from "../../intent-prediction/index.js";
+import type { NotificationActionLoopback } from "../../web-push/notification-action-loopback.js";
+import { handlePlatforms } from "./platforms.js";
+import { handleRegistryCatalog } from "./registry-catalog.js";
 import {
   handleRegistryResolved,
   handleRegistryProviderDisable,
   handleRegistryEvents,
-} from './registry-resolved.js';
+} from "./registry-resolved.js";
 import {
   handleDiscoveryGet,
   handleDiscoveryRun,
-} from './registry-discovery.js';
-import { handleWorktrees, handleWorktreeDispose } from './worktrees.js';
-import { handleBotCommands } from './bot-commands.js';
-import { handleDesignCheck, handleDesignDirectionPost } from './design-check.js';
-import { handleDesignPreviews } from './design-previews-route.js';
-import { handleDesignSystemCreate } from './design-system-create-route.js';
-import { handleHitlAuditRecent, handleHitlTestPushcut } from './hitl-pushcut-settings.js';
-import { handleWorkflowRoute } from './workflow-router.js';
-import { handleSkillRoute } from './skill-router.js';
-import { dispatchMutation } from './tabs-mutations.js';
-import { handleTemplatesList, handleTemplateGet, handleTemplateSave } from './templates.js';
-import { handleMcpHttpPost } from './mcp-http.js';
-import { handleMcpResourceGet, MCP_RESOURCE_ROUTE_PATH } from './mcp-resource-route.js';
+} from "./registry-discovery.js";
+import { handleWorktrees, handleWorktreeDispose } from "./worktrees.js";
+import { handleBotCommands } from "./bot-commands.js";
+import {
+  handleDesignCheck,
+  handleDesignDirectionPost,
+} from "./design-check.js";
+import { handleDesignPreviews } from "./design-previews-route.js";
+import { handleDesignSystemCreate } from "./design-system-create-route.js";
+import {
+  handleHitlAuditRecent,
+  handleHitlTestPushcut,
+} from "./hitl-pushcut-settings.js";
+import { handleWorkflowRoute } from "./workflow-router.js";
+import { handleSkillRoute } from "./skill-router.js";
+import { dispatchMutation } from "./tabs-mutations.js";
+import {
+  handleTemplatesList,
+  handleTemplateGet,
+  handleTemplateSave,
+} from "./templates.js";
+import { handleMcpHttpPost } from "./mcp-http.js";
+import {
+  handleMcpResourceGet,
+  MCP_RESOURCE_ROUTE_PATH,
+} from "./mcp-resource-route.js";
 // ⛔ 라우트 상수를 «디스패처»가 안 쓰고 문자열로 베끼고 있었다(16차 실측) — 잎에서 읽는다.
-import { APPROVALS_MERGES_PATH, DESIGN_DIRECTION_PATH, DESIGN_PREVIEW_PATH_PREFIX, DESIGN_PREVIEWS_PATH, DESIGN_SYSTEM_PATH, IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
-import { handleMergeApprovals } from './merge-approvals.js';
-import { GRAPH_APPROVALS_PATH, handleGraphApprovals } from './graph-approvals.js';
-import { handleExecRequests } from './exec-requests.js';
-import { handleSeatRequests, SEAT_REQUESTS_PATH, type SeatRequestsDeps } from './seat-requests.js';
-import { handleConsultRequests, CONSULT_REQUESTS_PATH, type ConsultRequestsDeps } from './consult-requests.js';
-import { ExecRequestRunner } from '../../exec-requests/runner.js';
-import { FIELD_SERVER_MAX_BODY_BYTES, FIELD_UPLOADS_PATH, FIELD_REEL_PATH, FIELD_REEL_FILE_PATH, handleFieldUploads, handleAppUploads, isAppUploadsPath } from './field-uploads.js';
-import { createAppUpload } from '../apps/app-upload.js';
-import { resolveStorageConfig } from '../../storage/object-store.js';
-import { handleLiveDetail, LIVE_DETAIL_PATH } from './live-detail.js';
-import { handleLiveShipped, LIVE_SHIPPED_PATH } from './live-shipped.js';
-import { handleMcpWidgetCall, MCP_WIDGET_CALL_ROUTE_PATH, persistWidgetTurnToSessionStore } from './mcp-widget-call-route.js';
-import type { McpClientsHandle } from '../boot/register-mcp-clients.js';
-import { mcpUnauthorizedResponse, oauthRegistrationRejected } from './mcp-oauth-hint.js';
-import { handleTabLogs } from './logs.js';
+import {
+  APPROVALS_MERGES_PATH,
+  DESIGN_DIRECTION_PATH,
+  DESIGN_PREVIEW_PATH_PREFIX,
+  DESIGN_PREVIEWS_PATH,
+  DESIGN_SYSTEM_PATH,
+  IPA_PATH_PREFIX,
+  MANIFEST_PATH,
+} from "./rest-route-paths.js";
+import { handleMergeApprovals } from "./merge-approvals.js";
+import {
+  GRAPH_APPROVALS_PATH,
+  handleGraphApprovals,
+} from "./graph-approvals.js";
+import { handleExecRequests } from "./exec-requests.js";
+import {
+  handleSeatRequests,
+  SEAT_REQUESTS_PATH,
+  type SeatRequestsDeps,
+} from "./seat-requests.js";
+import {
+  handleConsultRequests,
+  CONSULT_REQUESTS_PATH,
+  type ConsultRequestsDeps,
+} from "./consult-requests.js";
+import { ExecRequestRunner } from "../../exec-requests/runner.js";
+import {
+  FIELD_SERVER_MAX_BODY_BYTES,
+  FIELD_UPLOADS_PATH,
+  FIELD_REEL_PATH,
+  FIELD_REEL_FILE_PATH,
+  handleFieldUploads,
+  handleAppUploads,
+  isAppUploadsPath,
+} from "./field-uploads.js";
+import { createAppUpload } from "../apps/app-upload.js";
+import { resolveStorageConfig } from "../../storage/object-store.js";
+import { handleLiveDetail, LIVE_DETAIL_PATH } from "./live-detail.js";
+import { handleLiveShipped, LIVE_SHIPPED_PATH } from "./live-shipped.js";
+import {
+  handleMcpWidgetCall,
+  MCP_WIDGET_CALL_ROUTE_PATH,
+  persistWidgetTurnToSessionStore,
+} from "./mcp-widget-call-route.js";
+import type { McpClientsHandle } from "../boot/register-mcp-clients.js";
+import {
+  mcpUnauthorizedResponse,
+  oauthRegistrationRejected,
+} from "./mcp-oauth-hint.js";
+import { handleTabLogs } from "./logs.js";
 import {
   handleConfigGet,
   handleSwitchesList,
@@ -271,7 +443,7 @@ import {
   handleSecretDelete,
   handleSecretsList,
   type ConfigCtx,
-} from './config.js';
+} from "./config.js";
 import {
   handleBindingsList,
   handleBindingGet,
@@ -279,29 +451,37 @@ import {
   handleBindingPatch,
   handleBindingDelete,
   parseBindingPath,
-} from './registry.js';
+} from "./registry.js";
 import {
   handleEditInPwaPost,
   handleEditInPwaConsume,
   type EditInPwaCtx,
-} from './edit-in-pwa.js';
+} from "./edit-in-pwa.js";
 import {
   handleErrorDismiss,
   handleErrorGet,
   handleErrorsForTab,
   handleErrorsList,
   parseErrorsPath,
-} from './errors.js';
-import { handleChatBackendDetection } from './chat-backend-detection.js';
-import { handleChatFastPathConfig } from './chat-fast-path-config.js';
-import { connectInfoTokenAllowed, handleConnectInfoGet, handleConnectTokenMint, type ConnectInfoCtx } from './connect-info.js';
-import { handleStaticAppRequest, pathMatchesStaticPrefix } from './static-app.js';
+} from "./errors.js";
+import { handleChatBackendDetection } from "./chat-backend-detection.js";
+import { handleChatFastPathConfig } from "./chat-fast-path-config.js";
+import {
+  connectInfoTokenAllowed,
+  handleConnectInfoGet,
+  handleConnectTokenMint,
+  type ConnectInfoCtx,
+} from "./connect-info.js";
+import {
+  handleStaticAppRequest,
+  pathMatchesStaticPrefix,
+} from "./static-app.js";
 import {
   createWsBridge,
   type WsBridgeOpts,
   type WsHandlers,
   type BunServerLike,
-} from '../../boot/ws-bridge.js';
+} from "../../boot/ws-bridge.js";
 import {
   handleAttachmentGet,
   handleMediaGet,
@@ -316,29 +496,47 @@ import {
   handleIntakeIdRoute,
   handleIntakeListGet,
   handleIntakePost,
-} from './meta-api.js';
-import { handleIntakePipelinePreviewPost } from './intake-pipeline-preview.js';
-import { handleIntakePipelineCommitPost } from './intake-pipeline-commit.js';
-import { handleIntakeRoutePost } from './intake-route.js';
-import { corsPreflight, jsonResponse } from './json-response.js';
-import { isPublicRoute } from './public-routes.js';
-import { handleSchedulesActionPost } from './schedules-action.js';
-import { handleSchedulesList, handleScheduleDetail, handleScheduleRuns } from './schedules-read.js';
-import { handleIntakeRunsList } from './intake-runs.js';
-import { handleSessionsStoreList, handleSessionsStoreGet, handleSessionsStoreFork, handleSessionsStoreDelete, handleSessionsStorePatch } from './sessions-store.js';
-import { handleLogsQuery, handleLogsStream, handleLogsLevelGet, handleLogsLevelPost, handleLogsFacets, handleLogsHistogram, handleLogsInstances } from './log-fabric.js';
-import { handleTrace, handleTraceEvidence } from './trace.js';
-import { handleDispatchRunsList } from './dispatch-runs.js';
+} from "./meta-api.js";
+import { handleIntakePipelinePreviewPost } from "./intake-pipeline-preview.js";
+import { handleIntakePipelineCommitPost } from "./intake-pipeline-commit.js";
+import { handleIntakeRoutePost } from "./intake-route.js";
+import { corsPreflight, jsonResponse } from "./json-response.js";
+import { isPublicRoute } from "./public-routes.js";
+import { handleSchedulesActionPost } from "./schedules-action.js";
+import {
+  handleSchedulesList,
+  handleScheduleDetail,
+  handleScheduleRuns,
+} from "./schedules-read.js";
+import { handleIntakeRunsList } from "./intake-runs.js";
+import {
+  handleSessionsStoreList,
+  handleSessionsStoreGet,
+  handleSessionsStoreFork,
+  handleSessionsStoreDelete,
+  handleSessionsStorePatch,
+} from "./sessions-store.js";
+import {
+  handleLogsQuery,
+  handleLogsStream,
+  handleLogsLevelGet,
+  handleLogsLevelPost,
+  handleLogsFacets,
+  handleLogsHistogram,
+  handleLogsInstances,
+} from "./log-fabric.js";
+import { handleTrace, handleTraceEvidence } from "./trace.js";
+import { handleDispatchRunsList } from "./dispatch-runs.js";
 import {
   handleWorkflowLifecycleGet,
   handleWorkflowLifecyclePut,
-} from './workflow-lifecycle.js';
+} from "./workflow-lifecycle.js";
 import {
   handleWorkflowPinsList,
   handleWorkflowPinGet,
   handleWorkflowPinPut,
   handleWorkflowPinDelete,
-} from './workflow-pins.js';
+} from "./workflow-pins.js";
 import {
   handleAgentStatusPost,
   handleHudSegmentPost,
@@ -365,19 +563,25 @@ import {
   setupBearerScopeDenied,
   registerAuthPeerAddress,
   type MetaApiOpts,
-} from './meta-api.js';
+} from "./meta-api.js";
 // Surface-unification v2.2 V2.2-6 v2 (2026-05-11) — scheduler list /
 // detail endpoint pair retired together with the dashboard scheduler
 // view. Tasks-only handlers remain in `tasks-scheduler.ts` (rename to
 // `tasks.ts` deferred to a follow-up).
+import { handleTasksList, handleTaskDetail } from "./tasks-scheduler.js";
 import {
-  handleTasksList,
-  handleTaskDetail,
-} from './tasks-scheduler.js';
-import { handleTaskCardsGet, handleTaskCardsWishPost, handleTaskCardsClosePost } from './task-cards-api.js';
-import { boardCardNexusEvent, handleBoardRoute, resolveVerifiedMemberOwner, type BoardApiDeps } from './board-api.js';
-import { handleTaskCreatePost, handleTaskApprovePost } from './tasks-create.js';
-import { matchIngestAuthorization } from './ingest-token.js';
+  handleTaskCardsGet,
+  handleTaskCardsWishPost,
+  handleTaskCardsClosePost,
+} from "./task-cards-api.js";
+import {
+  boardCardNexusEvent,
+  handleBoardRoute,
+  resolveVerifiedMemberOwner,
+  type BoardApiDeps,
+} from "./board-api.js";
+import { handleTaskCreatePost, handleTaskApprovePost } from "./tasks-create.js";
+import { matchIngestAuthorization } from "./ingest-token.js";
 import {
   handleWorkflowApprovalApprove,
   handleWorkflowApprovalReject,
@@ -393,28 +597,56 @@ import {
   handleWorkflowValidate,
   handleWorkflowGenerate,
   handleWorkflowSynth,
-} from './workflows.js';
-import { handleTriggersSnapshot } from './triggers.js';
-import { handleWorkflowTemplatesList } from './workflow-templates.js';
-import { graphAccessForRequest, handleGraphAccess, handleGraphAccessPut, handleGraphVersionsGet, handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
-import { handleGraphKindsGet, handleGraphsValidatePost } from './graph-kinds.js';
-import { handleGraphWizardPost, handleGraphWizardPacksGet } from './graph-wizard-api.js';
-import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nodes.js';
-import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove, handlePluginWizardList, handlePluginWizardSave } from './plugins-market.js';
-import { handlePluginsCredentialsGet, handlePluginsCredentialsPut } from './plugins-credentials-api.js';
-import { createConfiguredMembersApi, type MembersApi } from '../members/members-api.js';
-import { createMemberStore } from '../members/member-store.js';
-import { openDeploymentApprovalStore } from '../members/deployment-approval-store.js';
-import { openDeploymentGrantStore, type DeploymentGrantBinding } from '../members/deployment-grant-store.js';
-import { OFFICIAL_MEMBER_ORIGIN } from '../apps/app-build-local-bridge.js';
-import { nexusRootDir } from '../paths.js';
-import type { GraphCapabilityRegistry } from '../../graph-runner/capabilities.js';
-import type { MemberEventStore } from './member-event-store.js';
+} from "./workflows.js";
+import { handleTriggersSnapshot } from "./triggers.js";
+import { handleWorkflowTemplatesList } from "./workflow-templates.js";
 import {
-  handleWorkflowsList,
-} from './workflows.js';
-import { handleWorkflowsEvents } from './workflow-events.js';
+  graphAccessForRequest,
+  handleGraphAccess,
+  handleGraphAccessPut,
+  handleGraphVersionsGet,
+  handleGraphsGet,
+  handleGraphsMutation,
+} from "./graphs-api.js";
+import {
+  handleGraphKindsGet,
+  handleGraphsValidatePost,
+} from "./graph-kinds.js";
+import {
+  handleGraphWizardPost,
+  handleGraphWizardPacksGet,
+} from "./graph-wizard-api.js";
+import { syncInstalledPluginNodes } from "../../graph-kinds/installed-plugin-nodes.js";
+import { elanousStateRoot } from "../../autopilot/state-paths.js";
+import {
+  handlePluginsIndexGet,
+  handlePluginsGet,
+  handlePluginsMarketRefresh,
+  handlePluginsInstall,
+  handlePluginsRemove,
+  handlePluginWizardList,
+  handlePluginWizardSave,
+} from "./plugins-market.js";
+import {
+  handlePluginsCredentialsGet,
+  handlePluginsCredentialsPut,
+} from "./plugins-credentials-api.js";
+import {
+  createConfiguredMembersApi,
+  type MembersApi,
+} from "../members/members-api.js";
+import { createMemberStore } from "../members/member-store.js";
+import { openDeploymentApprovalStore } from "../members/deployment-approval-store.js";
+import {
+  openDeploymentGrantStore,
+  type DeploymentGrantBinding,
+} from "../members/deployment-grant-store.js";
+import { OFFICIAL_MEMBER_ORIGIN } from "../apps/app-build-local-bridge.js";
+import { nexusRootDir } from "../paths.js";
+import type { GraphCapabilityRegistry } from "../../graph-runner/capabilities.js";
+import type { MemberEventStore } from "./member-event-store.js";
+import { handleWorkflowsList } from "./workflows.js";
+import { handleWorkflowsEvents } from "./workflow-events.js";
 import {
   handleTerminalScrollback,
   handleTerminalControl,
@@ -435,28 +667,39 @@ import {
   parseTerminalRenamePath,
   parseTerminalsPrunePath,
   parseTerminalTerminatePath,
-  parseScrollbackPath, parseTerminalStreamPath, handleTerminalStream,
+  parseScrollbackPath,
+  parseTerminalStreamPath,
+  handleTerminalStream,
   parseFramePath,
   parsePngPath,
-} from './terminals.js';
+} from "./terminals.js";
 import {
   handleAgentCliCancel,
   handleAgentCliCloseSession,
   handleAgentCliCreateSession,
   handleAgentCliPromptStream,
   parseAgentCliSessionPath,
-} from './agent-cli.js';
-import { handleSessionTurnControl, SESSION_TURN_CONTROL_PATH } from '../../session/session-turn-control.js';
-import { authenticatePodCredential, handlePodGrokCredential, handlePodGithubCredential, POD_CREDENTIAL_GROK_PATH, POD_CREDENTIAL_GITHUB_PATH } from './pod-credential-api.js';
-import { handleOutboundReport } from './outbound-report.js';
-import { handleErrorReportIngest } from './error-reports.js';
-import { routeOutboundInProcess } from './outbound-report.js';
-import { handleSelfEvent } from './self-event.js';
+} from "./agent-cli.js";
+import {
+  handleSessionTurnControl,
+  SESSION_TURN_CONTROL_PATH,
+} from "../../session/session-turn-control.js";
+import {
+  authenticatePodCredential,
+  handlePodGrokCredential,
+  handlePodGithubCredential,
+  POD_CREDENTIAL_GROK_PATH,
+  POD_CREDENTIAL_GITHUB_PATH,
+} from "./pod-credential-api.js";
+import { handleOutboundReport } from "./outbound-report.js";
+import { handleErrorReportIngest } from "./error-reports.js";
+import { routeOutboundInProcess } from "./outbound-report.js";
+import { handleSelfEvent } from "./self-event.js";
 /** 매매 «실행»은 애드온이다(대표 09-20 결정 ③ · 별도 상용 저장소 · release/trading-export.yaml) — 공개 코어엔 없다.
  *  있으면 그 경로를 켜고, 없으면 501. 경로를 변수로 둬 공개본 타입 검사가 «모듈 없음»으로 막히지 않게 한다. */
-const TRADE_PROPOSAL_MODULE: string = './trade-proposal.js';
+const TRADE_PROPOSAL_MODULE: string = "./trade-proposal.js";
 /** PITCH-ROOM — 투자자 피치 방(덱·티저)은 비공개다(release/public-export.yaml 이 pitch-api 를 뺀다). 공개본엔 모듈이 없어 404. */
-const PITCH_MODULE: string = './pitch-api.js';
+const PITCH_MODULE: string = "./pitch-api.js";
 import {
   handleShowroomLayoutDelete,
   handleShowroomLayoutGet,
@@ -464,14 +707,25 @@ import {
   handleShowroomLayoutsEvents,
   handleShowroomLayoutsList,
   parseShowroomLayoutPath,
-} from './showroom-layouts.js';
-import { createAppHostScopedResolver } from './app-host-scoped-resolver.js';
+} from "./showroom-layouts.js";
+import { createAppHostScopedResolver } from "./app-host-scoped-resolver.js";
 
 /** Process-wide DRAFT-METRIC cache (one background collection per TTL, shared by every page load). */
 let sharedDraftMetrics: DraftMetricsSource | undefined;
 const NO_CAPABILITY_REGISTRY = {};
-const defaultMembersApiResolvers = new WeakMap<object, (appHost?: object) => MembersApi | null>();
-function defaultMembersApi(appHost?: object, capabilityProviders?: GraphCapabilityRegistry): MembersApi | null {
+const defaultMembersApiResolvers = new WeakMap<
+  object,
+  (appHost?: object) => MembersApi | null
+>();
+/** Per-appHost late-bound channel to the authenticated relay host connection. */
+const membersApiPublicHandlePins = new WeakMap<
+  object,
+  (handle: string, memberId: string) => void
+>();
+function defaultMembersApi(
+  appHost?: object,
+  capabilityProviders?: GraphCapabilityRegistry,
+): MembersApi | null {
   const key = capabilityProviders ?? NO_CAPABILITY_REGISTRY;
   let resolver = defaultMembersApiResolvers.get(key);
   if (!resolver) {
@@ -480,71 +734,138 @@ function defaultMembersApi(appHost?: object, capabilityProviders?: GraphCapabili
         const nexusAppHost = candidate as NexusAppHost | undefined;
         if (!process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim()) return null;
         const memberStore = createMemberStore();
-        const deploymentAuthority = nexusAppHost ? (() => {
-          const path = join(nexusRootDir(), 'members', 'deployment-authority.sqlite');
-          const approvalStore = openDeploymentApprovalStore(path);
-          const grantStore = openDeploymentGrantStore(path);
-          const resolveOwner = async (appSlug: string, token: string) => {
-            if (!token.startsWith('aps_')) return null;
-            const owner = resolveVerifiedOwner(nexusAppHost, appSlug, token, memberStore);
-            const slot = owner && memberStore.appSlotForMember(owner.memberId);
-            return owner && memberStore.activeForAuth(owner.memberId)
-              && slot?.appSlug === appSlug && owner.entitlements['relay.connect'] === true
-              ? { memberId: owner.memberId } : null;
-          };
-          const activeBinding = async (binding: DeploymentGrantBinding) => {
-            const slot = memberStore.appSlotForMember(binding.memberId);
-            const plan = memberStore.memberPlanForMember(binding.memberId);
-            return memberStore.activeForAuth(binding.memberId) && slot?.appSlug === binding.appSlug
-              && nexusAppHost.slugs.includes(binding.appSlug) && plan?.entitlements['relay.connect'] === true
-              && memberStore.isActiveMemberKeyId(binding.memberId, binding.relayKeyId);
-          };
-          const resolveBrowserOwner = async (request: Request, appSlug: string) => {
-            const cookie = request.headers.get('cookie') ?? '';
-            const token = cookie.split(';').map(part => part.trim())
-              .find(part => part.startsWith('__Host-elanous_member_session='))
-              ?.slice('__Host-elanous_member_session='.length);
-            if (!token) return null;
-            const member = memberStore.memberForSession(decodeURIComponent(token));
-            const slot = member && memberStore.appSlotForMember(member.id);
-            return member && memberStore.activeForAuth(member.id) && slot?.appSlug === appSlug
-              && nexusAppHost.slugs.includes(appSlug) ? { memberId: member.id } : null;
-          };
-          return {
-            deploymentGrants: { store: grantStore, resolveOwner, activeBinding },
-            deploymentApprovals: { store: approvalStore, officialOrigin: OFFICIAL_MEMBER_ORIGIN,
-              resolveOwner, resolveBrowserOwner, activeBinding },
-          };
-        })() : undefined;
+        const deploymentAuthority = nexusAppHost
+          ? (() => {
+              const path = join(
+                nexusRootDir(),
+                "members",
+                "deployment-authority.sqlite",
+              );
+              const approvalStore = openDeploymentApprovalStore(path);
+              const grantStore = openDeploymentGrantStore(path);
+              const resolveOwner = async (appSlug: string, token: string) => {
+                if (!token.startsWith("aps_")) return null;
+                const owner = resolveVerifiedOwner(
+                  nexusAppHost,
+                  appSlug,
+                  token,
+                  memberStore,
+                );
+                const slot =
+                  owner && memberStore.appSlotForMember(owner.memberId);
+                return owner &&
+                  memberStore.activeForAuth(owner.memberId) &&
+                  slot?.appSlug === appSlug &&
+                  owner.entitlements["relay.connect"] === true
+                  ? { memberId: owner.memberId }
+                  : null;
+              };
+              const activeBinding = async (binding: DeploymentGrantBinding) => {
+                const slot = memberStore.appSlotForMember(binding.memberId);
+                const plan = memberStore.memberPlanForMember(binding.memberId);
+                return (
+                  memberStore.activeForAuth(binding.memberId) &&
+                  slot?.appSlug === binding.appSlug &&
+                  nexusAppHost.slugs.includes(binding.appSlug) &&
+                  plan?.entitlements["relay.connect"] === true &&
+                  memberStore.isActiveMemberKeyId(
+                    binding.memberId,
+                    binding.relayKeyId,
+                  )
+                );
+              };
+              const resolveBrowserOwner = async (
+                request: Request,
+                appSlug: string,
+              ) => {
+                const cookie = request.headers.get("cookie") ?? "";
+                const token = cookie
+                  .split(";")
+                  .map((part) => part.trim())
+                  .find((part) =>
+                    part.startsWith("__Host-elanous_member_session="),
+                  )
+                  ?.slice("__Host-elanous_member_session=".length);
+                if (!token) return null;
+                const member = memberStore.memberForSession(
+                  decodeURIComponent(token),
+                );
+                const slot = member && memberStore.appSlotForMember(member.id);
+                return member &&
+                  memberStore.activeForAuth(member.id) &&
+                  slot?.appSlug === appSlug &&
+                  nexusAppHost.slugs.includes(appSlug)
+                  ? { memberId: member.id }
+                  : null;
+              };
+              return {
+                deploymentGrants: {
+                  store: grantStore,
+                  resolveOwner,
+                  activeBinding,
+                },
+                deploymentApprovals: {
+                  store: approvalStore,
+                  officialOrigin: OFFICIAL_MEMBER_ORIGIN,
+                  resolveOwner,
+                  resolveBrowserOwner,
+                  activeBinding,
+                },
+              };
+            })()
+          : undefined;
         return createConfiguredMembersApi({
           store: memberStore,
           ...(deploymentAuthority ?? {}),
-          ...(nexusAppHost ? {
-            issueOwnerSession: (appId, memberId) => nexusAppHost.issueOwnerSession(appId, memberId),
-            resolveVerifiedOwner: (appSlug, credential, members) => resolveVerifiedOwner(nexusAppHost, appSlug, credential, members),
-            resolveVerifiedMemberOwner: (credential, members) => resolveVerifiedAppMemberOwner(nexusAppHost, credential, members),
-            publicAppUrl: slot => {
-              try {
-                const userSlug = resolvePublicAppUserId();
-                if (!userSlug || !nexusAppHost.slugs.includes(slot.appSlug)) return null;
-                return `${publicAppAddress({ appSlug: slot.appSlug, userSlug })}/`;
-              } catch { return null; }
-            },
-          } : {}),
+          pinPublicHandle: candidate
+            ? (handle, memberId) =>
+                membersApiPublicHandlePins.get(candidate)?.(handle, memberId)
+            : undefined,
+          ...(nexusAppHost
+            ? {
+                issueOwnerSession: (appId, memberId) =>
+                  nexusAppHost.issueOwnerSession(appId, memberId),
+                resolveVerifiedOwner: (appSlug, credential, members) =>
+                  resolveVerifiedOwner(
+                    nexusAppHost,
+                    appSlug,
+                    credential,
+                    members,
+                  ),
+                resolveVerifiedMemberOwner: (credential, members) =>
+                  resolveVerifiedAppMemberOwner(
+                    nexusAppHost,
+                    credential,
+                    members,
+                  ),
+                publicAppUrl: (slot) => {
+                  try {
+                    const userSlug = resolvePublicAppUserId();
+                    if (!userSlug || !nexusAppHost.slugs.includes(slot.appSlug))
+                      return null;
+                    return `${publicAppAddress({ appSlug: slot.appSlug, userSlug })}/`;
+                  } catch {
+                    return null;
+                  }
+                },
+              }
+            : {}),
           ...(capabilityProviders ? { capabilityProviders } : {}),
         });
-      } catch { return null; }
+      } catch {
+        return null;
+      }
     });
     defaultMembersApiResolvers.set(key, resolver);
   }
   return resolver(appHost);
 }
 
-export const NEXUS_HTTP_PORT_RANGE = 16;     // try 31415..31430
+export const NEXUS_HTTP_PORT_RANGE = 16; // try 31415..31430
 /** Short timeout for the pre-bind localhost occupancy probe. */
 export const NEXUS_PORT_PROBE_TIMEOUT_MS = 400;
 
-export type NexusPortProbeVerdict = 'occupied' | 'available';
+export type NexusPortProbeVerdict = "occupied" | "available";
 /** Injectable pre-bind probe. Failures and timeouts fail-open as available.
  *  The scan stays synchronous, so probes must return a verdict directly. */
 export type NexusPortProbe = (port: number) => NexusPortProbeVerdict;
@@ -554,7 +875,7 @@ export function nexusPortProbeUrl(port: number): string {
 }
 
 function readProbeVerdict(result: unknown): NexusPortProbeVerdict {
-  return result === 'occupied' ? 'occupied' : 'available';
+  return result === "occupied" ? "occupied" : "available";
 }
 
 /** Default occupancy probe used by `startNexusHttpServer`: a short-timeout
@@ -572,36 +893,42 @@ export function probeNexusHttpPort(
   timeoutMs: number = NEXUS_PORT_PROBE_TIMEOUT_MS,
 ): NexusPortProbeVerdict {
   const url = JSON.stringify(nexusPortProbeUrl(port));
-  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0
-    ? timeoutMs
-    : NEXUS_PORT_PROBE_TIMEOUT_MS;
+  const timeout =
+    Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : NEXUS_PORT_PROBE_TIMEOUT_MS;
   try {
     const result = spawnSync(
       process.execPath,
-      ['-e', `await fetch(${url}, { signal: AbortSignal.timeout(${timeout}), redirect: 'manual' }); process.stdout.write('occupied');`],
-      { encoding: 'utf8', timeout: timeout + 500 },
+      [
+        "-e",
+        `await fetch(${url}, { signal: AbortSignal.timeout(${timeout}), redirect: 'manual' }); process.stdout.write('occupied');`,
+      ],
+      { encoding: "utf8", timeout: timeout + 500 },
     );
-    return (result.stdout ?? '').trim() === 'occupied' ? 'occupied' : 'available';
+    return (result.stdout ?? "").trim() === "occupied"
+      ? "occupied"
+      : "available";
   } catch {
-    return 'available';
+    return "available";
   }
 }
 
 /** Subset of WsBridgeOpts that the caller supplies — hostname/port are
  *  filled in by the http-server itself once the bind succeeds. */
-export type NexusWsBridgeInit = Omit<WsBridgeOpts, 'hostname' | 'port'>;
+export type NexusWsBridgeInit = Omit<WsBridgeOpts, "hostname" | "port">;
 
 export interface NexusHttpServerOpts {
   /** Test seam for HQ's read-only release ledger; production reads this Nexus instance's checklist. */
   checklistReader?: (version: string) => Checklist;
   /** Grant metadata supplied by the host; without it credential health remains unmeasured. */
-  credentialHealthObserver?: import('../config/secrets/cred-health.js').CredentialHealthObserver;
+  credentialHealthObserver?: import("../config/secrets/cred-health.js").CredentialHealthObserver;
   /** ABSORB-INGEST owner-scoped scraps API; production wiring supplies the NM-1 session resolver and existing extractors. */
-  scraps?: Omit<ScrapsRouteOptions, 'resolveOwner'>;
+  scraps?: Omit<ScrapsRouteOptions, "resolveOwner">;
   /** Optional fabric-plan ledger and decomposition seam; production uses the instance root and existing fabric decomposer. */
   fabricPlans?: FabricPlansRouteOpts;
   /** GRAPH-WIZARD 시험 주입(LLM·템플릿 뿌리). 운영은 비워 둔다. */
-  graphWizard?: import('../../graph-wizard/generate.js').GraphWizardDeps;
+  graphWizard?: import("../../graph-wizard/generate.js").GraphWizardDeps;
   /** Roots the remote folder picker may browse (default: the daemon user's home). Tests inject a temp root. */
   projectFolderRoots?: string[];
   /** Optional installer state root for isolated API consumers and tests. */
@@ -615,13 +942,13 @@ export interface NexusHttpServerOpts {
   loopResources?: Parameters<typeof handleLoopResourcesGet>[0];
   /** DRAFT-METRIC cached source seam; omitted in production for the process-wide TTL cache. */
   draftMetrics?: DraftMetricsSource;
-  decisions?: Pick<DecisionsRouteDeps, 'ledger'>;
-  opsBoard?: Pick<OpsBoardDeps, 'openStore'>;
+  decisions?: Pick<DecisionsRouteDeps, "ledger">;
+  opsBoard?: Pick<OpsBoardDeps, "openStore">;
   /** `GET /api/task-agent/board` 의 원장 경로 — 생략하면 인스턴스의 task-agent-actions.json. */
   taskAgentStatePath?: string;
   cardFollowup?: CardFollowupJobs;
   /** GRAPH-RUN-DETACHED stage 1a: start a graph run owned by this process, outside any turn (bearer only). */
-  graphRuns?: Pick<GraphRunsRouteDeps, 'host'>;
+  graphRuns?: Pick<GraphRunsRouteDeps, "host">;
   skillExec?: SkillExecJobs;
   execRequests?: ExecRequestRunner;
   seatRequests?: SeatRequestsDeps;
@@ -663,15 +990,15 @@ export interface NexusHttpServerOpts {
   /** Explicit TLS terminator proof for loopback HTTP forwarded by a trusted local edge. */
   trustedTlsEdge?: TrustedTlsEdge;
   /** Server-side fake upstream and ledger sink for route-level proxy simulations. */
-  llmProxySimulation?: Pick<HqLlmProxyDeps, 'run' | 'record'>;
+  llmProxySimulation?: Pick<HqLlmProxyDeps, "run" | "record">;
   /** Main capability registry shared by member routes and graph-runner consumers. */
   capabilityProviders?: GraphCapabilityRegistry;
   /** Nexus state-directory event journal shared by `store.events@1` and member board routes. */
   boardEventStore?: MemberEventStore;
   /** Test-world LLM response seam; production uses the configured operating provider. */
-  shareSummaryGenerator?: import('./share-summary-requests.js').ShareSummaryRequestOptions['generateSummary'];
+  shareSummaryGenerator?: import("./share-summary-requests.js").ShareSummaryRequestOptions["generateSummary"];
   /** Plugin-owned handler for an explicitly approved member card. */
-  boardApprovalDispatch?: BoardApiDeps['dispatchApproved'];
+  boardApprovalDispatch?: BoardApiDeps["dispatchApproved"];
   /** Resolves the asynchronously booted configured MCP clients on each resource request. */
   getMcpClients?: () => McpClientsHandle | undefined;
   /** 대표 2026-09-10 — `POST /v1/nexus/admin/mcp-reload` 의 실행부.
@@ -709,7 +1036,9 @@ export interface NexusHttpServerOpts {
   /** Simulation-only UI projection, isolated from the live lifecycle ledger. */
   appSimulationSnapshot?: (appSlug: string) => AppSimulationSnapshot;
   /** Ordered app-scoped route handlers. Backends register here so host dispatch stays centralized. */
-  appRoutes?: readonly ((request: Request) => Response | undefined | Promise<Response | undefined>)[];
+  appRoutes?: readonly ((
+    request: Request,
+  ) => Response | undefined | Promise<Response | undefined>)[];
   /** Stable, non-identifying install-derived owner label used by the proposed simulation preview host. */
   appPreviewUserSlug?: string;
   /** P-2D.2 — runtime mutable ref for the dev-proxy upstream.
@@ -831,7 +1160,11 @@ export interface NexusHttpServerOpts {
       path: string;
       headers: Record<string, string | undefined>;
       body: string;
-    }) => Promise<{ status: number; body: string; headers?: Record<string, string> } | null>;
+    }) => Promise<{
+      status: number;
+      body: string;
+      headers?: Record<string, string>;
+    } | null>;
     isSelfVerifiedGraphWebhookRoute?: (method: string, path: string) => boolean;
     /** Surface-unification v2 — chat trigger dispatch. POST under
      *  `/v1/workflows/chat<path>` reaches the daemon's chat router,
@@ -849,7 +1182,14 @@ export interface NexusHttpServerOpts {
     } | null>;
     /** 넥서스 밖 텔레그램 폴러(`elanous telegram run`)가 받은 업데이트를 워크플로 트리거로 넘긴다
      *  — `POST /v1/workflows/telegram-dispatch` (bearer 필수). 폴러가 core 밖으로 나가도 트리거가 산다. */
-    dispatchTelegram?: (event: TelegramEvent) => Promise<Array<{ workflowName: string; nodeId: string; ok: boolean; error?: string }>>;
+    dispatchTelegram?: (event: TelegramEvent) => Promise<
+      Array<{
+        workflowName: string;
+        nodeId: string;
+        ok: boolean;
+        error?: string;
+      }>
+    >;
     /** V2.2-2 (2026-05-12) — hosted chat config lookup. The PWA
      *  hosted chat page calls `GET /v1/workflows/<name>/chat-config`
      *  on load to discover the chat trigger's POST path + streaming
@@ -860,7 +1200,7 @@ export interface NexusHttpServerOpts {
       nodeId: string;
       path: string;
       streaming: boolean;
-      sessionMode: 'stateless' | 'per-session';
+      sessionMode: "stateless" | "per-session";
       hostedUi: { enabled: boolean; requiresBearer: boolean };
     } | null;
   };
@@ -870,40 +1210,71 @@ export interface NexusHttpServer {
   port: number;
   hostname: string;
   url: string;
-  registerPublicApp?(input: Omit<AutoPublicAppRegistration, 'serverId'>): Promise<void>;
-  unregisterPublicApp?(input: Pick<AutoPublicAppRegistration, 'user' | 'app' | 'deploymentId' | 'grantId'>): Promise<void>;
+  registerPublicApp?(
+    input: Omit<AutoPublicAppRegistration, "serverId">,
+  ): Promise<void>;
+  unregisterPublicApp?(
+    input: Pick<
+      AutoPublicAppRegistration,
+      "user" | "app" | "deploymentId" | "grantId"
+    >,
+  ): Promise<void>;
+  pinPublicHandle?(user: string, memberId: string): Promise<void>;
   stop(): void;
 }
 
 /** Boot the HTTP API + (optionally) ACP/voice WS bridge. Returns the
  *  resolved port + a stop() thunk. Throws when the entire port range
  *  is exhausted. */
-export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer {
+export function startNexusHttpServer(
+  opts: NexusHttpServerOpts,
+): NexusHttpServer {
   // Resolve each member-owned app label from its private canonical slot binding.
   // Unbound legacy apps retain the configured host label; retired labels fail at appHost.
-  opts.appHost?.setPublicUserSlugResolver?.(appSlug =>
-    (opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders))?.publicUserSlugForApp?.(appSlug));
+  opts.appHost?.setPublicUserSlugResolver?.((appSlug) =>
+    (
+      opts.membersApi ??
+      defaultMembersApi(opts.appHost, opts.capabilityProviders)
+    )?.publicUserSlugForApp?.(appSlug),
+  );
   const startPort = opts.startPort ?? DEFAULT_NEXUS_HTTP_PORT;
   const range = opts.portRange ?? NEXUS_HTTP_PORT_RANGE;
-  const hostname = opts.hostname ?? '127.0.0.1';
+  const hostname = opts.hostname ?? "127.0.0.1";
   const portProbe = opts.portProbe ?? probeNexusHttpPort;
   const relayConfig = resolveNexusRelayConfig(getUserConfig());
   // Reject explicit malformed member mode before binding a listener, even if
   // the app host is currently absent and would otherwise disable the relay.
-  if (relayConfig.enabled && Boolean(relayConfig.memberNexusUrl) !== Boolean(relayConfig.memberKeyFile))
-    throw new Error('relay member Nexus URL and key file must be valid and configured together');
+  if (
+    relayConfig.enabled &&
+    Boolean(relayConfig.memberNexusUrl) !== Boolean(relayConfig.memberKeyFile)
+  )
+    throw new Error(
+      "relay member Nexus URL and key file must be valid and configured together",
+    );
   if (relayConfig.enabled && relayConfig.memberNexusUrl)
-    createRelayMemberTokenProvider({ nexusUrl: relayConfig.memberNexusUrl, readMemberKey: () => '' });
-  const relayConfigured = relayConfig.enabled && !!opts.appHost && !!relayConfig.url;
-  const memberKeyPath = relayConfigured && relayConfig.memberKeyFile
-    ? (isAbsolute(relayConfig.memberKeyFile) ? relayConfig.memberKeyFile : resolve(elanousConfigDir(), relayConfig.memberKeyFile))
-    : undefined;
-  const getMemberToken = relayConfigured && relayConfig.memberNexusUrl && memberKeyPath
-    ? createRelayMemberTokenProvider({ nexusUrl: relayConfig.memberNexusUrl,
-      readMemberKey: () => readRelayMemberKeyFile(memberKeyPath) }) : undefined;
+    createRelayMemberTokenProvider({
+      nexusUrl: relayConfig.memberNexusUrl,
+      readMemberKey: () => "",
+    });
+  const relayConfigured =
+    relayConfig.enabled && !!opts.appHost && !!relayConfig.url;
+  const memberKeyPath =
+    relayConfigured && relayConfig.memberKeyFile
+      ? isAbsolute(relayConfig.memberKeyFile)
+        ? relayConfig.memberKeyFile
+        : resolve(elanousConfigDir(), relayConfig.memberKeyFile)
+      : undefined;
+  const getMemberToken =
+    relayConfigured && relayConfig.memberNexusUrl && memberKeyPath
+      ? createRelayMemberTokenProvider({
+          nexusUrl: relayConfig.memberNexusUrl,
+          readMemberKey: () => readRelayMemberKeyFile(memberKeyPath),
+        })
+      : undefined;
   // P-2D.2 — every request reads from this ref. Admin endpoint
   // mutates it. When the caller didn't pass one we own the lifecycle.
-  const devProxyRef: DevProxyRuntimeRef = opts.devProxyRef ?? createDevProxyRuntimeRef();
+  const devProxyRef: DevProxyRuntimeRef =
+    opts.devProxyRef ?? createDevProxyRuntimeRef();
   const gridDataSource = createGridDataSource({ deps: opts.grid });
   const loopEdgesDataSource = createLoopEdgesDataSource();
 
@@ -914,14 +1285,14 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
     const port = startPort + i;
     let occupied = false;
     try {
-      occupied = readProbeVerdict(portProbe(port)) === 'occupied';
+      occupied = readProbeVerdict(portProbe(port)) === "occupied";
     } catch {
       occupied = false;
     }
     if (occupied) {
-      debug.log('nexus.http', 'port-occupied-skip', {
+      debug.log("nexus.http", "port-occupied-skip", {
         port,
-        reason: 'already answering',
+        reason: "already answering",
       });
       continue;
     }
@@ -938,7 +1309,13 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
           }
         : null;
       const bridge = wsBridgeInit
-        ? createWsBridge({ ...wsBridgeInit, hostname, port })
+        ? createWsBridge({
+            ...wsBridgeInit,
+            hostname,
+            port,
+            acpAudienceForUpgrade: (req) =>
+              requestDebugAudience(req, opts.metaApi),
+          })
         : null;
       const websocketHandler: WsHandlers | undefined = bridge?.websocket;
       // Bun's typed `Bun.serve` overloads disagree on the shape of
@@ -966,15 +1343,29 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
         // Bun 기본 128 MB 로는 현장 업로드(파일 200 MB · 요청 500 MB · JSON base64)가 못 들어온다.
         maxRequestBodySize: FIELD_SERVER_MAX_BODY_BYTES,
         fetch: async (req: Request, srv: unknown) =>
-          (await routeRequest(req, opts, srv as BunServerLike, bridge, devProxyRef, { hostname, port }, gridDataSource, loopEdgesDataSource)) ??
-          new Response(null, { status: 101 }),
+          (await routeRequest(
+            req,
+            opts,
+            srv as BunServerLike,
+            bridge,
+            devProxyRef,
+            { hostname, port },
+            gridDataSource,
+            loopEdgesDataSource,
+          )) ?? new Response(null, { status: 101 }),
         ...(websocketHandler ? { websocket: websocketHandler } : {}),
       } as unknown as Parameters<typeof Bun.serve>[0];
       server = Bun.serve(fetchOpts);
       // OB8 — this process now answers /v1/outbound itself; its own sendOutbound calls must not curl it.
       setInProcessOutbound(routeOutboundInProcess);
       // 데몬이 «실제로» 떴을 때만 재시작 복구(맡긴 일) — 주입된 러너(시험)는 건드리지 않는다.
-      if (!opts.execRequests) { try { execRequestRunner().reconcileInterrupted(); } catch { /* 복구 실패가 서버 기동을 막지 않는다 */ } }
+      if (!opts.execRequests) {
+        try {
+          execRequestRunner().reconcileInterrupted();
+        } catch {
+          /* 복구 실패가 서버 기동을 막지 않는다 */
+        }
+      }
       resolvedPort = port;
       break;
     } catch (err) {
@@ -990,10 +1381,13 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
     );
   }
 
-  const stopBoardEventSubscription = opts.boardEventStore?.subscribe?.(event => {
-    const nexusEvent = boardCardNexusEvent(event) ?? shareSummaryNexusEvent(event);
-    if (nexusEvent) pushEvent(opts.state, nexusEvent);
-  });
+  const stopBoardEventSubscription = opts.boardEventStore?.subscribe?.(
+    (event) => {
+      const nexusEvent =
+        boardCardNexusEvent(event) ?? shareSummaryNexusEvent(event);
+      if (nexusEvent) pushEvent(opts.state, nexusEvent);
+    },
+  );
 
   const url = `http://${hostname}:${resolvedPort}`;
   const stopInsideRelay = startInsideEventRelay();
@@ -1005,10 +1399,14 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
   let relayConnecting = false;
   if (relayConfig.enabled) {
     if (!opts.appHost || !relayConfig.url) {
-      debug.log('nexus.relay-host', 'disabled', { reason: !opts.appHost ? 'app-host-not-wired' : 'relay-url-missing' });
+      debug.log("nexus.relay-host", "disabled", {
+        reason: !opts.appHost ? "app-host-not-wired" : "relay-url-missing",
+      });
     } else {
       const identityPath = relayConfig.identityFile
-        ? (isAbsolute(relayConfig.identityFile) ? relayConfig.identityFile : resolve(elanousConfigDir(), relayConfig.identityFile))
+        ? isAbsolute(relayConfig.identityFile)
+          ? relayConfig.identityFile
+          : resolve(elanousConfigDir(), relayConfig.identityFile)
         : undefined;
       const scheduleRelayRetry = () => {
         if (serverStopped || relayRetryTimer) return;
@@ -1032,8 +1430,12 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
             daemonKeys: identity.daemonKeys,
             hostSigningKey: identity.hostSigningKey,
             ...(getMemberToken ? { getMemberToken } : {}),
-            handleRequest: request => opts.appHost!.handle(request),
-            onError: error => debug.log('nexus.relay-host', 'request-error', { serverId: identity.serverId, errorType: error.name }),
+            handleRequest: (request) => opts.appHost!.handle(request),
+            onError: (error) =>
+              debug.log("nexus.relay-host", "request-error", {
+                serverId: identity.serverId,
+                errorType: error.name,
+              }),
             onClose: scheduleRelayRetry,
             signal: controller.signal,
           });
@@ -1041,16 +1443,32 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
           else {
             relayConnection = connection;
             relayRetryDelayMs = 1_000;
-            debug.log('nexus.relay-host', 'connected', { serverId: connection.serverId });
+            debug.log("nexus.relay-host", "connected", {
+              serverId: connection.serverId,
+            });
+          }
+          if (opts.appHost && connection.pinPublicHandle) {
+            const pin = connection.pinPublicHandle.bind(connection);
+            membersApiPublicHandlePins.set(opts.appHost, (handle, memberId) => {
+              pin(handle, memberId).catch((error) =>
+                debug.log("nexus.relay-host", "handle-pin-failed", {
+                  errorType: error instanceof Error ? error.name : typeof error,
+                }),
+              );
+            });
           }
         } catch (error) {
-          debug.log('nexus.relay-host', 'connection-failed', {
+          debug.log("nexus.relay-host", "connection-failed", {
             errorType: error instanceof Error ? error.name : typeof error,
-            errorCode: error && typeof error === 'object' && 'code' in error ? String((error as { code: unknown }).code) : undefined,
+            errorCode:
+              error && typeof error === "object" && "code" in error
+                ? String((error as { code: unknown }).code)
+                : undefined,
           });
           scheduleRelayRetry();
         } finally {
-          if (relayAttemptController === controller) relayAttemptController = undefined;
+          if (relayAttemptController === controller)
+            relayAttemptController = undefined;
           relayConnecting = false;
         }
       };
@@ -1063,15 +1481,25 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
     url,
     registerPublicApp(input) {
       if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) {
-        return Promise.reject(new Error('relay app registration host is offline'));
+        return Promise.reject(
+          new Error("relay app registration host is offline"),
+        );
       }
       return relayConnection.registerPublicApp(input);
     },
     unregisterPublicApp(input) {
       if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) {
-        return Promise.reject(new Error('relay app registration host is offline'));
+        return Promise.reject(
+          new Error("relay app registration host is offline"),
+        );
       }
       return relayConnection.unregisterPublicApp(input);
+    },
+    pinPublicHandle(user, memberId) {
+      if (!relayConnection || relayConnection.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error("relay handle pin host is offline"));
+      }
+      return relayConnection.pinPublicHandle(user, memberId);
     },
     stop() {
       serverStopped = true;
@@ -1083,7 +1511,11 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
       relayConnection = undefined;
       stopInsideRelay();
       stopBoardEventSubscription?.();
-      try { server!.stop(true); } catch { /* idempotent */ }
+      try {
+        server!.stop(true);
+      } catch {
+        /* idempotent */
+      }
       loopEdgesDataSource.close();
       opts.appHost?.close();
       setInProcessOutbound(null);
@@ -1097,14 +1529,18 @@ export function handleProjectsGet(): Response {
 
 function isWithinRoot(path: string, root: string): boolean {
   const rel = relative(root, path);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 /** realpath-resolved folder-root allow-list; a missing root grants nothing. */
 function resolveFolderRoots(roots: string[]): string[] {
   const allowed: string[] = [];
   for (const root of roots) {
-    try { allowed.push(realpathSync(root)); } catch { /* a missing root grants nothing */ }
+    try {
+      allowed.push(realpathSync(root));
+    } catch {
+      /* a missing root grants nothing */
+    }
   }
   return allowed;
 }
@@ -1112,7 +1548,11 @@ function resolveFolderRoots(roots: string[]): string[] {
 /** Outcome of the folder-root allow-list check shared by the picker and project creation. */
 type FolderRootResolution =
   | { ok: true; path: string }
-  | { ok: false; error: 'folder_unavailable' | 'outside_allowed_roots'; status: 404 | 403 };
+  | {
+      ok: false;
+      error: "folder_unavailable" | "outside_allowed_roots";
+      status: 404 | 403;
+    };
 
 /**
  * Resolves a folder path against the allow-listed roots with realpath first,
@@ -1120,12 +1560,18 @@ type FolderRootResolution =
  * be resolved is unavailable (404); a resolved path outside every root is
  * refused (403).
  */
-function resolveWithinFolderRoots(requested: string, allowed: string[]): FolderRootResolution {
+function resolveWithinFolderRoots(
+  requested: string,
+  allowed: string[],
+): FolderRootResolution {
   let path: string;
-  try { path = realpathSync(requested); }
-  catch { return { ok: false, error: 'folder_unavailable', status: 404 }; }
-  if (!allowed.some(root => isWithinRoot(path, root))) {
-    return { ok: false, error: 'outside_allowed_roots', status: 403 };
+  try {
+    path = realpathSync(requested);
+  } catch {
+    return { ok: false, error: "folder_unavailable", status: 404 };
+  }
+  if (!allowed.some((root) => isWithinRoot(path, root))) {
+    return { ok: false, error: "outside_allowed_roots", status: 403 };
   }
   return { ok: true, path };
 }
@@ -1135,36 +1581,55 @@ function resolveWithinFolderRoots(requested: string, allowed: string[]): FolderR
  * Every path is resolved with realpath first, so `..` segments and symlinks cannot escape the roots;
  * dot-folders are hidden and symlinked entries that point outside the roots are not listed.
  */
-export function handleProjectFoldersGet(req: Request, roots: string[] = [homedir()]): Response {
+export function handleProjectFoldersGet(
+  req: Request,
+  roots: string[] = [homedir()],
+): Response {
   const allowed = resolveFolderRoots(roots);
-  if (allowed.length === 0) return jsonResponse({ error: 'folder_unavailable' }, 404);
-  const requested = new URL(req.url).searchParams.get('path') ?? allowed[0]!;
-  if (!isAbsolute(requested) || requested.includes('\0')) return jsonResponse({ error: 'invalid_folder' }, 400);
+  if (allowed.length === 0)
+    return jsonResponse({ error: "folder_unavailable" }, 404);
+  const requested = new URL(req.url).searchParams.get("path") ?? allowed[0]!;
+  if (!isAbsolute(requested) || requested.includes("\0"))
+    return jsonResponse({ error: "invalid_folder" }, 400);
   const resolved = resolveWithinFolderRoots(requested, allowed);
   if (!resolved.ok) {
-    if (resolved.status === 403) debug.log('nexus.projects', 'folders-refused', { reason: 'outside-roots' });
-    else debug.log('nexus.projects', 'folders-unavailable', { reason: 'missing' });
+    if (resolved.status === 403)
+      debug.log("nexus.projects", "folders-refused", {
+        reason: "outside-roots",
+      });
+    else
+      debug.log("nexus.projects", "folders-unavailable", { reason: "missing" });
     return jsonResponse({ error: resolved.error }, resolved.status);
   }
   const path = resolved.path;
   try {
-    if (!statSync(path).isDirectory()) return jsonResponse({ error: 'not_directory' }, 400);
+    if (!statSync(path).isDirectory())
+      return jsonResponse({ error: "not_directory" }, 400);
     const folders = readdirSync(path, { withFileTypes: true })
-      .filter(entry => {
-        if (entry.name.startsWith('.')) return false;
+      .filter((entry) => {
+        if (entry.name.startsWith(".")) return false;
         if (entry.isDirectory()) return true;
         if (!entry.isSymbolicLink()) return false;
         try {
           const target = realpathSync(join(path, entry.name));
-          return statSync(target).isDirectory() && allowed.some(root => isWithinRoot(target, root));
-        } catch { return false; }
+          return (
+            statSync(target).isDirectory() &&
+            allowed.some((root) => isWithinRoot(target, root))
+          );
+        } catch {
+          return false;
+        }
       })
-      .map(entry => ({ name: entry.name, path: join(path, entry.name) }))
+      .map((entry) => ({ name: entry.name, path: join(path, entry.name) }))
       .sort((a, b) => a.name.localeCompare(b.name));
     const atRoot = allowed.includes(path);
-    return jsonResponse({ path, parent: atRoot ? null : dirname(path), folders });
+    return jsonResponse({
+      path,
+      parent: atRoot ? null : dirname(path),
+      folders,
+    });
   } catch {
-    return jsonResponse({ error: 'folder_unavailable' }, 404);
+    return jsonResponse({ error: "folder_unavailable" }, 404);
   }
 }
 
@@ -1173,31 +1638,55 @@ export function handleProjectFoldersGet(req: Request, roots: string[] = [homedir
  * projectFolderRoots allow-list as the remote folder picker: realpath first,
  * so `..` segments and symlinks cannot persist a folder outside the roots.
  */
-export async function handleProjectsPost(req: Request, roots: string[] = [homedir()]): Promise<Response> {
+export async function handleProjectsPost(
+  req: Request,
+  roots: string[] = [homedir()],
+): Promise<Response> {
   let body: unknown;
-  try { body = await req.json(); }
-  catch { return jsonResponse({ error: 'invalid_json' }, 400); }
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return jsonResponse({ error: 'invalid_name' }, 400);
+  try {
+    body = await req.json();
+  } catch {
+    return jsonResponse({ error: "invalid_json" }, 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return jsonResponse({ error: "invalid_name" }, 400);
   }
   const { name, primaryFolder } = body as Record<string, unknown>;
-  if (typeof name !== 'string' || !name.trim() || name.length > 80) {
-    return jsonResponse({ error: 'invalid_name' }, 400);
+  if (typeof name !== "string" || !name.trim() || name.length > 80) {
+    return jsonResponse({ error: "invalid_name" }, 400);
   }
-  if (primaryFolder !== undefined && (typeof primaryFolder !== 'string' || !isAbsolute(primaryFolder))) {
-    return jsonResponse({ error: 'invalid_primary_folder' }, 400);
+  if (
+    primaryFolder !== undefined &&
+    (typeof primaryFolder !== "string" || !isAbsolute(primaryFolder))
+  ) {
+    return jsonResponse({ error: "invalid_primary_folder" }, 400);
   }
-  if (typeof primaryFolder === 'string') {
+  if (typeof primaryFolder === "string") {
     const allowed = resolveFolderRoots(roots);
-    if (allowed.length === 0) return jsonResponse({ error: 'folder_unavailable' }, 404);
+    if (allowed.length === 0)
+      return jsonResponse({ error: "folder_unavailable" }, 404);
     const resolved = resolveWithinFolderRoots(primaryFolder, allowed);
     if (!resolved.ok) {
-      if (resolved.status === 403) debug.log('nexus.projects', 'post-primary-folder-refused', { reason: 'outside-roots' });
-      else debug.log('nexus.projects', 'post-primary-folder-unavailable', { reason: 'missing' });
+      if (resolved.status === 403)
+        debug.log("nexus.projects", "post-primary-folder-refused", {
+          reason: "outside-roots",
+        });
+      else
+        debug.log("nexus.projects", "post-primary-folder-unavailable", {
+          reason: "missing",
+        });
       return jsonResponse({ error: resolved.error }, resolved.status);
     }
   }
-  return jsonResponse({ project: createProject({ name, ...(primaryFolder !== undefined ? { primaryFolder } : {}) }) }, 201);
+  return jsonResponse(
+    {
+      project: createProject({
+        name,
+        ...(primaryFolder !== undefined ? { primaryFolder } : {}),
+      }),
+    },
+    201,
+  );
 }
 
 function isPortBusy(err: unknown): boolean {
@@ -1206,8 +1695,8 @@ function isPortBusy(err: unknown): boolean {
   // alongside an SDK-side `.errno`. Fall back to message-string match
   // for runtimes that only stringify.
   const e = err as { code?: string; errno?: number; message?: string };
-  if (e.code === 'EADDRINUSE') return true;
-  if (e.errno === -48 || e.errno === -98) return true;     // darwin / linux
+  if (e.code === "EADDRINUSE") return true;
+  if (e.errno === -48 || e.errno === -98) return true; // darwin / linux
   const msg = e.message ?? String(err);
   return /EADDRINUSE|address already in use/i.test(msg);
 }
@@ -1224,45 +1713,81 @@ let cardFollowupJobs: CardFollowupJobs | undefined;
 function graphRunBearer(req: Request, opts: NexusHttpServerOpts): boolean {
   if (!opts.metaApi) return false;
   const kind = bearerCredential(req, opts.metaApi);
-  return kind === 'bearer-match' || kind === 'temp-token';
+  return kind === "bearer-match" || kind === "temp-token";
 }
 function defaultCardFollowupJobs(): CardFollowupJobs {
-  return cardFollowupJobs ??= createCardFollowupJobs();
+  return (cardFollowupJobs ??= createCardFollowupJobs());
 }
 
-const TASK_AGENT_BOARD_PATH = '/api/task-agent/board';
+const TASK_AGENT_BOARD_PATH = "/api/task-agent/board";
 
 let skillExecJobs: SkillExecJobs | undefined;
 function defaultSkillExecJobs(): SkillExecJobs {
-  return skillExecJobs ??= createSkillExecJobs();
+  return (skillExecJobs ??= createSkillExecJobs());
 }
 
-function secureMemberTransport(req: Request, opts: NexusHttpServerOpts, server: BunServerLike): boolean {
-  if (new URL(req.url).protocol === 'https:') return true;
+function secureMemberTransport(
+  req: Request,
+  opts: NexusHttpServerOpts,
+  server: BunServerLike,
+): boolean {
+  if (new URL(req.url).protocol === "https:") return true;
   const edge = opts.trustedTlsEdge;
-  if (!edge || new URL(req.url).protocol !== 'http:') return false;
-  const peer = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
-  if (peer !== '127.0.0.1' && peer !== '::1' && peer !== '::ffff:127.0.0.1') return false;
-  const offered = req.headers.get('x-elanous-tls-edge-secret');
-  return req.headers.get('x-forwarded-proto') === 'https'
-    && req.headers.get('x-forwarded-host') === new URL(edge.origin).host
-    && !!offered && compareTokenConstTime(offered, edge.secret);
+  if (!edge || new URL(req.url).protocol !== "http:") return false;
+  const peer = (
+    server as BunServerLike & {
+      requestIP?: (request: Request) => { address: string } | null;
+    }
+  ).requestIP?.(req)?.address;
+  if (peer !== "127.0.0.1" && peer !== "::1" && peer !== "::ffff:127.0.0.1")
+    return false;
+  const offered = req.headers.get("x-elanous-tls-edge-secret");
+  return (
+    req.headers.get("x-forwarded-proto") === "https" &&
+    req.headers.get("x-forwarded-host") === new URL(edge.origin).host &&
+    !!offered &&
+    compareTokenConstTime(offered, edge.secret)
+  );
 }
 
-function isResourceLedgerTransportSecure(req: Request, opts: NexusHttpServerOpts, server: BunServerLike): boolean {
+function isResourceLedgerTransportSecure(
+  req: Request,
+  opts: NexusHttpServerOpts,
+  server: BunServerLike,
+): boolean {
   if (secureMemberTransport(req, opts, server)) return true;
-  if (new URL(req.url).protocol !== 'http:') return false;
-  const peer = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
+  if (new URL(req.url).protocol !== "http:") return false;
+  const peer = (
+    server as BunServerLike & {
+      requestIP?: (request: Request) => { address: string } | null;
+    }
+  ).requestIP?.(req)?.address;
   if (!peer) return false;
   const url = new URL(req.url);
-  const host = req.headers.get('host') ?? url.host;
-  const loopbackPeer = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1' || /^127\./.test(peer);
-  const loopbackHost = (value: string): boolean => /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(value);
-  if (opts.allowInsecureResourceLedgerLoopbackForTests && loopbackPeer && loopbackHost(url.host) && loopbackHost(host)) return true;
-  const tailPeer = /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peer) || /^fd7a:115c:a1e0:/i.test(peer);
-  const tailHost = /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(host)
-    || /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host)
-    || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
+  const host = req.headers.get("host") ?? url.host;
+  const loopbackPeer =
+    peer === "127.0.0.1" ||
+    peer === "::1" ||
+    peer === "::ffff:127.0.0.1" ||
+    /^127\./.test(peer);
+  const loopbackHost = (value: string): boolean =>
+    /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(value);
+  if (
+    opts.allowInsecureResourceLedgerLoopbackForTests &&
+    loopbackPeer &&
+    loopbackHost(url.host) &&
+    loopbackHost(host)
+  )
+    return true;
+  const tailPeer =
+    /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peer) ||
+    /^fd7a:115c:a1e0:/i.test(peer);
+  const tailHost =
+    /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(
+      host,
+    ) ||
+    /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host) ||
+    /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
   return tailPeer && tailHost;
 }
 
@@ -1273,7 +1798,7 @@ export async function routeRequest(
   bridge: ReturnType<typeof createWsBridge> | null,
   devProxyRef: DevProxyRuntimeRef,
   bind: { hostname: string; port: number } = {
-    hostname: opts.hostname ?? '127.0.0.1',
+    hostname: opts.hostname ?? "127.0.0.1",
     port: opts.startPort ?? DEFAULT_NEXUS_HTTP_PORT,
   },
   gridDataSource?: GridDataSource,
@@ -1281,107 +1806,193 @@ export async function routeRequest(
 ): Promise<Response | undefined> {
   // Register peer context before any HTTP handler reaches checkAuth. Missing
   // requestIP is explicitly unknown so same-origin headers fail closed.
-  registerAuthPeerAddress(req, (server as BunServerLike & {
-    requestIP?: (request: Request) => { address: string } | null;
-  }).requestIP?.(req)?.address);
+  registerAuthPeerAddress(
+    req,
+    (
+      server as BunServerLike & {
+        requestIP?: (request: Request) => { address: string } | null;
+      }
+    ).requestIP?.(req)?.address,
+  );
   // NEXUS-APP-HOST-S1 — app host is a separate hostname/origin from the PWA.
   // Handle it before owner API routing; an app-host request must never reach /v1.
   const appResponse = opts.appHost?.handle(req);
-  const resolvedAppResponse = appResponse instanceof Promise ? await appResponse : appResponse;
+  const resolvedAppResponse =
+    appResponse instanceof Promise ? await appResponse : appResponse;
   if (resolvedAppResponse) return resolvedAppResponse;
   const requestPath = new URL(req.url).pathname;
-  const appVersionsMatch = /^\/v1\/apps\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\/versions(?:\/(checkpoints))?$/.exec(requestPath);
+  const appVersionsMatch =
+    /^\/v1\/apps\/([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\/versions(?:\/(checkpoints))?$/.exec(
+      requestPath,
+    );
   if (appVersionsMatch) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     const appId = appVersionsMatch[1]!;
-    if (!opts.appHost?.getManifest(appId)) return jsonResponse({ error: 'app-not-found' }, 404);
-    const saving = appVersionsMatch[2] === 'checkpoints';
-    if (req.method !== (saving ? 'POST' : 'GET')) return jsonResponse({ error: 'method-not-allowed' }, 405);
-    const environment = new URL(req.url).searchParams.get('environment');
-    if (environment !== null && environment !== 'simulation' && environment !== 'live') return jsonResponse({ error: 'invalid-environment' }, 400);
+    if (!opts.appHost?.getManifest(appId))
+      return jsonResponse({ error: "app-not-found" }, 404);
+    const saving = appVersionsMatch[2] === "checkpoints";
+    if (req.method !== (saving ? "POST" : "GET"))
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    const environment = new URL(req.url).searchParams.get("environment");
+    if (
+      environment !== null &&
+      environment !== "simulation" &&
+      environment !== "live"
+    )
+      return jsonResponse({ error: "invalid-environment" }, 400);
     let input: AppVersionCheckpointInput | undefined;
     if (saving) {
       try {
         const reader = req.body?.getReader();
-        if (!reader) throw new Error('invalid checkpoint');
-        let text = '';
+        if (!reader) throw new Error("invalid checkpoint");
+        let text = "";
         let bytes = 0;
         const decoder = new TextDecoder();
         for (;;) {
           const part = await reader.read();
           if (part.done) break;
           bytes += part.value.byteLength;
-          if (bytes > 4096) { await reader.cancel(); return jsonResponse({ error: 'checkpoint-too-large' }, 413); }
+          if (bytes > 4096) {
+            await reader.cancel();
+            return jsonResponse({ error: "checkpoint-too-large" }, 413);
+          }
           text += decoder.decode(part.value, { stream: true });
         }
         const body: unknown = JSON.parse(text + decoder.decode());
-        if (!body || typeof body !== 'object' || Array.isArray(body)
-          || Object.keys(body).some(key => !['eventId', 'trigger', 'summary', 'thumbnailObjectKey'].includes(key))) throw new Error('invalid checkpoint');
+        if (
+          !body ||
+          typeof body !== "object" ||
+          Array.isArray(body) ||
+          Object.keys(body).some(
+            (key) =>
+              !["eventId", "trigger", "summary", "thumbnailObjectKey"].includes(
+                key,
+              ),
+          )
+        )
+          throw new Error("invalid checkpoint");
         input = body as AppVersionCheckpointInput;
-      } catch { return jsonResponse({ error: 'invalid-checkpoint' }, 400); }
+      } catch {
+        return jsonResponse({ error: "invalid-checkpoint" }, 400);
+      }
     }
     let store: AppVersionStore | undefined;
     try {
       store = (opts.appVersionStore ?? openAppVersionStore)();
-      const result = saving ? { checkpoint: store.checkpoint(appId, input!) }
+      const result = saving
+        ? { checkpoint: store.checkpoint(appId, input!) }
         : { versions: store.list(appId, environment ?? undefined) };
       const response = jsonResponse(result, saving ? 201 : 200);
-      response.headers.set('cache-control', 'no-store');
+      response.headers.set("cache-control", "no-store");
       return response;
     } catch (error) {
-      if (error instanceof AppVersionConflict) return jsonResponse({ error: 'checkpoint-evidence-conflict' }, 409);
-      if (saving && error instanceof Error && error.message === 'invalid checkpoint') return jsonResponse({ error: 'invalid-checkpoint' }, 400);
-      debug.log('nexus.app-versions', 'store-unavailable', { appId });
-      return jsonResponse({ error: 'app-versions-unavailable' }, 503);
-    } finally { store?.close(); }
+      if (error instanceof AppVersionConflict)
+        return jsonResponse({ error: "checkpoint-evidence-conflict" }, 409);
+      if (
+        saving &&
+        error instanceof Error &&
+        error.message === "invalid checkpoint"
+      )
+        return jsonResponse({ error: "invalid-checkpoint" }, 400);
+      debug.log("nexus.app-versions", "store-unavailable", { appId });
+      return jsonResponse({ error: "app-versions-unavailable" }, 503);
+    } finally {
+      store?.close();
+    }
   }
 
-  if (requestPath === '/v1/apps') {
-    if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    if (!opts.appHost) return jsonResponse({ error: 'app-host-not-wired' }, 503);
+  if (requestPath === "/v1/apps") {
+    if (req.method !== "GET")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (!opts.appHost)
+      return jsonResponse({ error: "app-host-not-wired" }, 503);
     const requestOrigin = new URL(req.url).origin;
     const requestHost = new URL(req.url).hostname;
-    const consoleTarget = requestHost === 'console.elanous.ai' || requestHost.endsWith('.elanous.ai')
-      ? { kind: 'hosted' as const }
-      : { kind: 'local' as const, nexusOrigin: requestOrigin };
+    const consoleTarget =
+      requestHost === "console.elanous.ai" ||
+      requestHost.endsWith(".elanous.ai")
+        ? { kind: "hosted" as const }
+        : { kind: "local" as const, nexusOrigin: requestOrigin };
     let lifecycleBySlug: Map<string, AppLifecycleSnapshot | null>;
-    try { lifecycleBySlug = new Map(opts.appHost.slugs.map(slug => [slug, opts.appLifecycleSnapshot?.(slug) ?? null])); }
-    catch { return jsonResponse({ error: 'app-lifecycle-unavailable' }, 503); }
-    const simulationBySlug = new Map<string, AppSimulationSnapshot>(opts.appHost.slugs.map(slug => {
-      try { return [slug, opts.appSimulationSnapshot?.(slug) ?? { status: 'not-created', events: [], receipts: [] }]; }
-      catch { return [slug, { status: 'unavailable', events: [], receipts: [] }]; }
-    }));
-    const apps = opts.appHost.slugs.flatMap(slug => {
+    try {
+      lifecycleBySlug = new Map(
+        opts.appHost.slugs.map((slug) => [
+          slug,
+          opts.appLifecycleSnapshot?.(slug) ?? null,
+        ]),
+      );
+    } catch {
+      return jsonResponse({ error: "app-lifecycle-unavailable" }, 503);
+    }
+    const simulationBySlug = new Map<string, AppSimulationSnapshot>(
+      opts.appHost.slugs.map((slug) => {
+        try {
+          return [
+            slug,
+            opts.appSimulationSnapshot?.(slug) ?? {
+              status: "not-created",
+              events: [],
+              receipts: [],
+            },
+          ];
+        } catch {
+          return [slug, { status: "unavailable", events: [], receipts: [] }];
+        }
+      }),
+    );
+    const apps = opts.appHost.slugs.flatMap((slug) => {
       const manifest = opts.appHost!.getManifest(slug);
       if (!manifest) return [];
       let simulationHref: string | undefined;
       try {
         if (opts.appPreviewUserSlug) {
-          simulationHref = simulationPreviewAddress({ appSlug: slug, userSlug: opts.appPreviewUserSlug });
+          simulationHref = simulationPreviewAddress({
+            appSlug: slug,
+            userSlug: opts.appPreviewUserSlug,
+          });
         }
+      } catch {
+        /* An app slug may be valid locally but too long for the public relay host. */
       }
-      catch { /* An app slug may be valid locally but too long for the public relay host. */ }
-      return [{
-        slug,
-        name: manifest.title,
-        description: typeof manifest.description === 'string' ? manifest.description : '',
-        lifecycle: lifecycleBySlug.get(slug) ?? null,
-        backup: opts.appHost!.databaseBackupStatus?.(slug) ?? null,
-        // Simulation records live in a separate store and never change operational lifecycle state.
-        simulation: { ...simulationBySlug.get(slug)!, receipt: simulationBySlug.get(slug)!.receipts[0]?.id,
-          ...(simulationHref ? { href: simulationHref } : {}) },
-        production: { status: 'not-created', href: consoleAddress(consoleTarget) },
-      }];
+      return [
+        {
+          slug,
+          name: manifest.title,
+          description:
+            typeof manifest.description === "string"
+              ? manifest.description
+              : "",
+          lifecycle: lifecycleBySlug.get(slug) ?? null,
+          backup: opts.appHost!.databaseBackupStatus?.(slug) ?? null,
+          // Simulation records live in a separate store and never change operational lifecycle state.
+          simulation: {
+            ...simulationBySlug.get(slug)!,
+            receipt: simulationBySlug.get(slug)!.receipts[0]?.id,
+            ...(simulationHref ? { href: simulationHref } : {}),
+          },
+          production: {
+            status: "not-created",
+            href: consoleAddress(consoleTarget),
+          },
+        },
+      ];
     });
     return jsonResponse({ apps });
   }
   // Signed app-storage uploads use their own path so the bearer-authenticated
   // app API never shares credentials with the object PUT, but both endpoints
   // are consumers of the same appRoutes registry.
-  if (requestPath.startsWith('/v1/apps/') || requestPath.startsWith('/_app-storage/')) {
+  if (
+    requestPath.startsWith("/v1/apps/") ||
+    requestPath.startsWith("/_app-storage/")
+  ) {
     for (const appRoute of opts.appRoutes ?? []) {
       const response = await appRoute(req);
       if (response) return response;
@@ -1389,35 +2000,65 @@ export async function routeRequest(
   }
   // The agent-mission line is still used by mission-out and hand hooks. Its
   // scoped token and SSE event remain live even though mission CRUD routes retire.
-  if (new URL(req.url).pathname.startsWith('/v1/missions/')) {
+  if (new URL(req.url).pathname.startsWith("/v1/missions/")) {
     const root = opts.missionLineRoot ?? effectiveInstanceRoot();
-    const response = await handleMissionLineRequest(req, root, async (input, authority) => {
-      const { createMissionOutStore, MissionReplyStateError } = await import('../../agent-mission/mission-out.js');
-      const reply = await createMissionOutStore(root).reply(input.missionId, input.text, input.type === 'final', {
-        lineId: input.lineId,
-        ...(input.runId ? { runId: input.runId } : {}), ...(input.ptyId ? { ptyId: input.ptyId } : {}),
-        ...(input.replyTo ? { replyTo: input.replyTo } : {}),
-        attemptId: input.attemptId, agent: input.agent, lineType: input.type, source: input.source,
-        ...(input.kind ? { kind: input.kind } : {}),
-        ...(input.defaults ? { defaults: input.defaults } : {}),
-        ...(input.deadline ? { deadline: input.deadline } : {}),
-        ...(input.scope ? { scope: input.scope } : {}),
-        ...(input.stop !== undefined ? { stop: input.stop } : {}),
-        ...(input.priority ? { priority: input.priority } : {}),
-        ...(input.state ? { state: input.state } : {}), who: authority.who, what: authority.what,
-        ...(input.type === 'ask' || input.type === 'answer' || input.type === 'correct' ? { kind: input.type } : {}),
-      }).catch((error: unknown) => {
-        if (error instanceof MissionReplyStateError) throw new MissionLineHttpError(error.status);
-        throw error;
-      });
-      return { ...input, sequence: reply.sequence, createdAt: reply.createdAt, done: reply.done, ...(reply.deadline ? { deadline: reply.deadline } : {}), ...(reply.replyTo ? { replyTo: reply.replyTo } : {}), ...(reply.graphEvents ? { graphEvents: reply.graphEvents } : {}) };
-    }, (event) => {
-      pushEvent(opts.state, { kind: 'mission.line', detail: event as unknown as Record<string, unknown> });
-    });
+    const response = await handleMissionLineRequest(
+      req,
+      root,
+      async (input, authority) => {
+        const { createMissionOutStore, MissionReplyStateError } =
+          await import("../../agent-mission/mission-out.js");
+        const reply = await createMissionOutStore(root)
+          .reply(input.missionId, input.text, input.type === "final", {
+            lineId: input.lineId,
+            ...(input.runId ? { runId: input.runId } : {}),
+            ...(input.ptyId ? { ptyId: input.ptyId } : {}),
+            ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+            attemptId: input.attemptId,
+            agent: input.agent,
+            lineType: input.type,
+            source: input.source,
+            ...(input.kind ? { kind: input.kind } : {}),
+            ...(input.defaults ? { defaults: input.defaults } : {}),
+            ...(input.deadline ? { deadline: input.deadline } : {}),
+            ...(input.scope ? { scope: input.scope } : {}),
+            ...(input.stop !== undefined ? { stop: input.stop } : {}),
+            ...(input.priority ? { priority: input.priority } : {}),
+            ...(input.state ? { state: input.state } : {}),
+            who: authority.who,
+            what: authority.what,
+            ...(input.type === "ask" ||
+            input.type === "answer" ||
+            input.type === "correct"
+              ? { kind: input.type }
+              : {}),
+          })
+          .catch((error: unknown) => {
+            if (error instanceof MissionReplyStateError)
+              throw new MissionLineHttpError(error.status);
+            throw error;
+          });
+        return {
+          ...input,
+          sequence: reply.sequence,
+          createdAt: reply.createdAt,
+          done: reply.done,
+          ...(reply.deadline ? { deadline: reply.deadline } : {}),
+          ...(reply.replyTo ? { replyTo: reply.replyTo } : {}),
+          ...(reply.graphEvents ? { graphEvents: reply.graphEvents } : {}),
+        };
+      },
+      (event) => {
+        pushEvent(opts.state, {
+          kind: "mission.line",
+          detail: event as unknown as Record<string, unknown>,
+        });
+      },
+    );
     if (response) return response;
   }
   if (opts.metaApi && setupBearerScopeDenied(req, opts.metaApi)) {
-    return jsonResponse({ error: 'forbidden' }, 403);
+    return jsonResponse({ error: "forbidden" }, 403);
   }
 
   // PR c — try WS upgrade before HTTP routing. On undefined return the
@@ -1427,14 +2068,14 @@ export async function routeRequest(
   if (bridge) {
     const wsRes = bridge.tryUpgrade(req, server);
     if (wsRes !== undefined) return wsRes;
-    // wsRes === undefined here covers both "upgraded successfully"
-    // (path matched, Bun owns the response) and "path didn't match"
+    // wsRes === undefined here covers both 'upgraded successfully'
+    // (path matched, Bun owns the response) and 'path didn't match'
     // (continue HTTP routing). The path-match-but-upgraded case is
     // distinguished by Bun consuming the request — when upgrade()
     // returns true, the fetch handler's return is ignored. We pass
-    // through to HTTP routing for the "path didn't match" case.
+    // through to HTTP routing for the 'path didn't match' case.
     const url = new URL(req.url);
-    if (url.pathname === '/v1/acp' || url.pathname === '/v1/voice/ws') {
+    if (url.pathname === "/v1/acp" || url.pathname === "/v1/voice/ws") {
       // Path matched + bridge accepted → return undefined so Bun keeps
       // the upgraded socket. (Bun.serve's fetch handler is allowed to
       // return undefined when the socket has already been upgraded.)
@@ -1447,141 +2088,239 @@ export async function routeRequest(
 
   // Operator proxy credentials are distinct from the owner bearer. The ops handler
   // performs its own operatorSignal gate before reading any run or checklist data.
-  if (pathname === '/v1/ops' || pathname.startsWith('/v1/ops/')) {
+  if (pathname === "/v1/ops" || pathname.startsWith("/v1/ops/")) {
     return handleOpsApi(req, opts.metaApi);
   }
   // PITCH-ROOM — same operatorSignal gate, inside the (private-only) pitch module.
-  if (pathname.startsWith('/v1/pitch/')) {
-    let pitch: { handlePitchApi(req: Request, metaApi: typeof opts.metaApi): Response };
+  if (pathname.startsWith("/v1/pitch/")) {
+    let pitch: {
+      handlePitchApi(req: Request, metaApi: typeof opts.metaApi): Response;
+    };
     try {
-      pitch = await import(PITCH_MODULE) as typeof pitch;
+      pitch = (await import(PITCH_MODULE)) as typeof pitch;
     } catch {
-      return jsonResponse({ error: 'not-found' }, 404);
+      return jsonResponse({ error: "not-found" }, 404);
     }
     return pitch.handlePitchApi(req, opts.metaApi);
   }
   const pluginGraphRun = /^\/v1\/graph-plugins\/([^/]+)\/run$/.exec(pathname);
   if (pluginGraphRun) {
-    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (method !== "POST")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     const signal = operatorSignal(req, opts.metaApi);
     const credential = bearerCredential(req, opts.metaApi);
-    if (!signal.operator || (signal.operatorSource !== 'op-proxy' && credential !== 'bearer-match' && credential !== 'temp-token'))
-      return jsonResponse({ error: 'forbidden' }, 403);
+    if (
+      !signal.operator ||
+      (signal.operatorSource !== "op-proxy" &&
+        credential !== "bearer-match" &&
+        credential !== "temp-token")
+    )
+      return jsonResponse({ error: "forbidden" }, 403);
     return handlePluginGraphApiRun(req, pluginGraphRun[1]!);
   }
   // CGE-RUN — 편집기 «실행»은 운영자 전용이다: 사용자 그래프가 셸 노드를 부를 수 있으므로 같은 출처 무토큰 통과는 받지 않는다
   // (운영자 프록시 헤더 · owner bearer 일치 · owner 가 발급한 짧은 임시 토큰만 — 명시 토큰은 언제나 필요).
   if (/^\/v1\/graphs\/[^/]+\/(?:run|runs\/[^/]+)$/.test(pathname)) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     const signal = operatorSignal(req, opts.metaApi);
     const credential = bearerCredential(req, opts.metaApi);
-    if (!signal.operator || (signal.operatorSource !== 'op-proxy' && credential !== 'bearer-match' && credential !== 'temp-token')) {
-      debug.log('graphs.run', 'refused', { path: pathname, source: signal.operatorSource });
-      return jsonResponse({ error: 'forbidden' }, 403);
+    if (
+      !signal.operator ||
+      (signal.operatorSource !== "op-proxy" &&
+        credential !== "bearer-match" &&
+        credential !== "temp-token")
+    ) {
+      debug.log("graphs.run", "refused", {
+        path: pathname,
+        source: signal.operatorSource,
+      });
+      return jsonResponse({ error: "forbidden" }, 403);
     }
     const routed = handleGraphRunRoute(method, pathname);
     if (routed) return routed;
-    return jsonResponse({ error: 'method-not-allowed' }, 405);
+    return jsonResponse({ error: "method-not-allowed" }, 405);
   }
 
   // Warm-pool pool declarations are authoritative in the Nexus resource ledger.
   // Machine credentials can read only declarations that include their host; owner bearer can publish declarations.
-  if (pathname === '/v1/resource-ledger/pools') {
-    if (method === 'GET') {
+  if (pathname === "/v1/resource-ledger/pools") {
+    if (method === "GET") {
       if (!isResourceLedgerTransportSecure(req, opts, server)) {
-        debug.log('resource-ledger.auth', 'request-refused', { reason: 'secure-transport-required' }, { level: 'warn' });
-        return jsonResponse({ error: 'secure-transport-required' }, 403);
+        debug.log(
+          "resource-ledger.auth",
+          "request-refused",
+          { reason: "secure-transport-required" },
+          { level: "warn" },
+        );
+        return jsonResponse({ error: "secure-transport-required" }, 403);
       }
-      const offered = req.headers.get('authorization');
-      const presented = offered?.startsWith('Bearer ') ? offered.slice(7).trim() : '';
-      const machine = presented ? machineForExpiringToken(presented, effectiveInstanceRoot()) : undefined;
+      const offered = req.headers.get("authorization");
+      const presented = offered?.startsWith("Bearer ")
+        ? offered.slice(7).trim()
+        : "";
+      const machine = presented
+        ? machineForExpiringToken(presented, effectiveInstanceRoot())
+        : undefined;
       if (!machine) {
-        debug.log('resource-ledger.auth', 'request-refused', { reason: 'unauthorized' }, { level: 'warn' });
-        return jsonResponse({ error: 'unauthorized' }, 401);
+        debug.log(
+          "resource-ledger.auth",
+          "request-refused",
+          { reason: "unauthorized" },
+          { level: "warn" },
+        );
+        return jsonResponse({ error: "unauthorized" }, 401);
       }
       return handleResourceLedgerPoolsApi(machine);
     }
-    if (method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleResourceLedgerPoolDeclarationPost(req);
     }
-    return jsonResponse({ error: 'method-not-allowed' }, 405);
+    return jsonResponse({ error: "method-not-allowed" }, 405);
   }
 
   // Host heartbeats are accepted only over the protected machine transport and are bound to their expiring machine token.
-  if (pathname === '/v1/resource-ledger/host-readiness') {
-    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
-    if (!isResourceLedgerTransportSecure(req, opts, server)) return jsonResponse({ error: 'secure-transport-required' }, 403);
-    const offered = req.headers.get('authorization');
-    const presented = offered?.startsWith('Bearer ') ? offered.slice(7).trim() : '';
-    const machine = presented ? machineForExpiringToken(presented, effectiveInstanceRoot()) : undefined;
-    if (!machine) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/resource-ledger/host-readiness") {
+    if (method !== "POST")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (!isResourceLedgerTransportSecure(req, opts, server))
+      return jsonResponse({ error: "secure-transport-required" }, 403);
+    const offered = req.headers.get("authorization");
+    const presented = offered?.startsWith("Bearer ")
+      ? offered.slice(7).trim()
+      : "";
+    const machine = presented
+      ? machineForExpiringToken(presented, effectiveInstanceRoot())
+      : undefined;
+    if (!machine) return jsonResponse({ error: "unauthorized" }, 401);
     return handleResourceLedgerHostReadinessPost(req, machine);
   }
 
   if (pathname === HQ_LLM_PROXY_PATH) {
-    const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.get('authorization') ?? '')?.[1];
+    const bearer = /^Bearer\s+(\S+)$/i.exec(
+      req.headers.get("authorization") ?? "",
+    )?.[1];
     // A short-lived member bearer still carries paid capability and request content.
     // Never accept it over remote plaintext, even inside the tailnet.
-    if (bearer?.startsWith('emt_') && !secureMemberTransport(req, opts, server))
-      return jsonResponse({ error: 'secure-transport-required' }, 403);
-    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
-    const peer = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
-    const memberToken = membersApi?.memberForScope?.(req, 'llm.proxy', peer);
-    const host = req.headers.get('host') ?? new URL(req.url).host;
-    const tailPeer = !!peer && (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peer) || /^fd7a:115c:a1e0:/i.test(peer));
-    const tailHost = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(host)
-      || /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host) || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
+    if (bearer?.startsWith("emt_") && !secureMemberTransport(req, opts, server))
+      return jsonResponse({ error: "secure-transport-required" }, 403);
+    const membersApi =
+      opts.membersApi ??
+      defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    const peer = (
+      server as BunServerLike & {
+        requestIP?: (request: Request) => { address: string } | null;
+      }
+    ).requestIP?.(req)?.address;
+    const memberToken = membersApi?.memberForScope?.(req, "llm.proxy", peer);
+    const host = req.headers.get("host") ?? new URL(req.url).host;
+    const tailPeer =
+      !!peer &&
+      (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peer) ||
+        /^fd7a:115c:a1e0:/i.test(peer));
+    const tailHost =
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(
+        host,
+      ) ||
+      /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host) ||
+      /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
     return handleHqLlmProxy(req, {
       tailnet: () => tailPeer && tailHost,
-      authorize: request => !!memberToken || (!!opts.metaApi && opts.metaApi.noAuth !== true
-        && checkAuth(request, opts.metaApi) && bearerCredential(request, opts.metaApi) === 'bearer-match'),
-      machine: request => {
+      authorize: (request) =>
+        !!memberToken ||
+        (!!opts.metaApi &&
+          opts.metaApi.noAuth !== true &&
+          checkAuth(request, opts.metaApi) &&
+          bearerCredential(request, opts.metaApi) === "bearer-match"),
+      machine: (request) => {
         if (memberToken) return peer;
-        const token = request.headers.get('x-elanous-machine-token');
-        return token ? machineForExpiringToken(token, effectiveInstanceRoot()) : undefined;
+        const token = request.headers.get("x-elanous-machine-token");
+        return token
+          ? machineForExpiringToken(token, effectiveInstanceRoot())
+          : undefined;
       },
       record: opts.llmProxySimulation?.record ?? recordLlmProxyCall,
-      run: opts.llmProxySimulation?.run ?? (async (messages, llmOpts) => {
-        const configured = getUserConfig();
-        const billing = codexOAuthAvailable() ? 'subscription' as const : 'api' as const;
-        const model = llmOpts.model ?? 'gpt-6.1-terra';
-        if (!/^(?:gpt-|codex-)[A-Za-z0-9._-]+$/.test(model)) throw new Error('unsupported proxy model');
-        const provider = await getProviderForConfigAsync({ ...configured, llm: { ...configured.llm, provider: 'openai-codex', model, apiKey: undefined, baseUrl: undefined } }, model,
-          async id => id === 'OPENAI_API_KEY' ? await getSecretAsync('cred:openai.api_key') ?? await getSecretAsync(id) : getSecretAsync(id));
-        let usage: import('../../prompt-cache/types.js').LLMUsage = {};
-        async function* events() {
-          for await (const event of provider.streamChat!(messages, { ...llmOpts, signal: llmOpts.signal,
-            onUsage: value => { Object.assign(usage, value); } })) {
-            if (event.type === 'usage') Object.assign(usage, event.usage);
-            yield event;
+      run:
+        opts.llmProxySimulation?.run ??
+        (async (messages, llmOpts) => {
+          const configured = getUserConfig();
+          const billing = codexOAuthAvailable()
+            ? ("subscription" as const)
+            : ("api" as const);
+          const model = llmOpts.model ?? "gpt-6.1-terra";
+          if (!/^(?:gpt-|codex-)[A-Za-z0-9._-]+$/.test(model))
+            throw new Error("unsupported proxy model");
+          const provider = await getProviderForConfigAsync(
+            {
+              ...configured,
+              llm: {
+                ...configured.llm,
+                provider: "openai-codex",
+                model,
+                apiKey: undefined,
+                baseUrl: undefined,
+              },
+            },
+            model,
+            async (id) =>
+              id === "OPENAI_API_KEY"
+                ? ((await getSecretAsync("cred:openai.api_key")) ??
+                  (await getSecretAsync(id)))
+                : getSecretAsync(id),
+          );
+          let usage: import("../../prompt-cache/types.js").LLMUsage = {};
+          async function* events() {
+            for await (const event of provider.streamChat!(messages, {
+              ...llmOpts,
+              signal: llmOpts.signal,
+              onUsage: (value) => {
+                Object.assign(usage, value);
+              },
+            })) {
+              if (event.type === "usage") Object.assign(usage, event.usage);
+              yield event;
+            }
           }
-        }
-        return { events: events(), usage, billing };
-      }),
+          return { events: events(), usage, billing };
+        }),
     });
   }
 
-  if (pathname === '/v1/tokens/introspect') {
-    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
-    if (!secureMemberTransport(req, opts, server)) return jsonResponse({ error: 'secure-transport-required' }, 403);
-    const audience = new URL(req.url).searchParams.get('audience');
-    if (!audience || !/^[a-f0-9]{64}$/.test(audience)) return jsonResponse({ error: 'invalid-request' }, 400);
+  if (pathname === "/v1/tokens/introspect") {
+    if (method !== "POST")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (!secureMemberTransport(req, opts, server))
+      return jsonResponse({ error: "secure-transport-required" }, 403);
+    const audience = new URL(req.url).searchParams.get("audience");
+    if (!audience || !/^[a-f0-9]{64}$/.test(audience))
+      return jsonResponse({ error: "invalid-request" }, 400);
     const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost);
-    const member = membersApi?.memberForScope?.(req, 'relay.connect', audience);
+    const member = membersApi?.memberForScope?.(req, "relay.connect", audience);
     return member
-      ? new Response(JSON.stringify({ memberId: member.memberId }), { status: 200,
-        headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } })
-      : jsonResponse({ error: 'unauthorized' }, 401);
+      ? new Response(JSON.stringify({ memberId: member.memberId }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+          },
+        })
+      : jsonResponse({ error: "unauthorized" }, 401);
   }
-  if (pathname === '/v1/tokens') {
+  if (pathname === "/v1/tokens") {
     // The member key is long-lived. A loopback peer can also be a remote TLS edge,
     // so peer address alone cannot prove the client-to-edge leg was encrypted.
     if (!secureMemberTransport(req, opts, server))
-      return jsonResponse({ error: 'secure-transport-required' }, 403);
-    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
-    return membersApi?.handleToken ? membersApi.handleToken(req) : jsonResponse({ error: 'members-not-configured' }, 503);
+      return jsonResponse({ error: "secure-transport-required" }, 403);
+    const membersApi =
+      opts.membersApi ??
+      defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    return membersApi?.handleToken
+      ? membersApi.handleToken(req)
+      : jsonResponse({ error: "members-not-configured" }, 503);
   }
 
   // Default-deny for every `/v1/` path that is not on PUBLIC_ROUTES.
@@ -1592,147 +2331,292 @@ export async function routeRequest(
   // handlers answer it themselves, so the gate does not swallow it.
   // Without metaApi, only the owner bearer may reach these runtime-less
   // meta-API stubs. All other private paths remain default-denied.
-  const runtimeLessMetaRoute = !opts.metaApi && (
-    (method !== 'GET' && method !== 'OPTIONS'
-      && (pathname === '/v1/nexus/tabs' || pathname.startsWith('/v1/nexus/tabs/')))
-    || (method === 'GET' && (
-      ['/v1/simulations', '/v1/tools', '/v1/intake', '/v1/sessions', '/v1/control-signals', '/v1/turns/last/screenshot'].includes(pathname)
-      || pathname.startsWith('/v1/recordings/')
-    ))
-    || (method === 'POST' && (
-      ['/v1/intake', '/v1/sessions/external', '/v1/control-signals', '/v1/prompt'].includes(pathname)
-      || pathname.startsWith('/v1/hitl/callback/')
-    ))
+  const runtimeLessMetaRoute =
+    !opts.metaApi &&
+    ((method !== "GET" &&
+      method !== "OPTIONS" &&
+      (pathname === "/v1/nexus/tabs" ||
+        pathname.startsWith("/v1/nexus/tabs/"))) ||
+      (method === "GET" &&
+        ([
+          "/v1/simulations",
+          "/v1/tools",
+          "/v1/intake",
+          "/v1/sessions",
+          "/v1/control-signals",
+          "/v1/turns/last/screenshot",
+        ].includes(pathname) ||
+          pathname.startsWith("/v1/recordings/"))) ||
+      (method === "POST" &&
+        ([
+          "/v1/intake",
+          "/v1/sessions/external",
+          "/v1/control-signals",
+          "/v1/prompt",
+        ].includes(pathname) ||
+          pathname.startsWith("/v1/hitl/callback/"))));
+  const graphWebhookSelfVerified = isSelfVerifiedGraphWebhookRequest(
+    method,
+    pathname,
+    opts.workflowDaemon,
   );
-  const graphWebhookSelfVerified = isSelfVerifiedGraphWebhookRequest(method, pathname, opts.workflowDaemon);
   if (
-    method !== 'OPTIONS'
-    && pathname.startsWith('/v1/')
-    && !isPublicRoute(method, pathname, { setupMode: false })
-    && !graphWebhookSelfVerified
-    && !(pathname === '/v1/events' && (() => {
-      const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
-      return topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready' || topic === 'scrap.summary.result');
-    })())
+    method !== "OPTIONS" &&
+    pathname.startsWith("/v1/") &&
+    !isPublicRoute(method, pathname, { setupMode: false }) &&
+    !graphWebhookSelfVerified &&
+    !(
+      pathname === "/v1/events" &&
+      (() => {
+        const topics = (url.searchParams.get("topics") ?? "")
+          .split(",")
+          .map((topic) => topic.trim())
+          .filter(Boolean);
+        return (
+          topics.length > 0 &&
+          topics.every(
+            (topic) =>
+              topic === "board.card" ||
+              topic === "briefing.ready" ||
+              topic === "scrap.summary.result",
+          )
+        );
+      })()
+    )
   ) {
-    const fallbackToken = runtimeLessMetaRoute ? ensureAuthToken().token : undefined;
-    const offered = req.headers.get('authorization');
-    const fallbackAuthorized = fallbackToken !== undefined && offered?.startsWith('Bearer ') === true
-      && compareTokenConstTime(offered.slice('Bearer '.length).trim(), fallbackToken);
-    const graphPeerAuthorized = (method === 'GET' || method === 'PUT')
-      && graphAccessForRequest(pathname, method, offered?.startsWith('Bearer ') ? offered.slice(7).trim() : null);
-    const pluginOperator = method === 'GET' && !!opts.metaApi
-      && operatorSignal(req, opts.metaApi).operatorSource === 'op-proxy'
-      && hasDeclaredPluginHttpGet(BUILTIN_DIR, pathname);
-    if (!(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized) && !graphPeerAuthorized && !pluginOperator) {
-      const name = method === 'POST' && (pathname === '/v1/tasks' || pathname === '/v1/reports/ingest') && opts.metaApi
-        ? matchIngestAuthorization(req)?.name
-        : undefined;
+    const fallbackToken = runtimeLessMetaRoute
+      ? ensureAuthToken().token
+      : undefined;
+    const offered = req.headers.get("authorization");
+    const fallbackAuthorized =
+      fallbackToken !== undefined &&
+      offered?.startsWith("Bearer ") === true &&
+      compareTokenConstTime(
+        offered.slice("Bearer ".length).trim(),
+        fallbackToken,
+      );
+    const graphPeerAuthorized =
+      (method === "GET" || method === "PUT") &&
+      graphAccessForRequest(
+        pathname,
+        method,
+        offered?.startsWith("Bearer ") ? offered.slice(7).trim() : null,
+      );
+    const pluginOperator =
+      method === "GET" &&
+      !!opts.metaApi &&
+      operatorSignal(req, opts.metaApi).operatorSource === "op-proxy" &&
+      hasDeclaredPluginHttpGet(BUILTIN_DIR, pathname);
+    if (
+      !(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized) &&
+      !graphPeerAuthorized &&
+      !pluginOperator
+    ) {
+      const name =
+        method === "POST" &&
+        (pathname === "/v1/tasks" || pathname === "/v1/reports/ingest") &&
+        opts.metaApi
+          ? matchIngestAuthorization(req)?.name
+          : undefined;
       if (name === undefined) {
-        debug.log('nexus.auth', 'default-deny', { method, pathname });
+        debug.log("nexus.auth", "default-deny", { method, pathname });
         // MCP 클라이언트(Claude Code)에게는 «할 일»을 말한다 — 안 그러면 OAuth 로 가서 /register 405 를 만난다.
-        if (pathname === '/v1/mcp') return mcpUnauthorizedResponse(new URL(req.url).origin);
-        return jsonResponse({ error: 'unauthorized' }, 401);
+        if (pathname === "/v1/mcp")
+          return mcpUnauthorizedResponse(new URL(req.url).origin);
+        return jsonResponse({ error: "unauthorized" }, 401);
       }
-      debug.log('nexus.auth', 'ingest-token', { name, pathname });
+      debug.log("nexus.auth", "ingest-token", { name, pathname });
     }
   }
-  if (pathname.startsWith('/v1/members') || pathname.startsWith('/v1/member/keys') || pathname.startsWith('/v1/member/tokens')) {
-    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
-    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
-    const socketAddress = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
-    let networkKey = socketAddress ?? 'unknown';
+  if (
+    pathname.startsWith("/v1/members") ||
+    pathname.startsWith("/v1/member/keys") ||
+    pathname.startsWith("/v1/member/tokens")
+  ) {
+    const membersApi =
+      opts.membersApi ??
+      defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    if (!membersApi)
+      return jsonResponse({ error: "members-not-configured" }, 503);
+    const socketAddress = (
+      server as BunServerLike & {
+        requestIP?: (request: Request) => { address: string } | null;
+      }
+    ).requestIP?.(req)?.address;
+    let networkKey = socketAddress ?? "unknown";
     // This entry is served behind the local Caddy reverse proxy. Trust one
     // forwarded address only when the immediate socket is that loopback proxy;
     // never let a direct caller select another caller's rate bucket.
-    if (pathname.startsWith('/v1/members/connect/') && (socketAddress === '127.0.0.1' || socketAddress === '::1')) {
-      const forwarded = req.headers.get('x-forwarded-for');
-      const real = req.headers.get('x-real-ip');
+    if (
+      pathname.startsWith("/v1/members/connect/") &&
+      (socketAddress === "127.0.0.1" || socketAddress === "::1")
+    ) {
+      const forwarded = req.headers.get("x-forwarded-for");
+      const real = req.headers.get("x-real-ip");
       const candidate = forwarded ?? real;
-      networkKey = candidate && !candidate.includes(',') && candidate.trim() === candidate && isIP(candidate) !== 0
-        && (!forwarded || !real || real === forwarded) ? candidate : 'unknown';
+      networkKey =
+        candidate &&
+        !candidate.includes(",") &&
+        candidate.trim() === candidate &&
+        isIP(candidate) !== 0 &&
+        (!forwarded || !real || real === forwarded)
+          ? candidate
+          : "unknown";
     }
     // The trusted local TLS edge forwards an HTTP request to Bun. Only its
     // authenticated proof may restore the public HTTPS URL for approval pages.
-    const approvalId = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
-    const approvalPath = method === 'POST' && pathname === '/v1/members/deployment-approvals/intents'
-      || method === 'POST' && new RegExp(`^/v1/members/deployment-approvals/intents/${approvalId}/poll$`).test(pathname)
-      || method === 'GET' && new RegExp(`^/v1/members/deployment-approvals/${approvalId}$`).test(pathname)
-      || method === 'POST' && new RegExp(`^/v1/members/deployment-approvals/${approvalId}/approve$`).test(pathname);
-    const officialApprovalRequest = approvalPath && opts.trustedTlsEdge?.origin === OFFICIAL_MEMBER_ORIGIN
-      && new URL(req.url).protocol === 'http:' && secureMemberTransport(req, opts, server)
-      ? new Request(new URL(url.pathname + url.search, OFFICIAL_MEMBER_ORIGIN), req) : req;
-    const response = await membersApi.handle(officialApprovalRequest, networkKey);
+    const approvalId =
+      "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+    const approvalPath =
+      (method === "POST" &&
+        pathname === "/v1/members/deployment-approvals/intents") ||
+      (method === "POST" &&
+        new RegExp(
+          `^/v1/members/deployment-approvals/intents/${approvalId}/poll$`,
+        ).test(pathname)) ||
+      (method === "GET" &&
+        new RegExp(`^/v1/members/deployment-approvals/${approvalId}$`).test(
+          pathname,
+        )) ||
+      (method === "POST" &&
+        new RegExp(
+          `^/v1/members/deployment-approvals/${approvalId}/approve$`,
+        ).test(pathname));
+    const officialApprovalRequest =
+      approvalPath &&
+      opts.trustedTlsEdge?.origin === OFFICIAL_MEMBER_ORIGIN &&
+      new URL(req.url).protocol === "http:" &&
+      secureMemberTransport(req, opts, server)
+        ? new Request(
+            new URL(url.pathname + url.search, OFFICIAL_MEMBER_ORIGIN),
+            req,
+          )
+        : req;
+    const response = await membersApi.handle(
+      officialApprovalRequest,
+      networkKey,
+    );
     if (response) return response;
   }
-  if (pathname === '/v1/telegram/member-enrollment') {
-    if (method !== 'POST') return jsonResponse({ error: 'method not allowed' }, 405);
-    if (!opts.scraps) return jsonResponse({ error: 'scraps-not-wired' }, 503);
-    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
-    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
+  if (pathname === "/v1/telegram/member-enrollment") {
+    if (method !== "POST")
+      return jsonResponse({ error: "method not allowed" }, 405);
+    if (!opts.scraps) return jsonResponse({ error: "scraps-not-wired" }, 503);
+    const membersApi =
+      opts.membersApi ??
+      defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    if (!membersApi)
+      return jsonResponse({ error: "members-not-configured" }, 503);
     const headers = new Headers();
-    for (const name of ['cookie', 'origin', 'authorization']) {
+    for (const name of ["cookie", "origin", "authorization"]) {
       const value = req.headers.get(name);
       if (value) headers.set(name, value);
     }
-    const profileResponse = await membersApi.handle(new Request(new URL('/v1/members', req.url), { headers }), 'unknown');
-    const profile = profileResponse?.ok ? await profileResponse.json() as { member?: { id?: unknown } } : null;
+    const profileResponse = await membersApi.handle(
+      new Request(new URL("/v1/members", req.url), { headers }),
+      "unknown",
+    );
+    const profile = profileResponse?.ok
+      ? ((await profileResponse.json()) as { member?: { id?: unknown } })
+      : null;
     let memberId = profile?.member?.id;
-    if (typeof memberId !== 'string' || !memberId) {
-      const ownerResponse = await membersApi.handle(new Request(new URL('/v1/members/owner', req.url), { headers }), 'unknown');
-      const owner = ownerResponse?.ok ? await ownerResponse.json() as { memberId?: unknown } : null;
+    if (typeof memberId !== "string" || !memberId) {
+      const ownerResponse = await membersApi.handle(
+        new Request(new URL("/v1/members/owner", req.url), { headers }),
+        "unknown",
+      );
+      const owner = ownerResponse?.ok
+        ? ((await ownerResponse.json()) as { memberId?: unknown })
+        : null;
       memberId = owner?.memberId;
     }
-    if (typeof memberId !== 'string' || !memberId) return jsonResponse({ error: 'unauthorized' }, 401);
-    return jsonResponse({ code: issueTelegramMemberCode(opts.scraps.instanceRoot, memberId), expiresInSeconds: 600 });
+    if (typeof memberId !== "string" || !memberId)
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return jsonResponse({
+      code: issueTelegramMemberCode(opts.scraps.instanceRoot, memberId),
+      expiresInSeconds: 600,
+    });
   }
-  if (pathname === '/v1/scraps' || pathname === '/v1/scrap-folders'
-    || /^\/v1\/scrap-folders\/[a-f0-9-]{36}$/.test(pathname)
-    || /^\/v1\/scraps\/[a-f0-9]{16}\/(folder|class-date|export|retry)$/.test(pathname)) {
-    if (!opts.scraps) return jsonResponse({ error: 'scraps-not-wired' }, 503);
-    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
-    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
+  if (
+    pathname === "/v1/scraps" ||
+    pathname === "/v1/scrap-folders" ||
+    /^\/v1\/scrap-folders\/[a-f0-9-]{36}$/.test(pathname) ||
+    /^\/v1\/scraps\/[a-f0-9]{16}\/(folder|class-date|export|retry)$/.test(
+      pathname,
+    )
+  ) {
+    if (!opts.scraps) return jsonResponse({ error: "scraps-not-wired" }, 503);
+    const membersApi =
+      opts.membersApi ??
+      defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    if (!membersApi)
+      return jsonResponse({ error: "members-not-configured" }, 503);
     return handleScraps(req, {
       ...opts.scraps,
-      onSettled: opts.boardEventStore ? (memberId, scrapId) => publishAbsorbShareSummaryResults({
-        instanceRoot: opts.scraps!.instanceRoot, events: opts.boardEventStore!, memberId, scrapId,
-        generateSummary: opts.shareSummaryGenerator,
-      }) : undefined,
+      onSettled: opts.boardEventStore
+        ? (memberId, scrapId) =>
+            publishAbsorbShareSummaryResults({
+              instanceRoot: opts.scraps!.instanceRoot,
+              events: opts.boardEventStore!,
+              memberId,
+              scrapId,
+              generateSummary: opts.shareSummaryGenerator,
+            })
+        : undefined,
       resolveOwner: async (scrapRequest) => {
-        const ownerUrl = new URL('/v1/members/owner', scrapRequest.url);
+        const ownerUrl = new URL("/v1/members/owner", scrapRequest.url);
         const headers = new Headers();
-        for (const name of ['cookie', 'origin', 'authorization']) {
+        for (const name of ["cookie", "origin", "authorization"]) {
           const value = scrapRequest.headers.get(name);
           if (value) headers.set(name, value);
         }
-        const ownerRequest = new Request(ownerUrl, { method: 'GET', headers });
-        const ownerResponse = await membersApi.handle(ownerRequest, 'unknown');
+        const ownerRequest = new Request(ownerUrl, { method: "GET", headers });
+        const ownerResponse = await membersApi.handle(ownerRequest, "unknown");
         if (!ownerResponse?.ok) return null;
         let owner: unknown;
-        try { owner = await ownerResponse.json(); } catch { return null; }
-        if (!owner || typeof owner !== 'object' || typeof (owner as { memberId?: unknown }).memberId !== 'string') return null;
+        try {
+          owner = await ownerResponse.json();
+        } catch {
+          return null;
+        }
+        if (
+          !owner ||
+          typeof owner !== "object" ||
+          typeof (owner as { memberId?: unknown }).memberId !== "string"
+        )
+          return null;
         return { memberId: (owner as { memberId: string }).memberId };
       },
     });
   }
-  if (pathname === '/v1/scraps/summary-requests' || pathname.startsWith('/v1/scraps/summary-requests/')) {
-    if (!opts.scraps || !opts.boardEventStore) return jsonResponse({ error: 'summary-requests-not-wired' }, 503);
-    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
-    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
+  if (
+    pathname === "/v1/scraps/summary-requests" ||
+    pathname.startsWith("/v1/scraps/summary-requests/")
+  ) {
+    if (!opts.scraps || !opts.boardEventStore)
+      return jsonResponse({ error: "summary-requests-not-wired" }, 503);
+    const membersApi =
+      opts.membersApi ??
+      defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    if (!membersApi)
+      return jsonResponse({ error: "members-not-configured" }, 503);
     const api = createAbsorbShareSummaryRequestApi({
       instanceRoot: opts.scraps.instanceRoot,
       events: opts.boardEventStore,
       generateSummary: opts.shareSummaryGenerator,
-      ownerForRequest: async request => {
-        const owner = await resolveVerifiedShareSummaryOwner(request, membersApi);
+      ownerForRequest: async (request) => {
+        const owner = await resolveVerifiedShareSummaryOwner(
+          request,
+          membersApi,
+        );
         return owner?.memberId ?? null;
       },
     });
-    return (await api(req)) ?? jsonResponse({ error: 'not-found' }, 404);
+    return (await api(req)) ?? jsonResponse({ error: "not-found" }, 404);
   }
   // OAuth 동적 클라이언트 등록(RFC 7591) — Elanous 는 OAuth 를 쓰지 않는다. 405 대신 «이렇게 등록하라»를 돌려준다.
-  if (method === 'POST' && pathname === '/register') {
-    debug.log('nexus.auth', 'oauth-register-rejected', { pathname });
+  if (method === "POST" && pathname === "/register") {
+    debug.log("nexus.auth", "oauth-register-rejected", { pathname });
     return oauthRegistrationRejected(new URL(req.url).origin);
   }
 
@@ -1740,24 +2624,28 @@ export async function routeRequest(
   // its assets under `/app/*`, but browsers still probe the origin root
   // for `/favicon.ico` and bookmark `/`. Without these two handlers the
   // network panel always carries a noisy 404 on every fresh load, and
-  // typing the bare origin in the URL bar lands on a "not-found" JSON.
+  // typing the bare origin in the URL bar lands on a 'not-found' JSON.
   //
   //   GET /favicon.ico       → 204 No Content (silences the probe;
   //                            the PWA's own icon is wired via manifest
   //                            for the installed app surface)
   //   GET /                  → 302 → /app/  (one-hop to the SPA entry)
-  if (method === 'GET') {
-    if (pathname === '/favicon.ico') {
+  if (method === "GET") {
+    if (pathname === "/favicon.ico") {
       return new Response(null, { status: 204 });
     }
-    if (pathname === '/' || pathname === '') {
-      return new Response(null, { status: 302, headers: { location: '/app/' } });
+    if (pathname === "/" || pathname === "") {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "/app/" },
+      });
     }
     // ★ 미션 e4f97b(external-markdown) — 게시된 정적 HTML 서빙. POST /v1/publish/markdown 의 게시→열람
     //   왕복 완성. 공개 서빙(게시물은 공개가 목적·dist OTA 처럼 tailscale 경계가 접근제어). 404/410 매핑.
-    if (pathname.startsWith('/d/')) {
-      const id = pathname.slice(3).split('/')[0] ?? '';
-      const { handleMarkdownServe, getDefaultMarkdownPublishService } = await import('./markdown-publish.js');
+    if (pathname.startsWith("/d/")) {
+      const id = pathname.slice(3).split("/")[0] ?? "";
+      const { handleMarkdownServe, getDefaultMarkdownPublishService } =
+        await import("./markdown-publish.js");
       return handleMarkdownServe(id, getDefaultMarkdownPublishService());
     }
     // Stage B remote-install (2026-05-18) — ad-hoc IPA + manifest.plist
@@ -1766,133 +2654,203 @@ export async function routeRequest(
     // the auth gate; the Tailscale tailnet boundary is the access
     // control surface. See src/nexus/api/dist.ts for the full why.
     if (pathname === MANIFEST_PATH) {
-      const { handleDistManifest } = await import('./dist.js');
+      const { handleDistManifest } = await import("./dist.js");
       return handleDistManifest(req);
     }
-    if (pathname === `${IPA_PATH_PREFIX}install` || pathname === IPA_PATH_PREFIX) {
-      const { handleDistInstallPage } = await import('./dist.js');
+    if (
+      pathname === `${IPA_PATH_PREFIX}install` ||
+      pathname === IPA_PATH_PREFIX
+    ) {
+      const { handleDistInstallPage } = await import("./dist.js");
       return handleDistInstallPage(req);
     }
-    if (pathname.startsWith(IPA_PATH_PREFIX) && pathname.endsWith('.ipa')) {
-      const filename = decodeURIComponent(pathname.slice(IPA_PATH_PREFIX.length));
-      const { handleDistIpa } = await import('./dist.js');
+    if (pathname.startsWith(IPA_PATH_PREFIX) && pathname.endsWith(".ipa")) {
+      const filename = decodeURIComponent(
+        pathname.slice(IPA_PATH_PREFIX.length),
+      );
+      const { handleDistIpa } = await import("./dist.js");
       return handleDistIpa(req, filename);
     }
   }
 
   if (pathname === INSIDE_EVENTS_PATH) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleInsideEvents(req);
   }
 
-  const appInvitationMatch = /^\/v1\/nexus\/apps\/([a-z0-9-]+)\/invitations$/.exec(pathname);
+  const appInvitationMatch =
+    /^\/v1\/nexus\/apps\/([a-z0-9-]+)\/invitations$/.exec(pathname);
   if (appInvitationMatch) {
-    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    if (!opts.appHost) return jsonResponse({ error: 'app-host-not-wired' }, 503);
+    if (method !== "POST")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (!opts.appHost)
+      return jsonResponse({ error: "app-host-not-wired" }, 503);
     let body: unknown;
-    try { body = await req.json(); } catch { return jsonResponse({ error: 'invalid-json' }, 400); }
-    if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonResponse({ error: 'invalid-invitation' }, 400);
+    try {
+      body = await req.json();
+    } catch {
+      return jsonResponse({ error: "invalid-json" }, 400);
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body))
+      return jsonResponse({ error: "invalid-invitation" }, 400);
     const input = body as Record<string, unknown>;
-    if (typeof input.invitedBy !== 'string' || !input.invitedBy.trim()
-      || (input.role !== undefined && (typeof input.role !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(input.role)))
-      || (input.ttlMs !== undefined && (typeof input.ttlMs !== 'number' || !Number.isSafeInteger(input.ttlMs)))) {
-      return jsonResponse({ error: 'invalid-invitation' }, 400);
+    if (
+      typeof input.invitedBy !== "string" ||
+      !input.invitedBy.trim() ||
+      (input.role !== undefined &&
+        (typeof input.role !== "string" ||
+          !/^[a-z][a-z0-9_-]{0,63}$/.test(input.role))) ||
+      (input.ttlMs !== undefined &&
+        (typeof input.ttlMs !== "number" || !Number.isSafeInteger(input.ttlMs)))
+    ) {
+      return jsonResponse({ error: "invalid-invitation" }, 400);
     }
     try {
-      const invitation = opts.appHost.issueInvitation(appInvitationMatch[1]!, input.invitedBy, input.ttlMs as number | undefined, input.role as string | undefined);
+      const invitation = opts.appHost.issueInvitation(
+        appInvitationMatch[1]!,
+        input.invitedBy,
+        input.ttlMs as number | undefined,
+        input.role as string | undefined,
+      );
       return jsonResponse({ invitation }, 201);
     } catch {
-      return jsonResponse({ error: 'invalid-invitation' }, 400);
+      return jsonResponse({ error: "invalid-invitation" }, 400);
     }
   }
 
   if (pathname === LIVE_SHIPPED_PATH) {
-    return handleLiveShipped(req, { authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) });
+    return handleLiveShipped(req, {
+      authorize: (request) =>
+        !!opts.metaApi && checkAuth(request, opts.metaApi),
+    });
   }
   if (pathname === LIVE_DETAIL_PATH) {
     return handleLiveDetail(req, {
-      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      authorize: (request) =>
+        !!opts.metaApi && checkAuth(request, opts.metaApi),
     });
   }
 
   if (pathname === SEAT_REQUESTS_PATH) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleSeatRequests(req, opts.seatRequests);
   }
 
   if (pathname === CONSULT_REQUESTS_PATH) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleConsultRequests(req, opts.consultRequests);
   }
 
-  if (pathname === '/v1/exec-requests' || pathname.startsWith('/v1/exec-requests/')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (
+    pathname === "/v1/exec-requests" ||
+    pathname.startsWith("/v1/exec-requests/")
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     if (/^\/v1\/exec-requests\/[^/]+\/files\//.test(pathname)) {
       const credential = bearerCredential(req, opts.metaApi);
-      if (credential !== 'bearer-match' && credential !== 'temp-token') return jsonResponse({ error: 'unauthorized' }, 401);
+      if (credential !== "bearer-match" && credential !== "temp-token")
+        return jsonResponse({ error: "unauthorized" }, 401);
     }
     return handleExecRequests(req, opts.execRequests ?? execRequestRunner());
   }
 
-  if (pathname === GRAPH_APPROVALS_PATH || pathname.startsWith(`${GRAPH_APPROVALS_PATH}/`)) {
+  if (
+    pathname === GRAPH_APPROVALS_PATH ||
+    pathname.startsWith(`${GRAPH_APPROVALS_PATH}/`)
+  ) {
     return handleGraphApprovals(req, {
-      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
-      authReason: (request) => (opts.metaApi ? bearerCredential(request, opts.metaApi) : undefined),
+      authorize: (request) =>
+        !!opts.metaApi && checkAuth(request, opts.metaApi),
+      authReason: (request) =>
+        opts.metaApi ? bearerCredential(request, opts.metaApi) : undefined,
     });
   }
   if (isAppUploadsPath(pathname)) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) {
       return handleAppUploads(req, { authorize: () => false });
     }
-    const appUpload = createAppUpload({ config: resolveStorageConfig(getUserConfig() as Parameters<typeof resolveStorageConfig>[0]) });
+    const appUpload = createAppUpload({
+      config: resolveStorageConfig(
+        getUserConfig() as Parameters<typeof resolveStorageConfig>[0],
+      ),
+    });
     return handleAppUploads(req, {
-      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      authorize: (request) =>
+        !!opts.metaApi && checkAuth(request, opts.metaApi),
       appUpload,
     });
   }
   // 현장 업로드(owner 전용) — GET 목록 · POST 저장. 저장 규칙 정본 = src/field/field-media.ts.
-  if ((pathname === FIELD_UPLOADS_PATH && (method === 'GET' || method === 'POST'))
-    || ((pathname === FIELD_REEL_PATH || pathname === FIELD_REEL_FILE_PATH) && method === 'GET')) {
+  if (
+    (pathname === FIELD_UPLOADS_PATH &&
+      (method === "GET" || method === "POST")) ||
+    ((pathname === FIELD_REEL_PATH || pathname === FIELD_REEL_FILE_PATH) &&
+      method === "GET")
+  ) {
     return handleFieldUploads(req, {
-      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
-      configuredEvent: () => { try { return getUserConfig().telegram?.fieldDefaultEvent; } catch { return undefined; } },
+      authorize: (request) =>
+        !!opts.metaApi && checkAuth(request, opts.metaApi),
+      configuredEvent: () => {
+        try {
+          return getUserConfig().telegram?.fieldDefaultEvent;
+        } catch {
+          return undefined;
+        }
+      },
     });
   }
-  if (pathname === APPROVALS_MERGES_PATH || pathname.startsWith(`${APPROVALS_MERGES_PATH}/`)) {
+  if (
+    pathname === APPROVALS_MERGES_PATH ||
+    pathname.startsWith(`${APPROVALS_MERGES_PATH}/`)
+  ) {
     return handleMergeApprovals(req, {
-      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      authorize: (request) =>
+        !!opts.metaApi && checkAuth(request, opts.metaApi),
     });
   }
 
-  if (pathname === MCP_RESOURCE_ROUTE_PATH && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'mcp-resource-route-not-wired' }, 503);
+  if (pathname === MCP_RESOURCE_ROUTE_PATH && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "mcp-resource-route-not-wired" }, 503);
     return handleMcpResourceGet(req, {
       authorize: (request) => checkAuth(request, opts.metaApi!),
       getClients: () => opts.getMcpClients?.(),
     });
   }
 
-  if (pathname === MCP_WIDGET_CALL_ROUTE_PATH && method === 'POST') {
-    if (!opts.metaApi) return jsonResponse({ error: 'mcp-widget-call-route-not-wired' }, 503);
+  if (pathname === MCP_WIDGET_CALL_ROUTE_PATH && method === "POST") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "mcp-widget-call-route-not-wired" }, 503);
     return handleMcpWidgetCall(req, {
       authorize: (request) => checkAuth(request, opts.metaApi!),
       // Production boot supplies getMcpClients. A lone ready configured server
       // is the only trusted binding this route can infer without accepting a
       // request-provided server id; multiple servers fail closed until a caller
       // supplies an explicit trusted widget binding.
-      getTrustedServerId: opts.getMcpWidgetServerId ?? (() => {
-        const handle = opts.getMcpClients?.();
-        if (!handle) return undefined;
-        const readyServerIds = Object.entries(handle.perServer)
-          .filter(([, server]) => server.status === 'ready')
-          .map(([serverId]) => serverId);
-        return readyServerIds.length === 1 ? readyServerIds[0] : undefined;
-      }),
+      getTrustedServerId:
+        opts.getMcpWidgetServerId ??
+        (() => {
+          const handle = opts.getMcpClients?.();
+          if (!handle) return undefined;
+          const readyServerIds = Object.entries(handle.perServer)
+            .filter(([, server]) => server.status === "ready")
+            .map(([serverId]) => serverId);
+          return readyServerIds.length === 1 ? readyServerIds[0] : undefined;
+        }),
       getFeedbackEmitter: (sessionId) => {
-        const { getActiveAcpFeedbackBroadcaster } = require('../../acp/server.js') as
-          typeof import('../../acp/server.js');
-        return createFeedbackEmitter(opts.eventBus, sessionId, getActiveAcpFeedbackBroadcaster() ?? undefined);
+        const { getActiveAcpFeedbackBroadcaster } =
+          require("../../acp/server.js") as typeof import("../../acp/server.js");
+        return createFeedbackEmitter(
+          opts.eventBus,
+          sessionId,
+          getActiveAcpFeedbackBroadcaster() ?? undefined,
+        );
       },
       // ⛔⭐ 슬래시 명령으로 «시작한» 세션이 저장소에 안 생기던 자리(OBS-T521).
       //   클라이언트는 슬래시를 만나면 `/v1/prompt/stream` 을 건너뛰고 이 라우트로 곧장 온다 —
@@ -1909,21 +2867,22 @@ export async function routeRequest(
   // the rest of /v1/*.
   // MCP 전용 재장전 (대표 2026-09-10). GET-only 블록 «밖»이라 POST 가
   // 아래 mutation 관문보다 먼저 잡히며, 다른 privileged mutation처럼 bearer 인증을 요구한다.
-  if (pathname === '/v1/nexus/admin/mcp-reload') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/nexus/admin/mcp-reload") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     const mcpReloadRes = await tryHandleAdminMcpReload(req, url, {
       ...(opts.reloadMcpClients ? { reload: opts.reloadMcpClients } : {}),
     });
     if (mcpReloadRes) return mcpReloadRes;
   }
 
-  if (pathname === '/v1/nexus/admin/pwa-dev-proxy') {
-    return tryHandleAdminDevProxy(req, url, { ref: devProxyRef }).then((res) =>
-      res ?? jsonResponse({ error: 'not-found' }, 404),
+  if (pathname === "/v1/nexus/admin/pwa-dev-proxy") {
+    return tryHandleAdminDevProxy(req, url, { ref: devProxyRef }).then(
+      (res) => res ?? jsonResponse({ error: "not-found" }, 404),
     );
   }
 
-  if (pathname === OPENAI_RELAY_PATH && method === 'POST') {
+  if (pathname === OPENAI_RELAY_PATH && method === "POST") {
     return tryHandleOpenAiRelay(req, url);
   }
 
@@ -1943,12 +2902,14 @@ export async function routeRequest(
   // a workflow author has opted into surfacing via `hostedUi.enabled`.
   {
     const match = /^\/v1\/workflows\/([^/]+)\/chat-config\/?$/.exec(pathname);
-    if (match && method === 'GET') {
+    if (match && method === "GET") {
       const name = decodeURIComponent(match[1]!);
       const daemon = opts.workflowDaemon;
-      if (!daemon?.chatConfig) return jsonResponse({ error: 'workflow-daemon-not-wired' }, 503);
+      if (!daemon?.chatConfig)
+        return jsonResponse({ error: "workflow-daemon-not-wired" }, 503);
       const cfg = daemon.chatConfig(name);
-      if (!cfg) return jsonResponse({ error: 'not_found', workflow: name }, 404);
+      if (!cfg)
+        return jsonResponse({ error: "not_found", workflow: name }, 404);
       return jsonResponse(cfg, 200);
     }
   }
@@ -1959,10 +2920,11 @@ export async function routeRequest(
   // through to the 405 catch-all.
   {
     const match = /^\/v1\/workflows\/([^/]+)\/lifecycle\/?$/.exec(pathname);
-    if (match && (method === 'GET' || method === 'PUT')) {
+    if (match && (method === "GET" || method === "PUT")) {
       const name = decodeURIComponent(match[1]!);
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      if (method === 'GET') {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      if (method === "GET") {
         return handleWorkflowLifecycleGet(req, name, opts.metaApi);
       }
       return handleWorkflowLifecyclePut(req, name, opts.metaApi);
@@ -1973,102 +2935,152 @@ export async function routeRequest(
   // before method!=='GET' so PUT/DELETE don't fall through.
   {
     const listMatch = /^\/v1\/workflows\/([^/]+)\/pins\/?$/.exec(pathname);
-    if (listMatch && (method === 'GET' || method === 'DELETE')) {
+    if (listMatch && (method === "GET" || method === "DELETE")) {
       const name = decodeURIComponent(listMatch[1]!);
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      if (method === 'GET') return handleWorkflowPinsList(req, name, opts.metaApi);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      if (method === "GET")
+        return handleWorkflowPinsList(req, name, opts.metaApi);
       return handleWorkflowPinDelete(req, name, undefined, opts.metaApi);
     }
-    const itemMatch = /^\/v1\/workflows\/([^/]+)\/pins\/([^/]+)\/?$/.exec(pathname);
-    if (itemMatch && (method === 'GET' || method === 'PUT' || method === 'DELETE')) {
+    const itemMatch = /^\/v1\/workflows\/([^/]+)\/pins\/([^/]+)\/?$/.exec(
+      pathname,
+    );
+    if (
+      itemMatch &&
+      (method === "GET" || method === "PUT" || method === "DELETE")
+    ) {
       const name = decodeURIComponent(itemMatch[1]!);
       const nodeId = decodeURIComponent(itemMatch[2]!);
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      if (method === 'GET') return handleWorkflowPinGet(req, name, nodeId, opts.metaApi);
-      if (method === 'PUT') return handleWorkflowPinPut(req, name, nodeId, opts.metaApi);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      if (method === "GET")
+        return handleWorkflowPinGet(req, name, nodeId, opts.metaApi);
+      if (method === "PUT")
+        return handleWorkflowPinPut(req, name, nodeId, opts.metaApi);
       return handleWorkflowPinDelete(req, name, nodeId, opts.metaApi);
     }
   }
   // `POST /v1/workflows/chat<path>` → daemon's chat router (matches by
   // chatTrigger.path). Caught BEFORE the webhook catch-all because the
   // chat router has its own auth + body contract. POST-only.
-  if (pathname.startsWith('/v1/workflows/chat/') && method === 'POST') {
-    const chatPath = pathname.slice('/v1/workflows/chat'.length); // leading '/'
+  if (pathname.startsWith("/v1/workflows/chat/") && method === "POST") {
+    const chatPath = pathname.slice("/v1/workflows/chat".length); // leading '/'
     const daemon = opts.workflowDaemon;
     if (!daemon?.dispatchChat) {
-      return jsonResponse({ error: 'workflow-daemon-not-wired' }, 503);
+      return jsonResponse({ error: "workflow-daemon-not-wired" }, 503);
     }
-    return req.json().then(async (body: unknown) => {
-      const authorization = req.headers.get('authorization') ?? undefined;
-      const res = await daemon.dispatchChat!({
-        path: chatPath,
-        ...(authorization ? { authorization } : {}),
-        body: (body && typeof body === 'object' ? (body as { message?: string; sessionId?: string }) : {}),
-      });
-      if (!res) return jsonResponse({ error: 'workflow-daemon-not-started' }, 503);
-      // Surface-unification v2.1 (2026-05-11) — SSE response when the
-      // chat router returned a stream. Encode each frame as `event:
-      // <name>\ndata: <body>\n\n` per the SSE wire spec.
-      if (res.stream) {
-        const encoder = new TextEncoder();
-        // V2.2-1 (2026-05-12) — token frames carry raw chunks that may
-        // contain `\n`. SSE wire requires each line to start with a
-        // field name (`data:` etc.), so split multi-line data into one
-        // `data:` line per source line — the receiving EventSource joins
-        // them back with `\n` per the spec.
-        const encodeFrame = (event: string, data: string): string => {
-          const dataLines = data.split('\n').map(line => `data: ${line}`).join('\n');
-          return `event: ${event}\n${dataLines}\n\n`;
-        };
-        const body = new ReadableStream<Uint8Array>({
-          async start(controller) {
-            try {
-              for await (const frame of res.stream!) {
-                controller.enqueue(encoder.encode(encodeFrame(frame.event, frame.data)));
+    return req
+      .json()
+      .then(async (body: unknown) => {
+        const authorization = req.headers.get("authorization") ?? undefined;
+        const res = await daemon.dispatchChat!({
+          path: chatPath,
+          ...(authorization ? { authorization } : {}),
+          body:
+            body && typeof body === "object"
+              ? (body as { message?: string; sessionId?: string })
+              : {},
+        });
+        if (!res)
+          return jsonResponse({ error: "workflow-daemon-not-started" }, 503);
+        // Surface-unification v2.1 (2026-05-11) — SSE response when the
+        // chat router returned a stream. Encode each frame as `event:
+        // <name>\ndata: <body>\n\n` per the SSE wire spec.
+        if (res.stream) {
+          const encoder = new TextEncoder();
+          // V2.2-1 (2026-05-12) — token frames carry raw chunks that may
+          // contain `\n`. SSE wire requires each line to start with a
+          // field name (`data:` etc.), so split multi-line data into one
+          // `data:` line per source line — the receiving EventSource joins
+          // them back with `\n` per the spec.
+          const encodeFrame = (event: string, data: string): string => {
+            const dataLines = data
+              .split("\n")
+              .map((line) => `data: ${line}`)
+              .join("\n");
+            return `event: ${event}\n${dataLines}\n\n`;
+          };
+          const body = new ReadableStream<Uint8Array>({
+            async start(controller) {
+              try {
+                for await (const frame of res.stream!) {
+                  controller.enqueue(
+                    encoder.encode(encodeFrame(frame.event, frame.data)),
+                  );
+                }
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                controller.enqueue(
+                  encoder.encode(
+                    encodeFrame("error", JSON.stringify({ error: msg })),
+                  ),
+                );
+              } finally {
+                controller.close();
               }
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              controller.enqueue(encoder.encode(encodeFrame('error', JSON.stringify({ error: msg }))));
-            } finally {
-              controller.close();
-            }
-          },
-        });
-        return new Response(body, {
-          status: res.status,
-          headers: {
-            'content-type': 'text/event-stream',
-            'cache-control': 'no-cache',
-            connection: 'keep-alive',
-          },
-        });
-      }
-      return jsonResponse(res.body, res.status);
-    }).catch(() => jsonResponse({ error: 'bad_request', reason: 'JSON body required' }, 400));
+            },
+          });
+          return new Response(body, {
+            status: res.status,
+            headers: {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+              connection: "keep-alive",
+            },
+          });
+        }
+        return jsonResponse(res.body, res.status);
+      })
+      .catch(() =>
+        jsonResponse(
+          { error: "bad_request", reason: "JSON body required" },
+          400,
+        ),
+      );
   }
 
-  if (pathname === '/v1/workflows/telegram-dispatch' && method === 'POST') {
+  if (pathname === "/v1/workflows/telegram-dispatch" && method === "POST") {
     // 봇 프로세스가 부른다 — 웹훅과 달리 bearer 로 막는다(텔레그램 업데이트를 위조해 트리거를 쏘지 못하게).
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     const daemon = opts.workflowDaemon;
-    if (!daemon?.dispatchTelegram) return jsonResponse({ error: 'workflow-daemon-not-wired' }, 503);
-    return req.json().then(async (body: unknown) => {
-      const event = parseTelegramDispatchEvent(body);
-      if (!event) return jsonResponse({ error: 'bad_request', reason: 'event {kind, chat, user, body} required' }, 400);
-      const results = await daemon.dispatchTelegram!(event);
-      return jsonResponse({ results });
-    }).catch(() => jsonResponse({ error: 'bad_request', reason: 'JSON body required' }, 400));
+    if (!daemon?.dispatchTelegram)
+      return jsonResponse({ error: "workflow-daemon-not-wired" }, 503);
+    return req
+      .json()
+      .then(async (body: unknown) => {
+        const event = parseTelegramDispatchEvent(body);
+        if (!event)
+          return jsonResponse(
+            {
+              error: "bad_request",
+              reason: "event {kind, chat, user, body} required",
+            },
+            400,
+          );
+        const results = await daemon.dispatchTelegram!(event);
+        return jsonResponse({ results });
+      })
+      .catch(() =>
+        jsonResponse(
+          { error: "bad_request", reason: "JSON body required" },
+          400,
+        ),
+      );
   }
 
-  if (pathname.startsWith('/v1/workflows/webhooks/')) {
-    const wfPath = pathname.slice('/v1/workflows/webhooks'.length); // includes leading '/'
+  if (pathname.startsWith("/v1/workflows/webhooks/")) {
+    const wfPath = pathname.slice("/v1/workflows/webhooks".length); // includes leading '/'
     const daemon = opts.workflowDaemon;
     if (!daemon) {
-      return jsonResponse({ error: 'workflow-daemon-not-wired' }, 503);
+      return jsonResponse({ error: "workflow-daemon-not-wired" }, 503);
     }
     return req.text().then(async (body) => {
       const headersIn: Record<string, string | undefined> = {};
-      req.headers.forEach((v, k) => { headersIn[k.toLowerCase()] = v; });
+      req.headers.forEach((v, k) => {
+        headersIn[k.toLowerCase()] = v;
+      });
       const res = await daemon.dispatchWebhook({
         method,
         path: wfPath,
@@ -2076,11 +3088,11 @@ export async function routeRequest(
         body,
       });
       if (!res) {
-        return jsonResponse({ error: 'workflow-daemon-not-started' }, 503);
+        return jsonResponse({ error: "workflow-daemon-not-started" }, 503);
       }
       return new Response(res.body, {
         status: res.status,
-        headers: res.headers ?? { 'content-type': 'text/plain' },
+        headers: res.headers ?? { "content-type": "text/plain" },
       });
     });
   }
@@ -2088,398 +3100,616 @@ export async function routeRequest(
   // W9c Z13-d (#2445) — Device fleet is GET-only, so it must dispatch
   // before the mutation-only block below.
   if (isDevicesPath(pathname)) {
-    if (!opts.devices) return jsonResponse({ error: 'devices-not-wired' }, 503);
+    if (!opts.devices) return jsonResponse({ error: "devices-not-wired" }, 503);
     return handleDevices(req, opts.devices);
   }
 
   // Mock/test devices are a catalog reference, separate from the live fleet at /v1/devices.
   if (isUxSimDevicesPath(pathname)) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleUxSimDevices(req);
   }
 
   // Same owner auth as the neighbouring GETs (short-lived owner tokens · same-origin PWA); #23932 compared the admin
   // bearer only, so a PWA on a short-lived token got 401 and the loop map stayed empty.
-  if (pathname === '/v1/loops/resources' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/loops/resources" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleLoopResourcesGet(opts.loopResources);
   }
-  if (pathname === '/v1/loops/edges' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/loops/edges" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return (loopEdgesDataSource ?? createLoopEdgesDataSource()).read(req);
   }
 
-  if (pathname === '/v1/harness/runs' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/harness/runs" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleHarnessRunsGet(req, opts.metaApi);
   }
 
-  if (pathname === '/v1/harness/ask-status' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/harness/ask-status" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleHarnessAskStatusGet(req, opts.metaApi);
   }
 
-  if (pathname === '/v1/harness/run-screen' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/harness/run-screen" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleHarnessRunScreenGet(req, opts.metaApi);
   }
 
-  if (pathname === '/v1/harness/run-events' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/harness/run-events" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleHarnessRunEventsGet(req, opts.metaApi);
   }
 
   // HARNESS-RUN-LIVE-GRAPH — one run's ordered node steps ⊕ journey band (PWA /live-run).
-  if (pathname === '/v1/harness/run-traversal' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/harness/run-traversal" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleHarnessRunTraversalGet(req);
   }
 
   // Design direction is a write: check owner auth before the handler reads the body.
   // Keep this POST ahead of the mutation fallback, and never make it a public route.
-  if (method === 'POST' && pathname === DESIGN_DIRECTION_PATH) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "POST" && pathname === DESIGN_DIRECTION_PATH) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleDesignDirectionPost(req);
   }
   // Custom system create is a write that launches an extract. Auth before the body.
   // The default-deny gate above already refuses anonymous /v1 writes; this check
   // stays so a future gate change cannot reach the extractor without an owner.
-  if (method === 'POST' && pathname === DESIGN_SYSTEM_PATH) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "POST" && pathname === DESIGN_SYSTEM_PATH) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     // Same-origin exemption is enough for a direction pick. An extract writes a
     // library and launches Chrome, so it also requires the owner bearer.
     const owner = opts.metaApi.bearerToken;
-    const offered = (req.headers.get('authorization') ?? '').startsWith('Bearer ')
-      ? (req.headers.get('authorization') ?? '').slice('Bearer '.length).trim()
-      : '';
-    if (!owner || offered.length !== owner.length) return jsonResponse({ error: 'unauthorized' }, 401);
+    const offered = (req.headers.get("authorization") ?? "").startsWith(
+      "Bearer ",
+    )
+      ? (req.headers.get("authorization") ?? "").slice("Bearer ".length).trim()
+      : "";
+    if (!owner || offered.length !== owner.length)
+      return jsonResponse({ error: "unauthorized" }, 401);
     let bearerDiff = 0;
-    for (let i = 0; i < offered.length; i += 1) bearerDiff |= offered.charCodeAt(i) ^ owner.charCodeAt(i);
-    if (bearerDiff !== 0) return jsonResponse({ error: 'unauthorized' }, 401);
+    for (let i = 0; i < offered.length; i += 1)
+      bearerDiff |= offered.charCodeAt(i) ^ owner.charCodeAt(i);
+    if (bearerDiff !== 0) return jsonResponse({ error: "unauthorized" }, 401);
     return handleDesignSystemCreate(req);
   }
 
-  if (method === 'POST' && pathname === '/v1/graphs/validate') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "POST" && pathname === "/v1/graphs/validate") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleGraphsValidatePost(req, opts.metaApi);
   }
 
   // GRAPH-WIZARD — 설치된 팩 목록과 말 → 그래프 YAML(저장 안 함). 같은 소유자 인증.
-  if (method === 'GET' && pathname === '/v1/graphs/wizard/packs') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "GET" && pathname === "/v1/graphs/wizard/packs") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleGraphWizardPacksGet(opts.graphWizard);
   }
-  if (method === 'POST' && pathname === '/v1/graphs/wizard') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "POST" && pathname === "/v1/graphs/wizard") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleGraphWizardPost(req, opts.graphWizard, opts.eventBus);
   }
 
-  if (pathname === '/v1/fabric/decompose' || pathname.startsWith('/v1/fabric/plans/')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (
+    pathname === "/v1/fabric/decompose" ||
+    pathname.startsWith("/v1/fabric/plans/")
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleFabricPlans(req, opts.fabricPlans);
   }
 
-  if (pathname === '/v1/projects/folders' && method === 'GET') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/projects/folders" && method === "GET") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleProjectFoldersGet(req, opts.projectFolderRoots);
   }
-  if (pathname === '/v1/projects' && (method === 'GET' || method === 'POST')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req, opts.projectFolderRoots);
+  if (pathname === "/v1/projects" && (method === "GET" || method === "POST")) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return method === "GET"
+      ? handleProjectsGet()
+      : handleProjectsPost(req, opts.projectFolderRoots);
   }
-  if (pathname.startsWith('/v1/projects/') && pathname.endsWith('/autopsy') && method === 'GET') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return handleProjectAutopsy(req, pathname.slice('/v1/projects/'.length, pathname.length - '/autopsy'.length));
+  if (
+    pathname.startsWith("/v1/projects/") &&
+    pathname.endsWith("/autopsy") &&
+    method === "GET"
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return handleProjectAutopsy(
+      req,
+      pathname.slice(
+        "/v1/projects/".length,
+        pathname.length - "/autopsy".length,
+      ),
+    );
   }
 
   // Polling must remain outside the non-GET dispatch below.
-  if (method === 'GET' && pathname.startsWith(`${SKILL_EXEC_PATH}/`) && !pathname.slice(SKILL_EXEC_PATH.length + 1).includes('/')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return (opts.skillExec ?? defaultSkillExecJobs()).get(pathname.slice(SKILL_EXEC_PATH.length + 1));
+  if (
+    method === "GET" &&
+    pathname.startsWith(`${SKILL_EXEC_PATH}/`) &&
+    !pathname.slice(SKILL_EXEC_PATH.length + 1).includes("/")
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return (opts.skillExec ?? defaultSkillExecJobs()).get(
+      pathname.slice(SKILL_EXEC_PATH.length + 1),
+    );
   }
-  if (method === 'GET' && pathname.startsWith(`${CARD_FOLLOWUP_PATH}/`) && !pathname.slice(CARD_FOLLOWUP_PATH.length + 1).includes('/')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return (opts.cardFollowup ?? defaultCardFollowupJobs()).get(pathname.slice(CARD_FOLLOWUP_PATH.length + 1));
+  if (
+    method === "GET" &&
+    pathname.startsWith(`${CARD_FOLLOWUP_PATH}/`) &&
+    !pathname.slice(CARD_FOLLOWUP_PATH.length + 1).includes("/")
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return (opts.cardFollowup ?? defaultCardFollowupJobs()).get(
+      pathname.slice(CARD_FOLLOWUP_PATH.length + 1),
+    );
   }
 
-  if (pathname === OPS_BOARD_PATH && (method === 'GET' || method === 'POST')) {
-    const peerAddress = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
-    const host = req.headers.get('host') ?? new URL(req.url).host;
-    const tailnetPeer = peerAddress !== undefined && (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peerAddress)
-      || /^fd7a:115c:a1e0:/i.test(peerAddress));
-    const localPeer = peerAddress === '127.0.0.1' || peerAddress === '::1';
-    const tailnetHost = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(host)
-      || /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host) || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
-    const localHost = /^(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(host) || /^\[::1\](?::\d+)?$/.test(host);
-    if ((!tailnetPeer && !localPeer) || (!tailnetHost && !localHost)) return jsonResponse({ error: 'forbidden' }, 403);
+  if (pathname === OPS_BOARD_PATH && (method === "GET" || method === "POST")) {
+    const peerAddress = (
+      server as BunServerLike & {
+        requestIP?: (request: Request) => { address: string } | null;
+      }
+    ).requestIP?.(req)?.address;
+    const host = req.headers.get("host") ?? new URL(req.url).host;
+    const tailnetPeer =
+      peerAddress !== undefined &&
+      (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peerAddress) ||
+        /^fd7a:115c:a1e0:/i.test(peerAddress));
+    const localPeer = peerAddress === "127.0.0.1" || peerAddress === "::1";
+    const tailnetHost =
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(
+        host,
+      ) ||
+      /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host) ||
+      /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
+    const localHost =
+      /^(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(host) ||
+      /^\[::1\](?::\d+)?$/.test(host);
+    if ((!tailnetPeer && !localPeer) || (!tailnetHost && !localHost))
+      return jsonResponse({ error: "forbidden" }, 403);
     return handleOpsBoard(req, {
-      authorize: request => !!opts.metaApi && opts.metaApi.noAuth !== true && checkAuth(request, opts.metaApi),
+      authorize: (request) =>
+        !!opts.metaApi &&
+        opts.metaApi.noAuth !== true &&
+        checkAuth(request, opts.metaApi),
       ...opts.opsBoard,
     });
   }
   // TASKS-ON-TA-LEDGER — 읽기 전용 · 이 경로는 `/v1/` 밖이라 default-deny 관문이 못 덮는다 → 여기서 owner 인증을 직접 건다.
   if (pathname === TASK_AGENT_BOARD_PATH) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    if (!checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (method !== "GET")
+      return jsonResponse({ error: "method-not-allowed", method }, 405);
     // 동적 import — 다른 무거운 라우트(skill-exec · card-followup)와 같은 꼴: task-agent 모듈 트리를 데몬 기동 경로에 싣지 않는다.
-    const [{ taskAgentBoard }, { taskAgentStatePath }] = await Promise.all([import('../../task-agent/board.js'), import('../../task-agent/task-hand.js')]);
+    const [{ taskAgentBoard }, { taskAgentStatePath }] = await Promise.all([
+      import("../../task-agent/board.js"),
+      import("../../task-agent/task-hand.js"),
+    ]);
     try {
       // progress 관측은 동기 수 초라 요청이 명시할 때만(`?progress=1`) — 기본 응답은 progress=null(UX 수확 리뷰 should-fix).
-      const withProgress = new URL(req.url, 'http://local').searchParams.get('progress') === '1';
-      const response = taskAgentBoard(opts.taskAgentStatePath ?? taskAgentStatePath(), { withProgress });
-      debug.log('task-agent', 'board-served', { projects: response.board.length });
+      const withProgress =
+        new URL(req.url, "http://local").searchParams.get("progress") === "1";
+      const response = taskAgentBoard(
+        opts.taskAgentStatePath ?? taskAgentStatePath(),
+        { withProgress },
+      );
+      debug.log("task-agent", "board-served", {
+        projects: response.board.length,
+      });
       return jsonResponse(response);
     } catch (error) {
-      debug.log('task-agent', 'board-read-failed', { error: error instanceof Error ? error.message : String(error) });
-      return jsonResponse({ error: 'task-agent-ledger-unreadable' }, 503);
+      debug.log("task-agent", "board-read-failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return jsonResponse({ error: "task-agent-ledger-unreadable" }, 503);
     }
   }
-  if (method === 'GET' && pathname === DECISIONS_PATH) {
+  if (method === "GET" && pathname === DECISIONS_PATH) {
     return handleDecisions(req, {
-      authorize: request => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      authorize: (request) =>
+        !!opts.metaApi && checkAuth(request, opts.metaApi),
       ...opts.decisions,
     });
   }
 
   // routeRequest is the live GET-only caller of the cached grid snapshot; keep it behind the owner auth gate.
-  if (pathname === '/v1/grid') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
-    return jsonResponse((gridDataSource ?? createGridDataSource({ deps: opts.grid })).read());
+  if (pathname === "/v1/grid") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (method !== "GET")
+      return jsonResponse({ error: "method-not-allowed", method }, 405);
+    return jsonResponse(
+      (gridDataSource ?? createGridDataSource({ deps: opts.grid })).read(),
+    );
   }
   // DRAFT-METRIC: answers from memory; a stale/cold cache starts one background collection (never per request).
-  if (pathname === '/v1/drafts/metrics') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed', method }, 405);
-    return jsonResponse((opts.draftMetrics ?? (sharedDraftMetrics ??= createDraftMetricsSource())).read());
+  if (pathname === "/v1/drafts/metrics") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (method !== "GET")
+      return jsonResponse({ error: "method-not-allowed", method }, 405);
+    return jsonResponse(
+      (
+        opts.draftMetrics ?? (sharedDraftMetrics ??= createDraftMetricsSource())
+      ).read(),
+    );
   }
-  if (method === 'GET' && pathname === '/v1/outputs') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "GET" && pathname === "/v1/outputs") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleOutputsGet(req, opts.outputs);
   }
 
-  if (pathname === '/v1/config/chat-fast-path' && (method === 'GET' || method === 'PUT')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (
+    pathname === "/v1/config/chat-fast-path" &&
+    (method === "GET" || method === "PUT")
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleChatFastPathConfig(req);
   }
 
-  if (pathname === '/v1/usage') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
+  if (pathname === "/v1/usage") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (method !== "GET")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
     return (opts.usageHandler ?? handleUsageGet)();
   }
 
-  if (pathname === '/v1/release/checklist') {
-    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)
-      || !['bearer-match', 'temp-token'].includes(bearerCredential(req, opts.metaApi) ?? ''))
-      return jsonResponse({ error: 'unauthorized' }, 401);
-    const version = url.searchParams.get('version') ?? '';
+  if (pathname === "/v1/release/checklist") {
+    if (method !== "GET")
+      return jsonResponse({ error: "method-not-allowed" }, 405);
+    if (
+      !opts.metaApi ||
+      !checkAuth(req, opts.metaApi) ||
+      !["bearer-match", "temp-token"].includes(
+        bearerCredential(req, opts.metaApi) ?? "",
+      )
+    )
+      return jsonResponse({ error: "unauthorized" }, 401);
+    const version = url.searchParams.get("version") ?? "";
     if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(version))
-      return jsonResponse({ error: 'invalid-version' }, 400);
+      return jsonResponse({ error: "invalid-version" }, 400);
     try {
-      const response = jsonResponse((opts.checklistReader ?? listChecklist)(version));
-      response.headers.set('cache-control', 'no-store');
+      const response = jsonResponse(
+        (opts.checklistReader ?? listChecklist)(version),
+      );
+      response.headers.set("cache-control", "no-store");
       return response;
+    } catch {
+      return jsonResponse({ error: "checklist-unavailable" }, 503);
     }
-    catch { return jsonResponse({ error: 'checklist-unavailable' }, 503); }
   }
 
   // SK2 (PWA) list — GET must be routed before the non-GET block below; the original route sat inside it,
   // so the PWA banner's GET always fell through to «not-found» (found by the DEMO-RUNa rehearsal · 10-03).
-  if (method === 'GET' && pathname === '/v1/skills/problems') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    const { handleSkillProblems } = await import('./skill-problems.js');
+  if (method === "GET" && pathname === "/v1/skills/problems") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    const { handleSkillProblems } = await import("./skill-problems.js");
     return handleSkillProblems(req, opts.metaApi);
   }
 
-  if (method === 'GET' && pathname === '/v1/persona-presets') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "GET" && pathname === "/v1/persona-presets") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return dispatchPersonaRoute(req, pathname) as Promise<Response>;
   }
 
   // Mutation routes (PR ι) — POST/PATCH/DELETE on /v1/nexus/tabs[/:id[/action]].
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
-  if (method !== 'GET') {
-    if (pathname === '/v1/board' || pathname.startsWith('/v1/board/')) {
+  if (method !== "GET") {
+    if (pathname === "/v1/board" || pathname.startsWith("/v1/board/")) {
       const response = await handleBoardRoute(req, pathname, {
         store: opts.boardEventStore,
         dispatchApproved: opts.boardApprovalDispatch,
-        resolveOwner: request => resolveVerifiedMemberOwner(request, opts.membersApi ?? defaultMembersApi(opts.appHost), opts.appHost?.slugs),
-        publish: event => { pushEvent(opts.state, event); },
+        resolveOwner: (request) =>
+          resolveVerifiedMemberOwner(
+            request,
+            opts.membersApi ?? defaultMembersApi(opts.appHost),
+            opts.appHost?.slugs,
+          ),
+        publish: (event) => {
+          pushEvent(opts.state, event);
+        },
       });
       if (response) return response;
     }
-    if (method === 'POST' && pathname === SKILL_EXEC_PATH) {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method === "POST" && pathname === SKILL_EXEC_PATH) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return (opts.skillExec ?? defaultSkillExecJobs()).post(req);
     }
-    if (method === 'POST' && pathname === GRAPH_RUNS_PATH) {
-      return (await handleGraphRunsRoute(req, pathname, { ...opts.graphRuns, trusted: graphRunBearer(req, opts) }))!;
+    if (method === "POST" && pathname === GRAPH_RUNS_PATH) {
+      return (await handleGraphRunsRoute(req, pathname, {
+        ...opts.graphRuns,
+        trusted: graphRunBearer(req, opts),
+      }))!;
     }
-    if (method === 'POST' && pathname === CARD_FOLLOWUP_PATH) {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method === "POST" && pathname === CARD_FOLLOWUP_PATH) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return (opts.cardFollowup ?? defaultCardFollowupJobs()).post(req);
     }
-    if (method === 'POST' && /^\/v1\/decisions\/[^/]+\/decide$/.test(pathname)) {
+    if (
+      method === "POST" &&
+      /^\/v1\/decisions\/[^/]+\/decide$/.test(pathname)
+    ) {
       return handleDecisions(req, {
-        authorize: request => !!opts.metaApi && checkAuth(request, opts.metaApi),
+        authorize: (request) =>
+          !!opts.metaApi && checkAuth(request, opts.metaApi),
         ...opts.decisions,
       });
     }
-    if (method === 'POST' && pathname === '/v1/plugins/wizard') {
-      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method === "POST" && pathname === "/v1/plugins/wizard") {
+      if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
       return handlePluginWizardSave(req, opts.metaApi, opts.pluginStateRoot);
     }
-    if (method === 'POST' && pathname === '/v1/plugins/install') {
-      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method === "POST" && pathname === "/v1/plugins/install") {
+      if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
       return handlePluginsInstall(req, opts.metaApi, opts.pluginStateRoot);
     }
-    const marketRefresh = /^\/v1\/plugins\/markets\/([^/]+)\/refresh$/.exec(pathname);
-    if (method === 'POST' && marketRefresh) {
-      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
-      return handlePluginsMarketRefresh(req, marketRefresh[1]!, opts.metaApi, { root: opts.pluginStateRoot });
+    const marketRefresh = /^\/v1\/plugins\/markets\/([^/]+)\/refresh$/.exec(
+      pathname,
+    );
+    if (method === "POST" && marketRefresh) {
+      if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
+      return handlePluginsMarketRefresh(req, marketRefresh[1]!, opts.metaApi, {
+        root: opts.pluginStateRoot,
+      });
     }
-    const pluginCredentials = /^\/v1\/plugins\/([^/]+)\/credentials$/.exec(pathname);
-    if (method === 'PUT' && pluginCredentials) {
-      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
-      return handlePluginsCredentialsPut(req, pluginCredentials[1]!, opts.metaApi, opts.pluginStateRoot, opts.reloadMcpClients);
+    const pluginCredentials = /^\/v1\/plugins\/([^/]+)\/credentials$/.exec(
+      pathname,
+    );
+    if (method === "PUT" && pluginCredentials) {
+      if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
+      return handlePluginsCredentialsPut(
+        req,
+        pluginCredentials[1]!,
+        opts.metaApi,
+        opts.pluginStateRoot,
+        opts.reloadMcpClients,
+      );
     }
     const pluginRemove = /^\/v1\/plugins\/([^/]+)$/.exec(pathname);
-    if (method === 'DELETE' && pluginRemove) {
-      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
-      return handlePluginsRemove(req, pluginRemove[1]!, opts.metaApi, opts.pluginStateRoot);
+    if (method === "DELETE" && pluginRemove) {
+      if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
+      return handlePluginsRemove(
+        req,
+        pluginRemove[1]!,
+        opts.metaApi,
+        opts.pluginStateRoot,
+      );
     }
-    if (method === 'PUT' && /^\/v1\/graphs\/[^/]+\/access$/.test(pathname)) {
-      if (!opts.metaApi || bearerCredential(req, opts.metaApi) === undefined) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method === "PUT" && /^\/v1\/graphs\/[^/]+\/access$/.test(pathname)) {
+      if (!opts.metaApi || bearerCredential(req, opts.metaApi) === undefined)
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleGraphAccessPut(pathname, req);
     }
-    if ((method === 'PUT' || method === 'POST') && (pathname.startsWith('/v1/graphs/') || pathname === '/v1/graphs')) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-      const peerMayEdit = method === 'PUT' && graphAccessForRequest(pathname, method,
-        req.headers.get('authorization')?.startsWith('Bearer ') ? req.headers.get('authorization')!.slice(7).trim() : null);
+    if (
+      (method === "PUT" || method === "POST") &&
+      (pathname.startsWith("/v1/graphs/") || pathname === "/v1/graphs")
+    ) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
+      const peerMayEdit =
+        method === "PUT" &&
+        graphAccessForRequest(
+          pathname,
+          method,
+          req.headers.get("authorization")?.startsWith("Bearer ")
+            ? req.headers.get("authorization")!.slice(7).trim()
+            : null,
+        );
       const ownerAuthorized = checkAuth(req, opts.metaApi);
-      if (!ownerAuthorized && !peerMayEdit) return jsonResponse({ error: 'unauthorized' }, 401);
+      if (!ownerAuthorized && !peerMayEdit)
+        return jsonResponse({ error: "unauthorized" }, 401);
       // A peer save is recorded on the graph so every run path refuses it until the owner approves (W9c run guard).
-      const mutated = await handleGraphsMutation(pathname, req, {}, ownerAuthorized ? null
-        : { peerToken: req.headers.get('authorization')!.slice(7).trim() });
+      const mutated = await handleGraphsMutation(
+        pathname,
+        req,
+        {},
+        ownerAuthorized
+          ? null
+          : { peerToken: req.headers.get("authorization")!.slice(7).trim() },
+      );
       if (mutated) return mutated;
     }
     const cardClose = /^\/v1\/task-cards\/([^/]+)\/close$/.exec(pathname);
-    if (method === 'POST' && cardClose) {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      if (bearerCredential(req, opts.metaApi) !== 'bearer-match') return jsonResponse({ error: 'forbidden' }, 403);
+    if (method === "POST" && cardClose) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      if (bearerCredential(req, opts.metaApi) !== "bearer-match")
+        return jsonResponse({ error: "forbidden" }, 403);
       let id: string;
-      try { id = decodeURIComponent(cardClose[1]!); }
-      catch { return jsonResponse({ error: 'not_found' }, 404); }
+      try {
+        id = decodeURIComponent(cardClose[1]!);
+      } catch {
+        return jsonResponse({ error: "not_found" }, 404);
+      }
       return handleTaskCardsClosePost(req, id);
     }
-    if (method === 'POST' && pathname === '/v1/task-cards/wish') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method === "POST" && pathname === "/v1/task-cards/wish") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleTaskCardsWishPost(req);
     }
-    if (method === 'POST' && pathname === '/v1/tasks') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (method === "POST" && pathname === "/v1/tasks") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
       return handleTaskCreatePost(req, opts.metaApi);
     }
     // ER2 — error reports forwarded by the bot VM (ingest token · same as /v1/tasks).
-    if (method === 'POST' && pathname === '/v1/reports/ingest') return handleErrorReportIngest(req);
-    if (method === 'POST' && pathname.startsWith('/v1/tasks/') && pathname.endsWith('/approve')) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (method === "POST" && pathname === "/v1/reports/ingest")
+      return handleErrorReportIngest(req);
+    if (
+      method === "POST" &&
+      pathname.startsWith("/v1/tasks/") &&
+      pathname.endsWith("/approve")
+    ) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
       let taskId: string;
-      try { taskId = decodeURIComponent(pathname.slice('/v1/tasks/'.length, -'/approve'.length)); }
-      catch { return jsonResponse({ error: 'bad_request', reason: 'invalid taskId' }, 400); }
-      if (!taskId || taskId.includes('/') || taskId.includes('\\') || taskId.includes('..')) {
-        return jsonResponse({ error: 'bad_request', reason: 'invalid taskId' }, 400);
+      try {
+        taskId = decodeURIComponent(
+          pathname.slice("/v1/tasks/".length, -"/approve".length),
+        );
+      } catch {
+        return jsonResponse(
+          { error: "bad_request", reason: "invalid taskId" },
+          400,
+        );
+      }
+      if (
+        !taskId ||
+        taskId.includes("/") ||
+        taskId.includes("\\") ||
+        taskId.includes("..")
+      ) {
+        return jsonResponse(
+          { error: "bad_request", reason: "invalid taskId" },
+          400,
+        );
       }
       return handleTaskApprovePost(req, taskId, opts.metaApi);
     }
     // Pod grok access 재발급. 넥서스 bearer 가 아니라 llm-credential 토큰을 본문 파싱 전에 검증한다.
-    if (pathname === POD_CREDENTIAL_GROK_PATH && method === 'POST') {
+    if (pathname === POD_CREDENTIAL_GROK_PATH && method === "POST") {
       const gate = await authenticatePodCredential(req);
       if (!gate.ok) return gate.response;
       return handlePodGrokCredential(req);
     }
-    if (pathname === POD_CREDENTIAL_GITHUB_PATH && method === 'POST') {
-      const gate = await authenticatePodCredential(req, {}, 'gh-credential');
+    if (pathname === POD_CREDENTIAL_GITHUB_PATH && method === "POST") {
+      const gate = await authenticatePodCredential(req, {}, "gh-credential");
       if (!gate.ok) return gate.response;
       return handlePodGithubCredential(req);
     }
-    if (pathname === '/v1/harness/ask' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/harness/ask" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      if (!checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleHarnessAskPost(req, opts.metaApi, {
-        createFeedbackEmitter: (acceptanceId) => createFeedbackEmitter(opts.eventBus, acceptanceId, undefined),
+        createFeedbackEmitter: (acceptanceId) =>
+          createFeedbackEmitter(opts.eventBus, acceptanceId, undefined),
       });
     }
-    if (pathname === '/v1/harness/stop' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/harness/stop" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      if (!checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleHarnessStopPost(req, opts.metaApi);
     }
     {
       const controlId = parseTerminalControlPath(pathname);
-      if (controlId !== null && method === 'POST') {
-        if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (controlId !== null && method === "POST") {
+        if (!opts.metaApi)
+          return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
         return handleTerminalControl(req, opts.metaApi, controlId);
       }
     }
     {
       const renameId = parseTerminalRenamePath(pathname);
-      if (renameId !== null && method === 'POST') {
-        if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (renameId !== null && method === "POST") {
+        if (!opts.metaApi)
+          return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
         return handleTerminalRename(req, opts.metaApi, renameId);
       }
     }
-    if (parseTerminalsPrunePath(pathname) && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (parseTerminalsPrunePath(pathname) && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleTerminalsPrune(req, opts.metaApi);
     }
     {
       const terminateId = parseTerminalTerminatePath(pathname);
-      if (terminateId !== null && method === 'POST') {
-        if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (terminateId !== null && method === "POST") {
+        if (!opts.metaApi)
+          return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
         return handleTerminalTerminate(req, opts.metaApi, terminateId);
       }
     }
-    if (pathname === SESSION_TURN_CONTROL_PATH && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === SESSION_TURN_CONTROL_PATH && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleSessionTurnControl(req);
     }
-    if (pathname === '/v1/nexus/templates' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/nexus/templates" && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleTemplateSave(req, opts.registry);
     }
     // ROADMAP-ipad-companion-autopilot-priority §D2.0 — autopilot SSE
     // entry. iOS / PWA POST a mission + budget envelope and consume the
     // envelope/update/result stream. Placed inside the `method !== 'GET'`
     // block per memory `feedback_post_route_must_be_in_method_block`.
-    if (pathname === '/v1/autopilot/run' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      const { handleAutopilotRun } = await import('./autopilot-handler.js');
+    if (pathname === "/v1/autopilot/run" && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const { handleAutopilotRun } = await import("./autopilot-handler.js");
       return handleAutopilotRun(req);
     }
     // ★ 미션 e4f97b(external-markdown publishing) 배선 마무리 — orphan 이던 MarkdownPublisher +
     //   createGlobalRequestLimiter 를 POST 라우트로 소비. limiter(rate/concurrency) 통과 후 게시.
     //   method!=='GET' 블록 내(feedback_post_route_must_be_in_method_block).
-    if (pathname === '/v1/publish/markdown' && method === 'POST') {
+    if (pathname === "/v1/publish/markdown" && method === "POST") {
       // ★ 보안(SECURITY-external-publishing-tailscale-s3) — 게시는 mutation·인증 필수(무인증 시 DoS/악성콘텐츠).
       //   GET /d/:id(프리뷰)는 tailnet 경계라 open 유지하되, POST 게시는 bearer 게이트.
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      const { handleMarkdownPublish, getDefaultMarkdownPublishService } = await import('./markdown-publish.js');
-      return req.text().then((b) => handleMarkdownPublish(b, getDefaultMarkdownPublishService()));
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const { handleMarkdownPublish, getDefaultMarkdownPublishService } =
+        await import("./markdown-publish.js");
+      return req
+        .text()
+        .then((b) =>
+          handleMarkdownPublish(b, getDefaultMarkdownPublishService()),
+        );
     }
     // PLAN-autopilot-terminal-driving-2026-05-20 v2 Phase B (2026-05-20) —
     // mid-mission user instruction injection. Active-run registry lives
@@ -2488,9 +3718,10 @@ export async function routeRequest(
     // `feedback_post_route_must_be_in_method_block`.
     {
       const injectMatch = /^\/v1\/autopilot\/([^/]+)\/inject$/.exec(pathname);
-      if (injectMatch && method === 'POST') {
+      if (injectMatch && method === "POST") {
         const runId = injectMatch[1]!;
-        const { handleAutopilotInject } = await import('./autopilot-handler.js');
+        const { handleAutopilotInject } =
+          await import("./autopilot-handler.js");
         return handleAutopilotInject(req, runId);
       }
     }
@@ -2499,23 +3730,25 @@ export async function routeRequest(
     // markdown bundle to S3 under `debug-bundle/`, returns public URL
     // + paste-ready prompt. Placed inside the `method !== 'GET'` block
     // per memory `feedback_post_route_must_be_in_method_block`.
-    if (pathname === '/v1/debug-bundle' && method === 'POST') {
-      const { handleDebugBundlePost } = await import('./debug-bundle.js');
+    if (pathname === "/v1/debug-bundle" && method === "POST") {
+      const { handleDebugBundlePost } = await import("./debug-bundle.js");
       return handleDebugBundlePost(req);
     }
     // B 트랙 closure piece (RFC #2474) — MCP Streamable HTTP transport.
     // External MCP clients (Claude Code · Cursor · Codex) register elanous
-    // via `claude mcp add --transport http elanous http://localhost:31415/v1/mcp --header "Authorization: Bearer <acp-token>"`
+    // via `claude mcp add --transport http elanous http://localhost:31415/v1/mcp --header 'Authorization: Bearer <acp-token>'`
     // (토큰 없이 붙이면 401 → Claude Code 가 OAuth 를 시도한다 — mcp-oauth-hint.ts)
     // and reach the NEXUS daemon's ToolRuntime registry directly — no
     // child process spawn (cf. `elanous mcp serve` stdio · #2485), every
     // call flows through the PFC capture seam. Placed inside the
     // `method !== 'GET'` block per memory
     // `feedback_post_route_must_be_in_method_block`.
-    if (pathname === '/v1/mcp' && method === 'POST') {
-      const peer = (server as BunServerLike & {
-        requestIP?: (request: Request) => { address: string } | null;
-      }).requestIP?.(req);
+    if (pathname === "/v1/mcp" && method === "POST") {
+      const peer = (
+        server as BunServerLike & {
+          requestIP?: (request: Request) => { address: string } | null;
+        }
+      ).requestIP?.(req);
       return handleMcpHttpPost(req, {
         ...(peer ? { peerAddress: peer.address } : {}),
         binding: bind,
@@ -2530,152 +3763,243 @@ export async function routeRequest(
     // listing route lives further down in the GET block.
     {
       const restToolId = parseRuntimeToolCallPath(pathname);
-      if (restToolId !== null && method === 'POST') {
-        if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (restToolId !== null && method === "POST") {
+        if (!opts.metaApi)
+          return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
         return handleRuntimeToolCall(req, opts.metaApi, restToolId);
       }
     }
     // ⛔ 설정 쓰기 여섯(스위치·모델 티어·LLM provider·LLM 호스트·회전·미션 제어)은 인증 없이 핸들러에 닿았다
     //   (2026-09-26 🅢 비파괴 탐침: 무인증 PUT → 404/400 · 같은 조건 /v1/config/secrets → 401). PWA 는 same-origin 으로 통과.
-    if (pathname.startsWith('/v1/config/switches/') && method === 'PUT') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      const switchId = pathname.slice('/v1/config/switches/'.length);
+    if (pathname.startsWith("/v1/config/switches/") && method === "PUT") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const switchId = pathname.slice("/v1/config/switches/".length);
       return handleSwitchPut(req, makeConfigCtx(opts), switchId);
     }
-    if (pathname === '/v1/config/secrets' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/config/secrets" && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleSecretPost(req);
     }
     // M1-2b — friction-free model selection root-level sub-tree
     // (`modelTier` / `budget` / `smartDefaults`). PUT merges supplied
     // sub-trees into UserConfig (Path A). Validation lives in the
     // handler so invalid tier strings can't pollute the file.
-    if (pathname === '/v1/config/model-tier' && method === 'PUT') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      const { handleModelTierPut } = await import('./config-model-tier.js');
+    if (pathname === "/v1/config/model-tier" && method === "PUT") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const { handleModelTierPut } = await import("./config-model-tier.js");
       return handleModelTierPut(req);
     }
     // M3-3 (Phase 3) — NL chat tier intent. Detect-only by default ·
     // applies a session-scoped override when `apply: true`. Session
     // overrides auto-revert on TTL (default 8h) or explicit clear.
-    if (pathname === '/v1/chat/tier-intent' && method === 'POST') {
-      const { handleChatTierIntentPost } = await import('./chat-tier-intent.js');
+    if (pathname === "/v1/chat/tier-intent" && method === "POST") {
+      const { handleChatTierIntentPost } =
+        await import("./chat-tier-intent.js");
       return handleChatTierIntentPost(req);
     }
-    if (pathname === '/v1/nexus/edit-in-pwa' && method === 'POST') {
-      if (!opts.editInPwa) return jsonResponse({ error: 'edit-in-pwa-disabled' }, 503);
+    if (pathname === "/v1/nexus/edit-in-pwa" && method === "POST") {
+      if (!opts.editInPwa)
+        return jsonResponse({ error: "edit-in-pwa-disabled" }, 503);
       return handleEditInPwaPost(req, opts.editInPwa);
     }
-    if (pathname === '/v1/nexus/edit-in-pwa/consume' && method === 'POST') {
-      if (!opts.editInPwa) return jsonResponse({ error: 'edit-in-pwa-disabled' }, 503);
+    if (pathname === "/v1/nexus/edit-in-pwa/consume" && method === "POST") {
+      if (!opts.editInPwa)
+        return jsonResponse({ error: "edit-in-pwa-disabled" }, 503);
       return handleEditInPwaConsume(req, opts.editInPwa);
     }
     // R6 Task 5 · §6.1 (2026-05-09) — LLM-judge hybrid classifier.
     // POST + OPTIONS preflight (PWA dev mode is cross-origin).
-    if (pathname === '/v1/showroom/role-judge' && (method === 'POST' || method === 'OPTIONS')) {
+    if (
+      pathname === "/v1/showroom/role-judge" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
       return handleRoleJudge(req);
     }
     // R6 FU.2 · §6.3 audio bridge (2026-05-09) — multipart audio →
     // OpenAI Whisper transcript (TUI cloud reuse).
     // POST + OPTIONS preflight (PWA dev mode is cross-origin).
-    if (pathname === '/v1/audio/stt' && (method === 'POST' || method === 'OPTIONS')) {
+    if (
+      pathname === "/v1/audio/stt" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
       return handleAudioStt(req);
     }
     // micro.3 (2026-05-09) — LLM model list proxy (LM Studio /v1/
     // models). OPTIONS handled here so the PWA dropdown can preflight
     // a cross-origin GET (the actual GET sits in the GET-only block).
-    if (pathname === '/v1/llm/models' && method === 'OPTIONS') {
+    if (pathname === "/v1/llm/models" && method === "OPTIONS") {
       return handleLlmModels(req);
     }
     // FU.A3 (2026-05-09) — multi-host config hot-reload. OPTIONS +
     // PUT + DELETE in the mutation block; GET sits in the GET-only
     // block alongside /v1/llm/models.
-    if (pathname === '/v1/llm/hosts' && (method === 'OPTIONS' || method === 'PUT' || method === 'DELETE')) {
-      if (method !== 'OPTIONS') { if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401); }
+    if (
+      pathname === "/v1/llm/hosts" &&
+      (method === "OPTIONS" || method === "PUT" || method === "DELETE")
+    ) {
+      if (method !== "OPTIONS") {
+        if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+          return jsonResponse({ error: "unauthorized" }, 401);
+      }
       return handleLlmHostsConfig(req);
     }
     // iOS Phase 1.5 (2026-05-13) — provider rotation advance. POST
     // here in the mutation block (memory `feedback_post_route_must_be_in_method_block`),
     // GET sibling in the GET block below.
-    if (pathname === '/v1/llm/rotation/next' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'POST') { if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401); }
+    if (
+      pathname === "/v1/llm/rotation/next" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "POST") {
+        if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+          return jsonResponse({ error: "unauthorized" }, 401);
+      }
       return handleLlmRotationNext(req);
     }
-    if (pathname === '/v1/llm/rotation' && method === 'OPTIONS') {
+    if (pathname === "/v1/llm/rotation" && method === "OPTIONS") {
       return handleLlmRotationGet(req);
     }
     // The one-use link is verified by the claim handler, not by the owner bearer.
-    if (pathname === '/v1/setup/claim' && (method === 'POST' || method === 'OPTIONS')) {
-      return method === 'OPTIONS' ? corsPreflight('POST, OPTIONS') : handleSetupClaim(req);
+    if (
+      pathname === "/v1/setup/claim" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      return method === "OPTIONS"
+        ? corsPreflight("POST, OPTIONS")
+        : handleSetupClaim(req);
     }
-    if (pathname === '/v1/setup/credential-claim' && method === 'POST') {
+    if (pathname === "/v1/setup/credential-claim" && method === "POST") {
       return handleCredentialRegistrationClaim(req);
     }
-    if (pathname === '/v1/setup/credential-register' && method === 'POST') {
+    if (pathname === "/v1/setup/credential-register" && method === "POST") {
       return handleCredentialRegistrationSubmit(req);
     }
-    if (pathname === '/v1/credentials/registration-links' && method === 'POST') {
+    if (
+      pathname === "/v1/credentials/registration-links" &&
+      method === "POST"
+    ) {
       return handleCredentialRegistrationLinkCreate(req, {
-        authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
+        authorizeOwner: (request) =>
+          !!opts.metaApi &&
+          checkAuth(request, opts.metaApi) &&
+          !setupBearerScopeDenied(request, opts.metaApi),
       });
     }
-    if (pathname === '/v1/credentials/registration-links/revoke' && method === 'POST') {
+    if (
+      pathname === "/v1/credentials/registration-links/revoke" &&
+      method === "POST"
+    ) {
       return handleCredentialRegistrationLinkRevoke(req, {
-        authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
+        authorizeOwner: (request) =>
+          !!opts.metaApi &&
+          checkAuth(request, opts.metaApi) &&
+          !setupBearerScopeDenied(request, opts.metaApi),
       });
     }
-    if (pathname === '/v1/credentials/openrouter/oauth/start' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi) || setupBearerScopeDenied(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      pathname === "/v1/credentials/openrouter/oauth/start" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("POST, OPTIONS");
+      if (
+        !opts.metaApi ||
+        !checkAuth(req, opts.metaApi) ||
+        setupBearerScopeDenied(req, opts.metaApi)
+      )
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleOpenRouterOAuthStart(req);
     }
-    if (pathname === '/v1/credentials/openrouter/import' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('GET, POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi) || setupBearerScopeDenied(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      pathname === "/v1/credentials/openrouter/import" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("GET, POST, OPTIONS");
+      if (
+        !opts.metaApi ||
+        !checkAuth(req, opts.metaApi) ||
+        setupBearerScopeDenied(req, opts.metaApi)
+      )
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleOpenRouterImportConfirm(req);
     }
     // PWA `/setup` wizard Phase 1 (2026-05-19) — LLM provider 첫 셋업.
     // POST 는 mutation 블록 안에서 등록 (memory `feedback_post_route_must_be_in_method_block`).
     // GET sibling 은 아래 GET-only 블록에 등록.
-    if (pathname === '/v1/setup/codex-login' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('GET, POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      pathname === "/v1/setup/codex-login" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("GET, POST, OPTIONS");
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleSetupCodexLoginPost(req);
     }
-    if (pathname === '/v1/setup/llm-provider' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'POST') { if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401); }
+    if (
+      pathname === "/v1/setup/llm-provider" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "POST") {
+        if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+          return jsonResponse({ error: "unauthorized" }, 401);
+      }
       return handleLlmProviderSet(req);
     }
-    if (pathname === '/v1/setup/llm-providers' && method === 'OPTIONS') {
+    if (pathname === "/v1/setup/llm-providers" && method === "OPTIONS") {
       return handleLlmProvidersList(req);
     }
-    if (pathname === '/v1/setup/obsidian' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      pathname === "/v1/setup/obsidian" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("POST, OPTIONS");
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleObsidianSet(req);
     }
-    if (pathname === '/v1/setup/skills' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      pathname === "/v1/setup/skills" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("POST, OPTIONS");
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleSkillsSet(req);
     }
-    if (pathname === '/v1/setup/obsidian-skills' && method === 'OPTIONS') return corsPreflight('GET, OPTIONS');
-    if (pathname === '/v1/setup/channel-bot' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/setup/obsidian-skills" && method === "OPTIONS")
+      return corsPreflight("GET, OPTIONS");
+    if (
+      pathname === "/v1/setup/channel-bot" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("POST, OPTIONS");
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleChannelBotSet(req);
     }
-    if (pathname === '/v1/setup/channel-bots' && method === 'OPTIONS') return corsPreflight('GET, OPTIONS');
-    if ((pathname === '/v1/setup/child-llm' || pathname === '/v1/setup/answer-priority')
-      && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('GET, POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      return pathname === '/v1/setup/child-llm' ? handleChildLlmSet(req) : handleAnswerPrioritySet(req);
+    if (pathname === "/v1/setup/channel-bots" && method === "OPTIONS")
+      return corsPreflight("GET, OPTIONS");
+    if (
+      (pathname === "/v1/setup/child-llm" ||
+        pathname === "/v1/setup/answer-priority") &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("GET, POST, OPTIONS");
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      return pathname === "/v1/setup/child-llm"
+        ? handleChildLlmSet(req)
+        : handleAnswerPrioritySet(req);
     }
     // Persona creation and editing require owner auth before parsing a write body.
-    if ((method === 'POST' && pathname === '/v1/personas')
-      || (method === 'PATCH' && pathname.startsWith('/v1/personas/'))) {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      (method === "POST" && pathname === "/v1/personas") ||
+      (method === "PATCH" && pathname.startsWith("/v1/personas/"))
+    ) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       const result = await dispatchPersonaRoute(req, pathname);
       if (result) return result;
     }
@@ -2686,99 +4010,111 @@ export async function routeRequest(
     // instead of falling through to the catch-all 404. The handler
     // itself rejects non-POST/OPTIONS — same surface as `/v1/llm/rotation`
     // siblings.
-    if (pathname === '/v1/llm/route/predict') {
+    if (pathname === "/v1/llm/route/predict") {
       return handleLlmRoutePredict(req, { missionRouter: opts.missionRouter });
     }
     // T4.D — mint a copy-friendly bearer for paste-on-other-device.
     // connect-info.ts promises this route is already-authenticated only;
     // the gate lives here (same pattern as SESSION_TURN_CONTROL_PATH /
     // /v1/publish/markdown). handleConnectTokenMint itself does not check.
-    if (pathname === '/v1/nexus/connect-info/mint-token' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/nexus/connect-info/mint-token" && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       const ci = opts.connectInfo;
       const ctx: ConnectInfoCtx = {
         hostname: bind.hostname,
         port: bind.port,
-        nexusVersion: ci?.nexusVersion ?? opts.state.nexusVersion ?? '0.0.0',
-        ...(ci?.serverLabel !== undefined ? { serverLabel: ci.serverLabel } : {}),
-        ...(ci?.acpTokenPath !== undefined ? { acpTokenPath: ci.acpTokenPath } : {}),
-        ...(ci?.acpTokenOverride !== undefined ? { acpTokenOverride: ci.acpTokenOverride } : {}),
+        nexusVersion: ci?.nexusVersion ?? opts.state.nexusVersion ?? "0.0.0",
+        ...(ci?.serverLabel !== undefined
+          ? { serverLabel: ci.serverLabel }
+          : {}),
+        ...(ci?.acpTokenPath !== undefined
+          ? { acpTokenPath: ci.acpTokenPath }
+          : {}),
+        ...(ci?.acpTokenOverride !== undefined
+          ? { acpTokenOverride: ci.acpTokenOverride }
+          : {}),
       };
       return handleConnectTokenMint(ctx);
     }
-    if (pathname.startsWith('/v1/nexus/errors') && method === 'DELETE') {
+    if (pathname.startsWith("/v1/nexus/errors") && method === "DELETE") {
       const parsed = parseErrorsPath(pathname);
-      if (parsed?.tabId && parsed.ts) return handleErrorDismiss(parsed.tabId, parsed.ts);
-      return jsonResponse({ error: 'tab-id-and-ts-required' }, 400);
+      if (parsed?.tabId && parsed.ts)
+        return handleErrorDismiss(parsed.tabId, parsed.ts);
+      return jsonResponse({ error: "tab-id-and-ts-required" }, 400);
     }
-    if (pathname.startsWith('/v1/config/secrets/') && method === 'DELETE') {
-      const id = pathname.slice('/v1/config/secrets/'.length);
+    if (pathname.startsWith("/v1/config/secrets/") && method === "DELETE") {
+      const id = pathname.slice("/v1/config/secrets/".length);
       return handleSecretDelete(id);
     }
     // RFC #2161 Phase 6 — POST trigger for an on-demand discovery run.
-    if (pathname === '/v1/registry/discovery' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/registry/discovery" && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       // ⭐ 요청의 abort 신호를 «실제로» 잇는다. 이게 없으면 취소 전파는 시험에서만
       //    도는 배관이고, 클라이언트가 끊어도 서버는 상한을 다 기다린다.
       return handleDiscoveryRun({ discovery: { signal: req.signal } });
     }
     // RFC #2161 Phase 5 — manual disable / enable per-provider.
-    if (pathname.startsWith('/v1/registry/resolved/') && method === 'PUT') {
-      const tail = pathname.slice('/v1/registry/resolved/'.length);
-      const sep = tail.indexOf('/');
-      if (sep > 0 && tail.slice(sep) === '/disable') {
+    if (pathname.startsWith("/v1/registry/resolved/") && method === "PUT") {
+      const tail = pathname.slice("/v1/registry/resolved/".length);
+      const sep = tail.indexOf("/");
+      if (sep > 0 && tail.slice(sep) === "/disable") {
         const providerId = decodeURIComponent(tail.slice(0, sep));
         return handleRegistryProviderDisable(req, providerId);
       }
     }
     // PR τ — /v1/registry/bindings/:channel/:key {POST|PATCH|DELETE}
-    if (pathname.startsWith('/v1/registry/bindings')) {
+    if (pathname.startsWith("/v1/registry/bindings")) {
       const parsed = parseBindingPath(pathname);
       if (parsed?.channel && parsed?.key) {
-        if (method === 'POST') return handleBindingPost(req, parsed.channel, parsed.key);
-        if (method === 'PATCH') return handleBindingPatch(req, parsed.channel, parsed.key);
-        if (method === 'DELETE') return handleBindingDelete(parsed.channel, parsed.key);
+        if (method === "POST")
+          return handleBindingPost(req, parsed.channel, parsed.key);
+        if (method === "PATCH")
+          return handleBindingPatch(req, parsed.channel, parsed.key);
+        if (method === "DELETE")
+          return handleBindingDelete(parsed.channel, parsed.key);
       }
     }
     // PR d · meta-API mutations (push subscribe / unsubscribe / test ·
     // voice transcribe · attachment upload). Returns 503 when the boot
     // orchestrator hasn't wired `metaApi` opts yet.
     if (opts.metaApi) {
-      if (pathname === '/v1/push/subscribe' && method === 'POST') {
+      if (pathname === "/v1/push/subscribe" && method === "POST") {
         return handleSubscribePush(req, opts.metaApi);
       }
-      if (pathname.startsWith('/v1/push/subscribe/') && method === 'DELETE') {
-        const id = pathname.slice('/v1/push/subscribe/'.length);
+      if (pathname.startsWith("/v1/push/subscribe/") && method === "DELETE") {
+        const id = pathname.slice("/v1/push/subscribe/".length);
         return handleUnsubscribePush(req, id, opts.metaApi);
       }
-      if (pathname === '/v1/push/test' && method === 'POST') {
+      if (pathname === "/v1/push/test" && method === "POST") {
         return handleTestPush(req, opts.metaApi);
       }
-      if (pathname === '/v1/voice/transcribe' && method === 'POST') {
+      if (pathname === "/v1/voice/transcribe" && method === "POST") {
         return handleVoiceTranscribe(req, opts.metaApi);
       }
-      if (pathname === '/v1/attachments' && method === 'POST') {
+      if (pathname === "/v1/attachments" && method === "POST") {
         return handleAttachmentUpload(req, opts.metaApi);
       }
       // IPC followup (2026-05-13) — universal agent.status push seam.
-      if (pathname === '/v1/agent-status' && method === 'POST') {
+      if (pathname === "/v1/agent-status" && method === "POST") {
         return handleAgentStatusPost(req, opts.metaApi);
       }
       // PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M2 — universal
       // hud.segment push seam (dashboard mirror · sidecar tools etc).
-      if (pathname === '/v1/hud-segment' && method === 'POST') {
+      if (pathname === "/v1/hud-segment" && method === "POST") {
         return handleHudSegmentPost(req, opts.metaApi);
       }
     } else if (
-      pathname === '/v1/push/subscribe'
-      || pathname.startsWith('/v1/push/subscribe/')
-      || pathname === '/v1/push/test'
-      || pathname === '/v1/voice/transcribe'
-      || pathname === '/v1/attachments'
-      || pathname === '/v1/agent-status'
-      || pathname === '/v1/hud-segment'
+      pathname === "/v1/push/subscribe" ||
+      pathname.startsWith("/v1/push/subscribe/") ||
+      pathname === "/v1/push/test" ||
+      pathname === "/v1/voice/transcribe" ||
+      pathname === "/v1/attachments" ||
+      pathname === "/v1/agent-status" ||
+      pathname === "/v1/hud-segment"
     ) {
-      return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     }
     // R3 v1 fix (2026-05-09 dogfood) — POST /v1/notification-action.
     // The original PR placed this route after the `method !== 'GET'`
@@ -2786,10 +4122,16 @@ export async function routeRequest(
     // all. The unit test calls `handleNotificationAction` directly
     // and bypassed the http-server routing — only end-to-end
     // dogfood (curl POST hitting the daemon) surfaced the regression.
-    if (pathname === '/v1/notification-action' && method === 'POST' && opts.intentPrediction) {
+    if (
+      pathname === "/v1/notification-action" &&
+      method === "POST" &&
+      opts.intentPrediction
+    ) {
       return handleNotificationAction(req, {
         service: opts.intentPrediction,
-        ...(opts.notificationActionLoopback ? { loopback: opts.notificationActionLoopback } : {}),
+        ...(opts.notificationActionLoopback
+          ? { loopback: opts.notificationActionLoopback }
+          : {}),
       });
     }
     // R-OCR.1.2 (2026-05-09) — POST /v1/notes/from-image (camera →
@@ -2799,54 +4141,77 @@ export async function routeRequest(
     // guard and silently 405'd until end-to-end curl surfaced it).
     // OPTIONS handled in the handler itself for PWA dev-mode cross-
     // origin preflight (matches /v1/showroom/role-judge sibling).
-    if (pathname === '/v1/notes/from-image' && (method === 'POST' || method === 'OPTIONS')) {
-      if (!opts.notesFromImage) return jsonResponse({ error: 'notes-from-image-not-wired' }, 503);
+    if (
+      pathname === "/v1/notes/from-image" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (!opts.notesFromImage)
+        return jsonResponse({ error: "notes-from-image-not-wired" }, 503);
       return handleNotesFromImage(req, opts.notesFromImage);
     }
     // R-OCR follow-up — POST /v1/notes/from-images (plural · batch).
     // Same multipart shape, repeated `image` + `filename` fields per
     // entry. Sibling registration to /v1/notes/from-image so audits
     // see the cluster + same `method !== 'GET'` guard placement.
-    if (pathname === '/v1/notes/from-images' && (method === 'POST' || method === 'OPTIONS')) {
-      if (!opts.notesFromImages) return jsonResponse({ error: 'notes-from-images-not-wired' }, 503);
+    if (
+      pathname === "/v1/notes/from-images" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (!opts.notesFromImages)
+        return jsonResponse({ error: "notes-from-images-not-wired" }, 503);
       return handleNotesFromImages(req, opts.notesFromImages);
     }
     // R-OCR.3.2 (2026-05-09) — POST /v1/notes/save (review modal
     // Confirm → vault write). Same `method !== 'GET'` placement as
     // /v1/notes/from-image · companion endpoint registered next to
     // it so audits see the cluster.
-    if (pathname === '/v1/notes/save' && (method === 'POST' || method === 'OPTIONS')) {
-      if (!opts.notesSave) return jsonResponse({ error: 'notes-save-not-wired' }, 503);
+    if (
+      pathname === "/v1/notes/save" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (!opts.notesSave)
+        return jsonResponse({ error: "notes-save-not-wired" }, 503);
       return handleNotesSave(req, opts.notesSave);
     }
     // PR Y2 (PLAN §5 popup synergy follow-up · 2026-05-17) — POST
-    // /v1/image/generate (iPad CodeMirror editor "+AI Image" toolbar).
+    // /v1/image/generate (iPad CodeMirror editor '+AI Image' toolbar).
     // gpt-image-2 wrapper + vault attachments PNG write. Same cluster
     // as notes-save so audits see the vault-write endpoints together.
-    if (pathname === '/v1/image/generate' && (method === 'POST' || method === 'OPTIONS')) {
-      if (!opts.imageGenerate) return jsonResponse({ error: 'image-generate-not-wired' }, 503);
+    if (
+      pathname === "/v1/image/generate" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (!opts.imageGenerate)
+        return jsonResponse({ error: "image-generate-not-wired" }, 503);
       return handleImageGenerate(req, opts.imageGenerate);
     }
     // B3 / Y2 follow-up (2026-05-17) — POST /v1/image/edit (iPad
     // image regenerate button). OpenAI Images Edits endpoint. Reuses
     // the imageGenerate opts (vault + OPENAI_API_KEY + fetchFn) so no
     // separate wire surface needed.
-    if (pathname === '/v1/image/edit' && (method === 'POST' || method === 'OPTIONS')) {
-      if (!opts.imageGenerate) return jsonResponse({ error: 'image-generate-not-wired' }, 503);
+    if (
+      pathname === "/v1/image/edit" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (!opts.imageGenerate)
+        return jsonResponse({ error: "image-generate-not-wired" }, 503);
       return handleImageEdit(req, opts.imageGenerate);
     }
     // R-OCR.4.2 (2026-05-09) — POST /v1/metrics/notes-event for PWA
     // -side events (cancel/edit/discard). Same `method !== 'GET'`
     // placement as the rest of the camera-notes cluster. The GET
     // snapshot endpoint sits in the GET-only block further down.
-    if (pathname === '/v1/metrics/notes-event' && (method === 'POST' || method === 'OPTIONS')) {
+    if (
+      pathname === "/v1/metrics/notes-event" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
       return handleNotesMetricsEvent(req, opts.notesMetrics ?? {});
     }
     // R5.4 (2026-05-09) — POST /v1/sessions/:id/decision (PWA
     // card deck swipe). Sibling to /v1/sessions/active (GET).
     {
       const sessId = parseSessionDecisionPath(pathname);
-      if (sessId !== null && (method === 'POST' || method === 'OPTIONS')) {
+      if (sessId !== null && (method === "POST" || method === "OPTIONS")) {
         return handleSessionsDecision(req, sessId, opts.sessionsDecision ?? {});
       }
     }
@@ -2856,28 +4221,40 @@ export async function routeRequest(
     // `userIntentLogger().emit(...)` directly. Lives inside the
     // method!=='GET' block per the lesson from R3 + intent-feedback
     // (POST routes outside this guard silently 405).
-    if (pathname === '/v1/user-intents/emit' && (method === 'POST' || method === 'OPTIONS')) {
+    if (
+      pathname === "/v1/user-intents/emit" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
       return handleUserIntentEmit(req);
     }
     // PR D (2026-05-15 iOS cascade) — POST /v1/user-intents/batch.
     // iOS UserIntentForwarder 의 50 ms coalesce flush 대상. 단일 emit 의
     // batched variant · 같은 logger.emit() path → 같은 JSONL line.
-    if (pathname === '/v1/user-intents/batch' && (method === 'POST' || method === 'OPTIONS')) {
+    if (
+      pathname === "/v1/user-intents/batch" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
       return handleUserIntentBatch(req);
     }
     // PR D-2 (2026-05-15 iOS cascade) — POST /v1/debug-logs/batch.
     // iOS DebugLogForwarder 의 50 ms coalesce flush 대상 · LogRecord JSONL
     // 을 `~/.elanous/debug-tap/<date>.jsonl` 에 append.
-    if (pathname === '/v1/debug-logs/batch' && (method === 'POST' || method === 'OPTIONS')) {
+    if (
+      pathname === "/v1/debug-logs/batch" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
       return handleDebugLogsBatch(req);
     }
-    if (pathname === '/v1/log-federation/batch') return handleLogFederationBatch(req);
-    if (pathname === '/v1/log-federation/revoke') return handleLogFederationRevoke(req);
+    if (pathname === "/v1/log-federation/batch")
+      return handleLogFederationBatch(req);
+    if (pathname === "/v1/log-federation/revoke")
+      return handleLogFederationRevoke(req);
     // W7 Z11.a-1 — outbound device token registry. GET allowed for the
     // counts debug surface; POST/DELETE for mutation. Wired only when
     // opts.outboundTokens carries a tokenStore (runNexus boot).
-    if (pathname === '/v1/devices/tokens') {
-      if (!opts.outboundTokens) return jsonResponse({ error: 'outbound-tokens-not-wired' }, 503);
+    if (pathname === "/v1/devices/tokens") {
+      if (!opts.outboundTokens)
+        return jsonResponse({ error: "outbound-tokens-not-wired" }, 503);
       return handleOutboundTokens(req, opts.outboundTokens);
     }
     // ── Cascade-zyu W9 / W9b / W9c endpoint dispatch (W9d-FU 2026-05-12) ──
@@ -2889,13 +4266,15 @@ export async function routeRequest(
     // W9 Z4 (#2428) — Approval Showroom (GET).
     const approvalRunId = parseApprovalShowroomPath(pathname);
     if (approvalRunId !== null) {
-      if (!opts.approvalShowroom) return jsonResponse({ error: 'approval-showroom-not-wired' }, 503);
+      if (!opts.approvalShowroom)
+        return jsonResponse({ error: "approval-showroom-not-wired" }, 503);
       return handleApprovalShowroom(req, approvalRunId, opts.approvalShowroom);
     }
     // W9 Z6 (#2429) — Workflow Design Studio (POST).
     const workflowDesignName = parseWorkflowDesignPath(pathname);
     if (workflowDesignName !== null) {
-      if (!opts.workflowDesign) return jsonResponse({ error: 'workflow-design-not-wired' }, 503);
+      if (!opts.workflowDesign)
+        return jsonResponse({ error: "workflow-design-not-wired" }, 503);
       return handleWorkflowDesign(req, workflowDesignName, opts.workflowDesign);
     }
     // W9c Z13-d (#2445) — Template capability preview.
@@ -2905,26 +4284,31 @@ export async function routeRequest(
       return handleConversationStats(req);
     }
     if (isTemplateCapabilityPreviewPath(pathname)) {
-      if (!opts.devices) return jsonResponse({ error: 'devices-not-wired' }, 503);
+      if (!opts.devices)
+        return jsonResponse({ error: "devices-not-wired" }, 503);
       return handleTemplateCapabilityPreview(req, opts.devices);
     }
     // W9c Z13-a (#2447) — Next-Scenario Fluent preview (POST).
     if (isNextFluentPreviewPath(pathname)) {
-      if (!opts.nextFluent) return jsonResponse({ error: 'next-fluent-not-wired' }, 503);
+      if (!opts.nextFluent)
+        return jsonResponse({ error: "next-fluent-not-wired" }, 503);
       return handleNextFluentPreview(req, opts.nextFluent);
     }
     // 2026-07-15 — Next-Fluent 칩 1-클릭 액션 실행(POST {refId, action}).
     if (isNextFluentDispatchPath(pathname)) {
-      if (!opts.nextFluent) return jsonResponse({ error: 'next-fluent-not-wired' }, 503);
+      if (!opts.nextFluent)
+        return jsonResponse({ error: "next-fluent-not-wired" }, 503);
       return handleNextFluentDispatch(req, opts.nextFluent);
     }
     // W9c Z13-c (#2448) — Morning Showroom + Idle Nudge (POST each).
     if (isMorningShowroomPath(pathname)) {
-      if (!opts.morningShowroom) return jsonResponse({ error: 'morning-showroom-not-wired' }, 503);
+      if (!opts.morningShowroom)
+        return jsonResponse({ error: "morning-showroom-not-wired" }, 503);
       return handleMorningShowroom(req, opts.morningShowroom);
     }
     if (isIdleNudgePath(pathname)) {
-      if (!opts.idleNudge) return jsonResponse({ error: 'idle-nudge-not-wired' }, 503);
+      if (!opts.idleNudge)
+        return jsonResponse({ error: "idle-nudge-not-wired" }, 503);
       return handleIdleNudge(req, opts.idleNudge);
     }
     // SAME bug, older surface — the existing
@@ -2939,7 +4323,10 @@ export async function routeRequest(
     // root cause. Re-dispatch here for POST so the existing
     // dispatch's method-check returns 200 instead of the catch-all
     // 405.
-    if (pathname.startsWith('/v1/intent-prediction/') && opts.intentPrediction) {
+    if (
+      pathname.startsWith("/v1/intent-prediction/") &&
+      opts.intentPrediction
+    ) {
       const result = await dispatchIntentPredictionRoute(req, url, {
         service: opts.intentPrediction,
       });
@@ -2949,8 +4336,9 @@ export async function routeRequest(
     // `metaApi` opts include the relevant runtime field (intakeStore /
     // history) the dispatcher fires; otherwise 503 not-wired so PWA
     // cutover (PR a) sees a stable error rather than 404.
-    if (pathname === '/v1/intake' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/intake" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleIntakePost(req, opts.metaApi);
     }
     // FU3 (2026-05-12) — Phase 1 pipeline wire smoke. Runs decompose →
@@ -2959,85 +4347,121 @@ export async function routeRequest(
     // provisioning first. `register: true` writes Mission + Task rows
     // into an in-memory store and returns the ids (user's TOX
     // untouched). Real LLM/plugins land in a follow-up PR.
-    if (pathname === '/v1/intake/pipeline-preview' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/intake/pipeline-preview" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleIntakePipelinePreviewPost(req, opts.metaApi);
     }
     // FU-I7c (2026-05-12) — sibling of pipeline-preview that writes to
     // the user's real TaskStore (`~/.elanous/tasks/tasks.db`) + persists
     // workflow YAMLs to `~/.elanous/workflows/`. PWA register flow flips
     // to this path once the user has confirmed the preview cards.
-    if (pathname === '/v1/intake/pipeline-commit' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/intake/pipeline-commit" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleIntakePipelineCommitPost(req, opts.metaApi);
     }
     // I1 — 판정만. `/v1/intake/` 세션 id 캐치올보다 앞에 둔다(pipeline-preview 와 같은 자리).
-    if (pathname === '/v1/intake/route' && (method === 'POST' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      pathname === "/v1/intake/route" &&
+      (method === "POST" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("POST, OPTIONS");
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleIntakeRoutePost(req);
     }
-    if (pathname.startsWith('/v1/intake/')) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      const suffix = pathname.slice('/v1/intake/'.length);
+    if (pathname.startsWith("/v1/intake/")) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      const suffix = pathname.slice("/v1/intake/".length);
       return handleIntakeIdRoute(req, suffix, opts.metaApi);
     }
-    if (pathname === '/v1/sessions/external' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/sessions/external" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleSessionRegister(req, opts.metaApi);
     }
     // 통합 로그 패브릭 (LF1) — 레벨 런타임 변경 (즉시 적용 + config write-through).
-    if (pathname === '/v1/logs/level' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/logs/level" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleLogsLevelPost(req, opts.metaApi);
     }
     // 라이브 세션 관리 — POST /v1/sessions/store/:id/fork (히스토리 복사 새 세션).
-    if (pathname.startsWith('/v1/sessions/store/') && pathname.endsWith('/fork') && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      const id = decodeURIComponent(pathname.slice('/v1/sessions/store/'.length, -'/fork'.length));
+    if (
+      pathname.startsWith("/v1/sessions/store/") &&
+      pathname.endsWith("/fork") &&
+      method === "POST"
+    ) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      const id = decodeURIComponent(
+        pathname.slice("/v1/sessions/store/".length, -"/fork".length),
+      );
       return handleSessionsStoreFork(req, id, opts.metaApi);
     }
-    if (pathname.startsWith('/v1/sessions/store/') && !pathname.endsWith('/fork') && method === 'PATCH') {
-      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
-      const id = decodeURIComponent(pathname.slice('/v1/sessions/store/'.length));
+    if (
+      pathname.startsWith("/v1/sessions/store/") &&
+      !pathname.endsWith("/fork") &&
+      method === "PATCH"
+    ) {
+      if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
+      const id = decodeURIComponent(
+        pathname.slice("/v1/sessions/store/".length),
+      );
       return handleSessionsStorePatch(req, id, opts.metaApi);
     }
     // on-disk 세션 삭제(파괴적) — 라이브 세션 관리. /store/:id (fork/transcript 와 구분).
-    if (pathname.startsWith('/v1/sessions/store/') && !pathname.endsWith('/fork') && method === 'DELETE') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      const id = decodeURIComponent(pathname.slice('/v1/sessions/store/'.length));
+    if (
+      pathname.startsWith("/v1/sessions/store/") &&
+      !pathname.endsWith("/fork") &&
+      method === "DELETE"
+    ) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      const id = decodeURIComponent(
+        pathname.slice("/v1/sessions/store/".length),
+      );
       return handleSessionsStoreDelete(req, id, opts.metaApi);
     }
-    if (pathname.startsWith('/v1/sessions/') && method === 'DELETE') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      const id = decodeURIComponent(pathname.slice('/v1/sessions/'.length));
+    if (pathname.startsWith("/v1/sessions/") && method === "DELETE") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      const id = decodeURIComponent(pathname.slice("/v1/sessions/".length));
       return handleSessionDelete(req, id, opts.metaApi);
     }
-    if (pathname === '/v1/control-signals' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/control-signals" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleControlSignalsEmit(req, opts.metaApi);
     }
     // PR f/k · `/v1/prompt` — daemon-http-server 의 마지막 활성 endpoint
     // 가 NEXUS 로 통합. metaApi.history 가 wired 되면 dispatcher 로
     // 진입; 미wired 면 503 not-wired.
-    if (pathname === '/v1/prompt' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/prompt" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handlePromptPost(req, opts.metaApi);
     }
     // Phase B-1 (PWA chat streaming · 2026-05-06) — SSE variant of
     // /v1/prompt. Same auth + body shape; emits text-delta + turn-end
     // events instead of a single JSON body. PWA `chat-runtime`
     // streaming consumer is the only caller.
-    if (pathname === '/v1/prompt/stream' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/prompt/stream" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handlePromptStreamPost(req, opts.metaApi);
     }
     // PR h/k · hitl callback-server NEXUS-host. Pushcut Shortcut posts
     // here after the user taps Yes/No. metaApi.hitlPending wired →
     // resolveAnswer → 200; 미wired → 503. unknown requestId → 404.
-    if (pathname.startsWith('/v1/hitl/callback/') && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-      const requestId = decodeURIComponent(pathname.slice('/v1/hitl/callback/'.length));
+    if (pathname.startsWith("/v1/hitl/callback/") && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+      const requestId = decodeURIComponent(
+        pathname.slice("/v1/hitl/callback/".length),
+      );
       return handleHitlCallback(req, requestId, opts.metaApi);
     }
     // Round 3 PR1 (β-3 · 2026-05-08) — PWA Settings Pushcut card POST
@@ -3045,19 +4469,31 @@ export async function routeRequest(
     // recent`) lives in the GET-only block further down — placing it
     // here was a dead-code bug surfaced by FU.4 envelope audit
     // (2026-05-09) since `method !== 'GET'` outer guards it out.
-    if (pathname === '/v1/hitl/test-pushcut' && method === 'POST') {
+    if (pathname === "/v1/hitl/test-pushcut" && method === "POST") {
       return handleHitlTestPushcut(req);
     }
     // P8c — daemon-integrated HITL 매매 제안. verify 게이트 → Pushcut(아이폰)
     // 2단계 승인(requestConfirmation이 pending 등록 → 콜백 resolve). executor
     // 미배선이라 승인해도 집행 없음.
-    if (pathname === '/v1/trade/propose' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-      let trading: { handleTradeProposal(req: Request, metaApi: NonNullable<typeof opts.metaApi>): Promise<Response> };
+    if (pathname === "/v1/trade/propose" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
+      let trading: {
+        handleTradeProposal(
+          req: Request,
+          metaApi: NonNullable<typeof opts.metaApi>,
+        ): Promise<Response>;
+      };
       try {
-        trading = await import(TRADE_PROPOSAL_MODULE) as typeof trading;
+        trading = (await import(TRADE_PROPOSAL_MODULE)) as typeof trading;
       } catch {
-        return jsonResponse({ error: 'trading-addon-not-installed', detail: '매매 실행은 애드온이다 — 공개 코어엔 없다' }, 501);
+        return jsonResponse(
+          {
+            error: "trading-addon-not-installed",
+            detail: "매매 실행은 애드온이다 — 공개 코어엔 없다",
+          },
+          501,
+        );
       }
       return trading.handleTradeProposal(req, opts.metaApi);
     }
@@ -3065,149 +4501,181 @@ export async function routeRequest(
     // POST /:name/run + PUT /:name + DELETE /:name. The matching GET
     // routes (list / detail / run-status) sit in the GET-only block
     // below.
-    if (pathname === '/v1/workflows/validate' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (pathname === "/v1/workflows/validate" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
       return handleWorkflowValidate(req, opts.metaApi);
     }
     // ROADMAP Tier 1 W1 (2026-05-11) — POST /v1/workflows/generate.
     // Natural-language → workflow YAML via LLM. Returns YAML + warnings.
-    if (pathname === '/v1/workflows/generate' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (pathname === "/v1/workflows/generate" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
       return handleWorkflowGenerate(req, opts.metaApi);
     }
     // Surface-unification §C1 (2026-05-11) — POST /v1/workflows/synth.
     // R3 native skill `workflow.synth_from_intent`. Trigger-aware LLM
     // synth → YAML + workflowName + triggerSummary. Returns 200 (ok)
     // or 422 (LLM produced invalid YAML even after self-repair).
-    if (pathname === '/v1/workflows/synth' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (pathname === "/v1/workflows/synth" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
       return handleWorkflowSynth(req, opts.metaApi);
     }
     // BACKLOG #7 production wiring — LLM-based workflow router.
     // Caller posts userMessage → discovers workflows → builds router
     // prompt → calls LLM → returns picked name (or null + error).
-    if (pathname === '/v1/workflows/route' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (pathname === "/v1/workflows/route" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
       return handleWorkflowRoute(req, opts.metaApi);
     }
     // HANDOFF §4.2 follow-up — skill-side mirror of the workflow
     // router. Same regex → LLM cascade, applied to the skill index.
     // SK2 (PWA) — skills the index could not read: list ⊕ confirmed repair.
-    if (pathname === '/v1/skills/problems' || pathname === '/v1/skills/problems/repair') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-      const { handleSkillProblems } = await import('./skill-problems.js');
+    if (
+      pathname === "/v1/skills/problems" ||
+      pathname === "/v1/skills/problems/repair"
+    ) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
+      const { handleSkillProblems } = await import("./skill-problems.js");
       return handleSkillProblems(req, opts.metaApi);
     }
     // SC1 (PWA · beta) — «공유용 캡처»: masked screen PNG in, metadata chunks stripped, stored under <configDir>/captures.
-    if (pathname === '/v1/captures' || pathname.startsWith('/v1/captures/')) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-      const { handleShareCaptures } = await import('./share-captures.js');
+    if (pathname === "/v1/captures" || pathname.startsWith("/v1/captures/")) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
+      const { handleShareCaptures } = await import("./share-captures.js");
       return handleShareCaptures(req, opts.metaApi);
     }
-    if (pathname === '/v1/skills/route' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (pathname === "/v1/skills/route" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
       return handleSkillRoute(req, opts.metaApi);
     }
     // HANDOFF §4.2 follow-up — GUI-driven worktree cleanup.
     // POST `/v1/worktrees/dispose` body `{path, force?}` runs
     // `git worktree remove` (or just clears an orphan session JSON
     // when the worktree dir already vanished).
-    if (pathname === '/v1/worktrees/dispose' && method === 'POST') {
+    if (pathname === "/v1/worktrees/dispose" && method === "POST") {
       return handleWorktreeDispose(req);
     }
-    if (pathname.startsWith('/v1/workflows/')) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-      const tail = pathname.slice('/v1/workflows/'.length);
-      const segments = tail.split('/');
+    if (pathname.startsWith("/v1/workflows/")) {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-not-wired" }, 503);
+      const tail = pathname.slice("/v1/workflows/".length);
+      const segments = tail.split("/");
       // §5.1 approval — POST /runs/<runId>/{approve,reject}. Match
       // these BEFORE the workflow-name branch so `runs` doesn't get
       // misread as a workflow name.
       if (
-        segments[0] === 'runs'
-        && segments.length === 3
-        && method === 'POST'
-        && (segments[2] === 'approve' || segments[2] === 'reject')
+        segments[0] === "runs" &&
+        segments.length === 3 &&
+        method === "POST" &&
+        (segments[2] === "approve" || segments[2] === "reject")
       ) {
-        const runId = decodeURIComponent(segments[1] ?? '');
-        if (!runId || runId.includes('/') || runId.includes('..')) {
-          return jsonResponse({ error: 'bad_request', reason: 'invalid runId' }, 400);
+        const runId = decodeURIComponent(segments[1] ?? "");
+        if (!runId || runId.includes("/") || runId.includes("..")) {
+          return jsonResponse(
+            { error: "bad_request", reason: "invalid runId" },
+            400,
+          );
         }
-        return segments[2] === 'approve'
+        return segments[2] === "approve"
           ? handleWorkflowApprovalApprove(req, runId, opts.metaApi)
           : handleWorkflowApprovalReject(req, runId, opts.metaApi);
       }
-      const wfName = decodeURIComponent(segments[0] ?? '');
-      if (!wfName || wfName.includes('\\') || wfName.includes('..')) {
-        return jsonResponse({ error: 'bad_request', reason: 'invalid workflow name' }, 400);
+      const wfName = decodeURIComponent(segments[0] ?? "");
+      if (!wfName || wfName.includes("\\") || wfName.includes("..")) {
+        return jsonResponse(
+          { error: "bad_request", reason: "invalid workflow name" },
+          400,
+        );
       }
       if (segments.length === 1) {
-        if (method === 'PUT') return handleWorkflowPut(req, wfName, opts.metaApi);
-        if (method === 'DELETE') return handleWorkflowDelete(req, wfName, opts.metaApi);
+        if (method === "PUT")
+          return handleWorkflowPut(req, wfName, opts.metaApi);
+        if (method === "DELETE")
+          return handleWorkflowDelete(req, wfName, opts.metaApi);
       }
-      if (segments.length === 2 && segments[1] === 'run' && method === 'POST') {
+      if (segments.length === 2 && segments[1] === "run" && method === "POST") {
         return handleWorkflowRunStart(req, wfName, opts.metaApi);
       }
     }
     // CV-3 P5.x — agent CLI REST surface (real codex/claude/gemini
     // sub-process spawn via globalDualRoleManager).
-    if (pathname === '/v1/agent-cli/sessions' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/agent-cli/sessions" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleAgentCliCreateSession(req, opts.metaApi);
     }
-    if (pathname === '/v1/agent-cli/prompt' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/agent-cli/prompt" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleAgentCliPromptStream(req, opts.metaApi);
     }
-    if (pathname === '/v1/agent-cli/cancel' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/agent-cli/cancel" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleAgentCliCancel(req, opts.metaApi);
     }
     // R4 v1.2 (2026-07-07) — 대시보드 refresh 버튼의 온디맨드 라이브 재수집.
     // POST 라 mutation 블록 안(memory `feedback_post_route_must_be_in_method_block`).
-    if (pathname === '/v1/dashboard/refresh-live' && method === 'POST') {
+    if (pathname === "/v1/dashboard/refresh-live" && method === "POST") {
       return handleDashboardRefreshLive(req, opts.dashboard ?? {});
     }
     // P2 (2026-07-08) — /scheduler 쓰기 액션(adopt/release/enable/disable/delete/
     // update/create). CLI·schedule_manage 와 동일 dispatchScheduleManage 백엔드 재사용.
     // POST 라 mutation 블록 안(memory `feedback_post_route_must_be_in_method_block`).
-    if (pathname === '/v1/schedules/action' && method === 'POST') {
+    if (pathname === "/v1/schedules/action" && method === "POST") {
       return handleSchedulesActionPost(req);
     }
     // 흡수 원장 입구(RFC-pwa-intake-front-door A3 absorb) — 넣기·추적 둘 다 인증(PWA 칸은 user-private).
-    if (pathname === '/v1/intake-ledger/items' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      const { handleIntakeLedgerPost } = await import('./intake-ledger-api.js');
+    if (pathname === "/v1/intake-ledger/items" && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const { handleIntakeLedgerPost } = await import("./intake-ledger-api.js");
       return handleIntakeLedgerPost(req);
     }
-    if (pathname === '/v1/vault/file' && (method === 'PUT' || method === 'OPTIONS')) {
-      if (method === 'OPTIONS') return corsPreflight('PUT, OPTIONS');
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (
+      pathname === "/v1/vault/file" &&
+      (method === "PUT" || method === "OPTIONS")
+    ) {
+      if (method === "OPTIONS") return corsPreflight("PUT, OPTIONS");
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleVaultFilePut(req);
     }
     {
       const vaultSeg = parseVaultPath(pathname);
-      if (vaultSeg !== null && method === 'OPTIONS') return corsPreflight('GET, OPTIONS');
+      if (vaultSeg !== null && method === "OPTIONS")
+        return corsPreflight("GET, OPTIONS");
     }
     // Obsidian Vault PWA 이식 OP0 (2026-07-09) — 템플릿 전개(POST). GET reads 는 아래.
-    if (pathname === '/v1/vault/template-expand' && method === 'POST') {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (pathname === "/v1/vault/template-expand" && method === "POST") {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleTemplateExpand(req);
     }
     // B outbound — unified send: openclaw reports + Conatus alerts POST here
     // instead of hitting Telegram directly, so all outbound fans out through
     // elanous's report channel.
-    if (pathname === '/v1/outbound' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/outbound" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleOutboundReport(req, opts.metaApi);
     }
-    if (pathname === '/v1/self-event' && method === 'POST') {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (pathname === "/v1/self-event" && method === "POST") {
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleSelfEvent(req, opts.metaApi);
     }
     {
       const agentCliSid = parseAgentCliSessionPath(pathname);
-      if (agentCliSid !== null && method === 'DELETE') {
-        if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (agentCliSid !== null && method === "DELETE") {
+        if (!opts.metaApi)
+          return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
         return handleAgentCliCloseSession(req, opts.metaApi, agentCliSid);
       }
     }
@@ -3220,24 +4688,28 @@ export async function routeRequest(
         // dev. PUT/DELETE both ship JSON bodies + bearer auth, which
         // forces a browser preflight even when the response is
         // identical to the same-origin path.
-        if (method === 'OPTIONS') return corsPreflight();
-        if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-        if (method === 'PUT') return handleShowroomLayoutPut(req, opts.metaApi, layoutName);
-        if (method === 'DELETE') return handleShowroomLayoutDelete(req, opts.metaApi, layoutName);
+        if (method === "OPTIONS") return corsPreflight();
+        if (!opts.metaApi)
+          return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+        if (method === "PUT")
+          return handleShowroomLayoutPut(req, opts.metaApi, layoutName);
+        if (method === "DELETE")
+          return handleShowroomLayoutDelete(req, opts.metaApi, layoutName);
       }
     }
     const mutation = dispatchMutation(req, {
       state: opts.state,
       registry: opts.registry,
       authorize: opts.metaApi
-        ? (request: Request) => (
-          checkAuth(request, opts.metaApi!) ? undefined : jsonResponse({ error: 'unauthorized' }, 401)
-        )
-        : () => jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503),
+        ? (request: Request) =>
+            checkAuth(request, opts.metaApi!)
+              ? undefined
+              : jsonResponse({ error: "unauthorized" }, 401)
+        : () => jsonResponse({ error: "meta-api-runtime-not-wired" }, 503),
       ...(opts.supervisor ? { supervisor: opts.supervisor } : {}),
     });
     if (mutation.matched) return mutation.response!;
-    return jsonResponse({ error: 'method-not-allowed', method }, 405);
+    return jsonResponse({ error: "method-not-allowed", method }, 405);
   }
 
   // P-2B.1 — devProxy wins over staticDir + matches the wider /_next/*
@@ -3248,7 +4720,9 @@ export async function routeRequest(
   // take effect on the next dispatch.
   const liveDevProxy = devProxyRef.get();
   if (liveDevProxy && pathMatchesDevProxy(pathname)) {
-    return handleDevProxyHttpRequest(req, url, { upstream: liveDevProxy.upstream });
+    return handleDevProxyHttpRequest(req, url, {
+      upstream: liveDevProxy.upstream,
+    });
   }
 
   // T5.A — /app/* static (PWA export). When staticDir is omitted, falls
@@ -3257,44 +4731,51 @@ export async function routeRequest(
     if (opts.staticDir) {
       return handleStaticAppRequest(url, { staticDir: opts.staticDir });
     }
-    return jsonResponse({ error: 'static-not-wired' }, 404);
+    return jsonResponse({ error: "static-not-wired" }, 404);
   }
   // OPS1·OPS2 — whether this caller is an operator (draws the ops area). Answers everyone before any auth gate;
   // false unless this daemon's config has operator.enabled.
-  if (pathname === '/v1/me' && req.method === 'GET') return handleMe(req, opts.metaApi ?? ({} as MetaApiOpts));
-  if (pathname === '/v1/health') {
+  if (pathname === "/v1/me" && req.method === "GET")
+    return handleMe(req, opts.metaApi ?? ({} as MetaApiOpts));
+  if (pathname === "/v1/health") {
     return handleHealth(opts.state, opts.registry, {
       bindHost: bind.hostname,
       ...(opts.setup ? { setup: opts.setup } : {}),
     });
   }
-  if (pathname === '/v1/nexus') return handleNexusSnapshot(opts.state, opts.registry);
-  if (pathname === '/v1/nexus/tabs') return handleTabsList(opts.registry, url);
-  if (pathname === '/v1/nexus/templates') return handleTemplatesList();
+  if (pathname === "/v1/nexus")
+    return handleNexusSnapshot(opts.state, opts.registry);
+  if (pathname === "/v1/nexus/tabs") return handleTabsList(opts.registry, url);
+  if (pathname === "/v1/nexus/templates") return handleTemplatesList();
   // PR d · meta-API GET routes. VAPID public key is unauthed (PWA fetches
   // before pasting bearer); voice cost + attachment download are gated.
-  if (pathname === '/v1/push/vapid-public-key') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/push/vapid-public-key") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleVapidPublicKey();
   }
   // T5.D — GET /v1/push/subscriptions list (PWA Notifications 카드 사용).
-  if (pathname === '/v1/push/subscriptions') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/push/subscriptions") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleListPushSubscriptions(req, opts.metaApi);
   }
-  if (pathname === '/v1/voice/cost') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/voice/cost") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleVoiceCost(req, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/attachments/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    const id = pathname.slice('/v1/attachments/'.length);
+  if (pathname.startsWith("/v1/attachments/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    const id = pathname.slice("/v1/attachments/".length);
     return handleAttachmentGet(req, id, opts.metaApi);
   }
   // ⭐ 로컬에 보관한 생성물(`OBS-T526`) — 복원이 상대 CDN 수명(30일)에 안 걸리게 한다.
-  if (pathname.startsWith('/v1/media/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    const id = decodeURIComponent(pathname.slice('/v1/media/'.length));
+  if (pathname.startsWith("/v1/media/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    const id = decodeURIComponent(pathname.slice("/v1/media/".length));
     return handleMediaGet(req, id, opts.metaApi);
   }
   // PR e/k · read-only meta-API GET routes. When the matching runtime
@@ -3303,12 +4784,14 @@ export async function routeRequest(
   // 503 — PR k delivers intake / sessions / control-signals / tools /
   // simulations runtime; the screenshot / recording runtime is a
   // post-T3 follow-up.
-  if (pathname === '/v1/simulations') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/simulations") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleSimulationsList(req, opts.metaApi);
   }
-  if (pathname === '/v1/tools') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/tools") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleToolsList(req, opts.metaApi);
   }
   // B 트랙 Post-Closure (2026-05-13) — full ToolRuntime registry list
@@ -3317,8 +4800,9 @@ export async function routeRequest(
   // exposes the daemon-side bounded LLM surface (read by PWA
   // Settings); this route exposes EVERY registered runtime so
   // external curl callers can discover proxy MCP tools too.
-  if (pathname === '/v1/tools/runtime') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/tools/runtime") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleRuntimeToolsList(req, opts.metaApi, url);
   }
   // CV-3 P4.2 — daemon-side terminal scrollback for Showroom auto-fetch
@@ -3326,42 +4810,48 @@ export async function routeRequest(
   // 直接 (process-wide singleton — no MetaApiOpts runtime needed beyond
   // auth gate).
   // ★ PTY 관측소(2026-07-23) — 헤드리스 셸 라이브 뷰(HTML·same-origin·인증 shell 불필요·데이터 fetch 는 gated).
-  if (pathname === '/v1/terminals/view') {
+  if (pathname === "/v1/terminals/view") {
     return handleTerminalsView();
   }
-  if (pathname === '/v1/terminals') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/terminals") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleTerminalsList(req, opts.metaApi);
   }
   if (parseTerminalLineagePath(pathname)) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleTerminalLineage(req, opts.metaApi);
   }
   {
     const runId = parseTerminalRunGoalPath(pathname);
     if (runId !== null) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleTerminalRunGoal(req, opts.metaApi, runId);
     }
   }
   {
     const runId = parseTerminalRunParticipantsPath(pathname);
     if (runId !== null) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleTerminalRunParticipants(req, opts.metaApi, runId);
     }
   }
   {
     const streamId = parseTerminalStreamPath(pathname);
     if (streamId !== null) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleTerminalStream(req, opts.metaApi, streamId);
     }
   }
   {
     const scrollbackId = parseScrollbackPath(pathname);
     if (scrollbackId !== null) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleTerminalScrollback(req, opts.metaApi, scrollbackId, url);
     }
   }
@@ -3369,7 +4859,8 @@ export async function routeRequest(
   {
     const frameId = parseFramePath(pathname);
     if (frameId !== null) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleTerminalFrame(req, opts.metaApi, frameId, url);
     }
   }
@@ -3377,7 +4868,8 @@ export async function routeRequest(
   {
     const pngId = parsePngPath(pathname);
     if (pngId !== null) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleTerminalPng(req, opts.metaApi, pngId);
     }
   }
@@ -3387,72 +4879,86 @@ export async function routeRequest(
   // R6 FU.4 (2026-05-09) — moved here from the `method !== 'GET'`
   // block so the GET request actually reaches the handler. PWA
   // Settings Pushcut card reads the audit log tail.
-  if (pathname === '/v1/hitl/audit/recent') {
+  if (pathname === "/v1/hitl/audit/recent") {
     return handleHitlAuditRecent(req);
   }
   // micro.3 (2026-05-09) — LLM model list proxy. PWA Showroom
   // header dropdown reads this to enumerate deployed models.
-  if (pathname === '/v1/llm/models') {
+  if (pathname === "/v1/llm/models") {
     return handleLlmModels(req);
   }
   // R-OCR.4.2 (2026-05-09) — snapshot of the camera-notes metric
   // collector. PWA Settings card polls this. Returns an empty
   // snapshot (wired:false) when the collector isn't wired so the
   // card can render gracefully even pre-runNexus-rewire.
-  if (pathname === '/v1/metrics/notes-from-image') {
+  if (pathname === "/v1/metrics/notes-from-image") {
     return handleNotesMetricsSnapshot(req, opts.notesMetrics ?? {});
   }
   // R5.0 (2026-05-09) — active sessions snapshot for the PWA card
   // deck. Sibling to /v1/sessions; this one filters to recent +
   // adds a status pill (active / idle / stale).
-  if (pathname === '/v1/sessions/active') {
+  if (pathname === "/v1/sessions/active") {
     return handleSessionsActive(req, opts.sessionsActive ?? {});
   }
   // 통합 로그 패브릭 (LF1 · 2026-07-13) — 조회/스트림/레벨. logs.db(LF0) 위의
   // adb logcat 서버 반쪽. 설계: PLAN-unified-log-fabric-2026-07-13 §LF1.
-  if (pathname === '/v1/logs' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/logs" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleLogsQuery(req, opts.metaApi);
   }
   // Trace (v6 T1 · 2026-09-28) — 판단 사슬 L0–L3 ⊕ 증거 한 줄. 읽기만 한다.
-  if (pathname === '/v1/trace' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/trace" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleTrace(req, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/trace/evidence/') && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    return handleTraceEvidence(req, opts.metaApi, pathname.slice('/v1/trace/evidence/'.length));
+  if (pathname.startsWith("/v1/trace/evidence/") && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    return handleTraceEvidence(
+      req,
+      opts.metaApi,
+      pathname.slice("/v1/trace/evidence/".length),
+    );
   }
-  if (pathname === '/v1/logs/stream' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/logs/stream" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleLogsStream(req, opts.metaApi);
   }
-  if (pathname === '/v1/logs/level' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/logs/level" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleLogsLevelGet(req, opts.metaApi);
   }
-  if (pathname === '/v1/logs/facets' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/logs/facets" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleLogsFacets(req, opts.metaApi);
   }
-  if (pathname === '/v1/logs/histogram' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/logs/histogram" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleLogsHistogram(req, opts.metaApi);
   }
   // LF7-d — 연합 뷰: 인스턴스 목록(셀렉터 데이터). 조회/스트림/집계는
   // `?store=<name>` 파라미터로 타 인스턴스 read-only 조회.
-  if (pathname === '/v1/logs/instances' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/logs/instances" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleLogsInstances(req, opts.metaApi);
   }
   // 라이브 세션 관리 — on-disk 세션(CLI+텔레그램 실화) 목록/내용.
-  if (pathname === '/v1/sessions/store' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/sessions/store" && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleSessionsStoreList(req, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/sessions/store/') && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    const id = decodeURIComponent(pathname.slice('/v1/sessions/store/'.length));
+  if (pathname.startsWith("/v1/sessions/store/") && method === "GET") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    const id = decodeURIComponent(pathname.slice("/v1/sessions/store/".length));
     return handleSessionsStoreGet(req, id, opts.metaApi);
   }
   // R6.2 (2026-05-09) — daily reflection. /v1/reflection/today +
@@ -3465,7 +4971,7 @@ export async function routeRequest(
     }
   }
   // 통합 시그널 보드(2026-07-10) — 4소스(버즈·디깅/타임라인·국면·회고) recency 감지 피드.
-  if (pathname === '/v1/signals/board') {
+  if (pathname === "/v1/signals/board") {
     return handleSignalBoard(req);
   }
   // R4 (2026-07-07) — finance dashboard read API (organic-signal-engine).
@@ -3488,7 +4994,8 @@ export async function routeRequest(
   {
     const seg = parseVaultPath(pathname);
     if (seg !== null) {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
       return handleVaultGet(req, seg);
     }
   }
@@ -3504,87 +5011,116 @@ export async function routeRequest(
   // FU.A3 (2026-05-09) — multi-host config GET. Returns the
   // effective host config + source label ('override' | 'env' |
   // 'legacy') with apiKey fields redacted.
-  if (pathname === '/v1/llm/hosts') {
+  if (pathname === "/v1/llm/hosts") {
     return handleLlmHostsConfig(req);
   }
   // iOS Phase 1.5 (2026-05-13) — provider rotation list + active.
   // POST sibling lives in the mutation block above.
-  if (pathname === '/v1/llm/rotation') {
+  if (pathname === "/v1/llm/rotation") {
     return handleLlmRotationGet(req);
   }
   // PWA `/setup` wizard Phase 1 (2026-05-19) — provider catalog 표시.
   // POST sibling (`/v1/setup/llm-provider`) 는 위 mutation 블록.
-  if (pathname === '/v1/setup/codex-login') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/setup/codex-login") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleSetupCodexLoginGet();
   }
-  if (pathname === '/v1/credentials/slots' && method === 'GET') {
+  if (pathname === "/v1/credentials/slots" && method === "GET") {
     return handleCredentialSlotsGet(req, {
-      authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
-      ...(opts.credentialHealthObserver ? { healthObserver: opts.credentialHealthObserver } : {}),
+      authorizeOwner: (request) =>
+        !!opts.metaApi &&
+        checkAuth(request, opts.metaApi) &&
+        !setupBearerScopeDenied(request, opts.metaApi),
+      ...(opts.credentialHealthObserver
+        ? { healthObserver: opts.credentialHealthObserver }
+        : {}),
     });
   }
-  if (pathname === '/v1/credentials/openrouter/oauth/callback' && method === 'GET') {
+  if (
+    pathname === "/v1/credentials/openrouter/oauth/callback" &&
+    method === "GET"
+  ) {
     return handleOpenRouterOAuthCallback(req);
   }
-  if (pathname === '/v1/credentials/openrouter/import' && method === 'GET') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi) || setupBearerScopeDenied(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/credentials/openrouter/import" && method === "GET") {
+    if (
+      !opts.metaApi ||
+      !checkAuth(req, opts.metaApi) ||
+      setupBearerScopeDenied(req, opts.metaApi)
+    )
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleOpenRouterImportCandidates(req);
   }
-  if (pathname === '/v1/setup/llm-providers') {
+  if (pathname === "/v1/setup/llm-providers") {
     return handleLlmProvidersList(req);
   }
-  if (pathname === '/v1/setup/obsidian-skills') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/setup/obsidian-skills") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleObsidianSkillsGet();
   }
-  if (pathname === '/v1/setup/channel-bots') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/setup/channel-bots") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleChannelBotsGet();
   }
-  if (pathname === '/v1/setup/child-llm' || pathname === '/v1/setup/answer-priority') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return pathname === '/v1/setup/child-llm' ? handleChildLlmGet() : handleAnswerPriorityGet();
+  if (
+    pathname === "/v1/setup/child-llm" ||
+    pathname === "/v1/setup/answer-priority"
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return pathname === "/v1/setup/child-llm"
+      ? handleChildLlmGet()
+      : handleAnswerPriorityGet();
   }
   // P1-FU1 (2026-05-14) — mission router prediction is POST-only.
   // GET reaches here AFTER the mutation block (which only fires when
   // `method !== 'GET'`); routing the path here lets the handler
   // return its 405 fallback (with `error: 'method-not-allowed'`)
   // instead of falling through to the catch-all 404.
-  if (pathname === '/v1/llm/route/predict') {
+  if (pathname === "/v1/llm/route/predict") {
     return handleLlmRoutePredict(req, { missionRouter: opts.missionRouter });
   }
   // CV-3 FP-B — Showroom layout cross-device store (GET routes).
-  if (pathname === '/v1/showroom/layouts') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/showroom/layouts") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleShowroomLayoutsList(req, opts.metaApi);
   }
   // R6 FU.3 (2026-05-09) — SSE for sidebar widget refresh. Must
-  // match BEFORE the `:name` regex so the literal "events" segment
+  // match BEFORE the `:name` regex so the literal 'events' segment
   // isn't misread as a layout id (cf. §6.4 SSE precedence pattern).
-  if (pathname === '/v1/showroom/layouts/events') {
+  if (pathname === "/v1/showroom/layouts/events") {
     return handleShowroomLayoutsEvents(req);
   }
   {
     const layoutName = parseShowroomLayoutPath(pathname);
     if (layoutName !== null) {
-      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      if (!opts.metaApi)
+        return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
       return handleShowroomLayoutGet(req, opts.metaApi, layoutName);
     }
   }
-  if (pathname === '/v1/diag/auth-trace') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/diag/auth-trace") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleAuthTraceGet(req, opts.metaApi);
   }
-  if (pathname === '/v1/intake') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/intake") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleIntakeListGet(req, url, opts.metaApi);
   }
   // 흡수 원장 추적 — 인증 필수(PWA 칸은 user-private · 넣기는 위 method!=='GET' 블록).
-  if (pathname.startsWith('/v1/intake-ledger/items/')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    const { handleIntakeLedgerGet } = await import('./intake-ledger-api.js');
-    return handleIntakeLedgerGet(decodeURIComponent(pathname.slice('/v1/intake-ledger/items/'.length)));
+  if (pathname.startsWith("/v1/intake-ledger/items/")) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    const { handleIntakeLedgerGet } = await import("./intake-ledger-api.js");
+    return handleIntakeLedgerGet(
+      decodeURIComponent(pathname.slice("/v1/intake-ledger/items/".length)),
+    );
   }
   // I10 (2026-05-12) — dogfood retrospective. Reads recent rows from
   // ~/.elanous/intake/pipeline-runs.jsonl + aggregates across the full
@@ -3592,42 +5128,53 @@ export async function routeRequest(
   // dispatched in the method!=='GET' block above). Must dispatch
   // before the `/v1/intake/` catch-all so it doesn't get swallowed
   // as an intake id.
-  if (pathname === '/v1/intake/runs') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/intake/runs") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleIntakeRunsList(req, opts.metaApi);
   }
   // D8 (2026-05-12) — Phase 2 dispatch dogfood retrospective. Sibling
   // to /v1/intake/runs (I10). Reads ~/.elanous/dispatch/runs.jsonl +
   // aggregates per-axis success rates / top reject reasons.
-  if (pathname === '/v1/dispatch/runs') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/dispatch/runs") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleDispatchRunsList(req, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/intake/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    const suffix = pathname.slice('/v1/intake/'.length);
+  if (pathname.startsWith("/v1/intake/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    const suffix = pathname.slice("/v1/intake/".length);
     return handleIntakeIdRoute(req, suffix, opts.metaApi);
   }
-  if (pathname === '/v1/sessions') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/sessions") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleSessionsList(req, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/sessions/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
-    const id = decodeURIComponent(pathname.slice('/v1/sessions/'.length));
+  if (pathname.startsWith("/v1/sessions/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
+    const id = decodeURIComponent(pathname.slice("/v1/sessions/".length));
     return handleSessionGet(req, id, opts.metaApi);
   }
-  if (pathname === '/v1/control-signals') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/control-signals") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleControlSignalsList(req, url, opts.metaApi);
   }
   // T5.C — last-screenshot + recordings 흡수 (daemon-public-server lift).
-  if (pathname === '/v1/turns/last/screenshot' || pathname === '/last-screenshot') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (
+    pathname === "/v1/turns/last/screenshot" ||
+    pathname === "/last-screenshot"
+  ) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleLastScreenshotGet(req, url, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/recordings/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname.startsWith("/v1/recordings/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleRecordingGet(req, pathname, opts.metaApi);
   }
   // T5.G — task / scheduler board APIs lift (daemon-public-server →
@@ -3635,37 +5182,57 @@ export async function routeRequest(
   // 접근. 둘 다 process-singleton store (TaskStore · getSchedulerStore)
   // 라 zero-migration. metaApi 미wired 환경에서는 503 — daemon-public
   // grace-window 가 닫힌 후에도 PWA 가 stable error 만 보도록.
-  if (pathname === '/v1/schedules' && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname === "/v1/schedules" && method === "GET") {
+    if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
     return handleSchedulesList(req, opts.metaApi);
   }
   const scheduleRunsMatch = /^\/v1\/schedules\/([^/]+)\/runs$/.exec(pathname);
-  if (scheduleRunsMatch && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (scheduleRunsMatch && method === "GET") {
+    if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
     let id: string;
-    try { id = decodeURIComponent(scheduleRunsMatch[1]!); }
-    catch { return jsonResponse({ error: 'bad_request' }, 400); }
+    try {
+      id = decodeURIComponent(scheduleRunsMatch[1]!);
+    } catch {
+      return jsonResponse({ error: "bad_request" }, 400);
+    }
     return handleScheduleRuns(req, id, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/schedules/') && method === 'GET') {
-    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (pathname.startsWith("/v1/schedules/") && method === "GET") {
+    if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
     let id: string;
-    try { id = decodeURIComponent(pathname.slice('/v1/schedules/'.length)); }
-    catch { return jsonResponse({ error: 'bad_request' }, 400); }
+    try {
+      id = decodeURIComponent(pathname.slice("/v1/schedules/".length));
+    } catch {
+      return jsonResponse({ error: "bad_request" }, 400);
+    }
     return handleScheduleDetail(req, id, opts.metaApi);
   }
-  if (method === 'GET' && (pathname === '/v1/task-cards' || /^\/v1\/task-cards\/[^/]+$/.test(pathname))) {
+  if (
+    method === "GET" &&
+    (pathname === "/v1/task-cards" ||
+      /^\/v1\/task-cards\/[^/]+$/.test(pathname))
+  ) {
     return handleTaskCardsGet(pathname);
   }
-  if (pathname === '/v1/tasks') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/tasks") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleTasksList(req, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/tasks/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    const taskId = decodeURIComponent(pathname.slice('/v1/tasks/'.length));
-    if (!taskId || taskId.includes('/') || taskId.includes('\\') || taskId.includes('..')) {
-      return jsonResponse({ error: 'bad_request', reason: 'invalid taskId' }, 400);
+  if (pathname.startsWith("/v1/tasks/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    const taskId = decodeURIComponent(pathname.slice("/v1/tasks/".length));
+    if (
+      !taskId ||
+      taskId.includes("/") ||
+      taskId.includes("\\") ||
+      taskId.includes("..")
+    ) {
+      return jsonResponse(
+        { error: "bad_request", reason: "invalid taskId" },
+        400,
+      );
     }
     return handleTaskDetail(req, taskId, opts.metaApi);
   }
@@ -3674,126 +5241,189 @@ export async function routeRequest(
   // surface (`/v1/workflows` · `~/.elanous/workflows-runs/`) covers the same
   // user need.
 
-  if (method === 'GET' && pathname === '/v1/plugins/wizard') {
-    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "GET" && pathname === "/v1/plugins/wizard") {
+    if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
     return handlePluginWizardList(req, opts.metaApi, opts.pluginStateRoot);
   }
-  const pluginCredentialsGet = /^\/v1\/plugins\/([^/]+)\/credentials$/.exec(pathname);
-  if (method === 'GET' && pluginCredentialsGet) {
-    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
-    return handlePluginsCredentialsGet(req, pluginCredentialsGet[1]!, opts.metaApi, opts.pluginStateRoot);
+  const pluginCredentialsGet = /^\/v1\/plugins\/([^/]+)\/credentials$/.exec(
+    pathname,
+  );
+  if (method === "GET" && pluginCredentialsGet) {
+    if (!opts.metaApi) return jsonResponse({ error: "unauthorized" }, 401);
+    return handlePluginsCredentialsGet(
+      req,
+      pluginCredentialsGet[1]!,
+      opts.metaApi,
+      opts.pluginStateRoot,
+    );
   }
-  if (method === 'GET' && (pathname === '/v1/plugins/index' || pathname === '/v1/plugins')) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return pathname === '/v1/plugins/index' ? handlePluginsIndexGet(req, opts.metaApi, opts.pluginStateRoot) : handlePluginsGet(req, opts.metaApi, opts.pluginStateRoot);
+  if (
+    method === "GET" &&
+    (pathname === "/v1/plugins/index" || pathname === "/v1/plugins")
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return pathname === "/v1/plugins/index"
+      ? handlePluginsIndexGet(req, opts.metaApi, opts.pluginStateRoot)
+      : handlePluginsGet(req, opts.metaApi, opts.pluginStateRoot);
   }
-  if (method === 'GET' && pathname === '/v1/graph/kinds') {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    try { syncInstalledPluginNodes(opts.pluginStateRoot ?? elanousStateRoot()); }
-    catch (error) { debug.log('graph.kinds', 'installed-sync-failed', { reason: String(error) }); }
+  if (method === "GET" && pathname === "/v1/graph/kinds") {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+      return jsonResponse({ error: "unauthorized" }, 401);
+    try {
+      syncInstalledPluginNodes(opts.pluginStateRoot ?? elanousStateRoot());
+    } catch (error) {
+      debug.log("graph.kinds", "installed-sync-failed", {
+        reason: String(error),
+      });
+    }
     return handleGraphKindsGet(req, opts.metaApi);
   }
-  if (method === 'GET' && /^\/v1\/graphs\/[^/]+\/access$/.test(pathname)) {
-    if (!opts.metaApi || bearerCredential(req, opts.metaApi) === undefined) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (method === "GET" && /^\/v1\/graphs\/[^/]+\/access$/.test(pathname)) {
+    if (!opts.metaApi || bearerCredential(req, opts.metaApi) === undefined)
+      return jsonResponse({ error: "unauthorized" }, 401);
     return handleGraphAccess(pathname, req);
   }
   // F-M1 read + P-F1 raw YAML. Writes live in the mutation block and never touch core graphs/.
-  if (method === 'GET' && (pathname === '/v1/graphs' || /^\/v1\/graphs\/[^/]+$/.test(pathname) || /^\/v1\/graphs\/[^/]+\/(?:yaml|flat)$/.test(pathname))) {
+  if (
+    method === "GET" &&
+    (pathname === "/v1/graphs" ||
+      /^\/v1\/graphs\/[^/]+$/.test(pathname) ||
+      /^\/v1\/graphs\/[^/]+\/(?:yaml|flat)$/.test(pathname))
+  ) {
     return handleGraphsGet(pathname);
   }
-  if (method === 'GET' && /^\/v1\/graphs\/[^/]+\/versions$/.test(pathname)) {
+  if (method === "GET" && /^\/v1\/graphs\/[^/]+\/versions$/.test(pathname)) {
     return handleGraphVersionsGet(pathname);
   }
   // Archon-port T2.3 (2026-05-08) — workflow GET surface.
   // (POST /validate · POST /:name/run · PUT/DELETE /:name landed
   // inside the mutation block above.)
-  if (pathname === '/v1/workflows') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/workflows") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleWorkflowsList(req, opts.metaApi);
   }
   // Surface-unification §E1 (2026-05-11) — trigger snapshot. Flat list
   // of every trigger node (Schedule · Webhook · Discord · Telegram ·
   // Manual · Chat) across the discovered workflows. Drives the PWA
-  // "Active triggers" panel (E2). SSE event stream is v2.
-  if (pathname === '/v1/triggers') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  // 'Active triggers' panel (E2). SSE event stream is v2.
+  if (pathname === "/v1/triggers") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleTriggersSnapshot(req, opts.metaApi);
   }
   // Surface-unification §F2 (2026-05-11) — starter workflow templates
-  // for the PWA "+ New" picker. Returns metadata + raw YAML so the
+  // for the PWA '+ New' picker. Returns metadata + raw YAML so the
   // client can render a card grid + copy into the user's project on
   // Apply (via existing PUT /v1/workflows/<name>).
-  if (pathname === '/v1/workflows/templates') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/workflows/templates") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleWorkflowTemplatesList(req, opts.metaApi);
   }
   // D4 · §6.4 SSE — workflow yaml fs.watch stream. Client side
   // subscribes via `useWorkflows` to drop the cross-client refresh
   // latency from 30s polling to <500ms.
-  if (pathname === '/v1/workflows/events') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/workflows/events") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     const metaApi = opts.metaApi;
     return handleWorkflowsEvents(req, {
       checkAuth: (r) => checkAuth(r, metaApi),
     });
   }
   // Caveat #2 follow-up — disk-backed run history list.
-  if (pathname === '/v1/workflows/runs') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/workflows/runs") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleWorkflowRunsList(req, opts.metaApi);
   }
   // §5.1 — pending-approvals discovery. Matched BEFORE the runs/<id>
   // branch so 'pending' isn't read as a runId.
-  if (pathname === '/v1/workflows/runs/pending') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+  if (pathname === "/v1/workflows/runs/pending") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
     return handleWorkflowApprovalsPending(req, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/workflows/runs/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    const runId = decodeURIComponent(pathname.slice('/v1/workflows/runs/'.length));
-    if (!runId || runId.includes('/')) {
-      return jsonResponse({ error: 'bad_request', reason: 'invalid runId' }, 400);
+  if (pathname.startsWith("/v1/workflows/runs/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    const runId = decodeURIComponent(
+      pathname.slice("/v1/workflows/runs/".length),
+    );
+    if (!runId || runId.includes("/")) {
+      return jsonResponse(
+        { error: "bad_request", reason: "invalid runId" },
+        400,
+      );
     }
     return handleWorkflowRunGet(req, runId, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/workflows/')) {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
-    const segments = pathname.slice('/v1/workflows/'.length).split('/');
+  if (pathname.startsWith("/v1/workflows/")) {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-not-wired" }, 503);
+    const segments = pathname.slice("/v1/workflows/".length).split("/");
     let wfName: string;
-    try { wfName = decodeURIComponent(segments[0] ?? ''); }
-    catch { return jsonResponse({ error: 'bad_request', reason: 'invalid workflow name' }, 400); }
-    if (!wfName || wfName.includes('/') || wfName.includes('\\') || wfName.includes('..')) {
-      return jsonResponse({ error: 'bad_request', reason: 'invalid workflow name' }, 400);
+    try {
+      wfName = decodeURIComponent(segments[0] ?? "");
+    } catch {
+      return jsonResponse(
+        { error: "bad_request", reason: "invalid workflow name" },
+        400,
+      );
     }
-    if (segments.length === 2 && segments[1] === 'history') {
+    if (
+      !wfName ||
+      wfName.includes("/") ||
+      wfName.includes("\\") ||
+      wfName.includes("..")
+    ) {
+      return jsonResponse(
+        { error: "bad_request", reason: "invalid workflow name" },
+        400,
+      );
+    }
+    if (segments.length === 2 && segments[1] === "history") {
       return handleWorkflowHistoryList(req, wfName, opts.metaApi);
     }
-    if (segments.length === 3 && segments[1] === 'history') {
+    if (segments.length === 3 && segments[1] === "history") {
       let id: string;
-      try { id = decodeURIComponent(segments[2] ?? ''); }
-      catch { return jsonResponse({ error: 'bad_request', reason: 'invalid workflow history version id' }, 400); }
+      try {
+        id = decodeURIComponent(segments[2] ?? "");
+      } catch {
+        return jsonResponse(
+          {
+            error: "bad_request",
+            reason: "invalid workflow history version id",
+          },
+          400,
+        );
+      }
       return handleWorkflowHistoryVersionGet(req, wfName, id, opts.metaApi);
     }
-    if (segments.length === 1) return handleWorkflowGet(req, wfName, opts.metaApi);
+    if (segments.length === 1)
+      return handleWorkflowGet(req, wfName, opts.metaApi);
   }
-  if (pathname.startsWith('/v1/nexus/templates/')) {
-    const name = pathname.slice('/v1/nexus/templates/'.length);
+  if (pathname.startsWith("/v1/nexus/templates/")) {
+    const name = pathname.slice("/v1/nexus/templates/".length);
     return handleTemplateGet(name);
   }
-  if (pathname.startsWith('/v1/nexus/tabs/')) {
-    const tail = pathname.slice('/v1/nexus/tabs/'.length);
-    const segments = tail.split('/');
-    const id = segments[0] ?? '';
+  if (pathname.startsWith("/v1/nexus/tabs/")) {
+    const tail = pathname.slice("/v1/nexus/tabs/".length);
+    const segments = tail.split("/");
+    const id = segments[0] ?? "";
     const action = segments[1];
-    if (action === 'logs') {
+    if (action === "logs") {
       return handleTabLogs(opts.registry, id, url);
     }
     return handleTabDetail(opts.registry, opts.state, id || tail);
   }
-  if (pathname.startsWith('/v1/nexus/errors')) {
+  if (pathname.startsWith("/v1/nexus/errors")) {
     const parsed = parseErrorsPath(pathname);
     if (parsed) {
-      if (parsed.tabId && parsed.ts) return handleErrorGet(parsed.tabId, parsed.ts);
+      if (parsed.tabId && parsed.ts)
+        return handleErrorGet(parsed.tabId, parsed.ts);
       if (parsed.tabId) return handleErrorsForTab(parsed.tabId);
       return handleErrorsList(url);
     }
@@ -3801,60 +5431,93 @@ export async function routeRequest(
   // PWA mirror track PR 1 — chat-backend Quick Setup snapshot. Wraps
   // `buildQuickSetupSnapshot()` so the PWA SettingsPanel (PR 2-3)
   // can render the same card the TUI Settings tab does.
-  if (pathname === '/v1/nexus/chat-backend-detection') {
+  if (pathname === "/v1/nexus/chat-backend-detection") {
     return handleChatBackendDetection();
   }
   // T4.A — connect-info metadata endpoint. `elanous nexus connect <host>`
   // (T4.B) 가 처음 fetch · PWA Generate Token card (T4.D) 가 함께 사용.
-  if (pathname === '/v1/nexus/connect-info') {
+  if (pathname === "/v1/nexus/connect-info") {
     const ci = opts.connectInfo;
-    const requestHost = req.headers.get('host') || new URL(req.url).host;
+    const requestHost = req.headers.get("host") || new URL(req.url).host;
     const ctx: ConnectInfoCtx = {
       hostname: bind.hostname,
       port: bind.port,
-      nexusVersion: ci?.nexusVersion ?? opts.state.nexusVersion ?? '0.0.0',
+      nexusVersion: ci?.nexusVersion ?? opts.state.nexusVersion ?? "0.0.0",
       ...(ci?.serverLabel !== undefined ? { serverLabel: ci.serverLabel } : {}),
-      ...(ci?.acpTokenPath !== undefined ? { acpTokenPath: ci.acpTokenPath } : {}),
-      ...(ci?.acpTokenOverride !== undefined ? { acpTokenOverride: ci.acpTokenOverride } : {}),
+      ...(ci?.acpTokenPath !== undefined
+        ? { acpTokenPath: ci.acpTokenPath }
+        : {}),
+      ...(ci?.acpTokenOverride !== undefined
+        ? { acpTokenOverride: ci.acpTokenOverride }
+        : {}),
       ...(requestHost ? { requestHost } : {}),
-      allowAutoToken: connectInfoTokenAllowed(req.headers.get('origin'), requestHost || null),
+      allowAutoToken: connectInfoTokenAllowed(
+        req.headers.get("origin"),
+        requestHost || null,
+      ),
     };
     return handleConnectInfoGet(ctx);
   }
-  if (pathname === '/v1/board' || pathname.startsWith('/v1/board/')) {
+  if (pathname === "/v1/board" || pathname.startsWith("/v1/board/")) {
     const response = await handleBoardRoute(req, pathname, {
       store: opts.boardEventStore,
       dispatchApproved: opts.boardApprovalDispatch,
-      resolveOwner: request => resolveVerifiedMemberOwner(request, opts.membersApi ?? defaultMembersApi(opts.appHost), opts.appHost?.slugs),
-      publish: event => { pushEvent(opts.state, event); },
+      resolveOwner: (request) =>
+        resolveVerifiedMemberOwner(
+          request,
+          opts.membersApi ?? defaultMembersApi(opts.appHost),
+          opts.appHost?.slugs,
+        ),
+      publish: (event) => {
+        pushEvent(opts.state, event);
+      },
     });
     if (response) return response;
   }
-  if (pathname.startsWith('/v1/graph-runs/')) {
+  if (pathname.startsWith("/v1/graph-runs/")) {
     const graphRunEvents = handleGraphRunEvents(req, url);
     if (graphRunEvents) return graphRunEvents;
   }
-  if (pathname === '/v1/events') {
-    const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
+  if (pathname === "/v1/events") {
+    const topics = (url.searchParams.get("topics") ?? "")
+      .split(",")
+      .map((topic) => topic.trim())
+      .filter(Boolean);
     if (requestsPluginEvents(topics)) {
       // Same-origin, member cookies, setup/temp tokens and noAuth are not operator credentials.
-      if (!opts.metaApi || bearerCredential(req, opts.metaApi) !== 'bearer-match')
-        return jsonResponse({ error: 'unauthorized' }, 401);
-      const devices = url.searchParams.getAll('deviceId');
+      if (
+        !opts.metaApi ||
+        bearerCredential(req, opts.metaApi) !== "bearer-match"
+      )
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const devices = url.searchParams.getAll("deviceId");
       if (devices.length !== 1 || !isPluginEventDeviceId(devices[0]))
-        return jsonResponse({ error: 'device_scope_required' }, 400);
-      return handleSseEvents(opts.eventBus, url, { operatorBriefings: true, operatorDeviceId: devices[0] });
+        return jsonResponse({ error: "device_scope_required" }, 400);
+      return handleSseEvents(opts.eventBus, url, {
+        operatorBriefings: true,
+        operatorDeviceId: devices[0],
+      });
     }
-    const hasBoardTopic = topics.includes('board.card');
-    const hasBriefingTopic = topics.includes('briefing.ready');
-    const hasSummaryTopic = topics.includes('scrap.summary.result');
-    const memberOnlyTopics = topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready' || topic === 'scrap.summary.result');
-    const operatorAuthorized = !!opts.metaApi && !!bearerCredential(req, opts.metaApi);
+    const hasBoardTopic = topics.includes("board.card");
+    const hasBriefingTopic = topics.includes("briefing.ready");
+    const hasSummaryTopic = topics.includes("scrap.summary.result");
+    const memberOnlyTopics =
+      topics.length > 0 &&
+      topics.every(
+        (topic) =>
+          topic === "board.card" ||
+          topic === "briefing.ready" ||
+          topic === "scrap.summary.result",
+      );
+    const operatorAuthorized =
+      !!opts.metaApi && !!bearerCredential(req, opts.metaApi);
     if (hasBoardTopic && !memberOnlyTopics && !operatorAuthorized) {
-      return jsonResponse({ error: 'member_topic_must_be_isolated' }, 400);
+      return jsonResponse({ error: "member_topic_must_be_isolated" }, 400);
     }
-    if (hasBriefingTopic && !memberOnlyTopics && !operatorAuthorized) return jsonResponse({ error: 'unauthorized' }, 401);
-    if (hasSummaryTopic && !memberOnlyTopics) return jsonResponse({ error: 'member_topic_must_be_isolated' }, 400);
+    if (hasBriefingTopic && !memberOnlyTopics && !operatorAuthorized)
+      return jsonResponse({ error: "unauthorized" }, 401);
+    if (hasSummaryTopic && !memberOnlyTopics)
+      return jsonResponse({ error: "member_topic_must_be_isolated" }, 400);
     const needsMemberScope = memberOnlyTopics;
     const memberApi = opts.membersApi ?? defaultMembersApi(opts.appHost);
     const owner = needsMemberScope
@@ -3862,12 +5525,24 @@ export async function routeRequest(
         ? await resolveVerifiedShareSummaryOwner(req, memberApi)
         : await resolveVerifiedMemberOwner(req, memberApi, opts.appHost?.slugs)
       : null;
-    if (needsMemberScope && !owner && (hasSummaryTopic || !operatorAuthorized || (hasBoardTopic && !hasBriefingTopic))) return jsonResponse({ error: 'unauthorized' }, 401);
-    return handleSseEvents(opts.eventBus, url, owner?.memberId ?? (operatorAuthorized ? { operatorBriefings: true } : undefined));
+    if (
+      needsMemberScope &&
+      !owner &&
+      (hasSummaryTopic ||
+        !operatorAuthorized ||
+        (hasBoardTopic && !hasBriefingTopic))
+    )
+      return jsonResponse({ error: "unauthorized" }, 401);
+    return handleSseEvents(
+      opts.eventBus,
+      url,
+      owner?.memberId ??
+        (operatorAuthorized ? { operatorBriefings: true } : undefined),
+    );
   }
   // Phase 0.5 (2026-05-08) — intent-prediction REST + SSE.
   // /v1/intent-prediction/:sessionId{,/sse,/feedback}
-  if (pathname.startsWith('/v1/intent-prediction/') && opts.intentPrediction) {
+  if (pathname.startsWith("/v1/intent-prediction/") && opts.intentPrediction) {
     const result = await dispatchIntentPredictionRoute(req, url, {
       service: opts.intentPrediction,
     });
@@ -3878,33 +5553,60 @@ export async function routeRequest(
   // above (around line 445) where the other POST routes are.
   // §6.4 (2026-05-09) — personas REST (read-only · global registry).
   // /v1/personas[/:personaId]
-  if (pathname === '/v1/personas' || pathname.startsWith('/v1/personas/')) {
+  if (pathname === "/v1/personas" || pathname.startsWith("/v1/personas/")) {
     const result = await dispatchPersonaRoute(req, pathname);
     if (result) return result;
   }
-  if (pathname === '/v1/context/now') {
+  if (pathname === "/v1/context/now") {
     try {
-      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-      const audiences = url.searchParams.getAll('audience');
-      if (audiences.length > 1) return jsonResponse({ error: 'invalid_audience' }, 400);
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi))
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const audiences = url.searchParams.getAll("audience");
+      if (audiences.length > 1)
+        return jsonResponse({ error: "invalid_audience" }, 400);
       const requested = audiences[0];
-      if (requested !== undefined && requested !== 'operator' && requested !== 'user' && requested !== 'public-demo') {
-        return jsonResponse({ error: 'invalid_audience' }, 400);
+      if (
+        requested !== undefined &&
+        requested !== "operator" &&
+        requested !== "user" &&
+        requested !== "public-demo"
+      ) {
+        return jsonResponse({ error: "invalid_audience" }, 400);
       }
       const forced = getUserConfig().nexus?.demoMode === true;
-      const audience: ContextNowAudience = forced ? 'public-demo' : requested ?? 'operator';
-      const answer = contextNow({ audience, ...(url.searchParams.has('topic') ? { topic: url.searchParams.get('topic') ?? '' } : {}) }, opts.contextNowDeps);
-      debug.log('context.now', 'served', { audience, hidden: answer.hiddenCount ?? 0, forced });
-      return jsonResponse(url.searchParams.get('format') === 'voice'
-        ? { text: renderVoiceNow(answer, audience), audience, hiddenCount: answer.hiddenCount ?? 0 }
-        : { ...answer, audience, hiddenCount: answer.hiddenCount ?? 0 });
+      const audience: ContextNowAudience = forced
+        ? "public-demo"
+        : (requested ?? "operator");
+      const answer = contextNow(
+        {
+          audience,
+          ...(url.searchParams.has("topic")
+            ? { topic: url.searchParams.get("topic") ?? "" }
+            : {}),
+        },
+        opts.contextNowDeps,
+      );
+      debug.log("context.now", "served", {
+        audience,
+        hidden: answer.hiddenCount ?? 0,
+        forced,
+      });
+      return jsonResponse(
+        url.searchParams.get("format") === "voice"
+          ? {
+              text: renderVoiceNow(answer, audience),
+              audience,
+              hiddenCount: answer.hiddenCount ?? 0,
+            }
+          : { ...answer, audience, hiddenCount: answer.hiddenCount ?? 0 },
+      );
     } catch {
-      return jsonResponse({ error: 'context-now-failed' }, 500);
+      return jsonResponse({ error: "context-now-failed" }, 500);
     }
   }
   // §6.3 (2026-05-09) — context URL fetch (showroom).
   // POST /v1/context/fetch-url
-  if (pathname === '/v1/context/fetch-url') {
+  if (pathname === "/v1/context/fetch-url") {
     return handleContextFetchUrl(req);
   }
   // R6 Task 5 · §6.1 — POST handler lives inside the method !== 'GET'
@@ -3913,16 +5615,17 @@ export async function routeRequest(
   // Phase B-4 (PWA chat streaming · 2026-05-06) — observer SSE for
   // chat turn events. Long-lived; subscriber filters by sessionId.
   // Foundation for multi-tab `/chat` consistency.
-  if (pathname === '/v1/chat/events') {
-    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+  if (pathname === "/v1/chat/events") {
+    if (!opts.metaApi)
+      return jsonResponse({ error: "meta-api-runtime-not-wired" }, 503);
     return handleChatEventsGet(req, url, opts.metaApi);
   }
-  if (pathname === '/v1/config') return handleConfigGet();
+  if (pathname === "/v1/config") return handleConfigGet();
   // M1-2b — friction-free model selection GET. Returns only the
   // typed sub-trees (modelTier/budget/smartDefaults) so the PWA can
   // hydrate the slider without parsing the full UserConfig.
-  if (pathname === '/v1/config/model-tier') {
-    const { handleModelTierGet } = await import('./config-model-tier.js');
+  if (pathname === "/v1/config/model-tier") {
+    const { handleModelTierGet } = await import("./config-model-tier.js");
     return handleModelTierGet();
   }
   // M3-1 (Phase 3) — BudgetGuard evaluation. Joins the live voice cost
@@ -3930,26 +5633,28 @@ export async function routeRequest(
   // PWA threshold modal can decide whether to nag. Applying the
   // recommended fallback goes through the existing `PUT /v1/config/
   // model-tier` route — this endpoint is read-only.
-  if (pathname === '/v1/budget/status') {
-    const { handleBudgetStatusGet } = await import('./budget-status.js');
+  if (pathname === "/v1/budget/status") {
+    const { handleBudgetStatusGet } = await import("./budget-status.js");
     return handleBudgetStatusGet();
   }
   // M2-2b-v2 — ElevenLabs voice library proxy (10-min TTL cache · API
   // key never crosses to the browser). Returns { voices, configured,
   // fromCache, cacheTtlMs }.
-  if (pathname === '/v1/elevenlabs/voices') {
-    const { handleElevenLabsVoicesGet } = await import('./elevenlabs-voices.js');
+  if (pathname === "/v1/elevenlabs/voices") {
+    const { handleElevenLabsVoicesGet } =
+      await import("./elevenlabs-voices.js");
     return handleElevenLabsVoicesGet();
   }
-  if (pathname === '/v1/config/switches') return handleSwitchesList(opts.registry);
-  if (pathname.startsWith('/v1/config/switches/')) {
-    const switchId = pathname.slice('/v1/config/switches/'.length);
+  if (pathname === "/v1/config/switches")
+    return handleSwitchesList(opts.registry);
+  if (pathname.startsWith("/v1/config/switches/")) {
+    const switchId = pathname.slice("/v1/config/switches/".length);
     return handleSwitchGet(switchId, opts.registry);
   }
-  if (pathname === '/v1/config/secrets') return handleSecretsList();
+  if (pathname === "/v1/config/secrets") return handleSecretsList();
   // BACKLOG #2 — platform connection summary (Discord/Telegram/
   // Pushcut/ACP/Tailscale share). Read-only · no secret values.
-  if (pathname === '/v1/platforms') return handlePlatforms();
+  if (pathname === "/v1/platforms") return handlePlatforms();
   // BACKLOG #1 / RFC #2161 retirement (2026-05-11) — the legacy
   // `/v1/providers` snapshot was absorbed by `/v1/registry/catalog`
   // (RFC #2161 Phase 3) + the LlmCatalogCard matrix view (#2198 FU A4).
@@ -3957,31 +5662,34 @@ export async function routeRequest(
   // PR #2198 FU.
   // BACKLOG #5 — active worktree visualization. Aggregates `git
   // worktree list` + `~/.elanous/worktrees/*.json` session records.
-  if (pathname === '/v1/worktrees') return handleWorktrees();
+  if (pathname === "/v1/worktrees") return handleWorktrees();
   // Read-only bot command catalog. Returns `botCommandCatalog()` as-is
   // (no execution, no extra fields). Same auth posture as `/v1/worktrees`.
-  if (pathname === '/v1/bots/commands') return handleBotCommands();
+  if (pathname === "/v1/bots/commands") return handleBotCommands();
   // B4 — the `elanous repo design-check` verdict over the wire, so the PWA
   // renders the SAME resolution the CLI prints instead of re-deriving it.
-  if (pathname === '/v1/design-check') return handleDesignCheck();
+  if (pathname === "/v1/design-check") return handleDesignCheck();
   // RFC design loop §A2 — HTML previews under the same repository as design-check.
-  if (pathname === DESIGN_PREVIEWS_PATH || pathname.startsWith(DESIGN_PREVIEW_PATH_PREFIX)) {
+  if (
+    pathname === DESIGN_PREVIEWS_PATH ||
+    pathname.startsWith(DESIGN_PREVIEW_PATH_PREFIX)
+  ) {
     return handleDesignPreviews(pathname);
   }
   // RFC #2161 Phase 3 — Layer A static catalog snapshot. Read-only ·
   // refreshed on demand by the PWA Showroom dropdown + future
   // LlmCatalogCard. Phase 5 adds /v1/registry/resolved for live
   // (apiKey + health) state.
-  if (pathname === '/v1/registry/catalog') return handleRegistryCatalog();
+  if (pathname === "/v1/registry/catalog") return handleRegistryCatalog();
   // RFC #2161 Phase 5 — Layer A ⊕ Layer B (live state). Phase 6 layers
   // health-probe + rate-limit data on top.
-  if (pathname === '/v1/registry/resolved') return handleRegistryResolved();
-  if (pathname === '/v1/registry/events') return handleRegistryEvents();
+  if (pathname === "/v1/registry/resolved") return handleRegistryResolved();
+  if (pathname === "/v1/registry/events") return handleRegistryEvents();
   // RFC #2161 Phase 6 — Layer D auto-discovery snapshot. GET returns
   // the cached snapshot · POST triggers a fresh run (PWA refresh
   // button + future cron tick).
-  if (pathname === '/v1/registry/discovery') return handleDiscoveryGet();
-  if (pathname.startsWith('/v1/registry/bindings')) {
+  if (pathname === "/v1/registry/discovery") return handleDiscoveryGet();
+  if (pathname.startsWith("/v1/registry/bindings")) {
     const parsed = parseBindingPath(pathname);
     if (parsed && !parsed.channel && !parsed.key) {
       return handleBindingsList(url);
@@ -3996,18 +5704,29 @@ export async function routeRequest(
     }
   }
 
-  if (method === 'GET') {
+  if (method === "GET") {
     try {
-      const handler = await loadDeclaredPluginHttpGet<(request: Request, context: { operator: boolean }) => Response | Promise<Response>>(BUILTIN_DIR, pathname);
+      const handler = await loadDeclaredPluginHttpGet<
+        (
+          request: Request,
+          context: { operator: boolean },
+        ) => Response | Promise<Response>
+      >(BUILTIN_DIR, pathname);
       if (handler) {
-        const signal = opts.metaApi ? operatorSignal(req, opts.metaApi) : { operator: false, operatorSource: null };
-        const owner = !!opts.metaApi && bearerCredential(req, opts.metaApi) === 'bearer-match';
-        if (!owner) return jsonResponse({ error: 'unauthorized' }, 401);
+        const signal = opts.metaApi
+          ? operatorSignal(req, opts.metaApi)
+          : { operator: false, operatorSource: null };
+        const owner =
+          !!opts.metaApi &&
+          bearerCredential(req, opts.metaApi) === "bearer-match";
+        if (!owner) return jsonResponse({ error: "unauthorized" }, 401);
         return handler(req, { operator: signal.operator });
       }
-    } catch { return jsonResponse({ error: 'plugin-read-unavailable' }, 503); }
+    } catch {
+      return jsonResponse({ error: "plugin-read-unavailable" }, 503);
+    }
   }
-  return jsonResponse({ error: 'not-found', path: pathname }, 404);
+  return jsonResponse({ error: "not-found", path: pathname }, 404);
 }
 
 function makeConfigCtx(opts: NexusHttpServerOpts): ConfigCtx {
@@ -4019,7 +5738,10 @@ function makeConfigCtx(opts: NexusHttpServerOpts): ConfigCtx {
   };
 }
 
-type AcpFeedbackBroadcaster = (sessionId: string, env: FeedbackEnvelope) => unknown;
+type AcpFeedbackBroadcaster = (
+  sessionId: string,
+  env: FeedbackEnvelope,
+) => unknown;
 
 /** Delivers every feedback envelope to SSE and, when present, the ACP peer. */
 export function createFeedbackEmitter(
@@ -4028,28 +5750,44 @@ export function createFeedbackEmitter(
   broadcast: AcpFeedbackBroadcaster | undefined,
 ): (env: FeedbackEnvelope) => void {
   return (env) => {
-    eventBus.publish({ ts: Date.now(), kind: 'media.feedback', detail: env as unknown as Record<string, unknown> });
+    eventBus.publish({
+      ts: Date.now(),
+      kind: "media.feedback",
+      detail: env as unknown as Record<string, unknown>,
+    });
     if (broadcast) void broadcast(sessionId, env);
   };
 }
 
 /** `{ event: TelegramEvent }` 만 받는다 — 모르는 kind·빈 칸은 400. */
-export function parseTelegramDispatchEvent(body: unknown): TelegramEvent | null {
-  if (!body || typeof body !== 'object') return null;
+export function parseTelegramDispatchEvent(
+  body: unknown,
+): TelegramEvent | null {
+  if (!body || typeof body !== "object") return null;
   const e = (body as { event?: unknown }).event;
-  if (!e || typeof e !== 'object') return null;
+  if (!e || typeof e !== "object") return null;
   const r = e as Record<string, unknown>;
-  if (r.kind !== 'message' && r.kind !== 'command' && r.kind !== 'callback_query') return null;
-  if (typeof r.chat !== 'string' || typeof r.user !== 'string' || typeof r.body !== 'string') return null;
-  if (r.command !== undefined && typeof r.command !== 'string') return null;
+  if (
+    r.kind !== "message" &&
+    r.kind !== "command" &&
+    r.kind !== "callback_query"
+  )
+    return null;
+  if (
+    typeof r.chat !== "string" ||
+    typeof r.user !== "string" ||
+    typeof r.body !== "string"
+  )
+    return null;
+  if (r.command !== undefined && typeof r.command !== "string") return null;
   return {
     kind: r.kind,
     chat: r.chat,
     user: r.user,
     body: r.body,
-    ...(typeof r.command === 'string' ? { command: r.command } : {}),
+    ...(typeof r.command === "string" ? { command: r.command } : {}),
     ...(r.raw !== undefined ? { raw: r.raw } : {}),
   };
 }
 
-export { corsPreflight, jsonResponse } from './json-response.js';
+export { corsPreflight, jsonResponse } from "./json-response.js";

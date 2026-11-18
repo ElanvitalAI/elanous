@@ -592,7 +592,7 @@ const TOOLS_DEFAULTS: ToolsConfig = {
   selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, goalRecordInDoc: true, goalAuthorReviewerPrecheck: false, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, supervisor: { reasonRepair: false }, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
 };
 
-const DEBUG_DEFAULTS: DebugConfig = { file: true, level: 'trail', exposeFullLlmTools: true, renderLogs: false };
+const DEBUG_DEFAULTS: DebugConfig = { file: true, level: 'trail', renderLogs: false };
 
 const LOGS_DEFAULTS: LogsConfig = { retention: { maxAgeDays: 7, maxDbMb: 500, minRetainHours: 24 } };
 
@@ -2228,7 +2228,7 @@ function defaultConfig(): UserConfig {
       nativeStructure: { ...TOOLS_DEFAULTS.nativeStructure },
       selfImplement: { ...TOOLS_DEFAULTS.selfImplement },
     },
-    harness: { revertGuard: { depth: 50 }, nestedElanousMaxDepth: 2, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyPlacement: false, difficultyRouter: 'shadow', followUp: 'shadow' },
+    harness: { revertGuard: { depth: 50 }, nestedElanousMaxDepth: 2, budgetGate: { ...DEFAULT_BUDGET_GATE }, exposeGate: 'warn', difficultyRouter: 'shadow', followUp: 'shadow' },
     grounding: { sources: [] },
     raw: {},
   };
@@ -2918,7 +2918,6 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 50;
       })() },
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
-      difficultyPlacement: harness.difficultyPlacement === true,
       difficultyRouter: harness.difficultyRouter === 'on' ? 'on' : 'shadow',
       // HARNESS-FAILURE-ORACLE-GEN — `on` 만 싣는다(생략 = shadow · 기본 객체 모양은 그대로).
       // COST-OPTIMIZER-WINDOW-AWARE — 같은 꼴: `on` 만 싣는다.
@@ -3049,6 +3048,13 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(llm.codexTokenOwnerHost.trim())
         ? llm.codexTokenOwnerHost.trim() : undefined,
       streamIdleTimeoutMs: positiveFiniteNumber(llm.streamIdleTimeoutMs),
+      turnNoProgressMs: positiveFiniteNumber(llm.turnNoProgressMs),
+      turnNoProgressMailTo: Array.isArray(llm.turnNoProgressMailTo)
+        ? (() => {
+          const seats = llm.turnNoProgressMailTo.filter((seat): seat is string => typeof seat === 'string' && /^[A-Z][A-Z0-9_-]{0,63}$/.test(seat));
+          return seats.length > 0 ? seats : undefined;
+        })()
+        : undefined,
       openrouter: (() => {
         const router = llm.openrouter;
         if (!router || typeof router !== 'object' || Array.isArray(router)) return undefined;
@@ -3131,6 +3137,12 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         : undefined,
       reviewFallbackModels: Array.isArray(llm.reviewFallbackModels)
         ? llm.reviewFallbackModels.filter((s: unknown): s is string => typeof s === 'string')
+        : undefined,
+      // Only string arrays pass; role names and the GLM ban are judged by `resolveRoleProviderChain` alone.
+      roleProviderChains: llm.roleProviderChains && typeof llm.roleProviderChains === 'object' && !Array.isArray(llm.roleProviderChains)
+        ? Object.fromEntries(Object.entries(llm.roleProviderChains as Record<string, unknown>)
+          .filter((entry): entry is [string, unknown[]] => Array.isArray(entry[1]))
+          .map(([role, models]) => [role, models.filter((m): m is string => typeof m === 'string' && m.trim().length > 0).map((m) => m.trim())]))
         : undefined,
       geminiSafety: llm.geminiSafety === 'permissive' || llm.geminiSafety === 'strict'
         ? llm.geminiSafety
@@ -3244,9 +3256,6 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       // stale/incomplete config doesn't disable the forensic log.
       file: dbg.file === false ? false : DEBUG_DEFAULTS.file,
       level: normalizeDebugLevel(dbg.level),
-      exposeFullLlmTools: dbg.exposeFullLlmTools === false
-        ? false
-        : DEBUG_DEFAULTS.exposeFullLlmTools,
       // OH9 — 기본 false(억제). 명시 true 만 렌더 로그를 살린다(override).
       renderLogs: dbg.renderLogs === true ? true : DEBUG_DEFAULTS.renderLogs,
     },

@@ -5,6 +5,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { prodInstanceRoot } from '../instance/resolve.js';
 import { dirname, join } from 'node:path';
 import type { Command } from 'commander';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -13,13 +14,18 @@ import { attachEls } from '../els/attach-client.js';
 import { createKeyDecoder, createPrefixFilter, drawView, ENTER_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
 import { requestEls } from '../els/client.js';
 import type { ElsResult } from '../els/core.js';
+import { askHitlOnTerminal, controlledDo, journalControl } from '../els/control-cli.js';
 import { misplacedOptionHint, withNewDefaults } from '../els/cli-args.js';
 import { createFederation } from '../els/federation.js';
+import { elsJournalPath, findPane, loadJournal } from '../els/journal.js';
+import { emptyJournal } from '../els/space.js';
 import { withHerdrHost } from '../els/herdr-host.js';
 import { herdrCreated, herdrPanes, herdrTabs, herdrWorkspaces } from '../els/herdr-shape.js';
 import { keysToBytes } from '../els/keys.js';
 import { elsHostsPath, fetchHostJson, loadHostRegistry } from '../els/hosts.js';
 import { parseHttpBind } from '../els/http.js';
+import { insideElsPane, NESTED_ELS_MESSAGE } from '../els/nesting.js';
+import { createControlledBackend, createSocketBackend, serveElsMcpStdio } from '../els/mcp-serve.js';
 import { elsHostName, elsSocketPath, elsSocketTaken, startElsServer, type ElsRequest } from '../els/server.js';
 import { ensureServer, elanousCommandFor, serveCommandFor, supervisorOff, supervisorOn, supervisorPaths, supervisorStatus, type SupervisorDeps } from '../els/supervisor.js';
 
@@ -36,6 +42,32 @@ const REMOTE_TIMEOUT_MS = 2_000;
 
 // 출처: the receiving owner renders the pane's screen to check it is not busy before it answers (≤ the 10 s local request).
 const DO_TIMEOUT_MS = 8_000;
+
+// 출처: ELS-EXTERNAL-SURFACES §3.1 — a person at the terminal has this long to approve a dangerous shell line.
+const HITL_TIMEOUT_MS = 60_000;
+
+/** `<state>/els` — the allow list and the audit log live next to the journal. */
+function elsControlDir(): string {
+  return dirname(elsJournalPath());
+}
+
+/** The journal says which workspace a pane belongs to, and whether it is a shell (pty). A missing journal is an unknown pane. */
+async function lookupLocalPane(ref: string): Promise<{ readonly workspace: string; readonly pane: string; readonly shell: boolean } | undefined> {
+  let journal;
+  try { journal = loadJournal(elsJournalPath()); }
+  catch { return undefined; }
+  const pane = findPane(journal, ref);
+  const tab = pane ? journal.tabs.find((row) => row.id === pane.tabId) : undefined;
+  const ws = tab ? journal.workspaces.find((row) => row.id === tab.workspaceId) : undefined;
+  if (!pane || !ws) return undefined;
+  return { workspace: ws.name || ws.id, pane: pane.id, shell: pane.kind === 'pty' };
+}
+
+/** The journal gives pane lookup and allow-list name → id resolution. An unreadable journal resolves nothing. */
+function localControl(): ReturnType<typeof journalControl> {
+  try { return journalControl(loadJournal(elsJournalPath())); }
+  catch { return journalControl(emptyJournal()); }
+}
 
 function federation() {
   // ELS-ONE-SPACE ④ — the herdr panes of this machine are one more host (`herdr:`) in the same list when herdr is here.
@@ -56,7 +88,7 @@ function supervisorDeps(): SupervisorDeps {
   const stateRoot = elanousStateRoot();
   return {
     stateRoot,
-    isDefaultState: stateRoot === join(homedir(), '.elanous'),
+    isDefaultState: stateRoot === prodInstanceRoot(),
     platform: process.platform,
     paths: supervisorPaths(stateRoot),
     serveCommand: serveCommandFor({ prefixEnv: process.env.ELANOUS_INSTALL_PREFIX, home: homedir(), exists: existsSync, execPath: process.execPath, entry: process.argv[1] }),
@@ -79,13 +111,15 @@ function supervisorDeps(): SupervisorDeps {
 }
 
 export function registerElsCommands(program: Command): void {
-  const side = program.command('side').description('els — sidetab space (ws/tab/pane). Alias of the els bin.');
+  const side = program.command('side').description('Elanous Side (els) — workspaces, tabs and panes in one screen; the command is `els`. In a terminal, bare `els` opens the whole screen.');
   // `els` with no arguments: make sure a server answers (supervisor, installed on first use), then show the spaces.
   // Stage 1 shows the list; the live pane view arrives with the attach stages.
   side.option('--list', 'print the panes as lines instead of opening the screen (also what a pipe gets)');
   side.option('--side', 'open with the side list shown (remembered for next time)');
   side.option('--no-side', 'open with the side list hidden (remembered for next time)');
   side.action(async (options: { list?: boolean; side?: boolean }) => {
+    // A second full screen inside an els pane would be a frame in a frame: say so (rc 1) before anything is started.
+    if (!options.list && process.stdin.isTTY && process.stdout.isTTY && insideElsPane(process.env, elsSocketPath())) { emit({ exitCode: 1, message: NESTED_ELS_MESSAGE }); return; }
     const ready = await ensureServer(supervisorDeps());
     if (!ready.ok) { emit({ exitCode: 1, message: ready.message }); return; }
     // In a terminal: the whole screen at once, spaces on the left, the live pane on the right (herdr's way in).
@@ -118,6 +152,14 @@ export function registerElsCommands(program: Command): void {
       process.once('SIGTERM', stop);
       process.once('SIGINT', stop);
     });
+  side.command('mcp').description('els as an MCP server').command('serve')
+    .description('Serve els over stdio MCP (line-delimited JSON-RPC): tools els_ls·els_read·els_do·els_new·els_status, resources els://pane/<address>/screen|events')
+    // The one control door (§3.1): principal mcp-stdio:<clientInfo.name> · default deny via control-allow.json · -32001.
+    // No HITL over stdio (stdin is the protocol), so a dangerous shell `do` is held, never sent.
+    .action(async () => {
+      await serveElsMcpStdio(createControlledBackend({ stateDir: elsControlDir(), lookup: lookupLocalPane, inner: createSocketBackend(elsSocketPath()) }));
+      process.exit(0);
+    });
   side.command('ls')
     .description('List workspaces, tabs and panes as JSON: this host and the hosts in els/hosts.json (a host that does not answer is listed as down)')
     .option('--json', 'JSON (always on for els ls)')
@@ -146,9 +188,16 @@ export function registerElsCommands(program: Command): void {
     .option('--no-enter', 'do not press Enter after the text')
     .action((pane: string, text: string, opts: { enter: boolean }) => ask({ op: 'send', pane, text: opts.enter ? `${text}\r` : text }));
   side.command('do <pane> <text>')
-    .description('Type a line into a pane (local, ws/tab/pane or host:ws/tab/pane): marked «⇢ from · text», queued while the pane\'s turn is running')
+    .description('Type a line into a pane (local, ws/tab/pane or host:ws/tab/pane): marked «⇢ from · text», queued while the pane\'s turn is running. A local pane walks the control door first (default deny).')
     .option('--from <seat>', 'who is sending (shown to the receiver)', process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown')
-    .action(async (pane: string, text: string, opts: { from: string }) => emit(await federation().do(pane, text, opts.from)));
+    .action(async (pane: string, text: string, opts: { from: string }) => emit(await controlledDo({
+      stateDir: elsControlDir(),
+      from: opts.from,
+      uid: process.getuid?.() ?? -1,
+      ...localControl(),
+      send: (target, line, from) => federation().do(target, line, from),
+      ask: askHitlOnTerminal(HITL_TIMEOUT_MS),
+    }, pane, text)));
 
   // herdr's words: `els workspace|tab|pane …` (JSON `{result:{…}}` with *_id fields). The commands above stay as aliases.
   const listJson = async (): Promise<{ failed?: ElsResult; listed?: Parameters<typeof herdrPanes>[0] }> => {
@@ -156,7 +205,7 @@ export function registerElsCommands(program: Command): void {
     return answer.exitCode === 0 ? { listed: JSON.parse(answer.message) } : { failed: answer };
   };
   const printJson = (value: object): void => emit({ exitCode: 0, message: JSON.stringify(value, null, 2) });
-  const workspace = side.command('workspace').description('Workspaces (herdr words): list · create · close');
+  const workspace = side.command('workspace').description('Workspaces (herdr words): list · create · close · move');
   workspace.command('list').description('Workspaces as JSON').action(async () => {
     const { failed, listed } = await listJson(); if (failed) emit(failed); else printJson(herdrWorkspaces(listed!));
   });
@@ -167,10 +216,16 @@ export function registerElsCommands(program: Command): void {
     .action((command: string[] = [], opts: { cwd?: string; label?: string }) => createPane({ ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.label ? { ws: opts.label } : {}) }, command, true));
   workspace.command('close <workspace>').description('Close a workspace: stop its panes and forget it')
     .action((ws: string) => ask({ op: 'close-workspace', ws }));
-  const tab = side.command('tab').description('Tabs (herdr words): list');
+  workspace.command('move <workspace>').description('Put a workspace before another one (default: last) — the order every els screen and the eln side tab show')
+    .option('--before <workspace>', 'the workspace it goes in front of')
+    .action((ws: string, opts: { before?: string }) => ask({ op: 'reorder', kind: 'workspace', id: ws, ...(opts.before ? { before: opts.before } : {}) }));
+  const tab = side.command('tab').description('Tabs (herdr words): list · move');
   tab.command('list').option('--workspace <id>', 'only this workspace').description('Tabs as JSON').action(async (opts: { workspace?: string }) => {
     const { failed, listed } = await listJson(); if (failed) emit(failed); else printJson(herdrTabs(listed!, opts.workspace));
   });
+  tab.command('move <tab>').description('Put a tab before another tab of the same workspace (default: last in its workspace)')
+    .option('--before <tab>', 'the tab it goes in front of')
+    .action((id: string, opts: { before?: string }) => ask({ op: 'reorder', kind: 'tab', id, ...(opts.before ? { before: opts.before } : {}) }));
   side.command('attach <pane>')
     .description('Show one pane live in this terminal and type into it (ctrl+b q detaches; the pane keeps running)')
     .action(async (ref: string) => {
@@ -252,7 +307,9 @@ function runAttachView(ref: string): Promise<number> {
 /** The terminal side of bare `els`: raw keys → the app, window size → the app, the app's drawing → stdout. */
 function runAppView(sidebar: boolean | undefined): Promise<number> {
   const decodeKeys = createKeyDecoder();
+  const hosts = federation();                                    // the other hosts' panes (registered els hosts + herdr), read-only
   const app = createAttachApp({
+    remote: { list: () => hosts.list(), read: (address) => hosts.read(address) },
     request: (request) => requestEls(elsSocketPath(), request),
     attach: (pane, size, handlers) => attachEls(elsSocketPath(), pane, size, handlers),
     write: (text) => { process.stdout.write(text); },

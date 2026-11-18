@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, rmdirSync, symlinkSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { worktreeHasChanges, preservationHasChanges, changedFiles, commitTitles, commitWorktree, unstageElanousRuntimeArtifacts, featurePrompt, defaultSeams, changedFileTypecheck, mergeBaseDiagnostics, gateChangedFiles, gateWorktreeBehindMain, resolveBootFailureReason, toReviewIntentInput, worktreeDiff, reviewScopeDiff, REVIEW_SCOPE_UNMEASURABLE, podChildDependenciesRequired, type DefaultSeamsOptions } from './seams.js';
+import { worktreeHasChanges, preservationHasChanges, changedFiles, commitTitles, commitWorktree, unstageElanousRuntimeArtifacts, featurePrompt, defaultSeams, changedFileTypecheck, mergeBaseDiagnostics, gateChangedFiles, resolveGateComparisonBase, gateWorktreeBehindMain, resolveBootFailureReason, toReviewIntentInput, worktreeDiff, reviewScopeDiff, REVIEW_SCOPE_UNMEASURABLE, podChildDependenciesRequired, type DefaultSeamsOptions } from './seams.js';
 import type { PrManager } from '../autopilot/pr-manager.js';
 import type { SelfImplementSeams } from './orchestrator.js';
 import { runSelfImplement } from './orchestrator.js';
@@ -5335,5 +5335,185 @@ describe('TDD-SUPERVISOR-IMPOSSIBLE-EVIDENCE — 구조적으로 불가능한 �
     });
     expect(seen).toContain('구조적으로 불가능한 증거 요구');
     expect(seen).toContain('다음 조각 몫');
+  });
+});
+
+// TA-GATE-BASE-EXACT-SOURCE — `--source commit:<sha>` gives the Pod a detached HEAD in a shallow clone with no
+// default-branch ref. The gate used to stop at `comparison-base-unavailable` before the test step.
+// Axes (rule 13): entrance pinned / unpinned / pinned+explicit base × base ref missing locally / present × unresolvable.
+// Expected values are literals or SHAs read from git, never from the product code.
+describe('TA-GATE-BASE-EXACT-SOURCE — gate comparison base with an exact source pin', () => {
+  let root: string;
+  let origin: string;
+  let c0: string;
+  let pin: string;
+  const createdWorktrees: Array<{ repo: string; path: string }> = [];
+  const head = (cwd: string, ref = 'HEAD') => git(cwd, 'rev-parse', ref).stdout.trim();
+
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'seam-gate-pin-')));
+    origin = join(root, 'origin');
+    git(root, 'init', '-q', '-b', 'main', origin);
+    git(origin, 'config', 'user.email', 't@t.co');
+    git(origin, 'config', 'user.name', 'T');
+    mkdirSync(join(origin, 'src'), { recursive: true });
+    writeFileSync(join(origin, 'src/a.ts'), 'export const a = 0;\n');
+    writeFileSync(join(origin, 'src/a.test.ts'), "import { a } from './a';\ntest('a', () => { expect(a).toBe(0); });\n");
+    git(origin, 'add', '-A');
+    git(origin, 'commit', '-qm', 'c0');
+    c0 = head(origin);
+    writeFileSync(join(origin, 'src/a.ts'), 'export const a = 0;\nexport const b = 1;\n');
+    git(origin, 'commit', '-qam', 'c1 pin');
+    pin = head(origin);
+  });
+  afterEach(() => {
+    for (const wt of createdWorktrees.splice(0)) {
+      git(wt.repo, 'worktree', 'remove', '--force', wt.path);
+      rmSync(wt.path, { recursive: true, force: true });
+      try { rmdirSync(dirname(wt.path)); } catch { /* a non-empty shared parent stays */ }
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A Pod-like checkout: shallow (or full) clone, detached at the pin, every default-branch ref removed. */
+  function podCheckout(name: string, opts: { shallow: boolean }): string {
+    const repo = join(root, name);
+    expect(git(root, 'clone', '-q', ...(opts.shallow ? ['--depth', '1'] : []), `file://${origin}`, repo).status).toBe(0);
+    git(repo, 'config', 'user.email', 't@t.co');
+    git(repo, 'config', 'user.name', 'T');
+    git(repo, 'checkout', '-q', '--detach', pin);
+    git(repo, 'branch', '-D', 'main');
+    git(repo, 'symbolic-ref', '-d', 'refs/remotes/origin/HEAD');
+    git(repo, 'update-ref', '-d', 'refs/remotes/origin/main');
+    return repo;
+  }
+  function detachedWorktree(repo: string, name: string, at: string): string {
+    const path = join(root, name);
+    expect(git(repo, 'worktree', 'add', '-q', '--detach', path, at).status).toBe(0);
+    return path;
+  }
+
+  test('pinned · base ref missing in a shallow clone · recorded pin → resolves to the pin', () => {
+    const repo = podCheckout('pod-shallow', { shallow: true });
+    expect(git(repo, 'rev-parse', '--is-shallow-repository').stdout.trim()).toBe('true');
+    const wt = detachedWorktree(repo, 'wt-pinned', pin);
+    expect(resolveGateComparisonBase(wt, pin)).toEqual({ ref: pin, source: 'worktree-base' });
+  });
+
+  test('pinned with explicit base · base ref missing · recorded explicit base → resolves to that base', () => {
+    const repo = podCheckout('pod-partial', { shallow: false });
+    const wt = detachedWorktree(repo, 'wt-explicit', pin);
+    expect(resolveGateComparisonBase(wt, c0)).toEqual({ ref: c0, source: 'worktree-base' });
+  });
+
+  test('unpinned · base ref present → the default-branch fork point, unchanged', () => {
+    git(origin, 'checkout', '-q', '-b', 'feature');
+    writeFileSync(join(origin, 'src/a.ts'), 'export const a = 2;\n');
+    git(origin, 'commit', '-qam', 'round commit');
+    expect(resolveGateComparisonBase(origin, c0)).toEqual({ ref: pin, source: 'merge-base' });
+  });
+
+  test('pinned · base ref missing · nothing recorded → explicit reason, no ref', () => {
+    const repo = podCheckout('pod-unrecorded', { shallow: true });
+    const wt = detachedWorktree(repo, 'wt-unrecorded', pin);
+    expect(resolveGateComparisonBase(wt)).toEqual({ ref: null, reason: 'default-branch-missing', worktreeBase: 'not-recorded' });
+  });
+
+  test('pinned · recorded base absent from the shallow object store → missing-locally', () => {
+    const repo = podCheckout('pod-missing', { shallow: true });
+    const wt = detachedWorktree(repo, 'wt-missing', pin);
+    expect(resolveGateComparisonBase(wt, c0)).toEqual({ ref: null, reason: 'default-branch-missing', worktreeBase: 'missing-locally' });
+  });
+
+  test('default branch unrelated to the pin and recorded base not an ancestor → merge-base-failed · not-ancestor', () => {
+    const repo = podCheckout('pod-unrelated', { shallow: true });
+    git(repo, 'checkout', '-q', '--orphan', 'main');
+    git(repo, 'rm', '-rqf', '.');
+    writeFileSync(join(repo, 'other.md'), 'unrelated\n');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-qm', 'orphan');
+    const orphan = head(repo);
+    git(repo, 'checkout', '-q', '--detach', pin);
+    const wt = detachedWorktree(repo, 'wt-unrelated', pin);
+    expect(resolveGateComparisonBase(wt, orphan)).toEqual({ ref: null, reason: 'merge-base-failed', worktreeBase: 'not-ancestor' });
+  });
+
+  // Real gate (no integrity-gate stub): `defaultSeams().gate` → `runIntegrityGate` (`integrity-gate.ts:285`) spawns a real
+  // `bun test <filters>` in the worktree. The arranged test file writes a marker, so «the test step ran» is observed from
+  // the real run itself. Only verify-by-breaking (a second, base-side bun run unrelated to this contract) is injected.
+  function realGateSeams() {
+    return defaultSeams({
+      runVerifyByBreaking: () => ({
+        files: [{ file: 'src/a.test.ts', classification: 'distinguishes', base: { status: 'test-fail', log: 'base test failed' } }],
+        baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
+      }),
+    });
+  }
+  /** The same round change in both outermost cases: a source edit plus a test that leaves a marker when it executes. */
+  function arrangeRoundChange(wtPath: string): string {
+    const marker = join(root, 'test-step-ran.marker');
+    writeFileSync(join(wtPath, 'src/a.ts'), 'export const a = 0;\nexport const b = 2;\n');
+    writeFileSync(join(wtPath, 'src/a.test.ts'), [
+      "import { expect, test } from 'bun:test';",
+      "import { writeFileSync } from 'node:fs';",
+      "import { a, b } from './a';",
+      `test('pinned gate executes this file', () => { writeFileSync(${JSON.stringify(marker)}, 'ran'); expect(a + b).toBe(2); });`,
+      '',
+    ].join('\n'));
+    return marker;
+  }
+
+  test('outermost seam: worktree cut from a pinned shallow Pod checkout → the real gate resolves the pin and executes src/a.test.ts', async () => {
+    const repo = podCheckout('pod-e2e', { shallow: true });
+    // The Pod child runs from its checkout; `repoRoot` would route the gate to the external-target branch instead.
+    const originalCwd = process.cwd();
+    process.chdir(repo);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const seams = realGateSeams();
+      const wt = await seams.createWorktree({ branch: `se/ta-gate-pin-${Date.now()}`, runId: 'run-ta-gate-pin' });
+      createdWorktrees.push({ repo, path: wt.path });
+      expect(wt.resolvedBase).toBe(pin);
+      const marker = arrangeRoundChange(wt.path);
+      const result = await seams.gate(wt.path, { runId: 'run-ta-gate-pin' });
+      expect(existsSync(marker) ? readFileSync(marker, 'utf8') : 'not-executed').toBe('ran');
+      expect(result.log).toContain('[test] PASS bun test src/a.test.ts');
+      expect(result).toMatchObject({
+        testStepExecuted: true,
+        comparisonBaseStatus: 'tracked-changes',
+        scopeReason: 'changed-tests',
+        comparisonBase: pin,
+      });
+      expect(result.scopeReason).not.toBe('comparison-base-unavailable');
+      expect(log).toHaveBeenCalledWith('self-implement', 'gate.comparison-base',
+        { runId: 'run-ta-gate-pin', source: 'worktree-base', ref: pin }, { level: 'warn' });
+    } finally {
+      log.mockRestore();
+      process.chdir(originalCwd);
+    }
+  });
+
+  test('outermost seam (negative): same change, base unresolvable → the real gate does not execute the test, explicit reason', async () => {
+    const repo = podCheckout('pod-e2e-unresolved', { shallow: true });
+    const wt = detachedWorktree(repo, 'wt-e2e-unresolved', pin);
+    const marker = arrangeRoundChange(wt);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await realGateSeams().gate(wt, { runId: 'run-ta-gate-unresolved' });
+      expect(existsSync(marker)).toBe(false);
+      expect(result.log).not.toContain('bun test src/a.test.ts');
+      expect(result).toMatchObject({
+        passed: false,
+        testStepExecuted: false,
+        comparisonBaseStatus: 'unavailable',
+        scopeReason: 'comparison-base-unavailable',
+        comparisonBase: null,
+      });
+      expect(result.log).toContain('reason=default-branch-missing; worktreeBase=not-recorded');
+      expect(log).toHaveBeenCalledWith('self-implement', 'gate.comparison-base',
+        { runId: 'run-ta-gate-unresolved', source: 'unavailable', reason: 'default-branch-missing', worktreeBase: 'not-recorded' }, { level: 'warn' });
+    } finally {
+      log.mockRestore();
+    }
   });
 });

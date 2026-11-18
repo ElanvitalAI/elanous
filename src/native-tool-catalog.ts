@@ -180,6 +180,12 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     defaultEnabled: true,
     coreReason: 'N1',
     intentScope: 'coding',
+    // TC #92362 — guardian pre-call gate (HARNESS_GUARDIAN_ENABLED=1):
+    // classifies `args.command` argv-exact via the same classifier the
+    // seat approval flow uses. deny/ask-op block the call BEFORE the
+    // runtime executes (ask-op lands deny — unmanned fail-closed · HITL
+    // 승인 요청은 후속 칸).
+    guardian: { kind: 'shell-argv' },
   },
   {
     id: 'run_shell',

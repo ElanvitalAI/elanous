@@ -19,6 +19,7 @@
 import { debug } from '../debug/log.js';
 import { appendGuardianAudit } from './audit-sink.js';
 import { checkPluginCapability } from './policies/plugin-capability.js';
+import { checkShellArgv } from './policies/shell-argv.js';
 import { checkTrustStore } from './policies/trust-store.js';
 import type { GuardianContext, GuardianSpec, GuardianVerdict } from './types.js';
 
@@ -45,6 +46,11 @@ export function runGuardian(spec: GuardianSpec, ctx: GuardianContext): GuardianV
     case 'trust-store':
       verdict = checkTrustStore(ctx);
       break;
+    case 'shell-argv':
+      // TC #92362 — pre-call gate for the Bash tool. Vocabulary maps
+      // 1:1 onto GuardianDecision (allow/deny/needs-approval).
+      verdict = checkShellArgv(ctx);
+      break;
     case 'hitl-delivery':
     case 'mutating-default':
       // Forward-compat slot — vision-ready lane implements these.
@@ -70,7 +76,11 @@ export function runGuardian(spec: GuardianSpec, ctx: GuardianContext): GuardianV
   // 4-channel delivery slot hasn't landed. The verdict union keeps
   // the 3-variant shape so vision-ready can additively enable HITL
   // without changing the type surface.
-  if (verdict.decision === 'needs-approval') {
+  //
+  // TC #92362 — `shell-argv` is EXEMPT from this blanket demotion: it
+  // takes its own explicit path below so the policy's needs-approval
+  // verdict stays observable and testable per-policy.
+  if (verdict.decision === 'needs-approval' && spec.kind !== 'shell-argv') {
     verdict = {
       decision: 'deny',
       reasons: [
@@ -80,6 +90,23 @@ export function runGuardian(spec: GuardianSpec, ctx: GuardianContext): GuardianV
       auditPayload: verdict.auditPayload,
     };
     policyName = `${policyName}-hitl-degraded`;
+  }
+
+  // TC #92362 — shell-argv ask-op explicitly escaped the blanket
+  // demotion above. This PR is still unmanned fail-closed: the
+  // guardian pre-call seam has no approver port, so ask-op lands deny.
+  // HITL 승인 요청은 후속 칸 (bash-runtime.ts 의 사후 승인 흐름과는
+  // 별개 배선).
+  if (verdict.decision === 'needs-approval' && spec.kind === 'shell-argv') {
+    verdict = {
+      decision: 'deny',
+      reasons: [
+        ...verdict.reasons,
+        'shell-argv ask-op demoted to deny — unmanned fail-closed · HITL 승인 요청은 후속 칸 (TC #92362)',
+      ],
+      auditPayload: verdict.auditPayload,
+    };
+    policyName = `${policyName}-ask-op-denied`;
   }
 
   if (debug.enabled) {

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-TYPES-TS",
+  "path": "src/ux-sim/sim-world/types.ts",
+  "boundary": "Declares the scenario, device-registration, D10 recorder and verdict shapes that the four world hands code against; holds no runtime behaviour.",
+  "deviceIds": [
+    "sim-world-kernel"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

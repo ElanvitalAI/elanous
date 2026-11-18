@@ -19,6 +19,7 @@
 // seq 는 CLI 신고기와 같은 HerdrSequenceLease — max(직전+1 · 시각 · 예약 high-watermark+1).
 // 프로세스마다 1부터 다시 세면 같은 pane 재기동(H9 포함) 뒤 보고가 전부 버려진다.
 
+import { spawnSync } from 'node:child_process';
 import { connect, type Socket } from 'node:net';
 
 import { debug } from '../debug/log.js';
@@ -55,6 +56,8 @@ export interface HerdrSocketReporterDeps {
   readonly log?: (event: string, data: Record<string, unknown>) => void;
   /** 시험이 유닉스 소켓 대신 프레임을 받는다. 없으면 HERDR_SOCKET_PATH 로 연결. */
   readonly send?: HerdrSocketSend;
+  /** releaseNow 의 동기 전송. 없으면 자식 프로세스로 HERDR_SOCKET_PATH 에 보내고 응답을 기다린다. */
+  readonly sendSync?: (frame: HerdrSocketFrame) => boolean;
   /** pane 별 seq high-watermark. 없으면 CLI 신고기와 같은 파일 저장소. */
   readonly seqStore?: HerdrSeqStore;
   readonly now?: () => number;
@@ -81,6 +84,11 @@ export interface HerdrSocketReporter {
   metadata(meta?: HerdrSocketMetadata): void;
   /** 종료 때 권위 반납. 한 번만 · 남은 상태/메타는 버리고 진행 중 프레임 뒤에 보낸다. */
   release(): void;
+  /**
+   * 'exit' 훅용 동기 반납 — 그 안에서는 이벤트 루프가 돌지 않아 release() 의 비동기 프레임이 나가지 않는다.
+   * 이미 반납을 청했으면(신호 지킴이가 응답까지 기다림) 아무것도 안 한다.
+   */
+  releaseNow(): void;
   /** 지금 줄 선 전송이 다 끝나면 풀린다(시험·종료 대기). */
   settled(): Promise<void>;
 }
@@ -137,6 +145,7 @@ export function createHerdrSocketReporter(deps: HerdrSocketReporterDeps = {}): H
     title: seatTitleFromCwd(cwd),
     log,
     send: deps.send,
+    sendSync: deps.sendSync ?? ((frame) => writeHerdrSocketSync(socketPath, frame, log)),
     now,
     sequence: new HerdrSequenceLease(seqStore, now, (error) => {
       log('seq-store-failed', { error: error instanceof Error ? error.message : String(error) });
@@ -178,6 +187,7 @@ class SocketReporter implements HerdrSocketReporter {
     readonly title: string;
     readonly log: (event: string, data: Record<string, unknown>) => void;
     readonly send?: HerdrSocketSend;
+    readonly sendSync: (frame: HerdrSocketFrame) => boolean;
     readonly sequence: HerdrSequenceLease;
     readonly now: () => number;
     readonly tokens?: () => Readonly<Record<string, string>>;
@@ -210,6 +220,25 @@ class SocketReporter implements HerdrSocketReporter {
     this.pendingMeta = null;
     this.clearTimer();
     this.kick();
+  }
+
+  releaseNow(): void {
+    if (this.releaseRequested) return;
+    this.releaseRequested = true;
+    this.released = true;
+    this.desired = null;
+    this.pendingMeta = null;
+    this.clearTimer();
+    const frame: HerdrSocketFrame = {
+      id: this.nextId(),
+      method: 'pane.release_agent',
+      params: { pane_id: this.opts.paneId, source: SOURCE, agent: AGENT, seq: this.nextSeq() },
+    };
+    try {
+      if (!this.opts.sendSync(frame)) this.opts.log('release-sync-failed', {});
+    } catch (error) {
+      this.opts.log('release-sync-failed', { error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   async settled(): Promise<void> {
@@ -387,6 +416,7 @@ class SocketReporter implements HerdrSocketReporter {
 
 const RELEASE_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
 const DEFAULT_SIGNAL_RELEASE_WAIT_MS = 500;
+const SYNC_RELEASE_WAIT_MS = 1_000;
 
 /**
  * SIGINT·SIGTERM 기본 죽음에도 소켓 권위를 반납한다. `release_agent` 는 비동기 프레임이라
@@ -507,4 +537,34 @@ export function writeHerdrSocket(
       }
     });
   });
+}
+
+
+const SYNC_CLIENT = [
+  "const s=require('node:net').connect(process.env.ELN_HERDR_SOCK);let b='';",
+  "s.on('connect',()=>s.write(process.env.ELN_HERDR_FRAME+'\\n'));",
+  "s.on('data',d=>{b+=d;const n=b.indexOf('\\n');if(n<0)return;",
+  "let r={};try{r=JSON.parse(b.slice(0,n))}catch{}process.exit(r.result!==undefined&&!r.error?0:2)});",
+  "s.on('error',()=>process.exit(3));s.on('close',()=>process.exit(4));",
+].join('');
+
+/** writeHerdrSocket 의 동기판 — 자식 프로세스가 보내고 응답을 받을 때까지(상한 timeoutMs) 막는다. */
+export function writeHerdrSocketSync(
+  socketPath: string,
+  frame: HerdrSocketFrame,
+  log: (event: string, data: Record<string, unknown>) => void = defaultLog,
+  timeoutMs: number = SYNC_RELEASE_WAIT_MS,
+): boolean {
+  try {
+    const out = spawnSync(process.execPath, ['-e', SYNC_CLIENT], {
+      env: { ...process.env, BUN_BE_BUN: '1', ELN_HERDR_SOCK: socketPath, ELN_HERDR_FRAME: JSON.stringify(frame) },
+      stdio: 'ignore',
+      timeout: timeoutMs,
+    });
+    if (out.status === 0) return true;
+    log('send-sync-failed', { method: frame.method, status: out.status ?? -1, signal: out.signal ?? '' });
+  } catch (error) {
+    log('send-sync-failed', { method: frame.method, error: error instanceof Error ? error.message : String(error) });
+  }
+  return false;
 }

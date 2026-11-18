@@ -1266,7 +1266,7 @@ describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => 
 
   test('shadow: one card per cell, launch 0, seat path unchanged, and not handed twice', async () => fixture(async (root, id, logged) => {
     const launches: string[][] = [];
-    const deps: TickDeps = { ...base, handToTaskAgent: 'shadow', taskLauncher: async (args) => { launches.push(args); } };
+    const deps: TickDeps = { ...base, handToTaskAgent: 'shadow', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } };
     const state = await invoke(root, 'shadow08', '08', deps, logged);
     expect(launches).toHaveLength(0);
     expect(state.handed?.map(row => ({ cell: row.cell, mode: row.mode, launched: row.launched }))).toEqual([
@@ -1282,7 +1282,7 @@ describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => 
 
   test('live: the real handTask launches once through the launcher (pod · merge-by-host) and the seat journal stays empty', async () => fixture(async (root, id, logged) => {
     const launches: string[][] = [];
-    const deps: TickDeps = { ...base, split: validSplit, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } };
+    const deps: TickDeps = { ...base, split: validSplit, handToTaskAgent: 'live', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } };
     const state = await invoke(root, 'live08', '08', deps, logged);
     expect(launches).toHaveLength(2);
     expect(launches[0]).toEqual(expect.arrayContaining(['harness', 'say', '--merge-by-host']));
@@ -1306,7 +1306,7 @@ describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => 
 
   test('live hand under a shadow tick is card-only; a cell filter hands only that cell', async () => fixture(async (root, id, logged) => {
     const launches: string[][] = [];
-    const shadowTick = await invoke(root, 'tickshadow08', '08', { ...base, mode: 'shadow', handToTaskAgent: 'live', handToTaskAgentCell: 'C2', taskLauncher: async (args) => { launches.push(args); } }, logged);
+    const shadowTick = await invoke(root, 'tickshadow08', '08', { ...base, mode: 'shadow', handToTaskAgent: 'live', handToTaskAgentCell: 'C2', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } }, logged);
     expect(launches).toHaveLength(0);
     expect(shadowTick.handed?.map(row => [row.cell, row.mode])).toEqual([['C2', 'shadow']]);
     expect(logged.filter(row => row.event === 'hand-to-task-agent').map(row => row.reason)).toEqual([expect.stringContaining(`orch:${id}:C2:`)]);
@@ -1466,7 +1466,7 @@ test('ORCH-TA-HAND: an injected mode still honors the configured cell filter; sh
     writeFileSync(join(root, 'config.json'), JSON.stringify({ loops: { orchestrator: { handToTaskAgentCell: 'C2' } } }));
     resetUserConfig();
     // ① shadow tick (no placement): only the configured cell C2 gets a shadow card.
-    const shadow = await invoke(root, 'mix08s', '08', { mode: 'shadow', split, loadAdapter: async () => undefined, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } }, logged);
+    const shadow = await invoke(root, 'mix08s', '08', { mode: 'shadow', split, loadAdapter: async () => undefined, handToTaskAgent: 'live', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } }, logged);
     expect(shadow.handed?.map(row => [row.cell, row.mode])).toEqual([['C2', 'shadow']]);
     expect(launches).toHaveLength(0);
     // ② the same cells in a live tick: C2 (never seat-delegated) now launches through TASK-AGENT; C1 (outside the filter) takes the seat path.
@@ -1474,7 +1474,7 @@ test('ORCH-TA-HAND: an injected mode still honors the configured cell filter; sh
     writeFileSync(join(root, 'loop', 'orchestrator', 'mix08l.json'), JSON.stringify({ ...placed, runId: 'mix08l', mode: 'live',
       cells: placed.cells.map((cell: Record<string, unknown>) => ({ ...cell, version: '0.2.18' })), nodes: { intake: 'ok', split: 'ok', place: 'ok' }, handed: [] }));
     const live = await runOrchestratorNode('delegate', { root, runId: 'mix08l', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
-      handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } });
+      handToTaskAgent: 'live', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } });
     expect(launches).toHaveLength(1);
     expect(live.handed?.filter(row => row.mode === 'live').map(row => row.cell)).toEqual(['C2']);
     expect(journalRowsOf(root).map(row => row.cell)).toEqual(['C1']);
@@ -1485,7 +1485,7 @@ test('ORCH-TA-HAND: an injected mode still honors the configured cell filter; sh
     delete again.nodes.delegate;
     writeFileSync(join(root, 'loop', 'orchestrator', 'mix08l.json'), JSON.stringify(again));
     await runOrchestratorNode('delegate', { root, runId: 'mix08l', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
-      handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } });
+      handToTaskAgent: 'live', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } });
     expect(launches).toHaveLength(1);
     expect(journalRowsOf(root).map(row => row.cell)).toEqual(['C1']);
   } finally { resetElanousConfigDir(); resetUserConfig(); }
@@ -1495,7 +1495,7 @@ const journalRowsOf = (root: string) => { const path = join(root, 'seat-requests
 test('ORCH-TA-HAND: another run re-reading the ledger never claims a hand it did not make', async () => fixture(async (root) => {
   await placedRun(root, 'ownA');
   await runOrchestratorNode('delegate', { root, runId: 'ownA', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {},
-    handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async () => {} });
+    handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async (_args, _cwd, launchContext) => { return { runId: launchContext?.runId }; } });
   const placed = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'ownA.json'), 'utf8'));
   writeFileSync(join(root, 'loop', 'orchestrator', 'ownB.json'), JSON.stringify({ ...placed, runId: 'ownB', handed: undefined, nodes: { intake: 'ok', split: 'ok', place: 'ok' } }));
   const b = await runOrchestratorNode('delegate', { root, runId: 'ownB', window: '08', mode: 'live', now: new Date('2026-10-04T00:00:00Z'), print: () => {}, observe: () => {}, handToTaskAgent: 'off', handToTaskAgentCell: '-' });
@@ -1616,7 +1616,7 @@ test('COORD-HA × ORCH-TA-HAND: a live hand uses the per-tick cap; L2 never hand
     const goal = '첫 칸\n완료 경계 코드: src/loops/orchestrator/tick.ts 변경\n완료 경계 실물: live hand 발사\n완료 경계 증거 명령: bun test src/loops/orchestrator/tick.test.ts';
     const split: TickDeps['split'] = () => [{ id: 'C1', title: goal, seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }];
     const state = await invoke(root, 'capHand', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined,
-      handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async (args) => { launches.push(args); } }, logged);
+      handToTaskAgent: 'live', handToTaskAgentCell: 'C1', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } }, logged);
     expect(launches).toHaveLength(1);
     expect(state.delegatedKeys).toEqual([`orch:${id}:C1`]);
     expect(state.deferredCells?.map(cell => cell.id)).toEqual(['C2']);
@@ -1666,7 +1666,7 @@ test('COORD-HA × ORCH-TA-HAND: a capped cell still gets its shadow card; an unp
     const launches: string[][] = [];
     const split: TickDeps['split'] = () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }];
     const capped = await invoke(root, 'capShadow', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined,
-      handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } }, logged);
+      handToTaskAgent: 'live', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } }, logged);
     expect(launches).toHaveLength(0);
     expect(capped.handed?.map(row => [row.cell, row.mode])).toEqual([['C1', 'shadow']]);
     expect(capped.deferredCells?.map(cell => cell.id)).toEqual(['C1']);
@@ -1680,7 +1680,7 @@ test('COORD-HA × ORCH-TA-HAND: with cap 0 an unplaced cell in a live tick is ne
     writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: { maxDelegatePerTick: 0 } } }));
     const launches: string[][] = [];
     const state = await invoke(root, 'capUnplaced', '08', { mode: 'live', split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }], placeCell: () => null,
-      loadAdapter: async () => undefined, handToTaskAgent: 'live', taskLauncher: async (args) => { launches.push(args); } }, logged);
+      loadAdapter: async () => undefined, handToTaskAgent: 'live', taskLauncher: async (args, _cwd, launchContext) => { launches.push(args); return { runId: launchContext?.runId }; } }, logged);
     expect(launches).toHaveLength(0);
     expect(state.handed?.every(row => row.mode === 'shadow' && !row.launched)).toBe(true);
     expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);

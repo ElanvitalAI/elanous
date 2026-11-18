@@ -162,7 +162,7 @@ test('생산 resize draw가 프레임 본문 write 예외 뒤에도 synchronized
   const exceptionScreen = await pty.renderScreen();
   expect(readFileSync(join(root, 'draw-error'), 'utf8')).toContain('injected frame-body write failure');
   expect(count(after, SYNCHRONIZED_OUTPUT_BEGIN)).toBe(count(after, SYNCHRONIZED_OUTPUT_END));
-  expect(exceptionScreen).toContain('elanous');
+  expect(exceptionScreen).toContain('ChatLog');  // 출처: #34909 (8bcceba392) — 링크 pending이면 브랜드 행 대신 'Opening web setup…' (first-screen-band.ts:163) · ChatLog 위젯 헤더는 항상 렌더
   const evidenceDir = process.env.ELANOUS_FLICKER_LIVE_OUT;
   if (evidenceDir) {
     mkdirSync(evidenceDir, { recursive: true });

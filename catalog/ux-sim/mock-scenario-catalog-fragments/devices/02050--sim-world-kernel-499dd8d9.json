@@ -1,0 +1,36 @@
+{
+  "id": "sim-world-kernel",
+  "name": "Sim world kernel (packs · D10 recorder · expectation ratchet)",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/sim-world/types.ts",
+    "src/ux-sim/sim-world/recorder.ts",
+    "src/ux-sim/sim-world/expect.ts",
+    "src/ux-sim/sim-world/ratchet.ts",
+    "src/ux-sim/sim-world/kernel.ts",
+    "src/ux-sim/sim-world/example-scenarios.ts"
+  ],
+  "tests": [
+    "src/ux-sim/sim-world/recorder.test.ts",
+    "src/ux-sim/sim-world/expect.test.ts",
+    "src/ux-sim/sim-world/kernel.test.ts",
+    "src/ux-sim/sim-world/kernel-cli.test.ts",
+    "src/ux-sim/device-fidelity.test.ts"
+  ],
+  "target": "Runs the reserved memory/ta/graph/supervisors world packs scenario by scenario in isolated test universes and judges each against the red/green expectation table.",
+  "inputs": [
+    "world pack YAML rows",
+    "sim-world-expect.json",
+    "--seed / --engine / --only"
+  ],
+  "observations": [
+    "per-scenario events.jsonl, walk.json, seam-calls.jsonl, claims.jsonl, verdict.json",
+    "bundle summary.json with expected, actual, diff first line, seed and main sha"
+  ],
+  "entryCommands": [
+    "elanous --test sim world run all --seed 1"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}
