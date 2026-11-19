@@ -37,7 +37,7 @@ const nodeBody = (docsTree: string, calls: string[]) => async (_body: string, op
   const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string };
   calls.push(ctx.nodeId);
   if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\n', stderr: '' };
-  if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
+  if (ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
   if (ctx.nodeId === 'gate') return { exitCode: 1, stdout: '{"outcome":"fail","verdict":"fail","summary":"gate must not run on resume"}\n', stderr: '' };
   if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
   if (ctx.nodeId === 'known-issues') return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fixture","count":1}\n', stderr: '' };
@@ -64,7 +64,7 @@ async function stoppedAtGate(root: string, calls: string[]) {
     `  const ctx = JSON.parse(readFileSync(opts.env.ELANOUS_GRAPH_CONTEXT, 'utf8'));`,
     `  if (ctx.nodeId === 'gate') { writeFileSync(marker, ctx.runId); return new Promise(() => {}); }`,
     `  if (ctx.nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: '{"outcome":"legacy"}\\n', stderr: '' };`,
-    `  if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version, commit: sha, branch: 'release/' + version }) + '\\n', stderr: '' };`,
+    `  if (ctx.nodeId === 'cut-branch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version, commit: sha, branch: 'release/' + version }) + '\\n', stderr: '' };`,
     `  if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: 'release-docs/' + version, worktree: docsTree }) + '\\n', stderr: '' };`,
     `  return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\\n', stderr: '' };`,
     `};`,

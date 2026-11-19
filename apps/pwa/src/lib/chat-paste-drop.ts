@@ -1,4 +1,5 @@
-export const MAX_CHAT_FILE_BYTES = 20 * 1024 * 1024;
+// Matches the attachment-store server's default cap (10 MiB).
+export const MAX_CHAT_FILE_BYTES = 10 * 1024 * 1024;
 export const MAX_CHAT_FILES = 10;
 
 export interface ChatFileExtraction {
@@ -20,6 +21,11 @@ function selectFiles(files: readonly { file: File; filename: string }[]): ChatFi
     }
   }
   return result;
+}
+
+/** Apply the same per-batch limits to picker, paste and drag/drop. */
+export function extractPickedFiles(files: readonly File[]): ChatFileExtraction {
+  return selectFiles(files.map(file => ({ file, filename: file.name })));
 }
 
 /** Ignore text/HTML clipboard items so ordinary text paste retains its native behavior. */

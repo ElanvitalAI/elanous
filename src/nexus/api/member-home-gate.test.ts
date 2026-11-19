@@ -39,3 +39,29 @@ test('HTTP gate still denies an unrelated private path with a member cookie', as
     expect(response?.status).toBe(401);
   } finally { store.close(); }
 });
+
+test('HTTP gate lets the webchat handoff route reach its own session check', async () => {
+  const store = createMemberStore({ path: ':memory:' });
+  try {
+    const member = store.register({ sub: 'handoff-gate', email: 'handoff-gate@example.test',
+      emailVerified: true, name: 'Handoff Gate' }, { consents: { privacy: 'v1', terms: 'v1' } });
+    store.claimHandle(member.id, 'handoffgate');
+    const membersApi = createMembersApi({ store, google: {
+      redirectUri: 'https://api.example.test/v1/members/oauth/google/callback',
+    } as never, successRedirectUri: 'https://app.example.test/member', webOrigin: 'https://app.example.test',
+    webChatHandoff: { issue: ({ handle }) => `https://${handle}.elanous.app/app/chat/handoff?handoff-token=wch_gate-test-token`,
+      revokeDerivedForMember: () => {} } });
+    const opts = { membersApi } as NexusHttpServerOpts;
+    const route = (path: string, headers?: HeadersInit) => routeRequest(
+      new Request(`https://api.example.test${path}`, { headers }), opts, {} as never, null, createDevProxyRuntimeRef());
+
+    const handoff = await route('/v1/members/webchat-handoff', {
+      cookie: `__Host-elanous_member_session=${member.session.token}`,
+    });
+    expect(handoff?.status).toBe(303);
+    const location = handoff?.headers.get('location') ?? '';
+    expect(location).toBe('https://handoffgate.elanous.app/app/chat/handoff?handoff-token=wch_gate-test-token');
+    expect(location).not.toContain(member.session.token);
+    expect((await route('/v1/members/webchat-handoff'))?.status).toBe(401);
+  } finally { store.close(); }
+});

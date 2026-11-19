@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   extractClipboardFiles,
   extractDroppedFiles,
+  extractPickedFiles,
   hasDroppedFiles,
   MAX_CHAT_FILE_BYTES,
   MAX_CHAT_FILES,
@@ -82,7 +83,8 @@ test('both transfer paths report oversized and excess files while retaining vali
   const batch = [oversized, ...accepted];
   const pasted = extractClipboardFiles(clipboard(batch.map(item)), 1);
   const dropped = extractDroppedFiles({ files: batch } as unknown as DataTransfer);
-  for (const result of [pasted, dropped]) {
+  const picked = extractPickedFiles(batch);
+  for (const result of [pasted, dropped, picked]) {
     expect(result.files.map((entry) => entry.filename)).toEqual(
       accepted.slice(0, MAX_CHAT_FILES).map((entry) => entry.name),
     );
@@ -93,7 +95,10 @@ test('both transfer paths report oversized and excess files while retaining vali
 
 test('a file exactly at the byte limit is accepted', () => {
   const boundary = file('boundary.png');
-  Object.defineProperty(boundary, 'size', { value: MAX_CHAT_FILE_BYTES });
+  Object.defineProperty(boundary, 'size', { value: 10_485_760 }); // 10 MiB, the server attachment-store limit.
   expect(extractDroppedFiles({ files: [boundary] } as unknown as DataTransfer).files)
     .toEqual([{ file: boundary, filename: 'boundary.png' }]);
+  const over = file('over.png');
+  Object.defineProperty(over, 'size', { value: 10_485_761 });
+  expect(extractPickedFiles([over]).tooLarge).toBe(1);
 });

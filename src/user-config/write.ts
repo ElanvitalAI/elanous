@@ -318,7 +318,6 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
         enabled: cfg.chat.conciseness.enabled,
         finalMessageMaxLines: cfg.chat.conciseness.finalMessageMaxLines,
         preambleMaxWords: cfg.chat.conciseness.preambleMaxWords,
-        flatBullets: cfg.chat.conciseness.flatBullets,
       }),
       toolOutput: stripUndef({
         persistOnOverflow: cfg.chat.toolOutput.persistOnOverflow,

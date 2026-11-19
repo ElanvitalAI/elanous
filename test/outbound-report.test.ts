@@ -200,7 +200,8 @@ describe('outbound-report wire (http-server)', () => {
   const src = readFileSync(join(import.meta.dir, '..', 'src/nexus/api/http-server.ts'), 'utf-8');
   test('http-server imports + routes POST /v1/outbound → handleOutboundReport', () => {
     expect(src).toMatch(/import\s*\{\s*handleOutboundReport\s*\}\s*from\s*['"][^'"]*outbound-report/);
-    expect(src).toMatch(/pathname === '\/v1\/outbound' && method === 'POST'/);
+    // Quote-agnostic (#38766 reformatted http-server.ts to double quotes).
+    expect(src).toMatch(/pathname === ['"]\/v1\/outbound['"] && method === ['"]POST['"]/);
     expect(src).toMatch(/return handleOutboundReport\(req, opts\.metaApi\)/);
   });
 });

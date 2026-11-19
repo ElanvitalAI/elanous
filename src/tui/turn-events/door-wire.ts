@@ -19,6 +19,8 @@ export interface HumanFirstFacts {
   readonly lastHumanKeyAt: () => number;
   readonly now: () => number;
   readonly quietMs?: number;
+  /** TURN-FIELD-BUG-5: the key that submitted the last person turn (0 = none) — keys up to it are not «typing». */
+  readonly lastHumanTurnKeyAt?: () => number;
 }
 
 /** The internal-turn gate's «human typing» read, for the door: a person goes first. */
@@ -26,7 +28,8 @@ export function humanFirstDetail(facts: HumanFirstFacts): string | null {
   if (facts.draft().length > 0) return 'buffer';
   if (facts.unreadKeys() > 0) return 'unread-keys';
   const last = facts.lastHumanKeyAt();
-  if (last > 0 && facts.now() - last < (facts.quietMs ?? DOOR_HUMAN_QUIET_MS)) return 'quiet-window';
+  const mark = facts.lastHumanTurnKeyAt?.() ?? 0;
+  if (last > 0 && last > mark && facts.now() - last < (facts.quietMs ?? DOOR_HUMAN_QUIET_MS)) return 'quiet-window';
   return null;
 }
 

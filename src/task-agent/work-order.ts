@@ -49,7 +49,7 @@ export const TA_POD_DEADLINE_GRACE_SEC = 300;
 export type ParseWorkOrderBudgetResult = { ok: true; timeSec: number } | { ok: false; reason: string };
 
 /**
- * 예산 칸 `time=6900s usd=5` (공백·`·`·`,`·`;` 구분)를 읽는다. 키는 time·usd 둘뿐 — 중복·여분 키·`key = value`·대소문자 변형·빈 값은 거부(무시하지 않는다).
+ * 예산 칸 `time=6900s usd=5`를 읽는다. tier·pod·rework는 발사 설정으로 허용하되 예산 수치에는 쓰지 않는다. 중복·알 수 없는 키·빈 값은 거부한다.
  * time 은 «선언된 값 그대로» 정수 초(s·m·h 소문자 단위)이고 1..TA_PILOT_MAX_WALL_SEC 여야 한다 — 부동소수·허용오차 없이 BigInt 10진 산술로 판정한다.
  * usd 는 센트 단위 정수로 환산되는 양의 10진수(소수 둘째 자리까지)여야 한다. usd 는 형식만 검증하며 강제 소비자는 아직 없다(후속 칸).
  */
@@ -59,7 +59,7 @@ export function parseWorkOrderBudget(text: string): ParseWorkOrderBudgetResult {
     const match = /^([a-z]+)=(.+)$/u.exec(token);
     if (!match) return { ok: false, reason: `예산 토큰 «${token.slice(0, 40)}» 는 소문자 key=value 형식이 아니다` };
     const [, key, value] = match as unknown as [string, string, string];
-    if (key !== 'time' && key !== 'usd') return { ok: false, reason: `예산에 허용되지 않은 키 «${key}» (허용: time·usd)` };
+    if (!['time', 'usd', 'tier', 'pod', 'rework'].includes(key)) return { ok: false, reason: `예산에 허용되지 않은 키 «${key}» (허용: time·usd·tier·pod·rework)` };
     if (pairs.has(key)) return { ok: false, reason: `예산 키 «${key}» 가 중복 선언됐다` };
     pairs.set(key, value);
   }
@@ -82,6 +82,15 @@ export function parseWorkOrderBudget(text: string): ParseWorkOrderBudgetResult {
   return { ok: true, timeSec: Number(seconds) };
 }
 
+/** Only derive numeric limits from a fully valid budget, never a partially parsed string. */
+export function workOrderBudgetLimits(text: string): { timeSec: number; usdCap: number } | undefined {
+  const parsed = parseWorkOrderBudget(text);
+  if (!parsed.ok) return undefined;
+  const usd = text.split(/[\s·,;]+/u).find((part) => part.startsWith('usd='));
+  if (!usd) return undefined;
+  return { timeSec: parsed.timeSec, usdCap: Number(usd.slice(4)) };
+}
+
 /** 선언된 벽시계(env)에서 Pod Job 수명 상한(초)을 구한다 — 1..6900 정수 초가 아니면 undefined(적용 안 함). */
 export function taPodDeadlineSeconds(env: Readonly<Record<string, string | undefined>>): number | undefined {
   const raw = env[TA_BUDGET_WALL_ENV];
@@ -97,6 +106,11 @@ export function criticalUnknownFields(order: Pick<WorkOrder, 'unknownFields' | '
 
 /** 검증을 통과한 작업 지시서 — 모든 칸이 문자열로 채워져 있다(빠진 칸은 «모름»). */
 export interface WorkOrder {
+  /** Optional binding to the task card used to generate this order. */
+  owner?: string;
+  card?: string;
+  noAutoMerge?: boolean;
+  budgetLimits?: { timeSec: number; usdCap: number };
   lifeId: string;
   /** 필수 칸 — 이것만 없으면 거부한다. */
   cellId: string;
@@ -174,6 +188,15 @@ export function parseWorkOrder(source: string): ParseWorkOrderResult {
   const record = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   const rawCellId = record['cellId'];
   if (typeof rawCellId !== 'string' || !rawCellId.trim()) return { ok: false, reason: '칸 id 가 없다' };
+  if (record.owner !== undefined && (typeof record.owner !== 'string' || !record.owner.trim())) return { ok: false, reason: '작업 지시서 owner 오류' };
+  if (record.card !== undefined && (typeof record.card !== 'string' || !record.card.trim())) return { ok: false, reason: '작업 지시서 card 오류' };
+  if (record.noAutoMerge !== undefined && typeof record.noAutoMerge !== 'boolean') return { ok: false, reason: '작업 지시서 noAutoMerge 오류' };
+  if (record.budgetLimits !== undefined) {
+    const b = record.budgetLimits as Record<string, unknown> | null;
+    const expected = typeof record.budget === 'string' ? workOrderBudgetLimits(record.budget) : undefined;
+    if (!b || typeof b !== 'object' || !expected || b.timeSec !== expected.timeSec || b.usdCap !== expected.usdCap)
+      return { ok: false, reason: '작업 지시서 budgetLimits 불일치 또는 예산 오류' };
+  }
   const unknownFields: string[] = [];
   const cells = {} as Record<WorkOrderField, string>;
   for (const field of WORK_ORDER_FIELDS) {
@@ -187,6 +210,10 @@ export function parseWorkOrder(source: string): ParseWorkOrderResult {
     ok: true,
     order: {
       cellId: rawCellId.trim(), ...cells,
+      ...(typeof record.owner === 'string' ? { owner: record.owner.trim() } : {}),
+      ...(typeof record.card === 'string' ? { card: record.card.trim() } : {}),
+      ...(typeof record.noAutoMerge === 'boolean' ? { noAutoMerge: record.noAutoMerge } : {}),
+      ...(record.budgetLimits !== undefined ? { budgetLimits: record.budgetLimits as { timeSec: number; usdCap: number } } : {}),
       ...(dependencies.length ? { dependencies } : {}),
       unknownFields,
     },

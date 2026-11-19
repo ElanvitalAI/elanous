@@ -1,5 +1,6 @@
-// els server — the one owner process of the journal and the pane PTYs (`els serve`). Clients (`els ls/new/read/send`)
-// only send requests over a Unix socket in the state dir; they never write the journal.
+// els server — the one owner process of the journal (`els serve`). Clients (`els ls/new/read/send`) only send
+// requests over a Unix socket in the state dir; they never write the journal. Pane PTYs live in outside holder
+// processes (D1a) — this server owns the journal and adopts the holders back after a restart.
 // One server per state dir is the supervisor's job (launchd/systemd runs `els serve` once — OP 11-17). Ownership is
 // the bound socket, taken BEFORE the journal is read:
 //   - bind succeeds → this process is the owner;
@@ -15,8 +16,16 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createChildTabs, type ChildSource, type ChildTabs } from './child-tabs.js';
 import { createElsCore, type ElsCore, type ElsPty, type ElsResult } from './core.js';
 import { elsJournalPath, loadJournal, saveJournal } from './journal.js';
+import { holderPty, reattachHolder } from './holder.js';
 import { doPolicy, startElsHttp, type ElsHttpBind } from './http.js';
+import { startStallAlert, type StallAlert, type StallAlertDeps } from './stall-alert.js';
 import { createLineDecoder } from './wire.js';
+import { foregroundOf, parsePs, type Foreground } from './foreground.js';
+import { createControl } from './control.js';
+import { journalControl } from './control-cli.js';
+import { peerUid } from './peer-uid.js';
+import { peerPid, processIdentity, baselineBeforePidLookup, resolvePeerSeat, type ProcessIdentity } from './peer-seat.js';
+type SeatLookup = (pid: number | undefined, baseline?: ProcessIdentity) => ReturnType<typeof resolvePeerSeat> | { pane: string; seat: string } | undefined;
 
 /** This host's name in addresses (`host:ws/tab/pane`): ELANOUS_ELS_HOST, else the short machine name. */
 export function elsHostName(): string {
@@ -40,10 +49,14 @@ export function elsSocketPathProblem(socketPath: string): string | undefined {
 
 export type ElsRequest =
   | { readonly op: 'ping' }
+  | { readonly op: 'build'; readonly pane: string; readonly sha: string }
   | { readonly op: 'ls' }
+  | { readonly op: 'grep'; readonly pattern: string }
   | { readonly op: 'new'; readonly ws: string; readonly cwd: string; readonly command: readonly string[]; readonly title?: string }
   | { readonly op: 'read'; readonly pane: string; readonly at?: { readonly ws: string; readonly tab: string } }
   | { readonly op: 'send'; readonly pane: string; readonly text: string }
+  | { readonly op: 'status'; readonly pane: string }
+  | { readonly op: 'send-verified'; readonly pane: string; readonly text: string; readonly requireEmpty?: boolean }
   | { readonly op: 'attach'; readonly pane: string; readonly cols?: number; readonly rows?: number }
   | { readonly op: 'input'; readonly bytes: string }
   | { readonly op: 'resize'; readonly cols: number; readonly rows: number }
@@ -51,6 +64,7 @@ export type ElsRequest =
   | { readonly op: 'close'; readonly pane: string }
   | { readonly op: 'close-workspace'; readonly ws: string }
   | { readonly op: 'do'; readonly pane: string; readonly text: string; readonly from: string; readonly at?: { readonly ws: string; readonly tab: string } }
+  | { readonly op: 'input-line'; readonly pane: string; readonly text: string; readonly from: string; readonly at?: { readonly ws: string; readonly tab: string } }
   | { readonly op: 'child'; readonly action: 'start' | 'progress' | 'status' | 'end' | 'pin' | 'unpin' | 'dismiss' | 'tree' | 'summary';
       readonly id?: string; readonly ws?: string; readonly cwd?: string; readonly source?: ChildSource; readonly label?: string;
       readonly parent?: string; readonly line?: string; readonly state?: 'working' | 'blocked' | 'idle'; readonly ok?: boolean; readonly summary?: string };
@@ -93,10 +107,12 @@ function dispatchChild(tabs: ChildTabs, r: Extract<ElsRequest, { op: 'child' }>)
   }
 }
 
-async function dispatch(core: ElsCore, request: ElsRequest): Promise<ElsResult> {
+async function dispatch(core: ElsCore, request: ElsRequest, stateRoot: string, uid: number | undefined, pid: number | undefined, seatLookup: SeatLookup, baseline: ProcessIdentity | undefined): Promise<ElsResult> {
   switch (request.op) {
+    case 'build': return typeof request.pane === 'string' && typeof request.sha === 'string' ? core.reportBuild(request.pane, request.sha) : { exitCode: 2, message: 'els build: pane and sha required' };
     case 'ping': return { exitCode: 0, message: `els server pid ${process.pid}` };
     case 'ls': return core.list();
+    case 'grep': return core.grep(request.pattern);
     case 'new': return core.newPane({ ws: request.ws, cwd: request.cwd, command: request.command, ...(request.title ? { title: request.title } : {}) });
     case 'read': {
       // An address (ws/tab/pane) must name exactly that pane; a bare ref keeps the stage-1 lookup.
@@ -105,6 +121,8 @@ async function dispatch(core: ElsCore, request: ElsRequest): Promise<ElsResult> 
       return paneId ? core.read(paneId) : { exitCode: 1, message: `els read: unknown pane ${request.at.ws}/${request.at.tab}/${request.pane}` };
     }
     case 'send': return core.send(request.pane, request.text);
+    case 'status': return core.status(request.pane);
+    case 'send-verified': return core.sendVerified(request.pane, request.text, request.requireEmpty === true);
     case 'reorder': return core.reorder({ kind: request.kind, id: request.id, ...(request.before === undefined ? {} : { before: request.before }) });
     case 'close': return core.close(request.pane);
     case 'close-workspace': return core.closeWorkspace(request.ws);
@@ -113,6 +131,29 @@ async function dispatch(core: ElsCore, request: ElsRequest): Promise<ElsResult> 
       if (!request.at) return core.do(request.pane, request.text, request.from);
       const paneId = core.locate(request.at.ws, request.at.tab, request.pane);
       return paneId ? core.do(paneId, request.text, request.from) : { exitCode: 1, message: `els do: unknown pane ${request.at.ws}/${request.at.tab}/${request.pane}` };
+    }
+    case 'input-line': {
+      const at = request.at;
+      const validAt = at === undefined || (at !== null && typeof at === 'object' && typeof at.ws === 'string' && typeof at.tab === 'string');
+      const valid = typeof request.pane === 'string' && typeof request.text === 'string' && typeof request.from === 'string' && validAt;
+      const lookup = journalControl(loadJournal(elsJournalPath(stateRoot)));
+      const ref = valid ? (at ? core.locate(at.ws, at.tab, request.pane) : request.pane) : undefined;
+      const target = ref ? await lookup.lookup(ref) : undefined;
+      let seat: { pane: string; seat: string } | undefined;
+      try { seat = uid === undefined ? undefined : await seatLookup(pid, baseline); } catch { seat = undefined; }
+      const door = createControl({ stateDir: dirname(elsSocketPath(stateRoot)), resolve: lookup.resolve,
+        guard: () => !valid || !target ? 'invalid input request or unknown target' : undefined,
+        execute: async (input) => {
+          // Authorization may have gone stale while intent audit was written. Re-resolve immediately
+          // before enqueue/write; any ambiguity or changed caller fails closed.
+          let current: { pane: string; seat: string } | undefined;
+          try { current = uid === undefined ? undefined : await seatLookup(pid, baseline); } catch { /* deny */ }
+          if (!seat || !current || current.pane !== seat.pane || current.seat !== seat.seat)
+            return { exitCode: 1, message: 'els input: denied (caller pane changed)' };
+          return core.inputLine(input.target.pane, input.text ?? '', request.from, input.queueAudit);
+        } });
+      const result = await door.run({ principal: { id: uid === undefined ? 'unauthenticated' : `local:${uid}`, kind: 'cli', ...(seat ? { callerPane: seat.pane, callerSeat: seat.seat } : {}) }, from: typeof request.from === 'string' ? request.from : '', action: 'input', target: target ?? { workspace: '', pane: '', shell: false }, text: typeof request.text === 'string' ? request.text : '' });
+      return result.ok ? { exitCode: result.exitCode, message: result.message } : { exitCode: 1, message: result.message };
     }
     case 'child': {
       const tabs = childTabsOf.get(core);
@@ -125,6 +166,9 @@ async function dispatch(core: ElsCore, request: ElsRequest): Promise<ElsResult> 
 // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — 10 frames a second is smooth for typing and cheap: a frame is only
 // sent when the rendered screen differs from the last one sent.
 const ATTACH_POLL_MS = 100;
+// 출처: orders/ELS-FIRST-RUN-UX-1119.md 6 «폴링은 목록 갱신에만» — with an output subscription the screen is never polled; a pane
+// that ends without printing is still noticed this often (a liveness check only, no repaint).
+const ATTACH_LIVENESS_MS = 1_000;
 // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — a client that does not read stops getting frames once this much is queued.
 const ATTACH_MAX_QUEUED_BYTES = 1_048_576;
 
@@ -161,9 +205,17 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
     } finally { busy = false; }
   };
   const poke = (): void => { tick().catch(() => { busy = false; }); };
-  const timer = setInterval(poke, ATTACH_POLL_MS);
+  // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ④ p95 ≤ 50ms — PTY 데이터 이벤트 즉시 푸시 (attach 연결 = pane 스트림 구독)
+  const sub = core.onOutput?.(paneId, () => poke());
+  // ELS-FIRST-RUN-FU3 ②: subscribed → no screen poll (no re-render, no re-sent frame); only a liveness check. A PTY without
+  // an output event keeps the old 100 ms poll.
+  const liveness = (): void => {
+    if (closed || core.paneIsLive(paneId)) return;
+    poke();   // one last frame (the screen it left) and the «pane exited» end
+  };
+  const timer = sub ? setInterval(liveness, ATTACH_LIVENESS_MS) : setInterval(poke, ATTACH_POLL_MS);
   timer.unref?.();
-  const stop = (): void => { closed = true; clearInterval(timer); };
+  const stop = (): void => { closed = true; clearInterval(timer); sub?.dispose(); };
   socket.on('close', stop);
   socket.on('error', stop);
   poke();
@@ -184,7 +236,12 @@ function serveAttach(core: ElsCore, socket: Socket, request: Extract<ElsRequest,
 
 const isRequestObject = (value: unknown): value is ElsRequest => typeof value === 'object' && value !== null && !Array.isArray(value);
 
-function serveConnection(ready: Promise<ElsCore | undefined>, socket: Socket): void {
+function serveConnection(ready: Promise<ElsCore | undefined>, socket: Socket, stateRoot: string, seatLookup: SeatLookup): void {
+  // Capture before any credential syscall; sampling afterward permits a newly reused PID.
+  const beforePidLookup = Date.now();
+  const uid = peerUid(socket);
+  const pid = peerPid(socket);
+  const baseline = baselineBeforePidLookup(processIdentity(pid), pid, beforePidLookup);
   let handled = false;
   /** Once the first line was `attach`: where later lines go. Until the owner is ready they are kept, then replayed in order. */
   let attachLine: ((line: string) => void) | undefined;
@@ -212,7 +269,7 @@ function serveConnection(ready: Promise<ElsCore | undefined>, socket: Socket): v
       return;
     }
     void ready
-      .then((core) => core ? dispatch(core, request) : { exitCode: 1, message: 'els: the server is stopping' } as ElsResult)
+      .then((core) => core ? dispatch(core, request, stateRoot, uid, pid, seatLookup, baseline) : { exitCode: 1, message: 'els: the server is stopping' } as ElsResult)
       .catch((error: unknown): ElsResult => ({ exitCode: 1, message: `els: ${error instanceof Error ? error.message : String(error)}` }))
       .then(answer);
   });
@@ -224,25 +281,27 @@ function serveConnection(ready: Promise<ElsCore | undefined>, socket: Socket): v
   socket.on('error', () => { /* the client went away; its request may still finish */ });
 }
 
-/** Pane PTYs owned by this process (src/pty-shell/registry.ts). */
-function registryPty(command: readonly string[], cwd: string, title: string, env: Readonly<Record<string, string>>): ElsPty {
-  const registry = require('../pty-shell/registry.js') as typeof import('../pty-shell/registry.js');
-  const handle = registry.startPty({ cmd: command[0]!, args: command.slice(1), kind: 'shell', nickname: title, workdir: cwd, purpose: 'els-pane', env: { ...env } });
-  return {
-    id: handle.id,
-    isAlive: () => handle.isAlive(),
-    write: (text) => handle.write(text),
-    renderScreen: (options) => handle.renderScreen(options),
-    resize: (cols, rows) => handle.resize(cols, rows),
-    onExit: (cb) => {
-      handle.onExit(() => {
-        cb();
-        // The registry entry goes once the exit is handled (the handle keeps its screen for the final render).
-        setTimeout(() => { try { registry.unregisterPty(handle.id); } catch { /* already gone */ } }, 0);
-      });
-    },
-    kill: () => handle.kill(),
-  };
+/** Pane PTYs live in outside holder processes (D1a): src/els/holder.ts holderPty is the default spawn; the
+ *  registry-owned registryPty of the old contract is gone — a server stop now releases the panes instead of killing them. */
+
+/** The real process table: one `ps` run (pid, the terminal's foreground group, the command line). */
+function psSnapshot(): Promise<string> {
+  return new Promise((resolve) => {
+    const { execFile } = require('node:child_process') as typeof import('node:child_process');
+    execFile('ps', ['-A', '-o', 'pid=,tpgid=,args='], { timeout: 2_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => resolve(error ? '' : stdout));
+  });
+}
+
+/** ELS-PANE-AGENT-DETECT: read every live pane's foreground (a failed `ps` changes nothing). */
+export async function probeForegrounds(core: ElsCore, ps: () => Promise<string> = psSnapshot): Promise<string[]> {
+  const panes = core.shellPids();
+  if (panes.length === 0) return core.setForegrounds(new Map());
+  const text = await ps();
+  if (!text) return [];
+  const table = parsePs(text);
+  const next = new Map<string, Foreground>();
+  for (const { pane, pid } of panes) { const fg = foregroundOf(pid, table); if (fg) next.set(pane, fg); }
+  return core.setForegrounds(next);
 }
 
 function listen(server: Server, socketPath: string): Promise<NodeJS.ErrnoException | undefined> {
@@ -257,12 +316,18 @@ function listen(server: Server, socketPath: string): Promise<NodeJS.ErrnoExcepti
 
 export interface ElsServerOptions {
   readonly stateRoot?: string;
+  /** Dependency seam for isolated tests, never supplied by wire requests. */
+  readonly seatLookup?: SeatLookup;
   readonly spawn?: (command: readonly string[], cwd: string, title: string, env: Readonly<Record<string, string>>) => ElsPty;
   /** Open the read-only HTTP window for federated els (stage 2). */
   readonly http?: ElsHttpBind;
   readonly hostName?: string;
   /** Where a finished child's one result line goes. Default: `<state>/els/child-results.jsonl` (one JSON line each). */
   readonly notifyParent?: (ws: string, line: string) => void;
+  /** ELS-PANE-AGENT-DETECT: the process table (`ps -A -o pid=,tpgid=,args=`); tests hand in text. */
+  readonly ps?: () => Promise<string>;
+  /** Watch busy panes for stalls (mail + receipt). Overrides of the poller's own defaults for tests; `false` disables. */
+  readonly stall?: StallAlertDeps | false;
 }
 
 /** Become the owner, then load the journal. Resolves to the running server, or to a refusal. */
@@ -277,7 +342,7 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
 
   let markReady: (core: ElsCore | undefined) => void = () => {};
   const ready = new Promise<ElsCore | undefined>((resolve) => { markReady = resolve; });
-  const server = createServer((socket) => serveConnection(ready, socket));
+  const server = createServer((socket) => serveConnection(ready, socket, stateRoot, options.seatLookup ?? resolvePeerSeat));
   // 1. Own the socket first; the journal is not touched until this process owns it.
   let failed = await listen(server, socketPath);
   if (failed?.code === 'EADDRINUSE') {
@@ -292,7 +357,9 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
 
   // 2. Owner now: load the journal (requests that arrived meanwhile wait for this).
   const core = createElsCore({ load: () => loadJournal(journalPath), save: (journal) => saveJournal(journalPath, journal),
-    spawn: (command, cwd, title, env) => (options.spawn ?? registryPty)(command, cwd, title, { ...env, ELANOUS_ELS_SOCKET: socketPath }) });
+    // D1a: pane PTYs live in outside holders — the default, no option flag. A restart adopts them back (reattachHolder).
+    spawn: (command, cwd, title, env) => (options.spawn ?? holderPty(stateRoot))(command, cwd, title, { ...env, ELANOUS_ELS_SOCKET: socketPath }),
+    reattach: (pane) => reattachHolder(stateRoot, pane.id) });
   const resultsPath = join(dirname(socketPath), 'child-results.jsonl');
   const notifyParent = options.notifyParent ?? ((ws: string, line: string) => {
     // Bounded: past 256 KiB the file becomes `.1` (one older generation), so unread results cannot grow without limit.
@@ -301,11 +368,18 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
   });
   childTabsOf.set(core, createChildTabs({ core, notifyParent }));
   let httpServer: Server | undefined;
+  // The busy-pane stall watcher: started once the core owns the journal, stopped in close().
+  let stallAlert: StallAlert | undefined;
   // Queued `do` lines go out once a pane's turn is no longer running.
   const drainTimer = setInterval(() => { void core.drain(); }, 1_000);
+  // ELS-PANE-AGENT-DETECT: once a second, one `ps` snapshot → what each live pane runs in its foreground now.
+  const foregroundTimer = setInterval(() => { void probeForegrounds(core, options.ps); }, 1_000);
+  foregroundTimer.unref();
   drainTimer.unref();
   const close = async (): Promise<void> => {
     clearInterval(drainTimer);
+    clearInterval(foregroundTimer);
+    stallAlert?.stop();
     core.stopAll();
     if (httpServer) await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -317,6 +391,9 @@ export async function startElsServer(options: ElsServerOptions = {}): Promise<{ 
     await close();
     return refused;
   }
+  // 2.5. Busy panes that produce no new output for STALL_MS alert the owner (mail + receipt);
+  // `stall: false` or ELANOUS_ELS_STALL_MS=0 disables the watcher outright.
+  if (options.stall !== false) stallAlert = startStallAlert(core, { stateRoot, ...(options.stall ?? {}) });
   // 3. The read window for federated hosts, when asked for: it answers from this owner's journal in memory.
   if (options.http) {
     try { httpServer = await startElsHttp(core, options.hostName ?? elsHostName(), options.http, doPolicy(stateRoot)); }

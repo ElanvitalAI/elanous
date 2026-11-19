@@ -16,7 +16,9 @@ test('a batch of Agent calls shows every child running at once and then the pare
   const root = mkdtempSync(join(tmpdir(), 'agent-parallel-'));
   try {
     writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
-    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line` } }));
+    // #38772: an Agent call without run_in_background runs in the background, and the parent would answer at once.
+    // This test proves the parent answers only after every child returns, so it asks for the blocking call explicitly.
+    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line`, run_in_background: false } }));
     const seen: Record<string, string> = {};
     const run = await mockSeatPtySequence({
       executable: process.execPath,
@@ -62,7 +64,9 @@ test('Agent rows show the label and a one-line result, and the child\'s tool out
     const childData = join(root, 'child-data.txt');
     const CHILD_TOOL_OUTPUT = 'CHILD-TOOL-OUTPUT-MARK';
     writeFileSync(childData, `${CHILD_TOOL_OUTPUT} the child read this file\n`);
-    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line` } }));
+    // #38772: an Agent call without run_in_background runs in the background. This test reads each child's
+    // completed one-line result on its row, so it asks for the blocking call explicitly.
+    const batch = CHILDREN.map((name) => ({ name: 'Agent', args: { description: `probe ${name}`, prompt: `Investigate ${name} and answer in one line`, run_in_background: false } }));
     const summaryOf = (name: string): string => `CHILD-SUMMARY-${name} found the answer`;
     const seen: Record<string, string> = {};
     const run = await mockSeatPtySequence({

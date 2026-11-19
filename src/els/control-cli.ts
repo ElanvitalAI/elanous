@@ -56,7 +56,10 @@ export function cliPrincipal(stateDir: string, uid: number, ownerUid: (dir: stri
 
 /** What the person is approving: who, as whom, where, and the exact line. */
 export function hitlQuestion(request: HitlRequest): string {
-  return `els ${request.action}: ${request.reason}\n  by ${request.principal.id} (shown as ${request.from})\n  to ${request.target.workspace}/${request.target.pane}\n  line ${JSON.stringify(request.text)}\napprove? [y/N] `;
+  // OP #97576: 승인 문안은 ask 콜백으로 외부 전송(telegram/pushcut)되므로 line 의 비밀을 가린다 —
+  // TUI 승인 문안과 같은 maskApprovalCommandSecrets 합집합(#38865)을 쓴다. 제어문자·경로·명령 원문은 그대로(가림 리터럴 시험으로 고정).
+  const { maskApprovalCommandSecrets } = require('../tui/seat-approval-policy.js') as typeof import('../tui/seat-approval-policy.js');
+  return `els ${request.action}: ${request.reason}\n  by ${request.principal.id} (shown as ${request.from})\n  to ${request.target.workspace}/${request.target.pane}\n  line ${JSON.stringify(maskApprovalCommandSecrets(request.text))}\napprove? [y/N] `;
 }
 
 /** One local `els do` through the control door. Remote addresses skip this door. */
@@ -79,6 +82,29 @@ export async function controlledDo(deps: ControlledDoDeps, pane: string, text: s
   });
   return outcomeToResult(await control.run({ principal, from: deps.from, action: 'do', target, text }));
 }
+
+/** `els input <pane> <text>` — OP 의 직접 자리 입력 (OP #17 OP-DIRECT-SEAT-INPUT): «⇢» 마커 없이 친 사람처럼 한 줄을
+ *  Pane 에 타자한다. control 문 경유 — OP·RES-INFRA 만 통과한다. */
+export async function controlledInput(deps: ControlledDoDeps, pane: string, text: string): Promise<ElsResult> {
+  if (parseAddress(pane)?.host) return { exitCode: 1, message: 'els input: remote input requires authenticated destination control' };
+  const principal = cliPrincipal(deps.stateDir, deps.uid, deps.ownerUid);
+  if ('refused' in principal) return { exitCode: 1, message: `els input: denied (${principal.refused})` };
+  const target = await deps.lookup(pane);
+  if (!target) return { exitCode: 1, message: `els input: unknown pane ${pane}` };
+  const control = createControl({
+    stateDir: deps.stateDir,
+    now: deps.now,
+    ...(deps.resolve ? { resolve: deps.resolve } : {}),
+    execute: async (input) => {
+      const done = await deps.send(input.target.pane, input.text ?? '', deps.from);
+      const queued = queuedCount(done.message);
+      return { exitCode: done.exitCode, message: done.message, ...(queued !== undefined ? { queued } : {}) };
+    },
+    ...(deps.ask ? { hitl: async (request) => deps.ask!(hitlQuestion(request)) } : {}),
+  });
+  return outcomeToResult(await control.run({ principal, from: deps.from, action: 'input', target, text }));
+}
+
 
 function outcomeToResult(outcome: ControlOutcome): ElsResult {
   if (!outcome.ok) return { exitCode: 1, message: outcome.message };

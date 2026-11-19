@@ -41,6 +41,18 @@ import type { AutoPublicAppRegistration } from "./public-app-auto-registration.j
 
 const CLIENT_ID_BYTES = 4;
 const APP_RESPONSE_LIMIT = Math.floor((MAX_MUX_FRAME_BYTES - 1024) * 0.7);
+/**
+ * WEBCHAT-SESSION-HANDOFF — a response envelope's headers. `Object.fromEntries` keeps only the
+ * LAST Set-Cookie, so a handler that sets several (the web-chat exchange sets one per path:
+ * /app/chat · /v1/prompt/stream · /v1/chat/events) lost all but one across the relay. They go
+ * as one comma-joined header, which the relay's public response path splits back apart.
+ */
+function envelopeHeaders(headers: Headers): Record<string, string> {
+  const out = Object.fromEntries(headers.entries());
+  const cookies = headers.getSetCookie();
+  if (cookies.length > 1) out["set-cookie"] = cookies.join(", ");
+  return out;
+}
 const MAX_PENDING_REQUESTS_PER_CLIENT = 32;
 const MAX_PENDING_REQUEST_BYTES_PER_CLIENT = 4 * 1024 * 1024;
 
@@ -49,6 +61,12 @@ export interface RelayHostResponse {
   readonly headers: Record<string, string>;
   /** Base64 body keeps binary app responses intact across the mux JSON envelope. */
   readonly body: string;
+  /**
+   * 출처: #39009 — bare 오리진 회원 채팅 API SSE 스트리밍. true 면 몸통을
+   * 통째로 base64 로 싣지 않는다: `body` 는 빈 헤더-only scaffold 이고
+   * 실제 바디는 뒤따르는 `{chunk:"<base64>"}` 데이터 프레임으로 흘러간다.
+   */
+  readonly stream?: boolean;
 }
 
 export interface RelayHostConnectorOptions {
@@ -60,6 +78,14 @@ export interface RelayHostConnectorOptions {
   ) => Response | undefined | Promise<Response | undefined>;
   /** Fresh, server-bound relay.connect credential for a member-gated relay. */
   readonly getMemberToken?: (
+    serverId: string,
+    signal?: AbortSignal,
+  ) => string | Promise<string>;
+  /**
+   * (출처: #39104) 회원 서버 역할 서비스 토큰(ems_) — «아무 회원의 핸들 핀
+   * 불리언 읽기» 자격. 회원(emt_) 토큰과 함께 프로토콜 목록에 실린다.
+   */
+  readonly getMemberServiceToken?: (
     serverId: string,
     signal?: AbortSignal,
   ) => string | Promise<string>;
@@ -90,6 +116,8 @@ export interface RelayHostConnection {
     >,
   ): Promise<void>;
   pinPublicHandle(user: string, memberId: string): Promise<void>;
+  /** OP #105017 ⓐ① — relay «핀 읽기» 질의. 응답은 «살아 있는 핀» 불리언만이고 거부·실패는 false(fail-closed ②). */
+  publicHandlePinQuery(user: string, memberId: string): Promise<boolean>;
   close(code?: number, reason?: string): void;
 }
 
@@ -447,6 +475,8 @@ function requestFromPending(
 
 async function responseEnvelope(
   response: Response | undefined,
+  // 출처: #39009 — SSE/스트리밍 응답이면 헤더-only scaffold envelope 을 만든다.
+  stream?: boolean,
 ): Promise<RelayHostResponse> {
   if (!response)
     return {
@@ -454,6 +484,18 @@ async function responseEnvelope(
       headers: { "content-type": "text/plain; charset=utf-8" },
       body: Buffer.from("Not Found").toString("base64"),
     };
+  if (stream) {
+    // 출처: #39009 — text/event-stream 같은 무한 바디를 여기서 미리 읽으면
+    // arrayBuffer() 가 EOF 을 영원히 기다려 교착한다. status/headers 만 실은
+    // 헤더-only `stream:true` envelope 을 띄우고 실제 바디는 sendResponse 의
+    // `{chunk:"<base64>"}` 프레임으로 뒤따르게 한다.
+    return {
+      status: response.status,
+      headers: envelopeHeaders(response.headers),
+      body: "",
+      stream: true,
+    };
+  }
   const body = new Uint8Array(await response.arrayBuffer());
   if (body.length > APP_RESPONSE_LIMIT) {
     return {
@@ -464,7 +506,7 @@ async function responseEnvelope(
   }
   return {
     status: response.status,
-    headers: Object.fromEntries(response.headers.entries()),
+    headers: envelopeHeaders(response.headers),
     body: Buffer.from(body).toString("base64"),
   };
 }
@@ -486,20 +528,46 @@ export async function connectRelayHost(
     throw new Error("relayUrl serverId does not match daemon public key");
   relayUrl.searchParams.set("serverId", serverId);
   const memberToken = await options.getMemberToken?.(serverId, options.signal);
+  // (출처: #39104) 회원 서버 역할 서비스 토큰(ems_) — 타 회원 홈 «핀 읽기» 자격.
+  const memberServiceToken = await options.getMemberServiceToken?.(
+    serverId,
+    options.signal,
+  );
   if (options.signal?.aborted)
     throw new Error("relay host connection aborted before socket");
   if (memberToken !== undefined && !/^emt_[A-Za-z0-9_-]+$/.test(memberToken)) {
     throw new Error("invalid relay member token");
   }
+  if (
+    memberServiceToken !== undefined &&
+    !/^ems_[A-Za-z0-9_-]+$/.test(memberServiceToken) // (출처: #39104)
+  ) {
+    throw new Error("invalid relay member service token");
+  }
+  // (출처: #106092) ⓑ — 순수 서비스 연결(ems_ 만)은 room.services 슬롯 전용:
+  // relay 가 서비스 연결의 host-public-key 를 회신 없이 무시하므로
+  // publicKeyAccepted 대기(5초)는 영원히 만료된다. #106129 ① — 이 대기가
+  // 질의 race(2초)보다 길어 «public-handle-pin-query» 가 조용히 미전송되던
+  // 미도달(RED 39112-32a041add8e 시험⑤ · 2004ms)을 수리한다.
+  const serviceOnly = memberServiceToken !== undefined && !memberToken;
   const socket = (
     options.webSocketFactory ??
     ((url, protocols) => new WebSocket(url, protocols))
-  )(relayUrl.toString(), memberToken ? [memberToken] : undefined);
+  )(
+    relayUrl.toString(),
+    // (출처: #39104) 두 자격을 모두 프로토콜 목록에 실는다(emt_ 회원 + ems_ 서비스).
+    memberToken
+      ? [memberToken, ...(memberServiceToken ? [memberServiceToken] : [])]
+      : memberServiceToken
+        ? [memberServiceToken]
+        : undefined,
+  );
   const clients = new Map<number, ClientChannel>();
   const clientQueues = new Map<number, Promise<void>>();
   let closed = false;
   let authenticated = false;
-  let publicKeyAccepted = false;
+  // (출처: #106092) ⓑ — 순수 서비스 연결은 host-public-key 승인을 기다리지 않는다.
+  let publicKeyAccepted = serviceOnly;
   const publicKeyWaiters = new Set<{
     resolve: () => void;
     reject: (error: Error) => void;
@@ -508,7 +576,7 @@ export async function connectRelayHost(
   const pendingAppControls = new Map<
     string,
     {
-      resolve: () => void;
+      resolve: (value?: unknown) => void;
       reject: (error: Error) => void;
       timer: ReturnType<typeof setTimeout>;
     }
@@ -526,12 +594,24 @@ export async function connectRelayHost(
     pendingAppControls.clear();
   };
   const sendAppControl = async (
-    type: "public-app-register" | "public-app-unregister" | "public-handle-pin",
+    type:
+      | "public-app-register"
+      | "public-app-unregister"
+      | "public-handle-pin"
+      | "public-handle-pin-query",
     registration: object,
-  ): Promise<void> => {
+  ): Promise<unknown> => {
     if (closed || !authenticated || socket.readyState !== WebSocket.OPEN)
       throw new Error("relay app registration is unavailable");
-    if (!publicKeyAccepted)
+    // (출처: #39121 · OP #106339 재측정) emt_+ems_ 혼합 연결은 serviceOnly 아님 —
+    // 핀 질의 프레임만 승인 대기 제외(옛 345e91c634f8 논리를 #39116 serviceOnly
+    // 스킵과 공존해 재적용). emt_+ems_ 를 모두 실은 연결(#39104 설계)은
+    // publicKeyAccepted=false 로 시작하고 relay 는 서비스 자격 연결의
+    // host-public-key 회신을 무시하므로, 이 대기(5초)가 질의 race(2초)보다
+    // 길어 프레임이 조용히 미전송되었다. 그 프레임만 즉시 발송 · 다른
+    // app-control 프레임은 기존 대기 유지. 발송 뒤 회답 지연·무회답은
+    // publicHandlePinQuery 의 2초 상한(OP #105876)이 덮는다.
+    if (!publicKeyAccepted && type !== "public-handle-pin-query")
       await new Promise<void>((resolve, reject) => {
         const pending = {
           resolve,
@@ -548,7 +628,7 @@ export async function connectRelayHost(
     if (closed || socket.readyState !== WebSocket.OPEN)
       throw new Error("relay app registration connection closed");
     const requestId = randomUUID();
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingAppControls.delete(requestId);
         reject(new Error("relay app registration timed out"));
@@ -601,8 +681,86 @@ export async function connectRelayHost(
     state: ClientChannel,
     streamId: number,
     response: Response | undefined,
+    // 출처: #39009 — 스트리밍 중 앱 요청 중단(소비자 연결 해제)을 감지한다.
+    signal?: AbortSignal,
   ) => {
     if (clients.get(clientId) !== state) return;
+    // 출처: #39009 — SSE(text/event-stream) 응답은 바디가 무한해 단일
+    // envelope 에 못 담는다. (a) 헤더-only `stream:true` envelope 데이터
+    // 프레임 → (b) `response.body.getReader()` 청크마다 `{chunk:"<base64>"}`
+    // 데이터 프레임 → (c) 기존 close 프레임 순으로 흘려보낸다. encode/seal/send
+    // 패턴은 아래 비스트리밍 경로를 그대로 복제했다.
+    const isEventStream = (
+      response?.headers.get("content-type") ?? ""
+    )
+      .toLowerCase()
+      .startsWith("text/event-stream");
+    if (response && isEventStream) {
+      const streamEnvelope = await responseEnvelope(response, true);
+      const envelopeFrame = state.encoder.encode({
+        streamId,
+        kind: "data",
+        data: new TextEncoder().encode(JSON.stringify(streamEnvelope)),
+      });
+      if (!envelopeFrame.ok)
+        throw new Error(
+          `relay response mux encode failed: ${envelopeFrame.reason}`,
+        );
+      const sealedEnvelope = state.channel.seal(envelopeFrame.value);
+      if (!sealedEnvelope.ok)
+        throw new Error(
+          `relay response encryption failed: ${sealedEnvelope.reason}`,
+        );
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(clientPrefixed(clientId, sealedEnvelope.value));
+      const reader = response.body?.getReader();
+      if (reader) {
+        for (;;) {
+          const part = await reader.read();
+          if (part.done) break;
+          if (clients.get(clientId) !== state || signal?.aborted) {
+            // 출처: #39009 — 소비자가 끊기면 앱 스트림도 취소해 교착을 막는다.
+            void reader.cancel().catch(() => {});
+            return;
+          }
+          const chunkFrame = state.encoder.encode({
+            streamId,
+            kind: "data",
+            data: new TextEncoder().encode(
+              JSON.stringify({
+                chunk: Buffer.from(part.value).toString("base64"),
+              }),
+            ),
+          });
+          if (!chunkFrame.ok)
+            throw new Error(
+              `relay response mux encode failed: ${chunkFrame.reason}`,
+            );
+          const sealedChunk = state.channel.seal(chunkFrame.value);
+          if (!sealedChunk.ok)
+            throw new Error(
+              `relay response encryption failed: ${sealedChunk.reason}`,
+            );
+          if (socket.readyState !== WebSocket.OPEN) return;
+          socket.send(clientPrefixed(clientId, sealedChunk.value));
+        }
+      }
+      const closeFrame = state.encoder.encode({
+        streamId,
+        kind: "close",
+        reason: "",
+      });
+      if (!closeFrame.ok)
+        throw new Error(`relay response mux close failed: ${closeFrame.reason}`);
+      const sealedCloseFrame = state.channel.seal(closeFrame.value);
+      if (!sealedCloseFrame.ok)
+        throw new Error(
+          `relay response close encryption failed: ${sealedCloseFrame.reason}`,
+        );
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(clientPrefixed(clientId, sealedCloseFrame.value));
+      return;
+    }
     const envelope = await responseEnvelope(response);
     const data = state.encoder.encode({
       streamId,
@@ -655,7 +813,13 @@ export async function connectRelayHost(
         response = new Response("Host request failed", { status: 502 });
       }
       if (!active.controller.signal.aborted)
-        await sendResponse(clientId, state, streamId, response);
+        await sendResponse(
+          clientId,
+          state,
+          streamId,
+          response,
+          active.controller.signal,
+        );
     })()
       .catch((error) => {
         if (!active.controller.signal.aborted) reportError(error);
@@ -852,6 +1016,7 @@ export async function connectRelayHost(
       clientId?: unknown;
       capabilities?: unknown;
       requestId?: unknown;
+      result?: unknown;
     };
     try {
       control = JSON.parse(raw) as typeof control;
@@ -882,6 +1047,7 @@ export async function connectRelayHost(
       authenticated = true;
       clearTimeout(readyTimer);
       if (
+        !serviceOnly && // (출처: #106092) ⓑ — 서비스 연결은 room.host 슬롯이 없다: 미전송.
         Array.isArray(control.capabilities) &&
         control.capabilities.includes("public-http-v1")
       ) {
@@ -913,7 +1079,8 @@ export async function connectRelayHost(
       if (pending) {
         pendingAppControls.delete(control.requestId);
         clearTimeout(pending.timer);
-        if (control.type === "public-app-accepted") pending.resolve();
+        if (control.type === "public-app-accepted")
+          pending.resolve(control.result);
         else pending.reject(new Error("relay app registration rejected"));
       }
     }
@@ -1000,13 +1167,27 @@ export async function connectRelayHost(
       return socket.readyState;
     },
     registerPublicApp(input) {
-      return sendAppControl("public-app-register", { ...input, serverId });
+      return sendAppControl("public-app-register", { ...input, serverId }).then(() => undefined);
     },
     unregisterPublicApp(input) {
-      return sendAppControl("public-app-unregister", input);
+      return sendAppControl("public-app-unregister", input).then(() => undefined);
     },
     pinPublicHandle(user: string, memberId: string) {
-      return sendAppControl("public-handle-pin", { user, memberId });
+      return sendAppControl("public-handle-pin", { user, memberId }).then(() => undefined);
+    },
+    publicHandlePinQuery(user: string, memberId: string) {
+      // (출처: #39104 FU #105876) 회답 2초 상한 — relay 무응답 false, 늦은 회답은 무시.
+      const reply = sendAppControl("public-handle-pin-query", { user, memberId }).then(
+        (result) => result === true, // OP #105017 ① — 불리언만
+        () => false, // OP #105017 ② — 거부·실패는 false(fail-closed)
+      );
+      return new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 2_000); // OP #105876 — 상한 2s
+        reply.then((pinned) => {
+          clearTimeout(timer); // 회답 도착 — 타이머 참조 버림(멈춘 프라미스 누적 0)
+          resolve(pinned); // 타임아웃 뒤 늦은 회답은 이미 resolve 된 outer 로 no-op 무시
+        });
+      });
     },
     close(code = 1000, reason = "host connector stopped") {
       if (closed) return;

@@ -25,7 +25,7 @@ test('key router: plain text is input; ctrl+b then a herdr key is an action; ctr
 });
 
 test('pane rows come from an els list; anything else is no rows; exited reads as done', () => {
-  expect(parsePaneRows(listOf(row('w1', 'p1', 'shell', 'working'))).map((r) => [r.pane, r.wsId, r.workspace, r.title, r.state])).toEqual([['p1', 'w1', 'name-w1', 'shell', 'working']]);
+  expect(parsePaneRows(listOf(row('w1', 'p1', 'shell', 'working'))).map((r) => [r.pane, r.wsId, r.workspace, r.title, r.state])).toEqual([['p1', 'w1', 'name-w1', 'shell [build unknown]', 'working']]);
   for (const body of ['null', '7', '"x"', '[]', '{"panes":3}', 'not json']) expect(parsePaneRows(body)).toEqual([]);
   expect([wordOfState('working'), wordOfState('blocked'), wordOfState('idle'), wordOfState('exited'), wordOfState('')]).toEqual(['working', 'blocked', 'idle', 'done', 'done']);
 });
@@ -34,7 +34,7 @@ test('sidebar: workspace line with its rolled-up mark and «⎇n ●n», pane li
   const rows = parsePaneRows(listOf(row('w1', 'p1', 'build', 'working'), row('w1', 'p2', 'old', 'exited'), row('w2', 'p3', 'repl', 'idle')));
   const lines = buildSidebar(rows, 'p1', 28, 6);
   expect(lines).toHaveLength(6);
-  expect(lines.map(plain)).toEqual([' ▾ ● name-w1 ⎇2 ●1          ', '    ● build                 ', '    ✓ old                   ', ' ▾ ○ name-w2                ', '    ○ repl                  ', ' '.repeat(28)]);
+  expect(lines.map(plain)).toEqual([' ▾ ● name-w1 ⎇2 ●1          ', '    ● build [build unknown] ', '    ✓ old [build unknown]   ', ' ▾ ○ name-w2                ', '    ○ repl [build unknown]  ', ' '.repeat(28)]);
   expect(lines[1]).toContain('\u001b[7m');                     // the selected row is reverse video
   expect(lines[1]).toContain('\u001b[32m●');                   // working = green mark
   expect(lines[2]).toContain('\u001b[2m');                     // exited = dim
@@ -104,12 +104,20 @@ test('app: an empty server gets one new shell (defaults: $SHELL, this folder, fo
   expect(h.attachments[0]!.size).toEqual({ cols: 51, rows: 22 });      // 80 - 28 sidebar - 1 separator; 24 - 1 status line - 1 tab row
 });
 
-test('app: starts on the first pane that is still running; exited leftovers are closed, the list re-read', async () => {
+test('app: starts on the first pane that is still running; exited panes stay in the list (dimmed), never closed on their own (ELS-FIRST-RUN-LIVE-PANE)', async () => {
   const h = harness(listOf(row('w1', 'old1', 'dead', 'exited'), row('w1', 'live', 'work', 'idle'), row('w2', 'old2', 'dead2', 'exited')));
   await h.app.start();
-  expect(h.requests.filter((r) => r.op === 'close')).toEqual([{ op: 'close', pane: 'old1' }, { op: 'close', pane: 'old2' }]);
+  expect(h.requests.filter((r) => r.op === 'close')).toEqual([]);
   expect(h.attachments.map((a) => a.pane)).toEqual(['live']);
-  expect(h.lastScreen()).not.toContain('dead');
+  expect(h.lastScreen()).toContain('dead');                         // the exited tab is still there, dimmed
+});
+
+test('app: every pane exited (els reopened after the last shell ended) → a fresh $SHELL pane in this folder\'s space is opened and attached, not the exited one (ELS-FIRST-RUN-LIVE-PANE)', async () => {
+  const h = harness(listOf(row('proj', 'gone', 'zsh', 'exited')), undefined, { lastPane: 'gone' });
+  await h.app.start();
+  expect(h.requests.filter((r) => r.op === 'new')).toEqual([{ op: 'new', ws: 'proj', cwd: '/work/proj', command: ['/bin/zsh'] }]);
+  expect(h.attachments.map((a) => a.pane)).toEqual(['pnew1']);
+  expect(h.requests.filter((r) => r.op === 'close')).toEqual([]);
 });
 
 test('app: keys — input goes to the pane; ctrl+b j/k and 1-9 move between the tabs of the space, w to the next space (old attach released); b hides the list', async () => {
@@ -129,7 +137,7 @@ test('app: keys — input goes to the pane; ctrl+b j/k and 1-9 move between the 
   h.app.key('\u0002w');
   h.app.key('\u00022');                                           // the second tab of w1
   expect(h.attachments.at(-1)!.pane).toBe('p2');
-  expect(h.lastScreen().split('\r\n')[0]).toContain(' 🛠 one ○ │▸🛠 two ○ │');
+  expect(h.lastScreen().split('\r\n')[0]).toContain('│🛠 one  🛠 two  +');   // FU3: «emoji name» tabs, focus = reverse video
   h.app.key('\u0002b');
   expect(h.attachments.at(-1)!.resizes.at(-1)).toEqual([80, 22]);
   expect(h.lastScreen()).not.toContain('+ new · ≡ menu');
@@ -187,19 +195,23 @@ test('app: ctrl+b q detaches with code 0 and releases the attach without closing
   expect(h.requests.some((r) => r.op === 'close' || r.op === 'close-workspace')).toBe(false);
 });
 
-test('app: the selected pane exits → «pane 종료됨», its last screen stays and the pane stays in the list until the selection leaves; the server going away ends the app with code 1', async () => {
+test('app: the selected pane exits with another pane left → the focus moves to it (ELS-LAST-TAB-EXIT); the server going away ends the app with code 1', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle')));
   await h.app.start();
   h.setListing(listOf(row('w1', 'p1', 'one', 'exited'), row('w1', 'p2', 'two', 'idle')));
-  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 23, screen: '[screen 51x23 cursor=(row 0, col 0, visible false)]\nLAST WORDS' });
   h.attachments[0]!.handlers.onEnd(0, 'pane exited');
+  expect(h.attachments.at(-1)!.pane).toBe('p2');
   expect(h.lastScreen()).toContain('pane 종료됨');
-  expect(h.lastScreen()).toContain('LAST WORDS');
-  h.attachments[0]!.handlers.onEnd(1, 'els: the els server closed the connection');
-  // (the first attach already ended; a live one losing the server finishes the app)
-  h.app.key('\u0002w');
   h.attachments.at(-1)!.handlers.onEnd(1, 'els: the els server closed the connection');
   expect(await h.app.done).toEqual({ code: 1, message: 'els: the els server closed the connection' });
+});
+
+test('app: the last pane exits → the els view closes with code 0 (back to the terminal), like herdr; nothing is closed on the server (ELS-LAST-TAB-EXIT)', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'only', 'idle')));
+  await h.app.start();
+  h.attachments[0]!.handlers.onEnd(0, 'pane exited');
+  expect(await h.app.done).toEqual({ code: 0, message: '' });
+  expect(h.requests.filter((r) => r.op === 'close' || r.op === 'close-workspace')).toEqual([]);
 });
 
 test('toggle: ctrl+b s hides and shows the list (the pane is resized each time) and the choice is remembered', async () => {
@@ -294,9 +306,9 @@ test('remote rows: only panes of other hosts that answered, grouped «⇄host la
     fedRow('node-b', 'wa', 'tb', 'pc', 'review', 'blocked'),
     fedRow('down1', 'wz', 'tz', 'pz', 'gone', 'idle', 'down')));
   expect(rows.map((r) => `${r.pane} | ${r.wsId} | ${r.workspace} | ${r.title} | ${r.state} | ${r.remote}`)).toEqual([
-    'herdr:w1/t2/p2 | herdr:w1 | ⇄herdr OP | mshq 주 OP | idle | herdr',
-    'herdr:w1/t2/p3 | herdr:w1 | ⇄herdr OP | zsh | working | herdr',
-    'node-b:wa/tb/pc | node-b:wa | ⇄node-b wa | review | blocked | node-b',
+    'herdr:w1/t2/p2 | herdr:w1 | ⇄herdr OP | mshq 주 OP [build unknown] | idle | herdr',
+    'herdr:w1/t2/p3 | herdr:w1 | ⇄herdr OP | zsh [build unknown] | working | herdr',
+    'node-b:wa/tb/pc | node-b:wa | ⇄node-b wa | review [build unknown] | blocked | node-b',
   ]);
   for (const body of ['null', '7', '[]', '{"panes":3}', 'nope']) expect(parseRemoteRows(body)).toEqual([]);
 });
@@ -319,12 +331,12 @@ test('app: herdr panes join the left list under «⇄herdr …»; selecting one 
   const screens: string[] = [];
   await app.start();
   await Bun.sleep(20);
-  expect(screens.at(-1)!).toContain(' ○ ⇄herdr OP · 1');           // a space on the left; its pane is a tab once selected
+  expect(screens.at(-1)!).toContain(' ⊞ herdr · 1');               // FU3: herdr's spaces fold under one head on the left
   app.key('\u0002w');                                             // next space: the herdr one
   await Bun.sleep(20);
   expect(reads).toEqual(['herdr:w1/t2/p2']);
   expect(screens.at(-1)!).toContain('HERDR SCREEN of herdr:w1/t2/p2');
-  expect(screens.at(-1)!).toContain('▸🌐 mshq 주 OP ○ │');           // the remote pane's tab
+  expect(screens.at(-1)!).toContain('│🌐 mshq 주 OP  +');                             // the remote pane's tab (FU3 form)
   expect(screens.at(-1)!).toContain('읽기 전용');
   app.key('rm -rf x\r');
   await Bun.sleep(5);
@@ -440,4 +452,78 @@ test('unreachable host stays visible in a narrow terminal', async () => {
   }, 40);
   await app.start(); await Bun.sleep(20);
   expect(screens.at(-1)!).toContain('⇄node-b ?');
+});
+
+// ---- ELS-REMOTE-MARKER: a host reported down keeps its last known panes, marked «?» (they no longer vanish) ------------
+test('app: a host reported down keeps its space and tab marked «?»; they come back live when it answers again', async () => {
+  let reach: 'up' | 'down' = 'up';
+  const answer = (): ElsResult => ({ exitCode: 0, message: JSON.stringify({ hosts: [{ name: 'node-b', reach }], workspaces: [], tabs: [],
+    panes: reach === 'up' ? [fedRow('node-b', 'wa', 'tb', 'pc', 'review', 'blocked')] : [] }) });
+  const { app, screens, tick } = remoteApp({ list: async () => answer(), read: async () => ({ exitCode: 1, message: 'unreachable' }) });
+  await app.start(); await Bun.sleep(20);
+  expect(screens.at(-1)!).toContain(' ◐ ⇄node-b wa · 1');
+  app.key('\u0002w'); await Bun.sleep(20);                         // the node-b space: its pane is the tab
+  expect(screens.at(-1)!).toContain('│🌐 review  +');
+  reach = 'down'; tick(); await Bun.sleep(30);
+  expect(screens.at(-1)!).toContain('? ⇄node-b wa · 1');             // the space stays, marked unreachable
+  expect(screens.at(-1)!).toContain('│🌐 review ?  +');                            // and so does its last known tab
+  expect(screens.at(-1)!).toContain('⇄node-b ?');                    // the status line says so too (#38616)
+  reach = 'up'; tick(); await Bun.sleep(30);
+  expect(screens.at(-1)!).toContain('│🌐 review  +');
+  expect(screens.at(-1)!).not.toContain('🌐 review ?');
+});
+
+// ---- ELS-VOICE-CONTROL-POPUP (OP #101856 · #101876): ctrl+b : → say it → preview → Enter (closes need y) → the same els requests
+test('app: ctrl+b : — «two 탭 삭제해줘» shows ⚠ and Enter alone closes nothing; y closes it once; «새 셸 열어줘» → Enter → Enter opens one shell', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002:');
+  h.app.key('two 탭 삭제해줘\r'); await Bun.sleep(10);
+  expect(h.lastScreen()).toContain('⚠ → 탭 two 닫기 · y 로 확인 · 다른 키 취소');
+  h.app.key('\r'); await Bun.sleep(10);
+  expect(h.requests.filter((r) => r.op === 'close')).toEqual([]);
+  expect(h.lastScreen()).toContain('취소 (y 가 아님)');
+  h.app.key('\u0002:'); h.app.key('two 탭 삭제해줘\r'); await Bun.sleep(10);
+  h.app.key('y'); await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'close')).toEqual([{ op: 'close', pane: 'p2' }]);
+  expect(h.lastScreen()).toContain('완료: 탭 two 닫기');
+  const before = h.requests.filter((r) => r.op === 'new').length;
+  h.app.key('\u0002:'); h.app.key('새 셸 열어줘\r'); await Bun.sleep(10);
+  expect(h.lastScreen()).toContain('→ 새 셸 열기 · Enter 실행 · Esc 취소');
+  h.app.key('\r'); await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').length - before).toBe(1);
+  expect(h.attachments.at(-1)!.typed).toEqual([]);                 // none of the words went into the pane
+});
+
+// ---- ELS-EXIT-BG-BUTTONS (OP #102571): ⏏ 백그라운드 / ✕ 종료 at the right end of the bottom line (80x24: row 24) ----------
+const click = (x: number, y = 24): string => `\u001b[<0;${x};${y}M`;
+test('app: the bottom line shows « ⏏ 백그라운드  ✕ 종료 »; clicking ⏏ leaves els running (code 0, nothing closed) — like ctrl+b q', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'working')));
+  await h.app.start();
+  expect(h.lastScreen().split('\r\n').at(-1)).toContain(' ⏏ 백그라운드  ✕ 종료 ');
+  h.app.key(click(65));
+  expect(await h.app.done).toEqual({ code: 0, message: '' });
+  expect(h.requests.filter((r) => r.op === 'close' || r.op === 'close-workspace')).toEqual([]);
+});
+
+test('app: clicking ✕ on a space where nothing runs closes that space and leaves the view', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w2', 'p2', 'two', 'working')));
+  await h.app.start();
+  h.app.key(click(76));
+  expect(await h.app.done).toEqual({ code: 0, message: '' });
+  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1' }]);   // only this space
+});
+
+test('app: ✕ with something running asks «⚠ N개 실행 중 — 종료?»; any key but y closes nothing; ctrl+b Q then y closes and leaves', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'working'), row('w1', 'p2', 'two', 'idle')));
+  await h.app.start();
+  h.app.key(click(76));
+  expect(h.lastScreen()).toContain('⚠ 1개 실행 중 — 종료? · y 확인 · 다른 키 취소');
+  h.app.key('n');
+  await Bun.sleep(10);
+  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([]);
+  h.app.key('\u0002Q');
+  h.app.key('y');
+  expect(await h.app.done).toEqual({ code: 0, message: '' });
+  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1' }]);
 });

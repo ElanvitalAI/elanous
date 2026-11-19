@@ -116,6 +116,11 @@ export interface ToolRuntimeContext {
   requestOrigin?: RequestOrigin;
   /** Confirm through the originating chat's channels, not another user's global channel. */
   confirmChannels?: import('../hitl/confirm.js').ConfirmChannel[];
+  /** WEBCHAT-APP-BUILD-PLUGIN-BRIDGE — server-installed plugin route dispatcher for the app_build family.
+   *  The daemon chat turn binds its dispatchDaemonPluginRoute here, so the shared bridge delegates execution
+   *  to the one route adapter (member/confirmation/graph gates) instead of building a second executor.
+   *  Server-bound only; never accepted from tool arguments. */
+  appBuildRouteDispatch?: (name: 'app_build' | 'app_build_plan', args: Record<string, unknown>) => Promise<unknown>;
 }
 
 /** Output shape the LLM layer expects back. Most tools produce

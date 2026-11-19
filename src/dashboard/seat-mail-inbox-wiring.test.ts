@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSeatMailInboxWiring } from './seat-mail-inbox-wiring.js';
@@ -25,3 +25,22 @@ describe('createSeatMailInboxWiring', () => {
     expect(() => { wiring.noteTurnEnded(); wiring.stop(); }).not.toThrow();
   });
 });
+
+  test('sprint O5 ③ · OP #93799 — deps.getSessionId 주입 시 createSeatMailInbox에 heartbeat 주입: 박동 파일에 실측 세션 id 기록', () => {
+    const root = mkdtempSync(join(tmpdir(), 'seat-wiring-hb-'));
+    const stateRoot = join(root, 'seat-state');
+    const wiring = createSeatMailInboxWiring({
+      getCwd: () => join(root, 'seats', 'TC-WIRING-HB'),
+      seatStateRoot: stateRoot,
+      getSessionId: () => 'sess-w1',
+      startTurnIfIdle: () => ({ opened: true as const, turnId: 'wiring-test-turn' }),
+    });
+    wiring.noteTurnEnded();
+    const alive = join(stateRoot, 'TC-WIRING-HB', 'inbox.alive');
+    expect(existsSync(alive)).toBe(true);
+    const beat = JSON.parse(readFileSync(alive, 'utf8')) as { sessionId: string; host: string };
+    expect(beat.sessionId).toBe('sess-w1');
+    expect(typeof beat.host).toBe('string');
+    wiring.stop();
+    rmSync(root, { recursive: true, force: true });
+  });

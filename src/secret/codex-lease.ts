@@ -324,7 +324,7 @@ function renewPoint(row: Pick<LeaseRecord, 'issuedAt' | 'renewedAt' | 'expiresAt
 
 /** Issue (or with `renew`, re-issue when due) one Codex lease to one target. */
 export async function issueCodexLease(
-  input: { readonly to: string; readonly account?: string; readonly renew?: boolean; readonly ttlMs?: number },
+  input: { readonly to: string; readonly account?: string; readonly renew?: boolean; readonly ttlMs?: number; readonly podCard?: string },
   deps: CodexLeaseDeps,
 ): Promise<CodexLeaseResult> {
   const account = input.account ?? 'default';
@@ -377,7 +377,8 @@ export async function issueCodexLease(
       if (row.revokedAt === undefined && leaseTargetKey(row.target) === targetKey) return { ...row, revokedAt: now };
       return row;
     });
-    if (!renewing) next.push({ leaseId, kind: 'oauth', provider: 'codex', account, target, owner, issuedAt, expiresAt });
+    // #38815 ② — Pod 카드 id 를 원장 행에 남긴다(어느 Pod 발사에 주입됐는지 · 값/토큰 칸은 아니다).
+    if (!renewing) next.push({ leaseId, kind: 'oauth', provider: 'codex', account, target, owner, issuedAt, expiresAt, ...(input.podCard !== undefined ? { podCard: input.podCard } : {}) });
     return { rows: next, result: undefined };
   });
 

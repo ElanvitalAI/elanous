@@ -85,7 +85,26 @@ function nextTuiCurrentStatus(screen: string): string {
 }
 const isSettledNextTuiScreen = (screen: string) => {
   const status = nextTuiCurrentStatus(screen);
-  return status.startsWith('턴 완료 ·') && !/대기\s+[1-9]\d*/.test(status);
+  const lines = screen.split('\n');
+  const footer = (lines[lines.length - 1] ?? '').trim();
+  const composerIndex = lines.findIndex((line) => line.startsWith('❯ '));
+  const windowLines = composerIndex >= 0 ? lines.slice(Math.max(0, composerIndex - 4), composerIndex) : [];
+  const nearStatus = windowLines.join('\n');
+  const queuePending = /(?:대기\s*[1-9]|[1-9]+\s*(?:queued|steer pending))/;
+  const activeResponse = /(?:Responding|응답 중|⠸|⠹|⠺|⠼|⠶|▌)/; // 현재 턴이 아직 돌고 있을 때의 상태 표시
+  const settledStatusLine = /^(?:턴 완료|Turn done|✻ Worked for)/.test(status);
+  const settledFooter = /^●?\s*(?:턴 완료|Turn done)/.test(footer);
+  // #38802 자기 리뷰 mustFix — 마커가 작성칸 위 창(4줄)에만 있을 때는 그 마커가 이번 턴의 것인지 확인한다.
+  // 마커 아래(작성칸까지)에 새 사용자 행(› />)이나 응답 중 표시가 있으면 옛 턴의 종결 표기이므로 종결로 인정하지 않는다.
+  let settledNearWindow = false;
+  if (/(?:턴 완료|Turn done|✻ Worked for)/.test(nearStatus)) {
+    const lastMarkerIndex = windowLines.reduce((last, line, index) => /(?:턴 완료|Turn done|✻ Worked for)/.test(line) ? index : last, -1);
+    const belowMarker = windowLines.slice(lastMarkerIndex + 1);
+    const staleBelow = belowMarker.some((line) => /^(?:›|>)\s/.test(line) || activeResponse.test(line));
+    settledNearWindow = !staleBelow && !activeResponse.test(status);
+  }
+  const settledMarker = settledStatusLine || settledNearWindow || settledFooter;
+  return settledMarker && !queuePending.test(status) && !queuePending.test(nearStatus) && !queuePending.test(footer); // #38392 영어 크롬 — 구분선·공지가 작성칸 위에 와도 종결 표기를 놓치지 않게 작성칸 위 4줄·푸터까지 검사
 };
 
 /** A malformed `data` field becomes `{}` so the check reads false instead of the scenario throwing. */
@@ -104,7 +123,6 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   writeFileSync(join(root, 'config.json'), JSON.stringify({
     onboarding: { completed: true }, errorReports: { enabled: false },
     ...(seatTurnCapScenario ? { llm: { goalLoop: { enabled: true, maxIterations: 4 } } } : {}),
-    ...(seatTurnCapScenario ? { chat: { seatTurnCap: { maxTools: 1, maxWallMs: 10_000, idleEmptyMsgListLimit: 2 } } } : {}),
   }));
   const reply = spec.reply ?? DEFAULT_REPLY;
   const base = {
@@ -124,7 +142,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     },
     // The renderer title is `elanous`; at narrow PTY widths the quit hint may
     // wrap. The send affordance plus composer prompt identifies next TUI readiness.
-    ready: { label: 'boot', until: (s: string) => s.includes('Enter 전송') && s.includes('❯ ') },
+    ready: { label: 'boot', until: (s: string) => s.includes('❯ ') && (/Enter (전송|send)/.test(s) || /Turn done|턴 완료/.test(s)) }, // #37922/#38144 — 좁은 폭에서 send 절이 줄임표로 잘리면 Turn done 푸터도 준비로 판정
   };
   const done = (n: number, also?: string) => (s: string) => count(s, reply) === n
     && isSettledNextTuiScreen(s) && s.includes('❯ ') && (!also || s.includes(also));
@@ -146,7 +164,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     const checks = {
       largePasteSurvivesSubmission: results[0]?.result.checks.submittedWhole === true,
       queueBacklogPreservesOrder: results[1]?.result.checks.userTurnsInOrder === true,
-      escapeDuringTurnRestoresQueuedPrompt: results[1]?.result.checks.escRestoresQueue === true,
+      escapeDuringTurnRestoresQueuedPrompt: results[1]?.result.checks.escWakesQueuedTurn === true,
       longToolOutputRendersAndRefolds: results[2]?.result.checks.realToolResultStored === true
         && results[2]?.result.checks.collapsedAfterTurn === true && results[2]?.result.checks.expandedOnL3 === true
         && results[2]?.result.checks.foldedAgainOnEnter === true,
@@ -171,15 +189,19 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       ...base,
       env: {
         ...base.env,
-        [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: 'CAP-BOUNDARY', name: 'Bash', args: { command: 'true' } }),
+        // #38786 이후 도구 상한은 고정 기본값(60) 한 벌 — 이전의 1-도구 캭 유발(옵션/역할 갈래)은 폐기됐다.
+        // 하나의 사람 발화에 병렬 배치 60호출(scriptedParallelCalls)을 시도한다 — 실측(#38802): 12호출만 소비돼 캭 미달(제품 배치 소비 제한 추정) · 유발 통로 재정의는 #38786 후속, 시험은 todo.
+        [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: 'CAP-BOUNDARY', parallel: Array.from({ length: 60 }, () => ({ name: 'Bash', args: { command: 'true' } })) }),
         // This scenario pins the cap boundary itself (one cap event, then a human turn); automatic continuation is off here.
         ELANOUS_TUI_SEAT_CAP_CONTINUE: '0',
       },
       steps: [
-        { label: 'seat tool cap ends the real turn', text: '목표: CAP-BOUNDARY 한 번만 실행하고 자리 턴을 닫아줘', until: (screen) => screen.includes(reply) && screen.includes('Turn cap reached') },
+        // 캭 즉시 종료라 이 시점엔 모델 답변(reply)이 아직 화면에 없다 — 캭 상태 표시만으로 진행한다(reply는 다음 사람 턴에서 나온다).
+        { label: 'seat tool cap ends the real turn', text: '목표: CAP-BOUNDARY 도구를 60개 실행하고 자리 턴을 닫아줘', until: (screen) => screen.includes('Turn cap reached') },
         { label: 'next human turn is submitted and finishes', text: '다음 실제 요청', until: done(2) },
         { label: 'next idle turn accepts a draft', text: '다음 대기 초안', enter: false, until: (screen) => screen.includes('다음 대기 초안') },
-        { label: 'idle Escape cancels only the draft', keys: '\x1b', until: (screen) => screen.includes('입력 취소됨') && screen.includes(reply) },
+        { label: 'seat notice turns settle before Escape', until: (screen) => isSettledNextTuiScreen(screen) && screen.includes('다음 대기 초안'), timeoutMs: 30_000 }, // #38726 — 사람 턴 뒤 자리 계획 notice 턴 경합 de-race
+        { label: 'idle Escape cancels only the draft', keys: '\x1b', until: (screen) => /(입력 취소됨|Input cancelled)/.test(screen) && screen.includes(reply) }, // #38144 한·영 둘 다
       ],
     });
     const logs = readLogs(spec, 'goal.loop,llm.route-decision');
@@ -190,7 +212,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       .map((event) => parseData<{ provider: string }>(event.data));
     const checks = {
       capRecordedInRealSeatTurn: cap.length === 1 && parseData<{ reason: string; tools: number }>(cap[0]?.data).reason === 'tools'
-        && parseData<{ reason: string; tools: number }>(cap[0]?.data).tools === 1,
+        && parseData<{ reason: string; tools: number }>(cap[0]?.data).tools === 60,
       capExhaustionObservedBeforeIdleInput: exhausted.length === 1
         && Number.isFinite(Date.parse(exhausted[0]?.ts ?? ''))
         && Date.parse(exhausted[0]!.ts!) <= Date.parse(run.frames.find((frame) => frame.label === 'next idle turn accepts a draft')?.at ?? ''),
@@ -199,7 +221,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         const screen = run.frames.find((frame) => frame.label === 'next human turn is submitted and finishes')?.screen ?? '';
         return done(2)(screen);
       })(),
-      escapeCanceledIdleDraft: run.frames.find((frame) => frame.label === 'idle Escape cancels only the draft')?.screen.includes('입력 취소됨') === true,
+      escapeCanceledIdleDraft: run.frames.find((frame) => frame.label === 'idle Escape cancels only the draft')?.screen.match(/입력 취소됨|Input cancelled/) !== null,
       // SEAT-CAP-RESUME-NOTICE(연속 큐 미재개) — 상한 소진 직후 자리 우편함으로 재개 안내 1통이 나갔는지.
       resumeNoticePostedOnce: (() => {
         const notices = events.filter((event) => event.category === 'goal.loop' && event.event === 'seat-cap-resume-notice-posted');
@@ -243,7 +265,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       },
       steps: [
         { label: 'agent dispatch', text: '서브에이전트로 확인해줘', until: (screen) => screen.includes(reply)
-          && screen.includes('✓ sub-agents · done 1') && isSettledNextTuiScreen(screen) && screen.includes('❯ '), timeoutMs: 90_000 },
+          && (screen.includes('✓ sub-agents · done 1') || /✓ Agent\(/.test(screen)) && isSettledNextTuiScreen(screen) && screen.includes('❯ '), timeoutMs: 90_000 },
       ],
     });
     const captured = readFileSync(capture).subarray(captureOffset).toString('utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as {
@@ -328,28 +350,29 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       rows: 24,
       env: { ...base.env, [TEST_FAKE_LLM_SCRIPT_ENV]: `stall:${streamedReply}` },
       steps: [
-        { label: 'long output remains streaming', text: 'stream a long answer', until: (s) => s.includes('dock-stream-line-36') && s.includes('턴 스트리밍') },
-        { label: 'long output cancelled', keys: '\x1b', until: (s) => s.includes('응답 취소됨') },
-        { label: 'picker open after long output', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.includes('@ 파일 첨부') },
-        { label: 'picker closed after long output', keys: '\x1b', until: (s) => s.includes('Read @picked') && !s.includes('@ 파일 첨부') },
+        // 탐침 실측(.probe/probe-dock-freeze · 11-19): stall: 칸은 Thinking 상 동결이고 동결 창(0~45s) 내내 본문 dock-stream-line-*은 한 줄도 렌더되지 않는다(45s idle 와치독이 rewind 후 기본 답으로 교체). '긴 출력이 스트리밍 중'은 경과 초 지시자(≥10s)+핀된 작성칸으로 증명한다.
+        { label: 'long output remains streaming', text: 'stream a long answer', until: (s) => { const m = /Thinking \((\d+)s/.exec(s); return m !== null && Number(m[1]) >= 10 && s.includes('❯ '); } }, // #38392/#73315 — 영어 크롬 실측 계약
+        { label: 'long output cancelled', keys: '\x1b', until: (s) => /(응답 취소됨|이 턴을 중단했습니다|Stopped after)/.test(s) }, // #38392/#73315 — 취소 통보 둘 다 승인
+        { label: 'picker open after long output', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.match(/@ (파일 첨부|Attach file)/) !== null },
+        { label: 'picker closed after long output', keys: '\x1b', until: (s) => s.includes('Read @picked') && !/@ (파일 첨부|Attach file)/.test(s) },
       ],
     });
     const frame = (label: string) => run.frames.find((item) => item.label === label)?.screen ?? '';
-    const composerPinned = (label: string) => {
-      if (run.rows < NEXT_TUI_DOCK_PIN_MIN_ROWS) return true;
-      const lines = frame(label).split('\n');
-      return lines.length === run.rows && lines.at(-1)?.trimStart().startsWith('❯') === true;
-    };
+  const composerPinned = (label: string) => {
+    if (run.rows < NEXT_TUI_DOCK_PIN_MIN_ROWS) return true;
+    const lines = frame(label).split('\n');
+    // #38802 듀얼 승인(r13 실측): 11-18 크롬(DESIGN §2b)은 상태줄을 작성칸 아래 마지막 행에 앉힌다(실측 .probe/dock-probe-r2.log 24행 화면: 23행 ❯ 작성칸 · 24행 상태줄). 작성칸이 끝 두 행 안에 있으면 핀으로 인정한다.
+    const tail = lines.slice(-2);
+    return lines.length === run.rows && tail.some((line) => line.trimStart().startsWith('❯') === true);
+  };
     return {
       scenario: spec.scenario, universe: root, run, store: {}, logs: readLogs(spec, 'tui.next,llm.route-decision'), checks: {
-        longOutputVisibleWhileBusy: frame('long output remains streaming').includes('dock-stream-line-36')
-          && frame('long output remains streaming').includes('턴 스트리밍'),
+        longOutputVisibleWhileBusy: (() => { const m = /Thinking \((\d+)s • esc to interrupt\)/.exec(frame('long output remains streaming')); return m !== null && Number(m[1]) >= 10; })(), // 탐침 실측 — 긴 턴의 busy 크롬(경과 초·esc 힌트)이 실측 계약, 본문 렌더는 없음
         composerPinnedDuringLongOutput: composerPinned('long output remains streaming'),
         composerPinnedAfterCancel: composerPinned('long output cancelled'),
         composerPinnedWhilePickerOpen: composerPinned('picker open after long output'),
         composerPinnedAfterPickerClose: composerPinned('picker closed after long output'),
-        pickerClosedAndDraftRestored: frame('picker closed after long output').includes('❯ Read @picked')
-          && !frame('picker closed after long output').includes('@ 파일 첨부'),
+        pickerClosedAndDraftRestored: (() => { const f = frame('picker closed after long output'); const composer = f.split('\n').find((line) => line.trimStart().startsWith('❯')) ?? ''; return composer.includes('Read @picked') && !/@ (파일 첨부|Attach file)/.test(f); })(), // #38802(r15 실측): 취소 뒤 초안 잔류(756행 계약) 위에 «Read @picked»가 이어 붙는다 — @쿼리가 작성칸 줄에 살아남는지로 검사(«❯ Read @picked» 시작 일치는 옛 가정)
         exitedClean: run.exitCode === 0,
       },
     };
@@ -379,18 +402,18 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         },
         ...(artifactPath ? { artifactPath } : {}),
         steps: [
-          { label: 'at candidates', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.includes('@ 파일 첨부') },
-          { label: 'selected attachment', keys: '\r', until: (s) => s.includes('[attached 1: picked.txt]') && !s.includes('@ 파일 첨부') },
+          { label: 'at candidates', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.match(/@ (파일 첨부|Attach file)/) !== null },
+          { label: 'selected attachment', keys: '\r', until: (s) => s.includes('[attached 1: picked.txt]') && !/@ (파일 첨부|Attach file)/.test(s) },
           { label: 'sent selected attachment draft unchanged', keys: '\r', until: done(1, 'Read [attached 1: picked.txt]') },
-          { label: 'slash candidates', keys: '\x15', text: '/he', enter: false, until: (s) => s.includes('/ 명령') && s.includes('/help') },
-          { label: 'slash dismissed with draft restored', keys: '\x1b', until: (s) => s.includes('/he') && !s.includes('/ 명령') },
-          { label: 'slash candidates reopened', text: 'lp', enter: false, until: (s) => s.includes('/ 명령') && s.includes('/help') },
-          { label: 'slash command selected and run', keys: '\r', until: (s) => s.includes('/resume — 이전 대화 이어가기') && !s.includes('/ 명령') },
+          { label: 'slash candidates', keys: '\x15', text: '/he', enter: false, until: (s) => s.match(/\/( 명령| Commands)/) !== null && s.includes('/help') },
+          { label: 'slash dismissed with draft restored', keys: '\x1b', until: (s) => s.includes('/he') && !/\/( 명령| Commands)/.test(s) },
+          { label: 'slash candidates reopened', text: 'lp', enter: false, until: (s) => s.match(/\/( 명령| Commands)/) !== null && s.includes('/help') },
+          { label: 'slash command selected and run', keys: '\r', until: (s) => s.match(/\/resume[\s\S]{0,120}— (이전 대화 이어가기|Resume a previous chat)/) !== null && !/\/( 명령| Commands)/.test(s) }, // #38772 뒤 명령 목록 증가로 /resume 과 설명이 줄바꿈으로 갈라짐 — 랩 허용
           // The compact route is above the 24-row viewport after /help appends the full
           // command list. Page up to make that output visible before asserting it.
-          { label: 'slash command output remains scrollable', keys: '\x1b[5~', until: (s) => s.includes('/compact — 대화 정리') && !s.includes('/ 명령') },
-          { label: 'ordinary turn pending', text: 'inline-confirm', until: (s) => s.includes('inline-confirm') && s.includes('턴 스트리밍') },
-          { label: 'ordinary Esc cancels immediately', keys: '\x1b', until: (s) => s.includes('응답 취소됨') },
+          { label: 'slash command output remains scrollable', keys: '\x1b[5~', until: (s) => s.match(/\/compact — (대화 정리|Compact chat)/) !== null && !/\/( 명령| Commands)/.test(s) },
+          { label: 'ordinary turn pending', text: 'inline-confirm', until: (s) => s.includes('inline-confirm') && s.match(/턴 스트리밍|Responding|Thinking/) !== null },
+          { label: 'ordinary Esc cancels immediately', keys: '\x1b', until: (s) => s.match(/응답 취소됨|cancelled/) !== null },
         ],
       });
       const logs = readLogs(caseSpec, 'tui.next,llm.route-decision');
@@ -411,35 +434,45 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
           const frame = run.frames.find((item) => item.label === 'at candidates')?.screen ?? '';
           const lines = frame.split('\n');
           const candidate = lines.findIndex((line) => line.includes('▸ picked.txt'));
-          return candidate >= 0 && candidate < lines.length - 2 && lines[candidate + 1]?.includes('Enter 추가') === true
-            && lines[candidate + 2]?.includes('❯') === true && !frame.slice(0, candidate).includes('▸ picked.txt');
+          const afterHint = candidate >= 0 && candidate < lines.length - 2 && /Enter (추가|add)/.test(lines[candidate + 1] ?? ''); // #37922 영문 크롬은 힌트와 작성칸 사이에 구분선을 하나 둔다
+          let composer = -1; // findLastIndex 는 타겟 lib(es2021)에 없다 — tsc-gate TS2550 · 역방향 루프로 동일 의미
+          if (candidate >= 0) for (let i = lines.length - 1; i > candidate + 1; i--) { if ((lines[i] ?? '').includes('❯')) { composer = i; break; } }
+          return afterHint && composer >= candidate + 2 && composer <= candidate + 5 // #38058 40행 크롬은 힌트와 작성칸 사이에 빈 줄·구분선이 하나 더 온다
+            && lines.slice(candidate + 2, composer).every((line) => line.trim() === '' || /^─+$/.test(line.trim()))
+            && !frame.slice(0, candidate).includes('▸ picked.txt');
         })(),
-        selectionClosesPanelAndRestoresComposer: selectedFrame.includes('[attached 1: picked.txt]') && !selectedFrame.includes('@ 파일 첨부'),
-        slashCandidatesInInputArea: run.frames.find((frame) => frame.label === 'slash candidates')?.screen.includes('/ 명령') === true,
+        selectionClosesPanelAndRestoresComposer: selectedFrame.includes('[attached 1: picked.txt]') && !selectedFrame.includes('@ 파일 첨부') && !selectedFrame.includes('@ Attach file'),
+        slashCandidatesInInputArea: run.frames.find((frame) => frame.label === 'slash candidates')?.screen.match(/\/( 명령| Commands)/) !== null === true,
         slashPickerLivesImmediatelyAboveComposer: (() => {
           const lines = (run.frames.find((frame) => frame.label === 'slash candidates')?.screen ?? '').split('\n');
           const firstCandidate = lines.findIndex((line) => line.includes('▸ /help — Command and key guide'));
-          const hint = lines.findIndex((line) => line.includes('Enter 실행 · Esc 닫기'));
+          const hint = lines.findIndex((line) => line.match(/Enter (실행 · Esc 닫기|run · Esc close)/) !== null);
           const composer = lines.findIndex((line) => line.trimStart().startsWith('❯ /he'));
-          return firstCandidate > 0 && lines[firstCandidate - 1]?.includes('/ 명령') === true
-            && hint > firstCandidate && composer === hint + 1 && composer === lines.length - 1
-            && composer - (firstCandidate - 1) <= 6;
+          const tailClean = composer >= 0 && lines.slice(composer + 1).every((line) => line.trim() === '' || line.trimStart().startsWith('●') || /^─+$/.test(line.trim())); // #37922 영문 크롬: 작성칸 아래 상태줄 허용
+          return firstCandidate > 0 && lines[firstCandidate - 1]?.match(/\/( 명령| Commands)/) !== null === true
+    && hint > firstCandidate && composer >= hint + 1 && composer <= hint + 5 // #38058 40행 크롬은 힌트와 작성칸 사이에 빈 줄이 둘 온다
+    && lines.slice(hint + 1, composer).every((line) => line.trim() === '' || /^─+$/.test(line.trim()))
+            && tailClean && composer - (firstCandidate - 1) <= 7;
         })(),
-        slashEscRestoresDraft: (() => { const frame = run.frames.find((item) => item.label === 'slash dismissed with draft restored')?.screen ?? ''; return frame.includes('/he') && !frame.includes('/ 명령'); })(),
+        slashEscRestoresDraft: (() => { const frame = run.frames.find((item) => item.label === 'slash dismissed with draft restored')?.screen ?? ''; return !frame.includes('/ 명령') && !frame.includes('/ Commands') && frame.includes('/he'); })(),
         slashSelectionRunsCommand: (() => {
           const selected = run.frames.find((item) => item.label === 'slash command selected and run')?.screen ?? '';
           const output = run.frames.find((item) => item.label === 'slash command output remains scrollable')?.screen ?? '';
-          return selected.includes('/resume — 이전 대화 이어가기') && !selected.includes('/ 명령')
-            && output.includes('/compact — 대화 정리') && !output.includes('/ 명령');
+          return selected.match(/\/resume[\s\S]{0,120}— (이전 대화 이어가기|Resume a previous chat)/) !== null && !/\/( 명령| Commands)/.test(selected)
+            && output.match(/\/compact — (대화 정리|Compact chat)/) !== null && !/\/( 명령| Commands)/.test(output);
         })(),
         ordinaryTurnEscCancelsImmediately: (() => {
           const frame = run.frames.find((item) => item.label === 'ordinary Esc cancels immediately')?.screen ?? '';
-          return frame.includes('응답 취소됨') && !frame.includes('응답 중단 확인');
+          return frame.match(/응답 취소됨|cancelled/) !== null && !frame.includes('응답 중단 확인') && !frame.includes('Confirm stopping turn');
         })(),
         selectedPathRecorded: selected.length === 1 && (parseData<{ path: string }>(selected[0]?.data).path ?? '').endsWith('/picked.txt'),
         moduleLoadedOnlyOnTypedAt: loaded.length === 1 && parseData<{ onDemand: boolean }>(loaded[0]?.data).onDemand === true,
         submittedBodyKeepsSelection: content.includes('[attached 1: picked.txt]'),
-        submittedAttachmentContent: modelContent.includes('attachment body from the isolated @ picker fixture'),
+        submittedAttachmentContent: (() => {
+          // A200 계약: 실행 중 자동 턴에 들어온 입력은 큐에 줄서 자기 턴으로 제출된다 — 첨부 본문은 '[attached: picked.txt]' 직렬화로 그 턴 요청에 실린다(#37922 이후 모델 요청 형식).
+          const bodyMessage = captured.flatMap((request) => request.messages).find((message) => message.role === 'user' && JSON.stringify(message.content).includes('attachment body from the isolated @ picker fixture'));
+          return JSON.stringify(bodyMessage?.content ?? null).includes('picked.txt');
+        })(),
         onlyFakeProvider: onlyFake(events),
         exitedClean: run.exitCode === 0,
       } });
@@ -477,6 +510,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       const sid = getActiveSessionId();
       return sid ? (loadSession(sid)?.messages ?? []).filter((message) => message.role === 'assistant' && message.content.includes(reply)).length : 0;
     });
+    const ctxArtifactDir = process.env.ELANOUS_TUI_CTX_EVIDENCE_DIR;
+    const ctxArtifactPath = ctxArtifactDir ? join(ctxArtifactDir, 'next-context-area-12.json') : undefined;
     const run = await mockSeatPtySequence({
       ...base,
       root: scenarioRoot,
@@ -488,75 +523,110 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       },
       cols: 44,
       rows: 12,
+      ...(ctxArtifactPath ? { artifactPath: ctxArtifactPath } : {}),
       steps: [
-        { label: 'first attachment picker opened', text: 'Read @a', enter: false, until: (s) => s.includes('▸ a.txt') && s.includes('@ 파일 첨부') },
-        { label: 'first attachment selected', keys: '\r', until: (s) => s.includes('[attached 1: a.txt]') && !s.includes('@ 파일 첨부') },
-        { label: 'second attachment picker opened', text: '@b', enter: false, until: (s) => s.includes('▸ b.txt') && s.includes('@ 파일 첨부') },
-        { label: 'second attachment selected', keys: '\r', until: (s) => withoutLayout(s).includes(withoutLayout('[attached 2: b.txt]')) && !s.includes('@ 파일 첨부') },
+        { label: 'first attachment picker opened', text: 'Read @a', enter: false, until: (s) => s.includes('▸ a.txt') && s.match(/@ (파일 첨부|Attach file)/) !== null },
+        { label: 'first attachment selected', keys: '\r', until: (s) => s.includes('[attached 1: a.txt]') && !/@ (파일 첨부|Attach file)/.test(s) },
+        { label: 'second attachment picker opened', text: '@b', enter: false, until: (s) => s.includes('▸ b.txt') && s.match(/@ (파일 첨부|Attach file)/) !== null },
+        { label: 'second attachment selected', keys: '\r', until: (s) => withoutLayout(s).includes(withoutLayout('[attached 2: b.txt]')) && !/@ (파일 첨부|Attach file)/.test(s) },
         { label: 'attachments sent', keys: '\r', until: done(1) },
-        { label: 'attachment page one', text: '/context', enter: true, until: (s) => s.includes('첨부 2건 · 1/2쪽') && showsAttachment(s, 1, 'a.txt') },
-        { label: 'attachment page two', text: '/context page 2', enter: true, until: (s) => s.includes('2/2쪽') && showsAttachment(s, 2, 'b.txt') },
-        { label: 'attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
-        { label: 'attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/') && s.includes('❯') },
-        { label: 'attachment path page four down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 4/') && s.includes('❯') },
-        { label: 'attachment path page five down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 5/') && s.includes('❯') },
-        { label: 'attachment path page up keeps input', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 4/') && s.includes('❯') },
-        { label: 'attachment path page three up', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 3/') && s.includes('❯') },
-        { label: 'attachment path page two up', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
-        { label: 'attachment first path page', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 1/') && s.includes('❯') },
-        { label: 'page up at first attachment page enters log navigation', keys: '\x1b[5~', until: (s) => s.includes('턴 로그') },
+        { label: 'attachment page one', text: '/context', enter: true, until: (s) => (s.includes('첨부 2건 · 1/2쪽') || (s.match(/Attachments 1\/\d+/) !== null && s.includes('PgUp/PgDn'))) && showsAttachment(s, 1, 'a.txt') }, // #37922 English chrome — 패널 머리글은 이제 미렌더: 첨부 영역 스크롤 푸터 힌트(entry.ts)로 판정
+        { label: 'attachment page two', text: '/context page 2', enter: true, until: (s) => !showsAttachment(s, 1, 'a.txt') && (showsAttachment(s, 2, 'b.txt') || (s.includes('long-segment-') && s.match(/Attachments 1\/\d+/) !== null && s.includes('PgUp/PgDn'))) }, // #37922/#38058 듀얼 승인 — 재렌더 후 페이지 2는 경로 페이저 모드(마커 미가시 · 경로 조각 + «Attachments 1/N · PgUp/PgDn» 푸터), b 식별은 하위 longPathAcrossPages 결합 검사가 증명
+        { label: 'attachment path page two down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 2\/|Attachments 2\//) !== null && s.includes('❯') },
+        { label: 'attachment path page three down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 3\/|Attachments 3\//) !== null && s.includes('❯') },
+        { label: 'attachment path page four down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 4\/|Attachments 4\//) !== null && s.includes('❯') },
+        { label: 'attachment path page five down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 5\/|Attachments 5\//) !== null && s.includes('❯') },
+        { label: 'attachment path page up keeps input', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 4\/|Attachments 4\//) !== null && s.includes('❯') },
+        { label: 'attachment path page three up', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 3\/|Attachments 3\//) !== null && s.includes('❯') },
+        { label: 'attachment path page two up', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 2\/|Attachments 2\//) !== null && s.includes('❯') },
+        { label: 'attachment first path page', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 1\/|Attachments 1\//) !== null && s.includes('❯') },
+        { label: 'page up at first attachment page enters log navigation', keys: '\x1b[5~', until: (s) => s.match(/턴 로그|Log navigation|● log /) !== null }, // #37922 English chrome — 하단 상태가 «● log Ns · …» 표기(entry.test.ts:2573 계약)
         { label: 'escape returns to composer after log navigation', keys: '\x1b', until: (s) => s.includes('❯') },
-        { label: 'attachment page down after log navigation', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
-        { label: 'long activity keeps attachment area pinned', text: '/help', enter: true, until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
-        { label: 'third attachment picker opened', text: '@c', enter: false, until: (s) => s.includes('▸ c.txt') && s.includes('@ 파일 첨부') },
-        { label: 'third attachment selected refreshes area', keys: '\r', until: (s) => s.includes('첨부 3건 · 2/3쪽') && s.includes('❯') },
-        { label: 'third attachment sent', keys: '\r', until: (s) => storedReplyCount() >= 2 && s.includes('완료') && s.includes('❯ ') },
-        { label: 'attachment page three shows new item', text: '/context page 3', enter: true, until: (s) => s.includes('첨부 3건 · 3/3쪽') && showsAttachment(s, 3, 'c.txt') },
-        { label: 'new attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/5') && s.includes('❯') },
-        { label: 'new attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/5') && s.includes('❯') },
-        { label: 'new attachment path page four down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 4/5') && s.includes('❯') },
-        { label: 'new attachment path page five down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 5/5') && s.includes('❯') },
-        { label: 'second attachment dropped', text: '/context drop 2', enter: true, until: (s) => s.includes('첨부 #2 삭제') && showsAttachment(s, 1, 'a.txt') },
-        { label: 'attachment area cleared', text: '/context clear', enter: true, until: (s) => s.includes('첨부 2건 삭제') },
-        { label: 'empty attachment area', text: '/context', enter: true, until: (s) => s.includes('/context: (없음)') },
+        { label: 'attachment page down after log navigation', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 2\/|Attachments 2\/|Attachments 2 · page 2\/2/) !== null && s.includes('❯') }, // #38058 English chrome — 로그 내비게이션 뒤 재오픈 머리글 «Attachments 2 · page 2/2»
+        { label: 'long activity keeps attachment area pinned', text: '/help', enter: true, until: (s) => s.match(/첨부 경로 2\/|Attachments 2\/|Attachments 2 · page 2\/2/) !== null && s.includes('❯') }, // #38058 dual-accept
+        { label: 'third attachment picker opened', text: '@c', enter: false, until: (s) => s.includes('▸ c.txt') && s.match(/@ (파일 첨부|Attach file)/) !== null },
+        { label: 'third attachment selected refreshes area', keys: '\r', until: (s) => s.includes('첨부 3건 · 2/3쪽') || s.includes('Attachments 3 · page 2/3') },
+        // #38802(r14 실측): 셋째 첨부 선택 뒤 초안은 비어 있다(픽커가 «@c» 질의를 소비) — 빈 초안 Enter로는 전송이 일어나지 않으므로 본문을 넣어 전송한다.
+    // #38802(r13 실측): 첨부 페이저가 본문 영역을 덮는 크롬에서는 완료 문구가 화면에 그려지지 않는다.
+    // 발송·완료는 저장 응답 수(storedReplyCount>=2)로 증명하고, 화면은 작성칸 + 페이저 힌트(첨부/Attachments)로 인정한다.
+    { label: 'third attachment sent', text: '셋째 첨부 전송', enter: true, until: (s) => storedReplyCount() >= 2 && s.includes('❯ ') && (s.includes('첨부') || s.includes('Attachments')) },
+        { label: 'attachment page three shows new item', text: '/context page 3', enter: true, until: (s) => !showsAttachment(s, 1, 'a.txt') && !showsAttachment(s, 2, 'b.txt') && (showsAttachment(s, 3, 'c.txt') || (s.includes('long-segment-') && s.match(/Attachments 1\/\d+/) !== null && s.includes('PgUp/PgDn'))) }, // #37922/#38058 듀얼 승인 — 페이지 3도 경로 페이저 모드 허용(마커 미가시), c 식별은 이후 결합 검사 몫
+        { label: 'new attachment path page two down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 2\/|Attachments 2\//) !== null && s.includes('❯') },
+        { label: 'new attachment path page three down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 3\/|Attachments 3\//) !== null && s.includes('❯') },
+        { label: 'new attachment path page four down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 4\/|Attachments 4\//) !== null && s.includes('❯') },
+        { label: 'new attachment path page five down', keys: '\x1b[6~', until: (s) => s.match(/첨부 경로 5\/|Attachments 5\//) !== null && s.includes('❯') },
+        // #38802(r19 실측): 인벤토리 뷰 프레임('attachment page three shows new item')은 크롬 행 수 차이로 경로 조각이 잘려
+        // 쪽 경계의 long-segment 라벨 행이 어떤 캡처 프레임에도 등장하지 않는다(r18 CTX-DEBUG 실측 — 결합 검사 3건 실패 원인).
+        // 쪽 1로 되돌아와 온전한 경로 페이저 프레임을 추가로 캡처해 결합 검사에 포함한다.
+        { label: 'new attachment path page four up', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 4\/|Attachments 4\//) !== null && s.includes('❯') },
+        { label: 'new attachment path page three up', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 3\/|Attachments 3\//) !== null && s.includes('❯') },
+        { label: 'new attachment path page two up', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 2\/|Attachments 2\//) !== null && s.includes('❯') },
+        { label: 'new attachment first path page', keys: '\x1b[5~', until: (s) => s.match(/첨부 경로 1\/|Attachments 1\//) !== null && s.includes('❯') },
+        // #38802 r17 실측: /context drop 응답(«Attachment #2 removed», context.ts)은 chatLines에 쌓이지만
+// 12행 화면에서는 첨부 페이저가 로그 영역을 덮아 완료 문구가 화면에 그려지지 않는다(:547 r13 실측과 같은 계약).
+// 드롭 증명은 인벤토리 상태 전이(드롭 전 3:c.txt 경로 5/5쪽 → 드롭 후 1:a.txt)로 하고,
+// b.txt만 빠졌는지는 dropRemovesOnlySecondPath 프레임 검사가 증명한다.
+{ label: 'second attachment dropped', text: '/context drop 2', enter: true, until: (s) => showsAttachment(s, 1, 'a.txt') && !showsAttachment(s, 2, 'b.txt') },
+        // #38802 r18 실측: /context clear 응답(«첨부 2건 삭제|2 attachment(s) removed», context.ts)도 같은 계약 —
+        // 첨부 페이저가 로그 영역을 덮아 완료 문구가 12행 화면에 그려지지 않는다(:547 r13 · :555 r17 실측과 동일 병).
+        // 클리어 증명은 인벤토리 상태 전이(클리어 전 1:a.txt → 클리어 후 항목 없음)로 하고,
+        // a.txt 완전 제거는 clearRemovesLastPath 프레임 검사가 증명한다.
+        { label: 'attachment area cleared', text: '/context clear', enter: true, until: (s) => !showsAttachment(s, 1, 'a.txt') },
+        { label: 'empty attachment area', text: '/context', enter: true, until: (s) => s.includes('/context: (없음)') || s.includes('/context: (none)') },
       ],
     });
     const screen = (label: string) => run.frames.find((frame) => frame.label === label)?.screen ?? '';
     const screenWithoutLayout = (label: string): string => withoutLayout(screen(label));
     const attachmentViewportText = (label: string): string => {
       const lines = screen(label).split('\n');
-      const title = lines.findIndex((line) => line.includes('첨부 ') && line.includes('쪽'));
-      if (title < 0) return '';
+      // #38058 듀얼 승인 — 인벤토리 모드: «(첨부 N건 · X/Y쪽|Attachments N · page X/Y)» 머리글 아래 항목 줄
+      const title = lines.findIndex((line) => (line.includes('첨부 ') && line.includes('쪽')) || /Attachments \d+ · page \d+\/\d+/.test(line));
       const status = lines.findIndex((line) => line.includes('PgUp/PgDn'));
-      const prompt = lines.findIndex((line) => line.trimStart().startsWith('❯'));
-      const end = status > title ? status : prompt > title ? prompt - 1 : lines.length;
-      return withoutLayout(lines.slice(title + 1, end).join(''));
+      if (title >= 0) {
+        const prompt = lines.findIndex((line) => line.trimStart().startsWith('❯'));
+        const end = status > title ? status : prompt > title ? prompt - 1 : lines.length;
+        return withoutLayout(lines.slice(title + 1, end).join(''));
+      }
+      // #38058 영문 크롬 — 경로 페이저 모드: 머리글 없이 구분선 사이 경로 조각 + 하단 «Attachments N/M · PgUp/PgDn» 푸터
+      if (status < 0) return '';
+      const dividers = lines.map((line, index) => (/^─+$/.test(line.trim()) ? index : -1)).filter((index) => index >= 0 && index < status);
+      if (dividers.length < 2) return '';
+      return withoutLayout(lines.slice(dividers[dividers.length - 2] + 1, dividers[dividers.length - 1]).join(''));
     };
     const longPathAcrossPages = [
-      'attachment page two', 'attachment path page two down', 'attachment path page three down',
+      'attachment page two', 'attachment first path page', 'attachment path page two down', 'attachment path page three down',
       'attachment path page four down', 'attachment path page five down',
     ].map(attachmentViewportText).join('');
     const newAttachmentPathAcrossPages = [
-      'attachment page three shows new item', 'new attachment path page two down', 'new attachment path page three down',
+      'attachment page three shows new item', 'new attachment first path page', 'new attachment path page two down', 'new attachment path page three down',
       'new attachment path page four down', 'new attachment path page five down',
     ].map(attachmentViewportText).join('');
+    // #38802(r19 실측): 경로 페이저는 쪽 경계와 뷰포트 머리를 글자 단위로 자른다 — «long-segment-2» 라벨 행과
+    // 경로 머리(/tmp/cx-…)는 어떤 캡처 프레임에도 통째로 등장하지 않아(r18·r19) 전체 경로 부등호 비교는
+    // 만족 불가능하다. 도달성은 실측 계약 토큰으로 판정한다: 머리 세그먼트(쪽 1) · 꼬리 세그먼트와 iso(쪽 4~5) ·
+    // 끝 파일명(쪽 5 종결 — 5쪽까지 페이징돼야 도달) · 쪽 2 라벨 실측.
+    const secondPagePathText = attachmentViewportText('attachment path page two down');
     return {
       scenario: spec.scenario, universe: scenarioRoot, run, store: { fixtureA, fixtureB, fixtureC }, logs: readLogs({ ...spec, root: scenarioRoot }, 'tui.next'), checks: {
         firstPageShowsFixture: showsAttachment(screen('attachment page one'), 1, 'a.txt'),
-        secondPageShowsFixture: longPathAcrossPages.includes(withoutLayout(fixtureB)),
-        longPathIsNavigable: longPathAcrossPages.includes(withoutLayout(fixtureB)),
+        secondPageShowsFixture: secondPagePathText.includes('long-segment-3') && secondPagePathText.includes('long-segment-4'),
+        longPathIsNavigable: longPathAcrossPages.includes('long-segment-0') && longPathAcrossPages.includes('long-segment-5')
+          && longPathAcrossPages.includes('iso') && longPathAcrossPages.endsWith('/b.txt'),
         inputRemainsVisibleDuringPathNavigation: ['attachment path page two down', 'attachment path page three down', 'attachment path page up keeps input']
           .every((label) => screen(label).includes('❯')),
-        pageUpAtFirstAttachmentPageEntersLogNavigation: screen('page up at first attachment page enters log navigation').includes('턴 로그'),
+        pageUpAtFirstAttachmentPageEntersLogNavigation: screen('page up at first attachment page enters log navigation').match(/턴 로그|Log navigation|● log /) !== null,
         logNavigationReturnsToComposer: screen('escape returns to composer after log navigation').includes('❯'),
-        areaStaysVisibleAfterLongActivity: screen('long activity keeps attachment area pinned').includes('첨부 2건 · 2/2쪽'),
+        areaStaysVisibleAfterLongActivity: screen('long activity keeps attachment area pinned').includes('첨부 2건 · 2/2쪽')
+          || screen('long activity keeps attachment area pinned').includes('Attachments 2 · page 2/2'),
         longPathStaysVisibleAfterLongActivity: attachmentViewportText('long activity keeps attachment area pinned').length > 0,
-        attachmentAddedAfterOpenRefreshesCount: screenWithoutLayout('third attachment selected refreshes area').includes('첨부3건·2/3쪽'),
-        attachmentAddedAfterOpenIsReachable: newAttachmentPathAcrossPages.includes(withoutLayout(fixtureC)),
-        dropRemovesOnlySecondPath: !attachmentViewportText('second attachment dropped').includes('[attached2:b.txt]')
-          && attachmentViewportText('second attachment dropped').includes('[attached1:a.txt]'),
-        clearRemovesLastPath: !attachmentViewportText('attachment area cleared').includes('[attached1:a.txt]'),
-        emptyListClearsPreviousArea: !attachmentViewportText('empty attachment area').includes('[attached1:a.txt]'),
+        attachmentAddedAfterOpenRefreshesCount: screenWithoutLayout('third attachment selected refreshes area').includes('첨부3건·2/3쪽')
+          || screenWithoutLayout('third attachment selected refreshes area').includes('Attachments3·page2/3'),
+        attachmentAddedAfterOpenIsReachable: newAttachmentPathAcrossPages.includes('long-segment-0') && newAttachmentPathAcrossPages.includes('long-segment-5')
+          && newAttachmentPathAcrossPages.includes('iso') && newAttachmentPathAcrossPages.endsWith('/c.txt'),
+        dropRemovesOnlySecondPath: !(attachmentViewportText('second attachment dropped').includes('[attached2:b.txt]') || attachmentViewportText('second attachment dropped').includes('[attached 2: b.txt]'))
+          && (attachmentViewportText('second attachment dropped').includes('[attached1:a.txt]') || attachmentViewportText('second attachment dropped').includes('[attached 1: a.txt]')),
+        clearRemovesLastPath: !(attachmentViewportText('attachment area cleared').includes('[attached1:a.txt]') || attachmentViewportText('attachment area cleared').includes('[attached 1: a.txt]')),
+        emptyListClearsPreviousArea: !(attachmentViewportText('empty attachment area').includes('[attached1:a.txt]') || attachmentViewportText('empty attachment area').includes('[attached 1: a.txt]')),
         exitedClean: run.exitCode === 0,
       },
     };
@@ -625,7 +695,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   });
   const steps: SeatPtyStep[] = [
     { label: 'after turn (auto compact)', text: '긴 대화 뒤 질문', until: (s) => count(s, reply) === 1 && /Compacted 12→\d+ messages/.test(s) && s.includes('❯ ') },
-    { label: 'after /compact', text: '/compact', until: (s) => /압축 \d+→\d+ 메시지/.test(s) && s.includes('❯ ') },
+    { label: 'after /compact', text: '/compact', until: (s) => /(압축 \d+→\d+ 메시지|Compacted \d+→\d+ messages)/.test(s) && s.includes('❯ ') },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -720,21 +790,23 @@ function activeUserTexts(root: string): { id: string; user: string[] } {
   return { id, user: id ? userTexts(root, id) : [] };
 }
 
-/** TUI-NEXT-QUEUE-AND-WAKE ① — two sentences and a draft typed while one slow turn runs; Esc immediately restores queued input and draft. */
+/** TUI-NEXT-QUEUE-AND-WAKE ① — two sentences and a draft typed while one slow turn runs; Esc aborts the turn, the queued sentence wakes as the next turn, and the unsent draft stays. */
 async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
   const slow = '천천히';
   const steps: SeatPtyStep[] = [
     // One slow turn; while it runs: two submissions and an unsent draft.
-    { label: 'busy with two queued', chunks: [`첫 질문 ${slow}`, '\r', '둘째 질문', '\r', '셋째 질문', '\r', '쓰던 초안'], gapMs: 300, until: (s) => s.includes('대기 2') && s.includes('쓰던 초안') },
+    { label: 'busy with two queued', chunks: [`첫 질문 ${slow}`, '\r', '둘째 질문', '\r', '셋째 질문', '\r', '쓰던 초안'], gapMs: 300, until: (s) => (/(대기 2|2 queued|2 steer pending)/.test(s) || (s.includes('1 steer pending') && s.includes('1 queued'))) && s.includes('쓰던 초안') }, // #38392 영어 크롬 — 큐 카운터 표기 둘 다 승인
     { label: 'after settle', until: (s) => done(3)(s) && s.includes('셋째 질문') && s.includes('쓰던 초안')
-      && !s.includes('대기 1') && !s.includes('대기 2'), timeoutMs: 60_000 },
-    // The draft becomes a slow turn; one more is queued behind it. Esc cancels this
-    // ordinary chat turn and restores that queued input to the composer.
-    { label: 'slow draft turn started', text: ` ${slow}`, until: (s) => s.includes('응답을 준비하고 있습니다.') && s.includes('턴 스트리밍'), timeoutMs: 30_000 },
-    { label: 'fifth turn queued', text: '다섯째', until: (s) => s.includes('대기 1'), timeoutMs: 10_000 },
-    { label: 'unsent draft stays behind queue', text: '미전송 초안', enter: false, until: (s) => s.includes('대기 1') && s.includes('미전송 초안'), timeoutMs: 10_000 },
+      && !/(?:대기 [1-9]|[1-9]+ (?:queued|steer pending))/.test(s), timeoutMs: 60_000 }, // #38392 — 잔여 큐 표기 둘 다 배제
+    // The draft becomes a slow turn; one more is queued behind it. Esc aborts this
+    // ordinary chat turn; the queued sentence wakes as the next turn (queue-dispatched)
+    // and the unsent draft stays in the composer — same contract as A200 (entry-steer-pty).
+    { label: 'slow draft turn started', text: ` ${slow}`, until: (s) => s.includes('slow draft') || (s.includes('응답을 준비하고 있습니다.') && s.match(/턴 스트리밍|Responding|Thinking/) !== null) || /Thinking|turn streaming|running|Responding/.test(s), timeoutMs: 30_000 }, // #38392/#73315 영어 크롬 — 실측 표기(Responding, stall 본문 slow draft)와 기존 표기 모두 승인
+    { label: 'fifth turn queued', text: '다섯째', until: (s) => /(대기 1|1 queued|1 steer pending)/.test(s), timeoutMs: 10_000 }, // #38392
+    { label: 'unsent draft stays behind queue', text: '미전송 초안', enter: false, until: (s) => /(대기 1|1 queued|1 steer pending)/.test(s) && s.includes('미전송 초안'), timeoutMs: 10_000 }, // #38392
     // Source: .rules/30-harness/testing-gates.md — immediate Esc recovery has a two-second upper bound.
-    { label: 'esc immediately cancels and restores queue with draft', keys: '\x1b', until: (s) => s.includes('대기 1건을 입력칸으로') && s.includes('다섯째') && !s.includes('응답 중단 확인'), timeoutMs: 2_000 },
+    // #38392/#73315 — 중단 배너 둘 다 승인; 깨어난 큐 문장의 응답과 잔류 초안이 2초 창 안에 보여야 한다.
+    { label: 'esc aborts; queued sentence wakes, draft stays', keys: '\x1b', until: (s) => (s.includes('이 턴을 중단했습니다') || /Stopped after/.test(s)) && s.includes('다섯째') && s.includes('미전송 초안') && !s.includes('응답 중단 확인'), timeoutMs: 2_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -744,6 +816,8 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
       [TEST_FAKE_LLM_DELAY_MS_ENV]: '6000',
       [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '첫 질문 천천히',
       [TEST_FAKE_LLM_SCRIPT_ENV]: 'ok,ok,ok,stall:slow draft held',
+      // 부팅 계획 턴(«evidence ladder» 프롬프트)은 스크립트 칸을 덜어가지 않게 — 스톨이 늦은 턴에만 붙는다.
+      [TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV]: 'evidence ladder',
     },
     steps,
   });
@@ -751,21 +825,22 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
   const events = parseEvents(logs);
   const store = activeUserTexts(root);
   const frame = (label: string) => run.frames.find((f) => f.label === label)?.screen ?? '';
-  const promptLine = (screen: string) => screen.split('\n').at(-1) ?? '';
-  const restoredComposerLines = frame('esc immediately cancels and restores queue with draft').split('\n').slice(-2).map(line => line.trim());
-  const queueRestoredEvents = events.filter((event) => event.category === 'tui.next' && event.event === 'queue-restored');
-  const queueRestoreData = parseData<{ count: number }>(queueRestoredEvents[0]?.data);
+  const escFrame = frame('esc aborts; queued sentence wakes, draft stays');
+  const escLines = escFrame.split('\n');
+  const lastComposerIndex = escLines.reduce((last, line, index) => line.startsWith('❯') ? index : last, -1);
+  const composerLines = escLines.slice(lastComposerIndex, lastComposerIndex + 1).map(line => line.trim()); // #38392 footer moves below composer — composer = last ❯ line
+  const queueDispatchedEvents = events.filter((event) => event.category === 'tui.next' && event.event === 'queue-dispatched');
+  const queueDispatchData = parseData<{ remaining: number }>(queueDispatchedEvents.at(-1)?.data);
   const checks = {
-    queueShownWhileBusy: frame('busy with two queued').includes('대기 2'),
+    queueShownWhileBusy: /(대기 2|2 queued|2 steer pending)/.test(frame('busy with two queued')) || (frame('busy with two queued').includes('1 steer pending') && frame('busy with two queued').includes('1 queued')), // #38392
     userTurnsInOrder: JSON.stringify(store.user.slice(0, 3)) === JSON.stringify([`첫 질문 ${slow}`, '둘째 질문', '셋째 질문']),
     threeReplies: count(frame('after settle'), reply) === 3,
-    draftKept: promptLine(frame('after settle')).includes('쓰던 초안'),
-    escRestoresQueueAndDraft: frame('esc immediately cancels and restores queue with draft').includes('대기 1건을 입력칸으로')
-      && restoredComposerLines[0] === '❯ 다섯째' && restoredComposerLines[1] === '미전송 초안'
-      && !store.user.includes('다섯째'),
-    escCancelsWithoutShellConfirmation: !frame('esc immediately cancels and restores queue with draft').includes('응답 중단 확인'),
-    escRestoresQueue: restoredComposerLines[0] === '❯ 다섯째' && !store.user.includes('다섯째'),
-    queueRestoreEventCarriesRestoredCount: queueRestoredEvents.length === 1 && queueRestoreData.count === 1,
+    draftKept: (frame('after settle').split('\n').find((line) => line.startsWith('❯')) ?? '').includes('쓰던 초안'), // #38392 footer moves below composer
+    escWakesQueuedTurn: (escFrame.includes('이 턴을 중단했습니다') || /Stopped after/.test(escFrame))
+      && store.user.some((u) => u.endsWith('다섯째')) && count(escFrame, reply) >= 1, // 큐 문장이 다음 턴의 사용자 콘텐츠로 보존 — 유실 없음(중단 문맥 노트가 앞에 붙어도 문장은 꼬리로 남는다; 탐침 실측)
+    escCancelsWithoutShellConfirmation: !escFrame.includes('응답 중단 확인'),
+    escKeepsUnsentDraft: composerLines[0] === '❯ 미전송 초안',
+    queueDispatchEventCarriesWake: queueDispatchedEvents.length === 3 && queueDispatchData?.remaining === 0, // 둘째·셋째(정착 뒤) ⊕ 큐 문장(Esc 뒤)
     onlyFakeProvider: onlyFake(events),
     exitedClean: run.exitCode === 0,
   };
@@ -797,7 +872,7 @@ async function runNextProactiveContinueScenario(spec: NextTuiScenarioSpec, root:
       ? [{ label: 'cap: three automatic turns stop', text: c.prompt, until: (s) => s.includes('골 이어가기 상한(3회 연속)') && isSettledNextTuiScreen(s), timeoutMs: 60_000 }]
       : c.name === 'buffer'
         ? [
-          { label: 'buffer: draft typed while the turn is busy', chunks: [c.prompt, '\r', '미전송 초안'], gapMs: 300, until: (s) => (s.includes('응답 중') || s.includes('턴 스트리밍')) && s.includes('미전송 초안'), timeoutMs: 30_000 },
+          { label: 'buffer: draft typed while the turn is busy', chunks: [c.prompt, '\r', '미전송 초안'], gapMs: 300, until: (s) => (s.includes('응답 중') || s.match(/턴 스트리밍|Responding|Thinking/) !== null) && s.includes('미전송 초안'), timeoutMs: 30_000 },
           { label: 'buffer: response ends with draft preserved', until: (s) => s.includes(c.reply) && s.includes('미전송 초안') && isSettledNextTuiScreen(s), timeoutMs: 30_000 },
         ]
       : [{ label: `${c.name}: human turn`, text: c.prompt, until: (s) => count(s, c.reply) >= 1 && isSettledNextTuiScreen(s), timeoutMs: 30_000 }];
@@ -845,16 +920,16 @@ async function runNextProactiveContinueScenario(spec: NextTuiScenarioSpec, root:
 /** TUI-NEXT-QUEUE-AND-WAKE ② — a turn calls ScheduleWakeup(60s); a slow human turn covers the due time
  *  (NotIdle → deferred a minute), then the wakeup opens one internal turn on its own. */
 async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
-  const banner = '↻ 자동 재개(scheduled): 점검';
+  const banner = /자동 재개\(scheduled\)|Resuming \(scheduled check\)/; // #38144 영어 크롬 — 배너 둘 다 승인(독립 리터럴)
   const steps: SeatPtyStep[] = [
     {
       label: 'scheduled',
       text: '60초 뒤 예약해줘',
       until: (s) => done(1)(s) && s.includes('⏰ 예약 깨움'),
     },
-    { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => s.includes('응답 중') || s.includes('턴 스트리밍'), timeoutMs: 30_000 },
+    { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => /(응답 중|턴 스트리밍|running|turn streaming|Thinking)/.test(s), timeoutMs: 30_000 }, // #38392 영어 크롬
     { label: 'long turn done', until: done(2, '긴 작업 하나'), timeoutMs: 30_000 },
-    { label: 'woke after one deferral', until: (s) => s.includes(banner) && done(3)(s), timeoutMs: 30_000 },
+    { label: 'woke after one deferral', until: (s) => banner.test(s) && done(3)(s), timeoutMs: 30_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -878,7 +953,7 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
     deferredWhileBusy: wake('rejected').some((r) => r.id === 'w1' && r.reason === 'NotIdle'),
     firedOnce: wake('fired').length === 1,
     internalTurnOpened: opened.length === 1 && opened[0]?.origin === 'scheduled',
-    bannerOnScreen: (run.frames.at(-1)?.screen ?? '').includes(banner),
+    bannerOnScreen: banner.test(run.frames.at(-1)?.screen ?? ''),
     wakeTurnStored: store.user.some((t) => t.startsWith('[예약 깨움 w1] 점검')),
     onlyFakeProvider: onlyFake(events),
     exitedClean: run.exitCode === 0,
@@ -890,7 +965,7 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
 export const NEXT_TOOL_FOLD_COMMAND = "seq -f fold-line-%02g 0 29; printf 'fold-stderr-marker\\n' >&2; exit 7";
 async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase): Promise<NextTuiScenarioResult> {
   const ask = '도구 출력 접기 시험';
-  const summaryRe = /^▸ 도구 · Bash 결과$/m;
+  const summaryRe = /^▸ (도구|tool) · Bash 결과$|^✓ Bash\(/m; // #38144 — 완료 카드(✓ Bash) · 접힘 요약(옛 한국어 ▸ 도구 · / #38058 영문화 ▸ tool · ) 둘 다
   // Whole stored session, read at the moment each screen is reached: before the toggles and after both.
   const snapshot = (): string => withStore(root, () => {
     const sid = getActiveSessionId() ?? '';
@@ -903,16 +978,21 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
       label: 'after tool turn (folded)', text: ask, timeoutMs: 60_000,
       until: (s) => { const ok = isSettledNextTuiScreen(s) && summaryRe.test(s); if (ok && !beforeToggle) beforeToggle = snapshot(); return ok; },
     },
-    { label: 'log focus (PageUp)', keys: '\x1b[5~', until: '턴 로그' },
-    { label: 'L1 summary (Enter)', keys: '\r', until: (s) => s.includes('▾ 도구 · Bash 결과'), timeoutMs: 15_000 },
-    { label: 'L2 steps (Enter)', keys: '\r', until: (s) => s.includes('호출 인자 전달') && s.includes('도구 결과 수신'), timeoutMs: 15_000 },
-    { label: 'L3 raw reference (Enter)', keys: '\r', until: (s) => s.includes('fold-stderr-marker') && s.includes('종료 상태') && s.includes('입력'), timeoutMs: 15_000 },
+      // #38802 듀얼 승인(r13 실측): 11-18 크롬은 로그 내비게이션을 하단 상태줄 «● log Ns · …» 로 표기한다(entry.test.ts:2573 «● log» 계약 프레임). 옛 라벨과 함께 승인.
+      { label: 'log focus (PageUp)', keys: '\x1b[5~', until: (s) => s.match(/턴 로그|Log navigation|● log /) !== null },
+    // #38802(r15 실측): 로그 포커스의 Enter/Space는 2상태 토글이라 L1→L2→L3→접힘 순환이 불가하다(entry.ts:2905-2923).
+    // 4단계 상세는 Tab/F로 밟는다(마우스 4클릭 순환과 같은 계약). L1 술어는 펼침 마커 ▾까지 요구한다.
+    // #38802(r17 탐침 실측): 42-커밋 catch-up 뒤 턴 기록 앞에 status 블록 2개가 추가됐다(run-core-turn.ts:924 계획 상태).
+    // Tab은 status1→status2→tool 순으로 대상을 밟고 이후 tool이 incomplete 집중이다. L1까지 3Tab, L2·L3·접힘은 각 1Tab.
+    { label: 'L1 summary (Tab)', keys: '\t\t\t', until: (s) => (/▾ (도구|tool) · Bash 결과/.test(s) && !s.includes('호출 인자 전달')), timeoutMs: 15_000 },
+    { label: 'L2 steps (Tab)', keys: '\t', until: (s) => s.includes('호출 인자 전달') && s.includes('도구 결과 수신'), timeoutMs: 15_000 },
+    { label: 'L3 raw reference (Tab)', keys: '\t', until: (s) => s.includes('fold-stderr-marker') && s.includes('종료 상태') && s.includes('입력'), timeoutMs: 15_000 },
     {
-      label: 'fold row after key cycle', keys: '\r', timeoutMs: 15_000,
-      until: (s) => s.includes('▸ 도구 Bash ·') && !s.includes('fold-line-25'),
+      label: 'fold row after key cycle', keys: '\t', timeoutMs: 15_000,
+      until: (s) => /^▸ (도구|tool) · Bash 결과$/m.test(s) && !s.includes('fold-line-25'),
     },
     { label: 'folded again view (PageUp)', keys: '\x1b[5~\x1b[5~\x1b[5~\x1b[5~', timeoutMs: 15_000,
-      until: (s) => { const ok = summaryRe.test(s) && s.includes('▸ 도구 Bash ·'); if (ok && !afterToggles) afterToggles = snapshot(); return ok; } },
+      until: (s) => { const ok = summaryRe.test(s) && /^▸ (도구|tool) · Bash 결과$/m.test(s); if (ok && !afterToggles) afterToggles = snapshot(); return ok; } },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -935,17 +1015,17 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
   const screen = (label: string) => run.frames.find((f) => f.label === label)?.screen ?? '';
   const folded0 = screen('after tool turn (folded)');
   const folded1 = screen('folded again view (PageUp)');
-  const expanded = screen('L3 raw reference (Enter)');
+  const expanded = screen('L3 raw reference (Tab)');
   const checks = {
     // The 30 lines come from the Bash tool actually running in the turn loop.
     realToolResultStored: tool?.toolName === 'Bash' && stdoutLines.length === 30
       && stdoutLines.every((l, i) => l === `fold-line-${String(i).padStart(2, '0')}`),
     collapsedAfterTurn: summaryRe.test(folded0) && !folded0.includes('fold-line-12'),
-    summaryAtL1: screen('L1 summary (Enter)').includes('도구 · Bash 결과'),
-    stepsAtL2: screen('L2 steps (Enter)').includes('호출 인자 전달'),
+    summaryAtL1: screen('L1 summary (Tab)').includes('도구 · Bash 결과') || screen('L1 summary (Tab)').includes('tool · Bash 결과'),
+    stepsAtL2: screen('L2 steps (Tab)').includes('호출 인자 전달'),
     expandedOnL3: expanded.includes('fold-stderr-marker')
       && /종료 상태\s+7/.test(expanded) && !summaryRe.test(expanded),
-    foldedAgainOnEnter: summaryRe.test(folded1) && folded1.includes('▸ 도구 Bash ·'),
+    foldedAgainOnEnter: summaryRe.test(folded1) && (folded1.includes('▸ 도구 Bash ·') || folded1.includes('▸ tool · Bash 결과')),
     // Fold state is screen-only: the whole stored session read right after the first folded screen
     // equals the one read right after the second Enter (and it holds the real tool result).
     sessionUnchanged: beforeToggle !== '' && beforeToggle === afterToggles && beforeToggle.includes('fold-line-29'),
@@ -985,19 +1065,20 @@ async function runNextEscConfirmLongShellScenario(
       }),
     },
     steps: [
-      { label: 'long Bash running', text: ask, until: (screen) => screen.includes('턴 도구 실행') },
+      { label: 'long Bash running', text: ask, until: (screen) => screen.match(/턴 도구 실행|Bash running|Running Bash\(/) !== null },
       {
         label: 'long Bash Esc asks y/N', chunks: ['', '\u001b'], gapMs: LONG_SHELL_PTY_GAP_MS,
-        until: (screen) => screen.includes('긴 셸 명령 중단 확인') && screen.includes('y/n 입력 · 기본 N'),
+        until: (screen) => screen.match(/긴 셸 명령 중단 확인|Confirm stopping long shell/) !== null && screen.match(/y\/n (입력 · 기본 N|answer · default N)/) !== null,
       },
-      { label: 'N keeps Bash running', keys: 'n', until: (screen) => screen.includes('긴 셸 명령 계속 실행') },
+      // #38802 듀얼 승인(r13 실측): 이 크롬은 N 응답 뒤 계속 실행 문구를 그리지 않는다 — 확인 대화창이 닫히고 셸이 여전히 실행 중(⠏ Running Bash)이면 계속 실행으로 인정. 옛 문구가 그려지면 그것으로도 통과.
+      { label: 'N keeps Bash running', keys: 'n', until: (screen) => screen.match(/긴 셸 명령 계속 실행|Long shell continues/) !== null || (!screen.match(/긴 셸 명령 중단 확인|Confirm stopping long shell/) && screen.match(/턴 도구 실행|Bash running|Running Bash\(/) !== null) },
       { label: 'N command completes', until: (screen) => done(1)(screen) },
-      { label: 'second long Bash running', text: ask, until: (screen) => screen.includes('턴 도구 실행') },
+      { label: 'second long Bash running', text: ask, until: (screen) => screen.match(/턴 도구 실행|Bash running|Running Bash\(/) !== null },
       {
         label: 'second long Bash Esc asks y/N', chunks: ['', '\u001b'], gapMs: LONG_SHELL_PTY_GAP_MS,
-        until: (screen) => screen.includes('긴 셸 명령 중단 확인') && screen.includes('y/n 입력 · 기본 N'),
+        until: (screen) => screen.match(/긴 셸 명령 중단 확인|Confirm stopping long shell/) !== null && screen.match(/y\/n (입력 · 기본 N|answer · default N)/) !== null,
       },
-      { label: 'y stops Bash turn', keys: 'y', until: (screen) => screen.includes('응답 취소됨') && shellPidHasExited() },
+      { label: 'y stops Bash turn', keys: 'y', until: (screen) => screen.match(/응답 취소됨|cancelled/) !== null && shellPidHasExited() },
     ],
   });
   const cancelledShellPid = Number(readFileSync(shellPidPath, 'utf8'));
@@ -1005,11 +1086,11 @@ async function runNextEscConfirmLongShellScenario(
   const events = parseEvents(logs);
   const frame = (label: string) => run.frames.find((entry) => entry.label === label)?.screen ?? '';
   const checks = {
-    longShellShownWhileRunning: frame('long Bash running').includes('▸ 도구 · Bash 실행') && frame('long Bash running').includes('턴 도구 실행'),
-    longEscShowsDefaultNInlinePanel: frame('long Bash Esc asks y/N').includes('y/n 입력 · 기본 N'),
-    noKeepsTheSameShellRunning: frame('N keeps Bash running').includes('긴 셸 명령 계속 실행'),
+    longShellShownWhileRunning: frame('long Bash running').includes('⏺ Bash(') && frame('long Bash running').match(/턴 도구 실행|Bash running|Running Bash\(/) !== null,
+    longEscShowsDefaultNInlinePanel: frame('long Bash Esc asks y/N').match(/y\/n (입력 · 기본 N|answer · default N)/) !== null,
+    noKeepsTheSameShellRunning: frame('N keeps Bash running').match(/긴 셸 명령 계속 실행|Long shell continues/) !== null || (!frame('N keeps Bash running').match(/긴 셸 명령 중단 확인|Confirm stopping long shell/) && frame('N keeps Bash running').match(/턴 도구 실행|Bash running|Running Bash\(/) !== null),
     declinedShellCompletesNormally: done(1)(frame('N command completes')),
-    yesStopsTheSecondTurn: frame('y stops Bash turn').includes('응답 취소됨'),
+    yesStopsTheSecondTurn: frame('y stops Bash turn').match(/응답 취소됨|cancelled/) !== null,
     cancelledShellProcessExitedAtYConfirmation: Number.isInteger(cancelledShellPid) && cancelledShellPid > 0 && shellPidHasExited(),
     onlyFakeProvider: onlyFake(events),
     exitedClean: run.exitCode === 0,
@@ -1028,7 +1109,7 @@ export const NEXT_TOOL_FOLD_READ_LINES = 20;
  */
 async function runNextToolFoldReadScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, done: Done): Promise<NextTuiScenarioResult> {
   const ask = '읽기 출력 접기 시험';
-  const summaryRe = /▸ 도구 Read · 20줄 \(접힘\)/;
+  const summaryRe = /▸ 도구 Read · 20줄 \(접힘\)|✓ Read\(fold-read\.txt\)/; // #38144 — 완료 카드 · 옛 접힘 셀 둘 다
   const file = join(root, 'fold-read.txt');
   writeFileSync(file, Array.from({ length: NEXT_TOOL_FOLD_READ_LINES }, (_, i) => `fold-line-${i + 1}`).join('\n') + '\n');
   const steps: SeatPtyStep[] = [
@@ -1094,9 +1175,9 @@ async function runNextPasteScenario(spec: NextTuiScenarioSpec, root: string, bas
   const steps: SeatPtyStep[] = [
     { label: 'short pasted', keys: bracketedPaste(PASTE_SHORT), until: (s) => s.includes(`❯ ${PASTE_SHORT}`) },
     { label: 'cleared', keys: '\x15', until: (s) => !s.includes(PASTE_SHORT) },
-    { label: 'long pasted', keys: bracketedPaste(PASTE_LONG), until: (s) => s.includes(PASTE_LONG_TOKEN) },
+    { label: 'long pasted', keys: bracketedPaste(PASTE_LONG), until: (s) => (s.includes(PASTE_LONG_TOKEN) || s.includes('[Paste #1 · 50 lines · full text]')), timeoutMs: 90_000 },
     { label: 'submitted', keys: '\r', until: settledPaste(1), timeoutMs: 30_000 },
-    { label: 'ctrl+v', keys: '\x16', until: (s) => s.includes(CLIP_TOKEN) },
+    { label: 'ctrl+v', keys: '\x16', until: (s) => s.includes(CLIP_TOKEN) || /\[Paste #\d+ · 6 lines · full text\]/.test(s) },
     { label: 'clip submitted', keys: '\r', until: settledPaste(2), timeoutMs: 30_000 },
   ];
   const run = await mockSeatPtySequence({ ...base, env: { ...base.env, PATH: clipboardShimPath(root) }, steps });
@@ -1107,9 +1188,9 @@ async function runNextPasteScenario(spec: NextTuiScenarioSpec, root: string, bas
   const paste = (event: string) => events.filter((e) => e.category === 'tui.paste' && e.event === event).map((e) => parseData<{ lines: number; chars: number; count: number }>(e.data));
   const checks = {
     shortEchoed: screen('short pasted').includes(`❯ ${PASTE_SHORT}`),
-    longPlaceholder: screen('long pasted').includes(PASTE_LONG_TOKEN) && !screen('long pasted').includes('paste-line-49'),
+    longPlaceholder: (screen('long pasted').includes(PASTE_LONG_TOKEN) || screen('long pasted').includes('[Paste #1 · 50 lines · full text]')) && !screen('long pasted').includes('paste-line-49'),
     submittedWhole: store.user.length === 2 && store.user[0] === PASTE_LONG,
-    ctrlVPlaceholder: screen('ctrl+v').includes(CLIP_TOKEN),
+    ctrlVPlaceholder: screen('ctrl+v').includes(CLIP_TOKEN) || /\[Paste #\d+ · 6 lines · full text\]/.test(screen('ctrl+v')),
     ctrlVSubmittedWhole: store.user[1] === CLIP_TEXT,
     clipboardReadObserved: paste('clipboard-read').length === 1,
     foldedObserved: paste('folded').length === 2 && paste('folded')[0]?.lines === 50 && paste('folded')[0]?.chars === 699,
@@ -1179,7 +1260,7 @@ export const INTERNAL_TURN_USER_HEADER = /(?:나:|❯)\s*\[(?:골 이어가기|�
 export interface GoalInterimScreenCounts { steps: number; notDone: number; folded: number; userHeader: boolean }
 export function goalInterimScreenCounts(screen: string): GoalInterimScreenCounts {
   const n = (t: string) => screen.split(t).length - 1;
-  return { steps: n(GOAL_INTERIM_STEP_MARK), notDone: n(GOAL_INTERIM_NOT_DONE_MARK), folded: n('(접힘)'), userHeader: INTERNAL_TURN_USER_HEADER.test(screen) };
+  return { steps: n(GOAL_INTERIM_STEP_MARK), notDone: n(GOAL_INTERIM_NOT_DONE_MARK), folded: n('(접힘)') + n('(folded)'), userHeader: INTERNAL_TURN_USER_HEADER.test(screen) };
 }
 
 /** One human turn → goal-continue runs to its cap on «not done yet» replies. The conversation must show

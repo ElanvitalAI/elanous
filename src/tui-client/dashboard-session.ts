@@ -39,7 +39,7 @@ import {
   type ToolCallUpdate,
 } from '@agentclientprotocol/sdk';
 
-import { runAcpServer, type AcpServerOptions } from '../acp/server.js';
+import { runAcpServer, WEBTERM_EXT_METHOD_ALLOWLIST, type AcpServerOptions } from '../acp/server.js';
 import {
   bridgeCoreTurnToAcp,
   type CoreTurnBridgeDeps,
@@ -219,6 +219,7 @@ export class DashboardSession {
     });
 
     const serverPromise = runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
       transportFactory: pair.transportFactory,
       shutdownSignal: shutdownCtrl.signal,
       runTurn,

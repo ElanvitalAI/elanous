@@ -9,7 +9,7 @@ export interface AcpPanePeer {
 }
 
 export function createAcpPaneSessions(createPeer: (pane: string) => AcpPanePeer) {
-  const panes = new Map<string, { ready: Promise<{ peer: AcpPanePeer; session: string }>; closing?: Promise<void> }>();
+  const panes = new Map<string, { ready: Promise<{ peer: AcpPanePeer; session: string }>; closing?: Promise<void>; closeFailed?: boolean }>();
   return {
     async open(pane: string): Promise<void> {
       if (panes.has(pane)) throw new Error('pane already open');
@@ -23,7 +23,7 @@ export function createAcpPaneSessions(createPeer: (pane: string) => AcpPanePeer)
           throw error;
         }
       })();
-      const entry = { ready, closing: undefined as Promise<void> | undefined };
+      const entry = { ready, closing: undefined as Promise<void> | undefined, closeFailed: false };
       panes.set(pane, entry);
       try { await ready; } catch (error) {
         if (panes.get(pane) === entry && !entry.closing) panes.delete(pane);
@@ -32,11 +32,11 @@ export function createAcpPaneSessions(createPeer: (pane: string) => AcpPanePeer)
     },
     async prompt(pane: string, text: string, update: (value: SessionUpdate) => void) {
       const entry = panes.get(pane);
-      if (!entry || entry.closing) throw new Error('pane is not open');
+      if (!entry || entry.closing || entry.closeFailed) throw new Error('pane is not open');
       const { peer, session } = await entry.ready;
-      if (entry.closing) throw new Error('pane is not open');
+      if (entry.closing || entry.closeFailed) throw new Error('pane is not open');
       return peer.prompt(session, [{ type: 'text', text }], value => {
-        if (!entry.closing && panes.get(pane) === entry) update(value);
+        if (!entry.closing && !entry.closeFailed && panes.get(pane) === entry) update(value);
       });
     },
     async close(pane: string): Promise<void> {
@@ -44,15 +44,16 @@ export function createAcpPaneSessions(createPeer: (pane: string) => AcpPanePeer)
       if (!entry) return;
       if (!entry.closing) {
         entry.closing = (async () => {
-          try {
-            const opened = await entry.ready.catch(() => null);
-            if (opened) await opened.peer.stop();
-          } finally {
-            if (panes.get(pane) === entry) panes.delete(pane);
-          }
+          const opened = await entry.ready.catch(() => null);
+          if (opened) await opened.peer.stop();
+          if (panes.get(pane) === entry) panes.delete(pane);
         })();
       }
-      await entry.closing;
+      try { await entry.closing; } catch (error) {
+        entry.closeFailed = true;
+        entry.closing = undefined;
+        throw error;
+      }
     },
   };
 }

@@ -108,6 +108,10 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     method: 'GET', match: 'exact', path: '/v1/members/home', selfVerified: true,
     why: 'member home verifies the revocable HttpOnly member-session cookie before rendering private profile data',
   },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/webchat-handoff', selfVerified: true,
+    why: 'webchat handoff issuance verifies the revocable HttpOnly member-session cookie before issuing a one-use bound token',
+  },
   { method: 'GET', match: 'exact', path: '/v1/members/secret-backups', selfVerified: true,
     why: 'E2E ciphertext listing derives owner from the revocable member session' },
   { method: 'POST', match: 'exact', path: '/v1/members/secret-backups', selfVerified: true,

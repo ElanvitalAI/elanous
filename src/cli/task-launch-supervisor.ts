@@ -110,6 +110,19 @@ export async function retainLaunchFailureEvidence(scratchDirectory: string, code
               },
             },
           });
+    // A child may have already written a stop. Keep the single-stop invariant while
+    // recording this supervisor observation for the card-binding race.
+    appendRunLedgerEntryChecked(runId, (entries) =>
+      (entries ?? []).some((entry) => entry.event === 'launch-failed-supervisor')
+        ? { append: false, result: false }
+        : { append: true, entry: { timestamp: new Date().toISOString(), runId,
+            event: 'launch-failed-supervisor', data: { cause } } });
+    const cardId = process.env.ELANOUS_TASK_CARD_ID;
+    const statePath = process.env.ELANOUS_TASK_STATE_PATH;
+    if (cardId && statePath) {
+      const { reconcileLateLaunchFailure } = await import('../task-agent/late-launch-failure.js');
+      reconcileLateLaunchFailure(statePath, cardId, runId);
+    }
   } catch { /* fail-soft: retention never masks the child exit code */ }
 }
 

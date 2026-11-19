@@ -53,7 +53,7 @@ interface ReconcileCleanupFinding {
   resourcePresent?: boolean;
 }
 
-interface ReconcileCleanupResult {
+export interface ReconcileCleanupResult {
   mode: 'dry-run' | 'cleanup';
   candidates: Array<{ id: string; host: string; expectedLeaseHeartbeatAt: string; expectedLeaseExpiresAtMs: number; observedAtMs: number }>;
   reaped: Array<{ id: string; host: string }>;

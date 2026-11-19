@@ -158,7 +158,6 @@ body-dynamic-import	test/session-p4-render.test.ts	5
 body-dynamic-import	test/session-p5-search-rank.test.ts	9
 body-dynamic-import	test/session-p6-deeplink.test.ts	7
 body-dynamic-import	test/session-start-default-new.test.ts	2
-body-dynamic-import	test/sidebar-tab-surface.test.ts	1
 body-dynamic-import	test/skill-tool-agent.test.ts	6
 body-dynamic-import	test/skill-tool-api-call.test.ts	1
 body-dynamic-import	test/skill-tool-edit.test.ts	1
@@ -177,10 +176,9 @@ body-dynamic-import	test/test-state-dir-flag.test.ts	2
 body-dynamic-import	test/tool-hints-coding-intent.test.ts	1
 body-dynamic-import	test/tui-attach-daemon.test.ts	1
 body-dynamic-import	test/ui-modal-adapter.test.ts	1
-body-dynamic-import	test/ui-widgets-lc10.test.ts	2
-body-dynamic-import	test/widget-host.snapshot-describe.test.ts	12
-body-dynamic-import	test/widget-host.state-change.test.ts	13
-body-dynamic-import	test/widget-host.wr3-z-replay.test.ts	3
+body-dynamic-import	test/widget-host.snapshot-describe.test.ts	11
+body-dynamic-import	test/widget-host.state-change.test.ts	12
+body-dynamic-import	test/widget-host.wr3-z-replay.test.ts	2
 body-dynamic-import	test/workflow-runtime-daemon-trigger-gating.test.ts	1
 chdir-without-restore	plugins/doc-draft/graphs/run-step.test.ts	1
 chdir-without-restore	src/agent-mission/driver-workdir.test.ts	2

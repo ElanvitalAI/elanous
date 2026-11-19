@@ -356,6 +356,11 @@ export interface SerializedMessage {
   turn_id?: TurnUri;
   /** MSG-SOURCE-HIERARCHY: who sent this user-role message (absent = human). */
   from?: MessageSource;
+  /** Generated turn-interruption marker row (runTurn abort path). Provenance flag:
+   *  marker detection keys on this field — never on text — so a human message whose
+   *  string happens to equal a marker cannot hide the prior answer or failure card.
+   *  Survives appendMessage spread, JSONL round-trips and compaction verbatim replay. */
+  interruptionMarker?: boolean;
 }
 
 /** Flatten LLM content for JSONL. Named tool-use keeps the live SSE wording (`🔧 <name>`);

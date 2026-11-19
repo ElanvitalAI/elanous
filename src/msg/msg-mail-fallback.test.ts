@@ -196,3 +196,17 @@ test('MAIL-SOURCE-AND-FALLBACK: one ledger draws the agent line, knocks once wit
     expect(mailReceived(after, posted.id, 'HAND-X')).toBe(true);
   } finally { after.close(); }
 });
+
+test('ELS one-shot retry records delivered only after a verified turn opens', async () => {
+  const path = ledger();
+  const writer = new MsgStore(path);
+  const posted = writer.post({ from: 'OP', to: 'HAND-X', body: 'hello' });
+  writer.close();
+  const deps = { openStore: () => new MsgStore(path), sleep: async () => {},
+    wake: async () => ({ wake: 'els', target: 'els:w1/t1/p1', result: 'injected' }) };
+  expect(await runMailFallback({ messageId: posted.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('knocked');
+  expect(await runMailFallback({ messageId: posted.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('received');
+  const reader = new MsgStore(path);
+  try { expect(reader.listReceipts({ messageId: posted.id }).map(row => row.state)).toEqual(['posted', 'delivered']); }
+  finally { reader.close(); }
+});

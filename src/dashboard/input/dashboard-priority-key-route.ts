@@ -28,15 +28,11 @@ function trace(step: string, key: Key, claimed: boolean | string): void {
 }
 
 export interface DashboardPriorityKeyRouteDeps<Action> {
-  /** Classic-dashboard Ctrl+\\ is a recoverable guidance action, not
-   *  a process quit. Claim it before the global force-quit matcher. */
-  routeClassicSigquitChord?: (key: Key) => boolean;
   /** Step 0 — global force-quit chord that fires from ANYWHERE,
    *  including inside popup terminals + bell modal + dashboard
    *  scenes. Plain Ctrl+Q has too many child-app bindings (e.g.
    *  emacs quoted-insert), so Ctrl+Shift+Q is the force-quit escape
-   *  hatch. Ctrl+\\ is reserved by the classic dashboard for guidance.
-   *  Returns true when the matcher
+   *  hatch. Returns true when the matcher
    *  fires; the route then short-circuits to `{type:'quit'}`
    *  regardless of any other state. */
   isForceQuitChord: (key: Key) => boolean;
@@ -59,8 +55,7 @@ export async function routeDashboardPriorityKey<Action>(
   deps: DashboardPriorityKeyRouteDeps<Action>,
 ): Promise<DashboardPriorityKeyRouteResult> {
   // Step 0: global force-quit. Wins over EVERYTHING — bell modal,
-  // popup terminal, drag interceptors. Bound to Ctrl+Shift+Q;
-  // Ctrl+\\ has already been claimed by the classic guidance route.
+  // popup terminal, drag interceptors. Bound to Ctrl+Shift+Q.
   // This preserves the
   // "elanous escape hatch" concept the user explicitly wanted to keep:
   //   "ctrl+q 전체 강제 종료 컨셉은 남았으면 좋겠습니다.
@@ -74,11 +69,6 @@ export async function routeDashboardPriorityKey<Action>(
   // micro-cost when disabled).
   const tracing = debug.isKeyTraceEnabled();
   if (tracing) trace('begin', key, 'pending');
-
-  if (deps.routeClassicSigquitChord?.(key)) {
-    if (tracing) trace('routeClassicSigquitChord', key, true);
-    return { type: 'handled' };
-  }
 
   if (deps.isForceQuitChord(key)) {
     if (tracing) trace('isForceQuitChord', key, 'quit');

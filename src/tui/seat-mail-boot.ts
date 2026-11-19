@@ -15,6 +15,7 @@ import {
   type TaskRequest,
 } from '../dashboard/input/seat-task-decompose.js';
 import type { Message, MsgStore } from '../msg/msg-store.js';
+import { recordReceiptClock } from '../hq/msg-receipt-clock-sink.js';
 import { outcomeOfPlanWire, type PlanWire } from '../code-edit/plan-wire.js';
 import type { ReceiptInput, ReceiptRecordOutcome } from '../msg/msg-receipts.js';
 import { headerFieldsOf, seatMessageContextBlock, type StructuredMessageFields } from '../msg/msg-context-header.js';
@@ -89,7 +90,7 @@ export function readSeatMailSnapshot(
 }
 
 export function seatMailLine(snapshot: SeatMailSnapshot | null): string | null {
-  return snapshot ? `${snapshot.seat} · 우편 ${snapshot.unread ?? '확인 불가'}` : null;
+  return snapshot ? `${snapshot.seat} · 우편 ${snapshot.unread ?? '확인 불가'}${snapshot.unread !== null && snapshot.unread > 100 ? ' ⚠ 100건 초과' : ''}` : null;
 }
 
 // ── ELN-SEAT-INBOX-TURN-BOUNDARY — 턴 경계 우편 자동 수신 ───────────────────────────
@@ -110,6 +111,7 @@ export interface SeatMailInboxStore {
    * 끝난 경계(기존 «처리 뒤 ack» 시점). 없으면(옛 가짜 원장) 영수증 없이 지금 동작 그대로.
    */
   recordReceipt?(input: ReceiptInput): ReceiptRecordOutcome;
+  db?: MsgStore['db'];
   close(): void;
 }
 
@@ -120,6 +122,9 @@ export interface SeatMailInboxDeps {
   openStore?: (path: string) => SeatMailInboxStore;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   defer?: (fn: () => void, ms: number) => void;
+  /** §2b 박동(선택) — 주입한 경우에만 alive beat를 30초마다 쓴다. 주입 없으면 파일 시스템에 아무 것도 쓰지 않는다(기존 시험 오염 방지). */
+  /** §2b inbox heartbeat — alivePath/host · 세션 id 공급(OP #93799): sessionId 정적 값 또는 getSessionId 지연 공급원. */
+  heartbeat?: { alivePath?: string; host?: string; intervalMs?: number; sessionId?: string; getSessionId?: () => (string | null) };
 }
 
 export interface SeatMailInboxController {
@@ -155,6 +160,20 @@ export function createSeatMailInbox(deps: SeatMailInboxDeps): SeatMailInboxContr
   });
   let armed = false;
   const pendingAck = new Set<number>();
+  // §2b 박동(선택) — 주입 없으면 파일 시스템에 아무 것도 쓰지 않는다. 실패는 fail-soft(인박스 부재로 부팅이 막히지 않게).
+  const hb = (() => {
+    if (!deps.heartbeat) return null;
+    try {
+      const { startInboxHeartbeat } = require('../loops/inbox-liveness.js') as typeof import('../loops/inbox-liveness.js');
+      const path = deps.heartbeat.alivePath;
+      if (!path) return null;
+      return startInboxHeartbeat(path, { pid: process.pid, host: deps.heartbeat.host ?? 'unknown', sessionId: deps.heartbeat.sessionId ?? '' }, {
+        ...(deps.heartbeat.intervalMs !== undefined ? { intervalMs: deps.heartbeat.intervalMs } : {}),
+        ...(deps.heartbeat.getSessionId ? { getSessionId: deps.heartbeat.getSessionId } : {}),
+        ...(deps.log ? { log: (event, data) => log('tui.seat-mail-inbox', event, data ?? {}) } : {}),
+      });
+    } catch { return null; }
+  })();
 
   const check: SeatMailInboxController['check'] = () => {
     if (!armed) return { delivered: false, count: 0 };
@@ -191,6 +210,7 @@ export function createSeatMailInbox(deps: SeatMailInboxDeps): SeatMailInboxContr
       for (const m of batch) {
         pendingAck.add(m.id);
         tryReceipt(store, { messageId: m.id, recipient: deps.seat, state: 'delivered', source: 'dashboard-inbox' }, log);
+        if (store.db) recordReceiptClock(store.db, { messageId: m.id, recipient: deps.seat, event: 'started', eventId: result.turnId });
       }
       log('tui.seat-mail-inbox', 'delivered', { seat: deps.seat, count: batch.length, maxId, turnId: result.turnId });
       return { delivered: true, count: batch.length };
@@ -200,7 +220,7 @@ export function createSeatMailInbox(deps: SeatMailInboxDeps): SeatMailInboxContr
   return {
     noteTurnEnded() { armed = true; defer(() => { try { check(); } catch { /* fail-soft */ } }, 0); },
     check,
-    stop() { /* 원격 구독 경로 제거(mustFix ②) — 정리할 자원 없음 */ },
+    stop() { try { hb?.stop(); } catch { /* fail-soft */ } /* 원격 구독 경로 제거(mustFix ②) */ },
   };
 }
 
@@ -564,10 +584,19 @@ export function createSeatPlanTurnLink(runtime: SeatPlanRuntime) {
  * `syncPlan` retracts the notice of an item that closed before its turn started; a notice already delivered cannot be retracted.
  */
 export function seatTaskQueueFromPromptQueue(
-  promptQueue: { enqueueNotice(text: string, source: 'seat-mail'): { id: string }; cancel(id: string, reason?: string): unknown },
+  promptQueue: { enqueueNotice(text: string, source: 'seat-mail'): { id: string }; cancel(id: string, reason?: string): unknown;
+    onTransition?: (listener: (item: { id: string; status: string }) => void) => () => void },
+  onStarted?: (messageId: number, itemId: string) => void,
 ): SeatPlanQueuePort {
   const noticeOf = new Map<string, string>();
   const enqueued = new Map<string, SeatPlanItem>();
+  promptQueue.onTransition?.(item => {
+    if (item.status !== 'delivered') return;
+    const taskId = [...noticeOf].find(([, id]) => id === item.id)?.[0];
+    const source = taskId === undefined ? undefined : enqueued.get(taskId)?.sourceRequestId;
+    const id = /^mail#([1-9]\d*)$/.exec(source ?? '')?.[1];
+    if (id) onStarted?.(Number(id), item.id);
+  });
   return {
     enqueue: task => {
       if (noticeOf.has(task.id)) return;

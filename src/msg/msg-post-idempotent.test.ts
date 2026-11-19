@@ -378,3 +378,71 @@ test('r3 MF2: --origin-key + a lock before the write + the key stored for the SA
   expect(c.stdout[0]).toMatch(/^#1 \S+ OP → MK · 9 bytes$/);
   expect(rows(path).map(row => row.id)).toEqual([1]);
 });
+
+test('SEAT-MAIL #16: no origin-key, same body twice → 1 row, counter 2 on the first row, reason returned and printed', async () => {
+  const dir = tempDir();
+  const path = join(dir, 'messages.db');
+  const c = cli(dir, () => new MsgStore(path));
+  await c.run('--from', 'JUD', '--to', 'OP', '--body', 'gate 🟢 +0');
+  await c.run('--from', 'JUD', '--to', 'OP', '--body', '  gate 🟢   +0 ');
+  expect(c.exits).toEqual([]);
+  expect(rows(path).map(row => row.id)).toEqual([1]);
+  expect(c.stdout[1]).toContain('suppressed as repeat of #1 (×2 · same sender/body/evidence sha/meta within 30 min · no new row)');
+  const db = new Database(path, { readonly: true });
+  try {
+    const row = db.query('SELECT repeat_count, last_repeat_at FROM msg_messages WHERE id = 1').get() as { repeat_count: number; last_repeat_at: string | null };
+    expect(row.repeat_count).toBe(2);
+    expect(typeof row.last_repeat_at).toBe('string');
+  } finally { db.close(); }
+  const store = new MsgStore(path);
+  try {
+    const third = store.post({ from: 'JUD', to: 'OP', body: 'gate 🟢 +0' }, { dedupe: true });
+    expect([third.id, third.deduped, third.repeatCount]).toEqual([1, true, 3]);
+    expect(third.repeatReason).toBe('repeat of #1 (×3 · same sender/body/evidence sha/meta within 30 min · no new row)');
+  } finally { store.close(); }
+});
+
+test('SEAT-MAIL #16: no origin-key, a different evidence sha in refs → 2 rows', () => {
+  const dir = tempDir();
+  const path = join(dir, 'messages.db');
+  const store = new MsgStore(path);
+  try {
+    const a = store.post({ from: 'JUD', to: 'OP', body: 'landed', refs: ['build:abcdef1'] }, { dedupe: true });
+    const b = store.post({ from: 'JUD', to: 'OP', body: 'landed', refs: ['build:1234567'] }, { dedupe: true });
+    expect([a.id, b.id]).toEqual([1, 2]);
+    expect(b.deduped).toBe(undefined);
+  } finally { store.close(); }
+  expect(rows(path).map(row => row.id)).toEqual([1, 2]);
+});
+
+test('SEAT-MAIL #16: no origin-key, a different replyTo → 2 rows', () => {
+  const dir = tempDir();
+  const path = join(dir, 'messages.db');
+  const store = new MsgStore(path);
+  try {
+    store.post({ from: 'OP', to: 'JUD', body: 'q1' });
+    store.post({ from: 'OP', to: 'JUD', body: 'q2' });
+    const a = store.post({ from: 'JUD', to: 'OP', body: 'ok', replyTo: 1 }, { dedupe: true });
+    const b = store.post({ from: 'JUD', to: 'OP', body: 'ok', replyTo: 2 }, { dedupe: true });
+    expect([a.id, b.id]).toEqual([3, 4]);
+  } finally { store.close(); }
+  expect(rows(path).map(row => row.id)).toEqual([1, 2, 3, 4]);
+});
+
+test('SEAT-MAIL #16: an unset window is 30 minutes — 29 min apart is suppressed, 31 min apart is a new row', () => {
+  const dir = tempDir();
+  const path = join(dir, 'messages.db');
+  const saved = process.env.ELANOUS_MSG_DEDUPE_WINDOW_MS;
+  delete process.env.ELANOUS_MSG_DEDUPE_WINDOW_MS;
+  const store = new MsgStore(path);
+  try {
+    store.post({ from: 'JUD', to: 'OP', body: 'report' }, { dedupe: true });
+    store.db.query('UPDATE msg_messages SET created_at = ? WHERE id = 1').run(new Date(Date.now() - 29 * 60_000).toISOString());
+    expect(store.post({ from: 'JUD', to: 'OP', body: 'report' }, { dedupe: true }).id).toBe(1);
+    store.db.query('UPDATE msg_messages SET created_at = ? WHERE id = 1').run(new Date(Date.now() - 31 * 60_000).toISOString());
+    expect(store.post({ from: 'JUD', to: 'OP', body: 'report' }, { dedupe: true }).id).toBe(2);
+  } finally {
+    store.close();
+    if (saved === undefined) delete process.env.ELANOUS_MSG_DEDUPE_WINDOW_MS; else process.env.ELANOUS_MSG_DEDUPE_WINDOW_MS = saved;
+  }
+});

@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createSeatMailInbox, formatSeatMailPrompt, type SeatMailInboxStore, type SeatMailItem } from './seat-mail-boot.js';
 
 /** 인메모리 가짜 원장 — listByRecipient(after) 는 cursor 초과만, advanceCursor 단조 위반 throw 재현. */
@@ -209,5 +212,61 @@ describe('createSeatMailInbox — 턴 경계 자동 수신', () => {
     expect(receipts.map(r => r.state)).toEqual(['delivered', 'seen']);
     expect(store.acked).toEqual([{ recipient: 'OPC', id: 50, status: 'acked' }]);
     inbox.stop();
+  });
+});
+
+describe('createSeatMailInbox — §2b 박동(heartbeat) 배선', () => {
+  test('① 주입 heartbeat: alivePath에 JSON beat 즉시 1회 기록(pid·host·beatAt) + stop() no-throw', () => {
+    const store = new FakeStore();
+    const gate = { mode: [] as Gate[], calls: [] as Array<{ text: string }> };
+    const dir = mkdtempSync(join(tmpdir(), 'seat-inbox-hb-'));
+    const p = join(dir, 'inbox.alive');
+    try {
+      const inbox = createSeatMailInbox({ ...makeDeps(store, gate), heartbeat: { alivePath: p, host: 'h1', intervalMs: 60_000, sessionId: 'sess-t1' } });
+      const raw = readFileSync(p, 'utf8');
+      const beat = JSON.parse(raw) as { pid: number; host: string; sessionId: string; beatAt: string };
+      expect(beat.pid).toBe(process.pid);
+      expect(beat.host).toBe('h1');
+      expect(beat.sessionId).toBe('sess-t1');
+      expect(typeof beat.beatAt).toBe('string');
+      expect(() => { inbox.stop(); }).not.toThrow();
+      // stop 뒤 재기록 없음 — 60s interval이라 시험 중 반복은 없고, stop이 예외 없이 타이머를 정리한다.
+      expect(readFileSync(p, 'utf8')).toBe(raw);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('② 미주입: heartbeat 필드 없이도 생성·stop no-throw(회귀) — 파일 시스템에 아무 것도 쓰지 않는다', () => {
+    const store = new FakeStore();
+    const gate = { mode: [] as Gate[], calls: [] as Array<{ text: string }> };
+    const inbox = createSeatMailInbox(makeDeps(store, gate));
+    expect(inbox.check()).toEqual({ delivered: false, count: 0 });
+    expect(() => { inbox.stop(); }).not.toThrow();
+  });
+});
+
+describe('createSeatMailInbox — §2b 박동 sessionId 부재 방어(OP #93799)', () => {
+  test('③ getSessionId 가 빈 값을 주면 박동을 쓰지 않고 이유(no-session-id)를 기록한다', () => {
+    const store = new FakeStore();
+    const gate = { mode: [] as Gate[], calls: [] as Array<{ text: string }> };
+    const dir = mkdtempSync(join(tmpdir(), 'seat-inbox-hb-nosession-'));
+    const p = join(dir, 'inbox.alive');
+    const logged: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+    try {
+      const inbox = createSeatMailInbox({
+        ...makeDeps(store, gate),
+        log: (category, event, data) => { logged.push({ category, event, data }); },
+        heartbeat: { alivePath: p, host: 'h1', intervalMs: 60_000, getSessionId: () => null },
+      });
+      expect(existsSync(p)).toBe(false); // 빈 id로는 박동 파일이 생기지 않는다
+      const skip = logged.find(l => l.event === 'heartbeat-skipped-no-session-id');
+      expect(skip).toBeDefined();
+      expect(skip!.category).toBe('tui.seat-mail-inbox');
+      expect(skip!.data).toEqual({ reason: 'no-session-id', path: p, host: 'h1' });
+      expect(() => { inbox.stop(); }).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

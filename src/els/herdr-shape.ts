@@ -5,7 +5,7 @@
 import { parseAddress } from './address.js';
 
 interface ListedPane { address?: string; workspace?: string; tab?: string; pane?: string; title?: string; cwd?: string; state?: string;
-  host?: string; reach?: string; command?: string[] }
+  host?: string; reach?: string; command?: string[]; build?: unknown }
 interface ListedWorkspace { id?: string; name?: string; rootCwd?: string; host?: string }
 interface ListedTab { id?: string; workspaceId?: string; label?: string; focusPaneId?: string }
 interface Listed { hosts?: unknown; panes?: ListedPane[]; workspaces?: ListedWorkspace[]; tabs?: ListedTab[] }
@@ -19,7 +19,7 @@ export function herdrPanes(listed: Listed, workspace?: string): object {
   const panes = (listed.panes ?? [])
     .map((row) => ({ pane_id: row.pane ?? '', tab_id: row.tab ?? '', workspace_id: wsIdOf(row), workspace: row.workspace ?? '',
       title: row.title ?? '', cwd: row.cwd ?? '', state: row.state ?? '', host: row.host ?? '', reach: row.reach ?? '',
-      address: row.address ?? '' }))
+      address: row.address ?? '', build: row.build }))
     .filter((row) => !workspace || row.workspace_id === workspace || row.workspace === workspace);
   return { result: { panes } };
 }

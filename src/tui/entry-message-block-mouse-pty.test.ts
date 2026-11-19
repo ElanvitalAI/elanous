@@ -17,7 +17,7 @@ test('mouse clicks reach tool summary, steps and raw output then fold without an
     .map((name) => readFileSync(join(root, 'sessions', name), 'utf8')).join('\n');
   const atHeader = (condition: (screen: string) => boolean) => (screen: string): boolean => {
     if (!condition(screen)) return false;
-    row = screen.split('\n').findIndex((line) => /[▸▾] 도구 · Bash 결과/u.test(line)) + 1;
+    row = screen.split('\n').findIndex((line) => /[▸▾] (도구|tool) · Bash 결과/u.test(line)) + 1;
     return row > 0;
   };
   const click = () => `\x1b[<0;5;${row}M\x1b[<0;5;${row}m`;
@@ -35,22 +35,22 @@ test('mouse clicks reach tool summary, steps and raw output then fold without an
           command: "for n in $(seq 0 7); do printf 'mouse-line-%02d\\n' $n; done; printf 'mouse-stderr-marker\\n' >&2; exit 7",
         } }),
       },
-      ready: { label: 'boot', timeoutMs: TURN_WAIT_MS, until: (s) => s.includes('Enter 전송') && s.includes('❯ ') },
+      ready: { label: 'boot', timeoutMs: TURN_WAIT_MS, until: (s) => (s.includes('Enter 전송') || s.includes('Enter send')) && s.includes('❯ ') },
       steps: [
         { label: 'one real tool turn', timeoutMs: TURN_WAIT_MS, text: 'mouse tool details', until: (s) => {
-          if (!s.includes('턴 완료')) return false;
+          if (!(s.includes('턴 완료') || /Worked for \d+s · done/.test(s))) return false;
           before = transcript(); return true;
         } },
-        { label: 'explicit log view', timeoutMs: DETAIL_WAIT_MS, keys: '\x1b[5~\x1b[6~', until: atHeader((s) => s.includes('▸ 도구 · Bash 결과')) },
-        { label: 'click summary', timeoutMs: DETAIL_WAIT_MS, text: click, enter: false, until: atHeader((s) => s.includes('▾ 도구 · Bash 결과')) },
+        { label: 'explicit log view', timeoutMs: DETAIL_WAIT_MS, keys: '\x1b[5~\x1b[6~', until: atHeader((s) => s.includes('▸ 도구 · Bash 결과') || s.includes('▸ tool · Bash 결과')) },
+        { label: 'click summary', timeoutMs: DETAIL_WAIT_MS, text: click, enter: false, until: atHeader((s) => s.includes('▾ 도구 · Bash 결과') || s.includes('▾ tool · Bash 결과')) },
         { label: 'click steps', text: click, enter: false, timeoutMs: DETAIL_WAIT_MS,
           until: atHeader((s) => s.includes('호출 인자 전달') && s.includes('도구 결과 수신')) },
         { label: 'click raw reference', text: click, enter: false, timeoutMs: DETAIL_WAIT_MS,
           until: (s) => s.includes('mouse-line-07') && s.includes('mouse-stderr-marker') && s.includes('종료 상태') },
         { label: 'scroll expanded header into view', keys: '\x1b[5~\x1b[5~', timeoutMs: DETAIL_WAIT_MS,
-          until: atHeader((s) => s.includes('▾ 도구 · Bash 결과')) },
+          until: atHeader((s) => s.includes('▾ 도구 · Bash 결과') || s.includes('▾ tool · Bash 결과')) },
         { label: 'click folded again', text: click, enter: false, timeoutMs: DETAIL_WAIT_MS,
-          until: atHeader((s) => s.includes('▸ 도구 · Bash 결과') && !s.includes('mouse-stderr-marker')) },
+          until: atHeader((s) => (s.includes('▸ 도구 · Bash 결과') || s.includes('▸ tool · Bash 결과')) && !s.includes('mouse-stderr-marker')) },
       ],
     });
     const screen = (label: string) => run.frames.find((frame) => frame.label === label)?.screen ?? '';

@@ -71,7 +71,7 @@ function baseConfig(): UserConfig {
       bashApproval: 'dangerous',
     },
     chat: {
-      conciseness: { enabled: true, finalMessageMaxLines: 10, preambleMaxWords: 12, flatBullets: true },
+      conciseness: { enabled: true, finalMessageMaxLines: 10, preambleMaxWords: 12 },
       toolOutput: { persistOnOverflow: true, retentionDays: 7, previewLines: 20 },
       autoCompact: { enabled: true, triggerRatio: 0.85, preserveLastN: 4, partial: true },
       autoCopyQaToClipboard: false,

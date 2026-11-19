@@ -99,6 +99,17 @@ test('hitlQuestion shows control characters in the line instead of hiding them',
     .toContain('line "a\\tb"');
 });
 
+test('hitlQuestion masks secrets in the line (Bearer / env assign / ghp_ / URL creds / base64 blob / curl -u)', () => {
+  const q = hitlQuestion({ principal: { id: 'local:501', kind: 'cli' }, from: 'OP', action: 'do', target: shell, reason: 'x', text: 'curl -H "Authorization: Bearer AbCdEf1234567890123456789012345678901234" https://api -u alice:hunter2 AWS_SECRET_ACCESS_KEY=AbCdEf12//34567890123456789012345678901234567890123456789012345 && gh auth login --with-token ghp_16C114e46DfC29A11a3Fb1D8ADB06FE921B4E738' });
+  expect(q).toContain('Bearer ***');
+  expect(q).toContain('-u alice:****');
+  expect(q).toContain('AWS_SECRET_ACCESS_KEY=****');
+  expect(q).toContain('--with-token ****');
+  expect(q).not.toContain('AbCdEf1234567890123456789012345678901234');
+  expect(q).not.toContain('hunter2');
+  expect(q).not.toContain('ghp_16C114');
+});
+
 test('a remote address skips this host door and is handed to send unchanged', async () => {
   const dir = stateDir();
   const done: ElsResult = await controlledDo(deps(dir), 'other:HQ/t1/p9', 'echo hi');

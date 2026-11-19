@@ -27,6 +27,10 @@ async function runMessageCli(dbPath: string, hookStateDir: string, args: string[
     openStore: () => new MsgStore(dbPath),
     openReadStore: () => new MsgStore(dbPath, { readOnly: true }),
     hookStateDir,
+    // ⛔ 실 프로세스 stdin 상속 금지: hook 명령은 readStdin() 으로 stdin 을 읽는데,
+    // bun test 가 열린 stdin 을 물고 있으면 영구 블록돼 wakeRecipient 의 3000ms 레이스가
+    // 'timeout' 으로 지는 환경성 빨강이 생긴다(stdin EOF 러너에서만 초록).
+    readStdin: async () => '',
     out: { log: line => { output.push(String(line)); }, error: line => { throw new Error(line); } },
   });
   await program.parseAsync(['node', 'test', 'msg', ...args]);
@@ -117,6 +121,19 @@ test('routes pane/session and seat-pane addresses from a fake herdr pane census 
     { paneId: 'wT:p7', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
   ] });
   expect(duplicateRegisteredSeat).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
+});
+
+test('#23 registry pane present with agent_status=done is a live wake target; only an absent pane is dead', () => {
+  const readRegistry: WakeDeps['readRegistry'] = () => ({ status: 'ready', registry: { version: 1, seats: [
+    { address: 'RES-INFRA', host: 'local', target: 'wK:p3', wake: 'herdr', replyBody: 'agent', optIn: true },
+  ] } });
+  const deps = fixture({ readRegistry }).deps;
+  expect(resolveWake('RES-INFRA', { ...deps, listHerdrPanes: () => [{ paneId: 'wK:p3', status: 'done' }] }))
+    .toMatchObject({ wake: 'herdr', target: 'wK:p3', source: 'seat-registry' });
+  expect(resolveWake('pane:wK:p3', { ...deps, listHerdrPanes: () => [{ paneId: 'wK:p3', status: 'done' }] }))
+    .toMatchObject({ wake: 'herdr', target: 'wK:p3', source: 'herdr.pane' });
+  expect(resolveWake('RES-INFRA', { ...deps, listHerdrPanes: () => [{ paneId: 'wK:p9', status: 'idle' }] }))
+    .toMatchObject({ wake: 'none', source: 'unresolved', reason: 'dead-pane-address:candidates=0' });
 });
 
 test('registry herdr targets require one live matching census pane', () => {
@@ -240,6 +257,23 @@ test('replacing a registered pane revokes old wake consent unless fresh --wake i
   expect(resolveWake('MK', f.deps)).toMatchObject({ wake: 'herdr', target: 'wJ:p3', optIn: true });
 });
 
+test('a symlinked legacy pane index fails registration before the registry is written (#22 사후리뷰 · JUD-B must 1)', () => {
+  const seats = mkdtempSync(join(tmpdir(), 'msg-wake-panesymlink-'));
+  dirs.push(seats);
+  const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined, listPtys: () => [], readRegistry: undefined,
+    listHerdrPanes: () => [] });
+  const first = registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p1', host: 'local', enableWake: true }, f.deps);
+  const beforeRegistry = readFileSync(first.registryFile, 'utf8');
+  const paneIndex = join(seats, 'OP', 'tools', 'seat-panes.tsv');
+  const paneIndexTarget = join(seats, 'panes-target.tsv');
+  writeFileSync(paneIndexTarget, 'MK\twJ:p1\n');
+  rmSync(paneIndex);
+  symlinkSync(paneIndexTarget, paneIndex);
+  expect(() => registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p9', host: 'local', replace: true }, f.deps)).toThrow('seat pane directory must not be a symlink');
+  // 부분 커밋 금지: 실패 시 registry 는 이전 상태 그대로.
+  expect(readFileSync(first.registryFile, 'utf8')).toBe(beforeRegistry);
+});
+
 test('all registered addresses reach a pane consumer for ten messages per Codex, Claude, and remote route', async () => {
   const registered = Object.keys(SEAT_MESSAGE_ROUTES);
   expect(registered).toContain('NT-1');
@@ -358,9 +392,9 @@ test('herdr wake uses pane-list idle status before pane run, blocked waits, buil
   f.setPane('blocked');
   expect(await wakeRecipient('MK', 2, { from: 'OP' }, f.deps)).toMatchObject({ wake: 'herdr', result: 'busy', reason: 'agent_status=blocked' });
   f.setPane('done');
-  // Only idle is eligible; done is not treated as an empty input state.
-  expect(await wakeRecipient('MK', 3, { from: 'OP' }, f.deps)).toMatchObject({ result: 'busy', reason: 'agent_status=done' });
-  expect(f.herdr.map(([, line]) => line)).toEqual([wakeLine('OP', 'MK', 1)]);
+  // #23: herdr `done` = Idle ∧ seen=false — an empty input, injected like idle.
+  expect((await wakeRecipient('MK', 3, { from: 'OP' }, f.deps)).result).toBe('injected');
+  expect(f.herdr.map(([, line]) => line)).toEqual([wakeLine('OP', 'MK', 1), wakeLine('OP', 'MK', 3)]);
   // 자리 폴더가 대상을 정했으니 라벨은 묻지 않는다 — claude/codex pane 도 예전처럼 깨운다(not_elanous 로 막지 않음).
   const claude = fixture({}, { agent: 'claude' });
   expect((await wakeRecipient('MK', 4, { from: 'OP' }, claude.deps)).result).toBe('injected');
@@ -1039,4 +1073,56 @@ test('#38314 REVIEW ①④ — through wakeRecipient: a registered wake=none sea
   const placeholder = fixture({ readRegistry: registry([{ address: 'HAND-P', host: 'unknown', wake: 'none', replyBody: 'none', optIn: false }]), hasOptIn: () => false });
   expect((await wakeRecipient('HAND-P', 1, { from: 'OP' }, placeholder.deps)).result).toBe('no-wake');
   expect(placeholder.warned.at(-1)).toContain('받는 몸 모름: seat-registry 자리표시 줄 — host unknown · pane 없음');
+});
+
+test('registered opted-in unknown pane defers when full composer emptiness cannot be proven', async () => {
+  let opted = true; const pid = 42; const calls: string[] = []; const submissions: string[] = [];
+  const readRegistry: WakeDeps['readRegistry'] = () => ({ status: 'ready', registry: { version: 1, seats: [
+    { address: 'UNKNOWN-X', host: 'local', target: 'wJ:p1', wake: 'herdr', replyBody: 'agent', optIn: opted },
+  ] } });
+  const f = fixture({ readRegistry, listHerdrPanes: () => [{ paneId: 'wJ:p1', status: 'unknown' }], herdrRun: async argv => {
+    calls.push(argv[1]!);
+    const stdout = argv[1] === 'process-info' ? JSON.stringify({ result: { type: 'pane_process_info', process_info: { pane_id: 'wJ:p1', foreground_processes: [{ pid, name: 'eln', argv: ['eln'] }] } } })
+      : argv[1] === 'read' ? '❯ \n' : JSON.stringify({ result: { panes: [{ pane_id: 'wJ:p1', agent_status: 'unknown' }] } });
+    if (argv[1] === 'run') submissions.push(argv[3]!);
+    return { code: 0, stdout, stderr: '' };
+  } });
+  expect(await wakeRecipient('UNKNOWN-X', 1, { from: 'OP' }, f.deps)).toMatchObject({ result: 'wake-deferred', reason: 'pane-status-unknown:candidates=1' });
+  expect(calls).toEqual([]);
+  expect(submissions).toEqual([]);
+  expect(f.warned).toEqual(['깨움 보류 · 상태 unknown · 자동 재시도 없음(보낸 이가 직접 확인) (UNKNOWN-X · pane-status-unknown:candidates=1)']);
+  f.advance(WAKE_DEBOUNCE_MS); opted = false;
+  expect((await wakeRecipient('UNKNOWN-X', 2, { from: 'OP' }, f.deps)).result).not.toBe('injected');
+  expect(submissions).toHaveLength(0);
+});
+
+test('herdr re-resolution live to unknown defers and warns without submitting', async () => {
+  for (const address of ['MK', 'pane:wJ:p1']) {
+    let status = 'idle'; let lists = 0;
+    const f = fixture({ timeoutMs: 3000, listHerdrPanes: () => [
+      { paneId: 'wJ:p1', title: 'workspace | MK', cwd: '/tmp/seats/MK', status },
+    ] }, { wrap: run => async (argv, ms) => {
+      const result = await run(argv, ms);
+      if (argv[0] === 'pane' && argv[1] === 'list' && ++lists === 2) status = 'unknown';
+      return result;
+    } });
+    expect(await wakeRecipient(address, 1, { from: 'OP' }, f.deps)).toMatchObject({
+      result: 'wake-deferred', source: 'unresolved', reason: 'pane-status-unknown:candidates=1',
+    });
+    expect(lists).toBe(2);
+    expect(f.herdr).toEqual([]);
+    expect(f.warned).toEqual([`깨움 보류 · 상태 unknown · 자동 재시도 없음(보낸 이가 직접 확인) (${address} · pane-status-unknown:candidates=1)`]);
+  }
+});
+
+test('herdr agent_unknown overrides stale idle status and reports no automatic retry', async () => {
+  const calls: string[] = [];
+  const f = fixture({ herdrRun: async argv => {
+    calls.push(argv[1]!);
+    const agent = calls.length === 1 ? 'elanous' : 'unsupported';
+    return { code: 0, stdout: JSON.stringify({ result: { panes: [{ pane_id: 'wJ:p1', agent, agent_status: 'idle' }] } }), stderr: '' };
+  } });
+  expect(await wakeRecipient('MK', 1, { from: 'OP' }, f.deps)).toMatchObject({ result: 'busy', reason: 'agent_status=unknown' });
+  expect(calls).toEqual(['list', 'list']);
+  expect(f.warned).toEqual(['깨움 보류 · 상태 unknown · 자동 재시도 없음(보낸 이가 직접 확인) (MK · agent_status=unknown)']);
 });

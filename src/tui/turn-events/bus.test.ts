@@ -69,3 +69,19 @@ describe('turn event bus', () => {
     bus.ack(['a'], 'responded'); expect(bus.pending()).toEqual([]);
   });
 });
+
+test('bus records completed events once, leaving failed and cancelled events pending', () => {
+  const bus = createTurnEventBus({ backoffMs: () => 0 });
+  bus.publish(event('a', 'mail'));
+  bus.publish(event('b', 'watch'));
+  bus.take(2);
+  bus.ack(['a'], 'failed');
+  bus.ack(['b'], 'cancelled');
+  expect(bus.history()).toEqual({ rows: [], evicted: 0 });
+  expect(bus.pending().map(row => row.id)).toEqual(['a', 'b']);
+  bus.take(2);
+  bus.ack(['a'], 'responded');
+  bus.ack(['a'], 'responded');
+  expect(bus.history()).toEqual({ rows: [{ id: 'a', outcome: 'responded' }], evicted: 0 });
+  expect(bus.pending()).toEqual([]);
+});

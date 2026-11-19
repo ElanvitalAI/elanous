@@ -28,6 +28,8 @@ export interface SeatMailMessage extends StructuredMessageFields {
 export interface SeatMailMessageRead {
   seat: string;
   messages: SeatMailMessage[];
+  /** Actual ledger unread total, independent of the bounded message page. */
+  unreadTotal?: number;
   /**
    * ELN-SEAT-MAIL-REPLAY (11-18 live: REL «Queue 3641», JUD «Queue 3225» with 8 and 2 unread): taken in the SAME
    * snapshot as `messages`. `latestId` = newest ledger id (the watcher's next floor, so it never pages history);
@@ -50,6 +52,15 @@ export interface SeatReceiptWrite {
 
 export interface SeatReceiptWriter {
   record(input: SeatReceiptWrite): void;
+  /** [seat-mail #14 wiring] started 계기 — 큐 항목이 턴에 인계된 순간(onTransition delivered). 옵셔널: 구형 writer 무시. */
+  recordStarted?(input: SeatReceiptStartedWrite): void;
+}
+
+export interface SeatReceiptStartedWrite {
+  messageId: number;
+  recipient: string;
+  /** 시작 이벤트 식별자 — 큐 항목 전이가 곧 시작이라 queue item id 를 쓴다(생략 가능). */
+  eventId?: string | null;
 }
 
 /** Ledger row → notice input: transport fields ⊕ the B1-A structured fields the §5d header reads. */
@@ -111,7 +122,7 @@ export function readSeatMailMessages(
         after = rows.at(-1)!.id;
         if (page + 1 >= SEAT_MESSAGE_SCAN_PAGES) { truncated = true; break; }
       }
-      return { seat, messages, latestId: store.latestId(), cursor, seenSkipped: skipped, truncated };
+      return { seat, messages, unreadTotal: store.unreadCount(seat), latestId: store.latestId(), cursor, seenSkipped: skipped, truncated };
     }).deferred();
   } finally { store.close(); }
 }
@@ -147,6 +158,21 @@ export function createLedgerReceiptWriter(msgPath: string = join(elanousStateRoo
       } catch (error) {
         try {
           debug.log('msg.receipt-writer', 'record-failed', { msgId: input.messageId, recipient: input.recipient, state: input.state,
+            error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        } catch { /* observability is fail-open */ }
+      }
+    },
+    // [seat-mail #14 wiring] started 계기 — 원장을 열어 clock sink 로 직접 기록(state 기계와 무관한 clock 전용 이벤트).
+    recordStarted(input: SeatReceiptStartedWrite) {
+      try {
+        const mod = require('../msg/msg-store.js') as typeof import('../msg/msg-store.js');
+        const sink = require('../hq/msg-receipt-clock-sink.js') as typeof import('../hq/msg-receipt-clock-sink.js');
+        const store = new mod.MsgStore(msgPath);
+        try { sink.recordReceiptClock(store.db, { messageId: input.messageId, recipient: input.recipient, event: 'started', eventId: input.eventId ?? null }); }
+        finally { store.close(); }
+      } catch (error) {
+        try {
+          debug.log('msg.receipt-writer', 'record-started-failed', { msgId: input.messageId, recipient: input.recipient,
             error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
         } catch { /* observability is fail-open */ }
       }

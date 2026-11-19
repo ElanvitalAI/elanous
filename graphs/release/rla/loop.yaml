@@ -29,3 +29,25 @@ prompt:
   instruction: Observe the failed gate; propose a bounded retry edge, validate it, verify the result, and roll back on failure.
   llm: { role: supervisor-planner, optional: true }
 graph: ./supervisor.yaml
+# supervisor/v1 definition — loaded by src/supervision/definition-loader.ts with the macrophage/heal/silence/run-doctor set.
+supervisor:
+  apiVersion: elanous.dev/supervisor/v1
+  kind: supervisor
+  ref: 'loop:rla@1'
+  role: primary
+  supervises: [release-loop]
+  signals:
+    - { signal: gate.verdict, actor: final }
+    - { signal: release.incident, actor: final }
+    - { signal: run.failed, actor: observer }
+  authority: [reroute, add-node, repair, hitl, skip-node, gate-waiver, regression-response, emergency-release]
+  reportsTo: 'loop:coordinator@1'
+  # Source: RFC-loop-agent-supervisor-and-arg-contract.md §2b policy.ownership.silenceAfter PT10M.
+  escalation: { to: 'loop:coordinator@1', silenceAfter: PT10M }
+  # Source: RFC §2b memory — instance run handle, template gated-promotion, global card-bound read only.
+  # Retention periods are this definition's declared policy; GRAPH-MEMORY-SCOPES requires one but fixes no value.
+  memory:
+    instance: { read: true, write: true, promote: template-candidate, retention: P7D }
+    template: { read: true, write: gated-promotion, promote: none, retention: P90D }
+    global: { read: card-bound-only, write: none, promote: none }
+    provenance: required

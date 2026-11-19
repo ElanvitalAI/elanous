@@ -148,6 +148,9 @@ function defaultDefer(fn: () => void, ms: number): void {
   (t as { unref?: () => void }).unref?.();
 }
 
+/** First retry after a «turn-running» refusal at turn end (TURN-FIELD-BUG-5). OP #91474 (CX-7 diag): busy drops right after settle. */
+export const TURN_RUNNING_RETRY_BASE_MS = 50;
+
 export function createGoalContinue(deps: GoalContinueDeps): GoalContinueController {
   const isEnabled = deps.isEnabled ?? (() => isGoalContinueEnabledByEnv());
   const cap = deps.consecutiveCap ?? DEFAULT_GOAL_CONTINUE_CAP;
@@ -171,6 +174,8 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   const openedFingerprints = new Set<string>();
   let capNotified = false;
   let retryArmed = false;
+  /** TURN-FIELD-BUG-5: «turn-running» refusals in a row — the turn-end check runs before busy drops. */
+  let turnRunningStreak = 0;
   let completedGoal = false;
 
   /**
@@ -178,13 +183,19 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
    * arm and measure again once — at `retryAt` for pacing, else after `retryMs`. Any other refusal (incl. the pacing run cap,
    * which has no `retryAt`: only a new event or a person opens the next turn) drops the arm.
    */
-  const handleRejected = (result: { reason: string; retryAt?: number }): void => {
+  const handleRejected = (result: { reason: string; retryAt?: number; detail?: string }): void => {
     const pacedAt = result.reason === 'Cap' && result.retryAt !== undefined ? result.retryAt : null;
     const transient = result.reason === 'HumanTyping' || result.reason === 'NotIdle' || pacedAt !== null;
     if (!transient) { armed = null; return; }
     if (retryArmed) return;
     retryArmed = true;
-    const wait = pacedAt !== null ? Math.max(0, pacedAt - (deps.now ?? Date.now)()) : retryMs;
+    // TURN-FIELD-BUG-5: the turn-end check runs inside settle, while busy is still up — the gate says NotIdle
+    // «turn-running» although the turn is over. Try again almost at once (busy drops right after settle), doubling up
+    // to retryMs so a turn that really keeps running is not polled hard. Any other refusal keeps the old wait.
+    const turnRunning = result.reason === 'NotIdle' && result.detail === 'turn-running';
+    const fast = turnRunning ? Math.min(retryMs, TURN_RUNNING_RETRY_BASE_MS * 2 ** turnRunningStreak) : null;
+    if (turnRunning) turnRunningStreak += 1;
+    const wait = pacedAt !== null ? Math.max(0, pacedAt - (deps.now ?? Date.now)()) : fast ?? retryMs;
     defer(() => { retryArmed = false; try { check(); } catch { /* fail-soft */ } }, wait);
   };
 
@@ -268,6 +279,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
     const result = deps.startTurnIfIdle(formatGoalContinuePrompt(phrase), { origin: 'goal-continue', reason: mode === 'remaining' ? CONTINUE_REASON.remainingPlan : CONTINUE_REASON.nextStep });
     if (result.opened) {
       armed = null;
+      turnRunningStreak = 0;
       consecutive += 1;
       openedFingerprints.add(fingerprint);
       log('tui.goal-continue', 'decided', { opened: true, reason: 'pledge-without-result', phrase, tail, consecutive, turnId: result.turnId });
@@ -311,6 +323,7 @@ export function createGoalContinue(deps: GoalContinueDeps): GoalContinueControll
   return {
     noteTurnEnded(end) {
       armed = null;
+      turnRunningStreak = 0;
       if (completedGoal) return;
       if (!isEnabled()) return;
       if (end.failed) {

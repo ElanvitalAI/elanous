@@ -116,6 +116,10 @@ import type { ModelTier } from '../model-tier/types.js';
 import { setSessionTierOverride } from '../model-tier/session-override.js';
 
 export const ACP_SERVER_SELF_PERFORMER = 'elanous:self';
+/** Ops-Rules 22 (OP 92885): the full implemented ext surface as namespace
+ * prefixes — the allowlist the webterm daemon, nexus, and the TUI dashboard
+ * pass to keep their behavior. `els acp serve` passes no allowlist at all. */
+export const WEBTERM_EXT_METHOD_ALLOWLIST: readonly string[] = ['terminal/', 'elanous/'];
 
 // ACP SDK 1.x removed the session «model» API (`ModelInfo`·`SessionModelState`·`session/set_model`) in favour of
 // session config options — the model list is now a `select` option with category `model` (#21407 bumped the SDK).
@@ -242,6 +246,13 @@ export interface AcpServerOptions {
   /** ACP standalone entry: require session cwd or an explicit boot default. */
   requireSessionToolCwd?: boolean;
   bootToolCwd?: string;
+  /** Ops-Rules 22 (OP 92885, 계승 OP 92151 / JUD must-1 ⓒ #38790): ext
+   * methods are DENIED BY DEFAULT. A caller that owns the ext surface (webterm
+   * daemon, nexus, TUI dashboard) passes a code constant allowlist — entries
+   * are exact method names or `x/` namespace prefixes. `els acp serve` passes
+   * none: every ext request is refused, audited, before dispatch, so no PTY or
+   * control-door bypass surface exists. The prompt path stays open. */
+  extMethodAllowlist?: readonly string[];
   /** Optional PTY factory for the web terminal; production uses PreviewTerminal. */
   createWebTerminal?: (opts: ConstructorParameters<typeof import('../preview/terminal.js').PreviewTerminal>[0]) => import('../preview/terminal.js').PreviewTerminal;
   /** Test seam for exercising stdio EOF with controlled byte streams. */
@@ -2199,6 +2210,24 @@ function wireAcpConnection(
           method,
           terminalId: (params as { terminalId?: unknown })?.terminalId,
         }));
+      }
+      // Ops-Rules 22 (OP 92885, 계승 OP 92151 / JUD must-1 ⓒ #38790): ext
+      // methods are denied by default. A caller that owns the ext surface
+      // passes a code constant allowlist (exact names or `x/` prefixes);
+      // `els acp serve` passes none — terminal/spawn → arbitrary PTY would
+      // bypass the control door, so everything unlisted is refused, audited,
+      // before dispatch.
+      const extAllowed = opts.extMethodAllowlist?.some(
+        (entry) => method === entry || (entry.endsWith('/') && method.startsWith(entry)),
+      ) ?? false;
+      if (!extAllowed) {
+        debug.log('webterm.acp', 'extMethod.rejected', () => ({
+          method,
+          reason: 'ext-method-not-allowed',
+        }));
+        // RequestError (not a plain Error) so the SDK wire layer keeps the
+        // message instead of collapsing it to "Internal error".
+        throw new RequestError(-32601, `unknown extension method: ${method}`, { method, reason: 'ext-method-not-allowed' });
       }
       if (method === 'elanous/session/steer') {
         const p = params as { sessionId?: unknown; text?: unknown };

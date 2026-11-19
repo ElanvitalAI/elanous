@@ -172,6 +172,7 @@ export async function runShell(req: ShellRequest): Promise<ShellResult> {
     return withG(result);
   }
 
+  try { req.onSpawn?.(); } catch { /* the capsule clock is advisory */ }
   const result = await collectOutput(child, started, key, timeoutMs, maxOutput, req.signal, sandboxed, sandboxTool);
   // AU6 — flag sandbox-rejection when the kernel blocked the op.
   // Heuristic; false positives are OK because the LLM is instructed

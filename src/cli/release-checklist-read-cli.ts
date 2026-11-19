@@ -101,9 +101,13 @@ function evidenceTimestampNearIdentity(evidence: string, identity: string): numb
 export function collectChecklistEvidenceStages(item: ReturnType<typeof listChecklist>['items'][number], run: ChecklistEvidenceCommandRunner = evidenceCommand): ChecklistEvidenceStage[] {
   const measuredAt = new Date().toISOString();
   const evidence = item.evidence ?? '';
-  const prRefs = [...new Set([...evidence.matchAll(/(?:^|\s)#(\d{1,8})\b/gu)].map((match) => match[1]!))];
+  // OP #105708 파서 수리: E1 PR 인용은 명시적 꼴만 — «PR #N» · «pull/N» · 착지 커밋 «(#N)». 맨 «#N» 토큰(좌석 우편 번호 등)은 PR이 아니다.
+  const prRefPatterns = [/\bPR\s*#(\d{1,8})\b/giu, /\bpull\/(\d{1,8})\b/gu, /(?:^|\s)\(#(\d{1,8})\)/gu];
+  const prRefs = [...new Set(prRefPatterns.flatMap((pattern) => [...evidence.matchAll(pattern)].map((match) => match[1]!)))];
   const pr = prRefs.length === 1 ? prRefs[0] : undefined;
-  const prLine = pr ? evidence.split(/\r?\n/u).find((line) => new RegExp(`(?:^|\\s)#${pr}\\b`).test(line)) : undefined;
+  // 후속 수리(2026-11-20, SIM-WORLD 사례): 착지 전 «진행: PR #N» 줄이 첫 PR 인용 줄이어도 merge SHA와 결속된 줄을 찾아 판정한다(첫 줄만 보지 않는다).
+  const prRefLinePattern = (prRef: string) => new RegExp(`(?:\\bPR\\s*#${prRef}\\b|\\bpull\\/${prRef}\\b|(?:^|[^0-9])\\(#${prRef}\\))`, 'iu');
+  const prLines = pr ? evidence.split(/\r?\n/u).filter((line) => prRefLinePattern(pr).test(line)) : [];
   const e1: ChecklistEvidenceStage = { id: 'E1', state: 'missing', source: 'checklist evidence + eln gh pr view', measuredAt,
     reason: prRefs.length > 1 ? '근거에서 교차할 PR이 하나로 좁혀지지 않는다' : '근거에 병합 PR 번호가 없다' };
   let mergeSha: string | null = null;
@@ -116,7 +120,7 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
       const commit = record.mergeCommit && typeof record.mergeCommit === 'object' ? (record.mergeCommit as { oid?: unknown }).oid : null;
       mergeSha = typeof commit === 'string' && /^[a-f0-9]{40}$/i.test(commit) ? commit : null;
       if (!mergeSha) { e1.state = 'unmeasurable'; e1.reason = `PR #${pr} 조회에 유효한 merge SHA가 없다`; }
-      else if (!prLine || !new RegExp(`\\b${mergeSha}\\b`, 'i').test(prLine)) { e1.reason = `병합 PR #${pr}와 merge SHA가 같은 근거 줄에서 결속되지 않았다`; e1.source = `eln gh pr view #${pr} → ${mergeSha}`; }
+      else if (!prLines.some((line) => new RegExp(`\\b${mergeSha}\\b`, 'i').test(line))) { e1.reason = `병합 PR #${pr}와 merge SHA가 같은 근거 줄에서 결속되지 않았다`; e1.source = `eln gh pr view #${pr} → ${mergeSha}`; }
       else { e1.state = 'observed'; e1.reason = `PR #${pr} MERGED 및 merge SHA가 근거와 일치한다`; e1.source = `eln gh pr view #${pr} → ${mergeSha}`; }
     }
   }

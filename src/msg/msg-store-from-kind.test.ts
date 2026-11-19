@@ -182,6 +182,11 @@ describe('SEAT-INBOX-PROTOCOL B1-A mf2: SCHEMA-V2 columns, origin range, envelop
     const dir = mkdtempSync(join(tmpdir(), 'elanous-msg-fromkind-cli-'));
     dirs.push(dir);
     const stateDir = join(dir, 'state');
+    // 프리로드(test/preload-isolation.ts)의 프로세스 전역 격리 스탬프를 지우지 않는다 —
+    // 세팅 직전 원값을 캡처해 finally 에서 원복한다(delete 는 미설정이었을 때만).
+    // OP #100606: 풀스위트에서 스탬프 소실 시 이후 시험의 effectiveInstanceRoot() 가
+    // 기본 prodRoot 로 떨어져 liveUniverse()=참 — msg-post-office.test.ts:73 실패 유발.
+    const prevState = process.env.ELANOUS_STATE_DIR;
     process.env.ELANOUS_STATE_DIR = stateDir;
     try {
       const stdout: string[] = []; const stderr: string[] = []; const exits: number[] = [];
@@ -222,7 +227,10 @@ describe('SEAT-INBOX-PROTOCOL B1-A mf2: SCHEMA-V2 columns, origin range, envelop
         expect(row.crownDirective).toBe('1');
         expect(row.origin).toEqual({ kind: 'agent', seat: 'OP', delegatedByCrown: true });
       } finally { reopen.close(); }
-    } finally { delete process.env.ELANOUS_STATE_DIR; }
+    } finally {
+      if (prevState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = prevState;
+    }
   });
 
   test('a body over 4000 chars stays in the ledger row — no preview, no sidecar file', () => {

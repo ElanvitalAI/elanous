@@ -131,7 +131,6 @@ import {
   parseGroundingSources,
   type GroundingConfig,
 } from './grounding/sources.js';
-import { parseSeatTurnCapConfig, type SeatTurnCapConfig } from './core-turn/seat-turn-cap.js';
 import { sparseUserConfig } from './user-config/sparse-config.js';
 import { DEFAULT_BASH_APPROVAL, parseBashApprovalMode } from './user-config/shell.js';
 import { MAX_TURNS_BUDGET_KEYS } from './user-config/types.js';

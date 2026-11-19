@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
-import { evaluateTaPreflight, renderTaPreflight, targetEvidenceMismatch, taPreflightReceipt, type TaPreflightEvidence } from './ta-preflight.js';
+import { evaluateTaPreflight, parseHandShadowEvidence, renderTaPreflight, targetEvidenceMismatch, taPreflightReceipt, type TaPreflightEvidence } from './ta-preflight.js';
 
 const sha = 'a'.repeat(40);
 const dg = `sha256:${'b'.repeat(64)}`;
@@ -13,14 +13,16 @@ const dg = `sha256:${'b'.repeat(64)}`;
 const ARGV_CLOSED = ['harness', 'say', '--substrate', 'pod', '--no-auto-merge'];
 const ARGV_MERGE_BY_HOST = ['harness', 'say', '--substrate', 'pod', '--merge-by-host'];
 const good: TaPreflightEvidence = {
+  cardId: 'card-1',
   source: { requestedPin: sha, childHead: sha, privateRepo: true },
   image: { expectedDigest: dg, observedDigest: dg },
-  workOrder: { cellId: 'X', boundary: 'src/a.ts', budget: '6900s', contract: 'c', escalation: 'OP', unknownFields: [] },
+  workOrder: { cellId: 'X', boundary: 'src/a.ts', budget: '6900s', contract: 'c', escalation: 'OP', unknownFields: [],
+    owner: 'TC', card: 'card-1', noAutoMerge: true, budgetLimits: { timeSec: 6900, usdCap: 5 } },
   launchArgv: ARGV_CLOSED,
   mergePolicy: { taLandEnv: false, liveMovesProposeLand: false },
   owner: { card: 'TC', lease: 'TC', pod: 'TC' },
   limits: { wallClockSec: 6900, jobDeadlineSec: 10800, usdCap: 5 },
-  launch: { requestConsumed: false, activeSameGoalRuns: 0, opHoldActive: false },
+  launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false },
   entrance: { name: 'hand', groundingConfigured: true, groundingUrl: 'http://host.example:31415', groundingReachable: true },
 };
 
@@ -28,6 +30,20 @@ test('all evidence present and consistent is READY', () => {
   const report = evaluateTaPreflight(good);
   expect(report.overall).toBe('READY');
   expect(report.summary).toEqual({ pass: 6, fail: 0, unmeasured: 0 });
+});
+
+test('missing order binding or numeric budget stays UNMEASURED', () => {
+  const withoutBinding = evaluateTaPreflight({ ...good, workOrder: { ...good.workOrder!, owner: undefined } });
+  expect(withoutBinding.conditions[2]!.status).toBe('UNMEASURED');
+  const withoutBudget = evaluateTaPreflight({ ...good, workOrder: { ...good.workOrder!, budgetLimits: undefined } });
+  expect(withoutBudget.conditions[3]!.status).toBe('UNMEASURED');
+  const withoutMeasuredLimits = evaluateTaPreflight({ ...good, limits: undefined });
+  expect(withoutMeasuredLimits.conditions[3]!.status).toBe('UNMEASURED');
+  const wrongCard = evaluateTaPreflight({ ...good, workOrder: { ...good.workOrder!, card: 'other-card' } });
+  expect(wrongCard.conditions[2]!.status).toBe('FAIL');
+  expect(evaluateTaPreflight({ ...good, cardId: undefined }).conditions[2]!.status).toBe('UNMEASURED');
+  const wrongBudget = evaluateTaPreflight({ ...good, workOrder: { ...good.workOrder!, budgetLimits: { timeSec: 600, usdCap: 5 } } });
+  expect(wrongBudget.conditions[3]!.status).toBe('FAIL');
 });
 
 test('empty evidence never passes: every condition is UNMEASURED', () => {
@@ -51,7 +67,7 @@ test('mismatches fail with a reason', () => {
     workOrder: { ...good.workOrder!, budget: '모름', unknownFields: ['budget'] },
     owner: { card: 'MVP-B', lease: 'TC', pod: 'TC' },
     limits: { wallClockSec: 10800, jobDeadlineSec: 10800, usdCap: 5 },
-    launch: { requestConsumed: false, activeSameGoalRuns: 0, opHoldActive: true },
+    launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: true },
     entrance: { name: 'say', groundingConfigured: false },
   });
   expect(report.conditions.map((c) => c.status)).toEqual(['FAIL', 'PASS', 'FAIL', 'FAIL', 'FAIL', 'FAIL']);
@@ -68,15 +84,15 @@ test('malformed evidence JSON never counts as measured', () => {
   const bad = (patch: Record<string, unknown>) => evaluateTaPreflight({ ...good, ...patch } as unknown as TaPreflightEvidence);
   // opHoldActive:0 / 'false' must not read as «no hold».
   for (const opHoldActive of [0, 'false', null, 1]) {
-    expect(bad({ launch: { requestConsumed: false, activeSameGoalRuns: 0, opHoldActive } }).conditions[4]!.status).toBe('UNMEASURED');
+    expect(bad({ launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive } }).conditions[4]!.status).toBe('UNMEASURED');
   }
-  for (const requestConsumed of [0, 'no']) {
-    expect(bad({ launch: { requestConsumed, activeSameGoalRuns: 0, opHoldActive: false } }).conditions[4]!.status).toBe('UNMEASURED');
+  for (const cardClaimed of [0, 'no']) {
+    expect(bad({ launch: { cardClaimed, activeSameGoalRuns: 0, opHoldActive: false } }).conditions[4]!.status).toBe('UNMEASURED');
   }
   for (const activeSameGoalRuns of [-1, 1.5, '0', Number.NaN, null]) {
-    expect(bad({ launch: { requestConsumed: false, activeSameGoalRuns, opHoldActive: false } }).conditions[4]!.status).toBe('UNMEASURED');
+    expect(bad({ launch: { cardClaimed: false, activeSameGoalRuns, opHoldActive: false } }).conditions[4]!.status).toBe('UNMEASURED');
   }
-  expect(bad({ launch: { requestConsumed: false, activeSameGoalRuns: 2, opHoldActive: false } }).conditions[4]!.status).toBe('FAIL');
+  expect(bad({ launch: { cardClaimed: false, activeSameGoalRuns: 2, opHoldActive: false } }).conditions[4]!.status).toBe('FAIL');
   expect(bad({ launchArgv: 'harness say --no-auto-merge' }).conditions[2]!.status).toBe('UNMEASURED');
   expect(bad({ launchArgv: [1, 2] }).conditions[2]!.status).toBe('UNMEASURED');
   // groundingConfigured 가 불리언 true 가 아니면(1) «URL 설정»으로 읽지 않는다 → URL·정책 모두 없음 = FAIL(측정값으로 인정 안 함).
@@ -102,7 +118,7 @@ test('tasks preflight CLI prints the table, writes a receipt and exits 1 when no
   const dir = mkdtempSync(join(tmpdir(), 'ta-preflight-cli-'));
   const evidencePath = join(dir, 'evidence.json');
   const receiptPath = join(dir, 'r', 'receipt.json');
-  writeFileSync(evidencePath, JSON.stringify({ image: { expectedDigest: dg, observedDigest: dg }, limits: { usdCap: 5 } }));
+  writeFileSync(evidencePath, JSON.stringify({ cardId: 'card-1', image: { expectedDigest: dg, observedDigest: dg }, limits: { usdCap: 5 } }));
   const lines: string[] = [];
   const program = new Command().name('elanous').exitOverride();
   registerTasksCommands(program, { output: (line) => lines.push(line) });
@@ -125,7 +141,9 @@ test('tasks preflight CLI prints the table, writes a receipt and exits 1 when no
 
 test('receipt target must match the evidence that was checked', () => {
   expect(targetEvidenceMismatch(good, { commit: sha, cell: 'X' })).toBeNull();
-  expect(targetEvidenceMismatch(good, { card: 'any' })).toBeNull();
+  expect(targetEvidenceMismatch(good, { card: 'card-1' })).toBeNull();
+  expect(targetEvidenceMismatch(good, { card: 'other' })).toContain('--card');
+  expect(targetEvidenceMismatch({ ...good, cardId: undefined }, { card: 'card-1' })).toContain('없음');
   expect(targetEvidenceMismatch(good, { commit: 'd'.repeat(40) })).toContain('--commit');
   expect(targetEvidenceMismatch(good, { cell: 'OTHER' })).toContain('--cell');
   // evidence lacking the field cannot vouch for the target
@@ -133,9 +151,40 @@ test('receipt target must match the evidence that was checked', () => {
   expect(targetEvidenceMismatch({ ...good, workOrder: null }, { cell: 'X' })).toContain('없음');
 });
 
+test('JSON hand shadow binds its card and preserves the complete argv', () => {
+  const argv = ['harness', 'say', '--substrate', 'pod', '--no-auto-merge', 'goal with spaces'];
+  expect(parseHandShadowEvidence(JSON.stringify({ card: { id: 'card-1' }, move: { command: argv }, mode: 'shadow', launched: false })))
+    .toEqual({ cardId: 'card-1', launchArgv: argv });
+  expect(parseHandShadowEvidence(JSON.stringify({ card: { id: 'card-1' }, move: { command: argv }, mode: 'live', launched: true })))
+    .toEqual({ cardId: null, launchArgv: null });
+});
+
+test('preflight uses JSON shadow card and argv and refuses a different target card', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-shadow-json-'));
+  const evidence = join(dir, 'evidence.json'), shadow = join(dir, 'shadow.json'), receipt = join(dir, 'receipt.json');
+  const argv = ['harness', 'say', '--substrate', 'pod', '--no-auto-merge', 'goal with spaces'];
+  const previous = process.exitCode;
+  try {
+    writeFileSync(evidence, JSON.stringify(good));
+    writeFileSync(shadow, JSON.stringify({ card: { id: 'card-1' }, move: { command: argv }, mode: 'shadow', launched: false }));
+    const lines: string[] = [], program = new Command().name('elanous').exitOverride();
+    registerTasksCommands(program, { output: line => lines.push(line) });
+    await program.parseAsync(['node', 'elanous', 'tasks', 'preflight', '--evidence', evidence, '--hand-shadow', shadow, '--out', receipt, '--card', 'other']);
+    expect(lines.join('\n')).toContain('--card other');
+    expect(() => readFileSync(receipt)).toThrow();
+    const ok = new Command().name('elanous').exitOverride();
+    registerTasksCommands(ok, { output: () => {} });
+    await ok.parseAsync(['node', 'elanous', 'tasks', 'preflight', '--evidence', evidence, '--hand-shadow', shadow, '--out', receipt, '--card', 'card-1']);
+    const saved = JSON.parse(readFileSync(receipt, 'utf8'));
+    expect(saved.evidence.cardId).toBe('card-1');
+    expect(saved.evidence.launchArgv).toEqual(argv);
+  } finally { process.exitCode = previous ?? 0; rmSync(dir, { recursive: true, force: true }); }
+});
+
 // ── 점검표(표 시험) — ⑥ policy-off · ② pin 필수 · ①③ 정적 ⊕ fail-closed ──
 const fcAll = { sourceHead: true, imageDigest: true };
 const staticBase: TaPreflightEvidence = {
+  cardId: 'card-1',
   source: { requestedPin: sha, childHead: null, privateRepo: true },
   image: { expectedDigest: dg, observedDigest: null },
   workOrder: good.workOrder,
@@ -143,7 +192,7 @@ const staticBase: TaPreflightEvidence = {
   mergePolicy: { taLandEnv: false, liveMovesProposeLand: false },
   owner: { card: 'TC', lease: 'TC', pod: 'TC' },
   limits: { wallClockSec: 6900, jobDeadlineSec: 10800, usdCap: 5 },
-  launch: { requestConsumed: false, activeSameGoalRuns: 0, opHoldActive: false },
+  launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false },
   entrance: { name: 'hand', groundingConfigured: false, groundingPolicy: { off: true, reason: 'CROWN D2 M2 토큰 중계 안 켬' } },
   failClosed: fcAll,
 };
@@ -191,7 +240,10 @@ test('tasks preflight CLI: failClosed 는 증거 파일이 아니라 빌드의 �
   writeFileSync(evidencePath, JSON.stringify({ ...staticBase, failClosed: { sourceHead: false, imageDigest: false } }));
   const lines: string[] = [];
   const program = new Command().name('elanous').exitOverride();
-  registerTasksCommands(program, { output: (line) => lines.push(line) });
+  const taskStatePath = join(dir, 'cards.json');
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'card-1': { id: 'card-1', text: ARGV_CLOSED.at(-1), status: 'handed', history: [] } } }));
+  registerTasksCommands(program, { output: (line) => lines.push(line), taskStatePath,
+    preflightActiveRuns: () => [], preflightHoldActive: () => false });
   const previous = process.exitCode;
   process.exitCode = undefined;
   try {
@@ -341,29 +393,29 @@ const cells: Cell[] = [
   { id: 'L14', cond: 4, desc: 'wall > job', evidence: limEv({ wallClockSec: 12000, jobDeadlineSec: 10800, usdCap: 5 }), expect: 'FAIL' },
   { id: 'L15', cond: 4, desc: 'job 0', evidence: limEv({ wallClockSec: 6900, jobDeadlineSec: 0, usdCap: 5 }), expect: 'FAIL' },
   { id: 'L16', cond: 4, desc: '정상', evidence: limEv({ wallClockSec: 6900, jobDeadlineSec: 10800, usdCap: 5 }), expect: 'PASS' },
-  { id: 'L17', cond: 4, desc: '경계 wall 6900 < job 6901 · usd 0.01', evidence: limEv({ wallClockSec: 6900, jobDeadlineSec: 6901, usdCap: 0.01 }), expect: 'PASS' },
+  { id: 'L17', cond: 4, desc: '경계 wall 6900 < job 6901 · usd 0.01', evidence: { ...limEv({ wallClockSec: 6900, jobDeadlineSec: 6901, usdCap: 0.01 }), workOrder: { ...good.workOrder!, budgetLimits: { timeSec: 6900, usdCap: 0.01 } } }, expect: 'PASS' },
   { id: 'L18', cond: 4, desc: 'wall 0 + job·usd 누락 (나쁨 우선)', evidence: limEv({ wallClockSec: 0 }), expect: 'FAIL' },
   { id: 'L19', cond: 4, desc: 'wall ≥ job + usd 누락 (나쁨 우선)', evidence: limEv({ wallClockSec: 10800, jobDeadlineSec: 10800 }), expect: 'FAIL' },
   { id: 'L20', cond: 4, desc: 'wall·usd 정상 + job 누락', evidence: limEv({ wallClockSec: 6900, usdCap: 5 }), expect: 'UNMEASURED' },
   // ⑤ 중복·중지·hold
   { id: 'H01', cond: 5, desc: 'launch 없음', evidence: lauEv(undefined), expect: 'UNMEASURED' },
-  { id: 'H02', cond: 5, desc: '전부 정상(hold false · 미소비 · 활성 0)', evidence: lauEv({ opHoldActive: false, requestConsumed: false, activeSameGoalRuns: 0 }), expect: 'PASS' },
-  { id: 'H03', cond: 5, desc: 'hold true', evidence: lauEv({ opHoldActive: true, requestConsumed: false, activeSameGoalRuns: 0 }), expect: 'FAIL', detail: 'OP hold' },
+  { id: 'H02', cond: 5, desc: '전부 정상(hold false · claim 없음 · 활성 0)', evidence: lauEv({ opHoldActive: false, cardClaimed: false, activeSameGoalRuns: 0 }), expect: 'PASS' },
+  { id: 'H03', cond: 5, desc: 'hold true', evidence: lauEv({ opHoldActive: true, cardClaimed: false, activeSameGoalRuns: 0 }), expect: 'FAIL', detail: 'OP hold' },
   { id: 'H04', cond: 5, desc: 'hold true + 나머지 누락 (나쁨 우선)', evidence: lauEv({ opHoldActive: true }), expect: 'FAIL' },
-  { id: 'H05', cond: 5, desc: 'consumed true + hold null (나쁨 우선)', evidence: lauEv({ opHoldActive: null, requestConsumed: true, activeSameGoalRuns: 0 }), expect: 'FAIL', detail: '이미 소비' },
+  { id: 'H05', cond: 5, desc: 'claim true + hold null (나쁨 우선)', evidence: lauEv({ opHoldActive: null, cardClaimed: true, activeSameGoalRuns: 0 }), expect: 'FAIL', detail: 'claim' },
   { id: 'H06', cond: 5, desc: '활성 2 + 나머지 누락 (나쁨 우선)', evidence: lauEv({ activeSameGoalRuns: 2 }), expect: 'FAIL', detail: '활성 run 2' },
-  { id: 'H07', cond: 5, desc: 'hold null', evidence: lauEv({ opHoldActive: null, requestConsumed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
-  { id: 'H08', cond: 5, desc: 'hold 누락', evidence: lauEv({ requestConsumed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
-  { id: 'H09', cond: 5, desc: 'hold 0(비불리언)', evidence: lauEv({ opHoldActive: 0, requestConsumed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
-  { id: 'H10', cond: 5, desc: "hold 'false' 문자열", evidence: lauEv({ opHoldActive: 'false', requestConsumed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
-  { id: 'H11', cond: 5, desc: 'consumed 누락', evidence: lauEv({ opHoldActive: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
-  { id: 'H12', cond: 5, desc: "consumed 'no'", evidence: lauEv({ opHoldActive: false, requestConsumed: 'no', activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
-  { id: 'H13', cond: 5, desc: 'active 누락', evidence: lauEv({ opHoldActive: false, requestConsumed: false }), expect: 'UNMEASURED' },
-  { id: 'H14', cond: 5, desc: 'active -1', evidence: lauEv({ opHoldActive: false, requestConsumed: false, activeSameGoalRuns: -1 }), expect: 'UNMEASURED' },
-  { id: 'H15', cond: 5, desc: 'active 1.5', evidence: lauEv({ opHoldActive: false, requestConsumed: false, activeSameGoalRuns: 1.5 }), expect: 'UNMEASURED' },
-  { id: 'H16', cond: 5, desc: "active '0' 문자열", evidence: lauEv({ opHoldActive: false, requestConsumed: false, activeSameGoalRuns: '0' }), expect: 'UNMEASURED' },
-  { id: 'H17', cond: 5, desc: 'active NaN', evidence: lauEv({ opHoldActive: false, requestConsumed: false, activeSameGoalRuns: Number.NaN }), expect: 'UNMEASURED' },
-  { id: 'H18', cond: 5, desc: 'active null', evidence: lauEv({ opHoldActive: false, requestConsumed: false, activeSameGoalRuns: null }), expect: 'UNMEASURED' },
+  { id: 'H07', cond: 5, desc: 'hold null', evidence: lauEv({ opHoldActive: null, cardClaimed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
+  { id: 'H08', cond: 5, desc: 'hold 누락', evidence: lauEv({ cardClaimed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
+  { id: 'H09', cond: 5, desc: 'hold 0(비불리언)', evidence: lauEv({ opHoldActive: 0, cardClaimed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
+  { id: 'H10', cond: 5, desc: "hold 'false' 문자열", evidence: lauEv({ opHoldActive: 'false', cardClaimed: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
+  { id: 'H11', cond: 5, desc: 'claim 누락', evidence: lauEv({ opHoldActive: false, activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
+  { id: 'H12', cond: 5, desc: "claim 'no'", evidence: lauEv({ opHoldActive: false, cardClaimed: 'no', activeSameGoalRuns: 0 }), expect: 'UNMEASURED' },
+  { id: 'H13', cond: 5, desc: 'active 누락', evidence: lauEv({ opHoldActive: false, cardClaimed: false }), expect: 'UNMEASURED' },
+  { id: 'H14', cond: 5, desc: 'active -1', evidence: lauEv({ opHoldActive: false, cardClaimed: false, activeSameGoalRuns: -1 }), expect: 'UNMEASURED' },
+  { id: 'H15', cond: 5, desc: 'active 1.5', evidence: lauEv({ opHoldActive: false, cardClaimed: false, activeSameGoalRuns: 1.5 }), expect: 'UNMEASURED' },
+  { id: 'H16', cond: 5, desc: "active '0' 문자열", evidence: lauEv({ opHoldActive: false, cardClaimed: false, activeSameGoalRuns: '0' }), expect: 'UNMEASURED' },
+  { id: 'H17', cond: 5, desc: 'active NaN', evidence: lauEv({ opHoldActive: false, cardClaimed: false, activeSameGoalRuns: Number.NaN }), expect: 'UNMEASURED' },
+  { id: 'H18', cond: 5, desc: 'active null', evidence: lauEv({ opHoldActive: false, cardClaimed: false, activeSameGoalRuns: null }), expect: 'UNMEASURED' },
 ];
 for (const cell of cells) {
   test(`축곱 ${'①②③④⑤⑥'[cell.cond - 1]} ${cell.id}`, () => {
@@ -413,7 +465,7 @@ const laws: ReadonlyArray<{ cond: 1 | 2 | 3 | 4 | 5 | 6; fields: Field[] }> = [
   ] },
   { cond: 5, fields: [
     { name: 'opHoldActive', variants: [{ label: 'false', cls: 'ok', patch: keep }, { label: 'true', cls: 'bad', patch: withLaunch({ opHoldActive: true }) }, { label: 'null', cls: 'missing', patch: withLaunch({ opHoldActive: null }) }, { label: '0(비불리언)', cls: 'missing', patch: withLaunch({ opHoldActive: 0 }) }] },
-    { name: 'requestConsumed', variants: [{ label: 'false', cls: 'ok', patch: keep }, { label: 'true', cls: 'bad', patch: withLaunch({ requestConsumed: true }) }, { label: '누락', cls: 'missing', patch: withLaunch({ requestConsumed: undefined }) }, { label: "'no'", cls: 'missing', patch: withLaunch({ requestConsumed: 'no' }) }] },
+    { name: 'cardClaimed', variants: [{ label: 'false', cls: 'ok', patch: keep }, { label: 'true', cls: 'bad', patch: withLaunch({ cardClaimed: true }) }, { label: '누락', cls: 'missing', patch: withLaunch({ cardClaimed: undefined }) }, { label: "'no'", cls: 'missing', patch: withLaunch({ cardClaimed: 'no' }) }] },
     { name: 'activeSameGoalRuns', variants: [{ label: '0', cls: 'ok', patch: keep }, { label: '2', cls: 'bad', patch: withLaunch({ activeSameGoalRuns: 2 }) }, { label: '누락', cls: 'missing', patch: withLaunch({ activeSameGoalRuns: undefined }) }, { label: '-1', cls: 'missing', patch: withLaunch({ activeSameGoalRuns: -1 }) }, { label: "'0'", cls: 'missing', patch: withLaunch({ activeSameGoalRuns: '0' }) }] },
   ] },
   { cond: 6, fields: [
@@ -531,7 +583,8 @@ async function shadowThenPreflight(handArgs: string[]): Promise<{ handOut: strin
     writeFileSync(shadowPath, hand.stdout);
     const evidencePath = join(dir, 'e.json');
     const { launchArgv: _omit, ...rest } = staticBase;
-    writeFileSync(evidencePath, JSON.stringify(rest));
+    const card = parseHandShadowEvidence(hand.stdout).cardId;
+    writeFileSync(evidencePath, JSON.stringify({ ...rest, workOrder: { ...rest.workOrder!, card } }));
     const pre = await simCli(['tasks', 'preflight', '--evidence', evidencePath, '--hand-shadow', shadowPath], { mode: 'spawn', allowPaths: [['tasks', 'preflight']], timeoutMs: 120_000 });
     return { handOut: hand.stdout, preflightOut: pre.stdout, code: pre.exitCode };
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -541,7 +594,8 @@ test('실프로세스: hand shadow(--no-auto-merge) → preflight --hand-shadow 
   const r = await shadowThenPreflight(['ship it', '--no-auto-merge']);
   expect(r.handOut).toContain('harness say --substrate pod --no-auto-merge');
   expect(r.preflightOut).toMatch(/PASS {7}3\. 작업 지시서 · 귀속 · 자동 merge 0 — owner=TC/);
-  expect(r.code).toBe(0);
+  expect(r.preflightOut).toMatch(/UNMEASURED +5\./u);
+  expect(r.code).toBe(1);
 }, 400_000);
 
 test('실프로세스: hand shadow(옵션 없음 = --merge-by-host) → preflight --hand-shadow 는 ③ FAIL(자동 병합 가능)', async () => {
@@ -578,10 +632,10 @@ async function runPreflightProcess(evidence: unknown): Promise<{ exitCode: numbe
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-test('실프로세스: tasks preflight — 정적 증거 전체는 READY exit 0, failClosed 거짓 주장은 빌드가 덮어쓴다', async () => {
+test('실프로세스: tasks preflight — 카드 미관측은 UNMEASURED, failClosed 거짓 주장은 빌드가 덮어쓴다', async () => {
   const r = await runPreflightProcess({ ...staticBase, failClosed: { sourceHead: false, imageDigest: false } });
-  expect(r.exitCode).toBe(0);
-  expect(r.stdout).toContain('READY (pass 6 · fail 0 · unmeasured 0)');
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/UNMEASURED +5\./u);
   expect(r.stdout).toMatch(/PASS {7}1\. private repo \+ child 실제 HEAD — 정적: pin a{12} /);
   expect(r.stdout).toMatch(/PASS {7}6\. 단일 입구 · 그라운딩 — 입구 hand · 그라운딩 policy-off — 사유: CROWN D2 M2 토큰 중계 안 켬\n/);
 }, 150_000);
@@ -590,5 +644,5 @@ test('실프로세스: tasks preflight — 증거 한 칸이 빠지면 NOT_READY
   const r = await runPreflightProcess({ ...staticBase, source: { requestedPin: sha, childHead: null, privateRepo: null } });
   expect(r.exitCode).toBe(1);
   expect(r.stdout).toMatch(/UNMEASURED 1\. private repo \+ child 실제 HEAD — private repo 증거 없음/);
-  expect(r.stdout).toContain('NOT_READY (pass 5 · fail 0 · unmeasured 1)');
+  expect(r.stdout).toMatch(/UNMEASURED +5\./u);
 }, 150_000);

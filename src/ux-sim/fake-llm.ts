@@ -281,7 +281,12 @@ function scriptedToolCall(messages: LLMMessage[]): LLMStreamEvent | null {
     selectedName = after.name;
     selectedArgs = after.args;
   } else if (!text.includes(spec.when)) continue;
-  const args = selectedArgs && typeof selectedArgs === 'object' ? selectedArgs as Record<string, unknown> : {};
+  const args = selectedArgs && typeof selectedArgs === 'object' ? { ...selectedArgs as Record<string, unknown> } : {};
+  if (args.taskId === '$humanTaskId') {
+    const match = text?.match(/\btaskId=([A-Za-z0-9_-]+)/);
+    if (!match) continue;
+    args.taskId = match[1];
+  }
   return { type: 'tool_call', id: `call_fake_llm_tool_${++toolCallSeq}`, name: selectedName, args };
   }
   return null;

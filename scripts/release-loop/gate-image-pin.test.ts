@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
   gateImageLayerRuntimeKey, gateRuntimeBaseReuseMode, prebuildGateImagePinAtCut, prebuildGateImagePinForRuntimeBases,
-  runCutGateImagePrebuild, writeGateImagePin, poolSyncBuildFailure } from './gate-image-pin.js';
+  runCutGateImagePrebuild, writeGateImagePin, poolSyncBuildFailure, type PrebuildFailure } from './gate-image-pin.js';
 import { parsePodPool, runBuildScript, syncPoolImages } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { gateImageReadinessPendingPath, gateImageReadinessSignalPath,
@@ -507,4 +507,15 @@ it('Terra must 1: a main-run pool sync whose real build.sh exits 7 becomes a bui
     expect(failure?.reason).toStartWith('cut gate image build failed on pool-node-c: ');
     expect(poolSyncBuildFailure(members, new Map([['pool-node-c', { ok: true, detail: 'built' }]]))).toBeNull();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('passes structured child failure through the parent without losing stage or receipt', () => {
+  const root = mkdtempSync(join(tmpdir(), 'prebuild-structured-failure-'));
+  try {
+    const failure: PrebuildFailure = { outcome: 'failed', reason: 'archive lacks PWA', stage: 'pack-pwa',
+      receipt: [{ stage: 'pack-pwa', exit: 1, ok: false, reason: 'archive lacks PWA' }],
+      failureCode: 'PACK_MISSING_PWA', causes: ['PACK_MISSING_PWA'] };
+    const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+    expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 1, stdout: JSON.stringify(failure) }) })).toEqual(failure);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

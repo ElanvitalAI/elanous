@@ -137,6 +137,8 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
   let pending: InternalTurnRequest | null = null;
   let internalActive = false;
   let lastId: string | null = null;
+  /** TURN-FIELD-BUG-5: the person key that submitted the last person turn — it is not «typing» after that turn ends. */
+  let humanTurnKeyMark = 0;
   /** 열린(아직 안 꺼낸) 내부 턴 «직전»의 lastId — 거둘 때 되돌린다(실행 안 된 턴이 Superseded 기준이 되지 않게). */
   let idBeforePending: string | null = null;
   let seq = 0;
@@ -188,7 +190,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
     if (pendingKeys() > 0) return 'unread-keys';
     if (deps.getTypeaheadCount() > 0) return 'typeahead';
     const last = lastHumanKeyAt();
-    if (last > 0 && now() - last < quietMs) return 'quiet-window';
+    if (last > 0 && last > humanTurnKeyMark && now() - last < quietMs) return 'quiet-window';
     return null;
   };
 
@@ -269,6 +271,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       const id = `human-${++seq}`;
       lastId = id;
       internalActive = false;
+      humanTurnKeyMark = lastHumanKeyAt();
       return id;
     },
     noteTurnSettled() {

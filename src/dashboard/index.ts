@@ -386,7 +386,6 @@ import { CHAT_MAIN_AUTO_ENTRY_KEY_NAME } from './input/entry-mode.js';
 import { resolveDashboardChatMainPostTurn } from './input/chat-main-post-turn.js';
 import { resolveDashboardChatMainSubmitIntent } from './input/chat-main-submit-route.js';
 import { resolveDashboardChatMainSlashCommand } from './input/chat-main-slash-command.js';
-import { isClassicSigquitChord, registerClassicSigquitHandler } from './classic-sigquit.js';
 import { TuiChatPersonaSelection, tuiChatPersonaMessages } from './slash-runtime/chat-persona.js';
 import { awaitGlobalPersonaLoad } from '../persona/global-registry.js';
 import { createDashboardInlineSetupFlow } from './setup-inline.js';
@@ -1000,7 +999,7 @@ import {
   cleanupDashboardWorktreeSessions,
   createDashboardPlanModeHandoff,
 } from './plan-mode-runtime-boot.js';
-import { bootDashboardShellRunner } from './shell-runner-boot.js';
+import { bootDashboardShellRunner } from '../surface/shell-runner-boot.js';
 import { bootDashboardWidgetInspector } from './widget-inspector-boot.js';
 import { bootDashboardWidgetTools } from './widget-tools-boot.js';
 import { bootDashboardViewTools } from './view-tools-boot.js';
@@ -2053,7 +2052,6 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
   let disposeDashboardEventLoopMonitor = (): void => {};
   // TUI-AGENT-IDLE-WAKE — 이 대시보드 «자기» 완료 알림 구독만 푼다(배선 지점에서 채운다).
   let disposeDashboardAgentWake = (): void => {};
-  let disposeClassicSigquit = (): void => {};
   let closeClassicSidetabRuntime = (): void => {};
   let restoreTuiStderrOwner = (): void => {};
   const closeDashboardTui = (): void => {
@@ -2061,8 +2059,6 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
     disposeFatalErrorHandlers = (): void => {};
     disposeDashboardEventLoopMonitor();
     try { disposeDashboardAgentWake(); } catch { /* never block exit */ }
-    disposeClassicSigquit();
-    disposeClassicSigquit = (): void => {};
     try { closeClassicSidetabRuntime(); } catch { /* never block exit */ }
     closeClassicSidetabRuntime = (): void => {};
     try { restoreTuiStderrOwner(); } catch { /* never block screen cleanup */ }
@@ -3233,7 +3229,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getCwd: () => workingDir.cwd,
     notify: (line) => { chatLines.push(C.muted(line)); draw(); },
   });
-  const seatMailInbox = createSeatMailInboxWiring({ getCwd: () => workingDir.cwd, startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts), log: (category, event, data) => { debug.log(category, event, data); } }); // ⭐ ELN-SEAT-INBOX-TURN-BOUNDARY — 턴 경계 우편 수신·주입·ack(배선 본체: seat-mail-inbox-wiring.ts)
+  const seatMailInbox = createSeatMailInboxWiring({ getCwd: () => workingDir.cwd, startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts), getSessionId: currentChatPersonaSessionId, log: (category, event, data) => { debug.log(category, event, data); } }); // ⭐ ELN-SEAT-INBOX-TURN-BOUNDARY — 턴 경계 우편 수신·주입·ack(배선 본체: seat-mail-inbox-wiring.ts · 박동 sessionId 공급은 sprint O5 OP #93799)
   let autowakeTurnFailureRaw: string | null = null; // failed-turn 콜백이 설정, 그 턴의 스트리밍 정리에서 소비
   // ⭐ TURN-END-BEFORE-GOAL 골 이어가기 — «…하겠습니다» 로 끝났는데 결과물 없으면 H2 문으로 한 턴 더(판정·상한: goal-continue.ts · 여기선 배선만).
   const goalContinue = createGoalContinue({
@@ -4776,13 +4772,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     draw();
   };
   registerLogFoldInputBinding(toggleAllLogFolds);
-
-  const showClassicSigquitGuidance = (): void => {
-    debug.log('dashboard.signal', 'sigquit-guidance', { surface: 'classic', source: 'ctrl-backslash' });
-    chatLines.push(C.warning('  classic 사이드탭: /side · /side new · /side attach <번호>'));
-    chatScrollOffset = -1;
-    draw({ force: true });
-  };
 
   restoreTuiStderrOwner = installTuiStderrOwner((line) => {
     chatLines.push(C.warning(`[stderr] ${line}`));
@@ -12666,9 +12655,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       void started.completion;
       return started.result;
     });
-    disposeClassicSigquit = registerClassicSigquitHandler(() => {
-      classicSidetabRuntime.beginPrefix();
-    });
 
     // E3 (2026-05-17) — copyLastAssistantTurnToClipboard /
     // copyLastAssistantCodeToClipboard land into the outer-scoped
@@ -14616,12 +14602,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         classicSidetabRuntime.routeKey(routeKey);
       const priorityRoute = await routeDashboardPriorityKey(key, {
         inputOwner: chatMainVisibility.inputOwnership?.owner,
-        routeClassicSigquitChord: (routeKey) => {
-          if (classicSidetabRuntime.routeKey(routeKey)) return true;
-          if (!isClassicSigquitChord(routeKey)) return false;
-          showClassicSigquitGuidance();
-          return true;
-        },
         routeBellKey: async (routeKey) => {
           if (!bellOpen || routeKey.mouse) return false;
           const inst = widgetHost.get('wd-notification-bell');
@@ -15409,9 +15389,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
               routeQuitChord: (key) => {
                 if (classicSidetabRuntime.routeKey(key)) return 'consumed';
-                if (!isClassicSigquitChord(key)) return 'passthrough';
-                showClassicSigquitGuidance();
-                return 'consumed';
+                return 'passthrough';
               },
               shouldRouteInputDispatcherKey: (key) => {
                 const topModalId = display.modalStack().at(-1) ?? null;

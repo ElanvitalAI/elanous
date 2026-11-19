@@ -1,4 +1,8 @@
-// ELN-SEAT-TURN-CAP-CONTINUE(OP P0 · 11-18 13:0x) — 역할 상한·체크포인트·레지스트리 runtime 판정표.
+// SEAT-TURN-CAP-DEFAULT-15M (#38786) — JUD must ⓐ 수리(20261119-0319-JUD-CONFIRM-38786):
+// 삭제된 seat-turn-cap-role.test.ts 가 살아 있는 함수의 불변식 시험까지 지웠다.
+// seatCapCheckpoint 2 + readSeatRuntime 3 시험을 원문 그대로 이동해 온다.
+// (resolveSeatTurnCapForRole·seatRegistryRuntime 시험은 함수 자체가 삭제돼 함께 갔다.)
+// 원본: d826cc0586 src/core-turn/seat-turn-cap-role.test.ts — 출처: #38786
 //
 // 규칙 11(07:4x 회고): 시험 기대값은 제품과 독립 — 상수·렌더 함수 재사용 없이 독립 리터럴만.
 // 판정자가 같은 명령으로 같은 수를 얻어야 서명한다.
@@ -7,53 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readSeatRuntime } from './seat-registry-runtime.js';
-import {
-  resolveSeatTurnCapForRole,
-  seatCapCheckpoint,
-  seatRegistryRuntime,
-} from './seat-turn-cap.js';
-
-describe('resolveSeatTurnCapForRole — 역할 × 상한 판정표', () => {
-  // 행 = 레지스트리 runtime. 기대값은 독립 리터럴(구현 손 180 도구·45분 / 운영 60 도구·20분).
-  it('runtime=eln 자리만 구현 손 상한을 받고 나머지는 운영 상한 그대로다', () => {
-    const table: Array<[string | undefined, number, number]> = [
-      ['eln', 180, 2700000],
-      ['claude-code', 60, 1200000],
-      ['codex', 60, 1200000],
-      ['external-cli', 60, 1200000],
-      ['human', 60, 1200000],
-      [undefined, 60, 1200000],
-    ];
-    for (const [runtime, maxTools, maxWallMs] of table) {
-      expect(resolveSeatTurnCapForRole(runtime, undefined)).toEqual({
-        maxTools,
-        maxWallMs,
-        idleEmptyMsgListLimit: 2,
-      });
-    }
-  });
-
-  it('명시 override 칸은 역할 상한보다 이긴다(구현 손도 30 도구로 낮출 수 있다)', () => {
-    const overrideTools = 30;
-    const lowered = resolveSeatTurnCapForRole('eln', { maxTools: overrideTools });
-    expect(lowered.maxTools).toBe(30);
-    expect(lowered.maxWallMs).toBe(45 * 60_000);
-    expect(lowered.idleEmptyMsgListLimit).toBe(2);
-  });
-
-  it('idle «할 일 0» 칸은 역할이 안 바꾼다', () => {
-    expect(resolveSeatTurnCapForRole('eln', undefined).idleEmptyMsgListLimit).toBe(2);
-    expect(resolveSeatTurnCapForRole('claude-code', undefined).idleEmptyMsgListLimit).toBe(2);
-  });
-});
-
-describe('seatRegistryRuntime — 읽기 실패는 운영 상한으로', () => {
-  it('리더가 던지면 undefined(= 운영 상한)이고, 읽히면 그 값을 그대로 돌린다', () => {
-    expect(seatRegistryRuntime('UX', () => { throw new Error('registry locked'); })).toBeUndefined();
-    expect(seatRegistryRuntime('UX', () => 'eln')).toBe('eln');
-    expect(seatRegistryRuntime('UX', () => undefined)).toBeUndefined();
-  });
-});
+import { seatCapCheckpoint } from './seat-turn-cap.js';
 
 describe('seatCapCheckpoint — 체크포인트 유무 판정표', () => {
   // 행 = 요약(빈 · 있음 · 1500자 초과). 기대값은 독립 리터럴(표식·자를 길이 포함).

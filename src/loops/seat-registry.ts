@@ -9,7 +9,7 @@ export function readRegistryFile(path: string): string {
   return registryFileRead.read(path);
 }
 
-export type SeatRegistryWake = 'herdr' | 'pty-inject' | 'none';
+export type SeatRegistryWake = 'herdr' | 'pty-inject' | 'els' | 'none';
 export type SeatRegistryReplyBody = 'agent' | 'none' | 'rules';
 /** Which agent body runs in the seat's pane (OP 11-17 21:5x). `eln` seats watch their own inbox (#38164) when opted in. */
 export type SeatAgentRuntime = 'eln' | 'claude-code' | 'codex';
@@ -36,6 +36,7 @@ export type SeatRegistryRead =
 const ADDRESS = /^[A-Z][A-Z0-9_-]{0,63}$/;
 const HOST = /^(?:local|[A-Za-z0-9][A-Za-z0-9.-]{0,252})$/;
 const TARGET = /^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/;
+const ELS_TARGET = /^els:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 function parseRegistry(raw: unknown): SeatRegistry {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('expected an object');
@@ -52,12 +53,12 @@ function parseRegistry(raw: unknown): SeatRegistry {
     if (seen.has(address)) throw new Error(`duplicate address ${address}`);
     seen.add(address);
     if (!HOST.test(host)) throw new Error(`seats[${index}].host is invalid`);
-    if (entry.wake !== 'herdr' && entry.wake !== 'pty-inject' && entry.wake !== 'none') throw new Error(`seats[${index}].wake is invalid`);
+    if (entry.wake !== 'herdr' && entry.wake !== 'pty-inject' && entry.wake !== 'els' && entry.wake !== 'none') throw new Error(`seats[${index}].wake is invalid`);
     if (entry.replyBody !== 'agent' && entry.replyBody !== 'none' && entry.replyBody !== 'rules') throw new Error(`seats[${index}].replyBody is invalid`);
     if (typeof entry.optIn !== 'boolean') throw new Error(`seats[${index}].optIn must be boolean`);
-    if (entry.wake !== 'none' && (!target || !TARGET.test(target))) throw new Error(`seats[${index}].target is required and must be host:pane`);
+    if (entry.wake !== 'none' && (!target || !(entry.wake === 'els' ? ELS_TARGET.test(target) : TARGET.test(target)))) throw new Error(`seats[${index}].target is required and must be host:pane`);
     if (entry.wake === 'pty-inject' && host !== 'local') throw new Error(`seats[${index}]: pty-inject requires host=local`);
-    if (entry.wake === 'none' && target !== undefined && !TARGET.test(target)) throw new Error(`seats[${index}].target is invalid`);
+    if (entry.wake === 'none' && target !== undefined && !TARGET.test(target) && !ELS_TARGET.test(target)) throw new Error(`seats[${index}].target is invalid`);
     if (host === 'unknown' && (entry.wake !== 'none' || target !== undefined || entry.optIn !== false)) throw new Error('unknown host cannot bind a wake target');
     if (entry.runtime !== undefined && !SEAT_AGENT_RUNTIMES.includes(entry.runtime as SeatAgentRuntime)) throw new Error(`seats[${index}].runtime must be eln, claude-code or codex`);
     return { address, host, ...(target ? { target } : {}), wake: entry.wake, replyBody: entry.replyBody, optIn: entry.optIn,
@@ -122,7 +123,7 @@ function deliveryOf(value: unknown, index: number): SeatRegistryDelivery {
  *  herdr/pty-inject inject, so they are adapter and keep the pane target as session.
  *  Any other wake (including a future no-inject value) stays eln/queue and must not invent an adapter session. */
 export function normalizeSeatRegistryV1Entry(entry: SeatRegistryEntry): SeatRegistryEntryV2 {
-  if (entry.wake === 'herdr' || entry.wake === 'pty-inject') {
+  if (entry.wake === 'herdr' || entry.wake === 'pty-inject' || entry.wake === 'els') {
     return {
       // A declared eln body keeps its pane as the adapter session (the 60s fallback knocks there) but is runtime eln.
       address: entry.address, host: entry.host, runtime: entry.runtime === 'eln' ? 'eln' : 'external-cli', delivery: 'adapter',
@@ -149,7 +150,7 @@ function parseV2Seat(value: unknown, index: number, seen: Set<string>): SeatRegi
   const delivery = deliveryOf(entry.delivery, index);
   if (entry.replyBody !== 'agent' && entry.replyBody !== 'none' && entry.replyBody !== 'rules') throw new Error(`seats[${index}].replyBody is invalid`);
   if (typeof entry.optIn !== 'boolean') throw new Error(`seats[${index}].optIn must be boolean`);
-  if (session !== undefined && !SESSION.test(session) && !TARGET.test(session)) throw new Error(`seats[${index}].session is invalid`);
+  if (session !== undefined && !SESSION.test(session) && !TARGET.test(session) && !ELS_TARGET.test(session)) throw new Error(`seats[${index}].session is invalid`);
   // Agent seats have no delivery=none. parked is only for a human reader.
   if (runtime !== 'human' && delivery === 'none') throw new Error(`seats[${index}]: agent seat cannot use delivery=none`);
   if (delivery === 'parked' && runtime !== 'human') throw new Error(`seats[${index}]: parked delivery requires runtime=human`);

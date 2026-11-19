@@ -269,6 +269,7 @@ import { toolSurface } from '../boot/daemon-tools/index.js';
 import type { DaemonToolSurfaceKind } from '../boot/daemon-tools/types.js';
 import {
   runAcpServer,
+  WEBTERM_EXT_METHOD_ALLOWLIST,
   type AcpServerOptions,
 } from '../acp/server.js';
 import { globalAcpAgentManager } from '../acp/agent-manager.js';
@@ -1766,6 +1767,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     // broadcast-only (legacy).
 
     void runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
       runTurn,
       hasSession: (id) => runtimeHistory!.has(id),
       shutdownSignal: acpShutdown.signal,

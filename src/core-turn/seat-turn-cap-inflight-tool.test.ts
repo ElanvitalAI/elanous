@@ -11,6 +11,7 @@ import { SEAT_TURN_CAP_DEFAULTS } from './seat-turn-cap.js';
 import { buildReplTools } from '../repl/index.js';
 import { dispatchBash } from '../skills/tools/index.js';
 
+// 아래 리터럴은 역사적 주석과 달리 현재 기본값과 독립된 시험 설정이다.
 const SEAT = { seat: 'QSEAT', ...SEAT_TURN_CAP_DEFAULTS, maxWallMs: 900_000 }; // 출처: 내부 문서 `TURN-CAPSULE-EVENTS` — 운영 15분 자리 턴 상한(chat.seatTurnCap.maxWallMs)
 
 function harness() {

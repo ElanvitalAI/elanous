@@ -100,22 +100,27 @@ test('non-TA launches need no receipt; inherited parent receipt skips the receip
 
 // ③ `tasks preflight --out` 이 만든 실제 영수증 → 발사 관문 통과/거부, 두 쪽을 한 시험으로 묶는다.
 const GOOD_EVIDENCE = {
+  cardId: 'card-1',
   source: { requestedPin: SHA, childHead: SHA, privateRepo: true },
   image: { expectedDigest: `sha256:${'b'.repeat(64)}`, observedDigest: `sha256:${'b'.repeat(64)}` },
-  workOrder: { cellId: 'CELL-A', boundary: 'src/a.ts', budget: '6900s', contract: 'c', escalation: 'OP', unknownFields: [] },
-  autoMerge: false,
+  workOrder: { cellId: 'CELL-A', boundary: 'src/a.ts', budget: '6900s', contract: 'c', escalation: 'OP', unknownFields: [],
+    owner: 'TC', card: 'card-1', noAutoMerge: true, budgetLimits: { timeSec: 6900, usdCap: 5 } },
+  launchArgv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge', 'synthetic goal'],
+  mergePolicy: { taLandEnv: false, liveMovesProposeLand: false },
   owner: { card: 'TC', lease: 'TC', pod: 'TC' },
   limits: { wallClockSec: 6900, jobDeadlineSec: 10800, usdCap: 5 },
-  launch: { requestConsumed: false, activeSameGoalRuns: 0, opHoldActive: false },
-  entrance: { name: 'hand', groundingConfigured: true },
+  launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false },
+  entrance: { name: 'hand', groundingPolicy: { off: true, reason: 'test policy' } },
 };
 
 async function runPreflight(evidence: unknown, args: string[], outName: string): Promise<{ path: string; sha: string; exit: number }> {
   const evidencePath = join(dir, `${outName}.evidence.json`);
   const out = join(dir, `${outName}.json`);
+  const taskStatePath = join(dir, `${outName}.cards.json`);
   writeFileSync(evidencePath, JSON.stringify(evidence));
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'card-1': { id: 'card-1', text: 'synthetic goal', status: 'handed', history: [] } } }));
   const program = new Command().name('elanous').exitOverride();
-  registerTasksCommands(program, { output: () => {} });
+  registerTasksCommands(program, { output: () => {}, taskStatePath, preflightActiveRuns: () => [], preflightHoldActive: () => false });
   const previous = process.exitCode;
   process.exitCode = undefined;
   try {

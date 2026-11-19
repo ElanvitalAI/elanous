@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { parseWorkOrder, WORK_ORDER_FIELDS, type WorkOrder } from './work-order.js';
+import { parseWorkOrder, workOrderBudgetLimits, WORK_ORDER_FIELDS, type WorkOrder } from './work-order.js';
 
 export type WorkOrderRevision = string;
 
@@ -32,7 +32,8 @@ export function buildWorkOrder(input: BuildWorkOrderInput): WorkOrder {
     escalation: input.escalation,
   }));
   if (!parsed.ok) throw new Error(parsed.reason);
-  return parsed.order;
+  const budgetLimits = input.budget === undefined ? undefined : workOrderBudgetLimits(input.budget);
+  return { ...parsed.order, ...(budgetLimits ? { budgetLimits } : {}) };
 }
 
 
@@ -42,6 +43,10 @@ export function hashWorkOrderContent(order: WorkOrder, sourceRevision: WorkOrder
     cellId: order.cellId.trim(),
     sourceRevision: sourceRevision.trim(),
     fields: WORK_ORDER_FIELDS.map((field) => [field, order[field].trim()] as const),
+    ...(order.owner !== undefined ? { owner: order.owner } : {}),
+    ...(order.card !== undefined ? { card: order.card } : {}),
+    ...(order.noAutoMerge !== undefined ? { noAutoMerge: order.noAutoMerge } : {}),
+    ...(order.budgetLimits !== undefined ? { budgetLimits: order.budgetLimits } : {}),
     dependencies: (order.dependencies ?? []).map(({ cell, state, observedAt }) => ({
       cell: cell.trim(), state: state.trim(), observedAt: observedAt.trim(),
     })).sort((left, right) => {

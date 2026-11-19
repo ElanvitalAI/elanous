@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGraphEventBus, type GraphEvent } from '../graph-runner/graph-events.js';
 import { listGraphRuns, runGraph } from '../graph-runner/runner.js';
-import { dispatchGraphEventToDeclaredTargets } from './graph-trigger-dispatch.js';
+import { dispatchGraphEventToDeclaredTargets, dispatchSupervisorEventToDeclaredTargets,
+  type SupervisorTriggerEvent } from './graph-trigger-dispatch.js';
+import { claimGraphTriggerDispatchLease, registerGraphTriggerDispatchBinding,
+  releaseGraphTriggerDispatchLease } from './graph-trigger-dispatch-lease.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -128,4 +131,56 @@ test('unreadable or malformed event declarations leave source events pending for
     await dispatchGraphEventToDeclaredTargets(f.emitted[0]!, { graphRoot: f.root, registryRoot: f.root, stateRoot: f.root });
     expect(listGraphRuns(f.root).runs.filter(run => run.graphId === 'target')).toHaveLength(1);
   }
+});
+
+const supervisorEvent: SupervisorTriggerEvent = { supervisorId: 'loop:rla@1', targetGraphId: 'release-loop',
+  targetRunId: 'release-run', eventId: 'gate-failed-1', type: 'supervisor.complete',
+  emittedAt: '2026-11-18T00:00:00.000Z', data: { operation: 'reroute' } };
+
+test('one simulated supervisor event starts its declared target once and redelivery adds no run', async () => {
+  const f = fixture();
+  writeTarget(f.graphs, 'target', "'loop:rla@1'", 'supervisor.complete');
+  writeTarget(f.graphs, 'wrong-supervisor', "'loop:other@1'", 'supervisor.complete');
+  writeTarget(f.graphs, 'wrong-type', "'loop:rla@1'", 'supervisor.input_required');
+  const options = { graphRoot: f.root, registryRoot: f.root, stateRoot: f.root };
+
+  const first = await dispatchSupervisorEventToDeclaredTargets(supervisorEvent, options);
+  expect(first.map(result => [result.registration.graphId, result.claimed, result.mode]))
+    .toEqual([['target', true, 'start']]);
+  expect(first[0]?.state?.input).toEqual({ supervisorEvent });
+  expect(listGraphRuns(f.root).runs.map(run => run.graphId)).toEqual(['target']);
+
+  const duplicate = await dispatchSupervisorEventToDeclaredTargets(supervisorEvent, options);
+  expect(duplicate).toHaveLength(1);
+  expect(duplicate[0]?.mode).toBeUndefined();
+  expect(duplicate[0]?.registration.runId).toBe(first[0]?.registration.runId);
+  expect(listGraphRuns(f.root).runs.filter(run => run.graphId === 'target')).toHaveLength(1);
+});
+
+test('supervisor event dispatch waits on a live dispatch lease and runs once after release', async () => {
+  const f = fixture();
+  writeTarget(f.graphs, 'target', "'loop:rla@1'", 'supervisor.complete');
+  const options = { graphRoot: f.root, registryRoot: f.root, stateRoot: f.root };
+  const identity = { triggerId: 'event:loop:rla@1:supervisor.complete:target',
+    dedupeKey: 'loop:rla@1:release-loop:release-run:gate-failed-1', graphId: 'target' };
+  const binding = registerGraphTriggerDispatchBinding(identity, { registryRoot: f.root, stateRoot: f.root });
+  const held = claimGraphTriggerDispatchLease({ ...identity, runId: binding.runId }, { registryRoot: f.root, stateRoot: f.root });
+  if (!held.claimed) throw new Error('fixture lease was not claimed');
+
+  const blocked = await dispatchSupervisorEventToDeclaredTargets(supervisorEvent, options);
+  expect(blocked.map(result => result.claimed)).toEqual([false]);
+  expect(listGraphRuns(f.root).runs).toHaveLength(0);
+
+  releaseGraphTriggerDispatchLease(held.lease);
+  const released = await dispatchSupervisorEventToDeclaredTargets(supervisorEvent, options);
+  expect(released.map(result => [result.claimed, result.mode, result.registration.runId]))
+    .toEqual([[true, 'start', binding.runId]]);
+  expect(listGraphRuns(f.root).runs.filter(run => run.graphId === 'target')).toHaveLength(1);
+});
+
+test('supervisor event routing refuses an event without its routing identity', async () => {
+  const f = fixture();
+  await expect(dispatchSupervisorEventToDeclaredTargets({ ...supervisorEvent, supervisorId: ' ' },
+    { graphRoot: f.root, registryRoot: f.root, stateRoot: f.root }))
+    .rejects.toThrow('supervisor event routing requires supervisorId');
 });

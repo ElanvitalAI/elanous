@@ -1,6 +1,7 @@
 // 증거 수집기 시험 — 기대값을 수집기·제품 상수로 만들지 않는다. 원장은 «실제 생산자»(podSelfImplementSpawn · kubectl 가짜 클러스터)가
 // 쓴 것을 읽고, 기대값은 이 파일의 독립 리터럴(sha·digest)이다.
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { Command } from 'commander';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,7 +9,7 @@ import { join } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
-import { evidenceFromRunLedger, mergeCollectedEvidence } from './ta-preflight-collect.js';
+import { collectRuntimePreflightEvidence, evidenceFromRunLedger, mergeCollectedEvidence } from './ta-preflight-collect.js';
 import { evaluateTaPreflight } from './ta-preflight.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 
@@ -16,6 +17,62 @@ const PIN_SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
 const PIN_DIGEST = `sha256:${'c'.repeat(64)}`;
 const OTHER_DIGEST = `sha256:${'d'.repeat(64)}`;
+
+test('runtime collection measures the selected card claim and active runs; unknown is not zero', () => {
+  const card = { id: 'ta-collect', seat: 'TC', status: 'handed' as const, history: [] };
+  expect(collectRuntimePreflightEvidence({ card, activeRuns: [], opHoldActive: false }).launch)
+    .toMatchObject({ cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }); // 출처: #98174 격리 카드·빈 원장 픽스처.
+  expect(collectRuntimePreflightEvidence({ card: { ...card, history: [{ event: 'preflight-live-claim' }] }, activeRuns: 'unknown', opHoldActive: null }).launch)
+    .toMatchObject({ cardClaimed: true, activeSameGoalRuns: null, opHoldActive: null });
+  expect(collectRuntimePreflightEvidence({ card: null, activeRuns: 'unknown', opHoldActive: false }).launch)
+    .toMatchObject({ cardClaimed: null, activeSameGoalRuns: null });
+  expect(collectRuntimePreflightEvidence({ card: { ...card, runId: 'run-existing' }, activeRuns: ['run-existing'], opHoldActive: false }).launch)
+    .toMatchObject({ cardClaimed: true, activeSameGoalRuns: 1 }); // 출처: #98174 위 run 하나를 보유한 카드 픽스처.
+});
+
+test('preflight CLI reads card claim and exact-goal run observation, preserving unknown on query failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'preflight-auto-'));
+  const statePath = join(root, 'tasks.json'), evidencePath = join(root, 'evidence.json');
+  const id = 'ta-autocollect', text = 'synthetic goal';
+  const writeCard = (history: unknown[]) => writeFileSync(statePath, JSON.stringify({ tasks: {
+    [id]: { id, seat: 'TC', text, status: 'handed', history },
+  } }));
+  writeCard([]);
+  writeFileSync(evidencePath, JSON.stringify({ cardId: id, launchArgv: ['harness', 'say', text] }));
+  const previous = process.exitCode;
+  const run = async (active: (goalId: string) => readonly string[] | 'unknown') => {
+    const lines: string[] = []; const program = new Command().name('elanous').exitOverride();
+    registerTasksCommands(program, { taskStatePath: statePath, output: line => lines.push(line),
+      preflightActiveRuns: active, preflightHoldActive: () => false });
+    await program.parseAsync(['node', 'eln', 'tasks', 'preflight', '--evidence', evidencePath, '--card', id]);
+    return lines.join('\n');
+  };
+  try {
+    let observedGoal = '';
+    expect(await run((goal) => { observedGoal = goal; return []; })).toMatch(/PASS +5\./u);
+    expect(observedGoal).toBe(`request-${createHash('sha256').update(text).digest('hex').slice(0, 32)}`);
+    expect(await run(() => { throw new Error('ledger unavailable'); })).toMatch(/UNMEASURED +5\./u);
+    writeCard([{ event: 'preflight-live-claim' }]);
+    expect(await run(() => [])).toMatch(/FAIL +5\./u);
+  } finally { process.exitCode = previous ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('preflight without card cannot trust supplied launch observations for cell or commit receipt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'preflight-no-card-'));
+  const evidencePath = join(root, 'evidence.json');
+  writeFileSync(evidencePath, JSON.stringify({ workOrder: { cellId: 'cell-1' }, source: { requestedPin: 'a'.repeat(40) }, launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false } }));
+  const previous = process.exitCode;
+  try {
+    for (const target of [['--cell', 'cell-1'], ['--commit', 'a'.repeat(40)]]) {
+      const lines: string[] = [];
+      const program = new Command().name('elanous').exitOverride();
+      registerTasksCommands(program, { taskStatePath: join(root, 'tasks.json'), output: line => lines.push(line),
+        preflightActiveRuns: () => [], preflightHoldActive: () => false });
+      await program.parseAsync(['node', 'eln', 'tasks', 'preflight', '--evidence', evidencePath, ...target]);
+      expect(lines.join('\n')).toMatch(/UNMEASURED +5\./u);
+    }
+  } finally { process.exitCode = previous ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
 
 interface CanaryOptions { logs: string; imageID: string | null; tag: string }
 
@@ -130,19 +187,21 @@ test('a real canary whose child HEAD / imageID are malformed is flagged malforme
 const row = (event: string, data: Record<string, unknown>): RunLedgerEntry => ({ runId: 'run-table', event, data });
 const P = PIN_SHA;
 const D = PIN_DIGEST;
+// ② 열: #38394(«② pin 필수», 11-18 08:39)가 이 표(#38396, 08:26) 뒤에 착지 — 이미지 digest pin 이 없는 줄은 ② 가 UNMEASURED 가
+// 아니라 FAIL(«요청 pin 없음 — no-pin 으로 통과해 버림»). MAIN-BASELINE-RED-CLEAR.
 const cases: Array<{ name: string; entries: RunLedgerEntry[]; source?: { requestedPin: string; childHead: string | null }; image?: { expectedDigest: string; observedDigest: string | null }; malformed: string[]; status: ['PASS' | 'FAIL' | 'UNMEASURED', 'PASS' | 'FAIL' | 'UNMEASURED'] }> = [
   { name: '①② 값 있음·일치', entries: [row('pod-source-head-check', { pinned: P, received: P }), row('pod-image-digest', { digestPin: D, digest: D, final: true })], source: { requestedPin: P, childHead: P }, image: { expectedDigest: D, observedDigest: D }, malformed: [], status: ['PASS', 'PASS'] },
-  { name: '① received 없음(null)', entries: [row('pod-source-head-check', { pinned: P, received: null })], source: { requestedPin: P, childHead: null }, malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
-  { name: '① received 빈 문자열 = 없음', entries: [row('pod-source-head-check', { pinned: P, received: '  ' })], source: { requestedPin: P, childHead: null }, malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
-  { name: '① received 형식 오류(짧은 hex)', entries: [row('pod-source-head-check', { pinned: P, received: 'abc123' })], source: { requestedPin: P, childHead: 'abc123' }, malformed: ['source.childHead'], status: ['FAIL', 'UNMEASURED'] },
-  { name: '① received 형식 오류(숫자)', entries: [row('pod-source-head-check', { pinned: P, received: 12345 })], source: { requestedPin: P, childHead: 'number:12345' }, malformed: ['source.childHead'], status: ['FAIL', 'UNMEASURED'] },
-  { name: '① received 대문자 hex = 정규화돼 있음', entries: [row('pod-source-head-check', { pinned: P, received: P.toUpperCase() })], source: { requestedPin: P, childHead: P }, malformed: [], status: ['PASS', 'UNMEASURED'] },
-  { name: '① pinned 없음 → 수집 안 함', entries: [row('pod-source-head-check', { pinned: null, received: P })], malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
-  { name: '① pinned 형식 오류', entries: [row('pod-source-head-check', { pinned: 'zz', received: P })], source: { requestedPin: 'zz', childHead: P }, malformed: ['source.requestedPin'], status: ['FAIL', 'UNMEASURED'] },
+  { name: '① received 없음(null)', entries: [row('pod-source-head-check', { pinned: P, received: null })], source: { requestedPin: P, childHead: null }, malformed: [], status: ['UNMEASURED', 'FAIL'] },
+  { name: '① received 빈 문자열 = 없음', entries: [row('pod-source-head-check', { pinned: P, received: '  ' })], source: { requestedPin: P, childHead: null }, malformed: [], status: ['UNMEASURED', 'FAIL'] },
+  { name: '① received 형식 오류(짧은 hex)', entries: [row('pod-source-head-check', { pinned: P, received: 'abc123' })], source: { requestedPin: P, childHead: 'abc123' }, malformed: ['source.childHead'], status: ['FAIL', 'FAIL'] },
+  { name: '① received 형식 오류(숫자)', entries: [row('pod-source-head-check', { pinned: P, received: 12345 })], source: { requestedPin: P, childHead: 'number:12345' }, malformed: ['source.childHead'], status: ['FAIL', 'FAIL'] },
+  { name: '① received 대문자 hex = 정규화돼 있음', entries: [row('pod-source-head-check', { pinned: P, received: P.toUpperCase() })], source: { requestedPin: P, childHead: P }, malformed: [], status: ['PASS', 'FAIL'] },
+  { name: '① pinned 없음 → 수집 안 함', entries: [row('pod-source-head-check', { pinned: null, received: P })], malformed: [], status: ['UNMEASURED', 'FAIL'] },
+  { name: '① pinned 형식 오류', entries: [row('pod-source-head-check', { pinned: 'zz', received: P })], source: { requestedPin: 'zz', childHead: P }, malformed: ['source.requestedPin'], status: ['FAIL', 'FAIL'] },
   { name: '② digest 없음(null)·nonstandard 사유 없음', entries: [row('pod-image-digest', { digestPin: D, digest: null, final: true })], image: { expectedDigest: D, observedDigest: null }, malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
   { name: '② digest 형식 오류(문자열)', entries: [row('pod-image-digest', { digestPin: D, digest: 'sha256:xyz', final: true })], image: { expectedDigest: D, observedDigest: 'sha256:xyz' }, malformed: ['image.observedDigest'], status: ['UNMEASURED', 'FAIL'] },
   { name: '② digest null + nonstandard-image-id + imageID 원값 = 형식 오류', entries: [row('pod-image-digest', { digestPin: D, digest: null, digestUnavailable: 'nonstandard-image-id', imageID: 'weird-id', final: true })], image: { expectedDigest: D, observedDigest: 'weird-id' }, malformed: ['image.observedDigest'], status: ['UNMEASURED', 'FAIL'] },
-  { name: '② digestPin 없음 → 수집 안 함', entries: [row('pod-image-digest', { digestPin: null, digest: D, final: true })], malformed: [], status: ['UNMEASURED', 'UNMEASURED'] },
+  { name: '② digestPin 없음 → 수집 안 함', entries: [row('pod-image-digest', { digestPin: null, digest: D, final: true })], malformed: [], status: ['UNMEASURED', 'FAIL'] },
   { name: '② digestPin 형식 오류', entries: [row('pod-image-digest', { digestPin: 'sha256:short', digest: D, final: true })], image: { expectedDigest: 'sha256:short', observedDigest: D }, malformed: ['image.expectedDigest'], status: ['UNMEASURED', 'FAIL'] },
 ];
 for (const c of cases) {

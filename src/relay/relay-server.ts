@@ -1,4 +1,5 @@
 import { createPublicKey, randomBytes, randomUUID, verify } from "node:crypto";
+import { constantTimeTokenEqual } from "./member-service-token.js"; // (출처: #39104) 상수시간 대조
 import {
   closeSync,
   constants,
@@ -27,6 +28,10 @@ import {
   type PublicDispatchRoute,
 } from "./public-dispatch.js";
 import { isAnonymousPublicAppRead } from "./public-app-read.js";
+/** WEBCHAT-SESSION-HANDOFF — the member Nexus's derived web-chat session cookie (http-server.ts
+ * WEBCHAT_SESSION_COOKIE_NAME · value `wcs_<uuid>`). Shape only; the member Nexus validates it. */
+const WEBCHAT_SESSION_COOKIE =
+  /(?:^|;\s*)__Secure-elanous_webchat_session=wcs_[0-9a-f-]{36}(?:;|$)/i;
 import {
   validatedRelayPublicPolicySnapshot,
   type AutoPublicAppRegistration,
@@ -383,20 +388,64 @@ type SocketData = {
   tokens: number;
   refillAt: number;
   memberId?: string;
+  /** (출처: #39104) 회원 서버 서비스 자격(ems_)으로 승인된 연결 — 핀 읽기 게이트만 읽는다. */
+  memberService?: boolean;
+  /** (출처: #106092) ⓑ — 정책 member-service 결속 키로 온 연결(ems_ 서비스 자격 필수). */
+  memberServiceBound?: boolean;
   connectionId: string;
   authTimer?: ReturnType<typeof setTimeout>;
 };
 type Socket = ServerWebSocket<SocketData>;
+
+// (출처: #39104) 회원 서버 역할 서비스 토큰(ems_) 자격 증명 — WS 업그레이드
+// 프로토콜 목록에서만 운반된다. 공개 HTTP 회원 경로(memberAuthorized)에는
+// 효력이 없다: 서비스 자격은 host 연결 심사일 뿐이고 «아무 회원의 핸들 핀
+// 불리언 읽기» 외 권한은 0이다(쓰기 포함).
+const memberServiceCredential = (req: Request): string | undefined =>
+  req.headers
+    .get("sec-websocket-protocol")
+    ?.split(",")
+    .map((value) => value.trim())
+    .find((value) => /^ems_[A-Za-z0-9_-]+$/.test(value));
 type PublicResponse = {
   status: number;
   headers: Record<string, string>;
   body: string;
+  /**
+   * 출처: #39009 — true 면 `body` 는 빈 헤더-only scaffold 이고 실제 바디는
+   * 뒤따르는 `{chunk:"<base64>"}` 데이터 프레임으로 흘러온다(SSE 스트리밍).
+   */
+  stream?: boolean;
 };
 const publicNotFound = () =>
   new Response("Not Found", {
     status: 404,
     headers: { "content-type": "text/plain; charset=utf-8" },
   });
+
+/**
+ * WEBCHAT-401-LOGIN-PAGE — bare 핸들 호스트(회원 webchat 원점)에서 세션 없는
+ * «문서 요청»(GET + Accept: text/html)에 내려 줄 로그인 안내 본문. 401 상태·
+ * 쿠키·리다이렉트는 그대로 두고 401 본문 렌더만 교체한다(데모 빈 화면 RED 수리).
+ */
+const BARE_WEBCHAT_LOGIN_GUIDE_HTML = `<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>엘라누스 회원 로그인</title>
+</head>
+<body style="font-family: system-ui, sans-serif; max-width: 640px; margin: 4rem auto; text-align: center">
+<main>
+  <h1>엘라누스 회원 로그인 → 내 엘라누스에서 웹채팅 열기</h1>
+  <p>이 핸들 주소는 회원 로그인 후 이용할 수 있습니다.</p>
+  <p><a href="https://elanous.ai/members/"><button>엘라누스 회원 로그인</button></a></p>
+</main>
+</body>
+</html>`;
+const isBareWebchatDocumentRequest = (request: Request) =>
+  request.method === "GET" &&
+  (request.headers.get("accept") ?? "").includes("text/html");
 type PublicRequest = {
   channel: import("./channel.js").EncryptedChannel;
   decoder: MuxDecoder;
@@ -408,6 +457,12 @@ type PublicRequest = {
   connectionId: string;
   releaseSlot: () => void;
   response?: PublicResponse;
+  /**
+   * 출처: #39009 — 스트리밍 scaffold Response 의 바디 컨트롤러. `stream:true`
+   * envelope 프레임에서 채워지고, `{chunk}` 프레임으로 append 하다가 close
+   * 프레임에서 EOF 를 낸다.
+   */
+  streamController?: ReadableStreamDefaultController<Uint8Array>;
 };
 type AppKillSwitch = Pick<
   ReturnType<typeof import("./app-kill-switch.js").createAppKillSwitch>,
@@ -416,6 +471,12 @@ type AppKillSwitch = Pick<
 type Room = {
   host?: Socket;
   hostPublicKey?: Uint8Array;
+  /**
+   * (출처: #39104) ⓑ1 수리 — 서비스 자격(ems_) 연결 목록. 호스트 슬롯
+   * (host)과 분리되어 duplicate-host 검사·퇴거 대상이 아니고
+   * hostPublicKey 도 쓸 수 없다(«핀 읽기 질의» 전용).
+   */
+  services: Set<Socket>;
   clients: Map<number, Socket>;
   publicRequests: Map<number, PublicRequest>;
   publicSlots: number;
@@ -433,11 +494,23 @@ export interface RelayServerOptions {
   memberRequired?: boolean;
   /** Server IDs are pinned to the owning Nexus member, independent of caller claims. */
   hostOwnerMemberIds?: ReadonlyMap<string, string>;
+  /** (출처: #106092) ⓑ — 정책 member-service 결속 키 집합(선택). 등재
+   * serverId 는 owner 없이 유효(회원 서버 역할)하며 ems_ 없는 연결은
+   * fail-closed(비-WS 403 · WS 4401). */
+  memberServiceServerIds?: ReadonlySet<string>;
   /** Introspects relay.connect on every connection, so expiry and revocation take effect. */
   validateMemberToken?: (
     token: string,
     serverId: string,
   ) => Promise<{ memberId: string } | null>;
+  /**
+   * (출처: #39104) 회원 서버 역할 서비스 토큰(ems_ 접두 단일 시크릿). 회전은
+   * env(ELANOUS_RELAY_MEMBER_SERVICE_TOKEN) 또는 0600 권한 파일
+   * (ELANOUS_RELAY_MEMBER_SERVICE_TOKEN_FILE)로 한다. 이 자격은 «아무 회원의
+   * 핸들 핀 여부 불리언 읽기»만 허용하고 public-handle-pin 쓰기는 전부
+   * 거부된다(쓰기는 emt_ 소유자 대조만 지난다).
+   */
+  memberServiceToken?: string;
   /** Operator-provided private free-tier limits. The server never returns these values. */
   trafficCap?: RelayTrafficCapConfig;
   /** Optional synchronous private usage store; read/write failure rejects the measured frame. */
@@ -473,6 +546,16 @@ export interface RelayServerOptions {
       ownerId: string,
       input: { user: string; memberId: string },
     ): void | Promise<void>;
+    /** OP #105017 ⓐ① — 인증된 «핀 읽기» 질의: 살아 있는 핀 여부만 불리언으로 답한다(다른 값 노출 없음). */
+    queryHandlePin?(
+      serverId: string,
+      ownerId: string,
+      input: { user: string; memberId: string },
+    ): boolean | Promise<boolean>;
+    /** (출처: #39104) 회원 서버 서비스 자격 «핀 읽기» — 연결 소유자가 아닌 회원의 살아 있는 핀도 불리언으로 답한다(쓰기 경로 없음). */
+    queryHandlePinByMember?(
+      input: { user: string; memberId: string },
+    ): boolean | Promise<boolean>;
   };
   /** Separate expiring app/path POST opt-in; never extends member or control authority. */
   publicVisitorWritePolicies?: readonly PublicAppVisitorWritePolicy[];
@@ -551,6 +634,8 @@ function responseFromPublicEnvelope(
   value: PublicResponse | undefined,
   publicHost: string,
   internalHost: string,
+  // 출처: #39009 — 스트리밍 scaffold 의 바디 컨트롤러를 돌려받을 싱크.
+  streamSink?: { streamController?: ReadableStreamDefaultController<Uint8Array> },
 ): Response {
   if (
     !value ||
@@ -629,6 +714,18 @@ function responseFromPublicEnvelope(
       }
     } else headers.set(name, raw);
   }
+  if (value.stream) {
+    // 출처: #39009 — 헤더-only 스트리밍 scaffold: 바디는 지금 비어 있고
+    // 뒤따르는 `{chunk:"<base64>"}` 데이터 프레임으로 채워진다. 컨트롤러는
+    // streamSink 로 넘겨 조기 resolve 된 Response 가 계속 흐르게 한다.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (streamSink) streamSink.streamController = controller;
+        else controller.close();
+      },
+    });
+    return new Response(body, { status: value.status, headers });
+  }
   const body = Buffer.from(value.body, "base64");
   if (body.byteLength > MAX_MUX_FRAME_BYTES)
     return new Response("Response too large", { status: 502 });
@@ -681,6 +778,10 @@ export function startRelayServer(options: RelayServerOptions = {}) {
   let hostOwnerMemberIds = options.hostOwnerMemberIds
     ? new Map(options.hostOwnerMemberIds)
     : undefined;
+  // (출처: #106092) ⓑ — 정책 member-service 결속 집합(reload 시 원자 교체).
+  let memberServiceServerIds = options.memberServiceServerIds
+    ? new Set(options.memberServiceServerIds)
+    : undefined;
   for (const [id, key] of trustedHostKeys) {
     if (!/^[a-f0-9]{64}$/.test(id) || !decodeKey(key))
       throw new Error("invalid relay trusted host key entry");
@@ -690,7 +791,10 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     (!options.validateMemberToken ||
       !options.hostOwnerMemberIds ||
       [...trustedHostKeys.keys()].some(
-        (id) => !options.hostOwnerMemberIds?.get(id),
+        (id) =>
+          // (출처: #106092) ⓑ — 결속 서비스 키는 owner 없이 허용(회원 서버 역할).
+          !options.hostOwnerMemberIds?.get(id) &&
+          !options.memberServiceServerIds?.has(id),
       ))
   ) {
     throw new Error(
@@ -881,15 +985,24 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       : undefined;
     const nextKeys = new Map(candidate.trustedHostKeys);
     const nextOwners = new Map(candidate.hostOwnerMemberIds);
+    // (출처: #106092) ⓑ — reload 후보에 member-service 결속 집합도 반영한다.
+    const nextMemberServiceServerIds = candidate.memberServiceServerIds
+      ? new Set(candidate.memberServiceServerIds)
+      : undefined;
     const replaced = new Set(
       [...trustedHostKeys.keys()].filter(
         (serverId) =>
           nextKeys.get(serverId) !== trustedHostKeys.get(serverId) ||
-          nextOwners.get(serverId) !== hostOwnerMemberIds?.get(serverId),
+          nextOwners.get(serverId) !== hostOwnerMemberIds?.get(serverId) ||
+          // (출처: #106092) ⓑ — 결속 등재·해제도 권한 변경: 재심사(fail-closed).
+          // (출처: #106214) ⓑ 회귀 수리 — 양변 ?? false: 미구성 시 무변경.
+          (nextMemberServiceServerIds?.has(serverId) ?? false) !==
+            (memberServiceServerIds?.has(serverId) ?? false),
       ),
     );
     trustedHostKeys = nextKeys;
     hostOwnerMemberIds = nextOwners;
+    memberServiceServerIds = nextMemberServiceServerIds;
     publicRoutes = candidate.publicDispatchRoutes;
     publicReadableApps = new Set(candidate.publicReadableApps);
     publicReadExpiresAt = new Map(candidate.publicReadExpiresAt);
@@ -904,6 +1017,8 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     let room = rooms.get(id);
     if (!room) {
       room = {
+        // (출처: #39104) ⓑ1 — 서비스(ems_) 연결 목록(호스트 슬롯과 분리).
+        services: new Set(),
         clients: new Map(),
         publicRequests: new Map(),
         publicSlots: 0,
@@ -995,6 +1110,11 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         rooms.delete(data.serverId);
       return;
     }
+    // (출처: #39104) ⓑ1 수리 — 서비스 자격(ems_) 연결 정리: 호스트 슬롯·
+    // 공개 요청에는 영향 없이 services 목록에서만 뺀다.
+    if (data.role === "host" && data.memberService === true) {
+      room.services.delete(ws);
+    }
     if (data.role === "host" && room.host === ws) {
       room.host = undefined;
       room.hostPublicKey = undefined;
@@ -1046,21 +1166,37 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       .replace(/:\d+$/, "")
       .replace(/\.$/, "");
     const customRoute = customDomainRoutes.get(normalizedHost);
-    const publicApp =
+    let publicApp =
       parsePublicAppHost(hostHeader, options.publicDomain) ??
       (customRoute
         ? { app: customRoute.app, user: customRoute.user }
         : undefined);
+    // HANDLE-BARE-HOST-WEBCCHAT-PROXY: marks a bare-handle hit so forwarding keeps
+    // the member's own public host instead of a synthesized app origin.
+    let bareHit = false;
+    // 출처: #39024 — bare 고정 핸들 웹채팅 경로(진입 3종 + 회원 채팅 API 2종)는
+    // publicReadableApps "정확히 1개" 게이트보다 앞에서 판정한다. 공개 앱이
+    // 0개여도 bare 요청은 회원 Nexus 로 흘러야 하기 때문이다.
+    const bareEntryPath = new URL(req.url).pathname;
+    const bareWebChatNexusPath =
+      bareEntryPath === "/" ||
+      bareEntryPath === "/app/chat" ||
+      bareEntryPath.startsWith("/app/chat/") ||
+      bareEntryPath === "/v1/chat/events" ||
+      bareEntryPath === "/v1/prompt/stream";
     if (!publicApp) {
       // A bare member host can point only to one explicitly public app on a pinned host.
       // A second app makes the destination ambiguous, so the route stays closed.
+      // HANDLE-BARE-HOST-WEBCCHAT-PROXY (OP #99957): the bare handle host now proxies
+      // that single public app (the member webchat) instead of 308-redirecting, so the
+      // member's own address serves the chat directly and write routes flow through
+      // the same per-method gates as the app host.
       const suffix = `.${options.publicDomain}`;
       const bareUser =
         options.publicDomain && normalizedHost.endsWith(suffix)
           ? normalizedHost.slice(0, -suffix.length)
           : "";
       if (
-        (req.method === "GET" || req.method === "HEAD") &&
         bareUser &&
         /^[a-z][a-z0-9]{2,19}$/.test(bareUser) &&
         !["www", "docs", "api", "admin", "relay", "mail"].includes(bareUser) &&
@@ -1075,22 +1211,25 @@ export function startRelayServer(options: RelayServerOptions = {}) {
           if (
             parsePublicAppHost(targetHost, options.publicDomain)?.app === app
           ) {
-            const url = new URL(req.url);
-            return new Response(null, {
-              status: 308,
-              headers: {
-                location: `https://${targetHost}${url.pathname}${url.search}`,
-                "cache-control": "no-store",
-              },
-            });
+            publicApp = { app, user: bareUser };
+            bareHit = true;
           }
+        } else if (apps.length === 0 && bareWebChatNexusPath) {
+          // 출처: #39024 — 공개 앱이 0개여도 bare 웹채팅 경로는 회원 Nexus 로
+          // 흐른다. 앱 프록시가 아니므로 "정확히 1개" 게이트에 갇히지 않으며,
+          // 앱 이름은 bareNexusRoute 전달에 쓰지 않는다. 복수 공개 앱(모호)은
+          // 이전과 같이 닫아 둔다.
+          publicApp = { app: "", user: bareUser };
+          bareHit = true;
         }
       }
-      const legacyRoom = options.publicServerId
-        ? rooms.get(options.publicServerId)
-        : undefined;
-      if (legacyRoom) fail(legacyRoom, "public-invalid-host");
-      return publicNotFound();
+      if (!publicApp) {
+        const legacyRoom = options.publicServerId
+          ? rooms.get(options.publicServerId)
+          : undefined;
+        if (legacyRoom) fail(legacyRoom, "public-invalid-host");
+        return publicNotFound();
+      }
     }
     const serverId =
       publicRoutes?.get(publicApp.user)?.serverId ??
@@ -1248,7 +1387,20 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     }
     const readKey = publicApp.user + "/" + publicApp.app;
     const readExpiry = publicReadExpiresAt.get(readKey);
+    // WEBCHAT-SESSION-HANDOFF (JUD must ⓑ): after the handoff the bare-origin PWA carries
+    // no emt_, only the derived wcs_ web-chat session cookie (HttpOnly, set by the member
+    // Nexus on the exchange). The relay cannot read that ledger, so on the two chat routes
+    // of a bare handle host only — which go to the member Nexus itself, never to an app —
+    // it forwards such a request with its cookie, and the member Nexus decides (handle ·
+    // expiry · revocation · pin owner; anything else is its 401).
+    const bareWebChatSession =
+      bareHit &&
+      ((req.method === "POST" && bareEntryPath === "/v1/prompt/stream") ||
+        (req.method === "GET" && bareEntryPath === "/v1/chat/events")) &&
+      !memberCredentials(req).length &&
+      WEBCHAT_SESSION_COOKIE.test(req.headers.get("cookie") ?? "");
     const anonymousPublicRead =
+      !bareWebChatSession &&
       (readExpiry === undefined || Date.now() < readExpiry) &&
       isAnonymousPublicAppRead(
         req,
@@ -1257,7 +1409,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         publicReadableApps,
       );
     const visitorPolicy =
-      visitorGate && !memberCredentials(req).length
+      visitorGate && !bareWebChatSession && !memberCredentials(req).length
         ? visitorPolicies.find(
             (policy) =>
               policy.user === publicApp.user &&
@@ -1295,7 +1447,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     }
     const anonymousVisitorWrite = visitorBody !== undefined;
     const memberGate =
-      anonymousPublicRead || anonymousVisitorWrite
+      anonymousPublicRead || anonymousVisitorWrite || bareWebChatSession
         ? { status: "allowed" as const, consumed: [] }
         : await memberAuthorized(req, serverId);
     if (memberGate.status !== "allowed") {
@@ -1303,6 +1455,21 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       // A verified member of another host must not learn whether this app is mounted.
       // Match the app-host's missing-app response, including body and content type.
       if (memberGate.status === "foreign") return publicNotFound();
+      // WEBCHAT-401-LOGIN-PAGE: bare 핸들 호스트의 세션 없는 «문서 요청»만 401 상태
+      // 유지 + 로그인 안내 HTML 본문. API(JSON·SSE)·app 오리진은 기존 본문 그대로.
+      // busy(429) 회원은 로그인 안내 대신 기존 busy 본문을 유지한다(JUD must ⓑ).
+      if (
+        bareHit &&
+        memberGate.status !== "busy" &&
+        isBareWebchatDocumentRequest(req)
+      )
+        return new Response(BARE_WEBCHAT_LOGIN_GUIDE_HTML, {
+          status: 401,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+          },
+        });
       return new Response(
         memberGate.status === "busy" ? "busy" : "unauthorized",
         { status: memberGate.status === "busy" ? 429 : 401 },
@@ -1315,7 +1482,22 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       .toLowerCase()
       .replace(/:\d+$/, "")
       .replace(/\.$/, "");
-    const internalHost = `${publicApp.app}.app.localhost`;
+    // HANDLE-BARE-HOST-WEBCCHAT-PROXY: a bare handle host has no app origin of
+    // its own. Only the webchat PWA entry routes the member Nexus serves on a
+    // bare host (/, /app/chat, /app/chat/*) forward under the member's public
+    // host — a non-app host falls through NEXUS-APP-HOST-S1 to the member Nexus
+    // PWA default routes. Every other bare-handle path keeps proxying the
+    // single pinned public app under its synthesized origin, so #38981/#38994
+    // app-host semantics (e.g. session cookies staying bound to the serving
+    // host) stay unchanged.
+    const barePath = new URL(req.url).pathname;
+    // 출처: #39024 — 회원 채팅 API 2종(/v1/chat/events, /v1/prompt/stream)도
+    // bare 오리진에서 회원 Nexus 가 직접 받는다(SSE). 경로 집합은 위
+    // bareWebChatNexusPath 분기와 같은 5종으로 유지한다.
+    const bareNexusRoute = bareHit && bareWebChatNexusPath;
+    const internalHost = bareNexusRoute
+      ? publicHost
+      : `${publicApp.app}.app.localhost`;
     if (!room?.host || !room.hostPublicKey) {
       if (room) fail(room, "public-host-offline");
       return new Response("Host unavailable", { status: 503 });
@@ -1450,10 +1632,19 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       ]) {
         forwardedHeaders.delete(name);
       }
+      // 출처: #39024 — 허용된 회원 채팅 API 2경로(/v1/chat/events,
+      // /v1/prompt/stream)는 회원 게이트가 소비한 Authorization 을 지우지
+      // 않고 그대로 전달한다(회원 Nexus 의 checkAuth/SSE 구독이 원본 bearer
+      // 를 다시 검증한다). 그 외 경로는 이전과 같이 지워 앱 백엔드로의
+      // bearer 재생을 막는다.
+      const bareChatApiRoute =
+        bareNexusRoute &&
+        (barePath === "/v1/chat/events" || barePath === "/v1/prompt/stream");
       if (
         memberGate.consumed.some(
           (credential) => credential.source === "authorization",
-        )
+        ) &&
+        !bareChatApiRoute
       )
         forwardedHeaders.delete("authorization");
       const relayProtocols = new Set(
@@ -1572,15 +1763,46 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       if (!trustedHostKeys.has(serverId))
         return new Response("unknown serverId", { status: 403 });
       const memberGate = await memberAuthorized(req, serverId);
-      if (memberGate.status !== "allowed") {
+      // (출처: #39104) 회원 서버 역할 서비스 토큰(ems_) — host 연결 심사용
+      // 단일 시크릿을 상수시간 대조로만 인정한다. 이 자격은 회원 신원
+      // (data.memberId)을 주지 않는다: «아무 회원의 핸들 핀 불리언 읽기»만
+      // 넓어지고 public-handle-pin 쓰기는 emt_ 소유자 대조를 그대로 지나야
+      // 한다. 공개 HTTP 회원 경로에는 효력이 없다(protocol 헤더 · host WS 만).
+      const serviceCredentialToken =
+        url.pathname === "/host" ? memberServiceCredential(req) : undefined;
+      const memberServiceAuthorized =
+        serviceCredentialToken !== undefined &&
+        options.memberServiceToken !== undefined &&
+        constantTimeTokenEqual(
+          serviceCredentialToken,
+          options.memberServiceToken,
+        );
+      // (출처: #106092) ⓑ — 결속 키는 ems_ 서비스 연결로만: 서비스 자격 없는
+      // 연결(유효한 emt_ 포함)은 일반 호스트 슬롯으로도 fail-closed(403·4401).
+      const memberServiceBound =
+        memberServiceServerIds?.has(serverId) === true;
+      if (memberServiceBound && !memberServiceAuthorized) {
+        debug.log("relay.auth", "member-service-bound", {
+          serverId,
+          route: url.pathname,
+        });
+        if (!isWebSocket)
+          return new Response("member service required", { status: 403 });
+      }
+      if (memberGate.status !== "allowed" && !memberServiceAuthorized) {
         debug.log("relay.auth", "member-denied", {
           serverId,
           route: url.pathname,
         });
-        return new Response(
-          memberGate.status === "busy" ? "busy" : "unauthorized",
-          { status: memberGate.status === "busy" ? 429 : 401 },
-        );
+        // (출처: #39104) ⓑ1 수리 — WS 업그레이드 요청은 HTTP 401 대신
+        // 업그레이드를 완료해 open() 에서 닫힘 코드 401 로 끊는다
+        // (클라이언트가 «회원 게이트 401» 을 WS 닫힘 코드로 관측 —
+        // fail-closed). HTTP(비-WS) 요청은 기존 그대로 401/429 본문.
+        if (!isWebSocket)
+          return new Response(
+            memberGate.status === "busy" ? "busy" : "unauthorized",
+            { status: memberGate.status === "busy" ? 429 : 401 },
+          );
       }
       if (!isWebSocket)
         return new Response("upgrade required", { status: 426 });
@@ -1595,9 +1817,16 @@ export function startRelayServer(options: RelayServerOptions = {}) {
             lastSeen: now,
             tokens: BURST_BYTES,
             refillAt: now,
-            memberId: options.memberRequired
-              ? hostOwnerMemberIds!.get(serverId)
-              : undefined,
+            memberId:
+              options.memberRequired && memberGate.status === "allowed"
+                ? // (출처: #39104) emt_ 소유자 자격이 소비된 연결만 회원 신원을
+                  // 가진다 — 서비스(ems_) 단독 연결은 신원 없음(쓰기 0).
+                  hostOwnerMemberIds!.get(serverId)
+                : undefined,
+            // (출처: #39104) 회원 서버 서비스 자격 — 핀 읽기 게이트만 읽는다.
+            memberService: memberServiceAuthorized || undefined,
+            // (출처: #106092) ⓑ — 결속 키로 온 연결 표식(ems_ 없으면 open() 4401).
+            memberServiceBound: memberServiceBound || undefined,
             connectionId: randomUUID(),
           },
         })
@@ -1611,9 +1840,28 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       open(ws) {
         sockets.add(ws);
         const data = ws.data;
+        // (출처: #39104) ⓑ1 수리 — 회원 게이트가 거부한 WS 연결(emt_·ems_
+        // 모두 없음)은 업그레이드 완료 후 닫힘 코드 4401 로 끊는다(시험③
+        // fail-closed 관측 · OP 마지막 1줄 401→4401). 게이트를 통과한 연결만
+        // memberId 또는 memberService 를 가지므로 아래 조건은 «거부된
+        // 연결»과 정확히 일치한다(busy 포함 → 401).
+        // (출처: #106092) ⓑ — 결속 키는 ems_ 없으면 memberRequired 무관 4401.
+        if (
+          (options.memberRequired &&
+            data.memberId === undefined &&
+            data.memberService !== true) ||
+          (data.memberServiceBound === true && data.memberService !== true)
+        ) {
+          ws.close(4401, "unauthorized");
+          return;
+        }
         const room = roomFor(data.serverId);
         if (data.role === "host") {
-          if (room.host) {
+          // (출처: #39104) ⓑ1 수리 — 서비스 자격(ems_) 연결은 호스트 키
+          // 연결 경로에서 분리한다: duplicate-host 검사·퇴거 대상이
+          // 아니고 room.host 슬롯도 차지하지 않는다(auth 성공 시 아래
+          // message() 에서 room.services 로 등록된다).
+          if (!data.memberService && room.host) {
             fail(room, "duplicate-host");
             ws.close(1008, "host already connected");
             return;
@@ -1698,7 +1946,13 @@ export function startRelayServer(options: RelayServerOptions = {}) {
               /* invalid public key */
             }
           }
-          if (!valid || (room.host && room.host !== ws)) {
+          // (출처: #39104) ⓑ1 수리 — 서비스 자격(ems_) 연결은 호스트 슬롯
+          // 경쟁자가 아니므로 «이미 다른 호스트가 슬롯에 있다»는 사실만으로
+          // auth 를 끊지 않는다(서명 검증 자체는 그대로 엄격하다).
+          if (
+            !valid ||
+            (!data.memberService && room.host && room.host !== ws)
+          ) {
             fail(room, "invalid-auth");
             ws.close(1008, "invalid host signature");
             return;
@@ -1706,8 +1960,15 @@ export function startRelayServer(options: RelayServerOptions = {}) {
           data.authenticated = true;
           data.challenge = undefined;
           if (data.authTimer) clearTimeout(data.authTimer);
-          room.host = ws;
-          room.hostPublicKey = undefined;
+          if (data.memberService) {
+            // (출처: #39104) ⓑ1 수리 — auth 성공한 서비스 연결은
+            // room.host 가 아니라 room.services 에 등록한다. host 슬롯과
+            // hostPublicKey 는 전혀 건드리지 않는다(덮어쓰기 방어).
+            room.services.add(ws);
+          } else {
+            room.host = ws;
+            room.hostPublicKey = undefined;
+          }
           sendControl(
             ws,
             options.publicDomain
@@ -1717,7 +1978,14 @@ export function startRelayServer(options: RelayServerOptions = {}) {
           return;
         }
         if (typeof message === "string") {
-          if (data.role === "host" && options.publicDomain) {
+          // (출처: #39104) ⓑ1 수리 — app-control 프레임은 공개 도메인 relay
+          // 뿐 아니라 앱 등록·핀 원장(autoAppRegistration)을 운영하는 relay
+          // 에서도 유효하다. #39104 실경로 시험은 publicDomain 없이
+          // host WS 챌린지·서명만으로 질의·쓰기를 왕복한다.
+          if (
+            data.role === "host" &&
+            (options.publicDomain || options.autoAppRegistration)
+          ) {
             if (message.length > 4_096) {
               ws.close(1009, "host control too large");
               return;
@@ -1737,6 +2005,66 @@ export function startRelayServer(options: RelayServerOptions = {}) {
               typeof value.publicKey === "string"
                 ? decodeKey(value.publicKey)
                 : undefined;
+            // (출처: #39104) ⓑ1 수리 — 서비스 자격(ems_) 연결 전용 app-control
+            // 분기: 서비스 연결은 room.host 슬롯이 아니므로 아래 일반 호스트
+            // 분기들(room.host === ws)에 들어갈 수 없다. public-handle-pin-query
+            // 만 queryHandlePinByMember(회원별 원장 읽기)로 회답하고,
+            // public-handle-pin · public-app-register/unregister 등 그 밖의
+            // 프레임은 전부 rejected 로 돌려보낸다(서비스 자격 쓰기 0).
+            // host-public-key 프레임은 무시한다(회신 없음) — 서비스 연결의
+            // room.hostPublicKey 덮어쓰기 방어.
+            if (data.memberService === true) {
+              if (value.type === "host-public-key") return;
+              if (
+                options.autoAppRegistration?.queryHandlePinByMember &&
+                typeof value.requestId === "string" &&
+                /^[a-f0-9-]{36}$/.test(value.requestId) &&
+                value.type === "public-handle-pin-query" &&
+                value.registration &&
+                typeof (value.registration as { user?: unknown }).user ===
+                  "string" &&
+                typeof (value.registration as { memberId?: unknown }).memberId ===
+                  "string"
+              ) {
+                void Promise.resolve()
+                  .then(() =>
+                    options.autoAppRegistration!.queryHandlePinByMember!(
+                      value.registration as { user: string; memberId: string },
+                    ),
+                  )
+                  .then(
+                    (pinned) => {
+                      sendControl(ws, {
+                        type: "public-app-accepted",
+                        requestId: value.requestId,
+                        // (출처: #39104) 회답은 불리언 하나만 나간다.
+                        result: pinned === true,
+                      });
+                    },
+                    () => {
+                      sendControl(ws, {
+                        type: "public-app-rejected",
+                        requestId: value.requestId,
+                      });
+                    },
+                  );
+                return;
+              }
+              // (출처: #39104) 그 밖의 서비스 프레임 — 쓰기 전부 rejected.
+              if (
+                typeof value.requestId === "string" &&
+                /^[a-f0-9-]{36}$/.test(value.requestId)
+              ) {
+                sendControl(ws, {
+                  type: "public-app-rejected",
+                  requestId: value.requestId,
+                });
+                return;
+              }
+              fail(room, "plaintext-data");
+              ws.close(1003, "binary ciphertext required");
+              return;
+            }
             if (
               value.type === "host-public-key" &&
               publicKey &&
@@ -1796,10 +2124,75 @@ export function startRelayServer(options: RelayServerOptions = {}) {
                 );
               return;
             }
+          // OP #105017 ⓐ①③ — 회원 서버의 «핀 읽기» 질의. 서비스 자격은 핀
+          // 쓰기와 같은 신뢰 채널(host 챌린지 서명 + emt_ 회원 토큰 →
+          // data.memberId)이고, 응답은 «핸들 H · 회원 M · 지금 살아 있는 인증
+          // 호스트 핀» 불리언만 나간다. 위조(memberId ≠ owner)·남의 핸들은
+          // 거부되고, 회원 서버는 거부를 false 로 해석한다(fail-closed ②).
+          if (
+            options.autoAppRegistration?.queryHandlePin &&
+            room.host === ws &&
+            // (출처: #39104) ⓑ1 수리 — 질의 회답은 불리언 하나뿐인 제어면
+            // 읽기다: hostPublicKey 전제를 떼고 호스트 슬롯 인증
+            // (room.host === ws)을 자격으로 삼는다. 시험②·실경로는
+            // host-public-key 프레임 없이 rejected/accepted 를 기대한다.
+            typeof value.requestId === "string" &&
+            /^[a-f0-9-]{36}$/.test(value.requestId) &&
+            value.type === "public-handle-pin-query" &&
+            value.registration &&
+            typeof (value.registration as { user?: unknown }).user ===
+              "string" &&
+            typeof (value.registration as { memberId?: unknown }).memberId ===
+              "string"
+          ) {
+            const ownerId = hostOwnerMemberIds?.get(data.serverId);
+            const claimedMemberId = (
+              value.registration as { memberId: string }
+            ).memberId;
             if (
-              options.autoAppRegistration?.pinHandle &&
+              !ownerId ||
+              data.memberId !== ownerId ||
+              claimedMemberId !== ownerId
+            ) {
+              sendControl(ws, {
+                type: "public-app-rejected",
+                requestId: value.requestId,
+              });
+              return;
+            }
+            void Promise.resolve()
+              .then(() =>
+                options.autoAppRegistration!.queryHandlePin!(
+                  data.serverId,
+                  ownerId,
+                  value.registration as { user: string; memberId: string },
+                ),
+              )
+              .then(
+                (pinned) => {
+                  sendControl(ws, {
+                    type: "public-app-accepted",
+                    requestId: value.requestId,
+                    // OP #105017 ① — 불리언만 내려보낸다.
+                    result: pinned === true,
+                  });
+                },
+                () => {
+                  sendControl(ws, {
+                    type: "public-app-rejected",
+                    requestId: value.requestId,
+                  });
+                },
+              );
+            return;
+          }
+          if (
+            options.autoAppRegistration?.pinHandle &&
               room.host === ws &&
-              room.hostPublicKey &&
+              // (출처: #39104) ⓑ1 수리 — 핀 쓰기 자격도 호스트 슬롯 인증
+              // (room.host === ws + emt_ 소유자 대조)으로 충분하다.
+              // hostPublicKey 전제를 유지하면 host-public-key 프레임 없는
+              // 실경로 호스트의 쓰기가 전부 잘려 나간다(시험①②).
               typeof value.requestId === "string" &&
               /^[a-f0-9-]{36}$/.test(value.requestId) &&
               value.type === "public-handle-pin" &&
@@ -1969,20 +2362,71 @@ export function startRelayServer(options: RelayServerOptions = {}) {
             return;
           }
           if (decoded.value.kind === "data") {
+            let parsed: unknown;
             try {
-              pending.response = JSON.parse(
+              parsed = JSON.parse(
                 new TextDecoder().decode(decoded.value.data),
-              ) as PublicResponse;
+              );
             } catch {
               clearTimeout(pending.timer);
               room.publicRequests.delete(clientId);
               pending.releaseSlot();
               pending.resolve(new Response("Bad gateway", { status: 502 }));
+              return;
+            }
+            if (
+              parsed &&
+              typeof parsed === "object" &&
+              "chunk" in parsed &&
+              typeof (parsed as { chunk?: unknown }).chunk === "string"
+            ) {
+              // 출처: #39009 — 스트리밍 chunk 프레임: scaffold 바디에 도착
+              // 순서대로 base64 디코드해 이어 붙인다.
+              if (pending.streamController) {
+                pending.streamController.enqueue(
+                  new Uint8Array(
+                    Buffer.from((parsed as { chunk: string }).chunk, "base64"),
+                  ),
+                );
+              }
+              return;
+            }
+            pending.response = parsed as PublicResponse;
+            if (pending.response && pending.response.stream) {
+              // 출처: #39009 — 헤더-only `stream:true` envelope: scaffold
+              // Response 로 지금 바로 조기 resolve 하되, pending 은 뒤따르는
+              // `{chunk}`/close 프레임을 받기 위해 등록 상태로 남긴다.
+              const scaffold = responseFromPublicEnvelope(
+                pending.response,
+                pending.publicHost,
+                pending.internalHost,
+                pending,
+              );
+              if (pending.streamController) {
+                clearTimeout(pending.timer);
+                pending.resolve(scaffold);
+                return;
+              }
+              // 출처: #39009 — scaffold 를 못 만든 잘못된 envelope — 기존 502 정리.
+              clearTimeout(pending.timer);
+              room.publicRequests.delete(clientId);
+              pending.releaseSlot();
+              pending.resolve(scaffold);
+              return;
             }
           } else if (decoded.value.kind === "close") {
             clearTimeout(pending.timer);
             room.publicRequests.delete(clientId);
             pending.releaseSlot();
+            if (pending.streamController) {
+              // 출처: #39009 — 스트리밍 응답 종료: scaffold 바디에 EOF 를
+              // 보내 소비자 fetch 가 정상 끝맺음을 읽게 한다.
+              try {
+                pending.streamController.close();
+              } catch {
+                // 이미 닫혔으면 무시한다.
+              }
+            }
             pending.resolve(
               responseFromPublicEnvelope(
                 pending.response,

@@ -8,7 +8,7 @@ import { Command } from 'commander';
 import { MsgStore, type Message } from '../msg/msg-store.js';
 import { readPostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
-import { formatMessage, registerMsgCommands, type MsgCliDeps } from './msg-cli.js';
+import { formatMessage, registerMsgCommands, HOOK_STDIN_READ_LIMIT_MS, type MsgCliDeps } from './msg-cli.js';
 import { drainControlInbox, enqueueControlMemo, enqueueSoftStop, inspectControlInbox, readSoftStopRequest } from '../harness/control-inbox.js';
 import { runSelfImplement } from '../self-implement/orchestrator.js';
 import { seams } from '../self-implement/test-seams.js';
@@ -298,12 +298,12 @@ test('route shows reply body and resolved wake for loop and seat addresses', asy
   await f.run('route', 'opt', '--json');
   await f.run('route', 'ux', '--json');
   expect(f.stdout.map(line => JSON.parse(line))).toEqual([
-    { msgAddress: 'COORDINATOR', replyBody: 'rules', wake: 'cron', source: 'loop-table' },
-    { msgAddress: 'OPT', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing:candidates=0' },
-    { msgAddress: 'UX', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing:candidates=0' },
+    { msgAddress: 'COORDINATOR', replyBody: 'rules', wake: 'cron', source: 'loop-table', liveness: 'down' },
+    { msgAddress: 'OPT', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing:candidates=0', liveness: 'down' },
+    { msgAddress: 'UX', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing:candidates=0', liveness: 'down' },
   ]);
   await f.run('route', 'opt');
-  expect(f.stdout.at(-1)).toBe('OPT\treplyBody=모름\twake=none\t(unresolved: seat-registry-missing:candidates=0)');
+  expect(f.stdout.at(-1)).toBe('OPT\treplyBody=모름\twake=none\tliveness=down\t(unresolved: seat-registry-missing:candidates=0)');
 });
 
 test('pane address forms route through the Herdr census; unread drops recipients whose addresses are dead', async () => {
@@ -396,6 +396,7 @@ test('address register writes one private central registry row with explicit wak
   const result = JSON.parse(f.stdout[0]!);
   expect(result).toMatchObject({ address: 'NT-1', paneId: 'wJ:p10', host: 'mshq', changed: true, wakeEnabled: true });
   const registryPath = join(seatStateRoot, 'seat-registry.json');
+  expect(readFileSync(join(seatStateRoot, 'OP', 'tools', 'seat-panes.tsv'), 'utf8')).toBe('NT-1\twJ:p10\n');
   expect(lstatSync(registryPath).isFile()).toBe(true);
   expect(JSON.parse(readFileSync(registryPath, 'utf8')).seats.find((row: { address: string }) => row.address === 'OPT'))
     .toEqual({ address: 'OPT', host: 'unknown', wake: 'none', replyBody: 'agent', optIn: false });
@@ -409,6 +410,12 @@ test('address register writes one private central registry row with explicit wak
   await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p11', '--host', 'mshq', '--wake');
   expect(f.exits.at(-1)).toBe(2);
   expect(JSON.parse(readFileSync(registryPath, 'utf8')).seats.find((row: { address: string }) => row.address === 'NT-1').target).toBe('wJ:p10');
+  await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p11', '--host', 'mshq', '--replace');
+  const rebound = JSON.parse(readFileSync(registryPath, 'utf8')).seats.find((row: { address: string }) => row.address === 'NT-1');
+  expect(rebound).toMatchObject({ target: 'wJ:p11', optIn: false });
+  expect(readFileSync(join(seatStateRoot, 'OP', 'tools', 'seat-panes.tsv'), 'utf8')).toBe('NT-1\twJ:p11\n');
+  await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p12', '--host', 'node-c', '--replace');
+  expect(readFileSync(join(seatStateRoot, 'OP', 'tools', 'seat-panes.tsv'), 'utf8')).toBe('');
 });
 
 test('address register refuses a symlinked central registry and leaves its target untouched', async () => {
@@ -472,7 +479,9 @@ test('list pages by recipient and cursor; unread and watch are read-only until e
   } finally { store.close(); }
   await f.run('list', '--to', 't', '--limit', '1', '--json');
   expect(JSON.parse(f.stdout.pop()!).map((row: { id: number }) => row.id)).toEqual([1]);
+  expect(f.stderr.pop()).toContain('+1 더 · --after 1');
   await f.run('list', '--to', 'MK', '--after', '1');
+  expect(f.stdout.pop()).toBe('+0 더 · --after 3');
   expect(f.stdout.pop()).toContain('#3 ');
   await f.run('unread', '--json');
   expect(JSON.parse(f.stdout.pop()!)).toEqual([{ recipient: 'MK', count: 2 }, { recipient: 'UX', count: 1 }]);
@@ -501,6 +510,38 @@ test('list pages by recipient and cursor; unread and watch are read-only until e
   expect(f.stdout.pop()).toBe('UX: 1 unread');
   const reopened = f.store();
   try { expect(reopened.getCursor('MK')).toBe(3); } finally { reopened.close(); }
+});
+
+test('list reports the exact unread remainder and next cursor after a 100-message page', async () => {
+  const f = fixture();
+  const store = f.store();
+  try { for (let i = 1; i <= 140; i++) store.post({ from: 'OP', to: 'MK', body: `message ${i}` }); }
+  finally { store.close(); }
+  await f.run('list', '--to', 'MK');
+  expect(f.stdout.filter(line => line.startsWith('#'))).toHaveLength(100);
+  expect(f.stdout.at(-1)).toBe('+40 더 · --after 100');
+  f.stdout.length = 0;
+  await f.run('list', '--to', 'MK', '--after', '100');
+  expect(f.stdout.filter(line => line.startsWith('#'))).toHaveLength(40);
+  expect(f.stdout.at(-1)).toBe('+0 더 · --after 140');
+  f.stdout.length = 0;
+  await f.run('list', '--to', 'MK', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toHaveLength(100);
+  expect(f.stderr.at(-1)).toBe('+40 더 · --after 100');
+});
+
+test('list remainder excludes individually acknowledged mail and other recipients', async () => {
+  const f = fixture(), store = f.store();
+  try {
+    for (let i = 1; i <= 140; i++) store.post({ from: 'OP', to: 'MK', body: `message ${i}` });
+    store.ackMessage('MK', 20);
+    store.post({ from: 'OP', to: 'UX', body: 'not for MK' });
+    expect(store.unreadCountAfter('MK', 0)).toBe(139);
+    expect(store.unreadCountAfter('MK', 100)).toBe(40);
+  } finally { store.close(); }
+  await f.run('list', '--to', 'MK');
+  expect(f.stdout.filter(line => line.startsWith('#'))).toHaveLength(100);
+  expect(f.stdout.at(-1)).toBe('+39 더 · --after 101');
 });
 
 test('watch prints only unacknowledged messages for the seat and never acks by itself', async () => {
@@ -562,12 +603,18 @@ test('list --thread shows the durable request and reply across seats without cha
   const notice = JSON.parse(f.stdout.at(-1)!) as Message;
   await f.run('post', 'reply', '--from', 'TC', '--to', 'OP', '--reply-to', String(request.id), '--json');
   const reply = JSON.parse(f.stdout.at(-1)!) as Message;
+  // SEAT-MAIL #24 — the sender-entrance reply auto-acked the request for TC (one per-message ack row; the cursor
+  // still starts at 0). The stored row never carries the field, so strip it for the read-path comparisons below.
+  expect(reply.autoAcked).toBe(request.id);
+  delete reply.autoAcked;
   await f.run('list', '--thread', String(request.id), '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toEqual([request, reply]);
   await f.run('list', '--thread', String(request.id), '--after', String(request.id), '--limit', '1', '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toEqual([reply]);
   await f.run('list', '--to', 'TC', '--json');
-  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([request, notice]);
+  // SEAT-MAIL #24 — the auto-ack already consumed the request for TC; only the notice stays unread before the
+  // explicit cursor ack below.
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([notice]);
   await f.run('list', '--to', 'OP', '--json');
   expect(JSON.parse(f.stdout.at(-1)!)).toEqual([notice, reply]);
   await f.run('ack', String(request.id), '--to', 'TC');
@@ -1549,4 +1596,90 @@ test('ELN-SEAT-LIVE 11-18 — msg post to a runtime=eln seat WITHOUT autowake: n
   expect(f.exits).toEqual([]);
   expect(typed).toEqual([]);
   expect(fallbacks).toEqual([{ messageId: 1, recipient: 'HAND-ELN-ELS-API', from: 'RES-INFRA' }]);
+});
+
+test('ELS seat registration appears in msg route output', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-els-address-'));
+  dirs.push(seatStateRoot);
+  const f = fixture('', () => ({ wakeDeps: { seatStateRoot, listPtys: () => [], listHerdrPanes: () => [] } }));
+  await f.run('address', 'register', 'CX1', '--els-pane', 'els:w1/t1/p1', '--host', 'local', '--wake');
+  expect(f.exits).toEqual([]);
+  await f.run('route', 'CX1');
+  expect(f.stdout.at(-1)).toContain('wake=els');
+  expect(f.stdout.at(-1)).toContain('target=els:w1/t1/p1');
+});
+
+test('successful verified ELS wake records delivered but not seen', async () => {
+  const f = fixture('', () => ({ wake: async (address, msgId) => ({ wake: 'els', target: 'els:w1/t1/p1', source: 'seat-registry', address, msgId, result: 'injected' }) }));
+  await f.run('post', 'hello', '--from', 'OP', '--to', 'CX1', '--json');
+  const posted = JSON.parse(f.stdout[0]!) as { id: number };
+  const store = f.store();
+  try { expect(store.listReceipts({ messageId: posted.id }).map(row => row.state)).toEqual(['posted', 'delivered']); }
+  finally { store.close(); }
+});
+
+test('a busy ELS wake reports deferral while retaining the posted message', async () => {
+  const f = fixture('', () => ({ wake: async (address, msgId) => ({ wake: 'els', source: 'seat-registry', address, msgId, result: 'busy', reason: 'els-working' }) }));
+  await f.run('post', 'hello', '--from', 'OP', '--to', 'CX1', '--json');
+  expect(f.stderr.join('\n')).toContain('deferred (busy: els-working)');
+  const store = f.store();
+  try { expect(store.list('CX1').map(row => row.body)).toEqual(['hello']); }
+  finally { store.close(); }
+});
+
+test('busy ELS wake arms the existing one-shot retry, but uncertain delivery does not', async () => {
+  const retries: { messageId: number; recipient: string; from: string }[] = [];
+  let result: 'busy' | 'failed' = 'busy';
+  const f = fixture('', () => ({ wake: async (address, msgId) => ({ wake: 'els', source: 'seat-registry', address, msgId, result }),
+    spawnMailFallback: input => { retries.push(input); } }));
+  await f.run('post', 'first', '--from', 'OP', '--to', 'CX1');
+  result = 'failed';
+  await f.run('post', 'second', '--from', 'OP', '--to', 'CX1');
+  expect(retries).toEqual([{ messageId: 1, recipient: 'CX1', from: 'OP' }]);
+});
+
+test('msg hook CLI never blocks on a TTY stdin (interactive invocation)', async () => {
+  const f = fixture('', () => ({
+    hookStateDir: undefined, stdinIsTty: () => true,
+    readStdin: () => new Promise<string>(() => { /* never resolves — TTY 라면 읽지 않아야 완주 */ }),
+  }));
+  const store = f.store();
+  try { store.post({ from: 'MK', to: 'OP', body: 'tty invocation wake' }); } finally { store.close(); }
+  await f.run('hook', '--event', 'user-prompt-submit', '--format', 'claude', '--seat', 'OP');
+  expect(f.stdout[0]).toBeDefined();
+  expect(f.stderr).toEqual([]);
+});
+
+test('msg hook CLI bounds an unclosed pipe stdin: HOOK_STDIN_READ_LIMIT_MS 뒤 빈 입력 폴백으로 완주', async () => {
+  const f = fixture('', () => ({
+    hookStateDir: undefined, stdinIsTty: () => false,
+    readStdin: () => new Promise<string>(() => { /* never resolves — 닫히지 않는 파이프(테스트·데몬) */ }),
+    stdinReadLimitMs: 20,
+  }));
+  const store = f.store();
+  try { store.post({ from: 'MK', to: 'OP', body: 'unclosed pipe wake' }); } finally { store.close(); }
+  const started = Date.now();
+  await f.run('hook', '--event', 'user-prompt-submit', '--format', 'claude', '--seat', 'OP');
+  expect(Date.now() - started).toBeGreaterThanOrEqual(15); // 상한 대기 후 폴백 (즉시 EOF 아님)
+  expect(f.stdout[0]).toBeDefined(); // 빈 입력 → 프로세스 문맥(--seat) 으로 정상 hook 출력
+  expect(f.stderr).toEqual([]);
+});
+
+// [JUD-B #106365 must 1] fd0 반납 회귀 — 실자식: stdin 파이프를 열어 둔 채(EOF 없음) hook 을 돌려도
+// 상한+여유 안에 exit 0 이어야 한다(진행 중 읽기를 reader.cancel() 로 취소하지 않으면 프로세스가 종료하지 않는다).
+test('real hook child exits 0 within HOOK_STDIN_READ_LIMIT_MS+margin with an unclosed pipe stdin (fd0 released)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-hook-fd0-'));
+  dirs.push(dir);
+  const script = `import { Command } from 'commander'; import { registerMsgCommands } from './src/cli/msg-cli.ts'; const cli = new Command(); registerMsgCommands(cli); await cli.parseAsync(process.argv.slice(1), { from: 'user' });`;
+  const child = Bun.spawn(['bun', '-e', script, 'msg', 'hook', '--event', 'user-prompt-submit', '--format', 'claude', '--seat', 'OP'], {
+    cwd: process.cwd(), env: { ...process.env, ELANOUS_STATE_DIR: dir }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+  });
+  const started = Date.now();
+  const stderrText = new Response(child.stderr).text();
+  try {
+    const code = await child.exited; // stdin 을 끝내지 않은 채 대기 — 취소 없으면 60s 기본 타임아웃으로 빨강
+    expect(code, await stderrText).toBe(0);
+    expect(Date.now() - started).toBeLessThan(HOOK_STDIN_READ_LIMIT_MS + 8_000); // 상한(5s)+여유 안에 종료
+    expect(Date.now() - started).toBeGreaterThanOrEqual(HOOK_STDIN_READ_LIMIT_MS); // 상한을 실제로 기다린 뒤 폴백
+  } finally { try { child.stdin.end(); } catch { /* 자식 종료 뒤 정리 */ } }
 });

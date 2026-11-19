@@ -17,6 +17,7 @@
 
 import { requirePosixShell } from '../platform/default-shell.js';
 import { PreviewTerminal } from '../preview/terminal.js';
+import { shellChildEnv } from './child-env.js';
 import type { ShellRequest } from './types.js';
 import type { TerminalHost } from './pty-engine.js';
 import { detectShellKind, makeOsc133RcFile } from './osc133-rc.js';
@@ -85,7 +86,7 @@ export function createRunnerHostFactory(opts: RunnerHostFactoryOpts): RunnerHost
       return null;
     }
     const shellArgs: string[] = [...(opts.defaultShellArgs ?? [])];
-    const env: Record<string, string> = { ...(req.env ?? {}) };
+    const env = shellChildEnv(process.env, req.env);
 
     // NT-C1b-5 — inject OSC 133 rc for bash/zsh so PtyCaptureEngine
     // can pin command-end boundaries without prompt heuristics. Other
@@ -114,7 +115,7 @@ export function createRunnerHostFactory(opts: RunnerHostFactoryOpts): RunnerHost
         if (rc) rcCleanups.set(label, rc.cleanup);
         return host;
       }
-      const pty = new PreviewTerminal(spec);
+      const pty = new PreviewTerminal({ ...spec, isolatedEnv: true });
       pty.start();
       if (rc) rcCleanups.set(label, rc.cleanup);
       return pty;

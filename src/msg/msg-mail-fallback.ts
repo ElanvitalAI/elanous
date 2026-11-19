@@ -34,7 +34,7 @@ export type MailFallbackResult = 'received' | 'already-knocked' | 'knocked' | 'k
 
 export interface MailFallbackDeps {
   openStore: () => MsgStore;
-  wake: (address: string, msgId: number, message: { from: string; fallback: true }) => Promise<{ result: string; reason?: string }>;
+  wake: (address: string, msgId: number, message: { from: string; fallback: true }) => Promise<{ result: string; reason?: string; wake?: string; target?: string }>;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
   waitMs?: number;
@@ -52,6 +52,13 @@ export async function runMailFallback(input: { messageId: number; recipient: str
   if (!claimed) { log('already-knocked', {}); return 'already-knocked'; }
   try {
     const outcome = await deps.wake(input.recipient, input.messageId, { from: input.from, fallback: true });
+    if (outcome.result === 'injected' && outcome.wake === 'els') {
+      try {
+        const receipts = deps.openStore();
+        try { receipts.recordReceipt({ messageId: input.messageId, recipient: input.recipient, state: 'delivered', source: 'cli', evidence: outcome.target ?? 'els:unknown' }); }
+        finally { receipts.close(); }
+      } catch (error) { log('receipt-failed', { error: error instanceof Error ? error.message : String(error) }); }
+    }
     log(outcome.result === 'injected' ? 'knocked' : 'knock-failed', { result: outcome.result, reason: outcome.reason ?? null });
     return outcome.result === 'injected' ? 'knocked' : 'knock-failed';
   } catch (error) {

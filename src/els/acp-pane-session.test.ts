@@ -107,3 +107,20 @@ test('late updates from a closed pane cannot reach a reopened pane', async () =>
   expect(seen).toEqual([]);
   await sessions.close('pane');
 });
+
+test('a failed stop keeps the pane reserved and permits a cleanup retry', async () => {
+  let stops = 0;
+  const sessions = createAcpPaneSessions(() => ({
+    start: async () => {}, newSession: async () => 'session',
+    prompt: async () => ({ stopReason: 'end_turn' }),
+    stop: async () => { if (++stops === 1) throw new Error('stop failed'); },
+  }));
+  await sessions.open('pane');
+  await expect(sessions.close('pane')).rejects.toThrow('stop failed');
+  await expect(sessions.open('pane')).rejects.toThrow('pane already open');
+  await expect(sessions.prompt('pane', 'do not send', () => {})).rejects.toThrow('pane is not open');
+  await sessions.close('pane');
+  expect(stops).toBe(2);
+  await sessions.open('pane');
+  await sessions.close('pane');
+});

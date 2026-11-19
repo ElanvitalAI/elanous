@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import { detectSeatTui } from '../dashboard/seat-boot-preamble.js';
-import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../dashboard/input/internal-turn.js';
+import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../tui/input/internal-turn.js';
 import { defaultMsgStorePath, MsgStore, readUnreadSource, readUnreadSummary, type UnreadSource } from '../msg/msg-store.js';
 import type { MessageSource } from '../session/index.js';
 

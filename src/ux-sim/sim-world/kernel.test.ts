@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../../nexus/paths.js';
 import { deviceFidelityStatus } from '../device-fidelity.js';
 import { runSimWorlds, simWorldReplayOptions, type SimWorldRunOptions } from './kernel.js';
+import { SIM_WORLD_IDS } from './types.js';
 
 const roots: string[] = [];
 const priorRoot = getTestStateRoot();
@@ -17,7 +18,7 @@ afterEach(() => {
 const EXAMPLE = 'src/ux-sim/sim-world/example-scenarios.ts';
 const FILES = ['events.jsonl', 'walk.json', 'seam-calls.jsonl', 'claims.jsonl', 'verdict.json'];
 
-/** Temp pack root: memory pack = the example module's rows; the other three packs empty. */
+/** Temp pack root: memory has the example rows; every other registered pack is empty. */
 function fixture(entries: Record<string, unknown>, rows = ['K01', 'K02', 'K03', 'K04', 'K05', 'K06', 'K07', 'K08', 'K09'], module = EXAMPLE) {
   const root = mkdtempSync(join(tmpdir(), 'sim-world-kernel-'));
   roots.push(root);
@@ -25,7 +26,7 @@ function fixture(entries: Record<string, unknown>, rows = ['K01', 'K02', 'K03', 
   mkdirSync(packs);
   const list = rows.length ? `\n${rows.map((id) => `  - { id: ${id}, module: ${module} }`).join('\n')}` : ' []';
   writeFileSync(join(packs, 'sim-world-memory.yaml'), `schema: 1\nworld: memory\nscenarios:${list}\n`);
-  for (const world of ['ta', 'graph', 'supervisors']) writeFileSync(join(packs, `sim-world-${world}.yaml`), `schema: 1\nworld: ${world}\nscenarios: []\n`);
+  for (const world of SIM_WORLD_IDS.filter((id) => id !== 'memory')) writeFileSync(join(packs, `sim-world-${world}.yaml`), `schema: 1\nworld: ${world}\nscenarios: []\n`);
   writeFileSync(join(packs, 'sim-world-expect.json'), JSON.stringify({ schema: 1, entries }));
   const run = (runId: string, extra: Partial<SimWorldRunOptions & { replayOf: string }> = {}) => runSimWorlds({ worldId: 'all', seed: 1, engine: 'legacy', only: null,
     expectBaseFile: null, stateRoot: root, runId, packRoot: packs, isolate: 'inline', ...extra });
@@ -63,9 +64,9 @@ describe('SIM-WORLD-KERNEL', () => {
       'wrong-reason-red': 1, unmeasured: 1, malformed: 1, 'contract-violation': 1 });
     expect(summary.events.map((event) => `${event.kind}:${event.world}`)).toEqual([
       'scenario-infra-error:memory', 'engine-unsupported:memory', 'scenario-infra-error:memory', 'contract-violation:memory',
-      'pack-empty:ta', 'pack-empty:graph', 'pack-empty:supervisors',
+      'pack-empty:ta', 'pack-empty:graph', 'pack-empty:supervisors', 'pack-empty:seat-mail', 'pack-empty:capsule-events', 'pack-empty:seat-mail-roundtrip',
     ]);
-    expect(Object.keys(summary.worldWallMs)).toEqual(['memory', 'ta', 'graph', 'supervisors']);
+    expect(Object.keys(summary.worldWallMs)).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip']);
     // The contract verdict comes from the ledger device-fidelity store in each scenario's universe.
     setTestStateRoot(join(root, 'sim-world', 'full', '.universe', 'K01'));
     expect(deviceFidelityStatus('fake-github').verdict).toBe('green');
@@ -150,7 +151,7 @@ describe('SIM-WORLD-KERNEL', () => {
     const { run } = fixture(TABLE);
     const slow = await run('slow', { only: 'K01', wallBudgetMs: -1 });
     const warnings = slow.events.filter((event) => event.kind === 'world-over-budget');
-    expect(warnings.map((event) => event.world)).toEqual(['memory', 'ta', 'graph', 'supervisors']);
+    expect(warnings.map((event) => event.world)).toEqual(['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip']);
     expect(warnings[0]?.detail).toMatch(/^\d+ms > -1ms · slowest K01@legacy \d+ms$/);
     expect(warnings[1]?.detail).toMatch(/^\d+ms > -1ms · slowest \(no scenarios\)$/);
     expect(slow.ok).toBe(true);
@@ -198,7 +199,7 @@ describe('SIM-WORLD-KERNEL', () => {
     expect([mixed.scenarios.map((row) => row.scenario), mixed.events.some((event) => event.kind === 'world-unmeasured'), mixed.ok]).toEqual([['K01'], false, true]);
     const empty = fixture(TABLE, []);
     const none = await empty.run('empty');
-    expect([none.scenarios.length, none.events.map((event) => event.kind), none.ok]).toEqual([0, ['pack-empty', 'pack-empty', 'pack-empty', 'pack-empty'], true]);
+    expect([none.scenarios.length, none.events.map((event) => event.kind), none.ok]).toEqual([0, ['pack-empty', 'pack-empty', 'pack-empty', 'pack-empty', 'pack-empty', 'pack-empty', 'pack-empty'], true]);
   });
 
   test('MF3: a sandbox failure reports only the selected scenarios × engines', async () => {

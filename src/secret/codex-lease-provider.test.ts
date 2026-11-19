@@ -3,10 +3,11 @@
  * never refreshes and never falls back. FAKE values only (dummy strings · fake fetch · fake clock for issuance).
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { issueCodexLease, type CodexLeaseDeps } from './codex-lease.js';
+import { podCodexLeaseCredential } from '../task-orchestrator/surfaces/pod-codex-lease.js';
 import { CodexLeaseExpiredError, _setCodexLeaseObserverForTesting } from './codex-lease-guard.js';
 import { loadFreshCodexAuthState, readCodexOwnerMirrorForRun, _setCodexAuthObserverForTesting } from '../oauth/codex.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -146,6 +147,17 @@ describe('provider request (fake fetch device)', () => {
     expect(calls).not.toHaveLength(0);
     expect(calls.some((c) => Object.entries(c.headers).some(([k, v]) => k.toLowerCase() === 'authorization' && v.includes(ACCESS)))).toBe(true);
     expect(calls.every((c) => !JSON.stringify(c).includes(REFRESH))).toBe(true);
+  });
+
+  test('Pod lease-only store calls Responses HTTP without a Codex CLI auth file', async () => {
+    await leaseAt(Date.now(), 8 * HOUR);
+    const converted = podCodexLeaseCredential(readFileSync(join(target(), 'auth.json'), 'utf8'), Date.now(), Date.now() + 1);
+    expect(converted.codexAuth).toBe('');
+    writeFileSync(join(target(), 'auth.json'), converted.elanousAuth, { mode: 0o600 });
+    const { calls } = await run();
+    expect(calls).not.toHaveLength(0);
+    expect(calls.some(c => Object.entries(c.headers).some(([k, v]) => k.toLowerCase() === 'authorization' && v.includes(ACCESS)))).toBe(true);
+    expect(calls.every(c => !JSON.stringify(c).includes(REFRESH))).toBe(true);
   });
 
   test('after expiry no model call is made and the failure says «expired»', async () => {

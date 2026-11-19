@@ -40,6 +40,15 @@ const SECRET_TEXT_RULES: readonly { readonly id: string; readonly re: RegExp; re
   { id: 'slack-token', re: /\b(xox[abprs]-)[0-9A-Za-z-]{10,}/g, to: '$1***' },
   { id: 'gcp-api-key', re: /\b(AIza)[0-9A-Za-z_-]{35}\b/g, to: '$1***' },
   { id: 'jwt', re: /\b(ey)[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9._\\/-]{10,}/g, to: '$1***' },
+  // OP #97323 (JUD 20261119-1126 must 1) — AWS 이름 있는 자격 인자: 값 문자 종류와 무관하게 통째 가린다.
+  // base64 블롭 규칙이 «/» 를 클래스에서 뺀 탓에 «/» 섞인 40자(wJalr…EXAMPLEKEY)가 3조각으로 나뉘어
+  // 전부 길이 미달로 통과하던 회귀. «키=값»·«키: 값»·«키 값»(aws configure set …) 모두 커버.
+  { id: 'aws-named-credential-arg', re: /\b(aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|aws[_-]?session[_-]?token)(\s*[:=]\s*|\s+)(["']?)[^\s"']{4,}/gi, to: '$1$2$3***' },
+  // OP #97323 — compound 이름 있는 자격 인자(db_password·client_secret·GH_TOKEN 소문자형): generic-api-key 의
+  // \b(secret)\b 이 `_` 앞 단어 경계가 없어 못 잡는다. «키=값» 형태 · 값 4자 이상·글자 포함.
+  { id: 'named-credential-suffix', re: /\b([a-z][a-z0-9_-]{0,48}[_-](?:secret|password|passwd|token))(\s*[:=]\s*)(["']?)(?=[^\s"']*?[A-Za-z])[^\s"']{4,}/gi, to: '$1$2$3***' },
+  // OP #97323 — 같은 이름의 «키 값» 공백 형태: 산문 오탐을 좁히려 값 8자 이상·글자+숫자 포함만 가린다.
+  { id: 'named-credential-suffix-space', re: /\b([a-z][a-z0-9_-]{0,48}[_-](?:secret|password|passwd|token))(\s+)(["']?)(?=[^\s"']*?[A-Za-z])(?=[^\s"']*?[0-9])[^\s"']{8,}/gi, to: '$1$2$3***' },
   // gitleaks: generic-api-key 축소판 — `key = value` 형태.
   { id: 'generic-api-key', re: /\b(access[_-]?token|refresh[_-]?token|api[_-]?key|secret|password|passwd|token|credential)\b(\s*[:=]\s*)["']?[^\s"',;)]{4,}/gi, to: '$1$2***' },
   // 환경변수 형태 `OPENROUTER_API_KEY=…` — 위 규칙은 `_API_KEY` 앞에 단어 경계가 없어 못 잡는다. 값에 글자가 있어야 한다(`MAX_TOKEN=4096` 은 그대로).

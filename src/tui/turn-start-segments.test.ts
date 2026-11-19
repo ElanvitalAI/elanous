@@ -1,7 +1,7 @@
 // TURN-START-BLOCK-REST 2단계 — preamble 뒤 «무엇이» 막았나를 덩어리로 가른다(`tui.turn-start segments`).
 //   ⭐ 반증: 경계 측정(markAt)을 빼면 segmentsMs 가 비어 칸 모양 시험이 실패한다.
 import { afterEach, describe, expect, test } from 'bun:test';
-import { createInputLagProbe } from '../tui/input-lag-probe.js';
+import { createInputLagProbe } from './input-lag-probe.js';
 import {
   TURN_START_CATEGORY,
   TURN_START_SEGMENTS_EVENT,

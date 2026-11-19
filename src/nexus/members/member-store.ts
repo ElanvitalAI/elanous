@@ -122,6 +122,8 @@ export interface MemberStore {
   canClaimReservedJoosung(memberId: string): boolean;
   memberForHandle(handle: string): string | null;
   claimHandle(memberId: string, handle: string, previousPublicUserSlug?: string): string;
+  /** WEBCHAT-PIN-LEDGER-RECONNECT (OP #104299/#104391) — durable (handle, memberId) claim enumeration for relay reconnect re-pinning; read-only. */
+  handleClaims(): Array<{ readonly handle: string; readonly memberId: string }>;
   publicUserSlugForMember(memberId: string): string | null;
   publicUserSlugForApp(appSlug: string): string | null;
   memberForPublicUserSlug(userSlug: string): string | null;
@@ -870,6 +872,12 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         db.exec('COMMIT');
         return handle;
       } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    handleClaims() { // WEBCHAT-PIN-LEDGER-RECONNECT — 내구 claim 전체 열거(릴레이 재연결 재핀용, 읽기 전용)
+      assertOpen();
+      return (db.query('SELECT member_id, handle FROM member_handles').all() as Record<string, unknown>[]).map(
+        (row) => ({ handle: String(row.handle), memberId: String(row.member_id) }),
+      );
     },
     createMemberKey(memberId, name, at = iso(nowMs()), deliver) {
       assertOpen();

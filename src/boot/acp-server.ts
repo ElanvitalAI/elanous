@@ -34,7 +34,7 @@ import {
   listenWebSocket,
   createAuthVerifier,
 } from '../acp/transport/index.js';
-import { runAcpServer, type AcpServerOptions } from '../acp/server.js';
+import { WEBTERM_EXT_METHOD_ALLOWLIST,  runAcpServer, type AcpServerOptions } from '../acp/server.js';
 import type { LlmBrand } from '../llm-vision-capability.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 
@@ -251,6 +251,7 @@ export async function bootAcpServer(
       stderr.write(`[elanous-acp] starting (transport: stdio)\n`);
       writeRuntimeBanner(stderr, runtimeStatus);
       await runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
         shutdownSignal: ownSignal,
         ...(runTurn ? { runTurn } : {}),
         ...(hasSession ? { hasSession } : {}),
@@ -266,6 +267,7 @@ export async function bootAcpServer(
       stderr.write(`[elanous-acp] listening on unix socket: ${socketPath}\n`);
       writeRuntimeBanner(stderr, runtimeStatus);
       await runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
         transportFactory: (onConnection) =>
           listenUnixSocket({ path: socketPath, onConnection }),
         shutdownSignal: ownSignal,
@@ -294,6 +296,7 @@ export async function bootAcpServer(
     stderr.write(`[elanous-acp] ${authPieces.banner}\n`);
     writeRuntimeBanner(stderr, runtimeStatus);
     await runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
       transportFactory: (onConnection) =>
         listenWebSocket({
           port,

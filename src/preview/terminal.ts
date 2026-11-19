@@ -67,6 +67,8 @@ export interface PreviewTerminalOpts {
    *  splitting honest). */
   shellArgs?: readonly string[];
   env?: Record<string, string>;
+  /** Use the supplied environment as a complete set for the untrusted shell runner. */
+  isolatedEnv?: boolean;
   /** Remove captured environment keys after env composition (for subscription-only child auth). */
   unsetEnv?: readonly string[];
   /** Defaults to `xterm-256color` (universal). Override with
@@ -339,6 +341,7 @@ export class PreviewTerminal {
     const args = this.opts.shellArgs
       ? [...this.opts.shellArgs]
       : defaultShellArgsFor(shell);
+    if (this.opts.isolatedEnv && this.opts.useRegistry) throw new Error('isolated shell environment requires direct PTY spawn');
     if (this.opts.useRegistry) {
       // ★ P0b-2 (기본 off) — 공유 registry 버스로 spawn(자체 dup-fd 없음). term(terminfo name)은 childEnv.TERM
       //   으로 자식에 전달되고, registry startPty 의 term 은 allowlist 제약이 있어 생략(기본 xterm-256color·
@@ -362,7 +365,7 @@ export class PreviewTerminal {
         cols: this.term.cols,
         rows: this.term.rows,
         cwd: this.opts.cwd,
-        env: buildPtyEnv(childEnv, process.env, { unset: this.opts.unsetEnv }),
+        env: this.opts.isolatedEnv ? childEnv : buildPtyEnv(childEnv, process.env, { unset: this.opts.unsetEnv }),
       });
       const masterFd = this.resolveMasterFd(this.pty);
       if (masterFd === null) throw new Error('PreviewTerminal: could not resolve PTY master fd');

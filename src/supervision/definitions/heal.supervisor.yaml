@@ -1,0 +1,17 @@
+# supervisor/v1 — heal loop acts on recorded failures (graphs/heal/heal-loop.yaml trigger.events: [failure]).
+apiVersion: elanous.dev/supervisor/v1
+kind: supervisor
+ref: 'loop:heal@1'
+role: healer
+supervises: [heal-loop]
+signals:
+  - { signal: failure, actor: final }
+authority: [observe, triage, heal, replan, request-hitl]
+reportsTo: 'loop:coordinator@1'
+escalation: { to: 'loop:coordinator@1', silenceAfter: PT10M }
+# Retention periods are this definition's declared policy; GRAPH-MEMORY-SCOPES requires one but fixes no value.
+memory:
+  instance: { read: true, write: true, promote: template-candidate, retention: P7D }
+  template: { read: true, write: gated-promotion, promote: none, retention: P90D }
+  global: { read: card-bound-only, write: none, promote: none }
+  provenance: required

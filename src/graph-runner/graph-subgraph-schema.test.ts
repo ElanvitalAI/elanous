@@ -146,3 +146,75 @@ edges:
     expect(commands.filter(command => command === 'printf produced')).toHaveLength(3);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('unit source pins compare by content hash, not by checkout path', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-unit-pin-path-'));
+  const unitDir = join(root, 'units');
+  const graph = join(root, 'graph.yaml');
+  const childPath = join(unitDir, 'worker.yaml');
+  const childSource = `graph_id: worker
+version: 1
+unit: { inputs: [request], outputs: [answer], exits: [done, failed] }
+entry_node: produce
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: produce, kind: agent, recipe: 'cmd:produce', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: produce, on: outcome, map: { ok: done, fail: failed } }
+`;
+  // 각 런의 첫 post 실행은 실패(1), 재개 후 두 번째 실행은 성공(0)한다.
+  const makeDeps = () => {
+    let postRuns = 0;
+    return {
+      root,
+      runBash: async (command: string) => command === 'printf posted'
+        ? { stdout: '', stderr: '', exitCode: postRuns++ === 0 ? 1 : 0 }
+        : { stdout: '{"answer":"world"}', stderr: '', exitCode: 0 },
+    };
+  };
+  try {
+    mkdirSync(unitDir);
+    writeFileSync(join(root, 'recipes.yaml'), 'post:\n  command: "printf posted"\n');
+    writeFileSync(join(unitDir, 'recipes.yaml'), 'produce:\n  command: "printf produced"\n');
+    writeFileSync(graph, `graph_id: parent
+version: 1
+entry_node: invoke
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: invoke
+    kind: subgraph
+    recipe: none
+    max_visits: 2
+    call: worker@1
+    budget: { inner_steps: 3 }
+    contract: { inputs: [request], tools: read-only, outputs: [answer], input_schema: { type: object, required: [request], properties: { request: { type: string } } }, output_schema: { type: object, required: [answer], properties: { answer: { type: string } } } }
+  - { node_id: post, kind: agent, recipe: 'cmd:post', max_visits: 2 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: invoke, on: outcome, map: { done: post, failed: failed } }
+  - { from: post, on: outcome, map: { ok: done, fail: failed } }
+`);
+    writeFileSync(childPath, childSource);
+    // 같은 deps를 써야 첫 런의 post 실패(1) 후 재개의 post가 성공(0)한다.
+    const deps = makeDeps();
+    const first = await runGraph(graph, { input: { request: 'hello' }, deps, quiet: true });
+    expect(first.status).toBe('failed');
+    expect(first.path).toEqual(['invoke', 'post', 'failed']);
+    // 다른 체크아웃 경로에서의 재개: 기록된 핀의 절대 경로만 다르고 내용은 같다.
+    const state = JSON.parse(readFileSync(first.statePath, 'utf8')) as { unitPins: Record<string, { path: string }> };
+    state.unitPins.invoke.path = join(root, 'other-checkout', 'units', 'worker.yaml');
+    writeFileSync(first.statePath, JSON.stringify(state));
+    const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'invoke', deps, quiet: true });
+    expect(resumed.status).toBe('done');
+    expect(resumed.path).toEqual(['invoke', 'post', 'done']);
+    // 같은 경로라도 내용이 다르면 여전히 거부한다(핀 검사는 노드 실행 전에 일어난다).
+    const second = await runGraph(graph, { input: { request: 'hello' }, deps: makeDeps(), quiet: true });
+    expect(second.status).toBe('failed');
+    writeFileSync(childPath, childSource.replace('max_visits: 1 }', 'max_visits: 2 }'));
+    await expect(runGraph(graph, { resumeRunId: second.runId, fromNodeId: 'invoke', deps: makeDeps(), quiet: true }))
+      .rejects.toThrow('unit source changed since run started: invoke');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

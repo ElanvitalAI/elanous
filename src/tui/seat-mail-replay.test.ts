@@ -64,7 +64,7 @@ test('fresh session over 3000 acknowledged mails and 2 unacknowledged → exactl
   expect(w.noticeIds(queue)).toEqual([3001, 3002]);
   expect(w.events).toEqual([['seat-mail-replay-skipped', { seat: 'QSEAT', cursor: 3000, seenSkipped: 0, unacked: 2 }]]);
   // The next polls start after the ledger's newest id — nothing is paged forward.
-  expect(watcher.poll()).toEqual({ kind: 'quiet', unread: 0 });
+  expect(watcher.poll()).toEqual({ kind: 'quiet', unread: 2 }); // queued mail remains unread until acknowledged
   expect(w.noticeIds(queue)).toEqual([3001, 3002]);
 });
 
@@ -109,7 +109,8 @@ test('500 unacknowledged with cap 20 → 20 notices plus ONE summary, and the co
   expect(outcome).toEqual({ kind: 'messages', msgIds: Array.from({ length: 20 }, (_, i) => i + 1) });
   const seatMail = queue.items.filter((item) => item.source === 'seat-mail');
   expect(seatMail).toHaveLength(21);
-  expect(seatMail.at(-1)!.text).toBe('[seat-mail] 480 more unread mails for QSEAT, ids #21..#500 — not queued one by one; read them with: eln msg list --to QSEAT');
+  expect(seatMail.at(-1)!.text).toBe('[seat-mail] 480 more unread mails for QSEAT, ids #21..#500 · unread total 500 — not queued one by one; read them with: eln msg list --to QSEAT');
+  expect(seatMail[0]!.text).toContain('[미읽음 총 500통]');
   // 출처: #38517 — cap 20 (11-18 live unread REL 8 · JUD 2; justification in the PR body)
   expect(w.events).toEqual([['seat-mail-cap-collapse', { seat: 'QSEAT', cap: 20, collapsed: 480, firstId: 21, lastId: 500, truncated: false, summaryQueued: true }]]);
 });
@@ -147,7 +148,7 @@ test('r2 MF2: cap ≥ the read limit and 1500 unacknowledged → 1000 notices pl
   expect(outcome).toEqual({ kind: 'messages', msgIds: Array.from({ length: 1000 }, (_, i) => i + 1) });
   const seatMail = queue.items.filter((item) => item.source === 'seat-mail');
   expect(seatMail).toHaveLength(1001);
-  expect(seatMail.at(-1)!.text).toBe('[seat-mail] more unread mails beyond the read limit for QSEAT, ids #1001..#1500 — not queued one by one; read them with: eln msg list --to QSEAT');
+  expect(seatMail.at(-1)!.text).toBe('[seat-mail] more unread mails beyond the read limit for QSEAT, ids #1001..#1500 · unread total 1500 — not queued one by one; read them with: eln msg list --to QSEAT');
   // 출처: #38517 r2 MF2 — cap 2000 ≥ SEAT_MESSAGE_READ_LIMIT 1000 (the reviewer's «cap ≥ read limit» case)
   expect(w.events).toEqual([['seat-mail-cap-collapse', { seat: 'QSEAT', cap: 2000, collapsed: 0, firstId: 1001, lastId: 1500, truncated: true, summaryQueued: true }]]);
 });
@@ -158,7 +159,7 @@ test('r2 MF2: cap 20 and 1500 unacknowledged → 20 notices plus ONE summary nam
   const { queue, watcher } = w.boot(20);
   watcher.poll();
   const summaries = () => queue.items.filter((item) => item.source === 'seat-mail' && item.msgId === undefined);
-  expect(summaries().map((item) => item.text)).toEqual(['[seat-mail] 980+ more unread mails for QSEAT, ids #21..#1500 — not queued one by one; read them with: eln msg list --to QSEAT']);
+  expect(summaries().map((item) => item.text)).toEqual(['[seat-mail] 980+ more unread mails for QSEAT, ids #21..#1500 · unread total 1500 — not queued one by one; read them with: eln msg list --to QSEAT']);
   watcher.poll(); // same truncated ledger, nothing newer than the announced #1500
   expect(summaries()).toHaveLength(1);
   expect(w.events.filter(([event]) => event === 'seat-mail-cap-collapse')).toHaveLength(1);

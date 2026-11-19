@@ -44,7 +44,7 @@ export interface RunCompactOpts {
 export async function runCompactPipeline(
   messages: LLMMessage[],
   opts: RunCompactOpts = {},
-): Promise<CompactPipelineResult> {
+): Promise<CompactPipelineResult & { replaySourceIndex?: number }> {
   const policy = { ...DEFAULT_COMPACT_POLICY, ...opts.policy };
   const sessionId = opts.sessionId ?? 'default';
   const now = opts.now ?? Date.now;
@@ -63,6 +63,7 @@ export async function runCompactPipeline(
   let layer4Verdict: 'skipped' | 'ok' | 'rejected' = 'skipped';
   let layer5FallbackTruncated: 0 | 1 = 0;
   let userReplayApplied: 0 | 1 = 0;
+  let replaySourceIndex: number | undefined;
   const breakerTripped = isAutoCompactBreakerTripped() ? 1 : 0;
 
   const sliceUntil = Math.max(0, layer2.messages.length - policy.preserveLastN);
@@ -128,6 +129,7 @@ export async function runCompactPipeline(
                   .map(b => (b as { text: string }).text)
                   .join('\n');
             if (text.trim().length > 0) {
+              replaySourceIndex = anchorCount + i;
               replayedUser = {
                 role: 'user',
                 content: text,
@@ -166,6 +168,7 @@ export async function runCompactPipeline(
 
   return {
     messages: messagesAfter,
+    ...(replaySourceIndex === undefined ? {} : { replaySourceIndex }),
     diagnostics: {
       layer1ToolOutputBudgetSavedChars: layer1.savedChars,
       layer1ResponsesTrimmed: layer1.responsesTrimmed,

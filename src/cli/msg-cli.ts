@@ -20,9 +20,32 @@ import { configuredMirrorTarget, runMsgMirrorTick, type MirrorTarget, type MsgMi
 import { JsonMsgMirrorStateStore } from '../msg/msg-mirror-state.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
 import { debug } from '../debug/log.js';
+
+/** OP 승인 #106323(2026-11-19) — TTY 가 아닌데도 닫히지 않는 파이프 stdin(테스트·데몬이 fd 0 을 붙잡은 경우)에
+ *  hook 이 영구 블록되지 않게 하는 읽기 상한. 상한 초과 시 빈 입력 폴백 + 원장 'stdin-timeout' 1줄. */
+export const HOOK_STDIN_READ_LIMIT_MS = 5_000;
+
+const hookStdinTimedOut = Symbol('hook-stdin-timeout');
+
+/** 파이프 stdin 을 상한까지 읽고, 초과 시 빈 입력(프로세스 문맥 폴백)을 돌려준다. TTY 인 경우 호출하지 않는다.
+ *  [JUD-B #106365] 상한 초과 시 cancel() 로 진행 중 읽기까지 취소 — fd0 를 붙잡은 채 종료하지 않는 결함 방지. */
+async function readHookStdinWithLimit(readStdin: () => Promise<string>, limitMs: number, cancel?: () => void): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([
+    readStdin(),
+    new Promise<typeof hookStdinTimedOut>(resolve => { timer = setTimeout(() => resolve(hookStdinTimedOut), limitMs); }),
+  ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
+  if (settled === hookStdinTimedOut) {
+    try { cancel?.(); } catch { /* 취소는 best-effort — 폴백은 계속 진행 */ }
+    try { debug.log('msg.hook', 'stdin-timeout', { limitMs }); } catch { /* 원장 기록은 fail-open */ }
+    return '';
+  }
+  return settled;
+}
 import type { AgentReplyAddress, AgentReplyInput, AgentReplyResult } from '../loops/agent-reply.js';
 import { noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
-import { messageReplyBodyFor, registerSeatPaneAddress, registrySnapshot, resolveWake, seatDeliveryView, isLiveWakeUniverse, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
+import { messageReplyBodyFor, registerSeatPaneAddress, registrySnapshot, resolveSeatStateRoot, resolveWake, seatDeliveryView, isLiveWakeUniverse, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
+import { classifySeatInbox, seatInboxAlivePath } from '../loops/inbox-liveness.js';
 import { getUserConfig } from '../user-config/reader.js';
 import type { RoleLlmSpec } from '../user-config/types.js';
 import { postReleaseOpCommand, postReleaseOpQuestion } from '../release-loop/op-channel.js';
@@ -45,6 +68,10 @@ export interface MsgCliDeps {
   openReadStore?: () => MsgStore;
   out?: Pick<Console, 'log' | 'error'>;
   readStdin?: () => Promise<string>;
+  // TTY stdin 이면 hook 이 EOF 대기로 영구 블록되지 않도록 판정만 주입 가능하게 (기본 process.stdin.isTTY).
+  stdinIsTty?: () => boolean;
+  /** 테스트 주입용: 닫히지 않는 파이프 stdin 읽기 상한(ms). 미지정 시 HOOK_STDIN_READ_LIMIT_MS. */
+  stdinReadLimitMs?: number;
   sleep?: (ms: number) => Promise<void>;
   setExitCode?: (code: number) => void;
   signal?: AbortSignal;
@@ -200,7 +227,25 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   const open = deps.openStore ?? (() => openMsgStore());
   const openRead = deps.openReadStore ?? (() => openMsgStoreReadOnly());
   const out = deps.out ?? console;
-  const readStdin = deps.readStdin ?? (() => Bun.stdin.text());
+  // [JUD-B #106365 must 1] 기본 stdin 읽기는 취소 가능 reader — 상한 race 에서 져도 fd0 를 즉시 반납한다
+  // (취소 없으면 진행 중 Bun.stdin.text() 읽기가 fd0 을 붙잡은 채 프로세스가 종료하지 않는다).
+  let cancelDefaultStdin: (() => void) | undefined;
+  const readStdin = deps.readStdin ?? (() => {
+    const reader = Bun.stdin.stream().getReader();
+    cancelDefaultStdin = () => { try { void reader.cancel(); } catch { /* 이미 닫힘 */ } try { process.stdin.destroy(); } catch { /* 이미 닫힘 */ } };
+    const decoder = new TextDecoder();
+    return (async () => {
+      let text = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done || value === undefined) break;
+        text += decoder.decode(value, { stream: true });
+      }
+      return text + decoder.decode();
+    })().catch(() => '');
+  });
+  const stdinIsTty = deps.stdinIsTty ?? (() => process.stdin.isTTY ?? false);
+  const stdinReadLimitMs = deps.stdinReadLimitMs ?? HOOK_STDIN_READ_LIMIT_MS;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
   const msg = program.command('msg').description('Durable seat-addressed messages');
@@ -307,9 +352,11 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   const postedLine = (message: Message): string => {
     const head = formatMessage({ ...message, body: '' }).replace(/: $/, '');
     const bytes = Buffer.byteLength(message.body, 'utf8');
+    // SEAT-MAIL #24 — the human line names the auto-acked original; JSON output carries the field itself.
+    const autoAcked = message.autoAcked === undefined ? '' : ` · auto-acked #${message.autoAcked}`;
     return message.deduped
-      ? `${head} · ${bytes} bytes · deduped: already stored within the dedupe window (no new row; --no-dedupe to store again)`
-      : `${head} · ${bytes} bytes`;
+      ? `${head} · ${bytes} bytes · deduped: already stored within the dedupe window — suppressed as ${message.repeatReason ?? `repeat of #${message.id}`}${autoAcked}`
+      : `${head} · ${bytes} bytes${autoAcked}`;
   };
   const emit = (value: unknown, json: boolean | undefined, human: () => void) => {
     if (json) out.log(JSON.stringify(value));
@@ -462,7 +509,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--needs-ack', 'mark the message as acknowledgement-required')
     .option('--crown-directive <id>', 'crown directive ID this message executes')
     .option('--priority <level>', 'priority: urgent(2) | p0(1) | normal(0)')
-    .option('--no-dedupe', 'store even when the same from/to/body was posted within the dedupe window (default 10 min)')
+    .option('--no-dedupe', 'store even when the same from/to/body was posted within the dedupe window (default 30 min)')
     .option('--json')
     .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean; intent?: string; ref?: string[]; deadline?: string; done?: string; needsAck?: boolean; crownDirective?: string; priority?: string; dedupe?: boolean }) => run(async () => {
       const from = seat(opts.from, '--from');
@@ -575,8 +622,15 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       try {
         const woke = await (deps.wake ?? wakeRecipient)(to, posted.id, { from, ...(opts.kind === undefined ? {} : { kind: opts.kind }) },
           { ...deps.wakeDeps, warn: noBody ? () => {} : line => out.error(line) });
+        if (woke?.wake === 'els' && woke.result !== 'injected')
+          out.error(`msg wake: ${to} ${woke.result === 'busy' ? 'deferred' : 'not confirmed; check before retry'} (${woke.result}${woke.reason ? `: ${woke.reason}` : ''}); message #${posted.id} remains stored`);
+        // ELS verified wake has opened a turn; record delivery, never seen or done.
+        if (woke?.wake === 'els' && woke.result === 'injected') {
+          try { withStore(store => store.recordReceipt({ messageId: posted.id, recipient: to, state: 'delivered', source: 'cli', evidence: woke.target ?? 'els:unknown' })); }
+          catch (error) { debug.log('msg.receipt-writer', 'record-failed', { msgId: posted.id, recipient: to, state: 'delivered', error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+        }
         // OP 11-17 21:5x — an eln seat receives through its own mail watch; only if nothing is received in 60s, one knock.
-        if (woke?.result === 'eln-mail-watch') {
+        if (woke?.result === 'eln-mail-watch' || (woke?.wake === 'els' && woke.result === 'busy')) {
           try {
             (deps.spawnMailFallback ?? ((input) => { if (isLiveWakeUniverse(deps.wakeDeps)) spawnMailFallback(input); }))({ messageId: posted.id, recipient: to, from });
           } catch { /* the safety net never fails a post */ }
@@ -599,25 +653,34 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       const shared = { ...deps.wakeDeps, registrySnapshot: snapshot };
       const wake = resolveWake(to, shared);
       const delivery = seatDeliveryView(to, shared, snapshot);
-      const row = { msgAddress: to, replyBody: messageReplyBodyFor(to, shared), ...wake, ...delivery };
+      const seatName = to.replace(/^SEAT:/, '');
+      const SEAT_ID_LIKE = /^[A-Z][A-Z0-9_-]{0,63}$/;
+      const liveness = SEAT_ID_LIKE.test(seatName)
+        ? classifySeatInbox(seatInboxAlivePath(resolveSeatStateRoot(deps.wakeDeps ?? {}), seatName), { host: wake.host || 'unknown' }, Date.now())
+        : undefined;
+      const row = { msgAddress: to, replyBody: messageReplyBodyFor(to, shared), ...wake, ...delivery, ...(liveness ? { liveness: liveness.state, livenessAgeMs: 'ageMs' in liveness && Number.isFinite(liveness.ageMs) ? Math.round(liveness.ageMs) : undefined } : {}) };
       emit(row, opts.json, () => out.log(`${to}\treplyBody=${row.replyBody ?? '모름'}\twake=${wake.wake}`
         + `${wake.host ? `\thost=${wake.host}` : ''}${wake.target ? `\ttarget=${wake.target}` : ''}${wake.optIn === undefined ? '' : `\toptIn=${wake.optIn ? 'yes' : 'no(주입 0)'}`}`
         + `${delivery.runtime ? `\truntime=${delivery.runtime}` : ''}${delivery.delivery ? `\tdelivery=${delivery.delivery}` : ''}${delivery.session ? `\tsession=${delivery.session}` : ''}`
+        + `${liveness ? `\tliveness=${liveness.state}` : ''}`
         + `\t(${wake.source}${wake.reason ? `: ${wake.reason}` : ''})`));
     })());
 
   msg.command('address').description('Manage the central seat address registry')
     .command('register <seat>').description('Register a seat in the central seat address registry')
-    .requiredOption('--herdr-pane <pane>', 'Herdr pane ID, for example wJ:p10')
+    .option('--herdr-pane <pane>', 'Herdr pane ID, for example wJ:p10')
+    .option('--els-pane <pane>', 'ELS address els:workspace/tab/pane')
     .requiredOption('--host <host>', 'local or remote SSH alias')
     .option('--wake', 'allow this registered seat to receive message wake prompts')
     .option('--replace', 'replace an existing pane address')
     .option('--runtime <body>', 'agent body in the pane: eln | claude-code | codex (eln ⊕ autowake = no typing, 60s fallback only)')
     .option('--json')
-    .action((rawSeat: string, opts: { herdrPane: string; host: string; wake?: boolean; replace?: boolean; runtime?: string; json?: boolean }) => run(() => {
+    .action((rawSeat: string, opts: { herdrPane?: string; elsPane?: string; host: string; wake?: boolean; replace?: boolean; runtime?: string; json?: boolean }) => run(() => {
+      if (!!opts.herdrPane === !!opts.elsPane) throw new Error('choose exactly one of --herdr-pane or --els-pane');
       if (opts.runtime !== undefined && !SEAT_AGENT_RUNTIMES.includes(opts.runtime as SeatAgentRuntime)) throw new Error('--runtime must be eln, claude-code or codex');
       const result = registerSeatPaneAddress({
-        address: canonicalSeatId(rawSeat), paneId: opts.herdrPane, host: opts.host,
+        address: canonicalSeatId(rawSeat), paneId: (opts.elsPane ?? opts.herdrPane)!, host: opts.host,
+        ...(opts.elsPane ? { kind: 'els' as const } : {}),
         ...(opts.wake ? { enableWake: true } : {}), ...(opts.replace ? { replace: true } : {}),
         ...(opts.runtime === undefined ? {} : { runtime: opts.runtime as SeatAgentRuntime }),
       }, deps.wakeDeps);
@@ -681,7 +744,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--seat <seat>', 'seat ID or auto:cwd', 'auto:cwd')
     .action((opts: { event: MsgHookEvent; format: MsgHookFormat; seat: string }) => run(async () => {
       let input: Record<string, unknown> = {};
-      try { input = JSON.parse(await readStdin()) as Record<string, unknown>; } catch { /* empty input falls back to process context */ }
+      try { input = JSON.parse(stdinIsTty() ? '' : await readHookStdinWithLimit(readStdin, stdinReadLimitMs, () => cancelDefaultStdin?.())) as Record<string, unknown>; } catch { /* empty input falls back to process context (TTY 는 즉시, 닫히지 않는 파이프는 HOOK_STDIN_READ_LIMIT_MS 뒤 빈 입력 + fd0 반납) */ }
       const cwd = typeof input.cwd === 'string' && input.cwd.trim() ? input.cwd : process.cwd();
       const seat = opts.seat === 'auto:cwd' ? seatFromCwd(cwd) : canonicalSeatId(opts.seat);
       if (!seat || seat === 'ALL') return;

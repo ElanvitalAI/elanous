@@ -237,7 +237,6 @@ describe('user-config defaults', () => {
       enabled: true,
       finalMessageMaxLines: 10,
       preambleMaxWords: 12,
-      flatBullets: true,
     });
     expect(c.chat.toolOutput).toEqual({
       persistOnOverflow: true,
@@ -462,7 +461,6 @@ describe('user-config lsp section (Phase L4)', () => {
           enabled: false,
           finalMessageMaxLines: 999,
           preambleMaxWords: 0,
-          flatBullets: false,
         },
       },
     });
@@ -470,8 +468,17 @@ describe('user-config lsp section (Phase L4)', () => {
       enabled: false,
       finalMessageMaxLines: 100,
       preambleMaxWords: 1,
-      flatBullets: false,
     });
+  });
+
+  test('retired flatBullets key is removed on read and save', () => {
+    write({ chat: { conciseness: { flatBullets: false, preambleMaxWords: 9 } } });
+    const cfg = buildUserConfig(cfgPath);
+    expect(cfg.chat.conciseness).not.toHaveProperty('flatBullets');
+    saveUserConfig(cfg, cfgPath);
+    const saved = JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf8'));
+    expect(saved.chat.conciseness).not.toHaveProperty('flatBullets');
+    expect(saved.chat.conciseness.preambleMaxWords).toBe(9);
   });
 
   test('chat.toolOutput clamps numeric knobs and honors booleans', () => {
@@ -970,7 +977,6 @@ describe('user-config extended schema', () => {
         enabled: false,
         finalMessageMaxLines: 6,
         preambleMaxWords: 8,
-        flatBullets: false,
       },
       toolOutput: {
         persistOnOverflow: false,
@@ -1041,7 +1047,6 @@ describe('user-config extended schema', () => {
       enabled: false,
       finalMessageMaxLines: 6,
       preambleMaxWords: 8,
-      flatBullets: false,
     });
     expect(reloaded.chat.toolOutput).toEqual({
       persistOnOverflow: false,

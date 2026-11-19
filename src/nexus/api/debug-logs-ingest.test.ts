@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClientSideConnection, ndJsonStream } from '@agentclientprotocol/sdk';
 import { createInProcessAcpBridge } from '../../tui-client/acp-transport-local.js';
-import { runAcpServer } from '../../acp/server.js';
+import { runAcpServer, WEBTERM_EXT_METHOD_ALLOWLIST } from '../../acp/server.js';
 import type { AcpConnectionHandler, AcpTransportServer } from '../../acp/transport/index.js';
 
 // ⛔⭐⭐ **시험이 사람의 상태 디렉토리를 «오염시키지» 않게 뿌리를 옮긴다** —
@@ -85,6 +85,7 @@ describe('debug 로그 적재 — HTTP 와 ACP 가 «같은 길»', () => {
     const bridge = createInProcessAcpBridge();
     const abort = new AbortController();
     const server = runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
       shutdownSignal: abort.signal,
       transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
         void onConnection({ readable: bridge.a.readable, writable: bridge.a.writable,

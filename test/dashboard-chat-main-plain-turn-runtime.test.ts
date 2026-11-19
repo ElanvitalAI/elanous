@@ -215,7 +215,6 @@ async function implementationDisciplineFromDirectRuntime(
             enabled: false,
             finalMessageMaxLines: 6,
             preambleMaxWords: 12,
-            flatBullets: false,
           },
         },
         tools: { ...config.tools, nativeStructure: { enabled: nativeStructureEnabled } },

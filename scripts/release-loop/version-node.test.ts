@@ -79,6 +79,24 @@ test('explicit cut commit prebuilds and attests the image before readiness count
   }
 });
 
+test('prebuild failure reaches the node result with its measured stage and receipt', () => {
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId: 'failure-run', input: { version: '0.3.9',
+    gateExecutor: 'pod', gateImagePin: 'cut-commit', gatePodPool: 'pool-a' }, outputs: {} });
+  const failure = { outcome: 'failed' as const, reason: 'missing archive entry', stage: 'pack-pwa' as const,
+    receipt: [{ stage: 'pack-pwa' as const, exit: 1, ok: false, reason: 'missing archive entry' }],
+    failureCode: 'PACK_MISSING_PWA' as const, causes: ['PACK_MISSING_PWA' as const] };
+  try {
+    const output = versionNodeMain(['gate-image-prebuild', '--version', '0.3.9', '--cut', 'c'.repeat(40)], process.cwd(), {
+      prebuildGateImage: () => failure,
+    });
+    expect(output).toMatchObject({ outcome: 'error', error: 'cut gate image prebuild failed: missing archive entry', gateImagePrebuild: failure });
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
 test('cut-branch refuses graph progress when the image prebuild fails', () => {
   const previous = process.env.ELANOUS_GRAPH_CONTEXT;
   const commit = 'c'.repeat(40);
@@ -1218,6 +1236,10 @@ console.error('unsupported fake gh: ' + args.join(' ')); process.exit(2);
     const snapshotTree = runGit(['write-tree'], snapshotEnv);
     const snapshotCommit = runGit(['commit-tree', snapshotTree], {
       ...snapshotEnv,
+      GIT_AUTHOR_NAME: 'Release Fixture',
+      GIT_AUTHOR_EMAIL: 'release-fixture@example.invalid',
+      GIT_COMMITTER_NAME: 'Release Fixture',
+      GIT_COMMITTER_EMAIL: 'release-fixture@example.invalid',
       GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z',
       GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z',
     }, 'simulation source fixture\n');

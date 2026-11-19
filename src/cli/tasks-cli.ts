@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -18,9 +18,9 @@ import { boundPrTerminal, cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COM
 import { recordWiringLiveVerified, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { PARENT_HOST_COMPATIBILITY_CONTRACT, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs } from '../task-agent/parent-host.js';
 import { buildWorkOrder } from '../task-agent/work-order-build.js';
-import { evaluateTaPreflight, renderTaPreflight, targetEvidenceMismatch, taPreflightReceipt, type TaPreflightEvidence } from '../task-agent/ta-preflight.js';
+import { evaluateTaPreflight, parseHandShadowEvidence, renderTaPreflight, targetEvidenceMismatch, taPreflightReceipt, type TaPreflightEvidence } from '../task-agent/ta-preflight.js';
 import { parseWorkOrder } from '../task-agent/work-order.js';
-import { evidenceFromRunLedger, mergeCollectedEvidence } from '../task-agent/ta-preflight-collect.js';
+import { collectRuntimePreflightEvidence, evidenceFromRunLedger, mergeCollectedEvidence } from '../task-agent/ta-preflight-collect.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
 import { ambiguousGreenSweepPrs, applyGreenSweepDecisions, decideGreenSweep, greenSweepCandidates, greenSweepEvidenceTestArgs, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
 import { mapInventory, renderMapReduceTable, type MapInventory, type MapItem, type MapPorts } from '../task-agent/map-reduce.js';
@@ -32,7 +32,7 @@ import type { PluginWizardDeps } from '../graph-wizard/mission-compose.js';
 import type { TaskPluginWizardHostPorts } from './task-plugin-wizard-host.js';
 import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import type { LaunchRequestDoor } from '../execution-loop/launch-gate.js';
+import { activeRunsForGoal, launchRequestId, observeLaunchHold, type LaunchRequestDoor, type ActiveRunsForGoal } from '../execution-loop/launch-gate.js';
 import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
 import type { TierSizedDecompose } from '../task-agent/tier-split.js';
 import type { AdvanceMissionResult, MissionDecompose, PieceEvidenceReader } from '../task-agent/mission.js';
@@ -120,6 +120,9 @@ export interface TasksCliDeps {
   liveVerifiedLedgerDir?: string;
   /** `tasks preflight --from-run` 이 읽는 런 원장 디렉터리(시험 주입). 기본 = `runLedgerDir()`. */
   preflightLedgerDir?: string;
+  /** Test seam for the same-goal active-run observation; production queries the real run ledger. */
+  preflightActiveRuns?: (goalId: string) => ActiveRunsForGoal;
+  preflightHoldActive?: () => boolean;
   /** HARNESS-PARENT-ON-MSB1 — 원격 부모 카드의 원장 거울(시험 주입). 기본 = ssh 로 `<prodRoot>/remote-parents/<host>/run-ledger`. */
   remoteLedgerMirror?: (card: TaskCard) => void;
   /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
@@ -1909,10 +1912,11 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .requiredOption('--checklist <cellId>', '체크리스트 칸 id')
     .requiredOption('--version <version>', '체크리스트 판')
     .requiredOption('--out <path>', '작업 지시서 출력 파일')
+    .option('--card <id>', '작업 지시서에 연결할 기존 과제 카드')
     .option('--budget <text>', '예산(시간·모델 티어·Pod 자리·재작업 상한) — critical 칸, 비면 tasks hand 가 발사 거부')
     .option('--contract <text>', '현재 계약 — critical 칸')
     .option('--escalation <text>', '막히면 누구에게 올리는지 — critical 칸')
-    .action((opts: { checklist: string; version: string; out: string; budget?: string; contract?: string; escalation?: string }) => {
+    .action((opts: { checklist: string; version: string; out: string; card?: string; budget?: string; contract?: string; escalation?: string }) => {
       try {
         validateVersion(opts.version);
         const item = (deps.workOrderChecklist ?? listChecklist)(opts.version).items.find((cell) => cell.id === opts.checklist);
@@ -1923,6 +1927,9 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(targets.length ? [`대상 경로: ${targets.join(' · ')}`] : []),
           ...(missing.length ? [`boundary.missing: ${missing.join(' · ')}`] : []),
         ].join('\n');
+        const card = opts.card === undefined ? undefined : readTaskCard(opts.card, deps.taskStatePath);
+        if (opts.card !== undefined && (!card || card.id !== opts.card || !card.seat || card.checklistId !== item.id || card.checklistVersion !== opts.version))
+          throw new Error('카드가 없거나 자리·체크리스트·판이 일치하지 않는다');
         const order = buildWorkOrder({
           cellId: item.id,
           version: opts.version,
@@ -1933,7 +1940,29 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           escalation: opts.escalation,
         });
         mkdirSync(dirname(opts.out), { recursive: true });
-        writeFileSync(opts.out, `${JSON.stringify(order, null, 2)}\n`);
+        const temporary = join(dirname(opts.out), `.work-order-${randomUUID()}.tmp`);
+        try {
+          writeFileSync(temporary, `${JSON.stringify({ ...order, ...(card ? { owner: card.seat, card: card.id, noAutoMerge: card.noAutoMerge === true } : {}) }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+          let writtenCard: TaskCard | undefined;
+          if (card && order.budgetLimits) {
+            let updated = false;
+            updateTaskCard(deps.taskStatePath ?? taskStatePathDefault(), card.id, (current) => {
+              if (!current || JSON.stringify(current) !== JSON.stringify(card) || current.status !== 'handed' || current.runId || current.pr !== undefined)
+                return undefined;
+              if (current.budgetLimits && JSON.stringify(current.budgetLimits) !== JSON.stringify(order.budgetLimits)) return undefined;
+              updated = true;
+              writtenCard = { ...current, budgetLimits: { ...order.budgetLimits! } };
+              return writtenCard;
+            });
+            if (!updated) throw new Error('카드가 바뀌었거나 예산이 달라 작업 지시서를 만들 수 없다');
+          }
+          try { renameSync(temporary, opts.out); }
+          catch (error) {
+            if (card && writtenCard) updateTaskCard(deps.taskStatePath ?? taskStatePathDefault(), card.id,
+              (current) => JSON.stringify(current) === JSON.stringify(writtenCard) ? card : undefined);
+            throw error;
+          }
+        } finally { try { unlinkSync(temporary); } catch { /* renamed or never created */ } }
         out(opts.out);
       } catch (error) {
         out(error instanceof Error ? error.message : '작업 지시서 작성 실패');
@@ -1968,13 +1997,30 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           merged = { ...merged, workOrder: parsed.order };
         }
         if (opts.handShadow) {
-          // hand shadow 출력의 `elanous harness say …` 줄에서 플래그 토큰만 읽는다(첫 작은따옴표 인자 = 골 문면 앞까지).
           const shadow = readFileSync(resolve(opts.handShadow), 'utf8');
-          const line = shadow.split(/\r?\n/u).find((l) => /^(?:elanous|eln)\s+harness\s+say\b/u.test(l));
-          const argv = line ? line.slice(0, line.includes(" '") ? line.indexOf(" '") : undefined).trim().split(/\s+/u) : null;
+          const parsed = parseHandShadowEvidence(shadow);
           const { getUserConfig } = await import('../user-config.js');
           const liveMoves = (getUserConfig() as { taskAgent?: { liveMoves?: unknown } }).taskAgent?.liveMoves;
-          merged = { ...merged, launchArgv: argv, mergePolicy: { ...merged.mergePolicy, liveMovesProposeLand: Array.isArray(liveMoves) && liveMoves.includes('propose-land') } };
+          merged = { ...merged, cardId: parsed.cardId, launchArgv: parsed.launchArgv, mergePolicy: { ...merged.mergePolicy, liveMovesProposeLand: Array.isArray(liveMoves) && liveMoves.includes('propose-land') } };
+        }
+        const selectedCardId = opts.card?.trim() || merged.cardId;
+        if (selectedCardId) {
+          let card: TaskCard | undefined;
+          try { card = readTaskCard(selectedCardId, deps.taskStatePath); } catch { /* unreadable card remains unmeasured */ }
+          if (card?.id !== selectedCardId) card = undefined;
+          let activeRuns: ActiveRunsForGoal = 'unknown';
+          try {
+            if (card?.text?.trim() && Array.isArray(merged.launchArgv) && merged.launchArgv.at(-1) === card.text)
+              activeRuns = (deps.preflightActiveRuns ?? activeRunsForGoal)(launchRequestId(card.text));
+          } catch { /* remains unknown */ }
+          let opHoldActive: boolean | null = null;
+          try { opHoldActive = (deps.preflightHoldActive ?? observeLaunchHold)(); } catch { /* remains unknown */ }
+          const observed = collectRuntimePreflightEvidence({ card: card ?? null, activeRuns,
+            opHoldActive });
+          merged = { ...merged, launch: { ...merged.launch, ...observed.launch } };
+        } else {
+          // A cell or commit alone does not identify a card or its goal. Never trust supplied launch claims.
+          merged = { ...merged, launch: { cardClaimed: null, activeSameGoalRuns: null, opHoldActive: null } };
         }
         // 코드 기본값은 «관측값»이 아니다 — 증거를 채우지 않고 영수증에 defaultAssumed 로 따로 남긴다(조건 ④ 판정에 쓰지 않음).
         const [{ DEFAULT_MAX_HARD_WAIT_SEC }, { POD_JOB_DEADLINE_SECONDS }] = await Promise.all([

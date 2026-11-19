@@ -1,3 +1,4 @@
+import { buildAge, desiredSha, gitAncestor } from './build-badge.js';
 // els core — the single owner of the journal and of the pane PTYs (one server process; src/els/server.ts hosts it).
 // The journal in memory is the truth; every change is saved by this module and nothing else writes the file.
 // Rules that keep it correct without a lock:
@@ -11,10 +12,18 @@
 import { randomBytes } from 'node:crypto';
 import { addPane, addTab, findPane, findWorkspace, journalIds, patchPane, upsertWorkspace } from './journal.js';
 import { emptyJournal, paneAddress, type Pane, type PaneState, type SpaceJournal, type Tab, type Workspace } from './space.js';
+import { paneStatus } from './pane-status.js';
+import type { Foreground } from './foreground.js';
+import { grepScreens, type GrepHit } from './pane-grep.js';
+import { readUnreadMailBadges } from '../msg/msg-store.js';
+
+export type QueueAudit = (result: 'queued' | 'delivering' | 'delivered' | 'delivery-failed' | 'discarded', reason?: string) => boolean;
 
 export interface ElsResult {
   readonly exitCode: 0 | 1 | 2;
   readonly message: string;
+  /** Accepted into an in-memory queue, not delivered; lost if the owner or pane exits. */
+  readonly queued?: number;
 }
 
 /** A pane PTY as the owner sees it (src/pty-shell/registry.ts PtyHandle in the server). */
@@ -22,12 +31,22 @@ export interface ElsPty {
   readonly id: string;
   isAlive(): boolean;
   write(text: string): void;
+  writeAll?(text: string): Promise<void>;
+  bracketedPasteEnabled?(): boolean;
   /** The visible screen; `ansi: true` keeps colours/attributes as SGR sequences (the attach view paints them). */
   renderScreen(options?: { readonly ansi?: boolean }): Promise<string>;
   onExit(cb: () => void): void;
+  /** PTY 출력 구독 — 등록부 어댑터 경유 (src/els/server.ts registryPty). */
+  onOutput?(cb: (data: string) => void): { dispose(): void };
   kill(): void;
+  /** D1a: the PTY lives in an outside holder — release the connection without killing the child (a server stop keeps panes alive). */
+  detach?(): void;
   /** Resize the terminal (SIGWINCH) — absent on a PTY that cannot be resized. */
   resize?(cols: number, rows: number): void;
+  /** When the PTY last produced output (ms) — absent = not known (ELS-PANE-STATUS says unknown). */
+  lastOutputAt?(): number | undefined;
+  /** The shell's process id (ELS-PANE-AGENT-DETECT reads its terminal's foreground group); absent = not known. */
+  readonly pid?: number;
 }
 
 export interface ElsCoreDeps {
@@ -35,6 +54,8 @@ export interface ElsCoreDeps {
   readonly save: (journal: SpaceJournal) => void;
   /** `env` carries ELANOUS_ELS_WS (the server adds ELANOUS_ELS_SOCKET) so an eln started in the pane can report its children here. */
   readonly spawn: (command: readonly string[], cwd: string, title: string, env: Readonly<Record<string, string>>) => ElsPty;
+  /** D1a: adopt a pane whose PTY an outside holder still owns after a restart; undefined = it is gone. */
+  readonly reattach?: (pane: Pane) => ElsPty | undefined;
   /** Random id candidate; the core retries on a collision. */
   readonly randomId?: (prefix: string) => string;
   /** Clock for the queue settle time (tests). */
@@ -54,11 +75,19 @@ const ID_ATTEMPTS = 16;
 
 // 출처: eln's own working line shows «Turn running» (Korean UI: «응답 중») while a turn is in flight; typing into the
 // prompt then would interleave with it, so `do` waits (queues) instead.
-const BUSY_SCREEN = /Turn running|응답 중/;
+export const BUSY_SCREEN = /Turn running|응답 중/;
+// Observed Claude/Codex working hint; limit to the status area, not scrollback.
+const turnStarted = (screen: string): boolean => BUSY_SCREEN.test(screen) || /(?:esc|ctrl\+c) to interrupt/i.test(screen.split('\n').slice(-6).join('\n'));
+// D10 (els-round1b-a110): a fast turn (mock provider, 0s) finishes before the first 100ms poll renders
+// «Turn running», so the busy markers never appear — the fresh completion hint («✻ Worked for … · done …»)
+// is then the only on-screen evidence the turn started. Absent before the submit, present after: started.
+const TURN_DONE_HINT = /✻ Worked for/;
 // A queued line is delivered at most this often per pane: right after a write the screen may not show «Turn running» yet.
 const QUEUE_SETTLE_MS = 2_000;
 const MAX_QUEUE = 20;
 export const MAX_DO_CHARS = 8_000;
+/** Plain (unbracketed) sends: CR, LF and every C0 control except TAB, and DEL, are not text (JUD-B #103319). */
+const PLAIN_UNSAFE = /[\u0000-\u0008\u000a-\u001f\u007f]/;
 /** Control characters (ESC, CR, NL, …) would let the sender drive the terminal instead of typing text. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;   // C0 + DEL + C1 (0x9b is a one-byte CSI)
 export const clean = (value: string): string => value.replace(CONTROL, ' ').replace(/ {2,}/g, ' ').trim();
@@ -79,9 +108,12 @@ export function createElsCore(deps: ElsCoreDeps) {
   const randomId = deps.randomId ?? ((prefix: string) => `${prefix}${randomBytes(4).toString('hex')}`);
   let journal: SpaceJournal = emptyJournal();
   const ptys = new Map<string, ElsPty>();
+  const builds = new Map<string, { sha: string; seen: number }>();
   const now = deps.now ?? Date.now;
+  /** ELS-PANE-AGENT-DETECT: what each live pane runs in its foreground now (refreshed by the server). */
+  const foregrounds = new Map<string, Foreground>();
   /** `do` lines waiting for a pane whose turn is running (memory only: a restart drops them). */
-  const queues = new Map<string, { from: string; text: string }[]>();
+  const queues = new Map<string, { from: string; text: string; typed?: boolean; audit?: QueueAudit }[]>();
   const lastDelivery = new Map<string, number>();
   /** The terminal size an attached client last asked for (default 80x24). */
   const sizes = new Map<string, { cols: number; rows: number }>();
@@ -124,10 +156,17 @@ export function createElsCore(deps: ElsCoreDeps) {
     return persist(patchPane(journal, paneId, patch));
   };
 
+  const discardQueue = (paneId: string, reason: string): void => {
+    const queue = queues.get(paneId);
+    queues.delete(paneId);
+    for (const item of queue ?? []) item.audit?.('discarded', reason);
+  };
+
   /** The pane's PTY ended: record `exited` now (once). Returns false when this exit is not the pane's live PTY. */
   const recordExit = (paneId: string, ptyId: string): boolean => {
     ptys.delete(paneId);
-    queues.delete(paneId);
+    builds.delete(paneId);
+    discardQueue(paneId, 'pane exited');
     const pane = journal.panes.find((row) => row.id === paneId);
     if (!pane || pane.state === 'exited' || pane.ptyId !== ptyId) return false;
     const saveError = persist(patchPane(journal, paneId, { state: 'exited', ptyId: '' }));
@@ -161,6 +200,15 @@ export function createElsCore(deps: ElsCoreDeps) {
     const saveError = patchLive(pane.id, pty.id, { state: 'working' });
     return { exitCode: 0, message: `els do: ${pane.id} delivered ${text.length} chars from ${from}${saveError ? ` (state not saved: ${saveError})` : ''}` };
   };
+  /** OP #17 OP-DIRECT-SEAT-INPUT: a typed line without the «⇢» marker — the pane sees it as if the person at
+   *  the keyboard typed it and pressed Enter. Same one-line, no-control-characters rules as `do`. */
+  const deliverTyped = (pane: Pane, pty: ElsPty, text: string): ElsResult => {
+    try { pty.write(`${text}\r`); }
+    catch (error) { return { exitCode: 1, message: `els input: ${message(error)}` }; }
+    lastDelivery.set(pane.id, now());
+    const saveError = patchLive(pane.id, pty.id, { state: 'working' });
+    return { exitCode: 0, message: `els input: ${pane.id} typed ${text.length} chars${saveError ? ` (state not saved: ${saveError})` : ''}` };
+  };
 
   /** Deliver the next waiting line of one pane when its screen is idle. At most one step per pane in flight. */
   const drainPane = async (paneId: string): Promise<void> => {
@@ -169,7 +217,7 @@ export function createElsCore(deps: ElsCoreDeps) {
     try {
       const pane = journal.panes.find((row) => row.id === paneId);
       const pty = pane ? livePty(pane) : undefined;
-      if (!pane || !pty) { queues.delete(paneId); return; }
+      if (!pane || !pty) { discardQueue(paneId, 'pane unavailable'); return; }
       if (now() - (lastDelivery.get(paneId) ?? -Infinity) < QUEUE_SETTLE_MS) return;
       let busy: boolean;
       try { busy = BUSY_SCREEN.test(await pty.renderScreen()); } catch { return; }
@@ -178,7 +226,12 @@ export function createElsCore(deps: ElsCoreDeps) {
       const [next, ...rest] = queue;
       if (rest.length) queues.set(paneId, rest); else queues.delete(paneId);
       if (next) {
-        const result = deliver(pane, pty, next.from, next.text);
+        if (next.audit && !next.audit('delivering')) {
+          next.audit('discarded', 'delivery intent audit failed');
+          return;
+        }
+        const result = next.typed ? deliverTyped(pane, pty, next.text) : deliver(pane, pty, next.from, next.text);
+        next.audit?.(result.exitCode === 0 ? 'delivered' : 'delivery-failed', result.exitCode === 0 ? undefined : 'pty write failed');
         if (result.exitCode !== 0) process.stderr.write(`${result.message}\n`);
       }
     } finally { draining.delete(paneId); }
@@ -186,9 +239,10 @@ export function createElsCore(deps: ElsCoreDeps) {
 
   return {
     /**
-     * Load the journal once. Panes whose PTY belonged to a previous server lose it: ptyId is cleared and a live
-     * state becomes idle (exited stays exited); cwd, command and scrollback stay. Returns a refusal when the journal
-     * cannot be read or the restart state cannot be saved — the file is never replaced by an empty one.
+     * Load the journal once. A pane whose PTY an outside holder still owns is adopted as it is (D1a); the panes
+     * without one lose their PTY: ptyId is cleared and a live state becomes idle (exited stays exited); cwd,
+     * command and scrollback stay. Returns a refusal when the journal cannot be read or the restart state cannot
+     * be saved — the file is never replaced by an empty one.
      */
     start(): ElsResult | undefined {
       let loaded: SpaceJournal;
@@ -196,8 +250,20 @@ export function createElsCore(deps: ElsCoreDeps) {
       const gone = new Set(loaded.panes.filter((pane) => pane.kind === 'harness-child').map((pane) => pane.tabId));
       const kept: SpaceJournal = gone.size === 0 ? loaded : { ...loaded, tabs: loaded.tabs.filter((tab) => !gone.has(tab.id)),
         panes: loaded.panes.filter((pane) => pane.kind !== 'harness-child') };
-      const restarted: SpaceJournal = { ...kept, panes: kept.panes.map((pane) =>
-        pane.ptyId === '' ? pane : { ...pane, ptyId: '', state: pane.state === 'exited' ? 'exited' : 'idle' }) };
+      const restarted: SpaceJournal = { ...kept, panes: kept.panes.map((pane) => {
+        if (pane.ptyId === '') return pane;
+        // D1a: a pane whose PTY an outside holder still owns is adopted as it is (ptyId and state intact); without
+        // a holder — or with a dead one — the pane loses its PTY exactly as before.
+        const adopted = pane.state === 'exited' ? undefined : deps.reattach?.(pane);
+        if (!adopted) return { ...pane, ptyId: '', state: pane.state === 'exited' ? 'exited' : 'idle' };
+        ptys.set(pane.id, adopted);
+        const adoptedId = adopted.id;
+        adopted.onExit(() => {
+          if (!recordExit(pane.id, adoptedId)) return;
+          void adopted.renderScreen().then((screen) => recordFinalScreen(pane.id, screen), () => { /* keep the saved scrollback */ });
+        });
+        return { ...pane, ptyId: adoptedId, state: pane.state };
+      }) };
       try {
         if (gone.size > 0 || restarted.panes.some((pane, index) => pane !== kept.panes[index])) commit(restarted);
         else journal = restarted;
@@ -222,7 +288,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         paneId = freshId('p', taken);
       } catch (error) { return { exitCode: 1, message: `els new: ${message(error)}` }; }
       let pty: ElsPty;
-      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name }); }
+      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name, ELANOUS_ELS_PANE: paneId }); }
       catch (error) { return { exitCode: 1, message: `els new: failed to spawn: ${message(error)}` }; }
       let address = '';
       try {
@@ -245,6 +311,13 @@ export function createElsCore(deps: ElsCoreDeps) {
       return { exitCode: 0, message: JSON.stringify({ address, pane: paneId, ptyId, cwd: input.cwd }) };
     },
 
+    reportBuild(paneId: string, sha: string): ElsResult {
+      const pane = journal.panes.find((row) => row.id === paneId);
+      if (!pane || !livePty(pane) || !/^[a-f0-9]{40}$/i.test(sha)) return { exitCode: 1, message: 'els build: invalid pane or sha' };
+      builds.set(paneId, { sha: sha.toLowerCase(), seen: now() });
+      return { exitCode: 0, message: 'els build: recorded' };
+    },
+
     list(): ElsResult {
       // Panes come out in the order a person set: workspaces in journal order, tabs in journal order inside each, panes by
       // journal order inside a tab — so every client (els, the eln side tab) draws the same list from the same answer.
@@ -253,13 +326,23 @@ export function createElsCore(deps: ElsCoreDeps) {
       const ordered = journal.panes.map((pane, index) => ({ pane, index, tab: journal.tabs.find((row) => row.id === pane.tabId) }))
         .filter((row): row is { pane: Pane; index: number; tab: Tab } => row.tab !== undefined)
         .sort((a, b) => wsAt(a.tab.workspaceId) - wsAt(b.tab.workspaceId) || tabAt(a.tab.id) - tabAt(b.tab.id) || a.index - b.index);
+      const desired = desiredSha();
+      // JUD #39000 FU: the mail ledger is read once per listing for all seats (not once per pane), with a short wait.
+      const badges = mailBadgesOf(ordered.map(({ pane }) => seatOf(pane.cwd)).filter((seat): seat is string => seat !== null));
       const panes = ordered.flatMap(({ pane, tab }) => {
         const ws = journal.workspaces.find((row) => row.id === tab.workspaceId);
         if (!ws) return [];
         const live = livePty(pane);
-        return [{ address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
+        const report = builds.get(pane.id);
+        const sha = live && report && now() - report.seen < 90_000 ? report.sha : undefined;
+        const build = { sha: sha ?? null, source: sha ? 'self-reported' : 'unknown', trusted: false, desired: desired ?? null,
+          age: buildAge(sha, desired, gitAncestor) };
+        const seat = seatOf(pane.cwd);
+        const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
+        return [{ build, address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
           cwd: pane.cwd, command: pane.command, state: pane.state === 'exited' ? 'exited' : live ? pane.state : 'idle',
-          ptyId: live ? pane.ptyId : '', restore: pane.restore }];
+          ptyId: live ? pane.ptyId : '', restore: pane.restore, seat, unreadMail,
+          ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}) }];
       });
       return { exitCode: 0, message: JSON.stringify({ workspaces: journal.workspaces, tabs: journal.tabs, panes }, null, 2) };
     },
@@ -300,6 +383,43 @@ export function createElsCore(deps: ElsCoreDeps) {
       const tabs = [...rest.slice(0, at), moving, ...rest.slice(at)];
       try { commit({ ...journal, tabs }); } catch (error) { return { exitCode: 1, message: `els reorder: not saved: ${message(error)}` }; }
       return { exitCode: 0, message: `els reorder: tab ${moving.id} moved` };
+    },
+
+    /**
+     * ELS-DOOR-STRUCT-OPS: rename a workspace or a tab. The name is a person-facing label only — permissions key on
+     * stable ids, never names (control.ts pins names to ids on load), so a rename moves no permission.
+     */
+    rename(input: { kind: string; id: string; name: string }): ElsResult {
+      if (input.kind !== 'workspace' && input.kind !== 'tab') return { exitCode: 2, message: 'els rename: kind must be workspace or tab' };
+      if (typeof input.id !== 'string' || typeof input.name !== 'string' || !input.name.trim()) return { exitCode: 2, message: 'els rename: id and a non-empty name are required' };
+      if (input.kind === 'workspace') {
+        const ws = findWorkspace(journal, input.id);
+        if (!ws) return { exitCode: 1, message: `els rename: unknown workspace ${input.id}` };
+        const workspaces = journal.workspaces.map((row) => row.id === ws.id ? { ...row, name: input.name } : row);
+        try { commit({ ...journal, workspaces }); } catch (error) { return { exitCode: 1, message: `els rename: not saved: ${message(error)}` }; }
+        return { exitCode: 0, message: `els rename: workspace ${ws.id} renamed to ${input.name}` };
+      }
+      const tab = journal.tabs.find((row) => row.id === input.id);
+      if (!tab) return { exitCode: 1, message: `els rename: unknown tab ${input.id}` };
+      const tabs = journal.tabs.map((row) => row.id === tab.id ? { ...row, label: input.name } : row);
+      try { commit({ ...journal, tabs }); } catch (error) { return { exitCode: 1, message: `els rename: not saved: ${message(error)}` }; }
+      return { exitCode: 0, message: `els rename: tab ${tab.id} renamed to ${input.name}` };
+    },
+
+    /** ELS-DOOR-STRUCT-OPS: close every pane of a tab, then the tab itself. Same shape as `close` for a pane. */
+    closeTab(ref: string): ElsResult {
+      const tab = journal.tabs.find((row) => row.id === ref || row.label === ref);
+      if (!tab) return { exitCode: 1, message: `els close: unknown tab ${ref}` };
+      const panes = journal.panes.filter((row) => row.tabId === tab.id);
+      for (const pane of panes) {
+        const pty = ptys.get(pane.id);
+        ptys.delete(pane.id);
+        queues.delete(pane.id);
+        if (pty) { try { pty.kill(); } catch { /* already gone */ } }
+      }
+      const saveError = persist({ ...journal, tabs: journal.tabs.filter((row) => row.id !== tab.id),
+        panes: journal.panes.filter((row) => row.tabId !== tab.id) });
+      return { exitCode: 0, message: `els close: tab ${tab.id} (${panes.length} panes)${saveError ? ` (not saved yet: ${saveError})` : ''}` };
     },
 
     /** A person typing in an attached view: raw bytes to the pane's PTY, no queue and no «⇢» line. The settle clock starts,
@@ -352,6 +472,13 @@ export function createElsCore(deps: ElsCoreDeps) {
       return sizes.get(paneId) ?? { cols: DEFAULT_PANE_COLS, rows: DEFAULT_PANE_ROWS };
     },
 
+    /** The live PTY's data stream (attach turns it into immediate frame pushes — UX #38884 ④). */
+    onOutput(paneId: string, cb: (data: string) => void): { dispose(): void } | undefined {
+      const hit = resolve(paneId);
+      const pty = hit ? livePty(hit.pane) : undefined;
+      return pty?.onOutput?.(cb);
+    },
+
     /** The pane's id when `ref` names one (attach checks this before it opens a stream). */
     paneExists(ref: string): string | undefined {
       return resolve(ref)?.pane.id;
@@ -368,6 +495,113 @@ export function createElsCore(deps: ElsCoreDeps) {
       const saveError = patchLive(hit.pane.id, pty.id, { scrollback: screen, state: 'idle' });
       if (saveError) process.stderr.write(`els read: screen not saved: ${saveError}\n`);
       return { exitCode: 0, message: screen };
+    },
+
+    /**
+     * ELS-GREP-PANES: every pane's last screen searched for a literal `pattern` — the owner's whole pane universe, in
+     * the `list` order. A live PTY is rendered plainly (like `read`), an exited pane uses the saved scrollback; but
+     * unlike `read` nothing is saved — a search is not a change — and a pane whose screen cannot be rendered is
+     * reported in `errors`, never silently skipped. Exit 0 with `hits: []` means «nothing found», not a failure;
+     * the empty pattern is a usage error (2). The federation half of the command (remote hosts, herdr rows) lives
+     * in the CLI and reuses each host's read path.
+     */
+    async grep(pattern: string): Promise<ElsResult> {
+      if (typeof pattern !== 'string' || pattern === '') return { exitCode: 2, message: 'els grep: needs a pattern' };
+      const wsAt = (id: string): number => journal.workspaces.findIndex((row) => row.id === id);
+      const tabAt = (id: string): number => journal.tabs.findIndex((row) => row.id === id);
+      const ordered = journal.panes.map((pane, index) => ({ pane, index, tab: journal.tabs.find((row) => row.id === pane.tabId) }))
+        .filter((row): row is { pane: Pane; index: number; tab: Tab } => row.tab !== undefined)
+        .sort((a, b) => wsAt(a.tab.workspaceId) - wsAt(b.tab.workspaceId) || tabAt(a.tab.id) - tabAt(b.tab.id) || a.index - b.index);
+      const hits: GrepHit[] = [];
+      const errors: string[] = [];
+      for (const { pane, tab } of ordered) {
+        const ws = journal.workspaces.find((row) => row.id === tab.workspaceId);
+        if (!ws) continue;
+        const pty = livePty(pane);
+        let screen: string;
+        if (pty) {
+          try { screen = await pty.renderScreen(); }
+          catch (error) { errors.push(`els grep: cannot render ${pane.id}: ${message(error)}`); continue; }
+        } else screen = pane.scrollback;
+        hits.push(...grepScreens(pattern, [{ address: paneAddress(ws, tab, pane), screen }]));
+      }
+      return { exitCode: 0, message: JSON.stringify({ hits, errors }, null, 2) };
+    },
+
+    /** ELS-PANE-STATUS: what the pane is doing (JSON PaneStatus) — read from the live PTY; unknown + reason otherwise. */
+    async status(ref: string): Promise<ElsResult> {
+      const hit = resolve(ref);
+      if (!hit) return { exitCode: 1, message: `els status: unknown pane ${ref}` };
+      const pty = livePty(hit.pane);
+      let screen: string | undefined;
+      if (pty) { try { screen = await pty.renderScreen(); } catch { screen = undefined; } }
+      const status = paneStatus({ pane: hit.pane.id, alive: pty !== undefined, exited: hit.pane.state === 'exited',
+        screen, lastOutputAt: pty?.lastOutputAt?.(), now: now() });
+      const fg = pty ? foregrounds.get(hit.pane.id) : undefined;
+      return { exitCode: 0, message: JSON.stringify(fg ? { ...status, kind: fg.kind, pid: fg.pid } : status) };
+    },
+
+    /** ELS-PANE-AGENT-DETECT: the live panes with a known shell pid (what the server probes). */
+    shellPids(): { readonly pane: string; readonly pid: number }[] {
+      return journal.panes.flatMap((pane) => { const pid = livePty(pane)?.pid; return pid ? [{ pane: pane.id, pid }] : []; });
+    },
+    /** Set what each probed pane runs now; panes not in `next` are forgotten. Returns the panes whose kind changed. */
+    setForegrounds(next: ReadonlyMap<string, Foreground>): string[] {
+      const changed = [...next].filter(([pane, fg]) => foregrounds.get(pane)?.kind !== fg.kind).map(([pane]) => pane);
+      foregrounds.clear();
+      for (const [pane, fg] of next) foregrounds.set(pane, fg);
+      return changed;
+    },
+
+    /** Submit one intact paste, then report whether this PTY displayed a new running turn. */
+    async sendVerified(ref: string, text: string, requireEmpty = false): Promise<ElsResult> {
+      if (!text || text.includes('\x1b') || text.includes('\x00')) return { exitCode: 2, message: 'els send: empty text or unsupported control character; not sent' };
+      const first = resolve(ref);
+      if (!first) return { exitCode: 1, message: `els send: unknown pane ${ref}` };
+      return serialized(first.pane.id, async () => {
+        const hit = resolve(first.pane.id);
+        const pty = hit && livePty(hit.pane);
+        if (!hit || !pty) return { exitCode: 1, message: `els send: pane ${first.pane.id} has no live pty` };
+        let before: string;
+        try { before = await pty.renderScreen(); }
+        catch (error) { return { exitCode: 1, message: `els send: cannot inspect pane, not sent: ${message(error)}` }; }
+        if (turnStarted(before)) return { exitCode: 1, message: `els send: ${hit.pane.id} is already running, not sent` };
+        if (requireEmpty) {
+          const view = paneStatus({ pane: hit.pane.id, alive: true, exited: false, screen: before, lastOutputAt: pty.lastOutputAt?.(), now: now() });
+          if (view.state !== 'idle' || view.inputEmpty !== true) return { exitCode: 1, message: `els send: pane not idle with empty input; not sent (${view.reason})` };
+        }
+        if (!livePty(hit.pane)) return { exitCode: 1, message: `els send: ${hit.pane.id} exited, not sent` };
+        const pasteMode = pty.bracketedPasteEnabled?.() === true;
+        if (!pty.writeAll) return { exitCode: 1, message: 'els send: PTY cannot verify complete writes; not sent' };
+        // JUD-B #103319 must: without bracketed paste the shell reads every byte as typed — a line break inside the text
+        // would submit more than one command and a control byte (Ctrl-C/D …) would be a signal. Plain mode takes one line
+        // only (a trailing line break is the Enter it adds anyway); anything else is refused before a byte is written.
+        const line = text.replace(/[\r\n]+$/, '');
+        if (!pasteMode && PLAIN_UNSAFE.test(line)) return { exitCode: 2, message: 'els send: plain 모드는 한 줄 텍스트만 — 줄바꿈·제어 문자가 있어 보내지 않음 (bracketed paste 를 켠 pane 에선 여러 줄 가능)' };
+        const submitted = pasteMode ? `\x1b[200~${text}\x1b[201~\r` : `${line}\r`;
+        try { await pty.writeAll(submitted); }
+        catch (error) { return { exitCode: 1, message: `els send: write failed; delivery unknown: ${message(error)}` }; }
+        if (!pasteMode) {
+          const saveError = patchLive(hit.pane.id, pty.id, { state: 'working' });
+          return { exitCode: 0, message: `els send: ${hit.pane.id} submitted ${text.length} chars; mode=plain; turn start unverified${saveError ? ` (state not saved: ${saveError})` : ''}` };
+        }
+        for (let attempt = 0; attempt < 30; attempt++) { // 3 seconds, inside the client request timeout.
+          await new Promise<void>(resolve => setTimeout(resolve, 100));
+          if (!livePty(hit.pane)) return { exitCode: 1, message: `els send: ${hit.pane.id} exited after submit; turn start unknown` };
+          try {
+            const screen = await pty.renderScreen();
+            if (turnStarted(screen)) {
+              const saveError = patchLive(hit.pane.id, pty.id, { state: 'working' });
+              return { exitCode: 0, message: `els send: ${hit.pane.id} submitted ${text.length} chars; turn started${saveError ? ` (state not saved: ${saveError})` : ''}` };
+            }
+            // D10: the turn already finished before the busy marker could be observed (fast turn).
+            if (TURN_DONE_HINT.test(screen) && !TURN_DONE_HINT.test(before)) {
+              return { exitCode: 0, message: `els send: ${hit.pane.id} submitted ${text.length} chars; turn started (already completed before the busy marker could be observed)` };
+            }
+          } catch (error) { return { exitCode: 1, message: `els send: submitted; turn start unknown: ${message(error)}` }; }
+        }
+        return { exitCode: 1, message: `els send: ${hit.pane.id} submitted; turn start not observed (do not blindly retry)` };
+      });
     },
 
     async send(ref: string, text: string): Promise<ElsResult> {
@@ -424,6 +658,54 @@ export function createElsCore(deps: ElsCoreDeps) {
       });
     },
 
+    /**
+     * `input`: type a line into a live pane as the person at the keyboard would — no «⇢» marker, submitted with
+     * Enter (OP #17 OP-DIRECT-SEAT-INPUT; the control door lets only OP and RES-INFRA reach this). Same rules as
+     * `do`: one line, no control characters, queued while the pane's turn runs, fail closed.
+     */
+    async inputLine(ref: string, rawText: string, rawFrom: string, audit?: QueueAudit): Promise<ElsResult> {
+      const text = clean(rawText);
+      const from = clean(rawFrom).slice(0, 64) || 'unknown';
+      if (!text) return { exitCode: 2, message: 'els input: text is empty' };
+      if (text.length > MAX_DO_CHARS) return { exitCode: 2, message: `els input: text is longer than ${MAX_DO_CHARS} chars` };
+      const first = resolve(ref);
+      if (!first) return { exitCode: 1, message: `els input: unknown pane ${ref}` };
+      return serialized(first.pane.id, async () => {
+        const hit = resolve(first.pane.id);
+        if (!hit) return { exitCode: 1, message: `els input: unknown pane ${ref}` };
+        const pty = livePty(hit.pane);
+        if (!pty) return { exitCode: 1, message: `els input: pane ${hit.pane.id} has no live pty (restart restores cwd only)` };
+        let busy = queues.has(hit.pane.id) || now() - (lastDelivery.get(hit.pane.id) ?? -Infinity) < QUEUE_SETTLE_MS;
+        if (!busy) {
+          try { busy = BUSY_SCREEN.test(await pty.renderScreen()); }
+          catch (error) { return { exitCode: 1, message: `els input: cannot check whether ${hit.pane.id} is busy, not sent: ${message(error)}` }; }
+        }
+        if (busy) {
+          // The pane may have exited while its screen was being rendered.
+          const queue = queues.get(hit.pane.id) ?? [];
+          if (!livePty(hit.pane)) return { exitCode: 1, message: `els input: pane ${hit.pane.id} ended before the line was queued` };
+          if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: `els input: ${hit.pane.id} already has ${MAX_QUEUE} lines waiting, not queued` };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els input: not queued (audit not writable)' };
+          const at = queue.findIndex((item) => !item.typed);
+          const index = at < 0 ? queue.length : at;
+          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit }, ...queue.slice(index)]);
+          return { exitCode: 0, queued: queue.length + 1, message: `els input: queued ${queue.length + 1} for ${hit.pane.id} (turn running; memory only, not yet delivered)` };
+        }
+        // Idle: a queue may have appeared while the screen was rendering (a drain cannot, but stay safe) — then go behind it.
+        if (queues.has(hit.pane.id)) {
+          const queue = queues.get(hit.pane.id)!;
+          if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: `els input: ${hit.pane.id} already has ${MAX_QUEUE} lines waiting, not queued` };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els input: not queued (audit not writable)' };
+          const at = queue.findIndex((item) => !item.typed);
+          const index = at < 0 ? queue.length : at;
+          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit }, ...queue.slice(index)]);
+          return { exitCode: 0, queued: queues.get(hit.pane.id)!.length, message: `els input: queued ${queues.get(hit.pane.id)!.length} for ${hit.pane.id} (memory only, not yet delivered)` };
+        }
+        if (!livePty(hit.pane)) return { exitCode: 1, message: `els input: pane ${hit.pane.id} ended before the line was sent` };
+        return deliverTyped(hit.pane, pty, text);
+      });
+    },
+
     /** Deliver the next waiting `do` line to every pane that is idle again. Called on a timer by the server. */
     async drain(): Promise<void> {
       await Promise.all([...queues.keys()].map((paneId) => drainPane(paneId)));
@@ -445,7 +727,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       const paneId = hit.pane.id;
       const pty = ptys.get(paneId);
       ptys.delete(paneId);
-      queues.delete(paneId);
+      discardQueue(paneId, 'pane closed');
       if (pty) { try { pty.kill(); } catch { /* already gone */ } }
       const panes = journal.panes.filter((row) => row.id !== paneId);
       const tabs = panes.some((row) => row.tabId === hit.tab.id) ? journal.tabs : journal.tabs.filter((row) => row.id !== hit.tab.id);
@@ -462,7 +744,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       for (const pane of doomed) {
         const pty = ptys.get(pane.id);
         ptys.delete(pane.id);
-        queues.delete(pane.id);
+        discardQueue(pane.id, 'workspace closed');
         if (pty) { try { pty.kill(); } catch { /* already gone */ } }
       }
       const saveError = persist({ ...journal, workspaces: journal.workspaces.filter((row) => row.id !== ws.id),
@@ -522,11 +804,29 @@ export function createElsCore(deps: ElsCoreDeps) {
       return hit && owner ? hit.id : undefined;
     },
 
-    /** Stop every pane PTY (server shutdown). The journal keeps the panes; the next start clears their pty ids. */
+    /** Stop every pane PTY (server shutdown). A holder-owned PTY is released, not killed (D1a: the next server
+     *  re-attaches to the holder, the pane survives the restart); a PTY in this process still dies. The journal keeps the panes. */
     stopAll(): void {
-      for (const pty of ptys.values()) { try { pty.kill(); } catch { /* already gone */ } }
+      for (const paneId of queues.keys()) discardQueue(paneId, 'server shutdown');
+      for (const pty of ptys.values()) {
+        if (typeof pty.detach === 'function') { try { pty.detach(); } catch { /* already gone */ } }
+        else { try { pty.kill(); } catch { /* already gone */ } }
+      }
     },
   };
 }
 
 export type ElsCore = ReturnType<typeof createElsCore>;
+
+/** The seat a pane belongs to by its cwd (`…/seats/<SEAT>/…`), or null when the pane has no seat folder — the OP seat-mail badge (#22 주소록 cwd 규약). */
+function seatOf(cwd: string): string | null {
+  const i = cwd.lastIndexOf('/seats/');
+  if (i < 0) return null;
+  const seat = cwd.slice(i + '/seats/'.length).split('/')[0] ?? '';
+  return seat.length > 0 ? seat : null;
+}
+
+/** Unread mail badges (미ack 수 + 최장 대기) for the listed seats — one ledger read; absent/locked ledger → none, never throws (ls must not fail on badge lookup). */
+function mailBadgesOf(seats: readonly string[]): ReadonlyMap<string, { count: number; oldestCreatedAt: string | null } | null> {
+  try { return readUnreadMailBadges(seats); } catch { return new Map(); }
+}

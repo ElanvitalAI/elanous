@@ -1,8 +1,10 @@
+import { createTurnEventRing, type CompletedTurnEvent } from './ring.js';
 import { debug } from '../../debug/log.js';
 import { compareTurnEvents, type TurnEvent, type TurnEventBus, type TurnEventSource } from '../../turn-capsule/contract.js';
 
 export interface TurnEventBusOptions {
   readonly now?: () => number;
+  readonly history?: { record(entry: CompletedTurnEvent): boolean; snapshot(): { rows: CompletedTurnEvent[]; evicted: number } };
   readonly log?: (event: string, data: Record<string, unknown>) => void;
   /** Delay before a failed event can be offered again. */
   readonly backoffMs?: (source: TurnEventSource, failures: number) => number;
@@ -16,7 +18,8 @@ interface Entry {
 }
 
 /** In-memory delivery state. Durable producers retain ownership until responded is acknowledged. */
-export function createTurnEventBus(options: TurnEventBusOptions = {}): TurnEventBus {
+export function createTurnEventBus(options: TurnEventBusOptions = {}): TurnEventBus & { history(): { rows: CompletedTurnEvent[]; evicted: number } } {
+  const history = options.history ?? createTurnEventRing();
   const now = options.now ?? Date.now;
   const logger = options.log ?? ((event, data) => debug.log('turn-life', event, data));
   const log = (event: string, row: Entry, extra: Record<string, unknown> = {}): void => {
@@ -32,6 +35,7 @@ export function createTurnEventBus(options: TurnEventBusOptions = {}): TurnEvent
   };
   const snapshot = (event: TurnEvent): TurnEvent => ({ ...event, ...(event.capsule ? { capsule: { ...event.capsule } } : {}) });
   return {
+    history: () => history.snapshot(),
     publish(event) {
       if (keys.has(event.dedupeKey) || byId.has(event.id)) return { duplicate: true };
       const entry: Entry = { event: snapshot(event), state: 'waiting', readyAt: Number.NEGATIVE_INFINITY, failures: 0 };
@@ -51,7 +55,12 @@ export function createTurnEventBus(options: TurnEventBusOptions = {}): TurnEvent
       for (const id of ids) {
         const row = byId.get(id);
         if (!row || row.state !== 'inflight') continue;
-        if (outcome === 'responded') { row.state = 'done'; log('turn-life:event-acked', row, { outcome }); continue; }
+        if (outcome === 'responded') {
+          row.state = 'done';
+          try { history.record({ id: row.event.id, outcome, ...(row.event.capsule ? { capsuleId: row.event.capsule.capsuleId } : {}) }); } catch { /* history is observational */ }
+          log('turn-life:event-acked', row, { outcome });
+          continue;
+        }
         row.state = 'waiting';
         if (outcome === 'failed') {
           row.failures++;

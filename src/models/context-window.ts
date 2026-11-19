@@ -5,6 +5,7 @@ import { findGrokModel } from '../grok/models.js';
 import { loadCatalog } from '../intelligence-map/model-catalog.js';
 import { getCapabilitiesStore } from '../policy/model-capabilities.js';
 import { debug } from '../debug/log.js';
+import { REMOTE_VENDOR_PROVIDERS, remoteContextWindow } from './remote-context-window.js';
 
 function exactCatalogContextWindow(modelId: string): number | null {
   const lowered = modelId.toLowerCase();
@@ -45,12 +46,26 @@ function capabilityFamilyContextWindow(modelId: string): number | null {
   return null;
 }
 
+/** `openai/gpt-6-luna` → `gpt-6-luna` — only through a known remote vendor (an unknown prefix stays as it is). */
+function remoteVendorBareId(modelId: string): string | null {
+  const parts = modelId.trim().toLowerCase().replace(/^openrouter\//, '').split('/');
+  return parts.length === 2 && REMOTE_VENDOR_PROVIDERS[parts[0]!] && parts[1] ? parts[1] : null;
+}
+
 export function resolveModelContextWindow(modelId: string | undefined): number | null {
   const normalized = modelId?.trim();
   if (!normalized) return null;
+  const vendorBare = remoteVendorBareId(normalized);
   const contextWindow = exactCatalogContextWindow(normalized)
+    ?? (vendorBare !== null ? exactCatalogContextWindow(vendorBare) : null)
     ?? capabilityFamilyContextWindow(normalized);
   if (contextWindow !== null) return contextWindow;
+  // OP-LONG-SESSION-COMPACT (O4 · OP #90602): allow-list remote fallback — everything else is local → unknown.
+  const remote = remoteContextWindow(normalized, loadCatalog().catalog.models);
+  if (remote) {
+    debug.log('models.context-window', 'family-fallback', { modelId, provider: remote.provider, via: remote.via, contextWindow: remote.contextWindow });
+    return remote.contextWindow;
+  }
   debug.log('models.context-window', 'unknown', { modelId });
   return null;
 }

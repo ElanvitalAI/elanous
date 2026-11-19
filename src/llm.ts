@@ -9494,6 +9494,29 @@ export async function streamLLMWithTools(
           // A tool call or an image already escaped: never replay them elsewhere — run what the model asked for.
           if (pendingCalls.length > 0 || streamEmittedImage) {
             debug.log('llm.stream', 'no-progress-keep-pending', { provider: activeProvider.name, turn, pendingCalls: pendingCalls.length }, { level: 'warn' });
+            // O10 stream-stall advance — the stalled stream cannot serve the pending round. Advance to the
+            // next provider now (the escaped tool call / image is never replayed) so the round after the
+            // side effects runs on a live provider instead of looping back onto the dead one.
+            if (!opts.provider) {
+              const switched = firstAvailableFallbackProvider(attemptedProviders, opts);
+              if (switched && !attemptedProviders.has(switched.name)) {
+                (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, 'stream-stall-advance', Date.now());
+                debug.log('llm.router', 'provider-fallback', {
+                  turn,
+                  blockedProvider: activeProvider.name,
+                  fallbackProvider: switched.name,
+                  reason: `no-progress after ${Math.max(1, Math.round(err.quietMs / 60_000))} min with pending calls`,
+                  category: 'stream-stall',
+                  tools: activeTools.map((tool) => tool.name),
+                }, { level: 'warn' });
+                try { handlers.onStatus?.(`⚠ 공급자 전환: ${activeProvider.name} → ${switched.name} (stream-stall)`); } catch { /* status is fail-soft */ }
+                const finalized = finalizeStreamingProviderModel(switched, switched.defaultModel);
+                activeProvider = finalized.provider;
+                activeModel = finalized.model;
+                attemptedProviders.add(activeProvider.name);
+                streamDisconnectRetries = 0;
+              }
+            }
             break;
           }
           // Same context, next provider: drop this attempt's partial text (the retry display gate keeps the screen honest).
@@ -9533,8 +9556,32 @@ export async function streamLLMWithTools(
             streamIter = undefined;
             continue;
           }
-          // Do not replay or advance providers after a tool side effect or image escaped.
-          if (pendingCalls.length > 0 || streamEmittedImage) break;
+          // Do not replay or advance providers after a tool side effect or image escaped —
+          // except the stall itself: the escaped tool call / image is never replayed, but the
+          // next round must run on a live provider (O10 stream-stall advance), not this dead one.
+          if (pendingCalls.length > 0 || streamEmittedImage) {
+            if (!opts.provider) {
+              const switched2 = firstAvailableFallbackProvider(attemptedProviders, opts);
+              if (switched2 && !attemptedProviders.has(switched2.name)) {
+                (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, 'stream-stall-advance', Date.now());
+                debug.log('llm.router', 'provider-fallback', {
+                  turn,
+                  blockedProvider: activeProvider.name,
+                  fallbackProvider: switched2.name,
+                  reason: `stream idle timeout after ${streamIdleTimeoutMs}ms with pending calls`,
+                  category: 'stream-stall',
+                  tools: activeTools.map((tool) => tool.name),
+                }, { level: 'warn' });
+                try { handlers.onStatus?.(`⚠ 공급자 전환: ${activeProvider.name} → ${switched2.name} (stream-stall)`); } catch { /* status is fail-soft */ }
+                const finalized2 = finalizeStreamingProviderModel(switched2, switched2.defaultModel);
+                activeProvider = finalized2.provider;
+                activeModel = finalized2.model;
+                attemptedProviders.add(activeProvider.name);
+                streamDisconnectRetries = 0;
+              }
+            }
+            break;
+          }
           if (opts.signal?.aborted) throw err;
           if (opts.provider && (turnText.length > 0 || streamIdleRetryPartial.length > 0)) {
             // A pinned provider cannot advance to fallback. Keep already shown partial text

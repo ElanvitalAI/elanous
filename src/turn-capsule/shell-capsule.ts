@@ -22,8 +22,10 @@ export interface ShellCapsuleCall<R> {
   /** The command as the model wrote it; only a redacted one-line preview leaves this module. */
   readonly command: string;
   readonly turnSignal?: AbortSignal;
-  /** Starts the process. The signal is the turn's until detach, the capsule's own after. */
-  start(signal: AbortSignal | undefined): Promise<R>;
+  /** Starts the process. The signal is the turn's until detach, the capsule's own after. With `clockFromSpawn`, the
+   *  call reports `spawned()` once the process runs (an approval wait before it never counts toward the cap). */
+  start(signal: AbortSignal | undefined, spawned: () => void): Promise<R>;
+  readonly clockFromSpawn?: boolean;
   /** Final result → capsule status + the text the notification carries (bounded here). */
   describe(result: R): { readonly status: CapsuleStatus; readonly output: string };
   /** The result the turn gets at detach time. */
@@ -91,7 +93,7 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   const decision = deps.policy.decide({ tool: call.tool, kind: 'shell' });
   const cap = decision.mode === 'detach' ? 0 : decision.syncCapMs;
   // Capability, not a switch: only a session with a sink gets the result back — anywhere else, inline.
-  if (!Number.isFinite(cap) || sink === null) return call.start(call.turnSignal);
+  if (!Number.isFinite(cap) || sink === null) return call.start(call.turnSignal, () => {});
 
   const now = deps.now ?? Date.now;
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
@@ -105,10 +107,13 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   const turnSignal = call.turnSignal;
   if (turnSignal?.aborted) own.abort();
   else turnSignal?.addEventListener('abort', forward, { once: true });
-  const work = call.start(own.signal);
-
   let timer: unknown;
-  const capHit = new Promise<'cap'>((resolve) => { timer = setTimer(() => resolve('cap'), cap); });
+  let arm = (): void => {};
+  const capHit = new Promise<'cap'>((resolve) => {
+    arm = () => { arm = () => {}; timer = setTimer(() => resolve('cap'), cap); };
+  });
+  const work = call.start(own.signal, () => arm());
+  if (!call.clockFromSpawn) arm();
   let raced: { value: R } | 'cap';
   try {
     raced = await Promise.race([work.then((value) => ({ value })), capHit]);

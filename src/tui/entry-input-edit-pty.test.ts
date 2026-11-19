@@ -10,7 +10,7 @@ function latestTurnIsSettled(screen: string, reply: string, expectedReplies: num
   if (replies !== expectedReplies) return false;
   const lastReply = screen.lastIndexOf(reply);
   const tail = screen.slice(lastReply + reply.length);
-  const terminal = /(?:턴 완료|응답 완료|✔ 완료)(?:\s|$)/.exec(tail);
+  const terminal = /(?:턴 완료|응답 완료|✔ 완료|Turn done|✻ Worked for|· done)(?:\s|$)/.exec(tail); // #38392 영어 크롬 — 턴 종결 표기 둘 다 승인
   if (!terminal) return false;
   const nextPrompt = tail.search(/\n(?:❯ |❯ )/);
   return nextPrompt < 0 || terminal.index < nextPrompt;
@@ -25,19 +25,19 @@ test('next TUI edits at the cursor and applies Ctrl+W/U in a real PTY', async ()
       args: [join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs'), '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
       root, rows: 24, cols: 80,
       env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
-      ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && /Ctrl\+Q (종료|quit)/.test(screen) }, // #37922 English footer — 둘 다 승인
       steps: [
         { label: 'typed', text: 'alpha beta gamma', enter: false, until: '❯ alpha beta gamma' },
         { label: 'cursor-left', keys: '\x1b[D', until: '❯ alpha beta gamma' },
         { label: 'insert-at-cursor', keys: 'X', until: '❯ alpha beta gammXa' },
         { label: 'Ctrl+W', keys: '\x17', until: '❯ alpha beta a' },
-        { label: 'Ctrl+U', keys: '\x15', until: (s) => s.endsWith('❯ ') },
+        { label: 'Ctrl+U', keys: '\x15', until: (s) => s.split('\n').some((line) => line.trimEnd() === '❯') }, // #38392 footer moves below composer — 빈 작성칸 = ❯만 있는 줄
       ],
     });
     expect(run.frames.map((f) => f.label)).toEqual(['boot', 'typed', 'cursor-left', 'insert-at-cursor', 'Ctrl+W', 'Ctrl+U']);
     expect(run.frames[3]?.screen).toContain('alpha beta gammXa');
     expect(run.frames[4]?.screen).not.toContain('gamm');
-    expect(run.frames[5]?.screen).toEndWith('❯ ');
+    expect(run.frames[5]?.screen.split('\n').some((line) => line.trimEnd() === '❯')).toBe(true); // #38392
     expect(run.exitCode).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -60,7 +60,7 @@ test('classic and next PTYs recall submitted prompts with Up and restore the dra
         root, rows: 24, cols: 80,
         env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1', ELANOUS_TEST_FAKE_LLM_RESPONSE: reply },
         ready: { label: `${mode} boot`, until: (screen) => next
-          ? screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Enter 전송')
+          ? screen.split('\n').includes(NEXT_TUI_TITLE) && /Enter (전송|send)/.test(screen)
           : (screen.includes('elanous | daemon') || screen.includes('Opening web setup…')) && screen.includes('❯') },
         steps: [
           { label: 'first submitted prompt', text: 'first remembered', until: (s) => latestTurnIsSettled(s, reply, 1) },

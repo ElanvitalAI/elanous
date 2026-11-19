@@ -6,8 +6,52 @@ import { join, resolve } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
 import { DEFAULT_MAX_HARD_WAIT_SEC } from '../self-implement/headless-elanous-driver.js';
 import { buildWorkOrder, hashWorkOrderContent } from './work-order-build.js';
-import { parseWorkOrderBudget, TA_PILOT_MAX_WALL_SEC, taPodDeadlineSeconds } from './work-order.js';
+import { parseWorkOrder, parseWorkOrderBudget, TA_PILOT_MAX_WALL_SEC, taPodDeadlineSeconds } from './work-order.js';
+import { handTask } from './task-hand.js';
 import { criticalUnknownFields } from './work-order.js';
+
+test('TA-WO-FIELDS: work-order build copies owner, card and merge policy from the selected card', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'work-order-card-'));
+  const out = join(dir, 'order.json'), statePath = join(dir, 'cards.json');
+  writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-test-card': { id: 'ta-test-card', seat: 'TC',
+    checklistId: 'CELL', checklistVersion: '0.3.30', noAutoMerge: true, status: 'handed', history: [] } } }));
+  const program = new Command().exitOverride();
+  const previousExit = process.exitCode;
+  registerTasksCommands(program, { taskStatePath: statePath, output: () => {},
+    workOrderChecklist: (version) => ({ version, released: '', dev: '', history: [], items: [{
+      id: 'CELL', title: '대상 경로: src/task-agent/task-hand.ts', status: 'yellow', priority: 'P1', updatedAt: '', updatedBy: '',
+    }] }) });
+  try {
+    await program.parseAsync(['node', 'eln', 'tasks', 'work-order', 'build', '--checklist', 'CELL', '--version', '0.3.30',
+      '--card', 'ta-test-card', '--budget', 'time=3600s usd=3 tier=low pod=node-c rework=1', '--out', out]);
+    expect(JSON.parse(readFileSync(out, 'utf8'))).toMatchObject({ owner: 'TC', card: 'ta-test-card', noAutoMerge: true,
+      budget: 'time=3600s usd=3 tier=low pod=node-c rework=1', budgetLimits: { timeSec: 3600, usdCap: 3 } }); // 출처: #97932 독립 지시서 예산 픽스처.
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks['ta-test-card'].budgetLimits)
+      .toEqual({ timeSec: 3600, usdCap: 3 }); // 출처: #97791 위 카드와 지시서의 동일 예산.
+    const parsed = parseWorkOrder(readFileSync(out, 'utf8'));
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(hashWorkOrderContent(parsed.order, 'rev')).not.toBe(hashWorkOrderContent({ ...parsed.order, card: 'other-card' }, 'rev'));
+    const shadow = await handTask({ id: 'ta-test-card', text: '대상 경로: src/task-agent/task-hand.ts', seat: 'TC',
+      checklistId: 'CELL', checklistVersion: '0.3.30', noAutoMerge: true, workOrder: parsed.order,
+      statePath: join(dir, 'new-cards.json'), prelaunchInspector: () => ({ reason: 'completion-not-code-pr' }), launcher: () => {} });
+    expect(shadow.card.budgetLimits).toEqual({ timeSec: 3600, usdCap: 3 }); // 출처: #97791 위 지시서의 동일 예산.
+    const original = readFileSync(out, 'utf8');
+    await program.parseAsync(['node', 'eln', 'tasks', 'work-order', 'build', '--checklist', 'CELL', '--version', '0.3.30',
+      '--card', 'ta-test-card', '--budget', 'time=3600s usd=4', '--out', out]);
+    expect(process.exitCode).toBe(1);
+    expect(readFileSync(out, 'utf8')).toBe(original);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks['ta-test-card'].budgetLimits)
+      .toEqual({ timeSec: 3600, usdCap: 3 }); // 출처: #97791 위 카드의 기존 예산은 충돌 시 유지.
+    const pristine = { id: 'ta-test-card', seat: 'TC', checklistId: 'CELL', checklistVersion: '0.3.30',
+      noAutoMerge: true, status: 'handed', history: [] };
+    writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-test-card': pristine } }));
+    process.exitCode = 0;
+    await program.parseAsync(['node', 'eln', 'tasks', 'work-order', 'build', '--checklist', 'CELL', '--version', '0.3.30',
+      '--card', 'ta-test-card', '--budget', 'time=3600s usd=3', '--out', dir]);
+    expect(process.exitCode).toBe(1);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks['ta-test-card']).toEqual(pristine);
+  } finally { process.exitCode = previousExit ?? 0; rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('ENTRANCE-WORK-ORDER-BUILD core fills the nine fields and lists unknown values', () => {
   const order = buildWorkOrder({ cellId: 'ENTRANCE-WORK-ORDER-BUILD', version: '0.2.35' });
@@ -162,11 +206,12 @@ test('budget grammar: duplicates, extra keys, malformed declarations, whitespace
   const ok = (budget: string): boolean => parseWorkOrderBudget(budget).ok;
   for (const budget of ['time=60s usd=1', 'usd=1 time=60s', 'time=60s,usd=1', 'time=60s·usd=1', 'time=60s;usd=1', '  time=60s   usd=1  ']) expect([budget, ok(budget)]).toEqual([budget, true]);
   const rejected = ['time=7200s time=60s usd=1', 'time=60s time=7200s usd=1', 'time=60s usd=abc usd=5', 'time=60s usd=5 usd=abc', 'time=60s usd=1 usd=1',
-    'time=60s usd=1 tier=low', 'time=60s usd=1 pod=aws1', 'time=60s usd=1 rework=1', 'time=60s usd=1 calls=5',
+    'time=60s usd=1 calls=5', 'time=60s usd=1 tier=low tier=high',
     'time= usd=1', 'time=60s usd=', 'time = 60s usd=1', 'time=60s usd=1 extra', '시간 4h usd=1 time=60s', 'time=60s usd=1 =5',
     'TIME=60s usd=1', 'time=60s USD=1', 'Time=60s usd=1', 'time=60s', 'usd=1', '', '모름'];
   for (const budget of rejected) expect([budget, ok(budget)]).toEqual([budget, false]);
-  expect(parseWorkOrderBudget('time=60s usd=1 tier=low')).toMatchObject({ ok: false, reason: expect.stringContaining('허용되지 않은 키') });
+  expect(parseWorkOrderBudget('time=60s usd=1 tier=low pod=node-c rework=1')).toMatchObject({ ok: true, timeSec: 60 }); // 출처: #97932 허용 발사 설정 픽스처.
+  expect(parseWorkOrderBudget('time=60s usd=1 unknown=value')).toMatchObject({ ok: false, reason: expect.stringContaining('허용되지 않은 키') });
   expect(parseWorkOrderBudget('time=7200s time=60s usd=1')).toMatchObject({ ok: false, reason: expect.stringContaining('중복') });
 });
 

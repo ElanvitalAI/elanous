@@ -25,7 +25,7 @@ import { DAEMON_MEMBER_ROUTE_TOOL_ALLOWLIST } from './plugin-routes.js';
 const financeOff = { finance: { enabled: false } } as unknown as UserConfig;
 const financeOn = { finance: { enabled: true } } as unknown as UserConfig;
 
-const READONLY = ['Read', 'Grep', 'WebSearch', 'Plan', 'MarkStepDone'];
+const READONLY = ['Read', 'Grep', 'WebSearch', 'Plan', 'MarkStepDone', 'NotesSearch', 'NotesRead'];   // DEMO-1121-VAULT-NOTES-READ: the notes folder, read-only
 // chat = readonly + 코딩코어 편집/실행(Edit/Write/Bash) + delegate + L2 core(schedule_manage…mission_decide).
 const CHAT_CORE = [
   // #37807 pack-only query and parent #37791 discovery are intentional chat/webterm tools.
@@ -40,7 +40,10 @@ const CHAT_CORE = [
   'schedule_manage', 'session_manage', 'memory_recall', 'memory_save', 'fact_check', 'self_recall', 'context_now',
   'autopilot_missions', 'ops_status', 'se_build', 'logs_query', 'mission_decide', 'coo_admin',
   // SYNC1 ① #23007 — owner-only read tools; names are listed, dispatch refuses without a server-verified owner (like release_change).
-  'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'proact_meter', 'elanous_skills_list', 'skill_exec', 'app_deploy',
+  'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'proact_meter', 'elanous_skills_list', 'skill_exec',
+  // #38924 WEBCHAT-APP-BUILD-PLUGIN-BRIDGE: shared-app-tools now carries the app-build pair right before app_deploy
+  // (so their route copies are dropped as duplicates) — MAIN-BASELINE-RED-CLEAR ①.
+  'app_build_plan', 'app_build', 'app_deploy',
 ];
 const CHAT_PTY_EXTRA = ['ElanousHold', 'PtyControl'];
 // APP-BUILD-TOOLS-IN-DAEMON-TURN — the plugin route tools merged from the same bridge and helper the Next TUI
@@ -107,7 +110,7 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
     }
   });
 
-  test("'readonly' 서피스 = Read/Grep/WebSearch/Plan/MarkStepDone (cfg/pty/nest 무관·완전 고정)", () => {
+  test("'readonly' 서피스 = Read/Grep/WebSearch/Plan/MarkStepDone/NotesSearch/NotesRead (cfg/pty/nest 무관·완전 고정)", () => {
     expect(toolSurface('readonly', financeOff).specs.map((s) => s.name)).toEqual(READONLY);
   });
 
@@ -157,9 +160,9 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
     expect(on).toContain('finance_quote');
     // shared-app-tools contract: core, then the complete finance pack, then skill discovery/execution.
     expect(on).toEqual([
-      ...CHAT_CORE.slice(0, -3),
+      ...CHAT_CORE.slice(0, -5),
       ...buildFinanceTools().specs.map((spec) => spec.name),
-      'elanous_skills_list', 'skill_exec', 'app_deploy',
+      'elanous_skills_list', 'skill_exec', 'app_build_plan', 'app_build', 'app_deploy',
       ...off.slice(CHAT_CORE.length),
     ]);
   });

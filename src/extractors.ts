@@ -61,34 +61,34 @@ function finalize(text: string, meta?: Record<string, unknown>): ExtractResult {
 }
 
 /** Plain-text read (UTF-8). Used for both `text` and `md` attachment kinds. */
-export async function readText(path: string): Promise<ExtractResult> {
+export async function readText(path: string, transform: (text: string) => string = (text) => text): Promise<ExtractResult> {
   const raw = await readFile(path, 'utf-8');
-  return finalize(raw);
+  return finalize(transform(raw));
 }
 
-export async function extractPdf(path: string): Promise<ExtractResult> {
+export async function extractPdf(path: string, transform: (text: string) => string = (text) => text): Promise<ExtractResult> {
   const buf = await readFile(path);
-  return extractPdfBytes(buf);
+  return extractPdfBytes(buf, transform);
 }
 
 /** Extract already-authorized PDF bytes without reopening a caller-supplied path. */
-export async function extractPdfBytes(buf: Uint8Array): Promise<ExtractResult> {
+export async function extractPdfBytes(buf: Uint8Array, transform: (text: string) => string = (text) => text): Promise<ExtractResult> {
   // pdf-parse loads pdfjs-dist and @napi-rs/canvas (system fonts) at import time.
   // A plain text/CLI help request must not pay for the PDF renderer.
   const { PDFParse } = await import('pdf-parse');
   const parser = new PDFParse({ data: new Uint8Array(buf) });
   try {
     const result = await parser.getText();
-    return finalize(result.text, { pages: result.total });
+    return finalize(transform(result.text), { pages: result.total });
   } finally {
     await parser.destroy().catch(() => { /* best-effort cleanup */ });
   }
 }
 
-export async function extractDocx(path: string): Promise<ExtractResult> {
+export async function extractDocx(path: string, transform: (text: string) => string = (text) => text): Promise<ExtractResult> {
   const { default: mammoth } = await import('mammoth');
   const result = await mammoth.extractRawText({ path });
-  return finalize(result.value, { mammothMessages: result.messages.length });
+  return finalize(transform(result.value), { mammothMessages: result.messages.length });
 }
 
 /**

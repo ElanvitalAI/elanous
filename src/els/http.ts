@@ -82,9 +82,9 @@ export async function routeElsHttp(core: ElsCore, hostName: string, method: stri
   if (method === 'POST' && url.pathname === '/els/do' && info.policy) return routeDo(core, hostName, info);
   if (method !== 'GET') return json(405, { error: 'read-only: GET only' });
   if (url.pathname === '/els/ls') {
-    const listed = JSON.parse(core.list().message) as { panes: { tab: string; pane: string; title: string; cwd: string; state: string; address: string }[] };
+    const listed = JSON.parse(core.list().message) as { panes: { tab: string; pane: string; title: string; cwd: string; state: string; address: string; build?: unknown }[] };
     return json(200, { host: hostName, panes: listed.panes.map((row) => ({ ws: row.address.split('/')[0], tab: row.tab, pane: row.pane,
-      title: row.title, cwd: row.cwd, state: row.state })) });
+      title: row.title, cwd: row.cwd, state: row.state, build: row.build })) });
   }
   if (url.pathname === '/els/read') {
     const address = parseAddress(url.searchParams.get('address') ?? '');

@@ -2,9 +2,9 @@
   "schema": 1,
   "entries": {
     "seat-mail/M1": {
-      "expect": "red",
-      "reason": "ELN-SEAT-IDLE-QUEUE-STALL · fix #38510 (TC) · live 12:44 HAND-ELN-MSG Turn idle · Queue 1",
-      "redReason": "refused knock reported as delivered"
+      "expect": "green",
+      "reason": "ELN-SEAT-IDLE-QUEUE-STALL · fixed by #38510 (MERGED 2026-11-18 06:24Z · TC) · live was 12:44 HAND-ELN-MSG Turn idle · Queue 1 · was red: refused knock reported as delivered · promote 2026-11-19 (커널 판정 promote-required → 실측 green)",
+      "greenSince": "2026-11-19"
     },
     "seat-mail/M1b": {
       "expect": "green",
@@ -17,14 +17,14 @@
       "greenSince": "2026-11-18"
     },
     "seat-mail/M3": {
-      "expect": "red",
-      "reason": "ELN-TURN-STALL-WATCHDOG · fix #38515 (TC) · live 12:44 JUD-B Responding 1h03m",
-      "redReason": "silent stream never ended the turn"
+      "expect": "green",
+      "reason": "ELN-TURN-STALL-WATCHDOG · fixed by #38515 (MERGED 2026-11-18 06:26Z · TC) · live was 12:44 JUD-B Responding 1h03m · was red: silent stream never ended the turn · promote 2026-11-19 (커널 판정 promote-required → 실측 green)",
+      "greenSince": "2026-11-19"
     },
     "seat-mail/M4": {
-      "expect": "red",
-      "reason": "ELN-MSG-POST-IDEMPOTENT · fix #38516 (TC) · live 13:11 JUD 9+ copies",
-      "redReason": "committed post reported as failure"
+      "expect": "green",
+      "reason": "ELN-MSG-POST-IDEMPOTENT · fixed by #38516 (MERGED 2026-11-18 06:29Z · TC) · live was 13:11 JUD 9+ copies · was red: committed post reported as failure · promote 2026-11-19 (커널 판정 promote-required → 실측 green)",
+      "greenSince": "2026-11-19"
     },
     "seat-mail/M5": {
       "expect": "green",

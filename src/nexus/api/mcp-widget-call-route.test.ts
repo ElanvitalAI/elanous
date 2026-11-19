@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createMcpProxyRuntime, createMcpToolAuthorizer } from '../../mcp/proxy-runtime.js';
@@ -656,11 +656,11 @@ describe('MCP widget call route · runNexus boot options', () => {
   let configDir: string;
 
   beforeEach(() => {
-    stateRoot = mkdtempSync(join(tmpdir(), 'elanous-nexus-widget-call-'));
+    stateRoot = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-nexus-widget-call-')));
     configDir = mkdtempSync(join(tmpdir(), 'elanous-nexus-widget-config-'));
     writeFileSync(join(configDir, 'user.json'), JSON.stringify({
       mcp: { enabled: false },
-      autopilot: { threadRegistry: false, coordinatorGovern: false, coordinatorPush: false },
+      autopilot: { threadRegistry: false },
     }));
     setTestStateRoot(stateRoot);
     setElanousConfigDir(configDir);

@@ -11,6 +11,8 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 //
 // 반환 shape = {specs, names, dispatch} — buildCoreTools/buildFinanceTools 와 동형(drop-in). finance 는
 //   financeEnabled(cfg) 게이트(operator opt-in·미enable/미cfg 시 core 만·무회귀).
+// WEBCHAT-APP-BUILD-PLUGIN-BRIDGE(draft): graph plugin(elanous-app-build)의 app_build_plan·app_build 를
+//   여기에 결속 — 웹채팅 «앱 만들어줘» 턴이 풀에 app_build 를 가진다(#38215 «app_build not in the turn pool»).
 
 import { buildCoreTools } from '../domains/core-tools.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
@@ -22,6 +24,7 @@ import { buildElanousSkillsListTool, dispatchElanousSkillsList } from '../tool-r
 import type { ElanousSkillsListArgs } from '../tool-runtime/elanous-skills-list-runtime.js';
 import type { UserConfig } from '../user-config/types.js';
 import { appDeployPluginSpec, runAppDeploy } from './app-deploy-plugin.js';
+import { appBuildPluginSpecs, runAppBuild } from './app-build-plugin.js';
 
 
 export interface SharedAppTools {
@@ -30,18 +33,21 @@ export interface SharedAppTools {
   dispatch: (name: string, args: Record<string, unknown>, context?: ToolRuntimeContext) => Promise<unknown>;
 }
 
-/** L2 core + L3 finance(gated) + skill discovery/execution 단일 조립. specs 순서 = core, finance, discovery, execution. */
+/** L2 core + L3 finance(gated) + skill discovery/execution + graph app_build bridge 단일 조립. */
 export function buildSharedAppTools(cfg?: UserConfig): SharedAppTools {
   const core = buildCoreTools();
   const fin = cfg && financeEnabled(cfg) ? buildFinanceTools() : null;
   const skillsList = buildElanousSkillsListTool();
   const skill = skillExecRuntime;
+  const appBuild = appBuildPluginSpecs();
+  const appBuildNames = new Set<string>(appBuild.map(spec => spec.name));
   const deploy = appDeployPluginSpec();
-  const specs: LLMToolSpec[] = [...core.specs, ...(fin ? fin.specs : []), skillsList, skill.spec, deploy];
-  const names = new Set<string>([...core.names, ...(fin ? fin.names : []), skillsList.name, skill.id, deploy.name]);
+  const specs: LLMToolSpec[] = [...core.specs, ...(fin ? fin.specs : []), skillsList, skill.spec, ...appBuild, deploy];
+  const names = new Set<string>([...core.names, ...(fin ? fin.names : []), skillsList.name, skill.id, ...appBuildNames, deploy.name]);
   // context(B5) — 기억 조회 같은 긴 코어 도구가 진행 한 줄(emitFeedback)을 낼 수 있게 코어까지 넘긴다.
   const dispatch = async (name: string, args: Record<string, unknown>, context?: ToolRuntimeContext): Promise<unknown> =>
     name === deploy.name ? runAppDeploy(args, context) :
+    appBuildNames.has(name) ? runAppBuild(name as 'app_build' | 'app_build_plan', args, context) :
     name === skillsList.name ? dispatchElanousSkillsList(args as ElanousSkillsListArgs) :
       name === skill.id ? skill.run(args as unknown as SkillExecArgs, { surface: context?.surface ?? 'skill', signal: context?.signal }) :
         fin && fin.names.has(name) ? fin.dispatch(name, args) : core.dispatch(name, args, undefined, context);

@@ -214,13 +214,19 @@ describe('message wake pane-list guard — 구조 상태로만 입력 자격을 
   test.each([
     ['working', 'claude', 'agent_working'],
     ['blocked', 'codex', 'agent_blocked'],
-    ['done', 'elanous', 'agent_unknown'],
     ['unknown', 'claude', 'agent_unknown'],
   ] as const)('agent_status=%s 는 주입하지 않는다', async (status, agent, reason) => {
     const f = runner([row(agent, status)]);
     const result = await herdrPrompt({ target: 'wK:p5', text: 'wake line', anyAgent: true, requirePaneListStatus: true }, { run: f.run, log: () => {} });
     expect(result).toMatchObject({ accepted: false, reason, status });
     expect(f.calls.some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(false);
+  });
+
+  test('#23 agent_status=done(herdr Idle·seen=false) pane 은 idle 과 같이 주입한다', async () => {
+    const f = runner([[row('codex', 'done')], [row('codex', 'done')]]);
+    const result = await herdrPrompt({ target: 'wK:p5', text: 'wake line', anyAgent: true, requirePaneListStatus: true }, { run: f.run, log: () => {} });
+    expect(result).toMatchObject({ accepted: true, reason: 'submitted', agent: 'codex', status: 'done' });
+    expect(f.calls.some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(true);
   });
 
   test.each(['', 'remote', 'other'])('지원되지 않는 agent(%s)는 idle 이어도 주입하지 않는다', async agent => {

@@ -34,7 +34,7 @@ const BLOOM_BY_LEVEL: Readonly<Record<WorkLevel, BloomStage>> = {
 // ── 숫자 상수(NUMGUARD — 출처) ────────────────────────────────────────────────
 /** 위험 없는 일감: 바꿀 코드 경로가 이 수 이하면 L1. 출처: ASK §1 «문자열·UI 1라운드» = 한 파일 손질. */
 export const PLAIN_L1_MAX_PATHS = 1;
-/** 위험 없는 일감: 이 수 이하면 L2, 넘으면 L3. 출처: `src/llm/difficulty.ts` 의 small/medium 경계가 5경로 — 그 절반 아래를 «이해» 단계로 둔다. */
+/** 위험 없는 일감: 이 수 이하면 L2, 넘으면 L3. 출처: 기존 small/medium 경계가 5경로 — 그 절반 아래를 «이해» 단계로 둔다. */
 export const PLAIN_L2_MAX_PATHS = 3;
 /** 원장 한 줄에 싣는 근거 수 상한 — 경로 수백 개 골이 원장 한 줄을 부풀리지 않게. 출처: 칸 «대상 경로» 관례 상한이 한 자릿수(OPERATIONS 칸 문면). */
 export const WORK_ROUTE_MAX_REASONS = 20;

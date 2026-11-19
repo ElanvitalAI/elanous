@@ -1,4 +1,3 @@
-import { parseSeatTurnCapConfig, type SeatTurnCapConfig } from '../core-turn/seat-turn-cap.js';
 import { clampNum, positiveIntOr, str } from './coercion.js';
 
 // ── Chat presentation ───────────────────────────────────────────────
@@ -11,7 +10,6 @@ export interface ChatConcisenessConfig {
   enabled: boolean;
   finalMessageMaxLines: number;
   preambleMaxWords: number;
-  flatBullets: boolean;
 }
 
 export interface ChatToolOutputConfig {
@@ -101,8 +99,6 @@ export interface ChatCompactConfig {
 
 export interface ChatConfig {
   factQuestion: { maxToolTurns: number };
-  /** TUI-SEAT-TURN-CAP — 자리 TUI goal loop 한정 core 턴 상한 덮어쓰기(기본값 = core-turn/seat-turn-cap.ts). 설정했을 때만 있다. */
-  seatTurnCap?: Partial<SeatTurnCapConfig>;
   /** Short questions may receive a tool-free first reply. Default true. */
   fastPath: boolean;
   conciseness: ChatConcisenessConfig;
@@ -127,7 +123,6 @@ const CHAT_CONCISENESS_DEFAULTS: ChatConcisenessConfig = {
   enabled: true,
   finalMessageMaxLines: 10,
   preambleMaxWords: 12,
-  flatBullets: true,
 };
 
 export const CHAT_DEFAULTS: ChatConfig = {
@@ -203,7 +198,6 @@ export function parseChatConfig(raw: unknown): ChatConfig {
           && Number.isSafeInteger(chatFactQuestion.maxToolTurns) && chatFactQuestion.maxToolTurns > 0
           ? chatFactQuestion.maxToolTurns : CHAT_DEFAULTS.factQuestion.maxToolTurns,
       },
-      ...((): { seatTurnCap?: Partial<SeatTurnCapConfig> } => { const c = parseSeatTurnCapConfig(chat.seatTurnCap); return c ? { seatTurnCap: c } : {}; })(),
       fastPath: chat.fastPath === false || chat.fastPath === 'false' ? false : CHAT_DEFAULTS.fastPath,
       conciseness: {
         enabled: chatConciseness.enabled === false ? false : CHAT_CONCISENESS_DEFAULTS.enabled,
@@ -219,7 +213,6 @@ export function parseChatConfig(raw: unknown): ChatConfig {
           1,
           50,
         ),
-        flatBullets: chatConciseness.flatBullets === false ? false : CHAT_CONCISENESS_DEFAULTS.flatBullets,
       },
       toolOutput: {
         persistOnOverflow: chatToolOutput.persistOnOverflow === false ? false : CHAT_DEFAULTS.toolOutput.persistOnOverflow,

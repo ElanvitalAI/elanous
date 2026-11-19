@@ -35,9 +35,9 @@ export function resolveSeatMailQueueCap(option?: number, env: NodeJS.ProcessEnv 
 }
 
 /** The one notice that stands for the mail over the cap (ids are the ledger's; the seat reads them with `msg list`). */
-export function seatMailOverflowNotice(seat: string, count: number, firstId: number, lastId: number, truncated: boolean): string {
+export function seatMailOverflowNotice(seat: string, count: number, firstId: number, lastId: number, truncated: boolean, unreadTotal?: number): string {
   const howMany = count === 0 ? 'more unread mails beyond the read limit' : `${count}${truncated ? '+' : ''} more unread mails`;
-  return `[seat-mail] ${howMany} for ${seat}, ids #${firstId}..#${lastId} — not queued one by one; read them with: eln msg list --to ${seat}`;
+  return `[seat-mail] ${howMany} for ${seat}, ids #${firstId}..#${lastId}${unreadTotal === undefined ? '' : ` · unread total ${unreadTotal}`} — not queued one by one; read them with: eln msg list --to ${seat}`;
 }
 
 export type SeatMailPollOutcome =
@@ -153,7 +153,11 @@ export function createSeatMailArrivalWatcher(
       const mapped = noticeMessages.get(item.id);
       if (mapped === undefined) return;
       noticeMessages.delete(item.id);
-      if (item.status === 'delivered') inTurn.set(item.id, mapped);
+      if (item.status === 'delivered') {
+        inTurn.set(item.id, mapped);
+        // [seat-mail #14 wiring] started 계기 — 큐가 턴에 인계한 순간(orphan guard·fail-soft는 sink/writer 안).
+        source?.receipts?.recordStarted?.({ messageId: mapped.msgId, recipient: mapped.seat, eventId: item.id });
+      }
       // Dropped before any turn (cancel · supersede): the claim goes back, so another path may still carry it.
       else adapter.release('notice', [mapped.msgId]);
     })
@@ -265,7 +269,7 @@ export function createSeatMailArrivalWatcher(
     // A truncated read announces only mail newer than what an earlier summary already announced (no summary per poll).
     const newlyTruncated = truncated && Math.max(read.latestId ?? lastReturnedId, lastReturnedId) > summarizedThrough;
     if (reoffered > 0) deps.onArrived?.();
-    if (fresh.length === 0 && !newlyTruncated) return first ? { kind: 'baseline', unread: read.messages.length } : { kind: 'quiet', unread: read.messages.length };
+    if (fresh.length === 0 && !newlyTruncated) return first ? { kind: 'baseline', unread: read.unreadTotal ?? read.messages.length } : { kind: 'quiet', unread: read.unreadTotal ?? read.messages.length };
     const room = Math.max(0, queueCap - alreadyQueued);
     let taken = fresh.slice(0, room);
     if (taken.length > 0) {
@@ -279,6 +283,7 @@ export function createSeatMailArrivalWatcher(
         if (claim.waiting.includes(message.id)) {
           parked.set(message.id, { msgId: message.id, seat: read.seat, attempt: 1, message: { id: message.id, sender: message.from,
             body: message.body, kind: message.kind ?? null, ...headerFieldsOf(message),
+            ...(read.unreadTotal === undefined ? {} : { unreadTotal: read.unreadTotal }),
             ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }) } });
         } else log('seat-mail-dedupe-hit', { seat: read.seat, msgId: message.id, owner: adapter.owner(message.id) });
       }
@@ -295,6 +300,7 @@ export function createSeatMailArrivalWatcher(
         body: message.body,
         kind: message.kind ?? null,
         ...headerFieldsOf(message),
+        ...(read.unreadTotal === undefined ? {} : { unreadTotal: read.unreadTotal }),
         ...(message.createdAt === undefined ? {} : { createdAt: message.createdAt }),
       };
       const item = producers.seatMessageArrived(input);
@@ -313,7 +319,7 @@ export function createSeatMailArrivalWatcher(
       const lastId = truncated ? Math.max(read.latestId ?? lastReturnedId, over.at(-1)?.id ?? lastReturnedId) : over.at(-1)!.id;
       const pending = overflowItemId !== null && queue.items.some((item) => item.id === overflowItemId);
       if (!pending) {
-        const summary = queue.enqueueNotice(seatMailOverflowNotice(read.seat, over.length, firstId, lastId, truncated), 'seat-mail');
+        const summary = queue.enqueueNotice(seatMailOverflowNotice(read.seat, over.length, firstId, lastId, truncated, read.unreadTotal), 'seat-mail');
         overflowItemId = summary.id;
       }
       summarizedThrough = Math.max(summarizedThrough, lastId);

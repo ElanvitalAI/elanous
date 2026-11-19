@@ -38,6 +38,11 @@ import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { clampShellTimeoutMs } from '../../tool-runtime/shell-watchdog.js';
 import { getUserConfig } from '../../user-config/reader.js';
+import { readUserConfigObject } from '../../user-config/read.js';
+import { userConfigPath } from '../../user-config.js';
+import { createCapsulePolicy } from '../../core-turn/capsule-policy.js';
+import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.js';
+import { runShellCapsule, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
 import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
 import {
   globalTaskNotificationQueue,
@@ -701,7 +706,7 @@ export function enqueueShellCompletionNotice(
 
 export async function dispatchRunShell(
   rawArgs: Record<string, unknown>,
-  opts: { signal?: AbortSignal; availableToolNames?: readonly string[] } = {},
+  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; onSpawn?: () => void } = {},
 ): Promise<RunShellDispatchResult> {
   const command = asCommand(rawArgs.command);
   const cwd = typeof rawArgs.cwd === 'string' ? rawArgs.cwd : undefined;
@@ -757,6 +762,7 @@ export async function dispatchRunShell(
       ...(watch ? { watch } : {}),
       signal: opts.signal,
       deps,
+      ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
     });
     logShellDispatch(`runner.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
     return withLongSleepWarning(result, longSleep, bgAvailable, resumeHint);
@@ -770,6 +776,7 @@ export async function dispatchRunShell(
     sandbox,
     network,
     signal: opts.signal,
+    ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
   });
 
   logShellDispatch(`legacy.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
@@ -801,6 +808,7 @@ async function dispatchViaRunner(args: {
   watch?: ShellLineWatchSpec;
   signal?: AbortSignal;
   deps: NonNullable<ReturnType<typeof getShellRunnerDeps>>;
+  onSpawn?: () => void;
 }): Promise<RunShellDispatchResult> {
   const req: Parameters<typeof runnerDispatch>[0] = {
     command: args.command,
@@ -811,6 +819,7 @@ async function dispatchViaRunner(args: {
     ...(args.signal !== undefined ? { signal: args.signal } : {}),
   };
   const handle = runnerDispatch(req, args.deps);
+  try { args.onSpawn?.(); } catch { /* the capsule clock is advisory */ }
   if (args.mode === 'bg') {
     if (args.watch) {
       startShellLineWatch({
@@ -914,4 +923,53 @@ export function formatSummary(r: ShellResult): string {
   if (r.sandboxed) parts.push(`sandbox=${r.sandboxTool}`);
   if (r.spawnError) parts.push(`spawn_error="${r.spawnError}"`);
   return parts.join(' ');
+}
+
+/** CAPSULE-A2 — the RunShell result's capsule status (a watchdog stop is a timeout, an Esc/stop is cancelled). */
+export function runShellCapsuleStatus(result: RunShellDispatchResult): CapsuleStatus {
+  if (result.outcome === 'timeout' || result.watchdog) return 'timeout';
+  if (result.outcome === 'aborted') return 'cancelled';
+  return result.outcome === 'exit' && result.exitCode === 0 ? 'ok' : 'failed';
+}
+
+/** CAPSULE-A2 (JUD #38592 must ⓑ) — the detached call's completion text: the command's stdout, then its stderr, then the
+ *  one-line summary last. RunShell keeps the streams outside `output`, so the summary alone would drop what the command
+ *  printed; the notice keeps the tail (bounded · redacted in shell-capsule), so the summary and the output's end survive. */
+export function runShellCapsuleNoticeText(result: RunShellDispatchResult): string {
+  return [result.stdout.trimEnd(), result.stderr.trim() ? `--- stderr ---\n${result.stderr.trimEnd()}` : '', result.output]
+    .filter(Boolean).join('\n');
+}
+
+/** CAPSULE-A2 — what the turn reads when its RunShell call moved to the background (model contract · A5 owns wording). */
+export function runShellCapsuleStartedResult(capsuleId: string, syncCapMs: number): RunShellDispatchResult {
+  return {
+    output: `RunShell outcome=started capsule=${capsuleId} — still running after ${Math.round(syncCapMs / 1000)}s, so it moved `
+      + 'to the background (same process, same timeout). Do not wait or poll for it: finish this turn. Its result arrives '
+      + `as a new turn event (capsule-done ${capsuleId}).`,
+    exitCode: null, outcome: 'started', elapsedMs: syncCapMs, stdout: '', stderr: '', truncated: false,
+    approvalKey: `capsule:${capsuleId}`, sandboxed: false, sandboxTool: 'none',
+  };
+}
+
+/** CAPSULE-A2-BASH-DETACH (RunShell) — `dispatchRunShell` under the capsule policy. `mode:'bg'` already returns at once
+ *  and stays as is. The sync clock starts at spawn, so an approval wait never detaches a call. No switch (R3). */
+export function dispatchRunShellCapsule(
+  rawArgs: Record<string, unknown>,
+  opts: { signal?: AbortSignal; availableToolNames?: readonly string[] } = {},
+  deps: Omit<ShellCapsuleDeps, 'policy'> & { readonly policy?: CapsulePolicy } = {},
+): Promise<RunShellDispatchResult> {
+  if (rawArgs.mode === 'bg') return dispatchRunShell(rawArgs, opts);
+  const policy = deps.policy ?? createCapsulePolicy({
+    turnConfig: () => readUserConfigObject(userConfigPath())?.turn,
+    ...(deps.correlation?.turnId ? { correlation: { turnId: deps.correlation.turnId } } : {}),
+  });
+  const { signal, ...rest } = opts;
+  const command = Array.isArray(rawArgs.command) ? rawArgs.command.filter((part) => typeof part === 'string').join(' ') : '';
+  return runShellCapsule<RunShellDispatchResult>({
+    tool: 'RunShell', command, clockFromSpawn: true,
+    ...(signal ? { turnSignal: signal } : {}),
+    start: (own, spawned) => dispatchRunShell(rawArgs, { ...rest, ...(own ? { signal: own } : {}), onSpawn: spawned }),
+    describe: (result) => ({ status: runShellCapsuleStatus(result), output: runShellCapsuleNoticeText(result) }),
+    started: runShellCapsuleStartedResult,
+  }, { ...deps, policy });
 }

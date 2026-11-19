@@ -10,7 +10,7 @@ export function ChatDropOverlay() {
     >
       <div className="mx-4 rounded-2xl border-2 border-dashed border-primary/60 bg-card/90 px-8 py-6 text-center shadow-lg">
         <p className="text-lg font-semibold text-foreground">여기에 놓으면 첨부</p>
-        <p className="mt-2 text-sm text-muted-foreground">파일 {MAX_CHAT_FILES}개까지 · 큰 파일은 빠집니다</p>
+        <p className="mt-2 text-sm text-muted-foreground">파일 {MAX_CHAT_FILES}개까지 · 파일당 최대 10MiB</p>
       </div>
     </div>
   );

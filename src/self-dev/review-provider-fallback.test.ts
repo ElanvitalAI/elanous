@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getProvider, getProviderForConfig, streamLLM } from '../llm.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { buildDefaultSelfImplementSeams, planDevPipeline } from './dev-pipeline.js';
 import { clearLaunchRoleLlmOverrides, getUserConfig, parseSubscriptionReviewerSpec, setUserConfigOverlay } from '../user-config.js';
@@ -847,7 +848,36 @@ describe('TA-POD-REVIEW-PROVIDER-ALLOW — per-role provider chains', () => {
     expect([judgement.source, judgement.candidates.map((c) => c.model)]).toEqual(['default', [TERRA, GROK, QWEN]]);
   });
 
-  test('outermost Pod seams: review skips configured GLM and records qwen, recovery runs glm, an all-GLM judgement chain refuses', async () => {
+  test.each(['pod', 'hq'] as const)('%s Codex failure falls back with the correct quota guard', async (substrate) => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-role-429-'));
+    const keys = ['ELANOUS_SUBSTRATE', 'OPENROUTER_API_KEY', 'ELANOUS_REMOTE_CODEX_ACCESS_ONLY', 'ELANOUS_CODEX_ACCOUNT'] as const;
+    const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    const now = Date.now(), calls: string[] = [];
+    try {
+      setElanousConfigDir(root); process.env.ELANOUS_SUBSTRATE = substrate; process.env.OPENROUTER_API_KEY = 'fake-or';
+      process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1'; delete process.env.ELANOUS_CODEX_ACCOUNT;
+      writeFileSync(join(root, 'auth.json'), JSON.stringify({ providers: { 'openai-codex': { source: 'mirror', authMode: 'chatgpt',
+        chatGPT: { accountId: 'fake-account' }, tokens: { accessToken: 'fake-access', refreshToken: '', refresh_token: '', expiresAt: now + 3600_000 },
+        lease: { leaseId: 'lease-fake', kind: 'oauth', provider: 'codex', owner: 'mshq', issuedAt: now, expiresAt: now + 3600_000 } } } }));
+      clearLaunchRoleLlmOverrides();
+      setUserConfigOverlay(config => ({ ...config, roleLlm: {}, roleModelTiers: {}, roleModels: { review: TERRA }, llm: { ...config.llm, provider: substrate === 'pod' ? 'openrouter' : 'openai-codex', apiKey: 'sk-or-fake', roleProviderChains: { judgement: [TERRA, QWEN] } } }));
+      const fakeStream = (async (_messages: unknown, _chunk: unknown, opts: { model?: string }) => {
+        calls.push(opts.model ?? 'none'); if (opts.model === TERRA) throw new Error(substrate === 'pod' ? 'HTTP 429' : 'request timed out'); return 'VERDICT: PASS';
+      }) as unknown as typeof streamLLM;
+      process.env.ELANOUS_SUBSTRATE = 'pod';
+      const seams = await buildDefaultSelfImplementSeams(planDevPipeline({ input: { text: 'lease quota' } }), { toolReviewerRate: 0, streamLLM: fakeStream });
+      if (substrate === 'hq') delete process.env.ELANOUS_SUBSTRATE; else process.env.ELANOUS_SUBSTRATE = substrate;
+      expect(await seams.judgmentCallLLM!({ prompt: 'first' } as never)).toBe('VERDICT: PASS');
+      if (substrate === 'pod') expect(await seams.judgmentCallLLM!({ prompt: 'second' } as never)).toBe('VERDICT: PASS');
+      expect(calls).toEqual(substrate === 'pod' ? [TERRA, QWEN, QWEN] : [TERRA, QWEN]);
+    } finally {
+      resetElanousConfigDir(); setUserConfigOverlay(null);
+      for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key]; }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('outermost Pod seams: without a Codex lease, review·recovery·judgement explicitly fall back to Luna', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'elanous-pod-role-chain-'));
     const prior = { substrate: process.env.ELANOUS_SUBSTRATE, openrouter: process.env.OPENROUTER_API_KEY };
     const calls: string[] = [];
@@ -862,9 +892,12 @@ describe('TA-POD-REVIEW-PROVIDER-ALLOW — per-role provider chains', () => {
       setUserConfigOverlay((config) => ({ ...config, roleLlm: {},
         llm: { ...config.llm, roleProviderChains: { review: [GLM, QWEN], judgement: [GLM], recovery: [GLM] } },
       }));
-      const fakeStream = (async (_messages: unknown, _onChunk: unknown, opts: { model?: string }) => {
+      const fakeStream = (async (messages: unknown, _onChunk: unknown, opts: { model?: string }) => {
         calls.push(opts.model ?? 'none');
-        return opts.model === GLM ? 'TRIAGE: gate fixture lacks the base file' : 'VERDICT: PASS';
+        // escalation-triage 호출(seams.ts 전용 머리글 «트리아지 판정자»)만 TRIAGE 판정문을 반환 —
+        // 나머지(review·judgement)는 VERDICT 를 돌려준다. 임대 없음 시 역할은 luna로 폴백한다.
+        const prompt = JSON.stringify(messages ?? '');
+        return prompt.includes('트리아지 판정자') ? 'TRIAGE: pod fallback uses luna without a lease' : 'VERDICT: PASS';
       }) as unknown as typeof streamLLM;
       const seams = await buildDefaultSelfImplementSeams(planDevPipeline({ input: { text: 'pod role chain' } }), {
         toolReviewerRate: 0,
@@ -880,11 +913,13 @@ describe('TA-POD-REVIEW-PROVIDER-ALLOW — per-role provider chains', () => {
         runId: 'run-pod-role-chain', note: 'gate failed', kind: 'gate', round: 1, cwd: repo,
         goal: 'goal acceptance', history: [], effectiveMax: 1, purpose: 'escalation-triage',
       });
-      expect(triage).toBe('TRIAGE: gate fixture lacks the base file');
-      expect(calls.slice(reviewCalls)).toEqual([GLM]);
-      await expect(seams.judgmentCallLLM!({ prompt: 'BUDGET?' } as never)).rejects.toThrow(
-        'role-chain-exhausted: judgement: openrouter(openrouter/z-ai/glm-5.3)=not-in-review-allowlist');
-      expect(calls.slice(reviewCalls)).toEqual([GLM]);
+      // 임대가 없으므로 복구도 Luna로 폴백한다.
+      // diagnose 계약상 TRIAGE: 로 시작하는 판정문만 통과한다(seams.ts:3181).
+      expect(triage).toBe('TRIAGE: pod fallback uses luna without a lease');
+      expect(calls.slice(reviewCalls)).toEqual([QWEN]);
+      // 판정 사슬도 임대가 없으므로 Luna를 사용한다(HQ 는 기존 거부 유지).
+      await expect(seams.judgmentCallLLM!({ prompt: 'BUDGET?' } as never)).resolves.toBe('VERDICT: PASS');
+      expect(calls.slice(reviewCalls)).toEqual([QWEN, QWEN]);
     } finally {
       off();
       for (const [key, value] of [['ELANOUS_SUBSTRATE', prior.substrate], ['OPENROUTER_API_KEY', prior.openrouter]] as const) {

@@ -62,6 +62,21 @@ describe('redactSecretText — gitleaks 규칙 이식(탐지)', () => {
     const out = redactSecretText('Authorization: Bearer abcdefghijklmnop');
     expect(out).not.toContain('abcdefghijklmnop');
   });
+
+  test('OP #97323 — AWS 이름 있는 자격 인자는 값 문자 종류와 무관하게 통째 가린다', () => {
+    const out = redactSecretText('aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY');
+    expect(out).toBe('aws configure set aws_secret_access_key ***');
+    expect(out).not.toContain('wJalr');
+    expect(out).not.toContain('EXAMPLEKEY');
+    expect(redactSecretText('aws configure set secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')).toBe('aws configure set secret_access_key ***');
+    expect(redactSecretText('export AWS_SESSION_TOKEN=IQoJb3JpZ2luZ/XyZ1234567890ab')).toContain('AWS_SESSION_TOKEN=***');
+  });
+
+  test('OP #97323 — compound 이름 자격 인자(db_password·client_secret·GH_TOKEN 소문자형)', () => {
+    expect(redactSecretText('db_password=hunter2xyz')).toBe('db_password=***');
+    expect(redactSecretText('client_secret AbCdE123fGhI4567')).toContain('client_secret ***');
+    expect(redactSecretText('gh_token: abcd1234efgh5678')).toBe('gh_token: ***');
+  });
 });
 
 describe('redactSecretText — 오탐 가드(로그가 못 쓰게 되면 안 된다)', () => {
@@ -74,6 +89,7 @@ describe('redactSecretText — 오탐 가드(로그가 못 쓰게 되면 안 된
     'runId=run-8f7ba351-cb40-4745-a5c3-34c18ca978f8',
     'MAX_TOKEN=4096',
     'OPENROUTER_API_KEY 가 없다',
+    'csrf_token expired',
   ];
   for (const n of normals) {
     test(`훼손하지 않는다: ${n.slice(0, 40)}`, () => {

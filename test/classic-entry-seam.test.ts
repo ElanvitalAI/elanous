@@ -57,7 +57,7 @@ function dashboardEdges(path: string, text: string): string[] {
   return edges;
 }
 
-test('classic dashboard has one named root launcher seam and no other production imports', () => {
+test('classic dashboard has one named root launcher seam and no other production imports', () => { // 출처: #38824 스캔 시험 6.8s 실측(부하 호스트 · bun 기본 5s 초과) — timeout 부여(tsc 오버로드는 숫자 인자 형태만)
   const edges = productionTypescriptFiles(sourceRoot).flatMap((path) => dashboardEdges(path, readFileSync(path, 'utf8')));
   // #38701 TURN-FIELD-BUG-3 · #38298 A217 요청 계약 · #38210 TURN-PACING · #37875 graph-cli owner 바인딩(2026-11-18
   // known-fail 묶음5: 지연 적재로 전환 — 정적 import 면 elanous --help 파싱만으로 plugin-route-adapter가 즉시 돈다) ·
@@ -70,13 +70,12 @@ test('classic dashboard has one named root launcher seam and no other production
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
-    'src/tui-client/next-mail-wake.ts static ../dashboard/input/internal-turn.js',
     'src/tui-client/next-mail-wake.ts static ../dashboard/seat-boot-preamble.js',
     'src/tui/entry.ts dynamic ../dashboard/seat-local-instructions.js',
     'src/tui/input/goal-continue.ts static ../../dashboard/input/turn-outcome-shadow.js',
     'src/tui/seat-mail-boot.ts static ../dashboard/input/seat-task-decompose.js',
   ]);
-});
+}, 60_000); // 출처: #38824 — 스캔 6.8s > bun 기본 5s(부하 호스트 실측) · 저장소 관례 숫자 인자
 
 test('classic seam scan resolves directory imports and require calls into dashboard', () => {
   const path = resolve(sourceRoot, 'ux-sim/classic-bypass-example.ts');

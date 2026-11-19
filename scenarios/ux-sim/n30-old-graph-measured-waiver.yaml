@@ -10,6 +10,6 @@ cases:
     mode: old-graph-measured-waiver
     expect:
       status: resume-refused
-      mustVisit: [version-release, gate]
+      mustVisit: [cutoff, gate]
       mustNotVisit: [known-issues, publish]
       refusalIncludes: measured gate regressions cannot be waived

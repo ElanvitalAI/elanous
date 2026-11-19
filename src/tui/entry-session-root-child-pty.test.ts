@@ -33,21 +33,21 @@ test('Next test-mode parent and REPL child share the PID-fallback session for on
     let screen = '';
     while (Date.now() < deadline) {
       screen = await pty.renderScreen();
-      if (screen.includes('Ctrl+Q 종료')) break;
+      if (/Ctrl\+Q (종료|quit)/.test(screen)) break; // #37922 English footer — 둘 다 승인
       await Bun.sleep(200);
     }
-    expect(screen).toContain('Ctrl+Q 종료');
+    expect(screen).toMatch(/Ctrl\+Q (종료|quit)/);
     pty.write('2+2는?');
     await Bun.sleep(150);
     pty.write('\r');
     while (Date.now() < deadline) {
       screen = await pty.renderScreen();
-      if (screen.includes(reply) && screen.includes('턴 완료')) break;
+      if (screen.includes(reply) && /턴 완료|Turn done/.test(screen)) break; // #38392 영어 크롬 둘 다 승인
       await Bun.sleep(200);
     }
     expect(screen).toContain('2+2는?');
     expect(screen).toContain(reply);
-    expect(screen).toContain('턴 완료');
+    expect(/턴 완료|Turn done/.test(screen)).toBe(true); // #38392
     // The test run must not silently create a session under the isolated HOME's operating-style config root.
     expect(existsSync(join(configRoot, 'sessions', 'index.json'))).toBe(false);
   } finally {

@@ -16,43 +16,16 @@ export interface SeatTurnCapConfig {
   idleEmptyMsgListLimit: number;
 }
 
+// SEAT-TURN-CAP-DEFAULT-15M(0.3.30 · NIGHT-0330-ASSIGNMENT) — chat.seatTurnCap 옵션 삭제: 상한은 이 기본값 한 벌.
+//   벽시계 45분 (대표 11-20 01:2x 복원 · 턴 중 우편 수신 SEAT-TURN-MIDTURN-MAIL 0.3.31 전까지).
 export const SEAT_TURN_CAP_DEFAULTS: SeatTurnCapConfig = {
   maxTools: 60,
-  maxWallMs: 20 * 60_000,
+  maxWallMs: 45 * 60_000,
   idleEmptyMsgListLimit: 2,
 };
 
-// ELN-SEAT-TURN-CAP-CONTINUE — 구현 손(eln 자리)은 같은 일을 여러 턴에 걸쳐 잇는다.
-// 운영 자리(claude-code·codex·미선언)는 기본 상한 그대로. idle «할 일 0» 판정은 역할과 무관하게 유지.
-export type SeatTurnCapRole = 'implementer' | 'operator';
-
-export const IMPLEMENTER_SEAT_TURN_CAP: Pick<SeatTurnCapConfig, 'maxTools' | 'maxWallMs'> = {
-  maxTools: 180,
-  maxWallMs: 45 * 60_000,
-};
-
-/** 레지스트리 runtime. eln 만 구현 손. 없거나 다른 값이면 운영 자리. */
-export function seatTurnCapRole(runtime: string | undefined): SeatTurnCapRole {
-  return runtime === 'eln' ? 'implementer' : 'operator';
-}
-
-/** 자리 이름의 레지스트리 runtime. 읽기 실패·없음은 undefined(= 운영 상한). 파일 읽기는 호출자가 넘긴다. */
-export function seatRegistryRuntime(
-  seat: string,
-  read: (seat: string) => string | undefined,
-): string | undefined {
-  try { return read(seat); }
-  catch { return undefined; }
-}
-
-/** 역할 상한을 override 보다 먼저 깔고, 명시 override 가 있으면 그 칸만 이긴다. idle 칸은 역할이 안 바꾼다. */
-export function resolveSeatTurnCapForRole(
-  runtime: string | undefined,
-  override: Partial<SeatTurnCapConfig> | undefined,
-): SeatTurnCapConfig {
-  const roleCap = seatTurnCapRole(runtime) === 'implementer' ? IMPLEMENTER_SEAT_TURN_CAP : {};
-  return resolveSeatTurnCap({ ...roleCap, ...(override ?? {}) });
-}
+// SEAT-TURN-CAP-DEFAULT-15M — 역할 갈래(implementer/operator)·레지스트리 runtime 조회·역할 상한 병합을 삭제했다:
+//   옵션이 없으므로 자리·역할 무관 상한은 SEAT_TURN_CAP_DEFAULTS 한 벌. idle «할 일 0» 판정은 그대로.
 
 /** 재개 우편에 실을 체크포인트. 빈 요약은 넣지 않는다(다음 턴이 «처음부터»로 읽지 않게). */
 export const SEAT_CAP_CHECKPOINT_MAX_CHARS = 1500;
@@ -66,27 +39,7 @@ export function seatCapCheckpoint(finalText: string): string {
   return `\n[CHECKPOINT]\n${clipped}`;
 }
 
-function positiveInt(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
-}
-
-/** `chat.seatTurnCap` 원문을 읽는다. 객체가 아니거나 유효한 칸이 하나도 없으면 undefined(= 기본값). */
-export function parseSeatTurnCapConfig(raw: unknown): Partial<SeatTurnCapConfig> | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
-  const out: Partial<SeatTurnCapConfig> = {};
-  const maxTools = positiveInt(r.maxTools);
-  const maxWallMs = positiveInt(r.maxWallMs);
-  const idle = positiveInt(r.idleEmptyMsgListLimit);
-  if (maxTools !== undefined) out.maxTools = maxTools;
-  if (maxWallMs !== undefined) out.maxWallMs = maxWallMs;
-  if (idle !== undefined) out.idleEmptyMsgListLimit = idle;
-  return Object.keys(out).length > 0 ? out : undefined;
-}
-
-export function resolveSeatTurnCap(override: Partial<SeatTurnCapConfig> | undefined): SeatTurnCapConfig {
-  return { ...SEAT_TURN_CAP_DEFAULTS, ...(override ?? {}) };
-}
+// SEAT-TURN-CAP-DEFAULT-15M — chat.seatTurnCap 파서(parseSeatTurnCapConfig)와 resolveSeatTurnCap 을 삭제했다(옵션 없음 = 기본값 한 벌).
 
 // APP-BUILD-TOOL-WALL-CAP(11-17 run d2eab21a) — 자리 턴 벽시계 상한이 회원 게시 승인 창을 쥔 app_build 를 끊었다.
 //   승인을 쥘 수 있는 도구가 실행 중이면 상한은 «미룬다»: 새 도구는 막되 진행 중 호출은 끊지 않고,
@@ -104,7 +57,7 @@ export const SEAT_CAP_APPROVAL_DEFER_GRACE_MS = 60_000;
 /** 상한이 승인 도구 때문에 미룰 수 있는 최장 시간 — 상한 시각부터 승인 창 한 벌 ⊕ 여유. 이 뒤엔 미룸 없이 턴을 끊는다. */
 export const SEAT_CAP_APPROVAL_DEFER_MAX_MS = APP_BUILD_OWNER_APPROVAL_WINDOW_MS + SEAT_CAP_APPROVAL_DEFER_GRACE_MS;
 
-/** 미룬 상한에서 승인 도구가 돌아온 뒤 모델이 결과를 읽고 한 줄 요약으로 마감할 여유. 출처: 상한 안내(SEAT_TURN_CAP_TOOL_NOTICE) 뒤 요약 1회 응답 — 기본 벽시계 상한(20분)의 1/10. */
+/** 미룬 상한에서 승인 도구가 돌아온 뒤 모델이 결과를 읽고 한 줄 요약으로 마감할 여유. 출처: 상한 안내(SEAT_TURN_CAP_TOOL_NOTICE) 뒤 요약 1회 응답 — 기본 벽시계 상한(45분) 안의 여유(2분 고정값). */
 export const SEAT_CAP_DEFERRED_WRAPUP_MS = 2 * 60_000;
 
 /** 자리 턴 상한이 core 턴을 끊을 때 쓰는 abort reason. 하위 승인 노드는 이 reason 으로 «상한에 끊김» 을 사람 거절과 가른다. */

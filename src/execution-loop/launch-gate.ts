@@ -351,6 +351,11 @@ function holdReason(file: string): string | null {
   try { return readFileSync(file, 'utf8').split(/\r?\n/, 1)[0]!.trim().slice(0, 200) || '사유 없음'; } catch { return '사유 읽기 실패'; }
 }
 
+/** Treat an unreadable hold file as active, as the launch admission gate does. */
+export function observeLaunchHold(file = defaultLaunchHoldFile()): boolean {
+  return holdReason(file) !== null;
+}
+
 /**
  * TA 발사 입구 승인 — OP hold 가 있으면 거부, TA 발사(`ta`)는 READY 인 TA-PREFLIGHT 영수증이 없으면 거부.
  * force 도 이 판정을 건너뛰지 못한다(호출 쪽이 consume 안에서 force 처리보다 먼저 부른다).

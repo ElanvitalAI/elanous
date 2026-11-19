@@ -10,6 +10,8 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 
 // The cut tree runs the real docker/harness/build.sh — only the external tools (docker/registry, uname) are mocked.
 const REAL_BUILD_SH = readFileSync(join(import.meta.dir, '..', '..', 'docker', 'harness', 'build.sh'), 'utf8');
+// build.sh packs the PWA via the real scripts/lib/pack-pwa-output.ts (#38418) — the cut tree must carry that file too, or the real pack stage exits 61.
+const REAL_PACK_PWA_OUTPUT = readFileSync(join(import.meta.dir, '..', '..', 'scripts', 'lib', 'pack-pwa-output.ts'), 'utf8');
 
 type CutOpts = { buildBody?: string; pwa?: boolean; depsOut?: string; uname?: string; inspectOut?: string };
 
@@ -24,6 +26,7 @@ function cutTree(opts: CutOpts = {}): { repo: string; commit: string; bin: strin
   write('docker/harness/Dockerfile', 'FROM ubuntu:24.04\n');
   write('docker/harness/build.sh', opts.buildBody ? `#!/bin/bash\n${opts.buildBody}\n` : REAL_BUILD_SH);
   write('scripts/install.sh', '#!/bin/sh\n');
+  write('scripts/lib/pack-pwa-output.ts', REAL_PACK_PWA_OUTPUT);
   write('src/task-orchestrator/surfaces/pod-gate-deps.ts', `console.log(${JSON.stringify(opts.depsOut ?? 'staged digest=abcdefabcdef')});\n`);
   write('src/task-orchestrator/surfaces/pod-skills.ts', "console.log('staged digest=none');\n");
   if (opts.pwa !== false) write('apps/pwa/out/index.html', '<html>packed by the real build.sh\n');

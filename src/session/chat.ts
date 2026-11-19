@@ -54,8 +54,7 @@ import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
 import { assertTurnNotSilentFailure } from './turn-silent-failure.js';
 import type { CoreTurnCallbacks, CoreTurnContext, CoreTurnDispatchTool } from '../core-turn/types.js';
-import { resolveSeatTurnCapForRole, seatRegistryRuntime } from '../core-turn/seat-turn-cap.js';
-import { readSeatRuntime } from '../core-turn/seat-registry-runtime.js';
+import { SEAT_TURN_CAP_DEFAULTS } from '../core-turn/seat-turn-cap.js';
 import { postSeatCapResumeNotice } from '../core-turn/seat-cap-resume-notice.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
@@ -789,10 +788,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         const cwdSeat = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?:\/|$)/u.exec(process.cwd())?.[1];
         const envSeat = process.env.COORD_ID?.trim();
         const seat = opts.utteranceSurface === 'tui' ? (cwdSeat ?? envSeat)?.toUpperCase() : undefined;
-        const seatRuntime = seat ? seatRegistryRuntime(seat, readSeatRuntime) : undefined;
-        const seatTurnCap = seat
-          ? { ...resolveSeatTurnCapForRole(seatRuntime, opts.userConfig.chat.seatTurnCap), seat }
-          : undefined;
+        // SEAT-TURN-CAP-DEFAULT-15M — chat.seatTurnCap 옵션 삭제: 상한은 기본값 한 벌.
+        const seatTurnCap = seat ? { ...SEAT_TURN_CAP_DEFAULTS, seat } : undefined;
         // HARNESS-ADVISOR-CHECKPOINTS — 하니스 런에서만 코어 ADVISOR(그림자 기본).
         const advisor = coreAdvisorForGoalLoop({ userText: coreCtx.userText ?? '', signal: coreCtx.signal });
         const gl = await runGoalLoop(coreCtx, {
@@ -920,10 +917,11 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   if (opts.signal?.aborted) {
     try {
       const { buildTurnInterruptedMarker } = require('../chat/interjection.js') as typeof import('../chat/interjection.js');
-      const marker = buildTurnInterruptedMarker();
+      const marker = buildTurnInterruptedMarker(opts.signal.reason === 'stall' ? { reason: opts.signal.reason } : undefined);
       appendMessage(opts.sessionId, {
         role: 'user',
         content: marker,
+        interruptionMarker: true,
         ts: new Date().toISOString(),
         tokenEstimate: estimateTokens(marker),
       });

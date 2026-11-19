@@ -3,7 +3,7 @@
  *
  * 🔗 내부 문서 `HQ-CREDENTIAL-VAULT` §3.3 «원장» · §3.5 칸 목록.
  * File: `<owner state root>/secret-leases.json` (0600). One row per lease:
- *   { leaseId, kind: 'oauth', provider: 'codex', account, target, owner, issuedAt, expiresAt, renewedAt?, revokedAt? }
+ *   { leaseId, kind: 'oauth', provider: 'codex', account, target, owner, issuedAt, expiresAt, renewedAt?, revokedAt?, podCard? }
  * ⛔ There is NO value column. Nothing here can carry a token.
  *
  * V1 absorption: V1 (vault metadata · `eln secret inventory`) reads these rows as the `lastLeaseAt`/lease state of an
@@ -34,6 +34,8 @@ export interface LeaseRecord {
   readonly renewedAt?: number;
   readonly renewCount?: number;
   readonly revokedAt?: number;
+  /** #38815 ② — Pod 카드 id(Job 이름): 이 임대가 어느 Pod 발사에 주입됐는지. 값(토큰)은 없다. */
+  readonly podCard?: string;
 }
 
 interface LeaseStoreFile { version: number; leases: LeaseRecord[] }
@@ -86,6 +88,7 @@ export function updateLeaseRecords<T>(path: string, mutate: (rows: LeaseRecord[]
       ...(row.renewedAt !== undefined ? { renewedAt: row.renewedAt } : {}),
       ...(row.renewCount !== undefined ? { renewCount: row.renewCount } : {}),
       ...(row.revokedAt !== undefined ? { revokedAt: row.revokedAt } : {}),
+      ...(row.podCard !== undefined ? { podCard: row.podCard } : {}),
     }));
     writeAtomic0600(path, `${JSON.stringify({ version: SECRET_LEASE_STORE_VERSION, leases: clean }, null, 2)}\n`);
     return result;

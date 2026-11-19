@@ -1,5 +1,22 @@
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import type { TaPreflightEvidence } from './ta-preflight.js';
+import { PREFLIGHT_LIVE_CLAIM_EVENT } from './task-hand.js';
+
+/** Runtime observations are supplied by actual readers; unavailable observations stay null. */
+export function collectRuntimePreflightEvidence(input: {
+  card: { id: string; seat?: string; status: string; runId?: string; pr?: unknown; history?: readonly { event: string }[] } | null;
+  activeRuns: readonly string[] | 'unknown';
+  opHoldActive: boolean | null;
+}): { launch: { cardClaimed: boolean | null; activeSameGoalRuns: number | null; opHoldActive: boolean | null } } {
+  const history = input.card?.history;
+  return { launch: {
+    cardClaimed: input.card && Array.isArray(history) && history.every((entry) => entry && typeof entry.event === 'string')
+      ? input.card.status !== 'handed' || Boolean(input.card.runId) || input.card.pr !== undefined
+        || history.some((entry) => entry.event === PREFLIGHT_LIVE_CLAIM_EVENT) : null,
+    activeSameGoalRuns: Array.isArray(input.activeRuns) ? input.activeRuns.length : null,
+    opHoldActive: input.opHoldActive,
+  } };
+}
 
 /**
  * TA-PREFLIGHT 증거 수집기 — 시범(canary) 런의 run 원장에서 조건 ①②의 «실측» 증거를 뽑는다. 순수 함수(읽기 전용).

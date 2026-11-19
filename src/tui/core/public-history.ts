@@ -1,10 +1,10 @@
-import { stripQueueModelContext, TURN_INTERRUPTED_MARKER } from '../../chat/interjection.js';
+import { stripQueueModelContext } from '../../chat/interjection.js';
 import type { SerializedMessage } from '../../session/index.js';
 import { projectKnownAuthFailure, streamReplyFailure, streamReplyFinal } from './next-public-reply.js';
 
 /** Preserve saved indexes for log anchors while showing only the final public answer in the basic chat view. */
 export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omitLastTurnAnswer = false): SerializedMessage[] {
-  const visible = messages.map((message) => message.role === 'tool' || message.role === 'assistant'
+  const visible = messages.map((message) => message.role === 'tool' || message.role === 'assistant' || (message.role === 'user' && message.interruptionMarker === true)
     ? { role: 'system' as const, content: '', ts: message.ts }
     // A200 · ELN-QUEUE-SUPERSEDE — interrupted-on-purpose and «대체 후보» lines are model context; the bubble shows the person's words.
     : message.role === 'user' && stripQueueModelContext(message.content) !== message.content
@@ -31,8 +31,12 @@ export function nextTuiPublicHistory(messages: readonly SerializedMessage[], omi
   };
   for (const [index, message] of messages.entries()) {
     if (message.role === 'user') {
-      // Legacy runTurn stored a partial assistant before this interruption marker.
-      if (message.content.startsWith(TURN_INTERRUPTED_MARKER) || message.content === '[Request interrupted by user]') candidate = -1;
+      // MX13 marker provenance — a generated interruption marker is detected ONLY by its
+      // persisted interruptionMarker flag, never by its text. A flagged marker hides the
+      // preceding partial reply even when it was flagged final; a human message whose text
+      // merely collides with a marker string commits the turn normally, so string
+      // coincidences can no longer erase a completed answer or failure card.
+      if (message.interruptionMarker === true) candidate = -1;
       else commit();
       turn++;
     }

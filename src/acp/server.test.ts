@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from 'bun:test';
 import { ClientSideConnection, ndJsonStream, type ClientCapabilities } from '@agentclientprotocol/sdk';
 import { createInProcessAcpBridge } from '../tui-client/acp-transport-local.js';
-import { runAcpServer, getActiveAcpBroadcaster, getActiveAcpFeedbackBroadcaster, getActiveAcpAllSessionsFeedbackBroadcaster } from './server.js';
+import { WEBTERM_EXT_METHOD_ALLOWLIST,  runAcpServer, getActiveAcpBroadcaster, getActiveAcpFeedbackBroadcaster, getActiveAcpAllSessionsFeedbackBroadcaster } from './server.js';
 import type { FeedbackEnvelope } from '../feedback/envelope.js';
 import type { AcpConnectionHandler, AcpTransportServer } from './transport/index.js';
 import { debug } from '../debug/log.js';
@@ -56,6 +56,7 @@ test('webterm :agent broadcasts ordered turn boundaries after its stream', async
   const abort = new AbortController();
   const updates: Array<{ sessionUpdate: string; content?: { text?: string }; _meta?: { elanousTurn?: { phase: string; text?: string; stopReason?: string } } }> = [];
   const server = runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
     shutdownSignal: abort.signal,
     transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
       void onConnection({ readable: bridge.a.readable, writable: bridge.a.writable,
@@ -115,6 +116,7 @@ test('runAcpServer routes filtered and enabled terminal attachment diagnostics t
   debug.setLevel('off');
   debug.setDiagEnabled(false);
   const server = runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
     shutdownSignal: abort.signal,
     transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
       void onConnection({
@@ -171,6 +173,7 @@ test('plain initialize sees model text and real thought, never feedback; aware p
   const previousLevel = debug.level();
   debug.setLevel('off');
   const server = runAcpServer({
+      extMethodAllowlist: WEBTERM_EXT_METHOD_ALLOWLIST,
     shutdownSignal: abort.signal,
     transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
       bridges.forEach((bridge, i) => {

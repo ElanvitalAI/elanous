@@ -22,6 +22,7 @@ import {
 import { validateRelayPublicOptions } from "./relay-cli.js";
 
 type Relay = ReturnType<typeof startRelayServer>;
+type RelayOptions = NonNullable<Parameters<typeof startRelayServer>[0]>;
 type Message = string | Uint8Array;
 const servers: Relay[] = [];
 const openSockets: WebSocket[] = [];
@@ -60,9 +61,11 @@ function relay(key: ReturnType<typeof signing>) {
   servers.push(instance);
   return instance;
 }
-function connected(url: string): Promise<WebSocket> {
+// 출처: #39024 — memberRequired 서버는 WS 업그레이드 자체가 회원 게이트를
+// 지나므로, host WS 는 emt_ 프로토콜 자격증명으로 연결한다.
+function connected(url: string, protocols?: string[]): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, protocols);
     openSockets.push(ws);
     ws.binaryType = "arraybuffer";
     inbox.set(ws, []);
@@ -131,6 +134,62 @@ async function host(server: Relay, key: ReturnType<typeof signing>) {
     type: "authenticated",
   });
   return { ws, key };
+}
+// HANDLE-BARE-HOST-WEBCCHAT-PROXY: shared fixture — an authenticated host channel
+// with the single pinned readable app a bare member host routes to.
+async function bareHostFixture(
+  publicUserId: string,
+  extra?: (serverId: string) => Partial<RelayOptions>,
+  wsProtocols?: string[],
+) {
+  const signingKey = generateKeyPairSync("ed25519");
+  const signingPublicKey = signingKey.publicKey
+    .export({ format: "der", type: "spki" })
+    .subarray(-32)
+    .toString("base64url");
+  const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(31));
+  const serverId = serverIdFromPublicKey(daemonKeys.publicKey);
+  const server = startRelayServer({
+    trustedHostKeys: new Map([[serverId, signingPublicKey]]),
+    publicDomain: "elanous.app",
+    publicServerId: serverId,
+    publicUserId,
+    publicReadableApps: new Set([`${publicUserId}/chat`]),
+    ...(extra ? extra(serverId) : {}),
+  });
+  servers.push(server);
+  const hostSocket = await connected(
+    `ws://127.0.0.1:${server.port}/host?serverId=${serverId}`,
+    wsProtocols,
+  );
+  const challenge = JSON.parse((await next(hostSocket)) as string) as {
+    nonce: string;
+  };
+  hostSocket.send(
+    JSON.stringify({
+      type: "auth",
+      publicKey: signingPublicKey,
+      signature: sign(
+        null,
+        challengeMessage(serverId, challenge.nonce),
+        signingKey.privateKey,
+      ).toString("base64url"),
+    }),
+  );
+  expect(JSON.parse((await next(hostSocket)) as string)).toEqual({
+    type: "authenticated",
+    capabilities: ["public-http-v1"],
+  });
+  hostSocket.send(
+    JSON.stringify({
+      type: "host-public-key",
+      publicKey: Buffer.from(daemonKeys.publicKey).toString("base64url"),
+    }),
+  );
+  expect(JSON.parse((await next(hostSocket)) as string)).toEqual({
+    type: "host-public-key-accepted",
+  });
+  return { server, serverId, daemonKeys, hostSocket };
 }
 afterEach(() => {
   for (const ws of openSockets.splice(0)) ws.close();
@@ -275,7 +334,7 @@ describe("Bun encrypted-frame relay", () => {
     expect(correctUserOffline.status).toBe(503);
   });
 
-  test("bare member host redirects only one pinned public app and refuses ambiguous or write routes", async () => {
+  test("bare member host proxies the single pinned public app and refuses ambiguous routes", async () => {
     const key = signing();
     const server = startRelayServer({
       trustedHostKeys: new Map([[key.id, key.publicKey]]),
@@ -283,17 +342,22 @@ describe("Bun encrypted-frame relay", () => {
       publicServerId: key.id,
       publicUserId: "user",
       publicReadableApps: new Set(["user/notes"]),
+      // Without a member requirement every request passes the gate, so the write
+      // route would only ever reach the offline-host 503. Requiring membership
+      // makes the member gate answer 401 for anonymous writes, as on the app host.
+      memberRequired: true,
+      validateMemberToken: async () => null,
+      hostOwnerMemberIds: new Map([[key.id, "member-1"]]),
     });
     servers.push(server);
     const base = `http://127.0.0.1:${server.port}/hello?part=2`;
+    // Read routes now proxy into the single pinned app path: with no room connected
+    // the answer is the app host's 503, not a redirect. 출처: #38981
     const good = await fetch(base, {
       headers: { host: "user.elanous.app" },
-      redirect: "manual",
     });
-    expect(good.status).toBe(308);
-    expect(good.headers.get("location")).toBe(
-      "https://notes--user.elanous.app/hello?part=2",
-    );
+    expect(good.status).toBe(503);
+    // Write routes flow through the app path's member gate: 401, not route-closed 404.
     expect(
       (
         await fetch(base, {
@@ -301,7 +365,7 @@ describe("Bun encrypted-frame relay", () => {
           headers: { host: "user.elanous.app" },
         })
       ).status,
-    ).toBe(404);
+    ).toBe(401);
     expect(
       (await fetch(base, { headers: { host: "other.elanous.app" } })).status,
     ).toBe(404);
@@ -320,6 +384,599 @@ describe("Bun encrypted-frame relay", () => {
         })
       ).status,
     ).toBe(404);
+  });
+
+  test("bare host reserved words never fall into the pinned app proxy", async () => {
+    // JUD FU #38981 1: the routing-layer exclusion is observable even when a
+    // reserved word is itself pinned as the public user with a single readable
+    // app — without the exclusion every host below would proxy the member app.
+    for (const word of ["www", "docs", "api", "admin", "relay", "mail"]) {
+      const key = signing();
+      const server = startRelayServer({
+        trustedHostKeys: new Map([[key.id, key.publicKey]]),
+        publicDomain: "elanous.app",
+        publicServerId: key.id,
+        publicUserId: word,
+        publicReadableApps: new Set([`${word}/webchat`]),
+        memberRequired: true,
+        validateMemberToken: async () => null,
+        hostOwnerMemberIds: new Map([[key.id, "member-1"]]),
+      });
+      servers.push(server);
+      const res = await fetch(`http://127.0.0.1:${server.port}/hello`, {
+        headers: { host: `${word}.elanous.app` },
+      });
+      expect(res.status).toBe(404); // 출처: #38994
+    }
+  });
+
+  test("bare host answers /.well-known/elanous/apps with the opt-in listing", async () => {
+    // JUD FU #38981 2: the bare host serves the public app listing itself with
+    // no connected room, and the owner opt-in stays off by default (empty list).
+    const key = signing();
+    const server = startRelayServer({
+      trustedHostKeys: new Map([[key.id, key.publicKey]]),
+      publicDomain: "elanous.app",
+      publicServerId: key.id,
+      publicUserId: "user",
+      publicReadableApps: new Set(["user/webchat"]),
+      publicListedApps: new Set(["webchat"]),
+      memberRequired: true,
+      validateMemberToken: async () => null,
+      hostOwnerMemberIds: new Map([[key.id, "member-1"]]),
+    });
+    servers.push(server);
+    const listed = await fetch(
+      `http://127.0.0.1:${server.port}/.well-known/elanous/apps`,
+      { headers: { host: "user.elanous.app" } },
+    );
+    expect(listed.status).toBe(200); // 출처: #38994
+    expect(listed.headers.get("content-type")).toBe("application/json");
+    expect(listed.headers.get("cache-control")).toBe("no-store");
+    expect(listed.headers.get("x-robots-tag")).toBe("noindex");
+    expect(await listed.json()).toEqual({
+      apps: ["https://webchat--user.elanous.app"],
+    });
+    const unlisted = startRelayServer({
+      trustedHostKeys: new Map([[key.id, key.publicKey]]),
+      publicDomain: "elanous.app",
+      publicServerId: key.id,
+      publicUserId: "user",
+      publicReadableApps: new Set(["user/webchat"]),
+      memberRequired: true,
+      validateMemberToken: async () => null,
+      hostOwnerMemberIds: new Map([[key.id, "member-1"]]),
+    });
+    servers.push(unlisted);
+    const empty = await fetch(
+      `http://127.0.0.1:${unlisted.port}/.well-known/elanous/apps`,
+      { headers: { host: "user.elanous.app" } },
+    );
+    expect(empty.status).toBe(200); // 출처: #38994
+    expect(await empty.json()).toEqual({ apps: [] });
+    const post = await fetch(
+      `http://127.0.0.1:${unlisted.port}/.well-known/elanous/apps`,
+      { method: "POST", headers: { host: "user.elanous.app" } },
+    );
+    expect(post.status).toBe(405); // 출처: #38994
+  });
+
+  test("member session cookies stay bound to the serving host across bare and app origins", async () => {
+    // JUD FU #38981 3: the bare host and the app host are different origins, so
+    // a member session cookie must stay bound to whichever host served it. The
+    // stub app host answers with a Domain=elanous.app widening attempt and the
+    // live HTTP responses must hand the cookie back without any domain
+    // attribute — the relay keeps the session on the origin the member used.
+    const signingKey = generateKeyPairSync("ed25519");
+    const signingPublicKey = signingKey.publicKey
+      .export({ format: "der", type: "spki" })
+      .subarray(-32)
+      .toString("base64url");
+    const daemonKeys = await generateDaemonKeyPair(
+      new Uint8Array(32).fill(21), // 출처: #38994 — 기존 채널 시험의 결정론적 시드 상수
+    );
+    const serverId = serverIdFromPublicKey(daemonKeys.publicKey);
+    const server = startRelayServer({
+      trustedHostKeys: new Map([[serverId, signingPublicKey]]),
+      publicDomain: "elanous.app",
+      publicServerId: serverId,
+      publicUserId: "user",
+      publicReadableApps: new Set(["user/webchat"]),
+      // 출처: #38994 — memberRequired 서버는 host WS 를 멤버 자격증명 없이 거부한다
+      // (relay-server.ts memberAuthorized). 이 시험의 본체는 쿠키 오리진 결속이고
+      // 도메인 속성 제거는 무조건 적용이므로 회원 게이트 옵션을 끄고 잰다.
+    });
+    servers.push(server);
+    const hostSocket = await connected(
+      `ws://127.0.0.1:${server.port}/host?serverId=${serverId}`,
+    );
+    const challenge = JSON.parse((await next(hostSocket)) as string) as {
+      nonce: string;
+    };
+    hostSocket.send(
+      JSON.stringify({
+        type: "auth",
+        publicKey: signingPublicKey,
+        signature: sign(
+          null,
+          challengeMessage(serverId, challenge.nonce),
+          signingKey.privateKey,
+        ).toString("base64url"),
+      }),
+    );
+    expect(JSON.parse((await next(hostSocket)) as string)).toEqual({
+      type: "authenticated",
+      capabilities: ["public-http-v1"],
+    });
+    hostSocket.send(
+      JSON.stringify({
+        type: "host-public-key",
+        publicKey: Buffer.from(daemonKeys.publicKey).toString("base64url"),
+      }),
+    );
+    expect(JSON.parse((await next(hostSocket)) as string)).toEqual({
+      type: "host-public-key-accepted",
+    });
+    const answerSessionCookie = async (
+      responsePromise: ReturnType<typeof fetch>,
+    ): Promise<Awaited<ReturnType<typeof fetch>>> => {
+      const taggedPhoneKey = (await next(hostSocket)) as Uint8Array;
+      const clientId = new DataView(
+        taggedPhoneKey.buffer,
+        taggedPhoneKey.byteOffset,
+        4, // 출처: #38994 — 프레임 접두 id 4바이트(기존 채널 시험 관행)
+      ).getUint32(0, false); // 출처: #38994 — 빅엔디안 판독(기존 채널 시험 관행)
+      const channel = await acceptDaemonChannel(
+        daemonKeys,
+        taggedPhoneKey.subarray(4), // 출처: #38994 — 접두 4바이트 뒤 페이로드(기존 관행)
+      );
+      if (!channel.ok) throw new Error(channel.reason);
+      const streams = new MuxStreamState();
+      const decoder = new MuxDecoder(streams);
+      const encoder = new MuxEncoder(streams);
+      const requestOpen = (await next(hostSocket)) as Uint8Array;
+      const opened = channel.value.open(requestOpen.subarray(4)); // 출처: #38994 — 접두 4바이트 뒤 프레임(기존 관행)
+      if (!opened.ok) throw new Error(opened.reason);
+      const openFrame = decoder.decode(opened.value);
+      if (!openFrame.ok || openFrame.value.kind !== "open")
+        throw new Error("expected public HTTP open frame");
+      expect(openFrame.value.headers.host).toBe("webchat.app.localhost");
+      const requestEnd = await next(hostSocket);
+      if (!(requestEnd instanceof Uint8Array))
+        throw new Error(
+          `expected encrypted request end frame, received control: ${requestEnd}`,
+        );
+      const ended = channel.value.open(requestEnd.subarray(4)); // 출처: #38994 — 접두 4바이트 뒤 프레임(기존 관행)
+      if (!ended.ok) throw new Error(ended.reason);
+      expect(decoder.decode(ended.value)).toEqual({
+        ok: true,
+        value: { streamId: 1, kind: "end" }, // 출처: #38994 — 첫 스트림 id 1(기존 관행)
+      });
+      const envelope = new TextEncoder().encode(
+        JSON.stringify({
+          status: 200, // 출처: #38994
+          headers: {
+            "content-type": "text/html",
+            "set-cookie":
+              "member-session=stub-member-session-1; Path=/; Domain=elanous.app; HttpOnly; SameSite=Lax",
+          },
+          body: Buffer.from("webchat session").toString("base64"),
+        }),
+      );
+      const responseData = encoder.encode({
+        streamId: 1, // 출처: #38994 — 첫 스트림 id 1(기존 관행)
+        kind: "data",
+        data: envelope,
+      });
+      if (!responseData.ok) throw new Error(responseData.reason);
+      const encryptedData = channel.value.seal(responseData.value);
+      if (!encryptedData.ok) throw new Error(encryptedData.reason);
+      hostSocket.send(toIdBytes(clientId, encryptedData.value));
+      const responseClose = encoder.encode({
+        streamId: 1, // 출처: #38994 — 첫 스트림 id 1(기존 관행)
+        kind: "close",
+        reason: "",
+      });
+      if (!responseClose.ok) throw new Error(responseClose.reason);
+      const encryptedClose = channel.value.seal(responseClose.value);
+      if (!encryptedClose.ok) throw new Error(encryptedClose.reason);
+      hostSocket.send(toIdBytes(clientId, encryptedClose.value));
+      const response = await responsePromise;
+      await response.text();
+      expect(JSON.parse((await next(hostSocket)) as string)).toMatchObject({
+        type: "client-disconnected",
+      });
+      return response;
+    };
+    const bareResponsePromise = fetch(`http://127.0.0.1:${server.port}/session`, {
+      headers: { host: "user.elanous.app" },
+    });
+    const bareResponse = await answerSessionCookie(bareResponsePromise);
+    expect(bareResponse.status).toBe(200); // 출처: #38994
+    expect(bareResponse.headers.get("set-cookie")).toBe(
+      "member-session=stub-member-session-1; Path=/; HttpOnly; SameSite=Lax",
+    ); // 실측(JUD FU 3): Domain=elanous.app 확장이 제거됐다 — 세션 쿠키는 bare 호스트에만 결속
+    const appResponsePromise = fetch(`http://127.0.0.1:${server.port}/session`, {
+      headers: { host: "webchat--user.elanous.app" },
+    });
+    const appResponse = await answerSessionCookie(appResponsePromise);
+    expect(appResponse.status).toBe(200); // 출처: #38994
+    expect(appResponse.headers.get("set-cookie")).toBe(
+      "member-session=stub-member-session-1; Path=/; HttpOnly; SameSite=Lax",
+    ); // 실측(JUD FU 3): app 호스트에서도 같은 쿠키는 그 호스트에만 결속 — bare 와 공유되지 않는다
+  });
+
+  test("bare member host forwards to the member Nexus default route with the path intact", async () => {
+    const { server, daemonKeys, hostSocket } = await bareHostFixture("user");
+    const responsePromise = fetch(
+      `http://127.0.0.1:${server.port}/app/chat/?room=1`,
+      { headers: { host: "user.elanous.app" } },
+    );
+    const taggedPhoneKey = (await next(hostSocket)) as Uint8Array;
+    const clientId = new DataView(
+      taggedPhoneKey.buffer,
+      taggedPhoneKey.byteOffset,
+      4,
+    ).getUint32(0, false);
+    const channel = await acceptDaemonChannel(
+      daemonKeys,
+      taggedPhoneKey.subarray(4),
+    );
+    if (!channel.ok) throw new Error(channel.reason);
+    const streams = new MuxStreamState();
+    const decoder = new MuxDecoder(streams);
+    const encoder = new MuxEncoder(streams);
+    const requestOpen = (await next(hostSocket)) as Uint8Array;
+    const opened = channel.value.open(requestOpen.subarray(4));
+    if (!opened.ok) throw new Error(opened.reason);
+    const openFrame = decoder.decode(opened.value);
+    if (!openFrame.ok || openFrame.value.kind !== "open")
+      throw new Error("expected public HTTP open frame");
+    // HANDLE-BARE-HOST-WEBCCHAT-PROXY: the bare handle host forwards under the
+    // member's own public host (the member Nexus default route), never a
+    // synthesized <app>.app.localhost origin the member Nexus would 404.
+    expect(openFrame.value.headers.host).toBe("user.elanous.app");
+    expect(openFrame.value.headers.host).not.toMatch(/\.app\.localhost$/);
+    expect(openFrame.value.path).toBe("/app/chat/?room=1");
+    const requestEnd = await next(hostSocket);
+    if (!(requestEnd instanceof Uint8Array))
+      throw new Error("expected encrypted request end frame");
+    const ended = channel.value.open(requestEnd.subarray(4));
+    if (!ended.ok || !decoder.decode(ended.value).ok)
+      throw new Error("expected request end frame");
+
+    const envelope = new TextEncoder().encode(
+      JSON.stringify({
+        status: 200, // 출처: #39003
+        headers: {
+          "content-type": "text/plain",
+          location: "http://user.elanous.app/next",
+        },
+        body: Buffer.from("bare host ok").toString("base64"),
+      }),
+    );
+    const responseData = encoder.encode({
+      streamId: 1, // 출처: #39003
+      kind: "data",
+      data: envelope,
+    });
+    if (!responseData.ok) throw new Error(responseData.reason);
+    const encryptedData = channel.value.seal(responseData.value);
+    if (!encryptedData.ok) throw new Error(encryptedData.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedData.value));
+    const responseClose = encoder.encode({
+      streamId: 1, // 출처: #39003
+      kind: "close",
+      reason: "",
+    });
+    if (!responseClose.ok) throw new Error(responseClose.reason);
+    const encryptedClose = channel.value.seal(responseClose.value);
+    if (!encryptedClose.ok) throw new Error(encryptedClose.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedClose.value));
+
+    const response = await responsePromise;
+    expect(response.status).toBe(200); // 출처: #39003
+    // The daemon's same-origin redirect surfaces as the public https bare origin.
+    expect(response.headers.get("location")).toBe(
+      "https://user.elanous.app/next",
+    );
+    expect(await response.text()).toBe("bare host ok");
+    expect(JSON.parse((await next(hostSocket)) as string)).toMatchObject({
+      type: "client-disconnected",
+      clientId,
+    });
+  });
+
+  test("a bare webchat entry with zero public apps still flows to the member Nexus", async () => {
+    // 출처: #39024 — 공개 앱 0개 게이트 리터럴: bare `/` 는 publicReadableApps
+    // "정확히 1개" 선택보다 앞에서 회원 Nexus 로 흘러, 회원 측 303 `/app/chat/`
+    // 리디렉션이 공개 응답에 그대로 드러난다.
+    const { server, daemonKeys, hostSocket } = await bareHostFixture(
+      "user",
+      () => ({ publicReadableApps: new Set<string>() }),
+    );
+    const responsePromise = fetch(`http://127.0.0.1:${server.port}/`, {
+      headers: { host: "user.elanous.app" },
+      redirect: "manual",
+    });
+    const taggedPhoneKey = (await next(hostSocket)) as Uint8Array;
+    const clientId = new DataView(
+      taggedPhoneKey.buffer,
+      taggedPhoneKey.byteOffset,
+      4,
+    ).getUint32(0, false);
+    const channel = await acceptDaemonChannel(
+      daemonKeys,
+      taggedPhoneKey.subarray(4),
+    );
+    if (!channel.ok) throw new Error(channel.reason);
+    const streams = new MuxStreamState();
+    const decoder = new MuxDecoder(streams);
+    const encoder = new MuxEncoder(streams);
+    const requestOpen = (await next(hostSocket)) as Uint8Array;
+    const opened = channel.value.open(requestOpen.subarray(4));
+    if (!opened.ok) throw new Error(opened.reason);
+    const openFrame = decoder.decode(opened.value);
+    if (!openFrame.ok || openFrame.value.kind !== "open")
+      throw new Error("expected public HTTP open frame");
+    // 출처: #39024 — 공개 앱 0개여도 bare 진입 경로는 회원 Nexus 오리진으로.
+    expect(openFrame.value.headers.host).toBe("user.elanous.app");
+    expect(openFrame.value.path).toBe("/");
+    const requestEnd = await next(hostSocket);
+    if (!(requestEnd instanceof Uint8Array))
+      throw new Error("expected encrypted request end frame");
+    const ended = channel.value.open(requestEnd.subarray(4));
+    if (!ended.ok || !decoder.decode(ended.value).ok)
+      throw new Error("expected request end frame");
+    const envelope = new TextEncoder().encode(
+      JSON.stringify({
+        status: 303, // 출처: #39024 — 회원 Nexus 진입 리디렉션
+        headers: {
+          "content-type": "text/plain",
+          location: "http://user.elanous.app/app/chat/",
+        },
+        body: Buffer.from("").toString("base64"),
+      }),
+    );
+    const responseData = encoder.encode({
+      kind: "data",
+      streamId: openFrame.value.streamId,
+      data: envelope,
+    });
+    if (!responseData.ok) throw new Error(responseData.reason);
+    const encryptedData = channel.value.seal(responseData.value);
+    if (!encryptedData.ok) throw new Error(encryptedData.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedData.value));
+    const responseClose = encoder.encode({
+      kind: "close",
+      streamId: openFrame.value.streamId,
+      reason: "",
+    });
+    if (!responseClose.ok) throw new Error(responseClose.reason);
+    const encryptedClose = channel.value.seal(responseClose.value);
+    if (!encryptedClose.ok) throw new Error(encryptedClose.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedClose.value));
+    const response = await responsePromise;
+    await response.text();
+    expect(response.status).toBe(303); // 출처: #39024
+    expect(response.headers.get("location")).toBe(
+      "https://user.elanous.app/app/chat/",
+    );
+    expect(JSON.parse((await next(hostSocket)) as string)).toMatchObject({
+      type: "client-disconnected",
+      clientId,
+    });
+  });
+
+  test("bare member chat API POST keeps the consumed authorization forwarded", async () => {
+    // 출처: #39024 — 허용된 회원 채팅 API 2경로의 POST 는 회원 게이트가 소비한
+    // Authorization 을 지우지 않고 회원 Nexus 로 그대로 전달된다.
+    const { server, daemonKeys, hostSocket } = await bareHostFixture(
+      "user",
+      (serverId) => ({
+        memberRequired: true,
+        validateMemberToken: async () => ({ memberId: "member-1" }),
+        hostOwnerMemberIds: new Map([[serverId, "member-1"]]),
+      }),
+      // 출처: #39024 — memberRequired host WS 게이트 통과용 회원 자격증명.
+      ["emt_ws_member_1"],
+    );
+    const responsePromise = fetch(
+      `http://127.0.0.1:${server.port}/v1/prompt/stream`,
+      {
+        method: "POST",
+        headers: {
+          host: "user.elanous.app",
+          authorization: "Bearer emt_member_bare_chat",
+        },
+      },
+    );
+    const taggedPhoneKey = (await next(hostSocket)) as Uint8Array;
+    const clientId = new DataView(
+      taggedPhoneKey.buffer,
+      taggedPhoneKey.byteOffset,
+      4,
+    ).getUint32(0, false);
+    const channel = await acceptDaemonChannel(
+      daemonKeys,
+      taggedPhoneKey.subarray(4),
+    );
+    if (!channel.ok) throw new Error(channel.reason);
+    const streams = new MuxStreamState();
+    const decoder = new MuxDecoder(streams);
+    const encoder = new MuxEncoder(streams);
+    const requestOpen = (await next(hostSocket)) as Uint8Array;
+    const opened = channel.value.open(requestOpen.subarray(4));
+    if (!opened.ok) throw new Error(opened.reason);
+    const openFrame = decoder.decode(opened.value);
+    if (!openFrame.ok || openFrame.value.kind !== "open")
+      throw new Error("expected public HTTP open frame");
+    // 출처: #39024 — 채팅 API 도 bare 오리진 회원 Nexus 로 흐른다.
+    expect(openFrame.value.headers.host).toBe("user.elanous.app");
+    expect(openFrame.value.headers.authorization).toBe(
+      "Bearer emt_member_bare_chat",
+    );
+    const requestEnd = await next(hostSocket);
+    if (!(requestEnd instanceof Uint8Array))
+      throw new Error("expected encrypted request end frame");
+    const ended = channel.value.open(requestEnd.subarray(4));
+    if (!ended.ok || !decoder.decode(ended.value).ok)
+      throw new Error("expected request end frame");
+    const envelope = new TextEncoder().encode(
+      JSON.stringify({
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+        body: Buffer.from("chat api ok").toString("base64"),
+      }),
+    );
+    const responseData = encoder.encode({
+      kind: "data",
+      streamId: openFrame.value.streamId,
+      data: envelope,
+    });
+    if (!responseData.ok) throw new Error(responseData.reason);
+    const encryptedData = channel.value.seal(responseData.value);
+    if (!encryptedData.ok) throw new Error(encryptedData.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedData.value));
+    const responseClose = encoder.encode({
+      kind: "close",
+      streamId: openFrame.value.streamId,
+      reason: "",
+    });
+    if (!responseClose.ok) throw new Error(responseClose.reason);
+    const encryptedClose = channel.value.seal(responseClose.value);
+    if (!encryptedClose.ok) throw new Error(encryptedClose.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedClose.value));
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(JSON.parse((await next(hostSocket)) as string)).toMatchObject({
+      type: "client-disconnected",
+      clientId,
+    });
+  });
+
+  test("bare member non-chat paths still drop the consumed authorization", async () => {
+    // 출처: #39024 — 허용 채팅 API 2경로 밖의 경로는 회원 게이트가 소비한
+    // Authorization 을 이전과 같이 지운다(앱 백엔드로의 bearer 재생 방지).
+    const { server, daemonKeys, hostSocket } = await bareHostFixture(
+      "user",
+      (serverId) => ({
+        memberRequired: true,
+        validateMemberToken: async () => ({ memberId: "member-1" }),
+        hostOwnerMemberIds: new Map([[serverId, "member-1"]]),
+      }),
+      // 출처: #39024 — memberRequired host WS 게이트 통과용 회원 자격증명.
+      ["emt_ws_member_1"],
+    );
+    const responsePromise = fetch(`http://127.0.0.1:${server.port}/notes`, {
+      headers: {
+        host: "user.elanous.app",
+        authorization: "Bearer emt_member_bare_chat",
+      },
+    });
+    const taggedPhoneKey = (await next(hostSocket)) as Uint8Array;
+    const clientId = new DataView(
+      taggedPhoneKey.buffer,
+      taggedPhoneKey.byteOffset,
+      4,
+    ).getUint32(0, false);
+    const channel = await acceptDaemonChannel(
+      daemonKeys,
+      taggedPhoneKey.subarray(4),
+    );
+    if (!channel.ok) throw new Error(channel.reason);
+    const streams = new MuxStreamState();
+    const decoder = new MuxDecoder(streams);
+    const encoder = new MuxEncoder(streams);
+    const requestOpen = (await next(hostSocket)) as Uint8Array;
+    const opened = channel.value.open(requestOpen.subarray(4));
+    if (!opened.ok) throw new Error(opened.reason);
+    const openFrame = decoder.decode(opened.value);
+    if (!openFrame.ok || openFrame.value.kind !== "open")
+      throw new Error("expected public HTTP open frame");
+    // 출처: #39024 — 채팅 API 밖 경로는 앱 오리진으로, bearer 는 지워진다.
+    expect(openFrame.value.headers.host).toBe("chat.app.localhost");
+    expect(openFrame.value.headers.authorization).toBeUndefined();
+    const requestEnd = await next(hostSocket);
+    if (!(requestEnd instanceof Uint8Array))
+      throw new Error("expected encrypted request end frame");
+    const ended = channel.value.open(requestEnd.subarray(4));
+    if (!ended.ok || !decoder.decode(ended.value).ok)
+      throw new Error("expected request end frame");
+    const envelope = new TextEncoder().encode(
+      JSON.stringify({
+        status: 200,
+        headers: { "content-type": "text/plain" },
+        body: Buffer.from("dropped ok").toString("base64"),
+      }),
+    );
+    const responseData = encoder.encode({
+      kind: "data",
+      streamId: openFrame.value.streamId,
+      data: envelope,
+    });
+    if (!responseData.ok) throw new Error(responseData.reason);
+    const encryptedData = channel.value.seal(responseData.value);
+    if (!encryptedData.ok) throw new Error(encryptedData.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedData.value));
+    const responseClose = encoder.encode({
+      kind: "close",
+      streamId: openFrame.value.streamId,
+      reason: "",
+    });
+    if (!responseClose.ok) throw new Error(responseClose.reason);
+    const encryptedClose = channel.value.seal(responseClose.value);
+    if (!encryptedClose.ok) throw new Error(encryptedClose.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedClose.value));
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(JSON.parse((await next(hostSocket)) as string)).toMatchObject({
+      type: "client-disconnected",
+      clientId,
+    });
+  });
+
+  test("bare host reserved labels never proxy to the pinned host", async () => {
+    const { server, serverId } = await bareHostFixture("user");
+    const www = await fetch(`http://127.0.0.1:${server.port}/app/chat/`, {
+      headers: { host: "www.elanous.app" },
+    });
+    expect(www.status).toBe(404); // 출처: #39003
+    expect(server.stats(serverId).publicRequests).toBe(0); // 출처: #39003
+  });
+
+  test("an unpinned bare handle never reaches a connected host", async () => {
+    const { server, serverId } = await bareHostFixture("user");
+    const leaked = await fetch(`http://127.0.0.1:${server.port}/app/chat/`, {
+      headers: { host: "eve.elanous.app" },
+    });
+    expect(leaked.status).toBe(404); // 출처: #39003
+    expect(server.stats(serverId).publicRequests).toBe(0); // 출처: #39003
+  });
+
+  test("an anonymous write to a bare member host is rejected before proxying", async () => {
+    const key = signing();
+    const server = startRelayServer({
+      trustedHostKeys: new Map([[key.id, key.publicKey]]),
+      publicDomain: "elanous.app",
+      publicServerId: key.id,
+      publicUserId: "user",
+      publicReadableApps: new Set(["user/chat"]),
+      memberRequired: true,
+      validateMemberToken: async () => null,
+      hostOwnerMemberIds: new Map([[key.id, "member-1"]]),
+    });
+    servers.push(server);
+    const write = await fetch(
+      `http://127.0.0.1:${server.port}/app/chat/api/messages`,
+      {
+        method: "POST",
+        headers: { host: "user.elanous.app" },
+        body: "hello",
+      },
+    );
+    expect(write.status).toBe(401); // 출처: #39003
+    expect(server.stats(key.id).publicRequests).toBe(0); // 출처: #39003
   });
 
   test("custom relay hosts require verified ownership, pinned user, and a ready certificate", () => {

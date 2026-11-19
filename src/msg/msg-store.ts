@@ -6,6 +6,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { validateProvenance, type Provenance } from '../provenance/provenance.js';
 import { hasReceiptTable, latestReceiptIdOn, legacyIntent, listReceiptsOn, MSG_RECEIPTS_SCHEMA, recordReceiptOn, type Receipt, type ReceiptInput, type ReceiptQuery, type ReceiptRecordOutcome, type ReceiptSource, type ReceiptState } from './msg-receipts.js';
+import { recordReceiptClock } from '../hq/msg-receipt-clock-sink.js';
 
 export interface MessageEnvelope {
   from: string;
@@ -50,20 +51,47 @@ export interface Message extends MessageEnvelope {
   /** ELN-MSG-POST-IDEMPOTENT: this post matched a stored one (same sender · recipient · body within the dedupe window);
    *  no row was written and this is the stored message. Only ever set on a `post` result. */
   deduped?: true;
+  /** SEAT-MAIL #16 — on a deduped `post` result: how many times this mail has now been sent (the first row's counter,
+   *  this suppressed send included), when the last repeat arrived, and why it was suppressed. */
+  repeatCount?: number;
+  lastRepeatAt?: string;
+  repeatReason?: string;
+  /** SEAT-MAIL #24 — on a sender-entrance `post` result (dedupe on): the original message ID this reply auto-acked
+   *  for the replying seat. One per-message ack row; the cursor never moves. Absent when the original is not
+   *  addressed to the replying seat (ALL · group · another seat) and on every opted-out entrance (`--no-dedupe`,
+   *  programmatic producers). */
+  autoAcked?: number;
 }
 
 /** ELN-MSG-POST-IDEMPOTENT — default dedupe window. Justification: the 11-18 JUD retry loop re-sent one report 13 times
- *  over 5 min 16 s (#87715…#87739); the shortest legitimate repeat cadence on the seats is a 20-30 min standing report.
- *  10 min covers the retry storm with margin and stays well under that cadence. `ELANOUS_MSG_DEDUPE_WINDOW_MS` (0 = off)
+ *  over 5 min 16 s (#87715…#87739). SEAT-MAIL #16 (OP decision 11-19): 30 min — a mail with no explicit origin-key that
+ *  repeats with the same sender · normalized body · evidence sha · structural metadata inside 30 min is a repeat, not a
+ *  new report (a standing report that carries a new evidence sha or a changed body still goes through). `ELANOUS_MSG_DEDUPE_WINDOW_MS` (0 = off)
  *  or the store option overrides it. Only sender entrances opt in (`msg post` — `--no-dedupe` skips it — and the MsgPost
  *  tool); programmatic producers keep exact append. */
-export const MSG_DEDUPE_WINDOW_MS = 10 * 60_000;
+export const MSG_DEDUPE_WINDOW_MS = 30 * 60_000;
 
 function resolveDedupeWindowMs(option: number | undefined): number {
   if (option !== undefined && Number.isFinite(option) && option >= 0) return option;
   const raw = process.env.ELANOUS_MSG_DEDUPE_WINDOW_MS;
   const parsed = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : MSG_DEDUPE_WINDOW_MS;
+}
+
+/** SEAT-MAIL #16 — the repeat comparison's body: trimmed, every space/tab run folded to one space (line breaks and
+ *  other separators stay — a body that differs in them is a different mail). */
+export function normalizeRepeatBody(body: string): string {
+  return body.replace(/[ \t]+/g, ' ').trim();
+}
+
+/** SEAT-MAIL #16 — the evidence sha of a send: the first sha-shaped (7-40 hex) token inside its refs, lower-cased;
+ *  '' when there is none (a missing sha compares as empty). */
+export function repeatEvidenceSha(refs: readonly string[] | undefined): string {
+  for (const ref of refs ?? []) {
+    const match = /(?<![0-9a-zA-Z])[0-9a-fA-F]{7,40}(?![0-9a-zA-Z])/.exec(ref);
+    if (match) return match[0].toLowerCase();
+  }
+  return '';
 }
 
 /** The idempotency key's body part — hex sha256 of the exact UTF-8 body. */
@@ -233,7 +261,7 @@ function envelopeMetaSql(db: Database, qualified: boolean): string {
 }
 
 /** The unread set's WHERE (cursor · expiry · ack · direct/ALL/group) and its bound parameters — one definition for every unread read. */
-function unreadWhereOn(db: Database, to: string): { where: string; params: string[] } {
+function unreadWhereOn(db: Database, to: string, after?: number): { where: string; params: Array<string | number> } {
   const hasAcks = hasMessageAckTable(db);
   const hasMetadata = hasEnvelopeMetadata(db);
   const hasGroups = hasGroupMembershipTable(db);
@@ -244,10 +272,10 @@ function unreadWhereOn(db: Database, to: string): { where: string; params: strin
           AND m.id > gm.joined_after_id AND (gm.left_after_id IS NULL OR m.id <= gm.left_after_id)
       )` : '';
   return {
-    where: `m.id > COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)
+    where: `m.id > ${after === undefined ? 'COALESCE((SELECT last_id FROM msg_cursors WHERE recipient = ?), 0)' : '?'}
       ${expiryClause} ${ackClause}
       AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause})`,
-    params: [to, ...(hasAcks ? [to] : []), to, to, ...(hasGroups ? [to] : [])],
+    params: [after ?? to, ...(hasAcks ? [to] : []), to, to, ...(hasGroups ? [to] : [])],
   };
 }
 
@@ -549,6 +577,9 @@ export class MsgStore {
       if (!columns.has('body_sha256')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN body_sha256 TEXT');
       // MF3: the per-attempt token a sender writes with its INSERT, so recovery can identify its own commit.
       if (!columns.has('post_attempt')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN post_attempt TEXT');
+      // SEAT-MAIL #16 — repeat counter on the first row (NULL = sent once) and when the last suppressed repeat arrived.
+      if (!columns.has('repeat_count')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN repeat_count INTEGER');
+      if (!columns.has('last_repeat_at')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN last_repeat_at TEXT');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_dedupe ON msg_messages(sender, recipient, created_at)');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_post_attempt ON msg_messages(post_attempt)');
@@ -560,7 +591,7 @@ export class MsgStore {
     const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
     const wanted = ['reply_to', 'expires_at', 'priority', 'supersedes', 'provenance_json', 'from_kind', 'crown_directive', 'intent',
       'refs_json', 'body_ref_json', 'deadline_at', 'needs_ack', 'schema_version', 'origin_seat', 'origin_delegated', 'done_when', 'body_sha256',
-      'post_attempt'];
+      'post_attempt', 'repeat_count', 'last_repeat_at'];
     if (wanted.some(name => !columns.has(name))) return true;
     const indexes = new Set((this.db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'msg_messages'").all() as { name: string }[])
       .map(row => row.name));
@@ -568,22 +599,42 @@ export class MsgStore {
   }
 
   /**
-   * ELN-MSG-POST-IDEMPOTENT — the newest stored message with the same sender, recipient, reply target and body posted at
-   * or after `sinceIso`. Pre-key rows (body_sha256 NULL) match on the body itself. Runs inside the caller's IMMEDIATE
-   * transaction when called from `post`, so two concurrent identical posts serialize and the second finds the first.
+   * ELN-MSG-POST-IDEMPOTENT ⊕ SEAT-MAIL #16 — the newest stored message posted at or after `sinceIso` that this send
+   * repeats: same sender and recipient, same normalized body, same evidence sha (missing = ''), and the same structural
+   * metadata (replyTo · intent · deadline · needsAck · kind · priority). Runs inside the caller's IMMEDIATE transaction
+   * when called from `post`, so two concurrent identical posts serialize and the second finds the first.
    */
-  findRecentPost(input: Pick<MessageEnvelope, 'from' | 'to' | 'body' | 'replyTo'>, sinceIso: string): Message | null {
+  findRecentPost(input: MessageEnvelope, sinceIso: string): Message | null {
     const from = canonicalMessageAddress(input.from);
     const to = canonicalMessageAddress(input.to);
-    const columns = new Set((this.db.query('PRAGMA table_info(msg_messages)').all() as { name: string }[]).map(row => row.name));
-    const keyed = columns.has('body_sha256');
-    const replyClause = columns.has('reply_to') ? 'AND reply_to IS ?' : '';
-    const bodyClause = keyed ? '(body_sha256 = ? OR (body_sha256 IS NULL AND body = ?))' : 'body = ?';
-    const params: Array<string | number | null> = [from, to, sinceIso, ...(columns.has('reply_to') ? [input.replyTo ?? null] : []),
-      ...(keyed ? [messageBodySha256(input.body), input.body] : [input.body])];
-    const row = this.db.query(`SELECT id FROM msg_messages WHERE sender = ? AND recipient = ? AND created_at >= ? ${replyClause}
-      AND ${bodyClause} ORDER BY id DESC LIMIT 1`).get(...params) as { id: number } | null;
-    return row === null ? null : this.getMessage(row.id);
+    const ids = this.db.query('SELECT id FROM msg_messages WHERE sender = ? AND recipient = ? AND created_at >= ? ORDER BY id DESC')
+      .all(from, to, sinceIso) as { id: number }[];
+    const intent = input.intent ?? legacyIntent(input.kind);
+    const want = {
+      body: normalizeRepeatBody(input.body), evidence: repeatEvidenceSha(input.refs), replyTo: input.replyTo ?? null, intent,
+      deadlineAt: input.deadlineAt ?? null, needsAck: input.needsAck ?? (intent === 'request' || intent === 'decision'),
+      kind: input.kind ?? null, priority: input.priority ?? null,
+    };
+    for (const { id } of ids) {
+      const stored = this.getMessage(id);
+      if (stored === null) continue;
+      if (normalizeRepeatBody(stored.body) === want.body && repeatEvidenceSha(stored.refs) === want.evidence
+        && (stored.replyTo ?? null) === want.replyTo && (stored.intent ?? legacyIntent(stored.kind)) === want.intent
+        && (stored.deadlineAt ?? null) === want.deadlineAt && (stored.needsAck === true) === want.needsAck
+        && (stored.kind ?? null) === want.kind && (stored.priority ?? null) === want.priority) return stored;
+    }
+    return null;
+  }
+
+  /** SEAT-MAIL #16 — a suppressed repeat is not silent: bump the first row's counter and last time, return it with why. */
+  private recordRepeat(existing: Message, windowMs: number): Message {
+    const at = new Date().toISOString();
+    const row = this.db.query(`UPDATE msg_messages SET repeat_count = COALESCE(repeat_count, 1) + 1, last_repeat_at = ?
+      WHERE id = ? RETURNING repeat_count`).get(at, existing.id) as { repeat_count: number } | null;
+    const repeatCount = row?.repeat_count ?? 2;
+    const minutes = Math.round(windowMs / 60_000);
+    const repeatReason = `repeat of #${existing.id} (×${repeatCount} · same sender/body/evidence sha/meta within ${minutes} min · no new row)`;
+    return { ...existing, deduped: true as const, repeatCount, lastRepeatAt: at, repeatReason };
   }
 
   append(input: MessageEnvelope): Message { return this.post(input); }
@@ -658,7 +709,14 @@ export class MsgStore {
     if (input.state !== 'posted' && (recipient === 'ALL' || recipient.startsWith('group:'))) throw new Error('receipt recipient must be one seat');
     if (input.state !== 'posted' && this.getMessage(input.messageId) !== null && this.messageStatus(recipient, input.messageId) === null)
       throw new Error(`message #${input.messageId} is not addressed to ${recipient}`);
-    return recordReceiptOn(this.db, { ...input, recipient }, this.clock);
+    // [seat-mail #14 wiring] seen/done 3계기 clock — 이 깔때기 하나가 CLI·TUI·도구 전 경로를 커버한다.
+    // orphan guard(unknown id 미기록)·fail-soft는 sink 안. clock upsert는 멱등이라 이중 기록 무해.
+    // [JUD must=1 수리] recordReceiptOn 이 throw(done needs evidence 등)하면 clock 에 doneAt 이 남으면 안 된다 —
+    // 검증·기록이 성공한 뒤에만 clock 을 남긴다(순서: receipt 먼저, clock 나중).
+    const receipt = recordReceiptOn(this.db, { ...input, recipient }, this.clock);
+    if (input.state === 'seen' || input.state === 'done')
+      recordReceiptClock(this.db, { messageId: input.messageId, recipient, event: input.state });
+    return receipt;
   }
 
   /**
@@ -732,19 +790,19 @@ export class MsgStore {
       ? this.findRecentPost(message, new Date(Date.now() - windowMs).toISOString())
       : null;
     const insert = (envelope: MessageEnvelope): Message => this.insertMessage(envelope, options.attemptToken);
-    const posted: Message = this.withPostedEvents((): Message => {
+    let posted: Message = this.withPostedEvents((): Message => {
       if (message.to.startsWith('group:')) {
         if (!this.db.query('SELECT 1 FROM msg_groups WHERE address = ?').get(message.to)) throw new Error(`group not found: ${message.to}`);
         const existing = recent();
-        return existing === null ? insert(message) : { ...existing, deduped: true as const };
+        return existing === null ? insert(message) : this.recordRepeat(existing, windowMs);
       }
       if (message.to !== 'ALL') {
         const existing = recent();
-        return existing === null ? insert(message) : { ...existing, deduped: true as const };
+        return existing === null ? insert(message) : this.recordRepeat(existing, windowMs);
       }
       // ALL: a retried identical broadcast is the same logical send — it returns the stored row and spends no budget.
       const existing = recent();
-      if (existing !== null) return { ...existing, deduped: true as const };
+      if (existing !== null) return this.recordRepeat(existing, windowMs);
       const now = this.clock();
       const hourStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours())).toISOString();
       const row = this.db.query(`SELECT broadcast_count, summary_id FROM msg_group_all_budget
@@ -767,8 +825,26 @@ export class MsgStore {
       return stored;
     });
     if (posted.deduped) {
-      try { debug.log('msg', 'msg.post.deduped', { msgId: posted.id, from: posted.from, to: posted.to, windowMs }, { level: 'warn' }); }
+      try { debug.log('msg', 'msg.post.deduped', { msgId: posted.id, from: posted.from, to: posted.to, windowMs, repeatCount: posted.repeatCount }, { level: 'warn' }); }
       catch { /* observability is fail-open */ }
+    }
+    // SEAT-MAIL #24 — a sender-entrance reply (options.dedupe === true: `msg post` — `--no-dedupe` skips it — and the
+    // MsgPost tool; the same boundary as #16 dedupe) auto-acks the original for the replying seat: one per-message
+    // ack row (the original leaves that seat's unread set) while every cursor stays untouched (#89448 — an ack never
+    // moves a cursor). Only an original addressed to the replying seat qualifies (original.to === message.from); ALL
+    // broadcasts, group mail and other seats' mail are naturally excluded. A failed auto-ack is a warn, never a post
+    // failure — the reply is already stored.
+    if (options.dedupe === true && message.replyTo !== undefined) {
+      try {
+        const original = this.getMessage(message.replyTo);
+        if (original !== null && original.to === message.from) {
+          this.ackMessage(message.from, message.replyTo, 'acked');
+          posted = { ...posted, autoAcked: message.replyTo };
+        }
+      } catch (error) {
+        try { debug.log('msg', 'msg.post.auto-ack-failed', { msgId: posted.id, replyTo: message.replyTo, from: message.from, error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+        catch { /* observability is fail-open */ }
+      }
     }
     return posted;
   }
@@ -1089,6 +1165,15 @@ export class MsgStore {
     return unreadCountOn(this.db, to);
   }
 
+  /** Count the same unacknowledged, unexpired recipient set as list(), strictly after an explicit ID. */
+  unreadCountAfter(recipient: string, after: number): number {
+    const to = canonicalMessageAddress(recipient);
+    if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+    validCursor(after);
+    const { where, params } = unreadWhereOn(this.db, to, after);
+    return (this.db.query(`SELECT COUNT(*) AS count FROM msg_messages m WHERE ${where}`).get(...params) as { count: number }).count;
+  }
+
   unreadRecipients(): UnreadRecipient[] {
     const hasGroups = this.hasGroupMemberships;
     const hasAcks = hasMessageAckTable(this.db);
@@ -1150,6 +1235,66 @@ export function readUnreadSummary(recipient: string, path: string = defaultMsgSt
   db.exec(`PRAGMA busy_timeout = ${MSG_BUSY_TIMEOUT_MS}`);
   try { return unreadSummaryOn(db, to); }
   finally { db.close(); }
+}
+
+/** Unread mail badge for the els ls listing (OP #100208 · cell 6): count + oldest unacked waiting time. */
+export interface UnreadMailBadge {
+  count: number;
+  /** ISO timestamp of the oldest unread message (최장 대기 anchor) — null when count = 0. */
+  oldestCreatedAt: string | null;
+}
+
+/** Read-only unread badge summary for one seat (els ls 결합용) — absent ledger = null. */
+export function readUnreadMailBadge(recipient: string, path: string = defaultMsgStorePath()): UnreadMailBadge | null {
+  const to = canonicalMessageAddress(recipient);
+  if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
+  if (!existsSync(path)) return null;
+  const db = new Database(path, { readonly: true });
+  db.exec(`PRAGMA busy_timeout = ${MSG_BUSY_TIMEOUT_MS}`);
+  try {
+    const { where, params } = unreadWhereOn(db, to);
+    const row = db.query(`SELECT COUNT(*) AS count, MIN(m.created_at) AS oldest_created_at FROM msg_messages m WHERE ${where}`)
+      .get(...params) as { count: number; oldest_created_at: string | null };
+    return { count: row.count, oldestCreatedAt: row.oldest_created_at ?? null };
+  } finally { db.close(); }
+}
+
+// 출처: JUD #39000 FU — els ls 경로의 우편 DB 대기 상한(잠긴 원장에 pane×5s 로 서버 스레드를 막지 않게).
+export const UNREAD_BADGE_BUSY_TIMEOUT_MS = 100;
+
+/**
+ * Unread badges for several seats in ONE read-only open (JUD #39000 FU): `els ls` asks once per listing, not once
+ * per pane, and waits at most UNREAD_BADGE_BUSY_TIMEOUT_MS on a locked ledger. Absent ledger, a busy/locked ledger
+ * or a seat that cannot be a recipient → null for that seat; never throws.
+ */
+export function readUnreadMailBadges(
+  recipients: Iterable<string>,
+  path: string = defaultMsgStorePath(),
+  busyTimeoutMs: number = UNREAD_BADGE_BUSY_TIMEOUT_MS,
+): Map<string, UnreadMailBadge | null> {
+  const seats = [...new Set(recipients)];
+  const out = new Map<string, UnreadMailBadge | null>(seats.map((seat) => [seat, null]));
+  if (seats.length === 0 || !existsSync(path)) return out;
+  let db: Database;
+  try { db = new Database(path, { readonly: true }); } catch { return out; }
+  try {
+    db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))}`);
+    for (const seat of seats) {
+      try {
+        const to = canonicalMessageAddress(seat);
+        if (to === 'ALL') continue;
+        const { where, params } = unreadWhereOn(db, to);
+        const row = db.query(`SELECT COUNT(*) AS count, MIN(m.created_at) AS oldest_created_at FROM msg_messages m WHERE ${where}`)
+          .get(...params) as { count: number; oldest_created_at: string | null };
+        out.set(seat, { count: row.count, oldestCreatedAt: row.oldest_created_at ?? null });
+      } catch (error) {
+        // This seat shows no badge this time (ls stays fast). A busy/locked ledger stays so for the rest of this
+        // listing — stop asking; a bad address only skips that seat.
+        if (/busy|locked/i.test(error instanceof Error ? error.message : String(error))) break;
+      }
+    }
+  } catch { /* pragma failed: badges stay null */ } finally { db.close(); }
+  return out;
 }
 
 /** The single agent seat the unread set came from (see `UnreadSource`), or null. Read-only; absent ledger = null. */

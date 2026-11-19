@@ -1,6 +1,6 @@
 // els end to end: `side serve` is the one owner process; `side ls/new/read/send` are separate client processes.
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -78,15 +78,13 @@ test('one owner: new/send/read go through the server, a second serve is refused,
   expect(existsSync(join(state, 'els', 'els.sock'))).toBe(true);
   expect((await side(state, cwd, ['ls'])).stderr).toContain('els serve');
 
-  // Restart: a new serve clears the dead socket; the pane is back with its cwd and last screen, without a pty.
+  // Restart: a new serve clears the dead socket; D1a #39136 holder 입양 — the holder keeps the child alive and the replacement server adopts it (ptyId 'h:<pane>'); the pane keeps its cwd and live screen.
   const third = await serve(state);
   expect(third.output()).toContain('listening on');
   const listed = JSON.parse((await side(state, cwd, ['ls'])).stdout) as { panes: { pane: string; cwd: string; ptyId: string; state: string }[] };
-  expect(listed.panes.map((row) => [row.pane, row.cwd, row.ptyId, row.state])).toEqual([[pane, cwd, '', 'idle']]);
+  expect(listed.panes.map((row) => [row.pane, row.cwd, row.ptyId, row.state])).toEqual([[pane, cwd, 'h:' + pane, 'idle']]);
   expect((await side(state, cwd, ['read', pane])).stdout).toContain('els-hi');
-  const refused = await side(state, cwd, ['send', pane, 'x']);
-  expect(refused.exitCode).toBe(1);
-  expect(refused.stderr).toContain('no live pty');
+  expect((await side(state, cwd, ['send', pane, 'x'])).exitCode).toBe(0);
 }, 120_000);
 
 test('a state dir too deep for a Unix socket is reported by serve and by the CLI', async () => {
@@ -282,43 +280,59 @@ Elanous Side (els) — workspaces, tabs and panes in one screen; the command is
 \`els\`. In a terminal, bare \`els\` opens the whole screen.
 
 Options:
-  --list                        print the panes as lines instead of opening the
-                                screen (also what a pipe gets)
-  --side                        open with the side list shown (remembered for
-                                next time)
-  --no-side                     open with the side list hidden (remembered for
-                                next time)
-  -h, --help                    display help for command
+  --list                         print the panes as lines instead of opening the
+                                 screen (also what a pipe gets)
+  --side                         open with the side list shown (remembered for
+                                 next time)
+  --no-side                      open with the side list hidden (remembered for
+                                 next time)
+  --skill                        print the usage guide for coding agents
+                                 (markdown) and exit
+  -h, --help                     display help for command
 
 Commands:
-  supervisor                    The launchd user agent that keeps the els server
-                                running: on · off · status
-  serve [options]               Run the els server: the one owner of the journal
-                                and the pane PTYs (run once, by a supervisor)
-  ls [options]                  List workspaces, tabs and panes as JSON: this
-                                host and the hosts in els/hosts.json (a host
-                                that does not answer is listed as down)
-  new [options] [command...]    Open a pane: the server spawns a PTY and records
-                                ws/tab/pane + cwd in the journal. No command →
-                                $SHELL, no --cwd → this folder, no --ws → the
-                                folder name. Options go BEFORE --
-  read <pane>                   Read a pane: a local pane id, ws/tab/pane, or
-                                host:ws/tab/pane on a registered host
-  send [options] <pane> <text>  Type text into a live pane and press Enter
-                                (--no-enter: text only)
-  do [options] <pane> <text>    Type a line into a pane (local, ws/tab/pane or
-                                host:ws/tab/pane): marked «⇢ from · text»,
-                                queued while the pane's turn is running. A
-                                local pane walks the control door first
-                                (default deny).
-  workspace                     Workspaces (herdr words): list · create · close
-                                · move
-  tab                           Tabs (herdr words): list · move
-  attach <pane>                 Show one pane live in this terminal and type
-                                into it (ctrl+b q detaches; the pane keeps
-                                running)
-  pane                          Panes (herdr words): list · read · send-text ·
-                                send-keys · run · close
+  supervisor                     The launchd user agent that keeps the els
+                                 server running: on · off · status
+  serve [options]                Run the els server: the one owner of the
+                                 journal and the pane PTYs (run once, by a
+                                 supervisor)
+  mcp                            els as an MCP server
+  acp                            els as an ACP agent
+  ls [options]                   List workspaces, tabs and panes as JSON: this
+                                 host and the hosts in els/hosts.json (a host
+                                 that does not answer is listed as down)
+  new [options] [command...]     Open a pane: the server spawns a PTY and
+                                 records ws/tab/pane + cwd in the journal. No
+                                 command → $SHELL, no --cwd → this folder, no
+                                 --ws → the folder name. Options go BEFORE --
+  read <pane>                    Read a pane: a local pane id, ws/tab/pane, or
+                                 host:ws/tab/pane on a registered host
+  status [options] <pane>        What a pane is doing, from the PTY the server
+                                 owns: working/idle/exited/unknown (+ why) ·
+                                 input empty · last output ago · running tool
+  grep <pattern>                 Search the last screen of every pane — this
+                                 host, the registered hosts and the herdr rows —
+                                 for a literal pattern (hits as JSON: address ·
+                                 line · text)
+  send [options] <pane> <text>   Type text into a live pane and press Enter
+                                 (--no-enter: text only)
+  do [options] <pane> <text>     Type a line into a pane (local, ws/tab/pane or
+                                 host:ws/tab/pane): marked «⇢ from · text»,
+                                 queued while the pane's turn is running. A
+                                 local pane walks the control door first
+                                 (default deny).
+  input [options] <pane> <text>  Submit a direct operator line through the owner
+                                 control door
+  workspace                      Workspaces (herdr words): list · create · close
+                                 · move
+  tab                            Tabs (herdr words): list · move
+  attach <pane>                  Show one pane live in this terminal and type
+                                 into it (ctrl+b q detaches; the pane keeps
+                                 running)
+  pane                           Panes (herdr words): list · read · send-text ·
+                                 send-keys · run · close
+
+Agents: run \`els --skill\` for the usage guide (verbs, rules, what not to do).
 `;
   const rootHelpScreen = `Usage: elanous [options] [command]
 
@@ -514,3 +528,21 @@ ACP server (Agent Client Protocol)
   expect(viaRoot.exitCode).toBe(0);
   expect(words(viaRoot.stdout)).toBe(words(rootHelpScreen));
 });
+
+test('els send submits a long bracketed paste through a real owned PTY and observes the turn', async () => {
+  const state = tempDir('els-send-verified-');
+  const server = await serve(state);
+  expect(server.output()).toContain('listening on');
+  const captured = join(state, 'captured.txt');
+  const script = 'import os,sys,tty; tty.setraw(0); os.write(1,b"\\x1b[?2004hREADY\\r\\n"); b=b""\nwhile not b.endswith(b"\\x1b[201~\\r"):\n c=os.read(0,8192)\n if not c: break\n b+=c\nopen(sys.argv[1],"wb").write(b); os.write(1,b"\\r\\nWorking (esc to interrupt)\\r\\n"); import time; time.sleep(5)';
+  const created = await side(state, state, ['new', '--ws', 'HQ', '--cwd', state, '--', 'python3', '-u', '-c', script, captured]);
+  expect(created.exitCode).toBe(0);
+  const pane = (JSON.parse(created.stdout) as { pane: string }).pane;
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && !(await side(state, state, ['read', pane])).stdout.includes('READY')) await Bun.sleep(50);
+  const text = `${'한글'.repeat(4000)}\nsecond line`;
+  const sent = await side(state, state, ['send', pane, text]);
+  expect(sent.exitCode, sent.stderr).toBe(0);
+  expect(sent.stdout).toContain('turn started');
+  expect(readFileSync(captured, 'utf8')).toBe(`\x1b[200~${text}\x1b[201~\r`);
+}, 30000);

@@ -14,17 +14,21 @@ export const TURN_CANCEL_TYPE = 'elanous.next-tui.turn-cancel';
  *  출처: CAPSULE_SYNC_CAP_MS — the longest a synchronous capsule may hold the main turn. */
 export const TURN_CANCEL_GRACE_MS = CAPSULE_SYNC_CAP_MS;
 
+export type TurnCancelReason = 'stall';
+
 export interface TurnCancelMessage {
   readonly type: typeof TURN_CANCEL_TYPE;
   readonly sessionId: string;
   readonly turnId: string;
+  readonly reason?: TurnCancelReason;
 }
 
 export function isTurnCancelMessage(message: unknown): message is TurnCancelMessage {
   if (!message || typeof message !== 'object') return false;
   const value = message as Record<string, unknown>;
   return value.type === TURN_CANCEL_TYPE && typeof value.sessionId === 'string' && value.sessionId.length > 0
-    && typeof value.turnId === 'string' && value.turnId.length > 0;
+    && typeof value.turnId === 'string' && value.turnId.length > 0
+    && (value.reason === undefined || value.reason === 'stall');
 }
 
 /** Cancels kept for a turn that is not listening yet (cold boot · stdin read before listen). 출처: JUD #38560 must ⓑ —
@@ -35,10 +39,10 @@ export const TURN_CANCEL_HELD_MAX = 16;
  *  and applied the moment that turn registers — never swallowed. Turn ids are unique per child, so a late cancel for
  *  a finished turn can never cancel a later one; held ids are bounded by {@link TURN_CANCEL_HELD_MAX}. */
 export function createTurnCancelRouter() {
-  let active: { turnId: string; onCancel: () => void } | null = null;
-  const held: string[] = [];
-  const fire = (onCancel: () => void): void => {
-    try { onCancel(); } catch { /* the turn still settles through its own abort path */ }
+  let active: { turnId: string; onCancel: (reason?: TurnCancelReason) => void } | null = null;
+  const held: Array<{ turnId: string; reason?: TurnCancelReason }> = [];
+  const fire = (onCancel: (reason?: TurnCancelReason) => void, reason?: TurnCancelReason): void => {
+    try { onCancel(reason); } catch { /* the turn still settles through its own abort path */ }
   };
   return {
     /** True when the message was a turn-cancel (applied now or held for its turn); false lets other routers see it. */
@@ -47,18 +51,18 @@ export function createTurnCancelRouter() {
       if (active && active.turnId === message.turnId) {
         const { onCancel } = active;
         active = null;
-        fire(onCancel);
-      } else if (!held.includes(message.turnId)) {
-        held.push(message.turnId);
+        fire(onCancel, message.reason);
+      } else if (!held.some((entry) => entry.turnId === message.turnId)) {
+        held.push({ turnId: message.turnId, reason: message.reason });
         if (held.length > TURN_CANCEL_HELD_MAX) held.shift();
       }
       return true;
     },
-    listen(turnId: string, onCancel: () => void): () => void {
-      const index = held.indexOf(turnId);
+    listen(turnId: string, onCancel: (reason?: TurnCancelReason) => void): () => void {
+      const index = held.findIndex((entry) => entry.turnId === turnId);
       if (index >= 0) {
-        held.splice(index, 1);
-        fire(onCancel);
+        const [entry] = held.splice(index, 1);
+        fire(onCancel, entry?.reason);
         return () => { /* already cancelled */ };
       }
       const entry = { turnId, onCancel };

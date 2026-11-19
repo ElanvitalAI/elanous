@@ -206,7 +206,10 @@ actions:
     if (priorEnv.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = priorEnv.OPENAI_API_KEY;
   });
 
-  test('sim suite creates its own isolated root and reports an unconnected real target as unmeasured', async () => {
+  // #36802 (11-11, «require explicit test universe for real targets») landed after these two tests (#36347 · #36365, 11-10)
+  // and changed the contract: a real target is refused before anything runs — without an explicit --test universe, or
+  // without the four safety guard declarations. MAIN-BASELINE-RED-CLEAR.
+  test('sim suite refuses a real target without an explicit --test universe, and still cleans up the root it made', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sim-suite-real-'));
     roots.push(root);
     priorTestRoot = getTestStateRoot();
@@ -221,14 +224,16 @@ actions:
     process.exitCode = 0;
     const program = new Command();
     registerSimCommands(program);
+    const errors: string[] = [];
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
     await program.parseAsync(['node', 'test', 'sim', 'suite', suite, '--target', 'real']);
-    expect(output).toHaveLength(1);
-    expect(JSON.parse(output[0]!)).toMatchObject({ scenario: 'incident', field: 'target', actual: 'unmeasured: target runner unavailable' });
-    expect(process.exitCode).toBe(1);
+    expect(output).toEqual([]);
+    expect(errors).toEqual(['sim suite: real scenario target requires an explicit --test universe']);
+    expect(process.exitCode).toBe(2);
     expect(getTestStateRoot()).toBeUndefined();
   });
 
-  test('real suite stays unmeasured when no isolated worker is available', async () => {
+  test('a real suite inside a --test universe is refused when the scenario declares no safety guards', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sim-suite-target-'));
     roots.push(root);
     priorTestRoot = getTestStateRoot();
@@ -245,9 +250,12 @@ actions:
     process.exitCode = 0;
     const program = new Command();
     registerSimCommands(program);
+    const errors: string[] = [];
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
     await program.parseAsync(['node', 'test', 'sim', 'suite', suite, '--target', 'real', '--update-baseline']);
-    expect(output).toEqual([JSON.stringify({ scenario: 'incident', field: 'target', baseline: 'real', actual: 'unmeasured: target runner unavailable' })]);
-    expect(process.exitCode).toBe(1);
+    expect(output).toEqual([]);
+    expect(errors).toEqual(['sim suite: real target requires all four safety guard declarations']);
+    expect(process.exitCode).toBe(2);
   });
 
   test('sim watch streams world observation rows from the isolated test world', async () => {

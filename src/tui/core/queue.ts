@@ -1,7 +1,10 @@
 import { debug } from '../../debug/log.js';
+import { TURN_EVENT_SOURCES } from '../../turn-capsule/contract.js';
 import { emitTurnLife } from '../../debug/turn-life.js';
 import { detectReplacementCandidate, type ReplacementCandidate, type ReplacementDetection } from '../../chat/queue-supersede.js';
 import { pushNowToolDecision } from './tool-interrupt-class.js';
+
+export type NextTuiQueueInterruptReason = 'interrupt' | 'esc' | 'timeout-15m' | 'stream-stall';
 
 export type NextTuiQueueSettle =
   | { kind: 'none' }
@@ -16,7 +19,8 @@ export interface NextTuiSettledTurn { readonly text: string; readonly responded:
 
 export type NextTuiQueueDequeue =
   | { kind: 'none' }
-  | { kind: 'submit'; id: string; text: string; remaining: number; afterInterrupt: boolean; itemKind: NextTuiQueueItemKind; source?: NextTuiQueueNoticeSource; occurredAt?: number };
+  /** SEAT-INBOX B1-C — dequeue 뒤에도 ledger msgId(우편 영수 키)가 떨어지지 않는다(#38804 eventId 사슬). */
+  | { kind: 'submit'; id: string; text: string; remaining: number; afterInterrupt: boolean; interruptReason?: NextTuiQueueInterruptReason; itemKind: NextTuiQueueItemKind; source?: NextTuiQueueNoticeSource; occurredAt?: number; msgId?: number };
 
 /**
  * ELN-QUEUE-ITEM-STATE (CONDUCTOR ELN-STEER-AND-TOOL-WATCHDOG §6 «입력 큐 항목»).
@@ -47,6 +51,8 @@ export interface NextTuiQueueItem {
   readonly id: string;
   /** Monotonic per queue (= per TUI session); never renumbered, not even when an item is superseded. */
   readonly seq: number;
+  /** When this queue accepted the item, in epoch milliseconds. */
+  readonly enqueuedAt?: number;
   readonly kind: NextTuiQueueItemKind;
   readonly mode: NextTuiQueueMode;
   readonly delivery: NextTuiQueueDelivery;
@@ -60,6 +66,7 @@ export interface NextTuiQueueItem {
   readonly source?: NextTuiQueueNoticeSource;
   /** SEAT-INBOX B1-C: the ledger message a `seat-mail` notice carries — the receipt key (never parsed from text). */
   readonly msgId?: number;
+  readonly urgent?: boolean;
   /**
    * When a notice existed, if the producer knows. Absent means unknown.
    * The zero-miss receipt must not treat unknown as a zero wait.
@@ -72,6 +79,7 @@ export interface NextTuiQueueItem {
   readonly replacementCandidateFor?: string;
   /** The first item resubmitted after Esc carries the interrupted-on-purpose line. */
   readonly afterInterrupt?: boolean;
+  readonly interruptReason?: NextTuiQueueInterruptReason;
 }
 
 export type NextTuiQueueOp = 'deliver' | 'cancel' | 'supersede';
@@ -97,6 +105,7 @@ const defaultQueueLog: NextTuiQueueLog = (event, data) => debug.log('queue', eve
 interface MutableItem {
   id: string;
   seq: number;
+  enqueuedAt: number;
   kind: NextTuiQueueItemKind;
   mode: NextTuiQueueMode;
   delivery: NextTuiQueueDelivery;
@@ -106,9 +115,11 @@ interface MutableItem {
   supersededBy?: string;
   source?: NextTuiQueueNoticeSource;
   msgId?: number;
+  urgent?: boolean;
   occurredAt?: number;
   replacementCandidateFor?: string;
   afterInterrupt?: boolean;
+  interruptReason?: NextTuiQueueInterruptReason;
 }
 
 /** SEAT-INBOX B1-C: told after an item leaves `queued` (delivered · cancelled · superseded). */
@@ -126,6 +137,10 @@ function snapshot(item: MutableItem): NextTuiQueueItem {
  */
 function deliveryOrder(a: MutableItem, b: MutableItem): number {
   if (a.kind !== b.kind) return a.kind === 'user' ? -1 : 1;
+  if (a.kind === 'notice' && a.urgent !== b.urgent) {
+    const rank = (item: MutableItem) => TURN_EVENT_SOURCES.indexOf(item.urgent ? 'urgent-mail' : 'mail');
+    return rank(a) - rank(b);
+  }
   if (a.delivery !== b.delivery) return a.delivery === 'steer' ? -1 : 1;
   return a.seq - b.seq;
 }
@@ -135,6 +150,7 @@ export interface NextTuiQueueBatchItem {
   readonly kind: NextTuiQueueItemKind;
   readonly text: string;
   readonly afterInterrupt: boolean;
+  readonly interruptReason?: NextTuiQueueInterruptReason;
 }
 
 /**
@@ -154,6 +170,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   const byId = new Map<string, MutableItem>();
   let lastSeq = 0;
   let interrupted = false;
+  let interruptReason: NextTuiQueueInterruptReason = 'interrupt';
+  let resumeReason: NextTuiQueueInterruptReason | undefined;
   /** ELN-QUEUE-SUPERSEDE: detected «대체 후보» by the new item's id (targets · correction word for the lines). */
   const candidates = new Map<string, ReplacementCandidate>();
 
@@ -172,15 +190,15 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   };
   const queued = (): MutableItem[] => waiting;
   const ordered = (): MutableItem[] => [...waiting].sort(deliveryOrder);
-  const leave = (item: MutableItem): void => { waiting = waiting.filter((other) => other !== item); };
+  const leave = (item: MutableItem): void => { waiting = waiting.filter((other) => other !== item); if (waiting.length === 0) resumeReason = undefined; };
 
   /**
    * §6 invariant 7: accepting an item never stops current execution — this only appends.
    * §6 invariant 10: accepting an item never revises other items — no cancel, no supersede here.
    */
-  const accept = (fields: Omit<MutableItem, 'id' | 'seq' | 'status'>): NextTuiQueueItem => {
+  const accept = (fields: Omit<MutableItem, 'id' | 'seq' | 'status' | 'enqueuedAt'>): NextTuiQueueItem => {
     const seq = ++lastSeq;
-    const item: MutableItem = { id: `q${seq}`, seq, status: 'queued', ...fields };
+    const item: MutableItem = { id: `q${seq}`, seq, enqueuedAt: Date.now(), status: 'queued', ...fields };
     byId.set(item.id, item);
     waiting = [...waiting, item];
     // OBSERVE-TURN-EVENT-LIFECYCLE — accepted(=queued). busy 는 큐가 모른다(entry 의 몫) → 생략.
@@ -207,10 +225,14 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
   };
 
   const deliver = (item: MutableItem, boundary: NextTuiQueueBoundary): void => {
+    if (boundary === 'idle' && resumeReason !== undefined) {
+      item.afterInterrupt = true;
+      if (resumeReason !== 'interrupt') item.interruptReason = resumeReason;
+      resumeReason = undefined;
+    }
     item.status = 'delivered';
     leave(item);
-    // OBSERVE-TURN-EVENT-LIFECYCLE — item 이 enqueue 시각을 안 가지므로 waitMs 는 생략(r1 확정).
-    try { turnLifeLog('turn-life:event-dequeued', { itemId: item.id, eventId: item.msgId ?? item.id, source: item.source ?? null, boundary }); } catch { /* observability is fail-open */ }
+    try { turnLifeLog('turn-life:event-dequeued', { itemId: item.id, eventId: item.msgId ?? item.id, source: item.source ?? null, boundary, waitMs: Math.max(0, Date.now() - item.enqueuedAt) }); } catch { /* observability is fail-open */ }
     log('delivered', { id: item.id, seq: item.seq, delivery: item.delivery, boundary });
     notifyTransition(item);
   };
@@ -281,7 +303,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
      * A completion notice. It always waits behind user utterances and never steers the running turn:
      * seat mail that lands during a turn stays `queue` until the idle door opens the next turn.
      */
-    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number } = {}): NextTuiQueueItem {
+    enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta: { msgId?: number; occurredAt?: number; urgent?: boolean } = {}): NextTuiQueueItem {
       return accept({
         kind: 'notice',
         mode: 'chat',
@@ -289,6 +311,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         text,
         source,
         ...(meta.msgId === undefined ? {} : { msgId: meta.msgId }),
+        ...(meta.urgent ? { urgent: true } : {}),
         ...(meta.occurredAt === undefined ? {} : { occurredAt: meta.occurredAt }),
       });
     },
@@ -384,7 +407,10 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
       for (const item of recalled) cancel(item, 'recalled');
       return { text, count: recalled.length, steerIds };
     },
-    markInterrupted(): void { interrupted = true; },
+    markInterrupted(reason: NextTuiQueueInterruptReason = 'interrupt'): void {
+      if (!interrupted) interruptReason = reason;
+      interrupted = true;
+    },
     settle(_draft: string, turn?: NextTuiSettledTurn): NextTuiQueueSettle {
       const pending = queued();
       if (interrupted) {
@@ -402,8 +428,8 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
           item.delivery = 'queue';
           delete item.steerId;
         }
-        // Only the first resubmitted item carries the interrupted-on-purpose line (§6 invariant 4).
-        ordered()[0]!.afterInterrupt = true;
+        // The first actual idle delivery carries the interruption metadata (§6 invariant 4).
+        resumeReason ??= interruptReason;
         return { kind: 'resubmit', count: pending.length };
       }
       return pending.length > 0 ? { kind: 'wake' } : { kind: 'none' };
@@ -423,7 +449,9 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         text: next.text,
         remaining: queued().length,
         afterInterrupt: next.afterInterrupt === true,
+        ...(next.interruptReason === undefined ? {} : { interruptReason: next.interruptReason }),
         ...(next.occurredAt === undefined ? {} : { occurredAt: next.occurredAt }),
+        ...(next.msgId === undefined ? {} : { msgId: next.msgId }), // 출처: #38804 — dequeue 후에도 eventId 사슬(msgId ?? id)이 유지된다
       };
     },
     /**
@@ -438,7 +466,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
       const batch: MutableItem[] = [head];
       if (head.mode === 'chat') {
         for (const next of order.slice(1)) {
-          if (next.kind !== head.kind || next.mode !== 'chat') break;
+          if (next.kind !== head.kind || next.mode !== 'chat' || !!next.urgent !== !!head.urgent) break;
           batch.push(next);
         }
       }
@@ -447,7 +475,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
         kind: 'batch',
         mode: head.mode,
         itemKind: head.kind,
-        items: batch.map((item) => ({ id: item.id, kind: item.kind, text: item.text, afterInterrupt: item.afterInterrupt === true })),
+        items: batch.map((item) => ({ id: item.id, kind: item.kind, text: item.text, afterInterrupt: item.afterInterrupt === true, ...(item.interruptReason === undefined ? {} : { interruptReason: item.interruptReason }) })),
         remaining: queued().length,
       };
     },

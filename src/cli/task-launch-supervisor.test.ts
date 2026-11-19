@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn as nodeSpawn } from 'node:child_process';
+import { reconcileLateLaunchFailure } from '../task-agent/late-launch-failure.js';
 
 const supervisorPath = fileURLToPath(new URL('./task-launch-supervisor.ts', import.meta.url));
 
@@ -24,6 +25,59 @@ afterAll(() => {
 async function retain() {
   return import('./task-launch-supervisor.js');
 }
+
+test('late supervisor failure marks only its bound launched card failed', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
+  const statePath = join(scratch, 'cards.json');
+  const stderrPath = join(scratch, 'run-retain-late.stderr');
+  writeFileSync(statePath, JSON.stringify({ tasks: {
+    'ta-late': { id: 'ta-late', status: 'launched', runId: 'run-retain-late', history: [] },
+    'ta-other': { id: 'ta-other', status: 'launched', runId: 'run-other', history: [] },
+  } }));
+  const fd = openSync(stderrPath, 'w');
+  try {
+    const child = nodeSpawn(process.execPath, [supervisorPath, scratch, String(process.pid), process.execPath, '-e',
+      "process.stderr.write('error: late exit\\n'); process.exit(2)"], {
+      stdio: ['ignore', 'ignore', fd], env: { ...process.env, ELANOUS_TASK_CARD_ID: 'ta-late', ELANOUS_TASK_STATE_PATH: statePath },
+    });
+    await new Promise<void>((done) => child.once('exit', () => done()));
+    const cards = JSON.parse(readFileSync(statePath, 'utf8')).tasks;
+    expect(cards['ta-late'].status).toBe('launch-failed');
+    expect(cards['ta-late'].history.at(-1).detail).toContain('late exit');
+    expect(cards['ta-other'].status).toBe('launched');
+    expect(stopLines('run-retain-late')).toHaveLength(1);
+  } finally {
+    closeSync(fd);
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('late failure reconciliation handles a stop before card binding and never overwrites a newer run', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
+  const statePath = join(scratch, 'cards.json');
+  try {
+    writeFileSync(join(scratch, 'run-retain-race.stderr'), 'error: raced exit\n');
+    const ledgerDir = join(stateDir, 'run-ledger');
+    mkdirSync(ledgerDir, { recursive: true });
+    writeFileSync(join(ledgerDir, 'run-retain-race.jsonl'), `${JSON.stringify({ timestamp: new Date().toISOString(),
+      runId: 'run-retain-race', event: 'stop', data: { cause: 'existing child stop' } })}\n`);
+    writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-race': { id: 'ta-race', status: 'handed', history: [] } } }));
+    const previousCard = process.env.ELANOUS_TASK_CARD_ID, previousPath = process.env.ELANOUS_TASK_STATE_PATH;
+    process.env.ELANOUS_TASK_CARD_ID = 'ta-race'; process.env.ELANOUS_TASK_STATE_PATH = statePath;
+    try { await (await retain()).retainLaunchFailureEvidence(scratch, 2); }
+    finally {
+      if (previousCard === undefined) delete process.env.ELANOUS_TASK_CARD_ID; else process.env.ELANOUS_TASK_CARD_ID = previousCard;
+      if (previousPath === undefined) delete process.env.ELANOUS_TASK_STATE_PATH; else process.env.ELANOUS_TASK_STATE_PATH = previousPath;
+    }
+    writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-race': { id: 'ta-race', status: 'launched', runId: 'run-newer', history: [] } } }));
+    reconcileLateLaunchFailure(statePath, 'ta-race', 'run-retain-race');
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks['ta-race'].status).toBe('launched');
+    writeFileSync(statePath, JSON.stringify({ tasks: { 'ta-race': { id: 'ta-race', status: 'launched', runId: 'run-retain-race', history: [] } } }));
+    reconcileLateLaunchFailure(statePath, 'ta-race', 'run-retain-race');
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).tasks['ta-race'].status).toBe('launch-failed');
+    expect(stopLines('run-retain-race')).toHaveLength(1);
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+});
 
 function stopLines(runId: string): Array<{ event: string; data: Record<string, unknown> }> {
   const ledger = join(stateDir, 'run-ledger', `${runId}.jsonl`);

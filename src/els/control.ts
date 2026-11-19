@@ -2,7 +2,7 @@
 // Principal → authorize → classify → (HITL) → audit intent → execute → audit result.
 // The transport builds the Principal (CLI = local OS uid · HTTP = PAT · webhook = signing key id · MCP/ACP = session token).
 // A tool argument or a typed `--from` never becomes one; `from` is only shown.
-// Default is deny: a missing, empty or broken allow list authorizes nobody.
+// Other actions default deny; authenticated OP/RES-INFRA input has a code default, subject to explicit deny.
 // Allow rules are keyed by stable ids. A name in a rule is resolved and pinned to that id the first time the door
 // loads it (REVIEW-1 must ③): the pinned list keeps ids, so a rename does not move a permission and a name later
 // reused by a new workspace or pane inherits nothing; a name that does not resolve drops the rule until it does.
@@ -11,26 +11,34 @@
 // reason values never quote the text (REVIEW-1 must ②). The shown `from` is stored the same way — chars and a
 // sha256, never the free-input value (a495bddd8d review: audit from).
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { clean, type QueueAudit } from './core.js';
 import { classifyShellArgv, simpleArgv, type AllowShape } from '../security/shell-argv-policy.js';
 import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-export const CONTROL_ACTIONS = ['read', 'do', 'new', 'status', 'list'] as const;
+export const CONTROL_ACTIONS = ['read', 'do', 'input', 'new', 'status', 'list', 'rename', 'move', 'close'] as const;
+
+/** OP #17 OP-DIRECT-SEAT-INPUT: `input` is the operator's direct line into a seat — these principal ids only. */
+const INPUT_SEATS = ['OP', 'RES-INFRA'];
 export type ControlAction = (typeof CONTROL_ACTIONS)[number];
 
-export const PRINCIPAL_KINDS = ['cli', 'eln', 'http-token', 'webhook', 'mcp-stdio', 'mcp-http'] as const;
+export const PRINCIPAL_KINDS = ['cli', 'eln', 'http-token', 'webhook', 'mcp-stdio', 'mcp-http', 'acp-session'] as const;
 export type PrincipalKind = (typeof PRINCIPAL_KINDS)[number];
 
 /** Built by the transport. Never accepted from a tool argument. */
 export interface Principal {
   readonly id: string;
   readonly kind: PrincipalKind;
+  readonly callerPane?: string;
+  readonly callerSeat?: string;
 }
 
 export interface ControlTarget {
   /** Workspace id the pane belongs to. */
   readonly workspace: string;
+  /** Tab id. ELS-DOOR-STRUCT-OPS: tab-scoped structural actions name their tab here. */
+  readonly tab?: string;
   /** Pane id. */
   readonly pane: string;
   /** Only a shell pane is danger-classified. An agent pane is typed text, not a shell command. */
@@ -51,11 +59,25 @@ export interface HitlRequest {
 /** Ask a person. `timeout` and `deny` both mean the line is not sent. */
 export type HitlAsk = (request: HitlRequest) => Promise<HitlAnswer>;
 
+/** ELS-DOOR-STRUCT-OPS: the payload a structural action carries — `kind`+`id` name the object, `name` renames, `before` reorders. */
+export interface StructPayload {
+  readonly kind: 'workspace' | 'tab' | 'pane';
+  readonly id: string;
+  readonly name?: string;
+  readonly before?: string;
+}
+
 export interface ControlExecuteInput {
   readonly principal: Principal;
   readonly action: ControlAction;
   readonly target: ControlTarget;
   readonly text?: string;
+  /** ELS-DOOR-STRUCT-OPS: rename/move/close payload the executor routes to core. */
+  readonly struct?: StructPayload;
+  /** ELS-DOOR-STRUCT-OPS: human confirmation marker. `close` demands `true`; anything else is denied. */
+  readonly confirm?: boolean;
+  /** Forward to core.inputLine for queued delivery lifecycle auditing. */
+  readonly queueAudit?: QueueAudit;
 }
 
 export interface ControlExecuteResult {
@@ -74,7 +96,12 @@ export interface AllowRule {
   readonly workspace: string;
   /** Pane id. `*` matches every pane. */
   readonly pane: string;
+  /** ELS-DOOR-STRUCT-OPS: tab id. `*` or absent = every tab. A present tab id scopes the rule to that tab only. */
+  readonly tab?: string;
   readonly actions: readonly ControlAction[];
+  readonly seat?: string;
+  /** Explicit input deny overrides the code default; omitted means the legacy allow. */
+  readonly effect?: 'allow' | 'deny';
 }
 
 /** Name-or-id → stable id, from the owner's journal. Unknown = undefined. */
@@ -109,17 +136,20 @@ const ALLOW_NAME = 'control-allow.json';
 /** One allow-list row, or undefined when the row is not a rule or a name in it does not resolve. */
 function parseRule(value: unknown, resolve: IdResolver | undefined): AllowRule | undefined {
   if (!value || typeof value !== 'object') return undefined;
-  const row = value as { principal?: unknown; workspace?: unknown; pane?: unknown; actions?: unknown };
+  const row = value as { principal?: unknown; workspace?: unknown; pane?: unknown; tab?: unknown; actions?: unknown; seat?: unknown; effect?: unknown };
   if (typeof row.principal !== 'string' || typeof row.workspace !== 'string' || typeof row.pane !== 'string') return undefined;
+  if (row.tab !== undefined && typeof row.tab !== 'string') return undefined;
   if (!row.principal || !row.workspace || !row.pane) return undefined;
   if (!Array.isArray(row.actions)) return undefined;
+  if (row.effect !== undefined && row.effect !== 'allow' && row.effect !== 'deny') return undefined;
+  if (row.seat !== undefined && (typeof row.seat !== 'string' || !row.seat)) return undefined;
   const actions = row.actions.filter((action): action is ControlAction =>
     typeof action === 'string' && (CONTROL_ACTIONS as readonly string[]).includes(action));
   if (actions.length !== row.actions.length || actions.length === 0) return undefined;
   const workspace = row.workspace === '*' || !resolve ? row.workspace : resolve.workspace(row.workspace);
   const pane = row.pane === '*' || !resolve ? row.pane : resolve.pane(row.pane);
   if (!workspace || !pane) return undefined;
-  return { principal: row.principal, workspace, pane, actions };
+  return { principal: row.principal, workspace, pane, tab: row.tab, actions, ...(typeof row.seat === 'string' ? { seat: row.seat } : {}), ...(row.effect ? { effect: row.effect } : {}) };
 }
 
 /** Missing, empty or broken file = nobody. A row that is not a rule, or names what does not exist, is dropped. */
@@ -137,44 +167,50 @@ export function loadAllowList(stateDir: string, resolve?: IdResolver): readonly 
  * authorizes nobody until it resolves.
  *
  * a495bddd8d review: the rewrite is a unique stash plus rename, and it lands only when the file is still what
- * this run read — a revocation or concurrent edit that lands mid-run is never overwritten (that run loads the
- * admin's version instead). A pin whose write fails denies its row for this run: an unpinned name must not carry
- * a permission (fail closed).
+ * this run read — a revocation or concurrent edit that lands mid-run is never overwritten. A failed pin or
+ * concurrent change denies this entire request: neither an unpinned
+ * name nor a stale policy snapshot may be used for authorization.
  */
 export function pinAllowList(stateDir: string, resolve?: IdResolver, seams?: { readonly beforePin?: () => void }): readonly AllowRule[] {
   const file = join(stateDir, ALLOW_NAME);
-  const current = (): string => { try { return readFileSync(file, 'utf8'); } catch { return ''; } };
-  const raw = current();
-  let rows: readonly unknown[];
-  try {
-    const parsed = JSON.parse(raw) as { rules?: unknown };
-    if (!Array.isArray(parsed.rules)) return [];
-    rows = parsed.rules;
-  } catch { return []; }
-  const pinned = rows.map((row) => {
-    const rule = parseRule(row, resolve);
+  let raw: string;
+  try { raw = readFileSync(file, 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { rules?: unknown }).rules)) throw new Error('invalid control policy shape');
+  const rows: readonly unknown[] = (parsed as { rules: unknown[] }).rules;
+  const resolved = rows.map((row) => {
+    const shape = parseRule(row, undefined);
+    if (!shape) throw new Error('invalid control policy rule');
+    const rule = resolve ? parseRule(row, resolve) : shape;
+    if (shape.effect === 'deny' && !rule) throw new Error('unresolved control deny');
+    return rule;
+  });
+  const pinned = rows.map((row, index) => {
+    const rule = resolved[index];
     if (!rule || !resolve) return row;
     const named = row as { workspace?: string; pane?: string };
     return rule.workspace === named.workspace && rule.pane === named.pane
       ? row
-      : { principal: rule.principal, workspace: rule.workspace, pane: rule.pane, actions: rule.actions };
+      : { principal: rule.principal, workspace: rule.workspace, pane: rule.pane, actions: rule.actions, ...(rule.seat ? { seat: rule.seat } : {}), ...(rule.effect ? { effect: rule.effect } : {}) };
   });
   if (resolve && pinned.some((row, index) => row !== rows[index])) {
     const stash = `${file}.pin.${process.pid}.${Date.now()}`;  // a stash no concurrent pin overwrites
     try {
       seams?.beforePin?.();
       writeFileSync(stash, `${JSON.stringify({ rules: pinned }, null, 2)}\n`, { mode: 0o600 });
-      if (current() === raw) renameSync(stash, file);
-      else { rmSync(stash, { force: true }); return loadAllowList(stateDir, resolve); }  // the file changed under us: keep the admin's version
+      if (readFileSync(file, 'utf8') === raw) renameSync(stash, file);
+      else { rmSync(stash, { force: true }); throw new Error('control policy changed during pin'); }
     } catch (error) {
       try { rmSync(stash, { force: true }); } catch { /* the stash never landed */ }
       process.stderr.write(`els: control allow list not pinned: ${error instanceof Error ? error.message : String(error)}\n`);
-      const kept: AllowRule[] = [];
-      pinned.forEach((row, index) => { if (row === rows[index]) { const rule = parseRule(row, resolve); if (rule) kept.push(rule); } });
-      return kept;
+      throw error; // Neither stale grants nor unpinned denies are safe for this request.
     }
   }
-  return pinned.flatMap((row) => { const rule = parseRule(row, resolve); return rule ? [rule] : []; });
+  return resolved.filter((rule): rule is AllowRule => rule !== undefined);
 }
 
 function matches(pattern: string, value: string): boolean {
@@ -185,9 +221,10 @@ function matches(pattern: string, value: string): boolean {
 export function authorize(rules: readonly AllowRule[], principal: Principal, target: ControlTarget, action: ControlAction): boolean {
   if (!principal.id || !PRINCIPAL_KINDS.includes(principal.kind)) return false;
   return rules.some((rule) =>
-    matches(rule.principal, principal.id)
+    rule.effect !== 'deny' && matches(rule.principal, principal.id)
     && matches(rule.workspace, target.workspace)
     && matches(rule.pane, target.pane)
+    && (rule.tab === undefined || (target.tab !== undefined && matches(rule.tab, target.tab)))
     && rule.actions.includes(action));
 }
 
@@ -269,6 +306,19 @@ const ELS_ALLOW_SHAPES: readonly AllowShape[] = [
 
 /** A shell line is safe only when no danger rule matches, it has no shell syntax, and its argv is on the allow
  *  list by exact shape (shared module `classifyShellArgv`). The reason never quotes the line: no body in the audit ledger. */
+/** OP #17 OP-DIRECT-SEAT-INPUT: a shell-pane `input` line is the operator's own typing, not a tool-authored
+ * command — the safe-argv allow list never applies. Only the danger table (and shape) gates it, so a plain
+ * word reaches the pane and a dangerous line is held for a person. */
+export function classifyInputLine(text: string): { readonly dangerous: true; readonly reason: string } | { readonly dangerous: false; readonly reason: 'safe' } {
+  const line = text.trim();
+  if (!line) return { dangerous: true, reason: 'empty command cannot be classified' };
+  if (/[\n\r\u0000]/.test(text)) return { dangerous: true, reason: 'an input line is one line' };
+  for (const rule of DANGER) {
+    if (rule.re.test(line)) return { dangerous: true, reason: rule.reason };
+  }
+  return { dangerous: false, reason: 'safe' };
+}
+
 export function classifyShell(text: string): { readonly dangerous: true; readonly reason: string } | { readonly dangerous: false; readonly reason: 'safe' } {
   const line = text.trim();
   if (!line) return { dangerous: true, reason: 'empty command cannot be classified' };
@@ -319,23 +369,70 @@ export function createControl(deps: ControlDeps) {
     }
   };
   return {
-    async run(input: { readonly principal: Principal; readonly from?: string; readonly action: ControlAction; readonly target: ControlTarget; readonly text?: string }): Promise<ControlOutcome> {
+    async run(input: { readonly principal: Principal; readonly from?: string; readonly action: ControlAction; readonly target: ControlTarget; readonly text?: string; readonly struct?: StructPayload; readonly confirm?: boolean }): Promise<ControlOutcome> {
       const text = input.text ?? '';
+      // Input is delivered as a sanitized line; audit that line consistently throughout its lifecycle.
+      const auditedText = input.action === 'input' ? clean(text) : text;
       const from = input.from ?? input.principal.id;
+      // ELS-DOOR-STRUCT-OPS: close destroys work. It must carry a human confirmation marker; nothing else closes.
+      if (input.action === 'close' && input.confirm !== true) {
+        const reason = 'close needs confirm:true (human confirmation)';
+        audit({ principal: input.principal.id, kind: input.principal.kind, workspace: input.target.workspace, tab: input.target.tab, pane: input.target.pane, action: input.action, result: 'denied', danger: 'n/a', reason, chars: 0, sha256: sha256(''), at: now() });
+        return { ok: false, code: 'denied', reason, message: `els close: denied for ${input.principal.id} (${reason})` };
+      }
       const base = {
-        principal: input.principal.id, kind: input.principal.kind, fromChars: from.length, fromSha256: sha256(from),
+        ...(input.action === 'input' ? { requestId: randomUUID() } : {}),
+        principal: input.principal.id, kind: input.principal.kind, callerPane: input.principal.callerPane, seat: input.principal.callerSeat, fromChars: from.length, fromSha256: sha256(from),
         workspace: input.target.workspace, pane: input.target.pane, action: input.action,
-        chars: text.length, sha256: sha256(text), at: now(),
+        chars: auditedText.length, sha256: sha256(auditedText), at: now(),
       };
-      const rules = pinAllowList(deps.stateDir, deps.resolve);
-      if (!authorize(rules, input.principal, input.target, input.action)) {
-        const reason = 'not in control-allow.json';
-        audit({ ...base, result: 'denied', danger: 'n/a', reason });
-        return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied for ${input.principal.id} (not in control-allow.json)` };
+      let rules: readonly AllowRule[];
+      try { rules = pinAllowList(deps.stateDir, deps.resolve); }
+      catch {
+        const reason = 'control policy unavailable';
+        const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason });
+        if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
+        return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied (${reason})` };
+      }
+      // OP #17: a shell-pane `input` line is danger-gated FIRST (fail closed — a dangerous line is held before
+      // any allow question, same gate as `do`); the builtin seat default then decides the rest.
+      const inputDanger = input.action === 'input' && input.target.shell ? classifyInputLine(text) : undefined;
+      if (inputDanger?.dangerous) {
+        if (!deps.hitl) {
+          const reason = `${inputDanger.reason}; no person to ask`;
+          audit({ ...base, result: 'held', danger: inputDanger.reason, reason });
+          return { ok: false, code: 'held', reason, message: `els input: held, not sent (${inputDanger.reason}; nobody to approve)` };
+        }
+        const answer = await deps.hitl({ principal: input.principal, from, action: input.action, target: input.target, text, reason: inputDanger.reason });
+        if (answer !== 'approve') {
+          const code = answer === 'timeout' ? 'timeout' : 'rejected';
+          audit({ ...base, result: code, danger: inputDanger.reason, reason: answer });
+          return { ok: false, code, reason: inputDanger.reason, message: `els input: ${answer}, not sent (${inputDanger.reason})` };
+        }
+      }
+      // The socket transport authenticates callerSeat/callerPane, then revalidates at execution.
+      // File denies override the built-in input rule; legacy allow rows cannot grant input.
+      const principal = input.principal;
+      const inputDefault = input.action === 'input' && principal.kind === 'cli'
+        && /^local:\d+$/.test(principal.id) && !!principal.callerPane
+        && INPUT_SEATS.includes(principal.callerSeat ?? '');
+      const inputDenied = input.action === 'input' && rules.some((rule) => rule.effect === 'deny'
+        && matches(rule.principal, principal.id) && matches(rule.workspace, input.target.workspace)
+        && matches(rule.pane, input.target.pane) && rule.actions.includes('input')
+        && (rule.seat === undefined || rule.seat === principal.callerSeat));
+      const permitted = input.action === 'input' ? inputDefault && !inputDenied
+        : authorize(rules, principal, input.target, input.action);
+      const authorization = input.action === 'input' && inputDefault && !inputDenied ? 'builtin-input' : undefined;
+      if (!permitted) {
+        const reason = inputDenied ? 'explicit input deny' : 'not in control-allow.json';
+        const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason });
+        if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
+        return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied for ${input.principal.id} (${reason})` };
       }
       const refused = deps.guard ? deps.guard(input) : undefined;
       if (refused !== undefined) {
-        audit({ ...base, result: 'denied', danger: 'n/a', reason: refused });
+        const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason: refused });
+        if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
         return { ok: false, code: 'denied', reason: refused, message: `els ${input.action}: denied (${refused})` };
       }
       const danger = input.action === 'do' && input.target.shell ? classifyShell(text) : { dangerous: false as const, reason: 'safe' as const };
@@ -353,22 +450,33 @@ export function createControl(deps: ControlDeps) {
         }
       }
       const verdict = danger.dangerous ? 'approved' : 'safe';
-      const intentFailed = audit({ ...base, result: 'executing', danger: verdict });
+      const authorizedBase = authorization ? { ...base, authorization } : base;
+      const intentFailed = audit({ ...authorizedBase, result: 'executing', danger: verdict });
       if (intentFailed !== undefined) {
         return { ok: false, code: 'audit-failed', reason: intentFailed, message: `els ${input.action}: not sent (audit not writable: ${intentFailed})` };
       }
+      let queueRecorded = false;
+      const queueAudit: QueueAudit = (result, reason) => {
+        const ok = audit({ ...authorizedBase, at: now(), result, danger: verdict, ...(reason ? { reason } : {}) }) === undefined;
+        if (result === 'queued' && ok) queueRecorded = true;
+        return ok;
+      };
       let done: ControlExecuteResult;
       try {
-        done = await deps.execute({ principal: input.principal, action: input.action, target: input.target, ...(text ? { text } : {}) });
+        done = await deps.execute({ principal: input.principal, action: input.action, target: input.target, ...(text ? { text } : {}), ...(input.action === 'input' ? { queueAudit } : {}) });
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         process.stderr.write(`els: control executor error: ${reason}\n`);
-        audit({ ...base, result: 'executor-error', danger: verdict, reason: 'executor failed' });
+        audit({ ...authorizedBase, result: 'executor-error', danger: verdict, reason: 'executor failed' });
         return { ok: false, code: 'executor-error', reason, message: `els ${input.action}: failed (${reason})` };
       }
-      const resultFailed = audit({ ...base, result: done.exitCode === 0 ? 'executed' : 'executor-refused', danger: verdict, exitCode: done.exitCode, ...(done.queued !== undefined ? { queued: done.queued } : {}) });
+      // The core records queued synchronously before publishing the item; otherwise a drain can
+      // deliver before the executor returns and the queued record can appear after delivery.
+      const resultFailed = done.queued !== undefined && done.exitCode === 0 && queueRecorded
+        ? undefined
+        : audit({ ...authorizedBase, result: done.exitCode === 0 ? (done.queued !== undefined ? 'queued' : 'executed') : 'executor-refused', danger: verdict, exitCode: done.exitCode, ...(done.queued !== undefined ? { queued: done.queued } : {}) });
       const exitCode = resultFailed !== undefined && done.exitCode === 0 ? 1 : done.exitCode;
-      const message = resultFailed !== undefined ? `${done.message} (line sent; audit result not written: ${resultFailed})` : done.message;
+      const message = resultFailed !== undefined ? `${done.message} (execution outcome above; audit result not written, do not blindly retry: ${resultFailed})` : done.message;
       return { ok: true, exitCode, message, ...(done.queued !== undefined ? { queued: done.queued } : {}), danger: verdict };
     },
   };

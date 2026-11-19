@@ -22,6 +22,15 @@ export interface DashboardShellRunnerBootDeps<Handle> {
   setLatestShellRollup: (rollup: { running: number; backgrounded: number; background: number }) => void;
 }
 
+/** Surface-neutral installation; the REPL and dashboard share the same runner contract. */
+export function installShellRunnerDeps<Handle>(deps: {
+  registry: ShellRegistryLike<Handle>;
+  fileEngine?: unknown;
+  setShellRunnerDeps: DashboardShellRunnerBootDeps<Handle>['setShellRunnerDeps'];
+}): void {
+  deps.setShellRunnerDeps({ registry: deps.registry, ...(deps.fileEngine === undefined ? {} : { fileEngine: deps.fileEngine }) });
+}
+
 export function bootDashboardShellRunner<Handle>(
   deps: DashboardShellRunnerBootDeps<Handle>,
 ): void {
@@ -47,5 +56,5 @@ export function bootDashboardShellRunner<Handle>(
   try {
     deps.wireShellRunnerSurface?.({ shellRegistry: registry });
   } catch { /* never break boot */ }
-  deps.setShellRunnerDeps({ registry, fileEngine: deps.createFileCaptureEngine() });
+  installShellRunnerDeps({ registry, fileEngine: deps.createFileCaptureEngine(), setShellRunnerDeps: deps.setShellRunnerDeps });
 }

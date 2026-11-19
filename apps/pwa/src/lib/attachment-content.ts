@@ -23,6 +23,26 @@ export function isImageAttachment(meta: AttachmentMeta): boolean {
     && meta.mediaType.toLowerCase().startsWith('image/');
 }
 
+/** Lecture notes are extracted and redacted by the authenticated daemon. */
+export function isLectureNoteAttachment(meta: AttachmentMeta): boolean {
+  return /\.(txt|md|pdf|docx)$/i.test(meta.filename);
+}
+
+export async function fetchLectureNote(
+  meta: AttachmentMeta,
+  opts: { baseUrl: string; token?: string },
+): Promise<{ text: string; truncated: boolean }> {
+  if (!/^att-[a-z0-9]+-[a-z0-9]+$/.test(meta.id)) throw new Error('invalid attachment');
+  const url = `${opts.baseUrl.replace(/\/$/, '')}/v1/attachments/${meta.id}?extract=text`;
+  const headers: Record<string, string> = {};
+  if (opts.token) headers.authorization = `Bearer ${opts.token}`;
+  const response = await fetch(url, { headers });
+  if (!response.ok) throw new Error('attachment extraction failed');
+  const data = await response.json();
+  if (typeof data.text !== 'string' || typeof data.truncated !== 'boolean') throw new Error('invalid extraction response');
+  return data;
+}
+
 /** Fetch an attachment's bytes, base64-encode, and return the
  *  data string. Throws on transport / encoding failures so the
  *  caller can fall back to the legacy text-only path. */

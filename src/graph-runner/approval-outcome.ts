@@ -1,8 +1,13 @@
-/** What an owner-approval request came back with. Only `declined` is the owner saying no; every other reason means nobody decided. */
+/**
+ * What an owner-approval request came back with. `declined` is the owner saying no;
+ * `repeat-approval-request` is the seat itself auto-denying a repeated ask (SEAT-MAIL-EXCHANGE-FIX-1119 #25:
+ * no new OP mail — the caller gets an immediate refusal, recorded as a rejection);
+ * every other reason means nobody decided.
+ */
 export type ApprovalHoldReason = 'timeout' | 'turn-cancelled' | 'host-cancelled' | 'unavailable';
 export type ApprovalOutcome =
   | { readonly approved: true }
-  | { readonly approved: false; readonly reason: 'declined' | ApprovalHoldReason };
+  | { readonly approved: false; readonly reason: 'declined' | 'repeat-approval-request' | ApprovalHoldReason };
 
 export const APPROVAL_APPROVED: ApprovalOutcome = { approved: true };
 export const APPROVAL_DECLINED: ApprovalOutcome = { approved: false, reason: 'declined' };
@@ -12,9 +17,13 @@ export function normalizeApproval(value: boolean | ApprovalOutcome): ApprovalOut
   return typeof value === 'boolean' ? (value ? APPROVAL_APPROVED : APPROVAL_DECLINED) : value;
 }
 
-/** True when nobody decided (timeout, cancelled turn, no channel): the node must wait, not record a rejection. */
+/**
+ * True when nobody decided (timeout, cancelled turn, no channel): the node must wait, not record a rejection.
+ * `declined` (the owner said no) and `repeat-approval-request` (the seat auto-denied a repeated ask) are
+ * recorded refusals, not holds.
+ */
 export function isApprovalHold(outcome: ApprovalOutcome): outcome is { approved: false; reason: ApprovalHoldReason } {
-  return !outcome.approved && outcome.reason !== 'declined';
+  return !outcome.approved && outcome.reason !== 'declined' && outcome.reason !== 'repeat-approval-request';
 }
 
 export interface ApprovalHold {

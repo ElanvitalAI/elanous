@@ -2,6 +2,8 @@ import type { Command } from 'commander';
 import { join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { canonicalMessageAddress, defaultMsgStorePath, openMsgStore, type Message, type MsgStore } from '../msg/msg-store.js';
+import { formatReceiptClockStatus, getReceipt } from '../hq/msg-receipt-clocks.js';
+import { recordReceiptClock } from '../hq/msg-receipt-clock-sink.js';
 import { readQueryCache } from '../storage/short-lived-read-cache.js';
 
 interface MessageListOptions { to?: string; thread?: string; after?: string; limit?: string; json?: boolean }
@@ -18,9 +20,21 @@ const KIND_EMOJI: Readonly<Record<string, string>> = {
   coord: '🤝', report: '📋', info: 'ℹ️', question: '❓', alert: '🚨', progress: '⏳', incident: '🔥', coach: '🎓',
 };
 
-export function formatMessage(message: Message): string {
+export function formatMessage(message: Message, clockStatus?: string): string {
   const kind = message.kind ? ` ${Object.hasOwn(KIND_EMOJI, message.kind) ? KIND_EMOJI[message.kind] : ''}[${message.kind}]` : '';
-  return `#${message.id} ${message.createdAt} ${message.from} → ${message.to}${kind}: ${message.body}`;
+  const clock = clockStatus === undefined ? '' : ` [${clockStatus}]`;
+  return `#${message.id} ${message.createdAt} ${message.from} → ${message.to}${kind}${clock}: ${message.body}`;
+}
+
+/** [seat-mail #14 wiring] 각 행의 3계기 상태(미기록 '-'). 표가 없거나 읽기가 실패하면 빈 맵(전부 '-'). fail-soft. */
+function readClockStatuses(store: MsgStore, messages: Message[], recipient: string): Map<number, string> {
+  const statuses = new Map<number, string>();
+  try {
+    const table = store.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'msg_receipt_clocks'").get();
+    if (table === null) return statuses;
+    for (const message of messages) statuses.set(message.id, formatReceiptClockStatus(getReceipt(store.db, message.id, recipient)));
+  } catch { /* 상태 열은 fail-soft — 본체 목록은 그대로 */ }
+  return statuses;
 }
 
 /** Register only msg list so the hot read route does not load post/watch/mirror producers. */
@@ -57,13 +71,25 @@ export function registerMsgListCommand(msg: Command, deps: {
           root: join(elanousStateRoot(), 'cache', 'cli-read-query'), key,
           sourcePaths: [`${defaultMsgStorePath()}`, `${defaultMsgStorePath()}-wal`], ttlMs: 500, load,
         });
-        store.close();
-        store = undefined;
-        if (opts.json) out.log(JSON.stringify(messages));
+        const nextAfter = messages.at(-1)?.id ?? after ?? cursor ?? 0;
+        const remaining = to === undefined ? null : store.unreadCountAfter(to, nextAfter);
+        // [seat-mail #14 wiring] 상태 열은 수신자 모드에서만 — 스토어가 살아있는 동안 읽는다(thread 모드는 기존 양식).
+        const clockStatuses = to === undefined ? undefined : readClockStatuses(store, messages, to);
+        if (opts.json) {
+          out.log(JSON.stringify(messages));
+          if (to !== undefined) for (const message of messages) recordReceiptClock(store.db, { messageId: message.id, recipient: to, event: 'seen' });
+          if (remaining !== null && remaining > 0) out.error(`+${remaining} 더 · --after ${nextAfter}`);
+        }
         else {
           if (!messages.length) out.log('No messages.');
-          for (const message of messages) out.log(formatMessage(message));
+          for (const message of messages) {
+            out.log(formatMessage(message, clockStatuses === undefined ? undefined : clockStatuses.get(message.id) ?? '-'));
+            if (to !== undefined) recordReceiptClock(store.db, { messageId: message.id, recipient: to, event: 'seen' });
+          }
+          if (remaining !== null) out.log(`+${remaining} 더 · --after ${nextAfter}`);
         }
+        store.close();
+        store = undefined;
       } catch (error) {
         store?.close();
         out.error(`msg: ${error instanceof Error ? error.message : String(error)}`);

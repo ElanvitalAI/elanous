@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { isPublicRoute } from './public-routes.js';
+import { isPublicRoute, PUBLIC_ROUTES } from './public-routes.js';
 
 test('deployment grants reach only their self-verified handlers', () => {
   const context = { setupMode: false };
@@ -39,6 +39,20 @@ test('the member app-name routes are on the allowlist with exactly their methods
   for (const [method, path] of [['GET', '/v1/members/app-slot/name'], ['DELETE', '/v1/members/app-slot/name'], ['PUT', '/v1/members/app-slot/name'],
     ['POST', '/v1/members/app-slot/name-check'], ['DELETE', '/v1/members/app-slot/name-check'], ['POST', '/v1/members/app-slot/name/extra'],
     ['GET', '/v1/members/app-slot/name-checks'], ['POST', '/v1/members/app-slot/names']] as const) {
+    expect(isPublicRoute(method, path, context), `${method} ${path}`).toBe(false);
+  }
+});
+
+test('webchat handoff is one self-verified exact GET entry like the member home', () => {
+  const context = { setupMode: false };
+  expect(isPublicRoute('GET', '/v1/members/home', context)).toBe(true);
+  expect(isPublicRoute('GET', '/v1/members/webchat-handoff', context)).toBe(true);
+  const handoff = PUBLIC_ROUTES.filter((r) => r.method === 'GET' && r.path === '/v1/members/webchat-handoff');
+  expect(handoff).toHaveLength(1);
+  expect(handoff[0]).toMatchObject({ match: 'exact', selfVerified: true });
+  for (const [method, path] of [['POST', '/v1/members/webchat-handoff'], ['PUT', '/v1/members/webchat-handoff'],
+    ['DELETE', '/v1/members/webchat-handoff'], ['GET', '/v1/members/webchat-handoff/extra'],
+    ['GET', '/v1/members/webchat-handoffs']] as const) {
     expect(isPublicRoute(method, path, context), `${method} ${path}`).toBe(false);
   }
 });

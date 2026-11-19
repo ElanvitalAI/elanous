@@ -113,11 +113,13 @@ export function commandNameFromArgv(argv: readonly string[], allow: readonly All
  * r6 수리: 인용된 환경 접두는 argv 에 인자로 남는데, 그 값이 name → reason 을 타고 OP 요청에
  * 원문으로 흘러들 수 있었다(GITHUB_TOKEN="ghp_…" → «not on the seat allowlist: GITHUB_TOKEN=ghp_…»).
  * 판정·모양 일치는 원문 argv 로 하고 감사 이름에만 이 마스크를 씌운다(조항 5 — 원문을 남기지 않는다).
+ * SECRET-REDACT r3 (#38553): tool-activity 의 토큰 층이 이 가림을 그대로 재사용한다 — 합집합 층의
+ * 환경 할당 조각(NAME=value 값 가림)으로, 새 정규식 없이 기존 가림을 다시 쓴다.
  */
 // SHELL-POLICY-REDACT-EDGE-FU (#38524 r3 must ⓒ): the mask does not depend on the assignment's shape — a regex of
 // «valid» names missed «\GITHUB_TOKEN=S» (backslash prefix) and «GITHUB_TOKEN+=S» (append, a real assignment in
 // bash/zsh). Any token carried into name/reason keeps only what precedes its first '='; everything after is ****.
-function maskEnvAssignments(argv: readonly string[]): string[] {
+export function maskEnvAssignments(argv: readonly string[]): string[] {
   return argv.map(word => word.includes('=') ? `${word.slice(0, word.indexOf('=') + 1)}****` : word);
 }
 

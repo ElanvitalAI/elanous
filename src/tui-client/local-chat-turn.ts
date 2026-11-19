@@ -33,7 +33,7 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { SHELL_KILL_GRACE_MS, SHELL_SNAPSHOT_REPLY_TIMEOUT_MS } from '../tool-runtime/shell-watchdog.js';
 import { CAPSULE_FRAME_PREFIX, parseCapsuleFrame } from '../turn-capsule/capsule-frame.js';
-import { TURN_CANCEL_GRACE_MS, TURN_CANCEL_TYPE } from '../turn-capsule/turn-cancel.js';
+import { TURN_CANCEL_GRACE_MS, TURN_CANCEL_TYPE, type TurnCancelReason } from '../turn-capsule/turn-cancel.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import type { CapsuleEvent } from '../turn-capsule/contract.js';
 import { answerMemberBoardSessionCall, isMemberBoardSessionCall, type MemberBoardSessionSource } from './next-member-board-session.js';
@@ -589,9 +589,9 @@ class LocalChatSession {
   }
   /** CAPSULE-B2 — cancel the running turn over IPC; the child (and the capsules it hosts) keeps living.
    *  Pending approvals of this turn are withdrawn as close() does. False = nothing sent (caller falls back to close). */
-  cancelTurn(): boolean {
+  cancelTurn(reason?: TurnCancelReason): boolean {
     if (this.closed || !this.waiting) return false;
-    try { this.child.send({ type: TURN_CANCEL_TYPE, sessionId: this.sessionId, turnId: this.waiting.turnId }); }
+    try { this.child.send({ type: TURN_CANCEL_TYPE, sessionId: this.sessionId, turnId: this.waiting.turnId, ...(reason ? { reason } : {}) }); }
     catch { return false; }
     for (const callId of this.pendingShellApprovalIds) {
       try {
@@ -836,7 +836,7 @@ export async function runLocalChatTurn(
     // CAPSULE-B2 — Esc cancels the turn, not the child; the child gets a grace to settle, then the old close.
     let cancelFallback: ReturnType<typeof setTimeout> | undefined;
     const abort = (): void => {
-      if (!session.cancelTurn()) { void closeLocalChatSession(sessionId); return; }
+      if (!session.cancelTurn(signal.reason === 'stall' ? signal.reason : undefined)) { void closeLocalChatSession(sessionId); return; }
       cancelFallback = setTimeout(() => {
         emitTurnLife('turn-life:turn-cancel-fallback-close', { sessionId, graceMs: TURN_CANCEL_GRACE_MS });
         void closeLocalChatSession(sessionId);

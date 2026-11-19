@@ -1314,3 +1314,85 @@ describe("complete relay policy reload", () => {
     });
   });
 });
+
+// (출처: #39121 · OP #106416) Literal tests for the member «pin read» query: a
+// handle carrying an operator dispatch route never gains a dynamic pin
+// (pinHandle refuses it as a dispatch-table collision), so the query must
+// answer «pinned» from the operator-verified static claim alone (①) while
+// another member (②) and unclaimed handles (③) stay unpinned; an existing
+// dynamic pin (④) keeps answering pinned.
+describe("member handle pin query honors operator-verified static claims", () => {
+  const setupPinQuery = (claims: Record<string, string>) => {
+    const { files, put } = fixture();
+    const pinServerId = "b".repeat(64);
+    put(files.trustedHostKeys, { [serverId]: key, [pinServerId]: key });
+    put(files.hostOwnerMembers, {
+      [serverId]: "owner-1",
+      [pinServerId]: "owner-2",
+    });
+    put(files.publicDispatch, {
+      routes: [{ user: "ophome", serverId, ownerMemberId: "owner-1" }],
+    });
+    put(files.publicRead, { apps: [{ user: "ophome", app: "tickets" }] });
+    put(files.publicHandleClaims, claims);
+    const autoRegistrations = join(
+      realpathSync(roots[roots.length - 1]!),
+      "auto-pin-query.json",
+    );
+    const registrar = createRelayAutoAppRegistrar({
+      file: autoRegistrations,
+      domain: "elanous.app",
+      staticPolicy: () => loadRelayPublicPolicySnapshot(files, "elanous.app"),
+      apply: () => {},
+    });
+    return { files, put, registrar, pinServerId };
+  };
+
+  test("① operator-verified static claim answers pinned without a dynamic pin", () => {
+    const { registrar } = setupPinQuery({ ophome: "owner-1" });
+    expect(
+      registrar.queryHandlePinByMember({
+        user: "ophome",
+        memberId: "owner-1",
+      }),
+    ).toBe(true);
+  });
+
+  test("② the same claimed handle queried as another member answers unpinned", () => {
+    const { registrar } = setupPinQuery({ ophome: "owner-1" });
+    expect(
+      registrar.queryHandlePinByMember({
+        user: "ophome",
+        memberId: "owner-2",
+      }),
+    ).toBe(false);
+  });
+
+  test("③ a handle without a claim and without a dynamic pin answers unpinned", () => {
+    const { registrar } = setupPinQuery({ ophome: "owner-1" });
+    expect(
+      registrar.queryHandlePinByMember({
+        user: "nobodyclaimed",
+        memberId: "owner-1",
+      }),
+    ).toBe(false);
+  });
+
+  test("④ an existing dynamic pin keeps answering pinned", () => {
+    const { files, put, registrar, pinServerId } = setupPinQuery({
+      memberhome: "owner-2",
+    });
+    registrar.pinHandle(pinServerId, "owner-2", {
+      user: "memberhome",
+      memberId: "owner-2",
+    });
+    // Drop the claim after the pin: the dynamic pin alone must answer true.
+    put(files.publicHandleClaims, {});
+    expect(
+      registrar.queryHandlePinByMember({
+        user: "memberhome",
+        memberId: "owner-2",
+      }),
+    ).toBe(true);
+  });
+});

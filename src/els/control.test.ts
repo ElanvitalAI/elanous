@@ -187,6 +187,19 @@ test('a dangerous shell line is held when nobody can approve, and is not execute
   expect(auditLines(dir)[0]!.result).toBe('held');
 });
 
+test('a dangerous raw input line to a shell pane is held under the same gate as do', async () => {
+  const dir = stateDir();
+  allow(dir, [{ principal: '*', workspace: '*', pane: '*', actions: ['do', 'input'] }]);
+  const { control, ran } = door(dir);
+  const held = await control.run({ principal: cli, action: 'input', target: shell, text: 'rm -rf /tmp/x' });
+  expect(held.ok).toBe(false);
+  if (held.ok) return;
+  expect(held.code).toBe('held');
+  expect(ran).toEqual([]);
+  expect(auditLines(dir)[0]!.result).toBe('held');
+  expect(auditLines(dir)[0]!.danger).toBe('recursive rm');
+});
+
 test('HITL deny and timeout do not execute; approve executes once', async () => {
   const dir = stateDir();
   allow(dir, [{ principal: 'OP', workspace: 'HQ', pane: 'p1', actions: ['do'] }]);
@@ -265,7 +278,7 @@ test('a result audit line that cannot be written turns success into exit 1', asy
     appendAudit: () => { writes += 1; if (writes > 1) throw new Error('disk full'); },
   });
   const done = await control.run({ principal: cli, action: 'do', target: shell, text: 'echo hi' });
-  expect(done).toEqual({ ok: true, exitCode: 1, message: 'delivered (line sent; audit result not written: disk full)', danger: 'safe' });
+  expect(done).toEqual({ ok: true, exitCode: 1, message: 'delivered (execution outcome above; audit result not written, do not blindly retry: disk full)', danger: 'safe' });
 });
 
 test('an executor that throws is audited and reported, never silent', async () => {
@@ -318,12 +331,11 @@ test('a495bddd8d review (pin race): a revocation that lands while the list is pi
   allow(dir, [{ principal: 'OP', workspace: 'HQ', pane: 'main', actions: ['do'] }]);
   const ids = { workspace: (ref: string) => (ref === 'HQ' || ref === 'ws-1' ? 'ws-1' : undefined), pane: (ref: string) => (ref === 'main' || ref === 'pn-1' ? 'pn-1' : undefined) };
   const revoked = `${JSON.stringify({ rules: [] })}\n`;
-  const rules = pinAllowList(dir, ids, { beforePin: () => { writeFileSync(join(dir, 'control-allow.json'), revoked); } });
-  expect(rules).toEqual([]);                                                    // this run follows the admin's version
+  expect(() => pinAllowList(dir, ids, { beforePin: () => { writeFileSync(join(dir, 'control-allow.json'), revoked); } })).toThrow();                                                    // this run fails closed
   expect(readFileSync(join(dir, 'control-allow.json'), 'utf8')).toBe(revoked);  // the revocation was not restored
 });
 
-test('a495bddd8d review (pin fail): a pin whose write fails denies the name row this run; id rows keep working', () => {
+test('pin failure closes the entire policy, including previously stable id rows', () => {
   const dir = stateDir();
   allow(dir, [
     { principal: 'OP', workspace: 'ws-1', pane: 'pn-1', actions: ['do'] },
@@ -332,9 +344,7 @@ test('a495bddd8d review (pin fail): a pin whose write fails denies the name row 
   const ids = { workspace: (ref: string) => (ref === 'HQ' || ref === 'ws-1' ? 'ws-1' : undefined), pane: (ref: string) => (ref === 'main' || ref === 'pn-1' ? 'pn-1' : undefined) };
   chmodSync(dir, 0o555);  // the stash write fails
   try {
-    const rules = pinAllowList(dir, ids);
-    expect(rules).toEqual([{ principal: 'OP', workspace: 'ws-1', pane: 'pn-1', actions: ['do'] }]);
-    expect(authorize(rules, cli, { workspace: 'ws-1', pane: 'pn-1', shell: true }, 'do')).toBe(true);
+    expect(() => pinAllowList(dir, ids)).toThrow();
   } finally { chmodSync(dir, 0o700); }
 });
 
@@ -359,4 +369,173 @@ test('list passes the same door: denied without a rule, executed with one, audit
     .map((row) => JSON.parse(row) as { action: string; result: string; text?: string });
   expect(rows.map((row) => [row.action, row.result])).toEqual([['list', 'denied'], ['list', 'executing'], ['list', 'executed'], ['read', 'denied']]);
   expect(rows.every((row) => row.text === undefined)).toBe(true);
+});
+
+// OP #17 OP-DIRECT-SEAT-INPUT — `input` is the operator's direct line into a seat: an allowlist row must name the
+// action, and even then only OP and RES-INFRA pass the door. The audit keeps chars + sha256 only, never the text.
+test('els input: an allow row without the input action keeps OP out', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'els-input-allow-'));
+  writeFileSync(join(dir, 'control-allow.json'), JSON.stringify({ rules: [{ principal: '*', workspace: '*', pane: '*', actions: ['read'] }] }));
+  const door = createControl({ stateDir: dir, now: () => 1_700_000_000_000, execute: async () => ({ exitCode: 0, message: 'typed' }) });
+  const outcome = await door.run({ principal: { id: 'OP', kind: 'cli' }, action: 'input', target: { workspace: 'ws', pane: 'p1', shell: true }, text: 'x' });
+  expect(outcome.ok).toBe(false);
+  if (outcome.ok) throw new Error('expected denial');
+  expect(outcome.code).toBe('denied');
+  expect(outcome.reason).toBe('not in control-allow.json');
+  expect(outcome.message).toBe('els input: denied for OP (not in control-allow.json)');
+});
+
+test('els input: OP with an input row reaches the executor and the audit says executed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'els-input-op-'));
+  writeFileSync(join(dir, 'control-allow.json'), JSON.stringify({ rules: [{ principal: 'local:501', seat: 'OP', workspace: '*', pane: '*', actions: ['input'] }] }));
+  const door = createControl({ stateDir: dir, now: () => 1_700_000_000_000, execute: async () => ({ exitCode: 0, message: 'typed' }) });
+  const outcome = await door.run({ principal: { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' }, action: 'input', target: { workspace: 'ws', pane: 'p1', shell: true }, text: 'x' });
+  expect(outcome.ok).toBe(true);
+  const audit = await Bun.file(join(dir, 'control-audit.jsonl')).text();
+  expect(audit).toContain('"action":"input"');
+  expect(audit).toContain('"result":"executing"');
+  expect(audit).toContain('"result":"executed"');
+});
+
+test('els input: an input row does not open the door to other principals', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'els-input-gate-'));
+  writeFileSync(join(dir, 'control-allow.json'), JSON.stringify({ rules: [{ principal: '*', workspace: '*', pane: '*', actions: ['input'] }] }));
+  const door = createControl({ stateDir: dir, now: () => 1_700_000_000_000, execute: async () => ({ exitCode: 0, message: 'typed' }) });
+  const outcome = await door.run({ principal: { id: 'HAND-X', kind: 'cli' }, action: 'input', target: { workspace: 'ws', pane: 'p1', shell: true }, text: 'x' });
+  expect(outcome.ok).toBe(false);
+  if (outcome.ok) throw new Error('expected denial');
+  expect(outcome.code).toBe('denied');
+  expect(outcome.message).toBe('els input: denied for HAND-X (not in control-allow.json)');
+  const audit = await Bun.file(join(dir, 'control-audit.jsonl')).text();
+  expect(audit).toContain('"result":"denied"');
+});
+
+test('input built-in: authenticated seats only, explicit deny wins, other actions unchanged', async () => {
+  const dir = stateDir();
+  allow(dir, []);
+  const { control, ran } = door(dir);
+  const op: Principal = { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' };
+  const run = (principal: Principal, action: 'input' | 'read' = 'input', from = 'OP') => control.run({ principal, action, target: agent, text: 'secret', from });
+  expect((await run(op)).ok).toBe(true);
+  expect((await run({ ...op, callerSeat: 'RES-INFRA' })).ok).toBe(true);
+  expect((await run(op, 'read')).ok).toBe(false);
+  for (const forged of [
+    { ...op, callerSeat: undefined }, { ...op, callerPane: undefined },
+    { ...op, callerSeat: 'HAND-X' }, { ...op, kind: 'http-token' as const },
+    { ...op, id: 'OP' },
+  ]) expect((await run(forged)).ok).toBe(false);
+  allow(dir, [{ principal: 'local:501', workspace: 'HQ', pane: 'p1', actions: ['input'], effect: 'deny' }]);
+  expect((await run(op)).ok).toBe(false);
+  expect(ran).toEqual(['secret', 'secret']);
+  const rows = readFileSync(join(dir, 'control-audit.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(rows.slice(0, 4).every(row => row.authorization === 'builtin-input')).toBe(true);
+  expect(rows.at(-1).reason).toBe('explicit input deny');
+  expect(JSON.stringify(rows)).not.toContain('secret');
+});
+
+test('input deny survives pinning and does not grant other actions', async () => {
+  const dir = stateDir();
+  allow(dir, [{ principal: 'local:501', workspace: 'HQ', pane: 'main', actions: ['input', 'read'], effect: 'deny' }]);
+  const ids = { workspace: () => 'ws-1', pane: () => 'pn-1' };
+  const rules = pinAllowList(dir, ids);
+  expect(rules[0]?.effect).toBe('deny');
+  expect(JSON.parse(readFileSync(join(dir, 'control-allow.json'), 'utf8')).rules[0].effect).toBe('deny');
+  expect(authorize(rules, { id: 'local:501', kind: 'cli' }, { workspace: 'ws-1', pane: 'pn-1', shell: false }, 'read')).toBe(false);
+});
+
+test('input default spans file presence; non-input revocation remains effective', async () => {
+  const dir = stateDir();
+  const { control } = door(dir);
+  const principal: Principal = { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' };
+  const run = (action: 'input' | 'read') => control.run({ principal, action, target: agent });
+  expect((await run('input')).ok).toBe(true);
+  expect((await run('read')).ok).toBe(false);
+  allow(dir, [{ principal: 'local:501', workspace: '*', pane: '*', actions: ['read'] }]);
+  expect((await run('input')).ok).toBe(true);
+  expect((await run('read')).ok).toBe(true);
+  allow(dir, []);
+  expect((await run('input')).ok).toBe(true);
+  expect((await run('read')).ok).toBe(false);
+  allow(dir, [{ principal: 'local:501', workspace: '*', pane: '*', actions: ['read'] }]);
+  rmSync(join(dir, 'control-allow.json'));
+  expect((await run('input')).ok).toBe(true);
+  expect((await run('read')).ok).toBe(false);
+});
+
+test('input deny overrides allows and survives a failed name pin', async () => {
+  const dir = stateDir();
+  const deny: AllowRule = { principal: '*', workspace: 'HQ', pane: 'main', actions: ['input'], effect: 'deny' };
+  allow(dir, [{ principal: '*', workspace: '*', pane: '*', actions: ['input'] }, deny]);
+  const ids = { workspace: (ref: string) => ref === 'HQ' || ref === 'ws-1' ? 'ws-1' : undefined, pane: (ref: string) => ref === 'main' || ref === 'pn-1' ? 'pn-1' : undefined };
+  expect(() => pinAllowList(dir, ids, { beforePin: () => { throw new Error('simulated failure'); } })).toThrow();
+  const control = createControl({ stateDir: dir, resolve: ids, execute: async () => ({ exitCode: 0, message: 'typed' }) });
+  const result = await control.run({ principal: { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' }, action: 'input', target: { workspace: 'ws-1', pane: 'pn-1', shell: false } });
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toBe('explicit input deny');
+});
+
+test('input policy errors fail closed, only missing file permits default', async () => {
+  const principal: Principal = { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' };
+  for (const raw of ['{', 'null', '{}', '{"rules":{}}', '{"rules":[{}]}', '{"rules":[{"principal":"*","workspace":"*","pane":"*","actions":["input"],"effect":"denyy"}]}', '{"rules":[{"principal":"*","workspace":"*","pane":"*","actions":["input"],"effect":"deny","seat":42}]}']) {
+    const dir = stateDir();
+    writeFileSync(join(dir, 'control-allow.json'), raw);
+    const { control, ran } = door(dir);
+    expect((await control.run({ principal, action: 'input', target: agent })).ok).toBe(false);
+    expect(ran).toEqual([]);
+  }
+  const dir = stateDir();
+  const { mkdirSync } = await import('node:fs');
+  mkdirSync(join(dir, 'control-allow.json'));
+  const { control, ran } = door(dir);
+  expect((await control.run({ principal, action: 'input', target: agent })).ok).toBe(false);
+  expect(ran).toEqual([]);
+});
+
+test('deny resolution is stable for the whole authorization even if resolver changes', async () => {
+  const dir = stateDir();
+  allow(dir, [{ principal: '*', workspace: 'HQ', pane: 'main', actions: ['input'], effect: 'deny' }]);
+  let workspaceCalls = 0;
+  const control = createControl({ stateDir: dir, resolve: {
+    workspace: () => ++workspaceCalls === 1 ? 'ws-1' : undefined,
+    pane: () => 'pn-1',
+  }, execute: async () => { throw new Error('must not execute'); } });
+  const result = await control.run({ principal: { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' }, action: 'input', target: { workspace: 'ws-1', pane: 'pn-1', shell: false } });
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toBe('explicit input deny');
+  expect(workspaceCalls).toBe(1);
+});
+
+test('input denies malformed action mixtures and unresolved deny rules', async () => {
+  const principal: Principal = { id: 'local:501', kind: 'cli', callerPane: 'w1:p2', callerSeat: 'OP' };
+  for (const rule of [
+    { principal: '*', workspace: '*', pane: '*', actions: ['input', 'unknown'], effect: 'deny' },
+    { principal: '*', workspace: 'missing', pane: '*', actions: ['input'], effect: 'deny' },
+  ]) {
+    const dir = stateDir();
+    writeFileSync(join(dir, 'control-allow.json'), JSON.stringify({ rules: [rule] }));
+    let executed = false;
+    const control = createControl({ stateDir: dir, resolve: { workspace: () => undefined, pane: () => undefined }, execute: async () => { executed = true; return { exitCode: 0, message: 'typed' }; } });
+    const result = await control.run({ principal, action: 'input', target: agent });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('control policy unavailable');
+    expect(executed).toBe(false);
+    expect(auditLines(dir).map(row => row.result)).toEqual(['denied']);
+  }
+});
+
+test('pin failure after concurrent deny change never uses old snapshot', () => {
+  const dir = stateDir();
+  allow(dir, [{ principal: '*', workspace: 'HQ', pane: 'main', actions: ['read'] }]);
+  const ids = { workspace: () => 'ws-1', pane: () => 'pn-1' };
+  expect(() => pinAllowList(dir, ids, { beforePin: () => {
+    allow(dir, [{ principal: '*', workspace: '*', pane: '*', actions: ['input'], effect: 'deny' }]);
+    throw new Error('simulated failure');
+  } })).toThrow();
+});
+
+test('failed deny pin does not transiently bind a reusable name', () => {
+  const dir = stateDir();
+  allow(dir, [{ principal: '*', workspace: 'HQ', pane: 'main', actions: ['input'], effect: 'deny' }]);
+  const ids = { workspace: () => 'ws-1', pane: () => 'pn-1' };
+  expect(() => pinAllowList(dir, ids, { beforePin: () => { throw new Error('simulated failure'); } })).toThrow();
 });

@@ -636,6 +636,7 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
       >
         <ChatHistory messages={messages} pending={pending} />
         <ChatInput
+          responseActive={pending}
           onSubmit={handleSubmit}
           disabled={pending}
           attachments={pendingAttachments}

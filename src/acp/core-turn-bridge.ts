@@ -48,8 +48,7 @@ import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { stripGoalRepeatReadbackPreface } from '../core-turn/run-goal-loop.js';
-import { parseSeatTurnCapConfig, resolveSeatTurnCapForRole, seatRegistryRuntime } from '../core-turn/seat-turn-cap.js';
-import { readSeatRuntime } from '../core-turn/seat-registry-runtime.js';
+import { SEAT_TURN_CAP_DEFAULTS } from '../core-turn/seat-turn-cap.js';
 import { postSeatCapResumeNotice } from '../core-turn/seat-cap-resume-notice.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { getModelFamily } from '../models/prompts.js';
@@ -486,8 +485,9 @@ export function bridgeCoreTurnToAcp(
         });
       }
       // TUI-SEAT-TURN-CAP — 자리 판정으로 goal loop 에 온 턴만 core 턴 상한·«할 일 0» 판정을 받는다(사람 TUI·하니스 자식 0).
+      //   SEAT-TURN-CAP-DEFAULT-15M — chat.seatTurnCap 옵션 삭제로 상한은 기본값 한 벌.
       const seatTurnCap = armGoalLoop && seat !== null && route.reason.startsWith('seat-')
-        ? { seat, ...resolveSeatTurnCapForRole(seatRegistryRuntime(seat, readSeatRuntime), parseSeatTurnCapConfig(getUserConfig().chat?.seatTurnCap)) }
+        ? { seat, ...SEAT_TURN_CAP_DEFAULTS }
         : undefined;
       const runTurnDispatch = (c: CoreTurnContext): Promise<unknown> =>
         armGoalLoop

@@ -41,7 +41,9 @@ type ChainCandidateWhy =
   | 'no-credential'
   | 'availability-check-failed'
   | 'grok-usage-at-or-above-70'
-  | 'grok-usage-unmeasured';
+  | 'grok-usage-unmeasured'
+  | 'codex-mirror-missing'
+  | 'codex-quota-exhausted';
 
 export interface ChainCandidate { readonly model: string; readonly provider: string }
 interface ChainSkip extends ChainCandidate { readonly why: ChainCandidateWhy }
@@ -63,9 +65,13 @@ interface RoleProviderChainDeps {
   /** Grok usage against the 70% cap: `usable` below it, `exhausted` at or above it, `unknown` fails closed. */
   readonly grokQuota?: () => 'usable' | 'exhausted' | 'unknown';
   readonly providerOf?: (model: string) => string | null;
+  readonly substrate?: string;
+  readonly podCodexBlocked?: boolean;
 }
 
 /** Resolve one role's chain. Never falls back silently: every refusal is in `skipped` and an event. */
+const POD_ROLE_MODELS = ['gpt-6.1-terra', 'openrouter/openai/gpt-6-luna'] as const;
+
 export function resolveRoleProviderChain(role: ProviderChainRole, deps: RoleProviderChainDeps): RoleProviderChainResolution {
   const chains = deps.config?.llm?.roleProviderChains;
   // Own keys only: a config object must not answer a role through its prototype.
@@ -73,9 +79,11 @@ export function resolveRoleProviderChain(role: ProviderChainRole, deps: RoleProv
   const source = configured && configured.length > 0 ? 'config' as const : 'default' as const;
   const models = source === 'config' ? configured! : DEFAULT_ROLE_PROVIDER_CHAINS[role];
   const providerOf = deps.providerOf ?? ((model: string) => inferProviderFromModel(model));
+  const substrate = deps.substrate ?? process.env.ELANOUS_SUBSTRATE ?? 'hq';
+  const podPinned = substrate === 'pod';
   const candidates: ChainCandidate[] = [];
   const skipped: ChainSkip[] = [];
-  for (const model of models) {
+  for (const model of podPinned ? POD_ROLE_MODELS : models) {
     const provider = providerOf(model) ?? 'unknown';
     const skip = (why: ChainCandidateWhy) => { skipped.push({ model, provider, why }); };
     if (role !== 'recovery' && !reviewModelAllowed(model)) {
@@ -84,6 +92,7 @@ export function resolveRoleProviderChain(role: ProviderChainRole, deps: RoleProv
       continue;
     }
     if (provider === 'unknown') { skip('provider-unknown'); continue; }
+    if (podPinned && provider === 'openai-codex' && deps.podCodexBlocked) { skip('codex-quota-exhausted'); continue; }
     if (provider === 'grok') {
       let quota: 'usable' | 'exhausted' | 'unknown';
       try { quota = (deps.grokQuota ?? readCachedGrokQuota)(); } catch { quota = 'unknown'; }
@@ -91,12 +100,17 @@ export function resolveRoleProviderChain(role: ProviderChainRole, deps: RoleProv
     }
     let available: boolean;
     try { available = deps.isAvailable({ model, provider }); } catch { skip('availability-check-failed'); continue; }
-    if (!available) { skip('no-credential'); continue; }
+    if (!available) {
+      const why = podPinned && provider === 'openai-codex' ? (deps.podCodexBlocked ? 'codex-quota-exhausted' : 'codex-mirror-missing') : 'no-credential';
+      skip(why);
+      if (why !== 'no-credential') debug.log('self-dev.role-chain', 'fallback', { role, model, provider, why }, { level: 'warn' });
+      continue;
+    }
     candidates.push({ model, provider });
   }
   if (candidates.length > 0) return { role, source, candidates, skipped };
   const tried = skipped.length ? skipped.map((s) => `${s.provider}(${s.model})=${s.why}`).join(', ') : 'no candidates configured';
-  const exhaustedReason = `role-chain-exhausted: ${role}: ${tried}`;
+  const exhaustedReason = `role-chain-exhausted: ${role}: ${tried}${podPinned ? ' · pod-lease-fallback' : ''}`;
   debug.log('self-dev.role-chain', 'exhausted', { role, source, tried: skipped }, { level: 'warn' });
   return { role, source, candidates, skipped, exhaustedReason };
 }

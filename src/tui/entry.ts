@@ -40,7 +40,7 @@ import { createSeatApprovalHandler, seatApprovalLedgerPorts } from './seat-appro
 import { createSeatStopDriver, setSeatStopHandler } from './seat-stop-port.js';
 import { readUnreadSummary } from '../msg/msg-store.js';
 import { pullSeatAfterGoal, releaseBusyAfterSettle, settleSeatPullTurnEnd, type SeatPullAfterGoalDeps } from './seat-pull-after-goal.js';
-import { createSessionWakeupBinder } from '../skills/tools/schedule-wakeup.js';
+import { createSessionWakeupBinder, WAKEUP_DEFER_MAX_MS } from '../skills/tools/schedule-wakeup.js';
 import { countInterimDisplay, internalTurnOriginOfText, planInterimDisplay } from './chat/goal-interim.js';
 import type { NextTuiLoopBranch } from '../tui-client/next-loop-command.js';
 import { handleSignalsSlash, type SignalsSlashContext } from './slash/signals.js';
@@ -89,6 +89,8 @@ import { nextTuiPublicHistory } from './core/public-history.js';
 import { noticeOneDispatch } from './external-event-one-verdict.js';
 import { createEntryTurnDoor, humanFirstDetail, nextDoorOpener, runDoorTurn, doorOutcomeOf, type DoorTurnKind, type EntryTurnDoor } from './turn-events/door-wire.js';
 import { createSeatMailAdapter, type SeatMailAdapter } from './turn-events/mail-adapter.js';
+import { createTurnEventBus } from './turn-events/bus.js';
+import { createWakeupBusConsumer, openLateWakeupTurn, type WakeupBusConsumer } from './turn-events/wakeup-consumer.js';
 
 let nextTuiRouteRegistry: typeof import('./core/registry.js') | undefined;
 /** Full picker chrome: title + four candidates + hint (the previous fixed default). */
@@ -121,6 +123,8 @@ export interface QueuedExternalEventOne {
   readonly source?: string;
   /** When the event existed, if the producer knows. Absent is unknown. */
   readonly occurredAt?: number;
+  /** The ledger message id a seat-mail notice carries — keeps the #38804 eventId chain through a held re-dispatch. */
+  readonly msgId?: number;
   /** Queued items still behind this one (already off the queue). */
   readonly remaining: number;
 }
@@ -347,9 +351,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // A ref, not a let: it is assigned inside the boot closure below, which a `let` narrowing would hide (TS2339 never).
   const seatStopRef: { current: ReturnType<typeof createSeatStopDriver> | null } = { current: null };
   let doorTurnKind: DoorTurnKind | undefined;
+  // O2 (TC #94744): the bus's first consumer — a late one-shot the scheduler gave up on opens its turn through the door.
+  let wakeupBusConsumer: WakeupBusConsumer | null = null;
+  let wakeupBusTurn: string | null = null;
   const setBusy = (next: boolean): void => {
     if (busy === next) return;
     busy = next;
+    if (!next && wakeupBusTurn !== null) { wakeupBusConsumer?.settle(wakeupBusTurn, doorOutcomeOf(doorTurnKind)); wakeupBusTurn = null; }
     if (!next) { entryDoor?.endTurn(doorTurnKind); doorTurnKind = undefined; }
     // SEAT-GRACEFUL-QUIT-CONTROL: a quit/migrate that waited for this turn runs now (checkpoint → exit/restart).
     if (!next && seatStopRef.current) void seatStopRef.current.turnEnded().catch((error) => { debug.log('seat-stop', 'turn-end-failed', { error: String(error).slice(0, 200) }, { level: 'warn' }); });
@@ -624,7 +632,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     });
   })();
   // OBSERVE-TURN-EVENT-LIFECYCLE — 방금 꺼낸 재생 턴의 문 라벨(startChatTurn 관측이 텍스트로 대조해 읽는다).
-  let turnStartLabel: { door: string; text: string; source?: string; itemId?: string } | null = null;
+  let turnStartLabel: { door: string; text: string; source?: string; itemId?: string; eventId?: string | number } | null = null; // 출처: #38804 — msgId(number)가 사슬 값으로 그대로 흐른다
   // IDLE-WAKE-SINGLE-DOOR — self-pull, graph, mail, and the event bundle knock here.
   const idleWakeDoor = createIdleWakeDoor({
     busy: () => busy,
@@ -637,10 +645,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // CAPSULE-C2-FU: FIFO, not one slot — a second displaced notice never overwrites the first.
   const heldNotices: Parameters<typeof dispatchQueuedExternalEventOne>[0]['notice'][] = [];
   let doorHumanFirst: () => string | null = () => null;
+  // TURN-FIELD-BUG-5: the key that submitted the last person turn is not «typing» once that turn ended.
+  let humanTurnKeyAt = 0;
   // CAPSULE-FLAGS-REMOVE-DEFAULT: the one door is always on (the flag-off branches below go in R1b).
   {
     doorHumanFirst = () => humanFirstDetail({ draft: () => input.editor.text, unreadKeys: tuiPendingKeyCount,
-      lastHumanKeyAt: tuiLastHumanKeyAt, now: Date.now });
+      lastHumanKeyAt: tuiLastHumanKeyAt, now: Date.now, lastHumanTurnKeyAt: () => humanTurnKeyAt });
     entryDoor = createEntryTurnDoor({
       humanFirst: () => doorHumanFirst(),
       // CAPSULE-C2-FU: a person's queued line is not held for human-first (only notices · wakes are).
@@ -686,15 +696,20 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   idleWakeDoor.register({ id: 'external-event' });
   // [턴 근본 배선 #4a] B1: an unregistered source is refused by knock() — the capsule-done doorbell must be on the list.
   idleWakeDoor.register({ id: 'capsule-done' });
+  idleWakeDoor.register({ id: 'event-watch' });
   // [턴 근본 배선 #3] C3 (CC-4 #89716 · always on since CAPSULE-FLAGS-REMOVE-DEFAULT): one owner per seat mail, shared
   // by the watcher and the plan — the modules' own default instances are for tests only (CC-4 #90942).
   const seatMailAdapter: SeatMailAdapter | null = createSeatMailAdapter({ log: (event, data) => { debug.log('seat-mail', event, data); } });
   // Mail → decomposition → plan: the active plan item is a seat-mail notice in this queue (banner-less internal turn).
   try {
-    const { createSeatMailPlanRuntime, createSeatPlanTurnLink, seatTaskQueueFromPromptQueue } = await import('./seat-mail-boot.js');
+    const { createSeatMailPlanRuntime, createSeatPlanTurnLink, seatTaskQueueFromPromptQueue, resolveSeatId } = await import('./seat-mail-boot.js');
     const planSeat = options.seatPlanBootForTest;
+    const recipient = resolveSeatId(planSeat?.cwd ?? process.cwd());
+    const clockWriter = createLedgerReceiptWriter();
     const booted = createSeatMailPlanRuntime({ cwd: planSeat?.cwd ?? process.cwd(), ...(planSeat ? { deps: { home: planSeat.home } } : {}),
-      queue: seatTaskQueueFromPromptQueue(queue), ...(seatMailAdapter ? { mailAdapter: seatMailAdapter } : {}) });
+      queue: seatTaskQueueFromPromptQueue(queue, (messageId, eventId) => {
+        if (recipient) clockWriter.recordStarted?.({ messageId, recipient, eventId });
+      }), ...(seatMailAdapter ? { mailAdapter: seatMailAdapter } : {}) });
     if (booted.runtime) { seatPlan = booted.runtime; seatPlanLink = createSeatPlanTurnLink(booted.runtime); seatMailHeader = booted.header; }
   } catch { /* boot goes on without a plan */ }
   // #38031 (ELN-CHILD-NOTICE) — 사이드탭 미션 종결 알림 생산자(같은 (source,text) 중복 적입 억제).
@@ -833,13 +848,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     capsuleSubscription.stop = null;
     // CAPSULE-B1 (D12) — a finished background capsule queues one notice and knocks the idle door.
     // Same lazily loaded modules as the status sources (already cached when a session is observed).
-    void Promise.all([import('../tui-client/local-chat-turn.js'), import('./capsule-done-knock.js')])
-      .then(([chat, knock]) => {
+    void Promise.all([import('../tui-client/local-chat-turn.js'), import('./capsule-done-knock.js'), import('./shell-watch-knock.js')])
+      .then(([chat, knock, watch]) => {
         if (observedSessionId !== sessionId || capsuleSubscription.stop) return;
-        capsuleSubscription.stop = knock.wireCapsuleDoneKnock({
+        const stopDone = knock.wireCapsuleDoneKnock({
           sessionId, subscribe: chat.onLocalChatCapsuleEvent,
           enqueue: (event) => childNotices.capsuleDone(event, event.endedAt), knock: () => { idleWakeDoor.knock('capsule-done'); },
         });
+        const stopWatch = watch.wireShellWatchKnock({ sessionId, subscribe: chat.onLocalChatCapsuleEvent,
+          enqueue: (text, at) => queue.enqueueNotice(text, 'event-watch', { occurredAt: at }),
+          knock: () => { idleWakeDoor.knock('event-watch'); },
+        });
+        capsuleSubscription.stop = () => { stopDone(); stopWatch(); };
       }).catch(() => { /* the doorbell is optional; the next-turn drain still delivers the result */ });
     healthSubscription.stop?.();
     healthSnapshot = null;
@@ -896,6 +916,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const { codeRevision } = await import('../version/code-revision.js');
   const { createStaleInstallWatch, detectStaleInstall } = await import('../version/stale-install.js');
   const bootHead = codeRevision();
+  const { startElsBuildReporter } = await import('../els/build-reporter.js');
+  const stopElsBuildReporter = startElsBuildReporter(bootHead);
   const staleInstall = createStaleInstallWatch({ detect: () => detectStaleInstall({ runningHead: bootHead }) });
   staleInstall.check();
 
@@ -1038,7 +1060,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const statusInput = {
       turnState: turnStatusBase,
       model: readNextTuiStatusModel(id ?? undefined, session?.meta),
-      queued: queue.count,
+      queued: queue.count + heldNotices.length,
       steering: queue.steerCount,
       backgroundTasks,
       width: statusWidth,
@@ -1649,6 +1671,28 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     });
   };
 
+  /** O2: the door holds a reservation and nothing is queued — open one late wakeup from the bus (never twice). */
+  const openLateWakeup = (): boolean => {
+    const consumer = wakeupBusConsumer;
+    const scheduler = wakeup?.scheduler;
+    if (!consumer || !scheduler) return false;
+    const result = openLateWakeupTurn({
+      consumer,
+      start: (event) => {
+        turnStartLabel = { door: 'internal', text: event.text, source: 'scheduled', itemId: event.id, eventId: event.id };
+        // JUD-B should (#38905): a start that throws must not leave this label for a later human turn with the same text.
+        try { startChatTurn(event.text, continueBanner('scheduled'), { kind: 'system', origin: 'scheduled' }); }
+        catch (error) { turnStartLabel = null; throw error; }
+      },
+      running: () => busy,
+      cancel: (wakeupId) => scheduler.cancel(wakeupId),
+      abort: () => { turnAbort?.abort(); },
+      track: (eventId) => { wakeupBusTurn = eventId; },
+      log: (event, data) => { try { emitTurnLife(`turn-life:${event}`, data); } catch { /* observability is fail-open */ } },
+    });
+    return result === 'opened' || result === 'cancel-refused';
+  };
+
   /** Sends the head of the queue through the ordinary idle submit path (slash commands included). */
   const dispatchQueued = (): void => {
     // CAPSULE-C2: reserve before the dequeue — the busy mark exists before the notice chain's await (D7).
@@ -1660,10 +1704,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     if (!reservation) return;
     const held = opener === 'held-notice' ? heldNotices.shift() : undefined;
     if (held) {
-      turnStartLabel = { door: 'queue-notice', text: held.text, source: held.source ?? undefined };
+      turnStartLabel = { door: 'queue-notice', text: held.text, source: held.source ?? undefined, eventId: held.msgId ?? held.id }; // 출처: #38804 — eventId = msgId ?? id(도착·큐·꺼냄 사슬과 같은 id · OP msg:93180)
       dispatchNoticeThroughDoor(held, reservation);
       return;
     }
+    if (opener === 'none' && openLateWakeup()) return;
     const handoff = queue.dequeue();
     if (handoff.kind !== 'submit') {
       door.releaseIfUnstarted(reservation);
@@ -1674,10 +1719,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // alone sees the one-line source head («[notice · seat-mail]») on the turn it answers.
     if (handoff.itemKind === 'notice') {
       // OBSERVE-TURN-EVENT-LIFECYCLE — 재생하는 알림의 문 라벨(비동기라 startChatTurn 이 텍스트로 대조).
-      turnStartLabel = { door: 'queue-notice', text: handoff.text, source: handoff.source ?? undefined };
+      turnStartLabel = { door: 'queue-notice', text: handoff.text, source: handoff.source ?? undefined, eventId: handoff.msgId ?? handoff.id }; // 출처: #38804 — eventId = msgId ?? id(도착·큐·꺼냄 사슬과 같은 id · OP msg:93180)
       dispatchNoticeThroughDoor({ id: handoff.id, text: handoff.text, remaining: handoff.remaining,
         ...(handoff.source === undefined ? {} : { source: handoff.source }),
-        ...(handoff.occurredAt === undefined ? {} : { occurredAt: handoff.occurredAt }) }, reservation);
+        ...(handoff.occurredAt === undefined ? {} : { occurredAt: handoff.occurredAt }),
+        ...(handoff.msgId === undefined ? {} : { msgId: handoff.msgId }) }, reservation); // 출처: #38804 — held 재접수로 되돌아도 msgId 사슬 유지
       return;
     }
     // A queued person's line replays Enter, which takes the door as a person.
@@ -1694,7 +1740,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       : null;
     replacementContextFor = candidateLine ? { text: handoff.text.trim(), line: candidateLine } : null;
     // OBSERVE-TURN-EVENT-LIFECYCLE — 재생하는 대기 사용자 줄의 문 라벨(replay Enter → startChatTurn 이 읽는다).
-    turnStartLabel = { door: 'queue-user', text: handoff.text, itemId: handoff.id };
+    turnStartLabel = { door: 'queue-user', text: handoff.text, itemId: handoff.id, eventId: handoff.msgId ?? handoff.id }; // 출처: #38804 — eventId = msgId ?? id(itemId 는 #92565 규칙 그대로 · OP msg:93180)
     restoreDraft = input.editor.text;
     input.setText(handoff.text);
     focus = 'input';
@@ -1811,6 +1857,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         door: matched ? label!.door : 'human',
         ...(matched && label!.source !== undefined ? { source: label!.source } : {}),
         ...(matched && label!.itemId !== undefined ? { itemId: label!.itemId } : {}),
+        ...(matched && label!.eventId !== undefined ? { eventId: label!.eventId } : {}), // 출처: TC #92565 — 라벨 세터의 itemId 규칙 그대로 eventId 일치
         turnSessionId,
       });
       if (matched) turnStartLabel = null;
@@ -1836,7 +1883,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         debug.log('tui.next', 'turn.stalled', { sessionId: turnSessionId, idleMs: Math.round(verdict.idleMs), queued: queue.count,
           streamedChars: streamedOutputChars ?? 0, elapsedMs: Math.round(turnElapsedMs ?? 0) }, { level: 'warn' });
         queue.markInterrupted();
-        turnAbort.abort();
+        turnAbort.abort('stall');
         status = `No output for ${stallMinutes(verdict.idleMs)} min · turn stopped${queue.count > 0 ? ' · queued input is sent next' : ''}`;
       }
       render();
@@ -2245,6 +2292,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         try { return { retro: { seat: seatName, intervalMin, store: createFileSeatRetroStateStore(seatRetroStateFile(seatName)) } }; }
         catch { return {}; }
       })();
+      // TURN-CAPSULE-EVENTS R1(C4) — the scheduler's bus adapter (schedule-wakeup.ts:219) gets its production
+      // source: late wakes now publish TurnEvents. No switch — always on. CC-2 will wire the first consumer
+      // to this same bus handle.
+      const turnEventBus = createTurnEventBus();
       wakeup = createNextTuiWakeup({
         isTurnRunning: () => busy,
     turnLifeLog: emitTurnLife,
@@ -2257,10 +2308,19 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         pendingKeyCount: tuiPendingKeyCount,
         requestYield: () => injectKey(internalWake),
         notify: (line) => { pushNotice(line); render(); },
+        // TURN-CAPSULE-EVENTS R1(C4) — every scheduled/fired/cancelled wake lands on the turn-event bus.
+        publishEvent: (event) => {
+          turnEventBus.publish(event);
+          if (!busy && event.dedupeKey.endsWith(':late')) entryDoor?.door.offer('event');
+        },
         // SEAT-ROLE-CARD device 2 — a seat's built-in self-retro (ELANOUS_SEAT_RETRO_INTERVAL_MIN, minutes; 0 = off).
         ...retroDep,
       });
       // ⭐ OP-CRON-PROMPTS O2 — TUI 재기동해도 예약 깨움이 살게 파일에 저장·시작 복원한다(대화가 바뀌면 다시 묶는다).
+      const wakeupScheduler = wakeup.scheduler;
+      wakeupBusConsumer = createWakeupBusConsumer({ bus: turnEventBus,
+        wakeups: () => wakeupScheduler.list().map((entry) => ({ id: entry.id, fireCount: entry.fireCount, deliverBy: entry.dueAt + WAKEUP_DEFER_MAX_MS })),
+        log: (event, data) => { try { emitTurnLife(`turn-life:${event}`, data); } catch { /* observability is fail-open */ } } });
       bindWakeupSession = createSessionWakeupBinder(wakeup.scheduler, detectSeat(process.cwd())?.seat);
       bindWakeupSession(id);
       setNextTuiWakeupTool(wakeup.tool);
@@ -2462,7 +2522,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         const request = wakeup?.takePendingIfIdle();
         // OBSERVE-TURN-EVENT-LIFECYCLE — 꺼낸 내부 턴의 문 라벨(startChatTurn 관측이 텍스트로 대조해 읽는다).
-        if (request !== null) turnStartLabel = { door: 'internal', text: request.input, source: request.origin, itemId: request.turnId };
+        if (request !== null) turnStartLabel = { door: 'internal', text: request.input, source: request.origin, itemId: request.turnId, eventId: request.turnId }; // 출처: TC #92565 — itemId = eventId = turnId
         if (!request && doorHold) entryDoor?.releaseIfUnstarted(doorHold);
         // A calm English line (turn limit · next step · remaining plan · scheduled …), not the internal origin name.
         // MSG-SOURCE-HIERARCHY: a turn that delivers another seat's mail says that seat («⇢ OP · request · due 14:00 · #id»).
@@ -3314,7 +3374,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           const compactSessionId = id;
           setBusy(true);
           // OBSERVE-TURN-EVENT-LIFECYCLE — 채팅 턴 밖의 busy(압축): internal 문 관측.
-          try { emitTurnLife('turn-life:turn-start', { door: 'internal', turnSessionId: id }); } catch { /* observability is fail-open */ }
+          try { emitTurnLife('turn-life:turn-start', { door: 'internal', turnSessionId: id, eventId: id }); } catch { /* observability is fail-open */ } // 출처: TC #92565 — eventId = turnSessionId
           status = 'Compacting';
           turnAbort = null;
           turnDone = Promise.all([import('./slash/compact.js'), import('../tui-client/local-chat-turn.js')])
@@ -3422,7 +3482,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           activity = ['provider 목록 조회 중'];
           setBusy(true);
           // OBSERVE-TURN-EVENT-LIFECYCLE — 채팅 턴 밖의 busy(provider): provider 문 관측.
-          try { emitTurnLife('turn-life:turn-start', { door: 'provider', turnSessionId: id }); } catch { /* observability is fail-open */ }
+          try { emitTurnLife('turn-life:turn-start', { door: 'provider', turnSessionId: id, eventId: id }); } catch { /* observability is fail-open */ } // 출처: TC #92565 — eventId = turnSessionId
           status = 'provider 조회 중 · Esc 취소';
           const abort = new AbortController();
           turnAbort = abort;
@@ -3483,7 +3543,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           activity = [safeStatusText(branch.nextTuiHarnessStartLine(request))];
           setBusy(true);
           // OBSERVE-TURN-EVENT-LIFECYCLE — 채팅 턴 밖의 busy(하니스): harness 문 관측.
-          try { emitTurnLife('turn-life:turn-start', { door: 'harness', turnSessionId: id }); } catch { /* observability is fail-open */ }
+          try { emitTurnLife('turn-life:turn-start', { door: 'harness', turnSessionId: id, eventId: id }); } catch { /* observability is fail-open */ } // 출처: TC #92565 — eventId = turnSessionId
           status = '하니스 진행 중 · Esc 취소';
           const abort = new AbortController();
           turnAbort = abort;
@@ -3544,7 +3604,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           activity = ['현재 맥락 조회 중…'];
           setBusy(true);
           // OBSERVE-TURN-EVENT-LIFECYCLE — 채팅 턴 밖의 busy(now 분기): internal 문 관측.
-          try { emitTurnLife('turn-life:turn-start', { door: 'internal', turnSessionId: id }); } catch { /* observability is fail-open */ }
+          try { emitTurnLife('turn-life:turn-start', { door: 'internal', turnSessionId: id, eventId: id }); } catch { /* observability is fail-open */ } // 출처: TC #92565 — eventId = turnSessionId
           status = '현재 맥락 조회 중 · Esc 취소';
           const abort = new AbortController();
           turnAbort = abort;
@@ -3766,6 +3826,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         wakeup?.gate.port.declined?.('human-turn');
         wakeup?.gate.noteHumanTurn();
         goalContinue?.noteHumanTurn();
+        humanTurnKeyAt = tuiLastHumanKeyAt();
         personTurnStarted = true;
         // OBSERVE-TURN-EVENT-LIFECYCLE — 한가 자리에 사람 턴 도착.
         try { emitTurnLife('turn-life:event-arrived', { source: 'human', busy: false, arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
@@ -3801,6 +3862,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     if (sidetabChordTimer !== null) clearTimeout(sidetabChordTimer);
     sidetabAttachments?.close();
     restoreCliStderrSink?.();
+    stopElsBuildReporter();
     restoreCliStderrSink = null;
     restoreTuiStderrOwner?.();
     restoreTuiStderrOwner = null;

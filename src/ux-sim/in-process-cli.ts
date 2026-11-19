@@ -39,6 +39,8 @@ export interface InProcessCliOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Selected config root when it differs from the isolated state root. */
   readonly configRoot?: string;
+  /** Spawn mode only: input delivered to the isolated CLI stdin. */
+  readonly stdinText?: string;
   /** Spawn mode only. */
   readonly timeoutMs?: number;
   /** Spawn mode only: let a process-boundary E2E observe and stop a long-running CLI. */
@@ -114,7 +116,7 @@ export async function simCli(args: readonly string[], options: InProcessCliOptio
     throw new Error(`CLI command not allowed: ${args.join(' ') || '(empty)'}`);
   }
   if (options.mode !== 'spawn') {
-    if (options.timeoutMs !== undefined || options.signal !== undefined || options.killSignal !== undefined || options.detached !== undefined || options.onStdout !== undefined || options.stdoutFile !== undefined || options.entrypoint !== undefined || options.injectTestFlag !== undefined) {
+    if (options.timeoutMs !== undefined || options.signal !== undefined || options.killSignal !== undefined || options.detached !== undefined || options.onStdout !== undefined || options.stdoutFile !== undefined || options.entrypoint !== undefined || options.injectTestFlag !== undefined || options.stdinText !== undefined) {
       throw new Error('timeout, abort, output callbacks and entrypoint overrides require mode: spawn');
     }
     return runInProcessCli(args, options);
@@ -141,9 +143,10 @@ export async function simCli(args: readonly string[], options: InProcessCliOptio
         closeSync(outputFd);
       };
       const child = spawnElanous(cliArgs, {
-        bin: entry, stateDir: stateRoot, cwd, env, stdio: ['ignore', outputFd ?? 'pipe', 'pipe'],
+        bin: entry, stateDir: stateRoot, cwd, env, stdio: [options.stdinText === undefined ? 'ignore' : 'pipe', outputFd ?? 'pipe', 'pipe'],
         detached: options.detached ?? process.platform !== 'win32',
       });
+      if (options.stdinText !== undefined) { child.stdin?.on('error', () => {}); child.stdin?.end(options.stdinText); }
       recordCliChildEvent('child-started', child.pid);
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];

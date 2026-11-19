@@ -19,12 +19,14 @@ import { toast } from 'sonner';
 import { debugLog } from '@/lib/debug';
 import { uploadAttachments, type AttachmentMeta } from '@/lib/upload-attachment';
 import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
+import { extractPickedFiles } from '@/lib/chat-paste-drop';
 
 interface Props {
   onAttached?: (entries: AttachmentMeta[]) => void;
+  chatLimits?: boolean;
 }
 
-export function FileAttachButton({ onAttached }: Props) {
+export function FileAttachButton({ onAttached, chatLimits = false }: Props) {
   const { config } = useDaemon();
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -37,8 +39,13 @@ export function FileAttachButton({ onAttached }: Props) {
       toast.error(NEXUS_URL_MISSING);
       return;
     }
+    const picked = Array.from(list);
+    const selected = chatLimits ? extractPickedFiles(picked) : { files: picked.map(file => ({ file, filename: file.name })), tooLarge: 0, tooMany: 0 };
+    if (selected.tooLarge) toast.error(`파일당 최대 10MiB입니다 · ${selected.tooLarge}개 제외`);
+    if (selected.tooMany) toast.error(`한 번에 최대 10개입니다 · ${selected.tooMany}개 제외`);
+    if (!selected.files.length) return;
     setBusy(true);
-    const files = Array.from(list);
+    const files = selected.files.map(entry => entry.file);
     debugLog('webterm.files.pick', {
       count: files.length,
       totalBytes: files.reduce((acc, f) => acc + f.size, 0),
@@ -81,7 +88,7 @@ export function FileAttachButton({ onAttached }: Props) {
         disabled={busy}
         aria-label="attach files"
         title="attach files (Files.app · iCloud · multi-select)"
-        className="rounded p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+        className="flex min-h-11 min-w-11 items-center justify-center rounded p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
       >
         {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FilePlus2 className="h-3.5 w-3.5" />}
       </button>

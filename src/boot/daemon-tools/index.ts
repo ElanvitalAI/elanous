@@ -32,6 +32,7 @@ import { buildEditTool, dispatchEdit } from './edit.js';
 import { buildWriteTool, dispatchWrite } from './write.js';
 import { buildGrepTool, dispatchGrep } from './grep.js';
 import { buildReadTool, dispatchRead } from './read.js';
+import { buildNotesReadTool, buildNotesSearchTool, dispatchNotesRead, dispatchNotesSearch } from './notes.js';
 import {
   buildMarkStepDoneTool,
   buildPlanTool,
@@ -125,6 +126,9 @@ export {
 
 const READONLY_TOOL_NAMES = new Set([
   'Read',
+  // DEMO-1121-VAULT-NOTES-READ: the member's notes folder, read-only.
+  'NotesSearch',
+  'NotesRead',
   'Grep',
   'WebSearch',
   // Opportunistic followup §6.2 #4 (2026-05-13) — Plan + MarkStepDone
@@ -270,6 +274,8 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     buildWebSearchTool(),
     buildPlanTool(),
     buildMarkStepDoneTool(),
+    buildNotesSearchTool(),
+    buildNotesReadTool(),
   ];
 
   if (kind === 'readonly') {
@@ -288,6 +294,10 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         switch (name) {
           case 'Read':
             return dispatchRead(args as unknown as Parameters<typeof dispatchRead>[0], ctx);
+          case 'NotesSearch':
+            return dispatchNotesSearch(args);
+          case 'NotesRead':
+            return dispatchNotesRead(args);
           case 'Grep':
             return dispatchGrep(args as unknown as Parameters<typeof dispatchGrep>[0], ctx);
           case 'WebSearch':
@@ -299,7 +309,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
           default:
             throw new ToolSafetyError(
               'unavailable',
-              `daemon readonly surface does not know tool '${name}' (allowed: Read, Grep, WebSearch, Plan, MarkStepDone)`,
+              `daemon readonly surface does not know tool '${name}' (allowed: Read, Grep, WebSearch, Plan, MarkStepDone, NotesSearch, NotesRead)`,
             );
         }
       },
@@ -371,6 +381,10 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
       switch (name) {
         case 'Read':
           return dispatchRead(args as unknown as Parameters<typeof dispatchRead>[0], ctx);
+        case 'NotesSearch':
+          return dispatchNotesSearch(args);
+        case 'NotesRead':
+          return dispatchNotesRead(args);
         case 'Grep':
           return dispatchGrep(args as unknown as Parameters<typeof dispatchGrep>[0], ctx);
         case 'WebSearch':
@@ -421,6 +435,9 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         ...(ctx.surfaceHitlChannels ? { confirmChannels: ctx.surfaceHitlChannels } : {}),
         ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),
         ...(ctx.emitFeedback ? { emitFeedback: ctx.emitFeedback } : {}),
+        // WEBCHAT-APP-BUILD-PLUGIN-BRIDGE 실행 슬라이스 — the shared app_build bridge delegates to this
+        // surface's plugin route dispatcher, so the member/confirmation/graph gates stay in the route adapter.
+        appBuildRouteDispatch: (name, args) => dispatchDaemonPluginRoute(name, args, ctx),
       });
     }
     if (ptyAvailable() && name === 'ElanousHold') return dispatchElanousHold(args);

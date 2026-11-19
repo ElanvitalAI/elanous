@@ -228,6 +228,8 @@ export interface PtyHandle extends PtyControlTarget {
    *  PTYs (a session the user may still resume) are protected; only the
    *  oldest-untouched one is evicted. */
   readonly lastActivityAt: number;
+  /** Last time the PTY produced output (a write or a poll does not count) — ELS-PANE-STATUS «last output ago». */
+  readonly lastOutputAt?: number;
   readonly detach: boolean;
   exitCode: number | null;
   exitSignal: number | undefined;
@@ -247,6 +249,9 @@ export interface PtyHandle extends PtyControlTarget {
    *  a throw. Adapter errors retain their normal propagation; `actor` defaults
    *  to 'human' and autonomous drivers pass 'agent'. */
   write(chars: string, actor?: PtyWriteActor): void;
+  /** Write all bytes or reject; unsupported adapters must never claim complete delivery. */
+  writeAll(chars: string, actor?: PtyWriteActor): Promise<void>;
+  bracketedPasteEnabled(): boolean;
   /** ⭐P2 arbiter pre-check — would a write by `actor` be allowed under the
    *  current accessMode? Autonomous callers check this before driving. */
   canWrite(actor?: PtyWriteActor): boolean;
@@ -268,6 +273,7 @@ export interface PtyHandle extends PtyControlTarget {
 }
 
 interface PtyAdapter {
+  writeAll?(input: string): Promise<void>;
   // Subset of node-pty's IPty we need.
   pid: number;
   write(input: string): void;
@@ -495,6 +501,7 @@ export function startPty(opts: StartOpts): PtyHandle {
   let currentCols = opts.cols ?? 80;
   let currentRows = opts.rows ?? 24;
   let lastActivityAt = Date.now();
+  let lastOutputAt: number | undefined;
 
   // Screen emulator (@xterm/headless) — parses the same byte stream the
   // head/tail buffer captures, so `renderScreen()` can return the CURRENT
@@ -514,6 +521,7 @@ export function startPty(opts: StartOpts): PtyHandle {
 
   let nickname = opts.nickname;
   let lastWriteActor: PtyWriteActor | null = null;
+  let writeAllActive = false;
   let accessMode: PtyAccessMode = opts.accessMode ?? 'write';
   let transitionPolicy: PtyTransitionPolicy = opts.transitionPolicy ?? 'open';
   notePtyAccessMode(id, accessMode);
@@ -546,6 +554,7 @@ export function startPty(opts: StartOpts): PtyHandle {
     get cols() { return currentCols; },
     get rows() { return currentRows; },
     get lastActivityAt() { return lastActivityAt; },
+    get lastOutputAt() { return lastOutputAt; },
     detach: opts.detach ?? false,
     get exitCode() { return exitCode; },
     set exitCode(v) { exitCode = v; },
@@ -561,6 +570,7 @@ export function startPty(opts: StartOpts): PtyHandle {
     },
     appendOutput(chunk: string): void {
       lastActivityAt = Date.now();
+      lastOutputAt = lastActivityAt;
       delta += chunk;
       trackPtyMouseOutput(id, chunk);
       // Feed the screen emulator so renderScreen() reflects live state.
@@ -611,6 +621,7 @@ export function startPty(opts: StartOpts): PtyHandle {
         emitPtyEvent({ type: 'write-denied', id, actor, reason: decision.reason, bytes: chars.length });
         return;
       }
+      if (writeAllActive) throw new Error('PTY verified write in progress');
       adapter.write(chars);
       lastWriteActor = actor;
       debug.log('pty.control', 'write', { ptyId: id, actor, mode: accessMode, bytes: chars.length });
@@ -619,6 +630,19 @@ export function startPty(opts: StartOpts): PtyHandle {
       //   ⛔ 종전 판은 계기가 IPC 층에만 있어 ***감독의 쓰기가 계기 밖***이었다(`[S]` 리뷰가 잡았다).
       noteExternalWrite(id, actor);
       lastActivityAt = Date.now();
+    },
+    bracketedPasteEnabled(): boolean { return term?.modes.bracketedPasteMode === true; },
+    async writeAll(chars: string, actor: PtyWriteActor = 'human'): Promise<void> {
+      if (!resolveWriteDecision(accessMode, actor).allow) throw new Error('PTY write denied');
+      if (writeAllActive) throw new Error('PTY verified write in progress');
+      if (!adapter.writeAll) throw new Error('PTY backend cannot verify complete writes');
+      writeAllActive = true;
+      try {
+        await adapter.writeAll(chars);
+        lastWriteActor = actor;
+        noteExternalWrite(id, actor);
+        lastActivityAt = Date.now();
+      } finally { writeAllActive = false; }
     },
     kill(signal?: NodeJS.Signals): void {
       if (exited) return;

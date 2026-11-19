@@ -20,16 +20,16 @@ test('next prompt shows a short paste label in the same isolated screen as the b
       root, rows: 24, cols: 100,
       artifactPath: process.env.NEXT_INPUT_PASTE_RECEIPT_DIR
         ? join(process.env.NEXT_INPUT_PASTE_RECEIPT_DIR, 'paste-after.json') : undefined,
-      ready: { label: 'boot', until: (screen) => screen.includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: (screen) => screen.includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q quit') }, // 출처: #38058 next TUI 크롬 영문 스윕
       steps: [
         { label: 'four-line-paste', chunks: ['\x1b[200~first line\nsecond line\nthird line\nfourth line\x1b[201~'],
-          until: (screen) => screen.includes('[붙여넣음 #1 · 4줄 · 원문]') },
+          until: (screen) => screen.includes('[Paste #1 · 4 lines · full text]') }, // 출처: #38058 next TUI 크롬 영문 스윕
       ],
     });
     const paste = result.frames.find((frame) => frame.label === 'four-line-paste')?.screen ?? '';
     expect(result.exitCode).toBe(0);
-    expect(paste).toContain('❯ [붙여넣음 #1 · 4줄 · 원문]');
-    expect(paste).not.toContain('45자');
+    expect(paste).toContain('❯ [Paste #1 · 4 lines · full text]'); // 출처: #38058 next TUI 크롬 영문 스윕
+    expect(paste).not.toContain('45 chars'); // 출처: #38058 next TUI 크롬 영문 스윕
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -48,20 +48,20 @@ test('a fake next turn receives the full pasted lines instead of the display tok
       root, rows: 24, cols: 100,
       env: { ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
         ELANOUS_TEST_FAKE_LLM_RESPONSE: 'fake paste reply' },
-      ready: { label: 'boot', until: (screen) => screen.includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: (screen) => screen.includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q quit') }, // 출처: #38058 next TUI 크롬 영문 스윕
       steps: [
         { label: 'paste', chunks: ['\x1b[200~first line\nsecond line\nthird line\nfourth line\x1b[201~'],
-          until: (screen) => screen.includes('[붙여넣음 #1 · 4줄 · 원문]') },
+          until: (screen) => screen.includes('[Paste #1 · 4 lines · full text]') }, // 출처: #38058 next TUI 크롬 영문 스윕
         { label: 'submit', keys: '\r', until: (screen) => screen.includes('fake paste reply')
-          && screen.includes('나: first line') && screen.includes('fourth line') },
+          && screen.includes('> first line') && screen.includes('fourth line') }, // 출처: #38058 next TUI 크롬 영문 스윕
       ],
     });
     const submitted = result.frames.find((frame) => frame.label === 'submit')?.screen ?? '';
     expect(result.exitCode).toBe(0);
-    expect(submitted).toContain('나: first line');
+    expect(submitted).toContain('> first line'); // 출처: #38058 next TUI 크롬 영문 스윕
     expect(submitted).toContain('  fourth line');
     expect(submitted).toContain('fake paste reply');
-    expect(submitted).not.toContain('[붙여넣음 #1');
+    expect(submitted).not.toContain('[Paste #1'); // 출처: #38058 next TUI 크롬 영문 스윕
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

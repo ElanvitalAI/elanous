@@ -1,4 +1,5 @@
 import type { NextTuiQueueItem, NextTuiQueueNoticeSource } from './queue.js';
+import { isUrgentSeatMail } from '../seat-mail-priority.js';
 import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-context-header.js';
 
 /**
@@ -9,7 +10,7 @@ import { seatMessageContextBlock, type ContextHeaderInput } from '../../msg/msg-
 
 /** 큐에서 생산자가 쓰는 표면만 — 단위시험은 가짜 없이 진짜 큐를 그대로 쓴다. */
 export interface ChildNoticeQueue {
-  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number }): NextTuiQueueItem;
+  enqueueNotice(text: string, source: NextTuiQueueNoticeSource, meta?: { msgId?: number; occurredAt?: number; urgent?: boolean }): NextTuiQueueItem;
   readonly items: readonly NextTuiQueueItem[];
 }
 
@@ -82,9 +83,10 @@ export function eventWatchNotice(line: string): string | null {
 }
 
 /** SEAT-INBOX B1-C §3a — 메시지 한 통 = notice 한 항목. 문구 = §5d 머리줄 ⊕ msg:<id> ⊕ 전문(모델 맥락 그대로). */
-export type SeatMessageNoticeInput = ContextHeaderInput & { id: number; body: string; createdAt?: string };
+export type SeatMessageNoticeInput = ContextHeaderInput & { id: number; body: string; createdAt?: string; unreadTotal?: number };
 export function seatMessageNotice(message: SeatMessageNoticeInput): string {
-  return seatMessageContextBlock(message);
+  const body = seatMessageContextBlock(message);
+  return message.unreadTotal === undefined ? body : `${body}\n\n[미읽음 총 ${message.unreadTotal}통]`;
 }
 
 /**
@@ -139,6 +141,7 @@ export function createChildNoticeProducers(queue: ChildNoticeQueue) {
       const occurredAt = message.createdAt === undefined ? undefined : Date.parse(message.createdAt);
       return queue.enqueueNotice(seatMessageNotice(message), 'seat-mail', {
         msgId: message.id,
+        ...(isUrgentSeatMail(message) ? { urgent: true } : {}),
         ...(occurredAt === undefined || Number.isNaN(occurredAt) ? {} : { occurredAt }),
       });
     },

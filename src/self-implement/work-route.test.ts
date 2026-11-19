@@ -15,6 +15,7 @@ import { WORK_TIER_LADDER_CELL } from '../model-tier/work-tier-policy.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { buildUserConfig, resolveRoleLlm, setUserConfigOverlay } from '../user-config.js';
 import { debug } from '../debug/log.js';
+import { defaultSeams } from './seams.js';
 import type { RunLedgerEntry } from './run-ledger.js';
 import { coreAdvisorForGoalLoop } from '../core-turn/core-advisor-wiring.js';
 
@@ -48,7 +49,7 @@ async function launch(goalDocument: string, childLlm?: { provider: string; model
     binRoot: '/tmp/repo', cwd: '/tmp/hdr-child', featurePrompt: `decorated instructions ${PROSE_MARKER}`,
     goalDocument, runId: 'run-hdr-wiring', ...(childLlm ? { childLlm } : {}),
     recordWorkRoute: (entry) => { rows.push(entry); },
-    // 출처: R-TST36 — 가짜 spawn 은 isAlive 두 번 뒤 끝나 이 값은 실제 대기가 아니다(src/llm/difficulty.test.ts 의 가짜 발사와 같은 값).
+    // 출처: R-TST36 — 가짜 spawn 은 isAlive 두 번 뒤 끝나 이 값은 실제 대기가 아니다(가짜 발사).
     maxWaitSec: 1, maxHardWaitSec: 1, pollMs: 1, activityGraceSec: 100,
     ptyAvailable: () => true,
     spawn: ((options: { env: Record<string, string> }) => {
@@ -412,4 +413,32 @@ describe('COST-OPTIMIZER-WINDOW-AWARE — unmeasured window signals are marked (
       expect(plan.decision.unmeasured).toEqual(['resetsAtMs', 'costRank', 'mustLastUntilMs']);
     } finally { log.mockRestore(); }
   });
+});
+
+test('retired placement key cannot change PTY or synchronous fallback launch model', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'legacy-placement-launch-'));
+  const inherited = process.env.ELANOUS_LLM_MODEL;
+  delete process.env.ELANOUS_LLM_MODEL;
+  try {
+    const path = join(dir, 'config.json');
+    writeFileSync(path, JSON.stringify({ llm: { provider: 'openai-codex' }, harness: { difficultyPlacement: true, difficultyRouter: 'shadow' } }));
+    const cfg = buildUserConfig(path);
+    setUserConfigOverlay(() => cfg);
+    const authored = ['Goal', '- GoalType: implement', '대상 경로: src/a.ts', '## 판정 신호', '- Candidate decision signal:', '  - Expected result: passes'].join('\n');
+    const pty = await launch(authored);
+    expect(pty.env.ELANOUS_LLM_PROVIDER).toBe('openai-codex');
+    expect(pty.env.ELANOUS_LLM_MODEL).toBe('gpt-6.1-terra');
+    let fallback: Record<string, string | undefined> = {};
+    const implementation = defaultSeams({ ptyAvailable: () => false,
+      spawnSync: ((_cmd: string, _args: string[], opts: { env?: Record<string, string | undefined> }) => {
+        fallback = opts.env ?? {}; return { stdout: '', stderr: '', status: 0, signal: null };
+      }) as never }).implement;
+    await implementation({ cwd: dir, feature: authored, runId: 'legacy-placement-regression' });
+    expect(fallback.ELANOUS_LLM_PROVIDER).toBe('openai-codex');
+    expect(fallback.ELANOUS_LLM_MODEL).toBe('gpt-6.1-terra');
+  } finally {
+    if (inherited === undefined) delete process.env.ELANOUS_LLM_MODEL; else process.env.ELANOUS_LLM_MODEL = inherited;
+    setUserConfigOverlay(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

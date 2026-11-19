@@ -21,6 +21,19 @@ export function fitCells(text: string, width: number): string {
   return out + ' '.repeat(Math.max(0, width - used));
 }
 
+/** `text` cut to `width` terminal cells (wide characters count 2), not padded. */
+export function clipCells(text: string, width: number): string {
+  let out = '';
+  let used = 0;
+  for (const { segment } of graphemes.segment(text)) {
+    const cells = Bun.stringWidth(segment);
+    if (used + cells > width) break;
+    out += segment;
+    used += cells;
+  }
+  return out;
+}
+
 const SGR = /(\u001b\[[0-9;]*m)/;
 
 /** `text` (may carry SGR colour sequences) cut to `width` terminal cells and padded; escapes cost no width, and any colour
@@ -105,6 +118,16 @@ export interface PaneRow {
   readonly pane: string; readonly wsId: string; readonly workspace: string; readonly title: string; readonly state: string;
   /** Set on a pane of another host (a registered els host or `herdr`): `pane` is then its full address `host:ws/tab/pane`. */
   readonly remote?: string;
+  /** ELS-REMOTE-MARKER: its host is reported down — the last known row stays in the list, dimmed and marked «?». */
+  readonly stale?: boolean;
+}
+
+/** Unreachable mark (design DESIGN-ELS-SIDETAB-SERVER §원격 «닿지 않음 ?»); «✕ host off» needs the host heartbeat (FU). */
+export const UNREACHABLE_MARK = '?';
+
+function buildBadge(value: unknown): string {
+  const build = value && typeof value === 'object' ? value as { sha?: unknown; age?: unknown } : {};
+  return typeof build.sha === 'string' ? `[자체보고·미인증:${build.sha.slice(0, 7)} ${String(build.age ?? 'unknown')}]` : '[build unknown]';
 }
 
 /** The rows of an `els ls` answer, in the server's order. Anything that is not a list gives no rows. */
@@ -118,7 +141,7 @@ export function parsePaneRows(listJson: string): PaneRow[] {
     if (!raw || typeof raw !== 'object') continue;
     const row = raw as Record<string, unknown>;
     if (typeof row.pane !== 'string' || typeof row.address !== 'string') continue;
-    rows.push({ pane: row.pane, wsId: row.address.split('/')[0] ?? '', workspace: String(row.workspace ?? ''), title: String(row.title ?? row.pane), state: String(row.state ?? '') });
+    rows.push({ pane: row.pane, wsId: row.address.split('/')[0] ?? '', workspace: String(row.workspace ?? ''), title: `${String(row.title ?? row.pane)} ${buildBadge(row.build)}`, state: String(row.state ?? '') });
   }
   return rows;
 }
@@ -141,7 +164,7 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
     const title = String(row.title ?? '');
     const split = row.host === 'herdr' ? title.indexOf(' · ') : -1;
     const label = split > 0 ? title.slice(0, split) : row.ws;
-    rows.push({ pane: row.address, wsId: `${row.host}:${row.ws}`, workspace: `⇄${row.host} ${label}`, title: split > 0 ? title.slice(split + 3) : title || String(row.pane ?? row.address),
+    rows.push({ pane: row.address, wsId: `${row.host}:${row.ws}`, workspace: `⇄${row.host} ${label}`, title: `${split > 0 ? title.slice(split + 3) : title || String(row.pane ?? row.address)} ${buildBadge(row.build)}`,
       state: String(row.state ?? ''), remote: row.host });
   }
   return rows;
@@ -155,6 +178,9 @@ export function wordOfState(state: string): StatusWord {
 const COLOR_SGR: Readonly<Record<StatusColor, string>> = { green: `${ESC}[32m`, yellow: `${ESC}[33m`, dim: `${ESC}[2m`, red: `${ESC}[31m` };
 const markOf = (word: StatusWord): string => `${COLOR_SGR[STATUS[word].color]}${STATUS[word].mark}${ESC}[0m`;
 const REVERSE = `${ESC}[7m`;
+
+// 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ 하단 항상 · UX #38884 FIRST_RUN_HINT 리터럴
+export const FIRST_RUN_HINT = 'ctrl+b c new shell · a chat · s list · j/k move · x close · q quit · ? help';
 
 /** The workspace line shows the most urgent state inside it (blocked, then working, then idle, then done). */
 function rolledUp(words: readonly StatusWord[]): StatusWord {
@@ -194,6 +220,8 @@ export interface ComposeInput {
   /** ELS-ONE-SPACE: the selected space's tab row (space-tabs-view buildTabRow), drawn as the centre's first line; the pane
    *  sits under it. Absent = no row (the pane starts at the top). */
   readonly tabRow?: string;
+  /** ELS-EXIT-BG-BUTTONS: drawn at the right end of the status line (the status is cut to the room left). */
+  readonly buttons?: string;
 }
 
 /** One full repaint: sidebar (when it fits) | pane, the status line last, and the terminal cursor put where the pane's is. */
@@ -206,10 +234,16 @@ export function composeView(view: ComposeInput): string {
   const top = view.tabRow !== undefined ? 1 : 0;
   const lines: string[] = [];
   for (let row = 0; row < view.rows - 1; row++) {
-    const centreText = row < top ? fitCells(view.tabRow!, centre) : fitAnsi(body[row - top] ?? '', centre);
+    const centreText = row < top ? fitAnsi(view.tabRow!, centre) : fitAnsi(body[row - top] ?? '', centre);
     lines.push(`${sidebar ? `${fitAnsi(sidebar[row] ?? '', SIDEBAR_COLS)}│` : ''}${centreText}`);
   }
-  lines.push(`${REVERSE}${fitCells(view.status, view.cols)}${ESC}[0m`);
+  // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ — status 는 리터럴 그대로 (패딩 없이; trimRight 화면 판독과 양립)
+  // ELS-FIRST-RUN-FU3 ①: cut to the width (no padding) — a long status on a narrow terminal must not wrap and push the
+  // whole repaint up a line.
+  const buttons = view.buttons !== undefined && Bun.stringWidth(view.buttons) < view.cols ? view.buttons : '';
+  const room = view.cols - Bun.stringWidth(buttons);
+  const status = clipCells(view.status, room);
+  lines.push(`${REVERSE}${status}${buttons ? `${' '.repeat(room - Bun.stringWidth(status))}${ESC}[0m${buttons}` : ''}${ESC}[0m`);
   const cursorRow = header ? Number(header[1]) + top : -1;
   const cursorCol = header ? Number(header[2]) : -1;
   const showCursor = header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;

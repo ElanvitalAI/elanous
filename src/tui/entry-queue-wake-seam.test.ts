@@ -12,7 +12,7 @@ describe('queueWakeBarrierForTest — the C6 seam sits before the door and the d
     const doorAt = branch.indexOf("entryDoor?.door.offer('event')");
     expect(start).not.toBe(-1);
     expect(barrierAt).not.toBe(-1);
-    expect(doorAt).toBeGreaterThan(barrierAt);
+    expect(doorAt).toBeGreaterThan(barrierAt); // 출처: #38804 문(dispatch) 장벽 순서 규칙 — turn-start가 큐 배리어 뒤에 온다
   });
 
   test('the seam is observed as a turn-life event and production leaves it unset', () => {

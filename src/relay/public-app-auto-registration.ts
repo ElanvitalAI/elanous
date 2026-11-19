@@ -35,6 +35,9 @@ export interface RelayPublicPolicySnapshot {
   readonly publicReadExpiresAt?: ReadonlyMap<string, number>;
   /** handle -> owning member id; unset claims reject auto pins (fail-closed). */
   readonly publicHandleClaimOwners?: ReadonlyMap<string, string>;
+  /** (출처: #106092) ⓑ — member-service 결속 키 집합(회원 서버 역할). owner
+   * 없이 정책이 유효하고, ems_ 없는 연결은 일반 호스트 슬롯으로도 fail-closed. */
+  readonly memberServiceServerIds?: ReadonlySet<string>;
   readonly publicVisitorWritePolicies: readonly PublicAppVisitorWritePolicy[];
 }
 
@@ -43,6 +46,9 @@ export interface RelayPublicPolicyFiles {
   readonly hostOwnerMembers: string;
   readonly publicDispatch: string;
   readonly publicRead: string;
+  /** (출처: #106092) ⓑ — 선택 결속 파일(JSON serverId→true). 등재 키는
+   * trustedHostKeys 필수이며 owner 결속이 있으면 로드가 거부된다. */
+  readonly memberServiceHosts?: string;
   readonly visitorWrite?: string;
   readonly publicHandleClaims?: string;
   readonly autoRegistrations?: string;
@@ -683,6 +689,46 @@ export function createRelayAutoAppRegistrar(options: {
         throw new Error("auto handle pin server already routes a handle");
       applyRows(store.apps, false, [...store.pins, pin]);
     },
+    // OP #105017 ⓐ①③ — 인증된 «핀 읽기»: store.pins 에서 이 인증 호스트가
+    // 회원 M 소유로 핀한 라이브 라우트인지만 불리언으로 답한다(남의 핸들 → false).
+    queryHandlePin(
+      authenticatedServerId: string,
+      authenticatedOwnerId: string,
+      input: { user: string; memberId: string },
+    ) {
+      if (input.memberId !== authenticatedOwnerId) return false;
+      const store = loadRows();
+      return store.pins.some(
+        (item) =>
+          item.user === input.user &&
+          item.serverId === authenticatedServerId &&
+          item.ownerId === authenticatedOwnerId,
+      );
+    },
+    // (출처: #39104) 회원 서버 서비스 자격 «핀 읽기» — 인증 주체(연결 소유자)와
+    // 무관하게 회원 M 소유의 핀 여부만 불리언으로 답한다. 핀 쓰기는 이 자격으로
+    // 절대 열리지 않는다(쓰기는 emt_ 소유자 대조만 지난다).
+    // (출처: #39121 · OP #106416) 정적 public-dispatch 경로가 있는 핸들은 pinHandle 이
+    // «collides with the operator dispatch table» 으로 동적 핀을 정책상 거부하므로
+    // store.pins(동적 핀)만 읽으면 소유 확인된 정적 claim(운영자 확인 회원 소유)이
+    // 영원히 «안 핀됨» 으로 답해 회원 홈 웹채팅 링크가 죽는다. 동적 핀이 없으면 정적
+    // claim 소유자 대조로 답한다: claim memberId 가 조회 회원과 일치할 때만 true —
+    // 남의 핸들·다른 회원은 false.
+    queryHandlePinByMember(input: { user: string; memberId: string }) {
+      const store = loadRows();
+      if (
+        store.pins.some(
+          (item) =>
+            item.user === input.user && item.ownerId === input.memberId,
+        )
+      )
+        return true;
+      const staticPolicy = options.staticPolicy();
+      return (
+        staticPolicy.publicHandleClaimOwners?.get(input.user) ===
+        input.memberId
+      );
+    },
     unregister(
       authenticatedServerId: string,
       authenticatedOwnerId: string,
@@ -792,9 +838,10 @@ export function loadRelayPublicPolicySnapshot(
   const names = [
     files.trustedHostKeys,
     files.hostOwnerMembers,
-    files.publicDispatch,
-    files.publicRead,
-    ...(files.visitorWrite ? [files.visitorWrite] : []),
+        files.publicDispatch,
+        files.publicRead,
+        ...(files.memberServiceHosts ? [files.memberServiceHosts] : []),
+        ...(files.visitorWrite ? [files.visitorWrite] : []),
     ...(files.publicHandleClaims ? [files.publicHandleClaims] : []),
     ...(files.autoRegistrations ? [files.autoRegistrations] : []),
   ];
@@ -856,6 +903,28 @@ export function loadRelayPublicPolicySnapshot(
     }
     claims.set(handle, memberId);
   }
+  // (출처: #106092) ⓑ — 선택 member-service 결속 파일(serverId→true 집합).
+  // 없으면 빈 집합(기존 정책 무변경).
+  const memberServiceHostsValue: unknown = files.memberServiceHosts
+    ? JSON.parse(
+        first[names.indexOf(files.memberServiceHosts)]!.raw.toString("utf8"),
+      )
+    : {};
+  if (
+    !memberServiceHostsValue ||
+    typeof memberServiceHostsValue !== "object" ||
+    Array.isArray(memberServiceHostsValue)
+  ) {
+    throw new Error("invalid relay policy member service host");
+  }
+  const memberServiceServerIds = new Set<string>();
+  for (const [serverId, enabled] of Object.entries(
+    memberServiceHostsValue as Record<string, unknown>,
+  )) {
+    if (!/^[a-f0-9]{64}$/.test(serverId) || enabled !== true)
+      throw new Error("invalid relay policy member service host");
+    memberServiceServerIds.add(serverId);
+  }
   const staticCandidate = validatedRelayPublicPolicySnapshot(
     {
       trustedHostKeys: keys,
@@ -863,6 +932,9 @@ export function loadRelayPublicPolicySnapshot(
       publicDispatchRoutes: loadPublicDispatchRoutes(files.publicDispatch),
       publicReadableApps: loadPublicAppReadConfig(files.publicRead),
       ...(claims.size ? { publicHandleClaimOwners: claims } : {}),
+      ...(memberServiceServerIds.size
+        ? { memberServiceServerIds }
+        : {}), // (출처: #106092) ⓑ
       publicVisitorWritePolicies: files.visitorWrite
         ? loadPublicAppVisitorWriteConfig(files.visitorWrite)
         : [],
@@ -897,13 +969,29 @@ export function validatedRelayPublicPolicySnapshot(
     throw new Error("invalid relay policy snapshot");
   const keys = new Map(input.trustedHostKeys);
   const owners = new Map(input.hostOwnerMemberIds);
+  // (출처: #106092) ⓑ — 결속 서비스 키는 trustedHostKeys 필수(①). owner
+  // 결속이 있으면 정책가 거부된다(② — 임시 owner 우회 구조적 차단).
+  const memberServiceServerIds = input.memberServiceServerIds
+    ? new Set(input.memberServiceServerIds)
+    : undefined;
+  for (const memberServiceServerId of memberServiceServerIds ?? []) {
+    if (!keys.get(memberServiceServerId))
+      throw new Error("invalid relay policy member service binding");
+  }
   for (const [serverId, publicKey] of keys) {
     if (
       !/^[a-f0-9]{64}$/.test(serverId) ||
-      !/^[A-Za-z0-9_-]{43}$/.test(publicKey) ||
-      !owners.get(serverId)
+      !/^[A-Za-z0-9_-]{43}$/.test(publicKey)
     )
       throw new Error("invalid relay policy host binding");
+    // (출처: #106092) ⓑ — 서비스 키는 owner 없음이 허용된다(③). 비-서비스
+    // 키는 기존 owner 강제를 그대로 유지한다.
+    if (memberServiceServerIds?.has(serverId)) {
+      if (owners.get(serverId))
+        throw new Error("invalid relay policy member service binding");
+    } else if (!owners.get(serverId)) {
+      throw new Error("invalid relay policy host binding");
+    }
   }
   const routes = buildPublicDispatchRoutes(
     new Map(input.publicDispatchRoutes),
@@ -961,6 +1049,9 @@ export function validatedRelayPublicPolicySnapshot(
     publicReadableApps: reads,
     publicReadExpiresAt: readExpiresAt,
     ...(claimOwners?.size ? { publicHandleClaimOwners: claimOwners } : {}),
+    ...(memberServiceServerIds?.size
+      ? { memberServiceServerIds }
+      : {}), // (출처: #106092) ⓑ — 결속 집합은 재검증·재적재에서 유지된다.
     publicVisitorWritePolicies: writes,
   };
 }
@@ -1000,6 +1091,7 @@ export function relayPublicPolicyFingerprint(
     writes: [...input.publicVisitorWritePolicies].sort((a, b) =>
       (a.user + "/" + a.app).localeCompare(b.user + "/" + b.app),
     ),
+    memberServices: [...(input.memberServiceServerIds ?? [])].sort(), // (출처: #106092) ⓑ
   };
   return createHash("sha256").update(JSON.stringify(ordered)).digest("hex");
 }

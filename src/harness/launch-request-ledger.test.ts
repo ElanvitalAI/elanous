@@ -1,18 +1,31 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { handTask } from '../task-agent/task-hand.js';
 import { installHarnessCliCommand } from './harness-cli-command.js';
-import { LAUNCH_DOOR_RECEIPT_ENV, launchRequestId, openLaunchRequestDoor, summarizeLaunchRequestRows } from '../execution-loop/launch-gate.js';
+import { LAUNCH_DOOR_RECEIPT_ENV, TA_PREFLIGHT_RECEIPT_ENV, TA_PREFLIGHT_SHA_ENV, launchRequestId, openLaunchRequestDoor, summarizeLaunchRequestRows } from '../execution-loop/launch-gate.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 // LAUNCH-SINGLE-DOOR-1C — 발사 요청의 단일 문: append 전용 요청 원장 ⊕ requestId 단위 단일 소비 영수증.
 // 격리 test 우주(임시 인스턴스 루트)에서 같은 requestId 의 중복 요청 2회가 자식 발사 1회로 수렴하고
 // 거절·실패·재시도 사유가 원장 조회로 읽히는지를 잰다.
 const dirs: string[] = [];
+const preflightEnvKeys = [TA_PREFLIGHT_RECEIPT_ENV, TA_PREFLIGHT_SHA_ENV] as const;
+let previousPreflightEnv: Array<string | undefined>;
+beforeEach(() => {
+  // handTask reads these before the injected door, so isolate host admission state too.
+  previousPreflightEnv = preflightEnvKeys.map((key) => process.env[key]);
+  for (const key of preflightEnvKeys) delete process.env[key];
+});
 afterEach(() => {
+  preflightEnvKeys.forEach((key, i) => {
+    const previous = previousPreflightEnv[i];
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  });
   resetElanousConfigDir();
   process.exitCode = 0;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -96,23 +109,34 @@ test('harness launch-requests fails instead of reporting zero when the ledger ca
   } finally { error.mockRestore(); process.exitCode = priorExitCode ?? 0; }
 });
 
+// The door validates a real, isolated READY receipt; no host admission state or live process is used.
+function handDoor(root: string, card: string, now: () => Date) {
+  const receiptPath = join(root, 'preflight.json');
+  const receipt = JSON.stringify({ kind: 'ta-preflight', createdAt: now().toISOString(), target: { card }, report: { overall: 'READY' } });
+  writeFileSync(receiptPath, receipt);
+  return openLaunchRequestDoor({ root, source: 'hand', now, admission: {
+    holdFile: join(root, 'no-hold'), receiptPath, receiptSha256: createHash('sha256').update(receipt).digest('hex'),
+  } });
+}
+
 test('TASK-HAND-RETRY: 같은 카드 문면은 하루 뒤 새 넘김 시도로 다시 발사된다', async () => {
   const root = mkdtempSync(join(tmpdir(), 'launch-door-hand-'));
   dirs.push(root);
   setElanousConfigDir(root);
-  const door = openLaunchRequestDoor({ root, source: 'hand' });
+  let now = new Date('2026-10-28T10:00:00.000Z');
+  let door = handDoor(root, 'ta-retry-same-card', () => now);
   const text = '대상 경로: src/execution-loop/launch-gate.ts\n같은 원문의 과제를 두 번 넘긴다';
   const state = join(root, 'task-agent-actions.json');
   let launches = 0;
-  const launcher = async () => {
+  const launcher = async (_args: string[], _cwd?: string, context?: { runId: string }) => {
     launches += 1;
-    return { runId: 'run-launch-door-1' };
+    return { runId: context!.runId };
   };
-  let now = new Date('2026-10-28T10:00:00.000Z');
   const hand = () => handTask({ id: 'ta-retry-same-card', text, live: true, statePath: state, now: () => now, launchRequestDoor: door,
     prelaunchInspector: () => ({ reason: 'completion-not-code-pr' }), launcher });
   const first = await hand();
   now = new Date('2026-10-29T10:00:00.000Z');
+  door = handDoor(root, 'ta-retry-same-card', () => now);
   const duplicate = await hand();
   expect(launches).toBe(2);
   expect(first.launched).toBe(true);
@@ -122,7 +146,7 @@ test('TASK-HAND-RETRY: 같은 카드 문면은 하루 뒤 새 넘김 시도로 �
   const requests = rows.filter((row) => row.event === 'requested');
   expect(requests).toHaveLength(2);
   expect(new Set(requests.map((row) => row.requestId)).size).toBe(2);
-  expect(rows.filter((row) => row.event === 'consumed')).toHaveLength(2);
+  expect(rows.map((row) => row.event)).toEqual(['requested', 'consumed', 'requested', 'consumed']);
   expect(rows.some((row) => row.event === 'refused-duplicate')).toBe(false);
   const output: string[] = [];
   const log = spyOn(console, 'log').mockImplementation((line: string) => { output.push(line); });
@@ -138,19 +162,20 @@ test('TASK-HAND-RETRY: 실패한 넘김은 새 시도 키로 재발사할 수 �
   const root = mkdtempSync(join(tmpdir(), 'launch-door-fail-'));
   dirs.push(root);
   setElanousConfigDir(root);
-  const door = openLaunchRequestDoor({ root, source: 'hand' });
+  let now = new Date('2026-10-28T10:00:00.000Z');
+  let door = handDoor(root, 'ta-failed-retry', () => now);
   const text = '발사기가 죽는 과제 원문';
   const state = join(root, 'task-agent-actions.json');
-  let now = new Date('2026-10-28T10:00:00.000Z');
   await expect(handTask({ text, live: true, statePath: state, launchRequestDoor: door,
     id: 'ta-failed-retry', now: () => now, prelaunchInspector: () => ({ reason: 'completion-not-code-pr' }),
     launcher: async () => { throw new Error('spawn ENOENT: bun'); } }))
     .rejects.toThrow('spawn ENOENT: bun');
   now = new Date('2026-10-29T10:00:00.000Z');
+  door = handDoor(root, 'ta-failed-retry', () => now);
   const retry = await handTask({ text, live: true, statePath: state, launchRequestDoor: door,
     id: 'ta-failed-retry', now: () => now,
     prelaunchInspector: () => ({ reason: 'completion-not-code-pr' }),
-    launcher: async () => ({ runId: 'run-retry' }) });
+    launcher: async (_args, _cwd, context) => ({ runId: context!.runId }) });
   expect(retry.launched).toBe(true);
   const rows = door.rows().filter((row) => row.source === 'hand');
   expect(rows.map((row) => row.event)).toEqual(['requested', 'consumed', 'launch-failed', 'requested', 'consumed']);
@@ -161,12 +186,12 @@ test('TASK-HAND-RETRY: 시도별 영수증이 있어도 실행 중인 같은 골
   const root = mkdtempSync(join(tmpdir(), 'launch-door-active-hand-'));
   dirs.push(root);
   setElanousConfigDir(root);
-  const door = openLaunchRequestDoor({ root, source: 'hand' });
+  const door = handDoor(root, 'ta-active-card', () => new Date());
   const text = '대상 경로: src/task-agent/task-hand.ts\n같은 카드의 활성 런은 중복 실행하지 않는다';
   let contextEnv: Record<string, string> | undefined;
   const handed = await handTask({ id: 'ta-active-card', text, live: true, statePath: join(root, 'task-agent-actions.json'),
     launchRequestDoor: door, prelaunchInspector: () => ({ reason: 'completion-not-code-pr' }),
-    launcher: (_args, _cwd, context) => { contextEnv = context?.env; return { runId: 'run-active-card' }; } });
+    launcher: (_args, _cwd, context) => { contextEnv = context?.env; return { runId: context!.runId }; } });
   expect(handed.launched).toBe(true);
   expect(contextEnv?.ELANOUS_TASK_CARD_ID).toBe('ta-active-card');
   const inherited = contextEnv?.[LAUNCH_DOOR_RECEIPT_ENV];

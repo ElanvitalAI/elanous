@@ -1,7 +1,7 @@
 /** Human confirmation bridge for Bash calls made by the Next TUI's REPL child. */
 import { isPotentiallyDestructiveShellCommand } from '../cli/shell-confirmation-policy.js';
 import { isPublicApprovalUrl } from '../tui/publish-approval-session.js';
-import { APPROVAL_APPROVED, APPROVAL_DECLINED, normalizeApproval, type ApprovalHoldReason, type ApprovalOutcome } from '../graph-runner/approval-outcome.js';
+import { APPROVAL_APPROVED, APPROVAL_DECLINED, isApprovalHold, normalizeApproval, type ApprovalHoldReason, type ApprovalOutcome } from '../graph-runner/approval-outcome.js';
 
 export const NEXT_TUI_SHELL_APPROVAL_IPC_ENV = 'ELANOUS_NEXT_TUI_SHELL_APPROVAL_IPC';
 export const NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS = 5 * 60_000;
@@ -174,7 +174,7 @@ export function answerShellApprovalCall(
     try { if (handler) outcome = normalizeApproval(await handler(message.command, message.callId)); }
     catch { outcome = { approved: false, reason: 'unavailable' }; }
     return { type: RESULT_TYPE, callId: message.callId, approved: outcome.approved,
-      ...(!outcome.approved && outcome.reason !== 'declined' ? { reason: outcome.reason } : {}) };
+      ...(!outcome.approved && isApprovalHold(outcome) ? { reason: outcome.reason } : {}) };
   })();
 }
 

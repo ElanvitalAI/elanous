@@ -252,7 +252,7 @@ export function classifyReviewProviderFailure(message: string): ReviewFailureRea
     || /credentials?\s+(?:are\s+)?unavailable/.test(m)) return 'credentials-unavailable';
   // ⭐ 실물 문면을 먼저 둔다 — `#10069` 가 낸 그 문장이다.
   if (m.includes('overloaded') || m.includes('server_overloaded')) return 'overloaded';
-  if (m.includes('rate limit') || m.includes('rate_limit') || m.includes('429')) return 'rate-limited';
+  if (m.includes('rate limit') || m.includes('rate_limit') || m.includes('429') || /insufficient[_ -]quota|credit.{0,30}(?:exhaust|insufficient|deplet)/.test(m)) return 'rate-limited';
   if (/\b5\d\d\b/.test(m) || m.includes('internal server error') || m.includes('bad gateway')) return 'server-error';
   if (m.includes('timed out') || m.includes('timeout') || m.includes('etimedout')) return 'timeout';
   if (m.includes('model is not supported') || m.includes('model') && m.includes('provider')) return 'model-provider-mismatch';
@@ -441,6 +441,7 @@ export async function runReviewWithFallback(
     preSkipped?: readonly ReviewProviderCandidateSkip[];
     /** Maximum real provider calls; an availability skip does not spend this budget. */
     maxCalls?: number;
+    shouldFallback?: (attempt: ReviewProviderAttempt, reason: ReviewFailureReason) => boolean;
   } = {},
 ): Promise<{ text: string; used: ReviewProviderAttempt; attemptIndex: number }> {
   if (attempts.length === 0) throw new Error('review fallback: no attempts configured');
@@ -499,7 +500,7 @@ export async function runReviewWithFallback(
       const reason = classifyReviewProviderFailure(errorMessage);
       const resolved = resolvedProvider ? { resolvedProvider } : {};
       // ⛔ 제공자 가용성 오류만 다음 시도로 넘긴다. 다른 실패도 유한 사유·원문을 남긴다.
-      if (!isReviewFallbackReason(reason)) {
+      if (!isReviewFallbackReason(reason) || options.shouldFallback?.(attempt, reason) === false) {
         try { observe('exhausted', { ...base, ...resolved, afterReason: reason, errorMessage }); } catch { /* fail-soft */ }
         throw error;
       }

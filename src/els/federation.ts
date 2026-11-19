@@ -20,7 +20,7 @@ export interface FederationDeps {
   readonly postJson?: (host: FederatedHost, path: string, payload: unknown) => Promise<{ status: number; body: unknown }>;
 }
 
-interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string }
+interface RemotePane { ws: string; tab: string; pane: string; title: string; cwd: string; state: string; build?: unknown }
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
@@ -37,7 +37,7 @@ function remotePanes(body: unknown, hostName: string): RemotePane[] | undefined 
     const reparsed = parseAddress(formatAddress(parts));
     if (!reparsed || reparsed.ws !== parts.ws || reparsed.tab !== parts.tab || reparsed.pane !== parts.pane) return undefined;
     rows.push({ ws: parts.ws, tab: parts.tab, pane: parts.pane,
-      title: String(pane.title ?? ''), cwd: String(pane.cwd ?? ''), state: String(pane.state ?? '') });
+      title: String(pane.title ?? ''), cwd: String(pane.cwd ?? ''), state: String(pane.state ?? ''), build: pane.build });
   }
   return rows;
 }

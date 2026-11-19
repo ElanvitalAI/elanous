@@ -75,6 +75,7 @@ import type { MsgStore } from '../msg/msg-store.js';
 import { consumeWaiverEventFromLedger, gateWaiverEvidence, hasExactWaiverEvidence } from '../release-loop/waiver-events.js';
 import { fanOutGraphSource, nextNode, planHarnessLoopRoute, releaseRouteReachesKnownIssues, topLevelTerminalStatus, type PlannedStep } from './runner-routing.js';
 import { lastJsonObject, STOPPED_NODE_ERROR } from './runner-primitives.js';
+import { parsePromptOutputSpec, runStructuredPrompt, type PromptOutputSpec } from './prompt-output.js';
 import { declaredHealEdges, graphHealManifest, type DeclaredHealEdge } from './declared-heal-edges.js';
 import type { GraphGrowthScope, GraphLoopBudgetScope, GraphNodeLifecycleEvent, GraphNodeLifecyclePhase, GraphRun, GraphRunOptions, GraphRunState, S2CorrectionBudget } from './runner-types.js';
 
@@ -528,7 +529,8 @@ export function hitlChoiceDecision(option: { default?: boolean }): 'approved' | 
 }
 
 type CommandRecipe = { command: string; dry_run_command?: string; timeout_ms?: number };
-type PromptRecipe = { prompt: string };
+/** GRAPH-LLM-JSON-OUTPUT — `output` declares the reply JSON (prompt-output.ts); without it the reply is stored as text. */
+type PromptRecipe = { prompt: string; output?: PromptOutputSpec };
 type Recipe = CommandRecipe | PromptRecipe | ({ approval: string } & Partial<CommandRecipe>);
 
 /** 접두 없는 recipe 가 카탈로그 역할이고, 그래프 옆 recipes.yaml 에 같은 키의 `{ command }` 가 있을 때만 cmd 처럼 실행한다. */
@@ -622,8 +624,10 @@ function recipesFor(path: string, recipeSource: string): Record<string, Recipe> 
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`invalid recipe: ${id}`);
     const item = raw as Record<string, unknown>;
     if (Object.hasOwn(item, 'prompt')) {
-      if (typeof item.prompt !== 'string' || !item.prompt.trim() || Object.keys(item).some(key => key !== 'prompt')) throw new Error(`invalid recipe: ${id}`);
-      recipes[id] = { prompt: item.prompt };
+      if (typeof item.prompt !== 'string' || !item.prompt.trim() || Object.keys(item).some(key => key !== 'prompt' && key !== 'output')) throw new Error(`invalid recipe: ${id}`);
+      const output = item.output === undefined ? undefined : parsePromptOutputSpec(item.output);
+      if (typeof output === 'string') throw new Error(`invalid recipe: ${id}: ${output}`);
+      recipes[id] = { prompt: item.prompt, ...(output ? { output } : {}) };
     } else if (Object.hasOwn(item, 'approval')) {
       if (typeof item.approval !== 'string' || !item.approval.trim() ||
         (item.command !== undefined && (typeof item.command !== 'string' || !item.command.trim())) ||
@@ -1346,7 +1350,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (saved?.unitPins) {
     for (const [node, pin] of Object.entries(saved.unitPins)) {
       const current = unitPins[node];
-      if (!current || current.unit !== pin.unit || current.version !== pin.version || current.path !== pin.path ||
+      // A resume may run from a different checkout path than the run that
+      // recorded the pin; the unit source is compared by content hash
+      // (unit, version, hash, shapeHash), never by absolute path.
+      if (!current || current.unit !== pin.unit || current.version !== pin.version ||
           current.hash !== pin.hash || current.shapeHash !== pin.shapeHash)
         throw new Error(`unit source changed since run started: ${node}`);
     }
@@ -2782,6 +2789,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const result = await runArgSupervisorTick({ loopPath: resolve(dirname(path), 'rla/loop.yaml'), root,
         targetGraphId: graphId, targetRunId: runId, gateEventId: event.eventId,
         graphRevision: beforeRevision, operation: 'reroute', mutableState: state,
+        ...(options.graphEventTriggerRoot ? { eventTriggerRoot: options.graphEventTriggerRoot } : {}),
         feedback: { ...feedbackFor('retry-edge'), onCommitted: markFeedbackCommitted },
         ports: {
           persist: () => { graph = withAdaptiveGraphEdges(beforeGraph,
@@ -2808,6 +2816,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         const open = await runArgSupervisorTick({ loopPath: resolve(dirname(path), 'rla/loop.yaml'), root,
           targetGraphId: graphId, targetRunId: runId, gateEventId: event.eventId,
           graphRevision: openBefore, operation: 'reroute', mutableState: state,
+          ...(options.graphEventTriggerRoot ? { eventTriggerRoot: options.graphEventTriggerRoot } : {}),
           feedback: { ...feedbackFor('vocabulary'), onCommitted: markFeedbackCommitted },
           vocabularyOverlay: { sourcePath: resolve(dirname(path), 'release-edge-vocabulary.yaml'), path: vocabularyOverlayPath },
           openProposal: { observation: { gate: event.data?.gate, triage, plan: plan.disposition }, memory, callLLM },
@@ -3829,8 +3838,16 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         if (text.missing.length) throw new Error(`missing prompt reference: ${text.missing.join(', ')}`);
         // The LLM is injected only; production wiring to a provider is a follow-up slice.
         if (!callLLM) throw new Error('prompt node requires an injected LLM (deps.callLLM)');
-        output = await callLLM(text.text);
-        ok = true;
+        if (prompt.output) {
+          // GRAPH-LLM-JSON-OUTPUT: the stored output is the declared JSON (⊕ `outcome`, the key the next edge reads).
+          const structured = await runStructuredPrompt(text.text, prompt.output, callLLM);
+          output = JSON.stringify(structured.output ?? { attempts: structured.attempts });
+          ok = structured.ok;
+          if (structured.error) error = structured.error;
+        } else {
+          output = await callLLM(text.text);
+          ok = true;
+        }
       } catch (cause) {
         ok = false;
         error = cause instanceof Error ? cause.message : String(cause);
@@ -3854,7 +3871,13 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           if (!callLLM) throw new Error('classify node requires an injected LLM (deps.callLLM)');
           return callLLM(prompt);
         }, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }) });
+        // GRAPH-LLM-JSON-OUTPUT: the class is the edge outcome only where the next edge maps that class (never `ok`/`fail`,
+        // which stay the exit outcome) — existing ok/fail maps and grow-on graphs see no new outcome.
+        const classEdge = graph.edges.find((candidate) => candidate.from === current);
+        const routable = result.ok && typeof result.output === 'string' && result.output !== 'ok' && result.output !== 'fail'
+          && classEdge?.on === 'outcome' && !!classEdge.map && Object.hasOwn(classEdge.map, result.output);
         output = JSON.stringify({ input: input.arguments, ok: result.ok, verdict: result.output, output: result.output,
+          ...(routable ? { outcome: result.output } : {}),
           durationMs: result.durationMs, ...(result.error ? { error: result.error } : {}) });
         ok = result.ok;
         error = result.error;
@@ -4045,6 +4068,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const reportsOutcome = joinedFanout || waiving || approval || harnessLoopRoute || units.has(current) || handlerExecuted ||
       (resumingCompleted && (inProcessHandler || capabilityName || requiredContract)) || (prompt && !state.dryRun) ||
+      (node.kind === 'classify' && !state.dryRun) || // GRAPH-LLM-JSON-OUTPUT: classify writes `outcome` only where it is mapped
       (command && (!state.dryRun || command.dry_run_command));
     const reported: unknown = !reportsOutcome ? undefined
       : commandReportedOutcome !== undefined ? commandReportedOutcome

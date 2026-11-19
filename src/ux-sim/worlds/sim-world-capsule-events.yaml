@@ -11,3 +11,7 @@ scenarios:
     module: src/ux-sim/sim-world/capsule-events/c3-mail.ts
   - id: C2
     module: src/ux-sim/sim-world/capsule-events/c2-mail-tool.ts
+  - id: C5
+    module: src/ux-sim/sim-world/capsule-events/c5-wakeup.ts
+  - id: C6
+    module: src/ux-sim/sim-world/capsule-events/c6-boot-backlog.ts

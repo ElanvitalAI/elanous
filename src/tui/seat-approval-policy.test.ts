@@ -28,6 +28,29 @@ describe('seatApprovalDecision — 기본 거부 스키 (판정표는 shell-argv
   });
 });
 
+describe('seatApprovalDecision — guardian r8 합집합 판정 (OP #92922 · fail-closed)', () => {
+  test('echo 인자 문자열의 «rm -rf» 는 프린터 좁은 예외 — destructive 아님(자리몫 목록 ask)', () => {
+    const decision = seatApprovalDecision('echo "rm -rf x"', 'bash');
+    if (decision.decision !== 'ask-op') throw new Error('expected ask-op');
+    expect(decision.reason).toBe('not on the seat allowlist: echo');
+  });
+
+  test('bash -c "rm -rf x" = 실행 페이로드 — destructive 로 OP 에게', () => {
+    const decision = seatApprovalDecision('bash -c "rm -rf x"', 'bash');
+    if (decision.decision !== 'ask-op') throw new Error('expected ask-op');
+    expect(decision.reason).toBe('destructive: recursive rm');
+  });
+
+  test('ssh 의 첫 토큰은 프린터가 아니다 — 페이로드 낱말도 fail-closed 로 destructive 유지', () => {
+    const echo = seatApprovalDecision('ssh aws1 "echo cleanup rm -rf skipped"', 'bash');
+    if (echo.decision !== 'ask-op') throw new Error('expected ask-op');
+    expect(echo.reason).toBe('destructive: recursive rm');
+    const real = seatApprovalDecision('ssh aws1 "cd /tmp && rm -rf build"', 'bash');
+    if (real.decision !== 'ask-op') throw new Error('expected ask-op');
+    expect(real.reason).toBe('destructive: recursive rm');
+  });
+});
+
 describe('createSeatApprovalHandler — earlier wins (자판 vs OP)', () => {
   interface Harness { readonly ports: SeatApprovalPorts; readonly log: [string, Record<string, unknown>][]; readonly status: string[]; readonly bodies: string[]; readonly cancelled: string[] }
   const harness = (over: Partial<SeatApprovalPorts> = {}): Harness => {
@@ -130,7 +153,7 @@ describe('createSeatApprovalHandler — earlier wins (자판 vs OP)', () => {
     expect(h.log.find(([event]) => event === 'decided')).toBe(undefined);
   });
 
-  test('Terra ④ — OP 우편 본문에 원문 인자 없이 이유·명령 이름·sha256 만 (조항 5)', async () => {
+  test('#15 — 승인 요청 본문 = 비밀 가린 명령 원문 · 해시는 덧붙임 (조항 5 개정)', async () => {
     const command = 'deploy "--password" hunter2';
     const h = harness();
     const outcome = await createSeatApprovalHandler(h.ports)(command, 'c9', 'bash');
@@ -139,11 +162,147 @@ describe('createSeatApprovalHandler — earlier wins (자판 vs OP)', () => {
     expect(body).toContain('[승인 요청 · MVP-B]');
     expect(body).toContain('이유 credential');
     expect(body).toContain('명령 이름: deploy');
+    expect(body).toContain('명령(비밀 가림): deploy "--password" ****');
     expect(body).toContain(`sha256:${sha256(command)}`);
     expect(body).not.toContain('hunter2');
-    expect(body).not.toContain('--password');
     const asked = h.log.find(([event]) => event === 'asked-op');
     expect(String(JSON.stringify(asked?.[1]))).not.toContain('hunter2');
+  });
+
+  test('#15 — 토큰·환경 접두·URL 자격은 가리고 경로·플래그는 그대로', async () => {
+    const command = 'GITHUB_TOKEN=ghp_1AbCdEfGhIjKlMnOpQrSt git push https://x:ghp_1AbCdEfGhIjKlMnOpQrSt@github.com/o/r.git -u origin wip';
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15a', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).toContain('GITHUB_TOKEN=****');
+    expect(body).toContain('https://x:****@github.com/o/r.git');
+    expect(body).toContain('-u origin wip');
+    expect(body).toContain(`sha256:${sha256(command)}`);
+    expect(body).not.toContain('ghp_1AbCdEfGhIjKlMnOpQrSt');
+  });
+
+  test('#25 — 같은 승인 요청 2회째부터는 OP 우편 없이 즉시 자동 거부 답', async () => {
+    const command = 'rm -rf /var/lib/thing';
+    const handler = createSeatApprovalHandler(harness().ports);
+    const h2 = harness();
+    const handler2 = createSeatApprovalHandler(h2.ports);
+    const first = await handler2(command, 'c25a', 'bash');
+    expect(first).toEqual({ approved: false, reason: 'timeout' });
+    expect(h2.bodies.length).toBe(1);
+    const second = await handler2(command, 'c25b', 'bash');
+    expect(second).toEqual({ approved: false, reason: 'repeat-approval-request' });
+    expect(h2.bodies.length).toBe(1);
+    const denied = h2.log.find(([event]) => event === 'approval-repeat-denied');
+    expect(denied?.[1]).toMatchObject({ seat: 'MVP-B', callId: 'c25b', reason: 'destructive: recursive rm' });
+    expect(String(denied?.[1].auditSha256)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('#25 — 다른 명령은 반복 억제에 묻이지 않는다', async () => {
+    const h = harness();
+    const handler = createSeatApprovalHandler(h.ports);
+    await handler('rm -rf /var/lib/a', 'c25c', 'bash');
+    await handler('rm -rf /var/lib/b', 'c25d', 'bash');
+    expect(h.bodies.length).toBe(2);
+    const denied = h.log.filter(([event]) => event === 'approval-repeat-denied');
+    expect(denied.length).toBe(0);
+  });
+
+  test('#15 — JUD ⓒ stillLeak 4모양: Bearer 불투명 · curl -u · scheme URL 자격 · mysql -p (공용 redactSecretText 합집합)', async () => {
+    const cases: Array<[string, string]> = [
+      ['curl -s -H "Authorization: Bearer abcdEFGH1234ijklMNOP5678" https://api.example.com/v1/x', 'abcdEFGH1234ijklMNOP5678'],
+      ['curl -u alice:S3cr3tP4ssw0rd https://example.com/ping', 'S3cr3tP4ssw0rd'],
+      ['psql postgres://bob:hunter2xyz@db.internal:5432/app', 'hunter2xyz'],
+      ["mysql -u root -p'Pa55w0rdWord' -e 'select 1'", 'Pa55w0rdWord'],
+    ];
+    for (const [command, secret] of cases) {
+      const h = harness();
+      await createSeatApprovalHandler(h.ports)(command, `c15d-${secret.slice(0, 3)}`, 'bash');
+      expect(h.bodies[0]).not.toContain(secret);
+    }
+  });
+
+  test('#15 — JUD must 1(20261119-1126): aws 자격 인자 «/» 섞인 값 통째 가림(공용 redactSecretText 합집합)', async () => {
+    const command = 'aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15e', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).toContain('명령(비밀 가림): aws configure set aws_secret_access_key ***');
+    expect(body).not.toContain('wJalr');
+    expect(body).not.toContain('EXAMPLEKEY');
+    const second = harness();
+    await createSeatApprovalHandler(second.ports)('aws configure set AWS_SESSION_TOKEN IQoJb3JpZ2luZ/XyZ1234567890ab', 'c15f', 'bash');
+    expect(second.bodies[0]).not.toContain('IQoJb3JpZ2luZ');
+  });
+
+  test('#15 — 경로·크기·이유는 가리지 않는다 (#92648: OP 가 판단하려면 봐야 한다)', async () => {
+    const command = 'echo "rm -rf x"';
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15b', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).toContain('이유 not on the seat allowlist: echo');
+    expect(body).toContain('명령(비밀 가림): echo "rm -rf x"');
+    expect(body).toContain('명령 이름: echo');
+    expect(body).toContain(`sha256:${sha256(command)}`);
+  });
+
+  test('#15 — PEM 사열·긴 base64 자격은 가리고 순수 hex 커밋 sha 는 그대로', async () => {
+    const sha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';
+    const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh+/z\n-----END RSA PRIVATE KEY-----";
+    const command = `redis-cli SET k "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCd+/Ef=="; git cherry-pick ${sha}; printf '%s' '${pem}'`;
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15c', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).toContain(sha);
+    expect(body).toContain(`sha256:${sha256(command)}`);
+    expect(body).not.toContain('MIIEpAIBAAKCAQEA');
+    expect(body).not.toContain('AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCd+/Ef==');
+    expect(body).toContain('****');
+  });
+
+  test('#15 r2 — 단독 이름 TOKEN=·PASSWORD= 값과 ghu_ 사용자 토큰도 가린다 (JUD ⓒ1·ⓒ3)', async () => {
+    const command = 'TOKEN=hunter2 PASSWORD=hunter2 ghu_1AbCdEfGhIjKlMnOpQrSt git push --force origin main';
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15d', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).toContain('TOKEN=****');
+    expect(body).toContain('PASSWORD=****');
+    expect(body).not.toContain('hunter2');
+    expect(body).not.toContain('ghu_1AbCdEfGhIjKlMnOpQrSt');
+    expect(body).toContain(`sha256:${sha256(command)}`);
+  });
+
+  test('#15 r2 — +·/ 없는 base64 자격과 base64url JWT 도 가린다 (JUD ⓒ2)', async () => {
+    const b64 = 'QWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY3ODkw';
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4eXoifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+    const command = `curl -H "Authorization: Bearer ${jwt}" "https://x/api?token=${b64}"`;
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15e', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).not.toContain(b64);
+    expect(body).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+    expect(body).not.toContain('SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c');
+    expect(body).toContain('****');
+    expect(body).toContain(`sha256:${sha256(command)}`);
+  });
+
+  test('#15 r2 — 셸 이스케이프 인용값은 끝까지 가린다 (JUD ⓒ4)', async () => {
+    const command = 'redis-cli --password "abc\\"hunter2" --host prod-redis GET session';
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15f', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).not.toContain('hunter2');
+    expect(body).toContain('****');
+    expect(body).toContain(`sha256:${sha256(command)}`);
+  });
+
+  test('#15 r2 — 경로 세그먼트(/ 뒤 낱말)는 가리지 않는다 (JUD ⓑ: 경로 그대로)', async () => {
+    const seg = 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj';
+    const command = `rsync -a /Users/build/${seg} /backup/`;
+    const h = harness();
+    await createSeatApprovalHandler(h.ports)(command, 'c15g', 'bash');
+    const body = h.bodies[0]!;
+    expect(body).toContain(`/Users/build/${seg}`);
+    expect(body).toContain(`sha256:${sha256(command)}`);
   });
 });
 

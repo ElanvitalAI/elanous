@@ -13,9 +13,10 @@ import { createControl, type ControlAction, type ControlOutcome, type ControlTar
 import type { ElsResult } from './core.js';
 import { createLineDecoder } from './wire.js';
 
-/** Made by the transport from the initialize handshake — never taken from tool arguments. */
+/** Made by the transport — MCP forms `mcp-stdio` at the initialize handshake, the ACP glue forms
+ *  `acp-session` at session/new — never taken from tool arguments. */
 export interface ElsMcpPrincipal {
-  readonly kind: 'mcp-stdio';
+  readonly kind: 'mcp-stdio' | 'acp-session';
   readonly id: string;
 }
 
@@ -35,6 +36,7 @@ export interface ElsMcpBackend {
   ls(principal: ElsMcpPrincipal): Promise<ElsMcpResult>;
   read(principal: ElsMcpPrincipal, address: string): Promise<ElsMcpResult>;
   do(principal: ElsMcpPrincipal, address: string, text: string): Promise<ElsMcpResult>;
+  input(principal: ElsMcpPrincipal, address: string, text: string): Promise<ElsMcpResult>;
   newPane(principal: ElsMcpPrincipal, input: ElsMcpNewInput): Promise<ElsMcpResult>;
   status(principal: ElsMcpPrincipal, address?: string): Promise<ElsMcpResult>;
   events?(principal: ElsMcpPrincipal, address: string): Promise<ElsMcpResult>;
@@ -50,7 +52,7 @@ export interface ElsMcpControlDeps {
   readonly inner: ElsMcpBackend;
   /** Resolve a local pane ref to its workspace and whether it is a shell. Unknown = undefined. */
   readonly lookup: (pane: string) => Promise<{ readonly workspace: string; readonly pane: string; readonly shell: boolean } | undefined>;
-  /** Absent over stdio (stdin is the protocol): a dangerous shell `do` is held, never sent. */
+  /** Ask a person out-of-band about a dangerous shell `do` (confirm channels; stdin is the protocol). Absent → held. */
   readonly hitl?: HitlAsk;
   readonly env?: Record<string, string | undefined>;
   readonly cwd?: string;
@@ -113,6 +115,12 @@ export function createControlledBackend(deps: ElsMcpControlDeps): ElsMcpBackend 
     read: async (principal, address) => {
       const { target, limitation } = await pane(address, 'els read');
       return through(principal, 'read', target, () => limit(limitation, () => deps.inner.read(principal, address)));
+    },
+    // OP #17 OP-DIRECT-SEAT-INPUT: the operator's direct seat line — the door's `input` gate (OP/RES-INFRA only)
+    // runs before the executor, and the common path audits chars + sha256 (never the text itself).
+    input: async (principal, address, text) => {
+      const { target, limitation } = await pane(address, 'els input');
+      return through(principal, 'input', target, () => limit(limitation, () => deps.inner.input(principal, address, text)), text);
     },
     do: async (principal, address, text) => {
       const { target, limitation } = await pane(address, 'els do');
@@ -220,6 +228,10 @@ export function createSocketBackend(socketPath: string, env: Record<string, stri
       const target = local(address);
       return 'exitCode' in target ? target : requestEls(socketPath, { op: 'do', ...target, text, from: principal.id });
     },
+    input: async (principal, address, text) => {
+      const target = local(address);
+      return 'exitCode' in target ? target : requestEls(socketPath, { op: 'input-line', ...target, text, from: principal.id });
+    },
     newPane: (_principal, input) => {
       const args = withNewDefaults({ ws: input.ws, cwd: input.cwd, title: input.title, command: input.command ?? [] }, env, cwd);
       return requestEls(socketPath, { op: 'new', ws: args.ws, cwd: args.cwd, command: args.command, ...(args.title ? { title: args.title } : {}) });
@@ -246,6 +258,7 @@ export const ELS_MCP_TOOLS = [
   { name: 'els_read', description: 'Read a pane\'s screen as text.', inputSchema: { type: 'object', properties: { address: ADDRESS }, required: ['address'] } },
   { name: 'els_do', description: 'Type a line into a pane (marked with the sender, queued while the pane is busy).',
     inputSchema: { type: 'object', properties: { address: ADDRESS, text: str }, required: ['address', 'text'] } },
+  // Direct input is CTL-only: MCP principals cannot satisfy the CLI peer-identity gate.
   { name: 'els_new', description: 'Open a pane (defaults: $SHELL, the server\'s folder, workspace = folder name).',
     inputSchema: { type: 'object', properties: { ws: str, cwd: str, title: str, command: { type: 'array', items: str } } } },
   { name: 'els_status', description: 'Pane status.', inputSchema: { type: 'object', properties: { address: ADDRESS } } },
@@ -260,6 +273,8 @@ export interface ElsMcpSession {
   handle(request: JsonRpcRequest): Promise<Handled>;
   /** One raw input line → the answer line (without newline), or undefined for a notification. */
   handleLine(line: string): Promise<string | undefined>;
+  /** Check every subscription once → the notification lines for the resources that changed (no newlines). */
+  poll(): Promise<string[]>;
 }
 
 const ok = (id: JsonRpcResponse['id'], result: unknown): JsonRpcResponse => ({ jsonrpc: '2.0', id, result });
@@ -297,6 +312,14 @@ export function createElsMcpSession(backend: ElsMcpBackend): ElsMcpSession {
     }
   };
 
+  // resources/subscribe → the changed-resource notification lines (poll(): each poll re-reads through the
+  // same door as resources/read and reports the uri when the content changed).
+  const subscriptions = new Map<string, string>(); // uri → last message
+  const readResource = async (kind: string, address: string): Promise<ElsMcpResult> =>
+    kind === 'screen' ? backend.read(principal, address)
+      : backend.events ? backend.events(principal, address)
+      : { exitCode: 1 as const, message: 'els events: not available yet — no event request on the els server' };
+
   const listResources = async (): Promise<{ resources: unknown[] } | ElsMcpResult> => {
     const listed = await backend.ls(principal);
     if (listed.denied) return listed;
@@ -319,7 +342,7 @@ export function createElsMcpSession(backend: ElsMcpBackend): ElsMcpSession {
         principal = { kind: 'mcp-stdio', id: `mcp-stdio:${text(client?.name) ?? 'unknown'}` };
         return ok(id, {
           protocolVersion: negotiateMcpProtocolVersion(params.protocolVersion),
-          capabilities: { tools: {}, resources: {} },
+          capabilities: { tools: {}, resources: { subscribe: true } },
           serverInfo: { name: 'els', version: '1' },
         });
       }
@@ -346,12 +369,30 @@ export function createElsMcpSession(backend: ElsMcpBackend): ElsMcpSession {
         let address: string;
         try { address = decodeURIComponent(match[1]!); }
         catch { return fail(id, -32602, `malformed resource uri (bad percent-encoding): ${uri}`); }
-        const result = match[2] === 'screen' ? await backend.read(principal, address)
-          : backend.events ? await backend.events(principal, address)
-          : { exitCode: 1 as const, message: 'els events: not available yet — no event request on the els server' };
+        const result = await readResource(match[2]!, address);
         if (result.denied) return denied(id, result);
         if (result.exitCode !== 0) return fail(id, -32603, result.message);
         return ok(id, { contents: [{ uri, mimeType: match[2] === 'screen' ? 'text/plain' : 'application/json', text: result.message }] });
+      }
+      case 'resources/subscribe': {
+        const uri = typeof params.uri === 'string' ? params.uri : '';
+        const match = RESOURCE_URI.exec(uri);
+        if (!match) return fail(id, -32602, `unknown resource: ${uri}`);
+        let address: string;
+        try { address = decodeURIComponent(match[1]!); }
+        catch { return fail(id, -32602, `malformed resource uri (bad percent-encoding): ${uri}`); }
+        // Subscribing walks the same door as reading: the snapshot is a read, so a refusal is -32001
+        // (never a silent subscription), and an unavailable events resource is -32603, same as resources/read.
+        const snapshot = await readResource(match[2]!, address);
+        if (snapshot.denied) return denied(id, snapshot);
+        if (snapshot.exitCode !== 0) return fail(id, -32603, snapshot.message);
+        subscriptions.set(uri, snapshot.message);
+        return ok(id, {});
+      }
+      case 'resources/unsubscribe': {
+        const uri = typeof params.uri === 'string' ? params.uri : '';
+        subscriptions.delete(uri);
+        return ok(id, {});
       }
       default: return fail(id, -32601, `method not found: ${request.method}`);
     }
@@ -360,6 +401,20 @@ export function createElsMcpSession(backend: ElsMcpBackend): ElsMcpSession {
   return {
     principal: () => principal,
     handle,
+    async poll() {
+      const lines: string[] = [];
+      for (const [uri, last] of subscriptions) {
+        const match = RESOURCE_URI.exec(uri);
+        if (!match) continue;
+        let address: string;
+        try { address = decodeURIComponent(match[1]!); } catch { continue; }
+        const fresh = await readResource(match[2]!, address);
+        if (fresh.exitCode !== 0 || fresh.denied || fresh.message === last) continue;
+        subscriptions.set(uri, fresh.message);
+        lines.push(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/resources/updated', params: { uri } }));
+      }
+      return lines;
+    },
     async handleLine(line) {
       if (line.trim() === '') return undefined;
       let request: JsonRpcRequest;
@@ -381,12 +436,16 @@ export function createElsMcpSession(backend: ElsMcpBackend): ElsMcpSession {
  *  answer is flushed to the OS: each write's callback is awaited, then `output.flush()` (when the stream
  *  has one — fsync for file outputs) completes before the returned promise settles. Write/input errors
  *  propagate to the caller. */
-export function serveElsMcpStdio(backend: ElsMcpBackend, input: Readable = process.stdin, output: Writable = process.stdout): Promise<void> {
+export function serveElsMcpStdio(backend: ElsMcpBackend, input: Readable = process.stdin, output: Writable = process.stdout,
+  opts: { readonly pollMs?: number } = {}): Promise<void> {
   const session = createElsMcpSession(backend);
-  // stdout on a pipe is asynchronous — await each write's callback so every answer is handed to
-  // the OS before the promise settles (no truncated JSON-RPC frames).
   const writeAll = (data: string) => new Promise<void>((resolve, reject) => output.write(data, (error) => (error ? reject(error) : resolve())));
-  // The first failure (session or write) is captured here and re-thrown at `end`, so a broken
+  // Subscriptions are push: poll every pollMs and hand each changed-resource notification to the OS in order.
+  const pollMs = opts.pollMs ?? 1_000;
+  const timer = setInterval(() => { void session.poll().then((lines) => {
+    for (const line of lines) void writeAll(`${line}\n`);
+  }).catch(() => { /* a failed poll keeps the server alive; the next poll retries */ }); }, pollMs);
+  timer.unref?.();
   // pipe rejects the caller's promise instead of dying as an unhandled rejection mid-stream.
   let failure: unknown;
   let queue: Promise<void> = Promise.resolve();
@@ -409,6 +468,6 @@ export function serveElsMcpStdio(backend: ElsMcpBackend, input: Readable = proce
   return new Promise((resolve, reject) => {
     input.on('error', reject);
     input.on('data', (chunk: Buffer | string) => lines.push(chunk));
-    input.on('end', () => { void queue.then(() => { if (failure !== undefined) throw failure; return flushOutput(); }).then(() => resolve(), reject); });
+    input.on('end', () => { clearInterval(timer); void queue.then(() => { if (failure !== undefined) throw failure; return flushOutput(); }).then(() => resolve(), reject); });
   });
 }

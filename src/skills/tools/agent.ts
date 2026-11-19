@@ -180,9 +180,9 @@ interface QueuedBackgroundAdmission extends BackgroundAdmissionEntry {
 
 /** The SHARED waiting queue, per session (same scope as the slot ledger, so
  *  a busy session's waiters cannot head-of-line block another session).
- *  Entries live only while the fan-out ceiling is full and their launch
- *  opted in with `wait_for_slot`; every other launch keeps the immediate
- *  `background-fanout-limit` refusal. */
+ *  Entries live only while the fan-out ceiling is full; waiting is the
+ *  default, and only a launch that explicitly passed `wait_for_slot=false`
+ *  keeps the immediate `background-fanout-limit` refusal. */
 const backgroundAdmissionQueues = new WeakMap<object, QueuedBackgroundAdmission[]>();
 let backgroundAdmissionSeq = 0;
 
@@ -277,11 +277,12 @@ export interface AgentToolArgs {
   completion_delivery?: 'follow-up' | 'supplement';
   /** Best-effort wall-clock budget for a research child, in minutes. */
   budget_minutes?: number;
-  /** When true, a background launch that hits the fan-out ceiling WAITS on
-   *  the session's shared admission queue instead of being refused: it spawns
-   *  as soon as a live background agent terminals (subagent waits are
-   *  admitted before general-purpose ones, FIFO inside each class). Omitted
-   *  or false keeps the immediate `background-fanout-limit` refusal. */
+  /** Default true (opt-out): a background launch that hits the fan-out
+   *  ceiling WAITS on the session's shared admission queue and spawns as
+   *  soon as a live background agent terminals (subagent waits are
+   *  admitted before general-purpose ones, FIFO inside each class). Only
+   *  an explicit `false` keeps the immediate `background-fanout-limit`
+   *  refusal. */
   wait_for_slot?: boolean;
   /** UI label for this spawn — shown on agent-roster so siblings
    *  sharing a definition are distinguishable. Takes precedence
@@ -392,7 +393,7 @@ export function buildAgentTool(): LLMToolSpec {
         },
         wait_for_slot: {
           type: 'boolean',
-          description: 'Only meaningful with run_in_background. When the per-session background fan-out ceiling is already full, this launch waits on the shared admission queue instead of being refused, and spawns as soon as one live background agent finishes. Waiting subagent spawns (ones that name a subagent_type) are admitted before general-purpose ones; launches with the same class keep arrival order. Omit it to get the immediate "NOT SPAWNED" refusal and re-issue later.',
+          description: w.agentWaitForSlot,
         },
         name: {
           type: 'string',
@@ -718,8 +719,9 @@ async function dispatchAgentCore(
         };
       };
 
-      // Shared waiting queue — opt-in only. Launches that did not pass
-      // `wait_for_slot` keep the immediate refusal above, byte for byte.
+      // Shared waiting queue — on by default. Only a launch that explicitly
+      // passed `wait_for_slot=false` keeps the immediate refusal above, byte
+      // for byte.
       if (!waitsForSlot) return refuseForCeiling();
 
       const admissionPriority = classifyBackgroundAdmissionPriority(requestedType);

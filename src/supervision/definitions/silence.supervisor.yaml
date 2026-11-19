@@ -1,0 +1,19 @@
+# supervisor/v1 — silence watch escalates owner-less observations past their deadline (graphs/ops/silence-watch.yaml).
+apiVersion: elanous.dev/supervisor/v1
+kind: supervisor
+ref: 'loop:silence@1'
+role: watcher
+supervises: [silence-watch]
+signals:
+  - { signal: action.deadline, actor: final }
+  - { signal: run.failed, actor: observer }
+authority: [observe, escalate]
+reportsTo: 'loop:coordinator@1'
+# Source: src/supervision/silence-watch.ts DEFAULT_SILENCE_AFTER = PT10M.
+escalation: { to: 'loop:coordinator@1', silenceAfter: PT10M }
+# The watcher writes no reusable knowledge: it reads instance observations and escalates.
+memory:
+  instance: { read: true, write: false, promote: none, retention: P7D }
+  template: { read: false, write: none, promote: none, retention: P7D }
+  global: { read: none, write: none, promote: none }
+  provenance: required

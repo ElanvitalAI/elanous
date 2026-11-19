@@ -1,3 +1,4 @@
+import { classifyPrebuildFailure, type PrebuildFailureEvidence, type PrebuildFailureCode } from './prebuild-failure-code.js';
 import { constants } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -284,9 +285,10 @@ export function gateImagePinPath(root: string, version: string, runId: string): 
 }
 
 export interface CutGateImagePrebuildInput { root: string; repo: string; runId: string; version: string; commit: string; pool: string }
-type ChildGateImagePrebuildOutcome = GateImagePrebuildResult | { outcome: 'skipped' | 'failed'; reason: string };
+export type PrebuildFailure = { outcome: 'failed'; reason: string; stage?: PrebuildStage; receipt?: PrebuildStageReceipt[]; failureCode?: PrebuildFailureCode | 'UNKNOWN'; causes?: PrebuildFailureCode[] };
+type ChildGateImagePrebuildOutcome = GateImagePrebuildResult | { outcome: 'skipped'; reason: string } | PrebuildFailure;
 export type CutGateImagePrebuildOutcome = (GateImagePrebuildResult & { runId: string; cutCommit: string })
-  | { outcome: 'skipped' | 'failed'; reason: string };
+  | { outcome: 'skipped'; reason: string } | PrebuildFailure;
 interface CutGateImagePrebuildDeps {
   runPrebuild?: () => { stdout?: string | null; stderr?: string | null; status: number | null; error?: Error };
   now?: () => Date;
@@ -366,7 +368,13 @@ export const PREBUILD_STAGES = ['clone', 'deps', 'skills', 'base-pull', 'build',
 export type PrebuildStage = typeof PREBUILD_STAGES[number];
 /** `exit` is the stage child's own exit code (null = none measured); `ok` is the stage verdict — a child can exit 0 and still fail its stage. */
 export interface PrebuildStageReceipt { stage: PrebuildStage; exit: number | null; ok: boolean; reason: string }
-interface PrebuildProgress { current: PrebuildStage; stages: PrebuildStageReceipt[] }
+interface PrebuildProgress { current: PrebuildStage; stages: PrebuildStageReceipt[]; evidence?: Partial<PrebuildFailureEvidence> }
+
+/** Classify only measured evidence; an unprobed condition remains UNKNOWN. */
+export function buildPrebuildFailure(reason: string, stage: PrebuildStage, receipt: PrebuildStageReceipt[], evidence: Partial<PrebuildFailureEvidence> = {}): PrebuildFailure {
+  const { code, causes } = classifyPrebuildFailure({ ...evidence, stage });
+  return { outcome: 'failed', reason, stage, receipt, failureCode: code, causes };
+}
 
 /** Main-run build stage verdict from a pool sync: the first failed member, with its node-side build.sh exit (null = no build child ran). */
 export function poolSyncBuildFailure(members: readonly { context: string }[],
@@ -380,10 +388,13 @@ export function poolSyncBuildFailure(members: readonly { context: string }[],
 async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Promise<ChildGateImagePrebuildOutcome> {
   const enter = (stage: PrebuildStage) => { progress.current = stage; };
   const passed = (stage: PrebuildStage, reason = 'ok') => { progress.stages.push({ stage, exit: 0, ok: true, reason }); };
-  const failStage = (stage: PrebuildStage, exit: number | null, reason: string): never => {
+  const failStage = (stage: PrebuildStage, exit: number | null, reason: string, evidence?: Partial<PrebuildFailureEvidence>): never => {
+    progress.evidence = evidence;
     progress.stages.push({ stage, exit, ok: false, reason: reason.trim().slice(-300) });
     throw new Error(reason);
   };
+  const osEvidence = (error: Error | undefined): Partial<PrebuildFailureEvidence> | undefined =>
+    error && 'code' in error && typeof error.code === 'string' ? { osErrorCode: error.code } : undefined;
   const values = new Map<string, string>();
   // Hard rehearsal only: walk clone→push on the real build.sh, stop before the registry push (no ledger/pin writes).
   const rehearsalProbe = args.includes('--rehearsal-probe');
@@ -418,11 +429,11 @@ async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Pro
     const clone = spawnSync('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, sourceTree], {
       cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (clone.status !== 0) failStage('clone', clone.status, `cut image source clone failed: ${clone.stderr || clone.error || clone.status}`);
+    if (clone.status !== 0) failStage('clone', clone.status, `cut image source clone failed: ${clone.stderr || clone.error || clone.status}`, osEvidence(clone.error));
     const checkout = spawnSync('git', ['checkout', '--quiet', '--detach', commit], {
       cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (checkout.status !== 0) failStage('clone', checkout.status, `cut image source checkout failed: ${checkout.stderr || checkout.error || checkout.status}`);
+    if (checkout.status !== 0) failStage('clone', checkout.status, `cut image source checkout failed: ${checkout.stderr || checkout.error || checkout.status}`, osEvidence(checkout.error));
     const lockHash = createHash('sha256').update(readFileSync(pathJoin(sourceTree, 'bun.lock'))).digest('hex');
     const bunVersion = readFileSync(pathJoin(sourceTree, '.bun-version'), 'utf8').trim();
     passed('clone');
@@ -431,7 +442,7 @@ async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Pro
     const stagedDeps = spawnSync('bun', [pathJoin(sourceTree, 'src/task-orchestrator/surfaces/pod-gate-deps.ts'), 'stage', depsStage], {
       cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (stagedDeps.status !== 0 || stagedDeps.error) failStage('deps', stagedDeps.status, `gate image dependency inputs could not be measured: ${stagedDeps.stderr || stagedDeps.error || stagedDeps.status}`);
+    if (stagedDeps.status !== 0 || stagedDeps.error) failStage('deps', stagedDeps.status, `gate image dependency inputs could not be measured: ${stagedDeps.stderr || stagedDeps.error || stagedDeps.status}`, osEvidence(stagedDeps.error));
     const gateDepsDigest = /(?:^|\s)digest=([a-f0-9]{12})(?:\s|$)/i.exec(stagedDeps.stdout)?.[1]?.toLowerCase();
     if (!gateDepsDigest) failStage('deps', stagedDeps.status, 'gate image dependency digest is unmeasured');
     passed('deps');
@@ -440,7 +451,7 @@ async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Pro
     const stagedSkills = spawnSync('bun', [pathJoin(sourceTree, 'src/task-orchestrator/surfaces/pod-skills.ts'), 'stage', skillsStage], {
       cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
     });
-    if (stagedSkills.status !== 0 || stagedSkills.error) failStage('skills', stagedSkills.status, `gate image skill inputs could not be measured: ${stagedSkills.stderr || stagedSkills.error || stagedSkills.status}`);
+    if (stagedSkills.status !== 0 || stagedSkills.error) failStage('skills', stagedSkills.status, `gate image skill inputs could not be measured: ${stagedSkills.stderr || stagedSkills.error || stagedSkills.status}`, osEvidence(stagedSkills.error));
     const skillsDigest = /(?:^|\s)digest=([a-f0-9]{16}|none)(?:\s|$)/i.exec(stagedSkills.stdout)?.[1]?.toLowerCase();
     if (!skillsDigest) failStage('skills', stagedSkills.status, 'gate image skill digest is unmeasured');
     passed('skills');
@@ -484,13 +495,13 @@ async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Pro
           ELANOUS_BUILD_IMAGE_KEY: runtimeKey, ELANOUS_BUILD_EXPECTED_BASE_IMAGE_DIGEST: layerIdentity.digest },
       });
       if (built.status !== 0 || built.error)
-        failStage('build', built.status, `build.sh exited ${built.status ?? 'spawn'}: ${`${built.stderr || ''}${built.stdout || ''}` || built.error}`);
+        failStage('build', built.status, `build.sh exited ${built.status ?? 'spawn'}: ${`${built.stderr || ''}${built.stdout || ''}` || built.error}`, osEvidence(built.error));
       passed('build');
       enter('pack-pwa');
       const listing = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
       if (listing.status !== 0) failStage('pack-pwa', listing.status, `package archive unreadable: ${listing.stderr || listing.error}`);
       if (!listing.stdout.split(/\r?\n/).some((entry) => entry.replace(/^\.\//, '') === 'package/apps/pwa/out/index.html'))
-        failStage('pack-pwa', 1, 'package archive has no package/apps/pwa/out/index.html');
+        failStage('pack-pwa', 1, 'package archive has no package/apps/pwa/out/index.html', { packagePwaPresent: false });
       passed('pack-pwa');
       enter('push');
       for (const member of members) {
@@ -498,7 +509,7 @@ async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Pro
         const command = `docker inspect ${registry.split(':')[0]} >/dev/null`;
         const reach = member.sshHost ? defaultRemoteRun(member.sshHost, command)
           : spawnSync('sh', ['-c', command], { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
-        if (reach.status !== 0) failStage('push', reach.status, `registry ${registry} not reachable on ${member.context}: ${reach.stderr || ''}`);
+        if (reach.status !== 0) failStage('push', reach.status, `registry ${registry} not reachable on ${member.context}: ${reach.stderr || ''}`, /no such (?:object|container)/i.test(reach.stderr || '') ? { registryPresent: false } : undefined);
       }
       passed('push', 'probed: registry container present on every pool member (docker inspect), push not performed');
       return { outcome: 'skipped', reason: `rehearsal probe: push not performed (image ${image})` };
@@ -545,7 +556,8 @@ if (import.meta.main && process.argv.includes('--prebuild')) {
     const reason = error instanceof Error ? error.message : String(error);
     // One abnormal row per failure: failStage already wrote it; anything else (a throw with no child exit) gets exit null here.
     if (progress.stages.every((row) => row.ok)) progress.stages.push({ stage: progress.current, exit: null, ok: false, reason: reason.trim().slice(-300) });
-    console.log(JSON.stringify({ outcome: 'failed', reason, stage: progress.stages.at(-1)!.stage, receipt: progress.stages }));
+    const osErrorCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
+    console.log(JSON.stringify(buildPrebuildFailure(reason, progress.stages.at(-1)!.stage, progress.stages, { ...progress.evidence, ...(osErrorCode ? { osErrorCode } : {}) })));
     process.exitCode = 1;
   }
 }

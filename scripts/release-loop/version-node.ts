@@ -12,6 +12,12 @@ import { baseVersion, isReleaseVersion, isStableVersion, prereleaseKind } from '
 import { cutReleaseBranch } from './cut-branch.js';
 import { runCutGateImagePrebuild, type CutGateImagePrebuildOutcome } from './gate-image-pin.js';
 
+class PrebuildError extends Error {
+  constructor(readonly failure: Extract<CutGateImagePrebuildOutcome, { outcome: 'failed' }>) {
+    super(`cut gate image prebuild failed: ${failure.reason}`);
+  }
+}
+
 type Kind = 'release' | 'dev-bump';
 type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string;
   /** RELEASE-BRANCH: the release branch the cut lives on and the main commit it was cut from. */
@@ -599,7 +605,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
       debug.log('release-loop.cut-image', 'prebuild', { runId, version, commit, outcome: result.outcome,
         ...(result.outcome === 'failed' ? { reason: result.reason } : {}),
         ...(result.outcome === 'built' || result.outcome === 'reused' ? { digest: result.digest, eligiblePools: result.eligiblePools } : {}) });
-      if (result.outcome === 'failed') throw new Error(`cut gate image prebuild failed: ${result.reason}`);
+      if (result.outcome === 'failed') throw new PrebuildError(result);
       return result;
     };
     if (args[0] === 'cut-branch') {
@@ -631,7 +637,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     const outputVersion = kind === 'dev-bump' && version && isStableVersion(version)
       ? nextDevVersion(version) : version;
     return { outcome: 'error', kind, version: outputVersion,
-      commit: null, pr: null, ...(worktree ? { worktree } : {}), error: message };
+      commit: null, pr: null, ...(worktree ? { worktree } : {}), ...(error instanceof PrebuildError ? { gateImagePrebuild: error.failure } : {}), error: message };
   }
 }
 

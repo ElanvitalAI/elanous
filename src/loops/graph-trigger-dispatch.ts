@@ -71,30 +71,60 @@ function declaredEventTargets(root: string): DeclaredEventTarget[] {
   return targets;
 }
 
-/** Route real graph events to declared target graphs; the durable trigger registry deduplicates redelivery. */
-export async function dispatchGraphEventToDeclaredTargets(event: GraphTriggerEvent, options: {
+/** A supervisor decision announced to graphs that declare `triggers.event: { from: <supervisorId>, on: <type> }`. */
+export interface SupervisorTriggerEvent {
+  readonly supervisorId: string;
+  readonly targetGraphId: string;
+  readonly targetRunId: string;
+  readonly eventId: string;
+  readonly type: string;
+  readonly emittedAt: string;
+  readonly data?: Readonly<Record<string, unknown>>;
+}
+
+export interface DeclaredEventRoutingOptions {
   graphRoot: string;
   registryRoot: string;
   stateRoot: string;
   now?: () => number;
   eventNow?: () => Date;
-}): Promise<DispatchedGraphTriggerRun[]> {
-  if (!event.eventId.trim() || !event.graphId.trim() || !event.type.trim())
-    throw new Error('graph event routing requires graphId, type, and eventId');
+}
+
+async function dispatchToDeclaredTargets(source: { from: string; on: string; dedupeKey: string; payload: unknown },
+  options: DeclaredEventRoutingOptions): Promise<DispatchedGraphTriggerRun[]> {
   const results: DispatchedGraphTriggerRun[] = [];
-  const dedupeKey = `${event.graphId}:${event.runId}:${event.eventId}`;
   for (const target of declaredEventTargets(resolve(options.graphRoot))) {
-    if (target.from !== event.graphId || target.on !== event.type) continue;
+    if (target.from !== source.from || target.on !== source.on) continue;
     results.push(await dispatchGraphTriggerRun({
       graphId: target.graphId, graphPath: target.graphPath,
-      triggerId: `event:${target.from}:${target.on}:${target.graphId}`, dedupeKey,
-      payload: { graphEvent: event },
+      triggerId: `event:${target.from}:${target.on}:${target.graphId}`, dedupeKey: source.dedupeKey,
+      payload: source.payload,
     }, { registryRoot: options.registryRoot, stateRoot: options.stateRoot, runRoot: options.stateRoot,
       ...(options.now ? { now: options.now } : {}), ...(options.eventNow ? { eventNow: options.eventNow } : {}),
       graphRunOptions: { quiet: true, routeGraphEvents: false },
     }));
   }
   return results;
+}
+
+/** Route real graph events to declared target graphs; the durable trigger registry deduplicates redelivery. */
+export async function dispatchGraphEventToDeclaredTargets(event: GraphTriggerEvent,
+  options: DeclaredEventRoutingOptions): Promise<DispatchedGraphTriggerRun[]> {
+  if (!event.eventId.trim() || !event.graphId.trim() || !event.type.trim())
+    throw new Error('graph event routing requires graphId, type, and eventId');
+  return dispatchToDeclaredTargets({ from: event.graphId, on: event.type,
+    dedupeKey: `${event.graphId}:${event.runId}:${event.eventId}`, payload: { graphEvent: event } }, options);
+}
+
+/** Route a supervisor event through the same declared targets and trigger registry as graph events. */
+export async function dispatchSupervisorEventToDeclaredTargets(event: SupervisorTriggerEvent,
+  options: DeclaredEventRoutingOptions): Promise<DispatchedGraphTriggerRun[]> {
+  if (!event.supervisorId.trim() || !event.type.trim() || !event.eventId.trim() ||
+      !event.targetGraphId.trim() || !event.targetRunId.trim())
+    throw new Error('supervisor event routing requires supervisorId, type, eventId, targetGraphId, and targetRunId');
+  return dispatchToDeclaredTargets({ from: event.supervisorId, on: event.type,
+    dedupeKey: `${event.supervisorId}:${event.targetGraphId}:${event.targetRunId}:${event.eventId}`,
+    payload: { supervisorEvent: event } }, options);
 }
 
 /** Shared trigger ingress: bind identity, claim its lease, and start or resume the corresponding graph run. */

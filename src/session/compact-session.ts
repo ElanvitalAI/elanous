@@ -288,7 +288,11 @@ function rewriteKeepingAuditRows(
     return [
       ...keptHead,
       toSerialized(messages[summaryAt]!, ts),
-      ...(replay === 1 ? [toSerialized(messages[summaryAt + 1]!, ts)] : []),
+      ...(replay === 1 ? [
+        result.replaySourceIndex !== undefined && workingRows[result.replaySourceIndex] !== undefined
+          ? rows[workingRows[result.replaySourceIndex]!]!
+          : toSerialized(messages[summaryAt + 1]!, ts),
+      ] : []),
       ...rows.slice(tailStart),
     ];
   }

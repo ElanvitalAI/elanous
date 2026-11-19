@@ -98,7 +98,7 @@ test('a pane started by `els new` carries the workspace and socket in its env, a
   expect(env.ELANOUS_ELS_WS).toBe('OP');
   expect(env.ELANOUS_ELS_SOCKET).toBe(elsSocketPath(root));
   // Exactly the two names the eln side reads (dashboard + child-producer); an unread name would be a silent no-op.
-  expect(Object.keys(env).sort()).toEqual(['ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_WS']);
+  expect(Object.keys(env).sort()).toEqual(['ELANOUS_ELS_PANE', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_WS']);
   // What the eln in that pane does at boot: wire the producer from the env it was given.
   const registry = new AgentRegistry();
   const wired = wireElsChildProducer({ registry, ws: env.ELANOUS_ELS_WS!, socketPath: env.ELANOUS_ELS_SOCKET!, request: requestEls });

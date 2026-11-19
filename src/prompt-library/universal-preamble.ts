@@ -33,6 +33,7 @@ import { buildAnthropicFamilyAddendum } from './anthropic-family-addendum.js';
 import { buildGrokFamilyAddendum } from './grok-family-addendum.js';
 import { buildSessionGuidanceAddendum } from './session-guidance.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
+import { elsSelfContextEnv, elsSelfContextSystemMessages, ELS_SELF_CONTEXT_DEFAULT_SESSION_KEY } from '../els/els-self-context.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 export const PROJECT_ANCHOR_MAX_CHARS = 36 * 1024; // 10-10 증액(32K→36K) — 줄이기는 AGENTS-CLAUDE-DIET(0.2.24)
@@ -189,6 +190,8 @@ export interface UniversalPreambleContext {
   /** Working directory the agent is operating in. Anchor files
    *  (AGENTS.md / CLAUDE.md) load relative to this. */
   cwd: string;
+  /** Optional session/conversation id when the caller has one — 세션 단위 상태 키(ELN-ELS-SELF-CONTEXT 중복 억제 등). 없으면 cwd 로 대체한다. */
+  sessionId?: string;
   /** Optional model family. When provided, family-specific behavioral
    *  addendums append after the project anchor. codex (L-1, anti-
    *  reread), gemini (Wave 2, multi-turn activation), claude (Wave 3,
@@ -1059,6 +1062,16 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
   // family addendum so a per-tool directive can override family
   // defaults when the tool is in scope.
   out.push(...buildSessionGuidanceAddendum(ctx.enabledTools));
+  // ELN-ELS-SELF-CONTEXT — 이 판이 els pane 안이면(ELANOUS_ELS_WS/PANE/SOCKET env — els 가 pane 프로세스에 심는다)
+  // «내 els 위치» 블록을 매 턴 싣는다. 주입부는 r2 부터 여기(buildUniversalPreamble)다: els pane 자리의 실제 턴 조립
+  // 체인(dashboard getPreamble → buildDashboardTurnPreamble → 이 빌더)이 이 함수를 지나고, monad-agent-turn.ts 쪽은
+  // telegram/discord 전용 가드(surface !== 'telegram' && surface !== 'discord' → throw)라 이 경로에 있지 않다(측정
+  // 원문 r2 PR 본문). env 없으면 [] — 다른 환경에 새지 않는다. 세션 첫 사용 채움·캐시·중복 억제는 els-self-context 의
+  // 세션 키(ctx.sessionId ?? cwd) 단위다. src/dashboard 는 은퇴 폴더(신규 기능 0)라 프리앰블 빌더 안으로만 주입한다.
+  if (elsSelfContextEnv() !== null) {
+    out.push(...elsSelfContextSystemMessages(ctx.sessionId ?? ctx.cwd ?? ELS_SELF_CONTEXT_DEFAULT_SESSION_KEY));
+  }
+
   if (debug.enabled) {
     debug.log('chat.universal-preamble', 'built', {
       cwd: ctx.cwd,

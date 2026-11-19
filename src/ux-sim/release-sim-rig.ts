@@ -1062,7 +1062,7 @@ export interface ReleaseSimRigCaseResult {
   path: string[];
   dispatchedNodes: string[];
   unexpectedEdges: Array<{ from: string; to: string; outcome: string; expectedTo?: string }>;
-  checks: { status: boolean; mustVisit: boolean; mustNotVisit: boolean; overlap: boolean; ledgerEvents: boolean; events?: boolean; adaptiveRepair?: boolean;
+  checks: { status: boolean; mustVisit: boolean; mustNotVisit: boolean; overlap: boolean; ledgerEvents: boolean; events?: boolean; adaptiveRepair?: boolean; completeFanoutRetained?: boolean;
     productionTriage?: boolean; repairInputMatchesResidualExecution?: boolean; receiptMismatchRoutedToResidual?: boolean;
     appBugDetected?: boolean; appRepairRoutesGreen?: boolean; oneSameRunReceipt?: boolean };
   fanOuts?: GraphRunState['fanOuts'];
@@ -1491,7 +1491,7 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
         preexisting: 0, knownEnv: 0, durationMs: 1, stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 0 })}
 `, stderr: '' };
     }
-    if (nodeId === 'version-release' && item.unmeasuredGateShape) {
+    if (nodeId.startsWith('cut-branch') && item.unmeasuredGateShape) {
       const value = { outcome: 'ok', version: input.version, commit: cutTip(), branch: `release/${input.version}` };
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
       return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: '' };
@@ -1508,7 +1508,7 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
       return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
     }
-    if (nodeId === 'version-release' && fixtureOwnerWaiver) {
+    if (nodeId.startsWith('cut-branch') && fixtureOwnerWaiver) {
       const value = { outcome: 'ok', version: input.version, commit: cutTip(), branch: `release/${input.version}` };
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
       return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: '' };

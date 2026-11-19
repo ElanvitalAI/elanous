@@ -26,7 +26,8 @@ interface GraphCall { graphId: string; ownerId?: string; appSlug?: unknown }
 function fakeGraph(calls: GraphCall[]): NonNullable<ChildPluginRuntimeOptions['dispatchGraph']> {
   return async (_pluginId, graphId, _graphFile, args, context) => {
     calls.push({ graphId, ownerId: context?.verifiedOwner?.id, appSlug: args.appSlug });
-    return { graphId, status: 'completed' };
+    // The contract's terminal graph result: done with an explicit public URL publishes.
+    return { graphId, status: 'done', publicUrl: 'https://tix--m1.elanous.app/' };
   };
 }
 
@@ -71,8 +72,14 @@ describe('daemon chat turn — app_build approval path is the TUI one', () => {
     const tuiCalls: GraphCall[] = [];
     const daemon = await daemonChat(daemonCalls).dispatch('app_build', { ask: LINE }, ctx());
     const tui = await tuiRoutes(tuiCalls, { id: 'm1', appSlug: SLOT }).dispatchPluginTool('app_build', { ask: LINE });
-    expect(daemon).toEqual(tui);
+    // The TUI probe still speaks the raw envelope, the daemon answers with the server card —
+    // preserve the equality that matters: the same gate decision on both sides.
     expect((daemon as { code?: string }).code).toBe(APP_BUILD_DECLINED_CODE);
+    expect((tui as { code?: string }).code).toBe(APP_BUILD_DECLINED_CODE);
+    expect(daemon).toMatchObject({
+      kind: 'app-build', status: 'rejected', code: APP_BUILD_DECLINED_CODE, buildComplete: false,
+    });
+    expect((daemon as { publicUrl?: string }).publicUrl).toBeUndefined();
     expect(daemonCalls).toEqual([]);
     expect(tuiCalls).toEqual([]);
   });
@@ -84,8 +91,13 @@ describe('daemon chat turn — app_build approval path is the TUI one', () => {
     const daemon = await daemonChat(daemonCalls).dispatch('app_build', { ask: LINE },
       ctx({ verifiedOwner: undefined, surfaceHitlChannels: [counting] }));
     const tui = await tuiRoutes([], undefined).dispatchPluginTool('app_build', { ask: LINE });
-    expect(daemon).toEqual(tui);
+    // Same gate decision as the TUI probe (raw envelope) — the daemon answers with the server card.
     expect((daemon as { code?: string }).code).toBe('VERIFIED_OWNER_REQUIRED');
+    expect((tui as { code?: string }).code).toBe('VERIFIED_OWNER_REQUIRED');
+    expect(daemon).toMatchObject({
+      kind: 'app-build', status: 'needs_connection', code: 'VERIFIED_OWNER_REQUIRED',
+      needsConnection: true, buildComplete: false,
+    });
     expect(asked).toBe(0);
     expect(daemonCalls).toEqual([]);
   });
@@ -94,7 +106,13 @@ describe('daemon chat turn — app_build approval path is the TUI one', () => {
     const calls: GraphCall[] = [];
     const result = await daemonChat(calls).dispatch('app_build', { ask: LINE },
       ctx({ requestOrigin: 'external-agent', surfaceHitlChannels: [channel(true)] } as Partial<DaemonToolDispatchCtx>));
-    expect((result as { code?: string }).code).toBe('VERIFIED_OWNER_REQUIRED');
+    // Measured: an external-agent origin is refused before any owner gate — no gate code on the card.
+    // The invariant is «refused, never run» with no started/published forgery.
+    expect(result).toMatchObject({
+      kind: 'app-build', status: 'rejected', buildComplete: false,
+      error: expect.stringContaining('external-agent'),
+    });
+    expect((result as { code?: string }).code).toBeUndefined();
     expect(calls).toEqual([]);
   });
 
@@ -105,7 +123,10 @@ describe('daemon chat turn — app_build approval path is the TUI one', () => {
     expect((declined as { code?: string }).code).toBe(APP_BUILD_DECLINED_CODE);
     expect(calls).toEqual([]);
     const approved = await surface.dispatch('app_build', { ask: LINE }, ctx({ surfaceHitlChannels: [channel(true)] }));
-    expect(approved).toEqual({ ok: true, result: { graphId: 'app-build', status: 'completed' } });
+    // Published only behind a confirmed run with an explicit public URL.
+    expect(approved).toMatchObject({
+      kind: 'app-build', status: 'published', buildComplete: true, publicUrl: 'https://tix--m1.elanous.app/',
+    });
     expect(calls).toEqual([{ graphId: 'app-build', ownerId: 'm1', appSlug: SLOT }]);
   });
 
@@ -239,7 +260,8 @@ describe('daemon chat turn — route registry failures', () => {
       resetDaemonPluginRoutesForTest(() => { throw new Error('manifest unreadable'); });
       const names = toolSurface('chat', financeOff).specs.map((spec) => spec.name);
       expect(names).toContain('app_deploy');
-      expect(names).not.toContain('app_build');
+      // Shared-catalog decision: a registry read failure cannot unexpose app_build (fail-closed lives in dispatch).
+      expect(names).toContain('app_build');
       expect(log.mock.calls.some(([category, event]) =>
         category === 'capability.resolve' && event === 'daemon-plugin-routes-unavailable')).toBe(true);
       resetDaemonPluginRoutesForTest();
@@ -249,12 +271,18 @@ describe('daemon chat turn — route registry failures', () => {
     }
   });
 
-  test('a host without the app-build plugin exposes no app_build and refuses the name like any unknown tool', async () => {
+  test('a host without the app-build plugin still exposes the shared app_build name and fails the dispatch closed', async () => {
     const empty = mkdtempSync(join(tmpdir(), 'tc-dat-plugins-'));
+    const calls: GraphCall[] = [];
     try {
-      const surface = daemonChat([], empty);
-      expect(surface.specs.map((spec) => spec.name)).not.toContain('app_build');
-      await expect(surface.dispatch('app_build', { ask: LINE }, ctx())).rejects.toThrow(ToolSafetyError);
+      const surface = daemonChat(calls, empty);
+      // Shared-catalog decision: the name stays exposed even with no plugin registered under pluginRoot.
+      expect(surface.specs.map((spec) => spec.name)).toContain('app_build');
+      const result = await surface.dispatch('app_build', { ask: LINE }, ctx());
+      expect(result).toMatchObject({
+        kind: 'app-build', status: 'failed', buildComplete: false, error: 'unknown tool "app_build"',
+      });
+      expect(calls).toEqual([]);
     } finally {
       rmSync(empty, { recursive: true, force: true });
     }

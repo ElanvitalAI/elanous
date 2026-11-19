@@ -425,8 +425,11 @@ describe('bin/elanous.mjs ops status -r', () => {
 describe('ops status -r 이 부르는 경로는 «진짜» NEXUS 서버에 실재한다', () => {
   test('태스크 경로가 http-server 핸들러에 있고 mission list route 는 없다', () => {
     const serverSource = readFileSync(join(REPO_ROOT, 'src/nexus/api/http-server.ts'), 'utf8');
-    expect(serverSource).toContain(`'${REMOTE_OPS_TASKS_PATH}'`);
-    expect(serverSource).not.toContain("'/v1/missions'");
+    // 따옴표 무관(#38766 이 http-server.ts 를 큰따옴표로 재포맷) — 계약은 «경로 리터럴의 존재/부재»지 따옴표가 아니다.
+    //    부정 단언도 두 따옴표를 다 봐야 «공허한 통과»가 안 된다.
+    const quotedLiteral = (path: string): readonly string[] => [`'${path}'`, `"${path}"`];
+    expect(quotedLiteral(REMOTE_OPS_TASKS_PATH).some((lit) => serverSource.includes(lit))).toBe(true);
+    expect(quotedLiteral('/v1/missions').some((lit) => serverSource.includes(lit))).toBe(false);
   });
 
   // ⛔ arming 은 «리터럴이 아니다» — http-server 가 parseAutopilotPath 로 «접두 디스패치»한다.

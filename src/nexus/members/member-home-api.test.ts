@@ -472,15 +472,21 @@ test("MEMBER-HOME-WEBCHAT-SERVING-GATE: a serving signal opts the home back into
     const member = store.memberForGoogleSub("serving-gate-member")!;
     store.createMemberKey(member.id, "gate-laptop");
     store.claimHandle(member.id, "gate");
-    const slot = store.ensureNativeAppSlotForMember(member.id)!;
+    store.ensureNativeAppSlotForMember(member.id);
     const home = await (await api.handle(
       new Request("https://api.example.test/v1/members/home", {
         headers: { cookie: `__Host-elanous_member_session=${session}` },
       }),
     ))!.text();
     expect(home).toContain(
-      `data-member-webchat-entry href="https://${slot.appSlug}--gate.elanous.app/">웹채팅 시작</a>`,
+      'data-member-webchat-entry href="https://api.example.test/v1/members/webchat-handoff">웹채팅 시작</a>',
     );
+    // 렌더된 HTML 의 링크(href) 에 앱 슬롯 호스트(<app>--<handle>) 0 — 공개 앱 서빙 면이지 웹채팅 진입이
+    // 아니다 (출처: OP #106824 · MK #106820 — 앱 슬롯 링크 클릭 401). «내 주소 두 가지» 안내 문구의
+    // `--gate.elanous.app` 는 링크가 아닌 지문이므로 href 스코프로 잰다.
+    expect(
+      [...home.matchAll(/href="([^"]+)"/g)].map((match) => match[1]).join(" "),
+    ).not.toContain("--gate.elanous.app");
     expect(home).not.toContain("data-member-webchat-soon");
   } finally {
     store.close();

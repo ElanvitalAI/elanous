@@ -6,6 +6,11 @@ import { MsgStore } from '../msg/msg-store.js';
 import { createNextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { createSeatMailHeaderHook, readSeatMailSnapshot, seatMailLine } from './seat-mail-boot.js';
 
+test('seat header warns on more than 100 unread while preserving the actual count', () => {
+  expect(seatMailLine({ seat: 'TC', unread: 140 })).toBe('TC · 우편 140 ⚠ 100건 초과');
+  expect(seatMailLine({ seat: 'TC', unread: 100 })).toBe('TC · 우편 100');
+});
+
 test('자리 첫 화면 우편 스냅샷은 같은 원장을 읽고 ack cursor를 움직이지 않는다', () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-seat-mail-'));
   const home = join(root, 'home');

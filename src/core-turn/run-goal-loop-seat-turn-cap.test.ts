@@ -9,7 +9,7 @@ import { debug } from '../debug/log.js';
 import { DELEGATE_HINT } from '../agent/delegate-hint.js';
 import { GOAL_CONTINUATION_PROMPT, runGoalLoop, type GoalLoopOptions } from './run-goal-loop.js';
 import {
-  SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_DEFAULTS, isEmptyMailListResult, isIdleWaitCall, parseSeatTurnCapConfig,
+  SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_DEFAULTS, isEmptyMailListResult, isIdleWaitCall,
 } from './seat-turn-cap.js';
 
 const SEAT = { seat: 'OPT', ...SEAT_TURN_CAP_DEFAULTS };
@@ -120,10 +120,10 @@ describe('TUI-SEAT-TURN-CAP — 도구·벽시계 상한', () => {
   });
 
   test('자리 TUI: 벽시계 상한 뒤 전체 자리 턴을 닫는다', async () => {
-    const r = await drive([{ calls: shell(5), advanceMs: 6 * 60_000 }, { calls: [], complete: true }], { seatTurnCap: SEAT });
-    // 6·12·18분은 실행, 24분째(4번째) 호출은 거부.
-    expect(r.executed[0]).toHaveLength(3);
-    expect(r.find('seat-turn-cap')).toMatchObject({ reason: 'wall', tools: 3, iteration: 1 });
+    const r = await drive([{ calls: shell(5), advanceMs: 16 * 60_000 }, { calls: [], complete: true }], { seatTurnCap: SEAT });
+    // 45분 상한 — 16·32분은 실행, 48분째(3번째) 호출은 거부.
+    expect(r.executed[0]).toHaveLength(2);
+    expect(r.find('seat-turn-cap')).toMatchObject({ reason: 'wall', tools: 2, iteration: 1 });
     expect(r.calls).toBe(1);
     expect(r.result).toMatchObject({ stopReason: 'max_turns', goalComplete: false, iterations: 1 });
   });
@@ -312,12 +312,6 @@ describe('TUI-SEAT-TURN-CAP — caller dispatcher 계약(열차 r19d · 리뷰 r
 });
 
 describe('seat-turn-cap helpers', () => {
-  test('config 파서: 양의 정수만 받고, 유효 칸 0 이면 undefined', () => {
-    expect(parseSeatTurnCapConfig({ maxTools: 30, maxWallMs: 600_000 })).toEqual({ maxTools: 30, maxWallMs: 600_000 });
-    expect(parseSeatTurnCapConfig({ maxTools: 0, maxWallMs: -1, idleEmptyMsgListLimit: 1.5 })).toBeUndefined();
-    expect(parseSeatTurnCapConfig('x')).toBeUndefined();
-    expect(parseSeatTurnCapConfig(null)).toBeUndefined();
-  });
   test('빈 우편 판정은 MsgList 구조체 count 만 본다 · sleep 판정', () => {
     expect(isEmptyMailListResult('MsgList', { count: 0, messages: [] })).toBe(true);
     expect(isEmptyMailListResult('msg_list', { count: 2 })).toBe(false);

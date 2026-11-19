@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlink
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { debug } from '../debug/log.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { claimIncident, createFileIncidentClaimStore, isIncidentClaimCurrent, withIncidentClaim, type IncidentClaimStore, type SupervisorLoopRef } from '../supervision/incident-claim.js';
 import { MACROPHAGE_REPAIR_LADDER_LIMITS } from '../release-loop/macrophage-repair-ladder.js';
@@ -85,6 +86,8 @@ export interface ArgSupervisorTickRequest {
       { readonly outcome: 'verified' | 'rollback'; readonly effect: string } | 'absent' | 'unknown' |
       Promise<{ readonly outcome: 'verified' | 'rollback'; readonly effect: string } | 'absent' | 'unknown'> };
   readonly ports: ArgSupervisorPorts;
+  /** Root whose `graphs/` declarations receive this supervisor's events; defaults to the loop root. */
+  readonly eventTriggerRoot?: string;
 }
 
 export interface ArgSupervisorTickResult {
@@ -447,10 +450,35 @@ export async function runArgSupervisorTick(request: ArgSupervisorTickRequest): P
           outcome: 'fail', evidence: String(error), graphRevision: revision }) + '\n');
       } });
   }
-  if (graphRun.path.at(-1) === 'needs-human') return { resultType: 'input_required', graphRun,
+  const terminalNode = graphRun.path.at(-1);
+  // The legacy tick result has only complete/input_required; never turn its fallback
+  // value into a completion event unless the graph actually reached done.
+  const resultType = terminalNode === 'needs-human' ? 'input_required' as const : 'complete' as const;
+  if (terminalNode === 'done' || terminalNode === 'needs-human')
+    await routeSupervisorEvent(request, identity as string, resultType, graphRun, revision);
+  if (resultType === 'input_required') return { resultType, graphRun,
     graphRevision: revision, requestState: { supervisorId: identity as string, targetGraphId: request.targetGraphId,
       targetRunId: request.targetRunId, gateEventId: request.gateEventId, graphRevision: revision,
       ...(openProposal ? { proposal: JSON.stringify(openProposal) } : {}) },
     inputRequests: [{ kind: 'approval', prompt: openDecision?.reason ?? 'Approve the proposed release graph change' }] };
-  return { resultType: 'complete', graphRun, graphRevision: revision };
+  return { resultType, graphRun, graphRevision: revision };
+}
+
+/** Announce the tick outcome as `supervisor.<resultType>` to graphs declaring `triggers.event.from: <supervisorId>`.
+ *  Routing failures are logged and never change the supervisor's own result. */
+async function routeSupervisorEvent(request: ArgSupervisorTickRequest, supervisorId: string,
+  resultType: ArgSupervisorTickResult['resultType'], graphRun: GraphRunState, graphRevision: number): Promise<void> {
+  const type = `supervisor.${resultType}`;
+  try {
+    const { dispatchSupervisorEventToDeclaredTargets } = await import('../loops/graph-trigger-dispatch.js');
+    const graphRoot = request.eventTriggerRoot ?? (await import('../loops/registry.js')).defaultLoopRoot();
+    await dispatchSupervisorEventToDeclaredTargets({ supervisorId, targetGraphId: request.targetGraphId,
+      targetRunId: request.targetRunId, eventId: request.gateEventId, type, emittedAt: new Date().toISOString(),
+      data: { operation: request.operation, graphRevision, supervisorRunId: graphRun.runId,
+        terminalNode: graphRun.path.at(-1) ?? null } },
+    { graphRoot, registryRoot: request.root, stateRoot: request.root });
+  } catch (error) {
+    debug.log('graph.trigger-router', 'supervisor-dispatch-failed', { supervisorId, targetGraphId: request.targetGraphId,
+      targetRunId: request.targetRunId, eventId: request.gateEventId, type, error: String(error).slice(0, 300) }, { level: 'warn' });
+  }
 }

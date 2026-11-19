@@ -1028,7 +1028,7 @@ describe('pod codex rotation credentials', () => {
       writeFileSync(join(root, 'home-1', 'auth.json'), JSON.stringify({ tokens: { access_token: token(Math.floor(Date.now() / 1000) + 60), refresh_token: 'cli-refresh-third' } }));
       const rejected = fakeKubectl(['Complete'], '');
       const failure = await podSelfImplementSpawn({ kubectl: rejected.k, accountBroker: () => 'third', rotationAccounts: ['team', 'third'], credentials, env: {} })({ feature: 'x', spaceId: 'rotation-expired-all' }).done;
-      expect(failure.error?.message).toContain('3시간 안에 만료');
+      expect(failure.error?.message).toContain('openrouter 키 없음');
       expect(rejected.calls.filter((c) => c.args.endsWith('apply -f -'))).toHaveLength(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -4402,7 +4402,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     expect(calls.filter((c) => c.args.endsWith('apply -f -'))).toEqual([]);
   });
 
-  test('explicit Codex child ignores a stale OpenRouter arm env and does not receive its key', async () => {
+  test('explicit Codex child receives the OpenRouter key for role fallback', async () => {
     const { k, calls } = fakeKubectl(['Complete'], '');
     await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS,
       extraArgs: ['--child-llm-provider', 'openai-codex'],
@@ -4410,10 +4410,9 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       env: { OPENROUTER_API_KEY: 'test-openrouter-key' }, readKeyCache: () => undefined })({ feature: 'x', spaceId: 'codex-stale-openrouter-arm' }).done;
     const manifests = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
     expect(manifests).toHaveLength(2);
-    expect(manifests[0].stringData['env-OPENROUTER_API_KEY']).toBeUndefined();
-    expect(JSON.stringify(manifests)).not.toContain('test-openrouter-key');
+    expect(manifests[0].stringData['env-OPENROUTER_API_KEY']).toBe('test-openrouter-key');
     const job = manifests[1];
-    expect(job.spec.template.spec.containers[0].env.some((entry: { name: string }) => entry.name === 'OPENROUTER_API_KEY')).toBe(false);
+    expect(job.spec.template.spec.containers[0].env.some((entry: { name: string }) => entry.name === 'OPENROUTER_API_KEY')).toBe(true);
   });
 
   test('an OpenGateway child receives only its selected billing key from the host cache', async () => {
@@ -6818,6 +6817,7 @@ fi
       const frozenEnv = expectedHumanJob.spec.template.spec.containers[0].env as Array<{ name: string; value?: string }>;
       // POD-INPLACE-WORKTREE: the explicit disabled default and single-child guard are the only new env fields.
       frozenEnv.splice(frozenEnv.findIndex((entry) => entry.name === 'ELANOUS_SUBSTRATE') + 1, 0,
+        { name: 'ELANOUS_CODEX_QUOTA_POLICY', value: 'within-quota' },
         { name: 'ELANOUS_POD_SINGLE_CHILD', value: '1' }, { name: 'ELANOUS_POD_INPLACE_WORKTREE', value: '0' });
       frozenEnv.splice(frozenEnv.findIndex((entry) => entry.name === 'ELANOUS_HOST_ID') + 1, 0, ...provenanceEnv);
       // SI-TASK-ADMIT-RIGHTSIZE: the default request is 3Gi; the 16Gi limit stays byte-identical.
@@ -7404,13 +7404,13 @@ describe('Pod run label — harness stop ⊕ 오케스트레이터 신호 정리
   });
 });
 
-test('the Pod start script hands the host codex quota policy down, so a Pod child can rotate onto credits', () => {
+test('the Pod start script blocks credit spending even when the host permits it', () => {
   const saved = process.env.ELANOUS_CODEX_QUOTA_POLICY;
   process.env.ELANOUS_CODEX_QUOTA_POLICY = 'credits';
   try {
     for (const extra of [{}, { codexAccounts: ['team', 'third'] }]) {
       const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, ...extra }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
-      expect(script).toContain("export ELANOUS_CODEX_QUOTA_POLICY='credits'");
+      expect(script).toContain("export ELANOUS_CODEX_QUOTA_POLICY='within-quota'");
     }
   } finally {
     if (saved === undefined) delete process.env.ELANOUS_CODEX_QUOTA_POLICY; else process.env.ELANOUS_CODEX_QUOTA_POLICY = saved;

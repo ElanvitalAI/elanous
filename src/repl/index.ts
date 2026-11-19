@@ -161,9 +161,15 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
   // CAPSULE-B1-DONE-EVENT — each finished background root task also leaves as one `capsule-done` frame
   // (D12: the TUI can open a turn while idle). The notification drain below stays as is.
   const capsuleDone = watchCapsuleDone(sessionId, globalAgentRegistry, backgroundTaskIds);
+  // CAPSULE-B5 — completions filed only in this child's queue (RunShell bg · self-implement run-stop) also leave as frames.
+  const queueCapsules = (require('../turn-capsule/queue-bridge.js') as typeof import('../turn-capsule/queue-bridge.js'))
+    .watchQueueCapsuleDone(sessionId, globalTaskNotificationQueue);
   // CAPSULE-A2 — a Bash call detached past its sync cap leaves through the same frame wire.
   const shellCapsules = (require('../turn-capsule/shell-capsule.js') as typeof import('../turn-capsule/shell-capsule.js'))
     .installShellCapsuleSink(sessionId, (event) => { process.stderr.write(encodeCapsuleFrame(event)); });
+  // O1: watched lines cross the session boundary as progress; they are not completions.
+  const stopShellWatch = (require('../turn-capsule/shell-watch-frame.js') as typeof import('../turn-capsule/shell-watch-frame.js'))
+    .watchShellLineFrames(sessionId, globalTaskNotificationQueue, (frame) => { process.stderr.write(frame); });
   const onTaskStop = (message: unknown): void => {
     if (!message || typeof message !== 'object') return;
     const request = message as { type?: unknown; sessionId?: unknown; taskId?: unknown };
@@ -195,7 +201,7 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
       emit();
     },
     emit,
-    dispose() { clearInterval(timer); done.dispose(); capsuleDone.dispose(); shellCapsules?.dispose(); process.off('message', onTaskStop); },
+    dispose() { clearInterval(timer); done.dispose(); capsuleDone.dispose(); queueCapsules.dispose(); shellCapsules?.dispose(); stopShellWatch(); process.off('message', onTaskStop); },
   };
 }
 
@@ -454,6 +460,8 @@ export function buildReplTools(options: {
     return bashMod.dispatchBashCapsule(args, opts, turnId ? { correlation: { turnId } } : {});
   });
   specs.push(bashMod.buildBashTool());
+  const runShellMod = require('../skills/tools/shell.js') as typeof import('../skills/tools/shell.js');
+  specs.push(runShellMod.buildRunShellTool());
   const shellApprover = createReplShellApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const graphApprover = createReplGraphApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
   const publishApprover = createReplPublishApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
@@ -504,6 +512,29 @@ export function buildReplTools(options: {
       });
     }
     return runBash(args, signal);
+  });
+  dispatchByName.set('RunShell', async (args, callSignal) => {
+    const signal = combineSignals(options.getSignal?.(), callSignal);
+    const argv = Array.isArray(args.command) && args.command.every((v: unknown) => typeof v === 'string')
+      ? args.command as string[] : [];
+    if (argv.length === 0) return { error: 'RunShell requires a nonempty argv.' };
+    // The file-backed runner does not enforce sandboxing. Fail closed instead of silently ignoring it.
+    if ((args.mode === 'bg' || args.mode === 'inline') && args.sandbox !== undefined && args.sandbox !== 'off')
+      return { error: 'RunShell runner cannot enforce the requested sandbox.' };
+    const command = argv.join(' ');
+    const requiresApproval = !!bashApprovalFinding(command, getUserConfig().shell.bashApproval)
+      || args.approval === 'always' || args.approval === 'first-time';
+    return dispatchNextTuiBash({ command, enabled: true, requiresApproval, approve: shellApprover, signal,
+      dispatch: async () => {
+        const runner = require('../shell-runner/dispatch.js') as typeof import('../shell-runner/dispatch.js');
+        if (!runner.getShellRunnerDeps()) {
+          const { createShellRegistry } = require('../shell-runner/registry.js') as typeof import('../shell-runner/registry.js');
+          const { createFileCaptureEngine } = require('../shell-runner/file-engine.js') as typeof import('../shell-runner/file-engine.js');
+          const { installShellRunnerDeps } = require('../surface/shell-runner-boot.js') as typeof import('../surface/shell-runner-boot.js');
+          installShellRunnerDeps({ registry: createShellRegistry(), fileEngine: createFileCaptureEngine(), setShellRunnerDeps: runner.setShellRunnerDeps });
+        }
+        return runShellMod.dispatchRunShellCapsule({ ...args, approval: 'none' }, { signal, availableToolNames: specs.map(spec => spec.name) });
+      } });
   });
   const appDeploy = require('../agent/app-deploy-plugin.js') as typeof import('../agent/app-deploy-plugin.js');
   const appDeploySpec = appDeploy.appDeployPluginSpec();
@@ -1416,9 +1447,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         ? setShellWatchdogStatusSink((text) => { process.stdout.write(`${JSON.stringify({ event: 'status', turnId: turn.id, text })}\n`); })
         : null;
       if (streamTurn) process.once('SIGTERM', onTerminate);
-      const stopTurnCancel = streamTurn ? turnCancelRouter.listen(turn.id!, () => {
+      const stopTurnCancel = streamTurn ? turnCancelRouter.listen(turn.id!, (reason) => {
         emitTurnLife('turn-life:turn-cancel-received', { sessionId: sessionIdRef.current, turnId: turn.id });
-        turnAbort.abort();
+        turnAbort.abort(reason);
       }) : undefined;
       try {
         const sessionCfg = turn.sessionProvider && process.env.ELANOUS_NEXT_TUI_STREAM === '1'

@@ -20,6 +20,7 @@ function fakeBackend() {
     ls: record('ls', { exitCode: 0, message: LISTED }),
     read: record('read', { exitCode: 0, message: 'SCREEN' }) as ElsMcpBackend['read'],
     do: record('do', { exitCode: 1, message: 'els do: unknown pane w9/t9/p9' }) as ElsMcpBackend['do'],
+    input: record('input', { exitCode: 0, message: 'typed' }) as ElsMcpBackend['input'],
     newPane: record('new', { exitCode: 0, message: '{"pane":"p2"}' }) as ElsMcpBackend['newPane'],
     status: record('status', { exitCode: 1, message: 'no status' }) as ElsMcpBackend['status'],
   };
@@ -32,18 +33,31 @@ test('initialize negotiates the version, advertises tools+resources and names th
   const session = createElsMcpSession(fakeBackend().backend);
   const known = JSON.parse((await session.handleLine(line(1, 'initialize', { protocolVersion: '2024-11-05', clientInfo: { name: 'claude-code' } })))!);
   expect(known.result.protocolVersion).toBe('2024-11-05');
-  expect(known.result.capabilities).toEqual({ tools: {}, resources: {} });
+  expect(known.result.capabilities).toEqual({ tools: {}, resources: { subscribe: true } });
   expect(known.result.serverInfo.name).toBe('els');
   expect(session.principal()).toEqual({ kind: 'mcp-stdio', id: 'mcp-stdio:claude-code' });
   const unknown = JSON.parse((await session.handleLine(line(2, 'initialize', { protocolVersion: '1999-01-01' })))!);
   expect(unknown.result.protocolVersion).toBe('2025-11-25');
 });
 
-test('tools/list is exactly the five els tools, each with an input schema', async () => {
+test('tools/list includes the els tools, each with an input schema', async () => {
   const session = createElsMcpSession(fakeBackend().backend);
   const listed = JSON.parse((await session.handleLine(line(1, 'tools/list')))!);
   expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(['els_ls', 'els_read', 'els_do', 'els_new', 'els_status']);
   for (const tool of listed.result.tools) expect(tool.inputSchema.type).toBe('object');
+});
+
+test('direct input is not an MCP tool, even for a client claiming OP or RES-INFRA', async () => {
+  for (const client of ['OP', 'RES-INFRA']) {
+    const { backend, calls } = fakeBackend();
+    const session = createElsMcpSession(backend);
+    await session.handleLine(line(1, 'initialize', { clientInfo: { name: client } }));
+    const answer = JSON.parse((await session.handleLine(line(2, 'tools/call', {
+      name: 'els_input', arguments: { address: 'test-w/test-t/test-p', text: 'test-only', from: client, kind: 'cli' },
+    })))!);
+    expect(answer.error).toEqual({ code: -32602, message: 'unknown tool: els_input' });
+    expect(calls).toEqual([]);
+  }
 });
 
 test('tools/call: success passes the principal to the backend; exitCode != 0 is isError', async () => {
@@ -80,7 +94,9 @@ test('resources: list from ls, templates, read screen; events without a backend 
 
 test('unknown method -32601 and the session keeps answering; malformed JSON -32700; notifications get no answer', async () => {
   const session = createElsMcpSession(fakeBackend().backend);
-  expect(JSON.parse((await session.handleLine(line(1, 'resources/subscribe')))!).error.code).toBe(-32601);
+  expect(JSON.parse((await session.handleLine(line(1, 'resources/refresh')))!).error.code).toBe(-32601);
+  // resources/subscribe with no uri is malformed params, not unknown method
+  expect(JSON.parse((await session.handleLine(line(2, 'resources/subscribe')))!).error.code).toBe(-32602);
   expect(JSON.parse((await session.handleLine('{not json'))!)).toEqual({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } });
   expect(await session.handleLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }))).toBeUndefined();
   expect(JSON.parse((await session.handleLine(line(2, 'ping')))!).result).toEqual({});
@@ -129,7 +145,7 @@ test('real stdio process: initialize → tools/list → tools/call → resources
   const answers = out.trim().split('\n').map((raw) => JSON.parse(raw));
   expect(answers.map((a) => a.id)).toEqual([1, 2, 3, 4, 5, 6]);
   expect(answers[0].result.protocolVersion).toBe('2025-11-25');
-  expect(answers[1].result.tools.length).toBe(5);
+  expect(answers[1].result.tools.map((tool: { name: string }) => tool.name)).toEqual(['els_ls', 'els_read', 'els_do', 'els_new', 'els_status']);
   expect(answers[2].result).toEqual({ content: [{ type: 'text', text: 'els do: sent' }] });
   expect(answers[3].result.contents[0].text).toBe('hello from p1');
   expect(answers[4].error.code).toBe(-32601);
@@ -445,4 +461,30 @@ test('stdio: the first failure stops the queue — later lines are dropped, neve
   expect((failure as Error).message).toBe('pipe broken');
   // Line 1 reached the backend (read); line 2 was dropped after the write failure — never processed.
   expect(calls).toEqual([{ op: 'read', principal: 'mcp-stdio:unknown', args: ['w1/t1/p1'] }]);
+});
+
+test('resources/subscribe+poll: a screen change pushes notifications/resources/updated, no change stays silent, unsubscribe stops', async () => {
+  let screen = 'SCREEN-A';
+  const calls: string[] = [];
+  const backend: ElsMcpBackend = {
+    ls: async () => ({ exitCode: 0, message: LISTED }),
+    read: async (_p, _a) => { calls.push('read'); return { exitCode: 0, message: screen }; },
+    do: async () => ({ exitCode: 1 as const, message: 'no' }),
+    input: async () => { throw new Error('unexpected input'); },
+    newPane: async () => ({ exitCode: 0 as const, message: '{"pane":"p2"}' }),
+    status: async () => ({ exitCode: 1 as const, message: 'no status' }),
+  };
+  const session = createElsMcpSession(backend);
+  const sub = JSON.parse((await session.handleLine(line(1, 'resources/subscribe', { uri: 'els://pane/w1%2Ft1%2Fp1/screen' })))!);
+  expect(sub.result).toEqual({});
+  expect(await session.poll()).toEqual([]);            // unchanged → silent
+  screen = 'SCREEN-B';
+  const [first] = await session.poll();
+  expect(JSON.parse(first!).method).toBe('notifications/resources/updated');
+  expect(JSON.parse(first!).params.uri).toBe('els://pane/w1%2Ft1%2Fp1/screen');
+  expect(await session.poll()).toEqual([]);            // new baseline → silent
+  screen = 'SCREEN-C';
+  expect(JSON.parse((await session.handleLine(line(2, 'resources/unsubscribe', { uri: 'els://pane/w1%2Ft1%2Fp1/screen' })))!).result).toEqual({});
+  expect(await session.poll()).toEqual([]);            // unsubscribed → silent even on change
+  expect(calls.length).toBe(4);                           // every poll walked the read door (subscribe snapshot + 3 polls)
 });

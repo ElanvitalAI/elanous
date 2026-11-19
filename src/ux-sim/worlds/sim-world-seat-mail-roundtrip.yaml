@@ -1,0 +1,19 @@
+schema: 1
+world: seat-mail-roundtrip
+scenarios:
+  - id: R1-urgent-band
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts
+  - id: R2-receipt-stages
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts
+  - id: R3-repoll-dedupe
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts
+  - id: R4-expired-mail
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts
+  - id: R5-auto-receipts
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts
+  - id: R6-send-dedupe
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts
+  - id: R7-address-book
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts
+  - id: R8-list-cut
+    module: src/ux-sim/sim-world/seat-mail-roundtrip/scenarios.ts

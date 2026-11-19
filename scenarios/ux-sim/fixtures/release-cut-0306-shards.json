@@ -6419,7 +6419,6 @@
         "test/skill-tool-glob.test.ts",
         "apps/pwa/src/lib/show-beta.test.ts",
         "test/tui-client-headless-guard.test.ts",
-        "src/dashboard/classic-sigquit.test.ts",
         "test/pfc-agent-tool-new-fields.test.ts",
         "src/dashboard/slash-runtime/design-pick.test.ts",
         "src/intelligence-map/tools/route-to-model-coherence.test.ts",

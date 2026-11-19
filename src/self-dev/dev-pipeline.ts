@@ -51,7 +51,9 @@ import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
 import { getProvider, getProviderForConfig, inferProviderFromModel } from '../llm.js';
 import { resolveRoleProviderChain, type ProviderChainRole } from './role-provider-chain.js';
-import { noUsableReviewProviderError, planReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
+import { loadTokens } from '../oauth/store.js';
+import { podCodexLeaseCredential } from '../task-orchestrator/surfaces/pod-codex-lease.js';
+import { noUsableReviewProviderError, planReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, classifyReviewProviderFailure, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
 import { loadLlmPolicy, resolveSubscriptionReviewer } from '../policy/llm-policy.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
@@ -1166,7 +1168,12 @@ export async function buildDefaultSelfImplementSeams(
     try {
       if (routeProvider) {
         const config = getUserConfig();
-        provider = getProviderForConfig({ ...config, llm: { ...config.llm, provider: routeProvider as typeof config.llm.provider } }, normalizedModel);
+        const llm = { ...config.llm, provider: routeProvider as typeof config.llm.provider };
+        if (process.env.ELANOUS_SUBSTRATE === 'pod' && routeProvider === 'openai-codex') {
+          delete llm.apiKey;
+          delete llm.baseUrl;
+        }
+        provider = getProviderForConfig({ ...config, llm }, normalizedModel);
       } else if (inferredProvider) {
         provider = getProvider(normalizedModel);
       }
@@ -1206,16 +1213,41 @@ export async function buildDefaultSelfImplementSeams(
   };
   // Pod: each role resolves its chain from `llm.roleProviderChains` at call time (credentials and grok usage are live).
   // An exhausted chain throws its role-and-candidates reason; there is no silent fallback to another role's chain.
+  let podCodexBlocked = false;
+  const recordPodFallback = (role: ProviderChainRole, reason: string) => {
+    const runId = process.env.ELANOUS_RUN_ID;
+    if (!runId) return;
+    try { appendRunLedgerEntry({ runId, event: 'pod-role-fallback', data: { role, reason, provider: 'openrouter' } }); } catch { /* observation is fail-soft */ }
+  };
   const chainLLM = (role: ProviderChainRole) => async (prompt: string): Promise<string> => {
     const chain = resolveRoleProviderChain(role, {
       config: getUserConfig(),
-      isAvailable: ({ model, provider }) => reviewAttemptForModel(model, model, provider).provider?.available() ?? false,
+      podCodexBlocked,
+      isAvailable: ({ model, provider }) => {
+        if (process.env.ELANOUS_SUBSTRATE === 'pod' && provider === 'openai-codex') {
+          if (podCodexBlocked) return false;
+          try {
+            const entry = loadTokens('openai-codex');
+            const now = Date.now();
+            podCodexLeaseCredential(JSON.stringify({ providers: { 'openai-codex': entry } }), now, now + 1);
+          } catch { return false; }
+        }
+        return reviewAttemptForModel(model, model, provider).provider?.available() ?? false;
+      },
       ...(deps.reviewGrokQuota ? { grokQuota: deps.reviewGrokQuota } : {}),
     });
     if (chain.candidates.length === 0) throw new Error(chain.exhaustedReason);
+    const skippedCodex = chain.skipped.find(s => s.provider === 'openai-codex');
+    if (skippedCodex) recordPodFallback(role, skippedCodex.why);
     const r = await runReviewWithFallback(
       chain.candidates.map((candidate) => reviewAttemptForModel(candidate.model, `${role}:${candidate.model}`, candidate.provider)),
-      callAttempt(prompt), observeFallback(role), { maxCalls: 2 },
+      async (attempt, observe) => {
+        try { return await callAttempt(prompt)(attempt, observe); }
+        catch (error) {
+          if (attempt.provider?.name === 'openai-codex' && classifyReviewProviderFailure(error instanceof Error ? error.message : String(error)) === 'rate-limited') { podCodexBlocked = true; recordPodFallback(role, 'codex-quota-exhausted'); }
+          throw error;
+        }
+      }, observeFallback(role), { maxCalls: 2, shouldFallback: (attempt, reason) => process.env.ELANOUS_SUBSTRATE !== 'pod' || attempt.provider?.name !== 'openai-codex' || reason === 'rate-limited' || reason === 'credentials-unavailable' },
     );
     reviewerRan[role] = { provider: r.used.provider?.name ?? 'unknown', model: r.used.model };
     return r.text;

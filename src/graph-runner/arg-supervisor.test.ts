@@ -139,12 +139,14 @@ test('concurrent RLA ticks for one incident admit one live execution only', asyn
       return ok();
     } }) });
     await observeStarted;
-    const second = tick(root, state()).finally(() => { secondSettled = true; });
+    const second = tick(root, state(), { ports: ports({ observe: () => { observations += 1; return ok(); } }) })
+      .then(() => ({ error: null }), (error: Error) => ({ error }))
+      .finally(() => { secondSettled = true; });
     await Promise.resolve();
     expect(secondSettled).toBe(false);
     releaseObserve();
     await first;
-    await expect(second).rejects.toThrow('incident claim denied: incident already completed');
+    expect((await second).error?.message).toBe('RLA incident claim denied: incident already completed');
     expect(observations).toBe(1);
   } finally {
     releaseObserve();

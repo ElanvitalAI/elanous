@@ -51,6 +51,8 @@ export interface ShellRequest {
   /** Caller-supplied AbortSignal for cancellation. Composes with the
    *  timeout — either source kills the child. */
   signal?: AbortSignal;
+  /** CAPSULE-A2 — called once the process is spawned (after any approval wait): the capsule sync clock starts here. */
+  onSpawn?: () => void;
   /** Max bytes captured per stream (stdout + stderr). Past this,
    *  head+tail with truncation marker. Default SHELL_MAX_OUTPUT. */
   maxOutputChars?: number;

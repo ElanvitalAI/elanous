@@ -30,6 +30,7 @@
 //   (cleaner, no quoting surprises — codex-style).
 
 import { requirePosixShell } from '../platform/default-shell.js';
+import { shellChildEnv } from './child-env.js';
 import {
   spawn as nodeSpawn,
   type ChildProcessWithoutNullStreams,
@@ -406,7 +407,7 @@ function spawnChild(
 ): ChildProcessWithoutNullStreams {
   const spawnOpts: SpawnOptions = {
     cwd: req.cwd,
-    env: req.env ? { ...process.env, ...req.env } : process.env,
+    env: shellChildEnv(process.env, req.env) as NodeJS.ProcessEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   };
   if (typeof req.command === 'string') {

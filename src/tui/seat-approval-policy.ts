@@ -10,7 +10,8 @@
  * Design (#38454 r4 · OP «기본 거부 + argv 정확 일치» Bloom 5, 11-18): 판정 원칙은 공용 모듈(src/security/shell-argv-policy.ts)에
  * 있다 — 자동 승인은 argv 가 허용 목록 항목의 고정 모양과 정확히 일치할 때만 나오고, 메타문자가 하나라도 있거나 환경 접두가
  * NODE_ENV/CI 가 아니면 OP 에게 간다(«안전 명령이니 인자는 자유» 범주는 폐지). 이 파일은 자리몫 게이트(credential · op-only ·
- * destructive · graph)를 그 앞에 두고, 감사 기록과 OP 우편 본문에 인자 원문 대신 sha256 감사 해시를 싣는다. The allowlist file
+ * destructive · graph)를 그 앞에 두고, 감사 기록은 sha256 감사 해시로 남기되 OP 우편 본문은 비밀만 가린 명령 원문(경로·크기·이유
+ * 그대로)에 해시를 덧붙인다(#15 APPROVAL-REQUEST-PLAINTEXT · SEAT-MAIL-EXCHANGE-FIX-1119 — #38454 r4 «해시만» 폐지). The allowlist file
  * itself is OP's single-writer artifact — version + sha256 lock + stable item IDs + revocation tombstones (a resurrected
  * id or a backwards version is refused) at `seat-state/OP/approval-allow/<SEAT>` — read-only here.
  */
@@ -138,7 +139,7 @@ const OP_ONLY = /(^|\s)(pkill|killall)(\s|$)|\bgh\s+pr\s+merge\b|\bkill\s+-9\b/;
 
 /**
  * Pure policy — 자리몫 게이트(credential · op-only · destructive · graph) 륤 공용 argv 판정으로.
- * 결정 어디에도 인자 원문은 없다: 이유·명령 이름·sha256 감사 해시만 남는다(조항 5).
+ * 결정 어디에도 인자 원문은 없다: 이유·명령 이름·sha256 감사 해시만 남는다 — 우편 «본문» 의 비밀 가림 원문은 #15(마스킹은 핸들러).
  */
 export function seatApprovalDecision(command: string, kind: 'bash' | 'graph', extraAllowShapes: readonly AllowShape[] = []): SeatApprovalDecision {
   const auditSha256 = shellArgvAuditSha256(command);
@@ -186,9 +187,63 @@ export interface SeatApprovalPorts {
 
 const opOutcome = (decision: SeatApprovalOpDecision): ApprovalOutcome => decision.approved ? APPROVAL_APPROVED : { approved: false, reason: 'declined' };
 
+// ── #15 APPROVAL-REQUEST-PLAINTEXT (SEAT-MAIL-EXCHANGE-FIX-1119): the ask-op mail body carries the command itself,
+// secrets masked — 경로·크기·이유 stay readable so OP can actually judge (the #92648 오탐 lesson: «echo "rm -rf x"»
+// must be visible) — and the sha256 audit hash stays appended to tie the masked text back to the audited original.
+const SECRET_MASK = '****';
+/** 모양으로 아는 자격 증명: GitHub PAT(ghp/o/u/s/r_) · github_pat_ · sk-… · AWS AKIA · Slack xox… · base64url JWT · PEM 사열. */
+const SECRET_TOKEN_SHAPES: readonly RegExp[] = [
+  /\bgh[posru]_[A-Za-z0-9]{16,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{16,}\b/g,
+  /\bsk-[A-Za-z0-9_-]{16,}\b/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+  /-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----/g,
+];
+/** 환경 접두 할당(이름은 남기고 값만 가림 — PWD 는 경로라 제외) · https 자격 URL · --password 류 플래그 값. */
+const SECRET_ENV_ASSIGNMENT = /(^|[\s;&|(])([A-Za-z0-9_]*?(?:TOKEN|KEY|PASSWD|PASSWORD|SECRET|CREDENTIALS?|AUTH))=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s;&|()]+)/gi;
+const SECRET_URL_CREDENTIALS = /(https?:\/\/[^:/\s]+:)([^@\s]+)@/gi;
+const SECRET_FLAG_VALUE = /(["']?--(?:password|passwd|token|api-key|secret|access-token|pass)["']?[\s=]+)(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s;&|()"']+)/gi;
+/** 긴 base64/base64url 사열(40+ 자 · 대소문자 숫자 섞임): +·/ 없는 사열도 자격으로 본다(JUD ⓒ2) ·
+ *  클래스에 / 를 넣지 않는다 — / 로 이어진 경로를 통째로 삼키는 일이 없게(JUD ⓑ: / 뒤 세그먼트는 경로로 그대로) ·
+ *  순수 소문자 hex 커밋 sha 도 참조로 가리지 않는다. */
+const SECRET_BASE64_BLOB = /\b(?<!\/)(?=[A-Za-z0-9+_-]*[A-Z])(?=[A-Za-z0-9+_-]*[a-z])(?=[A-Za-z0-9+_-]*[0-9])[A-Za-z0-9+_-]{40,}={0,2}/g;
+
+/** 승인 요청 본문용: 명령 원문에서 비밀 값만 **** 로 가린다(#15). */
+export function maskApprovalCommandSecrets(command: string): string {
+  // JUD 20261119-1014 ⓒ (OP #94939): 공용 redactSecretText(gitleaks 이식 · #38865 합집합 원칙) 을 먼저 돌린다 —
+  // Bearer 불투명 토큰 · curl -u 사용자:비번 · postgres:// 등 scheme URL 자격 · mysql -p'비번' 은 공용이 가린다.
+  // 승인 요청 전용 규칙은 그 위에 추가로만 적용한다(합집합 · fail-closed).
+  const { redactSecretText } = require('../debug/secret-redaction.js') as typeof import('../debug/secret-redaction.js');
+  // 특정 모양(ghp_/JWT/…)이 공용보다 먼저: 공용의 generic 부분 가림(예: ey***)이 특정 토큰의 전체 가림(****)을 방해하지 않게(JUD ⓒ2 · r2 회귀 방지).
+  let preMasked = command;
+  for (const shape of SECRET_TOKEN_SHAPES) preMasked = preMasked.replace(shape, SECRET_MASK);
+  // 공용 redactSecretText(gitleaks 이식 · #38865 합집합 원칙) — Bearer 불투명 · curl -u 사용자:비번 · scheme URL 자격 · mysql -p'비번' 을 가린다(JUD ⓒ).
+  let masked = redactSecretText(preMasked);
+  masked = masked.replace(SECRET_URL_CREDENTIALS, `$1${SECRET_MASK}@`);
+  // JUD ⓒ: `curl -u alice:비번` 콜론 자격 인자 — 공용 gitleaks 이식이 안 가리는 모양 · 비번만 가린다(사용자 이름은 OP 판정에 필요).
+  const SECRET_COLON_CREDENTIAL_ARG = /(^|[\s"'])(-[uU]\b|--user(?:name)?)\s+([^\s"'@:]+):([^\s"']+)/g;
+  masked = masked.replace(SECRET_COLON_CREDENTIAL_ARG, `$1$2 $3:${SECRET_MASK}`);
+  // JUD ⓒ: postgres:// 등 https 가 아닌 scheme URL 자격 — 공용이 안 가리는 모양 · 사용자 이름은 유지(OP 판정).
+  const SECRET_ANY_SCHEME_URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s'"@\/]+):([^\s'"@\/]+)@/gi;
+  masked = masked.replace(SECRET_ANY_SCHEME_URL_CREDENTIALS, `$1$2:${SECRET_MASK}@`);
+  // JUD ⓒ: mysql -p'비번' 처럼 플래그 바로 뒤 인용된 자격 값 — 공용·기존 규칙이 안 가리는 모양.
+  const SECRET_QUOTED_FLAG_PASSWORD = /(^|[\s"'])(-[pPW]\b)(["'])([^\s"'\\]{3,})(\3)/g;
+  masked = masked.replace(SECRET_QUOTED_FLAG_PASSWORD, `$1$2$3${SECRET_MASK}$5`);
+  masked = masked.replace(SECRET_ENV_ASSIGNMENT, `$1$2=${SECRET_MASK}`);
+  masked = masked.replace(SECRET_FLAG_VALUE, `$1${SECRET_MASK}`);
+  masked = masked.replace(SECRET_BASE64_BLOB, SECRET_MASK);
+  return masked;
+}
+
 /** Wrap the TUI approval handler for a seat. Auto-approve on the allowlist; otherwise ask OP and the keyboard, earlier wins. */
 export function createSeatApprovalHandler(ports: SeatApprovalPorts) {
   const now = ports.now ?? Date.now;
+  // #25 APPROVAL-REPEAT-AUTO-DENY (SEAT-MAIL-EXCHANGE-FIX-1119 · 결함 #25): 밤 실측 — 같은 명령의 승인 요청이
+  // 10회+ 쌓여 전부 거부됐다. 세션 단위 기억(kind ⊕ 감사 해시 → 첫 요청 시각)으로 2회째부터는 OP 에 우편을
+  // 더 쌓지 않고 보낸 자리에 즉시 자동 거부로 답한다(옵션·깃발 없는 기본 동작).
+  const repeatAsks = new Map<string, { askedAtMs: number; outcome?: ApprovalOutcome }>();
   return async (command: string, callId: string, kind: 'bash' | 'graph', windowMs?: number): Promise<ApprovalOutcome> => {
     const verdict = seatApprovalDecision(command, kind, ports.extraAllowShapes?.() ?? []);
     if (verdict.decision === 'allow') {
@@ -196,16 +251,40 @@ export function createSeatApprovalHandler(ports: SeatApprovalPorts) {
       ports.setStatus(`자리 허용 목록 자동 승인 · ${verdict.rule}`);
       return APPROVAL_APPROVED;
     }
+    const repeatKey = `${kind}:${verdict.auditSha256}`;
+    const prior = repeatAsks.get(repeatKey);
+    if (prior?.outcome !== undefined && !prior.outcome.approved) {
+      // JUD ⓑ: 첫 요청이 거부·시간초과로 끝난 뒤의 재발만 즉시 자동 거부한다(창 = 이 핸들러의 세션 수명).
+      ports.log('approval-repeat-denied', { seat: ports.seat, callId, reason: verdict.reason, auditSha256: verdict.auditSha256, firstAskedAtMs: prior.askedAtMs, firstOutcome: prior.outcome.reason });
+      ports.setStatus('같은 승인 요청 반복 — 즉시 자동 거부 (OP 우편 없음)');
+      return { approved: false, reason: 'repeat-approval-request' };
+    }
+    if (prior?.outcome?.approved) {
+      // JUD ⓑ «승인은 통과»: 한 번 승인된 같은 요청의 재발은 다시 묻지 않고 통과시킨다.
+      ports.log('approval-repeat-approved', { seat: ports.seat, callId, reason: verdict.reason, auditSha256: verdict.auditSha256, firstAskedAtMs: prior.askedAtMs });
+      ports.setStatus('같은 승인 요청 반복 — 승인 재사용 (OP 우편 없음)');
+      return APPROVAL_APPROVED;
+    }
+    if (prior === undefined) repeatAsks.set(repeatKey, { askedAtMs: now() });
+    if (repeatAsks.size > 512) repeatAsks.delete(repeatAsks.keys().next().value as string);
+    // 이 요청이 어떤 결정으로 끝나는지 기억한다 — 다음 재발의 자동 거부/통과 판정 재료(JUD ⓑ).
+    const remember = (outcome: ApprovalOutcome): ApprovalOutcome => {
+      const cur = repeatAsks.get(repeatKey);
+      if (cur !== undefined) repeatAsks.set(repeatKey, { askedAtMs: cur.askedAtMs, outcome });
+      return outcome;
+    };
     let mailId: number | null = null;
     try {
-      // #38454 r4 (OP Bloom 5 ⑤): the mail body never carries the raw command — reason · command name · sha256 audit hash only.
-      mailId = ports.postRequest(`[승인 요청 · ${ports.seat}] ${kind === 'bash' ? 'Bash' : '그래프'} · 이유 ${verdict.reason}\n명령 이름: ${verdict.name} · 인자 원문은 감사 해시로만 남는다 sha256:${verdict.auditSha256}\n답: eln msg receipt <이 우편 id> accepted --to OP  |  rejected --to OP --reason "…" (화면에서 y/n 도 됨)`);
+      // #15 APPROVAL-REQUEST-PLAINTEXT (SEAT-MAIL-EXCHANGE-FIX-1119): the body carries the command itself, secrets
+      // masked (경로·크기·이유 그대로) so OP can judge it — the sha256 audit hash stays appended. #38454 r4 «hash-only» 폐지.
+      const maskedCommand = maskApprovalCommandSecrets(command);
+      mailId = ports.postRequest(`[승인 요청 · ${ports.seat}] ${kind === 'bash' ? 'Bash' : '그래프'} · 이유 ${verdict.reason}\n명령(비밀 가림): ${maskedCommand}\n명령 이름: ${maskApprovalCommandSecrets(verdict.name)} · 감사 해시 sha256:${verdict.auditSha256}\n답: eln msg receipt <이 우편 id> accepted --to OP  |  rejected --to OP --reason "…" (화면에서 y/n 도 됨)`);
       ports.log('asked-op', { seat: ports.seat, callId, mailId, reason: verdict.reason, auditSha256: verdict.auditSha256 });
     } catch (error) {
       // Never silent: the keyboard prompt still runs, and the failure is a warn line.
       ports.log('ask-op-failed', { seat: ports.seat, callId, reason: verdict.reason, error: error instanceof Error ? error.message : String(error), auditSha256: verdict.auditSha256 });
     }
-    if (mailId === null) return ports.local(command, callId, kind, windowMs);
+    if (mailId === null) return ports.local(command, callId, kind, windowMs).then(remember);
     // AUTHOR-PRECHECK extra «failure swallowed»: a ledger read error is not «OP has not answered» in silence — warn once per request.
     let readErrorLogged = false;
     const read = (): SeatApprovalOpDecision | null => {
@@ -249,7 +328,7 @@ export function createSeatApprovalHandler(ports: SeatApprovalPorts) {
     }
     if (source === 'op') ports.setStatus(outcome.approved ? `OP 승인 (#${mailId})` : `OP 거부 (#${mailId})`);
     ports.log('decided', { seat: ports.seat, callId, mailId, source, approved: outcome.approved, ...(outcome.approved ? {} : { reason: outcome.reason }), auditSha256: verdict.auditSha256 });
-    return outcome;
+    return remember(outcome);
   };
 }
 

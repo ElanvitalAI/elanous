@@ -148,7 +148,7 @@ describe('Agent-tool cap helpers', () => {
     expect(description).toContain('heavy multistep work that would overflow your context');
     expect(description).toContain('independent units in parallel');
     expect(description).toContain('long investigations');
-    expect(description).toContain('run_in_background');
+    expect(description).toContain('wait_for_slot=false');
   });
 
   test('buildAgentTool advertises wait_for_slot without making it required', () => {

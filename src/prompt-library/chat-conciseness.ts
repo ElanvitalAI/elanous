@@ -5,7 +5,6 @@ export interface BuildConcisenessSystemMessagesOpts {
   enabled: boolean;
   finalMessageMaxLines: number;
   preambleMaxWords: number;
-  flatBullets: boolean;
 }
 
 function lineCapText(maxLines: number): string {
@@ -55,7 +54,7 @@ useful answers instead of narrated progress.
 ## Terminal formatting
 
 - Use monospace CommonMark for commands, paths, env vars, and code ids.
-- ${opts.flatBullets ? 'Use flat bullet lists only; do not nest bullets or build outline trees unless the user asks for depth.' : 'Use short lists only when the content is inherently list-shaped; prose is preferred for simple answers.'}
+- Use flat bullet lists only; do not nest bullets or build outline trees unless the user asks for depth.
 - Do not use tables for facts that can be said plainly in prose or a short list.
 - Keep headings short and only when they improve scanability.
 `;

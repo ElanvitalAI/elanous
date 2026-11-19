@@ -50,7 +50,8 @@ describe('http-server imports cascade-zyu handlers', () => {
     ['idle-nudge',        'isIdleNudgePath'],
   ])('imports %s/%s', (module, symbol) => {
     expect(SOURCE).toContain(symbol);
-    expect(SOURCE).toContain(`from './${module}.js'`);
+    // Quote-agnostic (#38766 reformatted http-server.ts to double quotes + multi-line imports).
+    expect(SOURCE).toMatch(new RegExp(`from ['"]\\./${module}\\.js['"]`));
   });
 });
 

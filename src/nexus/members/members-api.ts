@@ -219,7 +219,22 @@ export interface MembersApiOptions {
   readonly webChatServing?: (input: {
     appSlug: string;
     handle: string;
+    /** OP #105017 ③: relay 질의에 회원 M 이 함께 가서 소유 대조가 가능하다. */
+    memberId: string;
   }) => boolean;
+  /** WEBCHAT-SESSION-HANDOFF — 회원 세션으로 일회용 핸드오프 토큰(60초 · 회원 결속)을 발급해 bare 핸들 원점 교환 URL 을 돌려준다. */
+  readonly webChatHandoff?: {
+    /** WEBCHAT-SESSION-HANDOFF — 진입 라우트가 부르는 발급 시임. FU ⓑ
+     * (#39056): 활성 핀 확인 뒤에만 발급된다(undefined → 503). 원본 세션
+     * 토큰은 이 시임과 원장을 거치지 않는다(원장 메모리 최소화). */
+    issue: (input: {
+      handle: string;
+      memberId: string;
+    }) => string | undefined;
+    /** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 회원 세션 폐기 → 파생
+     * 웹채팅 세션 폐기 체인(원장 노출). */
+    revokeDerivedForMember: (memberId: string) => void;
+  };
   /** Shared provider registry for graph-backed member route adapters. */
   readonly capabilityProviders?: GraphCapabilityRegistry;
   /** Private credential for the aggregate-only newsletter endpoint. */
@@ -1018,6 +1033,41 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           );
         }
       }
+      // WEBCHAT-SESSION-HANDOFF: 회원 세션 쿠키는 api 원점에만 있고 bare
+      // 핸들 원점으로는 따라가지 않는다. 진입은 여기서 일회용 토큰을 발급해
+      // bare 원점 교환 URL 로 303 — bare 원점이 토큰을 호스트 전용 HttpOnly
+      // 쿠키로 교환한 뒤 /app/chat/ 에 내려놓는다(http-server.ts 배선).
+      if (path === "/v1/members/webchat-handoff") {
+        if (request.method !== "GET")
+          return json({ error: "method-not-allowed" }, 405);
+        const sessionToken = sessionFromCookie(request);
+        const member = sessionToken
+          ? options.store.memberForSession(
+              sessionToken,
+              new Date(now()).toISOString(),
+            )
+          : null;
+        if (!member || !sessionToken)
+          return json({ error: "unauthorized" }, 401);
+        const handle = options.store.handleForMember(member.id);
+        const handoffUrl =
+          handle !== null
+            ? options.webChatHandoff?.issue({
+                handle,
+                memberId: member.id,
+              })
+            : undefined;
+        if (!handoffUrl)
+          return json({ error: "webchat-unavailable" }, 503);
+        return withCors(
+          request,
+          new Response(null, {
+            status: 303,
+            headers: { Location: handoffUrl },
+          }),
+          webOrigin,
+        );
+      }
       if (path === "/v1/members/home") {
         if (request.method !== "GET")
           return json({ error: "method-not-allowed" }, 405);
@@ -1041,13 +1091,13 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           },
           // MEMBER-HOME-AFTER-SIGNUP-DEADEND G1·G2·G4: connection/devices come from the member store's
           // active (unrevoked) member keys. No key yet = honest «연결 전»; only a failed lookup stays null.
-          // The web chat API rejects a member cookie (401), so the home never links to /app/chat: a
-          // connected member gets the chat address served by the connected device (the app host),
-          // a member without a device gets the connect guide instead of a chat button.
+          // 회원 홈 웹채팅 링크는 넘김 발급 라우트 /v1/members/webchat-handoff (members-api.ts 진입 라우트 →
+          // 303 bare 핸들 원점 + 일회용 토큰 · WEBCHAT-SESSION-HANDOFF)를 가리킨다. 앱 슬롯 호스트
+          // <app>--<handle> 는 공개 앱 서빙 면이지 웹채팅 진입이 아니다 (출처: OP #106824 · MK #106820 — 앱 슬롯 링크 클릭 401).
           // MEMBER-HOME-WEBCHAT-LINK-WRONG (OP 88490 안 A): the public slot address is <app>--<handle>, so a
           // member without a handle has no working chat host — the fallback slot URL (a 404 dead end,
           // MK #88484) must never leave this route, and the page offers the handle step instead.
-          // MEMBER-HOME-WEBCHAT-SERVING-GATE (OP #91609 ①): the slot host is not served in production yet, so the home must not link to a 404 — default hides the link; the serving check hook is where the relay pin ledger lands later.
+          // MEMBER-HOME-WEBCHAT-SERVING-GATE (OP #91609 ①): the slot host is not served in production yet, so the home must not link to a 404 — default hides the link; the serving check hook reads the host's pinned-handle ledger (HANDLE-BARE-HOST-WEBCCHAT-PROXY wiring in http-server.ts).
           ...(() => {
             const homeUrl = new URL("/v1/members/home", request.url).toString();
             try {
@@ -1064,8 +1114,9 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
                   options.webChatServing?.({
                     appSlug: slot.appSlug,
                     handle,
+                    memberId: member.id,
                   }) === true
-                    ? (publicSlot(slot).url ?? undefined)
+                    ? new URL("/v1/members/webchat-handoff", request.url).toString()
                     : undefined;
               } catch {
                 webChatUrl = undefined;
@@ -2307,16 +2358,26 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
       if (path === "/v1/members" && request.method === "DELETE") {
         if (origin !== webOrigin)
           return json({ error: "origin-not-allowed" }, 403);
-        const token = sessionFromCookie(request);
-        if (
-          !token ||
-          !options.store.requestDeletion(token, new Date(now()).toISOString())
-        )
-          return withCors(
-            request,
-            json({ error: "unauthorized" }, 401),
-            webOrigin,
-          );
+      const token = sessionFromCookie(request);
+      const member = token
+        ? options.store.memberForSession(
+            token,
+            new Date(now()).toISOString(),
+          )
+        : null;
+      if (
+        !member ||
+        !token ||
+        !options.store.requestDeletion(token, new Date(now()).toISOString())
+      )
+        return withCors(
+          request,
+          json({ error: "unauthorized" }, 401),
+          webOrigin,
+        );
+      // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056): 원본 회원 세션 폐기 → 파생
+      // 웹채팅 세션도 폐기한다(원본 폐기 → 파생 폐기 체인).
+      options.webChatHandoff?.revokeDerivedForMember(member.id);
         const response = json({ deletionRequested: true }, 202);
         response.headers.append("set-cookie", expiredCookie());
         return withCors(request, response, webOrigin);
@@ -2542,6 +2603,8 @@ export function createConfiguredMembersApi(
     | "resolveVerifiedMemberOwner"
     | "publicAppUrl"
     | "pinPublicHandle"
+    | "webChatServing"
+    | "webChatHandoff"
     | "capabilityProviders"
     | "runTryExample"
     | "now"
@@ -2605,6 +2668,12 @@ export function createConfiguredMembersApi(
   return createMembersApi({
     ...(options.pinPublicHandle
       ? { pinPublicHandle: options.pinPublicHandle }
+      : {}),
+    ...(options.webChatServing
+      ? { webChatServing: options.webChatServing }
+      : {}),
+    ...(options.webChatHandoff
+      ? { webChatHandoff: options.webChatHandoff }
       : {}),
     store,
     google,

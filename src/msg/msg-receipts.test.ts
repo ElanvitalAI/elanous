@@ -2,6 +2,7 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { MsgStore } from './msg-store.js';
+import { ensureReceiptClocksTable } from '../hq/msg-receipt-clocks.js';
 import { currentReceiptState, legacyIntent, receiptTransitionAllowed } from './msg-receipts.js';
 import { headerFieldsOf, modelContextHeader, seatMessageContextBlock } from './msg-context-header.js';
 
@@ -40,6 +41,11 @@ test('done 은 근거가 있어야 서고 호환 ack 를 done 으로 올린다 �
   const posted = store.post({ from: 'OP', to: 'TC', body: BODY });
   expect(() => store.recordReceipt({ messageId: posted.id, recipient: 'TC', state: 'done', source: 'cli' })).toThrow('done needs evidence');
   expect(() => store.recordReceipt({ messageId: posted.id, recipient: 'TC', state: 'rejected', source: 'cli' })).toThrow('rejected needs a reason');
+  // [JUD must=1 — 20261119-2358-JUD-CONFIRM-38881] throw 뒤 msg_receipt_clocks 에 doneAt 이 남으면 안 된다
+  // (검증 실패한 done 이 «완료 clock»으로 유출 · 가짜 완료 보고). 수리 = recordReceiptOn 성공 뒤에만 clock.
+  ensureReceiptClocksTable(store.db);
+  const clockRows = store.db.query('SELECT message_id, done_at FROM msg_receipt_clocks').all();
+  expect(clockRows).toEqual([]);
   store.recordReceipt({ messageId: posted.id, recipient: 'TC', state: 'seen', source: 'cli-ack' });
   store.recordReceipt({ messageId: posted.id, recipient: 'TC', state: 'done', source: 'cli', evidence: 'PR #1' });
   expect(ackRows(store)).toEqual([{ message_id: posted.id, recipient: 'TC', status: 'done' }]);

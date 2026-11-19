@@ -115,6 +115,7 @@ import {
   loadOrCreateRelayHostIdentity,
   type RelayHostConnection,
 } from "../../relay/host-connector.js";
+import { resolveMemberServiceToken } from "../../relay/member-service-token.js"; // (출처: #39104) env·0600 파일 회전
 import type { AutoPublicAppRegistration } from "../../relay/public-app-auto-registration.js";
 import {
   createRelayMemberTokenProvider,
@@ -541,6 +542,8 @@ import {
   handleAgentStatusPost,
   handleHudSegmentPost,
   handleChatEventsGet,
+  registerRelayHostChannelRequest, // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 릴레이 신뢰채널 표시
+  relayHostChatRouteAllowed, // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 채팅 쌍 2경로 게이트
   handlePromptPost,
   handlePromptStreamPost,
   handleSessionDelete,
@@ -635,7 +638,7 @@ import {
   createConfiguredMembersApi,
   type MembersApi,
 } from "../members/members-api.js";
-import { createMemberStore } from "../members/member-store.js";
+import { createMemberStore, type MemberStore } from "../members/member-store.js";
 import { openDeploymentApprovalStore } from "../members/deployment-approval-store.js";
 import {
   openDeploymentGrantStore,
@@ -722,6 +725,656 @@ const membersApiPublicHandlePins = new WeakMap<
   object,
   (handle: string, memberId: string) => void
 >();
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY: handles this appHost pinned to the relay; feeds
+ * the member home webchat serving gate (MembersApiOptions.webChatServing).
+ */
+const membersApiWebChatHandlePins = new WeakMap<object, Set<string>>();
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ (OP #103381) — 회원 홈 webChatServing
+ * 게이트. appHost candidate 가 있는 해상은 그 candidate 의 핀 원장을 읽고
+ * (기존 동작), candidate 없는 해상은 이 members API 를 만든 appHost 의 핀
+ * 원장을 읽는다(릴레이 배선이 createRelayWebChatLedger(opts.appHost) 로
+ * 그 키를 채운다). 핀 성공 핸들이면 true → 홈 webChatUrl 링크 노출,
+ * 핀 실패 · 미기록 · 끊김 원장이면 false → 숨김.
+ */
+/** OP #105017 ⓐ② — relay «핀 읽기» 응답 캐시 수명(≤30s). */
+const WEBCHAT_PIN_QUERY_CACHE_MS = 30_000;
+/** OP #105017 ⓐ — 회원 홈 게이트는 로컬 원장 대신 relay 질의 불리언만 따른다(자격은 연결의 회원 서버 host 인증). */
+const membersApiWebChatPinQueries = new WeakMap<
+  object,
+  (handle: string, memberId: string) => Promise<boolean>
+>();
+interface WebChatPinQueryEntry {
+  value: boolean;
+  at: number;
+}
+const membersApiWebChatPinQueryCache = new WeakMap<object, Map<string, WebChatPinQueryEntry>>();
+/** OP #105017 ⓐ① — relay 가 핀을 확인(accepted)한 순간 질의 캐시를 예열한다. */
+function seedWebChatPinQueryCache(appHost: object, handle: string, memberId: string): void {
+  const cache =
+    membersApiWebChatPinQueryCache.get(appHost) ??
+    new Map<string, WebChatPinQueryEntry>();
+  membersApiWebChatPinQueryCache.set(appHost, cache);
+  cache.set(`${memberId}\n${handle}`, { value: true, at: Date.now() });
+}
+
+export function membersApiWebChatServingGate(
+  candidate: object | undefined,
+  fallbackHost: object | undefined,
+): (input: { appSlug: string; handle: string; memberId: string }) => boolean {
+  return ({ handle, memberId }) => {
+    const ledgerHost = candidate ?? fallbackHost;
+    if (ledgerHost === undefined) return false;
+    const query = membersApiWebChatPinQueries.get(ledgerHost);
+    if (!query) return false; // 미배선·끊김 — fail-closed(OP #105017 ②)
+    const cache =
+      membersApiWebChatPinQueryCache.get(ledgerHost) ??
+      new Map<string, WebChatPinQueryEntry>();
+    membersApiWebChatPinQueryCache.set(ledgerHost, cache);
+    const key = `${memberId}\n${handle}`;
+    const entry = cache.get(key);
+    if (
+      entry === undefined ||
+      Date.now() - entry.at >= WEBCHAT_PIN_QUERY_CACHE_MS
+    ) {
+      // OP #105017 ①② — 회답은 불리언만 쓰고 실패는 false 로 기록한다.
+      void query(handle, memberId).then(
+        (value) => {
+          cache.set(key, { value: value === true, at: Date.now() });
+        },
+        () => {
+          cache.set(key, { value: false, at: Date.now() });
+        },
+      );
+      // 만료·미상·대기 중엔 false — fail-closed · 캐시 수명 ≤30s.
+      return false;
+    }
+    return entry.value;
+  };
+}
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 핀 성공 원장의 소유자
+ * 지도. 채팅 쌍 emt_ 회원 토큰 승인은 이 소유자 memberId 와 토큰 memberId 가
+ * 일치할 때만 뚫린다(원장 recordPin 확장이 여기를 채운다).
+ */
+const membersApiWebChatHandleOwners = new WeakMap<object, Map<string, string>>();
+
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓑ (#39003) — pin-success ledger seam shared by
+ * the relay wiring and its tests. `webChatServing` reads this exact WeakMap, so
+ * a bare origin is linked on the member home only after the relay confirms the
+ * pin.
+ */
+export function createRelayWebChatLedger(appHost: object): {
+  /** Handles whose relay pin succeeded — the webChatServing gate reads this set. */
+  handles: Set<string>;
+  /** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 핀 성공 핸들의 소유자
+   * memberId 지도. 채팅 쌍 emt_ 회원 토큰 승인이 토큰 memberId 와 이 값을
+   * 대조한다(핀이 성공할 때만 채워진다). */
+  pinOwners: Map<string, string>;
+  /** Records a pin attempt: the handle and its owner are recorded only when
+   * the pin resolves. */
+  recordPin: (handle: string, memberId: string, pin: Promise<unknown>) => void;
+  /** Clears every recorded handle — the relay connection dropped. */
+  onConnectionClosed: () => void;
+  /** OP #105017 ⓐ① — 연결 수립 시 «핀 읽기» 채널을 묶는다(끊기면 지워진다). */
+  setPinQueryChannel: (query: (handle: string, memberId: string) => Promise<boolean>) => void;
+} {
+  const handles =
+    membersApiWebChatHandlePins.get(appHost) ?? new Set<string>();
+  membersApiWebChatHandlePins.set(appHost, handles);
+  const pinOwners =
+    membersApiWebChatHandleOwners.get(appHost) ?? new Map<string, string>();
+  membersApiWebChatHandleOwners.set(appHost, pinOwners);
+  return {
+    handles,
+    pinOwners,
+    // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 핀 성공 시에만 소유자를
+    // 기록하고, 실패 핀은 (회원 홈 링크와 같은 원칙으로) 오래된 소유자 기록까지 지운다.
+    recordPin: (handle, memberId, pin) =>
+      recordWebChatHandlePinOutcome(handles, handle, pin.then(
+        (value) => {
+          pinOwners.set(handle, memberId);
+          // OP #105017 ⓐ① — relay 가 핀을 확인한 순간 질의 캐시를 예열한다.
+          seedWebChatPinQueryCache(appHost, handle, memberId);
+          return value;
+        },
+        (error) => {
+          pinOwners.delete(handle);
+          throw error;
+        },
+      )),
+    onConnectionClosed: () => {
+      handles.clear();
+      pinOwners.clear();
+      // OP #105017 ⓐ② — 끊김: «핀 읽기» 채널·캐시도 비운다(즉시 숨김).
+      membersApiWebChatPinQueries.delete(appHost);
+      membersApiWebChatPinQueryCache.delete(appHost);
+    },
+    setPinQueryChannel: (query) => {
+      membersApiWebChatPinQueries.set(appHost, query);
+    },
+  };
+}
+
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓑ (#39003) — a handle enters the serving
+ * ledger only after the relay confirms the pin; a failed pin removes any stale
+ * record so the member home never links a dead chat origin
+ * (MEMBER-HOME-WEBCHAT-LINK-WRONG).
+ */
+function recordWebChatHandlePinOutcome(
+  webChatHandles: Set<string>,
+  handle: string,
+  pin: Promise<unknown>,
+): void {
+  pin.then(
+    () => {
+      webChatHandles.add(handle);
+    },
+    (error) => {
+      webChatHandles.delete(handle);
+      debug.log("nexus.relay-host", "handle-pin-failed", {
+        errorType: error instanceof Error ? error.name : typeof error,
+      });
+    },
+  );
+}
+
+/**
+ * WEBCHAT-PIN-LEDGER-RECONNECT (OP #104299/#104391) — onClose 는 서빙 원장을
+ * 비우지만 재연결 배선은 핀 콜백만 다시 건다. 그대로 두면 어떤 내구 claim 도
+ * 다시 기록되지 않아 webChatServing 이 false 로 남는다(MEMBER-HOME-WEBCHAT-LINK-WRONG).
+ * 연결 수립·재연결 매번 회원 스토어의 내구 (handle, memberId) claim 전부를 원장에
+ * 다시 핀해 원장을 재구성한다. recordPin 은 핀 프라미스가 resolve 될 때만 기록하므로
+ * 거부된 재핀은 그 핸들을 원장 밖에 둔다(fail-closed — 게이트는 false 를 내는 채).
+ * 스토어 손잡이는 시험과 공유하는 심(seam)이다.
+ */
+export function restoreWebChatHandlePins(
+  ledger: ReturnType<typeof createRelayWebChatLedger>,
+  pin: (handle: string, memberId: string) => Promise<unknown>,
+  store: Pick<MemberStore, "handleClaims" | "close"> = createMemberStore(),
+): void {
+  try {
+    for (const claim of store.handleClaims()) {
+      ledger.recordPin(claim.handle, claim.memberId, pin(claim.handle, claim.memberId));
+    }
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * WEBCHAT-SESSION-HANDOFF — per-appHost one-time handoff token ledger. FU
+ * (#39056) 원장 메모리 최소화: 레코드는 소유자 결속 최소 필드만 담는다
+ * (원본 세션 토큰 미보관 — 교환은 파생 wcs_ 세션만 심는다).
+ */
+const membersApiWebChatHandoffs = new WeakMap<
+  object,
+  Map<
+    string,
+    {
+      readonly memberId: string;
+      readonly handle: string;
+      readonly expiresAt: number;
+    }
+  >
+>();
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — per-appHost 파생 웹채팅 세션
+ * (wcs_) 원장. 교환 성공 시 원본 세션 토큰 대신 쿠키에 심는 60초 토큰의 원장.
+ */
+const derivedByHost = new WeakMap<
+  object,
+  Map<
+    string,
+    {
+      readonly memberId: string;
+      readonly handle: string;
+      readonly expiresAt: number;
+      /** JUD #104249 ⓑ — use extends expiresAt, never past this. */
+      readonly absoluteExpiresAt: number;
+    }
+  >
+>();
+/** WEBCHAT-SESSION-HANDOFF — 토큰은 api 원점에서 발급되고 60초 안에 bare 핸들 원점에서 교환된다. */
+const WEBCHAT_HANDOFF_TTL_MS = 60_000;
+/**
+ * JUD #104249 ⓑ — 파생 웹채팅 세션은 채팅 세션 기준으로 산다: 쓸 때마다 유휴 창만큼
+ * 연장(60초 고정이면 넘김 1분 뒤 채팅이 전부 401 = 데모 중 끊김), 절대 상한을 넘지
+ * 않는다. 원본 회원 세션 폐기 → 파생 폐기 체인은 그대로다.
+ */
+// 출처: JUD #104249 ⓑ — «몇 시간» 유휴 창(채팅 한 자리) · 하루 업무 상한.
+const WEBCHAT_DERIVED_SESSION_IDLE_MS = 2 * 60 * 60_000;
+// 출처: JUD #104249 ⓑ — 절대 상한 12시간(넘김 한 번이 하루를 넘기지 않는다).
+const WEBCHAT_DERIVED_SESSION_MAX_MS = 12 * 60 * 60_000;
+/**
+ * FU (#39056) — 원장 상한: 발급 시마다 만료 레코드를 정리하고, 정리 후에도
+ * 이 값을 넘으면 가장 오래된 발급부터 치환한다(미교환 토큰 무한 누적 방지).
+ */
+const WEBCHAT_HANDOFF_LEDGER_MAX = 512;
+/** FU ⓑ (#39056) — 배선·핀 성공 원장이 없는 appHost 도 발급 검문에서 fail-closed 로 닫는다. */
+const EMPTY_WEBCHAT_PIN_OWNERS: ReadonlyMap<string, string> = new Map();
+/** FU (#39056) — 발급 시점 원장 정리·상한(핸드오프 원장 · 파생 세션 원장 공용). */
+function sweepWebChatLedgerEntries<V extends { readonly expiresAt: number }>(
+  map: Map<string, V>,
+  now: number,
+): void {
+  for (const [token, record] of map)
+    if (record.expiresAt <= now) map.delete(token);
+  while (map.size >= WEBCHAT_HANDOFF_LEDGER_MAX) {
+    const oldest = map.keys().next();
+    if (oldest.done) break;
+    map.delete(oldest.value);
+  }
+}
+/** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 교환 검증 실패 사유(401 error 코드). */
+export type WebChatHandoffConsumeFailure =
+  | "webchat-handoff-unknown"
+  | "webchat-handoff-handle-mismatch"
+  | "webchat-handoff-pin-mismatch"
+  | "webchat-handoff-expired";
+/** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — consume 결과: 성공(원본 레코드) 또는 실패 사유. */
+export type WebChatHandoffConsumeResult =
+  | {
+      ok: true;
+      record: { memberId: string; handle: string };
+    }
+  | { ok: false; reason: WebChatHandoffConsumeFailure };
+
+/**
+ * WEBCHAT-SESSION-HANDOFF — 일회용 핸드오프 토큰 원장. 발급은 members-api 의
+ * 진입 라우트(api 원점), 교환은 bare `<handle>.elanous.app` 원점이 하고 두
+ * 원점은 appHost 키로 같은 원장을 공유한다.
+ */
+export function createWebChatHandoffLedger(
+  appHost: object,
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 만료 시험 가속용 주입 clock.
+  clock: () => number = Date.now,
+  // FU ⓑ (#39056) — 발급 전 활성 핀 확인: 핀 성공 원장(핸들 → 소유자
+  // memberId). 활성 소유자와 어긩나면 발급을 거부한다(undefined → 503).
+  pinOwners?: ReadonlyMap<string, string>,
+) {
+  const handoffs = membersApiWebChatHandoffs.get(appHost) ?? new Map();
+  membersApiWebChatHandoffs.set(appHost, handoffs);
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 파생 웹채팅 세션(wcs_) 원장.
+  const derivedSessions = derivedByHost.get(appHost) ?? new Map();
+  derivedByHost.set(appHost, derivedSessions);
+  return {
+    /**
+     * 발급: (memberId, handle)에 결속된 일회용 토큰, 60초 TTL. FU ⓑ
+     * (#39056): 활성 핀 원장의 소유자와 일치할 때만 발급한다 — 교환이
+     * 반드시 실패할 URL 을 미리 내주지 않는다(undefined → 진입 라우트
+     * 503). 발급 시마다 만료 레코드를 정리하고 상한을 적용한다(FU).
+     */
+    issue: (
+      memberId: string,
+      handle: string,
+      now: number = clock(),
+    ): string | undefined => {
+      if (pinOwners && pinOwners.get(handle) !== memberId) return undefined;
+      sweepWebChatLedgerEntries(handoffs, now);
+      const token = `wch_${crypto.randomUUID()}`;
+      handoffs.set(token, {
+        memberId,
+        handle,
+        expiresAt: now + WEBCHAT_HANDOFF_TTL_MS,
+      });
+      return token;
+    },
+    /**
+     * 교환: 읽는 즉시 삭제(일회용). 핸들·만료·핀 소유자가 어긋나면 거부 사유를
+     * 돌려준다(HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 · #39056).
+     */
+    consume: (
+      token: string,
+      handle: string,
+      pinOwner: string | undefined,
+      now: number = clock(),
+    ): WebChatHandoffConsumeResult => {
+      const record = handoffs.get(token);
+      handoffs.delete(token);
+      if (!record) return { ok: false, reason: "webchat-handoff-unknown" };
+      if (record.handle !== handle)
+        return { ok: false, reason: "webchat-handoff-handle-mismatch" };
+      if (record.expiresAt <= now)
+        return { ok: false, reason: "webchat-handoff-expired" };
+      if (pinOwner === undefined || record.memberId !== pinOwner)
+        return { ok: false, reason: "webchat-handoff-pin-mismatch" };
+      return { ok: true, record };
+    },
+    /**
+     * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 교환 성공 후 파생 wcs_
+     * 세션 토큰 발급. 원본 세션 토큰은 파생 레코드에도 쿠키에도 절대 심히지
+     * 않는다.
+     */
+    issueDerivedSession: (
+      memberId: string,
+      handle: string,
+      now: number = clock(),
+    ) => {
+      sweepWebChatLedgerEntries(derivedSessions, now);
+      const token = `wcs_${crypto.randomUUID()}`;
+      derivedSessions.set(token, {
+        memberId,
+        handle,
+        expiresAt: now + WEBCHAT_DERIVED_SESSION_IDLE_MS,
+        absoluteExpiresAt: now + WEBCHAT_DERIVED_SESSION_MAX_MS,
+      });
+      return token;
+    },
+    /**
+     * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 비파괴 파생 세션 조회(만료
+     * · 타 핸들이면 undefined).
+     */
+    derivedSession: (
+      token: string,
+      handle: string,
+      now: number = clock(),
+    ) => {
+      const record = derivedSessions.get(token);
+      if (!record || record.handle !== handle || record.expiresAt <= now)
+        return undefined;
+      // JUD #104249 ⓑ — a live session used now slides its idle window (capped).
+      const extended = {
+        ...record,
+        expiresAt: Math.min(now + WEBCHAT_DERIVED_SESSION_IDLE_MS, record.absoluteExpiresAt),
+      };
+      derivedSessions.set(token, extended);
+      return extended;
+    },
+    /**
+     * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 회원의 파생 웹채팅 세션
+     * 전부 폐기(원본 세션 폐기 → 파생 세션 폐기 체인).
+     */
+    revokeDerivedForMember: (memberId: string) => {
+      for (const [token, record] of derivedSessions)
+        if (record.memberId === memberId) derivedSessions.delete(token);
+      // JUD terra ⓒ — an un-exchanged handoff token of that member dies with it too.
+      for (const [token, record] of handoffs)
+        if (record.memberId === memberId) handoffs.delete(token);
+    },
+    /** FU (#39056) — 원장 관측 시임: 만료 정리·상한 시험이 크기를 단언한다. */
+    stats: () => ({
+      handoffs: handoffs.size,
+      derivedSessions: derivedSessions.size,
+    }),
+    /** 릴레이 연결이 끊기면 핀이 사라지므로 미교환 토큰도 무효화한다. */
+    onConnectionClosed: () => {
+      handoffs.clear();
+      derivedSessions.clear();
+    },
+  };
+}
+
+export type WebChatHandoffLedger = ReturnType<typeof createWebChatHandoffLedger>;
+
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39003) — public app domain mirror of
+ * app-host's private PUBLIC_APP_DOMAIN copy.
+ */
+const BARE_WEBCHAT_PUBLIC_APP_DOMAIN = "elanous.app";
+/** Webchat PWA entry — the only /app subtree a bare origin may serve. */
+const BARE_WEBCHAT_ENTRY_PREFIX = "/app/chat";
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 파생 웹채팅 세션 쿠키. Path
+ * 한정 쿠키는 RFC 상 __Host- 를 쓸 수 없다(__Host- 는 Path=/ 전용) → __Secure-.
+ */
+const WEBCHAT_SESSION_COOKIE_NAME = "__Secure-elanous_webchat_session";
+/** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 파생 세션 쿠키가 사는 경로(착지 + 채팅 쌍 2경로). */
+const WEBCHAT_SESSION_COOKIE_PATHS = [
+  BARE_WEBCHAT_ENTRY_PREFIX,
+  "/v1/prompt/stream",
+  "/v1/chat/events",
+] as const;
+
+/**
+ * WEBCHAT-SESSION-HANDOFF JUD #104249 ⓒ (CSRF) — a SameSite=Lax cookie still rides a
+ * cross-origin POST from a sibling *.elanous.app host (another member's handle, any public
+ * app's JS), and a text/plain «simple» request skips the CORS preflight. So a chat-pair
+ * request carrying the wcs_ cookie — whatever its Authorization header says (JUD FU: a
+ * non-emt_ «Bearer junk» is no member credential at the relay and opens nothing in decideAuth,
+ * so it must not switch this check off while the cookie still authenticates) — must come from this
+ * handle's own origin: POST needs Origin — or, without it, Referer — exactly
+ * https://<handle>.elanous.app (else 403) and a JSON body (else 415, which forces a
+ * preflight); GET /v1/chat/events is refused (403) when it names another Origin.
+ * Returns the refusal, or undefined when the request may go on to auth.
+ */
+export function webChatCookieRequestRefusal(request: Request, handle: string): Response | undefined {
+  if (!(request.headers.get("cookie") ?? "").includes(`${WEBCHAT_SESSION_COOKIE_NAME}=`)) return undefined;
+  const host = `${handle}.${BARE_WEBCHAT_PUBLIC_APP_DOMAIN}`;
+  // The relay rewrites a same-origin Origin (https://<host>) to http://<internal host>, which
+  // for the bare chat routes IS <host> (relay-server «requestOrigin» rewrite); a foreign Origin
+  // passes through untouched. So exactly these two values mean «this handle's own page».
+  const ownOrigin = (value: string | null | undefined): boolean =>
+    value === `https://${host}` || value === `http://${host}`;
+  const origin = request.headers.get("origin");
+  let referrerOrigin: string | undefined;
+  try {
+    const referer = request.headers.get("referer");
+    referrerOrigin = referer ? new URL(referer).origin : undefined;
+  } catch {
+    referrerOrigin = undefined;
+  }
+  if (request.method === "POST") {
+    if (!ownOrigin(origin ?? referrerOrigin))
+      return jsonResponse({ error: "webchat-origin-mismatch" }, 403);
+    const type = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+    if (type !== "application/json")
+      return jsonResponse({ error: "webchat-json-required" }, 415);
+    return undefined;
+  }
+  if (origin !== null && !ownOrigin(origin))
+    return jsonResponse({ error: "webchat-origin-mismatch" }, 403);
+  return undefined;
+}
+
+/**
+ * WEBCHAT-SESSION-HANDOFF (JUD must ⓑ) — the member a request's derived wcs_ web-chat
+ * session cookie stands for on `handle`, or undefined. The ledger checks the handle, the
+ * expiry and revocation; a missing, malformed, foreign-handle, expired or revoked cookie
+ * resolves to nothing, so decideAuth's web-chat branch stays shut (→ 401).
+ */
+export function webChatSessionMember(
+  request: Request,
+  handle: string,
+  ledger: WebChatHandoffLedger | undefined,
+): string | undefined {
+  if (!ledger) return undefined;
+  for (const part of (request.headers.get("cookie") ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0 || part.slice(0, eq).trim() !== WEBCHAT_SESSION_COOKIE_NAME) continue;
+    let token: string;
+    try {
+      token = decodeURIComponent(part.slice(eq + 1).trim());
+    } catch {
+      continue;
+    }
+    if (!token.startsWith("wcs_")) continue;
+    const member = ledger.derivedSession(token, handle)?.memberId;
+    if (member) return member;
+  }
+  return undefined;
+}
+
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) 백스톱 — allowlist 밖 경로의 응답에
+ * 파생 웹채팅 세션 쿠키(3-Path) 삭제와 레거시 __Host-elanous_member_session
+ * (Path=/) 중화 Set-Cookie 를 덧붙인다. 쿠키는 착지 + 채팅 쌍 2경로에서만
+ * 살아 있어야 한다.
+ */
+function withWebChatCookieSweep(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const cookiePath of WEBCHAT_SESSION_COOKIE_PATHS) {
+    headers.append(
+      "set-cookie",
+      // JUD terra — a __Secure-/__Host- cookie is only cleared by a Secure Set-Cookie.
+      `${WEBCHAT_SESSION_COOKIE_NAME}=; Path=${cookiePath}; Max-Age=0; Secure`,
+    );
+  }
+  headers.append(
+    "set-cookie",
+    "__Host-elanous_member_session=; Path=/; Max-Age=0; Secure",
+  );
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+export function bareWebChatOriginHandle(hostname: string): string | undefined {
+  if (!hostname.endsWith(`.${BARE_WEBCHAT_PUBLIC_APP_DOMAIN}`)) return undefined;
+  const label = hostname.slice(
+    0,
+    hostname.length - (BARE_WEBCHAT_PUBLIC_APP_DOMAIN.length + 1),
+  );
+  // App public origins are `<app>--<user>` labels; a bare member origin is one
+  // plain label. Anything else defers to appHost.handle.
+  if (!label || label.includes(".") || label.includes("--")) return undefined;
+  return label;
+}
+
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39003 JUD must ⓐ) — explicit allowlist
+ * for the relay host connector on a pinned member's bare
+ * `<handle>.elanous.app` origin. A pinned bare origin serves the webchat PWA
+ * only: `/` and `/app/chat` redirect to the chat entry and `/app/chat/*` goes
+ * through the real static-app dispatch. Every other path — the entire `/v1/*`
+ * surface included — is a literal 404, so the public relay can never reach the
+ * member Nexus API from a bare origin (JUD must ⓒ warning). Returns undefined
+ * for non-bare origins (app `--` hosts, loopback) so those keep flowing to
+ * `appHost.handle`.
+ */
+export function routeBareWebChatHostRequest(
+  request: Request,
+  opts: {
+    pinnedHandles: ReadonlySet<string>;
+    /** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 핸들→핀 소유자
+     * memberId 원장. 채팅 쌍 emt_ 승인이 토큰 memberId 와 이 값을 대조한다. */
+    pinOwners?: ReadonlyMap<string, string>;
+    staticDir?: string;
+    // 출처: #39024 — allowlist 밖 경로(회원 채팅 API: /api/* 등)는 relay
+    // routeRequest(checkAuth 포함)로 전달되고, 없으면 예전 그대로 404.
+    forwardApi?: (request: Request) => Promise<Response>;
+    /** WEBCHAT-SESSION-HANDOFF — 발급된 일회용 토큰의 교환 원장. */
+    webChatHandoff?: WebChatHandoffLedger;
+  },
+): Response | Promise<Response> | undefined {
+  let url: URL;
+  try {
+    url = new URL(request.url);
+  } catch {
+    return undefined;
+  }
+  const handle = bareWebChatOriginHandle(url.hostname);
+  if (handle === undefined) return undefined;
+  // JUD must ⓑ: an unpinned handle exposes nothing — the pre-fix 404 stands.
+  if (!opts.pinnedHandles.has(handle))
+    return jsonResponse({ error: "handle-not-pinned" }, 404);
+  const pathname = url.pathname;
+  // Explicit allowlist — no fallthrough to other /app paths, /v1, or
+  // /_app-storage. Anything unmatched is 404.
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056): 루트("/")는 비-웹채팅 경로다 —
+  // 착지로 보내되 파생 웹채팅 세션 쿠키와 레거시 원본 쿠키를 지운다(백스톱).
+  if (pathname === "/")
+    return withWebChatCookieSweep(
+      new Response(null, {
+        status: 303,
+        headers: { Location: `${BARE_WEBCHAT_ENTRY_PREFIX}/` },
+      }),
+    );
+  if (pathname === BARE_WEBCHAT_ENTRY_PREFIX)
+    return new Response(null, {
+      status: 303,
+      headers: { Location: `${BARE_WEBCHAT_ENTRY_PREFIX}/` },
+    });
+  // WEBCHAT-SESSION-HANDOFF: 회원 세션 쿠키는 api 원점에만 있으므로, 진입
+  // 라우트가 발급한 일회용 토큰(60초 TTL · 회원 결속)을 여기서 교환한다.
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056): 교환 검증을 통과해야만 성공
+  // 이고, 실패 사유를 401 로 돌려준다. 성공해도 원본 세션 토큰은 절대 심지
+  // 않는다 — 파생 wcs_ 토큰을 착지 + 채팅 쌍 2경로에만 살게 한다.
+  if (
+    pathname === `${BARE_WEBCHAT_ENTRY_PREFIX}/handoff` &&
+    request.method === "GET"
+  ) {
+    const token = url.searchParams.get("handoff-token") ?? "";
+    const handoffLedger = opts.webChatHandoff;
+    const consumed = handoffLedger?.consume(
+      token,
+      handle,
+      opts.pinOwners?.get(handle),
+    );
+    if (!handoffLedger || !consumed?.ok)
+      return jsonResponse(
+        {
+          error:
+            consumed && !consumed.ok
+              ? consumed.reason
+              : "webchat-handoff-unknown",
+        },
+        401,
+      );
+    const derivedToken = handoffLedger.issueDerivedSession(
+      consumed.record.memberId,
+      handle,
+    );
+    const headers = new Headers({
+      Location: `${BARE_WEBCHAT_ENTRY_PREFIX}/`,
+    });
+    for (const cookiePath of WEBCHAT_SESSION_COOKIE_PATHS) {
+      headers.append(
+        "set-cookie",
+        // Path 한정 쿠키라 __Host- 접두는 RFC 상 불가(__Host- 는 Path=/
+        // 전용) → __Secure- + Secure 로 호스트 전용을 유지한다. 값은 파생
+        // wcs_ 토큰 — 원본 세션 토큰은 절대 여기에 없다.
+        `${WEBCHAT_SESSION_COOKIE_NAME}=${encodeURIComponent(derivedToken)}; Path=${cookiePath}; Secure; HttpOnly; SameSite=Lax`,
+      );
+    }
+    return new Response(null, { status: 303, headers });
+  }
+  if (pathname.startsWith(`${BARE_WEBCHAT_ENTRY_PREFIX}/`)) {
+    if (!opts.staticDir)
+      return jsonResponse({ error: "static-not-wired" }, 404);
+    return handleStaticAppRequest(url, { staticDir: opts.staticDir });
+  }
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 릴레이 신뢰채널 배선:
+  // 회원 채팅 쌍 2경로만, 그 핸들의 핀 소유자가 원장에 기록되어 있을 때만
+  // 신뢰채널 표시를 남긴다(meta-api decideAuth 의 emt_ 갈래가 이 표시와
+  // 소유자 일치를 함께 검사한다). 표시는 이 배선 안에서만 새겨지므로 공개
+  // 인터넷 요청은 결코 표시될 수 없고, 미표시 요청은 기존 401 로 폐쇄된다.
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) 백스톱: 채팅 쌍 2경로만 통과시킨다.
+  // 그 외 경로(404 폴스루 포함)의 응답에는 파생 웹채팅 세션 쿠키 3-Path 삭제와
+  // 레거시 __Host-elanous_member_session(Path=/) 중화를 덧붙여 쿠키가 allowlist
+  // 밖 경로로 새는 일을 원천 봉쇄한다.
+  const chatRouteAllowed = relayHostChatRouteAllowed(request);
+  if (chatRouteAllowed) {
+    const refused = webChatCookieRequestRefusal(request, handle);
+    if (refused) return refused;
+  }
+  const pinOwner = chatRouteAllowed
+    ? opts.pinOwners?.get(handle)
+    : undefined;
+  if (pinOwner)
+    registerRelayHostChannelRequest(
+      request,
+      pinOwner,
+      webChatSessionMember(request, handle, opts.webChatHandoff),
+    );
+  if (chatRouteAllowed) {
+    if (opts.forwardApi) return opts.forwardApi(request);
+    return jsonResponse({ error: "not-found" }, 404);
+  }
+  if (!opts.forwardApi)
+    return withWebChatCookieSweep(
+      jsonResponse({ error: "not-found" }, 404),
+    );
+  return opts.forwardApi(request).then((forwarded) =>
+    withWebChatCookieSweep(forwarded),
+  );
+}
+
 function defaultMembersApi(
   appHost?: object,
   capabilityProviders?: GraphCapabilityRegistry,
@@ -820,6 +1473,39 @@ function defaultMembersApi(
           pinPublicHandle: candidate
             ? (handle, memberId) =>
                 membersApiPublicHandlePins.get(candidate)?.(handle, memberId)
+            : undefined,
+          // HANDLE-BARE-HOST-WEBCCHAT-PROXY: a pinned handle means this host serves
+          // that bare webchat origin, so the member home may link the chat address —
+          // even with no appHost candidate, the pin ledger of the appHost this API
+          // was built for keeps the gate live (OP #103381).
+          webChatServing: membersApiWebChatServingGate(candidate, appHost),
+          // WEBCHAT-SESSION-HANDOFF: 진입 라우트가 부르는 발급 시임 — 회원
+          // 세션을 받아 일회용 토큰(60초)을 발급하고 bare 원점 교환 URL 을
+          // 돌려준다. 미배선이면 진입 라우트가 503 로 닫는다.
+          webChatHandoff: candidate
+            ? {
+                // WEBCHAT-SESSION-HANDOFF: 진입 라우트가 부르는 발급 시임 — 회원
+                // 세션을 받아 일회용 토큰(60초)을 발급하고 bare 원점 교환 URL 을
+                // 돌려준다. 미배선이면 진입 라우트가 503 로 닫는다.
+                issue: ({ handle, memberId }) => {
+                  // FU ⓑ (#39056): 발급 전 활성 핀 확인 — 이 appHost 의 핀
+                  // 성공 원장에 활성 소유자가 없으면 URL 을 내주지 않는다.
+                  const token = createWebChatHandoffLedger(
+                    candidate,
+                    Date.now,
+                    membersApiWebChatHandleOwners.get(candidate) ??
+                      EMPTY_WEBCHAT_PIN_OWNERS,
+                  ).issue(memberId, handle);
+                  if (token === undefined) return undefined;
+                  return `https://${handle}.${BARE_WEBCHAT_PUBLIC_APP_DOMAIN}${BARE_WEBCHAT_ENTRY_PREFIX}/handoff?handoff-token=${encodeURIComponent(token)}`;
+                },
+                // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056): 회원 세션 폐기 →
+                // 파생 웹채팅 세션 폐기(원본 폐기 → 파생 폐기 체인).
+                revokeDerivedForMember: (memberId) =>
+                  createWebChatHandoffLedger(candidate).revokeDerivedForMember(
+                    memberId,
+                  ),
+              }
             : undefined,
           ...(nexusAppHost
             ? {
@@ -1271,6 +1957,36 @@ export function startNexusHttpServer(
           readMemberKey: () => readRelayMemberKeyFile(memberKeyPath),
         })
       : undefined;
+  // (출처: #39104) 회원 서버 역할 서비스 토큰(ems_) — env(ELANOUS_RELAY_MEMBER_
+  // SERVICE_TOKEN) 또는 0600 파일(ELANOUS_RELAY_MEMBER_SERVICE_TOKEN_FILE)로
+  // 회전. «아무 회원의 핸들 핀 불리언 읽기» 질의 자격만 주고 쓰기 경로는
+  // 그대로(emt_ 소유자 대조)다. 없으면 서비스 자격을 아예 실지 않는다.
+  // (출처: #39104) JUD must ⓑ(#105797) — «없으면 실지 않는다»를 조건부 배선으로
+  // 구현한다: 회전 경로(env 또는 0600 파일)가 설정돼 있을 때만 콜백을 만든다.
+  // 경로가 없는 회원 기기는 콜백이 undefined 로 배선돼 relay 호스트 연결이 그대로
+  // 성립하고(핸들 웹채팅·공개 앱 서빙 유지), «핀 읽기» 질의만 자격 없음
+  // fail-closed(false)로 귀결된다. 이전의 «미해결 시 throw»는 relayConfigured
+  // 면 늘 배선되므로 토큰 없는 모든 회원 기기의 연결을 죽였다.
+  const memberServiceTokenSourceConfigured = (): boolean => {
+    const tokenEnv = process.env.ELANOUS_RELAY_MEMBER_SERVICE_TOKEN;
+    const tokenFileEnv =
+      process.env.ELANOUS_RELAY_MEMBER_SERVICE_TOKEN_FILE;
+    return (
+      (tokenEnv !== undefined && tokenEnv.trim() !== "") ||
+      (tokenFileEnv !== undefined && tokenFileEnv.trim() !== "")
+    );
+  };
+  const getMemberServiceToken =
+    relayConfigured && memberServiceTokenSourceConfigured()
+      ? () => {
+          // (출처: #39104) 회전 경로가 설정돼 있는데 해석이 비는 건 깨진 배포다 —
+          // 조용히 빈 자격을 흘리지 않고 명시적으로 실패한다(fail-closed).
+          const token = resolveMemberServiceToken();
+          if (token === undefined)
+            throw new Error("relay member service token unresolved");
+          return token;
+        }
+      : undefined;
   // P-2D.2 — every request reads from this ref. Admin endpoint
   // mutates it. When the caller didn't pass one we own the lifecycle.
   const devProxyRef: DevProxyRuntimeRef =
@@ -1280,6 +1996,10 @@ export function startNexusHttpServer(
 
   let server: ReturnType<typeof Bun.serve> | null = null;
   let resolvedPort = -1;
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY-FU (#39009 deadPath ①): the relay
+  // forwardApi below needs the bound port's ws bridge, but the bridge const
+  // is scoped inside the port loop — hoist the winning binding here.
+  let boundBridge: ReturnType<typeof createWsBridge> | null = null;
 
   for (let i = 0; i < range; i += 1) {
     const port = startPort + i;
@@ -1317,6 +2037,9 @@ export function startNexusHttpServer(
               requestDebugAudience(req, opts.metaApi),
           })
         : null;
+      // #39009 deadPath ①: expose the winning binding's bridge to the relay
+      // forwardApi defined after the port loop.
+      boundBridge = bridge;
       const websocketHandler: WsHandlers | undefined = bridge?.websocket;
       // Bun's typed `Bun.serve` overloads disagree on the shape of
       // `websocket` (the WebSocket-enabled overload expects a richer
@@ -1424,19 +2147,105 @@ export function startNexusHttpServer(
         const controller = new AbortController();
         relayAttemptController = controller;
         try {
+          // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓑ (#39003): the pin-success ledger is
+          // get-or-created before the relay dials, so the close hook can clear it
+          // and the bare-origin routing below reads live pin state.
+          const ledger = createRelayWebChatLedger(opts.appHost!);
+          // WEBCHAT-SESSION-HANDOFF: 핀 원장과 수명을 같이하는 핸드오프 원장.
+          const handoffLedger = createWebChatHandoffLedger(opts.appHost!);
           const identity = await loadOrCreateRelayHostIdentity(identityPath);
           const connection = await connectRelayHost({
             relayUrl: relayConfig.url!,
             daemonKeys: identity.daemonKeys,
             hostSigningKey: identity.hostSigningKey,
             ...(getMemberToken ? { getMemberToken } : {}),
-            handleRequest: (request) => opts.appHost!.handle(request),
+            // (출처: #39104) 서비스 자격 — 핀 읽기만. JUD must ⓑ(#105797): 배선은
+            // 조건부다 — 토큰 회전 경로가 없으면 getMemberServiceToken 가
+            // undefined 라 이 필드가 아예 빠진다. 연결은 그대로 성립하고 핀 읽기
+            // 질의만 자격 없음 fail-closed(false)로 귀결된다.
+            ...(getMemberServiceToken
+              ? { getMemberServiceToken }
+              : {}),
+            // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39003): a pinned bare
+            // `<handle>.elanous.app` origin routes through an explicit webchat
+            // allowlist (PWA static only — never the /v1 surface); every other
+            // origin flows to appHost.handle exactly as before.
+            handleRequest: async (request) =>
+              (await routeBareWebChatHostRequest(request, {
+                pinnedHandles: ledger.handles,
+                // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ): 채팅 쌍
+                // emt_ 회원 토큰 승인이 대조하는 핸들→소유자 지도.
+                pinOwners: ledger.pinOwners,
+                // WEBCHAT-SESSION-HANDOFF — 일회용 토큰 교환 원장.
+                webChatHandoff: handoffLedger,
+                ...(opts.staticDir ? { staticDir: opts.staticDir } : {}),
+               // #39009 deadPath ①: appHost.handle 404s every `--`-less
+                // bare host, so the allowlisted chat pair never reached a
+                // real handler. Forward to routeRequest — checkAuth
+                // included — exactly like the loopback fetch handler does.
+                forwardApi: async (apiRequest: Request) => {
+                  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 채팅 API
+                  // 쌍만 릴레이 신뢰채널 표시를 남긴다. 이 지점은 릴레이 배선 안쪽에서만
+                  // 도달 가능하므로 공개 인터넷 요청은 결코 표시될 수 없다. 표시값은
+                  // 그 핸들의 핀 소유자 memberId(원장 pinOwners 확장)다.
+                  const forwardedUrl = new URL(apiRequest.url);
+                  const chatPair =
+                    (apiRequest.method === "POST" &&
+                      forwardedUrl.pathname === "/v1/prompt/stream") ||
+                    (apiRequest.method === "GET" &&
+                      forwardedUrl.pathname === "/v1/chat/events");
+                  const pinOwner = chatPair
+                    ? ledger.pinOwners.get(
+                        bareWebChatOriginHandle(forwardedUrl.hostname) ?? "",
+                      )
+                    : undefined;
+                  if (pinOwner !== undefined) {
+                    registerRelayHostChannelRequest(
+                      apiRequest,
+                      pinOwner,
+                      // WEBCHAT-SESSION-HANDOFF (JUD must ⓑ) — same derived-session
+                      // lookup as routeBareWebChatHostRequest (this re-mark must not drop it).
+                      webChatSessionMember(
+                        apiRequest,
+                        bareWebChatOriginHandle(forwardedUrl.hostname) ?? "",
+                        handoffLedger,
+                      ),
+                    );
+                  }
+                  return (
+                    (await routeRequest(
+                      apiRequest,
+                      opts,
+                      server as unknown as BunServerLike,
+                      boundBridge,
+                      devProxyRef,
+                      { hostname, port: resolvedPort },
+                      gridDataSource,
+                      loopEdgesDataSource,
+                    )) ??
+                    (await opts.appHost!.handle(apiRequest)) ??
+                    // 출처: #39009 — bare 원점은 앱 호스트가 아니므로 appHost.handle
+                    // 가 undefined 를 내는 일은 없어야 하지만, 라우팅이 마지막까지
+                    // 응답을 못 정하면 회원 채팅 원점은 404 로 끝낸다.
+                    new Response("Not Found", { status: 404 })
+                  );
+                },
+              })) ?? opts.appHost!.handle(request),
             onError: (error) =>
               debug.log("nexus.relay-host", "request-error", {
                 serverId: identity.serverId,
                 errorType: error.name,
               }),
-            onClose: scheduleRelayRetry,
+            onClose: () => {
+              // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓑ (#39003): a dropped relay
+              // connection unpins every handle — dead origins must not stay
+              // linked on the member home.
+              ledger.onConnectionClosed();
+              // WEBCHAT-SESSION-HANDOFF: 핀이 사라진 원점에 세션을 넘기면
+              // 안 되므로 미교환 토큰도 함께 무효화한다.
+              handoffLedger.onConnectionClosed();
+              scheduleRelayRetry();
+            },
             signal: controller.signal,
           });
           if (serverStopped) connection.close();
@@ -1447,15 +2256,25 @@ export function startNexusHttpServer(
               serverId: connection.serverId,
             });
           }
-          if (opts.appHost && connection.pinPublicHandle) {
+          if (connection.pinPublicHandle) {
             const pin = connection.pinPublicHandle.bind(connection);
-            membersApiPublicHandlePins.set(opts.appHost, (handle, memberId) => {
-              pin(handle, memberId).catch((error) =>
-                debug.log("nexus.relay-host", "handle-pin-failed", {
-                  errorType: error instanceof Error ? error.name : typeof error,
-                }),
-              );
-            });
+            // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓑ (#39003): the serving ledger
+            // records a handle only after the relay confirms the pin — a failed
+            // pin removes the record so the member home never links a dead chat
+            // origin (MEMBER-HOME-WEBCHAT-LINK-WRONG).
+            membersApiPublicHandlePins.set(
+              opts.appHost!,
+              (handle, memberId) =>
+                ledger.recordPin(handle, memberId, pin(handle, memberId)),
+            );
+            // WEBCHAT-PIN-LEDGER-RECONNECT (OP #104299/#104391) — 위 배선은 새
+            // 핀만 기록한다. 끊김(onClose)이 이미 원장을 비웠으므로 연결이
+            // (재)수립될 때마다 스토어의 내구 claim 전부를 재핀해 원장을 재구성한다.
+            // 거부된 재핀은 원장에 남지 않는다(fail-closed).
+            // OP #105017 ⓐ① — 연결 수립마다 «핀 읽기» 채널을 묶는다(자격은
+            // 연결의 host 인증 · 판정은 relay 불리언 응답만).
+            ledger.setPinQueryChannel(connection.publicHandlePinQuery.bind(connection));
+            restoreWebChatHandlePins(ledger, pin);
           }
         } catch (error) {
           debug.log("nexus.relay-host", "connection-failed", {
@@ -1791,6 +2610,24 @@ function isResourceLedgerTransportSecure(
   return tailPeer && tailHost;
 }
 
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — decideAuth 의 릴레이
+ * 신뢰채널 emt_ 갈래가 회원 토큰을 검증할 손잡이를 메타-API 옵트에 묶는다.
+ * membersApi 의 memberForScope(relay.connect) 를 그대로 쓰고, 호출자가 이미
+ * 검증기를 주입했거나 membersApi 가 없으면 묶지 않는다(그러면 갈래는 폐쇄).
+ * routeRequest opts 객체마다 한 번만 묶인다(WeakSet 중복 방지).
+ */
+const relayHostChannelMemberWired = new WeakSet<object>();
+function wireRelayHostChannelMember(opts: NexusHttpServerOpts): void {
+  const memberForScope = opts.membersApi?.memberForScope?.bind(opts.membersApi);
+  if (!opts.metaApi || !memberForScope || relayHostChannelMemberWired.has(opts.metaApi)) return;
+  relayHostChannelMemberWired.add(opts.metaApi);
+  if (!opts.metaApi.relayHostChannelMember) {
+    opts.metaApi.relayHostChannelMember = (req: Request) =>
+      memberForScope(req, 'relay.connect') ?? null;
+  }
+}
+
 export async function routeRequest(
   req: Request,
   opts: NexusHttpServerOpts,
@@ -1814,9 +2651,19 @@ export async function routeRequest(
       }
     ).requestIP?.(req)?.address,
   );
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 위
+  // wireRelayHostChannelMember 로 decideAuth 의 emt_ 신뢰채널 갈래에 회원 토큰
+  // 검증기를 주입한다(라우팅 첫 checkAuth 전).
+  wireRelayHostChannelMember(opts);
   // NEXUS-APP-HOST-S1 — app host is a separate hostname/origin from the PWA.
   // Handle it before owner API routing; an app-host request must never reach /v1.
-  const appResponse = opts.appHost?.handle(req);
+  // 출처: #39009 — 릴레이에서 넘어온 bare `<handle>.elanous.app` 원점은 앱 호스트가
+  // 아니라 회원 채팅 API 전용 원점이다. appHost.handle 은 bare 원점에서 항상
+  // notFound 를 내므로 여기 그대로 흘리면 허용 목록 API 쌍이 /v1 라우팅에
+  // 절대 도달하지 못한다 — bare 원점은 앱 호스트 처리를 건너뛴다.
+  const bareOriginHandle = bareWebChatOriginHandle(new URL(req.url).hostname);
+  const appResponse =
+    bareOriginHandle !== undefined ? undefined : opts.appHost?.handle(req);
   const resolvedAppResponse =
     appResponse instanceof Promise ? await appResponse : appResponse;
   if (resolvedAppResponse) return resolvedAppResponse;

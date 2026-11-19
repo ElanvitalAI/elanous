@@ -18,7 +18,7 @@
 
 import {
   buildRunShellTool,
-  dispatchRunShell,
+  dispatchRunShellCapsule,
   type RunShellDispatchResult,
 } from '../skills/tools/shell.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
@@ -31,7 +31,8 @@ export const runShellRuntime: ToolRuntime<Record<string, unknown>, RunShellDispa
       ctx.surface === 'dashboard' && req.sandbox === undefined
         ? { ...req, sandbox: 'auto' }
         : req;
-    return dispatchRunShell(effectiveReq, {
+    // CAPSULE-A2 — past the 10s sync cap (turn.capsuleMode on) the call continues as a shell capsule.
+    return dispatchRunShellCapsule(effectiveReq, {
       signal: ctx.signal,
       availableToolNames: ctx.agentHostTools?.map(tool => tool.name),
     });

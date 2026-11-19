@@ -227,7 +227,8 @@ export async function herdrPrompt(opts: HerdrPromptOpts, deps: HerdrPromptDeps =
     view = await readPaneList(opts.target);
     if (!view) return done(false, false, 'agent_unknown', 'pane list did not report the registered pane');
     if (!supportedWakeAgent(view.agent)) return done(false, false, 'agent_unknown', 'pane list has no supported agent label');
-    if (view.status !== 'idle') {
+    // #23: herdr `done` = Idle with seen=false — an empty input, same as idle.
+    if (view.status !== 'idle' && view.status !== 'done') {
       const reason = view.status === 'working' ? 'agent_working' : view.status === 'blocked' ? 'agent_blocked' : 'agent_unknown';
       return done(false, false, reason, `pane list agent_status ${view.status} is not idle`);
     }
@@ -253,7 +254,7 @@ export async function herdrPrompt(opts: HerdrPromptOpts, deps: HerdrPromptDeps =
   const paneId = view.paneId;
   if (opts.requirePaneListStatus) {
     const latest = await readPaneList(paneId);
-    if (!latest || latest.paneId !== view.paneId || latest.agent !== view.agent || latest.status !== 'idle') {
+    if (!latest || latest.paneId !== view.paneId || latest.agent !== view.agent || (latest.status !== 'idle' && latest.status !== 'done')) {
       const reason = latest?.status === 'working' ? 'agent_working' : latest?.status === 'blocked' ? 'agent_blocked' : 'agent_unknown';
       return done(false, false, reason, 'pane list readiness changed before submission');
     }

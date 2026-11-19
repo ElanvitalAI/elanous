@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { REDACTED, safeAgentDescription, safeAgentSummary, TOOL_RUNNING_GLYPH, TOOL_DONE_GLYPH, TOOL_FOLD_MIN_RUN, isToolActivityLine, safeToolTarget, toolActivityTarget, toolActivityLines, updateToolActivity, safeCommandSummary, interleavedTurnLines } from './tool-activity.js';
+import { REDACTED, safeAgentDescription, safeAgentSummary, TOOL_RUNNING_GLYPH, TOOL_DONE_GLYPH, TOOL_FOLD_MIN_RUN, isToolActivityLine, safeToolActivityTarget, safeToolTarget, toolActivityTarget, toolActivityLines, updateToolActivity, safeCommandSummary, interleavedTurnLines } from './tool-activity.js';
 
 const R = TOOL_RUNNING_GLYPH;
 const D = TOOL_DONE_GLYPH;
@@ -288,4 +288,54 @@ test('Agent rows carry a short safe label and a one-line result, and never fold 
   const unsafe = updateToolActivity(updateToolActivity([], { phase: 'start', id: 'x', name: 'Agent', target: 'probe' }, 0),
     { phase: 'finish', id: 'x', name: 'Agent', summary: 'key sk-abcdefghijkl done' }, 0);
   expect(toolActivityLines(unsafe, 0)[0]).not.toContain('sk-abcdefghijkl');
+});
+
+// SECRET-REDACT r3 (#38553, «union · fail-closed») — the argv-policy token layer attaches after the existing
+// masking and can only hide more. Expected values below are independent literals, never product constants.
+test('r3 union: URL userinfo and ?key= query values never survive a non-shell tool target', () => {
+  // safeToolTarget keeps only a basename, and that basename still carried the authority: ftp://u:p4ss@h → u:p4ss@h.
+  expect(safeToolActivityTarget('WebFetch', 'ftp://u:p4ss@h')).toBe('…');
+  expect(safeToolActivityTarget('WebFetch', 'ssh://u:pw9@h')).toBe('…');
+  expect(safeToolActivityTarget('WebFetch', 'postgres://u:pw@h')).toBe('…');
+  expect(safeToolActivityTarget('WebFetch', 'ftp://tok123@h')).toBe('…');
+  expect(safeToolActivityTarget('WebFetch', 'https://h.test/p?key=123456')).toBe('…');
+  // The layer's maskEnvAssignments piece: an environment-assignment value never crosses, only its name.
+  expect(safeToolActivityTarget('WebFetch', 'GATEWAY_KEY=whsec_1234567890abc')).toBe('GATEWAY_KEY=****');
+  // …and the masked form is itself a fixed point, like the mark is.
+  expect(safeToolActivityTarget('WebFetch', 'GATEWAY_KEY=****')).toBe('GATEWAY_KEY=****');
+  // The file-tool path crosses the same gate.
+  expect(toolActivityTarget('Read', { file_path: 'ftp://u:p4ss@h' })).toBe('…');
+  // Not a fragment anywhere in the projected row state either.
+  const leaks: Array<[string, string]> = [
+    ['ftp://u:p4ss@h', 'p4ss'],
+    ['ssh://u:pw9@h', 'pw9'],
+    ['postgres://u:pw@h', 'u:pw'],
+    ['ftp://tok123@h', 'tok123@'],
+    ['https://h.test/p?key=123456', '123456'],
+  ];
+  for (const [input, secret] of leaks) {
+    const rows = updateToolActivity([], { phase: 'start', id: 'fetch', name: 'WebFetch', target: input }, 0);
+    expect(rows[0]?.target, input).toBe('…');
+    expect(JSON.stringify(rows), input).not.toContain(secret);
+  }
+  // Union order: the existing masking still decides first — its own verdicts are not rewritten by the added layer.
+  expect(safeToolActivityTarget('Read', '/synthetic/.npmrc')).toBe('(private file)');
+});
+
+test('r3 fail-closed: a target the tokenizer cannot close hides the whole line, never a fragment', () => {
+  expect(safeToolActivityTarget('Read', '/synthetic/report "q3.txt')).toBe('…');
+  expect(safeToolTarget('/synthetic/report "q3.txt')).toBe('…');
+  // The mark is a fixed point: re-projection (snapshot, transport) keeps the line closed.
+  expect(safeToolActivityTarget('Read', '…')).toBe('…');
+  const rows = updateToolActivity([], { phase: 'start', id: 'odd', name: 'Read', target: 'report "q3.txt' }, 0);
+  expect(rows[0]?.target).toBe('…');
+  expect(JSON.stringify(rows)).not.toContain('q3');
+});
+
+test('r3 terra-must: the token gate inspects the full target before the 80-char slice', () => {
+  const long = 'ftp://tok123' + 'x'.repeat(75) + '@h'; // the @ lands past the 80-char projection slice
+  expect(safeToolActivityTarget('Read', long)).toBe('…');
+  const rows = updateToolActivity([], { phase: 'start', id: 'long', name: 'Read', target: long }, 0);
+  expect(rows[0]?.target).toBe('…');
+  expect(JSON.stringify(rows)).not.toContain('tok123');
 });

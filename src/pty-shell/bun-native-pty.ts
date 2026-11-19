@@ -25,10 +25,25 @@
 
 import { constants as osConstants } from 'node:os';
 
+/** Write every UTF-8 byte, honoring partial writes and bounding backpressure. */
+export async function writeTerminalFully(terminal: { readonly closed: boolean; write(data: Uint8Array): number }, data: string): Promise<void> {
+  const bytes = Buffer.from(data, 'utf8');
+  const deadline = Date.now() + 3000;
+  let offset = 0;
+  while (offset < bytes.length) {
+    if (terminal.closed || Date.now() >= deadline) throw new Error(`PTY write incomplete: ${offset}/${bytes.length} bytes`);
+    const written = terminal.write(bytes.subarray(offset));
+    if (!Number.isInteger(written) || written < 0 || written > bytes.length - offset) throw new Error(`PTY write returned ${written}`);
+    offset += written;
+    if (offset < bytes.length) await new Promise<void>(resolve => setTimeout(resolve, 5));
+  }
+}
+
 /** Subset of node-pty's `IPty` that elanous's PTY spawn sites consume. */
 export interface MinimalPty {
   readonly pid: number;
   write(data: string): void;
+  writeAll?(data: string): Promise<void>;
   kill(signal?: string): void;
   resize(cols: number, rows: number): void;
   onData(cb: (data: string) => void): { dispose(): void };
@@ -143,6 +158,7 @@ export function bunSpawnPty(file: string, args: string[], opts: BunSpawnPtyOpts 
         /* terminal closed — writes after exit are no-ops, like node-pty */
       }
     },
+    async writeAll(data: string): Promise<void> { await writeTerminalFully(proc.terminal, data); },
     kill(signal?: string): void {
       try {
         proc.kill(signal as never);

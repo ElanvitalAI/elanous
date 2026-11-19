@@ -147,6 +147,10 @@ export function registerRelayCommand(
       "JSON serverId-to-memberId pins for member-required mode",
     )
     .option(
+      "--member-service-hosts <file>",
+      "Owner-only JSON {serverId:true} member-service binding keys (owner-less service role; RES #106180)",
+    )
+    .option(
       "--traffic-cap-config <file>",
       "Owner-only JSON with byte limits or measure-only mode",
     )
@@ -181,6 +185,7 @@ export function registerRelayCommand(
         memberRequired?: boolean;
         memberNexusUrl?: string;
         hostOwnerMembers?: string;
+        memberServiceHosts?: string;
         trafficCapConfig?: string;
         publicListingConfig?: string;
         publicReadConfig?: string;
@@ -230,12 +235,21 @@ export function registerRelayCommand(
               const { createNexusRelayMemberVerifier, loadRelayHostOwners } =
                 await import("./relay-member-verifier.js");
               const { loadRelayTrafficCap } = await import("./relay-server.js");
+              // (출처: #39104) 회원 서버 역할 서비스 토큰 — env 또는 0600 권한
+              // 파일로 회전한다(없으면 서비스 자격 게이트 자체가 꺼진다).
+              const { resolveMemberServiceToken } = await import(
+                "./member-service-token.js",
+              );
+              const memberServiceToken = resolveMemberServiceToken();
               return {
                 memberRequired: true,
                 hostOwnerMemberIds: loadRelayHostOwners(opts.hostOwnerMembers!),
                 validateMemberToken: createNexusRelayMemberVerifier(
                   opts.memberNexusUrl!,
                 ),
+                ...(memberServiceToken
+                  ? { memberServiceToken } // (출처: #39104) «핀 읽기»만 넓힌다
+                  : {}),
                 ...(opts.trafficCapConfig
                   ? { trafficCap: loadRelayTrafficCap(opts.trafficCapConfig) }
                   : {}),
@@ -298,6 +312,12 @@ export function registerRelayCommand(
                   : {}),
                 ...(opts.publicHandleClaims
                   ? { publicHandleClaims: opts.publicHandleClaims }
+                  : {}),
+                // (RES #106180) PAAR:894-913 파서가 {64hex:true} 집합을 로드하고
+                // initialPolicy 스프레드(:364)가 options.memberServiceServerIds
+                // 로 기동 결속을 전달한다(reload·registrar 는 policyFiles 재사용).
+                ...(opts.memberServiceHosts
+                  ? { memberServiceHosts: opts.memberServiceHosts }
                   : {}),
                 autoRegistrations: join(
                   getElanousConfigDir(),
@@ -385,6 +405,24 @@ export function registerRelayCommand(
                       if (!registrar)
                         throw new Error("relay app registrar unavailable");
                       registrar.pinHandle(serverId, ownerId, input);
+                    },
+                    queryHandlePin: (
+                      serverId: string,
+                      ownerId: string,
+                      input: { user: string; memberId: string },
+                    ) => {
+                      if (!registrar)
+                        throw new Error("relay app registrar unavailable");
+                      return registrar.queryHandlePin(serverId, ownerId, input);
+                    },
+                    // (출처: #39104) 회원 서버 서비스 자격 «핀 읽기» 위임 — 연결
+                    // 소유자가 아닌 회원의 살아 있는 핀도 불리언으로 답한다.
+                    queryHandlePinByMember: (
+                      input: { user: string; memberId: string },
+                    ) => {
+                      if (!registrar)
+                        throw new Error("relay app registrar unavailable");
+                      return registrar.queryHandlePinByMember(input);
                     },
                   },
                 }

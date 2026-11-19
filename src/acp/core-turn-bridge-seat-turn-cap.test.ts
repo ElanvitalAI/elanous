@@ -14,7 +14,7 @@ afterEach(() => mock.restore());
 const text = 'OP 13:14: 계속 — draft 다음 행.';
 const specs = ['Read', 'RunShell'].map((name) => ({ name, description: '', parameters: { type: 'object' as const } }));
 
-async function run(seat: string | null, seatTurnCap?: Record<string, unknown>) {
+async function run(seat: string | null, chatConfigOverride?: Record<string, unknown>) {
   const seen: GoalLoopOptions[] = [];
   spyOn(coreGoalLoop, 'runGoalLoop').mockImplementation(async (_ctx, opts) => {
     seen.push(opts ?? {});
@@ -25,7 +25,7 @@ async function run(seat: string | null, seatTurnCap?: Record<string, unknown>) {
   spyOn(config, 'getUserConfig').mockReturnValue({
     ...base,
     llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: true } },
-    chat: { ...base.chat, ...(seatTurnCap ? { seatTurnCap } : {}) },
+    chat: { ...base.chat, ...(chatConfigOverride ?? {}) },
   });
   await bridgeCoreTurnToAcp({
     tuiRouting: true, resolveSeat: () => seat,
@@ -39,15 +39,16 @@ async function run(seat: string | null, seatTurnCap?: Record<string, unknown>) {
   return seen;
 }
 
-test('자리 TUI 운영 지시 → goal loop 에 seatTurnCap(기본 60 도구·20분·빈 우편 2연속)', async () => {
+test('자리 TUI 운영 지시 → goal loop 에 seatTurnCap(기본 60 도구·45분·빈 우편 2연속)', async () => {
   const seen = await run('OPT');
   expect(seen).toHaveLength(1);
   expect(seen[0]!.seatTurnCap).toEqual({ seat: 'OPT', ...SEAT_TURN_CAP_DEFAULTS });
+  expect(SEAT_TURN_CAP_DEFAULTS.maxWallMs).toBe(45 * 60_000); // 자리 턴 기본 상한은 45분
 });
 
-test('config chat.seatTurnCap 으로 덮는다(유효 칸만)', async () => {
-  const seen = await run('OPT', { maxTools: 30, maxWallMs: 0 });
-  expect(seen[0]!.seatTurnCap).toEqual({ seat: 'OPT', ...SEAT_TURN_CAP_DEFAULTS, maxTools: 30 });
+test('반증(SEAT-TURN-CAP-DEFAULT-15M) — config chat.seatTurnCap 은 더 이상 칸이 없다(설정해도 무시)', async () => {
+  const seen = await run('OPT', { seatTurnCap: { maxTools: 30, maxWallMs: 0 } }); // 출처: #38786 — SEAT-TURN-CAP-DEFAULT-15M 칸 삭제 반증용 리터럴(무시됨을 증명)
+  expect(seen[0]!.seatTurnCap).toEqual({ seat: 'OPT', ...SEAT_TURN_CAP_DEFAULTS }); // 덮기 없음 — 기본값 그대로
 });
 
 test('반증 — 사람 TUI 는 goal loop 를 타지 않거나 타도 seatTurnCap 이 없다', async () => {
@@ -68,15 +69,15 @@ test('반증 — 하니스 구현 자식(executor)은 seatTurnCap 이 없다', a
   }
 });
 
-test('user config: chat.seatTurnCap 은 설정했을 때만 있고 유효 칸만 남는다', async () => {
+test('user config(SEAT-TURN-CAP-DEFAULT-15M): chat.seatTurnCap 칸이 삭제됐다 — 설정해도 스키마에 남지 않는다', async () => {
   const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const dir = mkdtempSync(join(tmpdir(), 'seat-turn-cap-'));
   try {
     const path = join(dir, 'config.json');
-    writeFileSync(path, JSON.stringify({ chat: { seatTurnCap: { maxTools: 40, idleEmptyMsgListLimit: 'x' } } }));
-    expect(config.buildUserConfig(path).chat.seatTurnCap).toEqual({ maxTools: 40 });
+    writeFileSync(path, JSON.stringify({ chat: { seatTurnCap: { maxTools: 40 } } })); // 출처: #38786 — SEAT-TURN-CAP-DEFAULT-15M 스키마 칸 삭제 반증용 시험값
+    expect('seatTurnCap' in config.buildUserConfig(path).chat).toBe(false); // 칸 삭제 — 조용히 버린다
     writeFileSync(path, JSON.stringify({ chat: {} }));
     expect('seatTurnCap' in config.buildUserConfig(path).chat).toBe(false);
   } finally {

@@ -1,3 +1,4 @@
+import { maskEnvAssignments, simpleArgv } from '../../security/shell-argv-policy.js';
 import { safeStatusText } from './log-view.js';
 
 export interface PublicToolCall { id: string; name: string; target?: string; /** A finished sub-agent's one-line result (Agent rows only). */ summary?: string }
@@ -173,7 +174,30 @@ export function safeToolActivityTarget(name: string, value: unknown): string | u
   return shellTool(name) ? safeCommandSummary(value) : safeToolTarget(value);
 }
 
+/**
+ * SECRET-REDACT r3 (#38553, «union · fail-closed»): the argv-policy token layer runs AFTER the existing masking
+ * and can only hide more — no projection may show more than the pre-r3 verdict did. simpleArgv refuses an
+ * unterminated quote and that refusal hides the whole line (fail-closed, never a plaintext fragment);
+ * maskEnvAssignments keeps only what precedes a token's first «=» (NAME=value → NAME=****). Each surviving
+ * token is judged on structure only: one shaped like a URL authority — userinfo (u:pass@host · user@host) or
+ * a query (?key=value) — becomes the mark. Tokens that pass cross unchanged, so re-projection (snapshot,
+ * transport) is a fixed point.
+ */
+function tokenLayerGate(existing: string): string {
+  const argv = simpleArgv(existing);
+  if (argv === null) return REDACTED;
+  const envMasked = maskEnvAssignments(argv);
+  let masked = envMasked.some((word, index) => word !== argv[index]);
+  const words = envMasked.map((word) => {
+    if (!word.includes('@') && !word.includes('?')) return word;
+    masked = true;
+    return REDACTED;
+  });
+  return masked ? words.join(' ') : existing;
+}
+
 /** Only a file basename crosses the progress boundary, never arguments or file contents. */
+
 export function safeToolTarget(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = safeStatusText(value).replaceAll(String.fromCharCode(92), '/')
@@ -184,7 +208,7 @@ export function safeToolTarget(value: unknown): string | undefined {
   if (/(?:auth|secret|credential|token|member-session|^\.env|^id_rsa|^id_ed25519|sk-|aps_)/i.test(name)
     || /^(?:\.netrc|\.npmrc|\.pypirc)(?:$|[._~-])/i.test(name)
     || /\.(?:pem|key)(?:$|[._~-])/i.test(name)) return PRIVATE_FILE;
-  return name.slice(0, 80);
+  return tokenLayerGate(name).slice(0, 80);
 }
 export function toolActivityTarget(name: string, args: Record<string, unknown>): string | undefined {
   if (agentTool(name)) return safeAgentDescription(args.description);

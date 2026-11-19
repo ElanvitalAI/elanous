@@ -87,6 +87,54 @@
   },
   "allOf": [{ "if": { "properties": { "kind": { "const": "orchestrator" } }, "required": ["kind"] }, "then": { "properties": { "orchestration": true }, "required": ["orchestration"] }, "else": { "not": { "required": ["orchestration"] } } }],
   "$defs": {
+    "supervisorV1": {
+      "description": "supervisor/v1 definition (kind: supervisor). Validated by src/supervision/definition-loader.ts; the set rule (one final actor per signal) is cross-definition and lives in the loader.",
+      "type": "object", "additionalProperties": false,
+      "required": ["apiVersion", "kind", "ref", "role", "supervises", "signals", "authority", "reportsTo", "escalation", "memory"],
+      "properties": {
+        "apiVersion": { "const": "elanous.dev/supervisor/v1" },
+        "kind": { "const": "supervisor" },
+        "ref": { "$ref": "#/$defs/supervisorLoopRef" },
+        "role": { "enum": ["primary", "healer", "observer", "watcher"] },
+        "supervises": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" } },
+        "signals": { "type": "array", "minItems": 1, "items": { "type": "object", "additionalProperties": false, "required": ["signal", "actor"], "properties": {
+          "signal": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)*$" },
+          "actor": { "enum": ["final", "observer"] }
+        } } },
+        "authority": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" } },
+        "reportsTo": { "$ref": "#/$defs/supervisorLoopRef" },
+        "escalation": { "type": "object", "additionalProperties": false, "required": ["to", "silenceAfter"], "properties": {
+          "to": { "$ref": "#/$defs/supervisorLoopRef" },
+          "silenceAfter": { "$ref": "#/$defs/isoDuration" }
+        } },
+        "memory": { "$ref": "#/$defs/graphMemoryScopes" }
+      }
+    },
+    "supervisorLoopRef": { "type": "string", "pattern": "^loop:[a-z][a-z0-9-]*@[1-9][0-9]*$" },
+    "isoDuration": { "type": "string", "pattern": "^P(?=.)(?:[0-9]+D)?(?:T(?=[0-9])(?:[0-9]+H)?(?:[0-9]+M)?(?:[0-9]+S)?)?$" },
+    "graphMemoryScopes": {
+      "description": "GRAPH-MEMORY-SCOPES: instance / template / global layers, each with read/write/promote, provenance tag and retention.",
+      "type": "object", "additionalProperties": false, "required": ["instance", "template", "global", "provenance"],
+      "properties": {
+        "instance": { "type": "object", "additionalProperties": false, "required": ["read", "write", "promote", "retention"], "properties": {
+          "read": { "type": "boolean" }, "write": { "type": "boolean" },
+          "promote": { "enum": ["none", "template-candidate"] },
+          "retention": { "$ref": "#/$defs/isoDuration" }
+        } },
+        "template": { "type": "object", "additionalProperties": false, "required": ["read", "write", "promote", "retention"], "properties": {
+          "read": { "type": "boolean" },
+          "write": { "enum": ["none", "gated-promotion"] },
+          "promote": { "const": "none" },
+          "retention": { "$ref": "#/$defs/isoDuration" }
+        } },
+        "global": { "type": "object", "additionalProperties": false, "required": ["read", "write", "promote"], "properties": {
+          "read": { "enum": ["none", "card-bound-only"] },
+          "write": { "const": "none" },
+          "promote": { "const": "none" }
+        } },
+        "provenance": { "const": "required" }
+      }
+    },
     "budget": { "type": "object", "additionalProperties": false, "required": ["maxTokens", "maxToolCalls", "maxCostUsd"], "properties": {
       "maxTokens": { "type": "integer", "minimum": 1 }, "maxToolCalls": { "type": "integer", "minimum": 1 }, "maxCostUsd": { "type": "number", "exclusiveMinimum": 0 }
     } },

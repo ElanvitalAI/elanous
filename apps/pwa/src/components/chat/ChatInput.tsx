@@ -144,6 +144,12 @@ interface Props {
   onListSkills?: (query: string) => Promise<{ entries: SkillPickerEntry[] }>;
   /** New shared text from the parent after mount. The id distinguishes repeat actions. */
   prefill?: { text: string; id: number };
+  /**
+   * DEMO-1121-WEBCHAT-LONG-TEXT — 이 composer 의 챗 턴 응답이 지금 스트리밍 중인가.
+   * 주어지면 그 값이 표시를 지배한다(ChatLayout·TerminalChatDock 은 pending 을 전달).
+   * 생략 시 제출 직후 자체 락(다음 편집 시작으로 해제)이 폴백으로 표시된다.
+   */
+  responseActive?: boolean;
 }
 
 function fmtKB(bytes: number): string {
@@ -164,6 +170,10 @@ function attachmentSrc(downloadUrl: string, baseUrl?: string, token?: string): s
   return `${base}${downloadUrl}${auth}`;
 }
 
+// DEMO-1121-WEBCHAT-LONG-TEXT — composer 폴드 임계(자). 이보다 긴 붙여넣기
+// (강의 노트 정본 1,513자 포함)는 textarea 를 compact 로 유지하고 프리뷰를 접는다.
+const COMPOSER_FOLD_CHAR_THRESHOLD = 1000;
+
 export function ChatInput({
   onSubmit,
   disabled,
@@ -173,6 +183,7 @@ export function ChatInput({
   onListFiles,
   onListSkills,
   prefill,
+  responseActive,
 }: Props) {
   const { client, config } = useDaemon();
   const [seats, setSeats] = useState<SeatSummary[]>([]);
@@ -231,6 +242,18 @@ export function ChatInput({
   const valueRef = useRef(value);
   valueRef.current = value;
   const userEditedRef = useRef(false);
+
+  // DEMO-1121-WEBCHAT-LONG-TEXT — 긴 초안 폴드 · 응답 스트리밍 표시.
+  // foldExpanded: 폴드 프리뷰 펼침 여부. awaitingResponse: responseActive 를
+  // 주지 않은 소비자용 폴백 락 — 제출 직후 켜고 새 편집 시작(value>0)에서 끈다.
+  const [foldExpanded, setFoldExpanded] = useState(false);
+  const [awaitingResponse, setAwaitingResponse] = useState(false);
+  const longDraft = value.length >= COMPOSER_FOLD_CHAR_THRESHOLD;
+  const responseStreaming = responseActive ?? awaitingResponse;
+  // 제출 직후(value='')에는 이 이펙트가 스트리밍 라인을 끄지 않는다.
+  useEffect(() => {
+    if (value.length > 0) setAwaitingResponse(false);
+  }, [value]);
 
   // PWA Phase 1·E+H — promptHistory state (cross-session via localStorage).
   // historyIndex: -1 = current draft · 0+ = recall index.
@@ -467,6 +490,9 @@ export function ChatInput({
       setHistoryIndex(-1);
       historyDraftRef.current = '';
     }
+    // DEMO-1121-WEBCHAT-LONG-TEXT — 제출 직후 응답 스트리밍 표시 락 + 폴드 초기화.
+    setAwaitingResponse(true);
+    setFoldExpanded(false);
     onSubmit(trimmed);
     setValue('');
     valueRef.current = '';
@@ -723,6 +749,38 @@ export function ChatInput({
 
   return (
     <div className="border-t border-border bg-background p-3">
+      {/* DEMO-1121-WEBCHAT-LONG-TEXT — 긴 초안(강의 노트 붙여넣기) 폴드 프리뷰 */}
+      {longDraft && (
+        <div
+          data-elanous-composer-fold="1"
+          className="mb-2 rounded-md border border-border bg-muted/40"
+        >
+          <button
+            type="button"
+            data-elanous-composer-fold-label="1"
+            className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted/70"
+            onClick={() => setFoldExpanded((expanded) => !expanded)}
+          >
+            📎 붙여넣은 글 {value.length.toLocaleString('en-US')}자 — {foldExpanded ? '접기' : '펼치기'}
+          </button>
+          {foldExpanded && (
+            <div className="max-h-40 overflow-y-auto whitespace-pre-wrap border-t border-border px-3 py-2 text-xs text-foreground">
+              {value}
+            </div>
+          )}
+        </div>
+      )}
+      {/* DEMO-1121-WEBCHAT-LONG-TEXT — 제출 직후 응답 스트리밍 라인 */}
+      {responseStreaming && (
+        <div
+          data-elanous-composer-streaming="1"
+          role="status"
+          aria-live="polite"
+          className="mb-2 flex items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground"
+        >
+          응답 스트리밍 중…
+        </div>
+      )}
       {seatReceipts.map((receipt) => <div key={receipt.receiptId} role="status" className="mb-2 rounded-md border border-border bg-card px-3 py-2 text-sm">
         📨 {seats.find((seat) => seat.id === receipt.seat)?.title ?? receipt.seat} 접수 {receipt.receiptId} · 방금 · 받음{receipt.attachments ? ` · 첨부 ${receipt.attachments}` : ''}{receipt.channel ? ` · 채널 ${receipt.channel}` : ''}
       </div>)}
@@ -944,7 +1002,7 @@ export function ChatInput({
             from the same picker). Camera, note, voice memo and provider chips were removed
             (backup tag archive/pwa-pre-minimal-20261117). */}
         <div className="flex shrink-0 items-center gap-0.5 pb-1" data-elanous-composer-tools>
-          <FileAttachButton onAttached={onAttached} />
+          <FileAttachButton onAttached={onAttached} chatLimits />
         </div>
         <textarea
           value={value}

@@ -29,12 +29,15 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { debug } from '../debug/log.js';
+import { requestEls } from '../els/client.js';
+import { elsSocketPath, type ElsRequest } from '../els/server.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { canonicalSeatId, readUnreadCount } from '../msg/msg-store.js';
 import { herdrPrompt, type HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
 import { messageRouteFor, parsePaneMessageAddress, SEAT_MESSAGE_ROUTES, type MessageWake } from './msg-address.js';
 import { acquireLockSync } from '../storage/file-lock.js';
+import { removeSeatPaneDirectoryEntry, updateSeatPaneDirectory } from './seat-pane-directory.js';
 	import { normalizeSeatRegistryV1Entry, readRegistryFile, readSeatRegistry, readSeatRegistryV2, seatRegistryEntry, seatRegistryPath, seatRegistryV2Entry, type SeatAgentRuntime, type SeatRegistryEntry, type SeatRegistryEntryV2 } from './seat-registry.js';
 
 export const WAKE_DEBOUNCE_MS = 5 * 60_000;
@@ -101,6 +104,9 @@ export interface WakeDeps {
   herdrRun?: HerdrCliRunner;
   /** Builds a herdr runner for a registered remote SSH host. No shell is used for host or argv values. */
   herdrRunForHost?: (host: string) => HerdrCliRunner;
+  /** ELS server request seam; production uses the local owner socket. */
+  elsRequest?: (request: ElsRequest) => Promise<{ exitCode: number; message: string }>;
+  elsRequestForHost?: (host: string, request: ElsRequest, timeoutMs: number) => Promise<{ exitCode: number; message: string }>;
   /** Registry path override; defaults to <seatStateRoot>/seat-registry.json. */
   registryPath?: string;
   /** Test seam for the central registry reader. */
@@ -164,8 +170,10 @@ function herdrPaneCensus(run?: WakeDeps['runHerdrPaneList']): HerdrPane[] | null
 
 function paneLiveness(pane: HerdrPane): 'live' | 'dead' | 'unknown' {
   const status = pane.status?.trim().toLowerCase();
-  if (status && ['idle', 'working', 'blocked'].includes(status)) return 'live';
-  if (status && ['done', 'dead', 'exited', 'closed', 'stopped', 'missing'].includes(status)) return 'dead';
+  // #23: herdr 0.9.1 `done` = Idle ∧ seen=false (finished turn not yet viewed), not an exited pane.
+  // A pane present in `pane list` with done/idle is a live wake target; only an absent/exited pane is dead.
+  if (status && ['idle', 'done', 'working', 'blocked'].includes(status)) return 'live';
+  if (status && ['dead', 'exited', 'closed', 'stopped', 'missing'].includes(status)) return 'dead';
   return 'unknown';
 }
 
@@ -247,7 +255,7 @@ function v2SeatAsV1(entry: { address: string; host: string; runtime: string; del
   // Host and replyBody stay on the entry; wake=none only disables injection (see wakeResolutionForSeat).
   const inject = entry.runtime !== 'human' && entry.delivery === 'adapter' && !!entry.session;
   return {
-    address: entry.address, host: entry.host, wake: inject ? 'herdr' : 'none', replyBody: entry.replyBody,
+    address: entry.address, host: entry.host, wake: inject ? entry.session?.startsWith('els:') ? 'els' : 'herdr' : 'none', replyBody: entry.replyBody,
     optIn: entry.runtime === 'human' ? false : entry.optIn,
     ...(inject && entry.session ? { target: entry.session } : {}),
   };
@@ -333,6 +341,31 @@ export function remoteHerdrRunner(host: string): HerdrCliRunner {
   });
 }
 
+/** SSH transports only a structured request; the remote ELS owner resolves and controls its own PTY. */
+export function remoteElsRequest(host: string, request: ElsRequest, timeoutMs: number): Promise<{ exitCode: number; message: string }> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) return Promise.resolve({ exitCode: 1, message: 'invalid ELS host' });
+  return new Promise(resolve => {
+    const child = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', host,
+      'PATH="$HOME/.local/share/elanous/bin:$PATH" eln side _wake-request'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    let output = ''; let errors = ''; let settled = false;
+    const finish = (result: { exitCode: number; message: string }) => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+    const timer = setTimeout(() => { child.kill(); finish({ exitCode: 1, message: 'remote ELS request timed out; delivery unknown' }); }, Math.max(1, timeoutMs));
+    child.stdout?.on('data', chunk => { if (output.length < 1024 * 1024) output += String(chunk); });
+    child.stderr?.on('data', chunk => { if (errors.length < 4096) errors += String(chunk); });
+    child.on('error', error => finish({ exitCode: 1, message: error.message }));
+    child.on('close', code => {
+      if (code !== 0) return finish({ exitCode: 1, message: errors || `ssh exited ${code}` });
+      try {
+        const result = JSON.parse(output) as { exitCode?: unknown; message?: unknown };
+        if (typeof result.exitCode !== 'number' || typeof result.message !== 'string') throw new Error('invalid response');
+        finish({ exitCode: result.exitCode, message: result.message });
+      } catch { finish({ exitCode: 1, message: 'invalid remote ELS response' }); }
+    });
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(JSON.stringify(request));
+  });
+}
+
 /** How a post to `address` would wake its reader — table first, then a live pty named after the seat, then herdr. */
 export function resolveWake(address: string, deps: WakeDeps = {}): WakeResolution {
   const raw = address.trim();
@@ -399,6 +432,7 @@ export interface RegisterSeatPaneOptions {
   paneId: string;
   host: string;
   enableWake?: boolean;
+  kind?: 'herdr' | 'els';
   replace?: boolean;
   /** The agent body in the pane (eln · claude-code · codex). Absent keeps what the registry had. */
   runtime?: SeatAgentRuntime;
@@ -441,11 +475,17 @@ export function registerSeatPaneAddress(input: RegisterSeatPaneOptions, deps: Wa
   if (!host) throw new Error('host is required (use local or an SSH alias)');
   if (host === 'unknown' || !/^(?:local|[A-Za-z0-9][A-Za-z0-9.-]{0,252})$/.test(host)) throw new Error('invalid host (use local or an SSH alias)');
   const paneId = input.paneId.trim();
-  if (!/^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/.test(paneId)) throw new Error('invalid herdr pane ID');
+  const kind = input.kind ?? 'herdr';
+  if (!(kind === 'els' ? /^els:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/ : /^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/).test(paneId)) throw new Error(`invalid ${kind} pane ID`);
   const root = resolveSeatStateRoot(deps);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const registryFile = deps.registryPath ?? seatRegistryPath(root);
   try { if (lstatSync(registryFile).isSymbolicLink()) throw new Error('seat registry must not be a symlink'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  // Validate every file this command will touch before writing any of them (#38900 FU · JUD-B must 1):
+  // a symlinked legacy pane index must fail the whole registration, not strand a half-written registry.
+  const paneIndexFile = join(root, 'OP', 'tools', 'seat-panes.tsv');
+  try { if (lstatSync(paneIndexFile).isSymbolicLink()) throw new Error('seat pane directory must not be a symlink'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   // A local PID check can mistake a live lock owner on another shared-registry host for a dead process.
   const unlock = acquireLockSync(`${registryFile}.lock`, { breakDeadHolder: false, staleMs: 5 * 60_000 });
@@ -460,12 +500,12 @@ export function registerSeatPaneAddress(input: RegisterSeatPaneOptions, deps: Wa
       }
     }
     const previous = seats.find(entry => entry.address === address);
-    const changed = previous?.target !== paneId || previous.host !== host || previous.wake !== 'herdr';
+    const changed = previous?.target !== paneId || previous.host !== host || previous.wake !== kind;
     const hasBinding = previous !== undefined && (previous.target !== undefined || previous.wake !== 'none');
     if (hasBinding && changed && !input.replace) throw new Error(`seat ${address} already points to ${previous.host}:${previous.target ?? '(none)'}; pass --replace to update`);
     const runtime = input.runtime ?? previous?.runtime;
     const entry: SeatRegistryEntry = {
-      address, host, target: paneId, wake: 'herdr', replyBody: previous?.replyBody ?? 'agent',
+      address, host, target: paneId, wake: kind, replyBody: previous?.replyBody ?? 'agent',
       // Rebinding revokes consent unless this command explicitly opts the new target in.
       optIn: input.enableWake === true ? true : changed ? false : previous?.optIn ?? false,
       ...(runtime === undefined ? {} : { runtime }),
@@ -475,6 +515,19 @@ export function registerSeatPaneAddress(input: RegisterSeatPaneOptions, deps: Wa
     const oldContents = currentRead.status === 'ready' ? JSON.stringify(currentRead.registry, null, 2) + '\n' : null;
     const changedFile = oldContents !== next;
     if (changedFile) atomicPrivateWrite(registryFile, next, currentRead.status === 'ready');
+    // The legacy pane index is informational only; it must never confer wake consent.
+    // Its two-column format has no host, so only the local display's panes belong in it.
+    {
+      const localPane = kind === 'herdr' && (host === 'local' || host === 'mshq');
+      const directory = paneIndexFile;
+      mkdirSync(dirname(directory), { recursive: true, mode: 0o700 });
+      let previousDirectory: string | null = null;
+      try { previousDirectory = readFileSync(directory, 'utf8'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      const nextDirectory = localPane ? updateSeatPaneDirectory(previousDirectory ?? '', address, paneId)
+        : removeSeatPaneDirectoryEntry(previousDirectory ?? '', address);
+      if (nextDirectory !== (previousDirectory ?? '')) atomicPrivateWrite(directory, nextDirectory, previousDirectory !== null);
+    }
     return { address, paneId, host, registryFile, changed: changedFile, wakeEnabled: entry.optIn };
   } finally { unlock(); }
 }
@@ -578,7 +631,7 @@ export function seatHasIdleMailWatch(address: string, deps: WakeDeps = {}): bool
  * `message.from`/`kind` decide the skips (a reply or a self-addressed note never wakes anyone).
  */
 export async function wakeRecipient(address: string, msgId: number, message: { from: string; kind?: string; /** 60s safety-net knock: skips the eln mail-watch rule and types {@link fallbackWakeLine}. */ fallback?: boolean }, deps: WakeDeps = {}): Promise<WakeOutcome> {
-  const timeoutMs = deps.timeoutMs ?? WAKE_TIMEOUT_MS;
+  const timeoutMs = deps.timeoutMs ?? (resolveWake(address, deps).wake === 'els' ? 20_000 : WAKE_TIMEOUT_MS);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let resolution: WakeResolution = { wake: 'none', source: 'unresolved', reason: 'not-resolved' };
   const controller = new AbortController();
@@ -593,6 +646,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
     if (message.kind === 'reply') return done('skipped-reply', 'kind=reply');
     if (message.from.toUpperCase() === address.toUpperCase()) return done('skipped-self', 'from=to');
     resolution = resolveWake(address, deps);
+    if (resolution.reason?.startsWith('pane-status-unknown')) return done('wake-deferred');
     if (resolution.wake === 'sse') return done('none-sse');
     if (resolution.wake === 'cron') return done('wake-deferred');
     if (resolution.wake === 'none') return done('no-wake');
@@ -623,6 +677,36 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         if (expired()) return done('timeout');
         injecting = true;
         await inject(resolution.target!, line);
+      } else if (resolution.wake === 'els') {
+        const target = resolution.target!;
+        const request = deps.elsRequest ?? (resolution.host && resolution.host !== 'local'
+          ? (r: ElsRequest) => (deps.elsRequestForHost ?? remoteElsRequest)(resolution.host!, r, Math.max(1, deadline - Date.now()))
+          : (r: ElsRequest) => requestEls(elsSocketPath(), r, Math.max(1, deadline - Date.now())));
+        const listed = await request({ op: 'ls' });
+        if (listed.exitCode !== 0) return done('failed', `els-list: ${listed.message}`);
+        let pane: string | undefined;
+        try {
+          const rows = (JSON.parse(listed.message) as { panes: { address: string; pane: string }[] }).panes;
+          const matches = rows.filter(row => row.address === target.slice(4));
+          if (matches.length === 1) pane = matches[0]!.pane;
+        } catch { return done('failed', 'els-list-invalid'); }
+        if (!pane) return done('busy', 'els-pane-not-found-or-ambiguous');
+        const status = await request({ op: 'status', pane });
+        if (status.exitCode !== 0) return done('busy', `els-status: ${status.message}`);
+        let view: { state?: string; inputEmpty?: boolean | 'unknown'; reason?: string };
+        try { view = JSON.parse(status.message); } catch { return done('busy', 'els-status-invalid'); }
+        if (view.state !== 'idle' || view.inputEmpty !== true) return done('busy', `els-${view.state ?? 'unknown'}:input=${view.inputEmpty ?? 'unknown'}:${view.reason ?? ''}`);
+        const again = resolveWake(address, deps);
+        if (again.optIn !== true) return done('skipped', 'human-pane-no-opt-in');
+        if (again.wake !== 'els' || again.target !== target || again.host !== resolution.host) return done('busy', 'target-moved');
+        if (expired()) return done('timeout');
+        injecting = true;
+        const sent = await request({ op: 'send-verified', pane, text: line, requireEmpty: true });
+        if (sent.exitCode !== 0) {
+          if (sent.message.includes('not sent')) { injecting = false; return done('busy', `els-send: ${sent.message}`); }
+          return done('failed', `els-send: ${sent.message}`);
+        }
+        if (!sent.message.includes('turn started')) return done('failed', `els-send-unverified: ${sent.message}`);
       } else {
         // 구조 pane list 확인(지원 agent · idle 만) → 제출 앞 관문 → bracketed `pane run` 한 번.
         // 화면 문구는 빈 입력 판정에 쓰지 않는다 — placeholder 와 사용자가 친 같은 문장을 구별할 수 없다.
@@ -635,6 +719,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
           beforeSubmit: () => {
             // opt-in 은 주입 직전에 «먼저» 다시 본다 — 기다리는 사이 `wake-inject` 를 지웠으면(대상이 바뀌었어도) 주입 0.
             const again = resolveWake(address, deps);
+            if (again.reason?.startsWith('pane-status-unknown')) { resolution = again; return again.reason; }
             if (again.optIn !== true) { resolution = { ...resolution, optIn: false }; return 'human-pane-no-opt-in'; }
             // 조회 사이 자리의 pane 이 바뀌었으면 옛 pane 에 넣지 않는다 — 주소→대상을 다시 푼다.
             if (again.wake !== 'herdr' || again.target !== target || again.host !== resolution.host) return `target-moved:${again.host ?? again.target ?? again.wake}`;
@@ -647,11 +732,13 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         if (!prompted.accepted) injecting = false;
         const reason = prompted.reason;
         const result: WakeResult = reason === 'submitted' ? 'injected'
-          : reason === 'human-pane-no-opt-in' ? 'skipped'
+          : reason.startsWith('pane-status-unknown') ? 'wake-deferred'
+            : reason === 'human-pane-no-opt-in' ? 'skipped'
             : reason === 'timeout' ? 'timeout'
               : reason.startsWith('target-moved:') || reason === 'agent_working' || reason === 'agent_blocked' || reason === 'agent_unknown' ? 'busy'
                 : 'failed';
-        const outReason = result === 'busy' && !reason.startsWith('target-moved:') ? `agent_status=${prompted.status ?? 'unknown'}`
+        const outReason = reason === 'agent_unknown' ? 'agent_status=unknown'
+          : result === 'busy' && !reason.startsWith('target-moved:') ? `agent_status=${prompted.status ?? 'unknown'}`
           : result === 'injected' || result === 'timeout' ? undefined : reason;
         logPending('herdr-prompt', { seat: address.trim().toUpperCase(), msgId, target, result, accepted: prompted.accepted, reason,
           ...(prompted.status ? { status: prompted.status } : {}), ...(prompted.agent ? { agent: prompted.agent } : {}), ms: prompted.ms });
@@ -660,7 +747,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
       return done('injected');
     } catch (error) {
       // 주입이 «시작»됐다 실패하면 들어갔는지 모른다 — 창을 돌려줘 다음 글이 다시 깨우게 한다.
-      injecting = false;
+      if (resolution.wake !== 'els') injecting = false;
       throw error;
     } finally { if (!injecting && claim) releaseClaim(claim); }
   })();
@@ -671,7 +758,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         controller.abort();
         // 시간 초과면 창을 돌려준다 — 주입 전이면 들어간 것이 없고, 주입 중 멈췄으면 들어갔는지 «모른다».
         // 모를 때는 다음 글이 다시 두드리게 둔다(내용 없는 한 줄의 중복은 무해, 깨움 누락은 16분 정지).
-        if (claim) releaseClaim(claim);
+        if (claim && !(resolution.wake === 'els' && injecting)) releaseClaim(claim);
         resolve({ ...resolution, address, msgId, result: 'timeout' });
       }, timeoutMs);
     })]);
@@ -680,7 +767,9 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
   } finally { clearTimeout(timer); }
   attempt.catch(() => { /* a late failure after timeout is already reported as timeout */ });
   try {
-    if (outcome.result === 'no-wake') {
+    if (outcome.reason?.startsWith('pane-status-unknown') || outcome.reason === 'agent_status=unknown') {
+      (deps.warn ?? (line => console.error(line)))(`깨움 보류 · 상태 unknown · 자동 재시도 없음(보낸 이가 직접 확인) (${address} · ${outcome.reason ?? 'pane-status-unknown'})`);
+    } else if (outcome.result === 'no-wake') {
       const notice = wakeNoneNotice(outcome, seatHasIdleMailWatch(address, deps));
       (deps.warn ?? (line => console.error(line)))(notice);
     }

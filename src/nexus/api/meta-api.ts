@@ -223,6 +223,12 @@ export interface MetaApiOpts {
    *  in-flight LLM/tool turn keeps running until natural end_turn
    *  (zombie LM Studio queue · HANDOFF §2.4 격차). */
   abortSession?: (sessionId: string) => boolean;
+  /** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — bare 오리진 회원 채팅
+   *  갈래의 emt_ 검증기. 릴레이 신뢰채널로 표시된 채팅 쌍 요청에서 살아있는
+   *  회원 접근 토큰을 대조해 그 memberId 를 돌려준다(없거나 무효면 null).
+   *  NEXUS HTTP 서버가 membersApi memberForScope(relay.connect) 솔기로 주입하며,
+   *  주입되지 않으면 갈래는 폐쇄된다(실패는 기존 401 갈래로 흘러간다). */
+  relayHostChannelMember?: (req: Request) => { memberId: string } | null;
 }
 
 type AuthReason =
@@ -231,6 +237,8 @@ type AuthReason =
   | 'untrusted-same-origin-peer'
   | 'bearer-match'
   | 'temp-token'
+  | 'relay-host-member'
+  | 'relay-host-webchat-session'
   | 'setup-bearer'
   | 'setup-scope-denied'
   | 'no-bearer-configured'
@@ -271,6 +279,25 @@ export function getAuthPeerAddress(req: Request): string | undefined {
   return authPeerAddresses.get(req);
 }
 
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — bare `<handle>.elanous.app`
+ * 회원 채팅 쌍이 릴레이 호스트 신뢰채널로 들어왔음을 새기는 표시. 값은 그 핸들의
+ * 핀 소유자 memberId 다. 표시는 오직 릴레이 배선(NEXUS HTTP 서버 안의
+ * forwardApi)만 남기므로 공개 인터넷 요청은 결코 표시될 수 없고, 미표시 요청은
+ * «신뢰채널 아님»으로 읽힌다 — registerAuthPeerAddress 의 «undefined 도 의도적
+ * 기록» 패턴과 같은 폐쇄 원칙이다.
+ */
+const relayHostChannelRequests = new WeakMap<Request, { memberId: string; webChatMemberId?: string }>();
+
+/** Mark a request as relay-host-channel chat-pair traffic for `pinOwnerMemberId`.
+ * `webChatMemberId` (WEBCHAT-SESSION-HANDOFF JUD must ⓑ) is the member a live derived
+ * `wcs_` web-chat session cookie on that request resolved to — handle, expiry and revocation
+ * already checked by the handoff ledger. Call sites live inside the NEXUS HTTP server's relay
+ * wiring only. */
+export function registerRelayHostChannelRequest(req: Request, pinOwnerMemberId: string, webChatMemberId?: string): void {
+  relayHostChannelRequests.set(req, { memberId: pinOwnerMemberId, ...(webChatMemberId ? { webChatMemberId } : {}) });
+}
+
 function setupRouteAllowed(req: Request): boolean {
   const path = new URL(req.url).pathname;
   if (path.startsWith('/v1/setup/')) return true;
@@ -280,6 +307,17 @@ function setupRouteAllowed(req: Request): boolean {
       || path === '/v1/chat/events'
       || path === '/v1/harness/runs'
     ));
+}
+
+/**
+ * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 릴레이 신뢰채널 emt_ 갈래가
+ * 승인하는 경로는 회원 웹채팅 채팅 쌍뿐이다(setupRouteAllowed 의 채팅 팔과 같은
+ * 두 경로). 다른 경로는 표시가 있어도 아래 기존 갈래로 흘러 401 이 된다.
+ */
+export function relayHostChatRouteAllowed(req: Request): boolean {
+  const path = new URL(req.url).pathname;
+  return (req.method === 'POST' && path === '/v1/prompt/stream')
+    || (req.method === 'GET' && path === '/v1/chat/events');
 }
 
 function decideAuth(req: Request, opts: MetaApiOpts): { ok: boolean; reason: AuthReason } {
@@ -293,6 +331,29 @@ function decideAuth(req: Request, opts: MetaApiOpts): { ok: boolean; reason: Aut
     return setupRouteAllowed(req)
       ? { ok: true, reason: 'setup-bearer' }
       : { ok: false, reason: 'setup-scope-denied' };
+  }
+  // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — bare 오리진 회원 PWA 가
+  // 채팅 쌍에 실어온 emt_ 회원 토큰 갈래. 릴레이 신뢰채널 표시(릴레이 배선만
+  // 새김) + 채팅 2경로 + 살아있는 회원 토큰(주입된 검증기) + 핀 소유자 일치가
+  // 모두 참일 때만 회원 신원으로 승인한다. 하나라도 어긩나면 아래 기존 갈래로
+  // 흘러 401 로 폐쇄된다(공개 인터넷 요청은 표시 자체가 불가능하다).
+  if (offered?.startsWith('Bearer emt_')) {
+    const channel = relayHostChannelRequests.get(req);
+    const verifier = opts.relayHostChannelMember;
+    const member = channel && relayHostChatRouteAllowed(req) && verifier
+      ? verifier(req)
+      : null;
+    if (channel && member && member.memberId === channel.memberId) {
+      return { ok: true, reason: 'relay-host-member' };
+    }
+  }
+  // WEBCHAT-SESSION-HANDOFF (JUD must ⓑ) — the bare-origin PWA after a handoff carries no emt_,
+  // only the derived wcs_ session cookie the exchange set. The relay wiring resolved it against
+  // the handoff ledger (same handle · not expired · not revoked); it opens the same two chat
+  // routes only, and only for the pin owner. Anything else falls through to the 401 below.
+  const webChat = relayHostChannelRequests.get(req);
+  if (webChat?.webChatMemberId && relayHostChatRouteAllowed(req) && webChat.webChatMemberId === webChat.memberId) {
+    return { ok: true, reason: 'relay-host-webchat-session' };
   }
   const peerAddress = authPeerAddresses.get(req);
   if (isSameOriginRequest(req, peerAddress)) return { ok: true, reason: 'same-origin' };
@@ -713,8 +774,25 @@ export async function handleAttachmentGet(req: Request, id: string, opts: MetaAp
   if (!filePath || !existsSync(filePath) || !statSync(filePath).isFile()) {
     return jsonResponse({ error: 'not_found' }, 404);
   }
-  const buf = readFileSync(filePath);
   const ext = extname(filePath).toLowerCase();
+  if (new URL(req.url).searchParams.get('extract') === 'text') {
+    if (!['.txt', '.md', '.pdf', '.docx'].includes(ext)) {
+      return jsonResponse({ error: 'unsupported_attachment' }, 415);
+    }
+    try {
+      const { readText, extractPdf, extractDocx } = await import('../../extractors.js');
+      const { redactSecretText } = await import('../../debug/secret-redaction.js');
+      const result = ext === '.pdf' ? await extractPdf(filePath, redactSecretText)
+        : ext === '.docx' ? await extractDocx(filePath, redactSecretText)
+          : await readText(filePath, redactSecretText);
+      return new Response(JSON.stringify({ text: result.text, truncated: result.truncated }), {
+        headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+      });
+    } catch {
+      return jsonResponse({ error: 'attachment_extraction_failed' }, 422);
+    }
+  }
+  const buf = readFileSync(filePath);
   const mime = MIME_BY_EXT[ext] ?? 'application/octet-stream';
   return new Response(buf, {
     status: 200,

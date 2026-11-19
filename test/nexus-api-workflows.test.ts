@@ -213,14 +213,16 @@ describe('POST /v1/workflows/generate', () => {
     // the wire smoke survives that cwd swap.
     const httpServerPath = join(import.meta.dir, '..', 'src', 'nexus', 'api', 'http-server.ts');
     const src = readFileSync(httpServerPath, 'utf-8');
-    const methodBlockStart = src.indexOf("if (method !== 'GET') {");
+    // Quote-agnostic (#38766 reformatted http-server.ts to double quotes); the brace
+    // anchor pins the mutation BLOCK, not a one-line method-not-allowed guard.
+    const methodBlockStart = src.search(/if \(method !== ['"]GET['"]\) \{/);
     expect(methodBlockStart).toBeGreaterThan(0);
-    const routeIdx = src.indexOf("'/v1/workflows/generate'");
+    const routeIdx = src.search(/['"]\/v1\/workflows\/generate['"]/);
     expect(routeIdx).toBeGreaterThan(methodBlockStart);
     // Confirm the matching POST guard sits on the same line.
     const lineEnd = src.indexOf('\n', routeIdx);
     const line = src.slice(routeIdx, lineEnd);
-    expect(line).toContain("method === 'POST'");
+    expect(line).toMatch(/method === ['"]POST['"]/);
   });
 
   it('exports handleWorkflowGenerate from workflows.ts', () => {
@@ -261,12 +263,14 @@ describe('POST /v1/workflows/synth', () => {
   it('route registration sits inside the method!==GET block (wire smoke)', () => {
     const httpServerPath = join(import.meta.dir, '..', 'src', 'nexus', 'api', 'http-server.ts');
     const src = readFileSync(httpServerPath, 'utf-8');
-    const methodBlockStart = src.indexOf("if (method !== 'GET') {");
+    // Quote-agnostic (#38766 reformatted http-server.ts to double quotes); the brace
+    // anchor pins the mutation BLOCK, not a one-line method-not-allowed guard.
+    const methodBlockStart = src.search(/if \(method !== ['"]GET['"]\) \{/);
     expect(methodBlockStart).toBeGreaterThan(0);
-    const routeIdx = src.indexOf("'/v1/workflows/synth'");
+    const routeIdx = src.search(/['"]\/v1\/workflows\/synth['"]/);
     expect(routeIdx).toBeGreaterThan(methodBlockStart);
     const lineEnd = src.indexOf('\n', routeIdx);
-    expect(src.slice(routeIdx, lineEnd)).toContain("method === 'POST'");
+    expect(src.slice(routeIdx, lineEnd)).toMatch(/method === ['"]POST['"]/);
   });
 
   it('exports handleWorkflowSynth from workflows.ts', () => {

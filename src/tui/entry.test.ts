@@ -2493,6 +2493,9 @@ test('Continuing is up once the turn opens, before the first tool (A207)', async
   };
   const output = process.stdout.write;
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  // A207 checks the banner at turn open, not pacing: the 45 s gap after the [plan] turn would outlast the 5 s test.
+  const pacingEnv = process.env.ELANOUS_TUI_TURN_PACING;
+  process.env.ELANOUS_TUI_TURN_PACING = 'off';
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(frames[0]).toContain('↻ Continuing');
@@ -2501,6 +2504,7 @@ test('Continuing is up once the turn opens, before the first tool (A207)', async
     expect(frames[1]).toContain('Read(notes.txt)');
   } finally {
     process.stdout.write = output;
+    if (pacingEnv === undefined) delete process.env.ELANOUS_TUI_TURN_PACING; else process.env.ELANOUS_TUI_TURN_PACING = pacingEnv;
   }
 });
 
@@ -2539,6 +2543,9 @@ test('a tool-only turn paints Continuing on the tool start, before any text (A20
   };
   const output = process.stdout.write;
   process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  // A207 checks the banner at turn open, not pacing: the 45 s gap after the [plan] turn would outlast the 5 s test.
+  const pacingEnv = process.env.ELANOUS_TUI_TURN_PACING;
+  process.env.ELANOUS_TUI_TURN_PACING = 'off';
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(frames[0]).toContain('↻ Continuing');
@@ -2548,6 +2555,7 @@ test('a tool-only turn paints Continuing on the tool start, before any text (A20
     expect(frames[1]).not.toContain('now open');
   } finally {
     process.stdout.write = output;
+    if (pacingEnv === undefined) delete process.env.ELANOUS_TUI_TURN_PACING; else process.env.ELANOUS_TUI_TURN_PACING = pacingEnv;
   }
 });
 
@@ -2654,7 +2662,9 @@ describe('ELN-SEAT-IDLE-QUEUE-STALL — idle ∧ queued drains through the real 
       expect(turnTextsSeen[0]).toBe('first typed turn');
       expect(turnTextsSeen[1]).toContain('뒤에-선-자식');
       expect(turnTextsSeen.join('\n')).not.toContain('거부될-자식');
-      expect(queueEvents).toContain('idle-stall-wake');
+      // The duplicate never ran (above) and the item behind it was delivered. Which knock delivers it is not the point:
+      // since the one door is always on (R1), its turn-end knock usually beats the 5 s idle watchdog.
+      expect(queueEvents).toContain('delivered');
     } finally {
       globalTaskNotificationQueue.clear();
       resetExternalEventOneWire();

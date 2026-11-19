@@ -19,12 +19,14 @@ export interface PreflightCondition {
 export const PREFLIGHT_CRITICAL_ORDER_FIELDS = WORK_ORDER_CRITICAL_FIELDS;
 
 export interface TaPreflightEvidence {
+  /** Identity of the card whose launch was examined, distinct from owner.card (the owner seat). */
+  readonly cardId?: string | null;
   /** ① 요청 pin 과 child 가 실제 받은 HEAD (둘 다 40자 hex 여야 PASS · 없으면 UNMEASURED). */
   readonly source?: { readonly requestedPin?: string | null; readonly childHead?: string | null; readonly privateRepo?: boolean | null };
   /** ② 요청 pin digest 와 실제 소비(Pod imageID) digest. */
   readonly image?: { readonly expectedDigest?: string | null; readonly observedDigest?: string | null };
   /** ③ 작업 지시서 · 자동 merge 끔 · 귀속(owner 가 카드·lease 와 같은지). */
-  readonly workOrder?: Pick<WorkOrder, 'cellId' | 'boundary' | 'budget' | 'contract' | 'escalation' | 'unknownFields'> | null;
+  readonly workOrder?: Pick<WorkOrder, 'cellId' | 'boundary' | 'budget' | 'contract' | 'escalation' | 'unknownFields' | 'owner' | 'card' | 'noAutoMerge' | 'budgetLimits'> | null;
   /**
    * 실제 발사 argv — `tasks hand` shadow 가 만드는 명령(`harness say …` 의 플래그들). 선언값(autoMerge:false)이 아니라 이 argv 로 merge 경로를 판정한다.
    * 자동 병합이 가능한 argv(`--merge-by-host`·`--auto-merge`·`--no-auto-merge` 없음)면 FAIL · argv 가 없거나 `harness say` 명령이 아니면 UNMEASURED.
@@ -36,7 +38,7 @@ export interface TaPreflightEvidence {
   /** ④ 시간·비용: 벽시계 상한과 Job 상한(초), USD 상한. 벽시계 < Job 이어야 하고 USD 상한이 양수여야 한다. */
   readonly limits?: { readonly wallClockSec?: number | null; readonly jobDeadlineSec?: number | null; readonly usdCap?: number | null };
   /** ⑤ 중복·중지: 같은 requestId 이미 소비? · 활성 같은 골 run 수 · 최신 OP hold 가 걸려 있는지. */
-  readonly launch?: { readonly requestConsumed?: boolean | null; readonly activeSameGoalRuns?: number | null; readonly opHoldActive?: boolean | null };
+  readonly launch?: { readonly requestConsumed?: boolean | null; readonly cardClaimed?: boolean | null; readonly activeSameGoalRuns?: number | null; readonly opHoldActive?: boolean | null };
   /** ⑥ 입구 단일화·그라운딩. entrance 는 허용된 단일 입구(hand) 만 PASS. */
   readonly entrance?: {
     readonly name?: string | null;
@@ -167,6 +169,11 @@ function checkOrder(e: TaPreflightEvidence): PreflightCondition {
     const unknownFields: unknown = order.unknownFields;
     const unknown = PREFLIGHT_CRITICAL_ORDER_FIELDS.filter((field) => (Array.isArray(unknownFields) ? unknownFields.includes(field) : true) || !present(order[field]) || order[field] === WORK_ORDER_UNKNOWN);
     if (unknown.length) fails.push(`critical 모름: ${unknown.join(', ')}`);
+    if (!present(order.owner) || !present(order.card) || !isBool(order.noAutoMerge)) unknowns.push('작업 지시서 owner/card/noAutoMerge 미지정');
+    if (!present(e.cardId)) unknowns.push('실제 카드 id 미측정');
+    if (present(order.owner) && present(e.owner?.card) && order.owner !== e.owner?.card) fails.push('작업 지시서 owner와 카드 owner 불일치');
+    if (present(order.card) && present(e.cardId) && order.card !== e.cardId) fails.push('작업 지시서 card와 실제 카드 불일치');
+    if (order.noAutoMerge === false) fails.push('작업 지시서 자동 merge 금지 아님');
   }
   const merge = mergePathOf(e.launchArgv, e.mergePolicy);
   if (merge.state === 'open') fails.push(merge.reason);
@@ -179,13 +186,20 @@ function checkOrder(e: TaPreflightEvidence): PreflightCondition {
   return judge(3, name, fails, unknowns, `owner=${card} · critical 칸 채움 · 자동 merge 0`);
 }
 
-function checkLimits(e: TaPreflightEvidence['limits']): PreflightCondition {
+function checkLimits(e: TaPreflightEvidence['limits'], declared: TaPreflightEvidence['workOrder']): PreflightCondition {
   const name = '시간 · 비용 상한';
   const fails: string[] = [];
   const unknowns: string[] = [];
   const wall = e && num(e.wallClockSec) ? e.wallClockSec : null;
   const job = e && num(e.jobDeadlineSec) ? e.jobDeadlineSec : null;
   const usd = e && num(e.usdCap) ? e.usdCap : null;
+  const orderWall = declared?.budgetLimits?.timeSec, orderUsd = declared?.budgetLimits?.usdCap;
+  if (!num(orderWall) || !num(orderUsd)) unknowns.push('작업 지시서 숫자 budgetLimits 미지정');
+  else {
+    if (orderWall <= 0 || orderUsd <= 0) fails.push('작업 지시서 budgetLimits는 양수여야 한다');
+    if (wall !== null && wall !== orderWall) fails.push('작업 지시서 timeSec와 측정 벽시계 불일치');
+    if (usd !== null && usd !== orderUsd) fails.push('작업 지시서 usdCap과 측정 USD 상한 불일치');
+  }
   // 숫자가 아닌 칸(없음·null·문자열·NaN·Infinity)은 측정값이 아니다 · 숫자인데 0 이하는 불량.
   for (const [label, value] of [['wallClock', wall], ['jobDeadline', job], ['USD 상한', usd]] as const) {
     if (value === null) unknowns.push(`${label} 미지정 또는 숫자 아님`);
@@ -201,11 +215,11 @@ function checkLaunch(e: TaPreflightEvidence['launch']): PreflightCondition {
   const unknowns: string[] = [];
   if (e?.opHoldActive === true) fails.push('최신 OP hold 가 걸려 있음');
   else if (!isBool(e?.opHoldActive)) unknowns.push('OP hold 미측정 또는 불리언 아님');
-  if (e?.requestConsumed === true) fails.push('같은 requestId 이미 소비됨(재시도는 새 요청으로)');
-  else if (!isBool(e?.requestConsumed)) unknowns.push('requestId 소비 여부 미측정 또는 불리언 아님');
+  if (e?.cardClaimed === true) fails.push('카드가 이미 claim 되었거나 발사 불가능');
+  else if (!isBool(e?.cardClaimed)) unknowns.push('카드 claim 여부 미측정');
   if (isCount(e?.activeSameGoalRuns)) { if (e.activeSameGoalRuns > 0) fails.push(`같은 골 활성 run ${e.activeSameGoalRuns}`); }
   else unknowns.push('활성 run 수 미측정 또는 0 이상 정수 아님');
-  return judge(5, name, fails, unknowns, 'hold 없음 · 미소비 · 활성 중복 0');
+  return judge(5, name, fails, unknowns, 'hold 없음 · 카드 claim 없음 · 활성 중복 0');
 }
 
 /** 그라운딩 URL 형식 — http(s) 절대 URL 이고 호스트가 있어야 한다. */
@@ -242,7 +256,7 @@ function checkEntrance(e: TaPreflightEvidence['entrance']): PreflightCondition {
 export function evaluateTaPreflight(evidence: TaPreflightEvidence): TaPreflightReport {
   const conditions = [
     checkSource(evidence.source, evidence.failClosed), checkImage(evidence.image, evidence.failClosed), checkOrder(evidence),
-    checkLimits(evidence.limits), checkLaunch(evidence.launch), checkEntrance(evidence.entrance),
+    checkLimits(evidence.limits, evidence.workOrder), checkLaunch(evidence.launch), checkEntrance(evidence.entrance),
   ];
   const count = (status: PreflightStatus): number => conditions.filter((c) => c.status === status).length;
   const summary = { pass: count('PASS'), fail: count('FAIL'), unmeasured: count('UNMEASURED') };
@@ -254,10 +268,13 @@ export interface TaPreflightTarget { readonly card?: string; readonly cell?: str
 
 /**
  * 영수증 target 은 «검사한 증거»와 같은 대상이어야 한다 — 아니면 commit Y 로 READY 받은 증거에 --commit X 영수증이 박혀 X 발사를 통과시킨다.
- * commit ↔ source.requestedPin, cell ↔ workOrder.cellId. 증거에 없는 대상 필드는 대조할 수 없으므로 불일치로 본다. card 는 증거에 대응 칸이 없어 대조하지 않는다.
+ * commit ↔ source.requestedPin, cell ↔ workOrder.cellId, card ↔ cardId. 증거에 없는 대상 필드는 불일치로 본다.
  * 일치하면 null, 아니면 사유.
  */
 export function targetEvidenceMismatch(evidence: TaPreflightEvidence, target: TaPreflightTarget): string | null {
+  if (target.card !== undefined && evidence.cardId !== target.card) {
+    return `--card ${target.card} ≠ 증거 cardId ${typeof evidence.cardId === 'string' ? evidence.cardId : '없음'}`;
+  }
   if (target.commit !== undefined && evidence.source?.requestedPin !== target.commit) {
     return `--commit ${target.commit.slice(0, 12)} ≠ 증거 source.requestedPin ${typeof evidence.source?.requestedPin === 'string' ? evidence.source.requestedPin.slice(0, 12) : '없음'}`;
   }
@@ -265,6 +282,25 @@ export function targetEvidenceMismatch(evidence: TaPreflightEvidence, target: Ta
     return `--cell ${target.cell} ≠ 증거 workOrder.cellId ${typeof evidence.workOrder?.cellId === 'string' ? evidence.workOrder.cellId : '없음'}`;
   }
   return null;
+}
+
+/** Read the actual card and argv emitted by tasks hand shadow; malformed JSON is never evidence. */
+export function parseHandShadowEvidence(raw: string): { cardId: string | null; launchArgv: readonly string[] | null } {
+  try {
+    const data: unknown = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return { cardId: null, launchArgv: null };
+    const result = data as { mode?: unknown; launched?: unknown; card?: { id?: unknown }; move?: { command?: unknown } };
+    if (result.mode !== 'shadow' || result.launched !== false) return { cardId: null, launchArgv: null };
+    const cardId = typeof result.card?.id === 'string' && result.card.id.trim() ? result.card.id : null;
+    const argv = result.move?.command;
+    return { cardId, launchArgv: Array.isArray(argv) && argv.every((part) => typeof part === 'string') ? argv : null };
+  } catch {
+    const lines = raw.split(/\r?\n/u);
+    const cardId = lines.find((line) => /^[^\t\s]+\tshadow\tnot launched(?:\t|$)/u.test(line))?.split('\t')[0] ?? null;
+    const line = lines.find((line) => /^(?:elanous|eln)\s+harness\s+say\b/u.test(line));
+    const argv = line ? line.slice(0, line.includes(" '") ? line.indexOf(" '") : undefined).trim().split(/\s+/u) : null;
+    return { cardId, launchArgv: argv };
+  }
 }
 
 /**

@@ -807,7 +807,7 @@ test('file drag overlay stays visible across children, closes on exit/drop/drage
   const surface = overlay()[0]!.findByType('div');
   expect(surface.props.className).toContain('pointer-events-none');
   expect(overlay()[0]!.findAllByType('p').map((p) => Array.isArray(p.props.children) ? p.props.children.join('') : p.props.children)).toEqual([
-    '여기에 놓으면 첨부', `파일 ${MAX_CHAT_FILES}개까지 · 큰 파일은 빠집니다`,
+    '여기에 놓으면 첨부', `파일 ${MAX_CHAT_FILES}개까지 · 파일당 최대 10MiB`,
   ]);
   await act(async () => { area.props.onDragEnter({ dataTransfer: transfer }); });
   await act(async () => { area.props.onDragLeave({ dataTransfer: transfer }); });
@@ -862,4 +862,27 @@ test('deployment confirmation uses its own chat card and defaults to N', async (
   await act(async () => { reply = receiveAsk({ ...payload, id: 'deploy-confirm-2' }); });
   await act(async () => { tree!.root.findByType(DeployConfirmCard).props.onYes(); });
   expect(await reply).toEqual({ answers: { confirm: 'y' } });
+});
+
+test('lecture extraction failure restores selected file and composer text', async () => {
+  const { input, streams } = await mount({ acp: false });
+  const note = { id: 'att-abc-def', filename: 'lecture.md', size: new Blob(['강의']).size, mediaType: 'text/markdown', downloadUrl: '/v1/attachments/att-abc-def' };
+  globalThis.fetch = (async () => new Response('', { status: 422 })) as unknown as typeof fetch;
+  await act(async () => { input.props.onAttached([note]); });
+  await act(async () => { await input.props.onSubmit('삼성전자 강의 요약'); });
+  expect(input.props.attachments).toEqual([note]);
+  expect(input.props.prefill.text).toBe('삼성전자 강의 요약');
+  expect(streams).toHaveLength(0);
+});
+
+test('lecture text reaches the turn without its raw attachment path', async () => {
+  const { input, streams } = await mount({ acp: false });
+  const note = { id: 'att-abc-def', filename: 'lecture.md', size: new Blob(['강의']).size, mediaType: 'text/markdown', downloadUrl: '/v1/attachments/att-abc-def', path: '/tmp/lecture.md' };
+  globalThis.fetch = (async () => Response.json({ text: '삼성전자 | 목표가 80,000원\napi_key=***', truncated: false })) as unknown as typeof fetch;
+  await act(async () => { input.props.onAttached([note]); });
+  await act(async () => { await input.props.onSubmit('강의 요약'); });
+  const body = streams[0] as { userText: string };
+  expect(body.userText).toContain('삼성전자 | 목표가 80,000원');
+  expect(body.userText).toContain('api_key=***');
+  expect(body.userText).not.toContain('/tmp/lecture.md');
 });

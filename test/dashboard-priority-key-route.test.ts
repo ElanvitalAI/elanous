@@ -232,18 +232,6 @@ describe('routeDashboardPriorityKey', () => {
     expect(calls).toEqual(['force-quit-check']);
   });
 
-  test('classic guidance is prioritized ahead of force-quit', async () => {
-    const { calls, deps } = createDeps({
-      routeClassicSigquitChord: (routeKey) => { calls.push(`classic-guidance:${routeKey.name}`); return true; },
-      isForceQuitChord: () => { calls.push('force-quit-check'); return true; },
-    });
-
-    const result = await routeDashboardPriorityKey(key('backslash', { ctrl: true }), deps);
-
-    expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['classic-guidance:backslash']);
-  });
-
   test('dashboard wires classic sidetab routing into the non-voice priority input path', () => {
     const priorityStart = dashboardSource.indexOf('const priorityRoute = await routeDashboardPriorityKey(key, {');
     const dispatchStart = dashboardSource.indexOf('dispatchPreKey: (routeKey, targetHandlerName) => {', priorityStart);

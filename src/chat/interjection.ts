@@ -71,12 +71,15 @@ export function buildInterjectionMessage(
  *   무관하게 assistant 메시지를 저장). ⇒ 빠져 있던 것은 이 «표식» 하나뿐이었다.
  */
 export const TURN_INTERRUPTED_MARKER = '[사용자가 이 턴을 중단했습니다]';
+/** Automatic idle watchdog cancellation is not a user interruption. */
+export const TURN_STALLED_MARKER = '[응답 정체로 이 턴이 자동 중단됐습니다]';
 
 /** 중단 표식 메시지 한 줄. 도구가 돌던 중이면 그 사실도 같이 남긴다. 순수. */
-export function buildTurnInterruptedMarker(opts?: { toolInFlight?: boolean }): string {
+export function buildTurnInterruptedMarker(opts?: { toolInFlight?: boolean; reason?: 'stall' }): string {
+  const marker = opts?.reason === 'stall' ? TURN_STALLED_MARKER : TURN_INTERRUPTED_MARKER;
   return opts?.toolInFlight
-    ? `${TURN_INTERRUPTED_MARKER} — 진행 중이던 도구 호출도 함께 끊겼습니다.`
-    : TURN_INTERRUPTED_MARKER;
+    ? `${marker} — 진행 중이던 도구 호출도 함께 끊겼습니다.`
+    : marker;
 }
 
 /**

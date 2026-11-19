@@ -1,13 +1,16 @@
 // C1 background-agent axis: actual TUI and child REPL; the LLM is the external fake device.
 // The other C1 sources are not measured by this scenario yet; this cannot certify all of C1.
+// Capsule behavior is always enabled; measure one default configuration, not historical stage variants.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mockSeatPtySequence } from '../../mock-seat-pty-sequence.js';
 import type { SimWorldScenario } from '../types.js';
+import { simWorldScenarios as c5Scenarios } from './c5-wakeup.js';
+import { simWorldScenarios as c6Scenarios } from './c6-boot-backlog.js';
 
-const c1: SimWorldScenario = {
+const c1Scene: SimWorldScenario = {
   id: 'C1',
-  title: 'background Agent completion wakes an idle seat',
+  title: 'background Agent completion wakes an idle seat (default capsule behavior)',
   async run(ctx) {
     const root = ctx.universeRoot;
     const capture = join(root, 'requests.jsonl');
@@ -43,4 +46,5 @@ const c1: SimWorldScenario = {
     }
   },
 };
-export const simWorldScenarios: readonly SimWorldScenario[] = [c1];
+
+export const simWorldScenarios: readonly SimWorldScenario[] = [c1Scene, ...c5Scenarios, ...c6Scenarios];

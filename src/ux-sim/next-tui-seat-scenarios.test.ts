@@ -11,7 +11,8 @@ test('next TUI production log renders two n8n iterations in one line each and re
   expect(counts).toEqual({ steps: GOAL_INTERIM_RENDER_TRACE.interimReplies.length, notDone: 0, folded: GOAL_INTERIM_RENDER_TRACE.interimReplies.length, userHeader: false });
   const interimLines = screen.split('\n').filter((line) => line.includes('단계 렌더를 진행했습니다'));
   expect(interimLines).toHaveLength(2);
-  expect(interimLines.every((line) => line.includes('(접힘)') && !line.includes('아직 못 했습니다'))).toBe(true);
+  expect(interimLines.every((line) => (line.includes('(접힘)') || line.includes('(folded)')) && !line.includes('아직 못 했습니다'))).toBe(true);
   expect(screen).toContain(GOAL_INTERIM_RENDER_TRACE.finalReply);
-  expect(screen).toContain('도구: ScheduleWakeup');
+  expect(['도구: ScheduleWakeup', 'Tool: ScheduleWakeup'].some((label) => screen.includes(label))).toBe(true); // #38144 English chrome
+  expect(screen).toContain('Tool: ScheduleWakeup');
 });

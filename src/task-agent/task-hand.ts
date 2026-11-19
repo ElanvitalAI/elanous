@@ -26,7 +26,7 @@ import { newLaunchUtteranceId, recordLaunchUtterance } from '../harness/launch-u
 import { debug } from '../debug/log.js';
 import { priorLessonsFor } from './recall-inject.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { LAUNCH_DOOR_RECEIPT_ENV, openLaunchRequestDoor, type LaunchRequestDoor } from '../execution-loop/launch-gate.js';
+import { LAUNCH_DOOR_RECEIPT_ENV, TA_PREFLIGHT_RECEIPT_ENV, TA_PREFLIGHT_SHA_ENV, decideLaunchAdmission, openLaunchRequestDoor, type LaunchRequestDoor } from '../execution-loop/launch-gate.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { checkCompletionEvidence, deliverableReceiptEvidence } from './completion-evidence.js';
 import { judgeNextMove } from './judge.js';
@@ -316,6 +316,8 @@ export const LIVE_MOVE_HISTORY_EVENT = 'live-move';
 export const LIVE_MOVE_RESULT_EVENT = 'live-move-result';
 /** HAND-MOVE-LEDGER — 자리가 손으로 마무리한 수 줄(`recordHandMove`) — 관측 기록이라 live-move 줄처럼 상태 사유 판정에서 뺀다. */
 export const HAND_MOVE_HISTORY_EVENT = 'hand-move';
+/** A receipt-bound live attempt claims the card under the first state-file lock. */
+export const PREFLIGHT_LIVE_CLAIM_EVENT = 'preflight-live-claim';
 export interface TaskCardMove { kind: 'launch' | 'wait'; command?: string[]; reason: string }
 export interface TaskCard {
   id: string;
@@ -423,6 +425,7 @@ export interface TaskCard {
   taLand?: true;
   /** `tasks hand --no-auto-merge` — 자동 병합을 끈다: 발사 인자 `--no-auto-merge`(PR 까지) · `--merge-by-host`(호스트 재게이트 뒤 병합)는 싣지 않는다. 첫 시범 PR 은 사람이 병합한다. */
   noAutoMerge?: true;
+  budgetLimits?: { timeSec: number; usdCap: number };
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
   childLlm?: TaskChildLlm;
   /** TA-PREFLIGHT ① — `tasks hand --source commit:<40hex>`: 자식이 받을 정확 소스. 발사 인자 `--source` 로 가고 부모가 자식 수신 HEAD 와 대조한다. */
@@ -1371,7 +1374,25 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   let parentRoleEnv = taskParentRoleEnv(parentRolePins); // validate before writing the card
   const completion = opts.completion ?? 'code-pr';
   const now = (opts.now ?? (() => new Date()))();
-  const id = opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
+  let receiptCard: TaskCard | undefined;
+  let receiptCardId: string | undefined;
+  const receiptPath = process.env[TA_PREFLIGHT_RECEIPT_ENV]?.trim(), receiptSha = process.env[TA_PREFLIGHT_SHA_ENV]?.trim();
+  if (opts.live && (receiptPath || receiptSha)) {
+    if (!receiptPath || !receiptSha) throw new Error('TA-PREFLIGHT receipt와 sha256이 모두 필요하다');
+    let value: { target?: { card?: unknown } };
+    try { value = JSON.parse(readFileSync(receiptPath, 'utf8')) as typeof value; } catch { throw new Error('TA-PREFLIGHT receipt를 읽지 못했다'); }
+    if (typeof value.target?.card !== 'string') throw new Error('TA-PREFLIGHT receipt에 card id가 없다');
+    receiptCardId = value.target.card;
+    taskCardLabelContext({ id: receiptCardId });
+    if (opts.id !== undefined && opts.id !== receiptCardId) throw new Error('TA-PREFLIGHT card id 불일치');
+    const admission = decideLaunchAdmission({ ta: true, now, target: { card: receiptCardId,
+      ...(opts.checklistId ? { cell: opts.checklistId } : {}), ...(opts.source?.startsWith('commit:') ? { commit: opts.source.slice(7) } : {}) } });
+    if (!admission.allowed) throw new Error(admission.reason);
+    receiptCard = readTaskCard(receiptCardId, path) ?? undefined;
+    if (!receiptCard || receiptCard.status !== 'handed' || receiptCard.runId || receiptCard.pr !== undefined || !Array.isArray(receiptCard.history)
+      || receiptCard.history.some((entry) => entry.event === PREFLIGHT_LIVE_CLAIM_EVENT)) throw new Error('TA-PREFLIGHT card가 없거나 발사 가능한 shadow 상태가 아니다');
+  }
+  const id = receiptCardId ?? opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
   if (opts.checklistId) {
     const priorCards = withFileLockSync(`${path}.lock`, () =>
       Object.values(readState(path).tasks ?? {}).filter((card) => card.id !== id));
@@ -1455,6 +1476,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
     ...(opts.taLand === true ? { taLand: true as const } : {}),
     ...(opts.noAutoMerge === true ? { noAutoMerge: true as const } : {}),
+    ...(opts.workOrder?.budgetLimits || receiptCard?.budgetLimits
+      ? { budgetLimits: { ...(opts.workOrder?.budgetLimits ?? receiptCard!.budgetLimits!) } } : {}),
     ...(childLlm ? { childLlm } : {}),
     ...(opts.source ? { source: opts.source } : {}),
     ...(opts.imageDigest ? { imageDigest: opts.imageDigest } : {}),
@@ -1475,13 +1498,21 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.cardFields?.handed !== undefined ? { handed: opts.cardFields.handed } : {}),
     ...(draftClaim ? { draftClaim } : {}),
   };
+  if (receiptCard) {
+    const keys = ['text', 'targetPaths', 'seat', 'checklistId', 'checklistVersion', 'completion', 'project', 'goal', 'milestone', 'source', 'imageDigest', 'childLlm', 'parentRoleLlm', 'noAutoMerge', 'budgetLimits', 'taLand', 'tier', 'tierSplit', 'mission', 'after'] as const;
+    if (keys.some((key) => JSON.stringify(receiptCard![key]) !== JSON.stringify(card[key]))) throw new Error('TA-PREFLIGHT card 내용 불일치');
+    card = { ...receiptCard, ...card, createdAt: receiptCard.createdAt,
+      history: [...receiptCard.history, ...card.history, { at: now.toISOString(), event: PREFLIGHT_LIVE_CLAIM_EVENT, detail: `receipt sha256 ${receiptSha}` }] };
+  }
   // 2판 graph-run 조합의 다음 수는 실제 graph run — harness say 인자를 조립하지 않는다.
   // MAKE-CODE-UNIT-THIN — code-pr 의 다음 수는 여전히 harness say 인자다: 그 인자를 make-code 노드 처리기가 그대로 발사한다.
   let move = graphRun && graphRunPath && !makeCodeGraph ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } satisfies TaskCardMove
     : selectionFailure ? undefined : nextMoveFor(card, opts.landed);
   // 분해 실패로 막은 카드는 wait(failed 사유)가 정답이다 — 던지지 않고 카드를 적은 뒤 발사 0 으로 돌아간다.
   if (move && move.kind !== 'launch' && tierSplitBlocked === undefined) throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
-  const guard = opts.writeGuard;
+  let receiptCardPending = receiptCard !== undefined;
+  const guard = receiptCard || opts.writeGuard ? (current: TaskCard | undefined) =>
+    (!receiptCardPending || JSON.stringify(current) === JSON.stringify(receiptCard)) && (!opts.writeGuard || opts.writeGuard(current)) : undefined;
   const writeCard = (target: string, next: TaskCard): void => {
     if (next.draftClaim?.body !== undefined && opts.draftClaim) {
       let written = false;
@@ -1572,6 +1603,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     }
   }
   writeCard(path, card);
+  receiptCardPending = false;
   if (!selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') persistComposition?.();
   try { debug.log('task-agent.hand', 'target-paths', { card: id, count: targetPaths.length, labelMissing: targetPathHints.labelMissing }); } catch { /* fail-soft */ }
   try { debug.log('task-agent.graph-select', !selected.composition ? 'composition-missing' : selected.error ? 'composition-invalid' : 'composition-selected', {
@@ -1754,7 +1786,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const runId = mintRunId();
   const launchId = newLaunchUtteranceId();
   recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
-  const context: TaskLaunchContext = { runId, launchId, launchUtterance: opts.text, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,
+  const context: TaskLaunchContext = { runId, launchId, launchUtterance: opts.text, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id, ELANOUS_TASK_STATE_PATH: path,
     ...parentRoleEnv,
     ...(inheritedLaunchDoorReceipt !== undefined ? { [LAUNCH_DOOR_RECEIPT_ENV]: inheritedLaunchDoorReceipt } : {}),
     ...(cardPrNumber(card) ? { ELANOUS_TASK_BOUND_PR: String(cardPrNumber(card)) } : {}),
@@ -1844,6 +1876,13 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ],
   };
   writeCard(path, launched);
+  // The supervisor may record a late failure just before this card is bound.
+  if (boundRunId) {
+    try {
+      const { reconcileLateLaunchFailure } = await import('./late-launch-failure.js');
+      reconcileLateLaunchFailure(path, id, boundRunId);
+    } catch { /* retain the accepted dispatch when the ledger is unavailable */ }
+  }
   // INFLIGHT-REGISTRY — 출발 때 맥락을 남긴다(머지 때 같은 파일 줄의 의도를 스마트 머지가 읽는다 · 착지하면 지운다).
   try {
     // Preserve any completion-boundary draft while keeping the recall-only suffix out of intent/path metadata.

@@ -24,6 +24,7 @@ import { genericResumeApprovalRefusal, savedAppBuildApprovalResumeInput, savedAp
 export function registerGraphCommands(program: Command, runsDeps: {
   root?: string; processStartMs?: (pid: number) => number | null; graphRoots?: string[];
   runBash?: NonNullable<GraphRunOptions['deps']>['runBash'];
+  callLLM?: NonNullable<GraphRunOptions['deps']>['callLLM'];
   capabilityProviders?: NonNullable<GraphRunOptions['deps']>['capabilityProviders'];
 } = {}): void {
   const graph = program.command('graph').description('Run a declared command graph or inspect its latest run');
@@ -242,7 +243,11 @@ export function registerGraphCommands(program: Command, runsDeps: {
         const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from && !pendingResume ? { fromNodeId: opts.from } : {}), ...(pendingResume ? { fromVisitId: pendingResume.executionId } : opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
           ...(verifiedOwnerId ? { verifiedOwnerId } : {}),
           ...(approvalSignal ? { signal: approvalSignal } : {}),
-          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: approvalRegistry } });
+          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: approvalRegistry,
+            callLLM: runsDeps.callLLM ?? (async (prompt: string) => {
+              const { buildCliWorkflowDeps } = await import('../cli/workflow.js');
+              return buildCliWorkflowDeps().callLLM({ prompt });
+            }) } });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;

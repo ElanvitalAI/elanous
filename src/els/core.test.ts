@@ -25,6 +25,8 @@ function fakePty(id: string) {
     killed: false,
     isAlive: () => alive,
     write: (text) => { writes.push(text); },
+    writeAll: async (text) => { writes.push(text); },
+    bracketedPasteEnabled: () => true,
     renderScreen: () => new Promise<string>((resolve, reject) => {
       if (holdRenders) { pending.push({ resolve, reject }); return; }
       if (renderFails) reject(new Error('render failed')); else resolve(screen);
@@ -553,4 +555,113 @@ test('reorder: an empty `before` means the end, exactly like omitting it or «en
   expect(t.core.reorder({ kind: 'workspace', id: 'A', before: ' ' }).exitCode).toBe(1);
   expect(t.core.reorder({ kind: 'tab', id: 'tnope', before: '' }).exitCode).toBe(1);
   expect(t.order()).toEqual(unchanged);
+});
+
+test('pane build reports belong to live PTYs and expire without a heartbeat', () => {
+  let clock = 1000;
+  const { core, ptys } = owner(emptyJournal(), undefined, () => clock);
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  const build = () => (JSON.parse(core.list().message) as { panes: { build: { sha: string | null; age: string } }[] }).panes[0]!.build;
+  expect(build().sha).toBeNull();
+  expect(core.reportBuild(pane, 'bad').exitCode).toBe(1);
+  expect(core.reportBuild('missing', 'a'.repeat(40)).exitCode).toBe(1);
+  expect(core.reportBuild(pane, 'a'.repeat(40)).exitCode).toBe(0);
+  expect(build()).toMatchObject({ sha: 'a'.repeat(40), source: 'self-reported', trusted: false });
+  clock += 90_000;
+  expect(build()).toMatchObject({ sha: null, age: 'unknown' });
+  core.reportBuild(pane, 'a'.repeat(40));
+  ptys[0]!.exit();
+  expect(build()).toMatchObject({ sha: null, age: 'unknown' });
+  expect(core.reportBuild(pane, 'a'.repeat(40)).exitCode).toBe(1);
+});
+
+test('verified send submits an intact long multiline paste and observes the turn start', async () => {
+  const { core, ptys } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  const body = `${'한글'.repeat(4000)}\nnext line`;
+  const sent = core.sendVerified(pane, body);
+  await settle();
+  expect(ptys[0]!.writes).toEqual([`\x1b[200~${body}\x1b[201~\r`]);
+  ptys[0]!.setScreen('• Working (1s • esc to interrupt)');
+  const result = await sent;
+  expect(result.exitCode).toBe(0);
+  expect(result.message).toContain('turn started');
+});
+
+test('verified send refuses an already running pane and an injected paste terminator', async () => {
+  const { core, ptys } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  ptys[0]!.setScreen('Turn running');
+  expect((await core.sendVerified(pane, 'new task')).message).toContain('not sent');
+  expect((await core.sendVerified(pane, 'bad\x1b[201~payload')).exitCode).toBe(2);
+  expect(ptys[0]!.writes).toEqual([]);
+});
+
+test('verified send reports an unobserved start without claiming failure to submit', async () => {
+  const { core } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  const result = await core.sendVerified(pane, 'task');
+  expect(result.exitCode).toBe(1);
+  expect(result.message).toContain('submitted; turn start not observed');
+}, 5000);
+
+// D10 (els-round1b-a110): 3 concurrent seats, mock provider, turn finishes in 0s — «Turn running» never
+// renders before the first 100ms poll, but the fresh «✻ Worked for» completion hint proves the turn started.
+test('verified send observes a fast turn through its fresh completion hint (busy marker missed)', async () => {
+  const { core, ptys } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  const sent = core.sendVerified(pane, 'SYNTHETIC simultaneous');
+  await settle();
+  expect(ptys[0]!.writes).toEqual(['\x1b[200~SYNTHETIC simultaneous\x1b[201~\r']);
+  ptys[0]!.setScreen('elanous\n\n> \n\nSYNTHETIC_OK\n\n✻ Worked for 0s · done 2:35 PM\n❯ \n● Turn done · Enter send');
+  const result = await sent;
+  expect(result.exitCode).toBe(0);
+  expect(result.message).toContain('turn started (already completed before the busy marker could be observed)');
+}, 5000);
+
+test('verified send does not mistake a completion hint that predates the submit for a started turn', async () => {
+  const { core, ptys } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  ptys[0]!.setScreen('✻ Worked for 9s · done 1:00 PM\n❯ \n● Turn done');
+  const result = await core.sendVerified(pane, 'task');
+  expect(result.exitCode).toBe(1);
+  expect(result.message).toContain('submitted; turn start not observed');
+}, 5000);
+
+test('verified send uses checked plain mode when bracketed paste is unavailable', async () => {
+  const { core, ptys } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  ptys[0]!.pty.bracketedPasteEnabled = () => false;
+  const result = await core.sendVerified(pane, 'echo safely\n');
+  expect(result.exitCode).toBe(0);
+  expect(result.message).toContain('mode=plain; turn start unverified');
+  expect(ptys[0]!.writes).toEqual(['echo safely\r']);
+});
+
+test('plain mode refuses a body with a line break inside (it would submit two commands) — nothing is written (JUD-B #103319)', async () => {
+  const { core, ptys } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  ptys[0]!.pty.bracketedPasteEnabled = () => false;
+  const result = await core.sendVerified(pane, 'echo one\nrm -rf ~\n');
+  expect(result).toEqual({ exitCode: 2, message: 'els send: plain 모드는 한 줄 텍스트만 — 줄바꿈·제어 문자가 있어 보내지 않음 (bracketed paste 를 켠 pane 에선 여러 줄 가능)' });
+  expect(ptys[0]!.writes).toEqual([]);
+});
+
+test('plain mode refuses Ctrl-C / Ctrl-D / DEL inside the body; TAB is still text; bracketed paste keeps multi-line (JUD-B #103319)', async () => {
+  const { core, ptys } = owner();
+  core.start();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  ptys[0]!.pty.bracketedPasteEnabled = () => false;
+  for (const body of ['sleep 9\u0003', 'cat\u0004', 'ab\u007fc', 'a\rb']) expect((await core.sendVerified(pane, body)).exitCode).toBe(2);
+  expect(ptys[0]!.writes).toEqual([]);
+  expect((await core.sendVerified(pane, 'printf "a\tb"')).exitCode).toBe(0);
+  expect(ptys[0]!.writes).toEqual(['printf "a\tb"\r']);
 });

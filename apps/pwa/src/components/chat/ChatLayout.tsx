@@ -55,6 +55,8 @@ import { extractClipboardFiles, extractDroppedFiles, hasDroppedFiles, type ChatF
 import {
   buildPromptUserContentFromAttachments,
   isImageAttachment,
+  isLectureNoteAttachment,
+  fetchLectureNote,
   isProviderUserMessageVisionCapable,
 } from '@/lib/attachment-content';
 import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
@@ -427,7 +429,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   }, []);
 
   const uploadTransferFiles = async ({ files, tooLarge, tooMany }: ChatFileExtraction): Promise<void> => {
-    if (tooLarge) toast.error(`${tooLarge} files exceed the 20 MB attachment limit`);
+    if (tooLarge) toast.error(`${tooLarge} files exceed the 10 MiB attachment limit`);
     if (tooMany) toast.error(`${tooMany} files exceed the 10-file attachment limit`);
     if (files.length === 0) return;
     if (!config.baseUrl) {
@@ -689,15 +691,28 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         `이 모델은 이미지 입력을 지원하지 않습니다 — ${imageAttachments.length}개 이미지가 무시됩니다. (vision 모델로 전환 후 재첨부)`,
       );
     }
-    // Non-image attachments still surface as `[attached] <path>` lines
-    // so the agent can fs-read them; this preserves the pre-P-3 flow
-    // for documents / archives / data files.
-    const attachLines = nonImageAttachments
+    const notes = nonImageAttachments.filter(isLectureNoteAttachment);
+    let extractedNotes: string[] = [];
+    if (notes.length > 0) {
+      try {
+        if (!config.baseUrl) throw new Error('missing daemon');
+        extractedNotes = await Promise.all(notes.map(async (note) => {
+          const result = await fetchLectureNote(note, { baseUrl: config.baseUrl, token: config.token });
+          if (result.truncated) toast.warning(`${note.filename}: 본문이 20KB로 잘렸습니다.`);
+          return `[강의 노트: ${note.filename}]\n${result.text}`;
+        }));
+      } catch {
+        setPendingAttachments((prev) => mergeAttachments(prev, attached));
+        setComposerPrefill((previous) => ({ text, id: (previous?.id ?? 0) + 1 }));
+        setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-end' }));
+        toast.error('강의 노트를 읽지 못했습니다. 파일을 확인하고 다시 보내 주세요.');
+        return;
+      }
+    }
+    const attachLines = nonImageAttachments.filter((e) => !isLectureNoteAttachment(e))
       .map((e) => (e.path ? `[attached] ${e.path}` : ''))
       .filter((line) => line.length > 0);
-    const composedText = attachLines.length > 0
-      ? `${attachLines.join('\n')}\n\n${text}`.trimEnd()
-      : text;
+    const composedText = [...extractedNotes, ...attachLines, text].filter(Boolean).join('\n\n');
     // Build the multi-part block list when we have images to ship.
     // Q1=B order: text first, then images. Each image fetch is the
     // composer's responsibility — bytes flow through the daemon
@@ -1321,6 +1336,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         onClear={() => updateQueue(clearChatQueue())}
       />
       <ChatInput
+        responseActive={pending}
         onSubmit={handleSubmit}
         prefill={composerPrefill}
         attachments={pendingAttachments}

@@ -254,8 +254,8 @@ describe('next TUI on N03 (this tree · fake LLM)', () => {
       const r = await runNextTuiScenario({ scenario: 'next-queue', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
       expect(r.checks).toEqual({
         queueShownWhileBusy: true, userTurnsInOrder: true, threeReplies: true, draftKept: true,
-        escCancelsWithoutShellConfirmation: true, escRestoresQueue: true,
-        escRestoresQueueAndDraft: true, queueRestoreEventCarriesRestoredCount: true,
+        escCancelsWithoutShellConfirmation: true, escKeepsUnsentDraft: true, // #38802 실측 계약 — Esc는 중단+미전송 초안 잔류(«복원» 아님)
+        escWakesQueuedTurn: true, queueDispatchEventCarriesWake: true, // 깨움 경로는 queue-dispatched(entry.ts:1702) · queue-restored 폐기
         onlyFakeProvider: true, exitedClean: true,
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
