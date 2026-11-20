@@ -28,8 +28,8 @@ cases:
         baselineRecheck: true
         stalledShards: [{ shard: 3, files: [src/example.test.ts], reason: no-output }]
     expect:
-      status: failed
-      mustVisit: [gate, gate-triage, traffic-failed-restore, failed]
+      status: awaiting-approval
+      mustVisit: [gate, gate-triage, gate-heal-decision]
       mustNotVisit: [publish, npm-publish]
   - id: stopped-gate-waiver-resumes-existing-release-cli
     mode: owner-waive-unmeasured-gate

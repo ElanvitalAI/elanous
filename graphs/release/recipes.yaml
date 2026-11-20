@@ -4,6 +4,11 @@ version-release:
 # RELEASE-RESUME-AFTER-CUT-PUSHED: the cut (no inline prebuild) and the pod prebuild are separate
 # nodes so a prebuild failure can resume at gate-image-prebuild without re-cutting the branch.
 # Legacy `version-release` (cut + inline prebuild) stays for old run states.
+# RELEASE-TRAFFIC-PREP-T1H: the entry holds until cutAt−1h when started early; 0 disables the command timeout
+# (same unbounded hold as readiness-countdown). The manual `elanous release traffic-prep` remains the fallback.
+traffic-prep:
+  command: 'bun scripts/release-loop/traffic-prep-node.ts'
+  timeout_ms: 0
 cut-branch:
   command: 'bun scripts/release-loop/version-node.ts release --no-prebuild --json'
   timeout_ms: 1800000

@@ -127,6 +127,79 @@ test('(a) citable partial evidence streams one partial-marked early answer; the 
   expect(sink.status.some(line => line.startsWith('근거 수집 중'))).toBe(false);
 });
 
+/** GROUNDING-PARTIAL-PREFIX-HONEST: the early answer is only the answer while research still runs. The 일부 검색이
+ * 불완전 header is shown solely from the structured search state (ok / error / failedEvidenceCount / sources). */
+async function runEarlyAnswerWith(partial: Record<string, unknown>) {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'research.turn') events.push({ event, data: (data ?? {}) as Record<string, unknown> });
+  });
+  let calls = 0;
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
+    calls += 1;
+    const text = calls === 1 ? `Early outlook from ${partialUrl} so far.\n` : `Full outlook from ${fullUrl}\n`;
+    handlers.onText(text, text);
+    return text;
+  });
+  const pending = runCoreTurn(context(request, sink), { runResearch: research.runResearch, timers: manualTimers().timers });
+  await until(() => research.hooks() !== undefined);
+  research.hooks()!.onPartialEvidence!(partial as never);
+  await until(() => events.some(entry => entry.event === 'grounding-first-early-answer-ready'));
+  const early = sink.visible.at(-1)!;
+  const first = sink.visible[0]!;
+  research.resolve(fullEvidence);
+  await pending;
+  return { early, first, events };
+}
+
+test('(a2) healthy partial evidence (ok, source, no error): the early answer has no incomplete-search header', async () => {
+  const { early, first, events } = await runEarlyAnswerWith({ ok: true, output: partialEvidence.output, sourceUrls: [partialUrl] });
+  expect(early.includes(GROUNDING_PARTIAL)).toBe(false);
+  expect(first).toContain('Early outlook');
+  expect(early).toContain(partialUrl);
+  expect(events.find(entry => entry.event === 'grounding-partial-prefix')?.data).toMatchObject({ shown: false, reason: 'healthy' });
+});
+
+test('(a3) the real in-progress snapshot (still collecting, no failed evidence) is not a failure: no header', async () => {
+  const { early, events } = await runEarlyAnswerWith({
+    ok: false, output: partialEvidence.output, sourceUrls: [partialUrl],
+    error: 'partial evidence: research is still collecting', collecting: true, failedEvidenceCount: 0,
+  });
+  expect(early.includes(GROUNDING_PARTIAL)).toBe(false);
+  expect(events.find(entry => entry.event === 'grounding-partial-prefix')?.data).toMatchObject({ shown: false, reason: 'healthy' });
+});
+
+test('(a4) a structured shortfall still shows the header: failed evidence, a real error, or a non-ok partial', async () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ ok: false, output: partialEvidence.output, sourceUrls: [partialUrl], collecting: true, failedEvidenceCount: 1 }, 'search-failed'],
+    [{ ok: true, output: partialEvidence.output, sourceUrls: [partialUrl], error: 'axis search timed out' }, 'search-error'],
+    [{ ok: false, output: partialEvidence.output, sourceUrls: [partialUrl] }, 'not-ok'],
+  ];
+  for (const [partial, reason] of cases) {
+    mock.restore();
+    const { early, first, events } = await runEarlyAnswerWith(partial);
+    expect(first).toBe(GROUNDING_PARTIAL + '\n\n');
+    expect(early.startsWith(GROUNDING_PARTIAL)).toBe(true);
+    expect(events.find(entry => entry.event === 'grounding-partial-prefix')?.data).toMatchObject({ shown: true, reason });
+  }
+});
+
+test('(a5) a search-failed shortfall with structured failedAxes names the axis; without failedAxes the fixed header stays', async () => {
+  const named = await runEarlyAnswerWith({
+    ok: false, output: partialEvidence.output, sourceUrls: [partialUrl], collecting: true, failedEvidenceCount: 1, failedAxes: ['환율 전망 축'],
+  });
+  expect(named.first).toContain('환율 전망 축');
+  expect(named.early.includes(GROUNDING_PARTIAL)).toBe(false);
+  mock.restore();
+  const healthy = await runEarlyAnswerWith({
+    ok: false, output: partialEvidence.output, sourceUrls: [partialUrl], collecting: true, failedEvidenceCount: 0, failedAxes: [],
+  });
+  expect(healthy.early.includes('환율 전망 축')).toBe(false);
+  expect(healthy.early.includes(GROUNDING_PARTIAL)).toBe(false);
+});
+
 test('(b) no citable evidence by the soft deadline: one honest elapsed-time status, no model answer', async () => {
   const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
   const research = heldResearch();
@@ -387,7 +460,8 @@ test('(g) 1121 PLAN-LATENCY: original-question evidence opens the early answer w
   expect(searched).toEqual([[request]]);
   expect(seedSignals[0]!.aborted).toBe(false);
   expect(prompts[0]).toContain(partialUrl);
-  expect(sink.visible.at(-1)!.startsWith(GROUNDING_PARTIAL)).toBe(true);
+  // GROUNDING-PARTIAL-PREFIX-HONEST: a still-collecting snapshot with no failed evidence is not an incomplete search.
+  expect(sink.visible.at(-1)!.includes(GROUNDING_PARTIAL)).toBe(false);
   expect(sink.replaced).toEqual([]);
 
   releasePlan(JSON.stringify({ outputContract: ladderContract, questions: planQuestions }));

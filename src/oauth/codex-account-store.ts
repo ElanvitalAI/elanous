@@ -5,6 +5,7 @@
 //   (조회는 되는데 실행은 안 되던 그 자리 · MANUAL-llm-provider-operations §3a).
 // ⛔ 토큰 «값»은 어디에도 출력하지 않는다 — accountId 앞 8자만(R-LLM2).
 
+import { currentCodexAccountOverride } from './codex-account-override.js';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { hostname } from 'node:os';
@@ -745,6 +746,9 @@ export function resolveCodexAccountForRun(
   // ⛔ 「이름만 주고 홈을 안 준」 경우를 정본 기록으로 메운다 — 안 그러면 조용히 default 로 떨어지고
   //   관측은 `explicit` 이라 말한다(2026-08-11 72차 실측).
   const storePathForHome = deps.storePath ?? codexAccountReadStorePath(authStorePath());
+  // 관문이 고른 행(호출 범위 override)은 «명시 env 가 없을 때만» 명시와 같이 취급한다(우선순위 근거: codex-account-override.ts).
+  const gateAccount = currentCodexAccountOverride();
+  if (gateAccount !== undefined && !env.ELANOUS_CODEX_ACCOUNT?.trim()) env = { ...env, ELANOUS_CODEX_ACCOUNT: gateAccount };
   const current = resolveCodexAccount(env, { storedHome: (key) => loadTokens(key, storePathForHome)?.codexHome });
   const explicit = Boolean(env.ELANOUS_CODEX_ACCOUNT?.trim());
   // ⛔⭐ 사람이 «명시»했으면 고정보다 «먼저» 이긴다(결정 ③) — 고정을 읽지도 쓰지도 않는다.

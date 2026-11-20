@@ -1,0 +1,13 @@
+{
+  "id": "llm-sim-supply-targets",
+  "name": "LLM sim supply targets",
+  "implementation": ["src/ux-sim/llm-provider-world/supply-remote.ts"],
+  "tests": ["src/ux-sim/llm-provider-world/supply-remote.test.ts"],
+  "target": "fake pod, ta and config-dir vault supply targets for the LLM provider simulation world: allow or refuse a vault item with the real supply.ts reasons, list leases without any value",
+  "inputs": ["a vault item name", "a sim clock", "a supply policy"],
+  "observations": ["supply returns ok with a leaseId or a refusal reason", "leases lists name, leaseId and expiresAt only", "revoke or the clock passing the TTL empties the list"],
+  "entryCommands": ["bun test src/ux-sim/llm-provider-world/supply-remote.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -105,6 +105,8 @@ export function runGuardian(spec: GuardianSpec, ctx: GuardianContext): GuardianV
         'shell-argv ask-op demoted to deny — unmanned fail-closed · HITL 승인 요청은 후속 칸 (TC #92362)',
       ],
       auditPayload: verdict.auditPayload,
+      // APPROVAL-REQUEST-PLAINTEXT-TARGET — 강등돼도 요청 문면(대상 평문)은 호출자에게 남긴다.
+      ...(verdict.approvalRequest !== undefined ? { approvalRequest: verdict.approvalRequest } : {}),
     };
     policyName = `${policyName}-ask-op-denied`;
   }

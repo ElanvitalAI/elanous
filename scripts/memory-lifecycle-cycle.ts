@@ -20,7 +20,7 @@ import { openKnowledgeDb, defaultEmbed, pruneKnowledge } from '../src/domains/kn
 import { getUserConfig } from '../src/user-config.js';
 import { promoteSessionRecaps, consolidateEpisodes } from '../src/domains/memory-consolidate.js';
 import { ensureArchiveTable, archiveColdEvents } from '../src/domains/memory-archive.js';
-import { runMemoryLifecycle, summarizeLifecycle } from '../src/domains/memory-lifecycle.js';
+import { runMemoryLifecycle, summarizeLifecycle, runAllCleanups } from '../src/domains/memory-lifecycle.js';
 import { recordAutonomousActionSafe } from '../src/domains/autonomy-log.js';
 import { sendOutbound } from '../src/domains/outbound-alert.js';
 
@@ -31,20 +31,32 @@ function log(s: string): void {
 }
 
 async function main(): Promise<void> {
-  log('=== memory-lifecycle 시작 (REM/미엘린 회고 루프) ===');
-  const sdb = openSurfaceEventsDb();
-  const kdb = openKnowledgeDb();
-  ensureArchiveTable(sdb);
+  // 관측 — cron-run 래퍼의 logs.db 싱크는 «래퍼 프로세스» 에만 붙는다(자식은 별도 프로세스).
+  //   이 자식이 스스로 싱크를 달아야 debug.log('memory.lifecycle') 가 logs.db 에 남는다(fail-open).
+  let offSink: (() => void) | null = null;
   try {
+    const { registerLogStoreSink, setLogInstanceName } = await import('../src/mss/logging/log-store.js');
+    const lc = getUserConfig().logs;
+    setLogInstanceName(lc.instanceName);
+    offSink = registerLogStoreSink((s) => debug.registerSink(s), 'scheduler', lc.retention);
+  } catch { /* fail-open */ }
+  log('=== memory-lifecycle 시작 (REM/미엘린 회고 루프) ===');
+  // 싱크 등록 뒤 «전 경로» 를 한 try 로 감싼다 — DB open·본 작업·close 어디서 던져도 finally 가 싱크를 해제한다.
+  let sdb: ReturnType<typeof openSurfaceEventsDb> | null = null;
+  let kdb: ReturnType<typeof openKnowledgeDb> | null = null;
+  try {
+    const db = (sdb = openSurfaceEventsDb());
+    const kn = (kdb = openKnowledgeDb());
+    ensureArchiveTable(db);
     const report = await runMemoryLifecycle({
-      replay: () => activeRecallReplay(sdb),                                // 축B 활동의존 replay(decay 前·중요/신규 강화)
-      decay: () => applyMemoryDecay(sdb),                                   // M1 tier 재계산(강등만)
-      rif: () => retrievalInducedForgetting(sdb),                          // 축B RIF 경쟁 억제(decay 後·archive 前)
-      recaps: () => promoteSessionRecaps(sdb),                             // M4 세션 recap(증분 consolidated=0)
-      consolidate: () => consolidateEpisodes(sdb, kdb, { embed: defaultEmbed }), // M3 에피소드 umbrella
-      archive: () => archiveColdEvents(sdb),                              // M2 Glacier(cold→S3·복원가능)
-      pruneEvents: () => pruneStaleEvents(sdb),                           // 오래+안중요+미회상만
-      pruneKnowledge: () => pruneKnowledge(kdb),
+      replay: () => activeRecallReplay(db),                                // 축B 활동의존 replay(decay 前·중요/신규 강화)
+      decay: () => applyMemoryDecay(db),                                   // M1 tier 재계산(강등만)
+      rif: () => retrievalInducedForgetting(db),                          // 축B RIF 경쟁 억제(decay 後·archive 前)
+      recaps: () => promoteSessionRecaps(db),                             // M4 세션 recap(증분 consolidated=0)
+      consolidate: () => consolidateEpisodes(db, kn, { embed: defaultEmbed }), // M3 에피소드 umbrella
+      archive: () => archiveColdEvents(db),                              // M2 Glacier(cold→S3·복원가능)
+      pruneEvents: () => pruneStaleEvents(db),                           // 오래+안중요+미회상만
+      pruneKnowledge: () => pruneKnowledge(kn),
     });
     const summary = summarizeLifecycle(report);
     log(`결과: ${summary}`);
@@ -57,7 +69,7 @@ async function main(): Promise<void> {
     if (retroSweepCfg?.missionRetroSweep !== false) {
       try {
         const { sweepMissionRetrospectives } = await import('../src/autopilot/mission-retrospect.js');
-        const sweep = await sweepMissionRetrospectives({ db: sdb });
+        const sweep = await sweepMissionRetrospectives({ db });
         log(`미션 회고 sweep: 신규 각인 ${sweep.retrospected.length}·skip ${sweep.skipped}(scan ${sweep.scanned})`);
       } catch (e) { log(`미션 회고 sweep 오류: ${e instanceof Error ? e.message : String(e)}`); }
     }
@@ -68,14 +80,14 @@ async function main(): Promise<void> {
     if (getUserConfig().taste?.captureEnabled) {
       try {
         const { syncTasteVectors } = await import('../src/domains/taste-model.js');
-        const ts = await syncTasteVectors({ surfaceDb: sdb, knowledgeDb: kdb, embed: defaultEmbed });
+        const ts = await syncTasteVectors({ surfaceDb: db, knowledgeDb: kn, embed: defaultEmbed });
         log(`taste 벡터 sync: 신규 ${ts.embedded}·skip ${ts.skipped}`);
 
         // ★ P6 능동 제안 gate — sync 직후 창발 테마 제안(config proposeEnabled 게이트·기본 OFF).
         //   ★ gate 는 제안만 — 미션 생성/승인은 대표(HITL). 신규 제안을 텔레그램(report)으로 표면화.
         if (getUserConfig().taste?.proposeEnabled) {
           const { runProposalGate } = await import('../src/domains/taste-propose.js');
-          const proposals = runProposalGate({ surfaceDb: sdb, knowledgeDb: kdb });
+          const proposals = runProposalGate({ surfaceDb: db, knowledgeDb: kn });
           if (proposals.length) {
             const body = proposals.map((p, i) => `${i + 1}. ${p.label} (강도 ${p.score.toFixed(2)})\n   ${p.rationale}`).join('\n\n');
             const msg = `💡 taste 제안 ${proposals.length}건 — 반복 관심에서 창발한 미션 후보입니다.\n(제안일 뿐 미션 생성 아님 · 승인/기각: \`/taste approve <테마>\` · \`/taste reject <테마>\`)\n\n${body}`;
@@ -114,7 +126,15 @@ async function main(): Promise<void> {
       refs: { log: LOG },
     });
     log('=== memory-lifecycle 완료 ===');
-  } finally { sdb.close(); kdb.close(); }
+  } finally {
+    // open/close/해제 각각 독립 — 하나가 던져도 나머지는 끝까지 돈다.
+    const errs = runAllCleanups([
+      { name: 'close-surface-db', fn: () => sdb?.close() },
+      { name: 'close-knowledge-db', fn: () => kdb?.close() },
+      { name: 'unregister-sink', fn: () => offSink?.() },
+    ]);
+    for (const e of errs) log(`정리 오류 ${e.stage}: ${e.error}`);
+  }
 }
 
 main().catch((e) => { log(`치명 오류: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); });

@@ -11,6 +11,7 @@ export const RELEASE_NODE_COMMANDS: Readonly<Record<string, Readonly<{ recipe: s
   cutoff: { recipe: 'cmd:cutoff', command: 'bun scripts/release-loop/node-verdict.ts cutoff' },
   'rla-cloud-join': { recipe: 'cmd:cloud-join', command: 'bun scripts/release-loop/hand-response-node.ts rla-cloud-join' },
   'checklist-gate': { recipe: 'cmd:checklist-gate', command: 'bun scripts/release-loop/checklist-gate-node.ts' },
+  'regression-suite': { recipe: 'cmd:regression-suite', command: 'bun scripts/release-loop/regression-suite-node.ts' },
   tsc: { recipe: 'cmd:tsc', command: 'bun run scripts/ci-typecheck-changed.ts' },
   ratchet: { recipe: 'cmd:ratchet', command: 'bash scripts/ratchets/train-side-invariants.sh' },
   prefetch: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },

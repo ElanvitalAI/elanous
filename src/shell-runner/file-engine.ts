@@ -31,6 +31,7 @@
 
 import { requirePosixShell } from '../platform/default-shell.js';
 import { shellChildEnv } from './child-env.js';
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import {
   spawn as nodeSpawn,
   type ChildProcessWithoutNullStreams,
@@ -169,11 +170,7 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
     timedOut = true;
     interrupted = true;
     outcome = 'timeout';
-    try { child.kill('SIGTERM'); } catch { /* ignore */ }
-    setTimeout(() => {
-      if (settled) return;
-      try { child.kill('SIGKILL'); } catch { /* ignore */ }
-    }, 2000);
+    void terminateTree(child, { group: true });
     // Let 'exit' finalize. But if the child somehow refuses even
     // SIGKILL, force-resolve here after one more second so the
     // Promise is never orphaned.
@@ -189,7 +186,7 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
       if (settled) return;
       interrupted = true;
       outcome = 'aborted';
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      void terminateTree(child, { group: true });
     };
     if (req.signal.aborted) onAbort();
     else req.signal.addEventListener('abort', onAbort, { once: true });
@@ -237,7 +234,8 @@ function startRun(req: ShellRequest, ctx: RunCtx, opts: FileEngineOpts): ShellHa
       if (settled) return;
       interrupted = true;
       outcome = 'aborted';
-      try { child.kill(signal ?? 'SIGTERM'); } catch { /* ignore */ }
+      // Both allowed signals (SIGTERM|SIGKILL) address the whole detached group.
+      void terminateTree(child, { group: true, firstSignal: signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM' });
     },
     background() {
       if (settled || status !== 'running') return false;
@@ -409,6 +407,8 @@ function spawnChild(
     cwd: req.cwd,
     env: shellChildEnv(process.env, req.env) as NodeJS.ProcessEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
+    // own process group → terminateTree can kill the whole tree (and only it).
+    detached: process.platform !== 'win32',
   };
   if (typeof req.command === 'string') {
     return spawnFn(

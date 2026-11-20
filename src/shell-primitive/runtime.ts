@@ -22,6 +22,7 @@ import {
   rememberDecision,
 } from './approval-cache.js';
 import { recordAudit } from './audit-log.js';
+import { terminateTree } from './terminate-tree.js';
 import { applySandbox, SandboxUnavailableError } from './sandbox.js';
 import { getSessionCwd } from '../session/working-dir.js';
 import { classifyDestructive, type GuardianFinding } from '../ask-user-question/guardian.js';
@@ -260,6 +261,8 @@ function spawnSafely(
       cwd,
       env: { ...process.env, ...(env ?? {}) },
       shell: false,
+      // own process group → terminateTree kills the whole tree (and only it).
+      detached: process.platform !== 'win32',
     });
   } catch (err) {
     return err instanceof Error ? err : new Error(String(err));
@@ -307,8 +310,7 @@ function collectOutput(
         if (settled) return;
         outcome = 'timeout';
         reportShellWatchdog(fired, { pid: child.pid ?? null });
-        try { child.kill('SIGTERM'); } catch { /* already gone */ }
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ok */ } }, KILL_ESCALATE_MS).unref();
+        void terminateTree(child, { group: true, graceMs: KILL_ESCALATE_MS });
         // An escaped grandchild can hold the pipe open past the kill; force the result.
         setTimeout(() => {
           if (settled) return;
@@ -322,7 +324,7 @@ function collectOutput(
 
     const onAbort = () => {
       if (outcome === 'exit') outcome = 'aborted';
-      try { child.kill('SIGTERM'); } catch { /* ok */ }
+      void terminateTree(child, { group: true, graceMs: KILL_ESCALATE_MS });
     };
     let outerDisposer: (() => void) | null = null;
     if (outerSignal) {

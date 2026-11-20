@@ -66,7 +66,7 @@ function sharedCardAttachmentFixture(): AttachmentMeta {
   return { id: 'shared-card', filename: source.name, size: source.size, mediaType: source.type, downloadUrl: '/v1/attachments/shared-card' };
 }
 
-async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean; mobileSimple?: boolean; actions?: boolean; search?: string; failStorageKey?: string; sessionStore?: Storage; localDraft?: string; cardOutcome?: 'done' | 'failed'; restoreFailure?: boolean; restorePending?: boolean }) {
+async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean; mobileSimple?: boolean; actions?: boolean; search?: string; failStorageKey?: string; sessionStore?: Storage; localDraft?: string; cardOutcome?: 'done' | 'failed'; restoreFailure?: boolean; restorePending?: boolean; bare?: boolean }) {
   const sessionStorage = opts.sessionStore ?? storage(opts.failStorageKey);
   const localStorage = storage();
   if (opts.localDraft !== undefined) localStorage.setItem('elanous.pwa.snapshot.chatInput.singleton', JSON.stringify(opts.localDraft));
@@ -82,7 +82,8 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     }),
   });
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: localStorage });
-  Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: Object.assign(new EventTarget(), opts.bare ? { querySelector: () => ({ getAttribute: () => '1' }) } : {}) });
+  const acpConnects: string[] = [];
   const requests: Array<{ method: string; body: unknown }> = [];
   const restoreRequests: string[] = [];
   let rejectRestore: ((error: Error) => void) | undefined;
@@ -118,7 +119,7 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     }) } as Response;
   }) as typeof fetch;
   const client = {
-    connectAcp: () => { if (!opts.acp) throw new Error('no ACP'); return acp; },
+    connectAcp: () => { acpConnects.push('c'); if (!opts.acp) throw new Error('no ACP'); return acp; },
     voiceWsUrl: () => '',
     voiceCost: async () => ({}),
     fetchJson: async (path: string) => {
@@ -159,7 +160,7 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
   const renderChat = (sessionId: string) => <DaemonContext.Provider value={{ ...daemon, sessionId }}><ChatLayout {...(opts.leading ? { leading: <button aria-label="대화 목록">☰</button> } : {})} {...(opts.mobileSimple ? { mobileSimple: true, mobileActivity: { kind: 'active' as const, run: { subjectId: 'task', runId: 'run-1', origin: 'system' as const, progressLine: '구현 중', progressStatus: 'running' as const, href: '/live-run?run=run-1' }, extraLiveCount: 0 }, conversationButton: <button aria-label="대화 목록">☰</button> } : {})} /></DaemonContext.Provider>;
   await act(async () => { tree = create(renderChat('session-1')); });
   const input = tree!.root.findByType(ChatInput);
-  return { requests, restoreRequests, rejectRestore: (error: Error) => rejectRestore?.(error), switchSession: async (sessionId: string) => { await act(async () => { tree!.update(renderChat(sessionId)); }); }, streams, turns, uploads, input, sessionStorage, historyCalls,
+  return { acpConnects, requests, restoreRequests, rejectRestore: (error: Error) => rejectRestore?.(error), switchSession: async (sessionId: string) => { await act(async () => { tree!.update(renderChat(sessionId)); }); }, streams, turns, uploads, input, sessionStorage, historyCalls,
     observer: () => observerHandlers!, receiveAsk: (payload: unknown) => inbound!(payload) };
 }
 
@@ -172,6 +173,15 @@ test('a session store failure is visible instead of being treated as an absent n
     expect(restoreRequests).toContain('/v1/sessions/store/session-1?ifExists=1');
     expect(error).toHaveBeenCalledWith('대화를 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.');
     expect(JSON.stringify(tree!.root.findByType(ChatHistory).props)).not.toContain('session store unavailable');
+  } finally { error.mockRestore(); }
+});
+
+test('bare webchat origin never requests the session store and shows no restore error', async () => {
+  const error = spyOn(toast, 'error').mockImplementation(() => '' as never);
+  try {
+    const { restoreRequests } = await mount({ acp: false, bare: true, restoreFailure: true });
+    expect(restoreRequests).toEqual([]);
+    expect(error).not.toHaveBeenCalled();
   } finally { error.mockRestore(); }
 });
 
@@ -885,4 +895,31 @@ test('lecture text reaches the turn without its raw attachment path', async () =
   expect(body.userText).toContain('삼성전자 | 목표가 80,000원');
   expect(body.userText).toContain('api_key=***');
   expect(body.userText).not.toContain('/tmp/lecture.md');
+});
+
+test('bare webchat compact menu has no dead home/settings links and no unresponsive conversation list button', async () => {
+  await mount({ acp: false, width: 390, mobileSimple: true, bare: true });
+  const root = tree!.root;
+  await act(async () => root.findByProps({ 'aria-label': '채팅 메뉴' }).props.onClick());
+  const menu = root.findByProps({ id: 'chat-mobile-menu' });
+  expect(menu.findAllByProps({ 'aria-label': '채팅 이동' })).toHaveLength(0);
+  expect(menu.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(0);
+});
+
+test('bare webchat origin (server meta) never opens ACP and runs the turn over SSE', async () => {
+  const { acpConnects, input, requests, streams } = await mount({ acp: true, bare: true });
+  expect(acpConnects).toHaveLength(0);
+  await act(async () => { input.findByType('textarea').props.onChange({ target: { value: 'hello' } }); });
+  await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
+  expect(acpConnects).toHaveLength(0);
+  expect(requests.filter((r) => r.method === 'session/prompt')).toHaveLength(0);
+  expect(streams).toHaveLength(1);
+});
+
+test('normal origin keeps the ACP path (connectAcp opened, no SSE turn)', async () => {
+  const { acpConnects, input, streams } = await mount({ acp: true });
+  expect(acpConnects.length).toBeGreaterThan(0);
+  await act(async () => { input.findByType('textarea').props.onChange({ target: { value: 'hello' } }); });
+  await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
+  expect(streams).toHaveLength(0);
 });

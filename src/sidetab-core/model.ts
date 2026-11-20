@@ -10,7 +10,7 @@ const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
 export type SidetabBadge = 'busy' | 'idle' | 'stale' | 'unknown' | 'exited';
 /** What an agent PTY is doing, as `elanous pty state` reports it (Next TUI src/tui/sidetab/agent-state.ts). */
-export type SidetabAgentState = 'working' | 'idle' | 'blocked' | 'waiting' | 'done';
+export type SidetabAgentState = 'working' | 'idle' | 'blocked' | 'waiting' | 'done' | 'stalled';
 
 export interface SidetabControlInput {
   readonly accessMode: 'read' | 'write' | 'auto';

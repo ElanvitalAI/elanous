@@ -19,7 +19,7 @@
  * sendBeacon 으로 마지막 배치 flush.
  */
 import { authRequiredNow } from './auth-required';
-import { loadDaemonConfig } from './daemon-config';
+import { loadDaemonConfig, surfaceForwards } from './daemon-config';
 
 let enabled = true; // PWA default on; toggleable via setDebugEnabled(false)
 
@@ -297,6 +297,8 @@ export class DebugForwarder {
 /** Page-leave send: a keepalive fetch outlives the page and, unlike sendBeacon, carries the token. Fire and forget. */
 function keepalivePost(body: string): boolean {
   if (typeof fetch !== 'function') return false;
+  // OP #113435 — surface does not forward the debug batch: nothing to send, treat as handled.
+  if (!surfaceForwards(ENDPOINT)) return true;
   const { baseUrl, token } = loadDaemonConfig();
   void fetch(`${baseUrl.replace(/\/+$/, '')}${ENDPOINT}`, {
     method: 'POST', keepalive: true, body,
@@ -306,6 +308,8 @@ function keepalivePost(body: string): boolean {
 }
 
 async function defaultPost(body: string): Promise<boolean> {
+  // OP #113435 — surface does not forward the debug batch: handled without a request (queue drains).
+  if (!surfaceForwards(ENDPOINT)) return true;
   // 상대 URL — PWA 는 데몬 origin 에서 서빙(same-origin auth 통과). HMR
   // dev(:3210 cross-origin)에선 404 → 실패로 큐 유지(콘솔은 불변).
   // The stored connection's token, like every other request (a tailnet device has no same-origin cookie).

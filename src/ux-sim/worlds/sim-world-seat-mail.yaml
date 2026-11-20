@@ -1,0 +1,4 @@
+# SIM-WORLD seat-mail pack — empty: the seat-mail scenarios run from src/ux-sim/sim-world/seat-mail/ with their own expect.json (kernel `all` needs the file to exist).
+schema: 1
+world: seat-mail
+scenarios: []

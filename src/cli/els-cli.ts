@@ -12,9 +12,11 @@ import { dirname, join } from 'node:path';
 import type { Command } from 'commander';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createAttachApp, type AttachAppDeps } from '../els/attach-app.js';
-import { attachEls } from '../els/attach-client.js';
-import { createKeyDecoder, createPrefixFilter, drawView, ENTER_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
+import { attachEls, isServerAway, noteAfterFrame, RECONNECT_NOTE } from '../els/attach-client.js';
+import { guardLeave, realProcess } from '../els/attach-leave.js';
+import { createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
 import { requestEls } from '../els/client.js';
+import { readPipedStdin } from './piped-stdin.js';
 import { grepScreens, type GrepHit, type GrepScreen } from '../els/pane-grep.js';
 import type { ElsResult } from '../els/core.js';
 import { tabBadge } from '../els/tab-badge.js';
@@ -26,10 +28,13 @@ import { createFederation } from '../els/federation.js';
 import { elsJournalPath, findPane, loadJournal } from '../els/journal.js';
 import { emptyJournal } from '../els/space.js';
 import { withHerdrHost } from '../els/herdr-host.js';
+import { importHerdr } from '../els/herdr-import.js';
+import { defaultHerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { herdrCreated, herdrPanes, herdrTabs, herdrWorkspaces } from '../els/herdr-shape.js';
 import { keysToBytes } from '../els/keys.js';
 import { elsHostsPath, fetchHostJson, loadHostRegistry } from '../els/hosts.js';
 import { parseHttpBind } from '../els/http.js';
+import { humanOwnerToken } from '../els/human-terminal-auth.js';
 import { insideElsPane, NESTED_ELS_MESSAGE } from '../els/nesting.js';
 import { createControlledBackend, createSocketBackend, serveElsMcpStdio } from '../els/mcp-serve.js';
 import { serveElsAcpStdio } from '../acp/els-acp-serve.js';
@@ -164,6 +169,15 @@ export function skillVerbs(side: Command): SkillVerb[] {
   return verbs;
 }
 
+/** `els ls` lines from the federated list JSON — one per pane: address, state, badge, title, build, cwd. The badge is the one the pane's own els server computed
+ *  (its clock, so a remote host's stall is judged there); a list without it falls back to the stall rule on `lastEventAtMs` and `nowMs`. */
+export function paneListLines(listJson: string, nowMs: number): string[] {
+  const listed = JSON.parse(listJson) as { panes: { address: string; title: string; state: string; cwd: string; badgeLabel?: string; lastEventAtMs?: number; build?: { sha?: string | null; age?: string } }[] };
+  return listed.panes.length === 0
+    ? ['els: no panes yet — open one with `els new` (defaults: $SHELL, this folder)']
+    : listed.panes.map((row) => `${row.address}  ${row.state.padEnd(7)} ${row.badgeLabel ?? tabBadge({ state: row.state as PaneState, ...(row.lastEventAtMs === undefined ? {} : { lastEventAtMs: row.lastEventAtMs }) }, nowMs).label} ${row.title} [자체보고·미인증:${row.build?.sha?.slice(0, 7) ?? 'unknown'} ${row.build?.age ?? 'unknown'}]  ${row.cwd}`);
+}
+
 export function registerElsCommands(program: Command): void {
   const side = program.command('side').description('Elanous Side (els) — workspaces, tabs and panes in one screen; the command is `els`. In a terminal, bare `els` opens the whole screen.');
   // `els` with no arguments: make sure a server answers (supervisor, installed on first use), then show the spaces.
@@ -181,15 +195,25 @@ export function registerElsCommands(program: Command): void {
     const ready = await ensureServer(supervisorDeps());
     if (!ready.ok) { emit({ exitCode: 1, message: ready.message }); return; }
     // In a terminal: the whole screen at once, spaces on the left, the live pane on the right (herdr's way in).
-    if (!options.list && process.stdin.isTTY && process.stdout.isTTY) { process.exitCode = await runAppView(options.side); return; }
+    if (!options.list && process.stdin.isTTY && process.stdout.isTTY) { adoptOwnerCredential(); process.exitCode = await runAppView(options.side); return; }
     const answer = await federation().list();
     if (answer.exitCode !== 0) { emit(answer); return; }
-    const listed = JSON.parse(answer.message) as { panes: { address: string; title: string; state: string; cwd: string; build?: { sha?: string | null; age?: string } }[] };
-    const lines = listed.panes.length === 0
-      ? ['els: no panes yet — open one with `els new` (defaults: $SHELL, this folder)']
-      : listed.panes.map((row) => `${row.address}  ${row.state.padEnd(7)} ${tabBadge({ state: row.state as PaneState }, Date.now()).label} ${row.title} [자체보고·미인증:${row.build?.sha?.slice(0, 7) ?? 'unknown'} ${row.build?.age ?? 'unknown'}]  ${row.cwd}`);
-    emit({ exitCode: 0, message: lines.join('\n') });
+    emit({ exitCode: 0, message: paneListLines(answer.message, Date.now()).join('\n') });
   });
+  // `els seat set OP`: a `seat` command with a `set` subcommand (a single `seat set <seat>` string would register `seat`
+  // taking the two arguments <set> <seat>, so the documented form failed with "only OP is supported").
+  const seatGroup = side.command('seat').description('Seat registration: `els seat set OP`');
+  const seatCmd = seatGroup.command('set <seat>').description('register the OP seat — the server owner\'s explicit act from the person\'s terminal (JUD #39057 ⓒ1③)');
+  seatCmd.action(async (seat: string) => {
+    // The owner credential lives next to the socket (written at serve start); this terminal is not a pane.
+    const ownerTokenFile = join(dirname(elsSocketPath()), 'owner-token');
+    try { process.env.ELANOUS_ELS_OWNER_TOKEN = readFileSync(ownerTokenFile, 'utf-8').trim(); }
+    catch { console.error('els seat set: no owner token found — no els server state in this directory'); process.exitCode = 1; return; }
+    const reply = await requestEls(elsSocketPath(), { op: 'seat-set', seat });
+    if (reply.message) console.log(reply.message);
+    process.exitCode = reply.exitCode ?? 1;
+  });
+
   const supervisor = side.command('supervisor').description('The launchd user agent that keeps the els server running: on · off · status');
   supervisor.command('on').description('Install/start the supervisor (and clear "off")')
     .action(async () => emit({ exitCode: 0, message: await supervisorOn(supervisorDeps()) }));
@@ -230,7 +254,8 @@ export function registerElsCommands(program: Command): void {
   // Internal SSH bridge: the remote host still resolves its own state root and owns the PTY.
   side.command('_wake-request', { hidden: true }).action(async () => {
     try {
-      const raw = await Bun.stdin.text();
+      // Piped-only read: a non-piped (TTY or never-closing) stdin returns immediately with empty input instead of blocking fd0 forever (stdin-timeout ledger in readPipedStdin).
+      const raw = await readPipedStdin();
       if (Buffer.byteLength(raw) > 65536) throw new Error('wake request too large');
       const r = JSON.parse(raw) as Record<string, unknown>;
       let request: ElsRequest;
@@ -287,6 +312,9 @@ export function registerElsCommands(program: Command): void {
   side.command('send <pane> <text>')
     .description('Type text into a live pane and press Enter (--no-enter: text only)')
     .option('--no-enter', 'do not press Enter after the text')
+    // #38988 (main, newer than #90792 13:54) — the person CLI send presses Enter through the verified paste
+    // path (raw text intact as a bracketed paste, turn start observed). The machine paths keep the #38608
+    // must ② split: cleaned `send` types text only, raw `input` (attach, `els pane run`/`send-keys`) presses keys.
     .action((pane: string, text: string, opts: { enter: boolean }) => ask(opts.enter ? { op: 'send-verified', pane, text } : { op: 'send', pane, text }));
   side.command('do <pane> <text>')
     .description('Type a line into a pane (local, ws/tab/pane or host:ws/tab/pane): marked «⇢ from · text», queued while the pane\'s turn is running. A local pane walks the control door first (default deny).')
@@ -300,6 +328,13 @@ export function registerElsCommands(program: Command): void {
       ask: askHitlOnTerminal(HITL_TIMEOUT_MS),
     }, pane, text)));
 
+  // Classic PTY capture on the thin els connection: the owner reuses src/capture + src/tool-runtime/pty-recording-runtimes.
+  side.command('snapshot <pane>')
+    .description('Save a pane\'s screen as an svg artifact (classic capture engine): prints {path}')
+    .action((pane: string) => { adoptOwnerCredential(); return ask({ op: 'snapshot', pane }); });
+  side.command('record <pane>')
+    .description('Record a pane\'s PTY output: first call starts (prints {recordingId}), the next call for the pane (even after it was closed) stops and saves the asciicast: prints {path}')
+    .action((pane: string) => { adoptOwnerCredential(); return ask({ op: 'record', pane }); });
   side.command('input <pane> <text>')
     .description('Submit a direct operator line through the owner control door')
     .option('--from <seat>', 'display name only', process.env.ELANOUS_TRACK || process.env.ELANOUS_SEAT || 'unknown')
@@ -340,6 +375,7 @@ export function registerElsCommands(program: Command): void {
         process.exitCode = 2;
         return;
       }
+      adoptOwnerCredential();
       const code = await runAttachView(ref);
       process.exitCode = code;
     });
@@ -350,15 +386,31 @@ export function registerElsCommands(program: Command): void {
     });
   pane.command('read <pane>').description('The pane\'s screen as text').action(async (ref: string) => emit(await federation().read(ref)));
   pane.command('send-text <pane> <text>').description('Type text, no Enter').action((ref: string, text: string) => ask({ op: 'send', pane: ref, text }));
-  pane.command('run <pane> <text>').description('Type text and press Enter').action((ref: string, text: string) => ask({ op: 'send', pane: ref, text: `${text}\r` }));
-  pane.command('send-keys <pane> <keys...>').description('Press keys: enter esc tab space backspace up down left right ctrl+c alt+x …')
+  pane.command('run <pane> <text>').description('Type text and press Enter').action((ref: string, text: string) => ask({ op: 'input', pane: ref, bytes: `${text}\r` })); // #38608 must ② — raw path: Enter must reach the pane
+  pane.command('send-keys <pane> <keys...>').description('Press keys: enter tab space backspace delete up down left right home end pageup pagedown shift+tab … (esc, ctrl+<key>, alt+<key> are refused)')
     .action((ref: string, keys: string[]) => {
       const bytes = keysToBytes(keys);
       if ('unknown' in bytes) { emit({ exitCode: 2, message: `els pane send-keys: unknown key ${bytes.unknown} (nothing was sent)` }); return; }
-      return ask({ op: 'send', pane: ref, text: bytes.bytes });
+      return ask({ op: 'input', pane: ref, bytes: bytes.bytes }); // #38608 must ② — keys are raw control bytes
     });
   pane.command('close <pane>').description('Stop the pane and remove it').action((ref: string) => ask({ op: 'close', pane: ref }));
+  // ELS-HERDR-IMPORT: herdr is read once; the plan is shown and a person says yes; els panes come from the owner's `new`.
+  side.command('import').description('Bring another layout into els').command('herdr')
+    .description('Read this machine\'s herdr workspaces/tabs/panes (cwd), show the plan, ask, then open the missing ones in els (same workspace · tab label · cwd; existing ones skipped; herdr is not changed). Prints a receipt: created · skipped · failed')
+    .action(async () => emit(await importHerdr({
+      run: defaultHerdrCliRunner(process.env),
+      request: (request) => requestEls(elsSocketPath(), request),
+      confirm: askHitlOnTerminal(HITL_TIMEOUT_MS),
+      shell: process.env.SHELL?.trim() || '/bin/sh',
+      lockDir: join(elsControlDir(), 'import-herdr.lock'),
+    })));
 
+}
+
+/** The person's terminal types with the server's owner token (read from the 0600 file next to the socket, like `els seat set`); a pane process keeps its pane token. */
+function adoptOwnerCredential(): void {
+  const token = humanOwnerToken({ env: process.env, socketPath: elsSocketPath(), isTerminal: Boolean(process.stdin.isTTY && process.stdout.isTTY) });
+  if (token) process.env.ELANOUS_ELS_OWNER_TOKEN = token;
 }
 
 /** The terminal side of `els attach`: raw keys → `input`, frames → one repaint, window size → `resize`. Returns the exit code. */
@@ -375,14 +427,17 @@ function runAttachView(ref: string): Promise<number> {
       process.stdout.write(drawView({ screen, cols, rows, status: statusLine(ref, note || undefined) }));
     };
     let finished = false;
+    // ELS-MOUSE-RELEASE: the leave bytes go out once, also when the process dies under the view (SIGHUP/uncaught exception).
+    const leaveGuard = guardLeave({ proc: realProcess, write: (text) => { process.stdout.write(text); }, bytes: LEAVE_PANE_VIEW });
     const finish = (code: number, message: string, keepLastScreen = false): void => {
       if (finished) return;
       finished = true;
+      if (retry) clearTimeout(retry);
       process.stdin.off('data', onKey);
       process.stdout.off('resize', onResize);
       try { process.stdin.setRawMode(false); } catch { /* not a TTY any more */ }
       process.stdin.pause();
-      process.stdout.write(LEAVE_VIEW);
+      leaveGuard.leave();
       // The alternate screen is gone now: when the pane exited, its last screen stays readable in the normal buffer.
       if (keepLastScreen && last) process.stdout.write(`${lastScreenText(last)}\n`);
       if (message) process.stderr.write(`${message}\n`);
@@ -390,20 +445,33 @@ function runAttachView(ref: string): Promise<number> {
     };
     // The pane has one row fewer than the terminal: the status line takes the last one.
     const paneSize = () => { const { cols, rows } = size(); return { cols, rows: Math.max(3, rows - 1) }; };
-    const attached = attachEls(elsSocketPath(), ref, paneSize(), {
-      onFrame: (frame) => paint(frame.screen),
-      // A pane that exits under the view is not a detach: say so and exit 1 (detach is the only 0).
-      onEnd: (exitCode, reason) => finish(1, reason === 'pane exited' ? 'els attach: the pane exited' : (exitCode === 0 ? `els attach: ${reason || 'the stream ended'}` : reason), reason === 'pane exited'),
-      onError: (problem) => { note = problem; paint(last); },
-    });
+    // D1a(ELS-SERVER-RESTART-SURVIVE): a server that went away after the pane was on screen is waited out — the
+    // screen stays, the note says so, and the view re-attaches once a second until the server answers again (every
+    // attach starts with the pane's current screen, so the pane comes back as it was).
+    let everFramed = false;
+    let attached: ReturnType<typeof attachEls> | undefined;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const open = (): void => {
+      attached = attachEls(elsSocketPath(), ref, paneSize(), {
+        onFrame: (frame) => { everFramed = true; note = noteAfterFrame(note); paint(frame.screen); },   // the first recovered frame ends the «다시 붙는 중» note
+        // A pane that exits under the view is not a detach: say so and exit 1 (detach is the only 0).
+        onEnd: (exitCode, reason) => {
+          if (finished) return;
+          if (everFramed && isServerAway(reason)) { note = RECONNECT_NOTE; paint(last); retry = setTimeout(open, 1_000); retry.unref?.(); return; }
+          finish(1, reason === 'pane exited' ? 'els attach: the pane exited' : (exitCode === 0 ? `els attach: ${reason || 'the stream ended'}` : reason), reason === 'pane exited');
+        },
+        onError: (problem) => { note = problem; paint(last); },
+      });
+    };
+    open();
     const onKey = (chunk: Buffer): void => {
       const keys = prefix.feed(decodeKeys(chunk));
-      if (keys.send) attached.input(keys.send);
+      if (keys.send) attached?.input(keys.send);
       if (keys.ignored) { note = `ctrl+b ${keys.ignored} 는 아직 없음`; paint(last); }
-      if (keys.detach) { attached.detach(); finish(0, ''); }
+      if (keys.detach) { attached?.detach(); finish(0, ''); }
     };
-    const onResize = (): void => { const next = paneSize(); attached.resize(next.cols, next.rows); };
-    process.stdout.write(ENTER_VIEW);
+    const onResize = (): void => { const next = paneSize(); attached?.resize(next.cols, next.rows); };
+    process.stdout.write(ENTER_PANE_VIEW);
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on('data', onKey);
@@ -436,6 +504,8 @@ function runAppView(sidebar: boolean | undefined): Promise<number> {
   });
   const onKey = (chunk: Buffer): void => app.key(decodeKeys(chunk));
   const onResize = (): void => app.resized();
+  // ELS-MOUSE-RELEASE: LEAVE_VIEW goes out once — on the app's end, and also when the process dies under the view (SIGHUP/uncaught exception).
+  const leaveGuard = guardLeave({ proc: realProcess, write: (text) => { process.stdout.write(text); }, bytes: LEAVE_VIEW });
   process.stdout.write(ENTER_VIEW);
   process.stdin.setRawMode(true);
   process.stdin.resume();
@@ -447,7 +517,7 @@ function runAppView(sidebar: boolean | undefined): Promise<number> {
     process.stdout.off('resize', onResize);
     try { process.stdin.setRawMode(false); } catch { /* not a TTY any more */ }
     process.stdin.pause();
-    process.stdout.write(LEAVE_VIEW);
+    leaveGuard.leave();
     if (message) process.stderr.write(`${message}\n`);
     return code;
   });

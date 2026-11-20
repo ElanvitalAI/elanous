@@ -12,6 +12,16 @@ function render(message: ChatMessage): string {
 const summaryText = (html: string) => (html.match(/<summary[^>]*>([\s\S]*?)<\/summary>/)?.[1] ?? '').replace(/<[^>]+>/g, '');
 
 describe('minimal chat fake stream', () => {
+  it('streaming early answer lands in the body; the capsule holds only the process (MOB-1 P1)', () => {
+    const html = render({ ...base, text: '초기 답: 메모리 호황 지속.', streaming: true, finalTextStart: 0, blocks: [
+      { kind: 'text', text: '초기 답: 메모리 호황 지속.' },
+      { kind: 'tool_use', id: 't1', name: 'web_search', status: 'running', startedAt: 0 },
+    ] });
+    const [body, capsule = ''] = html.split('<details');
+    expect(body).toContain('초기 답: 메모리 호황 지속.');
+    expect(capsule).not.toContain('초기 답');
+    expect(capsule).toContain('web_search');
+  });
   it('shows DEPLOY-1 receipt status and publishes a safe result link only after published', () => {
     const url = 'https://demo--alice.elanous.app/';
     const simulated = render({ ...base, text: '배포 중…', streaming: true, blocks: [

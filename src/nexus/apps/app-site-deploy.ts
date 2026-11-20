@@ -7,6 +7,7 @@ import { resolveAppDeploymentOwner, type AppMemberOwnerReceipt } from './app-dep
 import { parseAppManifest } from './app-contract.js';
 import { parsePublicAppHost } from '../../relay/relay-server.js';
 import type { AppDeployPublishHook } from '../../agent/app-deploy-plugin.js';
+import { terminateTree } from '../../shell-primitive/terminate-tree.js';
 
 const APP_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const TEMPLATE_ID = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -113,31 +114,21 @@ function runBuildCommand(args: readonly string[], cwd: string): Promise<void> {
       stdio: 'ignore', detached: process.platform !== 'win32',
     });
     let settled = false;
-    let forceTimer: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
-      if (child.pid !== undefined && process.platform !== 'win32') {
-        try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); }
-      } else child.kill('SIGTERM');
-      forceTimer = setTimeout(() => {
-        if (child.pid !== undefined && process.platform !== 'win32') {
-          try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
-        } else child.kill('SIGKILL');
-      }, 5_000);
-      forceTimer.unref();
+      // KILL-TREE-ONE: SIGTERM the group, SIGKILL after the 5s grace — the shared routine.
+      void terminateTree(child, { group: process.platform !== 'win32', graceMs: 5_000, pidFallback: true });
     }, 300_000);
     timer.unref();
     child.once('error', () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (forceTimer) clearTimeout(forceTimer);
       rejectBuild(new Error('app build process failed to start'));
     });
     child.once('close', code => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (forceTimer) clearTimeout(forceTimer);
       if (code === 0) resolveBuild();
       else rejectBuild(new Error('app build failed'));
     });

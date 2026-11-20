@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { onPtyEvent, startPty, unregisterPty } from '../pty-shell/registry.js';
 import type { ElsPty } from './core.js';
 import { createLineDecoder } from './wire.js';
+import { loginEnvForSpawn } from './login-env-handoff.js';
 
 // 출처: sockaddr_un.sun_path 상한 — src/els/server.ts MAX_SOCKET_PATH_BYTES 와 같은 값(holder 소켓 경로가
 // els.sock 보다 길어 서버와 같은 상한으로 거부해야 한다; server.ts 를 import 하면 2번 조각과 순환이 생겨 값 고정).
@@ -75,12 +76,110 @@ export function removeHolderMeta(path: string): void {
   try { unlinkSync(path); } catch { /* already gone */ }
 }
 
+// ── D1b(ELS-SERVER-RESTART-SURVIVE): 화면·스크롤백 스냅샷 ─────────────────────────
+// 출처: seat-state/HAND-TUI-D/evidence/d1a-holder/D1B-DESIGN-screen-scrollback.md — 홀더가 살아 있는
+// 동안 화면·스크롤백을 디바운스로 파일에 남긴다(출력 배치마다 예약). 재부팅이 홀더를 치우면(SIGTERM 정리 →
+// meta 소거) 다음 서버의 재결속이 실패하고, 그때 이 파일이 저장 화면을 상태 줄과 함께 보여준다.
+
+export function holderSnapshotPath(stateRoot: string, paneId: string): string {
+  return join(holdersDir(stateRoot), `${paneId}.snap.json`);
+}
+
+export interface ScreenSnapshot {
+  readonly version: 1;
+  readonly paneId: string;
+  readonly ptyId: string;
+  readonly cols: number;
+  readonly rows: number;
+  readonly screen: string;
+  readonly scrollback: string;
+  readonly savedAt: number;
+}
+
+// 출처: D1B-DESIGN «스크롤백 꼬리(홀더 링버퍼 재사용, 상한 존재)» — 화면 에뮬레이터(src/pty-shell/registry.ts
+// xterm scrollback 1000줄 링버퍼)에서 이만큼만 남겨 파일을 아껴도 직전 화면 이력은 충분하다(초과분은 오래된 것부터 버린다).
+export const SNAPSHOT_SCROLLBACK_MAX_LINES = 500;
+// 출처: D1B-DESIGN «명시적 상한» — 화면 줄 상한. renderScreen 출력은 헤더 1줄 + rows 줄이므로 이보다 큰
+// screen 필드는 renderScreen 결과가 아니라 쓰레기다(없는 것으로 본다).
+export const SNAPSHOT_SCREEN_MAX_LINES = 2_000;
+// 출처: D1B-DESIGN «디바운스 스냅샷 기록» — 출력 배치마다 예약하고 마지막 배치로부터 이 시간 뒤 한 번 기록한다.
+// 종료·SIGTERM flush 가 나머지 간극을 덮는다.
+const SNAPSHOT_DEBOUNCE_MS = 5_000;
+
+// 스냅샷도 meta 와 같은 형태로 기록한다(tmp → rename 원자기록 · 디렉터리 0700 · 파일 0600).
+let snapshotSequence = 0;
+export function saveScreenSnapshot(path: string, snapshot: ScreenSnapshot): void {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  const tmp = `${path}.${process.pid}.${++snapshotSequence}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* never written, or already renamed */ }
+    throw error;
+  }
+}
+
+/** 상한을 넘는 스크롤백은 오래된 것부터 버리고 정확히 상한만 남긴다(D1B-DESIGN «절단»). */
+export function trimScrollbackLines(lines: readonly string[], limit: number): string[] {
+  if (limit <= 0) return [];
+  return lines.length > limit ? lines.slice(lines.length - limit) : [...lines];
+}
+
+/** 읽을 수 없거나 모양이 다른 스냅샷은 없는 것으로 본다(loadHolderMeta 급 엄격 파서 + 명시적 상한).
+ *  상한은 시험이 작은 리터럴로 경계를 점검하도록 매개변수로 열어 둔다(기본 = 제품 상수). */
+export function loadScreenSnapshot(
+  path: string,
+  scrollbackMaxLines: number = SNAPSHOT_SCROLLBACK_MAX_LINES,
+  screenMaxLines: number = SNAPSHOT_SCREEN_MAX_LINES,
+): ScreenSnapshot | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<ScreenSnapshot>;
+    if (raw.version !== 1 || typeof raw.paneId !== 'string' || typeof raw.ptyId !== 'string'
+      || typeof raw.cols !== 'number' || typeof raw.rows !== 'number' || typeof raw.screen !== 'string'
+      || typeof raw.scrollback !== 'string' || typeof raw.savedAt !== 'number') return undefined;
+    if (raw.screen.split('\n').length > screenMaxLines) return undefined;
+    const scrollback = trimScrollbackLines(raw.scrollback.split('\n'), scrollbackMaxLines).join('\n');
+    return { version: 1, paneId: raw.paneId, ptyId: raw.ptyId, cols: raw.cols, rows: raw.rows,
+      screen: raw.screen, scrollback, savedAt: raw.savedAt };
+  } catch { return undefined; }
+}
+
+export function removeScreenSnapshot(path: string): void {
+  try { unlinkSync(path); } catch { /* already gone */ }
+}
+
+// 출처: D1B-DESIGN «상태 한 줄 표시: «재부팅으로 종료됨 — 이전 화면» + 재생성 안내(Enter)» — 원문 그대로.
+const REBOOT_STATUS_LINE = '재부팅으로 종료됨 — 이전 화면 — Enter 로 다시 만들기';
+
+/** 저장 화면 합성: 스크롤백(오래된 이력) → 화면 → 상태 한 줄(빈 칸은 덜어낸다). */
+export function composeRestoredScreen(screen: string, scrollback: string): string {
+  return [scrollback, screen, REBOOT_STATUS_LINE].filter((part) => part !== '').join('\n');
+}
+
+/** 재결속 실패(재부팅 감별) 뒤 저장 화면을 꺼내 준다 — 비파괴 읽기다. 파일은 저널 commit 이 성공한 뒤
+ *  consumeScreenSnapshot 이 지운다(저장 실패에도 복구 가능한 원본이 살아 있어야 한다). 스냅샷의 paneId 가
+ *  요청 pane 과 다르면 없는 것으로 본다(파일 이름이 틀린 pane 의 화면을 보이지 않게). */
+export function restoreScreenFromSnapshot(stateRoot: string, paneId: string): string | undefined {
+  const snapshot = loadScreenSnapshot(holderSnapshotPath(stateRoot, paneId));
+  if (!snapshot || snapshot.paneId !== paneId) return undefined;
+  return composeRestoredScreen(snapshot.screen, snapshot.scrollback);
+}
+
+/** 저널 commit 이 성공한 뒤에만 부르는 스냅샷 소비(삭제). */
+export function consumeScreenSnapshot(stateRoot: string, paneId: string): void {
+  removeScreenSnapshot(holderSnapshotPath(stateRoot, paneId));
+}
+
 export type HolderRequest =
   | { readonly op: 'ping' }
   | { readonly op: 'input'; readonly bytes: string }
   | { readonly op: 'write-all'; readonly text: string }
   | { readonly op: 'resize'; readonly cols: number; readonly rows: number }
-  | { readonly op: 'snapshot'; readonly ansi?: boolean }
+  | { readonly op: 'snapshot'; readonly ansi?: boolean; readonly scrollBack?: number }
   | { readonly op: 'kill' };
 
 export type HolderMessage =
@@ -204,7 +303,7 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
         case 'resize': handle.resize(message.cols, message.rows); return;
         case 'snapshot': send({ type: 'snapshot', paneId: meta.paneId, ptyId: handle.id, pid: handle.pid, alive: handle.isAlive(),
           cols: handle.cols, rows: handle.rows, exitCode: handle.exitCode, bracketedPaste: handle.bracketedPasteEnabled(),
-          lastOutputAt: handle.lastOutputAt ?? null, screen: await handle.renderScreen(message.ansi === true ? { ansi: true } : undefined) }); return;
+          lastOutputAt: handle.lastOutputAt ?? null, screen: await handle.renderScreen(message.ansi === true ? { ansi: true, ...(message.scrollBack ? { scrollBack: message.scrollBack } : {}) } : undefined) }); return;
         case 'kill': handle.kill(); return;
         default: send({ type: 'error', message: 'els holder: unknown op' });
       }
@@ -214,8 +313,29 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
   // 종료: PTY 끝 → 마지막 화면 방송 → grace → 정리. 접속 끊김은 그 어느 것도 건드리지 않는다(serveAttach 계약).
   let closed = false;
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  // D1b: 화면·스크롤백 스냅샷 — 출력 배치마다 예약해 디바운스로 남긴다(재부팅 뒤 이전 화면 렌더의 원천).
+  // 종료와 close()(SIGTERM)에서 flush 한다; 스냅샷은 최선을 다하는 부수 효과라 홀더를 죽이지 않는다.
+  const snapPath = holderSnapshotPath(start.stateRoot, start.paneId);
+  let snapTimer: ReturnType<typeof setTimeout> | undefined;
+  const writeSnapshot = async (screen?: string): Promise<void> => {
+    if (snapTimer) { clearTimeout(snapTimer); snapTimer = undefined; }
+    const text = screen ?? await handle.renderScreen();
+    const scrollback = await (handle.renderScrollback?.(SNAPSHOT_SCROLLBACK_MAX_LINES) ?? '');
+    saveScreenSnapshot(snapPath, { version: 1, paneId: meta.paneId, ptyId: handle.id, cols: handle.cols,
+      rows: handle.rows, screen: text, scrollback, savedAt: Date.now() });
+  };
   const offOutput = onPtyEvent((event) => {
-    if (event.type === 'output' && event.id === handle.id) broadcast({ type: 'output', paneId: meta.paneId, chunk: event.chunk });
+    if (event.type === 'output' && event.id === handle.id) {
+      broadcast({ type: 'output', paneId: meta.paneId, chunk: event.chunk });
+      // D1b: 출력 배치마다 스냅샷을 다시 예약한다(타이머는 홀더 프로세스를 붙잡지 않는다).
+      if (!snapTimer) {
+        snapTimer = setTimeout(() => {
+          snapTimer = undefined;
+          void writeSnapshot().catch(() => { /* best-effort */ });
+        }, SNAPSHOT_DEBOUNCE_MS);
+        snapTimer.unref?.();
+      }
+    }
   });
   let markDone: () => void = () => {};
   const done = new Promise<void>((resolve) => { markDone = resolve; });
@@ -223,6 +343,7 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
     if (closed) return;
     closed = true;
     if (graceTimer) clearTimeout(graceTimer);
+    if (snapTimer) { clearTimeout(snapTimer); snapTimer = undefined; }
     offOutput();
     const sockets = [...clients];
     clients.clear();
@@ -234,7 +355,11 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
   };
   handle.onExit(() => {
     void handle.renderScreen().then(
-      (screen) => broadcast({ type: 'exit', paneId: meta.paneId, exitCode: handle.exitCode, screen }),
+      (screen) => {
+        broadcast({ type: 'exit', paneId: meta.paneId, exitCode: handle.exitCode, screen });
+        // D1b 종료 flush: 최종 화면을 스냅샷에도 남긴다(서버가 exit 방송을 받지 못한 재시작에 대비).
+        void writeSnapshot(screen).catch(() => { /* best-effort */ });
+      },
       () => broadcast({ type: 'exit', paneId: meta.paneId, exitCode: handle.exitCode, screen: '' }))
       .finally(() => {
         graceTimer = setTimeout(() => { void cleanup().finally(markDone); }, start.exitGraceMs ?? HOLDER_EXIT_GRACE_MS);
@@ -245,6 +370,8 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
     meta,
     done,
     close: async (): Promise<void> => {
+      // D1b SIGTERM flush: 정리 전 마지막 화면을 남긴다(재부팅 뒤 이 화면이 복원된다).
+      try { await writeSnapshot(); } catch { /* best-effort */ }
       try { if (handle.isAlive()) handle.kill('SIGKILL'); } catch { /* already gone */ }
       await cleanup();
       markDone();
@@ -253,7 +380,7 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
 }
 
 /** els 서버가 pane 자식 대신 띄우는 detached holder 프로세스. 환경 = 서버 env ⊕ pane env(그대로 자식에게 내려간다). */
-export function spawnHolderDetached(start: HolderStart & { readonly execPath?: string; readonly scriptPath?: string }): { readonly pid: number } {
+export function spawnHolderDetached(start: HolderStart & { readonly execPath?: string; readonly scriptPath?: string; readonly loginEnv?: string }): { readonly pid: number } {
   const scriptPath = start.scriptPath ?? fileURLToPath(new URL('./holder-main.ts', import.meta.url));
   const argv = [start.execPath ?? process.execPath, scriptPath,
     '--state-root', start.stateRoot, '--pane', start.paneId, '--cwd', start.cwd, '--title', start.title,
@@ -261,8 +388,13 @@ export function spawnHolderDetached(start: HolderStart & { readonly execPath?: s
     ...(start.rows !== undefined ? ['--rows', String(start.rows)] : []),
     ...(start.exitGraceMs !== undefined ? ['--grace-ms', String(start.exitGraceMs)] : []),
     '--', ...start.command];
-  const child = Bun.spawn(argv, { cwd: start.cwd, env: { ...process.env, ...start.env },
-    stdio: ['ignore', 'ignore', 'ignore'], detached: true });
+  // The server's owner credential never rides into a holder (nor its pane): whether it comes from process.env or start.env.
+  const holderEnv: Record<string, string | undefined> = { ...process.env, ...start.env };
+  delete holderEnv.ELANOUS_ELS_OWNER_TOKEN;
+  // The captured login env (login-env-handoff.ts) goes over the pipe, not argv/env/disk; no payload = /dev/null and the holder captures itself.
+  const child = Bun.spawn(argv, { cwd: start.cwd, env: holderEnv,
+    stdio: [start.loginEnv === undefined ? 'ignore' : 'pipe', 'ignore', 'ignore'], detached: true });
+  if (start.loginEnv !== undefined) { child.stdin!.write(start.loginEnv); void child.stdin!.end(); }
   child.unref();
   return { pid: Number(child.pid) };
 }
@@ -389,7 +521,7 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
         return;
       }
       pending.push({ resolve, reject });
-      push({ op: 'snapshot', ...(options?.ansi ? { ansi: true } : {}) });
+      push({ op: 'snapshot', ...(options?.ansi ? { ansi: true } : {}), ...(options?.scrollBack ? { scrollBack: options.scrollBack } : {}) });
     }),
     onExit: (cb) => { if (exited) { try { cb(); } catch { /* a listener */ } return; } exitCbs.add(cb); },
     kill: () => {
@@ -490,14 +622,30 @@ export function holderPty(stateRoot: string): (command: readonly string[], cwd: 
     // D11: 스폰 «전» 점검 — 없는 실행 파일·cwd·shebang 인터프리터는 els new 가 실패 코드·사유로 거부한다(원문 invalid-and-spoof.raw · JUD-B #107020).
     const why = spawnPreflightFailure(command, cwd, env);
     if (why) throw new Error(why);
-    spawnHolderDetached({ stateRoot, paneId, cwd, title, env, command });
+    // The server's one login capture rides to the holder; while it is still running the spawn waits for it (the adapter retries its connect).
+    void loginEnvForSpawn()
+      .catch(() => undefined)
+      .then((loginEnv) => { spawnHolderDetached({ stateRoot, paneId, cwd, title, env, command, ...(loginEnv === undefined ? {} : { loginEnv }) }); })
+      .catch((error: unknown) => { process.stderr.write(`els holder: spawn failed for ${paneId}: ${error instanceof Error ? error.message : String(error)}\n`); });
     return connectHolderElsPty(stateRoot, paneId, undefined);
   };
 }
 
-/** 재기동: 살아 남은 홀더를 meta 로 찾아 재결속한다; meta 가 없으면 undefined(죽은 홀더 판정은 어댑터가 내린다). */
+/** meta 가 가리키는 홀더가 «실제로 있는가» — 동기 점검: meta.pid(= PTY 자식)가 살아 있고 소켓 파일이 소켓이다.
+ *  비정상 종료(SIGKILL·정전)는 홀더가 못 지운 meta·소켓만 남기므로 meta 존재만으로는 생존을 믿을 수 없다. */
+function holderLooksReal(stateRoot: string, meta: HolderMeta): boolean {
+  if (!Number.isInteger(meta.pid) || meta.pid <= 0) return false;
+  try { process.kill(meta.pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EPERM') return false; }
+  try { return statSync(holderSocketPath(stateRoot, meta.paneId)).isSocket(); } catch { return false; }
+}
+
+/** 재기동: 살아 남은 홀더를 meta 로 찾아 재결속한다. meta 가 없거나 가리키는 홀더가 실재하지 않으면(죽은 pid · 소켓
+ *  없음) 남은 meta 를 지우고 undefined — 호출자(core.start)가 저장 화면 복구 분기로 들어간다. 생존 판정을 통과한
+ *  뒤 소켓이 끝내 안 열리는 경우(pid 재사용 등)는 어댑터의 연결 시한이 내린다(기존 계약). */
 export function reattachHolder(stateRoot: string, paneId: string): ElsPty | undefined {
-  const meta = loadHolderMeta(holderMetaPath(stateRoot, paneId));
+  const metaPath = holderMetaPath(stateRoot, paneId);
+  const meta = loadHolderMeta(metaPath);
   if (!meta) return undefined;
+  if (!holderLooksReal(stateRoot, meta)) { removeHolderMeta(metaPath); return undefined; }
   return connectHolderElsPty(stateRoot, paneId, meta);
 }

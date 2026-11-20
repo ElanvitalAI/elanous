@@ -1799,6 +1799,81 @@ def auto_park_repeated_refusals(rows, active_prs):
         parked.add(pr)
     return parked
 
+UNMEASURED_INFRA_MARK = 'aggregate gate setup/unmeasured'
+# 출처: OP #113991 — 11-20 PR 38980 이 gcp1·node-c 두 호스트에서 GATE_RC=124 로 끝난 뒤 세 번째가 같은 꼴로 재배정됨.
+# Two gate runs on two different hosts that end without a verdict for the same PR/head are enough evidence; a third
+# hourly re-assignment on the next main base (new solo key) only burns another host slot for an hour.
+UNMEASURED_INFRA_HOLD_AFTER = 2
+UNMEASURED_LOGGED_RUNS = set()
+
+
+def unmeasured_refusal_events(pr=None, head=None):
+    """Refusal events that ended without a verdict (timeout / no result); never a PR strike."""
+    found, seen = [], set()
+    try:
+        lines = REFUSAL_EVENTS.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return found
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if UNMEASURED_INFRA_MARK not in str(event.get('reason', '')).lower():
+            continue
+        run_id = str(event.get('runId', ''))
+        if pr is not None and (str(event.get('pr')) != str(pr) or str(event.get('head', '')).lower() != head.lower()):
+            continue
+        if run_id and run_id not in seen:
+            seen.add(run_id)
+            found.append(event)
+    return found
+
+
+def unmeasured_cause(event):
+    """Return (cause, gate_rc, elapsed) from the preserved remote stdout; no GATE_RC line means no result."""
+    gate_rc, elapsed = '', '-'
+    match = re.search(r'elapsed (\d+)s', str(event.get('reason', '')))
+    if match:
+        elapsed = f'{match.group(1)}s'
+    try:
+        text = (Path(str(event.get('artifacts') or '')) / 'remote-gate.stdout.log').read_text(
+            encoding='utf-8', errors='replace')
+        rc = re.search(r'^GATE_RC=([0-9]+)$', text, re.M)
+        gate_rc = rc.group(1) if rc else ''
+    except OSError:
+        pass
+    if gate_rc == '124':
+        return 'gate-timeout', gate_rc, elapsed
+    return ('no-result' if not gate_rc else 'gate-unmeasured'), gate_rc, elapsed
+
+
+def log_unmeasured_refusals():
+    """One explicit train-manager.log line per gate run that finished without a verdict (OP #113991)."""
+    pending = [event for event in unmeasured_refusal_events()
+               if str(event.get('runId')) not in UNMEASURED_LOGGED_RUNS]
+    if not pending:
+        return 0
+    try:
+        with LOG.open('rb') as stream:
+            stream.seek(max(0, LOG.stat().st_size - 4_000_000))
+            already = stream.read().decode('utf-8', errors='replace')
+    except OSError:
+        already = ''
+    written = 0
+    for event in pending:
+        run_id = str(event.get('runId'))
+        UNMEASURED_LOGGED_RUNS.add(run_id)
+        if f'preflight no-result run={run_id} ' in already:
+            continue
+        cause, gate_rc, elapsed = unmeasured_cause(event)
+        log(f'preflight no-result run={run_id} pr=#{event.get("pr")} host={event.get("host")} '
+            f'cause={cause} gateRc={gate_rc or "-"} elapsed={elapsed} base={str(event.get("base", ""))[:12]} '
+            f'at={event.get("at")} disposition=unmeasured-infra strikes=0')
+        written += 1
+    return written
+
+
 def repeated_unattributed_bundle_members(rows):
     """Pin a PR/head to singleton gates after two unresolved bundle runs until attribution."""
     queued = {str(row.pr): row.head.lower() for row in rows}
@@ -1912,6 +1987,7 @@ def tick():
     rows = open_rows
     rows, _hotspot_blocked = order_and_hold_hotspot_rows(rows, base, express_order)
     auto_parked = auto_park_repeated_refusals(rows, busy_prs())
+    log_unmeasured_refusals()
     if auto_parked:
         rows = [row for row in rows if str(row.pr) not in auto_parked]
     if light_land_docs_only(rows, base):
@@ -1941,6 +2017,7 @@ def tick():
         must_rank.get(str(row.pr), len(must_rank)),
         express_rank[str(row.pr)] if str(row.pr) in express_rank else len(express_rank),
         rows.index(row)))
+    infra_held = set()  # PR ids whose exact head already ended twice without a gate verdict
     for row in ordered_rows:
         if str(row.pr) in EXPRESS_FORBIDDEN_HEADS and row.head.lower() == EXPRESS_FORBIDDEN_HEADS[str(row.pr)]:
             record_candidate_exclusion(row, base, 'policy-forbidden-head',
@@ -1989,6 +2066,19 @@ def tick():
             else:
                 record_candidate_exclusion(row, base, f'solo-check-{solo.get("status")}',
                                            'use existing solo evidence; retry only after a new head/base or repaired precondition')
+            continue
+        unmeasured_runs = unmeasured_refusal_events(row.pr, row.head)
+        unmeasured_hosts = {str(event.get('host')) for event in unmeasured_runs}
+        # Hold only when the same PR/head ended without a verdict on two different hosts: runs on one host
+        # may be that host's infra problem, not the PR's. MUST PRs are never held (their group path ignores
+        # infra_held), so no hold record is written for them either.
+        if len(unmeasured_hosts) >= UNMEASURED_INFRA_HOLD_AFTER and str(row.pr) not in must_rank:
+            hosts = ','.join(sorted(unmeasured_hosts))
+            record_candidate_exclusion(row, base, 'unmeasured-infra-hold',
+                                       f'{len(unmeasured_runs)} gate runs ended without a verdict '
+                                       f'(no-result/timeout; hosts={hosts}); strike 0, stays queued; '
+                                       'resumes on a new head or OP release')
+            infra_held.add(str(row.pr))
             continue
         if solo and solo.get('status') == 'unmeasured' and solo.get('mainMerge'):
             record_candidate_exclusion(row, base, 'solo-unmeasured-main-merge',
@@ -2282,7 +2372,7 @@ def tick():
                 if len(fillers) >= 4:
                     break
                 pr = str(row.pr)
-                if row.pr in active_prs or row.pr in assigned or pr in must_rank or pr in op_express_set or pr in forced_solo:
+                if row.pr in active_prs or row.pr in assigned or pr in must_rank or pr in op_express_set or pr in forced_solo or pr in infra_held:
                     continue
                 if pr in EXPRESS_FORBIDDEN_HEADS and row.head.lower() == EXPRESS_FORBIDDEN_HEADS[pr]:
                     continue
@@ -2310,7 +2400,7 @@ def tick():
                 if len(group) + len(companions) >= 4:
                     break
                 pr = str(row.pr)
-                if row.pr in active_prs or row.pr in assigned or row in group or pr in must_rank or pr in op_express_set or pr in forced_solo:
+                if row.pr in active_prs or row.pr in assigned or row in group or pr in must_rank or pr in op_express_set or pr in forced_solo or pr in infra_held:
                     continue
                 if pr in EXPRESS_FORBIDDEN_HEADS and row.head.lower() == EXPRESS_FORBIDDEN_HEADS[pr]:
                     continue

@@ -394,11 +394,16 @@ export function planReviewProviderAttempts(
   return { attempts: out, skipped };
 }
 
-export function noUsableReviewProviderError(skipped: readonly ReviewProviderCandidateSkip[]): Error {
+/** `no-usable-provider:` error that also carries the structured skips (provider names + fixed reason codes only). */
+export class NoUsableReviewProviderError extends Error {
+  constructor(message: string, readonly skipped: readonly ReviewProviderCandidateSkip[]) { super(message); this.name = 'Error'; }
+}
+
+export function noUsableReviewProviderError(skipped: readonly ReviewProviderCandidateSkip[]): NoUsableReviewProviderError {
   const reasons = skipped.length
     ? skipped.map((candidate) => `${candidate.provider ?? 'unknown'}(${candidate.model})=${candidate.why}`).join(', ')
     : 'no candidates configured';
-  return new Error(`no-usable-provider: ${reasons}`);
+  return new NoUsableReviewProviderError(`no-usable-provider: ${reasons}`, skipped);
 }
 
 /** A distinct provider is available even when the optional config list is empty. */

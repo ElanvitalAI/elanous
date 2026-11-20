@@ -101,6 +101,43 @@ describe('PLUGIN-ONLY-RATCHET', () => {
     }
   });
 
+  test('skips a gitignored untracked symlink artifact but still refuses a tracked or non-ignored symlink', () => {
+    const root = mkdtempSync(join(tmpdir(), 'plugin-only-ratchet-ignored-symlink-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });
+    try {
+      git('init', '-b', 'main');
+      git('config', 'user.name', 'Ratchet Test');
+      git('config', 'user.email', 'ratchet-test@example.invalid');
+      mkdirSync(join(root, 'src/harness/log/run-1'), { recursive: true });
+      mkdirSync(join(root, 'plugins'), { recursive: true });
+      writeFileSync(join(root, '.gitignore'), 'src/harness/log/latest\n');
+      writeFileSync(join(root, 'plugins/.keep'), 'fixture\n');
+      writeFileSync(join(root, 'src/real.ts'), "export const graphId = 'base-graph';\n");
+      git('add', '.gitignore', 'plugins/.keep', 'src/real.ts');
+      git('commit', '-m', 'base');
+      symlinkSync('run-1', join(root, 'src/harness/log/latest'));
+      // ignored artifact: inventory succeeds and still sees real source
+      expect(() => inventoryFromTree(root)).not.toThrow();
+      // a real new core identifier next to the artifact is still caught
+      writeFileSync(join(root, 'src/real.ts'), "export const graphId = 'base-graph';\nif (graphId === 'new-graph') {}\n");
+      expect(inventoryFromTree(root).coreFeatureIdentifiers).toContain('src/real.ts:comparison:graphId:new-graph');
+      // a new plugins code file is still caught
+      writeFileSync(join(root, 'plugins/new.ts'), 'export {};\n');
+      expect(inventoryFromTree(root).pluginCodeFiles).toEqual(['plugins/new.ts']);
+      // untracked but NOT ignored symlink still refused
+      symlinkSync('../src/real.ts', join(root, 'plugins/loose.ts'));
+      expect(() => inventoryFromTree(root)).toThrow('plugin-only inventory does not allow symlinks: plugins/loose.ts');
+      rmSync(join(root, 'plugins/loose.ts'));
+      // tracked symlink still refused, even if a later ignore rule matches it
+      symlinkSync('../src/real.ts', join(root, 'plugins/tracked.ts'));
+      git('add', '-f', 'plugins/tracked.ts');
+      writeFileSync(join(root, '.gitignore'), 'src/harness/log/latest\nplugins/tracked.ts\n');
+      expect(() => inventoryFromTree(root)).toThrow('plugin-only inventory does not allow symlinks: plugins/tracked.ts');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('rejects a baseline that blesses identifiers from the PR head instead of origin/main', () => {
     const root = mkdtempSync(join(tmpdir(), 'plugin-only-ratchet-baseline-test-'));
     const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });

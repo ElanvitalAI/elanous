@@ -11,7 +11,7 @@ cases:
     expect:
       status: failed
       mustVisit: []
-      mustNotVisit: [version-release, gate, publish]
+      mustNotVisit: [cut-branch, gate, publish]
   - id: macrophage-scrap-live-and-simulation
     mode: macrophage-heal
     expect:
@@ -22,11 +22,11 @@ cases:
     mode: baseline
     expect:
       status: done
-      mustVisit: [version-release, gate, publish, npm-publish, done]
+      mustVisit: [cut-branch, gate, publish, npm-publish, done]
       mustNotVisit: [failed]
       events:
-        - { event: node-start, nodeId: version-release }
-        - { event: node-end, nodeId: version-release, ok: true }
+        - { event: node-start, nodeId: cut-branch }
+        - { event: node-end, nodeId: cut-branch, ok: true }
   - id: gate-attribution-incomplete
     fault:
       node: gate
@@ -100,7 +100,7 @@ cases:
     mode: cut-tip-moved-after-resume
     expect:
       status: resume-refused
-      mustVisit: [version-release]
+      mustVisit: [cut-branch]
       mustNotVisit: [cutoff, gate, publish]
   - id: prefetch-cache-miss
     fault:
@@ -253,7 +253,7 @@ cases:
     mode: appended-tip-regate-before-waiver
     expect:
       status: done
-      mustVisit: [version-release, gate, known-issues, publish, npm-publish, done]
+      mustVisit: [cut-branch, gate, known-issues, publish, npm-publish, done]
       mustNotVisit: [failed]
   - id: append-receipt-set-absent-and-continuous-radius
     mode: append-receipt-continuity

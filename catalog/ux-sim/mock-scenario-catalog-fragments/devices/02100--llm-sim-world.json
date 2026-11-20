@@ -1,0 +1,26 @@
+{
+  "id": "llm-sim-world",
+  "name": "LLM provider sim world assembler and scenario helpers",
+  "implementation": [
+    "src/ux-sim/llm-provider-world/world.ts",
+    "src/ux-sim/llm-provider-world/scenarios.ts"
+  ],
+  "tests": [
+    "src/ux-sim/llm-provider-world/scenarios.test.ts"
+  ],
+  "target": "One fake LLM provider world (one shared SimClock, codex x3, Claude x2, OpenRouter credit, claude-acp, supply targets, remote host) whose states() feed decideLlmSpend and runLlmSpendGuard",
+  "inputs": [
+    "world start time, OpenRouter balance, supply policy",
+    "device switches: window usage, exhaustion, balance, spend, auto top-up, alive, sessions, desiredSha"
+  ],
+  "observations": [
+    "states() maps every policy row name to its device observe()",
+    "decision outcome, row, skipped reasons and ledger actions from the real decision function and guard"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/llm-provider-world/scenarios.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

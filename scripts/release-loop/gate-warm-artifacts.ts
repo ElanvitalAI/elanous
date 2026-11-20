@@ -210,6 +210,11 @@ export function warmReferenceFromJobArtifacts(prefix: string, file: string, expe
   const failureIds = cases.filter(item => item.failed).map(item => item.id).sort();
   // Dots-only success logs lack test identities. A same-file, same-count
   // JUnit can then be rebound with a fresh manifest, so fail closed.
+  // Bun ≥1.4's default reporter prints no `(pass)` console lines either, so
+  // a legitimate one-file log may carry no pass identities at all; the
+  // [warm-worker] junit-sha256 digest already bound into the log above ties
+  // the JUnit to this run then. Fail closed only when the log claims pass
+  // identities that contradict the JUnit.
   {
     const allIds = cases.map(item => item.id).sort();
     // A duplicate name cannot identify which JUnit case matches which log
@@ -217,8 +222,8 @@ export function warmReferenceFromJobArtifacts(prefix: string, file: string, expe
     if (new Set(allIds).size !== allIds.length) return null;
     const fromXml = allIds.filter(id => !failureIds.includes(id));
     const fromLog = logPassIds(log);
-    if (fromXml.length !== cases.length - failureIds.length || fromLog.length !== fromXml.length
-      || fromXml.some((id, index) => id !== fromLog[index])) return null;
+    if (fromLog.length > 0 && (fromLog.length !== fromXml.length
+      || fromXml.some((id, index) => id !== fromLog[index]))) return null;
   }
   // A manifest can be rebound after mixing two complete runs. Match each
   // failure's content, not only its test name, against the captured log.

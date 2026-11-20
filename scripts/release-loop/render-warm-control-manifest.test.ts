@@ -29,7 +29,10 @@ test('warm control init restores a persisted token file to mode 0600 without rep
       .replaceAll('/var/lib/elanous/control/tokens.json', tokenFile)
       .replaceAll('/var/lib/elanous/control', controlDir)
       .replaceAll('/run/secrets/control-tokens.json', seedFile);
-    const result = spawnSync('sh', ['-ec', isolated], { encoding: 'utf8' });
+    // The rendered init script keeps GNU stat for its linux pod; a darwin host executing the
+    // same script under its own sh must check the same 0600 mode with the BSD stat flag.
+    const hostScript = process.platform === 'darwin' ? isolated.replaceAll("stat -c '%a'", "stat -f '%Lp'") : isolated;
+    const result = spawnSync('sh', ['-ec', hostScript], { encoding: 'utf8' });
     expect(result.status).toBe(0);
     expect(statSync(tokenFile).mode & 0o777).toBe(0o600); // Source: #36630
     expect(readFileSync(tokenFile, 'utf8')).toBe('persisted-token');

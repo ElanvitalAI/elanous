@@ -17,6 +17,8 @@ import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
+import { GraphMemoryStore, assertGraphMemoryIdentity } from './graph-memory.js';
+import { applyHandlerMemory, readNodeMemory } from './graph-memory-port.js';
 import { installedCredentialEnvNames } from './plugin-credential-env.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
@@ -34,7 +36,7 @@ import { shapeGraphUnit } from './unit-shape.js';
 import { createGraphEventBus, createScopedGraphEventBus, publishNodeGraphEvent, type GraphEvent, type GraphEventBus } from './graph-events.js';
 import { appendGraphRunEvent, graphRunEventLedgerPath, readGraphRunEvents } from './graph-run-event-ledger.js';
 import { createNodeProgressReporter, NODE_HEARTBEAT_EVENT, NODE_PROGRESS_EVENT, type GraphNodeProgress,
-  type NodeProgressReporter } from './node-progress.js';
+  type GraphNodeProgressData, type NodeProgressReporter } from './node-progress.js';
 import { registerGraphRunMsgSubscribers } from './graph-run-msg-subscriptions.js';
 import { registerGraphSubscriptions, type GraphEdgeAdditionApi, type GraphSubgraphAppendProposal, type GraphSubscriptionDispatch } from './graph-subscriptions.js';
 import { registerReleaseGraphEventAdapters } from '../release-loop/graph-event-adapters.js';
@@ -46,7 +48,7 @@ import { createGraphVariant } from '../self-implement/graph-variant.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
-import { requireInProcessHandler, type InProcessHandlerRegistry } from './in-process-registry.js';
+import { requireInProcessHandler, type InProcessHandlerRegistry, type InProcessHandlerResult } from './in-process-registry.js';
 import { capabilityNameFromRecipe, dispatchGraphCapability, dispatchGraphContract, graphContractValueMatches, isCapabilityRecipe } from './capabilities.js';
 import { prepareGraphPreconditions } from './graph-precondition.js';
 import { interpolate } from '../workflow-runtime/variables.js';
@@ -1339,6 +1341,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const variant = options.variant ? createGraphVariant({ template: graph, ...options.variant }) : undefined;
   if (variant && !variant.ok) throw new Error(`graph variant rejected: ${JSON.stringify(variant.rejections)}`);
   if (variant?.ok) graph = variant.template;
+  if (graph.nodes.some(node => node.memory)) assertGraphMemoryIdentity(options.deps?.memoryIdentity);
   if (graphExtensionLedger) graphExtensionLedger = { ...graphExtensionLedger, graphHash: graphVersionHash(graph) };
   const loopBudget = graphLoopBudget(graph);
   const unitResolver = createGraphUnitResolver();
@@ -1530,6 +1533,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     debug.log('graph.run', 'harness-loop-plan', { graphId: graph.graphId, path: resolve(path), route: planned });
   }
   const graphId = safeSegment(graph.graphId);
+  const memoryTemplateId = `${graphId}.v${graph.v2?.sourceVersion ?? graph.version}`;
   const isReleaseLoop = graphId === 'release-loop';
   // A copied or saved release graph is still a release graph. Its path cannot grant or revoke
   // permission to dispatch a command; only the graph identity and this independent table can.
@@ -1927,6 +1931,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       ...(units.size > 0 ? { unitPins } : {}),
       ...(graphExtensionLedger ? { graphExtensionLedger } : {}),
       graphPath: resolve(path), ...(variant?.ok ? { variant: { overlayId: variant.overlay.overlayId, ...options.variant! } } : {}),
+      ...(graph.nodes.some(node => node.memory) ? { memoryIdentity: options.deps!.memoryIdentity } : {}),
       ...(options.input === undefined ? {} : { input: options.input }),
       ...(options.unitContext?.entryNodeId === undefined ? {} : { entryNodeId: options.unitContext.entryNodeId }),
       executed: 0, dryRun: options.dryRun === true, graphRevision: 1, statePath };
@@ -1967,6 +1972,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
   }
   if (options.resumeRunId && state.status === 'cancelled') throw new Error(`cancelled graph run cannot be resumed: ${graphId}/${runId}`);
+  if (options.resumeRunId && graph.nodes.some(node => node.memory) &&
+      (!state.memoryIdentity || state.memoryIdentity.memberId !== options.deps?.memoryIdentity?.memberId ||
+        state.memoryIdentity.universe !== options.deps?.memoryIdentity?.universe ||
+        state.memoryIdentity.provenance !== options.deps?.memoryIdentity?.provenance))
+    throw new Error('graph memory identity changed since run started');
   if (graphExtensionLedger) {
     if (state.graphExtensionLedger && JSON.stringify(state.graphExtensionLedger) !== JSON.stringify(graphExtensionLedger))
       throw new Error('graph extension ledger changed since run started');
@@ -2502,14 +2512,16 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   // node-progress · node-heartbeat only append to the run ledger. They never go through the event bus, so they never
   // write run state (the runner is its one writer) and never take or clear a pending persistence failure. Their
   // sequence comes from the same counter, so the next lifecycle event still lands after them.
-  const appendNodeObservation = (type: string, source: GraphEvent['source'], data: Readonly<Record<string, unknown>>): void => {
-    if (!eventRunState || !eventRunOwner) return;
+  const appendNodeObservation = (type: string, source: GraphEvent['source'], data: Readonly<Record<string, unknown>>): GraphEvent | undefined => {
+    if (!eventRunState || !eventRunOwner) return undefined;
     const sequence = Math.max(eventBusSequences.get(baseEventBus) ?? 0,
       eventSequence, eventRunState.graphEventSequence ?? eventSequenceBase) + 1;
     eventBusSequences.set(baseEventBus, sequence);
     eventSequence = sequence;
-    appendGraphRunEvent(graphRunEventLedgerPath(root, graphId, runId), { graphId, runId, type, source, data,
-      eventId: `${graphId}:${runId}:${sequence}`, sequence, emittedAt: (options.eventNow?.() ?? new Date()).toISOString() } as GraphEvent);
+    const appended = { graphId, runId, type, source, data,
+      eventId: `${graphId}:${runId}:${sequence}`, sequence, emittedAt: (options.eventNow?.() ?? new Date()).toISOString() } as GraphEvent;
+    appendGraphRunEvent(graphRunEventLedgerPath(root, graphId, runId), appended);
+    return appended;
   };
   const baseLog = options.deps?.log ?? ((event: string, data: Record<string, unknown>) => debug.log('graph.runner', event, data));
   // RFC §U: every event of a unit (child) run carries its parentRunId.
@@ -3001,7 +3013,41 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const command = resolved.command;
     const prompt = resolved.prompt;
-    const approval = resolved.approval ? { approval: approvalMessage(resolved.approval.approval, state.input, isReleaseLoop) } : undefined;
+    const memoryApprovalSourceNode = resolved.approval && node.input && typeof node.input === 'object' && !Array.isArray(node.input)
+      ? (node.input as Record<string, unknown>).memorySourceNode : undefined;
+    const memoryApprovalSource = typeof memoryApprovalSourceNode === 'string'
+      ? [...state.nodes].reverse().find(record => record.nodeId === memoryApprovalSourceNode && record.ok && record.executed)
+      : undefined;
+    const memoryApprovalOutput = lastJsonObject(memoryApprovalSource?.output)?.result as { item?: { id?: unknown } } | undefined;
+    const portSourceNode = memoryApprovalSourceNode !== undefined && !!options.deps?.memory &&
+      graph.nodes.some(source => source.nodeId === memoryApprovalSourceNode && !source.memory);
+    // Handler (port) path: the item id comes from the writes the handler node recorded, matched by the declared key.
+    const approvalInput = (node.input ?? {}) as Record<string, unknown>;
+    const portWrites = (lastJsonObject(memoryApprovalSource?.output)?.portMemory as { writes?: Array<{ key?: unknown; id?: unknown }> } | undefined)?.writes ?? [];
+    const portItemId = portSourceNode ? portWrites.find(write => write.key === approvalInput.memoryKey)?.id : undefined;
+    const memoryApprovalItemId = typeof portItemId === 'string' ? portItemId
+      : typeof memoryApprovalOutput?.item?.id === 'string' ? memoryApprovalOutput.item.id : undefined;
+    const memoryApprovalTarget = approvalInput.memoryTarget === 'template' || approvalInput.memoryTarget === 'global' ? approvalInput.memoryTarget : undefined;
+    let memoryApprovalText: string | undefined;
+    if (memoryApprovalSourceNode !== undefined && portSourceNode) {
+      const row = memoryApprovalItemId && memoryApprovalTarget
+        ? (await readNodeMemory(options.deps!.memory!, graphId, runId)).find(candidate => candidate.id === memoryApprovalItemId && candidate.runId === runId) : undefined;
+      if (!row) throw new Error(`approval memory source unavailable: ${current}`);
+      memoryApprovalText = row.text;
+    } else if (memoryApprovalSourceNode !== undefined) {
+      if (!memoryApprovalItemId || !graph.nodes.some(source => source.nodeId === memoryApprovalSourceNode && source.memory?.action === 'write'))
+        throw new Error(`approval memory source unavailable: ${current}`);
+      const identity = options.deps?.memoryIdentity;
+      assertGraphMemoryIdentity(identity);
+      const store = new GraphMemoryStore(root);
+      try {
+        const item = store.getInstance({ identity, graphId: memoryTemplateId, runId, id: memoryApprovalItemId });
+        if (!item || item.nodeId !== memoryApprovalSourceNode) throw new Error(`approval memory source unavailable: ${current}`);
+        memoryApprovalText = item.text;
+      } finally { store.close(); }
+    }
+    const approval = resolved.approval ? { approval: approvalMessage(resolved.approval.approval, state.input, isReleaseLoop) +
+      (memoryApprovalItemId ? `\nMemory item ${memoryApprovalItemId}: ${memoryApprovalText}` : '') } : undefined;
     if (resumingPending && (!approval || approval.approval !== state.pending?.message)) {
       throw new Error(`pending approval no longer matches graph: ${current}`);
     }
@@ -3009,7 +3055,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (approval && (!state.dryRun || document.dry_run_await_approval === true) && !state.pending?.decision) {
       if (!state.pending) {
         state.pending = { nodeId: current, message: approval.approval, since: new Date().toISOString(),
-          inputSha256: stableSha256(state.input), ...pendingHitlChoices(node) };
+          inputSha256: stableSha256(state.input), ...(memoryApprovalItemId ? { memoryItemId: memoryApprovalItemId } : {}), ...(portSourceNode && memoryApprovalTarget ? { memoryTarget: memoryApprovalTarget } : {}), ...pendingHitlChoices(node) };
         state.approvalSourceHash = approvalSourceHash;
       }
       state.status = 'awaiting-approval';
@@ -3129,9 +3175,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const requiredContract = requiredContractForNode(node);
     const capabilityName = node.kind === 'capability' && !requiredContract ? capabilityNameFromRecipe(node.recipe) : undefined;
     const inProcessHandler = capabilityName || requiredContract ? undefined : requireInProcessHandler(node.recipe, current, options.deps?.inProcessHandlers);
+    const memoryAction = node.kind === 'memory' ? node.memory?.action : undefined;
     let handlerExecuted = false;
     let reportedNodeOutcome: unknown;
     let blockedByPrecondition: string | undefined;
+    let portMemoryWrites: Array<{ key: string; id: string }> | undefined;
     let blockedEffectUnknown = false;
     let postForbidNext: readonly string[] = [];
     const recordPostRouteBlock = async (to: string) => {
@@ -3144,7 +3192,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         log('graph.precondition.blocked', { graphId, runId, ...data });
       } catch { /* display failure cannot weaken the saved barrier */ }
     };
-    if ((inProcessHandler || capabilityName || requiredContract) && !operatorNoGo && !waiving && !state.dryRun && !resumingCompleted) {
+    if ((inProcessHandler || capabilityName || requiredContract || memoryAction) && !operatorNoGo && !waiving && !state.dryRun && !resumingCompleted) {
       const eventNodeId = node.nodeId;
       const outputs: Record<string, unknown> = Object.assign(Object.create(null), options.branchParentOutputs ?? {});
       for (const previous of state.nodes) outputs[previous.nodeId] = lastJsonObject(previous.output) ?? previous.output ?? null;
@@ -3213,13 +3261,22 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         let nodeProgress: NodeProgressReporter | undefined;
         const startNodeProgress = (): NodeProgressReporter => {
           const reporter = createNodeProgressReporter({ nodeId: progressNodeId,
-            publish: async (type, data) => appendNodeObservation(type,
-              type === NODE_HEARTBEAT_EVENT ? { kind: 'runner', nodeId: progressNodeId } : { kind: 'node', nodeId: progressNodeId }, data) });
+            publish: async (type, data) => {
+              const appended = appendNodeObservation(type,
+                type === NODE_HEARTBEAT_EVENT ? { kind: 'runner', nodeId: progressNodeId } : { kind: 'node', nodeId: progressNodeId }, data);
+              // ELS-GRAPH-LIVE-VIEW: what the ledger just recorded (and only that) also reaches in-process viewers.
+              if (appended && type === NODE_PROGRESS_EVENT) emitGraphNodeProgress({ graphId, runId, nodeId: progressNodeId,
+                visit: visits.get(progressNodeId) ?? 1, dryRun: state.dryRun === true, at: appended.emittedAt,
+                progress: data as unknown as GraphNodeProgressData });
+            } });
           nodeProgress = reporter;
           liveNodeProgress.set(progressNodeId, reporter);
           return reporter;
         };
+        const portMemory = options.deps?.memory && inProcessHandler
+          ? await readNodeMemory(options.deps.memory, graphId, runId) : undefined;
         const handlerContext = { graphId, runId, nodeId: current, input: state.input ?? null,
+          ...(portMemory ? { memory: portMemory } : {}),
           reportProgress: (progress: GraphNodeProgress) => nodeProgress?.report(progress) ?? Promise.resolve(),
           ...(options.verifiedOwnerId ? { verifiedOwnerId: options.verifiedOwnerId } : {}),
           ...(Object.keys(nodeSecrets).length ? { secrets: nodeSecrets } : {}),
@@ -3260,6 +3317,56 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           ok = true;
           exit = 0;
         } else {
+          let memoryResult: InProcessHandlerResult | undefined;
+          if (memoryAction) {
+            const identity = options.deps?.memoryIdentity;
+            assertGraphMemoryIdentity(identity);
+            const payload = node.input && typeof node.input === 'object' && !Array.isArray(node.input)
+              ? node.input as Record<string, unknown> : {};
+            const graphInput = state.input && typeof state.input === 'object' && !Array.isArray(state.input)
+              ? state.input as Record<string, unknown> : {};
+            const store = new GraphMemoryStore(root);
+            try {
+              if (memoryAction === 'read') {
+                const query = payload.query ?? graphInput.memoryQuery;
+                if (typeof query !== 'string' || !query.trim()) throw new Error('graph memory query is required');
+                const items = store.read({ identity, graphId: memoryTemplateId, runId, scopes: node.memory!.read!, query });
+                memoryResult = { ok: true, outcome: 'done', result: { items } };
+              } else if (memoryAction === 'write') {
+                const key = payload.key ?? graphInput.memoryKey;
+                const text = typeof payload.text === 'string' && payload.text.startsWith('$')
+                  ? resolveUnitInputBinding(payload.text, outputs) : payload.text ?? graphInput.memoryText;
+                if (typeof key !== 'string' || typeof text !== 'string') throw new Error('graph memory key/text is required');
+                const item = store.write({ identity, graphId: memoryTemplateId, runId, nodeId: current,
+                  key, text, ...(Array.isArray(payload.tags) ? { tags: payload.tags as string[] } : {}) });
+                memoryResult = { ok: true, outcome: 'done', result: { item } };
+              } else {
+                const sourceNode = payload.sourceNode;
+                const reason = payload.reason;
+                const validationNode = node.memory!.promote!.validationNode;
+                const source = typeof sourceNode === 'string' ? outputs[sourceNode] as { result?: { item?: { id?: string } } } | undefined : undefined;
+                const sourceId = source?.result?.item?.id;
+                if (typeof sourceId !== 'string' || typeof reason !== 'string')
+                  throw new Error('graph memory promotion source/reason is required');
+                const sourceRecord = [...state.nodes].reverse().find(record => record.nodeId === sourceNode && record.ok && record.executed);
+                const validation = [...state.nodes].reverse().find(record => record.nodeId === validationNode && record.ok && record.executed);
+                const validationOutput = lastJsonObject(validation?.output)?.result as { validated?: unknown; sourceItemId?: unknown } | undefined;
+                const validationDeterministic = graph.nodes.some(candidate => candidate.nodeId === validationNode && candidate.kind !== 'prompt' && /^handler:/.test(candidate.recipe));
+                const validated = validationDeterministic && validationOutput?.validated === true && validationOutput.sourceItemId === sourceId &&
+                  !!sourceRecord && !!validation && state.nodes.indexOf(validation) > state.nodes.indexOf(sourceRecord);
+                const approvalNode = node.memory!.promote!.approvalNode;
+                const approvalRecord = approvalNode === undefined ? undefined : [...state.nodes].reverse().find(record => record.nodeId === approvalNode);
+                const approvalOutput = lastJsonObject(approvalRecord?.output);
+                const approved = !!approvalRecord && !!validation && state.nodes.indexOf(approvalRecord) > state.nodes.indexOf(validation) &&
+                  approvalRecord.ok && typeof approvalRecord.decidedBy === 'string' && !!approvalRecord.decidedBy.trim() &&
+                  approvalOutput?.outcome === 'approved' && approvalOutput.memoryItemId === sourceId &&
+                  graph.nodes.some(source => source.nodeId === approvalNode && source.kind === 'hitl');
+                const item = store.promote({ identity, graphId: memoryTemplateId, runId, nodeId: current, sourceId,
+                  to: node.memory!.promote!.to, reason, validated, approved });
+                memoryResult = { ok: true, outcome: 'done', result: { item } };
+              }
+            } finally { store.close(); }
+          }
           const capabilityRegistry = requiredContract && options.deps?.capabilityProviders
             && 'contracts' in options.deps.capabilityProviders ? options.deps.capabilityProviders : undefined;
           const declaredPreconditions = requiredContract && capabilityRegistry?.providers.some(provider =>
@@ -3289,7 +3396,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
               ? [value as Record<string, unknown>] : [];
           });
           const progress = startNodeProgress();
-          const result = await (async () => { try { return requiredContract
+          const result = memoryResult ?? await (async () => { try { return requiredContract
             ? await dispatchGraphContract(requiredContract, handlerContext, capabilityRegistry,
               declaredPreconditions ? {
                 deadlineAtMs: preconditionDeadlineAtMs, signal: options.signal,
@@ -3335,8 +3442,21 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
             await observePrecondition('blocked', 2, [], undefined,
               'effectStatus' in result && result.effectStatus === 'unknown' ? 'effect-unknown' : 'precondition-failed');
           }
+          if (options.deps?.memory && inProcessHandler && 'memory' in result && result.memory !== undefined) {
+            // A promote is approved only by the approval node it declares, and only when that node's recorded decision names
+            // this exact item and target (never "any earlier approval"; the approver did not see text a handler just wrote).
+            const approverFor = (entry: { approvalNode?: string; to: string }, sourceId: string): string | undefined => {
+              if (!entry.approvalNode || !graph.nodes.some(candidate => candidate.nodeId === entry.approvalNode && candidate.kind === 'hitl')) return undefined;
+              const record = [...state.nodes].reverse().find(candidate => candidate.nodeId === entry.approvalNode);
+              const decision = lastJsonObject(record?.output);
+              return record?.ok && typeof record.decidedBy === 'string' && record.decidedBy.trim() && decision?.outcome === 'approved' &&
+                decision.memoryItemId === sourceId && decision.memoryTarget === entry.to ? record.decidedBy : undefined;
+            };
+            portMemoryWrites = await applyHandlerMemory(options.deps.memory, { graphId, runId, nodeId: current }, result.memory, approverFor);
+          }
           reportedNodeOutcome = result.outcome;
           output = redactSerializedJson({ ...(result.result === undefined ? {} : { result: result.result }),
+            ...(portMemoryWrites?.length ? { portMemory: { writes: portMemoryWrites } } : {}),
             ...(result.evidence === undefined ? {} : { evidence: result.evidence }), outcome: result.outcome,
             ...(node.contract?.outputs.includes('undo') && result.undo !== undefined ? { undo: result.undo } : {}),
             ...(current === kstDayPolicy.outputNode && state.kstDayFallback ? { kstDayFallback: state.kstDayFallback } : {}),
@@ -3838,14 +3958,33 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         if (text.missing.length) throw new Error(`missing prompt reference: ${text.missing.join(', ')}`);
         // The LLM is injected only; production wiring to a provider is a follow-up slice.
         if (!callLLM) throw new Error('prompt node requires an injected LLM (deps.callLLM)');
+        let promptText = text.text;
+        if (node.memory?.action === 'read') {
+          const identity = options.deps?.memoryIdentity;
+          assertGraphMemoryIdentity(identity);
+          const input = node.input && typeof node.input === 'object' && !Array.isArray(node.input)
+            ? node.input as Record<string, unknown> : {};
+          const ceiling = input.memoryScope;
+          if (!['instance', 'template', 'global'].includes(String(ceiling))) throw new Error('prompt memoryScope is required');
+          const order = ['instance', 'template', 'global'] as const;
+          const scopes = (node.memory.read ?? []).filter(scope => order.indexOf(scope) <= order.indexOf(ceiling as typeof order[number]));
+          if (scopes.length) {
+            const store = new GraphMemoryStore(root);
+            try {
+              const items = store.read({ identity, graphId: memoryTemplateId, runId, scopes, query: promptText });
+              if (items.length) promptText += '\n\nScoped graph memory (instance entries may be unvalidated):\n' + items.map(item =>
+                `[${item.scope}/${item.id} source=${item.sourceRunId}/${item.sourceNodeId}] ${item.text}`).join('\n').slice(0, 8192);
+            } finally { store.close(); }
+          }
+        }
         if (prompt.output) {
           // GRAPH-LLM-JSON-OUTPUT: the stored output is the declared JSON (⊕ `outcome`, the key the next edge reads).
-          const structured = await runStructuredPrompt(text.text, prompt.output, callLLM);
+          const structured = await runStructuredPrompt(promptText, prompt.output, callLLM);
           output = JSON.stringify(structured.output ?? { attempts: structured.attempts });
           ok = structured.ok;
           if (structured.error) error = structured.error;
         } else {
-          output = await callLLM(text.text);
+          output = await callLLM(promptText);
           ok = true;
         }
       } catch (cause) {
@@ -3985,6 +4124,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         }
         output = JSON.stringify({ outcome: state.pending?.outcome ?? selected?.exit ?? (ok ? 'approved' : 'rejected'),
           ...(selected ? { choice: selected.key } : {}), graphId, runId, nodeId: current,
+          ...(state.pending?.memoryItemId ? { memoryItemId: state.pending.memoryItemId } : {}),
+          ...(state.pending?.memoryTarget ? { memoryTarget: state.pending.memoryTarget } : {}),
           ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null,
           ...(rejectionReason ? { error: rejectionReason } : {}) });
         if (rejectionReason) error = rejectionReason;
@@ -4928,6 +5069,28 @@ function graphNodeLifecycleListeners(): ReadonlySet<(event: GraphNodeLifecycleEv
 export function onGraphNodeLifecycle(listener: (event: GraphNodeLifecycleEvent) => void): () => void {
   graphNodeLifecycleListenerSet.add(listener);
   return () => { graphNodeLifecycleListenerSet.delete(listener); };
+}
+
+/** A node-progress the run ledger recorded (ELS-GRAPH-LIVE-VIEW): the same structured fields, for in-process viewers. */
+export interface GraphNodeProgressNotice {
+  readonly graphId: string;
+  readonly runId: string;
+  readonly nodeId: string;
+  readonly visit: number;
+  readonly dryRun: boolean;
+  readonly at: string;
+  readonly progress: GraphNodeProgressData;
+}
+const graphNodeProgressListenerSet = new Set<(notice: GraphNodeProgressNotice) => void>();
+export function onGraphNodeProgress(listener: (notice: GraphNodeProgressNotice) => void): () => void {
+  graphNodeProgressListenerSet.add(listener);
+  return () => { graphNodeProgressListenerSet.delete(listener); };
+}
+function emitGraphNodeProgress(notice: GraphNodeProgressNotice): void {
+  for (const listener of graphNodeProgressListenerSet) {
+    try { listener(notice); }
+    catch { /* a viewer never changes the node */ }
+  }
 }
 
 /**

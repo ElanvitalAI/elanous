@@ -415,6 +415,11 @@ export function registerRelayCommand(
                         throw new Error("relay app registrar unavailable");
                       return registrar.queryHandlePin(serverId, ownerId, input);
                     },
+                    queryHandleClaims: (serverId: string, ownerId: string) => {
+                      if (!registrar)
+                        throw new Error("relay app registrar unavailable");
+                      return registrar.queryHandleClaims(serverId, ownerId);
+                    },
                     // (출처: #39104) 회원 서버 서비스 자격 «핀 읽기» 위임 — 연결
                     // 소유자가 아닌 회원의 살아 있는 핀도 불리언으로 답한다.
                     queryHandlePinByMember: (

@@ -349,6 +349,32 @@ export function classifySubagentExit(text: string): 'done' | 'abnormal' | 'incom
   return INCOMPLETE_EXIT.test(text) ? 'incomplete' : 'done';
 }
 
+// HAND-RUN-ENDS-ON-PREFACE (TC #94015 · POOL-2 #93934): a delegated run ended after 22 s on «이제 세 개의 소스 파일을
+// 작성합니다» — an announcement, zero tool calls, zero commits. A step that made no tool call and only says what it is
+// about to do is not done: continue inside once with an explicit «do it now with tools» turn.
+export const SUBAGENT_PREFACE_CONTINUE_PROMPT = [
+  '[continue inside · preface-only]',
+  '방금 답은 «하겠다»는 안내뿐이고 도구 호출이 0 이다 — 아직 아무것도 하지 않았다. 지금 그 일을 도구로 실제로 하라.',
+  '정말 할 수 없으면 «BLOCKED: <사유> · <시도한 것>» 한 줄로 끝내라.',
+].join('\n');
+
+/** 출처: #94015 — an announcement is one or two sentences; a long reply is a real answer even if it ends with a plan. */
+const PREFACE_MAX_CHARS = 300;
+const PREFACE_FUTURE_KO = /(?:겠습니다|겠다|할게요|할 것입니다)[.!…\s]*$/;
+const PREFACE_NOW_KO = /(?:이제|지금|먼저|바로|다음으로|우선)\s[^\n]{0,120}(?:합니다|입니다)[.!…\s]*$/;
+const PREFACE_EN = /(?:^|[.!?]\s+)(?:(?:ok(?:ay)?|alright|sure)[,.!]?\s+)?(?:now\s+)?(?:I(?:'ll| will| am going to|'m going to)|let me|let's)\b[^.!?]*[.!?…]?\s*$/i;
+
+/** A reply that only announces the next action. Callers apply it only to a step with zero tool calls. Pure. */
+export function isPrefaceOnly(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > PREFACE_MAX_CHARS) return false;
+  // Every sentence must be an announcement, not just the last one: otherwise
+  // a completed answer followed by a plan is discarded and retried.
+  const sentences = trimmed.split(/(?<=[.!?…])\s+|\n+/);
+  return sentences.every(sentence =>
+    PREFACE_FUTURE_KO.test(sentence) || PREFACE_NOW_KO.test(sentence) || PREFACE_EN.test(sentence));
+}
+
 /** 걸음의 «답» 텍스트(마지막 도구 라운드 뒤)를 붙들어 두는 칸 — 걸음이 끝나 «밖으로 낼 답»으로 판정된 뒤에만
  *  부모에게 흘린다(r1 must-fix). 안에서 이어간 걸음의 답(«…하지 못했습니다»)은 부모 소비자에게 닿지 않는다.
  *  도구 호출 앞 진행 서술은 순서대로 바로 흘린다(이벤트 순서 계약 유지). */
@@ -359,7 +385,20 @@ export interface SubagentStepBuffer {
 
 async function runEncapsulated(task: AgentTask, runOnce: () => Promise<string>, step: SubagentStepBuffer): Promise<string> {
   step.reset();
+  let toolsBefore = task.toolCallCount ?? 0;
   let text = await runOnce();
+  // HAND-RUN-ENDS-ON-PREFACE: an announcement with zero tool calls gets one «do it now» turn inside (never a loop).
+  if ((task.toolCallCount ?? 0) === toolsBefore && isPrefaceOnly(text) && !task.controller.signal.aborted) {
+    const droppedStreamChars = step.reset();
+    debug.log('agent.encapsulation', 'continue-inside', { taskId: task.id, agent: task.definition.name, attempt: 0, reason: 'preface-only', chars: text.length, droppedStreamChars });
+    task.messages.push({ role: 'user', content: SUBAGENT_PREFACE_CONTINUE_PROMPT });
+    toolsBefore = task.toolCallCount ?? 0;
+    text = await runOnce();
+    if ((task.toolCallCount ?? 0) === toolsBefore && isPrefaceOnly(text)) {
+      debug.log('agent.encapsulation', 'surfaced', { taskId: task.id, agent: task.definition.name, reason: 'preface-only', attempts: 1 }, { level: 'warn' });
+      return text;
+    }
+  }
   const seen = new Set<string>([text.trim()]);
   for (let attempt = 1; attempt <= SUBAGENT_CONTINUE_INSIDE_CAP; attempt++) {
     const kind = classifySubagentExit(text);

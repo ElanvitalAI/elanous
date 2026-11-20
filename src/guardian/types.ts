@@ -58,6 +58,10 @@ export interface GuardianVerdict {
   /** Minimal, truncated audit record. Sink decides whether to
    *  persist; contents are safe to stringify. */
   auditPayload?: Record<string, unknown>;
+  /** APPROVAL-REQUEST-PLAINTEXT-TARGET — needs-approval 판정의 승인 요청 문면:
+   *  명령 이름 · 대상(경로·가지 이름) 평문 · 비밀 가린 명령 · 보조 sha256.
+   *  감사 싱크에는 싣지 않는다(감사 = 해시·이름만). */
+  approvalRequest?: string;
 }
 
 export interface GuardianContext {

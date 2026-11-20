@@ -53,7 +53,8 @@ import { getProvider, getProviderForConfig, inferProviderFromModel } from '../ll
 import { resolveRoleProviderChain, type ProviderChainRole } from './role-provider-chain.js';
 import { loadTokens } from '../oauth/store.js';
 import { podCodexLeaseCredential } from '../task-orchestrator/surfaces/pod-codex-lease.js';
-import { noUsableReviewProviderError, planReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, classifyReviewProviderFailure, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
+import { NO_REVIEW_PROVIDER, noReviewProviderError } from './no-review-provider.js';
+import { NoUsableReviewProviderError, noUsableReviewProviderError, planReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, classifyReviewProviderFailure, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
 import { loadLlmPolicy, resolveSubscriptionReviewer } from '../policy/llm-policy.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
@@ -1219,6 +1220,17 @@ export async function buildDefaultSelfImplementSeams(
     if (!runId) return;
     try { appendRunLedgerEntry({ runId, event: 'pod-role-fallback', data: { role, reason, provider: 'openrouter' } }); } catch { /* observation is fail-soft */ }
   };
+  // TA-POD-REVIEW-PROVIDER-ALLOW — one ledger line when no reviewer could even be tried: role, reason code, provider names and
+  // fixed skip codes only (no model-call text, no credential). Fail-soft like the other observations.
+  const recordNoReviewProvider = (role: ProviderChainRole, reason: 'role-chain-exhausted' | 'no-usable-provider', skipped: ReadonlyArray<{ provider?: string; why: string }>) => {
+    const runId = process.env.ELANOUS_RUN_ID;
+    if (!runId) return;
+    try {
+      appendRunLedgerEntry({ runId, event: NO_REVIEW_PROVIDER, data: {
+        role, reason, providers: [...new Set(skipped.map((s) => s.provider ?? 'unknown'))], skipped: skipped.map((s) => ({ provider: s.provider ?? 'unknown', why: s.why })),
+      } });
+    } catch { /* observation is fail-soft */ }
+  };
   const chainLLM = (role: ProviderChainRole) => async (prompt: string): Promise<string> => {
     const chain = resolveRoleProviderChain(role, {
       config: getUserConfig(),
@@ -1236,7 +1248,10 @@ export async function buildDefaultSelfImplementSeams(
       },
       ...(deps.reviewGrokQuota ? { grokQuota: deps.reviewGrokQuota } : {}),
     });
-    if (chain.candidates.length === 0) throw new Error(chain.exhaustedReason);
+    if (chain.candidates.length === 0) {
+      recordNoReviewProvider(role, 'role-chain-exhausted', chain.skipped);
+      throw noReviewProviderError(chain.exhaustedReason ?? `role-chain-exhausted: ${role}`);
+    }
     const skippedCodex = chain.skipped.find(s => s.provider === 'openai-codex');
     if (skippedCodex) recordPodFallback(role, skippedCodex.why);
     const r = await runReviewWithFallback(
@@ -1254,39 +1269,51 @@ export async function buildDefaultSelfImplementSeams(
   };
   const defaultApiReview = async (prompt: string): Promise<string> => {
     if (reviewAttempts.length === 0) {
-      const error = noUsableReviewProviderError(reviewPlan.skipped);
+      recordNoReviewProvider('review', 'no-usable-provider', reviewPlan.skipped);
+      const base = noUsableReviewProviderError(reviewPlan.skipped);
+      const error = noReviewProviderError(base.message);
       try { debug.log('self-dev.review-fallback', 'no-usable-provider', { candidates: reviewPlan.skipped }); } catch { /* fail-soft */ }
       throw error;
     }
-    const r = await runReviewWithFallback(
-      reviewAttempts,
-      callAttempt(prompt),
-      observeFallback(),
-      {
-        skipUnavailable: (attempt: (typeof reviewAttempts)[number]) => {
-          if (attempt.label !== 'primary' && inferProviderFromModel(attempt.model) === 'grok') {
-            const quota = (deps.reviewGrokQuota ?? readCachedGrokQuota)();
-            if (quota !== 'usable') return {
-              label: attempt.label, model: attempt.model, provider: 'grok',
-              why: quota === 'exhausted' ? 'quota-threshold' as const : 'quota-unmeasured' as const,
-            };
-          }
-          if (process.env.ELANOUS_SUBSTRATE !== 'pod') return undefined;
-          if (!attempt.provider) return undefined;
-          try {
-            return attempt.provider.available() ? undefined : {
-              label: attempt.label, model: attempt.model, provider: attempt.provider.name, why: 'no-credential' as const,
-            };
-          } catch {
-            return {
-              label: attempt.label, model: attempt.model, provider: attempt.provider.name, why: 'availability-check-failed' as const,
-            };
-          }
+    // TA-POD-REVIEW-PROVIDER-ALLOW — every attempt unavailable at call time = no reviewer was ever called: same ledger line and marker.
+    let r: Awaited<ReturnType<typeof runReviewWithFallback>>;
+    try {
+      r = await runReviewWithFallback(
+        reviewAttempts,
+        callAttempt(prompt),
+        observeFallback(),
+        {
+          skipUnavailable: (attempt: (typeof reviewAttempts)[number]) => {
+            if (attempt.label !== 'primary' && inferProviderFromModel(attempt.model) === 'grok') {
+              const quota = (deps.reviewGrokQuota ?? readCachedGrokQuota)();
+              if (quota !== 'usable') return {
+                label: attempt.label, model: attempt.model, provider: 'grok',
+                why: quota === 'exhausted' ? 'quota-threshold' as const : 'quota-unmeasured' as const,
+              };
+            }
+            if (process.env.ELANOUS_SUBSTRATE !== 'pod') return undefined;
+            if (!attempt.provider) return undefined;
+            try {
+              return attempt.provider.available() ? undefined : {
+                label: attempt.label, model: attempt.model, provider: attempt.provider.name, why: 'no-credential' as const,
+              };
+            } catch {
+              return {
+                label: attempt.label, model: attempt.model, provider: attempt.provider.name, why: 'availability-check-failed' as const,
+              };
+            }
+          },
+          preSkipped: reviewPlan.skipped,
+          maxCalls: 2,
         },
-        preSkipped: reviewPlan.skipped,
-        maxCalls: 2,
-      },
-    );
+      );
+    } catch (error) {
+      if (error instanceof NoUsableReviewProviderError) {
+        recordNoReviewProvider('review', 'no-usable-provider', error.skipped);
+        throw noReviewProviderError(error.message);
+      }
+      throw error;
+    }
     reviewerRan.review = { provider: r.used.provider?.name ?? 'unknown', model: r.used.model };
     return r.text;
   };

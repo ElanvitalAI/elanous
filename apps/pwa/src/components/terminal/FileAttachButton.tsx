@@ -19,14 +19,17 @@ import { toast } from 'sonner';
 import { debugLog } from '@/lib/debug';
 import { uploadAttachments, type AttachmentMeta } from '@/lib/upload-attachment';
 import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
+import { LOCAL_NOTE_LIMIT_NOTICE } from '@/lib/local-note-attach';
 import { extractPickedFiles } from '@/lib/chat-paste-drop';
 
 interface Props {
   onAttached?: (entries: AttachmentMeta[]) => void;
   chatLimits?: boolean;
+  /** Bare webchat: hand raw files to the caller (browser-side read, no upload). */
+  onLocalFiles?: (files: File[]) => void;
 }
 
-export function FileAttachButton({ onAttached, chatLimits = false }: Props) {
+export function FileAttachButton({ onAttached, chatLimits = false, onLocalFiles }: Props) {
   const { config } = useDaemon();
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -35,6 +38,7 @@ export function FileAttachButton({ onAttached, chatLimits = false }: Props) {
     const list = ev.target.files;
     ev.target.value = '';
     if (!list || list.length === 0) return;
+    if (onLocalFiles) { onLocalFiles(Array.from(list)); return; }
     if (!config.baseUrl) {
       toast.error(NEXUS_URL_MISSING);
       return;
@@ -87,7 +91,7 @@ export function FileAttachButton({ onAttached, chatLimits = false }: Props) {
         onClick={() => inputRef.current?.click()}
         disabled={busy}
         aria-label="attach files"
-        title="attach files (Files.app · iCloud · multi-select)"
+        title={onLocalFiles ? `attach notes (${LOCAL_NOTE_LIMIT_NOTICE})` : 'attach files (Files.app · iCloud · multi-select)'}
         className="flex min-h-11 min-w-11 items-center justify-center rounded p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
       >
         {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FilePlus2 className="h-3.5 w-3.5" />}
@@ -96,6 +100,7 @@ export function FileAttachButton({ onAttached, chatLimits = false }: Props) {
         ref={inputRef}
         type="file"
         multiple
+        {...(onLocalFiles ? { accept: '.txt,.md,text/plain,text/markdown' } : {})}
         className="hidden"
         onChange={onPick}
       />

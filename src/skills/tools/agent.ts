@@ -437,6 +437,11 @@ export function buildAgentTool(): LLMToolSpec {
 }
 
 export interface DispatchAgentOpts {
+  /** Internal in-process callers only (never model-reachable, not a tool arg):
+   *  run the child as an awaited foreground task and return its real result.
+   *  Bypasses the #38772 background default, the 10 s capsule sync-cap detach
+   *  and the queue-ticket detach. The caller bounds the wait with `signal`. */
+  awaitResult?: boolean;
   /** Owning conversation session, copied to background completion receipts. */
   parentSessionId?: string;
   /** Registry parent for a nested Agent call; omitted for a top-level child. */
@@ -558,7 +563,7 @@ async function dispatchAgentCore(
   const requestedMaxTurns = resolveAgentToolMaxTurns(args.max_turns);
 
   // PFC-S1 P1: new optional fields.
-  let runInBackground = args.run_in_background !== false;
+  let runInBackground = args.run_in_background !== false && opts.awaitResult !== true;
   const completionDelivery = args.completion_delivery === 'supplement' ? 'supplement' : 'follow-up';
   const requestedBudgetMinutes = typeof args.budget_minutes === 'number' && Number.isFinite(args.budget_minutes)
     ? Math.max(1, Math.min(60, Math.floor(args.budget_minutes)))
@@ -761,7 +766,8 @@ async function dispatchAgentCore(
         });
       };
       let queueTimer: ReturnType<typeof setTimeout> | undefined;
-      if (args.wait_for_slot === undefined) publishTicket();
+      if (opts.awaitResult === true) { /* awaited callers wait for the slot without detaching */ }
+      else if (args.wait_for_slot === undefined) publishTicket();
       else queueTimer = setTimeout(publishTicket, Math.max(0, CAPSULE_SYNC_CAP_MS - (Date.now() - dispatchStartedAt)));
       const admitted = await waitForBackgroundFanoutSlot(fanoutSession, admissionPriority, queueController.signal);
       if (queueTimer) clearTimeout(queueTimer);
@@ -1355,6 +1361,7 @@ async function dispatchAgentCore(
     ...(appliedIsolation ? { isolation: appliedIsolation } : {}),
   };
   })();
+  if (opts.awaitResult === true) return await foreground;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const detached = new Promise<AgentToolResult>(resolve => {
     timer = setTimeout(() => {

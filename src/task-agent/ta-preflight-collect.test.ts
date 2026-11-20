@@ -3,13 +3,13 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { Command } from 'commander';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
-import { collectRuntimePreflightEvidence, evidenceFromRunLedger, mergeCollectedEvidence } from './ta-preflight-collect.js';
+import { collectRuntimePreflightEvidence, evidenceFromRunLedger, mergeCollectedEvidence, observeTargetPaths } from './ta-preflight-collect.js';
 import { evaluateTaPreflight } from './ta-preflight.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 
@@ -18,8 +18,28 @@ const OTHER_SHA = 'b'.repeat(40);
 const PIN_DIGEST = `sha256:${'c'.repeat(64)}`;
 const OTHER_DIGEST = `sha256:${'d'.repeat(64)}`;
 
+test('target paths are observed inside the selected card project', () => {
+  const root = mkdtempSync(join(tmpdir(), 'preflight-target-'));
+  try {
+    writeFileSync(join(root, 'present.ts'), '');
+    expect(observeTargetPaths({ text: '대상 경로: present.ts', project: { target: root } })).toBe(true);
+    expect(observeTargetPaths({ text: '대상 경로: missing.ts', project: { target: root } })).toBeNull();
+    expect(observeTargetPaths({ text: 'label absent', project: { target: root } })).toBe(false);
+    expect(observeTargetPaths({ text: '대상 경로: ../outside.ts', project: { target: root } })).toBe(false);
+    symlinkSync(tmpdir(), join(root, 'escape'));
+    expect(observeTargetPaths({ text: '대상 경로: escape/.', project: { target: root } })).toBe(false);
+    expect(observeTargetPaths({ text: '대상 경로: present.ts' })).toBeNull();
+    expect(observeTargetPaths(null)).toBeNull();
+    expect(evaluateTaPreflight({ entrance: { name: 'hand', targetPathsValid: null, groundingPolicy: { off: true, reason: 'policy' } } }).conditions[5]?.status).toBe('UNMEASURED');
+    expect(evaluateTaPreflight({ entrance: { name: 'hand', targetPathsValid: false, groundingPolicy: { off: true, reason: 'policy' } } }).conditions[5]?.status).toBe('FAIL');
+    expect(evaluateTaPreflight({ entrance: { name: 'hand', targetPathsValid: true, targetHostBound: null, groundingPolicy: { off: true, reason: 'policy' } } }).conditions[5]?.status).toBe('UNMEASURED');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('runtime collection measures the selected card claim and active runs; unknown is not zero', () => {
   const card = { id: 'ta-collect', seat: 'TC', status: 'handed' as const, history: [] };
+  expect(collectRuntimePreflightEvidence({ card, activeRuns: [], opHoldActive: false }).owner.card).toBe('TC');
+  expect(collectRuntimePreflightEvidence({ card: null, activeRuns: 'unknown', opHoldActive: null }).owner.card).toBeNull();
   expect(collectRuntimePreflightEvidence({ card, activeRuns: [], opHoldActive: false }).launch)
     .toMatchObject({ cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }); // 출처: #98174 격리 카드·빈 원장 픽스처.
   expect(collectRuntimePreflightEvidence({ card: { ...card, history: [{ event: 'preflight-live-claim' }] }, activeRuns: 'unknown', opHoldActive: null }).launch)
@@ -43,7 +63,7 @@ test('preflight CLI reads card claim and exact-goal run observation, preserving 
   const run = async (active: (goalId: string) => readonly string[] | 'unknown') => {
     const lines: string[] = []; const program = new Command().name('elanous').exitOverride();
     registerTasksCommands(program, { taskStatePath: statePath, output: line => lines.push(line),
-      preflightActiveRuns: active, preflightHoldActive: () => false });
+      preflightActiveRuns: active, preflightHoldActive: () => false, preflightAllocation: () => null });
     await program.parseAsync(['node', 'eln', 'tasks', 'preflight', '--evidence', evidencePath, '--card', id]);
     return lines.join('\n');
   };
@@ -57,19 +77,38 @@ test('preflight CLI reads card claim and exact-goal run observation, preserving 
   } finally { process.exitCode = previous ?? 0; rmSync(root, { recursive: true, force: true }); }
 });
 
+test('preflight records only the observed allocation and drops a supplied claim on failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'preflight-alloc-'));
+  const statePath = join(root, 'tasks.json'), evidencePath = join(root, 'evidence.json'), receiptPath = join(root, 'receipt.json');
+  const id = 'ta-allocation';
+  writeFileSync(statePath, JSON.stringify({ tasks: { [id]: { id, text: 'goal', status: 'handed', history: [] } } }));
+  writeFileSync(evidencePath, JSON.stringify({ cardId: id, allocation: { host: 'fake', allocationId: 'fake', expiresAt: 9999 } }));
+  const previous = process.exitCode;
+  try {
+    for (const allocation of [{ host: 'node-c', allocationId: 'alloc-test', expiresAt: 2000 }, null]) {
+      const program = new Command().name('elanous').exitOverride();
+      registerTasksCommands(program, { taskStatePath: statePath, output: () => {}, preflightActiveRuns: () => [],
+        preflightHoldActive: () => false, preflightAllocation: () => allocation });
+      await program.parseAsync(['node', 'eln', 'tasks', 'preflight', '--evidence', evidencePath, '--card', id, '--out', receiptPath]);
+      expect(JSON.parse(readFileSync(receiptPath, 'utf8')).evidence.allocation).toEqual(allocation);
+    }
+  } finally { process.exitCode = previous ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
 test('preflight without card cannot trust supplied launch observations for cell or commit receipt', async () => {
   const root = mkdtempSync(join(tmpdir(), 'preflight-no-card-'));
   const evidencePath = join(root, 'evidence.json');
-  writeFileSync(evidencePath, JSON.stringify({ workOrder: { cellId: 'cell-1' }, source: { requestedPin: 'a'.repeat(40) }, launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false } }));
+  writeFileSync(evidencePath, JSON.stringify({ workOrder: { cellId: 'cell-1', boundary: 'src/a.ts', budget: 'time=3600s usd=3', contract: 'c', escalation: 'OP', unknownFields: [], owner: 'TC', card: 'card-1', noAutoMerge: true }, launchArgv: ['harness', 'say', '--no-auto-merge'], mergePolicy: { taLandEnv: false }, source: { requestedPin: 'a'.repeat(40) }, owner: { card: 'TC', lease: 'TC', pod: 'TC' }, launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false } }));
   const previous = process.exitCode;
   try {
     for (const target of [['--cell', 'cell-1'], ['--commit', 'a'.repeat(40)]]) {
       const lines: string[] = [];
       const program = new Command().name('elanous').exitOverride();
       registerTasksCommands(program, { taskStatePath: join(root, 'tasks.json'), output: line => lines.push(line),
-        preflightActiveRuns: () => [], preflightHoldActive: () => false });
+        preflightActiveRuns: () => [], preflightHoldActive: () => false, preflightAllocation: () => null });
       await program.parseAsync(['node', 'eln', 'tasks', 'preflight', '--evidence', evidencePath, ...target]);
       expect(lines.join('\n')).toMatch(/UNMEASURED +5\./u);
+      expect(lines.join('\n')).toContain('카드/lease/Pod owner 증거 부족');
     }
   } finally { process.exitCode = previous ?? 0; rmSync(root, { recursive: true, force: true }); }
 });

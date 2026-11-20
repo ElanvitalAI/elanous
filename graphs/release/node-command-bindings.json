@@ -41,5 +41,9 @@
   },
   "pod-reuse-prep": {
     "recipe": "none"
+  },
+  "traffic-prep": {
+    "recipe": "cmd:traffic-prep",
+    "command": "bun scripts/release-loop/traffic-prep-node.ts"
   }
 }

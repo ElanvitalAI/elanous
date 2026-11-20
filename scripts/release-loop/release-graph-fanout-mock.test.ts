@@ -105,6 +105,9 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
     calls.set(context.nodeId, (calls.get(context.nodeId) ?? 0) + 1);
     if (context.graphId === 'pod-reuse-prep') return { stdout: JSON.stringify({ outcome: 'legacy', verdict: 'legacy',
       reason: 'prep-body-pending', receiptPath: '' }), stderr: '', exitCode: 0 };
+    // The reuse-prep subgraph unit requires cutSha, which the release YAML sources from the cutoff node output.
+    if (context.nodeId === 'cutoff') return { stdout: JSON.stringify({ outcome: 'ok', version: '0.2.44',
+      commit: 'a'.repeat(40), branch: 'release/0.2.44', cutoff: { sha: 'a'.repeat(40) } }), stderr: '', exitCode: 0 };
     if (context.nodeId === 'docs-land' || context.nodeId === 'version-dev-bump') {
       activeBranches++;
       maxActiveBranches = Math.max(maxActiveBranches, activeBranches);
@@ -115,7 +118,7 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
       const ok = context.nodeId !== 'docs-land' || !failDocsLand;
       return { stdout: JSON.stringify({ outcome: ok ? 'ok' : 'fail', artifact: `${context.nodeId}-${calls.get(context.nodeId)}` }), stderr: '', exitCode: ok ? 0 : 1 };
     }
-    const extra = context.nodeId === 'version-release' ? { version: '0.2.44', commit: 'a'.repeat(40), branch: 'release/0.2.44' } : {};
+    const extra = context.nodeId === 'version-release' || context.nodeId === 'cut-branch' ? { version: '0.2.44', commit: 'a'.repeat(40), branch: 'release/0.2.44' } : {};
     const outcome = context.nodeId === 'gate-cutover-switch' ? 'legacy' : 'ok';
     return { stdout: JSON.stringify({ outcome, ...extra }), stderr: '', exitCode: 0 };
   };

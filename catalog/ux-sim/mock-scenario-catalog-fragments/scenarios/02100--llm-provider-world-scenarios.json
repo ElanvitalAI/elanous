@@ -1,0 +1,20 @@
+{
+  "id": "LLM-PROVIDER-WORLD-SCENARIOS",
+  "name": "LLM provider simulation world scenarios",
+  "kind": "llm-provider-spend-world",
+  "device": "llm-sim-world",
+  "implementation": [
+    "src/ux-sim/llm-provider-world/world.ts",
+    "src/ux-sim/llm-provider-world/scenarios.ts"
+  ],
+  "tests": [
+    "src/ux-sim/llm-provider-world/scenarios.test.ts"
+  ],
+  "trigger": "Drive the fake world (subscription exhaustion, window reset by advancing the shared clock, spend cap, auto top-up, role creditOk, review GLM deny, concurrent reservations, host-only claude-acp, vault supply, remote desiredSha drift) and call the real decideLlmSpend and runLlmSpendGuard.",
+  "observe": [
+    "chosen row, switch and return ledger actions, stop reason codes and skipped-row reasons as literal values in the tests",
+    "no secret-shaped text in device errors, decision output, guard ledger or reservation ledger",
+    "concurrent reservations never exceed the remaining daily cap, on both the memory and the file ledger"
+  ],
+  "expected": "Subscriptions are walked in the default fallbackOrder, credit is used only for roles with creditOk and under the cap, review never reaches a GLM model, and every value is fixed as a literal in scenarios.test.ts."
+}

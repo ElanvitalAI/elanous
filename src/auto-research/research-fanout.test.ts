@@ -111,7 +111,7 @@ test('fanout times out a stalled angle and withholds unsupported text without lo
     return new Promise<never>((_resolve, reject) => {
       signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
-  }, { workerTimeoutMs: 5 });
+  }, { angleDeadlineMs: 5 });
 
   expect(Date.now() - startedAt).toBeLessThan(2_000);
   expect(result.angles.map(({ status }) => status)).toEqual(['complete', 'failed', 'failed']);

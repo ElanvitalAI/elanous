@@ -12,12 +12,20 @@ const REQUEST_TIMEOUT_MS = 10_000;
 
 const NO_SERVER = 'els: no els server is running — start it with `els serve` (or `elanous side serve`)';
 
-export function requestEls(socketPath: string, request: ElsRequest, timeoutMs = REQUEST_TIMEOUT_MS): Promise<ElsResult> {
+/** The inherited pane credential — a pane's env carries the server-minted token, so the door can judge the request. */
+function paneAuth(credential?: string): ElsRequest | undefined {
+  const token = process.env.ELANOUS_ELS_PANE_TOKEN ?? process.env.ELANOUS_ELS_OWNER_TOKEN ?? credential;
+  return token ? { op: 'auth', token, pid: process.pid } : undefined;
+}
+
+export function requestEls(socketPath: string, request: ElsRequest, timeoutMs = REQUEST_TIMEOUT_MS, credential?: string): Promise<ElsResult> {
   const tooLong = elsSocketPathProblem(socketPath);
   if (tooLong) return Promise.resolve({ exitCode: 1, message: tooLong });
   return new Promise((resolve) => {
     const socket = createConnection(socketPath);
     let settled = false;
+    const auth = paneAuth(credential);
+    let awaitingAck = Boolean(auth);
     const done = (result: ElsResult): void => {
       if (settled) return;
       settled = true;
@@ -26,8 +34,12 @@ export function requestEls(socketPath: string, request: ElsRequest, timeoutMs = 
       resolve(result);
     };
     const timer = setTimeout(() => done({ exitCode: 1, message: `els: the els server did not answer within ${timeoutMs} ms` }), timeoutMs);
-    socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on('connect', () => {
+      if (auth) socket.write(`${JSON.stringify(auth)}\n`);
+      socket.write(`${JSON.stringify(request)}\n`);
+    });
     const lines = createLineDecoder((line) => {
+      if (awaitingAck) { awaitingAck = false; return; } // the auth ack line — the answer comes on the next line
       try { done(JSON.parse(line) as ElsResult); }
       catch { done({ exitCode: 1, message: 'els: malformed answer from the els server' }); }
     });

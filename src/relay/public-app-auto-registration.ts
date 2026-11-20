@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { debug } from "../debug/log.js";
 import {
   closeSync,
   constants,
@@ -704,6 +705,27 @@ export function createRelayAutoAppRegistrar(options: {
           item.serverId === authenticatedServerId &&
           item.ownerId === authenticatedOwnerId,
       );
+    },
+    // WEBCHAT-PIN-RESTORE — 인증 호스트가 «자기 소유 회원» 몫으로 갖는 정적 claim 열거.
+    // 재시작한 핸들 Nexus 가 메모리 원장(핀)을 재구성하는 재생 원천. 호스트가
+    // 소유 회원에 결속·신뢰 등재된 경우에만 답하고 남의 claim 은 절대 싣지 않는다.
+    queryHandleClaims(authenticatedServerId: string, authenticatedOwnerId: string) {
+      const staticPolicy = options.staticPolicy();
+      // 값 없는 사유 코드 — 빈 목록의 원인(ⓐ 클레임 없음 · ⓒ 소유자 불일치)을 가른다.
+      if (staticPolicy.hostOwnerMemberIds.get(authenticatedServerId) !== authenticatedOwnerId) {
+        debug.log("relay.claims", "claims-query-empty", { reason: "host-owner-mismatch" });
+        return [];
+      }
+      if (!staticPolicy.trustedHostKeys.has(authenticatedServerId)) {
+        debug.log("relay.claims", "claims-query-empty", { reason: "host-key-untrusted" });
+        return [];
+      }
+      const claims = [...(staticPolicy.publicHandleClaimOwners ?? [])]
+        .filter(([, owner]) => owner === authenticatedOwnerId)
+        .map(([handle]) => ({ handle, memberId: authenticatedOwnerId }));
+      if (claims.length === 0)
+        debug.log("relay.claims", "claims-query-empty", { reason: "no-owner-claims" });
+      return claims;
     },
     // (출처: #39104) 회원 서버 서비스 자격 «핀 읽기» — 인증 주체(연결 소유자)와
     // 무관하게 회원 M 소유의 핀 여부만 불리언으로 답한다. 핀 쓰기는 이 자격으로

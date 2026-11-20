@@ -10,6 +10,7 @@ import { buildExaWebSearchProvider } from './exa.js';
 import { buildFirecrawlWebSearchProvider } from './firecrawl.js';
 import { buildTavilyWebSearchProvider } from './tavily.js';
 import { buildFreeWebSearchProvider } from './free.js';
+import { buildFixedTestWebSearchProvider, testFixedSearchActive } from './test-fixed-search.js';
 import { isPaidWebSearchEnabled, isTavilySearchEnabled } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { wantsGrokSearch, wantsXSearch } from './x-intent.js';
@@ -35,6 +36,8 @@ const providers: WebSearchProvider[] = [];
 let includeEnvironmentResearchExa = true;
 
 function registerBuiltins(): void {
+  // Test boundary: an isolated fake-LLM universe may pin one fixed provider instead of the credential-backed list.
+  if (testFixedSearchActive()) { providers.push(buildFixedTestWebSearchProvider()); return; }
   // Firecrawl is the configured general default; DDG is the last keyless fallback. Grok stays explicit.
   // Other providers remain registered for explicit provider selection only.
   // Provider registration snapshots config at module load; changing these gates requires a process restart.

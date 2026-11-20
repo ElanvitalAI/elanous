@@ -13,6 +13,7 @@
 //                                              폴링마다 «자식이 아직 사나»를 같이 본다
 //   ⑤ 정리는 «모든» 경로에서 난다               → 성공·실패·예외 어디서든 stop 을 부르고 stop 은 멱등이다
 
+import { terminateTree, TERMINATE_TREE_KILL_WAIT_MS } from '../shell-primitive/terminate-tree.js';
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { connect as netConnect } from 'node:net';
 import { readFile } from 'node:fs/promises';
@@ -132,16 +133,6 @@ export function defaultProbePort(port: number, timeoutMs = 500): Promise<boolean
   });
 }
 
-/** 기본 그룹 종료 — detached 자식은 pgid 가 pid 와 같으므로 음수 pid 로 그룹에 보낸다. */
-export function defaultKillGroup(pid: number, signal: NodeJS.Signals): boolean {
-  try {
-    process.kill(-pid, signal);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** 기본 그룹 생존 검사 — 신호 0 은 «보내지 않고» 존재만 묻는다. ESRCH 면 비었고, EPERM 이면 있다. */
 export function defaultGroupAlive(pid: number): boolean | undefined {
   try {
@@ -168,7 +159,7 @@ export async function launchGoalArtifact(goalPath: string, deps: ArtifactLaunchD
     ?? ((input: { entrypoint?: string; targetPath: string; repositoryRoot: string }) =>
       resolveArtifactLaunchCommand(input as Parameters<typeof resolveArtifactLaunchCommand>[0]) as Promise<ArtifactLaunchCommandResolution>);
   const probePort = deps.probePort ?? ((port: number) => defaultProbePort(port));
-  const killGroup = deps.killGroup ?? defaultKillGroup;
+  const killGroup = deps.killGroup;
   const groupAlive = deps.groupAlive ?? defaultGroupAlive;
   const portOwnerPid = deps.portOwnerPid;
   const sleep = deps.sleep ?? defaultSleep;
@@ -264,37 +255,39 @@ export async function launchGoalArtifact(goalPath: string, deps: ArtifactLaunchD
       observe('stopped', { goalPath, pid: null, escalated: true, groupKilled: false });
       return;
     }
-    // ① 그룹에 보낸다 — 셸이 죽어도 그 자식이 남는 경로를 막는다.
-    // ② 그룹 신호는 «false 반환»으로도 «throw»로도 실패한다 — 둘 다 폴백으로 보낸다.
-    //   초판은 반환값만 봤고, throw 하면 폴백과 이후 정리가 «전부» 건너뛰어졌다(리뷰 must-fix).
-    const signalGroup = (signal: NodeJS.Signals): boolean => {
-      try { return killGroup(pid, signal); } catch { return false; }
-    };
+    // ① KILL-TREE-ONE — 신호 순서·유예·SIGKILL 승격·사후 확인은 공용 terminateTree 한 곳이 가진다.
+    //   이 모듈은 «주입 가능한 이음매»(killGroup · groupAlive)만 sendSignal 로 건네고, 그룹 신호가
+    //   «false 반환 · throw» 로 실패하면 자식 자신에게 폴백한다(리뷰 must-fix ②: 폴백이 건너뛰어지면 고아 경로).
     const signalChild = (signal: NodeJS.Signals): void => {
       try { child.kill(signal); } catch { /* 이미 죽었다 */ }
     };
-    if (!signalGroup('SIGTERM')) signalChild('SIGTERM');
-    // ③ 유예 대기의 now()/sleep() 이 throw 하면 정리가 «중간에» 끝난다 — 삼키고 강제 종료로 간다(리뷰 must-fix).
-    let gracefullyExited = false;
-    try {
-      const graceDeadline = now() + killGraceMs;
-      while (!exited && now() < graceDeadline) await sleep(pollIntervalMs);
-      gracefullyExited = exited;
-    } catch (error) {
-      observe('stop-wait-threw', { goalPath, pid, error: String(error).slice(0, 120) });
-    }
-    // ⛔ 리더가 죽어도 «그룹이 비었다»는 뜻이 아니다 — 손자가 남는다. 그룹을 «따로» 묻는다(리뷰 must-fix 5차).
-    //   못 쟀으면(undefined) 비었다고 가정하지 않고 강제 종료로 간다.
-    if (gracefullyExited) {
-      let alive: boolean | undefined;
-      try { alive = groupAlive(pid); } catch { alive = undefined; }
-      if (alive === false) { observe('stopped', { goalPath, pid, escalated: false, groupConfirmedEmpty: true }); return; }
-      observe('group-survived-leader', { goalPath, pid, groupAlive: alive === undefined ? 'unmeasured' : 'alive' });
-    }
-    // ② 그룹이 안 통했거나 살아남았으면 강제 종료 — 그룹 실패 시에도 «반드시» 폴백을 친다.
-    const groupKilled = signalGroup('SIGKILL');
-    if (!groupKilled) signalChild('SIGKILL');
-    observe('stopped', { goalPath, pid, escalated: true, groupKilled });
+    const sendSignal = (addr: number, signal: NodeJS.Signals | 0): void => {
+      const groupPid = -addr;
+      if (signal === 0) {
+        // ⛔ 리더(셸)의 exit 는 그룹이 비었음을 증명하지 못한다 — 그룹을 «따로» 묻는다(리뷰 must-fix 5차).
+        //   못 쟀으면(undefined) 비었다고 가정하지 않는다: ESRCH 가 아닌 오류로 던져 «있다고 간주 · 승격» 한다.
+        let alive: boolean | undefined;
+        try { alive = groupAlive(groupPid); } catch { alive = undefined; }
+        if (alive === false) throw Object.assign(new Error('group empty'), { code: 'ESRCH' });
+        if (alive === undefined) throw Object.assign(new Error('group unmeasured'), { code: 'EUNMEASURED' });
+        return;
+      }
+      // 이음매가 없으면 terminateTree 의 기본 송신(process.kill)과 같은 길을 쓴다 — 실패는 폴백으로 간다.
+      let delivered = false;
+      try {
+        if (killGroup) delivered = killGroup(groupPid, signal);
+        else { process.kill(addr, signal); delivered = true; }
+      } catch { delivered = false; }
+      if (!delivered) signalChild(signal);
+    };
+    const outcome = await terminateTree(child, {
+      group: true,
+      graceMs: killGraceMs,
+      killWaitMs: Math.min(killGraceMs, TERMINATE_TREE_KILL_WAIT_MS),
+      sendSignal,
+    });
+    if (!outcome.terminated) observe('stop-unconfirmed', { goalPath, pid, errors: outcome.errors.slice(0, 3) });
+    observe('stopped', { goalPath, pid, escalated: outcome.escalated, groupConfirmedEmpty: outcome.terminated && !outcome.escalated });
   };
   const stop = (): Promise<void> => (teardown ??= runStop());
 

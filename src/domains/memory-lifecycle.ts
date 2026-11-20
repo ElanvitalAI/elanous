@@ -86,3 +86,10 @@ export function summarizeLifecycle(r: MemoryLifecycleReport): string {
   if (r.errors.length) parts.push(`⚠️오류${r.errors.length}(${r.errors.map(e => e.stage).join(',')})`);
   return parts.join(' · ') || '변화 없음';
 }
+
+/** 정리 단계를 «각각 독립» 으로 끝까지 돈다 — 앞 단계가 던져도 다음 단계는 실행된다(예외는 모아 반환). */
+export function runAllCleanups(steps: Array<{ name: string; fn: () => void }>): StageError[] {
+  const errors: StageError[] = [];
+  for (const step of steps) guard(step.name, errors, step.fn);
+  return errors;
+}

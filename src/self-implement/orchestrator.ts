@@ -107,7 +107,7 @@ export function formatAutoMergeSuccessMessage(input: {
 import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-run-store.js';
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
 import { getUserConfig } from '../user-config/reader.js';
-import { appendRunLedgerEntries, appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, pathSignatureOf, queryRunChain, runLedgerDir, type RunChainShardSibling, type RunLedgerBatchWriter, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
+import { appendRunLedgerEntries, appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, pathSignatureOf, queryRunChain, runLedgerDir, type RunChainShardSibling, type RunLedgerBatchWriter, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js'; import { unreviewedMergeReason } from '../self-dev/no-review-provider.js';
 import { buildRunStopTerminalEvidence, classifyMergeHoldStop, classifyTerminalHarnessFailure, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
 import { autohealFromStop, parseAutohealMode, pickAutohealAction, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
 import { operationalAutohealActions } from './stop-autoheal-operational.js';
@@ -9311,7 +9311,7 @@ async function runSelfImplementInner(
       : requiredEvidenceMissing ? 'required-evidence-uncovered'
         : decisionSignalRed ? 'decision-signal-red'
         : latestSignalIncomplete ? 'signal-incomplete'
-        : !reviewReal ? 'no-real-review'
+        : !reviewReal ? unreviewedMergeReason(review?.failureReason)
           : review!.verdict === 'fail' ? 'review-must-fix'
           : reviewMustFixCount > 0 ? 'review-warn-with-must-fix'
             : review!.diffTruncated === true ? 'review-diff-truncated'

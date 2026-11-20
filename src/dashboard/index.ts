@@ -817,7 +817,7 @@ import { createDashboardPluginBaseRuntime } from './plugin-base-runtime.js';
 import { createDashboardPluginExecutionRuntime } from './plugin-execution-runtime.js';
 import { createDashboardPluginPaneRuntime } from './plugin-pane-runtime.js';
 import { createDashboardPluginThemeControl } from './plugin-theme-control.js';
-import { registerDashboardPaneArtifactRuntimes } from './pane-artifact-runtime-registration.js';
+import { registerDashboardPaneArtifactRuntimes } from '../tool-runtime/pane-artifact-runtime-registration.js';
 import { handleDashboardAttachmentPopupAction } from './attachment-popup-actions.js';
 import { renderDashboardAttachmentSummary } from './attachment-summary.js';
 import { openDashboardFolderAttachModal } from './folder-attach-modal-runtime.js';
@@ -17475,7 +17475,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             },
             runTailAutoCopy: async (userText, fullResponse) => {
               await runDashboardTurnTailAutoCopy({
-                enabled: opts.benchmark === true || getUserConfig().chat.autoCopyQaToClipboard,
+                enabled: opts.benchmark === true,
                 userText,
                 fullResponse,
                 autoCopyTurnQaToClipboard,

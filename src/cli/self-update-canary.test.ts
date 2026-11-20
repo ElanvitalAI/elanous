@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { planEdgeRail, type EdgeRailInput } from './self-update-canary.js';
 import { canaryRunSucceededInLedger, missingFixCommitTitles, runUpdateForInstallation, type SelfUpdateDeps } from './self-update.js';
 
@@ -37,7 +37,12 @@ test('rising measured failure rate rolls back; insufficient samples and non-quie
 function setup() {
   const root = mkdtempSync(join(tmpdir(), 'edge-rail-'));
   const stateDir = join(root, 'state');
-  const checkout = resolve(import.meta.dir, '../..');
+  // 체크아웃은 임시 디렉터리 — 실제 트리의 apps/pwa/out 유무(빌드 여부)에 시험이 좌우되지 않는다(#38401 이후 dev 레일은 PWA 출력 없으면 거절).
+  const checkout = join(root, 'checkout');
+  mkdirSync(join(checkout, 'scripts'), { recursive: true });
+  writeFileSync(join(checkout, 'scripts/install.sh'), '#!/bin/sh\n');
+  mkdirSync(join(checkout, 'apps/pwa/out'), { recursive: true });
+  writeFileSync(join(checkout, 'apps/pwa/out/index.html'), '<html></html>');
   const previous = '0.2.16-aaaaaaaaaaaa';
   const oldEntry = join(root, 'versions', previous, 'node_modules', 'elanous', 'bin');
   mkdirSync(oldEntry, { recursive: true });

@@ -89,10 +89,13 @@ test('Bash: an escaped grandchild holding the pipe cannot keep the tool open pas
   const command = `perl -e 'use POSIX; exit 0 if fork; POSIX::setsid(); sleep 8'`;
   const result = await dispatchBash({ command }, { cwd, stallMs: TINY_STALL_MS });
   expect(result.watchdog?.status).toBe('stalled');
-  // Order, not wall clock: stalled → SIGTERM → SIGKILL → forced result (the pipe never closed).
+  // Order, not wall clock: stalled → SIGTERM → forced result (the pipe never closed). KILL-TREE-ONE:
+  // the shared terminateTree escalates to SIGKILL only while the process GROUP is still present; here
+  // the group (the shell) is gone after SIGTERM and the grandchild escaped it, so no SIGKILL is sent
+  // (it would have addressed an empty group). The forced result after the second grace is unchanged.
   const order = events.filter((e) => e.category === 'tool.watchdog')
     .map((e) => e.event === 'kill' ? `kill:${(e.data as { signal: string }).signal}` : e.event);
-  expect(order).toEqual(['stalled', 'kill:SIGTERM', 'kill:SIGKILL', 'forced-close']);
+  expect(order).toEqual(['stalled', 'kill:SIGTERM', 'forced-close']);
 }, 15_000);
 
 test('RunShell legacy argv path: the same stall line applies (env override)', async () => {

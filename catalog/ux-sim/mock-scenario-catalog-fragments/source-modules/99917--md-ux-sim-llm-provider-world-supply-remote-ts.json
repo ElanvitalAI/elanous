@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-LLM-PROVIDER-WORLD-SUPPLY-REMOTE-TS",
+  "path": "src/ux-sim/llm-provider-world/supply-remote.ts",
+  "boundary": "Fake vault supply targets (pod, ta, config-dir as an in-memory 0600 model) with the real supply.ts refusal reasons and sim-clock lease TTL, plus a fake remote host whose heartbeat reports desiredSha, observedSha and alive; no value, key, network, file or host is ever touched",
+  "deviceIds": ["llm-sim-supply-targets", "llm-sim-remote-host"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-WORLD-MEMORY-STORE-TS",
+  "path": "src/ux-sim/sim-world/memory/store.ts",
+  "boundary": "D17 sim-memory: in-process stand-in for the graph memory storage port (read/write/promote/expire) with three layers, approval-gated promote, tenant isolation, serialized writes, death mid-write and clock-driven expiry; no persistence, ranking or capacity limits.",
+  "deviceIds": [
+    "sim-world-memory"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

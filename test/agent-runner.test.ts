@@ -555,7 +555,7 @@ describe('runAgent — definition model fallback', () => {
 });
 
 // ── SUBAGENT-ENCAPSULATION — «못 했다»형 답은 안에서 잇는다 · 밖으로는 완료·이상만 ──
-import { classifySubagentExit, SUBAGENT_CONTINUE_INSIDE_CAP, SUBAGENT_CONTINUE_INSIDE_PROMPT } from '../src/agent/runner';
+import { classifySubagentExit, isPrefaceOnly, SUBAGENT_CONTINUE_INSIDE_CAP, SUBAGENT_CONTINUE_INSIDE_PROMPT, SUBAGENT_PREFACE_CONTINUE_PROMPT } from '../src/agent/runner';
 import { createGlobalSubagentCallable } from '../src/agent/subagent-callable';
 
 describe('SUBAGENT-ENCAPSULATION', () => {
@@ -654,6 +654,61 @@ describe('SUBAGENT-ENCAPSULATION', () => {
     const h2 = reg.spawn({ definition: simpleDefinition(), prompt: 'y', tools, provider: diff.provider, dispatchTool: async () => 'ok' });
     await collectAgentText(h2.events);
     expect(diff.calls()).toBe(1 + SUBAGENT_CONTINUE_INSIDE_CAP);
+  });
+
+  // HAND-RUN-ENDS-ON-PREFACE (TC #94015 · POOL-2 #93934 «이제 세 개의 소스 파일을 작성합니다» 22 s · 커밋 0)
+  test('안내만 남기고 도구 0 인 걸음은 안에서 한 번 «지금 하라» 로 잇는다 · 그 답이 밖으로', async () => {
+    const reg = new AgentRegistry();
+    const cap = capturingProvider(['이제 세 개의 소스 파일을 작성합니다.', '작성 완료 · a.ts b.ts c.ts']);
+    const h = reg.spawn({ definition: simpleDefinition(), prompt: '세 파일 작성', tools, provider: cap.provider, dispatchTool: async () => 'ok' });
+    let streamed = '';
+    for await (const ev of h.events) if (ev.type === 'text') streamed += ev.delta;
+    expect([cap.calls(), cap.lastUser()[1], h.task.result, streamed]).toEqual([2, SUBAGENT_PREFACE_CONTINUE_PROMPT, '작성 완료 · a.ts b.ts c.ts', '작성 완료 · a.ts b.ts c.ts']);
+  });
+
+  test('또 안내뿐이면 한 번으로 멈추고 그대로 밖으로(되풀이 0)', async () => {
+    const reg = new AgentRegistry();
+    const cap = capturingProvider(['지금 바로 구현하겠습니다.']);
+    const h = reg.spawn({ definition: simpleDefinition(), prompt: 'x', tools, provider: cap.provider, dispatchTool: async () => 'ok' });
+    await collectAgentText(h.events);
+    expect([cap.calls(), h.task.result]).toEqual([2, '지금 바로 구현하겠습니다.']);
+  });
+
+  test('도구를 부른 걸음은 끝 문장이 «하겠습니다» 여도 잇지 않는다', async () => {
+    const provider = fakeProvider([
+      [{ type: 'tool_call', id: 'c1', name: 'Read', args: {} }],
+      [{ type: 'text', delta: '파일 셋을 썼습니다. 다음으로 PR 을 열겠습니다.' }],
+    ]);
+    const h = new AgentRegistry().spawn({ definition: simpleDefinition({ tools: ['Read'] }), prompt: 'x', tools, provider, dispatchTool: async () => 'ok' });
+    await collectAgentText(h.events);
+    expect([h.task.toolCallCount, h.task.result]).toEqual([1, '파일 셋을 썼습니다. 다음으로 PR 을 열겠습니다.']);
+  });
+
+  test('판별기(안내 전용): 미래형·«이제/먼저 …합니다»·I\'ll/Let me 만 · 결과 보고·긴 답은 아님', () => {
+    expect(['이제 세 개의 소스 파일을 작성합니다.', '테스트를 먼저 돌려 보겠습니다', "I'll now write the three files.", 'Let me check the repo first.', 'OK, I will implement it.']
+      .map(isPrefaceOnly)).toEqual([true, true, true, true, true]);
+    expect(['작업 완료 · 3 files', '테스트를 통과합니다.', `${'긴 결과 보고 '.repeat(40)}다음으로 정리하겠습니다.`, '권한이 없어 완료하지 못했습니다', ''].map(isPrefaceOnly))
+      .toEqual([false, false, false, false, false]);
+  });
+
+  test('실질 답변 뒤의 계획은 안내 전용이 아니다 (영어·한국어)', async () => {
+    const answers = [
+      'The answer is 42. I will check the repo.',
+      '결과는 42입니다. 다음으로 정리하겠습니다.',
+      '결과는 42입니다. 이제 테스트를 실행합니다.',
+      'The answer is 42.\nLet me check the repo.',
+      '결과는 42입니다.\n테스트를 돌려 보겠습니다.',
+    ];
+    for (const answer of answers) {
+      expect(isPrefaceOnly(answer)).toBe(false);
+      const cap = capturingProvider([answer, '잘못된 재시도']);
+      const h = new AgentRegistry().spawn({ definition: simpleDefinition(), prompt: 'x', provider: cap.provider });
+      expect(await collectAgentText(h.events)).toBe(answer);
+      expect(cap.calls()).toBe(1);
+    }
+    expect(isPrefaceOnly('먼저 파일을 확인하겠습니다. 다음으로 테스트를 실행하겠습니다.')).toBe(true);
+    expect(isPrefaceOnly("I'll check the files. Then I will run the tests.")).toBe(false);
+    expect(isPrefaceOnly("I'll check the files. I'll run the tests.")).toBe(true);
   });
 
   test('판별기: 완료·진행 답은 done · 미완형은 incomplete · 이상 사유가 섞이면 abnormal', () => {

@@ -1452,6 +1452,24 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 release.loop.gateRemote)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
     .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
+  // RELEASE-TRAFFIC-PREP-T1H — OP 대표 #108102: 예행·발행 런 1시간 전 트래픽 컨트롤(영수증 = release/<v>/traffic-prep.json).
+  release.command('traffic-prep')
+    .description('런 1시간 전 트래픽 컨트롤 — cutAt−1h ~ cutAt 창 안에서만 traffic.json 을 gate 로 전환하고 영수증 기록 · rc 예행도 같은 단계 · --restore 는 런을 접을 때 원복')
+    .requiredOption('--version <v>', '판(x.y.z)')
+    .option('--prerelease <kind>', 'rc 예행 — release run --prerelease rc 와 같은 <v>-rc.<다음 빈 번호>')
+    .option('--cut-at <iso>', '런 시작 시각(rc 예행 필수 · 정식은 일정 cutAt 과 같아야)')
+    .option('--restore', '이 판의 traffic-prep 을 원복하고 영수증을 무효로 표시')
+    .option('--json', '결과 한 줄 JSON(stdout)')
+    .action(async (o: { version: string; prerelease?: string; cutAt?: string; restore?: boolean; json?: boolean }) => {
+      await jsonAction(o.json, async (log) => {
+        const { runTrafficPrepCommand } = await import('../../scripts/release-loop/traffic-node.js');
+        const result = await runTrafficPrepCommand({ version: o.version, ...(o.prerelease !== undefined ? { prerelease: o.prerelease } : {}),
+          ...(o.cutAt !== undefined ? { cutAt: o.cutAt } : {}), ...(o.restore ? { restore: true } : {}) });
+        log(result.ok ? `✅ traffic-prep ${result.version}${o.restore ? ' 원복' : ''} · ${result.receiptPath}`
+          : `⛔ traffic-prep ${result.version} ${result.reason}: ${result.detail}`);
+        return result;
+      }, (result) => result.ok);
+    });
   release.command('preflight')
     .description('컷 전 사전 점검(기본 읽기 전용) — --countdown 은 단계 판정 모델만 표시하고 컷을 실행하지 않는다. --allow-side-effects 를 명시해야 실패 우편·원장을 기록한다.')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')

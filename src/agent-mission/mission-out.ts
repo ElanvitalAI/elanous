@@ -1,4 +1,5 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -820,7 +821,7 @@ export function registerMissionOutCommand(program: Command, deps: {
       try {
         const { record, transitioned } = await store.cancel(missionId);
         if (record.workerPid && transitioned) {
-          try { process.kill(-record.workerPid, 'SIGTERM'); } catch { try { process.kill(record.workerPid, 'SIGTERM'); } catch { /* worker already exited */ } }
+          await terminateTree({ pid: record.workerPid }, { group: true, pidFallback: true });
         }
         out(opts, { id: missionId, missionId, status: record.status === 'completed' ? 'done' : record.status, cancelled: record.status === 'cancelled' });
       } catch (e) { error(`${String(e)}\n`); process.exitCode = 1; }

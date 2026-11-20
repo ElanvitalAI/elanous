@@ -997,13 +997,19 @@ function checkBaseWindow(input: VerifyOverlapEvidenceInput, head: string, baseTi
   // 병합 커밋은 첫 부모 대비 diff(-m --first-parent) — base 에 «들어온» 변경만, 빠짐없이.
   const log = git(['log', '--first-parent', '-m', '--no-renames', '--name-only', `--format=${COMMIT_MARK}%H`, `${gateBase}..${baseTip}`]);
   if (!log.ok) return { ok: false, reason: `base-window-unmeasured: log ${short(gateBase)}..${short(baseTip)} failed · ${staleReason}` };
+  // 델타 서로소 (b): PR 이 바꾼 소스 foo.ts 의 짝 테스트 foo.test.ts 도 «공유 테스트 파일» 로 겹침에 센다.
+  const sharedTests = new Set<string>();
+  for (const file of prFiles) {
+    const match = /^(.*)\.(ts|tsx|js|jsx|mjs|cjs)$/.exec(file);
+    if (match && !/\.(test|spec)$/.test(match[1]!)) sharedTests.add(`${match[1]}.test.${match[2]}`);
+  }
   const touched = new Map<string, string[]>();
   let current = '';
   for (const raw of log.out.split('\n')) {
     const line = raw.trim();
     if (!line) continue;
     if (line.startsWith(COMMIT_MARK)) { current = line.slice(COMMIT_MARK.length); if (!touched.has(current)) touched.set(current, []); continue; }
-    if (current && prFiles.has(line)) touched.get(current)!.push(line);
+    if (current && (prFiles.has(line) || sharedTests.has(line))) touched.get(current)!.push(line);
   }
   const windowCommits = touched.size;
   if (windowCommits === 0 || [...touched.keys()].some((sha) => !SHA40.test(sha))) {
@@ -1015,7 +1021,7 @@ function checkBaseWindow(input: VerifyOverlapEvidenceInput, head: string, baseTi
     return {
       ok: false,
       windowCommits,
-      reason: `base-stale-overlap: gate ${short(gateBase)} ≠ ${input.remote}/${input.branch} ${short(baseTip)} · ${overlapping.length}/${windowCommits} window commits touch PR files (${overlapping.map(([sha]) => short(sha)).slice(0, 5).join(', ')}): ${files.slice(0, 10).join(', ')}`,
+      reason: `base-stale-overlap: gate ${short(gateBase)} ≠ ${input.remote}/${input.branch} ${short(baseTip)} · ${overlapping.length}/${windowCommits} window commits touch PR files or shared test file (${overlapping.map(([sha]) => short(sha)).slice(0, 5).join(', ')}): ${files.slice(0, 10).join(', ')}`,
     };
   }
   return { ok: true, windowCommits };

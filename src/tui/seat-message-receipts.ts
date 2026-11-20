@@ -54,6 +54,13 @@ export interface SeatReceiptWriter {
   record(input: SeatReceiptWrite): void;
   /** [seat-mail #14 wiring] started 계기 — 큐 항목이 턴에 인계된 순간(onTransition delivered). 옵셔널: 구형 writer 무시. */
   recordStarted?(input: SeatReceiptStartedWrite): void;
+  /** [seat-mail #16 wiring · S7 트리거] done 계기 — 턴이 우편에 답을 마친 순간(noteTurnFinished seen 정착). 옵셔널: 구형 writer 무시. */
+  recordDone?(input: SeatReceiptDoneWrite): void;
+}
+
+export interface SeatReceiptDoneWrite {
+  messageId: number;
+  recipient: string;
 }
 
 export interface SeatReceiptStartedWrite {
@@ -163,6 +170,21 @@ export function createLedgerReceiptWriter(msgPath: string = join(elanousStateRoo
       }
     },
     // [seat-mail #14 wiring] started 계기 — 원장을 열어 clock sink 로 직접 기록(state 기계와 무관한 clock 전용 이벤트).
+    // [seat-mail #16 wiring · S7 트리거] done 계기 — started와 같은 깔때기(sink 직접, clock 전용 이벤트).
+    recordDone(input: SeatReceiptDoneWrite) {
+      try {
+        const mod = require('../msg/msg-store.js') as typeof import('../msg/msg-store.js');
+        const sink = require('../hq/msg-receipt-clock-sink.js') as typeof import('../hq/msg-receipt-clock-sink.js');
+        const store = new mod.MsgStore(msgPath);
+        try { sink.recordReceiptClock(store.db, { messageId: input.messageId, recipient: input.recipient, event: 'done' }); }
+        finally { store.close(); }
+      } catch (error) {
+        try {
+          debug.log('msg.receipt-writer', 'record-done-failed', { msgId: input.messageId, recipient: input.recipient,
+            error: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+        } catch { /* observability is fail-open */ }
+      }
+    },
     recordStarted(input: SeatReceiptStartedWrite) {
       try {
         const mod = require('../msg/msg-store.js') as typeof import('../msg/msg-store.js');

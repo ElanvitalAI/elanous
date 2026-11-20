@@ -16,6 +16,7 @@
 //   - Push subscription (Phase 3)
 //   - Cache invalidation hooks (Phase 4)
 
+import { isBareWebChatOrigin } from './daemon-config';
 import { debugLog } from './debug';
 
 /** Path the daemon static-serve mounts the SW at. PWA basePath is
@@ -45,6 +46,11 @@ export async function registerServiceWorker(): Promise<RegisterSwOutcome> {
   }
   if (!('serviceWorker' in navigator)) {
     return { status: 'unsupported', reason: 'navigator.serviceWorker absent' };
+  }
+  // bare 핸들 호스트: /app/sw.js 는 릴레이의 정적 허용 목록에 없어 404 — 서비스워커는 등록하지 않는다
+  // (오프라인 캐시 이득 없음 · 매 진입 콘솔 404 제거). 목록에 넣는 대신 등록을 건너뛴다(범위·쿠키 없는 방문자 안전성 확인 전).
+  if (isBareWebChatOrigin()) {
+    return { status: 'unsupported', reason: 'bare webchat origin does not serve the service worker' };
   }
   // iOS Safari rejects SW registration in insecure contexts (HTTP
   // over LAN IP). The browser silently fails — we check explicitly

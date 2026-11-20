@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { createKeyDecoder, createPrefixFilter, drawView, fitCells, lastScreenText, statusLine } from './attach-view.js';
+import { createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitAnsi, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from './attach-view.js';
 
 test('fitCells clips by terminal cells (a wide character is two), pads, and never splits a character', () => {
   expect(fitCells('abc', 5)).toBe('abc  ');
@@ -49,4 +49,25 @@ test('prefix keys: ctrl+b q detaches, ctrl+b ctrl+b is one literal ctrl+b, anoth
   expect(filter.feed('\u0002z')).toEqual({ send: '', detach: false, ignored: 'z' });
   expect(filter.feed('\u0002')).toEqual({ send: '', detach: false, ignored: '' });
   expect(filter.feed('q')).toEqual({ send: '', detach: true, ignored: '' });
+});
+
+// ELS-MOUSE-REPORT (JUD #111411 ①): the app view must ASK the terminal for mouse reports, or the SGR click handling never fires.
+test('ENTER_VIEW switches to the alt screen and enables mouse reporting (1000 + SGR 1006); LEAVE_VIEW disables it in reverse and leaves the alt screen', () => {
+  expect(ENTER_VIEW).toBe('\u001b[?1049h\u001b[?1000h\u001b[?1006h\u001b[2J\u001b[H');
+  expect(LEAVE_VIEW).toBe('\u001b[?1006l\u001b[?1000l\u001b[?1049l');
+});
+
+test('the single-pane attach view never enables mouse reporting (its stdin goes raw into the pane)', () => {
+  expect(ENTER_PANE_VIEW).toBe('\u001b[?1049h\u001b[2J\u001b[H');
+  expect(LEAVE_PANE_VIEW).toBe('\u001b[?1049l');
+});
+
+test('fitAnsi: colon-form SGR (underline style/colour) is an escape, OSC 8 links and other CSI cost no cells, an open style is closed at the cut', () => {
+  const E = '\u001b';
+  const link = `${E}]8;;https://example.com/a/very/long/target${E}\\한국${E}]8;;${E}\\`;
+  expect(fitAnsi(`${link}abc`, 8)).toBe('한국abc ');
+  expect(fitAnsi(`${E}]8;;https://x.test${E}\\ab${E}]8;;\u0007`, 4)).toBe('ab  ');
+  expect(fitAnsi(`${E}[4:3;58:5:6mabcdef${E}[0m`, 3)).toBe(`${E}[4:3;58:5:6mabc${E}[0m`);
+  expect(fitAnsi(`${E}[4:1mab${E}[0mcd`, 6)).toBe(`${E}[4:1mab${E}[0mcd  `);
+  expect(fitAnsi(`${E}[2Kab${E}[?25l`, 3)).toBe('ab ');
 });

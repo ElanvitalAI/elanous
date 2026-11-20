@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import * as store from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
@@ -10,6 +10,9 @@ import { parseProvenanceEvidenceLine, provenanceEvidenceLine, validateProvenance
 import { messageRouteFor } from '../loops/msg-address.js';
 import { resolveSeatStateRoot } from '../loops/msg-wake.js';
 import { readSeatRegistry, seatRegistryPath } from '../loops/seat-registry.js';
+import { openMsgStore, type MsgStore } from '../msg/msg-store.js';
+import { releaseLedgerRoot } from '../instance/resolve.js';
+import { assertNotTestWritingOps } from '../instance/test-write-guard.js';
 export { parseTargetPathHintLine } from './checklist-target-path-hint.js';
 export type { TargetPathHintLine } from './checklist-target-path-hint.js';
 
@@ -117,6 +120,39 @@ export function checklistEvidenceChain(input: {
     greenEligible: unresolved.length === 0,
     reason: unresolved.length ? `${unresolved.map((stage) => `${stage.id}=${stage.state}: ${stage.reason}`).join('; ')}` : null,
   };
+}
+
+/** CHECKLIST-E4-RUN-RECEIPT — the logs.db event a cell's evidence run leaves; E4 binds it to the cell id it names. */
+export const CHECKLIST_EVIDENCE_RUN_EVENT = 'checklist.evidence.run';
+
+/**
+ * The cell's «완료 경계 증거 명령: <cmd>» from its title only (the last such marker when there are several) (0.3.31 titles write it as its own «- 완료 경계 증거 명령: …» line).
+ * The command runs to the end of the line or to the next «완료 경계 <이름>:» marker; a quoted «완료 경계 증거 명령» mention has no colon and is not a marker.
+ */
+export function checklistEvidenceCommand(title: string): string | null {
+  // OP #112499: titles are append-only — a corrected «완료 경계 증거 명령:» line is appended, so the LAST one wins.
+  const commands = [...title.matchAll(/(?:^|[\s·])(?:[-*]\s*)?완료 경계 증거 명령\s*[:=]\s*(.+?)(?=\s+[-*·]?\s*완료 경계 [^\s:]+(?: [^\s:]+)?\s*:|\s*$)/gmu)]
+    .map((match) => match[1]?.trim()).filter((command): command is string => Boolean(command));
+  return commands.at(-1) ?? null;
+}
+
+/** Test runs (bun test · tsc · pregate) — the seat host refuses to execute these locally. */
+export function isTestRunCommand(command: string): boolean {
+  return /(?:^|[\s;&|(])(?:bun\s+(?:run\s+)?test|bunx?\s+tsc|tsc|npx\s+tsc|(?:\S*\/)?pregate(?:\.py)?)(?=$|[\s;&|)])/u.test(command);
+}
+
+/** Short commit form in the evidence line (git's default abbreviation is 7; 12 keeps it unambiguous across this repo's history). */
+export const EVIDENCE_COMMIT_ABBREV = 12;
+/**
+ * The one evidence line an rc-0 evidence run appends; E4 reads runId·event·ISO 시각·host from it and binds the event to «칸 <id>».
+ * «host» is the registry name of the host whose logs.db holds the event (the only «host» token on the line). A run dispatched
+ * from the HQ host also names the ledger host and the commit it ran at («원장 <hq> · 실행 @<sha12>»).
+ */
+export function checklistEvidenceRunLine(input: { runId: string; at: string; cellId: string; command: string; host: string; ledgerHost?: string; commit?: string; cwd?: string }): string {
+  const dispatched = input.ledgerHost && input.commit ? ` · 원장 ${input.ledgerHost} · 실행 ${input.host} @${input.commit.slice(0, EVIDENCE_COMMIT_ABBREV)}` : '';
+  // A workspace package's tests run from that package directory («cwd apps/pwa»); a root run carries no cwd token.
+  const cwd = input.cwd ? ` · cwd ${input.cwd}` : '';
+  return `E4 test 층 — runId ${input.runId} · event: ${CHECKLIST_EVIDENCE_RUN_EVENT} · ${input.at} · host ${input.host} · 칸 ${input.cellId} · 명령: ${input.command}${cwd} · rc 0${dispatched} (evidence run · synthetic/test)`;
 }
 
 export function devVersion(): string {
@@ -778,4 +814,112 @@ export function seedFromRoadmap(v: string, markdown: string): Checklist {
     }
     return added;
   });
+}
+
+/** OP-STALL-P0-HOURLY: an open P0 cell whose PR head and branch did not move for this long is a stall OP must see. */
+export const P0_STALL_MS = 60 * 60_000;
+/** What an observer saw for one cell: the PR head sha, its branch, and when either last changed. */
+export interface P0HeadObservation { head: string; branch?: string; lastChangedAt: string }
+export interface P0StallMark { head: string; branch: string | null; lastChangedAt: string }
+/** Cells already alerted, keyed by cell id — one alert per (head, branch, lastChangedAt) stall. */
+export type P0StallAlertState = Record<string, P0StallMark>;
+export interface P0StallAlert { id: string; owner: string | null; head12: string; branch: string | null; lastChangedAt: string; stalledMinutes: number }
+export interface P0StallTick { alerts: P0StallAlert[]; cleared: string[]; alerted: P0StallAlertState }
+
+function sameP0StallMark(a: P0StallMark, b: P0StallMark): boolean {
+  return a.head === b.head && a.branch === b.branch && a.lastChangedAt === b.lastChangedAt;
+}
+
+/** Pure: which open P0 cells newly stalled (≥ {@link P0_STALL_MS} without a head/branch change) and which alerts cleared.
+ *  An unobserved cell keeps its alert (a missed read is not a recovery); an invalid time never alerts (fail closed). */
+export function p0StallAlerts(input: {
+  items: readonly ChecklistItem[];
+  heads: Readonly<Record<string, P0HeadObservation>>;
+  alerted?: P0StallAlertState;
+  now: Date;
+}): P0StallTick {
+  const previous = input.alerted ?? {};
+  const alerted: P0StallAlertState = {};
+  const alerts: P0StallAlert[] = [];
+  const cleared: string[] = [];
+  for (const item of input.items) {
+    if (item.priority !== 'P0' || item.status === 'green' || item.status === 'done') continue;
+    const old = previous[item.id];
+    const observed = input.heads[item.id];
+    const changedMs = observed ? Date.parse(observed.lastChangedAt) : Number.NaN;
+    if (!observed || !observed.head.trim() || !Number.isFinite(changedMs)) { if (old) alerted[item.id] = old; continue; }
+    const mark: P0StallMark = { head: observed.head, branch: observed.branch ?? null, lastChangedAt: new Date(changedMs).toISOString() };
+    if (old && sameP0StallMark(old, mark)) { alerted[item.id] = old; continue; }
+    if (old) cleared.push(item.id);
+    const stalledMs = input.now.getTime() - changedMs;
+    if (stalledMs < P0_STALL_MS) continue;
+    alerted[item.id] = mark;
+    alerts.push({ id: item.id, owner: item.owner ?? null, head12: mark.head.slice(0, 12), branch: mark.branch,
+      lastChangedAt: mark.lastChangedAt, stalledMinutes: Math.floor(stalledMs / 60_000) });
+  }
+  for (const id of Object.keys(previous)) if (!(id in alerted) && !cleared.includes(id)) cleared.push(id);
+  return { alerts, cleared, alerted };
+}
+
+export function p0StallMailBody(alert: P0StallAlert): string {
+  return `정체 P0 · 칸 ${alert.id} · 주인 ${alert.owner ?? '없음'} · head ${alert.head12}${alert.branch ? ` · 가지 ${alert.branch}` : ''}`
+    + ` · 마지막 변화 ${alert.lastChangedAt} · ${alert.stalledMinutes}분 무변화 → OP 재배정 판단`;
+}
+
+/** One logical mail per stall: a lost or concurrent state write cannot post the same stall twice. */
+function p0StallProvenanceKey(alert: P0StallAlert): string {
+  const identity = createHash('sha256').update([alert.id, alert.head12, alert.branch ?? '', alert.lastChangedAt].join('\0')).digest('hex').slice(0, 24);
+  return `coord:p0-stall-${identity}:OP`;
+}
+
+export function p0StallStatePath(version: string): string {
+  return join(releaseLedgerRoot(), 'release', version, 'p0-stall-alerts.json');
+}
+
+function readP0StallState(path: string): P0StallAlertState {
+  if (!existsSync(path)) return {};
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const state: P0StallAlertState = {};
+    for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+      const mark = value as Partial<P0StallMark> | null;
+      if (mark && typeof mark.head === 'string' && typeof mark.lastChangedAt === 'string' && (mark.branch === null || typeof mark.branch === 'string'))
+        state[id] = { head: mark.head, branch: mark.branch, lastChangedAt: mark.lastChangedAt };
+    }
+    return state;
+  } catch (error) {
+    // Unreadable state re-derives alerts; the mail provenance key keeps them from posting twice.
+    debug.log('release-loop.p0-stall', 'state-read-failed', { path, error: String(error).slice(0, 300) }, { level: 'warn' });
+    return {};
+  }
+}
+
+function writeP0StallState(path: string, state: P0StallAlertState): void {
+  assertNotTestWritingOps(path, 'write the P0 stall alert state');
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+/** Post one «정체 P0» mail to OP per newly stalled P0 cell, then persist the alert state (cleared cells drop out). */
+export function postP0StallAlerts(input: {
+  version: string;
+  items: readonly ChecklistItem[];
+  heads: Readonly<Record<string, P0HeadObservation>>;
+  now?: Date;
+}, deps: { statePath?: string; store?: Pick<MsgStore, 'appendWithProvenance'> } = {}): P0StallTick {
+  const path = deps.statePath ?? p0StallStatePath(input.version);
+  const tick = p0StallAlerts({ items: input.items, heads: input.heads, alerted: readP0StallState(path), now: input.now ?? new Date() });
+  if (tick.alerts.length) {
+    const owned = deps.store ? null : openMsgStore();
+    const store = deps.store ?? owned!;
+    try {
+      for (const alert of tick.alerts)
+        store.appendWithProvenance({ from: 'RLA', to: 'OP', kind: 'alert', intent: 'alert', body: p0StallMailBody(alert) }, p0StallProvenanceKey(alert));
+    } finally { owned?.close(); }
+  }
+  if (tick.alerts.length || tick.cleared.length) writeP0StallState(path, tick.alerted);
+  return tick;
 }

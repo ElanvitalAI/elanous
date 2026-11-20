@@ -1,0 +1,26 @@
+{
+  "id": "llm-sim-claude-acp",
+  "name": "LLM sim claude-acp",
+  "implementation": [
+    "src/ux-sim/llm-provider-world/credit-acp.ts"
+  ],
+  "tests": [
+    "src/ux-sim/llm-provider-world/credit-acp.test.ts"
+  ],
+  "target": "Fake host-only claude-acp device: alive switch, session count against maxSessions, optional subscription window as LlmSpendRowState",
+  "inputs": [
+    "an injected SimClock",
+    "fake balance, spend cap, auto top-up, session and alive switches"
+  ],
+  "observations": [
+    "503 device_down when not alive",
+    "503 session_limit when sessions reach maxSessions",
+    "observe() yields device health and optional window"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/llm-provider-world/credit-acp.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

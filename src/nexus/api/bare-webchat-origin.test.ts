@@ -23,6 +23,9 @@ import {
 } from "./http-server.js";
 import { createMemberStore } from "../members/member-store.js"; // 출처: #39056 — 파생 토큰 member-store 수준 검증
 
+// 출처: OP #107132 — 넘김 토큰은 HMAC-SHA256 서명으로 발급된다. 시험용 더미 키(≥32바이트 — 출처: OP #107132).
+process.env.ELANOUS_WEBCHAT_HANDOFF_HMAC_KEY ??= "x".repeat(32);
+
 /*
  * 출처: #39003 — JUD must ⓐ/ⓑ 실경로 시험.
  * ⓐ: 핀된 bare `<handle>.elanous.app` 원점이 실제 http-server 라우팅 분기와
@@ -897,18 +900,9 @@ describe("HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 derived webchat session (출처: 
     expect(resolved === null || resolved === undefined).toBe(true); // 출처: #39056 — 파생 토큰은 member-store 세션이 아니다
   });
 
-  test("⑦ FU ⓑ 발급 전 활성 핀 확인 — 활성 소유자 없으면 미발급(undefined)", () => {
-    const pinOwners = new Map<string, string>(); // 출처: #39056 — 핀 성공 원장
-    const ledger = createWebChatHandoffLedger(
-      {},
-      () => HANDOFF_CLOCK_BASE_MS,
-      pinOwners,
-    ); // 출처: #39056 — 발급 검문용 핀 원장 주입
-    expect(ledger.issue(HANDOFF_MEMBER_ID, "user")).toBeUndefined(); // 출처: #39056 — 활성 핀 없음 → 미발급
-    pinOwners.set("user", HANDOFF_MEMBER_ID); // 출처: #39056 — 핀 성공
-    expect(typeof ledger.issue(HANDOFF_MEMBER_ID, "user")).toBe("string"); // 출처: #39056 — 소유자 일치 → 발급
-    expect(ledger.issue("member-other", "user")).toBeUndefined(); // 출처: #39056 — 타 소유자 → 미발급
-  });
+  // ⑦ «FU ⓑ 발급 전 활성 핀 확인» 폐지 — 출처: OP #107132. 신 설계는 «핀 소유 대조는 교환 쪽에서만»
+  // 이므로 발급 검문이 원장 3인자 시그니처에 의존했다. 커버리지(핀 불일치 → 401 pin-mismatch)는
+  // 신규 webchat-handoff-hmac.test.ts ⓕ 로 이전됐다.
 
   test("⑧ FU 만료 정리·상한 — 발급 시 만료 레코드 소거, 상한 512 치환", () => {
     let clockMs = HANDOFF_CLOCK_BASE_MS; // 출처: #39056
@@ -1006,5 +1000,17 @@ describe("WEBCHAT-PIN-LEDGER-RECONNECT — relay 재연결 시 핀 원장 재구
     expect(ledger.pinOwners.get("gamma")).toBeUndefined(); // 소유자도 기록 안 됨
     expect(gate({ appSlug: "myapp", handle: "delta", memberId: deltaMemberId })).toBe(true); // 성공한 재핀만 서빙
     expect(ledger.pinOwners.get("delta")).toBe(deltaMemberId);
+  });
+
+  test("(d) relay 정적 claim 질의 실패 → 재생 원천 없음(fail-closed) · 로컬 claim 은 그대로 재핀", async () => {
+    const { memberA } = seedDurableClaims("epsilon", "zeta");
+    const appHost = {};
+    const ledger = createRelayWebChatLedger(appHost);
+    ledger.setPinQueryChannel(async () => true);
+    restoreWebChatHandlePins(ledger, async () => undefined, openStore(), async () => {
+      throw new Error("relay query failed");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(ledger.pinOwners.get("epsilon")).toBe(memberA);
   });
 });

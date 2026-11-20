@@ -74,9 +74,27 @@ test('new records the pane only after its PTY exists; ls, read and send work on 
   expect((await core.read(pane)).message).toBe('pty_1 ready\n');
   expect(stored().panes[0]!.scrollback).toBe('pty_1 ready\n');
   expect((await core.send(pane, 'echo hi\n')).exitCode).toBe(0);
-  expect(ptys[0]!.writes).toEqual(['echo hi\n']);
+  // clean() drops the \n: a caller cannot press Enter through send
+  expect(ptys[0]!.writes).toEqual(['echo hi']);
   const listed = JSON.parse(core.list().message) as { panes: { pane: string; ptyId: string; state: string; workspace: string }[] };
   expect(listed.panes.map((row) => [row.pane, row.ptyId, row.state, row.workspace])).toEqual([[pane, 'pty_1', 'working', 'HQ']]);
+});
+
+test('#38608 must ①② — workspaceOf tells both spellings of the truth; send cleans, input is the raw person path', async () => {
+  const { core, ptys } = owner();
+  expect(core.start()).toBeUndefined();
+  const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
+  // must ①: the journal answers with the workspace's id AND name — never the caller's claim back.
+  const ownerWs = core.workspaceOf(pane)!;
+  expect(ownerWs.name).toBe('HQ');
+  expect(ownerWs.id).not.toBe('HQ');
+  expect(core.workspaceOf('p-none')).toBeUndefined();
+  // must ②: send types cleaned TEXT — the \r cannot press Enter, the \x15 cannot clear the line.
+  expect((await core.send(pane, 'echo a\r\x15')).exitCode).toBe(0);
+  // input is the raw person path: Enter survives, and a paste bigger than one paste is refused.
+  expect(core.input(pane, 'echo raw\r')).toEqual({ exitCode: 0, message: '' });
+  expect(core.input(pane, 'x'.repeat(1_000_000))).toEqual({ exitCode: 2, message: expect.stringContaining('bytes at once') });
+  expect(ptys[0]!.writes).toEqual(['echo a', 'echo raw\r']);
 });
 
 test('write failure: a new pane whose journal save fails is not recorded and its PTY is stopped', () => {

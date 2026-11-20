@@ -143,3 +143,17 @@ test('without window, reporting and subscribing are no-ops', () => {
   expect(seen).toEqual([{ path: '/v1/health' }]);
   dispose();
 });
+
+test('bare webchat origin ignores a 401 on a path the relay does not forward, but keeps the chat pair', () => {
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { querySelector: (sel: string) => ({ getAttribute: () => (sel.includes('elanous-bare-capabilities') ? '/v1/prompt/stream,/v1/chat/events' : '1') }) } });
+  try {
+    const received: { path: string }[] = [];
+    const off = onAuthRequired((detail) => received.push(detail));
+    reportAuthRequired('/v1/terminals');
+    reportAuthRequired('/v1/sessions/store?limit=20');
+    expect(received).toEqual([]);
+    reportAuthRequired('/v1/prompt/stream');
+    expect(received).toEqual([{ path: '/v1/prompt/stream' }]);
+    off();
+  } finally { delete (globalThis as { document?: unknown }).document; }
+});

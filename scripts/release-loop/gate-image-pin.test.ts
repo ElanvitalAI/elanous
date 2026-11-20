@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
   gateImageLayerRuntimeKey, gateRuntimeBaseReuseMode, prebuildGateImagePinAtCut, prebuildGateImagePinForRuntimeBases,
-  runCutGateImagePrebuild, writeGateImagePin, poolSyncBuildFailure, type PrebuildFailure } from './gate-image-pin.js';
+  runCutGateImagePrebuild, prebuildFailureLine, writeGateImagePin, poolSyncBuildFailure, type PrebuildFailure } from './gate-image-pin.js';
 import { parsePodPool, runBuildScript, syncPoolImages } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { gateImageReadinessPendingPath, gateImageReadinessSignalPath,
@@ -517,5 +517,22 @@ it('passes structured child failure through the parent without losing stage or r
       failureCode: 'PACK_MISSING_PWA', causes: ['PACK_MISSING_PWA'] };
     const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
     expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 1, stdout: JSON.stringify(failure) }) })).toEqual(failure);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// RELEASE-RESUME-AFTER-CUT-PUSHED prescription 3: a measured host-resource failure names the exact resume command.
+it('RELEASE-RESUME-AFTER-CUT-PUSHED host-resource prebuild failure carries the exact resume command; code-side and unmeasured causes do not', () => {
+  const root = mkdtempSync(join(tmpdir(), 'prebuild-resume-hint-'));
+  const input = { root, repo: root, runId: 'run-hint-1', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+  const child = (failure: Partial<PrebuildFailure>) => ({ runPrebuild: () => ({ status: 1, stdout: JSON.stringify({ outcome: 'failed', reason: 'x', ...failure }) }) });
+  try {
+    const disk = runCutGateImagePrebuild(input, child({ stage: 'build', failureCode: 'DISK_FULL', causes: ['DISK_FULL'] })) as PrebuildFailure;
+    expect(disk.nextCommand).toBe('eln release resume --run run-hint-1 --from gate-image-prebuild');
+    expect(prebuildFailureLine(disk)).toBe('cut gate image prebuild failed: x — 호스트 자원을 비운 뒤 다음 명령: eln release resume --run run-hint-1 --from gate-image-prebuild');
+    const code = runCutGateImagePrebuild(input, child({ stage: 'pack-pwa', failureCode: 'PACK_MISSING_PWA', causes: ['PACK_MISSING_PWA'] })) as PrebuildFailure;
+    expect(code.nextCommand).toBeUndefined();
+    expect(prebuildFailureLine(code)).toBe('cut gate image prebuild failed: x');
+    const unknown = runCutGateImagePrebuild(input, child({ stage: 'build', failureCode: 'UNKNOWN', causes: [] })) as PrebuildFailure;
+    expect(unknown.nextCommand).toBeUndefined();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

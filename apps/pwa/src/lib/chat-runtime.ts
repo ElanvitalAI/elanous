@@ -821,7 +821,7 @@ export interface RunChatTurnStreamingHandlers {
   /** Fires each text-delta event with the cumulative assistant text.
    *  ChatLayout uses this to update a placeholder assistant message
    *  in place so the user sees tokens stream. */
-  onPartial?: (full: string) => void;
+  onPartial?: (full: string, segmentStart?: number) => void;
   /** Phase B-2/B-3 — fires after every block-list mutation (text
    *  growth · image append · tool_use push or status flip). Caller
    *  should re-render the placeholder with the supplied snapshot.
@@ -919,7 +919,11 @@ export async function runChatTurnStreaming(
         } else {
           blocks[textIdx] = { kind: 'text', text: full };
         }
-        handlers.onPartial?.(full);
+        // MOB-1 demo P1: the SSE stream cannot tell narration from the answer (the server tags no provisional /
+        // early-answer text; it arrives as plain text-delta). Segment 0 = the whole streamed text is the body, the same
+        // thing the finished message renders, so early-answer lines show at once and only tool / thinking / status
+        // blocks stay in the «자세히» capsule. Without it the renderer folded all streaming text into the capsule.
+        handlers.onPartial?.(full, 0);
         handlers.onPartialBlocks?.(snapshot());
       },
       onImageBlock: ({ src, mediaType, alt }) => {

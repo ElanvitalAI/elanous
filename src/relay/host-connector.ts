@@ -1,3 +1,4 @@
+import { debug } from "../debug/log.js";
 import {
   createPrivateKey,
   createPublicKey,
@@ -118,6 +119,8 @@ export interface RelayHostConnection {
   pinPublicHandle(user: string, memberId: string): Promise<void>;
   /** OP #105017 ⓐ① — relay «핀 읽기» 질의. 응답은 «살아 있는 핀» 불리언만이고 거부·실패는 false(fail-closed ②). */
   publicHandlePinQuery(user: string, memberId: string): Promise<boolean>;
+  /** WEBCHAT-PIN-RESTORE — relay 정적 claim 중 이 연결 소유 회원 몫 핸들 목록(실패·무응답은 빈 목록 · fail-closed). */
+  publicHandleClaimsQuery(): Promise<{ handle: string; memberId: string }[]>;
   close(code?: number, reason?: string): void;
 }
 
@@ -598,7 +601,8 @@ export async function connectRelayHost(
       | "public-app-register"
       | "public-app-unregister"
       | "public-handle-pin"
-      | "public-handle-pin-query",
+      | "public-handle-pin-query"
+      | "public-handle-claims-query",
     registration: object,
   ): Promise<unknown> => {
     if (closed || !authenticated || socket.readyState !== WebSocket.OPEN)
@@ -611,7 +615,7 @@ export async function connectRelayHost(
     // 길어 프레임이 조용히 미전송되었다. 그 프레임만 즉시 발송 · 다른
     // app-control 프레임은 기존 대기 유지. 발송 뒤 회답 지연·무회답은
     // publicHandlePinQuery 의 2초 상한(OP #105876)이 덮는다.
-    if (!publicKeyAccepted && type !== "public-handle-pin-query")
+    if (!publicKeyAccepted && type !== "public-handle-pin-query" && type !== "public-handle-claims-query")
       await new Promise<void>((resolve, reject) => {
         const pending = {
           resolve,
@@ -1186,6 +1190,39 @@ export async function connectRelayHost(
         reply.then((pinned) => {
           clearTimeout(timer); // 회답 도착 — 타이머 참조 버림(멈춘 프라미스 누적 0)
           resolve(pinned); // 타임아웃 뒤 늦은 회답은 이미 resolve 된 outer 로 no-op 무시
+        });
+      });
+    },
+    publicHandleClaimsQuery() {
+      type Claim = { handle: string; memberId: string };
+      const reply = sendAppControl("public-handle-claims-query", {}).then(
+        (result) =>
+          Array.isArray(result)
+            ? result.filter(
+                (c): c is Claim =>
+                  !!c && typeof c.handle === "string" && typeof c.memberId === "string",
+              )
+            : [],
+        (error: unknown) => {
+          // 값 없는 사유 코드: 인증 전/끊김 · 회답 타임아웃 · relay 거부 구분.
+          const message = error instanceof Error ? error.message : "";
+          const reason = message.includes("unavailable") || message.includes("connection closed")
+            ? "not-authenticated"
+            : message.includes("timed out")
+              ? "timeout"
+              : "rejected";
+          debug.log("relay.host-connector", "claims-query-failed", { reason });
+          return [] as Claim[]; // 거부·실패 → 재생 원천 없음(fail-closed)
+        },
+      );
+      return new Promise<Claim[]>((resolve) => {
+        const timer = setTimeout(() => {
+          debug.log("relay.host-connector", "claims-query-failed", { reason: "timeout" });
+          resolve([]);
+        }, 2_000); // 핀 질의와 같은 2s 상한
+        reply.then((claims) => {
+          clearTimeout(timer);
+          resolve(claims);
         });
       });
     },

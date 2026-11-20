@@ -299,6 +299,9 @@ const registerProviderCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'provid
 const registerCatalogCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'catalog'
   ? (() => undefined)
   : (require('./cli/catalog-cli.js') as typeof import('./cli/catalog-cli.js')).registerCatalogCommands) as typeof import('./cli/catalog-cli.js').registerCatalogCommands;
+const registerHostsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'hosts'
+  ? (() => undefined)
+  : (require('./cli/hosts-cli.js') as typeof import('./cli/hosts-cli.js')).registerHostsCommands) as typeof import('./cli/hosts-cli.js').registerHostsCommands;
 const registerAppCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'app'
   ? (() => undefined)
   : (require('./cli/app-cli.js') as typeof import('./cli/app-cli.js')).registerAppCommands) as typeof import('./cli/app-cli.js').registerAppCommands;
@@ -7122,6 +7125,7 @@ registerFleetCommands(program);
 // ── ops (운영 관측 — 지금 뭐 도나·이상 없나·상태 전이) ──
 registerOpsCommands(program);
 registerCatalogCommands(program);
+registerHostsCommands(program);
 registerAppCommands(program);
 registerOutputsCommands(program);
 

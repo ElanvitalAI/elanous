@@ -26,12 +26,12 @@ afterEach(async () => {
   else delete (globalThis as { localStorage?: Storage }).localStorage;
 });
 
-async function mount(show: boolean, entries: Array<{ id: string; title: string; preview: string; updatedAt: string; messageCount: number; source: string; active: boolean; createdAt: string }> = [], width = 412) {
+async function mount(show: boolean, entries: Array<{ id: string; title: string; preview: string; updatedAt: string; messageCount: number; source: string; active: boolean; createdAt: string }> = [], width = 412, bare = false) {
   const saved = new Map<string, string>();
   const storage = { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => saved.set(key, value) };
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
   Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { innerWidth: width, location: { search: '' }, sessionStorage: { getItem: () => null }, localStorage: storage }) });
-  Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: bare ? Object.assign(new EventTarget(), { querySelector: () => ({ getAttribute: () => '1' }) }) : new EventTarget() });
   let projectId: string | null = 'p';
   const calls: Array<{ path: string; init?: RequestInit }> = [];
   const client = { fetchJson: async (path: string, init?: RequestInit) => {
@@ -139,4 +139,10 @@ test('workspace-style ChatPanel keeps the original chat without conversation nav
   const { root } = await mount(false);
   expect(root.findAllByType(ChatLayout)).toHaveLength(1);
   expect(root.findAllByType(ChatConversationList)).toHaveLength(0);
+});
+
+test('bare webchat origin hides the conversation list and its polling', async () => {
+  const { root, calls } = await mount(true, [], 1200, true);
+  expect(root.findAllByType(ChatConversationList)).toHaveLength(0);
+  expect(calls.filter((call) => call.path.startsWith('/v1/sessions/store'))).toEqual([]);
 });

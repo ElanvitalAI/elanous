@@ -6,7 +6,11 @@ import { readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+// A Unix socket path holds at most 103 bytes (macOS): the land train's long TMPDIR puts the els server/holder socket
+// under <state>/els/ over it, so a state dir under a long TMPDIR falls back to /tmp (each test removes its own dir).
+const SOCKET_SAFE_TMP = tmpdir().length > 40 ? '/tmp' : tmpdir();
 import { expect, test } from 'bun:test';
+import { buttonsLayout } from './attach-buttons.js';
 import { requestEls } from '../els/client.js';
 import { elsSocketPath } from '../els/server.js';
 import { mockSeatPtySequence } from '../ux-sim/mock-seat-pty-sequence.js';
@@ -28,6 +32,13 @@ const P95_TEST_TIMEOUT_MS = 300_000;
 /** The one-line English hint the status line must show verbatim (UX-fixed wording — OP order ②). */
 export const FIRST_RUN_HINT = 'ctrl+b c new shell · a chat · s list · j/k move · x close · q quit · ? help';
 
+/** The bottom row at 120 cols: FIRST_RUN_HINT verbatim, blank padding, then the exit/background buttons (attach-buttons.ts layout). */
+const isHintRow = (line: string): boolean => {
+  const row = line.trimEnd();
+  const buttons = buttonsLayout(120).text.trimEnd();
+  return row.startsWith(FIRST_RUN_HINT) && row.endsWith(buttons) && row.slice(FIRST_RUN_HINT.length, row.length - buttons.length).trim() === '';
+};
+
 /** The production ledger this test must never touch (~/.elanous/els/journal.json → ELANOUS_STATE_DIR). */
 const prodJournal = process.env.HOME ? join(process.env.HOME, '.elanous', 'els', 'journal.json') : '';
 const prodPaneCount = (): number => {
@@ -35,7 +46,7 @@ const prodPaneCount = (): number => {
 };
 
 test('first run: bare els on an empty state dir opens exactly one shell pane, attaches to it, and the English hint line is the last line', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-first-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-first-'));
   const folder = basename(root);
   const panesBefore = prodPaneCount();
   let pid = 0;
@@ -47,8 +58,10 @@ test('first run: bare els on an empty state dir opens exactly one shell pane, at
       env: { SHELL: '/bin/sh', NODE_ENV: 'development' },
       ready: { label: 'shell-attached', timeoutMs: READY_TIMEOUT_MS, until: (screen) => screen.split('\n').some((line) => line.includes('│') && line.includes('$')) }, // 출처: #37153 live PTY readiness bound
       steps: [
-        // ② the hint line, verbatim, as the visible last line of the screen
-        { label: 'hint-line', text: '', until: (screen) => screen.split('\n').at(-1) === FIRST_RUN_HINT, timeoutMs: HINT_TIMEOUT_MS }, // 출처: #37153 live PTY step bound — ready 직후 즉시 렌더되는 정지 화면, 왕복 불필요
+        // ② the hint line, verbatim, at the left of the visible last line. Since #39036 the same row carries the
+        //   « ⏏ 백그라운드  ✕ 종료 » buttons at its right edge, so the row is hint · blank padding · buttons (the
+        //   captured line also carries the reverse-video row's trailing padding) — nothing else may be on it.
+        { label: 'hint-line', text: '', until: (screen) => isHintRow(screen.split('\n').at(-1) ?? ''), timeoutMs: HINT_TIMEOUT_MS }, // 출처: #37153 live PTY step bound — ready 직후 즉시 렌더되는 정지 화면, 왕복 불필요
       ],
       quitKeys: '\u0002q',
     });
@@ -71,7 +84,7 @@ test('first run: bare els on an empty state dir opens exactly one shell pane, at
 }, TEST_TIMEOUT_MS);
 
 test('first run: SGR colours survive the attach — \\e[31m…\\e[0m from the pane reaches the terminal bytes', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-sgr-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-sgr-'));
   let pid = 0;
   try {
     let sawRed = false;
@@ -97,7 +110,7 @@ test('first run: SGR colours survive the attach — \\e[31m…\\e[0m from the pa
 }, TEST_TIMEOUT_MS);
 
 test('first run: key→screen echo latency p95 ≤ 50ms (20 samples, measured on the raw attach frames)', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-p95-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-p95-'));
   let pid = 0;
   try {
     // The device measures write→output-chunk latencies (onStepInput fires after the typed text, before Enter).

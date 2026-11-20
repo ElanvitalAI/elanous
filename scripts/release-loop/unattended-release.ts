@@ -387,8 +387,9 @@ async function runUnattendedReleaseLocked(
   // Only a root — entry is version-release, no parent — may block or satisfy this launch.
   const priorRuns = runInventory.runs.filter((run) => run.graphId === 'release-loop'
     && run.parentRunId === undefined
-    && (run.entryNodeId === undefined || run.entryNodeId === 'version-release' || run.entryNodeId === 'cut-branch')
-    && (run.path[0] === 'version-release' || run.path[0] === 'cut-branch')
+    // RELEASE-TRAFFIC-PREP-T1H: current roots enter at traffic-prep; older roots entered at cut-branch / version-release.
+    && (run.entryNodeId === undefined || run.entryNodeId === 'version-release' || run.entryNodeId === 'cut-branch' || run.entryNodeId === 'traffic-prep')
+    && (run.path[0] === 'version-release' || run.path[0] === 'cut-branch' || run.path[0] === 'traffic-prep')
     && !!run.input && typeof run.input === 'object' && !Array.isArray(run.input)
     && (run.input as Record<string, unknown>).version === version);
   const completed = priorRuns.find((run) => run.status === 'done' || run.status === 'awaiting-approval');

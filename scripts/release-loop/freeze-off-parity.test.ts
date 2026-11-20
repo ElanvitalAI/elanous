@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import * as gateNode from './gate-node';
 import * as publishNode from './publish-node.js';
 import * as unattendedNode from './unattended-release.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 
 // FREEZE1 off-state parity (OP 10-04 19:39 condition ①): with no landing-freeze file, gate · publish · unattended
 // retain their pre-freeze behavior, with explicit release-policy selection and the measured publish-process receipt.
@@ -17,7 +18,7 @@ import * as unattendedNode from './unattended-release.js';
 // (not a work tree, shallow clone, or credential-free partial clone).
 // GOLDEN provenance: captured 2026-10-04 from origin/main d958ff5b (pre-FREEZE1) by running this file's `capture` against
 // that checkout's three nodes; with git history, the test re-derives the same value from the pre-freeze base each run.
-const GOLDEN = {"gate": {"outcome": "regression", "commit": "cccccccccccccccccccccccccccccccccccccccc", "introduced": ["src/b.test.ts > B"], "preexisting": 1, "fixed": 1, "knownEnv": 0, "knownEnvCleared": [], "stalledEnv": [], "baselineSource": "instance"}, "gateCalls": ["add cccccccccccccccccccccccccccccccccccccccc @<tmp>/cut", "bun install @<tmp>/cut", "bun install @<tmp>/cut/apps/pwa", "sweep @<tmp>/cut", "bun run test:deterministic ./src/b.test.ts @<tmp>/cut", "snapshot bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb @<tmp>/baseline", "bun install @<tmp>/baseline", "bun install @<tmp>/baseline/apps/pwa", "bun run test:deterministic ./src/b.test.ts @<tmp>/baseline", "bun run test:deterministic ./src/c.test.ts @<tmp>/cut", "removeSnapshot @<tmp>/baseline", "remove @<tmp>/cut"], "publish": {"outcome": "ok", "verdict": "pass", "summary": "published v0.2.4 · 0 assets downloadable", "tag": "v0.2.4"}, "publishCalls": [["git", "show", "release-docs/0.2.4:release/public/docs/releases/0.2.4.md"], ["git", "show", "release-docs/0.2.4:website/pages.json"], ["bun", "bin/elanous.mjs", "release", "publish", "--dir", "dist", "--notes-file", "<notes>", "--yes", "--json"]], "unattended": {"input": {"gatePodPool": "pool", "version": "0.2.4", "previousVersion": "0.2.3"}, "dryRun": false, "state": {"status": "done"}}, "graphInput": {"gatePodPool": "pool", "version": "0.2.4", "previousVersion": "0.2.3"}};
+const GOLDEN = {"gate": {"outcome": "regression", "commit": "cccccccccccccccccccccccccccccccccccccccc", "introduced": ["src/b.test.ts > B"], "preexisting": 1, "fixed": 1, "knownEnv": 0, "knownEnvCleared": [], "stalledEnv": [], "baselineSource": "instance"}, "gateCalls": ["add cccccccccccccccccccccccccccccccccccccccc @<tmp>/cut", "bun install @<tmp>/cut", "bun install @<tmp>/cut/apps/pwa", "sweep @<tmp>/cut", "bun run test:deterministic ./src/b.test.ts @<tmp>/cut", "snapshot bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb @<tmp>/baseline", "bun install @<tmp>/baseline", "bun install @<tmp>/baseline/apps/pwa", "bun run test:deterministic ./src/b.test.ts @<tmp>/baseline", "bun run test:deterministic ./src/c.test.ts @<tmp>/cut", "removeSnapshot @<tmp>/baseline", "remove @<tmp>/cut"], "publish": {"outcome": "ok", "verdict": "pass", "summary": "published v0.2.4 · 0 assets downloadable", "tag": "v0.2.4"}, "publishCalls": [["git", "show", "release-docs/0.2.4:release/public/docs/releases/0.2.4.md"], ["git", "show", "release-docs/0.2.4:website/pages.json"], ["bun", "bin/elanous.mjs", "release", "publish", "--dir", "dist", "--notes-file", "<notes>", "--yes", "--json"]], "unattended": {"input": {"gatePodPool": "pool", "graphCutover": "legacy", "version": "0.2.4", "previousVersion": "0.2.3"}, "dryRun": false, "state": {"status": "done"}}, "graphInput": {"gatePodPool": "pool", "graphCutover": "legacy", "version": "0.2.4", "previousVersion": "0.2.3"}};
 
 function expectedCurrentWithPolicy() {
   const expected = structuredClone(GOLDEN);
@@ -87,6 +88,9 @@ async function capture(mods: Mods, assertCurrentDiagnostics = false): Promise<st
   const pub = mods.runPublish((cmd: string, args: string[]) => { pcalls.push([cmd, ...args.map((a) => a.replace(/\/[^ ]*notes\.md$/, '<notes>'))]); return { status: 0, stdout: args.some((a) => a.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4', assets: [] }) : '# 0.2.4\nHello', stderr: '' }; }, undefined, undefined, proot);
   // unattended
   const uroot = realpathSync(mkdtempSync(join(tmpdir(), 'cap-un-'))); roots.push(uroot);
+  // The unattended runner is machine-wide outside an explicitly selected config universe (OP-r17a seat
+  // flock: opSeatLockRoot() ignores the injected ledgerRoot), so isolate through the official surface.
+  setElanousConfigDir(uroot);
   mkdirSync(join(uroot, 'release/0.2.3'), { recursive: true });
   writeFileSync(join(uroot, 'release/0.2.3/release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
   let graphInput: unknown = null;
@@ -97,6 +101,7 @@ async function capture(mods: Mods, assertCurrentDiagnostics = false): Promise<st
   } finally {
     if (env.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = env.state;
     if (env.graph === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = env.graph;
+    resetElanousConfigDir();
     for (const r of roots) rmSync(r, { recursive: true, force: true });
   }
 }

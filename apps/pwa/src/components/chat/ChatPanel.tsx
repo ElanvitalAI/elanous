@@ -2,6 +2,7 @@
 
 // Single-screen chat panel shared by the standalone page and compact shell.
 
+import { useIsBareWebChat } from '@/lib/use-bare-webchat';
 import { useEffect, useRef, useState } from 'react';
 import { ChatLayout } from './ChatLayout';
 import { ChatConversationList } from './ChatConversationList';
@@ -19,6 +20,9 @@ export interface ChatPanelProps {
 }
 
 export function ChatPanel(props: ChatPanelProps = {}) {
+  // bare 핸들 호스트: /v1/sessions/store 를 릴레이가 안 넘긴다 — 죽은 «아직 대화가 없습니다» 목록·폴링을 숨긴다.
+  const bareWebChat = useIsBareWebChat();
+  const showConversationList = !!props.showConversationList && !bareWebChat;
   useEffect(() => {
     if (!props.showConversationList) return;
     void userIntentLogger.emit({
@@ -61,11 +65,11 @@ export function ChatPanel(props: ChatPanelProps = {}) {
       // Only a selected session remounts; daemon adoption keeps the live turn.
       key={conversationKey}
       onSessionAdopt={(issued) => { adoptedSessionRef.current = issued; }}
-      {...(props.showConversationList && compact && !mobileSimple ? { leading: conversationButton } : {})}
-      {...(mobileSimple ? { mobileSimple, mobileActivity, conversationButton } : {})}
+      {...(showConversationList && compact && !mobileSimple ? { leading: conversationButton } : {})}
+      {...(mobileSimple ? { mobileSimple, mobileActivity, ...(bareWebChat ? {} : { conversationButton }) } : {})}
     />
   );
-  if (!props.showConversationList) return chat;
+  if (!showConversationList) return chat;
 
   return (
     <div className="flex h-full min-h-0 min-w-0">

@@ -6,6 +6,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 // tool 은 req/resp 라 스트림 불가 → 최근 상태 + 로그 tail. 라이브 스트림은 CLI --follow / SSE.
 // PLAN: 내부 문서 `PLAN-se-build-observability-stream-2026-07-13`
 
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import { readFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { runGitCommand } from '../git-fs/runner.js';
@@ -33,7 +34,7 @@ export function stopBuild(buildId: string): StopBuildResult {
       for (const line of (r.stdout ?? '').split('\n')) {
         const pid = Number(line.trim());
         if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-        try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch { /* */ } }
+        void terminateTree({ pid }, { group: true, pidFallback: true });
         killed.push(pid);
       }
     } catch { /* fail-soft */ }

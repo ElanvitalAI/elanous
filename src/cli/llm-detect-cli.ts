@@ -174,4 +174,35 @@ export function registerLlmDetectCommand(program: Command): void {
       const result = await runLlmDetect(opts);
       if (result.error) process.exitCode = 2;
     });
+  // LLM 지출 정책 한 장(ONE-SHOT) — 조회만. 쓰기는 «패널» 칸(넥서스 편집 API · owner 인증)이 맡는다.
+  const policyCommand = llmCommand.command('policy').description('LLM 지출 정책 한 장 — 적용 값 전부(코드 기본+저장 덮어씀) · 각 값 출처(default/yaml) · 공급자 상태는 주입된 실측만(없으면 unmeasured)')
+    .option('--json', 'JSON 출력(패널·시험용)')
+    .action(async (opts: { json?: boolean }) => {
+      const { runLlmPolicyView } = await import('./llm-policy-cli.js');
+      await runLlmPolicyView({ json: Boolean(opts.json) });
+    });
+  // 합성 사건 주입 — 정책이 있는 우주에서만. 관측 저장소 source 'synthetic' + 전환 원장 synthetic:true 강제 표시. 비밀 입력 0.
+  policyCommand.command('inject').description('합성 사건 «결정 드라이런» — 지금 이 사건이면 무엇을 골랐나(실호출 0 · 실 저장소 쓰기 0) · 정책 정본이 있는 우주에서만')
+    .option('--row <행>', '정책 행 이름')
+    .option('--event <사건>', 'usage_limit_reached|insufficient_credits|window-reset|spend-cap|auto-topup|window-usage')
+    .option('--resets-at <ISO>', 'usage_limit_reached 의 창 리셋 시각')
+    .option('--used-pct <N>', 'window-usage 의 창 사용률(%)')
+    .option('--slope-pct-per-hour <N>', 'window-usage 의 소진 기울기(%/h)')
+    .option('--amount-usd <N>', 'spend-cap(지출액)·auto-topup(충전액) USD')
+    .option('--role <역할>', '드라이런 결정 요청 역할(기본 authoring)')
+    .option('--difficulty <등급>', 'high|mid|low')
+    .option('--model <모델>', '드라이런 요청 모델')
+    .option('--live-synthetic', '시험 우주 전용 — 실 관문 저장소에 합성 관측 저장(시험 우주 신원 필요 · 운영 신원이면 거부)')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { row?: string; event?: string; resetsAt?: string; amountUsd?: string; usedPct?: string; slopePctPerHour?: string; role?: string; difficulty?: string; model?: string; liveSynthetic?: boolean; json?: boolean }) => {
+      const { runLlmPolicyInject } = await import('./llm-policy-cli.js');
+      const result = await runLlmPolicyInject({
+        ...(opts.row !== undefined ? { row: opts.row } : {}), ...(opts.event !== undefined ? { event: opts.event } : {}),
+        ...(opts.resetsAt !== undefined ? { resetsAt: opts.resetsAt } : {}), ...(opts.amountUsd !== undefined ? { amountUsd: opts.amountUsd } : {}),
+        ...(opts.usedPct !== undefined ? { usedPct: opts.usedPct } : {}), ...(opts.slopePctPerHour !== undefined ? { slopePctPerHour: opts.slopePctPerHour } : {}),
+        ...(opts.role !== undefined ? { role: opts.role } : {}), ...(opts.difficulty !== undefined ? { difficulty: opts.difficulty } : {}),
+        ...(opts.model !== undefined ? { model: opts.model } : {}), liveSynthetic: Boolean(opts.liveSynthetic), json: Boolean(opts.json),
+      });
+      if (!result.ok) process.exitCode = 2;
+    });
 }

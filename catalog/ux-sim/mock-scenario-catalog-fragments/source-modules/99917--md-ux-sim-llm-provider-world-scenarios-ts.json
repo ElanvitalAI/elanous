@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-LLM-PROVIDER-WORLD-SCENARIOS-TS",
+  "path": "src/ux-sim/llm-provider-world/scenarios.ts",
+  "boundary": "Scenario helpers that wire the fake LLM provider world to the real decideLlmSpend and runLlmSpendGuard (policy overlay, guard with in-memory ledger, secret-shape probe); no decision logic of its own and no real key, token, network or host",
+  "deviceIds": ["llm-sim-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

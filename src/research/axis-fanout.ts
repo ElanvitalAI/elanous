@@ -16,6 +16,13 @@ const RESEARCH_EXA_TIMEOUT_MS = 4_500;
 // Leave scheduler/logging headroom under the user-visible 15s aggregate cap.
 export const RESEARCH_SEARCH_BUDGET_MS = 14_500;
 const ENGINE_BREAKER_FAILURE_LIMIT = 2;
+/** Own cap for one axis page fetch, so slow native fetches cannot serialize the research tail.
+ * 출처: OP #114412 · RES WEBCHAT-A2DF-MK-113947 — native-fetch timeouts of 13–19 s ×3 near the end of axis collection. */
+export const RESEARCH_AXIS_FETCH_CAP_MS = 8_000;
+/** Structured failure reason of an axis fetch that hit its own cap. */
+export const AXIS_FETCH_CAP_REASON = 'fetch-cap';
+/** Structured failure reason of an axis call that had not settled when the research-phase deadline fired. */
+export const AXIS_RESEARCH_DEADLINE_REASON = 'research-deadline';
 
 export interface AxisToolCallPlan {
   questionId: string;
@@ -48,6 +55,8 @@ interface TimedAxisSearchResult extends AxisSearchResult {
   fetchedPage?: { url: string; output: string };
   fetchedPageObservedAt?: string;
   fetchedPagePublishedAt?: string;
+  /** A page fetch that failed structurally (today only the per-fetch cap); recorded as failed evidence. */
+  fetchFailed?: { url: string; reason: typeof AXIS_FETCH_CAP_REASON };
 }
 export interface AxisSearchContext {
   questionPrompt?: string;
@@ -59,6 +68,8 @@ export interface AxisFanoutDeps {
   search?: AxisSearch;
   fetchPage?: (url: string, question: BloomResearchQuestion, signal?: AbortSignal) => Promise<{ url: string; output: string }>;
   signal?: AbortSignal;
+  /** Per-axis page-fetch cap; default `RESEARCH_AXIS_FETCH_CAP_MS` (test seam). */
+  fetchCapMs?: number;
   admitToolCall?: (toolName: 'OmniSearch' | 'WebFetch') => boolean;
   /** Observation clock seam for deterministic source-reference dates. */
   now?: () => number;
@@ -321,6 +332,19 @@ function appendSearchEvidence(
       truncated: Array.from(content).length > 8_000,
     });
   }
+  if (response.fetchFailed) {
+    group.evidence.push({
+      questionId: question.id,
+      sourceKind: 'web-fetch',
+      source: response.fetchFailed.url,
+      observedAt,
+      ...(question.requestedWindow ? { requestedWindow: question.requestedWindow } : {}),
+      failureReason: response.fetchFailed.reason,
+      content: `${response.fetchFailed.reason}: page fetch exceeded its own time cap`,
+      outcome: 'failed',
+      truncated: false,
+    });
+  }
   for (const hit of response.hits) {
     try {
       group.evidence.push(evidenceFromHit(question, hit, observedAt));
@@ -380,8 +404,18 @@ export async function fanOutAxisEvidence(
     if (deps.admitToolCall && !deps.admitToolCall('WebFetch')) {
       return { ...response, budgetExhausted: true, observedAt } satisfies TimedAxisSearchResult;
     }
+    const capMs = deps.fetchCapMs ?? RESEARCH_AXIS_FETCH_CAP_MS;
+    const fetchUrl = response.hits[0]!.url;
+    const capController = new AbortController();
+    const fetchSignal = deps.signal ? AbortSignal.any([deps.signal, capController.signal]) : capController.signal;
+    let capped = false;
+    let capTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const page = await fetchPage(response.hits[0]!.url, question, deps.signal);
+      const fetching = fetchPage(fetchUrl, question, fetchSignal);
+      fetching.catch(() => undefined); // a fetch that outlives its cap must not leave an unhandled rejection
+      const page = await Promise.race([fetching, new Promise<never>((_, reject) => {
+        capTimer = setTimeout(() => { capped = true; capController.abort(new Error(AXIS_FETCH_CAP_REASON)); reject(new Error(AXIS_FETCH_CAP_REASON)); }, capMs);
+      })]);
       const fetchedPagePublishedAt = page.url === response.hits[0]!.url
         ? publishedDateFromHit(response.hits[0]!) : undefined;
       return {
@@ -391,9 +425,14 @@ export async function fanOutAxisEvidence(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       debug.log('research.search', 'native-fetch-failed', {
-        questionId: question.id, reason: message.slice(0, 200),
+        questionId: question.id, reason: capped ? AXIS_FETCH_CAP_REASON : message.slice(0, 200), capped, capMs,
       }, { level: 'warn' });
-      return { ...response, observedAt } satisfies TimedAxisSearchResult;
+      return {
+        ...response, observedAt,
+        ...(capped ? { fetchFailed: { url: fetchUrl, reason: AXIS_FETCH_CAP_REASON } } : {}),
+      } satisfies TimedAxisSearchResult;
+    } finally {
+      if (capTimer !== undefined) clearTimeout(capTimer);
     }
   };
   const byQuestion = new Map(questions.map(question => [question.id, question]));
@@ -403,10 +442,37 @@ export async function fanOutAxisEvidence(
     appendSearchEvidence(scratch, byQuestion.get(call.questionId)!, call, response);
     try { deps.onAxisEvidence(call.questionId, scratch.evidence); } catch { /* early-answer observer is fail-soft */ }
   };
-  const settled = await Promise.allSettled(plan.map(call => searchAxis(call).then(response => {
-    notifyAxisEvidence(call, response);
-    return response;
-  })));
+  // OP #114412: the research-phase deadline (deps.signal) ends collection. Calls that settled by then keep their
+  // evidence; the rest become failed evidence with a structured reason — never a wait for a hung provider.
+  const startedAtMs = now();
+  let collecting = true;
+  const outcomes: Array<PromiseSettledResult<TimedAxisSearchResult> | undefined> = plan.map(() => undefined);
+  const calls = plan.map((call, index) => searchAxis(call).then(response => {
+    outcomes[index] = { status: 'fulfilled', value: response };
+    if (collecting) notifyAxisEvidence(call, response);
+  }, (reason: unknown) => { outcomes[index] = { status: 'rejected', reason }; }));
+  let stoppedBy: 'completed' | 'deadline' = 'completed';
+  if (deps.signal) {
+    const signal = deps.signal;
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<'aborted'>(resolve => {
+      if (signal.aborted) resolve('aborted');
+      else { onAbort = () => resolve('aborted'); signal.addEventListener('abort', onAbort, { once: true }); }
+    });
+    const winner = await Promise.race([Promise.all(calls).then(() => 'done' as const), aborted]);
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+    if (winner === 'aborted' && outcomes.some(outcome => outcome === undefined)) stoppedBy = 'deadline';
+    else if (winner === 'aborted') await Promise.all(calls);
+  } else {
+    await Promise.all(calls);
+  }
+  collecting = false;
+  const settled = outcomes.map((outcome): PromiseSettledResult<TimedAxisSearchResult> => outcome
+    ?? { status: 'rejected', reason: new Error(`${AXIS_RESEARCH_DEADLINE_REASON}: axis search had not settled when the research phase ended`) });
+  debug.log('research.search', 'axis-fanout-collected', {
+    stoppedBy, callCount: plan.length, settledCount: outcomes.filter(outcome => outcome !== undefined).length,
+    elapsedMs: now() - startedAtMs,
+  });
   const axes: AxisEvidenceGroup[] = questions.map(question => ({ questionId: question.id, evidence: [] }));
   const groups = new Map(axes.map(axis => [axis.questionId, axis]));
   for (const question of questions) {

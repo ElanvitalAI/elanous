@@ -316,7 +316,8 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
       errors.push({ path: `${path}/id`, message: 'node.id 는 유효한 id 여야 한다' }); continue;
     }
     const ext = parseExt(combineExt(`${path}/ext`, errors, parseExt(node.ext, `${path}/ext`, errors),
-      namespaceUnmappedExtensions(node, sourceNamespace, ['id', 'type', 'call', 'call_entry', 'cap', 'requires', 'skill', 'uses', 'with', 'packs', 'map', 'post', 'contract', 'budget', 'max_visits', 'hitl', 'secrets', 'ext'])), `${path}/ext`, errors);
+      namespaceUnmappedExtensions(node, sourceNamespace, ['id', 'type', 'call', 'call_entry', 'cap', 'requires', 'skill', 'uses', 'with', 'memory', 'packs', 'map', 'post', 'contract', 'budget', 'max_visits', 'hitl', 'secrets', 'ext',
+        ...(record(node.input)?.memoryScope === undefined ? [] : ['input'])])), `${path}/ext`, errors);
     nodeExtById.set(node.id, ext);
     const map = record(node.map);
     if (node.map !== undefined && (!map || Object.keys(map).some(key => !['over', 'as', 'max_parallel', 'partial'].includes(key)) ||
@@ -339,6 +340,10 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
     nodePostById.set(node.id, post);
     const withPayload = record(node.with);
     if (node.with !== undefined && !withPayload) errors.push({ path: `${path}/with`, message: 'with 는 맵이어야 한다' });
+    const inputDeclaration = record(node.input);
+    if (inputDeclaration?.memoryScope !== undefined && (Object.keys(inputDeclaration).some(key => key !== 'memoryScope') ||
+      !['instance', 'template', 'global'].includes(String(inputDeclaration?.memoryScope))))
+      errors.push({ path: `${path}/input`, message: 'input 은 memoryScope: instance|template|global 만 허용한다' });
     if (withPayload && Object.hasOwn(withPayload, 'optional')) {
       const optional = record(withPayload.optional);
       if (!node.call || !optional || Object.keys(optional).length === 0 ||
@@ -356,6 +361,11 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
       errors.push({ path: `${path}/cap`, message: 'node.cap 은 L0·L1·L2·L3 중 하나여야 한다' });
     if (node.cap !== undefined) errors.push({ path: `${path}/cap`, message: 'node.cap 실행 상한은 runGraph IR 에서 강제되지 않아 안전 거부한다' });
     const type = typeof node.type === 'string' ? node.type : undefined;
+    const memoryAction = type?.startsWith('memory.') ? type.slice('memory.'.length) : undefined;
+    if (memoryAction && !['read', 'write', 'promote'].includes(memoryAction))
+      errors.push({ path: `${path}/type`, message: 'memory 노드 동사는 read|write|promote 이어야 한다' });
+    if (node.memory !== undefined && !record(node.memory)) errors.push({ path: `${path}/memory`, message: 'memory 는 맵이어야 한다' });
+    if (inputDeclaration?.memoryScope !== undefined && type !== 'prompt') errors.push({ path: `${path}/input`, message: 'input.memoryScope 는 prompt 노드 전용이다' });
     if (requires === undefined && node.requires === undefined) requires = inferredCapabilityContract(type, withPayload);
     if (map && typeof map.over === 'string' && typeof map.as === 'string' && Number.isSafeInteger(map.max_parallel)) {
       const source = map.over.match(/^\$([A-Za-z0-9][A-Za-z0-9._-]*)\.result\.items$/);
@@ -386,6 +396,7 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
     if (isCapability && requires === undefined)
       errors.push({ path: `${path}/requires`, message: 'capability 노드는 계약 id requires 를 선언하거나 알려진 계약으로 추론 가능해야 한다' });
     if (call !== undefined || isVerb) { kind = 'subgraph'; recipe = 'none'; loweredCall ??= `verb-${type}@^1`; }
+    else if (memoryAction && ['read', 'write', 'promote'].includes(memoryAction)) { kind = 'memory'; recipe = 'none'; }
     else if (isCapability) { kind = 'capability'; recipe = 'none'; }
     else if (type && (HARNESS_CORE_KINDS as readonly string[]).includes(type)) { kind = type; recipe = 'none'; }
     else { errors.push({ path: `${path}/type`, message: `type 을 낮출 수 없다: ${String(type)}` }); continue; }
@@ -402,6 +413,7 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
     const v1Input: Record<string, unknown> = { ...(withPayload ?? {}),
       ...(type ? { type } : {}), ...(typeof node.skill === 'string' ? { skill: node.skill } : {}),
       ...(uses ? { uses } : {}), ...(packs ? { packs } : {}),
+      ...(inputDeclaration?.memoryScope ? { memoryScope: inputDeclaration.memoryScope } : {}),
       ...(map ? { map: { over: map.over, as: map.as, max_parallel: map.max_parallel, ...(map.partial === undefined ? {} : { partial: map.partial }) } } : {}),
       ...(post ? { post } : {}),
       ...(withPayload?.context === undefined && !bundleExt && !graphExt && !ext && !loopExt && !policyExt
@@ -413,6 +425,7 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
     const contract = record(node.contract);
     if (node.contract !== undefined && !contract) errors.push({ path: `${path}/contract`, message: 'contract 는 맵이어야 한다' });
     v1Nodes.push({ node_id: node.id, kind, recipe, max_visits: maxVisits, ...(requires ? { requires } : {}),
+      ...((memoryAction || node.memory !== undefined) ? { memory: { ...(record(node.memory) ?? {}), ...(memoryAction || type === 'prompt' ? { action: memoryAction ?? 'read' } : {}) } } : {}),
       ...(typeof node.call_entry === 'string' ? { call_entry: node.call_entry } : {}),
       ...(node.hitl === undefined ? {} : { hitl: node.hitl }),
       ...(node.secrets === undefined ? {} : { secrets: node.secrets }),

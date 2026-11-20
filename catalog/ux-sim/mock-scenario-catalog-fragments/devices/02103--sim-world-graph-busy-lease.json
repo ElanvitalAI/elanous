@@ -1,0 +1,26 @@
+{
+  "id": "sim-world-graph-busy-lease",
+  "name": "Graph sim world: busy·lease·dedupe 장치 ⑦ — 진행 중 같은 키 duplicate · 다른 본문 거부 · 새 키 busy 기록 후 버림 · lease 상실 같은 runId mode:resume · 그래프 간 상한 새로 없음",
+  "audience": "internal",
+  "checklistCells": ["SCHEDULE-GRAPH-S1-MEMORY-LIFECYCLE"],
+  "implementation": ["src/ux-sim/sim-world/graph/schedule-devices.ts"],
+  "tests": ["src/ux-sim/sim-world/graph/schedule-devices.test.ts"],
+  "target": "graph 세계 — 깨움 계약의 동시성·중복·재개 규칙(GRAPH-SCHEDULER §1-2 · GRAPH-API-TRIGGER-DEDUP-FU)",
+  "inputs": [
+    "런 진행 중 같은 dedupeKey 재발화(같은 본문·다른 본문)",
+    "런 진행 중 새 dedupeKey(event 트리거)",
+    "중단(lease 상실) 런 상태 파일(status:running) 후 같은 키 재깨움",
+    "두 그래프(memory-lifecycle·release-loop) 동시 발화"
+  ],
+  "observations": [
+    "SB1 같은 키 → duplicate(같은 runId · 런 1개)",
+    "SB2 같은 키·다른 본문 → 거부",
+    "SB3 새 키 → busy 기록 후 버림(적체 금지)",
+    "SB4 lease 상실 → abort 후 같은 runId mode:resume",
+    "SB5 두 그래프 모두 실행(그래프 간 상한 새로 없음)"
+  ],
+  "entryCommands": ["bun test src/ux-sim/sim-world/graph/schedule-devices.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -1564,7 +1564,7 @@ test('a real one-file gate shell produces a named Job reference after collection
     expect(readFileSync(join(artifactsDir, 'part-0.rc'), 'utf8').trim()).toBe('1');
     expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toContain(`[warm-worker] file=${file}`);
     expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toMatch(/\[warm-worker\] junit-sha256=[0-9a-f]{64}/);
-    expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toContain('(pass) works');
+    expect(readFileSync(join(artifactsDir, 'part-0.junit.xml'), 'utf8')).toContain('name="works"');
     expect(readFileSync(join(artifactsDir, 'part-0.log'), 'utf8')).toContain('(fail) fails');
     return { exitCode: 0, artifactsDir, job: 'real-one-file-shell' };
   }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]), () => '');
@@ -1602,7 +1602,7 @@ test('a real one-file gate shell produces a named Job reference after collection
   const directRetryOutbox = join(retryHome, 'outbox');
   expect(readFileSync(join(directRetryOutbox, 'part-0.retry-0.junit.xml'), 'utf8')).toContain(`file="${weirdFile}"`);
   expect(readFileSync(join(directRetryOutbox, 'part-0.retry-0.rc'), 'utf8').trim()).toBe('0');
-  expect(readFileSync(join(directRetryOutbox, 'part-0.retry-0.log'), 'utf8')).toContain('(pass) fails once');
+  expect(readFileSync(join(directRetryOutbox, 'part-0.retry-0.junit.xml'), 'utf8')).toContain('name="fails once"');
   // Two real one-file shells produce distinct source attempt stamps. A fresh
   // collector manifest cannot relabel the first Job as the second.
   writeFileSync(join(repo, file), "import { expect, test } from 'bun:test'; test('works', () => expect(1).toBe(1)); test('fails', () => { throw new Error('later'); });\n");

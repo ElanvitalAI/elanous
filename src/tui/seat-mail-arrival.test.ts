@@ -240,3 +240,45 @@ test('TC #91989 리터럴: 중복 도착 2 → 사슬 1개(dedupe) — arrived 1
   expect(events.find((e) => e.event === 'turn-life:event-arrived')?.data).toMatchObject({ eventId: 7 });
   expect(events.filter((e) => e.event === 'turn-life:event-queued')).toHaveLength(1);
 });
+
+test('restarting the same watcher restores delivery and seen tracking exactly once', () => {
+  const queue = quietQueue();
+  const records: string[] = [];
+  let tick = () => {};
+  const watcher = createSeatMailArrivalWatcher('/h', queue, {
+    messages: {
+      read: () => ({ seat: SEAT, messages: [{ id: 7, from: 'REL', body: 'hello' }] }),
+      receipts: { record: (event) => { records.push(event.state); } },
+    },
+    timer: { set: (fn) => { tick = fn; return 'timer'; }, clear: () => {} },
+    log: () => {}, turnLifeLog: () => {},
+  });
+  watcher.start(); watcher.stop(); watcher.start(); watcher.start();
+  tick();
+  expect(watcher.getStatus()).toBe('running');
+  queue.settle('draft'); queue.dequeue(); watcher.noteTurnFinished(true);
+  expect(records).toEqual(['delivered', 'seen']);
+  watcher.stop();
+});
+
+test('a nested read failure is not overwritten by the older successful poll', () => {
+  const queue = quietQueue();
+  let tick = () => {};
+  let reads = 0;
+  const watcher = createSeatMailArrivalWatcher('/h', queue, {
+    messages: { read: () => {
+      reads += 1;
+      if (reads === 2) throw new Error('nested failure');
+      return { seat: SEAT, messages: [{ id: 7, from: 'REL', body: 'hello' }] };
+    } },
+    timer: { set: (fn) => { tick = fn; return 'timer'; }, clear: () => {} },
+    retryTimer: { set: () => 'retry', clear: () => {} },
+    onReadError: () => {}, log: () => {}, turnLifeLog: () => {},
+    onArrived: () => { expect(watcher.poll()).toEqual({ kind: 'read-error' }); },
+  });
+  watcher.start(); tick();
+  expect(watcher.getStatus()).toBe('read-error');
+  expect(watcher.poll().kind).toBe('quiet');
+  expect(watcher.getStatus()).toBe('running');
+  watcher.stop();
+});

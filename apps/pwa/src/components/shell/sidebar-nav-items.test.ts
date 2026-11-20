@@ -12,7 +12,7 @@ import {
 } from './sidebar-nav-items';
 
 const app = resolve(dirname(import.meta.path), '../../app');
-const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/member/invite', '/ops/release', '/scraps', '/settings', '/setup', '/setup/done', '/share/received', '/signup', '/signup/complete', '/term', '/vault', '/voice-notes'];
+const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/intake', '/live-run', '/live-run/adaptive', '/member/invite', '/ops/release', '/scraps', '/settings', '/setup', '/setup/done', '/share/received', '/signup', '/signup/complete', '/term', '/vault', '/voice-notes'];
 
 function builtRoutes(directory = app): string[] {
   const pages: string[] = [];

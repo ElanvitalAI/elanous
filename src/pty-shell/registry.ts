@@ -65,10 +65,15 @@ const ELIDED_MARKER = '\n[... elided middle ...]\n';
  * exit does not wait for escalation and a dead handle cannot be signalled.
  */
 const DEFAULT_KILL_ESCALATION_TIMEOUT_MS = 1_000;
+/** A synchronized-update region (DECSET 2026) that stays open longer than this is not a frame in progress but a program that
+ *  never closed it: the snapshot then follows the live grid again (terminals bound the hold the same way). */
+const SYNC_UPDATE_MAX_HOLD_MS = 1_000;
 
 export interface PtyScreenRenderOptions {
   /** Reconstruct each xterm cell's SGR attributes for terminal-native screen inspection. */
   readonly ansi?: boolean;
+  /** Show the screen this many lines above the live bottom (clamped to what the emulator kept); the header then carries `scrolled-back=N`. */
+  readonly scrollBack?: number;
 }
 
 type XtermCell = {
@@ -262,6 +267,12 @@ export interface PtyHandle extends PtyControlTarget {
    *  byte delta is unreadable. Async: flushes the xterm write queue first.
    *  Returns a note when the emulator is unavailable. */
   renderScreen(options?: PtyScreenRenderOptions): Promise<string>;
+  /** D1b(els-restart-survive): render the SCROLLBACK above the viewport (the
+   *  emulator's ring buffer — the source of the holder's 화면·스크롤백
+   *  snapshot in src/els/holder.ts). Reuses the renderScreen path: drops the
+   *  oldest lines and keeps only the newest `maxLines`. '' when the emulator
+   *  is unavailable or the buffer has no history. */
+  renderScrollback?(maxLines: number): Promise<string>;
   /** Render the current screen as a PNG (xterm grid → SVG → PNG). Returns
    *  null when the emulator or the SVG→PNG renderer is unavailable. For
    *  VISUAL delivery — e.g. a Telegram photo attachment when the user asks
@@ -518,6 +529,26 @@ export function startPty(opts: StartOpts): PtyHandle {
       allowProposedApi: true,
     });
   } catch { term = null; }
+  // DECSET 2026 (synchronized update): a full-screen TUI (eln) wraps each frame in `CSI ? 2026 h … l`. The emulator parses
+  // the bytes as they arrive, so a snapshot taken in between shows a half-erased, half-drawn frame (lines twice or missing).
+  // The grid as it was when the region opened is the last complete frame — renderScreen serves that until the region closes.
+  let syncFrame: { at: number; plain: string[]; ansi: string[]; cursor: string } | null = null;
+  const grid = (t: XtermHeadless, ansi: boolean, back = 0): string[] => {
+    const active = t.buffer.active;
+    const rows: string[] = [];
+    for (let y = 0; y < t.rows; y++) {
+      const line = active.getLine(active.viewportY - back + y);
+      rows.push(line ? ansi ? renderAnsiLine(line) : line.translateToString(true) : '');
+    }
+    return rows;
+  };
+  const cursorOf = (t: XtermHeadless): string => `row ${t.buffer.active.cursorY}, col ${t.buffer.active.cursorX}, visible ${!(t as unknown as XtermInternals)._core?.coreService?.isCursorHidden}`;
+  if (term) {
+    const t = term;
+    const handles2026 = (params: readonly (number | number[])[]): boolean => params.some((param) => param === 2026);
+    t.parser.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => { if (handles2026(params) && !syncFrame) syncFrame = { at: Date.now(), plain: grid(t, false), ansi: grid(t, true), cursor: cursorOf(t) }; return false; });
+    t.parser.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => { if (handles2026(params)) syncFrame = null; return false; });
+  }
 
   let nickname = opts.nickname;
   let lastWriteActor: PtyWriteActor | null = null;
@@ -662,15 +693,29 @@ export function startPty(opts: StartOpts): PtyHandle {
       // (write callbacks fire in order after the parser drains).
       await new Promise<void>(resolve => t.write('', () => resolve()));
       const active = t.buffer.active;
-      const lines: string[] = [];
-      for (let y = 0; y < t.rows; y++) {
-        const line = active.getLine(active.viewportY + y);
-        lines.push(line ? options.ansi ? renderAnsiLine(line) : line.translateToString(true) : '');
-      }
+      const back = Math.min(Math.max(0, Math.floor(options.scrollBack ?? 0)), active.baseY);
+      // A synchronized-update hold (DECSET 2026) is the live viewport's last complete frame: scrolled back, the view reads history, so no hold.
+      const held = back === 0 && syncFrame && Date.now() - syncFrame.at < SYNC_UPDATE_MAX_HOLD_MS ? syncFrame : null;
+      const lines = held ? [...(options.ansi ? held.ansi : held.plain)] : grid(t, options.ansi === true, back);
       while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-      const cursorVisible = !(t as unknown as XtermInternals)._core?.coreService?.isCursorHidden;
-      const header = `[screen ${t.cols}x${t.rows} cursor=(row ${active.cursorY}, col ${active.cursorX}, visible ${cursorVisible})]`;
+      const header = back > 0 ? `[screen ${t.cols}x${t.rows} scrolled-back=${back}]` : `[screen ${t.cols}x${t.rows} cursor=(${held ? held.cursor : cursorOf(t)})]`;
       return `${header}\n${lines.join('\n')}`;
+    },
+    // D1b(els-restart-survive): 뷰포트 위 스크롤백(에뮬레이터 링버퍼)을 텍스트로 렌더 — 홀더가 화면·스크롤백
+    // 스냅샷(src/els/holder.ts)을 남기는 원천. 기존 renderScreen 경로 재사용: 쓰기 큐 flush 후 같은 방식으로
+    // 줄을 뽑되, 오래된 것부터 버리고 최신 maxLines 줄만 남긴다(버퍼 자체 상한은 scrollback: 1000 줄).
+    async renderScrollback(maxLines: number): Promise<string> {
+      if (!term) return '';
+      const t = term;
+      await new Promise<void>(resolve => t.write('', () => resolve()));
+      const active = t.buffer.active;
+      const from = Math.max(0, active.viewportY - Math.max(0, Math.floor(maxLines)));
+      const lines: string[] = [];
+      for (let y = from; y < active.viewportY; y++) {
+        const line = active.getLine(y);
+        lines.push(line ? line.translateToString(true) : '');
+      }
+      return lines.join('\n');
     },
     async renderScreenPng(): Promise<Buffer | null> {
       if (!term) return null;
@@ -700,6 +745,7 @@ export function startPty(opts: StartOpts): PtyHandle {
       try {
         if (adapter.resize) { adapter.resize(c, r); currentCols = c; currentRows = r; }
       } catch { /* ignore */ }
+      syncFrame = null;                                      // a held frame has the old size
       if (term) { try { term.resize(c, r); } catch { /* ignore */ } }
     },
   };

@@ -176,12 +176,14 @@ test('RC-READINESS-COUNTDOWN: an rc without a schedule row still holds on a miss
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('RC-READINESS-COUNTDOWN: a stable version without a schedule row still throws the same message', async () => {
+test('RELEASE-COUNTDOWN-IN-GRAPH: a stable version without a schedule row holds SCHEDULE_MISSING instead of failing the graph', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-image-stable-'));
   try {
     await expect(waitForGateImageT60({ runId: 'run-stable', input: { version: '0.3.29' },
       outputs: { 'version-release': { commit: 'abcdef0123456789abcdef0123456789abcdef01' } } }, { ledgerRoot: root,
-      sleep: async () => { throw new Error('not reached'); } })).rejects.toThrow('readiness countdown requires a release schedule: 0.3.29');
+      sleep: async () => { throw new Error('held'); } })).rejects.toThrow('held');
+    expect(JSON.parse(readFileSync(join(root, 'release', '0.3.29', 'countdown.json'), 'utf8')).holds.map((hold: { code: string }) => hold.code))
+      .toEqual(['SCHEDULE_MISSING', 'IMAGE_NOT_READY']);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

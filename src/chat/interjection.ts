@@ -90,14 +90,24 @@ export function buildTurnInterruptedMarker(opts?: { toolInFlight?: boolean; reas
 export const INTERRUPTED_ON_PURPOSE_NOTE = '[사용자가 직전 턴을 의도적으로 중단했습니다. 중단된 도구·명령은 일부만 실행됐을 수 있으니 다시 하기 전에 현재 상태를 확인하십시오.]';
 
 /** 취소 뒤 자동 제출되는 발화에 맥락 한 줄을 앞세운다. 순수. */
-export function withInterruptedOnPurposeContext(text: string): string {
-  return `${INTERRUPTED_ON_PURPOSE_NOTE}\n\n${text}`;
+const INTERRUPT_CONTEXT_NOTES = {
+  interrupt: INTERRUPTED_ON_PURPOSE_NOTE,
+  esc: '[사용자가 Esc로 직전 턴을 중단했습니다. 중단된 도구·명령의 현재 상태를 확인하십시오.]',
+  'timeout-15m': '[직전 턴이 시간 제한으로 자동 중단됐습니다. 중단된 도구·명령의 현재 상태를 확인하십시오.]',
+  'stream-stall': '[직전 턴이 응답 정체로 자동 중단됐습니다. 중단된 도구·명령의 현재 상태를 확인하십시오.]',
+} as const;
+
+export function withInterruptedOnPurposeContext(text: string, reason: keyof typeof INTERRUPT_CONTEXT_NOTES = 'interrupt'): string {
+  return `${INTERRUPT_CONTEXT_NOTES[reason]}\n\n${text}`;
 }
 
 /** 화면·앵커용 — 맥락 한 줄을 떼어 사람 문장만 돌려준다. 순수. */
 export function stripInterruptedOnPurposeContext(text: string): string {
-  const prefix = `${INTERRUPTED_ON_PURPOSE_NOTE}\n\n`;
-  return text.startsWith(prefix) ? text.slice(prefix.length) : text;
+  for (const note of Object.values(INTERRUPT_CONTEXT_NOTES)) {
+    const prefix = `${note}\n\n`;
+    if (text.startsWith(prefix)) return text.slice(prefix.length);
+  }
+  return text;
 }
 
 /**

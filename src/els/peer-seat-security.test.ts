@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { baselineBeforePidLookup, processIdentity, resolvePeerSeat, peerIdentitySupported, validHerdrPane, type ProcessIdentity } from './peer-seat.js';
+import { authorizeRequest, type ServerRole } from './server-auth.js';
 
 const old: ProcessIdentity = { pid: 42, ppid: 3, session: 3, tty: 9, start: '100:123000', startedMs: 100123 };
 describe('peer process generation boundary', () => {
@@ -89,4 +90,43 @@ test.if(process.platform === 'darwin')('Darwin accepted Unix socket exposes actu
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// JUD #39096 must ⓒ (OP #106966·#107197): els pane 조상 검사 — 무토큰 pane 자손 탐지.
+import { resolveAncestorPane } from './peer-seat.js';
+
+test('JUD #39096 ⓒ — resolveAncestorPane: els pane 셸 조상이 있으면 그 pane 을 밝힌다', async () => {
+  const peer = { pid: 42, ppid: 3, session: 3, tty: 9, start: '100:1', startedMs: 100000 };
+  const shell = { pid: 3, ppid: 1, session: 3, tty: 9, start: '90:1', startedMs: 90000 };
+  const identity = (pid: number) => (pid === 42 ? peer : pid === 3 ? shell : undefined);
+  expect(await resolveAncestorPane(42, peer, [{ pane: 'w1:p1', pid: 3 }], { identity })).toEqual({ pane: 'w1:p1' });
+  expect(await resolveAncestorPane(42, peer, [{ pane: 'w1:p1', pid: 999 }], { identity })).toBeUndefined();
+  expect(await resolveAncestorPane(43, peer, [{ pane: 'w1:p1', pid: 3 }], { identity })).toBeUndefined();
+});
+
+// JUD #39096 must ⓒ (OP #107371·#107528): no-token typing is fail-closed — a setsid/double-fork
+// caller has no resolvable pane ancestor, so its typing ops (input-line AND interactive
+// input/resize) are denied by default; a human types with the owner token.
+test('JUD #39096 ⓒ — no-token input-line is denied by default regardless of ancestors/rules', () => {
+  const OUTSIDER: ServerRole = { kind: 'outsider', note: 'daemonized — no pane ancestor' };
+  expect(authorizeRequest(OUTSIDER, { op: 'input-line', pane: 'p1', text: 'x', from: 'HAND' }, 'w1', []).allow).toBe(false);
+});
+
+// JUD #39096 ⓒ (#107528): interactive typing ops are default-deny for a no-token connection.
+test('JUD #39096 ⓒ — no-token interactive input/resize are denied; view-only attach stays allowed', () => {
+  const OUTSIDER: ServerRole = { kind: 'outsider', note: 'daemonized — no pane ancestor' };
+  // resize carries cols/rows beyond RequestShape — pass via a const so TS's excess-property
+  // check on fresh literals does not fire; the cast-free literal satisfies RequestShape structurally.
+  const resizeReq = { op: 'resize', pane: 'p1', cols: 80, rows: 24 };
+  expect(authorizeRequest(OUTSIDER, { op: 'input', pane: 'p1', text: 'x' }, 'w1', []).allow).toBe(false);
+  expect(authorizeRequest(OUTSIDER, resizeReq, 'w1', []).allow).toBe(false);
+  expect(authorizeRequest(OUTSIDER, { op: 'attach', pane: 'p1' }, 'w1', []).allow).toBe(true);
+});
+
+test('JUD #39096 ⓒ — the owner token types; reading (attach) keeps its rules', () => {
+  const OWNER: ServerRole = { kind: 'owner', note: 'human with the owner token' };
+  const resizeReq = { op: 'resize', pane: 'p1', cols: 80, rows: 24 };
+  expect(authorizeRequest(OWNER, { op: 'input-line', pane: 'p1', text: 'x', from: 'OP' }, 'w1', []).allow).toBe(true);
+  expect(authorizeRequest(OWNER, { op: 'input', pane: 'p1', text: 'k' }, 'w1', []).allow).toBe(true);
+  expect(authorizeRequest(OWNER, resizeReq, 'w1', []).allow).toBe(true);
 });

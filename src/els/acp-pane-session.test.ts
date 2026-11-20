@@ -124,3 +124,34 @@ test('a failed stop keeps the pane reserved and permits a cleanup retry', async 
   await sessions.open('pane');
   await sessions.close('pane');
 });
+
+test('startup and cleanup failure reserve the pane until cleanup succeeds', async () => {
+  let stops = 0;
+  const sessions = createAcpPaneSessions(() => ({
+    start: async () => { throw new Error('start failed'); }, newSession: async () => 'unused',
+    prompt: async () => ({ stopReason: 'end_turn' }),
+    stop: async () => { if (++stops === 1) throw new Error('cleanup failed'); },
+  }));
+  await expect(sessions.open('pane')).rejects.toThrow('start failed');
+  await expect(sessions.open('pane')).rejects.toThrow('pane already open');
+  await expect(sessions.prompt('pane', 'do not send', () => {})).rejects.toThrow('pane is not open');
+  await sessions.close('pane');
+  expect(stops).toBe(2);
+});
+
+test('close racing with failed startup retries a failed cleanup', async () => {
+  let release!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  let stops = 0;
+  const sessions = createAcpPaneSessions(() => ({
+    start: async () => { await waiting; throw new Error('start failed'); }, newSession: async () => 'unused',
+    prompt: async () => ({ stopReason: 'end_turn' }),
+    stop: async () => { if (++stops === 1) throw new Error('cleanup failed'); },
+  }));
+  const opening = sessions.open('pane');
+  const closing = sessions.close('pane');
+  release();
+  await expect(opening).rejects.toThrow('start failed');
+  await closing;
+  expect(stops).toBe(2);
+});

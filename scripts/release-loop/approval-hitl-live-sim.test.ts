@@ -123,12 +123,12 @@ test('release HITL approval waits inside the live orchestration and continues th
       skippedNodeIds,
     };
     console.info(`[release-cut-measurement] ${JSON.stringify(cutMeasurement)}`);
-    // The declared release graph now includes readiness, cloud lifecycle, reuse prep, and cutover.
-    expect(cutMeasurement.reused).toBe(20);
-    expect(skippedNodeIds).toHaveLength(20);
+    // The declared release graph now includes traffic-prep, readiness, cloud lifecycle, reuse prep, and cutover.
+    expect(cutMeasurement.reused).toBe(21);
+    expect(skippedNodeIds).toHaveLength(21);
     expect(cutMeasurement.rerun).toBe(0);
     expect(skippedNodeIds).toEqual([
-      'cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join',
+      'traffic-prep', 'cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join',
       'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch',
       'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check',
     ]);

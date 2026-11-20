@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { runGraph, type GraphRunOptions } from '../../src/graph-runner/runner.js';
 import { debug } from '../../src/debug/log.js';
 import { runEmergencyPublishSwitchSimulation } from './emergency-publish-switch-sim.js';
-import { runTrafficNode } from './traffic-node.js';
+import { runTrafficNode, runTrafficPrepNode } from './traffic-node.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -44,8 +44,11 @@ test('release graph ignores caller timestamps and stays on the normal repair pat
       output.length = 0;
       console.log = (line?: unknown) => output.push(String(line ?? ''));
       try {
-        const exitCode = await runTrafficNode(context.nodeId, { ...env, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context) },
-          { options: { trafficFile }, report: () => {} });
+        const nodeEnv = { ...env, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context) };
+        // RELEASE-TRAFFIC-PREP-T1H: the graph entry applies the T-1h control against this fixture's traffic file.
+        const exitCode = context.nodeId === 'traffic-prep'
+          ? await runTrafficPrepNode(nodeEnv, { root, traffic: { trafficFile }, schedule: () => null, baseSha: () => null })
+          : await runTrafficNode(context.nodeId, nodeEnv, { options: { trafficFile }, report: () => {} });
         return { exitCode, stdout: `${output.at(-1)}\n`, stderr: '' };
       } finally { console.log = realLog; }
     }

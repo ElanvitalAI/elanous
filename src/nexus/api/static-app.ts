@@ -13,8 +13,8 @@
 // Path traversal: resolve() + prefix 비교로 차단.
 // gzip/cache header / CDN 통합 = ROADMAP §9.7 (v2 개선).
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { extname, join as joinPath, normalize, resolve } from 'node:path';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { extname, join as joinPath, normalize, resolve, sep } from 'node:path';
 
 export const STATIC_PATH_PREFIX = '/app';
 
@@ -55,6 +55,17 @@ export function pathMatchesStaticPrefix(pathname: string): boolean {
   return pathname === STATIC_PATH_PREFIX || pathname.startsWith(`${STATIC_PATH_PREFIX}/`);
 }
 
+/** Read a bare-origin asset only inside the real build tree, with no 404-page fallback. */
+export function handleBareStaticAsset(url: URL, opts: StaticAppOpts, method: string): Response {
+  try {
+    const root = realpathSync(opts.staticDir);
+    const file = realpathSync(joinPath(root, url.pathname.slice('/app/'.length)));
+    if (!file.startsWith(root + sep) || !statSync(file).isFile()) return notFound();
+    const headers = { 'content-type': MIME_BY_EXT[extname(file).toLowerCase()] ?? 'application/octet-stream' };
+    return new Response(method === 'HEAD' ? null : readFileSync(file), { status: 200, headers });
+  } catch { return notFound(); }
+}
+
 export function handleStaticAppRequest(
   url: URL,
   opts: StaticAppOpts,
@@ -64,7 +75,7 @@ export function handleStaticAppRequest(
   let rel = url.pathname.slice(STATIC_PATH_PREFIX.length);
   if (rel === '' || rel === '/') rel = '/index.html';
   const resolved = resolve(joinPath(opts.staticDir, normalize(rel)));
-  if (!resolved.startsWith(root)) return notFound();
+  if (resolved !== root && !resolved.startsWith(root + sep)) return notFound();
 
   let filePath = resolved;
   if (existsSync(filePath) && statSync(filePath).isDirectory()) {

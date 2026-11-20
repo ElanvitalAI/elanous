@@ -126,12 +126,14 @@ function canonicalPreGatePrefix(prefix: string[]): boolean {
   const legacy = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
     'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep'];
   const expected = ['cut-branch', 'gate-image-prebuild', ...legacy.slice(1)];
+  // RELEASE-TRAFFIC-PREP-T1H: current runs enter at traffic-prep before cut-branch.
+  const prepped = ['traffic-prep', ...expected];
   const withApproval = (path: string[]) => {
     const anchor = path.indexOf('cloud-approval-check');
     const at = anchor >= 0 ? anchor + 1 : 6;
     return [...path.slice(0, at), 'approve-cloud-elastic', ...path.slice(at)];
   };
-  return [legacy, withApproval(legacy), expected, withApproval(expected)].some((path) => path.length === prefix.length
+  return [legacy, withApproval(legacy), expected, withApproval(expected), prepped, withApproval(prepped)].some((path) => path.length === prefix.length
     && path.every((nodeId, index) => prefix[index] === nodeId));
 }
 
@@ -141,7 +143,7 @@ function rejectedHealRequiresNewRun(state: GraphRunState, gateIndex: number): bo
   const gate = state.nodes[gateIndex];
   if (state.status !== 'failed' || state.path.length !== state.nodes.length
     || gate?.nodeId !== 'gate' || gate.ok !== false || gate.executed !== true
-    || (state.path[0] !== 'version-release' && state.path[0] !== 'cut-branch') || state.nodes[0]?.nodeId !== state.path[0]
+    || (state.path[0] !== 'version-release' && state.path[0] !== 'cut-branch' && state.path[0] !== 'traffic-prep') || state.nodes[0]?.nodeId !== state.path[0]
     || state.nodes[0]?.ok !== true || state.nodes[0]?.executed !== true
     || !canonicalPreGatePrefix(state.path.slice(0, gateIndex))
     || state.path.slice(0, gateIndex).some((nodeId, index) => state.nodes[index]?.nodeId !== nodeId)

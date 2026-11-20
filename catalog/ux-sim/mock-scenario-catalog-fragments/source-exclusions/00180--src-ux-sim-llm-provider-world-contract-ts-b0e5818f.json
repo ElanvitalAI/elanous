@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/llm-provider-world/contract.ts",
+  "reason": "Type-only contract (interfaces) shared by the LLM provider sim-world devices; it holds no behavior to run. Devices that implement it register themselves as MD-UX-SIM-LLM-*."
+}

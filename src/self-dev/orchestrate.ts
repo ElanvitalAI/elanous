@@ -840,6 +840,12 @@ export interface OrchestrateSelfDevOptions {
    * skip (`repair-skipped`). Default: the card state file (no card there = nothing written · fail-soft).
    */
   recordCardEvent?: (cardId: string, event: { event: 'repair-retry' | 'repair-skipped'; detail: string; runId?: string }) => void;
+  /**
+   * TA-POD-REVIEW-PROVIDER-ALLOW — a failure whose review provider chain was exhausted before any call puts the card in
+   * `failed/needs-owner` (`detail` starts with that token; the card store then records the doctor visit). Default: the card
+   * state file (no card there, or the card is not `launched` = nothing written · fail-soft).
+   */
+  markCardNeedsOwner?: (cardId: string, detail: string) => void;
   /** ⭐ 둘째 자도 «같이» 주입할 수 있어야 한다 — 첫째만 열어 두면 호출자가 「첫째가 죽은 상황」을
    *  재현할 수 없다(무인 리뷰 지적 2026-08-21). 생략하면 실제 `os.cpus().length` 를 쓴다. */
   cpuCount?: () => number;
@@ -1867,6 +1873,9 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
             try { debug.log('self-dev.slice', 'repair-skipped', { slice: failedGoal?.id ?? ev.taskId, failedTaskId: ev.taskId,
               failureClass: repairVerdict.failureClass, reason: 'deterministic-failure' }, { level: 'warn' }); } catch { /* observation is fail-soft */ }
           }
+          if (repairEligible && !repairVerdict.retry && repairVerdict.failureClass === 'no-review-provider' && taskCardId?.trim()) {
+            try { (opts.markCardNeedsOwner ?? markCardNeedsOwner)(taskCardId, `failed/needs-owner — no-review-provider · ${ev.errorMessage ?? ev.errorCode ?? ''}`.replace(/\s+/g, ' ').slice(0, 300)); } catch { /* the card line never blocks the run */ }
+          }
           // A child without a PR gets one supervised, narrower attempt. Keep the original
           // failure in the checkpoint; redirect only its actual dependents to the replacement.
           if (stopReason === null && taskCardId?.trim() && failedGoal && failedTask?.surface.kind === 'self-implement' && !repairedGoals.has(failedGoal)
@@ -1994,6 +2003,14 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       if (openCount() === 0 || (blockedByParent.size > 0 && dispatched.length === 0 && graph.listRunning().length === 0)) finishOrReject();
     }
   });
+}
+
+/** TA-POD-REVIEW-PROVIDER-ALLOW — default needs-owner writer: only a still-`launched` card with a run moves; the card store logs the visit. */
+function markCardNeedsOwner(cardId: string, detail: string): void {
+  const { taskAgentStatePath, updateTaskCard } = require('../task-agent/task-card-state.js') as typeof import('../task-agent/task-card-state.js');
+  updateTaskCard(taskAgentStatePath(), cardId, (card) => card?.status === 'launched' && card.runId
+    ? { ...card, status: 'failed', history: [...card.history, { at: new Date().toISOString(), event: 'failed', detail, runId: card.runId }] }
+    : undefined);
 }
 
 /** TA-RETRY-VISIBLE-NO-AUTO — the default card writer: one history line on the card, if this machine has it. */

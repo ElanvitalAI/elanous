@@ -22,6 +22,7 @@
 //   - State persists to localStorage so the user's preference survives
 //     reload.
 
+import { useIsBareWebChat } from '@/lib/use-bare-webchat';
 import { useEffect, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { SidebarNav } from './SidebarNav';
@@ -50,6 +51,7 @@ export function AppShell({
   const { compact, setWide } = useCompactMode();
   const pathname = usePathname();
   const mobileChat = compact && isPwaRoute(pathname, '/chat');
+  const bareWebChat = useIsBareWebChat();
   const wakeControl = useTopBarWakeLock();
   const polled = useShellActivity();
   const activity = activityOverride ?? polled;
@@ -91,7 +93,7 @@ export function AppShell({
           {/* md+ inline sidebar — expanded: w-56 with labels, collapsed:
               w-10 icon-only rail (U-6b) so navigation stays one tap away
               without re-opening the drawer. */}
-          {sidebarOpen ? (
+          {bareWebChat ? null : sidebarOpen ? (
             <aside className="hidden md:flex md:w-56 md:flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
               <SidebarNav onNavigate={closeSidebar} onClose={closeSidebar} />
             </aside>
@@ -103,7 +105,7 @@ export function AppShell({
 
           {/* mobile drawer overlay — collapsed = nothing (max content
               area on phone); expanded = full-width drawer with backdrop. */}
-          {sidebarOpen && !mobileChat && (
+          {sidebarOpen && !mobileChat && !bareWebChat && (
             <>
               <button
                 type="button"
@@ -121,8 +123,8 @@ export function AppShell({
 
           <main className="flex-1 overflow-auto min-w-0">{children}</main>
         </div>
-        <InstallBanner />
-        {compact && <MobileBottomTabs />}
+        {!bareWebChat && <InstallBanner />}
+        {compact && !bareWebChat && <MobileBottomTabs />}
       </div>
   );
 }

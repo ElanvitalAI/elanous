@@ -41,6 +41,12 @@ export interface InProcessCliOptions {
   readonly configRoot?: string;
   /** Spawn mode only: input delivered to the isolated CLI stdin. */
   readonly stdinText?: string;
+  /**
+   * Spawn mode only: a path opened read-only as the child's stdin. `stdinText` arrives on a socketpair, which
+   * readPipedStdin deliberately treats as not piped; a test that must exercise the real piped read (sshd hands
+   * the command a FIFO) passes a FIFO here.
+   */
+  readonly stdinFile?: string;
   /** Spawn mode only. */
   readonly timeoutMs?: number;
   /** Spawn mode only: let a process-boundary E2E observe and stop a long-running CLI. */
@@ -116,7 +122,7 @@ export async function simCli(args: readonly string[], options: InProcessCliOptio
     throw new Error(`CLI command not allowed: ${args.join(' ') || '(empty)'}`);
   }
   if (options.mode !== 'spawn') {
-    if (options.timeoutMs !== undefined || options.signal !== undefined || options.killSignal !== undefined || options.detached !== undefined || options.onStdout !== undefined || options.stdoutFile !== undefined || options.entrypoint !== undefined || options.injectTestFlag !== undefined || options.stdinText !== undefined) {
+    if (options.timeoutMs !== undefined || options.signal !== undefined || options.killSignal !== undefined || options.detached !== undefined || options.onStdout !== undefined || options.stdoutFile !== undefined || options.entrypoint !== undefined || options.injectTestFlag !== undefined || options.stdinText !== undefined || options.stdinFile !== undefined) {
       throw new Error('timeout, abort, output callbacks and entrypoint overrides require mode: spawn');
     }
     return runInProcessCli(args, options);
@@ -128,6 +134,7 @@ export async function simCli(args: readonly string[], options: InProcessCliOptio
   const cwd = options.cwd ?? REPO_ROOT;
   const env = isolatedEnvironment(stateRoot, options.env);
   if (options.stdoutFile !== undefined && options.onStdout !== undefined) throw new Error('stdoutFile and onStdout are mutually exclusive');
+  if (options.stdinFile !== undefined && options.stdinText !== undefined) throw new Error('stdinFile and stdinText are mutually exclusive');
   try {
     const entry = options.entrypoint ?? join(REPO_ROOT, 'bin/elanous.mjs');
   const normalizedArgs = roots.hasStateFlag ? normalizeTestArgs(args)
@@ -142,10 +149,12 @@ export async function simCli(args: readonly string[], options: InProcessCliOptio
         outputClosed = true;
         closeSync(outputFd);
       };
+      const inputFd = options.stdinFile === undefined ? undefined : openSync(options.stdinFile, 'r');
       const child = spawnElanous(cliArgs, {
-        bin: entry, stateDir: stateRoot, cwd, env, stdio: [options.stdinText === undefined ? 'ignore' : 'pipe', outputFd ?? 'pipe', 'pipe'],
+        bin: entry, stateDir: stateRoot, cwd, env, stdio: [inputFd ?? (options.stdinText === undefined ? 'ignore' : 'pipe'), outputFd ?? 'pipe', 'pipe'],
         detached: options.detached ?? process.platform !== 'win32',
       });
+      if (inputFd !== undefined) closeSync(inputFd);
       if (options.stdinText !== undefined) { child.stdin?.on('error', () => {}); child.stdin?.end(options.stdinText); }
       recordCliChildEvent('child-started', child.pid);
       const stdout: Buffer[] = [];

@@ -13,12 +13,12 @@ const sideOf = (): Command => {
 
 test('the verb table is every visible els command, as typed (hidden ones left out)', () => {
   expect(skillVerbs(sideOf()).map((verb) => verb.usage)).toEqual([
-    'els supervisor on', 'els supervisor off', 'els supervisor status', 'els serve', 'els mcp serve', 'els acp serve',
+    'els seat set <seat>', 'els supervisor on', 'els supervisor off', 'els supervisor status', 'els serve', 'els mcp serve', 'els acp serve',
     'els ls', 'els new [command...]', 'els read <pane>', 'els status <pane>', 'els grep <pattern>', 'els send <pane> <text>',
-    'els do <pane> <text>', 'els input <pane> <text>', 'els workspace list', 'els workspace create [command...]', 'els workspace close <workspace>',
+    'els do <pane> <text>', 'els snapshot <pane>', 'els record <pane>', 'els input <pane> <text>', 'els workspace list', 'els workspace create [command...]', 'els workspace close <workspace>',
     'els workspace move <workspace>', 'els tab list', 'els tab move <tab>', 'els attach <pane>', 'els pane list',
     'els pane read <pane>', 'els pane send-text <pane> <text>', 'els pane run <pane> <text>', 'els pane send-keys <pane> <keys...>',
-    'els pane close <pane>',
+    'els pane close <pane>', 'els import herdr',
   ]);
 });
 

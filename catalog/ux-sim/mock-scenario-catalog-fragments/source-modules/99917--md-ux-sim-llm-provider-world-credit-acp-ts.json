@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-LLM-PROVIDER-WORLD-CREDIT-ACP-TS",
+  "path": "src/ux-sim/llm-provider-world/credit-acp.ts",
+  "boundary": "Fake OpenRouter credit row (balance, spend cap, auto top-up, 402 insufficient_credits, day/month spend) and fake host-only claude-acp device (alive, sessions, session_limit, device_down), both observed as LlmSpendRowState; simulation boundary: no real key, token, network or host",
+  "deviceIds": [
+    "llm-sim-openrouter",
+    "llm-sim-claude-acp"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

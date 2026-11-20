@@ -47,6 +47,8 @@ export interface SimWorldRunOptions extends Omit<SimWorldPackRequest, 'world' | 
   readonly expectFile?: string;
   /** 'sandbox' (default) spawns one network-zero process per non-empty pack; 'inline' runs in this process. */
   readonly isolate?: 'sandbox' | 'inline';
+  /** With worldId 'all': run exactly these worlds (a replay restores the recorded list, not the current registry). */
+  readonly worlds?: readonly SimWorldPackId[];
   /** Test seam for the disk-failure axis. */
   readonly recorderFs?: SimWorldRecorderOptions['fs'];
   /** Per-world wall budget; defaults to SIM_WORLD_WALL_BUDGET_MS. */
@@ -225,16 +227,20 @@ const SIM_WORLD_WALL_BUDGET_MS = 180_000;
 
 /** Read a recorded run's summary.json and return the options that replay it (same world id, seed, engine, only, base table). */
 export function simWorldReplayOptions(stateRoot: string, replayOf: string):
-  Pick<SimWorldRunOptions, 'worldId' | 'seed' | 'engine' | 'only' | 'expectBaseFile'> {
+  Pick<SimWorldRunOptions, 'worldId' | 'seed' | 'engine' | 'only' | 'expectBaseFile' | 'worlds'> {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(replayOf)) throw new Error(`sim world replay run id is invalid: ${replayOf}`);
   const file = join(stateRoot, 'sim-world', replayOf, 'summary.json');
   if (!existsSync(file)) throw new Error(`sim world replay has no recorded summary: ${file}`);
   const recorded = JSON.parse(readFileSync(file, 'utf8')) as Partial<SimWorldSummary>;
   if (recorded.schema !== 'sim-world.summary/1' || !Number.isSafeInteger(recorded.seed) || !Array.isArray(recorded.worlds) || !recorded.engine)
     throw new Error(`sim world replay summary is malformed: ${file}`);
-  const worldId: SimWorldReservedId = recorded.worlds.length === SIM_WORLD_IDS.length ? 'all' : recorded.worlds[0]!;
+  // A one-world record replays as that world; a longer one replays as `all` over the RECORDED list — comparing its length with the
+  // current registry would restore only the first world once a world is added (JUD-B #114066).
+  const known = recorded.worlds.filter((world): world is SimWorldPackId => (SIM_WORLD_IDS as readonly string[]).includes(world));
+  if (recorded.worlds.length === 0 || known.length !== recorded.worlds.length) throw new Error(`sim world replay summary names a world this build does not register: ${file}`);
+  const worldId: SimWorldReservedId = known.length === 1 ? known[0]! : 'all';
   // A summary from before expectBase was recorded has none: replay then runs without a base table, as it did.
-  return { worldId, seed: recorded.seed!, engine: recorded.engine, only: recorded.only ?? null, expectBaseFile: recorded.expectBase?.path ?? null };
+  return { worldId, ...(worldId === 'all' ? { worlds: known } : {}), seed: recorded.seed!, engine: recorded.engine, only: recorded.only ?? null, expectBaseFile: recorded.expectBase?.path ?? null };
 }
 
 const fileSha256 = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -253,7 +259,7 @@ export async function runSimWorlds(options: SimWorldRunOptions & { readonly repl
   const runDir = join(options.stateRoot, 'sim-world', options.runId);
   if (existsSync(runDir)) throw new Error(`sim world run already exists: ${runDir}`);
   mkdirSync(runDir, { recursive: true });
-  const worlds: SimWorldPackId[] = options.worldId === 'all' ? [...SIM_WORLD_IDS] : [options.worldId];
+  const worlds: SimWorldPackId[] = options.worldId === 'all' ? [...(options.worlds ?? SIM_WORLD_IDS)] : [options.worldId];
   const packRoot = options.packRoot ?? SIM_WORLD_PACK_ROOT;
   const expectFile = options.expectFile ?? join(packRoot, 'sim-world-expect.json');
   const events: SimWorldKernelEvent[] = [];

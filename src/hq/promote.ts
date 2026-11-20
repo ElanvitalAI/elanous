@@ -26,7 +26,7 @@ port_detail=$(lsof -nP -t -iTCP:31416 -sTCP:LISTEN 2>&1); port_rc=$?
 if [ "$port_rc" -ne 1 ] || [ -n "$port_detail" ]; then echo "port=31416 occupied or unreadable: $port_detail (lsof=$port_rc)" >&2; exit 1; fi
 python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 31416)); s.close(); print("port=31416 available")'`;
 // The drill uses short SSH aliases; host-local hq.hostName may use either the short or full name.
-const hostNamesFor = (host: string): string[] => host === 'node-b' ? ['node-b', 'MacStudioB1']
+export const hostNamesFor = (host: string): string[] => host === 'node-b' ? ['node-b', 'MacStudioB1']
   : host === 'mshq' ? ['mshq', 'Joosungui-MacStudio']
   : host === 'mbp' ? ['mbp', 'MacBookProM5'] : [host];
 const checks: Array<[string, string]> = [

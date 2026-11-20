@@ -19,6 +19,7 @@
  */
 
 import { migrateBaseUrl } from './migrate-base-url';
+import { BARE_CAPABILITIES_META_NAME, BARE_WEBCHAT_FORWARDED_API_PATHS, parseBareCapabilities } from '../../../../src/relay/bare-surface';
 
 const STORAGE_KEYS = {
   baseUrl: 'elanous.nexus.baseUrl',
@@ -43,6 +44,55 @@ export function defaultBaseUrl(): string {
   if (typeof window === 'undefined') return '';
   const proto = window.location.protocol === 'https:' ? 'https:' : 'http:';
   return `${proto}//${window.location.host}`;
+}
+
+/**
+ * MK #109711 — relay bare webchat origin (`<handle>.elanous.app/app/chat/`).
+ * The relay tunnels only the chat REST/SSE pair there (no WS upgrade for
+ * `/v1/acp`), so chat must use SSE (`POST /v1/prompt/stream`) instead of ACP.
+ * Signal is SERVER-DELIVERED, not a hostname guess: Nexus
+ * `routeBareWebChatHostRequest` injects `<meta name="elanous-bare-webchat"
+ * content="1">` into the /app/chat HTML it serves on a pinned bare origin.
+ * Daemon-direct origins never carry the tag.
+ */
+export const BARE_WEBCHAT_META_NAME = 'elanous-bare-webchat';
+export function isBareWebChatOrigin(
+  doc: Pick<Document, 'querySelector'> | undefined =
+    typeof document === 'undefined' ? undefined : document,
+): boolean {
+  if (!doc || typeof doc.querySelector !== 'function') return false;
+  try {
+    return doc.querySelector(`meta[name="${BARE_WEBCHAT_META_NAME}"]`)?.getAttribute('content') === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * OP #113435 — what the bare surface forwards, SERVER-DELIVERED (the same
+ * channel as the bare meta). Not bare (no bare meta) => everything is
+ * forwarded (daemon-direct, unchanged). Bare => only the paths in the
+ * `elanous-bare-capabilities` meta (a bare meta WITHOUT it fails closed).
+ * Single source of the set: src/relay/bare-surface.ts. Gated centrally in
+ * DaemonClient and the debug forwarder — pollers carry no bare check.
+ */
+export function surfaceForwards(
+  path: string,
+  doc: Pick<Document, 'querySelector'> | undefined =
+    typeof document === 'undefined' ? undefined : document,
+): boolean {
+  if (!isBareWebChatOrigin(doc)) return true;
+  let content: string | null | undefined;
+  try {
+    content = doc?.querySelector(`meta[name="${BARE_CAPABILITIES_META_NAME}"]`)?.getAttribute('content');
+  } catch {
+    content = undefined;
+  }
+  const pathname = path.split('?')[0]!.split('#')[0]!;
+  // A bare host whose HTML carries the bare meta but no capabilities meta (an older Nexus) falls back to the shared
+  // default set: pollers stay gated and the chat pair keeps working — never a dead chat.
+  const forwarded: readonly string[] = content == null ? BARE_WEBCHAT_FORWARDED_API_PATHS : parseBareCapabilities(content);
+  return forwarded.includes(pathname);
 }
 
 function deriveWsUrl(baseUrl: string, path: string): string {

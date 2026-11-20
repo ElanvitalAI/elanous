@@ -5,6 +5,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { requestEls } from '../els/client.js';
+import { elsSocketPath } from '../els/server.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
 
 // 출처: a fresh `elanous` process boots, loads the journal and binds the socket in a few seconds on the gate hosts.
@@ -19,7 +20,9 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const tempDir = (prefix: string) => { const dir = mkdtempSync(join(tmpdir(), prefix)); dirs.push(dir); return dir; };
+// A Unix socket path is limited (~104 bytes): under a long TMPDIR the state dirs go to /tmp.
+const SOCKET_SAFE_TMP = tmpdir().length > 40 ? '/tmp' : tmpdir();
+const tempDir = (prefix: string) => { const dir = mkdtempSync(join(SOCKET_SAFE_TMP, prefix)); dirs.push(dir); return dir; };
 
 /** Start `side serve` for `state` (through simCli) and wait until it listens or exits with its refusal.
  *  `kill()` SIGKILLs its process group: the server dies without removing its socket. */
@@ -42,6 +45,23 @@ const side = (state: string, cwd: string, args: string[], env: Record<string, st
   mode: 'spawn', allowPaths: [['side']], stateRoot: state, cwd, env: { NODE_ENV: 'development', HERDR_ENV: '', ...env },
 });
 
+/** The person's credential on one server: the explicit `seat-set OP` act (JUD #39057 ⓒ1③) presented with the server's
+ *  owner token (the 0600 owner-token file next to the socket), and that token in the client's env afterwards — a
+ *  token-less `send` is denied at the door (#39143), so the sends in the scenario below present the real owner
+ *  credential of the server they talk to (a new server = a new token). */
+async function asOwner(state: string): Promise<Record<string, string>> {
+  const token = readFileSync(join(state, 'els', 'owner-token'), 'utf8').trim();
+  const before = process.env.ELANOUS_ELS_OWNER_TOKEN;
+  process.env.ELANOUS_ELS_OWNER_TOKEN = token;
+  try {
+    const seated = await requestEls(elsSocketPath(state), { op: 'seat-set', seat: 'OP' });
+    expect(seated.exitCode, seated.message).toBe(0);
+  } finally {
+    if (before === undefined) delete process.env.ELANOUS_ELS_OWNER_TOKEN; else process.env.ELANOUS_ELS_OWNER_TOKEN = before;
+  }
+  return { ELANOUS_ELS_OWNER_TOKEN: token };
+}
+
 test('no server: the CLI says so and writes nothing', async () => {
   const state = tempDir('els-none-');
   const listed = await side(state, state, ['ls']);
@@ -55,6 +75,8 @@ test('one owner: new/send/read go through the server, a second serve is refused,
   const cwd = tempDir('els-cwd-');
   const first = await serve(state);
   expect(first.output()).toContain('listening on');
+  // Before the refused second serve below: that start rewrites the owner-token file, so the live server's token is read now.
+  const firstOwner = await asOwner(state);
 
   // Concurrent serve while one answers: refused, the first keeps serving.
   const second = await serve(state);
@@ -64,7 +86,8 @@ test('one owner: new/send/read go through the server, a second serve is refused,
   const created = await side(state, cwd, ['new', '--ws', 'HQ', '--cwd', cwd, '--', 'sh']);
   expect(created.exitCode, created.stderr).toBe(0);
   const pane = (JSON.parse(created.stdout) as { pane: string }).pane;
-  expect((await side(state, cwd, ['send', pane, 'echo els-hi\n'])).exitCode).toBe(0);
+  const firstSend = await side(state, cwd, ['send', pane, 'echo els-hi\n'], firstOwner);
+  expect(firstSend.exitCode, firstSend.stderr).toBe(0);
   let screen = '';
   for (let attempt = 0; attempt < 40 && !screen.includes('els-hi'); attempt += 1) {
     screen = (await side(state, cwd, ['read', pane])).stdout;
@@ -82,9 +105,16 @@ test('one owner: new/send/read go through the server, a second serve is refused,
   const third = await serve(state);
   expect(third.output()).toContain('listening on');
   const listed = JSON.parse((await side(state, cwd, ['ls'])).stdout) as { panes: { pane: string; cwd: string; ptyId: string; state: string }[] };
-  expect(listed.panes.map((row) => [row.pane, row.cwd, row.ptyId, row.state])).toEqual([[pane, cwd, 'h:' + pane, 'idle']]);
+  // D1a #39136 holder 입양: 교체 서버가 자식을 입양한다 — pane·cwd 그대로, ptyId 비어 있지 않음, state는 실제 관측값(idle|working)만 허용.
+  expect(listed.panes.map((row) => [row.pane, row.cwd])).toEqual([[pane, cwd]]);
+  const adoptedPty: unknown = listed.panes[0]!.ptyId;
+  expect(typeof adoptedPty).toBe('string');   // runtime check — the cast above proves nothing, and null/undefined must fail
+  expect(adoptedPty).toMatch(/^.+$/);          // non-empty (toMatch refuses a non-string outright)
+  expect(['idle', 'working']).toContain(listed.panes[0]!.state);
   expect((await side(state, cwd, ['read', pane])).stdout).toContain('els-hi');
-  expect((await side(state, cwd, ['send', pane, 'x'])).exitCode).toBe(0);
+  const thirdOwner = await asOwner(state);   // the replacement server minted its own owner token
+  const thirdSend = await side(state, cwd, ['send', pane, 'x'], thirdOwner);
+  expect(thirdSend.exitCode, thirdSend.stderr).toBe(0);
 }, 120_000);
 
 test('a state dir too deep for a Unix socket is reported by serve and by the CLI', async () => {
@@ -112,14 +142,15 @@ test('stage 2: ls and read reach a registered host through its read window; a ho
   expect(b.output()).toContain('listening on');
   const a = await serve(hostA, [], { ELANOUS_ELS_HOST: 'hosta' });
   expect(a.output()).toContain('listening on');
-  const sideAt = (state: string, args: string[], host: string) => simCli(['side', ...args], {
-    mode: 'spawn', allowPaths: [['side']], stateRoot: state, cwd: state, env: { NODE_ENV: 'development', HERDR_ENV: '', ELANOUS_ELS_HOST: host },
+  const bOwner = await asOwner(hostB);   // host B's door (#39143): its mutating `send` presents B's owner token
+  const sideAt = (state: string, args: string[], host: string, env: Record<string, string> = {}) => simCli(['side', ...args], {
+    mode: 'spawn', allowPaths: [['side']], stateRoot: state, cwd: state, env: { NODE_ENV: 'development', HERDR_ENV: '', ELANOUS_ELS_HOST: host, ...env },
   });
   // A pane on host B, with something on its screen.
   const created = await sideAt(hostB, ['new', '--ws', 'GATE', '--cwd', hostB, '--', 'sh'], 'hostb');
   expect(created.exitCode, created.stderr).toBe(0);
   const bPane = JSON.parse(created.stdout) as { address: string; pane: string };
-  await sideAt(hostB, ['send', bPane.pane, 'echo from-host-b\n'], 'hostb');
+  await sideAt(hostB, ['send', bPane.pane, 'echo from-host-b\n'], 'hostb', bOwner);
   // Host A registers B (and a public URL, which is rejected).
   mkdirSync(join(hostA, 'els'), { recursive: true });
   writeFileSync(join(hostA, 'els', 'hosts.json'), JSON.stringify({ hosts: [
@@ -167,47 +198,60 @@ test('herdr words and defaults: workspace create with no options, pane run/send-
   const server = await serve(state);
   expect(server.output()).toContain('listening on');
   const shell = { SHELL: '/bin/sh' };
+  const owner = await asOwner(state);
+  const asPerson = (args: string[], env: Record<string, string> = {}) => side(state, folder, args, { ...owner, ...env });
+  // The person's yes, as the view sends it (attach-app: `confirmed: true`) with the owner token — the CLI has no such flag.
+  const closeConfirmed = async (pane: string) => {
+    const before = process.env.ELANOUS_ELS_OWNER_TOKEN;
+    process.env.ELANOUS_ELS_OWNER_TOKEN = owner.ELANOUS_ELS_OWNER_TOKEN;
+    try { return await requestEls(elsSocketPath(state), { op: 'close', pane, confirmed: true }); }
+    finally { if (before === undefined) delete process.env.ELANOUS_ELS_OWNER_TOKEN; else process.env.ELANOUS_ELS_OWNER_TOKEN = before; }
+  };
 
-  const created = await side(state, folder, ['workspace', 'create'], shell);
+  const created = await asPerson(['workspace', 'create'], shell);
   expect(created.exitCode, created.stderr).toBe(0);
   const pane = (JSON.parse(created.stdout) as { result: { pane: { pane_id: string }; root_pane: { cwd: string } } }).result;
   expect(pane.root_pane.cwd).toBe(folder);
   const paneId = pane.pane.pane_id;
-  const workspaces = JSON.parse((await side(state, folder, ['workspace', 'list'])).stdout) as { result: { workspaces: { name: string }[] } };
+  const workspaces = JSON.parse((await asPerson(['workspace', 'list'])).stdout) as { result: { workspaces: { name: string }[] } };
   expect(workspaces.result.workspaces.map((row) => row.name)).toEqual(['myproj']);
 
   const readUntil = async (needle: RegExp): Promise<string> => {
     let screen = '';
     for (let attempt = 0; attempt < 50 && !needle.test(screen); attempt += 1) {
-      screen = (await side(state, folder, ['pane', 'read', paneId])).stdout;
+      screen = (await asPerson(['pane', 'read', paneId])).stdout;
       if (!needle.test(screen)) await Bun.sleep(100);
     }
     return screen;
   };
-  expect((await side(state, folder, ['pane', 'run', paneId, 'echo run-ok'])).exitCode).toBe(0);
+  expect((await asPerson(['pane', 'run', paneId, 'echo run-ok'])).exitCode).toBe(0);
   expect(await readUntil(/^run-ok$/m)).toMatch(/^run-ok$/m);
-  expect((await side(state, folder, ['send', paneId, 'echo enter-ok'])).exitCode).toBe(0);   // Enter by default
+  expect((await asPerson(['send', paneId, 'echo enter-ok'])).exitCode).toBe(0);   // Enter by default
   expect(await readUntil(/^enter-ok$/m)).toMatch(/^enter-ok$/m);
-  expect((await side(state, folder, ['pane', 'send-text', paneId, 'echo held'])).exitCode).toBe(0);   // no Enter
+  expect((await asPerson(['pane', 'send-text', paneId, 'echo held'])).exitCode).toBe(0);   // no Enter
   await Bun.sleep(300);
-  expect((await side(state, folder, ['pane', 'read', paneId])).stdout).not.toMatch(/^held$/m);
-  expect((await side(state, folder, ['pane', 'send-keys', paneId, 'enter'])).exitCode).toBe(0);
+  expect((await asPerson(['pane', 'read', paneId])).stdout).not.toMatch(/^held$/m);
+  expect((await asPerson(['pane', 'send-keys', paneId, 'enter'])).exitCode).toBe(0);
   expect(await readUntil(/^held$/m)).toMatch(/^held$/m);
-  const badKey = await side(state, folder, ['pane', 'send-keys', paneId, 'ctrl+c', 'bogus']);
+  const badKey = await asPerson(['pane', 'send-keys', paneId, 'ctrl+c', 'bogus']);
   expect(badKey.exitCode).toBe(2);
+  expect(badKey.stderr).toContain('unknown key ctrl+c'); // #90792 P0 ② — ctrl+c is refused before any byte exists
   expect(badKey.stderr).toContain('nothing was sent');
 
-  const misplaced = await side(state, folder, ['new', '--', 'sh', '--cwd', folder]);
+  const misplaced = await asPerson(['new', '--', 'sh', '--cwd', folder]);
   expect(misplaced.exitCode).toBe(2);
   expect(misplaced.stderr).toContain('must come before --');
-  const raw = await side(state, folder, ['new', '--ws', 'R', '--cwd', folder, '--raw', '--', 'sh', '--cwd', folder]);   // a command that really takes --cwd runs
+  const raw = await asPerson(['new', '--ws', 'R', '--cwd', folder, '--raw', '--', 'sh', '--cwd', folder]);   // a command that really takes --cwd runs
   expect(raw.exitCode, raw.stderr).toBe(0);
-  expect((await side(state, folder, ['pane', 'close', (JSON.parse(raw.stdout) as { pane: string }).pane])).exitCode).toBe(0);
+  const rawPane = (JSON.parse(raw.stdout) as { pane: string }).pane;
+  expect((await closeConfirmed(rawPane)).exitCode).toBe(0);
 
-  const listed = JSON.parse((await side(state, folder, ['pane', 'list'])).stdout) as { result: { panes: { pane_id: string; cwd: string }[] } };
+  const listed = JSON.parse((await asPerson(['pane', 'list'])).stdout) as { result: { panes: { pane_id: string; cwd: string }[] } };
   expect(listed.result.panes.map((row) => [row.pane_id, row.cwd])).toEqual([[paneId, folder]]);
-  expect((await side(state, folder, ['pane', 'close', paneId])).exitCode).toBe(0);
-  expect((JSON.parse((await side(state, folder, ['pane', 'list'])).stdout) as { result: { panes: unknown[] } }).result.panes).toEqual([]);
+  const refused = await asPerson(['pane', 'close', paneId]);   // the CLI carries no human confirmation: the door refuses (#39143)
+  expect([refused.exitCode, refused.stderr]).toEqual([1, expect.stringContaining('close needs confirm:true')]);
+  expect((await closeConfirmed(paneId)).exitCode).toBe(0);
+  expect((JSON.parse((await asPerson(['pane', 'list'])).stdout) as { result: { panes: unknown[] } }).result.panes).toEqual([]);
 }, 120_000);
 
 test('bare `els` on an empty isolated state dir starts the server by itself (no launchd), shows the spaces, and a second run reuses it', async () => {
@@ -242,21 +286,24 @@ test('`els workspace move` / `els tab move` change the order every list shows, a
   const cwd = tempDir('els-order-cwd-');
   const first = await serve(state);
   expect(first.output()).toContain('listening on');
-  for (const ws of ['alpha', 'beta', 'gamma']) expect((await side(state, cwd, ['new', '--ws', ws, '--cwd', cwd, '--', 'sh'])).exitCode).toBe(0);
-  const names = async () => (JSON.parse((await side(state, cwd, ['workspace', 'list'])).stdout) as { result: { workspaces: { name: string }[] } }).result.workspaces.map((ws) => ws.name);
+  let owner = await asOwner(state);
+  const asPerson = (args: string[]) => side(state, cwd, args, owner);
+  for (const ws of ['alpha', 'beta', 'gamma']) expect((await asPerson(['new', '--ws', ws, '--cwd', cwd, '--', 'sh'])).exitCode).toBe(0);
+  const names = async () => (JSON.parse((await asPerson(['workspace', 'list'])).stdout) as { result: { workspaces: { name: string }[] } }).result.workspaces.map((ws) => ws.name);
   expect(await names()).toEqual(['alpha', 'beta', 'gamma']);
-  expect((await side(state, cwd, ['workspace', 'move', 'gamma', '--before', 'alpha'])).exitCode).toBe(0);
-  expect((await side(state, cwd, ['workspace', 'move', 'beta'])).exitCode).toBe(0);
+  expect((await asPerson(['workspace', 'move', 'gamma', '--before', 'alpha'])).exitCode).toBe(0);
+  expect((await asPerson(['workspace', 'move', 'beta'])).exitCode).toBe(0);
   expect(await names()).toEqual(['gamma', 'alpha', 'beta']);
-  const bad = await side(state, cwd, ['workspace', 'move', 'nope']);
+  const bad = await asPerson(['workspace', 'move', 'nope']);
   expect([bad.exitCode, bad.stderr]).toEqual([1, expect.stringContaining('unknown workspace')]);
-  const tabs = (JSON.parse((await side(state, cwd, ['tab', 'list'])).stdout) as { result: { tabs: { tab_id: string }[] } }).result.tabs;
-  const crossed = await side(state, cwd, ['tab', 'move', tabs[0]!.tab_id, '--before', tabs[1]!.tab_id]);
+  const tabs = (JSON.parse((await asPerson(['tab', 'list'])).stdout) as { result: { tabs: { tab_id: string }[] } }).result.tabs;
+  const crossed = await asPerson(['tab', 'move', tabs[0]!.tab_id, '--before', tabs[1]!.tab_id]);
   expect([crossed.exitCode, crossed.stderr]).toEqual([2, expect.stringContaining('its own workspace')]);
   first.kill();
   await first.exited;
   const second = await serve(state);
   expect(second.output()).toContain('listening on');
+  owner = await asOwner(state);   // the restarted server minted its own owner token
   expect(await names()).toEqual(['gamma', 'alpha', 'beta']);
 }, 120_000);
 
@@ -291,6 +338,7 @@ Options:
   -h, --help                     display help for command
 
 Commands:
+  seat                           Seat registration: \`els seat set OP\`
   supervisor                     The launchd user agent that keeps the els
                                  server running: on · off · status
   serve [options]                Run the els server: the one owner of the
@@ -321,6 +369,12 @@ Commands:
                                  queued while the pane's turn is running. A
                                  local pane walks the control door first
                                  (default deny).
+  snapshot <pane>                Save a pane's screen as an svg artifact (classic
+                                 capture engine): prints {path}
+  record <pane>                  Record a pane's PTY output: first call starts
+                                 (prints {recordingId}), the next call for the
+                                 pane (even after it was closed) stops and saves
+                                 the asciicast: prints {path}
   input [options] <pane> <text>  Submit a direct operator line through the owner
                                  control door
   workspace                      Workspaces (herdr words): list · create · close
@@ -331,6 +385,7 @@ Commands:
                                  running)
   pane                           Panes (herdr words): list · read · send-text ·
                                  send-keys · run · close
+  import                         Bring another layout into els
 
 Agents: run \`els --skill\` for the usage guide (verbs, rules, what not to do).
 `;
@@ -467,6 +522,7 @@ Commands:
   fleet                                        멀티 elanous 인스턴스 통합 뷰(READ-ONLY 연합) — 등록 인스턴스·보유 스토어 매트릭스. \`logs instances\` 일반화(kubectl get nodes 등가). 연합 조회는 \`session list --all-instances\` 등.
   ops                                          운영 관측(READ-ONLY) — 미션·태스크·계약 루프·오케스트레이터 현재 상태·이상·전이. --json 프로그래매틱.
   catalog                                      서명된 LLM 모델 카탈로그 관리
+  hosts                                        원격 호스트 설치본(installedSha) 원장
   app                                          Validate and build local app sources
   outputs                                      산출물 원장 조회 (읽기 전용)
   publish                                      external-markdown 게시 라이프사이클 — 만료 게시물 GC(S3 콜드 백업·삭제 아님)
@@ -541,7 +597,7 @@ test('els send submits a long bracketed paste through a real owned PTY and obser
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline && !(await side(state, state, ['read', pane])).stdout.includes('READY')) await Bun.sleep(50);
   const text = `${'한글'.repeat(4000)}\nsecond line`;
-  const sent = await side(state, state, ['send', pane, text]);
+  const sent = await side(state, state, ['send', pane, text], await asOwner(state));
   expect(sent.exitCode, sent.stderr).toBe(0);
   expect(sent.stdout).toContain('turn started');
   expect(readFileSync(captured, 'utf8')).toBe(`\x1b[200~${text}\x1b[201~\r`);

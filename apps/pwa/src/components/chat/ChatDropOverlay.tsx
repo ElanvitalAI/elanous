@@ -1,6 +1,7 @@
 import { MAX_CHAT_FILES } from '@/lib/chat-paste-drop';
+import { LOCAL_NOTE_LIMIT_NOTICE } from '@/lib/local-note-attach';
 
-export function ChatDropOverlay() {
+export function ChatDropOverlay({ local = false }: { local?: boolean } = {}) {
   return (
     <div
       role="status"
@@ -10,7 +11,7 @@ export function ChatDropOverlay() {
     >
       <div className="mx-4 rounded-2xl border-2 border-dashed border-primary/60 bg-card/90 px-8 py-6 text-center shadow-lg">
         <p className="text-lg font-semibold text-foreground">여기에 놓으면 첨부</p>
-        <p className="mt-2 text-sm text-muted-foreground">파일 {MAX_CHAT_FILES}개까지 · 파일당 최대 10MiB</p>
+        <p className="mt-2 text-sm text-muted-foreground">{local ? LOCAL_NOTE_LIMIT_NOTICE : `파일 ${MAX_CHAT_FILES}개까지 · 파일당 최대 10MiB`}</p>
       </div>
     </div>
   );

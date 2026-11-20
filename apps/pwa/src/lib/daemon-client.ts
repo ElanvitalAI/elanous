@@ -14,7 +14,7 @@
  */
 
 import { reportAuthRequired } from './auth-required';
-import { buildAcpWsUrl, buildVoiceWsUrl, type DaemonConfig } from './daemon-config';
+import { buildAcpWsUrl, buildVoiceWsUrl, surfaceForwards, type DaemonConfig } from './daemon-config';
 import { debugLog } from './debug';
 import type { AttachmentMeta } from './upload-attachment';
 import {
@@ -397,6 +397,17 @@ export type CodexLoginStatus =
   | { state: 'ok'; mode: 'browser' | 'device' }
   | { state: 'error'; mode: 'browser' | 'device'; error: string };
 
+/** The serving surface (bare webchat host) does not forward this path — no request was made.
+ * Deliberately shaped like the failure it replaces (the relay's plain 404 «Not Found», no `.status`): callers that branch
+ * on error text or status (chat-persona's includes('404'), chat-fork's status === 404) and the transcript text of
+ * user-triggered commands (/rewind, /harness) stay exactly as before. Do not add a status or a path to the message. */
+export class SurfaceUnavailableError extends Error {
+  constructor(public readonly path: string) {
+    super('Not Found');
+    this.name = 'SurfaceUnavailableError';
+  }
+}
+
 export class DaemonClient {
   private readonly acpConnections = new Map<string, AcpConnectionImpl>();
 
@@ -426,6 +437,8 @@ export class DaemonClient {
    *  helper 밖에 없어서 그 목록이 통째로 버려졌고 위젯이 죽은 껍데기가 됐다.
    *  ⇒ URL 조립과 인증은 여전히 «이 한 집»에 있고, 머리를 읽어야 하는 쪽만 이 문으로 온다. */
   async fetchResponse(path: string, init?: RequestInit): Promise<Response> {
+    // OP #113435 — the one central gate: a path the surface does not forward never leaves the browser.
+    if (!surfaceForwards(path)) throw new SurfaceUnavailableError(path);
     const res = await fetch(this.url(path), {
       ...init,
       headers: { ...this.authHeaders(), ...(init?.headers ?? {}) },

@@ -1,7 +1,7 @@
-import { registerArtifactRuntimes } from '../tool-runtime/artifact-runtimes.js';
-import { registerPaneRuntimes } from '../tool-runtime/pane-runtimes.js';
-import { registerPaneWatchCompareRuntimes } from '../tool-runtime/pane-watch-compare-runtimes.js';
-import { registerRecordingRuntimes } from '../tool-runtime/recording-runtimes.js';
+import { registerArtifactRuntimes } from './artifact-runtimes.js';
+import { registerPaneRuntimes } from './pane-runtimes.js';
+import { registerPaneWatchCompareRuntimes } from './pane-watch-compare-runtimes.js';
+import { registerRecordingRuntimes } from './recording-runtimes.js';
 import type { ArtifactStore } from '../artifact/store.js';
 import type { PaneVisualStateStore } from '../panes/visual-state.js';
 import type { WidgetHost } from '../widgets/host.js';

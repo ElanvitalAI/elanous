@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { HARNESS_CORE_KINDS, hasNodeKind } from '../graph-kinds/registry.js';
 import { parseOverlayCondition } from './graph-overlay-condition.js';
+import { parseGraphMemoryDeclaration, type GraphMemoryDeclaration } from '../graph-runner/graph-memory.js';
 
 /** ⭐ RFC-graph-templates-as-yaml §5 «0단계» — YAML 저작본을 읽어 실행·해시·원장용 정규형으로.
  *
@@ -88,6 +89,7 @@ export interface GraphNodeSpec {
   readonly contract?: GraphNodeContract;
   /** Declarative human choice keys mapped to graph outcome exits. */
   readonly hitl?: { readonly options: readonly GraphHitlOption[] };
+  readonly memory?: GraphMemoryDeclaration;
   /** Optional node-scoped payload, used by persisted run-local graph additions. */
   readonly input?: unknown;
   /** Structured event kinds this node is allowed to publish. */
@@ -343,6 +345,22 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     }
     const recipe = n.recipe;
     if (typeof recipe !== 'string') { errors.push({ path: `${at}/recipe`, message: 'recipe 가 없다 — 이 노드가 «무엇으로» 도는지 모른다' }); continue; }
+    let memory: GraphMemoryDeclaration | undefined;
+    if (kind === 'memory' || n.memory !== undefined) {
+      if ((kind !== 'memory' && kind !== 'prompt') || (kind === 'memory' && recipe !== 'none'))
+        errors.push({ path: `${at}/memory`, message: 'memory 선언은 memory 또는 prompt 노드 전용이다' });
+      try { memory = parseGraphMemoryDeclaration(n.memory); }
+      catch (error) { errors.push({ path: `${at}/memory`, message: String(error) }); }
+      if (kind === 'prompt' && memory?.action !== 'read')
+        errors.push({ path: `${at}/memory/action`, message: 'prompt 노드는 memory.read 만 사용할 수 있다' });
+    }
+    const inputMemoryScope = n.input && typeof n.input === 'object' && !Array.isArray(n.input)
+      ? (n.input as Record<string, unknown>).memoryScope : undefined;
+    if (inputMemoryScope !== undefined && (!['instance', 'template', 'global'].includes(String(inputMemoryScope)) ||
+      kind !== 'prompt' || !memory?.read))
+      errors.push({ path: `${at}/input/memoryScope`, message: 'prompt memoryScope 는 memory.read 선언과 함께 instance|template|global 이어야 한다' });
+    if (kind === 'prompt' && memory && inputMemoryScope === undefined)
+      errors.push({ path: `${at}/input/memoryScope`, message: 'memory.read prompt 는 memoryScope 상한이 필요하다' });
     if (n.requires !== undefined && (typeof n.requires !== 'string' || !/^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*@[1-9]\d*$/.test(n.requires)))
       errors.push({ path: `${at}/requires`, message: 'requires 는 <namespace>.<contract>@<positive version> 이어야 한다' });
     const maxVisits = n.max_visits;
@@ -567,6 +585,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(typeof n.fan_out === 'string' ? { fanOut: n.fan_out } : {}),
       ...(contract ? { contract } : {}),
       ...(hitl ? { hitl } : {}),
+      ...(memory ? { memory } : {}),
       ...(Object.hasOwn(n, 'input') ? { input: n.input } : {}),
       ...(emits === undefined ? {} : { emits }),
       ...(subscribes === undefined ? {} : { subscribes }),

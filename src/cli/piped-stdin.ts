@@ -19,7 +19,7 @@ import { debug } from '../debug/log.js';
 /** 파이프가 아무것도 안 쓰고 침묵할 때 끊는 상한(ms). ⛔ 총 읽기 시간이 아니라 **유휴** 시간이다.
  *  ⛔ export 하지 않는다 — 밖에 소비자가 없다(죽은 export 는 계약처럼 읽힌다). 호출부가 조절해야 할
  *  근거가 생기면 그때 `idleTimeoutMs` 인자로 주거나 config-first 규율로 뺀다. */
-const PIPED_STDIN_IDLE_TIMEOUT_MS = 2000;
+export const PIPED_STDIN_IDLE_TIMEOUT_MS = 2000;
 
 /** 진짜 파이프인가. ⛔ `!isTTY` 로 판정하지 마라 — 소켓·리다이렉션이 전부 여기에 걸린다. */
 export function stdinLooksPiped(deps: { isTTY?: boolean; fstat?: (fd: number) => { isFIFO(): boolean } } = {}): boolean {

@@ -22,7 +22,7 @@ test('unattended release parent wires the production macrophage, logs its decisi
     "mkdirSync(join(root, 'release', '0.2.3'), { recursive: true });",
     "writeFileSync(join(root, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'sim' }));",
     "let runId = '';",
-    "await runUnattendedRelease({ version: '0.2.4' }, { ledgerRoot: root, config: { gatePodPool: 'sim-pool' },",
+    "await runUnattendedRelease({ version: '0.2.4' }, { ledgerRoot: root, config: { gatePodPool: 'sim-pool' }, assertCliCurrent: () => undefined,",
     "checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),",
     "graph: async (_path, options) => {",
     "const runtime = options as typeof options & { runId: string; eventBus: import('./src/graph-runner/graph-events.js').GraphEventBus }; runId = runtime.runId;",

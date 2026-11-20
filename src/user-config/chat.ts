@@ -105,7 +105,6 @@ export interface ChatConfig {
   toolOutput: ChatToolOutputConfig;
   autoCompact: ChatAutoCompactConfig;
   compact: ChatCompactConfig;
-  autoCopyQaToClipboard: boolean;
   systemPrompt: ChatSystemPromptConfig;
   rendering: ChatRenderingConfig;
   /** Wave 8 (2026-05-04) — tool deny list. Names matching here are
@@ -148,7 +147,6 @@ export const CHAT_DEFAULTS: ChatConfig = {
     archiveRetentionDays: 30,
     archiveRetentionMb: 100,
   },
-  autoCopyQaToClipboard: false,
   systemPrompt: {
     overridePath: undefined,
     taskVariant: 'default',
@@ -271,10 +269,6 @@ export function parseChatConfig(raw: unknown): ChatConfig {
           10_000,
         ),
       },
-      autoCopyQaToClipboard:
-        chat.autoCopyQaToClipboard === true
-          ? true
-          : CHAT_DEFAULTS.autoCopyQaToClipboard,
       // Wave 8 — toolDeny: accept readonly string[] from raw config,
       // filter to non-empty strings, dedupe. No clamp on length —
       // the catalog has ~150 tools, blocking ~10 is reasonable.

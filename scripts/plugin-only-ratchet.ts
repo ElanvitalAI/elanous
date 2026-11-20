@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import * as ts from 'typescript';
@@ -21,16 +21,39 @@ export interface PluginOnlyBaseline {
   coreFeatureIdentifiers: string[];
 }
 
+/**
+ * The ratchet covers tracked files. A symlink that git ignores and does not track (a test or build
+ * artifact such as src/harness/log/latest) is not repository content and is skipped; a tracked or
+ * merely untracked-but-not-ignored symlink still counts as a symlink and is refused.
+ */
+function isIgnoredUntrackedPath(root: string, path: string): boolean {
+  const git = (args: string[]) => spawnSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const top = git(['rev-parse', '--show-toplevel']);
+  if (top.status !== 0 || realpathSync(top.stdout.trim()) !== realpathSync(root)) return false;
+  if (git(['ls-files', '--error-unmatch', '--', path]).status === 0) return false;
+  return git(['check-ignore', '-q', '--', path]).status === 0;
+}
+
+function isSymlinkPath(absolute: string): boolean {
+  try { return lstatSync(absolute).isSymbolicLink(); } catch { return false; }
+}
+
 function walkFiles(root: string, dir: string): string[] {
   const absolute = join(root, dir);
-  if (!existsSync(absolute)) return [];
-  if (lstatSync(absolute).isSymbolicLink()) throw new Error(`plugin-only inventory does not allow symlinks: ${dir}`);
+  if (!existsSync(absolute) && !isSymlinkPath(absolute)) return [];
+  if (lstatSync(absolute).isSymbolicLink()) {
+    if (isIgnoredUntrackedPath(root, dir)) return [];
+    throw new Error(`plugin-only inventory does not allow symlinks: ${dir}`);
+  }
   const files: string[] = [];
   for (const entry of readdirSync(absolute, { withFileTypes: true })) {
     const child = join(dir, entry.name);
     if (entry.isDirectory()) files.push(...walkFiles(root, child));
     else if (entry.isFile()) files.push(child.split(sep).join('/'));
-    else if (entry.isSymbolicLink()) throw new Error(`plugin-only inventory does not allow symlinks: ${child}`);
+    else if (entry.isSymbolicLink()) {
+      if (isIgnoredUntrackedPath(root, child.split(sep).join('/'))) continue;
+      throw new Error(`plugin-only inventory does not allow symlinks: ${child}`);
+    }
   }
   return files.sort();
 }

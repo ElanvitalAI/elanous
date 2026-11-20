@@ -13,7 +13,9 @@ import {
 } from './holder.js';
 
 const cleanups: (() => Promise<void> | void)[] = [];
+const ownerTokenBefore = process.env.ELANOUS_ELS_OWNER_TOKEN;   // saved once; the afterEach below restores process.env
 afterEach(async () => {
+  if (ownerTokenBefore === undefined) delete process.env.ELANOUS_ELS_OWNER_TOKEN; else process.env.ELANOUS_ELS_OWNER_TOKEN = ownerTokenBefore;
   const pending = [...cleanups];
   cleanups.length = 0;
   for (const cleanup of pending.reverse()) await cleanup();
@@ -215,4 +217,28 @@ test('holder: a detached holder process answers on its socket independently of i
     await sleep(LIT_POLL_MS);
   }
   expect(existsSync(socketPath)).toBe(false);
+}, LIT_BOOT_MS + LIT_WAIT_MS);
+
+// ⑤ ELS-BUILD-BADGE: the pane's own els identity (ELANOUS_ELS_WS/PANE/SOCKET/PANE_TOKEN) must reach the child through the real
+// holder process — startPty rebuilds the child env from the login-shell capture, so a holder that does not hand it over
+// leaves every pane without the credential its build report (and child tabs, self-context) needs. The owner token never goes down.
+test('holder: a detached holder hands the pane its els identity and token, never the server owner token', async () => {
+  const root = mkdtempSync(join(tmpdir().length > 40 ? '/tmp' : tmpdir(), 'els-holderenv-'));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  process.env.ELANOUS_ELS_OWNER_TOKEN = 'lit-owner-secret';
+  spawnHolderDetached({ stateRoot: root, paneId: 'lit-env-5', cwd: root, title: 'lit-env-5', exitGraceMs: LIT_GRACE_MS,
+    env: { ELANOUS_ELS_WS: 'lit-ws', ELANOUS_ELS_PANE: 'lit-env-5', ELANOUS_ELS_SOCKET: '/lit/els.sock', ELANOUS_ELS_PANE_TOKEN: 'lit-pane-token' },
+    command: ['/bin/sh', '-c', 'printf "lit-env:%s:%s:%s:%s:%s\\r\\n" "$ELANOUS_ELS_WS" "$ELANOUS_ELS_PANE" "$ELANOUS_ELS_SOCKET" "$ELANOUS_ELS_PANE_TOKEN" "${ELANOUS_ELS_OWNER_TOKEN:-none}"; exec cat'] });
+  const socketPath = holderSocketPath(root, 'lit-env-5');
+  cleanups.push(async () => {
+    const socket = await connectOnce(socketPath);
+    if (socket) { socket.write(`${JSON.stringify({ op: 'kill' })}\n`); socket.destroy(); }
+    const stop = Date.now() + LIT_WAIT_MS;
+    while (existsSync(holderMetaPath(root, 'lit-env-5')) && Date.now() < stop) await sleep(LIT_POLL_MS);
+  });
+  const client = holderClient(await connectHolder(socketPath, LIT_BOOT_MS));
+  client.send({ op: 'ping' });
+  await client.next((message) => message.type === 'pong', LIT_WAIT_MS);
+  const shown = await untilSnapshot(client, 'lit-env:', LIT_WAIT_MS);
+  expect(shown.screen).toContain('lit-env:lit-ws:lit-env-5:/lit/els.sock:lit-pane-token:none');
 }, LIT_BOOT_MS + LIT_WAIT_MS);

@@ -5,9 +5,12 @@ import { cutChecklistGate, type ChecklistGate } from '../../src/release-loop/che
 
 /** Only the verdict fields are read — so a `release run` deps checklist (`Pick<…>`) fits as well. */
 export type ReadinessChecklist = Pick<ChecklistGate, 'ok' | 'red' | 'undecided' | 'blocked'>;
-import { getSchedule, formatKst } from '../../src/release-loop/release-schedule.js';
+import { RELEASE_CUT_DUE_WINDOW_MS, getSchedule, formatKst } from '../../src/release-loop/release-schedule.js';
 import { debug } from '../../src/debug/log.js';
 import { baseVersion, isReleaseVersion, prereleaseKind } from './release-version.js';
+import { parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { quickpassHint, countdownReceiptPath, defaultCountdownProbes, evaluateCountdown, poolHosts, writeCountdownReceipt,
+  type CountdownConditions, type CountdownProbes } from './release-countdown.js';
 
 export type ReleaseReadiness =
   | { ready: false; reason: 'already-published'; details: string }
@@ -75,7 +78,7 @@ export function readGateImageReadinessSignal(path: string, expected: { runId: st
 
 export interface ReadinessGraphContext {
   runId?: unknown;
-  input?: { version?: unknown };
+  input?: { version?: unknown; gatePodPool?: unknown; branchCutBaseCommit?: unknown };
   outputs?: Record<string, unknown>;
 }
 
@@ -85,7 +88,13 @@ export interface ImageT60HoldDeps {
   now?: () => Date;
   sleep?: (milliseconds: number) => Promise<void>;
   pollMilliseconds?: number;
+  /** Go/No-Go probes (RELEASE-COUNTDOWN-IN-GRAPH). The graph entry passes all of them; an absent probe is a skipped condition. */
+  probes?: Partial<CountdownProbes>;
 }
+
+// Source: QUICKPASS sheet (OP 대표 #105271) — after 15 minutes blocked an operator may choose the manual path.
+// Notice cadence only: the hold itself stays unbounded and fail-closed (recipes.yaml readiness-countdown timeout_ms 0).
+export const COUNTDOWN_LONG_HOLD_NOTICE_MS = 15 * 60_000;
 
 function writeCountdownState(path: string, state: Record<string, unknown>): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -113,10 +122,9 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
   const versionParts = (isReleaseVersion(version) ? baseVersion(version) : version).split('.').map(Number);
   const before037 = versionParts[0]! === 0 && (versionParts[1]! < 3 || (versionParts[1]! === 3 && versionParts[2]! < 7));
   // A prerelease (rehearsal) run has no schedule row of its own: its cut is treated as already reached,
-  // while the image T-60 signal contract below still applies. Stable versions keep requiring a schedule.
+  // while the image T-60 signal contract below still applies. A stable version without a row holds SCHEDULE_MISSING (bounded) instead of failing.
   const prerelease = isReleaseVersion(version) && prereleaseKind(version) !== null;
   if (!schedule && before037) return { version, runId, cutCommit, eta: (deps.now ?? (() => new Date()))().toISOString(), signalPath: '' };
-  if (!schedule && !prerelease) throw new Error(`readiness countdown requires a release schedule: ${version}`);
   if (schedule && !Number.isFinite(Date.parse(schedule.cutAt))) throw new Error(`readiness countdown has invalid cutAt: ${schedule.cutAt}`);
   const now = deps.now ?? (() => new Date());
   const sleep = deps.sleep ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
@@ -150,27 +158,70 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
     && typeof attestation.digest === 'string' && /^sha256:[0-9a-f]{64}$/i.test(attestation.digest)
     && Array.isArray(attestation.eligiblePools) && attestation.eligiblePools.length > 0
     && attestation.eligiblePools.every((pool) => typeof pool === 'string' && pool.trim());
+  const poolSpec = typeof context.input?.gatePodPool === 'string' ? context.input.gatePodPool : undefined;
+  const poolContexts = poolSpec ? parsePodPool(poolSpec).map((member) => member.context) : [];
+  const hosts = poolHosts(poolSpec);
+  const cutBase = versionOutput && typeof versionOutput === 'object' && !Array.isArray(versionOutput)
+    ? (versionOutput as { base?: unknown }).base : undefined;
+  const expectedBase = context.input?.branchCutBaseCommit;
+  const probes = deps.probes ?? {};
+  const receiptPath = countdownReceiptPath(root, version);
+  let holdSince: number | null = null;
+  let longHold: { since: string; codes: string[]; hint: string; notifiedAt: string } | null = null;
+  let attempt = 0;
   let lastReason = '';
   let lastCutAt: string | null | undefined;
   while (true) {
+    attempt++;
     const currentSchedule = getSchedule(version, root);
-    if (currentSchedule ? !Number.isFinite(Date.parse(currentSchedule.cutAt)) : !prerelease) throw new Error(`readiness countdown schedule unavailable or invalid: ${version}`);
+    if (currentSchedule && !Number.isFinite(Date.parse(currentSchedule.cutAt))) throw new Error(`readiness countdown schedule unavailable or invalid: ${version}`);
     const cutAt = currentSchedule?.cutAt ?? null;
     const instant = now();
     const observedAt = instant.toISOString();
     const fromCutAt = lastCutAt !== undefined && lastCutAt !== cutAt ? lastCutAt : undefined;
     const observed = readSignal(signalPath, { runId, cutCommit });
-    const image: GateImageReadiness = observed.status === 'unknown' ? observed
-      : prebuildSucceeded && String(attestation!.digest).toLowerCase() === observed.signal.imageDigest.toLowerCase()
-        && [...attestation!.eligiblePools as string[]].sort().join('\n') === [...observed.signal.eligiblePools].sort().join('\n')
-        ? observed : { status: 'unknown', reason: 'prebuild-unconfirmed' };
+    const image: GateImageReadiness | { status: 'unknown'; reason: 'pool-mismatch' } = observed.status === 'unknown' ? observed
+      : !(prebuildSucceeded && String(attestation!.digest).toLowerCase() === observed.signal.imageDigest.toLowerCase()
+        && [...attestation!.eligiblePools as string[]].sort().join('\n') === [...observed.signal.eligiblePools].sort().join('\n'))
+        ? { status: 'unknown', reason: 'prebuild-unconfirmed' }
+        // T-30: the image must be loaded on the run's own pool, not merely somewhere.
+        : poolContexts.length && !poolContexts.some((pool) => observed.signal.eligiblePools.includes(pool))
+          ? { status: 'unknown', reason: 'pool-mismatch' } : observed;
+    const conditions: CountdownConditions = {
+      schedule: { present: currentSchedule !== null, exempt: prerelease },
+      ...(typeof expectedBase === 'string' && expectedBase ? { baseSha: { expected: expectedBase, actual: typeof cutBase === 'string' ? cutBase : undefined } } : {}),
+      image: { ready: image.status === 'ready', detail: image.status === 'ready' ? 'ready' : `image-t60:${image.reason}` },
+      ...(probes.trafficPrep ? { traffic: probes.trafficPrep(version, { now: instant, cutAt }) } : {}),
+      ...(probes.hostReachable && hosts.length ? { hosts: hosts.map((host) => ({ host, reachable: probes.hostReachable!(host) })) } : {}),
+      ...(probes.credentials ? { credentials: probes.credentials() } : {}),
+    };
+    const verdict = evaluateCountdown('gate', conditions);
     const cutReached = cutAt === null || instant.getTime() >= Date.parse(cutAt);
-    const ready = image.status === 'ready' && cutReached;
-    const holdReason = image.status === 'ready' ? (cutReached ? null : 'cut-time-constraint') : `image-t60:${image.reason}`;
-    const eta = ready ? observedAt : image.status === 'ready' ? cutAt : null;
-    const state = { version, runId, cutCommit, phase: ready ? 'ready' : image.status === 'ready' ? 'countdown' : 'hold',
-      eta, holdReason, signalPath, updatedAt: observedAt };
+    const ready = verdict.go && cutReached;
+    const holdReason = verdict.holds.length
+      ? verdict.holds.map((hold) => hold.code === 'IMAGE_NOT_READY' ? hold.detail : hold.code).join(',')
+      : cutReached ? null : 'cut-time-constraint';
+    const eta = ready ? observedAt : verdict.go ? cutAt : null;
+    const phase = ready ? 'ready' : verdict.go ? 'countdown' : 'hold';
+    holdSince = verdict.go ? null : holdSince ?? instant.getTime();
+    if (holdSince === null) longHold = null;
+    else if (instant.getTime() - holdSince >= COUNTDOWN_LONG_HOLD_NOTICE_MS
+      && (longHold === null || instant.getTime() - Date.parse(longHold.notifiedAt) >= COUNTDOWN_LONG_HOLD_NOTICE_MS)) {
+      // A long hold never fails the run: it tells the operator once per cadence that QUICKPASS is an option.
+      longHold = { since: new Date(holdSince).toISOString(), codes: verdict.holds.map((hold) => hold.code), hint: quickpassHint(version), notifiedAt: observedAt };
+      debug.log('release.schedule', 'countdown-long-hold', { version, runId, ...longHold, attempt });
+    }
+    const state = { version, runId, cutCommit, phase, eta, holdReason, signalPath, updatedAt: observedAt };
     writeCountdownState(statePath, state);
+    writeCountdownReceipt(receiptPath, { schemaVersion: 1, version, runId, cutCommit, stage: verdict.stage, go: verdict.go, phase,
+      holds: verdict.holds, skipped: verdict.skipped, cutAt, eta, attempt, holdSince: holdSince === null ? null : new Date(holdSince).toISOString(),
+      longHold, evaluatedAt: observedAt });
+    // The only failure exit of a hold: the release's own deadline — the schedule row's cut-due window
+    // (RELEASE_CUT_DUE_WINDOW_MS, the same window dueReleaseCutEvents uses) has passed while still not GO.
+    if (!verdict.go && cutAt !== null && instant.getTime() - Date.parse(cutAt) >= RELEASE_CUT_DUE_WINDOW_MS) {
+      debug.log('release.schedule', 'countdown-window-expired', { version, runId, cutAt, codes: verdict.holds.map((hold) => hold.code), attempt });
+      throw new Error(`readiness countdown RELEASE_WINDOW_EXPIRED: cut ${cutAt} is past its due window and still held by ${verdict.holds.map((hold) => `${hold.code} (${hold.detail})`).join('; ')} — ${quickpassHint(version)}`);
+    }
     if (fromCutAt !== undefined) {
       debug.log('release.schedule', 'countdown-cut-time-changed', { version, runId, fromCutAt,
         cutAt, observedAt, eta, phase: state.phase, holdReason });
@@ -252,7 +303,9 @@ if (import.meta.main) {
     const contextPath = process.env.ELANOUS_GRAPH_CONTEXT;
     if (!contextPath) throw new Error('ELANOUS_GRAPH_CONTEXT is required');
     const context = JSON.parse(readFileSync(contextPath, 'utf8')) as ReadinessGraphContext;
-    const result = await waitForGateImageT60(context);
+    const result = await waitForGateImageT60(context, {
+      probes: defaultCountdownProbes(releaseLedgerRoot(), (context.input ?? {}) as Record<string, unknown>),
+    });
     console.log(JSON.stringify({ outcome: 'ok', ...result }));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

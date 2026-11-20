@@ -133,6 +133,7 @@ const EXPECTED: Record<RunStopClass, AutohealAction> = {
   'merge-held-release-path': 'wait-release',
   'pr-guard-failed': 'reauthor-from-materialized',
   'gate-unmeasured': 'remeasure-gate',
+  'no-review-provider': 'needs-owner',
   unclassified: 'needs-owner',
 };
 

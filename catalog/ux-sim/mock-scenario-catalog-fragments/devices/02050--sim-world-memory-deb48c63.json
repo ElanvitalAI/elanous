@@ -1,0 +1,31 @@
+{
+  "id": "sim-world-memory",
+  "name": "Memory sim world: D17 three-layer memory store behind the proposed graph memory port",
+  "audience": "internal",
+  "checklistCells": [
+    "SIM-WORLD-MEMORY"
+  ],
+  "implementation": [
+    "src/ux-sim/sim-world/memory/store.ts"
+  ],
+  "tests": [
+    "src/ux-sim/sim-world/memory/store.test.ts"
+  ],
+  "target": "Deterministic in-process memory store (instance/template/global layers, promote only with an approver, tenant isolation, serialized concurrent writes, death mid-write leaves no record, clock-driven expiry with tombstones) that stands in for the graph memory storage port in the memory sim world.",
+  "inputs": [
+    "Logical clock start (D7) and advance",
+    "armDeathMidWrite scripted condition",
+    "injectStoreFault infra fault",
+    "Scenario graphs written into an isolated ELANOUS_STATE_DIR per run"
+  ],
+  "observations": [
+    "Store event log: memory.written|promoted|refused|writer-died|expired|fault",
+    "faults() lists injected store faults for infra-error verdicts"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/sim-world/memory/store.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

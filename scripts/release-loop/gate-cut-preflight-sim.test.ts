@@ -13,6 +13,7 @@ import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.
 import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import type { LogRecord } from '../../src/mss/logging/record.js';
 import { gateShardRuntimeIdentityKey, type GateShardReceipt } from './gate-shard-dispatch.js';
+import type { GateCommandResult } from './gate-types.js';
 import { readGateShardLedger } from '../../src/release-loop/gate-shard-ledger.js';
 
 const CHANGED = ['docs/TECH-harness-map-2026-10-06.md', 'package.json', 'scenarios/ux-sim/rla-arg-adaptive-heal.yaml'];
@@ -238,6 +239,62 @@ export function sameGateTestedFileHashes(a?: Record<string, string>, b?: Record<
     expect(new Set(dispatchedFiles).size).toBe(6611);
     expect([...dispatchedFiles].sort()).toEqual(tests);
     console.log(`CUT-RADIUS-REPLAY ${priorCommit.slice(0, 8)}..${incidentCommit.slice(0, 8)} reason=changed-runtime-environment-input changedNonTs=${nonTs.length} tests=${tests.length} dispatchTests=${replayTests.length} receiptsReused=${reused}/81 radiusInvalidated=${invalidated}/81`);
+  } finally {
+    let removeError: string | undefined;
+    try {
+      if (worktreeAdded) {
+        const removed = gitRoot(['worktree', 'remove', '--force', historicalRepo]);
+        if (removed.status !== 0) removeError = removed.stderr;
+      }
+    } finally { rmSync(temp, { recursive: true, force: true }); }
+    if (removeError) throw new Error(`temporary incident worktree cleanup failed: ${removeError}`);
+  }
+});
+
+test('a Pod command that dies without a Job verdict stops the shard instead of bisecting', async () => {
+  const repo = process.cwd();
+  const roster = JSON.parse(readFileSync(new URL(RECEIPT_ROSTER, import.meta.url), 'utf8')) as {
+    shards: Array<{ id: string; files: string[] }>;
+  };
+  const files = [...new Set(roster.shards.flatMap((shard) => shard.files))].sort().slice(0, 12);
+  const temp = mkdtempSync(join(tmpdir(), 'release-cut-pod-error-'));
+  const historicalRepo = join(temp, 'repo');
+  const gitRoot = (args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  const git = (args: string[]) => spawnSync('git', args, { cwd: historicalRepo, encoding: 'utf8' });
+  let worktreeAdded = false;
+  try {
+    const added = gitRoot(['worktree', 'add', '--detach', historicalRepo, 'HEAD']);
+    expect(added.status).toBe(0);
+    worktreeAdded = true;
+    const historicalNodeModules = join(historicalRepo, 'node_modules');
+    const currentNodeModules = resolve(repo, 'node_modules');
+    if (existsSync(currentNodeModules)) symlinkSync(currentNodeModules, historicalNodeModules, 'dir');
+    const ledgerPath = join(temp, 'shards-ledger.jsonl');
+    const { createGateRunner } = await import(pathToFileURL(join(historicalRepo, 'scripts/release-loop/gate-node.ts')).href);
+    const command = async (cmd: string, args: string[], cwd: string) => {
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'merge-base') return { rc: 0, output: 'a'.repeat(40) };
+      const result = spawnSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      return { rc: result.status ?? 2, output: `${result.stdout ?? ''}\n${result.stderr ?? ''}` };
+    };
+    let podCalls = 0;
+    const runner = createGateRunner(historicalRepo, undefined, command, async () => {
+      podCalls++;
+      throw new Error('simulated pod infrastructure failure');
+    }, new PodPoolScheduler([{ context: 'sim', capacity: 8, k3dCluster: 'sim' }]));
+    // The sweep must settle finitely — no cap chunks, no halving, no per-file isolation for an error that
+    // never produced a Job. A bisecting sweep would fan out to 7 Pods per 4-file shard (21 total).
+    const outcome = await runner.sweep(historicalRepo, undefined, { pool: 'sim', shards: 3, freshShards: true, durationSource: '',
+      shardsFile: { path: join(temp, 'shards.json'), version: '0.3.6', ledgerPath, receiptRoot: join(temp, 'receipts'),
+        base40: 'b'.repeat(40), envFingerprint: 'c'.repeat(64) } })
+      .then((result: GateCommandResult) => ({ rc: result.rc }), () => ({ rc: 2 }));
+    expect(outcome.rc).not.toBe(0);
+    expect(podCalls).toBeLessThanOrEqual(6);
+    const ledger = readGateShardLedger(ledgerPath);
+    const shardIds = [...new Set((ledger?.rows ?? []).map((row) => row.shardId))];
+    expect(shardIds.length).toBeGreaterThan(0);
+    expect(shardIds.every((id) => /^pod-\d+$/.test(id))).toBe(true);
   } finally {
     let removeError: string | undefined;
     try {

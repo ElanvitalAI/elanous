@@ -14,6 +14,8 @@ import type { AcceptedRegression, GateExecutorOverride, GatePodPoolOverride, Gat
 import type { AdaptiveGateHealAppendNodeRequest, AdaptiveGateHealRerunGateRequest } from '../../scripts/release-loop/adaptive-gate-heal-adapter.js';
 import type { ReleaseOpEvent } from '../release-loop/op-channel.js';
 import type { MsgStore } from '../msg/msg-store.js';
+import type { GraphMemoryIdentity } from './graph-memory.js';
+import type { GraphMemoryBinding } from './graph-memory-port.js';
 
 export type GraphGrowthScope = 'harness' | 'task-agent';
 /** Authenticated host policy; this is never read from graph input or model output. */
@@ -70,8 +72,10 @@ export interface GraphRunState {
   /** The node now running and when it started; cleared when its record is written. */
   currentNode?: { nodeId: string; executionId?: string; startedAt: string };
   input?: unknown;
+  /** Trusted caller identity pinned on the first memory-enabled run and checked on every resume. */
+  memoryIdentity?: GraphMemoryIdentity;
   kstDayFallback?: { reason: 'missing-calendar-day' | 'invalid-calendar-day'; selected: string };
-  pending?: { nodeId: string; message: string; since: string; inputSha256?: string; approvalNonce?: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; outcome?: string; decidedBy?: string; decidedAt?: string;
+  pending?: { nodeId: string; message: string; since: string; inputSha256?: string; memoryItemId?: string; memoryTarget?: 'template' | 'global'; approvalNonce?: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; outcome?: string; decidedBy?: string; decidedAt?: string;
     /** Declared HITL options, pinned at pause only when a node declares 3+ (2-option nodes keep the yes/no record unchanged). */
     choices?: Array<{ key: string; exit: string; default?: boolean }>;
     /** The option key a person chose among `choices`; absent for yes/no approvals. */
@@ -258,6 +262,10 @@ export interface GraphRunOptions {
     inProcessHandlers?: InProcessHandlerRegistry;
     /** Generic provider bindings for the closed `cap:<name>` capability vocabulary. */
     capabilityProviders?: GraphCapabilityProviders;
+    /** Authenticated caller identity for scoped graph memory; graph input cannot supply this. */
+    memoryIdentity?: GraphMemoryIdentity;
+    /** Storage port + authenticated tenant for handler-requested memory (GRAPH-MEMORY-SCOPES port). */
+    memory?: GraphMemoryBinding;
     /** Host UI data callback; never serves as owner identity or human approval. */
     askUserForPreconditions?: (input: { readonly graphId: string; readonly runId: string;
       readonly nodeId: string; readonly missingKeys: readonly string[];

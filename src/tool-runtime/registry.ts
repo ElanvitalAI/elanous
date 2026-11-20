@@ -99,7 +99,7 @@ export async function dispatchToolByName(
       if (verdict.decision === 'deny') {
         return {
           ok: false,
-          error: `guardian: ${verdict.reasons.join('; ')}`,
+          error: `guardian: ${verdict.reasons.join('; ')}${verdict.approvalRequest !== undefined ? `\n${verdict.approvalRequest}` : ''}`,
           guardianReasons: verdict.reasons,
         };
       }

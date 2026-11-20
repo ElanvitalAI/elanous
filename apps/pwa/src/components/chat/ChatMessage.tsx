@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { MARKDOWN_REMARK_PLUGINS } from '@/lib/markdown-render';
 import { extractElanousCards } from '@/lib/elanous-card';
@@ -20,7 +20,14 @@ import { ToolProgressCard } from './blocks/ToolProgressCard';
 import { PerfTickSparkline } from './blocks/PerfTickSparkline';
 import { McpAppBlock } from './blocks/McpAppBlock';
 
-const MARKDOWN_COMPONENTS = { pre: CollapsibleCodeBlock };
+// 근거 URL 인용은 새 탭으로 연다 — 같은 탭 이동이면 bare 웹채팅(대화 상태 메모리뿐)이 사라진다.
+function MarkdownLink({ href, children }: { href?: string; children?: ReactNode }) {
+  const external = typeof href === 'string' && /^https?:\/\//i.test(href);
+  return external
+    ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
+    : <a href={href}>{children}</a>;
+}
+const MARKDOWN_COMPONENTS = { pre: CollapsibleCodeBlock, a: MarkdownLink };
 
 interface Props {
   message: ChatMessageT;
@@ -64,7 +71,7 @@ function ToolPill({
   mobileSimple = false,
 }: {
   block: Extract<ChatBlock, { kind: 'tool_use' }>;
-  children?: React.ReactNode;
+  children?: ReactNode;
   mobileSimple?: boolean;
 }) {
   const [open, setOpen] = useState(false);

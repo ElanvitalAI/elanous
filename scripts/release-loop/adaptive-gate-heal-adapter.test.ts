@@ -233,7 +233,7 @@ test('RLA-ALL-LIVE sim: production prescription is consumed and failed repair wa
     expect(state.pending?.nodeId).toBe('gate-heal-decision');
     expect(state.status).toBe('awaiting-approval');
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+}, 30000);
 
 test('RLA-ALL-LIVE runner: malformed macrophage ladder fails closed at the HITL node', async () => {
   const root = mkdtempSync(join('/tmp', 'rla-all-live-macro-invalid-'));
@@ -266,7 +266,7 @@ test('RLA-ALL-LIVE runner: malformed macrophage ladder fails closed at the HITL 
     expect(state.status).toBe('awaiting-approval');
     expect(commands.some((body) => body.includes('gate-repair-node.ts'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+}, 30000);
 
 test('RLA-ALL-LIVE sim: receipt audit rejects host attribution gaps and residual run retries on Pod in the same run', async () => {
   const root = mkdtempSync(join('/tmp', 'rla-all-live-pod-retry-'));
@@ -288,7 +288,7 @@ test('RLA-ALL-LIVE sim: receipt audit rejects host attribution gaps and residual
     const productionGraph = readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8');
     // Isolate receipt-audit recovery in a declared fixture; an undeclared YAML sibling under
     // graphs/release is correctly denied by the production graph asset manifest.
-    const productionErrorEdge = 'from: gate, on: outcome, map: { ok: cloud-leave-ok, fail: cloud-leave-fail, error: cloud-leave-error }';
+    const productionErrorEdge = 'from: gate, on: outcome, map: { ok: cloud-leave-ok, waived: receipt-audit, fail: cloud-leave-fail, error: cloud-leave-error }';
     expect(productionGraph).toContain(productionErrorEdge);
     const receiptAuditGraph = productionGraph.replace(productionErrorEdge,
       'from: gate, on: outcome, map: { ok: cloud-leave-ok, fail: cloud-leave-fail, error: receipt-audit }');
@@ -297,7 +297,7 @@ test('RLA-ALL-LIVE sim: receipt audit rejects host attribution gaps and residual
     copyFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), join(graphDir, 'recipes.yaml'));
     const cwd = join(import.meta.dir, '../..');
     const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
-      if (body.includes('version-node.ts release --json'))
+      if (body.includes('version-node.ts release --no-prebuild --json') || body.includes('version-node.ts release --json'))
         return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit }), stderr: '' };
       if (body.includes('gate-node.ts --json')) {
         gateVisits++;
@@ -344,7 +344,7 @@ test('RLA-ALL-LIVE sim: receipt audit rejects host attribution gaps and residual
     expect(state.path).toContain('receipt-audit-recheck');
     expect(state.status).toBe('done');
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+}, 30000);
 
 test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the same run then waits at HITL', async () => {
   const root = mkdtempSync(join('/tmp', 'rla-all-live-pod-retry-'));

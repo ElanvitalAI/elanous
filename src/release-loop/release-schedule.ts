@@ -55,13 +55,16 @@ function newerVersion(version: string, published: string): boolean {
 }
 
 /** cutAt is the earliest poll constraint; readiness inside runUnattendedRelease decides when the graph starts. */
+/** A scheduled cut stays due for 24h after cutAt; past that the row is stale (cut-due events and the countdown deadline). */
+export const RELEASE_CUT_DUE_WINDOW_MS = 24 * 3_600_000;
+
 export function dueReleaseCutEvents(now: string, root = releaseLedgerRoot()): ReleaseCutDueEvent[] {
   const at = Date.parse(now);
   if (!Number.isFinite(at)) throw new Error(`invalid schedule tick time: ${now}`);
   const published = releasedVersion(root);
   return readSchedules(root).filter(row => {
     const cut = Date.parse(row.cutAt);
-    return newerVersion(row.version, published) && cut <= at && at - cut < 24 * 3_600_000;
+    return newerVersion(row.version, published) && cut <= at && at - cut < RELEASE_CUT_DUE_WINDOW_MS;
   }).map(row => ({ id: `release.cut.due:${row.version}:${row.cutAt}`, type: 'release.cut.due' as const,
     version: row.version, cutAt: row.cutAt, at: new Date(at).toISOString() }));
 }

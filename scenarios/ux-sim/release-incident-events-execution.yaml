@@ -10,11 +10,11 @@ cases:
     mode: cut-tip-moved-after-resume
     expect:
       status: resume-refused
-      mustVisit: [version-release]
+      mustVisit: [cut-branch]
       mustNotVisit: [cutoff, gate, publish]
       events:
-        - { event: node-start, nodeId: version-release }
-        - { event: node-end, nodeId: version-release, ok: true }
+        - { event: node-start, nodeId: cut-branch }
+        - { event: node-end, nodeId: cut-branch, ok: true }
   - id: incident-02-pod-4-receipt-corrupt
     mode: append-receipt-continuity
     expect:

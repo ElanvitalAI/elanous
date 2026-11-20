@@ -486,15 +486,18 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     expect(first.executed).toBe(first.nodes.filter((record) => record.executed).length);
     expectPersistedExecutionCount();
     // The declared cloud (#35378) and Pod preparation (#36653) nodes precede the gate.
-    expect(first.path).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
+    expect(first.path).toEqual(['traffic-prep', 'cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
       'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate',
       'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    const firstCommands = ['readiness-countdown', 'traffic-cut-start', 'cutoff', 'regression-suite',
+    const firstCommands = ['traffic-prep', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'regression-suite',
       'prefetch', 'checklist-gate', 'cloud-approval-check', 'cloud-join', 'gate', 'cloud-leave-fail',
       'emergency-switch', 'gate-triage', 'traffic-failed-restore'];
     expect(seen.map((item) => item.nodeId)).toEqual(firstCommands);
-    expect(seen.map((item) => item.commit)).toEqual(firstCommands.map(() => cut));
+    // traffic-prep is the entry: it runs before the cut exists, so only the later nodes carry the cut commit.
+    const afterCut = seen.filter((item) => item.nodeId !== 'traffic-prep');
+    expect(seen.find((item) => item.nodeId === 'traffic-prep')?.commit).toBeUndefined();
+    expect(afterCut.map((item) => item.commit)).toEqual(afterCut.map(() => cut));
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });

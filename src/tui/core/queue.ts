@@ -270,6 +270,12 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
     get steerCount(): number { return queued().filter((item) => item.steerId !== undefined).length; },
     get steerIds(): readonly string[] { return queued().flatMap((item) => (item.steerId === undefined ? [] : [item.steerId])); },
     get interrupted(): boolean { return interrupted; },
+    /** Move the pending interruption to the entry turn, including off-queue held notices. */
+    takeResumeReason(): NextTuiQueueInterruptReason | undefined {
+      const reason = resumeReason;
+      resumeReason = undefined;
+      return reason;
+    },
     /** Any item this queue has seen, terminal ones included. */
     get(id: string): NextTuiQueueItem | undefined {
       const item = byId.get(id);
@@ -411,10 +417,11 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
       if (!interrupted) interruptReason = reason;
       interrupted = true;
     },
-    settle(_draft: string, turn?: NextTuiSettledTurn): NextTuiQueueSettle {
+    settle(_draft: string, turn?: NextTuiSettledTurn, hasHeldNotice = false): NextTuiQueueSettle {
       const pending = queued();
       if (interrupted) {
         interrupted = false;
+        if (hasHeldNotice) resumeReason ??= interruptReason;
         if (pending.length === 0) {
           // Esc table: queued input → next turn by itself (below) · queue empty ∧ no response → original text
           // back in the prompt · queue empty ∧ something answered → nothing to give back. Plans are never rolled back.

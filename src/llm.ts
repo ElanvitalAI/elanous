@@ -40,6 +40,7 @@ import { llmObserveSend, withLlmCallContext } from './session-runtime/llm-call-g
 import { estimateMessagesTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
 import { codexAccountReadStorePath } from './oauth/codex-owner-mirror.js';
+import { effectiveCodexAccountName, withCodexAccountOverride } from './oauth/codex-account-override.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
@@ -4993,17 +4994,67 @@ function requestMaxTokens(provider: LLMProvider, model: string, opts: LLMOpts): 
   return resolveRequestMaxTokens(model, opts.usageRole, opts.maxTokens);
 }
 
+type StreamLLMOpts = LLMOpts & {
+  provider?: LLMProvider;
+  /** Session turns already resolved a provider and must keep it under test. */
+  preferExplicitProvider?: boolean;
+  initialProvider?: LLMProvider;
+  onResolvedProvider?: (provider: string, model: string) => void;
+  skipProviders?: readonly string[];
+};
+
+/** 시험 전용 이음매 — 시험이 «자동 공급자 + 정책 우주» 를 흉내낼 때만 쓴다(운영 스위치 아님 · 기본 undefined). */
+let liveSpendTestSeam: { readonly eligible?: boolean; readonly deps?: Partial<import('./oauth/llm-call-gate.js').LlmCallGateDeps> & { policyDir?: string } } | undefined;
+export function __setLiveSpendTestSeam(seam: typeof liveSpendTestSeam): void { liveSpendTestSeam = seam; }
+
+/** 지출 관문 대상인가 — 명시 provider(opts.provider/initialProvider · auto 아닌 설정)·가짜 기본은 건드리지 않는다. */
+function liveSpendEligible(opts: StreamLLMOpts): boolean {
+  if (liveSpendTestSeam?.eligible !== undefined) return liveSpendTestSeam.eligible;
+  if (opts.provider || opts.initialProvider) return false;
+  if (testFakeLlmDefaultSelected()) return false;
+  try {
+    const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
+    return getUserConfig().llm.provider === 'auto';
+  } catch { return false; }
+}
+
+/**
+ * 지출 정책 관문 합류점(LLM-AUTO-PROVIDER-E2E) — 대표 켜짐은 «데이터 유무»(정책 정본 있음). 정책 없는 우주 = 관문 통과 +
+ * 원장 observe 1줄 외에 선택·결과·성능 변화 0. 정책 있음 = 행(공급자·계정) 선택 후 호출 · 멈춤이면 throw.
+ */
 export async function streamLLM(
   messages: LLMMessage[],
   onChunk: (delta: string, full: string) => void,
-  opts: LLMOpts & {
-    provider?: LLMProvider;
-    /** Session turns already resolved a provider and must keep it under test. */
-    preferExplicitProvider?: boolean;
-    initialProvider?: LLMProvider;
-    onResolvedProvider?: (provider: string, model: string) => void;
-    skipProviders?: readonly string[];
-  } = {},
+  opts: StreamLLMOpts = {},
+): Promise<string> {
+  if (!liveSpendEligible(opts)) return streamLLMCore(messages, onChunk, opts);
+  const live = await import('./oauth/llm-call-live.js');
+  const gate = await import('./oauth/llm-call-gate.js');
+  const result = await live.runLiveGate(
+    { role: live.spendRoleFor(opts.usageRole), location: 'host', ...(opts.model ? { models: [opts.model] } : {}), estimateUsd: 0.05, actor: opts.usageSite ?? 'stream-llm' }, // 출처: #39183 — 추정액은 크레딧 행 예약용 초기값(실 사용액은 settle 이 확정)
+    liveSpendTestSeam?.deps ?? {},
+  ).catch((error) => live.gateErrorOutcome(error, { ...(liveSpendTestSeam?.deps?.policyDir !== undefined ? { policyDir: liveSpendTestSeam.deps.policyDir } : {}), actor: opts.usageSite ?? 'stream-llm' })); // 관문 자체 오류: 정책 정본 있으면 멈춤(fail-closed) · 없으면 통과
+  if (result.outcome === 'pass-through') return streamLLMCore(messages, onChunk, opts);
+  if (result.outcome === 'stop') throw new Error(`LLM spend guard stop: ${result.reason}`);
+  const account = result.provider === 'openai-codex' ? live.codexAccountNameForRow(result.row) : undefined;
+  const routed: StreamLLMOpts = { ...opts, ...(opts.model === undefined && result.model ? { model: result.model } : {}) };
+  // ⛔ process.env 를 바꾸지 않는다 — 계정은 호출 범위(AsyncLocalStorage)로만 전한다(동시 호출 꼬임·env 영구 잔존 0).
+  const run = () => streamLLMCore(messages, onChunk, routed);
+  try {
+    const text = await (account !== undefined ? withCodexAccountOverride(account, run) : run());
+    await gate.settleLlmCall(result.handle, { status: 'ok' });
+    return text;
+  } catch (err) {
+    const signal = gate.llmSignalFromError(err);
+    await gate.settleLlmCall(result.handle, { status: 'failed', ...(signal ? { signal } : {}) });
+    throw err;
+  }
+}
+
+async function streamLLMCore(
+  messages: LLMMessage[],
+  onChunk: (delta: string, full: string) => void,
+  opts: StreamLLMOpts = {},
 ): Promise<string> {
   const started = Date.now();
   // NODE_ENV=test chooses a fake default, but an injected fixture provider
@@ -5040,8 +5091,8 @@ export async function streamLLM(
     opts.onResolvedProvider?.(activeProvider.name, activeModel);
     await recordChildFirstLlmStart({
       provider: activeProvider.name, model: activeModel,
-      ...(activeProvider.name === 'openai-codex' && process.env.ELANOUS_CODEX_ACCOUNT?.trim()
-        ? { accountName: process.env.ELANOUS_CODEX_ACCOUNT.trim() } : {}),
+      ...(activeProvider.name === 'openai-codex' && effectiveCodexAccountName()
+        ? { accountName: effectiveCodexAccountName()! } : {}),
     });
     if (!opts.usageRole) debug.log('llm.role', 'outside-role', {
       provider: activeProvider.name, model: activeModel, site: opts.usageSite ?? 'stream-llm',
@@ -8652,8 +8703,8 @@ export async function streamLLMWithTools(
   opts.onResolvedProvider?.(activeProvider.name, activeModel);
   await recordChildFirstLlmStart({
     provider: activeProvider.name, model: activeModel,
-    ...(activeProvider.name === 'openai-codex' && process.env.ELANOUS_CODEX_ACCOUNT?.trim()
-      ? { accountName: process.env.ELANOUS_CODEX_ACCOUNT.trim() } : {}),
+    ...(activeProvider.name === 'openai-codex' && effectiveCodexAccountName()
+      ? { accountName: effectiveCodexAccountName()! } : {}),
   });
   const initialToolHandler = handlers.onToolCall;
   handlers = {

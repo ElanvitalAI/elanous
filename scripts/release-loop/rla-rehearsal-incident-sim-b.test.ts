@@ -704,7 +704,9 @@ test('RLA rehearsal incident SIM-B uses release.gate.failed ARG append and same-
       });
       return { exitCode: 0, stdout: JSON.stringify(result), stderr: '' };
     }
-    if (body.includes('version-node.ts release --json'))
+    if (body.includes('version-node.ts gate-image-prebuild --json'))
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: 'e'.repeat(40) }), stderr: '' };
+    if (body.includes('version-node.ts release --no-prebuild --json') || body.includes('version-node.ts release --json'))
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: 'e'.repeat(40) }), stderr: '' };
     if (body.includes('gate-file-receipt-audit-node.ts')) {
       receiptAuditVisits++;
@@ -715,8 +717,9 @@ test('RLA rehearsal incident SIM-B uses release.gate.failed ARG append and same-
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: 'f'.repeat(40) }), stderr: '' };
     }
     const recognizedCommand = [
+      'version-node.ts release --no-prebuild --json',
       'version-node.ts release --json', 'release-readiness.ts', 'traffic-node.ts traffic-cut-start', 'node-verdict.ts cutoff',
-      'checklist-gate-node.ts', 'docs-node.ts --json', 'export-check-node.ts', 'gate-node.ts --json',
+      'checklist-gate-node.ts', 'regression-suite-node.ts', 'docs-node.ts --json', 'export-check-node.ts', 'gate-node.ts --json',
       'emergency-publish-switch-sim.ts', 'gate-file-receipt-audit-node.ts',
       'gate-triage-node.ts', 'gate-repair-node.ts',
       'traffic-node.ts traffic-gate-passed', 'mac-smoke-node.ts', 'node-verdict.ts pwa',
@@ -724,9 +727,14 @@ test('RLA rehearsal incident SIM-B uses release.gate.failed ARG append and same-
       'check-node.ts --json', 'auto-approve-node.ts', 'publish-node.ts', 'npm-publish-node.ts',
       'traffic-node.ts traffic-npm-published', 'docs-land-node.ts', 'version-node.ts dev-bump --json', 'verify-node.ts',
       'traffic-node.ts traffic-verify-complete', 'vault-note-node.ts', 'draft.ts --graph',
-      'ops-upgrade-node.ts',
+      'ops-upgrade-node.ts', 'traffic-node.ts traffic-failed-restore', 'cloud-elastic-node.ts approval-check',
+      'cloud-elastic-node.ts join', 'cloud-elastic-node.ts leave', 'gate-cutover-switch-node.ts',
+      'pwa-formal-update-node.ts',
     ].some((marker) => body.includes(marker));
     if (!recognizedCommand) throw new Error(`unexpected release graph command in SIM-B: ${body}`);
+    if (body.includes('gate-cutover-switch-node.ts')) {
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'audit' }), stderr: '' };
+    }
     return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
   };
 

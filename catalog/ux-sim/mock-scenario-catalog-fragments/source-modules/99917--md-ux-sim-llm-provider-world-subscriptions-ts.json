@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-LLM-PROVIDER-WORLD-SUBSCRIPTIONS-TS",
+  "path": "src/ux-sim/llm-provider-world/subscriptions.ts",
+  "boundary": "Fake LLM subscription world: a manipulable SimClock plus three codex and two Claude subscription accounts whose usage windows, reset times, 429 usage_limit_reached replies and lease slots (names only) feed LlmSpendRowState; no real key, token, network or host is touched",
+  "deviceIds": ["llm-sim-subscriptions"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

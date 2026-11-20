@@ -45,6 +45,29 @@ describe('ELS-DOOR-STRUCT-OPS · close 사람 확인 표시', () => {
   });
 });
 
+describe('ELS-DOOR-STRUCT-OPS · move(reorder) 사람 확인 표시', () => {
+  test('confirm 없는 move는 문이 거부한다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'door-struct-'));
+    writeFileSync(join(dir, 'control-allow.json'), JSON.stringify({ rules: rules(['close', 'rename', 'move']) }));
+    const auditLines: string[] = [];
+    const control = createControl({ stateDir: dir, appendAudit: (_p, line) => { auditLines.push(line); }, execute: async (input) => ({ exitCode: 0, message: 'ok' }) });
+    const outcome = await control.run({ principal, from: 'OP', action: 'move', target, struct: { kind: 'tab', id: 't1' } });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe('denied');
+    if (!outcome.ok) expect(outcome.reason).toBe('move needs confirm:true (human confirmation)');
+    expect(auditLines.join('')).toContain('\"result\":\"denied\"');
+  });
+  test('confirm:true move는 허용 규칙 아래 실행된다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'door-struct-'));
+    writeFileSync(join(dir, 'control-allow.json'), JSON.stringify({ rules: rules(['move']) }));
+    const calls: string[] = [];
+    const control = createControl({ stateDir: dir, execute: async (input) => { calls.push(input.action); return { exitCode: 0, message: 'ok' }; } });
+    const outcome = await control.run({ principal, from: 'OP', action: 'move', target, struct: { kind: 'tab', id: 't1' }, confirm: true });
+    expect(calls).toEqual(['move']);
+    expect(outcome.ok).toBe(true);
+  });
+});
+
 describe('ELS-DOOR-STRUCT-OPS · 허용 밖 동작 거부', () => {
   test('rename은 rename을 허용하지 않는 규칙 아래 거부된다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'door-struct-'));

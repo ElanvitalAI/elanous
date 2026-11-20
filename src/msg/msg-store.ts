@@ -440,16 +440,30 @@ export class MsgStore {
    * SEAT-INBOX B1-C (#38194 REVIEW-1 ①②): run one message write as a single immediate transaction so the message
    * INSERT and its posted receipt commit or roll back together (a failed post never leaves a stored message behind,
    * so a retry cannot store it twice), and emit `msg.receipt.posted` only after that commit.
+   *
+   * TRANSACTION-REVIEW #38917 ①: a caller may catch a nested write's failure, so the failure must not leak that
+   * attempt's partial writes (message + receipts) into the caller's still-open transaction — a nested write runs
+   * under a savepoint that rolls back on error, and the events this attempt queued are dropped with it.
    */
   private withPostedEvents<T>(write: () => T): T {
     this.postedEventDepth += 1;
+    const savepoint = `msg_posted_events_${this.postedEventDepth}`;
+    const nested = this.db.inTransaction;
+    const queuedAtEntry = this.pendingPostedEvents.length;
     let result: T;
-    try { result = this.db.inTransaction ? write() : this.db.transaction(write).immediate(); }
+    if (nested) this.db.exec(`SAVEPOINT ${savepoint}`);
+    try { result = nested ? write() : this.db.transaction(write).immediate(); }
     catch (error) {
+      if (nested) {
+        try { this.db.exec(`ROLLBACK TO ${savepoint}`); } catch { /* the failing write already unwound this savepoint */ }
+        try { this.db.exec(`RELEASE ${savepoint}`); } catch { /* savepoint already gone */ }
+        this.pendingPostedEvents.length = queuedAtEntry;
+      }
       this.postedEventDepth -= 1;
       if (this.postedEventDepth === 0) this.pendingPostedEvents = [];
       throw error;
     }
+    if (nested) this.db.exec(`RELEASE ${savepoint}`);
     this.postedEventDepth -= 1;
     if (this.postedEventDepth === 0 && !this.db.inTransaction) {
       const events = this.pendingPostedEvents;
@@ -957,16 +971,23 @@ export class MsgStore {
     return this.db.query('SELECT 1 FROM msg_ta_claim WHERE request_id = ?').get(requestId) ? 'held' : 'none';
   }
 
-  /** Only the active sender may settle or report its own attempt; stale failures cannot overwrite success. */
+  /** Only the active sender may settle or report its own attempt; stale failures cannot overwrite success.
+    * The claim cleanup runs after the settle commits and is fail-open: a cleanup failure must not flip
+    * a durable settle into a reported failure — the stale claim keeps blocking rival claims while the
+    * owner may re-settle, so the leftover row only narrows retries instead of losing the stored reply. */
   settleTaDelivery(requestId: number, token: string, replyBody: string, delivered: boolean): boolean {
-    return this.db.transaction(() => {
+    const settled = this.db.transaction(() => {
       const owner = this.db.query('SELECT token FROM msg_ta_claim WHERE request_id = ?').get(requestId) as { token: string } | null;
       if (owner?.token !== token || this.taDeliveryStatus(requestId) === 'delivered') return false;
       if (delivered) this.setTaDeliveryStatus(requestId, 'delivered');
       this.updateTaReply(requestId, replyBody);
-      this.db.query('DELETE FROM msg_ta_claim WHERE request_id = ? AND token = ?').run(requestId, token);
       return true;
     }).immediate();
+    if (settled) {
+      try { this.db.query('DELETE FROM msg_ta_claim WHERE request_id = ? AND token = ?').run(requestId, token); }
+      catch (error) { console.error(`msg: ta claim cleanup failed after settle — request #${requestId}; the claim stays held`, error); }
+    }
+    return settled;
   }
 
   /** Keep the claim after any transport/settlement exception: publication may already have happened. */

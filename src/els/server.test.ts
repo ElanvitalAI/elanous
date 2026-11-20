@@ -8,7 +8,8 @@ import { requestEls } from './client.js';
 import { wireElsChildProducer } from './child-producer.js';
 import type { ElsPty } from './core.js';
 import { elsJournalPath } from './journal.js';
-import { elsSocketPath, startElsServer } from './server.js';
+import { AUTH_PANE_TOKEN_ENV } from './server-auth.js';
+import { elsSocketPath, serveConnection, startElsServer } from './server.js';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -55,14 +56,68 @@ test('the journal is not read until the socket is owned: a refused serve leaves 
   expect(readFileSync(elsJournalPath(root), 'utf8')).toBe('{broken');
 });
 
-/** One request over the real Unix socket, as `els` clients send it. */
+/** Roots whose owner already ran `seat-set OP` on their server (JUD #39057 ⓒ1③ — one explicit registration per server). */
+const seatedRoots = new Set<string>();
+/** One request over the real Unix socket, as `els` clients send it — with the owner pane credential when the test process has one. */
 const ask = (root: string, request: object): Promise<{ exitCode: number; message: string }> => new Promise((resolve, reject) => {
+  const auth = { op: 'auth', token: process.env.ELANOUS_ELS_OWNER_TOKEN };
+  const send = (): void => {
+    const socket = createConnection(elsSocketPath(root));
+  let data = '';
+  socket.on('connect', () => {
+    if (auth.token) socket.write(`${JSON.stringify(auth)}\n`);
+    socket.write(`${JSON.stringify(request)}\n`);
+  });
+  socket.on('data', (chunk) => { data += chunk.toString(); });
+  socket.on('end', () => resolve(JSON.parse(data.split('\n').filter(Boolean).pop()!) as { exitCode: number; message: string }));
+  socket.on('error', reject);
+  };
+  if (auth.token && !seatedRoots.has(root)) {
+    // The test harness acts as the person: the first owner act on each server is the explicit OP registration.
+    seatedRoots.add(root);
+    const reg = createConnection(elsSocketPath(root));
+    let registered = false;
+    reg.on('connect', () => {
+      reg.write(`${JSON.stringify(auth)}\n`);
+      reg.write(`${JSON.stringify({ op: 'seat-set', seat: 'OP' })}\n`);
+    });
+    reg.on('data', (chunk) => { if (chunk.toString().includes('OP registered')) registered = true; });
+    reg.on('close', () => { registered ? send() : reject(new Error('seat-set registration failed')); });
+  } else send();
+});
+
+/** A raw ask that skips the auth preamble — exactly what an unauthenticated direct socket write is. */
+const askRaw = (root: string, request: object, authLine?: object): Promise<{ exitCode: number; message: string }> => new Promise((resolve, reject) => {
   const socket = createConnection(elsSocketPath(root));
   let data = '';
-  socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+  socket.on('connect', () => { if (authLine) socket.write(`${JSON.stringify(authLine)}\n`); socket.write(`${JSON.stringify(request)}\n`); });
   socket.on('data', (chunk) => { data += chunk.toString(); });
-  socket.on('end', () => resolve(JSON.parse(data) as { exitCode: number; message: string }));
+  socket.on('end', () => resolve(JSON.parse(data.split('\n').filter(Boolean).pop()!) as { exitCode: number; message: string }));
   socket.on('error', reject);
+});
+
+test('JUD #39053 ⓒ1 E2E: direct-socket and env-spoofed writes are denied at the server door, real pane credentials pass', async () => {
+  const root = state();
+  const fake = (): ElsPty => ({ id: `pty_${Math.random().toString(16).slice(2)}`, isAlive: () => true, write: () => {}, renderScreen: async () => '', onExit: () => {}, kill: () => {} });
+  const started = await startElsServer({ stateRoot: root, spawn: fake });
+  if ('exitCode' in started) throw new Error(started.message);
+  cleanups.push(() => started.close());
+  const made = JSON.parse((await ask(root, { op: 'new', ws: 'OP', cwd: '/work', command: ['sh'] })).message) as { pane: string };
+  // ① 직통 소켓(무토큰): 변형 연산 거부.
+  const direct = await askRaw(root, { op: 'do', pane: made.pane, action: 'text', text: 'ls' });
+  expect(direct.exitCode).toBe(1);
+  expect(direct.message).toContain('no pane credential');
+  // ② ELANOUS_SEAT=OP 위장: env 문자열을 토큰으로 제출해도 원장없는 토큰은 outsider.
+  const spoof = await askRaw(root, { op: 'do', pane: made.pane, action: 'text', text: 'ls' }, { op: 'auth', token: 'OP', pid: 1 });
+  expect(spoof.exitCode).toBe(1);
+  expect(spoof.message).toContain('unknown pane token');
+  // 거부는 감사 원장에 남는다.
+  const audit = readFileSync(join(root, 'els', 'control-audit.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { action: string; result: string });
+  expect(audit.length).toBeGreaterThanOrEqual(2);
+  expect(audit.every((row) => row.result === 'denied')).toBe(true);
+  // ③ 서버 소유자 토큰(진짜 자격)은 통과.
+  const legit = await ask(root, { op: 'close', pane: made.pane, confirmed: true });
+  expect(legit.exitCode, `legit close answer: ${JSON.stringify(legit)}`).toBe(0);
 });
 
 test('child op over the socket: start, status, end write the parent result line, summary and tree answer', async () => {
@@ -97,8 +152,8 @@ test('a pane started by `els new` carries the workspace and socket in its env, a
   const env = seen[0]!;
   expect(env.ELANOUS_ELS_WS).toBe('OP');
   expect(env.ELANOUS_ELS_SOCKET).toBe(elsSocketPath(root));
-  // Exactly the two names the eln side reads (dashboard + child-producer); an unread name would be a silent no-op.
-  expect(Object.keys(env).sort()).toEqual(['ELANOUS_ELS_PANE', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_WS']);
+  // Exactly the three names the pane carries: the two eln reads + the server-minted pane token (env inheritance = descent proof).
+  expect(Object.keys(env).sort()).toEqual(['ELANOUS_ELS_PANE', 'ELANOUS_ELS_PANE_TOKEN', 'ELANOUS_ELS_SOCKET', 'ELANOUS_ELS_WS']);
   // What the eln in that pane does at boot: wire the producer from the env it was given.
   const registry = new AgentRegistry();
   const wired = wireElsChildProducer({ registry, ws: env.ELANOUS_ELS_WS!, socketPath: env.ELANOUS_ELS_SOCKET!, request: requestEls });
@@ -136,4 +191,66 @@ test('reorder over the socket survives a restart of the owner: workspaces and ta
   if ('exitCode' in second) throw new Error(second.message);
   cleanups.push(() => second.close());
   expect((await listed()).map((p) => p.title)).toEqual(['three-2', 'one-0', 'two-3', 'two-1']);
+});
+
+test('JUD #39071 E2E: the spawn lambda passes the requesting role to registerSpawn as the parent', async () => {
+  const root = state();
+  const minted: string[] = [];
+  const fake = (): ElsPty => ({ id: `pty_${Math.random().toString(16).slice(2)}`, isAlive: () => true, write: () => {}, renderScreen: async () => '', onExit: () => {}, kill: () => {} });
+  const started = await startElsServer({ stateRoot: root, spawn: (_c, _d, _t, env) => { minted.push(env[AUTH_PANE_TOKEN_ENV] ?? ''); return fake(); } });
+  if ('exitCode' in started) throw new Error(started.message);
+  cleanups.push(() => started.close());
+  // OP 등록된 소유자 토큰으로 첫 new — role=op → parent {kind:'op'} → 자식 토큰은 op 자격으로 발급되어야 한다.
+  const first = JSON.parse((await ask(root, { op: 'new', ws: 'ONE', cwd: '/work', command: ['sh'] })).message) as { pane: string };
+  expect(minted.length).toBe(1);
+  const target = JSON.parse((await ask(root, { op: 'new', ws: 'TWO', cwd: '/work', command: ['sh'] })).message) as { pane: string };
+  expect(minted.length).toBe(2);
+  // 자식 토큰으로 다른 워크스페이스 패넨에 do — op 자격이면 통과, 부모가 잘려 hand/unknown 이면 거부.
+  const cross = await askRaw(root, { op: 'do', pane: target.pane, text: 'ls', from: 'server-owner' }, { op: 'auth', token: minted[0], pid: 1 });
+  expect(cross.exitCode, `cross-workspace do as the spawned child: ${JSON.stringify(cross)}`).toBe(0);
+});
+
+
+test('JUD must ⓒ2-② (OP #104711): listen 은 guard 준비 뒤 — guard 없는 mutating 요청은 fail-closed 거부', async () => {
+  const relay = createServer();
+  await new Promise<void>((resolve) => relay.listen(0, '127.0.0.1', resolve));
+  const port = (relay.address() as { port: number }).port;
+  const client = createConnection(port, '127.0.0.1');
+  const serverSide = await new Promise<import('node:net').Socket>((resolve) => relay.once('connection', resolve));
+  serveConnection(Promise.resolve(undefined), serverSide, '/state-root', undefined as never, { current: undefined });
+  client.setEncoding('utf8');
+  client.write(JSON.stringify({ op: 'input-line', pane: 'p-op', text: 'x', from: 'y' }) + '\n');
+  const denial = await new Promise<string>((resolve, reject) => {
+    client.once('data', (d) => resolve(String(d)));
+    setTimeout(() => reject(new Error('no answer from serveConnection')), 5_000);
+  });
+  expect(denial).toContain('els: input-line denied — not ready (no guard)');
+  client.destroy();
+  serverSide.destroy();
+  await new Promise<void>((resolve) => relay.close(() => resolve()));
+});
+
+// JUD #39096 must ⓒ (OP #106966·#107197): 무토큰 els pane 자손의 attach 는 역할 문에서 거부된다.
+test('JUD #39096 ⓒ — els pane 프로세스의 무토큰 요청은 문에서 거부', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'els-door-'));
+  const relay = createServer();
+  await new Promise<void>((resolve) => relay.listen(join(root, 'door.sock'), resolve));
+  const client = createConnection(join(root, 'door.sock'));
+  const serverSide = await new Promise<import('node:net').Socket>((resolve) => relay.once('connection', resolve));
+  const stubGuard = {
+    classify: () => ({ kind: 'outsider', note: 'tokenless' }) as never,
+    authorize: () => ({ allow: true }) as never,
+    audit: () => {},
+  } as never;
+  const fakeCore = { shellPids: () => [{ pane: 'w1:p1', pid: process.pid }] } as never;
+  serveConnection(Promise.resolve(fakeCore), serverSide, join(root, 'state'), undefined as never, { current: stubGuard });
+  client.setEncoding('utf8');
+  client.write(JSON.stringify({ op: 'input-line', pane: 'w1:p1', text: 'x' }) + '\n');
+  const answer = await new Promise<string>((resolve, reject) => {
+    client.once('data', (d) => resolve(String(d)));
+    setTimeout(() => reject(new Error('no answer from the door')), 5_000);
+  });
+  expect(answer).toContain('present the pane token');
+  client.destroy(); serverSide.destroy();
+  await new Promise<void>((resolve) => relay.close(() => resolve()));
 });

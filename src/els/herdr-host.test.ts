@@ -50,8 +50,11 @@ test('herdr panes join the same list as the host `herdr`: addresses, titles with
 test('the sidetab draws those panes as ⇄herdr rows with the working / blocked / idle / done words', async () => {
   const { federation } = rig();
   const rows = elsRowsFromList((await federation.list()).message, 'here');
-  expect(rows.map((row) => `${row.label} | ${row.agentState ?? row.badge}`)).toEqual([
-    '⇄herdr OP · mshq 주 OP | idle', '⇄herdr REL · eln·gpt-6-sol | working', '⇄herdr HAND-TUI-C · claude | blocked', '⇄herdr HAND-TUI-C · zsh | done', '⇄herdr HAND-TUI-C · zsh plain shell | unknown']);
+  // The ⇄herdr mark heads the host's subtree (every row of it carries remoteHost); the pane rows keep the words.
+  expect(rows[0]).toMatchObject({ label: '⇄herdr', remoteHost: 'herdr' });
+  expect(rows.every((row) => row.remoteHost === 'herdr')).toBe(true);
+  expect(rows.filter((row) => row.id.startsWith('els:')).map((row) => `${row.label.trim()} | ${row.agentState ?? row.badge}`)).toEqual([
+    'OP · mshq 주 OP | idle', 'REL · eln·gpt-6-sol | working', 'HAND-TUI-C · claude | blocked', 'HAND-TUI-C · zsh | done', 'HAND-TUI-C · zsh plain shell | unknown']);
 });
 
 test('read: the els address becomes the herdr pane id; an unknown pane is the usual els answer', async () => {

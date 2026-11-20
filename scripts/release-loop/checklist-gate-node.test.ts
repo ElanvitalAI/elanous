@@ -227,7 +227,9 @@ test('CLI disposition set and piped 100-item status JSON remain complete', () =>
   mkdirSync(dir, { recursive: true });
   const items = Array.from({ length: 100 }, (_, index) => ({ id: `K${index}`, title: `title ${index} ${'long description '.repeat(45)}`, status: 'yellow', updatedAt: new Date().toISOString(), updatedBy: 'TC' }));
   writeFileSync(join(dir, 'checklist.json'), JSON.stringify({ version: '0.2.6', released: '', dev: '', items, history: [] }));
-  const env = { ...process.env, HOME: join(root, '..'), ELANOUS_STATE_DIR: root };
+  // An ambient ELANOUS_CONFIG_DIR (train/pod shells) makes the CLI print a deprecation line on stdout; the explicit --config-dir below is the only config input.
+  const { ELANOUS_CONFIG_DIR: _ambientConfigDir, ...cleanEnv } = process.env;
+  const env = { ...cleanEnv, HOME: join(root, '..'), ELANOUS_STATE_DIR: root };
   const set = spawnSync('bun', ['bin/elanous.mjs', '--config-dir', root, '--test', 'release', 'checklist', 'set', 'K0', '--version', '0.2.6', '--disposition', 'known-issue'], { cwd: repo, encoding: 'utf8', env });
   expect(set.status).toBe(0);
   const invalid = spawnSync('bun', ['bin/elanous.mjs', '--config-dir', root, '--test', 'release', 'checklist', 'set', 'K0', '--version', '0.2.6', '--disposition', 'skip'], { cwd: repo, encoding: 'utf8', env });

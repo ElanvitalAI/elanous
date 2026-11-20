@@ -2,6 +2,7 @@ import { accessSync, closeSync, constants as fsConstants, existsSync, lstatSync,
 import { spawn } from 'node:child_process';
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { getTestStateRoot } from '../nexus/paths.js';
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import type { SuiteCase, SuiteReceipt } from './world.js';
 
 const UNAVAILABLE = 'real target is unmeasured: isolated worker is unavailable';
@@ -183,9 +184,8 @@ export async function runRealTargetSandbox(item: SuiteCase, options: RealTargetS
       const kill = (reason: string) => {
         if (abortReason || settled) return;
         abortReason = reason;
-        if (child.pid) {
-          try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
-        } else child.kill('SIGKILL');
+        // KILL-TREE-ONE — exact detached group, SIGKILL at once (no pid → child.kill).
+        void terminateTree(child, { group: true, firstSignal: 'SIGKILL' });
       };
       const timer = setTimeout(() => kill('real target time limit exceeded'), timeoutMs);
       const stopPoll = stopFile ? setInterval(() => { if (existsSync(stopFile)) kill('real target stop switch active'); }, STOP_POLL_MS) : undefined;

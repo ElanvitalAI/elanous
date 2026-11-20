@@ -19,6 +19,7 @@ import { ChatQueueChips } from './ChatQueueChips';
 import { clearChatQueue, dequeueChat, enqueueChat, removeChat, type ChatQueueEntry } from '@/lib/chat-queue';
 import { ChatDropOverlay } from './ChatDropOverlay';
 import { nextDropOverlay, type DropOverlayState } from '@/lib/drop-overlay';
+import { isBareWebChatOrigin } from '@/lib/daemon-config';
 import { dispatchHudSegmentEnvelope } from '@/lib/chat-runtime';
 import { restorableChatMessages } from '@/lib/session-restore';
 import { generateSessionId } from '@/lib/daemon-session';
@@ -60,6 +61,7 @@ import {
   isProviderUserMessageVisionCapable,
 } from '@/lib/attachment-content';
 import { NEXUS_URL_MISSING } from '@/lib/nexus-url-missing';
+import { composeTurnText, formatLocalNote, ingestLocalNotes, isLocalNoteId, LOCAL_NOTE_LIMIT_NOTICE } from '@/lib/local-note-attach';
 
 // A route remount can create a new ChatLayout while the previous instance is
 // still uploading the same Share Target payload. Keep one handoff active per
@@ -188,6 +190,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // pushes its meta here; submit drains it into the user text and the
   // message body so the LLM sees both the path list and any caption.
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentMeta[]>([]);
+  // Bare origin: note bodies are read + masked in the browser (no /v1/attachments there).
+  const localNoteText = useRef(new Map<string, string>());
   useEffect(() => {
     shareMountedRef.current = true;
     return () => { shareMountedRef.current = false; };
@@ -428,10 +432,23 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     });
   }, []);
 
+  const attachLocalFiles = async (files: readonly File[]): Promise<void> => {
+    let used = 0;
+    for (const text of localNoteText.current.values()) used += new Blob([text]).size;
+    const { accepted, refused } = await ingestLocalNotes(files, used);
+    for (const note of accepted) localNoteText.current.set(note.meta.id, note.text);
+    if (accepted.length) {
+      handleAttached(accepted.map((note) => note.meta));
+      toast.success(`📎 ${accepted.length === 1 ? accepted[0]!.meta.filename : `${accepted.length}개 파일`} · 비밀 값은 가려서 보냅니다`);
+    }
+    for (const r of refused) toast.error(`${r.filename}: ${r.reason} (${LOCAL_NOTE_LIMIT_NOTICE})`);
+  };
+
   const uploadTransferFiles = async ({ files, tooLarge, tooMany }: ChatFileExtraction): Promise<void> => {
     if (tooLarge) toast.error(`${tooLarge} files exceed the 10 MiB attachment limit`);
     if (tooMany) toast.error(`${tooMany} files exceed the 10-file attachment limit`);
     if (files.length === 0) return;
+    if (isBareWebChatOrigin()) { await attachLocalFiles(files.map((entry) => entry.file)); return; }
     if (!config.baseUrl) {
       toast.error(NEXUS_URL_MISSING);
       return;
@@ -518,6 +535,9 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // 탭 이동 후 돌아와도 리셋되지 않는다. 진행 중 메시지는 덮지 않음.
   useEffect(() => {
     if (!sessionId) return;
+    // bare 핸들 호스트(익명 웹채팅)는 /v1/sessions/store 를 릴레이가 넘기지 않는다(404) —
+    // 복원할 저장 대화도 없으니 부르지 않는다(MK #110935: 진입 직후 «불러오지 못했습니다» 알림).
+    if (isBareWebChatOrigin()) return;
     let alive = true;
     void (async () => {
       try {
@@ -545,6 +565,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
 
   const handleRemoveAttachment = useCallback((id: string): void => {
     setPendingAttachments((prev) => prev.filter((e) => e.id !== id));
+    localNoteText.current.delete(id);
     acknowledgeShareAttachmentIds([id]);
   }, []);
 
@@ -691,7 +712,16 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         `이 모델은 이미지 입력을 지원하지 않습니다 — ${imageAttachments.length}개 이미지가 무시됩니다. (vision 모델로 전환 후 재첨부)`,
       );
     }
-    const notes = nonImageAttachments.filter(isLectureNoteAttachment);
+    const localNotes = nonImageAttachments.filter((e) => isLocalNoteId(e.id) && localNoteText.current.has(e.id));
+    const notes = nonImageAttachments.filter((e) => !isLocalNoteId(e.id) && isLectureNoteAttachment(e));
+    if (nonImageAttachments.some((e) => isLocalNoteId(e.id) && !localNoteText.current.has(e.id))) {
+      // Fail closed: never send a turn that silently lacks an attached note.
+      setPendingAttachments((prev) => mergeAttachments(prev, attached));
+      setComposerPrefill((previous) => ({ text, id: (previous?.id ?? 0) + 1 }));
+      setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-end' }));
+      toast.error('첨부한 노트 본문을 잃었습니다. 노트를 지우고 다시 첨부해 주세요.');
+      return;
+    }
     let extractedNotes: string[] = [];
     if (notes.length > 0) {
       try {
@@ -709,10 +739,11 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         return;
       }
     }
+    extractedNotes = [...localNotes.map((n) => formatLocalNote(n.filename, localNoteText.current.get(n.id)!)), ...extractedNotes];
     const attachLines = nonImageAttachments.filter((e) => !isLectureNoteAttachment(e))
       .map((e) => (e.path ? `[attached] ${e.path}` : ''))
       .filter((line) => line.length > 0);
-    const composedText = [...extractedNotes, ...attachLines, text].filter(Boolean).join('\n\n');
+    const composedText = composeTurnText({ notes: extractedNotes, attachLines, text });
     // Build the multi-part block list when we have images to ship.
     // Q1=B order: text first, then images. Each image fetch is the
     // composer's responsibility — bytes flow through the daemon
@@ -808,7 +839,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     //     실패 (config.baseUrl 변경 race) 시 안전망. Q4=D1 결정 — CV-2
     //     에서 SSE handler 자체 제거 시 fallback 도 함께 제거.
     const acpInst = acpRef.current;
-    const useAcpPath = Boolean(acpInst && sessionId && config.baseUrl);
+    const useAcpPath = Boolean(acpInst && sessionId && config.baseUrl && !isBareWebChatOrigin());
     // Keep the turn's own lease across the session-adoption effect cleanup.
     // The handshake may replace a stale stored id before session/prompt starts.
     let turnAcp: AcpConnection | null = null;
@@ -854,6 +885,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             })),
           });
       acknowledgeSubmittedShareAttachments(attached);
+      for (const e of attached) localNoteText.current.delete(e.id);
       setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-end' }));
       // Replace the placeholder bubble with the finalized message so
       // meta (stopReason) attaches without a flicker.
@@ -1116,6 +1148,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   useEffect(() => {
     if (!sessionId) return;
     if (!config.baseUrl) return;
+    // MK #109711 — bare webchat host has no /v1/acp WS tunnel; SSE path only.
+    if (isBareWebChatOrigin()) return;
     let acp: ReturnType<typeof client.connectAcp> | null = null;
     try {
       // Multi-surface entry (CV-1 Phase E follow-up · 2026-05-07) —
@@ -1247,18 +1281,19 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         <span>공유 파일 업로드 실패: {shareRetryFiles.join(', ') || '공유 파일'}</span>
         <button type="button" onClick={() => { shareHandoffRef.current = null; setShareRetryId(null); setShareRetryFiles([]); setShareRetryNonce((value) => value + 1); }} className="shrink-0 rounded border border-border px-2 py-1 font-medium hover:bg-accent">다시 시도</button>
       </div>}
-      {dropOverlay.visible && <ChatDropOverlay />}
+      {dropOverlay.visible && <ChatDropOverlay local={isBareWebChatOrigin()} />}
       {props.mobileSimple && compact && <MobileChatStatus minimal activity={props.mobileActivity ?? { kind: 'loading' }} decisions={decisionCount} menu={
         <div ref={moreRef} className="relative shrink-0">
           <button type="button" aria-label="채팅 메뉴" aria-expanded={moreOpen} aria-controls="chat-mobile-menu" onClick={() => setMoreOpen((open) => !open)} className="rounded-lg p-1 hover:bg-muted">
             <MoreHorizontal className="h-5 w-5" aria-hidden="true" />
           </button>
           {moreOpen && <div id="chat-mobile-menu" className="absolute right-0 top-full z-50 mt-2 flex max-h-[70dvh] w-[min(19rem,calc(100vw-1rem))] flex-col gap-2 overflow-y-auto rounded-lg border border-border bg-popover p-3 shadow-lg">
-            <nav aria-label="채팅 이동" className="flex gap-3 text-sm">
+            {/* bare 핸들 호스트는 홈·설정 페이지와 대화 목록 서랍을 서빙하지 않는다 — 죽은 이동·무반응 버튼을 두지 않는다(JUD #113224). */}
+            {!isBareWebChatOrigin() && <nav aria-label="채팅 이동" className="flex gap-3 text-sm">
               <Link href="/" className="rounded px-2 py-1 hover:bg-muted">홈</Link>
               <Link href="/settings" className="rounded px-2 py-1 hover:bg-muted">설정</Link>
-            </nav>
-            {props.conversationButton}
+            </nav>}
+            {!isBareWebChatOrigin() && props.conversationButton}
           </div>}
         </div>
       } />}
@@ -1341,6 +1376,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         prefill={composerPrefill}
         attachments={pendingAttachments}
         onAttached={handleAttached}
+        onLocalFiles={isBareWebChatOrigin() ? (files) => { void attachLocalFiles(files); } : undefined}
         onRemoveAttachment={handleRemoveAttachment}
         onListFiles={acpForAsk && sessionId
           ? async (query) => {

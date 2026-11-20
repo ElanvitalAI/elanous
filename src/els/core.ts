@@ -13,7 +13,9 @@ import { randomBytes } from 'node:crypto';
 import { addPane, addTab, findPane, findWorkspace, journalIds, patchPane, upsertWorkspace } from './journal.js';
 import { emptyJournal, paneAddress, type Pane, type PaneState, type SpaceJournal, type Tab, type Workspace } from './space.js';
 import { paneStatus } from './pane-status.js';
+import { tabBadge } from './tab-badge.js';
 import type { Foreground } from './foreground.js';
+import type { SpawnParent } from './server-auth.js';
 import { grepScreens, type GrepHit } from './pane-grep.js';
 import { readUnreadMailBadges } from '../msg/msg-store.js';
 
@@ -34,7 +36,7 @@ export interface ElsPty {
   writeAll?(text: string): Promise<void>;
   bracketedPasteEnabled?(): boolean;
   /** The visible screen; `ansi: true` keeps colours/attributes as SGR sequences (the attach view paints them). */
-  renderScreen(options?: { readonly ansi?: boolean }): Promise<string>;
+  renderScreen(options?: { readonly ansi?: boolean; readonly scrollBack?: number }): Promise<string>;
   onExit(cb: () => void): void;
   /** PTY 출력 구독 — 등록부 어댑터 경유 (src/els/server.ts registryPty). */
   onOutput?(cb: (data: string) => void): { dispose(): void };
@@ -53,9 +55,14 @@ export interface ElsCoreDeps {
   readonly load: () => SpaceJournal;
   readonly save: (journal: SpaceJournal) => void;
   /** `env` carries ELANOUS_ELS_WS (the server adds ELANOUS_ELS_SOCKET) so an eln started in the pane can report its children here. */
-  readonly spawn: (command: readonly string[], cwd: string, title: string, env: Readonly<Record<string, string>>) => ElsPty;
+  readonly spawn: (command: readonly string[], cwd: string, title: string, env: Readonly<Record<string, string>>, parent?: SpawnParent) => ElsPty;
   /** D1a: adopt a pane whose PTY an outside holder still owns after a restart; undefined = it is gone. */
   readonly reattach?: (pane: Pane) => ElsPty | undefined;
+  /** D1b: read (non-destructively) a reboot-orphaned pane's saved screen snapshot (holder's <paneId>.snap.json);
+   *  returns the restored screen, or undefined when none remains. */
+  readonly restoreScreen?: (paneId: string) => string | undefined;
+  /** D1b: delete that snapshot — called only after the journal commit that records its screen succeeded. */
+  readonly consumeScreenSnapshot?: (paneId: string) => void;
   /** Random id candidate; the core retries on a collision. */
   readonly randomId?: (prefix: string) => string;
   /** Clock for the queue settle time (tests). */
@@ -67,6 +74,8 @@ export interface ElsNewInput {
   readonly cwd: string;
   readonly command: readonly string[];
   readonly title?: string;
+  /** Requester's role threaded straight from the server (JUD #39071: direct argument — no queue). */
+  readonly parent?: SpawnParent;
 }
 
 // 출처: ids carry 8 random hex digits (32 bits); retrying this many times on a collision is enough for any journal
@@ -115,6 +124,8 @@ export function createElsCore(deps: ElsCoreDeps) {
   /** `do` lines waiting for a pane whose turn is running (memory only: a restart drops them). */
   const queues = new Map<string, { from: string; text: string; typed?: boolean; audit?: QueueAudit }[]>();
   const lastDelivery = new Map<string, number>();
+  /** ELS-TAB-STATE-BADGE: when this server first knew each pane — the «last event» of a pane that never printed or got a `do`. */
+  const firstSeen = new Map<string, number>();
   /** The terminal size an attached client last asked for (default 80x24). */
   const sizes = new Map<string, { cols: number; rows: number }>();
   /** Panes whose drain step is in flight: one stuck render stops only that pane's queue, never the others'. */
@@ -130,14 +141,20 @@ export function createElsCore(deps: ElsCoreDeps) {
     return run;
   };
 
+  // ELS-DESKTOP-SIDETAB-SUBSCRIBE: a subscriber (the `subscribe` op) is told that the list may have changed; it re-reads `list()`.
+  const changeListeners = new Set<() => void>();
+  const notifyChange = (): void => { for (const listener of [...changeListeners]) { try { listener(); } catch { /* a listener never breaks a mutation */ } } };
+
   /** Save `next`, then make it the truth. A failed save leaves memory and the file as they were (used by `new`). */
   const commit = (next: SpaceJournal): void => {
     deps.save(next);
     journal = next;
+    notifyChange();
   };
   /** Make `next` the truth, then save it. A failed save is reported; memory keeps the change for the next save. */
   const persist = (next: SpaceJournal): string | undefined => {
     journal = next;
+    notifyChange();
     try { deps.save(next); return undefined; } catch (error) { return message(error); }
   };
 
@@ -250,12 +267,42 @@ export function createElsCore(deps: ElsCoreDeps) {
       const gone = new Set(loaded.panes.filter((pane) => pane.kind === 'harness-child').map((pane) => pane.tabId));
       const kept: SpaceJournal = gone.size === 0 ? loaded : { ...loaded, tabs: loaded.tabs.filter((tab) => !gone.has(tab.id)),
         panes: loaded.panes.filter((pane) => pane.kind !== 'harness-child') };
+      // D1b: panes the reboot ended with a saved screen. The screen goes into the same journal commit that marks
+      // the pane exited; the snapshot files are consumed only after that commit succeeded, so a failed save
+      // leaves the original on disk and the next start recovers the same screen.
+      const consumable: string[] = [];
+      // A restore that returns undefined, an empty screen or throws did not apply anything: never consumed.
+      const safeRestore = (paneId: string): string | undefined => {
+        try { const screen = deps.restoreScreen?.(paneId); return screen === undefined || screen === '' ? undefined : screen; } catch { return undefined; }
+      };
       const restarted: SpaceJournal = { ...kept, panes: kept.panes.map((pane) => {
-        if (pane.ptyId === '') return pane;
+        if (pane.ptyId === '') {
+          // D1b: a pane that already has no PTY may still have the holder's screen file. When the journal holds a
+          // recorded screen the file is only a leftover — dropped after the commit. When the recorded screen is empty
+          // (an adopted holder that never answered: its exit carried no final screen) the file is the only copy, so
+          // it is applied into the scrollback in this commit and consumed only after that commit succeeded.
+          // Consume only after applied: an undefined / empty / throwing restore (a transient read error) is "not
+          // applied" — the file stays and the next start retries.
+          if (pane.scrollback !== '') { consumable.push(pane.id); return pane; }
+          const saved = safeRestore(pane.id);
+          if (saved === undefined) return pane;
+          consumable.push(pane.id);
+          return { ...pane, scrollback: saved };
+        }
         // D1a: a pane whose PTY an outside holder still owns is adopted as it is (ptyId and state intact); without
         // a holder — or with a dead one — the pane loses its PTY exactly as before.
         const adopted = pane.state === 'exited' ? undefined : deps.reattach?.(pane);
-        if (!adopted) return { ...pane, ptyId: '', state: pane.state === 'exited' ? 'exited' : 'idle' };
+        if (!adopted) {
+          // D1b: no holder answers and no meta remains (a reboot took the holder away). For a live pane the
+          // snapshot is its last screen — the pane ended with the reboot and shows it; for an already exited
+          // pane the recorded final screen stays and the stale file is dropped (after the commit).
+          const restored = safeRestore(pane.id);
+          if (restored !== undefined) {
+            consumable.push(pane.id);
+            if (pane.state !== 'exited') return { ...pane, ptyId: '', state: 'exited', scrollback: restored };
+          }
+          return { ...pane, ptyId: '', state: pane.state === 'exited' ? 'exited' : 'idle' };
+        }
         ptys.set(pane.id, adopted);
         const adoptedId = adopted.id;
         adopted.onExit(() => {
@@ -269,6 +316,10 @@ export function createElsCore(deps: ElsCoreDeps) {
         else journal = restarted;
       } catch (error) {
         return { exitCode: 1, message: `els serve: cannot save the journal: ${message(error)}` };
+      }
+      // D1b: the journal holds the screens — only now are the snapshot files consumed.
+      for (const paneId of consumable) {
+        try { deps.consumeScreenSnapshot?.(paneId); } catch { /* a leftover file is harmless; the pane is exited */ }
       }
       return undefined;
     },
@@ -288,7 +339,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         paneId = freshId('p', taken);
       } catch (error) { return { exitCode: 1, message: `els new: ${message(error)}` }; }
       let pty: ElsPty;
-      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name, ELANOUS_ELS_PANE: paneId }); }
+      try { pty = deps.spawn(input.command, input.cwd, label, { ELANOUS_ELS_WS: ws.name, ELANOUS_ELS_PANE: paneId }, input.parent); }
       catch (error) { return { exitCode: 1, message: `els new: failed to spawn: ${message(error)}` }; }
       let address = '';
       try {
@@ -296,6 +347,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         const pane: Pane = { id: paneId, tabId, kind: 'pty', title: label, cwd: input.cwd, command: input.command,
           state: 'working', restore: 'cwd', ptyId: pty.id, scrollback: '' };
         address = paneAddress(ws, tab, pane);
+        firstSeen.set(pane.id, now());
         commit(addPane(addTab(existing ? journal : upsertWorkspace(journal, ws), tab), pane));
       } catch (error) {
         // Nothing records this PTY: stop it rather than leave an unlisted process.
@@ -316,6 +368,12 @@ export function createElsCore(deps: ElsCoreDeps) {
       if (!pane || !livePty(pane) || !/^[a-f0-9]{40}$/i.test(sha)) return { exitCode: 1, message: 'els build: invalid pane or sha' };
       builds.set(paneId, { sha: sha.toLowerCase(), seen: now() });
       return { exitCode: 0, message: 'els build: recorded' };
+    },
+
+    /** The list may have changed (any journal change or a pane's foreground kind). The callback must be cheap. */
+    onChange(listener: () => void): { dispose(): void } {
+      changeListeners.add(listener);
+      return { dispose: () => { changeListeners.delete(listener); } };
     },
 
     list(): ElsResult {
@@ -339,7 +397,18 @@ export function createElsCore(deps: ElsCoreDeps) {
           age: buildAge(sha, desired, gitAncestor) };
         const seat = seatOf(pane.cwd);
         const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
-        return [{ build, address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
+        // ELS-TAB-STATE-BADGE: the badge is the contract state; a working pane with no output, `do` or first sight for the
+        // stall window reads `stalled`. The server computes it (one clock), so every client — `els ls`, sidetab — shows the same.
+        const listedState = pane.state === 'exited' ? 'exited' : live ? pane.state : 'idle';
+        if (!firstSeen.has(pane.id)) firstSeen.set(pane.id, now());
+        // Last-event policy: the REAL last event wins — the PTY's own lastOutputAt (a reattached holder pane keeps the output
+        // time it really had before this server restarted) or the last `do` delivered, whichever is later. firstSeen
+        // (the first time THIS server run saw the pane) is only the floor for a pane with no real event at all (never
+        // printed, no `do`, no timestamp from its PTY); it never overrides an older real output. Memory only, nothing persisted.
+        const realEventAtMs = Math.max(live?.lastOutputAt?.() ?? 0, lastDelivery.get(pane.id) ?? 0);
+        const lastEventAtMs = realEventAtMs > 0 ? realEventAtMs : firstSeen.get(pane.id)!;
+        const badge = tabBadge({ state: listedState, lastEventAtMs }, now());
+        return [{ build, lastEventAtMs, badge: badge.state, badgeLabel: badge.label, stalled: badge.stalled, address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
           cwd: pane.cwd, command: pane.command, state: pane.state === 'exited' ? 'exited' : live ? pane.state : 'idle',
           ptyId: live ? pane.ptyId : '', restore: pane.restore, seat, unreadMail,
           ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}) }];
@@ -453,12 +522,12 @@ export function createElsCore(deps: ElsCoreDeps) {
 
     /** The pane's screen for an attached view: ANSI-coloured while the PTY runs, the saved text otherwise. Unlike `read` it
      *  never writes the journal — an attach asks ten times a second. */
-    async frame(ref: string): Promise<ElsResult> {
+    async frame(ref: string, scrollBack = 0): Promise<ElsResult> {
       const hit = resolve(ref);
       if (!hit) return { exitCode: 1, message: `els attach: unknown pane ${ref}` };
       const pty = livePty(hit.pane);
       if (!pty) return { exitCode: 0, message: hit.pane.scrollback };
-      try { return { exitCode: 0, message: await pty.renderScreen({ ansi: true }) }; }
+      try { return { exitCode: 0, message: await pty.renderScreen({ ansi: true, ...(scrollBack > 0 ? { scrollBack } : {}) }) }; }
       catch (error) { return { exitCode: 1, message: `els attach: cannot render ${hit.pane.id}: ${message(error)}` }; }
     },
 
@@ -482,6 +551,13 @@ export function createElsCore(deps: ElsCoreDeps) {
     /** The pane's id when `ref` names one (attach checks this before it opens a stream). */
     paneExists(ref: string): string | undefined {
       return resolve(ref)?.pane.id;
+    },
+
+    /** #38608 REVIEW must ① — the journal's answer to «which workspace holds this pane». A caller's workspace
+     *  is a claim the executor checks against this truth; never the other way round. */
+    workspaceOf(ref: string): { readonly id: string; readonly name: string } | undefined {
+      const hit = resolve(ref);
+      return hit ? { id: hit.ws.id, name: hit.ws.name } : undefined;
     },
 
     async read(ref: string): Promise<ElsResult> {
@@ -548,8 +624,10 @@ export function createElsCore(deps: ElsCoreDeps) {
     /** Set what each probed pane runs now; panes not in `next` are forgotten. Returns the panes whose kind changed. */
     setForegrounds(next: ReadonlyMap<string, Foreground>): string[] {
       const changed = [...next].filter(([pane, fg]) => foregrounds.get(pane)?.kind !== fg.kind).map(([pane]) => pane);
+      const forgotten = [...foregrounds.keys()].some((pane) => !next.has(pane));
       foregrounds.clear();
       for (const [pane, fg] of next) foregrounds.set(pane, fg);
+      if (changed.length > 0 || forgotten) notifyChange();
       return changed;
     },
 
@@ -604,7 +682,11 @@ export function createElsCore(deps: ElsCoreDeps) {
       });
     },
 
-    async send(ref: string, text: string): Promise<ElsResult> {
+    async send(ref: string, rawText: string): Promise<ElsResult> {
+      // #38608 REVIEW must ② — `send` types machine-composed TEXT into the pane: clean() drops every control
+      // byte, so a caller cannot press Enter, inject an escape or hit ctrl-c through it. The raw person path
+      // is `input` (attach, `els pane send-keys`/`run`), which no HTTP door reaches.
+      const text = clean(rawText);
       const hit = resolve(ref);
       if (!hit) return { exitCode: 1, message: `els send: unknown pane ${ref}` };
       const pty = livePty(hit.pane);

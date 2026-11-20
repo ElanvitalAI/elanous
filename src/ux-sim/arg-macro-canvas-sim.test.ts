@@ -6,7 +6,7 @@ import { parse as parseYaml } from 'yaml';
 import { createGraphEventBus, type GraphEvent } from '../graph-runner/graph-events.js';
 import { decideGraphApproval, runGraph, type GraphRunOptions } from '../graph-runner/runner.js';
 import { createMacrophageRuntime } from '../release-loop/macrophage-heal-node.js';
-import { runMacrophageHeal } from '../release-loop/macrophage-heal.js';
+import { runMacrophageHeal, type MacrophageAction } from '../release-loop/macrophage-heal.js';
 import { planMacrophageIncident } from '../release-loop/macrophage-incident-recovery.js';
 import { planMacrophageRepairLadder } from '../release-loop/macrophage-repair-ladder.js';
 import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
@@ -17,7 +17,7 @@ type Scenario = {
   canvas: { graph: string; macrophage: string; graphId: string; runId: string };
   inject: { failureId: string; commit: string };
   expect: {
-    declared: { gateFailure: string; macrophageWake: { event: string; nodeId: string; action: string }; argReturn: string };
+    declared: { gateFailure: string; gateFailureRoute: string; macrophageWake: { event: string; nodeId: string; action: string }; argReturn: string };
     macrophage: { sourceNode: string; signature: string };
     path: { beforeResume: string[]; afterResume: string[] };
   };
@@ -50,8 +50,11 @@ test('ARG and macrophage follow the declared release canvas through append and s
   const gateEdge = graph.edges.find((edge) => edge.from === 'gate' && edge.on === 'outcome');
   const gateFailureRoute = gateEdge?.map?.fail;
   const argAppendNode = scenario.expect.path.beforeResume.at(-1)!;
-  const normalEmergencyRoute = graph.edges.find((edge) => edge.from === gateFailureRoute && edge.on === 'outcome');
-  expect(gateFailureRoute).toBe('emergency-switch');
+  // Declared canvas: a failed gate now drains the cloud-leave cutover hop before the emergency
+  // switch, and the emergency switch keeps the stay-normal route that appends the ARG node.
+  const emergencySwitchId = graph.edges.find((edge) => edge.from === gateFailureRoute && edge.on === 'outcome')?.map?.ok;
+  const normalEmergencyRoute = graph.edges.find((edge) => edge.from === emergencySwitchId && edge.on === 'outcome');
+  expect(gateFailureRoute).toBe(scenario.expect.declared.gateFailureRoute);
   expect(normalEmergencyRoute?.map?.['stay-normal']).toBe(argAppendNode);
   expect(scenario.expect.declared.gateFailure).toBe(argAppendNode);
   const wake = subscriber.nodes.flatMap((node) => node.subscribes ?? []).find((item) =>
@@ -85,6 +88,10 @@ test('ARG and macrophage follow the declared release canvas through append and s
     if (command.includes('gate-repair-node.ts')) {
       repairVisits++;
       return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail' }), stderr: 'injected repair failure' };
+    }
+    // gate-cutover-switch routes on legacy/audit, not the generic ok outcome (see release-branch.test.ts).
+    if (command.includes('gate-cutover-switch-node.ts')) {
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy' }), stderr: '' };
     }
     return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
   };
@@ -130,7 +137,9 @@ test('ARG and macrophage follow the declared release canvas through append and s
 const fiveIncidentScenario = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/arg-macro-canvas.yaml'), 'utf8')) as {
   manifest: ArgMacroCanvasManifest;
   cases: Array<ArgMacroCanvasIncident & { id: string; simulatedTerminal: 'healed' | 'hitl'; expect: {
-    macrophageAction: string; policy: { label: string; step: string }; ladder: { action: string; step: string };
+    macrophageAction: MacrophageAction;
+    policy: Pick<ReturnType<typeof planMacrophageIncident>, 'label' | 'step'>;
+    ladder: Pick<ReturnType<typeof planMacrophageRepairLadder>, 'action' | 'step'>;
   } }>;
 };
 
@@ -152,9 +161,9 @@ for (const item of fiveIncidentScenario.cases) {
     if (item.simulatedTerminal === 'healed') {
       expect(append).toBeDefined();
       expect(append?.afterNodeId).toBe(item.afterNodeId);
-      expect(result.graph.nodes).toEqual(append?.proposal.nodes);
+      expect(result.graph.nodes).toEqual(append!.proposal.nodes);
       expect(result.graph.edges).toContainEqual({ from: item.afterNodeId, to: append?.proposal.entryNodeId });
-      expect(result.graph.edges).toContainEqual(append?.proposal.edges[0]);
+      expect(result.graph.edges).toContainEqual(append!.proposal.edges[0]!);
       expect(result.graph.nodes[0]?.recipe).toBe(item.recipe);
       expect(append?.proposal.edges[0]?.map).toEqual({ ok: fiveIncidentScenario.manifest.rejoinNode,
         fail: fiveIncidentScenario.manifest.hitlNode, error: fiveIncidentScenario.manifest.hitlNode });

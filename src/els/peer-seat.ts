@@ -110,3 +110,35 @@ export async function resolvePeerSeat(pid: number | undefined, baseline?: Proces
     return { pane: selected.pane, seat: selected.seat };
   } catch { return; }
 }
+
+/** JUD #39096 must ⓒ (OP #106966·#107197): 무토큰 연결의 프로세스 조상에 els pane 셸이 있으면
+ *  그 호출자는 사람이 아니라 pane 프로세스(손)다. resolvePeerSeat 은 seat-panes.tsv 원장의
+ *  herdr pane(OP/RES-INFRA)만 보므로, els pane 자손은 이 검사로 막는다. */
+export async function resolveAncestorPane(
+  pid: number | undefined,
+  baseline: ProcessIdentity | undefined,
+  shellPids: readonly { pane: string; pid: number }[],
+  deps: { identity: (pid: number) => ProcessIdentity | undefined } = resolverDeps,
+): Promise<{ pane: string } | undefined> {
+  try {
+    if (!pid) return;
+    const shells = new Map<number, string>();
+    for (const entry of shellPids) shells.set(entry.pid, entry.pane);
+    if (!shells.size) return;
+    // 피어 자신이 pane 셸 프로세스인 경우는 baseline 없이도 확정적이다 (procIdentity FFI 불가 환경 포함).
+    if (shells.has(pid)) return { pane: shells.get(pid)! };
+    const origin = baseline ?? deps.identity(pid);
+    if (!origin || origin.pid !== pid) return;
+    let p = origin.ppid, steps = 0;
+    while (p > 1 && steps++ < 128) {
+      if (shells.has(p)) return { pane: shells.get(p)! };
+      const item = deps.identity(p);
+      if (!item) return;
+      if (item.session !== origin.session || item.tty !== origin.tty) return;
+      if (p === origin.session) return;
+      if (item.ppid >= p) return;
+      p = item.ppid;
+    }
+    return;
+  } catch { return; }
+}

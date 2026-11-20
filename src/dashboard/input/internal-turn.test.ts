@@ -41,6 +41,37 @@ function harness(over: Partial<InternalTurnGateDeps> = {}) {
   return { gate, state, logs, mount, yields: () => yields };
 }
 
+describe('noteTurnStarted — 매 실제 턴은 고유한 id (SCHEDULE-WAKEUP-TURN-CAP)', () => {
+  test('문을 안 거친 턴(알림·우편)은 새 id · 사람/내부 턴은 연 id 를 한 번만 묶는다', () => {
+    const h = harness();
+    h.mount();
+    expect(h.gate.noteTurnStarted()).toBe('turn-1'); // 아무 턴도 없던 세션의 첫 알림 턴
+    expect(h.gate.noteHumanTurn()).toBe('human-2');
+    expect(h.gate.noteTurnStarted()).toBe('human-2');
+    h.gate.noteTurnSettled();
+    expect(h.gate.noteTurnStarted()).toBe('turn-3'); // 우편 알림 턴 — human-2 가 남지 않는다
+    expect(h.gate.noteTurnStarted()).toBe('turn-4');
+    expect(h.gate.isInternalTurnActive()).toBe(false);
+    expect(h.gate.startTurnIfIdle('깨움', { origin: 'scheduled' })).toEqual({ opened: true, turnId: 'auto-5' });
+    expect(h.gate.takePending()?.turnId).toBe('auto-5');
+    expect(h.gate.noteTurnStarted()).toBe('auto-5');
+    expect(h.gate.isInternalTurnActive()).toBe(true);
+    expect(h.gate.lastTurnId()).toBe('auto-5');
+  });
+
+  test('열었다 거둔 내부 턴은 직전 id 의 묶임 상태를 되돌린다', () => {
+    const h = harness();
+    h.mount();
+    h.gate.noteHumanTurn();
+    expect(h.gate.noteTurnStarted()).toBe('human-1');
+    h.gate.noteTurnSettled();
+    expect(h.gate.startTurnIfIdle('깨움', { origin: 'scheduled' }).opened).toBe(true);
+    expect(h.gate.withdrawPendingTurn('auto-2')).toBe(true);
+    expect(h.gate.lastTurnId()).toBe('human-1');
+    expect(h.gate.noteTurnStarted()).toBe('turn-3'); // human-1 은 이미 묶였다 — 재사용 금지
+  });
+});
+
 describe('startTurnIfIdle — 내부 턴 문 판정', () => {
   test('MSG-SOURCE: agent from 은 요청에 실리고 사람·system from 은 싣지 않는다(구조 칸만)', () => {
     const h = harness();

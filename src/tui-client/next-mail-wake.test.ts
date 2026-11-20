@@ -335,3 +335,94 @@ describe('#38219 REVIEW-2 ① — a mail turn that keeps ending with no answer b
     wake.dispose();
   });
 });
+
+describe('ELN-SEAT-AUTOWAKE-BUDGET — synthetic: budget spent → held → +1 day → resumed', () => {
+  const DAY1 = Date.UTC(2026, 10, 19, 10, 0, 0);
+  const DAY2 = DAY1 + 86_400_000;
+  test('spent budget holds the wake (0 turns, 1 event, mail untouched); the next day opens it once', () => {
+    let clock = DAY1;
+    const turns: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    const usage = (now: Date) => ({ budget: 100, used: now.toISOString().startsWith('2026-11-19') ? 100 : 0 });
+    const wake = createNextMailWake({
+      seat: 'R-TICKET', enabled: true, intervalMs: 60_000, now: () => clock,
+      readUnread: () => ({ count: 1, maxId: 9 }), readBudgetUsage: usage,
+      startTurnIfIdle: text => { turns.push(text); return { opened: true, turnId: 'auto-b' }; },
+      log: (event, data) => { if (data.reason === 'token-budget') events.push({ event, ...data }); },
+    });
+    wake.poll(); wake.poll();
+    expect(turns).toHaveLength(0);
+    expect(events).toEqual([{ event: 'rejected', seat: 'R-TICKET', maxId: 9, count: 1, reason: 'token-budget', budget: 100, used: 100 }]);
+    clock = DAY2;
+    wake.poll();
+    expect(turns).toHaveLength(1);
+    wake.dispose();
+  });
+
+  test('no budget (null) keeps the old behaviour; an unreadable budget fails open with a warning', () => {
+    const turns: string[] = [];
+    const errors: string[] = [];
+    for (const readBudgetUsage of [() => null, () => { throw new Error('ledger down'); }]) {
+      const wake = createNextMailWake({
+        seat: 'R-TICKET', enabled: true, intervalMs: 60_000, readBudgetUsage,
+        readUnread: () => ({ count: 1, maxId: 9 }),
+        startTurnIfIdle: text => { turns.push(text); return { opened: true, turnId: 'auto-c' }; },
+        log: event => { if (event === 'budget-read-error') errors.push(event); },
+      });
+      wake.poll();
+      wake.dispose();
+    }
+    expect(turns).toHaveLength(2);
+    expect(errors).toEqual(['budget-read-error']);
+  });
+
+  test('default supply: no budget file / invalid budget → the usage ledger provider is called 0 times (spy)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'wake-budget-'));
+    try {
+      const dir = join(home, 'elanous-hq', 'seat-state', 'R-TICKET');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'autowake'), '');
+      for (const budgetFile of [null, 'abc']) {
+        if (budgetFile !== null) writeFileSync(join(dir, 'autowake-budget'), budgetFile);
+        let ledgerCalls = 0;
+        const turns: string[] = [];
+        const wake = createNextMailWake({
+          seat: 'R-TICKET', home, intervalMs: 60_000, readUnread: () => ({ count: 1, maxId: 9 }),
+          readBudgetLedger: () => { ledgerCalls++; return []; },
+          startTurnIfIdle: text => { turns.push(text); return { opened: true, turnId: 'auto-d' }; }, log: () => {},
+        });
+        wake.poll();
+        expect(ledgerCalls).toBe(0);
+        expect(turns).toHaveLength(1);
+        wake.dispose();
+      }
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('default supply with a valid budget: spent → held; ledger unavailable → let through, warned once per day', () => {
+    const home = mkdtempSync(join(tmpdir(), 'wake-budget-'));
+    try {
+      const dir = join(home, 'elanous-hq', 'seat-state', 'R-TICKET');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'autowake'), '');
+      writeFileSync(join(dir, 'autowake-budget'), '100');
+      const row = { day: '2026-11-19', seat: 'R-TICKET', role: 'agent', site: 'agent-turn', inputTokens: 90, outputTokens: 10 };
+      let rows: typeof row[] | null = [row];
+      const turns: string[] = [];
+      const warnings: string[] = [];
+      const wake = createNextMailWake({
+        seat: 'R-TICKET', home, intervalMs: 60_000, now: () => DAY1, readUnread: () => ({ count: 1, maxId: 9 }),
+        readBudgetLedger: () => rows,
+        startTurnIfIdle: text => { turns.push(text); return { opened: true, turnId: 'auto-e' }; },
+        log: event => { if (event === 'budget-read-error') warnings.push(event); },
+      });
+      wake.poll();
+      expect(turns).toHaveLength(0);
+      rows = null;
+      wake.poll(); wake.poll(); // delivery is never confirmed here, so each let-through poll opens a turn
+      expect(turns).toHaveLength(2);
+      expect(warnings).toEqual(['budget-read-error']);
+      wake.dispose();
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+});

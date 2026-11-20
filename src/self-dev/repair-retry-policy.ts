@@ -8,7 +8,9 @@
  * same config and cannot pass. Those are skipped and reported; everything else keeps the one repair as before.
  */
 
-export type DeterministicFailureClass = 'no-usable-provider' | 'provider-not-allowed';
+import { isNoReviewProviderText } from './no-review-provider.js';
+
+export type DeterministicFailureClass = 'no-usable-provider' | 'provider-not-allowed' | 'no-review-provider';
 
 /**
  * Skip reasons that come from configuration, so a retry meets them again. Source: src/llm.ts FallbackCandidateSkipReason
@@ -32,6 +34,9 @@ export function noUsableProviderReasons(text: string): string[] | null {
 
 export function repairRetryVerdict(errorCode: string | undefined, errorMessage: string | undefined): RepairRetryVerdict {
   const text = `${errorCode ?? ''}: ${errorMessage ?? ''}`;
+  // TA-POD-REVIEW-PROVIDER-ALLOW: a review chain exhausted before any call (`role-chain-exhausted: <role>: …` or the
+  // `no-review-provider:` marker) is decided by configuration and credentials; the repair Job meets the same chain.
+  if (isNoReviewProviderText(text)) return { retry: false, failureClass: 'no-review-provider' };
   const reasons = noUsableProviderReasons(text);
   if (reasons !== null) {
     // Deterministic only when EVERY provider was ruled out by configuration; one transient reason keeps the repair.

@@ -51,6 +51,7 @@ import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.j
 import { runShellCapsule, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
 import { readUserConfigObject } from '../../user-config/read.js';
 import { userConfigPath } from '../../user-config.js';
+import { terminateTree } from '../../shell-primitive/terminate-tree.js';
 import {
   createSeqTracker,
   makeEnvelope,
@@ -351,29 +352,20 @@ export async function dispatchBash(
       },
     });
 
-    // Kill the child's whole process group (negative pid). Falls back to a
-    // direct child kill if the group signal fails (e.g. child already gone).
-    const killTree = (sig: NodeJS.Signals): void => {
-      try {
-        if (typeof child.pid === 'number') process.kill(-child.pid, sig);
-        else child.kill(sig);
-      } catch {
-        try { child.kill(sig); } catch { /* already gone */ }
-      }
-    };
-
-    // Stop the exact child's own process group: SIGTERM → SIGKILL after the grace. If an
-    // escaped grandchild (setsid/daemon) still holds the output pipe, 'close' never comes —
-    // force the result after a second grace so the tool cannot hang past its limit (A201).
+    // Stop the exact child's own process group via the shared terminateTree (KILL-TREE-ONE):
+    // SIGTERM → grace → SIGKILL while the group is still present. Each signal that is actually
+    // sent is a tool.watchdog event, in order. If an escaped grandchild (setsid/daemon) still
+    // holds the output pipe, 'close' never comes — force the result after a second grace so
+    // the tool cannot hang past its limit (A201).
     const stopChild = (): void => {
-      // Observation: each step of the stop path is a tool.watchdog event, in order.
-      debug.log('tool.watchdog', 'kill', { tool: 'Bash', signal: 'SIGTERM', pid: child.pid ?? null });
-      killTree('SIGTERM');
-      setTimeout(() => {
-        if (settled) return;
-        debug.log('tool.watchdog', 'kill', { tool: 'Bash', signal: 'SIGKILL', pid: child.pid ?? null });
-        killTree('SIGKILL');
-      }, SHELL_KILL_GRACE_MS).unref();
+      void terminateTree(child, {
+        group: true,
+        graceMs: SHELL_KILL_GRACE_MS,
+        sendSignal: (addr, sig) => {
+          if (sig === 'SIGTERM' || sig === 'SIGKILL') debug.log('tool.watchdog', 'kill', { tool: 'Bash', signal: sig, pid: child.pid ?? null });
+          process.kill(addr, sig);
+        },
+      });
       setTimeout(() => {
         if (settled) return;
         debug.log('tool.watchdog', 'forced-close', { tool: 'Bash', pid: child.pid ?? null });

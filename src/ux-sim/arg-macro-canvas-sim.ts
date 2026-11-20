@@ -115,7 +115,7 @@ export function runArgMacroCanvasSim(input: {
     const depth = item.depth ?? 1;
     const allowed = manifest.appendAfter.includes(item.afterNodeId)
       && manifest.appendRecipes.includes(item.recipe) && manifest.allowRecipes.includes(item.recipe)
-      && action !== 'retain' && Number.isSafeInteger(depth) && depth > 0 && depth <= manifest.maxDepth
+      && Number.isSafeInteger(depth) && depth > 0 && depth <= manifest.maxDepth
       && appended.length < manifest.allowance;
     if (!allowed) {
       edges.push({ from: item.afterNodeId, to: manifest.hitlNode });

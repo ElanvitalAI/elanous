@@ -32,6 +32,10 @@ export interface Principal {
   readonly kind: PrincipalKind;
   readonly callerPane?: string;
   readonly callerSeat?: string;
+  /** ELS-OP-ALLOW-RULE: seat identity the transport vouches for ('OP' or a seat name). The coded default rules key on this. */
+  readonly seat?: string;
+  /** ELS-OP-ALLOW-RULE: workspaces the transport vouches the seat owns; hand seats may control only these. */
+  readonly workspaces?: readonly string[];
 }
 
 export interface ControlTarget {
@@ -78,6 +82,8 @@ export interface ControlExecuteInput {
   readonly confirm?: boolean;
   /** Forward to core.inputLine for queued delivery lifecycle auditing. */
   readonly queueAudit?: QueueAudit;
+  /** The transport's original path (#38453 REVIEW must ④): `/els/v1/send` stays distinguishable from `/els/v1/do`. */
+  readonly path?: string;
 }
 
 export interface ControlExecuteResult {
@@ -132,6 +138,11 @@ export type ControlOutcome =
 
 const AUDIT_NAME = 'control-audit.jsonl';
 const ALLOW_NAME = 'control-allow.json';
+
+/** #90792 P0 ③ — panes this process is asking a person about, keyed `<stateDir>\u0000<pane>`: while the ask is in
+ *  flight, the send family (action `do` — send-text and send-keys at this door) is refused for that pane. The wait
+ *  lives in this door (measured: neither core nor the journal records a pending approval), so the guard lives here. */
+const PENDING_ASKS = new Set<string>();
 
 /** One allow-list row, or undefined when the row is not a rule or a name in it does not resolve. */
 function parseRule(value: unknown, resolve: IdResolver | undefined): AllowRule | undefined {
@@ -226,6 +237,27 @@ export function authorize(rules: readonly AllowRule[], principal: Principal, tar
     && matches(rule.pane, target.pane)
     && (rule.tab === undefined || (target.tab !== undefined && matches(rule.tab, target.tab)))
     && rule.actions.includes(action));
+}
+
+/** ELS-OP-ALLOW-RULE(ELS-OP-SMALLWINS ⑦): actions that destroy or relocate work — they need an explicit human confirmation marker or nothing moves. Guards close/move wherever the vocabulary lands (#39025 짝). */
+export const CONFIRM_REQUIRED_ACTIONS: ReadonlySet<string> = new Set(['close', 'move']);
+
+/**
+ * ELS-OP-ALLOW-RULE: coded default rules (옵션 0 · 기본 동작). File rules (control-allow.json) stay
+ * authoritative; these defaults fill the gap when the file is silent:
+ * OP seat → every pane; hand seats → only their own bound workspaces; close/move → human
+ * confirmation marker; anything else → deny with audit. Null when the principal carries no seat identity.
+ */
+export function defaultDecision(principal: Principal, target: ControlTarget, action: ControlAction, confirmed: boolean): { readonly allow: boolean; readonly reason: string } | null {
+  if (!principal.seat) return null;
+  if (CONFIRM_REQUIRED_ACTIONS.has(action) && !confirmed) return { allow: false, reason: `${action} needs confirm:true (human confirmation)` };
+  if (principal.seat === 'OP') return { allow: true, reason: 'default rules: OP seat commands all panes' };
+  if (principal.seat.startsWith('HAND-')) {
+    const own = principal.workspaces ?? [];
+    if (!own.includes(target.workspace)) return { allow: false, reason: `default rules: seat ${principal.seat} may control only its own workspaces (target ${target.workspace} not bound)` };
+    return { allow: true, reason: `default rules: hand seat ${principal.seat} controls its own workspace ${target.workspace}` };
+  }
+  return null;
 }
 
 interface DangerRule { readonly reason: string; readonly re: RegExp }
@@ -351,6 +383,43 @@ function defaultAppend(path: string, line: string): void {
   appendFileSync(path, line, { mode: 0o600 });
 }
 
+/** Surfaces that refuse before the door (bad signature, replayed nonce) still write one audit line here. Nothing runs, so best effort. */
+export function audit(stateDir: string, entry: Record<string, unknown>): void {
+  try {
+    defaultAppend(join(stateDir, AUDIT_NAME), `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
+  } catch (error) {
+    process.stderr.write(`els: control audit not written: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+/**
+ * #90792 P0 ④ — one audit line per send-family execution that reaches the owner directly over its socket
+ * (`els pane send-text` / `send-keys` / `run`, `els send --no-enter`): the same ledger, the same line shape and
+ * the same no-raw-text rule as the door's own lines — the text only as its length and its sha256.
+ */
+export function appendSendAudit(stateDir: string, send: {
+  readonly op: 'send' | 'input';
+  readonly pane: string;
+  readonly text: string;
+  readonly exitCode: 0 | 1 | 2;
+  readonly workspace?: string;
+}): string | undefined {
+  try {
+    defaultAppend(join(stateDir, AUDIT_NAME), `${JSON.stringify({
+      ts: new Date().toISOString(),
+      principal: 'local', kind: 'cli',
+      ...(send.workspace ? { workspace: send.workspace } : {}),
+      pane: send.pane, action: send.op, chars: send.text.length, sha256: sha256(send.text), at: Date.now(),
+      result: send.exitCode === 0 ? 'executed' : 'executor-refused', exitCode: send.exitCode,
+    })}\n`);
+    return undefined;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`els: send audit not written: ${reason}\n`);
+    return reason;
+  }
+}
+
 /**
  * The one door. `execute` runs only after authorize, after HITL when the shell line is dangerous, and after the
  * audit intent line is on disk. Every exit writes an audit line (best effort when nothing runs).
@@ -369,7 +438,7 @@ export function createControl(deps: ControlDeps) {
     }
   };
   return {
-    async run(input: { readonly principal: Principal; readonly from?: string; readonly action: ControlAction; readonly target: ControlTarget; readonly text?: string; readonly struct?: StructPayload; readonly confirm?: boolean }): Promise<ControlOutcome> {
+    async run(input: { readonly principal: Principal; readonly from?: string; readonly action: ControlAction; readonly target: ControlTarget; readonly text?: string; readonly struct?: StructPayload; readonly confirm?: boolean; readonly path?: string }): Promise<ControlOutcome> {
       const text = input.text ?? '';
       // Input is delivered as a sanitized line; audit that line consistently throughout its lifecycle.
       const auditedText = input.action === 'input' ? clean(text) : text;
@@ -393,6 +462,11 @@ export function createControl(deps: ControlDeps) {
         const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason });
         if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
         return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied (${reason})` };
+      }
+      if (CONFIRM_REQUIRED_ACTIONS.has(input.action) && input.confirm !== true) {
+        const reason = `${input.action} needs confirm:true (human confirmation)`;
+        audit({ ...base, result: 'denied', danger: 'n/a', reason });
+        return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied for ${input.principal.id} (${reason})` };
       }
       // OP #17: a shell-pane `input` line is danger-gated FIRST (fail closed — a dangerous line is held before
       // any allow question, same gate as `do`); the builtin seat default then decides the rest.
@@ -422,9 +496,11 @@ export function createControl(deps: ControlDeps) {
         && (rule.seat === undefined || rule.seat === principal.callerSeat));
       const permitted = input.action === 'input' ? inputDefault && !inputDenied
         : authorize(rules, principal, input.target, input.action);
+      // ELS-OP-ALLOW-RULE: coded defaults fill the gap when control-allow.json is silent (input keeps its builtin rule).
+      const coded = input.action === 'input' ? null : (permitted ? null : defaultDecision(principal, input.target, input.action, input.confirm === true));
       const authorization = input.action === 'input' && inputDefault && !inputDenied ? 'builtin-input' : undefined;
-      if (!permitted) {
-        const reason = inputDenied ? 'explicit input deny' : 'not in control-allow.json';
+      if (!permitted && !coded?.allow) {
+        const reason = input.action === 'input' ? (inputDenied ? 'explicit input deny' : 'not in control-allow.json') : (coded?.reason ?? 'not in control-allow.json');
         const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason });
         if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
         return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied for ${input.principal.id} (${reason})` };
@@ -435,14 +511,32 @@ export function createControl(deps: ControlDeps) {
         if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
         return { ok: false, code: 'denied', reason: refused, message: `els ${input.action}: denied (${refused})` };
       }
-      const danger = input.action === 'do' && input.target.shell ? classifyShell(text) : { dangerous: false as const, reason: 'safe' as const };
+      // #90792 P0 ③ — while a person is deciding on this pane, nothing else may type into it: a second send could
+      // interleave with the very line the approver is looking at, so the door refuses it (audited as denied) until
+      // the ask is answered. Reads stay open — they change nothing.
+      const deciding = `${deps.stateDir}\u0000${input.target.pane}`;
+      if (input.action === 'do' && PENDING_ASKS.has(deciding)) {
+        const reason = 'a person is still deciding on this pane';
+        audit({ ...base, result: 'denied', danger: 'n/a', reason });
+        return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied (${reason})` };
+      }
+      // #38453 must ② — /send types machine-assembled text; core.send strips control bytes before the pane
+      // sees them, so the door classifies the same cleaned text (the \x15 line-clear bypass dies here) and
+      // what a HITL approver sees is what runs. every path (send, do, hook) classifies clean(text) - JUD #110140: the hook used raw text, so a \x01 hid `--output=` from the argv split. The fail-closed one-line rule of #38607 is kept by classifyShell itself.
+      const danger = input.action === 'do' && input.target.shell
+        ? classifyShell(clean(text))
+        : { dangerous: false as const, reason: 'safe' as const };
       if (danger.dangerous) {
         if (!deps.hitl) {
           const reason = `${danger.reason}; no person to ask`;
           audit({ ...base, result: 'held', danger: danger.reason, reason });
           return { ok: false, code: 'held', reason, message: `els do: held, not sent (${danger.reason}; nobody to approve)` };
         }
-        const answer = await deps.hitl({ principal: input.principal, from, action: input.action, target: input.target, text, reason: danger.reason });
+        // #90792 P0 ③ — from here until the answer, this pane is deciding: any other send to it is refused above.
+        PENDING_ASKS.add(deciding);
+        let answer: HitlAnswer;
+        try { answer = await deps.hitl({ principal: input.principal, from, action: input.action, target: input.target, text, reason: danger.reason }); }
+        finally { PENDING_ASKS.delete(deciding); }
         if (answer !== 'approve') {
           const code = answer === 'timeout' ? 'timeout' : 'rejected';
           audit({ ...base, result: code, danger: danger.reason, reason: answer });
@@ -463,7 +557,7 @@ export function createControl(deps: ControlDeps) {
       };
       let done: ControlExecuteResult;
       try {
-        done = await deps.execute({ principal: input.principal, action: input.action, target: input.target, ...(text ? { text } : {}), ...(input.action === 'input' ? { queueAudit } : {}) });
+        done = await deps.execute({ principal: input.principal, action: input.action, target: input.target, ...(text ? { text } : {}), ...(input.struct ? { struct: input.struct } : {}), ...(input.confirm !== undefined ? { confirm: input.confirm } : {}), ...(input.action === 'input' ? { queueAudit } : {}), ...(input.path ? { path: input.path } : {}) });
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         process.stderr.write(`els: control executor error: ${reason}\n`);

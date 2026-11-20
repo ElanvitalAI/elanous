@@ -50,6 +50,20 @@ export const RESEARCH_EARLY_ANSWER_INSTRUCTION = [
 ].join(' ');
 
 /**
+ * MK stage feedback (OP #113145): answers opened with collection-process talk ("제공된 발췌에 따르면 … 기사 원문 대조는
+ * 미확인입니다 … 게시일 미확인") because the evidence trace's status lines were echoed as prose. The instruction keeps the
+ * process out of the answer body; verification state belongs to structured citation fields (citation ledger), not prose.
+ */
+export const RESEARCH_NO_PROCESS_NARRATION_RULE = [
+  'Do not narrate the evidence-collection process in the answer body: no mention of excerpts, retrieved snippets, or how the sources were gathered,',
+  'and no per-source verification or publication-date status lines (claim status, primary-source status, original publication date).',
+  'Present the findings directly and cite the sources; verification state is carried by structured citation fields, not by prose.',
+  // JUD #113291: the 미확인 label on a claim without a matching source row is NOT process narration — it is mandatory
+  // (or omit that claim). Dropping it would expose an unverified number unlabeled.
+  'Exception that always wins over the rule above: a claim, number or date without a matching complete source row must keep its 미확인 label (or be left out of the answer); never state it as verified.',
+].join(' ');
+
+/**
  * 1121 SYNTHESIS-RESERVE — time held back from research for the final synthesis, so fanout cannot spend the parent
  * turn's whole window. 출처: RES GROUNDING-MAIN2151-OP81990 (main 2151f484, 2026-11-17) — turn signal 150s, research
  * budget 120s, fanout ran to `wall-clock-budget` every run, forced synthesis started at ~120.0s: GLM 합성 ≥29.9s 미완
@@ -58,6 +72,67 @@ export const RESEARCH_EARLY_ANSWER_INSTRUCTION = [
  * answer without effort, 17–38s). Callers may pass their own reservation (`RunCoreTurnOptions.synthesisReservationMs`).
  */
 export const RESEARCH_SYNTHESIS_RESERVATION_MS = 45_000;
+
+/**
+ * OP #114412 · 끝 ≤60초 — the whole research turn (research phase + synthesis) is budgeted from the research turn start.
+ * 출처: OP #114412 RESEARCH-LATENCY-BUDGET — cut build 70 s (stock) / 77 s+ unfinished (semiconductor) vs a9dc LKG 41 s;
+ * RES WEBCHAT-A2DF-MK-113947 (candidate a2dfb4fc) took 98 s. Code default; callers/tests may inject `researchTurnBudgetMs`.
+ * 55 s → 45 s: OP #114684 · real pin 4409920b (MK #114676 · RES #114681): stock 54 s ✅, semiconductor 72 s ✗ — ~12–15 s of
+ * client/stream overhead sits outside the server-side turn budget, so the server budget is cut by 10 s
+ * (research deadline = budget − synthesis reserve).
+ */
+export const RESEARCH_TURN_BUDGET_MS = 45_000;
+
+/**
+ * Time held back inside `RESEARCH_TURN_BUDGET_MS` for the final synthesis (research phase deadline = budget − reserve).
+ * 출처: OP #114412 — synthesis took 6.9 s on RES WEBCHAT-A2DF-MK-113947; 12 s covers that with headroom (budget 55 s → research phase 43 s).
+ */
+export const RESEARCH_TURN_SYNTHESIS_RESERVE_MS = 12_000;
+
+/**
+ * Observed web-turn generation speed used to turn the synthesis time reserve into an output-token cap.
+ * 출처: OP #114563 · RES 61266 타임라인 — SEMICONDUCTOR 합성 outputChars 4,789 (≈ 3,000 토큰)이 36.9 s → ≈ 80 토큰/s.
+ */
+export const RESEARCH_SYNTHESIS_TOKENS_PER_SECOND = 80;
+
+/**
+ * Output-token ceiling of the final web-turn synthesis: the synthesis reserve at the observed speed
+ * (12 s × 80 tok/s = 960), so a long answer cannot run past the turn budget.
+ * 출처: OP #114563 · RES 61266 타임라인 (RESEARCH_TURN_SYNTHESIS_RESERVE_MS × RESEARCH_SYNTHESIS_TOKENS_PER_SECOND).
+ */
+export const RESEARCH_SYNTHESIS_MAX_OUTPUT_TOKENS = (RESEARCH_TURN_SYNTHESIS_RESERVE_MS / 1_000) * RESEARCH_SYNTHESIS_TOKENS_PER_SECOND;
+
+/**
+ * Floor of the synthesis cap when research overran the budget: still enough for a short cited answer (about three
+ * sentences). 출처: OP #114563 — RESEARCH_EARLY_ANSWER_MAX_OUTPUT_TOKENS (1,024) covers ≤ 4 sentences; a quarter of it.
+ */
+export const RESEARCH_SYNTHESIS_MIN_OUTPUT_TOKENS = RESEARCH_EARLY_ANSWER_MAX_OUTPUT_TOKENS / 4;
+
+/** Synthesis output cap from the time left in the turn budget: reserve-sized normally, shrinking when research overran. */
+export function resolveResearchSynthesisMaxOutputTokens(input: { budgetMs?: number; researchElapsedMs?: number }): number {
+  const { budgetMs, researchElapsedMs } = input;
+  if (budgetMs === undefined || researchElapsedMs === undefined || !Number.isFinite(budgetMs)) return RESEARCH_SYNTHESIS_MAX_OUTPUT_TOKENS;
+  const leftMs = Math.max(0, budgetMs - researchElapsedMs);
+  const byTime = Math.floor((leftMs / 1_000) * RESEARCH_SYNTHESIS_TOKENS_PER_SECOND);
+  return Math.max(RESEARCH_SYNTHESIS_MIN_OUTPUT_TOKENS, Math.min(RESEARCH_SYNTHESIS_MAX_OUTPUT_TOKENS, byTime));
+}
+
+/**
+ * The user's explicit length/format request wins over any structure added for deep continuation (Bloom instruction).
+ * Appended after that instruction in the synthesis system message; no classification of the user's text is involved.
+ * 출처: OP #114563 · RES 61266 타임라인 — '세 줄로' 요청에 deep-bloom 연속 합성이 4,789자·인용 38개를 썼다.
+ */
+export const RESEARCH_USER_FORMAT_PRECEDENCE_RULE = [
+  'If the user asked for a specific length or format (for example a number of lines, sentences, a table, or a word limit),',
+  'follow that request exactly: it overrides any structure, depth or section guidance given earlier for this answer.',
+  'Keep the answer compact enough to end on a complete sentence.',
+  // JUD #114615 ⓑ1: the requested length never swallows the evidence markers.
+  'Exception: source links and the 미확인 label are not part of the requested length — keep them as one short sources line outside it.',
+].join(' ');
+
+/** When the synthesis cap is reduced (research overran), the link requirement shrinks to this many links and the sources
+ * line goes FIRST so the cap cannot cut it. 출처: JUD #114615 ⓑ1. */
+export const RESEARCH_COMPACT_SOURCE_LINKS = 3;
 
 export type ResearchBudgetLimit = 'research-budget' | 'synthesis-reserve';
 
@@ -102,7 +177,36 @@ export const RESEARCH_TOOL_ALLOWLIST = [
   'MsgList',
 ] as const;
 
-const RESEARCH_TOOL_NAMES: ReadonlySet<string> = new Set(RESEARCH_TOOL_ALLOWLIST);
+/**
+ * MOB-1 FINANCE-FIRST (OP #110867): read-only market-data capability tools a research turn may call. Before this the
+ * research allowlist was web-only, so a configured finance pack (finance_quote EODHD/Toss · finance_kr_flow KIS/KRX 수급 ·
+ * MarketQuote · KrFlowSnapshot) was filtered out of every research/webchat turn and numbers came from web search alone.
+ * Presence in the pool is still decided by the surface (financeEnabled gate · credential probes) — nothing is added here
+ * that the surface did not already expose; a missing credential keeps the tool absent (→ «unavailable», never invented).
+ */
+export const RESEARCH_MARKET_DATA_TOOLS = ['finance_quote', 'finance_kr_flow', 'MarketQuote', 'KrFlowSnapshot'] as const;
+const MARKET_DATA_TOOL_NAMES: ReadonlySet<string> = new Set(RESEARCH_MARKET_DATA_TOOLS);
+
+export function isResearchMarketDataTool(name: string): boolean { return MARKET_DATA_TOOL_NAMES.has(name); }
+
+/** Market-data tools present in a tool pool (names only). */
+export function marketDataToolNames(tools: readonly { name: string }[]): string[] {
+  return tools.filter((tool) => MARKET_DATA_TOOL_NAMES.has(tool.name)).map((tool) => tool.name);
+}
+
+/** The finance-first instruction, or undefined when the pool has no market-data tool (nothing to prefer; no claim made).
+ * The model judges «is this an investment/market question» by meaning; the tools only exist where the surface allows. */
+export function buildMarketDataInstruction(toolNames: readonly string[]): string | undefined {
+  if (toolNames.length === 0) return undefined;
+  return [
+    `투자·시장 질문(시세·지수·재무·수급·환율)에는 웹 검색보다 시장데이터 도구(${toolNames.join(', ')})를 먼저 호출한다.`,
+    '시세·수급·재무 수치는 그 도구 결과에서만 인용하고, 수치마다 출처 도구/데이터 소스 이름을 붙인다.',
+    '웹 검색은 맥락·뉴스 보완용이며 수치의 근거로 쓰지 않는다.',
+    '도구가 실패하거나 결과가 없으면 «조회 불가»라고 말하고, 수치를 추정하거나 지어내지 않는다.',
+  ].join('\n');
+}
+
+const RESEARCH_TOOL_NAMES: ReadonlySet<string> = new Set([...RESEARCH_TOOL_ALLOWLIST, ...RESEARCH_MARKET_DATA_TOOLS]);
 export const RESEARCH_DOCUMENT_WRITE_TOOLS = ['Edit', 'Write'] as const;
 
 /** A research turn may write only when the user explicitly asks for a document at a concrete path. */
@@ -121,3 +225,14 @@ export function requestsResearchDocumentWrite(text: string | undefined): boolean
 export function isResearchToolAllowed(name: string): boolean {
   return RESEARCH_TOOL_NAMES.has(name);
 }
+
+/** MK #110816 — a research turn's model context carries earlier assistant turns verbatim (session history). Numbers
+ *  stated there were never verified against this turn's fetched evidence, yet the model quoted them as findings.
+ *  Added only when the context holds a prior assistant message; the citation ledger still gates what is shown. */
+export const RESEARCH_PRIOR_CLAIMS_NOTICE = [
+  '<unverified-prior-claims>',
+  'Assistant messages from earlier turns of this conversation are unverified prior claims, not evidence.',
+  'Do not restate figures, dates or quotes from them as findings. Use a number only when this turn\'s evidence rows support it with a source;',
+  'otherwise verify it via search or omit it. If you must mention a prior figure, label it 미확인.',
+  '</unverified-prior-claims>',
+].join('\n');

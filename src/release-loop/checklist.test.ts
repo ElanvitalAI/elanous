@@ -8,10 +8,11 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistEvidenceChain, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseChecklistTargetPaths, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistEvidenceChain, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseChecklistTargetPaths, parseOwner, parityGap, refRoots, postP0StallAlerts, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
 import { collectChecklistEvidenceStages, registerReleaseChecklistReadCommands, type ChecklistEvidenceCommandRunner, type ChecklistEvidenceReader } from '../cli/release-checklist-read-cli.js';
 import * as features from './feature-store.js';
+import { MsgStore } from '../msg/msg-store.js';
 
 const roots: string[] = [];
 function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checklist-')); roots.push(dir); setElanousConfigDir(dir); return dir; }
@@ -1101,4 +1102,73 @@ test('normalizeRefs finds a document in any root, and refRoots adds the git root
     expect(refRoots(join(repo, 'docs', 'sub'))).toContain(repo);
     expect(refRoots(install).length).toBe(1);
   } finally { rmSync(install, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); }
+});
+
+describe('OP-STALL-P0-HOURLY: stalled P0 head mails OP once', () => {
+  const cells = [
+    { id: 'P0-CELL', title: 'p0 cell', status: 'yellow', owner: 'MK', priority: 'P0', updatedAt: '2026-11-20T00:00:00.000Z', updatedBy: 'OP' },
+    { id: 'P1-CELL', title: 'p1 cell', status: 'yellow', owner: 'TC', priority: 'P1', updatedAt: '2026-11-20T00:00:00.000Z', updatedBy: 'OP' },
+  ] as const;
+  const firstHead = { head: 'aaaaaaaaaaaa1111111111111111111111111111', branch: 'mk/p0-cell', lastChangedAt: '2026-11-20T01:00:00.000Z' };
+  function harness() {
+    const dir = root();
+    const store = new MsgStore(join(dir, 'msg', 'messages.db'));
+    const statePath = join(dir, 'release', '9.9.9', 'p0-stall-alerts.json');
+    const tick = (heads: Record<string, typeof firstHead>, now: string) =>
+      postP0StallAlerts({ version: '9.9.9', items: cells, heads, now: new Date(now) }, { statePath, store });
+    const mails = () => store.list('OP', 0, 100, { includeAcked: true });
+    return { store, statePath, tick, mails };
+  }
+
+  test('61 min unchanged → exactly one OP mail with cell, owner, sha12 and ISO time; next tick does not repeat', () => {
+    const { store, tick, mails } = harness();
+    try {
+      const first = tick({ 'P0-CELL': firstHead }, '2026-11-20T02:01:00.000Z');
+      expect(first.alerts.map((alert) => alert.id)).toEqual(['P0-CELL']);
+      expect(mails().length).toBe(1);
+      expect(mails()[0]!.from).toBe('RLA');
+      expect(mails()[0]!.kind).toBe('alert');
+      expect(mails()[0]!.body).toBe('정체 P0 · 칸 P0-CELL · 주인 MK · head aaaaaaaaaaaa · 가지 mk/p0-cell · 마지막 변화 2026-11-20T01:00:00.000Z · 61분 무변화 → OP 재배정 판단');
+      const second = tick({ 'P0-CELL': firstHead }, '2026-11-20T02:16:00.000Z');
+      expect(second.alerts).toEqual([]);
+      expect(mails().length).toBe(1);
+    } finally { store.close(); }
+  });
+
+  test('head change clears the alert; 61 more unchanged minutes alert once again', () => {
+    const { store, tick, mails } = harness();
+    try {
+      tick({ 'P0-CELL': firstHead }, '2026-11-20T02:01:00.000Z');
+      const moved = { head: 'bbbbbbbbbbbb2222222222222222222222222222', branch: 'mk/p0-cell', lastChangedAt: '2026-11-20T02:10:00.000Z' };
+      const recovered = tick({ 'P0-CELL': moved }, '2026-11-20T02:11:00.000Z');
+      expect(recovered.cleared).toEqual(['P0-CELL']);
+      expect(recovered.alerted).toEqual({});
+      expect(mails().length).toBe(1);
+      const again = tick({ 'P0-CELL': moved }, '2026-11-20T03:11:00.000Z');
+      expect(again.alerts.map((alert) => alert.head12)).toEqual(['bbbbbbbbbbbb']);
+      expect(mails().length).toBe(2);
+      expect(mails()[1]!.body).toBe('정체 P0 · 칸 P0-CELL · 주인 MK · head bbbbbbbbbbbb · 가지 mk/p0-cell · 마지막 변화 2026-11-20T02:10:00.000Z · 61분 무변화 → OP 재배정 판단');
+    } finally { store.close(); }
+  });
+
+  test('non-P0 unchanged 120 min and P0 unchanged 59 min → no mail', () => {
+    const { store, tick, mails } = harness();
+    try {
+      const p1 = tick({ 'P1-CELL': { head: 'cccccccccccc3333333333333333333333333333', branch: 'tc/p1-cell', lastChangedAt: '2026-11-20T01:00:00.000Z' } }, '2026-11-20T03:00:00.000Z');
+      expect(p1.alerts).toEqual([]);
+      const young = tick({ 'P0-CELL': firstHead }, '2026-11-20T01:59:00.000Z');
+      expect(young.alerts).toEqual([]);
+      expect(mails().length).toBe(0);
+    } finally { store.close(); }
+  });
+
+  test('a lost alert state file does not post the same stall twice', () => {
+    const { store, statePath, tick, mails } = harness();
+    try {
+      tick({ 'P0-CELL': firstHead }, '2026-11-20T02:01:00.000Z');
+      rmSync(statePath);
+      tick({ 'P0-CELL': firstHead }, '2026-11-20T02:16:00.000Z');
+      expect(mails().length).toBe(1);
+    } finally { store.close(); }
+  });
 });

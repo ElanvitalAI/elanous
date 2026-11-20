@@ -22,6 +22,7 @@ import {
 import { askUserQuestionRuntime } from '../../tool-runtime/ask-user-question-runtime.js';
 import { buildElanousHoldTool, buildPtyControlTool, dispatchElanousHold, dispatchPtyControl } from '../../tool-runtime/elanous-control-runtimes.js';
 import { ptyAvailable } from '../../pty-shell/registry.js';
+import { buildElsControlTool, dispatchElsControl, elsControlSocketPath } from '../../els/els-control-tool.js';
 import { dispatchToolByName, listToolRuntimes } from '../../tool-runtime/registry.js';
 import { ACP_SESSION_RUNTIMES } from '../../tool-runtime/acp-session-runtime.js';
 import { ClaudeSubscriptionNotAllowedError } from '../../policy/claude-subscription-guard.js';
@@ -358,6 +359,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     ...ACP_SESSION_RUNTIMES.map((runtime) => runtime.spec),
     ...shared.specs, // L2 core + L3 finance(gated) — buildSharedAppTools 단일 출처(전 서피스 공용)
     ...(ptyAvailable() ? [buildElanousHoldTool(), buildPtyControlTool()] : []),
+    ...(elsControlSocketPath() ? [buildElsControlTool()] : []),
   ];
   // APP-BUILD-TOOLS-IN-DAEMON-TURN — the route adapter's merged host tools (app_build · app_build_plan · …),
   // from the same bridge and merge helper as the Next TUI / agent CLI. Names already on this surface win
@@ -442,6 +444,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     }
     if (ptyAvailable() && name === 'ElanousHold') return dispatchElanousHold(args);
     if (ptyAvailable() && name === 'PtyControl') return dispatchPtyControl(args);
+    if (elsControlSocketPath() && name === 'ElsControl') return dispatchElsControl(args);
     if (name === 'Bash') {
       // PLAN-ios-rich-dev-feedback-hydrate M3 (2026-05-13) — pass
       // sessionId + emitFeedback so dispatchBash emits tool.progress

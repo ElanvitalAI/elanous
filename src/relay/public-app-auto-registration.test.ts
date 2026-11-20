@@ -283,6 +283,218 @@ describe("complete relay policy reload", () => {
     }
   });
 
+  // (출처: OP #106250) ⓑ1 리터럴 — 결속 집합(memberServiceHosts) 없이 reload 하면
+  // 살아 있는 일반 호스트 연결이 닫히지 않는다(닫힘 0). 이전 회귀(OP #106214)에서는
+  // undefined !== false 비교로 reload 때마다 일반 호스트 연결이 1008 로 닫혔다.
+  test("policy reload without member-service binding keeps the living general host connection open", async () => {
+    const { files, put } = fixture();
+    const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(17));
+    const actualServerId = serverIdFromPublicKey(daemonKeys.publicKey);
+    const signingKeys = generateKeyPairSync("ed25519");
+    const der = signingKeys.publicKey.export({
+      format: "der",
+      type: "spki",
+    }) as Buffer;
+    const actualKey = der.subarray(-32).toString("base64url");
+    put(files.trustedHostKeys, { [actualServerId]: actualKey });
+    put(files.hostOwnerMembers, { [actualServerId]: "owner-1" });
+    put(files.publicDispatch, {
+      routes: [
+        { user: "alice", serverId: actualServerId, ownerMemberId: "owner-1" },
+      ],
+    });
+    const autoRegistrations = join(
+      realpathSync(roots[roots.length - 1]!),
+      "auto-apps-no-binding.json",
+    );
+    const initial = loadRelayPublicPolicySnapshot(files, "elanous.app");
+    let registrar: ReturnType<typeof createRelayAutoAppRegistrar>;
+    const relay = startRelayServer({
+      port: 0,
+      hostname: "127.0.0.1",
+      publicDomain: "elanous.app",
+      memberRequired: true,
+      validateMemberToken: async () => ({ memberId: "owner-1" }),
+      ...initial,
+      autoAppRegistration: {
+        register: (host, owner, input) =>
+          registrar.register(host, owner, input),
+        unregister: (host, owner, input) =>
+          registrar.unregister(host, owner, input),
+      },
+    });
+    registrar = createRelayAutoAppRegistrar({
+      file: autoRegistrations,
+      domain: "elanous.app",
+      staticPolicy: () => loadRelayPublicPolicySnapshot(files, "elanous.app"),
+      apply: (candidate) => relay.reloadPublicPolicySnapshot(candidate),
+    });
+    const host = await connectRelayHost({
+      relayUrl: `ws://127.0.0.1:${relay.port}/host`,
+      daemonKeys,
+      hostSigningKey: signingKeys.privateKey,
+      getMemberToken: async () => "emt_fake_test_member",
+      handleRequest: async () => new Response("still alive", { status: 200 }),
+    });
+    const request = () =>
+      fetch(`http://127.0.0.1:${relay.port}/reserve`, {
+        method: "GET",
+        headers: { host: "booking--alice.elanous.app" },
+      });
+    const registration = {
+      ownerId: "owner-1",
+      user: "alice",
+      app: "booking",
+      deploymentId: "dyn-42424242-4242-4242-8242-424242424242",
+      grantId: "grant-1",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    try {
+      await host.registerPublicApp(registration);
+      expect((await request()).status).toBe(200);
+      // 결속 집합 없는 reload — 파일 정적 스냅샷(등록 앱 미포함)으로 갱신한다.
+      // 이전 회귀(OP #106214)에서는 이때 살아 있는 일반 호스트 연결이
+      // 1008("host authority changed") 로 닫혔다.
+      relay.reloadPublicPolicySnapshot(
+        loadRelayPublicPolicySnapshot(files, "elanous.app"),
+      );
+      // 스냅샷에 앱이 없어 401 로 바뀐다(연결 문제와 무관한 정책 효과).
+      expect((await request()).status).toBe(401);
+      // 닫힘 0 — reload 뒤에도 «같은 연결»로 해제·재등록이 그대로 된다.
+      // 회귀였다면 이 프레임은 "connection closed" 로 실패한다.
+      await host.unregisterPublicApp({
+        user: "alice",
+        app: "booking",
+        deploymentId: registration.deploymentId,
+        grantId: registration.grantId,
+      });
+      await host.registerPublicApp(registration);
+      const afterReload = await request();
+      expect(afterReload.status).toBe(200);
+      expect(await afterReload.text()).toBe("still alive");
+    } finally {
+      host.close();
+      relay.stop();
+    }
+  });
+
+  // (출처: OP #106270) ⓑ2 리터럴 — --member-service-hosts 로 결속된 호스트는
+  // owner 결속 없이도 ems_ 서비스 연결로 살아 있고(회원 서버 역할), 같은
+  // serverId 를 일반(emt_만) 호스트 연결로는 못 얻는다(open 4401 · #106092 ⓑ).
+  test("member-service bound host stays alive as a service-only connection while a general host connection to the bound server closes 4401", async () => {
+    const { files, put } = fixture();
+    const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(17));
+    const boundServerId = serverIdFromPublicKey(daemonKeys.publicKey);
+    const signingKeys = generateKeyPairSync("ed25519");
+    const der = signingKeys.publicKey.export({
+      format: "der",
+      type: "spki",
+    }) as Buffer;
+    const boundKey = der.subarray(-32).toString("base64url");
+    put(files.trustedHostKeys, { [serverId]: key, [boundServerId]: boundKey });
+    // 결속 서버에는 owner 핀이 없다 — member-service 결속이 유일한 자격이다.
+    const memberServiceHosts = join(
+      realpathSync(roots[roots.length - 1]!),
+      "member-service-hosts.json",
+    );
+    put(memberServiceHosts, { [boundServerId]: true });
+    const autoRegistrations = join(
+      realpathSync(roots[roots.length - 1]!),
+      "auto-apps-service-binding.json",
+    );
+    const initial = loadRelayPublicPolicySnapshot(
+      { ...files, memberServiceHosts },
+      "elanous.app",
+    );
+    let registrar: ReturnType<typeof createRelayAutoAppRegistrar>;
+    const relay = startRelayServer({
+      port: 0,
+      hostname: "127.0.0.1",
+      publicDomain: "elanous.app",
+      memberRequired: true,
+      validateMemberToken: async () => ({ memberId: "owner-1" }),
+      memberServiceToken: "ems_fake_test_service_token",
+      ...initial,
+      autoAppRegistration: {
+        register: (host, owner, input) =>
+          registrar.register(host, owner, input),
+        unregister: (host, owner, input) =>
+          registrar.unregister(host, owner, input),
+        queryHandlePinByMember: (input) =>
+          registrar.queryHandlePinByMember(input),
+      },
+    });
+    registrar = createRelayAutoAppRegistrar({
+      file: autoRegistrations,
+      domain: "elanous.app",
+      // 정적 스냅샷도 결속 집합(memberServiceHosts)과 함께 읽는다 — 결속
+      // 서버의 «owner 없음» 은 이 집합이 있을 때만 정책상 합법이다.
+      staticPolicy: () =>
+        loadRelayPublicPolicySnapshot({ ...files, memberServiceHosts }, "elanous.app"),
+      apply: (candidate) => relay.reloadPublicPolicySnapshot(candidate),
+    });
+    const serviceHost = await connectRelayHost({
+      relayUrl: `ws://127.0.0.1:${relay.port}/host`,
+      daemonKeys,
+      hostSigningKey: signingKeys.privateKey,
+      getMemberServiceToken: async () => "ems_fake_test_service_token",
+      handleRequest: async () => new Response("service alive", { status: 200 }),
+    });
+    try {
+      // 결속 서버의 ems_ 서비스 연결은 owner 없이도 살아 있다 — 회원 서버
+      // 역할의 «핀 읽기» 질의가 그 연결로 그대로 왕복한다(쓰기 자격은 0).
+      expect(
+        await serviceHost.publicHandlePinQuery("alice", "owner-1"),
+      ).toBe(false);
+      // 같은 결속 serverId 를 일반(emt_만) 호스트 연결로 양보하려 하면
+      // open 4401 로 끊긴다 — 일반 호스트 슬롯은 이 serverId 에 없다.
+      // (출처: #39116 ⓑ2 수리) 첫 일반 연결 시도는 하니스 경합으로 close
+      // 4401 프레임 도달 전에 소켓이 끊겨 1006("Connection ended") 으로
+      // 관측될 수 있다(원시 소켓 프로브는 항상 4401 — 제품 결함 아님).
+      // 관측이 결정적으로 4401 이 될 때까지만 유한 폴링한다 — 상한 내
+      // 미관측 시 실패로 마감(1006 을 기대치로 낮추지 않는다).
+      const settleStepMs = 25;
+      const settleLimitMs = 2_000; // 상한 출처: OP #106250 리터럴 — reload 완료 대기
+      let observedClose4401 = false;
+      let lastObservation = "(no observation)";
+      for (
+        let settleElapsed = 0;
+        settleElapsed < settleLimitMs && !observedClose4401;
+        settleElapsed += settleStepMs
+      ) {
+        const observation = await connectRelayHost({
+          relayUrl: `ws://127.0.0.1:${relay.port}/host`,
+          daemonKeys,
+          hostSigningKey: signingKeys.privateKey,
+          getMemberToken: async () => "emt_fake_test_member",
+          handleRequest: async () => new Response("general", { status: 200 }),
+        }).then(
+          (connection) => {
+            connection.close();
+            return "general connection accepted";
+          },
+          (error: unknown) =>
+            error instanceof Error ? error.message : String(error),
+        );
+        lastObservation = observation;
+        if (observation.includes("4401")) observedClose4401 = true;
+        else await new Promise((resolve) => setTimeout(resolve, settleStepMs));
+      }
+      if (!observedClose4401) {
+        throw new Error(
+          `bound general connection did not close 4401 within ${settleLimitMs}ms — last observation: ${lastObservation}`,
+        );
+      }
+      // 서비스 연결은 여전히 살아 있다(일반 연결 거부로 끊기지 않는다).
+      expect(
+        await serviceHost.publicHandlePinQuery("alice", "owner-1"),
+      ).toBe(false);
+    } finally {
+      serviceHost.close();
+      relay.stop();
+    }
+  });
+
   test("claimed handle pins respect trust boundaries and collisions at the registrar level", () => {
     const { files, put } = fixture();
     const pinServerId = "b".repeat(64);
@@ -1376,6 +1588,22 @@ describe("member handle pin query honors operator-verified static claims", () =>
         memberId: "owner-1",
       }),
     ).toBe(false);
+  });
+
+  test("⑤ claims enumeration lists only the authenticated host's owner claims (restart replay source)", () => {
+    const { registrar, pinServerId } = setupPinQuery({
+      ophome: "owner-1",
+      memberhome: "owner-2",
+      otherhome: "owner-3",
+    });
+    expect(registrar.queryHandleClaims(serverId, "owner-1")).toEqual([
+      { handle: "ophome", memberId: "owner-1" },
+    ]);
+    expect(registrar.queryHandleClaims(pinServerId, "owner-2")).toEqual([
+      { handle: "memberhome", memberId: "owner-2" },
+    ]);
+    // 소유 결속이 다른 호스트/회원 조합 → 빈 목록(fail-closed)
+    expect(registrar.queryHandleClaims(serverId, "owner-2")).toEqual([]);
   });
 
   test("④ an existing dynamic pin keeps answering pinned", () => {

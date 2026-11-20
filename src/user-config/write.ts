@@ -330,8 +330,10 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
         preserveLastN: cfg.chat.autoCompact.preserveLastN,
         preserveFirstN: cfg.chat.autoCompact.preserveFirstN,
         partial: cfg.chat.autoCompact.partial,
+        // ★ 2026-11-19 ELN-CONFIG-SET-DROPS(잠복): workingBudgetTokens 이 타입(chat.ts)·파서(positiveIntOr)에는
+        //   있으나 이 whitelist 에 없어, `config set` 이 다른 칸을 고칠 때마다 드롭됐다.
+        workingBudgetTokens: cfg.chat.autoCompact.workingBudgetTokens,
       }),
-      autoCopyQaToClipboard: cfg.chat.autoCopyQaToClipboard,
       systemPrompt: stripUndef({
         overridePath: cfg.chat.systemPrompt.overridePath,
         taskVariant: cfg.chat.systemPrompt.taskVariant,

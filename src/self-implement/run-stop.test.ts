@@ -17,7 +17,7 @@ describe('recordRunStop', () => {
     expect(entries).toHaveLength(2);
     expect(entries[0]).toBe(prior);
     expect(entries[1]).toMatchObject({ runId: 'run-test', event: 'stop', data: { class: 'main-sync', cause: 'merge held: main-sync-conflict-unresolved', evidenceRef: 'run-ledger:run-test:merge-decision', nextMove: 'Review merge decision' } });
-    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat', 'review-out-of-scope', 'review-budget-exhausted', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'implement-aborted', 'out-of-scope-held', 'provider-auth-missing', 'provider-unavailable', 'merge-held-release-path', 'pr-guard-failed', 'gate-unmeasured', 'unclassified']);
+    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat', 'review-out-of-scope', 'review-budget-exhausted', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'implement-aborted', 'out-of-scope-held', 'provider-auth-missing', 'provider-unavailable', 'merge-held-release-path', 'pr-guard-failed', 'gate-unmeasured', 'no-review-provider', 'unclassified']);
   });
 
   test('unknown class is unclassified; cause is one line at most 120 characters without truncation marker', () => {
@@ -56,6 +56,7 @@ describe('recordRunStop', () => {
     expect(classifyStopReasonFromGraph('room pressure')).toBeUndefined();
     expect(classifyMergeHoldStop('main-sync-conflict-unresolved')).toBe('main-sync');
     expect(classifyMergeHoldStop('required-evidence-uncovered')).toBe('evidence-uncovered');
+    expect(classifyMergeHoldStop('no-review-provider')).toBe('no-review-provider');
     expect(classifyMergeHoldStop('review-must-fix')).toBe('review-repeat');
     expect(classifyMergeHoldStop('review-warn-with-must-fix')).toBe('review-repeat');
     expect(classifyMergeHoldStop('review-budget-exhausted')).toBe('review-budget-exhausted');
@@ -130,7 +131,7 @@ describe('recordRunStop', () => {
     expect(buildRunStopTerminalEvidence({ stage: 'aborted', node: 'unknown', outcome: 'abandoned', entries: [] })).toMatchObject({ childRunId: 'unknown', job: 'unknown', attempt: 'unknown', exitCode: 'unknown', reasonCode: 'unknown' });
 
     let artifactPath = '';
-    let artifact = Buffer.alloc(0);
+    let artifact: Buffer = Buffer.alloc(0);
     const runId = `run-stop-evidence-test-${Date.now()}`;
     const entry = recordRunStop({ runId, class: 'implement-aborted', cause: 'terminal failure', evidenceRef: `run-ledger:${runId}:aborted`, nextMove: 'inspect',
       terminalEvidence,

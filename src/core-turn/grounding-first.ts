@@ -44,6 +44,12 @@ export function needsGroundingFirst(text: string | undefined): boolean {
 export const GROUNDING_UNAVAILABLE = '외부 검색을 사용할 수 없거나 인용할 근거를 확보하지 못했습니다. 최신 사실·전망에 대한 답변을 유보합니다.';
 export const GROUNDING_PARTIAL = '일부 검색이 불완전합니다. 아래 답변은 확보한 출처 범위에 한정합니다.';
 
+/** Header for an incomplete search: names the failed axes when the structured partial carries them, else the fixed sentence. */
+export function groundingPartialHeader(failedAxes?: readonly string[]): string {
+  if (!failedAxes?.length) return GROUNDING_PARTIAL;
+  return `${failedAxes.map(axis => `«${axis}»`).join(', ')} 축 검색이 실패했습니다. 아래 답변은 확보한 출처 범위에 한정합니다.`;
+}
+
 /** Only structured evidence URLs count; prose or model-generated citations do not open the gate. */
 export function hasGroundingSources(result: { output: string; sourceUrls?: string[] } | null | undefined): boolean {
   return !!result?.output.trim() && (result.sourceUrls ?? []).some(value => {

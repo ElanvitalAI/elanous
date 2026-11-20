@@ -18,6 +18,7 @@
           "purpose": "Run the Elanous 0.x release workflow as one policy-bound graph instance.",
           "allow": {
             "recipes": [
+              "traffic-prep",
               "cut-branch",
               "gate-image-prebuild",
               "version-release",

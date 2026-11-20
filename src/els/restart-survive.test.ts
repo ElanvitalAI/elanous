@@ -4,20 +4,30 @@
 // 출처: seat-state/OP/orders/ELS-DEFECT-BOARD-1120.md D1a · OP 재배정 msg:105811.
 
 import { afterEach, expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createElsCore, type ElsPty } from './core.js';
 import { emptyJournal, type SpaceJournal } from './space.js';
 import { requestEls } from './client.js';
+import { attachEls, type AttachFrame } from './attach-client.js';
+import { AUTH_OWNER_TOKEN_ENV, AUTH_PANE_TOKEN_ENV } from './server-auth.js';
 import { elsSocketPath, startElsServer } from './server.js';
 import { connectHolderElsPty, reattachHolder, startHolder } from './holder.js';
 
+// A Unix socket path holds at most 103 bytes (macOS): under a long TMPDIR the els server/holder socket would pass it,
+// so a state dir falls back to /tmp (each test removes its own dir).
+const SOCKET_SAFE_TMP = tmpdir().length > 40 ? '/tmp' : tmpdir();
+
 const cleanups: (() => Promise<void> | void)[] = [];
+// The in-process servers set the owner token in this process env (and these tests put a stale one back): every test ends on the env it began with.
+const envAtStart = { owner: process.env[AUTH_OWNER_TOKEN_ENV], pane: process.env[AUTH_PANE_TOKEN_ENV] };
 afterEach(async () => {
   const pending = [...cleanups];
   cleanups.length = 0;
   for (const cleanup of pending.reverse()) await cleanup();
+  if (envAtStart.owner === undefined) delete process.env[AUTH_OWNER_TOKEN_ENV]; else process.env[AUTH_OWNER_TOKEN_ENV] = envAtStart.owner;
+  if (envAtStart.pane === undefined) delete process.env[AUTH_PANE_TOKEN_ENV]; else process.env[AUTH_PANE_TOKEN_ENV] = envAtStart.pane;
 });
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -33,14 +43,23 @@ const until = async (check: () => Promise<boolean> | boolean, ms: number = LIT_W
     await sleep(LIT_POLL_MS);
   }
 };
+/**
+ * Since the #39143 door a no-credential caller cannot `send`; the same-process server's owner token is not an
+ * OP-registered seat until the person's explicit `els seat set OP`. Register it once per server, over the real socket.
+ */
+async function seatOp(socket: string): Promise<void> {
+  const registered = await requestEls(socket, { op: 'seat-set', seat: 'OP' });
+  expect(registered).toEqual({ exitCode: 0, message: 'els seat: OP registered' });
+}
 const screenOf = async (socket: string, pane: string): Promise<string> => (await requestEls(socket, { op: 'read', pane })).message;
 
 test('restart survive: the first server releases the pane holder; the next server adopts the same live pane', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-rst-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-rst-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const socket = elsSocketPath(root);
   const first = await startElsServer({ stateRoot: root });
   if ('exitCode' in first) throw new Error(first.message);
+  await seatOp(socket);
   cleanups.push(() => first.close());
   const created = await requestEls(socket, { op: 'new', ws: 'OP', cwd: root, command: ['/bin/sh'] });
   expect(created.exitCode).toBe(0);
@@ -53,6 +72,7 @@ test('restart survive: the first server releases the pane holder; the next serve
   await first.close();
   const second = await startElsServer({ stateRoot: root });
   if ('exitCode' in second) throw new Error(second.message);
+  await seatOp(socket);
   cleanups.push(() => second.close());
   cleanups.push(async () => { await requestEls(socket, { op: 'close', pane }); });
 
@@ -64,17 +84,143 @@ test('restart survive: the first server releases the pane holder; the next serve
   const typed = await requestEls(socket, { op: 'send', pane, text: 'echo RST_SECOND_ALIVE\r' });
   expect(typed.exitCode).toBe(0);
   await until(async () => (await screenOf(socket, pane)).includes('RST_SECOND_ALIVE'));
+
+  // attach resumes: a real attach to the restarted server shows the pre-restart screen and its typed input reaches the pane.
+  const frames: AttachFrame[] = [];
+  const attached = attachEls(socket, pane, { cols: 90, rows: 20 }, { onFrame: (frame) => frames.push(frame), onEnd: () => {} });
+  cleanups.push(() => attached.detach());
+  const seen = (text: string): boolean => frames.some((frame) => frame.screen.includes(text));
+  await until(() => seen('RST_FIRST_ALIVE'));
+  attached.input('echo RST_ATTACH_$((6*7))_OK\r');
+  await until(() => seen('RST_ATTACH_42_OK'));
+  await until(async () => (await screenOf(socket, pane)).includes('RST_ATTACH_42_OK'));
 }, LIT_TEST_MS); // 출처: attach-pty 시험과 같은 실화면 PTY 대기 상한 — 각 단계는 LIT_WAIT_MS 안에 끝난다
+
+// D1a must-1(JUD-B #107693 · OP #107696): 우아한 서버 정지(close · els serve SIGTERM)는 attach 를 «pane exited» 가
+// 아니라 «the server is stopping» 으로 끝낸다 — 홀더가 자식을 살려 두므로, 클라는 그 end 를 재기동 대기로 탄다.
+// JUD-B 재현 그대로: 첫 서버 close → (클라) end 대기 → 새 서버 재부착 → 같은 자식 화면.
+test('restart survive: a graceful close ends the attach as the server going away; the next server re-attaches the same live pane', async () => {
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-rst-grace-'));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  const socket = elsSocketPath(root);
+  const first = await startElsServer({ stateRoot: root });
+  if ('exitCode' in first) throw new Error(first.message);
+  cleanups.push(() => first.close());
+  await seatOp(socket);
+  const created = await requestEls(socket, { op: 'new', ws: 'OP', cwd: root, command: ['/bin/sh'] });
+  expect(created.exitCode).toBe(0);
+  const { pane } = JSON.parse(created.message) as { pane: string };
+  const sent = await requestEls(socket, { op: 'send', pane, text: 'echo GRACE_CLOSE_ALIVE\r' });
+  expect(sent.exitCode).toBe(0);
+  await until(async () => (await screenOf(socket, pane)).includes('GRACE_CLOSE_ALIVE'));
+  const ends: [number, string][] = [];
+  const screens: string[] = [];
+  const attached = attachEls(socket, pane, { cols: 51, rows: 22 }, { // 출처: attach-app 시험과 같은 화면 크기(51x22)
+    onFrame: (frame) => { screens.push(frame.screen); },
+    onEnd: (code, reason) => { ends.push([code, reason]); },
+  });
+  await until(async () => screens.some((screen) => screen.includes('GRACE_CLOSE_ALIVE')));
+  // 우아 정지: close() 는 attach 연결을 stopAll 앞에 서버 떠남으로 끝낸다(기대: [1, 'the server is stopping']).
+  const closing = first.close();
+  await until(() => ends.length > 0);
+  expect(ends).toEqual([[1, 'the server is stopping']]);   // 독립 리터럴: 우아 종료의 end 코드·사유(0/'pane exited' 아님)
+  await closing;
+  const second = await startElsServer({ stateRoot: root });
+  if ('exitCode' in second) throw new Error(second.message);
+  cleanups.push(() => second.close());
+  cleanups.push(async () => { await requestEls(socket, { op: 'close', pane }); });
+  await seatOp(socket);
+  // 같은 자식: 새 서버가 홀더를 입양하고, 새 attach 의 첫 프레임이 첫 서버 시절의 화면을 그대로 다시 그린다.
+  const listed = JSON.parse((await requestEls(socket, { op: 'ls' })).message) as { panes: { pane: string; ptyId: string; state: string }[] };
+  const row = listed.panes.find((entry) => entry.pane === pane);
+  expect(row?.ptyId).not.toBe('');          // 독립 리터럴: 홀더 재발견(ptyId 유지)
+  expect(row?.state).not.toBe('exited');    // 독립 리터럴: 같은 자식이 살아 있다
+  const before = screens.length;
+  const reattached = attachEls(socket, pane, { cols: 51, rows: 22 }, { // 출처: 위와 같은 화면 크기(51x22)
+    onFrame: (frame) => { screens.push(frame.screen); },
+    onEnd: (code, reason) => { ends.push([code, reason]); },
+  });
+  cleanups.push(() => { try { reattached.detach(); } catch { /* already detached */ } });
+  await until(() => screens.length > before);            // 출처: 새 attach 의 첫 프레임 1개 도달(프레임 수 증가)
+  expect(screens.at(-1)).toContain('GRACE_CLOSE_ALIVE'); // 독립 리터럴: 첫 서버 시절 화면이 그대로 재부착됐다
+  // main's send family (#39168) types cleaned text and never presses Enter, so the marker is short enough not to wrap at 51 cols.
+  const typed = await requestEls(socket, { op: 'send', pane, text: 'GRACE_2ND' });
+  expect(typed.exitCode).toBe(0);
+  await until(async () => (await screenOf(socket, pane)).includes('GRACE_2ND'));
+  expect(ends).toEqual([[1, 'the server is stopping']]);  // 독립 리터럴: 전체에서 end 는 우아 종료 한 번뿐(«pane exited» 0회)
+}, LIT_TEST_MS); // 출처: attach-pty 시험과 같은 실화면 PTY 대기 상한 — 각 단계는 LIT_WAIT_MS 안에 끝난다
+
+// D1a r2 (JUD-CONFIRM #39155 · reattach after a restart): an owner terminal (`els attach` run by the person) holds the OWNER
+// token of the server it started with. A restart mints a new one (written next to the socket), so the reattach must present
+// the CURRENT one — with the old env token it was an outsider: view-only, typing silently refused.
+test('restart survive: after a restart the owner terminal re-attaches with the new owner token and its typing reaches the same child', async () => {
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-rst-type-'));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  const socket = elsSocketPath(root);
+  const first = await startElsServer({ stateRoot: root });
+  if ('exitCode' in first) throw new Error(first.message);
+  cleanups.push(() => first.close());
+  await seatOp(socket);
+  const ownerTokenOfFirstRun = process.env[AUTH_OWNER_TOKEN_ENV]!;
+  const created = await requestEls(socket, { op: 'new', ws: 'OP', cwd: root, command: ['/bin/sh'] });
+  expect(created.exitCode).toBe(0);
+  const { pane } = JSON.parse(created.message) as { pane: string };
+  const ends: [number, string][] = [];
+  const errors: string[] = [];
+  const screens: string[] = [];
+  const attached = attachEls(socket, pane, { cols: 51, rows: 22 }, { onFrame: (frame) => { screens.push(frame.screen); }, onEnd: (code, reason) => { ends.push([code, reason]); }, onError: (message) => { errors.push(message); } });
+  await until(() => screens.length > 0);
+  attached.input('echo TYPE_BEFORE_RESTART\r');
+  await until(() => screens.some((screen) => screen.includes('TYPE_BEFORE_RESTART')));
+  await first.close();
+  await until(() => ends.length > 0);
+  const second = await startElsServer({ stateRoot: root });
+  if ('exitCode' in second) throw new Error(second.message);
+  cleanups.push(() => second.close());
+  cleanups.push(async () => { await requestEls(socket, { op: 'close', pane }); });
+  // This process env now holds the second run's token (the in-process server sets it); the owner TERMINAL is another process
+  // that still carries the first run's token — put it back so the reattach starts from exactly that stale credential.
+  expect(process.env[AUTH_OWNER_TOKEN_ENV]).not.toBe(ownerTokenOfFirstRun);
+  process.env[AUTH_OWNER_TOKEN_ENV] = ownerTokenOfFirstRun;
+  delete process.env[AUTH_PANE_TOKEN_ENV];
+  const after: string[] = [];
+  const reattached = attachEls(socket, pane, { cols: 51, rows: 22 }, { onFrame: (frame) => { after.push(frame.screen); }, onEnd: () => {}, onError: (message) => { errors.push(message); } });
+  cleanups.push(() => { try { reattached.detach(); } catch { /* already detached */ } });
+  await until(() => after.length > 0);
+  expect(after[0]).toContain('TYPE_BEFORE_RESTART');                   // the same child, the same screen
+  reattached.input('echo TYPE_AFTER_RESTART\r');
+  await until(() => after.some((screen) => screen.includes('TYPE_AFTER_RESTART')));   // one typed line reached the child through the attach
+  expect(errors).toEqual([]);                                          // and nothing was refused on the way
+}, LIT_TEST_MS);
+
+// The owner-token file belongs to the RUNNING server: a second start that is refused («already answers») must not rewrite it,
+// or an owner terminal re-reading it after a restart gets a token no server knows.
+test('a refused second start leaves the live server\'s owner-token file alone', async () => {
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-rst-tok-'));
+  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  const first = await startElsServer({ stateRoot: root });
+  if ('exitCode' in first) throw new Error(first.message);
+  cleanups.push(() => first.close());
+  const tokenFile = join(root, 'els', 'owner-token');
+  const liveToken = readFileSync(tokenFile, 'utf8');
+  expect(liveToken).toMatch(/^\S+$/);
+  const liveEnv = process.env[AUTH_OWNER_TOKEN_ENV];
+  const second = await startElsServer({ stateRoot: root });
+  expect('exitCode' in second ? second.message : 'started').toContain('already answers');
+  process.env[AUTH_OWNER_TOKEN_ENV] = liveEnv;                       // the refused start also touched this process env — not under test here
+  expect(readFileSync(tokenFile, 'utf8')).toBe(liveToken);
+});
 
 // D11(RES 2회차 ced7641f · OP #106630): 없는 실행 파일로 els new 를 열면 exit 0·빈 pane 이 아니라
 // 실패 코드·사유로 거부된다 — detached 홀더 스폰이 성공해도 커맨드 스폰 실패는 els new 응답 «전»에 밝혀야 한다.
 // (원문: bad_command_exit=0 · p506bcc51 exited — seat-state/RES-INFRA/evidence/20261120/els-round2-ced/)
 test('restart survive: a missing executable is refused by els new with a reason and leaves no pane behind', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-d11-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-d11-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const socket = elsSocketPath(root);
   const server = await startElsServer({ stateRoot: root });
   if ('exitCode' in server) throw new Error(server.message);
+  await seatOp(socket);
   cleanups.push(() => server.close());
   const bad = await requestEls(socket, { op: 'new', ws: 'OP', cwd: root, command: ['/not/a/real/command'] });
   expect(bad.exitCode).toBe(1);                            // 독립 리터럴: 실패 코드(exit 0·주소 아님)
@@ -92,11 +238,12 @@ test('restart survive: a missing executable is refused by els new with a reason 
 // execve 실패가 성공 pane 반환 «뒤» 비동기 종료된다(RES 독립 3/3 재현 → must 1). 스폰 전 점검이 실패
 // 코드·사유로 거부하고 pane 을 남기지 않는다 — 좋은 shebang 은 그대로 스폰된다(회귀 가드).
 test('restart survive: a script whose shebang interpreter is missing is refused up front, a good shebang still spawns', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-d11s-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-d11s-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const socket = elsSocketPath(root);
   const server = await startElsServer({ stateRoot: root });
   if ('exitCode' in server) throw new Error(server.message);
+  await seatOp(socket);
   cleanups.push(() => server.close());
   const bad = join(root, 'lit-bad-shebang.sh');
   writeFileSync(bad, '#!/no/such/interp/lit-d11\nexit 0\n');
@@ -125,7 +272,7 @@ test('restart survive: a script whose shebang interpreter is missing is refused 
 }, LIT_TEST_MS);
 
 test('holder adapter: detach leaves the holder serving; reattachHolder adopts it again by its meta', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-hold-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-hold-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const holder = await startHolder({ stateRoot: root, paneId: 'lit-rst-pane', cwd: root, command: ['/bin/sh'], title: 'lit' });
   cleanups.push(() => holder.close());

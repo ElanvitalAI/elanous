@@ -150,6 +150,65 @@ describe('ScheduleWakeup — 예약 → 그 시각에 H2 문 1회', () => {
   });
 });
 
+describe('SCHEDULE-WAKEUP-TURN-CAP — 상한 키는 «실제로 도는 턴»에 묶인다(실제 문 + 실제 스케줄러)', () => {
+  const wired = () => {
+    const clock = fakeClock();
+    const gate = createInternalTurnGate({
+      isEnabled: () => true, isTurnRunning: () => false, getBufferText: () => '',
+      getTypeaheadCount: () => 0, pendingKeyCount: () => 0, lastHumanKeyAt: () => 0, now: clock.now, log: () => {},
+    });
+    gate.port.attach(() => true);
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = createWakeupScheduler({
+      startTurnIfIdle: (i, o) => gate.startTurnIfIdle(i, o),
+      isTurnActive: (id) => gate.isInternalTurnActive() && gate.lastTurnId() === id,
+      now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+      log: (_c, event, data) => logs.push({ event, data }),
+      currentTurnId: () => gate.lastTurnId(),
+    });
+    // 한 턴에서 상한까지 쓰고(전부 허용), 바로 다음 호출이 거부되는지 본다.
+    const isCapped = (): boolean => {
+      const r = s.tryCancel('nope');
+      return !r.ok && r.capped === true;
+    };
+    const burn = (): { allowed: number; capped: boolean } => {
+      let allowed = 0;
+      for (let i = 0; i < WAKEUP_MAX_CALLS_PER_TURN; i++) {
+        if (!isCapped()) allowed++;
+      }
+      return { allowed, capped: isCapped() };
+    };
+    return { gate, s, logs, burn };
+  };
+
+  test('같은 턴의 7번째 호출은 거부 · 알림/우편 턴(문을 안 거침)마다 새 예산', () => {
+    const w = wired();
+    w.gate.noteHumanTurn();
+    w.gate.noteTurnStarted();
+    expect(w.burn()).toEqual({ allowed: WAKEUP_MAX_CALLS_PER_TURN, capped: true });
+    expect(w.logs.filter(l => l.event === 'loop-capped').map(l => l.data.turnId)).toEqual(['human-1']);
+    // seat-mail 알림 턴: noteHumanTurn 도 startTurnIfIdle 도 없이 시작 — 예전엔 human-1 이 그대로라 영구 잠금.
+    w.gate.noteTurnStarted();
+    expect(w.gate.lastTurnId()).toBe('turn-2');
+    expect(w.burn()).toEqual({ allowed: WAKEUP_MAX_CALLS_PER_TURN, capped: true });
+    w.gate.noteTurnStarted();
+    expect(w.gate.lastTurnId()).toBe('turn-3');
+    expect(w.burn()).toEqual({ allowed: WAKEUP_MAX_CALLS_PER_TURN, capped: true });
+  });
+
+  test('깨움 구동 턴(auto-N)도 새 예산 · 같은 id 로 시작을 알려도 한 번만 묶는다', () => {
+    const w = wired();
+    w.gate.noteHumanTurn();
+    w.gate.noteTurnStarted();
+    expect(w.burn().capped).toBe(true);
+    expect(w.gate.startTurnIfIdle('깨움', { origin: 'scheduled' })).toEqual({ opened: true, turnId: 'auto-2' });
+    expect(w.gate.takePending()?.turnId).toBe('auto-2');
+    expect(w.gate.noteTurnStarted()).toBe('auto-2');
+    expect(w.burn()).toEqual({ allowed: WAKEUP_MAX_CALLS_PER_TURN, capped: true });
+    expect(w.gate.lastTurnId()).toBe('auto-2');
+  });
+});
+
 describe('바쁨 → rejected ⊕ 버리지 않고 미룬다(TUI-WAKEUP-DEFER-NOT-DROP)', () => {
   test('일회성: 거부 → 60초 뒤 다시 → 열림', () => {
     const r = rig({ results: [{ opened: false, reason: 'NotIdle', detail: 'turn-running' }] });

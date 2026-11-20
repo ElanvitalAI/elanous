@@ -29,6 +29,12 @@ describe('splitMouse', () => {
 });
 
 describe('interpretMouse', () => {
+  test('ELS-SIDEBAR-HERDR-CLEAN: the word «new» in the list\'s last line opens the new-tab name row; «menu», the gap and the other cells do nothing', () => {
+    const boxed = { ...layout, sidebarNew: { y: 20, from: 1, to: 4 } };
+    const at = (x: number, y: number) => interpretMouse({ button: 0, x, y, release: false, bytes: '' }, boxed);
+    expect([at(2, 20), at(4, 20)]).toEqual([{ kind: 'new-tab' }, { kind: 'new-tab' }]);
+    expect([at(1, 20), at(5, 20), at(9, 20), at(2, 19)]).toEqual([null, null, null, null]);
+  });
   test('사이드바 행 클릭 → 첫 pane 선택', () => {
     expect(interpretMouse({ button: 0, x: 10, y: 2, release: false, bytes: '' }, layout))
       .toEqual({ kind: 'select', pane: 'p2' });
@@ -53,4 +59,10 @@ describe('keys 라우터', () => {
     expect(events[0]).toEqual({ kind: 'input', bytes: 'hi' });
     expect(events[1]?.kind).toBe('mouse');
   });
+});
+
+test('ctrl+b [ and ctrl+b ] are the scrollback page keys (up / down)', () => {
+  const router = createKeyRouter();
+  expect(router.feed('\u0002[')).toEqual([{ kind: 'action', action: 'scroll-up' }]);
+  expect(router.feed('\u0002]')).toEqual([{ kind: 'action', action: 'scroll-down' }]);
 });

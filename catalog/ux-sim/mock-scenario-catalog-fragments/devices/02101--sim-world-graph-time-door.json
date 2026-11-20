@@ -1,0 +1,25 @@
+{
+  "id": "sim-world-graph-time-door",
+  "name": "Graph sim world: 시계 장치 ① — 시각 트리거 문(cron 평가 · window 창 안 첫 깨움 · 놓친 실행 합치기 · 동일 분 dedupeKey time:<graphId>:<분 ISO>)을 실제 디스패치 엔진에 연결",
+  "audience": "internal",
+  "checklistCells": ["SCHEDULE-GRAPH-S1-MEMORY-LIFECYCLE"],
+  "implementation": ["src/ux-sim/sim-world/graph/schedule-devices.ts"],
+  "tests": ["src/ux-sim/sim-world/graph/schedule-devices.test.ts"],
+  "target": "graph 세계 — 시각 트리거 평가가 그래프 트리거 런(dispatchGraphTriggerRun)으로 이어지는가",
+  "inputs": [
+    "격리 우주에 선언한 그래프(loop.trigger.cron '0 3 * * *')와 깨움 시각(분 ISO)",
+    "window '02:00-05:00' 선언(현재 문법은 loop.trigger 를 cron·events 만 취급)",
+    "놓친 발화: 마지막 실행 2026-11-20T03:00 이후 문이 2026-11-24T07:00 에 깨어남"
+  ],
+  "observations": [
+    "SC1 03:00 정시 발화 1회 started",
+    "SC2 창 안 첫 깨움 1회 · 창 밖(05:30) 무발화",
+    "SC3 마지막 예정 발화 1회 + logs missed: 3 · 소급 런 없음",
+    "SC4 동일 분 재깨움 duplicate(같은 runId · 런 1개)",
+    "SC5 gate-window 국면 결합 skipped + logs 한 줄(런 0)"
+  ],
+  "entryCommands": ["bun test src/ux-sim/sim-world/graph/schedule-devices.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

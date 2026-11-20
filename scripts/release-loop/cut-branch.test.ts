@@ -143,7 +143,7 @@ test('--append dry-run suggests up to two main commits defining imports from its
   expect(f.git(f.repo, 'worktree', 'list', '--porcelain')).not.toContain('release-cut-append-dry-run-');
   expect(f.git(f.repo, 'show', `${depA}:src/cli/internal.ts`)).toContain('depA');
   expect(result.dependencyPicks?.flatMap((pick) => pick.symbols)).not.toContain('unrelatedMissing');
-});
+}, 120_000); // Worktree-backed conflict analysis over ~30 fixture commits exceeds bun's 5s default on shared train hosts.
 
 test('--append fast-forwards a new main pick onto release/9.9.9 and refuses a moved tip without force-push', () => {
   const f = fixture();

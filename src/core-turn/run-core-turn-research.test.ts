@@ -9,6 +9,7 @@ const applyDeferredToolsActual = deferredModule.applyDeferredTools;
 import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
 import { researchTurnForGrounding, runResearchQuestionLadder } from '../auto-research/research-turn.js';
+import { buildLedgerCitationRule, verifiedEvidenceUrls } from '../auto-research/synthesis-evidence-budget.js';
 import { fanOutAxisEvidence } from '../research/axis-fanout.js';
 import { routeResearchOutput } from '../research/output-router.js';
 import {
@@ -22,6 +23,7 @@ import {
   RESEARCH_TURN_SHALLOW_FINAL_ANSWER_DEADLINE_MS,
 } from './research-policy.js';
 import { runCoreTurn } from './run-core-turn.js';
+import { RESEARCH_NO_PROCESS_NARRATION_RULE } from './research-policy.js';
 
 const tool: LLMToolSpec = {
   name: 'Read', description: 'Read a file', parameters: { type: 'object', properties: {} },
@@ -272,6 +274,8 @@ test('final synthesis receives the production source ledger and trusted claim ci
   expect(trustedSynthesisRules).toContain('Each factual claim must include its own source URL');
   expect(trustedSynthesisRules).toContain('publisher date and checked date');
   expect(trustedSynthesisRules).toContain('미확인');
+  expect(trustedSynthesisRules).toContain(RESEARCH_NO_PROCESS_NARRATION_RULE);
+  expect(trustedSynthesisRules).toContain('must keep its 미확인 label');
   expect(result.finalText).toContain('published 2026-10-30; checked 2026-11-01');
 });
 
@@ -1364,4 +1368,43 @@ test('does not invoke the Bloom research pipeline for a non-research TUI turn', 
     return { ok: true, output: 'unexpected evidence' };
   } });
   expect(calls).toBe(0);
+});
+
+// 출처: OP #113993 · RES WEBCHAT-A2DF-MK-113947 — the revise step must cite every verified ledger source.
+test('revise step carries the verified-source count and a model echoing the ledger links cites every verified source', async () => {
+  const SOURCES = 16;
+  const questions = Array.from({ length: 6 }, (_, index) => ({
+    id: `q${index + 1}`, level: (index + 1) as 1 | 2 | 3 | 4 | 5 | 6, prompt: `Question ${index + 1}`, searchTerms: [`t${index + 1}`], sectionId: 's',
+  }));
+  const evidence = Array.from({ length: SOURCES }, (_, i) => ({
+    questionId: `q${(i % questions.length) + 1}`, sourceKind: 'web-search', source: `https://outlet${i}.example.com/story/${i}`,
+    observedAt: '2026-11-20T00:00:00.000Z', publishedAt: '2026-10-01T00:00:00.000Z',
+    content: `Captured page ${i} body. `.repeat(200), outcome: i % 5 === 4 ? 'partial' as const : 'complete' as const, truncated: false,
+  }));
+  const verifiedUrls = verifiedEvidenceUrls(evidence);
+  const grounding = researchTurnForGrounding({
+    ok: true, ladder: { request: 'r', questions, evidence }, output: `# Research\n\n${evidence.map(item => `- ${item.source}: ${item.content}`).join('\n')}`,
+  });
+  let modelCalls = 0;
+  let reviseRules = '';
+  let reviseLedger = '';
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages) => {
+    modelCalls += 1;
+    if (modelCalls === 1) return 'provisional answer';
+    reviseLedger = messages.find(item => item.role === 'user' && typeof item.content === 'string' && item.content.includes('<bloom-research>'))?.content as string ?? '';
+    reviseRules = messages.filter(item => item.role === 'system' && typeof item.content === 'string').map(item => item.content as string).join('\n');
+    // Fake model: cites every ledger link it can see.
+    return evidence.filter(item => reviseLedger.includes(`](${item.source})`)).map(item => `Claim [outlet](${item.source})`).join('\n');
+  });
+  const request = 'compare bond yield changes';
+  const result = await runCoreTurn({
+    sessionId: 'research-verified-citations', messages: [{ role: 'user', content: request }],
+    tools: [tool, skillExecTool, webSearchTool, omniSearchTool, webFetchTool], dispatchTool: async () => null, signal, userText: request,
+  }, { runResearch: async () => grounding });
+
+  expect(grounding.verifiedSourceCount).toBe(verifiedUrls.length);
+  expect(reviseRules).toContain(buildLedgerCitationRule(verifiedUrls.length));
+  expect(reviseLedger).toContain('Verified sources in this ledger: ' + verifiedUrls.length);
+  const finalVerified = verifiedUrls.filter(url => result.finalText.includes(`](${url})`));
+  expect(finalVerified).toEqual(verifiedUrls);
 });

@@ -21,6 +21,8 @@ export const PREFLIGHT_CRITICAL_ORDER_FIELDS = WORK_ORDER_CRITICAL_FIELDS;
 export interface TaPreflightEvidence {
   /** Identity of the card whose launch was examined, distinct from owner.card (the owner seat). */
   readonly cardId?: string | null;
+  /** Read-only RES allocation observation; launch binding is checked separately. */
+  readonly allocation?: { readonly host: string; readonly allocationId: string; readonly expiresAt: number } | null;
   /** ① 요청 pin 과 child 가 실제 받은 HEAD (둘 다 40자 hex 여야 PASS · 없으면 UNMEASURED). */
   readonly source?: { readonly requestedPin?: string | null; readonly childHead?: string | null; readonly privateRepo?: boolean | null };
   /** ② 요청 pin digest 와 실제 소비(Pod imageID) digest. */
@@ -42,6 +44,10 @@ export interface TaPreflightEvidence {
   /** ⑥ 입구 단일화·그라운딩. entrance 는 허용된 단일 입구(hand) 만 PASS. */
   readonly entrance?: {
     readonly name?: string | null;
+    /** Actual declared card target paths checked within its project. */
+    readonly targetPathsValid?: boolean | null;
+    /** Allocation host bound to the observed project and eventual launch. */
+    readonly targetHostBound?: boolean | null;
     /** (구) 그라운딩 URL 설정 여부 — 설정됐다고만 말하고 닿는지는 모른다. */
     readonly groundingConfigured?: boolean | null;
     /** 설정된 그라운딩 URL 의 도달 확인(true=닿음 · false=안 닿음 · null=미측정). URL 이 있으면 도달 증거가 PASS 의 조건이다. */
@@ -233,6 +239,10 @@ function checkEntrance(e: TaPreflightEvidence['entrance']): PreflightCondition {
   if (!e) return cond(6, name, 'UNMEASURED', '입구·그라운딩 증거 없음');
   const fails: string[] = [];
   const unknowns: string[] = [];
+  if (e.targetHostBound === false) fails.push('관측 호스트와 배정 발사 호스트 불일치');
+  else if (e.targetHostBound === null) unknowns.push('관측 호스트와 배정 발사 호스트 결속 미측정');
+  if (e.targetPathsValid === false) fails.push('카드 대상 경로 선언 오류 또는 프로젝트 밖');
+  else if (e.targetPathsValid === null) unknowns.push('카드 대상 경로 실재 미측정');
   const entrance = e && present(e.name) ? e.name : null;
   if (entrance === null) unknowns.push('입구 증거 없음');
   else if (entrance !== ALLOWED_ENTRANCE) fails.push(`허용 입구는 ${ALLOWED_ENTRANCE} 하나 — 받은 값 ${entrance}`);

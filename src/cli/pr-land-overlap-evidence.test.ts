@@ -1145,6 +1145,24 @@ describe('advanced base window (OVERLAP-EVIDENCE-BASE-WINDOW)', () => {
     expect(verifyWindow({ prFiles: ['src/cli/pr-cli.ts'], window: [{ sha: WINDOW_COMMIT, files: ['src/cli/pr-cli.ts'] }] }))
       .toMatchObject({ ok: false, reason: expect.stringContaining('base-stale-overlap:'), baseTip: BASE_TIP });
   });
+
+  // 델타 서로소: window 가 PR 이 만진 «테스트 파일 공유» 도 건드리지 않아야 한다.
+  test('refuses a window commit that touches the test file named after a PR-changed source file', () => {
+    expect(verifyWindow({ prFiles: ['src/cli/pr-cli.ts'], window: [{ sha: WINDOW_COMMIT, files: ['src/cli/pr-cli.test.ts'] }] }))
+      .toMatchObject({ ok: false, reason: expect.stringContaining('base-stale-overlap:'), baseTip: BASE_TIP });
+    expect(verifyWindow({ prFiles: ['src/cli/pr-cli.ts'], window: [{ sha: WINDOW_COMMIT, files: ['src/cli/pr-cli.test.ts'] }] }))
+      .toMatchObject({ reason: expect.stringContaining('shared test file') });
+  });
+
+  test('refuses a window commit that touches a test file the PR itself changes', () => {
+    expect(verifyWindow({ prFiles: ['src/cli/a.test.ts'], window: [{ sha: WINDOW_COMMIT, files: ['src/cli/a.test.ts'] }] }))
+      .toMatchObject({ ok: false, reason: expect.stringContaining('base-stale-overlap:') });
+  });
+
+  test('still accepts a window that touches only unrelated test files', () => {
+    expect(verifyWindow({ prFiles: ['src/cli/pr-cli.ts'], window: [{ sha: WINDOW_COMMIT, files: ['src/cli/other.test.ts'] }] }))
+      .toMatchObject({ ok: true, mode: 'base-advanced-disjoint' });
+  });
 });
 
 describe('same-head error review candidates', () => {

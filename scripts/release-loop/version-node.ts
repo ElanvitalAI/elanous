@@ -10,11 +10,12 @@ import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/reso
 import { landingFreezeMessage, readLandingFreeze, type LandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { baseVersion, isReleaseVersion, isStableVersion, prereleaseKind } from './release-version.js';
 import { cutReleaseBranch } from './cut-branch.js';
-import { runCutGateImagePrebuild, type CutGateImagePrebuildOutcome } from './gate-image-pin.js';
+import { runCutGateImagePrebuild, prebuildFailureLine, type CutGateImagePrebuildOutcome } from './gate-image-pin.js';
+import { awaitTrafficPrep, TrafficPrepHoldError, type TrafficPrepHold, type TrafficPrepHoldDeps } from './traffic-prep.js';
 
 class PrebuildError extends Error {
   constructor(readonly failure: Extract<CutGateImagePrebuildOutcome, { outcome: 'failed' }>) {
-    super(`cut gate image prebuild failed: ${failure.reason}`);
+    super(prebuildFailureLine(failure));
   }
 }
 
@@ -22,7 +23,9 @@ type Kind = 'release' | 'dev-bump';
 type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string;
   /** RELEASE-BRANCH: the release branch the cut lives on and the main commit it was cut from. */
   branch?: string; base?: string; existing?: boolean; skipped?: string;
-  artifactOwner?: { runId: string; attempt: number }; gateImagePrebuild?: CutGateImagePrebuildOutcome };
+  artifactOwner?: { runId: string; attempt: number }; gateImagePrebuild?: CutGateImagePrebuildOutcome;
+  /** RELEASE-TRAFFIC-PREP-T1H: the exhausted cut-entry hold (code TRAFFIC_NOT_PREPPED + detail reason). */
+  hold?: TrafficPrepHold };
 
 export function nextDevVersion(version: string): string {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(isReleaseVersion(version) ? baseVersion(version) : version);
@@ -520,6 +523,8 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
 export function main(args: string[] = process.argv.slice(2), repo = process.cwd(), deps: {
   cutBranch?: typeof cutReleaseBranch;
   prebuildGateImage?: typeof runCutGateImagePrebuild;
+  /** RELEASE-TRAFFIC-PREP-T1H test seam for the cut-entry hold (clock, sleep, receipt check); the hold itself always runs. */
+  trafficPrepHold?: TrafficPrepHoldDeps;
 } = {}): Output {
   let kind: Kind | null = null;
   let version: string | null = null;
@@ -532,6 +537,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
   let gatePodPool: string | undefined;
   let gateExecutor: string | undefined;
   let gateImagePin: string | undefined;
+  let graphNodeId: string | undefined;
   try {
     if (args[0] !== 'release' && args[0] !== 'dev-bump' && args[0] !== 'cut-branch' && args[0] !== 'gate-image-prebuild')
       throw new Error('usage: version-node.ts <release|dev-bump|cut-branch|gate-image-prebuild> [--version <v>] [--cut <sha>] [--cut-commit <sha>] [--pick <sha>] [--base <sha>] [--append] [--dry-run] [--no-prebuild] --json');
@@ -557,13 +563,14 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
-        runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown;
+        runId?: unknown; nodeId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown;
           branchCutBaseCommit?: unknown; gatePodPool?: unknown; gateExecutor?: unknown; gateImagePin?: unknown };
         outputs?: Record<string, { outcome?: unknown; commit?: unknown; base?: unknown; branch?: unknown } | undefined> };
       if (context.runId !== undefined) {
         if (typeof context.runId !== 'string') throw new Error('runId must be a string');
         runId = context.runId;
       }
+      if (typeof context.nodeId === 'string') graphNodeId = context.nodeId;
       if (!version && typeof context.input?.version === 'string') version = context.input.version;
       if (typeof context.input?.gatePodPool === 'string') gatePodPool = context.input.gatePodPool;
       if (typeof context.input?.gateExecutor === 'string') gateExecutor = context.input.gateExecutor;
@@ -599,6 +606,12 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     }
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
+    // RELEASE-TRAFFIC-PREP-T1H: the release graph's cut entry holds TRAFFIC_NOT_PREPPED until the T-1h traffic-prep
+    // receipt for this run version is valid; a bounded hold then fails with the reason codes and the QUICKPASS hint.
+    if (args[0] === 'release' && !dryRun && graphNodeId === 'cut-branch') {
+      const receipt = awaitTrafficPrep(version, { ...deps.trafficPrepHold, ...(runId !== undefined ? { runId } : {}) });
+      debug.log('release-loop.traffic-prep', 'cut-admitted', { runId, version, prepRunId: receipt.prepRunId, appliedAt: receipt.appliedAt });
+    }
     const prebuildGateImage = (commit: string | null): CutGateImagePrebuildOutcome | undefined => {
       if (typeof commit !== 'string' || !commit || dryRun || noPrebuild || gateExecutor !== 'pod' || gateImagePin !== 'cut-commit' || !gatePodPool || !runId) return undefined;
       const result = (deps.prebuildGateImage ?? runCutGateImagePrebuild)({ root: effectiveInstanceRoot(), repo: resolve(repo), runId, version: version!, commit, pool: gatePodPool });
@@ -637,7 +650,8 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     const outputVersion = kind === 'dev-bump' && version && isStableVersion(version)
       ? nextDevVersion(version) : version;
     return { outcome: 'error', kind, version: outputVersion,
-      commit: null, pr: null, ...(worktree ? { worktree } : {}), ...(error instanceof PrebuildError ? { gateImagePrebuild: error.failure } : {}), error: message };
+      commit: null, pr: null, ...(worktree ? { worktree } : {}), ...(error instanceof PrebuildError ? { gateImagePrebuild: error.failure } : {}),
+      ...(error instanceof TrafficPrepHoldError ? { hold: error.hold } : {}), error: message };
   }
 }
 

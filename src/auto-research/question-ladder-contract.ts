@@ -34,6 +34,8 @@ export interface ResearchEvidenceEnvelope {
   content: string;
   outcome: 'complete' | 'partial' | 'failed';
   truncated: boolean;
+  /** Structured reason of a failed envelope (e.g. `fetch-cap`); never inferred from `content`. */
+  failureReason?: string;
 }
 
 export interface ResearchQuestionLadder {

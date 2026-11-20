@@ -1,4 +1,19 @@
-# SIM-WORLD memory pack — rows { id, module } filled by the memory hand (SIM-WORLD §2 · contract seat-state/TC/SIM-KERNEL-API.md).
+# Memory sim world pack (SIM-WORLD-MEMORY · S0) — kernel pack schema 1 (seat-state/TC/SIM-KERNEL-API.md §1).
+# The kernel owns this file's existence and `eln sim world run memory`; the rows below belong to S0.
+# Expectations live in src/ux-sim/worlds/sim-world-expect.json (memory/M01 … memory/M12 and memory/M25: green except M09 and M10, which are xfail).
 schema: 1
 world: memory
-scenarios: []
+scenarios:
+  - { id: M01, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M02, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M03, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M04, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M05, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M06, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M07, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M08, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M09, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M10, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M11, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M12, module: src/ux-sim/sim-world/memory/scenarios.ts }
+  - { id: M25, module: src/ux-sim/sim-world/memory/scenarios.ts }

@@ -7,7 +7,7 @@ function core() {
   let stored: SpaceJournal = emptyJournal();
   let alive = true;
   const pty: ElsPty = { id: 'pty_1', isAlive: () => alive, write: () => {}, renderScreen: async () => 'live screen\n', onExit: () => {}, kill: () => { alive = false; } };
-  const owner = createElsCore({ load: () => stored, save: (next) => { stored = next; }, spawn: () => pty });
+  const owner = createElsCore({ load: () => stored, save: (next) => { stored = next; }, spawn: () => pty, now: () => 1_700_000_000_000 });
   owner.start();
   const created = JSON.parse(owner.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }).message) as { address: string; pane: string };
   return { owner, address: created.address, stored: () => stored };
@@ -18,7 +18,13 @@ test('GET /els/ls lists this host and its panes from the owner journal', async (
   const answer = await routeElsHttp(owner, 'node-b', 'GET', '/els/ls');
   const [ws, tab, pane] = address.split('/');
   expect(answer.status).toBe(200);
-  expect(JSON.parse(answer.body)).toEqual({ host: 'node-b', panes: [{ ws, tab, pane, title: 'sh', cwd: '/work', state: 'working' }] });
+  // #38986 — every ls row now carries a build badge (sha · age · the machine's DESIRED sha), which is the
+  // badge feature's concern, not this read window's: the window still lists exactly this host's panes.
+  const body = JSON.parse(answer.body) as { host: string; panes: ({ build?: unknown } & Record<string, unknown>)[] };
+  const panes = body.panes.map(({ build, ...row }) => row);
+  expect(body.host).toBe('node-b');
+  expect(panes).toEqual([{ ws, tab, pane, title: 'sh', cwd: '/work', state: 'working',
+    badge: 'working', badgeLabel: '[▶ working]', stalled: false, lastEventAtMs: 1_700_000_000_000 }]);
 });
 
 test('GET /els/read answers only for an address of this host that names exactly one pane', async () => {

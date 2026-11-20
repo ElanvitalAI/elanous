@@ -237,19 +237,20 @@ test('tasks preflight CLI: failClosed 는 증거 파일이 아니라 빌드의 �
   const dir = mkdtempSync(join(tmpdir(), 'ta-preflight-static-'));
   const evidencePath = join(dir, 'e.json');
   const receiptPath = join(dir, 'r.json');
-  writeFileSync(evidencePath, JSON.stringify({ ...staticBase, failClosed: { sourceHead: false, imageDigest: false } }));
+  writeFileSync(evidencePath, JSON.stringify({ ...staticBase, launchArgv: [...ARGV_CLOSED, '대상 경로: target.ts'], failClosed: { sourceHead: false, imageDigest: false } }));
   const lines: string[] = [];
   const program = new Command().name('elanous').exitOverride();
   const taskStatePath = join(dir, 'cards.json');
-  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'card-1': { id: 'card-1', text: ARGV_CLOSED.at(-1), status: 'handed', history: [] } } }));
+  writeFileSync(join(dir, 'target.ts'), '');
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'card-1': { id: 'card-1', seat: 'TC', text: '대상 경로: target.ts', project: { target: dir }, status: 'handed', history: [] } } }));
   registerTasksCommands(program, { output: (line) => lines.push(line), taskStatePath,
-    preflightActiveRuns: () => [], preflightHoldActive: () => false });
+    preflightActiveRuns: () => [], preflightHoldActive: () => false, preflightAllocation: () => null });
   const previous = process.exitCode;
   process.exitCode = undefined;
   try {
     await program.parseAsync(['node', 'elanous', 'tasks', 'preflight', '--evidence', evidencePath, '--out', receiptPath, '--commit', sha, '--cell', 'X']);
-    expect(Number(process.exitCode ?? 0)).toBe(0);
-    expect(lines.join('\n')).toContain('READY');
+    expect(Number(process.exitCode ?? 0)).toBe(1);
+    expect(lines.join('\n')).toContain('관측 호스트와 배정 발사 호스트 결속 미측정');
     const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
     expect(receipt.evidence.failClosed).toEqual({ sourceHead: true, imageDigest: true });
   } finally { process.exitCode = previous ?? 0; rmSync(dir, { recursive: true, force: true }); }
@@ -593,7 +594,7 @@ async function shadowThenPreflight(handArgs: string[]): Promise<{ handOut: strin
 test('실프로세스: hand shadow(--no-auto-merge) → preflight --hand-shadow 는 ③ PASS(merge 경로 닫힘)', async () => {
   const r = await shadowThenPreflight(['ship it', '--no-auto-merge']);
   expect(r.handOut).toContain('harness say --substrate pod --no-auto-merge');
-  expect(r.preflightOut).toMatch(/PASS {7}3\. 작업 지시서 · 귀속 · 자동 merge 0 — owner=TC/);
+  expect(r.preflightOut).toMatch(/UNMEASURED +3\. 작업 지시서 · 귀속 · 자동 merge 0 — 카드\/lease\/Pod owner 증거 부족/);
   expect(r.preflightOut).toMatch(/UNMEASURED +5\./u);
   expect(r.code).toBe(1);
 }, 400_000);
@@ -637,7 +638,7 @@ test('실프로세스: tasks preflight — 카드 미관측은 UNMEASURED, failC
   expect(r.exitCode).toBe(1);
   expect(r.stdout).toMatch(/UNMEASURED +5\./u);
   expect(r.stdout).toMatch(/PASS {7}1\. private repo \+ child 실제 HEAD — 정적: pin a{12} /);
-  expect(r.stdout).toMatch(/PASS {7}6\. 단일 입구 · 그라운딩 — 입구 hand · 그라운딩 policy-off — 사유: CROWN D2 M2 토큰 중계 안 켬\n/);
+  expect(r.stdout).toMatch(/UNMEASURED +6\. 단일 입구 · 그라운딩 — 관측 호스트와 배정 발사 호스트 결속 미측정/);
 }, 150_000);
 
 test('실프로세스: tasks preflight — 증거 한 칸이 빠지면 NOT_READY exit 1 (소스 private 증거 없음 → ① UNMEASURED)', async () => {

@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'bun:test';
 
-import { buildAcpWsUrl, buildVoiceWsUrl } from './daemon-config';
+import { buildAcpWsUrl, buildVoiceWsUrl, isBareWebChatOrigin } from './daemon-config';
 
 function cfg(baseUrl: string): { baseUrl: string; token: string; provider: string } {
   return { baseUrl, token: '', provider: 'anthropic' };
@@ -62,5 +62,23 @@ describe('buildVoiceWsUrl', () => {
 
   it('returns empty string when baseUrl is empty (skip voice WS open)', () => {
     expect(buildVoiceWsUrl(cfg(''))).toBe('');
+  });
+});
+
+describe('isBareWebChatOrigin (MK #109711 — server-delivered meta)', () => {
+  const doc = (content: string | null) => ({
+    querySelector: (sel: string) =>
+      sel === 'meta[name="elanous-bare-webchat"]' && content !== null
+        ? { getAttribute: () => content }
+        : null,
+  });
+  it('true only when the server-injected meta is "1"', () => {
+    expect(isBareWebChatOrigin(doc('1') as never)).toBe(true);
+    expect(isBareWebChatOrigin(doc('0') as never)).toBe(false);
+    expect(isBareWebChatOrigin(doc(null) as never)).toBe(false);
+  });
+  it('false without a DOM (normal origin / SSR / test doubles)', () => {
+    expect(isBareWebChatOrigin(undefined)).toBe(false);
+    expect(isBareWebChatOrigin({} as never)).toBe(false);
   });
 });

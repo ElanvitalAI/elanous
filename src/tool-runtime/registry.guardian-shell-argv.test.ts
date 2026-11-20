@@ -84,4 +84,39 @@ describe('registry dispatchToolByName — guardian shell-argv gate (TC #92362)',
     expect(res.result).toEqual({ ran: true });
     expect(calls).toEqual(['sudo -n true']);
   });
+
+  // JUD #110605 FU (APPROVAL-REQUEST-PLAINTEXT-TARGET) — 승인 요청 문안은 dispatch error 문자열에
+  // 실려 로그로 흐른다. 그 경로에서 토큰 꼴 값은 가려지고 평문 경로는 남는지 고정한다.
+  // 기대값은 전부 독립 리터럴(규칙 11). 가짜 토큰 — ghp_ + 36자(실제 자격 아님).
+  test('dispatch error masks a token-looking value in the command while the target path stays plain', async () => {
+    process.env['HARNESS_GUARDIAN_ENABLED'] = '1';
+    const fakeToken = 'ghp_' + 'Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2';
+    const res = (await dispatchToolByName(
+      'Bash',
+      { command: `rm -r /tmp/x/y/ ${fakeToken}` },
+      { surface: 'tui' },
+    )) as DispatchOutcome;
+    expect(res.ok).toBe(false);
+    const err = res.error ?? '';
+    expect(err).toContain('/tmp/x/y/');
+    expect(err).not.toContain(fakeToken);
+    expect(err).not.toContain('Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2');
+    expect(err).toContain('****');
+    expect(calls).toEqual([]);
+  });
+
+  test('dispatch error masks a separated --token value; target path stays plain', async () => {
+    process.env['HARNESS_GUARDIAN_ENABLED'] = '1';
+    const res = (await dispatchToolByName(
+      'Bash',
+      { command: 'rm -r /tmp/x/y/ --token Qw3rtyS3cretValue7' },
+      { surface: 'tui' },
+    )) as DispatchOutcome;
+    expect(res.ok).toBe(false);
+    const err = res.error ?? '';
+    expect(err).toContain('/tmp/x/y/');
+    expect(err).not.toContain('Qw3rtyS3cretValue7');
+    expect(err).toContain('****');
+    expect(calls).toEqual([]);
+  });
 });

@@ -12,6 +12,7 @@ inject:
 expect:
   declared:
     gateFailure: gate-triage
+    gateFailureRoute: cloud-leave-fail
     macrophageWake: { event: node-end, nodeId: gate, action: wake }
     argReturn: gate
   macrophage:

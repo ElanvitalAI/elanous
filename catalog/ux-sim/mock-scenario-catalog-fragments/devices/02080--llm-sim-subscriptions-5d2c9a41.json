@@ -1,0 +1,20 @@
+{
+  "id": "llm-sim-subscriptions",
+  "name": "LLM sim subscriptions (SimClock, codex x3, Claude x2)",
+  "implementation": ["src/ux-sim/llm-provider-world/subscriptions.ts"],
+  "tests": ["src/ux-sim/llm-provider-world/subscriptions.test.ts"],
+  "target": "fake LLM subscription accounts and a manipulable clock for the provider-automation simulation world: usage windows, reset times, usage_limit_reached replies and lease slots, with no real key, token or network",
+  "inputs": [
+    "a SimClock started from an ISO time with a time zone",
+    "per-window used percent or an exhaust call with a reset time"
+  ],
+  "observations": [
+    "observe() returns the LlmSpendRowState the spend decision consumes",
+    "call() after exhaustion answers 429 usage_limit_reached with resetsAt",
+    "advancing the clock past the reset time returns the window to 0 percent"
+  ],
+  "entryCommands": ["bun test src/ux-sim/llm-provider-world/subscriptions.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

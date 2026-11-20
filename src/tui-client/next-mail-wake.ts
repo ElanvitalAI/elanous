@@ -1,9 +1,10 @@
 // Seat mail reaches next TUI through the shared H2 gate; no prompt is typed into a pane.
-import { statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
+import { readSeatBudgetUsage, type SeatUsageBucket } from '../dashboard/input/seat-autowake-budget.js';
 import { detectSeatTui } from '../dashboard/seat-boot-preamble.js';
 import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../tui/input/internal-turn.js';
 import { defaultMsgStorePath, MsgStore, readUnreadSource, readUnreadSummary, type UnreadSource } from '../msg/msg-store.js';
@@ -43,6 +44,14 @@ export interface NextMailWakeDeps {
    * seen once that turn answered (`noteTurnFinished` → `recordSeen`). Default: the ledger.
    */
   recordDelivered?: (seat: string, maxId: number, turnId: string) => void;
+  /**
+   * Daily token budget for this seat's wake turns: `{budget, used}` or null (no budget configured / usage unknown).
+   * Default: `seat-state/<seat>/autowake-budget` + today's usage ledger (read only when that file holds a valid budget).
+   * Fail-open: a read failure is null (the wake proceeds) — see the gate in poll().
+   */
+  readBudgetUsage?: (now: Date) => { budget: number; used: number } | null;
+  /** Test seam for the default supply's usage ledger read (rows of one UTC day); null = unavailable. */
+  readBudgetLedger?: (day: string) => readonly SeatUsageBucket[] | null;
   /** Local «HH:MM» for a due timestamp (test seam for the time zone). */
   formatDue?: (iso: string) => string | null;
   intervalMs?: number;
@@ -147,6 +156,25 @@ export function ledgerRecordDelivered(path: string = defaultMsgStorePath()) {
   };
 }
 
+/** Default budget supply: no `autowake-budget` file → null with zero ledger reads. Any read failure → null (fail-open). */
+function defaultBudgetUsage(home: string, seat: string, ledger?: NextMailWakeDeps['readBudgetLedger']): (now: Date) => { budget: number; used: number } | null {
+  return now => {
+    let budgetText: string | undefined;
+    try { budgetText = readFileSync(join(home, 'elanous-hq', 'seat-state', seat, 'autowake-budget'), 'utf8'); }
+    catch { return null; }
+    const result = readSeatBudgetUsage({ seat, budgetText, now, readUsage: ledger ?? (day => {
+      // Lazy: the ledger module is touched only once a budget file exists.
+      const { readUsageDaily } = require('../budget/usage-daily-store.js') as typeof import('../budget/usage-daily-store.js');
+      const usage = readUsageDaily(undefined, day);
+      return usage && usage.unclassifiedRows === 0 ? usage.rows : null;
+    }) });
+    if (result.budget === null) return null; // no / invalid budget file: the gate is off
+    // A valid budget whose usage cannot be known is a read failure: surfaced (poll logs budget-read-error) and let through.
+    if (result.used === null) throw new Error('usage ledger unavailable');
+    return { budget: result.budget, used: result.used };
+  };
+}
+
 function regularFile(path: string): boolean {
   try { return statSync(path).isFile(); } catch { return false; }
 }
@@ -166,6 +194,11 @@ export function createNextMailWake(deps: NextMailWakeDeps): NextMailWake {
   const log = deps.log ?? ((event: string, data: Record<string, unknown>) => debug.log('tui.msg-wake', event, data));
   // OBSERVE-TURN-EVENT-LIFECYCLE — 우편 깨움 관측 주입(기본: debug 직접 방출).
   const turnLifeLog = deps.turnLifeLog ?? emitTurnLife;
+  const readBudgetUsage = deps.readBudgetUsage ?? (seat ? defaultBudgetUsage(home, seat, deps.readBudgetLedger) : () => null);
+  /** The held batch already reported for this UTC day (one event per batch per day, not one per 15s poll). */
+  let budgetHeldKey = '';
+  /** A failing budget read is warned once per (UTC day, error), not every 15s poll. */
+  let budgetErrorKey = '';
   let lastOpenedId = 0;
   let pendingId = 0;
   /** Messages whose bodies the pending turn carries (agent-sourced turns only). */
@@ -198,6 +231,27 @@ export function createNextMailWake(deps: NextMailWakeDeps): NextMailWake {
     if (!unread || unread.count <= 0 || !unread.maxId || unread.maxId <= lastOpenedId) return;
     // A batch that keeps ending without an answer waits out its back-off; a new message (higher id) starts fresh.
     if (noAnswer && noAnswer.maxId === unread.maxId && nowMs() < noAnswer.notBefore) return;
+    // Daily token budget (cost cap): spent → no wake turn; the mail stays unread and is re-judged on every poll, so the
+    // next UTC day (used resets) resumes it. Fail-open: an unreadable budget/ledger (null or throw) lets the wake through —
+    // this gate only caps cost, a missed wake costs more than a day's overrun, and the failure is logged as a warning.
+    let usage: { budget: number; used: number } | null = null;
+    try { usage = readBudgetUsage(new Date(nowMs())); }
+    catch (error) {
+      const key = `${new Date(nowMs()).toISOString().slice(0, 10)}:${String(error)}`;
+      if (budgetErrorKey !== key) {
+        budgetErrorKey = key;
+        log('budget-read-error', { seat, error: String(error) });
+      }
+    }
+    if (usage && usage.used >= usage.budget) {
+      const day = new Date(nowMs()).toISOString().slice(0, 10);
+      const key = `${unread.maxId}@${day}`;
+      if (budgetHeldKey !== key) {
+        budgetHeldKey = key;
+        log('rejected', { seat, maxId: unread.maxId, count: unread.count, reason: 'token-budget', budget: usage.budget, used: usage.used });
+      }
+      return;
+    }
     // MSG-SOURCE-HIERARCHY: one agent sender (OP …) → the turn is drawn under «⇢ OP · request · due …»; mixed → system.
     let from: MessageSource | undefined;
     let source: UnreadSource | null = null;

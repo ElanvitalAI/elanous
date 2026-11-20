@@ -1,4 +1,5 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import { join, resolve } from 'node:path';
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
@@ -199,7 +200,7 @@ async function waitForHeldTui(entry: string, cwd: string, env: NodeJS.ProcessEnv
     await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
   }
   if (child.pid !== undefined) {
-    try { process.kill(-child.pid, 'SIGTERM'); } catch { /* process may already have exited */ }
+    await terminateTree(child, { group: true });
   }
   const output = existsSync(logPath) ? readFileSync(logPath, 'utf8') : '';
   throw new Error(`held TUI did not register an alive PTY before the shared deadline (waitedMs=${Date.now() - startedAt}; ${last}): ${output.slice(-1200)}`);
@@ -306,7 +307,7 @@ export async function runTuiTestUniverse(options: { readyTimeoutMs?: number; wit
     return { worktree, ptyId, runId: row.runId, nexusUrl, nexusPid: nexusProcess.pid ?? -1, snapshotPath, readyTimeoutMs, waitedMs: Date.now() - ptyReadyStartedAt, pwaBuild };
   } catch (error) {
     if (launcher?.pid !== undefined) {
-      try { (deps.killProcessGroup ?? ((pid) => process.kill(-pid, 'SIGTERM')))(launcher.pid); } catch { /* launcher group may already have exited */ }
+      try { (deps.killProcessGroup ?? ((pid) => { void terminateTree({ pid }, { group: true }); }))(launcher.pid); } catch { /* launcher group may already have exited */ }
     }
     try {
       const ptyRows = JSON.parse(checkedRun(deps, 'bun', buildHeldTuiRegistryArgs(targetEntry, testStateDir), worktree, testEnv, 10_000)) as Array<{ id?: string; alive?: boolean }>;

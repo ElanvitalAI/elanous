@@ -57,14 +57,16 @@ test('compose: sidebar | pane with the pane colours kept, the cursor placed at t
 function harness(initial: string, size = { cols: 80, rows: 24 }, remembered: { sidebar?: boolean; lastPane?: string } = {}, sidebar?: boolean) {
   const saved: { sidebar: boolean; lastPane?: string }[] = [];
   let listing = initial;
+  let lsAway: string | undefined;                                 // D1a: what `ls` answers while the els server is away
+  let poll: (() => void) | undefined;                             // D1a: the poll timer's callback, driven by tick()
   const requests: ElsRequest[] = [];
-  const attachments: { pane: string; size: { cols: number; rows: number }; handlers: AttachHandlers; typed: string[]; resizes: [number, number][]; detached: boolean }[] = [];
+  const attachments: { pane: string; size: { cols: number; rows: number }; handlers: AttachHandlers; typed: string[]; resizes: [number, number][]; scrolls: number[]; detached: boolean }[] = [];
   const writes: string[] = [];
   let created = 0;
   const app = createAttachApp({
     request: async (request): Promise<ElsResult> => {
       requests.push(request);
-      if (request.op === 'ls') return { exitCode: 0, message: listing };
+      if (request.op === 'ls') return lsAway ? { exitCode: 1, message: lsAway } : { exitCode: 0, message: listing };
       if (request.op === 'new') {
         created++;
         const pane = `pnew${created}`;
@@ -78,22 +80,22 @@ function harness(initial: string, size = { cols: 80, rows: 24 }, remembered: { s
       return { exitCode: 0, message: '' };
     },
     attach: (pane, paneSize, handlers): Attached => {
-      const entry = { pane, size: paneSize, handlers, typed: [] as string[], resizes: [] as [number, number][], detached: false };
+      const entry = { pane, size: paneSize, handlers, typed: [] as string[], resizes: [] as [number, number][], scrolls: [] as number[], detached: false };
       attachments.push(entry);
-      return { input: (bytes) => { entry.typed.push(bytes); }, resize: (cols, rows) => { entry.resizes.push([cols, rows]); }, detach: () => { entry.detached = true; } };
+      return { input: (bytes) => { entry.typed.push(bytes); }, resize: (cols, rows) => { entry.resizes.push([cols, rows]); }, scroll: (lines) => { entry.scrolls.push(lines); }, detach: () => { entry.detached = true; } };
     },
     write: (text) => { writes.push(text); },
     size: () => size,
     cwd: '/work/proj',
     env: { SHELL: '/bin/zsh' },
-    setInterval: () => 0,
+    setInterval: (callback: () => void) => { poll = callback; return 0; },
     clearInterval: () => {},
     pollMs: 1000,
     chatCommand: ['/opt/elanous/bin/elanous'],
     memory: { load: () => remembered, save: (state) => { saved.push(state); } },
     ...(sidebar === undefined ? {} : { sidebar }),
   });
-  return { app, saved, requests, attachments, writes, setListing: (next: string) => { listing = next; }, lastScreen: () => plain(writes.at(-1) ?? '') };
+  return { app, saved, requests, attachments, writes, setListing: (next: string) => { listing = next; }, setLsAway: (message: string | undefined) => { lsAway = message; }, tick: () => { poll?.(); }, lastScreen: () => plain(writes.at(-1) ?? '') };
 }
 
 test('app: an empty server gets one new shell (defaults: $SHELL, this folder, folder-named workspace) and the view attaches to it at the pane size', async () => {
@@ -109,7 +111,7 @@ test('app: starts on the first pane that is still running; exited panes stay in 
   await h.app.start();
   expect(h.requests.filter((r) => r.op === 'close')).toEqual([]);
   expect(h.attachments.map((a) => a.pane)).toEqual(['live']);
-  expect(h.lastScreen()).toContain('dead');                         // the exited tab is still there, dimmed
+  expect(h.lastScreen()).toContain('DEAD');                         // the exited tab is still there, dimmed
 });
 
 test('app: every pane exited (els reopened after the last shell ended) → a fresh $SHELL pane in this folder\'s space is opened and attached, not the exited one (ELS-FIRST-RUN-LIVE-PANE)', async () => {
@@ -137,28 +139,29 @@ test('app: keys — input goes to the pane; ctrl+b j/k and 1-9 move between the 
   h.app.key('\u0002w');
   h.app.key('\u00022');                                           // the second tab of w1
   expect(h.attachments.at(-1)!.pane).toBe('p2');
-  expect(h.lastScreen().split('\r\n')[0]).toContain('│🛠 one  🛠 two  +');   // FU3: «emoji name» tabs, focus = reverse video
+  expect(h.writes.at(-1) ?? '').toContain('│\u001b[100;37m 🛠 ONE \u001b[49;39m \u001b[44;37m 🛠 TWO \u001b[49;39m +');   // ELS-TAB-STYLE-HERDR: UPPERCASE padded tabs, focus blue, others gray
   h.app.key('\u0002b');
   expect(h.attachments.at(-1)!.resizes.at(-1)).toEqual([80, 22]);
-  expect(h.lastScreen()).not.toContain('+ new · ≡ menu');
+  expect(h.lastScreen()).not.toContain('new · menu');
 });
 
 test('app: frames from a stale attach are ignored after a switch; the current frame is painted next to the list', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle')));
   await h.app.start();
   h.app.key('\u0002w');
-  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 23, screen: '[screen 51x23 cursor=(row 0, col 0, visible true)]\nSTALE' });
-  h.attachments[1]!.handlers.onFrame({ pane: 'p2', seq: 1, cols: 51, rows: 23, screen: '[screen 51x23 cursor=(row 0, col 2, visible true)]\nfresh$ ' });
+  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 23, back: 0, screen: '[screen 51x23 cursor=(row 0, col 0, visible true)]\nSTALE' });
+  h.attachments[1]!.handlers.onFrame({ pane: 'p2', seq: 1, cols: 51, rows: 23, back: 0, screen: '[screen 51x23 cursor=(row 0, col 2, visible true)]\nfresh$ ' });
   const screen = h.lastScreen();
   expect(screen).toContain('fresh$');
   expect(screen).not.toContain('STALE');
-  expect(screen).toContain('name-w1');
+  expect(screen).toContain('NAME-W1');
 });
 
 test('app: c opens a pane in the current workspace, N a new workspace named after the folder (suffix when taken), x asks first and closes only on y, D likewise for the workspace', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
   await h.app.start();
   h.app.key('\u0002c');
+  h.app.key('\r');                                                  // ELS-NEW-TAB-NAME-WIDGET: c opens the name prompt; Enter on an empty name = the default tab
   await Bun.sleep(20);
   expect(h.requests.filter((r) => r.op === 'new').at(-1)).toEqual({ op: 'new', ws: 'name-w1', cwd: '/work/proj', command: ['/bin/zsh'] });
   expect(h.attachments.at(-1)!.pane).toBe('pnew1');
@@ -176,11 +179,12 @@ test('app: c opens a pane in the current workspace, N a new workspace named afte
   h.app.key('y');
   await Bun.sleep(20);
   expect(h.requests.filter((r) => r.op === 'close')).toHaveLength(closesBefore + 1);
+  expect(h.requests.filter((r) => r.op === 'close').at(-1)).toMatchObject({ confirmed: true });   // the y is the human confirmation the door asks for (#39143)
   h.app.key('\u0002D');
   expect(h.lastScreen()).toContain('작업공간');
   h.app.key('y');
   await Bun.sleep(20);
-  expect(h.requests.some((r) => r.op === 'close-workspace')).toBe(true);
+  expect(h.requests.filter((r) => r.op === 'close-workspace').at(-1)).toMatchObject({ confirmed: true });
 });
 
 test('app: ctrl+b q detaches with code 0 and releases the attach without closing anything; an unknown prefix key is said, not typed', async () => {
@@ -195,7 +199,7 @@ test('app: ctrl+b q detaches with code 0 and releases the attach without closing
   expect(h.requests.some((r) => r.op === 'close' || r.op === 'close-workspace')).toBe(false);
 });
 
-test('app: the selected pane exits with another pane left → the focus moves to it (ELS-LAST-TAB-EXIT); the server going away ends the app with code 1', async () => {
+test('app: the selected pane exits with another pane left → the focus moves to it (ELS-LAST-TAB-EXIT); the server going away is waited out, not the end (D1a)', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle')));
   await h.app.start();
   h.setListing(listOf(row('w1', 'p1', 'one', 'exited'), row('w1', 'p2', 'two', 'idle')));
@@ -203,7 +207,10 @@ test('app: the selected pane exits with another pane left → the focus moves to
   expect(h.attachments.at(-1)!.pane).toBe('p2');
   expect(h.lastScreen()).toContain('pane 종료됨');
   h.attachments.at(-1)!.handlers.onEnd(1, 'els: the els server closed the connection');
-  expect(await h.app.done).toEqual({ code: 1, message: 'els: the els server closed the connection' });
+  // D1a(ELS-SERVER-RESTART-SURVIVE): a server lost after a good list no longer ends the view — the screen stays and
+  // the status line says it is coming back (the dedicated D1a test below rides the whole cycle).
+  expect(h.lastScreen()).toContain('서버 재기동 중 — 다시 붙는 중…');
+  expect(await Promise.race([h.app.done.then(() => 'ended'), Bun.sleep(30).then(() => 'still running')])).toBe('still running');
 });
 
 test('app: the last pane exits → the els view closes with code 0 (back to the terminal), like herdr; nothing is closed on the server (ELS-LAST-TAB-EXIT)', async () => {
@@ -217,20 +224,20 @@ test('app: the last pane exits → the els view closes with code 0 (back to the 
 test('toggle: ctrl+b s hides and shows the list (the pane is resized each time) and the choice is remembered', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
   await h.app.start();
-  expect(h.lastScreen()).toContain('+ new · ≡ menu');
+  expect(h.lastScreen()).toContain('new · menu');
   h.app.key('\u0002s');
-  expect(h.lastScreen()).not.toContain('+ new · ≡ menu');
+  expect(h.lastScreen()).not.toContain('new · menu');
   expect(h.attachments[0]!.resizes.at(-1)).toEqual([80, 22]);
   expect(h.saved.at(-1)).toEqual({ sidebar: false, lastPane: 'p1' });
   h.app.key('\u0002s');
-  expect(h.lastScreen()).toContain('+ new · ≡ menu');
+  expect(h.lastScreen()).toContain('new · menu');
   expect(h.attachments[0]!.resizes.at(-1)).toEqual([51, 22]);
   expect(h.saved.at(-1)).toEqual({ sidebar: true, lastPane: 'p1' });
 });
 
 test('start state: --no-side beats a remembered open list, a remembered closed list stays closed, nothing remembered = open (els)', async () => {
   const listing = listOf(row('w1', 'p1', 'one', 'idle'));
-  const first = (h: ReturnType<typeof harness>) => h.lastScreen().includes('+ new · ≡ menu');
+  const first = (h: ReturnType<typeof harness>) => h.lastScreen().includes('new · menu');
   const a = harness(listing, undefined, { sidebar: true }, false); await a.app.start(); expect(first(a)).toBe(false);
   const b = harness(listing, undefined, { sidebar: false }); await b.app.start(); expect(first(b)).toBe(false);
   const c = harness(listing, undefined, { sidebar: false }, true); await c.app.start(); expect(first(c)).toBe(true);
@@ -271,7 +278,7 @@ test('quit while a request is in flight: a pane created / a close answered after
         if (request.op === 'new') { await gate; return { exitCode: 0, message: JSON.stringify({ pane: 'late' }) }; }
         return { exitCode: 0, message: request.op === 'ls' ? listing : '' };
       },
-      attach: (pane): Attached => { attachments.push(pane); return { input: () => {}, resize: () => {}, detach: () => {} }; },
+      attach: (pane): Attached => { attachments.push(pane); return { input: () => {}, resize: () => {}, scroll: () => {}, detach: () => {} }; },
       write: (text) => { writes.push(text); },
       size: () => ({ cols: 80, rows: 24 }),
       cwd: '/work/proj', env: { SHELL: '/bin/zsh' },
@@ -281,7 +288,8 @@ test('quit while a request is in flight: a pane created / a close answered after
     });
     await app.start();
     expect(attachments).toEqual(['p1']);
-    app.key(key);                       // the request is now waiting on the gate
+    app.key(key === '\u0002c' ? `${key}\r` : key);   // c opens the name prompt, Enter saves it
+    // the request is now waiting on the gate
     app.key('\u0002q');
     expect(await app.done).toEqual({ code: 0, message: '' });
     const savedBefore = saved.length;
@@ -321,7 +329,7 @@ test('app: herdr panes join the left list under «⇄herdr …»; selecting one 
   let tick: () => void = () => {};
   const app = createAttachApp({
     request: async (request): Promise<ElsResult> => request.op === 'ls' ? { exitCode: 0, message: listOf(row('w1', 'p1', 'mine', 'idle')) } : { exitCode: 0, message: '' },
-    attach: (pane, size, handlers): Attached => { const a = { pane, typed: [] as string[] }; attachments.push({ ...a, size, handlers, resizes: [], detached: false }); return { input: (b) => { a.typed.push(b); attachments.at(-1)!.typed.push(b); }, resize: () => {}, detach: () => {} }; },
+    attach: (pane, size, handlers): Attached => { const a = { pane, typed: [] as string[] }; attachments.push({ ...a, size, handlers, resizes: [], scrolls: [], detached: false }); return { input: (b) => { a.typed.push(b); attachments.at(-1)!.typed.push(b); }, resize: () => {}, scroll: () => {}, detach: () => {} }; },
     write: (text) => { screens.push(plain(text)); },
     size: () => ({ cols: 100, rows: 12 }), cwd: '/work/proj', env: {},
     setInterval: (callback) => { tick = callback; return 0; }, clearInterval: () => {}, pollMs: 1000, chatCommand: ['x'],
@@ -331,12 +339,12 @@ test('app: herdr panes join the left list under «⇄herdr …»; selecting one 
   const screens: string[] = [];
   await app.start();
   await Bun.sleep(20);
-  expect(screens.at(-1)!).toContain(' ⊞ herdr · 1');               // FU3: herdr's spaces fold under one head on the left
+  expect(screens.at(-1)!).toContain(' ⊞ HERDR · 1');               // FU3: herdr's spaces fold under one head on the left
   app.key('\u0002w');                                             // next space: the herdr one
   await Bun.sleep(20);
   expect(reads).toEqual(['herdr:w1/t2/p2']);
   expect(screens.at(-1)!).toContain('HERDR SCREEN of herdr:w1/t2/p2');
-  expect(screens.at(-1)!).toContain('│🌐 mshq 주 OP  +');                             // the remote pane's tab (FU3 form)
+  expect(screens.at(-1)!).toContain('│ 🌐 ⇄herdr MSHQ 주 OP  +');                             // the remote pane's tab (FU3 form)
   expect(screens.at(-1)!).toContain('읽기 전용');
   app.key('rm -rf x\r');
   await Bun.sleep(5);
@@ -357,7 +365,7 @@ test('app: a failing or empty federated list leaves the local list as it was; a 
   let tick: () => void = () => {};
   const app = createAttachApp({
     request: async (request): Promise<ElsResult> => request.op === 'ls' ? { exitCode: 0, message: listOf(row('w1', 'p1', 'mine', 'idle')) } : { exitCode: 0, message: '' },
-    attach: (): Attached => ({ input: () => {}, resize: () => {}, detach: () => {} }),
+    attach: (): Attached => ({ input: () => {}, resize: () => {}, scroll: () => {}, detach: () => {} }),
     write: (text) => { screens.push(plain(text)); }, size: () => ({ cols: 100, rows: 12 }), cwd: '/w', env: {},
     setInterval: (callback) => { tick = callback; return 0; }, clearInterval: () => {}, pollMs: 1000, chatCommand: ['x'],
     memory: { load: () => ({}), save: () => {} },
@@ -379,7 +387,7 @@ function remoteApp(remote: { list: () => Promise<ElsResult>; read: (address: str
   let tick: () => void = () => {};
   const app = createAttachApp({
     request: async (request): Promise<ElsResult> => request.op === 'ls' ? { exitCode: 0, message: listOf(row('w1', 'p1', 'mine', 'idle')) } : { exitCode: 0, message: '' },
-    attach: (): Attached => ({ input: () => {}, resize: () => {}, detach: () => {} }),
+    attach: (): Attached => ({ input: () => {}, resize: () => {}, scroll: () => {}, detach: () => {} }),
     write: (text) => { screens.push(plain(text)); }, size: () => ({ cols, rows: 12 }), cwd: '/w', env: {},
     setInterval: (callback) => { tick = callback; return 0; }, clearInterval: () => {}, pollMs: 1000, chatCommand: ['x'],
     memory: { load: () => ({}), save: () => {} }, remote,
@@ -440,9 +448,9 @@ test('federation status shows unreachable host and clears it after reconnection'
     read: async () => ({ exitCode: 1, message: 'unreachable' }),
   });
   await app.start(); await Bun.sleep(20);
-  expect(screens.at(-1)!).toContain('⇄node-b ?');
+  expect(screens.at(-1)!).toContain('⇄node-b ✕');
   down = false; tick(); await Bun.sleep(30);
-  expect(screens.at(-1)!).not.toContain('⇄node-b ?');
+  expect(screens.at(-1)!).not.toContain('⇄node-b ✕');
 });
 
 test('unreachable host stays visible in a narrow terminal', async () => {
@@ -451,27 +459,50 @@ test('unreachable host stays visible in a narrow terminal', async () => {
     read: async () => ({ exitCode: 1, message: 'unreachable' }),
   }, 40);
   await app.start(); await Bun.sleep(20);
-  expect(screens.at(-1)!).toContain('⇄node-b ?');
+  expect(screens.at(-1)!).toContain('⇄node-b ✕');
 });
 
-// ---- ELS-REMOTE-MARKER: a host reported down keeps its last known panes, marked «?» (they no longer vanish) ------------
-test('app: a host reported down keeps its space and tab marked «?»; they come back live when it answers again', async () => {
+// ---- ELS-REMOTE-MARKER: a host reported down keeps its last known panes, marked «✕» (they no longer vanish) ------------
+test('app: a host reported down keeps its space and tab marked «✕»; they come back live when it answers again', async () => {
   let reach: 'up' | 'down' = 'up';
   const answer = (): ElsResult => ({ exitCode: 0, message: JSON.stringify({ hosts: [{ name: 'node-b', reach }], workspaces: [], tabs: [],
     panes: reach === 'up' ? [fedRow('node-b', 'wa', 'tb', 'pc', 'review', 'blocked')] : [] }) });
   const { app, screens, tick } = remoteApp({ list: async () => answer(), read: async () => ({ exitCode: 1, message: 'unreachable' }) });
   await app.start(); await Bun.sleep(20);
-  expect(screens.at(-1)!).toContain(' ◐ ⇄node-b wa · 1');
+  expect(screens.at(-1)!).toContain(' ◐ ⇄MSB1 WA');
   app.key('\u0002w'); await Bun.sleep(20);                         // the node-b space: its pane is the tab
-  expect(screens.at(-1)!).toContain('│🌐 review  +');
+  expect(screens.at(-1)!).toContain('│ 🌐 ⇄node-b REVIEW  +');
   reach = 'down'; tick(); await Bun.sleep(30);
-  expect(screens.at(-1)!).toContain('? ⇄node-b wa · 1');             // the space stays, marked unreachable
-  expect(screens.at(-1)!).toContain('│🌐 review ?  +');                            // and so does its last known tab
-  expect(screens.at(-1)!).toContain('⇄node-b ?');                    // the status line says so too (#38616)
+  expect(screens.at(-1)!).toContain('✕ ⇄MSB1 WA');             // the space stays, marked unreachable
+  expect(screens.at(-1)!).toContain('│ 🌐 ⇄node-b REVIEW ✕  +');                            // and so does its last known tab
+  expect(screens.at(-1)!).toContain('⇄node-b ✕');                    // the status line says so too (#38616)
   reach = 'up'; tick(); await Bun.sleep(30);
-  expect(screens.at(-1)!).toContain('│🌐 review  +');
-  expect(screens.at(-1)!).not.toContain('🌐 review ?');
+  expect(screens.at(-1)!).toContain('│ 🌐 ⇄node-b REVIEW  +');
+  expect(screens.at(-1)!).not.toContain('🌐 ⇄node-b REVIEW ✕');
 });
+
+// ELS-REMOTE-MARKER: every surface (list · tab title · status line) × wide / narrow shows ⇄host, and a down host shows ✕ (not «?»).
+for (const [cols, name] of [[120, 'wide'], [40, 'narrow']] as const) {
+  test(`app (${name} ${cols} cols): remote pane is ⇄node-b on list/tab/status; after the host goes down the marker is ✕, never «?»`, async () => {
+    let reach: 'up' | 'down' = 'up';
+    const { app, screens, tick } = remoteApp({ read: async () => ({ exitCode: 0, message: 'remote screen' }),
+      list: async () => ({ exitCode: 0, message: JSON.stringify({ hosts: [{ name: 'node-b', reach }], workspaces: [], tabs: [],
+        panes: reach === 'up' ? [fedRow('node-b', 'wa', 'tb', 'pc', 'review', 'blocked')] : [] }) }) }, cols);
+    await app.start(); await Bun.sleep(20);
+    app.key('\u0002w'); await Bun.sleep(20);
+    const up = screens.at(-1)!;
+    expect(up).toContain('⇄node-b wa');                    // list (wide: side list · narrow: dropdown line)
+    expect(up).toContain(cols >= 60 ? '│ 🌐 ⇄node-b REVIEW' : '⇄node-b REVIEW');   // tab title
+    expect(up).toContain('⇄node-b wa ▸ review');            // status line
+    expect(up).not.toContain('⇄node-b ✕');
+    expect(up).not.toContain('✕ ⇄node-b');
+    reach = 'down'; tick(); await Bun.sleep(30);
+    const down = screens.at(-1)!;
+    expect(down).toContain('⇄node-b ✕');  // status line host chip
+    expect(down).not.toContain('⇄node-b ?');
+    if (cols >= 60) { expect(down).toContain('✕ ⇄MSB1 WA'); expect(down).toContain('│ 🌐 ⇄node-b REVIEW ✕'); }
+  });
+}
 
 // ---- ELS-VOICE-CONTROL-POPUP (OP #101856 · #101876): ctrl+b : → say it → preview → Enter (closes need y) → the same els requests
 test('app: ctrl+b : — «two 탭 삭제해줘» shows ⚠ and Enter alone closes nothing; y closes it once; «새 셸 열어줘» → Enter → Enter opens one shell', async () => {
@@ -485,7 +516,7 @@ test('app: ctrl+b : — «two 탭 삭제해줘» shows ⚠ and Enter alone close
   expect(h.lastScreen()).toContain('취소 (y 가 아님)');
   h.app.key('\u0002:'); h.app.key('two 탭 삭제해줘\r'); await Bun.sleep(10);
   h.app.key('y'); await Bun.sleep(20);
-  expect(h.requests.filter((r) => r.op === 'close')).toEqual([{ op: 'close', pane: 'p2' }]);
+  expect(h.requests.filter((r) => r.op === 'close')).toEqual([{ op: 'close', pane: 'p2', confirmed: true }]);
   expect(h.lastScreen()).toContain('완료: 탭 two 닫기');
   const before = h.requests.filter((r) => r.op === 'new').length;
   h.app.key('\u0002:'); h.app.key('새 셸 열어줘\r'); await Bun.sleep(10);
@@ -511,7 +542,7 @@ test('app: clicking ✕ on a space where nothing runs closes that space and leav
   await h.app.start();
   h.app.key(click(76));
   expect(await h.app.done).toEqual({ code: 0, message: '' });
-  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1' }]);   // only this space
+  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1', confirmed: true }]);   // only this space
 });
 
 test('app: ✕ with something running asks «⚠ N개 실행 중 — 종료?»; any key but y closes nothing; ctrl+b Q then y closes and leaves', async () => {
@@ -525,5 +556,273 @@ test('app: ✕ with something running asks «⚠ N개 실행 중 — 종료?»; 
   h.app.key('\u0002Q');
   h.app.key('y');
   expect(await h.app.done).toEqual({ code: 0, message: '' });
-  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1' }]);
+  expect(h.requests.filter((r) => r.op === 'close-workspace')).toEqual([{ op: 'close-workspace', ws: 'w1', confirmed: true }]);
+});
+
+// ---- ELS-MOUSE ③ (OP #101585): 탭 클릭 → 그 탭 포커스 — attach·입력·반전 표식이 모두 클릭한 탭으로 간다 -------------
+const TAB_ROW_CLICK_Y = 1;   // 탭 줄 = 화면 첫 줄(사이드바 오른쪽 · FU3 배치)
+const P2_TAB_CLICK_X = 40;   // 사이드바 28칸 + 구분선 1칸 + 첫 탭 8칸 + 간격 1칸 오른쪽, 두 번째 탭 안(패딩 다음 칸 · 1 기반 SGR 좌표)
+test('app: 마우스로 탭을 클릭하면 그 탭이 포커스된다 — attach 가 그 pane 으로, 입력이 그 pane 으로, 파랑(SGR 44) 표식이 그 탭으로 이동 (OP #101585 ③)', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle'), row('w2', 'p3', 'three', 'idle')));
+  await h.app.start();
+  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m 🛠 ONE \u001b[49;39m');        // 시작 표식은 첫 탭 p1
+  h.app.key(click(P2_TAB_CLICK_X, TAB_ROW_CLICK_Y));                        // 두 번째 탭 클릭(SGR press)
+  expect(h.attachments.at(-1)!.pane).toBe('p2');                            // attach 가 클릭한 pane 으로
+  expect(h.attachments[0]!.detached).toBe(true);                            // 예전 attach 는 해제
+  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m 🛠 TWO \u001b[49;39m');      // 반전 표식이 그 탭으로
+  expect(h.writes.at(-1) ?? '').not.toContain('\u001b[44;37m 🛠 ONE \u001b[49;39m');  // 옛 탭에서는 사라진다
+  h.app.key('ls\r');
+  expect(h.attachments[1]!.typed).toEqual(['ls\r']);                        // 입력도 이제 그 탭(pane)으로
+});
+
+// ---- ELS-SIDEBAR-HERDR-CLEAN: the list's rows are the click targets exactly where they are drawn (head row 1, then one row per space, «new» on the last list line) ----
+test('app: sidebar clicks follow the drawn rows — a space row selects its first pane, the «spaces» head does nothing, «new» opens the new-tab name row; releases are swallowed', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle'), row('w2', 'p3', 'three', 'idle')));
+  await h.app.start();
+  const screen = (): string[] => (h.lastScreen() ?? '').split('\r\n');
+  expect([screen()[0]!.slice(0, 7), screen()[1]!.slice(0, 11), screen()[2]!.slice(0, 11), screen()[22]!.slice(0, 11)]).toEqual([' spaces', ' ○ NAME-W1 ', ' ○ NAME-W2 ', ' new · menu']);
+  h.app.key(click(5, 1)); h.app.key('\u001b[<0;5;1m');                         // the head: consumed, selects nothing
+  expect(h.attachments.length).toBe(1);
+  h.app.key(click(5, 3)); h.app.key('\u001b[<0;5;3m');                         // second space row → its first pane p3
+  expect(h.attachments.at(-1)!.pane).toBe('p3');
+  h.app.key(click(3, 23)); h.app.key('\u001b[<0;3;23m');                       // the word «new»
+  expect(screen()[1]).toContain('new tab [');
+  expect(h.attachments.every((a) => a.typed.length === 0)).toBe(true);
+}, 10_000);
+
+// ---- ELS-MOUSE-RELEASE (JUD-B #111750): a release follows its press — pane press → release reaches the pane; consumed press → release swallowed --
+const PANE_PRESS = '\u001b[<0;50;10M';
+const PANE_RELEASE = '\u001b[<0;50;10m';
+const releaseApp = async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'two', 'idle')));
+  await h.app.start();
+  return h;
+};
+test('app: a press in the pane and its release both reach the pane program (whole, and the release split across two chunks)', async () => {
+  const h = await releaseApp();
+  h.app.key(PANE_PRESS);
+  h.app.key(PANE_RELEASE);
+  expect(h.attachments[0]!.typed).toEqual([PANE_PRESS, PANE_RELEASE]);
+  h.app.key(PANE_PRESS);
+  h.app.key('\u001b[<0;50');
+  h.app.key(';10m');
+  expect(h.attachments[0]!.typed).toEqual([PANE_PRESS, PANE_RELEASE, PANE_PRESS, PANE_RELEASE]);
+}, 10_000);
+
+test('app: the release of a pane press passes through wherever it lands (over the list or the tab row too) — the pane saw the press and needs it', async () => {
+  const h = await releaseApp();
+  h.app.key(PANE_PRESS);
+  h.app.key('\u001b[<0;10;2m');
+  expect(h.attachments[0]!.typed).toEqual([PANE_PRESS, '\u001b[<0;10;2m']);
+  expect(h.attachments).toHaveLength(1);                                     // the release did not select anything
+}, 10_000);
+
+test('app: the release of a press the app consumed (tab click, list click, bottom-line click) is swallowed — and the next pane press/release pass again', async () => {
+  const h = await releaseApp();
+  h.app.key(click(P2_TAB_CLICK_X, TAB_ROW_CLICK_Y));                          // consumed: selects p2
+  h.app.key(`\u001b[<0;${P2_TAB_CLICK_X};${TAB_ROW_CLICK_Y}m`);
+  h.app.key(click(5, 1));                                                     // consumed: list click on space w1 → p1
+  h.app.key('\u001b[<0;5;1m');
+  h.app.key(click(5));                                                        // consumed: bottom line, no button there
+  h.app.key('\u001b[<0;5;24m');
+  expect(h.attachments.every((a) => a.typed.length === 0)).toBe(true);        // no press and no release went to any pane
+  h.app.key(PANE_PRESS);
+  h.app.key(PANE_RELEASE);
+  expect(h.attachments.at(-1)!.typed).toEqual([PANE_PRESS, PANE_RELEASE]);
+}, 10_000);
+
+// ---- ELS-NARROW-TAB-DROPDOWN: narrow width folds the side list into one top row «emoji tab ▾» that opens a tab list -----------
+const narrowList = listOf(row('w1', 'p1', 'shell', 'idle'), row('w1', 'p2', 'build', 'working'), row('w2', 'p3', 'repl', 'blocked'));
+const PRESS = (x: number, y: number): string => `\u001b[<0;${x};${y}M`;
+const RELEASE = (x: number, y: number): string => `\u001b[<0;${x};${y}m`;
+
+test('narrow dropdown: width 120 keeps the side list; width 60 drops it for one top row «tab ▾» and the pane takes the whole width', async () => {
+  const wide = harness(narrowList, { cols: 120, rows: 24 });
+  await wide.app.start();
+  expect(wide.lastScreen()).toContain('NAME-W1');
+  expect(wide.lastScreen()).not.toContain('▾');
+  const size = { cols: 60, rows: 24 };
+  const h = harness(narrowList, size);
+  await h.app.start();
+  const screen = h.lastScreen().split('\r\n');
+  expect(screen[0]).toContain('🛠 SHELL  ▾');
+  expect(h.writes.at(-1) ?? '').toContain('\u001b[44;37m 🛠 SHELL \u001b[49;39m ▾');   // ELS-TAB-STYLE-HERDR: the current tab, UPPERCASE on blue
+  expect(h.lastScreen()).not.toContain('NAME-W1');
+  expect(h.attachments[0]!.size).toEqual({ cols: 60, rows: 22 });
+});
+
+test('narrow dropdown: ctrl+b s opens the list (spaces → tabs with status marks); j then Enter switches the tab and closes it; Esc closes without switching', async () => {
+  const h = harness(narrowList, { cols: 60, rows: 24 });
+  await h.app.start();
+  h.app.key('\u0002s');
+  const open = h.lastScreen().split('\r\n');
+  expect(open.slice(1, 6).map((line) => line.trim())).toEqual(['name-w1', expect.stringContaining('shell ○'), expect.stringContaining('build ●'), 'name-w2', expect.stringContaining('repl ')]);
+  h.app.key('j');
+  h.app.key('\r');
+  expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p2']);
+  expect(h.lastScreen().split('\r\n')[0]).toContain('🛠 BUILD  ▾');
+  expect(h.lastScreen()).not.toContain('name-w2');
+  h.app.key('\u0002s');
+  expect(h.lastScreen()).toContain('name-w2');
+  h.app.key('\u001b');
+  expect(h.lastScreen()).not.toContain('name-w2');
+  expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p2']);
+  expect(h.attachments.at(-1)!.typed).toEqual([]);                 // the dropdown keys never reached the pane
+});
+
+test('narrow dropdown: a click on the top row opens the list, a click on a tab switches and closes; each consumed press swallows its release; a click outside only closes', async () => {
+  const h = harness(narrowList, { cols: 60, rows: 24 });
+  await h.app.start();
+  h.app.key(PRESS(10, 1)); h.app.key(RELEASE(10, 1));
+  expect(h.lastScreen()).toContain('name-w2');
+  h.app.key(PRESS(10, 6)); h.app.key(RELEASE(10, 6));              // the «repl» line
+  expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p3']);
+  expect(h.lastScreen().split('\r\n')[0]).toContain('🛠 REPL  ▾');
+  expect(h.lastScreen()).not.toContain('name-w2');
+  h.app.key(PRESS(10, 1)); h.app.key(RELEASE(10, 1));
+  h.app.key(PRESS(10, 20)); h.app.key(RELEASE(10, 20));            // below the list
+  expect(h.lastScreen()).not.toContain('name-w2');
+  expect(h.attachments.map((a) => a.pane)).toEqual(['p1', 'p3']);
+  expect(h.attachments.flatMap((a) => a.typed)).toEqual([]);       // neither presses nor releases leaked to the pane
+});
+
+test('narrow dropdown: widening past the threshold closes the list and brings the side list back; ctrl+b s there still folds the side list', async () => {
+  const size = { cols: 60, rows: 24 };
+  const h = harness(narrowList, size);
+  await h.app.start();
+  h.app.key('\u0002s');
+  expect(h.lastScreen()).toContain('name-w2');
+  size.cols = 120;
+  h.app.resized();
+  expect(h.lastScreen()).toContain('NAME-W1');
+  expect(h.lastScreen()).not.toContain('▾');
+  expect(h.attachments[0]!.resizes.at(-1)).toEqual([91, 22]);
+  h.app.key('\u0002s');
+  expect(h.lastScreen()).not.toContain('NAME-W1');
+});
+
+test('app: wheel over the pane and ctrl+b [ / ] ask the server to scroll the attached pane; the status line says how far up the frame is', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u001b[<64;60;10M');                                  // wheel up (SGR 1006), over the pane
+  h.app.key('\u001b[<65;60;10M');                                  // wheel down
+  h.app.key('\u0002[');
+  h.app.key('\u0002]');
+  expect(h.attachments[0]!.scrolls).toEqual([3, -3, 20, -20]);     // a page is the terminal height (24) - 4
+  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 23, back: 7, screen: '[screen 51x23 scrolled-back=7]\nold' });
+  expect(h.lastScreen()).toContain('스크롤백 7줄 위');
+  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 2, cols: 51, rows: 23, back: 0, screen: '[screen 51x23 cursor=(row 0, col 0, visible true)]\nlive' });
+  expect(h.lastScreen()).not.toContain('스크롤백');
+});
+
+// ---- D1a(ELS-SERVER-RESTART-SURVIVE): a lost els server is waited out, and the pane comes back as it was ------------------
+
+test('D1a: the server going away mid-session keeps the view and the screen; the poll re-attaches when the server answers again', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 22, back: 0, screen: 'SAME CHILD STILL RUNNING' });
+  expect(h.lastScreen()).toContain('SAME CHILD STILL RUNNING');
+  // the els server is killed under the attach: the socket closes, the attach ends
+  h.attachments[0]!.handlers.onEnd(1, 'els: the els server closed the connection');
+  expect(h.lastScreen()).toContain('SAME CHILD STILL RUNNING');          // the screen it had is kept, not blanked
+  expect(h.lastScreen()).toContain('서버 재기동 중 — 다시 붙는 중…');
+  expect(await Promise.race([h.app.done.then(() => 'ended'), Bun.sleep(30).then(() => 'still running')])).toBe('still running');
+  // while the server is away the poll keeps asking and nothing ends; no blind re-attach attempts either
+  h.setLsAway('els: no els server is running — start it with `els serve` (or `elanous side serve`)');
+  h.tick(); await Bun.sleep(10);
+  expect(h.lastScreen()).toContain('서버 재기동 중 — 다시 붙는 중…');
+  expect(h.attachments).toHaveLength(1);
+  expect(await Promise.race([h.app.done.then(() => 'ended'), Bun.sleep(30).then(() => 'still running')])).toBe('still running');
+  // the server is back: the next poll re-attaches the same pane without clearing the screen, and its first frame repaints it
+  h.setLsAway(undefined);
+  h.tick(); await Bun.sleep(10);
+  expect(h.attachments).toHaveLength(2);
+  expect(h.attachments[1]!.pane).toBe('p1');
+  expect(h.attachments[1]!.size).toEqual({ cols: 51, rows: 22 });
+  expect(h.lastScreen()).toContain('SAME CHILD STILL RUNNING');          // the old screen was never blanked
+  h.attachments[1]!.handlers.onFrame({ pane: 'p1', seq: 2, cols: 51, rows: 22, back: 0, screen: 'SAME CHILD, PAINTED AGAIN AFTER THE RESTART' });
+  expect(h.lastScreen()).toContain('SAME CHILD, PAINTED AGAIN AFTER THE RESTART');
+  expect(h.lastScreen()).not.toContain('서버 재기동 중');                 // the note goes with the wait
+  // and the wait-out never swallows a real end: the pane exiting as the last one still closes the view with 0
+  h.attachments[1]!.handlers.onEnd(0, 'pane exited');
+  expect(await h.app.done).toEqual({ code: 0, message: '' });
+});
+
+test('D1a: a graceful server stop ends the attach as «the server is stopping» — the same wait-out, then the poll re-attaches', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 22, back: 0, screen: 'CHILD BEFORE THE GRACEFUL STOP' });
+  // the server is stopped on purpose (els serve SIGTERM → close()): the attach ends as the server going away
+  h.attachments[0]!.handlers.onEnd(1, 'the server is stopping');
+  expect(h.lastScreen()).toContain('CHILD BEFORE THE GRACEFUL STOP');   // the screen it had is kept, not blanked
+  expect(h.lastScreen()).toContain('서버 재기동 중 — 다시 붙는 중…');
+  expect(await Promise.race([h.app.done.then(() => 'ended'), Bun.sleep(30).then(() => 'still running')])).toBe('still running');
+  // the new server answers: the next poll re-attaches the same pane and its first frame repaints it
+  h.tick(); await Bun.sleep(10);
+  expect(h.attachments).toHaveLength(2);
+  expect(h.attachments[1]!.pane).toBe('p1');
+  h.attachments[1]!.handlers.onFrame({ pane: 'p1', seq: 2, cols: 51, rows: 22, back: 0, screen: 'SAME CHILD AFTER THE RESTART' });
+  expect(h.lastScreen()).toContain('SAME CHILD AFTER THE RESTART');
+  expect(h.lastScreen()).not.toContain('서버 재기동 중');                 // the note goes with the wait
+});
+
+test('D1a: a server already away at the first list still ends the view with its message — the wait-out starts after a good list', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  h.setLsAway('els: no els server is running — start it with `els serve` (or `elanous side serve`)');
+  await h.app.start();
+  expect(await h.app.done).toEqual({ code: 1, message: 'els: no els server is running — start it with `els serve` (or `elanous side serve`)' });
+});
+
+test('D1a r2: an attach refused for a reason that is not the server going away is not retried by the poll — the reason stays on the status line', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.attachments[0]!.handlers.onEnd(1, 'els: attach denied — caller is a pane process (seat HAND-X); present the pane token');
+  await Bun.sleep(10);
+  expect(h.lastScreen()).toContain('attach denied');
+  expect(h.lastScreen()).not.toContain('서버 재기동 중');
+  for (let n = 0; n < 5; n++) { h.tick(); await Bun.sleep(10); }       // five polls later the server answers fine — still no blind re-attach
+  expect(h.attachments).toHaveLength(1);
+  // an unknown pane is the same: a real end, never a retry loop
+  const g = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await g.app.start();
+  g.attachments[0]!.handlers.onEnd(1, 'els attach: unknown pane p1');
+  for (let n = 0; n < 5; n++) { g.tick(); await Bun.sleep(10); }
+  expect(g.attachments).toHaveLength(1);
+});
+
+test('D1a r2: a typing refusal from the server (the attach stays view-only) is shown on the status line, not swallowed', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.attachments[0]!.handlers.onFrame({ pane: 'p1', seq: 1, cols: 51, rows: 22, back: 0, screen: 'VIEW ONLY' });
+  h.attachments[0]!.handlers.onError?.('els: input denied — present the owner token');
+  expect(h.lastScreen()).toContain('input denied');
+});
+
+// ---- ELS-NEW-TAB-NAME-WIDGET: «+» and ctrl+b c open the name prompt; the name goes to the new request's title only ----------
+const plusAt = (h: ReturnType<typeof harness>): number => { const top = h.lastScreen().split('\r\n')[0]!; return Bun.stringWidth(top.slice(0, top.lastIndexOf('+'))) + 1; };
+
+test('app: clicking «+» opens the name prompt (press consumed, its release swallowed); typed text edits the row, not the pane; Enter makes a tab with that title', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  const x = plusAt(h);
+  h.app.key(`\u001b[<0;${x};1M`); h.app.key(`\u001b[<0;${x};1m`);
+  expect(h.lastScreen().split('\r\n')[1]).toContain('new tab [');
+  h.app.key('빌드 x'); h.app.key('\u007f');
+  expect(h.lastScreen().split('\r\n')[1]).toContain('new tab [빌드 ');
+  expect(h.attachments.at(-1)!.typed).toEqual([]);               // nothing reached the pane (not the text, not the click or its release)
+  h.app.key('\r'); await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new')).toEqual([{ op: 'new', ws: 'name-w1', cwd: '/work/proj', command: ['/bin/zsh'], title: '빌드' }]);
+  expect(h.lastScreen()).not.toContain('new tab [');
+});
+
+test('app: Esc cancels (no request), Ctrl+C clears, ESC bytes and ctrl+b c typed into the prompt never go to the pane', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002c'); h.app.key('abc\u0003z');
+  expect(h.lastScreen().split('\r\n')[1]).toContain('new tab [z');
+  h.app.key('\u001b[3;5~\u0002\u0002q');                        // an unknown sequence, a literal ctrl+b: all swallowed by the prompt
+  h.app.key('\u001b'); await Bun.sleep(10);
+  expect(h.lastScreen()).not.toContain('new tab [');
+  expect(h.requests.filter((r) => r.op === 'new')).toEqual([]);
+  expect(h.attachments.at(-1)!.typed).toEqual([]);
 });

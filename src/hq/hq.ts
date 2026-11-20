@@ -101,6 +101,12 @@ function readHost(path: string): string | undefined {
   return name;
 }
 
+/** This machine's HQ name: the host-local identity file, then hq.hostName, then the OS hostname (same order the lease uses). */
+export function hqLocalHostName(deps: Pick<HqDeps, 'config' | 'hostPath'> = {}): string {
+  const config = deps.config ?? getUserConfig().hq ?? {};
+  return readHost(deps.hostPath ?? defaultHostPath()) ?? config.hostName ?? hostname().replace(/\.local$/, '');
+}
+
 /** Set this machine's identity outside the replicable config.json and HQ state universe. */
 export function hqHostSet(name: string, path = defaultHostPath()): string {
   if (!name || name !== name.trim() || /[\r\n]/.test(name)) throw new Error('hq host set: name must be one nonempty line without surrounding whitespace');
@@ -123,7 +129,7 @@ function resolve(deps: HqDeps = {}): Resolved {
   const ssh = deps.ssh ?? defaultSshRunner;
   const arbiter = config.arbiter ?? 'cloud-vm';
   const local = readHost(deps.hostPath ?? defaultHostPath());
-  const me = local ?? config.hostName ?? hostname().replace(/\.local$/, '');
+  const me = hqLocalHostName({ ...deps, config });
   const log = deps.log ?? debug.log.bind(debug);
   if (local && config.hostName && local !== config.hostName) {
     try { log('hq.lease', 'hostname-mismatch', { local, config: config.hostName }); } catch { /* observation is fail-soft */ }

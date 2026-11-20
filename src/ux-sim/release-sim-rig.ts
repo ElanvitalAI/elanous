@@ -374,9 +374,18 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
         const context = readGraphContext(options.env);
         const latest = latestGateOutput(context);
         if (!latest) throw new Error('gate-triage simulation did not receive the latest gate or residual-run output');
-        const child = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
-          cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
-        });
+        // Bun 1.4.2 on a loaded host intermittently reports exit status null for a node child that
+        // already emitted its result and exited (the same runtime artifact version-node retries
+        // on). Do not park the gate boundary contract on that artifact: surface every non-zero
+        // triage spawn for diagnosis, then retry once on status null.
+        const triageSpawn = () => spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], { cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', timeout: 30_000 });
+        let child = triageSpawn();
+        if (child.status !== 0) {
+          console.error(`[release-sim-rig] gate-triage spawn anomaly status=${child.status} error=${String(child.error)} stderr=${String(child.stderr).slice(0, 400)}`);
+        }
+        if (child.status === null && !child.error) {
+          child = triageSpawn();
+        }
         let result: Record<string, unknown> = {};
         try { result = record(JSON.parse((child.stdout ?? '').trim().split('\n').at(-1) ?? 'null'), 'production gate-triage output'); }
         catch { /* Preserve child diagnostics in the graph node result. */ }
@@ -777,10 +786,15 @@ async function runProductionMissingReceiptGate(root: string, tests: string[], ve
   const ok = { rc: 0, output: '' };
   const runner: GateRunner = {
     async command() { return ok; }, async localCommand() { return ok; },
-    async sweep(tree, _logDir, _pod, only) {
+    async sweep(tree, _logDir?, _pod?, only?, _onProgress?) {
       if (tree.endsWith('/cut')) cutSweeps.push(!only);
-      const count = only?.length ?? tests.length;
-      return { rc: 0, output: `${count} pass\n0 fail\nRan ${count} tests across ${count} files.\n` };
+      // RFC-release-gate-file-receipts § the cut sweep must report the exact planned lane to the file-CAS audit;
+      // echo back the files this sweep was asked to run instead of a bare pass summary.
+      const measured: string[] = only ? [...only] : tests;
+      const count = measured.length;
+      return { rc: 0, validatedShards: true, output: `${count} pass\n0 fail\nRan ${count} tests across ${count} files.\n`,
+        podSweep: { id: 'release-sim-stub-sweep', invocationId: 'release-sim-stub-sweep', shards: 1,
+          files: measured, imageDigests: [SIM_IMAGE_DIGEST], disposition: { reused: 0, rerun: count, unmeasured: 0 } } };
     },
     async add() {}, async remove() {}, async snapshot() {}, async removeSnapshot() {},
   };
@@ -1390,7 +1404,8 @@ function resultForNode(nodeId: string, fault: SimulatedNodeFault | undefined, ve
   const triggeredFault = fault?.node === nodeId ? fault : undefined;
   const outcome = triggeredFault ? triggeredFault.outcome === 'timeout' ? 'error' : triggeredFault.outcome : 'ok';
   const evidence = triggeredFault?.evidence ?? {};
-  const commit = nodeId === 'version-release' ? { commit: cutTip(), tag: `v${version}` } : {};
+  const commit = nodeId === 'version-release' ? { commit: cutTip(), tag: `v${version}` }
+    : nodeId.startsWith('cut-branch') ? { commit: cutTip(), version, branch: `release/${version}` } : {};
   const introduced = Array.isArray(evidence.introduced) && evidence.introduced.every((id) => typeof id === 'string')
     ? evidence.introduced as string[] : [];
   // Triage is production code, so its simulated gate input must satisfy the
@@ -1436,7 +1451,7 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const ownerWaived = (item.mode === 'owner-waive-unmeasured-gate' && item.unmeasuredGateShape === undefined) || item.mode === 'owner-waive-0246-fixture' || downstreamFailure;
   const fixtureOwnerWaiver = item.mode === 'owner-waive-0246-fixture' || downstreamFailure;
   let input: { version: string; previousVersion: string; branchCut?: boolean; [key: string]: unknown } = fixtureOwnerWaiver ? { ...scenario.input, version: '0.2.46', previousVersion: '0.2.45', branchCut: true }
-    : ownerWaived ? { ...scenario.input, version: '0.2.45', previousVersion: '0.2.44' }
+    : ownerWaived ? { ...scenario.input, version: '0.2.45', previousVersion: '0.2.44', ...(item.mode === 'owner-waive-unmeasured-gate' ? { cutCommit: (() => { try { return cutTip(); } catch { return undefined; } })() } : {}) }
       : item.unmeasuredGateShape ? { ...scenario.input, branchCut: true } : { ...scenario.input };
   const gateFixture = item.mode === 'owner-waive-0246-fixture'
     ? JSON.parse(readFileSync(join(REPOSITORY_ROOT, 'scripts/release-loop/fixtures/gate-verdict-0.2.46.json'), 'utf8')) as Record<string, unknown>
@@ -1465,6 +1480,12 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
     dispatchedNodes.push(nodeId);
     if (!resumedPhase) firstAttemptDispatchedNodes.push(nodeId);
     const startedAtMs = performance.now();
+    // This command routes on legacy/audit, not the generic simulated ok outcome.
+    const cutover = runGateCutoverCommand(command, options.env);
+    if (cutover) {
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return cutover;
+    }
     if (resumedPhase && downstreamFailure && nodeId === 'pwa') {
       const failed = resultForNode(nodeId, { node: nodeId, outcome: 'fail', evidence: { source: 'owner-waive-downstream-failure' } }, input.version);
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
@@ -1645,7 +1666,12 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
       const previous = process.env.ELANOUS_GRAPH_CONTEXT;
       process.env.ELANOUS_GRAPH_CONTEXT = contextPath;
       try {
-        const result = runVerify(() => ({ status: 0, stdout: JSON.stringify({ ok: true, notesPage: 'ok', npmLatest: '0.2.46' }), stderr: '' }));
+        const result = runVerify(() => ({ status: 0, stdout: JSON.stringify({ ok: true, notesPage: 'ok', npmLatest: '0.2.46',
+        // A158: runVerify (scripts/release-loop/verify-node.ts) requires a passing Nexus first-run
+        // receipt for the installed version, so the fixture's fake `release verify --json` payload
+        // carries one: versionLine = "<version> <40-hex cut tip>" with the healthy exit shape.
+        nexusFirstRun: { ok: true, versionLine: `0.2.46 ${cutTip()}`, pid: 4242, health: 200, healthOk: true, app: 200,
+          testUniverse: true, ownPidStopped: true, forcedKill: false, exitCode: 0 } }), stderr: '' }));
         verifyEvidence = { result, command: 'release verify --version 0.2.46', npmLatest: '0.2.46' };
         nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
         return { exitCode: result.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(result)}\n`, stderr: '' };
@@ -1696,19 +1722,114 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
     if (item.unmeasuredGateShape === 'stopped') {
       state.path.splice(gateIndex + 1);
       state.nodes.splice(gateIndex + 1);
-      state.nodes[gateIndex] = { nodeId: 'gate', ok: false, exit: null, executed: false, error: STOPPED_NODE_ERROR, endedAt: '2026-11-07T00:00:00.000Z' };
+      state.nodes[gateIndex] = { nodeId: 'gate', ok: false, exit: null, executed: true, error: STOPPED_NODE_ERROR, endedAt: '2026-11-07T00:00:00.000Z' };
+      // The waiver boundary needs the recorded triage tail of a failed gate run:
+      // gate → cloud-leave-fail → emergency-switch → gate-triage → traffic-failed-restore → failed
+      // (gate fail routes through cloud-leave-fail, whose ok outcome reaches emergency-switch).
+      const triageTailIds = ['cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed'];
+      for (const tailId of triageTailIds) state.path.push(tailId);
+      // The terminal tail node is the only failing one; every earlier tail node is ok.
+      const terminalTailIndex = triageTailIds.length - 1;
+      state.nodes.push(
+        ...triageTailIds.map((tailId, tailIndex) => ({ nodeId: tailId, ok: tailIndex !== terminalTailIndex, exit: tailIndex !== terminalTailIndex ? 0 : null, executed: true, endedAt: '2026-11-07T00:00:00.000Z' as const })));
+      // Waiving a stopped gate needs the recorded release commit from the cut branch
+      // (resume-release pins the waived resume to that commit). The stopped run never
+      // recorded it, so the fabricated state carries the answered cut record ahead of gate.
+      const cutBranchEntryIds = ['cut-branch'];
+      if (!state.nodes.some((node) => node.nodeId.startsWith(cutBranchEntryIds[0]))) {
+        state.path.splice(gateIndex, 0, cutBranchEntryIds[0]);
+        state.nodes.splice(gateIndex, 0, { nodeId: cutBranchEntryIds[0], ok: true, exit: 0, executed: true,
+          output: `${JSON.stringify({ outcome: 'ok', version: input.version, commit: cutTip(), branch: `release/${input.version}` })}\n`, endedAt: '2026-11-07T00:00:00.000Z' });
+      }
     } else if (item.unmeasuredGateShape === 'sweep-incomplete') {
       const output = { outcome: 'error', verdict: 'fail', commit: cutTip(), introduced: [], preexisting: 0, fixed: null, knownEnv: 0,
         knownEnvCleared: [], stalledEnv: [], stalledShards: [{ shard: 3, files: ['a.test.ts'], reason: 'no-output' }], durationMs: 1,
         error: 'pod sweep incomplete: stalled shards 3' };
       state.nodes[gateIndex] = { nodeId: 'gate', ok: false, exit: 1, executed: true, error: 'bash exit 1',
         output: `${JSON.stringify(output)}\n`, endedAt: '2026-11-07T00:00:00.000Z' };
+      // The answered boundary needs the recorded fail tail of the unmeasured sweep gate: the
+      // re-recorded verdict has outcome 'error', whose edges route
+      // gate → cloud-leave-error → gate-triage → traffic-failed-restore → failed (mirrors the
+      // stopped fabrication above; the waiver guards require failedAfterGate on the saved path).
+      state.path.splice(gateIndex + 1);
+      state.nodes.splice(gateIndex + 1);
+      const sweepFailTailIds = ['cloud-leave-error', 'gate-triage', 'traffic-failed-restore', 'failed'];
+      const sweepTerminalIndex = sweepFailTailIds.length - 1;
+      for (const tailId of sweepFailTailIds) state.path.push(tailId);
+      state.nodes.push(...sweepFailTailIds.map((tailId, tailIndex) => ({ nodeId: tailId,
+        ok: tailIndex !== sweepTerminalIndex, exit: tailIndex !== sweepTerminalIndex ? 0 : null, executed: true,
+        endedAt: '2026-11-07T00:00:00.000Z' as const })));
+    } else if (item.unmeasuredGateShape === 'killed') {
+      // The killed gate process died to SIGTERM before printing any verdict line, so it is
+      // unmeasured exactly like the stopped gate; the re-recorded boundary carries the real
+      // killed record and the canonical gate-fail triage tail it parked ahead of:
+      // gate → cloud-leave-fail → emergency-switch → gate-triage → traffic-failed-restore → failed.
+      state.path.splice(gateIndex + 1);
+      state.nodes.splice(gateIndex + 1);
+      state.nodes[gateIndex] = { nodeId: 'gate', ok: false, exit: null, executed: true, error: 'process terminated by SIGTERM', endedAt: '2026-11-07T00:00:00.000Z' };
+      const killedTailIds = ['cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed'];
+      const killedTerminalIndex = killedTailIds.length - 1;
+      for (const tailId of killedTailIds) state.path.push(tailId);
+      state.nodes.push(...killedTailIds.map((tailId, tailIndex) => ({ nodeId: tailId,
+        ok: tailIndex !== killedTerminalIndex, exit: tailIndex !== killedTerminalIndex ? 0 : null, executed: true,
+        endedAt: '2026-11-07T00:00:00.000Z' as const })));
+      // Waiving the killed gate needs the recorded release commit from the cut branch, mirroring
+      // the stopped shape (the killed run never recorded it).
+      const killedCutEntryIds = ['cut-branch'];
+      if (!state.nodes.some((node) => node.nodeId.startsWith(killedCutEntryIds[0]))) {
+        state.path.splice(gateIndex, 0, killedCutEntryIds[0]);
+        state.nodes.splice(gateIndex, 0, { nodeId: killedCutEntryIds[0], ok: true, exit: 0, executed: true,
+          output: `${JSON.stringify({ outcome: 'ok', version: input.version, commit: cutTip(), branch: `release/${input.version}` })}\n`, endedAt: '2026-11-07T00:00:00.000Z' });
+      }
     }
+    // The release graph now parks a stopped/failed gate behind the gate-heal-decision HITL boundary
+    // (run status 'awaiting-approval'). This scenario resumes after the owner answered that decision,
+    // so the fabricated gate state reflects the answered boundary: no pending approval, failed run.
+    state.pending = undefined;
+    state.status = 'failed';
     state.executed = state.nodes.filter((node) => node.executed).length;
     writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
     first.path.splice(0, first.path.length, ...state.path);
     first.nodes.splice(0, first.nodes.length, ...state.nodes);
     first.executed = state.executed;
+  }
+  if ((fixtureOwnerWaiver || item.mode === 'owner-waive-unmeasured-gate') && !item.unmeasuredGateShape) {
+    // The real first run above parks the measured-gate regression at the gate-heal-decision
+    // HITL boundary (gate-triage emits decision-required → fail → the run awaits approval).
+    // The owner answered that decision, so record the answered boundary on the saved run before
+    // issuing the owner waiver. The owner waiver is only issuable for an unmeasured gate (the
+    // measured 0.2.46 verdict with its introduced count is rejected fail-closed), so the answered
+    // boundary re-records the waivable verdict shape together with its matching tail: the
+    // sweep-incomplete gate output fails with outcome 'error', whose edges route
+    // gate → cloud-leave-error → gate-triage → traffic-failed-restore → failed (mirrors the
+    // unmeasured fabrication above; the real measured-run tail through cloud-leave-fail belongs
+    // to the 'fail' outcome and no longer follows the re-recorded gate's edges).
+    const answeredStatePath = first.statePath;
+    const answeredState = JSON.parse(readFileSync(answeredStatePath, 'utf8')) as GraphRunState;
+    if (answeredState.status !== 'failed') {
+      const gateIndex = answeredState.path.lastIndexOf('gate');
+      if (gateIndex < 0) throw new Error('owner waive simulation did not persist gate state');
+      const ownerWaiveOutput = { outcome: 'error', verdict: 'fail', commit: cutTip(), introduced: [], preexisting: 0, fixed: null, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], stalledShards: [{ shard: 3, files: ['a.test.ts'], reason: 'no-output' }], durationMs: 1,
+        error: 'pod sweep incomplete: stalled shards 3' };
+      answeredState.nodes[gateIndex] = { nodeId: 'gate', ok: false, exit: 1, executed: true, error: 'bash exit 1',
+        output: `${JSON.stringify(ownerWaiveOutput)}\n`, endedAt: '2026-11-07T00:00:00.000Z' };
+      const canonicalFailTail = ['cloud-leave-error', 'gate-triage', 'traffic-failed-restore', 'failed'];
+      answeredState.path.splice(gateIndex + 1);
+      answeredState.nodes.splice(gateIndex + 1);
+      answeredState.path.push(...canonicalFailTail);
+      answeredState.nodes.push(...canonicalFailTail.map((tailId, tailIndex) => ({
+        nodeId: tailId, ok: tailIndex !== canonicalFailTail.length - 1,
+        exit: tailIndex !== canonicalFailTail.length - 1 ? 0 : null, executed: true,
+        endedAt: '2026-11-07T00:00:00.000Z' as const })));
+      answeredState.pending = undefined;
+      answeredState.status = 'failed';
+      answeredState.executed = answeredState.nodes.filter((node) => node.executed).length;
+      writeFileSync(answeredStatePath, `${JSON.stringify(answeredState, null, 2)}\n`);
+      first.path.splice(0, first.path.length, ...answeredState.path);
+      first.nodes.splice(0, first.nodes.length, ...answeredState.nodes);
+      first.executed = answeredState.executed;
+    }
   }
   let missingReasonRejected = true;
   if (item.unmeasuredGateShape) {
@@ -1731,8 +1852,13 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   };
   const trafficFile = join(root, 'traffic.json');
   writeFileSync(trafficFile, '{}\n');
-  const resumed = fixtureOwnerWaiver || item.unmeasuredGateShape
-    ? (await resumeReleaseRun({ runId, from: 'gate', ...(fixtureOwnerWaiver ? { ownerWaive: 'gate' as const, acceptedRegressions: [] }
+  // The runner consumes a one-use gate waiver event from the ledger at the waived gate, and only
+  // the resume path issues that event (resume-release appends it right before the graph runs). A
+  // direct runGraph call with releaseWaiver reaches that consumption guard with no event on the
+  // ledger, so the plain owner-waive-unmeasured-gate scenario resumes through the issuing path.
+  const plainOwnerWaive = item.mode === 'owner-waive-unmeasured-gate' && !item.unmeasuredGateShape;
+  const resumed = fixtureOwnerWaiver || item.unmeasuredGateShape || plainOwnerWaive
+    ? (await resumeReleaseRun({ runId, from: 'gate', ...(fixtureOwnerWaiver || plainOwnerWaive ? { ownerWaive: 'gate' as const, acceptedRegressions: [] }
       : { waive: 'gate' as const, acceptedRegressions }), reason, approvedBy: 'OP',
       partial: false, commandRoot: downstreamFailure ? createResumeCommandRoot(root) : REPOSITORY_ROOT }, {
       root, repo: REPOSITORY_ROOT, graphPath: RELEASE_GRAPH, runBash, trafficFile, ledgerRoot: root,
@@ -1772,7 +1898,8 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const actualGateTriage = outputRecord(first.nodes.find((node) => node.nodeId === 'gate-triage')?.output);
   const auditLine = ownerNotes.match(/<!-- (\{[^\n]*\}) -->/)?.[1];
   const audit = auditLine ? JSON.parse(auditLine) as Record<string, unknown> : undefined;
-  const expectedOwnerIds = fixtureOwnerWaiver ? fixtureIntroducedIds : [];
+  // An owner waive of an unmeasured gate carries no measured introduced ids.
+  const expectedOwnerIds: string[] = [];
   const ownerRecordOk = !ownerWaived || (ownerLedgerHasApproval && ownerLedger?.ownerWaived === true && ownerLedger.approvedBy === 'OP'
     && ownerLedger.reason === reason && JSON.stringify(ownerLedger.introducedIds ?? []) === JSON.stringify(expectedOwnerIds)
     && (downstreamFailure || (audit?.type === 'release-owner-waiver' && audit.approvedBy === 'OP' && audit.reason === reason
@@ -1785,7 +1912,7 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const notVisitOk = item.expect.mustNotVisit.every((id) => !visited.has(id));
   const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
     && ledgerEvents.filter((row) => row.event === 'edge-observed').length === Math.max(0, path.length - 1);
-  const expectedUnmeasured = item.unmeasuredGateShape === 'stopped' ? `stopped: ${STOPPED_NODE_ERROR}`
+  const expectedUnmeasured = item.unmeasuredGateShape === 'stopped' ? new RegExp(`^no-verdict: gate process ended with exit null and no result line — ${STOPPED_NODE_ERROR}$`)
     : item.unmeasuredGateShape === 'killed' ? /^no-verdict: gate process ended with exit null and no result line — .*SIGTERM/
       : item.unmeasuredGateShape === 'sweep-incomplete' ? /^sweep incomplete:/ : undefined;
   const waiverOk = gate?.ok === true && gate.executed === false && gate.waiver?.reason === reason
@@ -1944,6 +2071,14 @@ async function runAppendedTipReGateCase(scenario: ReleaseSimRigScenario, item: R
     }
     if (nodeId === 'gate') {
       gateRuns += 1;
+      // The re-gate fails as an unmeasured sweep so the hardened waiver (#35772) can still waive the gate;
+      // the initial run keeps the measured introduced regression, where waiving must be refused.
+      if (phase === 'regate') {
+        return { exitCode: 1, stdout: `${JSON.stringify({ outcome: 'error', verdict: 'fail', commit: branchTip, introduced: [],
+          preexisting: 0, knownEnv: 0, durationMs: 1, stalledEnv: [], stalledShards: [{ shard: 3, files: ['src/agent/turn.test.ts'], reason: 'no-output' }],
+          unmeasuredRecheckFiles: [], unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 3,
+          error: 'pod sweep incomplete: stalled shards 3' })}\n`, stderr: '' };
+      }
       return { exitCode: 1, stdout: `${JSON.stringify({ outcome: 'fail', verdict: 'fail', commit: branchTip, introduced: [introducedId],
         preexisting: 0, knownEnv: 0, durationMs: 1, stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [],
         rcNonzeroNoFailures: [], abortedShards: 0 })}\n`, stderr: '' };
@@ -2001,20 +2136,25 @@ async function runAppendedTipReGateCase(scenario: ReleaseSimRigScenario, item: R
   try {
     await resumeReleaseRun({ runId, from: 'gate', waive: 'gate', reason, approvedBy: 'OP',
       acceptedRegressions: [{ id: invalidId, note: 'Another failure remains' }] }, deps);
-  } catch (error) { invalidWaiverRejected = String(error).includes(introducedId); }
+  } catch (error) { invalidWaiverRejected = String(error).includes('measured gate regressions cannot be waived'); }
   const invalidAttemptUnchanged = readFileSync(first.statePath, 'utf8') === stateBefore;
 
   branchTip = appendedTip;
-  let movedTipWaiverRefused = false;
-  try {
-    await resumeReleaseRun({ runId, from: 'gate', waive: 'gate', reason, approvedBy: 'OP', acceptedRegressions }, deps);
-  } catch (error) { movedTipWaiverRefused = String(error).includes('release branch moved — re-gate the new tip before waiving a node'); }
-  const movedTipAttemptUnchanged = readFileSync(first.statePath, 'utf8') === stateBefore;
-
   phase = 'regate';
   // In the current graph the gate runs before export-check, so a gate failure cannot resume from export-check.
   const regated = await resumeReleaseRun({ runId, from: 'gate' }, deps);
   const regatedState = readFileSync(first.statePath, 'utf8');
+
+  // The hardened waiver refuses a measured gate before the branch-tip check, so the moved-tip
+  // refusal is only observable after the re-gate leaves the saved gate unmeasured.
+  branchTip = 'c'.repeat(40);
+  let movedTipWaiverRefused = false;
+  try {
+    await resumeReleaseRun({ runId, from: 'gate', waive: 'gate', reason, approvedBy: 'OP', acceptedRegressions }, deps);
+  } catch (error) { movedTipWaiverRefused = String(error).includes('release branch moved — re-gate the new tip before waiving a node'); }
+  const movedTipAttemptUnchanged = readFileSync(first.statePath, 'utf8') === regatedState;
+
+  branchTip = appendedTip;
   const reGateTip = regated.tip;
   const regateFailed = regated.state.status === 'failed';
   const regatePartial = regated.partial;
@@ -2253,11 +2393,15 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
     const mustVisit = item.expect.mustVisit.every((nodeId) => path.includes(nodeId));
     const mustNotVisit = item.expect.mustNotVisit.every((nodeId) => !path.includes(nodeId));
     const edgeIssues = unexpectedEdges(path, macro.graphState, edges);
-    const firstReceiptAudit = outputRecord(macro.graphState.nodes.find((node) => node.nodeId === 'receipt-audit')?.output);
+    const firstReceiptAuditNode = macro.graphState.nodes.find((node) => node.nodeId === 'receipt-audit');
+    const firstReceiptAudit = outputRecord(firstReceiptAuditNode?.output);
+    const firstReceiptAuditFailRouted =
+      (firstReceiptAuditNode as { ok?: boolean; resumeNextNode?: string } | undefined)?.ok === false
+      && (firstReceiptAuditNode as { ok?: boolean; resumeNextNode?: string } | undefined)?.resumeNextNode === 'residual-run';
     const receiptAuditEdge = edges.get('receipt-audit')?.map;
     const receiptAuditFailTarget = receiptAuditEdge && typeof receiptAuditEdge === 'object' && !Array.isArray(receiptAuditEdge)
       ? (receiptAuditEdge as Record<string, unknown>).fail : undefined;
-    const injectedMismatchRoutedToResidual = firstReceiptAudit?.outcome === 'fail'
+    const injectedMismatchRoutedToResidual = (firstReceiptAudit?.outcome === 'fail' || firstReceiptAuditFailRouted)
       && receiptAuditFailTarget === 'residual-run' && path.indexOf('residual-run') > firstAudit && edgeIssues.length === 0;
     const sameRun = macro.runId === runId && macro.graphState.runId === runId
       && macro.cases.every((entry) => entry.receipt?.runId === runId && entry.receipt.gateVisit === 2);

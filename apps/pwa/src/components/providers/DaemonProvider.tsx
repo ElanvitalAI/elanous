@@ -6,9 +6,13 @@ import {
   saveDaemonConfig,
   type DaemonConfig,
 } from '@/lib/daemon-config';
+import { DaemonHealthController } from '@/lib/daemon-health';
 import { ensureSessionId } from '@/lib/daemon-session';
 import { DaemonClient } from '@/lib/daemon-client';
 import { debugLog } from '@/lib/debug';
+
+/** r2 mustFix — 데몬 부재·복구를 버튼 상태에 반영하는 가용성 재탐침 주기. */
+const DAEMON_HEALTH_POLL_MS = 15000;
 
 interface DaemonContextValue {
   config: DaemonConfig;
@@ -16,6 +20,13 @@ interface DaemonContextValue {
   client: DaemonClient;
   sessionId: string;
   setSessionId: (id: string) => void;
+  /** [PWA-INTAKE-N1-N5A-N6A] self-review must3 — 데몬 가용성.
+   *  /v1/health 성공=true · 실패/미연결=false. token 변경도 재검사 ·
+   *  15초 재탐침 · 구성 변경 시 핸들러에서 «동기» false 리셋(r3 mustFix —
+   *  설정 변경 첫 렌더에 이전 true 가 남지 않는다. 겹친 탐침의 늦은
+   *  응답은 세대 가드로 폐기). 선택형(optional)이라
+   *  이 필드를 모르는 기존 소비자는 그대로 동작한다. */
+  daemonAvailable?: boolean;
 }
 
 /** Internal context handle. Exported so opt-in consumers (e.g.
@@ -44,6 +55,15 @@ export function DaemonProvider({ children }: { children: React.ReactNode }) {
   const [config, setConfigState] = useState<DaemonConfig>(EMPTY_CONFIG);
   const [sessionId, setSessionIdState] = useState<string>('');
   const [client] = useState(() => new DaemonClient(EMPTY_CONFIG));
+  // [PWA-INTAKE-N1-N5A-N6A] self-review must3 — 데몬 가용성.
+  // 미확인(false)으로 시작해 health 탐침 결과로 갱신한다(15초 간격 재탐침).
+  const [daemonAvailable, setDaemonAvailable] = useState(false);
+  // r3 mustFix — 탐침 세대 가드 컨트롤러(설정 변경 동기 무효화 · 겹친 탐침의
+  // 늦은 응답 폐기). 순수 로직 원문·시험: lib/daemon-health(.test).ts
+  const health = useMemo(
+    () => new DaemonHealthController(client, setDaemonAvailable),
+    [client],
+  );
 
   useEffect(() => {
     // Mount: read localStorage, push into state + DaemonClient. Storage
@@ -54,6 +74,27 @@ export function DaemonProvider({ children }: { children: React.ReactNode }) {
     setSessionIdState(ensureSessionId());
     debugLog('webterm.provider.daemon.init', { baseUrl: cfg.baseUrl, hasToken: !!cfg.token });
   }, [client]);
+
+  // [PWA-INTAKE-N1-N5A-N6A] self-review must3 — 데몬 가용성 탐침(r2 mustFix 강화).
+  // baseUrl 이 없으면 미연결(false). 있으면 /v1/health 로 즉시 1회 + 15초 간격
+  // 재탐침한다(성공=true · 실패=false). baseUrl·token 이 바뀌면 다시 잰다 —
+  // 새 탐침이 끝나기 전까지 이전 true 를 유지하지 않는다(false 리셋).
+  // SSR·첫 렌더는 false 로 고정이라 hydration 에도 안전.
+  useEffect(() => {
+    if (!config.baseUrl) {
+      setDaemonAvailable(false);
+      return;
+    }
+    // r2 mustFix — 구성(baseUrl·token)이 바뀌면 새 탐침이 끝나기 전까지 이전 true 를 유지하지 않는다.
+    // r3 mustFix — «설정 변경 순간»의 동기 리셋은 setConfig·storage 핸들러의
+    // health.invalidateSync() 가 담당한다(첫 렌더부터 false). 이 effect 의 리셋은
+    // baseUrl·token 의존성 재실행분을 담고, health.probe() 는 세대 가드로
+    // 겹친 탐침의 늦은 응답이 최신 결과를 덮지 않게 한다.
+    setDaemonAvailable(false);
+    health.probe();
+    const poll = setInterval(() => health.probe(), DAEMON_HEALTH_POLL_MS);
+    return () => clearInterval(poll);
+  }, [client, health, config.baseUrl, config.token]);
 
   // Image-pipeline followup #2 (2026-05-05) — cross-tab sessionId sync.
   // localStorage is shared across same-origin tabs, but mutating it in
@@ -72,6 +113,8 @@ export function DaemonProvider({ children }: { children: React.ReactNode }) {
       if (e.key === 'elanous.daemon.token' || e.key === 'elanous.nexus.baseUrl') {
         const cfg = loadDaemonConfig();
         client.updateConfig(cfg);
+        // r3 mustFix — 다른 탭에서 설정이 바뀌어도 같은 규칙: 동기 무효화 후 재탐침.
+        health.invalidateSync();
         setConfigState(cfg);
         debugLog('webterm.provider.daemon.config-cross-tab', { key: e.key, hasToken: !!cfg.token });
         return;
@@ -91,9 +134,18 @@ export function DaemonProvider({ children }: { children: React.ReactNode }) {
     };
     window.addEventListener('storage', handler);
     return () => window.removeEventListener('storage', handler);
-  }, [client]);
+  }, [client, health]);
 
   const setConfig = (next: Partial<DaemonConfig>): void => {
+    // r3 mustFix — 설정이 바뀌면 «첫 렌더»부터 이전 가용성(true)을 안 남긴다:
+    // useEffect 까지 미루지 않고 이 핸들러 안에서 동기로 무효화한다
+    // (진행 중 탐침도 세대 가드로 파기 — token 만 바뀐 경우도 같은 길).
+    if (
+      (next.baseUrl !== undefined && next.baseUrl !== config.baseUrl) ||
+      (next.token !== undefined && next.token !== config.token)
+    ) {
+      health.invalidateSync();
+    }
     setConfigState((prev) => {
       const merged = { ...prev, ...next };
       saveDaemonConfig(next);
@@ -112,8 +164,8 @@ export function DaemonProvider({ children }: { children: React.ReactNode }) {
   };
 
   const value = useMemo<DaemonContextValue>(
-    () => ({ config, setConfig, client, sessionId, setSessionId }),
-    [config, client, sessionId],
+    () => ({ config, setConfig, client, sessionId, setSessionId, daemonAvailable }),
+    [config, client, sessionId, daemonAvailable],
   );
 
   return <DaemonContext.Provider value={value}>{children}</DaemonContext.Provider>;

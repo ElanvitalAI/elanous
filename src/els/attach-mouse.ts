@@ -42,11 +42,14 @@ export interface MouseLayout {
   readonly rows: number;              // 화면 전체 행(1 기반; 마지막 행은 상태줄)
   readonly sidebarWidth: number;      // 0 = 사이드바 닫힘
   readonly sidebar: readonly { readonly y: number; readonly ws: string; readonly pane: string }[]; // y = 화면 행(1 기반)
+  readonly sidebarNew?: { readonly y: number; readonly from: number; readonly to: number }; // ELS-SIDEBAR-HERDR-CLEAN: the word «new» in the list's last line (열 0 기반)
   readonly tabs: readonly { readonly from: number; readonly to: number; readonly pane: string }[]; // 탭 중앙 오프셋(0 기반)
+  readonly plus?: { readonly from: number; readonly to: number }; // ELS-NEW-TAB-NAME-WIDGET: «+» 칸(중앙 0 기반)
 }
 
 export type MouseAction =
   | { readonly kind: 'select'; readonly pane: string }
+  | { readonly kind: 'new-tab' } // «+» 클릭: 새 탭 이름 입력줄을 연다
   | { readonly kind: 'scroll'; readonly lines: number } // 양수 = 과거로
   | { readonly kind: 'passthrough'; readonly bytes: string };
 
@@ -62,6 +65,8 @@ export function interpretMouse(report: MouseReport, layout: MouseLayout): MouseA
     return lines !== 0 ? { kind: 'scroll', lines } : null;
   }
   if (layout.sidebarWidth > 0 && x <= layout.sidebarWidth) {
+    const box = layout.sidebarNew;
+    if (box && y === box.y && x - 1 >= box.from && x - 1 < box.to) return { kind: 'new-tab' };
     const hit = layout.sidebar.find((item) => item.y === y);
     return hit ? { kind: 'select', pane: hit.pane } : null;
   }
@@ -69,6 +74,7 @@ export function interpretMouse(report: MouseReport, layout: MouseLayout): MouseA
   if (y === 1 && layout.tabs.length > 0) {
     const col = x - left - 1; // 탭 범위는 중앙 0 기준
     const tab = layout.tabs.find((t) => col >= t.from && col < t.to);
+    if (layout.plus && col >= layout.plus.from && col < layout.plus.to) return { kind: 'new-tab' };
     return tab ? { kind: 'select', pane: tab.pane } : { kind: 'passthrough', bytes: report.bytes };
   }
   return { kind: 'passthrough', bytes: report.bytes };

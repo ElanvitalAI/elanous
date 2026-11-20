@@ -84,6 +84,7 @@ import { tscEnv, assessTypecheckExecution, classifyTypecheckErrors, diffTypechec
 import { nestCapReached, childNestEnv, nestInfo } from '../agent/nest-depth.js';
 import { harnessBoundaryEnv, harnessBoundaryRequestsEnv, harnessBoundaryResponsesEnv, harnessSpaceEnv, getHarnessSpace, normalizeSpaceId, getHarnessRunId, resolveRunIdentity } from '../harness/harness-space.js';
 import { debug } from '../debug/log.js';
+import { reviewerRecordLine } from '../self-dev/no-review-provider.js';
 import { RELEASE_PATH_HOLD_MARKER, RELEASE_PATH_LABEL, releasePathHoldShouldPost, releasePathHoldCommentsArgs } from '../self-dev/release-path-guard.js';
 import { readPrFilesWithRateLimitFallback, runGhApp } from './app-api-budget.js';
 import { emitDecision } from '../live/detail-switch.js';
@@ -2996,12 +2997,18 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           ...(rr.failureReason !== undefined ? { failureReason: rr.failureReason } : {}),
           ...reviewDiffBudgetObservation(rr),
         });
+        // TA-POD-REVIEW-PROVIDER-ALLOW — the reviewer actually used goes on the card history and (first line of the summary) in the PR text.
+        const reviewerLine = reviewerRecordLine(reviewer);
+        try {
+          const cardId = process.env.ELANOUS_TASK_CARD_ID?.trim();
+          if (cardId) updateTaskCard(taskAgentStatePath(), cardId, (card) => card ? { ...card, history: [...card.history, { at: new Date().toISOString(), event: 'review-reviewer', detail: reviewerLine, ...(ctx?.runId ? { runId: ctx.runId } : {}) }] } : undefined);
+        } catch { /* the card line never blocks the review */ }
         try { emitDecision(reviewDecision({ runId: ctx?.runId, verdict: rr.verdict, reviewed: rr.reviewed ?? false, mustFix: rr.mustFix.length, shouldFix: rr.shouldFix.length, topFinding: rr.mustFix[0], reason: rr.failureReason, ...(reviewer ? { reviewer } : {}) })); } catch { /* observation must not change the review result */ }
         return {
           verdict: rr.verdict,
           mustFix: rr.mustFix,
           shouldFix: rr.shouldFix,
-          summary: rr.reviewed ? renderReview(rr).slice(0, 2000) : `리뷰 못 함(사유: ${rr.failureReason ?? '사유 미상'})`,
+          summary: `${reviewerLine}\n${rr.reviewed ? renderReview(rr).slice(0, 2000) : `리뷰 못 함(사유: ${rr.failureReason ?? '사유 미상'})`}`,
           reviewed: rr.reviewed ?? false,
           // ⛔⭐ 이 한 줄이 `orchestrator.ts` 의 「찍는 줄」에 값을 «흘린다». 빼면 그 줄은 살아 있는데 값이 안 온다.
           ...(rr.failureReason !== undefined ? { failureReason: rr.failureReason } : {}),

@@ -23,7 +23,7 @@ import { carrySessionProvider, requestNewTuiSession } from './slash/new-session.
 import { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS } from './slash/compact-command.js';
 import { RESUME_BUSY_STATUS, parseResumeCommand } from './slash/resume-command.js';
 import { reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
-import { createNextTuiQueue, type NextTuiSettledTurn } from './core/queue.js';
+import { createNextTuiQueue, type NextTuiSettledTurn, type NextTuiQueueInterruptReason } from './core/queue.js';
 import { stripQueueModelContext, withInterruptedOnPurposeContext, withQueueNoticeContext, withReplacementCandidateContext } from '../chat/interjection.js';
 import { replacementCandidateContextLine, replacementCandidateScreenLine } from '../chat/queue-supersede.js';
 import { isTurnTypeaheadSteerable } from '../chat/turn-typeahead.js';
@@ -57,6 +57,7 @@ import { createIdleEventWake, graphNodeEndNotice, graphRunIdleNotice, idleChildL
 import { createIdleWakeDoor } from './idle-wake-door.js';
 import { QUEUE_IDLE_STALL_MS, QUEUE_IDLE_TICK_MS, createQueueIdleWatchdog } from './core/queue-idle-watchdog.js';
 import { seatMailOnArrived } from './seat-mail-on-arrived.js';
+import { enqueueMidTurnEvent } from '../session/mid-turn-events.js';
 // OP-EVENT-WATCH-WAKE: event-watch-runner 는 동적 import (entry 는 훅만).
 import { createLedgerReceiptWriter, readSeatMailMessages } from './seat-message-receipts.js'; // SEAT-INBOX B1-C 메시지 단위 notice ⊕ 영수증
 import { nextSlashCandidates } from './input/slash-complete.js';
@@ -344,6 +345,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const compactPainter = createNextTuiCompactPainter((text) => process.stdout.write(text));
   const missionWatchCancellation: { cancel?: () => void } = {};
   let busy = false;
+  let outerElsArmed = false; // ELS-NESTING-RULE ③: the session already lives in an els pane; this eln closes and els takes the terminal
+  let handoffExit = false;
   /** #38510 r1 MF1: every busy flip is a turn boundary the idle watchdog must see (set once it exists). */
   let onBusyFlip: (() => void) | null = null;
   // CAPSULE-C2 (flag on): the one turn door; a chat turn's end (busy → false) gives its reservation back.
@@ -417,6 +420,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let remoteSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
   let remoteSidetabRefreshPending = false;
   let elsSidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
+  // ELS-DESKTOP-SIDETAB-SUBSCRIBE: the server's push feed; null while the panel is closed. The 1 s timer polls only when it is not live.
+  let elsFeed: import('./sidetab/els-subscribe.js').ElsFeed | null = null;
   let elsSidetabRefreshPending = false;
   let sidetabApi: typeof import('./sidetab/list.js') | null = null;
   const getSidetabViewMode = (): 'current' | 'all' | 'workspaces' => sidetabViewMode;
@@ -644,6 +649,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   /** CAPSULE-C2: notices a person's Enter displaced before their ledger opened — they go first at the next offer. */
   // CAPSULE-C2-FU: FIFO, not one slot — a second displaced notice never overwrites the first.
   const heldNotices: Parameters<typeof dispatchQueuedExternalEventOne>[0]['notice'][] = [];
+  // A dequeued notice remains pending while its wire import is in flight.
+  let noticesInFlight = 0;
   let doorHumanFirst: () => string | null = () => null;
   // TURN-FIELD-BUG-5: the key that submitted the last person turn is not «typing» once that turn ended.
   let humanTurnKeyAt = 0;
@@ -714,18 +721,42 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   } catch { /* boot goes on without a plan */ }
   // #38031 (ELN-CHILD-NOTICE) — 사이드탭 미션 종결 알림 생산자(같은 (source,text) 중복 적입 억제).
   const childNotices = createChildNoticeProducers(queue);
+  // OP #106762 ⓐ — 턴 중 이벤트가 배수돼 모델 입력에 실리면, 같은 사건의 대기 큐 노티스를 원본에서 지운다
+  // (같은 msgId 는 세션 동안 한 번 · fail-open: 이미 떠난 항목은 조용히 넘어간다).
+  const removeQueuedNotice = (match: { source: string; msgId?: number; text?: string }): number => {
+    const wanted = queue.items.filter((item) =>
+      item.kind === 'notice' && item.source === match.source &&
+      (match.msgId !== undefined ? item.msgId === match.msgId : match.text !== undefined && item.text === match.text));
+    let removed = 0;
+    for (const item of wanted) {
+      try { queue.cancel(item.id, 'mid-turn-carried'); removed += 1; } catch { /* fail-open */ }
+    }
+    return removed;
+  };
   // #38031 — 자리 우편 도착 감시(기본 15초 폴링 · 첫 관측은 기준선만). notice 는 이 큐에 그대로.
   // MF(r3): 핸들을 변수로 보존해야 showNextTui 종료(finally)에서 stop() 할 수 있다 — 버리면 TUI 를 닫아도 15초 폴링이 남는다.
   // Seat mail that lands during a turn stays a queued notice. The idle door (queueWake after settle)
   // opens it as the next turn; it is not offered to the running turn as a steer (#38193).
   // SEAT-INBOX B1-C — one notice per message (msgId) · receipts delivered (enqueue) · seen (queue delivered).
   const seatMailWatcher = createSeatMailArrivalWatcher(process.cwd(), queue, {
-    onArrived: seatMailOnArrived({ busy: () => busy, injectKey: () => { idleWakeDoor.knock('seat-mail'); }, queueWake }),
+    onArrived: seatMailOnArrived({
+      busy: () => busy, injectKey: () => { idleWakeDoor.knock('seat-mail'); }, queueWake,
+      enqueueMidTurn: (event, onDrained) => { const sid = telemetrySessionId; return sid !== null && enqueueMidTurnEvent(sid, event, onDrained); },
+      removeQueuedNotice,
+    }),
     turnLifeLog: emitTurnLife,
     messages: { read: (cwd, afterId) => readSeatMailMessages(cwd, afterId), receipts: createLedgerReceiptWriter() },
     ...(seatMailAdapter ? { mailAdapter: seatMailAdapter } : {}),
   });
-  seatMailWatcher.start();
+  // Project the actual watcher's health alongside the existing plan in every header render.
+  const mailHeaderSeat = options.seatPlanBootForTest;
+  seatMailHeader = createSeatMailHeaderHook(
+    mailHeaderSeat?.cwd ?? process.cwd(),
+    mailHeaderSeat ? { home: mailHeaderSeat.home } : {},
+    seatPlan,
+    seatMailWatcher,
+  );
+  try { seatMailWatcher.start(); } catch { /* the header exposes start-error without aborting the TUI */ }
   // ELN-EXTERNAL-EVENTS-BETWEEN-TURNS — a harness child finishing, or a graph
   // node ending, stays a queued notice. The idle door opens only when nothing
   // is running; a running turn is never steered.
@@ -754,6 +785,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const offIdleGraphWake = onGraphRunIdleWake((wake) => {
     if (idleEventWake.onGraphRun(wake)) idleWakeDoor.knock('graph-node');
   });
+  // ELS-GRAPH-LIVE-VIEW — inside an els pane (els sets ELANOUS_ELS_WS), this process's graph runs become a child tab in
+  // that workspace: node chain in start order, node-progress as each line's note, ● ◐ ✕ from the last event.
+  const elsGraphWs = process.env.ELANOUS_ELS_WS?.trim();
+  let offElsGraph: () => void = () => {};
+  if (elsGraphWs) {
+    const [{ wireElsGraphProducer }, { requestEls }, { elsSocketPath }, { onGraphNodeProgress }] = await Promise.all([
+      import('../els/graph-producer.js'), import('../els/client.js'), import('../els/server.js'), import('../graph-runner/runner.js')]);
+    const producer = wireElsGraphProducer({ ws: elsGraphWs, socketPath: process.env.ELANOUS_ELS_SOCKET?.trim() || elsSocketPath(),
+      cwd: process.cwd(), request: (socketPath, request) => requestEls(socketPath, request),
+      sources: { onLifecycle: onGraphNodeLifecycle, onProgress: onGraphNodeProgress, onRunEnd: onGraphRunIdleWake } });
+    offElsGraph = () => producer.dispose();
+  }
   // OP-EVENT-WATCH-WAKE: 감시 줄이 큐에 들어가면 queueWake. spawn·줄 버퍼는 runner.
   const eventWatchWake: { current: (() => void) | null } = { current: null };
   // Read through a local so a literal-empty test env does not narrow the command to "".
@@ -767,8 +810,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const steerRequest: { current: ((steerId: string, text: string) => boolean) | null } = { current: null };
   const steerRetract: { current: ((steerIds: readonly string[]) => void) | null } = { current: null };
   let steerSerial = 0;
-  /** The queued text that leaves right after an Esc cancel — its turn carries the interrupted-on-purpose line. */
-  let interruptContextFor: string | null = null;
+  /** Dequeued interruption belongs to the next actual chat turn, even if a notice yields the door. */
+  let interruptContextFor: NextTuiQueueInterruptReason | null = null;
   /** mf1(#38102 r4): the notice dispatchQueued is about to open — consumed (and cleared) by startChatTurn. */
   let pendingNoticeTurn: {
     id: string;
@@ -854,6 +897,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const stopDone = knock.wireCapsuleDoneKnock({
           sessionId, subscribe: chat.onLocalChatCapsuleEvent,
           enqueue: (event) => childNotices.capsuleDone(event, event.endedAt), knock: () => { idleWakeDoor.knock('capsule-done'); },
+          busy: () => busy,
+          enqueueMidTurn: (event, onDrained) => enqueueMidTurnEvent(sessionId, event, onDrained),
+          removeQueuedNotice,
         });
         const stopWatch = watch.wireShellWatchKnock({ sessionId, subscribe: chat.onLocalChatCapsuleEvent,
           enqueue: (text, at) => queue.enqueueNotice(text, 'event-watch', { occurredAt: at }),
@@ -973,6 +1019,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         clearInterval(sidetabRefreshTimer);
         sidetabRefreshTimer = null;
       }
+      stopElsFeed();
     }
     if (compactMode) setTuiMouseCapture(sidetabOpen);
     const sidetabWidth = sidetabOpen ? sidetabApi!.sidetabWidthForTerminal(columns) : 0;
@@ -1423,6 +1470,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       status = '사이드탭 off · /side on 으로 이 세션에서 켜기';
       return;
     }
+    if (!sidetabOpen && !outerElsArmed) {
+      // ELS-NESTING-RULE ③: a bare eln with a live els server puts els around this session (same session id, a pane).
+      // Anything else — inside a pane, no server, a turn running, a failed hand-off — keeps the toggle below as it was.
+      const handoff = await import('./els-handoff.js');
+      const moved = await handoff.elnToggleHandoff({
+        env: process.env, sessionId: id!, cwd: process.cwd(), busy, ...handoff.realToggleHandoffSeams(),
+        armOuter: () => { outerElsArmed = true; return true; },
+      });
+      if (moved.kind === 'exit') { status = moved.message; handoffExit = true; injectKey(seatStopKey); return; }
+      if ('message' in moved) status = moved.message;
+    }
     if (!sidetabOpen && (process.stdout.columns || 0) < 34) {
       status = '사이드탭은 터미널 폭 34칸 이상에서 열 수 있습니다';
       return;
@@ -1437,19 +1495,20 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabSelected = next.selected;
     sidetabMode = 'list';
     if (sidetabOpen && sidetabRefreshTimer === null) {
-      void refreshElsSidetabRows();
+      void tickElsSidetab();
       if (process.env.ELANOUS_REMOTE_SIDETAB === '1') void refreshRemoteSidetabRows();
       sidetabRefreshTimer = setInterval(() => {
         if (!sidetabOpen || !sidetabApi) return;
         refreshSidetabRows();
         refreshRichView();
-          void refreshElsSidetabRows();
+        void tickElsSidetab();
         if (process.env.ELANOUS_REMOTE_SIDETAB === '1') void refreshRemoteSidetabRows();
         render();
       }, 1000);
     } else if (!sidetabOpen && sidetabRefreshTimer !== null) {
       clearInterval(sidetabRefreshTimer);
       sidetabRefreshTimer = null;
+      stopElsFeed();
     }
   };
 
@@ -1461,6 +1520,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       sidetabSelected = preservedIndex >= 0
         ? preservedIndex
         : Math.min(sidetabSelected, Math.max(0, sidetabRows.length - 1));
+      // A fresh selection never lands on an els tree header (ws / tab / host line, no pane address): it moves to the next row.
+      const onElsHeader = (row: { kind: string; id: string } | undefined): boolean => row?.kind === 'els' && !row.id.startsWith('els:');
+      if (preservedIndex < 0 && onElsHeader(sidetabRows[sidetabSelected])) {
+        const next = sidetabRows.findIndex((row, index) => index > sidetabSelected && !onElsHeader(row));
+        if (next >= 0) sidetabSelected = next;
+      }
     }
     // Follow the row list. No local tab clears an automatic binding and returns.
     if (workspaceInput && refreshWorkspaceInputRows) refreshWorkspaceInputRows(workspaceInput);
@@ -1478,6 +1543,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const { federation } = (await import('./sidetab/els-subscribe.js')).realElsFederation();
     return { do: (address, text, from) => federation.do(address, text, from), read: (address) => federation.read(address),
       from: process.env.ELANOUS_TRACK?.trim() || process.env.ELANOUS_SEAT?.trim() || 'sidetab' };
+  };
+  const stopElsFeed = (): void => { elsFeed?.stop(); elsFeed = null; };
+  // One panel tick for the els section: follow the server's push (subscribe op); poll `ls` only when the push is not live
+  // (no server / older server / dropped) or on the slow heartbeat for the federated part. A feed that cannot be built polls.
+  const tickElsSidetab = async (): Promise<void> => {
+    try {
+      const subscribe = await import('./sidetab/els-subscribe.js');
+      if (!sidetabOpen) return;
+      elsFeed ??= subscribe.realElsFeed(() => { void refreshElsSidetabRows().then(() => { if (sidetabOpen) render(); }); });
+      if (!elsFeed.tick().poll) return;
+    } catch { /* fall through to the plain poll */ }
+    await refreshElsSidetabRows();
   };
   // The els server's spaces (ws/tab/pane, status words, ⇄host). Read-only: no server is started and none is stopped
   // when the panel closes; no answer means no rows.
@@ -1641,7 +1718,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     seatMailWatcher.noteTurnFinished(false);
     wakeup?.gate.noteTurnSettled();
     try { seatPlan?.absorb(); } catch { /* mail absorption never blocks a turn end */ }
-    const result = queue.settle(input.editor.text, turn);
+    const noticePending = heldNotices.length > 0 || noticesInFlight > 0;
+    const result = queue.settle(input.editor.text, turn, noticePending);
+    // Held and importing notices live outside the queue and may be its only pending work.
+    // Only the notice case moves the reason out of the queue: resubmit reasons stay queued for deliver() at the idle boundary,
+    // so a later item's cancel leave() cannot strand them in entry scope and leak `reason:esc` into an unrelated turn.
+    if (noticePending) {
+      const reason = queue.takeResumeReason();
+      if (reason !== undefined) interruptContextFor ??= reason;
+    }
     if (result.kind === 'restore-original') {
       const draft = input.editor.text;
       input.setText(draft ? `${result.text}\n${draft}` : result.text);
@@ -1658,17 +1743,23 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   /** CAPSULE-C2: one notice through the door — kept (not opened) if a person takes the door during the import. */
   const dispatchNoticeThroughDoor = (notice: (typeof heldNotices)[number],
     reservation: import('../turn-capsule/contract.js').DoorReservation): void => {
-    void dispatchQueuedExternalEventOne({
-      notice,
-      onSeatMail: (oneId, oneText) => { seatPlanLink?.noticeDispatched(oneId, oneText); },
-      injectKey: () => injectKey(queueWake),
-      keepOpen: (one) => { pendingNoticeTurn = one; },
-      startChatTurn: (text, status) => { startChatTurn(text, status); render(); },
-      log: (event, fields) => { debug.log('tui.next', event, fields); },
-      held: () => entryDoor?.door.holds(reservation) === true,
-      onSuperseded: () => { heldNotices.unshift(notice); },
-      afterDispatch: () => { entryDoor?.releaseIfUnstarted(reservation); },
-    });
+    noticesInFlight++;
+    try {
+      void dispatchQueuedExternalEventOne({
+        notice,
+        onSeatMail: (oneId, oneText) => { seatPlanLink?.noticeDispatched(oneId, oneText); },
+        injectKey: () => injectKey(queueWake),
+        keepOpen: (one) => { pendingNoticeTurn = one; },
+        startChatTurn: (text, status) => { startChatTurn(text, status); render(); },
+        log: (event, fields) => { debug.log('tui.next', event, fields); },
+        held: () => entryDoor?.door.holds(reservation) === true,
+        onSuperseded: () => { heldNotices.unshift(notice); },
+        afterDispatch: () => { entryDoor?.releaseIfUnstarted(reservation); },
+      }).finally(() => { noticesInFlight--; });
+    } catch (error) {
+      noticesInFlight--;
+      throw error;
+    }
   };
 
   /** O2: the door holds a reservation and nothing is queued — open one late wakeup from the bus (never twice). */
@@ -1714,6 +1805,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       door.releaseIfUnstarted(reservation);
       return;
     }
+    if (handoff.afterInterrupt) interruptContextFor ??= handoff.interruptReason ?? 'interrupt';
     // mf1(#38102 r4): a notice is not the person — it opens its own turn through the door (one notice, one turn,
     // one chain: dispatchQueuedExternalEventOne). The composer, the draft and noteHumanTurn are untouched; the model
     // alone sees the one-line source head («[notice · seat-mail]») on the turn it answers.
@@ -1731,7 +1823,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // 대기열에서 나가는 것도 사람이 쳐 둔 턴이다 — 골 이어가기의 연속·지문을 비운다(r3 must-fix).
     goalContinue?.noteHumanTurn();
     personTurnStarted = true;
-    interruptContextFor = handoff.afterInterrupt ? handoff.text.trim() : null;
     const candidate = queue.replacementCandidate(handoff.id);
     const candidateOld = candidate ? queue.get(candidate.candidateFor) : undefined;
     // The old item's status at dispatch decides the wording (queued vs already delivered); cancelled → no line.
@@ -1755,7 +1846,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const shellDecision = nextTuiShellEscDecision(activeShellCalls, monotonicNowMs());
     if (shellDecision !== 'confirm') {
       turnAbort?.abort();
-      queue.markInterrupted();
+      queue.markInterrupted('esc');
       status = '응답 취소 중';
     } else {
       stopConfirmationSelection = 1;
@@ -1810,6 +1901,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   };
   const startChatTurnBody = (turnText: string, banner?: string, from?: import('../session/index.js').MessageSource): void => {
     turnFrom = from;
+    // SCHEDULE-WAKEUP-TURN-CAP: every real turn start gets its own gate turn id (notice/mail/queue turns skip the gate's open paths).
+    wakeup?.gate.noteTurnStarted();
     // Which plan item (if any) this turn works for: a dispatched plan notice, or an automatic follow-up of one.
     const planChainNotice = seatPlanLink?.turnStarted(turnText, banner !== undefined) ?? null;
     activity = [];
@@ -1836,8 +1929,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       backgroundJobs.setSessionId(id);
     }
     const turnSessionId = id;
-    const carriesInterruptContext = interruptContextFor !== null && turnText.trim() === interruptContextFor;
-    interruptContextFor = null;
     // mf1(#38102 r4): only the exact notice text dispatched a moment ago claims the source head.
     const noticeTurn = pendingNoticeTurn !== null && pendingNoticeTurn.text === turnText ? pendingNoticeTurn : null;
     const noticeSource = noticeTurn?.source ?? null;
@@ -1882,7 +1973,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         turnStallHandled = true;
         debug.log('tui.next', 'turn.stalled', { sessionId: turnSessionId, idleMs: Math.round(verdict.idleMs), queued: queue.count,
           streamedChars: streamedOutputChars ?? 0, elapsedMs: Math.round(turnElapsedMs ?? 0) }, { level: 'warn' });
-        queue.markInterrupted();
+        queue.markInterrupted('stream-stall');
         turnAbort.abort('stall');
         status = `No output for ${stallMinutes(verdict.idleMs)} min · turn stopped${queue.count > 0 ? ' · queued input is sent next' : ''}`;
       }
@@ -1929,16 +2020,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           });
         }
         observeSession(sessionId, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus);
+        const interruptContext = interruptContextFor;
         // Model-context lines, outermost first: interrupted-on-purpose → «대체 후보» → the person's words.
         const withCandidate = replacementContextLine ? withReplacementCandidateContext(text, replacementContextLine) : text;
         // mf1(#38102 r4): the notice turn carries the one-line source head for the model only; the person's
         // view is stripped back to the notice text (public-history, like the interrupt/candidate heads).
-        const childText = noticeSource !== null
-          ? withQueueNoticeContext(withCandidate, noticeSource)
-          : carriesInterruptContext ? withInterruptedOnPurposeContext(withCandidate) : withCandidate;
+        const withNotice = noticeSource !== null ? withQueueNoticeContext(withCandidate, noticeSource) : withCandidate;
+        const childText = interruptContext !== null ? withInterruptedOnPurposeContext(withNotice, interruptContext) : withNotice;
         if (noticeSource !== null) debug.log('tui.next', 'turn-notice-context', { source: noticeSource, chars: text.length });
         if (replacementContextLine) debug.log('tui.next', 'turn-replacement-candidate-context', { chars: text.length });
-        if (carriesInterruptContext) debug.log('tui.next', 'turn-after-interrupt', { chars: text.length });
+        if (interruptContext !== null) debug.log('tui.next', 'turn-after-interrupt', { chars: text.length });
         if (signal.aborted || id !== turnSessionId) return { goalComplete: false };
         // A207 — «↻ Continuing» only after runLocalChatTurn has returned its handle. A throw
         // during that open never paints the banner. The running status is already on screen.
@@ -2012,7 +2103,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             nodeLivenessTui.observe(event, runningToolLabel(visibleToolActivity)?.name);
             reportTuiProgress();
             render();
-          }, turnFrom);
+          }, turnFrom, () => {
+            // A child pipe flush is the best available delivery boundary, not provider acknowledgement.
+            if (interruptContext !== null && interruptContextFor === interruptContext) interruptContextFor = null;
+          });
         paintTurnOpen();
         return opened;
       },
@@ -2237,12 +2331,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabRows = sidetabApi.loadSidetabRows(getSidetabViewMode() === 'all', undefined, sidetabScope());
     // The side list is remembered as open across sessions, so this branch is the COMMON start: the els rows (this host's
     // panes, ⇄herdr, registered hosts) must be read here too, not only after a toggle.
-    void refreshElsSidetabRows();
+    void tickElsSidetab();
     sidetabRefreshTimer = setInterval(() => {
       if (!sidetabApi || !sidetabOpen) return;
       refreshSidetabRows();
       refreshRichView();
-      void refreshElsSidetabRows();
+      void tickElsSidetab();
       render();
     }, 1_000);
   }
@@ -2831,7 +2925,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           stopConfirmationKind = null;
           if (stop) {
             turnAbort?.abort();
-            queue.markInterrupted();
+            queue.markInterrupted('esc');
             status = '응답 취소 중';
           } else status = confirmationKind === 'long-shell' ? '긴 셸 명령 계속 실행 · Esc 취소' : '응답 중 · Esc 취소';
         }
@@ -3852,6 +3946,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     offIdleChildWake();
     offIdleGraphNode();
     offIdleGraphWake();
+    offElsGraph();
     eventWatchStop.current?.();
     // #38260 REVIEW-2 ②: the fleet poller ends with this TUI (a re-entry creates its own; no second poller keeps asking).
     fleetSegment.stop();
@@ -3859,6 +3954,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     delete missionWatchCancellation.cancel;
     if (simWatchTimer !== null) clearInterval(simWatchTimer);
     if (sidetabRefreshTimer !== null) clearInterval(sidetabRefreshTimer);
+    stopElsFeed();
     if (sidetabChordTimer !== null) clearTimeout(sidetabChordTimer);
     sidetabAttachments?.close();
     restoreCliStderrSink?.();
@@ -3897,4 +3993,5 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     process.stdout.off('resize', render);
     closeTui();
   }
+  if (handoffExit && outerElsArmed) process.exitCode = (await import('./els-handoff.js')).runOuterEls();
 }

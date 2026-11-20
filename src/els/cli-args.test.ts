@@ -20,15 +20,23 @@ test('an els option right after the command name is explained; later words, a gi
   expect(misplacedOptionHint({ command: [] })).toBeUndefined();
 });
 
-test('send-keys: names → bytes, validated as a whole before anything is sent', () => {
+test('send-keys: the allowlist is separate from the person path — harmless keys only, whole-validated', () => {
+  // #90792 P0 ② — esc, ctrl+<key> (ctrl+c, the interrupt, among them) and alt+<key> are control keys a
+  // script must not press; enter and the editing/navigation keys are all it gets.
   expect(keyBytes('Enter')).toBe('\r');
-  expect(keyBytes('ctrl+c')).toBe('\x03');
-  expect(keyBytes('esc')).toBe('\x1b');
+  expect(keyBytes('ctrl+c')).toBeUndefined();
+  expect(keyBytes('ctrl+d')).toBeUndefined();
+  expect(keyBytes('esc')).toBeUndefined();
+  expect(keyBytes('escape')).toBeUndefined();
+  expect(keyBytes('alt+x')).toBeUndefined();
   expect(keyBytes('up')).toBe('\x1b[A');
   expect(keyBytes('x')).toBe('x');
   expect(keyBytes('ctrl+1')).toBeUndefined();
-  expect(keysToBytes(['ctrl+c', 'enter'])).toEqual({ bytes: '\x03\r' });
-  expect(keysToBytes(['esc', 'bogus', 'enter'])).toEqual({ unknown: 'bogus' });
+  expect(keyBytes('pageup')).toBe('\x1b[5~');
+  expect(keyBytes('shift+tab')).toBe('\x1b[Z');
+  expect(keysToBytes(['enter', 'up'])).toEqual({ bytes: '\r\x1b[A' });
+  expect(keysToBytes(['ctrl+c', 'enter'])).toEqual({ unknown: 'ctrl+c' });      // refused before enter: nothing is sent
+  expect(keysToBytes(['esc', 'bogus', 'enter'])).toEqual({ unknown: 'esc' });  // esc is the first refused key now
 });
 
 test('herdr-shaped JSON: *_id fields under result, workspace filter, creation shape', () => {

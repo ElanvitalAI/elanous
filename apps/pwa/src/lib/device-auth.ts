@@ -2,7 +2,7 @@
 // sends its own requests — a device without a token used to fire a dozen calls that all failed (activity error,
 // project error, «socket closed 1008 auth_failed») at once.
 import { DaemonClient } from '@/lib/daemon-client';
-import { loadDaemonConfig, type DaemonConfig } from '@/lib/daemon-config';
+import { isBareWebChatOrigin, loadDaemonConfig, type DaemonConfig } from '@/lib/daemon-config';
 
 export type DeviceAuth = 'connected' | 'unconnected' | 'unreachable';
 
@@ -14,6 +14,8 @@ export const PROBE_TIMEOUT_MS = 5_000;
 
 export async function probeDeviceAuth(config: DaemonConfig = loadDaemonConfig(),
   client: Pick<DaemonClient, 'fetchResponse'> = new DaemonClient(config), timeoutMs: number = PROBE_TIMEOUT_MS): Promise<DeviceAuth> {
+  // bare 핸들 호스트: 릴레이가 /v1/nexus 를 넘기지 않는다 — 물으면 401/404 라 연결 화면이 앱을 덮는다. 세션은 wcs_ 쿠키로 이미 입장함.
+  if (isBareWebChatOrigin()) return 'connected';
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   try {

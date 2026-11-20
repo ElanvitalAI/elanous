@@ -23,9 +23,11 @@ test('RELEASE-GATE-INDEPENDENT-OF-EXPORT sim: export failure runs the gate, then
           started.push(nodeId);
           const failed = nodeId === 'export-check' && exportFailures > 0;
           if (failed) exportFailures -= 1;
-          const output = nodeId === 'version-release'
+          const output = nodeId === 'version-release' || nodeId === 'cut-branch'
             ? { outcome: 'ok', version: '9.9.9', commit, branch: 'release/9.9.9' }
-            : { outcome: failed ? 'fail' : 'ok', verdict: failed ? 'fail' : 'pass', summary: 'fixture' };
+            : nodeId === 'gate-cutover-switch'
+              ? { outcome: 'legacy' }
+              : { outcome: failed ? 'fail' : 'ok', verdict: failed ? 'fail' : 'pass', summary: 'fixture' };
           return {
             exitCode: failed ? 1 : 0,
             stdout: JSON.stringify(output) + '\n',

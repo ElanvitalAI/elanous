@@ -1,6 +1,6 @@
 import { debug } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
-import { readSeatMailSnapshot, type SeatMailSnapshot } from './seat-mail-boot.js';
+import { readSeatMailSnapshot, type SeatMailSnapshot, type SeatMailWatchStatus } from './seat-mail-boot.js';
 import { createChildNoticeProducers, type ChildNoticeQueue } from './core/notice-producers.js';
 import { headerFieldsOf } from '../msg/msg-context-header.js';
 import type { NextTuiQueueTransitionListener } from './core/queue.js';
@@ -66,6 +66,8 @@ export type SeatMailWatchQueue = ChildNoticeQueue & {
 };
 
 export interface SeatMailArrivalWatcher {
+  /** Live health: running requires a successful seat read, not merely an armed timer. */
+  getStatus(): SeatMailWatchStatus;
   poll(): SeatMailPollOutcome;
   /**
    * The turn that took this watcher's notices ended. `responded` → those messages are «seen» now. Otherwise (failed ·
@@ -75,6 +77,18 @@ export interface SeatMailArrivalWatcher {
   noteTurnFinished(responded: boolean, outcome?: TurnEventOutcome): void;
   start(): void;
   stop(): void;
+}
+
+/** OP #106762 ⓐ — what `onArrived` carries: the ledger msgId (세션 1회 계약의 키) and the queued notice text. */
+export interface SeatMailArrivalInfo {
+  /** Ledger msgId — 수 모드 노티스엔 없다. */
+  readonly msgId?: number;
+  /** 큐 항목과 같은 문면(seatMessageNotice — 머리줄 ⊕ msg:<id> ⊕ 전문). */
+  readonly text: string;
+  /** 받은 자리. */
+  readonly seat: string;
+  /** 보낸 자리. */
+  readonly sender?: string;
 }
 
 export function createSeatMailArrivalWatcher(
@@ -90,8 +104,11 @@ export function createSeatMailArrivalWatcher(
     /**
      * Called after a new seat-mail notice is queued. The TUI wakes the idle door when no turn is running;
      * a notice that lands during a turn stays queued until that turn settles.
+     *
+     * OP #106762 ⓐ — receives what actually arrived (msgId · the queued notice text · seats) so a busy
+     * turn's mid-turn event can carry the real body. undefined = a re-submission with no fresh info.
      */
-    onArrived?: () => void;
+    onArrived?: (arrivals?: readonly SeatMailArrivalInfo[]) => void;
     /** Per-message notices allowed to wait at once (default {@link resolveSeatMailQueueCap}). */
     queueCap?: number;
     log?: (event: string, data: Record<string, unknown>) => void;
@@ -118,6 +135,7 @@ export function createSeatMailArrivalWatcher(
   const producers = createChildNoticeProducers(queue);
   let lastUnread: number | null = null;
   let handle: unknown = null;
+  let status: SeatMailWatchStatus = 'stopped';
   let lastMsgId: number | null = null;
   const queueCap = resolveSeatMailQueueCap(deps.queueCap);
   const log = deps.log ?? ((event: string, data: Record<string, unknown>) => {
@@ -148,8 +166,10 @@ export function createSeatMailArrivalWatcher(
     clear: (handle: unknown) => clearTimeout(handle as Parameters<typeof clearTimeout>[0]),
   };
   let readRetry: unknown = null;
-  const detachTransition = source && queue.onTransition
-    ? queue.onTransition((item) => {
+  let detachTransition: (() => void) | null = null;
+  const attachTransition = (): void => {
+    if (detachTransition || !source || !queue.onTransition) return;
+    detachTransition = queue.onTransition((item) => {
       const mapped = noticeMessages.get(item.id);
       if (mapped === undefined) return;
       noticeMessages.delete(item.id);
@@ -160,8 +180,10 @@ export function createSeatMailArrivalWatcher(
       }
       // Dropped before any turn (cancel · supersede): the claim goes back, so another path may still carry it.
       else adapter.release('notice', [mapped.msgId]);
-    })
-    : null;
+    });
+  };
+  // Manual poll() before start is supported too.
+  attachTransition();
   /** CAPSULE-C3: queue parked mail the adapter grants again. Returns how many notices it queued. */
   const reofferParked = (room: number): number => {
     if (parked.size === 0) return 0;
@@ -208,7 +230,11 @@ export function createSeatMailArrivalWatcher(
     const seen = new Set(settled.seen);
     const retry = new Set(settled.retry);
     for (const [itemId, mapped] of finished) {
-      if (seen.has(mapped.msgId)) source.receipts?.record({ messageId: mapped.msgId, recipient: mapped.seat, state: 'seen', queueItemId: itemId });
+      if (seen.has(mapped.msgId)) {
+        source.receipts?.record({ messageId: mapped.msgId, recipient: mapped.seat, state: 'seen', queueItemId: itemId });
+        // [seat-mail #16 wiring · S7 트리거] done 계기 — 턴이 이 우편에 답을 마친 순간(seen 정착 = answered).
+        source?.receipts?.recordDone?.({ messageId: mapped.msgId, recipient: mapped.seat });
+      }
       else if (retry.has(mapped.msgId)) parked.set(mapped.msgId, { ...mapped, attempt: mapped.attempt + 1 });
       else if (settled.gaveUp.includes(mapped.msgId)) log('seat-mail-gave-up', { msgId: mapped.msgId, seat: mapped.seat, attempts: mapped.attempt });
       // OBSERVE-TURN-LIFE-DIAG-COMPLETE — 우편 사건의 끝(ack): 같은 eventId로 사슬을 닫는다(turn-start 지점은 임대 ③ 배선 뒤 완결).
@@ -293,6 +319,7 @@ export function createSeatMailArrivalWatcher(
     }
     const over = fresh.slice(room);
     const msgIds: number[] = [];
+    const arrivals: SeatMailArrivalInfo[] = []; // OP #106762 ⓐ — onArrived 가 실 도착 정보(msgId·본문 문면·자리)를 싣는다
     for (const message of taken) {
       const input = {
         id: message.id,
@@ -309,6 +336,7 @@ export function createSeatMailArrivalWatcher(
       try { turnLifeLog('turn-life:event-arrived', { source: 'seat-mail', eventId: message.id, msgId: message.id, itemId: item.id, arrivedAt: Date.now() }); } catch { /* observability is fail-open */ }
       offered.add(message.id);
       msgIds.push(message.id);
+      arrivals.push({ msgId: message.id, seat: read.seat, sender: message.from, text: item.text });
       noticeMessages.set(item.id, { msgId: message.id, seat: read.seat, message: input, attempt: 1 });
       src.receipts?.record({ messageId: message.id, recipient: read.seat, state: 'delivered', queueItemId: item.id });
     }
@@ -329,11 +357,19 @@ export function createSeatMailArrivalWatcher(
     }
     // #38193: a new notice wakes the idle door once (the TUI decides: idle → next turn · busy → stays queued, no steer).
     // Duplicates (same msgId still queued) are not new arrivals.
-    if (msgIds.length > 0) deps.onArrived?.();
+    if (msgIds.length > 0) deps.onArrived?.(arrivals);
     return { kind: 'messages', msgIds };
   };
 
+  let pollGeneration = 0;
   const poll = (): SeatMailPollOutcome => {
+    const generation = ++pollGeneration;
+    const outcome = pollOnce();
+    if (handle !== null && generation === pollGeneration) status = outcome.kind === 'read-error' || outcome.kind === 'no-seat' ? 'read-error' : 'running';
+    return outcome;
+  };
+
+  const pollOnce = (): SeatMailPollOutcome => {
     if (source) return pollMessages(source);
     let snapshot: SeatMailSnapshot | null;
     try { snapshot = read(cwd); }
@@ -351,7 +387,8 @@ export function createSeatMailArrivalWatcher(
       lastUnread = snapshot.unread;
       const item = producers.seatMailArrived({ seat: snapshot.seat, unread: snapshot.unread });
       // A duplicate (same text still queued) is not a new arrival — do not offer it again.
-      if (item !== null) deps.onArrived?.();
+      // OP #106762 ⓐ — 수 모드 노티스엔 msgId 가 없다(정보만 전달; 어댑터는 세션 1회 계약이 못 되는 이벤트를 만들지 않는다).
+      if (item !== null) deps.onArrived?.([{ text: item.text, seat: snapshot.seat }]);
       return { kind: 'arrived', unread: snapshot.unread, noticeText: item === null ? null : item.text };
     }
     lastUnread = snapshot.unread;
@@ -359,14 +396,21 @@ export function createSeatMailArrivalWatcher(
   };
 
   return {
+    getStatus: () => status,
     poll,
     noteTurnFinished,
     start(): void {
       if (handle !== null) return;
-      handle = timer.set(poll, intervalMs);
+      attachTransition();
+      status = 'starting';
+      try { handle = timer.set(poll, intervalMs); }
+      catch (error) { status = 'start-error'; throw error; }
     },
     stop(): void {
+      ++pollGeneration;
+      status = 'stopped';
       detachTransition?.();
+      detachTransition = null;
       if (readRetry !== null) { retryTimer.clear(readRetry); readRetry = null; }
       if (handle === null) return;
       timer.clear(handle);

@@ -108,6 +108,9 @@ export interface InternalTurnGate {
   withdrawPendingTurn(turnId: string): boolean;
   /** 사람이 턴을 열었다(제출이 받아들여졌다) — Superseded 의 기준이 바뀐다. */
   noteHumanTurn(): string;
+  /** 턴이 «실제로 시작»되는 단일 길목에서 부른다 — 문이 이미 id 를 준 턴(사람·내부)이면 그 id 를 그대로 쓰고,
+   *  알림·우편·늦은 깨움처럼 문을 거치지 않은 턴이면 새 id 를 낸다. 반환 = 지금 도는 턴 id(매 턴 고유). */
+  noteTurnStarted(): string;
   /** 턴이 끝나 입력 루프로 돌아왔다 — 내부 턴 «진행 중» 표지를 내린다. */
   noteTurnSettled(): void;
   /** 지금 도는 턴이 내부 턴인가 — 사람 후속 입력을 그 턴에 끼워 넣지(steer) 않는 데 쓴다. */
@@ -142,6 +145,9 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
   /** 열린(아직 안 꺼낸) 내부 턴 «직전»의 lastId — 거둘 때 되돌린다(실행 안 된 턴이 Superseded 기준이 되지 않게). */
   let idBeforePending: string | null = null;
   let seq = 0;
+  /** lastId 가 아직 어떤 «시작된 턴»에도 묶이지 않았다(사람 제출·내부 턴 open 직후). noteTurnStarted 가 한 번 묶는다. */
+  let idUnclaimed = false;
+  let unclaimedBeforePending = false;
   /** Pacing state: when the last automatic turn opened / ended, and how many self-started ones in a row since a person/event. */
   let lastAutoOpenedAt: number | null = null;
   /** #38210 REVIEW-2: the rest is measured from when the automatic turn ENDED (classic autowake does the same). */
@@ -154,6 +160,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
     const { origin, turnId } = pending;
     pending = null;
     lastId = idBeforePending;
+    idUnclaimed = unclaimedBeforePending;
     log('tui.autoturn', 'rejected', { origin, reason: 'HumanTyping', turnId, detail: `late:${detail}` });
   };
 
@@ -233,6 +240,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
 
       const turnId = `auto-${++seq}`;
       idBeforePending = lastId;
+      unclaimedBeforePending = idUnclaimed;
       pending = { turnId, input: text, origin, ...(opts.reason ? { reason: opts.reason } : {}),
         ...(opts.from?.kind === 'agent' ? { from: opts.from } : {}) };
       // ⭐ 물러남은 textInput 의 몫 — 버퍼가 비었을 때만 true 를 낸다(입력칸 무접촉).
@@ -245,6 +253,7 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       // OBSERVE-TURN-EVENT-LIFECYCLE — 문이 잡은 내부 턴(pending 은 최대 1 → queuedCount 1).
       try { turnLifeLog('turn-life:event-queued', { itemId: turnId, eventId: turnId, kind: 'internal', source: origin, delivery: 'queue', queuedCount: 1 }); } catch { /* observability is fail-open */ }
       lastId = turnId;
+      idUnclaimed = true;
       lastAutoOpenedAt = now();
       if (EXTERNAL_EVENT_ORIGINS.has(origin)) consecutiveSelfStarted = 0;
       else if (!ALARM_ORIGINS.has(origin)) consecutiveSelfStarted += 1;
@@ -270,8 +279,17 @@ export function createInternalTurnGate(deps: InternalTurnGateDeps): InternalTurn
       consecutiveSelfStarted = 0;
       const id = `human-${++seq}`;
       lastId = id;
+      idUnclaimed = true;
       internalActive = false;
       humanTurnKeyMark = lastHumanKeyAt();
+      return id;
+    },
+    noteTurnStarted() {
+      if (idUnclaimed && lastId !== null) { idUnclaimed = false; return lastId; }
+      // 문을 거치지 않고 시작된 턴(알림·우편·큐 재생·늦은 깨움) — 새 id. 안 그러면 마지막 사람 id 가 영원히 «이번 턴»으로 남는다.
+      const id = `turn-${++seq}`;
+      lastId = id;
+      internalActive = false;
       return id;
     },
     noteTurnSettled() {

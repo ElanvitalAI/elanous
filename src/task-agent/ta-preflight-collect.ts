@@ -1,15 +1,38 @@
+import { realpathSync } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import type { TaPreflightEvidence } from './ta-preflight.js';
 import { PREFLIGHT_LIVE_CLAIM_EVENT } from './task-hand.js';
+
+/** Observe declared target paths in the card's project; missing project or I/O failures remain unknown. */
+export function observeTargetPaths(card: { text?: unknown; project?: { target?: unknown } } | null): boolean | null {
+  if (!card || typeof card.text !== 'string') return null;
+  const parsed = parseAskTargetPathHintsResult(card.text);
+  if (parsed.labelMissing || parsed.paths.length === 0 || parsed.rejected.length !== 0) return false;
+  if (typeof card.project?.target !== 'string' || !isAbsolute(card.project.target)) return null;
+  try {
+    const root = realpathSync(card.project.target);
+    for (const path of parsed.paths) {
+      if (isAbsolute(path)) return false;
+      const lexical = relative(root, resolve(root, path));
+      if (!lexical || lexical === '..' || lexical.startsWith(`..${sep}`) || isAbsolute(lexical)) return false;
+      const target = realpathSync(resolve(root, path));
+      const rel = relative(root, target);
+      if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
+    }
+    return true;
+  } catch { return null; }
+}
 
 /** Runtime observations are supplied by actual readers; unavailable observations stay null. */
 export function collectRuntimePreflightEvidence(input: {
   card: { id: string; seat?: string; status: string; runId?: string; pr?: unknown; history?: readonly { event: string }[] } | null;
   activeRuns: readonly string[] | 'unknown';
   opHoldActive: boolean | null;
-}): { launch: { cardClaimed: boolean | null; activeSameGoalRuns: number | null; opHoldActive: boolean | null } } {
+}): { owner: { card: string | null }; launch: { cardClaimed: boolean | null; activeSameGoalRuns: number | null; opHoldActive: boolean | null } } {
   const history = input.card?.history;
-  return { launch: {
+  return { owner: { card: typeof input.card?.seat === 'string' && input.card.seat.trim() ? input.card.seat : null }, launch: {
     cardClaimed: input.card && Array.isArray(history) && history.every((entry) => entry && typeof entry.event === 'string')
       ? input.card.status !== 'handed' || Boolean(input.card.runId) || input.card.pr !== undefined
         || history.some((entry) => entry.event === PREFLIGHT_LIVE_CLAIM_EVENT) : null,

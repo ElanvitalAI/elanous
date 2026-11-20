@@ -116,3 +116,18 @@ test('explicit queue waiting detaches within ten seconds', async () => {
     for (const release of releases) release();
   }
 }, 15000);
+
+test('an internal awaitResult Agent is not detached by the ten-second sync cap and returns the real answer', async () => {
+  const provider: LLMProvider = {
+    name: 'slow', defaultModel: 'slow', available: () => true,
+    async *streamChat() { await new Promise(resolve => setTimeout(resolve, 10500)); yield { type: 'text', delta: 'awaited answer' }; },
+    async *chat() {},
+  };
+  const result = await dispatchAgent({ description: 'awaited child', prompt: 'awaited internal child' }, {
+    provider, awaitResult: true, parentSessionId: 'await-result-test',
+    resolveAgentDef: () => ({ name: 'general-purpose', systemPrompt: 'test', tools: [] }),
+  });
+  expect(result.background).toBeUndefined();
+  expect(result.output).toContain('awaited answer');
+  expect(globalTaskNotificationQueue.drainForParentSession('await-result-test')).toEqual([]);
+}, 20000);

@@ -394,3 +394,26 @@ test('review r3: the q0 merge follows the same per-question rule (fast path)', a
   expect(result.ladder.evidence.filter((item) => item.source === seedUrl).map((item) => item.questionId).sort()).toEqual(['q1', 'q5']);
   expect(duplicatesWithinAnAxis(result.ladder.evidence)).toEqual([]);
 });
+
+// JUD (MOB-1): «while the raw-question search is held, search starts once the route is confirmed with plan entities».
+// CURRENT behavior, documented as-is (ROUTE-PRIVACY: do not change here): the route is confirmed off the stream
+// (gateExternalSearchByRoute), but the plan-entity search (startEarlyAxisSearch) waits for closedStreamedPlanRoot.
+test('📌 current: raw question is never sent; with route confirmed + first question streamed, the plan-entity search still waits for the closed root', async () => {
+  const plan = planJson(FACT);
+  const { invokeAxes, calls } = fakeSearch();
+  const seen: number[] = [];
+  const steps = fullStream(plan).slice(0, 2);
+  await runResearchQuestionLadder(request, gated(invokeAxes, async (prompt, signal, onChunk) => {
+    for (const step of steps) { clock = step.at; onChunk?.(step.text); await flush(); seen.push(calls.length); }
+    clock = PLAN_END_AT;
+    return plan;
+  }));
+  // After the route AND the first question streamed (root still open) nothing was dispatched yet.
+  expect(seen).toEqual([0, 0]);
+  expect(calls[0]!.at).toBe(PLAN_END_AT);
+  // The raw question text (or a run of it) is never an external search term, held or released.
+  expect(sentTerms(calls).some((term) => term.includes(request) || request.includes(term))).toBe(false);
+  expect(withheld().map((entry) => entry.target)).toContain('original-question');
+});
+
+test.todo('desired (NOT current): plan-entity search starts at route confirmation, before the plan root closes (needs a ROUTE-PRIVACY decision)', () => {});

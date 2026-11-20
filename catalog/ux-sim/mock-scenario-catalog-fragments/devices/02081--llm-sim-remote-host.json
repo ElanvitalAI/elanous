@@ -1,0 +1,13 @@
+{
+  "id": "llm-sim-remote-host",
+  "name": "LLM sim remote host",
+  "implementation": ["src/ux-sim/llm-provider-world/supply-remote.ts"],
+  "tests": ["src/ux-sim/llm-provider-world/supply-remote.test.ts"],
+  "target": "a fake remote host with a heartbeat for the LLM provider simulation world so desired versus observed sha drift can be judged without contacting any host",
+  "inputs": ["desiredSha and observedSha", "alive flag", "a sim clock"],
+  "observations": ["heartbeat returns at, desiredSha, observedSha and alive", "drifted is true when the two shas differ"],
+  "entryCommands": ["bun test src/ux-sim/llm-provider-world/supply-remote.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

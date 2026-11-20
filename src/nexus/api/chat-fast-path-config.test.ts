@@ -34,7 +34,7 @@ const request = (method: string, body?: unknown) => new Request(url, {
 
 test('empty config defaults true; PUT false persists and GET reflects it without losing sibling keys', async () => {
   expect(buildUserConfig(configPath).chat.fastPath).toBe(true);
-  writeFileSync(configPath, JSON.stringify({ chat: { fastPath: 'false', autoCopyQaToClipboard: true }, custom: 17 }));
+  writeFileSync(configPath, JSON.stringify({ chat: { fastPath: 'false', conciseness: { enabled: false } }, custom: 17 }));
   expect(buildUserConfig(configPath).chat.fastPath).toBe(false);
   expect((await (await handleChatFastPathConfig(request('GET'))).json())).toEqual({ enabled: false });
   expect((await (await handleChatFastPathConfig(request('PUT', { enabled: true }))).json())).toEqual({ enabled: true });
@@ -42,7 +42,7 @@ test('empty config defaults true; PUT false persists and GET reflects it without
   expect((await (await handleChatFastPathConfig(request('GET'))).json())).toEqual({ enabled: false });
   const stored = JSON.parse(readFileSync(configPath, 'utf8'));
   expect(stored.chat.fastPath).toBe(false);
-  expect(stored.chat.autoCopyQaToClipboard).toBe(true);
+  expect(stored.chat.conciseness.enabled).toBe(false);
   expect(stored.custom).toBe(17);
 });
 

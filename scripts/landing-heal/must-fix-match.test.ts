@@ -335,3 +335,18 @@ test('a «must-fix resolved in #N» note closes the landed-open items of that PR
   expect(after.matches.filter((m) => m.verdict === 'resolved').map((m) => m.resolvedIn)).toEqual([[21982], [21982]]);
   expect(after.matches).toHaveLength(before.matches.length);
 });
+
+test('OP-STALL-P0-HOURLY: the landing-heal collect tick calls the P0 stall tick with its gh seam and clock', () => {
+  const now = new Date('2026-11-20T10:43:00.000Z');
+  const gh = () => '[]';
+  const seen: Array<{ gh: unknown; now: string }> = [];
+  const result = runMission('collect', {}, gh, now, undefined, (input) => {
+    seen.push({ gh: input.gh, now: input.now.toISOString() });
+    return [{ version: '0.3.31', alerts: [], cleared: ['OLD-CELL'], alerted: {} }];
+  });
+  expect(seen).toEqual([{ gh, now: '2026-11-20T10:43:00.000Z' }]);
+  expect(result.p0Stall).toEqual({ ok: true, versions: [{ version: '0.3.31', alerts: [], cleared: ['OLD-CELL'] }] });
+  const failed = runMission('collect', {}, gh, now, undefined, () => { throw new Error('ledger unreadable'); });
+  expect(failed.outcome).toBe('ok');
+  expect(failed.p0Stall).toEqual({ ok: false, error: 'Error: ledger unreadable' });
+});

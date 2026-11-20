@@ -527,20 +527,12 @@ describe('user-config lsp section (Phase L4)', () => {
     }
   });
 
-  test('chat.autoCopyQaToClipboard parses boolean with safe default', () => {
-    write({
-      chat: {
-        autoCopyQaToClipboard: true,
-      },
-    });
-    expect(buildUserConfig(cfgPath).chat.autoCopyQaToClipboard).toBe(true);
-
-    write({
-      chat: {
-        autoCopyQaToClipboard: 'bogus',
-      },
-    });
-    expect(buildUserConfig(cfgPath).chat.autoCopyQaToClipboard).toBe(false);
+  test('legacy auto-copy config is ignored and removed on save', () => {
+    write({ chat: { autoCopyQaToClipboard: true } });
+    const cfg = buildUserConfig(cfgPath);
+    expect(cfg.chat).not.toHaveProperty('autoCopyQaToClipboard');
+    saveUserConfig(cfg, cfgPath);
+    expect(JSON.parse(readFileSync(cfgPath, 'utf8')).chat).not.toHaveProperty('autoCopyQaToClipboard');
   });
 
   test('chat.systemPrompt parses overridePath and taskVariant', () => {
@@ -989,7 +981,6 @@ describe('user-config extended schema', () => {
         preserveLastN: 2,
         partial: false,
       },
-      autoCopyQaToClipboard: true,
       systemPrompt: {
         overridePath: '/tmp/custom.md',
         taskVariant: 'default',
@@ -1061,7 +1052,6 @@ describe('user-config extended schema', () => {
       partial: false,
       workingBudgetTokens: 256_000,
     });
-    expect(reloaded.chat.autoCopyQaToClipboard).toBe(true);
     expect(reloaded.chat.systemPrompt).toEqual({
       overridePath: '/tmp/custom.md',
       taskVariant: 'default',

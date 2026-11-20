@@ -111,7 +111,7 @@ test('split: a caller override replaces the default reservation; a negative over
     .toEqual({ researchDeadlineMs: BUDGET, reservationMs: 0, limitedBy: 'research-budget' });
 });
 
-async function runReserveTurn(turnOptions: { turnDeadlineMs?: number; researchWallClockBudgetMs?: number }) {
+async function runReserveTurn(turnOptions: { turnDeadlineMs?: number; researchWallClockBudgetMs?: number; researchTurnBudgetMs?: number }) {
   const manual = createManualTimers();
   const startClock = RESERVE;
   let clock = startClock;
@@ -194,9 +194,9 @@ test('turn: the default (deep) research budget is also cut by a parent deadline 
   expect(turnDeadlineMs - ((run.synthesisClock as number) - run.startClock)).toBeGreaterThanOrEqual(RESERVE);
 });
 
-test('turn: unknown parent deadline keeps the configured research budget and logs no reservation', async () => {
+test('turn: no parent deadline and no turn budget keeps the configured research budget and logs no reservation', async () => {
   const researchWallClockBudgetMs = RESERVE;
-  const run = await runReserveTurn({ researchWallClockBudgetMs });
+  const run = await runReserveTurn({ researchWallClockBudgetMs, researchTurnBudgetMs: Number.POSITIVE_INFINITY });
 
   expect(run.split).toMatchObject({
     turnDeadlineMs: null, reservationMs: null, researchBudgetMs: researchWallClockBudgetMs,

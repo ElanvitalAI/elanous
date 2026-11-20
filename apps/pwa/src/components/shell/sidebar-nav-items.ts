@@ -103,6 +103,7 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/live-run/adaptive', category: 'beta-direct-link', reason: '런 장면에서 여는 적응형 그래프 시뮬레이션 재생 화면.' },
   { href: '/share/received', category: 'system-share-target', reason: 'OS 공유 수신 후 회원 스크랩 저장 화면.' },
   { href: '/scraps', category: 'member-scraps', reason: '공유 완료 화면에서 여는 회원 본인의 저장한 스크랩 목록.' },
+  { href: '/intake', category: 'beta-direct-link', reason: '소원 접수(intake) 화면 직접 진입점.' },
   { href: '/setup', category: 'provider-onboarding', reason: 'LLM provider 온보딩 진입점.' },
   { href: '/setup/done', category: 'provider-onboarding-complete', reason: 'LLM provider 온보딩 완료 화면.' },
   { href: '/', category: 'root-welcome', reason: '첫 방문자를 위한 루트 welcome 화면.' },

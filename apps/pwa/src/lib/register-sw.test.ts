@@ -83,6 +83,20 @@ describe('registerServiceWorker — guards', () => {
   });
 });
 
+describe('registerServiceWorker — bare webchat origin', () => {
+  test('never registers the service worker the bare host does not serve', async () => {
+    setWindow({ isSecureContext: true });
+    const registered: string[] = [];
+    setNavigator({ serviceWorker: { register: async (path: string) => { registered.push(path); } } });
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { querySelector: () => ({ getAttribute: () => '1' }) } });
+    try {
+      const r = await registerServiceWorker();
+      expect(r.status).toBe('unsupported');
+      expect(registered).toEqual([]);
+    } finally { delete (globalThis as { document?: unknown }).document; }
+  });
+});
+
 describe('registerServiceWorker — success paths', () => {
   test('registered with no waiting → updateAvailable=false', async () => {
     setWindow({ isSecureContext: true });

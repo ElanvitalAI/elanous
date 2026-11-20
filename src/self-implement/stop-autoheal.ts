@@ -77,6 +77,8 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
   'merge-held-release-path': 'wait-release',
   'pr-guard-failed': 'reauthor-from-materialized',
   'gate-unmeasured': 'remeasure-gate',
+  // TA-POD-REVIEW-PROVIDER-ALLOW: no reviewer could be tried — a retry meets the same chain; the owner decides.
+  'no-review-provider': 'needs-owner',
 };
 
 /** 처방 노드 id 로 인정하는 이름 — 오버레이가 더한 노드 중 이 넷만 처방으로 읽는다. */

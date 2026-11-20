@@ -8,6 +8,7 @@ import { emitDecision } from '../../src/live/detail-switch.js';
 import { expandRecords, parse } from '../../src/agent-substrate/pr-comment-meta.js';
 import { classifyReviewRounds, matchMustFix, type MustFixVerdict } from './must-fix-match.js';
 import { verifyCleanCheckout, type CheckoutResult } from './clean-checkout.js';
+import { tickP0Stall } from '../../src/release-loop/p0-stall-observer.js';
 
 interface PullRequest {
   number: number;
@@ -94,7 +95,17 @@ export function resolvedInPrs(body: string | undefined): number[] {
   return match ? [...match[1]!.matchAll(/#(\d+)/g)].map((m) => Number(m[1])) : [];
 }
 
-export function runMission(mission: string, ctx: GraphContext, run: RunCommand = gh, now = new Date(), verify = verifyCleanCheckout): Record<string, unknown> {
+// OP-STALL-P0-HOURLY: this 30-minute tick is the live periodic caller of the stalled-P0 alert; its failure never fails collect.
+function p0StallSummary(run: RunCommand, now: Date, tick: typeof tickP0Stall): Record<string, unknown> {
+  try {
+    return { ok: true, versions: tick({ gh: run, now }).map(({ version, alerts, cleared }) => ({ version, alerts: alerts.map((alert) => alert.id), cleared })) };
+  } catch (error) {
+    debug.log('landing-heal', 'p0-stall-failed', { error: String(error).slice(0, 300) }, { level: 'warn' });
+    return { ok: false, error: String(error).slice(0, 300) };
+  }
+}
+
+export function runMission(mission: string, ctx: GraphContext, run: RunCommand = gh, now = new Date(), verify = verifyCleanCheckout, p0Tick = tickP0Stall): Record<string, unknown> {
   switch (mission) {
     case 'collect': {
       const minutes = ctx.input?.windowMinutes ?? 60;
@@ -104,7 +115,7 @@ export function runMission(mission: string, ctx: GraphContext, run: RunCommand =
       if (!Array.isArray(rows)) throw new Error('gh pr list did not return an array');
       const prs = rows.filter((pr) => /^(?:self-impl\/|self-implement\/)/.test(pr.headRefName ?? '') &&
         (pr.state === 'OPEN' || (pr.state === 'MERGED' && !!pr.mergedAt && Date.parse(pr.mergedAt) >= since.getTime())));
-      return { outcome: 'ok', prs, since: since.toISOString() };
+      return { outcome: 'ok', prs, since: since.toISOString(), p0Stall: p0StallSummary(run, now, p0Tick) };
     }
     case 'must-fix-match': {
       const matches: Match[] = [];

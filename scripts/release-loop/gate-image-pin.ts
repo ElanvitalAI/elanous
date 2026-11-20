@@ -285,7 +285,8 @@ export function gateImagePinPath(root: string, version: string, runId: string): 
 }
 
 export interface CutGateImagePrebuildInput { root: string; repo: string; runId: string; version: string; commit: string; pool: string }
-export type PrebuildFailure = { outcome: 'failed'; reason: string; stage?: PrebuildStage; receipt?: PrebuildStageReceipt[]; failureCode?: PrebuildFailureCode | 'UNKNOWN'; causes?: PrebuildFailureCode[] };
+export type PrebuildFailure = { outcome: 'failed'; reason: string; stage?: PrebuildStage; receipt?: PrebuildStageReceipt[]; failureCode?: PrebuildFailureCode | 'UNKNOWN'; causes?: PrebuildFailureCode[];
+  /** Set only when a measured host-resource cause makes a plain retry sound: the exact human resume command. */ nextCommand?: string };
 type ChildGateImagePrebuildOutcome = GateImagePrebuildResult | { outcome: 'skipped'; reason: string } | PrebuildFailure;
 export type CutGateImagePrebuildOutcome = (GateImagePrebuildResult & { runId: string; cutCommit: string })
   | { outcome: 'skipped'; reason: string } | PrebuildFailure;
@@ -295,6 +296,20 @@ interface CutGateImagePrebuildDeps {
   invalidateReady?: (input: CutGateImagePrebuildInput) => void;
   markLocalPending?: () => void;
   writeReady?: (input: CutGateImagePrebuildInput, result: GateImagePrebuildResult, now: Date) => void;
+}
+
+const HOST_RESOURCE_CAUSES: readonly PrebuildFailureCode[] = ['DISK_FULL', 'STATE_DIR_MISSING', 'MIRROR_PARTIAL', 'REGISTRY_ABSENT'];
+
+/** RELEASE-RESUME-AFTER-CUT-PUSHED: a measured host-resource failure is fixed on the host, then the run resumes at the prebuild
+ *  (the pushed release branch is reused, the cut is not re-run). Unmeasured or code-side causes get no hint. */
+export function prebuildResumeCommand(failure: PrebuildFailure, runId: string): string | undefined {
+  if (!failure.causes?.some((cause) => HOST_RESOURCE_CAUSES.includes(cause)) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId)) return undefined;
+  return `eln release resume --run ${runId} --from gate-image-prebuild`;
+}
+
+/** The failure line a human reads: the reason, then the next command when one is sound. */
+export function prebuildFailureLine(failure: PrebuildFailure): string {
+  return `cut gate image prebuild failed: ${failure.reason}${failure.nextCommand ? ` — 호스트 자원을 비운 뒤 다음 명령: ${failure.nextCommand}` : ''}`;
 }
 
 function writePendingMarker(path: string, input: CutGateImagePrebuildInput): void {
@@ -335,6 +350,11 @@ function invalidateGateImageReadiness(input: CutGateImagePrebuildInput): void {
   rmSync(path, { force: true });
 }
 
+function withResumeCommand(failure: PrebuildFailure, runId: string): PrebuildFailure {
+  const nextCommand = prebuildResumeCommand(failure, runId);
+  return nextCommand ? { ...failure, nextCommand } : failure;
+}
+
 /** Sync entry point used immediately after cut-branch; the child performs the asynchronous pool build. */
 export function runCutGateImagePrebuild(input: CutGateImagePrebuildInput, deps: CutGateImagePrebuildDeps = {}): CutGateImagePrebuildOutcome {
   if (!input.pool || !input.runId || !/^[0-9a-f]{40}$/i.test(input.commit)) return { outcome: 'skipped', reason: 'gate pool, run id, or cut commit absent' };
@@ -349,7 +369,7 @@ export function runCutGateImagePrebuild(input: CutGateImagePrebuildInput, deps: 
   if (!line) return { outcome: 'failed', reason: `${run.stderr || run.error || `prebuild child exited ${run.status}`}`.trim().slice(-1000) };
   try {
     const result = JSON.parse(line) as ChildGateImagePrebuildOutcome;
-    if (run.status !== 0 || run.error) return result.outcome === 'failed' ? result
+    if (run.status !== 0 || run.error) return result.outcome === 'failed' ? withResumeCommand(result, input.runId)
       : { outcome: 'failed', reason: `${run.stderr || run.error || `prebuild child exited ${run.status}`}`.trim().slice(-1000) };
     if (result.outcome === 'built' || result.outcome === 'reused') {
       try {

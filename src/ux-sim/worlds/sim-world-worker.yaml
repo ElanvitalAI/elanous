@@ -1,0 +1,13 @@
+# SIM-WORLD worker pack (WORKER-UNIFY §6-2 S1): the worker device's injected anomalies (red until a nexus registry/watch consumer lands) and the wire-consumer boundary (green).
+schema: 1
+world: worker
+scenarios:
+  - { id: WORKER-STALL, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-DEATH, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-APPROVAL, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-REORDER, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-FLOOD, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-MIXED, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-BINDINGS, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-WIRE-ACCEPT, module: src/ux-sim/sim-world/worker/scenarios.ts }
+  - { id: WORKER-WIRE-REJECT, module: src/ux-sim/sim-world/worker/scenarios.ts }

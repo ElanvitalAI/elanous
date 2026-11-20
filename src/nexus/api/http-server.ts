@@ -15,6 +15,7 @@
 // Port policy (N1-2 decision): auto-pick from 31415 upward. Actual port
 // is recorded in runtime.json + printed in boot banner.
 
+import { bareCapabilitiesMetaTag } from "../../relay/bare-surface.js";
 import { setInProcessOutbound } from "../../domains/outbound-alert.js";
 import {
   hasDeclaredPluginHttpGet,
@@ -27,7 +28,8 @@ import { spawnSync } from "node:child_process";
 import { isIP } from "node:net";
 import { isAbsolute, join, dirname, relative, resolve } from "node:path";
 import { homedir } from "node:os";
-import { readdirSync, realpathSync, statSync } from "node:fs";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createProject, listProjects } from "../../project/project-store.js";
 import { handleOutputsGet, type OutputsDeps } from "./outputs-route.js";
 import {
@@ -122,6 +124,7 @@ import {
   readRelayMemberKeyFile,
 } from "../../relay/member-token-provider.js";
 import { resolvePublicAppUserId } from "../../relay/relay-server.js";
+import { isBareStaticAssetRequest } from "../../relay/bare-static-path.js";
 import { elanousConfigDir } from "../config/paths.js";
 
 export { DEFAULT_NEXUS_HTTP_PORT } from "../default-port.js";
@@ -474,6 +477,7 @@ import {
   type ConnectInfoCtx,
 } from "./connect-info.js";
 import {
+  handleBareStaticAsset,
   handleStaticAppRequest,
   pathMatchesStaticPrefix,
 } from "./static-app.js";
@@ -895,20 +899,64 @@ export function restoreWebChatHandlePins(
   ledger: ReturnType<typeof createRelayWebChatLedger>,
   pin: (handle: string, memberId: string) => Promise<unknown>,
   store: Pick<MemberStore, "handleClaims" | "close"> = createMemberStore(),
+  /**
+   * WEBCHAT-PIN-RESTORE (POOL-4 #109017) — 핸들 Nexus(minim5) 로컬 스토어는 재시작 뒤
+   * 비어 있다(내구 claim 은 GCP 회원 스토어 · relay 정적 claim). relay 가 «이 연결의
+   * 소유 회원 몫» 으로 인증해 답하는 정적 claim 도 재생 원천에 합친다. 남의 핸들은
+   * relay 가 싣지 않고, 싣더라도 핀 쓰기가 소유자 대조로 거부되어 원장 밖에 남는다.
+   */
+  relayClaims?: () => Promise<readonly { handle: string; memberId: string }[]>,
 ): void {
+  const seen = new Set<string>();
+  const replay = (claim: { handle: string; memberId: string }) => {
+    const key = `${claim.memberId}\n${claim.handle}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    ledger.recordPin(claim.handle, claim.memberId, pin(claim.handle, claim.memberId));
+  };
   try {
-    for (const claim of store.handleClaims()) {
-      ledger.recordPin(claim.handle, claim.memberId, pin(claim.handle, claim.memberId));
-    }
+    for (const claim of store.handleClaims()) replay(claim);
   } finally {
     store.close();
   }
+  if (relayClaims)
+    void relayClaims().then(
+      (claims) => {
+        // 정적 dispatch route 가 있는 핸들은 relay pinHandle 이 «collides with the
+        // operator dispatch table» 로 쓰기를 영구 거부한다(#39121) — relay 가 이미
+        // 소유자 대조로 확인해 내려준 claim 이므로 쓰기 없이 원장에만 기록한다(읽기 전용 재생).
+        let recorded = 0;
+        for (const claim of claims) {
+          const key = `${claim.memberId}\n${claim.handle}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          ledger.recordPin(claim.handle, claim.memberId, Promise.resolve());
+          recorded++;
+        }
+        // 기계 판독 사유 코드 — 값(핸들·회원 id) 없이 코드·개수만.
+        debug.log("nexus.relay-host", "pin-replay", {
+          source: "relay",
+          outcome: claims.length === 0 ? "claims-empty" : "claims-ok",
+          count: recorded,
+        });
+      },
+      () => {
+        // 질의 실패 → 재생 원천 없음(fail-closed)
+        debug.log("nexus.relay-host", "pin-replay", { source: "relay", outcome: "claims-rejected", count: 0 });
+      },
+    );
 }
 
 /**
  * WEBCHAT-SESSION-HANDOFF — per-appHost one-time handoff token ledger. FU
  * (#39056) 원장 메모리 최소화: 레코드는 소유자 결속 최소 필드만 담는다
  * (원본 세션 토큰 미보관 — 교환은 파생 wcs_ 세션만 심는다).
+ *
+ * OP #107132 (ⓑ HMAC 서명 토큰): 발급(회원 API · GCP)과 교환(핸들 Nexus ·
+ * minim5)은 서로 다른 프로세스라 프로세스 로컬 원장으로는 상대 발급분을
+ * 대조할 수 없었다(→ 503 webchat-unavailable). 토큰은 이제 HMAC-SHA256 로
+ * 자기서명한다 — 같은 비밀을 읽는 두 프로세스끼리만 유효하고, 원장은
+ * 같은 프로세스 안의 1회성(폐기·연결 끊김·재사용)만 담당한다.
  */
 const membersApiWebChatHandoffs = new WeakMap<
   object,
@@ -917,6 +965,8 @@ const membersApiWebChatHandoffs = new WeakMap<
     {
       readonly memberId: string;
       readonly handle: string;
+      /** OP #107132 ⓑ — 재사용 방지 1회성 nonce(서명 페이로드에 포함). */
+      readonly nonce: string;
       readonly expiresAt: number;
     }
   >
@@ -938,8 +988,6 @@ const derivedByHost = new WeakMap<
     }
   >
 >();
-/** WEBCHAT-SESSION-HANDOFF — 토큰은 api 원점에서 발급되고 60초 안에 bare 핸들 원점에서 교환된다. */
-const WEBCHAT_HANDOFF_TTL_MS = 60_000;
 /**
  * JUD #104249 ⓑ — 파생 웹채팅 세션은 채팅 세션 기준으로 산다: 쓸 때마다 유휴 창만큼
  * 연장(60초 고정이면 넘김 1분 뒤 채팅이 전부 401 = 데모 중 끊김), 절대 상한을 넘지
@@ -954,8 +1002,124 @@ const WEBCHAT_DERIVED_SESSION_MAX_MS = 12 * 60 * 60_000;
  * 이 값을 넘으면 가장 오래된 발급부터 치환한다(미교환 토큰 무한 누적 방지).
  */
 const WEBCHAT_HANDOFF_LEDGER_MAX = 512;
-/** FU ⓑ (#39056) — 배선·핀 성공 원장이 없는 appHost 도 발급 검문에서 fail-closed 로 닫는다. */
-const EMPTY_WEBCHAT_PIN_OWNERS: ReadonlyMap<string, string> = new Map();
+/**
+ * OP #107132 ⓑ — 토큰 서명 비밀(이름 상수 · env). 발급(회원 API · GCP)과
+ * 교환(핸들 Nexus · minim5)이 같은 값을 읽는다. 값의 생성·회전은 RES 몫이고
+ * 코드는 이름만 안다. 인라인 값(`ELANOUS_WEBCHAT_HANDOFF_HMAC_KEY`)과 파일
+ * 경로(`ELANOUS_WEBCHAT_HANDOFF_HMAC_KEY_FILE` — 파일 내용을 trim 해서
+ * 읽는다)을 둘 다 지원하고, 매 호출 직독해 회전을 즉시 반영한다(발급·교환은
+ * 드문 경로라 캐시 없이 직독해도 성능 무관).
+ * 비밀이 없으면 발급은 undefined(→ 503), 교환은 unknown 실패(→ 401) — fail-closed.
+ */
+const WEBCHAT_HANDOFF_HMAC_KEY_ENV = "ELANOUS_WEBCHAT_HANDOFF_HMAC_KEY";
+const WEBCHAT_HANDOFF_HMAC_KEY_FILE_ENV =
+  "ELANOUS_WEBCHAT_HANDOFF_HMAC_KEY_FILE";
+function readWebChatHandoffHmacKey(): string | undefined {
+  const inline = process.env[WEBCHAT_HANDOFF_HMAC_KEY_ENV];
+  if (inline && inline.length > 0)
+    return webChatHandoffHmacKeyOrMissing(inline);
+  const file = process.env[WEBCHAT_HANDOFF_HMAC_KEY_FILE_ENV];
+  if (file && file.length > 0) {
+    try {
+      const key = readFileSync(file, "utf8").trim();
+      if (key.length > 0) return webChatHandoffHmacKeyOrMissing(key);
+    } catch {
+      // 읽기 실패면 비밀 없음 취급(fail-closed).
+    }
+  }
+  return undefined;
+}
+/**
+ * 출처: OP #107132(ⓑ 승인 — 제안 #107122 «짧은 값(<32B)은 fail-closed») — 짧은
+ * 비밀은 서명 비밀로 쓰지 않는다: 32바이트 미만이면 없는 값 취급해 발급 503 ·
+ * 교환 401 로 닫는다(fail-closed).
+ */
+function webChatHandoffHmacKeyOrMissing(key: string): string | undefined {
+  return Buffer.byteLength(key, "utf8") < 32 ? undefined : key;
+}
+/**
+ * OP #107132 ⓑ — 토큰 포맷: `wch_<base64url(JSON payload)>.<base64url(HMAC)>`.
+ * payload = {handle, memberId, nonce, iat, exp}. `wch_` 접두는 기존 정상 경로
+ * 형식 유지(#39133 착지 시험도 `wch_` 를 본다).
+ */
+const WEBCHAT_HANDOFF_TOKEN_PREFIX = "wch_";
+const WEBCHAT_HANDOFF_TTL_MS = 60_000; // 출처: OP #107132 — payload exp ≤ 60초 상한
+type WebChatHandoffTokenPayload = {
+  handle: string;
+  memberId: string;
+  nonce: string;
+  iat: number;
+  exp: number;
+};
+function signWebChatHandoffToken(
+  payload: WebChatHandoffTokenPayload,
+  key: string,
+): string {
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString(
+    "base64url",
+  );
+  const signature = createHmac("sha256", key).update(body).digest("base64url");
+  return `${WEBCHAT_HANDOFF_TOKEN_PREFIX}${body}.${signature}`;
+}
+function verifyWebChatHandoffTokenSignature(
+  token: string,
+  key: string,
+): WebChatHandoffTokenPayload | undefined {
+  if (!token.startsWith(WEBCHAT_HANDOFF_TOKEN_PREFIX)) return undefined;
+  const dot = token.indexOf(".", WEBCHAT_HANDOFF_TOKEN_PREFIX.length);
+  if (dot <= WEBCHAT_HANDOFF_TOKEN_PREFIX.length) return undefined;
+  const body = token.slice(WEBCHAT_HANDOFF_TOKEN_PREFIX.length, dot);
+  const signature = token.slice(dot + 1);
+  if (body.length === 0 || signature.length === 0) return undefined;
+  const expected = createHmac("sha256", key).update(body).digest("base64url");
+  const given = Buffer.from(signature, "utf8");
+  const wanted = Buffer.from(expected, "utf8");
+  if (given.length !== wanted.length || !timingSafeEqual(given, wanted))
+    return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const { handle, memberId, nonce, iat, exp } = parsed as Record<
+    string,
+    unknown
+  >;
+  if (
+    typeof handle !== "string" ||
+    typeof memberId !== "string" ||
+    typeof nonce !== "string" ||
+    typeof iat !== "number" ||
+    typeof exp !== "number"
+  )
+    return undefined;
+  return { handle, memberId, nonce, iat, exp };
+}
+/**
+ * OP #107132 ⓑ — 교환 1회성 원장(이 프로세스에서 이미 교환된 nonce). 재사용
+ * 기억은 토큰 exp 까지면 충분하다(그 뒤는 서명 검증이 만료로 거부). 원장은
+ * 같은 프로세스 발급분만 담고, 다른 프로세스(발급 ≠ 교환, 데모 체인)는
+ * HMAC 서명 검증이 담당한다. 폐기(revokeDerivedForMember)·릴레이 연결
+ * 끊김(onConnectionClosed)도 미교환 토큰을 여기 남겨 무효화한다.
+ */
+const spentWebChatHandoffNonces = new WeakMap<
+  object,
+  Map<string, { expiresAt: number }>
+>();
+const revokedWebChatHandoffNonces = new WeakMap<
+  object,
+  Map<string, { expiresAt: number }>
+>();
+function handoffNonceMap(
+  byHost: WeakMap<object, Map<string, { expiresAt: number }>>,
+  appHost: object,
+): Map<string, { expiresAt: number }> {
+  const map = byHost.get(appHost) ?? new Map();
+  byHost.set(appHost, map);
+  return map;
+}
 /** FU (#39056) — 발급 시점 원장 정리·상한(핸드오프 원장 · 파생 세션 원장 공용). */
 function sweepWebChatLedgerEntries<V extends { readonly expiresAt: number }>(
   map: Map<string, V>,
@@ -972,6 +1136,8 @@ function sweepWebChatLedgerEntries<V extends { readonly expiresAt: number }>(
 /** HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 교환 검증 실패 사유(401 error 코드). */
 export type WebChatHandoffConsumeFailure =
   | "webchat-handoff-unknown"
+  // 출처: OP #107132 ⓑ — 위조 서명(서명 검증 실패) 401 사유.
+  | "webchat-handoff-invalid-signature"
   | "webchat-handoff-handle-mismatch"
   | "webchat-handoff-pin-mismatch"
   | "webchat-handoff-expired";
@@ -992,40 +1158,56 @@ export function createWebChatHandoffLedger(
   appHost: object,
   // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 만료 시험 가속용 주입 clock.
   clock: () => number = Date.now,
-  // FU ⓑ (#39056) — 발급 전 활성 핀 확인: 핀 성공 원장(핸들 → 소유자
-  // memberId). 활성 소유자와 어긩나면 발급을 거부한다(undefined → 503).
-  pinOwners?: ReadonlyMap<string, string>,
 ) {
-  const handoffs = membersApiWebChatHandoffs.get(appHost) ?? new Map();
+  const handoffs =
+    membersApiWebChatHandoffs.get(appHost) ??
+    new Map<
+      string,
+      { memberId: string; handle: string; nonce: string; expiresAt: number }
+    >();
   membersApiWebChatHandoffs.set(appHost, handoffs);
+  // OP #107132 ⓑ — 교환 쪽의 1회성·폐기 원장(appHost 키로 프로세스별).
+  const spentNonces = handoffNonceMap(spentWebChatHandoffNonces, appHost);
+  const revokedNonces = handoffNonceMap(revokedWebChatHandoffNonces, appHost);
   // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 파생 웹채팅 세션(wcs_) 원장.
   const derivedSessions = derivedByHost.get(appHost) ?? new Map();
   derivedByHost.set(appHost, derivedSessions);
   return {
     /**
-     * 발급: (memberId, handle)에 결속된 일회용 토큰, 60초 TTL. FU ⓑ
-     * (#39056): 활성 핀 원장의 소유자와 일치할 때만 발급한다 — 교환이
-     * 반드시 실패할 URL 을 미리 내주지 않는다(undefined → 진입 라우트
-     * 503). 발급 시마다 만료 레코드를 정리하고 상한을 적용한다(FU).
+     * 발급(OP #107132 ⓑ): (memberId, handle)에 결속된 HMAC 서명 토큰, 60초
+     * TTL(출처: OP #107132 — exp ≤ 60초 상한). 비밀이 없으면 undefined(→ 진입
+     * 라우트 503 · fail-closed). 핀 소유 대조는 교환 쪽에서만 한다(핀이 발급
+     * 순간보다 교환 순간에 살아 있어야 의미 있다). 발급 시마다 만료 레코드를
+     * 정리하고 상한을 적용한다(FU).
      */
     issue: (
       memberId: string,
       handle: string,
       now: number = clock(),
     ): string | undefined => {
-      if (pinOwners && pinOwners.get(handle) !== memberId) return undefined;
+      const key = readWebChatHandoffHmacKey();
+      if (!key) return undefined;
       sweepWebChatLedgerEntries(handoffs, now);
-      const token = `wch_${crypto.randomUUID()}`;
+      sweepWebChatLedgerEntries(spentNonces, now);
+      sweepWebChatLedgerEntries(revokedNonces, now);
+      const nonce = crypto.randomUUID();
+      const token = signWebChatHandoffToken(
+        { handle, memberId, nonce, iat: now, exp: now + WEBCHAT_HANDOFF_TTL_MS },
+        key,
+      );
       handoffs.set(token, {
         memberId,
         handle,
+        nonce,
         expiresAt: now + WEBCHAT_HANDOFF_TTL_MS,
       });
       return token;
     },
     /**
-     * 교환: 읽는 즉시 삭제(일회용). 핸들·만료·핀 소유자가 어긋나면 거부 사유를
-     * 돌려준다(HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 · #39056).
+     * 교환(OP #107132 ⓑ · HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 #39056 순서
+     * 보존): 서명 → 만료 → handle 일치 → 교환 프로세스 로컬 핀 원장 대조 →
+     * nonce 1회 기록(spent/revoked 재사용 거부, 토큰 exp 까지 기억). 비밀이
+     * 없으면 unknown 실패(→ 401 · fail-closed). 거부 사유를 401 로 돌려준다.
      */
     consume: (
       token: string,
@@ -1033,16 +1215,26 @@ export function createWebChatHandoffLedger(
       pinOwner: string | undefined,
       now: number = clock(),
     ): WebChatHandoffConsumeResult => {
-      const record = handoffs.get(token);
-      handoffs.delete(token);
-      if (!record) return { ok: false, reason: "webchat-handoff-unknown" };
-      if (record.handle !== handle)
-        return { ok: false, reason: "webchat-handoff-handle-mismatch" };
-      if (record.expiresAt <= now)
+      const key = readWebChatHandoffHmacKey();
+      if (!key) return { ok: false, reason: "webchat-handoff-unknown" };
+      const payload = verifyWebChatHandoffTokenSignature(token, key);
+      if (!payload)
+        return { ok: false, reason: "webchat-handoff-invalid-signature" };
+      if (payload.exp <= now)
         return { ok: false, reason: "webchat-handoff-expired" };
-      if (pinOwner === undefined || record.memberId !== pinOwner)
+      if (payload.handle !== handle)
+        return { ok: false, reason: "webchat-handoff-handle-mismatch" };
+      if (pinOwner === undefined || payload.memberId !== pinOwner)
         return { ok: false, reason: "webchat-handoff-pin-mismatch" };
-      return { ok: true, record };
+      const spent = spentNonces;
+      const revoked = revokedNonces;
+      sweepWebChatLedgerEntries(spent, now);
+      sweepWebChatLedgerEntries(revoked, now);
+      if (spent.has(payload.nonce) || revoked.has(payload.nonce))
+        return { ok: false, reason: "webchat-handoff-unknown" };
+      spent.set(payload.nonce, { expiresAt: payload.exp });
+      handoffs.delete(token);
+      return { ok: true, record: { memberId: payload.memberId, handle: payload.handle } };
     },
     /**
      * HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 (#39056) — 교환 성공 후 파생 wcs_
@@ -1092,16 +1284,25 @@ export function createWebChatHandoffLedger(
       for (const [token, record] of derivedSessions)
         if (record.memberId === memberId) derivedSessions.delete(token);
       // JUD terra ⓒ — an un-exchanged handoff token of that member dies with it too.
+      // OP #107132 ⓑ — 삭제분은 revoked nonce 맵으로 이동해 무효화를 유지한다.
       for (const [token, record] of handoffs)
-        if (record.memberId === memberId) handoffs.delete(token);
+        if (record.memberId === memberId) {
+          handoffs.delete(token);
+          revokedNonces.set(record.nonce, { expiresAt: record.expiresAt });
+        }
     },
     /** FU (#39056) — 원장 관측 시임: 만료 정리·상한 시험이 크기를 단언한다. */
     stats: () => ({
       handoffs: handoffs.size,
       derivedSessions: derivedSessions.size,
     }),
-    /** 릴레이 연결이 끊기면 핀이 사라지므로 미교환 토큰도 무효화한다. */
+    /**
+     * 릴레이 연결이 끊기면 핀이 사라지므로 미교환 토큰도 무효화한다. OP #107132
+     * ⓑ — 삭제분은 revoked nonce 맵으로 이동해 무효화를 유지한다(토큰 exp 까지).
+     */
     onConnectionClosed: () => {
+      for (const [, record] of handoffs)
+        revokedNonces.set(record.nonce, { expiresAt: record.expiresAt });
       handoffs.clear();
       derivedSessions.clear();
     },
@@ -1247,6 +1448,30 @@ export function bareWebChatOriginHandle(hostname: string): string | undefined {
  * for non-bare origins (app `--` hosts, loopback) so those keep flowing to
  * `appHost.handle`.
  */
+/**
+ * MK #109711 — 서버가 PWA 에 «여긴 bare 웹채팅 원점(WS /v1/acp 터널 없음)» 을
+ * 확정 전달한다: HTML 문서의 <head> 에 meta 한 줄을 심는다. PWA 는 이 태그가
+ * 있을 때만 ACP WebSocket 대신 SSE 경로를 쓴다. 비-HTML(자산)은 그대로.
+ */
+export const BARE_WEBCHAT_META_TAG =
+  '<meta name="elanous-bare-webchat" content="1">';
+export async function markBareWebChatDocument(
+  response: Response,
+): Promise<Response> {
+  const type = response.headers.get("content-type") ?? "";
+  if (!response.ok || !type.toLowerCase().includes("text/html"))
+    return response;
+  const html = await response.text();
+  const marked = html.replace(
+    /<head(\s[^>]*)?>/i,
+    (m) => `${m}${BARE_WEBCHAT_META_TAG}${bareCapabilitiesMetaTag()}`,
+  );
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.delete("etag");
+  return new Response(marked, { status: response.status, headers });
+}
+
 export function routeBareWebChatHostRequest(
   request: Request,
   opts: {
@@ -1334,10 +1559,42 @@ export function routeBareWebChatHostRequest(
     }
     return new Response(null, { status: 303, headers });
   }
-  if (pathname.startsWith(`${BARE_WEBCHAT_ENTRY_PREFIX}/`)) {
+  // MK #109530: 해시 정적 산출물 — wcs_ 쿠키 게이트 없이 staticDir 아래 파일만 서빙.
+  // 같은 판정(GET/HEAD · 탈출 거부)을 릴레이와 공유한다. 핀 확인은 위에서 끝났다.
+  if (isBareStaticAssetRequest(request.method, pathname)) {
     if (!opts.staticDir)
       return jsonResponse({ error: "static-not-wired" }, 404);
-    return handleStaticAppRequest(url, { staticDir: opts.staticDir });
+    return handleBareStaticAsset(url, { staticDir: opts.staticDir }, request.method);
+  }
+  if (pathname.startsWith(`${BARE_WEBCHAT_ENTRY_PREFIX}/`)) {
+    // 출처: OP #108575 — 착지 문서 갈래(/app/chat/ · 그 하위 자산)도 채팅 쌍
+    // 2경로와 같은 wcs_ 파생 세션 장치를 지난다. 쿠키가 실려 있으면
+    // fail-closed: CSRF Origin 거부는 채팅 쌍과 동일(403), 서명·만료·남의
+    // handle 결속·폐기 어느 하나라도 어긋나면 401(리터럴 시험으로 증명).
+    // 쿠키가 아예 없는 요청은 이 장치의 대상이 아니다 — 릴레이 회원 게이트가
+    // 앱 0 + memberRequired 조합의 무쿠키 문서 GET 을 401 로 이미 막고
+    // (OP #108575 ①), 공개 앱의 무명 문서 읽기는 기존 동작을 유지한다(③
+    // 다른 경로 확장 0).
+    if (
+      (request.headers.get("cookie") ?? "").includes(
+        `${WEBCHAT_SESSION_COOKIE_NAME}=`,
+      )
+    ) {
+      const refused = webChatCookieRequestRefusal(request, handle);
+      if (refused) return refused;
+      const webChatMember = webChatSessionMember(
+        request,
+        handle,
+        opts.webChatHandoff,
+      );
+      if (!webChatMember)
+        return jsonResponse({ error: "webchat-session-invalid" }, 401);
+    }
+    if (!opts.staticDir)
+      return jsonResponse({ error: "static-not-wired" }, 404);
+    return Promise.resolve(
+      handleStaticAppRequest(url, { staticDir: opts.staticDir }),
+    ).then(markBareWebChatDocument);
   }
   // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 릴레이 신뢰채널 배선:
   // 회원 채팅 쌍 2경로만, 그 핸들의 핀 소유자가 원장에 기록되어 있을 때만
@@ -1488,13 +1745,12 @@ function defaultMembersApi(
                 // 세션을 받아 일회용 토큰(60초)을 발급하고 bare 원점 교환 URL 을
                 // 돌려준다. 미배선이면 진입 라우트가 503 로 닫는다.
                 issue: ({ handle, memberId }) => {
-                  // FU ⓑ (#39056): 발급 전 활성 핀 확인 — 이 appHost 의 핀
-                  // 성공 원장에 활성 소유자가 없으면 URL 을 내주지 않는다.
+                  // FU ⓑ (#39056) → OP #107132 ⓑ: 핀 소유 대조는 교환 쪽으로
+                  // 옮겼다(교환 순간의 살아 있는 핀만 의미 있다). 발급은 서명
+                  // 비밀 유무만으로 닫는다(없으면 503 · fail-closed).
                   const token = createWebChatHandoffLedger(
                     candidate,
                     Date.now,
-                    membersApiWebChatHandleOwners.get(candidate) ??
-                      EMPTY_WEBCHAT_PIN_OWNERS,
                   ).issue(memberId, handle);
                   if (token === undefined) return undefined;
                   return `https://${handle}.${BARE_WEBCHAT_PUBLIC_APP_DOMAIN}${BARE_WEBCHAT_ENTRY_PREFIX}/handoff?handoff-token=${encodeURIComponent(token)}`;
@@ -2274,7 +2530,12 @@ export function startNexusHttpServer(
             // OP #105017 ⓐ① — 연결 수립마다 «핀 읽기» 채널을 묶는다(자격은
             // 연결의 host 인증 · 판정은 relay 불리언 응답만).
             ledger.setPinQueryChannel(connection.publicHandlePinQuery.bind(connection));
-            restoreWebChatHandlePins(ledger, pin);
+            restoreWebChatHandlePins(
+              ledger,
+              pin,
+              undefined,
+              connection.publicHandleClaimsQuery.bind(connection),
+            );
           }
         } catch (error) {
           debug.log("nexus.relay-host", "connection-failed", {

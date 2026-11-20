@@ -6,12 +6,13 @@
 import { buttonsLayout, hitButton } from './attach-buttons.js';
 import { planVoice, type VoiceDoor } from './voice-control.js';
 import { createVoicePopup } from './voice-popup.js';
+import { createNewTabPrompt } from './new-tab-prompt.js';
 import { tabName } from './space-tabs-view.js';
 import { basename } from 'node:path';
-import type { AttachFrame, AttachHandlers, Attached } from './attach-client.js';
+import { isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachFrame, type AttachHandlers, type Attached } from './attach-client.js';
 import { createKeyRouter, type KeyAction } from './attach-keys.js';
-import { composeView, FIRST_RUN_HINT, parsePaneRows, parseRemoteRows, SIDEBAR_HELP, sidebarWidthFor, type PaneRow } from './attach-view.js';
-import { buildSpaceList, buildTabRow, withCommands } from './space-tabs-view.js';
+import { composeView, FIRST_RUN_HINT, NARROW_BELOW_COLS, parsePaneRows, parseRemoteRows, SIDEBAR_HELP, sidebarWidthFor, UNREACHABLE_MARK, type PaneRow } from './attach-view.js';
+import { buildTabDropdown, layoutSpaceList, buildTabRow, dropdownOrder, withCommands } from './space-tabs-view.js';
 import { interpretMouse, type MouseLayout, type MouseReport } from './attach-mouse.js';
 import { withNewDefaults } from './cli-args.js';
 import type { ElsResult } from './core.js';
@@ -75,6 +76,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   let generation = 0;
   let timer: unknown;
   let finished = false;
+  let awaitingServer = false;                                    // D1a: ONLY a server-away end arms the re-attach — a refused/unknown-pane attach never retries
+  let everListed = false;                                        // D1a: a server lost AFTER a good list is waited out, not the end
   let resolveDone: (result: { code: number; message: string }) => void = () => {};
   const done = new Promise<{ code: number; message: string }>((resolve) => { resolveDone = resolve; });
 
@@ -91,29 +94,67 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   };
   const everyRow = (): PaneRow[] => [...rows, ...remoteRows];
   // ELS-MOUSE (OP #100984): 마우스 해석용 마지막 배치 + 스크롤백 히스토리/오프셋
+  // ELS-NARROW-TAB-DROPDOWN: under NARROW_BELOW_COLS the top row is «emoji tab ▾»; open, the tab list is drawn under it.
+  let dropdown = false;
+  let dropCursor: string | undefined;
+  let dropHits: readonly { readonly y: number; readonly pane: string }[] = [];
+  const narrow = (): boolean => deps.size().cols < NARROW_BELOW_COLS;
   let mouseLayout: MouseLayout = { cols: 0, rows: 0, sidebarWidth: 0, sidebar: [], tabs: [] };
-  let history: string[] = [];
-  let scroll = 0;
+  let scroll = 0;                // lines the shown frame is above the live bottom (told by the server's frame)
+  // ELS-MOUSE-RELEASE (JUD-B #111750): a release follows its press. The press the app consumed (tab/list/⏏✕ click, wheel
+  // excluded — it has no release) is answered by swallowing its release; a press that went to the pane program is answered by
+  // passing its release to the pane too, wherever the pointer is let go — the pane saw the press and waits for the release.
+  let pressConsumed = false;
   const handleMouse = (report: MouseReport): void => {
+    if (report.release) {
+      const swallow = pressConsumed;
+      pressConsumed = false;
+      if (!swallow && attached) attached.input(report.bytes);
+      return;
+    }
+    const wheel = (report.button & 0x40) !== 0;
     // ELS-EXIT-BG-BUTTONS: a left click on the bottom line hits ⏏ 백그라운드 / ✕ 종료 (the rest of that line does nothing).
     if (report.y === mouseLayout.rows && mouseLayout.rows > 0) {
-      const hit = !report.release && report.button === 0 ? hitButton(report.x, mouseLayout.cols) : null;
+      pressConsumed = !wheel;
+      const hit = report.button === 0 ? hitButton(report.x, mouseLayout.cols) : null;
       if (hit === 'background') finish(0, '');
       else if (hit === 'quit') quitSpace();
       return;
     }
+    if (narrow() && !wheel && report.button === 0 && (dropdown || (report.y === 1 && everyRow().length > 0))) {
+      pressConsumed = true;                                       // the list (or its top row) takes the press, so it swallows the release too
+      if (dropdown) { const hit = dropHits.find((one) => one.y === report.y); dropdown = false; if (hit) select(hit.pane); render(); } else openDropdown();
+      return;
+    }
     const action = interpretMouse(report, mouseLayout);
+    pressConsumed = !wheel && action?.kind !== 'passthrough';
     if (!action) return;
-    if (action.kind === 'select') select(action.pane);
-    else if (action.kind === 'scroll') { scroll = Math.min(Math.max(0, scroll + action.lines), Math.max(0, history.length - 1)); render(); }
+    if (action.kind === 'new-tab') { dropdown = false; if (!current()?.remote) newTab.openPrompt(); }
+    else if (action.kind === 'select') select(action.pane);
+    else if (action.kind === 'scroll') scrollPane(action.lines);
     else if (attached) attached.input(action.bytes);
     else { note = '원격 pane은 마우스 통과 불가'; render(); }
+  };
+  const openDropdown = (): void => { if (everyRow().length === 0) return; dropdown = true; dropCursor = selected; render(); };
+  const dropdownKey = (bytes: string): void => {
+    const order = dropdownOrder(withCommands(everyRow(), lsAnswer));
+    const at = Math.max(0, order.indexOf(dropCursor ?? ''));
+    if (bytes === '\u001b') dropdown = false;
+    else if (bytes === '\r' || bytes === '\n') { dropdown = false; select(dropCursor); }
+    else if (bytes === 'j' || bytes === '\u001b[B') dropCursor = order[Math.min(at + 1, order.length - 1)];
+    else if (bytes === 'k' || bytes === '\u001b[A') dropCursor = order[Math.max(at - 1, 0)];
+    render();
+  };
+  const scrollPane = (lines: number): void => {
+    if (current()?.remote || !attached) { note = '이 pane 은 스크롤백을 볼 수 없음'; render(); return; }
+    attached.scroll(lines);
   };
   const current = (): PaneRow | undefined => everyRow().find((row) => row.pane === selected);
 
   const statusText = (): string => {
     if (voice.isOpen()) return voice.line();
     if (confirm) return ` ${confirm.prompt} · y 확인 · 다른 키 취소 `;
+    if (scroll > 0) return ` ↑ 스크롤백 ${scroll}줄 위 · 휠·ctrl+b [ ] 이동 · 입력하면 맨 아래로 `;
     // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ 하단 항상 · UX #38884 — 조용할 때는 FIRST_RUN_HINT 리터럴 한 줄
     if (!remoteStatus && !note && !readError && !current()?.remote) return FIRST_RUN_HINT;
     if (!remoteStatus && !readError && !current()?.remote) return `${note} · ${FIRST_RUN_HINT}`;
@@ -129,13 +170,20 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     const width = sidebarWidthFor(cols, sidebarOpen);
     // ELS-ONE-SPACE (대표 11-18): left = the spaces folded (no pane lines, no headings); top = the selected space's tabs.
     const shown = withCommands(everyRow(), lsAnswer);
-    const tabs = buildTabRow(shown, selected, Math.max(10, cols - (width ? width + 1 : 0)));
-    const spaces: { y: number; ws: string; pane: string }[] = [];
-    for (const row of shown) if (!spaces.some((s) => s.ws === row.workspace)) spaces.push({ y: spaces.length + 1, ws: row.workspace, pane: row.pane });
-    mouseLayout = { cols, rows: height, sidebarWidth: width, sidebar: spaces, tabs: tabs.tabs };
-    const shownFrame = scroll > 0 && history.length ? history[history.length - 1 - scroll] ?? frame : frame;
-    deps.write(composeView({ cols, rows: height, sidebar: width ? buildSpaceList(shown, selected, width, height - 1) : null, frame: shownFrame, status: statusText(), buttons: buttonsLayout(cols).text,
-      ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}) }));
+    if (cols >= NARROW_BELOW_COLS) dropdown = false;             // widened: back to the side list
+    let tabs = buildTabRow(shown, selected, Math.max(10, cols - (width ? width + 1 : 0)));
+    let overlay: readonly string[] | undefined;
+    dropHits = [];
+    if (cols < NARROW_BELOW_COLS && shown.length > 0) {
+      const down = buildTabDropdown(shown, selected, dropdown ? dropCursor : undefined, cols, Math.max(1, height - 3));
+      tabs = { line: down.line, tabs: [] };
+      if (dropdown) { overlay = down.list; dropHits = down.hits; }
+    }
+    const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME) : undefined;
+    if (newTab.isOpen()) overlay = [newTab.line(cols)];          // ELS-NEW-TAB-NAME-WIDGET: the name prompt is the row under the tab row
+    mouseLayout = { cols, rows: height, sidebarWidth: width, sidebar: list?.spaces ?? [], ...(list?.newBox ? { sidebarNew: list.newBox } : {}), tabs: tabs.tabs, ...(tabs.plus ? { plus: tabs.plus } : {}) };
+    deps.write(composeView({ cols, rows: height, sidebar: list ? list.lines : null, frame, status: statusText(), buttons: buttonsLayout(cols).text,
+      ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}), ...(overlay ? { overlay } : {}) }));
   };
   const finish = (code: number, message: string): void => {
     if (finished) return;
@@ -146,6 +194,44 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     resolveDone({ code, message });
   };
 
+  /** One attach wiring for one selection generation. D1a(ELS-SERVER-RESTART-SURVIVE): a server-away end keeps the
+   *  screen as it was and waits for the poll to re-attach — the view does not end while the els server restarts. */
+  const wire = (mine: number): Attached => deps.attach(selected!, paneSize(), {
+    onFrame: (next: AttachFrame) => {
+      if (mine !== generation) return;
+      note = noteAfterFrame(note);
+      awaitingServer = false;
+      frame = next.screen;
+      scroll = next.back;                // the server tells how far this frame is above the live bottom
+      render();
+    },
+    onError: (message) => { if (mine === generation) { note = message; render(); } },   // typing refused (view-only attach): said, not swallowed
+    onEnd: (code, reason) => {
+      if (mine !== generation) return;
+      attached = undefined;
+      // ELS-LAST-TAB-EXIT (OP #102044): like herdr — the last of this host's panes ending closes the view (code 0; the
+      // server and every other client go on); otherwise the focus moves to the next live pane (the exited one is then
+      // closed by the list's clean-up, as when the selection leaves it).
+      if (reason === 'pane exited') {
+        const live = (row: PaneRow): boolean => row.pane !== selected && row.state !== 'exited';
+        const at = rows.findIndex((row) => row.pane === selected);
+        const next = rows.slice(at + 1).find(live) ?? rows.slice(0, Math.max(at, 0)).reverse().find(live);
+        if (!next) { finish(0, ''); return; }
+        note = 'pane 종료됨';
+        select(next.pane);
+        void refresh();
+        return;
+      }
+      // D1a(ELS-SERVER-RESTART-SURVIVE): the server going away is not the end of the view — the screen stays, the
+      // status line says so, and the next successful poll re-attaches (every attach starts with the pane's current
+      // screen, so the pane comes back as it was).
+      if (code !== 0 && isServerAway(reason)) { awaitingServer = true; note = RECONNECT_NOTE; render(); return; }
+      // Any other end (a refusal at the door, an unknown pane, a malformed stream) is real: say why and do NOT re-attach.
+      if (code !== 0) note = reason;
+      void refresh();
+    },
+  });
+
   const select = (pane: string | undefined): void => {
     if (finished || (pane === selected && attached)) return;      // after the app ended nothing attaches or is remembered
     wrapped = false;                                             // any move other than the wrap itself ends the wrap
@@ -155,37 +241,24 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     attached = undefined;
     selected = pane;
     frame = '';
-    history = [];
     scroll = 0;
     readError = '';
     remember();
     if (pane && remoteRows.some((row) => row.pane === pane)) {
       void showRemote(mine);                                    // read-only: a polled screen, no live attach
     } else if (pane) {
-      attached = deps.attach(pane, paneSize(), {
-        onFrame: (next: AttachFrame) => { if (mine === generation) { frame = next.screen; history = [...history.slice(-39), next.screen]; if (scroll > 0) scroll++; render(); } },
-        onEnd: (code, reason) => {
-          if (mine !== generation) return;
-          attached = undefined;
-          // ELS-LAST-TAB-EXIT (OP #102044): like herdr — the last of this host's panes ending closes the view (code 0; the
-          // server and every other client go on); otherwise the focus moves to the next live pane (the exited one is then
-          // closed by the list's clean-up, as when the selection leaves it).
-          if (reason === 'pane exited') {
-            const live = (row: PaneRow): boolean => row.pane !== pane && row.state !== 'exited';
-            const at = rows.findIndex((row) => row.pane === pane);
-            const next = rows.slice(at + 1).find(live) ?? rows.slice(0, Math.max(at, 0)).reverse().find(live);
-            if (!next) { finish(0, ''); return; }
-            note = 'pane 종료됨';
-            select(next.pane);
-            void refresh();
-            return;
-          }
-          if (code !== 0 && /no els server|closed the connection|did not answer/.test(reason)) { finish(1, reason); return; }
-          void refresh();
-        },
-      });
+      attached = wire(mine);
     }
     render();
+  };
+
+  /** D1a(ELS-SERVER-RESTART-SURVIVE): the server answered the poll again — re-attach to the same pane without
+   *  clearing the screen; the first frame of the new attach repaints the pane as it was (same child, same bytes). */
+  const reattach = (): void => {
+    if (finished || attached || !awaitingServer || !selected || current()?.remote) return;
+    awaitingServer = false;
+    generation++;
+    attached = wire(generation);
   };
 
   /**
@@ -232,7 +305,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
             && typeof (host as { name?: unknown }).name === 'string'
             && /^[a-zA-Z0-9._-]+$/.test((host as { name: string }).name)
             && (host as { reach?: unknown }).reach === 'down')
-          .map((host: { name: string }) => `⇄${host.name} ?`).join(' · ') : '';
+          .map((host: { name: string }) => `⇄${host.name} ${UNREACHABLE_MARK}`).join(' · ') : '';
       } catch { remoteStatus = '원격 목록 확인 불가'; }
       // ELS-REMOTE-MARKER: a host reported down keeps its last known panes in the list (dimmed «?»), so they do not
       // silently vanish; they are replaced as soon as the host answers again. A failed list as a whole still drops them.
@@ -249,7 +322,13 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   const refresh = async (): Promise<void> => {
     const answer = await deps.request({ op: 'ls' });
     if (finished) return;
-    if (answer.exitCode !== 0) { finish(1, answer.message); return; }
+    if (answer.exitCode !== 0) {
+      // D1a(ELS-SERVER-RESTART-SURVIVE): a server lost after a good list is waited out — the screen stays and this
+      // poll asks again; before the first good list the message goes out as it always did.
+      if (everListed && isServerAway(answer.message)) { if (selected && !attached) awaitingServer = true; note = RECONNECT_NOTE; render(); return; }
+      finish(1, answer.message); return;
+    }
+    everListed = true;
     const before = rows;
     rows = parsePaneRows(answer.message);
     lsAnswer = answer.message;
@@ -268,6 +347,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       select((live.find((row) => row.pane === remembered.lastPane) ?? live.find((row) => row.workspace === folder) ?? live[0]!).pane);
       return;
     }
+    if (awaitingServer && !attached && selected && !current()?.remote) reattach();   // D1a(ELS-SERVER-RESTART-SURVIVE): the server is back
     render();
   };
 
@@ -326,8 +406,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       switch (step.op) {
         case 'tab.new': case 'pane.new': await create(a.workspace ?? (current() && !current()!.remote ? current()!.workspace : undefined), { command: [], title: a.title ?? '' }); return { ok: true, message: '' };
         case 'workspace.create': await create(a.name ?? freshWorkspaceName()); return { ok: true, message: '' };
-        case 'tab.close': case 'pane.close': { const row = findTab(a.tab ?? a.pane ?? ''); return row && !row.remote ? answer({ op: 'close', pane: row.pane }) : { ok: false, message: `${a.tab ?? a.pane} 탭 없음` }; }
-        case 'workspace.close': { const row = findSpace(a.workspace ?? ''); return row ? answer({ op: 'close-workspace', ws: row.wsId }) : { ok: false, message: `${a.workspace} 공간 없음` }; }
+        case 'tab.close': case 'pane.close': { const row = findTab(a.tab ?? a.pane ?? ''); return row && !row.remote ? answer({ op: 'close', pane: row.pane, confirmed: true }) : { ok: false, message: `${a.tab ?? a.pane} 탭 없음` }; }
+        case 'workspace.close': { const row = findSpace(a.workspace ?? ''); return row ? answer({ op: 'close-workspace', ws: row.wsId, confirmed: true }) : { ok: false, message: `${a.workspace} 공간 없음` }; }
         case 'workspace.move': { const row = findSpace(a.workspace ?? ''); const before = a.before ? findSpace(a.before)?.wsId : undefined; return row ? answer({ op: 'reorder', kind: 'workspace', id: row.wsId, ...(before ? { before } : {}) }) : { ok: false, message: `${a.workspace} 공간 없음` }; }
         case 'pane.focus': { const row = findTab(a.pane ?? a.tab ?? ''); if (!row) return { ok: false, message: `${a.pane ?? a.tab} 없음` }; select(row.pane); return { ok: true, message: '' }; }
         default: return { ok: false, message: '아직 없는 동작 (ELS-DOOR-STRUCT-OPS)' };
@@ -340,6 +420,11 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     changed: () => { if (!voice.isOpen() && voice.lastMessage()) { note = voice.lastMessage(); void refresh(); } else render(); },
   });
 
+  // ELS-NEW-TAB-NAME-WIDGET: the typed name goes to the `new` request's title ONLY (cleaned and capped in the prompt); never to the pane.
+  const newTab = createNewTabPrompt({
+    save: (name) => { const row = current(); void create(row && !row.remote ? row.workspace : undefined, { command: [], title: name }); },
+    changed: () => render(),
+  });
   const freshWorkspaceName = (): string => {
     const base = basename(deps.cwd) || 'els';
     const taken = new Set(rows.map((row) => row.workspace));
@@ -349,6 +434,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
 
   const act = (action: KeyAction, n?: number): void => {
     note = '';
+    if (dropdown && action !== 'toggle-sidebar') dropdown = false;
     const row = current();
     switch (action) {
       case 'detach': finish(0, ''); return;
@@ -356,13 +442,15 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       case 'previous': move(-1); return;
       case 'next-workspace': nextTab(); return;
       case 'goto': { const tabs = spaceTabs(); if (n !== undefined && tabs[n - 1]) select(tabs[n - 1]!.pane); return; }
-      case 'toggle-sidebar': sidebarOpen = !sidebarOpen; remember(); attached?.resize(paneSize().cols, paneSize().rows); render(); return;
+      case 'toggle-sidebar': if (narrow()) { if (dropdown) { dropdown = false; render(); } else openDropdown(); return; } sidebarOpen = !sidebarOpen; remember(); attached?.resize(paneSize().cols, paneSize().rows); render(); return;
       case 'new-chat': void create(row && !row.remote ? row.workspace : undefined, { command: deps.chatCommand, title: 'elanous' }); return;
-      case 'new': void create(row && !row.remote ? row.workspace : undefined); return;
+      case 'new': if (!row?.remote) newTab.openPrompt(); else void create(undefined); return;   // ELS-NEW-TAB-NAME-WIDGET: the name prompt first; Enter on an empty name = the default tab
       case 'new-workspace': void create(freshWorkspaceName()); return;
       case 'close': if (row?.remote) { note = `⇄${row.remote} pane 은 여기서 닫을 수 없음 (그 호스트에서)`; render(); return; } if (row) { confirm = { what: 'close', target: row.pane, prompt: `pane «${row.title}» 닫기?` }; render(); } return;
       case 'close-workspace': if (row?.remote) { note = `⇄${row.remote} 작업공간은 여기서 닫을 수 없음 (그 호스트에서)`; render(); return; } if (row) { confirm = { what: 'close-workspace', target: row.wsId, prompt: `작업공간 «${row.workspace}» 와 그 안의 pane 모두 닫기?` }; render(); } return;
       case 'help': note = SIDEBAR_HELP; render(); return;
+      case 'scroll-up': scrollPane(Math.max(1, deps.size().rows - 4)); return;
+      case 'scroll-down': scrollPane(-Math.max(1, deps.size().rows - 4)); return;
     }
   };
 
@@ -373,12 +461,12 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     if (row.remote) { note = `⇄${row.remote} 공간은 여기서 닫을 수 없음 — ⏏ 백그라운드로 나가기`; render(); return; }
     const running = rows.filter((one) => one.wsId === row.wsId && (one.state === 'working' || one.state === 'blocked')).length;
     if (running > 0) { confirm = { what: 'quit', target: row.wsId, prompt: `⚠ ${running}개 실행 중 — 종료?` }; render(); return; }
-    void deps.request({ op: 'close-workspace', ws: row.wsId }).then(() => finish(0, ''));
+    void deps.request({ op: 'close-workspace', ws: row.wsId, confirmed: true }).then(() => finish(0, ''));
   };
 
   const settle = async (pending: Confirm): Promise<void> => {
-    if (pending.what === 'quit') { await deps.request({ op: 'close-workspace', ws: pending.target }); finish(0, ''); return; }
-    const answer = await deps.request(pending.what === 'close' ? { op: 'close', pane: pending.target } : { op: 'close-workspace', ws: pending.target });
+    if (pending.what === 'quit') { await deps.request({ op: 'close-workspace', ws: pending.target, confirmed: true }); finish(0, ''); return; }
+    const answer = await deps.request(pending.what === 'close' ? { op: 'close', pane: pending.target, confirmed: true } : { op: 'close-workspace', ws: pending.target, confirmed: true });
     if (finished) return;
     if (answer.exitCode !== 0) note = answer.message;
     await refresh();
@@ -400,6 +488,11 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       if (finished) return;
       for (const event of router.feed(text)) {
         if (voice.isOpen()) { if (event.kind === 'input') void voice.feed(event.bytes); continue; }
+        if (newTab.isOpen()) {                                     // keys (and clicks) belong to the prompt: nothing reaches the pane
+          if (event.kind === 'input') newTab.feed(event.bytes);
+          else if (event.kind === 'mouse') { if (event.report.release) pressConsumed = false; else pressConsumed = (event.report.button & 0x40) === 0; }
+          continue;
+        }
         if (confirm) {
           const pending = confirm;
           confirm = undefined;
@@ -407,6 +500,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
           else { note = '취소'; render(); }
           continue;
         }
+        if (dropdown && event.kind === 'input') { dropdownKey(event.bytes); continue; }
         if (event.kind === 'mouse') handleMouse(event.report);
         else if (event.kind === 'input') {
           if (current()?.remote) { note = `⇄${current()!.remote} pane 은 읽기 전용 — 입력은 els do ${current()!.pane} <글>`; render(); } else attached?.input(event.bytes);

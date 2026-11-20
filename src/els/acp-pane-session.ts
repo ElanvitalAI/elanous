@@ -9,24 +9,28 @@ export interface AcpPanePeer {
 }
 
 export function createAcpPaneSessions(createPeer: (pane: string) => AcpPanePeer) {
-  const panes = new Map<string, { ready: Promise<{ peer: AcpPanePeer; session: string }>; closing?: Promise<void>; closeFailed?: boolean }>();
+  const panes = new Map<string, { ready: Promise<{ peer: AcpPanePeer; session: string }>; closing?: Promise<void>; closeFailed?: boolean; state: { peer: AcpPanePeer; needsCleanupRetry: boolean } }>();
   return {
     async open(pane: string): Promise<void> {
       if (panes.has(pane)) throw new Error('pane already open');
       const peer = createPeer(pane);
+      const state = { peer, needsCleanupRetry: false };
       const ready = (async () => {
         try {
           await peer.start();
           return { peer, session: await peer.newSession() };
         } catch (error) {
-          await peer.stop().catch(() => {});
+          try { await peer.stop(); } catch { state.needsCleanupRetry = true; }
           throw error;
         }
       })();
-      const entry = { ready, closing: undefined as Promise<void> | undefined, closeFailed: false };
+      const entry = { ready, closing: undefined as Promise<void> | undefined, closeFailed: false, state };
       panes.set(pane, entry);
       try { await ready; } catch (error) {
-        if (panes.get(pane) === entry && !entry.closing) panes.delete(pane);
+        if (panes.get(pane) === entry) {
+          if (state.needsCleanupRetry) entry.closeFailed = true;
+          else if (!entry.closing) panes.delete(pane);
+        }
         throw error;
       }
     },
@@ -46,6 +50,7 @@ export function createAcpPaneSessions(createPeer: (pane: string) => AcpPanePeer)
         entry.closing = (async () => {
           const opened = await entry.ready.catch(() => null);
           if (opened) await opened.peer.stop();
+          else if (entry.state.needsCleanupRetry) { await entry.state.peer.stop(); entry.state.needsCleanupRetry = false; }
           if (panes.get(pane) === entry) panes.delete(pane);
         })();
       }

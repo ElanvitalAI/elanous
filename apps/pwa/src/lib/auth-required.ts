@@ -1,11 +1,17 @@
+import { surfaceForwards } from './daemon-config';
+
 type AuthRequiredDetail = { path: string };
 
 const EVENT_NAME = 'elanous:auth-required';
 let reportedPath: string | null = null;
 let dismissed = false;
 
+// bare 핸들 호스트에서 서버가 «넘긴다» 고 전달한 경로(surfaceForwards)만 401 이 «기기 연결» 카드를 띄운다.
+// 그 밖의 401 은 «이 호스트가 그 경로를 안 넘김» 이다(채팅 쌍 401 은 그대로 드러남).
+
 export function reportAuthRequired(path: string): void {
   if (typeof window === 'undefined' || reportedPath !== null) return;
+  if (!surfaceForwards(path)) return;
   reportedPath = path;
   window.dispatchEvent(new CustomEvent<AuthRequiredDetail>(EVENT_NAME, { detail: { path } }));
 }

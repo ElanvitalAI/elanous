@@ -1262,7 +1262,9 @@ test('two independent tick processes serialize against the same queue file', asy
     + `const result = await tickHarnessQueue({root: ${JSON.stringify(dir)}, cap: () => 2, pool: () => ({running:0,pending:0,reserved:0,limit:2}), alive: () => true, processes: () => [], authorShadow: () => {}, launch: async () => { await Bun.sleep(100); return process.pid; }, log: () => {}});\n`
     + `console.log(result.outcome);`;
   const run = () => new Promise<{ code: number | null; output: string }>((done, reject) => {
-    const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // An ambient ELANOUS_CONFIG_DIR (train/pod shells) makes the child print a deprecation line on stderr, which this helper treats as failure.
+    const { ELANOUS_CONFIG_DIR: _ambientConfigDir, ...cleanEnv } = process.env;
+    const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'pipe'], env: cleanEnv });
     let output = '', errors = '';
     child.stdout.on('data', (chunk) => { output += String(chunk); });
     child.stderr.on('data', (chunk) => { errors += String(chunk); });

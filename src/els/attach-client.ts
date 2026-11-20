@@ -1,11 +1,14 @@
 // els attach client — one long connection to the owner for one pane: frames in, `input`/`resize` lines out. Closing the
 // connection (detach) never touches the pane. The terminal drawing lives in attach-view.ts; this file only speaks the wire.
 
+import { readFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
+import { dirname, join } from 'node:path';
 import { elsSocketPathProblem } from './server.js';
 import { createLineDecoder } from './wire.js';
+import { AUTH_PANE_TOKEN_ENV, AUTH_OWNER_TOKEN_ENV } from './server-auth.js';
 
-export interface AttachFrame { readonly pane: string; readonly seq: number; readonly cols: number; readonly rows: number; readonly screen: string }
+export interface AttachFrame { readonly pane: string; readonly seq: number; readonly cols: number; readonly rows: number; readonly screen: string; /** Lines this frame is scrolled above the live bottom (0 = live). */ readonly back: number }
 
 export interface AttachHandlers {
   readonly onFrame: (frame: AttachFrame) => void;
@@ -18,24 +21,54 @@ export interface AttachHandlers {
 export interface Attached {
   readonly input: (bytes: string) => void;
   readonly resize: (cols: number, rows: number) => void;
+  /** Scroll the view into the pane's scrollback: positive = towards older lines. */
+  readonly scroll: (lines: number) => void;
   readonly detach: () => void;
+}
+
+/** D1a: the credential this attach presents, read FRESH at every (re)attach. A pane process carries its pane token. An owner
+ *  terminal (the person's `els attach`) carries the OWNER token of the server run it started against — a restart mints a new
+ *  one and rewrites the owner-token file next to the socket, so an owner holder re-reads that file instead of reusing a
+ *  token no running server knows (that attach would be a view-only outsider: typing refused). Only a process that already
+ *  holds an owner token does this: a pane process (pane token) never reads the owner file, so nothing is promoted here. */
+function attachAuth(socketPath: string): string | undefined {
+  const pane = process.env[AUTH_PANE_TOKEN_ENV];
+  if (pane) return pane;
+  const owner = process.env[AUTH_OWNER_TOKEN_ENV];
+  if (!owner) return undefined;
+  try { return readFileSync(join(dirname(socketPath), 'owner-token'), 'utf8').trim() || owner; }
+  catch { return owner; }
 }
 
 export function attachEls(socketPath: string, pane: string, size: { cols: number; rows: number }, handlers: AttachHandlers): Attached {
   let ended = false;
-  const end = (exitCode: 0 | 1 | 2, reason: string): void => { if (!ended) { ended = true; handlers.onEnd(exitCode, reason); } };
   const tooLong = elsSocketPathProblem(socketPath);
-  if (tooLong) { queueMicrotask(() => end(1, tooLong)); return { input: () => {}, resize: () => {}, detach: () => {} }; }
+  // JUD-B must #107737: end 는 socket 선언 뒤에 정의한다 — tooLong 조기 반환 경로에는 socket 이 없어서, end 가
+  // socket.destroy() 를 참조하면 queueMicrotask 의 end(1, tooLong) 이 TDZ ReferenceError 로 프로세스를 죽인다.
+  if (tooLong) { queueMicrotask(() => { if (!ended) { ended = true; handlers.onEnd(1, tooLong); } }); return { input: () => {}, resize: () => {}, scroll: () => {}, detach: () => {} }; }
   const socket = createConnection(socketPath);
+  // D1a must-1(JUD-B #107693): end 는 소켓도 닫는다 — 서버가 end 를 보내면 절반만 닫힌 연결이 남아 서버의 close() 를
+  // 묶어둔다(els serve SIGTERM 이 끝나지 않는다). end 를 받은 클라 소켓은 즉시 완전히 닫는다.
+  const end = (exitCode: 0 | 1 | 2, reason: string): void => { if (!ended) { ended = true; socket.destroy(); handlers.onEnd(exitCode, reason); } };
   const write = (value: object): void => { if (!ended && !socket.destroyed) socket.write(`${JSON.stringify(value)}\n`); };
-  // The attach line is queued first, on the not-yet-connected socket (Node buffers writes in order until it connects), so an
-  // `input`/`resize` called before `connect` can only follow it, never overtake it.
+  // JUD #39096 ⓒ (OP #107528): the typing lines (input/resize) are owner-token-only at the door, so the attach
+  // client presents the same credential `requestEls` does — the pane token of the pane it lives in, or the owner
+  // token the CLI loaded from the owner-token file. Without it the connection stays view-only (outsider: attach
+  // yes, typing denied). The server's auth ack line is neither frame/end/error, so the decoder ignores it.
+  const auth = attachAuth(socketPath);
+  if (auth) write({ op: 'auth', token: auth, pid: process.pid });
+  // The attach line is queued right behind the auth line (Node buffers writes in order until the socket connects),
+  // so an `input`/`resize` called before `connect` can only follow it, never overtake it.
   write({ op: 'attach', pane, cols: size.cols, rows: size.rows });
   const lines = createLineDecoder((line) => {
     let value: { type?: string; exitCode?: 0 | 1 | 2; message?: string } & Partial<AttachFrame>;
     try { value = JSON.parse(line) as typeof value; } catch { end(1, 'els: malformed frame from the els server'); return; }
+    // The door answers a refused attach with a plain result line (no `type`) and closes: that refusal is the end, with its own
+    // words — left to the socket close it would read as «the server closed the connection», the signal views retry on.
+    // (The auth ack is also a plain result line, but with exitCode 0.)
+    if (value && value.type === undefined && typeof value.exitCode === 'number' && value.exitCode !== 0) { end(value.exitCode, value.message ?? 'refused'); return; }
     if (value.type === 'frame' && typeof value.screen === 'string') {
-      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), screen: value.screen });
+      handlers.onFrame({ pane: String(value.pane), seq: Number(value.seq), cols: Number(value.cols), rows: Number(value.rows), back: Number(value.back ?? 0), screen: value.screen });
     } else if (value.type === 'end') end(value.exitCode ?? 0, value.message ?? '');
     else if (value.type === 'error') handlers.onError?.(value.message ?? 'refused');
   });
@@ -47,6 +80,19 @@ export function attachEls(socketPath: string, pane: string, size: { cols: number
   return {
     input: (bytes) => write({ op: 'input', bytes }),
     resize: (cols, rows) => write({ op: 'resize', cols, rows }),
+    scroll: (lines) => write({ op: 'scroll', lines }),
     detach: () => { if (!ended) { ended = true; socket.destroy(); } },
   };
+}
+
+/** D1a(ELS-SERVER-RESTART-SURVIVE): the ends a client can ride out — the els server going away (a restart, an update,
+ *  a dropped socket). A pane that exited, a pane that never existed and a malformed stream are real ends: retrying
+ *  them would lie. The strings are the wire's own words (this file's error paths, the request client's no-server and
+ *  timeout lines, the server's stopping message). */
+export const RECONNECT_NOTE = '서버 재기동 중 — 다시 붙는 중…';
+/** The status-line note after a frame arrived: the reconnect note goes with the wait, any other note stays. */
+export const noteAfterFrame = (note: string): string => (note === RECONNECT_NOTE ? '' : note);
+const SERVER_AWAY = /no els server is running|closed the connection|did not answer|the server is stopping/;
+export function isServerAway(reason: string): boolean {
+  return SERVER_AWAY.test(reason);
 }

@@ -615,6 +615,122 @@ def remote_setup_infra_detail(log_path):
     return ''
 
 
+BUN_ASSERTION_LINE = re.compile(r'^\s*(error: expect\(|error: assert|Expected:|Received:|- Expected|\+ Received)')
+BUN_STATUS_LINE = re.compile(r'^\((pass|fail|skip|todo)\)')
+BUN_FILE_HEADER = re.compile(r'^[A-Za-z0-9_./@+-]+\.test\.tsx?:$')
+# bun prints this on the line right after `(fail) <name> [Nms]`, and only for a timeout (same shape gate-diff.ts parses).
+BUN_TIMEOUT_MARKER = re.compile(r'^\s*\^ this test timed out after \d+(?:\.\d+)?ms\.?\s*$')
+BUN_ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
+BUN_SUMMARY_LINE = re.compile(r'^\s*(\d+) (pass|fail|error|errors)\s*$')
+
+
+def classify_bun_failures(text):
+    """Split bun `(fail)` lines into load timeouts and real failures, block by block; fail closed on anything unexplained.
+    Timeout = the line immediately after `(fail)` is bun's timeout marker AND the block above the `(fail)` (everything since
+    the previous status/file-header line) holds no `error:` line. A block that ends at a pass/skip/todo/file header/EOF with an
+    `error:` or `Unhandled error` line in it is an unhandled error (module load failure etc.) = violation. bun's own
+    `N fail` / `N error` summary is reconciled: failures it counts that no `(fail)` line explains are violations too."""
+    lines = [BUN_ANSI.sub('', raw) for raw in text.splitlines()]
+    timeouts, violations = [], []
+    block_start = 0
+
+    def orphan(upto):
+        block = lines[block_start:upto]
+        hit = next((l.strip() for l in block if l.lstrip().startswith('error:') or 'Unhandled error' in l), None)
+        if hit:
+            violations.append(('unhandled: ' + hit)[:160])
+
+    summary = {}
+    for index, line in enumerate(lines):
+        counted = BUN_SUMMARY_LINE.match(line)
+        if counted:
+            summary['error' if counted.group(2).startswith('error') else counted.group(2)] = int(counted.group(1))
+            continue
+        if BUN_FILE_HEADER.match(line.strip()):
+            orphan(index)
+            block_start = index + 1
+            continue
+        if not BUN_STATUS_LINE.match(line):
+            continue
+        consumed = index + 1
+        if line.startswith('(fail)'):
+            marker = index + 1 < len(lines) and BUN_TIMEOUT_MARKER.match(lines[index + 1]) is not None
+            errored = any(before.lstrip().startswith('error:') or 'Unhandled error' in before or BUN_ASSERTION_LINE.match(before)
+                          for before in lines[block_start:index])
+            (timeouts if marker and not errored else violations).append(line[len('(fail) '):][:160])
+            if marker:
+                consumed = index + 2
+        else:
+            orphan(index)
+        block_start = consumed
+    orphan(len(lines))
+    explained = len(timeouts) + len([v for v in violations if not v.startswith('unhandled: ')])
+    if summary.get('error', 0) > 0 or summary.get('fail', 0) > explained:
+        if not any(v.startswith('unhandled: ') for v in violations):
+            violations.append(f"unexplained: bun summary fail={summary.get('fail', 0)} error={summary.get('error', 0)} vs {explained} classified"[:160])
+    return {'timeouts': timeouts, 'violations': violations}
+
+
+def ratchet_log_text(summary_path, data):
+    ratchets = data.get('trainAlwaysRatchets')
+    if not isinstance(ratchets, dict):
+        return None
+    base = Path(summary_path).parent
+    name = Path(summary_path).name
+    # Only THIS attempt's own log: a retry/handoff without its own log is unmeasurable, never "borrow the primary's" (fail closed).
+    art = 'handoff-art' if 'handoff' in name else ('retry-art' if 'retry' in name else 'primary-art')
+    log = base / 'remote-artifacts' / art / str(ratchets.get('log') or 'always-ratchets.log')
+    try:
+        return log.read_text(errors='replace') if log.is_file() else None
+    except OSError:
+        return None
+
+
+def ratchet_timeout_only(summary_path, data):
+    """True when the only thing that failed is the always-ratchet bundle and every failing test merely timed out under load:
+    unmeasured infrastructure, not a violation (OP TRAIN-TIMEOUT-NOT-VIOLATION). Any real failure keeps it a failure."""
+    ratchets = data.get('trainAlwaysRatchets')
+    typecheck = data.get('typecheck')
+    if (not isinstance(ratchets, dict) or ratchets.get('status') != 'failed'
+            or ratchets.get('tests') != list(TRAIN_ALWAYS_RATCHETS)
+            or not isinstance(typecheck, dict) or typecheck.get('status') != 'passed'
+            or any(data.get(k, 0) != 0 for k in ('introduced', 'unknown', 'unrunImporters'))):
+        return False
+    text = ratchet_log_text(summary_path, data)
+    if text is None:
+        return False
+    # Completion evidence: bun ends a complete run with `N pass/fail/skip/todo` summary lines and a final
+    # `Ran N tests across M files.` line, and the counts must add up. A log cut off earlier cannot be proven to hold nothing
+    # but timeouts (fail closed).
+    counts, ran = {}, None
+    for raw in text.splitlines():
+        line = BUN_ANSI.sub('', raw)
+        counted = re.match(r'^\s*(\d+) (pass|fail|skip|todo)\s*$', line)
+        if counted:
+            counts[counted.group(2)] = int(counted.group(1))
+        done = re.match(r'^\s*Ran (\d+) tests? across \d+ files?\.', line)
+        if done:
+            ran = int(done.group(1))
+    if 'fail' not in counts or ran is None or sum(counts.values()) != ran:
+        return False
+    found = classify_bun_failures(text)
+    return bool(found['timeouts']) and not found['violations']
+
+
+def unmeasured_refusal_marker(*summary_paths):
+    """host-infra marker only when EVERY gate run seen so far failed on ratchet timeouts alone — a violation in any run
+    (e.g. the primary) is never washed out by a timeout-only retry."""
+    try:
+        for path in summary_paths:
+            if not ratchet_timeout_only(path, json.loads(Path(path).read_text())):
+                return ''
+        return 'host-infra: always-ratchet timeouts only (no violation); ' if summary_paths else ''
+    except Exception:
+        return ''
+
+
 def always_ratchet_detail(summary_path, data):
     """Name the first failing always-ratchet test from the preserved log (OP 11-05)."""
     ratchets = data.get('trainAlwaysRatchets')
@@ -638,6 +754,8 @@ def always_ratchet_detail(summary_path, data):
         if fails:
             first = fails[0][len('(fail) '):][:160]
             hint = f" received={'|'.join(received[:3])}" if received else ''
+            kinds = classify_bun_failures('\n'.join(lines))
+            hint += f" timeouts={len(kinds['timeouts'])} violations={len(kinds['violations'])}"
             return f'failed {status} fails={len(fails)} first={first}{hint} log={art}/{log_name}' + (f' file={header}' if header else '')
         return f'{status} log={art}/{log_name} (no (fail) line)'
     return f'{status} log not preserved'
@@ -999,6 +1117,8 @@ def gate_is_unmeasured(path, base, integration):
     if data.get('base40') != base or data.get('head40') != integration:
         raise RuntimeError('unmeasured gate base/integration head mismatch')
     typecheck = data.get('typecheck')
+    if ratchet_timeout_only(path, data):
+        return True  # load timeouts in the ratchet bundle are unmeasured infra: rerun on another host, never a strike
     if data.get('verdict') != 'unmeasured' and not (
             isinstance(typecheck, dict) and typecheck.get('status') == 'unmeasured'):
         return False
@@ -1060,6 +1180,8 @@ def gate_failed_introduced(path):
         data = json.loads(Path(path).read_text())
     except Exception:
         return False
+    if ratchet_timeout_only(path, data):
+        return False  # the remote forced verdict=failed for the ratchet rc; timeouts alone are unmeasured, not a failure
     typecheck = data.get('typecheck')
     always_ratchets = data.get('trainAlwaysRatchets')
     return (data.get('verdict') == 'failed'
@@ -1493,6 +1615,23 @@ def remote_batch_root(home, run_id, suffix):
     return f'{home}/elanous-hq/seat-state/OP/train-artifacts/batch-{run_id}/{suffix}'
 
 
+# unix socket sun_path is 104 bytes on macOS (108 on Linux); tests append `<mkdtemp-prefix>-XXXXXX/<name>.sock`
+# (up to ~48 bytes) under TMPDIR, so the gate TMPDIR must stay well below that. It used to be
+# `<home>/elanous-hq/seat-state/OP/train-artifacts/batch-<id>/<suffix>-tmp` (83..100 bytes) -> socket tests broke only on the train.
+SCRATCH_PARENT = '.etb'
+SCRATCH_OWNER = '.owner'
+
+
+def remote_scratch_path(home, run_id, suffix):
+    """Short per-run gate TMPDIR (`<home>/.etb/<10 hex>`); ownership is proven by the `.owner` marker, not by its name."""
+    if not re.fullmatch(r'[0-9]+', str(run_id)) or not re.fullmatch(r'[A-Za-z0-9._-]+', suffix):
+        raise ValueError('invalid remote scratch identity')
+    if not str(home).startswith('/'):
+        raise ValueError('remote scratch home must be absolute')
+    digest = hashlib.sha1(f'{run_id}/{suffix}'.encode()).hexdigest()[:10]
+    return f'{home}/{SCRATCH_PARENT}/{digest}'
+
+
 def build_remote_integration_command(base, rows, worktree, bundle, run_id, suffix):
     """Create the exact PR subset integration tree and bundle in the batch host clone."""
     if not re.fullmatch(r'[0-9a-f]{40}', base):
@@ -1573,35 +1712,76 @@ def integrate_rows_remote(host, base, rows, run_id, suffix, resources, remote_ho
     return {'host': host, 'head': head.group(1), 'bundle': bundle, 'worktree': worktree}
 
 
-def cleanup_remote_integrations(resources):
-    """Remove only the integration worktrees and bundles this invocation created."""
-    errors = []
+def remote_worktree_gc(path, pattern):
+    """Shell: take a worktree off the critical path. `mv` is a rename (instant); the slow recursive delete of its
+    node_modules runs detached. A node_modules symlink is only unlinked (never followed); a path that does not match
+    the train-artifacts pattern is left alone."""
+    p = shlex.quote(path)
+    return (f'if [ -e {p} ]; then case {p} in {pattern}) gc={p}.gc-$$; '
+            f'if mv -- {p} "$gc"; then [ -L "$gc/node_modules" ] && rm -f -- "$gc/node_modules"; '
+            "nohup sh -c 'T=; command -v timeout >/dev/null 2>&1 && T=\"timeout " + str(GC_RM_TIMEOUT_SECONDS) + "\"; chmod -R u+w \"$1\" 2>/dev/null; $T rm -rf -- \"$1\"' sh \"$gc\" >/dev/null 2>&1 </dev/null & fi ;; "
+            '*) echo "[train-batch-cleanup] refusing unowned worktree path" >&2 ;; esac; fi; ')
+
+
+DETACHED_CLEANUPS = []
+# ConnectTimeout/ServerAlive limit only an unreachable or unresponsive peer (connect, keepalive). They are NOT an overall
+# run-time cap: a remote rm/git that hangs while the peer still answers keepalives is not bounded by them. The verdict path
+# never waits for it, so that costs nothing there; a lingering remote process is the host-side sweeper's job. The remote
+# recursive delete itself carries coreutils `timeout` when the host has it. The exact PID is in the cleanup record; never
+# killed by pattern.
+GC_RM_TIMEOUT_SECONDS = 900
+DETACH_SSH_OPTIONS = ['-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4']
+
+
+def reap_detached_cleanups():
+    """Collect already-finished detached ssh children (poll only — never waits, never kills)."""
+    DETACHED_CLEANUPS[:] = [proc for proc in DETACHED_CLEANUPS if proc.poll() is None]
+
+
+def detach_remote(host, payload, log_path=None):
+    """Fire-and-forget ssh: the verdict never waits for cleanup. Only a failure to START is recorded (never raised);
+    the completion state after a successful start (ssh failure, timeout, rc) is not recorded — follow-up work."""
+    try:
+        out = open(log_path, 'ab') if log_path else subprocess.DEVNULL
+        try:
+            argv = ssh_remote_command(host, payload)
+            argv[1:1] = DETACH_SSH_OPTIONS
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+        finally:
+            if log_path:
+                out.close()
+        DETACHED_CLEANUPS.append(proc)
+        return {'host': host, 'detached': True, 'pid': proc.pid}
+    except Exception as exc:
+        return {'host': host, 'detached': False, 'error': str(exc)[-300:]}
+
+
+def cleanup_remote_integrations(resources, log_dir=None):
+    """Remove only the integration worktrees and bundles this invocation created — detached, never raising."""
+    outcomes = []
     for item in reversed(resources):
         payload = (
-            'set -e; cd ~/source/elanous-agent; '
-            f'if [ -e {shlex.quote(item["worktree"])} ]; then '
-            f'git worktree remove --force {shlex.quote(item["worktree"])}; fi; '
-            f'rm -f -- {shlex.quote(item["bundle"])}; '
+            'cd ~/source/elanous-agent; '
+            + remote_worktree_gc(item['worktree'], '*/train-artifacts/batch-*/integration-*')
+            + f'rm -f -- {shlex.quote(item["bundle"])}; '
             + '; '.join(f'git update-ref -d {shlex.quote(ref)} || true' for ref in item['refs'])
             + '; git worktree prune'
         )
-        result = command(ssh_remote_command(item['host'], payload), timeout=180)
-        if result.returncode:
-            errors.append(f'{item["host"]}:{item["worktree"]} rc={result.returncode}')
-    if errors:
-        raise RuntimeError('remote integration cleanup failed: ' + '; '.join(errors))
+        outcomes.append(detach_remote(item['host'], payload, str(Path(log_dir) / 'cleanup-async.log') if log_dir else None))
+    return outcomes
 
 
 def build_remote_batch_tmp_cleanup_command(remote_tmpdir, remote_art):
     """Remove one owned batch scratch tree, never its sibling artifacts."""
     tmp = Path(remote_tmpdir)
     art = Path(remote_art)
-    if (not tmp.is_absolute() or not art.is_absolute() or not tmp.name.endswith('-tmp')
-            or art.name != tmp.name[:-4] + '-art'
-            or not re.fullmatch(r'batch-[0-9]+', tmp.parent.name)
-            or tmp.parent.parent.name != 'train-artifacts'
-            or tmp.parent.parent.parent.name != 'OP'
-            or tmp.parent.parent.parent.parent.name != 'seat-state'):
+    if (not tmp.is_absolute() or not art.is_absolute() or tmp.parent.name != SCRATCH_PARENT
+            or not re.fullmatch(r'[0-9a-f]{10}', tmp.name) or not art.name.endswith('-art')
+            or not re.fullmatch(r'batch-[0-9]+', art.parent.name)
+            or art.parent.parent.name != 'train-artifacts'
+            or art.parent.parent.parent.name != 'OP'
+            or art.parent.parent.parent.parent.name != 'seat-state'):
         raise ValueError('unsafe remote batch scratch identity')
     return f"""python3 - {shlex.quote(str(tmp))} {shlex.quote(str(art))} <<'PY_BATCH_TMP_CLEANUP'
 import os, pathlib, re, shutil, sys
@@ -1610,16 +1790,20 @@ status = 'skipped'
 try:
     if raw_tmp.is_symlink() or raw_art.is_symlink() or not raw_tmp.is_dir() or not raw_art.is_dir():
         raise ValueError('scratch/artifact must be existing real directories')
+    if raw_tmp.parent.is_symlink():
+        raise ValueError('scratch parent must be a real directory')
     scratch, artifact = raw_tmp.resolve(strict=True), raw_art.resolve(strict=True)
-    if scratch.parent != artifact.parent or scratch.name != raw_tmp.name or artifact.name != raw_art.name:
-        raise ValueError('scratch/artifact escaped batch directory')
-    if (not re.fullmatch(r'batch-[0-9]+', scratch.parent.name)
-            or scratch.parent.parent.name != 'train-artifacts'
-            or scratch.parent.parent.parent.name != 'OP'
-            or scratch.parent.parent.parent.parent.name != 'seat-state'):
-        raise ValueError('resolved scratch path escaped train-artifacts')
-    if not scratch.name.endswith('-tmp') or artifact.name != scratch.name[:-4] + '-art':
-        raise ValueError('scratch/artifact sibling contract mismatch')
+    if scratch.name != raw_tmp.name or artifact.name != raw_art.name or scratch.parent.name != '{SCRATCH_PARENT}':
+        raise ValueError('scratch/artifact identity changed on resolve')
+    if (not re.fullmatch(r'batch-[0-9]+', artifact.parent.name)
+            or artifact.parent.parent.name != 'train-artifacts'
+            or artifact.parent.parent.parent.name != 'OP'
+            or artifact.parent.parent.parent.parent.name != 'seat-state'):
+        raise ValueError('resolved artifact path escaped train-artifacts')
+    # Ownership = the marker written by this run's worker setup names exactly this artifact directory.
+    owner = scratch / '{SCRATCH_OWNER}'
+    if owner.is_symlink() or not owner.is_file() or owner.read_text().strip() != str(artifact):
+        raise ValueError('scratch is not owned by this batch artifact (missing/different owner marker)')
     # The invocation has ended; fail closed if a same-user process retained cwd/fds.
     proc_root = pathlib.Path('/proc')
     if not proc_root.is_dir():
@@ -1665,45 +1849,60 @@ print('[train-batch-cleanup] batch-tmp ' + status.replace('\\n', ' '))
 PY_BATCH_TMP_CLEANUP"""
 
 
-def cleanup_remote_batch_temps(resources, log):
-    """Best-effort cleanup of tracked scratch dirs after batch completion."""
+def cleanup_remote_batch_temps(resources, log, log_dir=None):
+    """Detached best-effort cleanup of tracked scratch dirs after the verdict is recorded (owner-marker checked remotely)."""
     outcomes = []
     for item in reversed(resources):
         try:
             payload = build_remote_batch_tmp_cleanup_command(item['tmp'], item['art'])
-            result = command(ssh_remote_command(item['host'], payload), timeout=120)
-            output = ((result.stdout or '') + (result.stderr or '')).strip()
-            outcomes.append({'host': item['host'], 'tmp': item['tmp'],
-                             'returncode': result.returncode, 'output': output[-1000:]})
-            log(f"remote tmp cleanup {item['host']} {item['tmp']}: rc={result.returncode} {output[-300:]}")
+            outcome = detach_remote(item['host'], payload, str(Path(log_dir) / 'cleanup-async.log') if log_dir else None)
         except Exception as exc:
-            outcomes.append({'host': item['host'], 'tmp': item['tmp'], 'returncode': 1, 'output': str(exc)})
-            log(f"remote tmp cleanup failed {item['host']} {item['tmp']}: {exc}")
+            outcome = {'host': item['host'], 'detached': False, 'error': str(exc)[-300:]}
+        outcome['tmp'] = item['tmp']
+        outcomes.append(outcome)
+        log(f"remote tmp cleanup {item['host']} {item['tmp']}: {outcome}")
     return outcomes
 
 
-def cleanup_remote_bundle_copies(copies):
-    """Remove only cross-host bundle copies staged for retry/handoff gates."""
-    errors = []
-    for item in reversed(copies):
-        result = command(ssh_remote_command(
-            item['host'], f'rm -f -- {shlex.quote(item["path"])}'), timeout=60)
-        if result.returncode:
-            errors.append(f'{item["host"]}:{item["path"]} rc={result.returncode}')
-    if errors:
-        raise RuntimeError('remote retry bundle cleanup failed: ' + '; '.join(errors))
+def run_detached_cleanups(artifacts, bundle_copies, integrations, tmp_resources, log):
+    """Start all three cleanups detached and record every outcome (start failures included) in tmp-cleanup.json.
+    Never raises: the caller's verdict/return value is unaffected by anything that happens here."""
+    record = {'bundle': [], 'integration': [], 'tmp': []}
+    for key, call in (('bundle', lambda: cleanup_remote_bundle_copies(bundle_copies, artifacts)),
+                      ('integration', lambda: cleanup_remote_integrations(integrations, artifacts)),
+                      ('tmp', lambda: cleanup_remote_batch_temps(tmp_resources, log, artifacts))):
+        try:
+            record[key] = call()
+        except Exception as exc:
+            record[key] = [{'detached': False, 'error': str(exc)[-300:]}]
+    try:
+        if artifacts:
+            (Path(artifacts) / 'tmp-cleanup.json').write_text(json.dumps(record, indent=2) + '\n')
+    except OSError as exc:
+        log(f'tmp-cleanup.json not written: {exc}')
+    reap_detached_cleanups()
+    return record
 
 
-def select_gate_summary(primary, retry, base, integration, rows, retry_host='retry host'):
+def cleanup_remote_bundle_copies(copies, log_dir=None):
+    """Remove only cross-host bundle copies staged for retry/handoff gates (output goes to cleanup-async.log when known)."""
+    log_path = str(Path(log_dir) / 'cleanup-async.log') if log_dir else None
+    return [detach_remote(item['host'], f'rm -f -- {shlex.quote(item["path"])}', log_path) for item in reversed(copies)]
+
+
+def select_gate_summary(primary, retry, base, integration, rows, retry_host='retry host', attempts=None):
+    # `attempts` = EVERY gate summary of this batch in order (primary, retry, handoff): the host-infra marker needs all of them
+    # to be pure ratchet timeouts, so a violation in a middle attempt can never be washed out by the last one.
+    attempts = [a for a in (attempts or [primary, retry]) if a is not None]
     if retry is not None and gate_failed_introduced(primary):
         if gate_is_unmeasured(retry, base, integration):
-            raise RuntimeError(f'{retry_host} retry of failed primary remained unmeasured; landing refused')
+            raise RuntimeError(f'{unmeasured_refusal_marker(*attempts)}{retry_host} retry of failed primary remained unmeasured; landing refused')
         return validate_gate(retry, base, integration, rows), 2
     if gate_is_unmeasured(primary, base, integration):
         if retry is None:
-            raise RuntimeError(f'unmeasured primary gate requires retry on {retry_host}')
+            raise RuntimeError(f'{unmeasured_refusal_marker(*attempts)}unmeasured primary gate requires retry on {retry_host}')
         if gate_is_unmeasured(retry, base, integration):
-            raise RuntimeError(f'{retry_host} retry remained unmeasured; landing refused')
+            raise RuntimeError(f'{unmeasured_refusal_marker(*attempts)}{retry_host} retry remained unmeasured; landing refused')
         return validate_gate(retry, base, integration, rows), 2
     return validate_gate(primary, base, integration, rows), 1
 
@@ -1746,8 +1945,9 @@ def remote_worker_setup(remote_art, remote_tmpdir):
     state_root = shlex.quote(f'{remote_tmpdir}/state')
     return (
         f"umask 022; mkdir -p {art}; "
-        f"umask 077; mkdir -m 700 -p {scratch} {state_root}; "
+        f"umask 077; mkdir -m 700 -p {shlex.quote(str(Path(remote_tmpdir).parent))} {scratch} {state_root}; "
         f"chmod 700 {scratch} {state_root}; "
+        f"(CDPATH= cd {art} && pwd -P) > {scratch}/{SCRATCH_OWNER}; "
         f"export TMPDIR={scratch} ELANOUS_STATE_DIR={state_root}; umask 022; "
     )
 
@@ -1762,16 +1962,15 @@ def remote_dependency_scratch_cleanup(remote_tmpdir, remote_art):
         f"artifact_real=$(physical_dir {art}) || cleanup_rc=$?; "
         f"scratch_real=$(physical_dir {scratch}) || cleanup_rc=$?; "
         "if [ \"$cleanup_rc\" -eq 0 ]; then "
-        "expected_scratch=\"${artifact_real%/*}/primary-tmp\"; "
-        "if [ \"$scratch_real\" != \"$expected_scratch\" ]; then cleanup_rc=1; "
+        f"if [ \"$(cat \"$scratch_real/{SCRATCH_OWNER}\" 2>/dev/null)\" != \"$artifact_real\" ]; then cleanup_rc=1; "
         "else dep_path=\"$scratch_real/state/worktree-deps\"; "
         "if [ -e \"$dep_path\" ] || [ -L \"$dep_path\" ]; then "
         "dep_real=$(physical_dir \"$dep_path\") || cleanup_rc=$?; "
         "if [ \"$cleanup_rc\" -eq 0 ]; then "
         "case \"$dep_real/\" in \"$scratch_real/\"*) "
         "if [ \"$dep_real\" = \"$scratch_real\" ]; then cleanup_rc=1; "
-        "else chmod -R u+w \"$dep_real\" || cleanup_rc=$?; "
-        "if [ \"$cleanup_rc\" -eq 0 ]; then rm -rf -- \"$dep_real\" || cleanup_rc=$?; fi; fi ;; "
+        "else gcdep=\"$dep_real.gc-$$\"; mv -- \"$dep_real\" \"$gcdep\" || cleanup_rc=$?; "
+        "if [ \"$cleanup_rc\" -eq 0 ]; then nohup sh -c 'T=; command -v timeout >/dev/null 2>&1 && T=\"timeout " + str(GC_RM_TIMEOUT_SECONDS) + "\"; chmod -R u+w \"$1\" 2>/dev/null; $T rm -rf -- \"$1\"' sh \"$gcdep\" >/dev/null 2>&1 </dev/null & fi; fi ;; "
         "*) cleanup_rc=1 ;; esac; fi; fi; fi; fi; "
         "printf '[train-batch-cleanup] dependency-scratch rc=%s\\n' \"$cleanup_rc\" >> \"$artifact_real/cleanup.log\" 2>/dev/null || "
         "printf '[train-batch-cleanup] dependency-scratch rc=%s\\n' \"$cleanup_rc\" >&2; "
@@ -1789,8 +1988,9 @@ def remote_worker_cleanup_trap(remote_tree, remote_tmpdir, remote_art, helper=No
         "if [ \"$worktree_created\" = 1 ]; then "
         f"{remote_dependency_scratch_cleanup(remote_tmpdir, remote_art)} "
         "cleanup_dependency_scratch; "
-        f"git -C ~/source/elanous-agent worktree remove --force {tree} >/dev/null 2>&1 || true; "
+        f"{remote_worktree_gc(remote_tree, '*/train-artifacts/batch-*/*-worktree')}"
         "else "
+        f"rm -f -- {shlex.quote(remote_tmpdir + '/' + SCRATCH_OWNER)}; "
         f"rmdir -- {shlex.quote(remote_tmpdir + '/state')} {scratch} >/dev/null 2>&1 || true; fi; "
         f"{helper_cleanup}"
         "git -C ~/source/elanous-agent worktree prune >/dev/null 2>&1 || true; "
@@ -2825,7 +3025,7 @@ def run_live(args):
                     raise RuntimeError(f'cannot resolve persistent artifact home on {host}')
                 remote_root = remote_batch_root(home_result.stdout.strip(), remote_id, suffix)
                 remote_tree = f'{remote_root}-worktree'
-                remote_tmpdir = f'{remote_root}-tmp'
+                remote_tmpdir = remote_scratch_path(home_result.stdout.strip(), remote_id, suffix)
                 remote_art = f'{remote_root}-art'
                 remote_tmp_resources.append({'host': host, 'tmp': remote_tmpdir, 'art': remote_art})
                 remote_bundle = gate_bundle['bundle'] if host == gate_bundle['host'] else f'{remote_root}.bundle'
@@ -2926,7 +3126,7 @@ def run_live(args):
                 suffix = f'timeout-remeasure-{host}'
                 remote_root = remote_batch_root(home_result.stdout.strip(), remote_id, suffix)
                 remote_tree = f'{remote_root}-worktree'
-                remote_tmpdir = f'{remote_root}-tmp'
+                remote_tmpdir = remote_scratch_path(home_result.stdout.strip(), remote_id, suffix)
                 remote_art = f'{remote_root}-art'
                 remote_tmp_resources.append({'host': host, 'tmp': remote_tmpdir, 'art': remote_art})
                 remote_bundle = gate_bundle['bundle'] if host == gate_bundle['host'] else f'{remote_root}.bundle'
@@ -2958,7 +3158,7 @@ def run_live(args):
                     raise RuntimeError(f'cannot resolve persistent artifact home on {host}')
                 remote_root = remote_batch_root(home_result.stdout.strip(), remote_id, suffix)
                 remote_tree = f'{remote_root}-worktree'
-                remote_tmpdir = f'{remote_root}-tmp'
+                remote_tmpdir = remote_scratch_path(home_result.stdout.strip(), remote_id, suffix)
                 remote_art = f'{remote_root}-art'
                 remote_tmp_resources.append({'host': host, 'tmp': remote_tmpdir, 'art': remote_art})
                 remote_bundle = gate_bundle['bundle'] if host == gate_bundle['host'] else f'{remote_root}.bundle'
@@ -2999,6 +3199,7 @@ def run_live(args):
                                         args.artifacts / 'remote-gate.stdout.log',
                                         integration_artifact, integration, chosen, primary_pr_files)
             retry_summary = None
+            gate_attempts = [summary]  # every gate summary of this batch, in order (primary, retry, handoff)
             gate_host = args.host
             timeout_files = gate_timeout_only_files(summary)
             timeout_only_attempted = bool(timeout_files)
@@ -3096,6 +3297,7 @@ def run_live(args):
                     (args.artifacts / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
                 # OP 10-28 20:4x: 열차 N개 — 재판정은 기본 «자기 호스트»(--retry-host). 남의 열차 호스트로 가면 두 게이트가 겹쳐 baseline 이 OOM(SIGKILL)으로 unmeasured 가 된다(193133).
                 retry_summary = args.artifacts / f'summary-{retry_host}-retry.json'
+                gate_attempts.append(retry_summary)
                 retry_plan = plan_retry_for_batch(
                     retry_rows, primary_pr_files, attributed=retry_attributed,
                     attributed_pr_files=retry_pr_files if retry_attributed else None)
@@ -3137,12 +3339,13 @@ def run_live(args):
                                                     'from': retry_host, 'to': handoff_host,
                                                     'summary': str(handoff_summary),
                                                     'integrationHead': retry_integration}
+                        gate_attempts.append(handoff_summary)
                         retry_summary = handoff_summary
                         retry_host = handoff_host
                         gate_host = handoff_host
                     (args.artifacts / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
             _, gate_invocations = select_gate_summary(
-                summary, retry_summary, args.base, retry_integration, retry_rows, retry_host)
+                summary, retry_summary, args.base, retry_integration, retry_rows, retry_host, attempts=gate_attempts)
             if retry_summary is not None:
                 summary = retry_summary
             final_summary = json.loads(summary.read_text())
@@ -3257,15 +3460,9 @@ def run_live(args):
             (args.artifacts / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
             return result
         finally:
-            try:
-                cleanup_remote_bundle_copies(remote_bundle_copies)
-            finally:
-                try:
-                    cleanup_remote_integrations(integration_resources)
-                finally:
-                    tmp_cleanup = cleanup_remote_batch_temps(remote_tmp_resources, log)
-                    if args.artifacts:
-                        (args.artifacts / 'tmp-cleanup.json').write_text(json.dumps(tmp_cleanup, indent=2) + '\n')
+            # Cleanup runs strictly after result.json/summary are written and is detached: a slow or failed
+            # cleanup (180 s timeout on `worktree remove --force` of a node_modules tree) never becomes a verdict.
+            run_detached_cleanups(args.artifacts, remote_bundle_copies, integration_resources, remote_tmp_resources, log)
     finally:
         try:
             release_acquired_lock(batch_lock_handle)

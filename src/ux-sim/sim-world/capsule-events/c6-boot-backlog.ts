@@ -97,11 +97,14 @@ const c6: SimWorldScenario = {
       // any other turn opens — one turn-start inside the person's turn window is red (OR).
       // 출처: 2026-11-19 병합 뒤 실측 — 자식 TUI 종료 직후 디버그 원장 플러시가 늦을 수 있다(판독 시점
       // 0행 → 수 초 뒤 35행). 판정은 원문 그대로: 최대 2초까지 100ms 간격으로 행이 보일 때까지 기다린다.
-      const ledgerDir = join(root, '.elanous', 'debug');
-      let ledger = turnLifeRows(ledgerDir);
+      // 출처: 2026-11-20 node-b 실측 — 우주가 소스 트리(.elanous-test) 안이면 debug/log.ts 가 원장을 `<cwd>/log`
+      // 로 보낸다(소스 경계 안 cwd). 두 위치를 모두 읽는다(한쪽만 채워진다).
+      const ledgerDirs = [join(root, '.elanous', 'debug'), join(root, 'log')];
+      const readLedger = () => ledgerDirs.flatMap(dir => turnLifeRows(dir));
+      let ledger = readLedger();
       for (let waitedMs = 0; ledger.length === 0 && waitedMs < 2_000; waitedMs += 100) {
         await new Promise(resolve => setTimeout(resolve, 100)); // 출처: 위 실측 — 플러시 유예
-        ledger = turnLifeRows(ledgerDir);
+        ledger = readLedger();
       }
       const personStart = ledger.findIndex(row => row.event === 'turn-life:turn-start' && rowField(row.data, 'door') === 'human');
       const personEnd = personStart >= 0

@@ -32,6 +32,21 @@ function door(dir: string, hitl?: () => Promise<HitlAnswer>, execute?: () => Pro
 const auditLines = (dir: string): { result: string; danger: string; reason?: string; chars: number; sha256: string; fromChars?: number; fromSha256?: string; text?: string }[] =>
   readFileSync(join(dir, 'control-audit.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { result: string; danger: string; reason?: string; chars: number; sha256: string; fromChars?: number; fromSha256?: string; text?: string });
 
+test('structural payload reaches the authorized executor intact', async () => {
+  const dir = stateDir();
+  allow(dir, [{ principal: 'OP', workspace: 'HQ', pane: 'p1', actions: ['rename', 'move', 'close'] }]);
+  const received: unknown[] = [];
+  const control = createControl({ stateDir: dir, execute: async (input) => { received.push(input); return { exitCode: 0, message: 'ok' }; } });
+  await control.run({ principal: cli, action: 'rename', target: agent, struct: { kind: 'tab', id: 't1', name: 'new name' } });
+  await control.run({ principal: cli, action: 'move', target: agent, struct: { kind: 'tab', id: 't1', before: 't2' }, confirm: true });
+  await control.run({ principal: cli, action: 'close', target: agent, confirm: true });
+  expect(received).toEqual([
+    { principal: cli, action: 'rename', target: agent, struct: { kind: 'tab', id: 't1', name: 'new name' } },
+    { principal: cli, action: 'move', target: agent, struct: { kind: 'tab', id: 't1', before: 't2' }, confirm: true },
+    { principal: cli, action: 'close', target: agent, confirm: true },
+  ]);
+});
+
 test('default deny: a missing allow list authorizes nobody and never executes', async () => {
   const dir = stateDir();
   const { control, ran } = door(dir);
@@ -331,11 +346,13 @@ test('a495bddd8d review (pin race): a revocation that lands while the list is pi
   allow(dir, [{ principal: 'OP', workspace: 'HQ', pane: 'main', actions: ['do'] }]);
   const ids = { workspace: (ref: string) => (ref === 'HQ' || ref === 'ws-1' ? 'ws-1' : undefined), pane: (ref: string) => (ref === 'main' || ref === 'pn-1' ? 'pn-1' : undefined) };
   const revoked = `${JSON.stringify({ rules: [] })}\n`;
-  expect(() => pinAllowList(dir, ids, { beforePin: () => { writeFileSync(join(dir, 'control-allow.json'), revoked); } })).toThrow();                                                    // this run fails closed
-  expect(readFileSync(join(dir, 'control-allow.json'), 'utf8')).toBe(revoked);  // the revocation was not restored
+  // main(#39060) 강화: 핀 도중 관리자 개정이 내려오면 이번 요청은 판정하지 않는다(fail-closed throw).
+  expect(() => pinAllowList(dir, ids, { beforePin: () => { writeFileSync(join(dir, 'control-allow.json'), revoked); } }))
+    .toThrow('control policy changed during pin');
+  expect(readFileSync(join(dir, 'control-allow.json'), 'utf8')).toBe(revoked);  // the revocation was kept, never overwritten
 });
 
-test('pin failure closes the entire policy, including previously stable id rows', () => {
+test('a495bddd8d review (pin fail): a pin whose write fails denies the name row this run; id rows keep working', () => {
   const dir = stateDir();
   allow(dir, [
     { principal: 'OP', workspace: 'ws-1', pane: 'pn-1', actions: ['do'] },
@@ -344,6 +361,7 @@ test('pin failure closes the entire policy, including previously stable id rows'
   const ids = { workspace: (ref: string) => (ref === 'HQ' || ref === 'ws-1' ? 'ws-1' : undefined), pane: (ref: string) => (ref === 'main' || ref === 'pn-1' ? 'pn-1' : undefined) };
   chmodSync(dir, 0o555);  // the stash write fails
   try {
+    // main(#39060) 강화: 핀 쓰기 실패는 조용히 넘어가지 않고 표면화된다(불완전한 핀으로 판정하지 않는다).
     expect(() => pinAllowList(dir, ids)).toThrow();
   } finally { chmodSync(dir, 0o700); }
 });

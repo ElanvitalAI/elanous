@@ -8,6 +8,7 @@
 // 모두 커맨드라인에 missionId 를 담으므로 registry 없이 pgrep 로 잡힌다.
 
 import { spawnSync } from 'node:child_process';
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 
 /** pgrep -f 패턴(순수·테스트 가능) — run-mission(빌드)·se-mission-prepare(분해) 둘 다 매칭.
  *  두 프로세스 모두 cmdline 에 missionId 를 담으므로 registry 없이 잡힌다. */
@@ -26,7 +27,7 @@ export function defaultFindExecutorPids(missionId: string): number[] {
 /** 프로세스 그룹 SIGTERM seam(테스트 주입). run-mission·se-mission-prepare 둘 다 detached 그룹리더라
  *  -pid 로 자식(sol/terra LLM 호출 등)까지 종료. */
 function defaultKillGroup(pid: number): void {
-  try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch { /* 이미 종료 */ } }
+  void terminateTree({ pid }, { group: true, pidFallback: true });
 }
 
 /**

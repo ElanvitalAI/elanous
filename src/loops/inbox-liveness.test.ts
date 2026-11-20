@@ -41,6 +41,10 @@ describe('classifySeatInbox — 파일 없음 = down', () => {
   test('ENOENT → down/∞', () => {
     expect(classifySeatInbox(join(tmpdir(), 'no-such-inbox-alive'), ID, NOW)).toEqual({ state: 'down', ageMs: Number.POSITIVE_INFINITY });
   });
+  test('읽기 실패는 파일 없음으로 오인하지 않는다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'inbox-read-error-'));
+    expect(classifySeatInbox(dir, ID, NOW)).toEqual({ state: 'unknown', reason: 'read-error' });
+  });
   test('깨진 JSON → invalid-beat', () => {
     const dir = mkdtempSync(join(tmpdir(), 'inbox-'));
     const p = join(dir, 'inbox.alive');

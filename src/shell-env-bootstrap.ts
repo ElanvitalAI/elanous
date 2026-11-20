@@ -163,12 +163,17 @@ export function runPrintenvCapture(): Record<string, string> | null {
   return parsed;
 }
 
+/** The documented opt-outs: no login shell is spawned and callers use `process.env`. */
+export function loginEnvOptedOut(): boolean {
+  return process.env.ELANOUS_SKIP_LOGIN_ENV === '1' || process.env.TERM_PROGRAM === 'monad-agent-nested';
+}
+
 /** Fill the login-env cache off the event loop (daemon boot). The first web-terminal spawn otherwise ran the
  *  `-l -i` printenv with spawnSync and froze the whole daemon for ~3 s (10-02 TERM1). A no-op once captured;
  *  a failed warm leaves the cache empty so `getCapturedEnv()` still tries (and falls back) as before. */
 export async function warmCapturedEnv(spawn: typeof Bun.spawn = Bun.spawn): Promise<boolean> {
   if (captured) return cached !== null;
-  if (process.env.ELANOUS_SKIP_LOGIN_ENV === '1' || process.env.TERM_PROGRAM === 'monad-agent-nested') return false;
+  if (loginEnvOptedOut()) return false;
   const seedStart = performance.now();
   const seed = captureSeed();
   logBootPhase('login-env.seed', seedStart, seed ? 'ready' : 'unavailable');
@@ -207,8 +212,7 @@ export function getCapturedEnv(): Record<string, string> {
   if (captured && cached) return cached;
   if (captured && !cached) return process.env as Record<string, string>;
 
-  if (process.env.ELANOUS_SKIP_LOGIN_ENV === '1'
-      || process.env.TERM_PROGRAM === 'monad-agent-nested') {
+  if (loginEnvOptedOut()) {
     captured = true;
     cached = null;
     debug.log('shell.envbootstrap.capture', 'skipped', {
@@ -263,10 +267,21 @@ export function mergeCapturedPath(target: NodeJS.ProcessEnv = process.env, opts:
   return added;
 }
 
-/** Reset cache — test seam. */
-export function resetCapturedEnvForTesting(): void {
+/** Forget the capture so the next warm/get runs the login shell again (its rc files changed). */
+export function invalidateCapturedEnv(): void {
   cached = null;
   captured = false;
+}
+
+/** Adopt a login env that a parent already captured: no login shell runs in this process. */
+export function adoptCapturedEnv(env: Record<string, string>): void {
+  cached = env;
+  captured = true;
+}
+
+/** Reset cache — test seam. */
+export function resetCapturedEnvForTesting(): void {
+  invalidateCapturedEnv();
 }
 
 /** Inject a synthetic env — test seam. */

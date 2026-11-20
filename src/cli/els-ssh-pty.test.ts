@@ -1,5 +1,8 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
+// A Unix socket path holds at most 103 bytes (macOS): the land train's long TMPDIR puts the els server/holder socket
+// under <state>/els/ over it, so a state dir under a long TMPDIR falls back to /tmp (each test removes its own dir).
+const SOCKET_SAFE_TMP = tmpdir().length > 40 ? '/tmp' : tmpdir();
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
 import { requestEls } from '../els/client.js';
@@ -22,7 +25,7 @@ const sh = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`;
 const run = privateSshdAvailable() ? test : test.skip;
 
 run('real ssh: bare els attaches to the resident server; detach keeps the pane; a second ssh sees the same pane; two ssh logins at once share one screen', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'els-ssh-'));
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'els-ssh-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const sshd: PrivateSshd = await startPrivateSshd();
   cleanups.push(() => sshd.stop());
@@ -55,16 +58,16 @@ run('real ssh: bare els attaches to the resident server; detach keeps the pane; 
   expect([ping.exitCode, /^els server pid \d+$/.test(ping.message)]).toEqual([0, true]);
   const left = JSON.parse((await requestEls(elsSocketPath(root), { op: 'ls' })).message) as { panes: { ptyId: string }[] };
   expect(left.panes).toHaveLength(1);
-  expect(left.panes[0]!.ptyId).toMatch(/^shell_[0-9a-f]{8}$/);                 // a live PTY id (an exited pane has an empty one)
+  expect(left.panes[0]!.ptyId).toMatch(/^h:p[0-9a-f]{8}$/);                    // a live PTY id: the holder adapter id h:<paneId> since D1a #39122 (an exited pane has an empty one)
 
   // 2b. two more workspaces, one with two tabs, made through the socket while nobody is attached.
   for (const [ws, title] of [['alpha', 'alpha-one'], ['alpha', 'alpha-two'], ['beta', 'beta-one']] as const) {
     expect((await requestEls(elsSocketPath(root), { op: 'new', ws, cwd: root, command: ['/bin/sh'], title })).exitCode).toBe(0);
   }
-  // ELS-ONE-SPACE (출처: JUD must #38640 · OP 89950 · 2026-11-18): every space is listed («alpha · 2»), but only the
+  // ELS-ONE-SPACE (출처: JUD must #38640 · OP 89950 · 2026-11-18): every space is listed («ALPHA»), but only the
   // SELECTED space's tabs are drawn — the other spaces' tab titles must stay absent from the screen.
   const everything = (screen: string): boolean =>
-    ['alpha · 2', 'beta · 1'].every((name) => screen.includes(name)) &&
+    ['ALPHA', 'BETA'].every((name) => screen.includes(name)) &&
     ['alpha-one', 'alpha-two', 'beta-one'].every((name) => !screen.includes(name));
 
   // 3. two more logins AT THE SAME TIME: each first screen lists every space (only the selected space's tabs), each shows the earlier output, and

@@ -1,0 +1,26 @@
+{
+  "id": "llm-sim-openrouter",
+  "name": "LLM sim OpenRouter credit",
+  "implementation": [
+    "src/ux-sim/llm-provider-world/credit-acp.ts"
+  ],
+  "tests": [
+    "src/ux-sim/llm-provider-world/credit-acp.test.ts"
+  ],
+  "target": "Fake OpenRouter credit row: balance, spend cap, auto top-up, per-call charge, 402 insufficient_credits and day/month spend as LlmSpendRowState",
+  "inputs": [
+    "an injected SimClock",
+    "fake balance, spend cap, auto top-up, session and alive switches"
+  ],
+  "observations": [
+    "402 insufficient_credits when balance is below call cost",
+    "auto top-up records a topup event and passes",
+    "observe() yields balance, autoTopUp and spend with byRole"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/llm-provider-world/credit-acp.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

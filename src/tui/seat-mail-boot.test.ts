@@ -6,6 +6,39 @@ import { MsgStore } from '../msg/msg-store.js';
 import { createNextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { createSeatMailHeaderHook, readSeatMailSnapshot, seatMailLine } from './seat-mail-boot.js';
 
+test('only an identified seat missing binding warns; track alone is not a seat', () => {
+  const root = mkdtempSync(join(tmpdir(), 'mail-bind-'));
+  const deps = { home: root, msgPath: join(root, 'missing.db'), env: { ELANOUS_TRACK: 'OPC' } };
+  try {
+    expect(createSeatMailHeaderHook(join(root, 'project'), deps)(null, null)).toBeNull();
+    expect(createSeatMailHeaderHook(join(root, 'seats', 'OPC'), deps)(null, null)).toContain('우편 감시 결속 실패: cwd/seat-state 없음');
+    mkdirSync(join(root, 'elanous-hq', 'seat-state', 'OPC'), { recursive: true });
+    expect(createSeatMailHeaderHook(join(root, 'project'), { ...deps, env: { ...deps.env, COORD_ID: 'OPC' } })(null, null)).toBe('OPC · 우편 0');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('header reflects watcher failure and recovery without breaking on getter errors', () => {
+  const root = mkdtempSync(join(tmpdir(), 'mail-watch-header-'));
+  mkdirSync(join(root, 'elanous-hq', 'seat-state', 'OPC'), { recursive: true });
+  try {
+    let status: import('./seat-mail-boot.js').SeatMailWatchStatus = 'starting';
+    let throws = false;
+    const watcher = { getStatus() { if (throws) throw new Error('bad observer'); return status; } };
+    const header = createSeatMailHeaderHook(join(root, 'seats', 'OPC'), { home: root, msgPath: join(root, 'none'), env: {} }, null, watcher);
+    expect(header(null, null)).toBe('OPC · 우편 0 · 우편 감시 starting');
+    status = 'start-error';
+    expect(header(null, null)).toContain('우편 감시 오류: start-error');
+    status = 'running';
+    expect(header(null, null)).toBe('OPC · 우편 0');
+    status = 'read-error';
+    expect(header(null, null)).toContain('우편 감시 오류: read-error');
+    status = 'running';
+    expect(header(null, null)).toBe('OPC · 우편 0');
+    throws = true;
+    expect(header(null, null)).toContain('우편 감시 오류: read-error');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('seat header warns on more than 100 unread while preserving the actual count', () => {
   expect(seatMailLine({ seat: 'TC', unread: 140 })).toBe('TC · 우편 140 ⚠ 100건 초과');
   expect(seatMailLine({ seat: 'TC', unread: 100 })).toBe('TC · 우편 100');

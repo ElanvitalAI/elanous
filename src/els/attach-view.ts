@@ -34,7 +34,11 @@ export function clipCells(text: string, width: number): string {
   return out;
 }
 
-const SGR = /(\u001b\[[0-9;]*m)/;
+// One escape sequence of the pane's ANSI frame. SGR keeps its colon sub-parameters (`4:1` underline style, `58:2::r:g:b`), which the
+// emulator emits for underlined cells; every other CSI, OSC (BEL or ST terminated, e.g. OSC 8 links) and two-byte escape is
+// dropped. Escapes cost no cells: only the characters between them are measured.
+const ESCAPE = /(\u001b\[[0-9;:]*m)|\u001b\[[0-9;:?<=> ]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|\u001b[^[\]]?/g;
+const isSgrReset = (sgr: string): boolean => /^\u001b\[0*(?:;0*)*m$/.test(sgr);
 
 /** `text` (may carry SGR colour sequences) cut to `width` terminal cells and padded; escapes cost no width, and any colour
  *  still open at the cut is closed with a reset so it cannot bleed into the next column. Other escapes are dropped. */
@@ -42,16 +46,24 @@ export function fitAnsi(text: string, width: number): string {
   let out = '';
   let used = 0;
   let styled = false;
-  for (const part of text.split(SGR)) {
-    if (SGR.test(part)) { out += part; styled = part !== '\u001b[0m' && part !== '\u001b[m'; continue; }
-    for (const { segment } of graphemes.segment(part.replace(/\u001b\[[0-9;?]*[A-Za-ln-z]/g, ''))) {
+  const close = (): string => `${styled ? `${ESC}[0m` : ''}${' '.repeat(Math.max(0, width - used))}`;
+  let from = 0;
+  const take = (plain: string): boolean => {
+    for (const { segment } of graphemes.segment(plain)) {
       const cells = Bun.stringWidth(segment);
-      if (used + cells > width) return `${out}${styled ? `${ESC}[0m` : ''}${' '.repeat(Math.max(0, width - used))}`;
+      if (used + cells > width) return false;
       out += segment;
       used += cells;
     }
+    return true;
+  };
+  for (const match of text.matchAll(ESCAPE)) {
+    if (!take(text.slice(from, match.index))) return `${out}${close()}`;
+    from = match.index + match[0].length;
+    if (match[1] !== undefined) { out += match[1]; styled = !isSgrReset(match[1]); }
   }
-  return `${out}${styled ? `${ESC}[0m` : ''}${' '.repeat(Math.max(0, width - used))}`;
+  if (!take(text.slice(from))) return `${out}${close()}`;
+  return `${out}${close()}`;
 }
 
 export interface ViewInput { readonly screen: string; readonly cols: number; readonly rows: number; readonly status: string }
@@ -105,8 +117,13 @@ export function createPrefixFilter(): { feed: (bytes: string) => { send: string;
   };
 }
 
-export const ENTER_VIEW = `${ESC}[?1049h${ESC}[2J${ESC}[H`;
-export const LEAVE_VIEW = `${ESC}[?1049l`;
+// Bare `els` (the app view) is mouse-driven: tab/button clicks arrive as SGR (1006) press reports, so the terminal must be asked
+// to send them (1000 = button reports). Disabled again in reverse order on leave.
+export const ENTER_VIEW = `${ESC}[?1049h${ESC}[?1000h${ESC}[?1006h${ESC}[2J${ESC}[H`;
+export const LEAVE_VIEW = `${ESC}[?1006l${ESC}[?1000l${ESC}[?1049l`;
+// `els attach <pane>` forwards raw stdin to the pane, so it must NOT turn mouse reporting on (the reports would land in the shell).
+export const ENTER_PANE_VIEW = `${ESC}[?1049h${ESC}[2J${ESC}[H`;
+export const LEAVE_PANE_VIEW = `${ESC}[?1049l`;
 
 // ---- Stage 3: the herdr-shaped screen — spaces on the left, the live pane in the middle, one status line --------------
 
@@ -118,12 +135,14 @@ export interface PaneRow {
   readonly pane: string; readonly wsId: string; readonly workspace: string; readonly title: string; readonly state: string;
   /** Set on a pane of another host (a registered els host or `herdr`): `pane` is then its full address `host:ws/tab/pane`. */
   readonly remote?: string;
-  /** ELS-REMOTE-MARKER: its host is reported down — the last known row stays in the list, dimmed and marked «?». */
+  /** ELS-REMOTE-MARKER: its host is reported down — the last known row stays in the list, dimmed and marked «✕». */
   readonly stale?: boolean;
+  /** ELS-SIDEBAR-HERDR-CLEAN: the pane's working folder (the selected space's path line). */
+  readonly cwd?: string;
 }
 
-/** Unreachable mark (design DESIGN-ELS-SIDETAB-SERVER §원격 «닿지 않음 ?»); «✕ host off» needs the host heartbeat (FU). */
-export const UNREACHABLE_MARK = '?';
+/** Mark of a host the federated list reports down (design DESIGN-ELS-SIDETAB-SERVER §원격 «⇄aws1 ✕»; same «✕ ⇄host · 연결 끊김» as the sidetab rows). */
+export const UNREACHABLE_MARK = '✕';
 
 function buildBadge(value: unknown): string {
   const build = value && typeof value === 'object' ? value as { sha?: unknown; age?: unknown } : {};
@@ -141,7 +160,7 @@ export function parsePaneRows(listJson: string): PaneRow[] {
     if (!raw || typeof raw !== 'object') continue;
     const row = raw as Record<string, unknown>;
     if (typeof row.pane !== 'string' || typeof row.address !== 'string') continue;
-    rows.push({ pane: row.pane, wsId: row.address.split('/')[0] ?? '', workspace: String(row.workspace ?? ''), title: `${String(row.title ?? row.pane)} ${buildBadge(row.build)}`, state: String(row.state ?? '') });
+    rows.push({ pane: row.pane, wsId: row.address.split('/')[0] ?? '', workspace: String(row.workspace ?? ''), title: `${String(row.title ?? row.pane)} ${buildBadge(row.build)}`, state: String(row.state ?? ''), ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
   return rows;
 }
@@ -165,14 +184,15 @@ export function parseRemoteRows(listJson: string): PaneRow[] {
     const split = row.host === 'herdr' ? title.indexOf(' · ') : -1;
     const label = split > 0 ? title.slice(0, split) : row.ws;
     rows.push({ pane: row.address, wsId: `${row.host}:${row.ws}`, workspace: `⇄${row.host} ${label}`, title: `${split > 0 ? title.slice(split + 3) : title || String(row.pane ?? row.address)} ${buildBadge(row.build)}`,
-      state: String(row.state ?? ''), remote: row.host });
+      state: String(row.state ?? ''), remote: row.host, ...(typeof row.cwd === 'string' && row.cwd ? { cwd: row.cwd } : {}) });
   }
   return rows;
 }
 
 /** Pane state → the shared status word (`exited` reads as done: the screen it left is still there). */
 export function wordOfState(state: string): StatusWord {
-  return state === 'working' ? 'working' : state === 'blocked' ? 'blocked' : state === 'idle' ? 'idle' : 'done';
+  // `failed` is a contract word no PaneState carries today; a list that says it (or a future server) must read as failed, not done.
+  return state === 'working' ? 'working' : state === 'blocked' ? 'blocked' : state === 'idle' ? 'idle' : state === 'failed' ? 'failed' : 'done';
 }
 
 const COLOR_SGR: Readonly<Record<StatusColor, string>> = { green: `${ESC}[32m`, yellow: `${ESC}[33m`, dim: `${ESC}[2m`, red: `${ESC}[31m` };
@@ -211,7 +231,10 @@ export function buildSidebar(rows: readonly PaneRow[], selected: string | undefi
   return shown;
 }
 
-export const sidebarWidthFor = (cols: number, open: boolean): number => open && cols >= MIN_COLS_FOR_SIDEBAR ? SIDEBAR_COLS : 0;
+/** ELS-NARROW-TAB-DROPDOWN: under this width the side list folds away and the tabs become one top row «emoji name ▾» that opens a list.
+ *  (80 = the plain terminal width; the done-line needs 60 to be narrow, so this is above the old 60-col hide.) Widening to it restores the side list. */
+export const NARROW_BELOW_COLS = 80;
+export const sidebarWidthFor = (cols: number, open: boolean): number => open && cols >= NARROW_BELOW_COLS ? SIDEBAR_COLS : 0;
 
 const CURSOR_HEADER = /^\[screen \d+x\d+ cursor=\(row (\d+), col (\d+), visible (true|false)\)\]\n/;
 
@@ -222,6 +245,8 @@ export interface ComposeInput {
   readonly tabRow?: string;
   /** ELS-EXIT-BG-BUTTONS: drawn at the right end of the status line (the status is cut to the room left). */
   readonly buttons?: string;
+  /** ELS-NARROW-TAB-DROPDOWN: the open tab list, drawn over the pane from the row under the top row (the cursor is hidden). */
+  readonly overlay?: readonly string[];
 }
 
 /** One full repaint: sidebar (when it fits) | pane, the status line last, and the terminal cursor put where the pane's is. */
@@ -237,6 +262,7 @@ export function composeView(view: ComposeInput): string {
     const centreText = row < top ? fitAnsi(view.tabRow!, centre) : fitAnsi(body[row - top] ?? '', centre);
     lines.push(`${sidebar ? `${fitAnsi(sidebar[row] ?? '', SIDEBAR_COLS)}│` : ''}${centreText}`);
   }
+  (view.overlay ?? []).forEach((text, at) => { if (at + 1 < lines.length) lines[at + 1] = fitAnsi(text, view.cols); });
   // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ — status 는 리터럴 그대로 (패딩 없이; trimRight 화면 판독과 양립)
   // ELS-FIRST-RUN-FU3 ①: cut to the width (no padding) — a long status on a narrow terminal must not wrap and push the
   // whole repaint up a line.
@@ -246,7 +272,7 @@ export function composeView(view: ComposeInput): string {
   lines.push(`${REVERSE}${status}${buttons ? `${' '.repeat(room - Bun.stringWidth(status))}${ESC}[0m${buttons}` : ''}${ESC}[0m`);
   const cursorRow = header ? Number(header[1]) + top : -1;
   const cursorCol = header ? Number(header[2]) : -1;
-  const showCursor = header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;
+  const showCursor = !view.overlay && header !== null && header[3] === 'true' && cursorRow < view.rows - 1 && cursorCol < centre;
   const place = showCursor ? `${ESC}[${cursorRow + 1};${left + cursorCol + 1}H${ESC}[?25h` : `${ESC}[?25l`;
   return `${ESC}[?25l${ESC}[H${lines.join('\r\n')}${place}`;
 }

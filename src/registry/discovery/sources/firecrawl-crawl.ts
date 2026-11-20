@@ -31,6 +31,7 @@
 //   src/storage/s3.ts (availability-probe precedent)
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { terminateTree, type TerminateTreeResult } from '../../../shell-primitive/terminate-tree.js';
 import { getFirecrawlConfigAsync } from '../config.js';
 import {
   extractCrawlJson,
@@ -49,7 +50,6 @@ const CLI_VERSION_TIMEOUT_MS = 3_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const KILL_GRACE_MS = 250;
 const POST_KILL_WAIT_MS = 250;
-const TREE_POLL_MS = 20;
 
 /** Probe `firecrawl --version`. Returns false when the binary is
  *  missing or any spawn error occurs (PATH wrong, permission denied).
@@ -128,25 +128,6 @@ export type FirecrawlSpawnFn = (
   opts: FirecrawlSpawnOpts,
 ) => FirecrawlSpawnResult | Promise<FirecrawlSpawnResult>;
 
-function killProcessTree(
-  child: ChildProcess,
-  pgid: number | undefined,
-  signal: 'SIGTERM' | 'SIGKILL',
-): void {
-  if (typeof pgid === 'number') {
-    try {
-      process.kill(-pgid, signal);
-    } catch {
-      /* process group may already be gone, or unsupported on this platform */
-    }
-  }
-  try {
-    child.kill(signal);
-  } catch {
-    /* already dead */
-  }
-}
-
 /** ⛔ 「그룹이 없다」와 「이 플랫폼에선 물어볼 수 없다」를 한 값으로 접지 않는다.
  *  음수 PGID 시그널은 POSIX 규약이고, 지원하지 않는 플랫폼(Windows 등)에서는
  *  `process.kill(-pgid, 0)` 이 EINVAL/ENOSYS/EPERM 으로 실패한다. 그것을 `false`
@@ -177,14 +158,18 @@ export function sliceUtf8AtBoundary(buf: Buffer, limit: number): Buffer {
   return buf.subarray(0, end);
 }
 
-function probeProcessGroup(pgid: number | undefined): ProcessGroupState {
-  if (typeof pgid !== 'number') return 'unobservable';
-  try {
-    process.kill(-pgid, 0);
-    return 'alive';
-  } catch (err) {
-    return classifyProcessGroupError((err as NodeJS.ErrnoException).code);
+/** terminateTree 결과 → 세 상태. ⛔ 확인된 «소멸»만 'exited' — 확인 못 한 것을 끝났다고 접지 않는다.
+ *  SIGKILL 뒤에도 그룹이 남아 있으면 'alive'(우리가 «살아 있음을 확인»), 그룹을 «물을 수 없으면»
+ *  (pid 없음 · 플랫폼 미지원 · EPERM 외 probe 오류) 'unobservable'. */
+function treeStateOf(outcome: TerminateTreeResult): ProcessGroupState {
+  if (outcome.terminated) return 'exited';
+  if (outcome.errors.includes('SIGKILL: target still present')) return 'alive';
+  // 신호·probe 오류 코드는 기존 분류기로 — EPERM=alive · 그 밖(EINVAL·ENOSYS·미상)=unobservable.
+  for (const e of outcome.errors) {
+    const code = /(?:probe |: )(E[A-Z]+)$/.exec(e)?.[1];
+    if (code === 'EPERM') return classifyProcessGroupError(code);
   }
+  return 'unobservable';
 }
 
 function spawnCommand(
@@ -222,7 +207,6 @@ function spawnCommand(
       detached: true,
       env: opts.env ?? process.env,
     });
-    const pgid = typeof child.pid === 'number' ? child.pid : undefined;
 
     const cleanup = (): void => {
       if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
@@ -253,31 +237,6 @@ function spawnCommand(
       }
     };
 
-    const waitForTreeExit = (reason: FirecrawlKillReason): void => {
-      const deadline = Date.now() + POST_KILL_WAIT_MS;
-      const poll = (): void => {
-        if (settled) return;
-        const state = probeProcessGroup(pgid);
-        if (state === 'exited') {
-          finishForcedKill(reason, 'exited');
-          return;
-        }
-        if (state === 'unobservable') {
-          // 이 플랫폼에선 그룹을 물어볼 수 없다. 기다려 봐야 답이 안 나오므로
-          // ⛔ 「끝났다」로 접지 말고 «모른다»를 그대로 낸다.
-          finishForcedKill(reason, 'unobservable');
-          return;
-        }
-        if (Date.now() >= deadline) {
-          // 기다리기를 그만뒀다 — 그룹은 «살아 있는 것을 확인»한 상태다.
-          finishForcedKill(reason, 'alive');
-          return;
-        }
-        forceTimer = setTimeout(poll, TREE_POLL_MS);
-      };
-      poll();
-    };
-
     const beginKill = (reason: FirecrawlKillReason): void => {
       if (settled || killReason) return;
       killReason = reason;
@@ -285,13 +244,11 @@ function spawnCommand(
         clearTimeout(timeoutTimer);
         timeoutTimer = undefined;
       }
-      killProcessTree(child, pgid, 'SIGTERM');
-      // Shell `close` must not cancel this: SIGTERM-ignoring grandchildren
-      // stay in the process group and need the SIGKILL escalation.
-      graceTimer = setTimeout(() => {
-        killProcessTree(child, pgid, 'SIGKILL');
-        waitForTreeExit(reason);
-      }, KILL_GRACE_MS);
+      // KILL-TREE-ONE — SIGTERM → 유예 → SIGKILL → 그룹 소멸 확인은 공용 terminateTree 한 곳이 한다.
+      // Shell `close` must not cancel this: SIGTERM-ignoring grandchildren stay in the process
+      // group and need the SIGKILL escalation (`close` early-returns while killReason is set).
+      void terminateTree(child, { group: true, graceMs: KILL_GRACE_MS, killWaitMs: POST_KILL_WAIT_MS })
+        .then((outcome) => { finishForcedKill(reason, treeStateOf(outcome)); });
     };
 
     /** 상한에 닿으면 파이프를 «끊는다». destroy 가 실패해도 위의 조기 반환이

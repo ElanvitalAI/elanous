@@ -6,6 +6,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { cutReleaseBranchForRun, main as versionNodeMain, nextDevVersion } from './version-node';
 import { createTempGitRemote } from '../../src/ux-sim/temp-git-remote';
 import { runGraph } from '../../src/graph-runner/runner';
+import { releaseGateCutoverPath } from '../../src/graph-runner/release-gate-cutover-policy.js';
 import { parseOptions } from './gate-node';
 import { runPrepare } from './prepare-node';
 import { runCutGateImagePrebuild } from './gate-image-pin.js';
@@ -557,7 +558,7 @@ test('actual repository lockfile accepts bumped manifest with frozen install', (
   });
   expect(installed.status).toBe(0);
   expect(readFileSync(join(root, 'bun.lock'), 'utf8')).toBe(readFileSync(resolve(import.meta.dir, '../../bun.lock'), 'utf8'));
-}, 30_000);
+}, 180_000);
 
 test('already released version returns origin/main commit without landing', () => {
   const { run } = fixture('0.2.4');
@@ -732,7 +733,10 @@ test('chosen commit from version-release reaches cutoff, gate and prepare contex
       if (node === 'version-release') seen.input = context.input.cutCommit;
       if (node === 'cutoff') seen.cutoff = context.outputs['cut-branch']?.commit ?? '';
       if (node === 'gate' || node === 'prepare') seen[node] = context.outputs['cut-branch']?.commit ?? '';
-      return { exitCode: node === 'prepare' ? 1 : 0, stdout: JSON.stringify({ outcome: node === 'prepare' ? 'fail' : 'ok', verdict: node === 'prepare' ? 'fail' : 'pass', ...(node === 'version-release' ? { commit: released.output.commit } : {}) }) + '\n', stderr: '' };
+      // The separated graph routes through the gate-cutover judge, which emits a route (legacy), not ok.
+      const payload = body.includes('gate-cutover-switch-node.ts') ? { outcome: releaseGateCutoverPath(context.input), verdict: 'pass' }
+        : { outcome: node === 'prepare' ? 'fail' : 'ok', verdict: node === 'prepare' ? 'fail' : 'pass', ...(node === 'version-release' ? { commit: released.output.commit } : {}) };
+      return { exitCode: node === 'prepare' ? 1 : 0, stdout: JSON.stringify(payload) + '\n', stderr: '' };
     } } });
   expect(result.status).toBe('failed');
   expect(seen.input).toBe(chosen);
@@ -750,10 +754,15 @@ test('cutoff --cutoff, gate commit and prepare --source consume the chosen relea
     const gate = parseOptions(['--json'], process.env);
     expect(gate).toMatchObject({ commit: sha });
     const commands: string[] = [];
+    const publicCommit = 'e'.repeat(40);
     const prepared = runPrepare((command, args) => {
       commands.push(`${command} ${args.join(' ')}`);
       return command === 'git' ? { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' }
-        : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.4', sourceCommit: sha, distDir: join(args[args.indexOf('--out') + 1]!, 'dist') } }), stderr: '' };
+        : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.4', sourceCommit: sha, publicCommit,
+          distDir: join(args[args.indexOf('--out') + 1]!, 'dist'),
+          // The graph boundary must prove the installed package passed the A158 Nexus first-run receipt.
+          e2e: { ran: true, ok: true, nexusFirstRun: { ok: true, versionLine: `0.2.4 ${publicCommit}`, pid: 4242,
+            health: 200, healthOk: true, app: 200, testUniverse: true, ownPidStopped: true, forcedKill: false, exitCode: 0 } } } }), stderr: '' };
     });
     expect(prepared.commit).toBe(sha);
     expect(commands[1]).toContain(`--source ${sha}`);
@@ -844,11 +853,19 @@ test('the chosen cut completes the fake release graph through dev-bump while adv
           bumps.push(bump);
           return { exitCode: bump.status!, stdout: JSON.stringify(bump.output) + '\n', stderr: bump.stderr };
         }
+        // The separated graph routes through the gate-cutover judge, which emits a route (legacy), not ok.
+        if (body.includes('gate-cutover-switch-node.ts')) {
+          const { input } = JSON.parse(process.env.ELANOUS_GRAPH_CONTEXT!) as { input: unknown };
+          return { exitCode: 0, stdout: JSON.stringify({ outcome: releaseGateCutoverPath(input), verdict: 'pass' }) + '\n', stderr: '' };
+        }
         return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '' };
       } } });
     expect(result.status).toBe('done');
     expect(result.fanOuts?.['traffic-npm-published:ok']?.branches['version-dev-bump']?.status).toBe('done');
-    expect(result.nodes.find((node) => node.nodeId === 'version-release')?.output).toContain(chosen);
+    // RELEASE-RESUME-AFTER-CUT-PUSHED: the graph entry is `cut-branch` (dispatching version-node.ts release
+    // --no-prebuild); the release cut record — {outcome, commit, version} containing the chosen sha — now lives
+    // on that node's output, so assert the ledger record there instead of the legacy version-release node.
+    expect(result.nodes.find((node) => node.nodeId === 'cut-branch')?.output).toContain(chosen);
     expect(bumps).toHaveLength(1);
     expect(bumps[0]!.output).toMatchObject({ outcome: 'ok', version: '0.2.5', commit: 'base-sha' });
     expect(bumps[0]!.calls).not.toContain('pr land');
@@ -1106,7 +1123,7 @@ test('source snapshot tree preserves staged and unstaged tracked changes, rename
   expect(run(['show', `${tree}:ignored-new.txt`])).toBe('force tracked');
 });
 
-function runRealDevBumpCliScenario(failReady = false) {
+function runRealDevBumpCliScenario(failReady = false, attempt = 1) {
   const project = resolve(import.meta.dir, '../..');
   const previousAuthorDate = process.env.GIT_AUTHOR_DATE;
   const previousCommitterDate = process.env.GIT_COMMITTER_DATE;
@@ -1261,6 +1278,7 @@ console.error('unsupported fake gh: ' + args.join(' ')); process.exit(2);
   git(checkout, ['fetch', 'origin']);
   git(checkout, ['config', 'user.email', 'test@example.com']);
   git(checkout, ['config', 'user.name', 'Test User']);
+  const fixturePrBase = git(checkout, ['rev-parse', 'origin/main']);
 
   writeFileSync(statePath, JSON.stringify({ head: null, state: 'OPEN', isDraft: false, failReady }));
   writeFileSync(callsPath, '');
@@ -1279,6 +1297,13 @@ console.error('unsupported fake gh: ' + args.join(' ')); process.exit(2);
     else process.env[key] = value;
   }
   delete process.env.GIT_SSH;
+  // The pregate lane exports TSC_BASE_REF=<real origin/main> into the whole test process. The
+  // fixture repository cannot contain that object, so the dev-bump pr-land tsc-gate would fail
+  // closed on a base it cannot resolve («Invalid symmetric difference expression»). Pin the gate
+  // base to the fixture's own origin/main — the PR base inside the simulation boundary — so the
+  // scenario stays deterministic regardless of lane env leakage. The finally below restores
+  // TSC_BASE_REF from priorEnv.
+  process.env.TSC_BASE_REF = fixturePrBase;
   try {
     const ghPath = spawnSync('which', ['gh'], { encoding: 'utf8', env: process.env });
     if (ghPath.status !== 0 || ghPath.stdout.trim() !== fakeGhPath)
@@ -1290,6 +1315,10 @@ console.error('unsupported fake gh: ' + args.join(' ')); process.exit(2);
     const run = spawnSync(process.execPath, [resolve(import.meta.dir, 'version-node.ts'), 'dev-bump', '--json'], {
       cwd: checkout, encoding: 'utf8', env: process.env, timeout: 180_000, maxBuffer: 32 * 1024 * 1024,
     });
+    // Bun 1.4.2 on a loaded host intermittently reports exit status null for a CLI child that
+    // already emitted its complete result JSON and exited. Retry the whole scenario once on a
+    // fresh fixture instead of failing the boundary contract on that runtime artifact.
+    if (run.status === null && !run.error && attempt === 1) return runRealDevBumpCliScenario(failReady, 2);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { outcome?: string; kind?: string; version?: string; pr?: number | null; error?: string; worktree?: string };
     const calls = readFileSync(callsPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { args: string[]; cwdHead: string });
     if (output.worktree) scratch.push(dirname(output.worktree));

@@ -105,7 +105,7 @@ const GOOD_EVIDENCE = {
   image: { expectedDigest: `sha256:${'b'.repeat(64)}`, observedDigest: `sha256:${'b'.repeat(64)}` },
   workOrder: { cellId: 'CELL-A', boundary: 'src/a.ts', budget: '6900s', contract: 'c', escalation: 'OP', unknownFields: [],
     owner: 'TC', card: 'card-1', noAutoMerge: true, budgetLimits: { timeSec: 6900, usdCap: 5 } },
-  launchArgv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge', 'synthetic goal'],
+  launchArgv: ['harness', 'say', '--substrate', 'pod', '--no-auto-merge', '대상 경로: target.ts'],
   mergePolicy: { taLandEnv: false, liveMovesProposeLand: false },
   owner: { card: 'TC', lease: 'TC', pod: 'TC' },
   limits: { wallClockSec: 6900, jobDeadlineSec: 10800, usdCap: 5 },
@@ -118,9 +118,10 @@ async function runPreflight(evidence: unknown, args: string[], outName: string):
   const out = join(dir, `${outName}.json`);
   const taskStatePath = join(dir, `${outName}.cards.json`);
   writeFileSync(evidencePath, JSON.stringify(evidence));
-  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'card-1': { id: 'card-1', text: 'synthetic goal', status: 'handed', history: [] } } }));
+  writeFileSync(join(dir, 'target.ts'), '');
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'card-1': { id: 'card-1', seat: 'TC', text: '대상 경로: target.ts', project: { target: dir }, status: 'handed', history: [] } } }));
   const program = new Command().name('elanous').exitOverride();
-  registerTasksCommands(program, { output: () => {}, taskStatePath, preflightActiveRuns: () => [], preflightHoldActive: () => false });
+  registerTasksCommands(program, { output: () => {}, taskStatePath, preflightActiveRuns: () => [], preflightHoldActive: () => false, preflightAllocation: () => null });
   const previous = process.exitCode;
   process.exitCode = undefined;
   try {
@@ -130,16 +131,16 @@ async function runPreflight(evidence: unknown, args: string[], outName: string):
   } finally { process.exitCode = previous ?? 0; }
 }
 
-test('end to end: a receipt made by `tasks preflight --out` passes the launch door for its own launch and is refused otherwise', async () => {
+test('end to end: an unbound target host remains NOT_READY and the launch door refuses it', async () => {
   const ready = await runPreflight(GOOD_EVIDENCE, ['--card', 'card-1', '--cell', 'CELL-A', '--commit', `commit:${SHA}`], 'ready');
-  expect(ready.exit).toBe(0);
+  expect(ready.exit).toBe(1);
   const d = door({ holdFile: NONE(), receiptPath: ready.path, receiptSha256: ready.sha });
   const id = d.requestId('e2e-1');
   // 다른 카드/commit 발사 → 거부(force 포함)
   expect(d.consume(id, { ta: true, force: true, target: { card: 'card-9', cell: 'CELL-A', commit: SHA } }).status).toBe('refused');
   expect(d.consume(id, { ta: true, target: { card: 'card-1', cell: 'CELL-A', commit: 'c'.repeat(40) } }).status).toBe('refused');
-  // 자기 발사 → 통과
-  expect(d.consume(id, { ta: true, target: { card: 'card-1', cell: 'CELL-A', commit: SHA } }).status).toBe('consumed');
+  // The matching card is still refused until the observed host is bound to the allocation.
+  expect(d.consume(id, { ta: true, target: { card: 'card-1', cell: 'CELL-A', commit: SHA } }).status).toBe('refused');
 
   // NOT_READY 영수증(증거 일부 미측정) → exit 1 이고 관문도 거부
   const notReady = await runPreflight({ ...GOOD_EVIDENCE, image: undefined }, ['--card', 'card-1', '--cell', 'CELL-A'], 'notready');

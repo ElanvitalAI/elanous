@@ -1,6 +1,6 @@
 import type { ObservatorySubject } from '@/components/observatory/subject-list';
 import { DaemonClient, type DaemonLogEntry } from '@/lib/daemon-client';
-import { loadDaemonConfig } from '@/lib/daemon-config';
+import { isBareWebChatOrigin, loadDaemonConfig } from '@/lib/daemon-config';
 import { buildActivitySnapshot, type ShellActivitySnapshot } from './activity-snapshot';
 
 type TerminalsResponse = { subjects?: ObservatorySubject[] };
@@ -27,6 +27,9 @@ function configuredClient(): DaemonClient {
 export async function fetchActivitySnapshot(
   deps: ActivityFetchDeps = {},
 ): Promise<ShellActivitySnapshot> {
+  // bare 핸들 호스트(익명 웹채팅): 릴레이가 /v1/terminals · /v1/logs 를 넘기지 않는다(404) — 활동 줄은 조용히 둔다.
+  // 물어봐야 «활동 정보를 못 불러옴» 만 무대에 뜬다(MK #112921). 요청 0.
+  if (isBareWebChatOrigin()) return { kind: 'quiet' };
   const client = deps.fetchImpl ? undefined : deps.client ?? configuredClient();
   const fetchTerminals = (): Promise<Response> => deps.fetchImpl ? deps.fetchImpl('/v1/terminals') : client!.fetchResponse('/v1/terminals');
   // Both requests take the same path: 401 = not connected (quiet, the connect card says it); any other failure is an

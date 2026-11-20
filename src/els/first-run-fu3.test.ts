@@ -63,17 +63,17 @@ test('③ herdr spaces fold into one «herdr» bundle below my spaces; it opens 
   ] }));
   const rows = [...herdr, ...local];
   const trim = (lines: readonly string[]) => lines.map((line) => line.replace(/\u001b\[[0-9;]*m/g, '').trimEnd());
-  expect(trim(buildSpaceList(rows, 'p1', 30, 4))).toEqual(['▸○ ux · 1', ' ⊞ herdr · 2', ' + new · ≡ menu', '']);
-  expect(trim(buildSpaceList(rows, 'herdr:w2/t0/p0', 30, 5))).toEqual([' ○ ux · 1', ' ⊟ herdr · 2', '   ● ⇄herdr OP · 1', '  ▸○ ⇄herdr TC · 1', ' + new · ≡ menu']);
+  expect(trim(buildSpaceList(rows, 'p1', 30, 4))).toEqual([' spaces', ' ○ UX', ' ⊞ HERDR · 2', ' new · menu']);
+  expect(trim(buildSpaceList(rows, 'herdr:w2/t0/p0', 30, 6))).toEqual([' spaces', ' ○ UX', ' ⊟ HERDR · 2', '   ● ⇄HERDR OP', '   ○ ⇄HERDR TC', ' new · menu']);
 });
 
-test('④ (OP #101592 · #101606) focus marker: the tab row is «emoji name» like herdr, the focused tab and the selected space are reverse video, and the block moves with the focus', () => {
+test('④ (OP #101592 · #101606) focus marker: the tab row is padded UPPERCASE «emoji NAME» like herdr (focused blue, others gray, ELS-TAB-STYLE-HERDR), the selected space is reverse video, and the block moves with the focus', () => {
   const LS = JSON.stringify({ panes: [
     { address: 'op/t1/p1', workspace: 'op', pane: 'p1', title: 'OP', state: 'working', command: ['/usr/local/bin/eln'], build: { sha: 'c8db6fc953e4', age: 'current' } },
     { address: 'op/t1/p2', workspace: 'op', pane: 'p2', title: '/bin/zsh', state: 'idle', command: ['/bin/zsh'] },
   ] });
   const rows = withCommands(parsePaneRows(LS), LS);
-  expect(buildTabRow(rows, 'p1', 20).line).toBe('\u001b[7m💬 OP\u001b[27m  ⌨️ zsh  +    ');
-  expect(buildTabRow(rows, 'p2', 20).line).toBe('💬 OP  \u001b[7m⌨️ zsh\u001b[27m  +    ');
-  expect(buildSpaceList(rows, 'p2', 12, 2)[0]).toBe('\u001b[7m▸● op · 2   \u001b[27m');
+  expect(buildTabRow(rows, 'p1', 20).line).toBe('\u001b[44;37m 💬 OP \u001b[49;39m \u001b[100;37m ⌨️ ZSH \u001b[49;39m +  ');
+  expect(buildTabRow(rows, 'p2', 20).line).toBe('\u001b[100;37m 💬 OP \u001b[49;39m \u001b[44;37m ⌨️ ZSH \u001b[49;39m +  ');
+  expect(buildSpaceList(rows, 'p2', 12, 3)[1]).toBe('\u001b[7m ● OP       \u001b[27m');
 });

@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-LLM-PROVIDER-WORLD-WORLD-TS",
+  "path": "src/ux-sim/llm-provider-world/world.ts",
+  "boundary": "Assembles one fake LLM provider world around a single shared SimClock (codex x3, Claude x2, OpenRouter credit, claude-acp, supply targets, remote host) and exposes states() as LlmSpendRowState rows; no real key, token, network or host is touched",
+  "deviceIds": ["llm-sim-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

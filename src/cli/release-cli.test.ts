@@ -323,6 +323,7 @@ test('recovery apply executes the real release graph from gate through gate-tria
     runBash: async (body) => {
       commands.push(body);
       visits.push(body.includes('gate-node.ts') ? 'gate' : body.includes('gate-triage-node.ts') ? 'gate-triage'
+        : body.includes('cloud-elastic-node.ts leave') ? 'cloud-leave'
         : body.includes('traffic-node.ts traffic-failed-restore') ? 'traffic-failed-restore' : 'unexpected');
       return { stdout: '{"outcome":"fail"}', stderr: '', exitCode: 1 };
     },
@@ -337,10 +338,11 @@ test('recovery apply executes the real release graph from gate through gate-tria
     expect(result).toMatchObject({ ok: true, recovery: 'resumed', runId: fixture.runId, status: 'awaiting-approval',
       state: { pending: { nodeId: 'gate-heal-decision' } } });
     expect(process.exitCode).toBe(0);
-    expect(visits).toEqual(['gate', 'gate-triage']);
-    expect(commands).toHaveLength(2);
+    expect(visits).toEqual(['gate', 'cloud-leave', 'gate-triage']);
+    expect(commands).toHaveLength(3);
     expect(commands[0]).toContain('gate-node.ts');
-    expect(commands[1]).toContain('gate-triage-node.ts');
+    expect(commands[1]).toContain('cloud-elastic-node.ts leave');
+    expect(commands[2]).toContain('gate-triage-node.ts');
     expect(result.state.nodes.filter((node) => node.nodeId === 'gate')).toHaveLength(1);
     expect(result.state.nodes.filter((node) => node.nodeId === 'gate-triage')).toHaveLength(1);
     expect(result.state.nodes.filter((node) => node.nodeId === 'mac-smoke')).toHaveLength(0);
@@ -440,7 +442,7 @@ test('recovery apply write-fence denial does not invoke the resume graph', async
   const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
   const fixture = await seedFailedReleaseRun(root);
   const store = fileLeaseStore(join(instance, 'hq', 'lease.json'), () => 100);
-  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(instance, 'hq', 'local.json'),
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, hostPath: join(tmpdir(), 'release-cli-test-no-host-marker-' + process.pid), localPath: join(instance, 'hq', 'local.json'),
     seenPath: join(instance, 'hq', 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
   let runBashCalls = 0;
   const rehearsalDeps: RehearsalDeps = { schedules: () => [], lightRc: async () => { throw new Error('write fence bypassed'); } };
@@ -467,7 +469,7 @@ test('recovery apply write-fence denial does not invoke the resume graph', async
 test('rehearsal CLI no-option tick forwards planned shards and records a measured gate failure as error', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-cli-gate-'));
   const exit = process.exitCode;
-  const lines: string[] = [], selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const lines: string[] = [], selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean; fullFallback?: { plannedShards: number; reason: string } }> = [];
   const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
   const version = '0.2.23', cutAt = '2026-10-10T13:00:00Z';
   const deps: RehearsalDeps = {
@@ -475,6 +477,7 @@ test('rehearsal CLI no-option tick forwards planned shards and records a measure
     schedules: () => [{ version, cutAt } as ReturnType<NonNullable<RehearsalDeps['schedules']>>[number]],
     git: args => ({ rc: 0, stdout: args[0] === 'rev-parse' ? 'a'.repeat(40) : '' }),
     leakCheck: () => ({ status: 0 }),
+    cloudVmAdapter: { start: async () => {}, stop: async () => {}, status: async () => ({ host: 'aws1', state: 'running' }) },
     shardPlan: () => ({ shards: 2, testFiles: 7, gatePlanShards: 4, resources: { cpus: 2, freeBytes: 2e9, totalBytes: 4e9 }, unmeasured: 'sufficiency threshold not measured' }),
     lightRc: async (_version, _checkout, selection) => {
       selections.push(selection);
@@ -488,10 +491,11 @@ test('rehearsal CLI no-option tick forwards planned shards and records a measure
     process.exitCode = 0;
     await cmd.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
     expect(process.exitCode).toBe(1);
-    expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true }]);
+    expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true,
+      fullFallback: { plannedShards: 2, reason: expect.stringContaining('planned shard count 2 does not match') } }]);
     const tick = JSON.parse(lines[0]!) as { ok: boolean; stamps: Array<{ step: string }> };
     expect(tick.ok).toBe(false);
-    expect(tick.stamps.find(stamp => stamp.step === 'rc-7h')).toMatchObject({ outcome: 'error', selection: { shards: 2 }, shardPlan: { testFiles: 7, unmeasured: 'sufficiency threshold not measured' }, result: { gateExitCode: 1 } });
+    expect(tick.stamps.find(stamp => stamp.step === 'rc-7h')).toMatchObject({ outcome: 'error', selection: { shards: 4, fullFallback: { plannedShards: 2 } }, shardPlan: { testFiles: 7, unmeasured: 'sufficiency threshold not measured' }, result: { gateExitCode: 1 } });
     expect(JSON.parse(readFileSync(join(root, 'release', version, 'rehearsal', 'rc-7h.json'), 'utf8'))).toMatchObject({ outcome: 'error', shardPlan: { testFiles: 7 }, result: { gateExitCode: 1 } });
   } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
 });
@@ -917,7 +921,7 @@ describe('release checklist CLI', () => {
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
       // recover-landing is part of this PR's CLI surface; keep the registered command and its help discoverable.
-      expect(release.commands.map((c) => c.name())).toEqual(['status', 'gate-shards', 'schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'recover-landing', 'gate-history', 'rehearsal', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['status', 'critpath', 'gate-shards', 'schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'traffic-prep', 'preflight', 'light-rc', 'resume', 'recover', 'recover-landing', 'gate-history', 'rehearsal', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'recover-landing')!.helpInformation()).toContain('착지 알림 수동 재생 입구');
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
@@ -1000,6 +1004,7 @@ describe('release checklist CLI', () => {
   test('owner 필터는 자리와 하위 자리 경계를 지키고 claim CLI 의 강제 이력이 JSON 에 보인다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-claim-cli-'));
     setElanousConfigDir(dir);
+    const oldTrack = process.env.ELANOUS_TRACK;
     const lines: string[] = [];
     const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
     const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
@@ -1021,11 +1026,14 @@ describe('release checklist CLI', () => {
       }
       await run('status', '--json');
       expect(JSON.parse(lines.at(-1)!).bySeat).toEqual({ TC: 2, MK: 1 });
+      process.env.ELANOUS_TRACK = 'TC';
       await run('claim', 'B', '--by', 'TC/rel', '--json');
       expect(JSON.parse(lines.at(-1)!).history.at(-1)).toMatchObject({ field: 'claim', from: 'TC', to: 'TC/rel' });
-      await expect(run('claim', 'A', '--by', 'TC/docs')).rejects.toThrow('지금 주인: TC/rel — --force 로만 바꾼다');
-      await run('claim', 'C', '--by', 'TC/docs', '--force', '--json');
-      expect(JSON.parse(lines.at(-1)!).history.at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/docs', force: true });
+      process.env.ELANOUS_TRACK = 'MK';
+      await expect(run('claim', 'A', '--by', 'TC/docs')).rejects.toThrow('칸 주인 또는 OP만 claim 할 수 있다 (caller: MK)');
+      process.env.ELANOUS_TRACK = 'OP';
+      await run('claim', 'C', '--by', 'TC/docs', '--force', '--reason', 'fixture repair', '--json');
+      expect(JSON.parse(lines.at(-1)!).history.at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/docs', force: true, reason: 'fixture repair' });
       await run('history', 'C', '--json');
       expect(JSON.parse(lines.at(-1)!).at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/docs', force: true });
       await run('set', 'C', '--evidence', 'proof', '--json');
@@ -1037,7 +1045,7 @@ describe('release checklist CLI', () => {
       await run('export', '--json');
       expect(JSON.parse(lines.at(-1)!).history.find((entry: { field: string; id: string }) => entry.field === 'claim' && entry.id === 'C')).toMatchObject({ to: 'TC/docs', force: true });
       expect(listChecklist('9.9.9').items.find((item) => item.id === 'C')?.owner).toBe('TC/docs');
-    } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack; }
   });
 
   test('move CLI --reason is persisted across versions in checklistHistory', async () => {
@@ -1189,7 +1197,7 @@ test('isolated schedule and evidence writes bypass the lease; a schedule targeti
   const dir = mkdtempSync(join(tmpdir(), 'release-hq-other-'));
   setElanousConfigDir(dir);
   const store = fileLeaseStore(join(dir, 'lease.json'), () => 100);
-  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, hostPath: join(tmpdir(), 'release-cli-test-no-host-marker-' + process.pid), localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
   const lines: string[] = [];
   const log = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
   const error = spyOn(console, 'error').mockImplementation((line: string) => { lines.push(line); });
@@ -1221,7 +1229,7 @@ test('place and rebalance refuse a foreign HQ before writing the schedule ledger
   const dir = mkdtempSync(join(tmpdir(), 'release-placement-fence-'));
   const ledger = join(dir, 'external-ledger');
   const store = fileLeaseStore(join(dir, 'lease.json'), () => 100);
-  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, hostPath: join(tmpdir(), 'release-cli-test-no-host-marker-' + process.pid), localPath: join(dir, 'local.json'), seenPath: join(dir, 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
   const errors: string[] = [];
   const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
   const output = spyOn(console, 'log').mockImplementation(() => {});
@@ -1233,7 +1241,7 @@ test('place and rebalance refuse a foreign HQ before writing the schedule ledger
     const cli = new Command();
     registerReleaseCommands(cli, { ledgerRoot: ledger }, {}, hq);
     const run = (...args: string[]) => cli.parseAsync(['release', ...args], { from: 'user' });
-    await run('checklist', 'add', 'K1', 'Fixture', '--version', '9.9.9', '--owner', 'OP', '--priority', 'P1');
+    await run('checklist', 'add', 'K1', 'Fixture', '--version', '9.9.9', '--owner', 'OP', '--priority', 'P1', '--deadline-version', '9.9.9');
     setSchedule('9.9.9', { cutAt: '2099-10-04T12:00+09:00', landBy: '2099-10-04T11:00+09:00' }, 'fixture', ledger);
     expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
     process.exitCode = 0;
@@ -1539,9 +1547,9 @@ describe('release run CLI', () => {
       await run('--if-ready', '--publish-at', '2099-10-09T20:00+09:00');
       await run();
       expect(inputs).toEqual([
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
       ]);
       process.exitCode = 0;
       await run('--publish-at', '2099-10-09T20:00');
@@ -1778,7 +1786,7 @@ describe('release run CLI', () => {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--json'], { from: 'user' });
       expect(stdout).toHaveLength(1);
       expect(stdout[0]!.endsWith('\n')).toBe(true);
-      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { ...loop, version: '0.2.4', previousVersion: '0.2.3', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true } });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { ...loop, version: '0.2.4', previousVersion: '0.2.3', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', branchCut: true } });
       expect(stderr.join('\n')).toContain('"previousVersion":"0.2.3"');
       expect([checklistCalls, graphCalls]).toEqual([0, 0]);
       expect(process.exitCode ?? 0).toBe(0);
@@ -1847,9 +1855,9 @@ describe('release run CLI', () => {
       for (const flags of [[], ['--cut-commit', currentCommit], ['--if-ready', '--cut-commit', currentCommit]])
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', ...flags], { from: 'user' });
       expect(inputs).toEqual([
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: currentCommit },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: currentCommit },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', cutCommit: currentCommit },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', cutCommit: currentCommit },
       ]);
     } finally { output.mockRestore(); process.exitCode = previous ?? 0; rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1873,6 +1881,9 @@ describe('release run CLI', () => {
     const errors: string[] = [];
     const errorOutput = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
     const previousExit = process.exitCode;
+    // A partial-clone checkout would lazy-fetch the fake unresolved CLI sha over the network (88s measured on node-b); keep the check local.
+    const previousLazyFetch = process.env.GIT_NO_LAZY_FETCH;
+    process.env.GIT_NO_LAZY_FETCH = '1';
     try {
       setElanousConfigDir(dir);
       setCodeRevisionRootForTesting(stalePackage);
@@ -1882,7 +1893,10 @@ describe('release run CLI', () => {
       expect(graphCalls).toBe(0);
       expect(errors.join('\n')).not.toBeEmpty();
       expect(process.exitCode).toBe(1);
-    } finally { setCodeRevisionRootForTesting(undefined); resetElanousConfigDir(); errorOutput.mockRestore(); process.exitCode = previousExit ?? 0; rmSync(dir, { recursive: true, force: true }); }
+    } finally {
+      if (previousLazyFetch === undefined) delete process.env.GIT_NO_LAZY_FETCH; else process.env.GIT_NO_LAZY_FETCH = previousLazyFetch;
+      setCodeRevisionRootForTesting(undefined); resetElanousConfigDir(); errorOutput.mockRestore(); process.exitCode = previousExit ?? 0; rmSync(dir, { recursive: true, force: true });
+    }
   }, 30_000);
 
   test('--dry-run --if-ready preserves the input preview without checking readiness, running the graph or writing a lock', async () => {
@@ -1907,14 +1921,14 @@ describe('release run CLI', () => {
           graph: async () => { graphCalls++; throw new Error('preview invoked graph'); } });
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready', '--json'], { from: 'user' });
         expect(stdout).toHaveLength(1);
-        expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true } });
+        expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', branchCut: true } });
         expect([checklistCalls, graphCalls]).toEqual([0, 0]);
         expect(existsSync(target)).toBe(false);
         expect(process.exitCode).toBe(0);
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready'], { from: 'user' });
         expect(human).toHaveLength(1);
         expect(human[0]).toStartWith('· 드라이런 0.2.4 · 입력 ');
-        expect(JSON.parse(human[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true });
+        expect(JSON.parse(human[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', branchCut: true });
         expect([checklistCalls, graphCalls]).toEqual([0, 0]);
         expect(existsSync(target)).toBe(false);
         expect(process.exitCode).toBe(0);
@@ -1936,7 +1950,7 @@ describe('release run CLI', () => {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run'], { from: 'user' });
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain('드라이런');
-      expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', gateRemote: 'node-b', branchCut: true });
+      expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', gateRemote: 'node-b', branchCut: true });
       expect(process.exitCode ?? 0).toBe(0);
     } finally { process.exitCode = before ?? 0; output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
@@ -2100,7 +2114,7 @@ describe('release run CLI', () => {
       graph: async (path, opts) => { expect(path).toEndWith('graphs/release/release-loop.yaml'); expect((opts.input as unknown as Record<string, unknown>).previousVersion).toBe('0.2.3'); graphCalls++; return { status: 'awaiting-approval', runId: 'run-1' } as never; } });
     try {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
-      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests }, state: { status: 'awaiting-approval', runId: 'run-1' } });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests }, state: { status: 'awaiting-approval', runId: 'run-1' } });
       expect([checklistCalls, graphCalls]).toEqual([1, 1]);
       expect(process.exitCode ?? 0).toBe(0);
       const blocked = new Command();
@@ -2775,7 +2789,7 @@ describe('RELEASE-REHEARSAL-RC CLI freshness scope', () => {
       process.exitCode = 0;
       await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'rc', '--if-ready', '--json'], { from: 'user' });
       expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: true, input: { version: '0.2.18-rc.1', branchCut: true } });
-      expect(inputs).toEqual([{ version: '0.2.18-rc.1', previousVersion: '0.2.17', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests }]);
+      expect(inputs).toEqual([{ version: '0.2.18-rc.1', previousVersion: '0.2.17', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests }]);
       expect(process.exitCode).toBe(0);
       await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'beta', '--json'], { from: 'user' });
       expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: false, error: '--prerelease supports rc only: beta' });

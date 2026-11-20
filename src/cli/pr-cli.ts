@@ -1427,7 +1427,7 @@ export async function verifyPinnedOverlapDecision(input: {
       out.log(verdict.mode === 'already-ancestor'
         ? `✓ overlap-evidence: already-ancestor — 겹친 최근 착지 ${overlappingLandings.length}개가 전부 head ${opts.expectedHead!.slice(0, 12)} 의 조상 · review pass must-fix 0 (${verdict.reviewResult})`
         : verdict.mode === 'base-advanced-disjoint'
-          ? `✓ overlap-evidence: base-advanced-disjoint — gate base ${verdict.gateBase.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} 까지 ${verdict.windowCommits}개 커밋이 PR 파일을 안 건드린다 · review pass|warn must-fix 0 (${verdict.reviewResult})`
+          ? `✓ overlap-evidence: base-advanced-disjoint — gate base ${verdict.gateBase.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} 까지 ${verdict.windowCommits}개 커밋이 PR 파일·공유 테스트 파일을 안 건드린다(델타 서로소) · review pass|warn must-fix 0 (${verdict.reviewResult})`
           : `✓ overlap-evidence: ${ref.remote}/${ref.branch} ${verdict.baseTip.slice(0, 12)} ⊂ head ${opts.expectedHead!.slice(0, 12)} · gate passed on that base · review pass must-fix 0 (${verdict.reviewResult})`);
     } else {
       const pureNotRebased = verdict.baseTip !== undefined && verdict.reason ===

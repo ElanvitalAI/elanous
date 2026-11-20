@@ -35,6 +35,7 @@ import { SHELL_KILL_GRACE_MS, SHELL_SNAPSHOT_REPLY_TIMEOUT_MS } from '../tool-ru
 import { CAPSULE_FRAME_PREFIX, parseCapsuleFrame } from '../turn-capsule/capsule-frame.js';
 import { TURN_CANCEL_GRACE_MS, TURN_CANCEL_TYPE, type TurnCancelReason } from '../turn-capsule/turn-cancel.js';
 import { emitTurnLife } from '../debug/turn-life.js';
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import type { CapsuleEvent } from '../turn-capsule/contract.js';
 import { answerMemberBoardSessionCall, isMemberBoardSessionCall, type MemberBoardSessionSource } from './next-member-board-session.js';
 
@@ -493,7 +494,7 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage'], onGraphProgress?: WaitingTurn['onGraphProgress'], from?: MessageSource): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string, replace?: boolean, source?: 'assistant-text') => void, attachments: readonly string[] = [], onStatus?: (text: string) => void, onAgent?: (event: AgentDisplayEvent) => void, onMessageBlock?: (block: MessageBlock) => void, onShellActivity?: WaitingTurn['onShellActivity'], onToolActivity?: WaitingTurn['onToolActivity'], onPushNowResult?: WaitingTurn['onPushNowResult'], onMeasuredUsage?: WaitingTurn['onMeasuredUsage'], onGraphProgress?: WaitingTurn['onGraphProgress'], from?: MessageSource, onPromptWritten?: () => void): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
@@ -508,6 +509,7 @@ class LocalChatSession {
     try {
       if (writePrompt) await writePrompt(payload);
       else await this.writeInput(payload);
+      try { onPromptWritten?.(); } catch { /* observer cannot fail a written turn */ }
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)));
     }
@@ -529,12 +531,10 @@ class LocalChatSession {
           this.pendingShellApprovalIds.clear();
           for (const callId of this.pendingHarnessAskUserIds) nextTuiHarnessAskUserCancelHandler?.(callId);
           this.pendingHarnessAskUserIds.clear();
-          try { this.child.kill(); } catch { /* already exited */ }
           // A201 — a wedged child (blocked loop or a SIGTERM handler that never runs) must not
-          // hold «응답 취소 중» forever: escalate to SIGKILL on this exact child after the grace.
-          const escalate = setTimeout(() => { try { this.child.kill('SIGKILL'); } catch { /* already exited */ } }, SHELL_KILL_GRACE_MS);
-          escalate.unref?.();
-          void this.exited.finally(() => clearTimeout(escalate));
+          // hold «응답 취소 중» forever: shared terminateTree = SIGTERM, then SIGKILL on this exact
+          // child pid (not a group — the REPL child is not detached) after the grace (KILL-TREE-ONE).
+          void terminateTree(this.child as unknown as Parameters<typeof terminateTree>[0], { group: false, graceMs: SHELL_KILL_GRACE_MS });
         }
         await this.exited;
       })();
@@ -737,6 +737,8 @@ export async function runLocalChatTurn(
   onPushNowResult?: WaitingTurn['onPushNowResult'],
   onGraphProgress?: WaitingTurn['onGraphProgress'],
   from?: MessageSource,
+  /** Called after the prompt is flushed to the child, not an acknowledgement from the provider. */
+  onPromptWritten?: () => void,
 ): Promise<{ goalComplete: boolean; goalStopReason?: string; planOutcome?: PlanWire }> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
@@ -861,7 +863,7 @@ export async function runLocalChatTurn(
       (event) => { if (!signal.aborted) onToolActivity?.(event); },
       (event) => { if (!signal.aborted) onPushNowResult?.(event); },
       (usage) => { if (!signal.aborted) compact.onMeasuredUsage?.(usage); },
-      (event) => { if (!signal.aborted) onGraphProgress?.(event); }, from);
+      (event) => { if (!signal.aborted) onGraphProgress?.(event); }, from, onPromptWritten);
     } catch (error) {
       if (signal.aborted) throw new Error('응답을 취소했습니다');
       await closeLocalChatSession(sessionId);

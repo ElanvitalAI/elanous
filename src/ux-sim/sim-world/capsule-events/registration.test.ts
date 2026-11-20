@@ -21,8 +21,8 @@ test('capsule-events registers one default C1 and the other scenes with literal 
     { id: 'C6', module: 'src/ux-sim/sim-world/capsule-events/c6-boot-backlog.ts' }]);
   expect(simWorldScenarios.map(row => row.id)).toEqual(['C1', 'C5', 'C6']);
   expect(table.entries['capsule-events/C1']).toEqual({ expect: 'red',
-    reason: 'C1 background Agent axis: real Next TUI idle wake, PR #38565 · default capsule behavior',
-    redReason: 'background agent end never wakes the turn' });
+    reason: "C1 background Agent axis: agent-end delivery passes (exactly one delivery); mail and harness sources remain unmeasured — redReason follows the scenario's own partial-red reason (was the stale pre-fix catch reason, wrong-reason-red since #38582)",
+    redReason: 'C1 mail and harness axes unmeasured' });
   expect(table.entries['capsule-events/C7']).toEqual({ expect: 'red',
     reason: 'C7 partial MCP axis; provider, harness, and deadline event remain unmeasured',
     redReason: 'silent MCP holds the main turn' });
@@ -36,7 +36,7 @@ test('capsule-events registers one default C1 and the other scenes with literal 
   // 'C5 gate-declined and pty axes unmeasured' and its own test expects false — so the table declares red, not green.
   expect(table.entries['capsule-events/C5']).toEqual({ expect: 'red',
     reason: 'C5 wakeup partial: busy-turn defer and restart axes held (#38725); the takePending gate-decline (D6) and pty axes remain unmeasured',
-    redReason: 'D6 gate-declined · pty 축 미측정' });
+    redReason: 'C5 gate-declined and pty axes unmeasured' });
   // C6 stays green — its own test observes ok:true (JUD 20261119-1913: «C6 은 자기 시험이 ok:true 라 green 맞음»).
   // The parsed green row normalizes away redReason (expect.ts), so the literal locks the parsed shape.
   expect(table.entries['capsule-events/C6']).toEqual({ expect: 'green',

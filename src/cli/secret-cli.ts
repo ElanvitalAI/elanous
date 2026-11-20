@@ -27,6 +27,7 @@ import { registerSecretBackupCommands } from './secret-backup-cli.js';
 import { registerSecretInventoryCommand } from './secret-inventory-cli.js';
 import { registerSecretOauthLeaseCommands } from './secret-oauth-lease-cli.js';
 import { registerSecretLeaseCommands } from './secret-lease-cli.js';
+import { registerSecretSupplyCommand } from './secret-supply-cli.js';
 import { appSecretId, appSecretIdForExistingApp } from '../nexus/config/secrets/app-secret-ledger.js';
 import type { SecretBackendId } from '../nexus/config/secrets/types.js';
 import { revokeAppSecretValues, setAppSecretValue, type AppSecretRevokeResult } from '../nexus/config/secrets/file-backend.js';
@@ -212,6 +213,8 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
   registerSecretOauthLeaseCommands(secret);
   // HQ-VAULT V3 — 정적 키 임대(`secret lease`). V2 OAuth 임대는 같은 명령의 `oauthLease` 이음매로 합류한다.
   registerSecretLeaseCommands(secret);
+  // SECRET-SUPPLY-TARGETS — 대상 꼴(pod·ta·host·config-dir) 한 길. 임대는 위 두 길에 위임, 허용 목록은 기본 거부.
+  registerSecretSupplyCommand(secret);
 
   const slots = secret.command('slot').description('Inspect shared credential slots without displaying their values.');
   slots.command('list')

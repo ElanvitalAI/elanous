@@ -1,4 +1,5 @@
 import { createEventWatch, type EventWatch, type EventWatchLineOutcome } from './event-watch.js';
+import { terminateTree } from '../shell-primitive/terminate-tree.js';
 import type { ChildNoticeQueue } from './core/notice-producers.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 
@@ -104,9 +105,9 @@ export function attachEventWatchProcess(
   const killGroup = (): void => {
     const pid = child?.pid;
     if (pid === undefined) return;
-    // shell:true 의 sh 만 죽이면 a|b · tail -f 손자가 남는다. 그룹째 끊는다.
-    try { process.kill(-pid, 'SIGTERM'); } catch { /* not a group leader yet */ }
-    try { child?.kill('SIGTERM'); } catch { /* already gone */ }
+    // shell:true 의 sh 만 죽이면 a|b · tail -f 손자가 남는다. 그룹째 끊는다(KILL-TREE-ONE 공용 루틴:
+    // 그룹 SIGTERM → 유예 → SIGKILL · 그룹이 없으면 pid 자신).
+    void terminateTree({ pid }, { group: true, pidFallback: true });
   };
   const stop = (): void => {
     if (stopped) return;

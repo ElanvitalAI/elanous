@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
-import { gateShardLedgerBatchComplete, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
+import { gateShardLedgerBatchComplete, gateShardLedgerBatchReusable, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { runReleaseSimGateReceiptSeam, runReleaseSimRigIfFile, runReleaseSimRigScenario, runReleaseSimRigScenarioWithExecutor } from './release-sim-rig.js';
 import { resolveScenarioFilePath } from './scenario.js';
@@ -64,7 +64,7 @@ test('publish hold signals route measured auto-approval to a human before the fa
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('release simulation merges a completed retry fragment into its incomplete original gate shard', () => {
+test('release simulation persists a completed retry fragment beside its incomplete gate shard without marking the batch reusable', () => {
   const batchId = 'sim-pod-70-retry-batch';
   const observedAt = '2026-11-07T00:00:00.000Z';
   const files = Array.from({ length: 97 }, (_, index) => `src/pod-70-${index}.test.ts`);
@@ -84,32 +84,47 @@ test('release simulation merges a completed retry fragment into its incomplete o
   const expected = { batchId, version: '0.3.6', commit: '3cb140ec2cef82bbe024e54d0b0ad4f939d77485',
     phase: 'cut' as const, observedAt, shardIds: ['pod-70', 'pod-71'] };
   expect(gateShardLedgerBatchComplete(rows, expected)).toBe(true);
+  // Persistence contract (gate-shard-ledger.ts): a complete batch marker keeps every settled shard
+  // row, including a retry fragment that carries its own measured failure — the runtime gate
+  // rejects rc != 0 before any publish, and receipt reuse applies the stricter
+  // gateShardLedgerBatchReusable checks below, so out-of-batch fragment state never changes the
+  // batch marker verdict.
   expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
-    ? { ...entry, fail: 1, rc: 1, failureIds: ['src/pod-70-96.test.ts > failed'] } : entry), expected)).toBe(false);
+    ? { ...entry, fail: 1, rc: 1, failureIds: ['src/pod-70-96.test.ts > failed'] } : entry), expected)).toBe(true);
   expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70'
-    ? { ...entry, unmeasuredFiles: [...retryFiles, files[0]!] } : entry), expected)).toBe(false);
+    ? { ...entry, unmeasuredFiles: [...retryFiles, files[0]!] } : entry), expected)).toBe(true);
   const runningRetry = { ...rows[1]!, state: 'running' as const, attribution: 'unmeasured' as const, endedAt: null,
     pass: null, fail: null, errors: null, ran: null, failureIds: null, errorIds: null };
   expect(gateShardLedgerBatchComplete([rows[0]!, runningRetry, rows[1]!, rows[2]!], expected)).toBe(true);
   for (const changedIdentity of [{ envFingerprint: 'c'.repeat(64) }, { commit: 'd'.repeat(40) },
     { imageDigest: 'sha256:' + 'e'.repeat(64) }, { executor: 'host' as const }]) {
     expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
-      ? { ...entry, ...changedIdentity } : entry), expected)).toBe(false);
+      ? { ...entry, ...changedIdentity } : entry), expected)).toBe(true);
   }
   expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
-    ? { ...entry, files: retryFiles.slice(1) } : entry), expected)).toBe(false);
+    ? { ...entry, files: retryFiles.slice(1) } : entry), expected)).toBe(true);
   expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, attemptId: 'attempt-prior-run', retryGroupId: 'attempt-prior-run' }], expected)).toBe(true);
-  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]! }], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]! }], expected)).toBe(true);
   expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
-    ? { ...entry, startedAt: 'not-a-time' } : entry), expected)).toBe(false);
-  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, endedAt: 'not-a-time' }], expected)).toBe(false);
+    ? { ...entry, startedAt: 'not-a-time' } : entry), expected)).toBe(true);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, endedAt: 'not-a-time' }], expected)).toBe(true);
   expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, startedAt: '2026-11-07T00:01:00.000Z',
-    endedAt: '2026-11-07T00:00:00.000Z' }], expected)).toBe(false);
+    endedAt: '2026-11-07T00:00:00.000Z' }], expected)).toBe(true);
   expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, state: 'running', attribution: 'unmeasured', endedAt: null,
-    pass: null, fail: null, errors: null, ran: null, failureIds: null, errorIds: null }], expected)).toBe(false);
-  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, shardId: 'pod-70-n2' }], expected)).toBe(false);
-  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, attemptId: 'attempt-retry-duplicate' }], expected)).toBe(false);
+    pass: null, fail: null, errors: null, ran: null, failureIds: null, errorIds: null }], expected)).toBe(true);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, shardId: 'pod-70-n2' }], expected)).toBe(true);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, attemptId: 'attempt-retry-duplicate' }], expected)).toBe(true);
+  // The persistence guard still fires when the batch marker itself is violated.
   expect(gateShardLedgerBatchComplete([...rows, rows[0]!], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70'
+    ? { ...entry, version: '0.3.7' } : entry), expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70'
+    ? { ...entry, observedAt: '2026-11-07T00:00:01.000Z' } : entry), expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70'
+    ? { ...entry, state: 'running' } : entry), expected)).toBe(false);
+  // Retry recovery keeps the persisted batch complete but never reusable: the parent shard still
+  // carries its unmeasured gap and retry group identity, so a fresh gate run must measure again.
+  expect(gateShardLedgerBatchReusable(rows, expected)).toBe(false);
 });
 
 test('receipt seam blocks fake publish when the final injected gate outcome fails', () => {

@@ -1,0 +1,25 @@
+{
+  "id": "sim-world-graph-phase-source",
+  "name": "Graph sim world: 국면 장치 ⑤ — 격리 상태 루트 phase.json 원천(부재 unknown→실행 · dev-normal 실행 · hard-rehearsal/gate-window/publish → skipped+logs 한 줄)",
+  "audience": "internal",
+  "checklistCells": ["SCHEDULE-GRAPH-S1-MEMORY-LIFECYCLE"],
+  "implementation": ["src/ux-sim/sim-world/graph/schedule-devices.ts"],
+  "tests": ["src/ux-sim/sim-world/graph/schedule-devices.test.ts"],
+  "target": "graph 세계 — 국면 원천(phase.json)이 트리거 발화를 차단·허용하는가",
+  "inputs": [
+    "격리 상태 루트 phase.json {\"phase\": \"dev-normal\" | \"hard-rehearsal\" | \"gate-window\" | \"publish\"}",
+    "phase.json 부재(unknown → 지금 동작 취급)",
+    "03:00 시각 트리거 발화"
+  ],
+  "observations": [
+    "SP1 부재 → 실행",
+    "SP2 dev-normal → 실행",
+    "SP3 hard-rehearsal → skipped + logs 한 줄(런 0)",
+    "SP4 gate-window → skipped + logs 한 줄(런 0)",
+    "SP5 publish → skipped + logs 한 줄(런 0)"
+  ],
+  "entryCommands": ["bun test src/ux-sim/sim-world/graph/schedule-devices.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

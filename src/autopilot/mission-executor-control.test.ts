@@ -37,3 +37,21 @@ describe('stopMissionExecutor — cancel이 executor 종료(대표 2026-07-16 �
     expect(killed).toEqual([]);
   });
 });
+
+describe('stopMissionExecutor default kill path — KILL-TREE-ONE (real detached child, exact pid only)', () => {
+  test('kills the detached group (leader + grandchild) and reports the pid', async () => {
+    const { spawn } = await import('node:child_process');
+    const child = spawn('/bin/sh', ['-c', 'sleep 300 & echo $!; wait'], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    const gpid = await new Promise<number>((res) => child.stdout!.once('data', (b) => res(Number(String(b).trim()))));
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; } };
+    try {
+      expect(stopMissionExecutor('apm_real', { findPids: () => [child.pid!] })).toEqual([child.pid!]);
+      const end = Date.now() + 4000;
+      while (Date.now() < end && (alive(child.pid!) || alive(gpid))) await new Promise((r) => setTimeout(r, 25));
+      expect(alive(child.pid!)).toBe(false);
+      expect(alive(gpid)).toBe(false);
+    } finally {
+      for (const p of [child.pid!, gpid]) { try { process.kill(p, 'SIGKILL'); } catch { /* gone */ } }
+    }
+  });
+});

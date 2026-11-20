@@ -22,7 +22,7 @@ export const RUN_STOP_CLASSES = [
   'env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat',
   'review-out-of-scope', 'review-budget-exhausted', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed',
   'implement-aborted', 'out-of-scope-held', 'provider-auth-missing', 'provider-unavailable',
-  'merge-held-release-path', 'pr-guard-failed', 'gate-unmeasured', 'unclassified',
+  'merge-held-release-path', 'pr-guard-failed', 'gate-unmeasured', 'no-review-provider', 'unclassified',
 ] as const;
 export type RunStopClass = typeof RUN_STOP_CLASSES[number];
 
@@ -236,6 +236,7 @@ export function classifyMergeHoldStop(mergeReason: string | undefined): RunStopC
   if (graphClass) return graphClass;
   if (reason.startsWith('main-sync') || reason === 'default-branch-unresolved') return 'main-sync';
   if (reason === 'required-evidence-uncovered') return 'evidence-uncovered';
+  if (reason === 'no-review-provider') return 'no-review-provider';
   if (reason.startsWith('review-budget')) return 'review-budget-exhausted';
   if (reason === 'review-must-fix' || reason === 'review-warn-with-must-fix') return 'review-repeat';
   if (reason.startsWith('review-diff') || reason === 'no-real-review') return 'review-out-of-scope';

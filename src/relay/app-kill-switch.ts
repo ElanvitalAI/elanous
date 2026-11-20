@@ -291,7 +291,18 @@ export function createAppKillSwitch(databasePath = defaultDatabasePath(), option
 
     isDown(userIdInput: string, appIdInput: string): boolean {
       const userId = validateUserId(userIdInput);
-      const appId = validateAppId(appIdInput);
+      // 출처: RES #108420 — 읽기 판정은 validateAppId 를 통과 못 하는 앱 id(앱 0개
+      // bare 핸들 호스트가 합성하는 app:"" — relay-server.ts 공개 앱 판정)에 throw 하지
+      // 않고 «다운 아님» 을 반환한다. 무효 id 는 쓰기 경로(applyIncident·reactivate)의
+      // validateAppId 로 상태표에 절대 기록되지 않으므로 «다운 아님» 이 정확한 판정이고,
+      // 이 판정은 공개 요청 게이트(relay-server.ts 회원 게이트 직후)에 놓여 throw 가
+      // 그대로 500 이 된다. 쓰기·감사 경로의 validateAppId 는 그대로 유지한다.
+      let appId: string;
+      try {
+        appId = validateAppId(appIdInput);
+      } catch {
+        return false;
+      }
       const row = db.query('SELECT is_down FROM app_kill_switch_state WHERE user_id=? AND app_id=?')
         .get(userId, appId) as { is_down: number } | null;
       return row?.is_down === 1;

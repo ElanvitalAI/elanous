@@ -17,6 +17,7 @@ import { partialPlanPath } from './gate-partial.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
 import { runGraph, verifyReleaseCommandRoot } from '../../src/graph-runner/runner.js';
 import { main as versionNodeMain } from './version-node.js';
+import { writeValidTrafficPrep } from './traffic-prep-fixture.js';
 import { createGateRunner, gateReceiptReuseKey, judgeGate, runGateNode, type GateRunner } from './gate-node.js';
 import { gateEnvFingerprint, gateSourcePins } from './gate-baseline-receipt.js';
 import { inspectGateShardReceipts, markGateShardUnmeasured, saveGateShardResult } from './gate-shard-receipts.js';
@@ -381,8 +382,8 @@ test('host-down from runGateNode is preserved through resume and switches the sa
     state.input.gatePodPool = 'pool-test';
     state.input.gateImagePin = 'cut-commit';
     state.input.previousVersion = '0.2.18';
-    // Source: release-loop.yaml routes pre-gate-join through cloud approval/join and pod reuse before gate.
-    state.path = ['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
+    // Source: release-loop.yaml enters at traffic-prep and routes pre-gate-join through cloud approval/join and pod reuse before gate.
+    state.path = ['traffic-prep', 'cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
     state.nodes = state.path.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true,
       output: nodeId === 'cut-branch' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
         : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: nodeId === 'pod-reuse-prep' ? 'skip' : 'ok' }) }));
@@ -471,8 +472,8 @@ test('interference partial-resume rechecks only affected files at the same cut',
   runState.input.commit = SHA;
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
-  // Source: release-loop.yaml routes pre-gate-join through cloud approval/join and pod reuse before gate.
-  runState.path = ['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
+  // Source: release-loop.yaml enters at traffic-prep and routes pre-gate-join through cloud approval/join and pod reuse before gate.
+  runState.path = ['traffic-prep', 'cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
     output: nodeId === 'cut-branch' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'cutoff' ? JSON.stringify({ baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: SHA } })
@@ -545,8 +546,8 @@ test('load-flaky autoheal without explicit interference evidence falls back inst
   runState.input.commit = SHA;
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
-  // Source: the current graph adds readiness-countdown before traffic-cut-start.
-  runState.path = ['cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+  // Source: the current graph enters at traffic-prep and adds readiness-countdown before traffic-cut-start.
+  runState.path = ['traffic-prep', 'cut-branch', 'gate-image-prebuild', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
     output: nodeId === 'cut-branch' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
@@ -1598,8 +1599,8 @@ test('a moved command checkout stops a resumed Bash node before its runner is ca
   let commands = 0;
   const runBash = async (body: string) => {
     commands++;
-    // Source: the current graph runs readiness-countdown and traffic-cut-start before the test's failing cutoff node.
-    if (body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
+    // Source: the current graph runs traffic-prep, readiness-countdown and traffic-cut-start before the test's failing cutoff node.
+    if (body.includes('traffic-prep-node.ts') || body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
       return { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) };
     return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' };
   };
@@ -1637,7 +1638,7 @@ test('a clean cut checkout with different recipes is rejected before resumed Bas
   let calls = 0;
   const runBash = async (body: string) => {
     calls++;
-    return body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild')
+    return body.includes('traffic-prep-node.ts') || body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild')
       ? { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) }
       : { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' };
   };
@@ -1751,7 +1752,7 @@ test('the resumed Bash process reads from the verified command checkout', async 
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   try {
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true }, deps: { root,
-      runBash: async (body) => body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start')
+      runBash: async (body) => body.includes('traffic-prep-node.ts') || body.includes('version-node.ts release') || body.includes('version-node.ts gate-image-prebuild') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start')
         ? { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) }
         : { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' } } });
     expect(first.status).toBe('failed');
@@ -2793,15 +2794,17 @@ test('RELEASE-RESUME-AFTER-CUT-PUSHED: real production commands and a real resum
     }
     // Downstream scenario plumbing: readiness/traffic run as pass-through so the resume proceeds
     // past the prebuild; the failing cutoff ends the run. Only the prebuild claim is under test.
-    if (body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
+    if (body.includes('traffic-prep-node.ts') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
       return { exitCode: 0, stderr: '', stdout: `${JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}` })}\n` };
     return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
   };
   try {
+    // RELEASE-TRAFFIC-PREP-T1H: the real cut-branch node holds without the T-1h traffic-prep receipt.
+    await writeValidTrafficPrep(root, VERSION);
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, branchCutBaseCommit: mainTip,
       gateExecutor: 'pod', gateImagePin: 'cut-commit', gatePodPool: 'pool-a' }, deps: { root, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path).toEqual(['cut-branch', 'gate-image-prebuild', 'failed']);
+    expect(first.path).toEqual(['traffic-prep', 'cut-branch', 'gate-image-prebuild', 'failed']);
     expect(cutCommands).toBe(1);
     const firstCut = JSON.parse(String(first.nodes.find((node) => node.nodeId === 'cut-branch')?.output));
     expect(firstCut).toMatchObject({ outcome: 'ok', kind: 'release', version: VERSION, branch: `release/${VERSION}` });
@@ -2824,6 +2827,6 @@ test('RELEASE-RESUME-AFTER-CUT-PUSHED: real production commands and a real resum
     expect(resumedCut.commit).toBe(firstCut.commit);
     const resumedPrebuild = JSON.parse(String(resumed.state.nodes.find((node) => node.nodeId === 'gate-image-prebuild')?.output));
     expect(resumedPrebuild).toMatchObject({ outcome: 'ok', commit: firstCut.commit, gateImagePrebuild: { outcome: 'built' } });
-    expect(resumed.state.path.slice(0, 3)).toEqual(['cut-branch', 'gate-image-prebuild', 'readiness-countdown']);
+    expect(resumed.state.path.slice(0, 4)).toEqual(['traffic-prep', 'cut-branch', 'gate-image-prebuild', 'readiness-countdown']);
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 }, 120_000);

@@ -33,7 +33,7 @@ test('KAIST stage injects a lecture-scrap route bug, heals it in the same run, a
     setTestStateRoot(previous ?? null);
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 120_000); // Real graph execution exceeds bun's 5s default on shared train hosts.
 
 test('KAIST failed repair keeps the cloned search route at 404 and cannot satisfy the route gate', () => {
   const host = createFakeAppHost([{ slug: 'lecture-scrap', current: 'bug-injected', versions: [
@@ -63,5 +63,5 @@ for (const repairFault of ['bad-artifact', 'unlanded'] as const) {
       setTestStateRoot(previous ?? null);
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 120_000); // Real graph execution exceeds bun's 5s default on shared train hosts.
 }

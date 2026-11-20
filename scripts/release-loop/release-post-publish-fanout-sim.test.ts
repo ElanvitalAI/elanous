@@ -211,7 +211,7 @@ if [ "$1" = "bin/elanous.mjs" ] && [ "$2" = "pr" ] && [ "$3" = "land" ]; then
   exit 0
 fi
 if [ "$1" = "bin/elanous.mjs" ] && [ "$2" = "release" ] && [ "$3" = "verify" ]; then
-  echo '{"ok":true,"notesPage":"ok"}'
+  echo '{"ok":true,"notesPage":"ok","nexusFirstRun":{"ok":true,"versionLine":"0.3.1 a1b2c3d4e5f6071829300000000000000000000a","health":200,"healthOk":true,"app":200,"testUniverse":true,"ownPidStopped":true,"forcedKill":false,"exitCode":0,"pid":12345}}'
   exit 0
 fi
 if [ "$1" = "install" ] || [ "$1" = "website/scripts/deploy-pages.ts" ]; then exit 0; fi

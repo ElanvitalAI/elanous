@@ -1,3 +1,4 @@
+import { RELEASE_CUT_NODE_IDS } from '../../scripts/release-loop/release-node-ids.js';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -32,6 +33,25 @@ function validRelativeEvidence(path: unknown, seat: 'REL' | 'JUD'): path is stri
 }
 function object(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * RELEASE-PWA-MAIL-WAIVER-CUT-PARSE: a tip refresh (release resume/recover/append) appends a second JSON line
+ * (`{..., commit: <new tip>, refreshedFrom: <old>}`) to the cut node output, so the whole output is not one JSON
+ * document. The last JSON object line is the current cut; blank/non-JSON lines are ignored. None → fail closed.
+ */
+export function latestCutRecord(output: unknown): Record<string, unknown> {
+  if (object(output)) return output;
+  const lines = typeof output === 'string' ? output.split('\n') : [];
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!.trim();
+    if (!line.startsWith('{')) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (object(parsed)) return parsed;
+    } catch { /* not a JSON line: keep looking upward */ }
+  }
+  throw new Error('PWA mail waiver cut-branch output missing or has no JSON object line (cannot read the cut commit)');
 }
 
 /** Resolve release identities from the declared plugin graph, not a parallel list in this verifier. */
@@ -106,9 +126,10 @@ export function assertPwaMailWaiver(
   if (state.graphId !== route.graphId || state.dryRun || !RUN.test(state.runId)
     || (!recorded && state.status !== 'failed')) throw new Error('PWA mail waiver requires a failed release run');
   const version = (state.input as { version?: unknown } | undefined)?.version;
-  const cutNode = state.nodes.find(node => node.nodeId === route.cutNode);
-  let cut: unknown;
-  try { cut = JSON.parse(String(cutNode?.output ?? '{}')).commit; } catch { /* invalid source */ }
+  // Declared entry node first; legacy runs carry `version-release` (RELEASE_CUT_NODE_IDS, same as releaseCutRecord).
+  const cutNode = state.nodes.find(node => node.nodeId === route.cutNode)
+    ?? state.nodes.find(node => RELEASE_CUT_NODE_IDS.includes(node.nodeId));
+  const cut: unknown = latestCutRecord(cutNode?.output).commit;
   const inputCut = (state.input as { cutCommit?: unknown } | undefined)?.cutCommit;
   if (typeof version !== 'string' || !VERSION.test(version)
     || typeof cut !== 'string' || !CUT.test(cut)

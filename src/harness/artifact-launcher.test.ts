@@ -19,6 +19,9 @@ const GOAL_WITH_PORT = '# goal\n\n## 산출물을 어떻게 켜나\nEntrypoint: 
 const GOAL_NO_DECLARATION = '# goal\n\n본문만 있다.\n';
 const GOAL_NO_PORT = '# goal\n\n## 산출물을 어떻게 켜나\nEntrypoint: test:deterministic\n';
 
+/** stop 이 끝나야 하는 실시간 상한 — 유예(killGraceMs)+확인(killWaitMs) 위에 넉넉히 얹은 값. */
+const STOP_BOUND_MS = 2_000;
+
 /** 시간을 손으로 돌린다 — 상한·유예를 실시간 없이 재기 위해. */
 function fakeClock() {
   let t = 0;
@@ -142,6 +145,7 @@ describe('launchGoalArtifact — 상한과 정리(⑤)', () => {
     const result = await launchGoalArtifact('goal.md', baseDeps({
       spawn: () => asChild(child),
       probePort: async () => false,
+      groupAlive: () => true,                          // KILL-TREE-ONE: SIGKILL 승격은 «그룹이 남았을 때» — 그룹 probe 가 권위
       killGroup: (_pid, signal) => { groupSignals.push(signal); return true; },
     }));
     expect(result.ok === false && result.reason).toBe('port-timeout');
@@ -154,6 +158,7 @@ describe('launchGoalArtifact — 상한과 정리(⑤)', () => {
     const result = await launchGoalArtifact('goal.md', baseDeps({
       spawn: () => asChild(child),
       probePort: async () => false,
+      groupAlive: () => true,                          // 그룹이 남아 있다 → 유예 뒤 SIGKILL (그룹 신호는 계속 실패 → 자식 폴백)
       killGroup: () => false,
     }));
     expect(result.ok).toBe(false);
@@ -217,6 +222,7 @@ describe('launchGoalArtifact — 상한과 정리(⑤)', () => {
     const result = await launchGoalArtifact('goal.md', baseDeps({
       spawn: () => asChild(child),
       probePort: async () => false,
+      groupAlive: () => true,
       killGroup: () => { throw new Error('EPERM'); },
     }));
     expect(result.ok).toBe(false);
@@ -239,6 +245,36 @@ describe('launchGoalArtifact — 상한과 정리(⑤)', () => {
     expect(result.ok).toBe(false);
     expect(result.ok === false && result.detail).toContain('probe exploded');
     expect(groupSignals).toContain('SIGTERM');
+  });
+});
+
+describe('launchGoalArtifact — KILL-TREE-ONE: 정리는 공용 terminateTree', () => {
+  it('리더가 안 죽어도 «그룹이 비면» 유예 안에 끝나고 SIGKILL 을 보내지 않는다', async () => {
+    const child = new FakeChild();
+    const groupSignals: NodeJS.Signals[] = [];
+    let probes = 0;
+    await launchGoalArtifact('goal.md', baseDeps({
+      spawn: () => asChild(child),
+      probePort: async () => false,
+      killGroup: (_pid, signal) => { groupSignals.push(signal); return true; },
+      groupAlive: () => { probes += 1; return probes < 3 ? true : false; },   // 두 번 살아 있다가 비었다
+    }));
+    expect(groupSignals).toEqual(['SIGTERM']);
+    expect(child.killed).toHaveLength(0);
+  });
+
+  it('SIGKILL 뒤에도 그룹이 남으면 stop 은 끝나되(무한 대기 없음) 확인 실패를 관측으로 남긴다', async () => {
+    const child = new FakeChild();
+    const groupSignals: NodeJS.Signals[] = [];
+    const t0 = Date.now();
+    await launchGoalArtifact('goal.md', baseDeps({
+      spawn: () => asChild(child),
+      probePort: async () => false,
+      groupAlive: () => true,
+      killGroup: (_pid, signal) => { groupSignals.push(signal); return true; },
+    }));
+    expect(groupSignals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(Date.now() - t0).toBeLessThan(STOP_BOUND_MS);   // 유예 100ms + 확인 100ms — 상한이 있다
   });
 });
 
@@ -543,7 +579,7 @@ describe('launchGoalArtifact — 성공과 멱등 stop(①⑤)', () => {
     expect(child.killed).toEqual(['SIGTERM', 'SIGKILL']); // ⛔ 그러나 «아무것도 안 함»은 고아 경로다
   });
 
-  it('stop 의 유예 대기에서 sleep 이 throw 해도 강제 종료까지 간다', async () => {
+  it('stop 은 주입된 sleep 에 의존하지 않는다 — sleep 이 throw 해도 강제 종료까지 간다', async () => {
     const child = new FakeChild();
     let probes = 0;
     const groupSignals: NodeJS.Signals[] = [];
@@ -553,6 +589,7 @@ describe('launchGoalArtifact — 성공과 멱등 stop(①⑤)', () => {
       probePort: async () => { probes += 1; return probes > 1; },
       now: clock.now,
       sleep: async (ms: number) => { if (probes > 1) throw new Error('sleep exploded'); await clock.sleep(ms); },
+      groupAlive: () => true,
       killGroup: (_pid, signal) => { groupSignals.push(signal); return true; },
     }));
     expect(result.ok).toBe(true);

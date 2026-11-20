@@ -149,6 +149,37 @@ describe('named installed skill research routing', () => {
     expect(statuses).not.toContain('먼저 답변을 시작하고 근거를 확인합니다.');
   });
 
+  test('research turn marks earlier assistant turns as unverified prior claims; no notice without history (MK #110816)', async () => {
+    const prompt = 'omni crawl 로 grokbot 사용사례를 찾아주고 elanous 와 어떤 연계를 하면 될까요?';
+    const run = async (history: LLMMessage[]): Promise<LLMMessage[]> => {
+      let seen: LLMMessage[] = [];
+      spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages) => { seen = [...messages]; return 'done'; });
+      await runCoreTurn({
+        sessionId: 'research-prior-claims',
+        messages: [...history, { role: 'user', content: prompt }],
+        tools: [{ ...tool, name: 'skill_exec' }, { ...tool, name: 'WebSearch' }],
+        dispatchTool: async () => null,
+        signal,
+        userText: prompt,
+      }, { runResearch: async () => ({ ok: true, output: 'mock evidence' }) });
+      return seen;
+    };
+    const isNotice = (m: LLMMessage): boolean => m.role === 'system' && typeof m.content === 'string'
+      && m.content.includes('<unverified-prior-claims>');
+    const prior: LLMMessage[] = [
+      { role: 'user', content: '반도체 시장 규모는?' },
+      { role: 'assistant', content: 'WSTS 전망은 1조 9,000억 달러입니다.' },
+    ];
+    const withHistory = await run(prior);
+    const noticeIndex = withHistory.findIndex(isNotice);
+    expect(noticeIndex).not.toBe(-1);
+    // The notice precedes the prior assistant text in the model context, which is still passed through unchanged.
+    expect(noticeIndex < withHistory.findIndex(m => m.role === 'assistant')).toBe(true);
+    expect(withHistory.some(m => m.role === 'assistant' && m.content === prior[1]!.content)).toBe(true);
+    expect(withHistory.filter(isNotice)).toHaveLength(1);
+    expect((await run([])).some(isNotice)).toBe(false);
+  });
+
   test('CEO original research answer keeps a readable 45-line mock intact without a forced next-step section', async () => {
     const prompt = 'omni crawl 로 grokbot 사용사례를 찾아주고 elanous 와 어떤 연계를 하면 될까요?';
     const answer = [

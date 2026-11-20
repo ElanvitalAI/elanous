@@ -122,11 +122,15 @@ test('만료되면 틱을 지우고 셸 프로세스 그룹을 끊는다', async
     deadlineMs: START + 1_000,
     onQueued: () => {},
   });
-  const killed: Array<NodeJS.Signals | undefined> = [];
+  const signals: Array<string | number | undefined> = [];
   const groups: number[] = [];
   const realKill = process.kill.bind(process);
-  process.kill = ((pid: number, signal?: NodeJS.Signals) => {
-    if (pid < 0) { groups.push(-pid); return true; }
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    // fake pid 4242: a group SIGTERM lands, then the existence probe (signal 0) reports ESRCH = gone.
+    if (pid < 0) {
+      if (signal === 0) throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+      groups.push(-pid); signals.push(signal); return true;
+    }
     return realKill(pid, signal);
   }) as typeof process.kill;
   try {
@@ -135,7 +139,7 @@ test('만료되면 틱을 지우고 셸 프로세스 그룹을 끊는다', async
       now: () => START + 2_000,
       spawnImpl: () => ({
         pid: 4242,
-        kill(signal?: NodeJS.Signals) { killed.push(signal); return true; },
+        kill() { return true; },
         stdout: null,
         stderr: null,
         on() { return this; },
@@ -144,7 +148,7 @@ test('만료되면 틱을 지우고 셸 프로세스 그룹을 끊는다', async
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     expect(runner.stopped).toBe(true);
     expect(groups).toContain(4242);
-    expect(killed).toContain('SIGTERM');
+    expect(signals).toEqual(['SIGTERM']);
     proc.stop();
     expect(groups.filter((pid) => pid === 4242)).toEqual([4242]);
   } finally {

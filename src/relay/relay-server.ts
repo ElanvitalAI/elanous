@@ -1,3 +1,4 @@
+import { isBareForwardedApiPath } from "./bare-surface.js";
 import { createPublicKey, randomBytes, randomUUID, verify } from "node:crypto";
 import { constantTimeTokenEqual } from "./member-service-token.js"; // (출처: #39104) 상수시간 대조
 import {
@@ -28,6 +29,7 @@ import {
   type PublicDispatchRoute,
 } from "./public-dispatch.js";
 import { isAnonymousPublicAppRead } from "./public-app-read.js";
+import { isBareStaticAssetRequest } from "./bare-static-path.js";
 /** WEBCHAT-SESSION-HANDOFF — the member Nexus's derived web-chat session cookie (http-server.ts
  * WEBCHAT_SESSION_COOKIE_NAME · value `wcs_<uuid>`). Shape only; the member Nexus validates it. */
 const WEBCHAT_SESSION_COOKIE =
@@ -69,7 +71,16 @@ export type RelayTrafficCapConfig =
     }
   | { readonly mode: "measure-only" };
 
+/** Bun.serve 최대 idleTimeout(초) — 기본 10초가 조용한 SSE 를 끊는다. */
+export const RELAY_HTTP_IDLE_TIMEOUT_SECONDS = 255;
+
 export type RelayTrafficDirection = "ingress" | "egress";
+/** relay 정적 claim 한 건 — memberId 는 항상 인증 호스트의 소유 회원. */
+export interface HandleClaim {
+  readonly handle: string;
+  readonly memberId: string;
+}
+
 export interface RelayTrafficUsage {
   readonly minute: number;
   readonly ingressBytes: number;
@@ -552,6 +563,11 @@ export interface RelayServerOptions {
       ownerId: string,
       input: { user: string; memberId: string },
     ): boolean | Promise<boolean>;
+    /** WEBCHAT-PIN-RESTORE — 인증 호스트 소유 회원의 정적 claim 핸들 목록(재시작 재핀 원천 · 읽기 전용). */
+    queryHandleClaims?(
+      serverId: string,
+      ownerId: string,
+    ): HandleClaim[] | Promise<HandleClaim[]>;
     /** (출처: #39104) 회원 서버 서비스 자격 «핀 읽기» — 연결 소유자가 아닌 회원의 살아 있는 핀도 불리언으로 답한다(쓰기 경로 없음). */
     queryHandlePinByMember?(
       input: { user: string; memberId: string },
@@ -1182,8 +1198,9 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       bareEntryPath === "/" ||
       bareEntryPath === "/app/chat" ||
       bareEntryPath.startsWith("/app/chat/") ||
-      bareEntryPath === "/v1/chat/events" ||
-      bareEntryPath === "/v1/prompt/stream";
+      isBareForwardedApiPath(bareEntryPath) ||
+      // MK #109530: PWA 정적 산출물(GET/HEAD /app/_next/static/** 등)도 회원 Nexus 로.
+      isBareStaticAssetRequest(req.method, bareEntryPath);
     if (!publicApp) {
       // A bare member host can point only to one explicitly public app on a pinned host.
       // A second app makes the destination ambiguous, so the route stays closed.
@@ -1393,14 +1410,27 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     // of a bare handle host only — which go to the member Nexus itself, never to an app —
     // it forwards such a request with its cookie, and the member Nexus decides (handle ·
     // expiry · revocation · pin owner; anything else is its 401).
+    // 출처: OP #108575 — handoff 303 착지 직후 같은 wcs_ 세션으로 GET /app/chat ·
+    // GET /app/chat/ 문서 2경로도 회원 Nexus 로 포워드한다(착지→문서 200→채팅 한 쌍
+    // 끝단 수리). 조건은 채팅 2경로와 동일 — bare 호스트 · wcs_ 쿠키 실림 · 회원
+    // 자격증명 없음. 쿠키 없는 문서 GET 은 이 집합 밖이라 memberGate 401 →
+    // WEBCHAT-401-LOGIN-PAGE 안내 HTML 로 그대로 떨어진다(다른 경로 확장 0).
     const bareWebChatSession =
       bareHit &&
       ((req.method === "POST" && bareEntryPath === "/v1/prompt/stream") ||
-        (req.method === "GET" && bareEntryPath === "/v1/chat/events")) &&
+        (req.method === "GET" && bareEntryPath === "/v1/chat/events") ||
+        (req.method === "GET" &&
+          (bareEntryPath === "/app/chat" ||
+            bareEntryPath === "/app/chat/"))) &&
       !memberCredentials(req).length &&
       WEBCHAT_SESSION_COOKIE.test(req.headers.get("cookie") ?? "");
+    // MK #109530: wcs_ 쿠키는 Path=/app/chat 라 /app/_next/* 에 실리지 않는다 →
+    // 해시 정적 산출물(비밀 없음)만 무쿠키 통과. 핀/클레임된 bare 핸들(bareHit)에 한정.
+    const bareStaticAsset =
+      bareHit && isBareStaticAssetRequest(req.method, bareEntryPath);
     const anonymousPublicRead =
       !bareWebChatSession &&
+      !bareStaticAsset &&
       (readExpiry === undefined || Date.now() < readExpiry) &&
       isAnonymousPublicAppRead(
         req,
@@ -1409,7 +1439,10 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         publicReadableApps,
       );
     const visitorPolicy =
-      visitorGate && !bareWebChatSession && !memberCredentials(req).length
+      visitorGate &&
+      !bareWebChatSession &&
+      !bareStaticAsset &&
+      !memberCredentials(req).length
         ? visitorPolicies.find(
             (policy) =>
               policy.user === publicApp.user &&
@@ -1447,7 +1480,16 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     }
     const anonymousVisitorWrite = visitorBody !== undefined;
     const memberGate =
-      anonymousPublicRead || anonymousVisitorWrite || bareWebChatSession
+      anonymousPublicRead ||
+      anonymousVisitorWrite ||
+      bareWebChatSession ||
+      bareStaticAsset ||
+      // 출처: OP #108336 — 무쿠키 GET /app/chat/handoff?handoff-token=… 교환 1경로만 통과(판정·실패 401 JSON 사유는 핀 호스트 Nexus consume).
+      (bareHit &&
+        req.method === "GET" &&
+        bareEntryPath === "/app/chat/handoff" &&
+        new URL(req.url).searchParams.has("handoff-token") &&
+        !memberCredentials(req).length)
         ? { status: "allowed" as const, consumed: [] }
         : await memberAuthorized(req, serverId);
     if (memberGate.status !== "allowed") {
@@ -1669,7 +1711,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       // An anonymous read consumes no member credential, so the consumed-only
       // stripping above cannot protect it. Never deliver audience credentials
       // (including cookies or protocol tokens) to a public application's host.
-      if (anonymousPublicRead || anonymousVisitorWrite) {
+      if (anonymousPublicRead || anonymousVisitorWrite || bareStaticAsset) {
         for (const name of [
           "authorization",
           "cookie",
@@ -1749,6 +1791,11 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 0,
     maxRequestBodySize: MAX_MUX_FRAME_BYTES,
+    // MK #109818 — Bun 기본 idleTimeout 은 10초: 소켓에 바이트가 오가지 않으면 연결을 끊는다.
+    // bare 웹채팅의 SSE(조용한 /v1/chat/events · 첫 토큰이 늦는 /v1/prompt/stream)가 10초 넘게
+    // 조용하면 브라우저가 «network error» 로 본다. Nexus 와 같은 Bun 최대값(255초)으로 맞춘다.
+    // (WebSocket 은 별도 websocket.idleTimeout 이라 영향 없음.)
+    idleTimeout: RELAY_HTTP_IDLE_TIMEOUT_SECONDS,
     async fetch(req, server) {
       const url = new URL(req.url);
       const isWebSocket =
@@ -2129,6 +2176,32 @@ export function startRelayServer(options: RelayServerOptions = {}) {
           // data.memberId)이고, 응답은 «핸들 H · 회원 M · 지금 살아 있는 인증
           // 호스트 핀» 불리언만 나간다. 위조(memberId ≠ owner)·남의 핸들은
           // 거부되고, 회원 서버는 거부를 false 로 해석한다(fail-closed ②).
+          if (
+            options.autoAppRegistration?.queryHandleClaims &&
+            room.host === ws &&
+            typeof value.requestId === "string" &&
+            /^[a-f0-9-]{36}$/.test(value.requestId) &&
+            value.type === "public-handle-claims-query"
+          ) {
+            const ownerId = hostOwnerMemberIds?.get(data.serverId);
+            if (!ownerId || data.memberId !== ownerId) {
+              sendControl(ws, { type: "public-app-rejected", requestId: value.requestId });
+              return;
+            }
+            void Promise.resolve()
+              .then(() => options.autoAppRegistration!.queryHandleClaims!(data.serverId, ownerId))
+              .then(
+                (handles) =>
+                  sendControl(ws, {
+                    type: "public-app-accepted",
+                    requestId: value.requestId,
+                    // 인증 호스트 소유 회원 몫 (handle, memberId) 쌍만 내려보낸다.
+                    result: handles,
+                  }),
+                () => sendControl(ws, { type: "public-app-rejected", requestId: value.requestId }),
+              );
+            return;
+          }
           if (
             options.autoAppRegistration?.queryHandlePin &&
             room.host === ws &&

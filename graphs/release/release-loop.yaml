@@ -18,10 +18,13 @@ triggers:
 version: 1
 # The runner's real node-arrival hook reads OP commands addressed to RLA before each release node.
 max_parallel_nodes: 3
-entry_node: cut-branch
+entry_node: traffic-prep
 dry_run_await_approval: true
 terminal_nodes: [done, failed]
 nodes:
+  # RELEASE-TRAFFIC-PREP-T1H: traffic control lives in the graph. The entry applies the T-1h traffic control under this run
+  # (holds before cutAt−1h, applies late runs with late: true) so cut-branch's guard and the countdown read its receipt.
+  - { node_id: traffic-prep, kind: gate, recipe: 'cmd:traffic-prep', max_visits: 1 }
   - { node_id: cut-branch, kind: git, recipe: 'cmd:cut-branch', max_visits: 1 }
   - { node_id: gate-image-prebuild, kind: git, recipe: 'cmd:gate-image-prebuild', max_visits: 1 }
   - { node_id: readiness-countdown, kind: gate, recipe: 'cmd:readiness-countdown', max_visits: 1 }
@@ -111,6 +114,8 @@ nodes:
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
 edges:
+  # A failed prep applied nothing for this run; resume re-enters at traffic-prep.
+  - { from: traffic-prep, on: outcome, map: { ok: cut-branch, fail: failed, error: failed } }
   - { from: cut-branch, on: outcome, map: { ok: gate-image-prebuild, fail: failed, error: failed } }
   - { from: gate-image-prebuild, on: outcome, map: { ok: readiness-countdown, fail: failed, error: failed } }
   - { from: readiness-countdown, on: outcome, map: { ok: traffic-cut-start, fail: failed, error: failed } }

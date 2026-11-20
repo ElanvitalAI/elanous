@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Message } from '../msg/msg-store.js';
 import type { GraphRunState } from './runner-types.js';
-import { assertPwaMailWaiver, isOperationalPwaMailSource, PWA_POLICY_SHA256, pwaMailPaths, pwaMailRowSha256 } from './release-pwa-mail-waiver.js';
+import { assertPwaMailWaiver, isOperationalPwaMailSource, latestCutRecord, PWA_POLICY_SHA256, pwaMailPaths, pwaMailRowSha256 } from './release-pwa-mail-waiver.js';
 import { assertSignedPwaBranchWaiver } from './release-pwa-waiver.js';
 import { openMsgStore } from '../msg/msg-store.js';
 
@@ -66,6 +66,19 @@ test.each(['0.3.15', '0.3.16'])('fresh PWA waiver %s requires exact current chil
       judMessageSha256: pin.judMessageSha256, pairedLogSha256: hash(paired) });
     expect(assertSignedPwaBranchWaiver(state, root, false, lookup)).toEqual({ documentSha256: packetSha256,
       signatureSha256: pin.judMessageSha256, pairedLogSha256: hash(paired) });
+    // RELEASE-PWA-MAIL-WAIVER-CUT-PARSE: a tip refresh (release resume/recover) appends a second JSON line to the cut output.
+    const staleCut = cut.replace(/a/g, 'c');
+    const cutLine = (commit: string, extra: Record<string, unknown> = {}) => JSON.stringify({ outcome: 'ok', commit, ...extra });
+    const withCutOutput = (cutOutput: string) => ({ ...state,
+      path: state.path.map(id => id === 'version-release' ? 'cut-branch' : id),
+      nodes: state.nodes.map(node => node.nodeId === 'version-release' ? { nodeId: 'cut-branch', output: cutOutput } : node) }) as unknown as GraphRunState;
+    const refreshed = `${cutLine(staleCut)}\n${cutLine(cut, { refreshedFrom: staleCut })}\n`;
+    expect(assertPwaMailWaiver(withCutOutput(refreshed), root, false, lookup).packetSha256).toBe(packetSha256);
+    expect(assertPwaMailWaiver(withCutOutput(`\nnot json\n${refreshed}\n  \n`), root, false, lookup).packetSha256).toBe(packetSha256);
+    expect(assertPwaMailWaiver(withCutOutput(cutLine(cut)), root, false, lookup).packetSha256).toBe(packetSha256);
+    expect(() => assertPwaMailWaiver(withCutOutput(`${cutLine(cut)}\n${cutLine(staleCut)}\n`), root, false, lookup)).toThrow('packet identity');
+    expect(() => assertPwaMailWaiver(withCutOutput('garbage\n{not json\n'), root, false, lookup)).toThrow('no JSON object line');
+    expect(() => assertPwaMailWaiver(withCutOutput(''), root, false, lookup)).toThrow('no JSON object line');
     expect(() => assertPwaMailWaiver({ ...state, runId: 'different-run' }, root, false, lookup)).toThrow();
     expect(() => assertPwaMailWaiver({ ...state, input: { version: version === '0.3.16' ? '0.3.15' : '0.3.16' } }, root, false, lookup)).toThrow();
     expect(() => assertPwaMailWaiver({ ...state, input: { version, cutCommit: 'b'.repeat(40) } }, root, false, lookup)).toThrow();
@@ -99,6 +112,17 @@ test.each(['0.3.15', '0.3.16'])('fresh PWA waiver %s requires exact current chil
     state.fanOuts!['traffic-gate-passed:ok']!.branches.pwa!.waiver!.signatureSha256 = 'b'.repeat(64);
     expect(() => assertPwaMailWaiver(state, root, true, lookup)).toThrow('saved waiver differs');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('latestCutRecord reads the last JSON object line of a refreshed cut output and fails closed without one', () => {
+  const staleCut = cut.replace(/a/g, 'c');
+  const refreshed = [JSON.stringify({ commit: staleCut }), JSON.stringify({ commit: cut, refreshedFrom: staleCut })].join('\n');
+  expect(latestCutRecord(`${refreshed}\n`)).toEqual({ commit: cut, refreshedFrom: staleCut });
+  expect(latestCutRecord(`${refreshed}\ntrailing log line\n\n`).commit).toBe(cut);
+  expect(latestCutRecord(JSON.stringify({ commit: cut })).commit).toBe(cut);
+  expect(latestCutRecord({ commit: cut }).commit).toBe(cut);
+  expect(() => latestCutRecord('garbage\n[]\n{broken')).toThrow('no JSON object line');
+  expect(() => latestCutRecord(undefined)).toThrow('no JSON object line');
 });
 
 test('null provenance is authorized only by IDs read from the operational instance mail DB', () => {

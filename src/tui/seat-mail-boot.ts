@@ -224,18 +224,28 @@ export function createSeatMailInbox(deps: SeatMailInboxDeps): SeatMailInboxContr
   };
 }
 
-/**
- * Register the seat branch once at boot; each render projects live health and wake state.
- * ELN-PLAN-WIRE-SEAT (#38016): `plan`이 주어지면 매 렌더에 «계획 k/m» 조각을 헤더에 붙인다(mf②).
- */
+export type SeatMailWatchStatus = 'stopped' | 'starting' | 'running' | 'read-error' | 'start-error';
+
+/** Register the seat branch once at boot; project current watcher health on each render. */
 export function createSeatMailHeaderHook(
   cwd: string,
   deps: Parameters<typeof readSeatMailSnapshot>[1] = {},
   plan?: { status(): SeatPlanStatus | null } | null,
+  watcher?: { getStatus(): SeatMailWatchStatus } | null,
 ): (health: NextTuiSelfHealthSnapshot | null, wakeup: Pick<NextTuiWakeup, 'headline'> | null) => string | null {
-  const mail = seatMailLine(readSeatMailSnapshot(cwd, deps));
+  const snapshot = readSeatMailSnapshot(cwd, deps);
+  const mail = seatMailLine(snapshot) ?? (resolveSeatId(cwd, { env: deps.env })
+    ? '⚠ 우편 감시 결속 실패: cwd/seat-state 없음' : null);
   return (health, wakeup) => {
-    const line = mail && wakeup ? `${mail} · ${wakeup.headline(health)}` : mail;
+    let watchLine: string | null = null;
+    if (mail && watcher) {
+      let status: SeatMailWatchStatus;
+      try { status = watcher.getStatus(); } catch { status = 'read-error'; }
+      if (status === 'read-error' || status === 'start-error') watchLine = `⚠ 우편 감시 오류: ${status}`;
+      else if (status === 'starting' || status === 'stopped') watchLine = `우편 감시 ${status}`;
+    }
+    const mailWithWatch = watchLine ? `${mail} · ${watchLine}` : mail;
+    const line = mailWithWatch && wakeup ? `${mailWithWatch} · ${wakeup.headline(health)}` : mailWithWatch;
     return plan ? appendSeatPlan(line, plan.status()) : line;
   };
 }

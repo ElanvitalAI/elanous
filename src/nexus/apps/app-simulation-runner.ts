@@ -7,6 +7,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { spawnElanous } from '../../instance/spawn-elanous.js';
 import { validateAppSimulationResult, type AppSimulationResult } from './app-simulation.js';
 import { renderAppScreen } from './app-screen-render.js';
+import { terminateTree } from '../../shell-primitive/terminate-tree.js';
 
 const REPOSITORY_ROOT = resolve(import.meta.dir, '../../..');
 const SCENARIOS: Readonly<Record<string, string>> = {
@@ -209,26 +210,18 @@ async function buildLectureScrapScenario(scenarioPath: string): Promise<{ file: 
     symlinkSync(dependencies, join(appRoot, 'node_modules'), 'dir');
     await new Promise<void>((resolveBuild, rejectBuild) => {
       const child = spawn(nextBin, ['build'], { cwd: appRoot, env: { ...process.env, NEXT_TELEMETRY_DISABLED: '1' }, stdio: ['ignore', 'ignore', 'pipe'], detached: process.platform !== 'win32' });
-      const signalBuildTree = (signal: NodeJS.Signals) => {
-        if (process.platform !== 'win32' && child.pid !== undefined) {
-          try { process.kill(-child.pid, signal); return; } catch { /* Fall through if the process group is already gone. */ }
-        }
-        child.kill(signal);
-      };
       let stderr = '';
       let timedOut = false;
       let settled = false;
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      let forceKill: ReturnType<typeof setTimeout> | undefined;
       let hardStop: ReturnType<typeof setTimeout> | undefined;
-      const clearTimers = () => { if (timeout) clearTimeout(timeout); if (forceKill) clearTimeout(forceKill); if (hardStop) clearTimeout(hardStop); };
+      const clearTimers = () => { if (timeout) clearTimeout(timeout); if (hardStop) clearTimeout(hardStop); };
       const fail = (error: Error) => { if (settled) return; settled = true; clearTimers(); rejectBuild(error); };
       timeout = setTimeout(() => {
         timedOut = true;
-        signalBuildTree('SIGTERM');
-        forceKill = setTimeout(() => signalBuildTree('SIGKILL'), 5_000);
+        // KILL-TREE-ONE: SIGTERM the group, SIGKILL after 5s (shared routine); the 15s hard stop still rejects.
+        void terminateTree(child, { group: process.platform !== 'win32', graceMs: 5_000, pidFallback: true });
         hardStop = setTimeout(() => {
-          signalBuildTree('SIGKILL');
           fail(new Error(`lecture-scrap static build process tree did not close after termination${stderr.trim() ? `: ${stderr.trim().slice(-1_000)}` : ''}`));
         }, 15_000);
       }, 180_000);

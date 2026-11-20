@@ -27,7 +27,7 @@ test('named release graph lowers traffic after gate and restores it only after v
   const verifyTraffic = 'traffic-verify-complete';
 
   // Cloud capacity drains before the pinned cutover policy selects the traffic path.
-  expect(edge('gate')).toEqual({ ok: 'cloud-leave-ok', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
+  expect(edge('gate')).toEqual({ ok: 'cloud-leave-ok', waived: 'receipt-audit', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
   expect(edge('cloud-leave-ok')).toEqual({ ok: 'gate-cutover-switch', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
   expect(edge('gate-cutover-switch')).toEqual({ legacy: gateTraffic, audit: 'receipt-audit', error: 'traffic-failed-restore' });
   expect(graph.edges.find((item) => item.from === gateTraffic)).toMatchObject({ warning_branches: ['mac-smoke'] });

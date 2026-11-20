@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 
 export type InboxLiveness =
   | { state: 'live' | 'stale' | 'down'; ageMs: number }
-  | { state: 'unknown'; reason: 'invalid-beat' | 'identity-mismatch' | 'future-beat' };
+  | { state: 'unknown'; reason: 'invalid-beat' | 'identity-mismatch' | 'future-beat' | 'read-error' };
 
 export function inboxLiveness(beat: unknown, identity: { host: string; sessionId?: string }, now: number): InboxLiveness {
   if (!beat || typeof beat !== 'object' || !Number.isFinite(now)) return { state: 'unknown', reason: 'invalid-beat' };
@@ -33,7 +33,11 @@ export function seatInboxAlivePath(seatStateRoot: string, seat: string): string 
 export function classifySeatInbox(path: string, identity: { host: string; sessionId?: string }, now: number): InboxLiveness {
   let raw: string;
   try { raw = readFileSync(path, 'utf8'); }
-  catch { return { state: 'down', ageMs: Number.POSITIVE_INFINITY }; } // ENOENT 등 → §2b 파일 없음 = down
+  catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+      ? { state: 'down', ageMs: Number.POSITIVE_INFINITY }
+      : { state: 'unknown', reason: 'read-error' };
+  }
   try { return inboxLiveness(JSON.parse(raw), identity, now); }
   catch { return { state: 'unknown', reason: 'invalid-beat' }; }
 }

@@ -51,7 +51,19 @@ export function cliPrincipal(stateDir: string, uid: number, ownerUid: (dir: stri
   try { owner = ownerUid(stateDir); }
   catch (error) { return { refused: `state folder unreadable: ${error instanceof Error ? error.message : String(error)}` }; }
   if (owner !== undefined && owner !== uid) return { refused: `state folder ${stateDir} belongs to uid ${owner}, not uid ${uid}` };
-  return { id: `local:${uid}`, kind: 'cli' };
+  // ELS-OP-ALLOW-RULE: merge ambient seat identity (no flags) — the door's coded defaults key on it.
+  const ambient = ambientSeat();
+  return { id: `local:${uid}`, kind: 'cli', ...ambient };
+}
+
+/** ELS-OP-ALLOW-RULE: seat identity from the environment — hands carry their seat name and the workspaces bound to them; OP carries 'OP'. */
+function ambientSeat(): { seat?: string; workspaces?: readonly string[] } {
+  const seat = process.env.ELANOUS_SEAT ?? process.env.SEAT;
+  const workspaces = process.env.ELANOUS_WORKSPACES;
+  return {
+    ...(seat ? { seat } : {}),
+    ...(workspaces ? { workspaces: workspaces.split(',').map((w) => w.trim()).filter(Boolean) } : {}),
+  };
 }
 
 /** What the person is approving: who, as whom, where, and the exact line. */

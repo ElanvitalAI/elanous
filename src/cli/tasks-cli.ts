@@ -16,11 +16,12 @@ import { compareVersions } from '../directives/version-at.js';
 import type { BoardNode } from '../task-agent/board.js';
 import { boundPrTerminal, cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, defaultDraftClaimGhPorts, handDraftClaim, HAND_MOVE_HISTORY_EVENT, updateTaskCard, resolveHandText, readTaskAgentState, readTaskCard, runTagChange, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_SEATS, type CompletionKind, type DraftClaimGhPorts, type TaskCard, type TaskCardEvent, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { recordWiringLiveVerified, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
-import { PARENT_HOST_COMPATIBILITY_CONTRACT, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs } from '../task-agent/parent-host.js';
+import { PARENT_HOST_COMPATIBILITY_CONTRACT, defaultSshRunner, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs } from '../task-agent/parent-host.js';
+import { readCardAllocation } from '../task-agent/alloc-evidence.js';
 import { buildWorkOrder } from '../task-agent/work-order-build.js';
 import { evaluateTaPreflight, parseHandShadowEvidence, renderTaPreflight, targetEvidenceMismatch, taPreflightReceipt, type TaPreflightEvidence } from '../task-agent/ta-preflight.js';
 import { parseWorkOrder } from '../task-agent/work-order.js';
-import { collectRuntimePreflightEvidence, evidenceFromRunLedger, mergeCollectedEvidence } from '../task-agent/ta-preflight-collect.js';
+import { collectRuntimePreflightEvidence, evidenceFromRunLedger, mergeCollectedEvidence, observeTargetPaths } from '../task-agent/ta-preflight-collect.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
 import { ambiguousGreenSweepPrs, applyGreenSweepDecisions, decideGreenSweep, greenSweepCandidates, greenSweepEvidenceTestArgs, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
 import { mapInventory, renderMapReduceTable, type MapInventory, type MapItem, type MapPorts } from '../task-agent/map-reduce.js';
@@ -123,6 +124,7 @@ export interface TasksCliDeps {
   /** Test seam for the same-goal active-run observation; production queries the real run ledger. */
   preflightActiveRuns?: (goalId: string) => ActiveRunsForGoal;
   preflightHoldActive?: () => boolean;
+  preflightAllocation?: (cardId: string) => ReturnType<typeof readCardAllocation>;
   /** HARNESS-PARENT-ON-MSB1 — 원격 부모 카드의 원장 거울(시험 주입). 기본 = ssh 로 `<prodRoot>/remote-parents/<host>/run-ledger`. */
   remoteLedgerMirror?: (card: TaskCard) => void;
   /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
@@ -2017,10 +2019,15 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           try { opHoldActive = (deps.preflightHoldActive ?? observeLaunchHold)(); } catch { /* remains unknown */ }
           const observed = collectRuntimePreflightEvidence({ card: card ?? null, activeRuns,
             opHoldActive });
-          merged = { ...merged, launch: { ...merged.launch, ...observed.launch } };
+          let allocation: ReturnType<typeof readCardAllocation> = null;
+          try {
+            if (card) allocation = deps.preflightAllocation ? deps.preflightAllocation(card.id)
+              : readCardAllocation(card.id, Math.floor(Date.now() / 1000), defaultSshRunner);
+          } catch { /* inaccessible authority is unmeasured */ }
+          merged = { ...merged, allocation, owner: { ...merged.owner, ...observed.owner }, launch: { ...merged.launch, ...observed.launch }, entrance: { ...merged.entrance, targetPathsValid: observeTargetPaths(card ?? null), targetHostBound: null } };
         } else {
           // A cell or commit alone does not identify a card or its goal. Never trust supplied launch claims.
-          merged = { ...merged, launch: { cardClaimed: null, activeSameGoalRuns: null, opHoldActive: null } };
+          merged = { ...merged, allocation: null, owner: { ...merged.owner, card: null }, launch: { cardClaimed: null, activeSameGoalRuns: null, opHoldActive: null }, entrance: { ...merged.entrance, targetPathsValid: null, targetHostBound: null } };
         }
         // 코드 기본값은 «관측값»이 아니다 — 증거를 채우지 않고 영수증에 defaultAssumed 로 따로 남긴다(조건 ④ 판정에 쓰지 않음).
         const [{ DEFAULT_MAX_HARD_WAIT_SEC }, { POD_JOB_DEADLINE_SECONDS }] = await Promise.all([

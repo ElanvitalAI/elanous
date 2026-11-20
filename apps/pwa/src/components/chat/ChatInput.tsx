@@ -135,6 +135,8 @@ interface Props {
   attachments?: AttachmentMeta[];
   onAttached?: (entries: AttachmentMeta[]) => void;
   onRemoveAttachment?: (id: string) => void;
+  /** Bare webchat: picked files are read in the browser instead of uploaded. */
+  onLocalFiles?: (files: File[]) => void;
   /** PWA Phase 2·A — `@` file picker fetcher. parent (ChatLayout) 가
    *  AcpConnection.send('elanous/fs/list', ...) 으로 wire. nil 시 picker
    *  disabled (no overlay). */
@@ -180,6 +182,7 @@ export function ChatInput({
   attachments = EMPTY_ATTACHMENTS,
   onAttached,
   onRemoveAttachment,
+  onLocalFiles,
   onListFiles,
   onListSkills,
   prefill,
@@ -1002,7 +1005,7 @@ export function ChatInput({
             from the same picker). Camera, note, voice memo and provider chips were removed
             (backup tag archive/pwa-pre-minimal-20261117). */}
         <div className="flex shrink-0 items-center gap-0.5 pb-1" data-elanous-composer-tools>
-          <FileAttachButton onAttached={onAttached} chatLimits />
+          <FileAttachButton onAttached={onAttached} chatLimits onLocalFiles={onLocalFiles} />
         </div>
         <textarea
           value={value}

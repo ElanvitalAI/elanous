@@ -1976,6 +1976,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const isEmptyFixture = (file: string) => file === 'test/__audit-ratchet-fake.test.ts';
     const allAssignable = allFiles.filter((file) => !isEmptyFixture(file) && !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
       && !file.split('/').some((part) => part.startsWith('.')));
+    // GATE-REPLAY-STABILITY — the audit sentinel's skip (#37020) is an analytic dispatch lane, not an inventory
+    // removal. Receipt-radius and stable-layout proofs must keep seeing it as a measured file: a recorded partition
+    // that ran it inside a multi-file shard stays valid. Filtering it here made every replay of a pre-#37020 receipt
+    // set fail its radius proof and silently replan, moving all tests between shard IDs and voiding the per-shard
+    // impact proofs the receipts exist for (known-fail 190: dispatch drifted from the recorded roster).
+    const receiptAssignable = allFiles.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
+      && !file.split('/').some((part) => part.startsWith('.')));
     const verdictRoot = pod.shardsFile?.path
       ? dirname(dirname(dirname(dirname(dirname(pod.shardsFile.path))))) : undefined;
     const knownInterferencePairs = only && verdictRoot && pod.shardsFile?.version
@@ -2032,9 +2039,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (impact.fullRerun) changedReceiptFullRerun = impact.fullRerun;
       for (const file of impact.files) changedReceiptFiles.add(file);
     }
-    const radiusSelection = effectiveOnly ?? (changedReceiptFullRerun ? allAssignable : [...changedReceiptFiles]);
+    const radiusSelection = effectiveOnly ?? (changedReceiptFullRerun ? receiptAssignable : [...changedReceiptFiles]);
     const radiusPriorCommit = effectiveOnly ? pod.shardsFile?.radiusPriorCommit ?? '' : receiptHeads.length === 1 ? receiptHeads[0]! : commit;
-    const radiusReceiptPlan = priorReceiptRows.length ? planGateReceiptRadius({ receipts: priorReceiptRows, tests: allAssignable,
+    const radiusReceiptPlan = priorReceiptRows.length ? planGateReceiptRadius({ receipts: priorReceiptRows, tests: receiptAssignable,
       selectedFiles: radiusSelection, priorCommit: radiusPriorCommit }) : null;
     const radiusUnchangedShardIds = radiusReceiptPlan?.unchangedShardIds ?? [];
     const radiusInvalidatedShardIds = radiusReceiptPlan?.invalidatedShardIds ?? [];
@@ -2044,10 +2051,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       // current durations can move tests between shard IDs and makes a valid per-shard impact proof unusable.
       const ordered = [...priorReceiptRows].sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
       const measuredFiles = ordered.flatMap((receipt) => receipt.files);
-      const inventory = new Set(allAssignable);
+      const inventory = new Set(receiptAssignable);
       const stableLayout = ordered.every((receipt, index) => receipt.id === `pod-${index}` && receipt.status === 'complete'
         && receipt.files.length > 0 && receipt.files.every((file) => inventory.has(file)))
-        && measuredFiles.length === allAssignable.length && new Set(measuredFiles).size === measuredFiles.length
+        && measuredFiles.length === receiptAssignable.length && new Set(measuredFiles).size === measuredFiles.length
         && measuredFiles.every((file) => inventory.has(file));
       if (stableLayout) {
         assignable = allAssignable;
@@ -2954,6 +2961,18 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       }
       // A launch that failed before placement still gives its admission back (release is idempotent).
       admitted?.release();
+      // GATE-POD-COMMAND-FAILFAST — a Pod command that died without any Job verdict (infra: launch, queue, ssh
+      // failure) carries no per-file signal, but the bisect fan-out is only dangerous in a fresh re-measurement of
+      // receipt-backed shards (known-fail 190: one infra error replayed into a whole split tree — ~90 Pods per
+      // shard, ledger rows past 12k; freshShards marks exactly that replay context and receiptRoot holds the prior
+      // coverage the settle falls back on). Fresh ad-hoc sweeps keep their designed recovery paths: member-lost
+      // host failover, failure-evidence capture (pod-N.json), supervision rejections, and thrown timeout /
+      // artifact-retrieval errors that may still carry per-file signal and must be split (see gate-node «Pod splits
+      // thrown timeout or artifact retrieval errors»). An image-pin supervision rejection keeps its specific
+      // fail-closed reason everywhere.
+      if (jobFailed && !imagePinMismatch && pod.freshShards === true && receiptRoot !== undefined && existsSync(receiptRoot) && rc === undefined && output === undefined && junit === undefined)
+        return { runs: [], stalled: [{ shard, files: paths, reason: 'job-failed',
+          detail: jobError.slice(0, 300), ...(placedOn ? { lastHost: placedOn } : {}) }] };
       if (warmQuarantineFailed) return { runs: [], stalled: [{ shard, files: paths, reason: 'job-failed',
         detail: jobError.slice(0, 300), ...(placedOn ? { lastHost: placedOn } : {}) }] };
       const durationMs = clock() - start;

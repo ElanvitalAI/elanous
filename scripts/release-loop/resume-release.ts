@@ -30,7 +30,7 @@ import { assertSignedPwaBranchWaiver } from '../../src/graph-runner/release-pwa-
 import { publicWaiverReason } from './known-issues-node.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
-import { runCutGateImagePrebuild } from './gate-image-pin.js';
+import { runCutGateImagePrebuild, prebuildFailureLine } from './gate-image-pin.js';
 import { releaseLoopConfig } from './unattended-release.js';
 import { trafficOptionsFromConfig } from './traffic-transition.js';
 import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
@@ -1322,7 +1322,7 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
       outcome: gateImagePrebuild.outcome, ...(gateImagePrebuild.outcome === 'failed' ? { reason: gateImagePrebuild.reason } : {}),
       ...(gateImagePrebuild.outcome === 'built' || gateImagePrebuild.outcome === 'reused'
         ? { digest: gateImagePrebuild.digest, eligiblePools: gateImagePrebuild.eligiblePools } : {}) });
-    if (gateImagePrebuild.outcome === 'failed') return stop('resume', new Error(`cut gate image prebuild failed: ${gateImagePrebuild.reason}`));
+    if (gateImagePrebuild.outcome === 'failed') return stop('resume', new Error(prebuildFailureLine(gateImagePrebuild)));
   }
 
   // 3/3 resume from the earliest saved cut consumer — the read-only preflight first (its plan is the record), then the graph run.

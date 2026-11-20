@@ -210,6 +210,23 @@ describe('runChatTurnStreaming — block accumulator (Phase B-2)', () => {
     const result = await runChatTurnStreaming('배포해줘', makeCtx('sess-deploy'));
     expect(result.message.blocks?.find((block) => block.kind === 'deploy_result')).toEqual({ kind: 'deploy_result', toolId: 'd1', result: { status: 'published', publicUrl: receipt.publicUrl } });
   });
+  it('streams early-answer text as body (segmentStart 0) before turn-end, even once tools start', async () => {
+    const early = '반도체 2027: 메모리 업사이클 지속.';
+    globalThis.fetch = mockSseResponseChunks([
+      `event: turn-begin\ndata: {"sessionId":"sess-early"}\n\n`,
+      `event: text-delta\ndata: ${JSON.stringify({ delta: early, full: early })}\n\n`,
+      `event: tool-call\ndata: {"id":"t1","name":"web_search","args":{}}\n\n`,
+      `event: text-delta\ndata: ${JSON.stringify({ delta: ' 근거 1.', full: `${early} 근거 1.` })}\n\n`,
+      `event: turn-end\ndata: ${JSON.stringify({ sessionId: 'sess-early', text: `${early} 근거 1. 최종.`, stopReason: 'end_turn' })}\n\n`,
+    ]);
+    const partials: Array<[string, number | undefined]> = [];
+    const result = await runChatTurnStreaming('2027 반도체 전망', makeCtx('sess-early'), {
+      onPartial: (full, segmentStart) => partials.push([full, segmentStart]),
+    });
+    // Every streamed delta (before turn-end resolved) carries segmentStart 0 => the renderer shows it in the body.
+    expect(partials).toEqual([[early, 0], [`${early} 근거 1.`, 0]]);
+    expect(result.message.blocks?.some((b) => b.kind === 'tool_use')).toBe(true);
+  });
   it('text-only turn returns ChatMessage without `.blocks` (legacy text path preserved)', async () => {
     globalThis.fetch = mockSseResponseChunks([
       `event: turn-begin\ndata: {"sessionId":"sess-A"}\n\n`,
