@@ -73,6 +73,58 @@ const serverWithPane = async (screen: string, withTap = true): Promise<{ root: s
   return { root, pane: made.pane, token: envs[0]?.[AUTH_PANE_TOKEN_ENV] as string, emit, close };
 };
 
+test('closed recording is stoppable by the same seat but not another seat', async () => {
+  __resetRecordingStoreForTest();
+  const root = state();
+  const tokens: string[] = [];
+  const started = await startElsServer({ stateRoot: root, stall: false, spawn: (_c, _d, _t, env) => {
+    tokens.push(env[AUTH_PANE_TOKEN_ENV]!);
+    return fakePty('record').pty;
+  } });
+  if ('exitCode' in started) throw new Error(started.message);
+  cleanups.push(() => started.close());
+  const make = (ws: string, seat: string) => JSON.parse(started.core.newPane({ ws, cwd: '/tmp', command: ['sh'], ownerSeat: seat, parent: { kind: 'hand', seat, workspaces: [ws] } }).message).pane as string;
+  const caller = make('A', 'HAND-A');
+  const target = make('A', 'HAND-A');
+  make('B', 'HAND-B');
+  expect((await ask(root, { op: 'record', pane: target }, tokens[0])).exitCode).toBe(0);
+  expect(started.core.close(target).exitCode).toBe(0);
+  expect((await ask(root, { op: 'record', pane: target }, tokens[2])).exitCode).toBe(1);
+  expect(getRecordingStore().size()).toBe(1);
+  const stop = await ask(root, { op: 'record', pane: target }, tokens[0]);
+  expect(stop.exitCode).toBe(0);
+  expect(existsSync(castPath(stop))).toBe(true);
+  expect(getRecordingStore().size()).toBe(0);
+  expect(caller).not.toBe(target);
+});
+
+test('child lifecycle stays within the caller owned workspace', async () => {
+  const root = state();
+  const tokens: string[] = [];
+  const started = await startElsServer({ stateRoot: root, stall: false, spawn: (_c, _d, _t, env) => {
+    tokens.push(env[AUTH_PANE_TOKEN_ENV]!);
+    return fakePty('child').pty;
+  } });
+  if ('exitCode' in started) throw new Error(started.message);
+  cleanups.push(() => started.close());
+  const make = (ws: string, seat: string) => started.core.newPane({ ws, cwd: '/tmp', command: ['sh'], ownerSeat: seat, parent: { kind: 'hand', seat, workspaces: [ws] } });
+  expect(make('A', 'HAND-A').exitCode).toBe(0);
+  expect(make('B', 'HAND-B').exitCode).toBe(0);
+  const child = (action: string, extra: object = {}) => ({ op: 'child', action, ...extra });
+  expect((await ask(root, child('start', { id: 'c', ws: 'A', label: 'own' }), tokens[0])).exitCode).toBe(0);
+  expect((await ask(root, child('progress', { id: 'c', line: 'bad' }), tokens[1])).exitCode).toBe(1);
+  expect((await ask(root, child('status', { id: 'c', state: 'blocked' }), tokens[1])).exitCode).toBe(1);
+  expect((await ask(root, child('status', { id: 'c', state: 'blocked' }))).exitCode).toBe(1);
+  expect((await ask(root, child('tree', { ws: 'A' }), tokens[1])).exitCode).toBe(1);
+  expect((await ask(root, child('start', { id: 'bad', ws: 'B', parent: 'c', label: 'bad' }), tokens[1])).exitCode).toBe(1);
+  expect((await ask(root, child('progress', { id: 'c', line: 'good' }), tokens[0])).exitCode).toBe(0);
+  expect((await ask(root, child('status', { id: 'c', state: 'blocked' }), tokens[0])).exitCode).toBe(0);
+  const tree = await ask(root, child('tree', { ws: 'A' }), tokens[0]);
+  expect(tree.exitCode).toBe(0);
+  expect(tree.message).toContain('blocked');
+  expect((await ask(root, child('end', { id: 'c', ok: true, summary: 'done' }), tokens[0])).exitCode).toBe(0);
+});
+
 // ── snapshot ─────────────────────────────────────────────────────
 test('snapshot saves an svg artifact holding the pane screen, owner-only, under the state root', async () => {
   __resetRecordingStoreForTest();

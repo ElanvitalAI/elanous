@@ -15,6 +15,8 @@ import {
   type LogEntry,
   type RenderOpts,
 } from '../log-entry.js';
+import { runShell } from '../shell-runner/dispatch.js';
+import { getShellRegistry } from '../shell-runner/registry.js';
 import type { ExecuteSkillOpts, SkillManifest } from './runner.js';
 import type { TerminalSessionRegistry } from '../terminal/session-registry.js';
 import { setTerminalInjectApprover, setTerminalInjectRegistryForTesting } from '../tool-runtime/terminal-inject-runtime.js';
@@ -68,7 +70,7 @@ const skillRunnerSpies = [
         mermaidDispatchResult = toolResult;
         return toolResult;
       })
-      : call.name === 'TerminalModalInject'
+      : call.name === 'TerminalModalInject' || call.name === 'ShellKill'
         ? await handlers.dispatchTool(call.name, call.args, { callId: call.id })
       : TOOL_OUTPUT;
     handlers.onToolResult?.({ id: call.id, name: call.name, result });
@@ -447,4 +449,27 @@ describe('executeSkill feedback ledger (SK1)', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 120_000);
+});
+
+test('skill runner binds ShellKill to the host session and ignores argument identity', async () => {
+  const registry = getShellRegistry();
+  let kills = 0;
+  const handle = { id: 'skill-owned-shell', status: 'running', kill: () => { kills += 1; } };
+  const register = spyOn(registry, 'register').mockImplementation(() => {});
+  const get = spyOn(registry, 'get').mockReturnValue(handle as never);
+  runShell({ command: ['fixture'], mode: 'bg' }, {
+    registry, fileEngine: { run: () => handle } as never,
+  }, { ownerSessionId: 'shell-owner' });
+  const previousToolCall = streamToolCall;
+  streamToolCall = { name: 'ShellKill', args: { id: handle.id, sessionId: 'shell-owner' } };
+  try {
+    await runExecuteSkill(undefined, { sessionId: 'other-session' });
+    expect(kills).toBe(0);
+    await runExecuteSkill(undefined, { sessionId: 'shell-owner' });
+    expect(kills).toBe(1);
+  } finally {
+    streamToolCall = previousToolCall;
+    get.mockRestore();
+    register.mockRestore();
+  }
 });

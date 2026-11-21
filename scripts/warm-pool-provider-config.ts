@@ -540,10 +540,12 @@ export async function runWarmPoolProviderConfig(argv: readonly string[]): Promis
   }
 }
 
-if (import.meta.main) {
+async function runWarmPoolProviderConfigMain(): Promise<void> {
   try { await runWarmPoolProviderConfig(process.argv.slice(2)); }
   catch (error) {
     process.stderr.write(`warm-pool-provider-config: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 2;
   }
 }
+
+if (import.meta.main) void runWarmPoolProviderConfigMain();

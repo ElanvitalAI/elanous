@@ -1,6 +1,7 @@
 import { debug } from '../debug/log.js';
 import { cardPrNumber, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, readTaskAgentState, readTaskCard, shellQuote, taskAgentStatePath as taskStatePathDefault, taskCardLabelContext, type TaskCard } from '../task-agent/task-hand.js';
 import { RUN_TAG_KEYS, runIdentityFieldText, runPriorityClass } from '../task-agent/run-identity.js';
+import { recycleStalledLaunches, runLedgerReasonCodeFor, taLaunchLine } from '../task-agent/launch-result-loop.js';
 import { readCardSalvageBranch, refreshCardRunBinding } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import type { TasksCliDeps } from './tasks-cli.js';
@@ -97,6 +98,7 @@ function taskCardLines(card: TaskCard): string[] {
     ...(card.targetPaths !== undefined ? [`대상 경로: ${card.targetPaths.length ? card.targetPaths.join(' · ') : '(유효한 경로 없음)'}`] : []),
     ...(card.mission ? [`미션: ${card.mission} · after: ${card.after?.length ? card.after.join(', ') : '-'}`] : []),
     ...runLinkLine(card),
+    ...(card.runId ? [taLaunchLine(card)] : []), // TA-LAUNCH-RESULT-LOOP — 발사마다 관측 한 줄(runId·칸·head·단계)
     ...liveMoveLines(card),
     `다음 수: ${moveLine(card)}`,
   ];
@@ -177,14 +179,24 @@ export async function showTaskCard(id: string, opts: { json?: boolean }, deps: T
     }
     return;
   }
+  // TA-LAUNCH-RESULT-LOOP(수 2) — 관측 고리: 보는 순간 15분 무진척 발사면 자동 회수(정확 runId stop ⊕ 원인 분류 skip-note).
+  // 카드 status 는 기존 전이 소유 — 여기선 history 에 skip-note 만 더한다(보존). 멱등: 이미 회수된 카드는 건너뛴다.
+  const recycled = recycleStalledLaunches([card], {
+    ...(deps.reviewResultNow ? { nowMs: deps.reviewResultNow().getTime() } : {}),
+    // 원인 분류의 정본은 런 원장 stop 기록이다(읽기 전용) — 미배선 시 항상 unknown→unclassified 였다(JUD-B #118928).
+    ...(deps.reasonCodeFor ? { reasonCodeFor: deps.reasonCodeFor } : { reasonCodeFor: runLedgerReasonCodeFor }),
+    statePath: deps.taskStatePath ?? taskStatePathDefault(),
+  });
+  if (recycled.length) card = readTaskCard(id, deps.taskStatePath) ?? card;
   // DRAFT-NOT-ARCHIVE: 멈춘 런이 draft PR 대신 남긴 수확 가지(원장 `salvaged`). 못 읽었으면 «못 읽음»(⛔ 없음 아님).
   let salvage: Awaited<ReturnType<typeof readCardSalvageBranch>> = { salvageBranch: null };
   try { salvage = await readCardSalvageBranch(card, deps.cardRunEvidence ?? {}); }
   catch (error) { salvage = { salvageBranch: null, readErrors: [error instanceof Error ? error.message : String(error)] }; }
   const salvageUnread = !salvage.salvageBranch && !!salvage.readErrors?.length;
-  if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card), ...cardGoalEvidence(card, deps), salvageBranch: salvage.salvageBranch, ...(salvageUnread ? { salvageBranchUnread: true } : {}) }));
+  if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card), ...cardGoalEvidence(card, deps), salvageBranch: salvage.salvageBranch, ...(salvageUnread ? { salvageBranchUnread: true } : {}), ...(recycled.length ? { taRecycled: recycled } : {}) }));
   else {
     for (const line of taskCardLines(card)) out(line);
+    for (const outcome of recycled) out(`TA 회수: runId=${outcome.runId} · 원인=${outcome.cause} · 무진척 ${outcome.minutesStalled}분 · 정확 runId stop=${outcome.stopRecorded ? '기록됨' : `실패 — 재시도 대상 유지(${outcome.skipNote})`} · ${outcome.stopRecorded ? 'skip-note=칸 history' : '마커=칸 history(회수 아님)'}`);
     if (card.parentHost) out(`부모 호스트: ${card.parentHost.host}${card.parentHost.pid ? ` (pid ${card.parentHost.pid})` : ''} · PR 까지만 — 병합은 HQ${card.parentHost.log ? ` · 로그 ${card.parentHost.host}:${card.parentHost.log}` : ''}`);
     if (salvage.salvageBranch) out(`수확 가지: ${salvage.salvageBranch} (draft PR 대신)`);
     else if (salvageUnread) out('수확 가지: 못 읽음(원장 읽기 실패)');

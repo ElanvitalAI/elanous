@@ -1,5 +1,5 @@
-import type { OpsSeats } from '@/lib/ops-api';
-import { seatNowLine, type LoopSeat } from '@/components/inside/loop-agents-view';
+import type { OpsSeats } from '../../lib/ops-api';
+import { seatNowLine, type LoopSeat } from '../inside/loop-agents-view';
 
 const ORDER = [
   { id: 'OP', seat: 'COO' }, { id: 'MK', seat: 'CMO' },

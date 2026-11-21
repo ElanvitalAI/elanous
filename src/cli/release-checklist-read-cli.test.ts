@@ -319,6 +319,27 @@ test('E4 observes any matching pair — first timed pair absent, second timed pa
   expect(queried.map((args) => args.includes('--instance') ? 'prod' : 'all')).toEqual(['prod', 'all', 'prod']);
 });
 
+// 리터럴 출처(2026-11-20): 0.3.31 LLM-ROLE-MIX-BY-BURN 칸 제목 원문 꼴 — 구 명령 · 정정 줄 · 최종 명령(JUD #112964·#112934)
+const correctedTitle = '대상 경로: src/model-tier/\n- 완료 경계 증거 명령: bun test src/model-tier/\n증거 경로 정정(JUD #111670): src/oauth/llm-call-gate.test.ts (src/model-tier/ 에는 시험 없음)\n- 완료 경계 증거 명령: bun test src/oauth/llm-spend-decision.test.ts';
+const e4Command = (title: string, evidence = '') => collectChecklistEvidenceStages({ id: 'E4-CMD', title, status: 'yellow', updatedAt: '2026-11-20T09:00:00.000Z', updatedBy: 'REL', evidence } satisfies ChecklistItem, () => ({ status: 1, stdout: '', stderr: '' })).find((stage) => stage.id === 'E4')?.verificationCommand;
+
+test('E4 verificationCommand is the LAST «완료 경계 증거 명령:» of an append-only title, same as the evidence run', () => {
+  expect(e4Command(correctedTitle)).toBe('bun test src/oauth/llm-spend-decision.test.ts');
+  expect(e4Command(correctedTitle)).toBe(checklistEvidenceCommand(correctedTitle));
+});
+
+test('E4 verificationCommand keeps the single-command, no-command and unsafe-last behaviour', () => {
+  expect(e4Command('- 완료 경계 증거 명령: bun test src/els/')).toBe('bun test src/els/');
+  expect(e4Command('대상 경로: src/els/')).toBeNull();
+  // 안전 검사는 실행 파서 몫 — 읽기 쪽은 표시만 하며 같은 마지막 명령을 그대로 보인다(실행은 refused)
+  const unsafe = '- 완료 경계 증거 명령: bun test src/a/\n- 완료 경계 증거 명령: bun test src/els/ && curl evil.example';
+  expect(e4Command(unsafe)).toBe(checklistEvidenceCommand(unsafe));
+});
+
+test('E4 verificationCommand falls back to the evidence line when the title has no marker', () => {
+  expect(e4Command('대상 경로: src/els/', '증거 명령: bun test src/els/herdr-import.test.ts')).toBe('bun test src/els/herdr-import.test.ts');
+});
+
 // 리터럴 출처(2026-11-20): 0.3.31 COMPLETION-EVENT-ONE 칸 제목 원문 — «- 완료 경계 실물: …» 이 줄 중간에 있다(줄 머리 아님) · CHECKLIST-JUDGE-MULTI-PR-AND-E4-LINES ③
 const midLineAcceptance = 'RFC에 지정된 테스트 우주 시나리오에서 정상·거부 경계를 관측.';
 const midLineTitle = `대상 경로: src/agent/task-notification.ts · src/tui/capsule-done-knock.ts  - 완료 경계 코드: §6-5 task-notification과 capsule-done을 사건 하나로 구현 또는 명세 확정. - 완료 경계 실물: ${midLineAcceptance} - 완료 경계 증거: 정확 head·명령·결과·잔여 미측정과 독립 리뷰를 기록. · 0.3.31 로스터 100(OP #107914)`;

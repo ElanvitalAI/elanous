@@ -1194,7 +1194,18 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     // publicReadableApps "정확히 1개" 게이트보다 앞에서 판정한다. 공개 앱이
     // 0개여도 bare 요청은 회원 Nexus 로 흘러야 하기 때문이다.
     const bareEntryPath = new URL(req.url).pathname;
+    // WEBCHAT-SESSION-HISTORY-PERSIST — 회원 대화 목록·내용 읽기(GET 2경로)도 회원 Nexus 로.
+    // 회원 Nexus 가 wcs_ 파생 세션을 대조하고 그 회원 소유 세션만 답한다.
+    const bareSessionStoreRead =
+      req.method === "GET" &&
+      (bareEntryPath === "/v1/sessions/store" ||
+        /^\/v1\/sessions\/store\/[^/]+$/.test(bareEntryPath));
+    const bareSessionStoreWrite =
+      (req.method === "PATCH" || req.method === "DELETE") &&
+      /^\/v1\/sessions\/store\/[^/]+$/.test(bareEntryPath);
     const bareWebChatNexusPath =
+      bareSessionStoreRead ||
+      bareSessionStoreWrite ||
       bareEntryPath === "/" ||
       bareEntryPath === "/app/chat" ||
       bareEntryPath.startsWith("/app/chat/") ||
@@ -1419,6 +1430,8 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       bareHit &&
       ((req.method === "POST" && bareEntryPath === "/v1/prompt/stream") ||
         (req.method === "GET" && bareEntryPath === "/v1/chat/events") ||
+        bareSessionStoreRead ||
+        bareSessionStoreWrite ||
         (req.method === "GET" &&
           (bareEntryPath === "/app/chat" ||
             bareEntryPath === "/app/chat/"))) &&
@@ -1681,7 +1694,9 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       // bearer 재생을 막는다.
       const bareChatApiRoute =
         bareNexusRoute &&
-        (barePath === "/v1/chat/events" || barePath === "/v1/prompt/stream");
+        (barePath === "/v1/chat/events" ||
+          barePath === "/v1/prompt/stream" ||
+          bareSessionStoreRead);
       if (
         memberGate.consumed.some(
           (credential) => credential.source === "authorization",
@@ -2176,6 +2191,18 @@ export function startRelayServer(options: RelayServerOptions = {}) {
           // data.memberId)이고, 응답은 «핸들 H · 회원 M · 지금 살아 있는 인증
           // 호스트 핀» 불리언만 나간다. 위조(memberId ≠ owner)·남의 핸들은
           // 거부되고, 회원 서버는 거부를 false 로 해석한다(fail-closed ②).
+          // An authenticated host may ask before claims support is configured. Reject
+          // this known control without dropping the host's otherwise usable tunnel.
+          if (
+            value.type === "public-handle-claims-query" &&
+            room.host === ws &&
+            typeof value.requestId === "string" &&
+            /^[a-f0-9-]{36}$/.test(value.requestId) &&
+            !options.autoAppRegistration?.queryHandleClaims
+          ) {
+            sendControl(ws, { type: "public-app-rejected", requestId: value.requestId });
+            return;
+          }
           if (
             options.autoAppRegistration?.queryHandleClaims &&
             room.host === ws &&

@@ -106,6 +106,11 @@ export interface S3Config {
 /** 공개 링크를 «의도적으로» 만드는 기능의 키 조각 — 이 조각이 든 키만 공개 버킷으로 간다. 나머지는 전부 비공개. */
 export const PUBLIC_FEATURE_SEGMENTS = ['publish', 'publish-cold', 'morning', 'debug-bundle'] as const;
 
+/** 회원 파일 게시의 공개 네임스페이스 — `members/<handle>/public/<YYYYMMDD>/<이름>` 형태만 공개 취급.
+ * JUD-B #39393 mustFix ③: 전역 조각 'public' 은 금지(어떤 기능 키에나 'public' 조각만 넣으면 공개 버킷으로 새는 구멍).
+ * 바이너리·비-게시 경로가 우연히 'public' 조각을 품어도 members 게시 형태가 아니면 비공개다. */
+const MEMBER_PUBLIC_KEY = /^members\/[a-z][a-z0-9]*\/public\/\d{8}\//;
+
 function configuredBuckets(): { bucket?: string; publicBucket?: string } {
   try {
     const raw = JSON.parse(readFileSync(join(getElanousConfigDir(), 'config.json'), 'utf8')) as { storage?: { s3?: { bucket?: unknown; publicBucket?: unknown } } };
@@ -127,8 +132,9 @@ export function s3Config(): S3Config {
   };
 }
 
-/** 키가 공개 기능의 것인가 — 접두 다음 조각들 중 하나가 `PUBLIC_FEATURE_SEGMENTS` 면 공개. */
+/** 키가 공개 기능의 것인가 — members 게시 네임스페이스 형태이거나, 접두 다음 조각 중 하나가 `PUBLIC_FEATURE_SEGMENTS` 면 공개. */
 export function isPublicKey(key: string): boolean {
+  if (MEMBER_PUBLIC_KEY.test(key)) return true;
   return key.split('/').some((seg) => (PUBLIC_FEATURE_SEGMENTS as readonly string[]).includes(seg));
 }
 

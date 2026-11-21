@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { resolveRemoteExportCheckInvocation, runExportCheck } from './export-check-node.js';
 import type { CommandRunner } from './node-verdict.js';
 
@@ -152,6 +152,13 @@ test('remote host-only invocation resolves commit and version from graph context
   });
 });
 
+test('remote host-only invocation defaults to the node-b code default host (RELEASE-EXPORT-CHECK-REMOTE-LIVE)', () => {
+  const context = { input: { version: '0.3.6' }, outputs: { 'version-release': { commit } } } as never;
+  expect(resolveRemoteExportCheckInvocation([], () => context)).toEqual({
+    host: 'node-b', commit, version: '0.3.6', graphContext: JSON.stringify(context),
+  });
+});
+
 test('real export-check CLI sends graph commit/version through a fake SSH remote boundary', () => {
   const root = mkdtempSync(join(tmpdir(), 'export-check-cli-process-'));
   const bin = join(root, 'bin');
@@ -160,26 +167,36 @@ test('real export-check CLI sends graph commit/version through a fake SSH remote
   const sshArgs = join(root, 'ssh-args.log');
   const redactions = join(root, 'redactions.tsv');
   const ssh = join(bin, 'ssh');
-  const currentCommit = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
-  mkdirSync(bin, { recursive: true });
-  const init = spawnSync('git', ['clone', '--bare', '--shared', '--quiet', process.cwd(), bareMirror], { encoding: 'utf8' });
-  expect(init.status).toBe(0);
-  writeFileSync(ssh, [
-    '#!/bin/sh',
-    'case "$*" in *git-receive-pack*) exec git-receive-pack "$MOCK_GATE_MIRROR";; esac',
-    'printf \'%s\\n\' "$*" > "$MOCK_GATE_SSH_ARGS"',
-    'cat > "$MOCK_GATE_SSH_SCRIPT"',
-    'printf \'%s\\n\' "$MOCK_GATE_REMOTE_RESULT"',
-    'printf \'\\n__GATE_REMOTE_RC=0\\n\' >&2',
-  ].join('\n'));
-  chmodSync(ssh, 0o755);
-  writeFileSync(redactions, 'private-test-value\tpublic-placeholder\n', { mode: 0o600 });
-  chmodSync(redactions, 0o600);
-  const fakeResult = JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake remote export-check pass', step: 'build', tail: '' });
-  const context = JSON.stringify({ input: { version: '0.3.6', previousVersion: '0.3.5' }, outputs: { 'version-release': { commit: currentCommit } } });
+  const sourceRepo = join(root, 'source');
+  const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
   try {
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(sourceRepo);
+    // Keep both pushed commits and their objects independent of the pregate checkout's promisor remote.
+    git(sourceRepo, 'init', '--quiet', '--template=', '--initial-branch=main');
+    const commitFixture = (subject: string) => git(sourceRepo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+      '-c', 'commit.gpgSign=false', 'commit', '--quiet', '--allow-empty', '-m', subject);
+    commitFixture('base');
+    const mainCommit = git(sourceRepo, 'rev-parse', 'HEAD');
+    git(sourceRepo, 'update-ref', 'refs/remotes/origin/main', mainCommit);
+    commitFixture('cut');
+    const currentCommit = git(sourceRepo, 'rev-parse', 'HEAD');
+    git(root, 'init', '--quiet', '--bare', '--template=', bareMirror);
+    writeFileSync(ssh, [
+      '#!/bin/sh',
+      'case "$*" in *git-receive-pack*) exec git-receive-pack "$MOCK_GATE_MIRROR";; esac',
+      'printf \'%s\\n\' "$*" > "$MOCK_GATE_SSH_ARGS"',
+      'cat > "$MOCK_GATE_SSH_SCRIPT"',
+      'printf \'%s\\n\' "$MOCK_GATE_REMOTE_RESULT"',
+      'printf \'\\n__GATE_REMOTE_RC=0\\n\' >&2',
+    ].join('\n'));
+    chmodSync(ssh, 0o755);
+    writeFileSync(redactions, 'private-test-value\tpublic-placeholder\n', { mode: 0o600 });
+    chmodSync(redactions, 0o600);
+    const fakeResult = JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake remote export-check pass', step: 'build', tail: '' });
+    const context = JSON.stringify({ input: { version: '0.3.6', previousVersion: '0.3.5' }, outputs: { 'version-release': { commit: currentCommit } } });
     const run = spawnSync(process.execPath, [join(import.meta.dir, 'export-check-node.ts'), '--remote', 'aws1'], {
-      cwd: process.cwd(), encoding: 'utf8', timeout: 10_000,
+      cwd: sourceRepo, encoding: 'utf8', timeout: 30_000,
       env: {
         ...process.env,
         PATH: `${bin}:${process.env.PATH ?? ''}`,
@@ -192,7 +209,14 @@ test('real export-check CLI sends graph commit/version through a fake SSH remote
         MOCK_GATE_REMOTE_RESULT: fakeResult,
       },
     });
+    if (run.status !== 0) {
+      console.error(`[fake-ssh cli] status=${run.status} signal=${run.signal}`);
+      console.error(`[fake-ssh cli] stdout=${run.stdout}`);
+      console.error(`[fake-ssh cli] stderr=${run.stderr}`);
+    }
     expect(run.status).toBe(0);
+    expect(git(bareMirror, 'rev-parse', `refs/elanous/gate/${mainCommit}`)).toBe(mainCommit);
+    expect(git(bareMirror, 'rev-parse', `refs/elanous/gate/${currentCommit}`)).toBe(currentCommit);
     expect(run.stdout).toContain('"summary":"fake remote export-check pass"');
     const receivedScript = readFileSync(sshScript, 'utf8');
     expect(readFileSync(sshArgs, 'utf8')).toContain('aws1 sh -s');
@@ -204,7 +228,7 @@ test('real export-check CLI sends graph commit/version through a fake SSH remote
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 15_000);
+}, 45_000);
 
 test('pinned invocation requires both valued identity flags', () => {
   const readContext = () => { throw new Error('graph context should not be read'); };

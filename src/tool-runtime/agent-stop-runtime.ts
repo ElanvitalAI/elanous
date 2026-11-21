@@ -16,5 +16,5 @@ import type { ToolRuntime } from './types.js';
 export const agentStopRuntime: ToolRuntime<Partial<AgentStopParams>, AgentStopResult> = {
   id: 'agent_stop',
   spec: buildAgentStopTool(),
-  async run(req) { return dispatchAgentStop(req); },
+  async run(req, ctx) { return dispatchAgentStop(req, { requester: ctx.parentSessionId ?? ctx.sessionId }); },
 };

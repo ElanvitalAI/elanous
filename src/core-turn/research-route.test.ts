@@ -94,6 +94,21 @@ test('fact questions (1121 shapes · Korean · English) enter research on the st
   expect(entered).toBe(FACT_QUESTIONS.length);
 });
 
+test('internal research source counts reach the core turn completion callback', async () => {
+  spyOn(llm, 'streamLLMWithTools').mockResolvedValue('근거 기반 답 https://example.org/official');
+  const seen: unknown[] = [];
+  await runCoreTurn({
+    sessionId: 'research-sources', messages: [{ role: 'user', content: DEMO_1121_SHAPES[0]! }],
+    userText: DEMO_1121_SHAPES[0]!, tools: [webSearch, read], dispatchTool: async () => null,
+    signal: new AbortController().signal,
+    callbacks: { onResearchSourceUsage: (usage) => seen.push(usage) },
+  }, { runResearch: async (_request, _signal, _admit, _routing, hooks) => {
+    hooks?.onRoute?.(FACT);
+    return { ...evidence, sourceUsage: { firecrawl: 2, grok: 1, market: 0 } };
+  } });
+  expect(seen).toEqual([{ firecrawl: 2, grok: 1, market: 0 }]);
+});
+
 test('local requests (code edit · file read · shell) never enter research: 0/3', async () => {
   let ordinaryCalls = 0;
   spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages) => {
@@ -125,22 +140,62 @@ test('a failed plan on a CONFIRMED (fast-path) entry still enters research — t
   expect(result.finalText).toBe(GROUNDING_UNAVAILABLE);
 });
 
-test('the shadow heuristic disagreeing with the structured verdict emits research.route-mismatch (codes only)', async () => {
+/** WEBCHAT-SHORT-FACT-NOT-RESEARCH: the plan's structured `answerableWithoutWeb` verdict decides — fixtures only. */
+const CLOCK: ResearchRouteFields = { needsFreshFacts: false, needsCitations: false, localOnly: false, answerableWithoutWeb: true, reason: 'clock' };
+const SHORT_DATE_QUESTION = '오늘 요일만';
+// A sentence the deprecated classifier WOULD flag (오늘 + 뭐 + 한국), yet it is a clock question.
+const REGEX_TRIGGER_CLOCK_QUESTION = '오늘 한국 날짜가 뭐야?';
+
+test('a clock/date question with answerableWithoutWeb skips research and answers as an ordinary turn', async () => {
+  let seen: Array<{ role: string; content: unknown }> = [];
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages) => { seen = messages as typeof seen; return '토요일입니다'; });
+  const turn = routedTurn(SHORT_DATE_QUESTION, CLOCK);
+  const result = await turn.run;
+  expect(routeEvents()).toEqual([expect.objectContaining({ route: 'skipped', by: 'structured', reason: 'answerable-without-web' })]);
+  expect(result.finalText).toBe('토요일입니다');
+  expect(result.finalText).not.toBe(GROUNDING_UNAVAILABLE);
+  expect(events.filter(entry => entry.event === 'original-question-search-started')).toEqual([]);
+  expect(seen.some(message => typeof message.content === 'string' && message.content.includes(evidence.output))).toBe(false);
+  // The ordinary answer path carries today's date AND weekday from the clock helper.
+  const dateLine = seen.find(message => message.role === 'system' && typeof message.content === 'string' && message.content.startsWith('Current local date:'));
+  expect(String(dateLine?.content)).toMatch(/^Current local date: \d{4}-\d{2}-\d{2} \((?:Sun|Mon|Tues|Wednes|Thurs|Fri|Satur)day\)\./);
+});
+
+test('a stock-news question with needsFreshFacts enters research (negative control)', async () => {
   spyOn(llm, 'streamLLMWithTools').mockResolvedValue(`답 ${evidence.sourceUrls[0]}`);
-  // Cases 2·5 shape: the legacy sentence classifier would not enter; the structured verdict does.
-  for (const text of [DEMO_1121_SHAPES[1]!, DEMO_1121_SHAPES[4]!]) {
-    expect(needsGroundingFirst(text)).toBe(false);
-    events = [];
-    await routedTurn(text, FACT).run;
-    const mismatch = events.filter(entry => entry.event === 'route-mismatch').map(entry => entry.data);
-    expect(mismatch).toEqual([{ sessionId: 'research-route-test', structured: 'entered', heuristic: 'skipped', reason: 'fresh-facts' }]);
-    for (const value of Object.values(mismatch[0]!)) expect(String(value)).not.toContain(text.slice(0, 8));
-  }
-  // Agreement emits nothing.
-  events = [];
-  await routedTurn(DEMO_1121_SHAPES[0]!, FACT).run;
+  const turn = routedTurn('삼성전자 주가 오늘 왜 올랐어? 뉴스 출처 알려줘', FACT);
+  await turn.run;
+  expect(turn.researchCalls()).toBe(1);
+  expect(routeEvents()).toEqual([expect.objectContaining({ route: 'entered', by: 'structured', reason: 'fresh-facts' })]);
+});
+
+test('a missing verdict enters research (fail-open)', async () => {
+  spyOn(llm, 'streamLLMWithTools').mockResolvedValue(`답 ${evidence.sourceUrls[0]}`);
+  const turn = routedTurn('주식 시장 전망 알려줘', 'none');
+  await turn.run;
+  expect(turn.researchCalls()).toBe(1);
+  expect(routeEvents()).toEqual([expect.objectContaining({ route: 'entered', by: 'fallback' })]);
+});
+
+test('the deprecated regex flagging a clock question no longer forces entry: the structured verdict decides', async () => {
+  expect(needsGroundingFirst(REGEX_TRIGGER_CLOCK_QUESTION)).toBe(true);
+  spyOn(llm, 'streamLLMWithTools').mockResolvedValue('2026-11-21 토요일');
+  const turn = routedTurn(REGEX_TRIGGER_CLOCK_QUESTION, CLOCK);
+  const result = await turn.run;
+  expect(routeEvents()).toEqual([expect.objectContaining({ route: 'skipped', by: 'structured', reason: 'answerable-without-web' })]);
+  expect(result.finalText).toBe('2026-11-21 토요일');
+  // The shadow mismatch event is gone.
   expect(events.filter(entry => entry.event === 'route-mismatch')).toEqual([]);
-  expect(RESEARCH_ROUTE_EVENTS).toEqual(['route', 'route-mismatch']);
+  expect(RESEARCH_ROUTE_EVENTS).toEqual(['route']);
+});
+
+test('answerableWithoutWeb contradicted by needsFreshFacts/needsCitations is not confident: enters', () => {
+  expect(decideResearchRoute(CLOCK)).toEqual({ decision: 'skipped', by: 'structured', reason: 'answerable-without-web' });
+  expect(decideResearchRoute({ ...CLOCK, needsFreshFacts: true })).toEqual({ decision: 'entered', by: 'structured', reason: 'fresh-facts' });
+  expect(decideResearchRoute({ ...CLOCK, needsCitations: true })).toEqual({ decision: 'entered', by: 'structured', reason: 'citations' });
+  expect(decideResearchRoute({ localOnly: false, answerableWithoutWeb: false })).toEqual({ decision: 'entered', by: 'structured', reason: 'not-local' });
+  expect(parseResearchRouteFields({ answerableWithoutWeb: 'yes' })).toBeUndefined();
+  expect(parseResearchRouteFields({ answerableWithoutWeb: true })).toEqual({ answerableWithoutWeb: true });
 });
 
 test('decision table: only an explicit localOnly=true skips; missing fields enter', () => {

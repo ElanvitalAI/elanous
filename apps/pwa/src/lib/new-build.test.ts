@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { extractBuildId, isNewBuild } from './new-build';
+import { extractBuildId, isNewBuild, probeServedBuild } from './new-build';
 
 describe('extractBuildId — 정적 export HTML 의 빌드 id', () => {
   test('RSC 머리의 이스케이프된 "b" 를 읽는다', () => {
@@ -22,5 +22,24 @@ describe('isNewBuild', () => {
     expect(isNewBuild('a1b2c3d4e5', 'a1b2c3d4e5')).toBe(false);
     expect(isNewBuild(null, 'z9y8x7w6v5')).toBe(false);
     expect(isNewBuild('a1b2c3d4e5', null)).toBe(false);
+  });
+});
+
+describe('probeServedBuild', () => {
+  const page = (body: string, status = 200) => async () => new Response(body, { status });
+
+  test('asks the tab own page path and reads its build id', async () => {
+    const asked: string[] = [];
+    const probe = await probeServedBuild(async (input) => { asked.push(input); return new Response('{"b":"abcdefgh12"}'); }, '/app/chat/');
+    expect(asked).toEqual(['/app/chat/']);
+    expect(probe).toEqual({ kind: 'served', id: 'abcdefgh12' });
+  });
+
+  test('a non-OK answer is unavailable (the caller stops polling), not served', async () => {
+    expect(await probeServedBuild(page('Not Found', 404), '/app/chat/')).toEqual({ kind: 'unavailable', status: 404 });
+  });
+
+  test('a network failure is offline (retry later)', async () => {
+    expect(await probeServedBuild(async () => { throw new Error('down'); }, '/app/chat/')).toEqual({ kind: 'offline' });
   });
 });

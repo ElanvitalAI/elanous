@@ -176,7 +176,13 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     // 완화(bash-runtime.ts ctx.surface==='tui'). RunShell(argv)과 병행 노출.
     host: ['skill', 'tui'],
     safety: ['process', 'mutating'],
-    supportsParallel: false,
+    // CAPSULE-A2-BASH-DETACH (정본 §3.6 C3:805 · 2026-11-21) — 한 assistant 메시지의
+    // Bash 묶음은 동시 디스패치: 긴 명령은 각자 10s 동기 캡에서 탈착(캡슐)되므로 대기가
+    // 겹쳐야 메인 턴이 20s 안에 idle 로 복귀한다. 직렬 디스패치면 캡 10s×3 = 30s hold 로
+    // 축 위반(C3-TRIO 빨강 원문). 호출마다 프로세스가 분리되므로(각 Bash = 자기 셸) 겹침
+    // 실행이 가능하되, 쓰기/변이 명령은 bash-parallel-safety.ts 의 명령별 관문이 병렬
+    // 묶음에서 직렬로 되돌린다(JUD #39447 HOLD #122147) — claude-code toolOrchestration 선례.
+    supportsParallel: true,
     defaultEnabled: true,
     coreReason: 'N1',
     intentScope: 'coding',
@@ -196,7 +202,8 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     promptSummary: '`RunShell` (argv exec, no shell parsing, approval cache, audit trail in ~/.monad-agent/audit/)',
     host: ['skill', 'tui'],
     safety: ['process', 'mutating'],
-    // Mutating tools run serially by catalog contract — matches Bash.
+    // RunShell(argv 짧은 동기 명령 위주)은 직렬 계약 유지 — A2 병렬 탈착 축(§3.6 C3:805)은
+    // Bash 긴 셸에만 요구된다. Bash 의 supportsParallel=true 전환과는 의도적 비대칭.
     supportsParallel: false,
     defaultEnabled: true,
     coreReason: 'N1',

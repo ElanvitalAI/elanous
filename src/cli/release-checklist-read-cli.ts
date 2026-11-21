@@ -260,7 +260,9 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
   const runId = labelledIdentity?.[2] ?? bareIdentityPattern.exec(evidence)?.[1];
   const identityField = identityFieldOf(labelledIdentity?.[1]?.toLowerCase());
   const event = eventPattern.exec(evidence)?.[1];
-  const verificationCommand = /(?:완료 경계 증거 명령|증거 명령|verification command)\s*[:=]\s*([^\r\n]+)/iu.exec(`${item.title}\n${evidence}`)?.[1]?.trim() ?? null;
+  // 정본 = 실행 파서가 쓰는 checklistEvidenceCommand(제목의 «완료 경계 증거 명령:» 중 마지막 — 제목은 append-only 라 정정 줄이 뒤에 붙는다). 제목에 없을 때만 기존 근거 줄 추출(호환 fallback).
+  const verificationCommand = checklistEvidenceCommand(item.title)
+    ?? /(?:완료 경계 증거 명령|증거 명령|verification command)\s*[:=]\s*([^\r\n]+)/iu.exec(`${item.title}\n${evidence}`)?.[1]?.trim() ?? null;
   const e4: ChecklistEvidenceStage = { id: 'E4', state: 'missing', source: null, measuredAt, verificationCommand, reason: '근거에 runId·missionId·taskId 중 하나와 event·원문 검증 명령이 모두 필요하다' };
   if (runId && event && verificationCommand) {
     // CHECKLIST-JUDGE-MULTI-PR-AND-E4-LINES(2026-11-20): 근거 줄마다 (식별자·event·그 줄의 ISO 시각) 짝을 만들고, 어느 짝이든 로그에서 실물이 잡히면 인정한다.

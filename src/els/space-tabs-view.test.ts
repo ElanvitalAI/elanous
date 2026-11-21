@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { Terminal } from '@xterm/headless';
 import { buildSpaceList, buildTabRow, layoutSpaceList, paneEmoji, withCommands, type SpaceTabRow } from './space-tabs-view.js';
 import { parsePaneRows } from './attach-view.js';
 
@@ -64,18 +65,16 @@ const I = '\u001b[100;37m';
 const O = '\u001b[49;39m';
 test('tab row = the selected space\'s panes as padded UPPERCASE «emoji NAME» blocks: focused blue, others gray, «+» last (ELS-TAB-STYLE-HERDR)', () => {
   const row = buildTabRow(ROWS, 'p2', 60);
-  expect(row.line!.trimEnd()).toBe(`${I} 💬 ELN ${O} ${A} 🤖 CODEX ${O} ${I} ⌨️ ZSH ${O} +`);
+  expect(row.line!.trimEnd()).toBe(`${I} 💬 ELN ${O} ${A} 🤖 CODEX ${O} ${I} ⌨︎  ZSH ${O} +`);
   expect(row.tabs).toEqual([{ from: 0, to: 8, pane: 'p1' }, { from: 9, to: 19, pane: 'p2' }, { from: 20, to: 28, pane: 'p3' }]);
   expect(Bun.stringWidth(row.line!)).toBe(60);
-  // every click box covers exactly its own tab's cells (padding included): the plain text under [from, to)
-  const plain = row.line!.replace(/\u001b\[[0-9;]*m/g, '');
-  expect(row.tabs.map((tab) => plain.slice(tab.from, tab.to))).toEqual([' 💬 ELN ', ' 🤖 CODEX ', ' ⌨️ ZSH ']);
+  // Verify cell ranges with xterm below rather than slicing UTF-16 at cell offsets.
 });
 
 test('the stored title is never uppercased: only the drawn name is (Korean is unaffected)', () => {
   const ls = JSON.stringify({ panes: [{ address: 'w/t/p1', workspace: 'w', pane: 'p1', title: '한글 abc', state: 'idle', command: ['zsh'] }] });
   const rows = withCommands(parsePaneRows(ls), ls);
-  expect(buildTabRow(rows, 'p1', 40).line).toContain(' ⌨️ 한글 ABC ');
+  expect(buildTabRow(rows, 'p1', 40).line).toContain(' ⌨︎  한글 ABC ');
   expect(rows[0]!.title).toBe(parsePaneRows(ls)[0]!.title);   // the stored title keeps its case
   expect(rows[0]!.title).toContain('abc');
 });
@@ -87,7 +86,7 @@ test('emoji are 2 cells: tabs of the same title length line up whatever the emoj
 
 test('overflow keeps the selected tab and shows ‹ ›; no panes = no row', () => {
   const narrow = buildTabRow(ROWS, 'p3', 16);
-  expect(narrow.line).toBe(`‹${A} ⌨️ ZSH ${O} +     `);
+  expect(narrow.line).toBe(`‹${A} ⌨︎  ZSH ${O} +     `);
   expect(narrow.tabs).toEqual([{ from: 1, to: 9, pane: 'p3' }]);
   const first = buildTabRow(ROWS, 'p1', 16);
   expect(first.line).toBe(`${A} 💬 ELN ${O} ›      `);
@@ -128,34 +127,34 @@ const EDGE_LS = JSON.stringify({ panes: [
 const LONG_ROWS: SpaceTabRow[] = withCommands(parsePaneRows(LONG_LS), LONG_LS);
 const EDGE_ROWS: SpaceTabRow[] = withCommands(parsePaneRows(EDGE_LS), EDGE_LS);
 const NARROW_ROW_WIDTH = 12;  // 출처: #38438 review must[1]
-const CLIP_ONE_LESS = 9;      // 출처: #38438 must[1] — the single « ⌨️ EDGE » tab exactly (padded; no badge, no mark)
+const CLIP_ONE_LESS = 9;      // 출처: #38438 must[1] — the single « ⌨︎  EDGE » tab exactly (padded; no badge, no mark)
 const WIDE_ROW_WIDTH = 80;    // 출처: #38438 must[1] — the whole two-tab row fits
 
 test('#38438 must[1]: a too-wide selected tab is clipped to the row and keeps a click range — narrow', () => {
   const row = buildTabRow(LONG_ROWS, 'p1', NARROW_ROW_WIDTH);
-  expect(row.line).toBe(`${A} ⌨️ LONG TIT${O}`);
+  expect(row.line).toBe(`${A} ⌨︎  LONG TIT${O}`);
   expect(row.tabs).toEqual([{ from: 0, to: NARROW_ROW_WIDTH, pane: 'p1' }]);
   expect(Bun.stringWidth(row.line!)).toBe(NARROW_ROW_WIDTH);
 });
 
 test('#38438 must[1]: wide row = the whole row, click ranges unchanged', () => {
   const row = buildTabRow(LONG_ROWS, 'p1', WIDE_ROW_WIDTH);
-  expect(row.line!.trimEnd()).toBe(`${A} ⌨️ LONG TITLE ${O} ${I} ⌨️ LONG ONE ${O} +`);
+  expect(row.line!.trimEnd()).toBe(`${A} ⌨︎  LONG TITLE ${O} ${I} ⌨︎  LONG ONE ${O} +`);
   expect(row.tabs).toEqual([{ from: 0, to: 15, pane: 'p1' }, { from: 16, to: 29, pane: 'p2' }]);
 });
 
 test('#38438 must[1]: boundary — the single tab fits without its separator, clips one cell shorter', () => {
   const whole = buildTabRow(EDGE_ROWS, 'p1', CLIP_ONE_LESS);
-  expect(whole.line).toBe(`${A} ⌨️ EDGE ${O}`);
+  expect(whole.line).toBe(`${A} ⌨︎  EDGE ${O}`);
   expect(whole.tabs).toEqual([{ from: 0, to: CLIP_ONE_LESS, pane: 'p1' }]);
   const clipped = buildTabRow(EDGE_ROWS, 'p1', CLIP_ONE_LESS - 1);
-  expect(clipped.line).toBe(`${A} ⌨️ EDGE${O}`);
+  expect(clipped.line).toBe(`${A} ⌨︎  EDGE${O}`);
   expect(clipped.tabs).toEqual([{ from: 0, to: CLIP_ONE_LESS - 1, pane: 'p1' }]);
 });
 
 test('#38438 must[1]: a too-wide selected tab after ‹ is clipped into what is left of the row', () => {
   const row = buildTabRow(LONG_ROWS, 'p2', NARROW_ROW_WIDTH);
-  expect(row.line).toBe(`‹${A} ⌨️ LONG ON${O}`);
+  expect(row.line).toBe(`‹${A} ⌨︎  LONG ON${O}`);
   expect(row.tabs).toEqual([{ from: 1, to: NARROW_ROW_WIDTH, pane: 'p2' }]);
 });
 
@@ -173,7 +172,7 @@ test('ELS-FIRST-RUN-LIVE-PANE: an exited pane\'s tab is dimmed (SGR 2), the focu
     { address: 'w/t/p2', workspace: 'w', pane: 'p2', title: 'eln', state: 'idle', command: ['/usr/local/bin/eln'] },
   ] });
   const row = buildTabRow(withCommands(parsePaneRows(ls), ls), 'p2', 20);
-  expect(row.line).toBe(`\u001b[2m${I} ⌨️ ZSH \u001b[22m${O} ${A} 💬 ELN ${O} + `);
+  expect(row.line).toBe(`\u001b[2m${I} ⌨︎  ZSH \u001b[22m${O} ${A} 💬 ELN ${O} + `);
   expect(row.tabs).toEqual([{ from: 0, to: 8, pane: 'p1' }, { from: 9, to: 17, pane: 'p2' }]);
 });
 
@@ -182,4 +181,25 @@ test('ELS-NEW-TAB-NAME-WIDGET: the tab row tells where its «+» is (one cell, a
   const plain = (row.line ?? '').replace(/\u001b\[[0-9;]*m/g, '');
   expect(row.plus).toEqual({ from: Bun.stringWidth(plain.slice(0, plain.indexOf('+'))), to: Bun.stringWidth(plain.slice(0, plain.indexOf('+'))) + 1 });
   expect(buildTabRow(ROWS, 'p1', 10).plus).toBeUndefined();
+});
+
+test('xterm cells and hitboxes agree for shell tabs and the plus at 80, 120 and 200 columns', async () => {
+  const shells: SpaceTabRow[] = [
+    { pane: 's1', wsId: 'w', workspace: 'w', title: 'one', state: 'idle', command: ['sh'] },
+    { pane: 's2', wsId: 'w', workspace: 'w', title: 'two', state: 'idle', command: ['zsh'] },
+  ];
+  for (const width of [80, 120, 200]) {
+    const row = buildTabRow(shells, 's1', width);
+    const terminal = new Terminal({ cols: width, rows: 2, allowProposedApi: true });
+    await new Promise<void>((resolve) => terminal.write(row.line!, resolve));
+    const screen = terminal.buffer.active.getLine(0)!;
+    expect(row.tabs).toEqual([{ from: 0, to: 8, pane: 's1' }, { from: 9, to: 17, pane: 's2' }]);
+    expect(row.plus).toEqual({ from: 18, to: 19 });
+    expect(screen.getCell(18)!.getChars()).toBe('+');
+    expect(screen.getCell(17)!.getChars()).toBe(' ');
+    expect(screen.getCell(19)!.getChars()).toBe(' ');
+    expect(screen.translateToString(false, 0, 8)).toBe(' ⌨︎  ONE ');
+    expect(screen.translateToString(false, 9, 17)).toBe(' ⌨︎  TWO ');
+    terminal.dispose();
+  }
 });

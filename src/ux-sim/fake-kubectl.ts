@@ -204,7 +204,7 @@ export function createFakeKubectl(options: { context: string; node: string; node
   };
 }
 
-if (import.meta.main) {
+async function runFakeKubectlCli(): Promise<void> {
   const endpoint = process.env.ELANOUS_FAKE_KUBECTL_URL;
   if (!endpoint) {
     process.stderr.write('fake-kubectl requires ELANOUS_FAKE_KUBECTL_URL\n');
@@ -224,3 +224,5 @@ if (import.meta.main) {
     }
   }
 }
+
+if (import.meta.main) void runFakeKubectlCli();

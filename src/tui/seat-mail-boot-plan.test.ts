@@ -501,3 +501,60 @@ test('real boot wiring: one message whose receipt write fails does not block the
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+describe('ELN-SEAT-INBOX-TURN-BOUNDARY (#121130) — a plan notice is the mail original, not a summary', () => {
+  test('a mail absorbed as a plan item is injected at the turn boundary as its ORIGINAL (sender · msg:<id> · body verbatim)', () => {
+    const { queue, port } = realPort();
+    // «칸 … 시험 진행» — a request the decomposition actually absorbs as a plan item (a 0-item mail
+    // is the watcher's, TURN-FIELD-BUG-3). Multi-line: the verbatim check must survive line breaks.
+    const body = '칸 INBOX_BOUNDARY_MARKER 원문 주입 시험 진행\nINBOX_BOUNDARY_MARKER 원문 첫째 줄\n둘째 줄: 발신·msgId·본문 전체가 모델 입력에 그대로 들어가야 한다';
+    const rt = wireSeatMailToPlan(port, { seat: SEAT, ledger: fakeLedger([mail(7, body)]) });
+    rt.absorb();
+    const notice = queue.items.find(item => item.kind === 'notice');
+    expect(notice).toBeDefined();
+    // The queue tracks the mail identity on the notice (msgId meta — the wait/observation machinery keys on it).
+    expect(notice?.msgId).toBe(7);
+    // The next-turn model input is this notice text: it must carry the sender, the msg id and the body VERBATIM.
+    expect(notice?.text).toContain('OP');
+    expect(notice?.text).toContain('msg:7');
+    expect(notice?.text).toContain(body);
+  });
+
+  test('r2 (JUD #121493) — the plan notice keeps the ledger\'s VERIFIED markers (origin · intent · crown) when they differ from legacy sender/kind', () => {
+    const { queue, port } = realPort();
+    // Legacy row: sender OP · transport kind 'note' → the legacy fallback header would be «[from OP · info]».
+    // Verified columns (B1-A): origin { agent · TC-H-CC-1 } · intent 'decision' · crown 'd-9' — these must WIN.
+    const verified = {
+      ...mail(11, '칸 INBOX_VERIFIED_MARKER 진행 후 시험 보고'),
+      kind: 'note',
+      origin: { kind: 'agent', seat: 'TC-H-CC-1' },
+      intent: 'decision',
+      crownDirective: 'd-9',
+    } as unknown as Message;
+    // The request carries the verified fields alongside the legacy ones (header = headerFieldsOf of the message).
+    expect(messageToTaskRequest(verified)).toMatchObject({
+      sender: 'OP',
+      kind: 'note',
+      header: { fromKind: 'agent', fromSeat: 'TC-H-CC-1', intent: 'decision', crownDirective: 'd-9' },
+    });
+    const rt = wireSeatMailToPlan(port, { seat: SEAT, ledger: fakeLedger([verified]) });
+    rt.absorb();
+    const notice = queue.items.find(item => item.kind === 'notice')!;
+    // The next-turn model input prefers the VERIFIED header — the legacy «[from OP · …]» must not appear.
+    expect(notice.text).toContain('[from TC-H-CC-1 · decision · crown]');
+    expect(notice.text).not.toContain('[from OP');
+    expect(notice.text).toContain('msg:11');
+    expect(notice.text).toContain('칸 INBOX_VERIFIED_MARKER 진행 후 시험 보고');
+  });
+
+  test('r2 (JUD #121493) — a legacy-only row (no verified columns) keeps the sender/kind fallback header, unchanged', () => {
+    const { queue, port } = realPort();
+    const legacyOnly = mail(12, '#5101 merge 시험 보고', 'note');
+    const rt = wireSeatMailToPlan(port, { seat: SEAT, ledger: fakeLedger([legacyOnly]) });
+    rt.absorb();
+    const notice = queue.items.find(item => item.kind === 'notice')!;
+    // No verified columns → the header falls back exactly as before r2: [from OP · info(note)].
+    expect(notice.text).toContain('[from OP · info]');
+    expect(notice.text).toContain('msg:12');
+  });
+});

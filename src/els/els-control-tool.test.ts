@@ -3,8 +3,9 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { AllowRule, ControlAction } from './control.js';
+import { requestEls } from './client.js';
 import {
   ELS_CONTROL_ACTIONS,
   ELS_CONTROL_TOOL_NAME,
@@ -29,6 +30,12 @@ async function fakeEls(socketPath: string, reply: (request: Record<string, unkno
     let timer: ReturnType<typeof setTimeout> | undefined;
     const handle = (line: string) => {
       const request = JSON.parse(line) as Record<string, unknown>;
+      // Authentication is a transport handshake, not a control operation. Never
+      // retain its credentials in the fixture's captured request list.
+      if (request.op === 'auth') {
+        socket.write(JSON.stringify({ exitCode: 0, message: 'auth: fixture' }) + '\n');
+        return;
+      }
       received.push(request);
       const outcome = reply(request);
       socket.write(JSON.stringify(outcome) + '\n');
@@ -48,7 +55,7 @@ async function fakeEls(socketPath: string, reply: (request: Record<string, unkno
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(socketPath, () => resolve());
+    server.listen(join(dirname(socketPath), 'ctl.sock'), () => resolve());
   });
   return { received, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
@@ -97,6 +104,51 @@ describe('ELN-ELS-NATIVE-TOOL · 게이트 · 명세', () => {
 });
 
 describe('ELN-ELS-NATIVE-TOOL · 가짜 els 소켓 왕복', () => {
+  test('fixture acknowledges authentication separately without retaining credentials as control requests', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elsctl-auth-'));
+    const fake = await fakeEls(join(dir, 's.sock'), journal());
+    try {
+      const result = await requestEls(join(dir, 'ctl.sock'), { op: 'ls' }, 10_000, 'fixture-only');
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.message)).toEqual(LISTING);
+      expect(fake.received).toEqual([{ op: 'ls' }]);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  test('stop requires tool do permission and sends only an interrupt to the selected agent pane', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elsctl-stop-'));
+    const socketPath = join(dir, 's.sock');
+    const fake = await fakeEls(socketPath, journal());
+    try {
+      const denied = await runElsControl({ action: 'stop', pane: 'pa' }, { socketPath, stateDir: dir });
+      expect(denied.allowed).toBe(false);
+      expect(sentWithoutLookup(fake)).toEqual([]);
+      allow(dir, ['do']);
+      const allowed = await runElsControl({ action: 'stop', pane: 'pa', text: 'ignored' }, { socketPath, stateDir: dir });
+      expect(allowed).toMatchObject({ ok: true });
+      expect(sentWithoutLookup(fake)).toEqual([{ op: 'interrupt', pane: 'pa' }]);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  test('send requires tool do permission and blocks dangerous shell input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elsctl-send-'));
+    const socketPath = join(dir, 's.sock');
+    const fake = await fakeEls(socketPath, journal());
+    try {
+      allow(dir, ['do']);
+      const held = await runElsControl({ action: 'send', pane: 'p1', text: 'sudo id' }, { socketPath, stateDir: dir });
+      expect(held.ok).toBe(false);
+      expect(sentWithoutLookup(fake)).toEqual([]);
+      const sent = await runElsControl({ action: 'send', pane: 'p1', text: 'pwd' }, { socketPath, stateDir: dir });
+      expect(sent.ok).toBe(true);
+      expect(sentWithoutLookup(fake)).toEqual([{ op: 'input-line', pane: 'p1', text: 'pwd', from: 'ElsControl' }]);
+    } finally { await fake.close(); }
+  });
+
   test('허용목록 없으면 기본 거부(문이 막는다)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'elsctl-'));
     const fake = await fakeEls(join(dir, 's.sock'), journal());

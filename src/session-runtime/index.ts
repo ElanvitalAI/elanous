@@ -134,7 +134,8 @@ export interface SessionTurnProfile {
  *  long-lived session never presents yesterday as today's date. */
 export function buildResearchDateSystemMessage(now = new Date()): LLMMessage {
   const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-  return { role: 'system', content: `Current local date: ${localDate}. Verify dates in sources; do not infer freshness from an undated result.` };
+  const weekday = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][now.getDay()];
+  return { role: 'system', content: `Current local date: ${localDate} (${weekday}). Verify dates in sources; do not infer freshness from an undated result.` };
 }
 
 export interface SessionModeSnapshot {
@@ -561,7 +562,7 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
     description: 'Cancel a running background sub-agent task.',
     build: () => buildAgentStopTool(),
     match: () => false,
-    dispatch: async (args) => await dispatchAgentStop(args),
+    dispatch: async (args, _signal, opts) => await dispatchAgentStop(args, { requester: opts?.sessionId }),
     preferRuntime: true,
   },
   {

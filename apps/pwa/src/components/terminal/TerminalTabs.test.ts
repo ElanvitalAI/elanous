@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import {
-  loadTabIds, nextDefaultId, resolveNewTabId, saveTabIds, shouldReacquireAcp,
+  loadTabIds, loadHiddenTabIds, saveHiddenTabIds, nextDefaultId, resolveNewTabId, saveTabIds, shouldReacquireAcp,
   orphanedInitialSpawn, spawnNewTerminal, summarizeTabs, tabCountLabel, tabsCleanableAsUnknown, parseTerminalListResponse,
 } from './TerminalTabs';
 import { originChipText, originTooltipText, terminalOriginLabel } from './terminal-origin-label';
@@ -41,6 +41,21 @@ describe('TerminalTabs storage helpers', () => {
     expect(env.store.get(STORAGE_KEY)).toBe('["preview-1","preview-3"]');
     expect(loadTabIds()).toEqual(['preview-1', 'preview-3']);
     expect(nextDefaultId(loadTabIds())).toBe('preview-2');
+  });
+
+  test('continues when storage access or writes are blocked', () => {
+    for (const localStorage of [
+      { getItem() { throw new Error('denied'); }, setItem() { throw new Error('quota'); } },
+      undefined,
+    ]) {
+      (globalThis as { window?: unknown }).window = localStorage
+        ? { localStorage }
+        : Object.defineProperty({}, 'localStorage', { get() { throw new Error('denied'); } });
+      expect(loadTabIds()).toEqual([]);
+      expect(loadHiddenTabIds()).toEqual([]);
+      expect(() => saveTabIds(['a'])).not.toThrow();
+      expect(() => saveHiddenTabIds(['a'])).not.toThrow();
+    }
   });
 
   test('returns an empty list without throwing for malformed or non-array storage values', () => {

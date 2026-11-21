@@ -11,6 +11,7 @@
 // HITL(제1원칙): 코딩은 자율, PR open 은 approvePr 게이트(대표 승인·draft 기본). 실패 시 worktree 는
 // 보존(검사용). 관측 = self-implement.* 카테고리.
 
+import { reviewerTag, recordReviewerOnCard, type ReviewerRan } from './reviewer-record.js';
 import {
   PR_EVIDENCE_AXES,
   decidePrEvidenceGate,
@@ -700,6 +701,8 @@ export interface SelfImplementReview {
    * ⛔ 오케스트레이터는 이 칸을 추측하지 않는다.
    */
   canSelfRead?: boolean;
+  /** TA-POD-REVIEW-PROVIDER-ALLOW — the provider/model that actually produced this review (names only). Set by the seam for a completed review. */
+  reviewer?: ReviewerRan;
 }
 
 /** reviewed 관측에 실리는 리뷰어 자기읽기 능력. 미선언은 필드 부재가 아니라 `'unknown'`. */
@@ -1095,6 +1098,8 @@ export interface SelfImplementSeams {
   stopAutohealLoadLedger?: (runId: string) => readonly RunLedgerEntry[] | null;
   /** Supervisor heal delivery history reader; defaults to the run ledger unless a test injects a writer. */
   healPackLoadLedger?: (runId: string) => readonly RunLedgerEntry[] | null;
+  /** TA-POD-REVIEW-PROVIDER-ALLOW — one `reviewer=<provider>/<model>` line on the task card history; fail-soft. Default writes the real card. */
+  recordReviewerOnCard?: (cardId: string, event: { detail: string; runId?: string }) => void;
   /** STOP-AUTOHEAL — observes each dispatcher result (tests). */
   onStopAutoheal?: (result: AutohealResult) => void;
   /** Optional context-journal sink for isolated runs. */
@@ -6292,6 +6297,14 @@ async function runSelfImplementInner(
   const prCommentBuffer: string[] = [];
   // GitHub PR comment bodies are bounded; retain the RFC header and disclose omitted source rather than losing the whole record.
   const MAX_PR_COMMENT_BODY_CHARS = 60_000;
+  // TA-POD-REVIEW-PROVIDER-ALLOW — an unreviewed round never names a reviewer; a non-name value yields no line at all.
+  const completedReviewerTag = (r: SelfImplementReview | undefined): string | undefined => r?.reviewed ? reviewerTag(r.reviewer) : undefined;
+  const recordReviewerLine = (r: SelfImplementReview | undefined): void => {
+    const detail = completedReviewerTag(r);
+    const cardId = process.env.ELANOUS_TASK_CARD_ID?.trim();
+    if (!detail || !cardId) return;
+    try { (s.recordReviewerOnCard ?? recordReviewerOnCard)(cardId, { detail, runId }); } catch { /* the card line never blocks the run */ }
+  };
   const bufferPrComment = (roundNumber: number, role: PrCommentRole, title: string, details: readonly string[] = []): void => {
     const header = formatPrComment({ role, round: roundNumber, run: runId });
     const body = [
@@ -8903,7 +8916,9 @@ async function runSelfImplementInner(
         canSelfRead: reviewerCanSelfReadObservation(review.canSelfRead),
         ...(review.failureReason !== undefined ? { failureReason: review.failureReason } : {}),
         ...(reviewArtifactPath ? { artifactPath: reviewArtifactPath } : {}),
+        ...(completedReviewerTag(review) ? { reviewer: completedReviewerTag(review) } : {}),
       });
+      recordReviewerLine(review);
       if (review.reviewed) {
         reviewMustFixCountHistory.push(review.mustFix.length);
         reviewedFindings.push(review.mustFix.map((item) => ({ id: stableMustFixId(item), item })));
@@ -9200,7 +9215,8 @@ async function runSelfImplementInner(
         bufferPrComment(round, 'author', `Round ${round}: child implementation completed.`, [
           `Child completion: ${impl.summary.trim() || '(summary unavailable)'}`,
         ]);
-        bufferPrComment(round, 'reviewer', `Round ${round}: reviewer requested ${effectiveMustFix.length} must-fix change(s).`, effectiveMustFix);
+        // 60000자 절단은 본문 «뒤»를 자른다 — reviewer 태그를 must-fix 목록 «앞»에 둬 절단에도 남긴다.
+      bufferPrComment(round, 'reviewer', `Round ${round}: reviewer requested ${effectiveMustFix.length} must-fix change(s).`, [...(completedReviewerTag(review) ? [completedReviewerTag(review)!] : []), ...effectiveMustFix]);
         round++;
         continue;
       }
@@ -9234,6 +9250,13 @@ async function runSelfImplementInner(
       bufferPrComment(round, 'author', `Round ${round}: child implementation completed.`, [
         `Child completion: ${impl.summary.trim() || '(summary unavailable)'}`,
       ]);
+      // 완료된 리뷰는 재작업으로 넘어가도 reviewer 기록을 남긴다(라운드마다 약속).
+      if (review?.reviewed) {
+        bufferPrComment(round, 'reviewer', `Round ${round}: review completed (${review.verdict}).`, [
+          ...(completedReviewerTag(review) ? [completedReviewerTag(review)!] : []),
+          `Review summary: ${review.summary.trim() || '(summary unavailable)'}`,
+        ]);
+      }
       round = nextRound;
       continue;
     }
@@ -9243,6 +9266,7 @@ async function runSelfImplementInner(
     if (review) {
       if (review.reviewed) {
         bufferPrComment(round, 'reviewer', `Round ${round}: review completed (${review.verdict}).`, [
+          ...(completedReviewerTag(review) ? [completedReviewerTag(review)!] : []),
           `Review summary: ${review.summary.trim() || '(summary unavailable)'}`,
         ]);
       } else {

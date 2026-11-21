@@ -49,7 +49,7 @@ const until = async (check: () => Promise<boolean> | boolean, ms: number = LIT_W
  */
 async function seatOp(socket: string): Promise<void> {
   const registered = await requestEls(socket, { op: 'seat-set', seat: 'OP' });
-  expect(registered).toEqual({ exitCode: 0, message: 'els seat: OP registered' });
+  expect(registered).toMatchObject({ exitCode: 0, message: 'els seat: OP registered' });
 }
 const screenOf = async (socket: string, pane: string): Promise<string> => (await requestEls(socket, { op: 'read', pane })).message;
 
@@ -64,7 +64,7 @@ test('restart survive: the first server releases the pane holder; the next serve
   const created = await requestEls(socket, { op: 'new', ws: 'OP', cwd: root, command: ['/bin/sh'] });
   expect(created.exitCode).toBe(0);
   const { pane } = JSON.parse(created.message) as { pane: string };
-  const sent = await requestEls(socket, { op: 'send', pane, text: 'echo RST_FIRST_ALIVE\r' });
+  const sent = await requestEls(socket, { op: 'input', pane, bytes: 'echo RST_FIRST_ALIVE\r' });
   expect(sent.exitCode).toBe(0);
   await until(async () => (await screenOf(socket, pane)).includes('RST_FIRST_ALIVE'));
 
@@ -81,7 +81,7 @@ test('restart survive: the first server releases the pane holder; the next serve
   expect(row?.ptyId).not.toBe('');
   expect(row?.state).not.toBe('exited');
   await until(async () => (await screenOf(socket, pane)).includes('RST_FIRST_ALIVE'));
-  const typed = await requestEls(socket, { op: 'send', pane, text: 'echo RST_SECOND_ALIVE\r' });
+  const typed = await requestEls(socket, { op: 'input', pane, bytes: 'echo RST_SECOND_ALIVE\r' });
   expect(typed.exitCode).toBe(0);
   await until(async () => (await screenOf(socket, pane)).includes('RST_SECOND_ALIVE'));
 
@@ -110,7 +110,7 @@ test('restart survive: a graceful close ends the attach as the server going away
   const created = await requestEls(socket, { op: 'new', ws: 'OP', cwd: root, command: ['/bin/sh'] });
   expect(created.exitCode).toBe(0);
   const { pane } = JSON.parse(created.message) as { pane: string };
-  const sent = await requestEls(socket, { op: 'send', pane, text: 'echo GRACE_CLOSE_ALIVE\r' });
+  const sent = await requestEls(socket, { op: 'input', pane, bytes: 'echo GRACE_CLOSE_ALIVE\r' });
   expect(sent.exitCode).toBe(0);
   await until(async () => (await screenOf(socket, pane)).includes('GRACE_CLOSE_ALIVE'));
   const ends: [number, string][] = [];

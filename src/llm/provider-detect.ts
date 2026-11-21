@@ -32,7 +32,7 @@ export interface ProviderDetectDeps {
 
 const LIMIT_MS = 3_000;
 const CLAUDE_LIMIT_MS = 5_000;
-const ORDER = ['openai-codex', 'anthropic', 'grok', 'gemini', 'openrouter', 'openai', 'ollama', 'local', 'opengateway'] as const;
+const ORDER = ['openai-codex', 'anthropic', 'grok', 'gemini', 'openrouter', 'openai', 'ollama', 'local', 'opengateway', 'timelyrouter'] as const;
 const AGENT_RANK = { 'claude-code': -2, antigravity: -1 } as const;
 const SOURCE_PRIORITY: Readonly<Record<string, number>> = {
   'elanous-auth': 0,
@@ -152,6 +152,9 @@ export async function detectProviders(deps: ProviderDetectDeps = {}): Promise<De
     for (const [provider, keys] of Object.entries(ENV_KEYS)) {
       const key = keys.find((name) => populated(env[name]));
       if (key) add(provider, 'apikey', `env:${key}`);
+    }
+    if (populated(env.TIMELYROUTER_API_KEY) && populated(env.TIMELYROUTER_BASE_URL) && populated(env.TIMELYROUTER_MODEL)) {
+      add('timelyrouter', 'apikey', 'env:TIMELYROUTER_API_KEY');
     }
     if (populated(env.LOCAL_LLM_URL)) add('local', 'local', 'env:LOCAL_LLM_URL');
     for (const name of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN']) {

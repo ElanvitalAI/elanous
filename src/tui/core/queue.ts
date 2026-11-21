@@ -36,7 +36,7 @@ export type NextTuiQueueBoundary = 'tool-result' | 'idle';
  * ELN-CHILD-NOTICE-INTO-QUEUE; this file only owns their place in the order.
  */
 export type NextTuiQueueItemKind = 'user' | 'notice';
-export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'graph-node' | 'event-watch' | 'capsule-done';
+export type NextTuiQueueNoticeSource = 'sidetab' | 'harness-child' | 'seat-mail' | 'graph-node' | 'event-watch' | 'capsule-done' | 'ceo-ingress';
 /** Input mode decides batching: a slash command or `!` shell line never travels with ordinary chat. */
 export type NextTuiQueueMode = 'chat' | 'command' | 'shell';
 
@@ -66,6 +66,8 @@ export interface NextTuiQueueItem {
   readonly source?: NextTuiQueueNoticeSource;
   /** SEAT-INBOX B1-C: the ledger message a `seat-mail` notice carries — the receipt key (never parsed from text). */
   readonly msgId?: number;
+  /** Why a `cancelled` item was cancelled (the `cancel` reason) — a watcher tells «carried into the running turn» from a drop. */
+  readonly cancelReason?: string;
   readonly urgent?: boolean;
   /**
    * When a notice existed, if the producer knows. Absent means unknown.
@@ -115,6 +117,7 @@ interface MutableItem {
   supersededBy?: string;
   source?: NextTuiQueueNoticeSource;
   msgId?: number;
+  cancelReason?: string;
   urgent?: boolean;
   occurredAt?: number;
   replacementCandidateFor?: string;
@@ -239,6 +242,7 @@ export function createNextTuiQueue(options: { log?: NextTuiQueueLog; turnLifeLog
 
   const cancel = (item: MutableItem, reason: string): void => {
     item.status = 'cancelled';
+    item.cancelReason = reason;
     leave(item);
     log('cancelled', { id: item.id, seq: item.seq, delivery: item.delivery, reason });
     notifyTransition(item);

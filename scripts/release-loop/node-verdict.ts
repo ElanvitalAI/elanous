@@ -209,4 +209,4 @@ export async function runNodeVerdict(argv: string[], env: NodeJS.ProcessEnv = pr
   }
 }
 
-if (import.meta.main) process.exitCode = await runNodeVerdict(process.argv.slice(2), process.env);
+if (import.meta.main) void runNodeVerdict(process.argv.slice(2), process.env).then((code) => { process.exitCode = code; });

@@ -25,11 +25,15 @@ import { debug } from '../debug/log.js';
 import { globalAgentRegistry } from './registry.js';
 import type { AgentRegistry } from './registry.js';
 import type { AgentState } from './types.js';
+import { judgeStop } from './stop-door.js';
+import type { StopOutcome } from './stop-door.js';
 
 export type AgentStopStatus =
   | 'success'           // abort signal delivered to a live task
   | 'already_terminal'  // task already done/error/aborted
-  | 'not_found';        // no task with that id
+  | 'not_found'          // no task with that id
+  | 'refused'            // caller does not own the task
+  | 'failed';             // registry did not send a signal
 
 export interface AgentStopParams {
   taskId: string;
@@ -59,6 +63,8 @@ export interface AgentStopResult extends Record<string, unknown> {
    *  alongside the target. Present only when `cascade: true` was
    *  passed. Zero when the target had no live children. */
   descendantsAborted?: number;
+  /** STOP-DOOR-ONE — the shared verdict shape (same as ShellKill · task-stop · detached capsule). */
+  stop?: StopOutcome;
 }
 
 export function buildAgentStopTool(): LLMToolSpec {
@@ -97,6 +103,7 @@ function isTerminal(state: AgentState): boolean {
 
 export interface DispatchAgentStopDeps {
   registry?: AgentRegistry;
+  requester?: string;
 }
 
 export async function dispatchAgentStop(
@@ -107,7 +114,14 @@ export async function dispatchAgentStop(
   const reason = typeof raw.reason === 'string' ? raw.reason : undefined;
   const cascade = raw.cascade === true;
   const registry = deps.registry ?? globalAgentRegistry;
+  const task = taskId ? registry.get(taskId) : undefined;
+  const verdict = judgeStop({
+    kind: 'agent', id: taskId, exists: task !== undefined,
+    ended: task !== undefined && isTerminal(task.state),
+    owner: task?.parentSessionId, requester: deps.requester, reason,
+  });
   const record = (result: AgentStopResult): AgentStopResult => {
+    result = { ...result, stop: result.stop ?? verdict };
     debug.log('agent.stop', 'dispatch', {
       taskId: result.taskId,
       stopStatus: result.stopStatus,
@@ -130,7 +144,6 @@ export async function dispatchAgentStop(
     });
   }
 
-  const task = registry.get(taskId);
   if (!task) {
     return record({
       output: 'AgentStop: task not found',
@@ -141,7 +154,12 @@ export async function dispatchAgentStop(
   }
 
   const stateAtCall = task.state;
-  if (isTerminal(stateAtCall)) {
+  if (verdict.refused) {
+    return record({
+      output: 'AgentStop: stop refused', stopStatus: 'refused', taskId,
+    });
+  }
+  if (verdict.alreadyEnded) {
     return record({
       output: `AgentStop: already terminal (${stateAtCall})`,
       stopStatus: 'already_terminal',
@@ -152,13 +170,16 @@ export async function dispatchAgentStop(
     });
   }
 
-  let descendantsAborted = 0;
-  if (cascade) {
-    const result = registry.abortCascade(taskId);
-    descendantsAborted = result.descendants;
-  } else {
-    registry.abort(taskId);
+  const aborted = cascade
+    ? registry.abortCascade(taskId)
+    : { self: registry.abort(taskId), descendants: 0 };
+  if (!aborted.self) {
+    return record({
+      output: 'AgentStop: abort signal was not sent', stopStatus: 'failed', taskId,
+      stop: { ...verdict, stopped: false, failed: 'signal-failed' },
+    });
   }
+  const descendantsAborted = aborted.descendants;
 
   const tail = cascade
     ? ` · cascade=${descendantsAborted} descendant${descendantsAborted === 1 ? '' : 's'}`

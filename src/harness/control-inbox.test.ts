@@ -81,7 +81,7 @@ function trackWorker(child: ReturnType<typeof spawn>): ReturnType<typeof spawn> 
 function runWorker(script: string, isolated: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = trackWorker(spawn(process.execPath, ['-e', script], {
-      cwd: import.meta.dir,
+      cwd: repoRoot,
       env: { ...process.env, ...isolated },
       stdio: ['ignore', 'pipe', 'pipe'],
     }));
@@ -96,7 +96,7 @@ function runWorker(script: string, isolated: NodeJS.ProcessEnv): Promise<string>
 
 function spawnObservedWorker(script: string, isolated: NodeJS.ProcessEnv): ReturnType<typeof spawn> {
   const child = trackWorker(spawn(process.execPath, ['-e', script], {
-    cwd: import.meta.dir,
+    cwd: repoRoot,
     env: { ...process.env, ...isolated },
     stdio: ['ignore', 'pipe', 'pipe'],
   }));
@@ -230,10 +230,12 @@ async function waitForPidExitViaPs(pid: number, withinMs: number): Promise<numbe
   return countPidViaPs(pid);
 }
 
+// Workers run from repoRoot with an absolute require: a cwd of src/harness made debug/log.ts create src/harness/log/latest (a symlink),
+// which PLUGIN-ONLY-RATCHET (walks src/) refuses — it failed every train batch whose cohort included this file.
 const workerPrelude = `
   const fs = require('node:fs');
   const { setTimeout } = require('node:timers/promises');
-  const { enqueueControlMemo, drainControlInbox } = require('./control-inbox.ts');
+  const { enqueueControlMemo, drainControlInbox } = require(${JSON.stringify(join(import.meta.dir, 'control-inbox.ts'))});
   const barrier = process.env.CONTROL_INBOX_BARRIER;
   const parentPid = process.ppid;
   const parsedTimeout = Number(process.env.CONTROL_INBOX_BARRIER_TIMEOUT_MS);
@@ -923,7 +925,7 @@ describe('control inbox', () => {
       const { spawn } = require('node:child_process');
       const fs = require('node:fs');
       const child = spawn(${JSON.stringify(process.execPath)}, ['-e', ${JSON.stringify(waitingWorkerScript)}], {
-        cwd: ${JSON.stringify(import.meta.dir)},
+        cwd: ${JSON.stringify(repoRoot)},
         env: Object.assign({}, process.env, {
           ELANOUS_STATE_DIR: ${JSON.stringify(isolated.ELANOUS_STATE_DIR)},
           CONTROL_INBOX_BARRIER: ${JSON.stringify(barrier)},

@@ -1,6 +1,8 @@
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { seatHandoffStateRoot } from '../memory.js';
+import { buildOpHandoffRecall } from '../seat-memory/seat-handoff-recall.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import {
@@ -29,6 +31,32 @@ import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../chat/inte
 export interface SeatMailSnapshot {
   seat: string;
   unread: number | null;
+}
+
+/** The OP first-turn handoff shares the seat boot's home and isolated state root. */
+export function readSeatHandoffBootPrompt(seat: string, home: string, now: Date, env: NodeJS.ProcessEnv = process.env): string | null {
+  if (seat !== 'OP') return null;
+  const stateRoot = seatHandoffStateRoot(home, env);
+  const trustedBase = stateRoot === join(home, 'elanous-hq', 'seat-state') ? home : dirname(stateRoot);
+  return buildOpHandoffRecall(stateRoot, now, trustedBase);
+}
+
+const OP_ROLE_PACK_PATH = join(import.meta.dir, '..', '..', 'seats', 'OP-ELN', 'ROLE-PACK.md');
+const OP_ROLE_PACK_MAX_BYTES = 32 * 1024;
+
+/** Packaged OP instructions reach the same first-turn system message as the seat boot card. */
+export function readOpRolePackBootPrompt(seat: string): string | null {
+  if (seat !== 'OP') return null;
+  try {
+    const info = lstatSync(OP_ROLE_PACK_PATH);
+    if (!info.isFile() || info.size > OP_ROLE_PACK_MAX_BYTES) return '⚠ OP-ELN ROLE-PACK 확인 실패: 팩 형식 또는 크기 오류. 권한 효과를 실행하지 말고 OP에 보고하라.';
+    const body = readFileSync(OP_ROLE_PACK_PATH, 'utf8').trim();
+    if (!body.startsWith('# OP-ELN ROLE-PACK')) return '⚠ OP-ELN ROLE-PACK 확인 실패: 팩 머리말 오류. 권한 효과를 실행하지 말고 OP에 보고하라.';
+    return body;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return `⚠ OP-ELN ROLE-PACK 확인 실패: ${code === 'ENOENT' ? '설치본에 팩 없음' : '읽기 오류'}. 권한 효과를 실행하지 말고 OP에 보고하라.`;
+  }
 }
 
 const SEAT_IN_PATH = /(?:^|\/)seats\/([A-Za-z][A-Za-z0-9_-]{0,63})(?=\/|$)/g;
@@ -377,12 +405,21 @@ export function appendSeatPlan(line: string | null, status: SeatPlanStatus | nul
 export function messageToTaskRequest(message: Message): TaskRequest {
   const parsed = Date.parse(message.createdAt);
   const priority = structuredPriority(message);
+  // r2 (JUD #121493): the ledger's VERIFIED fields (B1-A origin kind/seat · intent · crown) ride along so the plan
+  // notice's header prefers them over the legacy sender/kind — the same rule the immediate-injection path already
+  // follows (formatSeatMailPrompt spreads headerFieldsOf). Legacy stays the fallback for rows without the columns.
+  const header = headerFieldsOf(message);
   return {
     id: `mail#${message.id}`,
     text: message.body,
     receivedAt: Number.isFinite(parsed) ? parsed : message.id,
+    // ELN-SEAT-INBOX-TURN-BOUNDARY (#121130): sender + transport kind ride along so the queue notice
+    // can carry the mail ORIGINAL (sender · msg:<id> · body verbatim) — never a one-line summary.
+    sender: message.from,
+    ...(message.kind !== undefined ? { kind: message.kind } : {}),
     ...(message.kind === 'interrupt' ? { interrupt: true } : {}),
     ...(priority === undefined ? {} : { priority }),
+    ...(Object.keys(header).length > 0 ? { header } : {}),
   };
 }
 
@@ -594,7 +631,7 @@ export function createSeatPlanTurnLink(runtime: SeatPlanRuntime) {
  * `syncPlan` retracts the notice of an item that closed before its turn started; a notice already delivered cannot be retracted.
  */
 export function seatTaskQueueFromPromptQueue(
-  promptQueue: { enqueueNotice(text: string, source: 'seat-mail'): { id: string }; cancel(id: string, reason?: string): unknown;
+  promptQueue: { enqueueNotice(text: string, source: 'seat-mail', meta?: { msgId?: number; occurredAt?: number; urgent?: boolean }): { id: string }; cancel(id: string, reason?: string): unknown;
     onTransition?: (listener: (item: { id: string; status: string }) => void) => () => void },
   onStarted?: (messageId: number, itemId: string) => void,
 ): SeatPlanQueuePort {
@@ -610,7 +647,22 @@ export function seatTaskQueueFromPromptQueue(
   return {
     enqueue: task => {
       if (noticeOf.has(task.id)) return;
-      noticeOf.set(task.id, promptQueue.enqueueNotice(`[계획] ${task.title}`, 'seat-mail').id);
+      const mailIdMatch = /^mail#([1-9]\d*)$/.exec(task.sourceRequestId);
+      const mailIdNum = mailIdMatch === null ? undefined : Number(mailIdMatch[1]);
+      // ELN-SEAT-INBOX-TURN-BOUNDARY (#121130): this notice IS the next turn's model input — it must carry
+      // the mail ORIGINAL (sender · msg:<id> · body verbatim, seatMessageContextBlock), never a summary line:
+      // a summary made the model «answer» without ever seeing the mail, and the after-turn ack then made
+      // it vanish from the unread list. The queue keys the mail identity as msgId meta, never as its text.
+      // r2 (JUD #121493): the VERIFIED header markers (origin kind/seat · intent · crown) ride the plan
+      // notice too — headerFieldsOf already flattened them onto the task; legacy sender/kind is only the
+      // fallback, exactly like the immediate-injection path (formatSeatMailPrompt).
+      const original = mailIdNum === undefined || task.sourceSender === undefined ? '' : `\n${seatMessageContextBlock({
+        id: mailIdNum, sender: task.sourceSender, body: task.sourceText,
+        ...(task.sourceKind !== undefined ? { kind: task.sourceKind } : {}),
+        ...(task.sourceHeader ?? {}),
+      })}`;
+      noticeOf.set(task.id, promptQueue.enqueueNotice(`[계획] ${task.title}${original}`, 'seat-mail',
+        mailIdNum === undefined ? {} : { msgId: mailIdNum }).id);
       enqueued.set(task.id, task);
     },
     snapshot: () => [...enqueued.values()],

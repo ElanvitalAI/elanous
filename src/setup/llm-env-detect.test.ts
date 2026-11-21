@@ -20,7 +20,8 @@ describe('11-04 setup service catalog', () => {
     const daemonNames = new Set(DAEMON_KEY_ENV_NAMES);
     for (const name of catalogEnv) expect(daemonNames.has(name)).toBe(true);
     for (const spec of PROVIDER_ENV_SPEC) {
-      if (spec.primaryKeyEnv !== 'LOCAL_LLM_URL') expect(catalogEnv.has(spec.primaryKeyEnv)).toBe(true);
+      // HQ proxy machine tokens are provisioned by the owner, not the user key setup catalog.
+      if (spec.primaryKeyEnv !== 'LOCAL_LLM_URL' && spec.provider !== 'hq-proxy') expect(catalogEnv.has(spec.primaryKeyEnv)).toBe(true);
     }
     for (const item of AUXILIARY_AI_ENV_VARS) expect(catalogEnv.has(item.name)).toBe(true);
   });

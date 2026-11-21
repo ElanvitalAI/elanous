@@ -96,6 +96,8 @@ export interface GuardMemory {
   readonly currentRow?: string;
   readonly stopped?: boolean;
   readonly windows: Readonly<Record<string, WindowSnapshot>>;
+  /** 저잔액·구독 소진 알림 중복 억제 — 행 → 마지막으로 우편을 보낸 레벨(llm-low-balance-alert.ts). 회복하면 지운다(재무장). */
+  readonly alerted?: Readonly<Record<string, string>>;
 }
 
 export interface GuardMemoryStore {
@@ -119,6 +121,7 @@ export function createFileGuardStore(path: string): GuardMemoryStore {
           ...(typeof parsed.currentRow === 'string' ? { currentRow: parsed.currentRow } : {}),
           ...(parsed.stopped === true ? { stopped: true } : {}),
           windows: parsed.windows && typeof parsed.windows === 'object' ? parsed.windows : {},
+          ...(parsed.alerted && typeof parsed.alerted === 'object' ? { alerted: parsed.alerted } : {}),
         };
       } catch { return { windows: {} }; }
     },
@@ -290,6 +293,7 @@ async function runLlmSpendGuardLocked(
     windows,
     ...(nextRow !== undefined ? { currentRow: nextRow } : {}),
     ...(stopped ? { stopped: true } : {}),
+    ...(memory.alerted ? { alerted: memory.alerted } : {}),
   });
   return { decision, resets, ledgerWritten, ...(ledgerError !== undefined ? { ledgerError } : {}), ...(reservation ? { reservation } : {}) };
 }

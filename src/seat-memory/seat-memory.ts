@@ -13,6 +13,7 @@
 //    읽기 실패 파일은 건너뛰고 턴은 막지 않는다(fail-soft).
 
 import { existsSync, lstatSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
 import { estimateTokens } from '../tokens.js';
@@ -413,8 +414,8 @@ export function buildSeatMemoryIndexBlock(seat: string, dir: string, caps: { max
   return { block, lines: kept.length, totalLines: all.length, bytes, totalBytes, truncated };
 }
 
-/** 세션마다 이미 꺼낸 이름 — 같은 기억을 턴마다 다시 싣지 않는다. 세션 수 상한 = turn-session-layers SESSION_LAYER_CACHE_MAX(32). */
-const recalledBySession = new Map<string, Set<string>>();
+/** 세션마다 이미 꺼낸 이름과 내용 지문 — 같은 줄은 생략하지만 정정된 줄은 다음 턴에 다시 싣는다. */
+const recalledBySession = new Map<string, Map<string, string>>();
 const RECALL_SESSION_CACHE_MAX = 32;
 
 export function resetSeatMemoryRecallForTest(): void {
@@ -428,7 +429,7 @@ export function recallSeatMemoriesForTurn(opts: {
   seat: string; dir: string; text: string; sessionKey?: string;
   maxHits?: number; maxTokens?: number; minScore?: number;
 }): SeatMemoryRecall | null {
-  const seen = opts.sessionKey ? recalledBySession.get(opts.sessionKey) ?? new Set<string>() : new Set<string>();
+  const seen = opts.sessionKey ? recalledBySession.get(opts.sessionKey) ?? new Map<string, string>() : new Map<string, string>();
   // 낱말 1개 이하 글은 의도 판정이 어렵다 — 회상하지 않는다(전역 주입의 low-context 가드와 같은 규칙).
   const tokenCount = extractKeywords(opts.text).length;
   const candidates = tokenCount < 2 ? [] : searchSeatMemories(opts.text, opts.dir, Number.MAX_SAFE_INTEGER);
@@ -437,15 +438,18 @@ export function recallSeatMemoriesForTurn(opts: {
   const maxTokens = opts.maxTokens ?? SEAT_MEMORY_RECALL_MAX_TOKENS;
   const chunks: string[] = [];
   const names: string[] = [];
+  const revisions = new Map<string, string>();
   let used = 0;
   for (const hit of candidates) {
     if (names.length >= maxHits) break;
-    if (hit.score < minScore || seen.has(hit.entry.name)) continue;
+    const revision = createHash('sha256').update(JSON.stringify([hit.entry.type, hit.entry.description, hit.entry.body])).digest('hex');
+    if (hit.score < minScore || seen.get(hit.entry.name) === revision) continue;
     const chunk = `### ${hit.entry.name} [${hit.entry.type}]\n${redactSecretText(hit.entry.body || hit.entry.description)}`;
     const tok = estimateTokens(chunk);
     if (used + tok > maxTokens) continue;
     chunks.push(chunk);
     names.push(hit.entry.name);
+    revisions.set(hit.entry.name, revision);
     used += tok;
   }
   // 낱말이 모자란 글(빈 유휴 preamble 등)은 «부를 일이 없었다» — 관측 소음을 만들지 않는다.
@@ -458,7 +462,7 @@ export function recallSeatMemoriesForTurn(opts: {
   }
   if (names.length === 0) return null;
   if (opts.sessionKey) {
-    for (const n of names) seen.add(n);
+    for (const n of names) seen.set(n, revisions.get(n)!);
     recalledBySession.delete(opts.sessionKey);
     recalledBySession.set(opts.sessionKey, seen);
     while (recalledBySession.size > RECALL_SESSION_CACHE_MAX) recalledBySession.delete(recalledBySession.keys().next().value as string);

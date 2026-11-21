@@ -15,6 +15,7 @@
 //       sessionUpdate: 'agent_thought_chunk',
 //       content: { type: 'text', text: '<ElanousTermEnvelope>' } } } }
 
+import { preloadTerminalFont } from '@/lib/terminal-font';
 import { useEffect, useRef, useState } from 'react';
 // We intentionally exclude `sessionId` from the effect deps so the
 // auto-handshake socket isn't torn down when the daemon-issued
@@ -38,19 +39,22 @@ import {
 } from '@/lib/snapshot';
 import { ACP_AUTH_HOWTO, ACP_AUTH_MESSAGE, classifyAcpFailure, reconnectDelayMs } from './acp-failure';
 import { dispatchTouchWheel, touchScrollAction, touchScrollLines, touchWheelLines } from './touch-scroll';
+import { createPaneTouches, createPinchZoom } from './pinch-zoom';
 import { createXtermResizeController } from '@/lib/xterm-resize-controller';
 import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
 import { createTerminalInputSender } from './terminal-input-sender';
 import { registerTerminalHistoryView, registerTerminalInput, takeStickyModifiers } from './terminal-input-registry';
 import { applyStickyModifiers, canApplyStickyModifiers } from '@/lib/key-sequences';
 import { shouldClear } from './terminal-clear';
-import { clampFontSize, fontStepKey, isFocusToggleKey, readTermFocusStartDisabled, readTermFontSize, writeTermFocusStartDisabled, writeTermFontSize } from '@/lib/term-focus';
+import { clampFontSize, fontStepKey, isFocusToggleKey, publishTermFontSize, readTermFocusStartDisabled, readTermFontSize, subscribeTermFontSize, writeTermFocusStartDisabled, writeTermFontSize } from '@/lib/term-focus';
 import { useCompactMode } from '@/lib/compact-mode';
 
 interface Props {
   sessionId: string;
   terminalId: string;
   clearRequest?: number;
+  sharedFontSize?: number | null;
+  onFontSizeChange?: (size: number) => void;
   /** Default false at WT-A-2a — keyboard input flows back to PTY via
    *  ACP `terminal/input`. Pass `readOnly={true}` for view-only modes
    *  (e.g. multi-device viewer that shouldn't compete on stdin). */
@@ -64,9 +68,18 @@ interface Props {
 /** 새 셸의 «첫 출력»을 기다리는 입력 관문의 상한(ms). */
 export const SHELL_READY_CAP_MS = 2_000;
 
-export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = false, onForeignInputActivity }: Props) {
+export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = false, onForeignInputActivity, sharedFontSize, onFontSizeChange }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
+  const setFontSizeRef = useRef<(size: number) => void>(() => {});
+  const applySharedFontSizeRef = useRef<(size: number) => void>(() => {});
+  const cancelPinchForFontChangeRef = useRef<(size: number) => void>(() => {});
+  const onFontSizeChangeRef = useRef(onFontSizeChange);
+  onFontSizeChangeRef.current = onFontSizeChange;
+  const sharedFontSizeRef = useRef(sharedFontSize);
+  sharedFontSizeRef.current = sharedFontSize;
+  const lastFontSizeRef = useRef<number | null>(null);
+  const controlledFontSize = sharedFontSize != null && onFontSizeChange != null;
   // TERM2 집중 모드 — 터미널 표면이 화면 전체를 덮는다(사이드바·머리 줄·독·칩을 하나씩 숨기지 않는다).
   const hostRef = useRef<HTMLDivElement>(null);
   const { compact } = useCompactMode();
@@ -135,12 +148,18 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
 
   useEffect(() => {
     if (!ref.current) return;
+    preloadTerminalFont();
     const term = new Terminal({
       // Bundled via apps/pwa/public/fonts/ + @font-face in globals.css.
       // Falls back to system JetBrains Mono / monospace if bundle is
       // mid-loading — `font-display: swap` makes the swap-in seamless.
       fontFamily: '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace',
-      fontSize: readTermFontSize(typeof window === 'undefined' ? null : window.localStorage),
+      fontSize: (sharedFontSizeRef.current != null && onFontSizeChangeRef.current
+        ? sharedFontSizeRef.current
+        : lastFontSizeRef.current ?? sharedFontSizeRef.current) ?? readTermFontSize(
+        (() => { try { return window.localStorage; } catch { return null; } })(),
+        window.matchMedia?.('(pointer: coarse)').matches ?? false,
+      ),
       theme: {
         background: '#0d0c08',
         foreground: '#e9e3d4',
@@ -196,6 +215,32 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     const screenHost = hostRef.current as (HTMLDivElement & { __elanousTerm?: Terminal }) | null;
     if (screenHost) screenHost.__elanousTerm = term;
     fit.fit();
+    const applyFontSize = (size: number) => {
+      const next = clampFontSize(size);
+      lastFontSizeRef.current = next;
+      if (term.options.fontSize === next) return;
+      cancelPinchForFontChangeRef.current(next);
+      term.options.fontSize = next;
+      try { writeTermFontSize(window.localStorage, next); } catch { /* storage may be blocked */ }
+      try { fit.fit(); } catch { /* dimensions not ready yet */ }
+      debugLog('webterm.focus-mode', { event: 'font', size: next });
+    };
+    applySharedFontSizeRef.current = applyFontSize;
+    const requestFontSize = (size: number) => {
+      const next = clampFontSize(size);
+      if (term.options.fontSize === next) return;
+      const onChange = onFontSizeChangeRef.current;
+      if (sharedFontSizeRef.current != null && onChange) {
+        // A controlled value is only a request until the parent supplies it.
+        onChange(next);
+        return;
+      }
+      applyFontSize(next);
+      publishTermFontSize(next);
+      // The panel passes the publisher itself while its controlled value initializes.
+      if (onChange !== publishTermFontSize) onChange?.(next);
+    };
+    setFontSizeRef.current = requestFontSize;
 
     // BACKLOG #3 — restore prior scrollback before the daemon streams
     // fresh frames. SerializeAddon emits a single string of ANSI bytes
@@ -427,25 +472,59 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // 폰 터치: 일반 화면은 스크롤백, 대체 화면은 xterm 휠(마우스 추적 / alternate scroll)에 맡긴다.
     const touchHost = ref.current;
     let touchStart: { y: number; viewportY: number; wheelSent: number; bufferType: 'normal' | 'alternate' } | null = null;
+    const pinch = createPinchZoom();
+    cancelPinchForFontChangeRef.current = (size) => {
+      if (clampFontSize(size) !== term.options.fontSize) pinch.cancel();
+    };
+    let blockedByExtraTouch = false;
+    let crossPaneSingleBlocked = false;
+    let pinchInProgress = false;
+    // Claim browser movement from the second local contact until this pane is empty.
+    let multiTouchClaimed = false;
+    const paneTouches = createPaneTouches();
     const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length !== 1) { touchStart = null; return; }
-      touchStart = { y: e.touches[0].clientY, viewportY: term.buffer.active.viewportY, wheelSent: 0, bufferType: term.buffer.active.type };
+      const touches = paneTouches(e);
+      if (touches.length >= 2) multiTouchClaimed = true;
+      if (touches.length > 2) { blockedByExtraTouch = true; pinchInProgress = false; touchStart = null; pinch.cancel(); }
+      if (blockedByExtraTouch) return;
+      if (touches.length !== 1) {
+        touchStart = null;
+        if (touches.length === 2) crossPaneSingleBlocked = false;
+        pinchInProgress = touches.length === 2;
+        pinch.start(touches, term.options.fontSize ?? 13);
+        return;
+      }
+      pinch.cancel();
+      if (e.touches.length > 1) crossPaneSingleBlocked = true;
+      if (crossPaneSingleBlocked) return;
+      touchStart = { y: touches[0].clientY, viewportY: term.buffer.active.viewportY, wheelSent: 0, bufferType: term.buffer.active.type };
     };
     const onTouchMove = (e: TouchEvent) => {
-      if (!touchStart || e.touches.length !== 1) return;
+      const touches = paneTouches(e);
+      if (touches.length >= 2) multiTouchClaimed = true;
+      if (multiTouchClaimed && e.cancelable) e.preventDefault();
+      if (touches.length > 2) { blockedByExtraTouch = true; pinchInProgress = false; touchStart = null; pinch.cancel(); }
+      if (blockedByExtraTouch) return;
+      if (touches.length !== 1) {
+        const next = pinch.move(touches);
+        if (next !== null) requestFontSize(next);
+        return;
+      }
+      if (e.touches.length > 1) { crossPaneSingleBlocked = true; touchStart = null; }
+      if (crossPaneSingleBlocked || !touchStart) return;
       const bufferType = term.buffer.active.type;
       if (bufferType !== touchStart.bufferType) {
-        touchStart = { y: e.touches[0].clientY, viewportY: term.buffer.active.viewportY, wheelSent: 0, bufferType };
+        touchStart = { y: touches[0].clientY, viewportY: term.buffer.active.viewportY, wheelSent: 0, bufferType };
         return;
       }
       const screen = term.element?.querySelector('.xterm-screen');
       const cellHeight = term.rows > 0 ? (screen?.getBoundingClientRect().height ?? 0) / term.rows : 0;
       if (!(cellHeight > 0)) return;
       const lines = bufferType === 'alternate'
-        ? touchWheelLines({ startY: touchStart.y, currentY: e.touches[0].clientY, cellHeight, sentSteps: touchStart.wheelSent })
+        ? touchWheelLines({ startY: touchStart.y, currentY: touches[0].clientY, cellHeight, sentSteps: touchStart.wheelSent })
         : touchScrollLines({
             startY: touchStart.y,
-            currentY: e.touches[0].clientY,
+            currentY: touches[0].clientY,
             cellHeight,
             startViewportY: touchStart.viewportY,
             currentViewportY: term.buffer.active.viewportY,
@@ -457,15 +536,54 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       } else if (action.kind === 'wheel') {
         const target = term.element;
         if (!target) return;
-        dispatchTouchWheel(target, action.steps, e.touches[0].clientX, e.touches[0].clientY);
+        dispatchTouchWheel(target, action.steps, touches[0].clientX, touches[0].clientY);
         touchStart.wheelSent += action.steps;
         debugLog('webterm.touch-scroll', { kind: action.kind, steps: action.steps, bufferType });
       }
     };
-    const onTouchEnd = () => { touchStart = null; };
+    const onTouchEnd = (e: TouchEvent) => {
+      const touches = paneTouches(e);
+      if (touches.length === 0) { crossPaneSingleBlocked = false; multiTouchClaimed = false; }
+      if (blockedByExtraTouch) {
+        if (touches.length === 0) blockedByExtraTouch = false;
+        return;
+      }
+      touchStart = null;
+      pinch.cancel();
+      // A finger left over from a pinch is still part of that gesture, not a scroll.
+      if (pinchInProgress && touches.length === 1) blockedByExtraTouch = true;
+      pinchInProgress = false;
+      if (touches.length === 2) {
+        pinchInProgress = true;
+        pinch.start(touches, term.options.fontSize ?? 13);
+      }
+    };
+    const onTouchCancel = (e: TouchEvent) => { touchStart = null; pinch.cancel(); pinchInProgress = false; const remaining = paneTouches(e).length; blockedByExtraTouch = remaining > 0; if (remaining === 0) { crossPaneSingleBlocked = false; multiTouchClaimed = false; } };
+    // A foreign contact can start and end without another event reaching this
+    // pane. Invalidate the old one-finger gesture immediately in capture phase.
+    const onDocumentTouchStart = (e: TouchEvent) => {
+      if (touchStart && e.touches.length > 1 && Array.from(e.changedTouches).some((touch) => !touchHost.contains(touch.target as Node))) {
+        crossPaneSingleBlocked = true;
+        touchStart = null;
+      }
+    };
+    const touchDocument = touchHost.ownerDocument;
+    touchDocument?.addEventListener('touchstart', onDocumentTouchStart, true);
+    let lastZoomWheelAt: number | null = null;
+    const onZoomWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.deltaY === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const now = Date.now();
+      if (lastZoomWheelAt !== null && now - lastZoomWheelAt < 150) return;
+      lastZoomWheelAt = now;
+      requestFontSize((term.options.fontSize ?? 13) + (e.deltaY < 0 ? 1 : -1));
+    };
     touchHost.addEventListener?.('touchstart', onTouchStart, { passive: true });
-    touchHost.addEventListener?.('touchmove', onTouchMove, { passive: true });
+    touchHost.addEventListener?.('touchmove', onTouchMove, { passive: false });
     touchHost.addEventListener?.('touchend', onTouchEnd, { passive: true });
+    touchHost.addEventListener?.('touchcancel', onTouchCancel, { passive: true });
+    touchHost.addEventListener?.('wheel', onZoomWheel, { passive: false, capture: true });
 
     const resizeController = createXtermResizeController({
       target: ref.current,
@@ -491,9 +609,14 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
         debugLog('webterm.xterm.snapshot.error', { reason: String(e) });
       }
       try { resizeController.dispose(); } catch { /* swallow */ }
+      touchDocument?.removeEventListener('touchstart', onDocumentTouchStart, true);
       touchHost.removeEventListener?.('touchstart', onTouchStart);
       touchHost.removeEventListener?.('touchmove', onTouchMove);
       touchHost.removeEventListener?.('touchend', onTouchEnd);
+      touchHost.removeEventListener?.('touchcancel', onTouchCancel);
+      touchHost.removeEventListener?.('wheel', onZoomWheel, true);
+      setFontSizeRef.current = () => {};
+      applySharedFontSizeRef.current = () => {};
       unregisterHistoryView?.();
       unregisterInput?.();
       inputSender.dispose();
@@ -554,6 +677,36 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [failureKind, terminalId]);
 
+  // A controlled initial prop belongs to this view; only later changes are publications.
+  const previousSharedFontSizeRef = useRef(sharedFontSize);
+  const firstFontPropEffectRef = useRef(true);
+  useEffect(() => {
+    const changed = previousSharedFontSizeRef.current !== sharedFontSize;
+    const initialUncontrolled = firstFontPropEffectRef.current && !controlledFontSize;
+    previousSharedFontSizeRef.current = sharedFontSize;
+    firstFontPropEffectRef.current = false;
+    if (sharedFontSize != null && (changed || initialUncontrolled)) {
+      applySharedFontSizeRef.current(sharedFontSize);
+      publishTermFontSize(sharedFontSize);
+    }
+  }, [sharedFontSize]);
+
+  useEffect(() => {
+    if (controlledFontSize) applySharedFontSizeRef.current(sharedFontSizeRef.current!);
+    let initialNotification = true;
+    return subscribeTermFontSize((size) => {
+      // The first notification is storage hydration, not a newer publication;
+      // preserve a controlled initial prop. Later publications are authoritative
+      // immediately, before React can propagate the parent's updated prop.
+      if (!controlledFontSize || (!initialNotification && onFontSizeChangeRef.current === publishTermFontSize)) {
+        applySharedFontSizeRef.current(size);
+      } else if (controlledFontSize) {
+        cancelPinchForFontChangeRef.current(size);
+      }
+      initialNotification = false;
+    });
+  }, [controlledFontSize]);
+
   useEffect(() => {
     if (shouldClear(previousClearRequestRef.current, clearRequest) && termRef.current) {
       termRef.current.clear();
@@ -592,10 +745,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       const term = termRef.current;
       if (step !== 0 && term && owns()) {
         e.preventDefault(); e.stopPropagation();
-        const next = clampFontSize((term.options.fontSize ?? 13) + step);
-        term.options.fontSize = next;
-        writeTermFontSize(window.localStorage, next);
-        debugLog('webterm.focus-mode', { event: 'font', size: next });
+        setFontSizeRef.current((term.options.fontSize ?? 13) + step);
       }
     };
     document.addEventListener('keydown', onKey, true);
@@ -618,9 +768,32 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       ref={hostRef}
       data-xterm-host
       data-focus-mode={focusMode ? '1' : undefined}
-      className={focusMode ? 'fixed inset-0 z-[90] h-[100dvh] w-screen bg-[#0d0c08]' : 'relative h-full w-full bg-[#0d0c08]'}
+      className={focusMode ? 'fixed inset-0 z-[90] flex h-[100dvh] w-screen flex-col bg-[#0d0c08]' : 'relative flex h-full w-full flex-col bg-[#0d0c08]'}
     >
-      <div ref={ref} className="h-full w-full" />
+      <div className="flex shrink-0 flex-wrap items-start justify-between gap-1">
+        <div data-share-hide data-zoom-controls className="flex shrink-0 self-start gap-1 rounded bg-black/70 text-[#e9e3d4]">
+          <button type="button" aria-label="터미널 글자 작게" className="min-h-11 min-w-11 px-2" onMouseDown={(event) => event.preventDefault()} onClick={(event) => { setFontSizeRef.current((termRef.current?.options.fontSize ?? 13) - 1); if (event.detail > 0 && !readOnly) termRef.current?.focus(); }}>A−</button>
+          <button type="button" aria-label="터미널 글자 크게" className="min-h-11 min-w-11 px-2" onMouseDown={(event) => event.preventDefault()} onClick={(event) => { setFontSizeRef.current((termRef.current?.options.fontSize ?? 13) + 1); if (event.detail > 0 && !readOnly) termRef.current?.focus(); }}>A+</button>
+        </div>
+        <span data-acp-status className={`pointer-events-none rounded bg-black/70 px-2 py-1 text-xs ${statusTone}`}>
+          ACP: {statusLabel}
+          {acpState === 'CONNECTING' && <span data-share-hide>{' · '}{`${connectingDurationSeconds}초 · ${connectionTarget} · ${config.baseUrl}`}</span>}
+        </span>
+      </div>
+      {failureKind === 'auth' && (
+        <div role="alert" className="shrink-0 space-y-1 rounded bg-amber-950/95 px-3 py-2 text-sm text-amber-100" data-webterm-auth-missing>
+          <p>{ACP_AUTH_MESSAGE}</p>
+          <p className="text-xs text-amber-200/90">{ACP_AUTH_HOWTO}</p>
+          {/* 일반 링크로 전체 페이지를 다시 읽는다. */}
+          <a href="/app/settings/#bearer-token" className="inline-block font-medium underline" data-webterm-auth-settings>설정 열기 →</a>
+        </div>
+      )}
+      {visibleInputError && (
+        <div role="alert" className="shrink-0 rounded bg-red-950/95 px-3 py-2 text-sm text-red-100">
+          터미널 입력 전송 실패: {visibleInputError.dropped}바이트가 버려졌습니다. 명령이 일부만 실행됐을 수 있습니다. 입력을 확인하고 다시 입력하세요.
+        </div>
+      )}
+      <div ref={ref} className="min-h-0 w-full flex-1" />
       <button
         type="button"
         data-share-hide
@@ -634,25 +807,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       >
         {focusMode ? '⤡ 나가기' : '⤢ 집중'}
       </button>
-      {visibleInputError && (
-        <div role="alert" className="pointer-events-none absolute bottom-2 left-2 right-2 rounded bg-red-950/95 px-3 py-2 text-sm text-red-100">
-          터미널 입력 전송 실패: {visibleInputError.dropped}바이트가 버려졌습니다. 명령이 일부만 실행됐을 수 있습니다. 입력을 확인하고 다시 입력하세요.
-        </div>
-      )}
-      {failureKind === 'auth' && (
-        // ⛔ z-index 필수 — xterm 층이 z-index 최대 11 이라 없으면 캔버스가 클릭을 먹는다(대표 2026-09-28 «링크가 안 눌린다»).
-        <div role="alert" className="absolute left-2 right-2 top-10 z-30 space-y-1 rounded bg-amber-950/95 px-3 py-2 text-sm text-amber-100" data-webterm-auth-missing>
-          <p>{ACP_AUTH_MESSAGE}</p>
-          <p className="text-xs text-amber-200/90">{ACP_AUTH_HOWTO}</p>
-          {/* ⛔ 평범한 <a> — Next Link 의 클라이언트 이동이 이 화면에서 끝나지 않았다(클릭은 먹고 경로가 안 바뀜 · 2026-09-28 실측). 설정은 새로 읽어도 된다. */}
-          <a href="/app/settings/#bearer-token" className="inline-block font-medium underline" data-webterm-auth-settings>설정 열기 →</a>
-        </div>
-      )}
       <span aria-live="polite" className="sr-only">ACP: {statusLabel}</span>
-      <span className={`pointer-events-none absolute right-2 top-2 rounded bg-black/70 px-2 py-1 text-xs ${statusTone}`}>
-        ACP: {statusLabel}
-        {acpState === 'CONNECTING' && <span data-share-hide>{' · '}{`${connectingDurationSeconds}초 · ${connectionTarget} · ${config.baseUrl}`}</span>}
-      </span>
     </div>
   );
 }

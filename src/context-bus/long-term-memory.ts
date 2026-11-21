@@ -86,7 +86,9 @@ function readCondenseEventsFrom(since: string, path: string): CondenseEvent[] {
       WHERE surface IN ('coord:channel', 'context:external', 'context:session') AND direction='outbound' AND ts>=?`)
       .all(since) as Array<{ id: string; surface: string }>;
     const byEvent = new Map(surfaces.map(row => [row.id, row.surface]));
-    return listCoordEvents({ since }, { db }).map(event => ({ ...event, surface: byEvent.get(event.id) }));
+    // The coordination journal includes raw exit signals; long-term memory only consumes curated event rows.
+    return listCoordEvents({ since }, { db }).filter(event => byEvent.has(event.id))
+      .map(event => ({ ...event, surface: byEvent.get(event.id) }));
   } finally { db.close(); }
 }
 

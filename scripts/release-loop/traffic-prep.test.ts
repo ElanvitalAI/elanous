@@ -161,7 +161,8 @@ test('no receipt holds TRAFFIC_NOT_PREPPED(missing), re-evaluates within the bud
     expect(error).toBeInstanceOf(TrafficPrepHoldError);
     const message = (error as Error).message;
     expect(message).toStartWith(`${TRAFFIC_NOT_PREPPED}(missing)`);
-    expect(message).toContain('eln release critpath --version 0.3.31');
+    expect(message).toContain('eln release prepare --version 0.3.31');
+    expect(message).toContain('eln release publish --dir <prepared> --notes-file <approved-notes> --yes');
     expect(holds.map((hold) => hold.reason)).toEqual(Array.from({ length: EXHAUSTED_EVALUATIONS }, () => 'missing'));
     expect(holds.at(-1)).toMatchObject({ code: TRAFFIC_NOT_PREPPED, attempts: EXHAUSTED_EVALUATIONS, heldMs: TRAFFIC_PREP_HOLD_BUDGET_MS });
   } finally { f.cleanup(); }
@@ -223,7 +224,7 @@ test('version-node holds the cut-branch entry by default, fails with code and hi
     const held = versionNodeMain(['release', '--no-prebuild', '--json'], f.root, { trafficPrepHold: { ...fakeHoldClock(CUT), check: check('0.3.31') } });
     expect(held).toMatchObject({ outcome: 'error', version: '0.3.31', hold: { code: TRAFFIC_NOT_PREPPED, reason: 'missing', attempts: EXHAUSTED_EVALUATIONS } });
     expect(held.error).toStartWith(`${TRAFFIC_NOT_PREPPED}(missing)`);
-    expect(held.error).toContain('eln release critpath');
+    expect(held.error).toContain('eln release publish --dir <prepared>');
     await writeValidTrafficPrep(f.root, '0.3.31');
     checked.length = 0;
     const admitted = versionNodeMain(['release', '--no-prebuild', '--json'], f.root, { trafficPrepHold: { check: check('0.3.31'), sleep: () => { throw new Error('no hold expected'); } } });

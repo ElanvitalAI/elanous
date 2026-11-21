@@ -1,0 +1,13 @@
+signal: rail-catchup-exit1
+owner: RES
+diagnose:
+  - action: evidence.read
+    args: {path: OPS/tb/evidence/rail-catchup-exit1.log}
+repair:
+  - action: hitl.request
+    risk: hitl
+    rollback: preserve prior session
+verify:
+  - action: evidence.read
+    args: {path: OPS/tb/evidence/rail-catchup-exit1.log}
+escalate: {after: 1, message: operator review required}

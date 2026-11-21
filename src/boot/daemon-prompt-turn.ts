@@ -1,5 +1,7 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
+import type { ResearchSourceAttribution, ResearchSourceUsage } from '../core-turn/types.js';
 import { classifyShortQuestion } from '../chat/short-question.js';
+import { RESEARCH_ROUTE_WEB_TOOLS } from '../core-turn/research-route.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { runCoreTurn } from '../core-turn/run-core-turn.js';
 import type { LLMMessage } from '../llm.js';
@@ -32,6 +34,38 @@ export interface DaemonPromptTurnResult {
   text: string;
   stopReason: string;
   providerFinishReason?: string;
+  sourceUsage?: ResearchSourceUsage;
+}
+
+/** Count distinct attributed sources actually cited in the delivered answer. */
+export function citedResearchSourceUsage(
+  answer: string, attribution: ResearchSourceAttribution,
+): ResearchSourceUsage {
+  const counts = { firecrawl: new Set<string>(), grok: new Set<string>(), market: new Set<string>() };
+  const urlPart = /[\p{L}\p{N}/?&#%=._~-]/u;
+  // A bare '?' may be part of the URL itself, so it cannot certify a shorter prefix.
+  const sentencePunctuation = /^[.,;!](?=$|[\s)\]}])/u;
+  const koreanParticle = /^(?:으로|에서|에게|까지|부터|처럼|보다|은|는|이|가|을|를|의|에|와|과|도|로)(?=$|[\s.,;!?()\]}])/u;
+  for (const [source, providers] of Object.entries(attribution)) {
+    let offset = 0;
+    let cited = false;
+    while ((offset = answer.indexOf(source, offset)) !== -1) {
+      const before = answer[offset - 1] ?? ' ';
+      const after = answer[offset + source.length] ?? ' ';
+      // A shorter URL prefix or source marker inside another token is not a citation.
+      const tail = answer.slice(offset + source.length);
+      const complete = !urlPart.test(after) || sentencePunctuation.test(tail)
+        || source.startsWith('http') && koreanParticle.test(tail);
+      if (!urlPart.test(before) && complete) {
+        cited = true;
+        break;
+      }
+      offset += source.length;
+    }
+    if (!cited) continue;
+    for (const provider of providers) counts[provider].add(source);
+  }
+  return { firecrawl: counts.firecrawl.size, grok: counts.grok.size, market: counts.market.size };
 }
 
 /** Phase B-3 (PWA chat streaming · 2026-05-06) — derive a one-line
@@ -138,6 +172,8 @@ export async function runDaemonPromptTurn(opts: {
    *  and the turn loop runs unchanged. `delta` is the new fragment;
    *  `full` is the cumulative assistant text up to and including it. */
   onTextDelta?: (delta: string, full: string) => void;
+  /** Internal ladder evidence already gathered for this turn. */
+  onResearchSourceUsage?: (usage: ResearchSourceUsage) => void;
   /** Phase B-2.5 (PWA chat streaming · 2026-05-06) — tool-result image
    *  hook. Fires once per resolved tool call whose result follows the
    *  image-bearing convention (`{mediaType: 'image/…', dataB64, …}`,
@@ -192,9 +228,15 @@ export async function runDaemonPromptTurn(opts: {
     ?.some((block) => block.type !== 'text') ?? false;
   // SW2 스위치 `chat.fastPath`(기본 켜짐 · PWA «짧은 물음은 빠르게» 카드) — 끄면 분류하지 않는다.
   const fastPathEnabled = opts.fastPathEnabled ?? (() => { try { return getUserConfig().chat?.fastPath !== false; } catch { return true; } })();
-  const { fast, reason } = fastPathEnabled
+  const shortVerdict = fastPathEnabled
     ? classifyShortQuestion(request.userText, { hasAttachments })
     : { fast: false, reason: 'disabled' };
+  // When web grounding exists, keep the tools until core-turn's structured question plan decides whether this is a
+  // known-answer/local turn. The short-form classifier cannot safely decide freshness from wording alone.
+  const structuredWebRouteAvailable = toolSurface?.kind !== 'none'
+    && toolSurface?.specs.some((tool) => RESEARCH_ROUTE_WEB_TOOLS.has(tool.name));
+  const fast = shortVerdict.fast && !structuredWebRouteAvailable;
+  const reason = shortVerdict.fast && structuredWebRouteAvailable ? 'structured-web-route' : shortVerdict.reason;
   const activeToolSurface = fast ? undefined : toolSurface;
   const toolsBefore = toolSurface && toolSurface.kind !== 'none' ? toolSurface.specs.length : 0;
   const tools: LLMToolSpec[] = activeToolSurface && activeToolSurface.kind !== 'none'
@@ -283,6 +325,9 @@ export async function runDaemonPromptTurn(opts: {
     : terminal
       ? terminal.systemPromptParts.join('\n\n')
       : augmentedSystemPrompt;
+  // A member may delete this session while personaPromptForChat is awaiting.
+  // Stop before the first history write; appendFileSync would recreate its file.
+  ctrl.signal.throwIfAborted();
   const isFirstTurn = history.get(request.sessionId).length === 0;
   const messages = opts.promptBlocks && opts.promptBlocks.length > 0
     ? appendUserPromptBlocksAndBuildMessages(
@@ -306,6 +351,8 @@ export async function runDaemonPromptTurn(opts: {
   if (!isFirstTurn && personaPrompt) {
     messages.unshift({ role: 'system', content: personaPrompt });
   }
+  let researchSourceUsage: ResearchSourceUsage | undefined;
+  let researchSourceAttribution: ResearchSourceAttribution | undefined;
   const result = await runCoreTurn({
     sessionId: request.sessionId,
     userText: request.userText,
@@ -316,7 +363,12 @@ export async function runDaemonPromptTurn(opts: {
     ...(terminal?.llmOpts.budgetGrant ? { budgetGrant: terminal.llmOpts.budgetGrant } : {}),
     callbacks: {
       onTurnComplete: (newMessages: LLMMessage[]): void => {
+        if (ctrl.signal.aborted) return;
         appendAssistantMessages(history, request.sessionId, newMessages);
+      },
+      onResearchSourceUsage: (usage, attribution): void => {
+        researchSourceUsage = usage;
+        researchSourceAttribution = attribution;
       },
       ...(opts.onTextDelta
         ? {
@@ -381,6 +433,8 @@ export async function runDaemonPromptTurn(opts: {
         : {}),
     },
   });
+  if (researchSourceAttribution) researchSourceUsage = citedResearchSourceUsage(result.finalText, researchSourceAttribution);
+  if (researchSourceUsage) opts.onResearchSourceUsage?.(researchSourceUsage);
   // Cleanup PR — fire Web Push to subscribed PWA clients ("agent done").
   // Fire-and-forget: turn already succeeded, push failure must not block
   // the REST response. Helper handles aborted/empty-text early-return.
@@ -393,6 +447,7 @@ export async function runDaemonPromptTurn(opts: {
     sessionId: request.sessionId,
     text: result.finalText,
     stopReason: result.stopReason,
+    ...(researchSourceUsage ? { sourceUsage: researchSourceUsage } : {}),
     ...(result.providerFinishReason ? { providerFinishReason: result.providerFinishReason } : {}),
   };
 }

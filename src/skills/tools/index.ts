@@ -46,12 +46,10 @@ import {
   SHELL_DEFAULT_TIMEOUT_MS, SHELL_KILL_GRACE_MS, SHELL_MAX_TIMEOUT_MS, SHELL_MIN_TIMEOUT_MS,
   createShellWatchdog, reportShellWatchdog, resolveShellStallMs, type ShellWatchdogResult,
 } from '../../tool-runtime/shell-watchdog.js';
-import { createCapsulePolicy } from '../../core-turn/capsule-policy.js';
 import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.js';
-import { runShellCapsule, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
-import { readUserConfigObject } from '../../user-config/read.js';
-import { userConfigPath } from '../../user-config.js';
+import { runShellCapsule, shellCapsulePolicy, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
 import { terminateTree } from '../../shell-primitive/terminate-tree.js';
+import { gateShellCommand } from '../../shell-primitive/runtime.js';
 import {
   createSeqTracker,
   makeEnvelope,
@@ -84,6 +82,10 @@ export interface BashToolOpts {
   /** Propagated to the spawned child. When the dashboard aborts the
    *  streaming LLM call, the in-flight bash subprocess is killed. */
   signal?: AbortSignal;
+  /** Host-only proof: the current command passed a prior human approval prompt. Never sourced from tool args. */
+  priorHumanApproval?: boolean;
+  /** Capsule clock starts only after the process exists, never during approval. */
+  onSpawn?: () => void;
   /** Sandbox mode (Track G — shares runShell's X3 wrapper). Default
    *  'off' keeps existing Bash behaviour; 'auto' wraps the shell
    *  binary in sandbox-exec on macOS; 'strict' errors when the
@@ -222,12 +224,33 @@ export async function dispatchBash(
     ? (args.network as 'inherit' | 'off')
     : opts.network;
 
+  const gate = await gateShellCommand({
+    command: [shell, '-c', command], cwd: opts.cwd,
+    approval: 'none', signal: opts.signal, network: networkMode,
+  }, opts.priorHumanApproval === true);
+  if (gate) return rejectedResult(gate.outcome === 'aborted' ? 'shell command aborted before execution' : 'shell command denied by approval');
+
   // Sandbox wrapping (Track G). Reuses the same applySandbox the
   // shell-primitive uses — keeps one canonical SBPL profile across
   // Bash and RunShell.
   let sandboxed = false;
   let sandboxTool: BashResult['sandboxTool'] = 'none';
-  let sandboxedArgv: string[] = [shell, '-c', command];
+  // ELN-BASH-BG-DETACH — a command that explicitly backgrounds work
+  // (`nohup` / `setsid` / a trailing `&`) must not stay in the shell's
+  // process group. The watchdog kills that group on timeout, and bash
+  // waits for an undisowned `&` job, so the background child died with
+  // the tool return (MVP-B `nohup … &` lasted ~1s). A python setsid
+  // grandchild leaves only that child in a new session (macOS has no
+  // `setsid` binary); the shell stays killable.
+  const launched = detachExplicitBackground(command);
+  // r5 — the rewritten single simple command setsids out of the group before
+  // the shell exits, so its pipes close with the shell and 'close' settles the
+  // tool (the detached job surviving IS the feature). A verbatim `&` job
+  // instead stays in the tool's process group and inherits the pipes, so
+  // 'close' can only fire once that job itself ends — settle on the shell's
+  // exit instead (listener wired at the child events below).
+  const strayJob = launched === command && hasBackgroundJob(command);
+  let sandboxedArgv: string[] = [shell, '-c', launched];
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const { applySandbox, SandboxUnavailableError } = require('../../shell-primitive/sandbox.js');
@@ -351,6 +374,7 @@ export async function dispatchBash(
         CLAUDECODE: '1',
       },
     });
+    try { opts.onSpawn?.(); } catch { /* the capsule clock is advisory */ }
 
     // Stop the exact child's own process group via the shared terminateTree (KILL-TREE-ONE):
     // SIGTERM → grace → SIGKILL while the group is still present. Each signal that is actually
@@ -483,6 +507,22 @@ export async function dispatchBash(
       finish(127);
     });
     child.on('close', (code) => finish(code));
+    // ELN-BASH-BG-DETACH r5 — a verbatim `&` job holds the output pipes past
+    // the shell's exit, so 'close' would stall the tool until that job ends
+    // (or the watchdog fires). The shell exiting completed every foreground
+    // command, so drain one grace of pipe tail — the foreground's last
+    // writes — then stop the process group the tool owns (the exited shell
+    // leaves its strays to us; only a deliberate setsid detach outlives the
+    // result) and settle with the shell's own exit code.
+    child.on('exit', (code) => {
+      if (!strayJob || settled) return;
+      setTimeout(() => {
+        if (settled) return;
+        debug.log('tool.watchdog', 'bg-settle', { tool: 'Bash', pid: child.pid ?? null });
+        stopChild();
+        finish(code ?? null);
+      }, SHELL_BG_EXIT_DRAIN_MS).unref();
+    });
   });
 }
 
@@ -509,22 +549,237 @@ export function dispatchBashCapsule(
   opts: BashToolOpts,
   deps: Omit<ShellCapsuleDeps, 'policy'> & { readonly policy?: CapsulePolicy } = {},
 ): Promise<BashResult> {
-  const policy = deps.policy ?? createCapsulePolicy({
-    turnConfig: () => readUserConfigObject(userConfigPath())?.turn,
-    ...(deps.correlation?.turnId ? { correlation: { turnId: deps.correlation.turnId } } : {}),
-  });
+  const policy = deps.policy ?? shellCapsulePolicy(deps.correlation);
   const { signal, ...rest } = opts;
   return runShellCapsule<BashResult>({
     tool: 'Bash',
     command: typeof args.command === 'string' ? args.command : '',
     ...(signal ? { turnSignal: signal } : {}),
-    start: (own) => dispatchBash(args, own ? { ...rest, signal: own } : rest),
+    clockFromSpawn: true,
+    start: (own, spawned) => dispatchBash(args, own ? { ...rest, signal: own, onSpawn: spawned } : { ...rest, onSpawn: spawned }),
     describe: (result) => ({ status: bashCapsuleStatus(result), output: result.output }),
     started: bashCapsuleStartedResult,
   }, { ...deps, policy });
 }
 
 // ── internals ──
+
+/** ELN-BASH-BG-DETACH r5 — pipe-tail drain window after the shell exits
+ * (before the tool stops its own process group) for a verbatim `&` job. */
+const SHELL_BG_EXIT_DRAIN_MS = 50;
+
+/**
+ * ELN-BASH-BG-DETACH r6 — strip here-document bodies from `command`.
+ * A body is data: quotes, escapes, comments, and operators inside it are literal text, so an
+ * unquoted `&` in a body is content, never a job terminator. The operator line itself is kept —
+ * its own `&` is real command text (`cat <<EOF &` backgrounds the heredoc command). The body runs
+ * from the line after the operator line to the line equal to the delimiter (tab-stripped for
+ * `<<-`). An unterminated body consumes the rest of the text, so no body `&` is ever seen.
+ *
+ * ELN-BASH-BG-DETACH r9 (JUD #123951): one operator line may open several here-documents
+ * (`cat <<A; cat <<B`) — every delimiter on it is opened and each body runs to its own
+ * terminator, in order, the first body ending first. A delimiter word is read after any run of
+ * blanks (`cat << EOF`, `cat << -EOF` are valid bash); the tab-strip flag is only `<<-`.
+ *
+ * ELN-BASH-BG-DETACH r10 (JUD #124088): an operator we cannot positively parse is never
+ * SKIPPED — a skipped body resurfaces as command text and its data `&` is misread as a job
+ * (a false early settle). Unconfirmed syntax (unreadable or partial delimiter) returns null
+ * and the caller detects no job at all: the command settles normally.
+ */
+function stripHeredocBodies(command: string): string | null {
+  const kept: string[] = [];
+  const open: Array<{ delim: string; stripTabs: boolean }> = [];
+  for (const line of command.split('\n')) {
+    if (open.length > 0) {
+      const front = open[0]!;
+      const candidate = front.stripTabs ? line.replace(/^\t+/, '') : line;
+      if (candidate === front.delim) open.shift(); // the terminator line ends this body
+      continue; // body line: content, never command text
+    }
+    kept.push(line);
+    const starts = heredocStarts(line);
+    if (starts === null) return null; // JUD #124088: unconfirmed syntax — no job is detected at all
+    open.push(...starts);
+  }
+  return kept.join('\n');
+}
+
+/** Every here-document start on `line`: `<<[-]WORD`, with WORD bare or quoted, read after any run
+ *  of blanks (`<< EOF`, `<< -EOF` are valid bash; the tab-strip flag stays `<<-`). `<<<`
+ *  (here-string) is operator text, not a start.
+ *
+ * ELN-BASH-BG-DETACH r10 (JUD #124088): the scan keeps only syntax it can positively confirm.
+ * The delimiter is the FULL word (a prefix would close the body early and expose its data `&`
+ * as a job), and an unreadable delimiter — end of line, a metacharacter, a comment, an escape or
+ * a command substitution, an unterminated quote, or a word glued after one (`<<"EOF"x`) —
+ * returns null: the whole command is unconfirmed and no job is detected at all. */
+function heredocStarts(line: string): Array<{ delim: string; stripTabs: boolean }> | null {
+  const starts: Array<{ delim: string; stripTabs: boolean }> = [];
+  let quote: '"' | "'" | undefined;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i]!;
+    if (quote) { if (ch === '\\') i += 1; else if (ch === quote) quote = undefined; continue; }
+    if (ch === '\\') { i += 1; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '<' && line[i + 1] === '<') {
+      if (line[i + 2] === '<') { i += 2; continue; } // here-string: operator text, not a body start
+      let j = i + 2;
+      const stripTabs = line[j] === '-';
+      if (stripTabs) j += 1;
+      while (line[j] === ' ' || line[j] === '\t') j += 1; // a spaced word is still the delimiter
+      const q = line[j];
+      if (q === '"' || q === "'") {
+        const end = line.indexOf(q, j + 1);
+        if (end < 0) return null; // unterminated quote: unconfirmed syntax, no job detection
+        // a word glued after the closing quote (`<<"EOF"x`) needs quote removal we do not model
+        const next = line.slice(end + 1).charAt(0);
+        if (next !== '' && next !== ' ' && next !== '\t' && !/[;&|()<>]/.test(next)) return null;
+        starts.push({ delim: line.slice(j + 1, end), stripTabs });
+        i = end;
+        continue;
+      }
+      // no delimiter word here — end of line, a metacharacter, or a comment/escape/substitution
+      // start — is syntax we cannot confirm: the scan stops and no job is detected.
+      if (q === '#' || q === '`' || q === '\\') return null;
+      const word = /^[^\s;&|()<>`'"\\]+/.exec(line.slice(j));
+      if (!word) return null;
+      // the word must be whole: quoting glued to its end (`<<EOF"x`) is not modeled — unconfirmed
+      const after = line.slice(j + word[0].length).charAt(0);
+      if (after === '"' || after === "'" || after === '`' || after === '\\') return null;
+      starts.push({ delim: word[0], stripTabs });
+      i = j + word[0].length - 1;
+      continue;
+    }
+  }
+  return starts;
+}
+
+/**
+ * Whether `command` — as a shell parses it — really backgrounds a job: an
+ * `&` outside quotes, escapes, comments, and here-document bodies that is
+ * neither the `&&` list operator nor the `&>` / `>&` redirects. Bash makes
+ * such an `&` a command terminator (also after `;`, `&&`, or `|`), so the job
+ * runs in the tool's process group and inherits its output pipes.
+ *
+ * ELN-BASH-BG-DETACH r6 (JUD hold-39412-0e006d8a9f88 mustFix): an unquoted
+ * `&` inside a here-document body is content, not a job terminator, so the
+ * bodies are stripped before the scan. A form we cannot positively parse
+ * (here-string `<<<`, malformed or unterminated heredoc) keeps normal
+ * settlement: a missed early settle is safe, a false one is not.
+ */
+export function hasBackgroundJob(command: string): boolean {
+  const stripped = stripHeredocBodies(command);
+  // JUD #124088 (10th HOLD): syntax the scan cannot positively confirm — an unreadable or a
+  // partial delimiter — stops job detection entirely: the command settles normally.
+  return stripped === null ? false : hasBackgroundJobText(stripped);
+}
+
+/** ELN-BASH-BG-DETACH r6 — the operator scanner itself, run on heredoc-stripped text. */
+function hasBackgroundJobText(command: string): boolean {
+  let quote: '"' | "'" | '`' | undefined;
+  let escaped = false;
+  let comment = false;
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i]!;
+    if (comment) {
+      if (ch === '\n') comment = false;
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = quote !== "'";
+      else if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+    // `#` opens a comment only at a word start; a mid-word `#` is literal.
+    if (ch === '#' && (i === 0 || /\s/.test(command[i - 1]!))) { comment = true; continue; }
+    if (ch === '&') {
+      if (command[i + 1] === '&' || command[i + 1] === '>') continue;
+      if (command[i - 1] === '&' || command[i - 1] === '>') continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether `whole` — the text before the trailing background `&` — is one
+ * simple command: a single word list whose only shell syntax is quoting,
+ * escapes, and output redirects. Quotes hide their content and an escape
+ * hides the next character. Anything that would make this more than one
+ * command — a `;` or newline separator, a `|` pipeline, another `&` job
+ * (`>&1` is a redirect, not a job), a `()`/`{}` group, a `#` comment, `<`
+ * input redirection, or a `<<` here-document — or an unbalanced quote
+ * returns false, and the caller keeps the original text (fail-safe default).
+ */
+function isOneSimpleCommand(whole: string): boolean {
+  let quote: '"' | "'" | '`' | undefined;
+  let escaped = false;
+  const masked = whole.split('');
+  for (let i = 0; i < whole.length; i += 1) {
+    const ch = whole[i]!;
+    if (quote) {
+      masked[i] = ' ';
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = quote !== "'";
+      else if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (escaped) { masked[i] = ' '; escaped = false; continue; }
+    if (ch === '\\') { masked[i] = ' '; escaped = true; continue; }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; masked[i] = ' '; continue; }
+    // More than one command, or syntax we do not model, keeps the original.
+    if (ch === ';' || ch === '\n' || ch === '|' || ch === '<' || ch === '#'
+      || ch === '(' || ch === ')' || ch === '{' || ch === '}') return false;
+    if (ch === '&' && whole[i - 1] !== '>') return false;
+    masked[i] = ch;
+  }
+  if (quote !== undefined || escaped) return false;
+  const text = masked.join('');
+  if (!text.trim()) return false;
+  // A loop, a conditional, or a case block is not a simple command either.
+  return !/\b(?:while|until|for|select|if|case|do|done|fi|esac)\b/.test(text);
+}
+
+/** A bash single-quoted literal. The outer shell must not expand `$`, backticks, or newlines. */
+function bashSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Rewrite an explicitly-backgrounded command so its child leaves the
+ * shell process group before the tool returns.
+ *
+ * Only one simple command with a trailing `&` is rewritten, and it detaches
+ * verbatim — `nohup` kept, quotes and redirect scope intact. Every other
+ * shape — a separator, a newline, a pipeline, an and-list, a loop, a group,
+ * a comment, a here-document — keeps the original text, so timeout and abort
+ * still stop the whole group the shell started, and no fresh bash runs the
+ * job without the leading foreground's shell state (JUD #120509).
+ */
+export function detachExplicitBackground(command: string): string {
+  const body = command.trim();
+  if (!body || /(?:^|&&|\|\||;|\n)\s*setsid(?:\s|$)/.test(body)) return command;
+  // `&>` / `>&` is a foreground redirect, not a background job. Only a real
+  // trailing `&` — nothing after it, and not `&&` — marks the job.
+  const job = body.match(/^([\s\S]*\S)\s+&(?!>)(?!&)$/);
+  if (!job) return command;
+  // ELN-BASH-BG-DETACH r4 — only one simple command detaches, whole. Every
+  // other shape keeps the original text (fail-safe default).
+  const whole = job[1]!;
+  if (!isOneSimpleCommand(whole)) return command;
+  // The job detaches verbatim — redirects inside it — so the redirect scope is
+  // preserved. `nohup` is part of the command, not noise to peel: stripping it
+  // changes the command's own signal behavior (JUD #120509 mustFix).
+  // macOS has no `setsid` binary. python3 calls setsid(2), then replaces
+  // itself with the original command. The command is a single-quoted argv
+  // so the outer shell does not expand `$`, backticks, or newlines first.
+  const quoted = bashSingleQuote(whole);
+  return `python3 -c 'import os,sys; os.setsid(); os.execvp("bash",["bash","-c",sys.argv[1]])' ${quoted} >/dev/null 2>&1 </dev/null &`;
+}
 
 function clamp(v: number, lo: number, hi: number): number {
   if (!Number.isFinite(v)) return lo;

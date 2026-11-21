@@ -4,35 +4,36 @@
  * ⛔ 호출자 cwd 는 보지 않는다 — 2026-09-24 설치본 전환 뒤 데몬이 WorkingDirectory(pilot)의 HEAD 를
  *    `daemonSha` 로 말했다(설치본 168eb32 인데 7368f6a). src/index.ts 에서 옮겨 왔다.
  */
-import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname as _dirname, join as _joinPath, resolve } from 'node:path';
+import { findElanousRepoRoot } from '../code-edit/system-file-guard.js';
 import { runGitCommand } from '../git-fs/runner.js';
 
-const REPOSITORY_ROOT = resolve(import.meta.dir, '..', '..');
+const REPOSITORY_ROOT = findElanousRepoRoot(import.meta.dir) ?? resolve(import.meta.dir, '..', '..');
 const PACKAGED_REVISION_PATH = 'src/version/packed-revision.json';
 
 /** bun pm pack prepack hook: capture HEAD into a package-owned file; never ship stale metadata. */
-export function writePackagedRevision(root: string = REPOSITORY_ROOT): void {
+export function writePackagedRevision(root: string = REPOSITORY_ROOT, now: () => number = Date.now): void {
   const path = _joinPath(root, PACKAGED_REVISION_PATH);
   const revision = checkoutRevision(root);
   if (revision === 'unknown' || !/^[0-9a-f]{40}$/.test(revision)) {
-    try { unlinkSync(path); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    // 🩸 2026-09-24: 종전엔 여기서 throw 해 pack 이 실패했고, «git 이 실패해도 커밋 없이 설치는 산다»는 설치기 계약
-    //    (scripts/install.test.ts)이 깨졌다(#20320 회귀). 옛 파일은 지우고(낡은 커밋을 싣지 않는다) 경고만 남긴다 → --version = unknown.
+    // Pack without a commit, replacing any stale identity from a previous pack.
     process.stderr.write('⚠ no valid git HEAD — packing without a commit (elanous --version will say unknown)\n');
+    writeFileSync(path, JSON.stringify({ builtAt: Math.floor(now() / 1000) }) + '\n');
     return;
   }
-  writeFileSync(path, JSON.stringify({ commit: revision }) + '\n');
+  writeFileSync(path, JSON.stringify({ commit: revision, builtAt: Math.floor(now() / 1000) }) + '\n');
 }
 
-function packagedRevision(root: string): string | undefined {
+function packagedBuild(root: string): { commit?: string; builtAt?: number } | undefined {
   try {
     const parsed: unknown = JSON.parse(readFileSync(_joinPath(root, PACKAGED_REVISION_PATH), 'utf8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-    const commit = (parsed as { readonly commit?: unknown }).commit;
-    return typeof commit === 'string' && /^[0-9a-f]{40}$/.test(commit) ? commit : undefined;
+    const { commit, builtAt } = parsed as { commit?: unknown; builtAt?: unknown };
+    return {
+      ...(typeof commit === 'string' && /^[0-9a-f]{40}$/.test(commit) ? { commit } : {}),
+      ...(typeof builtAt === 'number' && Number.isSafeInteger(builtAt) && builtAt > 0 ? { builtAt } : {}),
+    };
   } catch {
     return undefined;
   }
@@ -139,6 +140,13 @@ function versionedInstallerMetadataPath(versionDir: string, packageEntry: string
   if (basename(versionsDir) !== 'versions') return undefined;
   const root = resolve(versionsDir, '..');
   try {
+    const windowsShim = _joinPath(root, 'bin', 'elanous.cmd');
+    if (isFile(windowsShim) && isFile(packageEntry)) {
+      const text = readFileSync(windowsShim, 'utf8');
+      if (/^rem elanous-wrapper\r?$/m.test(text) && /%~dp0\.\.[\\/]current[\\/]node_modules[\\/]elanous[\\/]bin[\\/]elanous\.mjs/.test(text)) {
+        return _joinPath(versionDir, 'install.json');
+      }
+    }
     const shim = _joinPath(root, 'bin', 'elanous');
     const shimStat = lstatSync(shim);
     if (shimStat.isSymbolicLink()) {
@@ -191,6 +199,42 @@ function installMetadataCommit(root: string): string | undefined {
     if (commit) return commit;
   }
   return undefined;
+}
+
+export type BuildChannel = 'official' | 'dev';
+export interface InstalledBuildMetadata {
+  readonly commit?: string;
+  readonly channel: BuildChannel;
+  readonly builtAt?: number;
+}
+
+function releaseMetadataSource(source: unknown): boolean {
+  if (typeof source !== 'string') return false;
+  return /^https:\/\/github\.com\/ElanvitalAI\/elanous\/releases\/download\/v\d+\.\d+\.\d+\/elanous\.tgz$/i.test(source)
+    || /^https:\/\/registry\.npmjs\.org\/elanous\/-\/elanous-\d+\.\d+\.\d+\.tgz$/i.test(source);
+}
+
+/** Use metadata from this code's own install directory. A legacy release can lack a commit in install.json. */
+export function installedBuildMetadata(root: string = testCodeRevisionRoot ?? REPOSITORY_ROOT): InstalledBuildMetadata | undefined {
+  for (const path of installMetadataCandidates(root)) {
+    try {
+      const value = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const packed = packagedBuild(root);
+      const commit = typeof value.commit === 'string' ? usableInstallMetadataCommit(value.commit) ?? packed?.commit : packed?.commit;
+      const channel = value.channel === 'official' || value.channel === 'dev'
+        ? value.channel : releaseMetadataSource(value.source) ? 'official' : 'dev';
+      const builtAt = typeof value.builtAt === 'number' && Number.isSafeInteger(value.builtAt) && value.builtAt > 0
+        ? value.builtAt : packed?.commit === commit ? packed?.builtAt : undefined;
+      return { commit, channel, builtAt };
+    } catch { /* Try the next candidate. */ }
+  }
+  return undefined;
+}
+
+export function packagedBuildTime(root: string, sha: string): number | undefined {
+  const packed = packagedBuild(root);
+  return packed?.commit === sha ? packed.builtAt : undefined;
 }
 
 /** Return the install.json source only when it names an existing directory. */
@@ -263,5 +307,5 @@ export function codeRevision(): string | undefined {
   // checkoutRevision checks installer ownership before consulting an enclosing git checkout.
   const revision = checkoutRevision(root);
   if (revision !== 'unknown') return revision;
-  return installMetadataCommit(root) ?? packagedRevision(root);
+  return installMetadataCommit(root) ?? packagedBuild(root)?.commit;
 }

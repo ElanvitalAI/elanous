@@ -230,7 +230,7 @@ export async function resyncTickWithReleaseProbe(
   } finally { held?.release(); }
 }
 
-if (import.meta.main) {
+async function runResyncTickCli(): Promise<void> {
   let sinkReady = false;
   try { sinkReady = await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('steward'); }
   catch (error) { console.error(`steward resync: log sink registration failed — ${error instanceof Error ? error.message : String(error)}`); }
@@ -239,3 +239,5 @@ if (import.meta.main) {
   console.log(`steward resync: ${result.decision}${result.reason ? ` — ${result.reason}` : ''}`);
   process.exitCode = 0;
 }
+
+if (import.meta.main) void runResyncTickCli();

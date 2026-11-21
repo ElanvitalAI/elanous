@@ -1,5 +1,5 @@
 import type { Command } from 'commander';
-import { desiredSha as readDesiredSha } from '../els/build-badge.js';
+import { desiredSha as readDesiredSha } from '../nexus/host-registry/desired-sha.js';
 import { classifyHost, DEFAULT_STALE_MS } from '../nexus/host-registry/classify.js';
 import { hostLedgerPath, isHostRecord, readHostLedger, recordHeartbeat } from '../nexus/host-registry/store.js';
 import type { HostChannel, HostLedger } from '../nexus/host-registry/types.js';

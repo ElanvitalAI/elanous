@@ -16,6 +16,8 @@ import { mergeRowStates } from '../nexus/llm-spend-policy/credit-adapter.js';
 import { runLlmSpendGuard, type GuardMemoryStore, type SpendReservationHandle } from './llm-spend-guard.js';
 import type { LlmSpendSkippedRow } from './llm-spend-decision.js';
 import type { SpendReservationLedger } from './llm-spend-reservation.js';
+import { alertOnFallback, type LowBalanceMailer } from './llm-low-balance-alert.js';
+import { withSpendLock } from './llm-spend-reservation.js';
 
 /** 행 상태 관측기 — 구독 창·크레딧 잔액·ACP 헬스·임대 등 «한 가지 관측» 을 행 상태 배열로 낸다. throw = 그 관측 없음(모름). */
 export type RowStateObserver = () => readonly LlmSpendRowState[] | Promise<readonly LlmSpendRowState[]>;
@@ -77,6 +79,8 @@ export interface LlmCallGateDeps {
   readonly recordUsageTag?: (tag: LlmCallTag) => void | Promise<void>;
   /** settle 이 «실제 신호»(429 usage_limit_reached · 402)를 관측 저장소에 남기는 슬롯. */
   readonly recordSignal?: (record: LlmSignalRecord) => void | Promise<void>;
+  /** 저잔액·구독 소진 폴백 우편(행·레벨당 1건). 없으면 알림 0 — 기본 배선은 llm-call-live. */
+  readonly lowBalanceMailer?: LowBalanceMailer;
 }
 
 /** 호출 결과에서 읽은 «실제 소진 신호». */
@@ -204,13 +208,32 @@ function logGateDecision(result: LlmCallGateResult, states: readonly LlmSpendRow
 
 /** 호출 «전» 관문 — 어느 행(공급자·계정)으로 갈지, 또는 멈출지. 결정마다 logs.db 이벤트 1줄. */
 export async function gateLlmCall(request: LlmCallGateRequest, deps: LlmCallGateDeps): Promise<LlmCallGateResult> {
-  const seen: { states: readonly LlmSpendRowState[] } = { states: [] };
+  const seen: { states: readonly LlmSpendRowState[]; policy?: LlmSpendPolicyDoc } = { states: [] };
   const result = await decideGate(request, deps, seen);
   logGateDecision(result, seen.states, deps.now);
+  const mailer = deps.lowBalanceMailer;
+  const policy = seen.policy;
+  if (mailer && policy && result.outcome !== 'pass-through') {
+    // 동시 호출이 같은 행·레벨 억제를 동시에 통과해 폴백 우편을 2통 내는 구멍(JUD HOLD #11717) —
+    // 알림 억제(load→우편→save)도 판정과 «같은 직렬화» 임계 구역 안에서: 같은 프로세스 는 withSpendLock FIFO,
+    // 파일 예약 원장이면 그 위에 교차 프로세스 withExclusive 까지. 락 대기 초과는 우편 0(기록도 0 → 다음 호출 재시도) —
+    // 결정(go/stop)은 이미 났으므로 불변(알림 실패는 삼키는 현행 규칙과 동일).
+    const input = {
+      policy, states: seen.states, skipped: result.skipped,
+      ...(result.outcome === 'go' ? { chosenRow: result.row } : {}),
+      memory: deps.memory, mailer,
+    };
+    const mail = async (): Promise<void> => { await alertOnFallback(input).catch(() => undefined); };
+    const ledger = deps.reservations;
+    await withSpendLock(ledger ?? deps.memory, async () => {
+      if (ledger?.withExclusive) await ledger.withExclusive(mail).catch(() => undefined);
+      else await mail();
+    });
+  }
   return result;
 }
 
-async function decideGate(request: LlmCallGateRequest, deps: LlmCallGateDeps, seen: { states: readonly LlmSpendRowState[] }): Promise<LlmCallGateResult> {
+async function decideGate(request: LlmCallGateRequest, deps: LlmCallGateDeps, seen: { states: readonly LlmSpendRowState[]; policy?: LlmSpendPolicyDoc }): Promise<LlmCallGateResult> {
   const ledgerLines: LlmSpendLedgerEntry[] = [];
   let policy: LlmSpendPolicyDoc | null;
   try { policy = await (deps.readPolicy ?? readPolicyFromStore)(); } catch (error) {
@@ -229,6 +252,7 @@ async function decideGate(request: LlmCallGateRequest, deps: LlmCallGateDeps, se
   }
   const states = await collectStates(deps.observers);
   seen.states = states;
+  seen.policy = policy;
   const guardDeps = {
     policy, memory: deps.memory, now: deps.now,
     readStates: () => states,

@@ -418,6 +418,49 @@ test('address register writes one private central registry row with explicit wak
   expect(readFileSync(join(seatStateRoot, 'OP', 'tools', 'seat-panes.tsv'), 'utf8')).toBe('');
 });
 
+test('remote tmux registration revokes old pane consent and requires exact seat session', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-seat-tmux-'));
+  dirs.push(seatStateRoot);
+  const f = fixture('', () => ({ wakeDeps: { seatStateRoot, listPtys: () => [], listHerdrPanes: () => [] } }));
+  await f.run('address', 'register', 'TC-H-CX-15', '--herdr-pane', 'wJ:p10', '--host', 'node-b', '--wake');
+  await f.run('address', 'register', 'TC-H-CX-15', '--tmux-session', 'seat-TC-H-CX-15', '--host', 'node-b', '--replace', '--json');
+  const first = JSON.parse(f.stdout.at(-1)!);
+  expect(first).toMatchObject({ address: 'TC-H-CX-15', paneId: 'seat-TC-H-CX-15', wakeEnabled: false });
+  await f.run('route', 'TC-H-CX-15', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ wake: 'tmux', target: 'seat-TC-H-CX-15', optIn: false });
+  await f.run('address', 'register', 'TC-H-CX-15', '--tmux-session', 'seat-TC-H-CX-15', '--host', 'node-b', '--wake', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ changed: true, wakeEnabled: true });
+  await f.run('address', 'register', 'TC-H-CX-15', '--tmux-session', 'seat-OTHER', '--host', 'node-b', '--replace', '--wake');
+  expect(f.exits.at(-1)).toBe(2);
+  const row = JSON.parse(readFileSync(join(seatStateRoot, 'seat-registry.json'), 'utf8')).seats.find((entry: { address: string }) => entry.address === 'TC-H-CX-15');
+  expect(row).toMatchObject({ target: 'seat-TC-H-CX-15', wake: 'tmux', optIn: true });
+});
+
+test('real msg post CLI wakes only the explicitly re-opted remote tmux seat', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-seat-tmux-cli-'));
+  dirs.push(seatStateRoot);
+  const sent: string[][] = [];
+  const f = fixture('', () => ({ wake: undefined, wakeDeps: {
+    seatStateRoot, stateRoot: seatStateRoot, live: true, localHostAliases: ['mshq'],
+    listPtys: () => [], listHerdrPanes: () => [],
+    remoteTmuxRun: async (_host, argv) => {
+      if (argv[0] === 'send-keys') sent.push([...argv]);
+      return { code: 0, stdout: argv[0] === 'list-panes'
+        ? '%21|seat-TC-H-CX-15|/Users/test/elanous-hq/seats/TC-H-CX-15/work|0|codex\n'
+          + '%22|seat-OTHER|/Users/test/elanous-hq/seats/OTHER/work|0|codex\n' : '', stderr: '' };
+    },
+  } }));
+  await f.run('address', 'register', 'TC-H-CX-15', '--herdr-pane', 'wJ:p10', '--host', 'node-b', '--wake');
+  await f.run('address', 'register', 'TC-H-CX-15', '--tmux-session', 'seat-TC-H-CX-15', '--host', 'node-b', '--replace');
+  await f.run('post', '--from', 'OP', '--to', 'TC-H-CX-15', 'before consent');
+  expect(sent).toHaveLength(0);
+  await f.run('address', 'register', 'TC-H-CX-15', '--tmux-session', 'seat-TC-H-CX-15', '--host', 'node-b', '--wake');
+  await f.run('post', '--from', 'OP', '--to', 'TC-H-CX-15', 'after consent');
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toContain('%21');
+  expect(sent[0]).not.toContain('%22');
+});
+
 test('address register refuses a symlinked central registry and leaves its target untouched', async () => {
   const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-seat-address-link-'));
   const outside = mkdtempSync(join(tmpdir(), 'msg-seat-address-outside-'));
@@ -1607,6 +1650,144 @@ test('ELS seat registration appears in msg route output', async () => {
   await f.run('route', 'CX1');
   expect(f.stdout.at(-1)).toContain('wake=els');
   expect(f.stdout.at(-1)).toContain('target=els:w1/t1/p1');
+});
+
+test('route uses a live ELS seat when its inbox heartbeat is absent', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-els-live-'));
+  dirs.push(seatStateRoot);
+  const calls: string[] = [];
+  let herdrReads = 0;
+  const f = fixture('', () => ({ wakeDeps: {
+    seatStateRoot, listPtys: () => [], listHerdrPanes: () => { herdrReads++; return []; },
+    elsRequest: async request => {
+      calls.push(request.op);
+      if (request.op === 'ls') return { exitCode: 0, message: JSON.stringify({ panes: [
+        { seat: 'CX1', address: 'w1/t1/p1', pane: 'p1', state: 'idle', ptyId: 'h:p1' },
+      ] }) };
+      if (request.op === 'status') return { exitCode: 0, message: JSON.stringify({ state: 'idle', inputEmpty: true }) };
+      return { exitCode: 1, message: 'unexpected request' };
+    },
+  } }));
+  await f.run('route', 'CX1', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ msgAddress: 'CX1', wake: 'els', target: 'els:w1/t1/p1', liveness: 'live' });
+  expect(calls).toEqual(['ls', 'status']);
+  expect(herdrReads).toBe(0);
+});
+
+test('route uses ELS cwd seat when the PTY is alive but its activity screen has no recognised prompt', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-els-cwd-live-'));
+  dirs.push(seatStateRoot);
+  const f = fixture('', () => ({ wakeDeps: {
+    seatStateRoot, listHerdrPanes: () => [],
+    elsRequest: async request => request.op === 'ls'
+      ? { exitCode: 0, message: JSON.stringify({ panes: [{ seat: null,
+        cwd: '/tmp/probe/elanous-hq/seats/CX15-ELS-PROBE', address: 'w1/t1/p1', pane: 'p1', state: 'working', ptyId: 'h:p1',
+      }] }) }
+      : { exitCode: 0, message: JSON.stringify({ state: 'unknown',
+        reason: 'no working row and no prompt recognised on screen', inputEmpty: 'unknown' }) },
+  } }));
+  await f.run('route', 'CX15-ELS-PROBE', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ msgAddress: 'CX15-ELS-PROBE', source: 'els',
+    wake: 'els', target: 'els:w1/t1/p1', optIn: false, liveness: 'live' });
+});
+
+test('route reads the registered remote host ELS ledger and does not use the local server', async () => {
+  const hosts: string[] = [];
+  const f = fixture('', () => ({ wakeDeps: {
+    listHerdrPanes: () => [],
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [
+      { address: 'CX2', host: 'node-b', wake: 'herdr', target: 'wX:p2', replyBody: 'agent', optIn: false },
+    ] } }),
+    elsRequestForHost: async (host, request) => {
+      hosts.push(`${host}:${request.op}`);
+      return request.op === 'ls'
+        ? { exitCode: 0, message: JSON.stringify({ panes: [{ seat: 'CX2', address: 'w2/t2/p2', pane: 'p2', ptyId: 'h:p2' }] }) }
+        : { exitCode: 0, message: JSON.stringify({ state: 'working', inputEmpty: 'unknown' }) };
+    },
+  } }));
+  await f.run('route', 'CX2', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ host: 'node-b', wake: 'els', target: 'els:w2/t2/p2', liveness: 'live', optIn: false });
+  expect(hosts).toEqual(['node-b:ls', 'node-b:status']);
+});
+
+test('route distinguishes an absent ELS seat from a failed server lookup', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-els-errors-'));
+  dirs.push(seatStateRoot);
+  let failed = false;
+  const f = fixture('', () => ({ wakeDeps: {
+    seatStateRoot, listHerdrPanes: () => [],
+    elsRequest: async () => failed
+      ? { exitCode: 1, message: 'server unavailable' }
+      : { exitCode: 0, message: JSON.stringify({ panes: [] }) },
+  } }));
+  await f.run('route', 'CX4', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ liveness: 'down' });
+  failed = true;
+  await f.run('route', 'CX4', '--json');
+  expect(JSON.parse(f.stdout[1]!)).toMatchObject({ liveness: 'unknown', livenessReason: 'els-unavailable' });
+});
+
+test('remote tmux seat is live from its host ledger when ELS is unavailable', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-remote-ledger-'));
+  dirs.push(seatStateRoot);
+  const hosts: string[] = [];
+  const f = fixture('', () => ({ wakeDeps: {
+    seatStateRoot, listHerdrPanes: () => [],
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [
+      { address: 'CX5', host: 'node-b', wake: 'herdr', target: 'w5:p5', replyBody: 'agent', optIn: false },
+    ] } }),
+    elsRequestForHost: async () => ({ exitCode: 1, message: 'no ELS server' }),
+    remoteSeatLiveness: async (host, seat) => { hosts.push(`${host}:${seat}`); return { state: 'live', ageMs: 0 }; },
+  } }));
+  await f.run('route', 'CX5', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ host: 'node-b', wake: 'herdr', liveness: 'live' });
+  expect(hosts).toEqual(['node-b:CX5']);
+});
+
+test('route falls back to the federated Herdr host cwd when the ELS owner has no seat', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-herdr-ledger-'));
+  dirs.push(seatStateRoot);
+  const f = fixture('', () => ({ wakeDeps: {
+    seatStateRoot, listHerdrPanes: () => [],
+    elsRequest: async () => ({ exitCode: 0, message: JSON.stringify({ panes: [] }) }),
+    herdrRun: async () => ({ code: 0, stderr: '', stdout: JSON.stringify({ result: { snapshot: { panes: [
+      { workspace_id: 'w8', pane_id: 'w8:pP', tab_id: 'w8:tP', cwd: '/Users/j/elanous-hq/seats/TC-H-POOL-4', agent_status: 'working' },
+    ] } } }) }),
+  } }));
+  await f.run('route', 'TC-H-POOL-4', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ msgAddress: 'TC-H-POOL-4', liveness: 'live' });
+});
+
+test('route treats its own mshq registry alias as local for Herdr fallback', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-local-alias-'));
+  dirs.push(seatStateRoot);
+  const f = fixture('', () => ({ wakeDeps: {
+    seatStateRoot, localHostAliases: ['mshq'], listHerdrPanes: () => [{ paneId: 'wA:p1', status: 'done' }],
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [
+      { address: 'MK', host: 'mshq', wake: 'herdr', target: 'wA:p1', replyBody: 'agent', optIn: true },
+    ] } }),
+    elsRequest: async () => ({ exitCode: 0, message: JSON.stringify({ panes: [] }) }),
+    herdrRun: async () => ({ code: 0, stderr: '', stdout: JSON.stringify({ result: { snapshot: { panes: [
+      { workspace_id: 'wA', pane_id: 'wA:p1', tab_id: 'wA:t1', cwd: '/Users/j/elanous-hq/seats/MK', agent_status: 'done' },
+    ] } } }) }),
+  } }));
+  await f.run('route', 'MK', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ host: 'mshq', wake: 'herdr', liveness: 'live' });
+});
+
+test('twelve ELS registered seats form a live CLI route table', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-els-table-'));
+  dirs.push(seatStateRoot);
+  const seats = Array.from({ length: 12 }, (_, i) => `CX-${i + 1}`);
+  const panes = seats.map((seat, i) => ({ seat, address: `w1/t1/p${i + 1}`, pane: `p${i + 1}`, ptyId: `h:p${i + 1}` }));
+  const f = fixture('', () => ({ wakeDeps: { seatStateRoot, listHerdrPanes: () => [],
+    elsRequest: async request => request.op === 'ls'
+      ? { exitCode: 0, message: JSON.stringify({ panes }) }
+      : { exitCode: 0, message: JSON.stringify({ state: 'working', inputEmpty: 'unknown' }) },
+  } }));
+  for (const seat of seats) await f.run('route', seat, '--json');
+  expect(f.stdout.map(line => JSON.parse(line)).map(row => [row.msgAddress, row.source, row.liveness]))
+    .toEqual(seats.map(seat => [seat, 'els', 'live']));
 });
 
 test('successful verified ELS wake records delivered but not seen', async () => {

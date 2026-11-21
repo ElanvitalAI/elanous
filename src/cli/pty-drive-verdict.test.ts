@@ -7,6 +7,41 @@ describe('verdictForFinalPtyScreen', () => {
       .toEqual({ kind: 'done-but-failed', reason: `child exit code ${exitCode}`, evidence: null });
   });
 
+  test.each([null, 0])('429 final screen rejects a verified artifact with exit %s', (exitCode) => {
+    expect(verdictForFinalPtyScreen({ screen: '429 rate limit exceeded', inputHistory: [], exitCode, artifactEvidence: true }))
+      .toEqual({ kind: 'done-but-failed', reason: '429 rate limit exceeded', evidence: null });
+  });
+
+  test('a historical 429 in a tool block does not reject a verified artifact', () => {
+    expect(verdictForFinalPtyScreen({ screen: '• Failed (exit 1) request\n└ 429 rate limit exceeded\nThe artifact is ready.', inputHistory: [], exitCode: 0, artifactEvidence: true }).kind)
+      .toBe('success-unverified');
+  });
+
+  test.each([null, 0])('CLI rejects final 429 after success without artifact evidence with exit %s', (exitCode) => {
+    expect(verdictForFinalPtyScreen({ screen: '5 pass\n429 rate limit exceeded', inputHistory: [], exitCode }))
+      .toEqual({ kind: 'done-but-failed', reason: '429 rate limit exceeded', evidence: null });
+  });
+
+  test('CLI without artifact evidence preserves historical 429 followed by success', () => {
+    expect(verdictForFinalPtyScreen({ screen: '429 rate limit exceeded\n5 pass', inputHistory: [], exitCode: 0 }).kind)
+      .toBe('success');
+  });
+
+  test('artifact-backed historical standalone 429 followed by success succeeds', () => {
+    expect(verdictForFinalPtyScreen({ screen: '429 rate limit exceeded\n5 pass', inputHistory: [], exitCode: 0, artifactEvidence: true }))
+      .toEqual({ kind: 'success', reason: 'final PTY screen has success evidence', evidence: '5 pass' });
+  });
+
+  test('artifact-backed final standalone 429 after success fails', () => {
+    expect(verdictForFinalPtyScreen({ screen: '5 pass\n429 rate limit exceeded', inputHistory: [], exitCode: 0, artifactEvidence: true }))
+      .toEqual({ kind: 'done-but-failed', reason: '429 rate limit exceeded', evidence: null });
+  });
+
+  test('a sentence discussing a 429 is not itself a 429 screen', () => {
+    expect(verdictForFinalPtyScreen({ screen: 'Documented the 429 rate limit exceeded response.\n5 pass', inputHistory: [], exitCode: 0, artifactEvidence: true }).kind)
+      .toBe('success');
+  });
+
   test('command not found takes precedence over a later success marker', () => {
     expect(verdictForFinalPtyScreen({ screen: 'bash: build-tool: command not found\n5 pass', inputHistory: ['build-tool\r'], exitCode: 0 }))
       .toEqual({ kind: 'done-but-failed', reason: 'bash: build-tool: command not found', evidence: null });

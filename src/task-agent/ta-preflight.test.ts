@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
@@ -583,7 +583,7 @@ async function shadowThenPreflight(handArgs: string[]): Promise<{ handOut: strin
     const shadowPath = join(dir, 'shadow.txt');
     writeFileSync(shadowPath, hand.stdout);
     const evidencePath = join(dir, 'e.json');
-    const { launchArgv: _omit, ...rest } = staticBase;
+    const { launchArgv: _omit, launch: _omitLaunch, ...rest } = staticBase;
     const card = parseHandShadowEvidence(hand.stdout).cardId;
     writeFileSync(evidencePath, JSON.stringify({ ...rest, workOrder: { ...rest.workOrder!, card } }));
     const pre = await simCli(['tasks', 'preflight', '--evidence', evidencePath, '--hand-shadow', shadowPath], { mode: 'spawn', allowPaths: [['tasks', 'preflight']], timeoutMs: 120_000 });
@@ -634,7 +634,7 @@ async function runPreflightProcess(evidence: unknown): Promise<{ exitCode: numbe
 }
 
 test('실프로세스: tasks preflight — 카드 미관측은 UNMEASURED, failClosed 거짓 주장은 빌드가 덮어쓴다', async () => {
-  const r = await runPreflightProcess({ ...staticBase, failClosed: { sourceHead: false, imageDigest: false } });
+  const r = await runPreflightProcess({ ...staticBase, launch: undefined, failClosed: { sourceHead: false, imageDigest: false } });
   expect(r.exitCode).toBe(1);
   expect(r.stdout).toMatch(/UNMEASURED +5\./u);
   expect(r.stdout).toMatch(/PASS {7}1\. private repo \+ child 실제 HEAD — 정적: pin a{12} /);
@@ -642,8 +642,143 @@ test('실프로세스: tasks preflight — 카드 미관측은 UNMEASURED, failC
 }, 150_000);
 
 test('실프로세스: tasks preflight — 증거 한 칸이 빠지면 NOT_READY exit 1 (소스 private 증거 없음 → ① UNMEASURED)', async () => {
-  const r = await runPreflightProcess({ ...staticBase, source: { requestedPin: sha, childHead: null, privateRepo: null } });
+  const r = await runPreflightProcess({ ...staticBase, launch: undefined, source: { requestedPin: sha, childHead: null, privateRepo: null } });
   expect(r.exitCode).toBe(1);
   expect(r.stdout).toMatch(/UNMEASURED 1\. private repo \+ child 실제 HEAD — private repo 증거 없음/);
   expect(r.stdout).toMatch(/UNMEASURED +5\./u);
+}, 150_000);
+
+// ══ TA-PREFLIGHT-CARD-EVIDENCE(OP 결정 A · 우편 #118314) — `--card` 관측 병합 법칙 ══
+// 관측 «측정값» 이 우선 · 관측이 null/«모름» 이면 «제출된 실측 증거» 가 남는다(덮어쓰지 않는다) · 둘 다 없으면 null(UNMEASURED 유지).
+// 조각 카드를 본뜬 상태(project.target 미기록) — 대상 경로·호스트 결속 관측은 «모름» · argv 마지막 토큰 ≠ 카드 문면이면 활성 run 관측도 «모름».
+const CARD_EVIDENCE_TEXT = '대상 경로: target.ts';
+const cardEvidenceEntrance = { name: 'hand', groundingConfigured: false, groundingPolicy: { off: true, reason: 'CROWN D2 M2 토큰 중계 안 켬' }, targetPathsValid: true, targetHostBound: true };
+
+// (r3 · JUD hold mustFix) 임대(lease) 원장 관측 재료 — readCardAllocation 이 반환하는 활성 배정 레코드 형태.
+const CARD_ALLOCATION = { host: 'aws1', allocationId: 'alloc-card-1', expiresAt: 4102444800 };
+
+async function preflightCardEvidenceRun(evidence: TaPreflightEvidence, activeRuns: () => readonly string[] | 'unknown' = () => 'unknown',
+  options: { readonly withTargetProject?: boolean; readonly allocation?: TaPreflightEvidence['allocation']; readonly unreadableCard?: boolean; readonly holdActiveThrows?: boolean;
+    readonly hostProbe?: (host: string, command: string, timeoutMs: number) => { status: number | null; stdout: string } } = {})
+  : Promise<{ exitCode: number; stdout: string; receipt: { evidence: { launch?: Record<string, unknown>; entrance?: Record<string, unknown>; evidenceBackedFields?: readonly string[] } } }> {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-preflight-card-evidence-'));
+  try {
+    const evidencePath = join(dir, 'e.json');
+    const receiptPath = join(dir, 'r.json');
+    const taskStatePath = join(dir, 'cards.json');
+    writeFileSync(evidencePath, JSON.stringify(evidence));
+    // (r3) withTargetProject — ⑥ 대상 경로 관측 재료: 실재 target.ts + card.project.target(observeTargetPaths 가 true 를 내는 조건).
+    if (options.withTargetProject) { mkdirSync(join(dir, 'proj')); writeFileSync(join(dir, 'proj', 'target.ts'), 'export {};\n'); }
+    // (r5 · JUD hold 39396 2차 mustFix) unreadableCard — 카드 원장 파일이 깨져 readTaskCard 가 관측하지 못하는 상태.
+    if (options.unreadableCard) writeFileSync(taskStatePath, '{"tasks":{"card-1":{"id":"card-1"');
+    else writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'card-1': { id: 'card-1', seat: 'TC', text: CARD_EVIDENCE_TEXT, status: 'handed', history: [], ...(options.withTargetProject ? { project: { target: join(dir, 'proj') } } : {}) } } }));
+    const lines: string[] = [];
+    const program = new Command().name('elanous').exitOverride();
+    // (r5) holdActiveThrows — OP hold 원장 관측이 예외로 실패하는 상태(관측 null 경로).
+    // (r5) preflightHostProbe — 시험은 프로브 불능 stub(status null → ⑥ null·UNMEASURED)으로 격리한다(시험 자식의 원격 ssh 금지).
+    registerTasksCommands(program, { output: (line) => lines.push(line), taskStatePath, preflightActiveRuns: activeRuns, preflightHoldActive: options.holdActiveThrows ? () => { throw new Error('OP hold 원장 관측 불능'); } : () => false, preflightAllocation: () => options.allocation ?? null, preflightHostProbe: options.hostProbe ?? (() => ({ status: null, stdout: '' })) });
+    const previous = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await program.parseAsync(['node', 'elanous', 'tasks', 'preflight', '--evidence', evidencePath, '--out', receiptPath, '--card', 'card-1']);
+      return { exitCode: Number(process.exitCode ?? 0), stdout: lines.join('\n'), receipt: JSON.parse(readFileSync(receiptPath, 'utf8')) };
+    } finally { process.exitCode = previous ?? 0; }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+// (r3 · JUD hold mustFix) 원장을 못 읽으면 제출된 ⑤⑥ 실측 주장은 폐기된다 — UNMEASURED 유지(제출값으로 READY 조작 금지).
+test('--card 병합: 관측 불능 시 제출된 ⑤⑥은 채워지지 않는다 — UNMEASURED 유지(READY 조작 금지)', async () => {
+  const r = await preflightCardEvidenceRun({ ...staticBase, launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }, entrance: { ...cardEvidenceEntrance } });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/UNMEASURED +5\. 중복 · 중지 · 최신 OP hold/);
+  expect(r.stdout).toMatch(/UNMEASURED +6\. 단일 입구 · 그라운딩/);
+  // 제출된 ⑤ activeSameGoalRuns=0·⑥ targetPathsValid/targetHostBound=true 는 관측 불능 시 영수에 남지 않는다(null).
+  expect(r.receipt.evidence.launch).toEqual({ cardClaimed: false, activeSameGoalRuns: null, opHoldActive: false });
+  expect(r.receipt.evidence.entrance).toMatchObject({ targetPathsValid: null, targetHostBound: null });
+  expect(r.receipt.evidence.evidenceBackedFields).toEqual([]);
+}, 150_000);
+
+// (r5 수리 · JUD hold-39396-6efcfcfe6614 2차 mustFix) ⑤ 관측(런 원장 활성 0)은 여전히 나쁜 제출값(2)을 이긴다 —
+// 그러나 ⑥ 호스트 결속의 유일 원천은 «배정된 호스트 위» 대상 경로 관측(프로브)이라 프로브가 없으면(불능 stub)
+// 로컬 경로 실재(targetPathsValid true)+활성 배정(allocation)만으로 true 를 합성하지 않는다 — null(UNMEASURED) → NOT_READY.
+test('--card 병합: ⑤ 원장 관측은 제출값을 이긴다 — ⑥ 은 배정 호스트 위 관측 없음에 UNMEASURED(NOT_READY)', async () => {
+  const r = await preflightCardEvidenceRun(
+    { ...staticBase, launchArgv: [...ARGV_CLOSED, CARD_EVIDENCE_TEXT], launch: { cardClaimed: false, activeSameGoalRuns: 2, opHoldActive: false },
+      entrance: { name: 'hand', groundingConfigured: false, groundingPolicy: { off: true, reason: 'CROWN D2 M2 토큰 중계 안 켬' }, targetPathsValid: false, targetHostBound: false } },
+    () => [], { withTargetProject: true, allocation: CARD_ALLOCATION });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/UNMEASURED +6\. 단일 입구 · 그라운딩/);
+  expect(r.stdout).not.toMatch(/FAIL +5\./u);
+  expect(r.receipt.evidence.launch).toEqual({ cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false });
+  expect(r.receipt.evidence.entrance).toMatchObject({ targetPathsValid: true, targetHostBound: null });
+  expect(r.receipt.evidence.evidenceBackedFields).toEqual([]);
+}, 150_000);
+
+// (r5 수리) 프로브가 «배정된 호스트 위» 대상 경로를 확인하면 그때만 ⑥ 결속이 true 다 — ⑤⑥ 관측이 다 서야 READY.
+test('--card 병합: 배정 호스트 위 프로브 확인이 ⑥ 을 true 로 만들고 READY 를 낸다', async () => {
+  const r = await preflightCardEvidenceRun(
+    { ...staticBase, launchArgv: [...ARGV_CLOSED, CARD_EVIDENCE_TEXT], launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }, entrance: { ...cardEvidenceEntrance } },
+    () => [], { withTargetProject: true, allocation: CARD_ALLOCATION, hostProbe: (host, command) => {
+      expect(host).toBe('aws1');
+      expect(command).toContain('test -e');
+      return { status: 0, stdout: '' };
+    } });
+  expect(r.exitCode).toBe(0);
+  expect(r.stdout).toContain('READY (pass 6 · fail 0 · unmeasured 0)');
+  expect(r.receipt.evidence.entrance).toMatchObject({ targetPathsValid: true, targetHostBound: true });
+}, 150_000);
+
+test('--card 병합: 제출 증거가 없는 칸은 관측 부재 그대로 UNMEASURED 유지 — 증거가 PASS 를 지어내지 않는다', async () => {
+  const r = await preflightCardEvidenceRun({ ...staticBase, launch: { cardClaimed: false }, entrance: { name: 'hand', groundingConfigured: false, groundingPolicy: { off: true, reason: 'CROWN D2 M2 토큰 중계 안 켬' } } });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/UNMEASURED 5\. 중복 · 중지 · 최신 OP hold — .*활성 run 수 미측정/);
+  expect(r.stdout).toMatch(/UNMEASURED +6\. 단일 입구 · 그라운딩/);
+  // 관측 «측정값» cardClaimed=false·opHoldActive=false 는 관측 우선 법칙대로 영수 증거에 남는다 — 제출 없는 ⑤ 는 메워지지 않고
+  // r3 영수 계약대로 명시 null 마커로 남는다(관측 불능=UNMEASURED 문서화 · ⑥ entrance null 마커·무카드 분기와 같은 관례).
+  expect(r.receipt.evidence.launch).toEqual({ cardClaimed: false, activeSameGoalRuns: null, opHoldActive: false });
+  expect(r.receipt.evidence.entrance).toEqual({ name: 'hand', groundingConfigured: false, groundingPolicy: { off: true, reason: 'CROWN D2 M2 토큰 중계 안 켬' }, targetPathsValid: null, targetHostBound: null });
+  expect(r.receipt.evidence.evidenceBackedFields).toEqual([]);
+}, 150_000);
+
+test('--card 병합: 관측 «측정값»은 제출 증거보다 우선 — 활성 run 관측 2가 제출 0을 이긴다(FAIL)', async () => {
+  const r = await preflightCardEvidenceRun({ ...staticBase, launchArgv: [...ARGV_CLOSED, CARD_EVIDENCE_TEXT], launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }, entrance: { ...cardEvidenceEntrance } }, () => ['run-1', 'run-2']);
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/FAIL {7}5\. 중복 · 중지 · 최신 OP hold — 같은 골 활성 run 2/);
+  expect(r.receipt.evidence.launch).toEqual({ cardClaimed: false, activeSameGoalRuns: 2, opHoldActive: false });
+  // (r3) ⑥ 제출값은 더 이상 기록되지 않는다 — 관측 불능 시 폐기(빨강 시험: r2 법칙에서 이 기대치는 반대였음).
+  expect(r.receipt.evidence.evidenceBackedFields).toEqual([]);
+}, 150_000);
+
+// ══ (r5 · JUD hold-39396-6efcfcfe6614 2차 mustFix) «Keep launch-critical unknowns unmeasured» ══
+// ⑥ 호스트 결속의 유일 원천은 «배정된 호스트 위» 대상 경로 관측이다 — 로컬 경로 실재(allocation!=null ∧ observeTargetPaths)만으로
+// true 를 만들지 않는다. ⑤ 계열 부울(cardClaimed·opHoldActive)도 관측이 null 이면 제출값을 폐기하고 null(UNMEASURED) 을 유지한다.
+
+// (r5) 로컬 프로젝트 경로가 실재하고 임대 원장에 활성 배정이 있어도, 배정 호스트 위 관측이 없으면 ⑥ 은 UNMEASURED 다.
+test('--card 병합: ⑥ 로컬 경로 실재 + 활성 배정만으로 호스트 결속을 재지 않는다 — 배정 호스트 위 관측 없으면 UNMEASURED', async () => {
+  const r = await preflightCardEvidenceRun(
+    { ...staticBase, launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }, entrance: { ...cardEvidenceEntrance } },
+    () => [], { withTargetProject: true, allocation: CARD_ALLOCATION });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/UNMEASURED +6\. 단일 입구 · 그라운딩/);
+  expect(r.receipt.evidence.entrance).toMatchObject({ targetPathsValid: true, targetHostBound: null });
+}, 150_000);
+
+// (r5) 카드 원장을 못 읽으면 제출된 cardClaimed=false 부울도 폐기한다 — 관측 없는 칸은 null(UNMEASURED) 유지.
+test('--card 병합: 카드 원장 관측 불능 시 제출 cardClaimed 는 남지 않는다 — null(UNMEASURED) 유지', async () => {
+  const r = await preflightCardEvidenceRun(
+    { ...staticBase, launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }, entrance: { ...cardEvidenceEntrance } },
+    () => [], { unreadableCard: true });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/UNMEASURED +5\. 중복 · 중지 · 최신 OP hold/);
+  expect(r.receipt.evidence.launch).toEqual({ cardClaimed: null, activeSameGoalRuns: null, opHoldActive: false });
+}, 150_000);
+
+// (r5) OP hold 원장 관측이 실패하면 제출된 opHoldActive=false 부울도 폐기한다 — 관측 없는 칸은 null(UNMEASURED) 유지.
+test('--card 병합: OP hold 관측 불능 시 제출 opHoldActive 는 남지 않는다 — null(UNMEASURED) 유지', async () => {
+  const r = await preflightCardEvidenceRun(
+    { ...staticBase, launchArgv: [...ARGV_CLOSED, CARD_EVIDENCE_TEXT], launch: { cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: false }, entrance: { ...cardEvidenceEntrance } },
+    () => [], { holdActiveThrows: true });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toMatch(/UNMEASURED +5\. 중복 · 중지 · 최신 OP hold/);
+  expect(r.receipt.evidence.launch).toEqual({ cardClaimed: false, activeSameGoalRuns: 0, opHoldActive: null });
 }, 150_000);

@@ -5,6 +5,8 @@
  * - Within the cap: the call's own result, exactly as today.
  * - Past the cap: the turn's abort signal is unhooked from the process (a later Esc no longer stops it), the capsule is
  *   kept in this module's registry, one `capsule-progress` frame goes out, and the turn continues.
+ * - JUD #39435 must: a seat turn cap before the confirmed start never detaches — the pending approval/work is
+ *   cancelled (abort) and the cap reason re-thrown. Bash's start call is itself the start; RunShell's is `spawned()`.
  * - On exit: one `capsule-done` frame (B1 wire) and one task notification (the next turn's drain carries the bounded,
  *   redacted output — the frame itself never carries raw output).
  * - No sink (JUD #38713 must: not the Next TUI chat child — classic · --json · --stdin-jsonl · --scenario · harness · ACP):
@@ -12,9 +14,15 @@
  * - `syncCapMs` = Infinity (`syncCapMs: 0` config): same — inline.
  * - A detached capsule's notification always carries its session (`parentSessionId`): it never reaches another session.
  */
+import { judgeStop } from '../agent/stop-door.js';
+import type { StopOutcome } from '../agent/stop-door.js';
 import { globalTaskNotificationQueue, TASK_NOTIFICATION_OUTPUT_CAP, type TaskNotificationQueue } from '../agent/task-notification.js';
 import { redactSecretText } from '../debug/log.js';
 import { emitTurnLife } from '../debug/turn-life.js';
+import { createCapsulePolicy } from '../core-turn/capsule-policy.js';
+import { isSeatTurnCapAbort } from '../core-turn/seat-turn-cap.js';
+import { readUserConfigObject } from '../user-config/read.js';
+import { userConfigPath } from '../user-config.js';
 import type { CapsuleDoneEvent, CapsuleEvent, CapsulePolicy, CapsuleStatus } from './contract.js';
 
 export interface ShellCapsuleCall<R> {
@@ -39,6 +47,9 @@ export interface ShellCapsuleDeps {
   readonly setTimer?: (fn: () => void, ms: number) => unknown;
   readonly clearTimer?: (timer: unknown) => void;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
+  /** A turn abort with this reason detaches the capsule at once instead of stopping it (OP 19:2x: the seat turn cap
+   *  detaches + [CHECKPOINT], it does not cut). Default: the seat turn cap. A person's Esc still stops the process. */
+  readonly detachOnAbort?: (reason: unknown) => boolean;
   /** turn-life correlation (OBSERVE-TURN-LIFE-DIAG-COMPLETE): the turn that started the call. */
   readonly correlation?: { readonly turnId?: string };
 }
@@ -57,7 +68,7 @@ export const SHELL_CAPSULE_PREVIEW_CAP = 80;
 interface Sink { readonly sessionId: string; readonly write: (event: CapsuleEvent) => void }
 let sink: Sink | null = null;
 let nextId = 0;
-const detached = new Map<string, DetachedShellCapsule & { readonly stop: AbortController }>();
+const detached = new Map<string, DetachedShellCapsule & { readonly stop: AbortController; readonly ownerSessionId: string }>();
 
 /** The chat child's bridge installs the frame writer (it knows the session). No sink = no frame, notification only. */
 export function installShellCapsuleSink(sessionId: string, write: (event: CapsuleEvent) => void): { dispose(): void } {
@@ -67,15 +78,23 @@ export function installShellCapsuleSink(sessionId: string, write: (event: Capsul
 }
 
 export function listDetachedShellCapsules(): readonly DetachedShellCapsule[] {
-  return [...detached.values()].map(({ stop: _stop, ...rest }) => rest);
+  return [...detached.values()].map(({ stop: _stop, ownerSessionId: _owner, ...rest }) => rest);
 }
 
 /** Stops one detached capsule (its process gets the same SIGTERM → SIGKILL path as an Esc). False when unknown. */
-export function stopDetachedShellCapsule(capsuleId: string): boolean {
-  const entry = detached.get(capsuleId);
-  if (!entry) return false;
-  entry.stop.abort();
-  return true;
+export function stopDetachedShellCapsule(capsuleId: string, requester?: string): boolean {
+  return stopDetachedShellCapsuleOutcome(capsuleId, requester).stopped;
+}
+
+/** STOP-DOOR-ONE — same verdict shape as the other three doors; `stopDetachedShellCapsule` stays the boolean alias. */
+export function stopDetachedShellCapsuleOutcome(capsuleId: string, requester = sink?.sessionId): StopOutcome {
+  const record = detached.get(capsuleId);
+  const verdict = judgeStop({
+    kind: 'capsule', id: capsuleId, exists: record !== undefined, ended: record?.stop.signal.aborted ?? false,
+    owner: record?.ownerSessionId, requester,
+  });
+  if (verdict.stopped) record?.stop.abort();
+  return verdict;
 }
 
 export function shellCapsulePreview(command: string): string {
@@ -90,10 +109,15 @@ function bounded(output: string): { text: string; truncated: boolean } {
 }
 
 export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellCapsuleDeps): Promise<R> {
+  const detachOn = deps.detachOnAbort ?? isSeatTurnCapAbort;
+  // JUD #39435 must: a seat turn cap that lands before the start never launches — no approval request, no
+  // process, no ghost capsule. The turn's own cap reason is re-thrown as is (only a started process detaches).
+  if (call.turnSignal?.aborted && detachOn(call.turnSignal.reason)) throw call.turnSignal.reason;
   const decision = deps.policy.decide({ tool: call.tool, kind: 'shell' });
   const cap = decision.mode === 'detach' ? 0 : decision.syncCapMs;
   // Capability, not a switch: only a session with a sink gets the result back — anywhere else, inline.
-  if (!Number.isFinite(cap) || sink === null) return call.start(call.turnSignal, () => {});
+  const at = sink;
+  if (!Number.isFinite(cap) || at === null) return call.start(call.turnSignal, () => {});
 
   const now = deps.now ?? Date.now;
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
@@ -103,18 +127,37 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   const ids = (capsuleId: string) => (turnId ? { turnId, capsuleId } : { capsuleId });
   const startedAt = now();
   const own = new AbortController();
-  const forward = (): void => own.abort();
-  const turnSignal = call.turnSignal;
-  if (turnSignal?.aborted) own.abort();
-  else turnSignal?.addEventListener('abort', forward, { once: true });
   let timer: unknown;
   let arm = (): void => {};
-  const capHit = new Promise<'cap'>((resolve) => {
+  let hit: (why: 'cap' | 'turn-cap') => void = () => {};
+  const capHit = new Promise<'cap' | 'turn-cap'>((resolve) => {
+    hit = resolve;
     arm = () => { arm = () => {}; timer = setTimer(() => resolve('cap'), cap); };
   });
-  const work = call.start(own.signal, () => arm());
+  const turnSignal = call.turnSignal;
+  // OP #121854 — the hit↔abort microtask race: once the seat turn cap hit, a spawned()
+  // report that lands in the same flush never counts as `launched` (the abort wins the boundary).
+  let capped = false;
+  // JUD #39435: `launched` is the confirmed start — Bash's start call is itself the launch, RunShell's is the
+  // `spawned()` report. Only a launched call may detach; a pre-launch cap cancels below.
+  let launched = !call.clockFromSpawn;
+  // OP #122497 — a pre-start cap cancels the child signal synchronously, inside this handler: a queued approval
+  // continuation (allow resolved before the cap in the same tick) must never observe a live signal and spawn
+  // past the cap. A started call keeps the detach path untouched.
+  const forward = (): void => {
+    if (detachOn(turnSignal?.reason)) {
+      capped = true; hit('turn-cap');
+      if (!launched) own.abort(turnSignal?.reason);
+    } else own.abort();
+  };
+  if (turnSignal?.aborted) forward();
+  else turnSignal?.addEventListener('abort', forward, { once: true });
+  const work = call.start(own.signal, () => {
+    if (capped) return; // OP #121854 — the cap hit first: this report is cancelled, not launched.
+    launched = true; arm();
+  });
   if (!call.clockFromSpawn) arm();
-  let raced: { value: R } | 'cap';
+  let raced: { value: R } | 'cap' | 'turn-cap';
   try {
     raced = await Promise.race([work.then((value) => ({ value })), capHit]);
   } catch (error) {
@@ -122,7 +165,16 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
     turnSignal?.removeEventListener('abort', forward);
     throw error;
   }
-  if (raced !== 'cap') {
+  if (raced === 'turn-cap' && !launched) {
+    // JUD #39435 must: the cap won before the process started — the pending approval/work is cancelled (no
+    // capsule, no frame, no notification) and the cap reason goes back to the caller.
+    clearTimer(timer);
+    turnSignal?.removeEventListener('abort', forward);
+    work.then(() => {}, () => {}); // the cancelled wait's own outcome never surfaces — the cap is the answer
+    own.abort(turnSignal?.reason);
+    throw turnSignal?.reason;
+  }
+  if (raced !== 'cap' && raced !== 'turn-cap') {
     clearTimer(timer);
     turnSignal?.removeEventListener('abort', forward);
     return raced.value;
@@ -133,10 +185,9 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
   const capsuleId = `shell-${startedAt.toString(36)}-${++nextId}`;
   const preview = shellCapsulePreview(call.command);
   const detachedAt = now();
-  detached.set(capsuleId, { capsuleId, tool: call.tool, preview, startedAt, detachedAt, stop: own });
-  const at = sink;
+  detached.set(capsuleId, { capsuleId, tool: call.tool, preview, startedAt, detachedAt, stop: own, ownerSessionId: at.sessionId });
   try {
-    log('turn-life:capsule-detached', { ...ids(capsuleId), tool: call.tool, kind: 'shell', syncCapMs: cap, reason: decision.reason });
+    log('turn-life:capsule-detached', { ...ids(capsuleId), tool: call.tool, kind: 'shell', syncCapMs: cap, reason: raced === 'turn-cap' ? 'seat-turn-cap' : decision.reason });
   } catch { /* observability is fail-open */ }
   try {
     at?.write({ type: 'capsule-progress', capsuleId, kind: 'shell', sessionId: at.sessionId, at: detachedAt,
@@ -174,4 +225,13 @@ export async function runShellCapsule<R>(call: ShellCapsuleCall<R>, deps: ShellC
     (error: unknown) => settle('failed', error instanceof Error ? error.message : String(error)),
   );
   return call.started(capsuleId, cap);
+}
+
+/** The A2 policy — the A1 capsule policy over the user's `turn` config (`turn.syncCapMs`, default 10s). No switch
+ *  (CAPSULE-FLAGS-REMOVE-DEFAULT · R3): the way back is a revert PR. */
+export function shellCapsulePolicy(
+  correlation?: { readonly turnId?: string },
+  turnConfig: () => unknown = () => readUserConfigObject(userConfigPath())?.turn,
+): CapsulePolicy {
+  return createCapsulePolicy({ turnConfig, ...(correlation?.turnId ? { correlation: { turnId: correlation.turnId } } : {}) });
 }

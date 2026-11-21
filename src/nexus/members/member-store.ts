@@ -3,6 +3,7 @@ import { Database } from 'bun:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { nexusRootDir } from '../paths.js';
+import { HANDLE_PATTERN, isReservedHandle, suggestAlternatives } from './member-handle-suggest.js';
 import { checkAppSlugName, type AppSlugNameVerdict } from './app-slug-name.js';
 import { createAppLifecycleEvent, validateAppLifecycleEvent, type AppLifecycleEvent } from '../apps/app-lifecycle-ledger.js';
 
@@ -50,6 +51,8 @@ export interface MemberProfile {
   readonly eventCode: string | null;
   readonly createdAt: string;
 }
+
+export interface MemberHandleAvailability { readonly status: 'ok' | 'taken' | 'reserved' | 'invalid'; readonly alternatives: string[] }
 
 export interface MemberKeyInfo { readonly id: string; readonly name: string; readonly createdAt: string; readonly lastUsedAt: string | null }
 export interface IssuedMemberKey extends MemberKeyInfo { readonly key: string }
@@ -122,6 +125,8 @@ export interface MemberStore {
   canClaimReservedJoosung(memberId: string): boolean;
   memberForHandle(handle: string): string | null;
   claimHandle(memberId: string, handle: string, previousPublicUserSlug?: string): string;
+  /** MEMBER-JOURNEY S2 — read-only: is this public handle free for `memberId` (or anyone)? Taken includes retired slugs. Alternatives only when not ok. */
+  handleAvailability(candidate: string, memberId?: string): MemberHandleAvailability;
   /** WEBCHAT-PIN-LEDGER-RECONNECT (OP #104299/#104391) — durable (handle, memberId) claim enumeration for relay reconnect re-pinning; read-only. */
   handleClaims(): Array<{ readonly handle: string; readonly memberId: string }>;
   publicUserSlugForMember(memberId: string): string | null;
@@ -209,7 +214,6 @@ function base62(bytes: Buffer): string {
 function newMemberKey(): string { return `emk_${base62(randomBytes(32))}`; }
 function keyDigest(salt: string, key: string): string { return hash(`${salt}:${key}`); }
 
-const RESERVED_MEMBER_HANDLES = new Set(['admin', 'user', 'ElanvitalAI', 'elanvital', 'monad', 'elanous']);
 
 /** Persistent private member records, short-lived OAuth replay hashes and revocable sessions. */
 export function createMemberStore(options: { readonly path?: string; readonly now?: () => number;
@@ -810,6 +814,22 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       return (db.query('SELECT member_id FROM member_public_user_slugs WHERE user_slug = ? AND retired = 0')
         .get(userSlug) as { member_id: string } | null)?.member_id ?? null;
     },
+    handleAvailability(candidate, memberId) {
+      assertOpen();
+      const status = (value: string): MemberHandleAvailability['status'] => {
+        if (typeof value !== 'string' || !HANDLE_PATTERN.test(value)) return 'invalid';
+        const mayHoldJoosung = value === 'user' && memberId !== undefined && reservedOwnerMatches(memberId);
+        if (isReservedHandle(value, mayHoldJoosung)) return 'reserved';
+        const owner = memberForHandle(value);
+        if (owner && owner !== memberId) return 'taken';
+        const slug = db.query('SELECT member_id, retired FROM member_public_user_slugs WHERE user_slug = ?').get(value) as { member_id: string; retired: number } | null;
+        if (slug && (slug.member_id !== memberId || slug.retired)) return 'taken';
+        return 'ok';
+      };
+      const verdict = status(candidate);
+      if (verdict === 'ok') return { status: 'ok', alternatives: [] };
+      return { status: verdict, alternatives: suggestAlternatives(candidate, value => status(value) !== 'ok') };
+    },
     claimHandle(memberId, requested, previousPublicUserSlug) {
       assertOpen();
       const handle = requested;
@@ -819,7 +839,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       db.exec('BEGIN IMMEDIATE');
       try {
         if (!activeForAuth(memberId)) throw new Error('member is not active for handle change');
-        if (RESERVED_MEMBER_HANDLES.has(handle) && (handle !== 'user' || !reservedOwnerMatches(memberId))) {
+        if (isReservedHandle(handle, handle === 'user' && reservedOwnerMatches(memberId))) {
           throw new Error('reserved member ID');
         }
         const current = db.query('SELECT handle FROM member_handles WHERE member_id = ?').get(memberId) as { handle: string } | null;

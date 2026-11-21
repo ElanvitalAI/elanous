@@ -24,6 +24,7 @@ export interface AttachAppDeps {
   readonly write: (text: string) => void;
   readonly size: () => { cols: number; rows: number };
   readonly cwd: string;
+  readonly buildLabel?: string;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly setInterval: (callback: () => void, ms: number) => unknown;
   readonly clearInterval: (handle: unknown) => void;
@@ -67,6 +68,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   let selected: string | undefined;
   let wrapped = false;                                           // ELS-ONE-SPACE: `w` wrapped this space's tab cycle — the next `w` steps to the next space
   let lsAnswer = '';                                             // the last `els ls` answer (each pane's command → its tab emoji)
+  let ceoPendingRed = 0;                                         // authoritative els owner count; never infer 👀 from queue arrival
+  let ceoSideUnavailable = false;
   const remembered = deps.memory.load();
   let sidebarOpen = deps.sidebar ?? remembered.sidebar ?? true;
   let frame = '';
@@ -76,7 +79,11 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   let generation = 0;
   let timer: unknown;
   let finished = false;
+  let escapePending = '';
+  let discardEscapeSuffix = false;
+  let escapeTimer: ReturnType<typeof setTimeout> | undefined;
   let awaitingServer = false;                                    // D1a: ONLY a server-away end arms the re-attach — a refused/unknown-pane attach never retries
+  let automaticCreateAttempted = false;
   let everListed = false;                                        // D1a: a server lost AFTER a good list is waited out, not the end
   let resolveDone: (result: { code: number; message: string }) => void = () => {};
   const done = new Promise<{ code: number; message: string }>((resolve) => { resolveDone = resolve; });
@@ -156,7 +163,7 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     if (confirm) return ` ${confirm.prompt} · y 확인 · 다른 키 취소 `;
     if (scroll > 0) return ` ↑ 스크롤백 ${scroll}줄 위 · 휠·ctrl+b [ ] 이동 · 입력하면 맨 아래로 `;
     // 출처: seat-state/OP/orders/ELS-FIRST-RUN-UX-1119.md ③ 하단 항상 · UX #38884 — 조용할 때는 FIRST_RUN_HINT 리터럴 한 줄
-    if (!remoteStatus && !note && !readError && !current()?.remote) return FIRST_RUN_HINT;
+    if (!remoteStatus && !note && !readError && !current()?.remote) return deps.buildLabel ? ` ${deps.buildLabel} · ${FIRST_RUN_HINT.trimStart()}` : FIRST_RUN_HINT;
     if (!remoteStatus && !readError && !current()?.remote) return `${note} · ${FIRST_RUN_HINT}`;
     const row = current();
     // ELS-FIRST-RUN-FU3 ①: the status line is cut to the width — the pane name without its badge, and the read error right
@@ -179,15 +186,17 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
       tabs = { line: down.line, tabs: [] };
       if (dropdown) { overlay = down.list; dropHits = down.hits; }
     }
-    const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME) : undefined;
-    if (newTab.isOpen()) overlay = [newTab.line(cols)];          // ELS-NEW-TAB-NAME-WIDGET: the name prompt is the row under the tab row
+    const list = width ? layoutSpaceList(shown, selected, width, height - 1, deps.env.HOME, ceoSideUnavailable ? -1 : ceoPendingRed) : undefined;
     mouseLayout = { cols, rows: height, sidebarWidth: width, sidebar: list?.spaces ?? [], ...(list?.newBox ? { sidebarNew: list.newBox } : {}), tabs: tabs.tabs, ...(tabs.plus ? { plus: tabs.plus } : {}) };
-    deps.write(composeView({ cols, rows: height, sidebar: list ? list.lines : null, frame, status: statusText(), buttons: buttonsLayout(cols).text,
-      ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}), ...(overlay ? { overlay } : {}) }));
+    const screen = composeView({ cols, rows: height, sidebar: list ? list.lines : null, frame, status: statusText(), buttons: buttonsLayout(cols).text,
+      ...(tabs.line !== undefined ? { tabRow: tabs.line } : {}), ...(overlay ? { overlay } : {}) });
+    deps.write(screen + (newTab.isOpen() ? newTab.dialog(cols, height, width ? width + 1 : 0) : ''));
   };
   const finish = (code: number, message: string): void => {
     if (finished) return;
     finished = true;
+    if (escapeTimer) clearTimeout(escapeTimer);
+    escapePending = '';
     deps.clearInterval(timer);
     generation++;
     attached?.detach();
@@ -319,36 +328,49 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   };
 
   /** Re-read the list; keep the selection when its pane still exists, else the neighbour that took its place. */
-  const refresh = async (): Promise<void> => {
-    const answer = await deps.request({ op: 'ls' });
-    if (finished) return;
+  const refresh = async (afterCreate = false): Promise<boolean> => {
+    let answer: ElsResult;
+    try { answer = await deps.request({ op: 'ls' }); }
+    catch (error) { if (afterCreate) return false; throw error; }
+    if (finished) return false;
     if (answer.exitCode !== 0) {
+      if (afterCreate) return false;
       // D1a(ELS-SERVER-RESTART-SURVIVE): a server lost after a good list is waited out — the screen stays and this
       // poll asks again; before the first good list the message goes out as it always did.
-      if (everListed && isServerAway(answer.message)) { if (selected && !attached) awaitingServer = true; note = RECONNECT_NOTE; render(); return; }
-      finish(1, answer.message); return;
+      if (everListed && isServerAway(answer.message)) { if (selected && !attached) awaitingServer = true; note = RECONNECT_NOTE; render(); return false; }
+      finish(1, answer.message); return false;
     }
     everListed = true;
     const before = rows;
     rows = parsePaneRows(answer.message);
     lsAnswer = answer.message;
+    try {
+      const side = (JSON.parse(answer.message) as { ceoSide?: { pendingRed?: unknown } }).ceoSide;
+      ceoSideUnavailable = side !== undefined && (side as { error?: unknown }).error === 'unavailable';
+      ceoPendingRed = typeof side?.pendingRed === 'number' && Number.isSafeInteger(side.pendingRed) && side.pendingRed > 0
+        ? Math.min(side.pendingRed, 99) : 0;
+    } catch { ceoPendingRed = 0; ceoSideUnavailable = true; }
     // ELS-FIRST-RUN-LIVE-PANE (OP #102204): an exited pane stays in the list, dimmed — it is never closed automatically.
     if (selected && !everyRow().some((row) => row.pane === selected)) {
       const was = before.findIndex((row) => row.pane === selected);
       select(rows[Math.min(Math.max(was, 0), rows.length - 1)]?.pane);
-      return;
+      return true;
     }
     if (!selected && rows.length > 0) {
       // First view (ELS-FIRST-RUN-LIVE-PANE): the live pane it was left on, else the first live one in this folder's space,
       // else any live one; nothing live (every pane exited) → a fresh $SHELL pane in this folder's space, attached.
       const live = rows.filter((row) => row.state !== 'exited');
-      if (live.length === 0) { await create(undefined); return; }
+      if (live.length === 0) {
+        if (!automaticCreateAttempted) { automaticCreateAttempted = true; await create(undefined, undefined, true); }
+        return true;
+      }
       const folder = basename(deps.cwd) || 'els';
       select((live.find((row) => row.pane === remembered.lastPane) ?? live.find((row) => row.workspace === folder) ?? live[0]!).pane);
-      return;
+      return true;
     }
     if (awaitingServer && !attached && selected && !current()?.remote) reattach();   // D1a(ELS-SERVER-RESTART-SURVIVE): the server is back
     render();
+    return true;
   };
 
   // ELS-ONE-SPACE: n/p and 1-9 move between the tabs of the selected space (herdr's tabs); w walks the same tabs further —
@@ -382,15 +404,30 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     select(all.find((entry) => entry.wsId === next)?.pane);
   };
 
-  const create = async (workspace: string | undefined, what: { command: readonly string[]; title: string } = { command: [], title: '' }): Promise<void> => {
+  const create = async (workspace: string | undefined, what: { command: readonly string[]; title: string } = { command: [], title: '' }, automatic = false): Promise<boolean | 'unknown'> => {
+    // A manual request may already have reached the server even while its result is pending or unknown.
+    // Never start a separate automatic creation after it, including from a concurrent poll.
+    if (!automatic) automaticCreateAttempted = true;
     const input = withNewDefaults({ command: [...what.command], ...(workspace ? { ws: workspace } : {}), ...(what.title ? { title: what.title } : {}) }, deps.env, deps.cwd);
-    const made = await deps.request({ op: 'new', ...input });
-    if (finished) return;                                         // ctrl+b q while the server was answering: done means done
-    if (made.exitCode !== 0) { note = made.message; render(); return; }
-    const pane = (JSON.parse(made.message) as { pane: string }).pane;
-    await refresh();
-    if (finished) return;
+    let made: ElsResult;
+    try { made = await deps.request({ op: 'new', ...input }); }
+    catch { note = 'Creation outcome unknown; inspect tabs before retry'; render(); return 'unknown'; }
+    if (finished) return false;                                   // ctrl+b q while the server was answering: done means done
+    if (made.transport?.outcome === 'unknown') { note = 'Creation outcome unknown; inspect tabs before retry'; render(); return 'unknown'; }
+    if (made.exitCode !== 0) {
+      if (automatic && made.transport?.outcome === 'not-sent') automaticCreateAttempted = false;
+      note = made.message; render(); return false;
+    }
+    let pane: string;
+    try { const parsed = JSON.parse(made.message) as { pane?: unknown }; if (typeof parsed.pane !== 'string' || !parsed.pane) throw new Error('missing pane'); pane = parsed.pane; }
+    catch { note = 'Creation outcome unknown; inspect tabs before retry'; render(); return 'unknown'; }
+    const listed = await refresh(true);
+    if (finished) return false;
+    if (!listed || !rows.some((row) => row.pane === pane)) {
+      note = 'Creation confirmed but tab not listed; inspect tabs before retry'; render(); return 'unknown';
+    }
     select(pane);
+    return true;
   };
   // ELS-VOICE-CONTROL-POPUP (OP #101876): steps run as the same els requests the keys use (new · close · close-workspace ·
   // reorder) — the control door gets structure ops in its own cell (ELS-DOOR-STRUCT-OPS). Names are what the person said.
@@ -404,8 +441,8 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         return { ok: done.exitCode === 0, message: done.message };
       };
       switch (step.op) {
-        case 'tab.new': case 'pane.new': await create(a.workspace ?? (current() && !current()!.remote ? current()!.workspace : undefined), { command: [], title: a.title ?? '' }); return { ok: true, message: '' };
-        case 'workspace.create': await create(a.name ?? freshWorkspaceName()); return { ok: true, message: '' };
+        case 'tab.new': case 'pane.new': { const ok = await create(a.workspace ?? (current() && !current()!.remote ? current()!.workspace : undefined), { command: [], title: a.title ?? '' }); return { ok: ok === true, message: ok === true ? '' : note }; }
+        case 'workspace.create': { const ok = await create(a.name ?? freshWorkspaceName()); return { ok: ok === true, message: ok === true ? '' : note }; }
         case 'tab.close': case 'pane.close': { const row = findTab(a.tab ?? a.pane ?? ''); return row && !row.remote ? answer({ op: 'close', pane: row.pane, confirmed: true }) : { ok: false, message: `${a.tab ?? a.pane} 탭 없음` }; }
         case 'workspace.close': { const row = findSpace(a.workspace ?? ''); return row ? answer({ op: 'close-workspace', ws: row.wsId, confirmed: true }) : { ok: false, message: `${a.workspace} 공간 없음` }; }
         case 'workspace.move': { const row = findSpace(a.workspace ?? ''); const before = a.before ? findSpace(a.before)?.wsId : undefined; return row ? answer({ op: 'reorder', kind: 'workspace', id: row.wsId, ...(before ? { before } : {}) }) : { ok: false, message: `${a.workspace} 공간 없음` }; }
@@ -421,8 +458,16 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
   });
 
   // ELS-NEW-TAB-NAME-WIDGET: the typed name goes to the `new` request's title ONLY (cleaned and capped in the prompt); never to the pane.
+  let unresolvedTabTarget: { workspace: string | undefined } | undefined;
   const newTab = createNewTabPrompt({
-    save: (name) => { const row = current(); void create(row && !row.remote ? row.workspace : undefined, { command: [], title: name }); },
+    save: async (name) => {
+      const row = current();
+      const target = unresolvedTabTarget ?? { workspace: row && !row.remote ? row.workspace : undefined };
+      const result = await create(target.workspace, { command: [], title: name });
+      if (result === 'unknown') unresolvedTabTarget = target;
+      else if (result === true) unresolvedTabTarget = undefined;
+      return result;
+    },
     changed: () => render(),
   });
   const freshWorkspaceName = (): string => {
@@ -472,35 +517,26 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
     await refresh();
   };
 
-  return {
-    done,
-    async start(pane) {
-      try {
-        timer = deps.setInterval(() => { void refreshRemote(); refresh().catch((error: unknown) => finish(1, `els: ${error instanceof Error ? error.message : String(error)}`)); }, deps.pollMs);
-        await refresh();
-        void refreshRemote();                                      // the other hosts join the list when they answer
-        if (finished) return;
-        if (pane) select(pane);
-        else if (rows.length === 0) await create(undefined);     // an empty server opens with one shell, like herdr's first workspace
-      } catch (error) { finish(1, `els: ${error instanceof Error ? error.message : String(error)}`); }
-    },
-    key(text) {
+  let wasSavingAtInput = false;
+  const routeInput = (text: string): void => {
       if (finished) return;
-      for (const event of router.feed(text)) {
-        if (voice.isOpen()) { if (event.kind === 'input') void voice.feed(event.bytes); continue; }
+      if (wasSavingAtInput && !newTab.isSaving()) router.resetPrefix();
+      router.feed(text, () => newTab.isOpen() && !newTab.isSaving(), (event) => {
+        if (voice.isOpen()) { if (event.kind === 'input') void voice.feed(event.bytes); return; }
         if (newTab.isOpen()) {                                     // keys (and clicks) belong to the prompt: nothing reaches the pane
+          if (newTab.isSaving() && event.kind === 'action' && event.action === 'detach') { finish(0, ''); return; }
           if (event.kind === 'input') newTab.feed(event.bytes);
           else if (event.kind === 'mouse') { if (event.report.release) pressConsumed = false; else pressConsumed = (event.report.button & 0x40) === 0; }
-          continue;
+          return;
         }
         if (confirm) {
           const pending = confirm;
           confirm = undefined;
           if (event.kind === 'input' && event.bytes[0] === 'y') void settle(pending);
           else { note = '취소'; render(); }
-          continue;
+          return;
         }
-        if (dropdown && event.kind === 'input') { dropdownKey(event.bytes); continue; }
+        if (dropdown && event.kind === 'input') { dropdownKey(event.bytes); return; }
         if (event.kind === 'mouse') handleMouse(event.report);
         else if (event.kind === 'input') {
           if (current()?.remote) { note = `⇄${current()!.remote} pane 은 읽기 전용 — 입력은 els do ${current()!.pane} <글>`; render(); } else attached?.input(event.bytes);
@@ -509,7 +545,96 @@ export function createAttachApp(deps: AttachAppDeps): AttachApp {
         else if (event.key === ':') voice.open();                  // ELS-VOICE-CONTROL-POPUP: say it to els
         else if (event.key === 'Q') quitSpace();                  // ELS-EXIT-BG-BUTTONS: ✕ 종료 by key (ctrl+b q = ⏏ 백그라운드)
         else { note = `ctrl+b ${event.key} 는 아직 없음`; render(); }
+      });
+      wasSavingAtInput = newTab.isSaving();
+  };
+
+  // Terminal reads can split ESC from the rest of a key or SGR mouse report.
+  // Delay a bare Escape briefly only while the modal owns input; completed
+  // sequences go through the ordinary router, including mouse ownership.
+  const frameModalInput = (text: string): void => {
+    let remaining = text;
+    if (!newTab.isOpen() && (escapePending || discardEscapeSuffix)) {
+      if (escapeTimer) clearTimeout(escapeTimer);
+      escapeTimer = undefined;
+      escapePending = '';
+      discardEscapeSuffix = false;
+    }
+    while (remaining) {
+      if (discardEscapeSuffix) {
+        // A fresh Escape lets the user abandon an incomplete sequence.
+        if (remaining[0] === '\u001b') { discardEscapeSuffix = false; continue; }
+        const end = remaining.search(/[@-~]/);
+        if (end < 0) return;
+        remaining = remaining.slice(end + 1);
+        discardEscapeSuffix = false;
+        continue;
       }
+      if (!escapePending) {
+        const at = remaining.indexOf('\u001b');
+        if (at < 0) { routeInput(remaining); return; }
+        if (at > 0) { routeInput(remaining.slice(0, at)); remaining = remaining.slice(at); }
+        if (!newTab.isOpen()) { routeInput(remaining); return; }
+        escapePending = '\u001b';
+        remaining = remaining.slice(1);
+      }
+      if (escapeTimer) { clearTimeout(escapeTimer); escapeTimer = undefined; }
+      if (escapePending === '\u001b' && remaining && remaining[0] !== '[' && remaining[0] !== 'O') {
+        escapePending = ''; routeInput('\u001b');
+        // The entire terminal read belonged to the modal at cancellation.
+        if (!newTab.isOpen()) return;
+        remaining = remaining.slice(1);
+        continue;
+      }
+      while (remaining && escapePending.length < 128) {
+        const char = remaining[0]!; remaining = remaining.slice(1); escapePending += char;
+        if (escapePending.length >= 3 && /[@-~]/.test(char)) {
+          const sequence = escapePending; escapePending = ''; routeInput(sequence); break;
+        }
+      }
+      if (escapePending.length >= 128) { escapePending = ''; discardEscapeSuffix = true; }
+      if (escapePending) {
+        const captured = escapePending;
+        escapeTimer = setTimeout(() => {
+          escapeTimer = undefined;
+          if (escapePending !== captured) return;
+          escapePending = '';
+          if (captured === '\u001b' && newTab.isOpen() && !finished) routeInput(captured);
+          else if (captured !== '\u001b' && newTab.isOpen() && !finished) discardEscapeSuffix = true;
+        // Legacy terminals cannot distinguish a lone Esc from an arbitrarily delayed sequence.
+        // Give ordinary transport/scheduling jitter 40ms; longer gaps can still be misclassified.
+        }, captured === '\u001b' ? 40 : 250);
+        return;
+      }
+    }
+  };
+
+  return {
+    done,
+    async start(pane) {
+      try {
+        timer = deps.setInterval(() => {
+          void refreshRemote();
+          refresh().then(async (listed) => {
+            if (listed && !finished && !selected && rows.length === 0 && !automaticCreateAttempted) {
+              automaticCreateAttempted = true;
+              await create(undefined, undefined, true);
+            }
+          }).catch((error: unknown) => finish(1, `els: ${error instanceof Error ? error.message : String(error)}`));
+        }, deps.pollMs);
+        await refresh();
+        void refreshRemote();                                      // the other hosts join the list when they answer
+        if (finished) return;
+        if (pane) select(pane);
+        else if (rows.length === 0 && !automaticCreateAttempted) {
+          automaticCreateAttempted = true;
+          await create(undefined, undefined, true);             // an empty server opens with one shell, like herdr's first workspace
+        }
+      } catch (error) { finish(1, `els: ${error instanceof Error ? error.message : String(error)}`); }
+    },
+    key(text) {
+      if (finished) return;
+      frameModalInput(text);
     },
     resized() { const size = paneSize(); attached?.resize(size.cols, size.rows); render(); },
   };

@@ -4,7 +4,7 @@ import { reduceSignals, seatKey, SignalGenerator } from './signals.js';
 import { createLogicalClock } from './store.js';
 import { runSignalScenario, SIGNAL_SCENARIOS, type SignalVerdictKind } from './signal-scenarios.js';
 
-const VERDICTS: Readonly<Record<string, SignalVerdictKind>> = { M19: 'pass', M20: 'pass', M21: 'pass', M22: 'pass', M23: 'pass', M24: 'xfail' };
+const VERDICTS: Readonly<Record<string, SignalVerdictKind>> = { M19: 'pass', M20: 'pass', M21: 'pass', M22: 'pass', M23: 'pass', M24: 'pass' };
 
 for (const scenario of SIGNAL_SCENARIOS) test(`${scenario.id} ${scenario.title} → ${VERDICTS[scenario.id]}`, async () => {
   const verdict = await runSignalScenario(scenario);
@@ -16,7 +16,7 @@ test('the six rows are exactly M19..M24 in order', () => {
 });
 test('a red row with the wrong reason is wrong-reason-red, never xfail', async () => {
   const base = SIGNAL_SCENARIOS.find(s => s.id === 'M24')!;
-  expect((await runSignalScenario({ ...base, reason: 'something else' })).verdict).toBe('wrong-reason-red');
+  expect((await runSignalScenario({ ...base, expected: 'red', expect: { ...base.expect, total: 1 }, reason: 'something else' })).verdict).toBe('wrong-reason-red');
 });
 test('a red row that already matches asks for promote', async () => {
   const base = SIGNAL_SCENARIOS.find(s => s.id === 'M19')!;

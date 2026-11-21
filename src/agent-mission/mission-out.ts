@@ -9,6 +9,7 @@ import type { AsyncLockHandle } from '../storage/file-lock.js';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { createMissionLineStore, MissionLineHttpError, postMissionLineEvent, type MissionLineEvent, type MissionLineType } from './mission-line.js';
 import type { LinearMissionLink } from '../intake-plane/linear-mission-sync.js';
+import { missionOutPublicStatus, missionOutWorkerView } from './mission-name.js';
 
 const MISSION_CONTEXT_ENV = 'ELANOUS_MISSION_CONTEXT';
 const HAND_CHILD_ENV_KEYS = [
@@ -518,7 +519,7 @@ const missionUsage = {
     },
     status: {
       args: ['<id>'],
-      responseSchema: { type: 'object', required: ['id', 'missionId', 'status', 'artifacts', 'replies'], properties: { id: { type: 'string', format: 'uuid' }, missionId: { type: 'string', format: 'uuid' }, status: { enum: ['running', 'done', 'cancelled', 'failed', 'timeout'] }, body: { type: 'string' }, artifacts: { type: 'array', items: { type: 'string' } }, replies: { type: 'array', items: { $ref: '#/events/mission.reply' } }, result: { type: 'string' }, lockStale: { type: 'boolean' }, error: { type: 'string' } } },
+      responseSchema: { type: 'object', required: ['id', 'missionId', 'status', 'artifacts', 'replies'], properties: { id: { type: 'string', format: 'uuid' }, missionId: { type: 'string', format: 'uuid' }, status: { enum: ['running', 'done', 'cancelled', 'failed', 'timeout'] }, workerState: { type: 'object', required: ['state'], properties: { state: { enum: ['working', 'idle', 'needs-approval', 'done', 'failed', 'stalled'] }, reason: { type: 'string' } } }, body: { type: 'string' }, artifacts: { type: 'array', items: { type: 'string' } }, replies: { type: 'array', items: { $ref: '#/events/mission.reply' } }, result: { type: 'string' }, lockStale: { type: 'boolean' }, error: { type: 'string' } } },
     },
     reply: {
       args: ['[missionId]', '[text|stdin]'], flags: ['--mission <missionId>', '--done', '--kind <kind>', '--defaults <text>', '--deadline <value>', '--reply-to <sequence>', '--scope <text>', '--[no-]stop', '--priority <value>'],
@@ -526,7 +527,7 @@ const missionUsage = {
     },
     cancel: {
       args: ['<missionId>'],
-      responseSchema: { type: 'object', required: ['missionId', 'status', 'cancelled'], properties: { missionId: { type: 'string', format: 'uuid' }, status: { enum: ['running', 'completed', 'cancelled', 'failed'] }, cancelled: { type: 'boolean' } } },
+      responseSchema: { type: 'object', required: ['missionId', 'status', 'cancelled'], properties: { missionId: { type: 'string', format: 'uuid' }, status: { enum: ['running', 'done', 'cancelled', 'failed', 'timeout'] }, workerState: { type: 'object', required: ['state'], properties: { state: { enum: ['working', 'idle', 'needs-approval', 'done', 'failed', 'stalled'] }, reason: { type: 'string' } } }, cancelled: { type: 'boolean' } } },
     },
   },
   events: { 'mission.reply': { type: 'object', required: ['type', 'missionId', 'sequence', 'text', 'done', 'createdAt'], properties: { type: { const: 'mission.reply' }, missionId: { type: 'string', format: 'uuid' }, sequence: { type: 'integer' }, replyTo: { type: 'integer', minimum: 1 }, runId: { type: 'string' }, ptyId: { type: 'string' }, text: { type: 'string' }, done: { type: 'boolean' }, createdAt: { type: 'string', format: 'date-time' }, kind: { type: 'string', description: 'Reserved kinds: ask, answer, correct.' }, defaults: { type: 'string' }, deadline: { type: 'string' }, scope: { type: 'string' }, stop: { type: 'boolean' }, priority: { type: 'string' } } } },
@@ -686,7 +687,8 @@ export function registerMissionOutCommand(program: Command, deps: {
       }
       const publicRecord = {
         id: record.missionId, missionId: record.missionId, agent: record.agent,
-        status: record.status === 'completed' ? 'done' : record.status,
+        status: missionOutPublicStatus(record.status),
+        workerState: missionOutWorkerView(record.status),
         lockStale,
         ...(record.result !== undefined ? { body: record.result, artifacts: [record.targetOutputPath] }
           : record.error !== undefined ? { body: record.error, artifacts: [] as string[] }
@@ -823,7 +825,7 @@ export function registerMissionOutCommand(program: Command, deps: {
         if (record.workerPid && transitioned) {
           await terminateTree({ pid: record.workerPid }, { group: true, pidFallback: true });
         }
-        out(opts, { id: missionId, missionId, status: record.status === 'completed' ? 'done' : record.status, cancelled: record.status === 'cancelled' });
+        out(opts, { id: missionId, missionId, status: missionOutPublicStatus(record.status), workerState: missionOutWorkerView(record.status), cancelled: record.status === 'cancelled' });
       } catch (e) { error(`${String(e)}\n`); process.exitCode = 1; }
     });
 

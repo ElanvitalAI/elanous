@@ -15,9 +15,11 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { LLMMessage } from '../llm.js';
 import { debug, redactSecretText } from '../debug/log.js';
+import { buildSeatRoleCardBlock } from './seat-role-card.js';
 import { collectSeatBootSections, renderSeatBootCard } from '../cli/seat-cli.js';
 import { defaultMsgStorePath } from '../msg/msg-store.js';
 import { buildSeatMemoryIndexBlock, seatMemoryDir } from '../seat-memory/seat-memory.js';
+import { readOpRolePackBootPrompt, readSeatHandoffBootPrompt } from '../tui/seat-mail-boot.js';
 
 export interface SeatDetection {
   seat: string;
@@ -367,6 +369,8 @@ function buildCardMessages(cwd: string, deps: SeatBootDeps): CardEntry {
   const at = snapshotAt.toISOString();
   const recall = seatMemoryRecallLine(seatDir);
   const memoryImport = buildSeatMemoryImport(cwd, detection.seat, home, snapshotAt);
+  const opHandoff = readSeatHandoffBootPrompt(detection.seat, home, snapshotAt, deps.env ?? process.env);
+  const opRolePack = readOpRolePackBootPrompt(detection.seat);
   debug.log('dashboard.seat-boot', 'memory-import', {
     seat: detection.seat,
     chars: memoryImport.length,
@@ -375,12 +379,19 @@ function buildCardMessages(cwd: string, deps: SeatBootDeps): CardEntry {
     unknown: memoryImport.includes('- 현재 우선순위: 미관측'),
     updatedAt: snapshotAt.toISOString(),
   });
+  // SEAT-ROLE-CARD-AND-SELF-RETRO device 1 — the seat's own role card (or the instruction to write it) rides with the boot card.
+  const roleCard = buildSeatRoleCardBlock(detection.seat, seatDir);
+  debug.log('dashboard.seat-boot', 'role-card', { seat: detection.seat, state: roleCard.state, truncated: roleCard.truncated, chars: roleCard.text.length });
   const content =
+    (detection.seat === 'OP' ? 'OP 첫 턴: PR 목록은 과거 스냅샷이다. 진행 중 PR을 말하기 전에 현재 GitHub 정본을 다시 확인하고, 조회 실패면 확인 불가로 말하라.\n' : '') +
     `## 자리 부트 카드 — 너는 이 작업 디렉터리의 ${detection.seat} 자리에서 일한다\n` +
     `(판정: ${detection.source === 'cwd' ? `cwd 의 /seats/${detection.seat}` : 'COORD_ID'} · 세션 시작 스냅샷 ${at} · 이후 바뀐 값은 다시 조회하라)\n` +
     `사람이 다른 일을 먼저 시키지 않았다면, 첫 답에서 자리 이름·'자리 역할' 절의 역할·안 읽은 우편 수를 각각 명시하고 처리할 일을 제안하라. 역할이 미관측이면 추측하지 말고 미관측이라고 말하라.\n` +
     (recall ? `${recall}\n` : '') +
     `${memoryImport}\n` +
+    (opHandoff ? `${opHandoff}\n` : '') +
+    (opRolePack ? `${opRolePack}\n` : '') +
+    `${roleCard.text}\n` +
     '\n' +
     `${SEAT_INTENT_ESCALATION_FLOW}\n\n` +
     card;

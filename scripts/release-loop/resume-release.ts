@@ -733,7 +733,9 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     // The one JSON exception is safe only while both the production reader and a test name this exact file at the tip.
     // A renamed, computed or unreadable reader returns to the full gate instead of trusting a stale dependency map.
     const reader = tree.read('scripts/release-loop/known-issues-node.ts');
-    if (!reader || !/readFileSync\(join\(import\.meta\.dir,\s*['"]known-issues-0\.2\.33-approved\.json['"]\)/.test(reader)) {
+    const bundledReader = /^import\s+[$\w]+\s+from\s+['"]\.\/known-issues-0\.2\.33-approved\.json['"]/m;
+    const historicReader = /readFileSync\(join\(import\.meta\.dir,\s*['"]known-issues-0\.2\.33-approved\.json['"]\)/;
+    if (!reader || (!bundledReader.test(reader) && !historicReader.test(reader))) {
       return fallback('known-issues JSON reader not statically verified — full gate');
     }
     const readerClosure = testsReachingChanged(tree, ['scripts/release-loop/known-issues-node.ts'], tests, { cliEntries: CLI_ENTRIES });

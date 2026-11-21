@@ -7,7 +7,7 @@ const { shouldRunCliEntry } = await import('../src/harness/progress-worker-runti
 if (!shouldRunCliEntry()) {
   // 워커 문맥: 이 스레드는 하위 조회만 한다 — 대시보드·provider 선택·명령 디스패치를 다시 걸면 관측이 멈춘다.
 } else if (process.argv.length === 3 && (process.argv[2] === '--version' || process.argv[2] === '-V')) {
-  // `0.3.27 <sha>` (official) · `0.3.28-dev.0 261117_1925 <sha>` (dev: build commit time, KST) — the sha stays last.
+  // `<version> <YYMMDD_HHMM in KST> <sha>`. The stamp is omitted for legacy packages without build time.
   const { cliVersionLine } = await import('../src/version/build-stamp.ts');
   console.log(cliVersionLine());
 } else {

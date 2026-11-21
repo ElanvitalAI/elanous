@@ -135,6 +135,10 @@ test('journal lookup gives ids: a pane named by title or id resolves to the same
   expect(await local.lookup('nope')).toBeUndefined();
 });
 
+test('journal target carries its tab id for tab-scoped policy', async () => {
+  expect((await journalControl(journal).lookupWithTab('pn-1'))?.tab).toBe('tb-1');
+});
+
 test('through the journal, an id rule and a name rule both authorize; a rule naming nothing real does not', async () => {
   for (const rule of [{ workspace: 'ws-1', pane: 'pn-1' }, { workspace: 'HQ', pane: 'main' }]) {
     const dir = stateDir();

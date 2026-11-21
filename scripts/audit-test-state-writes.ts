@@ -54,9 +54,18 @@ type AuditFinding = {
   staticSafety: StaticSafetyClassification;
 };
 
+/** fs copy reads argument 0 and writes argument 1; symlink creates only argument 1; rename mutates both paths. */
+function writeTargets(name: string, node: ts.CallExpression | ts.NewExpression): readonly ts.Expression[] {
+  const args = node.arguments ?? [];
+  if (['copyFile', 'copyFileSync', 'symlink', 'symlinkSync'].includes(name)) return args[1] ? [args[1]] : [];
+  if (name === 'rename' || name === 'renameSync') return args.slice(0, 2);
+  return args[0] ? [args[0]] : [];
+}
+
 function formatWriterPattern(name: string, node: ts.CallExpression | ts.NewExpression, source: ts.SourceFile): string {
-  const first = node.arguments?.[0];
-  const target = first ? first.getText(source).replace(/\s+/g, ' ').slice(0, 100) : 'indirect store or override';
+  const targets = writeTargets(name, node);
+  const target = targets.length ? targets.map((arg) => arg.getText(source).replace(/\s+/g, ' ').slice(0, 100)).join(' -> ')
+    : 'indirect store or override';
   return `${name}(${target})`;
 }
 
@@ -133,8 +142,15 @@ function writerIsolation(source: ts.SourceFile, writer: ts.CallExpression | ts.N
     seen.add(name);
     return `(${expand(variables.get(name)!)})`;
   });
-  const argumentsText = writer.arguments?.map((argument) => argument.getText(source)).join(' ') ?? '';
-  return { ...classifyStaticIsolation(expand(argumentsText)), realHomeTarget: realHomeTarget(source, writer) };
+  const targets = writeTargets(name, writer).map((argument) => {
+    seen.clear();
+    return classifyStaticIsolation(expand(argument.getText(source)));
+  });
+  return {
+    signals: [...new Set(targets.flatMap(({ signals }) => signals))],
+    safety: targets.length > 0 && targets.every(({ safety }) => safety === 'isolated') ? 'isolated' : 'manual-review',
+    realHomeTarget: realHomeTarget(source, writer, name),
+  };
 }
 
 /** Lexically nearest declaration of `name` visible before `at` (same file-wide name reused across tests must not leak). */
@@ -154,10 +170,10 @@ function scopedInitializer(source: ts.SourceFile, at: ts.Node, name: string): ts
   return undefined;
 }
 
-/** Only the target path (first argument) counts — written content may mention homedir() as fixture text. */
-function realHomeTarget(source: ts.SourceFile, writer: ts.CallExpression | ts.NewExpression): boolean {
-  const target = writer.arguments?.[0];
-  if (!target) return false;
+/** Only paths changed by the call count; source data and symlink target text may mention homedir() without writing it. */
+function realHomeTarget(source: ts.SourceFile, writer: ts.CallExpression | ts.NewExpression, name: string): boolean {
+  const targets = writeTargets(name, writer);
+  if (!targets.length) return false;
   const seen = new Set<string>();
   const expand = (node: ts.Node, text: string): string => text.replace(/\b[A-Za-z_$][\w$]*\b/g, (name) => {
     if (seen.has(name)) return name;
@@ -166,8 +182,11 @@ function realHomeTarget(source: ts.SourceFile, writer: ts.CallExpression | ts.Ne
     seen.add(name);
     return `(${expand(initializer, initializer.getText(source))})`;
   });
-  const expanded = expand(target, target.getText(source));
-  return REAL_HOME_TARGET.test(expanded) && classifyStaticIsolation(expanded).safety !== 'isolated';
+  return targets.some((target) => {
+    seen.clear();
+    const expanded = expand(target, target.getText(source));
+    return REAL_HOME_TARGET.test(expanded) && classifyStaticIsolation(expanded).safety !== 'isolated';
+  });
 }
 
 export type CandidateClassification = {

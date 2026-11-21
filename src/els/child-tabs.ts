@@ -179,6 +179,7 @@ export function createChildTabs(deps: ChildTabsDeps) {
   };
 
   return {
+    workspaceOf(id: string): string | undefined { return children.get(id)?.ws; },
     start(input: ChildStart) {
       if (!input.id || !input.ws || !input.label) return refuse('start needs id, ws and label');
       if (children.has(input.id)) return refuse(`${input.id} already started`);

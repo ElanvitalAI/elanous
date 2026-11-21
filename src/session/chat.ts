@@ -527,7 +527,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     turnVolatileBlocks.length = 0;
   }
   const longAnswer = /설계|아키텍처|RFC|상세|자세히|보고서|design|architecture|detailed|comprehensive/i.test(opts.userText);
-  const outputTokens = llmOpts?.maxTokens ?? resolveDefaultOutputTokens(llmOpts?.model ?? provider.defaultModel, llmOpts?.usageRole, longAnswer);
+  // usageRole 'main'(일반 턴)은 ModelRole 예산 구분이 아니다 — 기본 버킷(4096, longAnswer 8192)을 그대로 쓰도록 undefined 로 좁힌다(타입만 · 의미 변경 0).
+  const outputTokens = llmOpts?.maxTokens ?? resolveDefaultOutputTokens(llmOpts?.model ?? provider.defaultModel, llmOpts?.usageRole === 'main' ? undefined : llmOpts?.usageRole, longAnswer);
   let finishReason: string | undefined;
 
   // 2) Assemble, trim, call. When images are attached for THIS turn,

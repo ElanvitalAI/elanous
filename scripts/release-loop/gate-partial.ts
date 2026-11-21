@@ -5,6 +5,7 @@
 // GATE-REUSE-BY-DIFF (0.2.25): a code change no longer forces the full sweep — with the tip's import closure
 // (gate-closure.ts) the plan adds every test that can reach a changed file, and every test whose closure is opaque.
 // `release resume --from gate` now plans this by default when the tip moved (`--no-partial` = full gate).
+import { findElanousRepoRoot } from '../../src/code-edit/system-file-guard.js';
 import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -219,7 +220,7 @@ export type GateAppendReceiptCosts = { partialMs: number; fullMs: number; source
 
 const DEPENDENCY_LAYER_FILE = /(?:^|\/)(?:bun\.lock(?:b)?|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|tsconfig(?:\.[^/]+)?\.json|Dockerfile)$/i;
 const VERDICT_AFFECTING_FILE = /^(?:scripts\/release-loop\/(?:gate-[^/]+\.ts|resume-release\.ts|node-verdict\.ts)|src\/release-loop\/gate-[^/]+\.ts|graphs\/release\/(?:recipes|release-policies)\.yaml)$/;
-const RELEASE_GRAPH_MANIFEST = loadReleaseGraphManifest(join(import.meta.dir, '../../graphs/release/plugin.json'));
+const RELEASE_GRAPH_MANIFEST = loadReleaseGraphManifest(join(findElanousRepoRoot(import.meta.dir) ?? join(import.meta.dir, '../..'), 'graphs/release/plugin.json'));
 
 export function selectGateAppendRecheckEdge(input: {
   changedFiles: readonly string[];

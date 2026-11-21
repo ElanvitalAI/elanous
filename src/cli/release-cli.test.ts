@@ -2456,7 +2456,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
         ok: false, health: 200, healthOk: true, app: 404, testUniverse: true, pid: 12345,
         ownPidStopped: true, forcedKill: false, exitCode: 0 }), stderr: '' };
       if (c === 'curl') return notesCurl(a) ?? { status: 0, stdout: 'installer', stderr: '' };
-      if (a[0] === '--version') return { status: 0, stdout: '0.1.1 abc', stderr: '' };
+      if (a[0] === '--version') return { status: 0, stdout: `0.1.1 261121_0855 ${'a'.repeat(40)}`, stderr: '' };
       return stateOk(a);
     };
     const result = await verifyRelease({ version: '0.1.1', log: line => lines.push(line) }, run);
@@ -2488,7 +2488,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
       if (command.endsWith('/bin/elanous') && args[0] === 'nexus' && args[1] === '--status')
         return { status: 0, stdout: '  status    not running\n', stderr: '' };
       if (command === 'curl') return notesCurl(args) ?? { status: 0, stdout: 'installer', stderr: '' };
-      if (args[0] === '--version') return { status: 0, stdout: '0.1.1 cafe\n', stderr: '' };
+      if (args[0] === '--version') return { status: 0, stdout: `0.1.1 261121_0855 ${'a'.repeat(40)}\n`, stderr: '' };
       return stateOk(args);
     };
     try {
@@ -2520,7 +2520,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
     const verifyRunner: Runner = (command, args) => {
       verifyCalls.push({ command, args });
       if (command === 'curl') return notesCurl(args) ?? { status: 0, stdout: 'installer', stderr: '' };
-      return args[0] === '--version' ? { status: 0, stdout: '0.1.1 abc', stderr: '' } : stateOk(args);
+      return args[0] === '--version' ? { status: 0, stdout: `0.1.1 261121_0855 ${'a'.repeat(40)}`, stderr: '' } : stateOk(args);
     };
     await verifyRelease({ version: '0.1.1', log: () => {} }, verifyRunner);
     expect(verifyCalls.find((call) => call.command === 'bash')).toEqual({ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path', '--no-setup'] });
@@ -2589,7 +2589,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
     const run: Runner = (c, a) => {
       calls.push({ command: c, args: a });
       if (c === 'curl') { const n = notesCurl(a); if (n) return n; urls.push(String(a[1])); return { status: 0, stdout: 'echo installer', stderr: '' }; }
-      if (a[0] === '--version') return { status: 0, stdout: '0.1.1 cafe\n', stderr: '' };
+      if (a[0] === '--version') return { status: 0, stdout: `0.1.1 261121_0855 ${'a'.repeat(40)}\n`, stderr: '' };
       return stateOk(a);
     };
     const r = await verifyRelease({ version: '0.1.1', log: () => {} }, run);
@@ -2600,7 +2600,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
     expect(calls.find((call) => call.command === 'bash' && call.args[0] === '-s')?.args).toContain('--no-setup');
     expect(calls.some((call) => call.args[0] === 'nexus' && call.args[1] === '--stop')).toBe(true);
     expect(calls.some((call) => call.args[0] === 'nexus' && call.args[1] === '--status')).toBe(true);
-    const wrong: Runner = (c, a) => (c === 'curl' && notesCurl(a) ? notesCurl(a)! : a[0] === '--version' ? { status: 0, stdout: '0.1.0 cafe', stderr: '' } : stateOk(a));
+    const wrong: Runner = (c, a) => (c === 'curl' && notesCurl(a) ? notesCurl(a)! : a[0] === '--version' ? { status: 0, stdout: `0.1.0 261121_0855 ${'a'.repeat(40)}`, stderr: '' } : stateOk(a));
     expect((await verifyRelease({ version: '0.1.1', log: () => {} }, wrong)).ok).toBe(false);
   });
 
@@ -2609,7 +2609,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
     const saved = { s: process.env.ELANOUS_STATE_DIR, x: process.env.XDG_DATA_HOME };
     process.env.ELANOUS_STATE_DIR = '/real/state'; process.env.XDG_DATA_HOME = '/real/xdg';
     try {
-      const run: Runner = (c, a, cwd, o) => { if (o?.env) seen.push(o.env); return c === 'curl' ? (notesCurl(a) ?? { status: 0, stdout: 'x', stderr: '' }) : a[0] === '--version' ? { status: 0, stdout: '0.1.1 c', stderr: '' } : stateOk(a); };
+      const run: Runner = (c, a, cwd, o) => { if (o?.env) seen.push(o.env); return c === 'curl' ? (notesCurl(a) ?? { status: 0, stdout: 'x', stderr: '' }) : a[0] === '--version' ? { status: 0, stdout: `0.1.1 261121_0855 ${'a'.repeat(40)}`, stderr: '' } : stateOk(a); };
       await verifyRelease({ version: '0.1.1', log: () => {} }, run);
     } finally {
       if (saved.s === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = saved.s;
@@ -2620,7 +2620,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
   });
 
   test('--version 이 맞아도 상태 왕복(기억 · 로그)이 안 되면 ok 가 아니다', async () => {
-    const base: Runner = (c, a) => (c === 'curl' ? (notesCurl(a) ?? { status: 0, stdout: 'echo installer', stderr: '' }) : a[0] === '--version' ? { status: 0, stdout: '0.1.1 cafe\n', stderr: '' } : stateOk(a));
+    const base: Runner = (c, a) => (c === 'curl' ? (notesCurl(a) ?? { status: 0, stdout: 'echo installer', stderr: '' }) : a[0] === '--version' ? { status: 0, stdout: `0.1.1 261121_0855 ${'a'.repeat(40)}\n`, stderr: '' } : stateOk(a));
     const noMemory: Runner = (c, a, cwd, o) => (a[0] === 'memory' && a[1] === 'search' ? { status: 0, stdout: 'no matches', stderr: '' } : base(c, a, cwd, o));
     const oldLogs: Runner = (c, a, cwd, o) => (a[0] === 'logs' ? { status: 0, stdout: '{"id":1,"ts_ms":1}\n', stderr: '' } : base(c, a, cwd, o));
     expect((await verifyRelease({ version: '0.1.1', log: () => {} }, base)).ok).toBe(true);
@@ -2716,7 +2716,7 @@ describe('release verify — 노트 페이지가 문서 사이트에 있나(🅕
     const mk = (code: string): Runner => (c, a) => {
       if (c === 'curl' && a.includes('-w')) { pages.push(String(a[a.length - 1])); return { status: 0, stdout: code, stderr: '' }; }
       if (c === 'curl') return { status: 0, stdout: 'echo installer', stderr: '' };
-      return a[0] === '--version' ? { status: 0, stdout: '0.2.2 cafe\n', stderr: '' } : stateOk(a);
+      return a[0] === '--version' ? { status: 0, stdout: `0.2.2 261121_0855 ${'a'.repeat(40)}\n`, stderr: '' } : stateOk(a);
     };
     const ok = await verifyRelease({ version: '0.2.2', log: () => {} }, mk('200'));
     expect(ok.ok).toBe(true);

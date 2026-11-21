@@ -123,12 +123,19 @@ describe('Wave 4 · pipeline Layer 3 integration', () => {
     expect(r.diagnostics.layer3SummaryApplied).toBe(1);
     expect(r.diagnostics.layer3SummaryModel).toBe('mock-haiku');
     expect(r.diagnostics.layer3SummaryChars).toBe('mock summary text'.length);
-    // 1 summary system message + last 4 turns
-    expect(r.messages).toHaveLength(5);
+    // 1 summary system message + COMPACT P0 structurally preserved slice users (3) + last 4 turns
+    expect(r.messages).toHaveLength(8);
     expect(r.messages[0]?.role).toBe('system');
     expect(r.messages[0]?.content).toContain('mock summary text');
+    // ★ COMPACT P0 (OP #123867) — slice users (msg 1/3/5) survive verbatim right after the summary.
+    expect(r.messages[1]?.role).toBe('user');
+    expect(r.messages[1]?.content).toBe('msg 1');
+    expect(r.messages[2]?.role).toBe('user');
+    expect(r.messages[2]?.content).toBe('msg 3');
+    expect(r.messages[3]?.role).toBe('user');
+    expect(r.messages[3]?.content).toBe('msg 5');
     // Tail preserved verbatim
-    expect(r.messages[4]?.content).toBe('msg 10');
+    expect(r.messages[7]?.content).toBe('msg 10');
   });
 
   test('Layer 3 returning null leaves Layer 1+2 result intact', async () => {
@@ -222,6 +229,14 @@ describe('Wave 4 · pipeline Layer 3 integration', () => {
     });
     // First message is the summary (anchor NOT pinned) — original behavior.
     expect(r.messages[0]?.role).toBe('system');
-    expect(r.messages).toHaveLength(5);
+    // ★ COMPACT P0 (OP #123867) — 8 = 1 summary + 3 preserved slice users + 4 tail.
+    expect(r.messages).toHaveLength(8);
+    const userTexts = r.messages
+      .filter(m => m.role === 'user')
+      .map(m => (typeof m.content === 'string' ? m.content : ''));
+    expect(userTexts).toContain('msg 1');
+    expect(userTexts).toContain('msg 3');
+    expect(userTexts).toContain('msg 5');
+    expect(userTexts).toHaveLength(5); // 3 preserved slice users + 2 tail users (msg 7, msg 9)
   });
 });

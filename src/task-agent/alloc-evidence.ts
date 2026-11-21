@@ -27,3 +27,17 @@ export function readCardAllocation(cardId: string, nowEpochSeconds: number, ssh:
     return result.status === 0 ? activeCardAllocation(result.stdout, cardId, nowEpochSeconds) : null;
   } catch { return null; }
 }
+
+/** Observe the card's declared target path on its allocated host — the only authority for ⑥ targetHostBound (r5 · JUD hold-39396-6efcfcfe6614).
+ *  A live allocation plus local path existence must NOT synthesize a binding: a probe that cannot confirm the path stays null (UNMEASURED). */
+export function observeTargetOnAllocatedHost(card: { project?: { target?: unknown } } | null,
+  allocation: ReturnType<typeof activeCardAllocation>,
+  ssh: (host: string, command: string, timeoutMs: number) => { status: number | null; stdout: string }): boolean | null {
+  const target = typeof card?.project?.target === 'string' && card.project.target ? card.project.target : null;
+  if (allocation === null || target === null) return null;
+  try {
+    // POSIX 단일 인용 리터럴(' → '\'') — JSON.stringify 따옴표는 셸 이스케이프가 아니다(r6 · JUD hold-39396-b626 mustFix).
+    const literal = `'${target.replaceAll("'", String.raw`'\''`)}'`;
+    return ssh(allocation.host, `test -e ${literal}`, 10_000).status === 0 ? true : null;
+  } catch { return null; }
+}

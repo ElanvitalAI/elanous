@@ -4,10 +4,11 @@ import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { lastJsonObject } from '../../src/graph-runner/runner-primitives.js';
 import type { GraphRunState } from '../../src/graph-runner/runner-types.js';
 import { join } from 'node:path';
+import APPROVED_0233_INPUT from './known-issues-0.2.33-approved.json';
 import { emitNodeResult, readGraphContext, runCommand, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
 
 const FALLBACK = 'Known issues have been reported for this release.';
-const APPROVED_0233_INPUT = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8')) as Issue[];
+// Bun embeds the static JSON import when bundling the CLI entrypoint.
 const APPROVED_0233_BY_ID = new Map(APPROVED_0233_INPUT.map((issue) => [issue.id, issue.note]));
 const APPROVED_0233_BULLETS = new Map([
   ['KI-0233-REGRESSIONS · 0.2.33: 사용자 영향은 bot routine dry-run 루틴 사용 금지. 격리 시험은 검증되지 않았으며 0.2.34에서 복원·재검증한다.', 'Bot routine dry runs must not be used in this release.'],

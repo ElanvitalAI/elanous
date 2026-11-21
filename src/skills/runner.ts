@@ -429,6 +429,8 @@ export interface AgentBatchStatusInfo {
 }
 
 export interface ExecuteSkillOpts {
+  /** Conversation selected by the host, never derived from model tool arguments. */
+  sessionId?: string;
   /** Override the provider (by name or model string). */
   modelOverride?: string;
   temperature?: number;
@@ -1338,7 +1340,7 @@ async function executeSkillUnrecorded(
     // NT-C1b-2 — shell-runner LLM tools.
     ShellList:     async (a) => dispatchShellList(a, getShellRegistry()),
     ShellPoll:     async (a) => dispatchShellPoll(a, getShellRegistry()),
-    ShellKill:     (a) => dispatchShellKill(a, getShellRegistry()),
+    ShellKill:     (a) => dispatchShellKill(a, getShellRegistry(), opts.sessionId),
     TerminalModalList:    (a) => dispatchTerminalModalList(a),
     TerminalModalObserve: (a) => dispatchTerminalModalObserve(a),
     TerminalModalFocus:   (a) => dispatchTerminalModalFocus(a),

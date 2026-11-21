@@ -50,20 +50,22 @@ export interface ChatEventBus {
   /** Subscribe to events for `sessionId`. Returns an unsubscribe
    *  function the caller MUST invoke on stream close to avoid a
    *  reference leak. */
-  subscribe(sessionId: string, listener: ChatBusListener): () => void;
+  subscribe(sessionId: string, listener: ChatBusListener, onClose?: () => void): () => void;
+  /** Revoke all current observers for a deleted session before its id can be reused. */
+  closeSession(sessionId: string): void;
   /** Diagnostic — current subscriber count for `sessionId`. */
   subscriberCount(sessionId: string): number;
 }
 
 export function createChatEventBus(): ChatEventBus {
-  const listeners = new Map<string, Set<ChatBusListener>>();
+  const listeners = new Map<string, Set<{ listener: ChatBusListener; onClose?: () => void }>>();
   return {
     publish(sessionId, event): void {
       const set = listeners.get(sessionId);
       if (!set || set.size === 0) return;
-      for (const fn of set) {
+      for (const entry of set) {
         try {
-          fn(event);
+          entry.listener(event);
         } catch {
           // Bus must not let one bad listener break the others.
           // Subscribers that throw simply drop the event; the SSE
@@ -71,19 +73,28 @@ export function createChatEventBus(): ChatEventBus {
         }
       }
     },
-    subscribe(sessionId, listener): () => void {
+    subscribe(sessionId, listener, onClose): () => void {
       let set = listeners.get(sessionId);
       if (!set) {
         set = new Set();
         listeners.set(sessionId, set);
       }
-      set.add(listener);
+      const entry = { listener, onClose };
+      set.add(entry);
       return () => {
         const cur = listeners.get(sessionId);
         if (!cur) return;
-        cur.delete(listener);
+        cur.delete(entry);
         if (cur.size === 0) listeners.delete(sessionId);
       };
+    },
+    closeSession(sessionId): void {
+      const set = listeners.get(sessionId);
+      if (!set) return;
+      listeners.delete(sessionId);
+      for (const entry of set) {
+        try { entry.onClose?.(); } catch { /* one observer cannot hold the others open */ }
+      }
     },
     subscriberCount(sessionId): number {
       return listeners.get(sessionId)?.size ?? 0;

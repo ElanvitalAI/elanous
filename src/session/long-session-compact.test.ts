@@ -250,8 +250,17 @@ describe('O4 core — compaction keeps audit rows as they are (Terra #38156)', (
     expect(hasAuditInUser(after)).toBe(false);
     // The kept tail is the stored rows as they were, in order (an audit row inside it stays in place).
     const summaryAt = after.findIndex(row => row.content.startsWith(SUMMARY_OPEN));
-    const tail = after.slice(summaryAt + 1).map(row => JSON.stringify(row));
-    expect(before.map(row => JSON.stringify(row)).slice(-tail.length)).toEqual(tail);
+    // ★ COMPACT P0(OP #123867) — 요약 뒤 «슬라이스의 모든 사람 user»가 원문 순서로
+    //   요약 바로 뒤에 재배치된다: [summary, 보존 user…, tail]. 꼬리 비교는 after 의
+    //   마지막 preserveLastN 행이 저장된 행·순서와 같은지로 하고, 그 앞 행은 전부
+    //   before 에 원문 그대로 존재하는 보존 user 인지 확인한다.
+    const afterRows = after.slice(summaryAt + 1).map(row => JSON.stringify(row));
+    const beforeRows = before.map(row => JSON.stringify(row));
+    const tailLen = CHAT_DEFAULTS.autoCompact.preserveLastN;
+    expect(afterRows.slice(-tailLen)).toEqual(beforeRows.slice(-tailLen));
+    const preserved = afterRows.slice(0, -tailLen);
+    expect(preserved.length).toBeGreaterThan(0);
+    for (const row of preserved) expect(beforeRows).toContain(row);
   });
 
   test('the codex request-size guard path (prepareOnly) shares the same role-preserving rewrite', async () => {

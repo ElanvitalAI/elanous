@@ -19,7 +19,7 @@ import {
 } from './codex-account.js';
 import { authStorePath, defaultCodexHome, isUnderTestRunner, listProviders, loadTokens, saveTokens } from './store.js';
 import { codexHealthCredential, isCodexUnauthorized } from './codex-account-health.js';
-import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaSignalCredits, readQuotaSignalUsedPercent, readQuotaSignalObservedAt, readQuotaSignalObservedAtRaw } from '../budget/codex-reset-credit-state.js';
+import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignalUsedPercent, readQuotaSignalSnapshot, createQuotaSignalDecisionReader, type QuotaSignalReader, type QuotaSignalSnapshot } from '../budget/codex-reset-credit-state.js';
 import { creditPaceStatus } from '../budget/codex-credit-pace.js';
 import { noteCodexBillingDecision, type CodexCreditSpendReason } from './codex-billing-route.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
@@ -240,8 +240,9 @@ export function _resetCodexRotationPinForTesting(): void {
  */
 function pinnedAccountExhausted(home: string, accountName: string): boolean {
   const now = Date.now();
-  if (readQuotaSignal(now, home) === true) return true;
-  const used = readQuotaSignalUsedPercent(now, home);
+  const quota = readQuotaSignalSnapshot(now, home);
+  if (quota.reached === true) return true;
+  const used = quota.usedPercent;
   if (typeof used !== 'number' || !Number.isFinite(used)) return false;
   // ⛔ 판정이 쓰는 «같은 자»를 쓴다 — 여기서 임계를 다시 지으면 핀과 판정이 갈린다.
   const threshold = codexAccountThresholdPercent(accountName, {
@@ -271,12 +272,11 @@ function inspectedQuotaPolicy(): ResolvedCodexQuotaPolicy {
 }
 
 /** 지금 계정의 크레딧 신호 — 판정 입력 두 칸. 신호를 이 계정에 귀속할 수 없으면 비운다(모른다). */
-function currentCreditsInput(home: string | undefined, now: number): { currentCreditBalance?: number; currentHasCredits?: boolean } {
-  if (!home) return {};
-  const c = readQuotaSignalCredits(now, home);
+function currentCreditsInput(quota: QuotaSignalSnapshot | undefined): { currentCreditBalance?: number; currentHasCredits?: boolean } {
+  if (!quota) return {};
   return {
-    ...(c.balance === undefined ? {} : { currentCreditBalance: c.balance }),
-    ...(c.hasCredits === undefined ? {} : { currentHasCredits: c.hasCredits }),
+    ...(quota.creditBalance === undefined ? {} : { currentCreditBalance: quota.creditBalance }),
+    ...(quota.hasCredits === undefined ? {} : { currentHasCredits: quota.hasCredits }),
   };
 }
 
@@ -343,7 +343,8 @@ function rotationCreditsGrant(candidates: readonly RotationCandidate[]): Rotatio
   }
 }
 
-function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessEnv = process.env): RotationCandidate[] {
+function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessEnv = process.env,
+  quotaRead: QuotaSignalReader = createQuotaSignalDecisionReader(now)): RotationCandidate[] {
   return listCodexAccountsInStore(path, now)
     .map((row) => {
       const stored = loadTokens(row.storeKey, path);
@@ -354,13 +355,14 @@ function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessE
       const home = stored?.codexHome
         ?? (row.storeKey === 'openai-codex' ? resolveCodexAccount({ CODEX_HOME: env.CODEX_HOME } as unknown as NodeJS.ProcessEnv).home : undefined); // CODEX_HOME 한 칸만(이름 계정 설정을 안 끼운다 · 🅢 #21079 의도) — unknown 단언: Next 타입은 ProcessEnv 에 NODE_ENV 를 필수로 더해 PWA 빌드가 깨졌다
       if (!home) return null;
-      const usedPercent = readQuotaSignalUsedPercent(now, home);
-      const credits = readQuotaSignalCredits(now, home);
+      const quota = quotaRead(home);
+      const usedPercent = quota.usedPercent;
+      const credits = { balance: quota.creditBalance, hasCredits: quota.hasCredits };
       return {
         name: row.name,
         storeKey: row.storeKey,
         home,
-        reached: readQuotaSignal(now, home),
+        reached: quota.reached,
         resetCreditAvailability: resetCreditAvailability(home, now),
         unhealthy: isCodexUnauthorized(path, row.storeKey, codexHealthCredential(stored?.tokens ?? {})),
         ...(usedPercent === undefined ? {} : { usedPercent }),
@@ -658,7 +660,7 @@ export function readCachedGrokQuota(): 'usable' | 'exhausted' | 'unknown' {
 
 export function inspectCodexRotation(
   env: NodeJS.ProcessEnv = process.env,
-  deps: { readonly storePath?: string; readonly now?: number } = {},
+  deps: { readonly storePath?: string; readonly now?: number; readonly quotaRead?: typeof readQuotaSignalSnapshot } = {},
 ): {
   readonly current: CodexAccountResolution;
   readonly currentHome: string | undefined;
@@ -683,6 +685,8 @@ export function inspectCodexRotation(
   readonly observedAtByHome: Readonly<Record<string, number>>;
   /** ⭐ 후보별 «판정 유효성» — false = 있지만 늙었다. */
   readonly freshByHome: Readonly<Record<string, boolean>>;
+  /** 후보별 신선한 브랜드 창 리셋 시각. 모르는 계정은 키가 없다. */
+  readonly resetsAtByHome: Readonly<Record<string, number>>;
   /** Pure rotation authority's account-availability evidence. */
   readonly reason: string;
   readonly candidateCount: number | undefined;
@@ -701,11 +705,14 @@ export function inspectCodexRotation(
   const enabled = rotationConfig.enabled;
   const currentHomeInfo = effectiveCodexHome(current, loadTokens(current.storeKey, path), env);
   const currentHome = currentHomeInfo.home;
-  const candidates = buildRotationCandidates(path, now, env);
+  const quotaRead = createQuotaSignalDecisionReader(now, deps.quotaRead);
+  const candidates = buildRotationCandidates(path, now, env, quotaRead);
   const currentSignalAttributable = signalAttributableToAccount(currentHomeInfo);
-  const currentReached = currentSignalAttributable && currentHome ? readQuotaSignal(now, currentHome) : undefined;
-  const currentUsedPercent = currentSignalAttributable && currentHome ? readQuotaSignalUsedPercent(now, currentHome) : undefined;
-  const currentCredits = currentCreditsInput(currentSignalAttributable ? currentHome : undefined, now);
+  const currentQuota = currentSignalAttributable && currentHome
+    ? quotaRead(currentHome) : undefined;
+  const currentReached = currentQuota?.reached;
+  const currentUsedPercent = currentQuota?.usedPercent;
+  const currentCredits = currentCreditsInput(currentQuota);
   const policy = inspectedQuotaPolicy();
   const rawThreshold = rotationThresholdFromConfig();
   const thresholdPercentByAccount = rotationThresholdsByAccountFromConfig();
@@ -715,21 +722,25 @@ export function inspectCodexRotation(
   // ⛔⭐ 나이는 «만료돼도» 낸다 — 「65분 전」과 「3일 전」은 다른 진단이다(리뷰 must-fix).
   const observedAtByHome: Record<string, number> = {};
   const freshByHome: Record<string, boolean> = {};
+  const resetsAtByHome: Record<string, number> = {};
   for (const c of candidates) {
-    const raw = readQuotaSignalObservedAtRaw(now, c.home);
+    const quota = quotaRead(c.home);
+    const raw = quota?.observedAtMs;
     if (raw !== undefined) observedAtByHome[c.home] = raw;
-    freshByHome[c.home] = readQuotaSignalObservedAt(now, c.home) !== undefined;
+    freshByHome[c.home] = quota?.fresh === true;
+    const resetsAt = quota?.resetsAtMs;
+    if (resetsAt !== undefined) resetsAtByHome[c.home] = resetsAt;
   }
   return {
     current, currentHome, currentReached, currentUsedPercent, policy,
     currentCreditBalance: currentSignalAttributable ? currentCredits.currentCreditBalance : candidates.find((c) => c.storeKey === current.storeKey)?.creditBalance,
     currentHasCredits: currentSignalAttributable ? currentCredits.currentHasCredits : candidates.find((c) => c.storeKey === current.storeKey)?.hasCredits,
-    currentObservedAt: currentHome ? readQuotaSignalObservedAtRaw(now, currentHome) : undefined,
-    currentSignalFresh: currentHome ? readQuotaSignalObservedAt(now, currentHome) !== undefined : false,
+    currentObservedAt: currentQuota?.observedAtMs,
+    currentSignalFresh: currentQuota?.fresh === true,
     explicit, enabled,
     // ⛔ 계정에 적용한 «실효» 임계 — 판정기가 실제로 쓴 값이다
     thresholdPercent: codexAccountThresholdPercent(current.name, { thresholdPercent: rawThreshold, thresholdPercentByAccount }),
-    candidates, observedAtByHome, freshByHome,
+    candidates, observedAtByHome, freshByHome, resetsAtByHome,
     knownAccountCount: listCodexAccountsInStore(path).length,
     reason: decision.reason, candidateCount: decision.candidateCount, accountThresholds: decision.accountThresholds, to: decision.to?.name,
     ...(decision.creditReserveHit ? { creditReserveHit: decision.creditReserveHit } : {}),
@@ -803,8 +814,10 @@ export function resolveCodexAccountForRun(
   const now = Date.now();
   const currentHomeInfo = effectiveCodexHome(current, loadTokens(current.storeKey, path), env);
   const currentHome = currentHomeInfo.home;
-  const candidates = buildRotationCandidates(path, now, env);
+  const quotaRead = createQuotaSignalDecisionReader(now);
+  const candidates = buildRotationCandidates(path, now, env, quotaRead);
   const currentSignalAttributable = signalAttributableToAccount(currentHomeInfo);
+  const currentQuota = currentSignalAttributable && currentHome ? quotaRead(currentHome) : undefined;
 
   const creditPace = rotationCreditPace(candidates, now);
   const creditsGrant = rotationCreditsGrant(candidates);
@@ -814,14 +827,14 @@ export function resolveCodexAccountForRun(
     // ⭐ 기본 ON — «명시적 false 일 때만» 꺼진다.
     enabled,
     disabledProvenance: rotationConfig.state,
-    currentReached: currentSignalAttributable && currentHome ? readQuotaSignal(now, currentHome) : undefined,
-    currentUsedPercent: currentSignalAttributable && currentHome ? readQuotaSignalUsedPercent(now, currentHome) : undefined,
+    currentReached: currentQuota?.reached,
+    currentUsedPercent: currentQuota?.usedPercent,
     resetCreditAvailability: resetCreditAvailability(currentHome, now),
     thresholdPercent: rotationThresholdFromConfig(),
     thresholdPercentByAccount: rotationThresholdsByAccountFromConfig(),
     creditsAllowed: creditsGrant.allowed,
     creditReserve: codexCreditReserveFromConfig(),
-    ...currentCreditsInput(currentSignalAttributable ? currentHome : undefined, now),
+    ...currentCreditsInput(currentQuota),
     candidates,
     balanceKey: runId,
     accountWeights: accountWeightsForHost(),

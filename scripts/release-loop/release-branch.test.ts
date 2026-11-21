@@ -339,7 +339,7 @@ test('RELEASE-APPEND-SCOPE-SKIP: export-check resume plans only the verified JSO
     };
     writeFileSync(runFile, JSON.stringify(savedRun));
     writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: old, failures: [] }));
-    const reader = "import { readFileSync } from 'node:fs'; import { join } from 'node:path'; export const issues = JSON.parse(readFileSync(join(import.meta.dir, 'known-issues-0.2.33-approved.json'), 'utf8'));";
+    const reader = "import issues from './known-issues-0.2.33-approved.json'; export { issues };";
     const files: Record<string, string> = {
       [TRACEABLE_RELEASE_JSON]: '[]',
       'scripts/release-loop/known-issues-node.ts': reader,

@@ -639,8 +639,11 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
       if (capped) return { ok: false, error: capped };
       // Presence is the contract: invalidly typed `at` values from the host
       // must still conflict with delaySeconds rather than silently disappear.
-      const hasAt = req.atProvided ?? req.at !== undefined;
-      const hasDelay = req.delaySeconds !== undefined;
+      // UX #115497 — strict-mode 호스트가 optional 필드를 빈 값(at:""/null · delaySeconds:0/null)으로 채워 보낸다.
+      // 빈 값·0 은 «미지정»이다. 실값(비어 있지 않은 at · 0 이 아닌 delaySeconds)만 존재로 센다.
+      const atBlank = req.at === undefined || req.at === null || (typeof req.at === 'string' && req.at.trim() === '');
+      const hasAt = (req.atProvided ?? req.at !== undefined) && !atBlank;
+      const hasDelay = req.delaySeconds !== undefined && req.delaySeconds !== null && req.delaySeconds !== 0;
       if (hasAt && hasDelay) {
         const key = requestKey ?? canonicalToolArgs(req as Record<string, unknown>);
         if (turnId !== null) {
@@ -793,7 +796,7 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
         reason: typeof args.reason === 'string' ? args.reason : '',
         atProvided,
         ...(atProvided ? { at: args.at } : {}),
-        ...(typeof args.delaySeconds === 'number' ? { delaySeconds: args.delaySeconds } : {}),
+        ...(typeof args.delaySeconds === 'number' && args.delaySeconds !== 0 ? { delaySeconds: args.delaySeconds } : {}),
         ...(typeof args.repeatMinutes === 'number' ? { repeatMinutes: args.repeatMinutes } : {}),
       };
       const result = scheduler.schedule(request, canonicalToolArgs(args));

@@ -2,14 +2,14 @@
 // Gate: ELANOUS_ELS_SOCKET — the socket of the els server this daemon runs inside. No socket → no tool.
 // 우회 0: every action runs through createControl (control-allow.json · control-audit.jsonl · close human
 // confirmation). The tool's only executor is requestEls over the els socket — it never touches panes directly.
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { requestEls } from './client.js';
 import { audit, createControl, type ControlAction, type ControlTarget, type IdResolver, type StructPayload } from './control.js';
 import type { ElsRequest } from './server.js';
 
 export const ELS_CONTROL_TOOL_NAME = 'ElsControl';
-export const ELS_CONTROL_ACTIONS = ['ls', 'status', 'read', 'new', 'do', 'send', 'close', 'rename', 'move', 'focus'] as const;
+export const ELS_CONTROL_ACTIONS = ['ls', 'status', 'read', 'new', 'do', 'send', 'stop', 'close', 'rename', 'move', 'focus'] as const;
 export type ElsControlAction = (typeof ELS_CONTROL_ACTIONS)[number];
 
 /** Door action per tool action. focus: the door vocabulary + server focus pointer land in the follow-up
@@ -20,7 +20,9 @@ const DOOR_ACTION: Record<ElsControlAction, ControlAction | null> = {
   read: 'read',
   new: 'new',
   do: 'do',
-  send: 'input',
+  // Tool-authored operations need the stricter do gate; the server independently authenticates input.
+  send: 'do',
+  stop: 'do',
   close: 'close',
   rename: 'rename',
   move: 'move',
@@ -47,6 +49,7 @@ export interface ElsControlResult {
   readonly ok: boolean;
   readonly exitCode: number;
   readonly message: string;
+  readonly queued?: number;
   readonly code?: string;
   readonly reason?: string;
   readonly request?: ElsRequest;
@@ -71,7 +74,7 @@ function tryParse(message: string): unknown {
 
 
 interface JournalRow { readonly id: string; readonly name?: string; readonly workspaceId?: string }
-interface ListedPane { readonly pane: string; readonly tab: string; readonly kind?: string }
+interface ListedPane { readonly pane: string; readonly tab: string; readonly kind?: string; readonly cwd?: string }
 interface Listing { readonly workspaces: readonly JournalRow[]; readonly tabs: readonly JournalRow[]; readonly panes: readonly ListedPane[] }
 
 /** Pane kinds that take typed prose, not shell lines. Every other kind (pty, shell, other, remote, unknown) is
@@ -119,7 +122,7 @@ function refusal(action: string, code: string, reason: string, stateDir: string,
 }
 
 /** Door action → els wire request. The executor runs only when the door allowed the payload. */
-function wireRequest(input: { action: ControlAction; target: ControlTarget; text?: string }, title?: string): ElsRequest {
+function wireRequest(input: { action: ControlAction; target: ControlTarget; text?: string }, title?: string, cwd?: string): ElsRequest {
   const struct = (input as { struct?: StructPayload }).struct;
   switch (input.action) {
     case 'list':
@@ -132,7 +135,7 @@ function wireRequest(input: { action: ControlAction; target: ControlTarget; text
       return {
         op: 'new',
         ws: input.target.workspace,
-        cwd: '',
+        cwd: typeof cwd === 'string' ? cwd : '',
         command: (input.text ?? '').split(/\s+/).filter(Boolean),
         ...(title ? { title } : {}),
       };
@@ -190,7 +193,7 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
     if (!paneId) return refusal(action, 'pane-required', 'pane id is required', deps.stateDir, '');
     let listed: { readonly exitCode: number; readonly message: string };
     try {
-      listed = await requestEls(deps.socketPath, { op: 'ls' });
+      listed = await requestEls(join(dirname(deps.socketPath), 'ctl.sock'), { op: 'ls' });
     } catch (error) {
       return refusal(action, 'lookup-failed', `journal lookup failed: ${error instanceof Error ? error.message : String(error)}`, deps.stateDir, paneId);
     }
@@ -223,16 +226,19 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
     stateDir: deps.stateDir,
     ...(resolver ? { resolve: resolver } : {}),
     execute: async (input) => {
-      sent = wireRequest(input, title);
-      return requestEls(deps.socketPath, sent);
+      sent = action === 'stop' ? { op: 'interrupt', pane: input.target.pane }
+        : action === 'send' ? { op: 'input-line', pane: input.target.pane, text: input.text ?? '', from: 'ElsControl' }
+        : wireRequest(input, title, resolved?.listing.panes.find((pane) => pane.pane === paneId)?.cwd);
+      return requestEls(join(dirname(deps.socketPath), 'ctl.sock'), sent);
     },
   });
   const outcome = await control.run({
     principal: { id: 'eln:tool', kind: 'eln' },
-    from: ELS_CONTROL_TOOL_NAME,
+    from: action === 'stop' ? `${ELS_CONTROL_TOOL_NAME}:stop` : ELS_CONTROL_TOOL_NAME,
     action: doorAction,
-    target,
-    ...(text ? { text } : {}),
+    // stop sends a fixed Escape, not a shell command; it still needs the do allow rule and server input gate.
+    target: action === 'stop' ? { ...target, shell: false } : target,
+    ...(action === 'stop' ? {} : text ? { text } : {}),
     ...(struct ? { struct } : {}),
     ...(confirm !== undefined ? { confirm } : {}),
   });
@@ -249,7 +255,7 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
       message: outcome.message,
     };
   }
-  const allowed = outcome as { exitCode?: number; message?: string };
+  const allowed = outcome as { exitCode?: number; message?: string; queued?: number };
   const exitCode = allowed.exitCode ?? 0;
   const message = allowed.message ?? '';
   const data = action === 'ls' ? tryParse(message) : undefined;
@@ -260,6 +266,7 @@ export async function runElsControl(args: unknown, deps: ElsControlDeps): Promis
     ok: exitCode === 0,
     exitCode,
     message,
+    ...(allowed.queued !== undefined ? { queued: allowed.queued } : {}),
     ...(sent ? { request: sent } : {}),
     ...(data !== undefined ? { data } : {}),
   };
@@ -284,7 +291,7 @@ export function buildElsControlTool(): LLMToolSpec {
   return {
     name: ELS_CONTROL_TOOL_NAME,
     description:
-      'ELS panes·tabs 제어 — 모든 동작이 els 제어 문(control-allow.json 허용목록 · 감사 · close 사람 확인)을 경유합니다. 결과는 구조 JSON. 동작: ls·status·read·new·do·send·close·rename·move·focus(focus는 후속 델타).',
+      'ELS panes·tabs 제어 — 모든 동작이 els 제어 문(control-allow.json 허용목록 · 감사 · close 사람 확인)을 경유합니다. 결과는 구조 JSON. 동작: ls·status·read·new·do·send·stop(중단 키 요청; 결과는 read로 확인)·close·rename·move·focus(focus는 후속 델타).',
     parameters: {
       type: 'object',
       properties: {

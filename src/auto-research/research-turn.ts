@@ -1,9 +1,12 @@
 import { streamLLM, type LLMOpts, type LLMProvider } from '../llm.js';
+import type { ResearchSocialNote, ResearchSourceUsage } from '../core-turn/types.js';
 import { invokeResearchAxes } from '../research-bridge/index.js';
 import { RESEARCH_TURN_DEADLINE_STOP_ERROR, RESEARCH_TURN_FINAL_ANSWER_DEADLINE_MS } from '../core-turn/research-policy.js';
 import { invokeResearch } from '../research-bridge/invoke.js';
 import type { AxisFanoutDeps, AxisFanoutResult } from '../research/axis-fanout.js';
 import { formatResearchEvidenceAttribution, researchEvidenceSourceUrls } from '../research/evidence-attribution.js';
+import { conatusPackEvidence, koreanRouteSymbols, type ConatusPackEvidenceDeps } from '../research/conatus-pack-evidence.js';
+import { socialEvidence, type SocialEvidenceDeps } from '../research/social-evidence.js';
 import { routeResearchOutput } from '../research/output-router.js';
 import { planGapFollowup } from '../research/gap-followup.js';
 import type { ResearchGapFollowupInput, ResearchGapFollowupPlan, ResearchGapFollowupResult } from '../research/gap-followup.js';
@@ -39,6 +42,10 @@ import {
   type ResearchEntityStatusClaim,
   type ResearchSupplyChainClaim,
 } from '../research/entity-status-table.js';
+import {
+  MARKET_DATA_SOURCE_KIND_PREFIX, formatMarketAttemptSummary, formatMarketDataSection, marketEvidence,
+  type MarketEvidenceDeps,
+} from '../research/market-evidence.js';
 
 export interface ResearchQuestionLadderRunOptions {
   /** Explicit inherited run identity for diagnostics; omitted values are never fabricated here. */
@@ -116,6 +123,12 @@ export interface ResearchQuestionLadderRunOptions {
   bloomExemplarPackPath?: string;
   /** Host hook for private trigger calibration; public default stays conservative. */
   secondOrderTriggerClassifier?: SecondOrderTriggerClassifier;
+  /** DEMO-RESEARCH-MARKET-DATA seam: registry/dispatch/clock for the market-data calls a `topic: "market"` route triggers. */
+  marketData?: MarketEvidenceDeps;
+  /** g6 seam: the conatus-solution pack step (Korean market routes only). */
+  knowledgePack?: Omit<ConatusPackEvidenceDeps, 'signal'>;
+  /** g6 seam: the X·Reddit social step (routes with a plan-written socialQuery only). */
+  social?: Omit<SocialEvidenceDeps, 'signal'>;
 }
 
 function emitGraphEvent(options: ResearchQuestionLadderRunOptions, event: ResearchGraphEvent): void {
@@ -150,6 +163,10 @@ export interface ResearchGroundingResult {
   ok: boolean;
   output: string;
   sourceUrls?: string[];
+  sourceUsage?: ResearchSourceUsage;
+  sourceAttribution?: import('../core-turn/types.js').ResearchSourceAttribution;
+  /** Bounded, source-bound Reddit search snippets for an answer that asks about investor sentiment. */
+  redditSnippets?: ResearchSocialNote[];
   axisCount?: number;
   error?: string;
   /** Partial snapshots only: still collecting (not a failure). */
@@ -164,6 +181,8 @@ export interface ResearchGroundingResult {
   synthesisBudget?: ResearchSynthesisBudgetReport;
   /** Distinct verified (complete, with URL) sources in the ledger the synthesis sees; the citation floor of the revise step. */
   verifiedSourceCount?: number;
+  /** Present only when the plan routed the turn as `topic: "market"`: complete market-data evidence texts. */
+  marketData?: { evidenceTexts: string[]; summary?: string };
 }
 
 export interface ResearchSynthesisBudgetReport {
@@ -367,6 +386,10 @@ export interface ResearchQuestionLadderRunResult {
   outputContract?: WorkingBackwardsOutputContract;
   output: string;
   error?: string;
+  /** True only when the plan route said `topic: "market"` (market-data was requested for this turn). */
+  marketRequested?: true;
+  /** Trusted provider attempt count and reasons for the final answer. */
+  marketSummary?: string;
 }
 
 export interface WorkingBackwardsBlankSlot {
@@ -727,6 +750,7 @@ async function runResearchQuestionLadderBody(
   const seedQuestion: BloomResearchQuestion = { id: ORIGINAL_QUESTION_AXIS_ID, level: 1, prompt: seedQuery, searchTerms: [seedQuery] };
   const seedEnvelopes: ResearchEvidenceEnvelope[] = [];
   const axisPartialEnvelopes: ResearchEvidenceEnvelope[] = [];
+  const socialPartialEnvelopes: ResearchEvidenceEnvelope[] = [];
   let partialLadder: SixLevelResearchQuestionLadder | undefined;
   let seedTargetId: string | undefined;
   // GROUNDING-FIRST-ANSWER-30S (RES 82685 case 5): on a confirmation-gated turn q0 never runs, so the first citable
@@ -743,7 +767,7 @@ async function runResearchQuestionLadderBody(
     if (!onPartialGrounding) return;
     const base = partialLadder ?? { request, questions: [seedQuestion, ...(earlyAxisQuestion ? [earlyAxisQuestion] : [])], evidence: [] };
     const seeds = seedTargetId ? seedEnvelopes.map((envelope) => ({ ...envelope, questionId: seedTargetId! })) : seedEnvelopes;
-    const partial = partialGroundingSnapshot(request, base, [...seeds, ...axisPartialEnvelopes]);
+    const partial = partialGroundingSnapshot(request, base, [...seeds, ...axisPartialEnvelopes, ...socialPartialEnvelopes]);
     if (!partial) return;
     try { onPartialGrounding(partial); } catch { /* early-answer observer is fail-soft */ }
   };
@@ -949,6 +973,8 @@ async function runResearchQuestionLadderBody(
   };
   let contractRaw: string;
   let raw = '';
+  // DEMO-RESEARCH-MARKET-DATA: the FINAL parsed route (duplicate-route safe); only `topic: "market"` changes the turn.
+  let planRoute: ResearchRouteFields | undefined;
   let routeReported = false;
   const reportRoute = (fields: ResearchRouteFields | undefined): void => {
     if (routeReported) return;
@@ -989,6 +1015,7 @@ async function runResearchQuestionLadderBody(
       const duplicateRoute = topLevelKeys(extractJson(preparedRaw)).filter((key) => key === 'route').length > 1;
       const finalRoute = duplicateRoute ? undefined : parseResearchRouteFields(preparedRecord.route);
       reportRoute(finalRoute);
+      planRoute = finalRoute;
       if (requireConfirmedRoute) routeConfirmed = confirmsEntry(finalRoute);
       if (!('outputContract' in preparedRecord) || !('questions' in preparedRecord)) {
         throw new Error('research preparation requires outputContract and questions');
@@ -1204,6 +1231,51 @@ async function runResearchQuestionLadderBody(
     emitGraphEvent(options, { type: 'edge-rerouted', from: node, outcome: '$default', to: 'evidence-check', was: '$absent', reason: 'Each evidence axis returns to the shared output contract check' });
     emitGraphEvent(options, { type: 'enter', node });
   }
+  // Market-data runs beside the web axes (web stays supplementary). Only symbols from the plan route are sent — no user text.
+  const marketRequested = planRoute?.topic === 'market';
+  const marketPromise = marketRequested && ladder.questions[0] && !signal.aborted
+    ? marketEvidence(planRoute?.symbols ?? [], ladder.questions[0].id, {
+      ...options.marketData, signal, ...(options.runId ? { runId: options.runId } : {}),
+    }).catch(() => {
+      try {
+        debug.log('research.market-data', 'failed', {
+          ...(options.runId ? { runId: options.runId } : {}),
+          provider: 'none', contract: 'collector', durationMs: 0, reason: 'collector-error',
+        }, { level: 'warn' });
+      } catch { /* observation must not mask the explicit collector failure */ }
+      return { evidence: [], checkedProviderIds: [], invokedProviderIds: [], calls: [{
+        provider: 'none', contract: 'collector', outcome: 'failed' as const, durationMs: 0, reason: 'collector-error',
+      }] };
+    })
+    : undefined;
+  // g6 CONATUS-PACK-STEP: a Korean market route (KRX codes in the plan symbols, or no symbols → the KR benchmark basket)
+  // also reads the installed conatus-solution sector map — in parallel, size-capped, never in place of the axes or market-data.
+  const routeSymbols = planRoute?.symbols ?? [];
+  const krRouteSymbols = koreanRouteSymbols(routeSymbols);
+  const packPromise = marketRequested && (routeSymbols.length === 0 || krRouteSymbols.length > 0) && ladder.questions[0] && !signal.aborted
+    ? conatusPackEvidence(krRouteSymbols, ladder.questions[0].id, { ...options.knowledgePack, signal })
+      .catch(() => { debug.log('research.pack', 'failed', { reason: 'collector-error' }, { level: 'warn' }); return undefined; })
+    : undefined;
+  // g6 SOCIAL-AXIS: X·Reddit opinion via the research OmniSearch path (Grok ⊕ web), from the plan's own social query.
+  // On a confirmation-gated turn a query carrying a verbatim run of the user's text is not sent (same rule as the axes).
+  const plannedSocialQuery = planRoute?.socialQuery && !(requireConfirmedRoute && carriesRawUserText(planRoute.socialQuery, request))
+    ? planRoute.socialQuery : undefined;
+  // The market route is already a structured meaning decision. Korean market questions still need US-leading and
+  // community signals when the planner omits socialQuery; use fixed words and validated KR codes, never the raw request.
+  const socialQuery = plannedSocialQuery ?? (marketRequested && (routeSymbols.length === 0 || krRouteSymbols.length > 0)
+    ? ['Korea market US leading signals sector X Reddit', ...krRouteSymbols.slice(0, 4)].join(' ')
+    : undefined);
+  const socialPromise = socialQuery && ladder.questions[0] && !signal.aborted
+    ? socialEvidence(socialQuery, ladder.questions[0].id, {
+      ...options.social, signal,
+      onPlatformEvidence: (evidence, platform) => {
+        socialPartialEnvelopes.push(...evidence);
+        publishPartialGrounding();
+        try { options.social?.onPlatformEvidence?.(evidence, platform); } catch { /* observer is fail-soft */ }
+      },
+    })
+      .catch(() => { debug.log('research.social', 'failed', { reason: 'collector-error' }, { level: 'warn' }); return undefined; })
+    : undefined;
   let axesFinished = false;
   const finishAxes = (outcome: string): void => {
     if (axesFinished) return;
@@ -1307,6 +1379,26 @@ async function runResearchQuestionLadderBody(
       }, { level: 'warn' });
       sections.push('## Parallel research angles\n\nFanout failed before producing angle results; native axis evidence is preserved.');
     }
+  }
+  let marketSection: string | undefined;
+  let marketSummary: string | undefined;
+  if (marketPromise) {
+    const market = await marketPromise;
+    for (const envelope of market.evidence) {
+      const attached = attachResearchEvidence(ladder, envelope);
+      if (attached.ok) ladder.evidence = attached.value.evidence;
+    }
+    marketSection = formatMarketDataSection(market, formatResearchEvidenceAttribution);
+    marketSummary = formatMarketAttemptSummary(market);
+    sections.push(marketSection);
+  }
+  for (const step of [await socialPromise, await packPromise]) {
+    if (!step || step.evidence.length === 0 && !('platforms' in step)) continue;
+    for (const envelope of step.evidence) {
+      const attached = attachResearchEvidence(ladder, envelope);
+      if (attached.ok) ladder.evidence = attached.value.evidence;
+    }
+    sections.push(step.section);
   }
 
   let finalBoundary = planWorkingBackwardsCompletion(outputContract, ladder.questions, ladder.evidence);
@@ -1481,6 +1573,8 @@ async function runResearchQuestionLadderBody(
     return {
       ok: false, ladder, outputContract, output: partialOutput,
       error: RESEARCH_TURN_DEADLINE_STOP_ERROR,
+      ...(marketSection ? { marketRequested: true as const } : {}),
+      ...(marketSummary ? { marketSummary } : {}),
     };
   }
 
@@ -1630,6 +1724,8 @@ async function runResearchQuestionLadderBody(
     ladder,
     outputContract,
     output: [output + routedOutput, formatResearchAnswerSourceTrace(ladder, routedOutput)].filter(Boolean).join('\n\n'),
+    ...(marketSection ? { marketRequested: true as const } : {}),
+    ...(marketSummary ? { marketSummary } : {}),
     ...(!allOk || signal.aborted || entityStatusTableFailed ? {
       error: entityStatusTableFailed ? 'research entity status table generation failed'
         : signal.aborted ? RESEARCH_TURN_DEADLINE_STOP_ERROR
@@ -1695,9 +1791,89 @@ export function researchTurnForGrounding(result: ResearchQuestionLadderRunResult
     ...(budgeted ? { synthesisOutput: budgeted.text, synthesisBudget: budgeted.report } : {}),
     verifiedSourceCount: budgeted ? budgeted.verifiedSourceCount : verifiedEvidenceUrls(result.ladder.evidence).length,
     sourceUrls: researchEvidenceSourceUrls(result.ladder.evidence),
+    sourceUsage: researchSourceUsageFromEvidence(result.ladder.evidence),
+    sourceAttribution: researchSourceAttributionFromEvidence(result.ladder.evidence),
+    redditSnippets: redditSnippetsFromEvidence(result.ladder.evidence),
     axisCount: result.ladder.questions.length,
     ...(result.error ? { error: result.error } : {}),
+    ...(result.marketRequested ? { marketData: { evidenceTexts: result.ladder.evidence
+      .filter((item) => item.outcome === 'complete' && item.sourceKind.startsWith(MARKET_DATA_SOURCE_KIND_PREFIX))
+      .map((item) => item.content), ...(result.marketSummary ? { summary: result.marketSummary } : {}) } } : {}),
   };
+}
+
+function redditSnippetsFromEvidence(evidence: readonly ResearchEvidenceEnvelope[]): ResearchSocialNote[] {
+  const seen = new Set<string>();
+  const summaries: ResearchSocialNote[] = [];
+  const excerpts: ResearchSocialNote[] = [];
+  const add = (rows: ResearchSocialNote[], note: ResearchSocialNote): void => {
+    const key = JSON.stringify([note.kind, note.sourceKind, note.url, note.snippet]);
+    if (seen.has(key)) return;
+    seen.add(key);
+    rows.push(note);
+  };
+  for (const item of evidence) {
+    if (item.sourceKind !== 'search-summary:grok' || item.outcome === 'failed') continue;
+    let parsed: { summary?: unknown; citationUrls?: unknown };
+    try { parsed = JSON.parse(item.content) as typeof parsed; } catch { continue; }
+    if (typeof parsed.summary !== 'string' || !Array.isArray(parsed.citationUrls)) continue;
+    const cited = parsed.citationUrls.find((url): url is string => typeof url === 'string' &&
+      evidence.some(hit => hit.questionId === item.questionId && /^web-search:grok/u.test(hit.sourceKind)
+        && hit.source === url && isRedditUrl(url)));
+    if (!cited) continue;
+    add(summaries, { url: cited, kind: 'provider-synthesis', sourceKind: item.sourceKind,
+      snippet: `Grok search-level synthesis across returned citations, not a verified post excerpt. The linked Reddit URL is a related search hit, not proof for every summary claim: ${Array.from(parsed.summary.trim()).slice(0, 800).join('')}` });
+  }
+  for (const item of evidence) {
+    if (item.outcome !== 'complete' || !/^(?:web|social)-search:/u.test(item.sourceKind) || !item.content.trim()) continue;
+    if (!isRedditUrl(item.source)) continue;
+    add(excerpts, { url: item.source, kind: 'source-excerpt', sourceKind: item.sourceKind,
+      snippet: Array.from(item.content.trim()).slice(0, 500).join('') });
+  }
+  return [...excerpts.slice(0, 3), ...summaries.slice(0, 3)];
+}
+
+function isRedditUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'https:' || url.protocol === 'http:') &&
+      (url.hostname.toLowerCase() === 'reddit.com' || url.hostname.toLowerCase().endsWith('.reddit.com'));
+  } catch { return false; }
+}
+
+/** The ladder has already attributed each search hit to an engine; keep those counts for the final surface. */
+export function researchSourceUsageFromEvidence(evidence: readonly ResearchEvidenceEnvelope[]): ResearchSourceUsage {
+  const seen = { firecrawl: new Set<string>(), grok: new Set<string>(), market: new Set<string>() };
+  for (const item of evidence) {
+    if (item.outcome === 'failed' || !item.source) continue;
+    const kind = item.sourceKind.toLowerCase();
+    if (kind === 'web-search:firecrawl' || /^social-search:(?:x|reddit):firecrawl$/.test(kind)) seen.firecrawl.add(item.source);
+    else if (/^web-search:grok(?:$|[-_.])/.test(kind) || /^social-search:(?:x|reddit):grok$/.test(kind)) seen.grok.add(item.source);
+    else if (kind === 'market-data' || kind.startsWith('market-data:')
+      || kind === 'research.market-data' || kind.startsWith('research.market-data:')) seen.market.add(item.source);
+  }
+  return { firecrawl: seen.firecrawl.size, grok: seen.grok.size, market: seen.market.size };
+}
+
+/** Preserve provenance per source so the host can count only final answer citations. */
+export function researchSourceAttributionFromEvidence(
+  evidence: readonly ResearchEvidenceEnvelope[],
+): import('../core-turn/types.js').ResearchSourceAttribution {
+  const attribution: import('../core-turn/types.js').ResearchSourceAttribution = Object.create(null);
+  for (const item of evidence) {
+    if (item.outcome === 'failed' || !item.source) continue;
+    const kind = item.sourceKind.toLowerCase();
+    const provider = kind === 'web-search:firecrawl' || /^social-search:(?:x|reddit):firecrawl$/.test(kind)
+      ? 'firecrawl' : /^web-search:grok(?:$|[-_.])/.test(kind) || /^social-search:(?:x|reddit):grok$/.test(kind)
+        ? 'grok' : kind === 'market-data' || kind.startsWith('market-data:')
+          || kind === 'research.market-data' || kind.startsWith('research.market-data:')
+          ? 'market' : undefined;
+    if (provider !== 'market' && !traceHttpUrl(item.source)) continue;
+    if (!provider) continue;
+    const providers = attribution[item.source] ?? (attribution[item.source] = []);
+    if (!providers.includes(provider)) providers.push(provider);
+  }
+  return attribution;
 }
 
 /** Bounded synthesis input. Under the budget it returns undefined and the caller keeps the full `output` unchanged.
@@ -1832,7 +2008,10 @@ function buildSinglePreparationPrompt(
   return [
     'Prepare the result contract and six-level evidence ladder together in this single preparation call.',
     'Return one JSON object with exactly these top-level fields, in this order: route, outputContract and questions.',
-    'route comes FIRST and decides whether this turn needs outside evidence: needsFreshFacts (true when the answer depends on real-world facts that can change or be dated: prices, schedules, announcements, news, people, companies, markets, weather), needsCitations (true when the answer should cite sources or the user asks for them), localOnly (true ONLY when the request is about this conversation, local files, a code repository, or running/editing something locally, and needs no outside-world facts), and reason (one short phrase). Judge by meaning, in any language.',
+    'route comes FIRST and decides whether this turn needs outside evidence. Fields: needsFreshFacts (true ONLY when the answer depends on real-world facts outside this machine that can change or be dated: prices, schedules, announcements, news, people, companies, markets, weather; false for the current date, weekday or time, which come from the clock), needsCitations (true when the user asks for sources or the answer must cite them), localOnly (true ONLY when the request is about this conversation, local files, a code repository, or running/editing something locally, and needs no outside-world facts), answerableWithoutWeb (true when the answer needs NO external source: the current date, weekday or time from the clock, this conversation or session context, arithmetic or unit conversion, or stable general knowledge that does not change; false when any web evidence would improve or verify the answer), and reason (one short phrase). If answerableWithoutWeb is true then needsFreshFacts and needsCitations must be false. Judge by meaning, in any language.',
+    'route may also carry an OPTIONAL socialQuery: a short search query for X/Twitter and Reddit posts when the question asks for social or community sentiment, including market signals and sector context; otherwise omit it.',
+    'route may also carry two OPTIONAL fields: topic ("market" ONLY when the question is about the price, trend, volume, investor flow (foreign/institution net buying), sector links, or US leading signals for listed securities, indices or other markets; otherwise omit topic or use "general") and symbols (only when topic is "market": up to twelve tickers you resolved by meaning — 6-digit KRX codes such as 005930, or upper-case US tickers such as NVDA; omit any you are not sure of; for broad Korean market outlook, leading-signal or sector questions include a Korean index-tracking ETF and major names such as 069500 005930 000660, plus linked US indices, sector ETFs and names such as SPY QQQ SOXX NVDA MU AVGO).',
+
     'outputContract must contain deliverable, format, sections (each with unique id, title, purpose), and non-empty completionCriteria.',
     'questions must contain exactly six questions, one unique Bloom level from 1 through 6 each; each question has id, level, prompt, non-empty searchTerms, and sectionId.',
     'Every question sectionId must exactly match an id in outputContract.sections. Assign questions by meaning, not by order.',
@@ -1842,7 +2021,8 @@ function buildSinglePreparationPrompt(
     bloom45Directive,
     exemplarContext ? `Bloom exemplar context:\n${exemplarContext}` : '',
     retroContext,
-    'JSON shape: {"route":{"needsFreshFacts":true,"needsCitations":true,"localOnly":false,"reason":"..."},"outputContract":{"deliverable":"...","format":"...","sections":[{"id":"...","title":"...","purpose":"..."}],"completionCriteria":["..."]},"questions":[{"id":"q1","level":1,"prompt":"...","searchTerms":["..."],"sectionId":"<outputContract section id>"}]}',
+    'JSON shape: {"route":{"needsFreshFacts":true,"needsCitations":true,"localOnly":false,"topic":"general","symbols":[],"socialQuery":"...","reason":"..."},"outputContract":{"deliverable":"...","format":"...","sections":[{"id":"...","title":"...","purpose":"..."}],"completionCriteria":["..."]},"questions":[{"id":"q1","level":1,"prompt":"...","searchTerms":["..."],"sectionId":"<outputContract section id>"}]}',
+
   ].filter(Boolean).join('\n\n');
 }
 

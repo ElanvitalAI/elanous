@@ -34,6 +34,10 @@ export interface Pane {
   readonly ptyId: string;
   /** 마지막 스크롤백. 재기동 뒤 읽기 전용. */
   readonly scrollback: string;
+  /** Millisecond wall clock when the PTY exited; legacy exited rows receive this on server start. */
+  readonly exitedAt?: number;
+  /** Verified creator seat; absent on legacy or unverified panes. */
+  readonly ownerSeat?: string;
 }
 
 export interface SpaceJournal {

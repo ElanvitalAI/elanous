@@ -25,15 +25,17 @@ import { Database } from 'bun:sqlite';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { debug } from '../debug/log.js';
 import { requestEls } from '../els/client.js';
+import { herdrSnapshotPanes } from '../els/herdr-host.js';
 import { elsSocketPath, type ElsRequest } from '../els/server.js';
+import { classifyElsPaneStatus, classifyHerdrSeatRows, classifyTmuxSeatList, findElsSeatPane, findTmuxSeatPane, type InboxLiveness } from './inbox-liveness.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { canonicalSeatId, readUnreadCount } from '../msg/msg-store.js';
-import { herdrPrompt, type HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
+import { defaultHerdrCliRunner, herdrPrompt, type HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
 import { messageRouteFor, parsePaneMessageAddress, SEAT_MESSAGE_ROUTES, type MessageWake } from './msg-address.js';
 import { acquireLockSync } from '../storage/file-lock.js';
@@ -55,7 +57,7 @@ export interface WakeResolution {
   /** pty id (pty-inject) or herdr pane id (herdr). */
   target?: string;
   /** Where the answer came from — `unresolved` means «모름», not a measured absence. */
-  source: 'loop-table' | 'seat-registry' | 'pty-name' | 'pty.ref' | 'herdr.pane' | 'unresolved';
+  source: 'loop-table' | 'seat-registry' | 'els' | 'pty-name' | 'pty.ref' | 'herdr.pane' | 'unresolved';
   /** Registered execution host; `local` uses the current process and any other value is an SSH alias. */
   host?: string;
   reason?: string;
@@ -107,6 +109,12 @@ export interface WakeDeps {
   /** ELS server request seam; production uses the local owner socket. */
   elsRequest?: (request: ElsRequest) => Promise<{ exitCode: number; message: string }>;
   elsRequestForHost?: (host: string, request: ElsRequest, timeoutMs: number) => Promise<{ exitCode: number; message: string }>;
+  /** Read-only host ledger seam for remote tmux seats. */
+  remoteSeatLiveness?: (host: string, seat: string, timeoutMs: number) => Promise<InboxLiveness>;
+  /** Remote tmux command seam; production runs SSH with shell-quoted argv. */
+  remoteTmuxRun?: (host: string, argv: readonly string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+  /** The current host's explicit aliases in an isolated route probe. */
+  localHostAliases?: readonly string[];
   /** Registry path override; defaults to <seatStateRoot>/seat-registry.json. */
   registryPath?: string;
   /** Test seam for the central registry reader. */
@@ -120,13 +128,21 @@ export interface WakeDeps {
 
 type HerdrPane = { paneId: string; sessionId?: string; title?: string; cwd?: string; host?: string; status?: string };
 
+export function isLocalWakeHost(host: string | undefined, deps: WakeDeps = {}, currentHostname = hostname()): boolean {
+  if (!host || host === 'local') return true;
+  const short = currentHostname.toLowerCase().split('.')[0]!;
+  const aliases = [short, currentHostname.toLowerCase(), ...(short === 'joosungui-macstudio' ? ['mshq'] : []),
+    ...(deps.localHostAliases ?? [])];
+  return aliases.some(alias => alias.toLowerCase() === host.toLowerCase());
+}
+
 let paneCensusCachedAt = 0;
 let paneCensusHasValue = false;
 let paneCensusCache: HerdrPane[] | null = null;
 
 function herdrPaneCensus(run?: WakeDeps['runHerdrPaneList']): HerdrPane[] | null {
   if (!run && paneCensusHasValue && Date.now() - paneCensusCachedAt < 500) return paneCensusCache;
-  const command = run ?? ((args: readonly string[]) => spawnSync('herdr', [...args], { encoding: 'utf8', timeout: 1500, windowsHide: true }));
+  const command = run ?? ((args: readonly string[]) => spawnSync(herdrBinary(), [...args], { encoding: 'utf8', timeout: 1500, windowsHide: true }));
   let result = command(['pane', 'list', '--json']);
   // Herdr 0.9.1 emits JSON by default and rejects --json. Retry only that
   // version mismatch; other failures must remain an unknown census.
@@ -166,6 +182,14 @@ function herdrPaneCensus(run?: WakeDeps['runHerdrPaneList']): HerdrPane[] | null
     paneCensusHasValue = true;
   }
   return parsed;
+}
+
+/** A noninteractive mail CLI has no login-shell PATH, but the host-installed Herdr is still authoritative. */
+export function herdrBinary(env: NodeJS.ProcessEnv = process.env, installed = existsSync): string {
+  const explicit = env.HERDR_BIN_PATH?.trim();
+  if (explicit) return explicit;
+  const local = join(homedir(), '.local', 'bin', 'herdr');
+  return installed(local) ? local : 'herdr';
 }
 
 function paneLiveness(pane: HerdrPane): 'live' | 'dead' | 'unknown' {
@@ -279,6 +303,14 @@ export function seatDeliveryView(address: string, deps: WakeDeps = {}, snapshot:
   return v1 ? deliveryFields(normalizeSeatRegistryV1Entry(v1)) : {};
 }
 
+/** Cheap host and consent hint for the ELS-first path; it never probes Herdr. */
+export function seatRouteHint(address: string, deps: WakeDeps = {}): WakeResolution {
+  const snapshot = registrySnapshot(deps);
+  if (snapshot.routed.status !== 'ready') return { wake: 'none', source: 'unresolved' };
+  const entry = seatRegistryEntry(snapshot.routed.registry, address.trim().toUpperCase().replace(/^SEAT:/, ''));
+  return entry ? wakeResolutionForSeat(entry, snapshot.v2Seats !== undefined) : { wake: 'none', source: 'unresolved' };
+}
+
 function wakeResolutionForSeat(entry: SeatRegistryEntry, fromV2 = false): WakeResolution {
   // v1 wake=none is a disabled address. A v2 no-inject seat is projected as wake=none too, but it is
   // still a registered seat: keep host and do not mark it disabled (that drops a remote queue host).
@@ -295,7 +327,7 @@ function validateRegisteredHerdrPane(entry: SeatRegistryEntry, census: () => Her
   // A remote-host pane never appears in the local herdr census; rejecting it as
   // dead-pane-address here silently drops the downlink. The async prompt below
   // runs a remote census (requirePaneListStatus) and is the real liveness/idle gate.
-  if (entry.host && entry.host !== 'local') return registered;
+  if (!isLocalWakeHost(entry.host)) return registered;
   const panes = census();
   if (panes === null) return unresolved('pane-census-unavailable:candidates=unknown');
   const matches = panes.filter(row => row.paneId === entry.target);
@@ -317,8 +349,37 @@ export function messageReplyBodyFor(address: string, deps: WakeDeps = {}): strin
 
 /** POSIX-shell quote argv because OpenSSH transmits its remote command as text. */
 export function quoteRemoteHerdrCommand(argv: readonly string[]): string {
+  return quoteRemoteArgv(['herdr', ...argv]);
+}
+
+function quoteRemoteArgv(argv: readonly string[]): string {
   const escapedQuote = String.fromCharCode(39, 92, 39, 39);
-  return ['herdr', ...argv].map(value => String.fromCharCode(39) + value.replaceAll(String.fromCharCode(39), escapedQuote) + String.fromCharCode(39)).join(' ');
+  return argv.map(value => String.fromCharCode(39) + value.replaceAll(String.fromCharCode(39), escapedQuote) + String.fromCharCode(39)).join(' ');
+}
+
+function remoteTmuxRun(host: string, argv: readonly string[], timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) return Promise.resolve({ code: null, stdout: '', stderr: 'invalid SSH host' });
+  return new Promise(resolve => {
+    const child = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', host, quoteRemoteArgv(['tmux', ...argv])],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let stdout = ''; let stderr = ''; let stdoutBytes = 0; let stderrBytes = 0; let settled = false;
+    const finish = (result: { code: number | null; stdout: string; stderr: string }) => {
+      if (settled) return; settled = true; clearTimeout(timer); resolve(result);
+    };
+    const timer = setTimeout(() => { child.kill(); finish({ code: null, stdout, stderr: 'remote tmux timed out' }); }, Math.max(1, timeoutMs));
+    child.stdout?.on('data', chunk => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+      if (stdoutBytes + bytes > 64 * 1024) { child.kill(); finish({ code: null, stdout: '', stderr: 'remote tmux output too large' }); }
+      else { stdoutBytes += bytes; stdout += String(chunk); }
+    });
+    child.stderr?.on('data', chunk => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+      if (stderrBytes + bytes > 4096) { child.kill(); finish({ code: null, stdout: '', stderr: 'remote tmux error output too large' }); }
+      else { stderrBytes += bytes; stderr += String(chunk); }
+    });
+    child.on('error', error => finish({ code: null, stdout, stderr: error.message }));
+    child.on('close', code => finish({ code, stdout, stderr }));
+  });
 }
 
 /** Default SSH transport for a registered remote herdr host. */
@@ -364,6 +425,91 @@ export function remoteElsRequest(host: string, request: ElsRequest, timeoutMs: n
     child.stdin?.on('error', () => {});
     child.stdin?.end(JSON.stringify(request));
   });
+}
+
+export function remoteTmuxSeatLiveness(host: string, seat: string, timeoutMs = 1500): Promise<InboxLiveness> {
+  const unavailable = (): InboxLiveness => ({ state: 'unknown', reason: 'host-ledger-unavailable' });
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) return Promise.resolve(unavailable());
+  return new Promise(resolve => {
+    const child = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=2', host,
+      "tmux list-panes -a -F '#{pane_id}|#{session_name}|#{pane_current_path}|#{pane_dead}|#{pane_current_command}'"],
+    { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let output = ''; let settled = false;
+    const finish = (result: InboxLiveness) => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+    const timer = setTimeout(() => { child.kill(); finish(unavailable()); }, Math.max(1, timeoutMs));
+    child.stdout?.on('data', chunk => {
+      const text = String(chunk);
+      if (output.length + text.length > 64 * 1024) { child.kill(); finish(unavailable()); }
+      else output += text;
+    });
+    child.on('error', () => finish(unavailable()));
+    child.on('close', code => finish(code === 0 ? classifyTmuxSeatList(output, seat) : unavailable()));
+  });
+}
+
+export async function resolveRemoteSeatLiveness(address: string, host: string | undefined, deps: WakeDeps = {}): Promise<InboxLiveness | undefined> {
+  if (!host || isLocalWakeHost(host, deps) || host === 'unknown') return undefined;
+  const seat = address.trim().toUpperCase().replace(/^SEAT:/, '');
+  if (!/^[A-Z][A-Z0-9_-]{0,63}$/.test(seat)) return undefined;
+  if (!deps.remoteSeatLiveness && (deps.seatStateRoot || deps.readRegistry || deps.listHerdrPanes)) return undefined;
+  try { return await (deps.remoteSeatLiveness ?? remoteTmuxSeatLiveness)(host, seat, Math.min(deps.timeoutMs ?? 1500, 1500)); }
+  catch { return { state: 'unknown', reason: 'host-ledger-unavailable' }; }
+}
+
+export async function resolveHerdrSeatLiveness(address: string, deps: WakeDeps = {}): Promise<InboxLiveness | undefined> {
+  const seat = address.trim().toUpperCase().replace(/^SEAT:/, '');
+  if (!/^[A-Z][A-Z0-9_-]{0,63}$/.test(seat)) return undefined;
+  if (!deps.herdrRun && (deps.seatStateRoot || deps.readRegistry || deps.listHerdrPanes)) return undefined;
+  const run = deps.herdrRun ?? defaultHerdrCliRunner({ ...process.env, HERDR_BIN_PATH: herdrBinary() });
+  let result: Awaited<ReturnType<HerdrCliRunner>>;
+  try { result = await run(['api', 'snapshot'], Math.min(deps.timeoutMs ?? 1500, 1500)); }
+  catch { return { state: 'unknown', reason: 'host-ledger-unavailable' }; }
+  if (result.code !== 0) return { state: 'unknown', reason: 'host-ledger-unavailable' };
+  let snapshot: ReturnType<typeof herdrSnapshotPanes>;
+  try { snapshot = herdrSnapshotPanes(JSON.parse(result.stdout)); }
+  catch { return { state: 'unknown', reason: 'host-ledger-invalid' }; }
+  if (!snapshot) return { state: 'unknown', reason: 'host-ledger-invalid' };
+  const classified = classifyHerdrSeatRows(snapshot.panes, seat);
+  return classified.state === 'down' && snapshot.skipped > 0 ? { state: 'unknown', reason: 'host-ledger-invalid' } : classified;
+}
+
+/** Prefer the server's registered seat and live PTY over the legacy Herdr/heartbeat view. */
+export async function resolveElsSeat(address: string, deps: WakeDeps = {}, fallback: WakeResolution = resolveWake(address, deps)):
+  Promise<{ wake?: WakeResolution; liveness?: InboxLiveness }> {
+  const seat = address.trim().toUpperCase().replace(/^SEAT:/, '');
+  if (!/^[A-Z][A-Z0-9_-]{0,63}$/.test(seat) || messageRouteFor(seat)?.wake) return {};
+  if (fallback.source === 'seat-registry' && fallback.wake === 'tmux') return {};
+  // A supplied census is an isolated caller unless it also supplies an ELS request seam.
+  if (!deps.elsRequest && !deps.elsRequestForHost && (deps.listHerdrPanes || deps.listPtys || deps.readRegistry || deps.seatStateRoot)) return {};
+  const host = fallback.host ?? 'local';
+  const timeout = Math.min(deps.timeoutMs ?? 1500, 1500);
+  const request = deps.elsRequest ?? (!isLocalWakeHost(host, deps)
+    ? (r: ElsRequest) => (deps.elsRequestForHost ?? remoteElsRequest)(host, r, timeout)
+    : (r: ElsRequest) => requestEls(elsSocketPath(), r, timeout));
+  let listed: { exitCode: number; message: string };
+  try { listed = await request({ op: 'ls' }); }
+  catch { return { liveness: { state: 'unknown', reason: 'els-unavailable' } }; }
+  if (listed.exitCode !== 0) return { liveness: { state: 'unknown', reason: 'els-unavailable' } };
+  let list: unknown;
+  try { list = JSON.parse(listed.message); }
+  catch { return { liveness: { state: 'unknown', reason: 'els-list-invalid' } }; }
+  const found = findElsSeatPane(list, seat);
+  if (found.kind === 'absent') return {};
+  if (found.kind === 'unknown') return { liveness: { state: 'unknown', reason: found.reason } };
+  let status: { exitCode: number; message: string };
+  try { status = await request({ op: 'status', pane: found.pane }); }
+  catch { return { liveness: { state: 'unknown', reason: 'els-unavailable' } }; }
+  if (status.exitCode !== 0) return { liveness: { state: 'unknown', reason: 'els-unavailable' } };
+  let view: unknown;
+  try { view = JSON.parse(status.message); }
+  catch { return { liveness: { state: 'unknown', reason: 'els-status-unknown' } }; }
+  const liveness = classifyElsPaneStatus(view);
+  if (liveness.state !== 'live') return { liveness };
+  // Discovery grants no injection consent. A registry target's opt-in belongs to that exact pane.
+  if (fallback.source === 'seat-registry' && (fallback.wake === 'none' || fallback.wake === 'sse')) return { liveness };
+  const target = `els:${found.address}`;
+  return { wake: { ...fallback, wake: 'els', target, source: 'els', host,
+    optIn: fallback.wake === 'els' && fallback.target === target && fallback.optIn === true, reason: undefined }, liveness };
 }
 
 /** How a post to `address` would wake its reader — table first, then a live pty named after the seat, then herdr. */
@@ -432,7 +578,7 @@ export interface RegisterSeatPaneOptions {
   paneId: string;
   host: string;
   enableWake?: boolean;
-  kind?: 'herdr' | 'els';
+  kind?: 'herdr' | 'els' | 'tmux';
   replace?: boolean;
   /** The agent body in the pane (eln · claude-code · codex). Absent keeps what the registry had. */
   runtime?: SeatAgentRuntime;
@@ -476,7 +622,8 @@ export function registerSeatPaneAddress(input: RegisterSeatPaneOptions, deps: Wa
   if (host === 'unknown' || !/^(?:local|[A-Za-z0-9][A-Za-z0-9.-]{0,252})$/.test(host)) throw new Error('invalid host (use local or an SSH alias)');
   const paneId = input.paneId.trim();
   const kind = input.kind ?? 'herdr';
-  if (!(kind === 'els' ? /^els:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/ : /^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/).test(paneId)) throw new Error(`invalid ${kind} pane ID`);
+  if (kind === 'tmux' && (paneId !== `seat-${address}` || isLocalWakeHost(host, deps))) throw new Error('tmux session must match seat-<SEAT> on a remote host');
+  if (kind !== 'tmux' && !(kind === 'els' ? /^els:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/ : /^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/).test(paneId)) throw new Error(`invalid ${kind} pane ID`);
   const root = resolveSeatStateRoot(deps);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const registryFile = deps.registryPath ?? seatRegistryPath(root);
@@ -645,7 +792,9 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
       ({ ...resolution, ...(reason ? { reason } : {}), address, msgId, result });
     if (message.kind === 'reply') return done('skipped-reply', 'kind=reply');
     if (message.from.toUpperCase() === address.toUpperCase()) return done('skipped-self', 'from=to');
-    resolution = resolveWake(address, deps);
+    const hint = seatRouteHint(address, deps);
+    resolution = hint.wake === 'els' || hint.wake === 'tmux' ? resolveWake(address, deps)
+      : (await resolveElsSeat(address, deps, hint)).wake ?? resolveWake(address, deps);
     if (resolution.reason?.startsWith('pane-status-unknown')) return done('wake-deferred');
     if (resolution.wake === 'sse') return done('none-sse');
     if (resolution.wake === 'cron') return done('wake-deferred');
@@ -656,7 +805,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
     // ELN-SEAT-LIVE 11-18: every eln seat TUI watches its inbox (seat-mail notice queue, #38031/#38193) whether or not the
     // `autowake` opt-in file exists — typing into it as well made ONE mail two turns (HAND-ELN-ELS-API #87012: herdr turn,
     // then the queued notice; the duplicate read-only work hit the 60-tool turn cap twice). runtime=eln alone now decides.
-    if (!message.fallback && resolution.runtime === 'eln') return done('eln-mail-watch', seatHasIdleMailWatch(address, deps) ? IDLE_WATCH_WAKE : ELN_SEAT_MAIL_QUEUE);
+    if (!message.fallback && resolution.runtime === 'eln' && resolution.wake !== 'tmux') return done('eln-mail-watch', seatHasIdleMailWatch(address, deps) ? IDLE_WATCH_WAKE : ELN_SEAT_MAIL_QUEUE);
     if (!isLive(deps)) return done('skipped-test-universe');
     claim = claimWake(claimDbPath(deps), address, (deps.now ?? Date.now)());
     if (!claim) return done('debounced');
@@ -677,9 +826,25 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         if (expired()) return done('timeout');
         injecting = true;
         await inject(resolution.target!, line);
+      } else if (resolution.wake === 'tmux') {
+        const target = resolution.target!;
+        const host = resolution.host!;
+        const run = deps.remoteTmuxRun ?? remoteTmuxRun;
+        const remaining = () => Math.max(1, deadline - Date.now());
+        const listed = await run(host, ['list-panes', '-a', '-F', '#{pane_id}|#{session_name}|#{pane_current_path}|#{pane_dead}|#{pane_current_command}'], remaining());
+        if (listed.code !== 0) return done('failed', 'tmux-list-unavailable');
+        const pane = findTmuxSeatPane(listed.stdout, address.trim().toUpperCase().replace(/^SEAT:/, ''));
+        if (!pane) return done('busy', 'tmux-seat-pane-absent-or-ambiguous');
+        const again = resolveWake(address, deps);
+        if (again.optIn !== true) return done('skipped', 'human-pane-no-opt-in');
+        if (again.wake !== 'tmux' || again.host !== host || again.target !== target) return done('busy', 'target-moved');
+        if (expired()) return done('timeout');
+        injecting = true;
+        const sent = await run(host, ['send-keys', '-t', pane, '--', line, 'Enter'], remaining());
+        if (sent.code !== 0) return done('failed', 'tmux-send-unknown');
       } else if (resolution.wake === 'els') {
         const target = resolution.target!;
-        const request = deps.elsRequest ?? (resolution.host && resolution.host !== 'local'
+        const request = deps.elsRequest ?? (resolution.host && !isLocalWakeHost(resolution.host, deps)
           ? (r: ElsRequest) => (deps.elsRequestForHost ?? remoteElsRequest)(resolution.host!, r, Math.max(1, deadline - Date.now()))
           : (r: ElsRequest) => requestEls(elsSocketPath(), r, Math.max(1, deadline - Date.now())));
         const listed = await request({ op: 'ls' });
@@ -696,7 +861,8 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         let view: { state?: string; inputEmpty?: boolean | 'unknown'; reason?: string };
         try { view = JSON.parse(status.message); } catch { return done('busy', 'els-status-invalid'); }
         if (view.state !== 'idle' || view.inputEmpty !== true) return done('busy', `els-${view.state ?? 'unknown'}:input=${view.inputEmpty ?? 'unknown'}:${view.reason ?? ''}`);
-        const again = resolveWake(address, deps);
+        const fallbackAgain = resolveWake(address, deps);
+        const again = fallbackAgain.wake === 'els' ? fallbackAgain : (await resolveElsSeat(address, deps, fallbackAgain)).wake ?? fallbackAgain;
         if (again.optIn !== true) return done('skipped', 'human-pane-no-opt-in');
         if (again.wake !== 'els' || again.target !== target || again.host !== resolution.host) return done('busy', 'target-moved');
         if (expired()) return done('timeout');
@@ -713,9 +879,9 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         const target = resolution.target!;
         const prompted = await herdrPrompt({ target, text: line, anyAgent: true, requirePaneListStatus: true,
           timeoutMs: Math.max(1, deadline - Date.now()) }, {
-          ...((resolution.host && resolution.host !== 'local')
-            ? { run: (deps.herdrRunForHost ?? remoteHerdrRunner)(resolution.host) }
-            : deps.herdrRun ? { run: deps.herdrRun } : {}),
+          run: resolution.host && !isLocalWakeHost(resolution.host, deps)
+            ? (deps.herdrRunForHost ?? remoteHerdrRunner)(resolution.host)
+            : deps.herdrRun ?? defaultHerdrCliRunner({ ...process.env, HERDR_BIN_PATH: herdrBinary() }),
           beforeSubmit: () => {
             // opt-in 은 주입 직전에 «먼저» 다시 본다 — 기다리는 사이 `wake-inject` 를 지웠으면(대상이 바뀌었어도) 주입 0.
             const again = resolveWake(address, deps);

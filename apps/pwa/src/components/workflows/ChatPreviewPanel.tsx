@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { debugLog } from '@/lib/debug';
 import { fetchChatConfig, sendChatMessage, type HostedChatConfig } from '@/lib/hosted-chat-runtime';
+import { randomId } from '@/lib/random-id';
 
 type LoadState =
   | { kind: 'loading' }
@@ -18,7 +19,8 @@ const NO_PERMISSION = '미리보기 권한이 없습니다 — 채팅 트리거�
 
 export function ChatPreviewPanel({ workflow, onClose }: { workflow: string; onClose: () => void }) {
   const { config } = useDaemon();
-  const [sessionId] = useState(() => crypto.randomUUID());
+  // 출처: #39459 — crypto.randomUUID 는 secure context 전용; http 랜 원점 폴백(randomId).
+  const [sessionId] = useState(() => randomId());
   const [load, setLoad] = useState<LoadState>({ kind: 'loading' });
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');

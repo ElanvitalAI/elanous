@@ -12,6 +12,13 @@ function render(message: ChatMessage): string {
 const summaryText = (html: string) => (html.match(/<summary[^>]*>([\s\S]*?)<\/summary>/)?.[1] ?? '').replace(/<[^>]+>/g, '');
 
 describe('minimal chat fake stream', () => {
+  it('puts the source line after the final answer at mobile width and hides it on incomplete turns', () => {
+    const usage = { firecrawl: 2, grok: 1, market: 1 };
+    const html = render({ ...base, text: '답변입니다.', sourceUsage: usage });
+    expect(html.indexOf('답변입니다.')).toBeLessThan(html.indexOf('data-elanous-sources-used'));
+    expect(html).toContain('쓴 출처: firecrawl 2 · grok(X·레딧) 1 · 시세 1');
+    expect(render({ ...base, text: '부분 답변', sourceUsage: usage, incomplete: true })).not.toContain('data-elanous-sources-used');
+  });
   it('streaming early answer lands in the body; the capsule holds only the process (MOB-1 P1)', () => {
     const html = render({ ...base, text: '초기 답: 메모리 호황 지속.', streaming: true, finalTextStart: 0, blocks: [
       { kind: 'text', text: '초기 답: 메모리 호황 지속.' },

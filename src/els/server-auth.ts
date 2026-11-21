@@ -2,8 +2,8 @@
 // The decision lives HERE, in the server process. A peer's env self-report (ELANOUS_SEAT) is
 // never a principal: the only accepted credential is the pane token this server minted into a
 // pane's env at spawn time and recorded in its own ledger. A peer proves which pane it
-// descends from by presenting that inherited token (env is inherited by descendants, so
-// presenting the token = descent proof; claiming a seat name means nothing). The uid side of
+// descends from by presenting that inherited token and passing the server's live socket-peer
+// ancestry and pane-generation check; the token alone does not prove descent. The uid side of
 // «peer credentials» is pinned by the socket file's 0600 perms — only this user can connect.
 // 같은 uid 의 els 밖 프로세스는 outsider: 읽기 연산만 허용(③).
 
@@ -21,13 +21,14 @@ export const AUTH_OWNER_TOKEN_ENV = 'ELANOUS_ELS_OWNER_TOKEN';
  * `snapshot` shows the same screen as `read` but WRITES an svg under the state dir, so it is mutating (an outsider can never
  * make the owner write files) and judged as the `read` action; `record`
  * taps a pane's live output stream, so it is mutating and judged as `do` (pane credential, own workspace).
- * `child` reads are decided by MUTATING_CHILD_ACTIONS below (status/tree/summary are reads).
+ * `child` reads are decided by MUTATING_CHILD_ACTIONS below (tree/summary are reads; status updates state).
  */
 export const READ_OPS: ReadonlySet<string> = new Set(['ping', 'auth', 'ls', 'subscribe', 'grep', 'read', 'status']);
-/** `child` actions that mutate the tree; the rest (status/tree/summary) are reads. */
-const MUTATING_CHILD_ACTIONS: ReadonlySet<string> = new Set(['start', 'end', 'pin', 'unpin', 'dismiss', 'progress']);
+/** `child` actions that mutate the tree; tree and summary are reads. */
+const MUTATING_CHILD_ACTIONS: ReadonlySet<string> = new Set(['start', 'end', 'pin', 'unpin', 'dismiss', 'progress', 'status']);
 
 export interface PaneRegistration { readonly pane: string; readonly workspace: string; readonly role: 'op' | 'hand'; readonly seat: string | undefined; readonly token: string }
+export type PaneProcessBinding = { readonly pid: number; readonly start: string; readonly generation: string };
 
 export type ServerRole =
   | { readonly kind: 'op'; readonly pane: string }
@@ -41,9 +42,14 @@ export type ServerRole =
 /** JUD #39057 ⓒ1 — the role a new pane inherits from its requester. cwd never decides roles. */
 export type SpawnParent = { readonly kind: 'op' } | { readonly kind: 'hand'; readonly seat: string; readonly workspaces: readonly string[] };
 
+// Role object provenance is server-side only: a pane name can never confer owner authority.
+const ownerRoles = new WeakSet<ServerRole>();
+export const isServerOwnerRole = (role: ServerRole): boolean => ownerRoles.has(role);
+
 /** The server's own ledger: token → pane record. Tokens are minted at spawn, never chosen by clients. */
 export class PaneRegistry {
   private readonly byToken = new Map<string, PaneRegistration>();
+  private readonly spawnBindings = new Map<string, { read: () => PaneProcessBinding | undefined; pinned?: PaneProcessBinding; invalid?: boolean }>();
   private ownerToken: string | undefined;
   private ownerRegistered = false;
   private counter = 0;
@@ -77,16 +83,44 @@ export class PaneRegistry {
     return { ...rest, [AUTH_PANE_TOKEN_ENV]: token };
   }
 
+  /** Bind to the exact PTY adapter returned by this spawn, not a later pane lookup. */
+  bindSpawn(token: string, read: () => PaneProcessBinding | undefined): void {
+    if (!this.byToken.has(token) || this.spawnBindings.has(token)) throw new Error('invalid pane spawn binding');
+    this.spawnBindings.set(token, { read });
+  }
+
+  spawnBinding(token: string): PaneProcessBinding | undefined {
+    const entry = this.spawnBindings.get(token);
+    if (!entry || entry.invalid || !this.byToken.has(token)) return undefined;
+    try {
+      const current = entry.read();
+      if (!current) {
+        if (entry.pinned) entry.invalid = true;
+        return undefined;
+      }
+      if (!entry.pinned) entry.pinned = { ...current };
+      const pinned = entry.pinned;
+      if (pinned.pid !== current.pid || pinned.start !== current.start || pinned.generation !== current.generation) {
+        entry.invalid = true;
+        return undefined;
+      }
+      return pinned;
+    } catch { entry.invalid = true; return undefined; }
+  }
+
   /** OP #104178 ① — a spawn whose PTY call throws leaves no orphan token in the ledger. */
-  forget(token: string): void { this.byToken.delete(token); }
+  forget(token: string): void { this.byToken.delete(token); this.spawnBindings.delete(token); }
 
   /** A claim is judged ONLY by the ledger — env seat strings are irrelevant by construction. */
   classify(claim: { token?: unknown; pid?: unknown } | undefined): ServerRole {
     const token = typeof claim?.token === 'string' ? claim.token : undefined;
-    if (token && this.ownerToken && token === this.ownerToken)
-      return this.ownerRegistered
+    if (token && this.ownerToken && token === this.ownerToken) {
+      const role: ServerRole = this.ownerRegistered
         ? { kind: 'op', pane: 'server-owner' }
         : { kind: 'owner', note: 'server owner terminal — run `els seat set OP` to register the OP seat' };
+      ownerRoles.add(role);
+      return role;
+    }
     const found = token ? this.byToken.get(token) : undefined;
     if (!found) return { kind: 'outsider', note: token ? 'unknown pane token' : 'no pane credential' };
     if (found.role === 'op') return { kind: 'op', pane: found.pane };
@@ -98,17 +132,43 @@ export class PaneRegistry {
 
 export type AuthVerdict = { readonly allow: true } | { readonly allow: false; readonly reason: string };
 
+/** Server-resolved tab target. Seats come from server-minted pane registrations, never from cwd or request fields. */
+export interface TabCloseScope {
+  readonly tabId: string;
+  readonly workspace: string;
+  readonly ownerSeats: readonly (string | null)[];
+}
+
+/** Join the journal's exact tab/pane ids to the server's token ledger. An absent or mixed registration has no owner. */
+export function resolveTabCloseScope(
+  listed: { readonly workspaces: readonly { readonly id: string; readonly name: string }[];
+    readonly tabs: readonly { readonly id: string; readonly workspaceId: string }[];
+    readonly panes: readonly { readonly pane: string; readonly tab: string }[] },
+  registrations: readonly PaneRegistration[],
+  tabId: string,
+): TabCloseScope | undefined {
+  const tab = listed.tabs.find((row) => row.id === tabId);
+  const workspace = tab && listed.workspaces.find((row) => row.id === tab.workspaceId)?.name;
+  if (!tab || !workspace) return undefined;
+  const ownerSeats = listed.panes.filter((row) => row.tab === tab.id).map((row) => {
+    const owners = registrations.filter((entry) => entry.pane === row.pane && entry.workspace === workspace);
+    const seats = new Set(owners.map((entry) => entry.seat));
+    return owners.length && seats.size === 1 ? owners[0]!.seat ?? null : null;
+  });
+  return { tabId: tab.id, workspace, ownerSeats };
+}
+
 // Payload fields (text/pattern/from) ride along so callers pass real op shapes; the door itself never reads them.
-interface RequestShape { readonly op: string; readonly pane?: string; readonly ws?: string; readonly at?: { readonly ws: string }; readonly action?: string; readonly seat?: string; readonly text?: string; readonly pattern?: string; readonly from?: string }
+interface RequestShape { readonly op: string; readonly pane?: string; readonly tab?: string; readonly ws?: string; readonly at?: { readonly ws: string }; readonly action?: string; readonly seat?: string; readonly runtime?: unknown; readonly text?: string; readonly pattern?: string; readonly from?: string; readonly confirmed?: boolean }
 
 /** op → control door action vocabulary (control.ts CONTROL_ACTIONS). */
 function doorAction(op: string): 'read' | 'do' | 'input' | 'new' | 'close' | 'move' | undefined {
   switch (op) {
     case 'do': case 'build': case 'child': case 'record': return 'do';
     case 'snapshot': return 'read'; // same screen as `read`, but it writes a file: mutating at the door, judged with `read`'s rules
-    case 'send': case 'send-verified': case 'attach': case 'input': case 'input-line': case 'resize': return 'input';
+    case 'send': case 'send-verified': case 'attach': case 'input': case 'input-line': case 'interrupt': case 'resize': return 'input';
     case 'new': return 'new';
-    case 'close': case 'close-workspace': return 'close';
+    case 'close': case 'close-workspace': case 'close-tab': return 'close';
     default: return undefined; // `reorder` is a workspace-less UI-order action: any pane role may do it.
   }
 }
@@ -119,12 +179,13 @@ export function isMutating(request: RequestShape): boolean {
 }
 
 /** The one rule set: reuse the door's defaultDecision + allow-list file so client and server cannot drift. */
-export function authorizeRequest(role: ServerRole, request: RequestShape, workspace: string | undefined, rules: readonly AllowRule[] | undefined): AuthVerdict {
-  // `els seat set OP` — the owner's explicit OP registration: only the owner credential (or OP) may register.
+export function authorizeRequest(role: ServerRole, request: RequestShape, workspace: string | undefined, rules: readonly AllowRule[] | undefined, tabScope?: TabCloseScope): AuthVerdict {
+  // A server-minted OP pane may attempt registration only with a runtime claim;
+  // registerSeatRuntime independently verifies the actual OS ancestry and publishes its token.
   if (request.op === 'seat-set') {
-    return role.kind === 'owner' || role.kind === 'op'
+    return ownerRoles.has(role) || (role.kind === 'op' && request.seat === 'OP' && request.runtime != null)
       ? { allow: true }
-      : { allow: false, reason: `els: seat-set denied — only the server owner may register the OP seat (${role.kind === 'hand' ? `hand seat ${role.seat}` : role.kind === 'peer' ? `peer seat ${role.seat}` : role.note})` };
+      : { allow: false, reason: `els: seat-set denied — only the server owner may register the OP seat (${role.kind === 'hand' ? `hand seat ${role.seat}` : role.kind === 'peer' ? `peer seat ${role.seat}` : role.kind === 'op' ? `OP pane ${role.pane}` : role.note})` };
   }
   if (!isMutating(request)) return { allow: true };
   // `new` stays open to any same-uid caller (main #39060 behavior): spawning a pane is not typing
@@ -151,6 +212,14 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
   if (request.op === 'build' && (role.kind === 'hand' || role.kind === 'op') && request.pane === role.pane) return { allow: true };
   const action = doorAction(request.op);
   if (!action) return { allow: false, reason: `els: ${request.op} is mutating but has no door action mapping` };
+  if (request.op === 'close-tab') {
+    if (request.confirmed !== true) return { allow: false, reason: 'els: close-tab denied — close needs confirm:true (human confirmation)' };
+    if (!tabScope || tabScope.tabId !== request.tab || tabScope.workspace !== workspace || !tabScope.workspace)
+      return { allow: false, reason: 'els: close-tab denied — tab identity or workspace changed before authorization' };
+    if ((role.kind === 'hand' || role.kind === 'peer')
+      && (!tabScope.ownerSeats.length || tabScope.ownerSeats.some((seat) => seat !== role.seat)))
+      return { allow: false, reason: 'els: close-tab denied — tab contains another or unverified seat owner' };
+  }
   // JUD #39096 ⓑ: a ledger-verified peer seat is a principal — «토큰 역할 ∨ peer seat». The control
   // 문 still makes the final adjudication; the role door only refuses to block the verified peer.
   const principal: Principal = role.kind === 'op'
@@ -159,7 +228,7 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
       ? { id: `local:${role.uid}`, kind: 'eln', seat: role.seat, workspaces: [] }
       : { id: `els-pane:${role.pane}`, kind: 'eln', seat: role.seat, workspaces: role.workspaces };
   const confirmed = Boolean((request as { confirmed?: boolean }).confirmed);
-  const target: ControlTarget = { workspace: workspace ?? '', pane: request.pane ?? '', shell: false };
+  const target: ControlTarget = { workspace: workspace ?? '', pane: request.op === 'close-tab' ? tabScope!.tabId : request.pane ?? '', shell: false };
   const decision = defaultDecision(principal, target, action, confirmed);
   if (decision) return decision.allow ? { allow: true } : { allow: false, reason: `els: ${request.op} denied — ${decision.reason}` };
   if (rules && authorize(rules, principal, target, action)) return { allow: true };
@@ -167,19 +236,20 @@ export function authorizeRequest(role: ServerRole, request: RequestShape, worksp
 }
 
 /** Audit line for a denial, in the control-audit.jsonl format (same fields as control.ts). */
-export function denialAuditLine(request: RequestShape, role: ServerRole, reason: string, pid: unknown): string {
+export function denialAuditLine(request: RequestShape, role: ServerRole, reason: string, pid: number | undefined, claimedPid?: number): string {
   return JSON.stringify({
     ts: new Date().toISOString(),
     principal: role.kind === 'outsider' || role.kind === 'owner' ? `els-socket:${role.kind}` : role.kind === 'peer' ? `local:${role.uid}` : `els-pane:${role.pane}`,
     kind: 'cli',
     workspace: request.ws ?? request.at?.ws ?? '',
-    pane: request.pane ?? '',
+    pane: request.pane ?? request.tab ?? '',
     action: request.op,
     result: 'denied',
     reason,
     chars: 0,
     sha256: createHash('sha256').update('').digest('hex'),
-    ...(typeof pid === 'number' ? { peerPid: pid } : {}),
+    peerPid: pid ?? 'unknown',
+    ...(claimedPid !== undefined ? { claimedPid } : {}),
   });
 }
 

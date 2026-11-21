@@ -238,6 +238,17 @@ describe('runLlmPolicyInject — 합성 사건 결정 드라이런', () => {
       const other = await inject({ ...lowUse, states: [...windowOnly().filter((x) => x.row !== 'codex-team'), { row: 'codex-team', provider: 'openai-codex', lease: { leaseId: 'REAL-LEASE-TEST', expiresAt: LEASE } }] });
       expect(other.result.ok && other.result.decision?.lease).toBe('virtual(dry-run)');
     });
+    test('UX #115450 회귀: 같은 행이 두 번 주입돼도(앞 항목 임대 없음 · 뒤 항목 명시 임대) 선택 행 라벨은 injected', async () => {
+      await policy();
+      const lowUse = { row: 'codex-default', event: 'window-usage' as const, usedPct: 50, slopePctPerHour: 0, resetsAt: RESET, role: 'review' };
+      const bare: LlmSpendRowState = { row: 'codex-default', provider: 'openai-codex' };
+      const explicit: LlmSpendRowState = { row: 'codex-default', provider: 'openai-codex', lease: { leaseId: 'REAL-LEASE-TEST', expiresAt: LEASE } };
+      const dup = await inject({ ...lowUse, json: true, states: [bare, explicit] });
+      const parsed = JSON.parse(dup.out[0]!);
+      expect(parsed.decision.row).toBe('codex-default');
+      expect(parsed.decision.lease).toBe('injected');
+      expect(dup.out[0]).not.toContain('REAL-LEASE-TEST');
+    });
     test('가상 임대가 선택 행에 실제 적용되면 lease 는 virtual(dry-run) — 텍스트·JSON 동일 · 멈춤이면 none', async () => {
       await policy();
       const base = { row: 'codex-default', event: 'window-usage' as const, usedPct: 10, slopePctPerHour: 0.1, resetsAt: RESET, role: 'authoring', states: windowOnly() };

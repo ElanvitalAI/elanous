@@ -1,10 +1,94 @@
 /** Seat inbox heartbeat classification; see SEAT-INBOX-PROTOCOL.md §2b. */
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { basename, join, dirname, resolve } from 'node:path';
 
 export type InboxLiveness =
   | { state: 'live' | 'stale' | 'down'; ageMs: number }
-  | { state: 'unknown'; reason: 'invalid-beat' | 'identity-mismatch' | 'future-beat' | 'read-error' };
+  | { state: 'unknown'; reason: 'invalid-beat' | 'identity-mismatch' | 'future-beat' | 'read-error' | 'els-unavailable' | 'els-list-invalid' | 'els-ambiguous' | 'els-status-unknown' | 'host-ledger-unavailable' | 'host-ledger-invalid' | 'host-pane-unknown' };
+
+/** The ELS server owns this seat-to-pane registration; title text is never a seat identity. */
+export function seatFromPaneCwd(cwd: unknown): string | undefined {
+  if (typeof cwd !== 'string' || !cwd.startsWith('/')) return undefined;
+  let path = resolve(cwd);
+  while (path !== dirname(path)) {
+    const parent = dirname(path);
+    if (basename(parent) === 'seats' && basename(dirname(parent)) === 'elanous-hq') {
+      const seat = basename(path);
+      return /^[A-Z][A-Z0-9_-]{0,63}$/.test(seat) ? seat : undefined;
+    }
+    path = parent;
+  }
+  return undefined;
+}
+
+export function findElsSeatPane(list: unknown, seat: string): { kind: 'found'; pane: string; address: string } | { kind: 'absent' } | { kind: 'unknown'; reason: 'els-list-invalid' | 'els-ambiguous' } {
+  if (!list || typeof list !== 'object' || !Array.isArray((list as { panes?: unknown }).panes)) return { kind: 'unknown', reason: 'els-list-invalid' };
+  const listed = (list as { panes: unknown[] }).panes;
+  if (listed.some(row => !row || typeof row !== 'object' || Array.isArray(row))) return { kind: 'unknown', reason: 'els-list-invalid' };
+  const rows = listed as Record<string, unknown>[];
+  const matches = rows.filter(row => row.seat === seat || ((row.seat === null || row.seat === undefined || row.seat === '') && seatFromPaneCwd(row.cwd) === seat));
+  if (matches.length === 0) return { kind: 'absent' };
+  if (matches.length !== 1) return { kind: 'unknown', reason: 'els-ambiguous' };
+  const row = matches[0]!;
+  if (typeof row.pane !== 'string' || !row.pane || typeof row.address !== 'string' || !row.address
+    || typeof row.ptyId !== 'string') return { kind: 'unknown', reason: 'els-list-invalid' };
+  return { kind: 'found', pane: row.pane, address: row.address };
+}
+
+/** An active PTY is live while it is idle or working; empty input is only a send gate. */
+export function classifyElsPaneStatus(status: unknown): InboxLiveness {
+  if (!status || typeof status !== 'object') return { state: 'unknown', reason: 'els-status-unknown' };
+  const state = (status as { state?: unknown }).state;
+  if (state === 'idle' || state === 'working') return { state: 'live', ageMs: 0 };
+  if (state === 'exited') return { state: 'down', ageMs: Number.POSITIVE_INFINITY };
+  // ELS reached a live PTY and rendered its screen, but could not infer its activity.
+  // That proves process liveness only; send-verified still requires idle + empty input.
+  if (state === 'unknown' && (status as { reason?: unknown }).reason === 'no working row and no prompt recognised on screen')
+    return { state: 'live', ageMs: 0 };
+  return { state: 'unknown', reason: 'els-status-unknown' };
+}
+
+/** A remote tmux host is judged from its own pane ledger, never a local inbox.alive copy. */
+export function classifyTmuxSeatList(output: string, seat: string): InboxLiveness {
+  if (!/^[A-Z][A-Z0-9_-]{0,63}$/.test(seat)) return { state: 'unknown', reason: 'host-ledger-invalid' };
+  const rows = output.trim() ? output.trimEnd().split('\n') : [];
+  let uncertain = false;
+  for (const row of rows) {
+    const fields = row.split('|');
+    if (fields.length !== 5 || !/^%[0-9]+$/.test(fields[0]!) || !['0', '1'].includes(fields[3]!))
+      return { state: 'unknown', reason: 'host-ledger-invalid' };
+    const [, session, cwd, dead, command] = fields;
+    if (session !== `seat-${seat}`) continue;
+    if (seatFromPaneCwd(cwd) !== seat) continue;
+    if (dead === '1') continue;
+    if (['codex', 'eln', 'elanous', 'claude'].includes(command!)) return { state: 'live', ageMs: 0 };
+    uncertain = true;
+  }
+  return uncertain ? { state: 'unknown', reason: 'host-pane-unknown' }
+    : { state: 'down', ageMs: Number.POSITIVE_INFINITY };
+}
+
+/** An exact, unique running pane in the registered seat session is the only tmux wake target. */
+export function findTmuxSeatPane(output: string, seat: string): string | undefined {
+  if (!/^[A-Z][A-Z0-9_-]{0,63}$/.test(seat)) return undefined;
+  const matches: string[] = [];
+  for (const row of output.trim() ? output.trimEnd().split('\n') : []) {
+    const fields = row.split('|');
+    if (fields.length !== 5 || !/^%[0-9]+$/.test(fields[0]!) || !['0', '1'].includes(fields[3]!)) return undefined;
+    const [pane, session, cwd, dead, command] = fields;
+    if (session === `seat-${seat}` && seatFromPaneCwd(cwd) === seat && dead === '0'
+      && ['codex', 'eln', 'elanous', 'claude'].includes(command!)) matches.push(pane!);
+  }
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/** ELS federation's Herdr host reports seat cwd and status without an inbox heartbeat. */
+export function classifyHerdrSeatRows(rows: readonly { cwd: string; state: string }[], seat: string): InboxLiveness {
+  const matches = rows.filter(row => seatFromPaneCwd(row.cwd) === seat);
+  if (matches.some(row => ['idle', 'done', 'working'].includes(row.state))) return { state: 'live', ageMs: 0 };
+  if (matches.some(row => row.state === 'blocked' || row.state === 'unknown')) return { state: 'unknown', reason: 'host-pane-unknown' };
+  return { state: 'down', ageMs: Number.POSITIVE_INFINITY };
+}
 
 export function inboxLiveness(beat: unknown, identity: { host: string; sessionId?: string }, now: number): InboxLiveness {
   if (!beat || typeof beat !== 'object' || !Number.isFinite(now)) return { state: 'unknown', reason: 'invalid-beat' };

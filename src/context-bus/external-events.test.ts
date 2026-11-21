@@ -3,13 +3,63 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { openSurfaceEventsDb, recordEvent } from '../domains/surface-events.js';
+import { openSurfaceEventsDb, pruneStaleEvents, recordEvent } from '../domains/surface-events.js';
 import { contextDayTimeline } from './context-day.js';
 import { listCoordEvents, recordCoordEvent } from './coord-events.js';
 import { CONTEXT_SUMMARY_MAX, observeExternalEvent, recordExternalEvent } from './external-events.js';
 import { emitSessionEvent } from './session-events.js';
 
 const base = '2026-10-02T02:00:00.000Z';
+
+test('release graph exit delivery retries keep one signal receipt', () => {
+  const db = openSurfaceEventsDb(':memory:');
+  try {
+    const input = { origin: 'release-graph' as const, kind: 'exit' as const, summary: 'child finished',
+      source: 'elanous://release/run-1', delivery: { eventId: 'event-1', subscriberId: 'sub-1' } };
+    const first = recordExternalEvent(input, { db });
+    expect(recordExternalEvent(input, { db })).toBe(first);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM signals').get() as { n: number }).n).toBe(1);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n).toBe(0);
+  } finally { db.close(); }
+});
+
+test('release graph exit receipt survives signal retention for a delayed replay', () => {
+  const db = openSurfaceEventsDb(':memory:');
+  try {
+    const input = { origin: 'release-graph' as const, kind: 'exit' as const, summary: 'old child exit',
+      source: 'elanous://release/old-run', at: '2026-11-01T00:00:00Z',
+      delivery: { eventId: 'old-event', subscriberId: 'context-bus' } };
+    const first = recordExternalEvent(input, { db });
+    pruneStaleEvents(db, { nowExpr: '2026-11-21T00:00:00Z' });
+    expect(db.prepare('SELECT id FROM signals').all()).toEqual([]);
+    expect(recordExternalEvent(input, { db })).toBe(first);
+    expect(db.prepare('SELECT id FROM signals').all()).toEqual([]);
+  } finally { db.close(); }
+});
+
+test('upgrading an old journal backfills delivery receipts before signals expire', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-receipt-upgrade-'));
+  const path = join(root, 'surface_events.db');
+  try {
+    const old = openSurfaceEventsDb(path);
+    const input = { origin: 'release-graph' as const, kind: 'exit' as const, summary: 'old child exit',
+      source: 'elanous://release/old-run', at: '2026-11-01T00:00:00Z',
+      delivery: { eventId: 'old-event', subscriberId: 'context-bus' } };
+    const first = recordExternalEvent(input, { db: old });
+    recordEvent(old, { surface: 'context:external', direction: 'outbound', kind: 'exit',
+      text: 'invalid legacy refs', refs: '{invalid', ts: '2026-11-01T00:00:00Z' });
+    old.run('DROP TABLE external_delivery_receipts');
+    old.close();
+
+    const upgraded = openSurfaceEventsDb(path);
+    try {
+      pruneStaleEvents(upgraded, { nowExpr: '2026-11-21T00:00:00Z' });
+      expect(upgraded.prepare('SELECT id FROM signals').all()).toEqual([]);
+      expect(recordExternalEvent(input, { db: upgraded })).toBe(first);
+      expect(upgraded.prepare('SELECT id FROM signals').all()).toEqual([]);
+    } finally { upgraded.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('three origins share the chronological coord events journal without storing conversations', () => {
   const db = openSurfaceEventsDb(':memory:');

@@ -16,6 +16,7 @@ import { wallFromSearch } from './pty-wall';
 import { TerminalTabs, type InitialTerminalState } from './TerminalTabs';
 import { CompactTerminalBar } from './CompactTerminalBar';
 import { useCompactMode } from '@/lib/compact-mode';
+import { publishTermFontSize, subscribeTermFontSize } from '@/lib/term-focus';
 import { initialTerminalNotice } from './initial-terminal-notice';
 import { TuiMirrorViewLazy as TuiMirrorView } from './TuiMirrorView.lazy';
 import { TerminalControls } from './TerminalControls';
@@ -66,6 +67,14 @@ import {
 const ACTIVE_KEY = 'elanous.webterm.activeId';
 const MINIMIZED_KEY = 'elanous.webterm.panelsMinimized';
 const CHAT_DOCK_KEY = 'elanous.webterm.chatDockOpen';
+
+function readPanelPreference(key: string): string | null {
+  try { return window.localStorage.getItem(key); } catch { return null; }
+}
+
+function writePanelPreference(key: string, value: string): void {
+  try { window.localStorage.setItem(key, value); } catch { /* Keep the current UI state. */ }
+}
 // A bounded snapshot shows enough recent terminal context without making a list click expensive.
 const PTY_SCROLLBACK_LINES = 100;
 
@@ -104,6 +113,8 @@ export function TerminalPaneLayout({
   visible?: boolean;
   clearRequests?: Readonly<Record<string, number>>;
 }) {
+  const [sharedFontSize, setSharedFontSize] = useState<number | null>(null);
+  useEffect(() => subscribeTermFontSize(setSharedFontSize), []);
   const slots = layout.layouts.flatMap((entry) => entry.slots);
   const slotById = new Map(slots.map((slot) => [slot.terminalId, slot]));
   const runStartIds = new Set(layout.layouts.map((entry) => entry.slots[0]?.terminalId).filter((id): id is string => Boolean(id)));
@@ -140,6 +151,8 @@ export function TerminalPaneLayout({
               sessionId={sessionId}
               terminalId={terminalId}
               clearRequest={clearRequests?.[terminalId] ?? 0}
+              sharedFontSize={sharedFontSize}
+              onFontSizeChange={publishTermFontSize}
               onForeignInputActivity={onForeignInputActivity}
             />
           </div>
@@ -602,21 +615,21 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const stored = window.localStorage.getItem(ACTIVE_KEY);
+    const stored = readPanelPreference(ACTIVE_KEY);
     if (stored && stored.length > 0 && (!initialPtyId || stored !== initialPtyId)) {
       setTerminalId(stored);
       initialPickDoneRef.current = true; // 사람이 고른 것이 있다 — 자동 선택은 «안 돈다»
     }
-    const minStored = window.localStorage.getItem(MINIMIZED_KEY);
+    const minStored = readPanelPreference(MINIMIZED_KEY);
     if (minStored === '1') setPanelsMinimized(true);
-    const dockStored = window.localStorage.getItem(CHAT_DOCK_KEY);
+    const dockStored = readPanelPreference(CHAT_DOCK_KEY);
     if (dockStored === '0') setChatDockOpen(false);
   }, []);
 
   const onActiveChange = (next: string): void => {
     setTerminalId(next);
     if (typeof window !== 'undefined') {
-      window.localStorage.setItem(ACTIVE_KEY, next);
+      writePanelPreference(ACTIVE_KEY, next);
     }
   };
 
@@ -643,7 +656,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     setPanelsMinimized((prev) => {
       const next = !prev;
       if (typeof window !== 'undefined') {
-        window.localStorage.setItem(MINIMIZED_KEY, next ? '1' : '0');
+        writePanelPreference(MINIMIZED_KEY, next ? '1' : '0');
       }
       return next;
     });
@@ -657,19 +670,19 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     if (panelsMinimized) {
       setPanelsMinimized(false);
       if (typeof window !== 'undefined') {
-        window.localStorage.setItem(MINIMIZED_KEY, '0');
+        writePanelPreference(MINIMIZED_KEY, '0');
       }
       // dock open 도 같이 보장 — 사용자가 "보이게" 의도한 것이므로.
       setChatDockOpen(true);
       if (typeof window !== 'undefined') {
-        window.localStorage.setItem(CHAT_DOCK_KEY, '1');
+        writePanelPreference(CHAT_DOCK_KEY, '1');
       }
       return;
     }
     setChatDockOpen((prev) => {
       const next = !prev;
       if (typeof window !== 'undefined') {
-        window.localStorage.setItem(CHAT_DOCK_KEY, next ? '1' : '0');
+        writePanelPreference(CHAT_DOCK_KEY, next ? '1' : '0');
         // Force the xterm fit() in the next frame so the cell grid
         // catches up with the new container box. ResizeObserver fires
         // async after layout, which adds a 1-2 frame perceptual lag

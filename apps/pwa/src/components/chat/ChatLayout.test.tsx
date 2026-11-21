@@ -176,11 +176,12 @@ test('a session store failure is visible instead of being treated as an absent n
   } finally { error.mockRestore(); }
 });
 
-test('bare webchat origin never requests the session store and shows no restore error', async () => {
+// WEBCHAT-SESSION-HISTORY-PERSIST — bare 웹채팅도 이제 회원 스코프 /v1/sessions/store/:id 로 이전 대화를 복원한다.
+test('bare webchat origin restores the open conversation from the member-scoped session store', async () => {
   const error = spyOn(toast, 'error').mockImplementation(() => '' as never);
   try {
-    const { restoreRequests } = await mount({ acp: false, bare: true, restoreFailure: true });
-    expect(restoreRequests).toEqual([]);
+    const { restoreRequests } = await mount({ acp: false, bare: true });
+    expect(restoreRequests).toContain('/v1/sessions/store/session-1?ifExists=1');
     expect(error).not.toHaveBeenCalled();
   } finally { error.mockRestore(); }
 });

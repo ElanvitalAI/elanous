@@ -11,6 +11,7 @@ import { listCredentialSlotsAsync, selectBackendFromConfig, setCredentialSlotAsy
 import { scanCredentialImports, type CredentialImportScan } from '../setup/cred-import-scan.js';
 import { pickOpenRouterModel, SOLAR_DEMO_PRESET_ID } from './first-run/openrouter-picker.js';
 import { existingOpenRouterKey, openRouterHeadless, openRouterKeySuffix, openRouterPkce, registerOpenRouterByPhone, scanOpenRouterKeyCandidates } from './first-run/openrouter-key-supply.js';
+import { saveTimelyRouterCredential } from '../llm/timelyrouter-credential.js';
 
 export interface SetupKeysIO {
   ask(prompt: string): Promise<string>;
@@ -65,6 +66,7 @@ function providerForService(id: string): string | undefined {
     case 'openrouter': return 'openrouter';
     case 'xai': return 'grok';
     case 'opengateway': return 'opengateway';
+    case 'timelyrouter': return 'timelyrouter';
     default: return undefined;
   }
 }
@@ -72,7 +74,8 @@ function providerForService(id: string): string | undefined {
 function providerBaseUrl(config: UserConfig, serviceId: string): string | undefined {
   const provider = providerForService(serviceId);
   if (!provider) return undefined;
-  return config.llm.rotation?.find(item => item.provider === provider)?.baseUrl;
+  return (config.llm.provider === provider ? config.llm.baseUrl : undefined)
+    ?? config.llm.rotation?.find(item => item.provider === provider)?.baseUrl;
 }
 
 function renderProviderProposal(config: UserConfig, providers: Awaited<ReturnType<typeof detectProviders>>): string[] {
@@ -147,6 +150,14 @@ export async function importServiceKeys(values: ParsedServiceKeyEnv, io: Pick<Se
       try {
         if (options.saveCredentialSlotBatch) await options.saveCredentialSlotBatch({ [item.storeIds[0]]: value });
         else await (options.saveCredentialSlot ?? setCredentialSlotAsync)(item.storeIds[0], value);
+        env[name] = value;
+        stored.push(name);
+      } catch { rejected.push(name); }
+    } else if (item?.id === 'timelyrouter') {
+      try {
+        const baseUrl = providerBaseUrl(options.config, item.id) ?? env.TIMELYROUTER_BASE_URL;
+        if (!baseUrl) throw new Error('timelyrouter baseUrl required');
+        saveTimelyRouterCredential(value, baseUrl, options.cacheDir);
         env[name] = value;
         stored.push(name);
       } catch { rejected.push(name); }

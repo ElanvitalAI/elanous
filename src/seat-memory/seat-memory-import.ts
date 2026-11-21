@@ -15,16 +15,19 @@ import {
 
 export type SeatMemoryImportAction = 'create' | 'update' | 'same';
 export type SeatMemoryImportSkip = 'secret-pattern' | 'unparsable' | 'not-regular-file';
+const SUPPLEMENTAL_MARKER = '<!-- elanous seat memory import: unindexed -->';
 
 export interface SeatMemoryImportPlan {
   from: string;
   to: string;
   seat: string;
-  files: Array<{ file: string; name: string; action: SeatMemoryImportAction; text: string }>;
+  files: Array<{ file: string; name: string; action: SeatMemoryImportAction; text: string; reference?: boolean }>;
   /** 거부·건너뛴 파일 — 이름만(본문 0). */
   skipped: Array<{ file: string; reason: SeatMemoryImportSkip }>;
-  /** 새 색인 문면(원본 순서 보존 ⊕ 기존 자리 줄 ⊕ 빠진 줄 보충). */
+  /** 손 고른 원본 주 색인 줄만 담는다. */
   index: string;
+  /** 주 색인 밖 기억을 가리키는 하위 색인. 첫 턴 주 색인에는 자동으로 붙이지 않는다. */
+  supplementalIndex?: { file: string; text: string };
   indexDroppedLines: number;
 }
 
@@ -47,6 +50,35 @@ function realOrSelf(path: string): string {
   try { return join(realpathSync(head), ...tail); } catch { return abs; }
 }
 
+function regularFile(path: string): boolean {
+  try { return lstatSync(path).isFile(); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function pathOccupied(path: string): boolean {
+  try { lstatSync(path); return true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function supplementalFileName(from: string, to: string): string {
+  for (let suffix = 0; suffix < 100; suffix++) {
+    const name = suffix ? `MEMORY-UNINDEXED-${suffix + 1}.md` : 'MEMORY-UNINDEXED.md';
+    if (pathOccupied(join(from, name))) continue;
+    const target = join(to, name);
+    let stat;
+    try { stat = lstatSync(target); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return name;
+      throw error;
+    }
+    if (stat.isFile() && readFileSync(target, 'utf8').startsWith(SUPPLEMENTAL_MARKER)) return name;
+  }
+  throw new Error('보조 색인 파일 이름을 안전하게 고를 수 없음');
+}
+
 /** 원본을 읽어 계획을 만든다(쓰기 0). */
 export function planSeatMemoryImport(opts: { from: string; to: string; seat: string }): SeatMemoryImportPlan {
   const from = realOrSelf(opts.from);
@@ -55,6 +87,11 @@ export function planSeatMemoryImport(opts: { from: string; to: string; seat: str
   if (isInside(to, from) || isInside(from, to)) throw new Error('원본과 대상 폴더가 겹친다 — 원본은 읽기 전용이다');
   const existing = new Map(listSeatMemories(to).map(e => [e.file, e]));
   const existingByName = new Map(listSeatMemories(to).map(e => [e.name, e]));
+  const sourceIndexPath = join(from, SEAT_MEMORY_INDEX_FILE);
+  const sourceIndex = existsSync(sourceIndexPath) && lstatSync(sourceIndexPath).isFile()
+    ? readFileSync(sourceIndexPath, 'utf8') : '';
+  const linkOf = (line: string): string | null => /\]\(([^)\s]+\.md)\)/.exec(line)?.[1] ?? null;
+  const sourceLinks = new Set(sourceIndex.split('\n').map(linkOf).filter((link): link is string => link !== null));
   const files: SeatMemoryImportPlan['files'] = [];
   const skipped: SeatMemoryImportPlan['skipped'] = [];
   for (const file of readdirSync(from).sort()) {
@@ -66,7 +103,15 @@ export function planSeatMemoryImport(opts: { from: string; to: string; seat: str
     const text = readFileSync(path, 'utf8');
     if (looksSecret(text)) { skipped.push({ file, reason: 'secret-pattern' }); continue; }
     const entry = parseSeatMemoryText(text, file);
-    if (!entry) { skipped.push({ file, reason: 'unparsable' }); continue; }
+    if (!entry) {
+      // A linked subindex is a reference document, not a malformed memory card.
+      if (!sourceLinks.has(file)) { skipped.push({ file, reason: 'unparsable' }); continue; }
+      const targetPath = join(to, file);
+      const present = existsSync(targetPath) && lstatSync(targetPath).isFile();
+      files.push({ file, name: file, reference: true, action: !present ? 'create'
+        : readFileSync(targetPath, 'utf8') === text ? 'same' : 'update', text });
+      continue;
+    }
     // 같은 name 이 다른 파일로 이미 있으면 그 파일을 고친다(중복 0).
     const target = existingByName.get(entry.name)?.file ?? file;
     const current = existing.get(target);
@@ -74,31 +119,38 @@ export function planSeatMemoryImport(opts: { from: string; to: string; seat: str
       : readFileSync(join(to, target), 'utf8') === text ? 'same' : 'update';
     files.push({ file: target, name: entry.name, action, text });
   }
-  // 색인: 원본 줄(거부·누락 파일 가리키는 줄과 비밀처럼 보이는 줄은 뺌) → 대상에만 있는 기존 줄 → 줄 없는 가져온 기억.
+  // 원본 주 색인 줄은 제자리 보존. 대상의 옛 자동 덧붙임과 새 미색인 기억은 하위 색인으로 이동.
   const imported = new Set(files.map(f => f.file));
-  const sourceIndex = existsSync(join(from, SEAT_MEMORY_INDEX_FILE)) && lstatSync(join(from, SEAT_MEMORY_INDEX_FILE)).isFile()
-    ? readFileSync(join(from, SEAT_MEMORY_INDEX_FILE), 'utf8') : '';
-  const linkOf = (line: string): string | null => /\]\(([^)\s]+\.md)\)/.exec(line)?.[1] ?? null;
   const out: string[] = [];
   let dropped = 0;
+  const available = (link: string): boolean => basename(link) === link
+    && (imported.has(link) || existing.has(link) || regularFile(join(to, link)));
   for (const line of sourceIndex.replace(/\n+$/, '').split('\n')) {
     if (!sourceIndex) break;
     const link = linkOf(line);
-    if ((link && !imported.has(link) && !existing.has(link)) || looksSecret(line)) { dropped += 1; continue; }
+    if ((link && !available(link)) || looksSecret(line)) { dropped += 1; continue; }
     out.push(line);
   }
-  const has = (file: string): boolean => out.some(l => l.includes(`](${file})`));
+  const supplemental: string[] = [];
+  const has = (lines: string[], file: string): boolean => lines.some(l => l.includes(`](${file})`));
   for (const line of readSeatMemoryIndex(to).replace(/\n+$/, '').split('\n')) {
     const link = linkOf(line);
-    if (link && !has(link)) out.push(line);
+    if (link && basename(link) === link && !looksSecret(line) && !has(out, link)
+      && (imported.has(link) || existing.has(link)) && !has(supplemental, link)) supplemental.push(line);
   }
   for (const f of files) {
-    if (!has(f.file)) {
+    if (!f.reference && !has(out, f.file) && !has(supplemental, f.file)) {
       const entry = parseSeatMemoryText(f.text, f.file)!;
-      out.push(seatMemoryIndexLine(entry));
+      supplemental.push(seatMemoryIndexLine(entry));
     }
   }
-  return { from, to, seat: opts.seat, files, skipped, index: out.length ? `${out.join('\n')}\n` : '', indexDroppedLines: dropped };
+  for (const entry of existing.values()) {
+    if (!has(out, entry.file) && !has(supplemental, entry.file)) supplemental.push(seatMemoryIndexLine(entry));
+  }
+  const supplementalFile = supplemental.length ? supplementalFileName(from, to) : null;
+  return { from, to, seat: opts.seat, files, skipped, index: out.length ? `${out.join('\n')}\n` : '',
+    ...(supplementalFile ? { supplementalIndex: { file: supplementalFile, text: `${SUPPLEMENTAL_MARKER}\n${supplemental.join('\n')}\n` } } : {}),
+    indexDroppedLines: dropped };
 }
 
 export interface SeatMemoryImportSummary {
@@ -123,6 +175,7 @@ export function summarizeSeatMemoryImport(plan: SeatMemoryImportPlan, applied: b
 export function applySeatMemoryImport(plan: SeatMemoryImportPlan): SeatMemoryImportSummary {
   mkdirSync(plan.to, { recursive: true });
   for (const f of plan.files) if (f.action !== 'same') writeFileDurable(join(plan.to, f.file), f.text);
+  if (plan.supplementalIndex) writeFileDurable(join(plan.to, plan.supplementalIndex.file), plan.supplementalIndex.text);
   writeFileDurable(join(plan.to, SEAT_MEMORY_INDEX_FILE), plan.index);
   const summary = summarizeSeatMemoryImport(plan, true);
   debug.log('memory', 'imported', {

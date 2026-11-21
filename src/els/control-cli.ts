@@ -124,7 +124,7 @@ function outcomeToResult(outcome: ControlOutcome): ElsResult {
 }
 
 /** Pane lookup and allow-list name resolution from one journal. Names resolve to ids; ids stay ids. */
-export function journalControl(journal: SpaceJournal): { readonly lookup: (ref: string) => Promise<ControlTarget | undefined>; readonly resolve: IdResolver } {
+export function journalControl(journal: SpaceJournal): { readonly lookup: (ref: string) => Promise<ControlTarget | undefined>; readonly lookupWithTab: (ref: string) => Promise<ControlTarget | undefined>; readonly resolve: IdResolver } {
   const workspaceOf = (paneId: string): string | undefined => {
     const pane = journal.panes.find((row) => row.id === paneId);
     const tab = pane ? journal.tabs.find((row) => row.id === pane.tabId) : undefined;
@@ -136,6 +136,12 @@ export function journalControl(journal: SpaceJournal): { readonly lookup: (ref: 
       const workspace = pane ? workspaceOf(pane.id) : undefined;
       if (!pane || !workspace) return undefined;
       return { workspace, pane: pane.id, shell: pane.kind === 'pty' };
+    },
+    lookupWithTab: async (ref) => {
+      const pane = findPane(journal, ref);
+      const workspace = pane ? workspaceOf(pane.id) : undefined;
+      if (!pane || !workspace) return undefined;
+      return { workspace, tab: pane.tabId, pane: pane.id, shell: pane.kind === 'pty' };
     },
     resolve: {
       workspace: (ref) => journal.workspaces.find((row) => row.id === ref)?.id ?? journal.workspaces.find((row) => row.name === ref)?.id,

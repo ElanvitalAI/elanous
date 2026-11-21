@@ -45,18 +45,6 @@ export default function RootLayout({
 }) {
   return (
     <html lang="ko" className={cn('font-sans', geist.variable)}>
-      <head>
-        {/* Preload the Regular weight so xterm.js measures glyphs with
-            the bundled Nerd Font on first paint instead of falling back
-            to monospace and reflowing once the @font-face fetch lands. */}
-        <link
-          rel="preload"
-          as="font"
-          type="font/ttf"
-          href="/app/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"
-          crossOrigin="anonymous"
-        />
-      </head>
       <body className="min-h-screen bg-background text-foreground antialiased">
         <ServiceWorkerRegister />
         <NewBuildBanner />

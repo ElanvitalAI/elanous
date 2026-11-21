@@ -3,7 +3,7 @@ import { loadPrivateRedactions, privateRedactionsPath } from '../../scripts/publ
 import { defaultSshRunner, type SshRunner } from './parent-host.js';
 import { shellQuote } from './task-hand.js';
 
-const ALLOWED_HOSTS = new Set(['node-b', 'elangram-wsl', 'host-e-wsl']);
+const ALLOWED_HOSTS = new Set(['node-b', 'gcp1', 'elangram-wsl', 'host-e-wsl']);
 
 /** Give a train host the same private list that release export-check reads on HQ.
  * The list travels only over SSH stdin and is installed atomically at mode 0600.

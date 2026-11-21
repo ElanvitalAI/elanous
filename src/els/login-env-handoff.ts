@@ -29,6 +29,7 @@ export function packLoginEnv(captured: Readonly<Record<string, string>>, key: st
   const env: Record<string, string> = { ...captured };
   delete env[AUTH_OWNER_TOKEN_ENV];
   delete env[AUTH_PANE_TOKEN_ENV];
+  delete env.ELANOUS_CEO_TELEGRAM_TOKEN;
   return JSON.stringify({ key, env });
 }
 
@@ -53,7 +54,8 @@ export function warmLoginEnv(): Promise<void> {
       if (await warmCapturedEnv() && capturedEnvAvailable()) {
         cache = { key, payload: packLoginEnv(getCapturedEnv(), key) };
         // The capture inherits this server's own tokens from process.env; keep them out of the server's shared cache too.
-        const { [AUTH_OWNER_TOKEN_ENV]: _owner, [AUTH_PANE_TOKEN_ENV]: _pane, ...scrubbed } = getCapturedEnv();
+        const { [AUTH_OWNER_TOKEN_ENV]: _owner, [AUTH_PANE_TOKEN_ENV]: _pane,
+          ELANOUS_CEO_TELEGRAM_TOKEN: _ceoBot, ...scrubbed } = getCapturedEnv();
         adoptCapturedEnv(scrubbed);
       }
     }

@@ -2526,10 +2526,12 @@ export async function runWarmPodProviderCli(argv: readonly string[] = process.ar
   return { exitCode: 2 };
 }
 
-if (import.meta.main) {
+async function runWarmPodProviderMain(): Promise<void> {
   try { process.exitCode = (await runWarmPodProviderCli()).exitCode; }
   catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 2;
   }
 }
+
+if (import.meta.main) void runWarmPodProviderMain();

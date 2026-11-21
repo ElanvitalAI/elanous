@@ -34,7 +34,7 @@ describe('toCodexResponsesTools — server-tool opt-in', () => {
       { name: 'web_fetch', description: 'fetch url', parameters: { type: 'object', properties: {} } },
     ]);
     expect(out).toEqual([
-      { type: 'function', name: 'web_fetch', description: 'fetch url', parameters: { type: 'object', properties: {} } },
+      { type: 'function', name: 'web_fetch', description: 'fetch url', parameters: { type: 'object', properties: {} }, strict: false },
     ]);
   });
 

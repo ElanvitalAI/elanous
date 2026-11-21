@@ -15,14 +15,15 @@
 // drop-oldest retry loop: when the summarizer itself overflows on a
 // huge transcript, elanous's provider returns null and the pipeline
 // no-ops. Rather than give up (fatal for an unattended run), we shed
-// the oldest non-preserved message and retry so the summarizer input
-// shrinks until it fits.
+// the oldest non-preserved assistant/tool-carrier row and retry so the
+// summarizer input shrinks until it fits. ★ COMPACT P0(OP #123867) —
+// 사람 user 행은 결코 흘리지 않는다(원문 보존 계약이 우선).
 
 import type { ContentBlock, LLMMessage } from '../llm.js';
 import { estimateTokens } from '../tokens.js';
 import { debug } from '../debug/log.js';
 import { shouldAutoCompact } from '../compact/auto.js';
-import { runCompactPipeline } from '../compact/pipeline.js';
+import { runCompactPipeline, isHumanUserMessage } from '../compact/pipeline.js';
 import { getDefaultCompactProvider, type CompactProvider } from '../compact/provider.js';
 import type { ChatAutoCompactConfig } from '../user-config/chat.js';
 import { loadSession, rewriteSessionMessages, type SerializedMessage } from './index.js';
@@ -106,12 +107,17 @@ function toSerialized(m: LLMMessage, ts: string): SerializedMessage {
   return { role, content, ts, tokenEstimate: estimateTokens(content) };
 }
 
-/** Index of the oldest non-system message outside the preserve window, or -1 when nothing is
- *  droppable so the retry loop terminates. */
+/** Index of the oldest droppable message outside the preserve window, or -1 when nothing is
+ * droppable so the retry loop terminates. ★ COMPACT P0(OP #123867 · JUD-B #124147 · OP
+ * #124161) — 사람 user 행은 원문 보존 계약 때문에 drop 후보에서 제외된다: overflow
+ * 재시도는 assistant·tool_result 캐리어 행만 줄인다. 후보가 사람 user 뿐이면 -1 로
+ * 즉시 종결한다(보존이 압축 성공보다 우선). */
 function dropOldestIndex(messages: LLMMessage[], preserveLastN: number): number {
   const preserveFrom = Math.max(0, messages.length - preserveLastN);
   for (let i = 0; i < preserveFrom; i++) {
-    if (messages[i]!.role === 'system') continue;
+    const m = messages[i]!;
+    if (m.role === 'system') continue;
+    if (isHumanUserMessage(m)) continue;
     return i;
   }
   return -1;
@@ -187,8 +193,9 @@ export async function compactSessionHistory(
 
   // codex #1 remove_first_item — run the pipeline; if it produced no
   // reduction (summarizer overflow / null + no fallback target), shed
-  // the oldest non-preserved message and retry so the summarizer input
-  // shrinks until it fits.
+  // the oldest non-preserved assistant/tool-carrier row and retry so the
+  // summarizer input shrinks until it fits. 사람 user 행은 drop 후보에서
+  // 제외된다(COMPACT P0 OP #123867 · OP #124161) — 후보가 없으면 no-op 로 끝난다.
   let working = llm;
   let workingRows = convoIdx;
   let result = await runCompactPipeline(working, {
@@ -267,8 +274,9 @@ export async function compactSessionHistory(
 
 /** Map the pipeline output back onto the stored rows without converting any role.
  *  - Layer 3 (LLM summary, written first since no anchors are pinned here): the audit rows before the
- *    kept tail stay in their original order, then the summary (+ replayed user), then the stored tail
- *    rows as they are — audit rows inside the tail keep their position.
+ *    kept tail stay in their original order, then the summary (+ structurally preserved user
+ *    messages · COMPACT P0 OP #123867), then the stored tail rows as they are — audit rows inside
+ *    the tail keep their position.
  *  - Otherwise (Layer 5 truncation, one message per working row): each kept conversation row keeps its
  *    stored identity with only its content updated; audit rows stay where they are. */
 function rewriteKeepingAuditRows(
@@ -280,19 +288,23 @@ function rewriteKeepingAuditRows(
   const messages = result.messages;
   const summaryAt = messages.findIndex(m => m.role === 'system' && typeof m.content === 'string' && m.content.startsWith('<context_summary>'));
   if (result.diagnostics.layer3SummaryApplied === 1 && summaryAt >= 0) {
-    const replay = result.diagnostics.userReplayApplied === 1 ? 1 : 0;
-    const tailLen = messages.length - summaryAt - 1 - replay;
+    // ★ COMPACT P0 (OP #123867) — user 메시지는 원문 보존으로 summary 뒤에 살아
+    //   있다(Wave 7 replay 폐지). summary 이후 블록 = 보존 user P개 + tail T개 →
+    //   tail 은 마지막 T개 working rows 에 1:1, 보존 user 는 원본 행 그대로.
+    const preserved = result.preservedUserIndices ?? [];
+    const tailLen = messages.length - summaryAt - 1 - preserved.length;
     const tailStart = tailLen > 0 ? workingRows[workingRows.length - tailLen]! : rows.length;
     const anchors = workingRows.slice(0, summaryAt);
     const keptHead = rows.slice(0, tailStart).filter((row, i) => isAuditRow(row) || anchors.includes(i));
+    const preservedRows = preserved
+      .map(pos => workingRows[pos])
+      .filter((row): row is number => row !== undefined)
+      .map(row => rows[row]!)
+      .filter((row): row is SerializedMessage => row !== undefined);
     return [
       ...keptHead,
       toSerialized(messages[summaryAt]!, ts),
-      ...(replay === 1 ? [
-        result.replaySourceIndex !== undefined && workingRows[result.replaySourceIndex] !== undefined
-          ? rows[workingRows[result.replaySourceIndex]!]!
-          : toSerialized(messages[summaryAt + 1]!, ts),
-      ] : []),
+      ...preservedRows,
       ...rows.slice(tailStart),
     ];
   }

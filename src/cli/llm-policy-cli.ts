@@ -362,7 +362,8 @@ export async function runLlmPolicyInject(opts: LlmPolicyInjectOptions): Promise<
   });
   const skipped = decision.skipped.map((s) => ({ row: s.row, why: s.why }));
   // 라벨은 «선택된 행» 의 임대 출처만 말한다 — 다른 행의 명시 임대나 가상 임대는 영향 0.
-  const explicitLease = decision.outcome === 'choice' ? (opts.states ?? []).find((s) => s.row === decision.row)?.lease : undefined;
+  // 같은 행을 두 번 주입해도 결정 함수가 본 병합 결과(mergeRowStates)와 같은 임대를 본다(UX #115450 중복 행 반례).
+  const explicitLease = decision.outcome === 'choice' ? mergeRowStates([], opts.states ?? []).find((s) => s.row === decision.row)?.lease : undefined;
   const leaseSource: InjectLeaseSource = decision.outcome !== 'choice' ? 'none'
     : explicitLease === undefined ? VIRTUAL_LEASE_ID
       : explicitLease.leaseId === null ? 'none' : 'injected';

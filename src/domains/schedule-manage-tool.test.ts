@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SCHEDULE_MANAGE_SPEC, compactSchedule, dispatchScheduleManage } from './schedule-manage-tool.js';
@@ -16,8 +16,10 @@ const schedule = (command: string, extra: Record<string, unknown> = {}) => ({
 describe('dispatchScheduleManage wrap — explicit shell jobs', () => {
   test('dry-run lists shell and Bun jobs, counts interpreter-free .sh, and --yes backs up and preserves ids', async () => {
     const root = mkdtempSync(join(tmpdir(), 'schedule-wrap-shell-'));
-    const bin = join(root, 'crontab');
-    const state = join(root, 'crontab.txt');
+    const binDir = join(root, 'bin');
+    mkdirSync(binDir);
+    const bin = join(binDir, 'crontab');
+    const state = join(root, 'crontab');
     const lines = [
       '0 7 * * * zsh $HOME/s/intake-cron.sh',
       '20 4 * * * bash /x/backup.sh --source cron >> /tmp/b.log 2>&1',
@@ -35,7 +37,7 @@ describe('dispatchScheduleManage wrap — explicit shell jobs', () => {
     const previous = { state: process.env.ELANOUS_STATE_DIR, config: process.env.ELANOUS_CONFIG_DIR, path: process.env.PATH };
     process.env.ELANOUS_STATE_DIR = root;
     process.env.ELANOUS_CONFIG_DIR = root;
-    process.env.PATH = `${root}:${previous.path ?? ''}`;
+    process.env.PATH = `${binDir}:${previous.path ?? ''}`;
     try {
       const dry = await dispatchScheduleManage({ action: 'wrap' }) as { dryRun: boolean; count: number; jobs: string[]; skippedShell: number };
       expect(dry).toMatchObject({ dryRun: true, count: 7, skippedShell: 2 });

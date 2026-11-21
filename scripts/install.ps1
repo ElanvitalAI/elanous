@@ -488,6 +488,13 @@ try {
   $version = (Read-Text $installedPackage | ConvertFrom-Json).version
   if (-not $version) { Fail "package version missing: $installedPackage" 1 }
   $metadata = [ordered]@{ version = $version; versionDir = "versions/$versionName"; source = $metadataSource; installedAt = [DateTime]::UtcNow.ToString('o') }
+  $metadata.channel = if ($releaseDirectory -and $version -match '^\d+\.\d+\.\d+$') { 'official' } else { 'dev' }
+  $packedBuildPath = Join-Path $versionDirectory 'node_modules\elanous\src\version\packed-revision.json'
+  $packedBuild = if (Test-Path -LiteralPath $packedBuildPath) { try { Read-Text $packedBuildPath | ConvertFrom-Json } catch { $null } } else { $null }
+  if ($packedBuild -and $packedBuild.builtAt -gt 0 -and (-not $metadataCommit -or $packedBuild.commit -eq $metadataCommit)) {
+    $metadata.builtAt = $packedBuild.builtAt
+  }
+  if (-not $metadataCommit -and $packedBuild -and $packedBuild.commit -cmatch '^[0-9a-f]{40}$') { $metadataCommit = $packedBuild.commit }
   if ($metadataCommit) { $metadata.commit = $metadataCommit }
   $metadataJson = $metadata | ConvertTo-Json -Compress
   $metadataJson | Set-Content -LiteralPath (Join-Path $Prefix 'install.json') -NoNewline

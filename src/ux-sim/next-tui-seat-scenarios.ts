@@ -790,6 +790,27 @@ function activeUserTexts(root: string): { id: string; user: string[] } {
   return { id, user: id ? userTexts(root, id) : [] };
 }
 
+// The stop banner can disappear before any PTY screen poll. Prove interruption via
+// the isolated session and ordered latency/dispatch events instead of demanding a banner.
+export function queueWakeInterrupted(events: LogEvent[], users: string[]): boolean {
+  const cancelled = events.findIndex((event) => event.category === 'tui.next' && event.event === 'turn-latency'
+    && parseData<{ outcome: string }>(event.data).outcome === 'cancelled');
+  const dispatch = events.findIndex((event, index) => index > cancelled && event.category === 'tui.next'
+    && event.event === 'queue-dispatched' && parseData<{ remaining: number }>(event.data).remaining === 0);
+  const marker = users.indexOf('[사용자가 이 턴을 중단했습니다]');
+  return cancelled >= 0 && dispatch > cancelled && marker > 0
+    && users[marker - 1] === '쓰던 초안 천천히' && users[marker + 1]?.endsWith('다섯째') === true;
+}
+
+export function queueWakeResponseShown(screen: string, reply: string): boolean {
+  const lines = screen.split('\n');
+  const composer = lines.reduce((last, line, index) => line.startsWith('❯') ? index : last, -1);
+  const queued = lines.findIndex((line) => /^(?:›|>)\s+다섯째\s*$/.test(line));
+  return composer >= 0 && lines[composer]!.trim() === '❯ 미전송 초안'
+    && queued >= 0 && queued < composer && lines.slice(queued + 1, composer).join('\n').includes(reply)
+    && !/응답 중단 확인|Confirm stopping turn/.test(screen);
+}
+
 /** TUI-NEXT-QUEUE-AND-WAKE ① — two sentences and a draft typed while one slow turn runs; Esc aborts the turn, the queued sentence wakes as the next turn, and the unsent draft stays. */
 async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
   const slow = '천천히';
@@ -805,8 +826,8 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
     { label: 'fifth turn queued', text: '다섯째', until: (s) => /(대기 1|1 queued|1 steer pending)/.test(s), timeoutMs: 10_000 }, // #38392
     { label: 'unsent draft stays behind queue', text: '미전송 초안', enter: false, until: (s) => /(대기 1|1 queued|1 steer pending)/.test(s) && s.includes('미전송 초안'), timeoutMs: 10_000 }, // #38392
     // Source: .rules/30-harness/testing-gates.md — immediate Esc recovery has a two-second upper bound.
-    // #38392/#73315 — 중단 배너 둘 다 승인; 깨어난 큐 문장의 응답과 잔류 초안이 2초 창 안에 보여야 한다.
-    { label: 'esc aborts; queued sentence wakes, draft stays', keys: '\x1b', until: (s) => (s.includes('이 턴을 중단했습니다') || /Stopped after/.test(s)) && s.includes('다섯째') && s.includes('미전송 초안') && !s.includes('응답 중단 확인'), timeoutMs: 2_000 },
+    // Stop is transient; capture the wake independently within the recovery bound.
+    { label: 'queued sentence wakes, draft stays', keys: '\x1b', until: (s) => queueWakeResponseShown(s, reply), timeoutMs: 2_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -825,7 +846,7 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
   const events = parseEvents(logs);
   const store = activeUserTexts(root);
   const frame = (label: string) => run.frames.find((f) => f.label === label)?.screen ?? '';
-  const escFrame = frame('esc aborts; queued sentence wakes, draft stays');
+  const escFrame = frame('queued sentence wakes, draft stays');
   const escLines = escFrame.split('\n');
   const lastComposerIndex = escLines.reduce((last, line, index) => line.startsWith('❯') ? index : last, -1);
   const composerLines = escLines.slice(lastComposerIndex, lastComposerIndex + 1).map(line => line.trim()); // #38392 footer moves below composer — composer = last ❯ line
@@ -836,7 +857,7 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
     userTurnsInOrder: JSON.stringify(store.user.slice(0, 3)) === JSON.stringify([`첫 질문 ${slow}`, '둘째 질문', '셋째 질문']),
     threeReplies: count(frame('after settle'), reply) === 3,
     draftKept: (frame('after settle').split('\n').find((line) => line.startsWith('❯')) ?? '').includes('쓰던 초안'), // #38392 footer moves below composer
-    escWakesQueuedTurn: (escFrame.includes('이 턴을 중단했습니다') || /Stopped after/.test(escFrame))
+    escWakesQueuedTurn: queueWakeInterrupted(events, store.user) && queueWakeResponseShown(escFrame, reply)
       && store.user.some((u) => u.endsWith('다섯째')) && count(escFrame, reply) >= 1, // 큐 문장이 다음 턴의 사용자 콘텐츠로 보존 — 유실 없음(중단 문맥 노트가 앞에 붙어도 문장은 꼬리로 남는다; 탐침 실측)
     escCancelsWithoutShellConfirmation: !escFrame.includes('응답 중단 확인'),
     escKeepsUnsentDraft: composerLines[0] === '❯ 미전송 초안',

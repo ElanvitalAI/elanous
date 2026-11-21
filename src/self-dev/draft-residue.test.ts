@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
 import { debug } from '../debug/log.js';
+import type { HostRegatePrHeadSnapshot } from '../self-implement/regate-detail.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { podSelfImplementSpawn, type Kubectl, type PodSpawnOptions } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { runDraftSweep, type DraftSweepAdapters, type SweepDraft } from './draft-sweep.js';
@@ -920,7 +921,7 @@ describe('Pod terminal residue', () => {
   test('host-regate failure reason survives classification and the pr-terminal ledger row (AUT-HOST-REGATE-REASON-LOST)', async () => {
     const rawDetail = `error\n  TS2345:   Argument of type 'string' is not assignable to parameter of type 'number'. ${'noise '.repeat(120)}`;
     const folded = rawDetail.split(/\s+/).filter(Boolean).join(' ');
-    const prHeadSnapshot = { headRefOid: 'a'.repeat(40), state: 'OPEN', isDraft: true, baseRefName: 'main', baseRefOid: 'b'.repeat(40) };
+    const prHeadSnapshot: HostRegatePrHeadSnapshot = { headRefOid: 'a'.repeat(40), state: 'OPEN', isDraft: true, baseRefName: 'main', baseRefOid: 'b'.repeat(40) };
     const failed = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
       hostRegate: { passed: false, failures: [{ step: 'typecheck', detail: rawDetail,
         failedConditions: ['pr-is-draft'], prHeadSnapshot }], os: 'ubuntu-24.04' } } });

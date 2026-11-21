@@ -1779,7 +1779,7 @@ test('seat-stop admits only an allowed local seat and a valid mode through the o
   const calls: string[] = [];
   const target = { id, ...fakeHandle() };
   const unregister = registerPtyControlTarget(target);
-  upsertPtyManifest({ id, kind: 'tui', cmd: 'eln', seat: 'TC', startedAt: Date.now(), now: Date.now() });
+  upsertPtyManifest({ id, kind: 'tui', cmd: 'eln', seat: 'TC', workdir: '/seats/TC', startedAt: Date.now(), now: Date.now() });
   const unbind = setSeatStopHandler(async (request) => { calls.push(request.mode); return 'waiting'; });
   async function send(payload: unknown) {
     const result = requestRemotePtyControl(id, 'seat-stop' as never, payload as never);
@@ -1790,6 +1790,14 @@ test('seat-stop admits only an allowed local seat and a valid mode through the o
     expect(await send({ mode: 'quit', sender: 'OTHER' })).toEqual({ status: 'denied', reason: 'seat-control-not-authorized' });
     expect(await send({ mode: 'bogus', sender: 'OP' })).toEqual({ status: 'denied', reason: 'invalid-seat-stop' });
     expect(await send({ mode: 'quit', sender: 'OP' })).toEqual({ status: 'success', reason: 'waiting' });
-    expect(calls).toEqual(['quit']);
+    const current = getPtyManifest(id)!;
+    const expected = { id, ownerPid: current.ownerPid, sessionId: current.sessionId, workdir: current.workdir! };
+    for (const changed of [{ id: 'tui:wrong' }, { ownerPid: current.ownerPid + 1 },
+      { sessionId: `${current.sessionId}-wrong` }, { workdir: '/other' }]) {
+      expect(await send({ mode: 'migrate', sender: 'OP', expected: { ...expected, ...changed } }))
+        .toEqual({ status: 'denied', reason: 'target-changed' });
+    }
+    expect(await send({ mode: 'migrate', sender: 'OP', expected })).toEqual({ status: 'success', reason: 'waiting' });
+    expect(calls).toEqual(['quit', 'migrate']);
   } finally { unbind(); unregister(); }
 });

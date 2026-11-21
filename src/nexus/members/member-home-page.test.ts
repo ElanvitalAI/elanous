@@ -16,7 +16,7 @@ const member: MemberHomePageInput = {
   },
   connection: { linked: false, recheckUrl: "/v1/members/home" },
   siteUrl: "https://elanous.ai/",
-  handleStepUrl: "https://elanous.ai/members/",
+  handleStepUrl: "https://elanous.ai/v1/members/handle",
   webChatUrl: "https://mychat--member-a.elanous.app/",
   myElanous: { handleAddress: null },
   devices: [],
@@ -35,7 +35,7 @@ test("signed-in home has one next action, public account data and no key control
   expect(primaries(page)).toEqual(["기기 연결하는 법"]);
   // No handle yet: the card offers the website's handle step instead of saying «핸들을 먼저 정해야» with nowhere to go.
   expect(page).toContain(
-    '<a class="quiet" data-member-handle-step href="https://elanous.ai/members/">핸들 정하기</a>',
+    '<a class="quiet" data-member-handle-step href="https://elanous.ai/v1/members/handle">핸들 정하기</a>',
   );
   expect(page).not.toContain('href="/app"');
   expect(page).toContain('href="#connect-guide"');
@@ -112,7 +112,7 @@ test("MEMBER-HOME-WEBCHAT-LINK-WRONG (OP 88490 안 A): no handle means no web-ch
   expect(page).not.toContain("mychat--member-a");
   expect(primaries(page)).toEqual(["핸들 정하기"]);
   expect(page).toContain(
-    '<a class="primary" data-member-handle-step href="https://elanous.ai/members/">핸들 정하기</a>',
+    '<a class="primary" data-member-handle-step href="https://elanous.ai/v1/members/handle">핸들 정하기</a>',
   );
   expect(page).not.toContain("data-member-webchat-soon");
 });

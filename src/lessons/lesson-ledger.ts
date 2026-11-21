@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { appendClause, type KnowhowClause } from '../knowhow/clauses.js';
 import { debug } from '../debug/log.js';
 
 export type LessonStatus = 'open' | 'enforced' | 'candidate' | 'promoted';
@@ -40,10 +41,12 @@ function enforcement(value: string): string {
 
 export class LessonLedger {
   readonly path: string;
+  private readonly stateDir: string;
   private readonly now: () => Date;
 
   constructor(options: LessonLedgerOptions = {}) {
-    this.path = join(options.stateDir ?? elanousStateRoot(), 'lessons', 'lessons.sqlite');
+    this.stateDir = options.stateDir ?? elanousStateRoot();
+    this.path = join(this.stateDir, 'lessons', 'lessons.sqlite');
     this.now = options.now ?? (() => new Date());
   }
 
@@ -176,6 +179,37 @@ export class LessonLedger {
       const row = this.row(db, id);
       this.log('promote', row);
       return row;
+    }));
+  }
+
+  /**
+   * ★ 같은 꼴 실패 반복(기본 3회) → 노하우 승화(자동 · MEM-LESSON-TO-KNOWHOW-PROMOTION).
+   * disproof 문서가 없어도 **관측 자체**(occurrence_count ≥ threshold)가 승격 근거다.
+   * 조항은 팩 조항 id 결정 원장(knowhow/clauses.json · 내용 해시 id)에 기록되고,
+   * history 'promote' detail 이 `knowhow:<조항id>` 를 가리킨다. 재호출·재스윕 모두
+   * 같은 id 로 중복 판정되어 조항·행 모두 중복이 생기지 않는다(중복 0).
+   */
+  promoteToKnowhow(id: string, input: { by: string; threshold?: number }): {
+    row: LessonRow; clause: KnowhowClause; duplicate: boolean;
+  } {
+    const by = required(input.by, 'by');
+    const threshold = input.threshold ?? 3;
+    return this.using(db => this.transaction(db, () => {
+      const previous = this.row(db, id);
+      if (previous.occurrence_count < threshold) {
+        throw new LessonInputError(`recurrence threshold not reached: ${previous.occurrence_count} < ${threshold}`);
+      }
+      const appended = appendClause(this.stateDir, {
+        lessonId: previous.id, owner: previous.owner,
+        incident: previous.incident, cause: previous.cause, remedy: previous.remedy,
+        occurrences: previous.occurrence_count,
+      }, this.now);
+      const at = this.now().toISOString();
+      db.query("UPDATE lessons SET status = 'promoted', updated_at = ? WHERE id = ?").run(at, id);
+      this.record(db, id, at, by, 'promote', `knowhow:${appended.clause.id}${appended.duplicate ? ' ·duplicate' : ''}`);
+      const row = this.row(db, id);
+      this.log('promote', row);
+      return { row, clause: appended.clause, duplicate: appended.duplicate };
     }));
   }
 

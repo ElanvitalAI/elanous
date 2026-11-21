@@ -2,6 +2,7 @@
 // it and never write the journal. Stage 2: `ls` and `read` also reach the remote hosts in els/hosts.json through their
 // read window (`serve --http`), read-only. attach·wait·close·send to remote hosts come later.
 
+import { buildCommitTime, cliBuildIdentity, versionLabel } from '../version/build-stamp.js';
 import { elsSkillText, type SkillVerb } from '../els/skill.js';
 import { formatPaneStatus, type PaneStatus } from '../els/pane-status.js';
 import { spawn, spawnSync } from 'node:child_process';
@@ -14,12 +15,20 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createAttachApp, type AttachAppDeps } from '../els/attach-app.js';
 import { attachEls, isServerAway, noteAfterFrame, RECONNECT_NOTE } from '../els/attach-client.js';
 import { guardLeave, realProcess } from '../els/attach-leave.js';
-import { createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
+import { buildBadge, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from '../els/attach-view.js';
 import { requestEls } from '../els/client.js';
 import { readPipedStdin } from './piped-stdin.js';
 import { grepScreens, type GrepHit, type GrepScreen } from '../els/pane-grep.js';
 import type { ElsResult } from '../els/core.js';
 import { tabBadge } from '../els/tab-badge.js';
+import { updateAllElsTabs, updateResultsTable } from '../els/update-all.js';
+import { runRemoteUpdate } from '../els/remote-update.js';
+import { runSeatControl } from './seat-control-cli.js';
+import { detectSeatTui } from '../seat/seat-boot-preamble.js';
+import { listPtyManifestRowsStrict } from '../pty-shell/pty-manifest.js';
+import { requestRemotePtyControl } from '../pty-shell/pty-control-ipc.js';
+import { desiredSha } from '../nexus/host-registry/desired-sha.js';
+import { readInstalledIdentity } from './self-update.js';
 import type { PaneState } from '../els/space.js';
 import { askHitlOnTerminal, controlledDo, controlledInput, journalControl } from '../els/control-cli.js';
 import { mcpHitlAsk } from '../els/mcp-hitl.js';
@@ -32,7 +41,7 @@ import { importHerdr } from '../els/herdr-import.js';
 import { defaultHerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { herdrCreated, herdrPanes, herdrTabs, herdrWorkspaces } from '../els/herdr-shape.js';
 import { keysToBytes } from '../els/keys.js';
-import { elsHostsPath, fetchHostJson, loadHostRegistry } from '../els/hosts.js';
+import { elsHostsPath, fetchHostJson, loadHostRegistry, registeredHostAtExecution, type HostRegistry } from '../els/hosts.js';
 import { parseHttpBind } from '../els/http.js';
 import { humanOwnerToken } from '../els/human-terminal-auth.js';
 import { insideElsPane, NESTED_ELS_MESSAGE } from '../els/nesting.js';
@@ -81,10 +90,10 @@ function localControl(): ReturnType<typeof journalControl> {
   catch { return journalControl(emptyJournal()); }
 }
 
-function federation() {
+function federation(registry: HostRegistry = loadHostRegistry(elsHostsPath(elanousStateRoot()))) {
   // ELS-ONE-SPACE ④ — the herdr panes of this machine are one more host (`herdr:`) in the same list when herdr is here.
   const hosts = withHerdrHost({
-    registry: loadHostRegistry(elsHostsPath(elanousStateRoot())),
+    registry,
     fetchJson: (host, path) => fetchHostJson(host, path, REMOTE_TIMEOUT_MS),
     postJson: (host, path, payload) => fetchHostJson(host, path, DO_TIMEOUT_MS, payload),
   });
@@ -175,7 +184,7 @@ export function paneListLines(listJson: string, nowMs: number): string[] {
   const listed = JSON.parse(listJson) as { panes: { address: string; title: string; state: string; cwd: string; badgeLabel?: string; lastEventAtMs?: number; build?: { sha?: string | null; age?: string } }[] };
   return listed.panes.length === 0
     ? ['els: no panes yet — open one with `els new` (defaults: $SHELL, this folder)']
-    : listed.panes.map((row) => `${row.address}  ${row.state.padEnd(7)} ${row.badgeLabel ?? tabBadge({ state: row.state as PaneState, ...(row.lastEventAtMs === undefined ? {} : { lastEventAtMs: row.lastEventAtMs }) }, nowMs).label} ${row.title} [자체보고·미인증:${row.build?.sha?.slice(0, 7) ?? 'unknown'} ${row.build?.age ?? 'unknown'}]  ${row.cwd}`);
+    : listed.panes.map((row) => `${row.address}  ${row.state.padEnd(7)} ${row.badgeLabel ?? tabBadge({ state: row.state as PaneState, ...(row.lastEventAtMs === undefined ? {} : { lastEventAtMs: row.lastEventAtMs }) }, nowMs).label} ${row.title} ${buildBadge(row.build, '[자체보고·미인증:unknown unknown]')}  ${row.cwd}`);
 }
 
 export function registerElsCommands(program: Command): void {
@@ -279,6 +288,67 @@ export function registerElsCommands(program: Command): void {
       listed.panes = listed.panes.filter((row) => row.build?.age === 'older');
       emit({ ...answer, message: JSON.stringify(listed, null, 2) });
     });
+  side.command('update-all').description('Catch up registered ELS hosts to desiredSha, migrate seat tabs at their turn boundary, and print one result row per tab')
+    .option('--local-only', 'SSH child: only this host; do not fan out')
+    .option('--json', 'emit a machine-readable result for the pinned SSH parent')
+    .option('--expected-desired <sha>', 'require the SSH parent-approved exact desired commit')
+    .action(async (opts: { localOnly?: boolean; json?: boolean; expectedDesired?: string }) => {
+      const sender = () => detectSeatTui(process.cwd())?.seat ?? null;
+      const registryPath = elsHostsPath(elanousStateRoot());
+      let listedRegistry: HostRegistry | undefined;
+      try {
+        const result = await updateAllElsTabs({
+          sender,
+          expectedDesired: opts.expectedDesired,
+          prepare: async () => {
+            // Reuse guarded catch-up and keep the OP HITL in this command's install→migrate path.
+            // RES-INFRA operates only after an independently verified install.
+            if (sender() !== 'OP') return;
+            const { runCatchUp } = await import('./self-update-catch-up.js');
+            let approved = false;
+            const installed = await runCatchUp({ seat: 'OP', restart: false }, {
+              approveOp: async (detail) => {
+                approved = (await askHitlOnTerminal(HITL_TIMEOUT_MS)(
+                  `${detail}\nOP 승인 뒤 이 호스트와 등록된 원격 호스트에 desired 빌드를 설치하고 탭 이전을 요청합니다. 계속할까요? [y/N] `)) === 'approve';
+                return approved;
+              },
+            });
+            if (installed.exitCode !== 0) throw new Error(`installation update failed: ${installed.reason}`);
+            if (!approved && (await askHitlOnTerminal(HITL_TIMEOUT_MS)(
+              'OP와 등록된 원격 호스트의 탭을 턴 경계에서 이전합니다. 승인합니까? [y/N] ')) !== 'approve')
+              throw new Error('OP migration approval denied');
+          },
+          target: () => ({ desired: desiredSha(), installed: readInstalledIdentity().installedCommit }),
+          list: async () => {
+            listedRegistry = loadHostRegistry(registryPath);
+            const listed = await federation(listedRegistry).list();
+            if (listed.exitCode !== 0) throw new Error(listed.message);
+            const all = JSON.parse(listed.message) as { panes: { address: string; host: string; reach: string; seat?: string; state: string; cwd: string; pid?: number; kind?: string }[]; hosts: { name: string; reach: string }[]; hostsProblem?: string; rejectedHosts?: string[] };
+            return opts.localOnly ? { ...all, panes: all.panes.filter(pane => pane.reach === 'local'), hosts: all.hosts.filter(host => host.reach === 'local') } : all;
+          },
+          seats: listPtyManifestRowsStrict,
+          migrate: (seat, expected) => runSeatControl(seat, 'migrate', {
+            sender,
+            rows: listPtyManifestRowsStrict,
+            send: (id, action, payload) => requestRemotePtyControl(id, action, payload),
+          }, expected),
+          sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+          now: () => Date.now(),
+          localOnly: opts.localOnly,
+          remoteUpdate: opts.localOnly ? undefined : async (host, panes, desired) => {
+            if (!listedRegistry) throw new Error('els host listing snapshot absent');
+            const registered = registeredHostAtExecution(registryPath, listedRegistry, host.name);
+            return runRemoteUpdate(registered, panes, desired);
+          },
+        });
+        if (opts.json) process.stdout.write(`ELS_UPDATE_ALL_RESULT=${JSON.stringify({ ...result, desired: desiredSha(), installed: readInstalledIdentity().installedCommit })}\n`);
+        else process.stdout.write(`${result.reason ? `els update-all: ${result.reason}\n` : ''}${updateResultsTable(result.rows)}\n`);
+        if (!result.ok) process.exitCode = 1;
+      } catch (error) {
+        process.exitCode = 1;
+        process.stderr.write(`els update-all: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
+    });
   const createPane = async (opts: { ws?: string; cwd?: string; title?: string; raw?: boolean }, command: string[], herdrShape: boolean): Promise<void> => {
     const hint = misplacedOptionHint({ ...opts, command });
     if (hint) { emit({ exitCode: 2, message: hint }); return; }
@@ -360,10 +430,16 @@ export function registerElsCommands(program: Command): void {
   workspace.command('move <workspace>').description('Put a workspace before another one (default: last) — the order every els screen and the eln side tab show')
     .option('--before <workspace>', 'the workspace it goes in front of')
     .action((ws: string, opts: { before?: string }) => ask({ op: 'reorder', kind: 'workspace', id: ws, ...(opts.before ? { before: opts.before } : {}) }));
-  const tab = side.command('tab').description('Tabs (herdr words): list · move');
+  const tab = side.command('tab').description('Tabs (herdr words): list · close · move');
   tab.command('list').option('--workspace <id>', 'only this workspace').description('Tabs as JSON').action(async (opts: { workspace?: string }) => {
     const { failed, listed } = await listJson(); if (failed) emit(failed); else printJson(herdrTabs(listed!, opts.workspace));
   });
+  tab.command('close <tab>').description('Close a tab and all its panes after terminal confirmation')
+    .action(async (id: string) => {
+      const decision = await askHitlOnTerminal(HITL_TIMEOUT_MS)(`Close tab ${id} and all its panes? [y/N] `);
+      if (decision !== 'approve') emit({ exitCode: 2, message: `els tab close: ${decision === 'timeout' ? 'confirmation unavailable' : 'cancelled'}` });
+      await ask({ op: 'close-tab', tab: id, confirmed: true });
+    });
   tab.command('move <tab>').description('Put a tab before another tab of the same workspace (default: last in its workspace)')
     .option('--before <tab>', 'the tab it goes in front of')
     .action((id: string, opts: { before?: string }) => ask({ op: 'reorder', kind: 'tab', id, ...(opts.before ? { before: opts.before } : {}) }));
@@ -414,7 +490,13 @@ function adoptOwnerCredential(): void {
 }
 
 /** The terminal side of `els attach`: raw keys → `input`, frames → one repaint, window size → `resize`. Returns the exit code. */
+function ownBuildLabel(): string {
+  const build = cliBuildIdentity();
+  return versionLabel(build, buildCommitTime(build)).label;
+}
+
 function runAttachView(ref: string): Promise<number> {
+  const label = ownBuildLabel();
   return new Promise((resolve) => {
     const size = () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 });
     const prefix = createPrefixFilter();
@@ -424,7 +506,7 @@ function runAttachView(ref: string): Promise<number> {
     const paint = (screen: string): void => {
       last = screen;
       const { cols, rows } = size();
-      process.stdout.write(drawView({ screen, cols, rows, status: statusLine(ref, note || undefined) }));
+      process.stdout.write(drawView({ screen, cols, rows, status: statusLine(ref, [note, label].filter(Boolean).join(' · ')) }));
     };
     let finished = false;
     // ELS-MOUSE-RELEASE: the leave bytes go out once, also when the process dies under the view (SIGHUP/uncaught exception).
@@ -493,6 +575,7 @@ function runAppView(sidebar: boolean | undefined): Promise<number> {
     write: (() => { let last: string | undefined; return (text: string) => { if (text === last) return; last = text; process.stdout.write(text); }; })(),
     size: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
     cwd: process.cwd(),
+    buildLabel: ownBuildLabel(),
     env: process.env,
     setInterval: (callback, ms) => { const handle = setInterval(callback, ms); handle.unref?.(); return handle; },
     clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),

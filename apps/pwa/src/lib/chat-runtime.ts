@@ -30,6 +30,8 @@ import { isLlmTierProvider, lookupLlmTierSpec } from './model-tier-spec';
 import { handleModelCommand, parseModelCommand } from './chat-model-commands';
 import { handleSessionCommand, parseSessionCommand } from './chat-session-commands';
 import { handleChatPersona, selectedChatPersona } from './chat-persona';
+import { addSourceUsage, hasSourceUsage, mergeSourceUsage, readSourceUsage, type SourceUsage } from './source-usage';
+import { randomId } from './random-id';
 
 function chatPersonaId(sessionId: string): string | undefined {
   return typeof localStorage === 'undefined' ? undefined : selectedChatPersona(sessionId, localStorage);
@@ -421,6 +423,8 @@ export interface ChatMessage {
   terminalId?: string;
   // optional metadata for assistant turns (provider · model · stopReason · tokens · mirror origin)
   meta?: { provider?: string; model?: string; stopReason?: string; mirrored?: 'repl'; systemLevel?: 'note' | 'error' };
+  /** Counts from this turn's existing research tool results. */
+  sourceUsage?: SourceUsage;
 }
 
 export interface MetaResult {
@@ -457,8 +461,14 @@ interface PendingWish {
 
 const WISH_PENDING_PREFIX = 'elanous:wish:pending:';
 
+// 출처: #39459 JUD-B HOLD #124078 — :wish 가 저장하는 id 는 secure 원점의 UUID 와
+// insecure(http 랜) 원점의 generateSessionId 폴백 `s-<ts36>-<hex16>`(OP #123699 ·
+// daemon-session.ts fallbackRandomHex64) 두 형식이다. pending/retry 도 같은
+// 집합을 수용한다 — 소유권(baseUrl/sessionId/ref) 검사는 그대로다.
+const WISH_PENDING_ID_RE = /^(?:[0-9a-f-]{36}|s-[0-9a-z]{1,16}-[0-9a-z]{1,16})$/i;
+
 function pendingWish(id: string): PendingWish | undefined {
-  if (!/^[0-9a-f-]{36}$/.test(id)) return undefined;
+  if (!WISH_PENDING_ID_RE.test(id)) return undefined;
   const raw = localStorage.getItem(`${WISH_PENDING_PREFIX}${id}`);
   if (!raw) return undefined;
   const value: unknown = JSON.parse(raw);
@@ -711,7 +721,8 @@ export const META_HANDLERS: Record<
         }
         wish = saved;
       } else {
-        const id = crypto.randomUUID();
+        // 출처: #39459 — crypto.randomUUID 는 secure context 전용; http 랜 원점 폴백(randomId).
+        const id = randomId();
         wish = { id, baseUrl, sessionId: ctx.sessionId, text,
           ref: `${ctx.sessionId}:${Date.now()}:${id}` };
         // Persist before sending: a committed request can lose its response or be interrupted by reload.
@@ -873,6 +884,8 @@ export async function runChatTurnStreaming(
   let toolCount = 0;
   let mcpAppCount = 0;
   let feedbackCount = 0;
+  let sourceUsage: SourceUsage = { firecrawl: 0, grok: 0, market: 0 };
+  const countedSourceResults = new Set<string>();
   const snapshot = (): ChatBlock[] => blocks.map((b) => ({ ...b }));
   /** ⛔⭐⭐⭐ **끝 관측을 «한 자리»에서만 낸다 — 성공이든 실패든.**
    *
@@ -962,6 +975,10 @@ export async function runChatTurnStreaming(
         handlers.onPartialBlocks?.(snapshot());
       },
       onToolResult: ({ id, name, ok, summary, rawOutput, resourceUri }) => {
+        if (!countedSourceResults.has(id)) {
+          countedSourceResults.add(id);
+          sourceUsage = addSourceUsage(sourceUsage, name, ok, rawOutput);
+        }
         // Find the matching running pill. If no match (rare —
         // server fired result before call, or pill list mutated),
         // synthesize a fresh done pill so the user still sees the
@@ -1027,6 +1044,8 @@ export async function runChatTurnStreaming(
     throw err;
   });
   emitEnd({ stopReason: res.stopReason, sessionId: res.sessionId });
+  const internalSourceUsage = readSourceUsage(res.sourceUsage);
+  if (internalSourceUsage) sourceUsage = mergeSourceUsage(sourceUsage, internalSourceUsage);
   // Reconcile: ensure the final text block matches `res.text` (the
   // server's authoritative copy) so a missed-tail delta doesn't
   // truncate the bubble. If the daemon never emitted text-delta
@@ -1043,6 +1062,7 @@ export async function runChatTurnStreaming(
     ...(isIncompleteChatStopReason(res.stopReason) ? { incomplete: true } : {}),
     timestamp: Date.now(),
     meta: { provider: ctx.provider, stopReason: res.stopReason },
+    ...(hasSourceUsage(sourceUsage) && !isIncompleteChatStopReason(res.stopReason) ? { sourceUsage } : {}),
     ...(hasNonTextBlock ? { blocks: snapshot() } : {}),
   };
   return {
@@ -1382,6 +1402,8 @@ export async function runChatTurnAcp(
   let finalTextStart = 0;
   let imageCount = 0;
   let toolCount = 0;
+  let sourceUsage: SourceUsage = { firecrawl: 0, grok: 0, market: 0 };
+  const countedSourceResults = new Set<string>();
   // ⭐ 스트리밍 경로와 «같은 이름»으로 센다 — 두 경로를 한 조회로 비교할 수 있어야 한다.
   let mcpAppCount = 0;
   let cumulativeText = '';
@@ -1425,6 +1447,9 @@ export async function runChatTurnAcp(
     if (!params || params.sessionId !== sessionId) return;
     const update = params.update;
     if (!update) return;
+
+    const internalUsage = readSourceUsage(update._meta?.elanousSourceUsage);
+    if (internalUsage) sourceUsage = mergeSourceUsage(sourceUsage, internalUsage);
 
     if (update.sessionUpdate === 'agent_message_chunk') {
       const content = update.content;
@@ -1539,6 +1564,11 @@ export async function runChatTurnAcp(
         (b) => b.kind === 'tool_use' && b.id === update.toolCallId,
       );
       const status: 'done' | 'error' = update.status === 'completed' ? 'done' : 'error';
+      if (!countedSourceResults.has(update.toolCallId)) {
+        countedSourceResults.add(update.toolCallId);
+        const toolName = idx >= 0 ? (blocks[idx] as Extract<ChatBlock, { kind: 'tool_use' }>).name : update.title ?? '';
+        sourceUsage = addSourceUsage(sourceUsage, toolName, status === 'done', update.rawOutput);
+      }
       if (idx === -1) {
         toolCount += 1;
         blocks.push({
@@ -1683,6 +1713,7 @@ export async function runChatTurnAcp(
       ...(isIncompleteChatStopReason(stopReason) ? { incomplete: true } : {}),
       timestamp: Date.now(),
       meta: { provider: ctx.provider, stopReason },
+      ...(hasSourceUsage(sourceUsage) && !isIncompleteChatStopReason(stopReason) ? { sourceUsage } : {}),
       ...(hasNonTextBlock ? { blocks: snapshot() } : {}),
     };
     // ACP `session/prompt` response carries no sessionId — caller bound the
@@ -1766,7 +1797,7 @@ interface AcpSessionUpdateContent {
 
 interface AcpSessionUpdate {
   sessionUpdate?: string;
-  _meta?: { elanousTurn?: { phase?: string; text?: string; stopReason?: string } };
+  _meta?: { elanousTurn?: { phase?: string; text?: string; stopReason?: string }; elanousSourceUsage?: unknown };
   content?: AcpSessionUpdateContent;
   toolCallId?: string;
   rawInput?: Record<string, unknown>;

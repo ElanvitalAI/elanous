@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { inboxLiveness, classifySeatInbox, seatInboxAlivePath, writeInboxBeatAtomic, startInboxHeartbeat } from './inbox-liveness.js';
+import { inboxLiveness, classifyElsPaneStatus, classifyHerdrSeatRows, classifySeatInbox, classifyTmuxSeatList, findElsSeatPane, findTmuxSeatPane, seatFromPaneCwd, seatInboxAlivePath, writeInboxBeatAtomic, startInboxHeartbeat } from './inbox-liveness.js';
 import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +7,59 @@ import { join } from 'node:path';
 const ID = { host: 'mbp.local', sessionId: 's-1' };
 const NOW = Date.parse('2026-11-19T04:00:00Z');
 const beat = (over: Record<string, unknown> = {}) => ({ pid: 12345, host: 'mbp.local', sessionId: 's-1', startedAt: '2026-11-19T03:00:00Z', beatAt: new Date(NOW - 89_999).toISOString(), ...over });
+
+test('ELS seat identity comes from the server registration and rejects ambiguity', () => {
+  const pane = { seat: 'CX1', pane: 'p1', address: 'w1/t1/p1', ptyId: 'h:p1', title: 'someone else' };
+  expect(findElsSeatPane({ panes: [pane] }, 'CX1')).toEqual({ kind: 'found', pane: 'p1', address: 'w1/t1/p1' });
+  expect(findElsSeatPane({ panes: [{ ...pane, seat: null, title: 'CX1' }] }, 'CX1')).toEqual({ kind: 'absent' });
+  expect(findElsSeatPane({ panes: [pane, pane] }, 'CX1')).toEqual({ kind: 'unknown', reason: 'els-ambiguous' });
+  expect(findElsSeatPane({ panes: [{ ...pane, pane: null }] }, 'CX1')).toEqual({ kind: 'unknown', reason: 'els-list-invalid' });
+  expect(findElsSeatPane({ panes: [null] }, 'CX1')).toEqual({ kind: 'unknown', reason: 'els-list-invalid' });
+  expect(findElsSeatPane({ panes: [{ ...pane, seat: null, cwd: '/Users/j/elanous-hq/seats/CX1/work' }] }, 'CX1'))
+    .toEqual({ kind: 'found', pane: 'p1', address: 'w1/t1/p1' });
+  expect(findElsSeatPane({ panes: [{ ...pane, seat: 'OTHER', cwd: '/Users/j/elanous-hq/seats/CX1' }] }, 'CX1'))
+    .toEqual({ kind: 'absent' });
+  expect(seatFromPaneCwd('/Users/j/elanous-hq/seats/CX12/work')).toBe('CX12');
+  expect(seatFromPaneCwd('/Users/j/elanous-hq/seats/CX1-EXTRA/work')).toBe('CX1-EXTRA');
+  expect(seatFromPaneCwd('/tmp/seats/CX1')).toBeUndefined();
+});
+
+test('ELS pane status distinguishes activity, exit, and uncertain readings', () => {
+  expect(classifyElsPaneStatus({ state: 'working', inputEmpty: false }).state).toBe('live');
+  expect(classifyElsPaneStatus({ state: 'idle', inputEmpty: 'unknown' }).state).toBe('live');
+  expect(classifyElsPaneStatus({ state: 'exited' }).state).toBe('down');
+  expect(classifyElsPaneStatus({ state: 'unknown', reason: 'no working row and no prompt recognised on screen', inputEmpty: 'unknown' }))
+    .toEqual({ state: 'live', ageMs: 0 });
+  expect(classifyElsPaneStatus({ state: 'unknown', reason: 'no live PTY (restored after restart: cwd only)' }))
+    .toEqual({ state: 'unknown', reason: 'els-status-unknown' });
+  expect(classifyElsPaneStatus({ state: 'unknown' })).toEqual({ state: 'unknown', reason: 'els-status-unknown' });
+});
+
+test('remote tmux ledger requires an exact seat cwd and a running agent command', () => {
+  expect(classifyTmuxSeatList('%1|seat-CX1|/Users/j/elanous-hq/seats/CX1|0|codex\n', 'CX1').state).toBe('live');
+  expect(classifyTmuxSeatList('%1|seat-CX12|/Users/j/elanous-hq/seats/CX12|0|codex\n', 'CX1').state).toBe('down');
+  expect(classifyTmuxSeatList('%1|seat-CX1|/Users/j/elanous-hq/seats/CX1|0|zsh\n', 'CX1')).toEqual({ state: 'unknown', reason: 'host-pane-unknown' });
+  expect(classifyTmuxSeatList('%1|seat-CX1|/Users/j/elanous-hq/seats/CX1|1|codex\n', 'CX1').state).toBe('down');
+  expect(classifyTmuxSeatList('%1|seat-OTHER|/Users/j/elanous-hq/seats/CX1|0|codex\n', 'CX1').state).toBe('down');
+  expect(classifyTmuxSeatList('garbage', 'CX1')).toEqual({ state: 'unknown', reason: 'host-ledger-invalid' });
+});
+
+test('federated Herdr rows use the exact cwd and active status', () => {
+  const row = { cwd: '/Users/j/elanous-hq/seats/TC-H-POOL-4', state: 'working' };
+  expect(classifyHerdrSeatRows([row], 'TC-H-POOL-4').state).toBe('live');
+  expect(classifyHerdrSeatRows([row], 'TC-H-POOL-40').state).toBe('down');
+  expect(classifyHerdrSeatRows([{ ...row, state: 'unknown' }], 'TC-H-POOL-4')).toEqual({ state: 'unknown', reason: 'host-pane-unknown' });
+});
+
+test('tmux wake target requires one exact live seat pane, never a neighboring session', () => {
+  const target = '%21|seat-CX1|/Users/j/elanous-hq/seats/CX1/work|0|codex\n';
+  const other = '%22|seat-CX12|/Users/j/elanous-hq/seats/CX12/work|0|codex\n';
+  expect(findTmuxSeatPane(target + other, 'CX1')).toBe('%21');
+  expect(findTmuxSeatPane(other, 'CX1')).toBeUndefined();
+  expect(findTmuxSeatPane(target + target, 'CX1')).toBeUndefined();
+  expect(findTmuxSeatPane(target.replace('|0|codex', '|1|codex'), 'CX1')).toBeUndefined();
+  expect(findTmuxSeatPane(target + 'garbage\n', 'CX1')).toBeUndefined();
+});
 
 describe('inboxLiveness §2b 경계', () => {
   test('live: 89_999ms · 90_000ms(경계 포함)', () => {

@@ -14,6 +14,7 @@ import {
   appendSpendObservation, createObservationObserver, type SpendObservation,
 } from '../nexus/llm-spend-policy/observations.js';
 import { isLlmSpendPolicyRole, type LlmSpendPolicyRole } from '../nexus/llm-spend-policy/types.js';
+import { createCreditRowStateObserver, type CreditAdapterDeps } from '../nexus/llm-spend-policy/credit-adapter.js';
 import {
   gateLlmCall, readPolicyFromStore, type LlmCallGateDeps, type LlmCallGateRequest, type LlmCallGateResult, type LlmSignalRecord,
 } from './llm-call-gate.js';
@@ -36,12 +37,23 @@ export function signalToObservation(record: LlmSignalRecord): SpendObservation {
 const passThroughObserved = new Set<string>();
 
 /** 기본 배선 deps — 파일 기억·예약 원장·전환 원장·관측 저장소(모두 넥서스 데이터 영역). 시험은 overrides 로 덮는다. */
-export async function defaultLiveGateDeps(policyDir?: string): Promise<LlmCallGateDeps> {
+export async function defaultLiveGateDeps(
+  policyDir?: string,
+  extra: { credit?: CreditAdapterDeps } = {},
+): Promise<LlmCallGateDeps> {
   const dir = await llmSpendPolicyDir(policyDir);
+  // CC-1 잔액 어댑터 관측기(LLM-POLICY-OR-MANAGEMENT-LEASE) — «임대가 실제로 주입된» 경우에만 관측기 목록에 들어간다.
+  //   임대 값이 하나도 없으면 관측기를 붙이지 않는다(= 기존 observers 그대로 → 결정·출력 계약 영향 0 · 네트워크 0).
+  //   ⛔ 임대는 «주입 경계» — 이 헬퍼는 금고를 스스로 조회하지 않는다(관리 키 발급은 HITL 대기).
+  const observers = [createObservationObserver(policyDir, { includeSynthetic: () => getTestStateRoot() !== undefined })];
+  const credit = extra.credit;
+  if (credit !== undefined && Object.values(credit.leases ?? {}).some((lease) => typeof lease === 'string' && lease.length > 0)) {
+    observers.push(createCreditRowStateObserver(() => readPolicyFromStore(policyDir), credit));
+  }
   return {
     readPolicy: () => readPolicyFromStore(policyDir),
     // 대표 합성 관측은 «시험 우주 신원» 일 때만 읽는다(운영 신원 = 기본 무시). 호출마다 평가.
-    observers: [createObservationObserver(policyDir, { includeSynthetic: () => getTestStateRoot() !== undefined })],
+    observers,
     memory: createFileGuardStore(join(dir, 'guard-memory.json')),
     reservations: createFileReservationLedger(join(dir, 'reservations.json')),
     appendLedger: async (entry) => {
@@ -53,6 +65,14 @@ export async function defaultLiveGateDeps(policyDir?: string): Promise<LlmCallGa
       await appendSpendTransition(entry, policyDir);
     },
     now: () => new Date(),
+    lowBalanceMailer: async (mail) => {
+      const { openMsgStore } = await import('../msg/msg-store.js');
+      const store = openMsgStore();
+      let id: number;
+      try { id = store.post({ from: 'LLM-GATE', to: 'OP', kind: 'llm-low-balance', intent: 'alert', body: `${mail.subject}\n${mail.body}` }).id; } finally { store.close(); }
+      // 깨움은 기다리지 않는다 — 관문(모든 LLM 호출의 길)이 깨움 지연에 묶이지 않게. 우편은 이미 영속이라 실패해도 무시.
+      void import('../loops/msg-wake.js').then((m) => m.wakeRecipient('OP', id, { from: 'LLM-GATE', kind: 'llm-low-balance' })).catch(() => undefined);
+    },
     recordSignal: async (record) => { await appendSpendObservation(signalToObservation(record), policyDir); },
   };
 }
@@ -70,10 +90,11 @@ export function codexAccountNameForRow(row: string): string | undefined {
 
 /** 관문 호출 — 기본 deps 위에 overrides 를 얹는다. gate 가 던지지 않지만 deps 구성 실패도 «통과» 로 접지 않는다(정책 있으면 멈춤). */
 export async function runLiveGate(
-  request: LlmCallGateRequest, overrides: Partial<LlmCallGateDeps> & { policyDir?: string } = {},
+  request: LlmCallGateRequest,
+  overrides: Partial<LlmCallGateDeps> & { policyDir?: string; credit?: CreditAdapterDeps } = {},
 ): Promise<LlmCallGateResult> {
-  const { policyDir, ...rest } = overrides;
-  const deps = { ...(await defaultLiveGateDeps(policyDir)), ...rest };
+  const { policyDir, credit, ...rest } = overrides;
+  const deps = { ...(await defaultLiveGateDeps(policyDir, credit !== undefined ? { credit } : {})), ...rest };
   return gateLlmCall(request, deps);
 }
 

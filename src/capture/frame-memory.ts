@@ -1,7 +1,6 @@
 // ── Capture substrate · frame → episodic self-memory (PLAN P5 · §5) ──
 //
-// Turn captured screen frames into episodic memory the daemon can later
-// recall (`elanous self recall`). PLAN §5/§9: summarize the frame into a
+// Turn captured screen frames into low-signal observations. PLAN §5/§9: summarize the frame into a
 // short line + store POINTERS in refs (surfaceId · instance · frameAt ·
 // pngRef) — never the full-frame blob (surface_events has no BLOB column).
 //
@@ -12,7 +11,7 @@
 //      SALIENT changes, not one event per frame. Emits a SelfEventInput.
 //   3. startFrameMemoryPoller — daemon-side: poll the pty-manifest for
 //      framed tui/pty surfaces (cross-process · dashboard TUI + forwarded
-//      children), summarize, and recordSelfEvent into surface_events.
+//      children), summarize, and recordSelfEvent into surface_events.signals.
 //
 // cf. producer `tui-self-report.ts` · store `domains/surface-events.ts` ·
 // recall `domains/self-awareness.ts` (recallSelfEvents).

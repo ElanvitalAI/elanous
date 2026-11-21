@@ -1,17 +1,82 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 
 import { DaemonSessionHistory } from './daemon-runtime.js';
-import { runDaemonPromptTurn } from './daemon-prompt-turn.js';
+import { citedResearchSourceUsage, runDaemonPromptTurn } from './daemon-prompt-turn.js';
 import * as coreTurnModule from '../core-turn/run-core-turn.js';
 import { debug } from '../debug/log.js';
 import { surfaceUxFromDispatchCtx } from '../agent/surface-ux/build.js';
 import type { ConfirmChannel } from '../hitl/confirm.js';
 import type { DaemonToolDispatchCtx, DaemonToolSurface } from './daemon-tools/types.js';
 import { handlePromptStreamPost } from '../nexus/api/meta-api.js';
+import * as llm from '../llm.js';
+import * as researchTurn from '../auto-research/research-turn.js';
+import { DaemonClient } from '../../apps/pwa/src/lib/daemon-client.js';
+import { runChatTurnStreaming } from '../../apps/pwa/src/lib/chat-runtime.js';
 
 afterEach(() => {
+  mock.restore();
   spyOn(coreTurnModule, 'runCoreTurn').mockRestore();
   spyOn(debug, 'log').mockRestore();
+});
+
+test('source usage counts exact final citations and preserves query and trailing question mark', () => {
+  const attribution = {
+    'https://news.example/item?a=1&b=2': ['firecrawl' as const],
+    'https://news.example/item?a=1': ['grok' as const],
+    'https://reddit.com/r/stocks?': ['grok' as const],
+    'eodhd:market.quote@1:SPY': ['market' as const],
+  };
+  expect(citedResearchSourceUsage(
+    '근거: [뉴스](https://news.example/item?a=1&b=2), [레딧](https://reddit.com/r/stocks?) eodhd:market.quote@1:SPY',
+    attribution,
+  )).toEqual({ firecrawl: 1, grok: 1, market: 1 });
+  expect(citedResearchSourceUsage('근거 링크 미제공', attribution))
+    .toEqual({ firecrawl: 0, grok: 0, market: 0 });
+  expect(citedResearchSourceUsage('출처 https://news.example/item?a=1&b=2. 레딧 https://reddit.com/r/stocks?는 표본이다.', attribution))
+    .toEqual({ firecrawl: 1, grok: 1, market: 0 });
+  expect(citedResearchSourceUsage('https://news.example/item?a=1&b=2.evil', attribution))
+    .toEqual({ firecrawl: 0, grok: 0, market: 0 });
+  expect(citedResearchSourceUsage('https://news.example/item?a=1&b=2?', attribution))
+    .toEqual({ firecrawl: 0, grok: 0, market: 0 });
+});
+
+test('internal ladder evidence reaches the PWA message through the real core turn and nexus stream', async () => {
+  const previousFetch = globalThis.fetch;
+  const source = 'https://example.org/season';
+  const question = '2026년 11월 리조트의 공식 시즌 계획은 무엇인가요? 출처를 알려 주세요.';
+  spyOn(llm, 'streamLLMWithTools').mockResolvedValue(`공식 계획입니다. ${source}`);
+  spyOn(researchTurn, 'runResearchQuestionLadder').mockImplementation(async (_request, options) => {
+    options?.onRoute?.({ needsFreshFacts: true, needsCitations: true, localOnly: false, reason: 'dated public fact' });
+    return {
+      ok: true, output: `공식 발표: ${source}`,
+      ladder: {
+        request: question,
+        questions: [{ id: 'q1', level: 1, prompt: question, searchTerms: ['season'] }],
+        evidence: [{ questionId: 'q1', sourceKind: 'web-search:firecrawl', source,
+          content: '공식 시즌 계획', outcome: 'complete', truncated: false }],
+      },
+    } as Awaited<ReturnType<typeof researchTurn.runResearchQuestionLadder>>;
+  });
+  const toolSurface: DaemonToolSurface = { kind: 'chat', specs: [{ name: 'WebSearch', description: 'search', parameters: { type: 'object', properties: {} } }],
+    dispatch: async () => ({ ok: true }) };
+  let requests = 0;
+  globalThis.fetch = (async (input, init) => {
+    requests += 1;
+    return handlePromptStreamPost(new Request(String(input), init), {
+      noAuth: true, history: new DaemonSessionHistory(), toolSurface, toolCwd: process.cwd(),
+    });
+  }) as typeof fetch;
+  try {
+    const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: 'tok', provider: 'anthropic' });
+    const { message } = await runChatTurnStreaming(question, {
+      client, sessionId: 'internal-sources-integration', provider: 'anthropic', setSessionId: () => {},
+    });
+    expect(message.text).toContain(source);
+    expect(message.sourceUsage).toEqual({ firecrawl: 1, grok: 0, market: 0 });
+    expect(requests).toBe(1);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 });
 
 describe('runDaemonPromptTurn surface dispatch context', () => {

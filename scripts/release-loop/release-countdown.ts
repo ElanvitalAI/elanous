@@ -65,9 +65,9 @@ export function evaluateCountdown(stage: CountdownStage, c: CountdownConditions)
   return { stage, go: holds.length === 0, holds, skipped };
 }
 
-/** Long-hold notice: the manual path that absorbed 0.3.28–0.3.30. The operator decides; the graph keeps holding. */
+/** Long-hold notice: the operator uses the explicit prepare/publish path; the graph keeps holding. */
 export function quickpassHint(version: string): string {
-  return `QUICKPASS: graph path held — fix the hold, or switch to \`eln release critpath --version ${version}\` (manual publish sheet)`;
+  return `QUICKPASS: graph path held for v${version} — OP explicitly runs \`eln release prepare --version ${version} --source <cut> --out <prepared>\`, verifies cut and notes, then \`eln release publish --dir <prepared> --notes-file <approved-notes> --yes\`; critpath cannot auto-publish without out-of-band proof`;
 }
 
 export interface CountdownProbes {

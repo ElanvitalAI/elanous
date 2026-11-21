@@ -47,7 +47,8 @@ export type PtyControlPayload =
   | { readonly nickname: string }
   | { readonly cols: number; readonly rows: number; readonly title?: string }
   | { readonly force: true; readonly actorIdentity: string; readonly reason: string }
-  | { readonly mode: SeatControlMode; readonly sender: string };
+  | { readonly mode: SeatControlMode; readonly sender: string;
+      readonly expected?: { readonly id: string; readonly ownerPid: number; readonly sessionId: string; readonly workdir: string } };
 
 export interface PtyControlRequestOptions {
   /** 요청자가 주장하는 쓰기 주체. `'agent'` 는 run-identity 일치를 요구한다(`resolveRemoteControlActor`). */
@@ -622,10 +623,15 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
         const target = getPtyManifest(row.pty_id);
         const mode = payload && typeof payload === 'object' && 'mode' in payload ? payload.mode : undefined;
         const sender = payload && typeof payload === 'object' && 'sender' in payload ? payload.sender : undefined;
+        const expected = payload && typeof payload === 'object' && 'expected' in payload ? payload.expected : undefined;
         if ((mode !== 'quit' && mode !== 'migrate' && mode !== 'force') || typeof sender !== 'string') {
           result = { status: 'denied', reason: 'invalid-seat-stop' };
         } else if (row.pty_id !== `tui:${process.pid}` || target?.kind !== 'tui' || !target.seat || !authorizeSeatControl({ sender, target: target.seat, sameHost: true })) {
           result = { status: 'denied', reason: 'seat-control-not-authorized' };
+        } else if (expected !== undefined && (!expected || typeof expected !== 'object'
+          || expected.id !== target.id || expected.ownerPid !== target.ownerPid
+          || expected.sessionId !== target.sessionId || expected.workdir !== target.workdir)) {
+          result = { status: 'denied', reason: 'target-changed' };
         } else {
           const outcome = await requestSeatStop({ requestId: row.request_id, mode });
           result = outcome === 'waiting' || outcome === 'accepted'

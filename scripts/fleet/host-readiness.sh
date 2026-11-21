@@ -55,7 +55,12 @@ def probe(host, item, e):
     if item == 'mirror':
         return mirror_probe(host,e)[0]=='PASS'
     if item == 'version':
-        return ok(host, f'test "$(elanous --version 2>/dev/null)" = {shlex.quote(e["version"])}')
+        observed = ssh(host, 'elanous --version')
+        if observed.returncode != 0: return False
+        actual, expected = observed.stdout.strip(), e['version']
+        if actual == expected: return True
+        installed = re.fullmatch(r'(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?) (?:(?:\d{6}_\d{4}|official) )?([a-fA-F0-9]{40})', actual)
+        return installed is not None and expected in (installed[1], f'{installed[1]} {installed[2]}')
     if item == 'images':
         return ok(host, 'docker image inspect '+shlex.quote(e['gate_image'])+' '+shlex.quote(e['harness_image'])+' >/dev/null 2>&1')
     if item == 'auth':

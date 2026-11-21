@@ -98,3 +98,24 @@ test('remote failure and host rejection do not disclose source bytes or stderr',
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('gcp1 is admitted by exact host name and receives the list only on stdin', () => {
+  const root = mkdtempSync(join(tmpdir(), 'export-gcp1-'));
+  try {
+    const source = join(root, 'redactions.tsv');
+    writeFileSync(source, fixture, { mode: 0o600 });
+    chmodSync(source, 0o600);
+    let calls = 0;
+    const ssh: SshRunner = (host, script, _timeout, stdin) => {
+      calls++;
+      expect(host).toBe('gcp1');
+      expect(stdin).toBe(fixture);
+      expect(script).not.toContain(fixture);
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    provisionExportRedactions('gcp1', source, ssh);
+    expect(calls).toBe(1);
+    expect(() => provisionExportRedactions('gcp1.example', source, ssh)).toThrow('host not allowed');
+    expect(calls).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

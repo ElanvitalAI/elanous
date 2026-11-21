@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { activeCardAllocation, readCardAllocation } from './alloc-evidence.js';
+import { activeCardAllocation, observeTargetOnAllocatedHost, readCardAllocation } from './alloc-evidence.js';
 
 const header = '시각\t카드\t풀\t모델\t예약id\t공급자\t만료epoch(30분)';
 const row = '11-19 12:28:53\tta-card-1\tminih\tterra\talloc-canary-123\tcodex\t2000';
@@ -28,4 +28,24 @@ test('HQ ledger read uses the fixed authority and fails closed on transport erro
   expect(result?.host).toBe('node-c');
   expect(readCardAllocation('ta-card-1', 1000, () => ({ status: 1, stdout: `${header}\n${row}` }))).toBeNull();
   expect(readCardAllocation('ta-card-1', 1000, () => { throw new Error('unavailable'); })).toBeNull();
+});
+
+test('(r6 · JUD hold-39396-b626) 원격 프로브는 카드 대상 경로를 불활성 셸 리터럴로 넘긴다 — JSON 따옴표는 셸 이스케이프가 아니다', () => {
+  const quote = String.fromCharCode(39); // '
+  const backtick = String.fromCharCode(96); // `
+  const hostile = `/tmp/x${quote}$(touch pwned)"z; rm -rf ~${backtick}y`;
+  // POSIX 단일 인용 이스케이프: ' → '\'' — 안쪽의 $ · ; · ` 는 전부 불활성이어야 한다.
+  const posixLiteral = `'${hostile.replaceAll(quote, `${quote}\\${quote}${quote}`)}'`;
+  const allocation = activeCardAllocation(`${header}\n${row}\n`, 'ta-card-1', 1000);
+  const seen: Array<{ host: string; command: string; timeout: number }> = [];
+  const probe = observeTargetOnAllocatedHost({ project: { target: hostile } }, allocation, (host, command, timeout) => {
+    seen.push({ host, command, timeout }); return { status: 0, stdout: '' };
+  });
+  expect(probe).toBe(true);
+  expect(seen).toEqual([{ host: 'node-c', command: `test -e ${posixLiteral}`, timeout: 10_000 }]);
+  // 현재(결함)의 JSON.stringify 형태가 명령에 그대로 남으면 안 된다.
+  expect(seen[0]!.command).not.toContain(JSON.stringify(hostile));
+  // 프로브 실패·예외는 여전히 null(UNMEASURED) — ⑥ 관측 법칙은 그대로.
+  expect(observeTargetOnAllocatedHost({ project: { target: hostile } }, allocation, () => ({ status: null, stdout: '' }))).toBeNull();
+  expect(observeTargetOnAllocatedHost({ project: { target: hostile } }, allocation, () => { throw new Error('ssh down'); })).toBeNull();
 });

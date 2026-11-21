@@ -1,6 +1,6 @@
 import { DebugForwarder } from './debug';
 import { afterEach, expect, test } from 'bun:test';
-import { DaemonClient, SurfaceUnavailableError } from './daemon-client';
+import { DaemonClient } from './daemon-client';
 import { surfaceForwards } from './daemon-config';
 import { BARE_CAPABILITIES_META_NAME, bareCapabilitiesContent, BARE_WEBCHAT_FORWARDED_API_PATHS } from '../../../../src/relay/bare-surface';
 import { withFakeFetchDevice } from '../test-devices/fake-fetch';
@@ -35,11 +35,12 @@ test('bare: only the server-delivered set is forwarded; query ignored', () => {
   for (const p of BARE_WEBCHAT_FORWARDED_API_PATHS) expect(surfaceForwards(`${p}?x=1`)).toBe(true);
 });
 
-test('bare: client call to an unforwarded path makes zero fetches and rejects typed', async () => {
+test('bare: client call to an unforwarded path makes zero fetches and answers like the relay 404', async () => {
   setDoc(bareDoc);
   await withFakeFetchDevice([{ url: '/v1/seat-requests', response: json }], async (device) => {
-    await expect(client().fetchJson('/v1/seat-requests')).rejects.toBeInstanceOf(SurfaceUnavailableError);
-    await expect(client().fetchResponse('/v1/sessions/store')).rejects.toBeInstanceOf(SurfaceUnavailableError);
+    await expect(client().fetchJson('/v1/seat-requests')).rejects.toThrow('Not Found');
+    const response = await client().fetchResponse('/v1/sessions/store');
+    expect([response.status, await response.text()]).toEqual([404, 'Not Found']);
     expect(device.calls()).toEqual([]);
   });
 });
@@ -65,6 +66,7 @@ test('bare meta without capabilities meta (older server): falls back to the shar
   expect(surfaceForwards('/v1/seat-requests')).toBe(false);
   expect(surfaceForwards('/v1/prompt/stream')).toBe(true);
   expect(surfaceForwards('/v1/chat/events?sessionId=s1')).toBe(true);
+  expect(surfaceForwards('/v1/sessions/store/one?ifExists=1')).toBe(false);
 });
 
 test('bare: debug batch forwarder makes zero fetches and drains its queue (handled)', async () => {
@@ -77,11 +79,4 @@ test('bare: debug batch forwarder makes zero fetches and drains its queue (handl
     expect(device.calls()).toEqual([]);
     expect(f.pending).toBe(0);
   });
-});
-
-test('SurfaceUnavailableError looks like the old relay 404 failure: message Not Found, no status', async () => {
-  const error = new SurfaceUnavailableError('/v1/personas/x');
-  expect(error.message).toBe('Not Found');
-  expect('status' in error).toBe(false);
-  expect(error.message.includes('404')).toBe(false);
 });

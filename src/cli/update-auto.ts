@@ -22,6 +22,10 @@ export const UPDATE_SYSTEMD_UNIT = 'elanous-update';
 export const UPDATE_HOUR = 4;
 export const UPDATE_MINUTE = 17;
 
+export const CATCH_UP_INTERVAL_SEC = 900;
+
+export interface CatchUpMode { seat: string }
+
 export type AutoAction = 'on' | 'off' | 'status';
 
 export interface AutoUpdateDeps {
@@ -45,17 +49,30 @@ export interface AutoUpdateResult {
   schedulers: string[];
 }
 
-export function updateCommand(): string[] {
+export function updateCommand(mode?: CatchUpMode): string[] {
   const run = nexusRunCommand();
   // nexusRunCommand = [bun, <elanous.mjs>, 'nexus', 'run'] — 앞 둘만 쓴다(폴백 ['elanous','nexus','run'] 도 같은 자리).
-  return [...run.slice(0, run.length - 2), 'self-update', '--restart', '--alert'];
+  const head = run.slice(0, run.length - 2);
+  return mode ? [...head, 'self-update', '--catch-up', '--seat', mode.seat, '--restart', '--alert'] : [...head, 'self-update', '--restart', '--alert'];
 }
 
 function xml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-export function renderUpdatePlist(command: string[], home: string, logPath: string): string {
+export function renderUpdatePlist(command: string[], home: string, logPath: string, mode?: CatchUpMode): string {
+  const schedule = mode
+    ? `  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>${CATCH_UP_INTERVAL_SEC}</integer>`
+    : `  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>${UPDATE_HOUR}</integer>
+    <key>Minute</key>
+    <integer>${UPDATE_MINUTE}</integer>
+  </dict>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -66,13 +83,7 @@ export function renderUpdatePlist(command: string[], home: string, logPath: stri
   <array>
 ${command.map((a) => `    <string>${xml(a)}</string>`).join('\n')}
   </array>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>${UPDATE_HOUR}</integer>
-    <key>Minute</key>
-    <integer>${UPDATE_MINUTE}</integer>
-  </dict>
+${schedule}
   <key>WorkingDirectory</key>
   <string>${xml(home)}</string>
   <key>StandardOutPath</key>
@@ -88,7 +99,10 @@ function unitQuote(arg: string): string {
   return /[\s"\\]/.test(arg) ? `"${arg.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : arg;
 }
 
-export function renderUpdateUnits(command: string[], home: string): { service: string; timer: string } {
+export function renderUpdateUnits(command: string[], home: string, mode?: CatchUpMode): { service: string; timer: string } {
+  const when = mode
+    ? `OnBootSec=1min\nOnUnitActiveSec=${CATCH_UP_INTERVAL_SEC / 60}min`
+    : `OnCalendar=*-*-* ${String(UPDATE_HOUR).padStart(2, '0')}:${String(UPDATE_MINUTE).padStart(2, '0')}:00\nRandomizedDelaySec=30m`;
   return {
     service: `[Unit]
 Description=elanous self-update (auto)
@@ -102,8 +116,7 @@ ExecStart=${command.map(unitQuote).join(' ')}
 Description=elanous self-update (daily)
 
 [Timer]
-OnCalendar=*-*-* ${String(UPDATE_HOUR).padStart(2, '0')}:${String(UPDATE_MINUTE).padStart(2, '0')}:00
-RandomizedDelaySec=30m
+${when}
 Persistent=true
 
 [Install]
@@ -123,7 +136,7 @@ function defaultReadCrontab(): string | null {
   return r.status === 0 ? r.stdout : null;
 }
 
-export async function runAutoUpdate(action: AutoAction, deps: AutoUpdateDeps = {}): Promise<AutoUpdateResult> {
+export async function runAutoUpdate(action: AutoAction, deps: AutoUpdateDeps = {}, mode?: CatchUpMode): Promise<AutoUpdateResult> {
   const platform = deps.platform ?? process.platform;
   const home = deps.home ?? homedir();
   const exists = deps.exists ?? existsSync;
@@ -158,24 +171,26 @@ export async function runAutoUpdate(action: AutoAction, deps: AutoUpdateDeps = {
       log(`⛔ 이미 크론이 self-update 를 부른다 — 이중 갱신은 서로의 판 정리를 밟는다. 켜지 않는다:\n${cronLines.map((l) => `  ${l.trim()}`).join('\n')}`);
       return { exitCode: 1, schedulers };
     }
-    const command = deps.command ?? updateCommand();
+    if (mode && !['OP', 'TC', 'MK', 'UX'].includes(mode.seat)) { log('⛔ --catch-up 은 --seat OP|TC|MK|UX 가 필요하다.'); return { exitCode: 2, schedulers }; }
+    const command = deps.command ?? updateCommand(mode);
+    const cadence = mode ? `부팅·깨어남 즉시 + ${CATCH_UP_INTERVAL_SEC / 60}분마다(desiredSha 따라잡기)` : `매일 ${UPDATE_HOUR}:${String(UPDATE_MINUTE).padStart(2, '0')}`;
     if (platform === 'darwin') {
       const logPath = join(elanousStateRoot(), 'logs', 'self-update-auto.log');   // 우주 해석기로(격리 게이트)
-      write(plist, renderUpdatePlist(command, home, logPath));
+      write(plist, renderUpdatePlist(command, home, logPath, mode));
       await run(['launchctl', 'bootout', `gui/${uid}/${UPDATE_LAUNCHD_LABEL}`]);   // 이전 판이 올라가 있으면 내린다(없으면 실패해도 괜찮다)
       const boot = await run(['launchctl', 'bootstrap', `gui/${uid}`, plist]);
       if (boot.exitCode !== 0) { log(`⛔ launchctl bootstrap 실패: ${boot.stderr.trim()}`); return { exitCode: 1, schedulers }; }
-      log(`✅ 자동 갱신 켬 — 매일 ${UPDATE_HOUR}:${String(UPDATE_MINUTE).padStart(2, '0')} · ${plist} · 로그 ${logPath}`);
+      log(`✅ 자동 갱신 켬 — ${cadence} · ${plist} · 로그 ${logPath}`);
       return { exitCode: 0, schedulers: [`launchd ${plist}`] };
     }
-    const units = renderUpdateUnits(command, home);
+    const units = renderUpdateUnits(command, home, mode);
     write(service, units.service);
     write(timer, units.timer);
     for (const cmd of [['systemctl', '--user', 'daemon-reload'], ['systemctl', '--user', 'enable', '--now', `${UPDATE_SYSTEMD_UNIT}.timer`]]) {
       const r = await run(cmd);
       if (r.exitCode !== 0) { log(`⛔ ${cmd.join(' ')} 실패: ${r.stderr.trim()}`); return { exitCode: 1, schedulers }; }
     }
-    log(`✅ 자동 갱신 켬 — 매일 ${UPDATE_HOUR}:${String(UPDATE_MINUTE).padStart(2, '0')}(+30분 안 무작위 · 놓치면 부팅 뒤) · ${timer} · 로그 journalctl --user -u ${UPDATE_SYSTEMD_UNIT}`);
+    log(`✅ 자동 갱신 켬 — ${cadence}(놓치면 부팅 뒤) · ${timer} · 로그 journalctl --user -u ${UPDATE_SYSTEMD_UNIT}`);
     return { exitCode: 0, schedulers: [`systemd ${timer}`] };
   }
 

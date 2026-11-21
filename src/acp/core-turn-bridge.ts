@@ -350,8 +350,8 @@ export function bridgeCoreTurnToAcp(
       // CHAT-TOOLS-ENTRY-VIA-CORE-TURN (JUD-B ACP clause · R-SIG): a single core turn no longer gets its research tool
       // budget from the `isResearchAgentIntent` sentence regex. runCoreTurn applies RESEARCH_TURN_MAX_TOOL_TURNS itself
       // once its research route enters (run-core-turn.ts `maxToolTurns`) — the structured route on a web-tool pool, the
-      // same decision the CLI and the Next TUI reach; the legacy verdict survives there only as the route-mismatch
-      // shadow. A goal-loop turn is an excluded path (#38246 exclusions) and keeps its pre-existing budget verdict.
+      // same decision the CLI and the Next TUI reach; the legacy verdict survives there only for the no-web-tool
+      // route. A goal-loop turn is an excluded path (#38246 exclusions) and keeps its pre-existing budget verdict.
       const goalLoopResearchBudget = armGoalLoop && isResearchAgentIntent(turnCtx.userText);
       const resolvedMaxToolTurns = explicitMaxToolTurns ?? (factQuestion
         ? getUserConfig().chat.factQuestion.maxToolTurns
@@ -569,6 +569,12 @@ export function bridgeCoreTurnToAcp(
         ...(requestSizeGuard ? { requestSizeGuard } : {}),
         ...((!factQuestion || explicitMaxToolTurns !== undefined) && deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
         callbacks: {
+          onResearchSourceUsage: (usage) => {
+            void turnCtx.pushSessionUpdate(
+              { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } },
+              { elanousSourceUsage: usage },
+            );
+          },
           onStatus: (line) => {
             void turnCtx.pushSessionUpdate(
               { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: line } },

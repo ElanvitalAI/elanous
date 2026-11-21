@@ -30,3 +30,33 @@ test('a failed envelope bound to an unknown question carries no axis name', () =
   expect(snapshot?.failedEvidenceCount).toBe(1);
   expect(snapshot?.failedAxes).toEqual([]);
 });
+
+test('a Grok Reddit search summary reaches the partial answer only with a returned Reddit citation', () => {
+  const reddit = 'https://www.reddit.com/r/stocks/comments/2027/outlook/';
+  const hit: ResearchEvidenceEnvelope = { questionId: 'q1', sourceKind: 'web-search:grok', source: reddit,
+    content: '2027 market outlook', outcome: 'partial', truncated: true };
+  const summary: ResearchEvidenceEnvelope = { questionId: 'q1', sourceKind: 'search-summary:grok',
+    source: 'grok-search-summary', outcome: 'partial', truncated: true,
+    content: JSON.stringify({ provider: 'grok', summary: 'Investors split on AI risks and growth.', citationUrls: [reddit] }) };
+  const snapshot = partialGroundingSnapshot('req', ladder, [hit, summary]);
+  expect(snapshot?.redditSnippets).toEqual([{ url: reddit, kind: 'provider-synthesis', sourceKind: 'search-summary:grok',
+    snippet: expect.stringContaining('Investors split on AI risks and growth.') }]);
+  const injected = partialGroundingSnapshot('req', ladder, [hit, { ...summary,
+    content: JSON.stringify({ provider: 'grok', summary: 'fake', citationUrls: ['https://www.reddit.com/r/fake/'] }) }]);
+  expect(injected?.redditSnippets).toEqual([]);
+});
+
+test('same Reddit URL preserves separate excerpts and provider synthesis with their sources', () => {
+  const reddit = 'https://www.reddit.com/r/stocks/comments/shared/outlook/';
+  const evidence: ResearchEvidenceEnvelope[] = [
+    { questionId: 'q1', sourceKind: 'web-search:grok', source: reddit, content: 'Grok captured post note', outcome: 'complete', truncated: false },
+    { questionId: 'q1', sourceKind: 'social-search:reddit:firecrawl', source: reddit, content: 'Firecrawl captured different note', outcome: 'complete', truncated: false },
+    { questionId: 'q1', sourceKind: 'search-summary:grok', source: 'grok-search-summary', content: JSON.stringify({ summary: 'Cross-post sentiment is mixed', citationUrls: [reddit] }), outcome: 'partial', truncated: true },
+  ];
+  const notes = partialGroundingSnapshot('req', ladder, evidence)?.redditSnippets;
+  expect(notes).toEqual([
+    { url: reddit, kind: 'source-excerpt', sourceKind: 'web-search:grok', snippet: 'Grok captured post note' },
+    { url: reddit, kind: 'source-excerpt', sourceKind: 'social-search:reddit:firecrawl', snippet: 'Firecrawl captured different note' },
+    { url: reddit, kind: 'provider-synthesis', sourceKind: 'search-summary:grok', snippet: expect.stringContaining('Cross-post sentiment is mixed') },
+  ]);
+});

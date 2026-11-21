@@ -199,6 +199,17 @@ describe('parseMcpAppPayload', () => {
 });
 
 describe('runChatTurnStreaming — block accumulator (Phase B-2)', () => {
+  it('uses the SSE tool-result metadata in bare webchat without another request', async () => {
+    globalThis.fetch = mockSseResponseChunks([
+      'event: turn-begin\ndata: {"sessionId":"sess-sources-sse"}\n\n',
+      'event: tool-call\ndata: {"id":"s1","name":"OmniSearch","args":{}}\n\n',
+      `event: tool-result\ndata: ${JSON.stringify({ id: 's1', name: 'OmniSearch', ok: true, result: { metadata: { perEngine: { firecrawl: { hits: 2 } } } } })}\n\n`,
+      'event: turn-end\ndata: {"sessionId":"sess-sources-sse","text":"답변","stopReason":"end_turn"}\n\n',
+    ]);
+    const { message } = await runChatTurnStreaming('조사', makeCtx('sess-sources-sse'));
+    expect(message.sourceUsage).toEqual({ firecrawl: 2, grok: 0, market: 0 });
+    expect(calls).toHaveLength(1);
+  });
   it('turns an app_deploy SSE receipt into a dedicated public URL block', async () => {
     const receipt = { kind: 'site-deploy', status: 'published', publicUrl: 'https://demo--alice.elanous.app/' };
     globalThis.fetch = mockSseResponseChunks([
@@ -600,6 +611,33 @@ function chunkUpdate(sessionId: string, update: Record<string, unknown>): AcpFra
 }
 
 describe('runChatTurnAcp — CV-1b chat self-turn ACP path', () => {
+  it('carries actual tool-result source counts to the final webchat message once per call', async () => {
+    const handle = makeProgrammableAcp();
+    handle.programNext('session/prompt', [
+      chunkUpdate('sess-sources', { sessionUpdate: 'tool_call', toolCallId: 'search', title: 'OmniSearch' }),
+      chunkUpdate('sess-sources', { sessionUpdate: 'tool_call_update', toolCallId: 'search', status: 'completed', rawOutput: {
+        output: 'two results', metadata: { perEngine: { firecrawl: { hits: 1 }, grok: { hits: 1 } } },
+      } }),
+      chunkUpdate('sess-sources', { sessionUpdate: 'tool_call_update', toolCallId: 'search', status: 'completed', rawOutput: {
+        metadata: { perEngine: { firecrawl: { hits: 1 } } },
+      } }),
+      chunkUpdate('sess-sources', { sessionUpdate: 'tool_call', toolCallId: 'quote', title: 'finance_quote' }),
+      chunkUpdate('sess-sources', { sessionUpdate: 'tool_call_update', toolCallId: 'quote', status: 'completed', rawOutput: { source: 'eodhd', price: 42 } }),
+      chunkUpdate('sess-sources', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '답변입니다.' } }),
+    ], { stopReason: 'end_turn' });
+    const { message } = await runChatTurnAcp(handle.acp, '조사해줘', makeAcpCtx('sess-sources'));
+    expect(message.sourceUsage).toEqual({ firecrawl: 1, grok: 1, market: 1 });
+  });
+  it('counts internal research metadata sent through ACP without a named tool result', async () => {
+    const handle = makeProgrammableAcp();
+    handle.programNext('session/prompt', [
+      chunkUpdate('sess-internal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' },
+        _meta: { elanousSourceUsage: { firecrawl: 2, grok: 1, market: 1 } } }),
+      chunkUpdate('sess-internal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '답변입니다.' } }),
+    ], { stopReason: 'end_turn' });
+    const { message } = await runChatTurnAcp(handle.acp, '조사해줘', makeAcpCtx('sess-internal'));
+    expect(message.sourceUsage).toEqual({ firecrawl: 2, grok: 1, market: 1 });
+  });
   it('shows an app_deploy ACP receipt without relying on the final prose', async () => {
     const handle = makeProgrammableAcp();
     handle.programNext('session/prompt', [chunkUpdate('sess-deploy', {
@@ -1280,8 +1318,8 @@ describe(':budget · :history · :help', () => {
   it("input '/new' opens a new session id and keeps the previous conversation at 0 lines", async () => {
     const ctx = ctxWith();
     ctx.messages = [
-      { id: 'u1', role: 'user', text: 'one' },
-      { id: 'a1', role: 'assistant', text: 'two' },
+      { id: 'u1', role: 'user', text: 'one', timestamp: 0 },
+      { id: 'a1', role: 'assistant', text: 'two', timestamp: 0 },
     ];
     const opened = await dispatchMeta('/new', ctx);
     expect(opened?.newSessionId).toBeTruthy();
@@ -1425,6 +1463,43 @@ describe('PWA :wish', () => {
     globalThis.fetch = mockResponse({ status: 401, body: { error: 'unauthorized' } });
     expect((await dispatchMeta(':wish 소원', ctx))?.text).toContain('소원 카드 저장 실패 — HTTP 401');
     expect((await dispatchMeta(':wish 소원', makeCtx()))?.text).toContain('소원 카드 저장 실패');
+  });
+
+  it('accepts the insecure-context fallback id for --pending and --retry after a lost response (출처: #39459 JUD-B HOLD #124078)', async () => {
+    // Insecure origin (http LAN) — crypto.getRandomValues without randomUUID — so
+    // randomId()/generateSessionId() mints the OP #123699 fallback `s-<ts36>-<hex16>`.
+    const realCrypto = globalThis.crypto;
+    Object.defineProperty(globalThis, 'crypto', { configurable: true, value: {
+      getRandomValues: (arr: ArrayBufferView) => realCrypto.getRandomValues(arr),
+    } });
+    const ctx = { ...makeCtx('insecure-session'), daemon: { baseUrl: 'http://127.0.0.1:31415', token: 'tok' } };
+    let attempt = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: input as string | URL, init });
+      attempt++;
+      if (attempt === 1) throw new Error('response lost after commit');
+      return Response.json({ title: '폴백 소원' });
+    }) as typeof fetch;
+    try {
+      const failure = (await dispatchMeta(':wish 폴백 소원', ctx))!.text;
+      // Persisted before the fetch; the retry hint carries the fallback id, not a UUID.
+      // 출처: #39459 — wish pending lifecycle sizes
+      expect(wishStorage.size).toBe(1);
+      const id = failure.match(/:wish --retry (\S+)/)?.[1];
+      expect(id).toMatch(/^s-[0-9a-z]+-[0-9a-f]{16}$/);
+      // --pending must list the fallback-id wish.
+      expect((await dispatchMeta(':wish --pending', ctx))?.text).toContain(`${id} — 폴백 소원`);
+      // Ownership preserved: another session cannot retry it.
+      expect((await dispatchMeta(`:wish --retry ${id}`, { ...makeCtx('other-session'), daemon: ctx.daemon }))?.text)
+        .toContain('재시도할 작업을 찾을 수 없습니다');
+      // --retry recovers the same committed ref and clears the pending record.
+      expect((await dispatchMeta(`:wish --retry ${id}`, ctx))?.text).toBe('소원 카드로 남겼습니다 — 폴백 소원');
+      expect(JSON.parse(String(calls[1]!.init?.body))).toEqual(JSON.parse(String(calls[0]!.init?.body)));
+      // 출처: #39459 — wish pending lifecycle sizes
+      expect(wishStorage.size).toBe(0);
+    } finally {
+      Object.defineProperty(globalThis, 'crypto', { configurable: true, value: realCrypto });
+    }
   });
 });
 

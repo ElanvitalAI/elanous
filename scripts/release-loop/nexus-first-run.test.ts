@@ -13,7 +13,7 @@ async function probe(mode: string) {
 import { createServer } from 'node:http';
 import { mkdirSync, realpathSync } from 'node:fs';
 const mode = ${JSON.stringify(mode)};
-if (process.argv.includes('--version')) { console.log('0.3.25 ${'a'.repeat(40)}'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('0.3.25 261121_0855 ${'a'.repeat(40)}'); process.exit(0); }
 const state = process.argv.find(a => a.startsWith('--test=')).slice(7);
 const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
 mkdirSync(state + '/nexus', { recursive: true });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { PaneRegistry, authorizeRequest, isMutating, spawnParentOf, type ServerRole } from './server-auth.js'; import type { AllowRule } from './control.js';
+import { PaneRegistry, authorizeRequest, isMutating, resolveTabCloseScope, spawnParentOf, type ServerRole } from './server-auth.js'; import type { AllowRule } from './control.js';
 
 const OWNER_ENV = 'ELANOUS_ELS_OWNER_TOKEN';
 const PANE_ENV = 'ELANOUS_ELS_PANE_TOKEN';
@@ -23,6 +23,23 @@ describe('PaneRegistry.registerOwner + classify — owner 등록 절차', () => 
     expect(authorizeRequest(registry.classify({ token: owner.token }), { op: 'new', ws: 'w' }, undefined, undefined).allow).toBe(true);
   });
 
+  test('seat-set rejects an OP pane credential but allows the registered server owner', () => {
+    const registry = new PaneRegistry();
+    const owner = registry.registerOwner();
+    const env = registry.registerSpawn({ ELANOUS_ELS_PANE: 'p-op', ELANOUS_ELS_WS: 'w' }, '/tmp', OP_PARENT);
+    registry.registerSeat('OP');
+    expect(authorizeRequest(registry.classify({ token: env[PANE_ENV] }), { op: 'seat-set', seat: 'OP' }, undefined, undefined).allow).toBe(false);
+    expect(authorizeRequest(registry.classify({ token: owner.token }), { op: 'seat-set', seat: 'OP' }, undefined, undefined).allow).toBe(true);
+  });
+
+  test('an OP pane named server-owner cannot register the OP runtime', () => {
+    const registry = new PaneRegistry();
+    const owner = registry.registerOwner();
+    const env = registry.registerSpawn({ ELANOUS_ELS_PANE: 'server-owner', ELANOUS_ELS_WS: 'w' }, '/tmp', OP_PARENT);
+    registry.registerSeat('OP');
+    expect(authorizeRequest(registry.classify({ token: env[PANE_ENV] }), { op: 'seat-set', seat: 'OP' }, undefined, undefined).allow).toBe(false);
+    expect(authorizeRequest(registry.classify({ token: owner.token }), { op: 'seat-set', seat: 'OP' }, undefined, undefined).allow).toBe(true);
+  });
   test('seat-set 은 hand·outsider 에게 거부', () => {
     const registry = new PaneRegistry();
     const handEnv = registry.registerSpawn({ ELANOUS_ELS_PANE: 'p-hand', ELANOUS_ELS_WS: 'w-hand' }, '/Users/x/elanous-hq/seats/HAND-MCP', HAND_PARENT);
@@ -128,6 +145,58 @@ describe('authorizeRequest — JUD #39053 ⓒ1 리터럴', () => {
     const verdict = authorizeRequest(opRole, { op: 'close', pane: 'p-x' }, 'w-x', undefined);
     expect(verdict.allow).toBe(false);
     expect(verdict.allow === false && verdict.reason).toContain('confirm');
+  });
+
+  test('tab close: a confirmed own-workspace tab is allowed, a foreign tab and unconfirmed close are refused', () => {
+    expect(authorizeRequest(handRole, { op: 'close-tab', tab: 't-own', confirmed: true }, 'w-hand', undefined,
+      { tabId: 't-own', workspace: 'w-hand', ownerSeats: ['HAND-MCP'] })).toEqual({ allow: true });
+    expect(authorizeRequest(handRole, { op: 'close-tab', tab: 't-other', confirmed: true }, 'w-op', undefined,
+      { tabId: 't-other', workspace: 'w-op', ownerSeats: ['HAND-OTHER'] }).allow).toBe(false);
+    const unconfirmed = authorizeRequest(opRole, { op: 'close-tab', tab: 't-own' }, 'w-hand', undefined);
+    expect(unconfirmed.allow).toBe(false);
+    expect(unconfirmed.allow === false && unconfirmed.reason).toContain('confirm');
+  });
+
+  test('tab close refuses another seat in the same workspace, mixed owners, and a checked tab ID unlike execution', () => {
+    const request = { op: 'close-tab', tab: 't-other', confirmed: true };
+    expect(authorizeRequest(handRole, request, 'w-hand', undefined,
+      { tabId: 't-other', workspace: 'w-hand', ownerSeats: ['HAND-OTHER'] }).allow).toBe(false);
+    expect(authorizeRequest(handRole, request, 'w-hand', undefined,
+      { tabId: 't-other', workspace: 'w-hand', ownerSeats: ['HAND-MCP', 'HAND-OTHER'] }).allow).toBe(false);
+    expect(authorizeRequest(handRole, request, 'w-hand', undefined,
+      { tabId: 't-own', workspace: 'w-hand', ownerSeats: ['HAND-MCP'] }).allow).toBe(false);
+  });
+
+  test('same-workspace tab owners come from server-minted pane registrations, including mixed seats', () => {
+    const minted = new PaneRegistry();
+    const a = minted.registerSpawn({ ELANOUS_ELS_PANE: 'p-a', ELANOUS_ELS_WS: 'W' }, '/seats/HAND-B',
+      { kind: 'hand', seat: 'HAND-A', workspaces: ['W'] });
+    minted.registerSpawn({ ELANOUS_ELS_PANE: 'p-b', ELANOUS_ELS_WS: 'W' }, '/seats/HAND-A',
+      { kind: 'hand', seat: 'HAND-B', workspaces: ['W'] });
+    const role = minted.classify({ token: a[PANE_ENV] });
+    const base = { workspaces: [{ id: 'w', name: 'W' }], tabs: [{ id: 't', workspaceId: 'w' }] };
+    const foreign = resolveTabCloseScope({ ...base, panes: [{ pane: 'p-b', tab: 't' }] }, minted.entries(), 't')!;
+    expect(foreign.ownerSeats).toEqual(['HAND-B']);
+    expect(authorizeRequest(role, { op: 'close-tab', tab: 't', confirmed: true }, 'W', undefined, foreign).allow).toBe(false);
+    const mixed = resolveTabCloseScope({ ...base, panes: [{ pane: 'p-a', tab: 't' }, { pane: 'p-b', tab: 't' }] }, minted.entries(), 't')!;
+    expect(mixed.ownerSeats).toEqual(['HAND-A', 'HAND-B']);
+    expect(authorizeRequest(role, { op: 'close-tab', tab: 't', confirmed: true }, 'W', undefined, mixed).allow).toBe(false);
+  });
+
+  test('RES-INFRA allow-list peer cannot close another seat live tab in the same workspace', () => {
+    const peer: ServerRole = { kind: 'peer', pid: 4242, pane: 'p-res', seat: 'RES-INFRA', uid: 501 };
+    const rules: readonly AllowRule[] = [{ principal: 'local:501', seat: 'RES-INFRA', workspace: 'W', pane: '*', actions: ['close'] }];
+    const request = { op: 'close-tab', tab: 't-live', confirmed: true };
+    expect(authorizeRequest(peer, request, 'W', rules,
+      { tabId: 't-live', workspace: 'W', ownerSeats: ['TC-H-CX-12'] }).allow).toBe(false);
+    expect(authorizeRequest(peer, request, 'W', rules,
+      { tabId: 't-live', workspace: 'W', ownerSeats: ['RES-INFRA', 'TC-H-CX-12'] }).allow).toBe(false);
+    expect(authorizeRequest(peer, request, 'W', rules,
+      { tabId: 't-live', workspace: 'W', ownerSeats: ['RES-INFRA'] }).allow).toBe(true);
+    const opPeer: ServerRole = { ...peer, seat: 'OP' };
+    const opRules: readonly AllowRule[] = [{ ...rules[0]!, seat: 'OP' }];
+    expect(authorizeRequest(opPeer, request, 'W', opRules,
+      { tabId: 't-live', workspace: 'W', ownerSeats: ['TC-H-CX-12'] }).allow).toBe(false);
   });
 
   test('outsider 읽기 연산 허용(③ 읽기 전용)', () => {

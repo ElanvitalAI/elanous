@@ -96,11 +96,15 @@ mock.module('@/lib/debug', () => ({
 }));
 
 const storage = new Map<string, string>();
+let blockStorageWrites = false;
 const priorWindow = (globalThis as { window?: unknown }).window;
 (globalThis as { window?: unknown }).window = {
   localStorage: {
     getItem: (key: string) => storage.get(key) ?? null,
-    setItem: (key: string, value: string) => { storage.set(key, value); },
+    setItem: (key: string, value: string) => {
+      if (blockStorageWrites) throw new Error('quota');
+      storage.set(key, value);
+    },
   },
   confirm: (message: string) => {
     confirmMessages.push(message);
@@ -181,6 +185,36 @@ async function renderTabs(
 }
 
 describe('TerminalTabs initial daemon issuance interaction', () => {
+  test('keeps issuance, add, switch and local close working when storage writes fail', async () => {
+    const active: string[] = [];
+    const states: unknown[] = [];
+    blockStorageWrites = true;
+    try {
+      await renderTabs(active, states);
+      connection.state = 'OPEN';
+      harness.act(() => stateListener?.('OPEN'));
+      await harness.settle();
+      expect(active.at(-1)).toBe('daemon-1');
+      expect(states.at(-1)).toEqual({ status: 'ready', issuedBy: 'daemon' });
+      const add = harness.find((element) => element.type === 'button' && element.props.title === 'new terminal');
+      harness.act(() => (add.props.onClick as () => void)());
+      await harness.settle();
+      expect(active.at(-1)).toBe('daemon-2');
+      harness.act(() => (switchButton('daemon-1').props.onClick as () => void)());
+      await harness.settle();
+      expect(active.at(-1)).toBe('daemon-1');
+      listEntries = [{ terminalId: 'daemon-1', isAlive: true }, { terminalId: 'daemon-2', isAlive: true }];
+      clickWithPropagationGuard(closeButton('daemon-2'));
+      await harness.settle();
+      expect(harness.findAll((element) => element.props['aria-label'] === 'switch to daemon-2')).toHaveLength(0);
+      expect(destroyCalls).toBe(0);
+      expect(switchButton('daemon-1')).toBeDefined();
+    } finally {
+      harness.unmount();
+      listEntries = [];
+      blockStorageWrites = false;
+    }
+  });
   test('direct PTY links defer shell issuance until the live view is closed', async () => {
     const { TerminalTabs } = await import('./TerminalTabs');
     const active: string[] = [];

@@ -11,6 +11,11 @@
       "reason": "C3 shell axis: a real Next TUI Bash past the 10s cap detaches and its capsule-done opens exactly one next turn; Esc, mail/person and three-at-once axes unmeasured",
       "greenSince": "#38673 (main with R1 #38713 no switch · B1 wiring #38676)"
     },
+    "capsule-events/C3-TRIO": {
+      "expect": "green",
+      "greenSince": "2026-11-21 (A2 완료선 PR — 이 PR로 신규 착지)",
+      "reason": "A2 완료선(정본 §3.6 C3:805) — 한 assistant 배치의 10분(시뮬 25s) Bash 3개가 분리 배경 캡슐로 모두 살아남고: 메인 턴 idle 복귀 ≤20s · 그 틈 우편·사람 입력이 각각 자기 턴을 즉시 열며 · Bash 완료 3건이 고유 셸 id 로 정확히 한 번씩 사건 턴을 연다(중복 송달 없음 · Esc 생존 축은 정본 C3 에 그대로)"
+    },
     "capsule-events/C7": {
       "expect": "red",
       "reason": "C7 partial MCP axis; provider, harness, and deadline event remain unmeasured",
@@ -36,6 +41,16 @@
       "greenSince": "#38725",
       "reason": "C6 boot backlog: unread turn-life rows at boot re-open as one backlog window judged on the real turn timeline",
       "redReason": "boot backlog drops unread turn-start"
+    },
+    "capsule-events/C4": {
+      "expect": "green",
+      "greenSince": "#39444 seed-7 Next TUI scenario",
+      "reason": "C4 urgent mail opens within 20s while a background Agent is active; the Agent completion opens one later turn and a progress line is visible. The fake provider compresses the 20-minute hold to 40s."
+    },
+    "capsule-events/C3-ESC": {
+      "expect": "green",
+      "greenSince": "#39444 seed-7 Next TUI scenario",
+      "reason": "C3 Esc axis: a Bash with a 10-minute timeout remains alive after Esc cancels another turn, then writes its completion marker. The wall-clock hold is bounded to 32s."
     },
     "seat-mail-roundtrip/R1-urgent-band": {
       "expect": "red",
@@ -261,6 +276,21 @@
       "expect": "green",
       "greenSince": "#39267 (SCHEDULE-GRAPH-S1 Slice A — main c304956c36)",
       "reason": "두 그래프(memory-lifecycle·release-loop) 동시 발화: lease 가 (triggerId,dedupeKey) 단위라 서로를 막지 않고 둘 다 실행된다 — 그래프 간 상한 새로 없음."
+    },
+    "op-channel/OP-C1": {
+      "expect": "green",
+      "greenSince": "2026-11-21 (#39405 CEO channel · main d6f032d64f)",
+      "reason": "OP-CHANNEL-INGRESS-1121 ①→③→④ 정상 축: 허용 채팅 CEO 메시지 accepted → 대기열 1행 → from=CEO→OP coord 우편(OP 위장 0) → seen → answered → 같은 chat/messageId/thread 회신 → counts 0/1/0"
+    },
+    "op-channel/OP-C2": {
+      "expect": "green",
+      "greenSince": "2026-11-21 (#39405 CEO channel · main d6f032d64f)",
+      "reason": "OP-CHANNEL-INGRESS-1121 ① dedupe 축 (OP #119739 / JUD #119740): telegram messageId 는 채팅 단위 — 허용 채팅 2곳의 같은 messageId 는 2행(중복 아님) · seen/answered 채팅별 독립 → counts 0/2/0"
+    },
+    "op-channel/OP-C3": {
+      "expect": "green",
+      "greenSince": "2026-11-21 (#39405 CEO channel · main d6f032d64f)",
+      "reason": "OP-CHANNEL-INGRESS-1121 저장 실패 중 재시작 축 (JUD #119836 / OP #119845): 낡은 (source, message_id) 키 + reply_text 없는 db 부팅 1 → 재키 COPY 실패 → ROLLBACK(migrate-rolled-back) · 행 2 생존 → 열 복구 후 부팅 2 재키 성공 · 같은 행 waiting 2"
     }
   }
 }

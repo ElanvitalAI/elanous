@@ -6,6 +6,7 @@ import { NEXT_TUI_TITLE } from './core/render.js';
 //          ② 턴 시작·끝이 herdr 에 working → idle 로 신고된다(옛 판 next TUI 는 턴을 신고하지 않아 --wait 가 stalled).
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -20,6 +21,62 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'next-tui-herdr-'));
   for (const key of ['ELANOUS_STATE_DIR', 'ELANOUS_STATE_DIR_SOURCE', 'ELANOUS_SESSION_ROOT']) saved[key] = process.env[key];
 });
+
+test('real Next TUI in a moved Herdr pane reports idle on its current pane id', async () => {
+  if (!ptyAvailable()) return;
+  const iso = join(dir, 'moved');
+  mkdirSync(iso, { recursive: true });
+  writeFileSync(join(iso, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+  process.env.ELANOUS_STATE_DIR = iso;
+  process.env.ELANOUS_STATE_DIR_SOURCE = 'test';
+  process.env.ELANOUS_SESSION_ROOT = join(iso, 'sessions');
+  const sock = join(dir, 'herdr.sock');
+  const frames: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let status = 'unknown';
+  const server = createServer((client) => {
+    let buf = '';
+    client.on('data', (chunk) => {
+      buf += String(chunk);
+      const end = buf.indexOf('\n');
+      if (end < 0) return;
+      const frame = JSON.parse(buf.slice(0, end)) as { id: string; method: string; params: Record<string, unknown> };
+      frames.push(frame);
+      if (frame.method === 'pane.current') {
+        client.write(JSON.stringify({ id: frame.id, result: { pane: { pane_id: 'w3:p5', terminal_id: 'term-test' } } }) + '\n');
+      } else if (frame.params.pane_id !== 'w3:p5') {
+        client.write(JSON.stringify({ id: frame.id, error: { code: 'pane_not_found' } }) + '\n');
+      } else {
+        if (frame.method === 'pane.report_agent') status = String(frame.params.state);
+        client.write(JSON.stringify({ id: frame.id, result: { type: 'ok' } }) + '\n');
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(sock, resolve));
+  const fake = createFakeBins({ herdr: {} });
+  const repo = join(import.meta.dir, '..', '..');
+  const pty = startPty({
+    cmd: process.execPath,
+    args: [join(repo, 'bin', 'elanous.mjs'), '--config-dir', iso, '--test-state-dir', iso, '--tui', 'next'],
+    cols: 80, rows: 24, workdir: iso, unsetEnv: PROVIDER_KEYS,
+    env: { ...credentialFreeEnv(), HOME: iso, TMPDIR: dir, ELANOUS_SKIP_LOGIN_ENV: '1',
+      ELANOUS_STATE_DIR: iso, ELANOUS_STATE_DIR_SOURCE: 'test', ELANOUS_SESSION_ROOT: join(iso, 'sessions'),
+      ELANOUS_TEST_FAKE_LLM: '1', HERDR_ENV: '1', HERDR_PANE_ID: 'w4:pP',
+      HERDR_SOCKET_PATH: sock, HERDR_BIN_PATH: fake.bin('herdr') },
+  });
+  try {
+    const until = Date.now() + 45_000;
+    while (status !== 'idle' && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(status).toBe('idle');
+    expect(frames.filter((frame) => frame.method === 'pane.report_agent').map((frame) => frame.params.pane_id)).toEqual(['w3:p5']);
+    expect((await pty.renderScreen())).toContain(NEXT_TUI_TITLE);
+  } finally {
+    pty.write('\x11');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    try { pty.kill(); } catch { /* already exited */ }
+    fake.cleanup();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}, 90_000);
 
 afterEach(() => {
   for (const [key, value] of Object.entries(saved)) {
@@ -96,13 +153,13 @@ describe('next TUI × herdr prompt (L3)', () => {
       .filter((c) => c.argv[0] === 'pane' && c.argv[1] === 'report-agent')
       .map((c) => c.argv[c.argv.indexOf('--state') + 1] ?? '?');
     try {
-      await waitFor('boot', (s) => s.split('\n').includes(NEXT_TUI_TITLE) && s.includes('Ctrl+Q 종료'));
+      await waitFor('boot', (s) => s.split('\n').includes(NEXT_TUI_TITLE) && (s.includes('Ctrl+Q 종료') || s.includes('Ctrl+Q quit')));
       const deadline = Date.now() + 10_000;
       while (!states().includes('idle') && Date.now() < deadline) await sleep(100);
       expect(states()[0]).toBe('idle');
       // herdr `pane run` 이 bracketed-paste 모드 pane 에 쓰는 바이트 그대로.
       pty.write(`\x1b[200~${prompt}\x1b[201~\r`);
-      const after = await waitFor('reply', (s) => s.includes(reply) && (s.includes('응답 완료') || s.includes('턴 완료')));
+      const after = await waitFor('reply', (s) => s.includes(reply) && (s.includes('응답 완료') || s.includes('턴 완료') || s.includes('Turn done')));
       expect(after).toContain(prompt);
       const id = getActiveSessionId() ?? '';
       expect(loadSession(id)?.messages.filter((m) => m.role === 'user').map((m) => m.content)).toEqual([prompt]);

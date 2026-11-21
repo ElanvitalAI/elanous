@@ -31,6 +31,18 @@ export type CoreTurnStopReason =
   | 'auth_rejected'
   | 'error';
 
+/** Counts of existing research evidence delivered to a turn, without additional lookups. */
+export interface ResearchSourceUsage { firecrawl: number; grok: number; market: number }
+/** Providers that supplied each citable URL or market source locator in a research turn. */
+export type ResearchSourceAttribution = Record<string, Array<'firecrawl' | 'grok' | 'market'>>;
+/** A provider's cross-source synthesis and a captured post excerpt remain distinct, even for one URL. */
+export interface ResearchSocialNote {
+  url: string;
+  snippet: string;
+  kind: 'provider-synthesis' | 'source-excerpt';
+  sourceKind: string;
+}
+
 export interface CoreToolCall {
   id: string;
   name: string;
@@ -91,6 +103,7 @@ export interface CoreTurnCallbacks {
   onStatus?(line: string): void;
   /** Observation only: the research question-plan model call settled (the plan cost a research route adds). */
   onResearchPlanSettled?(info: { outcome: string; elapsedMs: number }): void;
+  onResearchSourceUsage?(usage: ResearchSourceUsage, attribution?: ResearchSourceAttribution): void;
   /** The final answer came back enriched with a runtime verification
    *  supplement — forwarded from `StreamWithToolsHandlers.onFinalAnswerSupplement`. */
   onFinalAnswerSupplement?(info: { answer: string; supplement: string; finalText: string }): void;

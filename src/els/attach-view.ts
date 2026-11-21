@@ -144,9 +144,14 @@ export interface PaneRow {
 /** Mark of a host the federated list reports down (design DESIGN-ELS-SIDETAB-SERVER §원격 «⇄aws1 ✕»; same «✕ ⇄host · 연결 끊김» as the sidetab rows). */
 export const UNREACHABLE_MARK = '✕';
 
-function buildBadge(value: unknown): string {
-  const build = value && typeof value === 'object' ? value as { sha?: unknown; age?: unknown } : {};
-  return typeof build.sha === 'string' ? `[자체보고·미인증:${build.sha.slice(0, 7)} ${String(build.age ?? 'unknown')}]` : '[build unknown]';
+export function buildBadge(value: unknown, unknown = '[build unknown]'): string {
+  const build = value && typeof value === 'object' ? value as { sha?: unknown; age?: unknown; version?: unknown; stamp?: unknown; channel?: unknown } : {};
+  if (typeof build.sha !== 'string' || !/^[0-9a-f]{7,40}$/i.test(build.sha)) return unknown;
+  const version = typeof build.version === 'string' && build.version.length <= 64 && /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(build.version) ? build.version : undefined;
+  const stamp = typeof build.stamp === 'string' && build.stamp.length === 11 && /^\d{6}_\d{4}$/.test(build.stamp) ? build.stamp : undefined;
+  const channel = build.channel === 'official' || build.channel === 'dev' ? build.channel : undefined;
+  const age = build.age === 'current' || build.age === 'older' || build.age === 'different' ? build.age : 'unknown';
+  return `[자체보고·미인증:${[version, channel, stamp, build.sha.slice(0, 7), age].filter(Boolean).join(' ')}]`;
 }
 
 /** The rows of an `els ls` answer, in the server's order. Anything that is not a list gives no rows. */

@@ -141,8 +141,10 @@ test('workspace-style ChatPanel keeps the original chat without conversation nav
   expect(root.findAllByType(ChatConversationList)).toHaveLength(0);
 });
 
-test('bare webchat origin hides the conversation list and its polling', async () => {
+test('bare webchat origin hides list polling and restores the active member session', async () => {
   const { root, calls } = await mount(true, [], 1200, true);
   expect(root.findAllByType(ChatConversationList)).toHaveLength(0);
-  expect(calls.filter((call) => call.path.startsWith('/v1/sessions/store'))).toEqual([]);
+  expect(calls.filter((call) => call.path.startsWith('/v1/sessions/store'))).toEqual([
+    { path: '/v1/sessions/store/one?ifExists=1', init: undefined },
+  ]);
 });

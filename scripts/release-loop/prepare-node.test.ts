@@ -34,7 +34,7 @@ function fixture(refreshedFrom: string | null = old) {
 function nexusProof() {
   const publicCommit = 'e'.repeat(40);
   return { publicCommit, e2e: { ran: true, ok: true, nexusFirstRun: {
-    ok: true, versionLine: `0.2.31 ${publicCommit}`, health: 200, healthOk: true, app: 200,
+    ok: true, versionLine: `0.2.31 261121_0855 ${publicCommit}`, health: 200, healthOk: true, app: 200,
     testUniverse: true, pid: 12345, ownPidStopped: true, forcedKill: false, exitCode: 0,
   } } };
 }

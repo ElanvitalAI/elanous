@@ -11,23 +11,50 @@
 
 import { Database } from 'bun:sqlite';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
-import { dirname, join } from 'node:path';
-import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { dirname, join, sep } from 'node:path';
 import { prevScheduledFire } from './cron-match.js';
 import { debug } from '../debug/log.js';
 import { listSources } from '../intake-plane/intake-sources.js';
 import { getUserConfig } from '../user-config/reader.js';
-import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { effectiveInstanceRoot, effectiveStateRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { deriveScheduleName, ensureScheduleRunsSchema, recordScheduleRun } from './schedule-runs.js';
 
 /** 스케줄 레지스트리 DB 정본 경로 — state-dir 존중(lazy · Phase B). prod(ELANOUS_STATE_DIR
  *  미설정)=`~/.elanous/schedules.db`(무변경) · 격리 test 인스턴스=자기 루트(빈 시작). 종전
  *  homedir 하드코딩은 test 데몬의 미션 materialize/cancel 이 prod 크론을 건드리던 근본. */
+function scheduleStateRoot(): string {
+  const root = effectiveStateRoot();
+  const prod = prodInstanceRoot();
+  if (root === prod) return root;
+  if (root.startsWith(`${prod}${sep}`)) throw new Error('격리 schedule 루트가 운영 집 안에 있음');
+  try {
+    if (lstatSync(root).isSymbolicLink()) throw new Error('격리 schedule 루트가 symlink임');
+    const realRoot = realpathSync(root);
+    let realProd = prod;
+    try { realProd = realpathSync(prod); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (realRoot === realProd || realRoot.startsWith(`${realProd}${sep}`)) {
+      throw new Error('격리 schedule 루트가 운영 집을 가리킴');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return root;
+}
+
+function assertScheduleLeaf(path: string): void {
+  try {
+    if (!lstatSync(path).isFile()) throw new Error(`격리 schedule 파일이 일반 파일이 아님: ${path}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
 export function schedulesDbPath(): string {
-  return join(elanousStateRoot(), 'schedules.db');
+  return join(scheduleStateRoot(), 'schedules.db');
 }
 
 /** 도메인 무관 카테고리 (§타입 일반화 — Conatus 전용 탈피). */
@@ -62,7 +89,14 @@ export interface ScheduleRow {
 }
 
 export function openSchedulesDb(path: string = schedulesDbPath()): Database {
-  if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
+  if (path !== ':memory:') {
+    const root = scheduleStateRoot();
+    if (root !== prodInstanceRoot() && path === join(root, 'schedules.db')) {
+      mkdirSync(root, { recursive: true, mode: 0o700 });
+      scheduleStateRoot(); // 생성 뒤 실경로를 다시 확인한다(부모 symlink 포함).
+      for (const suffix of ['', '-wal', '-shm', '-journal']) assertScheduleLeaf(`${path}${suffix}`);
+    } else mkdirSync(dirname(path), { recursive: true });
+  }
   const db = new Database(path);
   db.run('PRAGMA busy_timeout = 2000');
   const schemaObjects = db.prepare(`SELECT name FROM sqlite_master WHERE name IN ('schedule_registry', 'idx_sched_cat', 'schedule_runs', 'idx_schedule_runs_schedule_fired')`).all() as Array<{ name: string }>;
@@ -366,13 +400,37 @@ export function inferCategory(command: string): ScheduleCategory {
   return 'maintenance';
 }
 
+/** 격리 우주는 자기 예약 파일만 읽고 쓴다. */
+function isolatedCrontabPath(): string | null {
+  // The crontab view must share the same state root as schedules.db, including
+  // a programmatic config override paired with an isolated state stamp.
+  const root = scheduleStateRoot();
+  return root === prodInstanceRoot() ? null : join(root, 'crontab');
+}
+
+function readIsolatedCrontab(path: string): string {
+  try {
+    if (lstatSync(path).isSymbolicLink()) throw new Error('격리 crontab 파일이 symlink임');
+    return readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
 /** 현재 crontab 원문 반환(없으면 ''). */
 export function readCrontab(): string {
+  const isolated = isolatedCrontabPath();
+  if (isolated) return readIsolatedCrontab(isolated);
   // ⛔ stderr 를 물려받지 않는다 — 크론이 없는 기계에서 「no crontab for <user>」가 TUI 화면 한가운데 찍혔다
   //   (2026-09-26 베어 Ubuntu 26.04 실측 · UX 17). 크론 없음은 정상이라 빈 문자열이다.
   // env 명시 — bun 은 env 없이 부르면 «기동 시» PATH 로 찾는다(시험이 PATH 앞에 둔 가짜 crontab 을 지나쳐 실물을 연다).
   try { return execFileSync('crontab', ['-l'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: process.env }); }
-  catch { return ''; } // no crontab for user
+  catch (error) {
+    const stderr = String((error as { stderr?: Buffer | string }).stderr ?? '');
+    if (/^\s*(?:crontab:\s*)?no crontab for\b/i.test(stderr)) return '';
+    throw error;
+  }
 }
 
 /** crontab → 레지스트리 upsert. 사용자 설정(note·domain override·managed_by)은
@@ -606,8 +664,6 @@ export function driftedSchedules(db: Database, staleBefore: string): ScheduleRow
 // 즉사 방지 · feedback_crontab_line_cd_repo_required) ③ 로그 리다이렉트 ④ 파괴적
 // 작업은 확인. 실행 엔진 신설 아님 — 시스템 crontab을 안전하게 CRUD.
 
-import { writeFileSync } from 'node:fs';
-
 /** elanous repo 루트(이 파일 = src/domains/…). */
 export function repoRoot(): string {
   return cronRepoRoot(join(import.meta.dir, '..', '..'));
@@ -734,11 +790,45 @@ export function setLineEnabled(current: string, rawLine: string, enabled: boolea
 
 /** 임퓨어: 백업 후 crontab 교체. 백업 경로 반환. */
 export function applyCrontab(text: string, opts: { backupDir?: string; now?: string } = {}): string {
-  const dir = opts.backupDir ?? join(elanousStateRoot(), 'backups');
-  mkdirSync(dir, { recursive: true });
+  const isolated = isolatedCrontabPath();
+  const root = scheduleStateRoot();
+  const dir = opts.backupDir ?? join(root, 'backups');
+  if (isolated) {
+    if (dir !== join(root, 'backups')) throw new Error('격리 crontab 백업 경로가 우주 밖임');
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    scheduleStateRoot();
+    try {
+      if (!lstatSync(dir).isDirectory()) throw new Error('격리 crontab 백업 폴더가 symlink이거나 폴더가 아님');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      mkdirSync(dir, { mode: 0o700 });
+    }
+  } else mkdirSync(dir, { recursive: true });
   const stamp = (opts.now ?? new Date().toISOString()).replace(/[:.]/g, '-');
-  const backup = join(dir, `crontab-cronmanage-${stamp}.bak`);
-  try { writeFileSync(backup, readCrontab()); } catch { /* 최초엔 빈 crontab */ }
-  execFileSync('crontab', ['-'], { input: text.replace(/\n*$/, '\n'), encoding: 'utf-8', env: process.env });
+  const backup = join(dir, `crontab-cronmanage-${stamp}${isolated ? `-${randomUUID()}` : ''}.bak`);
+  const before = readCrontab();
+  if (isolated) {
+    const tempBackup = `${backup}.tmp`;
+    try {
+      writeFileSync(tempBackup, before, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      renameSync(tempBackup, backup);
+    } catch (error) {
+      try { unlinkSync(tempBackup); } catch { /* no temp */ }
+      throw error;
+    }
+  } else writeFileSync(backup, before);
+  if (isolated) {
+    // Rename prevents a failed write from exposing a partial schedule.
+    const temp = `${isolated}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, text.replace(/\n*$/, '\n'), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      renameSync(temp, isolated);
+    } catch (error) {
+      try { unlinkSync(temp); } catch { /* no temp */ }
+      throw error;
+    }
+  } else {
+    execFileSync('crontab', ['-'], { input: text.replace(/\n*$/, '\n'), encoding: 'utf-8', env: process.env });
+  }
   return backup;
 }

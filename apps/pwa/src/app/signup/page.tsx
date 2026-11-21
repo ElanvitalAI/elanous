@@ -33,7 +33,7 @@ export default function MemberSignupPage() {
       const endpoint = daemon?.config.baseUrl ? new URL('/v1/members', daemon.config.baseUrl).toString() : '/v1/members';
       const response = await fetch(endpoint, { method: 'POST', credentials: 'include',
         headers: { 'content-type': 'application/json' }, body: JSON.stringify(memberSignupBody(intent, newsletterChoice)) });
-      if (!response.ok) throw new Error(response.status === 400 ? '초대 또는 행사 코드를 확인해 주세요.'
+      if (!response.ok) throw new Error(response.status === 400 ? '초대 링크를 확인해 주세요.'
         : response.status === 429 ? '접속이 많습니다. 잠시 뒤 다시 시도해 주세요.' : '가입을 시작하지 못했습니다. 다시 시도해 주세요.');
       const body = await response.json() as { authorizationUrl?: unknown };
       if (typeof body.authorizationUrl !== 'string' || new URL(body.authorizationUrl).protocol !== 'https:')
@@ -53,9 +53,7 @@ export default function MemberSignupPage() {
     <p>Google 계정으로 가입합니다. 초대 링크로 오셨다면 추천 관계가 가입 시 기록됩니다.</p>
     {intent?.ref && <p className="rounded border border-border bg-card p-3 text-sm">회원 ID {intent.ref}의 추천 링크가 적용됩니다.</p>}
     {intent?.referralCode && <p className="rounded border border-border bg-card p-3 text-sm">기존 초대 링크가 적용됩니다.</p>}
-    {intent?.eventCode === KCB_EVENT_CODE ? <label className="flex flex-col gap-2 text-sm">행사 코드
-      <input value={intent.eventCode} readOnly className="rounded-md border bg-muted px-3 py-2" aria-label="행사 코드" />
-    </label> : intent?.eventCode && <p className="rounded border border-border bg-card p-3 text-sm">행사 코드 {intent.eventCode}가 적용됩니다.</p>}
+    {intent?.eventCode && <p className="rounded border border-border bg-card p-3 text-sm">초대 코드 적용됨</p>}
     <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={consented} onChange={event => setConsented(event.target.checked)} />
       <span>개인정보 처리와 이용약관에 동의합니다.</span></label>
     <fieldset className="space-y-2 rounded-md border border-border p-4">

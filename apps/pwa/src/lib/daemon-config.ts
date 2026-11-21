@@ -19,7 +19,7 @@
  */
 
 import { migrateBaseUrl } from './migrate-base-url';
-import { BARE_CAPABILITIES_META_NAME, BARE_WEBCHAT_FORWARDED_API_PATHS, parseBareCapabilities } from '../../../../src/relay/bare-surface';
+import { BARE_CAPABILITIES_META_NAME, BARE_WEBCHAT_FORWARDED_API_PATHS, BARE_WEBCHAT_SESSION_ITEM_CAPABILITY, parseBareCapabilities } from '../../../../src/relay/bare-surface';
 
 const STORAGE_KEYS = {
   baseUrl: 'elanous.nexus.baseUrl',
@@ -92,7 +92,8 @@ export function surfaceForwards(
   // A bare host whose HTML carries the bare meta but no capabilities meta (an older Nexus) falls back to the shared
   // default set: pollers stay gated and the chat pair keeps working — never a dead chat.
   const forwarded: readonly string[] = content == null ? BARE_WEBCHAT_FORWARDED_API_PATHS : parseBareCapabilities(content);
-  return forwarded.includes(pathname);
+  return forwarded.includes(pathname)
+    || (forwarded.includes(BARE_WEBCHAT_SESSION_ITEM_CAPABILITY) && /^\/v1\/sessions\/store\/[^/]+$/.test(pathname));
 }
 
 function deriveWsUrl(baseUrl: string, path: string): string {
@@ -129,8 +130,12 @@ export function loadDaemonConfig(): DaemonConfig {
       }
     },
   });
+  // 출처: #39459 — 명시적 빈 `elanous.daemon.token`(«다시 연결»이 저장)은
+  // «토큰 없음»의 확정 상태다. 이주 폴백은 키 부재(null)에만 달리붙게
+  // 해서, 남은 레거시 elanous.voice.token 이 거부된 옛 토큰을 되살리는
+  // 일을 막는다(JUD-B #124629 기능 HOLD — 복원 차단).
   const legacyVoiceToken = localStorage.getItem(LEGACY_KEYS.voiceToken);
-  if (legacyVoiceToken && !localStorage.getItem(STORAGE_KEYS.token)) {
+  if (legacyVoiceToken && localStorage.getItem(STORAGE_KEYS.token) === null) {
     localStorage.setItem(STORAGE_KEYS.token, legacyVoiceToken);
   }
   // Empty-string check — `??` only fires on null/undefined. Without this,
@@ -151,6 +156,16 @@ export function saveDaemonConfig(cfg: Partial<DaemonConfig>): void {
   if (cfg.baseUrl !== undefined) localStorage.setItem(STORAGE_KEYS.baseUrl, cfg.baseUrl);
   if (cfg.token !== undefined) localStorage.setItem(STORAGE_KEYS.token, cfg.token);
   if (cfg.provider !== undefined) localStorage.setItem(STORAGE_KEYS.provider, cfg.provider);
+}
+
+/**
+ * 출처: #39459 — «다시 연결»(reconnectRejectedDevice) 전용: 원샷 이주가 남긴
+ * 레거시 elanous.voice.token 까지 지운다. 남겨두면 재로드 때 loadDaemonConfig
+ * 의 이주 경로가 거부된 옛 토큰을 되살린다(JUD-B #124629 기능 HOLD).
+ */
+export function clearLegacyVoiceToken(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(LEGACY_KEYS.voiceToken);
 }
 
 export function readSetupScope(): number | null {

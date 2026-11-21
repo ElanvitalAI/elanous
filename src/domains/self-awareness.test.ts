@@ -218,7 +218,7 @@ describe('injectUtterance — observer ingress 분류', () => {
       injectUtterance({ text: '사람이 인용한 pty_a4c9f0: screenshot', origin: 'claude-code' }, db);
       injectUtterance({ text: '', origin: 'claude-code' }, db);
 
-      const rows = queryEvents(db, { domain: SELF_DOMAIN });
+      const rows = db.prepare("SELECT * FROM signals WHERE domain='elanous'").all() as Array<{ tags: string; surface: string; kind: string }>;
       expect(rows).toHaveLength(3);
       expect(rows.every((row) => row.tags === 'origin:claude-code')).toBe(true);
       expect(rows.every((row) => row.surface === 'ext:claude-code' && row.kind === 'utterance')).toBe(true);

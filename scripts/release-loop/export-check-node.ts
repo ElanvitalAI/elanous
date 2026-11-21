@@ -58,8 +58,9 @@ export function resolveRemoteExportCheckInvocation(
   const context = argv.includes('--commit') ? undefined : readContext();
   const identity = resolveExportCheckIdentity(argv, context ? () => context : readContext);
   const configuredHost = context?.input.exportCheckRemote;
+  // RELEASE-EXPORT-CHECK-REMOTE-LIVE (0.3.32 P0): the code default remote host is node-b.
   return {
-    host: remote ?? (typeof configuredHost === 'string' ? configuredHost : 'aws1'),
+    host: remote ?? (typeof configuredHost === 'string' ? configuredHost : 'node-b'),
     ...identity,
     ...(context ? { graphContext: JSON.stringify(context) } : {}),
   };

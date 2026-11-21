@@ -603,6 +603,11 @@ export function SettingsPanel() {
           the legacy ProviderCapabilityCard's capability matrix table —
           toggle "View: matrix" inside the card to see the 5×14 grid. */}
       <LlmCatalogCard />
+      <section className="rounded border border-border bg-card p-4" aria-label="TimelyRouter 공급자 연결">
+        <h3 className="text-sm font-semibold">TimelyRouter 공급자 연결</h3>
+        <p className="mt-1 text-xs text-muted-foreground">계정별 HTTPS 주소와 모델 ID를 확인한 뒤 키를 검증합니다. 가격 확인 전에는 비용을 알 수 없는 상태로 표시합니다.</p>
+        <a className="mt-2 inline-block text-xs underline" href="/credentials">연결 안내 보기</a>
+      </section>
 
       {/* §3.6 (post-DM-Stage-4 dogfood · 2026-05-10) — multi-host
           hot-reload GUI consumer for FU.A3 (#2118). Lets users add

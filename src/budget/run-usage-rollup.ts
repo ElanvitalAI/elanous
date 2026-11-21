@@ -16,6 +16,8 @@ export interface RunUsageInput {
   cacheCreationInputTokens?: number | null;
   reasoningOutputTokens?: number | null;
   cost?: { kind?: string; usd?: number; apiEquivalentUsd?: number } | null;
+  /** 공급자가 usage 를 안 줘 글자 수로 어림한 호출(LLM-USAGE-GROK-BLIND). */
+  estimated?: boolean | null;
 }
 
 /** A returned Pod raw usage row is covered only by a measured rollup from the same Job. */
@@ -47,6 +49,8 @@ export interface RunUsageRow {
   unknownCostCalls: number;
   includedCalls: number;
   apiEquivalentUsd: number;
+  /** 어림(추정) 호출 수 — 하나도 없으면 칸 자체가 없다. */
+  estimatedCalls?: number;
 }
 
 /** Aggregate llm-usage observations without turning unavailable prices into a known zero. */
@@ -75,6 +79,7 @@ export function rollupRunUsage(...[rows, opts]: [rows: readonly RunUsageInput[],
     }
     if (data.hostId && !row.hostIds.includes(data.hostId)) row.hostIds.push(data.hostId);
     row.calls++;
+    if (data.estimated === true) row.estimatedCalls = (row.estimatedCalls ?? 0) + 1;
     for (const field of ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reasoningOutputTokens'] as const) {
       const value = data[field];
       if (typeof value === 'number' && Number.isFinite(value)) row[field] += value;

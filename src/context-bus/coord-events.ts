@@ -133,9 +133,13 @@ export function listCoordEvents(opts: { since: string; seat?: string; channelOnl
     ? new Database(surfaceEventsDbPath(), { readonly: true, strict: true })
     : openSurfaceEventsDb());
   try {
-    const rows = db.prepare(`SELECT id, ts, text, summary, kind, refs FROM events
+    const hasSignals = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='signals'").get());
+    const rows = db.prepare(`WITH journal AS (
+      SELECT id, ts, text, summary, kind, refs, surface, direction, 0 AS source_order, rowid AS ord FROM events
+      ${hasSignals ? "UNION ALL SELECT id, ts, text, summary, kind, refs, surface, direction, 1 AS source_order, rowid AS ord FROM signals WHERE surface='context:external' AND kind='exit'" : ''}
+    ) SELECT id, ts, text, summary, kind, refs FROM journal
       WHERE surface ${opts.channelOnly ? "= 'coord:channel'" : "IN ('coord:channel', 'context:external', 'context:session')"} AND direction='outbound' AND ts>=?
-      ${opts.seat ? "AND json_extract(refs,'$.seat')=?" : ''} ORDER BY ts ASC, rowid ASC`)
+      ${opts.seat ? "AND json_extract(refs,'$.seat')=?" : ''} ORDER BY ts ASC, source_order ASC, ord ASC`)
       .all(...(opts.seat ? [opts.since, opts.seat] : [opts.since])) as Array<{
         id: string; ts: string; text: string; summary: string; kind: string; refs: string;
       }>;

@@ -735,7 +735,7 @@ export async function runStewardStageCommand(stage: StewardStage, deps: StewardC
           const { deliver } = await import('../domains/outbound-alert.js');
           return deliver(text, kind) !== false;
         });
-        if (!await send(failureAlertText(state), 'alert')) throw new Error('steward alert delivery failed');
+        if (!await send(failureAlertText(state, root), 'alert')) throw new Error('steward alert delivery failed');
         state.alertedAt = now().toISOString();
         writeFailureStreak(root, state);
         debug.log('steward.streak', 'alerted', { consecutive: state.consecutive, stage: state.lastStage });

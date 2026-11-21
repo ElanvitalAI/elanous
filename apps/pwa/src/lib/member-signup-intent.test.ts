@@ -39,3 +39,16 @@ test('KCB event code aliases share the canonical signup and first-run intent', (
     eventCode: 'KCB1114', referralCode: 'KCB_1114',
   });
 });
+
+test('invite code picks the first non-empty value across code= and eventCode= (UX #116886 · JUD #116120)', () => {
+  // mixed: a usable code= wins over eventCode=; the notice line and the POST share the one intent value.
+  expect(memberSignupIntentFromSearch('?code=AB12&eventCode=KCB1114')).toEqual({ eventCode: 'AB12' });
+  // an empty or whitespace-only code= falls through to eventCode= — no «행사 코드가 비어 있습니다» dead end.
+  expect(memberSignupIntentFromSearch('?code=&eventCode=KCB1114')).toEqual({ eventCode: 'KCB1114' });
+  expect(memberSignupIntentFromSearch('?code=%20&eventCode=kcb-1114')).toEqual({ eventCode: 'KCB1114' });
+  // an eventCode=-only link applies exactly like a code= link; both-empty still fails closed.
+  expect(memberSignupIntentFromSearch('?eventCode=KCB1114')).toEqual({ eventCode: 'KCB1114' });
+  expect(() => memberSignupIntentFromSearch('?code=&eventCode=')).toThrow('행사 코드가 비어 있습니다.');
+  // JSON metacharacters never reach a POST body: the intent layer rejects them outright.
+  expect(() => memberSignupIntentFromSearch('?code=z%22%2C%22evil%22%3A1')).toThrow('행사 코드가 올바르지 않습니다.');
+});

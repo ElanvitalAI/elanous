@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "entries": {
+    "op-channel/OP-C1": {
+      "expect": "green",
+      "greenSince": "2026-11-21",
+      "reason": "OP-CHANNEL-INGRESS-1121 ①→③→④ 정상 축 (#39405 main d6f032d64f): 허용 채팅 CEO 메시지 accepted → 대기열 1행 → from=CEO→OP coord 우편(OP 위장 0) → seen → answered → 같은 chat/messageId/thread 회신 → counts 0/1/0"
+    },
+    "op-channel/OP-C2": {
+      "expect": "green",
+      "greenSince": "2026-11-21",
+      "reason": "OP-CHANNEL-INGRESS-1121 ① dedupe 축 (OP #119739 / JUD #119740): telegram messageId 는 채팅 단위 — 허용 채팅 2곳의 같은 messageId 는 2행(중복 아님) · seen/answered 채팅별 독립 → counts 0/2/0"
+    },
+    "op-channel/OP-C3": {
+      "expect": "green",
+      "greenSince": "2026-11-21",
+      "reason": "OP-CHANNEL-INGRESS-1121 저장 실패 중 재시작 축 (JUD #119836 / OP #119845): 낡은 (source, message_id) 키 + reply_text 없는 db 부팅 1 → 재키 COPY 실패 → ROLLBACK(migrate-rolled-back) · 행 2 생존 → 열 복구 후 부팅 2 재키 성공 · 같은 행 waiting 2"
+    }
+  }
+}

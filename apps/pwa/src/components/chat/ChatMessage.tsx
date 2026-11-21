@@ -10,6 +10,7 @@ import { ContextSourcesCard } from './ContextSourcesCard';
 import { HarnessAskCard } from './HarnessAskCard';
 import { cn } from '@/lib/utils';
 import type { ChatBlock, ChatMessage as ChatMessageT } from '@/lib/chat-runtime';
+import type { SourceUsage } from '@/lib/source-usage';
 import { CollapsibleCodeBlock } from '@/components/agent/CollapsibleCodeBlock';
 import { ThinkingPill } from './blocks/ThinkingPill';
 import { StatusChip } from './blocks/StatusChip';
@@ -33,6 +34,12 @@ interface Props {
   message: ChatMessageT;
   mobileSimple?: boolean;
   minimal?: boolean;
+}
+
+function SourcesUsedLine({ usage }: { usage: SourceUsage }) {
+  return <p data-elanous-sources-used className="mt-2 border-t border-border/60 pt-1.5 text-xs text-muted-foreground">
+    쓴 출처: firecrawl {usage.firecrawl} · grok(X·레딧) {usage.grok} · 시세 {usage.market}
+  </p>;
 }
 
 /** REL9p — cards only in daemon-side messages; a user's own text is shown exactly as typed. */
@@ -379,6 +386,7 @@ export function ChatMessageView({ message, mobileSimple = false, minimal = false
     return <div className="flex justify-start px-4 py-3" data-elanous-message={message.role} data-elanous-streaming={message.streaming ? 'true' : 'false'} data-elanous-incomplete={message.incomplete ? 'true' : 'false'}>
       <div className="max-w-[85%] rounded-lg border border-border bg-card px-3 py-2 text-sm text-card-foreground shadow-sm">
         <MinimalAssistantBody message={message} mobileSimple={mobileSimple} />
+        {message.sourceUsage && !message.streaming && !message.incomplete && <SourcesUsedLine usage={message.sourceUsage} />}
       </div>
     </div>;
   }
@@ -396,6 +404,7 @@ export function ChatMessageView({ message, mobileSimple = false, minimal = false
         {useBlocks
           ? <BlocksBody blocks={message.blocks!} showCards={!isUser} mobileSimple={mobileSimple} />
           : <CardTextBody text={message.text} showCards={!isUser} />}
+        {!isUser && message.sourceUsage && !message.streaming && !message.incomplete && <SourcesUsedLine usage={message.sourceUsage} />}
         <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
           <span>{time}</span>
           {/* ⭐ 어느 터미널과의 대화인가 — 웹터미널 Dock 만 채운다. 없으면 안 그린다.

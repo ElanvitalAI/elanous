@@ -105,15 +105,12 @@ test('실 relay: 정적 dispatch 핸들 핀 쓰기는 영구 거부 · 읽기 �
   }
 });
 
-test('실 relay: autoAppRegistration 없음 → 2s 상한 빈 목록 · 아무것도 기록되지 않음(fail-closed)', async () => {
+test('실 relay: claims 미구성 질의는 연결을 끊지 않고 빈 목록을 반환한다', async () => {
   const { relay, connection, dir } = await harness(false);
   try {
-    const ledger = createRelayWebChatLedger({});
-    const startedAt = Date.now();
-    restoreWebChatHandlePins(ledger, async () => undefined, emptyStore(), connection.publicHandleClaimsQuery.bind(connection));
-    await new Promise((resolve) => setTimeout(resolve, 2_300));
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2_000);
-    expect(ledger.pinOwners.size).toBe(0);
+    expect(await connection.publicHandleClaimsQuery()).toEqual([]);
+    expect(connection.readyState).toBe(WebSocket.OPEN);
+    expect(relay.stats(connection.serverId).host).toBe(true);
   } finally {
     connection.close();
     relay.stop();

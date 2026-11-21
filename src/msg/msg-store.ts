@@ -1138,13 +1138,18 @@ export class MsgStore {
   ack(recipient: string, cursor: number): number { return this.advanceCursor(recipient, cursor); }
 
   /**
-   * Cursor ack that leaves «seen» for every message it moves past (unacknowledged · after the cursor · ≤ through), in one
-   * transaction — the hand-ack rule of #38305, shared by the CLI and the agent's MsgAck tool. Without it the tool path moved
-   * the cursor silently: HAND-ELN-ELS-API acked #87012 at 10:16 and the ledger still showed it «delivered», never seen
-   * (11-18 ELN-SEAT-LIVE). A failed receipt is a warn and never changes the ack.
+   * Cursor ack. The CLI hand-ack of #38305 also leaves «seen» for every message it moves past (unacknowledged · after the
+   * cursor · ≤ through) in one transaction — a terminal's human eyes are the eyes-on evidence. The agent's MsgAck tool
+   * (#122460 · CX-16 postland 실측 2026-11-21) moves the cursor only: a tool call is not processing, «seen» is the answered
+   * turn's receipt (tui-queue, queueItemId-bound) — the tool-ack seen the 11-18 rule added was stamped before the answer
+   * (seen 영수 queueItemId 공백 · 정답 턴의 queue 결속 seen 은 not-forward 로 밀림). A failed receipt is a warn and never
+   * changes the ack.
    */
   ackThroughSeen(recipient: string, through: number, source: Extract<ReceiptSource, 'cli-ack' | 'tool-ack'>): number {
     return this.db.transaction(() => {
+      // #122460 — a tool call is not processing: the agent's MsgAck advances the cursor and leaves the seen receipt to
+      // the turn that answers the message.
+      if (source !== 'cli-ack') return this.ack(recipient, through);
       const HAND_ACK_SEEN_MAX = 1000; // Source: #38305 REVIEW ③ — the same bound as listByRecipient's page
       const page = this.listByRecipient(recipient, this.getCursor(recipient), HAND_ACK_SEEN_MAX);
       const passing = page.filter(message => message.id <= through).map(message => message.id);

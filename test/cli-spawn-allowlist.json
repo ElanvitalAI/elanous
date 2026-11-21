@@ -17,7 +17,7 @@
   "scripts/release-loop/freeze-off-parity.test.ts": 1,
   "scripts/release-loop/gate-partial.test.ts": 9,
   "scripts/release-loop/release-sim-chain-remaining-cli.test.ts": 1,
-  "scripts/release-loop/version-node.test.ts": 89,
+  "scripts/release-loop/version-node.test.ts": 87,
   "scripts/test-timeout-audit.test.ts": 1,
   "scripts/verify-kpack6-live.test.ts": 1,
   "scripts/windows-startup-smoke.test.ts": 1,

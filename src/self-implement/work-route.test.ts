@@ -387,6 +387,7 @@ describe('COST-OPTIMIZER-WINDOW-AWARE — unmeasured window signals are marked (
       ],
       observedAtByHome: { '/h/default': NOW, '/h/team': NOW },
       freshByHome: { '/h/default': true, '/h/team': true },
+      resetsAtByHome: {},
     }),
   });
 
@@ -404,6 +405,27 @@ describe('COST-OPTIMIZER-WINDOW-AWARE — unmeasured window signals are marked (
         expect(rows[0]!.data).toMatchObject({ unmeasured: ['resetsAtMs', 'costRank', 'mustLastUntilMs'] });
       }
     } finally { log.mockRestore(); }
+  });
+
+  test('a measured reset flows through the production snapshot and changes the child account on on mode', () => {
+    const snapshot = readAccountWindowSnapshot(PROVIDER, {
+      now: () => NOW, emit: () => {}, config: () => ({ harness: { windowAccounts: 'on' } }),
+      inspectCodex: () => ({
+        current: { name: 'default', storeKey: 'openai-codex', home: '/h/default', source: 'default' },
+        explicit: false, reason: 'not-reached', to: undefined,
+        candidates: [
+          { name: 'default', storeKey: 'openai-codex', home: '/h/default', reached: undefined, usedPercent: 20 },
+          { name: 'team', storeKey: 'openai-codex:team', home: '/h/team', reached: undefined, usedPercent: 20 },
+        ],
+        observedAtByHome: { '/h/default': NOW, '/h/team': NOW },
+        freshByHome: { '/h/default': true, '/h/team': true },
+        resetsAtByHome: { '/h/default': NOW + 600_000, '/h/team': NOW + 60_000 },
+      }),
+    });
+    const plan = planWorkRoute(RISKY_GOAL, PROVIDER, snapshot, modelOrchestrationCore());
+    expect(plan.decision.account).toBe('team');
+    expect(plan.decision.unmeasured).toEqual(['costRank', 'mustLastUntilMs']);
+    expect(windowAccountChildEnv(plan, PROVIDER)).toEqual({ ELANOUS_CODEX_ACCOUNT: 'team' });
   });
 
   test('a missing snapshot also marks every window signal unmeasured', () => {

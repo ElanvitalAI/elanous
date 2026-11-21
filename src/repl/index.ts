@@ -1,3 +1,4 @@
+import { judgeStop } from '../agent/stop-door.js';
 import { buildInstalledPackQueryTool, dispatchInstalledPackQuery } from '../boot/installed-pack-query.js';
 import { emitTurnLife } from '../debug/turn-life.js';
 import { safeAgentSummary, toolActivityTarget } from '../tui/chat/tool-activity.js';
@@ -174,8 +175,16 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
     if (!message || typeof message !== 'object') return;
     const request = message as { type?: unknown; sessionId?: unknown; taskId?: unknown };
     if (request.type !== 'elanous.next-tui.task-stop' || request.sessionId !== sessionId || typeof request.taskId !== 'string') return;
-    const task = globalAgentRegistry.list().find((item) => item.id === request.taskId && backgroundTaskIds.has(item.id));
-    if (task) globalAgentRegistry.abort(task.id);
+    const known = backgroundTaskIds.has(request.taskId) ? globalAgentRegistry.get(request.taskId) : undefined;
+    const verdict = judgeStop({
+      kind: 'task',
+      id: request.taskId,
+      exists: known !== undefined,
+      ended: known !== undefined && (known.state === 'done' || known.state === 'error' || known.state === 'aborted'),
+      owner: known ? known.parentSessionId ?? sessionId : undefined,
+      requester: sessionId,
+    });
+    if (verdict.stopped && known) globalAgentRegistry.abort(known.id);
     emit();
   };
   process.on('message', onTaskStop);
@@ -375,6 +384,8 @@ export async function resolveSeatMemoryAudience(
 }
 
 export function buildReplTools(options: {
+  /** Only the structured Next TUI child can advertise the els tool. */
+  readonly nextTui?: boolean;
   readonly onGraphProgress?: (event: GraphProgressObservation) => void;
   readonly sessionId?: string;
   /** One trusted user request/turn, distinct from the lifetime of the sticky REPL session. */
@@ -382,7 +393,7 @@ export function buildReplTools(options: {
   /** CAPSULE-A2 — the TUI turn id, for turn-life correlation of shell capsules. */
   readonly getTurnId?: () => string | undefined;
   readonly shellApprovalProcess?: ShellApprovalIpcProcess;
-  readonly dispatchBash?: (args: Record<string, unknown>, options: { cwd: string; signal?: AbortSignal }) => Promise<unknown>;
+  readonly dispatchBash?: (args: Record<string, unknown>, options: { cwd: string; signal?: AbortSignal; priorHumanApproval?: boolean }) => Promise<unknown>;
   readonly getSignal?: () => AbortSignal | undefined;
   /** An authenticated member session supplied by the Next host. */
   readonly memberBoardSession?: ReplOpts['memberBoardSession'];
@@ -401,6 +412,14 @@ export function buildReplTools(options: {
   const combineSignals = (a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined =>
     a && b ? AbortSignal.any([a, b]) : (a ?? b);
   const dispatchByName = new Map<string, (args: Record<string, unknown>, callSignal?: AbortSignal) => Promise<unknown>>();
+  if (options.nextTui) {
+    const els = require('../els/els-control-tool.js') as typeof import('../els/els-control-tool.js');
+    if (els.elsControlSocketPath()) {
+      const spec = els.buildElsControlTool();
+      specs.push(spec);
+      dispatchByName.set(spec.name, args => els.dispatchElsControl(args));
+    }
+  }
   const packQuery = buildInstalledPackQueryTool();
   specs.push(packQuery);
   dispatchByName.set(packQuery.name, args => dispatchInstalledPackQuery(args));
@@ -493,8 +512,8 @@ export function buildReplTools(options: {
         : { status: 'answered', answer, assumptions: round.assumptions };
     });
   }
-  const runBash = (args: Record<string, unknown>, signal?: AbortSignal) =>
-    dispatchBash(args, { cwd: getSessionCwd(), ...(signal ? { signal } : {}) });
+  const runBash = (args: Record<string, unknown>, signal?: AbortSignal, priorHumanApproval = false) =>
+    dispatchBash(args, { cwd: getSessionCwd(), ...(signal ? { signal } : {}), priorHumanApproval });
   dispatchByName.set('Bash', async (args, callSignal) => {
     // ELN-SEAT-TURN-HARD-CAP ④: the seat turn cap aborts through the call's own signal (dctx.signal); the person's Esc
     // signal stays too — either one stops the shell child (11-18: the cap never reached a running Bash, +247 s).
@@ -508,7 +527,7 @@ export function buildReplTools(options: {
         requiresApproval: true,
         approve: shellApprover,
         signal,
-        dispatch: () => runBash(args, signal),
+        dispatch: (priorHumanApproval) => runBash(args, signal, priorHumanApproval),
       });
     }
     return runBash(args, signal);
@@ -525,7 +544,7 @@ export function buildReplTools(options: {
     const requiresApproval = !!bashApprovalFinding(command, getUserConfig().shell.bashApproval)
       || args.approval === 'always' || args.approval === 'first-time';
     return dispatchNextTuiBash({ command, enabled: true, requiresApproval, approve: shellApprover, signal,
-      dispatch: async () => {
+      dispatch: async (priorHumanApproval) => {
         const runner = require('../shell-runner/dispatch.js') as typeof import('../shell-runner/dispatch.js');
         if (!runner.getShellRunnerDeps()) {
           const { createShellRegistry } = require('../shell-runner/registry.js') as typeof import('../shell-runner/registry.js');
@@ -533,7 +552,7 @@ export function buildReplTools(options: {
           const { installShellRunnerDeps } = require('../surface/shell-runner-boot.js') as typeof import('../surface/shell-runner-boot.js');
           installShellRunnerDeps({ registry: createShellRegistry(), fileEngine: createFileCaptureEngine(), setShellRunnerDeps: runner.setShellRunnerDeps });
         }
-        return runShellMod.dispatchRunShellCapsule({ ...args, approval: 'none' }, { signal, availableToolNames: specs.map(spec => spec.name) });
+        return runShellMod.dispatchRunShellCapsule({ ...args, approval: 'none' }, { signal, sessionId: options.sessionId, availableToolNames: specs.map(spec => spec.name), priorHumanApproval });
       } });
   });
   const appDeploy = require('../agent/app-deploy-plugin.js') as typeof import('../agent/app-deploy-plugin.js');
@@ -1252,7 +1271,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
   let activeTurnId: string | undefined;
   let activeRequestId: string | undefined;
   let requestSequence = 0;
-  const baseTools = opts.enableTools ? buildReplTools({ sessionId: session.id, getSignal: () => activeTurnSignal,
+  const baseTools = opts.enableTools ? buildReplTools({ nextTui: opts.nextTui === true, sessionId: session.id, getSignal: () => activeTurnSignal,
     getRequestId: () => activeRequestId,
     getTurnId: () => activeTurnId,
     onGraphProgress: (event) => {

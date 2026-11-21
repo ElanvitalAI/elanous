@@ -51,6 +51,69 @@ export function processIdentity(pid: number | undefined): ProcessIdentity | unde
 }
 
 type Seat = { pane: string; seat: string };
+
+/** Server-owned live pane generation; start must be captured when its PTY identity is bound. */
+export type ElsSeatBinding = { pane: string; seat: string; pid: number; start: string; generation: string };
+
+/** Pane ownership is not process identity. Until bindings carry independently verified
+ * actor identity, they must never grant a peer seat, even with stable OS ancestry. */
+export function resolveElsPeerSeat(
+  pid: number | undefined,
+  baseline: ProcessIdentity | undefined,
+  bindings: () => readonly ElsSeatBinding[],
+  deps: { identity: typeof processIdentity } = { identity: processIdentity },
+): Seat | undefined {
+  // The binding's seat is the creator/owner of the resource, not the actor
+  // running inside it. A process-generation check cannot bridge that trust gap.
+  void pid; void baseline; void bindings; void deps;
+  return undefined;
+}
+
+/** Bind an issued pane credential to the socket peer, never to a claimed PID or pane owner. */
+export function verifyPanePeer(
+  pid: number | undefined, baseline: ProcessIdentity | undefined, pane: string,
+  binding: () => { readonly pid: number; readonly start: string; readonly generation: string } | undefined,
+  shells: () => readonly { readonly pane: string; readonly pid: number }[],
+  identity: typeof processIdentity = processIdentity,
+): boolean {
+  try {
+    if (!pid || !baseline || baseline.pid !== pid) return false;
+    const target = binding();
+    if (!target || !target.start || !target.generation) return false;
+    const shellList = shells();
+    if (shellList.filter(s => s.pid === target.pid && s.pane === pane).length !== 1 ||
+        shellList.some(s => s.pid === target.pid && s.pane !== pane)) return false;
+    const chain: ProcessIdentity[] = [];
+    let current = pid;
+    while (current > 1 && chain.length < 128) {
+      if (chain.some(item => item.pid === current)) return false;
+      const item = identity(current);
+      if (!item || item.pid !== current || item.session !== baseline.session || item.tty !== baseline.tty ||
+          (chain.length === 0 && item.start !== baseline.start)) return false;
+      chain.push(item);
+      const nearest = shellList.filter(s => s.pid === current);
+      if (nearest.length) {
+        if (nearest.length !== 1 || nearest[0]!.pane !== pane || current !== target.pid || item.start !== target.start) return false;
+        const live = binding();
+        if (!live || live.pid !== target.pid || live.start !== target.start || live.generation !== target.generation) return false;
+        const currentShells = shells();
+        if (chain.some(old => {
+          const before = shellList.filter(s => s.pid === old.pid).map(s => s.pane).sort();
+          const after = currentShells.filter(s => s.pid === old.pid).map(s => s.pane).sort();
+          return before.length !== after.length || before.some((value, i) => value !== after[i]);
+        })) return false;
+        return chain.every(old => {
+          const now = identity(old.pid);
+          return !!now && now.start === old.start && now.ppid === old.ppid && now.session === old.session && now.tty === old.tty;
+        });
+      }
+      if (current === baseline.session || item.ppid <= 1) return false;
+      current = item.ppid;
+    }
+    return false;
+  } catch { return false; }
+}
+
 type ResolverDeps = { identity: typeof processIdentity; ledger: (path: string) => Promise<string>; paneInfo: (pane: string) => Promise<unknown> };
 const resolverDeps: ResolverDeps = {
   identity: processIdentity,
@@ -66,7 +129,7 @@ const resolverDeps: ResolverDeps = {
   },
 };
 /** Only the fixed installation is consulted, never PATH or client-provided environment. */
-export async function resolvePeerSeat(pid: number | undefined, baseline?: ProcessIdentity, ledger = join(homedir(), 'elanous-hq/seat-state/OP/tools/seat-panes.tsv'), deps: ResolverDeps = resolverDeps): Promise<Seat | undefined> {
+export async function resolvePeerSeatWithAnchor(pid: number | undefined, baseline?: ProcessIdentity, ledger = join(homedir(), 'elanous-hq/seat-state/OP/tools/seat-panes.tsv'), deps: ResolverDeps = resolverDeps): Promise<(Seat & { anchor: ProcessIdentity }) | undefined> {
   try {
     if (!baseline || baseline.pid !== pid) return;
     const ledgerText = await deps.ledger(ledger);
@@ -107,8 +170,48 @@ export async function resolvePeerSeat(pid: number | undefined, baseline?: Proces
       const now = deps.identity(old.pid);
       if (!now || now.start !== old.start || now.ppid !== old.ppid || now.session !== old.session || now.tty !== old.tty) return;
     }
-    return { pane: selected.pane, seat: selected.seat };
+    return { pane: selected.pane, seat: selected.seat, anchor: selected.shell };
   } catch { return; }
+}
+
+export async function resolvePeerSeat(pid: number | undefined, baseline?: ProcessIdentity, ledger?: string, deps?: ResolverDeps): Promise<Seat | undefined> {
+  const found = await resolvePeerSeatWithAnchor(pid, baseline, ledger, deps);
+  return found ? { pane: found.pane, seat: found.seat } : undefined;
+}
+
+export function inspectReadAncestry(
+  pid: number | undefined,
+  baseline: ProcessIdentity | undefined,
+  shellPids: readonly { pane: string; pid: number }[],
+  deps: { identity: (pid: number) => ProcessIdentity | undefined } = resolverDeps,
+): { kind: 'human' } | { kind: 'pane'; pane: string } | { kind: 'unknown' } {
+  try {
+    if (!pid || !baseline || baseline.pid !== pid) return { kind: 'unknown' };
+    const origin = deps.identity(pid);
+    if (!origin || origin.start !== baseline.start || origin.ppid !== baseline.ppid || origin.session !== baseline.session || origin.tty !== baseline.tty) return { kind: 'unknown' };
+    const shells = new Map(shellPids.map(entry => [entry.pid, entry.pane]));
+    const chain: ProcessIdentity[] = [];
+    let current = origin;
+    for (let steps = 0; steps < 128; steps++) {
+      chain.push(current);
+      const pane = shells.get(current.pid);
+      if (pane) return { kind: 'pane', pane };
+      if (current.pid === origin.session) {
+        // A changing or recycled process chain is not evidence of a human caller.
+        const stable = chain.every(old => {
+          const now = deps.identity(old.pid);
+          return !!now && now.pid === old.pid && now.start === old.start && now.ppid === old.ppid
+            && now.session === old.session && now.tty === old.tty;
+        });
+        return stable ? { kind: 'human' } : { kind: 'unknown' };
+      }
+      if (current.ppid <= 1 || current.ppid >= current.pid) return { kind: 'unknown' };
+      const parent = deps.identity(current.ppid);
+      if (!parent || parent.session !== origin.session || parent.tty !== origin.tty) return { kind: 'unknown' };
+      current = parent;
+    }
+  } catch { /* an unavailable identity is not evidence of a human */ }
+  return { kind: 'unknown' };
 }
 
 /** JUD #39096 must ⓒ (OP #106966·#107197): 무토큰 연결의 프로세스 조상에 els pane 셸이 있으면

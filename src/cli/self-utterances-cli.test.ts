@@ -34,7 +34,8 @@ test('self utterance CLI records explicit human and defaults unmarked Claude Cod
       expect(agent.utterances.map((row) => row.text).sort()).toEqual(['explicit agent', 'unmarked prompt']);
       // The domain query covers the agent filter/output; the real human CLI query below covers entry and persistence.
       expect(agent.utterances.map((row) => [row.text, row.origin, row.source]).sort()).toEqual([['explicit agent', 'agent', 'claude-code'], ['unmarked prompt', 'agent', 'claude-code']]);
-      const rows = db.query('SELECT text, surface, refs FROM events ORDER BY text').all() as Array<{ text: string; surface: string; refs: string }>;
+      expect((db.query("SELECT COUNT(*) AS n FROM events WHERE surface='ext:claude-code'").get() as { n: number }).n).toBe(0);
+      const rows = db.query('SELECT text, surface, refs FROM events UNION ALL SELECT text, surface, refs FROM signals ORDER BY text').all() as Array<{ text: string; surface: string; refs: string }>;
       expect(rows.map((row) => [row.text, row.surface, JSON.parse(row.refs)])).toEqual([
         ['codex human prompt', 'ext:codex', { origin: 'codex', utteranceOrigin: 'human' }],
         ['explicit agent', 'ext:claude-code', { origin: 'claude-code' }],

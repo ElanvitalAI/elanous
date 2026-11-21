@@ -67,4 +67,4 @@ export async function runTestInterferenceGate(io: TestInterferenceGateIo = {}): 
   return 0;
 }
 
-if (import.meta.main) process.exitCode = await runTestInterferenceGate();
+if (import.meta.main) void runTestInterferenceGate().then((code) => { process.exitCode = code; });

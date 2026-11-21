@@ -16,6 +16,7 @@ import { runCoreTurn, type ResearchRunHooks } from './run-core-turn.js';
 import { GROUNDING_PARTIAL, GROUNDING_UNAVAILABLE } from './grounding-first.js';
 import { RESEARCH_EARLY_ANSWER_REASONING_EFFORT, RESEARCH_TURN_FIRST_REPLY_BUDGET_MS } from './research-policy.js';
 import { CitationLedger, countVerifiedCitations } from './citation-guard.js';
+import { RESEARCH_SYNTHESIS_EVIDENCE_BUDGET_CHARS } from '../auto-research/synthesis-evidence-budget.js';
 
 beforeEach(() => {
   spyOn(surfaces, 'resolveSessionSurfaceProfile').mockReturnValue({
@@ -253,6 +254,187 @@ test('(c) the early answer never shows a URL the turn did not fetch, and stays w
   expect(result.finalText).not.toBe(GROUNDING_UNAVAILABLE);
 });
 
+test('a timed-out plan synthesizes completed social and web evidence instead of keeping the early answer', async () => {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const clock = manualTimers();
+  const firecrawlUrl = 'https://news.example/market-2027';
+  const grokUrl = 'https://x.com/market/post/27';
+  const redditUrl = 'https://www.reddit.com/r/stocks/comments/2027/market_outlook/';
+  const boundedEvidence = `Firecrawl market source ${firecrawlUrl}; Grok market source ${grokUrl}; Reddit investors expect volatility ${redditUrl}`;
+  const partial = {
+    ok: false, collecting: true, output: boundedEvidence + ' UNBOUNDED_EVIDENCE'.repeat(5_000),
+    synthesisOutput: boundedEvidence,
+    sourceUrls: [firecrawlUrl, grokUrl, redditUrl],
+    sourceUsage: { firecrawl: 1, grok: 2, market: 0 },
+    sourceAttribution: { [firecrawlUrl]: ['firecrawl' as const], [grokUrl]: ['grok' as const], [redditUrl]: ['grok' as const] },
+  };
+  const prompts: string[] = [];
+  let usage: unknown;
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages, handlers) => {
+    const prompt = messageText(messages);
+    prompts.push(prompt);
+    const answer = prompts.length === 1
+      ? `레딧 여론은 미확인입니다. ${firecrawlUrl}`
+      : `레딧 투자자들은 변동성을 예상합니다. ${redditUrl} 시장 근거: ${firecrawlUrl} ${grokUrl}`;
+    handlers.onText(answer, answer);
+    return answer;
+  });
+  const base = context(request, sink);
+  const pending = runCoreTurn({ ...base, callbacks: {
+    ...base.callbacks, onResearchSourceUsage: value => { usage = value; },
+  } }, { runResearch: research.runResearch, timers: clock.timers,
+    researchWallClockBudgetMs: 250, researchTurnBudgetMs: 1_000, synthesisReservationMs: 0 });
+  await until(() => research.hooks() !== undefined);
+  research.hooks()!.onPartialEvidence!(partial);
+  await until(() => prompts.length === 1 && sink.visible.some(value => value.includes('미확인')));
+  expect(clock.has(250)).toBe(true);
+  clock.fire(250);
+  research.resolve({ ok: false, output: `Firecrawl market source ${firecrawlUrl}`, sourceUrls: [firecrawlUrl],
+    error: 'research stopped by its deadline' });
+  const result = await pending;
+  expect(prompts.length).toBe(2);
+  expect(prompts[1]).toContain(redditUrl);
+  expect(prompts[1]).not.toContain('UNBOUNDED_EVIDENCE');
+  expect(result.finalText).toContain('레딧 투자자들은 변동성을 예상');
+  expect(result.finalText).toContain(redditUrl);
+  expect(sink.replaced.at(-1)).toBe(result.finalText);
+  expect(usage).toEqual(partial.sourceUsage);
+});
+
+test('deadline merges Reddit summary and Grok attribution even when final and partial URLs match', async () => {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const clock = manualTimers();
+  const redditUrl = 'https://www.reddit.com/r/stocks/comments/same/url/';
+  const summary = 'Grok search-level synthesis: investors split on AI risk.';
+  const excerpt = 'Original Reddit post excerpt: earnings uncertainty is the top comment.';
+  const prompts: string[] = [];
+  let usage: unknown;
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages, handlers) => {
+    const prompt = messageText(messages); prompts.push(prompt);
+    const answer = prompts.length === 1 ? '레딧 미확인' : `검색 요약에 따르면 의견이 갈린다. ${redditUrl}`;
+    handlers.onText(answer, answer); return answer;
+  });
+  const base = context('2027 증시 레딧 여론은?', sink);
+  const pending = runCoreTurn({ ...base, callbacks: { ...base.callbacks,
+    onResearchSourceUsage: value => { usage = value; } } }, { runResearch: research.runResearch, timers: clock.timers,
+    researchWallClockBudgetMs: 250, researchTurnBudgetMs: 1_000, synthesisReservationMs: 0 });
+  await until(() => research.hooks() !== undefined);
+  research.hooks()!.onPartialEvidence!({ ok: false, output: `Reddit hit ${redditUrl}`, sourceUrls: [redditUrl],
+    sourceAttribution: { [redditUrl]: ['grok'] }, sourceUsage: { firecrawl: 0, grok: 1, market: 0 },
+    redditSnippets: [{ url: redditUrl, snippet: summary, kind: 'provider-synthesis', sourceKind: 'search-summary:grok' }] });
+  await until(() => prompts.length === 1);
+  clock.fire(250);
+  research.resolve({ ok: false, output: `Reddit hit ${redditUrl}`, sourceUrls: [redditUrl],
+    sourceAttribution: { [redditUrl]: ['firecrawl'] }, sourceUsage: { firecrawl: 1, grok: 0, market: 0 },
+    redditSnippets: [{ url: redditUrl, snippet: excerpt, kind: 'source-excerpt', sourceKind: 'web-search:firecrawl' }],
+    error: 'research stopped by its deadline' } as ResearchGroundingResult);
+  const result = await pending;
+  expect(prompts[1]).toContain(summary);
+  expect(prompts[1]).toContain(excerpt);
+  expect(prompts[1]).toContain('"kind":"provider-synthesis"');
+  expect(prompts[1]).toContain('"kind":"source-excerpt"');
+  expect(prompts[1]).toContain('"sourceKind":"web-search:firecrawl"');
+  expect(prompts[1]).not.toContain('1 verified sources');
+  expect(result.finalText).toContain(redditUrl);
+  expect(usage).toEqual({ firecrawl: 1, grok: 1, market: 0 });
+});
+
+test('deadline merges distinct excerpts at the same URL even with identical attribution', async () => {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const clock = manualTimers();
+  const prompts: string[] = [];
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages, handlers) => {
+    prompts.push(messageText(messages));
+    const answer = `Source ${partialUrl}`; handlers.onText(answer, answer); return answer;
+  });
+  const pending = runCoreTurn(context(request, sink), { runResearch: research.runResearch, timers: clock.timers,
+    researchWallClockBudgetMs: 250, researchTurnBudgetMs: 1_000, synthesisReservationMs: 0 });
+  await until(() => research.hooks() !== undefined);
+  research.hooks()!.onPartialEvidence!({ ok: false, output: `Partial excerpt says AI risk ${partialUrl}`,
+    sourceUrls: [partialUrl], sourceAttribution: { [partialUrl]: ['grok'] } });
+  await until(() => prompts.length === 1);
+  clock.fire(250);
+  research.resolve({ ok: false, output: `Final excerpt says earnings growth ${partialUrl}`,
+    sourceUrls: [partialUrl], sourceAttribution: { [partialUrl]: ['grok'] },
+    error: 'research stopped by its deadline' } as ResearchGroundingResult);
+  await pending;
+  expect(prompts[1]).toContain('Partial excerpt says AI risk');
+  expect(prompts[1]).toContain('Final excerpt says earnings growth');
+});
+
+test('an X-only sentiment request does not receive Reddit instructions', async () => {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const clock = manualTimers();
+  const xUrl = 'https://x.com/example/status/27';
+  const prompts: string[] = [];
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages, handlers) => {
+    prompts.push(messageText(messages));
+    const answer = `X sample ${xUrl}`; handlers.onText(answer, answer); return answer;
+  });
+  const pending = runCoreTurn(context('2027년 미국 증시에 대한 X 여론은?', sink), { runResearch: research.runResearch,
+    timers: clock.timers, researchWallClockBudgetMs: 250, researchTurnBudgetMs: 1_000, synthesisReservationMs: 0 });
+  await until(() => research.hooks() !== undefined);
+  research.hooks()!.onPartialEvidence!({ ok: false, output: `X discussion ${xUrl}`, sourceUrls: [xUrl] });
+  await until(() => prompts.length === 1);
+  clock.fire(250);
+  research.resolve({ ok: false, output: '', error: 'research stopped by its deadline' });
+  await pending;
+  expect(prompts[1]).not.toContain('Reddit sample summary');
+  expect(prompts[1]).toContain('X sample summary');
+});
+
+test('deadline merger bounds the whole synthesis evidence with long source URLs and raw output', async () => {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const clock = manualTimers();
+  const extraUrls = Array.from({ length: 100 }, (_, index) => `https://publisher.example/${index}/${'long-segment'.repeat(35)}`);
+  const prompts: string[] = [];
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages, handlers) => {
+    const prompt = messageText(messages); prompts.push(prompt);
+    const answer = `Observed ${partialUrl}`; handlers.onText(answer, answer); return answer;
+  });
+  const pending = runCoreTurn(context(request, sink), { runResearch: research.runResearch, timers: clock.timers,
+    researchWallClockBudgetMs: 250, researchTurnBudgetMs: 1_000, synthesisReservationMs: 0 });
+  await until(() => research.hooks() !== undefined);
+  research.hooks()!.onPartialEvidence!({ ok: false, output: `Partial ${partialUrl} ${'x'.repeat(100_000)}`,
+    sourceUrls: [partialUrl] });
+  await until(() => prompts.length === 1);
+  clock.fire(250);
+  research.resolve({ ok: false, output: 'Final ' + 'y'.repeat(100_000),
+    sourceUrls: extraUrls, error: 'research stopped by its deadline' });
+  await pending;
+  const evidence = prompts[1]!.split('<bloom-research>\n')[1]!.split('\n</bloom-research>')[0]!;
+  expect(evidence.length).toBeLessThanOrEqual(RESEARCH_SYNTHESIS_EVIDENCE_BUDGET_CHARS);
+  expect(evidence).toContain(partialUrl);
+});
+
+test('a hung research promise uses its partial snapshot once and retains its bounded tail', async () => {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const clock = manualTimers();
+  const prompts: string[] = [];
+  spyOn(llm, 'streamLLMWithTools').mockImplementation(async (messages, handlers) => {
+    prompts.push(messageText(messages));
+    const answer = `Observed ${partialUrl}`; handlers.onText(answer, answer); return answer;
+  });
+  const pending = runCoreTurn(context(request, sink), { runResearch: research.runResearch, timers: clock.timers,
+    researchWallClockBudgetMs: 250, researchTurnBudgetMs: 1_000, synthesisReservationMs: 0 });
+  await until(() => research.hooks() !== undefined);
+  const bounded = `HEAD ${partialUrl} ` + 'x'.repeat(19_000) + ' BOUNDED_TAIL_MARKER';
+  research.hooks()!.onPartialEvidence!({ ok: false, output: bounded, synthesisOutput: bounded, sourceUrls: [partialUrl] });
+  await until(() => prompts.length === 1);
+  clock.fire(250);
+  await until(() => clock.has(50));
+  clock.fire(50);
+  await pending;
+  expect(prompts[1]).toContain('BOUNDED_TAIL_MARKER');
+  expect(prompts[1]!.match(/BOUNDED_TAIL_MARKER/g)).toHaveLength(1);
+});
+
 /** A slow provider (GLM 11-17 shape): the early-answer stream shows a first delta, then waits until its own signal aborts. */
 function slowEarlyAnswerModel(prompts: string[], earlySignals: AbortSignal[]) {
   let releaseEarly: (() => void) | undefined;
@@ -300,6 +482,31 @@ test('(e) research that settles with citable evidence preempts a still-streaming
   expect(result.stopReason).not.toBe('aborted');
   expect(result.finalText).not.toBe(GROUNDING_UNAVAILABLE);
   expect(result.finalText).toContain(fullUrl);
+  expect(sink.replaced.at(-1)).toBe(result.finalText);
+});
+
+test('deadline partial evidence preempts a slow early answer before the synthesis reserve is consumed', async () => {
+  const sink = { visible: [] as string[], replaced: [] as string[], status: [] as string[] };
+  const research = heldResearch();
+  const clock = manualTimers();
+  const prompts: string[] = [];
+  const earlySignals: AbortSignal[] = [];
+  const model = slowEarlyAnswerModel(prompts, earlySignals);
+  const pending = runCoreTurn(context(request, sink), { runResearch: research.runResearch,
+    timers: clock.timers, researchWallClockBudgetMs: 250, researchTurnBudgetMs: 1_000, synthesisReservationMs: 0 });
+  await until(() => research.hooks() !== undefined);
+  research.hooks()!.onPartialEvidence!(partialEvidence);
+  await until(() => earlySignals.length === 1);
+  expect(clock.has(250)).toBe(true);
+  clock.fire(250);
+  research.resolve({ ok: false, output: '', error: 'research stopped by its deadline' });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const preempted = earlySignals[0]!.aborted;
+  if (!preempted) model.releaseEarly();
+  const result = await pending;
+  expect(preempted).toBe(true);
+  expect(prompts.length).toBe(2);
+  expect(result.finalText).toContain(partialUrl);
   expect(sink.replaced.at(-1)).toBe(result.finalText);
 });
 

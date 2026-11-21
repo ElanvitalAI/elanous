@@ -66,6 +66,12 @@ export function CredentialVaultView({ load, startOpenRouter, listOpenRouterImpor
     {oauthResult === 'connected' && view.state === 'error' && <p role="alert">OpenRouter 연결 응답은 받았지만 Nexus 슬롯 상태를 읽지 못했습니다.</p>}
     {oauthResult === 'failed' && <p role="alert">OpenRouter 연결을 완료하지 못했습니다. 다시 시도해 주세요.</p>}
     {importResult === 'saved' && <p role="status">감지한 OpenRouter 키를 Nexus가 검증해 저장했습니다.</p>}
+    <section className="rounded-xl border p-4" aria-label="TimelyRouter 연결 안내">
+      <h2 className="font-semibold">TimelyRouter 연결 미리보기</h2>
+      <p className="mt-2 text-sm">발급받은 API 주소, 키, 모델 ID를 같은 공급자 설정에 넣으면 OpenAI 호환 호출을 사용할 수 있습니다. 모델 목록은 해당 주소의 /models 응답으로 확인하세요.</p>
+      <p className="mt-2 text-sm">가격은 공급자 원장에서 확인한 모델별 입력·출력 단가를 별도로 등록해야 절감 영수에 반영됩니다. 확인되지 않은 가격은 금액으로 표시하지 않습니다.</p>
+      <p className="mt-2 text-xs text-muted-foreground">현재 웹 자격 등록은 타임리 공급자 주소 검증이 준비될 때까지 열리지 않습니다. 연결 상태를 완료로 표시하지 않습니다.</p>
+    </section>
     {view.state === 'ready' && <ul className="divide-y rounded-xl border" aria-label="자격 슬롯 목록">
       {view.rows.map((row) => <li key={row.id} className="flex flex-wrap items-center justify-between gap-3 p-4">
         <div><div className="font-medium">{row.label}</div><div className="text-xs text-muted-foreground">{row.id}</div></div>

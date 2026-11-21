@@ -44,7 +44,7 @@ async function readHookStdinWithLimit(readStdin: () => Promise<string>, limitMs:
 }
 import type { AgentReplyAddress, AgentReplyInput, AgentReplyResult } from '../loops/agent-reply.js';
 import { noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
-import { messageReplyBodyFor, registerSeatPaneAddress, registrySnapshot, resolveSeatStateRoot, resolveWake, seatDeliveryView, isLiveWakeUniverse, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
+import { isLocalWakeHost, messageReplyBodyFor, registerSeatPaneAddress, registrySnapshot, resolveElsSeat, resolveHerdrSeatLiveness, resolveRemoteSeatLiveness, resolveSeatStateRoot, resolveWake, seatDeliveryView, seatRouteHint, isLiveWakeUniverse, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
 import { classifySeatInbox, seatInboxAlivePath } from '../loops/inbox-liveness.js';
 import { getUserConfig } from '../user-config/reader.js';
 import type { RoleLlmSpec } from '../user-config/types.js';
@@ -487,6 +487,16 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .requiredOption('--msg <id>').requiredOption('--to <seat>').requiredOption('--from <seat>')
     .option('--wait-ms <ms>', 'wait before checking', String(MAIL_FALLBACK_MS))
     .action((opts: { msg: string; to: string; from: string; waitMs: string }) => run(async () => {
+      // #122460 ③ — attach the logs.db sink before the wait: this CLI lives for the one knock, so its msg.fallback /
+      // msg.wake evidence lines must reach `elanous logs` — a short CLI otherwise leaves only the file trail (CX-16
+      // postland: the fallback claimed at 11:15:15 but the retry wake's line was never observed in eln logs).
+      try {
+        let sinkTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          (deps.registerLogSink ?? (async () => (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('cli')))(),
+          new Promise<void>(resolve => { sinkTimer = setTimeout(resolve, 1000); }),
+        ]).finally(() => clearTimeout(sinkTimer));
+      } catch { /* observability is fail-open */ }
       const result = await runMailFallback({ messageId: integer(opts.msg, '--msg', 0, 1, Number.MAX_SAFE_INTEGER), recipient: canonicalSeatId(opts.to), from: canonicalSeatId(opts.from) }, {
         openStore: open, waitMs: integer(opts.waitMs, '--wait-ms', MAIL_FALLBACK_MS, 0, 3_600_000),
         ...(deps.fallbackSleep ? { sleep: deps.fallbackSleep } : {}),
@@ -647,18 +657,29 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
   msg.command('route <address>').description('Show how a post to this address is read (replyBody) and woken (wake)')
     .option('--json')
-    .action((address: string, opts: CommonOptions) => run(() => {
+    .action((address: string, opts: CommonOptions) => run(async () => {
       const to = canonicalMessageAddress(address);
       const snapshot = registrySnapshot(deps.wakeDeps ?? {});
       const shared = { ...deps.wakeDeps, registrySnapshot: snapshot };
-      const wake = resolveWake(to, shared);
+      const els = await resolveElsSeat(to, shared, seatRouteHint(to, shared));
+      const wake = els.wake ?? resolveWake(to, shared);
       const delivery = seatDeliveryView(to, shared, snapshot);
       const seatName = to.replace(/^SEAT:/, '');
       const SEAT_ID_LIKE = /^[A-Z][A-Z0-9_-]{0,63}$/;
-      const liveness = SEAT_ID_LIKE.test(seatName)
+      const legacyLiveness = SEAT_ID_LIKE.test(seatName)
         ? classifySeatInbox(seatInboxAlivePath(resolveSeatStateRoot(deps.wakeDeps ?? {}), seatName), { host: wake.host || 'unknown' }, Date.now())
         : undefined;
-      const row = { msgAddress: to, replyBody: messageReplyBodyFor(to, shared), ...wake, ...delivery, ...(liveness ? { liveness: liveness.state, livenessAgeMs: 'ageMs' in liveness && Number.isFinite(liveness.ageMs) ? Math.round(liveness.ageMs) : undefined } : {}) };
+      const remoteLiveness = els.liveness?.state === 'live' ? undefined : await resolveRemoteSeatLiveness(to, wake.host, shared);
+      const herdrLiveness = els.liveness?.state === 'live' || remoteLiveness || !isLocalWakeHost(wake.host, shared)
+        ? undefined : await resolveHerdrSeatLiveness(to, shared);
+      const primaryLiveness = els.liveness?.state === 'live' ? els.liveness : remoteLiveness ?? (herdrLiveness?.state === 'live' ? herdrLiveness : els.liveness ?? herdrLiveness);
+      const liveness = primaryLiveness?.state === 'unknown' && (legacyLiveness?.state === 'live' || legacyLiveness?.state === 'stale')
+        ? legacyLiveness : primaryLiveness ?? legacyLiveness;
+      const row = { msgAddress: to, replyBody: messageReplyBodyFor(to, shared), ...wake, ...delivery, ...(liveness ? {
+        liveness: liveness.state,
+        livenessAgeMs: 'ageMs' in liveness && Number.isFinite(liveness.ageMs) ? Math.round(liveness.ageMs) : undefined,
+        ...('reason' in liveness ? { livenessReason: liveness.reason } : {}),
+      } : {}) };
       emit(row, opts.json, () => out.log(`${to}\treplyBody=${row.replyBody ?? '모름'}\twake=${wake.wake}`
         + `${wake.host ? `\thost=${wake.host}` : ''}${wake.target ? `\ttarget=${wake.target}` : ''}${wake.optIn === undefined ? '' : `\toptIn=${wake.optIn ? 'yes' : 'no(주입 0)'}`}`
         + `${delivery.runtime ? `\truntime=${delivery.runtime}` : ''}${delivery.delivery ? `\tdelivery=${delivery.delivery}` : ''}${delivery.session ? `\tsession=${delivery.session}` : ''}`
@@ -670,17 +691,18 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .command('register <seat>').description('Register a seat in the central seat address registry')
     .option('--herdr-pane <pane>', 'Herdr pane ID, for example wJ:p10')
     .option('--els-pane <pane>', 'ELS address els:workspace/tab/pane')
+    .option('--tmux-session <session>', 'remote tmux session seat-<SEAT>')
     .requiredOption('--host <host>', 'local or remote SSH alias')
     .option('--wake', 'allow this registered seat to receive message wake prompts')
     .option('--replace', 'replace an existing pane address')
     .option('--runtime <body>', 'agent body in the pane: eln | claude-code | codex (eln ⊕ autowake = no typing, 60s fallback only)')
     .option('--json')
-    .action((rawSeat: string, opts: { herdrPane?: string; elsPane?: string; host: string; wake?: boolean; replace?: boolean; runtime?: string; json?: boolean }) => run(() => {
-      if (!!opts.herdrPane === !!opts.elsPane) throw new Error('choose exactly one of --herdr-pane or --els-pane');
+    .action((rawSeat: string, opts: { herdrPane?: string; elsPane?: string; tmuxSession?: string; host: string; wake?: boolean; replace?: boolean; runtime?: string; json?: boolean }) => run(() => {
+      if ([opts.herdrPane, opts.elsPane, opts.tmuxSession].filter(Boolean).length !== 1) throw new Error('choose exactly one of --herdr-pane, --els-pane or --tmux-session');
       if (opts.runtime !== undefined && !SEAT_AGENT_RUNTIMES.includes(opts.runtime as SeatAgentRuntime)) throw new Error('--runtime must be eln, claude-code or codex');
       const result = registerSeatPaneAddress({
-        address: canonicalSeatId(rawSeat), paneId: (opts.elsPane ?? opts.herdrPane)!, host: opts.host,
-        ...(opts.elsPane ? { kind: 'els' as const } : {}),
+        address: canonicalSeatId(rawSeat), paneId: (opts.elsPane ?? opts.herdrPane ?? opts.tmuxSession)!, host: opts.host,
+        ...(opts.elsPane ? { kind: 'els' as const } : opts.tmuxSession ? { kind: 'tmux' as const } : {}),
         ...(opts.wake ? { enableWake: true } : {}), ...(opts.replace ? { replace: true } : {}),
         ...(opts.runtime === undefined ? {} : { runtime: opts.runtime as SeatAgentRuntime }),
       }, deps.wakeDeps);

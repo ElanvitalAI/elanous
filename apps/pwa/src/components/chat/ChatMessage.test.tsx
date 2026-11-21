@@ -26,6 +26,13 @@ function makeMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe('ChatMessageView — blocks renderer (Phase B-2)', () => {
+  it('shows source counts after the normal answer and before message metadata', () => {
+    const html = renderToStaticMarkup(<ChatMessageView message={makeMessage({
+      text: '답변입니다.', sourceUsage: { firecrawl: 1, grok: 0, market: 1 },
+    })} />);
+    expect(html.indexOf('답변입니다.')).toBeLessThan(html.indexOf('data-elanous-sources-used'));
+    expect(html).toContain('쓴 출처: firecrawl 1 · grok(X·레딧) 0 · 시세 1');
+  });
   it('renders a markdown paragraph from `text` when blocks are absent (legacy path)', () => {
     const html = renderToStaticMarkup(
       <ChatMessageView message={makeMessage({ text: 'hello world' })} />,

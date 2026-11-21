@@ -102,10 +102,22 @@ export function applyIsolatedRoot(dir: string): void {
       }
       cfgDir.setElanousConfigDir(dir, 'flag');
     }
+    // Sim worlds are closed test universes. Their fake providers must never
+    // receive the operating auth/secrets that ordinary --test can copy.
+    // This check precedes sync, including when an old test root is reused.
+    const argv = process.argv.slice(2);
+    const simWorldRun = argv.some((arg, i) => arg === 'sim' && argv[i + 1] === 'world' && argv[i + 2] === 'run');
+    if (simWorldRun) {
+      const { existsSync } = require('node:fs') as typeof import('node:fs');
+      const { join } = require('node:path') as typeof import('node:path');
+      for (const file of ['auth.json', 'secrets.json', '.env', '.env.local', 'credentials.json']) {
+        if (existsSync(join(dir, file))) throw new Error(`sim world credential file in test root: ${file}`);
+      }
+    }
     // config 사본이 없고 운영 원본이 있으면 물질화하고, 있으면 drift 경고만
     // (자동 덮어쓰기 금지 — 명시적 sync 원칙). 유닛 테스트(NODE_ENV=test)는
     // 실 운영 config/secrets 를 temp 로 복사하지 않도록 sync 스킵.
-    if (process.env.NODE_ENV !== 'test') {
+    if (process.env.NODE_ENV !== 'test' && !simWorldRun) {
       const sync = require('./config-test-sync.js') as typeof import('./config-test-sync.js');
       const { existsSync } = require('node:fs') as typeof import('node:fs');
       const { join } = require('node:path') as typeof import('node:path');

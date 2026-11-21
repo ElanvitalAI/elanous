@@ -16,7 +16,7 @@
 // the legacy dashboard.
 
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { hostname } from 'node:os';
 import { request as httpRequest } from 'node:http';
 import { isIP } from 'node:net';
@@ -75,7 +75,8 @@ import { buildPatcherSubstrate, stopPatcherSubstrate, type PatcherSubstrate } fr
 import { resolvePatcherLlmCallables } from '../background-reasoning/patcher-llm-resolver.js';
 import { buildDevicesSubstrate, stopDevicesSubstrate, type DevicesSubstrate } from '../mission-templates/devices-boot.js';
 import { migrateLegacyEnvToConfig } from './config/env-migrate.js';
-import { getSecretAsync, selectBackendFromConfig, setSecretAsync } from './config/secrets/index.js';
+import { getSecretAsync, selectBackendFromConfig } from './config/secrets/index.js';
+import { getOrCreateAppAuthSigningKey } from './apps/app-auth-signing-key.js';
 import { appSecretId } from './config/secrets/app-secret-ledger.js';
 import { registerAllCloudBackends } from './config/secrets/register-cloud.js';
 import { SERVICE_KEY_CATALOG } from '../setup/service-key-catalog.js';
@@ -2380,12 +2381,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     }
     const appPublicUserSlug = resolvePublicAppUserId();
     try {
-      const keyId = 'nexus.app-auth-signing-key';
-      let key = await getSecretAsync(keyId);
-      if (!key) {
-        key = randomBytes(32).toString('base64url');
-        await setSecretAsync(keyId, key);
-      }
+      const key = await getOrCreateAppAuthSigningKey();
       appAuthSigningKey = key;
       let backupKey: Buffer | undefined;
       const historicalBackupKeys = new Map<string, Buffer>();

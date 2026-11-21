@@ -1,0 +1,21 @@
+# ── 기억 그래프 조리법 (memory · 2026-11-21) ──────────────────────────────────────
+# 칸: MEM-LESSON-TO-KNOWHOW-PROMOTION (ROSTER-0332 · TC-H-POOL-4 · P1 기억).
+# 신호 POST-TURN-LESSON-REVIEW — 턴 끝 교훈 회고에서 같은 꼴 실패 3회짜리 교훈을
+# 노하우 팩 조항으로 승화한다(조항 id 결정 원장 · 중복 0 · 재실행 멱등).
+phase-guard:
+  command: bun scripts/memory-lifecycle-graph-node.ts phase-guard
+run:
+  command: bun scripts/memory-lifecycle-cycle.ts
+  timeout_ms: 3600000
+verify-effect:
+  command: bun scripts/memory-lifecycle-graph-node.ts verify-effect
+record:
+  command: bun scripts/memory-lifecycle-graph-node.ts record
+post-turn-lesson-review:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/knowhow/promotion-sweep.ts"'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/knowhow/promotion-sweep.ts" --dry-run'
+  timeout_ms: 60000
+promote:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/knowhow/promotion-sweep.ts"'
+  dry_run_command: 'bun "$ELANOUS_GRAPH_DIR/../../src/knowhow/promotion-sweep.ts" --dry-run'
+  timeout_ms: 60000

@@ -5,6 +5,7 @@ import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, signedT6PwaKnownIssue, type CommandRunner, type GraphContext } from './node-verdict.js';
 import { isReleaseVersion } from './release-version.js';
+import { parseInstalledVersionLine } from '../../src/version/installed-version-line.js';
 import { isNexusFirstRunPass } from './nexus-first-run.js';
 import { releaseCutRecord } from './release-cut-record.js';
 
@@ -14,9 +15,9 @@ interface PreparedManifest {
 }
 function preparedNexusPassed(manifest: PreparedManifest, version: string): boolean {
   const receipt = manifest.e2e?.nexusFirstRun;
-  return manifest.e2e?.ran === true && manifest.e2e.ok === true
-    && typeof manifest.publicCommit === 'string' && /^[a-f0-9]{40}$/i.test(manifest.publicCommit)
-    && isNexusFirstRunPass(receipt) && receipt.versionLine === `${version} ${manifest.publicCommit}`;
+  if (manifest.e2e?.ran !== true || manifest.e2e.ok !== true || !isNexusFirstRunPass(receipt)) return false;
+  const installed = parseInstalledVersionLine(receipt.versionLine);
+  return installed?.version === version && installed.commit === manifest.publicCommit;
 }
 
 /** Apparent bytes of the preserved archive; never follow a symlink out of its private directory. */

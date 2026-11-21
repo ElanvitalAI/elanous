@@ -27,6 +27,7 @@ describe("bare webchat document marker", () => {
     expect(res?.status).toBe(200);
     const html = await res!.text();
     expect(html).toContain(`<head lang="ko">${BARE_WEBCHAT_META_TAG}${bareCapabilitiesMetaTag()}<title>`);
+    expect(html).toContain('<meta name="elanous-bare-capabilities" content="/v1/prompt/stream,/v1/chat/events,/v1/sessions/store/:id">');
   });
 
   test("non-HTML and error responses pass through untouched", async () => {

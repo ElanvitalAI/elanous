@@ -4,7 +4,7 @@
 // trees. This command only assembles the shared report.
 
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { lookup } from 'node:dns/promises';
 import { homedir, hostname, networkInterfaces } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +24,7 @@ import { formatTierShareReport, summarizeTierShares, type TierShareInput } from 
 import { defaultSshRunner, type SshRunner } from '../task-agent/parent-host.js';
 import { shellQuote } from '../task-agent/task-hand.js';
 import { listSshHosts } from '../ssh/ssh-hosts.js';
+import { formatMeasuredApiSpend, measuredApiSpend } from '../budget/measured-api-spend.js';
 
 export interface UsageCliDeps {
   readonly collect?: typeof collectUnifiedUsage;
@@ -70,6 +71,27 @@ function readRunLogs(query: LogQuery): LogStoreRow[] {
   } finally {
     store.close();
   }
+}
+
+function readMeasuredApiLogs(sinceMs: number): { rows: LogStoreRow[]; truncated: boolean } {
+  const path = logsDbPath();
+  try { statSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { rows: [], truncated: false };
+    throw error;
+  }
+  const store = LogStore.openReadOnly(path);
+  try {
+    const rows: LogStoreRow[] = [];
+    let beforeId: number | undefined;
+    for (let page = 0; page < 10; page++) {
+      const batch = store.query({ exactCategories: ['llm.usage'], events: ['llm-usage'], sinceMs, beforeId, limit: 1000 });
+      rows.push(...batch);
+      if (batch.length < 1000) return { rows, truncated: false };
+      beforeId = batch.at(-1)!.id;
+    }
+    return { rows, truncated: true };
+  } finally { store.close(); }
 }
 
 type UsageHostRoster = { local: string; remote: string[]; duplicateCandidates?: string[]; configuredLocalVerified?: boolean };
@@ -188,6 +210,8 @@ type AxisUsageRow = {
   apiEquivalentUsd: number;
   /** 비용 순위 = usdKnown + apiEquivalentUsd — 구독 호출의 목록가 «그림자 비용»까지 더한 값. */
   rankUsd: number;
+  /** 공급자 usage 부재로 어림한 호출 수 — 없으면 칸 없음. */
+  estimatedCalls?: number;
 };
 
 type FederatedUsageRow = {
@@ -195,7 +219,7 @@ type FederatedUsageRow = {
   billingProvider?: string; billing?: string; hostIds: string[]; rankUsd?: number;
   calls: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number;
   cacheCreationInputTokens: number; reasoningOutputTokens: number; usdKnown: number;
-  unknownCostCalls: number; includedCalls: number; apiEquivalentUsd: number;
+  unknownCostCalls: number; includedCalls: number; apiEquivalentUsd: number; estimatedCalls?: number;
 };
 type HostMeasurement = { host: string; status: 'ok' | 'unmeasured'; reason?: string };
 const SUM_FIELDS = ['calls', 'inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reasoningOutputTokens', 'usdKnown', 'unknownCostCalls', 'includedCalls', 'apiEquivalentUsd'] as const;
@@ -230,6 +254,7 @@ function mergeUsageRows(groups: readonly FederatedUsageRow[][], axis: 'run' | 'r
     const previous = merged.get(key);
     if (!previous) { merged.set(key, { ...row, hostIds: [...row.hostIds] }); continue; }
     for (const field of SUM_FIELDS) previous[field] += row[field];
+    if (row.estimatedCalls !== undefined) previous.estimatedCalls = (previous.estimatedCalls ?? 0) + row.estimatedCalls;
     previous.hostIds = [...new Set([...previous.hostIds, ...row.hostIds])];
     if (axis === 'stage' || axis === 'phase' || axis === 'model' || axis === 'account' || axis === 'job') previous.rankUsd = previous.usdKnown + previous.apiEquivalentUsd;
   }
@@ -359,6 +384,8 @@ function rollupByAxis(inputs: readonly ExtendedRunUsageInput[], axis: UsageAxis)
       apiEquivalentUsd,
       rankUsd: usdKnown + apiEquivalentUsd,
     };
+    const estimatedCalls = rows.reduce((sum, row) => sum + (row.estimatedCalls ?? 0), 0);
+    if (estimatedCalls > 0) result.estimatedCalls = estimatedCalls;
     return result;
   }).sort((a, b) => (b.rankUsd - a.rankUsd) || (b.calls - a.calls));
 }
@@ -367,9 +394,14 @@ function isUsageAxis(value: string): value is 'run' | 'role' | UsageAxis {
   return value === 'run' || value === 'role' || value === 'stage' || value === 'phase' || value === 'model' || value === 'account' || value === 'job';
 }
 
+/** 추정 호출이 «있을 때만» 붙는 꼬리 — 없으면 종전 출력과 바이트 동일. */
+function estimateNote(estimatedCalls: number | undefined): string {
+  return estimatedCalls ? `  추정=${estimatedCalls}호출(공급자 usage 없음·글자수 어림)` : '';
+}
+
 function formatAxisUsage(row: AxisUsageRow, axis: UsageAxis): string {
   const value = row[axis] ?? '(none)';
-  return `${axis}=${value}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}  rankUsd=${row.rankUsd}`;
+  return `${axis}=${value}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}  rankUsd=${row.rankUsd}${estimateNote(row.estimatedCalls)}`;
 }
 
 function defaultCreditPlan(): CodexCreditPlan | null {
@@ -387,12 +419,18 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
     .action(async (opts: { json?: boolean }) => {
       const report = await collect();
       const creditPlan = (deps.creditPlan ?? defaultCreditPlan)();
+      const nowMs = Date.now();
+      const recent = deps.readRunLogs
+        ? { rows: deps.readRunLogs({ exactCategories: ['llm.usage'], events: ['llm-usage'], sinceMs: nowMs - 60 * 60_000 }), truncated: false }
+        : readMeasuredApiLogs(nowMs - 60 * 60_000);
+      const spend = measuredApiSpend(recent.rows, nowMs, recent.truncated);
       if (opts.json) {
-        out.log(JSON.stringify({ ...report, codexCreditPlan: creditPlan }, null, 2));
+        out.log(JSON.stringify({ ...report, codexCreditPlan: creditPlan, measuredApiSpend: spend }, null, 2));
         return;
       }
       out.log(formatUnifiedUsage(report));
       if (creditPlan) out.log(['', 'codex 크레딧', ...formatCodexCreditPlan(creditPlan).map((l) => `  ${l}`)].join('\n'));
+      out.log(formatMeasuredApiSpend(spend));
     });
 
   usage
@@ -455,8 +493,8 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         if (rows.length === 0) { out.log('(일치하는 런 사용량 없음)'); return; }
         for (const row of rows) {
           if (opts.by === 'stage' || opts.by === 'phase' || opts.by === 'model' || opts.by === 'account' || opts.by === 'job') out.log(formatAxisUsage(row as AxisUsageRow, opts.by));
-          else if (opts.by === 'role') out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
-          else out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+          else if (opts.by === 'role') out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}${estimateNote(row.estimatedCalls)}`);
+          else out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}${estimateNote(row.estimatedCalls)}`);
         }
       };
       let rows: LogStoreRow[] = [];
@@ -504,9 +542,9 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
       if (tierShare) for (const line of formatTierShareReport(tierShare)) out.log(line);
       for (const row of report) {
         if (opts.by === 'role') {
-          out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+          out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}${estimateNote(row.estimatedCalls)}`);
         } else {
-          out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+          out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}${estimateNote(row.estimatedCalls)}`);
         }
       }
     });

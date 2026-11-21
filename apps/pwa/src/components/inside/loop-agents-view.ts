@@ -1,5 +1,5 @@
-import type { OpsSeats } from '@/lib/ops-api';
-import type { HarnessRunsResponse } from '@/nexus/client';
+import type { OpsSeats } from '../../lib/ops-api';
+import type { HarnessRunsResponse } from '../../nexus/client';
 import { toPublicText } from './public-text';
 
 export type LoopSeat = 'COO' | 'CMO' | 'CTO' | 'CXO';

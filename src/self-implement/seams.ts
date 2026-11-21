@@ -3023,6 +3023,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             contextOmittedItems: rr.contextBudget.omittedItems,
           } : {}),
           ...(o.reviewerCanSelfRead !== undefined ? { canSelfRead: o.reviewerCanSelfRead } : {}),
+          ...(reviewer ? { reviewer: { provider: reviewer.provider, model: reviewer.model } } : {}),
         };
       },
       // ★ 진단 합성 seam(#1·2026-07-22 대표 PLAN) — 재투입 전 raw 실패/리뷰 지적을 "왜 실패했나(근본)+어떻게

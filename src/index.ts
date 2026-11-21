@@ -320,6 +320,9 @@ const registerHooksCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
 const registerMemberConnectCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'member'
   ? (() => undefined)
   : (require('./cli/member-connect-cli.js') as typeof import('./cli/member-connect-cli.js')).registerMemberConnectCommands) as typeof import('./cli/member-connect-cli.js').registerMemberConnectCommands;
+const registerMemberFilePublishCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'member'
+  ? (() => undefined)
+  : (require('./cli/member-file-quick-publish.js') as typeof import('./cli/member-file-quick-publish.js')).registerMemberFilePublishCommands) as typeof import('./cli/member-file-quick-publish.js').registerMemberFilePublishCommands;
 const registerSetupCommand = (shouldRegisterSetupCommand
   ? (require('./cli/setup-cli.js') as typeof import('./cli/setup-cli.js')).registerSetupCommand
   : (() => undefined)) as typeof import('./cli/setup-cli.js').registerSetupCommand;
@@ -1667,6 +1670,7 @@ registerControlCommands(program);
 registerHooksCommands(program);
 registerSetupCommand(program);
 registerMemberConnectCommands(program);
+registerMemberFilePublishCommands(program);
 if (shouldRegisterSetupCommand) {
   program.commands.find(command => command.name() === 'setup')!
     .option('--terminal', 'Run the terminal onboarding wizard')
@@ -1859,15 +1863,17 @@ program.command('self-update')
   .option('--dev', '판 사이 dev 빌드 설치 — versions/<판>-dev.<sha12> · install.json channel=dev · 이전 versionDir 보존 (사람 승인 · 자동 아님)')
   .option('--rollback', 'install.json 의 이전 versionDir 로 current 를 되돌린다 (이전이 없으면 거부)')
   .option('--auto [on|off|status]', '인자 없이: 에지 레일 계획/실행 · on|off|status: 기존 자동 갱신 서비스 관리')
+  .option('--catch-up', 'dev 채널 호스트: latest 릴리스 대신 desiredSha 를 따라잡는다(--seat 필요 · OP 자리는 HITL)')
+  .option('--expected-desired <sha>', '원격 갱신에서 승인된 정확한 desired SHA (--catch-up 전용)')
   .option('--dry-run', '에지 레일 계획만 출력; 설치·되돌림·상태 쓰기 없음')
   .option('--seat <seat>', '에지 레일 자리 (OP|TC|MK|UX)')
   .option('--quiet-window', '상주 프로세스 재시작이 가능한 조용한 창이라고 명시')
   .option('--canary-run-id <id>', '캐너리 성공 런의 고유 ID (독립 검증된 성공 런에서만 입력; 같은 ID 는 중복 적중하지 않음)')
-  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; skipPwaBuild?: boolean; dev?: boolean; rollback?: boolean; auto?: string | boolean; dryRun?: boolean; seat?: string; quietWindow?: boolean; canaryRunId?: string }) => {
+  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; skipPwaBuild?: boolean; dev?: boolean; rollback?: boolean; auto?: string | boolean; dryRun?: boolean; seat?: string; quietWindow?: boolean; canaryRunId?: string; catchUp?: boolean; expectedDesired?: string }) => {
     if (typeof opts.auto === 'string') {
       if (!['on', 'off', 'status'].includes(opts.auto)) { console.error(`--auto 는 on · off · status 중 하나: ${opts.auto}`); process.exitCode = 2; return; }
       const { runAutoUpdate } = await import('./cli/update-auto.js');
-      process.exitCode = (await runAutoUpdate(opts.auto as 'on' | 'off' | 'status')).exitCode;
+      process.exitCode = (await runAutoUpdate(opts.auto as 'on' | 'off' | 'status', {}, opts.catchUp ? { seat: opts.seat ?? '' } : undefined)).exitCode;
       return;
     }
     const { runUpdateForInstallation } = await import('./cli/self-update.js');
@@ -13353,6 +13359,8 @@ export interface TuiSelfRestartDeps {
   /** 관측 전용 — «전역 최신»이 무엇이든 재기동 id 는 여기서 고르지 않는다(로그·사유 문면에만 적는다). */
   readonly globalLatestSessionId?: () => string | null;
   readonly spawnChild?: (command: string, argv: readonly string[], env: Record<string, string>) => Promise<number>;
+  /** The old TUI no longer owns the screen while its replacement runs on the same PTY. */
+  readonly retireCurrentTui?: () => void;
   readonly log?: (event: string, detail: Record<string, unknown>) => void;
 }
 
@@ -13400,7 +13408,11 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
   const tuiReport = await import('./capture/tui-self-report.js');
   const store = await import('./session/index.js');
   const owned = (deps.owned ?? tuiReport.getTuiOwnedSession)();
-  const liveActiveSessionId = (deps.liveActiveSessionId ?? store.getActiveSessionId)();
+  // Explicit seat migration carries the TUI's own captured session. The host-wide active marker
+  // can already belong to another tab; it cannot override this control request's session binding.
+  const liveActiveSessionId = deps.liveActiveSessionId
+    ? deps.liveActiveSessionId()
+    : deps.migrateSessionId ?? store.getActiveSessionId();
   const globalLatestSessionId = (deps.globalLatestSessionId
     ?? (() => { try { return store.listSessions({ limit: 1 })[0]?.id ?? null; } catch { return null; } }))();
   if (generation >= TUI_SELF_RESTART_MAX_GENERATION) {
@@ -13456,6 +13468,12 @@ export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {
       const turnLife = deps.turnLifeLog ?? (await import('./debug/turn-life.js')).emitTurnLife;
       turnLife('turn-life:seat-control-relaunch', { eventId: deps.migrateRequestId, sessionId: decision.sessionId, outcome: 'starting' });
     } catch { /* observation must not alter the restart */ }
+  }
+  try {
+    (deps.retireCurrentTui ?? tuiReport.stopTuiSelfReportForCurrentProcess)();
+  } catch (error) {
+    report('blocked', { reason: 'owner-retire-failed', error: String(error).slice(0, 200) });
+    return { outcome: 'blocked', reason: 'owner-retire-failed' };
   }
   const exitCode = await (deps.spawnChild ?? defaultTuiSelfRestartSpawn)(process.execPath, argv, env);
   return { outcome: 'relaunch', reason: staleness.reason, sessionId: decision.sessionId, argv, exitCode };

@@ -165,6 +165,9 @@ interface DesiredState {
 
 class SocketReporter implements HerdrSocketReporter {
   private id = 0;
+  /** Herdr keeps the launch-time pane id as an alias after a move; reports must use the current id. */
+  private terminalId: string | null = null;
+  private canonicalPaneId: string | null = null;
   /** 호출자가 원하는 마지막 상태. 펌프만 confirmed 로 옮긴다. */
   private desired: DesiredState | null = null;
   /** herdr 가 `result` 로 받은 마지막 상태. 실패면 안 바뀐다. */
@@ -229,10 +232,23 @@ class SocketReporter implements HerdrSocketReporter {
     this.desired = null;
     this.pendingMeta = null;
     this.clearTimer();
+    let paneId = this.opts.paneId;
+    if (!this.opts.send) {
+      let current: unknown;
+      const found = this.terminalId !== null && writeHerdrSocketSync(this.opts.socketPath, {
+        id: this.nextId(), method: 'pane.current', params: { caller_pane_id: this.opts.paneId },
+      }, this.opts.log, SYNC_RELEASE_WAIT_MS, (result) => { current = result; });
+      const pane = (current as { pane?: { pane_id?: unknown; terminal_id?: unknown } } | undefined)?.pane;
+      if (!found || typeof pane?.pane_id !== 'string' || !pane.pane_id || pane.terminal_id !== this.terminalId) {
+        this.opts.log('release-sync-failed', { reason: 'pane identity not confirmed' });
+        return;
+      }
+      paneId = pane.pane_id;
+    }
     const frame: HerdrSocketFrame = {
       id: this.nextId(),
       method: 'pane.release_agent',
-      params: { pane_id: this.opts.paneId, source: SOURCE, agent: AGENT, seq: this.nextSeq() },
+      params: { pane_id: paneId, source: SOURCE, agent: AGENT, seq: this.nextSeq() },
     };
     try {
       if (!this.opts.sendSync(frame)) this.opts.log('release-sync-failed', {});
@@ -404,7 +420,30 @@ class SocketReporter implements HerdrSocketReporter {
   private async emit(frame: HerdrSocketFrame): Promise<boolean> {
     try {
       if (this.opts.send) return (await this.opts.send(frame)) === true;
-      return await writeHerdrSocket(this.opts.socketPath, frame, this.opts.connectTimeoutMs, (event, data) => {
+      let current: unknown;
+      const found = await writeHerdrSocket(this.opts.socketPath, {
+        id: this.nextId(), method: 'pane.current', params: { caller_pane_id: this.opts.paneId },
+      }, this.opts.connectTimeoutMs, this.opts.log, (result) => { current = result; });
+      const pane = (current as { pane?: { pane_id?: unknown; terminal_id?: unknown } } | undefined)?.pane;
+      if (!found || typeof pane?.pane_id !== 'string' || !pane.pane_id || typeof pane.terminal_id !== 'string' || !pane.terminal_id) {
+        this.opts.log('pane-current-unconfirmed', { method: frame.method });
+        return false;
+      }
+      if (this.terminalId && pane.terminal_id !== this.terminalId) {
+        this.opts.log('pane-terminal-changed', { method: frame.method });
+        return false;
+      }
+      const moved = this.canonicalPaneId !== null && this.canonicalPaneId !== pane.pane_id;
+      this.terminalId = pane.terminal_id;
+      this.canonicalPaneId = pane.pane_id;
+      if (moved && frame.method === 'pane.report_metadata') {
+        // A pane move can drop Herdr's agent lease while the TUI stays idle.
+        // Restore the state before sending metadata to its new address.
+        this.confirmed = null;
+        this.opts.log('pane-moved-rebind', { method: frame.method });
+        return false;
+      }
+      return await writeHerdrSocket(this.opts.socketPath, { ...frame, params: { ...frame.params, pane_id: pane.pane_id } }, this.opts.connectTimeoutMs, (event, data) => {
         this.opts.log(event, data);
       });
     } catch (error) {
@@ -491,6 +530,7 @@ export function writeHerdrSocket(
   frame: HerdrSocketFrame,
   timeoutMs: number,
   log: (event: string, data: Record<string, unknown>) => void = defaultLog,
+  onResult?: (result: unknown) => void,
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let socket: Socket;
@@ -522,10 +562,11 @@ export function writeHerdrSocket(
         if (nl < 0) return;
         const line = buf.slice(0, nl);
         try {
-          const parsed = JSON.parse(line) as { result?: unknown; error?: { code?: string; message?: string } };
-          if (parsed.error) finish('response-error', { code: parsed.error.code ?? '', message: parsed.error.message ?? '' });
+          const parsed = JSON.parse(line) as { id?: unknown; result?: unknown; error?: { code?: string; message?: string } };
+          if (parsed.id !== frame.id) finish('response-error', { message: 'response-id-mismatch' });
+          else if (parsed.error) finish('response-error', { code: parsed.error.code ?? '', message: parsed.error.message ?? '' });
           else if (parsed.result === undefined) finish('response-error', { message: 'no-result' });
-          else finish(null);
+          else { onResult?.(parsed.result); finish(null); }
         } catch {
           finish('response-error', { message: 'unparseable' });
         }
@@ -541,10 +582,12 @@ export function writeHerdrSocket(
 
 
 const SYNC_CLIENT = [
-  "const s=require('node:net').connect(process.env.ELN_HERDR_SOCK);let b='';",
+  "const fs=require('node:fs');const s=require('node:net').connect(process.env.ELN_HERDR_SOCK);let b='';",
   "s.on('connect',()=>s.write(process.env.ELN_HERDR_FRAME+'\\n'));",
-  "s.on('data',d=>{b+=d;const n=b.indexOf('\\n');if(n<0)return;",
-  "let r={};try{r=JSON.parse(b.slice(0,n))}catch{}process.exit(r.result!==undefined&&!r.error?0:2)});",
+  "s.on('data',d=>{b+=d;if(b.length>65536)process.exit(2);const n=b.indexOf('\\n');if(n<0)return;",
+  "let r={};try{r=JSON.parse(b.slice(0,n))}catch{}",
+  "if(r.id!==JSON.parse(process.env.ELN_HERDR_FRAME).id||r.result===undefined||r.error)process.exit(2);",
+  "fs.writeSync(1,JSON.stringify(r.result));process.exit(0)});",
   "s.on('error',()=>process.exit(3));s.on('close',()=>process.exit(4));",
 ].join('');
 
@@ -554,14 +597,19 @@ export function writeHerdrSocketSync(
   frame: HerdrSocketFrame,
   log: (event: string, data: Record<string, unknown>) => void = defaultLog,
   timeoutMs: number = SYNC_RELEASE_WAIT_MS,
+  onResult?: (result: unknown) => void,
 ): boolean {
   try {
     const out = spawnSync(process.execPath, ['-e', SYNC_CLIENT], {
       env: { ...process.env, BUN_BE_BUN: '1', ELN_HERDR_SOCK: socketPath, ELN_HERDR_FRAME: JSON.stringify(frame) },
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'ignore'],
       timeout: timeoutMs,
+      maxBuffer: 65_536,
     });
-    if (out.status === 0) return true;
+    if (out.status === 0) {
+      if (onResult) onResult(JSON.parse(String(out.stdout)));
+      return true;
+    }
     log('send-sync-failed', { method: frame.method, status: out.status ?? -1, signal: out.signal ?? '' });
   } catch (error) {
     log('send-sync-failed', { method: frame.method, error: error instanceof Error ? error.message : String(error) });

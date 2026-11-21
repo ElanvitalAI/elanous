@@ -55,6 +55,12 @@ describe('S3 버킷 분리 — 기본 버킷 없음 · 공개 기능만 공개 �
       expect(s3Uri('monad/publish/abc/index.html')).toBe('s3://pub/monad/publish/abc/index.html');
       expect(isPublicKey('monad/ID/debug-bundle/b.zip')).toBe(true);
       expect(isPublicKey('monad/ID/spill/s.txt')).toBe(false);
+      // JUD-B #39393 mustFix ③ — 'public' 조각은 member 게시 네임스페이스(members/<handle>/public/<YYYYMMDD>/) 에만 공개.
+      expect(isPublicKey('members/demo/public/20260121/a-b-0123456789ab.txt')).toBe(true);
+      expect(isPublicKey('members/demo/backup/public/x.txt')).toBe(false);
+      expect(isPublicKey('ops/demo/public/20260121/x.txt')).toBe(false);
+      expect(isPublicKey('monad/ID/spill/public.txt')).toBe(false);
+      expect(isPublicKey('members/demo/public/x.txt')).toBe(false);
       expect(s3PublicBase()).toBe('https://pub.s3.amazonaws.com');
     } finally { restore(); }
   });

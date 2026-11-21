@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitAnsi, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from './attach-view.js';
+import { buildBadge, createKeyDecoder, createPrefixFilter, drawView, ENTER_PANE_VIEW, ENTER_VIEW, fitAnsi, fitCells, LEAVE_PANE_VIEW, LEAVE_VIEW, lastScreenText, statusLine } from './attach-view.js';
 
 test('fitCells clips by terminal cells (a wide character is two), pads, and never splits a character', () => {
   expect(fitCells('abc', 5)).toBe('abc  ');
@@ -70,4 +70,19 @@ test('fitAnsi: colon-form SGR (underline style/colour) is an escape, OSC 8 links
   expect(fitAnsi(`${E}[4:3;58:5:6mabcdef${E}[0m`, 3)).toBe(`${E}[4:3;58:5:6mabc${E}[0m`);
   expect(fitAnsi(`${E}[4:1mab${E}[0mcd`, 6)).toBe(`${E}[4:1mab${E}[0mcd  `);
   expect(fitAnsi(`${E}[2Kab${E}[?25l`, 3)).toBe('ab ');
+});
+
+test('build badge accepts only the display fields allowed in federated pane reports', () => {
+  const build = { sha: 'abcdef1234', version: '0.3.32', stamp: '261121_0801', channel: 'official' };
+  for (const age of ['current', 'older', 'different', 'unknown']) {
+    expect(buildBadge({ ...build, age })).toBe(`[자체보고·미인증:0.3.32 official 261121_0801 abcdef1 ${age}]`);
+  }
+  expect(buildBadge({ ...build, channel: 'dev', age: 'current' })).toContain(' dev ');
+  for (const invalid of ['\u001b[2J', '\r\nforged', '\u009b2J', '\u0000']) {
+    expect(buildBadge({ ...build, version: invalid, stamp: invalid, channel: invalid, age: invalid }))
+      .toBe('[자체보고·미인증:abcdef1 unknown]');
+  }
+  expect(buildBadge({ ...build, stamp: '261121_0801\n', channel: 'release', age: { value: 'older' } }))
+    .toBe('[자체보고·미인증:0.3.32 abcdef1 unknown]');
+  expect(buildBadge({ ...build, sha: 'abcde\u001bf' })).toBe('[build unknown]');
 });

@@ -652,7 +652,7 @@ export class WarmPodTransport {
 const prefixArgs = (spec: WarmPodSpec) => ['--context', spec.kubectlContext, '-n', spec.namespace];
 
 /** Explicit shadow caller for a pre-existing warm Pod. Input file is `{spec, command}`; no apply/create path exists here. */
-if (import.meta.main) {
+async function runWarmPodShadowCli(): Promise<void> {
   const [mode, inputPath] = process.argv.slice(2);
   if (mode !== '--shadow-request' || !inputPath) throw new Error('usage: bun pod-warm-worker-pod.ts --shadow-request <payload.json>');
   const input = JSON.parse(readFileSync(inputPath, 'utf8')) as { spec: WarmPodSpec; command: WarmWorkerCommand };
@@ -660,3 +660,5 @@ if (import.meta.main) {
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (result.status !== 'observed') process.exitCode = 2;
 }
+
+if (import.meta.main) void runWarmPodShadowCli();

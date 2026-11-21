@@ -26,33 +26,35 @@ const AFTER_PREFIX: Readonly<Record<string, KeyAction>> = {
   b: 'toggle-sidebar', s: 'toggle-sidebar', c: 'new', a: 'new-chat', N: 'new-workspace', x: 'close', D: 'close-workspace', '?': 'help', '[': 'scroll-up', ']': 'scroll-down',
 };
 
-export function createKeyRouter(): { feed: (text: string) => KeyEvent[] } {
+export function createKeyRouter(): { resetPrefix: () => void; feed: (text: string, literalPrefix?: boolean | (() => boolean), dispatch?: (event: KeyEvent) => void) => KeyEvent[] } {
   let armed = false;
   let pending = '';
   return {
-    feed(text) {
+    resetPrefix() { armed = false; },
+    feed(text, literalPrefix = false, dispatch) {
       const events: KeyEvent[] = [];
+      const emit = (event: KeyEvent): void => { events.push(event); dispatch?.(event); };
       const split = splitMouse(pending + text);
       pending = split.pending;
       let typed = '';
-      const flush = (): void => { if (typed) { events.push({ kind: 'input', bytes: typed }); typed = ''; } };
+      const flush = (): void => { if (typed) { emit({ kind: 'input', bytes: typed }); typed = ''; } };
       const runText = (chunk: string): void => {
         for (const char of chunk) {
           if (!armed) {
-            if (char === PREFIX) { flush(); armed = true; } else typed += char;
+            if (char === PREFIX && !(typeof literalPrefix === 'function' ? literalPrefix() : literalPrefix)) { flush(); armed = true; } else typed += char;
             continue;
           }
           armed = false;
           if (char === PREFIX) typed += PREFIX;             // ctrl+b ctrl+b = one literal ctrl+b
           else if (char === ESCAPE) { /* the prefix is cancelled */ }
-          else if (char >= '1' && char <= '9') events.push({ kind: 'action', action: 'goto', n: Number(char) });
-          else if (AFTER_PREFIX[char]) events.push({ kind: 'action', action: AFTER_PREFIX[char]! });
-          else events.push({ kind: 'unknown', key: char });
+          else if (char >= '1' && char <= '9') emit({ kind: 'action', action: 'goto', n: Number(char) });
+          else if (AFTER_PREFIX[char]) emit({ kind: 'action', action: AFTER_PREFIX[char]! });
+          else emit({ kind: 'unknown', key: char });
         }
       };
       for (const segment of split.segments) {
         if (segment.kind === 'text') runText(segment.text);
-        else { flush(); events.push(mouseEvent(segment.report)); }
+        else { flush(); emit(mouseEvent(segment.report)); }
       }
       flush();
       return events;

@@ -37,13 +37,14 @@ async function lowSignalRows(perKind: number): Promise<Record<string, number>> {
   const db = openSurfaceEventsDb(':memory:');
   try {
     let tick = 0;
-    const consumer = createFrameMemoryConsumer({ record: input => { recordSelfEvent(db, input); }, minGapMs: 0, now: () => ++tick * 10_000 });
+    const consumer = createFrameMemoryConsumer({ record: input => { recordSelfEvent(db, input); }, now: () => ++tick * 10_000 });
     for (let i = 0; i < perKind; i++) consumer.observe({ surfaceId: 'pane-1', instance: 'i-1', frameAt: i, text: `build step ${i}` } as never);
     for (let i = 0; i < perKind; i++) recordExternalEvent({ origin: 'harness-child', kind: 'exit', summary: `child ${i} exit`, source: `elanous://child/${i}` }, { db });
     for (let i = 0; i < perKind; i++) injectUtterance({ origin: 'claude-code', text: `utterance body ${i}` }, db);
     const count = (surface: string) => (db.prepare('SELECT COUNT(*) AS n FROM events WHERE surface LIKE ?').get(surface) as { n: number }).n;
     return { frame: count('ext:tui-observe'), exit: count('context:external'), utterance: count('ext:claude-code'),
-      total: (db.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n };
+      total: (db.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n,
+      signals: (db.prepare('SELECT COUNT(*) AS n FROM signals').get() as { n: number }).n };
   } finally {
     db.close();
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
@@ -103,10 +104,10 @@ export const SIGNAL_SCENARIOS: readonly SignalScenario[] = [
       return { display: seatDisplay(own), storeId: seatStoreId(own), ownRead: await read('TC'), otherRead: (await read('OP')).length,
         badIdentities: ['TC,OP', '*', 'tc', 'pane_9f3a7c01d2b84e5fa6c9017b3d2e8f40a1b5c7d9e'].map(bad) };
     }),
-  { id: 'M24', title: '저신호 수집 필터 · 기억 행 0', expected: 'red', greenBy: '시그널 저장소 분리 + 수집 필터(MEMORY-SIGNALS §2 규칙 2)',
+  { id: 'M24', title: '저신호 수집 필터 · 기억 행 0', expected: 'green', greenBy: '시그널 저장소 분리 + 수집 필터(MEMORY-SIGNALS §2 규칙 2)',
     checks: 'tui-observe frame · context:external exit · claude-code utterance, 40 each through the real producers: 0 memory rows (surface_events)',
-    reason: 'surface_events 직행: 수집 필터 없음 — frame 40 · exit 40 · utterance 40 = 기억 행 120',
-    expect: { frame: 0, exit: 0, utterance: 0, total: 0 }, async run() {
+    reason: '',
+    expect: { frame: 0, exit: 0, utterance: 0, total: 0, signals: 120 }, async run() {
       const rows = await lowSignalRows(40);
       return { ...rows, ...(rows.total > 0 ? { redReason: `surface_events 직행: 수집 필터 없음 — frame ${rows.frame} · exit ${rows.exit} · utterance ${rows.utterance} = 기억 행 ${rows.total}` } : {}) };
     } },

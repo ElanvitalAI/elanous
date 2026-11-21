@@ -1,5 +1,6 @@
 'use client';
 
+import { preloadTerminalFont } from '@/lib/terminal-font';
 import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -12,6 +13,8 @@ import {
 } from './pty-live-poll';
 import { debugLog } from '@/lib/debug';
 import { cellFromPoint, isMouseModeOff, mouseButtonName } from './pty-mouse-forward';
+import { createPaneTouches, createPinchZoom } from './pinch-zoom';
+import { clampFontSize, publishTermFontSize, readTermFontSize, subscribeTermFontSize } from '@/lib/term-focus';
 
 interface Props {
   terminal: DaemonTerminalSummary;
@@ -31,6 +34,7 @@ interface LiveSession {
 export function PtyLiveView({ terminal, client, onClose }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const screen = useRef<Terminal | null>(null);
+  const setFontSizeRef = useRef<(size: number) => void>(() => {});
   const sessionRef = useRef<LiveSession | null>(null);
   const stateRef = useRef<PtyLivePollState>(initialPtyLivePollState);
   const [writable, setWritable] = useState(false);
@@ -50,10 +54,14 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
     busyRef.current = false;
     setBusy(false);
     const source = { sourceRoot: terminal.sourceRoot?.dbPath };
+    preloadTerminalFont();
     const term = new Terminal({
       cols: 110, rows: 40,
       fontFamily: '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace',
-      fontSize: 13,
+      fontSize: readTermFontSize(
+        (() => { try { return window.localStorage; } catch { return null; } })(),
+        typeof window !== 'undefined' && (window.matchMedia?.('(pointer: coarse)').matches ?? false),
+      ),
       theme: { background: '#0d0c08', foreground: '#e9e3d4', cursor: '#e9e3d4' },
       cursorBlink: false,
       disableStdin: true,
@@ -68,6 +76,20 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
     term.open(container.current);
     term.write('\x1b[?25l');
     screen.current = term;
+    const pinch = createPinchZoom();
+    const applyFontSize = (size: number) => {
+      const next = clampFontSize(size);
+      if (next !== term.options.fontSize) pinch.cancel();
+      term.options.fontSize = next;
+    };
+    const unsubscribeFont = typeof window === 'undefined' ? () => {} : subscribeTermFontSize(applyFontSize);
+    const setFontSize = (size: number) => {
+      const next = clampFontSize(size);
+      if (next === term.options.fontSize) return;
+      applyFontSize(next);
+      if (typeof window !== 'undefined') publishTermFontSize(next);
+    };
+    setFontSizeRef.current = setFontSize;
     stateRef.current = initialPtyLivePollState;
     setWritable(false);
     setMessage(null);
@@ -127,15 +149,68 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
       if (!button || !cell) return;
       sendMouse({ ...cell, kind: 'click', button });
     };
+    let blockedByExtraTouch = false;
+    let suppressGestureDefaults = false;
+    const paneTouches = createPaneTouches();
+    const onTouchStart = (e: TouchEvent) => {
+      const touches = paneTouches(e);
+      if (touches.length >= 2) suppressGestureDefaults = true;
+      if (touches.length > 2) { blockedByExtraTouch = true; pinch.cancel(); }
+      if (blockedByExtraTouch) return;
+      if (touches.length === 2) pinch.start(touches, term.options.fontSize ?? 13);
+      else pinch.cancel();
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      const touches = paneTouches(e);
+      if (touches.length >= 2) suppressGestureDefaults = true;
+      if (suppressGestureDefaults && e.cancelable) e.preventDefault();
+      if (touches.length > 2) { blockedByExtraTouch = true; pinch.cancel(); }
+      if (blockedByExtraTouch || touches.length !== 2) return;
+      const next = pinch.move(touches);
+      if (next !== null) setFontSize(next);
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      const touches = paneTouches(e);
+      if (touches.length === 0) suppressGestureDefaults = false;
+      if (blockedByExtraTouch) {
+        if (touches.length === 0) blockedByExtraTouch = false;
+        return;
+      }
+      pinch.cancel();
+      // A remaining pinch contact cannot begin another gesture until the pane is empty.
+      if (suppressGestureDefaults && touches.length === 1) blockedByExtraTouch = true;
+      if (touches.length === 2) pinch.start(touches, term.options.fontSize ?? 13);
+    };
+    const onTouchCancel = (e: TouchEvent) => {
+      pinch.cancel();
+      const remaining = paneTouches(e).length;
+      blockedByExtraTouch = remaining > 0;
+      if (remaining === 0) suppressGestureDefaults = false;
+    };
+    let lastZoomWheel = -Infinity;
     const onWheel = (e: WheelEvent) => {
-      if (!forwarding() || e.deltaY === 0) return;
+      if ((e.ctrlKey || e.metaKey) && e.deltaY !== 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const now = Date.now();
+        if (now - lastZoomWheel >= 150) {
+          lastZoomWheel = now;
+          setFontSize((term.options.fontSize ?? 13) + (e.deltaY < 0 ? 1 : -1));
+        }
+        return;
+      }
+      if (!forwarding() || !client.sendTerminalMouse || e.deltaY === 0) return;
       const cell = cellOf(e);
       if (!cell) return;
-      // xterm 은 마우스 추적이 없을 때 휠을 ↑↓ 화살표로 바꿔 보낸다(실측: 앱이 `ESC[A` 를 받았다) — 캡처 단계에서 가로채 막는다.
+      // xterm 은 마우스 추적이 없을 때 휠을 ↑↓ 화살표로 바꿔 보낸다 — 캡처 단계에서 가로채 막는다.
       e.preventDefault();
       e.stopPropagation();
       sendMouse({ ...cell, kind: e.deltaY < 0 ? 'scroll-up' : 'scroll-down' });
     };
+    host.addEventListener?.('touchstart', onTouchStart, { passive: true });
+    host.addEventListener?.('touchmove', onTouchMove, { passive: false });
+    host.addEventListener?.('touchend', onTouchEnd, { passive: true });
+    host.addEventListener?.('touchcancel', onTouchCancel, { passive: true });
     host.addEventListener?.('mousedown', onMouseDown, { capture: true });
     host.addEventListener?.('wheel', onWheel, { passive: false, capture: true });
 
@@ -200,6 +275,12 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
       disposeStream?.();
       document.removeEventListener('visibilitychange', onVisibility);
       input.dispose();
+      unsubscribeFont();
+      setFontSizeRef.current = () => {};
+      host.removeEventListener?.('touchstart', onTouchStart);
+      host.removeEventListener?.('touchmove', onTouchMove);
+      host.removeEventListener?.('touchend', onTouchEnd);
+      host.removeEventListener?.('touchcancel', onTouchCancel);
       host.removeEventListener?.('mousedown', onMouseDown, { capture: true });
       host.removeEventListener?.('wheel', onWheel, { capture: true });
       // A takeover may still be in flight when the view is removed. Its promise
@@ -283,7 +364,13 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
         <button type="button" onClick={onClose} aria-label="PTY 라이브 닫기">닫기</button>
       </header>
       {message && <p role="status" className="px-3 py-1 text-amber-300">{message}</p>}
-      <div ref={container} className="min-h-0 flex-1 overflow-auto" aria-label={`${terminal.id} 화면`} />
+      <div data-share-hide data-zoom-controls className="flex shrink-0 self-start gap-1 rounded bg-black/70 text-[#e9e3d4]">
+        <button type="button" aria-label="터미널 글자 작게" className="min-h-11 min-w-11 px-2" onMouseDown={(event) => event.preventDefault()} onClick={(event) => { setFontSizeRef.current((screen.current?.options.fontSize ?? 13) - 1); if (event.detail > 0 && sessionRef.current?.accepting) screen.current?.focus(); }}>A−</button>
+        <button type="button" aria-label="터미널 글자 크게" className="min-h-11 min-w-11 px-2" onMouseDown={(event) => event.preventDefault()} onClick={(event) => { setFontSizeRef.current((screen.current?.options.fontSize ?? 13) + 1); if (event.detail > 0 && sessionRef.current?.accepting) screen.current?.focus(); }}>A+</button>
+      </div>
+      <div className="relative min-h-0 flex-1">
+        <div ref={container} className="h-full overflow-auto" aria-label={`${terminal.id} 화면`} />
+      </div>
     </section>
   );
 }

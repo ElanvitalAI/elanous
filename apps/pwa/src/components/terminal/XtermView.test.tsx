@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
 import { sendToTerminal, setStickyModifiers, takeStickyModifiers } from './terminal-input-registry';
 import { COMPACT_MAX_WIDTH } from '@/lib/compact-mode';
-import { TERM_FOCUS_DISABLED_KEY } from '@/lib/term-focus';
+import { publishTermFontSize, subscribeTermFontSize, TERM_FOCUS_DISABLED_KEY } from '@/lib/term-focus';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -80,9 +80,20 @@ Object.defineProperty(globalThis, 'window', {
 
 Date.now = () => now;
 
+const touchListeners = new Map<string, (event: any) => void>();
+const documentTouchListeners = new Set<(event: any) => void>();
+const fakeTouchDocument = {
+  addEventListener: (name: string, listener: (event: any) => void) => { if (name === 'touchstart') documentTouchListeners.add(listener); },
+  removeEventListener: (name: string, listener: (event: any) => void) => { if (name === 'touchstart') documentTouchListeners.delete(listener); },
+};
 const element = (type: unknown, props?: Record<string, unknown>) => {
   const ref = props?.ref as { current: unknown } | undefined;
-  if (ref) ref.current = {};
+  if (ref) ref.current = {
+    ownerDocument: fakeTouchDocument,
+    contains: (target: unknown) => target === 'own-pane',
+    addEventListener: (name: string, listener: (event: any) => void) => touchListeners.set(name, listener),
+    removeEventListener: (name: string) => touchListeners.delete(name),
+  };
   return react.createElement(type, props);
 };
 
@@ -90,12 +101,16 @@ mock.module('react/jsx-dev-runtime', () => ({ jsxDEV: element, Fragment: react.F
 mock.module('react/jsx-runtime', () => ({ jsx: element, jsxs: element, Fragment: react.Fragment }));
 
 class Terminal {
-  constructor() { terminals.push(this); }
+  options: { fontSize?: number };
+  constructor(options: { fontSize?: number }) { this.options = options; terminals.push(this); }
+  focusCount = 0;
+  focus(): void { this.focusCount++; }
   clearCount = 0;
   clear(): void { this.clearCount += 1; }
   cols = 80;
   rows = 24;
   unicode = { activeVersion: '' };
+  buffer = { active: { viewportY: 0, type: 'normal' } };
   loadAddon(): void {}
   open(): void {}
   writes: string[] = [];
@@ -155,7 +170,7 @@ mock.module('@/components/providers/DaemonProvider', () => ({ ...actualDaemonPro
 
 const { XtermView } = await import('./XtermView');
 
-type Element = { props?: { children?: unknown[]; className?: string; 'aria-live'?: string } };
+type Element = { props?: { children?: unknown[]; className?: string; 'aria-live'?: string; 'data-acp-status'?: boolean } };
 
 /** 자식이 하나면 React 는 배열이 아니라 그 값 하나를 준다 — 둘 다 받는다. */
 function childList(value: Element): unknown[] {
@@ -173,7 +188,7 @@ function textOf(value: unknown): string {
 function statusClassOf(value: unknown): string {
   if (!value || typeof value !== 'object') return '';
   const elementValue = value as Element;
-  if (typeof elementValue.props?.className === 'string' && elementValue.props.className.includes('absolute right-2 top-2')) {
+  if (elementValue.props?.['data-acp-status'] === true && typeof elementValue.props.className === 'string') {
     return elementValue.props.className;
   }
   const children = childList(elementValue);
@@ -218,6 +233,486 @@ function resetState(): void {
   storage.clear();
   windowListeners.clear();
 }
+
+describe('XtermView pinch events', () => {
+  test('suppresses remaining pinch contact until release, then permits a fresh scroll', () => {
+    resetState();
+    const originalWheelEvent = globalThis.WheelEvent;
+    const wheels: unknown[] = [];
+    (globalThis as any).WheelEvent = class { constructor(public type: string, public options: unknown) {} };
+    try {
+      harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1' }));
+      const term = terminals.at(-1)!;
+      term.buffer.active.type = 'alternate';
+      Object.assign(term, { modes: { mouseTrackingMode: 'none' }, element: {
+        querySelector: () => ({ getBoundingClientRect: () => ({ height: 240 }) }),
+        dispatchEvent: (event: unknown) => { wheels.push(event); return true; },
+      } });
+      const a = { identifier: 1, clientX: 0, clientY: 0 };
+      const b = { identifier: 2, clientX: 100, clientY: 0 };
+      const fire = (type: string, touches: unknown[], changedTouches: unknown[]) => touchListeners.get(type)!({ type, touches, changedTouches, cancelable: true, preventDefault() {} });
+      fire('touchstart', [a], [a]);
+      fire('touchstart', [a, b], [b]);
+      fire('touchmove', [a, { ...b, clientX: 150 }], [{ ...b, clientX: 150 }]);
+      fire('touchend', [a], [b]);
+      fire('touchmove', [{ ...a, clientY: 30 }], [{ ...a, clientY: 30 }]);
+      expect(wheels).toHaveLength(0);
+      fire('touchend', [], [a]);
+      fire('touchstart', [a], [a]);
+      fire('touchmove', [{ ...a, clientY: 30 }], [{ ...a, clientY: 30 }]);
+      // 출처: #39399 한 손가락 스크롤 복구 계약은 최소 한 번의 wheel 전달을 요구한다.
+      expect(wheels.length).toBeGreaterThan(0);
+      expect(sends).toEqual([]);
+    } finally {
+      harness.unmount();
+      (globalThis as any).WheelEvent = originalWheelEvent;
+    }
+  });
+  for (const ending of ['touchend', 'touchcancel', 'extra'] as const) {
+    test(`prevents browser movement through ${ending} until all pane contacts leave`, () => {
+      resetState();
+      render();
+      const term = terminals.at(-1)!;
+      const scrolled: number[] = [];
+      Object.assign(term, { modes: { mouseTrackingMode: 'none' }, scrollLines: (lines: number) => scrolled.push(lines), element: {
+        querySelector: () => ({ getBoundingClientRect: () => ({ height: 240 }) }),
+      } });
+      const a = { identifier: 1, clientX: 0, clientY: 0 };
+      const b = { identifier: 2, clientX: 100, clientY: 0 };
+      const c = { identifier: 3, clientX: 200, clientY: 0 };
+      const fire = (type: string, touches: unknown[], changedTouches: unknown[], cancelable = true) => {
+        let prevented = 0;
+        touchListeners.get(type)!({ type, touches, changedTouches, cancelable, preventDefault() { prevented++; } });
+        return prevented;
+      };
+      try {
+        fire('touchstart', [a], [a]);
+        fire('touchstart', [a, b], [b]);
+        expect(fire('touchmove', [a, b], [b])).toBe(1);
+        if (ending === 'extra') {
+          fire('touchstart', [a, b, c], [c]);
+          expect(fire('touchmove', [a, b, c], [c])).toBe(1);
+          fire('touchend', [a, b], [c]);
+          expect(fire('touchmove', [a, b], [b])).toBe(1);
+          fire('touchend', [a], [b]);
+        } else {
+          fire(ending, [a], [b]);
+        }
+        expect(fire('touchmove', [{ ...a, clientY: 30 }], [a])).toBe(1);
+        expect(fire('touchmove', [a], [a], false)).toBe(0);
+        expect(scrolled).toEqual([]);
+        fire('touchend', [], [a]);
+        fire('touchstart', [a], [a]);
+        expect(fire('touchmove', [{ ...a, clientY: 30 }], [a])).toBe(0);
+        // 출처: #39399 한 손가락 스크롤 복구 계약은 최소 한 번의 스크롤을 요구한다.
+        expect(scrolled.length).toBeGreaterThan(0);
+      } finally { harness.unmount(); }
+    });
+  }
+  test('never emits wheel for a contact while another pane is touched, even after the other contact ends', () => {
+    resetState();
+    const originalWheelEvent = globalThis.WheelEvent;
+    const wheels: unknown[] = [];
+    (globalThis as any).WheelEvent = class { constructor(public type: string, public options: unknown) {} };
+    try {
+      render();
+      const term = terminals.at(-1)!;
+      term.buffer.active.type = 'alternate';
+      Object.assign(term, { modes: { mouseTrackingMode: 'none' }, element: {
+        querySelector: () => ({ getBoundingClientRect: () => ({ height: 240 }) }),
+        dispatchEvent: (event: unknown) => { wheels.push(event); return true; },
+      } });
+      const a = { identifier: 1, clientX: 0, clientY: 0 };
+      const other = { identifier: 2, clientX: 100, clientY: 0 };
+      const fire = (type: string, touches: unknown[], changedTouches: unknown[]) => touchListeners.get(type)!({ type, touches, changedTouches, cancelable: true, preventDefault() {} });
+      fire('touchstart', [a], [a]);
+      fire('touchmove', [{ ...a, clientY: 30 }, other], [{ ...a, clientY: 30 }]);
+      fire('touchmove', [{ ...a, clientY: 50 }], [{ ...a, clientY: 50 }]);
+      expect(wheels).toHaveLength(0);
+      fire('touchend', [], [a]);
+      fire('touchstart', [a], [a]);
+      fire('touchmove', [{ ...a, clientY: 30 }], [{ ...a, clientY: 30 }]);
+      // 출처: #39399 한 손가락 스크롤 복구 계약은 최소 한 번의 wheel 전달을 요구한다.
+      expect(wheels.length).toBeGreaterThan(0);
+    } finally {
+      harness.unmount();
+      (globalThis as any).WheelEvent = originalWheelEvent;
+    }
+  });
+  test('invalidates normal scroll when a foreign contact starts and ends without a local move', () => {
+    resetState();
+    render();
+    const term = terminals.at(-1)!;
+    const scrolled: number[] = [];
+    Object.assign(term, { modes: { mouseTrackingMode: 'none' }, scrollLines: (lines: number) => scrolled.push(lines), element: {
+      querySelector: () => ({ getBoundingClientRect: () => ({ height: 240 }) }),
+    } });
+    const a = { identifier: 1, clientX: 0, clientY: 0, target: 'own-pane' };
+    const other = { identifier: 2, clientX: 100, clientY: 0, target: 'other-pane' };
+    const fire = (type: string, touches: unknown[], changedTouches: unknown[]) => touchListeners.get(type)!({ type, touches, changedTouches, cancelable: true, preventDefault() {} });
+    fire('touchstart', [a], [a]);
+    for (const listener of documentTouchListeners) listener({ touches: [a, other], changedTouches: [other] });
+    fire('touchmove', [{ ...a, clientY: 30 }], [{ ...a, clientY: 30 }]);
+    expect(scrolled).toEqual([]);
+    fire('touchend', [], [a]);
+    fire('touchstart', [a], [a]);
+    fire('touchmove', [{ ...a, clientY: 30 }], [{ ...a, clientY: 30 }]);
+    // 출처: #39399 한 손가락 스크롤 복구 계약은 최소 한 번의 스크롤을 요구한다.
+    expect(scrolled.length).toBeGreaterThan(0);
+    harness.unmount();
+    expect(documentTouchListeners.size).toBe(0);
+  });
+  test('ignores touches on another pane and recovers after cancel', () => {
+    resetState();
+    const changes: number[] = [];
+    harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', onFontSizeChange: (size) => changes.push(size) }));
+    const a = { identifier: 1, clientX: 0, clientY: 0 };
+    const b = { identifier: 2, clientX: 100, clientY: 0 };
+    const other = { identifier: 3, clientX: 200, clientY: 0 };
+    const fire = (name: string, touches: unknown[], changedTouches: unknown[]) => touchListeners.get(name)!({ type: name, touches, changedTouches, cancelable: true, preventDefault() {} });
+    fire('touchstart', [a], [a]);
+    fire('touchmove', [a, other], [a]);
+    expect(changes).toEqual([]);
+    fire('touchcancel', [other], [a]);
+    fire('touchstart', [a, other], [a]);
+    fire('touchstart', [a, b, other], [b]);
+    fire('touchmove', [a, { ...b, clientX: 150 }, other], [b]);
+    expect(changes).toEqual([14]);
+    harness.unmount();
+  });
+  test('claims two-finger movement before the threshold and notifies once per gesture', () => {
+    resetState();
+    const changes: number[] = [];
+    harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', onFontSizeChange: (size) => changes.push(size) }));
+    const points = (distance: number) => [{ clientX: 0, clientY: 0 }, { clientX: distance, clientY: 0 }];
+    touchListeners.get('touchstart')!({ touches: points(100) });
+    let prevented = 0;
+    const move = (distance: number) => touchListeners.get('touchmove')!({ touches: points(distance), cancelable: true, preventDefault: () => { prevented++; } });
+    move(103);
+    move(120);
+    move(150);
+    expect(prevented).toBe(3);
+    expect(changes).toEqual([14]);
+    const third = [...points(150), { clientX: 0, clientY: 1 }];
+    touchListeners.get('touchstart')!({ touches: third });
+    touchListeners.get('touchend')!({ touches: points(100) });
+    move(150);
+    touchListeners.get('touchstart')!({ touches: third });
+    touchListeners.get('touchend')!({ touches: points(100) });
+    move(150);
+    expect(changes).toEqual([14]);
+    touchListeners.get('touchend')!({ touches: [] });
+    touchListeners.get('touchstart')!({ touches: points(100) });
+    move(150);
+    expect(changes).toEqual([14, 15]);
+    harness.unmount();
+    expect(touchListeners.has('touchmove')).toBe(false);
+  });
+
+  test('font size buttons change and persist the client font without terminal input', () => {
+    resetState();
+    const changes: number[] = [];
+    harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', onFontSizeChange: (size) => changes.push(size) }));
+    const plus = harness.find((element) => element.props['aria-label'] === '터미널 글자 크게');
+    const minus = harness.find((element) => element.props['aria-label'] === '터미널 글자 작게');
+    let prevented = 0;
+    for (const button of [plus, minus]) (button.props.onMouseDown as (event: { preventDefault(): void }) => void)({ preventDefault: () => { prevented++; } });
+    expect(prevented).toBe(2);
+    const zoomClass = harness.find((element) => element.props['data-zoom-controls'] === true).props.className as string;
+    expect(zoomClass).not.toContain('absolute');
+    expect(zoomClass).toContain('self-start');
+    (plus.props.onClick as (event: { detail: number }) => void)({ detail: 1 });
+    (minus.props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+    expect(terminals[0]?.focusCount).toBe(1);
+    expect(changes).toEqual([14, 13]);
+    expect(storage.get('elanous.pwa.termFontSize')).toBe('13');
+    expect(sends).toEqual([]);
+    harness.unmount();
+  });
+
+  test('ctrl-wheel zooms while ordinary wheel is not intercepted', () => {
+    resetState();
+    const changes: number[] = [];
+    harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', onFontSizeChange: (size) => changes.push(size) }));
+    let prevented = 0;
+    let stopped = 0;
+    const wheel = (ctrlKey: boolean, deltaY: number) => touchListeners.get('wheel')!({ ctrlKey, deltaY, preventDefault: () => { prevented++; }, stopPropagation: () => { stopped++; } });
+    wheel(false, -1);
+    expect(changes).toEqual([]);
+    expect(prevented).toBe(0);
+    wheel(true, -100);
+    now = 149;
+    wheel(true, 1);
+    expect(changes).toEqual([14]);
+    now = 150;
+    wheel(true, 100);
+    now = 300;
+    touchListeners.get('wheel')!({ ctrlKey: false, metaKey: true, deltaY: -1, preventDefault: () => { prevented++; }, stopPropagation: () => { stopped++; } });
+    expect(changes).toEqual([14, 13, 14]);
+    expect(prevented).toBe(4);
+    expect(stopped).toBe(4);
+    harness.unmount();
+    expect(touchListeners.has('wheel')).toBe(false);
+  });
+});
+
+describe("OP119481 pinch shared font race", () => {
+  test('a new controlled pinch cannot publish a stale size before its parent updates', () => {
+    resetState();
+    publishTermFontSize(18);
+    try {
+      harness.render(() => XtermView({ sessionId: 's1', terminalId: 'controlled', sharedFontSize: 18, onFontSizeChange: publishTermFontSize }));
+      publishTermFontSize(21);
+      const points = (distance: number) => [{ clientX: 0, clientY: 0 }, { clientX: distance, clientY: 0 }];
+      touchListeners.get('touchstart')!({ touches: points(100) });
+      touchListeners.get('touchmove')!({ touches: points(150), cancelable: true, preventDefault() {} });
+      expect(storage.get('elanous.pwa.termFontSize')).toBe('22');
+    } finally { harness.unmount(); }
+  });
+  test("a pinch started before another view changes size must not restore the stale starting size", () => {
+    resetState();
+    publishTermFontSize(13);
+    const second = createReactHookHarness(react);
+    try {
+      harness.render(() => XtermView({ sessionId: "s1", terminalId: "first" }));
+      const first = terminals[0]!;
+      const start = touchListeners.get("touchstart")!;
+      const move = touchListeners.get("touchmove")!;
+      const points = (distance: number) => [{ clientX: 0, clientY: 0 }, { clientX: distance, clientY: 0 }];
+      start({ touches: points(100) });
+      second.render(() => XtermView({ sessionId: "s1", terminalId: "second" }));
+      const plus = second.find((item) => item.props["aria-label"] === "터미널 글자 크게");
+      for (let i = 0; i < 7; i++) (plus.props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      expect(first.options.fontSize).toBe(20);
+      expect(terminals[1]?.options.fontSize).toBe(20);
+      expect(storage.get("elanous.pwa.termFontSize")).toBe("20");
+      move({ touches: points(150), cancelable: true, preventDefault() {} });
+      expect(first.options.fontSize).toBe(20);
+      expect(terminals[1]?.options.fontSize).toBe(20);
+      expect(storage.get("elanous.pwa.termFontSize")).toBe("20");
+    } finally { second.unmount(); harness.unmount(); }
+  });
+});
+
+describe('XtermView shared font size', () => {
+  test('new stale controlled view cannot overwrite existing views or storage', () => {
+    resetState();
+    const second = createReactHookHarness(react);
+    try {
+      harness.render(() => XtermView({ sessionId: 's1', terminalId: 'first' }));
+      publishTermFontSize(21);
+      expect(terminals[0]?.options.fontSize).toBe(21);
+      expect(storage.get('elanous.pwa.termFontSize')).toBe('21');
+      second.render(() => XtermView({ sessionId: 's1', terminalId: 'second', sharedFontSize: 18, onFontSizeChange: () => {} }));
+      expect(terminals[1]?.options.fontSize).toBe(18); // controlled parent wins locally
+      expect(terminals[0]?.options.fontSize).toBe(21);
+      expect(storage.get('elanous.pwa.termFontSize')).toBe('21');
+    } finally { second.unmount(); harness.unmount(); }
+  });
+
+  test('prop without callback follows later shared publications', () => {
+    resetState();
+    try {
+      harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: 18 }));
+      expect(terminals[0]?.options.fontSize).toBe(18);
+      publishTermFontSize(21);
+      expect(terminals[0]?.options.fontSize).toBe(21);
+    } finally { harness.unmount(); }
+  });
+  test('recreation does not republish an unchanged stale prop over another screen', () => {
+    resetState();
+    const observed: number[] = [];
+    const unsubscribe = subscribeTermFontSize((size) => observed.push(size));
+    let readOnly = false;
+    const draw = () => harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: 18, onFontSizeChange: () => {}, readOnly }));
+    try {
+      draw();
+      publishTermFontSize(21);
+      readOnly = true;
+      draw();
+      expect(terminals.at(-1)?.options.fontSize).toBe(18);
+      expect(observed.at(-1)).toBe(21);
+      expect(storage.get('elanous.pwa.termFontSize')).toBe('21');
+    } finally { harness.unmount(); unsubscribe(); }
+  });
+  test('controlled requests wait for the parent before changing terminal or storage', () => {
+    resetState();
+    const requests: number[] = [];
+    let shared = 18;
+    const draw = () => harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: shared, onFontSizeChange: (size) => requests.push(size) }));
+    try {
+      draw();
+      const before = storage.get('elanous.pwa.termFontSize');
+      const click = () => (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      click();
+      expect(requests).toEqual([19]);
+      expect(terminals[0]?.options.fontSize).toBe(18);
+      expect(storage.get('elanous.pwa.termFontSize')).toBe(before);
+      draw(); // parent rejected the request
+      expect(terminals[0]?.options.fontSize).toBe(18);
+      shared = 19;
+      draw(); // parent accepts it later
+      expect(terminals[0]?.options.fontSize).toBe(19);
+      expect(storage.get('elanous.pwa.termFontSize')).toBe('19');
+    } finally { harness.unmount(); }
+  });
+  test('standalone follows published sizes, controlled size wins, and unmount unsubscribes', () => {
+    resetState();
+    let shared: number | null = null;
+    const draw = () => harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: shared, onFontSizeChange: () => {} }));
+    try {
+      draw();
+      const term = terminals[0]!;
+      expect(term.options.fontSize).toBe(13);
+      // Compact mode and the shared font subscription each listen for storage changes.
+      expect(windowListeners.get('storage')?.size).toBe(2);
+      publishTermFontSize(19);
+      expect(term.options.fontSize).toBe(19);
+      shared = 22;
+      draw();
+      expect(term.options.fontSize).toBe(22);
+      publishTermFontSize(16);
+      expect(term.options.fontSize).toBe(22);
+      shared = null;
+      draw();
+      expect(term.options.fontSize).toBe(16);
+      harness.unmount();
+      expect(windowListeners.get('storage')?.size ?? 0).toBe(0);
+      publishTermFontSize(20);
+      expect(term.options.fontSize).toBe(16);
+    } finally { harness.unmount(); }
+  });
+  test('uncontrolled callback notifies and publishes to other subscribers', () => {
+    resetState();
+    const observed: number[] = [];
+    const changes: number[] = [];
+    const unsubscribe = subscribeTermFontSize((size) => observed.push(size));
+    try {
+      harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', onFontSizeChange: (size) => changes.push(size) }));
+      (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      expect(terminals[0]?.options.fontSize).toBe(14);
+      expect(changes).toEqual([14]);
+      expect(observed).toEqual([13, 14]);
+      expect(storage.get('elanous.pwa.termFontSize')).toBe('14');
+      expect(sends).toEqual([]);
+    } finally { unsubscribe(); harness.unmount(); }
+  });
+  test('uncontrolled publisher callback emits only once during panel initialization', () => {
+    resetState();
+    const observed: number[] = [];
+    const unsubscribe = subscribeTermFontSize((size) => observed.push(size));
+    try {
+      harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: null, onFontSizeChange: publishTermFontSize }));
+      (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      expect(observed).toEqual([13, 14]);
+    } finally { unsubscribe(); harness.unmount(); }
+  });
+  test('publishes zoom synchronously to subscribers without a parent callback', () => {
+    resetState();
+    const observed: number[] = [];
+    const unsubscribe = subscribeTermFontSize((size) => observed.push(size));
+    try {
+      render();
+      expect(observed).toEqual([13]);
+      (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      expect(terminals[0]?.options.fontSize).toBe(14);
+      expect(observed).toEqual([13, 14]);
+      expect(sends).toEqual([]);
+    } finally {
+      unsubscribe();
+      harness.unmount();
+    }
+  });
+  test('prop updates publish to independent same-document subscribers', () => {
+    resetState();
+    const observed: number[] = [];
+    const unsubscribe = subscribeTermFontSize((size) => observed.push(size));
+    let shared = 18;
+    const draw = () => harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: shared, onFontSizeChange: () => {} }));
+    try {
+      draw();
+      shared = 21;
+      draw();
+      expect(terminals[0]?.options.fontSize).toBe(21);
+      expect(observed.at(-1)).toBe(21);
+    } finally { harness.unmount(); unsubscribe(); }
+  });
+  test('prop without callback retains local zoom behavior', () => {
+    resetState();
+    try {
+      harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: 18 }));
+      (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      expect(terminals[0]?.options.fontSize).toBe(19);
+    } finally { harness.unmount(); }
+  });
+  test('blocked storage preserves uncontrolled zoom on terminal recreation', () => {
+    resetState();
+    const descriptor = Object.getOwnPropertyDescriptor(window, 'localStorage')!;
+    Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new Error('blocked'); } });
+    try {
+      render('t1', 0, false);
+      (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      expect(terminals.at(-1)?.options.fontSize).toBe(14);
+      render('t1', 0, true);
+      expect(terminals.at(-1)?.options.fontSize).toBe(14);
+    } finally {
+      harness.unmount();
+      Object.defineProperty(window, 'localStorage', descriptor);
+    }
+  });
+  test('preserves the shared size when read-only changes recreate the terminal', () => {
+    resetState();
+    harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: 18, readOnly: false }));
+    expect(terminals.at(-1)?.options.fontSize).toBe(18);
+    storage.set('elanous.pwa.termFontSize', '14'); // another screen changed its saved size
+    harness.render(() => XtermView({ sessionId: 's1', terminalId: 't1', sharedFontSize: 18, readOnly: true }));
+    expect(terminals.at(-1)?.options.fontSize).toBe(18);
+    harness.unmount();
+  });
+});
+
+describe('XtermView font zoom resize isolation', () => {
+  test('recomputes the local grid and sends standard resize without PTY input on font zoom', async () => {
+    resetState();
+    // Clear the shared in-memory fallback left by the blocked-storage test.
+    publishTermFontSize(13);
+    const FitAddon = (require('@xterm/addon-fit') as { FitAddon: { prototype: { fit: () => void } } }).FitAddon;
+    const oldFit = FitAddon.prototype.fit;
+    const oldResize = Terminal.prototype.onResize;
+    let resize: ((size: { cols: number; rows: number }) => void) | undefined;
+    let fits = 0;
+    FitAddon.prototype.fit = function () {
+      fits++;
+      const term = terminals.at(-1)!;
+      const cols = term.options.fontSize === 14 ? 74 : 80;
+      const rows = term.options.fontSize === 14 ? 22 : 24;
+      if (cols !== term.cols || rows !== term.rows) {
+        term.cols = cols; term.rows = rows;
+        resize?.({ cols, rows });
+      }
+    };
+    Terminal.prototype.onResize = function (callback?: (size: { cols: number; rows: number }) => void) {
+      resize = callback;
+      return { dispose() { resize = undefined; } };
+    };
+    try {
+      render('terminal-a');
+      await harness.settle(); // Exclude the legitimate attach size sync.
+      sends = [];
+      const beforeFits = fits;
+      (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      await harness.settle();
+      expect(fits).toBe(beforeFits + 1);
+      expect([terminals[0]!.cols, terminals[0]!.rows]).toEqual([74, 22]);
+      expect(sends.filter((method) => method === 'terminal/resize')).toEqual(['terminal/resize']);
+      expect(sends.filter((method) => method === 'terminal/input')).toEqual([]);
+    } finally {
+      harness.unmount();
+      FitAddon.prototype.fit = oldFit;
+      Terminal.prototype.onResize = oldResize;
+    }
+  });
+});
 
 describe('XtermView compact touch focus start', () => {
   const host = () => harness.find((item) => item.props['data-xterm-host'] === true);
@@ -292,6 +787,53 @@ describe('XtermView compact touch focus start', () => {
     render();
     expect(host().props['data-focus-mode']).toBeUndefined();
     harness.unmount();
+  });
+});
+
+describe('XtermView zoom persistence and Ctrl+B routing', () => {
+  test('retains zoom through connection changes and remount without intercepting Ctrl+B', async () => {
+    resetState();
+    publishTermFontSize(13);
+    const sent: Array<{ data: string; sessionId: string }> = [];
+    sendInput = async (data, sessionId) => { sent.push({ data, sessionId }); return {}; };
+    const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    const keys = new Set<(event: KeyboardEvent) => void>();
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: {
+      activeElement: null,
+      querySelector: () => (harness.find((item) => item.props['data-xterm-host'] === true).props.ref as { current: unknown }).current,
+      addEventListener: (name: string, listener: (event: KeyboardEvent) => void) => { if (name === 'keydown') keys.add(listener); },
+      removeEventListener: (name: string, listener: (event: KeyboardEvent) => void) => { if (name === 'keydown') keys.delete(listener); },
+    } });
+    try {
+      render('terminal-a');
+      await harness.settle();
+      (harness.find((item) => item.props['aria-label'] === '터미널 글자 크게').props.onClick as (event: { detail: number }) => void)({ detail: 0 });
+      expect(storage.get('elanous.pwa.termFontSize')).toBe('14');
+      for (const state of ['CLOSED', 'CONNECTING', 'OPEN'] as const) {
+        listeners.forEach((listener) => listener(state));
+        expect(terminals.at(-1)?.options.fontSize).toBe(14);
+      }
+      harness.unmount();
+      expect(keys.size).toBe(0);
+      render('terminal-a');
+      await harness.settle();
+      expect(terminals.at(-1)?.options.fontSize).toBe(14);
+      expect(keys.size).toBeGreaterThan(0);
+      let prevented = 0;
+      let stopped = 0;
+      const event = { key: 'b', code: 'KeyB', ctrlKey: true, metaKey: false, shiftKey: false, altKey: false, preventDefault() { prevented++; }, stopPropagation() { stopped++; } } as KeyboardEvent;
+      for (const listener of keys) listener(event);
+      expect([prevented, stopped]).toEqual([0, 0]);
+      expect(terminals.at(-1)?.options.fontSize).toBe(14);
+      expect(onTerminalData).toBeDefined();
+      onTerminalData?.('\x02');
+      await harness.settle();
+      expect(sent).toEqual([{ data: '\x02', sessionId: 's1' }]);
+    } finally {
+      harness.unmount();
+      if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
+      else delete (globalThis as { document?: unknown }).document;
+    }
   });
 });
 
@@ -579,6 +1121,9 @@ describe('XtermView ACP status surface', () => {
     await harness.settle();
     const alert = harness.find((element) => element.props.role === 'alert');
     expect(harness.textOf(alert)).toContain('4바이트가 버려졌습니다');
+    // Warnings occupy their own row instead of covering the terminal or focus control.
+    expect(alert.props.className).toContain('shrink-0');
+    expect(alert.props.className).not.toContain('absolute');
     onTerminalData?.('later');
     await harness.settle();
     expect(sent).toEqual(['lost', 'later']);

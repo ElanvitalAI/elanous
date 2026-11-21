@@ -10,7 +10,7 @@
 import type { IncidentClaimStore } from '../../supervision/incident-claim.js';
 
 /** The reserved `sim world run` ids. `all` expands to every pack in this order. */
-export const SIM_WORLD_IDS = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker'] as const;
+export const SIM_WORLD_IDS = ['memory', 'ta', 'graph', 'supervisors', 'seat-mail', 'capsule-events', 'seat-mail-roundtrip', 'worker', 'op-channel'] as const;
 export type SimWorldPackId = typeof SIM_WORLD_IDS[number];
 export type SimWorldReservedId = SimWorldPackId | 'all';
 

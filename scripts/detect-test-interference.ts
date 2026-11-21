@@ -185,4 +185,4 @@ export async function main(args: readonly string[] = process.argv.slice(2), runn
   return report.status === 'interference' ? EXIT_INTERFERENCE : EXIT_NO_INTERFERENCE;
 }
 
-if (import.meta.main) process.exitCode = await main();
+if (import.meta.main) void main().then((code) => { process.exitCode = code; });

@@ -27,7 +27,7 @@ test('verify invokes the public install verifier with the published version and 
       if (command === 'curl') return { status: 0, stdout: '{"name":"elanous","dist-tags":{"latest":"0.2.4","next":"0.2.4"}}', stderr: '' };
       expect(command).toBe('bun');
       expect(args).toEqual(['bin/elanous.mjs', 'release', 'verify', '--version', '0.2.4', '--json']);
-      return { status: 0, stdout: `installer output\n${JSON.stringify({ ok: true, notesPage: 'ok', nexusFirstRun: { ok: true, versionLine: `0.2.4 ${'e'.repeat(40)}`, health: 200, healthOk: true, app: 200, testUniverse: true, pid: 12345, ownPidStopped: true, forcedKill: false, exitCode: 0 } })}\n`, stderr: '' };
+      return { status: 0, stdout: `installer output\n${JSON.stringify({ ok: true, notesPage: 'ok', nexusFirstRun: { ok: true, versionLine: `0.2.4 261121_0855 ${'e'.repeat(40)}`, health: 200, healthOk: true, app: 200, testUniverse: true, pid: 12345, ownPidStopped: true, forcedKill: false, exitCode: 0 } })}\n`, stderr: '' };
     });
 
     expect(calls.some(({ command }) => command === 'bun')).toBe(true);
@@ -90,7 +90,7 @@ test('verify cannot accept an old or failed Nexus receipt even with top-level ok
   for (const nexusFirstRun of [undefined, { ok: false }, { ok: true, ownPidStopped: false }, {
     ok: true, versionLine: `0.2.3 ${'e'.repeat(40)}`, health: 200, healthOk: true, app: 200,
     testUniverse: true, pid: 12345, ownPidStopped: true, forcedKill: false, exitCode: 0,
-  }, { ok: true, versionLine: `0.2.4 ${'e'.repeat(40)}`, health: 200, healthOk: true, app: 200,
+  }, { ok: true, versionLine: `0.2.4 261121_0855 ${'e'.repeat(40)}`, health: 200, healthOk: true, app: 200,
     testUniverse: true, pid: 12345, ownPidStopped: true, forcedKill: false, exitCode: 3,
   }]) {
     withGraphContext(validContext, () => {

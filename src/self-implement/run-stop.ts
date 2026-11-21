@@ -13,7 +13,7 @@ import { debug } from '../debug/log.js';
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { appendRunLedgerEntry, runLedgerDir, runLedgerPath, type RunLedgerEntry, type RunLedgerWriter, type RunShardIdentity } from './run-ledger.js';
+import { appendRunLedgerEntryChecked, runLedgerDir, runLedgerPath, type RunLedgerEntry, type RunLedgerWriter, type RunShardIdentity } from './run-ledger.js';
 import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
 import { defaultOverlaysDir, loadGraphOverlays } from './graph-overlay-yaml.js';
 
@@ -310,8 +310,30 @@ export function forgetRunStop(runId: string): void {
   recordedThisProcess.delete(runId);
 }
 
-/** 멈춘 런에 stop 한 줄을 더한다 — 기존 관측은 바꾸지 않는다. 쓴 줄을 돌려준다. */
-export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appendRunLedgerEntry): RunLedgerEntry {
+/** 주입 writer 의 반환값이 «원장에 남은 이 runId 의 stop 줄»인가 — 계약이 void 라 형태로만 판별한다. */
+function isWrittenRunStopLine(value: unknown, runId: string): value is RunLedgerEntry {
+  if (typeof value !== 'object' || value === null) return false;
+  const line = value as RunLedgerEntry;
+  return line.runId === runId && line.event === RUN_STOP_EVENT;
+}
+
+/**
+ * Stop 줄 적립 — 런 원장 잠금 «아래에서» 원장을 다시 읽어 그 runId 의 stop 줄이 이미 있으면
+ * 새 줄을 적립하지 않고 기존 줄을 돌려준다: 카드 쓰기 전에 사망해 원장에만 stop 이 남은 뒤
+ * 오는 별도 프로세스 재시도(15분 창)가 같은 runId 에 두 번째 stop 을 쌓지 않는다(JUD-B #119237/#119258).
+ * «더하기만» 계약 유지 — 기존 줄·관측은 되돌리지 않는다. 기각이 아니라 기존 줄 반환이라
+ * recordRunStop 재시도의 TA_STOP_FAILED_EVENT churn 을 만들지 않는다.
+ */
+export function appendRunStopEntryOnce(entry: RunLedgerEntry, dir = runLedgerDir()): RunLedgerEntry {
+  const outcome = appendRunLedgerEntryChecked<RunLedgerEntry>(entry.runId, (existing) => {
+    const prior = existing?.find((row) => row.event === RUN_STOP_EVENT) ?? null;
+    return prior ? { append: false, result: prior } : { append: true, entry };
+  }, dir);
+  return outcome.result ?? entry;
+}
+
+/** 멈춘 런에 stop 한 줄을 더한다 — 기존 관측은 바꾸지 않는다. 쓴 줄을 돌려준다. 기본 기록기(appendRunStopEntryOnce)는 같은 runId 의 기존 stop 줄을 재적립하지 않는다. */
+export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appendRunStopEntryOnce): RunLedgerEntry {
   const base: Omit<RunStopRecord, 'terminalEvidence'> = {
     class: isRunStopClass(input.class) ? input.class : 'unclassified',
     ...(input.site ? { site: input.site } : {}),
@@ -329,17 +351,22 @@ export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appe
     ...(input.goalId ? { goalId: input.goalId } : {}),
     ...input.shardIdentity,
   };
-  write(entry);
+  // 기록기가 돌려준 «원장에 실제로 남은 줄»을 쓴다: 기본 기록기(appendRunStopEntryOnce)는 재시도가
+  // 기존 stop 줄과 겹칠 때 새 줄을 적립하지 않고 그 기존 줄을 돌려준다. 그때 반환값·listener 에도
+  // 그 원장 줄이 사실로 전달돼야 한다 — 원장에 없는 새 entry 가 새 사실처럼 흘러나가면 안 된다(JUD-B #119409).
+  // 주입 writer 의 반환값은 계약상 void 이므로 runId+stop 줄 형태일 때만 원장 줄로 삼는다.
+  const written: unknown = write(entry);
+  const settled = isWrittenRunStopLine(written, input.runId) ? written : entry;
   if (recordedThisProcess.size >= RECORDED_MAX) recordedThisProcess.clear();
   recordedThisProcess.add(input.runId);
   for (const listener of runStopListeners) {
-    try { listener(entry); } catch { /* wake consumers cannot change run outcome */ }
+    try { listener(settled); } catch { /* wake consumers cannot change run outcome */ }
   }
   try {
     debug.log('self-implement.run-stop', 'cause-classified', { runId: input.runId, terminalEvidence });
     debug.log('self-implement.run-stop', 'recorded', { runId: input.runId, site: input.site ?? null, ...record, requestedClass: input.class ?? null });
   } catch { /* observation is fail-soft */ }
-  return entry;
+  return settled;
 }
 
 /** 원장 항목이 stop 줄이면 그 레코드를 돌려준다(STOP-AUTOHEAL 소비용). */

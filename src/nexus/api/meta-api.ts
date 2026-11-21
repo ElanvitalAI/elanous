@@ -82,7 +82,9 @@ import { coerceHitlCallbackAnswer, type HitlPendingCallbacks } from './hitl-runt
 import { createPwaConfirmChannel, createPwaQuestionChannel } from './hitl-pwa-channel.js';
 import type { NexusEventBus } from './event-bus.js';
 import { jsonResponse } from './json-response.js';
+import { claimSessionForMember, findSessionMeta, isMemberSessionId, sessionOwnedByMember } from './webchat-session-owner.js';
 import { defaultChatEventBus } from './chat-event-bus.js';
+import { registerActiveChatTurn } from './chat-turn-lifecycle.js';
 import { resolveSessionProjectContext } from '../../project/session-context.js';
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -318,6 +320,40 @@ export function relayHostChatRouteAllowed(req: Request): boolean {
   const path = new URL(req.url).pathname;
   return (req.method === 'POST' && path === '/v1/prompt/stream')
     || (req.method === 'GET' && path === '/v1/chat/events');
+}
+
+/**
+ * WEBCHAT-SESSION-HISTORY-PERSIST — 회원 웹채팅이 자기 대화 목록·내용을 읽는 두 경로
+ * (GET /v1/sessions/store · GET /v1/sessions/store/:id). checkAuth 를 넓히지 않는다 —
+ * 이 경로의 회원 갈래는 sessions-store 가 회원 스코프(자기 소유 세션만)로 따로 연다.
+ */
+export function relayHostSessionReadRouteAllowed(req: Request): boolean {
+  if (req.method !== 'GET') return false;
+  const path = new URL(req.url).pathname;
+  return path === '/v1/sessions/store' || /^\/v1\/sessions\/store\/[^/]+$/.test(path);
+}
+
+/** Member-scoped management is confined to one stored conversation. */
+export function relayHostSessionWriteRouteAllowed(req: Request): boolean {
+  if (req.method !== 'PATCH' && req.method !== 'DELETE') return false;
+  return /^\/v1\/sessions\/store\/[^/]+$/.test(new URL(req.url).pathname);
+}
+
+/**
+ * WEBCHAT-SESSION-HISTORY-PERSIST — 릴레이 신뢰채널로 들어온 회원 웹채팅 요청의 memberId.
+ * decideAuth 의 두 회원 갈래와 같은 증명만 받는다: 릴레이 배선이 새긴 표시 ⊕
+ * (살아 있는 emt_ 회원 토큰 · 또는 wcs_ 파생 세션) ⊕ 핀 소유자 일치. 그 밖은 undefined.
+ */
+export function relayHostWebChatMember(req: Request, opts: MetaApiOpts): string | undefined {
+  const channel = relayHostChannelRequests.get(req);
+  if (!channel) return undefined;
+  const offered = req.headers.get('authorization');
+  if (offered?.startsWith('Bearer emt_')) {
+    const member = opts.relayHostChannelMember?.(req);
+    if (member && member.memberId === channel.memberId) return member.memberId;
+  }
+  if (channel.webChatMemberId && channel.webChatMemberId === channel.memberId) return channel.webChatMemberId;
+  return undefined;
 }
 
 function decideAuth(req: Request, opts: MetaApiOpts): { ok: boolean; reason: AuthReason } {
@@ -1072,9 +1108,22 @@ export async function handlePromptStreamPost(
     return badRequest('userText or userContent required');
   }
   const body = rawBody as DaemonPromptBody;
+  // JUD #39431 필수(경로 탈출) — 회원 요청의 sessionId 는 프로젝트·세션 조회 전에 생성 규칙으로 검증한다.
+  const webChatMember = relayHostWebChatMember(req, opts);
+  if (webChatMember !== undefined && body.sessionId !== undefined && !isMemberSessionId(body.sessionId)) {
+    return jsonResponse({ ok: false, error: 'invalid_session_id' }, 400);
+  }
   const projectContext = resolveSessionProjectContext(typeof body.sessionId === 'string' ? body.sessionId : undefined);
   const parsed = parseDaemonPromptBody(body, projectContext?.instructions ? [opts.systemPrompt, projectContext.instructions].filter(Boolean).join('\n\n') : opts.systemPrompt);
   if (!parsed.ok) return badRequest(parsed.reason);
+  // WEBCHAT-SESSION-HISTORY-PERSIST — 회원 웹채팅 턴은 자기 세션에서만 돈다. 새 세션은
+  // 이 회원 소유로 새기고, 남의 세션·소유자 없는 옛 세션은 이어 가지 않는다(문맥 유출 차단).
+  if (webChatMember !== undefined) {
+    const sid = parsed.value.sessionId;
+    if (typeof sid !== 'string' || !claimSessionForMember(sid, webChatMember)) {
+      return jsonResponse({ ok: false, error: 'session-not-owned' }, 403);
+    }
+  }
   // M6 PR 1 (PLAN-rich-dev-feedback-multi-surface · 2026-05-13) — opt-in
   // debug-tap. PWA `/chat?debug-tap=on` propagates the query down to
   // `/v1/prompt/stream`; the debug-bridge created below activates only
@@ -1115,6 +1164,7 @@ export async function handlePromptStreamPost(
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const write = (event: string, data: unknown): void => {
+        if (turnAbortController.signal.aborted) return;
         try {
           controller.enqueue(
             enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`),
@@ -1144,6 +1194,7 @@ export async function handlePromptStreamPost(
         try { controller.close(); } catch { /* already closed */ }
         return;
       }
+      const unregisterActiveTurn = registerActiveChatTurn(sessionId, turnAbortController);
       try {
         write('turn-begin', { sessionId });
         const result = await runDaemonPromptSubmit({
@@ -1404,6 +1455,7 @@ export async function handlePromptStreamPost(
           sessionId: result.sessionId,
           text: result.text,
           stopReason: result.stopReason,
+          ...(result.sourceUsage ? { sourceUsage: result.sourceUsage } : {}),
           ...(result.providerFinishReason ? { providerFinishReason: result.providerFinishReason } : {}),
           ...(provider ? { provider } : {}),
           ...(model ? { model } : {}),
@@ -1449,6 +1501,7 @@ export async function handlePromptStreamPost(
           });
         }
       } finally {
+        unregisterActiveTurn();
         releaseTurn(sessionId, key);
         try { controller.close(); } catch { /* already closed */ }
       }
@@ -1521,6 +1574,20 @@ export function handleChatEventsGet(
       400,
     );
   }
+  // WEBCHAT-SESSION-HISTORY-PERSIST (JUD #39431 필수 ①) — 회원은 소유가 확정된 자기 세션만 구독한다.
+  // 아직 없는 세션은 거부한다 — 열어 두면 나중에 그 id 로 생긴 남의 세션 이벤트가 이 구독으로 흐른다.
+  {
+    const member = relayHostWebChatMember(req, opts);
+    if (member !== undefined && !isMemberSessionId(sessionId)) {
+      return jsonResponse({ ok: false, error: 'invalid_session_id' }, 400);
+    }
+    if (member !== undefined) {
+      const meta = findSessionMeta(sessionId);
+      if (!sessionOwnedByMember(meta, member)) {
+        return jsonResponse({ ok: false, error: 'session-not-owned' }, 403);
+      }
+    }
+  }
   const bus = defaultChatEventBus();
   const enc = new TextEncoder();
   let unsubscribe: (() => void) | null = null;
@@ -1545,6 +1612,9 @@ export function handleChatEventsGet(
         } catch {
           // Controller closed — unsubscribe via cancel callback below.
         }
+      }, () => {
+        unsubscribe = null;
+        try { controller.close(); } catch { /* already closed */ }
       });
     },
     cancel(): void {

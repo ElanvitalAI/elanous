@@ -118,4 +118,4 @@ export async function runOpenCoreBoundaryCli(root = process.cwd()): Promise<Boun
   return report;
 }
 
-if (import.meta.main) await runOpenCoreBoundaryCli();
+if (import.meta.main) void runOpenCoreBoundaryCli();

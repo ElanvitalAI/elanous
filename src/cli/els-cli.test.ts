@@ -349,6 +349,9 @@ Commands:
   ls [options]                   List workspaces, tabs and panes as JSON: this
                                  host and the hosts in els/hosts.json (a host
                                  that does not answer is listed as down)
+  update-all                     Catch up this host to desiredSha, migrate local
+                                 ELS seat tabs at their turn boundary, and
+                                 print one result row per tab
   new [options] [command...]     Open a pane: the server spawns a PTY and
                                  records ws/tab/pane + cwd in the journal. No
                                  command → $SHELL, no --cwd → this folder, no
@@ -379,7 +382,7 @@ Commands:
                                  control door
   workspace                      Workspaces (herdr words): list · create · close
                                  · move
-  tab                            Tabs (herdr words): list · move
+  tab                            Tabs (herdr words): list · close · move
   attach <pane>                  Show one pane live in this terminal and type
                                  into it (ctrl+b q detaches; the pane keeps
                                  running)
@@ -520,7 +523,7 @@ Commands:
   lesson                                       교훈 · 재발 로컬 원장
   directives                                   대표 지시 로컬 색인·검색
   fleet                                        멀티 elanous 인스턴스 통합 뷰(READ-ONLY 연합) — 등록 인스턴스·보유 스토어 매트릭스. \`logs instances\` 일반화(kubectl get nodes 등가). 연합 조회는 \`session list --all-instances\` 등.
-  ops                                          운영 관측(READ-ONLY) — 미션·태스크·계약 루프·오케스트레이터 현재 상태·이상·전이. --json 프로그래매틱.
+  ops                                          운영 관측·수복 — 미션·태스크·계약 루프·오케스트레이터 상태와 카드 기반 heal. --json 프로그래매틱.
   catalog                                      서명된 LLM 모델 카탈로그 관리
   hosts                                        원격 호스트 설치본(installedSha) 원장
   app                                          Validate and build local app sources
@@ -602,3 +605,33 @@ test('els send submits a long bracketed paste through a real owned PTY and obser
   expect(sent.stdout).toContain('turn started');
   expect(readFileSync(captured, 'utf8')).toBe(`\x1b[200~${text}\x1b[201~\r`);
 }, 30000);
+
+test('tab close removes only the named tab and preserves its workspace', async () => {
+  const state = tempDir('els-tab-close-');
+  const server = await serve(state);
+  expect(server.output()).toContain('listening on');
+  for (const title of ['one', 'two']) {
+    const created = await side(state, state, ['new', '--ws', 'W', '--title', title, '--', 'sh']);
+    expect(created.exitCode, created.stderr).toBe(0);
+  }
+  const tabs = JSON.parse((await side(state, state, ['tab', 'list'])).stdout) as { result: { tabs: { tab_id: string; label: string }[] } };
+  expect(tabs.result.tabs.map(t => t.label)).toEqual(['one', 'two']);
+  const owner = await asOwner(state);
+  const unconfirmed = await side(state, state, ['tab', 'close', tabs.result.tabs[0]!.tab_id], owner);
+  expect(unconfirmed.exitCode).toBe(2);
+  expect(unconfirmed.stderr).toContain('confirmation unavailable');
+  const closed = await (async () => {
+    const previous = process.env.ELANOUS_ELS_OWNER_TOKEN;
+    try {
+      process.env.ELANOUS_ELS_OWNER_TOKEN = owner.ELANOUS_ELS_OWNER_TOKEN;
+      return await requestEls(elsSocketPath(state), { op: 'close-tab', tab: tabs.result.tabs[0]!.tab_id, confirmed: true });
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_ELS_OWNER_TOKEN;
+      else process.env.ELANOUS_ELS_OWNER_TOKEN = previous;
+    }
+  })();
+  expect(closed.exitCode, closed.message).toBe(0);
+  const remaining = JSON.parse((await side(state, state, ['tab', 'list'])).stdout) as { result: { tabs: { label: string }[] } };
+  expect(remaining.result.tabs.map(t => t.label)).toEqual(['two']);
+  expect((await side(state, state, ['tab', 'close', 'missing'], owner)).exitCode).toBe(2);
+}, 120_000);

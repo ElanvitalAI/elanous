@@ -25,9 +25,10 @@
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync,
   renameSync, unlinkSync, readdirSync, rmdirSync, statSync, copyFileSync,
+  lstatSync, realpathSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, isAbsolute, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { InputSourceKind } from '../input/input-source-kind.js';
 import { resolveInstanceName } from '../instance-identity.js';
@@ -251,6 +252,9 @@ export interface SessionMeta {
   retiredAt?: string | null;
   /** Per-session Next TUI presentation preferences. */
   uiState?: { sidetabOpen?: boolean; sidetabSectionOrder?: string[] };
+  /** WEBCHAT-SESSION-HISTORY-PERSIST — 이 세션을 연 웹채팅 회원 memberId. 회원 자격은
+   *  이 값이 자기 것인 세션만 보고 이어 간다. 없음 = 소유자 미기록(회원에게 안 보임). */
+  ownerMemberId?: string;
 }
 
 /** Runtime channel attachments. Each key is optional; presence means
@@ -682,6 +686,67 @@ export function adoptSession(id: string, opts: CreateSessionOpts = {}, root: str
   return meta;
 }
 
+/** WEBCHAT-SESSION-HISTORY-PERSIST (JUD #39431 필수 ②) — 회원 소유 새 세션을 «한 잠금 · 한 쓰기» 로 만든다.
+ *  색인을 잠금 안에서 다시 읽어 그 id 가 이미 있으면 아무것도 바꾸지 않고 그 메타를 돌려준다(남이 만든 세션 ·
+ *  빈 무소유 세션 포함 — 채택하지 않음). 색인에는 없는데 내용 있는 세션 파일이 있으면 만들지 않는다(null).
+ *  새로 만들면 생성 순간의 메타에 이미 `ownerMemberId` 가 있다. */
+function isSymlink(path: string): boolean {
+  try { return lstatSync(path).isSymbolicLink(); } catch { return false; }
+}
+
+export function createOwnedSession(
+  id: string,
+  ownerMemberId: string,
+  opts: CreateSessionOpts = {},
+  root: string = sessionRoot(),
+): { meta: SessionMeta; created: boolean } | null {
+  // JUD #39431 필수(경로 탈출) — 파일 이름 한 조각만 받고, 실경로 기준으로 세션 루트 바로 아래에 가둔다.
+  if (!id || id === '.' || id === '..' || /[\\/\0]/.test(id) || isAbsolute(id)) return null;
+  ensureRoots(root);
+  const realRoot = realpathSync(root);
+  const file = join(realRoot, `${id}.jsonl`);
+  if (dirname(resolve(file)) !== realRoot) return null;
+  const p = indexPath(root);
+  let created = false;
+  const meta = withDirLock(join(root, '.index.lock'), INDEX_LOCK_TIMEOUT_MS, (): SessionMeta | null => {
+    const idx = readIndex(root);
+    const existing = idx.find((m) => m.id === id);
+    if (existing) return existing;
+    if (existsSync(file) || isSymlink(file)) {
+      // 심볼릭 링크(깨진 것 포함) · 색인 밖 내용 있는 파일은 채택하지 않는다.
+      if (isSymlink(file) || statSync(file).size > 0) return null;
+    }
+    const now = new Date().toISOString();
+    const source: SessionSource = opts.source ?? 'cli';
+    const origin = resolveCreateSessionOrigin(opts.origin);
+    const fresh: SessionMeta = {
+      id,
+      createdAt: now,
+      updatedAt: now,
+      title: opts.title ?? '(new session)',
+      provider: opts.provider ?? 'auto',
+      model: opts.model ?? '',
+      messageCount: 0,
+      source,
+      sourceSource: opts.source === undefined ? 'default' : 'declared',
+      sourceKind: opts.sourceKind ?? defaultSessionSourceKind(source),
+      ...(origin ? { origin } : {}),
+      originInstance: resolveInstanceName(),
+      ownerMemberId,
+    };
+    if (!existsSync(file)) writeFileSync(file, '', { encoding: 'utf-8', flag: 'wx' });
+    idx.unshift(fresh);
+    const tmp = `${p}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+    writeFileSync(tmp, JSON.stringify(idx, null, 2) + '\n', 'utf-8');
+    renameSync(tmp, p);
+    created = true;
+    return fresh;
+  });
+  if (!meta) return null;
+  if (created) fireSessionCreated(meta);
+  return { meta, created };
+}
+
 export function forkSessionFromHistory(
   opts: ForkSessionOpts,
   root: string = sessionRoot(),
@@ -1002,6 +1067,44 @@ export function deleteSession(id: string, root: string = sessionRoot()): boolean
   // Clear active marker if it pointed at the deleted session.
   if (getActiveSessionId() === id) clearActiveSessionId();
   return true;
+}
+
+/** Remove a member conversation only after checking its owner under the index lock. */
+export function deleteOwnedSession(
+  id: string,
+  ownerMemberId: string,
+  root: string = sessionRoot(),
+  beforeDelete?: () => void,
+  afterDelete?: () => void,
+): boolean {
+  if (!id || id === '.' || id === '..' || /[\\/\0]/.test(id) || isAbsolute(id) || !ownerMemberId) return false;
+  ensureRoots(root);
+  const realRoot = realpathSync(root);
+  const file = join(realRoot, `${id}.jsonl`);
+  if (dirname(resolve(file)) !== realRoot || isSymlink(file)) return false;
+  const index = indexPath(root);
+  return withDirLock(join(root, '.index.lock'), INDEX_LOCK_TIMEOUT_MS, () => {
+    const rows = readIndex(root);
+    const pos = rows.findIndex((row) => row.id === id);
+    if (pos < 0 || rows[pos]?.ownerMemberId !== ownerMemberId) return false;
+    beforeDelete?.();
+    const heldFile = existsSync(file) ? `${file}.${process.pid}.${randomUUID().slice(0, 8)}.deleting` : null;
+    if (heldFile) renameSync(file, heldFile);
+    const temp = `${index}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+    try {
+      rows.splice(pos, 1);
+      writeFileSync(temp, JSON.stringify(rows, null, 2) + '\n', 'utf-8');
+      renameSync(temp, index);
+    } catch (error) {
+      try { unlinkSync(temp); } catch { /* no temp after rename */ }
+      if (heldFile) renameSync(heldFile, file);
+      throw error;
+    }
+    if (heldFile) unlinkSync(heldFile);
+    if (getActiveSessionId() === id) clearActiveSessionId();
+    afterDelete?.();
+    return true;
+  });
 }
 
 /** Bulk delete — unlink each file then rewrite the index ONCE. Calling

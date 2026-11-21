@@ -16,6 +16,7 @@ import { clean, type QueueAudit } from './core.js';
 import { classifyShellArgv, simpleArgv, type AllowShape } from '../security/shell-argv-policy.js';
 import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { sameUidSeatBoundary } from './seat-boundary.js';
 
 export const CONTROL_ACTIONS = ['read', 'do', 'input', 'new', 'status', 'list', 'rename', 'move', 'close'] as const;
 
@@ -47,6 +48,10 @@ export interface ControlTarget {
   readonly pane: string;
   /** Only a shell pane is danger-classified. An agent pane is typed text, not a shell command. */
   readonly shell: boolean;
+  /** SAME-UID-SEAT-ISOLATION: seat that owns this pane, when the transport knows it. Unknown = legacy behavior. */
+  readonly ownerSeat?: string;
+  /** SAME-UID-SEAT-ISOLATION: other seats the owner explicitly shared this pane with. */
+  readonly sharedWith?: readonly string[];
 }
 
 export type HitlAnswer = 'approve' | 'deny' | 'timeout';
@@ -122,6 +127,8 @@ export interface ControlDeps {
   readonly execute: ControlExecute;
   /** Required whenever a shell `do` can be dangerous. Absent = danger cannot be approved. */
   readonly hitl?: HitlAsk;
+  /** Server-selected tool do routed through input retains the stricter shell do classifier. */
+  readonly inputUsesDoPolicy?: boolean;
   /** Resolves names in the allow list to ids, pining them back to the file (REVIEW-1 must ③). Absent = ids already. */
   readonly resolve?: IdResolver;
   readonly now?: () => number;
@@ -135,6 +142,11 @@ export interface ControlDeps {
 export type ControlOutcome =
   | { readonly ok: true; readonly exitCode: 0 | 1 | 2; readonly message: string; readonly queued?: number; readonly danger: 'safe' | 'approved' }
   | { readonly ok: false; readonly code: 'denied' | 'held' | 'rejected' | 'timeout' | 'audit-failed' | 'executor-error'; readonly message: string; readonly reason: string };
+
+export type SocketAudit = { readonly peerPid: number | undefined; readonly claimedPid?: number };
+const socketAuditFields = (socket: SocketAudit | undefined) => socket ? {
+  peerPid: socket.peerPid ?? 'unknown', ...(socket.claimedPid !== undefined ? { claimedPid: socket.claimedPid } : {}),
+} : {};
 
 const AUDIT_NAME = 'control-audit.jsonl';
 const ALLOW_NAME = 'control-allow.json';
@@ -206,7 +218,7 @@ export function pinAllowList(stateDir: string, resolve?: IdResolver, seams?: { r
     const named = row as { workspace?: string; pane?: string };
     return rule.workspace === named.workspace && rule.pane === named.pane
       ? row
-      : { principal: rule.principal, workspace: rule.workspace, pane: rule.pane, actions: rule.actions, ...(rule.seat ? { seat: rule.seat } : {}), ...(rule.effect ? { effect: rule.effect } : {}) };
+      : { principal: rule.principal, workspace: rule.workspace, pane: rule.pane, actions: rule.actions, ...(rule.tab !== undefined ? { tab: rule.tab } : {}), ...(rule.seat ? { seat: rule.seat } : {}), ...(rule.effect ? { effect: rule.effect } : {}) };
   });
   if (resolve && pinned.some((row, index) => row !== rows[index])) {
     const stash = `${file}.pin.${process.pid}.${Date.now()}`;  // a stash no concurrent pin overwrites
@@ -226,6 +238,13 @@ export function pinAllowList(stateDir: string, resolve?: IdResolver, seams?: { r
 
 function matches(pattern: string, value: string): boolean {
   return pattern === '*' || pattern === value;
+}
+export function inputExplicitlyDenied(rules: readonly AllowRule[], principal: Principal, target: ControlTarget): boolean {
+  return rules.some((rule) => rule.effect === 'deny'
+    && matches(rule.principal, principal.id) && matches(rule.workspace, target.workspace)
+    && matches(rule.pane, target.pane) && rule.actions.includes('input')
+    && (rule.tab === undefined || matches(rule.tab, target.tab ?? ''))
+    && (rule.seat === undefined || rule.seat === principal.callerSeat));
 }
 
 /** Default deny. A rule must name this principal (or `*`), this workspace id, this pane id, and this action. */
@@ -403,11 +422,12 @@ export function appendSendAudit(stateDir: string, send: {
   readonly text: string;
   readonly exitCode: 0 | 1 | 2;
   readonly workspace?: string;
+  readonly socketAudit?: SocketAudit;
 }): string | undefined {
   try {
     defaultAppend(join(stateDir, AUDIT_NAME), `${JSON.stringify({
       ts: new Date().toISOString(),
-      principal: 'local', kind: 'cli',
+      principal: 'local', kind: 'cli', ...socketAuditFields(send.socketAudit),
       ...(send.workspace ? { workspace: send.workspace } : {}),
       pane: send.pane, action: send.op, chars: send.text.length, sha256: sha256(send.text), at: Date.now(),
       result: send.exitCode === 0 ? 'executed' : 'executor-refused', exitCode: send.exitCode,
@@ -438,18 +458,19 @@ export function createControl(deps: ControlDeps) {
     }
   };
   return {
-    async run(input: { readonly principal: Principal; readonly from?: string; readonly action: ControlAction; readonly target: ControlTarget; readonly text?: string; readonly struct?: StructPayload; readonly confirm?: boolean; readonly path?: string }): Promise<ControlOutcome> {
+    async run(input: { readonly principal: Principal; readonly from?: string; readonly action: ControlAction; readonly target: ControlTarget; readonly text?: string; readonly struct?: StructPayload; readonly confirm?: boolean; readonly path?: string; readonly fixedKey?: 'escape'; readonly socketAudit?: SocketAudit }): Promise<ControlOutcome> {
       const text = input.text ?? '';
-      // Input is delivered as a sanitized line; audit that line consistently throughout its lifecycle.
-      const auditedText = input.action === 'input' ? clean(text) : text;
+      // The server-selected interrupt is a raw Escape, whereas normal input is a sanitized line.
+      const auditedText = input.fixedKey === 'escape' ? '\x1b' : input.action === 'input' ? clean(text) : text;
       const from = input.from ?? input.principal.id;
       // ELS-DOOR-STRUCT-OPS: close destroys work. It must carry a human confirmation marker; nothing else closes.
       if (input.action === 'close' && input.confirm !== true) {
         const reason = 'close needs confirm:true (human confirmation)';
-        audit({ principal: input.principal.id, kind: input.principal.kind, workspace: input.target.workspace, tab: input.target.tab, pane: input.target.pane, action: input.action, result: 'denied', danger: 'n/a', reason, chars: 0, sha256: sha256(''), at: now() });
+        audit({ ...socketAuditFields(input.socketAudit), principal: input.principal.id, kind: input.principal.kind, workspace: input.target.workspace, tab: input.target.tab, pane: input.target.pane, action: input.action, result: 'denied', danger: 'n/a', reason, chars: 0, sha256: sha256(''), at: now() });
         return { ok: false, code: 'denied', reason, message: `els close: denied for ${input.principal.id} (${reason})` };
       }
       const base = {
+        ...socketAuditFields(input.socketAudit),
         ...(input.action === 'input' ? { requestId: randomUUID() } : {}),
         principal: input.principal.id, kind: input.principal.kind, callerPane: input.principal.callerPane, seat: input.principal.callerSeat, fromChars: from.length, fromSha256: sha256(from),
         workspace: input.target.workspace, pane: input.target.pane, action: input.action,
@@ -470,12 +491,15 @@ export function createControl(deps: ControlDeps) {
       }
       // OP #17: a shell-pane `input` line is danger-gated FIRST (fail closed — a dangerous line is held before
       // any allow question, same gate as `do`); the builtin seat default then decides the rest.
-      const inputDanger = input.action === 'input' && input.target.shell ? classifyInputLine(text) : undefined;
+      const inputDanger = input.action === 'input' && input.target.shell
+        ? deps.inputUsesDoPolicy ? classifyShell(clean(text)) : classifyInputLine(text)
+        : undefined;
       if (inputDanger?.dangerous) {
         if (!deps.hitl) {
           const reason = `${inputDanger.reason}; no person to ask`;
           audit({ ...base, result: 'held', danger: inputDanger.reason, reason });
-          return { ok: false, code: 'held', reason, message: `els input: held, not sent (${inputDanger.reason}; nobody to approve)` };
+          const guidance = deps.inputUsesDoPolicy ? '; agent prose is not supported; use eln msg for seat instructions' : '';
+          return { ok: false, code: 'held', reason, message: `els input: held, not sent (${inputDanger.reason}; nobody to approve${guidance})` };
         }
         const answer = await deps.hitl({ principal: input.principal, from, action: input.action, target: input.target, text, reason: inputDanger.reason });
         if (answer !== 'approve') {
@@ -490,10 +514,7 @@ export function createControl(deps: ControlDeps) {
       const inputDefault = input.action === 'input' && principal.kind === 'cli'
         && /^local:\d+$/.test(principal.id) && !!principal.callerPane
         && INPUT_SEATS.includes(principal.callerSeat ?? '');
-      const inputDenied = input.action === 'input' && rules.some((rule) => rule.effect === 'deny'
-        && matches(rule.principal, principal.id) && matches(rule.workspace, input.target.workspace)
-        && matches(rule.pane, input.target.pane) && rule.actions.includes('input')
-        && (rule.seat === undefined || rule.seat === principal.callerSeat));
+      const inputDenied = input.action === 'input' && inputExplicitlyDenied(rules, principal, input.target);
       const permitted = input.action === 'input' ? inputDefault && !inputDenied
         : authorize(rules, principal, input.target, input.action);
       // ELS-OP-ALLOW-RULE: coded defaults fill the gap when control-allow.json is silent (input keeps its builtin rule).
@@ -504,6 +525,15 @@ export function createControl(deps: ControlDeps) {
         const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason });
         if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
         return { ok: false, code: 'denied', reason, message: `els ${input.action}: denied for ${input.principal.id} (${reason})` };
+      }
+      // SAME-UID-SEAT-ISOLATION: seats share one UID; a seat may not type into another seat's pane unless shared.
+      if (input.action === 'do' || input.action === 'input') {
+        const boundary = sameUidSeatBoundary(principal.callerSeat ?? principal.seat, input.target);
+        if (!boundary.allow) {
+          const auditFailure = audit({ ...base, result: 'denied', danger: 'n/a', reason: boundary.reason });
+          if (auditFailure) return { ok: false, code: 'audit-failed', reason: auditFailure, message: `els ${input.action}: denied; audit not written` };
+          return { ok: false, code: 'denied', reason: boundary.reason, message: `els ${input.action}: denied for ${input.principal.id} (${boundary.reason})` };
+        }
       }
       const refused = deps.guard ? deps.guard(input) : undefined;
       if (refused !== undefined) {

@@ -1,10 +1,16 @@
-import { expect, spyOn, test } from 'bun:test';
+import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
 import { judgeGoalTurn } from './goals/judge.js';
 import { analyzeDiff } from './grok.js';
 import * as llm from './llm.js';
 import { PROVIDERS, streamLLM, type LLMProvider } from './llm.js';
 import { setUserConfigOverlay } from './user-config.js';
+
+// Tests here inject fixture providers; a global ELANOUS_TEST_FAKE_LLM=1 (gate pods) is a forced-fake fence that outranks
+// them by design. The one test that pins that fence sets the switch itself, so lift it for the file and restore it.
+let priorTestFakeLlm: string | undefined;
+beforeAll(() => { priorTestFakeLlm = process.env.ELANOUS_TEST_FAKE_LLM; delete process.env.ELANOUS_TEST_FAKE_LLM; });
+afterAll(() => { if (priorTestFakeLlm === undefined) delete process.env.ELANOUS_TEST_FAKE_LLM; else process.env.ELANOUS_TEST_FAKE_LLM = priorTestFakeLlm; });
 
 function bypassProvider(name: string, model: string, text: string, usage: { inputTokens: number; outputTokens: number }): LLMProvider {
   return {

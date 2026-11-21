@@ -1,3 +1,5 @@
+import { CONATUS_PACK_LABEL } from '../research/conatus-pack-evidence.js';
+
 /** Shared guardrails for every core-turn research surface. */
 export const RESEARCH_TURN_MAX_TOOL_TURNS = 20;
 export const RESEARCH_TURN_FIRST_REPLY_BUDGET_MS = 15_000;
@@ -194,19 +196,43 @@ export function marketDataToolNames(tools: readonly { name: string }[]): string[
   return tools.filter((tool) => MARKET_DATA_TOOL_NAMES.has(tool.name)).map((tool) => tool.name);
 }
 
+/**
+ * g5 CONATUS-PACK: the read-only installed knowledge-pack lookup (src/boot/installed-pack-query.ts) a research turn may
+ * call. Before this the research allowlist dropped KnowledgeQuery, so webchat research could never consult an installed
+ * pack (e.g. the conatus-solution Korea↔US sector map). The surface still decides presence; the tool searches installed
+ * or bundled packs only (no vault), and an uninstalled pack returns an explicit `pack-not-installed` reason.
+ */
+export const RESEARCH_KNOWLEDGE_TOOLS = ['KnowledgeQuery'] as const;
+const KNOWLEDGE_TOOL_NAMES: ReadonlySet<string> = new Set(RESEARCH_KNOWLEDGE_TOOLS);
+
+/** The installed Conatus solution pack (Korea↔US sector map · capstone backtest rules); the prepass step reads it (g6). */
+export { CONATUS_SOLUTION_PACK_ID } from '../research/conatus-pack-evidence.js';
+
+/** Tools a research turn keeps from the surface pool even when the catalog tier deferred them (ToolSearch is not allowed). */
+export function isResearchCapabilityTool(name: string): boolean {
+  return MARKET_DATA_TOOL_NAMES.has(name) || KNOWLEDGE_TOOL_NAMES.has(name);
+}
+
 /** The finance-first instruction, or undefined when the pool has no market-data tool (nothing to prefer; no claim made).
- * The model judges «is this an investment/market question» by meaning; the tools only exist where the surface allows. */
+ * The model judges «is this an investment/market question» by meaning; the tools only exist where the surface allows.
+ * g6: the conatus-solution sector map arrives as a bounded prepass evidence section («연구 근거(코나투스)»), not as a tool
+ * the model must remember to call — g5's «call KnowledgeQuery first» line was measured at 0 calls. */
+
 export function buildMarketDataInstruction(toolNames: readonly string[]): string | undefined {
   if (toolNames.length === 0) return undefined;
   return [
     `투자·시장 질문(시세·지수·재무·수급·환율)에는 웹 검색보다 시장데이터 도구(${toolNames.join(', ')})를 먼저 호출한다.`,
+    `근거에 «${CONATUS_PACK_LABEL}» 절이 있으면 그 섹터 지도(한국 섹터 ↔ 미국 ETF·핵심 종목)를 «${CONATUS_PACK_LABEL}:»로 시작하는 별도 문장으로 인용하고, 시세·수급 수치와 섞지 않는다. 그 짝 미국 티커의 수치는 시장데이터 절에 있을 때만 인용한다.`,
+    '팩은 연관 섹터와 과거 연구의 근거일 뿐 지금 수치의 출처가 아니다. 팩 백테스트 수치를 인용하면 가정(ρ·기간·종목)과 ρ=0 하한을 같이 적고 «과거 연구 결과(가정 포함)»로만 말하며, 매수·매도 권유로 쓰지 않는다. 그 절이 없으면 팩 내용을 지어내지 않는다.',
+    '근거에 «Social sentiment (X · Reddit)» 절의 게시물이 있으면 X·레딧 여론을 그 게시물 링크와 함께 요약한다. 결과가 없다고 적힌 플랫폼만 «검색 결과 없음»으로 말한다.',
+
     '시세·수급·재무 수치는 그 도구 결과에서만 인용하고, 수치마다 출처 도구/데이터 소스 이름을 붙인다.',
     '웹 검색은 맥락·뉴스 보완용이며 수치의 근거로 쓰지 않는다.',
     '도구가 실패하거나 결과가 없으면 «조회 불가»라고 말하고, 수치를 추정하거나 지어내지 않는다.',
   ].join('\n');
 }
 
-const RESEARCH_TOOL_NAMES: ReadonlySet<string> = new Set([...RESEARCH_TOOL_ALLOWLIST, ...RESEARCH_MARKET_DATA_TOOLS]);
+const RESEARCH_TOOL_NAMES: ReadonlySet<string> = new Set([...RESEARCH_TOOL_ALLOWLIST, ...RESEARCH_MARKET_DATA_TOOLS, ...RESEARCH_KNOWLEDGE_TOOLS]);
 export const RESEARCH_DOCUMENT_WRITE_TOOLS = ['Edit', 'Write'] as const;
 
 /** A research turn may write only when the user explicitly asks for a document at a concrete path. */

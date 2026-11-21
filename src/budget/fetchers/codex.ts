@@ -121,11 +121,16 @@ export function createCodexFetcher(opts: CodexFetcherOpts = {}): ProviderFetcher
       //   headless 하니스 런에서는 «영영 비어» 있다(1R 이 냄새를 맡은 자리).
       // ⛔⭐⭐ 그리고 «어느 홈을 잰 것인가»를 같이 넘긴다 — 계정이 여럿이 된 뒤로
       //   신호 하나에 뭉개면 A 의 「찼다」를 B 의 것으로 읽는다.
-      const usedPercent = snapshot.windows
+      const limitingWindow = snapshot.windows
         .filter((window) => window.model === undefined)
-        .reduce<number | undefined>((max, window) => max === undefined || window.used > max ? window.used : max, undefined);
+        .sort((a, b) => b.used - a.used
+          || (a.resetsAt > 0 ? a.resetsAt : Number.POSITIVE_INFINITY)
+            - (b.resetsAt > 0 ? b.resetsAt : Number.POSITIVE_INFINITY))[0];
+      const usedPercent = limitingWindow?.used;
+      const resetsAtMs = limitingWindow && limitingWindow.resetsAt > Date.now() ? limitingWindow.resetsAt : undefined;
       writeQuotaSignal(snapshot.rateLimitReached, usedPercent, opts.codexHome, opts.quotaSignalStorage,
-        snapshot.credits ? { balance: snapshot.credits.balance, hasCredits: snapshot.credits.hasCredits } : undefined);
+        snapshot.credits ? { balance: snapshot.credits.balance, hasCredits: snapshot.credits.hasCredits } : undefined,
+        { resetsAtMs });
       return snapshot;
     },
   };

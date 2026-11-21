@@ -143,7 +143,9 @@ describe('dispatchWithParallelSafety', () => {
     expect(order).toEqual(['start:a', 'end:a', 'start:b', 'end:b']);
   });
 
-  test('mixed batch: safe group parallel, unsafe sequential after', async () => {
+  // HOLD #122147(2026-11-21) — 혼합 배치 실행 순서 보장: 안전하지 않은 호출이
+  // 하나라도 섞이면 «safe 병렬 먼저» 가 아니라 묶음 전부가 원본 순서 직렬로 돈다.
+  test('mixed batch: whole batch sequential in original order (HOLD #122147)', async () => {
     pushFake({ id: 'mx_read', aliases: ['MxRead'], displayName: 'MxRead', supportsParallel: true });
     pushFake({ id: 'mx_write', aliases: ['MxWrite'], displayName: 'MxWrite', supportsParallel: false });
 
@@ -160,18 +162,16 @@ describe('dispatchWithParallelSafety', () => {
       order.push(`end:${call.id}`);
     };
     const summary = await dispatchWithParallelSafety(calls, dispatchOne);
-    expect(summary.parallelActivated).toBe(true);
+    expect(summary.parallelActivated).toBe(false);
     expect(summary.safeCount).toBe(2);
     expect(summary.unsafeCount).toBe(2);
-    // First 4 events = reads start (parallel kickoff) + reads end;
-    // then writes sequential in original order.
-    expect(order.slice(0, 2)).toEqual(expect.arrayContaining(['start:r1', 'start:r2']));
-    // Writes run strictly after reads and in original order.
-    const w1Idx = order.indexOf('start:w1');
-    const w2Idx = order.indexOf('start:w2');
-    expect(w1Idx).toBeGreaterThan(-1);
-    expect(w2Idx).toBeGreaterThan(w1Idx);
-    expect(order.indexOf('end:w1')).toBeLessThan(w2Idx);
+    // 원본 순서 그대로 — 앞선 쓰기를 뒤의 읽기가 앞지르지 않는다.
+    expect(order).toEqual([
+      'start:r1', 'end:r1',
+      'start:w1', 'end:w1',
+      'start:r2', 'end:r2',
+      'start:w2', 'end:w2',
+    ]);
   });
 
   test('one failing safe call does not cancel siblings', async () => {
@@ -249,7 +249,8 @@ describe('dispatchWithParallelSafety', () => {
     expect(summary.skippedIndices).toEqual([1, 2]);
   });
 
-  test('mixed batch: abort during the safe group skips every unsafe call', async () => {
+  // HOLD #122147 — 혼합 배치는 직렬로만 돌므로 중단 시 남은 호출 전부가 스킵된다.
+  test('mixed batch: abort mid-batch skips every remaining call (HOLD #122147)', async () => {
     pushFake({ id: 'ab_read', aliases: ['AbRead'], displayName: 'AbRead', supportsParallel: true });
     pushFake({ id: 'ab_write2', aliases: ['AbWrite2'], displayName: 'AbWrite2', supportsParallel: false });
     const calls = [
@@ -264,9 +265,11 @@ describe('dispatchWithParallelSafety', () => {
       called.push(call.id);
       if (call.id === 'r1') controller.abort();
     }, controller.signal);
-    expect(summary.parallelActivated).toBe(true);
-    expect(called.sort()).toEqual(['r1', 'r2']);
-    expect(summary.skippedIndices).toEqual([1, 3]);
+    expect(summary.parallelActivated).toBe(false);
+    // 이미 시작한 호출은 마쳤고, 남은 3칸(호출 2~4)은 새로 시작하지 않는다.
+    // 출처: HOLD #122147 혼합 배치 실행 순서 보장 — 중단 후 잔여 인덱스 스킵 단언.
+    expect(called).toEqual(['r1']);
+    expect(summary.skippedIndices).toEqual([1, 2, 3]);
   });
 
   test('already-aborted signal dispatches nothing; caller can fill every slot (tool_call/tool_result pairing)', async () => {

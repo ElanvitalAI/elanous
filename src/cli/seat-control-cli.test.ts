@@ -20,6 +20,21 @@ test('unknown sender, unauthorized caller, invalid mode and ambiguous targets ne
   expect(calls).toBe(0);
 });
 
+test('a pinned migration rejects each changed ledger identity before seat-stop', async () => {
+  const expected = { id: 'tui:10', ownerPid: 10, sessionId: 'session-a', workdir: '/seats/TC' };
+  let calls = 0;
+  for (const changed of [
+    { id: 'tui:20' }, { ownerPid: 20 }, { sessionId: 'session-b' }, { workdir: '/other' },
+  ]) {
+    const result = await runSeatControl('TC', 'migrate', {
+      sender: () => 'OP', rows: () => [{ ...expected, ...changed, kind: 'tui', alive: true, seat: 'TC' }],
+      send: async () => { calls++; return { status: 'success' as const }; },
+    }, expected);
+    expect(result).toEqual({ status: 'denied', reason: 'target-changed' });
+  }
+  expect(calls).toBe(0);
+});
+
 test('a live TUI whose build predates seat control (no seat on its row) is named, not «not running» — and nothing is sent (RES #100614)', async () => {
   let calls = 0;
   const send = async () => { calls++; return { status: 'success' as const }; };

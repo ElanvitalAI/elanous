@@ -569,7 +569,7 @@ async function prebuildFromArgs(args: string[], progress: PrebuildProgress): Pro
   } finally { rmSync(sourceRoot, { recursive: true, force: true }); }
 }
 
-if (import.meta.main && process.argv.includes('--prebuild')) {
+async function runPrebuildCli(): Promise<void> {
   const progress: PrebuildProgress = { current: 'clone', stages: [] };
   try { console.log(JSON.stringify({ ...await prebuildFromArgs(process.argv.slice(2), progress), receipt: progress.stages })); }
   catch (error) {
@@ -581,3 +581,5 @@ if (import.meta.main && process.argv.includes('--prebuild')) {
     process.exitCode = 1;
   }
 }
+
+if (import.meta.main && process.argv.includes('--prebuild')) void runPrebuildCli();

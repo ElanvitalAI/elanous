@@ -4,7 +4,7 @@
 // list, and per conversation «정보» (the full id, copyable) and «삭제». Projects were removed from the chat screen
 // (backup: tag archive/pwa-pre-minimal-20261117).
 import { useEffect, useRef, useState } from 'react';
-import { Check, Copy, MoreHorizontal, Plus, Search, Trash2 } from 'lucide-react';
+import { Check, Copy, MoreHorizontal, Pencil, Plus, Search, Trash2 } from 'lucide-react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { forkSession } from '@/lib/daemon-session';
 import { useSessions } from '@/lib/use-sessions';
@@ -39,6 +39,9 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
   const [deleting, setDeleting] = useState<SessionSummary | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [draftTitle, setDraftTitle] = useState('');
+  const [renameError, setRenameError] = useState<string | null>(null);
   // #38183 REVIEW-1: a delete that finds the conversation already gone (another device removed it) is said as such —
   // not as an error and not as a silent success.
   const [notice, setNotice] = useState<string | null>(null);
@@ -97,6 +100,22 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
 
   const copyId = async (id: string) => {
     try { await navigator.clipboard.writeText(id); setCopied(id); setTimeout(() => setCopied(null), 1200); } catch { /* the id stays selectable */ }
+  };
+
+  const saveTitle = async (id: string) => {
+    const title = draftTitle.trim();
+    if (!title) { setRenameError('이름을 입력해 주세요'); return; }
+    setBusy(true);
+    setRenameError(null);
+    try {
+      await new SessionsStoreApi(daemon.client).rename(id, title);
+      setTitles((current) => ({ ...current, [id]: title }));
+      setRenaming(null);
+      setMenuFor(null);
+      void getSessionsService(daemon.client).forceRefresh();
+    } catch (error) {
+      setRenameError(error instanceof Error ? error.message : String(error));
+    } finally { setBusy(false); }
   };
 
   const confirmDelete = async () => {
@@ -163,6 +182,23 @@ export function ChatConversationList({ onSelect }: { onSelect?: () => void }) {
                         </button>
                       </div>
                     </div>
+                    {renaming === s.id ? (
+                      <div className="space-y-1">
+                        <input aria-label="대화 이름" value={draftTitle} maxLength={120}
+                          onChange={(event) => setDraftTitle(event.target.value)}
+                          onKeyDown={(event) => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) void saveTitle(s.id); }}
+                          className="w-full rounded border border-border bg-background px-2 py-1" />
+                        {renameError && <p role="alert" className="text-rose-600">{renameError}</p>}
+                        <div className="flex gap-2">
+                          <button type="button" disabled={busy} onClick={() => void saveTitle(s.id)}>저장</button>
+                          <button type="button" onClick={() => { setRenaming(null); setRenameError(null); }}>취소</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button type="button" role="menuitem" onClick={() => { setRenaming(s.id); setDraftTitle(conversationTitle(s, titles[s.id])); setRenameError(null); }} className="flex w-full items-center gap-2 rounded px-1 py-1 text-left hover:bg-secondary">
+                        <Pencil className="h-3.5 w-3.5" aria-hidden="true" /> 이름 변경
+                      </button>
+                    )}
                     <button type="button" role="menuitem" onClick={() => { setDeleteError(null); setMenuFor(null); setDeleting(s); }} className="flex w-full items-center gap-2 rounded px-1 py-1 text-left text-rose-600 hover:bg-secondary">
                       <Trash2 className="h-3.5 w-3.5" aria-hidden="true" /> 삭제
                     </button>

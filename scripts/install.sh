@@ -475,7 +475,9 @@ download_latest_asset() {
   return 1
 }
 
+INSTALL_CHANNEL=dev
 if [ -z "$SOURCE" ] && [ "$IS_CHECKOUT" -eq 0 ]; then
+  INSTALL_CHANNEL=official
   RELEASE_BASE="${ELANOUS_RELEASE_BASE:-https://github.com/ElanvitalAI/elanous/releases}"
   if [ -n "${ELANOUS_VERSION:-}" ]; then
     RELEASE_DIR="${RELEASE_BASE%/}/download/v${ELANOUS_VERSION}/"
@@ -711,8 +713,16 @@ INSTALLED_PACKAGE="$PREFIX/current/node_modules/elanous/package.json"
 VERSION="$(bun -e 'const p=JSON.parse(await Bun.file(process.argv.at(-1)).text()); process.stdout.write(p.version)' "$INSTALLED_PACKAGE")"
 [ -n "$VERSION" ] || { echo "⛔ package version missing: $INSTALLED_PACKAGE" >&2; exit 1; }
 INSTALLED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-bun -e 'const [version,versionDir,source,installedAt,commit]=process.argv.slice(-5); console.log(JSON.stringify({version,versionDir,source,installedAt,...(commit ? {commit} : {})}))' \
-  "$VERSION" "versions/$VERSION_NAME" "$METADATA_SOURCE" "$INSTALLED_AT" "${METADATA_COMMIT:-}" > "$PREFIX/install.json"
+bun -e '
+  const [version,versionDir,source,installedAt,checkoutCommit,installChannel,packagePath]=process.argv.slice(-7);
+  let packed = {};
+  try { packed = await Bun.file(packagePath).json() ?? {}; } catch {}
+  const commit = checkoutCommit || (/^[0-9a-f]{40}$/.test(packed.commit ?? "") ? packed.commit : "");
+  const channel = installChannel === "official" && /^\d+\.\d+\.\d+$/.test(version) ? "official" : "dev";
+  const builtAt = Number.isSafeInteger(packed.builtAt) && packed.builtAt > 0 && (!checkoutCommit || checkoutCommit === packed.commit) ? packed.builtAt : undefined;
+  console.log(JSON.stringify({version,versionDir,source,installedAt,channel,builtAt,...(commit ? {commit} : {})}));
+' "$VERSION" "versions/$VERSION_NAME" "$METADATA_SOURCE" "$INSTALLED_AT" "${METADATA_COMMIT:-}" "$INSTALL_CHANNEL" \
+  "$PREFIX/current/node_modules/elanous/src/version/packed-revision.json" > "$PREFIX/install.json"
 # 판 폴더에도 같은 것을 둔다 — `elanous --version` 은 «자기 판»의 것을 읽는다(롤백한 판이 마지막 설치의 커밋을 말하지 않게).
 cp "$PREFIX/install.json" "$VERSION_DIR/install.json"
 

@@ -4,7 +4,7 @@
 // import from './shell-primitive'. Tests reach into the sub-modules
 // directly for the cache reset seam.
 
-export { runShell, setShellApprover } from './runtime.js';
+export { runShell, gateShellCommand, setShellApprover } from './runtime.js';
 export { commandKey } from './approval-cache.js';
 export {
   recordAudit, setAuditLogRootForTesting, setAuditSinkForTesting,

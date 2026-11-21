@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 /** A158: exercise the installed package, never a checkout or the operator's Nexus. */
+import { parseInstalledVersionLine } from '../../src/version/installed-version-line.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
@@ -26,7 +27,7 @@ export function isNexusFirstRunPass(value: unknown): value is NexusFirstRunRecei
   if (!value || typeof value !== 'object') return false;
   const receipt = value as Partial<NexusFirstRunReceipt>;
   return receipt.ok === true && !receipt.error && typeof receipt.versionLine === 'string'
-    && /^\S+ [a-f0-9]{40}$/i.test(receipt.versionLine) && receipt.health === 200 && receipt.healthOk === true
+    && parseInstalledVersionLine(receipt.versionLine) !== null && receipt.health === 200 && receipt.healthOk === true
     && receipt.app === 200 && receipt.testUniverse === true && receipt.ownPidStopped === true
     && receipt.forcedKill === false && receipt.exitCode === 0
     && Number.isSafeInteger(receipt.pid) && receipt.pid! > 0;
@@ -78,9 +79,9 @@ export async function verifyNexusFirstRun(binary: string, expectedVersion?: stri
   try {
     const version = spawnSync(resolve(binary), ['--version'], { cwd: workspace, env, encoding: 'utf8', timeout: 15_000 });
     receipt.versionLine = (version.stdout ?? '').trim();
-    const match = /^(\S+) ([a-f0-9]{40})$/i.exec(receipt.versionLine);
-    if (version.status !== 0 || !match || expectedVersion && match[1] !== expectedVersion
-      || expectedCommit && match[2] !== expectedCommit) throw new Error('installed version/full commit mismatch');
+    const installed = parseInstalledVersionLine(receipt.versionLine);
+    if (version.status !== 0 || !installed || expectedVersion && installed.version !== expectedVersion
+      || expectedCommit && installed.commit !== expectedCommit) throw new Error('installed version/full commit mismatch');
     const port = await freePort();
     // Global --test=<dir> BEFORE the command selects the inline, owned child lifecycle.
     // `nexus run --test` instead forks through pwa-test and cannot prove this PID owns it.
@@ -139,7 +140,7 @@ export async function verifyNexusFirstRun(binary: string, expectedVersion?: stri
   return receipt;
 }
 
-if (import.meta.main) {
+async function runNexusFirstRunCli(): Promise<void> {
   const args = process.argv.slice(2);
   const value = (name: string) => { const at = args.indexOf(name); return at < 0 ? undefined : args[at + 1]; };
   const binary = value('--binary');
@@ -148,3 +149,5 @@ if (import.meta.main) {
   console.log(JSON.stringify(result));
   process.exitCode = result.ok ? 0 : 1;
 }
+
+if (import.meta.main) void runNexusFirstRunCli();

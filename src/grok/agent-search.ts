@@ -25,7 +25,7 @@
 
 import { llmNetworkSend } from '../session-runtime/llm-call-gateway.js';
 import { getGrokApiKey, refreshKeyFromCache } from '../config.js';
-import { resolveFreshGrokCredential } from './credential.js';
+import { peekGrokCredential, resolveFreshGrokCredential } from './credential.js';
 import { debug } from '../debug/log.js';
 
 /** Agent Tools API endpoint (distinct from GROK_API_URL=chat/completions). */
@@ -61,9 +61,11 @@ export interface GrokAgentSearchOpts {
   baseUrl?: string;
   headers?: Record<string, string>;
   /** Opt-in credential order for search callers; unset preserves the direct API-key behavior. */
-  credentialPreference?: 'api_key';
+  credentialPreference?: 'api_key' | 'subscription';
   /** Model used only when resolving a fallback subscription credential. */
   credentialModel?: string;
+  /** Selected credential home; default is the current user's home. */
+  credentialHome?: string;
 }
 
 export interface GrokCitation {
@@ -95,9 +97,18 @@ export async function grokAgentSearch(
   query: string,
   opts: GrokAgentSearchOpts = {},
 ): Promise<GrokAgentSearchResult> {
-  const credential = opts.credentialPreference
-    ? resolveFreshGrokCredential({ prefer: opts.credentialPreference, ...(opts.credentialModel ? { model: opts.credentialModel } : {}) })
-    : null;
+  const credentialOpts = { ...(opts.credentialModel ? { model: opts.credentialModel } : {}),
+    ...(opts.credentialHome ? { home: opts.credentialHome } : {}) };
+  // A social axis has a 6.5s shared Grok budget. A synchronous CLI token refresh can take 8s,
+  // so use the read-only credential snapshot and let an expired token fail into web fallback.
+  const credential = opts.credentialPreference === 'subscription'
+    ? peekGrokCredential(credentialOpts)
+    : opts.credentialPreference === 'api_key'
+      ? resolveFreshGrokCredential({ ...credentialOpts, prefer: 'api_key' })
+      : null;
+  if (opts.credentialPreference === 'subscription' && credential?.kind !== 'subscription') {
+    return { ok: false, status: 0, text: '', citations: [], error: 'missing-subscription-credential' };
+  }
   if (credential) debug.log('grok.agent-search', 'credential-selected', { kind: credential.kind, source: credential.source });
   const apiKey = opts.apiKey ?? credential?.token ?? getGrokApiKey();
   if (!apiKey) return { ok: false, status: 0, text: '', citations: [], error: 'missing-api-key' };

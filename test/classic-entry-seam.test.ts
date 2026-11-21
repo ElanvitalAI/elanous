@@ -63,6 +63,9 @@ test('classic dashboard has one named root launcher seam and no other production
   // known-fail 묶음5: 지연 적재로 전환 — 정적 import 면 elanous --help 파싱만으로 plugin-route-adapter가 즉시 돈다) ·
   // #38069 ELN-SELF-TIMER-WATCH · #38186 seat AGENTS.md 적재 · #38006 TURN-ROUTE-PIN — 0.3.29 착지군이
   // 대시보드 내부 계약 모듈(플러그인 경로 어댑터·commitment-ledger·turn-life 사건·seat 부트) 을 참조하게 했다.
+  // CLASSIC-TUI-RETIRE-SWEEP ② — next-mail-wake 의 seat-boot seam 을 정본 src/seat/seat-boot-preamble 으로 전환해 목록에서 제거.
+  // #39242 ELN-SEAT-AUTOWAKE-BUDGET — next-mail-wake 의 budget seam 등록 누락 보충: fbd9c03ade 착지가 이 목록을 갱신하지 않아 main known-fail.
+  // CLASSIC-TUI-RETIRE-SWEEP ① 2단계 — goal-continue 의 turn-outcome-shadow seam 을 정본 src/commitment/turn-outcome-shadow 로 전환해 목록에서 제거.
   expect(edges.sort()).toEqual([
     'src/graph-runner/graph-cli-owner.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/index.ts dynamic ./dashboard/index.js',
@@ -70,9 +73,8 @@ test('classic dashboard has one named root launcher seam and no other production
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
     'src/repl/index.ts dynamic ../dashboard/plugin-route-adapter.js',
-    'src/tui-client/next-mail-wake.ts static ../dashboard/seat-boot-preamble.js',
+    'src/tui-client/next-mail-wake.ts static ../dashboard/input/seat-autowake-budget.js',
     'src/tui/entry.ts dynamic ../dashboard/seat-local-instructions.js',
-    'src/tui/input/goal-continue.ts static ../../dashboard/input/turn-outcome-shadow.js',
     'src/tui/seat-mail-boot.ts static ../dashboard/input/seat-task-decompose.js',
   ]);
 }, 60_000); // 출처: #38824 — 스캔 6.8s > bun 기본 5s(부하 호스트 실측) · 저장소 관례 숫자 인자

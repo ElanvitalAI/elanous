@@ -22,7 +22,7 @@ import { createHerdrAgentReporter, guardHerdrReleaseOnSignal, type HerdrAgentRep
 import { clearApprovalHerdrBlockedHook, setApprovalHerdrBlockedHook, type ApprovalHerdrBlockedHook } from '../approval-herdr-hook.js';
 import { createHerdrSocketReporter, guardHerdrSocketReleaseOnSignal, type HerdrSocketReporter, type HerdrSocketState } from './herdr-socket-report.js';
 import { runGitCommand } from '../git-fs/runner.js';
-import { codeRevision, packageVersion, readInstallMetadataCommit } from '../version/code-revision.js';
+import { codeRevision, installedBuildMetadata, packageVersion, readInstallMetadataCommit } from '../version/code-revision.js';
 import {
   buildStaleInstallRelaunchCommand,
   formatStaleInstallNotice,
@@ -53,10 +53,14 @@ export function resolveRunningBuild(deps: RunningBuildDeps = {}): PtyBuildIdenti
   const codeRoot = deps.codeRoot ?? CODE_ROOT;
   const version = (deps.version ?? packageVersion)();
   const versionDir = (deps.versionDirOf ?? versionedDashboardInstallDir)(codeRoot, deps.installRoot);
-  if (versionDir) {
-    // 판 폴더의 install.json 만이 «실은 판»의 증거다 — 못 읽으면 다른 출처로 메우지 않고 모른다로 둔다.
-    const sha = (deps.readInstallCommit ?? readInstallMetadataCommit)(join(versionDir, 'install.json')) ?? '';
-    return { version, sha, source: sha ? 'installed' : 'unknown', codeRoot };
+  // A custom install prefix can still be authenticated by the installer-owned shim at the code root.
+  const metadata = installedBuildMetadata(codeRoot);
+  if (versionDir || metadata) {
+    const sha = (versionDir ? (deps.readInstallCommit ?? readInstallMetadataCommit)(join(versionDir, 'install.json')) : undefined)
+      ?? metadata?.commit ?? '';
+    return { version, sha, source: sha || metadata ? 'installed' : 'unknown', codeRoot,
+      ...(metadata ? { channel: metadata.channel } : {}),
+      ...(metadata?.builtAt !== undefined ? { builtAt: metadata.builtAt } : {}) };
   }
   const sha = (deps.revision ?? codeRevision)() ?? '';
   return { version, sha, source: sha ? 'checkout' : 'unknown', codeRoot };

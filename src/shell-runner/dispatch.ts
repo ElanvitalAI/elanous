@@ -55,6 +55,13 @@ export interface RunShellOpts {
   /** RunCtx forwarded to the engine. When omitted, a minimal
    *  default is synthesized (cwd = req.cwd or process.cwd()). */
   ctx?: RunCtx;
+  ownerSessionId?: string;
+}
+
+const handleOwners = new WeakMap<ShellHandle, string>();
+
+export function shellHandleOwner(handle: ShellHandle): string | undefined {
+  return handleOwners.get(handle);
 }
 
 let singleton: ShellRunnerDeps | null = null;
@@ -90,6 +97,7 @@ export function runShell(
   };
   const normalizedReq: ShellRequest = { ...req, mode: effectiveMode };
   const handle = engine.run(normalizedReq, ctx);
+  if (opts.ownerSessionId) handleOwners.set(handle, opts.ownerSessionId);
   deps.registry.register(handle);
   try { deps.attachSurface?.(handle, normalizedReq); } catch { /* isolate */ }
   return handle;

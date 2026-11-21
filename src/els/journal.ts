@@ -60,12 +60,16 @@ export function validJournal(raw: unknown): SpaceJournal {
   const panes = raw.panes.map((pane, index): Pane => {
     if (!isRecord(pane) || ![pane.id, pane.tabId, pane.title, pane.cwd, pane.ptyId, pane.scrollback].every(isString) || !pane.id
       || !Array.isArray(pane.command) || !pane.command.every(isString)
+      || (pane.exitedAt !== undefined && (!Number.isSafeInteger(pane.exitedAt) || (pane.exitedAt as number) < 0))
+      || (pane.ownerSeat !== undefined && (typeof pane.ownerSeat !== 'string' || !pane.ownerSeat.trim()))
       || !PANE_STATES.has(pane.state as string) || !PANE_KINDS.has(pane.kind as string) || !RESTORE_POLICIES.has(pane.restore as string)) {
       throw bad('panes', index);
     }
     return { id: pane.id as string, tabId: pane.tabId as string, kind: pane.kind as Pane['kind'], title: pane.title as string,
       cwd: pane.cwd as string, command: pane.command as string[], state: pane.state as Pane['state'], restore: pane.restore as Pane['restore'],
-      ptyId: pane.ptyId as string, scrollback: pane.scrollback as string };
+      ptyId: pane.ptyId as string, scrollback: pane.scrollback as string,
+      ...(pane.exitedAt !== undefined ? { exitedAt: pane.exitedAt as number } : {}),
+      ...(typeof pane.ownerSeat === 'string' ? { ownerSeat: pane.ownerSeat } : {}) };
   });
   const ids = [...workspaces, ...tabs, ...panes].map((row) => row.id);
   if (new Set(ids).size !== ids.length) throw new Error('journal ids are not unique');

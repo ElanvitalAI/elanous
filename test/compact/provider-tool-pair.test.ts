@@ -85,9 +85,11 @@ describe('compact provider tool-pair boundary', () => {
       provider: getDefaultCompactProvider(),
     });
 
-    expect(result.messages).toHaveLength(5);
+    // ★ COMPACT P0 (OP #123867) — 슬라이스 안 사람 user('old request') 1건이 요약 뒤에도 원문 보존(5→6).
+    expect(result.messages).toHaveLength(6);
     expect(result.messages[0]?.content).toContain('fake compact summary');
-    expect(result.messages.slice(1)).toEqual(messages.slice(1));
+    expect(result.messages[1]).toBe(messages[0]);
+    expect(result.messages.slice(2)).toEqual(messages.slice(1));
     const resultIds = result.messages.flatMap((message) => Array.isArray(message.content)
       ? message.content.filter((block) => block.type === 'tool_result').map((block) => block.tool_use_id)
       : []);
@@ -118,9 +120,19 @@ describe('compact provider tool-pair boundary', () => {
     });
 
     expect(transcript).toContain('old request');
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[1]).toBe(messages[3]);
-    expect(result.messages[2]).toBe(messages[4]);
+    // ★ COMPACT P0 (OP #123867) — 사람 user('old request') 원문 보존으로 1건 추가(3→4).
+    //    toolResult A(role user·tool_result 캐리어)는 보존 제외 — 짝(toolUse A)과 함께 요약된다.
+    expect(result.messages).toHaveLength(4);
+    expect(result.messages[1]).toBe(messages[0]);
+    expect(result.messages[2]).toBe(messages[3]);
+    expect(result.messages[3]).toBe(messages[4]);
+    const resultIds = result.messages.flatMap((message) => Array.isArray(message.content)
+      ? message.content.filter((block) => block.type === 'tool_result').map((block) => block.tool_use_id)
+      : []);
+    const useIds = new Set(result.messages.flatMap((message) => Array.isArray(message.content)
+      ? message.content.filter((block) => block.type === 'tool_use').map((block) => block.id)
+      : []));
+    expect(resultIds.every((id) => useIds.has(id))).toBe(true);
     expect(debug.events().some((entry) => entry.event === 'tool-pair-boundary-shift')).toBe(false);
   });
 

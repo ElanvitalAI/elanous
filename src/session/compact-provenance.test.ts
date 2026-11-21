@@ -30,9 +30,12 @@ for (const marker of [true, false]) {
     const result = await compactSessionHistory(session.id, { root, config: { ...CHAT_DEFAULTS.autoCompact, preserveLastN: 2 }, force: true, provider, modelId: 'test' });
     expect(result.fired).toBe(true);
     const after = loadSession(session.id, root)!.messages;
-    expect(after[1]).toEqual(before[2]);
-    expect(after.slice(2)).toEqual(before.slice(3));
-    const projected = nextTuiPublicHistory([{role:'user',content:'q',ts:'0'}, {role:'assistant',content:'answer',ts:'1',replyFinal:true}, after[1]!]);
+    // ★ COMPACT P0(OP #123867) — 구 replay(마지막 user 1개)와 달리 요약 뒤 «슬라이스의
+    //   모든 사람 user»가 원문 순서로 재배치된다: after = [summary, before[0], before[2], …tail].
+    expect(after[1]).toEqual(before[0]);
+    expect(after[2]).toEqual(before[2]);
+    expect(after.slice(3)).toEqual(before.slice(3));
+    const projected = nextTuiPublicHistory([{role:'user',content:'q',ts:'0'}, {role:'assistant',content:'answer',ts:'1',replyFinal:true}, after[2]!]);
     expect(projected[1]!.role).toBe(marker ? 'system' : 'assistant');
   });
 }
@@ -61,7 +64,10 @@ test('overflow retry preserves selected source through workingRows remapping', a
   const root = mkdtempSync(join(tmpdir(), 'compact-overflow-source-')); roots.push(root);
   const session = createSession({ source: 'tui', model: 'test' }, root);
   const add = (row: SerializedMessage) => appendMessage(session.id, row, root);
-  add({ role: 'user', content: 'old', ts: '1', turn_id: 'dropped' } as SerializedMessage);
+  // COMPACT P0(OP #123867 · OP #124161) — 사람 user 행은 overflow 재시도의 drop 후보에서
+  // 제외됐다. 이 시험의 drop 행을 구계약(user 'old')에서 assistant 로 갱신한다(재매핑
+  // 커버리지 유지·신 보존 계약 준수).
+  add({ role: 'assistant', content: 'old', ts: '1', turn_id: 'dropped' } as SerializedMessage);
   add({ role: 'user', content: 'identical', ts: '2', turn_id: 'selected', interruptionMarker: true } as SerializedMessage);
   add({ role: 'user', content: 'identical', ts: '3', turn_id: 'audit', goalInterim: true } as SerializedMessage);
   add({ role: 'assistant', content: 'tail 1', ts: '4' });

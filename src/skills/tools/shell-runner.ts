@@ -20,6 +20,9 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 
 import type { ShellHandle, ShellMode, ShellStatus } from '../../shell-runner/types.js';
 import type { ShellRegistry } from '../../shell-runner/registry.js';
+import { shellHandleOwner } from '../../shell-runner/dispatch.js';
+import { judgeStop } from '../../agent/stop-door.js';
+import type { StopOutcome } from '../../agent/stop-door.js';
 import type {
   TerminalSurfaceCapability,
   TerminalUserExposure,
@@ -142,6 +145,7 @@ export interface ShellKillResult extends Record<string, unknown> {
   found: boolean;
   id: string;
   status?: ShellStatus;
+  stop?: StopOutcome;
 }
 
 // ── Dispatchers ─────────────────────────────────────────────────
@@ -213,6 +217,7 @@ function formatShellPollOutput(
 export async function dispatchShellKill(
   raw: Record<string, unknown>,
   registry: ShellRegistry,
+  requester?: string,
 ): Promise<ShellKillResult> {
   const id = requireString(raw.id, 'id');
   const signal = asSignal(raw.signal) ?? 'SIGTERM';
@@ -222,9 +227,22 @@ export async function dispatchShellKill(
       output: `ShellKill found=false id=${id}`,
       found: false,
       id,
+      stop: judgeStop({ kind: 'shell', id, exists: false, ended: false }),
     };
   }
-  try { h.kill(signal); } catch { /* swallow; surface via status */ }
+  const verdict = judgeStop({
+    kind: 'shell', id, exists: true, ended: h.status === 'completed' || h.status === 'killed',
+    owner: shellHandleOwner(h), requester,
+  });
+  if (verdict.refused) return { output: 'ShellKill: stop refused', found: true, id, stop: verdict };
+  if (verdict.stopped) {
+    try { h.kill(signal); } catch {
+      return {
+        output: 'ShellKill: stop signal failed', found: true, id,
+        stop: { ...verdict, stopped: false, failed: 'signal-failed' },
+      };
+    }
+  }
   // Wait one microtask so the engine has a chance to flip status
   // before the LLM sees the result. The dispatch caller can still
   // follow up with ShellPoll to confirm full shutdown (graceful
@@ -235,6 +253,7 @@ export async function dispatchShellKill(
     found: true,
     id: h.id,
     status: h.status,
+    stop: verdict,
   };
 }
 

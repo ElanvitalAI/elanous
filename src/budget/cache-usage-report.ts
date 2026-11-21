@@ -98,6 +98,12 @@ function line(group: CacheUsageGroup): string {
   return `${group.key}  calls=${group.calls}  reported=${group.reportedCalls}  input=${group.inputTokens}  reportedInput=${group.reportedInputTokens}  cacheRead=${group.cacheReadInputTokens}  cacheWrite=${group.cacheCreationInputTokens}  hit=${pct(group.hitRate)}`;
 }
 
+function grokHitRate(groups: readonly CacheUsageGroup[]): number | null {
+  const reported = groups.reduce((n, g) => n + g.reportedCalls, 0);
+  const prompt = groups.reduce((n, g) => n + g.reportedInputTokens + g.cacheReadInputTokens + g.cacheCreationInputTokens, 0);
+  return reported > 0 && prompt > 0 ? groups.reduce((n, g) => n + g.cacheReadInputTokens, 0) / prompt : null;
+}
+
 export function formatCacheUsageReport(report: CacheUsageReport): string {
   const compactions = report.compactions === null ? '' : ` · 압축 ${report.compactions}회`;
   // The compaction count is shown even when no usage row matched (e.g. a provider without a ledger).
@@ -105,5 +111,8 @@ export function formatCacheUsageReport(report: CacheUsageReport): string {
   const head = `캐시 적중률 ${pct(report.total.hitRate)} · 호출 ${report.total.calls} (캐시 보고 ${report.total.reportedCalls})`
     + (report.sessionId ? ` · 세션 ${report.sessionId}` : '')
     + compactions;
-  return [head, ...report.groups.map(group => `  ${line(group)}`)].join('\n');
+  // ⭐ LLM-USAGE-GROK-BLIND — grok 은 «한 줄로» 따로 본다(모델이 여럿이어도 provider 합). 키는 `billingProvider/model`.
+  const grok = report.groups.filter(group => group.key.startsWith('grok/'));
+  const grokLine = grok.length === 0 ? [] : [`grok 캐시 적중률 ${pct(grokHitRate(grok))} · 호출 ${grok.reduce((n, g) => n + g.calls, 0)} (캐시 보고 ${grok.reduce((n, g) => n + g.reportedCalls, 0)})`];
+  return [head, ...grokLine, ...report.groups.map(group => `  ${line(group)}`)].join('\n');
 }

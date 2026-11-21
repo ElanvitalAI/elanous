@@ -1,6 +1,7 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { hostname } from 'node:os';
 import { parse as parseYaml } from 'yaml';
 import type { Database } from 'bun:sqlite';
@@ -761,11 +762,123 @@ export function loopStatus(id: string, opts: LoopRegistryOptions = {}): LoopEntr
 
 /** The crontab line a loop runs — same shape as the other elanous crons: cron starts in $HOME with a thin PATH,
  *  so a bare `elanous graph run <relative file>` fails silently every tick (09-29 steward). */
-export function loopCronCommand(id: string, file: string, root: string, bun = process.execPath): string {
-  // Quote only when needed: the other crons (and `graphJobMatches`) use bare absolute paths.
-  const q = (value: string) => /^[\w./@+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
-  const log = `/tmp/elanous-loop-${id.replace(/[^\w.-]/g, '_')}.log`;
-  return `cd ${q(root)} && ${q(bun)} bin/elanous.mjs graph run ${q(file)} >> ${log} 2>&1`;
+export function loopCronLogPath(id: string, stateRoot = effectiveInstanceRoot()): string {
+  if (!stateRoot.trim() || !isAbsolute(stateRoot) || /[\r\n%\0]/.test(stateRoot)) throw new Error('invalid loop cron stateRoot');
+  return join(stateRoot, 'loop-logs', `elanous-loop-${id.replace(/[^\w.-]/g, '_')}.log`);
+}
+
+export function loopCronCommand(id: string, file: string, root: string, bun = process.execPath, stateRoot = effectiveInstanceRoot()): string {
+  // Cron interprets percent and newline before the shell, even inside quotes.
+  const q = (value: string) => {
+    if (/[\r\n%\0]/.test(value)) throw new Error('invalid cron command path');
+    return /^[\w./@+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+  };
+  // JUD #117698: the registered line must not let the shell open the loop log — no `>>` anywhere.
+  // The eln wrapper owns the guarded open (openLoopLogFile) and connects the graph child's stdout
+  // and stderr to that descriptor; the trailing marker keeps crontab inventory bound to the loop.
+  if (!/^[a-zA-Z0-9][\w.-]*$/.test(id)) throw new Error('invalid cron command loop id');
+  return `cd ${q(root)} && ${q(bun)} bin/elanous.mjs loop cron ${q(id)} --graph ${q(file)} --state-root ${q(stateRoot)} # elanous-loop=${id}`;
+}
+
+/** Run one loop's graph cron through the guarded open: openLoopLogFile owns the log target and the
+ *  graph child's stdout+stderr both land on that descriptor — the old line's `>> … 2>&1` without the
+ *  shell ever touching the file. Returns the child's exit status for the caller to propagate. */
+export function runLoopCron(id: string, file: string, stateRoot: string, deps: { bun?: string; graphArgs?: string[]; spawn?: typeof spawnSync } = {}): number {
+  ensureLoopLogsDir(stateRoot);
+  const fd = openLoopLogFile(loopCronLogPath(id, stateRoot));
+  try {
+    const child = (deps.spawn ?? spawnSync)(deps.bun ?? process.execPath, deps.graphArgs ?? ['bin/elanous.mjs', 'graph', 'run', file], { stdio: ['ignore', fd, fd] });
+    return child.status ?? 1;
+  } finally { closeSync(fd); }
+}
+
+/** A loop log target that is a symlink, a non-regular object, foreign-owned, or writable beyond the owner.
+ *  Registration-time string checks cannot guarantee where cron later writes, so every open goes through here. */
+export class LoopLogTargetError extends Error {
+  constructor(reason: string) {
+    super(`unsafe loop log target: ${reason}`);
+    this.name = 'LoopLogTargetError';
+  }
+}
+
+// Group/world write bits: loop cron logs are single-user files; anything broader is a planted target.
+const LOOP_LOG_GROUP_WRITE_MASK = 0o022;
+// O_NOFOLLOW refuses to open a symlinked leaf; O_NONBLOCK keeps a planted FIFO from blocking the open.
+const LOOP_LOG_OPEN_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+function assertOwnedByCurrentUser(stats: Stats, what: string): void {
+  const euid = process.geteuid?.() ?? -1;
+  if (stats.uid !== euid) throw new LoopLogTargetError(`${what} is owned by uid ${stats.uid}, not the current user (euid ${euid})`);
+}
+
+function assertOwnerOnlyWritable(stats: Stats, what: string): void {
+  if (stats.mode & LOOP_LOG_GROUP_WRITE_MASK) throw new LoopLogTargetError(`${what} is writable by group/others (mode 0${stats.mode.toString(8)})`);
+}
+
+function assertSafeDirectory(path: string, stats: Stats): void {
+  if (stats.isSymbolicLink() || !stats.isDirectory()) throw new LoopLogTargetError(`${path} is not a real directory`);
+  assertOwnedByCurrentUser(stats, path);
+  assertOwnerOnlyWritable(stats, path);
+}
+
+/** Reject a leaf that exists but is not a plain owner-only file (symlink, FIFO, socket, …). */
+function assertSafeExistingLogFile(path: string, stats: Stats): void {
+  if (stats.isSymbolicLink() || !stats.isFile()) throw new LoopLogTargetError(`${path} is a ${stats.isSymbolicLink() ? 'symlink' : 'non-regular object'}, not a regular log file`);
+  assertOwnedByCurrentUser(stats, path);
+  assertOwnerOnlyWritable(stats, path);
+}
+
+/** Create `stateRoot/loop-logs` behind a barrier: existing components must be real directories we own. */
+export function ensureLoopLogsDir(stateRoot: string): string {
+  const dir = join(stateRoot, 'loop-logs');
+  for (const path of [stateRoot, dir]) {
+    let stats: Stats;
+    try { stats = lstatSync(path); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    assertSafeDirectory(path, stats);
+  }
+  mkdirSync(dir, { recursive: true });
+  assertSafeDirectory(dir, lstatSync(dir)); // what we actually have now — mkdir follows a symlink planted mid-call
+  return dir;
+}
+
+/** Fail-closed validation of an already-existing log leaf (registration barrier). No-op when the log does not exist yet. */
+export function guardLoopLogFile(logPath: string): void {
+  let stats: Stats;
+  try { stats = lstatSync(logPath); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  assertSafeExistingLogFile(logPath, stats);
+}
+
+/** Open a loop log for append with an open-time barrier: the parent must be a real owned directory,
+ *  the leaf must not be a symlink (O_NOFOLLOW), and what the fd points at must be an owner-only regular file. */
+export function openLoopLogFile(logPath: string): number {
+  assertSafeDirectory(dirname(logPath), lstatSync(dirname(logPath)));
+  guardLoopLogFile(logPath);
+  const fd = openSync(logPath, LOOP_LOG_OPEN_FLAGS, 0o644);
+  try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) throw new LoopLogTargetError(`${logPath} resolved to a non-regular object`);
+    assertOwnedByCurrentUser(stats, logPath);
+    assertOwnerOnlyWritable(stats, logPath);
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/** Append one chunk to a loop's cron log through the open-time barrier. Returns the log path. */
+export function appendLoopLog(id: string, text: string, stateRoot = effectiveInstanceRoot()): string {
+  const logPath = loopCronLogPath(id, stateRoot);
+  ensureLoopLogsDir(stateRoot);
+  const fd = openLoopLogFile(logPath);
+  try { writeSync(fd, text); } finally { closeSync(fd); }
+  return logPath;
 }
 
 export async function setLoopEnabled(id: string, enabled: boolean, yes = false, opts: LoopRegistryOptions = {}): Promise<unknown> {
@@ -779,8 +892,15 @@ export async function setLoopEnabled(id: string, enabled: boolean, yes = false, 
   const entryLabel = entryScript ? { entryScript: true } : {};
   if (!pending.length && loop.jobs.length) return { action, id, changed: false, enabled: loop.enabled, ...entryLabel };
   const changes = loop.jobs.length ? pending.map(job => ({ action: enabled ? 'enable' : 'disable', id: job.id })) :
-    [{ action: 'create', cron: loop.trigger.cron, command: loopCronCommand(id, loop.file, resolve(opts.root ?? defaultLoopRoot())) }];
+    [{ action: 'create', cron: loop.trigger.cron, command: loopCronCommand(id, loop.file, resolve(opts.root ?? defaultLoopRoot()), process.execPath, opts.stateRoot) }];
   if (!yes) return { action, id, dryRun: true, changes, ...entryLabel, note: 'Apply with --yes (crontab backup).' };
+  // Registration-time barrier: refuse to install the cron when the log target or its directory is a
+  // symlink, foreign-owned, non-regular, or over-permissive — string checks cannot see a later swap.
+  if (!loop.jobs.length) {
+    const logStateRoot = opts.stateRoot ?? effectiveInstanceRoot();
+    ensureLoopLogsDir(logStateRoot);
+    guardLoopLogFile(loopCronLogPath(id, logStateRoot));
+  }
   const dispatch = opts.scheduleAction ?? (async (kind: 'create' | 'enable' | 'disable', args: Record<string, unknown>) => {
     const { dispatchScheduleManage } = await import('../domains/schedule-manage-tool.js');
     return dispatchScheduleManage({ action: kind, ...args });

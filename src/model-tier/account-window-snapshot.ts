@@ -3,7 +3,7 @@
 // 오늘 구조화돼 «디스크에» 있는 것만 읽는다:
 //   · openai-codex — 계정별 쿼터 신호 파일(`inspectCodexRotation`): 사용률·「찼다」·관측 시각·신선함(1시간)·명시 계정·건강.
 // 없는 것은 «모름»으로 둔다(지어 넣지 않는다):
-//   · 창 리셋 시각(codex 신호에 없다) · 버텨야 할 시각 · API 결과당 비용 순위 · 다른 provider 의 계정 목록.
+//   · 옛 Codex 신호의 창 리셋 시각 · 버텨야 할 시각 · API 결과당 비용 순위 · 다른 provider 의 계정 목록.
 //   · codex 크레딧 잔액은 신호에 있지만 이 판은 싣지 않는다 — 크레딧 정책은 회전 판정(`codex-account-rotation`)의 몫이고 가격 숫자는 결정 칸에 넣지 않는다.
 // ⛔ Claude 창(OAuth 조회)·teamclaude 할당량은 «호출»이라 판정 경로에서 읽지 않는다(src/budget/codex-reset-credit-state.ts «판정 경로에서 네트워크를 치지 않는다»).
 
@@ -19,7 +19,7 @@ export function resolveWindowAccountsMode(config: Pick<UserConfig, 'harness'> | 
   return config?.harness?.windowAccounts === 'on' ? 'on' : 'shadow';
 }
 
-type CodexInspect = Pick<ReturnType<typeof inspectCodexRotation>, 'current' | 'explicit' | 'candidates' | 'observedAtByHome' | 'freshByHome' | 'reason' | 'to'>;
+type CodexInspect = Pick<ReturnType<typeof inspectCodexRotation>, 'current' | 'explicit' | 'candidates' | 'observedAtByHome' | 'freshByHome' | 'resetsAtByHome' | 'reason' | 'to'>;
 
 export interface AccountWindowSnapshotDeps {
   readonly now?: () => number;
@@ -63,9 +63,10 @@ export function readAccountWindowSnapshot(provider: string, deps: AccountWindowS
     const remaining = !fresh ? undefined
       : c.reached === true ? 0
       : typeof c.usedPercent === 'number' && Number.isFinite(c.usedPercent) ? (100 - c.usedPercent) / 100 : undefined;
+    const resetsAtMs = fresh ? state.resetsAtByHome[c.home] : undefined;
     candidates.push({
       provider, account: c.name, billing: 'subscription',
-      ...(remaining === undefined ? {} : { window: { remaining } }),
+      ...(remaining === undefined ? {} : { window: { remaining, ...(resetsAtMs === undefined ? {} : { resetsAtMs }) } }),
     });
   }
   if (unhealthy > 0) observe('snapshot-skip', { provider, reason: 'unhealthy-excluded', count: unhealthy });

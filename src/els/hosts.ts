@@ -13,6 +13,9 @@ export interface FederatedHost {
   readonly baseUrl: string;
   /** `herdr` = the herdr panes of this machine, answered by `src/els/herdr-host.ts` instead of an HTTP read window. */
   readonly kind?: 'herdr';
+  /** Explicit, pinned operator transport for remote update-all. Read-only federation does not need this. */
+  readonly update?: { readonly sshTarget: string; readonly knownHostsFile: string; readonly catchUpSeat: 'OP' | 'TC' | 'MK' | 'UX'; readonly bin?: string;
+    readonly home?: string; readonly stateRoot?: string; readonly cwd?: string };
 }
 
 export interface HostRegistry {
@@ -50,6 +53,27 @@ function tailnetOrigin(raw: string): string | undefined {
   }
 }
 
+function updateTransport(raw: unknown, baseUrl: string): FederatedHost['update'] | string {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return 'update transport is not an object';
+  const row = raw as Record<string, unknown>;
+  const target = row.sshTarget;
+  const known = row.knownHostsFile;
+  if (!['OP', 'TC', 'MK', 'UX'].includes(String(row.catchUpSeat))) return 'update catchUpSeat must be OP, TC, MK or UX';
+  if (typeof target !== 'string' || !/^[a-z_][a-z0-9_-]*@[A-Za-z0-9._-]+$/i.test(target)) return 'update sshTarget must be user@host';
+  const targetHost = target.slice(target.indexOf('@') + 1).toLowerCase();
+  if (targetHost !== new URL(baseUrl).hostname.toLowerCase()) return 'update SSH HostName differs from registered URL host';
+  if (typeof known !== 'string' || !known.startsWith('/')) return 'update knownHostsFile must be absolute';
+  if (/[\s%\0]/.test(known)) return 'update knownHostsFile must be one single literal file';
+  for (const key of ['bin', 'home', 'stateRoot', 'cwd']) if (row[key] !== undefined
+    && (typeof row[key] !== 'string' || !(row[key] as string).startsWith('/') || /[\r\n\0]/.test(row[key] as string)))
+    return `update ${key} must be absolute`;
+  return { sshTarget: target, knownHostsFile: known, catchUpSeat: row.catchUpSeat as 'OP' | 'TC' | 'MK' | 'UX',
+    ...(typeof row.bin === 'string' ? { bin: row.bin } : {}),
+    ...(typeof row.home === 'string' ? { home: row.home } : {}),
+    ...(typeof row.stateRoot === 'string' ? { stateRoot: row.stateRoot } : {}),
+    ...(typeof row.cwd === 'string' ? { cwd: row.cwd } : {}) };
+}
+
 export function loadHostRegistry(path: string): HostRegistry {
   let text: string;
   try {
@@ -73,9 +97,24 @@ export function loadHostRegistry(path: string): HostRegistry {
     if (!HOST_NAME.test(name)) rejected.push(`hosts[${index}]: bad name`);
     else if (!baseUrl) rejected.push(`${name}: baseUrl is not a tailnet or loopback http(s) URL`);
     else if (hosts.some((host) => host.name === name)) rejected.push(`${name}: duplicate name`);
-    else hosts.push({ name, baseUrl });
+    else {
+      const update = (row as { update?: unknown }).update === undefined ? undefined : updateTransport((row as { update?: unknown }).update, baseUrl);
+      if (typeof update === 'string') rejected.push(`${name}: ${update}`);
+      else hosts.push({ name, baseUrl, ...(update ? { update } : {}) });
+    }
   });
   return { hosts, rejected };
+}
+
+/** Bind the effect to the registry snapshot used for the pane listing; a changed entry revokes this run. */
+export function registeredHostAtExecution(path: string, listed: HostRegistry, name: string): FederatedHost {
+  const current = loadHostRegistry(path);
+  if (listed.problem || listed.rejected.length || current.problem || current.rejected.length
+    || JSON.stringify(current.hosts) !== JSON.stringify(listed.hosts))
+    throw new Error('els host registry changed after listing');
+  const host = listed.hosts.find(row => row.name === name);
+  if (!host) throw new Error('registered host missing from listing snapshot');
+  return host;
 }
 
 /**

@@ -11,16 +11,13 @@ import { fitLogLine } from '../tui/chat/log-view.js';
 import { renderStatusline, STATUSLINE_SEPARATOR, type StatuslineRenderedSegment, type StatuslineSnapshot } from './evaluate.js';
 import { defaultStatuslineDefinition, snapshotFromLegacyStatus } from './legacy-parity.js';
 import { locateStatuslineIssue, mergeStatuslineLayers, parseStatuslineYaml, type StatuslineLoadIssue } from './load.js';
-import { versionLabel } from '../version/build-stamp.js';
+import { versionLabel, type BuildIdentity } from '../version/build-stamp.js';
 import { machinesSnapshot, type FleetValue } from './sources/machines.js';
 import { STATUSLINE_DEFAULT_POSITION, statuslineBreakpoints, statuslineWidthBand, type StatuslineDefinition } from './schema.js';
 
 /** The running build as `runningBuild()` reports it (src/pty-shell/tui-run-state.ts), plus its commit time when known. */
-export interface StatuslineBuild {
-  readonly version: string;
-  readonly sha: string;
-  readonly source: 'installed' | 'checkout' | 'unknown';
-  /** Committer time of the build commit (epoch seconds) — dev builds show it as yymmdd_hhmm KST. */
+export interface StatuslineBuild extends BuildIdentity {
+  /** Legacy fall back when the packed build time is unavailable. */
   readonly commitTime?: number;
 }
 
@@ -253,7 +250,7 @@ export function createNextTuiStatusline(options: {
     warning: loaded.warning,
     /** Where the line sits (DESIGN §2b · STATUSLINE-CONTRACT-V1 `position:`); bottom unless the definition says otherwise. */
     position: loaded.definition.position ?? STATUSLINE_DEFAULT_POSITION,
-    /** The commit time is looked up after the first paint (a git call); until then a dev version shows no stamp. */
+    /** Legacy commit time is looked up after the first paint. */
     /** Returns true when the footer changes (the caller paints again). */
     setCommitTime(commitTime: number | undefined): boolean {
       if (commitTime === undefined || commitTime === build.commitTime) return false;

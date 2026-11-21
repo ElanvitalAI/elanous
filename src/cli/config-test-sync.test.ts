@@ -332,6 +332,24 @@ describe('채널 탭 봇 토큰 — 격리 우주에 운영 봇이 가지 않는
     const raw = { tabs: { 'telegram:2': { tokenRef: 'ref:secret:custom-bot' } } };
     expect(testSyncExcludedSecretIds(raw, ['custom-bot', 'llm'])).toEqual(['custom-bot']);
   });
+
+  it('test sync excludes the Nexus app auth signing key while keeping LLM secrets', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-cfgsync-app-auth-'));
+    const src = join(dir, 'operating');
+    const testDir = join(dir, 'test');
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, 'config.json'), '{}');
+    writeFileSync(join(src, 'secrets.json'), JSON.stringify({ version: 1, secrets: {
+      'nexus.app-auth-signing-key': 'fake-operating-signing-key-with-256-bits',
+      llmKey: 'fake-llm-key',
+    } }));
+    try {
+      syncTestConfig(testDir, src);
+      const copied = JSON.parse(readFileSync(join(testDir, 'secrets.json'), 'utf8')) as { secrets: Record<string, string> };
+      expect(copied.secrets['nexus.app-auth-signing-key']).toBeUndefined();
+      expect(copied.secrets.llmKey).toBe('fake-llm-key');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('overlay(buildTestSafeDaemonConfig) 파리티 — 정책 원전과 결과 동일', () => {

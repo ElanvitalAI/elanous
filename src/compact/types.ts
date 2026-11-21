@@ -29,6 +29,12 @@ export interface CompactPolicy {
   toolOutputTailLines: number;
   archiveEnabled: boolean;
   archiveDir?: string;
+  /** ★ COMPACT P0 (OP #123867, 2026-11-21) — user 원문 보존 예산(글자 수).
+   *  미지정(undefined)=무제한: 요약 슬라이스의 user 메시지는 **전부 원문 그대로**
+   *  보존된다(앵커~tail 사이, 순서 유지). 지정되면 user 원문 합이 예산을 넘을 때만
+   *  **가장 오래된** user 메시지부터 요약으로 이관되고 그 사실이 요약에 명시된다
+   *  (USER_BUDGET_TRANSFER_MARKER). 예: 압축 뒤 목표의 25%. */
+  userPreserveBudgetChars?: number;
 }
 
 export const DEFAULT_COMPACT_POLICY: CompactPolicy = {
@@ -73,14 +79,12 @@ export interface CompactPipelineResult {
     /** Wave 5 — circuit breaker state at the time of run. */
     breakerTripped: 0 | 1;
     archived: number;
-    /** Wave 7 (2026-05-04) — user-message replay applied? Fires when
-     *  Layer 3 summarize runs AND the post-compact tail contains no
-     *  user role (assistant-only chain), in which case the last user
-     *  message from the summarized slice is re-emitted (text-only,
-     *  media stripped) right after the summary so the model retains a
-     *  clear task-intent anchor. ref/opencode `compaction.process`
-     *  (session/compaction.ts:155-175, 283-338) pattern. */
-    userReplayApplied: 0 | 1;
+    /** ★ COMPACT P0 (OP #123867, 2026-11-21) — Wave 7 의 조건부 user replay 는
+     *  구조적 보존으로 대체·폐지: 요약 슬라이스의 user 메시지는 전부(또는 예산
+     *  내 최신 순) 원문 보존된다. preserved = 원문 보존된 user 메시지 수,
+     *  budgetTransferred = 예산 초과 요약 이관 발생(0|1). */
+    userDirectivesPreserved: number;
+    userDirectivesBudgetTransferred: 0 | 1;
   };
 }
 

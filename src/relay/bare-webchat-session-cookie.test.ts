@@ -14,6 +14,7 @@ import { connectRelayHost } from './host-connector.js';
 import { startRelayServer } from './relay-server.js';
 import { createAppKillSwitch } from './app-kill-switch.js';
 import { createMemberStore } from '../nexus/members/member-store.js';
+import { createOwnedSession } from '../session/index.js';
 import {
   createRelayWebChatLedger,
   createWebChatHandoffLedger,
@@ -94,17 +95,18 @@ test('넘김 뒤 wcs_ 쿠키만으로 채팅 쌍이 열리고(쓰면 연장), �
 
     // 브라우저의 같은 출처 fetch 꼴: Origin = 그 핸들 원점 · POST 몸통은 JSON. extra 로 바꿔 CSRF 꼴을 만든다.
     const OWN_ORIGIN = 'https://owner.elanous.app';
-    const bare = (method: 'GET' | 'POST', path: string, cookie?: string, extra: Record<string, string> = {}) =>
+    const bare = (method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: string, cookie?: string, extra: Record<string, string> = {}) =>
       fetch(`http://127.0.0.1:${relay.port}${path}`, {
         method,
         redirect: 'manual',
         headers: Object.fromEntries(Object.entries({   // 빈 값 = 그 헤더를 아예 보내지 않음
           host: 'owner.elanous.app',
           ...(cookie ? { cookie } : {}),
-          ...(method === 'POST' ? { origin: OWN_ORIGIN, 'content-type': 'application/json' } : {}),
+          ...(method === 'POST' || method === 'PATCH' ? { origin: OWN_ORIGIN, 'content-type': 'application/json' }
+            : method === 'DELETE' ? { origin: OWN_ORIGIN } : {}),
           ...extra,
         }).filter(([, value]) => value !== '')),
-        ...(method === 'POST' ? { body: '{}' } : {}),
+        ...(method === 'POST' ? { body: '{}' } : method === 'PATCH' ? { body: '{"title":"새 제목"}' } : {}),
       });
     const exchange = async () => {
       const token = handoff.issue(owner.id, 'owner')!;
@@ -113,11 +115,11 @@ test('넘김 뒤 wcs_ 쿠키만으로 채팅 쌍이 열리고(쓰면 연장), �
       // 세 경로 쿠키가 릴레이를 지나 모두 온다(출처: #39056 — 착지 + 채팅 쌍 2경로). 예전 호스트
       // envelope 은 Object.fromEntries 로 마지막 한 줄(/v1/chat/events)만 남겼다.
       expect(response.headers.getSetCookie().map((line) => /Path=([^;]+)/.exec(line)?.[1]))
-        .toEqual(['/app/chat', '/v1/prompt/stream', '/v1/chat/events']);
+        .toEqual(['/app/chat', '/v1/prompt/stream', '/v1/chat/events', '/v1/sessions/store']);
       const cookie = response.headers.getSetCookie().find((line) => line.includes('Path=/v1/prompt/stream'))!;
       return cookie.slice(0, cookie.indexOf(';'));   // «__Secure-elanous_webchat_session=wcs_…»
     };
-    const status = async (method: 'GET' | 'POST', path: string, cookie?: string, extra?: Record<string, string>) => {
+    const status = async (method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: string, cookie?: string, extra?: Record<string, string>) => {
       const response = await bare(method, path, cookie, extra);
       await response.body?.cancel();
       return response.status;
@@ -127,8 +129,23 @@ test('넘김 뒤 wcs_ 쿠키만으로 채팅 쌍이 열리고(쓰면 연장), �
     //    런타임 미배선 503(출처: #39024 — 같은 조립의 emt_ 통과 결과와 같은 값).
     const cookie = await exchange();
     expect(cookie.startsWith('__Secure-elanous_webchat_session=wcs_')).toBe(true);
-    expect(await status('GET', '/v1/chat/events?sessionId=wcs-1', cookie)).toBe(200);
+    // JUD #39431 필수 ① — 회원 구독은 소유가 확정된 자기 세션만: 없는 세션 403 · 자기 세션 200.
+    expect(await status('GET', '/v1/chat/events?sessionId=a1a1a1a1-0000-4000-8000-000000000001', cookie)).toBe(403);
+    createOwnedSession('a1a1a1a1-0000-4000-8000-000000000001', owner.id);
+    createOwnedSession('a1a1a1a1-0000-4000-8000-000000000002', owner.id);
+    expect(await status('GET', '/v1/chat/events?sessionId=a1a1a1a1-0000-4000-8000-000000000001', cookie)).toBe(200);
     expect(await status('POST', '/v1/prompt/stream', cookie)).toBe(503);
+    // WEBCHAT-SESSION-HISTORY-PERSIST — 대화 목록·내용 읽기도 같은 쿠키로 릴레이를 지나 회원 Nexus 에 닿는다.
+    expect(await status('GET', '/v1/sessions/store', cookie)).toBe(200);
+    expect(await status('GET', '/v1/sessions/store/a1a1a1a1-0000-4000-8000-0000000000ff?ifExists=1', cookie)).toBe(200);
+    // JUD #39431 필수(경로 탈출) — 생성 규칙 밖 id 는 릴레이를 지나도 400.
+    expect(await status('GET', '/v1/sessions/store/no-such-session?ifExists=1', cookie)).toBe(400);
+    expect(await status('GET', '/v1/sessions/store')).toBe(401);
+    createOwnedSession('s-manage-1', owner.id);
+    expect(await status('PATCH', '/v1/sessions/store/s-manage-1', cookie)).toBe(200);
+    expect(await status('PATCH', '/v1/sessions/store/s-manage-1', cookie, { origin: 'https://attacker.elanous.app' })).toBe(403);
+    expect(await status('DELETE', '/v1/sessions/store/s-manage-1', cookie, { origin: 'https://attacker.elanous.app' })).toBe(403);
+    expect(await status('DELETE', '/v1/sessions/store/s-manage-1', cookie)).toBe(200);
 
     // ② 무쿠키 · 모양만 맞는 남의 값 · 다른 핸들에 묶인 파생 세션 → 401.
     expect(await status('POST', '/v1/prompt/stream')).toBe(401);
@@ -157,7 +174,7 @@ test('넘김 뒤 wcs_ 쿠키만으로 채팅 쌍이 열리고(쓰면 연장), �
     clockMs += 61_000;
     expect(await status('POST', '/v1/prompt/stream', cookie)).toBe(503);
     clockMs += 90 * 60_000;   // 첫 사용 뒤 1시간 31분 — 연장이 없었다면 2시간 창을 넘었을 시점
-    expect(await status('GET', '/v1/chat/events?sessionId=wcs-2', cookie)).toBe(200);
+    expect(await status('GET', '/v1/chat/events?sessionId=a1a1a1a1-0000-4000-8000-000000000002', cookie)).toBe(200);
     clockMs += 2 * 60 * 60_000 + 1_000;
     expect(await status('POST', '/v1/prompt/stream', cookie)).toBe(401);
 
@@ -260,7 +277,7 @@ test('앱 0 + memberRequired: 무쿠키 handoff 교환 GET 은 Nexus consume 로
     const exchanged = await bare('GET', `/app/chat/handoff?handoff-token=${encodeURIComponent(token)}`);
     expect(exchanged.status).toBe(303);
     expect(exchanged.headers.getSetCookie().map((line) => /Path=([^;]+)/.exec(line)?.[1]))
-      .toEqual(['/app/chat', '/v1/prompt/stream', '/v1/chat/events']);
+      .toEqual(['/app/chat', '/v1/prompt/stream', '/v1/chat/events', '/v1/sessions/store']);
     const exchangedCookie = exchanged.headers.getSetCookie().find((line) => line.includes('Path=/v1/prompt/stream'))!;
     expect(exchangedCookie.slice(0, exchangedCookie.indexOf(';')).startsWith('__Secure-elanous_webchat_session=wcs_')).toBe(true);
     await exchanged.body?.cancel();
@@ -429,7 +446,7 @@ test('app-kill-switch 주입(앱 0 + memberRequired): 합성 bare 앱 id("") 판
     const exchanged = await bare('GET', `/app/chat/handoff?handoff-token=${encodeURIComponent(token)}`);
     expect(exchanged.status).toBe(303);
     expect(exchanged.headers.getSetCookie().map((line) => /Path=([^;]+)/.exec(line)?.[1]))
-      .toEqual(['/app/chat', '/v1/prompt/stream', '/v1/chat/events']);
+      .toEqual(['/app/chat', '/v1/prompt/stream', '/v1/chat/events', '/v1/sessions/store']);
     const cookieLine = exchanged.headers.getSetCookie().find((line) => line.includes('Path=/v1/prompt/stream'))!;
     const cookie = cookieLine.slice(0, cookieLine.indexOf(';'));   // «__Secure-elanous_webchat_session=wcs_…»
 
@@ -448,7 +465,8 @@ test('app-kill-switch 주입(앱 0 + memberRequired): 합성 bare 앱 id("") 판
 
     // 채팅 한 쌍 개통: GET 은 SSE 200, POST 는 인증 통과 뒤 프롬프트 런타임 미배선 503
     // (위 #39067 시험 ① 과 같은 값 — 500 아님).
-    expect(await status('GET', '/v1/chat/events?sessionId=wcs-1', cookie)).toBe(200);
+    createOwnedSession('a1a1a1a1-0000-4000-8000-000000000003', owner.id); // JUD #39431 필수 ① — 구독은 소유 확정 세션만
+    expect(await status('GET', '/v1/chat/events?sessionId=a1a1a1a1-0000-4000-8000-000000000003', cookie)).toBe(200);
     expect(await status('POST', '/v1/prompt/stream', cookie)).toBe(503);
 
     // 출처: OP #108575 ② — 문서 GET 의 wcs_ fail-closed 리터럴 4종(위조 · 남의

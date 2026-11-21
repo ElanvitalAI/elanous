@@ -29,10 +29,25 @@ const { debug } = await import('../debug/log.js');
 const {
   planWorkingBackwardsCompletion,
   researchTurnForGrounding,
+  researchSourceUsageFromEvidence,
   runResearchQuestionLadder: runResearchQuestionLadderWithSubagents,
 } = await import('./research-turn.js');
 const runResearchQuestionLadder: typeof runResearchQuestionLadderWithSubagents = (request, options = {}) =>
   runResearchQuestionLadderWithSubagents(request, { ...options, enableResearchFanout: false });
+
+test('grounding source counts use successful distinct engine and market evidence only', () => {
+  const row = (sourceKind: string, source: string, outcome: 'complete' | 'failed' = 'complete') =>
+    ({ questionId: 'q1', sourceKind, source, content: 'evidence', outcome, truncated: false });
+  expect(researchSourceUsageFromEvidence([
+    row('web-search:firecrawl', 'https://example.org/a'),
+    row('web-search:firecrawl', 'https://example.org/a'),
+    row('web-search:grok-search', 'https://example.org/b'),
+    row('market-data:quote', 'ABC'),
+    row('research.market-data:quote', 'DEF'),
+    row('market-data:quote', 'XYZ', 'failed'),
+    row('web-search:exa', 'https://example.org/c'),
+  ])).toEqual({ firecrawl: 1, grok: 1, market: 2 });
+});
 const { routeResearchOutput } = await import('../research/output-router.js');
 
 const questions: BloomResearchQuestion[] = Array.from({ length: 6 }, (_, index) => ({

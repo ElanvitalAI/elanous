@@ -120,6 +120,8 @@ export interface PtyBuildIdentity {
   /** 40자 커밋 — 모르면 ''. */
   readonly sha: string;
   readonly source: PtyBuildSource;
+  readonly channel?: 'official' | 'dev';
+  readonly builtAt?: number;
   /** 기동한 코드의 뿌리 — checkout 이면 지금 HEAD 와 비교하는 자리. */
   readonly codeRoot?: string;
 }
@@ -812,6 +814,14 @@ export function listPtyManifestRows(): PtyManifestRow[] {
   } catch {
     return [];
   }
+}
+
+/** Effect gates need to distinguish a confirmed empty ledger from a failed read. */
+export function listPtyManifestRowsStrict(): PtyManifestRow[] {
+  const d = db();
+  if (!d) throw new Error('PTY manifest unavailable');
+  const rows = d.query('SELECT * FROM pty_manifest ORDER BY started_at ASC').all() as Array<Record<string, unknown>>;
+  return rows.map(mapRow);
 }
 
 /**

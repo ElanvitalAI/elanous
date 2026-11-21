@@ -33,7 +33,10 @@ async function mount(list: typeof cards = cards, titleRequestFails = false) {
   } });
   Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { localStorage, location: { search: '' } }) });
   let requests = 0;
-  const client = { fetchJson: async () => {
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  const client = { fetchJson: async (path: string, init?: RequestInit) => {
+    calls.push({ path, init });
+    if (init?.method === 'PATCH') return { ok: true, meta: { ...list[0], title: JSON.parse(String(init.body)).title } };
     if (titleRequestFails && ++requests > 1) throw Error('title unavailable');
     return { sessions: list };
   }, sessionStoreEventsUrl: () => '' };
@@ -42,8 +45,21 @@ async function mount(list: typeof cards = cards, titleRequestFails = false) {
   await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatConversationList /></DaemonContext.Provider>); });
   await act(async () => { await getSessionsService(client as never).forceRefresh(); });
   const buttons = () => tree!.root.findAllByType('button');
-  return { buttons, selected, saved, requests: () => requests };
+  return { buttons, selected, saved, requests: () => requests, calls };
 }
+
+test('이름 변경 saves through the stored-session API and updates the visible title', async () => {
+  const { calls } = await mount();
+  await act(async () => tree!.root.findAllByProps({ 'aria-label': '대화 관리' })[0]!.props.onClick());
+  await act(async () => tree!.root.findAllByProps({ role: 'menuitem' })
+    .find((item) => item.children.join('').includes('이름 변경'))!.props.onClick());
+  const input = tree!.root.findByProps({ 'aria-label': '대화 이름' });
+  await act(async () => input.props.onChange({ target: { value: '내 새 이름' } }));
+  await act(async () => tree!.root.findAllByType('button').find((button) => button.children.join('') === '저장')!.props.onClick());
+  expect(calls.some(({ path, init }) => path === '/v1/sessions/store/current' && init?.method === 'PATCH'
+    && init.body === '{"title":"내 새 이름"}')).toBe(true);
+  expect(JSON.stringify(tree!.toJSON())).toContain('내 새 이름');
+});
 
 test('recent conversations use title, preview fallback, relative time and current highlight', async () => {
   const { buttons } = await mount();

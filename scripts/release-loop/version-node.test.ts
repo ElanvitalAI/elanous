@@ -11,6 +11,8 @@ import { parseOptions } from './gate-node';
 import { runPrepare } from './prepare-node';
 import { runCutGateImagePrebuild } from './gate-image-pin.js';
 import { gateImageReadinessSignalPath, readGateImageReadinessSignal } from './release-readiness.js';
+import { simCli } from '../../src/ux-sim/in-process-cli.js';
+import { runTrafficPrepForRun } from './traffic-prep.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -342,7 +344,36 @@ function fixture(version: string, land = 'ok', install = 'ok', ready = 'ok') {
     });
     return { status: result.status, output: JSON.parse(result.stdout.trim().split('\n').at(-1)!), calls: readFileSync(join(root, 'calls'), 'utf8'), stderr: result.stderr, stdout: result.stdout };
   };
-  return { root, run, ghCalls: () => readFileSync(join(root, 'gh-calls'), 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)) };
+  const runAt = async (now: Date, ...args: string[]) => {
+    const wrapper = join(root, 'version-node-clock.ts');
+    writeFileSync(wrapper, `
+import { main } from ${JSON.stringify(resolve(import.meta.dir, 'version-node.ts'))};
+import { readGraphContext } from ${JSON.stringify(resolve(import.meta.dir, 'node-verdict.ts'))};
+import { setElanousConfigDir } from ${JSON.stringify(resolve(import.meta.dir, '../../src/elanous-config-dir.ts'))};
+import { checkTrafficPrepReceipt } from ${JSON.stringify(resolve(import.meta.dir, 'traffic-prep.ts'))};
+
+setElanousConfigDir(process.cwd());
+const { input, runId } = readGraphContext();
+const now = new Date(${now.getTime()});
+const output = main(process.argv.slice(2), process.cwd(), {
+  trafficPrepHold: {
+    now: () => now.getTime(),
+    sleep: () => { throw new Error('Fixture cut unexpectedly waited for traffic prep'); },
+    check: () => checkTrafficPrepReceipt(input.version, { root: process.cwd(), now: () => now, runId }),
+  },
+});
+console.log(JSON.stringify({ ...output, verdict: output.outcome === 'ok' ? 'pass' : 'fail',
+  summary: output.outcome === 'ok' ? output.kind + ' ' + output.version + ' · ' + output.commit : output.error }));
+if (output.outcome === 'error') process.exitCode = 1;
+`);
+    const result = await simCli(args, {
+      mode: 'spawn', entrypoint: wrapper, injectTestFlag: false,
+      allowPaths: [['release'], ['dev-bump']], cwd: root, stateRoot: root,
+      env: { PATH: `${bin}:${process.env.PATH}`, VERSION_NODE_TEST_ROOT: root, ELANOUS_GRAPH_CONTEXT: process.env.ELANOUS_GRAPH_CONTEXT },
+    });
+    return { status: result.exitCode, output: JSON.parse(result.stdout.trim().split('\n').at(-1)!), calls: readFileSync(join(root, 'calls'), 'utf8'), stderr: result.stderr };
+  };
+  return { root, run, runAt, ghCalls: () => readFileSync(join(root, 'gh-calls'), 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)) };
 }
 
 test('nextDevVersion increments patch without changing major/minor', () => {
@@ -833,10 +864,13 @@ test('chosen 0.2.4 cut survives the graph dev-bump after main has advanced to st
 });
 
 test('the chosen cut completes the fake release graph through dev-bump while advanced main stays unchanged', async () => {
-  const { root, run } = fixture('0.2.5');
+  const { root, runAt } = fixture('0.2.5');
   const chosen = 'a'.repeat(40);
   const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
   writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, chosen, chosenVersion: '0.2.4' }));
+  const now = new Date('2026-11-21T05:30:00.000Z');
+  const trafficFile = join(root, 'traffic.json');
+  writeFileSync(trafficFile, JSON.stringify({ global: 'green', seats: { OP: {}, TC: {}, MK: {}, UX: {} } }));
   const previous = process.env.ELANOUS_GRAPH_CONTEXT;
   const bumps: Array<{ output: { outcome: string; version: string; commit: string }; calls: string }> = [];
   try {
@@ -844,12 +878,21 @@ test('the chosen cut completes the fake release graph through dev-bump while adv
     const result = await runGraph(graph, { input: { version: '0.2.4', previousVersion: '0.2.3', cutCommit: chosen },
       deps: { root, runBash: async (body, opts) => {
         process.env.ELANOUS_GRAPH_CONTEXT = readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8');
+        if (body.includes('traffic-prep-node.ts')) {
+          const { input, runId } = JSON.parse(process.env.ELANOUS_GRAPH_CONTEXT!) as { input: { version: string }; runId: string };
+          const prep = await runTrafficPrepForRun({ version: input.version, runId }, {
+            root, now: () => now, schedule: () => null, traffic: { trafficFile },
+          });
+          const payload = prep.ok ? { outcome: 'ok', verdict: 'pass' } : { outcome: 'fail', verdict: 'fail' };
+          return { exitCode: prep.ok ? 0 : 1, stdout: JSON.stringify(payload) + '\n', stderr: '' };
+        }
         if (body.includes('version-node.ts release')) {
-          const released = run('release', '--json');
+          const released = await runAt(now, 'release', '--json');
+          expect(released.output).toMatchObject({ outcome: 'ok', commit: chosen });
           return { exitCode: released.status!, stdout: JSON.stringify(released.output) + '\n', stderr: released.stderr };
         }
         if (body.includes('version-node.ts dev-bump')) {
-          const bump = run('dev-bump', '--json');
+          const bump = await runAt(now, 'dev-bump', '--json');
           bumps.push(bump);
           return { exitCode: bump.status!, stdout: JSON.stringify(bump.output) + '\n', stderr: bump.stderr };
         }

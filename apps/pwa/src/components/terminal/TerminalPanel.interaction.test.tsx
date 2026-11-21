@@ -105,6 +105,7 @@ let daemon = defaultDaemon;
 mock.module('@/components/providers/DaemonProvider', () => ({ ...actualDaemonProvider, useDaemon: () => daemon }));
 
 let TerminalPanelComponent: typeof import('./TerminalPanel').TerminalPanel;
+let TerminalPaneLayoutComponent: typeof import('./TerminalPanel').TerminalPaneLayout;
 let ModifierBarComponent: typeof import('./ModifierBar').ModifierBar;
 let registerTerminalInputFn: typeof import('./terminal-input-registry').registerTerminalInput;
 let TerminalChatDockModule: typeof import('./TerminalChatDock').TerminalChatDock;
@@ -117,6 +118,7 @@ beforeAll(async () => {
     import('./TerminalChatDock'), import('./PtyLiveView.lazy'),
   ]);
   TerminalPanelComponent = panel.TerminalPanel;
+  TerminalPaneLayoutComponent = panel.TerminalPaneLayout;
   ModifierBarComponent = modifier.ModifierBar;
   registerTerminalInputFn = input.registerTerminalInput;
   TerminalChatDockModule = dock.TerminalChatDock;
@@ -191,6 +193,66 @@ async function selectTheOnlyRow(): Promise<string> {
   await harness.settle();
   return text;
 }
+
+describe('TerminalPaneLayout · shared font size', () => {
+  test('separate mounts and storage events update every layout and a later mount', async () => {
+    storage.clear();
+    const layout = { layouts: [{ runId: 'run', slots: [{ terminalId: 'a', position: 'split' as const }] }], unknown: [] };
+    function Layout({ id }: { id: string }) {
+      const element = TerminalPaneLayoutComponent({ layout: { ...layout, layouts: [{ ...layout.layouts[0], slots: [{ terminalId: id, position: 'split' as const }] }] }, sessionId: 's', onForeignInputActivity: () => {} });
+      const rewrite = (node: ReactNode): ReactNode => {
+        if (Array.isArray(node)) return node.map(rewrite);
+        if (!isValidElement(node)) return node;
+        const props = node.props as Record<string, unknown>;
+        if (typeof props.onFontSizeChange === 'function') return createElement('div', { key: id, 'data-id': id, 'data-size': props.sharedFontSize, onChange: props.onFontSizeChange });
+        return cloneElement(node as ReactElement, props, rewrite(props.children as ReactNode));
+      };
+      return rewrite(element);
+    }
+    let tree: ReturnType<typeof create> | undefined;
+    try {
+      await act(async () => { tree = create(<><Layout id="a" /><Layout id="b" /></>); });
+      const pane = (id: string) => tree!.root.findByProps({ 'data-id': id });
+      await act(async () => { pane('a').props.onChange(19); });
+      expect(pane('b').props['data-size']).toBe(19);
+      storage.set('elanous.pwa.termFontSize', '23');
+      await act(async () => { for (const listener of windowListeners.get('storage') ?? []) listener({ key: 'elanous.pwa.termFontSize', storageArea: window.localStorage }); });
+      expect(pane('a').props['data-size']).toBe(23);
+      expect(pane('b').props['data-size']).toBe(23);
+      await act(async () => { tree!.update(<><Layout id="a" /><Layout id="b" /><Layout id="c" /></>); });
+      expect(pane('c').props['data-size']).toBe(23);
+    } finally {
+      if (tree) await act(async () => { tree!.unmount(); });
+      storage.clear();
+    }
+  });
+  test('a font change from one pane reaches both panes', async () => {
+    await act(async () => { harness.unmount(); });
+    const layout = { layouts: [{ runId: 'run', slots: [{ terminalId: 'a', position: 'split' as const }, { terminalId: 'b', position: 'tab' as const }] }], unknown: [] };
+    harness.render(() => TerminalPaneLayoutComponent({ layout, sessionId: 's1', onForeignInputActivity: () => {} }));
+    const panes = () => harness.findAll((item) => typeof item.props.onFontSizeChange === 'function');
+    expect(panes()).toHaveLength(2);
+    harness.act(() => (panes()[0].props.onFontSizeChange as (size: number) => void)(18));
+    expect(panes().map((pane) => pane.props.sharedFontSize)).toEqual([18, 18]);
+    await act(async () => { harness.unmount(); });
+  });
+});
+
+describe('TerminalPanel · unavailable storage', () => {
+  test('mount and tab selection remain usable when the storage getter throws', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(window, 'localStorage')!;
+    Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new Error('storage blocked'); } });
+    try {
+      await renderPanel();
+      const tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+      harness.act(() => (tabs.props.onActiveChange as (id: string) => void)('shell-a'));
+      expect(harness.find((element) => typeof element.props.onActiveChange === 'function').props.activeId).toBe('shell-a');
+    } finally {
+      await act(async () => { harness.unmount(); });
+      Object.defineProperty(window, 'localStorage', descriptor);
+    }
+  });
+});
 
 describe('TerminalPanel · modifier bar placement', () => {
   test('coarse-pointer bar targets the selected shell terminal, including after a tab switch', async () => {

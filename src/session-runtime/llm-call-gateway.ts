@@ -45,6 +45,17 @@ export function llmObserveDelegation<T>(fields: LlmCallContext, send: () => T): 
   return observeSend(null, fields, send, 'llm.delegate', 'prompt');
 }
 
+/** Declared-name ↔ wire-name aliases. The provider registry calls the subscription
+ *  backend `openai-codex` (provider.name), the wire transport says `codex`
+ *  (retryOptsFor('codex', …) → retry-api.ts). Same backend — without symmetric
+ *  normalization every codex call fired one mismatch warn row (24h 실측 38,395/41,683
+ *  attempt ≈ 92%가 이 별칭쌍 · LLM-CALL-LEDGER-NO-GAP). Comparison-only: emitted rows
+ *  keep the raw names. */
+const PROVIDER_NAME_ALIASES: Readonly<Record<string, string>> = { 'openai-codex': 'codex' };
+function canonicalProviderName(name: string): string {
+  return PROVIDER_NAME_ALIASES[name] ?? name;
+}
+
 function observeSend<T>(
   url: string | URL | null, fields: LlmCallContext, send: () => T,
   category: 'llm.call' | 'llm.delegate', event: 'attempt' | 'prompt',
@@ -69,7 +80,8 @@ function observeSend<T>(
     });
     // Declared != observed: exactly one extra warn line, only when a requested value was declared and differs (never inferred).
     const model = scoped.model ?? null;
-    const providerDiffers = scoped.requestedProvider !== undefined && scoped.requestedProvider !== provider;
+    const providerDiffers = scoped.requestedProvider !== undefined
+      && canonicalProviderName(scoped.requestedProvider) !== canonicalProviderName(provider);
     const modelDiffers = scoped.requestedModel !== undefined && scoped.requestedModel !== model;
     if (providerDiffers || modelDiffers) {
       debug.log(category, 'mismatch', {

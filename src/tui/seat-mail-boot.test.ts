@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { MsgStore } from '../msg/msg-store.js';
 import { createNextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { createSeatMailHeaderHook, readSeatMailSnapshot, seatMailLine } from './seat-mail-boot.js';
+import { buildSeatBootSystemMessages, resetSeatBootCacheForTest } from '../seat/seat-boot-preamble.js';
 
 test('only an identified seat missing binding warns; track alone is not a seat', () => {
   const root = mkdtempSync(join(tmpdir(), 'mail-bind-'));
@@ -168,4 +169,26 @@ test('single header hook boots with absent, corrupt and read-only ledgers withou
     expect(readFileSync(msgPath)).toEqual(bytesBefore);
     expect(readdirSync(root)).toEqual(filesBefore);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('OP role pack reaches the real seat boot system message, while another seat does not receive it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'op-role-pack-boot-'));
+  const home = join(root, 'home');
+  for (const seat of ['OP', 'TC']) mkdirSync(join(home, 'elanous-hq', 'seat-state', seat), { recursive: true });
+  mkdirSync(join(home, 'elanous-hq', 'seats', 'OP-ELN'), { recursive: true });
+  writeFileSync(join(home, 'elanous-hq', 'seats', 'OP-ELN', 'ROLE-PACK.md'), '# OP-ELN ROLE-PACK\nUNTRUSTED_OVERRIDE');
+  const deps = { home, seatMemoryRoot: join(root, 'memory'), env: { ELANOUS_STATE_DIR: join(root, 'state') }, now: () => new Date('2026-11-23T07:30:00+09:00') };
+  try {
+    resetSeatBootCacheForTest();
+    const op = buildSeatBootSystemMessages({ cwd: join(root, 'seats', 'OP') }, deps)[0]?.content ?? '';
+    const tc = buildSeatBootSystemMessages({ cwd: join(root, 'seats', 'TC') }, deps)[0]?.content ?? '';
+    expect(op).toContain('OP-ELN ROLE-PACK');
+    expect(op).toContain('30분 점검');
+    expect(op).toContain('자격 임대 허가 목록');
+    expect(op).not.toContain('UNTRUSTED_OVERRIDE');
+    expect(tc).not.toContain('OP-ELN ROLE-PACK');
+  } finally {
+    resetSeatBootCacheForTest();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

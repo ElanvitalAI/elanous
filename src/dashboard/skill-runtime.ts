@@ -30,6 +30,7 @@ type PendingFold = {
 };
 
 export interface DashboardSkillRuntimeDeps {
+  sessionId?: string;
   chatHistory: readonly DashboardConversationTurn[];
   chatLines: string[];
   contextRegistry: ContextRegistry;
@@ -214,6 +215,7 @@ export async function runDashboardSkillByName(
       },
       {
         signal: abortCtrl.signal,
+        sessionId: deps.sessionId,
         systemContext: deps.skillContextLabel,
         context: deps.contextRegistry,
         priorConversation: buildDashboardSkillPriorConversation(deps.chatHistory, 6),

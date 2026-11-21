@@ -1,6 +1,12 @@
-import { expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { _setStreamDisconnectRetryDelayForTest } from './llm/stream-fallback.js';
 import { streamLLMWithTools, type LLMProvider, type LLMStreamEvent } from './llm.js';
+
+// These rounds run on an injected fixture provider; a global ELANOUS_TEST_FAKE_LLM=1 (gate pods) is a forced-fake fence that
+// outranks it by design (llm-usage-attribution.test.ts), so lift the switch for this file and restore it.
+let priorTestFakeLlm: string | undefined;
+beforeAll(() => { priorTestFakeLlm = process.env.ELANOUS_TEST_FAKE_LLM; delete process.env.ELANOUS_TEST_FAKE_LLM; });
+afterAll(() => { if (priorTestFakeLlm === undefined) delete process.env.ELANOUS_TEST_FAKE_LLM; else process.env.ELANOUS_TEST_FAKE_LLM = priorTestFakeLlm; });
 
 async function renderRounds(rounds: Array<Array<LLMStreamEvent | Error>>) {
   let round = 0;
@@ -69,4 +75,13 @@ test('disconnect after a tool paragraph rewinds and replays the separator as ord
     expect(result.deltas).not.toContain('\n\n');
     expect(result.turnTextChars).toContain('\n\nsecond'.length);
   } finally { _setStreamDisconnectRetryDelayForTest(undefined); }
+});
+
+test('the paragraph glue between rounds is not part of the returned final answer that replaces earlier rounds', async () => {
+  const result = await renderRounds([
+    [{ type: 'text', delta: '준비하겠습니다.' }, tool],
+    [{ type: 'text', delta: '완료했습니다.' }],
+  ]);
+  expect(result.visible).toBe('준비하겠습니다.\n\n완료했습니다.');
+  expect(result.text).toBe('완료했습니다.');
 });

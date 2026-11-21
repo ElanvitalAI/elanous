@@ -142,8 +142,8 @@ export class WorkerRegistryStore {
 
   // Read committed log only; callers must resnapshot on any uncertainty.
   watchNext(seq: number): WorkerWatchEvent | undefined {
-    if (this.db.inTransaction) throw new Error('watch unavailable during transaction');
     if (this.watchFileIdentity() !== this.fileIdentity) throw new Error('watch database replaced; resnapshot');
+    if (this.db.inTransaction) throw new Error('watch unavailable during transaction');
     return this.db.transaction(() => {
       if (seq && !this.db.query('SELECT 1 FROM worker_watch WHERE seq = ?').get(seq))
         throw new Error('watch cursor expired; resnapshot');

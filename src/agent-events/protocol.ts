@@ -12,8 +12,8 @@ export const ENV_EVENT_SOCKET = 'ELANOUS_EVENT_SOCKET';
 export const ENV_EVENT_PANE = 'ELANOUS_EVENT_PANE';
 export const ENV_EVENT_WS = 'ELANOUS_EVENT_WS';
 
-export type AgentState = 'working' | 'idle' | 'blocked' | 'done' | 'exited';
-export const AGENT_STATES: readonly AgentState[] = ['working', 'idle', 'blocked', 'done', 'exited'];
+export type AgentState = 'working' | 'idle' | 'blocked' | 'waiting-input' | 'done' | 'exited';
+export const AGENT_STATES: readonly AgentState[] = ['working', 'idle', 'blocked', 'waiting-input', 'done', 'exited'];
 export type ChildSourceName = 'subagent' | 'harness' | 'graph' | 'mission' | 'shell' | 'graph-node';
 export const CHILD_SOURCES: readonly ChildSourceName[] = ['subagent', 'harness', 'graph', 'mission', 'shell', 'graph-node'];
 

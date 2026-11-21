@@ -1,16 +1,11 @@
 // Pane reports describe the running TUI, not the els server or its working tree.
-import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { desiredSha } from '../nexus/host-registry/desired-sha.js';
 
 export type BuildAge = 'current' | 'older' | 'different' | 'unknown';
-export function desiredSha(path = join(homedir(), 'elanous-hq/seat-state/OP/rail/DESIRED.json')): string | undefined {
-  try {
-    const value: unknown = JSON.parse(readFileSync(path, 'utf8')).sha;
-    return typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : undefined;
-  } catch { return undefined; }
-}
+export { desiredSha };
 export function buildAge(sha: string | undefined, desired: string | undefined, ancestor: (a: string, b: string) => boolean | undefined): BuildAge {
   if (!sha || !desired || !/^[a-f0-9]{40}$/i.test(sha)) return 'unknown';
   if (sha.toLowerCase() === desired.toLowerCase()) return 'current';

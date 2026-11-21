@@ -395,7 +395,7 @@ function refuse(r: Resolved, id: string, target: string, reason: StaticLeaseRefu
 
 function eventFields(record: StaticLeaseRecord): Record<string, unknown> {
   return {
-    kind: 'static', id: record.id, leaseId: record.leaseId, target: record.target, targetType: record.targetType,
+    kind: 'static', id: record.id, envName: record.envName, leaseId: record.leaseId, target: record.target, targetType: record.targetType,
     issuedAt: record.issuedAt, expiresAt: record.expiresAt, fingerprint8: record.fingerprint8,
     ...(record.targetIdentity?.nodeKeyFingerprint8 ? { nodeKeyFingerprint8: record.targetIdentity.nodeKeyFingerprint8 } : {}),
   };
@@ -476,9 +476,9 @@ export async function issueStaticLease(req: StaticLeaseRequest, deps: StaticLeas
   return writeLease(r, checked, r.newLeaseId(), r.now());
 }
 
-/** (항목, 대상) 의 가장 최근 원장 줄 — 상태와 무관하게. 회수된 줄도 «최근»이면 그대로 돌려준다(건너뛰지 않는다). */
-function latestFor(r: Resolved, itemId: string, target: string): StaticLeaseRecord | undefined {
-  return readStaticLeaseRecords(r.configDir).filter((x) => x.id === itemId && x.target === target).pop();
+/** (서비스, env 슬롯, 대상) 의 가장 최근 원장 줄 — 회수된 줄도 건너뛰지 않는다. */
+function latestFor(r: Resolved, item: StaticLeaseItem, target: string): StaticLeaseRecord | undefined {
+  return readStaticLeaseRecords(r.configDir).filter((x) => x.id === item.id && x.envName === item.envName && x.target === target).pop();
 }
 
 /**
@@ -494,8 +494,8 @@ export async function renewStaticLease(req: StaticLeaseRequest & { leaseId?: str
   if ('ok' in checked) return checked;
   const target = checked.target.target;
   const current = req.leaseId
-    ? readStaticLeaseRecords(r.configDir).find((x) => x.leaseId === req.leaseId && x.id === checked.item.id && x.target === target)
-    : latestFor(r, checked.item.id, target);
+    ? readStaticLeaseRecords(r.configDir).find((x) => x.leaseId === req.leaseId && x.id === checked.item.id && x.envName === checked.item.envName && x.target === target)
+    : latestFor(r, checked.item, target);
   if (!current) {
     if (req.leaseId) return refuse(r, checked.item.id, target, 'not-found', `임대 ${req.leaseId} 가 원장에 없다 — 새로 만들지 않는다`);
     return writeLease(r, checked, r.newLeaseId(), r.now());
@@ -549,11 +549,13 @@ export async function revokeStaticLeases(sel: { leaseId?: string; to?: string; i
   if (sel.to && !parsed) return { ok: false, reason: 'invalid-target' };
   const itemId = sel.id ? resolveStaticLeaseItem(sel.id) : undefined;
   const wantId = itemId && !('refused' in itemId) ? itemId.id : sel.id;
+  const wantEnvName = itemId && !('refused' in itemId) ? itemId.envName : undefined;
   const targetValue = parsed?.type === 'config-dir' ? (() => { try { return realpathSync(parsed.value); } catch { return parsed.value; } })() : parsed?.value;
   const picked = readStaticLeaseRecords(r.configDir).filter((x) => !x.revokedAt
     && (sel.leaseId ? x.leaseId === sel.leaseId : true)
     && (targetValue ? x.target === targetValue : true)
-    && (wantId ? x.id === wantId : true));
+    && (wantId ? x.id === wantId : true)
+    && (wantEnvName ? x.envName === wantEnvName : true));
   if (!picked.length || (!sel.leaseId && !sel.to)) {
     r.log('secret', 'secret.lease.refused', { kind: 'static', id: sel.id, target: sel.to, leaseId: sel.leaseId, reason: 'not-found', op: 'revoke' }, 'warn');
     return { ok: false, reason: 'not-found' };

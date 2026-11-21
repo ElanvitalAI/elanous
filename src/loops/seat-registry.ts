@@ -9,7 +9,7 @@ export function readRegistryFile(path: string): string {
   return registryFileRead.read(path);
 }
 
-export type SeatRegistryWake = 'herdr' | 'pty-inject' | 'els' | 'none';
+export type SeatRegistryWake = 'herdr' | 'pty-inject' | 'els' | 'tmux' | 'none';
 export type SeatRegistryReplyBody = 'agent' | 'none' | 'rules';
 /** Which agent body runs in the seat's pane (OP 11-17 21:5x). `eln` seats watch their own inbox (#38164) when opted in. */
 export type SeatAgentRuntime = 'eln' | 'claude-code' | 'codex';
@@ -37,6 +37,7 @@ const ADDRESS = /^[A-Z][A-Z0-9_-]{0,63}$/;
 const HOST = /^(?:local|[A-Za-z0-9][A-Za-z0-9.-]{0,252})$/;
 const TARGET = /^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/;
 const ELS_TARGET = /^els:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const TMUX_TARGET = /^seat-[A-Z][A-Z0-9_-]{0,63}$/;
 
 function parseRegistry(raw: unknown): SeatRegistry {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('expected an object');
@@ -53,10 +54,10 @@ function parseRegistry(raw: unknown): SeatRegistry {
     if (seen.has(address)) throw new Error(`duplicate address ${address}`);
     seen.add(address);
     if (!HOST.test(host)) throw new Error(`seats[${index}].host is invalid`);
-    if (entry.wake !== 'herdr' && entry.wake !== 'pty-inject' && entry.wake !== 'els' && entry.wake !== 'none') throw new Error(`seats[${index}].wake is invalid`);
+    if (entry.wake !== 'herdr' && entry.wake !== 'pty-inject' && entry.wake !== 'els' && entry.wake !== 'tmux' && entry.wake !== 'none') throw new Error(`seats[${index}].wake is invalid`);
     if (entry.replyBody !== 'agent' && entry.replyBody !== 'none' && entry.replyBody !== 'rules') throw new Error(`seats[${index}].replyBody is invalid`);
     if (typeof entry.optIn !== 'boolean') throw new Error(`seats[${index}].optIn must be boolean`);
-    if (entry.wake !== 'none' && (!target || !(entry.wake === 'els' ? ELS_TARGET.test(target) : TARGET.test(target)))) throw new Error(`seats[${index}].target is required and must be host:pane`);
+    if (entry.wake !== 'none' && (!target || !(entry.wake === 'els' ? ELS_TARGET.test(target) : entry.wake === 'tmux' ? target === `seat-${address}` && TMUX_TARGET.test(target) : TARGET.test(target)))) throw new Error(`seats[${index}].target is invalid for its wake kind`);
     if (entry.wake === 'pty-inject' && host !== 'local') throw new Error(`seats[${index}]: pty-inject requires host=local`);
     if (entry.wake === 'none' && target !== undefined && !TARGET.test(target) && !ELS_TARGET.test(target)) throw new Error(`seats[${index}].target is invalid`);
     if (host === 'unknown' && (entry.wake !== 'none' || target !== undefined || entry.optIn !== false)) throw new Error('unknown host cannot bind a wake target');
@@ -123,7 +124,7 @@ function deliveryOf(value: unknown, index: number): SeatRegistryDelivery {
  *  herdr/pty-inject inject, so they are adapter and keep the pane target as session.
  *  Any other wake (including a future no-inject value) stays eln/queue and must not invent an adapter session. */
 export function normalizeSeatRegistryV1Entry(entry: SeatRegistryEntry): SeatRegistryEntryV2 {
-  if (entry.wake === 'herdr' || entry.wake === 'pty-inject' || entry.wake === 'els') {
+  if (entry.wake === 'herdr' || entry.wake === 'pty-inject' || entry.wake === 'els' || entry.wake === 'tmux') {
     return {
       // A declared eln body keeps its pane as the adapter session (the 60s fallback knocks there) but is runtime eln.
       address: entry.address, host: entry.host, runtime: entry.runtime === 'eln' ? 'eln' : 'external-cli', delivery: 'adapter',

@@ -43,7 +43,7 @@ test('server: sh → a child «eln» → kind eln (ls · status · tab «💬 el
   const tabOf = async () => { const ls = (await requestEls(socket, { op: 'ls' })).message; return buildTabRow(withCommands(parsePaneRows(ls), ls), undefined, 20).line!.trimEnd(); };
 
   expect(await probeForegrounds(started.core, async () => table)).toEqual([pane]);
-  expect(await tabOf()).toBe('\u001b[100;37m ⌨️ SH \u001b[49;39m +');
+  expect(await tabOf()).toBe('\u001b[100;37m ⌨︎  SH \u001b[49;39m +');
   table = '  4242  5000 /bin/sh\n  5000  5000 bun /opt/x/elanous.mjs\n';
   expect(await probeForegrounds(started.core, async () => table)).toEqual([pane]);
   const listed = JSON.parse((await requestEls(socket, { op: 'ls' })).message) as { panes: { kind?: string; fgCommand?: string[] }[] };
@@ -52,5 +52,5 @@ test('server: sh → a child «eln» → kind eln (ls · status · tab «💬 el
   expect(await tabOf()).toBe('\u001b[100;37m 💬 ELN \u001b[49;39m +');
   table = '  4242  4242 /bin/sh\n';
   expect(await probeForegrounds(started.core, async () => table)).toEqual([pane]);
-  expect(await tabOf()).toBe('\u001b[100;37m ⌨️ SH \u001b[49;39m +');
+  expect(await tabOf()).toBe('\u001b[100;37m ⌨︎  SH \u001b[49;39m +');
 });

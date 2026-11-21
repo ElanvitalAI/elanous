@@ -1,3 +1,4 @@
+import { findElanousRepoRoot } from '../code-edit/system-file-guard.js';
 import { RELEASE_CUT_NODE_IDS } from '../../scripts/release-loop/release-node-ids.js';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs';
@@ -56,7 +57,7 @@ export function latestCutRecord(output: unknown): Record<string, unknown> {
 
 /** Resolve release identities from the declared plugin graph, not a parallel list in this verifier. */
 function pwaRoute() {
-  const manifest = loadReleaseGraphManifest(join(import.meta.dir, '../../graphs/release/plugin.json'));
+  const manifest = loadReleaseGraphManifest(join(findElanousRepoRoot(import.meta.dir) ?? join(import.meta.dir, '../..'), 'graphs/release/plugin.json'));
   const graph = parseYaml(manifest.graphSources[0] ?? '') as {
     graph_id?: string; entry_node?: string;
     edges?: Array<{ from?: string; on?: string; branches?: { ok?: string[] }; join?: string }>;

@@ -1,4 +1,6 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { loopCronLogPath } from '../loops/registry.js';
 import { join } from 'node:path';
 import { redactSecretText } from '../debug/log.js';
 
@@ -73,6 +75,7 @@ export function shouldAlert(state: FailureStreak, threshold: number): boolean {
   return state.consecutive >= threshold && !state.alertedAt;
 }
 
-export function failureAlertText(state: FailureStreak): string {
-  return `스튜어드 연속 실패 ${state.consecutive}회 · 마지막 ${state.lastStage} · ${redactSecretText(state.lastReason).slice(0, 120)} · 로그 /tmp/elanous-loop-steward.log`;
+export function failureAlertText(state: FailureStreak, stateRoot = effectiveInstanceRoot(), legacyPath = '/tmp/elanous-loop-steward.log'): string {
+  const legacy = existsSync(legacyPath) ? `\n옛 경로(만료) ${legacyPath}` : '';
+  return `스튜어드 연속 실패 ${state.consecutive}회 · 마지막 ${state.lastStage} · ${redactSecretText(state.lastReason).slice(0, 120)} · 로그 ${loopCronLogPath('steward', stateRoot)}${legacy}`;
 }

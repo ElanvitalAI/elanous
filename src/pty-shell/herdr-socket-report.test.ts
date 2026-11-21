@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:net';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -397,7 +397,9 @@ describe('createHerdrSocketReporter', () => {
           buf = buf.slice(nl + 1);
           const frame = JSON.parse(line) as HerdrSocketFrame;
           got.push(frame);
-          if (rejectFirst) {
+          if (frame.method === 'pane.current') {
+            c.write(JSON.stringify({ id: frame.id, result: { pane: { pane_id: 'w1:p1', terminal_id: 'term-1' } } }) + '\n');
+          } else if (rejectFirst) {
             rejectFirst = false;
             c.write(`{"id":"${frame.id}","error":{"code":"busy","message":"x"}}\n`);
           } else {
@@ -426,18 +428,173 @@ describe('createHerdrSocketReporter', () => {
       await reporter.settled();
       reporter.release();
       await reporter.settled();
-      expect(methods(got)).toEqual(['report_agent', 'report_agent', 'report_metadata', 'release_agent']);
-      expect(got[1]!.params).toMatchObject({ state: 'working', source: 'elanous', agent: 'elanous', pane_id: 'w1:p1' });
-      expect(got[1]!.params).not.toHaveProperty('metadata');
-      expect(got[2]!.params).toMatchObject({ display_agent: 'eln·grok-4.7', ttl_ms: 60_000 });
+      expect(methods(got)).toEqual(['current', 'report_agent', 'current', 'report_agent', 'current', 'report_metadata', 'current', 'release_agent']);
+      expect(got[3]!.params).toMatchObject({ state: 'working', source: 'elanous', agent: 'elanous', pane_id: 'w1:p1' });
+      expect(got[3]!.params).not.toHaveProperty('metadata');
+      expect(got[5]!.params).toMatchObject({ display_agent: 'eln·grok-4.7', ttl_ms: 60_000 });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('moved Herdr pane: inherited old id reports to the current pane, never the old address', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'herdr-moved-'));
+    const sock = join(dir, 'h.sock');
+    const frames: HerdrSocketFrame[] = [];
+    let status = 'unknown';
+    let terminalId = 'term-j';
+    const logs: string[] = [];
+    const server = createServer((client) => {
+      let buf = '';
+      client.on('data', (chunk) => {
+        buf += String(chunk);
+        const end = buf.indexOf('\n');
+        if (end < 0) return;
+        const frame = JSON.parse(buf.slice(0, end)) as HerdrSocketFrame;
+        frames.push(frame);
+        if (frame.method === 'pane.current') {
+          client.write(JSON.stringify({ id: frame.id, result: { pane: { pane_id: 'w3:p5', terminal_id: terminalId } } }) + '\n');
+        } else if (frame.params.pane_id !== 'w3:p5') {
+          client.write(JSON.stringify({ id: frame.id, error: { code: 'pane_not_found', message: 'moved' } }) + '\n');
+        } else {
+          if (frame.method === 'pane.report_agent') status = String(frame.params.state);
+          client.write(JSON.stringify({ id: frame.id, result: { type: 'ok' } }) + '\n');
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(sock, resolve));
+    try {
+      const reporter = createHerdrSocketReporter({
+        env: { HERDR_ENV: '1', HERDR_PANE_ID: 'w4:pP', HERDR_SOCKET_PATH: sock },
+        now: () => 1_700_000_000_000,
+        schedule: manualTimers().schedule,
+        log: (event) => { logs.push(event); },
+      })!;
+      reporter.state('idle');
+      await reporter.settled();
+      expect(status).toBe('idle');
+      expect(frames.map((frame) => frame.method)).toEqual(['pane.current', 'pane.report_agent', 'pane.current', 'pane.report_metadata']);
+      expect(frames.every((frame) => frame.method === 'pane.current' || frame.params.pane_id === 'w3:p5')).toBe(true);
+      terminalId = 'another-terminal';
+      reporter.state('working');
+      await reporter.settled();
+      expect(status).toBe('idle');
+      expect(frames.at(-1)?.method).toBe('pane.current');
+      expect(logs).toContain('pane-terminal-changed');
+    } finally {
+      server.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('move after idle was confirmed re-reports state when the refresh finds the new pane', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'herdr-late-move-'));
+    const sock = join(dir, 'h.sock');
+    const frames: HerdrSocketFrame[] = [];
+    let currentPane = 'w4:pP';
+    let status = 'unknown';
+    const server = createServer((client) => {
+      let buf = '';
+      client.on('data', (chunk) => {
+        buf += String(chunk);
+        const end = buf.indexOf('\n');
+        if (end < 0) return;
+        const frame = JSON.parse(buf.slice(0, end)) as HerdrSocketFrame;
+        frames.push(frame);
+        if (frame.method === 'pane.current') {
+          client.write(JSON.stringify({ id: frame.id, result: { pane: { pane_id: currentPane, terminal_id: 'term-j' } } }) + '\n');
+        } else if (frame.params.pane_id !== currentPane) {
+          client.write(JSON.stringify({ id: frame.id, error: { code: 'pane_not_found' } }) + '\n');
+        } else {
+          if (frame.method === 'pane.report_agent') status = String(frame.params.state);
+          client.write(JSON.stringify({ id: frame.id, result: { type: 'ok' } }) + '\n');
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(sock, resolve));
+    const timers = manualTimers();
+    try {
+      const reporter = createHerdrSocketReporter({
+        env: { HERDR_ENV: '1', HERDR_PANE_ID: 'w4:pP', HERDR_SOCKET_PATH: sock },
+        now: () => 1_700_000_000_000,
+        schedule: timers.schedule,
+      })!;
+      reporter.state('idle');
+      await reporter.settled();
+      expect(status).toBe('idle');
+      currentPane = 'w3:p5';
+      status = 'unknown'; // Herdr loses the old agent lease when the pane moves.
+      timers.fire(); // The long-running TUI refreshes metadata without changing state.
+      await reporter.settled();
+      if (status !== 'idle') {
+        timers.fire(); // A retry, if rebind schedules one, must restore state.
+        await reporter.settled();
+      }
+      expect(status).toBe('idle');
+      expect(frames.some((frame) => frame.method === 'pane.report_agent' && frame.params.pane_id === 'w3:p5')).toBe(true);
+    } finally {
+      server.close();
       rmSync(dir, { recursive: true, force: true });
     }
   });
 });
 
 describe('releaseNow — exit 훅의 동기 반납', () => {
+  test('terminal mismatch or failed current lookup sends no release; verified move releases current pane', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'herdr-sync-identity-'));
+    const sock = join(dir, 'h.sock');
+    const modeFile = join(dir, 'mode');
+    const framesFile = join(dir, 'frames');
+    writeFileSync(modeFile, 'normal');
+    writeFileSync(framesFile, '');
+    const script = [
+      "const fs=require('node:fs');const net=require('node:net');",
+      "const [sock,modeFile,framesFile]=process.argv.slice(1);",
+      "net.createServer(c=>{let b='';c.on('data',d=>{b+=d;const n=b.indexOf('\\n');if(n<0)return;",
+      "const f=JSON.parse(b.slice(0,n));fs.appendFileSync(framesFile,JSON.stringify(f)+'\\n');",
+      "const mode=fs.readFileSync(modeFile,'utf8');let result={type:'ok'};let error;",
+      "if(f.method==='pane.current'){if(mode==='error')error={code:'unavailable'};",
+      "else result={pane:{pane_id:mode==='moved'?'w3:p5':'w4:pP',terminal_id:mode==='mismatch'?'term-other':'term-original'}};}",
+      "c.end(JSON.stringify({id:f.id,...(error?{error}:{result})})+'\\n');})})",
+      ".listen(sock,()=>console.log('ready'));",
+    ].join('');
+    const server = Bun.spawn([process.execPath, '-e', script, sock, modeFile, framesFile], { stdout: 'pipe', stderr: 'ignore' });
+    try {
+      const reader = server.stdout.getReader();
+      let output = '';
+      while (!output.includes('ready')) output += new TextDecoder().decode((await reader.read()).value);
+      const makeReporter = async () => {
+        writeFileSync(modeFile, 'normal');
+        const reporter = createHerdrSocketReporter({
+          env: { HERDR_ENV: '1', HERDR_PANE_ID: 'w4:pP', HERDR_SOCKET_PATH: sock },
+          schedule: manualTimers().schedule,
+        })!;
+        reporter.state('idle');
+        await reporter.settled();
+        return reporter;
+      };
+      const releases = () => readFileSync(framesFile, 'utf8').split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line) as HerdrSocketFrame)
+        .filter((frame) => frame.method === 'pane.release_agent');
+      const mismatch = await makeReporter();
+      writeFileSync(modeFile, 'mismatch');
+      mismatch.releaseNow();
+      expect(releases()).toHaveLength(0);
+      const unavailable = await makeReporter();
+      writeFileSync(modeFile, 'error');
+      unavailable.releaseNow();
+      expect(releases()).toHaveLength(0);
+      const moved = await makeReporter();
+      writeFileSync(modeFile, 'moved');
+      moved.releaseNow();
+      expect(releases().map((frame) => frame.params.pane_id)).toEqual(['w3:p5']);
+    } finally {
+      server.kill();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('이벤트 루프 없이 release_agent 한 프레임 · 뒤 상태는 안 보낸다', async () => {
     const c = collecting();
     const sync: HerdrSocketFrame[] = [];

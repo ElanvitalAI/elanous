@@ -150,7 +150,7 @@ test('isolated decisions CLI skips adjudication and records the write target', (
     registerDecisionsCommands(cli, { humanTerminal: () => true, stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) }, { log: s => lines.push(s) }, hq);
     cli.parse(['decisions', ...withJudgment(raise), '--hq-override'], { from: 'user' });
     const entry = JSON.parse(lines.at(-1)!);
-    cli.parse(['decisions', 'decide', entry.id, 'a', '--json'], { from: 'user' });
+    cli.parse(['decisions', 'decide', entry.id, 'a', '--auto', '--agent', 'codex', '--delegation', 'isolated test', '--json'], { from: 'user' });
     expect(JSON.parse(lines.at(-1)!).choice).toBe('a');
     expect(events).toContainEqual({ category: 'hq.fence', event: 'skipped-isolated', data: { root: stateDir, command: 'decisions raise' } });
     expect(events).toContainEqual({ category: 'hq.fence', event: 'skipped-isolated', data: { root: stateDir, command: 'decisions decide' } });
@@ -301,11 +301,11 @@ test('decisions CLI fences raise/decide at generation, permits observed override
     expect(readFileSync(path, 'utf8')).toBe(before);
     expect(JSON.parse(run('show', entry.id, '--json')!).status).toBe('open');
     process.exitCode = 0;
-    expect(run('decide', entry.id, 'a')).toBeUndefined();
+    expect(run('decide', entry.id, 'a', '--auto', '--agent', 'codex', '--delegation', 'fence test')).toBeUndefined();
     expect(process.exitCode).toBe(4);
     expect(readFileSync(path, 'utf8')).toBe(before);
     process.exitCode = 0;
-    expect(JSON.parse(run('decide', entry.id, 'a', '--hq-override', '--json')!).choice).toBe('a');
+    expect(JSON.parse(run('decide', entry.id, 'a', '--auto', '--agent', 'codex', '--delegation', 'fence test', '--hq-override', '--json')!).choice).toBe('a');
     expect(process.exitCode).toBe(0);
     expect(logs).toContain('cli-override');
     expect(errors.some(line => line.includes('hq override: decisions decide'))).toBe(true);
@@ -315,7 +315,7 @@ test('decisions CLI fences raise/decide at generation, permits observed override
     expect(errors.some(line => line.includes('hq override: decisions raise'))).toBe(true);
   } finally { process.exitCode = prior ?? 0; console.error = oldError; rmSync(stateDir, { recursive: true, force: true }); }
 });
-test('CLI raises, filters, shows and records human/AUTO decisions; validation errors do not append', () => {
+test('CLI raises, filters, shows and records AUTO decisions; validation errors do not append', () => {
   const stateDir = root();
   const repoRoot = emptyGitRepo(join(stateDir, 'repo'));
   const lines: string[] = [];
@@ -354,7 +354,7 @@ test('CLI resume flags round-trip and decide invokes the injected writer; run al
   const entry = JSON.parse(run(...flags, '--resume-question', 'auq:q1:abcde', '--run', 'run-x'));
   expect(entry.resume).toEqual({ questionId: 'auq:q1:abcde', runId: 'run-x' });
   expect(JSON.parse(run('show', entry.id, '--json')).resume).toEqual(entry.resume);
-  expect(JSON.parse(run('decide', entry.id, 'a', '--json')).status).toBe('decided');
+  expect(JSON.parse(run('decide', entry.id, 'a', '--auto', '--agent', 'codex', '--delegation', 'CLI test', '--json')).status).toBe('decided');
   expect(calls).toEqual([{ id: 'auq:q1:abcde', result: { answers: { scope_choice: 'a) Publish' } } }]);
   expect(readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8').trim().split('\n')).toHaveLength(2);
 });
@@ -374,7 +374,7 @@ test('CLI reports durable decision with failed delivery and can retry only the a
     { label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' },
   ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
   const exitBefore = process.exitCode;
-  const decided = run('decide', entry.id, 'a', '--note', 'Private memo');
+  const decided = run('decide', entry.id, 'a', '--auto', '--agent', 'codex', '--delegation', 'delivery test', '--note', 'Private memo');
   expect(decided).toContain('결정:');
   expect(decided).toContain('⚠ 답 전달 실패(auq:q1:abcde');
   expect(decided).toContain(`elanous decisions retry-answer ${entry.id}`);
@@ -407,7 +407,7 @@ test('unknown actor is never silently attributed to elanous; historical options 
     const item = new DecisionLedger({ stateDir }).importPending({ title: 'Historical', category: 'scope', scqa: { s: 'Original request.', c: 'No options recorded.' }, options: [], recommendation: { skipped: true, reason: 'Unknown' }, raisedBy: { agent: 'codex' }, refs: ['historical#H1'] });
     expect(() => run('add-options', item.id, '--option', 'a=Approve:Proceed', '--option', 'b=Decline:Stop')).toThrow('agent unknown');
     expect(JSON.parse(run('add-options', item.id, '--agent', 'codex', '--option', 'a=Approve:Proceed', '--option', 'b=Decline:Stop', '--json')).options).toHaveLength(2);
-    expect(JSON.parse(run('decide', item.id, 'a', '--json')).choice).toBe('a');
+    expect(JSON.parse(run('decide', item.id, 'a', '--auto', '--agent', 'codex', '--delegation', 'historical test', '--json')).choice).toBe('a');
   } finally { if (oldAgent === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = oldAgent; }
 });
 
@@ -425,7 +425,7 @@ test('isolated CLI helper raises and decides a pending question', async () => {
   // PR-1: a child process is not a person's terminal — the human decide is refused; the delegated decide still delivers.
   const refused = await simCli(['--test', stateDir, 'decisions', 'decide', id, 'a', '--json'], { allowPaths: [['decisions']], stateRoot: stateDir });
   expect(refused.exitCode).not.toBe(0);
-  expect(refused.stderr).toContain('사람 결정은 사람의 터미널에서만 기록한다');
+  expect(refused.stderr).toContain('CLI는 사람 신원을 검증할 수 없어 human 결정을 기록하지 않는다');
   const decided = await simCli(['--test', stateDir, 'decisions', 'decide', id, 'a', '--auto', '--agent', 'codex', '--delegation', 'CLI child test', '--json'], {
     allowPaths: [['decisions']], stateRoot: stateDir,
   });
@@ -487,7 +487,7 @@ test('CLI decide with no pending question at all reports the failed delivery and
   const entry = JSON.parse(run('raise', '--agent', 'codex', '--title', 'Scope?', '--category', 'scope', '--s', 'S.', '--c', 'C.',
     '--option', 'a=Small:Less', '--option', 'b=Large:More', '--recommend', 'a', '--why', 'safer', '--resume-question', 'auq:qmissing:abcde', '--run', 'run-x', '--json'));
   const exitBefore = process.exitCode;
-  const out = JSON.parse(run('decide', entry.id, 'b', '--json'));
+  const out = JSON.parse(run('decide', entry.id, 'b', '--auto', '--agent', 'codex', '--delegation', 'delivery test', '--json'));
   expect(process.exitCode).toBe(3);
   process.exitCode = exitBefore ?? 0;
   expect(out).toMatchObject({ status: 'decided', choice: 'b', delivery: { ok: false, questionId: 'auq:qmissing:abcde' } });
@@ -495,7 +495,7 @@ test('CLI decide with no pending question at all reports the failed delivery and
   expect(events.filter((event: { type: string }) => event.type === 'decided')).toHaveLength(1);
 });
 
-test('DECISION-LEDGER-HUMAN-AUTH PR-1 — CLI human decide only from a person\'s terminal; --auto still works; via=cli', () => {
+test('DECISION-LEDGER-HUMAN-AUTH — CLI never attributes a TTY decision to a human', () => {
   expect([isHumanTerminal({}, true), isHumanTerminal({ ELANOUS_SEAT: 'TC-H-CC-3' }, true), isHumanTerminal({}, false), isHumanTerminal({ ELANOUS_SEAT: '  ' }, true)])
     .toEqual([true, false, false, true]);
   const stateDir = root();
@@ -509,8 +509,10 @@ test('DECISION-LEDGER-HUMAN-AUTH PR-1 — CLI human decide only from a person\'s
     const seatSide = raise('seat side');
     expect(() => run('decide', seatSide, 'a', '--json')).toThrow(HUMAN_DECIDE_REFUSED);
     expect(new DecisionLedger({ stateDir }).show(seatSide).status).toBe('open');
-    expect(JSON.parse(run('decide', seatSide, 'a', '--auto', '--agent', 'codex', '--delegation', 'TC 위임', '--json')).decidedBy).toMatchObject({ kind: 'auto', agent: 'codex' });
+    expect(JSON.parse(run('decide', seatSide, 'a', '--auto', '--agent', 'codex', '--delegation', 'TC 위임', '--json')).decidedBy).toMatchObject({ kind: 'auto', agent: 'codex', origin: 'automation' });
     terminal = true;
-    expect(JSON.parse(run('decide', raise('person'), 'b', '--json')).decidedBy).toEqual({ kind: 'human', via: 'cli' });
+    const person = raise('person');
+    expect(() => run('decide', person, 'b', '--json')).toThrow(HUMAN_DECIDE_REFUSED);
+    expect(new DecisionLedger({ stateDir }).show(person).status).toBe('open');
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });

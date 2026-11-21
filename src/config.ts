@@ -9,6 +9,7 @@ import { isInstalledPackagePath } from './instance/installed-package.js';
 import { defaultObsidianVault } from './obsidian/default-vault.js';
 import { OPENGATEWAY_DEFAULT_MODEL } from './llm/opengateway-models.js';
 import { SERVICE_KEY_CATALOG } from './setup/service-key-catalog.js';
+import { timelyRouterApiKeyFor } from './llm/timelyrouter-credential.js';
 
 // ── User config ──
 export const REMOTE_HOME = homedir();
@@ -277,6 +278,9 @@ export const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'openrouter/z-ai
 /** Optional OpenAI-compatible gateway. Cache wins over inherited env, as for other API keys. */
 export function getOpenGatewayApiKey(): string | undefined {
   return keyFromCacheOrEnv('OPENGATEWAY_API_KEY');
+}
+export function getTimelyRouterApiKey(baseUrl?: string): string | undefined {
+  return timelyRouterApiKeyFor(baseUrl);
 }
 export const OPENGATEWAY_API_URL = 'https://apis.opengateway.ai/v1/chat/completions';
 export const OPENGATEWAY_MODEL = process.env.OPENGATEWAY_MODEL || OPENGATEWAY_DEFAULT_MODEL;

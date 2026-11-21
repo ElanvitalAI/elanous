@@ -23,6 +23,7 @@ import { carrySessionProvider, requestNewTuiSession } from './slash/new-session.
 import { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS } from './slash/compact-command.js';
 import { RESUME_BUSY_STATUS, parseResumeCommand } from './slash/resume-command.js';
 import { reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
+import { setTuiForegroundSessionId } from '../capture/tui-self-report.js';
 import { createNextTuiQueue, type NextTuiSettledTurn, type NextTuiQueueInterruptReason } from './core/queue.js';
 import { stripQueueModelContext, withInterruptedOnPurposeContext, withQueueNoticeContext, withReplacementCandidateContext } from '../chat/interjection.js';
 import { replacementCandidateContextLine, replacementCandidateScreenLine } from '../chat/queue-supersede.js';
@@ -36,6 +37,9 @@ import { setCliStderrSink } from '../git-fs/cli-stderr.js';
 import { createInputLagProbe } from './input-lag-probe.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { detectSeat, detectSeatTui } from '../seat/seat-boot-preamble.js';
+import { randomUUID } from 'node:crypto';
+import type { CeoAcceptedTurn } from '../agent-events/ceo-ingress.js';
+import { postCeoTurnReply, type CeoTurnRef } from './ceo-turn-reply.js';
 import { createSeatApprovalHandler, seatApprovalLedgerPorts } from './seat-approval-policy.js';
 import { createSeatStopDriver, setSeatStopHandler } from './seat-stop-port.js';
 import { readUnreadSummary } from '../msg/msg-store.js';
@@ -91,6 +95,8 @@ import { noticeOneDispatch } from './external-event-one-verdict.js';
 import { createEntryTurnDoor, humanFirstDetail, nextDoorOpener, runDoorTurn, doorOutcomeOf, type DoorTurnKind, type EntryTurnDoor } from './turn-events/door-wire.js';
 import { createSeatMailAdapter, type SeatMailAdapter } from './turn-events/mail-adapter.js';
 import { createTurnEventBus } from './turn-events/bus.js';
+import { getAgentEventEmitter } from '../agent-events/emit.js';
+import { createAgentEventBridge } from './agent-event-bridge.js';
 import { createWakeupBusConsumer, openLateWakeupTurn, type WakeupBusConsumer } from './turn-events/wakeup-consumer.js';
 
 let nextTuiRouteRegistry: typeof import('./core/registry.js') | undefined;
@@ -205,6 +211,35 @@ export function dispatchQueuedExternalEventOne(input: {
     });
 }
 
+/**
+ * JUD hold #123230 (request 123207 · OP #123241 P0) — the notice's `startChatTurn` wrapper:
+ * the intake acknowledgement binds to the REAL turn start. `runDoorTurn` returns false when
+ * the door REFUSED the turn reservation (busy, or the holder is gone) — the body never ran and
+ * nothing threw, so silence must not read as acceptance: refused → `failed` (the entry answers
+ * a refusal — never a 👀 for a no-op); started → `accepted` (the honest 👀 moment); a throwing
+ * start → `failed` + rethrow (afterDispatch still frees the unstarted hold).
+ */
+export function startChatTurnWithIntakeAck(input: {
+  readonly startChatTurn: (text: string, status: string) => boolean;
+  readonly notifyTurnIntake: (id: string, status: 'accepted' | 'failed' | 'cancelled', turn?: CeoAcceptedTurn) => void;
+  readonly acceptedTurn?: () => CeoAcceptedTurn | undefined;
+  readonly noticeId: string;
+  readonly render: () => void;
+}): (text: string, status: string) => void {
+  const { startChatTurn, notifyTurnIntake, noticeId, render } = input;
+  return (text, status) => {
+    let started: boolean;
+    try {
+      started = startChatTurn(text, status);
+    } catch (error) {
+      notifyTurnIntake(noticeId, 'failed');
+      throw error;
+    }
+    notifyTurnIntake(noticeId, started ? 'accepted' : 'failed', started ? input.acceptedTurn?.() : undefined);
+    render();
+  };
+}
+
 type NextTuiTermSession = {
   id: string;
   title: string;
@@ -298,6 +333,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     id = createSession({ source: 'tui', ...(simWorldId ? { title: `SIM-TUI ${simWorldId}` } : {}) }).id;
     setActiveSessionId(id);
   }
+  setTuiForegroundSessionId(id);
   if (options.initialProvider) {
     const { parseSessionProvider, setSessionProvider } = await import('../tui-client/session-provider.js');
     setSessionProvider(id, parseSessionProvider(options.initialProvider.provider, options.initialProvider.model));
@@ -345,6 +381,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const compactPainter = createNextTuiCompactPainter((text) => process.stdout.write(text));
   const missionWatchCancellation: { cancel?: () => void } = {};
   let busy = false;
+  const activeShellCapsules = new Set<string>();
+  const agentEvents = createAgentEventBridge(getAgentEventEmitter()); // ELN-AGENT-EVENT-PROTOCOL: no ELANOUS_EVENT_SOCKET → no-op
   let outerElsArmed = false; // ELS-NESTING-RULE ③: the session already lives in an els pane; this eln closes and els takes the terminal
   let handoffExit = false;
   /** #38510 r1 MF1: every busy flip is a turn boundary the idle watchdog must see (set once it exists). */
@@ -360,6 +398,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const setBusy = (next: boolean): void => {
     if (busy === next) return;
     busy = next;
+    agentEvents.busy(next);
     if (!next && wakeupBusTurn !== null) { wakeupBusConsumer?.settle(wakeupBusTurn, doorOutcomeOf(doorTurnKind)); wakeupBusTurn = null; }
     if (!next) { entryDoor?.endTurn(doorTurnKind); doorTurnKind = undefined; }
     // SEAT-GRACEFUL-QUIT-CONTROL: a quit/migrate that waited for this turn runs now (checkpoint → exit/restart).
@@ -605,6 +644,23 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // leaves one item per settle. A200: a chat line is also handed to the running turn as a steer (joins the
   // next model request); Esc leaves what is still queued as the next turn by itself, not back in the prompt.
   const queue = createNextTuiQueue({ turnLifeLog: emitTurnLife });
+  let activeTurnRunId: string | null = null;
+  const ceoNoticeRefs = new Map<string, CeoTurnRef>();
+  // OP #122919 / JUD hold #122913 — the ACTUAL-INTAKE acknowledgements for dequeued notices:
+  // the ceo ingress 👀 binds to a real turn accepting the notice as its input (notifyTurnIntake
+  // from the dispatch site below), never to the queue's drain-time `delivered` transition
+  // (that fires when the batch is handed to the caller that submits it — before acceptance).
+  type TurnIntakeStatus = 'accepted' | 'failed' | 'cancelled';
+  const turnIntakeListeners = new Set<(item: { id: string; status: TurnIntakeStatus; turn?: CeoAcceptedTurn }) => void>();
+  const notifyTurnIntake = (id: string, status: TurnIntakeStatus, turn?: CeoAcceptedTurn): void => {
+    for (const listener of turnIntakeListeners) {
+      try { listener({ id, status, ...(turn ? { turn } : {}) }); } catch { /* a listener never breaks the intake dispatch */ }
+    }
+  };
+  const onTurnIntake = (listener: (item: { id: string; status: TurnIntakeStatus }) => void): (() => void) => {
+    turnIntakeListeners.add(listener);
+    return () => { turnIntakeListeners.delete(listener); };
+  };
   // Distinct sentinels: the loop owns them, nothing else reads them as keys.
   // queueWake is declared here, before the seat-mail watcher closes over it.
   const queueWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
@@ -627,7 +683,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       migrate: (sessionId) => { requestTuiSelfRestart(`seat-stop:migrate:${sessionId}`); injectKey(seatStopKey); },
       abort: () => { turnAbort?.abort(); },
     });
-    const driver = createSeatStopDriver({ control: seatControl, busy: () => busy });
+    const driver = createSeatStopDriver({ control: seatControl, busy: () => busy,
+      capsulesActive: () => activeShellCapsules.size > 0 });
     seatStopRef.current = driver;
     return setSeatStopHandler(async (request) => {
       seatStopRequestId = request.requestId;
@@ -704,6 +761,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // [턴 근본 배선 #4a] B1: an unregistered source is refused by knock() — the capsule-done doorbell must be on the list.
   idleWakeDoor.register({ id: 'capsule-done' });
   idleWakeDoor.register({ id: 'event-watch' });
+  // [턴 근본 배선] OP-CHANNEL-INGRESS ③ — the ceo ingress doorbell: an authenticated CEO frame
+  // queued as this session's turn input knocks the same one idle door.
+  idleWakeDoor.register({ id: 'ceo-ingress' });
   // [턴 근본 배선 #3] C3 (CC-4 #89716 · always on since CAPSULE-FLAGS-REMOVE-DEFAULT): one owner per seat mail, shared
   // by the watcher and the plan — the modules' own default instances are for tests only (CC-4 #90942).
   const seatMailAdapter: SeatMailAdapter | null = createSeatMailAdapter({ log: (event, data) => { debug.log('seat-mail', event, data); } });
@@ -739,6 +799,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // opens it as the next turn; it is not offered to the running turn as a steer (#38193).
   // SEAT-INBOX B1-C — one notice per message (msgId) · receipts delivered (enqueue) · seen (queue delivered).
   const seatMailWatcher = createSeatMailArrivalWatcher(process.cwd(), queue, {
+    heartbeat: { getSessionId: () => id },
     onArrived: seatMailOnArrived({
       busy: () => busy, injectKey: () => { idleWakeDoor.knock('seat-mail'); }, queueWake,
       enqueueMidTurn: (event, onDrained) => { const sid = telemetrySessionId; return sid !== null && enqueueMidTurnEvent(sid, event, onDrained); },
@@ -880,6 +941,33 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       fleetSegment.start();
     } });
   if (footerStatusline.warning) pushNotice(footerStatusline.warning);
+  // OP-CHANNEL-INGRESS ②③ — els provisioned THIS tab's ceo ingress (socket + per-tab secret in
+  // the env): host the listener; one authenticated frame becomes the session's TURN INPUT (front
+  // of the queue, never shell typing) and knocks the idle door. Absent env → inactive (fail-soft).
+  void import('../agent-events/ceo-ingress-entry.js').then(async ({ wireCeoIngressEntry }) => {
+    const listener = await wireCeoIngressEntry(process.env, {
+      enqueueNotice: (text, source, meta) => {
+        const notice = queue.enqueueNotice(text, source, { occurredAt: meta?.occurredAt ?? Date.now() });
+        if (meta?.ceo) ceoNoticeRefs.set(notice.id, meta.ceo);
+        return notice;
+      },
+      knock: () => { idleWakeDoor.knock('ceo-ingress'); },
+      // JUD hold #122410 — the queue's terminal leaves (cancelled/superseded refuse: never turn input).
+      onTransition: (notify) => queue.onTransition((item) => {
+        if (item.status === 'queued') return; // never at transition time — a structural guard only
+        if (item.status === 'cancelled' || item.status === 'superseded') ceoNoticeRefs.delete(item.id);
+        notify({ id: item.id, status: item.status });
+      }),
+      // OP #122919 / JUD hold #122913 — the 👀 binds to ACTUAL TURN INTAKE: the TUI's
+      // acknowledgement that a real turn accepted the notice as its input. The queue's
+      // `delivered` transition fires at drain hand-out — before submission — so the answer
+      // (and els' 👀) waits on this channel instead (accepted → answer(0) / failed·cancelled → refusal).
+      onIntake: (notify) => onTurnIntake(notify),
+    });
+    if (listener) debug.log('agent-events', 'ceo-ingress-entry-on', { socketPath: listener.socketPath });
+  }).catch((error) => {
+    debug.log('agent-events', 'ceo-ingress-entry-failed', { error: error instanceof Error ? error.message : String(error) });
+  });
   const observeSession = (
     sessionId: string,
     onBackground: typeof import('../tui-client/local-chat-turn.js').onLocalChatBackgroundStatus,
@@ -905,7 +993,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           enqueue: (text, at) => queue.enqueueNotice(text, 'event-watch', { occurredAt: at }),
           knock: () => { idleWakeDoor.knock('event-watch'); },
         });
-        capsuleSubscription.stop = () => { stopDone(); stopWatch(); };
+        const stopMigrationWait = chat.onLocalChatCapsuleEvent(sessionId, (event) => {
+          if (event.kind !== 'shell') return;
+          if (event.type === 'capsule-progress') activeShellCapsules.add(event.capsuleId);
+          else activeShellCapsules.delete(event.capsuleId);
+          // A pending migrate leaves through the normal turn-end door after the capsule-done notice turn.
+        });
+        capsuleSubscription.stop = () => { stopDone(); stopWatch(); stopMigrationWait(); };
       }).catch(() => { /* the doorbell is optional; the next-turn drain still delivers the result */ });
     healthSubscription.stop?.();
     healthSnapshot = null;
@@ -1613,6 +1707,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     saveMessageBlockSession();
     id = targetId;
+    setTuiForegroundSessionId(id);
     bindWakeupSession?.(id);
     restoreMessageBlockSession(targetId);
     lastFoldTargetKey = null;
@@ -1750,7 +1845,17 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         onSeatMail: (oneId, oneText) => { seatPlanLink?.noticeDispatched(oneId, oneText); },
         injectKey: () => injectKey(queueWake),
         keepOpen: (one) => { pendingNoticeTurn = one; },
-        startChatTurn: (text, status) => { startChatTurn(text, status); render(); },
+        // OP #122919 / JUD holds #122913 + #123230 — the intake ack rides the REAL turn acceptance
+        // (startChatTurn taken), never the drain-time dequeue that handed this notice out, and never
+        // a silent refusal: accepted → the honest 👀 moment; a throwing or REFUSED start → failed →
+        // refusal (no 👀 for a no-op). The binding lives in startChatTurnWithIntakeAck (tested there).
+        startChatTurn: startChatTurnWithIntakeAck({
+          startChatTurn,
+          notifyTurnIntake,
+          acceptedTurn: () => id && activeTurnRunId ? { sessionId: id, turnRunId: activeTurnRunId } : undefined,
+          noticeId: notice.id,
+          render,
+        }),
         log: (event, fields) => { debug.log('tui.next', event, fields); },
         held: () => entryDoor?.door.holds(reservation) === true,
         onSuperseded: () => { heldNotices.unshift(notice); },
@@ -1896,10 +2001,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let turnFrom: import('../session/index.js').MessageSource | undefined;
   // CAPSULE-C2 (flag on): no turn without the door's reservation — two openers can never run two turns.
   // CAPSULE-C2-FU: a throw before setBusy(true) ends the door ('failed') instead of locking it forever.
-  const startChatTurn = (turnText: string, banner?: string, from?: import('../session/index.js').MessageSource): void => {
+  // JUD hold #123230 — return runDoorTurn's boolean: false = the door REFUSED the reservation (body
+  // never ran, nothing threw) — the notice intake ack binds to that, never to silence.
+  const startChatTurn = (turnText: string, banner?: string, from?: import('../session/index.js').MessageSource): boolean =>
     runDoorTurn(entryDoor, () => busy, () => { startChatTurnBody(turnText, banner, from); });
-  };
   const startChatTurnBody = (turnText: string, banner?: string, from?: import('../session/index.js').MessageSource): void => {
+    const turnRunId = randomUUID();
+    activeTurnRunId = turnRunId;
     turnFrom = from;
     // SCHEDULE-WAKEUP-TURN-CAP: every real turn start gets its own gate turn id (notice/mail/queue turns skip the gate's open paths).
     wakeup?.gate.noteTurnStarted();
@@ -1922,6 +2030,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const attachments = [...atAttachmentTokens].filter(([token]) => turnText.includes(token)).map(([, path]) => path);
     if (!id) {
       id = createSession({ source: 'tui' }).id;
+      setTuiForegroundSessionId(id);
       bindWakeupSession?.(id);
       restoreMessageBlockSession(id);
       setActiveSessionId(id);
@@ -1931,6 +2040,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const turnSessionId = id;
     // mf1(#38102 r4): only the exact notice text dispatched a moment ago claims the source head.
     const noticeTurn = pendingNoticeTurn !== null && pendingNoticeTurn.text === turnText ? pendingNoticeTurn : null;
+    const ceoTurn = noticeTurn ? ceoNoticeRefs.get(noticeTurn.id) : undefined;
+    if (noticeTurn) ceoNoticeRefs.delete(noticeTurn.id);
     const noticeSource = noticeTurn?.source ?? null;
     pendingNoticeTurn = null;
     const replacementContextLine = replacementContextFor !== null && turnText.trim() === replacementContextFor.text
@@ -2212,6 +2323,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         });
         session = loadSession(turnSessionId);
         messages = session?.messages ?? [];
+        if (ceoTurn && outcome.kind === 'completed' && outcome.goalStopReason !== 'max_turns') {
+          const reply = messages.slice(messagesAtTurnStart).filter((row) => row.role === 'assistant' && row.replyFinal === true).at(-1)?.content;
+          if (reply) {
+            try { postCeoTurnReply({ ...ceoTurn, sessionId: turnSessionId, turnRunId }, reply,
+              process.env.ELANOUS_CEO_INGRESS_AUTH ?? ''); }
+            catch (error) { debug.log('ceo-channel', 'reply-post-failed', { error: error instanceof Error ? error.message : String(error) }); }
+          }
+        }
         const turnEndText = formatTurnEndTime(turnStartedWallAt, Date.now(), outcome.kind !== 'completed', backgroundJobs.snapshot()?.running ?? 0);
         // Keep a non-ordinary outcome (cap reached, failed, cancelled, compacted) visible after the
         // turn-end summary; an ordinary completion shows the summary alone (#37966).
@@ -3441,6 +3560,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             // The new conversation inherits the TUI's session provider (TUI-NEW-SESSION-KEEPS-PROVIDER).
             await carrySessionProvider(previous, next.id);
             id = next.id;
+            setTuiForegroundSessionId(id);
             bindWakeupSession?.(id);
             restoreMessageBlockSession(id);
             lastFoldTargetKey = null;
@@ -3516,6 +3636,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             }
             saveMessageBlockSession();
             id = next.id;
+            setTuiForegroundSessionId(id);
             bindWakeupSession?.(id);
             restoreMessageBlockSession(id);
             lastFoldTargetKey = null;

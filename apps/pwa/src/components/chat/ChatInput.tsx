@@ -18,6 +18,7 @@ import {
 } from '@/lib/snapshot';
 import { SeatRequestError, type SeatRequestReceipt, type SeatSummary } from '@/lib/daemon-client';
 import { debugLog } from '@/lib/debug';
+import { randomId } from '@/lib/random-id';
 
 const INPUT_PERSIST_DEBOUNCE_MS = 300;
 const EMPTY_ATTACHMENTS: AttachmentMeta[] = [];
@@ -32,9 +33,12 @@ function seatAskClientIdForBrowser(): string {
   let id: string | null = null;
   try { id = window.sessionStorage.getItem(SEAT_ASK_CLIENT_KEY); } catch { /* cookie fallback */ }
   try {
-    id ??= /(?:^|; )elanous\.seat-ask\.client=([a-f0-9-]{36})(?:;|$)/i.exec(document.cookie)?.[1] ?? null;
+    // 출처: #39459 — cookie 회복 경로도 폴백(지속본)을 읽어 교체하지 않는다. OP #123699 —
+    // 수리 폴백 rand 는 64bit hex 16자(⊆ base36 ≤16자)라 레거시와 같은 정책으로 그대로 읽는다.
+    id ??= /(?:^|; )elanous\.seat-ask\.client=((?:[a-f0-9-]{36}|s-[0-9a-z]{1,16}-[0-9a-z]{1,16}))(?:;|$)/i.exec(document.cookie)?.[1] ?? null;
   } catch { /* keep the in-memory identifier for remounts */ }
-  id ??= seatAskClientFallback ?? crypto.randomUUID();
+  // 출처: #39459 — crypto.randomUUID 는 secure context 전용; http 랜 원점 폴백(randomId).
+  id ??= seatAskClientFallback ?? randomId();
   seatAskClientFallback = id;
   try { window.sessionStorage.setItem(SEAT_ASK_CLIENT_KEY, id); } catch { /* cookie fallback */ }
   try { document.cookie = `${SEAT_ASK_CLIENT_KEY}=${id}; Path=/; SameSite=Lax; Max-Age=2592000`; } catch { /* remount still uses memory */ }
@@ -423,7 +427,7 @@ export function ChatInput({
     try {
       if (isCtoAsk(request.text)) {
         const result = await client.submitSeatAsk(request.text, seatAskClientId.current!);
-        setSeatAskMessages((previous) => [...previous, { id: crypto.randomUUID(), text: result.reply }]);
+        setSeatAskMessages((previous) => [...previous, { id: randomId(), text: result.reply }]);
         setValue('');
         clearSnapshot(persistKey);
         return;
@@ -459,7 +463,7 @@ export function ChatInput({
     const trimmed = text.trim();
     if (isCtoAsk(trimmed)) {
       if (attachments.length) { setSeatError('질문에는 첨부를 넣을 수 없습니다'); return; }
-      void sendSeatRequest({ seat: 'TC', text: trimmed, attachments: [], key: crypto.randomUUID() });
+      void sendSeatRequest({ seat: 'TC', text: trimmed, attachments: [], key: randomId() });
       return;
     }
     const addressed = /^@\S+\s+[\s\S]*\S$/.test(text.trimEnd());
@@ -469,7 +473,7 @@ export function ChatInput({
       return;
     }
     if (addressed && trimmed) {
-      const request: { seat?: string; text: string; attachments: AttachmentMeta[]; key: string } = { text: trimmed, attachments: [...attachments], key: crypto.randomUUID() };
+      const request: { seat?: string; text: string; attachments: AttachmentMeta[]; key: string } = { text: trimmed, attachments: [...attachments], key: randomId() };
       const retry = retryRef.current;
       const same = retry && retry.seat === request.seat && retry.text === request.text
         && retry.attachments.length === request.attachments.length

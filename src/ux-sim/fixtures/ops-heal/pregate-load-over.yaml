@@ -1,0 +1,13 @@
+signal: pregate-load-over
+owner: RES
+diagnose:
+  - action: host.load.read
+repair:
+  - action: host.load.wait
+    args: {maxLoad: 50, seconds: 0}
+    risk: safe
+    rollback: no state changed
+verify:
+  - action: host.load.verify
+    args: {maxLoad: 50}
+escalate: {after: 1, message: host remains loaded}

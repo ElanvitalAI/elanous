@@ -49,7 +49,7 @@ export type LLMProviderName =
   | 'kimi' | 'qwen' | 'glm'
   // 대표 2026-09-23 — OpenAI 호환 게이트웨이. kimi·qwen·glm 의 «첫 실제 경로»(모델 id `openrouter/<vendor>/<model>`).
   | 'openrouter'
-  | 'opengateway'
+  | 'opengateway' | 'timelyrouter'
   // 대표 2026-10-10 (BEDROCK-PROVIDER) — AWS Bedrock 의 Claude. 자격 = AWS 기본 자격 체인 · 명시 선택 전용(auto·폴백 후보 아님).
   | 'bedrock' | 'hq-proxy';
 
@@ -1626,6 +1626,9 @@ export interface AutoReviewConfig {
 }
 
 export type ModelRole = 'implement' | 'review' | 'research' | 'planning' | 'audit' | 'classify' | 'graph-grow' | 'coordinator' | 'guardian';
+
+/** Usage-row role: a ModelRole, or the general (non-research) core-turn role `main` (OP #124624). */
+export type UsageRole = ModelRole | 'main';
 
 export type AgentModelRole = 'coordinator' | 'guardian';
 

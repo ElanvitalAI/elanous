@@ -13,8 +13,9 @@
  *
  * 이 모듈은 node 내장만 쓴다(config.ts 가 부팅 초기에 부른다). 값은 반환값 밖 어디에도 싣지 않는다.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync, type Stats } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { prodInstanceRoot } from '../instance/resolve.js';
 
 export const STATIC_LEASE_AREA_DIR = 'secrets-lease';
 export const STATIC_LEASE_META_DIR = 'meta';
@@ -75,6 +76,20 @@ export interface StaticLeaseConsumerDeps {
   log?: (category: string, event: string, data: Record<string, unknown>, level: 'error') => void;
 }
 
+function privateRegularFile(st: Stats): boolean {
+  return st.isFile() && (process.platform === 'win32' || (st.mode & 0o777) === 0o600)
+    && (typeof process.getuid !== 'function' || st.uid === process.getuid());
+}
+
+/** Keep the checked inode open while reading; a concurrent symlink swap cannot redirect the copy. */
+function readPrivateFile(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    if (!privateRegularFile(fstatSync(fd))) throw new Error('ELANOUS_STATIC_LEASE_FILE_UNSAFE');
+    return readFileSync(fd, 'utf8');
+  } finally { closeSync(fd); }
+}
+
 const loggedFailures = new Set<string>();
 
 /** 시험 seam — 같은 임대·이유의 경보 1회 묶음을 비운다. */
@@ -117,8 +132,7 @@ export function resolveStaticLeaseCopy(
 ): { value: string; lease: ActiveStaticLease } | null {
   if (!CACHE_NAME_PATTERN.test(cacheName)) return null;
   const now = deps.now ?? Date.now;
-  const readFile = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
-  const exists = deps.exists ?? existsSync;
+  const readFile = deps.readFile ?? readPrivateFile;
   const log = deps.log ?? defaultLog;
   const cacheFile = resolve(deps.cacheFilePath);
   const seen = new Set<string>();
@@ -127,7 +141,6 @@ export function resolveStaticLeaseCopy(
     if (seen.has(root)) continue;
     seen.add(root);
     const metaPath = staticLeaseMetaPath(root, cacheName);
-    if (!exists(metaPath)) continue;
     const fail = (reason: StaticLeaseFailureReason, meta: StaticLeaseCopyMeta | null): never => {
       const key = `${root}:${cacheName}:${meta?.leaseId ?? '-'}:${reason}`;
       if (!loggedFailures.has(key)) {
@@ -139,20 +152,56 @@ export function resolveStaticLeaseCopy(
       }
       throw new StaticLeaseExpiredError(reason, cacheName, meta?.leaseId, meta?.expiresAt);
     };
+    if (deps.exists) {
+      try { if (!deps.exists(metaPath)) continue; } catch { return fail('invalid', null); }
+    }
+    let metaStat: Stats;
+    try { metaStat = lstatSync(metaPath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      return fail('invalid', null);
+    }
+    if (!privateRegularFile(metaStat)) return fail('invalid', null);
     let meta: StaticLeaseCopyMeta | null;
     try { meta = parseMeta(readFile(metaPath), cacheName); } catch { meta = null; }
     if (!meta) return fail('invalid', null);
-    // 자기 임대 영역의 사본인가 — 뿌리 경로 대조가 아니라 꼬리로 잰다(macOS /tmp→/private/tmp 같은 링크 차이로 «안 맞음 → 조용한 폴백»이 되지 않게).
-    const ownCopy = resolve(meta.copyPath).endsWith(`/${STATIC_LEASE_AREA_DIR}/${STATIC_LEASE_COPIES_DIR}/${cacheName}`);
-    // 호스트 사본(~/.cache/<name>)은 «이 프로세스가 읽을 그 파일»일 때만 이 임대가 다스린다.
-    // (시험·격리 우주가 ELANOUS_KEY_CACHE_DIR 로 다른 캐시를 볼 때 운영 집 메타가 끼어들지 않는다.)
-    if (!ownCopy && resolve(meta.copyPath) !== cacheFile) continue;
+    // 인스턴스 사본은 메타의 바로 그 root 에 결속한다. realpath 는
+    // macOS /tmp→/private/tmp 별칭을 수용하면서 다른 인스턴스와 디렉터리 링크를 거부한다.
+    let ownCopy = false;
+    try {
+      ownCopy = basename(meta.copyPath) === cacheName
+        && realpathSync(dirname(meta.copyPath)) === join(realpathSync(root), STATIC_LEASE_AREA_DIR, STATIC_LEASE_COPIES_DIR);
+    } catch { /* 존재하지 않거나 읽을 수 없는 복사 디렉터리는 아래에서 거부 */ }
+    // 호스트 사본은 이 root 가 실제 운영 HOME 의 .elanous 일 때만 허용한다.
+    // 격리 캐시를 보는 프로세스에서는 운영 집의 별개 임대를 건너뛴다.
+    const operatingRoot = resolve(prodInstanceRoot());
+    let operatingRootMatches = false;
+    try { operatingRootMatches = realpathSync(root) === realpathSync(operatingRoot); } catch { /* 운영 root 없음 = 호스트 예외 없음 */ }
+    const hostCopy = operatingRootMatches
+      ? resolve(dirname(operatingRoot), '.cache', cacheName) : undefined;
+    if (!ownCopy && hostCopy && resolve(meta.copyPath) === hostCopy && cacheFile !== hostCopy) continue;
+    if (!ownCopy && !(hostCopy && resolve(meta.copyPath) === hostCopy && cacheFile === hostCopy)) return fail('invalid', meta);
     if (meta.revokedAt) return fail('revoked', meta);
     const expiresAtMs = Date.parse(meta.expiresAt);
     if (now() >= expiresAtMs) return fail('expired', meta);
+    let copyStat: Stats;
+    try { copyStat = lstatSync(meta.copyPath); }
+    catch (error) {
+      return fail((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'copy-missing' : 'invalid', meta);
+    }
+    if (!privateRegularFile(copyStat)) return fail('invalid', meta);
     let value = '';
-    try { value = readFile(meta.copyPath).trim().replace(/^["']|["']$/g, ''); } catch { value = ''; }
+    try { value = readFile(meta.copyPath).trim().replace(/^["']|["']$/g, ''); } catch { return fail('invalid', meta); }
     if (!value) return fail('copy-missing', meta);
+    // The issuer replaces metadata atomically on renewal/revoke. Re-read after
+    // the copy so a cancellation or expiry during I/O cannot release a stale key.
+    let latest: StaticLeaseCopyMeta | null;
+    try { latest = parseMeta(readFile(metaPath), cacheName); } catch { latest = null; }
+    if (!latest) return fail('invalid', meta);
+    if (latest.revokedAt) return fail('revoked', latest);
+    if (latest.leaseId !== meta.leaseId || latest.id !== meta.id
+      || latest.copyPath !== meta.copyPath || latest.expiresAt !== meta.expiresAt) return fail('invalid', latest);
+    if (now() >= expiresAtMs) return fail('expired', latest);
     return { value, lease: { leaseId: meta.leaseId, id: meta.id, cacheName, expiresAtMs, root } };
   }
   return null;

@@ -12,17 +12,18 @@ function processCwd(pid: number): string | null {
   return line ? line.slice(1) : null;
 }
 
-type Candidate = { id: string; kind: string; seat?: string; alive: boolean; ownerPid?: number };
+type Candidate = { id: string; kind: string; seat?: string; alive: boolean; ownerPid?: number; sessionId?: string; workdir?: string };
+export type SeatControlExpected = { id: string; ownerPid: number; sessionId: string; workdir: string };
 interface SeatControlDeps {
   sender(): string | null;
   rows(): readonly Candidate[];
-  send(id: string, action: 'seat-stop', payload: { mode: SeatControlMode; sender: string }): Promise<PtyControlResult>;
+  send(id: string, action: 'seat-stop', payload: { mode: SeatControlMode; sender: string; expected?: SeatControlExpected }): Promise<PtyControlResult>;
   /** SEAT-CONTROL-REGISTRY-MISMATCH: the seat a live process runs in (from its working folder), or undefined. */
   seatOfPid?(pid: number): string | undefined;
 }
 
 /** Same uid is a cooperative policy boundary, not proof of a seat identity. */
-export async function runSeatControl(target: string, rawMode: string, deps: SeatControlDeps): Promise<PtyControlResult> {
+export async function runSeatControl(target: string, rawMode: string, deps: SeatControlDeps, expected?: SeatControlExpected): Promise<PtyControlResult> {
   if (rawMode !== 'quit' && rawMode !== 'migrate' && rawMode !== 'force') return { status: 'denied', reason: 'invalid-mode' };
   if (!/^[A-Z][A-Z0-9_-]{0,63}$/.test(target)) return { status: 'denied', reason: 'invalid-seat' };
   const sender = deps.sender();
@@ -38,7 +39,10 @@ export async function runSeatControl(target: string, rawMode: string, deps: Seat
     return { status: 'unknown-pty', reason: 'seat-not-running' };
   }
   if (matches.length !== 1) return { status: 'denied', reason: 'ambiguous-seat' };
-  return deps.send(matches[0]!.id, 'seat-stop', { mode: rawMode, sender });
+  if (expected && (matches[0]!.id !== expected.id || matches[0]!.ownerPid !== expected.ownerPid
+    || matches[0]!.sessionId !== expected.sessionId || matches[0]!.workdir !== expected.workdir))
+    return { status: 'denied', reason: 'target-changed' };
+  return deps.send(matches[0]!.id, 'seat-stop', { mode: rawMode, sender, ...(expected ? { expected } : {}) });
 }
 
 export function registerSeatControlCommand(command: Command): void {

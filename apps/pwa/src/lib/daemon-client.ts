@@ -146,6 +146,7 @@ export interface PromptResponse {
   sessionId: string;
   text: string;
   stopReason: string;
+  sourceUsage?: { firecrawl: number; grok: number; market: number };
   /** 실제 답한 LLM(백엔드 활성 provider+model) — PWA 메시지 태깅용. */
   provider?: string;
   model?: string;
@@ -397,17 +398,6 @@ export type CodexLoginStatus =
   | { state: 'ok'; mode: 'browser' | 'device' }
   | { state: 'error'; mode: 'browser' | 'device'; error: string };
 
-/** The serving surface (bare webchat host) does not forward this path — no request was made.
- * Deliberately shaped like the failure it replaces (the relay's plain 404 «Not Found», no `.status`): callers that branch
- * on error text or status (chat-persona's includes('404'), chat-fork's status === 404) and the transcript text of
- * user-triggered commands (/rewind, /harness) stay exactly as before. Do not add a status or a path to the message. */
-export class SurfaceUnavailableError extends Error {
-  constructor(public readonly path: string) {
-    super('Not Found');
-    this.name = 'SurfaceUnavailableError';
-  }
-}
-
 export class DaemonClient {
   private readonly acpConnections = new Map<string, AcpConnectionImpl>();
 
@@ -438,7 +428,10 @@ export class DaemonClient {
    *  ⇒ URL 조립과 인증은 여전히 «이 한 집»에 있고, 머리를 읽어야 하는 쪽만 이 문으로 온다. */
   async fetchResponse(path: string, init?: RequestInit): Promise<Response> {
     // OP #113435 — the one central gate: a path the surface does not forward never leaves the browser.
-    if (!surfaceForwards(path)) throw new SurfaceUnavailableError(path);
+    // The answer is exactly what the relay would have given for a path it does not forward (a plain 404 «Not Found»), so
+    // every caller — fetchJson's «Not Found» error, 404 branches, transcript texts of /rewind or /harness — behaves as
+    // before, and the gate can never surface as an unhandled rejection (a caller that awaits without a catch).
+    if (!surfaceForwards(path)) return new Response('Not Found', { status: 404, headers: { 'content-type': 'text/plain' } });
     const res = await fetch(this.url(path), {
       ...init,
       headers: { ...this.authHeaders(), ...(init?.headers ?? {}) },

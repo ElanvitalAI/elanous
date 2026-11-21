@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
+import { parseInstalledVersionLine } from '../../src/version/installed-version-line.js';
 import { isNexusFirstRunPass } from './nexus-first-run.js';
 
 export function runVerify(run: CommandRunner = runCommand) {
@@ -10,7 +11,7 @@ export function runVerify(run: CommandRunner = runCommand) {
   if (output.stderr) process.stderr.write(output.stderr);
   const result = lastResult(output);
   const nexusPassed = isNexusFirstRunPass(result?.nexusFirstRun)
-    && result.nexusFirstRun.versionLine.startsWith(`${context.input.version} `);
+    && parseInstalledVersionLine(result.nexusFirstRun.versionLine)?.version === context.input.version;
   const passed = output.status === 0 && result?.ok === true && result.notesPage === 'ok' && nexusPassed;
   if (output.status === null || output.status === 2 || !result) throw new Error(`release verify incomplete: ${output.stderr.trim()}`);
   return { outcome: passed ? 'ok' as const : 'fail' as const, verdict: passed ? 'pass' as const : 'fail' as const,

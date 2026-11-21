@@ -6,16 +6,21 @@
 // serving, not API) and stay in relay-server / bare-static-path.
 
 export const BARE_WEBCHAT_FORWARDED_API_PATHS = ["/v1/prompt/stream", "/v1/chat/events"] as const;
+// PWA capability only: one session ID segment. Relay matches this route with
+// a separate GET gate, so this template must not enter the exact chat-pair set.
+export const BARE_WEBCHAT_SESSION_ITEM_CAPABILITY = "/v1/sessions/store/:id";
 
 export const BARE_CAPABILITIES_META_NAME = "elanous-bare-capabilities";
 
+// This predicate is the relay's exact chat-pair check. The session item route
+// is matched separately by relayHostSessionReadRouteAllowed with a GET gate.
 export function isBareForwardedApiPath(pathname: string): boolean {
   return (BARE_WEBCHAT_FORWARDED_API_PATHS as readonly string[]).includes(pathname);
 }
 
 /** Meta `content`: comma-joined forwarded paths. */
 export function bareCapabilitiesContent(): string {
-  return BARE_WEBCHAT_FORWARDED_API_PATHS.join(",");
+  return [...BARE_WEBCHAT_FORWARDED_API_PATHS, BARE_WEBCHAT_SESSION_ITEM_CAPABILITY].join(",");
 }
 
 export function bareCapabilitiesMetaTag(): string {

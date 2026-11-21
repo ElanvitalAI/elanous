@@ -10,8 +10,8 @@
 //   ⭐ 반면 `writeQuotaSignal` 은 «판정 신호»라 조회를 막으면 안 되므로 자기가 삼킨다(아래 주석).
 
 import { appendCreditHistory } from './codex-credit-plan.js';
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -122,6 +122,8 @@ interface QuotaSignalState {
   rateLimitReached?: string | null;
   /** 브랜드 총량 창의 사용률. 옛 신호에는 없을 수 있다. */
   usedPercent?: number;
+  /** 브랜드 총량 창의 관측된 리셋 시각(ms). 옛 신호에는 없다. */
+  resetsAtMs?: number;
   observedAt?: string;
   /** ⭐ 이 관측이 «어느 홈»을 잰 것인가. 파일 이름은 해시라 사람이 못 읽는다. */
   measuredHome?: string;
@@ -217,7 +219,9 @@ export function writeQuotaSignal(
   homePath?: string,
   storage?: QuotaSignalStorageOpts,
   credits?: { readonly balance?: number; readonly hasCredits?: boolean },
+  window?: { readonly resetsAtMs?: number },
 ): void {
+  let temporaryPath: string | undefined;
   try {
     const usedPercent = typeof usedPercentOrHome === 'number' && Number.isFinite(usedPercentOrHome)
       ? Math.max(0, Math.min(100, usedPercentOrHome))
@@ -228,14 +232,22 @@ export function writeQuotaSignal(
     const next: QuotaSignalState = {
       rateLimitReached: rateLimitReached ?? null,
       ...(usedPercent === undefined ? {} : { usedPercent }),
+      ...(typeof window?.resetsAtMs === 'number' && Number.isFinite(window.resetsAtMs) && window.resetsAtMs > Date.now()
+        ? { resetsAtMs: window.resetsAtMs } : {}),
       observedAt: new Date().toISOString(),
       measuredHome: normalizeHome(home?.trim() || process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')),
       ...(typeof credits?.balance === 'number' && Number.isFinite(credits.balance) ? { creditsBalance: credits.balance } : {}),
       ...(typeof credits?.hasCredits === 'boolean' ? { hasCredits: credits.hasCredits } : {}),
     };
-    writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporaryPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    renameSync(temporaryPath, path);
+    temporaryPath = undefined;
     if (next.creditsBalance !== undefined && next.measuredHome) appendCreditHistory(dirname(path), next.measuredHome, next.creditsBalance);
-  } catch { /* fail-soft */ }
+  } catch {
+    if (temporaryPath) try { unlinkSync(temporaryPath); } catch { /* best-effort cleanup */ }
+    // Quota observation must not block usage fetch; missing evidence stays unknown to the selector.
+  }
 }
 
 function readFreshQuotaSignal(nowMs: number, homePath?: string, storage?: QuotaSignalStorageOpts): QuotaSignalState | undefined {
@@ -307,4 +319,58 @@ export function readQuotaSignalUsedPercent(nowMs: number = Date.now(), homePath?
   return typeof usedPercent === 'number' && Number.isFinite(usedPercent) && usedPercent >= 0 && usedPercent <= 100
     ? usedPercent
     : undefined;
+}
+
+/** 창 선택용 계정 신호 한 번 읽기. 손상·권한 실패는 부재로 바꾸지 않는다. */
+export function readQuotaSignalSnapshot(nowMs: number, homePath: string, storage?: QuotaSignalStorageOpts): {
+  readonly observedAtMs?: number;
+  readonly fresh: boolean;
+  readonly reached?: boolean;
+  readonly usedPercent?: number;
+  readonly resetsAtMs?: number;
+  readonly creditBalance?: number;
+  readonly hasCredits?: boolean;
+} {
+  let raw: string;
+  try { raw = readFileSync(quotaSignalPath(homePath, storage?.root), 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { fresh: false };
+    throw error;
+  }
+  const state = JSON.parse(raw) as QuotaSignalState;
+  if (state?.measuredHome !== normalizeHome(homePath)) throw new Error('codex quota signal owner mismatch');
+  const observedAtMs = state.observedAt ? Date.parse(state.observedAt) : Number.NaN;
+  if (!Number.isFinite(observedAtMs) || observedAtMs > nowMs) throw new Error('codex quota signal observation invalid');
+  const fresh = nowMs - observedAtMs <= QUOTA_SIGNAL_MAX_AGE_MS;
+  return {
+    observedAtMs, fresh,
+    ...(fresh && state.rateLimitReached ? { reached: true } : {}),
+    ...(fresh && typeof state.usedPercent === 'number' && Number.isFinite(state.usedPercent) && state.usedPercent >= 0 && state.usedPercent <= 100
+      ? { usedPercent: state.usedPercent } : {}),
+    ...(fresh && typeof state.resetsAtMs === 'number' && Number.isFinite(state.resetsAtMs) && state.resetsAtMs > nowMs
+      ? { resetsAtMs: state.resetsAtMs } : {}),
+    ...(fresh && typeof state.creditsBalance === 'number' && Number.isFinite(state.creditsBalance)
+      ? { creditBalance: state.creditsBalance } : {}),
+    ...(fresh && typeof state.hasCredits === 'boolean' ? { hasCredits: state.hasCredits } : {}),
+  };
+}
+
+export type QuotaSignalSnapshot = ReturnType<typeof readQuotaSignalSnapshot>;
+export type QuotaSignalReader = (homePath: string) => QuotaSignalSnapshot;
+
+/** 한 번의 판정 동안 정규화한 CODEX_HOME마다 정확히 한 관측을 공유한다. */
+export function createQuotaSignalDecisionReader(
+  nowMs: number,
+  read: typeof readQuotaSignalSnapshot = readQuotaSignalSnapshot,
+): QuotaSignalReader {
+  const byHome = new Map<string, QuotaSignalSnapshot>();
+  return (homePath) => {
+    const home = normalizeHome(homePath);
+    let snapshot = byHome.get(home);
+    if (!snapshot) {
+      snapshot = read(nowMs, home);
+      byHome.set(home, snapshot);
+    }
+    return snapshot;
+  };
 }

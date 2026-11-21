@@ -122,6 +122,9 @@ export function createSeatMailArrivalWatcher(
     mailAdapter?: SeatMailAdapter;
     /** One-shot timer for the read retry (default setTimeout, unref'd). */
     retryTimer?: { set: (fn: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
+    heartbeat?: { getSessionId: () => string | null; seatStateRoot?: string; host?: string;
+      schedule?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
+      cancel?: (timer: ReturnType<typeof setInterval>) => void };
   } = {},
 ): SeatMailArrivalWatcher {
   const read = deps.readSnapshot ?? readSeatMailSnapshot;
@@ -135,6 +138,7 @@ export function createSeatMailArrivalWatcher(
   const producers = createChildNoticeProducers(queue);
   let lastUnread: number | null = null;
   let handle: unknown = null;
+  let heartbeat: { stop(): void } | null = null;
   let status: SeatMailWatchStatus = 'stopped';
   let lastMsgId: number | null = null;
   const queueCap = resolveSeatMailQueueCap(deps.queueCap);
@@ -173,6 +177,12 @@ export function createSeatMailArrivalWatcher(
       const mapped = noticeMessages.get(item.id);
       if (mapped === undefined) return;
       noticeMessages.delete(item.id);
+      // «mid-turn-carried»: the running turn drained this mail into its model input, so that turn's outcome settles it
+      // (seen on a completed turn · retry on failed/cancelled) — releasing it here would leave it processed but never acked.
+      if (item.status === 'cancelled' && item.cancelReason === 'mid-turn-carried') {
+        inTurn.set(item.id, mapped);
+        return;
+      }
       if (item.status === 'delivered') {
         inTurn.set(item.id, mapped);
         // [seat-mail #14 wiring] started 계기 — 큐가 턴에 인계한 순간(orphan guard·fail-soft는 sink/writer 안).
@@ -223,7 +233,11 @@ export function createSeatMailArrivalWatcher(
     if (inTurn.size === 0 || !source) return;
     const finished = [...inTurn];
     inTurn.clear();
-    const settledOutcome: TurnEventOutcome = responded ? 'responded' : outcome === undefined || outcome === 'responded' ? 'failed' : outcome;
+    // `responded` only says some output or tool activity appeared. «seen» (the ack) needs a completed turn: an outcome of
+    // cancelled · stopped · failed wins over responded=true (a partial answer then cancel must not ack — it is retried).
+    // No outcome given (older callers) keeps the plain responded → seen meaning.
+    const settledOutcome: TurnEventOutcome = outcome === 'cancelled' || outcome === 'stopped' || outcome === 'failed' ? outcome
+      : responded ? 'responded' : 'failed';
     const settled = adapter.settle('notice', finished.map(([, m]) => m.msgId),
       // An unanswered turn is never «responded» (#38483 seen-only-after-answer), whatever outcome the caller passed.
       settledOutcome);
@@ -405,8 +419,28 @@ export function createSeatMailArrivalWatcher(
       status = 'starting';
       try { handle = timer.set(poll, intervalMs); }
       catch (error) { status = 'start-error'; throw error; }
+      try {
+        if (deps.heartbeat) {
+          const { resolveSeatId } = require('./seat-mail-boot.js') as typeof import('./seat-mail-boot.js');
+          const seat = resolveSeatId(cwd);
+          if (seat) {
+            const { startInboxHeartbeat, seatInboxAlivePath, writeInboxBeatAtomic } = require('../loops/inbox-liveness.js') as typeof import('../loops/inbox-liveness.js');
+            const { resolveSeatStateRoot } = require('../loops/msg-wake.js') as typeof import('../loops/msg-wake.js');
+            const { hostname } = require('node:os') as typeof import('node:os');
+            const hb = deps.heartbeat;
+            heartbeat = startInboxHeartbeat(seatInboxAlivePath(hb.seatStateRoot ?? resolveSeatStateRoot(), seat),
+              { pid: process.pid, host: hb.host ?? hostname(), sessionId: '' }, {
+                getSessionId: () => { try { return status === 'running' ? hb.getSessionId() : null; } catch { return null; } },
+                write: (path, payload) => { try { writeInboxBeatAtomic(path, payload); } catch { /* fail-soft */ } },
+                ...(hb.schedule ? { schedule: hb.schedule } : {}), ...(hb.cancel ? { cancel: hb.cancel } : {}),
+              });
+          }
+        }
+      } catch { /* heartbeat is optional; polling must continue */ }
     },
     stop(): void {
+      try { heartbeat?.stop(); } catch { /* fail-soft */ }
+      heartbeat = null;
       ++pollGeneration;
       status = 'stopped';
       detachTransition?.();

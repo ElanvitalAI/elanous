@@ -36,6 +36,13 @@ export function parseOpenAIUsage(event: unknown): LLMUsage | null {
   const r = raw as {
     prompt_tokens?: number;
     completion_tokens?: number;
+    /** xAI/Responses 계열 변형 — chat 형 필드가 없을 때만 쓴다. */
+    input_tokens?: number;
+    output_tokens?: number;
+    input_tokens_details?: { cached_tokens?: number };
+    output_tokens_details?: { reasoning_tokens?: number };
+    /** xAI 구형 최상위 캐시 칸. */
+    cached_prompt_text_tokens?: number;
     /** OpenRouter 는 캐시 쓰기를 `cache_write_tokens` 로 싣는다(Anthropic 상류 · OR-ANTHROPIC-CACHE). */
     prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
     completion_tokens_details?: { reasoning_tokens?: number };
@@ -50,13 +57,15 @@ export function parseOpenAIUsage(event: unknown): LLMUsage | null {
   // ⛔⭐ elanous 의 `inputTokens` 는 «새 입력만»이다(Anthropic 규약 · metrics 적중률 분모 = input + cacheRead + cacheCreation).
   //   OpenAI 계열 `prompt_tokens` 는 캐시 적중분을 «포함»하므로 뺀다. 빼지 않으면 캐시분이 입력 단가로 한 번,
   //   캐시 단가로 또 한 번 매겨진다(BACKLOG C4 · opencode openai-chat.ts · hermes normalize_usage 와 같은 처리).
-  const cached = [r.prompt_tokens_details?.cached_tokens, r.cached_tokens, r.prompt_cache_hit_tokens]
+  const cached = [r.prompt_tokens_details?.cached_tokens, r.input_tokens_details?.cached_tokens, r.cached_tokens, r.prompt_cache_hit_tokens, r.cached_prompt_text_tokens]
     .find((v): v is number => typeof v === 'number');
   // OR-ANTHROPIC-CACHE — OpenRouter(Anthropic 상류)의 캐시 «쓰기»도 prompt_tokens 에 포함돼 온다 → 새 입력에서 빼고
   //   cacheCreationInputTokens 로 옮긴다(Anthropic 규약). 칸이 없으면(OpenAI·Grok·DeepSeek …) 종전과 같다.
   const written = typeof r.prompt_tokens_details?.cache_write_tokens === 'number' ? r.prompt_tokens_details.cache_write_tokens : undefined;
-  if (typeof r.prompt_tokens === 'number') out.inputTokens = Math.max(0, r.prompt_tokens - (cached ?? 0) - (written ?? 0));
-  if (typeof r.completion_tokens === 'number') out.outputTokens = r.completion_tokens;
+  const promptTokens = typeof r.prompt_tokens === 'number' ? r.prompt_tokens : r.input_tokens;
+  const completionTokens = typeof r.completion_tokens === 'number' ? r.completion_tokens : r.output_tokens;
+  if (typeof promptTokens === 'number') out.inputTokens = Math.max(0, promptTokens - (cached ?? 0) - (written ?? 0));
+  if (typeof completionTokens === 'number') out.outputTokens = completionTokens;
   if (cached !== undefined || written !== undefined) {
     out.cacheReadInputTokens = cached ?? 0;
     // OpenAI caches are free-on-hit and rolled into prompt_tokens for
@@ -68,9 +77,8 @@ export function parseOpenAIUsage(event: unknown): LLMUsage | null {
   // even though qwen calls it `reasoning_content` rather than the
   // OpenAI Responses-API `summary` shape), gpt-oss. Counted inside
   // `completion_tokens` already, broken out for cost attribution.
-  if (typeof r.completion_tokens_details?.reasoning_tokens === 'number') {
-    out.reasoningOutputTokens = r.completion_tokens_details.reasoning_tokens;
-  }
+  const reasoning = r.completion_tokens_details?.reasoning_tokens ?? r.output_tokens_details?.reasoning_tokens;
+  if (typeof reasoning === 'number') out.reasoningOutputTokens = reasoning;
   if (typeof r.cost === 'number' && Number.isFinite(r.cost) && r.cost >= 0) out.reportedCostUsd = r.cost;
   // OR-BYOK-COST — BYOK 호출이면 `byok` ⊕ `upstreamCostUsd`(비-BYOK 이면 아무 칸도 안 더한다 · 종전 바이트).
   Object.assign(out, readOpenRouterByokUsage(event));

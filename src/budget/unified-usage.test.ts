@@ -467,6 +467,22 @@ describe('grokUsageToSnapshot — 실제 주간 할당량 창과 크레딧은 �
 });
 
 describe('formatUnifiedUsage ⊕ CLI 가 같은 문면을 낸다', () => {
+  it('connected subscription rows show the next usable reset order without inventing prepaid resets', () => {
+    const now = Date.now();
+    const base = {
+      provider: 'codex' as const, accountCount: 2, soleAccount: false,
+      credits: { status: 'absent' as const }, resetCredits: { status: 'not-applicable' as const },
+    };
+    const report = { accountCounts: { codex: 2, grok: 0, openrouter: 1 }, rows: [
+      { ...base, accountName: 'later', subscription: { status: 'available' as const, remainingPercent: 80, resetsAt: now + 120_000, windowKind: 'weekly' as const } },
+      { ...base, accountName: 'soon\nspoof', subscription: { status: 'available' as const, remainingPercent: 30, resetsAt: now + 60_000, windowKind: 'weekly' as const } },
+      { ...base, provider: 'openrouter' as const, accountName: 'default', subscription: { status: 'unavailable' as const, reason: 'not-a-subscription' as const } },
+    ] };
+    expect(formatUnifiedUsage(report)).toContain('리셋 순서: codex/soon spoof → codex/later');
+    expect(formatUnifiedUsage(report)).not.toContain('soon\nspoof');
+    expect(formatUnifiedUsage(report)).not.toContain('openrouter/default →');
+  });
+
   it('빈 리포트의 기존 CLI 문면을 그대로 유지한다', () => {
     expect(formatUnifiedUsage({ rows: [], accountCounts: { codex: 0, grok: 0, openrouter: 0 } })).toBe([
       'usage — 계정마다 한 행 · 크레딧 축과 구독 축은 각각 칸',
@@ -544,7 +560,8 @@ describe('formatUnifiedUsage ⊕ CLI 가 같은 문면을 낸다', () => {
       out: { log: (s) => { lines.push(s); } },
     });
     await program.parseAsync(['usage'], { from: 'user' });
-    expect(lines.join('\n')).toBe(expected);
+    expect(lines[0]).toBe(expected);
+    expect(lines[1]).toContain('추천 보류');
     expect(expected).toContain('credits.usedPercent');
     expect(expected).toContain('weekly 2026-08-14~2026-08-15');
     expect(expected).toContain('subscription');

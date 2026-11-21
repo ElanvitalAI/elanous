@@ -11,7 +11,7 @@ import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 //   status:error → error       (on throw)
 //   status:aborted             (on abort — no `error` frame)
 
-import { describe, test, expect } from 'bun:test';
+import { afterAll, beforeAll, describe, test, expect } from 'bun:test';
 import {
   AgentRegistry, collectAgentText,
 } from '../src/agent/registry';
@@ -22,6 +22,14 @@ import type {
   AgentDefinition, AgentEvent,
 } from '../src/agent/types';
 import type { LLMProvider, LLMStreamEvent } from '../src/llm';
+
+// ── Env isolation ──
+// Every spawn here injects its own fixture provider. A global ELANOUS_TEST_FAKE_LLM=1 (gate pods set it for the whole
+// run) is a forced-fake fence in llm.ts that deliberately outranks injected providers (llm-usage-attribution.test.ts pins
+// that), so this file lifts the switch for its own run and restores it — the product fence stays as it is.
+let priorTestFakeLlm: string | undefined;
+beforeAll(() => { priorTestFakeLlm = process.env.ELANOUS_TEST_FAKE_LLM; delete process.env.ELANOUS_TEST_FAKE_LLM; });
+afterAll(() => { if (priorTestFakeLlm === undefined) delete process.env.ELANOUS_TEST_FAKE_LLM; else process.env.ELANOUS_TEST_FAKE_LLM = priorTestFakeLlm; });
 
 // ── Test helpers ──
 

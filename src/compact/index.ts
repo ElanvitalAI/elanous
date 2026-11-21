@@ -48,6 +48,8 @@ export {
 } from './truncate-proportional.js';
 export {
   runCompactPipeline,
+  isHumanUserMessage,
+  USER_BUDGET_TRANSFER_MARKER,
   type RunCompactOpts,
 } from './pipeline.js';
 export {

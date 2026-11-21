@@ -4,7 +4,7 @@ import Ajv2020 from 'ajv/dist/2020.js';
 import { parse as parseYaml } from 'yaml';
 import type { SupervisorLoopRef } from './incident-claim.js';
 
-const contractSchema = JSON.parse(readFileSync(resolve(import.meta.dir, '../loops/contract/loop-agent.schema.json'), 'utf8')) as { $id: string };
+import contractSchema from '../loops/contract/loop-agent.schema.json';
 const ajv = new Ajv2020({ allErrors: true, strict: true });
 ajv.addSchema(contractSchema);
 const validateDefinition = ajv.getSchema(`${contractSchema.$id}#/$defs/supervisorV1`)!;

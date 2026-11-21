@@ -17,6 +17,7 @@ import { connectRelayHost } from './host-connector.js';
 import { MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
 import { startRelayServer } from './relay-server.js';
 import { createMemberStore } from '../nexus/members/member-store.js';
+import { createOwnedSession } from '../session/index.js';
 import {
   createRelayWebChatLedger,
   routeBareWebChatHostRequest,
@@ -206,8 +207,13 @@ test('bare 웹채팅 채팅 쌍은 릴레이 신뢰채널 + 핀 소유자 일치
       return { id, envelope };
     };
 
+    // JUD #39431 필수 ① — 회원 구독은 소유가 확정된 자기 세션만: 아직 없는 세션은 403.
+    const notYet = await requestBare('GET', '/v1/chat/events?sessionId=b2b2b2b2-0000-4000-8000-000000000001', `Bearer ${ownerToken}`);
+    expect(notYet.envelope.status).toBe(403);
+    sendMuxFrame({ streamId: notYet.id, kind: 'close', reason: 'test done' });
+    createOwnedSession('b2b2b2b2-0000-4000-8000-000000000001', owner.id);
     // 같은 소유자 emt_ — GET /v1/chat/events → 200 SSE 스캐폴드 + subscribed 청크.
-    const own = await requestBare('GET', '/v1/chat/events?sessionId=bare-member-1', `Bearer ${ownerToken}`);
+    const own = await requestBare('GET', '/v1/chat/events?sessionId=b2b2b2b2-0000-4000-8000-000000000001', `Bearer ${ownerToken}`);
     expect(own.envelope.status).toBe(200); // 출처: #39024 — must ⓐ: 같은 소유자 emt_ 승인
     expect(own.envelope.headers['content-type']?.toLowerCase()).toContain('text/event-stream'); // 출처: #39024 — SSE 응답 계약
     expect(own.envelope.stream).toBe(true); // 출처: #39024 — 몸통은 뒤따르는 chunk 프레임(#39009 전송 계약)

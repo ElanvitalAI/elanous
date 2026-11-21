@@ -171,6 +171,21 @@ describe('createObjectStore', () => {
     expect(store.publicUrl('monad/id/sessions/a')).toBeNull();
   });
 
+  test('gcs put 은 gcsAccessTokenFile 을 --access-token-file 로 싣는다(JUD hold 14:57 ⑦차 ① — 자격 결속)', () => {
+    const calls: Array<{ bin: string; args: string[] }> = [];
+    const run: RunFn = (bin, args) => { calls.push({ bin, args }); return { stdout: '', stderr: '' }; };
+    const cfg: StorageConfig = { provider: 'gcs', localDir: '/tmp/x', bucket: 'b', publicBucket: 'pub', prefix: 'monad' };
+    const store = createObjectStore(cfg, { run, which: () => 'gcloud' });
+    // 결속 있으면: gcloud storage cp 가 그 ADC 파생 토큰 파일로만 서명한다.
+    store.put('pre/a', 'data', { contentType: 'text/plain', gcsAccessTokenFile: '/tmp/adcp-token' });
+    expect(calls[0]!.bin).toBe('gcloud');
+    expect(calls[0]!.args).toContain('--access-token-file');
+    expect(calls[0]!.args).toContain('/tmp/adcp-token');
+    // 결속 없으면: 어떤 --access-token-file 도 실리지 않는다(앰비언트 gcloud 자격 = 결속 없음).
+    store.put('pre/b', 'data', { contentType: 'text/plain' });
+    expect(calls[1]!.args).not.toContain('--access-token-file');
+  });
+
   test('azure 는 --auth-mode login 으로 upload|download|show|list', () => {
     const calls: Array<{ bin: string; args: string[] }> = [];
     const run: RunFn = (bin, args) => {

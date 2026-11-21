@@ -727,22 +727,70 @@ describe('LLM 도구', () => {
     scheduler.dispose();
   });
 
-  test('빈 at 도 필드가 함께 오면 충돌로 거부하고 충돌 1회만 기록한다', async () => {
-    const r = rig({ currentTurnId: () => 'turn-1' });
-    const tool = buildScheduleWakeupHostTool(r.s);
-    const host = new PluginHost({ log: () => {}, hudSet: () => {}, requestRender: () => {}, focusPane: () => {} });
-    host.registerHostTool(tool);
-    const args = { at: '', delaySeconds: 60, reason: '빈 at 충돌' };
+  // UX #115497 — strict-mode 호스트는 optional 필드를 빈 값으로 채워 보낸다. 빈 값·0·null = 미지정.
+  describe('빈 값 정규화(UX #115497)', () => {
+    const mk = () => {
+      const r = rig({ currentTurnId: () => 'turn-1' });
+      const host = new PluginHost({ log: () => {}, hudSet: () => {}, requestRender: () => {}, focusPane: () => {} });
+      host.registerHostTool(buildScheduleWakeupHostTool(r.s));
+      return { r, host };
+    };
+    const errOf = (x: { ok: boolean; result?: unknown }) => String((x.result as { error?: unknown }).error ?? '');
 
-    const rejected = await host.dispatchTool('ScheduleWakeup', args);
-    expect(rejected).toMatchObject({ ok: true, result: { error: expect.stringContaining('at 과 delaySeconds 는 둘 중 하나만') } });
-    expect(r.s.list()).toHaveLength(0);
-
-    const duplicate = await host.dispatchTool('ScheduleWakeup', args);
-    expect(duplicate).toMatchObject({ ok: true, result: { error: expect.stringContaining('같은 충돌 인자의 재시도는 억제했다') } });
-    expect(r.logs).toHaveLength(1);
-    expect(r.logs[0]).toMatchObject({ event: 'rejected', data: { reason: 'invalid' } });
-    expect(r.s.list()).toHaveLength(0);
+    test('repeatMinutes 단독 30분(+ at:"" · delaySeconds:0) 은 예약되고 list 에 1건 보인다', async () => {
+      const { r, host } = mk();
+      const res = await host.dispatchTool('ScheduleWakeup', { reason: '30분 보고', at: '', delaySeconds: 0, repeatMinutes: 30 });
+      expect(res).toMatchObject({ ok: true, result: { scheduled: { id: 'w1', repeatMinutes: 30 } } });
+      const listed = await host.dispatchTool('ScheduleWakeup', { action: 'list' });
+      expect((listed as { result: { wakeups: unknown[] } }).result.wakeups).toHaveLength(1);
+      expect(r.s.list()).toHaveLength(1);
+    });
+    test('repeatMinutes 단독(생략) 30분도 예약된다', async () => {
+      const { r, host } = mk();
+      const res = await host.dispatchTool('ScheduleWakeup', { reason: '30분 보고', repeatMinutes: 30 });
+      expect(res).toMatchObject({ ok: true, result: { scheduled: { repeatMinutes: 30 } } });
+      expect(r.s.list()).toHaveLength(1);
+    });
+    test('at:null · at:"  " 도 미지정 — delaySeconds 단독으로 예약', async () => {
+      for (const at of [null, '  ']) {
+        const { r, host } = mk();
+        const res = await host.dispatchTool('ScheduleWakeup', { reason: '빈 at', at, delaySeconds: 120 });
+        expect(res).toMatchObject({ ok: true, result: { scheduled: { id: 'w1' } } });
+        expect(r.s.list()).toHaveLength(1);
+      }
+    });
+    test('at 실값 + delaySeconds:0 → at 로 예약 · delaySeconds 실값 + at:"" → delay 로 예약', async () => {
+      const a = mk();
+      expect(await a.host.dispatchTool('ScheduleWakeup', { reason: 'at', at: '23:59', delaySeconds: 0 }))
+        .toMatchObject({ ok: true, result: { scheduled: { id: 'w1' } } });
+      const b = mk();
+      expect(await b.host.dispatchTool('ScheduleWakeup', { reason: 'delay', at: '', delaySeconds: 90 }))
+        .toMatchObject({ ok: true, result: { scheduled: { id: 'w1' } } });
+    });
+    test('at 단독 · delaySeconds 단독 은 예약된다', async () => {
+      const a = mk();
+      expect(await a.host.dispatchTool('ScheduleWakeup', { reason: 'at only', at: '23:59' })).toMatchObject({ ok: true, result: { scheduled: { id: 'w1' } } });
+      const b = mk();
+      expect(await b.host.dispatchTool('ScheduleWakeup', { reason: 'delay only', delaySeconds: 60 })).toMatchObject({ ok: true, result: { scheduled: { id: 'w1' } } });
+    });
+    test('at 실값 + delaySeconds 실값 은 계속 명시 오류로 거부한다', async () => {
+      const { r, host } = mk();
+      const res = await host.dispatchTool('ScheduleWakeup', { reason: '충돌', at: '23:59', delaySeconds: 60 }) as { ok: boolean; result?: unknown };
+      expect(errOf(res)).toContain('at 과 delaySeconds 는 둘 중 하나만');
+      expect(r.s.list()).toHaveLength(0);
+    });
+    test('전부 빈 값(at:"" · delaySeconds:0 · repeat 없음)은 «하나는 있어야 한다» 로 거부', async () => {
+      const { r, host } = mk();
+      const res = await host.dispatchTool('ScheduleWakeup', { reason: '빈', at: '', delaySeconds: 0 }) as { ok: boolean; result?: unknown };
+      expect(errOf(res)).toContain('중 하나는 있어야 한다');
+      expect(r.s.list()).toHaveLength(0);
+    });
+    test('list · cancel 회귀', async () => {
+      const { r, host } = mk();
+      await host.dispatchTool('ScheduleWakeup', { reason: 'x', delaySeconds: 60, at: '' });
+      expect(await host.dispatchTool('ScheduleWakeup', { action: 'cancel', id: 'w1' })).toMatchObject({ ok: true, result: { cancelled: 'w1' } });
+      expect(r.s.list()).toHaveLength(0);
+    });
   });
 
   test('스케줄 handler 는 at·delaySeconds·repeatMinutes 모두 빠진 요청을 실행하지 않는다', async () => {

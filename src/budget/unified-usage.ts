@@ -565,7 +565,7 @@ export function formatUsageCompact(report: UnifiedUsageReport, options: { width:
     const balance = credits.status === 'ok' && credits.balance !== null && Number.isFinite(credits.balance)
       ? ` · 크레딧 ${new Intl.NumberFormat('en-US', { maximumFractionDigits: credits.balance >= 1_000 ? 0 : 1 }).format(credits.balance)}` : '';
     const prefix = `${row.provider} `;
-    const name = row.accountName.replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ');
+    const name = safeUsageAccountName(row.accountName);
     const remainingLabel = `남은 ${remaining === null ? '잔량 모름' : `${remaining}%`}`;
     const width = Number.isFinite(options.width) ? Math.max(0, Math.floor(options.width)) : 120;
     const suffix = ` · ${remainingLabel}${when}${balance}`;
@@ -635,7 +635,20 @@ export function formatUnifiedUsage(report: UnifiedUsageReport): string {
   for (const row of report.rows) {
     lines.push(formatRow(row));
   }
+  const readAtMs = Date.now();
+  const resetOrder = report.rows
+    .filter((row) => row.subscription.status === 'available'
+      && Number.isFinite(row.subscription.resetsAt) && row.subscription.resetsAt > readAtMs
+      && Number.isFinite(row.subscription.remainingPercent) && row.subscription.remainingPercent > 0)
+    .sort((a, b) => (a.subscription.status === 'available' ? a.subscription.resetsAt : Infinity)
+      - (b.subscription.status === 'available' ? b.subscription.resetsAt : Infinity)
+      || `${a.provider}/${a.accountName}`.localeCompare(`${b.provider}/${b.accountName}`));
+  if (resetOrder.length > 0) lines.push(`  리셋 순서: ${resetOrder.map((row) => `${row.provider}/${safeUsageAccountName(row.accountName)}`).join(' → ')}`);
   return lines.join('\n');
+}
+
+function safeUsageAccountName(name: string): string {
+  return name.replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ');
 }
 
 function formatRow(row: AccountUsageRow): string {
@@ -644,7 +657,7 @@ function formatRow(row: AccountUsageRow): string {
   const resetsIn = formatWindowResetsIn(row.credits);
   const resetCredits = formatResetCreditExpiryCell(row.resetCredits);
   const subscription = formatSubscriptionCell(row.subscription);
-  return `  ${row.provider.padEnd(10)} ${row.accountName.padEnd(11)} ${String(row.accountCount).padEnd(8)} ${credits.padEnd(20)} ${window.padEnd(26)} ${resetsIn.padEnd(22)} ${resetCredits.padEnd(36)} ${subscription}${row.note ? `  — ${row.note}` : ''}`;
+  return `  ${row.provider.padEnd(10)} ${safeUsageAccountName(row.accountName).padEnd(11)} ${String(row.accountCount).padEnd(8)} ${credits.padEnd(20)} ${window.padEnd(26)} ${resetsIn.padEnd(22)} ${resetCredits.padEnd(36)} ${subscription}${row.note ? `  — ${row.note}` : ''}`;
 }
 
 function formatResetCreditExpiryCell(expiry: ResetCreditExpiryAxis): string {

@@ -22,6 +22,14 @@
 
 /** 빠진 칸을 채우는 값 — RFC «빠진 칸은 «모름»으로 적는다». */
 export const WORK_ORDER_UNKNOWN = '모름';
+
+/** TA-BUDGET-WALL: 실값 예산이 파싱에 실패하면 그 이유(안정 코드)를 돌려준다 — 빈 값·«모름» 은 undefined(벽 없음이 정상). 사유는 입력 조각을 담지 않는다(발사 응답 reason · 카드 history detail · debug 원장에 그대로 흘러 세 표면 모두 무노출 — OP #117315). */
+export function workOrderBudgetFailureReason(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed === WORK_ORDER_UNKNOWN) return undefined;
+  const parsed = parseWorkOrderBudget(trimmed);
+  return parsed.ok ? undefined : parsed.reason;
+}
 /** 지시서 골 파일 이름 접미 — 이 이름으로 끝나는 파일만 지시서로 검증한다. */
 export const WORK_ORDER_FILE_PATTERN = /\.work-order\.json$/i;
 
@@ -52,33 +60,34 @@ export type ParseWorkOrderBudgetResult = { ok: true; timeSec: number } | { ok: f
  * 예산 칸 `time=6900s usd=5`를 읽는다. tier·pod·rework는 발사 설정으로 허용하되 예산 수치에는 쓰지 않는다. 중복·알 수 없는 키·빈 값은 거부한다.
  * time 은 «선언된 값 그대로» 정수 초(s·m·h 소문자 단위)이고 1..TA_PILOT_MAX_WALL_SEC 여야 한다 — 부동소수·허용오차 없이 BigInt 10진 산술로 판정한다.
  * usd 는 센트 단위 정수로 환산되는 양의 10진수(소수 둘째 자리까지)여야 한다. usd 는 형식만 검증하며 강제 소비자는 아직 없다(후속 칸).
+ * 거부 사유는 입력 토큰·time·usd 조각을 담지 않는 안정 코드(budget-… — OP #117315)다: 사유가 세 표면(발사 응답 · 카드 history · debug 원장)에 그대로 흘러 입력값이 새는 일이 없어야 한다.
  */
 export function parseWorkOrderBudget(text: string): ParseWorkOrderBudgetResult {
   const pairs = new Map<string, string>();
   for (const token of text.split(/[\s·,;]+/u).filter(Boolean)) {
     const match = /^([a-z]+)=(.+)$/u.exec(token);
-    if (!match) return { ok: false, reason: `예산 토큰 «${token.slice(0, 40)}» 는 소문자 key=value 형식이 아니다` };
+    if (!match) return { ok: false, reason: 'budget-invalid-format' };
     const [, key, value] = match as unknown as [string, string, string];
-    if (!['time', 'usd', 'tier', 'pod', 'rework'].includes(key)) return { ok: false, reason: `예산에 허용되지 않은 키 «${key}» (허용: time·usd·tier·pod·rework)` };
-    if (pairs.has(key)) return { ok: false, reason: `예산 키 «${key}» 가 중복 선언됐다` };
+    if (!['time', 'usd', 'tier', 'pod', 'rework'].includes(key)) return { ok: false, reason: 'budget-key-not-allowed' };
+    if (pairs.has(key)) return { ok: false, reason: 'budget-duplicate-key' };
     pairs.set(key, value);
   }
   const rawTime = pairs.get('time');
-  if (rawTime === undefined) return { ok: false, reason: '예산에 time=<초|분m|시간h> 가 없다' };
+  if (rawTime === undefined) return { ok: false, reason: 'budget-time-missing' };
   const time = /^(\d{1,6})(?:\.(\d{1,12}))?([smh]?)$/u.exec(rawTime);
-  if (!time) return { ok: false, reason: `time=${rawTime.slice(0, 20)} 형식 오류(숫자+s|m|h 소문자 단위)` };
+  if (!time) return { ok: false, reason: 'budget-time-invalid' };
   const fraction = time[2] ?? '';
   const scaled = BigInt(`${time[1]}${fraction}`) * BigInt(time[3] === 'h' ? 3600 : time[3] === 'm' ? 60 : 1);
   const divisor = 10n ** BigInt(fraction.length);
-  if (scaled % divisor !== 0n) return { ok: false, reason: `time ${rawTime} 는 정수 초가 아니다` };
+  if (scaled % divisor !== 0n) return { ok: false, reason: 'budget-time-noninteger' };
   const seconds = scaled / divisor;
-  if (seconds < 1n || seconds > BigInt(TA_PILOT_MAX_WALL_SEC)) return { ok: false, reason: `time ${seconds}s 는 1..${TA_PILOT_MAX_WALL_SEC}s 밖이다` };
+  if (seconds < 1n || seconds > BigInt(TA_PILOT_MAX_WALL_SEC)) return { ok: false, reason: 'budget-time-out-of-range' };
   const rawUsd = pairs.get('usd');
-  if (rawUsd === undefined) return { ok: false, reason: '예산에 usd=<양수·소수 둘째 자리까지> 상한이 없다' };
+  if (rawUsd === undefined) return { ok: false, reason: 'budget-usd-missing' };
   const usd = /^(\d{1,9})(?:\.(\d{1,2}))?$/u.exec(rawUsd);
-  if (!usd) return { ok: false, reason: `usd=${rawUsd.slice(0, 20)} 는 센트 단위 양수(최대 소수 둘째 자리)가 아니다` };
+  if (!usd) return { ok: false, reason: 'budget-usd-invalid' };
   const cents = BigInt(usd[1]!) * 100n + BigInt((usd[2] ?? '').padEnd(2, '0') || '0');
-  if (cents <= 0n) return { ok: false, reason: 'usd 상한은 0보다 커야 한다' };
+  if (cents <= 0n) return { ok: false, reason: 'budget-usd-not-positive' };
   return { ok: true, timeSec: Number(seconds) };
 }
 

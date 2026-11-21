@@ -10,6 +10,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { onPtyEvent, startPty, unregisterPty } from '../pty-shell/registry.js';
 import type { ElsPty } from './core.js';
+import { processIdentity } from './peer-seat.js';
 import { createLineDecoder } from './wire.js';
 import { loginEnvForSpawn } from './login-env-handoff.js';
 
@@ -38,6 +39,7 @@ export interface HolderMeta {
   readonly title: string;
   readonly socketPath: string;
   readonly startedAt: number;
+  readonly processStart?: string;
   readonly cols: number;
   readonly rows: number;
 }
@@ -68,7 +70,7 @@ export function loadHolderMeta(path: string): HolderMeta | undefined {
       || typeof raw.title !== 'string' || typeof raw.socketPath !== 'string' || typeof raw.startedAt !== 'number'
       || typeof raw.cols !== 'number' || typeof raw.rows !== 'number') return undefined;
     return { paneId: raw.paneId, ptyId: raw.ptyId, pid: raw.pid, cwd: raw.cwd, command: raw.command, title: raw.title,
-      socketPath: raw.socketPath, startedAt: raw.startedAt, cols: raw.cols, rows: raw.rows };
+      socketPath: raw.socketPath, startedAt: raw.startedAt, ...(typeof raw.processStart === 'string' && raw.processStart ? { processStart: raw.processStart } : {}), cols: raw.cols, rows: raw.rows };
   } catch { return undefined; }
 }
 
@@ -183,8 +185,8 @@ export type HolderRequest =
   | { readonly op: 'kill' };
 
 export type HolderMessage =
-  | { readonly type: 'pong'; readonly paneId: string; readonly ptyId: string; readonly pid: number }
-  | { readonly type: 'snapshot'; readonly paneId: string; readonly ptyId: string; readonly pid: number; readonly alive: boolean;
+  | { readonly type: 'pong'; readonly paneId: string; readonly ptyId: string; readonly pid: number; readonly processStart?: string }
+  | { readonly type: 'snapshot'; readonly paneId: string; readonly ptyId: string; readonly pid: number; readonly processStart?: string; readonly alive: boolean;
       readonly cols: number; readonly rows: number; readonly exitCode: number | null; readonly bracketedPaste: boolean;
       readonly lastOutputAt: number | null; readonly screen: string }
   | { readonly type: 'output'; readonly paneId: string; readonly chunk: string }
@@ -273,17 +275,20 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
   chmodSync(socketPath, 0o700);
   // 이제 PTY 를 띄운다: 소켓은 이미 우리 것이다. 스폰 실패 시 소켓을 직접 정리한다.
   let handle: ReturnType<typeof startPty>;
+  const beforeSpawn = Date.now();
   try {
     handle = startPty({ cmd: start.command[0], args: start.command.slice(1), kind: 'shell', nickname: start.title,
-      workdir: start.cwd, purpose: 'els-pane', env: { ...start.env },
+      workdir: start.cwd, purpose: 'els-pane', env: { ...start.env, ELANOUS_CEO_TELEGRAM_TOKEN: '' },
       ...(start.cols !== undefined ? { cols: start.cols } : {}), ...(start.rows !== undefined ? { rows: start.rows } : {}) });
   } catch (error) {
     server.close();
     try { unlinkSync(socketPath); } catch { /* never spawned */ }
     throw error;
   }
+  const born = processIdentity(handle.pid);
+  const processStart = born?.pid === handle.pid && born.ppid === process.pid && born.startedMs >= beforeSpawn ? born.start : undefined;
   const meta: HolderMeta = { paneId: start.paneId, ptyId: handle.id, pid: handle.pid, cwd: start.cwd, command: [...start.command],
-    title: start.title, socketPath, startedAt: handle.startedAt, cols: handle.cols, rows: handle.rows };
+    title: start.title, socketPath, startedAt: handle.startedAt, ...(processStart ? { processStart } : {}), cols: handle.cols, rows: handle.rows };
   const metaPath = holderMetaPath(start.stateRoot, start.paneId);
   try { saveHolderMeta(metaPath, meta); } catch (error) {
     server.close();
@@ -297,11 +302,11 @@ export async function startHolder(start: HolderStart): Promise<Holder> {
     try { message = JSON.parse(line) as HolderRequest; } catch { send({ type: 'error', message: 'els holder: malformed line' }); return; }
     try {
       switch (message.op) {
-        case 'ping': send({ type: 'pong', paneId: meta.paneId, ptyId: handle.id, pid: handle.pid }); return;
+        case 'ping': send({ type: 'pong', paneId: meta.paneId, ptyId: handle.id, pid: handle.pid, ...(processStart ? { processStart } : {}) }); return;
         case 'input': handle.write(message.bytes); return;
         case 'write-all': await handle.writeAll(message.text); send({ type: 'wrote', paneId: meta.paneId }); return;
         case 'resize': handle.resize(message.cols, message.rows); return;
-        case 'snapshot': send({ type: 'snapshot', paneId: meta.paneId, ptyId: handle.id, pid: handle.pid, alive: handle.isAlive(),
+        case 'snapshot': send({ type: 'snapshot', paneId: meta.paneId, ptyId: handle.id, pid: handle.pid, ...(processStart ? { processStart } : {}), alive: handle.isAlive(),
           cols: handle.cols, rows: handle.rows, exitCode: handle.exitCode, bracketedPaste: handle.bracketedPasteEnabled(),
           lastOutputAt: handle.lastOutputAt ?? null, screen: await handle.renderScreen(message.ansi === true ? { ansi: true, ...(message.scrollBack ? { scrollBack: message.scrollBack } : {}) } : undefined) }); return;
         case 'kill': handle.kill(); return;
@@ -391,6 +396,9 @@ export function spawnHolderDetached(start: HolderStart & { readonly execPath?: s
   // The server's owner credential never rides into a holder (nor its pane): whether it comes from process.env or start.env.
   const holderEnv: Record<string, string | undefined> = { ...process.env, ...start.env };
   delete holderEnv.ELANOUS_ELS_OWNER_TOKEN;
+  // The ELS-only Telegram adapter credential must never ride into any pane.
+  // OP receives only its scoped ingress socket secret through envFor(OP).
+  delete holderEnv.ELANOUS_CEO_TELEGRAM_TOKEN;
   // The captured login env (login-env-handoff.ts) goes over the pipe, not argv/env/disk; no payload = /dev/null and the holder captures itself.
   const child = Bun.spawn(argv, { cwd: start.cwd, env: holderEnv,
     stdio: [start.loginEnv === undefined ? 'ignore' : 'pipe', 'ignore', 'ignore'], detached: true });
@@ -413,7 +421,7 @@ const HOLDER_CONNECT_TIMEOUT_MS = 5_000;
 const HOLDER_CONNECT_RETRY_MS = 100;
 
 /** 홀더 소켓에 붙는 ElsPty — 연결·재시도·exit 방송·쓰기 큐를 한데 묶는다(기동 전 쓰기는 소켓 뒤에 쌓인다). */
-export function connectHolderElsPty(stateRoot: string, paneId: string, meta: HolderMeta | undefined): ElsPty {
+export function connectHolderElsPty(stateRoot: string, paneId: string, meta: HolderMeta | undefined, lookupIdentity = processIdentity): ElsPty {
   const id = holderAdapterId(paneId);
   const socketPath = holderSocketPath(stateRoot, paneId);
   let alive = true;
@@ -422,6 +430,9 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
   let bracketedPaste = false;
   let lastOutputAt: number | undefined;
   let pidNow = meta?.pid;
+  let holderPtyId = meta?.ptyId;
+  let processStart: string | undefined;
+  let identityEstablished = false;
   let lastScreen: string | undefined;
   let killQueued = false;
   let socket: Socket | undefined;
@@ -446,6 +457,31 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
     if (socket && !socket.destroyed) socket.write(line); else outbox.push(line);
   };
   const onMessage = (message: HolderMessage): void => {
+    if ('paneId' in message && message.paneId !== paneId) {
+      socket?.destroy();
+      fireExit();
+      return;
+    }
+    if (message.type === 'pong' || message.type === 'snapshot') {
+      if (typeof message.ptyId !== 'string' || !message.ptyId || !Number.isSafeInteger(message.pid) || message.pid <= 0
+        || (holderPtyId !== undefined && holderPtyId !== message.ptyId)
+        || (pidNow !== undefined && pidNow !== message.pid)) {
+        socket?.destroy();
+        fireExit();
+        return;
+      }
+      holderPtyId = message.ptyId;
+      const identity = lookupIdentity(message.pid);
+      const claimedStart = typeof message.processStart === 'string' && message.processStart ? message.processStart : undefined;
+      const verifiedStart = claimedStart && identity?.pid === message.pid && identity.start === claimedStart
+        && (!meta || meta.processStart === claimedStart) ? claimedStart : undefined;
+      if (!identityEstablished) {
+        processStart = verifiedStart;
+        identityEstablished = true;
+      } else if (processStart !== verifiedStart) {
+        processStart = undefined;
+      }
+    }
     switch (message.type) {
       case 'pong': pidNow = message.pid; pending.shift()?.resolve(''); return;
       case 'snapshot':
@@ -481,6 +517,9 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
       // detach 한 뒤가 아니라면 홀더가 사라진 것이다 — 이 pane 의 생애도 끝난다(exit 방송이 마지막 화면을 실어 왔다).
       if (!detached) fireExit();
     });
+    // Establish the holder generation before exposing its process identity to the server.
+    pending.unshift({ resolve: () => {}, reject: () => {} });
+    connected.write(`${JSON.stringify({ op: 'ping' })}\n`);
     for (const line of outbox.splice(0)) connected.write(line);
     if (killQueued) connected.write(`${JSON.stringify({ op: 'kill' })}\n`);
   };
@@ -500,6 +539,7 @@ export function connectHolderElsPty(stateRoot: string, paneId: string, meta: Hol
   return {
     id,
     get pid() { return pidNow; },
+    get processBinding() { return pidNow && holderPtyId && processStart && !exited && !detached ? { pid: pidNow, generation: holderPtyId, start: processStart } : undefined; },
     isAlive: () => alive,
     write: (text) => {
       if (detached || exited) throw new Error('els holder: pane is not running');

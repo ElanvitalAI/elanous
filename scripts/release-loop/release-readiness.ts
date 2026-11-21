@@ -297,7 +297,7 @@ export function releaseReadiness(version: string, deps: ReleaseReadinessDeps = {
   return { ready: true, reason: 'ready', details: gate };
 }
 
-if (import.meta.main) {
+async function runImageT60HoldCli(): Promise<void> {
   try {
     if (!process.argv.includes('--image-t60-hold')) throw new Error('usage: release-readiness.ts --image-t60-hold');
     const contextPath = process.env.ELANOUS_GRAPH_CONTEXT;
@@ -312,3 +312,5 @@ if (import.meta.main) {
     process.exitCode = 1;
   }
 }
+
+if (import.meta.main) void runImageT60HoldCli();

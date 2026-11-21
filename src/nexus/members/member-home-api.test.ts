@@ -310,10 +310,10 @@ test("MEMBER-HOME-AFTER-SIGNUP-DEADEND: home right after signup shows real devic
     expect(hrefs).toEqual([
       "https://app.example.test/",
       "#connect-guide",
-      "https://app.example.test/members/",
+      "https://app.example.test/v1/members/handle",
     ]);
     expect(fresh).toContain(
-      'data-member-handle-step href="https://app.example.test/members/">핸들 정하기</a>',
+      'data-member-handle-step href="https://app.example.test/v1/members/handle">핸들 정하기</a>',
     );
     expect(fresh).toContain(
       'class="primary" href="#connect-guide">기기 연결하는 법</a>',
@@ -347,13 +347,13 @@ test("MEMBER-HOME-AFTER-SIGNUP-DEADEND: home right after signup shows real devic
       [...linked.matchAll(/href="([^"]+)"/g)].map((match) => match[1]),
     ).toEqual([
       "https://app.example.test/",
-      "https://app.example.test/members/",
-      "https://app.example.test/members/",
+      "https://app.example.test/v1/members/handle",
+      "https://app.example.test/v1/members/handle",
     ]);
     expect(linked).not.toContain("data-member-webchat-entry");
     expect(linked).not.toContain("data-member-start-terminal");
     expect(linked).toContain(
-      '<a class="primary" data-member-handle-step href="https://app.example.test/members/">핸들 정하기</a>',
+      '<a class="primary" data-member-handle-step href="https://app.example.test/v1/members/handle">핸들 정하기</a>',
     );
     store.claimHandle(member.id, "deadend");
     store.ensureNativeAppSlotForMember(member.id);
@@ -427,7 +427,7 @@ test("MEMBER-HOME-WEBCHAT-LINK-WRONG: a handle-less member is never linked to th
     // 핸들 없음 → «내 주소 … (곧 열림)» 줄도 0 (OP #92257 리터럴 1)
     expect(home).not.toContain("data-member-webchat-soon");
     expect(home).toContain(
-      '<a class="primary" data-member-handle-step href="https://app.example.test/members/">핸들 정하기</a>',
+      '<a class="primary" data-member-handle-step href="https://app.example.test/v1/members/handle">핸들 정하기</a>',
     );
     expect(home).not.toContain("data-member-start-terminal");
   } finally {

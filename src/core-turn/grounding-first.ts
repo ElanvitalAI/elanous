@@ -4,8 +4,8 @@ const EXECUTION_REQUEST = /(?:구현|코드|버그|배포|설치|재시작|앱.{
 const LOCAL_STATE = /\b(?:cwd|git|branch|commits?|directory|filesystem|process|disk)\b|디렉[터토]리|작업\s*폴더|현재\s*경로|커밋|로컬|파일\s*(?:목록|경로|내용|상태)|시스템\s*(?:상태|정보)/iu;
 
 /** Execution requests and local machine/repo state stay on their ordinary tool path.
- * @deprecated 1121 RESEARCH-ROUTING: no longer a research-routing input on a web-capable turn — shadow only
- * (`research.route-mismatch`); the structured plan field `localOnly` decides. Its one remaining use only ACCELERATES the
+ * @deprecated 1121 RESEARCH-ROUTING: no longer a research-routing input on a web-capable turn; the
+ * structured plan fields (`localOnly` · `answerableWithoutWeb`) decide. Its one remaining use only ACCELERATES the
  * q0 original-question search (old fast path, never blocks entry). 만료: «11-24 불일치율 보고 뒤 삭제 · 칸 만료». */
 export function isExecutionOrLocalRequest(text: string | undefined): boolean {
   return !!text && (EXECUTION_REQUEST.test(text) || LOCAL_STATE.test(text));
@@ -21,7 +21,7 @@ export function isCitationGuardedQuestion(text: string | undefined): boolean {
 }
 
 /** @deprecated 1121 RESEARCH-ROUTING: on a web-capable turn research entry is the plan's structured `route` verdict
- * (default ENTER, skip only on `localOnly: true`); this sentence classifier is shadow only (`research.route-mismatch`)
+ * (default ENTER, skip only on `localOnly: true` or a confident `answerableWithoutWeb: true`); this sentence classifier no longer decides entry there
  * and still picks grounding-first vs provisional MODE and the route of turns with no web tool. 만료: «11-24 불일치율 보고 뒤 삭제 · 칸 만료». */
 export function needsGroundingFirst(text: string | undefined): boolean {
   if (!text?.trim()) return false;

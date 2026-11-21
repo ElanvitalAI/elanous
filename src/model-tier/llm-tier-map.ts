@@ -430,6 +430,15 @@ const OPENGATEWAY: TierMap = {
   loaded:   { model: OPENGATEWAY_MODEL, reasoningLevel: 'off', label: 'DeepSeek V4.1 Flash Ultrafast (OpenGateway)', rationale: 'Single verified first-slice model', status: 'shipping' },
 };
 
+// Partner model IDs and prices are account-specific until verified discovery.
+// Explicit llm.model remains required; tiers must never fabricate a billable ID.
+const TIMELYROUTER: TierMap = Object.fromEntries(
+  ['budget', 'balanced', 'better', 'best', 'loaded'].map(tier => [tier, {
+    model: 'timelyrouter/(configure-model)', label: `TimelyRouter ${tier}`,
+    rationale: 'Choose a verified model from the configured endpoint', status: 'wip',
+  }]),
+) as TierMap;
+
 // ── AWS Bedrock (BEDROCK-PROVIDER · 2026-10-11) ───────────────────
 //   ⛔ bedrock 은 명시 선택 전용 — 이 표는 `--role-llm <role>=bedrock/<tier>` 같은 «명시» 해석에만 쓰인다.
 //   ⚠️ status = `wip`: mantle-openai 모델의 실제 호출 가능성은 계정별 IAM 접근 조건을 따르며,
@@ -486,6 +495,7 @@ export const LLM_TIER_MAP_BY_PROVIDER: Readonly<Record<LlmTierProvider, TierMap>
   grok: GROK,
   openrouter: OPENROUTER,
   opengateway: OPENGATEWAY,
+  timelyrouter: TIMELYROUTER,
   bedrock: BEDROCK,
   // HQ proxy accepts the Codex model family and forwards those choices unchanged.
   'hq-proxy': CODEX,
@@ -510,7 +520,7 @@ export function parseTierArg(raw: string): ModelTier | undefined {
  *  tsc 는 배열 누락을 못 잡는다(2026-09-23 `#19900` 이 `openrouter` 를 빠뜨려 배선 계약 자가 그것을
  *  한 번도 누르지 않았다). 자 = `provider-wiring-contract.test.ts`. */
 export const TIER_PROVIDERS: readonly LlmTierProvider[] = [
-  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter', 'opengateway', 'bedrock', 'hq-proxy',
+  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter', 'opengateway', 'timelyrouter', 'bedrock', 'hq-proxy',
 ];
 
 /** OpenRouter 모델 id(`openrouter/<vendor>/<model>` 또는 `<vendor>/<model>`)의 tier-map 칸.

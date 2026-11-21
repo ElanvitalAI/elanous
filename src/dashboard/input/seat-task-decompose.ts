@@ -21,11 +21,46 @@
 
 // ── 계약(스펙 필드) ────────────────────────────────────────────────────────────────────
 
+/**
+ * ELN-SEAT-INBOX-TURN-BOUNDARY r2 (JUD #121493) — 우편 원장이 검증한 머리글 칸(B1-A `origin` kind/seat · `intent` ·
+ * `crown_directive`)의 전달 형태. 구조적으로 `src/msg/msg-context-header.ts` 의 `headerFieldsOf` 결과
+ * (`Partial<ContextHeaderInput>`)와 같다 — 원장 칸이 비어 있을 때 null 이므로 fromKind/fromSeat 는
+ * `Partial<ContextHeaderInput>` 처럼 `| null` 까지 그대로 받는다(r3 게이트 changed-tsc TS2322: null 없는
+ * 좁은 판은 `headerFieldsOf` 결과를 `TaskRequest.header` 에 못 실었다). 큐 알림 머리글
+ * «[from <자리> · <intent> · crown]» 은 이 칸을 legacy sender/kind 폴백보다 우선한다(즉시 주입 경로와 같은 규칙).
+ * 이 모듈은 순수 판정 모듈(의존 import 0)이라 타입을 로컬로 정의한다.
+ */
+type MessageFromKind = 'human' | 'agent' | 'system' | 'tool';
+
+export interface SourceHeaderFields {
+  /** B1-A `origin.kind` — 사람 발언은 우편 원장에 오지 않으므로 폴백은 legacyFromKind(sender) 그대로. 칸이 비면 null. */
+  fromKind?: MessageFromKind | null;
+  /** B1-A 구조 `origin.seat` — 없으면 legacy sender 가 자리 이름이 된다. 칸이 비면 null. */
+  fromSeat?: string | null;
+  /** B1-A `intent` — 없으면 legacy kind 매핑(legacyIntent)이 인텐트가 된다. */
+  intent?: string | null;
+  /** B1-A `crown_directive` — 검증된 지시 id일 때만 머리글에 «crown» 이 붙는다(§5c). */
+  crownDirective?: string | null;
+}
+
 export interface TaskRequest {
   id: string;
   text: string;
   receivedAt: number;
   interrupt?: boolean;
+  /**
+   * ELN-SEAT-INBOX-TURN-BOUNDARY (#121130): the mail's sender (legacy `msg_messages.sender`) — carried so the
+   * queue notice can name the origin instead of paraphrasing it away. Absent for non-mail requests.
+   */
+  sender?: string;
+  /** The mail's transport kind — the notice header's intent fallback. */
+  kind?: string | null;
+  /**
+   * r2 (#121130 · JUD #121493): the mail ledger's VERIFIED header fields (B1-A origin kind/seat · intent ·
+   * crown_directive) — the queue notice's header prefers these over the legacy sender/kind (the same rule the
+   * immediate-injection path already follows). Absent for non-mail requests and legacy-only rows.
+   */
+  header?: SourceHeaderFields;
   /**
    * ELN-SEAT-WORK-QUEUE: priority from the message's structured fields (B1-A `priority` · 대표 crown delegation) —
    * never from wording. The decomposition takes the higher of this and its text marks.
@@ -50,6 +85,12 @@ export interface DecomposedTask {
   sourceRequestId: string;
   /** 원문 전문 보존(절대 요약으로 대체 금지). */
   sourceText: string;
+  /** 원문 발신 자리(#121130) — 큐 알림 머리글이 발신자를 그대로 적는다(원문 보존의 한 조각). */
+  sourceSender?: string;
+  /** 원문 transport kind — 알림 머리글의 intent 폴백용. */
+  sourceKind?: string | null;
+  /** r2 (#121130 · JUD #121493): 원문의 검증 머리글 칸 — 큐 알림 머리글이 legacy sourceSender/sourceKind 대신 우선한다. */
+  sourceHeader?: SourceHeaderFields;
   status: 'queued' | 'active' | 'done' | 'cancelled' | 'superseded';
   /** 대체(superseded)됐을 때 이 자리를 차지한 작업 id — 원문은 둘 다 보존. */
   supersededBy?: string;
@@ -318,7 +359,13 @@ export function decomposeRequests(requests: TaskRequest[], opts: { seqStart?: nu
       }
     }
     if (req.interrupt) notes.push(`인터럽트(${req.id}) — 진행 중 작업 정정(reconcile) 대상: 일시 중지 후 재계획`);
-    tasks.push(...reqTasks);
+    // 원문 발신자·transport kind 는 요청의 작업마다 보존(#121130 — 큐 알림이 원문을 그대로 싣는다).
+    tasks.push(...reqTasks.map(task => ({
+      ...task,
+      ...(req.sender !== undefined ? { sourceSender: req.sender } : {}),
+      ...(req.kind !== undefined ? { sourceKind: req.kind } : {}),
+      ...(req.header !== undefined ? { sourceHeader: req.header } : {}),
+    })));
   }
 
   // 취소 후보 중 같은 묶음에 그 대상의 대응 작업이 있으면 취소 아님 — 정정(reconcile) 대상.

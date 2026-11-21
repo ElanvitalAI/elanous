@@ -40,13 +40,48 @@ export function clampFontSize(size: number): number {
   return Math.min(TERM_FONT_MAX, Math.max(TERM_FONT_MIN, Math.round(size)));
 }
 
-export function readTermFontSize(storage: StorageLike | null | undefined): number {
+export function readTermFontSize(storage: StorageLike | null | undefined, mobile = false): number {
+  const fallback = TERM_FONT_DEFAULT + (mobile ? 1 : 0);
   try {
     const raw = storage?.getItem(TERM_FONT_KEY);
-    return raw ? clampFontSize(Number(raw)) : TERM_FONT_DEFAULT;
-  } catch { return TERM_FONT_DEFAULT; }
+    return raw ? clampFontSize(Number(raw)) : fallback;
+  } catch { return fallback; }
 }
 
 export function writeTermFontSize(storage: StorageLike | null | undefined, size: number): void {
   try { storage?.setItem(TERM_FONT_KEY, String(clampFontSize(size))); } catch { /* 기억 못 해도 지금 크기는 그대로 */ }
+}
+
+// Storage events only reach other documents; notify the other mounted layouts in
+// this document explicitly, even when browser storage is unavailable.
+const fontSizeListeners = new Set<(size: number) => void>();
+let currentFontSize: number | undefined;
+
+export function publishTermFontSize(size: number): void {
+  const next = clampFontSize(size);
+  currentFontSize = next;
+  try {
+    const storage = window.localStorage;
+    storage.setItem(TERM_FONT_KEY, String(next));
+    if (storage.getItem(TERM_FONT_KEY) === String(next)) currentFontSize = undefined;
+  } catch { /* keep the current size in memory if storage is blocked */ }
+  for (const listener of fontSizeListeners) listener(next);
+}
+
+export function subscribeTermFontSize(listener: (size: number) => void): () => void {
+  fontSizeListeners.add(listener);
+  const refresh = () => {
+    let storage: StorageLike | null = null;
+    try { storage = window.localStorage; } catch { /* storage access may be blocked */ }
+    listener(currentFontSize ?? readTermFontSize(storage, window.matchMedia?.('(pointer: coarse)').matches ?? false));
+  };
+  const onStorage = (event: StorageEvent) => {
+    if (event.key !== TERM_FONT_KEY && event.key !== null) return;
+    try { if (event.storageArea && event.storageArea !== window.localStorage) return; } catch { return; }
+    currentFontSize = undefined;
+    refresh();
+  };
+  window.addEventListener('storage', onStorage);
+  refresh();
+  return () => { fontSizeListeners.delete(listener); window.removeEventListener('storage', onStorage); };
 }

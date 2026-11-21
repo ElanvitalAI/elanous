@@ -11,7 +11,7 @@ import { defaultTaskLauncher, registerTasksCommands, spawnDetachedConfirmed, typ
 import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { abandonedDraftReleaseNote, cardsTouchingPaths, taBudgetEnv, closeTaskCard, draftTaskOwner, handDraftClaim, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, updateTaskCard, writeTaskCards, TaskAgentStateError, TaskDraftClaimRejectedError, type DraftClaimGhPorts, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { abandonedDraftReleaseNote, cardsTouchingPaths, taBudgetEnv, taBudgetWallRefusal, LAUNCH_REFUSED_BUDGET_EVENT, closeTaskCard, draftTaskOwner, handDraftClaim, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, updateTaskCard, writeTaskCards, TaskAgentStateError, TaskDraftClaimRejectedError, type DraftClaimGhPorts, type TaskCard, type TaskLaunchContext } from './task-hand.js';
 import { advanceMission } from './mission.js';
 import { remoteLaunchScript } from './parent-host.js';
 import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
@@ -1758,7 +1758,7 @@ test('COORD-ENTRANCE-FOLD: 실제 tasks hand work-order 발사가 원문 hash �
   const state = join(root, 'task-agent-actions.json');
   const file = join(root, 'coord.work-order.json');
   const order = buildWorkOrder({ cellId: 'COORD-ENTRANCE-FOLD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts',
-    budget: 'time=6900s tier=low pod=aws1 rework=1', contract: 'coordinator-shadow 원문 hash 행', escalation: 'OP' });
+    budget: 'time=6900s usd=1 tier=low pod=aws1 rework=1', contract: 'coordinator-shadow 원문 hash 행', escalation: 'OP' });
   writeFileSync(file, `${JSON.stringify(order)}\n`);
   const savedAgent = process.env.ELANOUS_SEAT;
   const savedAiAgent = process.env.AI_AGENT;
@@ -3040,3 +3040,34 @@ test('실프로세스: tasks hand (옵션 없음) 은 종전대로 --merge-by-ho
   expect(r.stdout).toContain('harness say --substrate pod --merge-by-host');
   expect(r.stdout).not.toContain('--no-auto-merge');
 }, 150_000);
+
+
+test('TA-BUDGET-WALL ③: taBudgetWallRefusal — 실값 예산 파싱 실패만 거부 사유, 빈 값·«모름»은 통과', () => {
+  const parsed = parseWorkOrder(JSON.stringify(fullWorkOrder));
+  if (!parsed.ok) throw new Error(parsed.reason);
+  expect(taBudgetWallRefusal({ ...parsed.order, budget: 'time=1800s usd=1' })).toBe(undefined);
+  expect(taBudgetWallRefusal({ ...parsed.order, budget: '모름' })).toBe(undefined);
+  expect(taBudgetWallRefusal(undefined)).toBe(undefined);
+  const refusal = taBudgetWallRefusal({ ...parsed.order, budget: 'time=7200s usd=1' });
+  expect(typeof refusal).toBe('string');
+  expect(refusal!.length).toBeGreaterThan(0);
+});
+
+test('TA-BUDGET-WALL ③④: 실값 예산 파싱 실패면 발사를 거부한다(fail-closed · launch-refused-budget)', async () => {
+  const parsed = parseWorkOrder(JSON.stringify(fullWorkOrder));
+  if (!parsed.ok) throw new Error(parsed.reason);
+  const root = mkdtempSync(join(tmpdir(), 'ta-budget-wall-'));
+  const statePath = join(root, 'tasks.json');
+  const launcher = () => { throw new Error('TA-BUDGET-WALL: 발사가 허용되어선 안 된다'); };
+  const r = await handTask({
+    id: 'ta-budget-wall', text: '예산 벽 결함 수리', seat: 'TC', checklistId: 'CL-1', checklistVersion: '1', noAutoMerge: true,
+    workOrder: { ...parsed.order, budget: 'time=7200s usd=1' },
+    statePath, prelaunchInspector: () => ({ reason: 'test' }), launcher,
+  });
+  expect(r.launched).toBe(false);
+  expect(r.reason ?? '').toContain('launch-refused-budget');
+  expect(r.card.history.some((h) => h.event === LAUNCH_REFUSED_BUDGET_EVENT)).toBe(true);
+  // writeCard는 statePath 문서의 tasks 맵에 병합 영속한다(writeTaskCards: {...disk, tasks}) — cards 키가 아니라 tasks 에서 읽는다.
+  expect((JSON.parse(readFileSync(statePath, 'utf8')).tasks['ta-budget-wall'].history as Array<{ event: string }>).some((h) => h.event === LAUNCH_REFUSED_BUDGET_EVENT)).toBe(true);
+  rmSync(root, { recursive: true, force: true });
+});

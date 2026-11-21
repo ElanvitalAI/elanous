@@ -114,7 +114,7 @@ test('a late run (after cutAt, within validUntil) still applies and records late
       expect(stale.code).not.toBe(0);
       expect(stale.output).toMatchObject({ outcome: 'fail' });
       expect(String(stale.output.summary)).toStartWith(`${TRAFFIC_NOT_PREPPED}(stale)`);
-      expect(String(stale.output.summary)).toContain('eln release critpath --version 0.3.31');
+      expect(String(stale.output.summary)).toContain('eln release prepare --version 0.3.31');
       expect(readFileSync(g.trafficFile, 'utf8')).toBe(before);
     } finally { g.cleanup(); }
   } finally { f.cleanup(); }

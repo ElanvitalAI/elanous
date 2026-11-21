@@ -56,6 +56,8 @@ export interface TaPreflightEvidence {
     /** 그라운딩 URL 없음 = 정책상 끔(예: 대표 D2 «M2 토큰 중계 안 켬») — off:true 와 사유 원문이 함께 있어야 PASS(policy-off). */
     readonly groundingPolicy?: { readonly off?: boolean | null; readonly reason?: string | null } | null;
   };
+  /** (관측 원천 기록) `tasks preflight --card` 가 관측 null/«모름» 칸을 «제출된 실측 증거» 값으로 유지한 필드 목록 — 관측 «측정값» 은 제출값보다 우선하므로 여기에 없다. */
+  readonly evidenceBackedFields?: readonly string[];
   /**
    * ①② 정적 판정용 — «어긋나면 런을 실패시키는 코드»가 이 빌드에 있는가. 증거 파일이 스스로 주장하지 못하게
    * `tasks preflight` 가 모듈 export 를 직접 확인해 채운다(주어진 값은 덮어쓴다).

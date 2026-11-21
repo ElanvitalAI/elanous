@@ -1,6 +1,6 @@
 import type { Command } from 'commander';
 import { writeStdoutJson } from '../cli/stdout-json.js';
-import { listAllLoops, listLoops, loopStatus, runLoop, setLoopEnabled, unregisteredCronLoops, type AllLoopEntry, type LoopRegistryOptions } from './registry.js';
+import { listAllLoops, listLoops, loopStatus, runLoop, runLoopCron, setLoopEnabled, unregisteredCronLoops, type AllLoopEntry, type LoopRegistryOptions } from './registry.js';
 import { checkLoops, countLoopStates, entriesFromRegistry, LOOP_STATES, notifyOwners, observeLoopCheck, pruneJudgment, pruneText, type RegistryAdapterDeps } from './checker.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { verifyLoopPackage } from './package/verify.js';
@@ -87,6 +87,16 @@ export function registerLoopCommands(program: Command, checkerDeps: RegistryAdap
         await output(await setLoopEnabled(id, enabled, !!opts.yes), !!opts.json);
       }));
   }
+  // JUD #117698: crontab lines must not let the shell open the loop log (`>> … 2>&1`). The registered
+  // line runs `… loop cron <id> --graph <file> --state-root <dir>` — this wrapper owns the guarded
+  // open, pipes the graph child's stdout+stderr onto that descriptor, and propagates its exit status.
+  loop.command('cron <id>').description('Run one loop graph cron through the guarded log open (crontab entry point)')
+    .requiredOption('--graph <file>', 'Graph YAML path relative to the project root')
+    .requiredOption('--state-root <dir>', 'Instance state root that owns loop-logs')
+    .action((id: string, opts: { graph: string; stateRoot: string }) => handle(async () => {
+      const status = runLoopCron(id, opts.graph, opts.stateRoot);
+      if (status !== 0) process.exitCode = status;
+    }));
   loop.command('run <id>').option('--dry-run', 'Walk the graph without executing commands')
     .option('--json', 'Print JSON')
     .action((id: string, opts: { dryRun?: boolean; json?: boolean }) => handle(async () => {

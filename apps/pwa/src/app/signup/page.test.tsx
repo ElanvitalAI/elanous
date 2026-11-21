@@ -88,8 +88,8 @@ test('KCB QR fills the event code and signup sends it to member OAuth once', asy
   let tree!: ReturnType<typeof create>;
   try {
     await act(async () => { tree = create(<MemberSignupPage />); });
-    expect(tree.root.findByProps({ 'aria-label': '행사 코드' }).props.value).toBe('KCB1114');
-    await act(async () => { tree.root.findAllByType('input')[1]!.props.onChange({ target: { checked: true } }); });
+    expect(JSON.stringify(tree.toJSON()).includes('KCB1114')).toBe(false);
+    await act(async () => { tree.root.findAllByType('input')[0]!.props.onChange({ target: { checked: true } }); });
     await act(async () => { tree.root.findByProps({ name: 'newsletterPreference', value: 'declined' }).props.onChange(); });
     await act(async () => { tree.root.findByType('button').props.onClick(); await Promise.resolve(); });
     expect(requests).toMatchObject([{ url: '/v1/members', body: { eventCode: 'KCB1114' } }]);
@@ -118,8 +118,8 @@ test('KCB printed and spoken aliases display and submit the one canonical event 
     let tree: ReturnType<typeof create> | null = null;
     try {
       await act(async () => { tree = create(<MemberSignupPage />); });
-      expect(tree!.root.findByProps({ 'aria-label': '행사 코드' }).props.value).toBe('KCB1114');
-      await act(async () => { tree!.root.findAllByType('input')[1]!.props.onChange({ target: { checked: true } }); });
+      expect(JSON.stringify(tree!.toJSON()).includes('KCB1114')).toBe(false);
+      await act(async () => { tree!.root.findAllByType('input')[0]!.props.onChange({ target: { checked: true } }); });
       await act(async () => { tree!.root.findByProps({ name: 'newsletterPreference', value: 'declined' }).props.onChange(); });
       await act(async () => { await tree!.root.findByType('button').props.onClick(); });
       expect(posted?.eventCode).toBe('KCB1114');
@@ -157,7 +157,7 @@ test('QR start survives signup retry and page reload so an old journey cannot be
   try {
     await act(async () => { tree = create(<MemberSignupPage />); });
     expect(stored.get('kcb-qr-journey-started-at')).toBe(String(started));
-    await act(async () => { tree!.root.findAllByType('input')[1]!.props.onChange({ target: { checked: true } }); });
+    await act(async () => { tree!.root.findAllByType('input')[0]!.props.onChange({ target: { checked: true } }); });
     await act(async () => { tree!.root.findByProps({ name: 'newsletterPreference', value: 'declined' }).props.onChange(); });
     await act(async () => { tree!.root.findByType('button').props.onClick(); await Promise.resolve(); });
     expect(tree!.root.findByProps({ role: 'alert' }).children.join('')).toContain('다시 시도');
@@ -253,7 +253,7 @@ test('real QR and completion components observe first-result SLA through fake OI
       await act(async () => { signup = create(<MemberSignupPage />); });
       expect(storage.get('kcb-qr-journey-started-at')).toBe(String(now));
       now += 15_000;
-      await act(async () => { signup.root.findAllByType('input')[1]!.props.onChange({ target: { checked: true } }); });
+      await act(async () => { signup.root.findAllByType('input')[0]!.props.onChange({ target: { checked: true } }); });
       await act(async () => { signup.root.findByProps({ name: 'newsletterPreference', value: 'declined' }).props.onChange(); });
       await act(async () => { signup.root.findByType('button').props.onClick(); await Promise.resolve(); });
       expect(authorizationUrl).toStartWith('https://accounts.google.test/');

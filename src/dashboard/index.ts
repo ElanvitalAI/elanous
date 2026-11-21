@@ -2418,6 +2418,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
   // name was unknown (caller's choice whether to surface a hint).
   const runSkillByName = async (skillArg: string, skillArgs: string): Promise<boolean> =>
     runDashboardSkillByName(skillArg, skillArgs, {
+      sessionId: currentChatPersonaSessionId(),
       chatHistory: chat.history,
       chatLines,
       contextRegistry,

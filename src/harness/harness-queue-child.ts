@@ -33,5 +33,5 @@ export async function runHarnessQueueChild(
 if (import.meta.main) {
   const [receiptPath, command, ...args] = process.argv.slice(2);
   if (!receiptPath || !command) throw new Error('queue child requires receipt path and command');
-  process.exitCode = await runHarnessQueueChild(receiptPath, command, args);
+  void runHarnessQueueChild(receiptPath, command, args).then((code) => { process.exitCode = code; });
 }

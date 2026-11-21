@@ -42,6 +42,10 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'grant revocation verifies a fresh app owner session and the exact owned grant record' },
   { method: 'PUT', match: 'exact', path: '/v1/members/handle', selfVerified: true,
     why: 'handle registration verifies its own member web session or app owner session before claiming a name' },
+  { method: 'GET', match: 'exact', path: '/v1/members/handle', selfVerified: true,
+    why: 'the handle confirmation page (MEMBER-JOURNEY S3) verifies its own revocable member session and answers 401 itself; other methods answer 405 at the handler' },
+  { method: '*', match: 'exact', path: '/v1/members/handle/check', selfVerified: true,
+    why: 'handle availability answers only a signed-in member (revocable member-session cookie), one candidate at a time, read-only; a non-GET must reach the handler so it answers 405 method-not-allowed instead of the auth gate' },
   { method: 'POST', match: 'exact', path: '/v1/tokens', selfVerified: true,
     why: 'member key bearer is checked by the token API before minting a scoped access token' },
   { method: 'POST', match: 'exact', path: '/v1/tokens/introspect', selfVerified: true,
@@ -284,7 +288,7 @@ export function isPublicRoute(
   ctx: PublicRouteContext,
 ): boolean {
   for (const route of PUBLIC_ROUTES) {
-    if (route.method !== method) continue;
+    if (route.method !== '*' && route.method !== method) continue;
     if (route.path.startsWith('/v1/setup/') && route.path !== '/v1/setup/claim' && !route.selfVerified && !ctx.setupMode) continue;
     if (route.match === 'exact') {
       if (pathname === route.path) return true;

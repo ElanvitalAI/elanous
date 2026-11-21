@@ -36,6 +36,9 @@ export interface PutOptions {
   contentType?: string;
   /** CLI `--public`. 키의 공개 기능 여부와 무관하게 공개 버킷. */
   public?: boolean;
+  /** JUD hold(14:57) ⑦차 ① — gcs 업로드 자격 결속: ADC 파생 접근 토큰 파일 경로.
+   *  gcloud storage cp 는 이 토큰으로만 서명한다(--access-token-file · 앰비언트 gcloud 자격 사용 안 함). */
+  gcsAccessTokenFile?: string;
 }
 
 export interface ObjectStore {
@@ -279,10 +282,13 @@ export function createObjectStore(config: StorageConfig, deps: ObjectStoreDeps =
     if (provider === 'gcs') {
       const bin = which('gcloud');
       const uri = `gs://${bucket}/${key}`;
+      // JUD hold(14:57) ⑦차 ① — 결속된 ADC 파생 토큰 파일이 있으면 그 자격으로만 서명한다(신원 해석과 같은 출처).
+      const boundToken = typeof opts?.gcsAccessTokenFile === 'string' && opts.gcsAccessTokenFile
+        ? ['--access-token-file', opts.gcsAccessTokenFile] : [];
       if (fileBody) {
-        run(bin, ['storage', 'cp', body, uri, ...ct], { timeoutMs: 60_000 });
+        run(bin, ['storage', 'cp', body, uri, ...boundToken, ...ct], { timeoutMs: 60_000 });
       } else {
-        run(bin, ['storage', 'cp', '-', uri, ...ct], { input: asBytes(body), timeoutMs: 60_000 });
+        run(bin, ['storage', 'cp', '-', uri, ...boundToken, ...ct], { input: asBytes(body), timeoutMs: 60_000 });
       }
       return;
     }

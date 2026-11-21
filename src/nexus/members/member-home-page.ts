@@ -63,7 +63,7 @@ function href(value: string): string {
 /** Return standalone HTML for the signed-in elanous.ai page. The caller sets the session and CSP headers. */
 /** The app-name card's line for a member without an event code (OP 11-18 B: the rule stays, the page says it). */
 export const APP_NAME_NEEDS_EVENT_CODE =
-  "이벤트 코드로 가입한 회원부터 앱 주소를 열 수 있어요.";
+  "초대를 받아 가입한 회원부터 앱 주소를 열 수 있어요.";
 
 export function renderMemberHomePage(input: MemberHomePageInput): string {
   const devices =

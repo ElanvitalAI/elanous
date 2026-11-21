@@ -3,14 +3,17 @@ import { readFileSync } from "node:fs";
 import {
   BARE_CAPABILITIES_META_NAME,
   BARE_WEBCHAT_FORWARDED_API_PATHS,
+  BARE_WEBCHAT_SESSION_ITEM_CAPABILITY,
   bareCapabilitiesContent,
   bareCapabilitiesMetaTag,
+  isBareForwardedApiPath,
   parseBareCapabilities,
 } from "./bare-surface.js";
 
 test("meta content round-trips the single forwarded set", () => {
-  expect(parseBareCapabilities(bareCapabilitiesContent())).toEqual([...BARE_WEBCHAT_FORWARDED_API_PATHS]);
+  expect(parseBareCapabilities(bareCapabilitiesContent())).toEqual([...BARE_WEBCHAT_FORWARDED_API_PATHS, BARE_WEBCHAT_SESSION_ITEM_CAPABILITY]);
   expect(bareCapabilitiesMetaTag()).toBe(`<meta name="${BARE_CAPABILITIES_META_NAME}" content="${bareCapabilitiesContent()}">`);
+  expect(isBareForwardedApiPath('/v1/sessions/store/:id')).toBe(false);
 });
 
 test("relay-server derives its bare path check from the shared constant, not literals", () => {

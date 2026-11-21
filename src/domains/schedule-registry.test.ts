@@ -990,7 +990,7 @@ describe('지워진 crontab 줄 — enabled 를 내리는 경로', () => {
 
     const OLD_LINE = '0 8 * * * cd /r && bun scripts/cron-run.ts scripts/ops-health-check.ts >> /tmp/o.log 2>&1';
     const NEW_LINE = '0 9 * * * cd /r && bun scripts/cron-run.ts scripts/ops-health-check.ts >> /tmp/o.log 2>&1';
-    const crontabState = join(root, 'crontab.txt');
+    const crontabState = join(stateDir, 'crontab');
     writeFileSync(crontabState, `${NEW_LINE}\n`);
     writeFileSync(join(binDir, 'crontab'), `#!/bin/sh\nif [ "$1" = "-l" ]; then cat "${crontabState}"; exit 0; fi\nexit 0\n`);
     chmodSync(join(binDir, 'crontab'), 0o755);

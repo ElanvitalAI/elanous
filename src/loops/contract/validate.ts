@@ -1,9 +1,8 @@
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { parse as parseYaml } from 'yaml';
 
-const schema = JSON.parse(readFileSync(resolve(import.meta.dir, 'loop-agent.schema.json'), 'utf8'));
+import schema from './loop-agent.schema.json';
 const ajv = new Ajv2020({ allErrors: true, strict: true });
 const validateShape = ajv.compile(schema);
 const resolutionRank: Record<string, number> = { L0: 0, L1: 1, L2: 2, L3: 3 };

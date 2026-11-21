@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -8,6 +8,7 @@ import { resolveGrokCredential } from '../grok/credential.js';
 import { grokAgentSearch } from '../grok/agent-search.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
+import { buildGrokResearchSocialWebSearchProvider } from './grok.js';
 import { _resetWebSearchProvidersForTests, addWebSearchProvider, listWebSearchProviders, searchWeb } from './index.js';
 
 afterEach(() => {
@@ -16,6 +17,30 @@ afterEach(() => {
 });
 
 describe('Grok subscription search default', () => {
+  test('research social provider binds its fake subscription token to the proxy origin and returns a Reddit citation', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'grok-research-social-'));
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::fixture': { key: 'social-subscription-fixture', expires_at: '2030-01-01T00:00:00Z' },
+    }));
+    try {
+      const provider = buildGrokResearchSocialWebSearchProvider(home);
+      expect(provider.available()).toBe(true);
+      await withFakeFetchDevice([{
+        url: 'https://cli-chat-proxy.grok.com/v1/responses', method: 'POST',
+        response: () => Response.json({ output: [{ type: 'web_search_call', action: { sources: [
+          { url: 'https://www.reddit.com/r/stocks/comments/fixture/', title: 'Reddit discussion' },
+        ] } }] }),
+      }], async (device) => {
+        const result = await provider.search({ query: '2027 stock market Reddit sentiment' });
+        expect(result.hits[0]?.url).toBe('https://www.reddit.com/r/stocks/comments/fixture/');
+        expect(device.calls()).toHaveLength(1);
+        expect(device.calls()[0]?.headers.authorization).toBe('Bearer social-subscription-fixture');
+        expect(device.calls()[0]?.url).toBe('https://cli-chat-proxy.grok.com/v1/responses');
+      });
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
   test('Firecrawl is the default while metered Grok remains opt-in', () => {
     setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
     _resetWebSearchProvidersForTests();

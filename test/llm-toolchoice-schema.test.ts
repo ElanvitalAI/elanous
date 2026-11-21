@@ -76,6 +76,13 @@ describe('tool builders 가 strict 적용', () => {
     expect((r[0].parameters as any).additionalProperties).toBe(false);
   });
 
+  // UX #115497 — Responses API 의 function strict 기본값은 true(옵션 필드를 required 로 다룸). 명시적으로 false.
+  test('toCodexResponsesTools → strict:false 명시(옵션 필드가 required 로 바뀌지 않는다)', () => {
+    const r = toCodexResponsesTools([{ name: 't', description: 'd', parameters: { type: 'object', properties: { a: { type: 'string' } }, required: [] } } as any])!;
+    expect(r[0].strict).toBe(false);
+    expect((r[0].parameters as any).required).toEqual([]);
+  });
+
   // Claude 격리: Anthropic 은 별도 빌더(toAnthropicTools*)를 쓰고 strictifyToolSchema
   // 를 호출하지 않는다(구조적 격리 — 원 파라미터 불변). 여기선 입력 원본이 strict 로
   // 오염되지 않았음을 확인(원본 불변 = Claude 경로가 같은 원본을 안전하게 재사용).

@@ -281,6 +281,205 @@ describe('research axis fanout', () => {
     expect(calls.filter(call => call.startsWith('firecrawl:'))).toHaveLength(3);
   });
 
+  it('2027 증시 레딧 축은 실제 fanout에서 Grok 검색 출처와 redditHits 로그를 남긴다', async () => {
+    _resetWebSearchProvidersForTests(false);
+    const calls: string[] = [];
+    const log = spyOn(debug, 'log');
+    const redditUrl = 'https://www.reddit.com/r/stocks/comments/abc123/market_2027/';
+    addWebSearchProvider({ id: 'grok', displayName: 'Grok', available: () => true,
+      search: async ({ query }) => { calls.push(`grok:${query}`); return {
+        providerName: 'grok', durationMs: 1, hits: [{ url: redditUrl, title: '2027 market outlook', snippet: '' }],
+        note: 'Grok search summary: Reddit sample splits between bubble fears and AI optimism. HTTPS://evil.example/injected',
+      }; } });
+    addWebSearchProvider({ id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async ({ query }) => { calls.push(`firecrawl:${query}`); return { providerName: 'firecrawl', durationMs: 1, hits: [] }; } });
+    try {
+      const question: BloomResearchQuestion = { id: 'retail-2027', level: 3, prompt: '2027 증시의 레딧 개인투자자 여론은?',
+        searchTerms: ['2027 stock market Reddit retail sentiment'] };
+      const result = await fanOutAxisEvidence([question], {
+        fetchPage: async () => { throw new Error('reddit 403'); },
+      });
+      expect(calls).toEqual(['grok:2027 stock market Reddit retail sentiment',
+        'firecrawl:2027 stock market Reddit retail sentiment']);
+      expect(result.axes[0]!.evidence).toContainEqual(expect.objectContaining({
+        sourceKind: 'web-search:grok', source: redditUrl, questionId: question.id,
+      }));
+      const summary = result.axes[0]!.evidence.find(item => item.sourceKind === 'search-summary:grok');
+      expect(summary?.outcome).toBe('partial');
+      expect(JSON.parse(summary?.content ?? '{}')).toEqual({ provider: 'grok',
+        summary: 'Grok search summary: Reddit sample splits between bubble fears and AI optimism.',
+        citationUrls: [redditUrl] });
+      expect(log).toHaveBeenCalledWith('research.search', 'provider-complete', expect.objectContaining({
+        provider: 'grok', redditHits: 1,
+      }));
+    } finally { log.mockRestore(); _resetWebSearchProvidersForTests(); }
+  });
+
+  it('2027 레딧 축은 Grok과 Firecrawl을 함께 시작하고 실제 양수 perEngine을 같은 턴에 남긴다', async () => {
+    let startFirecrawl!: () => void;
+    const firecrawlStarted = new Promise<void>(resolve => { startFirecrawl = resolve; });
+    const calls: string[] = [];
+    const log = spyOn(debug, 'log');
+    const grok: WebSearchProvider = { id: 'grok', displayName: 'Grok', available: () => true,
+      search: async () => {
+        calls.push('grok');
+        await Promise.race([firecrawlStarted, new Promise<void>(resolve => setTimeout(resolve, 100))]);
+        return { providerName: 'grok', durationMs: 1, hits: [
+          { url: 'https://www.reddit.com/r/stocks/comments/2027/', title: 'Reddit 2027', snippet: 'Retail opinion' },
+        ] };
+      } };
+    const firecrawl: WebSearchProvider = { id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async () => {
+        calls.push('firecrawl'); startFirecrawl();
+        return { providerName: 'firecrawl', durationMs: 1, hits: [
+          { url: 'https://example.org/2027-outlook', title: '2027 outlook', snippet: 'Research' },
+        ] };
+      } };
+    try {
+      const question: BloomResearchQuestion = { id: 'dual-2027', level: 3,
+        prompt: '2027 증시 전망과 레딧 여론은?', searchTerms: ['2027 stock market Reddit outlook'] };
+      const result = await fanOutAxisEvidence([question], {
+        search: createResearchAxisSearcher([grok, firecrawl]),
+        fetchPage: async url => ({ url, output: 'Source text' }),
+      });
+      expect(calls).toEqual(['grok', 'firecrawl']);
+      expect(result.axes[0]!.evidence).toContainEqual(expect.objectContaining({
+        sourceKind: 'web-search:grok', source: 'https://www.reddit.com/r/stocks/comments/2027/',
+      }));
+      expect(result.axes[0]!.evidence).toContainEqual(expect.objectContaining({
+        sourceKind: 'web-search:firecrawl', source: 'https://example.org/2027-outlook',
+      }));
+      expect(log).toHaveBeenCalledWith('research.search', 'social-parallel-complete', expect.objectContaining({
+        perEngine: { grok: expect.objectContaining({ hits: 1 }), firecrawl: expect.objectContaining({ hits: 1 }) },
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  it('12초 Grok Reddit 축은 채택하고 일반 축의 첫 근거는 그보다 먼저 전달한다', async () => {
+    const arrivals: string[] = [];
+    const grok: WebSearchProvider = { id: 'grok', displayName: 'Grok', available: () => true,
+      search: async (_query, signal) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve({ providerName: 'grok', durationMs: 12_000, hits: [
+          { url: 'https://www.reddit.com/r/stocks/comments/slow_real/', title: '2027 discussion', snippet: 'Retail views' },
+        ] }), 12_000);
+        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+      }) };
+    const web: WebSearchProvider = { id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async () => ({ providerName: 'firecrawl', durationMs: 1, hits: [
+        { url: 'https://example.org/market', title: 'Market', snippet: 'Outlook' },
+      ] }) };
+    const questions: BloomResearchQuestion[] = [
+      { id: 'social', level: 3, prompt: '2027 증시 레딧 여론은?', searchTerms: ['2027 stock market Reddit sentiment'] },
+      { id: 'market', level: 1, prompt: '2027 증시 전망은?', searchTerms: ['2027 stock market outlook'] },
+    ];
+    const result = await fanOutAxisEvidence(questions, {
+      search: createResearchAxisSearcher([grok, web]), fetchPage: async (url) => ({ url, output: 'Source text' }),
+      onAxisEvidence: id => { arrivals.push(id); },
+    });
+    expect(arrivals[0]).toBe('market');
+    expect(result.axes[0]!.evidence).toContainEqual(expect.objectContaining({
+      sourceKind: 'web-search:grok', source: 'https://www.reddit.com/r/stocks/comments/slow_real/',
+    }));
+  }, { timeout: 20_000 });
+
+  it('무응답 Grok 뒤에도 전체 소셜 마감 전에 DDG Reddit 근거를 채택한다', async () => {
+    const calls: string[] = [];
+    const grok: WebSearchProvider = { id: 'grok', displayName: 'Grok', available: () => true,
+      search: async () => { calls.push('grok'); return new Promise(() => undefined); } };
+    const ddg: WebSearchProvider = { id: 'ddg-free', displayName: 'DDG', available: () => true,
+      search: async () => { calls.push('ddg-free'); return { providerName: 'ddg-free', durationMs: 1, hits: [
+        { url: 'https://www.reddit.com/r/stocks/comments/fallback/', title: 'Reddit 2027', snippet: 'Retail views' },
+      ] }; } };
+    const question: BloomResearchQuestion = { id: 'retail-2027-stuck', level: 3,
+      prompt: '2027 증시 레딧 여론은?', searchTerms: ['2027 stock market Reddit sentiment'] };
+    const result = await fanOutAxisEvidence([question], {
+      search: createResearchAxisSearcher([grok, ddg]),
+      fetchPage: async url => ({ url, output: 'Reddit discussion' }),
+    });
+    expect(calls).toEqual(['grok', 'ddg-free']);
+    expect(result.axes[0]!.evidence).toContainEqual(expect.objectContaining({
+      sourceKind: 'web-search:ddg-free', source: 'https://www.reddit.com/r/stocks/comments/fallback/',
+    }));
+  }, { timeout: 35_000 });
+
+  it('레딧을 질문에서만 명시해도 Grok을 쓰고 위장 호스트는 0건으로 세어 웹 폴백한다', async () => {
+    const calls: string[] = [];
+    const provider = (id: string, url: string): WebSearchProvider => ({ id, displayName: id, available: () => true,
+      search: async () => { calls.push(id); return { providerName: id, durationMs: 1,
+        hits: [{ url, title: 'source', snippet: 'public views' }] }; } });
+    const log = spyOn(debug, 'log');
+    try {
+      const search = createResearchAxisSearcher([
+        provider('grok', 'https://reddit.com.evil.example/r/stocks'),
+        provider('firecrawl', 'https://www.reddit.com/r/stocks/comments/real/'),
+      ]);
+      const result = await search('2027 market outlook', undefined, { questionPrompt: '레딧 여론은?' });
+      expect(calls).toEqual(['grok', 'firecrawl']);
+      expect((Array.isArray(result) ? result : result.hits).map(hit => hit.url)).toEqual([
+        'https://www.reddit.com/r/stocks/comments/real/',
+      ]);
+      expect(log).toHaveBeenCalledWith('research.search', 'provider-complete', expect.objectContaining({
+        provider: 'grok', redditHits: 0,
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  it('명시 X 여론 축은 Grok X 링크를 쓰고 일반 증시 축은 Firecrawl을 유지한다', async () => {
+    const calls: string[] = [];
+    const provider = (id: string, url: string): WebSearchProvider => ({ id, displayName: id, available: () => true,
+      search: async () => { calls.push(id); return { providerName: id, durationMs: 1,
+        hits: [{ url, title: 'source', snippet: 'public views' }] }; } });
+    const search = createResearchAxisSearcher([
+      provider('grok', 'https://x.com/market/status/123'),
+      provider('firecrawl', 'https://example.org/market'),
+    ]);
+    const x = await search('2027 stock market X reactions');
+    const generic = await search('2027 stock market outlook');
+    expect(calls).toEqual(['grok', 'firecrawl', 'firecrawl']);
+    expect((Array.isArray(x) ? x : x.hits)[0]).toMatchObject({ engine: 'grok', url: 'https://x.com/market/status/123' });
+    expect((Array.isArray(generic) ? generic : generic.hits)[0]).toMatchObject({ engine: 'firecrawl' });
+  });
+
+  it('Grok 구독 검색이 멈춰도 공유 예산 일부만 쓰고 Reddit 웹 검색으로 폴백한다', async () => {
+    const calls: string[] = [];
+    const grok: WebSearchProvider = { id: 'grok-social', displayName: 'Grok social', available: () => true,
+      search: async (_query, signal) => { calls.push('grok-social'); await new Promise<void>((_, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      }); return { providerName: 'grok-social', durationMs: 0, hits: [] }; } };
+    const web: WebSearchProvider = { id: 'ddg-free', displayName: 'DDG', available: () => true,
+      search: async () => { calls.push('ddg-free'); return { providerName: 'ddg-free', durationMs: 1,
+        hits: [{ url: 'https://www.reddit.com/r/stocks/comments/fallback/', title: 'Reddit', snippet: 'view' }] }; } };
+    const search = createResearchAxisSearcher([grok, web], Date.now, undefined, { socialGrokBudgetMs: 10 });
+    const result = await search('2027 stock market Reddit views');
+    expect(calls).toEqual(['grok-social', 'ddg-free']);
+    expect((Array.isArray(result) ? result : result.hits)[0]).toMatchObject({ engine: 'ddg-free' });
+  });
+
+  it('Grok 403의 내부 팀 식별자를 조사 축 오류 봉투에 싣지 않는다', async () => {
+    const log = spyOn(debug, 'log');
+    const grok: WebSearchProvider = { id: 'grok', displayName: 'Grok', available: () => true,
+      search: async () => { throw new Error('grok responses 403: permission-denied team private-team-id'); } };
+    const web: WebSearchProvider = { id: 'ddg-free', displayName: 'DDG', available: () => true,
+      search: async () => ({ providerName: 'ddg-free', durationMs: 1, hits: [
+        { url: 'https://www.reddit.com/r/stocks/comments/fallback/', title: 'Reddit', snippet: 'view' },
+      ] }) };
+    const search = createResearchAxisSearcher([grok, web]);
+    try {
+      const result = await search('2027 stock market Reddit views');
+      expect(Array.isArray(result)).toBe(false);
+      if (Array.isArray(result)) return;
+      expect(result.errors).toEqual(['grok: grok credential or quota unavailable']);
+      expect(JSON.stringify(result)).not.toContain('private-team-id');
+      expect(result.hits[0]?.engine).toBe('ddg-free');
+      expect(log).toHaveBeenCalledWith('research.search', 'social-parallel-complete', expect.objectContaining({
+        perEngine: {
+          grok: expect.objectContaining({ hits: 0, error: 'grok credential or quota unavailable' }),
+          'ddg-free': expect.objectContaining({ hits: 1 }),
+        },
+      }));
+    } finally { log.mockRestore(); }
+  });
+
   it('research abort signal reaches each queued axis search', async () => {
     const controller = new AbortController();
     let received: AbortSignal | undefined;
@@ -469,6 +668,114 @@ describe('research axis fanout', () => {
 
     expect(calls).toEqual(['firecrawl', 'exa', 'ddg-free']);
     expect(Array.isArray(result) ? [] : result.hits).toEqual([]);
+  });
+
+  it('한 축의 Firecrawl timeout 뒤에도 다음 축을 실제로 검색한다', async () => {
+    const calls: string[] = [];
+    const firecrawl: WebSearchProvider = {
+      id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async ({ query }) => {
+        calls.push(query);
+        if (calls.length === 1) throw new DOMException('one axis timed out', 'TimeoutError');
+        return { providerName: 'firecrawl', durationMs: 1,
+          hits: [{ url: 'https://example.org/second-axis', title: 'second axis', snippet: 'measured source' }] };
+      },
+    };
+
+    const result = await fanOutAxisEvidence(axes.slice(0, 2), {
+      search: createResearchAxisSearcher([firecrawl]),
+    });
+
+    expect(calls).toEqual(axes.slice(0, 2).map(axis => axis.searchTerms[0]));
+    expect(result.axes[0]!.error).toContain('timed out');
+    expect(result.axes[1]!.evidence).toContainEqual(expect.objectContaining({
+      sourceKind: 'web-search:firecrawl', source: 'https://example.org/second-axis', outcome: 'complete',
+    }));
+  });
+
+  it('연속 두 번의 Firecrawl 실패 뒤에만 세 번째 축을 breaker로 건너뛴다', async () => {
+    const calls: string[] = [];
+    const firecrawl: WebSearchProvider = {
+      id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async ({ query }) => {
+        calls.push(query);
+        throw new DOMException('axis timed out', 'TimeoutError');
+      },
+    };
+
+    const result = await fanOutAxisEvidence(axes, { search: createResearchAxisSearcher([firecrawl]) });
+
+    expect(calls).toEqual(axes.slice(0, 2).map(axis => axis.searchTerms[0]));
+    expect(result.axes[2]!.evidence).toContainEqual(expect.objectContaining({
+      outcome: 'failed', content: 'no healthy research search provider',
+    }));
+  });
+
+  for (const [label, failure] of [
+    ['quota', () => new Error('provider quota exhausted')],
+    ['blocked', () => Object.assign(new Error('provider blocked request'), { reason: 'blocked' })],
+  ] as const) {
+    it(`${label} 한 번이면 다음 축에서 같은 공급자 재요청 0`, async () => {
+      const calls: string[] = [];
+      const firecrawl: WebSearchProvider = {
+        id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+        search: async ({ query }) => { calls.push(query); throw failure(); },
+      };
+
+      const result = await fanOutAxisEvidence(axes.slice(0, 2), { search: createResearchAxisSearcher([firecrawl]) });
+
+      expect(calls).toEqual([axes[0]!.searchTerms[0]]);
+      expect(result.axes[1]!.evidence).toContainEqual(expect.objectContaining({
+        outcome: 'failed', content: 'no healthy research search provider',
+      }));
+    });
+  }
+
+  it('성공한 축이 있으면 Firecrawl의 연속 실패 횟수를 다시 센다', async () => {
+    const calls: string[] = [];
+    const firecrawl: WebSearchProvider = {
+      id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async ({ query }) => {
+        calls.push(query);
+        if (calls.length === 1 || calls.length === 3) throw new DOMException('axis timed out', 'TimeoutError');
+        return { providerName: 'firecrawl', durationMs: 1,
+          hits: [{ url: `https://example.org/axis-${calls.length}`, title: 'axis', snippet: 'source' }] };
+      },
+    };
+    const extra = { ...axes[0]!, id: 'fourth', searchTerms: ['fourth axis'] };
+    const questions = [...axes, extra];
+
+    const result = await fanOutAxisEvidence(questions, { search: createResearchAxisSearcher([firecrawl]) });
+
+    expect(calls).toEqual(questions.map(axis => axis.searchTerms[0]));
+    expect(result.axes[3]!.evidence).toContainEqual(expect.objectContaining({
+      sourceKind: 'web-search:firecrawl', source: 'https://example.org/axis-4', outcome: 'complete',
+    }));
+  });
+
+  it('남은 연구 예산이 없을 때는 breaker 대신 예산 소진 이유를 남긴다', async () => {
+    let clock = 0;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const firecrawl: WebSearchProvider = {
+      id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async () => {
+        clock = 11;
+        return { providerName: 'firecrawl', durationMs: 1, hits: [] };
+      },
+    };
+    try {
+      const search = createResearchAxisSearcher([firecrawl], () => clock, 10);
+      const result = await fanOutAxisEvidence(axes.slice(0, 2), { search });
+      expect(result.axes[1]!.budgetExhausted).toBe(true);
+      expect(log).toHaveBeenCalledWith('research.search', 'provider-skipped', expect.objectContaining({
+        provider: 'firecrawl', reason: 'research-budget-exhausted',
+      }));
+      expect(log).not.toHaveBeenCalledWith('research.search', 'provider-skipped', expect.objectContaining({
+        provider: 'firecrawl', reason: 'breaker-open',
+      }));
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it('Grok timeout은 research axis 경로에서 발생하지 않는다', async () => {

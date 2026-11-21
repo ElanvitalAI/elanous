@@ -592,3 +592,85 @@ test('crash after the seat message but before the journal outcome: retry with th
   expect(await retry.json()).toMatchObject({ seat: 'OP', channel: 'unknown' });
   expect(stored).toHaveLength(1);
 });
+
+
+// 출처: #39459 WEBCHAT-REJECTED-TOKEN-NO-CRASH — JUD-B HOLD #123198(hold-39459-b6af48614eca-judb.json)
+// 재현: 원점이 insecure(http://LAN-IP)면 PWA randomId()(generateSessionId)가 `s-<ts36>-<…>`
+// 폴백을 내고 seatAskClientId 로 쓰인다(생성~sessionStorage·cookie 지속본 포함). ask·poll·ack
+// 3경로 서버 계약이 그 폴백을 일관되게 받아야 한다 — 형식 밖 엉터리는 여전히 400.
+// JUD HOLD #123572(OP #123577) · OP 결정 #123699 — 수리 폴백 rand 는 crypto.getRandomValues
+// 64bit(hex 16자 ⊆ base36 ≤16자)라 기존 정책 {1,16}을 그대로 통과한다(서버 변경 0 · hex32 유니언 폐기).
+test('insecure-origin fallback seatAskClientId(legacy · 64bit hex16) is accepted by CTO ask, answer poll and ack', async () => {
+  const fallbacks = [
+    's-mwqee5zf-bo242p6z', // 출처: #39459 JUD-B 증거 원문과 같은 형태의 레거시 폴백 id(지속본 호환)
+    's-mwqee5zf-0123456789abcdef', // 출처: #39459 OP #123699 — getRandomValues 64bit hex16 수리본
+  ];
+  for (const fallback of fallbacks) {
+    const root = mkdtempSync(join(tmpdir(), 'seat-fallback-client-'));
+    roots.push(root);
+    const store = new MsgStore(':memory:');
+    store.close = () => {};
+    const deps = {
+      root: () => root,
+      ceoDeps: () => ({ ownerId: null, replyTarget: null, runGh: async () => 0,
+        append: (message: MessageEnvelope) => { void message; }, hasMessage: () => false }),
+      askDeps: {
+        open: () => store,
+        now: () => 1_700_000_000_000, // 출처: #39459 위 텔레그램 왕복 시험 기준 시각 관례 재사용
+        dispatch: async () => ({ reply: 'ok', channel: 'posted' as const }),
+        send: async () => {},
+      },
+    };
+    try {
+      // 1) CTO ask — 폴백 clientId 가 400이 아니라 202 + reply 로 받아진다.
+      const ask = await handleSeatRequests(new Request('http://localhost/v1/seat-requests', {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-seat-ask-client': fallback },
+        body: JSON.stringify({ seat: 'CTO', text: 'CTO에게 물어봐 배포 상태?' }),
+      }), deps);
+      const askBody = (await ask.json()) as { reply: string };
+      expect(ask.status).toBe(202);
+      expect(askBody.reply).toContain('물었습니다');
+      // 2) 같은 폴백 clientId 로 답변 poll — 답변이 이 클라이언트로 배달된다.
+      const answerId = (store.db.query('SELECT id FROM seat_asks LIMIT 1').get() as { id: string }).id;
+      answerSeatAsk(answerId, '배포 완료', { open: () => store, now: () => 1_700_000_180_000 }); // 출처: #39459 위 기준 시각 +180초 관례
+      const poll = await handleSeatRequests(new Request('http://localhost/v1/seat-requests?answers=1', {
+        headers: { 'x-seat-ask-client': fallback },
+      }), deps);
+      const pollBody = (await poll.json()) as { items: Array<{ id: string; text: string; status: string }> };
+      expect(poll.status).toBe(200);
+      expect(pollBody.items).toEqual([{ id: answerId, text: `CTO 답변 (${answerId}): 배포 완료`, status: 'answered' }]);
+      // 3) 같은 폴백 clientId 로 ack — 200 ok.
+      const ack = await handleSeatRequests(new Request('http://localhost/v1/seat-requests?answers=ack', {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-seat-ask-client': fallback },
+        body: JSON.stringify({ ids: [answerId] }),
+      }), deps);
+      expect(ack.status).toBe(200);
+      expect(await ack.json()).toEqual({ ok: true });
+      // 4) 부정 대조 — 형식 밖 엉터리 clientId 는 3경로 전부 여전히 400.
+      //    경계(OP #123699 — 기존 정책 {1,16} 그대로): 마지막 세그먼트 17자(16자 초과)·
+      //    32hex(폐기한 유니언)도 밖.
+      for (const bad of [
+        'not-a-client-id',
+        's-bo242p6z',
+        's-mwqee5zf-bo242p6z-extra',
+        `s-mwqee5zf-${'0'.repeat(17)}`, // 출처: #39459 OP #123699 — 기존 정책 {1,16} 경계 밖(17자)
+        's-mwqee5zf-0123456789abcdef0123456789abcdef', // 출처: #39459 OP #123699 — hex32 유니언 폐기 → 400
+      ]) {
+        const polled = await handleSeatRequests(new Request('http://localhost/v1/seat-requests?answers=1', {
+          headers: { 'x-seat-ask-client': bad },
+        }), deps);
+        expect(polled.status).toBe(400);
+        const acked = await handleSeatRequests(new Request('http://localhost/v1/seat-requests?answers=ack', {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-seat-ask-client': bad },
+          body: JSON.stringify({ ids: [answerId] }),
+        }), deps);
+        expect(acked.status).toBe(400);
+        const asked = await handleSeatRequests(new Request('http://localhost/v1/seat-requests', {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-seat-ask-client': bad },
+          body: JSON.stringify({ seat: 'CTO', text: 'CTO에게 물어봐 배포 상태?' }),
+        }), deps);
+        expect(asked.status).toBe(400);
+      }
+    } finally { store.close(); }
+  }
+});

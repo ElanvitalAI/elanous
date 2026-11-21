@@ -9,7 +9,7 @@ export function opsNowExitCode(outcome: OpsNowResult['outcome']): number {
 
 export function registerOpsCommands(program: Command): void {
 const opsCmd = program.command('ops')
-  .description('운영 관측(READ-ONLY) — 미션·태스크·계약 루프·오케스트레이터 현재 상태·이상·전이. --json 프로그래매틱.');
+  .description('운영 관측·수복 — 미션·태스크·계약 루프·오케스트레이터 상태와 카드 기반 heal. --json 프로그래매틱.');
 
 interface OpsOpts { entityType?: string; event?: string; sinceHours?: string; limit?: string; json?: boolean }
 
@@ -161,6 +161,12 @@ opsCmd.command('now-refresh').description('채널 📌안내로 ops-now 고정 �
       if (o.dryRun && result.body !== undefined) console.log(result.body);
     }
     process.exitCode = opsNowExitCode(result.outcome);
+  });
+
+opsCmd.command('heal <signal>').description('TB 카드로 진단 → 허용 수리 → 재확인 → 원장 기록; 위험 단계는 HITL')
+  .action(async (signal: string) => {
+    const { runOpsHeal } = await import('../ops/heal-cli.js');
+    process.exitCode = await runOpsHeal(signal);
   });
 
 opsCmd.command('status').description('현재 상태 종합(미션·태스크·루프·오케스트레이션·스케줄) · --all-instances 로 fleet 전체 종합(미션/태스크/loops/스케줄/오케스트레이션) · -r/--remote 로 원격 GET 조립')

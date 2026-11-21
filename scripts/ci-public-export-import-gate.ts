@@ -155,5 +155,5 @@ export async function runPublicExportImportGate(io: { args: readonly string[]; c
 }
 
 if (import.meta.main) {
-  process.exit(await runPublicExportImportGate({ args: process.argv.slice(2), cwd: resolve(import.meta.dir, '..'), log: console.log, error: console.error }));
+  void runPublicExportImportGate({ args: process.argv.slice(2), cwd: resolve(import.meta.dir, '..'), log: console.log, error: console.error }).then((code) => process.exit(code));
 }

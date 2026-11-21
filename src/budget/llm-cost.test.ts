@@ -55,6 +55,17 @@ describe('estimateLlmCost — catalog reuse', () => {
 });
 
 describe('estimateLlmCost — unknown is not zero', () => {
+  it('keeps an unpriced TimelyRouter model unknown and uses only a supplied price ledger row', () => {
+    const usage = { model: 'timelyrouter/demo-model', inputTokens: MILLION, outputTokens: MILLION };
+    expect(estimateLlmCost(usage, noOverlay)).toEqual({ kind: 'unknown', model: usage.model });
+    const pricing = readLlmConfigPricing({ budget: { llmPricing: {
+      'timelyrouter/demo-model': { inputPerM: 1.25, outputPerM: 2.5 },
+    } } });
+    expect(estimateLlmCost(usage, { configPricing: pricing })).toMatchObject({
+      kind: 'known', model: usage.model, usd: 3.75, source: 'config',
+    });
+  });
+
   it('returns an explicit unknown result with the model name, not 0', () => {
     for (const model of ['absent-model-for-test', 'another-absent-model']) {   // ⛔ claude-sonnet-5 는 BACKLOG C2 로 «알게» 됐다(저장소 정본 폴백)
       const got = estimateLlmCost({

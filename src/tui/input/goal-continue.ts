@@ -15,7 +15,7 @@
 //   인지 = 턴 끝 ∧ 답 끝 구절이 약속형 ∧ 질문형 아님 ∧ 상한 안
 //   힐링 = H2 로 «약속한 일을 지금 실행하라» 한 턴(화면 «↻ 자동 재개(goal-continue): …») · 상한 → 멈춤 ⊕ 'cap'
 
-import { compareTurnOutcome } from '../../dashboard/input/turn-outcome-shadow.js';
+import { compareTurnOutcome } from '../../commitment/turn-outcome-shadow.js';
 import type { PlanTurnOutcome } from '../../code-edit/plan-outcome.js';
 import { outcomeOfPlanWire, type PlanWire } from '../../code-edit/plan-wire.js';
 import type { TextInputInternalTurnYieldPort } from '../../chat/index.js';

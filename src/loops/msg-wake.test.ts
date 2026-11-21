@@ -1,5 +1,5 @@
 import { afterEach, expect, setDefaultTimeout, spyOn, test } from 'bun:test';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -10,7 +10,7 @@ import { SEAT_MESSAGE_ROUTES, messageRouteFor } from './msg-address.js';
 import { spawn } from 'node:child_process';
 import type { HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { createFakeHerdr, type FakeHerdrStatus } from '../ux-sim/fake-herdr.js';
-import { claimWake, MAX_REDELIVER_ATTEMPTS, PENDING_WAKE_TTL_MS, redeliverLine, redeliverPendingWakes, registerSeatPaneAddress, resolveWake, startPendingWakePoller, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps, fallbackWakeLine, IDLE_WATCH_WAKE, wakeNoneNotice, NO_WAKE_NOTICE } from './msg-wake.js';
+import { claimWake, herdrBinary, isLocalWakeHost, MAX_REDELIVER_ATTEMPTS, PENDING_WAKE_TTL_MS, redeliverLine, redeliverPendingWakes, registerSeatPaneAddress, resolveWake, startPendingWakePoller, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps, fallbackWakeLine, IDLE_WATCH_WAKE, wakeNoneNotice, NO_WAKE_NOTICE } from './msg-wake.js';
 import { readSeatRegistry } from './seat-registry.js';
 
 // Real Bun subprocesses can exceed Bun's 5 s default under gate-pod load.
@@ -18,6 +18,71 @@ setDefaultTimeout(60_000);
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('noninteractive mail resolves the host-installed Herdr binary without a login PATH', () => {
+  expect(herdrBinary({}, () => true)).toEndWith('/.local/bin/herdr');
+  expect(herdrBinary({}, () => false)).toBe('herdr');
+  expect(herdrBinary({ HERDR_BIN_PATH: '/opt/herdr' }, () => false)).toBe('/opt/herdr');
+});
+
+test('mshq registry alias is local only on the HQ host', () => {
+  expect(isLocalWakeHost('mshq', {}, 'Joosungui-MacStudio.local')).toBe(true);
+  expect(isLocalWakeHost('mshq', {}, 'MacStudioB1')).toBe(false);
+  expect(isLocalWakeHost('node-b', {}, 'Joosungui-MacStudio.local')).toBe(false);
+});
+
+test('remote tmux wake sends once only after exact registry re-opt-in and never to another seat pane', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'msg-remote-tmux-'));
+  dirs.push(root);
+  const registryPath = join(root, 'seat-registry.json');
+  const calls: Array<{ host: string; argv: readonly string[] }> = [];
+  let ledger = '%21|seat-TC-H-CX-15|/Users/test/elanous-hq/seats/TC-H-CX-15/work|0|codex\n'
+    + '%22|seat-OTHER|/Users/test/elanous-hq/seats/OTHER/work|0|codex\n';
+  const deps: WakeDeps = {
+    seatStateRoot: root, stateRoot: root, live: true, localHostAliases: ['mshq'],
+    listHerdrPanes: () => [], listPtys: () => [],
+    remoteTmuxRun: async (host, argv) => {
+      calls.push({ host, argv });
+      return { code: 0, stdout: argv[0] === 'list-panes' ? ledger : '', stderr: '' };
+    },
+  };
+  registerSeatPaneAddress({ address: 'TC-H-CX-15', paneId: 'wJ:p10', host: 'node-b', enableWake: true }, deps);
+  registerSeatPaneAddress({ address: 'TC-H-CX-15', paneId: 'seat-TC-H-CX-15', host: 'node-b', kind: 'tmux', replace: true }, deps);
+  expect(readSeatRegistry(registryPath)).toMatchObject({ status: 'ready' });
+  expect(await wakeRecipient('TC-H-CX-15', 10, { from: 'OP' }, deps)).toMatchObject({ result: 'skipped', optIn: false });
+  expect(calls).toHaveLength(0);
+  registerSeatPaneAddress({ address: 'TC-H-CX-15', paneId: 'seat-TC-H-CX-15', host: 'node-b', kind: 'tmux', enableWake: true }, deps);
+  expect(await wakeRecipient('TC-H-CX-15', 11, { from: 'OP' }, deps)).toMatchObject({ result: 'injected', wake: 'tmux' });
+  expect(calls.map(call => call.argv[0])).toEqual(['list-panes', 'send-keys']);
+  expect(calls[1]!.argv).toContain('%21');
+  expect(calls[1]!.argv).not.toContain('%22');
+  calls.length = 0;
+  ledger = '%22|seat-OTHER|/Users/test/elanous-hq/seats/OTHER/work|0|codex\n';
+  expect((await wakeRecipient('TC-H-CX-15', 12, { from: 'OP' }, { ...deps, stateRoot: mkdtempSync(join(tmpdir(), 'msg-remote-tmux-claim-')) })).result).not.toBe('injected');
+  expect(calls.map(call => call.argv[0])).toEqual(['list-panes']);
+});
+
+test('remote tmux SSH output is capped in bytes before parsing multibyte pane data', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'msg-remote-tmux-bytes-'));
+  dirs.push(root);
+  const bin = join(root, 'bin');
+  mkdirSync(bin);
+  const fakeSsh = join(bin, 'ssh');
+  writeFileSync(fakeSsh, "#!/bin/sh\n/usr/bin/python3 -c 'import sys; sys.stdout.write(\"한\" * 25000)'\n");
+  chmodSync(fakeSsh, 0o700);
+  const deps: WakeDeps = { seatStateRoot: root, stateRoot: root, live: true, localHostAliases: ['mshq'],
+    listHerdrPanes: () => [], listPtys: () => [] };
+  registerSeatPaneAddress({ address: 'TC-H-CX-15', paneId: 'seat-TC-H-CX-15', host: 'fake', kind: 'tmux', enableWake: true }, deps);
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path ?? ''}`;
+  try {
+    expect(await wakeRecipient('TC-H-CX-15', 100, { from: 'OP' }, deps))
+      .toMatchObject({ result: 'failed', reason: 'tmux-list-unavailable' });
+  } finally {
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+  }
+});
 
 async function runMessageCli(dbPath: string, hookStateDir: string, args: string[]): Promise<string[]> {
   const output: string[] = [];

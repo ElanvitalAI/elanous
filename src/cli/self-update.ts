@@ -37,6 +37,9 @@ export interface SelfUpdateOptions {
   rollback?: boolean;
   /** Canary rollout action; legacy --auto on|off|status is handled by the CLI scheduler. */
   auto?: boolean;
+  catchUp?: boolean;
+  /** Parent-approved exact desired commit for a pinned remote catch-up. */
+  expectedDesired?: string;
   dryRun?: boolean;
   seat?: string;
   quietWindow?: boolean;
@@ -245,6 +248,7 @@ export interface InstallRecord {
   versionDir?: string;
   source?: string;
   installedAt?: string;
+  builtAt?: number;
   commit?: string;
   channel?: string;
   previous?: string;
@@ -343,6 +347,7 @@ export function installDevBuild(checkout: string, commit: string, deps: Pick<Sel
     channel: 'dev',
     ...(previous && previous !== versionDir ? { previous } : {}),
   };
+  writeFileSync(join(root, versionDir, 'install.json'), `${JSON.stringify(record, null, 2)}\n`);
   writeFileSync(join(root, 'install.json'), `${JSON.stringify(record, null, 2)}\n`);
   return { versionName, versionDir, previous, record };
 }
@@ -357,11 +362,10 @@ export function rollbackDevInstall(deps: Pick<SelfUpdateDeps, 'installRoot'> = {
   const currentName = versionDirName(prior.versionDir);
   relinkInstallCurrent(root, previousName);
   const parsed = parseVersionDirName(previousName);
+  const previousRecord = readInstallRecord(join(root, 'versions', previousName));
   const record: InstallRecord = {
-    ...prior,
-    ...(parsed ? { version: parsed.version, commit: parsed.commit } : {}),
+    ...(previousRecord ?? (parsed ? { version: parsed.version, commit: parsed.commit } : {})),
     versionDir: `versions/${previousName}`,
-    channel: prior.channel === 'dev' ? undefined : prior.channel,
     previous: currentName ? `versions/${currentName}` : undefined,
     installedAt: new Date().toISOString(),
   };
@@ -985,7 +989,7 @@ export function canaryRunSucceededInLedger(runId: string, sinceIso: string, dir?
   } catch { return false; }
 }
 
-async function restartEdgeRail(deps: SelfUpdateDeps, checkout: string): Promise<boolean> {
+export async function restartEdgeRail(deps: SelfUpdateDeps, checkout: string): Promise<boolean> {
   if (deps.restartEdgeRail) return deps.restartEdgeRail();
   if (deps.allowLiveRestart === false || (deps.allowLiveRestart !== true && liveRestartBlocked())) return false;
   const os = deps.os ?? platform();
@@ -1135,6 +1139,8 @@ export async function runUpdateForInstallation(
   deps: { cliRoot?: string; exists?: (path: string) => boolean; readText?: (path: string) => string; release?: ReleaseUpdateDeps; checkout?: SelfUpdateDeps } = {},
 ): Promise<SelfUpdateResult> {
   const cliRoot = resolve(deps.cliRoot ?? resolve(import.meta.dir, '../..'));
+  // catch-up is decided before --auto: a bare --auto must never bypass the dev-channel check, rail gate or OP protection.
+  if (options.catchUp) return (await import('./self-update-catch-up.js')).runCatchUp(options, { cliRoot, ...deps.checkout });
   if (options.auto) return runEdgeRailUpdate(options, { cliRoot, ...deps.checkout });
   const exists = deps.exists ?? existsSync;
   const holder = resolve(cliRoot, '..', '..');

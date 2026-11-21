@@ -33,3 +33,12 @@ test('unattributed relevant usage and read errors are unknown, never zero', () =
   // 출처: #38013 분리 요구 · 바로 위 픽스처 예산 100, 읽기 실패.
   expect(readSeatBudgetUsage({ ...base, readUsage: () => { throw new Error('unavailable'); } })).toEqual({ budget: 100, used: null });
 });
+
+test('site filter excludes rows whose only mismatch is site', () => {
+  const result = readSeatBudgetUsage({ seat: 'TC', budgetText: '100', now: new Date('2026-11-18T12:00:00Z'), roles: ['agent'], sites: ['agent-turn'], readUsage: () => [
+    { day: '2026-11-18', seat: 'TC', role: 'agent', site: 'agent-turn', inputTokens: 7, outputTokens: 3 },
+    { day: '2026-11-18', seat: 'TC', role: 'agent', site: 'other-site', inputTokens: 400, outputTokens: 50 },
+  ] });
+  // 출처: #39241 site 만 다른 행 회귀 · 위 독립 픽스처 예산 100, site 일치 행 입력 7 + 출력 3.
+  expect(result).toEqual({ budget: 100, used: 10 });
+});

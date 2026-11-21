@@ -1,5 +1,5 @@
 /** 1121 RESEARCH-ROUTING — research entry is decided by structured fields on the question-plan call we already make,
- * not by sentence classifiers. Default = ENTER; only the plan's `localOnly: true` (or one obvious-local pre-filter)
+ * not by sentence classifiers. Default = ENTER; only the plan's `localOnly: true` / `answerableWithoutWeb: true` (or one obvious-local pre-filter)
  * skips. Missing fields, a parse failure or a plan failure enter (a missed grounding costs far more than a few seconds).
  * Design: seat-state/OP/RETHINK-RESEARCH-ROUTING-1117.md (대표 11-17 Bloom 4·5). */
 import { debug } from '../debug/log.js';
@@ -7,8 +7,7 @@ import { debug } from '../debug/log.js';
 /** Event names this module emits (category `research`). Registered here so `elanous logs --event` callers can import them. */
 export const RESEARCH_ROUTE_CATEGORY = 'research';
 export const RESEARCH_ROUTE_EVENT = 'route';
-export const RESEARCH_ROUTE_MISMATCH_EVENT = 'route-mismatch';
-export const RESEARCH_ROUTE_EVENTS = [RESEARCH_ROUTE_EVENT, RESEARCH_ROUTE_MISMATCH_EVENT] as const;
+export const RESEARCH_ROUTE_EVENTS = [RESEARCH_ROUTE_EVENT] as const;
 
 /** Tools that give a turn a web-grounding path; a turn whose pool has none is outside the structured route. */
 export const RESEARCH_ROUTE_WEB_TOOLS: ReadonlySet<string> = new Set(['WebSearch', 'OmniSearch', 'WebFetch']);
@@ -18,9 +17,26 @@ export interface ResearchRouteFields {
   needsFreshFacts?: boolean;
   needsCitations?: boolean;
   localOnly?: boolean;
+  /** 1121 WEBCHAT-SHORT-FACT-NOT-RESEARCH: true when the answer needs NO external source — the clock/date/time, this
+   * conversation or session context, or stable general knowledge a model already has. A skip verdict only when it is not
+   * contradicted by needsFreshFacts/needsCitations; missing → ENTER (fail-open for market/news questions). */
+  answerableWithoutWeb?: boolean;
   /** Model-written; never logged (may echo the user's words). Only its presence is observed. */
   reason?: string;
+  /** Closed topic list. Only `market` is carried: `general`, a missing or an unknown value all collapse to absent, which
+   * keeps the pre-topic behavior. Set by the plan model by meaning — never by a sentence classifier. */
+  topic?: 'market';
+  /** Tickers the plan model resolved from the question (KR 6 digits, US upper-case); only meaningful with topic `market`. */
+  symbols?: string[];
+  /** g6 SOCIAL-AXIS: a short search query the plan model wrote (by meaning) when the question asks for X/Twitter·Reddit
+   * or other social/community opinion. Absent otherwise. Sent to the social step only — never logged. */
+  socialQuery?: string;
 }
+
+/** Provider-ready ticker shapes (same patterns the market-data providers validate). */
+const ROUTE_SYMBOL_PATTERN = /^(?:\d{6}|[A-Z][A-Z0-9.-]{0,19})$/;
+const ROUTE_SYMBOL_LIMIT = 12;
+const ROUTE_SOCIAL_QUERY_MAX_CHARS = 120;
 
 export type ResearchRouteDecision = {
   decision: 'entered' | 'skipped';
@@ -30,7 +46,7 @@ export type ResearchRouteDecision = {
 };
 
 export type ResearchRouteReason =
-  | 'local-only' | 'fresh-facts' | 'citations' | 'not-local'
+  | 'local-only' | 'answerable-without-web' | 'fresh-facts' | 'citations' | 'not-local'
   | 'route-missing' | 'local-only-missing' | 'plan-failed' | 'budget'
   | ObviousLocalCommand | 'route-pin-forced';
 
@@ -39,10 +55,23 @@ export function parseResearchRouteFields(value: unknown): ResearchRouteFields | 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const fields: ResearchRouteFields = {};
-  for (const key of ['needsFreshFacts', 'needsCitations', 'localOnly'] as const) {
+  for (const key of ['needsFreshFacts', 'needsCitations', 'localOnly', 'answerableWithoutWeb'] as const) {
     if (typeof record[key] === 'boolean') fields[key] = record[key] as boolean;
   }
   if (typeof record.reason === 'string' && record.reason.trim()) fields.reason = record.reason.trim().slice(0, 200);
+  if (record.topic === 'market') {
+    fields.topic = 'market';
+    if (Array.isArray(record.symbols)) {
+      const symbols = [...new Set(record.symbols
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim().toUpperCase())
+        .filter((item) => ROUTE_SYMBOL_PATTERN.test(item)))].slice(0, ROUTE_SYMBOL_LIMIT);
+      if (symbols.length > 0) fields.symbols = symbols;
+    }
+  }
+  if (typeof record.socialQuery === 'string' && record.socialQuery.trim()) {
+    fields.socialQuery = Array.from(record.socialQuery.replace(/\s+/g, ' ').trim()).slice(0, ROUTE_SOCIAL_QUERY_MAX_CHARS).join('');
+  }
   return Object.keys(fields).length > 0 ? fields : undefined;
 }
 
@@ -160,11 +189,16 @@ function closedStreamedObject(streamed: string, start: number): string | undefin
   return undefined;
 }
 
-/** Structured verdict → decision. Only an explicit `localOnly: true` skips; everything else enters — on a turn whose
+/** Structured verdict → decision. Only an explicit `localOnly: true` or a confident `answerableWithoutWeb: true` skips; everything else enters — on a turn whose
  * entry is already CONFIRMED (the caller's fast path). On an unconfirmed default entry use `settleUnconfirmedRoute`. */
 export function decideResearchRoute(fields: ResearchRouteFields | undefined, missingReason: 'route-missing' | 'plan-failed' | 'budget' = 'route-missing'): ResearchRouteDecision {
   if (!fields) return { decision: 'entered', by: 'fallback', reason: missingReason };
   if (fields.localOnly === true) return { decision: 'skipped', by: 'structured', reason: 'local-only' };
+  // A confident «no external source needed» verdict (clock/date/session context/stable knowledge) skips; a plan that
+  // contradicts itself (also asks for fresh facts or citations) is not confident → falls through to ENTER.
+  if (fields.answerableWithoutWeb === true && fields.needsFreshFacts !== true && fields.needsCitations !== true) {
+    return { decision: 'skipped', by: 'structured', reason: 'answerable-without-web' };
+  }
   if (fields.localOnly !== false) return { decision: 'entered', by: 'fallback', reason: 'local-only-missing' };
   return {
     decision: 'entered', by: 'structured',
@@ -232,21 +266,4 @@ export function logResearchRoute(sessionId: string | undefined, route: ResearchR
     route: route.decision, by: route.by, reason: route.reason,
     ...(extra.hasModelReason !== undefined ? { hasModelReason: extra.hasModelReason } : {}),
   });
-}
-
-/** Shadow comparison until 11-24: the legacy sentence classifiers no longer decide; when they would have decided
- * differently from the structured verdict, record it (codes only, no text) for the 11-24 mismatch-rate report. */
-export function logResearchRouteMismatch(
-  sessionId: string | undefined,
-  structured: ResearchRouteDecision,
-  heuristicEnters: boolean,
-): boolean {
-  if (structured.by !== 'structured') return false;
-  const heuristic = heuristicEnters ? 'entered' : 'skipped';
-  if (heuristic === structured.decision) return false;
-  debug.log(RESEARCH_ROUTE_CATEGORY, RESEARCH_ROUTE_MISMATCH_EVENT, {
-    ...(sessionId ? { sessionId } : {}),
-    structured: structured.decision, heuristic, reason: structured.reason,
-  });
-  return true;
 }

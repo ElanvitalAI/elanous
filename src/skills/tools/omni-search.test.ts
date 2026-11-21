@@ -18,7 +18,7 @@ function provider(id: string, search: WebSearchProvider['search']): WebSearchPro
 
 afterEach(() => { _resetWebSearchProvidersForTests(); _resetResearchOmniSearchReadinessForTests(); });
 
-test('research dispatch selects Exa and Firecrawl, excluding Grok, Tavily and DDG', async () => {
+test('research dispatch selects Exa/Firecrawl plus concurrent Grok, excluding grok-api, Tavily and DDG', async () => {
   _resetWebSearchProvidersForTests(false);
   const calls: string[] = [];
   for (const id of ['grok', 'grok-api', 'exa', 'firecrawl', 'tavily', 'ddg']) {
@@ -28,8 +28,8 @@ test('research dispatch selects Exa and Firecrawl, excluding Grok, Tavily and DD
     }));
   }
   const result = await dispatchResearchOmniSearch({ query: 'HBM4' });
-  expect(calls).toEqual(['exa']);
-  expect(result.metadata.perEngine).toMatchObject({ exa: { hits: 1 } });
+  expect(calls.sort()).toEqual(['exa', 'grok']);
+  expect(result.metadata.perEngine).toMatchObject({ exa: { hits: 1 }, grok: { hits: 1 } });
 });
 
 test('research explicit engines intersect the allowlist and empty intersections never use defaults', async () => {
@@ -48,6 +48,26 @@ test('research explicit engines intersect the allowlist and empty intersections 
   const empty = await dispatchResearchOmniSearch({ query: 'topic', engines: ['tavily', 'ddg'] });
   expect(calls).toEqual([]);
   expect(empty.metadata.perEngine).toEqual({});
+});
+
+test('research engines as an empty array falls back to the default providers, not an empty allowlist (a9dc 0-hits)', async () => {
+  _resetWebSearchProvidersForTests(false);
+  const calls: string[] = [];
+  addWebSearchProvider(provider('firecrawl', async () => {
+    calls.push('firecrawl');
+    return { providerName: 'firecrawl', durationMs: 1, hits: [{ url: 'https://firecrawl.example/topic', title: 'topic', snippet: 'topic' }] };
+  }));
+  addWebSearchProvider(provider('grok', async () => {
+    calls.push('grok');
+    return { providerName: 'grok', durationMs: 1, hits: [] };
+  }));
+  const research = await dispatchResearchOmniSearch({ query: 'topic', engines: [] });
+  expect(calls.sort()).toEqual(['firecrawl', 'grok']);
+  expect(research.metadata).toMatchObject({ totalHits: 1, perEngine: { firecrawl: { hits: 1 } } });
+  calls.length = 0;
+  const plain = await dispatchOmniSearch({ query: 'topic', engines: [] });
+  expect(calls.sort()).toEqual(['firecrawl']);
+  expect(plain.metadata).toMatchObject({ totalHits: 1, perEngine: { firecrawl: { hits: 1 } } });
 });
 
 test('Firecrawl-only HBM4 mock retains five hits and a 949ms duration (plumbing only)', async () => {
@@ -73,7 +93,7 @@ test('Firecrawl-only HBM4 mock retains five hits and a 949ms duration (plumbing 
   }
 });
 
-test('research dispatch never invokes Grok even when it is configured', async () => {
+test('research dispatch invokes configured Grok and a Grok timeout keeps all Firecrawl hits (g3)', async () => {
   _resetWebSearchProvidersForTests(false);
   let grokCalls = 0;
   addWebSearchProvider(provider('grok', async () => { grokCalls++; throw new DOMException('timed out', 'TimeoutError'); }));
@@ -85,8 +105,9 @@ test('research dispatch never invokes Grok even when it is configured', async ()
   })));
   const result = await dispatchResearchOmniSearch({ query: 'HBM4' });
   expect(result.metadata.totalHits).toBe(5);
-  expect(grokCalls).toBe(0);
-  expect(Object.keys(result.metadata.perEngine)).toEqual(['firecrawl']);
+  expect(grokCalls).toBe(1);
+  expect(Object.keys(result.metadata.perEngine).sort()).toEqual(['firecrawl', 'grok']);
+  expect(result.metadata.perEngine.grok?.error).toBe('timed out');
 });
 
 test('research dispatch excludes both Grok routes', async () => {
@@ -133,15 +154,15 @@ test('research web fallbacks share the 14.5-second deadline and pass remaining t
   }
 });
 
- test('research dispatch emits no Grok event because Grok is not selected', async () => {
+ test('research dispatch reports a failed Grok as a per-engine error event (g3)', async () => {
   _resetWebSearchProvidersForTests(false);
   addWebSearchProvider(provider('grok', async () => { throw new Error('HTTP 429 quota exhausted'); }));
   const events: Array<{ engine: string; phase: string; error?: string }> = [];
   const result = await dispatchResearchOmniSearch({ query: 'topic' }, {
     onEngine: event => { if (event.phase === 'complete') events.push(event); },
   });
-  expect(result.metadata.perEngine.grok).toBeUndefined();
-  expect(events).toEqual([]);
+  expect(result.metadata.perEngine.grok?.error).toBe('HTTP 429 quota exhausted');
+  expect(events.map(event => [event.engine, event.error])).toEqual([['grok', 'HTTP 429 quota exhausted']]);
 });
 
  test('research availability requires Exa or Firecrawl, never Grok/Tavily/DDG', () => {
@@ -385,4 +406,41 @@ test('a caller cancelled before dispatch still hands the provider an aborted sig
   const result = await dispatchResearchOmniSearch({ query: 'cancelled before dispatch', engines: ['exa'] }, { signal: controller.signal });
   expect(providerSignal?.aborted).toBe(true);
   expect(result.metadata.perEngine.exa?.error).toContain('parent research cancelled');
+});
+
+test('g3: research dispatch calls Grok and Firecrawl together; a Grok failure keeps the Firecrawl hits', async () => {
+  _resetWebSearchProvidersForTests(false);
+  const calls: string[] = [];
+  addWebSearchProvider(provider('firecrawl', async () => {
+    calls.push('firecrawl');
+    return { providerName: 'firecrawl', durationMs: 1, hits: [{ url: 'https://news.example/hbm4', title: 'HBM4 news', snippet: 'web' }] };
+  }));
+  addWebSearchProvider(provider('grok', async () => {
+    calls.push('grok');
+    return { providerName: 'grok', durationMs: 1, hits: [{ url: 'https://x.com/someone/status/1', title: 'X post', snippet: 'opinion' }] };
+  }));
+  const both = await dispatchResearchOmniSearch({ query: 'HBM4 opinion' });
+  expect(calls.sort()).toEqual(['firecrawl', 'grok']);
+  expect(both.metadata.totalHits).toBe(2);
+  expect(both.metadata.perEngine).toMatchObject({ firecrawl: { hits: 1 }, grok: { hits: 1 } });
+  expect(both.output).toContain('https://news.example/hbm4');
+  expect(both.output).toContain('https://x.com/someone/status/1');
+
+  _resetWebSearchProvidersForTests(false);
+  _resetResearchOmniSearchReadinessForTests();
+  calls.length = 0;
+  addWebSearchProvider(provider('firecrawl', async () => {
+    calls.push('firecrawl');
+    return { providerName: 'firecrawl', durationMs: 1, hits: [{ url: 'https://news.example/hbm4', title: 'HBM4 news', snippet: 'web' }] };
+  }));
+  addWebSearchProvider(provider('grok', async () => {
+    calls.push('grok');
+    throw new Error('grok down');
+  }));
+  const grokFailed = await dispatchResearchOmniSearch({ query: 'HBM4 opinion' });
+  expect(calls.sort()).toEqual(['firecrawl', 'grok']);
+  expect(grokFailed.metadata.totalHits).toBe(1);
+  expect(grokFailed.metadata.perEngine.firecrawl).toMatchObject({ hits: 1 });
+  expect(grokFailed.metadata.perEngine.grok?.error).toBe('grok down');
+  expect(grokFailed.output).toContain('https://news.example/hbm4');
 });

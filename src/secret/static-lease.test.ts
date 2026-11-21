@@ -4,6 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +21,7 @@ import { registerSecretLeaseCommands } from '../cli/secret-lease-cli.js';
 import { KNOWN_LOG_EVENT_NAMES } from '../cli/log-event-names.js';
 import { _resetKeyCacheForTests, keyFromCacheOrEnv } from '../config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { currentBackendId, getSecretAsync, useBackend } from '../nexus/config/secrets/index.js';
 
 const CANARY = 'CANARY-vault-v3-9f3e2a7d-not-a-real-key';
 const T0 = Date.parse('2026-11-17T00:00:00.000Z');
@@ -209,6 +211,100 @@ describe('HQ-VAULT V3 static lease — refusals (default deny)', () => {
 });
 
 describe('HQ-VAULT V3 static lease — renew · revoke', () => {
+  test('getSecretAsync resolves each KIS credential slot from its own lease', async () => {
+    const previousBackend = currentBackendId();
+    const values: Record<string, string> = { KIS_APP_KEY: 'FAKE-KIS-KEY-ONLY', KIS_APP_SECRET: 'FAKE-KIS-SECRET-ONLY' };
+    const deps: StaticLeaseDeps = { ...rig.deps, now: Date.now, readSourceValue: async (item) => values[item.envName] };
+    try {
+      setElanousConfigDir(rig.universe);
+      useBackend('file');
+      const issued = await leaseStaticKeysForCredPush({ to: rig.universe, keys: ['KIS_APP_KEY', 'KIS_APP_SECRET'] }, deps);
+      expect(issued.every((result) => result.ok)).toBe(true);
+      expect((await getSecretAsync('cred:kis.app_key')) === values.KIS_APP_KEY).toBe(true);
+      expect((await getSecretAsync('cred:kis.app_secret')) === values.KIS_APP_SECRET).toBe(true);
+      assertNoCanaryOutsideCopy([JSON.stringify(issued)]);
+    } finally {
+      useBackend(previousBackend);
+      resetElanousConfigDir();
+    }
+  });
+
+  test('a revoked KIS slot cannot borrow the other live slot', async () => {
+    const previousBackend = currentBackendId();
+    const values: Record<string, string> = { KIS_APP_KEY: 'FAKE-KIS-KEY-ONLY', KIS_APP_SECRET: 'FAKE-KIS-SECRET-ONLY' };
+    const deps: StaticLeaseDeps = { ...rig.deps, now: Date.now, readSourceValue: async (item) => values[item.envName] };
+    try {
+      setElanousConfigDir(rig.universe);
+      useBackend('file');
+      const issued = await leaseStaticKeysForCredPush({ to: rig.universe, keys: ['KIS_APP_KEY', 'KIS_APP_SECRET'] }, deps);
+      expect(issued.every((result) => result.ok)).toBe(true);
+      expect(await revokeStaticLeases({ to: rig.universe, id: 'KIS_APP_SECRET' }, deps)).toMatchObject([{ result: 'removed' }]);
+      expect((await getSecretAsync('cred:kis.app_key')) === values.KIS_APP_KEY).toBe(true);
+      await expect(getSecretAsync('cred:kis.app_secret')).rejects.toThrow(StaticLeaseExpiredError);
+      assertNoCanaryOutsideCopy([JSON.stringify(issued)]);
+    } finally {
+      useBackend(previousBackend);
+      resetElanousConfigDir();
+    }
+  });
+
+  test('cred-push renew keeps both KIS env slots and their distinct receipts', async () => {
+    const values: Record<string, string> = { KIS_APP_KEY: 'FAKE-KIS-KEY-ONLY', KIS_APP_SECRET: 'FAKE-KIS-SECRET-ONLY' };
+    const deps: StaticLeaseDeps = { ...rig.deps, readSourceValue: async (item) => values[item.envName] };
+    const first = await leaseStaticKeysForCredPush({ to: rig.universe, keys: ['KIS_APP_KEY', 'KIS_APP_SECRET'] }, deps);
+    expect(first.every((x) => x.ok)).toBe(true);
+    if (!first[0]?.ok || !first[1]?.ok) return;
+    expect(first.map((x) => x.ok && x.record.envName)).toEqual(['KIS_APP_KEY', 'KIS_APP_SECRET']);
+    expect(new Set(first.map((x) => x.ok && x.record.leaseId)).size).toBe(2);
+    for (const result of first) {
+      if (!result.ok) continue;
+      expect(result.record.fingerprint8).toBe(createHash('sha256').update(values[result.record.envName]!).digest('hex').slice(0, 8));
+      expect(readFileSync(staticLeaseCopyPath(rig.universe, result.record.cacheName), 'utf8').trim()).toBe(values[result.record.envName]);
+    }
+    rig.clock.now = T0 + 13 * HOUR;
+    const renewed = await leaseStaticKeysForCredPush({ to: rig.universe, keys: ['KIS_APP_KEY', 'KIS_APP_SECRET'] }, deps);
+    expect(renewed.map((x) => x.ok && [x.action, x.record.envName, x.record.leaseId])).toEqual(first.map((x) => x.ok && ['renewed', x.record.envName, x.record.leaseId]));
+    expect(readStaticLeaseRecords(rig.issuer)).toHaveLength(2);
+    const out: string[] = []; const err: string[] = []; const codes: number[] = [];
+    const program = new Command().exitOverride();
+    registerSecretLeaseCommands(program.command('secret'), { ...deps, output: { log: (s) => out.push(s), error: (s) => err.push(s) }, setExitCode: (c) => codes.push(c) });
+    await program.parseAsync(['node', 'eln', 'secret', 'lease', 'KIS_APP_KEY,KIS_APP_SECRET', '--to', rig.universe, '--renew']);
+    expect(codes).toEqual([0]);
+    expect(err).toEqual([]);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toContain('kis/KIS_APP_KEY');
+    expect(out[1]).toContain('kis/KIS_APP_SECRET');
+    expect(out[0]).toContain(first[0].record.leaseId);
+    expect(out[1]).toContain(first[1].record.leaseId);
+    expect(out.join('\n')).not.toContain(values.KIS_APP_KEY);
+    expect(out.join('\n')).not.toContain(values.KIS_APP_SECRET);
+  });
+
+  test('pinned KIS renew and exact-slot revoke cannot cross to the other env slot', async () => {
+    const deps: StaticLeaseDeps = { ...rig.deps, readSourceValue: async (item) => item.envName === 'KIS_APP_KEY' ? 'FAKE-KIS-KEY-ONLY' : 'FAKE-KIS-SECRET-ONLY' };
+    const key = await issueStaticLease({ id: 'KIS_APP_KEY', to: rig.universe }, deps);
+    const secret = await issueStaticLease({ id: 'KIS_APP_SECRET', to: rig.universe }, deps);
+    if (!key.ok || !secret.ok) throw new Error('fixture issue failed');
+    rig.clock.now = T0 + 13 * HOUR;
+    expect(await renewStaticLease({ id: 'KIS_APP_SECRET', to: rig.universe, leaseId: key.record.leaseId }, deps)).toMatchObject({ ok: false, reason: 'not-found' });
+    expect(await revokeStaticLeases({ to: rig.universe, id: 'KIS_APP_SECRET' }, deps)).toEqual([{ leaseId: secret.record.leaseId, id: 'kis', target: secret.record.target, result: 'removed' }]);
+    expect(await renewStaticLease({ id: 'KIS_APP_SECRET', to: rig.universe }, deps)).toMatchObject({ ok: false, reason: 'revoked' });
+    expect(await renewStaticLease({ id: 'KIS_APP_KEY', to: rig.universe }, deps)).toMatchObject({ ok: true, action: 'renewed', record: { envName: 'KIS_APP_KEY', leaseId: key.record.leaseId } });
+    expect(readFileSync(staticLeaseCopyPath(rig.universe, 'kis_app_key'), 'utf8').trim()).toBe('FAKE-KIS-KEY-ONLY');
+    expect(existsSync(staticLeaseCopyPath(rig.universe, 'kis_app_secret'))).toBe(false);
+  });
+
+  test('an expired KIS secret does not block renewing the still-active key slot', async () => {
+    const deps: StaticLeaseDeps = { ...rig.deps, readSourceValue: async (item) => item.envName === 'KIS_APP_KEY' ? 'FAKE-KIS-KEY-ONLY' : 'FAKE-KIS-SECRET-ONLY' };
+    const key = await issueStaticLease({ id: 'KIS_APP_KEY', to: rig.universe }, deps);
+    const secret = await issueStaticLease({ id: 'KIS_APP_SECRET', to: rig.universe, ttlMs: HOUR }, deps);
+    if (!key.ok || !secret.ok) throw new Error('fixture issue failed');
+    rig.clock.now = T0 + 13 * HOUR;
+    expect(await renewStaticLease({ id: 'KIS_APP_SECRET', to: rig.universe }, deps)).toMatchObject({ ok: false, reason: 'expired' });
+    expect(await renewStaticLease({ id: 'KIS_APP_KEY', to: rig.universe }, deps)).toMatchObject({ ok: true, action: 'renewed', record: { envName: 'KIS_APP_KEY', leaseId: key.record.leaseId } });
+    expect(readStaticLeaseRecords(rig.issuer)).toHaveLength(2);
+  });
+
   test('renew: fresh before 50%, same leaseId re-issued after 50%', async () => {
     const first = await issueStaticLease({ id: 'openrouter', to: rig.universe }, rig.deps);
     if (!first.ok) throw new Error('issue failed');
@@ -337,6 +433,74 @@ describe('HQ-VAULT V3 static lease — renew · revoke', () => {
 });
 
 describe('HQ-VAULT V3 static lease — consumer expiry is loud', () => {
+  test('lease expiry between copy read and return refuses the value', async () => {
+    const issued = await issueStaticLease({ id: 'openrouter', to: rig.universe }, rig.deps);
+    if (!issued.ok) throw new Error('issue failed');
+    const cacheName = 'openrouter_api_key';
+    const copy = JSON.parse(readFileSync(staticLeaseMetaPath(rig.universe, cacheName), 'utf8')).copyPath as string;
+    let clock = rig.clock.now;
+    expect(() => resolveStaticLeaseCopy(cacheName, {
+      roots: [rig.universe], cacheFilePath: join(rig.base, 'cache', cacheName), now: () => clock,
+      readFile: path => {
+        const value = readFileSync(path, 'utf8');
+        if (path === copy) clock = Date.parse(issued.record.expiresAt);
+        return value;
+      },
+    })).toThrow(StaticLeaseExpiredError);
+  });
+
+  test('lease revoke between copy read and return refuses the value', async () => {
+    const issued = await issueStaticLease({ id: 'openrouter', to: rig.universe }, rig.deps);
+    if (!issued.ok) throw new Error('issue failed');
+    const cacheName = 'openrouter_api_key';
+    const metaPath = staticLeaseMetaPath(rig.universe, cacheName);
+    const copy = JSON.parse(readFileSync(metaPath, 'utf8')).copyPath as string;
+    expect(() => resolveStaticLeaseCopy(cacheName, {
+      roots: [rig.universe], cacheFilePath: join(rig.base, 'cache', cacheName), now: () => rig.clock.now,
+      readFile: path => {
+        const value = readFileSync(path, 'utf8');
+        if (path === copy) writeFileSync(metaPath, JSON.stringify({ ...JSON.parse(readFileSync(metaPath, 'utf8')), revokedAt: new Date(rig.clock.now).toISOString() }), { mode: 0o600 });
+        return value;
+      },
+    })).toThrow(StaticLeaseExpiredError);
+  });
+
+  test('a separate .elanous root cannot claim its HOME cache as the operating host lease', async () => {
+    const issued = await issueStaticLease({ id: 'openrouter', to: rig.universe }, rig.deps);
+    if (!issued.ok) throw new Error('issue failed');
+    const cacheName = 'openrouter_api_key';
+    const fakeHome = join(rig.base, 'other-home');
+    const separateRoot = join(fakeHome, '.elanous');
+    const cacheDir = join(fakeHome, '.cache');
+    const cacheFile = join(cacheDir, cacheName);
+    mkdirSync(join(separateRoot, 'secrets-lease', 'meta'), { recursive: true, mode: 0o700 });
+    mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+    writeFileSync(cacheFile, CANARY, { mode: 0o600 });
+    const meta = JSON.parse(readFileSync(staticLeaseMetaPath(rig.universe, cacheName), 'utf8'));
+    writeFileSync(staticLeaseMetaPath(separateRoot, cacheName), JSON.stringify({ ...meta, copyPath: cacheFile }), { mode: 0o600 });
+    expect(() => resolveStaticLeaseCopy(cacheName, {
+      roots: [separateRoot], cacheFilePath: cacheFile, now: () => rig.clock.now,
+    })).toThrow(StaticLeaseExpiredError);
+  });
+
+  test('instance metadata accepts its own copy and refuses another instance copy', async () => {
+    const issued = await issueStaticLease({ id: 'openrouter', to: rig.universe }, rig.deps);
+    if (!issued.ok) throw new Error('issue failed');
+    const cacheName = 'openrouter_api_key';
+    const deps = { roots: [rig.universe], cacheFilePath: join(rig.base, 'cache', cacheName), now: () => rig.clock.now };
+    expect(resolveStaticLeaseCopy(cacheName, deps)?.value).toBe(CANARY);
+
+    const other = join(rig.hqRoot, 'universes', 'another');
+    const otherCopy = staticLeaseCopyPath(other, cacheName);
+    mkdirSync(join(other, 'secrets-lease', 'copies'), { recursive: true, mode: 0o700 });
+    writeFileSync(otherCopy, CANARY, { mode: 0o600 });
+    const metaPath = staticLeaseMetaPath(rig.universe, cacheName);
+    const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+    writeFileSync(metaPath, JSON.stringify({ ...meta, copyPath: otherCopy }), { mode: 0o600 });
+    expect(() => resolveStaticLeaseCopy(cacheName, deps)).toThrow(StaticLeaseExpiredError);
+    expect(() => resolveStaticLeaseCopy(cacheName, { ...deps, cacheFilePath: otherCopy })).toThrow(StaticLeaseExpiredError);
+  });
+
   test('expired copy → typed error + one secret.lease.expired event, never the stale value', async () => {
     const res = await issueStaticLease({ id: 'openrouter', to: rig.universe }, rig.deps);
     if (!res.ok) throw new Error('issue failed');
@@ -403,9 +567,9 @@ describe('HQ-VAULT V3 static lease — CLI · events · remote script', () => {
     const issued = await runCli(['lease', 'openrouter,zai', '--to', 'node-b']);
     expect(issued.codes).toEqual([0]);
     expect(issued.out).toHaveLength(2);
-    expect(issued.out[0]).toContain('lease issued · openrouter → node-b');
+    expect(issued.out[0]).toContain('lease issued · openrouter/OPENROUTER_API_KEY → node-b');
     const listed = await runCli(['lease', 'list']);
-    expect(listed.out.slice(1).map((l) => l.split('\t')[4])).toEqual(['active', 'active']);
+    expect(listed.out.slice(1).map((l) => l.split('\t')[5])).toEqual(['active', 'active']);
     const refused = await runCli(['lease', 'openrouter', '--to', 'aws9']);
     expect(refused.codes).toEqual([1]);
     expect(refused.err[0]).toContain('not-allowlisted');
@@ -439,7 +603,17 @@ describe('HQ-VAULT V3 static lease — CLI · events · remote script', () => {
     expect(meta).toMatchObject({ leaseId: res.record.leaseId, kind: 'static', copyPath: copy, expiresAt: res.record.expiresAt });
     expect(readFileSync(metaPath, 'utf8')).not.toContain(CANARY);
     // 받는 쪽 소비자 해석기가 이 메타를 그대로 집행한다
-    expect(resolveStaticLeaseCopy('openrouter_api_key', { roots: [join(fakeHome, '.elanous')], cacheFilePath: copy, now: () => rig.clock.now })?.value).toBe(CANARY);
+    const consumer = spawnSync(process.execPath, ['-e', [
+      "import { resolveStaticLeaseCopy } from './src/secret/static-lease-consumer.ts';",
+      "import { readFileSync } from 'node:fs'; import { homedir } from 'node:os'; import { join } from 'node:path';",
+      "const home = homedir(); const copy = join(home, '.cache', 'openrouter_api_key');",
+      "const meta = JSON.parse(readFileSync(join(home, '.elanous', 'secrets-lease', 'meta', 'openrouter_api_key.json'), 'utf8'));",
+      "const result = resolveStaticLeaseCopy('openrouter_api_key', { roots: [join(home, '.elanous')], cacheFilePath: copy, now: () => Date.parse(meta.issuedAt) + 1000 });",
+      "if (result?.value !== readFileSync(copy, 'utf8').trim()) process.exit(1);",
+    ].join('\n')], { cwd: process.cwd(), env: { ...process.env, HOME: fakeHome }, encoding: 'utf8' });
+    expect(consumer.stderr).toBe('');
+    expect(consumer.status).toBe(0);
+    expect(consumer.stdout + consumer.stderr).not.toContain(CANARY);
     expect(await revokeStaticLeases({ leaseId: res.record.leaseId }, { ...rig.deps, ssh: localSsh })).toMatchObject([{ result: 'removed' }]);
     expect(existsSync(copy)).toBe(false);
     expect(JSON.parse(readFileSync(metaPath, 'utf8')).revokedAt).toBeString();

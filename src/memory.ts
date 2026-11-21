@@ -122,6 +122,12 @@ export function memoryRoot(): string {
   return join(base, 'elanous', 'memory');
 }
 
+/** OP handoff reads share the test-state boundary with file memory. */
+export function seatHandoffStateRoot(home: string = homedir(), env: NodeJS.ProcessEnv = process.env): string {
+  const isolated = getAppliedGlobalTestRoot() ?? env.ELANOUS_STATE_DIR?.trim();
+  return isolated ? join(isolated, 'seat-state') : join(home, 'elanous-hq', 'seat-state');
+}
+
 export function memoryIndexPath(root: string = memoryRoot()): string {
   return join(root, 'MEMORY.md');
 }

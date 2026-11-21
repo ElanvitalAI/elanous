@@ -321,7 +321,7 @@ export async function runResyncShadow(max = 3, deps: ResyncShadowDeps = {}, mode
   return summary;
 }
 
-if (import.meta.main) {
+async function runResyncShadowCli(): Promise<void> {
   try {
     const args = process.argv.slice(2);
     if (args.includes('--help')) {
@@ -340,3 +340,5 @@ if (import.meta.main) {
     process.exitCode = 1;
   }
 }
+
+if (import.meta.main) void runResyncShadowCli();

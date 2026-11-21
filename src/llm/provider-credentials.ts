@@ -40,6 +40,7 @@ const ENV_KEY_OVERLAY: Readonly<Record<string, string>> = {
   //   apiKeyEnv)에서 온다 ⇒ 파생 맵이 비어 하니스 자식에게 키가 릴레이되지 않았다(env 로만 키를 둔 사용자는 자식이 죽는다).
   openrouter: 'OPENROUTER_API_KEY',
   opengateway: 'OPENGATEWAY_API_KEY',
+  timelyrouter: 'TIMELYROUTER_API_KEY',
 };
 
 /** 키가 필요 없는 provider — 자격증명 부재가 **정상**이다(누락 경고를 내면 안 됨).
@@ -303,6 +304,9 @@ export async function resolveProviderCredentialAsync(
   input: ResolveCredentialInput,
   getSecret?: (id: string) => Promise<string | undefined>,
 ): Promise<ResolvedCredential> {
+  // TimelyRouter's cached key is bound to its verified base URL in one file.
+  // A bare SecretStore key has no such binding and must not override that pair.
+  if (input.provider === 'timelyrouter') return resolveProviderCredential(input);
   if (input.provider === 'openrouter') {
     const env = input.env ?? process.env;
     if (getSecret || canReadHostSecretStore(env)) {

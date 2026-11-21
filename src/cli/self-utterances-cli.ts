@@ -97,7 +97,7 @@ export function collectSelfUtterances(opts: SelfUtterancesOptions, db: ReturnTyp
   const start = (page - 1) * PAGE_SIZE;
   // ⭐ 원천별 수를 «명시»한다 — 사람 원천 0 을 사람 표본으로 오인하지 않게(시험 fixture·외부 CLI agent 분리).
   const originCounts = countSurfaceUtterancesByOrigin(db, { from, to, ...(opts.surface ? { surface: opts.surface } : {}) });
-  return { source: 'surface_events.events (read-only)', filters: { from, to, surface: opts.surface ?? null, origin: opts.origin ?? null, automatic: 'excluded' }, originCounts, humanSample: originCounts.human === 0 ? 'absent' : 'present', counts: { matched: total, excludedAutomatic, excludedByOrigin, excludedUnextractable, ambiguous, truncated, capReached, possibleLoss }, page: { number: page, size: PAGE_SIZE, total, hasNext: start + PAGE_SIZE < total }, utterances: utterances.slice(start, start + PAGE_SIZE) };
+  return { source: 'surface_events.events+signals (read-only)', filters: { from, to, surface: opts.surface ?? null, origin: opts.origin ?? null, automatic: 'excluded' }, originCounts, humanSample: originCounts.human === 0 ? 'absent' : 'present', counts: { matched: total, excludedAutomatic, excludedByOrigin, excludedUnextractable, ambiguous, truncated, capReached, possibleLoss }, page: { number: page, size: PAGE_SIZE, total, hasNext: start + PAGE_SIZE < total }, utterances: utterances.slice(start, start + PAGE_SIZE) };
 }
 
 export function recordSelfUtterance(input: UtteranceInput & { utteranceOrigin?: 'human' | 'agent' }, db?: Database): { eventId: string } {
@@ -105,7 +105,8 @@ export function recordSelfUtterance(input: UtteranceInput & { utteranceOrigin?: 
   try {
     const result = injectUtterance(input, store);
     if (input.utteranceOrigin === 'human') {
-      store.prepare("UPDATE events SET refs = json_set(refs, '$.utteranceOrigin', 'human') WHERE id = ?").run(result.eventId);
+      const table = input.origin === 'claude-code' ? 'signals' : 'events';
+      store.prepare(`UPDATE ${table} SET refs = json_set(refs, '$.utteranceOrigin', 'human') WHERE id = ?`).run(result.eventId);
     }
     return result;
   } finally { if (!db) store.close(); }

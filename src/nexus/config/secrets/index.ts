@@ -20,6 +20,11 @@ import { appSecretId } from './app-secret-ledger.js';
 import { assertSharedSecretId } from './types.js';
 import { hasAppSecretEventForId } from './app-secret-ledger.js';
 import { assertCredentialSlotId, assertTransferableStaticCredentialSlotId } from './cred-slot-schema.js';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../../../instance/resolve.js';
+import { SERVICE_KEY_CATALOG } from '../../../setup/service-key-catalog.js';
+import { resolveStaticLeaseCopy } from '../../../secret/static-lease-consumer.js';
 
 export * from './types.js';
 export {
@@ -81,7 +86,28 @@ export {
 // ---------------------------------------------------------------------------
 
 export async function getSecretAsync(id: string): Promise<string | undefined> {
-  return currentBackend().get(id);
+  // A confirmed absence in the selected store may be supplied by a host's
+  // static vault lease. Store read errors still propagate; they are not absence.
+  const stored = await currentBackend().get(id);
+  if (stored !== undefined || !id.startsWith('cred:')) return stored;
+  const item = SERVICE_KEY_CATALOG.find(candidate => candidate.kind === 'api-key'
+    && candidate.storeIds?.includes(id));
+  if (!item) return undefined;
+  // Multi-slot catalog rows pair each store ID with the env name at the same
+  // index. Never use another slot's lease when a row is missing that pairing.
+  const slotIndex = item.storeIds!.indexOf(id);
+  if (item.storeIds!.length !== item.envNames.length) return undefined;
+  const envName = item.envNames[slotIndex];
+  if (!envName) return undefined;
+  const cacheName = envName.toLowerCase();
+  const cacheDir = process.env.ELANOUS_KEY_CACHE_DIR?.trim() || join(homedir(), '.cache');
+  const leased = resolveStaticLeaseCopy(cacheName, {
+    roots: [effectiveInstanceRoot(), prodInstanceRoot()],
+    cacheFilePath: resolve(cacheDir, cacheName),
+  });
+  if (!leased) return undefined;
+  if (leased.lease.id !== item.id) throw new Error('ELANOUS_STATIC_LEASE_SLOT_MISMATCH');
+  return leased.value;
 }
 
 export async function setSecretAsync(id: string, value: string): Promise<void> {

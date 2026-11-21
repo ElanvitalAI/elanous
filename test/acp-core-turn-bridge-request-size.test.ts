@@ -321,7 +321,7 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
           layer2MicrocompactCleared: 0, layer2MicrocompactSavedChars: 0,
           layer3SummaryApplied: 1, layer3SummaryModel: 'test', layer3SummaryChars: 24,
           layer4VerifyVerdict: 'skipped', layer5FallbackTruncated: 0,
-          breakerTripped: 0, archived: 0, userReplayApplied: 0,
+          breakerTripped: 0, archived: 0, userDirectivesPreserved: 0, userDirectivesBudgetTransferred: 0,
         },
         };
       },
@@ -473,7 +473,7 @@ describe('TUI-TOKEN-GUARD-WIRE — ACP bridge request-size cap', () => {
           layer2MicrocompactCleared: 0, layer2MicrocompactSavedChars: 0,
           layer3SummaryApplied: 1, layer3SummaryModel: 'test', layer3SummaryChars: 9,
           layer4VerifyVerdict: 'skipped', layer5FallbackTruncated: 0,
-          breakerTripped: 0, archived: 0, userReplayApplied: 0,
+          breakerTripped: 0, archived: 0, userDirectivesPreserved: 0, userDirectivesBudgetTransferred: 0,
         },
       }),
       requestSizeMaxChars: estimateRequestChars(host.getMessages({ userText: 'latest ask' })) + 20,

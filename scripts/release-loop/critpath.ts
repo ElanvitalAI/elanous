@@ -1,7 +1,8 @@
 // RELEASE-PARALLEL-CRITPATH-LIVE — the manual critical path REL ran by hand for 0.3.28 and 0.3.29, as one command.
-// prepare → (docs-node skipped · web notes ship via a docs PR + deploy-pages after merge) → OP approval record →
-// publish → npm → verify. No confirm/bypass flag: the irreversible half runs only when a human decided the
-// publish card bound to (version · cut commit · notes sha256). Every step lands in an append-only ledger
+// prepare → (docs-node skipped · web notes ship via a docs PR + deploy-pages after merge) → approval wait.
+// A local ledger human marker is unverified until a separate trust root exists, so this command cannot
+// enter publish or npm from that marker. Explicit manual release publish is a separate command.
+// Every step lands in an append-only ledger
 // (<instance>/release/<v>/critpath.json) so a rerun skips what is already done and the run is its own evidence.
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -15,7 +16,7 @@ export interface CritpathLedger { version: string; binding?: ApprovalBinding; wa
 
 /** What a human approves: exactly this version, cut commit and notes body. Anything else needs a new card. */
 export interface ApprovalBinding { version: string; cutSha: string; notesSha256: string }
-export type ApprovalState = { state: 'approved'; id: string } | { state: 'pending'; id: string } | { state: 'declined'; id: string } | { state: 'none' };
+export type ApprovalState = { state: 'approved'; id: string } | { state: 'pending'; id: string } | { state: 'unverified'; id: string } | { state: 'declined'; id: string } | { state: 'none' };
 /** The slice of a decision-ledger entry the approval check reads (src/decisions/decision-ledger.ts DecisionEntry). */
 export interface ApprovalRecord { id: string; refs?: string[]; status: string; choice?: string; decidedBy?: { kind: string } }
 
@@ -27,13 +28,16 @@ export function approvalRef(b: ApprovalBinding): string {
   return `release-critpath/${b.version}/${b.cutSha}/${b.notesSha256}`;
 }
 
-/** Same rule as the graph's approve-publish authority: a human decision on the bound card, never auto/imported. */
+/** A ledger human marker has no out-of-band proof and cannot authorize an irreversible step. */
 export function approvalState(records: readonly ApprovalRecord[], b: ApprovalBinding): ApprovalState {
   const ref = approvalRef(b);
   const entry = records.filter((r) => r.refs?.includes(ref)).at(-1);
   if (!entry) return { state: 'none' };
   if (entry.status === 'open') return { state: 'pending', id: entry.id };
-  if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'human') return { state: 'approved', id: entry.id };
+  // The ledger is writable by the same account as a seat. Until an out-of-band
+  // trust root exists, even a human marker is a claim, never release authority.
+  if (entry.status === 'decided' && entry.choice === APPROVE_OPTION && entry.decidedBy?.kind === 'human')
+    return { state: 'unverified', id: entry.id };
   return { state: 'declined', id: entry.id };
 }
 
@@ -206,11 +210,13 @@ export async function runCritpath(o: CritpathOptions, deps: CritpathDeps): Promi
     const approval = approvalState(deps.approvalRecords(), binding);
     if (approval.state === 'declined') return fail('approval', approvalCmd, `publish card ${approval.id} was not approved — a changed cut or notes raises a new card`);
     if (approval.state !== 'approved') {
-      const card = approval.state === 'pending' ? { id: approval.id } : deps.requestApproval(binding, waiveReason);
-      record('approval', approvalCmd, 'waiting-approval', binding.cutSha, `card ${card.id}`);
-      const resume = `a human records it: \`elanous decisions decide ${card.id} ${APPROVE_OPTION}\` (or the card on Telegram/PWA), then rerun: ${rerun}`;
+      const card = approval.state === 'pending' || approval.state === 'unverified' ? { id: approval.id } : deps.requestApproval(binding, waiveReason);
+      record('approval', approvalCmd, 'waiting-approval', binding.cutSha, `card ${card.id}${approval.state === 'unverified' ? ' · human proof unverified' : ''}`);
+      const resume = approval.state === 'unverified'
+        ? `decision ${card.id} claims human approval but has no trusted out-of-band proof; automatic critpath publication remains disabled`
+        : `card ${card.id} awaits a trusted out-of-band approval; automatic critpath publication remains disabled`;
       log(`⏸ waiting for publish approval\n   version ${o.version} · cut ${binding.cutSha} · notes sha256 ${binding.notesSha256}${waiveReason ? `\n   waiver: ${waiveReason}` : ''}\n   ${resume}`);
-      return { status: 'waiting-approval', exitCode: CRITPATH_WAITING_EXIT, step: 'approval', cmd: approvalCmd, resume, approval: { state: 'pending', id: card.id }, ledger: o.ledgerPath };
+      return { status: 'waiting-approval', exitCode: CRITPATH_WAITING_EXIT, step: 'approval', cmd: approvalCmd, resume, approval: approval.state === 'unverified' ? approval : { state: 'pending', id: card.id }, ledger: o.ledgerPath };
     }
     record('approval', approvalCmd, 'ok', binding.cutSha, `card ${approval.id}`);
   }

@@ -51,4 +51,19 @@ describe('declared != observed: one warn row, only when a requested value was de
     expect(rows('attempt')).toEqual([expect.anything()]);
     expect(rows('mismatch')).toEqual([expect.anything()]);
   });
+
+  test('wire alias — registry name `openai-codex` vs wire name `codex` (same subscription backend) is NOT a mismatch, both directions', async () => {
+    // 레지스트리는 `openai-codex`(provider.name · llm.ts:9509), 와이어는 `codex`
+    // (retryOptsFor('codex', …) · llm.ts:2237 → retry-api.ts:149). 정규화 없이는 codex
+    // 경로 매호출 warn — 24h 실측 mismatch 38,395/attempt 41,683(≈92%)가 이 별칭쌍(LLM-CALL-LEDGER-NO-GAP).
+    await call({ provider: 'codex', model: 'gpt-actual', requestedProvider: 'openai-codex', requestedModel: 'gpt-actual' });
+    expect(rows('mismatch')).toEqual([]);
+    expect(rows('attempt')).toEqual([expect.anything()]);
+    await call({ provider: 'openai-codex', model: 'gpt-actual', requestedProvider: 'codex', requestedModel: 'gpt-actual' });
+    expect(rows('mismatch')).toEqual([]);
+    expect(rows('attempt')).toEqual([expect.anything()]);
+    // 진짜 다른 공급자는 여전히 warn — 정규화가 관문을 넓히면 안 된다.
+    await call({ provider: 'codex', model: 'gpt-actual', requestedProvider: 'glm', requestedModel: 'gpt-actual' });
+    expect(rows('mismatch')).toEqual([expect.anything()]);
+  });
 });

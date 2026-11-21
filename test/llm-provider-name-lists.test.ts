@@ -28,6 +28,15 @@ describe('shipping 사다리 provider 는 config·env·--role-llm 로 «고를 �
 });
 
 describe('모델 id → 계열/호환 — 게이트웨이 접두가 먼저다', () => {
+  test('TimelyRouter 접두는 내부 모델 이름이 타 공급자와 같아도 자격을 분리한다', async () => {
+    const { inferRuntimeLlmModelFamily, isRuntimeLlmModelCompatibleWithProvider } = await import('../src/user-config');
+    const id = 'timelyrouter/anthropic/claude-demo';
+    expect(inferRuntimeLlmModelFamily(id)).toBe('timelyrouter');
+    expect(isRuntimeLlmModelCompatibleWithProvider('timelyrouter', id)).toBe(true);
+    expect(isRuntimeLlmModelCompatibleWithProvider('openrouter', id)).toBe(false);
+    expect(isRuntimeLlmModelCompatibleWithProvider('anthropic', id)).toBe(false);
+  });
+
   test('openrouter/* 는 openrouter 계열이고 openrouter 와만 호환된다(벤더 이름이 claude 여도)', async () => {
     const { inferRuntimeLlmModelFamily, isRuntimeLlmModelCompatibleWithProvider } = await import('../src/user-config');
     const { LLM_TIER_MAP_BY_PROVIDER } = await import('../src/model-tier/llm-tier-map');

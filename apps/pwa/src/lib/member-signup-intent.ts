@@ -8,16 +8,23 @@ export function memberSignupIntentFromSearch(search: string): MemberSignupLinkIn
   const refs = params.getAll('ref');
   const referralCodes = params.getAll('referralCode');
   const eventCodes = params.getAll('code');
-  if (refs.length > 1 || referralCodes.length > 1 || eventCodes.length > 1 || (refs.length && referralCodes.length))
+  const linkEventCodes = params.getAll('eventCode');
+  if (refs.length > 1 || referralCodes.length > 1 || eventCodes.length > 1 || linkEventCodes.length > 1 || (refs.length && referralCodes.length))
     throw new Error('가입 링크의 추천 정보가 중복되었습니다.');
   const ref = refs[0]?.trim();
   const referralCode = referralCodes[0]?.trim();
-  const rawEventCode = eventCodes[0]?.trim().toUpperCase();
+  // UX #116886 · JUD #116120: the invite code is the first non-empty value after trimming across
+  // code= and eventCode= — the same rule the hosted login's inviteCodeFrom applies, so the PWA
+  // notice line, the PWA POST, and the hosted login cannot disagree (mixed: code= wins; an
+  // empty or whitespace-only code= falls through to eventCode= instead of dead-ending).
+  const rawEventCode = [eventCodes[0], linkEventCodes[0]]
+    .map((value) => (value ?? '').trim().toUpperCase())
+    .find(Boolean);
   // The demo code accepts common spoken and printed separators; other event codes keep their spelling.
   const eventCode = rawEventCode?.replace(/[_\-\s]/g, '') === 'KCB1114' ? 'KCB1114' : rawEventCode;
   if (referralCodes.length && !referralCode) throw new Error('초대 코드가 비어 있습니다.');
   if (refs.length && !ref) throw new Error('회원 ID가 비어 있습니다.');
-  if (eventCodes.length && !eventCode) throw new Error('행사 코드가 비어 있습니다.');
+  if ((eventCodes.length || linkEventCodes.length) && !eventCode) throw new Error('행사 코드가 비어 있습니다.');
   if (referralCode && !/^[A-Za-z0-9_-]{1,80}$/.test(referralCode)) throw new Error('초대 코드가 올바르지 않습니다.');
   if (ref && !(/^em_[A-Za-z0-9_-]{3,80}$/.test(ref) || /^[a-z][a-z0-9_]{2,29}$/.test(ref)))
     throw new Error('회원 ID가 올바르지 않습니다.');

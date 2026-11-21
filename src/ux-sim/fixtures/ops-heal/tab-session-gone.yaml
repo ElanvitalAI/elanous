@@ -1,0 +1,13 @@
+signal: tab-session-gone
+owner: RES
+diagnose:
+  - action: evidence.read
+    args: {path: OPS/tb/evidence/tab-session-gone.log}
+repair:
+  - action: hitl.request
+    risk: hitl
+    rollback: preserve prior session
+verify:
+  - action: evidence.read
+    args: {path: OPS/tb/evidence/tab-session-gone.log}
+escalate: {after: 1, message: operator review required}

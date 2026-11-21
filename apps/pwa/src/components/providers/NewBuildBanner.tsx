@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from 'react';
 import { debugLog } from '@/lib/debug';
-import { extractBuildId, isNewBuild } from '@/lib/new-build';
+import { extractBuildId, isNewBuild, probeServedBuild } from '@/lib/new-build';
 
 const CHECK_MS = 120_000;
 
@@ -26,17 +26,22 @@ export function NewBuildBanner() {
     setCurrent(mine);
     let stopped = false;
     const check = async () => {
-      if (document.visibilityState !== 'visible') return;
-      try {
-        const res = await fetch('/app/', { cache: 'no-store' });
-        if (!res.ok) return;
-        const id = extractBuildId(await res.text());
-        if (stopped) return;
-        setServed(id);
-        if (isNewBuild(mine, id)) debugLog('pwa.new-build.detected', { current: mine, served: id });
-      } catch { /* 데몬이 잠깐 없을 수 있다 — 다음에 다시 본다 */ }
+      if (stopped || document.visibilityState !== 'visible') return;
+      // The tab's own page path (not '/app/'): every surface serves the document the tab came from, the bare handle host
+      // does not forward '/app/'. A non-OK answer stops the polling (one debug line) instead of a 404 every two minutes.
+      const probe = await probeServedBuild((input, init) => fetch(input, init), window.location.pathname);
+      if (stopped) return;
+      if (probe.kind === 'unavailable') {
+        stopped = true;
+        window.clearInterval(timer);
+        debugLog('pwa.new-build.polling-stopped', { status: probe.status });
+        return;
+      }
+      if (probe.kind !== 'served') return; // 데몬이 잠깐 없을 수 있다 — 다음에 다시 본다
+      setServed(probe.id);
+      if (isNewBuild(mine, probe.id)) debugLog('pwa.new-build.detected', { current: mine, served: probe.id });
     };
-    const timer = window.setInterval(() => { void check(); }, CHECK_MS);
+    const timer: number = window.setInterval(() => { void check(); }, CHECK_MS);
     const onVisible = () => { void check(); };
     document.addEventListener('visibilitychange', onVisible);
     void check();

@@ -654,7 +654,7 @@ function opDecidePass(config: SeatLoopConfig, deps: SeatDeps, now: Date, path: s
         return owners.get(runId);
       }),
       routeToSeat: (to, card, reason) => {
-        askSeat(stateRoot, 'OP', to, `결정 카드 ${card.id} «${card.title}» — ${reason}. 런 주인이 판단해 elanous decisions decide ${card.id} 로 닫아 주세요.`,
+        askSeat(stateRoot, 'OP', to, `결정 카드 ${card.id} «${card.title}» — ${reason}. 런 주인이 PWA·텔레그램 결정 카드에서 직접 선택해 주세요. CLI decide는 AUTO 위임만 기록합니다.`,
           `op-decide:${card.id}:${to}`);
         return true;
       },

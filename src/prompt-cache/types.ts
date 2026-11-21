@@ -36,6 +36,8 @@ export interface LLMUsage {
   /** provider 가 «응답에 실어 보낸» 실제 청구액(USD) — OpenRouter `usage.cost`(요청에 `usage:{include:true}`).
    *  ⭐ 추정(카탈로그 단가)이 아니라 청구 사실이다 — 비용 판정이 이것을 먼저 쓴다(BACKLOG C7). */
   reportedCostUsd?: number;
+  /** 공급자가 usage 를 «안 줘서» 우리가 글자 수로 어림한 값이다(LLM-USAGE-GROK-BLIND). 측정치에는 칸 자체가 없다. */
+  estimated?: true;
   /** OR-BYOK-COST — OpenRouter `usage.is_byok === true`(상류 키로 청구된 호출 · OR `cost` 는 0). */
   byok?: true;
   /** OR-BYOK-COST — OpenRouter `usage.cost_details.upstream_inference_cost`(상류 키로 실제 청구된 USD).

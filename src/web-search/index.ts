@@ -5,7 +5,7 @@
 // order) and routes the query. Callers that want a specific
 // provider pass `providerId` to force the choice.
 
-import { buildGrokSubscriptionWebSearchProvider, buildGrokWebSearchProvider } from './grok.js';
+import { buildGrokResearchSocialWebSearchProvider, buildGrokSubscriptionWebSearchProvider, buildGrokWebSearchProvider } from './grok.js';
 import { buildExaWebSearchProvider } from './exa.js';
 import { buildFirecrawlWebSearchProvider } from './firecrawl.js';
 import { buildTavilyWebSearchProvider } from './tavily.js';
@@ -204,6 +204,7 @@ export async function probeResearchWebSearchProvidersAsync(signal?: AbortSignal,
 }> {
   const snapshot = [...providers];
   if (includeEnvironmentResearchExa && !snapshot.some(provider => provider.id === 'exa')) snapshot.push(buildExaWebSearchProvider());
+  if (includeEnvironmentResearchExa && !snapshot.some(provider => provider.id === 'grok-social')) snapshot.push(buildGrokResearchSocialWebSearchProvider());
   const probed = await Promise.all(snapshot.map(provider => probeSearchProviderReadiness(provider, signal, timeoutMs)));
   signal?.throwIfAborted();
   const ready = probed.map(entry => entry.available);

@@ -1,12 +1,13 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { attachEls, noteAfterFrame, RECONNECT_NOTE, type AttachFrame } from './attach-client.js';
+import { elsJournalPath } from './journal.js';
+import { processIdentity } from './peer-seat.js';
+import { attachEls, isServerAway, noteAfterFrame, RECONNECT_NOTE, type AttachFrame } from './attach-client.js';
 import { requestEls } from './client.js';
 import type { ElsPty } from './core.js';
 import { elsSocketPath, startElsServer } from './server.js';
-import { elsJournalPath } from './journal.js';
 import { AUTH_PANE_TOKEN_ENV, AUTH_OWNER_TOKEN_ENV } from './server-auth.js';
 import net from 'node:net';
 
@@ -82,6 +83,17 @@ test('attach: input goes to the PTY as typed, resize reaches the PTY, a bad line
   view.attached.input('still works');
   await until(() => state.writes.length === 2);
   expect(view.ends).toEqual([]);
+});
+
+test('HITL: authenticated attach key reaches pending approval while one-shot socket inputs are barred', async () => {
+  const { root, state, pane } = await boot();
+  state.screen = 'Bash approval · Full command\n  rm -rf /isolated/target\ny run · n deny · Enter default N · Esc deny';
+  const view = open(root, pane);
+  await until(() => view.frames.length === 1);
+  view.attached.input('y');
+  await until(() => state.writes.length === 1);
+  expect(state.writes).toEqual(['y']);
+  expect(view.errors).toEqual([]);
 });
 
 test('attach: an unknown pane is refused with an end line; a pane that exits ends the stream with its last screen', async () => {
@@ -190,9 +202,9 @@ test('attach client: input and resize called before the connection is up follow 
 });
 
 
-// JUD #39096 ⓒ (OP #106366·#106663): attach 는 이제 문 판정을 통과한다 — 리터럴: ① 손 토큰으로 다른 좌석
-// 워크스페이스의 pane attach 는 거부(pane PTY 미도달) ② attach 뒤의 input 줄은 같은 판정(허용 행 제거 시 거부).
-test('JUD #39096 ⓒ — cross-seat attach 거부(문) · attach 뒤 input 줄 같은 판정', async () => {
+// A pane token copied into this process is not proof of pane ancestry: authentication fails
+// as outsider before either the cross-seat or own-pane attach reaches the door.
+test('copied pane credential without pane ancestry is outsider for cross-seat and own-pane attach', async () => {
   const { root, state, pty } = setup();
   const captured: Record<string, string>[] = [];
   const started = await startElsServer({ stateRoot: root, spawn: (command: readonly string[], cwd: string, title: string, env: Readonly<Record<string, string>>) => {
@@ -218,21 +230,84 @@ test('JUD #39096 ⓒ — cross-seat attach 거부(문) · attach 뒤 input 줄 �
   await cross.closed;
   const denial = cross.lines.map((l) => JSON.parse(l)).find((v) => v && v.exitCode === 1);
   expect(denial?.exitCode).toBe(1);
-  expect(denial?.message).toMatch(/own workspaces|denied/);
-  expect(state.writes.some((w) => w.includes('door-cross'))).toBe(false);
+  expect(denial?.message).toBe('auth: outsider');
+  const own = await openRaw(handPane);
+  await own.closed;
+  const ownDenial = own.lines.map((l) => JSON.parse(l)).find((v) => v && v.exitCode === 1);
+  expect(ownDenial?.message).toBe('auth: outsider');
+  expect(state.writes).toEqual([]);
+});
+// This fixture binds the test process itself as the HAND pane shell: it exercises the real
+// socket peer/generation check and control door, not a real holder or a child process.
+test.skipIf(process.platform !== 'darwin')('JUD #39096: verified pane principal cannot cross seats and input is rechecked after revocation', async () => {
+  if (process.env.ELS_ATTACH_PRIVATE_TTY !== '1') {
+    const child = Bun.spawn(['/usr/bin/script', '-q', '/dev/null', process.execPath, 'test', import.meta.path, '-t', 'JUD #39096: verified'], {
+      env: { ...process.env, ELS_ATTACH_PRIVATE_TTY: '1', NO_COLOR: '1' }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect({ code, output: out + err }).toMatchObject({ code: 0, output: expect.stringContaining('1 pass') });
+    return;
+  }
+  const { root, state, pty } = setup();
+  const identity = processIdentity(process.pid);
+  expect(identity).toBeDefined();
+  const captured: Record<string, string>[] = [];
+  let count = 0;
+  const started = await startElsServer({ stateRoot: root, spawn: (_command, _cwd, _title, env) => {
+    captured.push({ ...env });
+    return count++ === 0 ? { ...pty, pid: process.pid, processBinding: { pid: process.pid, start: identity!.start, generation: 'fixture' } } : pty;
+  } });
+  if ('exitCode' in started) throw new Error(started.message);
+  cleanups.push(() => started.close());
+  const hand = JSON.parse((await requestEls(elsSocketPath(root), { op: 'new', ws: 'HAND-ELN', cwd: '/work', command: ['sh'] })).message).pane as string;
+  const op = JSON.parse((await requestEls(elsSocketPath(root), { op: 'new', ws: 'OP', cwd: '/work', command: ['sh'] })).message).pane as string;
+  const token = captured[0]?.[AUTH_PANE_TOKEN_ENV];
+  expect(typeof token).toBe('string');
+  const openRaw = (pane: string) => {
+    const socket = net.createConnection(elsSocketPath(root));
+    cleanups.push(() => { socket.destroy(); });
+    const lines: any[] = [];
+    let buffer = '';
+    socket.on('data', (chunk: Buffer) => { buffer += chunk.toString(); const parts = buffer.split('\n'); buffer = parts.pop()!; for (const part of parts) lines.push(JSON.parse(part)); });
+    socket.write(`${JSON.stringify({ op: 'auth', token, pid: process.pid })}\n${JSON.stringify({ op: 'attach', pane, cols: 40, rows: 10 })}\n`);
+    return { socket, lines };
+  };
+  // Also exercise the real attach client, not just the raw protocol: only a door
+  // denial after verified pane authentication proves the no-retry contract.
+  process.env[AUTH_PANE_TOKEN_ENV] = token;
+  const view = open(root, op);
+  await until(() => view.ends.length === 1);
+  expect(view.ends[0]![0]).toBe(1);
+  expect(view.ends[0]![1]).toMatch(/own workspaces|denied/);
+  expect(isServerAway(view.ends[0]![1])).toBe(false);
+  expect(view.frames).toEqual([]);
+  const cross = openRaw(op);
+  await until(() => cross.lines.some(line => line.exitCode === 1));
+  expect(cross.lines.find(line => line.exitCode === 1).message).toMatch(/own workspaces|denied/);
+  expect(state.writes).toEqual([]);
   const allowFile = join(dirname(elsJournalPath(root)), 'control-allow.json');
   mkdirSync(dirname(allowFile), { recursive: true });
-  writeFileSync(allowFile, JSON.stringify({ rules: [{ principal: `els-pane:${handPane}`, workspace: 'HAND-ELN', pane: '*', actions: ['input'], effect: 'allow' }] }));
-  const own = await openRaw(handPane);
-  await until(() => own.lines.length > 0);
+  writeFileSync(allowFile, JSON.stringify({ rules: [{ principal: `els-pane:${hand}`, workspace: 'HAND-ELN', pane: '*', actions: ['input'], effect: 'allow' }] }));
+  const own = openRaw(hand);
+  await until(() => own.lines.some(line => line.type === 'frame'));
   own.socket.write(`${JSON.stringify({ op: 'input', bytes: 'door-ok\n' })}\n`);
-  await until(() => state.writes.some((w) => w.includes('door-ok')));
+  await until(() => state.writes.includes('door-ok\n'));
+  state.screen = 'Bash approval · Full command\ny run · n deny · Enter default N · Esc deny';
+  own.socket.write(`${JSON.stringify({ op: 'input', bytes: 'y' })}\n`);
+  await until(() => own.lines.some(line => line.type === 'error'));
+  expect(state.writes).not.toContain('y'); // pane credential is not a human approval credential
+  const approvals = readFileSync(join(dirname(elsJournalPath(root)), 'control-audit.jsonl'), 'utf8').trim().split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+    .filter(line => line.action === 'input' && line.pane === hand && line.chars === 1);
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0]).toMatchObject({ result: 'executor-refused', exitCode: 1 });
+  expect(JSON.stringify(approvals[0])).not.toContain('rm -rf');
   rmSync(allowFile);
   own.socket.write(`${JSON.stringify({ op: 'input', bytes: 'door-DENY\n' })}\n`);
-  await until(() => own.lines.some((l) => { try { return JSON.parse(l).type === 'error'; } catch { return false; } }));
-  expect(state.writes.some((w) => w.includes('door-DENY'))).toBe(false);
-  own.socket.end();
-});
+  await until(() => own.lines.filter(line => line.type === 'error').length >= 2);
+  expect(state.writes).not.toContain('door-DENY\n');
+}, 30_000);
+
 test('attach client: an overlong socket path is refused with an end line — no socket is touched, nothing crashes', async () => {
   const ends: [number, string][] = [];
   const frames: AttachFrame[] = [];
@@ -248,9 +323,9 @@ test('attach client: an overlong socket path is refused with an end line — no 
   expect(frames).toEqual([]);
 });
 
-// D1a r2 (remote review must «attach retry range»): a door-denied attach answers with a plain result line, then closes. The
-// client must end with THAT message — the generic «connection closed» wording is the server-away signal a view retries on.
-test('attach client: a door-denied attach ends with the denial message, never as a lost server (so no view retries it)', async () => {
+// A copied pane credential is rejected at authentication; the client must surface that result
+// rather than the generic «connection closed» wording that makes a view retry.
+test('attach client: outsider denial is not reported as a lost server (so no view retries it)', async () => {
   const { root, pty } = setup();
   const captured: Record<string, string>[] = [];
   const started = await startElsServer({ stateRoot: root, spawn: (_command: readonly string[], _cwd: string, _title: string, env: Readonly<Record<string, string>>) => { captured.push({ ...(env as Record<string, string>) }); return pty; } });
@@ -265,7 +340,7 @@ test('attach client: a door-denied attach ends with the denial message, never as
   const view = open(root, opPane);                                  // a hand attaching to the OP workspace's pane: refused at the door
   await until(() => view.ends.length === 1);
   expect(view.ends[0]![0]).toBe(1);
-  expect(view.ends[0]![1]).toMatch(/own workspaces|denied/);
+  expect(view.ends[0]![1]).toBe('auth: outsider');
   expect(view.ends[0]![1]).not.toContain('closed the connection');
   expect(view.frames).toEqual([]);
 });
@@ -284,7 +359,8 @@ test('server close: an attach peer that never reads nor closes its end cannot ho
   stuck.on('error', () => {});
   let received = '';
   stuck.on('data', (chunk: Buffer) => { received += chunk.toString('utf8'); });
-  stuck.write(`${JSON.stringify({ op: 'attach', pane, cols: 40, rows: 10 })}\n`);
+  // This test exercises shutdown of an established attach, not anonymous admission.
+  stuck.write(`${JSON.stringify({ op: 'auth', token: process.env[AUTH_OWNER_TOKEN_ENV] })}\n${JSON.stringify({ op: 'attach', pane, cols: 40, rows: 10 })}\n`);
   await new Promise((resolve) => setTimeout(resolve, 200));          // the attach is registered on the server
   const outcome = await Promise.race([started.close().then(() => 'closed'), new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 8_000))]);
   expect(outcome).toBe('closed');

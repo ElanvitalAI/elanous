@@ -1,0 +1,30 @@
+graph_id: memory-lifecycle
+version: 1
+phases:
+  deny: [hard-rehearsal, gate-window]
+entry_node: phase-guard
+terminal_nodes: [done, failed]
+loop:
+  trigger:
+    cron: '0 3 * * *'
+    events: [memory.signal.batch]
+nodes:
+  - { node_id: phase-guard, kind: agent, recipe: 'cmd:phase-guard', max_visits: 1 }
+  - { node_id: run, kind: agent, recipe: 'cmd:run', max_visits: 1 }
+  - { node_id: verify-effect, kind: agent, recipe: 'cmd:verify-effect', max_visits: 1 }
+  - { node_id: record, kind: agent, recipe: 'cmd:record', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: phase-guard
+    on: outcome
+    map: { ok: run, skipped: done, fail: failed }
+  - from: run
+    on: outcome
+    map: { ok: verify-effect, fail: failed }
+  - from: verify-effect
+    on: outcome
+    map: { ok: record, fail: failed }
+  - from: record
+    on: outcome
+    map: { ok: done, fail: failed }

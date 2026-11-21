@@ -5,11 +5,13 @@
 // 회전이 `reset-credit-unknown` 으로 건강한 기본 계정에서 도망친다.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeAvailabilityState, writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
+import { readAccountWindowSnapshot } from '../model-tier/account-window-snapshot.js';
+import { planWorkRoute, windowAccountChildEnv } from '../self-implement/work-route.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { debug } from '../debug/log.js';
 import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
@@ -73,6 +75,38 @@ function stripStoredHome(storePath: string, storeKey: string): void {
   delete parsed.providers[storeKey]?.codexHome;
   writeFileSync(storePath, `${JSON.stringify(parsed, null, 2)}\n`);
 }
+
+test('window selection uses one changing quota observation per home through the real launch path', () => {
+  const root = isolatedRoot('codex-window-race-');
+  const defaultHome = join(root, 'default-home');
+  const teamHome = join(root, 'team-home');
+  for (const home of [defaultHome, teamHome]) mkdirSync(home, { recursive: true });
+  process.env.CODEX_HOME = defaultHome;
+  const store = join(root, 'auth.json');
+  saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: defaultHome }, store);
+  saveTokens('openai-codex:team', tokens(), { mirrorCodex: false, codexHome: teamHome }, store);
+  const now = Date.now();
+  const reads = new Map<string, number>();
+  const quotaRead = (_at: number, home: string) => {
+    const count = (reads.get(home) ?? 0) + 1;
+    reads.set(home, count);
+    return home === realpathSync(defaultHome)
+      ? count === 1
+        ? { fresh: true, observedAtMs: now, usedPercent: 20, resetsAtMs: now + 600_000, creditBalance: 100, hasCredits: true }
+        : { fresh: true, observedAtMs: now, usedPercent: 90, resetsAtMs: now + 30_000, creditBalance: 0, hasCredits: false }
+      : { fresh: true, observedAtMs: now, usedPercent: 20, resetsAtMs: now + 60_000, creditBalance: 200, hasCredits: true };
+  };
+  const inspected = inspectCodexRotation({ CODEX_HOME: defaultHome }, { storePath: store, now, quotaRead });
+  const snapshot = readAccountWindowSnapshot('openai-codex', {
+    now: () => now, config: () => ({ harness: { windowAccounts: 'on' } }), inspectCodex: () => inspected,
+  });
+  const plan = planWorkRoute('대상 경로: src/self-implement/run-ledger.ts', 'openai-codex', snapshot);
+  expect(reads.get(realpathSync(defaultHome))).toBe(1);
+  expect(reads.get(realpathSync(teamHome))).toBe(1);
+  expect(inspected.currentCreditBalance).toBe(100);
+  expect(plan.decision.account).toBe('team');
+  expect(windowAccountChildEnv(plan, 'openai-codex')).toEqual({ ELANOUS_CODEX_ACCOUNT: 'team' });
+});
 
 describe('회전 임계 관측 — 설정에서 판정까지', () => {
   test('inspect는 계정별 실효 임계와 상태를 내고 로그를 남기지 않으며 실행은 계정마다 기록한다', () => {

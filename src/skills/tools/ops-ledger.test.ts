@@ -744,8 +744,8 @@ describe('ops-ledger 한 턴 시나리오 — OP 가 우편 5통을 읽고 판�
   });
 });
 
-describe('ELN-SEAT-LIVE 11-18 — the agent MsgAck tool leaves «seen» like the CLI ack (it used to move the cursor only)', () => {
-  test('real tool registry (tui surface) · MsgAck through #2 → seen(tool-ack) for #1 and #2 · #3 untouched · cursor 2', async () => {
+describe('#122460 ①② (CX-16 postland 실측) — the agent MsgAck tool moves the cursor only: a tool call is not processing', () => {
+  test('real tool registry (tui surface) · MsgAck through #2 → cursor 2 · no seen rows («seen» is the answered turn\'s receipt)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ops-ledger-ack-seen-'));
     const oldState = process.env.ELANOUS_STATE_DIR;
     process.env.ELANOUS_STATE_DIR = dir;
@@ -759,7 +759,7 @@ describe('ELN-SEAT-LIVE 11-18 — the agent MsgAck tool leaves «seen» like the
       const store = new MsgStore(join(dir, 'msg', 'messages.db'));
       try {
         const seen = (id: number) => store.listReceipts({ messageId: id }).filter(r => r.state === 'seen').map(r => r.source);
-        expect([seen(ids[0]!), seen(ids[1]!), seen(ids[2]!)]).toEqual([['tool-ack'], ['tool-ack'], []]);
+        expect([seen(ids[0]!), seen(ids[1]!), seen(ids[2]!)]).toEqual([[], [], []]);
       } finally { store.close(); }
     } finally {
       if (oldState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = oldState;

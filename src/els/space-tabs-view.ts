@@ -140,7 +140,7 @@ const homePath = (cwd: string, home: string | undefined): string => home && (cwd
  * workspace «● NAME» (the name UPPERCASE for display only, one status dot = the most urgent state inside it), the selected
  * space's path on one dim line under it (home as «~», cut by cells), «new · menu» pinned to the last line. No pane count.
  */
-export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string): SpaceListLayout {
+export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: string | undefined, width: number, height: number, home?: string, ceoPendingRed = 0): SpaceListLayout {
   const chosen = selectedSpace(rows, selectedPane);
   type Item = { readonly text: string; readonly ws?: string; readonly pane?: string; readonly mode?: 'focus' | 'dim' };
   const nameOf = (space: Space): string => `${markOf(space.panes)} ${space.name.toLocaleUpperCase()}`;
@@ -169,7 +169,9 @@ export function layoutSpaceList(rows: readonly SpaceTabRow[], selectedPane: stri
   const start = items.length <= room ? 0 : Math.min(at, Math.max(Math.min(Math.max(0, at - Math.floor(room / 2)), items.length - room), at + tail + 1 - room));
   const lines: string[] = [];
   const spaces: { y: number; ws: string; pane: string }[] = [];
-  if (head) lines.push(`\u001b[2m${fitCells(SPACE_LIST_HEAD, width)}\u001b[22m`);
+  if (head) lines.push(ceoPendingRed !== 0
+    ? `\u001b[31m${fitCells(ceoPendingRed < 0 ? ' 🔴 대표 대기 글 확인 불가' : ` 🔴 대표 대기 글 ${ceoPendingRed}`, width)}\u001b[39m`
+    : `\u001b[2m${fitCells(SPACE_LIST_HEAD, width)}\u001b[22m`);
   for (const item of items.slice(start, start + room)) {
     if (item.ws !== undefined) spaces.push({ y: lines.length + 1, ws: item.ws, pane: item.pane! });
     const text = fitCells(item.text, width);
@@ -246,7 +248,11 @@ const DIM_OFF = '\u001b[22m';
 /** «emoji [⇄host ]name»: a pane of another host carries ⇄host in its tab title (the local host has no mark). */
 const remoteLabel = (row: SpaceTabRow, upper = false): string => {
   const name = row.agent ?? tabName(row.title);
-  return `${paneEmoji(row)} ${row.remote ? `⇄${row.remote} ` : ''}${upper ? name.toUpperCase() : name}`;   // ELS-TAB-STYLE-HERDR: UPPERCASE name only (host and emoji as they are)
+  // Keyboard emoji presentation has terminal-dependent width (xterm renders ⌨️ as one cell while Bun counts two).
+  // Force its text presentation and explicitly pad it to two cells, keeping drawing and hitboxes aligned.
+  const icon = paneEmoji(row);
+  const emoji = icon === '⌨️' ? '⌨︎ ' : icon;
+  return `${emoji} ${row.remote ? `⇄${row.remote} ` : ''}${upper ? name.toUpperCase() : name}`;   // ELS-TAB-STYLE-HERDR: UPPERCASE name only (host and emoji as they are)
 };
 
 /** The selected workspace's panes as tabs; the focused one in reverse video. Overflow keeps the focused tab and shows ‹ / ›. */

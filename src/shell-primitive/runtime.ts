@@ -25,6 +25,7 @@ import { recordAudit } from './audit-log.js';
 import { terminateTree } from './terminate-tree.js';
 import { applySandbox, SandboxUnavailableError } from './sandbox.js';
 import { getSessionCwd } from '../session/working-dir.js';
+import { runtimeProcessIdentity } from '../els/seat-runtime.js';
 import { classifyDestructive, type GuardianFinding } from '../ask-user-question/guardian.js';
 import { detectSandboxFailure } from './escalation-prompt.js';
 import {
@@ -52,7 +53,32 @@ export function _getShellApproverForTesting(): ShellApprover | null {
 
 const KILL_ESCALATE_MS = SHELL_KILL_GRACE_MS;
 
-export async function runShell(req: ShellRequest): Promise<ShellResult> {
+/** Approval boundary shared by the argv runtime and the runner/Bash tool paths. */
+export async function gateShellCommand(req: ShellRequest, priorHumanApproval = false): Promise<ShellResult | null> {
+  const cwd = req.cwd ?? getSessionCwd();
+  const key = commandKey({ command: req.command, cwd });
+  const guardian = classifyDestructive(req.command);
+  const withGuardian = (result: ShellResult): ShellResult => guardian ? { ...result, guardian } : result;
+  const policy = guardian ? 'always' : (req.approval ?? 'none');
+  const audit = (result: ShellResult): ShellResult => {
+    recordAudit({
+      type: 'run', ts: new Date().toISOString(), approvalKey: key,
+      command: req.command, cwd, outcome: result.outcome,
+      exitCode: result.exitCode, elapsedMs: result.elapsedMs, truncated: result.truncated,
+    });
+    return withGuardian(result);
+  };
+  if (priorHumanApproval) return req.signal?.aborted ? audit(aborted(key)) : null;
+  if (policy !== 'none') {
+    const decision = await resolveApproval(policy, key, req, cwd);
+    if (req.signal?.aborted) return audit(aborted(key));
+    if (decision === 'deny-once' || decision === 'deny-session') return audit(denied(key));
+  }
+  if (req.signal?.aborted) return audit(aborted(key));
+  return null;
+}
+
+export async function runShell(req: ShellRequest, priorHumanApproval = false): Promise<ShellResult> {
   if (!Array.isArray(req.command) || req.command.length === 0) {
     return {
       exitCode: null,
@@ -84,32 +110,8 @@ export async function runShell(req: ShellRequest): Promise<ShellResult> {
     guardian ? { ...r, guardian } : r
   );
 
-  // ─── Approval ────────────────────────────────────────────────
-  // AU3 — when Guardian flags a command, we upgrade the approval
-  // policy from 'none' / 'first-time' → 'always' so the user sees
-  // the prompt regardless of prior session approval decisions. The
-  // `approval !== 'none'` branch handles the cache consultation as
-  // before, but we overwrite the effective mode.
-  const approvalPolicy = guardian ? 'always' : (req.approval ?? 'none');
-  if (approvalPolicy !== 'none') {
-    const decision = await resolveApproval(approvalPolicy, key, req, cwd);
-    if (decision === 'deny-once' || decision === 'deny-session') {
-      const denyResult = denied(key);
-      recordAudit({
-        type: 'run',
-        ts: new Date().toISOString(),
-        approvalKey: key,
-        command: req.command,
-        cwd,
-        outcome: denyResult.outcome,
-        exitCode: denyResult.exitCode,
-        elapsedMs: denyResult.elapsedMs,
-        truncated: denyResult.truncated,
-      });
-      return withG(denyResult);
-    }
-    // allow-once / allow-session fall through to execution.
-  }
+  const gateResult = await gateShellCommand(req, priorHumanApproval);
+  if (gateResult) return gateResult;
 
   // ─── Sandbox wrapping (X3) ───────────────────────────────────
   // Happens after approval so the audit trail shows the user's
@@ -152,6 +154,25 @@ export async function runShell(req: ShellRequest): Promise<ShellResult> {
     MAX_TIMEOUT_MS,
   );
   const maxOutput = req.maxOutputChars ?? SHELL_MAX_OUTPUT;
+
+  // OP #121854 — the last look before spawn: the abort may have landed at any await above
+  // (or the call may have started already aborted). An aborted turn spawns nothing — no
+  // prompt answer, no cache write, and no process get to run past this point.
+  if (req.signal?.aborted) {
+    const abortResult = aborted(key);
+    recordAudit({
+      type: 'run',
+      ts: new Date().toISOString(),
+      approvalKey: key,
+      command: req.command,
+      cwd,
+      outcome: abortResult.outcome,
+      exitCode: abortResult.exitCode,
+      elapsedMs: abortResult.elapsedMs,
+      truncated: abortResult.truncated,
+    });
+    return withG(abortResult);
+  }
 
   const child = spawnSafely(sandboxedCommand, cwd, req.env);
   if (child instanceof Error) {
@@ -232,8 +253,13 @@ async function resolveApproval(
     cwd,
     approvalKey: key,
     context: req.network === 'off' ? 'network: off' : undefined,
+    // OP #121854 — hand the caller's abort to the prompt so it can cancel with the turn.
+    signal: req.signal,
   });
-  rememberDecision(key, decision);
+  // OP #121854 — an allow/deny that lands after the caller's abort is a late answer to a
+  // cancelled question: it must not poison the session cache (the run never spawns either —
+  // the pre-spawn check below answers 'aborted').
+  if (!req.signal?.aborted) rememberDecision(key, decision);
   recordAudit({
     type: 'approval', ts: new Date().toISOString(),
     approvalKey: key, decision, source: 'approver',
@@ -251,15 +277,30 @@ function denied(key: string): ShellResult {
   };
 }
 
+/** OP #121854 — the caller's signal fired before spawn: no process, answer 'aborted'. */
+function aborted(key: string): ShellResult {
+  return {
+    exitCode: null, stdout: '', stderr: '',
+    elapsedMs: 0, approvalKey: key,
+    outcome: 'aborted', truncated: false,
+    sandboxed: false, sandboxTool: 'none',
+  };
+}
+
 function spawnSafely(
   command: string[],
   cwd: string,
   env: Record<string, string> | undefined,
 ): ChildProcess | Error {
   try {
+    const childEnv = { ...process.env, ...(env ?? {}) };
+    // The child claims this live runtime, not a possibly inherited stale claim.
+    const runtime = runtimeProcessIdentity(process.pid);
+    if (runtime) childEnv.ELN_SEAT_RUNTIME = JSON.stringify({ pid: runtime.pid, start: runtime.start });
+    else delete childEnv.ELN_SEAT_RUNTIME;
     return spawn(command[0]!, command.slice(1), {
       cwd,
-      env: { ...process.env, ...(env ?? {}) },
+      env: childEnv,
       shell: false,
       // own process group → terminateTree kills the whole tree (and only it).
       detached: process.platform !== 'win32',

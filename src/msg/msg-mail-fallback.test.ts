@@ -1,4 +1,4 @@
-// OP 11-17 21:5x — eln 자리 우편 60초 안전망: 받음(delivered↑ 영수증 · ack/커서)이 없을 때만 «우편 확인» 한 번.
+// eln 자리 우편 60초 안전망: 받음(seen↑ 영수증 · ack/커서)이 없을 때만 «우편 확인» 한 번.
 // 임시 원장 · 가짜 잠(즉시) · 가짜 깨움(실제 herdr 0).
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -37,7 +37,76 @@ test('nothing received in 60s → one knock; a second checker never knocks again
   expect(knocks).toEqual([['HAND-X', posted.id, { from: 'OP', fallback: true }]]);
 });
 
-test('received = delivered receipt (mail-wake turn opened) or ack → no knock', async () => {
+test('queued delivered alone does not suppress fallback; seen does', async () => {
+  const path = ledger();
+  const writer = new MsgStore(path);
+  const queued = writer.post({ from: 'OP', to: 'HAND-X', body: 'queued' });
+  const seen = writer.post({ from: 'OP', to: 'HAND-Y', body: 'seen' });
+  writer.recordReceipt({ messageId: queued.id, recipient: 'HAND-X', state: 'delivered', source: 'tui-queue', queueItemId: 'q1' });
+  writer.recordReceipt({ messageId: seen.id, recipient: 'HAND-Y', state: 'seen', source: 'tui-queue', queueItemId: 'q2' });
+  writer.close();
+  const knocks: number[] = [];
+  const deps = { openStore: () => new MsgStore(path), sleep: async () => {}, wake: async (_address: string, id: number) => { knocks.push(id); return { result: 'injected' }; } };
+  expect(await runMailFallback({ messageId: queued.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('knocked');
+  expect(await runMailFallback({ messageId: seen.id, recipient: 'HAND-Y', from: 'OP' }, deps)).toBe('received');
+  expect(knocks).toEqual([queued.id]);
+});
+
+test('other recipient and overdue receipts do not count as seen', () => {
+  const path = ledger();
+  const store = new MsgStore(path);
+  try {
+    const message = store.post({ from: 'OP', to: 'ALL', body: 'broadcast' });
+    store.recordReceipt({ messageId: message.id, recipient: 'HAND-X', state: 'delivered', source: 'tui-queue' });
+    store.recordReceipt({ messageId: message.id, recipient: 'HAND-X', state: 'overdue', source: 'plan' });
+    store.recordReceipt({ messageId: message.id, recipient: 'HAND-Y', state: 'seen', source: 'tui-queue' });
+    expect(mailReceived(store, message.id, 'HAND-X')).toBe(false);
+    expect(mailReceived(store, message.id, 'HAND-Y')).toBe(true);
+    expect(mailReceived(store, message.id + 1000, 'HAND-X')).toBe(true);
+  } finally { store.close(); }
+});
+
+test('failed fallback remains claimed and does not falsely record delivery', async () => {
+  const path = ledger();
+  const store = new MsgStore(path);
+  const message = store.post({ from: 'OP', to: 'HAND-X', body: 'failure' });
+  store.close();
+  let calls = 0;
+  const deps = { openStore: () => new MsgStore(path), sleep: async () => {}, wake: async () => { calls++; throw new Error('unavailable'); } };
+  expect(await runMailFallback({ messageId: message.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('knock-failed');
+  expect(await runMailFallback({ messageId: message.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('already-knocked');
+  expect(calls).toBe(1);
+  const after = new MsgStore(path);
+  try { expect(after.listReceipts({ messageId: message.id }).map(r => r.state)).toEqual(['posted']); }
+  finally { after.close(); }
+});
+
+test('accepted receipt matches the canonical recipient spelling', () => {
+  const path = ledger();
+  const store = new MsgStore(path);
+  try {
+    const message = store.post({ from: 'OP', to: 'HAND-X', body: 'accepted' });
+    store.recordReceipt({ messageId: message.id, recipient: 'HAND-X', state: 'accepted', source: 'plan' });
+    expect(mailReceived(store, message.id, 'hand-x')).toBe(true);
+  } finally { store.close(); }
+});
+
+test('a posted reply auto-ack without a queued receipt keeps fallback suppressed', async () => {
+  const path = ledger();
+  const writer = new MsgStore(path);
+  const original = writer.post({ from: 'OP', to: 'HAND-X', body: 'question' });
+  writer.post({ from: 'HAND-X', to: 'OP', body: 'answer', replyTo: original.id }, { dedupe: true });
+  expect(writer.messageStatus('HAND-X', original.id)).toBe('acked');
+  expect(mailReceived(writer, original.id, 'HAND-X')).toBe(true);
+  writer.close();
+  let wakes = 0;
+  expect(await runMailFallback({ messageId: original.id, recipient: 'HAND-X', from: 'OP' }, {
+    openStore: () => new MsgStore(path), sleep: async () => {}, wake: async () => { wakes++; return { result: 'injected' }; },
+  })).toBe('received');
+  expect(wakes).toBe(0);
+});
+
+test('opened mail-wake turn permits one fallback knock; ack without delivery remains suppressed', async () => {
   const path = ledger();
   const writer = new MsgStore(path);
   const a = writer.post({ from: 'OP', to: 'HAND-X', body: 'a' });
@@ -50,15 +119,15 @@ test('received = delivered receipt (mail-wake turn opened) or ack → no knock',
   try {
     expect(reader.listReceipts({ messageId: a.id }).map(r => [r.state, r.source, r.queueItemId])).toEqual([['posted', 'ledger', undefined], ['delivered', 'tui-mail-wake', 'auto-1']]);
     expect(reader.messageStatus('HAND-X', a.id)).toBe('delivered'); // 아직 안 읽음 — list 에서 안 숨는다
-    expect(mailReceived(reader, a.id, 'HAND-X')).toBe(true);
+    expect(mailReceived(reader, a.id, 'HAND-X')).toBe(false);
     reader.ackMessage('HAND-Y', b.id);
     expect(mailReceived(reader, b.id, 'HAND-Y')).toBe(true);
   } finally { reader.close(); }
   const knocks: number[] = [];
   const deps = { openStore: () => new MsgStore(path), sleep: async () => {}, wake: async (_a: string, id: number) => { knocks.push(id); return { result: 'injected' }; } };
-  expect(await runMailFallback({ messageId: a.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('received');
+  expect(await runMailFallback({ messageId: a.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('knocked');
   expect(await runMailFallback({ messageId: b.id, recipient: 'HAND-Y', from: 'OP' }, deps)).toBe('received');
-  expect(knocks).toEqual([]);
+  expect(knocks).toEqual([a.id]);
 });
 
 test('msg post: an eln-mail-watch wake starts the 60s checker once; any other wake result does not', async () => {
@@ -119,7 +188,7 @@ test('#38285 REVIEW ① — no CLI entry: the safety net does not start and says
   expect(events).toContainEqual({ event: 'spawn-skipped', data: { msgId: 7, to: 'HAND-X', reason: 'no-cli-entry' } });
 });
 
-test('MAIL-SOURCE-AND-FALLBACK: one post starts the 60s checker, and the mail-wake turn on that ledger stops the knock', async () => {
+test('MAIL-SOURCE-AND-FALLBACK: one post starts the 60s checker, and opening a mail-wake turn still permits one fallback knock', async () => {
   const path = ledger();
   const spawned: Array<{ messageId: number; recipient: string; from: string }> = [];
   const program = new Command();
@@ -153,8 +222,8 @@ test('MAIL-SOURCE-AND-FALLBACK: one post starts the 60s checker, and the mail-wa
   expect(await runMailFallback(spawned[0]!, {
     openStore: () => new MsgStore(path), sleep: async () => {},
     wake: async (_address: string, id: number) => { knocks.push(id); return { result: 'injected' }; },
-  })).toBe('received');
-  expect(knocks).toEqual([]);
+  })).toBe('knocked');
+  expect(knocks).toEqual([1]);
 });
 
 test('MAIL-SOURCE-AND-FALLBACK: one ledger draws the agent line, knocks once with no receipt, and the mail-wake turn carries the body', async () => {
@@ -193,11 +262,13 @@ test('MAIL-SOURCE-AND-FALLBACK: one ledger draws the agent line, knocks once wit
   const after = new MsgStore(path);
   try {
     expect(after.listReceipts({ messageId: posted.id }).some(row => row.state === 'delivered' && row.source === 'tui-mail-wake')).toBe(true);
+    expect(mailReceived(after, posted.id, 'HAND-X')).toBe(false);
+    after.recordReceipt({ messageId: posted.id, recipient: 'HAND-X', state: 'seen', source: 'tui-queue' });
     expect(mailReceived(after, posted.id, 'HAND-X')).toBe(true);
   } finally { after.close(); }
 });
 
-test('ELS one-shot retry records delivered only after a verified turn opens', async () => {
+test('ELS one-shot retry records delivery without treating injection as receipt', async () => {
   const path = ledger();
   const writer = new MsgStore(path);
   const posted = writer.post({ from: 'OP', to: 'HAND-X', body: 'hello' });
@@ -205,7 +276,7 @@ test('ELS one-shot retry records delivered only after a verified turn opens', as
   const deps = { openStore: () => new MsgStore(path), sleep: async () => {},
     wake: async () => ({ wake: 'els', target: 'els:w1/t1/p1', result: 'injected' }) };
   expect(await runMailFallback({ messageId: posted.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('knocked');
-  expect(await runMailFallback({ messageId: posted.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('received');
+  expect(await runMailFallback({ messageId: posted.id, recipient: 'HAND-X', from: 'OP' }, deps)).toBe('already-knocked');
   const reader = new MsgStore(path);
   try { expect(reader.listReceipts({ messageId: posted.id }).map(row => row.state)).toEqual(['posted', 'delivered']); }
   finally { reader.close(); }

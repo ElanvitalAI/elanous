@@ -21,7 +21,7 @@ import type { LLMUsage } from './prompt-cache/types.js';
 import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
 import { detectLocale, type Locale } from './expression/locale.js';
 import { format, getMessages } from './expression/i18n/index.js';
-import type { ModelRole } from './user-config/types.js';
+import type { ModelRole, UsageRole } from './user-config/types.js';
 // ⭐ grok 자격 해석 — 구독(OAuth) 1순위 · API 키 2순위. ACP 경로와 «같은» 규칙.
 import { isGrokUnauthorized, refreshGrokSubscriptionToken, resolveFreshGrokCredential, resolveGrokCredential } from './grok/credential.js';
 import {
@@ -30,6 +30,7 @@ import {
   getAnthropicApiKey, ANTHROPIC_MODEL, ANTHROPIC_API_URL,
   getOpenRouterApiKey, OPENROUTER_API_URL, OPENROUTER_MODEL,
   getOpenGatewayApiKey, OPENGATEWAY_API_URL, OPENGATEWAY_MODEL,
+  getTimelyRouterApiKey,
   getLocalLLMUrl, LOCAL_LLM_MODEL,
   getGeminiApiKey, GEMINI_MODEL,
   DEFAULT_PROVIDER,
@@ -37,8 +38,9 @@ import {
 import { debug, getAmbientSessionId, redactSecrets, redactSecretText } from './debug/log.js';
 import { emitTurnLife } from './debug/turn-life.js';
 import { llmObserveSend, withLlmCallContext } from './session-runtime/llm-call-gateway.js';
-import { estimateMessagesTokens } from './tokens.js';
+import { estimateMessagesTokens, estimateTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
+import { timelyRouterBaseUrl } from './llm/timelyrouter-credential.js';
 import { codexAccountReadStorePath } from './oauth/codex-owner-mirror.js';
 import { effectiveCodexAccountName, withCodexAccountOverride } from './oauth/codex-account-override.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
@@ -48,7 +50,7 @@ import { ToolCallTiming } from './chat/tool-call-timing.js';
 import { recordChildFirstLlmResponse, recordChildFirstLlmStart, recordChildFirstToolCall } from './llm/child-first-llm-observation.js';
 import {
   dispatchWithParallelSafety,
-  isSafeForParallel,
+  isCallSafeForParallel,
 } from './session-runtime/parallel-dispatch.js';
 import { createRetryDisplayGate, type RetryDisplayStep } from './llm-stream-retry-display.js';
 import {
@@ -441,7 +443,7 @@ export interface LLMOpts {
    *  Oversized results are spilled to a local file and represented by head/tail. */
   toolResultInlineLimitBytes?: number;
   /** Optional model role attached to this request's usage observation. */
-  usageRole?: ModelRole;
+  usageRole?: UsageRole;
   /** Optional per-call metering phase; absent calls keep the existing ledger shape. */
   usagePhase?: string;
   /** Optional per-call self-dev job kind; absent calls keep the existing ledger shape. */
@@ -1173,6 +1175,14 @@ function profileTimeoutMs(model: string, field: keyof ModelProfile['timeouts']):
   return modelProfileTimeoutMs(resolveModelProfile(model), field);
 }
 
+/** grok/xAI 엔드포인트인가 — API(api.x.ai)와 구독 프록시(cli-chat-proxy.grok.com) 둘 다. 호스트 이름만 본다. */
+function isGrokEndpoint(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === 'x.ai' || host.endsWith('.x.ai') || host === 'grok.com' || host.endsWith('.grok.com');
+  } catch { return false; }
+}
+
 function inferOpenAIProviderName(url: string): string {
   if (/^https?:\/\/openrouter\.ai(?::\d+)?(?:\/|$)/i.test(url)) return 'openrouter';
   if (/^https?:\/\/apis\.opengateway\.ai(?::\d+)?(?:\/|$)/i.test(url)) return 'opengateway';
@@ -1182,7 +1192,7 @@ function inferOpenAIProviderName(url: string): string {
   return 'openai-compatible';
 }
 
-async function* streamOpenAIEvents(
+export async function* streamOpenAIEvents(
   url: string,
   apiKey: string | undefined,
   body: any,
@@ -1194,6 +1204,7 @@ async function* streamOpenAIEvents(
   remainingFallbacks?: number,
   allowLengthContinuation = true,
   headerTimeoutMs?: number,
+  redirect?: RequestRedirect,
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -1220,6 +1231,7 @@ async function* streamOpenAIEvents(
       headers,
       body: JSON.stringify({ ...body, stream: true }),
       signal,
+      ...(redirect ? { redirect } : {}),
     },
     {
       ...retryOptsFor(inferOpenAIProviderName(url), 'LLM API', remainingFallbacks,
@@ -1239,6 +1251,7 @@ async function* streamOpenAIEvents(
   let textContent = '';
   let stopReason: string | undefined;
   let stopReasonDelivered = false;
+  let usageMeasured = false;
   try {
     // OR-TOOLARGS-REPAIR — 깨진 도구 인자 표지는 OpenRouter 엔드포인트에서만 켠다(다른 공급자 무변경).
     const flagInvalidToolArgs = inferOpenAIProviderName(url) === 'openrouter';
@@ -1250,12 +1263,26 @@ async function* streamOpenAIEvents(
     })) {
       if (ev.type === 'text') { textChars += ev.delta.length; textContent += ev.delta; }
       else if (ev.type === 'tool_call') toolCalls++;
+      if (ev.type === 'usage' && (ev.usage.inputTokens !== undefined || ev.usage.outputTokens !== undefined)) usageMeasured = true;
       if (ev.type === 'usage' && stopReason) {
         stopReasonDelivered = true;
         yield { ...ev, usage: { ...ev.usage, stopReason } };
         continue;
       }
       yield ev;
+    }
+    // ⭐ LLM-USAGE-GROK-BLIND — grok 구독 프록시가 usage 를 안 주면 종전엔 토큰 칸 없는 `{stopReason}` 한 줄만 남아
+    //   원장이 0 으로 읽혔다. 못 받았으면 글자 수로 «어림»하되 `estimated:true` 로 표시한다(측정치와 섞이지 않게).
+    if (!usageMeasured && isGrokEndpoint(url) && (textChars > 0 || toolCalls > 0) && !signal?.aborted) {
+      yield { type: 'usage', usage: {
+        provider: 'openai',
+        inputTokens: estimateTokens(JSON.stringify(body?.messages ?? [])) + (body?.tools ? estimateTokens(JSON.stringify(body.tools)) : 0),
+        outputTokens: estimateTokens(textContent),
+        estimated: true,
+        ...(stopReason ? { stopReason } : {}),
+      } };
+      stopReasonDelivered = true;
+      debug.log('llm.usage', 'provider-usage-missing', { model: body?.model, url }, { level: 'warn' });
     }
     if (stopReason && !stopReasonDelivered) yield { type: 'usage', usage: { provider: 'openai', stopReason } };
     debug.log('llm.response.complete', 'stream done', {
@@ -1273,7 +1300,7 @@ async function* streamOpenAIEvents(
         { role: 'user', content: 'Continue exactly where the answer stopped. Do not repeat earlier text.' },
       ] };
       debug.log('llm.request', 'length-continuation', { model: body?.model, textChars });
-      yield* streamOpenAIEvents(url, apiKey, continuationBody, signal, extraHeaders, remainingFallbacks, false, headerTimeoutMs);
+      yield* streamOpenAIEvents(url, apiKey, continuationBody, signal, extraHeaders, remainingFallbacks, false, headerTimeoutMs, redirect);
     }
   } catch (err: any) {
     if (err.name === 'AbortError') {
@@ -2497,6 +2524,9 @@ export function toCodexResponsesTools(
         name: t.name,
         description: t.description,
         parameters: strictifyToolSchema(t.parameters),
+        // Responses API 의 function `strict` 기본값은 true — 생략하면 백엔드가 optional 필드를 전부 required 로
+        // 다룬다(UX #115497 · ScheduleWakeup at·delaySeconds). 우리는 옵션 필드를 그대로 두려 명시한다.
+        strict: false,
       });
     }
   }
@@ -4077,6 +4107,13 @@ export const PROVIDERS: Record<string, LLMProvider> = {
     streamChat: (messages, opts = {}) => makeOpenGatewayProvider({ provider: 'opengateway' }).streamChat!(messages, opts),
     chat: (messages, opts = {}) => makeOpenGatewayProvider({ provider: 'opengateway' }).chat!(messages, opts),
   },
+  timelyrouter: {
+    name: 'timelyrouter',
+    get defaultModel() { return process.env.TIMELYROUTER_MODEL?.trim() || '(configure-model)'; },
+    available: () => !!(process.env.TIMELYROUTER_BASE_URL?.trim() && process.env.TIMELYROUTER_MODEL?.trim() && getTimelyRouterApiKey()),
+    streamChat: (messages, opts = {}) => makeTimelyRouterProvider({ provider: 'timelyrouter' }).streamChat!(messages, opts),
+    chat: (messages, opts = {}) => makeTimelyRouterProvider({ provider: 'timelyrouter' }).chat!(messages, opts),
+  },
   bedrock: BedrockProvider, // 명시 선택 전용 — 자동 순서·폴백 체인에 «안» 넣는다(src/llm/bedrock-provider.ts)
 };
 
@@ -4091,7 +4128,7 @@ function configuredHqProxyProvider(): LLMProvider {
 }
 
 const AUTOMATIC_PROVIDER_ORDER = ['grok', 'anthropic', 'gemini', 'local'] as const;
-const PROVIDER_DECISION_ORDER = ['grok', 'anthropic', 'openai', 'gemini', 'local', 'openrouter'] as const;
+const PROVIDER_DECISION_ORDER = ['grok', 'anthropic', 'openai', 'gemini', 'local', 'openrouter', 'timelyrouter'] as const;
 const SUBSCRIPTION_DECISION_ORDER = ['openai-codex', 'grok'] as const;
 
 type AutomaticProviderName = typeof AUTOMATIC_PROVIDER_ORDER[number];
@@ -4284,13 +4321,15 @@ export function decideProviderForConfig(
       return { provider, model: selectedModel, auth: apiKey || getOpenRouterApiKey() ? 'apikey' : 'none' };
     case 'opengateway':
       return { provider, model: selectedModel, auth: apiKey || getOpenGatewayApiKey() ? 'apikey' : 'none' };
+    case 'timelyrouter':
+      return { provider, model: selectedModel, auth: apiKey || getTimelyRouterApiKey(baseUrl) ? 'apikey' : 'none' };
     case 'bedrock': return { provider, model: selectedModel, auth: authKindForProvider('bedrock', selectedModel) };
   }
   throw new Error(`unknown provider: ${provider as string}`);
 }
 
 function isKnownProviderName(provider: string): provider is ConcreteProviderName {
-  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter' || provider === 'opengateway' || provider === 'bedrock' || provider === 'hq-proxy';
+  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter' || provider === 'opengateway' || provider === 'timelyrouter' || provider === 'bedrock' || provider === 'hq-proxy';
 }
 
 function authKindForProvider(provider: string, model: string, apiKey?: string): ProviderDecisionAuth {
@@ -4306,6 +4345,7 @@ function authKindForProvider(provider: string, model: string, apiKey?: string): 
   if (provider === 'gemini') return getGeminiApiKey() ? 'apikey' : 'none';
   if (provider === 'openrouter') return getOpenRouterApiKey() ? 'apikey' : 'none';
   if (provider === 'opengateway') return getOpenGatewayApiKey() ? 'apikey' : 'none';
+  if (provider === 'timelyrouter') return getTimelyRouterApiKey() ? 'apikey' : 'none';
   if (provider === 'bedrock') return BedrockProvider.available() ? 'apikey' : 'none';
   if (provider === 'openai-codex') {
     try {
@@ -4328,6 +4368,7 @@ function defaultModelForProvider(provider: ConcreteProviderName): string {
     case 'local': return LOCAL_LLM_MODEL;
     case 'openrouter': return OPENROUTER_MODEL;
     case 'opengateway': return OPENGATEWAY_MODEL;
+    case 'timelyrouter': return process.env.TIMELYROUTER_MODEL?.trim() || '(configure-model)';
     case 'bedrock': return BedrockProvider.defaultModel;
   }
   throw new Error(`unknown provider: ${provider as string}`);
@@ -4624,6 +4665,7 @@ export function getProvider(model?: string): LLMProvider {
     if (p.available()) return p;
   }
   if (PROVIDERS.openrouter!.available()) return PROVIDERS.openrouter!;
+  if (PROVIDERS.timelyrouter!.available()) return PROVIDERS.timelyrouter!;
 
   // Gate Pod may intentionally have no credentials. The explicit test env
   // supplies a deterministic answer only after every real auto candidate failed.
@@ -4787,7 +4829,7 @@ export function isLikelyVisionModel(model: string | undefined): boolean {
 // ⭐ OPENROUTER-OPTIMIZE G9 — `reportedCostUsd`(OpenRouter `usage.cost`)도 싣는다. 빠지면 `stream-llm` 행이
 //   실청구액을 잃고 카탈로그 추정(대개 `cost.kind=unknown`)으로 떨어진다(리뷰·저작 행 실측).
 //   합산은 토큰 칸과 같은 규약이다 — OpenAI 호환 스트림은 `usage` 를 마지막 청크에 «한 번» 싣는다(누적 반복 보고 아님).
-type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd' | 'byok' | 'upstreamCostUsd' | 'stopReason'>;
+type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd' | 'byok' | 'upstreamCostUsd' | 'stopReason' | 'estimated'>;
 
 type ProviderTextResult =
   | { ok: true; full: string; usage: ObservedUsage | 'unmeasured'; finishReason?: string }
@@ -4839,6 +4881,7 @@ function accumulateUsage(usage: ObservedUsage | undefined, received: LLMUsage): 
     if (received[field] !== undefined) total[field] = (total[field] ?? 0) + received[field];
   }
   if (received.stopReason !== undefined) total.stopReason = received.stopReason;
+  if (received.estimated) total.estimated = true;
   return accumulateByokUsage(total, received); // OR-BYOK-COST
 }
 
@@ -5210,7 +5253,7 @@ async function streamLLMCore(
       message: reason,
       ...providerFailureEvidence(err),
       ...(isAuthRejectionError(err) ? { authRejected: true } : {}),
-    }, { level: 'error' });
+    }, { level: opts.signal?.aborted ? 'info' : 'error' });
     if (opts.provider) {
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'error', kind: 'streamLLM', durationMs: Date.now() - started });
       throw err;
@@ -8495,7 +8538,7 @@ export function billingRouteForProvider(provider: string | undefined, model: str
 }
 
 /** Observe usage with optional site/role metadata; a provider-name string remains supported. */
-export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole; phase?: string; jobKind?: string; sessionId?: string }): void {
+export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: UsageRole; phase?: string; jobKind?: string; sessionId?: string }): void {
   try {
     const providerName = typeof providerNameOrOptions === 'string' ? providerNameOrOptions : providerNameOrOptions?.providerName;
     const site = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.site) ?? 'agent-turn';
@@ -8520,6 +8563,7 @@ export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOr
       ...(usage.inputTokens !== undefined && { inputTokens: usage.inputTokens }),
       ...(usage.outputTokens !== undefined && { outputTokens: usage.outputTokens }),
       ...(usage.stopReason !== undefined && { stopReason: usage.stopReason }),
+      ...(usage.estimated ? { estimated: true } : {}),
       ...(usage.cacheReadInputTokens !== undefined && { cacheReadInputTokens: usage.cacheReadInputTokens }),
       ...(usage.cacheCreationInputTokens !== undefined && { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
       ...llmUsageCostFields(model, usage, undefined, billing),
@@ -9160,6 +9204,8 @@ export async function streamLLMWithTools(
     let turnText = '';
     let paragraphBoundaryPending = priorRoundHadToolCalls && fullText.length > 0;
     let paragraphLeadingText = '';
+    // The glue inserted between rounds belongs to the cumulative text only; a final answer that replaces earlier rounds starts at its own first character.
+    let turnParagraphSeparator = '';
     let turnFinishReason: string | undefined;
     let turnTextPhase: 'commentary' | 'final' | undefined;
     let turnEnd: boolean | undefined;
@@ -9363,6 +9409,7 @@ export async function streamLLMWithTools(
     };
     const rewindDisconnectedStream = () => {
       paragraphLeadingText = '';
+      turnParagraphSeparator = '';
       if (turnText.length > 0) {
         fullText = fullText.slice(0, fullText.length - turnText.length);
         turnText = '';
@@ -9840,6 +9887,7 @@ export async function streamLLMWithTools(
           // The separator is ordinary turn text: retry rewind and replay must
           // account for exactly the same bytes as the visible delta.
           delta = separator + paragraphLeadingText;
+          turnParagraphSeparator = separator;
           paragraphLeadingText = '';
           paragraphBoundaryPending = false;
         }
@@ -9991,7 +10039,7 @@ export async function streamLLMWithTools(
       const sig = opts.missionContext.pollSignal();
       if (sig && (sig.kind === 'abort' || sig.kind === 'pause')) {
         debug.log('mission.walker', 'signal-received', { missionId: opts.missionContext.missionId, phaseId: opts.missionContext.phaseId, turn, kind: sig.kind, reason: sig.reason ?? null });
-        const finalText = finalizeVisibleAssistantText(fullText, turnText, sawToolRound);
+        const finalText = finalizeVisibleAssistantText(fullText, turnText.slice(turnText.startsWith(turnParagraphSeparator) ? turnParagraphSeparator.length : 0), sawToolRound);
         emitTurnComplete(finalText);
         return finalText;
       }
@@ -10035,7 +10083,7 @@ export async function streamLLMWithTools(
     lengthContinuationNeeded = false;
     // No tool calls + non-empty text = the model gave its final answer.
     if (pendingCalls.length === 0 && turnText.length > 0) {
-      const visibleText = finalizeVisibleAssistantText(fullText, turnText, sawToolRound);
+      const visibleText = finalizeVisibleAssistantText(fullText, turnText.slice(turnText.startsWith(turnParagraphSeparator) ? turnParagraphSeparator.length : 0), sawToolRound);
       const finalization = buildFinalizationPolicySnapshot(
         autoNarrowedInspections,
         editedFilePaths,
@@ -11641,10 +11689,13 @@ export async function streamLLMWithTools(
           batchElapsedMs: Date.now() - batchStartedAt,
         });
       } else {
-        // P2 — Safe-parallel batch path. Read-only tools with
-        // supportsParallel=true run concurrently via Promise.all; the
-        // rest stay sequential. Degrades to pure sequential when
-        // there are <2 safe calls, matching pre-P2 behaviour exactly.
+        // P2 — Safe-parallel batch path (all-or-nothing, JUD #39447 HOLD
+        // #122147): the batch fans out via Promise.all only when EVERY call
+        // is per-call safe (session-runtime/parallel-dispatch.ts); any
+        // unsafe call — e.g. a write/mutating Bash command past the
+        // per-command gate in bash-parallel-safety.ts — pins the whole batch
+        // to original-order sequential. Degrades to pure sequential for <2
+        // calls, matching pre-P2 behaviour exactly.
         // Agent is excluded (handled by the Agent-batch branch above).
         const dispatchWithPostProc = async (
           call: typeof pendingCalls[number],
@@ -11712,7 +11763,7 @@ export async function streamLLMWithTools(
             safeCount: partition.safeCount,
             unsafeCount: partition.unsafeCount,
             safeNames: callsToDispatch
-              .filter((c) => isSafeForParallel(c.name))
+              .filter((c) => isCallSafeForParallel(c))
               .map((c) => c.name),
           });
         }
@@ -12419,7 +12470,7 @@ function makeOpenAICompatProvider(
   defaultModel: string,
   defaultUrl: string,
   cfg: UCLLMConfig,
-  wire: { model?: (model: string) => string; headers?: Record<string, string>; omitDefaultTemperature?: boolean; omitMaxTokens?: boolean; extraBody?: Record<string, unknown> } = {},
+  wire: { model?: (model: string) => string; headers?: Record<string, string>; omitDefaultTemperature?: boolean; omitMaxTokens?: boolean; extraBody?: Record<string, unknown>; redirect?: RequestRedirect } = {},
 ): LLMProvider {
   const resolvedUrl = (() => {
     // A `baseUrl` override is meant for a custom CLOUD gateway/proxy for the
@@ -12575,6 +12626,7 @@ function makeOpenAICompatProvider(
         undefined,
         allowAutomaticContinuation(opts),
         opts.streamHeaderTimeoutMs,
+        wire.redirect,
       );
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
@@ -12633,6 +12685,26 @@ function makeOpenGatewayProvider(cfg: UCLLMConfig): LLMProvider {
     if (opts.model && !isVerifiedOpenGatewayModel(opts.model)) throw new Error(`opengateway model not verified: ${opts.model}`);
     yield* inner.chat!(messages, { ...opts, reasoningEffort: undefined });
   } };
+}
+
+/** Account-specific OpenAI-compatible route. Never infer a partner endpoint, model, or price. */
+function makeTimelyRouterProvider(cfg: UCLLMConfig): LLMProvider {
+  const configuredKey = cfg.apiKey?.trim();
+  const configuredUrl = cfg.baseUrl?.trim();
+  if (configuredKey && !configuredUrl) {
+    throw new Error('timelyrouter apiKey and baseUrl must be configured together');
+  }
+  const baseUrl = configuredUrl || process.env.TIMELYROUTER_BASE_URL?.trim();
+  const selectedModel = cfg.model?.trim() || process.env.TIMELYROUTER_MODEL?.trim();
+  if (!baseUrl) throw new Error('timelyrouter baseUrl required');
+  timelyRouterBaseUrl(baseUrl);
+  if (!selectedModel || selectedModel === '(configure-model)' || selectedModel === 'timelyrouter/(configure-model)') throw new Error('timelyrouter model required');
+  const apiKey = configuredKey || getTimelyRouterApiKey(baseUrl);
+  return makeOpenAICompatProvider('timelyrouter', selectedModel, baseUrl,
+    { ...cfg, baseUrl, apiKey, model: selectedModel },
+    { model: model => model.startsWith('timelyrouter/') ? model.slice('timelyrouter/'.length) : model,
+      omitDefaultTemperature: true, omitMaxTokens: true,
+      redirect: 'manual', extraBody: { stream_options: { include_usage: true } } });
 }
 
 /** OR-TOOLARGS-REPAIR — 깨진 도구 인자 호출에 돌려주는 오류 문면(도구는 실행되지 않았다). */
@@ -13281,6 +13353,7 @@ function ownApiKeyForProvider(provider: string): string | undefined {
     case 'gemini': return getGeminiApiKey();
     case 'openrouter': return getOpenRouterApiKey();
     case 'opengateway': return getOpenGatewayApiKey();
+    case 'timelyrouter': return getTimelyRouterApiKey();
     default: return undefined;
   }
 }
@@ -13343,6 +13416,9 @@ export function getProviderForConfig(
     if (resolvedProviderName === 'opengateway') {
       return makeOpenGatewayProvider({ provider: 'opengateway', model: decision.model, reasoningLevel: userConfig.llm.reasoningLevel });
     }
+    if (resolvedProviderName === 'timelyrouter') {
+      return makeTimelyRouterProvider({ provider: 'timelyrouter', model: decision.model, reasoningLevel: userConfig.llm.reasoningLevel });
+    }
     return PROVIDERS[resolvedProviderName]!;
   }
   if (!isKnownProviderName(resolvedProviderName)) {
@@ -13396,6 +13472,8 @@ export function getProviderForConfig(
       return makeOpenRouterProvider(userConfig.llm.provider === 'openrouter' ? llm : { provider: 'openrouter', model: decision.model, reasoningLevel: llm.reasoningLevel });
     case 'opengateway':
       return makeOpenGatewayProvider(userConfig.llm.provider === 'opengateway' ? llm : { provider: 'opengateway', model: decision.model, reasoningLevel: llm.reasoningLevel });
+    case 'timelyrouter':
+      return makeTimelyRouterProvider(userConfig.llm.provider === 'timelyrouter' ? llm : { provider: 'timelyrouter', model: decision.model, reasoningLevel: llm.reasoningLevel });
     case 'anthropic':
       return makeAnthropicProvider(llm);
     case 'bedrock': return makeBedrockProvider(llm);

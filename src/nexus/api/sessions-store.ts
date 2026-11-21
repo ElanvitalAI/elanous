@@ -21,8 +21,11 @@ import {
 import { getProject } from '../../project/project-store.js';
 import { sessionRoot, updateSessionMeta } from '../../session/index.js';
 import { debug } from '../../debug/log.js';
-import { checkAuth, type MetaApiOpts } from './meta-api.js';
+import { checkAuth, relayHostSessionReadRouteAllowed, relayHostSessionWriteRouteAllowed, relayHostWebChatMember, type MetaApiOpts } from './meta-api.js';
+import { deleteMemberSession, isMemberSessionId, renameMemberSession, sessionOwnedByMember } from './webchat-session-owner.js';
 import { jsonResponse } from './json-response.js';
+import { defaultChatEventBus } from './chat-event-bus.js';
+import { abortActiveChatTurns } from './chat-turn-lifecycle.js';
 
 /** active(대화중) 판정 임계 — updatedAt 이 10분 내면 최근 대화중으로 표시. */
 const ACTIVE_MS = 10 * 60_000;
@@ -78,8 +81,60 @@ function lastPreview(id: string): string {
 }
 
 /** GET /v1/sessions/store — on-disk 세션 목록(newest-first·기본 빈 세션 제외). */
+/**
+ * WEBCHAT-SESSION-HISTORY-PERSIST — 소유자(데몬) 자격이 아니면, 릴레이 신뢰채널 회원 웹채팅의
+ * memberId(읽기 2경로 한정). 둘 다 아니면 null(→ 401). 소유자 자격 = 'owner'(전체 · 불변).
+ */
+function sessionReadScope(req: Request, opts: MetaApiOpts): 'owner' | { memberId: string } | null {
+  if (checkAuth(req, opts)) return 'owner';
+  if (!relayHostSessionReadRouteAllowed(req)) return null;
+  const memberId = relayHostWebChatMember(req, opts);
+  return memberId ? { memberId } : null;
+}
+
+function sessionWriteScope(req: Request, opts: MetaApiOpts): 'owner' | { memberId: string } | null {
+  if (checkAuth(req, opts)) return 'owner';
+  if (!relayHostSessionWriteRouteAllowed(req)) return null;
+  const memberId = relayHostWebChatMember(req, opts);
+  return memberId ? { memberId } : null;
+}
+
+const MEMBER_TITLE_BODY_MAX_BYTES = 1_024;
+
+async function readMemberTitleBody(req: Request): Promise<{ text: string } | { error: 'body_too_large' | 'body_timeout' }> {
+  const declared = Number(req.headers.get('content-length') ?? '0');
+  if (Number.isFinite(declared) && declared > MEMBER_TITLE_BODY_MAX_BYTES) return { error: 'body_too_large' };
+  const reader = req.body?.getReader();
+  if (!reader) return { text: '' };
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, 5_000);
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (timedOut) return { error: 'body_timeout' };
+      if (done) break;
+      length += value.byteLength;
+      if (length > MEMBER_TITLE_BODY_MAX_BYTES) {
+        await reader.cancel();
+        return { error: 'body_too_large' };
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
+  } finally {
+    clearTimeout(timeout);
+    reader.releaseLock();
+  }
+}
+
 export function handleSessionsStoreList(req: Request, opts: MetaApiOpts): Response {
-  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  const scope = sessionReadScope(req, opts);
+  if (!scope) return jsonResponse({ error: 'unauthorized' }, 401);
   const url = new URL(req.url);
   const includeEmpty = url.searchParams.get('includeEmpty') === '1';
   // 운영 크론 실행(sourceKind:'scheduled')은 기본 숨김 — includeOperational=1 로 포함.
@@ -92,13 +147,15 @@ export function handleSessionsStoreList(req: Request, opts: MetaApiOpts): Respon
   const nowMs = Date.now();
 
   let metas = listSessions({
-    limit: 600,
+    ...(scope === 'owner' ? { limit: 600 } : {}),
     ...(projectId !== null ? { projectId } : {}),
     ...(includeOperational ? {} : { excludeSourceKinds: ['scheduled'] }),
     ...(includeHarness ? {} : { excludeOrigins: [HARNESS_SESSION_ORIGIN] }),
   }); // 이미 updatedAt DESC
   if (!includeHarness) metas = metas.filter((m) => !isHarnessSessionOrigin(m.origin));
   if (!includeEmpty) metas = metas.filter((m) => m.messageCount > 0);
+  // 회원 스코프: 자기 소유 세션만(소유자 기록 없는 옛 세션 제외 · fail-closed).
+  if (scope !== 'owner') metas = metas.filter((m) => sessionOwnedByMember(m, scope.memberId));
   metas = metas.slice(0, limit);
 
   const sessions = metas.map((m) => toCard(m, lastPreview(m.id), nowMs));
@@ -107,8 +164,13 @@ export function handleSessionsStoreList(req: Request, opts: MetaApiOpts): Respon
 
 /** GET /v1/sessions/store/:id — 세션 transcript(meta + messages). */
 export function handleSessionsStoreGet(req: Request, id: string, opts: MetaApiOpts): Response {
-  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
-  const loaded = loadSession(id);
+  const scope = sessionReadScope(req, opts);
+  if (!scope) return jsonResponse({ error: 'unauthorized' }, 401);
+  // JUD #39431 필수(경로 탈출) — 회원 스코프는 생성 규칙 밖 id 를 파일·색인 조회 전에 400 으로 돌려보낸다.
+  if (scope !== 'owner' && !isMemberSessionId(id)) return jsonResponse({ ok: false, error: 'invalid_session_id' }, 400);
+  const found = loadSession(id);
+  // 회원 스코프: 남의 세션 · 소유자 없는 옛 세션은 «없음» 과 같은 답(존재 여부도 새지 않는다).
+  const loaded = found && (scope === 'owner' || sessionOwnedByMember(found.meta, scope.memberId)) ? found : null;
   if (!loaded) {
     // `?ifExists=1` — «있으면 복원»하는 호출자(PWA 챗·터미널 독: 새 세션은 아직 저장소에 없다)용.
     // 없음을 오류가 아니라 값으로 돌려준다 — 404 가 매 새 세션마다 콘솔에 빨간 줄을 남겼다(탭 트리아지 P0).
@@ -166,13 +228,36 @@ export async function handleSessionsStoreFork(
 
 /** PATCH /v1/sessions/store/:id — only project membership; leave transcript and other meta untouched. */
 export async function handleSessionsStorePatch(req: Request, id: string, opts: MetaApiOpts): Promise<Response> {
-  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  const scope = sessionWriteScope(req, opts);
+  if (!scope) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (scope !== 'owner' && !isMemberSessionId(id)) return jsonResponse({ ok: false, error: 'invalid_session_id' }, 400);
   if (!id || id.includes('/') || id.includes('\\') || id.includes('..')) {
     return jsonResponse({ ok: false, error: 'invalid_session_id' }, 400);
   }
   let body: unknown;
-  try { body = await req.json(); }
-  catch { return jsonResponse({ ok: false, error: 'invalid_json' }, 400); }
+  if (scope === 'owner') {
+    try { body = await req.json(); }
+    catch { return jsonResponse({ ok: false, error: 'invalid_json' }, 400); }
+  } else {
+    let read: Awaited<ReturnType<typeof readMemberTitleBody>>;
+    try { read = await readMemberTitleBody(req); }
+    catch { return jsonResponse({ ok: false, error: 'body_read_failed' }, 503); }
+    if ('error' in read) return jsonResponse({ ok: false, error: read.error }, read.error === 'body_timeout' ? 408 : 413);
+    try { body = JSON.parse(read.text); }
+    catch { return jsonResponse({ ok: false, error: 'invalid_json' }, 400); }
+  }
+  if (scope !== 'owner') {
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).length !== 1 || typeof (body as { title?: unknown }).title !== 'string') {
+      return jsonResponse({ ok: false, error: 'invalid_title' }, 400);
+    }
+    const title = (body as { title: string }).title.trim();
+    if (!title || title.length > 120 || /[\x00-\x1f\x7f]/.test(title)) {
+      return jsonResponse({ ok: false, error: 'invalid_title' }, 400);
+    }
+    const meta = renameMemberSession(id, scope.memberId, title);
+    return meta ? jsonResponse({ ok: true, meta }, 200) : jsonResponse({ ok: false, error: 'not_found' }, 404);
+  }
   if (!body || typeof body !== 'object' || Array.isArray(body)
     || !Object.hasOwn(body, 'projectId')
     || Object.keys(body).some((key) => key !== 'projectId')) {
@@ -202,13 +287,36 @@ export async function handleSessionsStorePatch(req: Request, id: string, opts: M
 /** DELETE /v1/sessions/store/:id — on-disk 세션 삭제(index.json + <id>.jsonl 제거).
  *  파괴적·복구불가. in-flight turn abort + in-memory history forget 도 fail-soft 로 동반. */
 export function handleSessionsStoreDelete(req: Request, id: string, opts: MetaApiOpts): Response {
-  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  const scope = sessionWriteScope(req, opts);
+  if (!scope) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (scope !== 'owner' && !isMemberSessionId(id)) return jsonResponse({ ok: false, error: 'invalid_session_id' }, 400);
   if (!id || id.includes('/') || id.includes('\\') || id.includes('..')) {
     return jsonResponse({ ok: false, error: 'invalid_session_id' }, 400);
+  }
+  if (scope !== 'owner') {
+    let deleted: boolean;
+    try {
+      deleted = deleteMemberSession(
+        id, scope.memberId, sessionRoot(),
+        () => {
+          abortActiveChatTurns(id);
+          opts.abortSession?.(id);
+        },
+        () => {
+          defaultChatEventBus().closeSession(id);
+          try { opts.history?.forget(id); } catch { /* fail-soft observer cleanup */ }
+        },
+      );
+    } catch {
+      return jsonResponse({ ok: false, error: 'session_delete_failed' }, 503);
+    }
+    if (!deleted) return jsonResponse({ ok: false, error: 'not_found' }, 404);
+    return jsonResponse({ ok: true, id, deleted: true }, 200);
   }
   // in-flight turn 중단 + in-memory 기록 제거(있으면) — on-disk 삭제 전에.
   try { opts.abortSession?.(id); } catch { /* fail-soft */ }
   try { opts.history?.forget(id); } catch { /* fail-soft */ }
   const deleted = deleteSession(id); // on-disk(index+jsonl) 제거
+  if (deleted) defaultChatEventBus().closeSession(id);
   return jsonResponse({ ok: true, id, deleted }, 200);
 }

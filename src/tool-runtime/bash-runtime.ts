@@ -78,6 +78,7 @@ export const bashRuntime: ToolRuntime<Record<string, unknown>, BashResult> = {
       : (ctx.surface === 'tui' || ctx.surface === 'dashboard')
         ? bashApprovalFinding(command, policy)
         : null;
+    let priorHumanApproval = false;
     if (approvalFinding) {
       let approved = false;
       try {
@@ -98,6 +99,7 @@ export const bashRuntime: ToolRuntime<Record<string, unknown>, BashResult> = {
         return { stdout: BASH_APPROVAL_NO_OUTPUT, stderr: error, output: error, exitCode: BASH_APPROVAL_DENIED_EXIT_CODE,
           timedOut: false, aborted: false, durationMs: BASH_APPROVAL_PRESPAWN_DURATION_MS };
       }
+      priorHumanApproval = true;
     }
     // Track H — dashboard surface defaults to sandbox='auto' so
     // LLM-invoked Bash calls get sandbox-exec wrapping on macOS
@@ -106,6 +108,6 @@ export const bashRuntime: ToolRuntime<Record<string, unknown>, BashResult> = {
     if (ctx.surface === 'dashboard' && opts.sandbox === undefined && req.sandbox === undefined) {
       opts.sandbox = 'auto';
     }
-    return dispatchBash(req, opts);
+    return dispatchBash(req, { ...opts, priorHumanApproval });
   },
 };

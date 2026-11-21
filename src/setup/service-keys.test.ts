@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { parseServiceKeyEnv, serviceKeyStatus, storeServiceKeys, verifyServiceKey } from './service-keys.js';
 import { buildUserConfig } from '../user-config.js';
 import { importServiceKeys, renderServiceKeyStatus } from '../cli/setup-keys.js';
+import { getProviderForConfig } from '../llm.js';
+import { _resetKeyCacheForTests } from '../config.js';
 
 const roots: string[] = [];
 function cacheDir(): string {
@@ -15,6 +17,50 @@ function cacheDir(): string {
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
 
 describe('service key setup storage boundary', () => {
+  test('TimelyRouter setup imports a key only after the configured model endpoint verifies it', async () => {
+    const root = cacheDir();
+    const config = buildUserConfig(join(root, 'config.json'));
+    config.llm = { provider: 'timelyrouter', model: 'timelyrouter/demo-model', baseUrl: 'https://timely.mock.invalid/v1' };
+    const env: NodeJS.ProcessEnv = {};
+    const key = 'timely-test-key';
+    const requests: Array<{ url: string; auth: string | null }> = [];
+    const originalFetch = globalThis.fetch;
+    const previousCacheDir = process.env.ELANOUS_KEY_CACHE_DIR;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ url: String(input), auth: new Headers(init?.headers).get('authorization') });
+      return String(input).endsWith('/models')
+        ? new Response('{}', { status: 200 })
+        : new Response('data: {"choices":[{"delta":{"content":"setup worked"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }) as typeof fetch;
+    try {
+      const result = await importServiceKeys(parseServiceKeyEnv(`TIMELYROUTER_API_KEY=${key}`), { print: () => {} }, { config, env, cacheDir: root });
+      expect(result).toEqual({ stored: ['TIMELYROUTER_API_KEY'], rejected: [], unverified: [] });
+      expect(JSON.parse(readFileSync(join(root, 'timelyrouter_credential.json'), 'utf8'))).toEqual({
+        version: 1, baseUrl: 'https://timely.mock.invalid/v1', apiKey: key,
+      });
+      process.env.ELANOUS_KEY_CACHE_DIR = root;
+      _resetKeyCacheForTests();
+      const text: string[] = [];
+      for await (const chunk of getProviderForConfig(config).chat([{ role: 'user', content: 'hello' }])) text.push(chunk);
+      expect(text).toEqual(['setup worked']);
+      config.llm.baseUrl = 'https://other.mock.invalid/v1';
+      const changed = getProviderForConfig(config);
+      expect(changed.available()).toBe(false);
+      await expect(async () => { for await (const _ of changed.chat([{ role: 'user', content: 'hello' }])) { /* consume */ } }).toThrow();
+      config.llm.baseUrl = 'https://timely.mock.invalid/v1';
+      expect(getProviderForConfig(config).available()).toBe(true);
+      expect(requests).toEqual([
+        { url: 'https://timely.mock.invalid/v1/models', auth: `Bearer ${key}` },
+        { url: 'https://timely.mock.invalid/v1/chat/completions', auth: `Bearer ${key}` },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousCacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR;
+      else process.env.ELANOUS_KEY_CACHE_DIR = previousCacheDir;
+      _resetKeyCacheForTests();
+    }
+  });
+
   test('imports only catalogued .env names and never returns values in the write result', async () => {
     const root = cacheDir();
     const secret = 'sentinel-value-never-render';
@@ -155,5 +201,19 @@ describe('service key setup storage boundary', () => {
     expect(requestedUrl).not.toContain(secret);
     expect(requestedUrl).not.toContain('?key=');
     expect(new Headers(requestHeaders).get('x-goog-api-key')).toBe(secret);
+  });
+
+  test('TimelyRouter verifies only the configured HTTPS model endpoint without following redirects', async () => {
+    const key = 'timely-test-key';
+    const requests: Array<{ url: string; auth: string | null; redirect: RequestRedirect | undefined }> = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
+      requests.push({ url: String(input), auth: new Headers(init?.headers).get('authorization'), redirect: init?.redirect });
+      return new Response('{}', { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await verifyServiceKey('timelyrouter', key, { fetchImpl })).toEqual({ result: 'unavailable' });
+    expect(await verifyServiceKey('timelyrouter', key, { baseUrl: 'http://other.example/v1', fetchImpl })).toEqual({ result: 'unavailable' });
+    expect(requests).toEqual([]);
+    expect(await verifyServiceKey('timelyrouter', key, { baseUrl: 'https://timely.mock.invalid/v1', fetchImpl })).toEqual({ result: 'verified', httpStatus: 200 });
+    expect(requests).toEqual([{ url: 'https://timely.mock.invalid/v1/models', auth: `Bearer ${key}`, redirect: 'manual' }]);
   });
 });

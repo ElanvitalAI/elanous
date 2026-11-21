@@ -1,6 +1,8 @@
 import { isRecord } from '../primitives/guards.js';
 /** Shared, deterministic retrieval contract for TUI and task-agent knowhow. */
 
+import type { KnowhowClause } from './clauses.js';
+
 export const KNOWHOW_PACK_DEFAULT_K = 8;
 export const KNOWHOW_PACK_DEFAULT_CHAR_BUDGET = 32_000;
 
@@ -112,6 +114,31 @@ function validFragment(fragment: KnowhowFragment, request: KnowhowPackRequest, n
       * 24 * 60 * 60 * 1000)
     && sameTarget(fragment.target, request.target)
     && sameSignature(fragment.signature, request.signature);
+}
+
+/**
+ * 팩 조항(원장 승화 조항) → 팩 단편. 승화된 교훈은 heuristic 종류로 90일 반감기에
+ * 들어가고, 출처는 그 조항을 결정한 원장(knowhow/clauses.json · autopsy)을 가리킨다.
+ * buildKnowhowPack 의 일반 자격 검증(verified·만료·대상·서명)을 그대로 통과해야
+ * 승화가 회상에 도달한다 — 이 매핑은 강제가 아니라 형상 맞춤이다.
+ */
+export function fragmentFromClause(
+  clause: KnowhowClause,
+  opts: { sourcePath?: string; expiresAt?: string } = {},
+): KnowhowFragment {
+  return {
+    id: clause.id,
+    target: { surface: 'lesson-ledger', scope: `owner:${clause.owner}` },
+    signature: { kind: 'lesson-recurrence', stableCode: clause.lessonId, normalizedArgsHash: `sha256:${clause.id}` },
+    text: `${clause.incident} — 원인: ${clause.cause} · 치료: ${clause.remedy}`,
+    kind: 'heuristic',
+    source: { kind: 'autopsy', path: opts.sourcePath ?? 'knowhow/clauses.json', ref: clause.id },
+    status: 'verified',
+    confidence: Math.min(1, 0.5 + clause.occurrences * 0.1),
+    verifiedAt: clause.createdAt,
+    expiresAt: opts.expiresAt
+      ?? new Date(Date.parse(clause.createdAt) + KNOWHOW_HALF_LIFE_DAYS.heuristic * 24 * 60 * 60 * 1000).toISOString(),
+  };
 }
 
 /**

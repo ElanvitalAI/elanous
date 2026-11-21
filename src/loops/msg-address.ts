@@ -26,7 +26,7 @@ export const SEAT_MESSAGE_ROUTES: Readonly<Record<string, { msgAddress: string; 
   Object.fromEntries(SEAT_ADDRESS_IDS.map((id) => [id, { msgAddress: id, replyBody: 'agent', wakeFrom: 'host' }]));
 
 export type LoopReplyBody = 'none' | 'rules' | 'agent';
-export type MessageWake = 'sse' | 'pty-inject' | 'herdr' | 'els' | 'cron' | 'none';
+export type MessageWake = 'sse' | 'pty-inject' | 'herdr' | 'els' | 'tmux' | 'cron' | 'none';
 
 export type PaneMessageAddress =
   | { kind: 'pane'; paneId: string }

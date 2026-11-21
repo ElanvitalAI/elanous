@@ -23,7 +23,7 @@ afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn()
  */
 async function registerOpSeat(socket: string): Promise<void> {
   const registered = await requestEls(socket, { op: 'seat-set', seat: 'OP' });
-  expect(registered).toEqual({ exitCode: 0, message: 'els seat: OP registered' });
+  expect(registered).toMatchObject({ exitCode: 0, message: 'els seat: OP registered' });
 }
 
 test('registered ELS route sends one verified wake through the actual ELS socket', async () => {
@@ -84,6 +84,29 @@ test('busy or unknown ELS input is deferred without sending', async () => {
   expect(requests).toEqual(['ls', 'status']);
 });
 
+test('ELS discovery does not transfer a disabled registry wake consent to another pane', async () => {
+  const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'elswake-discovery-'));
+  cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+  const ops: string[] = [];
+  const deps = { stateRoot: root, seatStateRoot: join(root, 'seats'), live: true,
+    listHerdrPanes: () => [],
+    readRegistry: () => ({ status: 'ready' as const, registry: { version: 1 as const, seats: [
+      { address: 'CX3', host: 'local', wake: 'none' as const, replyBody: 'agent' as const, optIn: true },
+    ] } }),
+    elsRequest: async (r: { op: string }) => {
+      ops.push(r.op);
+      if (r.op === 'ls') return { exitCode: 0, message: JSON.stringify({ panes: [
+        { seat: 'CX3', address: 'w3/t3/p3', pane: 'p3', ptyId: 'h:p3' },
+      ] }) };
+      if (r.op === 'status') return { exitCode: 0, message: JSON.stringify({ state: 'idle', inputEmpty: true }) };
+      return { exitCode: 0, message: 'turn started' };
+    },
+  };
+  const result = await wakeRecipient('CX3', 33, { from: 'OP' }, deps);
+  expect(result).toMatchObject({ wake: 'none', source: 'seat-registry', result: 'no-wake' });
+  expect(ops).toEqual(['ls', 'status']);
+});
+
 test('a draft typed after status was read prevents the final ELS write', async () => {
   const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'elswake-'));
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
@@ -109,6 +132,7 @@ test('a draft typed after status was read prevents the final ELS write', async (
 });
 
 test('remote ELS wake sends structured requests to the registered host and requires an empty input', async () => {
+  const remoteHost = 'remote-els.invalid';
   const root = mkdtempSync(join(SOCKET_SAFE_TMP, 'elswake-'));
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   const calls: { host: string; op: string; requireEmpty?: boolean }[] = [];
@@ -118,10 +142,10 @@ test('remote ELS wake sends structured requests to the registered host and requi
       return { exitCode: 0, message: request.op === 'ls' ? JSON.stringify({ panes: [{ address: 'w1/t1/p1', pane: 'p1' }] })
         : request.op === 'status' ? JSON.stringify({ state: 'idle', inputEmpty: true }) : 'els send: turn started' };
     } };
-  registerSeatPaneAddress({ address: 'CX4', paneId: 'els:w1/t1/p1', kind: 'els', host: 'minim5', enableWake: true }, deps);
-  expect(resolveWake('CX4', deps)).toMatchObject({ wake: 'els', host: 'minim5', target: 'els:w1/t1/p1' });
+  registerSeatPaneAddress({ address: 'CX4', paneId: 'els:w1/t1/p1', kind: 'els', host: remoteHost, enableWake: true }, deps);
+  expect(resolveWake('CX4', deps)).toMatchObject({ wake: 'els', host: remoteHost, target: 'els:w1/t1/p1' });
   expect((await wakeRecipient('CX4', 13, { from: 'OP' }, deps)).result).toBe('injected');
-  expect(calls).toEqual([{ host: 'minim5', op: 'ls' }, { host: 'minim5', op: 'status' }, { host: 'minim5', op: 'send-verified', requireEmpty: true }]);
+  expect(calls).toEqual([{ host: remoteHost, op: 'ls' }, { host: remoteHost, op: 'status' }, { host: remoteHost, op: 'send-verified', requireEmpty: true }]);
 });
 
 test('a timed-out ELS submission keeps its claim to avoid duplicate injection', async () => {

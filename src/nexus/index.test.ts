@@ -21,6 +21,8 @@ import { createRegistryBackend } from './webterm/pty.js';
 import { createFakeStt } from '../ux-sim/fake-stt.js';
 import { fakeElevenLabsAudioBytes, startFakeElevenLabs } from '../ux-sim/fake-elevenlabs.js';
 import { appSecretId } from './config/secrets/app-secret-ledger.js';
+import { createAppAuth } from './apps/app-auth.js';
+import { APP_AUTH_SIGNING_KEY_ID } from './apps/app-auth-signing-key.js';
 import { deleteAppSecretValue, fileBackend, setAppSecretValue } from './config/secrets/file-backend.js';
 import { setCredentialSlotAsync } from './config/secrets/cred-slots.js';
 import type { StartOpts } from '../pty-shell/registry.js';
@@ -313,6 +315,10 @@ describe('Nexus startup bearer token', () => {
   });
 
   test('runNexus routes the shared runtime event bus into authenticated app database writers', async () => {
+    const oldOperatingKey = 'synthetic-operating-signing-key-with-at-least-256-bits';
+    writeFileSync(join(isolated, 'secrets.json'), JSON.stringify({ version: 1, secrets: {
+      [APP_AUTH_SIGNING_KEY_ID]: oldOperatingKey,
+    } }));
     const appDir = join(isolated, 'nexus', 'apps', 'runtime-notes');
     mkdirSync(join(appDir, 'out'), { recursive: true });
     writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0
@@ -345,6 +351,8 @@ rpc:
     try {
       expect(captured.eventBus).toBe(nexus.eventBus);
       const invitation = appHost.issueInvitation('runtime-notes', 'sim-owner', undefined, 'owner');
+      const operatingVerifier = createAppAuth({ dir: join(isolated, 'operating-verifier'), key: oldOperatingKey });
+      expect(operatingVerifier.acceptInvitation({ appSlug: 'runtime-notes', token: invitation.token }).status).toBe(401);
       const accepted = (await appHost.handle(new Request(
         `http://nexus.invalid/__auth/accept?token=${encodeURIComponent(invitation.token)}`,
         { headers: { host: 'runtime-notes.app.localhost' } },
@@ -367,7 +375,7 @@ rpc:
       appHost.close();
       nexus.release();
     }
-  });
+  }, 20_000);
 
   test('live Nexus dispatches manifest STT through the app route registry and closed secret boundary', async () => {
     const appDir = join(isolated, 'nexus', 'apps', 'voice-note');

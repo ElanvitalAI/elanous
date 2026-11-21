@@ -128,6 +128,8 @@ describe('CAPSULE-A2 shell capsule', () => {
     await tick();
     timer.elapse();
     const id = await pending;
+    expect(stopDetachedShellCapsule(id, 'foreign')).toBe(false);
+    expect(q.drain()).toEqual([]);
     expect(stopDetachedShellCapsule(id)).toBe(true);
     expect(stopDetachedShellCapsule('shell-unknown')).toBe(false);
     await tick();

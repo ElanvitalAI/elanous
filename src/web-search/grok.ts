@@ -41,6 +41,14 @@ export function buildGrokSubscriptionWebSearchProvider(): WebSearchProvider {
     () => ({ credentialPreference: 'api_key', credentialModel: GROK_SUBSCRIPTION_SEARCH_MODEL }));
 }
 
+/** Research social axes only: prefer the connected subscription over a metered API key. */
+export function buildGrokResearchSocialWebSearchProvider(home?: string): WebSearchProvider {
+  return makeGrokProvider('grok-social', 'Grok subscription social search',
+    () => peekGrokCredential({ model: GROK_SUBSCRIPTION_SEARCH_MODEL, ...(home ? { home } : {}) })?.kind === 'subscription',
+    () => ({ credentialPreference: 'subscription', credentialModel: GROK_SUBSCRIPTION_SEARCH_MODEL,
+      model: GROK_SUBSCRIPTION_SEARCH_MODEL, ...(home ? { credentialHome: home } : {}) }));
+}
+
 function makeGrokProvider(
   id: string,
   displayName: string,

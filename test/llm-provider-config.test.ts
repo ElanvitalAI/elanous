@@ -12,7 +12,7 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getProvider, getProviderForConfig, noProviderAvailableMessage, CODEX_DEFAULT_MODEL, PROVIDERS, isLoopbackBaseUrl, decideProviderForConfig, finalizeProviderModelCompatibility, resolveDefaultProvider, streamLLM, type ProviderDecision } from '../src/llm';
+import { getProvider, getProviderForConfig, getProviderForConfigAsync, noProviderAvailableMessage, CODEX_DEFAULT_MODEL, PROVIDERS, isLoopbackBaseUrl, decideProviderForConfig, finalizeProviderModelCompatibility, resolveDefaultProvider, streamLLM, type ProviderDecision } from '../src/llm';
 import { inspectActiveProvider } from '../src/provider-summary';
 import { resolveActiveProvider, setUserConfigOverlay, type UserConfig } from '../src/user-config';
 import { saveTokens, loadTokens } from '../src/oauth/store';
@@ -56,7 +56,7 @@ function writeGrokSubscriptionCredential(): void {
 beforeEach(() => {
   // These cases exercise the real provider decision, including its failure
   // branch, even when the gate Pod enables the separate fake-provider lane.
-  for (const k of ['ELANOUS_TEST_FAKE_LLM', 'XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY', 'LOCAL_LLM_URL']) {
+  for (const k of ['ELANOUS_TEST_FAKE_LLM', 'XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY', 'TIMELYROUTER_API_KEY', 'TIMELYROUTER_BASE_URL', 'TIMELYROUTER_MODEL', 'LOCAL_LLM_URL']) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
@@ -66,9 +66,12 @@ beforeEach(() => {
   savedEnv.HOME = process.env.HOME;
   savedEnv.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
   savedEnv.CODEX_HOME = process.env.CODEX_HOME;
+  savedEnv.ELANOUS_KEY_CACHE_DIR = process.env.ELANOUS_KEY_CACHE_DIR;
   process.env.HOME = tmpXdg;
   process.env.XDG_CONFIG_HOME = tmpXdg;
   process.env.CODEX_HOME = join(tmpXdg, 'codex-home');
+  process.env.ELANOUS_KEY_CACHE_DIR = join(tmpXdg, 'key-cache');
+  config._resetKeyCacheForTests();
   spyOn(grokCredential, 'resolveGrokCredential').mockImplementation(((opts = {}) => (
     resolveGrokCredential({ ...opts, home: tmpXdg ?? undefined })
   )) as typeof resolveGrokCredential);
@@ -91,6 +94,7 @@ afterEach(() => {
   spyOn(config, 'getOpenRouterApiKey').mockRestore();
   spyOn(grokCredential, 'resolveGrokCredential').mockRestore();
   spyOn(grokCredential, 'resolveFreshGrokCredential').mockRestore();
+  config._resetKeyCacheForTests();
   for (const [k, v] of Object.entries(savedEnv)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
@@ -99,6 +103,100 @@ afterEach(() => {
 });
 
 describe('getProviderForConfig — explicit provider overrides', () => {
+  test('TimelyRouter sends its own key and configured model to the OpenAI-compatible endpoint', async () => {
+    const cfg = baseUserConfig();
+    cfg.llm = { provider: 'timelyrouter', apiKey: 'timely-test-key', baseUrl: 'https://timely.mock.invalid/v1', model: 'timelyrouter/demo-model' };
+    const requests: Array<{ url: string; auth: string | null; model: unknown; redirect: RequestRedirect | undefined }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ url: String(input), auth: new Headers(init?.headers).get('Authorization'), model: JSON.parse(String(init?.body)).model, redirect: init?.redirect });
+      return new Response('data: {"choices":[{"delta":{"content":"mock reply"}}]}\n\ndata: [DONE]\n\n', {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }) as typeof fetch;
+
+    const provider = getProviderForConfig(cfg);
+    const chunks: string[] = [];
+    for await (const chunk of provider.chat([{ role: 'user', content: 'hello' }])) chunks.push(chunk);
+
+    expect(provider.name).toBe('timelyrouter');
+    expect(chunks).toEqual(['mock reply']);
+    expect(requests).toEqual([{ url: 'https://timely.mock.invalid/v1/chat/completions', auth: 'Bearer timely-test-key', model: 'demo-model', redirect: 'manual' }]);
+  });
+
+  test('TimelyRouter requires a configured HTTPS endpoint and model before sending a key', () => {
+    const cfg = baseUserConfig();
+    cfg.llm = { provider: 'timelyrouter', apiKey: 'timely-test-key', model: 'timelyrouter/demo-model' };
+    expect(() => getProviderForConfig(cfg)).toThrow(/apiKey and baseUrl/);
+    cfg.llm.baseUrl = 'http://other.example/v1';
+    expect(() => getProviderForConfig(cfg)).toThrow(/HTTPS/);
+    cfg.llm.baseUrl = 'https://timely.mock.invalid/v1';
+    delete cfg.llm.model;
+    expect(() => getProviderForConfig(cfg)).toThrow(/model required/);
+  });
+
+  test('TimelyRouter keeps its key at the original origin on a redirect response', async () => {
+    const cfg = baseUserConfig();
+    cfg.llm = { provider: 'timelyrouter', apiKey: 'timely-test-key', baseUrl: 'https://timely.mock.invalid/v1', model: 'timelyrouter/demo-model' };
+    const requests: Array<{ url: string; redirect: RequestRedirect | undefined }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({ url: String(input), redirect: init?.redirect });
+      return new Response(null, { status: 302, headers: { Location: 'https://other.mock.invalid/v1/chat/completions' } });
+    }) as typeof fetch;
+    const provider = getProviderForConfig(cfg);
+    await expect(async () => { for await (const _ of provider.chat([{ role: 'user', content: 'hello' }])) { /* consume */ } }).toThrow();
+    expect(requests.some(request => request.url === 'https://timely.mock.invalid/v1/chat/completions')).toBe(true);
+    expect(requests.every(request => request.url === 'https://timely.mock.invalid/v1/chat/completions' && request.redirect === 'manual')).toBe(true);
+  });
+
+  test('a bare secret-store key cannot activate TimelyRouter without an origin-bound pair', async () => {
+    const previousMode = process.env.ELANOUS_LLM_MODE;
+    process.env.ELANOUS_LLM_MODE = 'real';
+    try {
+    const cfg = baseUserConfig();
+    cfg.llm = { provider: 'timelyrouter', baseUrl: 'https://timely.mock.invalid/v1', model: 'timelyrouter/demo-model' };
+    const queried: string[] = [];
+    const provider = await getProviderForConfigAsync(cfg, undefined, async id => { queried.push(id); return 'unbound-key'; }, process.env);
+    expect(provider.available()).toBe(false);
+    expect(queried).toEqual([]);
+    } finally {
+      if (previousMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = previousMode;
+    }
+  });
+
+  test('auto selects TimelyRouter only when its key, endpoint, and model are all present', () => {
+    const cfg = baseUserConfig();
+    process.env.TIMELYROUTER_API_KEY = 'timely-env-key';
+    process.env.TIMELYROUTER_BASE_URL = 'https://timely.mock.invalid/v1';
+    expect(decideProviderForConfig(cfg).provider).not.toBe('auto:timelyrouter');
+    process.env.TIMELYROUTER_MODEL = 'timelyrouter/demo-model';
+    expect(decideProviderForConfig(cfg)).toEqual({ provider: 'auto:timelyrouter', model: 'timelyrouter/demo-model', auth: 'apikey' });
+    expect(getProviderForConfig(cfg).name).toBe('timelyrouter');
+  });
+
+  test('cross-provider model routing never sends an OpenRouter key to TimelyRouter', async () => {
+    const previousMode = process.env.ELANOUS_LLM_MODE;
+    process.env.ELANOUS_LLM_MODE = 'real';
+    try {
+    const cfg = baseUserConfig();
+    cfg.llm = { provider: 'openrouter', apiKey: 'sk-or-foreign', baseUrl: 'https://openrouter.mock.invalid/v1', model: 'timelyrouter/demo-model' };
+    process.env.TIMELYROUTER_BASE_URL = 'https://timely.mock.invalid/v1';
+    const requests: string[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Headers(init?.headers).get('Authorization') || '');
+      return new Response('data: [DONE]\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }) as typeof fetch;
+    const provider = getProviderForConfig(cfg);
+    expect(provider.name).toBe('timelyrouter');
+    expect(provider.available()).toBe(false);
+    await expect(async () => { for await (const _ of provider.chat([{ role: 'user', content: 'hello' }])) { /* consume */ } }).toThrow();
+    expect(requests).toEqual([]);
+    } finally {
+      if (previousMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = previousMode;
+    }
+  });
+
   test('grok with inline apiKey preserves runtime credential availability', () => {
     const cfg = baseUserConfig();
     cfg.llm = { provider: 'grok', apiKey: 'xai-test', model: 'grok-4' };

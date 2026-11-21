@@ -535,9 +535,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // 탭 이동 후 돌아와도 리셋되지 않는다. 진행 중 메시지는 덮지 않음.
   useEffect(() => {
     if (!sessionId) return;
-    // bare 핸들 호스트(익명 웹채팅)는 /v1/sessions/store 를 릴레이가 넘기지 않는다(404) —
-    // 복원할 저장 대화도 없으니 부르지 않는다(MK #110935: 진입 직후 «불러오지 못했습니다» 알림).
-    if (isBareWebChatOrigin()) return;
+    // WEBCHAT-SESSION-HISTORY-PERSIST — bare 핸들 호스트도 이제 /v1/sessions/store/:id 를
+    // 회원 스코프로 넘긴다(자기 대화만 · 새 세션은 ifExists=1 → exists:false). 이전 대화를 열면 복원한다.
     let alive = true;
     void (async () => {
       try {

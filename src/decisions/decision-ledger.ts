@@ -20,7 +20,7 @@ export const HUMAN_DECISION_VIA = ['telegram', 'discord', 'webpush', 'slash', 'p
 export type HumanDecisionVia = (typeof HUMAN_DECISION_VIA)[number];
 export type DecisionActor =
   | { kind: 'human'; via?: HumanDecisionVia; /** platform user id that tapped (Telegram/Discord) — an id, never a token */ platformUserId?: string }
-  | { kind: 'auto'; agent: string; track?: DecisionTrack; delegation: string }
+  | { kind: 'auto'; agent: string; track?: DecisionTrack; delegation: string; origin?: 'automation' }
   /** Recorded from a document, not decided here: never passes a human gate. */
   | { kind: 'imported'; source: string };
 export interface DecisionEntry {

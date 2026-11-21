@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { Terminal } from '@xterm/headless';
 import type { AttachHandlers, Attached } from './attach-client.js';
 import { createAttachApp } from './attach-app.js';
 import { createKeyRouter, type KeyAction } from './attach-keys.js';
@@ -9,6 +10,37 @@ import type { ElsRequest } from './server.js';
 const row = (ws: string, pane: string, title: string, state: string) => ({ address: `${ws}/t1/${pane}`, workspace: `name-${ws}`, pane, title, state });
 const listOf = (...panes: object[]): string => JSON.stringify({ workspaces: [], tabs: [], panes });
 const plain = (text: string): string => text.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
+
+test('CEO 30-second no-eyes receipt paints the els side red and clears after actual intake', async () => {
+  const panes = [row('op', 'p1', 'OP', 'working')];
+  const listed = (pendingRed: number) => JSON.stringify({ panes, ceoSide: { pendingRed } });
+  const h = harness(listed(0), { cols: 120, rows: 24 });
+  await h.app.start();
+  expect(h.lastScreen()).not.toContain('대표 대기 글');
+  h.setListing(listed(1));
+  h.tick(); await Bun.sleep(20);
+  expect(h.lastScreen()).toContain('대표 대기 글');
+  expect(h.writes.at(-1)).toContain('\u001b[31m');
+  h.setListing(listed(0));
+  h.tick(); await Bun.sleep(20);
+  expect(h.lastScreen()).not.toContain('대표 대기 글');
+});
+
+test('a damaged CEO side status is visibly unknown rather than silently zero', async () => {
+  const panes = [row('op', 'p1', 'OP', 'idle')];
+  const h = harness(JSON.stringify({ panes, ceoSide: { error: 'unavailable' } }), { cols: 120, rows: 24 });
+  await h.app.start();
+  expect(h.lastScreen()).toContain('대표 대기 글 확인 불가');
+  expect(h.writes.at(-1)).toContain('\u001b[31m');
+  h.setListing(JSON.stringify({ panes }));
+  h.tick(); await Bun.sleep(20);
+  expect(h.lastScreen()).not.toContain('대표 대기 글');
+});
+// Inspect the actual absolute-positioned overlay, not the old underlying screen row.
+const modalRow = (screen: string, y: number, x = 31): string => {
+  const match = new RegExp(`\\x1b\\[${y};${x}H([^\\x1b]*(?:\\x1b\\[[0-9;]*m[^\\x1b]*)*)`).exec(screen);
+  return plain(match?.[1] ?? '');
+};
 
 test('key router: plain text is input; ctrl+b then a herdr key is an action; ctrl+b ctrl+b is a literal ctrl+b; Esc cancels; the prefix survives a split read', () => {
   const router = createKeyRouter();
@@ -53,6 +85,14 @@ test('compose: sidebar | pane with the pane colours kept, the cursor placed at t
   expect(composeView({ cols: 70, rows: 4, sidebar: null, frame: '[screen 40x5 cursor=(row 0, col 0, visible false)]\nx', status: 's' }).endsWith('\u001b[?25l')).toBe(true);
 });
 
+async function renderedRow(screen: string, y: number): Promise<string> {
+  const terminal = new Terminal({ cols: 80, rows: 24, allowProposedApi: true });
+  try {
+    await new Promise<void>((resolve) => terminal.write(screen, resolve));
+    return terminal.buffer.active.getLine(y - 1)!.translateToString(true);
+  } finally { terminal.dispose(); }
+}
+
 // ---- the controller, with a scripted server and a fake attach ----------------------------------------------------------
 function harness(initial: string, size = { cols: 80, rows: 24 }, remembered: { sidebar?: boolean; lastPane?: string } = {}, sidebar?: boolean) {
   const saved: { sidebar: boolean; lastPane?: string }[] = [];
@@ -63,11 +103,13 @@ function harness(initial: string, size = { cols: 80, rows: 24 }, remembered: { s
   const attachments: { pane: string; size: { cols: number; rows: number }; handlers: AttachHandlers; typed: string[]; resizes: [number, number][]; scrolls: number[]; detached: boolean }[] = [];
   const writes: string[] = [];
   let created = 0;
+  let newResponse: (() => Promise<ElsResult>) | undefined;
   const app = createAttachApp({
     request: async (request): Promise<ElsResult> => {
       requests.push(request);
       if (request.op === 'ls') return lsAway ? { exitCode: 1, message: lsAway } : { exitCode: 0, message: listing };
       if (request.op === 'new') {
+        if (newResponse) return newResponse();
         created++;
         const pane = `pnew${created}`;
         listing = JSON.stringify({ panes: [...(JSON.parse(listing) as { panes: object[] }).panes, row(`wn${created}`, pane, 'fresh', 'working')] });
@@ -95,8 +137,284 @@ function harness(initial: string, size = { cols: 80, rows: 24 }, remembered: { s
     memory: { load: () => remembered, save: (state) => { saved.push(state); } },
     ...(sidebar === undefined ? {} : { sidebar }),
   });
-  return { app, saved, requests, attachments, writes, setListing: (next: string) => { listing = next; }, setLsAway: (message: string | undefined) => { lsAway = message; }, tick: () => { poll?.(); }, lastScreen: () => plain(writes.at(-1) ?? '') };
+  return { app, saved, requests, attachments, writes, setNewResponse: (next: (() => Promise<ElsResult>) | undefined) => { newResponse = next; }, setListing: (next: string) => { listing = next; }, setLsAway: (message: string | undefined) => { lsAway = message; }, tick: () => { poll?.(); }, lastScreen: () => plain(writes.at(-1) ?? '') };
 }
+
+test('automatic creation: a definitely unsent request recovers on the next poll', async () => {
+  for (const initial of [listOf(), listOf(row('w1', 'p1', 'old', 'exited'))]) {
+    const h = harness(initial);
+    h.setNewResponse(async () => ({ exitCode: 1, message: 'connect failed', transport: { outcome: 'not-sent', reason: 'connect' } }));
+    await h.app.start();
+    expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+    h.setNewResponse(undefined);
+    h.tick(); await Bun.sleep(20);
+    expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(2);
+    expect(h.attachments.at(-1)?.pane).toBe('pnew1');
+  }
+});
+
+test('automatic creation: unknown result is not retried on later polls', async () => {
+  for (const initial of [listOf(), listOf(row('w1', 'p1', 'old', 'exited'))]) {
+    const h = harness(initial);
+    h.setNewResponse(async () => { throw new Error('timeout'); });
+    await h.app.start();
+    h.tick(); await Bun.sleep(10); h.tick(); await Bun.sleep(10);
+    expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+  }
+});
+
+test('automatic creation: polls do not duplicate an in-flight request', async () => {
+  for (const initial of [listOf(), listOf(row('w1', 'p1', 'old', 'exited'))]) {
+    const h = harness(initial);
+    let resolve!: (result: ElsResult) => void;
+    h.setNewResponse(() => new Promise((done) => { resolve = done; }));
+    const starting = h.app.start();
+    await Bun.sleep(10);
+    h.tick(); h.tick(); await Bun.sleep(10);
+    expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+    resolve({ exitCode: 1, message: 'not sent', transport: { outcome: 'not-sent', reason: 'connect' } });
+    await starting;
+  }
+});
+
+test('new tab modal: list failure after creation keeps the app and name for inspection', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.setNewResponse(async () => {
+    h.setLsAway('list timed out');
+    return { exitCode: 0, message: JSON.stringify({ pane: 'p2' }) };
+  });
+  h.app.key('\u0002c'); h.app.key('named\r');
+  await Bun.sleep(20);
+  expect(h.lastScreen()).toContain('Outcome unknown');
+  expect(await renderedRow(h.writes.at(-1)!, 11)).toContain('named');
+});
+
+test('new tab modal: cancel consumes the rest of the same input chunk', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002c');
+  h.app.key('\u001bxabc\r');
+  expect(h.attachments[0]!.typed).toEqual([]);
+});
+
+test('new tab modal: incomplete escape cannot consume pane input after save finishes', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  let resolve!: (value: ElsResult) => void;
+  h.setNewResponse(() => new Promise((r) => { resolve = r; }));
+  h.app.key('\u0002c'); h.app.key('named\r');
+  h.app.key('\u001b[');
+  h.setListing(listOf(row('w1', 'p1', 'one', 'idle'), row('w1', 'p2', 'new', 'idle')));
+  resolve({ exitCode: 0, message: JSON.stringify({ pane: 'p2' }) });
+  await Bun.sleep(300);
+  h.app.key('ls\r');
+  expect(h.attachments.at(-1)!.typed.join('')).toBe('ls\r');
+});
+
+test('new tab modal: arrow split by a short scheduling delay stays in the prompt', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002c'); h.app.key('ab');
+  h.app.key('\u001b'); await Bun.sleep(15); h.app.key('[D'); h.app.key('X\r');
+  await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['aXb']);
+  expect(h.attachments[0]!.typed).toEqual([]);
+});
+
+test('new tab modal: fragmented arrow does not cancel or leak into the pane', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002c'); h.app.key('ab');
+  h.app.key('\u001b'); h.app.key('['); h.app.key('D'); h.app.key('X\r');
+  await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['aXb']);
+  expect(h.attachments[0]!.typed).toEqual([]);
+});
+
+test('new tab modal: a delayed incomplete escape suffix is discarded', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002c'); h.app.key('ab');
+  h.app.key('\u001b[3');
+  await Bun.sleep(300);
+  h.app.key('~'); h.app.key('X\r');
+  await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['abX']);
+  expect(h.attachments[0]!.typed).toEqual([]);
+});
+
+test('new tab modal: mouse reports split at every boundary do not cancel or leak', async () => {
+  const report = '\u001b[<0;40;12M';
+  for (let cut = 1; cut < report.length; cut++) {
+    const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+    await h.app.start();
+    h.app.key('\u0002c'); h.app.key('work');
+    h.app.key(report.slice(0, cut)); h.app.key(report.slice(cut)); h.app.key('\r');
+    await Bun.sleep(10);
+    expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['work']);
+    expect(h.attachments[0]!.typed).toEqual([]);
+  }
+});
+
+test('new tab modal: an escape coalesced with opening is framed across reads', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002cab\u001b');
+  h.app.key('[D'); h.app.key('X\r');
+  await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['aXb']);
+  expect(h.attachments[0]!.typed).toEqual([]);
+});
+
+test('new tab modal: coalesced open and input is routed to the prompt', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002c\u0002bX\r');
+  await Bun.sleep(10);
+  expect(h.requests.filter((r) => r.op === 'new').at(-1)).toMatchObject({ title: 'bX' });
+  expect(h.attachments[0]!.typed).toEqual([]);
+});
+
+test('new tab modal: successful creation followed by failed listing does not attach an unlisted pane or allow retry', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  h.setNewResponse(async () => {
+    h.setLsAway('els: no els server is running — start it with `els serve` (or `elanous side serve`)');
+    return { exitCode: 0, message: JSON.stringify({ pane: 'pnew1' }) };
+  });
+  await h.app.start();
+  h.app.key('\u0002cwork\r'); await Bun.sleep(20);
+  expect(h.attachments.map((a) => a.pane)).toEqual(['p1']);
+  expect(h.lastScreen()).toContain('Outcome unknown');
+  h.app.key('\r'); await Bun.sleep(10);
+  expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+});
+
+test('new tab modal: unknown create outcome does not allow duplicate submission', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  h.setNewResponse(async () => ({ exitCode: 1, message: 'timed out', transport: { outcome: 'unknown', reason: 'timeout' } }));
+  await h.app.start();
+  h.app.key('\u0002cwork\r');
+  await Bun.sleep(20);
+  h.app.key('\r');
+  await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+  expect(h.writes.join('')).toContain('unknown');
+});
+
+test('new tab modal: unknown manual creation is not followed by automatic creation on an empty or exited list', async () => {
+  for (const after of [listOf(), listOf(row('w1', 'p1', 'old', 'exited'))]) {
+    const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+    h.setNewResponse(async () => ({ exitCode: 1, message: 'timed out', transport: { outcome: 'unknown', reason: 'timeout' } }));
+    await h.app.start();
+    h.app.key('\u0002cwork\r'); await Bun.sleep(20);
+    h.setListing(after);
+    h.tick(); await Bun.sleep(20); h.tick(); await Bun.sleep(20);
+    expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+  }
+});
+
+test('new tab modal: uncertain result survives close and reopening until acknowledged', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  h.setNewResponse(async () => ({ exitCode: 1, message: 'timed out', transport: { outcome: 'unknown', reason: 'timeout' } }));
+  await h.app.start();
+  h.app.key('\u0002cwork\r'); await Bun.sleep(20);
+  h.app.key('\u001b'); await Bun.sleep(60);
+  h.app.key('\u0002c');
+  expect(h.lastScreen()).toContain('Outcome unknown');
+  h.app.key('\r'); await Bun.sleep(10);
+  expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+  h.app.key('r'); h.app.key('\r'); await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['work', 'work']);
+});
+
+test('new tab modal: cancelling risky retry keeps unknown name guarded on reopen', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  h.setNewResponse(async () => ({ exitCode: 1, message: 'timed out', transport: { outcome: 'unknown', reason: 'timeout' } }));
+  await h.app.start();
+  h.app.key('\u0002cwork\r'); await Bun.sleep(20);
+  h.app.key('r'); h.app.key('\u001b'); await Bun.sleep(60);
+  h.app.key('\u0002c');
+  expect(h.lastScreen()).toContain('Outcome unknown');
+  expect(await renderedRow(h.writes.at(-1)!, 11)).toContain('work');
+  h.app.key('\r'); await Bun.sleep(10);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['work']);
+});
+test('new tab modal: uncertain retry retains the original workspace after navigation', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle'), row('w2', 'p2', 'two', 'idle')));
+  h.setNewResponse(async () => ({ exitCode: 1, message: 'timed out', transport: { outcome: 'unknown', reason: 'timeout' } }));
+  await h.app.start();
+  h.app.key('\u0002cwork\r'); await Bun.sleep(20);
+  h.app.key('\u001b'); await Bun.sleep(60);
+  h.app.key('\u0002w');
+  h.app.key('\u0002c'); h.app.key('r'); h.app.key('\r'); await Bun.sleep(20);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.ws)).toEqual(['name-w1', 'name-w1']);
+});
+
+test('new tab modal: a refused create retains the name and permits retry', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  h.setNewResponse(async () => ({ exitCode: 1, message: 'refused' }));
+  await h.app.start();
+  h.app.key('\u0002c'); h.app.key('work\r');
+  await Bun.sleep(10);
+  expect(h.lastScreen()).toContain('새 탭 이름');
+  expect(await renderedRow(h.writes.at(-1)!, 11)).toContain('work');
+  expect(h.lastScreen()).toContain('refused');
+  h.setNewResponse(undefined);
+  h.app.key('\r');
+  await Bun.sleep(10);
+  expect(h.requests.filter((r) => r.op === 'new').map((r) => r.title)).toEqual(['work', 'work']);
+});
+
+test('new tab modal: Ctrl+B during a pending request cannot consume later Esc', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  let resolve!: (result: ElsResult) => void;
+  h.setNewResponse(() => new Promise((done) => { resolve = done; }));
+  await h.app.start();
+  h.app.key('\u0002cwork\r');
+  h.app.key('\u0002');
+  resolve({ exitCode: 1, message: 'refused' });
+  await Bun.sleep(10);
+  h.app.key('\u001b'); await Bun.sleep(60);
+  expect(h.lastScreen()).not.toContain('새 탭 이름');
+  expect(h.attachments[0]!.typed).toEqual([]);
+});
+
+test('new tab modal: repeated Enter while creation is pending sends only one request', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  let resolve!: (result: ElsResult) => void;
+  h.setNewResponse(() => new Promise((done) => { resolve = done; }));
+  await h.app.start();
+  h.app.key('\u0002cwork\r');
+  h.app.key('\r\r');
+  expect(h.requests.filter((r) => r.op === 'new')).toHaveLength(1);
+  resolve({ exitCode: 1, message: 'refused' });
+  await Bun.sleep(10);
+  expect(await renderedRow(h.writes.at(-1)!, 11)).toContain('work');
+  h.app.key('\u001b');
+});
+test('new tab modal: Ctrl+B does not consume Esc or name characters and does not arm a pane shortcut', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  await h.app.start();
+  h.app.key('\u0002c');
+  expect(h.lastScreen()).toContain('새 탭 이름');
+  h.app.key('\u0002');
+  h.app.key('\u001b');
+  await Bun.sleep(60); // Allow the escape disambiguation window to expire.
+  expect(h.lastScreen()).not.toContain('새 탭 이름');
+  expect(h.requests.filter((r) => r.op === 'new')).toEqual([]);
+  h.app.key('z');
+  expect(h.attachments[0]!.typed).toEqual(['z']);
+  h.app.key('\u0002c');
+  h.app.key('\u0002\u001b');
+  await Bun.sleep(60); // A trailing Esc has the same disambiguation window.
+  expect(h.lastScreen()).not.toContain('새 탭 이름');
+  expect(h.requests.filter((r) => r.op === 'new')).toEqual([]);
+  h.app.key('\u0002c');
+  h.app.key('a\u0002b');
+  h.app.key('\r');
+  expect(h.requests.filter((r) => r.op === 'new').at(-1)).toMatchObject({ title: 'ab' });
+});
 
 test('app: an empty server gets one new shell (defaults: $SHELL, this folder, folder-named workspace) and the view attaches to it at the pane size', async () => {
   const h = harness(listOf());
@@ -526,6 +844,15 @@ test('app: ctrl+b : — «two 탭 삭제해줘» shows ⚠ and Enter alone close
   expect(h.attachments.at(-1)!.typed).toEqual([]);                 // none of the words went into the pane
 });
 
+test('voice create reports server refusal rather than success', async () => {
+  const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
+  h.setNewResponse(async () => ({ exitCode: 1, message: 'refused' }));
+  await h.app.start();
+  h.app.key('\u0002:'); h.app.key('새 셸 열어줘\r'); await Bun.sleep(10);
+  h.app.key('\r'); await Bun.sleep(20);
+  expect(h.lastScreen()).toContain('refused');
+  expect(h.lastScreen()).not.toContain('완료: 새 셸 열기');
+});
 // ---- ELS-EXIT-BG-BUTTONS (OP #102571): ⏏ 백그라운드 / ✕ 종료 at the right end of the bottom line (80x24: row 24) ----------
 const click = (x: number, y = 24): string => `\u001b[<0;${x};${y}M`;
 test('app: the bottom line shows « ⏏ 백그라운드  ✕ 종료 »; clicking ⏏ leaves els running (code 0, nothing closed) — like ctrl+b q', async () => {
@@ -586,7 +913,8 @@ test('app: sidebar clicks follow the drawn rows — a space row selects its firs
   h.app.key(click(5, 3)); h.app.key('\u001b[<0;5;3m');                         // second space row → its first pane p3
   expect(h.attachments.at(-1)!.pane).toBe('p3');
   h.app.key(click(3, 23)); h.app.key('\u001b[<0;3;23m');                       // the word «new»
-  expect(screen()[1]).toContain('new tab [');
+  expect(modalRow(h.writes.at(-1)!, 9)).toContain('┌ 새 탭 이름');
+  expect(modalRow(h.writes.at(-1)!, 15)).toContain('└');
   expect(h.attachments.every((a) => a.typed.length === 0)).toBe(true);
 }, 10_000);
 
@@ -806,23 +1134,26 @@ test('app: clicking «+» opens the name prompt (press consumed, its release swa
   await h.app.start();
   const x = plusAt(h);
   h.app.key(`\u001b[<0;${x};1M`); h.app.key(`\u001b[<0;${x};1m`);
-  expect(h.lastScreen().split('\r\n')[1]).toContain('new tab [');
+  expect(modalRow(h.writes.at(-1)!, 9)).toContain('┌ 새 탭 이름');
+  expect(modalRow(h.writes.at(-1)!, 10)).toContain('Name');
+  expect(modalRow(h.writes.at(-1)!, 15)).toContain('└');
   h.app.key('빌드 x'); h.app.key('\u007f');
-  expect(h.lastScreen().split('\r\n')[1]).toContain('new tab [빌드 ');
+  expect(await renderedRow(h.writes.at(-1)!, 11)).toContain('빌드 ');
   expect(h.attachments.at(-1)!.typed).toEqual([]);               // nothing reached the pane (not the text, not the click or its release)
   h.app.key('\r'); await Bun.sleep(20);
   expect(h.requests.filter((r) => r.op === 'new')).toEqual([{ op: 'new', ws: 'name-w1', cwd: '/work/proj', command: ['/bin/zsh'], title: '빌드' }]);
-  expect(h.lastScreen()).not.toContain('new tab [');
+  expect(modalRow(h.writes.at(-1)!, 9)).not.toContain('새 탭 이름');
 });
 
 test('app: Esc cancels (no request), Ctrl+C clears, ESC bytes and ctrl+b c typed into the prompt never go to the pane', async () => {
   const h = harness(listOf(row('w1', 'p1', 'one', 'idle')));
   await h.app.start();
   h.app.key('\u0002c'); h.app.key('abc\u0003z');
-  expect(h.lastScreen().split('\r\n')[1]).toContain('new tab [z');
+  expect(await renderedRow(h.writes.at(-1)!, 11)).toContain('z');
+  expect(await renderedRow(h.writes.at(-1)!, 11)).not.toContain('abc');
   h.app.key('\u001b[3;5~\u0002\u0002q');                        // an unknown sequence, a literal ctrl+b: all swallowed by the prompt
-  h.app.key('\u001b'); await Bun.sleep(10);
-  expect(h.lastScreen()).not.toContain('new tab [');
+  h.app.key('\u001b'); await Bun.sleep(60);
+  expect(modalRow(h.writes.at(-1)!, 9)).not.toContain('새 탭 이름');
   expect(h.requests.filter((r) => r.op === 'new')).toEqual([]);
   expect(h.attachments.at(-1)!.typed).toEqual([]);
 });

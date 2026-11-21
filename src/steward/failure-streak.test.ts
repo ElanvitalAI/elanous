@@ -49,7 +49,11 @@ test('corrupt streak.json starts clean without throwing', () => fixture(root => 
 
 test('alert text masks secrets and bounds the last reason to 120 characters', () => fixture(root => {
   const state = markStageEnd(root, 'triage', false, 'x'.repeat(130), clock);
-  expect(failureAlertText(state)).toBe(`스튜어드 연속 실패 1회 · 마지막 triage · ${'x'.repeat(120)} · 로그 /tmp/elanous-loop-steward.log`);
+  const legacy = join(root, 'old.log');
+  expect(failureAlertText(state, root, legacy)).toBe(`스튜어드 연속 실패 1회 · 마지막 triage · ${'x'.repeat(120)} · 로그 ${root}/loop-logs/elanous-loop-steward.log`);
+  writeFileSync(legacy, 'old content');
+  expect(failureAlertText(state, root, legacy)).toContain(`\n옛 경로(만료) ${legacy}`);
+  expect(readFileSync(legacy, 'utf8')).toBe('old content');
   const secret = 'sk-ant-api03-' + 'a'.repeat(32);
   const masked = markStageEnd(root, 'triage', false, `failed ${secret}`, clock);
   expect(readFailureStreak(root).lastReason).not.toContain(secret);

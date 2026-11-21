@@ -17,7 +17,7 @@ import type { BoardNode } from '../task-agent/board.js';
 import { boundPrTerminal, cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, defaultDraftClaimGhPorts, handDraftClaim, HAND_MOVE_HISTORY_EVENT, updateTaskCard, resolveHandText, readTaskAgentState, readTaskCard, runTagChange, taskAgentStatePath as taskStatePathDefault, shellQuote, TASK_SEATS, type CompletionKind, type DraftClaimGhPorts, type TaskCard, type TaskCardEvent, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { recordWiringLiveVerified, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { PARENT_HOST_COMPATIBILITY_CONTRACT, defaultSshRunner, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs } from '../task-agent/parent-host.js';
-import { readCardAllocation } from '../task-agent/alloc-evidence.js';
+import { observeTargetOnAllocatedHost, readCardAllocation } from '../task-agent/alloc-evidence.js';
 import { buildWorkOrder } from '../task-agent/work-order-build.js';
 import { evaluateTaPreflight, parseHandShadowEvidence, renderTaPreflight, targetEvidenceMismatch, taPreflightReceipt, type TaPreflightEvidence } from '../task-agent/ta-preflight.js';
 import { parseWorkOrder } from '../task-agent/work-order.js';
@@ -71,6 +71,8 @@ export interface TasksCliDeps {
   taskLauncher?: TaskLauncher;
   /** TA-REVIEW-RESULT-CAPTURE — `tasks show` 의 리뷰 결과 회수 시각(시험 주입 · 기본 지금). */
   reviewResultNow?: () => Date;
+  /** TA-LAUNCH-RESULT-LOOP — 회수 원인 코드 공급자(시험 주입). 기본 = 런 원장 stop 기록 판독 `runLedgerReasonCodeFor`(읽기 전용). */
+  reasonCodeFor?: (runId: string) => string;
   /** 과제 카드 상태 파일(시험 주입). 기본 = `effectiveInstanceRoot()/task-agent-actions.json`. */
   taskStatePath?: string;
   /** 조합 선택 시험에서만 그래프 저장소 루트를 바꾼다. */
@@ -125,6 +127,8 @@ export interface TasksCliDeps {
   preflightActiveRuns?: (goalId: string) => ActiveRunsForGoal;
   preflightHoldActive?: () => boolean;
   preflightAllocation?: (cardId: string) => ReturnType<typeof readCardAllocation>;
+  /** ⑥ 호스트 결속 프로브(시험 주입) — 기본 = defaultSshRunner 로 «배정된 호스트 위» 대상 경로 관측(observeTargetOnAllocatedHost). 프로브 불능·실패는 null(UNMEASURED). */
+  preflightHostProbe?: (host: string, command: string, timeoutMs: number) => { status: number | null; stdout: string };
   /** HARNESS-PARENT-ON-MSB1 — 원격 부모 카드의 원장 거울(시험 주입). 기본 = ssh 로 `<prodRoot>/remote-parents/<host>/run-ledger`. */
   remoteLedgerMirror?: (card: TaskCard) => void;
   /** `tasks parents` 의 낡은 부모 보고 의존(시험 주입). */
@@ -2024,7 +2028,24 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
             if (card) allocation = deps.preflightAllocation ? deps.preflightAllocation(card.id)
               : readCardAllocation(card.id, Math.floor(Date.now() / 1000), defaultSshRunner);
           } catch { /* inaccessible authority is unmeasured */ }
-          merged = { ...merged, allocation, owner: { ...merged.owner, ...observed.owner }, launch: { ...merged.launch, ...observed.launch }, entrance: { ...merged.entrance, targetPathsValid: observeTargetPaths(card ?? null), targetHostBound: null } };
+          // (TA-PREFLIGHT-CARD-EVIDENCE-r3·r5 · JUD hold 39396 1·2차 mustFix) ⑤⑥ 은 원장 관측이 유일 권위 원천이다.
+          // 관측 불능(null/«모름») 시 제출값을 폐기하고 UNMEASURED 를 유지한다 — 제출값으로 READY 를 지어내지 않는다(fail-closed).
+          // ⑤ 활성 run = 런 원장 관측(activeRunsForGoal) · ⑥ 대상 경로 = 카드 프로젝트 실재 관측(observeTargetPaths) ·
+          // ⑥ 호스트 결속 = «배정된 호스트 위» 대상 경로 관측(observeTargetOnAllocatedHost)이 유일 원천이다(r5 2차 mustFix) —
+          // 임대 원장 활성 배정(readCardAllocation)+로컬 경로 실재만으로 true 를 합성하지 않는다. 프로브 불능·실패는 null(UNMEASURED).
+          // ③ owner.card(card.seat)·⑤ 계열 부울(cardClaimed·opHoldActive)도 관측 «측정값» 만 남는다(r5) — 관측 null(불능) 시에는
+          // 제출 부울도 폐기해 null(UNMEASURED) 유지: 부울 제출값이 관측 부재를 메워 READY 를 지어내지 않게 한다.
+          const evidenceBackedFields: string[] = [];
+          const ownerMerged = { ...merged.owner, ...observed.owner };
+          const launchMerged = { ...merged.launch };
+          launchMerged.cardClaimed = observed.launch.cardClaimed;
+          launchMerged.opHoldActive = observed.launch.opHoldActive;
+          launchMerged.activeSameGoalRuns = observed.launch.activeSameGoalRuns;
+          const targetPathsObserved = observeTargetPaths(card ?? null);
+          const entranceMerged = { ...merged.entrance };
+          entranceMerged.targetPathsValid = targetPathsObserved;
+          entranceMerged.targetHostBound = observeTargetOnAllocatedHost(card ?? null, allocation, deps.preflightHostProbe ?? defaultSshRunner);
+          merged = { ...merged, evidenceBackedFields, allocation, owner: ownerMerged, launch: launchMerged, entrance: entranceMerged };
         } else {
           // A cell or commit alone does not identify a card or its goal. Never trust supplied launch claims.
           merged = { ...merged, allocation: null, owner: { ...merged.owner, card: null }, launch: { cardClaimed: null, activeSameGoalRuns: null, opHoldActive: null }, entrance: { ...merged.entrance, targetPathsValid: null, targetHostBound: null } };

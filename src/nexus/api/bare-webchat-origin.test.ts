@@ -848,10 +848,10 @@ describe("HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓒ1 derived webchat session (출처: 
     expect(response?.status).toBe(303); // 출처: #39056
     expect(response?.headers.get("Location")).toBe("/app/chat/"); // 출처: #39056
     const cookies = response?.headers.getSetCookie() ?? []; // 출처: #39056
-    expect(cookies.length).toBe(3); // 출처: #39056 — 착지 + 채팅 쌍 2경로
+    expect(cookies.length).toBe(4); // 출처: #39056 — 착지 + 채팅 쌍 2경로 · WEBCHAT-SESSION-HISTORY-PERSIST 대화 목록 읽기 1경로
     expect(
       cookies.map((cookie) => /Path=([^;]+)/.exec(cookie)?.[1]),
-    ).toEqual(["/app/chat", "/v1/prompt/stream", "/v1/chat/events"]); // 출처: #39056
+    ).toEqual(["/app/chat", "/v1/prompt/stream", "/v1/chat/events", "/v1/sessions/store"]); // 출처: #39056 ⊕ WEBCHAT-SESSION-HISTORY-PERSIST
     for (const cookie of cookies) {
       expect(cookie.startsWith("__Secure-elanous_webchat_session=wcs_")).toBe(true); // 출처: #39056 — __Host- 아님 + 파생 wcs_ 값
       expect(cookie).toContain("; Secure; HttpOnly; SameSite=Lax"); // 출처: #39056 — Domain 없음(호스트 전용)

@@ -1,17 +1,12 @@
-// ELS-NEW-TAB-NAME-WIDGET (대표 11-21): the herdr-look prompt row for a new tab's name —
-//   « new tab [name▏        ] ↵ save  ^c clear  esc cancel »
-// Pure state machine: key bytes in, one ANSI row out (the app draws it as the overlay row under the tab row and routes keys here
-// while it is open, so nothing typed reaches the pane). Saving hands the cleaned name to `deps.save`; an empty name saves '' (the
-// default tab, as `ctrl+b c` made before).
-//
-// Reuse notes (HAND-TUI-D design ELS-HERDR-LOOK-INVENTORY-AND-MIGRATION-1121 §1.5 (a)): the key map is the classic single-line
-// input's (src/ui/widgets/edit-view.ts EditView: ←/→/Home/End/Backspace/Delete, Enter = submit, Esc = cancel, a maxLength), and the
-// name is cleaned with core.ts clean(). EditView itself is NOT imported: it draws into the classic Printer cell grid with the
-// theme palette `C` (src/tui.ts), counts UTF-16 units not cells, and has no Ctrl+C = clear — importing it would drag the classic
-// stack into the els client. Only its pure editing rules are carried here, on graphemes and terminal cells (Bun.stringWidth, the
-// same width the els view uses), so a Korean or wide glyph is one step of the cursor and two cells of the field.
+// ELS new-tab prompt: retain grapheme-aware key handling while drawing the shared
+// Dialog and EditView centered in the available pane. Enter closes the prompt and
+// hands the cleaned name to deps.save; an empty name selects the default tab.
 
 import { clean } from './core.js';
+import { Dialog } from '../ui/widgets/dialog.js';
+import { EditView } from '../ui/widgets/edit-view.js';
+import { Printer } from '../ui/printer.js';
+import type { View, Size } from '../ui/view.js';
 
 /** The name's length cap in terminal cells (a wide glyph is two). */
 export const NEW_TAB_NAME_MAX_CELLS = 40;
@@ -28,7 +23,7 @@ const isControl = (char: string): boolean => /^[\u0000-\u001f\u007f-\u009f]$/.te
 
 export interface NewTabPromptDeps {
   /** Enter: the cleaned name ('' = the default tab). The prompt is already closed. */
-  readonly save: (name: string) => void;
+  readonly save: (name: string) => void | Promise<boolean | 'unknown'>;
   /** The row changed: repaint. */
   readonly changed: () => void;
 }
@@ -36,8 +31,19 @@ export interface NewTabPromptDeps {
 export function createNewTabPrompt(deps: NewTabPromptDeps) {
   let open = false;
   let text = '';
+  let fits = true;
   let cursor = 0;                                      // in graphemes
-  const close = (): void => { open = false; text = ''; cursor = 0; deps.changed(); };
+  let saving = false;
+  let unknown = false;
+  let duplicateRisk = false;
+  const close = (): void => {
+    open = false;
+    // A risky retry selection is not a resolution: cancelling it must not
+    // turn a later reopen into an unguarded fresh creation.
+    if (duplicateRisk) unknown = true;
+    if (!unknown) { text = ''; cursor = 0; duplicateRisk = false; }
+    deps.changed();
+  };
   const insert = (char: string): void => {
     const before = split(text).slice(0, cursor).join('') + char;
     const next = before + split(text).slice(cursor).join('');
@@ -54,11 +60,21 @@ export function createNewTabPrompt(deps: NewTabPromptDeps) {
     else if (sequence === '3~' && cursor < parts.length) { parts.splice(cursor, 1); text = parts.join(''); }
   };
   return {
-    openPrompt(): void { open = true; text = ''; cursor = 0; deps.changed(); },
+    openPrompt(): void { open = true; if (!unknown) { text = ''; cursor = 0; } deps.changed(); },
     isOpen: (): boolean => open,
+    isSaving: (): boolean => saving,
     value: (): string => text,
     /** Keys while open: every byte is consumed here (a stray escape sequence is dropped, never typed). */
     feed(bytes: string): void {
+      if (saving) return;
+      if (!fits) { if (bytes === ESC) close(); return; }
+      if (unknown) {
+        if (bytes === ESC) close();
+        else if (bytes[0] === 'r' || bytes[0] === 'R') { unknown = false; duplicateRisk = true; deps.changed(); } // discard the rest: retry requires a fresh Enter
+        return;
+      }
+      // A risky retry must target the unresolved name and require a distinct Enter.
+      if (duplicateRisk && bytes !== ESC && bytes !== '\r' && bytes !== '\n') return;
       const chars = [...bytes];
       for (let at = 0; at < chars.length && open; at++) {
         const char = chars[at]!;
@@ -69,13 +85,64 @@ export function createNewTabPrompt(deps: NewTabPromptDeps) {
           while (end < chars.length && !/[@-~]/.test(chars[end]!)) end++;
           edit(chars.slice(at + 2, end + 1).join(''));
           at = end;
-        } else if (char === '\r' || char === '\n') { const name = clean(text); close(); deps.save(name); return; }
+        } else if (char === '\r' || char === '\n') {
+          const result = deps.save(clean(text));
+          if (result === undefined) { unknown = false; duplicateRisk = false; close(); }
+          else {
+            saving = true;
+            void result.then((ok) => { saving = false; if (ok === true) { unknown = false; duplicateRisk = false; close(); } else { unknown = ok === 'unknown'; deps.changed(); } }, () => { saving = false; unknown = true; deps.changed(); });
+          }
+          return;
+        }
         else if (char === '\u0003') { text = ''; cursor = 0; }                // Ctrl+C = clear the buffer (the prompt stays)
         else if (char === '\u007f' || char === '\b') {
           if (cursor > 0) { const parts = split(text); parts.splice(cursor - 1, 1); text = parts.join(''); cursor--; }
         } else if (!isControl(char)) insert(char);
       }
       if (open) deps.changed();
+    },
+    /** Draw the shared dialog over the pane, preserving the sidebar when present. */
+    dialog(cols: number, rows: number, sidebar = 0): string {
+      const left = Math.max(0, Math.min(cols, sidebar));
+      const available = cols - left;
+      fits = available >= 24 && rows >= 7;
+      if (!fits) return `\u001b[1;${left + 1}H\u001b[0m${'Screen too small - Esc'.slice(0, Math.max(0, available))}\u001b[?25l`;
+      const width = Math.min(48, available - 2);
+      const height = 7;
+      const x = left + Math.floor((available - width) / 2), y = Math.floor((rows - height) / 2);
+      const pieces = split(text);
+      let start = 0;
+      while (start < cursor && Bun.stringWidth(pieces.slice(start, cursor).join('')) > width - 6) start++;
+      const before = pieces.slice(start, cursor).join('');
+      const remaining = width - 4 - Bun.stringWidth(before) - 1;
+      let after = '';
+      for (const piece of pieces.slice(cursor)) {
+        if (Bun.stringWidth(after + piece) > remaining) break;
+        after += piece;
+      }
+      // Printer currently splits ZWJ graphemes into cells. Keep the shared
+      // EditView as the field, then paint its clipped contents intact below.
+      const input = new EditView({ initialValue: before });
+      input.takeFocus();
+      const body: View = {
+        draw(p) {
+          p.text(0, 0, 'Name');
+          input.draw(p.sub(1, 1, Math.max(0, p.width - 2), 1, { focused: true }));
+          p.text(0, 2, unknown ? (p.width < 31 ? 'Outcome unknown' : 'Outcome unknown: duplicate risk') : duplicateRisk ? (p.width < 30 ? 'Duplicate risk' : 'Duplicate risk: Enter to retry') : 'Enter save  ^C clear');
+          p.text(0, 3, unknown ? (p.width < 31 ? 'R duplicate risk Esc' : 'Inspect tabs; R retry; Esc close') : duplicateRisk && p.width < 30 ? 'Enter retry; Esc' : 'Esc cancel');
+        },
+        onEvent: (ev) => input.onEvent(ev),
+        layout: (_size: Size) => {},
+        requiredSize: (size: Size) => size,
+        takeFocus: () => input.takeFocus(),
+      };
+      const dialog = new Dialog({ title: '새 탭 이름', body, buttons: [], onSubmit: () => {} });
+      dialog.layout({ width, height });
+      const printer = Printer.create({ width, height, focused: true });
+      dialog.draw(printer);
+      return printer.lines().map((line, i) => `\u001b[${y + i + 1};${x + 1}H\u001b[0m${line}\u001b[0m`).join('')
+        + `\u001b[${y + 3};${x + 3}H\u001b[0m${' '.repeat(width - 4)}`
+        + `\u001b[${y + 3};${x + 3}H${before}▎${after}\u001b[0m\u001b[?25l`;
     },
     /** The prompt row, `cols` cells wide (the field shrinks, then drops the hint, on a narrow terminal). */
     line(cols: number): string {

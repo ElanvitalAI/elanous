@@ -20,6 +20,7 @@
 // ⛔ prepare 는 «네트워크에 아무것도 쓰지 않는다»(공개 저장소를 «읽기»로 clone 만 한다) — 쓰는 것은 publish 뿐이고 `--yes` 가 있어야 한다.
 //    공개는 되돌릴 수 없다(그 판은 영구히 공개 라이선스).
 // ⛔ 공개본은 «원본 매니페스트»(`release/public-export.yaml`)대로만 만든다 — 매매 실행 코드는 그 매니페스트가 이미 뺀다(🅢 #20529).
+import { parseInstalledVersionLine } from '../version/installed-version-line.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
@@ -247,7 +248,9 @@ export async function prepareRelease(opts: PrepareOptions, run: Runner = default
       const install = runReleaseInstaller(readFileSync(join(distDir, 'install.sh'), 'utf8'), home, env, run);
       const version = run(join(prefix, 'bin', 'elanous'), ['--version'], home, { env });
       const versionLine = version.stdout.trim();
-      const versionOk = install.status === 0 && version.status === 0 && versionLine === `${opts.version} ${publicCommit}`;
+      const installed = parseInstalledVersionLine(versionLine);
+      const versionOk = install.status === 0 && version.status === 0
+        && installed?.version === opts.version && installed.commit === publicCommit;
       let nexusFirstRun: NexusFirstRunReceipt | undefined;
       try {
         if (versionOk) nexusFirstRun = installedNexusFirstRun(join(prefix, 'bin', 'elanous'), home, env, run, log, opts.version, publicCommit);
@@ -521,7 +524,9 @@ export async function verifyRelease(opts: { version?: string; publicRepo?: strin
     isolatedEnv = env;
     const script = must(run('curl', ['-fsSL', installerUrl], home), `설치기 받기 ${installerUrl}`);
     const install = runReleaseInstaller(script, home, env, run);
-    const versionLine = run(binary, ['--version'], home, { env }).stdout.trim();
+    const versionProbe = run(binary, ['--version'], home, { env });
+    const versionLine = versionProbe.stdout.trim();
+    const installed = parseInstalledVersionLine(versionLine);
     const nexusFirstRun = installedNexusFirstRun(binary, home, env, run, log, opts.version);
     const state = stateRoundTrip(binary, home, env, run, startedAtMs);
     const update = run(binary, ['self-update', '--json'], home, { env });
@@ -537,7 +542,7 @@ export async function verifyRelease(opts: { version?: string; publicRepo?: strin
       ? run('bash', [join(prefix, 'current', 'node_modules', 'elanous', 'scripts', 'uninstall.sh')], home, { env })
       : { status: null, stdout: '', stderr: 'uninstall.sh 없음' };
     const notes = checkReleaseNotesPage(opts.version, run, home);
-    const ok = install.status === 0 && nexusFirstRun.ok && (opts.version ? versionLine.startsWith(`${opts.version} `) : versionLine.length > 0) && update.status === 0 && daemonStopped && state.memory && state.logs !== 'fail' && notes.notesPage !== 'missing';
+    const ok = install.status === 0 && nexusFirstRun.ok && (versionProbe.status === 0 && installed !== null && (!opts.version || installed.version === opts.version)) && update.status === 0 && daemonStopped && state.memory && state.logs !== 'fail' && notes.notesPage !== 'missing';
     log(`${ok ? '✅' : '⛔'} ${installerUrl}\n  설치 rc=${install.status} · --version «${versionLine}» · 기억 왕복 ${state.memory ? 'ok' : 'FAIL'} · 로그 왕복 ${state.logs === 'ok' ? 'ok' : state.logs === 'fail' ? 'FAIL' : '안 잼(스토어 없음 — 데몬이 한 번 떠야 생긴다)'} · self-update rc=${update.status} · NEXUS 종료 ${daemonStop.status}/${daemonStatus.status} «${daemonStopped ? 'not running' : daemonStatus.stdout.trim().slice(-240)}» · 제거 rc=${uninstall.status} · 노트 페이지 ${notes.notesPage === 'ok' ? 'ok' : notes.notesPage === 'missing' ? `없음 — release/public/docs/releases/${opts.version}.md ⊕ website/pages.json ⊕ \`bun website/scripts/deploy-pages.ts\` (${notes.url})` : '해당 없음'}`);
     return { ok, ...(!nexusFirstRun.ok ? { error: `A158 Nexus first-run failed: ${nexusFirstRun.error ?? `health=${nexusFirstRun.health}/app=${nexusFirstRun.app}/ownPIDStopped=${nexusFirstRun.ownPidStopped}`}` } : {}),
       versionLine, installerUrl, steps: { install: install.status, selfUpdate: update.status, uninstall: uninstall.status, daemonStop: daemonStop.status }, state, notesPage: notes.notesPage, daemonStopped, nexusFirstRun };

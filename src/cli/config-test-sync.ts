@@ -16,7 +16,8 @@
 //   • discord off · 평문 비밀 필드 재귀 제거
 //   • 채널 탭(telegram:* · discord:*)의 tokenRef 제거 — 🩸 2026-09-27: 봇 토큰이 탭 tokenRef 로 옮겨간 뒤(#20732)
 //     `resolveChannelBotToken` 이 tokenRef 를 먼저 풀어 «시험 봇 스왑»을 무시하고 운영 봇을 격리 우주에 줬다.
-//   • secrets.json 은 «그대로»가 아니라 아웃바운드 자격(채널 탭 봇 토큰 · 웹 푸시 VAPID)을 뺀 사본으로.
+//   • secrets.json 은 «그대로»가 아니라 아웃바운드 자격(채널 탭 봇 토큰 · 웹 푸시 VAPID)
+//     및 Nexus 앱 인증 서명 키를 뺀 사본으로.
 //
 // 부속 파일 복사 정책(대표 지시 "현재 그대로 복사"):
 //   • 복사 = 연산/인바운드에 필요한 것 (LLM 키·oauth·identity)
@@ -37,7 +38,7 @@ export function prodConfigDir(): string {
 
 /** 그대로 복사할 부속 파일 (운영 config dir 상대). 없는 파일은 조용히 스킵. */
 export const TEST_SYNC_AUX_FILES: readonly string[] = [
-  'secrets.json',      // LLM/서비스 키 — 에이전트 턴에 필요 (아웃바운드 자격은 빼고 쓴다 — testSyncExcludedSecretIds)
+  'secrets.json',      // LLM/서비스 키 — 에이전트 턴에 필요 (아웃바운드·앱 인증 자격은 뺀다 — testSyncExcludedSecretIds)
   'llm-fallback.json', // 모델 폴백 체인
   'auth.json',         // oauth 자격 (LLM provider)
   'identity.json',     // self identity — 무해·자기인식 일관
@@ -61,8 +62,9 @@ const SECRET_KEY_PATTERN = /^(apiKey|botToken|token|secret|password|clientSecret
 const CHANNEL_TAB_ID = /^(telegram|discord):/;
 /** 웹 푸시 VAPID 쌍 — 격리 우주는 부재 시 자기 쌍을 새로 만든다(`src/web-push/vapid-keys.ts`). */
 const VAPID_SECRET_PREFIX = 'pwa-push-vapid-';
+const APP_AUTH_SIGNING_KEY_ID = 'nexus.app-auth-signing-key';
 
-/** 운영 secrets.json 에서 격리 사본에 넣지 않을 비밀 id — 채널 탭이 참조하는 봇 토큰 ⊕ VAPID. */
+/** 운영 secrets.json 에서 격리 사본에 넣지 않을 비밀 id — 채널 봇 토큰 ⊕ VAPID ⊕ 앱 인증 서명 키. */
 export function testSyncExcludedSecretIds(raw: Record<string, unknown>, secretIds: readonly string[]): string[] {
   const refd = new Set<string>();
   const tabs = raw.tabs && typeof raw.tabs === 'object' && !Array.isArray(raw.tabs) ? raw.tabs as Record<string, unknown> : {};
@@ -72,7 +74,8 @@ export function testSyncExcludedSecretIds(raw: Record<string, unknown>, secretId
     const sid = isSecretRef(ref) ? secretIdFromRef(ref as string) : null;
     if (sid) refd.add(sid);
   }
-  return secretIds.filter((sid) => refd.has(sid) || /^(telegram|discord)_\d+__tokenRef$/.test(sid) || sid.startsWith(VAPID_SECRET_PREFIX));
+  return secretIds.filter((sid) => sid === APP_AUTH_SIGNING_KEY_ID || refd.has(sid)
+    || /^(telegram|discord)_\d+__tokenRef$/.test(sid) || sid.startsWith(VAPID_SECRET_PREFIX));
 }
 
 /** raw JSON dict 레벨 test-safe 변환 — 미지 필드는 보존하고 평문 비밀만 제거한다. */

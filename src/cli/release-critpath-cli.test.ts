@@ -55,5 +55,11 @@ describe('release critpath CLI', () => {
     expect(process.exitCode).toBe(CRITPATH_WAITING_EXIT);
     expect(calls).toEqual(['resolve', 'prepare', 'card']);
     expect(cards.map((c) => c.cutSha)).toEqual([binding.cutSha]);
+    // The actual CLI dispatch must not accept a forged human marker on the next run.
+    deps.approvalRecords = () => [{ id: 'D-1', refs: [approvalRef(cards[0]!)], status: 'decided', choice: 'a', decidedBy: { kind: 'human' } }];
+    process.exitCode = 0;
+    await program.parseAsync(['node', 'elanous', 'release', 'critpath', '--version', '9.9.9', '--notes-file', notes, '--branch', 'release/9.9.9']);
+    expect(process.exitCode).toBe(CRITPATH_WAITING_EXIT);
+    expect(calls).toEqual(['resolve', 'prepare', 'card', 'resolve', 'prepare']);
   });
 });

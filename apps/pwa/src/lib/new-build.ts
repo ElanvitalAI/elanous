@@ -12,3 +12,27 @@ export function extractBuildId(html: string): string | null {
 export function isNewBuild(current: string | null, served: string | null): boolean {
   return current !== null && served !== null && current !== served;
 }
+
+export type ServedBuildProbe =
+  | { kind: 'served'; id: string | null }
+  | { kind: 'unavailable'; status: number }
+  | { kind: 'offline' };
+
+/**
+ * Ask the surface for the build it serves — through the page the tab itself was loaded from (`pagePath`), which every
+ * serving surface forwards (the bare handle host forwards only the entry documents, not `/app/`: PWA-NEWBUILD-BANNER-404).
+ * A non-OK answer means this surface has no version document to compare: the caller stops polling instead of retrying every
+ * two minutes into a 404.
+ */
+export async function probeServedBuild(
+  fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
+  pagePath: string,
+): Promise<ServedBuildProbe> {
+  try {
+    const res = await fetchImpl(pagePath, { cache: 'no-store' });
+    if (!res.ok) return { kind: 'unavailable', status: res.status };
+    return { kind: 'served', id: extractBuildId(await res.text()) };
+  } catch {
+    return { kind: 'offline' };
+  }
+}

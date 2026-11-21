@@ -236,6 +236,19 @@ export function getTuiOwnedSession(): TuiOwnedSession | null {
 // 재기동 «요청» — 사용자가 q 로 끄는 것은 재기동이 아니다(기본 동작 보존). 재기동은 누군가(H9 유휴
 // 재기동 방아쇠 등)가 «다시 뜨려고» TUI 를 닫을 때만 일어난다 — 그 쪽이 닫기 전에 이것을 부른다.
 let restartRequest: { readonly reason: string; readonly at: number; readonly requestId?: string } | null = null;
+const activeTuiReports = new Map<string, () => void>();
+let nextTuiForegroundSessionId: string | null | undefined;
+
+/** The Next TUI's own focused session; the host-wide active marker belongs to whichever tab wrote last. */
+export function setTuiForegroundSessionId(sessionId: string | null): void {
+  nextTuiForegroundSessionId = normalizeSessionId(sessionId);
+  claimTuiOwnedSession(nextTuiForegroundSessionId);
+}
+
+/** Retire the old owner before a replacement child starts on the same PTY. */
+export function stopTuiSelfReportForCurrentProcess(): void {
+  activeTuiReports.get(`tui:${process.pid}`)?.();
+}
 
 /** TUI 를 «다시 뜨려고» 닫는다고 적는다 — 종료 경계(`exitTuiRun`)가 한 번 읽고 지운다. */
 export function requestTuiSelfRestart(reason: string, at: number = Date.now(), meta?: { readonly requestId: string }): void {
@@ -448,7 +461,8 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   }
   const activeControlTarget = controlTarget;
   const readActiveSessionId: () => string | null = deps.readActiveSessionId
-    ?? (() => { try { return getActiveSessionId(); } catch { return null; } });
+    ?? (() => { if (nextTuiForegroundSessionId !== undefined) return nextTuiForegroundSessionId;
+      try { return getActiveSessionId(); } catch { return null; } });
   let stopRunState: () => void = () => {};
   // 행 등록을 갈아 끼운 호출자(시험)는 실 manifest 를 안 건드린다 — 기본 녹음기는 기본 행 등록과 짝일 때만.
   // TUI-H9: 그 기본 녹음기에 «사람 입력 없음»(마지막 사람 키 입력) ⊕ «지금 대화» 를 실 신호로 주입한다 —
@@ -646,6 +660,8 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   const stop = (): void => {
     if (stopped) return;
     stopped = true;
+    if (activeTuiReports.get(surfaceId) === stop) activeTuiReports.delete(surfaceId);
+    if (surfaceId === `tui:${process.pid}`) nextTuiForegroundSessionId = undefined;
     try { stopSource(); } catch { /* fail-soft — unregisters observer / clears tick timer */ }
     try { mirror?.stop(); } catch { /* fail-soft — restores stdout.write */ }
     try { stopHeartbeat(); } catch { /* fail-soft */ }
@@ -658,6 +674,7 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     try { stopControlPoller(); } catch { /* fail-soft */ }
     try { unregisterControlTarget(); } catch { /* fail-soft */ }
   };
+  activeTuiReports.set(surfaceId, stop);
   (deps.onExit ?? ((s) => process.on('exit', s)))(stop);
   return stop;
 }

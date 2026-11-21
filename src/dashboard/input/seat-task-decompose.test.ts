@@ -59,6 +59,17 @@ describe('decomposeRequests 단위', () => {
     expect(report.title).toBe('보고: PR 번호·head40 → OP');
   });
 
+  test('#121130 r2 (JUD #121493) — 원문의 검증 머리글 칸(header)이 그 요청의 모든 작업에 sourceHeader 로 보존된다', () => {
+    const header = { fromKind: 'agent', fromSeat: 'TC-H-CC-1', intent: 'decision', crownDirective: 'd-9' } as const;
+    const r = decomposeRequests([{ ...req('mail#1', '#5101 merge 시험 보고', 1), sender: 'OP', kind: 'note', header }]);
+    expect(r.tasks.length).toBeGreaterThan(0); // 출처: #121493 스코프-0 방지 — 작업 0건이면 칸 단언이 공허해진다
+    for (const task of r.tasks) expect(task.sourceHeader).toEqual(header);
+    // header 없는 요청(옛 칸 행)은 없는 그대로 — legacy sender/kind 폴백은 그대로 산다.
+    const legacy = decomposeRequests([{ ...req('mail#2', '#5102 merge 시험 보고', 1), sender: 'OP', kind: 'note' }]);
+    expect(legacy.tasks.length).toBeGreaterThan(0); // 출처: #121493 스코프-0 방지 — 옛 칸 폴백 비교도 0건이면 공허하다
+    for (const task of legacy.tasks) expect(task.sourceHeader).toBeUndefined();
+  });
+
   test('인터럽트 요청 urgent + reconcile 대상 notes', () => {
     const r = decomposeRequests([req('r', R3, 1, true)]);
     const prTask = r.tasks.find(t => (t.targets ?? []).includes('#38007'));

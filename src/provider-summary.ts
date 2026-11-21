@@ -107,6 +107,13 @@ function authDetailForDecision(
       ? llm.apiKey ? 'API key (config)' : 'API key (~/.cache/openrouter_api_key · env OPENROUTER_API_KEY)'
       : 'not configured — bash scripts/add-api-key.sh OPENROUTER_API_KEY';
   }
+  if (provider === 'timelyrouter' || provider === 'auto:timelyrouter') {
+    const configured = auth === 'apikey' && model !== '(configure-model)'
+      && (llm.baseUrl ? true : !llm.apiKey && !!(process.env.TIMELYROUTER_API_KEY?.trim() && process.env.TIMELYROUTER_BASE_URL?.trim()));
+    return configured
+      ? (llm.baseUrl ? 'API key + HTTPS endpoint (config)' : 'API key + HTTPS endpoint (TimelyRouter env)')
+      : 'not configured — TimelyRouter key, HTTPS endpoint, and model required';
+  }
   // GLM-NO-CREDENTIAL-FALLBACK (OP #28375 · 🩸 run-6c85c69f) — 종전엔 glm 칸이 없어 자격이 «있어도» 아래 일반 문면
   //   「no provider configured」가 찍혔고(자식 PTY 첫 줄), 부검이 그 줄을 «자격 결손» 원인으로 읽었다. 판정은 glm 직결이 서는 조건 그 함수다.
   if (provider === 'glm') {

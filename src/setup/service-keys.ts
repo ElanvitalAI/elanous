@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import { SERVICE_KEY_CATALOG } from './llm-env-detect.js';
+import { hasTimelyRouterCredential, timelyRouterBaseUrl } from '../llm/timelyrouter-credential.js';
 
 const SERVICE_KEY_ENV_NAMES = new Set(SERVICE_KEY_CATALOG
   .filter(item => item.kind === 'api-key')
@@ -133,12 +134,21 @@ export async function serviceKeyStatus(options: {
     return getSecretAsync(id);
   });
   return Promise.all(SERVICE_KEY_CATALOG.map(async item => {
-    const envSources = item.envNames.filter(name => Boolean(env[name]?.trim()));
-    const cacheSources = item.storeIds?.length
+    const envSources = item.id === 'timelyrouter'
+      ? (env.TIMELYROUTER_API_KEY?.trim() && env.TIMELYROUTER_BASE_URL?.trim() && env.TIMELYROUTER_MODEL?.trim() ? ['TIMELYROUTER_API_KEY'] : [])
+      : item.envNames.filter(name => Boolean(env[name]?.trim()));
+    let sourceCheckFailed = false;
+    let timelyCache = false;
+    if (item.id === 'timelyrouter') {
+      try { timelyCache = hasTimelyRouterCredential(cacheDir); }
+      catch { sourceCheckFailed = true; }
+    }
+    const cacheSources = item.id === 'timelyrouter'
+      ? (timelyCache ? ['cache:TIMELYROUTER_API_KEY'] : [])
+      : item.storeIds?.length
       ? [] // A cached LINEAR_API_KEY is not one of the runtime credential sources.
       : item.envNames.filter(name => Boolean(cachedValue(name, cacheDir))).map(name => `cache:${name}`);
     const secretSources: string[] = [];
-    let sourceCheckFailed = false;
     for (const id of item.storeIds ?? []) {
       try { if ((await getSecret(id))?.trim()) secretSources.push(id); }
       catch { sourceCheckFailed = true; }
@@ -244,6 +254,15 @@ export async function verifyServiceKey(id: string, key: string, options: VerifyS
       init = { method: 'GET', headers: { 'x-goog-api-key': key } };
       break;
     case 'opengateway': bearer('https://apis.opengateway.ai/v1/models'); break;
+    case 'timelyrouter': {
+      const baseUrl = options.baseUrl?.trim() || env.TIMELYROUTER_BASE_URL?.trim();
+      if (!baseUrl) return { result: 'unavailable' };
+      let endpoint: string;
+      try { endpoint = timelyRouterBaseUrl(baseUrl); } catch { return { result: 'unavailable' }; }
+      bearer(modelsUrl(endpoint, endpoint));
+      init!.redirect = 'manual';
+      break;
+    }
     case 'telegram-chat': {
       const bot = env.ELANOUS_TELEGRAM_BOT_TOKEN?.trim() || cachedValue('ELANOUS_TELEGRAM_BOT_TOKEN', options.cacheDir ?? (process.env.ELANOUS_KEY_CACHE_DIR?.trim() || join(homedir(), '.cache')));
       if (!bot) return { result: 'unsupported' };

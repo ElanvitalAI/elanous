@@ -234,7 +234,7 @@ export const TRAFFIC_PREP_HOLD_BUDGET_MS = 15 * 60_000;
 // Source: release-readiness.ts waitForGateImageT60 — the countdown re-evaluates every 30 seconds.
 export const TRAFFIC_PREP_HOLD_POLL_MS = 30_000;
 export function trafficPrepQuickpassHint(version: string): string {
-  return `QUICKPASS: graph path blocked — fix the hold or switch to \`eln release critpath --version ${version}\` (manual publish sheet)`;
+  return `QUICKPASS: graph path blocked for v${version} — OP explicitly runs \`eln release prepare --version ${version} --source <cut> --out <prepared>\`, verifies cut and notes, then \`eln release publish --dir <prepared> --notes-file <approved-notes> --yes\`; critpath cannot auto-publish without out-of-band proof`;
 }
 
 export interface TrafficPrepHold { code: typeof TRAFFIC_NOT_PREPPED; reason: TrafficPrepHoldReason; detail: string; receiptPath: string;

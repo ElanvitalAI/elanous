@@ -5,6 +5,7 @@ import { marketSecretLookup, requiredMarketSecret } from './market-secrets.js';
 import type { MarketSecretLookup } from './market-secrets.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { getElanousConfigDir } from '../../../elanous-config-dir.js';
 
 function configuredKisMode(): 'real' | 'vts' {
@@ -24,6 +25,21 @@ export interface KisOptions {
   readonly now?: () => Date;
   /** Configuration, not a credential. Use `vts` for the KIS mock-trading host. */
   readonly mode?: 'real' | 'vts';
+  /** Wait before the single retry of a KIS per-second rate-limit answer (default 1.1 s; tests pass 0). */
+  readonly rateLimitRetryMs?: number;
+}
+
+/** KIS «초당 거래건수 초과» message code (structured field, not message text). */
+const KIS_RATE_LIMIT_CODE = 'EGW00201';
+const KIS_RATE_LIMIT_RETRY_MS = 1_100;
+type KisTokenEntry = { token?: string; expiresAt: number; pending?: Promise<string> };
+/** Access tokens per fetcher → host·app key, process-wide (memory only, never logged or persisted). Production shares the
+ * global fetch, so the cache outlives the per-turn registry; a test's own fetcher gets its own cache. */
+const KIS_TOKENS = new WeakMap<object, Map<string, KisTokenEntry>>();
+function kisTokenCache(fetcher: object): Map<string, KisTokenEntry> {
+  let cache = KIS_TOKENS.get(fetcher);
+  if (!cache) KIS_TOKENS.set(fetcher, cache = new Map());
+  return cache;
 }
 
 /** Read-only KIS quotation endpoints. The user's app key and secret never enter graph input or result. */
@@ -40,25 +56,42 @@ export function createKisDeclarations(options: KisOptions = {}): readonly GraphC
   const base = (options.mode ?? configuredKisMode()) === 'vts'
     ? 'https://openapivts.koreainvestment.com:29443'
     : 'https://openapi.koreainvestment.com:9443';
-  let token: string | undefined;
-  let tokenExpiresAt = 0;
+  // g6 KIS-BURST: the registry is rebuilt per research turn and a Korean basket fires ~9 KIS calls in the same tick. Each
+  // used to issue its OWN token request (g5 demo: 4/9 calls failed in 61–65 ms → «수급 조회 불가»). One in-flight token
+  // request is shared per key·host, and a cached token outlives the per-turn registry.
   async function accessToken(appKey: string, appSecret: string): Promise<string> {
-    if (token && now().getTime() < tokenExpiresAt) return token;
-    const payload = await responseJson(fetcher, `${base}/oauth2/tokenP`, { method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ grant_type: 'client_credentials', appkey: appKey, appsecret: appSecret }) });
-    if (typeof payload.access_token !== 'string' || !payload.access_token) throw new Error('invalid_response');
-    token = payload.access_token;
-    tokenExpiresAt = now().getTime() + Math.max(0, number(payload.expires_in ?? 3600) - 60) * 1000;
-    return token;
+    // A rotated secret owns a different token even if the public app key and host stay the same.
+    const key = `${base}\u0000${appKey}\u0000${createHash('sha256').update(appSecret).digest('hex')}`;
+    const tokens = kisTokenCache(fetcher);
+    const cached = tokens.get(key);
+    if (cached?.token && now().getTime() < cached.expiresAt) return cached.token;
+    if (cached?.pending) return cached.pending;
+    const pending = (async () => {
+      const payload = await responseJson(fetcher, `${base}/oauth2/tokenP`, { method: 'POST', redirect: 'error',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'client_credentials', appkey: appKey, appsecret: appSecret }) });
+      if (typeof payload.access_token !== 'string' || !payload.access_token) throw new Error('invalid_response');
+      tokens.set(key, { token: payload.access_token,
+        expiresAt: now().getTime() + Math.max(0, number(payload.expires_in ?? 3600) - 60) * 1000 });
+      return payload.access_token;
+    })();
+    tokens.set(key, { expiresAt: 0, pending });
+    try { return await pending; }
+    catch (error) { if (tokens.get(key)?.pending === pending) tokens.delete(key); throw error; }
   }
   async function quotation(path: string, trId: string, params: URLSearchParams): Promise<Record<string, unknown>> {
     const { appKey, appSecret } = await credentials();
     const bearer = await accessToken(appKey, appSecret);
-    const data = await responseJson(fetcher, `${base}${path}?${params}`, {
+    const call = () => responseJson(fetcher, `${base}${path}?${params}`, { redirect: 'error',
       headers: { authorization: `Bearer ${bearer}`, appkey: appKey, appsecret: appSecret, tr_id: trId,
         'content-type': 'application/json' },
     });
+    let data = await call();
+    // KIS answers a per-second burst with rt_cd≠0 and msg_cd EGW00201; that call is retried once after a short wait.
+    if (data.rt_cd !== '0' && data.msg_cd === KIS_RATE_LIMIT_CODE) {
+      await new Promise((resolve) => setTimeout(resolve, options.rateLimitRetryMs ?? KIS_RATE_LIMIT_RETRY_MS));
+      data = await call();
+    }
     if (data.rt_cd !== '0') throw new Error('provider_failed');
     return data;
   }

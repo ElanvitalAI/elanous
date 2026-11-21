@@ -34,6 +34,7 @@ export const runShellRuntime: ToolRuntime<Record<string, unknown>, RunShellDispa
     // CAPSULE-A2 — past the 10s sync cap (turn.capsuleMode on) the call continues as a shell capsule.
     return dispatchRunShellCapsule(effectiveReq, {
       signal: ctx.signal,
+      sessionId: ctx.sessionId ?? ctx.parentSessionId,
       availableToolNames: ctx.agentHostTools?.map(tool => tool.name),
     });
   },

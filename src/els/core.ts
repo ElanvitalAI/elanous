@@ -24,6 +24,11 @@ export type QueueAudit = (result: 'queued' | 'delivering' | 'delivered' | 'deliv
 export interface ElsResult {
   readonly exitCode: 0 | 1 | 2;
   readonly message: string;
+  /** Client-observed transport status; answered does not imply the operation succeeded or was side-effect free. */
+  readonly transport?:
+    | { readonly outcome: 'answered' }
+    | { readonly outcome: 'not-sent'; readonly reason: 'path' | 'connect' | 'timeout' | 'disconnect' }
+    | { readonly outcome: 'unknown'; readonly reason: 'timeout' | 'disconnect' | 'malformed' };
   /** Accepted into an in-memory queue, not delivered; lost if the owner or pane exits. */
   readonly queued?: number;
 }
@@ -49,6 +54,8 @@ export interface ElsPty {
   lastOutputAt?(): number | undefined;
   /** The shell's process id (ELS-PANE-AGENT-DETECT reads its terminal's foreground group); absent = not known. */
   readonly pid?: number;
+  /** OS identity captured when the holder's PTY generation was bound. */
+  readonly processBinding?: { readonly pid: number; readonly generation: string; readonly start: string };
 }
 
 export interface ElsCoreDeps {
@@ -67,6 +74,8 @@ export interface ElsCoreDeps {
   readonly randomId?: (prefix: string) => string;
   /** Clock for the queue settle time (tests). */
   readonly now?: () => number;
+  /** Durable screen and identity archive; throws to leave the exited pane in the journal. */
+  readonly archiveExited?: (pane: Pane) => void;
 }
 
 export interface ElsNewInput {
@@ -76,6 +85,8 @@ export interface ElsNewInput {
   readonly title?: string;
   /** Requester's role threaded straight from the server (JUD #39071: direct argument — no queue). */
   readonly parent?: SpawnParent;
+  /** Server-verified creator, never sourced from request data. */
+  readonly ownerSeat?: string;
 }
 
 // 출처: ids carry 8 random hex digits (32 bits); retrying this many times on a collision is enough for any journal
@@ -100,6 +111,15 @@ const PLAIN_UNSAFE = /[\u0000-\u0008\u000a-\u001f\u007f]/;
 /** Control characters (ESC, CR, NL, …) would let the sender drive the terminal instead of typing text. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;   // C0 + DEL + C1 (0x9b is a one-byte CSI)
 export const clean = (value: string): string => value.replace(CONTROL, ' ').replace(/ {2,}/g, ' ').trim();
+/** Any control in a send-text payload can leave an approval key behind after cleaning. */
+const SEND_TEXT_CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+/** The choice row is pinned to the visible bottom; a long command may scroll its title out of view. */
+export const hitlApprovalPending = (screen: string): boolean => {
+  const bottom = screen.split('\n').slice(-8).join('').replace(/\s/g, '');
+  return /(?:EnterdefaultN|Enter기본N)/.test(bottom)
+    && /(?:yrun|yapprove|y실행|y승인)/.test(bottom)
+    && /(?:Escdeny|Esc거부)/.test(bottom);
+};
 
 // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — a terminal grid outside these bounds is a client bug, not a size.
 const MIN_COLS = 10;
@@ -108,6 +128,7 @@ const MIN_ROWS = 3;
 const MAX_ROWS = 200;
 // 출처: 내부 문서 `ELS-SIDETAB-SERVER` «attach» — one `input` chunk is a paste, not a file (the socket line cap is 1 MB).
 const MAX_INPUT_BYTES = 65_536;
+export const EXITED_PANE_RETENTION_MS = 30 * 60_000;
 export const DEFAULT_PANE_COLS = 80;
 export const DEFAULT_PANE_ROWS = 24;
 
@@ -117,13 +138,55 @@ export function createElsCore(deps: ElsCoreDeps) {
   const randomId = deps.randomId ?? ((prefix: string) => `${prefix}${randomBytes(4).toString('hex')}`);
   let journal: SpaceJournal = emptyJournal();
   const ptys = new Map<string, ElsPty>();
-  const builds = new Map<string, { sha: string; seen: number }>();
+  const builds = new Map<string, { sha: string; seen: number; version?: string; stamp?: string }>();
   const now = deps.now ?? Date.now;
   /** ELS-PANE-AGENT-DETECT: what each live pane runs in its foreground now (refreshed by the server). */
   const foregrounds = new Map<string, Foreground>();
   /** `do` lines waiting for a pane whose turn is running (memory only: a restart drops them). */
-  const queues = new Map<string, { from: string; text: string; typed?: boolean; audit?: QueueAudit }[]>();
+  const queues = new Map<string, { from: string; text: string; typed?: boolean; audit?: QueueAudit; validate?: () => Promise<boolean> }[]>();
   const lastDelivery = new Map<string, number>();
+  const rawInputVersion = new Map<string, number>();
+  // A screen can change while the final authorization performs asynchronous OS checks.
+  const finalAuthorization = async (pty: ElsPty, validate?: () => Promise<boolean>) => {
+    let changed = false;
+    let subscription: { dispose(): void } | undefined;
+    try {
+      subscription = pty.onOutput?.(() => { changed = true; });
+      const allowed = !validate || await validate().catch(() => false);
+      return { allowed, changed };
+    } catch { return { allowed: false, changed: true }; }
+    finally { subscription?.dispose(); }
+  };
+
+  const tuiNeedsPaste = (pane: Pane, pty: ElsPty, screen?: string): boolean =>
+    pty.bracketedPasteEnabled?.() !== true && (
+      foregrounds.get(pane.id)?.kind === 'eln'
+      || pane.command.some((part, at) => part === '--tui' && pane.command[at + 1] === 'next')
+      || screen?.split('\n').slice(0, 4).some(line => line.trim() === 'elanous') === true
+    );
+  const machineInputRefusal = async (pane: Pane, pty: ElsPty, refuseBusy = false): Promise<string | undefined> => {
+    try {
+      const screen = await pty.renderScreen();
+      if (hitlApprovalPending(screen)) return 'HITL approval pending; use an authenticated human attach key';
+      if (tuiNeedsPaste(pane, pty, screen)) return 'TUI paste mode not confirmed; machine input denied';
+      if (refuseBusy && turnStarted(screen)) return 'turn running; use the queued seat input path';
+      return undefined;
+    }
+    catch { return 'cannot inspect the pane before machine input'; }
+  };
+  // A paste is one semantic key in Next TUI. The approval handler ignores paste keys, even if
+  // the panel opens between our screen inspection and the PTY write. A following Enter is safe:
+  // on an approval panel it chooses the default N, while at the composer it submits the text.
+  const machinePaste = (pane: Pane, pty: ElsPty, text: string, enter: boolean): string => {
+    const pasteMode = pty.bracketedPasteEnabled?.() === true;
+    // A shell can turn into Next TUI after the last screen inspection. Without a paste
+    // envelope, an approval letter would become a raw key at the new panel.
+    if (!pasteMode && (tuiNeedsPaste(pane, pty) || /[yY]/.test(text))) throw new Error('safe paste mode not confirmed for approval letter; machine input denied');
+    return pasteMode && text
+      ? `\x1b[200~${text}\x1b[201~${enter ? '\r' : ''}`
+      : `${text}${enter ? '\r' : ''}`;
+  };
+
   /** ELS-TAB-STATE-BADGE: when this server first knew each pane — the «last event» of a pane that never printed or got a `do`. */
   const firstSeen = new Map<string, number>();
   /** The terminal size an attached client last asked for (default 80x24). */
@@ -133,8 +196,8 @@ export function createElsCore(deps: ElsCoreDeps) {
   /** One `do` at a time per pane: the busy check and the delivery (or enqueue) are one step, in arrival order. */
   const doLocks = new Map<string, Promise<unknown>>();
   const serialized = <T>(paneId: string, work: () => Promise<T>): Promise<T> => {
-    const previous = doLocks.get(paneId) ?? Promise.resolve();
-    const run = previous.then(work, work);
+    const previous = doLocks.get(paneId);
+    const run = previous ? previous.then(work, work) : work();
     const tail = run.catch(() => undefined);
     doLocks.set(paneId, tail);
     void tail.then(() => { if (doLocks.get(paneId) === tail) doLocks.delete(paneId); });
@@ -186,7 +249,7 @@ export function createElsCore(deps: ElsCoreDeps) {
     discardQueue(paneId, 'pane exited');
     const pane = journal.panes.find((row) => row.id === paneId);
     if (!pane || pane.state === 'exited' || pane.ptyId !== ptyId) return false;
-    const saveError = persist(patchPane(journal, paneId, { state: 'exited', ptyId: '' }));
+    const saveError = persist(patchPane(journal, paneId, { state: 'exited', ptyId: '', exitedAt: now() }));
     if (saveError) process.stderr.write(`els: exit of ${paneId} not saved yet: ${saveError}\n`);
     return true;
   };
@@ -211,7 +274,7 @@ export function createElsCore(deps: ElsCoreDeps) {
   };
 
   const deliver = (pane: Pane, pty: ElsPty, from: string, text: string): ElsResult => {
-    try { pty.write(`⇢ ${from} · ${text}\r`); }
+    try { pty.write(machinePaste(pane, pty, `⇢ ${from} · ${text}`, true)); }
     catch (error) { return { exitCode: 1, message: `els do: ${message(error)}` }; }
     lastDelivery.set(pane.id, now());
     const saveError = patchLive(pane.id, pty.id, { state: 'working' });
@@ -220,7 +283,7 @@ export function createElsCore(deps: ElsCoreDeps) {
   /** OP #17 OP-DIRECT-SEAT-INPUT: a typed line without the «⇢» marker — the pane sees it as if the person at
    *  the keyboard typed it and pressed Enter. Same one-line, no-control-characters rules as `do`. */
   const deliverTyped = (pane: Pane, pty: ElsPty, text: string): ElsResult => {
-    try { pty.write(`${text}\r`); }
+    try { pty.write(machinePaste(pane, pty, text, true)); }
     catch (error) { return { exitCode: 1, message: `els input: ${message(error)}` }; }
     lastDelivery.set(pane.id, now());
     const saveError = patchLive(pane.id, pty.id, { state: 'working' });
@@ -232,17 +295,46 @@ export function createElsCore(deps: ElsCoreDeps) {
     if (draining.has(paneId)) return;
     draining.add(paneId);
     try {
+      await serialized(paneId, async () => {
       const pane = journal.panes.find((row) => row.id === paneId);
       const pty = pane ? livePty(pane) : undefined;
       if (!pane || !pty) { discardQueue(paneId, 'pane unavailable'); return; }
       if (now() - (lastDelivery.get(paneId) ?? -Infinity) < QUEUE_SETTLE_MS) return;
+      const inputVersion = rawInputVersion.get(paneId) ?? 0;
       let busy: boolean;
-      try { busy = BUSY_SCREEN.test(await pty.renderScreen()); } catch { return; }
+      try { const screen = await pty.renderScreen(); busy = BUSY_SCREEN.test(screen) || hitlApprovalPending(screen); } catch { return; }
+      if ((rawInputVersion.get(paneId) ?? 0) !== inputVersion) return;
       const queue = queues.get(paneId);
       if (busy || !queue || !livePty(pane)) return;
       const [next, ...rest] = queue;
       if (rest.length) queues.set(paneId, rest); else queues.delete(paneId);
       if (next) {
+        if (next.validate && !(await next.validate().catch(() => false))) {
+          next.audit?.('discarded', 'authorization changed');
+          return;
+        }
+        // Authorization can await OS lookups while the target starts a turn on its own.
+        // A stale idle snapshot must never authorize delivery; failed rendering defers too.
+        let stillIdle = false;
+        try { const screen = await pty.renderScreen(); stillIdle = !BUSY_SCREEN.test(screen) && !hitlApprovalPending(screen); } catch { /* defer */ }
+        const current = journal.panes.find((row) => row.id === paneId);
+        if (!current || livePty(current) !== pty) {
+          next.audit?.('discarded', 'pane ended before delivery');
+          return;
+        }
+        if (!stillIdle || (rawInputVersion.get(paneId) ?? 0) !== inputVersion) {
+          queues.set(paneId, [next, ...(queues.get(paneId) ?? [])]);
+          return;
+        }
+        const final = await finalAuthorization(pty, next.validate);
+        if (!final.allowed) {
+          next.audit?.('discarded', 'authorization changed');
+          return;
+        }
+        if (final.changed || livePty(current) !== pty || (rawInputVersion.get(paneId) ?? 0) !== inputVersion) {
+          queues.set(paneId, [next, ...(queues.get(paneId) ?? [])]);
+          return;
+        }
         if (next.audit && !next.audit('delivering')) {
           next.audit('discarded', 'delivery intent audit failed');
           return;
@@ -251,6 +343,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         next.audit?.(result.exitCode === 0 ? 'delivered' : 'delivery-failed', result.exitCode === 0 ? undefined : 'pty write failed');
         if (result.exitCode !== 0) process.stderr.write(`${result.message}\n`);
       }
+      });
     } finally { draining.delete(paneId); }
   };
 
@@ -311,9 +404,11 @@ export function createElsCore(deps: ElsCoreDeps) {
         });
         return { ...pane, ptyId: adoptedId, state: pane.state };
       }) };
+      const aged: SpaceJournal = { ...restarted, panes: restarted.panes.map((pane) =>
+        pane.state === 'exited' && pane.exitedAt === undefined ? { ...pane, exitedAt: now() } : pane) };
       try {
-        if (gone.size > 0 || restarted.panes.some((pane, index) => pane !== kept.panes[index])) commit(restarted);
-        else journal = restarted;
+        if (gone.size > 0 || aged.panes.some((pane, index) => pane !== kept.panes[index])) commit(aged);
+        else journal = aged;
       } catch (error) {
         return { exitCode: 1, message: `els serve: cannot save the journal: ${message(error)}` };
       }
@@ -322,6 +417,27 @@ export function createElsCore(deps: ElsCoreDeps) {
         try { deps.consumeScreenSnapshot?.(paneId); } catch { /* a leftover file is harmless; the pane is exited */ }
       }
       return undefined;
+    },
+
+    /** Archive the original saved screen before removing an aged exited pane. Live panes are never candidates. */
+    reapExited(): number {
+      if (!deps.archiveExited) return 0;
+      let reaped = 0;
+      for (const pane of [...journal.panes]) {
+        if (pane.state !== 'exited' || pane.exitedAt === undefined || ptys.has(pane.id)
+          || now() - pane.exitedAt < EXITED_PANE_RETENTION_MS) continue;
+        try {
+          deps.archiveExited(pane);
+          const panes = journal.panes.filter((row) => row.id !== pane.id);
+          const tabs = panes.some((row) => row.tabId === pane.tabId)
+            ? journal.tabs : journal.tabs.filter((row) => row.id !== pane.tabId);
+          commit({ ...journal, panes, tabs });
+          reaped += 1;
+        } catch (error) {
+          process.stderr.write(`els reap: ${pane.id} kept: ${message(error)}\n`);
+        }
+      }
+      return reaped;
     },
 
     newPane(input: ElsNewInput): ElsResult {
@@ -345,7 +461,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       try {
         const tab: Tab = { id: tabId, workspaceId: ws.id, label, focusPaneId: paneId };
         const pane: Pane = { id: paneId, tabId, kind: 'pty', title: label, cwd: input.cwd, command: input.command,
-          state: 'working', restore: 'cwd', ptyId: pty.id, scrollback: '' };
+          state: 'working', restore: 'cwd', ptyId: pty.id, scrollback: '', ...(input.ownerSeat ? { ownerSeat: input.ownerSeat } : {}) };
         address = paneAddress(ws, tab, pane);
         firstSeen.set(pane.id, now());
         commit(addPane(addTab(existing ? journal : upsertWorkspace(journal, ws), tab), pane));
@@ -363,10 +479,12 @@ export function createElsCore(deps: ElsCoreDeps) {
       return { exitCode: 0, message: JSON.stringify({ address, pane: paneId, ptyId, cwd: input.cwd }) };
     },
 
-    reportBuild(paneId: string, sha: string): ElsResult {
+    reportBuild(paneId: string, sha: string, version?: string, stamp?: string): ElsResult {
       const pane = journal.panes.find((row) => row.id === paneId);
       if (!pane || !livePty(pane) || !/^[a-f0-9]{40}$/i.test(sha)) return { exitCode: 1, message: 'els build: invalid pane or sha' };
-      builds.set(paneId, { sha: sha.toLowerCase(), seen: now() });
+      const label = typeof version === 'string' && version.length <= 64 && /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) ? version : undefined;
+      const timestamp = typeof stamp === 'string' && /^\d{6}_\d{4}$/.test(stamp) ? stamp : undefined;
+      builds.set(paneId, { sha: sha.toLowerCase(), seen: now(), version: label, stamp: timestamp });
       return { exitCode: 0, message: 'els build: recorded' };
     },
 
@@ -394,7 +512,9 @@ export function createElsCore(deps: ElsCoreDeps) {
         const report = builds.get(pane.id);
         const sha = live && report && now() - report.seen < 90_000 ? report.sha : undefined;
         const build = { sha: sha ?? null, source: sha ? 'self-reported' : 'unknown', trusted: false, desired: desired ?? null,
-          age: buildAge(sha, desired, gitAncestor) };
+          age: buildAge(sha, desired, gitAncestor),
+          ...(sha && report?.version ? { version: report.version } : {}),
+          ...(sha && report?.stamp ? { stamp: report.stamp } : {}) };
         const seat = seatOf(pane.cwd);
         const unreadMail = seat !== null ? badges.get(seat) ?? null : null;
         // ELS-TAB-STATE-BADGE: the badge is the contract state; a working pane with no output, `do` or first sight for the
@@ -410,7 +530,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         const badge = tabBadge({ state: listedState, lastEventAtMs }, now());
         return [{ build, lastEventAtMs, badge: badge.state, badgeLabel: badge.label, stalled: badge.stalled, address: paneAddress(ws, tab, pane), workspace: ws.name, tab: tab.id, pane: pane.id, title: pane.title, kind: pane.kind,
           cwd: pane.cwd, command: pane.command, state: pane.state === 'exited' ? 'exited' : live ? pane.state : 'idle',
-          ptyId: live ? pane.ptyId : '', restore: pane.restore, seat, unreadMail,
+          ptyId: live ? pane.ptyId : '', ...(live?.pid ? { pid: live.pid } : {}), restore: pane.restore, seat, unreadMail,
           ...(live && foregrounds.has(pane.id) ? { kind: foregrounds.get(pane.id)!.kind, fgCommand: foregrounds.get(pane.id)!.command } : {}) }];
       });
       return { exitCode: 0, message: JSON.stringify({ workspaces: journal.workspaces, tabs: journal.tabs, panes }, null, 2) };
@@ -477,7 +597,8 @@ export function createElsCore(deps: ElsCoreDeps) {
 
     /** ELS-DOOR-STRUCT-OPS: close every pane of a tab, then the tab itself. Same shape as `close` for a pane. */
     closeTab(ref: string): ElsResult {
-      const tab = journal.tabs.find((row) => row.id === ref || row.label === ref);
+      if (typeof ref !== 'string' || !ref) return { exitCode: 2, message: 'els tab close: tab id required' };
+      const tab = journal.tabs.find((row) => row.id === ref);
       if (!tab) return { exitCode: 1, message: `els close: unknown tab ${ref}` };
       const panes = journal.panes.filter((row) => row.tabId === tab.id);
       for (const pane of panes) {
@@ -501,6 +622,7 @@ export function createElsCore(deps: ElsCoreDeps) {
       const pty = livePty(hit.pane);
       if (!pty) return { exitCode: 1, message: `els input: ${hit.pane.id} is not running` };
       try { pty.write(bytes); } catch (error) { return { exitCode: 1, message: `els input: ${message(error)}` }; }
+      rawInputVersion.set(hit.pane.id, (rawInputVersion.get(hit.pane.id) ?? 0) + 1);
       lastDelivery.set(hit.pane.id, now());
       return { exitCode: 0, message: '' };
     },
@@ -617,6 +739,18 @@ export function createElsCore(deps: ElsCoreDeps) {
       return { exitCode: 0, message: JSON.stringify(fg ? { ...status, kind: fg.kind, pid: fg.pid } : status) };
     },
 
+    /** A live holder binding for the server-issued pane identity, never a client-supplied PID. */
+    paneProcessBinding(paneId: string): { readonly pid: number; readonly generation: string; readonly start: string } | undefined {
+      const pane = journal.panes.find(p => p.id === paneId);
+      return pane ? livePty(pane)?.processBinding : undefined;
+    },
+    /** Live server-owned seat bindings, excluding panes whose process generation is not verified. */
+    seatBindings(): { pane: string; seat: string; pid: number; generation: string; start: string }[] {
+      return journal.panes.flatMap(pane => {
+        const binding = livePty(pane)?.processBinding;
+        return pane.ownerSeat && binding ? [{ pane: pane.id, seat: pane.ownerSeat, ...binding }] : [];
+      });
+    },
     /** ELS-PANE-AGENT-DETECT: the live panes with a known shell pid (what the server probes). */
     shellPids(): { readonly pane: string; readonly pid: number }[] {
       return journal.panes.flatMap((pane) => { const pid = livePty(pane)?.pid; return pid ? [{ pane: pane.id, pid }] : []; });
@@ -643,6 +777,8 @@ export function createElsCore(deps: ElsCoreDeps) {
         let before: string;
         try { before = await pty.renderScreen(); }
         catch (error) { return { exitCode: 1, message: `els send: cannot inspect pane, not sent: ${message(error)}` }; }
+        if (hitlApprovalPending(before)) return { exitCode: 1, message: 'els send: HITL approval pending; authenticated human attach key required' };
+        if (tuiNeedsPaste(hit.pane, pty, before)) return { exitCode: 1, message: 'els send: TUI paste mode not confirmed; not sent' };
         if (turnStarted(before)) return { exitCode: 1, message: `els send: ${hit.pane.id} is already running, not sent` };
         if (requireEmpty) {
           const view = paneStatus({ pane: hit.pane.id, alive: true, exited: false, screen: before, lastOutputAt: pty.lastOutputAt?.(), now: now() });
@@ -655,6 +791,7 @@ export function createElsCore(deps: ElsCoreDeps) {
         // would submit more than one command and a control byte (Ctrl-C/D …) would be a signal. Plain mode takes one line
         // only (a trailing line break is the Enter it adds anyway); anything else is refused before a byte is written.
         const line = text.replace(/[\r\n]+$/, '');
+        if (!pasteMode && /[yY]/.test(line)) return { exitCode: 1, message: 'els send: safe paste mode not confirmed for approval letter; not sent' };
         if (!pasteMode && PLAIN_UNSAFE.test(line)) return { exitCode: 2, message: 'els send: plain 모드는 한 줄 텍스트만 — 줄바꿈·제어 문자가 있어 보내지 않음 (bracketed paste 를 켠 pane 에선 여러 줄 가능)' };
         const submitted = pasteMode ? `\x1b[200~${text}\x1b[201~\r` : `${line}\r`;
         try { await pty.writeAll(submitted); }
@@ -683,18 +820,51 @@ export function createElsCore(deps: ElsCoreDeps) {
     },
 
     async send(ref: string, rawText: string): Promise<ElsResult> {
-      // #38608 REVIEW must ② — `send` types machine-composed TEXT into the pane: clean() drops every control
-      // byte, so a caller cannot press Enter, inject an escape or hit ctrl-c through it. The raw person path
-      // is `input` (attach, `els pane send-keys`/`run`), which no HTTP door reaches.
-      const text = clean(rawText);
+      if (typeof rawText !== 'string' || SEND_TEXT_CONTROL.test(rawText)) return { exitCode: 2, message: 'els send: control byte refused; nothing sent' };
       const hit = resolve(ref);
       if (!hit) return { exitCode: 1, message: `els send: unknown pane ${ref}` };
-      const pty = livePty(hit.pane);
-      if (!pty) return { exitCode: 1, message: `els send: pane ${hit.pane.id} has no live pty (restart restores cwd only)` };
-      try { pty.write(text); }
-      catch (error) { return { exitCode: 1, message: `els send: ${message(error)}` }; }
-      const saveError = patchLive(hit.pane.id, pty.id, { state: 'working' });
-      return { exitCode: 0, message: `els send: ${hit.pane.id} ${text.length} chars${saveError ? ` (state not saved: ${saveError})` : ''}` };
+      return serialized(hit.pane.id, async () => {
+        const current = resolve(hit.pane.id);
+        const pty = current && livePty(current.pane);
+        if (!current || !pty) return { exitCode: 1, message: `els send: pane ${hit.pane.id} has no live pty (restart restores cwd only)` };
+        const refusal = await machineInputRefusal(current.pane, pty, true);
+        if (refusal) return { exitCode: 1, message: `els send: ${refusal}; nothing sent` };
+        if (livePty(current.pane) !== pty) return { exitCode: 1, message: 'els send: pane changed; nothing sent' };
+        const text = clean(rawText);
+        try { pty.write(machinePaste(current.pane, pty, text, false)); }
+        catch (error) { return { exitCode: 1, message: `els send: ${message(error)}` }; }
+        const saveError = patchLive(current.pane.id, pty.id, { state: 'working' });
+        return { exitCode: 0, message: `els send: ${current.pane.id} ${text.length} chars${saveError ? ` (state not saved: ${saveError})` : ''}` };
+      });
+    },
+
+    /** One-shot socket input is machine input. Only the authenticated attach stream calls raw input(). */
+    async machineInput(ref: string, bytes: string, allowBusyInterrupt = false): Promise<ElsResult> {
+      if (typeof bytes !== 'string') return { exitCode: 2, message: 'els input: bytes must be a string' };
+      const hit = resolve(ref);
+      if (!hit) return { exitCode: 1, message: `els input: unknown pane ${ref}` };
+      return serialized(hit.pane.id, async () => {
+        const current = resolve(hit.pane.id);
+        const pty = current && livePty(current.pane);
+        if (!current || !pty) return { exitCode: 1, message: `els input: pane ${hit.pane.id} is not running` };
+        const refusal = await machineInputRefusal(current.pane, pty, !allowBusyInterrupt);
+        if (refusal) return { exitCode: 1, message: `els input: ${refusal}; nothing sent` };
+        if (allowBusyInterrupt && bytes === '\x1b') return this.input(current.pane.id, bytes);
+        const pasteMode = pty.bracketedPasteEnabled?.() === true;
+        if (pasteMode) {
+          const enter = bytes.endsWith('\r');
+          const text = enter ? bytes.slice(0, -1) : bytes;
+          if (text && !SEND_TEXT_CONTROL.test(text)) return this.input(current.pane.id, machinePaste(current.pane, pty, text, enter));
+          // Pure editing keys may still be sent, but raw control mixtures and approval letters
+          // cannot bypass the send-keys allowlist by addressing the socket directly.
+          if (/^(?:\r|\t|\x7f|\x1b\[(?:[ABCDHFZ]|3~|5~|6~))+$/.test(bytes)) return this.input(current.pane.id, bytes);
+          return { exitCode: 2, message: 'els input: unsupported control byte on TUI machine path; not sent' };
+        }
+        const plain = /[\r\n]$/.test(bytes) ? bytes.slice(0, -1) : bytes;
+        if (!SEND_TEXT_CONTROL.test(plain) && !/[yY]/.test(plain)) return this.input(current.pane.id, bytes);
+        if (/^(?:\r|\n|\t|\x7f|\x1b\[(?:[ABCDHFZ]|3~|5~|6~))+$/.test(bytes)) return this.input(current.pane.id, bytes);
+        return { exitCode: 2, message: 'els input: control sequence or approval letter needs safe paste mode; not sent' };
+      });
     },
 
     /**
@@ -703,7 +873,7 @@ export function createElsCore(deps: ElsCoreDeps) {
      * in order — it never overwrites a running turn — and `drain` delivers it when the screen is idle.
      * If the busy check itself fails the line is NOT sent (fail closed).
      */
-    async do(ref: string, rawText: string, rawFrom: string): Promise<ElsResult> {
+    async do(ref: string, rawText: string, rawFrom: string, audit?: QueueAudit, validate?: () => Promise<boolean>): Promise<ElsResult> {
       const text = clean(rawText);
       const from = clean(rawFrom).slice(0, 64) || 'unknown';
       if (!text) return { exitCode: 2, message: 'els do: text is empty' };
@@ -716,6 +886,10 @@ export function createElsCore(deps: ElsCoreDeps) {
         if (!hit) return { exitCode: 1, message: `els do: unknown pane ${ref}` };
         const pty = livePty(hit.pane);
         if (!pty) return { exitCode: 1, message: `els do: pane ${hit.pane.id} has no live pty (restart restores cwd only)` };
+        const approvalRefusal = await machineInputRefusal(hit.pane, pty);
+        if (approvalRefusal) return { exitCode: 1, message: `els do: ${approvalRefusal}; not sent` };
+        // A raw attach input can arrive while screen inspection or authorization awaits.
+        const inputVersion = rawInputVersion.get(hit.pane.id) ?? 0;
         // Waiting lines, or a line delivered a moment ago (the screen may not show «Turn running» yet), mean busy.
         let busy = queues.has(hit.pane.id) || now() - (lastDelivery.get(hit.pane.id) ?? -Infinity) < QUEUE_SETTLE_MS;
         if (!busy) {
@@ -727,16 +901,43 @@ export function createElsCore(deps: ElsCoreDeps) {
           const queue = queues.get(hit.pane.id) ?? [];
           if (!livePty(hit.pane)) return { exitCode: 1, message: `els do: pane ${hit.pane.id} ended before the line was queued` };
           if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: `els do: ${hit.pane.id} already has ${MAX_QUEUE} lines waiting, not queued` };
-          queues.set(hit.pane.id, [...queue, { from, text }]);
-          return { exitCode: 0, message: `els do: queued ${queue.length + 1} for ${hit.pane.id} (turn running)` };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els do: not queued (audit not writable)' };
+          queues.set(hit.pane.id, [...queue, { from, text, audit, validate }]);
+          return { exitCode: 0, queued: queue.length + 1, message: `els do: queued ${queue.length + 1} for ${hit.pane.id} (turn running)` };
         }
         // Idle: a queue may have appeared while the screen was rendering (a drain cannot, but stay safe) — then go behind it.
         if (queues.has(hit.pane.id)) {
-          queues.set(hit.pane.id, [...queues.get(hit.pane.id)!, { from, text }]);
-          return { exitCode: 0, message: `els do: queued ${queues.get(hit.pane.id)!.length} for ${hit.pane.id}` };
+          const queue = queues.get(hit.pane.id)!;
+          if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: `els do: ${hit.pane.id} already has ${MAX_QUEUE} lines waiting, not queued` };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els do: not queued (audit not writable)' };
+          queues.set(hit.pane.id, [...queue, { from, text, audit, validate }]);
+          return { exitCode: 0, queued: queue.length + 1, message: `els do: queued ${queue.length + 1} for ${hit.pane.id}` };
         }
-        if (!livePty(hit.pane)) return { exitCode: 1, message: `els do: pane ${hit.pane.id} ended before the line was sent` };
-        return deliver(hit.pane, pty, from, text);
+        if (validate && !(await validate().catch(() => false))) return { exitCode: 1, message: 'els do: authorization changed, not sent' };
+        let stillIdle = false;
+        try { stillIdle = !BUSY_SCREEN.test(await pty.renderScreen()); } catch { /* defer */ }
+        const current = journal.panes.find((row) => row.id === hit.pane.id);
+        if (!current || livePty(current) !== pty) return { exitCode: 1, message: `els do: pane ${hit.pane.id} ended before the line was sent` };
+        if (!stillIdle || (rawInputVersion.get(hit.pane.id) ?? 0) !== inputVersion) {
+          const queue = queues.get(hit.pane.id) ?? [];
+          if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: `els do: ${hit.pane.id} already has ${MAX_QUEUE} lines waiting, not queued` };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els do: not queued (audit not writable)' };
+          queues.set(hit.pane.id, [...queue, { from, text, audit, validate }]);
+          return { exitCode: 0, queued: queue.length + 1, message: `els do: queued ${queue.length + 1} for ${hit.pane.id} (input changed)` };
+        }
+        const final = await finalAuthorization(pty, validate);
+        if (!final.allowed) return { exitCode: 1, message: 'els do: authorization changed, not sent' };
+        const finalRefusal = await machineInputRefusal(current, pty);
+        if (finalRefusal) return { exitCode: 1, message: `els do: ${finalRefusal}; not sent` };
+        if (livePty(current) !== pty) return { exitCode: 1, message: 'els do: pane changed, not sent' };
+        if (final.changed || (rawInputVersion.get(hit.pane.id) ?? 0) !== inputVersion) {
+          const queue = queues.get(hit.pane.id) ?? [];
+          if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: 'els do: queue full, not sent' };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els do: not queued (audit not writable)' };
+          queues.set(hit.pane.id, [...queue, { from, text, audit, validate }]);
+          return { exitCode: 0, queued: queue.length + 1, message: 'els do: queued after target changed' };
+        }
+        return deliver(current, pty, from, text);
       });
     },
 
@@ -745,7 +946,7 @@ export function createElsCore(deps: ElsCoreDeps) {
      * Enter (OP #17 OP-DIRECT-SEAT-INPUT; the control door lets only OP and RES-INFRA reach this). Same rules as
      * `do`: one line, no control characters, queued while the pane's turn runs, fail closed.
      */
-    async inputLine(ref: string, rawText: string, rawFrom: string, audit?: QueueAudit): Promise<ElsResult> {
+    async inputLine(ref: string, rawText: string, rawFrom: string, audit?: QueueAudit, validate?: () => Promise<boolean>): Promise<ElsResult> {
       const text = clean(rawText);
       const from = clean(rawFrom).slice(0, 64) || 'unknown';
       if (!text) return { exitCode: 2, message: 'els input: text is empty' };
@@ -757,6 +958,9 @@ export function createElsCore(deps: ElsCoreDeps) {
         if (!hit) return { exitCode: 1, message: `els input: unknown pane ${ref}` };
         const pty = livePty(hit.pane);
         if (!pty) return { exitCode: 1, message: `els input: pane ${hit.pane.id} has no live pty (restart restores cwd only)` };
+        const approvalRefusal = await machineInputRefusal(hit.pane, pty);
+        if (approvalRefusal) return { exitCode: 1, message: `els input: ${approvalRefusal}; nothing sent` };
+        const inputVersion = rawInputVersion.get(hit.pane.id) ?? 0;
         let busy = queues.has(hit.pane.id) || now() - (lastDelivery.get(hit.pane.id) ?? -Infinity) < QUEUE_SETTLE_MS;
         if (!busy) {
           try { busy = BUSY_SCREEN.test(await pty.renderScreen()); }
@@ -770,7 +974,7 @@ export function createElsCore(deps: ElsCoreDeps) {
           if (audit && !audit('queued')) return { exitCode: 1, message: 'els input: not queued (audit not writable)' };
           const at = queue.findIndex((item) => !item.typed);
           const index = at < 0 ? queue.length : at;
-          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit }, ...queue.slice(index)]);
+          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit, validate }, ...queue.slice(index)]);
           return { exitCode: 0, queued: queue.length + 1, message: `els input: queued ${queue.length + 1} for ${hit.pane.id} (turn running; memory only, not yet delivered)` };
         }
         // Idle: a queue may have appeared while the screen was rendering (a drain cannot, but stay safe) — then go behind it.
@@ -780,11 +984,38 @@ export function createElsCore(deps: ElsCoreDeps) {
           if (audit && !audit('queued')) return { exitCode: 1, message: 'els input: not queued (audit not writable)' };
           const at = queue.findIndex((item) => !item.typed);
           const index = at < 0 ? queue.length : at;
-          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit }, ...queue.slice(index)]);
+          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit, validate }, ...queue.slice(index)]);
           return { exitCode: 0, queued: queues.get(hit.pane.id)!.length, message: `els input: queued ${queues.get(hit.pane.id)!.length} for ${hit.pane.id} (memory only, not yet delivered)` };
         }
-        if (!livePty(hit.pane)) return { exitCode: 1, message: `els input: pane ${hit.pane.id} ended before the line was sent` };
-        return deliverTyped(hit.pane, pty, text);
+        if (validate && !(await validate().catch(() => false))) return { exitCode: 1, message: 'els input: authorization changed, not sent' };
+        let stillIdle = false;
+        try { stillIdle = !BUSY_SCREEN.test(await pty.renderScreen()); } catch { /* defer */ }
+        const current = journal.panes.find((row) => row.id === hit.pane.id);
+        if (!current || livePty(current) !== pty) return { exitCode: 1, message: `els input: pane ${hit.pane.id} ended before the line was sent` };
+        if (!stillIdle || (rawInputVersion.get(hit.pane.id) ?? 0) !== inputVersion) {
+          const queue = queues.get(hit.pane.id) ?? [];
+          if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: `els input: ${hit.pane.id} already has ${MAX_QUEUE} lines waiting, not queued` };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els input: not queued (audit not writable)' };
+          const at = queue.findIndex(item => !item.typed);
+          const index = at < 0 ? queue.length : at;
+          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit, validate }, ...queue.slice(index)]);
+          return { exitCode: 0, queued: queue.length + 1, message: `els input: queued ${queue.length + 1} for ${hit.pane.id} (input changed; memory only, not yet delivered)` };
+        }
+        const final = await finalAuthorization(pty, validate);
+        if (!final.allowed) return { exitCode: 1, message: 'els input: authorization changed, not sent' };
+        const finalRefusal = await machineInputRefusal(current, pty);
+        if (finalRefusal) return { exitCode: 1, message: `els input: ${finalRefusal}; nothing sent` };
+        if (livePty(current) !== pty) return { exitCode: 1, message: 'els input: pane changed, not sent' };
+        if (final.changed || (rawInputVersion.get(hit.pane.id) ?? 0) !== inputVersion) {
+          const queue = queues.get(hit.pane.id) ?? [];
+          if (queue.length >= MAX_QUEUE) return { exitCode: 1, message: 'els input: queue full, not sent' };
+          if (audit && !audit('queued')) return { exitCode: 1, message: 'els input: not queued (audit not writable)' };
+          const at = queue.findIndex(item => !item.typed);
+          const index = at < 0 ? queue.length : at;
+          queues.set(hit.pane.id, [...queue.slice(0, index), { from, text, typed: true, audit, validate }, ...queue.slice(index)]);
+          return { exitCode: 0, queued: queue.length + 1, message: 'els input: queued after target changed' };
+        }
+        return deliverTyped(current, pty, text);
       });
     },
 

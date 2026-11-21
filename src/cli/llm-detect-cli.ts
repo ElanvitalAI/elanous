@@ -205,4 +205,21 @@ export function registerLlmDetectCommand(program: Command): void {
       });
       if (!result.ok) process.exitCode = 2;
     });
+  // LLM 지출 절감 영수 — SMART-ROUTER-DEMO-SAVINGS(타임리 시연 · OP #116366). 실측 원장(llm-usage)만 · 가격 비공개(비율만).
+  llmCommand.command('savings').description('스마트 라우터 절감 영수 — 실측 원장 창의 호출 표 · 고급/전체 · «강 단독» 대비 절감 비율(가격·금액 비공개)')
+    .option('--premium-model <모델>', '«강 단독» 기준 모델 id(필수 — 이 모델로 다 돌았을 때와 비교)')
+    .option('--minutes <N>', '측정 창(분 · 기본 60)')
+    .option('--run-id <id>', '특정 런만')
+    .option('--json', 'JSON 출력(영수 수치)')
+    .action(async (opts: { premiumModel?: string; minutes?: string; runId?: string; json?: boolean }) => {
+      const { runLlmSavings } = await import('./llm-savings-cli.js');
+      const minutes = opts.minutes !== undefined ? Number(opts.minutes) : undefined;
+      const result = await runLlmSavings({
+        ...(opts.premiumModel !== undefined ? { premiumModel: opts.premiumModel } : {}),
+        ...((minutes !== undefined && Number.isFinite(minutes)) ? { minutes } : {}),
+        ...(opts.runId !== undefined ? { runId: opts.runId } : {}),
+        json: Boolean(opts.json),
+      });
+      if (result.error) { console.error(result.error); process.exitCode = 2; }
+    });
 }

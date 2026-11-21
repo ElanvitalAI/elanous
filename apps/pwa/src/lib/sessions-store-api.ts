@@ -68,6 +68,13 @@ export class SessionsStoreApi {
   async delete(id: string): Promise<{ ok: boolean; deleted?: boolean; error?: string }> {
     return this.client.fetchJson(`/v1/sessions/store/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
+
+  /** Rename one stored conversation. The server checks the verified member's ownership. */
+  async rename(id: string, title: string): Promise<{ ok: boolean; meta: { id: string; title: string } }> {
+    return this.client.fetchJson(`/v1/sessions/store/${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title }),
+    });
+  }
 }
 
 /** id prefix resolve (P3 · 2026-07-12) — 디스코드 `!attach <prefix>` 동형.

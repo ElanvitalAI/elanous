@@ -41,7 +41,7 @@ export function verdictForFinalPtyScreen({ screen, inputHistory, exitCode, artif
   // For artifact-backed missions, consider only answer text following the last tool block.
   const lastTool = artifactEvidence ? lines.reduce((index, line, i) => /^•\s+(?:Ran|Failed|Running|Worked)\b/i.test(line) ? i : index, -1) : -1;
   const answer = lastTool < 0 ? lines : lines.slice(lastTool + 1).filter((line) => !/^[└│]/.test(line));
-  const failure = (artifactEvidence ? answer : lines).find((line) => FAILURE.test(line) && !toolNoMatch(line));
+  const failure = (artifactEvidence ? answer : lines).find((line, index, candidates) => (FAILURE.test(line) || (index === candidates.length - 1 && /^429\s+rate\s+limit\s+exceeded\s*$/i.test(line))) && !toolNoMatch(line));
   if (failure) return { kind: 'done-but-failed', reason: failure, evidence: null };
   const evidence = lines.find((line) => SUCCESS.test(line) && !/\b0\s+(?:pass|passed)\b/i.test(line));
   if (evidence) return { kind: 'success', reason: 'final PTY screen has success evidence', evidence };

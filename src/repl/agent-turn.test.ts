@@ -7,7 +7,7 @@ import { DaemonSessionHistory } from '../boot/daemon-runtime.js';
 import { abortAgentTurn, createAgentTurnRunner } from './agent-turn.js';
 import { buildReplSystemPrompt } from './index.js';
 import { buildDashboardTurnPreamble } from '../dashboard/turn-preamble.js';
-import { resetSeatBootCacheForTest, SEAT_MEMORY_RECALL_PREFIX } from '../dashboard/seat-boot-preamble.js';
+import { resetSeatBootCacheForTest, SEAT_MEMORY_RECALL_PREFIX } from '../seat/seat-boot-preamble.js';
 import { MsgStore } from '../msg/msg-store.js';
 import type { UserConfig } from '../user-config/types.js';
 import { debug } from '../debug/log.js';

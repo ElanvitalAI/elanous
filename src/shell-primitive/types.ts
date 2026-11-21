@@ -123,6 +123,10 @@ export interface ApprovalRequest {
   approvalKey: string;
   /** Optional summary the UI shows under the primary prompt. */
   context?: string;
+  /** OP #121854 — the caller's abort signal, so a prompt can cancel with the turn.
+   *  A decision that lands after this fired is a late answer to a cancelled question:
+   *  the runtime neither caches it nor spawns. */
+  signal?: AbortSignal;
 }
 
 export type ShellApprover = (req: ApprovalRequest) => Promise<ApprovalDecision>;

@@ -72,7 +72,7 @@ describe('release critpath', () => {
     const r = await runCritpath(opts(), w.deps);
     expect(r.status).toBe('waiting-approval');
     expect(r.exitCode).toBe(CRITPATH_WAITING_EXIT);
-    expect(r.resume).toContain(`elanous decisions decide D-NEW ${APPROVE_OPTION}`);
+    expect(r.resume).toContain('automatic critpath publication remains disabled');
     expect(w.calls).toEqual(['prepare', 'request approval']);
     expect(ledger().entries.map((e) => `${e.step}:${e.outcome}`)).toEqual(['prepare:ok', 'approval:waiting-approval']);
     expect(ledger().binding).toEqual(binding());
@@ -82,13 +82,14 @@ describe('release critpath', () => {
     expect(w.calls.filter((c) => c === 'request approval')).toEqual(['request approval']);
   });
 
-  test('with a matching human approval it runs publish → npm → verify and writes the ledger', async () => {
+  test('a matching human marker remains unverified and cannot run publish or npm', async () => {
     const w = world({ records: [approved(binding())] });
     const r = await runCritpath(opts(), w.deps);
-    expect(r.status).toBe('done');
-    expect(r.exitCode).toBe(0);
-    expect(w.calls).toEqual(['prepare', 'publish --yes', 'npm publish', 'verify']);
-    expect(ledger().entries.map((e) => `${e.step}:${e.outcome}`)).toEqual(['prepare:ok', 'approval:ok', 'publish:ok', 'npm:ok', 'verify:ok']);
+    expect(r.status).toBe('waiting-approval');
+    expect(r.exitCode).toBe(CRITPATH_WAITING_EXIT);
+    expect(r.approval).toEqual({ state: 'unverified', id: 'D-OK' });
+    expect(w.calls).toEqual(['prepare']);
+    expect(ledger().entries.map((e) => `${e.step}:${e.outcome}`)).toEqual(['prepare:ok', 'approval:waiting-approval']);
     expect(ledger().entries.every((e) => e.cmd && e.at)).toBe(true);
   });
 
@@ -112,17 +113,12 @@ describe('release critpath', () => {
     expect(auto.calls).not.toContain('publish --yes');
   });
 
-  test('stops at the first failure with step, command and resume hint', async () => {
+  test('an unverified marker still blocks a publish failure path', async () => {
     const w = world({ records: [approved(binding())], failAt: 'publish' });
     const r = await runCritpath(opts(), w.deps);
-    expect(r.status).toBe('failed');
-    expect(r.exitCode).toBe(1);
-    expect(r.step).toBe('publish');
-    expect(r.cmd).toContain('elanous release publish');
-    expect(r.resume).toContain('rerun from publish');
-    expect(r.resume).toContain(`elanous release critpath --version ${VERSION}`);
-    expect(w.calls).toEqual(['prepare', 'publish --yes']);
-    expect(ledger().entries.at(-1)).toMatchObject({ step: 'publish', outcome: 'fail' });
+    expect(r.status).toBe('waiting-approval');
+    expect(r.step).toBe('approval');
+    expect(w.calls).toEqual(['prepare']);
   });
 
   test('re-entry skips done steps: prepared folder, existing release, same-shasum npm', async () => {
@@ -144,20 +140,19 @@ describe('release critpath', () => {
     expect(w.calls).toEqual([]);
   });
 
-  test('npm E409 counts as done only when the registry holds the same shasum', async () => {
+  test('npm E409 recovery still waits for approval proof', async () => {
     const w = world({ prepared: true, release: true, records: [approved(binding())], npmResult: { ok: false, summary: 'npm failed: E409 Conflict' } });
     w.deps.npmPublish = async () => { w.calls.push('npm publish'); w.s.npm = { visible: true, shasum: TGZ_SHA1 }; return { ok: false, summary: 'npm failed: E409 Conflict' }; };
     const r = await runCritpath(opts(), w.deps);
-    expect(r.status).toBe('done');
-    expect(ledger().entries.find((e) => e.step === 'npm')?.detail).toContain('E409');
+    expect(r.status).toBe('waiting-approval');
+    expect(w.calls).toEqual([]);
   });
 
-  test('staged npm is not published again on re-entry', async () => {
+  test('unverified approval cannot stage npm on re-entry', async () => {
     const w = world({ records: [approved(binding())], npmResult: { ok: true, npm: 'staged-not-visible', summary: 'staged' } });
-    expect((await runCritpath(opts(), w.deps)).status).toBe('done');
-    await runCritpath(opts(), w.deps);
-    expect(w.calls.filter((c) => c === 'npm publish')).toEqual(['npm publish']);
-    expect(ledger().entries.filter((e) => e.step === 'npm').map((e) => e.outcome)).toEqual(['staged', 'staged']);
+    expect((await runCritpath(opts(), w.deps)).status).toBe('waiting-approval');
+    expect((await runCritpath(opts(), w.deps)).status).toBe('waiting-approval');
+    expect(w.calls.filter((c) => c === 'npm publish')).toEqual([]);
   });
 
   test('--dry-run prepares and previews only: no publish, no npm publish, no approval card', async () => {
@@ -235,18 +230,19 @@ describe('release critpath', () => {
     expect(w.calls).toEqual(['resolve branch', 'prepare', 'request approval']);
     expect(ledger().binding).toEqual(binding({ cutSha: OTHER_CUT }));
     expect(w.s.records.at(-1)?.refs).toEqual([approvalRef(binding({ cutSha: OTHER_CUT }))]);
-    // Approved for the resolved commit → it publishes.
+    // A matching but unverified marker still cannot publish.
     w.s.records.push(approved(binding({ cutSha: OTHER_CUT })));
     const again = await runCritpath(opts({ cutCommit: undefined, branch }), w.deps);
-    expect(again.status).toBe('done');
+    expect(again.status).toBe('waiting-approval');
+    expect(again.approval?.state).toBe('unverified');
     expect(w.calls.filter((c) => c === 'prepare')).toEqual(['prepare']);
-    expect(w.calls).toContain('publish --yes');
+    expect(w.calls).not.toContain('publish --yes');
   });
 
-  test('publish reads a pinned copy of the approved notes bytes, not the editable file', async () => {
+  test('explicit dry-run preview reads a pinned copy of the notes bytes', async () => {
     const w = world({ records: [approved(binding())] });
     const approvedSha = notesSha();
-    expect((await runCritpath(opts(), w.deps)).status).toBe('done');
+    expect((await runCritpath(opts({ dryRun: true }), w.deps)).status).toBe('dry-run');
     const pinned = w.s.publishedNotes.at(-1) ?? '';
     expect(pinned).not.toBe(notes);
     expect(createHash('sha256').update(readFileSync(pinned)).digest('hex')).toBe(approvedSha);

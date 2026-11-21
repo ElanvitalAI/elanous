@@ -4,7 +4,7 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Skill-essence extraction of ~/.claude/skills/omni-crawl/. Different
 // from WebSearch (cascade — first available wins): omni_search runs
 // every selected provider in parallel and merges hits. Research dispatch
-// has a narrower Exa/Firecrawl allowlist; Grok is reserved for explicit X intent.
+// uses Exa/Firecrawl web fallback alongside concurrent Grok when it is ready.
 //
 // Probe: at least 2 providers available. With only 1, plain WebSearch
 // is sufficient — no point paying the parallel-fan-out cost.
@@ -64,7 +64,7 @@ export function buildOmniSearchTool(): LLMToolSpec {
     description:
       'Multi-provider web search — fans out to configured search providers in parallel and ' +
       'merges hits. Wider coverage than WebSearch (cascade). Research searches use bounded ' +
-      'Exa / Firecrawl routes; Grok is reserved for explicit X/Twitter intent. Probe-gated: requires at ' +
+      'Exa / Firecrawl routes alongside Grok when configured. Probe-gated: requires at ' +
       'least 2 available providers (otherwise WebSearch already covers it).',
     parameters: {
       type: 'object',
@@ -85,6 +85,7 @@ export function buildOmniSearchTool(): LLMToolSpec {
 
 const RESEARCH_SEARCH_BUDGET_MS = 14_500;
 const RESEARCH_WEB_FALLBACK_IDS = ['exa', 'firecrawl'];
+const RESEARCH_GROK_ID = 'grok';
 const RESEARCH_EXA_TIMEOUT_MS = 4_500;
 const researchHits = new WeakMap<OmniSearchResult, Record<string, WebSearchHit[]>>();
 
@@ -93,7 +94,7 @@ export async function dispatchOmniSearch(
   opts: OmniSearchDispatchOpts = {},
 ): Promise<OmniSearchResult> {
   const args = validate(rawArgs);
-  const allowed = await resolveResearchProvidersForDispatch(opts.signal);
+  const allowed = researchOrder(await resolveResearchProvidersForDispatch(opts.signal));
   const requested = args.engines === undefined ? undefined : new Set(args.engines.map(id => id.toLowerCase()));
   const providers = requested === undefined
     ? allowed
@@ -109,14 +110,21 @@ export async function dispatchResearchOmniSearch(
   const now = opts.now ?? Date.now;
   const deadlineAt = now() + RESEARCH_SEARCH_BUDGET_MS;
   // Typed-store credentials (e.g. Firecrawl key only in the secret store) need async readiness, inside the research budget.
-  const selected = await resolveResearchProvidersForDispatch(opts.signal, Math.max(1, Math.min(RESEARCH_SEARCH_BUDGET_MS, deadlineAt - now())));
+  const ready = await resolveResearchProvidersForDispatch(opts.signal, Math.max(1, Math.min(RESEARCH_SEARCH_BUDGET_MS, deadlineAt - now())));
   const requested = args.engines === undefined ? undefined : new Set(args.engines.map(id => id.toLowerCase()));
-  const providers = requested === undefined
-    ? selected
-    : selected.filter(provider => requested.has(provider.id.toLowerCase()));
-  const webFallback = providers.filter(provider => RESEARCH_WEB_FALLBACK_IDS.includes(provider.id));
-  const webResult = await dispatchResearchWebFallback(args, opts, webFallback, deadlineAt);
-  return combineResearchResults(args, emptyOmniSearchResult(args), webResult);
+  const pick = (list: ResearchProviders): ResearchProviders => requested === undefined
+    ? list
+    : list.filter(provider => requested.has(provider.id.toLowerCase()));
+  const webFallback = pick(researchOrder(ready));
+  // g3 demo: Grok (X/Reddit opinion) runs concurrently with the Exa/Firecrawl web fallback; its failure never drops web hits.
+  const grok = pick(ready.filter(provider => provider.id === RESEARCH_GROK_ID));
+  const [grokResult, webResult] = await Promise.all([
+    grok.length === 0
+      ? Promise.resolve(emptyOmniSearchResult(args))
+      : dispatchWithProviders(args, opts, grok, { deadlineAt, now }).catch(() => emptyOmniSearchResult(args)),
+    dispatchResearchWebFallback(args, opts, webFallback, deadlineAt),
+  ]);
+  return combineResearchResults(args, grokResult, webResult);
 }
 
 function emptyOmniSearchResult(args: OmniSearchArgs): OmniSearchResult {
@@ -356,18 +364,23 @@ function researchOrder(available: ResearchProviders): ResearchProviders {
 }
 
 async function resolveResearchProviders(signal?: AbortSignal, timeoutMs?: number): Promise<ResearchProviders> {
-  const ready = await getAvailableResearchWebSearchProvidersAsync(signal, timeoutMs);
-  lastAsyncReadyResearch = ready;
-  return researchOrder(ready);
+  return researchOrder(await resolveReadyResearchProviders(signal, timeoutMs));
 }
 
-/** Dispatch keeps its envelope contract: if the caller cancels while readiness is resolving, fall back to the
+async function resolveReadyResearchProviders(signal?: AbortSignal, timeoutMs?: number): Promise<ResearchProviders> {
+  const ready = await getAvailableResearchWebSearchProvidersAsync(signal, timeoutMs);
+  lastAsyncReadyResearch = ready;
+  return ready;
+}
+
+/** Returns the full ready snapshot (Grok included); callers apply researchOrder for the Exa/Firecrawl route.
+ *  Dispatch keeps its envelope contract: if the caller cancels while readiness is resolving, fall back to the
  *  synchronous snapshot so the cancellation reaches the provider calls and is reported per engine, not thrown. */
 async function resolveResearchProvidersForDispatch(signal?: AbortSignal, timeoutMs?: number): Promise<ResearchProviders> {
-  try { return await resolveResearchProviders(signal, timeoutMs); }
+  try { return await resolveReadyResearchProviders(signal, timeoutMs); }
   catch (error) {
     if (!signal?.aborted) throw error;
-    return researchOrder(getAvailableResearchWebSearchProviders());
+    return getAvailableResearchWebSearchProviders();
   }
 }
 
@@ -438,6 +451,10 @@ function validate(raw: Record<string, unknown>): OmniSearchArgs {
       throw new Error(`'engines' must be an array of strings`);
     }
   }
+  // An empty engines array is «no preference», the same as omitting the argument.
+  // Keeping it as an empty set would filter out every provider (a9dc research turns
+  // answered «0 hits across 0 providers» — OP #117982 / RES #117975).
+  const normalizedEngines = Array.isArray(engines) && engines.length === 0 ? undefined : engines as string[] | undefined;
   const limit = raw.limit;
   if (limit !== undefined && (typeof limit !== 'number' || limit <= 0)) {
     throw new Error(`'limit' must be a positive number`);
@@ -448,7 +465,7 @@ function validate(raw: Record<string, unknown>): OmniSearchArgs {
   }
   return {
     query,
-    engines: engines as string[] | undefined,
+    engines: normalizedEngines,
     limit: limit as number | undefined,
     merge: merge as OmniSearchArgs['merge'],
     allow_domains: raw.allow_domains as string[] | undefined,

@@ -170,7 +170,8 @@ describe('usage runs', () => {
       const report: Awaited<ReturnType<typeof collectUnifiedUsage>> = { rows: [], accountCounts: { codex: 0, grok: 0, openrouter: 0 } };
       registerUsageCommand(command, { collect: async () => report, creditPlan: () => null, out: { log: (line) => lines.push(line) } });
       await command.parseAsync(['usage', '--json'], { from: 'user' });
-      expect(lines).toEqual([JSON.stringify({ ...report, codexCreditPlan: null }, null, 2)]);
+      expect(JSON.parse(lines[0]!)).toMatchObject({ ...report, codexCreditPlan: null,
+        measuredApiSpend: { windowMinutes: 60, rows: [], recommendation: null } });
     } finally { store.close(); }
   });
 
@@ -191,6 +192,31 @@ describe('usage runs', () => {
     registerUsageCommand(b, { collect: async () => report, creditPlan: () => plan, out: { log: (line) => json.push(line) } });
     await b.parseAsync(['usage', '--json'], { from: 'user' });
     expect(JSON.parse(json[0]!).codexCreditPlan).toEqual(plan);
+  });
+});
+
+describe('usage measured API spend', () => {
+  it('reads the real usage command ledger seam for the same local 60 minute window and withholds result-cost advice', async () => {
+    const now = Date.now();
+    const make = (id: number, data: object, at = now): LogStoreRow => ({ ...row(data), id, ts: new Date(at).toISOString() });
+    const rows = [
+      make(1, { billing: 'api', billingProvider: 'openrouter', model: 'model-a', workTier: 'mid', cost: { kind: 'known', usd: 0.02 } }),
+      make(2, { billing: 'api', billingProvider: 'zai', model: 'model-b', workTier: 'mid', cost: { kind: 'known', usd: 0.01 } }),
+      make(3, { billing: 'api', billingProvider: 'zai', model: 'model-b', workTier: 'mid', cost: { kind: 'unknown' } }),
+      make(4, { billing: 'api', billingProvider: 'zai', model: 'model-b', workTier: 'mid', cost: { kind: 'known', usd: 99 } }, now - 61 * 60_000),
+      make(5, { billing: 'subscription', billingProvider: 'codex', model: 'model-c', workTier: 'mid', cost: { kind: 'included', apiEquivalentUsd: 9 } }),
+    ];
+    let query: unknown;
+    const lines: string[] = [];
+    const command = new Command();
+    registerUsageCommand(command, { collect: async () => ({ rows: [], accountCounts: { codex: 0, grok: 0, openrouter: 0 } }),
+      creditPlan: () => null, readRunLogs: (q) => { query = q; return rows; }, out: { log: (line) => lines.push(line) } });
+    await command.parseAsync(['usage', '--json'], { from: 'user' });
+    const spend = JSON.parse(lines[0]!).measuredApiSpend;
+    expect(query).toMatchObject({ exactCategories: ['llm.usage'], events: ['llm-usage'] });
+    expect(spend).toMatchObject({ windowMinutes: 60, excludedCalls: 1, recommendation: null,
+      rows: [{ tier: 'mid', provider: 'zai', calls: 1, usd: 0.01 }, { tier: 'mid', provider: 'openrouter', calls: 1, usd: 0.02 }] });
+    expect(JSON.stringify(spend)).not.toContain('99');
   });
 });
 

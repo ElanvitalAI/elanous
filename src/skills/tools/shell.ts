@@ -24,6 +24,7 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { harnessCommandWriteReject } from '../../harness/harness-write-boundary.js';
 import {
   runShell,
+  gateShellCommand,
   type ShellRequest,
   type ShellResult,
   DEFAULT_TIMEOUT_MS,
@@ -38,11 +39,9 @@ import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { clampShellTimeoutMs } from '../../tool-runtime/shell-watchdog.js';
 import { getUserConfig } from '../../user-config/reader.js';
-import { readUserConfigObject } from '../../user-config/read.js';
-import { userConfigPath } from '../../user-config.js';
-import { createCapsulePolicy } from '../../core-turn/capsule-policy.js';
 import type { CapsulePolicy, CapsuleStatus } from '../../turn-capsule/contract.js';
-import { runShellCapsule, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
+import { runShellCapsule, shellCapsulePolicy, type ShellCapsuleDeps } from '../../turn-capsule/shell-capsule.js';
+import { triageShellIsolation } from '../../shell-runner/isolation-triage.js';
 import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
 import {
   globalTaskNotificationQueue,
@@ -706,7 +705,7 @@ export function enqueueShellCompletionNotice(
 
 export async function dispatchRunShell(
   rawArgs: Record<string, unknown>,
-  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; onSpawn?: () => void } = {},
+  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; sessionId?: string; onSpawn?: () => void; priorHumanApproval?: boolean } = {},
 ): Promise<RunShellDispatchResult> {
   const command = asCommand(rawArgs.command);
   const cwd = typeof rawArgs.cwd === 'string' ? rawArgs.cwd : undefined;
@@ -726,6 +725,12 @@ export async function dispatchRunShell(
   if (command[0] === 'cd') {
     logShellDispatch('cd.rejected', { reason: 'argv-state-does-not-persist' }, argsTrace);
     return rejectedCdResult();
+  }
+  // §6-4 triage: pure decider; only an unknown explicit `isolation` is refused, everything else is unchanged.
+  const triage = triageShellIsolation({ mode, sandbox, network, isolation: rawArgs.isolation }, process.env);
+  if (!triage.allowed) {
+    logShellDispatch('isolation.rejected', { reason: triage.reason }, argsTrace);
+    throw new Error(`RunShell rejected: ${triage.reason}`);
   }
   const ledgerCliMatch = matchLedgerCli(command, opts.availableToolNames);
   if (ledgerCliMatch) {
@@ -757,10 +762,21 @@ export async function dispatchRunShell(
   }
   const bgAvailable = getShellRunnerDeps() !== null;
   if (mode && deps) {
+    const gate = await gateShellCommand({ command, cwd: effectiveCwd, approval, sandbox, network, signal: opts.signal }, opts.priorHumanApproval === true);
+    if (gate) {
+      logShellDispatch(`runner.${gate.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
+      return {
+        output: formatSummary(gate), exitCode: gate.exitCode, outcome: gate.outcome,
+        elapsedMs: gate.elapsedMs, stdout: gate.stdout, stderr: gate.stderr,
+        truncated: gate.truncated, approvalKey: gate.approvalKey,
+        sandboxed: gate.sandboxed, sandboxTool: gate.sandboxTool,
+      };
+    }
     const result = await dispatchViaRunner({
       command, cwd, timeoutMs, mode, description,
       ...(watch ? { watch } : {}),
       signal: opts.signal,
+      ownerSessionId: opts.sessionId,
       deps,
       ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
     });
@@ -777,7 +793,7 @@ export async function dispatchRunShell(
     network,
     signal: opts.signal,
     ...(opts.onSpawn ? { onSpawn: opts.onSpawn } : {}),
-  });
+  }, opts.priorHumanApproval === true);
 
   logShellDispatch(`legacy.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
   const summary = result.watchdog ? `${result.watchdog.text}\n${formatSummary(result)}` : formatSummary(result);
@@ -808,6 +824,7 @@ async function dispatchViaRunner(args: {
   watch?: ShellLineWatchSpec;
   signal?: AbortSignal;
   deps: NonNullable<ReturnType<typeof getShellRunnerDeps>>;
+  ownerSessionId?: string;
   onSpawn?: () => void;
 }): Promise<RunShellDispatchResult> {
   const req: Parameters<typeof runnerDispatch>[0] = {
@@ -818,7 +835,7 @@ async function dispatchViaRunner(args: {
     ...(args.description !== undefined ? { description: args.description } : {}),
     ...(args.signal !== undefined ? { signal: args.signal } : {}),
   };
-  const handle = runnerDispatch(req, args.deps);
+  const handle = runnerDispatch(req, args.deps, { ownerSessionId: args.ownerSessionId });
   try { args.onSpawn?.(); } catch { /* the capsule clock is advisory */ }
   if (args.mode === 'bg') {
     if (args.watch) {
@@ -955,14 +972,11 @@ export function runShellCapsuleStartedResult(capsuleId: string, syncCapMs: numbe
  *  and stays as is. The sync clock starts at spawn, so an approval wait never detaches a call. No switch (R3). */
 export function dispatchRunShellCapsule(
   rawArgs: Record<string, unknown>,
-  opts: { signal?: AbortSignal; availableToolNames?: readonly string[] } = {},
+  opts: { signal?: AbortSignal; availableToolNames?: readonly string[]; sessionId?: string; priorHumanApproval?: boolean } = {},
   deps: Omit<ShellCapsuleDeps, 'policy'> & { readonly policy?: CapsulePolicy } = {},
 ): Promise<RunShellDispatchResult> {
   if (rawArgs.mode === 'bg') return dispatchRunShell(rawArgs, opts);
-  const policy = deps.policy ?? createCapsulePolicy({
-    turnConfig: () => readUserConfigObject(userConfigPath())?.turn,
-    ...(deps.correlation?.turnId ? { correlation: { turnId: deps.correlation.turnId } } : {}),
-  });
+  const policy = deps.policy ?? shellCapsulePolicy(deps.correlation);
   const { signal, ...rest } = opts;
   const command = Array.isArray(rawArgs.command) ? rawArgs.command.filter((part) => typeof part === 'string').join(' ') : '';
   return runShellCapsule<RunShellDispatchResult>({

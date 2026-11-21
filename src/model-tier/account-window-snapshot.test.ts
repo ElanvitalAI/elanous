@@ -23,6 +23,7 @@ const inspect = (over: Partial<Inspect> = {}): Inspect => ({
   ],
   observedAtByHome: { '/h/default': OLDER, '/h/team': NEWER, '/h/third': NOW - WINDOW_SNAPSHOT_TTL_MS * 3 },
   freshByHome: { '/h/default': true, '/h/team': true, '/h/third': false, '/h/sick': true },
+  resetsAtByHome: {},
   ...over,
 });
 
@@ -61,6 +62,11 @@ describe('readAccountWindowSnapshot — codex quota signals only', () => {
       .toEqual({ provider: 'openai-codex', account: 'third' });
     expect(read('openai-codex', { inspectCodex: () => inspect({ reason: 'no-candidate', to: undefined }) }).snapshot?.active)
       .toEqual({ provider: 'openai-codex', account: 'default' });
+  });
+
+  test('passes a measured future reset through to the actual account selector input', () => {
+    const { snapshot } = read('openai-codex', { inspectCodex: () => inspect({ resetsAtByHome: { '/h/default': NOW + 60_000 } }) });
+    expect(snapshot?.candidates[0]?.window).toEqual({ remaining: 0.5, resetsAtMs: NOW + 60_000 });
   });
 
   test('explicit account is carried so the selector keeps the human choice', () => {

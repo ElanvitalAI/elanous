@@ -226,9 +226,12 @@ test('holder: a detached holder hands the pane its els identity and token, never
   const root = mkdtempSync(join(tmpdir().length > 40 ? '/tmp' : tmpdir(), 'els-holderenv-'));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   process.env.ELANOUS_ELS_OWNER_TOKEN = 'lit-owner-secret';
+  const priorCeoToken = process.env.ELANOUS_CEO_TELEGRAM_TOKEN;
+  cleanups.push(() => { if (priorCeoToken === undefined) delete process.env.ELANOUS_CEO_TELEGRAM_TOKEN; else process.env.ELANOUS_CEO_TELEGRAM_TOKEN = priorCeoToken; });
+  process.env.ELANOUS_CEO_TELEGRAM_TOKEN = 'synthetic-parent-bot-token';
   spawnHolderDetached({ stateRoot: root, paneId: 'lit-env-5', cwd: root, title: 'lit-env-5', exitGraceMs: LIT_GRACE_MS,
     env: { ELANOUS_ELS_WS: 'lit-ws', ELANOUS_ELS_PANE: 'lit-env-5', ELANOUS_ELS_SOCKET: '/lit/els.sock', ELANOUS_ELS_PANE_TOKEN: 'lit-pane-token' },
-    command: ['/bin/sh', '-c', 'printf "lit-env:%s:%s:%s:%s:%s\\r\\n" "$ELANOUS_ELS_WS" "$ELANOUS_ELS_PANE" "$ELANOUS_ELS_SOCKET" "$ELANOUS_ELS_PANE_TOKEN" "${ELANOUS_ELS_OWNER_TOKEN:-none}"; exec cat'] });
+    command: ['/bin/sh', '-c', 'printf "lit-env:%s:%s:%s:%s:%s:%s\\r\\n" "$ELANOUS_ELS_WS" "$ELANOUS_ELS_PANE" "$ELANOUS_ELS_SOCKET" "$ELANOUS_ELS_PANE_TOKEN" "${ELANOUS_ELS_OWNER_TOKEN:-none}" "${ELANOUS_CEO_TELEGRAM_TOKEN:-none}"; exec cat'] });
   const socketPath = holderSocketPath(root, 'lit-env-5');
   cleanups.push(async () => {
     const socket = await connectOnce(socketPath);
@@ -240,5 +243,5 @@ test('holder: a detached holder hands the pane its els identity and token, never
   client.send({ op: 'ping' });
   await client.next((message) => message.type === 'pong', LIT_WAIT_MS);
   const shown = await untilSnapshot(client, 'lit-env:', LIT_WAIT_MS);
-  expect(shown.screen).toContain('lit-env:lit-ws:lit-env-5:/lit/els.sock:lit-pane-token:none');
+  expect(shown.screen).toContain('lit-env:lit-ws:lit-env-5:/lit/els.sock:lit-pane-token:none:none');
 }, LIT_BOOT_MS + LIT_WAIT_MS);

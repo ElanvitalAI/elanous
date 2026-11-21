@@ -70,6 +70,89 @@ test('queued audit failure never publishes or delivers the line', async () => {
   } finally { f.cleanup(); }
 });
 
+test('a later input cannot overtake queued input during asynchronous reauthorization', async () => {
+  const f = await fixture();
+  try {
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    expect((await f.core.inputLine(f.pane, 'first', 'OP', undefined, async () => { entered(); await gate; return true; })).queued).toBe(1);
+    f.idle();
+    const draining = f.core.drain();
+    await started;
+    const later = f.core.inputLine(f.pane, 'second', 'OP');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(f.writes).toEqual([]);
+    release();
+    await draining;
+    await later;
+    expect(f.writes[0]).toBe('first\r');
+  } finally { f.cleanup(); }
+});
+
+test('raw input during queued reauthorization defers delivery without losing the queued line', async () => {
+  const f = await fixture();
+  try {
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    expect((await f.core.inputLine(f.pane, 'queued', 'OP', undefined, async () => { entered(); await gate; return true; })).queued).toBe(1);
+    f.idle();
+    const draining = f.core.drain();
+    await started;
+    expect(f.core.input(f.pane, 'human').exitCode).toBe(0);
+    release(); await draining;
+    expect(f.writes).toEqual(['human']);
+    expect(f.core.queued(f.pane)).toBe(1);
+    f.tick(); await f.core.drain();
+    expect(f.writes).toEqual(['human', 'queued\r']);
+  } finally { f.cleanup(); }
+});
+
+test('raw input during immediate reauthorization defers both typed and ordinary lines', async () => {
+  for (const kind of ['input', 'do'] as const) {
+    const f = await fixture();
+    try {
+      f.idle();
+      let entered!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const validate = async () => { entered(); await gate; return true; };
+      const pending = kind === 'input'
+        ? f.core.inputLine(f.pane, 'line', 'OP', undefined, validate)
+        : f.core.do(f.pane, 'line', 'OP', undefined, validate);
+      await started;
+      expect(f.core.input(f.pane, 'human').exitCode).toBe(0);
+      release();
+      expect((await pending).queued).toBe(1);
+      expect(f.writes).toEqual(['human']);
+      f.tick(); await f.core.drain();
+      expect(f.writes).toEqual(['human', kind === 'input' ? 'line\r' : '⇢ OP · line\r']);
+    } finally { f.cleanup(); }
+  }
+});
+
+test('queued input is discarded if pane exits or closes during authorization', async () => {
+  for (const how of ['exit', 'close'] as const) {
+    const f = await fixture();
+    try {
+      let entered!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const results: string[] = [];
+      const result = await f.core.inputLine(f.pane, 'secret', 'OP', event => { results.push(event); return true; }, async () => { entered(); await gate; return true; });
+      expect(result.queued).toBe(1);
+      f.idle();
+      const drain = f.core.drain();
+      await started;
+      if (how === 'exit') f.exit(); else f.core.close(f.pane);
+      release(); await drain;
+      expect(f.writes).toEqual([]);
+      expect(results).toEqual(['queued', 'discarded']);
+    } finally { f.cleanup(); }
+  }
+});
+
 test('queued write failure, pane exit, close, shutdown and audit-intent failure are distinguished', async () => {
   for (const how of ['write', 'exit', 'close', 'shutdown', 'audit'] as const) {
     const f = await fixture();

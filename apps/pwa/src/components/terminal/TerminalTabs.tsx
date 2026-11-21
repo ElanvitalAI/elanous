@@ -160,7 +160,9 @@ export function loadTabIds(): string[] {
 
 export function saveTabIds(ids: readonly string[]): void {
   if (typeof window === 'undefined') return;
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(ids));
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(ids));
+  } catch { /* Keep the current tab state when storage is unavailable. */ }
 }
 
 export function loadHiddenTabIds(): string[] {
@@ -176,7 +178,9 @@ export function loadHiddenTabIds(): string[] {
 
 export function saveHiddenTabIds(ids: readonly string[]): void {
   if (typeof window === 'undefined') return;
-  window.localStorage.setItem(HIDDEN_STORAGE_KEY, JSON.stringify(ids));
+  try {
+    window.localStorage.setItem(HIDDEN_STORAGE_KEY, JSON.stringify(ids));
+  } catch { /* Keep the hidden-tab set for this mounted instance. */ }
 }
 
 export function nextDefaultId(existing: readonly string[]): string {

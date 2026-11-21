@@ -36,7 +36,7 @@ import { POD_DISTRIBUTOR_ENTRY_ENV, TASK_HAND_POD_DISTRIBUTOR_ENTRY } from './po
 // Keep doctor-visit recording synchronous: updateTaskCard callers observe it before the transition returns.
 import { recordTaskAgentNeedsOwnerVisit } from '../self-implement/doctor-visit.js';
 import { applyRunIdentityTag, applyRunIdentityTags, deriveBirthIdentity, parseRunIdentityTag, runIdentityFieldText, runIdentityQueuePriority, runPriorityClass, validateRunIdentity, type RunIdentity, type RunIdentityCell, type RunIdentityOrigin } from './run-identity.js';
-import { criticalUnknownFields, parseWorkOrder, parseWorkOrderBudget, TA_BUDGET_WALL_ENV, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type WorkOrder } from './work-order.js';
+import { criticalUnknownFields, parseWorkOrder, parseWorkOrderBudget, TA_BUDGET_WALL_ENV, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, workOrderBudgetFailureReason, type WorkOrder } from './work-order.js';
 import { recordCoordinatorShadowDispatch, resolveCoordinatorShadowRoot } from '../loops/orchestrator/coordinator-shadow.js';
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
@@ -120,6 +120,12 @@ export function taBudgetEnv(order: WorkOrder | undefined): Record<string, string
   if (order === undefined) return {};
   const budget = parseWorkOrderBudget(order.budget);
   return budget.ok ? { [TA_BUDGET_WALL_ENV]: String(budget.timeSec) } : {};
+}
+
+/** TA-BUDGET-WALL: 실값 예산 파싱 실패는 발사 거부 사유다 — 예산 벽 없는 발사를 허용하지 않는다(fail-closed). */
+export function taBudgetWallRefusal(order: WorkOrder | undefined): string | undefined {
+  if (order === undefined) return undefined;
+  return workOrderBudgetFailureReason(order.budget);
 }
 
 export type TaskSeat = typeof TASK_SEATS[number];
@@ -893,6 +899,8 @@ export const CLOSED_BY_HAND_EVENT = 'closed-by-hand';
 
 /** LAUNCH-SINGLE-DOOR-1C — 단일문 거절 줄 — 같은 requestId 로 이미 소비된 중복 발사를 카드 history 에 남긴다. */
 export const LAUNCH_REFUSED_DUPLICATE_EVENT = 'launch-refused-duplicate';
+/** TA-BUDGET-WALL: 실값 예산 파싱 실패로 발사가 거부됐다느 카드 history 이벤트. */
+export const LAUNCH_REFUSED_BUDGET_EVENT = 'launch-refused-budget';
 
 /** 카드를 손으로 닫는다 — 상태를 `failed` 로 두고 history 에 한 줄(`closed-by-hand`)을 남긴다. 이미 손으로 닫은 카드는 그대로 돌려준다(멱등). */
 export function closeTaskCard(card: TaskCard, input: { reason: string; by: string; at: string }): TaskCard {
@@ -1604,6 +1612,15 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   }
   writeCard(path, card);
   receiptCardPending = false;
+  // TA-BUDGET-WALL — 예산 벽 거부는 tier-split·그림자·graph-run·harness-say 등 모든 발사 경로보다 먼저다(fail-closed: 벽 없는 발사 0).
+  const budgetRefusal = taBudgetWallRefusal(opts.workOrder);
+  if (budgetRefusal !== undefined) {
+    const at = (opts.now ?? (() => new Date()))().toISOString();
+    const refused: TaskCard = { ...card, history: [...card.history, { at, event: LAUNCH_REFUSED_BUDGET_EVENT, detail: budgetRefusal }] };
+    writeCard(path, refused);
+    try { debug.log('task-agent', 'launch-refused-budget', { taskId: id, reason: budgetRefusal }); } catch { /* fail-soft */ }
+    return { card: refused, move: move ?? nextMoveFor(card), mode, launched: false, reason: `${LAUNCH_REFUSED_BUDGET_EVENT}: ${budgetRefusal}`, ...(project ? { cwd: project.target } : {}) };
+  }
   if (!selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') persistComposition?.();
   try { debug.log('task-agent.hand', 'target-paths', { card: id, count: targetPaths.length, labelMissing: targetPathHints.labelMissing }); } catch { /* fail-soft */ }
   try { debug.log('task-agent.graph-select', !selected.composition ? 'composition-missing' : selected.error ? 'composition-invalid' : 'composition-selected', {

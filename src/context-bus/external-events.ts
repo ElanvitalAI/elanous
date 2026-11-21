@@ -40,16 +40,19 @@ export function recordExternalEvent(input: ExternalEventInput, deps: { db?: Data
       slot: null, deadline: null, url: source, origin: input.origin, source, ...(input.delivery ?? {}) });
     return db.transaction(() => {
       if (input.delivery) {
-        const prior = db.prepare(`SELECT id FROM events WHERE surface='context:external'
-          AND json_extract(refs,'$.eventId')=? AND json_extract(refs,'$.subscriberId')=? LIMIT 1`)
-          .get(input.delivery.eventId, input.delivery.subscriberId) as { id: string } | null;
-        if (prior) return prior.id;
+        const prior = db.prepare(`SELECT surface_event_id FROM external_delivery_receipts
+          WHERE event_id=? AND subscriber_id=?`)
+          .get(input.delivery.eventId, input.delivery.subscriberId) as { surface_event_id: string } | null;
+        if (prior) return prior.surface_event_id;
       }
-      return recordEvent(db, {
+      const id = recordEvent(db, {
         surface: 'context:external', direction: 'outbound', domain: 'elanous', category: 'coordination',
         kind: input.kind, text: summary, summary, refs,
         ...(input.at ? { ts: input.at } : {}),
       });
+      if (input.delivery) db.prepare(`INSERT INTO external_delivery_receipts(event_id, subscriber_id, surface_event_id)
+        VALUES (?, ?, ?)`).run(input.delivery.eventId, input.delivery.subscriberId, id);
+      return id;
     }).immediate();
   } finally { if (!deps.db) db.close(); }
 }

@@ -63,6 +63,7 @@ function owner(initial: SpaceJournal = emptyJournal(), ids?: string[], now?: () 
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 const paneOf = (result: { message: string }) => (JSON.parse(result.message) as { pane: string }).pane;
+const machineLine = (text: string): string => `\x1b[200~${text}\x1b[201~\r`;
 
 test('new records the pane only after its PTY exists; ls, read and send work on the live pane', async () => {
   const { core, ptys, stored } = owner();
@@ -73,9 +74,9 @@ test('new records the pane only after its PTY exists; ls, read and send work on 
   expect(stored().panes.map((row) => [row.id, row.ptyId, row.cwd, row.state])).toEqual([[pane, 'pty_1', '/work', 'working']]);
   expect((await core.read(pane)).message).toBe('pty_1 ready\n');
   expect(stored().panes[0]!.scrollback).toBe('pty_1 ready\n');
-  expect((await core.send(pane, 'echo hi\n')).exitCode).toBe(0);
-  // clean() drops the \n: a caller cannot press Enter through send
-  expect(ptys[0]!.writes).toEqual(['echo hi']);
+  expect((await core.send(pane, 'echo hi\n')).exitCode).toBe(2);
+  expect((await core.send(pane, 'echo hi')).exitCode).toBe(0);
+  expect(ptys[0]!.writes).toEqual(['\x1b[200~echo hi\x1b[201~']);
   const listed = JSON.parse(core.list().message) as { panes: { pane: string; ptyId: string; state: string; workspace: string }[] };
   expect(listed.panes.map((row) => [row.pane, row.ptyId, row.state, row.workspace])).toEqual([[pane, 'pty_1', 'working', 'HQ']]);
 });
@@ -89,12 +90,12 @@ test('#38608 must ①② — workspaceOf tells both spellings of the truth; send
   expect(ownerWs.name).toBe('HQ');
   expect(ownerWs.id).not.toBe('HQ');
   expect(core.workspaceOf('p-none')).toBeUndefined();
-  // must ②: send types cleaned TEXT — the \r cannot press Enter, the \x15 cannot clear the line.
-  expect((await core.send(pane, 'echo a\r\x15')).exitCode).toBe(0);
+  // must ②: send rejects the whole input when control bytes are present.
+  expect((await core.send(pane, 'echo a\r\x15')).exitCode).toBe(2);
   // input is the raw person path: Enter survives, and a paste bigger than one paste is refused.
   expect(core.input(pane, 'echo raw\r')).toEqual({ exitCode: 0, message: '' });
   expect(core.input(pane, 'x'.repeat(1_000_000))).toEqual({ exitCode: 2, message: expect.stringContaining('bytes at once') });
-  expect(ptys[0]!.writes).toEqual(['echo a', 'echo raw\r']);
+  expect(ptys[0]!.writes).toEqual(['echo raw\r']);
 });
 
 test('write failure: a new pane whose journal save fails is not recorded and its PTY is stopped', () => {
@@ -294,7 +295,7 @@ test('do types «⇢ from · text» + Enter into an idle pane and strips control
   const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
   const done = await core.do(pane, 'run\x1b[31m tests\nnow', 'mshq/OP');
   expect(done.exitCode).toBe(0);
-  expect(ptys[0]!.writes).toEqual(['⇢ mshq/OP · run [31m tests now\r']);
+  expect(ptys[0]!.writes).toEqual([machineLine('⇢ mshq/OP · run [31m tests now')]);
   expect((await core.do(pane, '   ', 'OP')).exitCode).toBe(2);
   expect((await core.do('pdeadbeef', 'x', 'OP')).exitCode).toBe(1);
 });
@@ -315,14 +316,14 @@ test('do queues while «Turn running», keeps order, and delivers one line per i
   // lines already waiting keep their order even though the screen is idle now
   expect((await core.do(pane, 'third', 'OP')).message).toContain('queued 3');
   await core.drain();
-  expect(fake.writes).toEqual(['⇢ OP · first\r']);
+  expect(fake.writes).toEqual([machineLine('⇢ OP · first')]);
   await core.drain();                              // settle time not over: no second line yet
   expect(fake.writes.length).toBe(1);
   clock += 2_500;
   await core.drain();
   clock += 2_500;
   await core.drain();
-  expect(fake.writes).toEqual(['⇢ OP · first\r', '⇢ JUD · second\r', '⇢ OP · third\r']);
+  expect(fake.writes).toEqual([machineLine('⇢ OP · first'), machineLine('⇢ JUD · second'), machineLine('⇢ OP · third')]);
   expect(core.queued(pane)).toBe(0);
 });
 
@@ -357,10 +358,10 @@ test('do: a second line right after a delivery is queued (the screen may not sho
   expect((await core.do(pane, 'one', 'OP')).message).toContain('delivered');
   clock += 500;
   expect((await core.do(pane, 'two', 'OP')).message).toContain('queued 1');
-  expect(fake.writes).toEqual(['⇢ OP · one\r']);
+  expect(fake.writes).toEqual([machineLine('⇢ OP · one')]);
   clock += 2_500;
   await core.drain();
-  expect(fake.writes).toEqual(['⇢ OP · one\r', '⇢ OP · two\r']);
+  expect(fake.writes).toEqual([machineLine('⇢ OP · one'), machineLine('⇢ OP · two')]);
   clock += 2_500;
   expect((await core.do(pane, 'three', 'OP')).message).toContain('delivered');   // settled and idle: straight through
 });
@@ -370,7 +371,7 @@ test('do strips C1 control characters (0x9b is a one-byte CSI) as well as C0', a
   core.start();
   const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
   await core.do(pane, 'a\u009b31mb\u0085c', 'OP');
-  expect(ptys[0]!.writes).toEqual(['⇢ OP · a 31mb c\r']);
+  expect(ptys[0]!.writes).toEqual([machineLine('⇢ OP · a 31mb c')]);
 });
 
 test('close stops the PTY and removes the pane and its tab; closeWorkspace removes everything under it; unknown refs fail', async () => {
@@ -405,12 +406,12 @@ test('do: two do calls at the same moment on one idle pane — one goes out now,
   fake.releaseRenders();
   const answers = await Promise.all([first, second, third]);
   expect(answers.map((row) => row.message.includes('delivered') ? 'now' : row.message.includes('queued') ? 'queued' : row.message)).toEqual(['now', 'queued', 'queued']);
-  expect(fake.writes).toEqual(['⇢ OP · first\r']);
+  expect(fake.writes).toEqual([machineLine('⇢ OP · first')]);
   clock += 2_500;
   await core.drain();
   clock += 2_500;
   await core.drain();
-  expect(fake.writes).toEqual(['⇢ OP · first\r', '⇢ JUD · second\r', '⇢ OP · third\r']);
+  expect(fake.writes).toEqual([machineLine('⇢ OP · first'), machineLine('⇢ JUD · second'), machineLine('⇢ OP · third')]);
 });
 
 test('drain is per pane: a pane whose render never finishes does not hold back the queues of the other panes', async () => {
@@ -429,14 +430,14 @@ test('drain is per pane: a pane whose render never finishes does not hold back t
   clock += 2_500;
   void core.drain();                               // starts the stuck pane's step, which never finishes
   await core.drain();                              // the other pane is still served
-  expect(ptys[1]!.writes).toEqual(['⇢ OP · other-line\r']);
+  expect(ptys[1]!.writes).toEqual([machineLine('⇢ OP · other-line')]);
   expect(ptys[0]!.writes).toEqual([]);
   expect(core.queued(stuck)).toBe(1);
   ptys[0]!.releaseRenders();                       // it recovers: its line goes out on a later drain
   await settle();
   clock += 2_500;
   await core.drain();
-  expect(ptys[0]!.writes).toEqual(['⇢ OP · stuck-line\r']);
+  expect(ptys[0]!.writes).toEqual([machineLine('⇢ OP · stuck-line')]);
 });
 
 test('a child tab survives a failed save: it stays in memory and the next save writes it', () => {
@@ -584,8 +585,11 @@ test('pane build reports belong to live PTYs and expire without a heartbeat', ()
   expect(build().sha).toBeNull();
   expect(core.reportBuild(pane, 'bad').exitCode).toBe(1);
   expect(core.reportBuild('missing', 'a'.repeat(40)).exitCode).toBe(1);
-  expect(core.reportBuild(pane, 'a'.repeat(40)).exitCode).toBe(0);
-  expect(build()).toMatchObject({ sha: 'a'.repeat(40), source: 'self-reported', trusted: false });
+  expect(core.reportBuild(pane, 'a'.repeat(40), '0.3.31', '261121_0628').exitCode).toBe(0);
+  expect(build()).toMatchObject({ version: '0.3.31', stamp: '261121_0628', sha: 'a'.repeat(40), source: 'self-reported', trusted: false });
+  core.reportBuild(pane, 'a'.repeat(40), '\u001b[31m0.3.31', 'not-time');
+  expect(build()).not.toHaveProperty('version');
+  expect(build()).not.toHaveProperty('stamp');
   clock += 90_000;
   expect(build()).toMatchObject({ sha: null, age: 'unknown' });
   core.reportBuild(pane, 'a'.repeat(40));
@@ -657,10 +661,11 @@ test('verified send uses checked plain mode when bracketed paste is unavailable'
   core.start();
   const pane = paneOf(core.newPane({ ws: 'HQ', cwd: '/work', command: ['sh'] }));
   ptys[0]!.pty.bracketedPasteEnabled = () => false;
-  const result = await core.sendVerified(pane, 'echo safely\n');
+  const result = await core.sendVerified(pane, 'echo safe\n');
   expect(result.exitCode).toBe(0);
   expect(result.message).toContain('mode=plain; turn start unverified');
-  expect(ptys[0]!.writes).toEqual(['echo safely\r']);
+  expect(ptys[0]!.writes).toEqual(['echo safe\r']);
+  expect((await core.sendVerified(pane, 'echo y\n')).exitCode).toBe(1);
 });
 
 test('plain mode refuses a body with a line break inside (it would submit two commands) — nothing is written (JUD-B #103319)', async () => {
@@ -682,4 +687,105 @@ test('plain mode refuses Ctrl-C / Ctrl-D / DEL inside the body; TAB is still tex
   expect(ptys[0]!.writes).toEqual([]);
   expect((await core.sendVerified(pane, 'printf "a\tb"')).exitCode).toBe(0);
   expect(ptys[0]!.writes).toEqual(['printf "a\tb"\r']);
+});
+
+test('tab close stops only its panes and leaves sibling tabs and workspace', () => {
+  const t = ordered();
+  const tab = t.rows().find(row => row.pane === t.a)!.tab;
+  expect(t.core.closeTab('missing').exitCode).toBe(1);
+  expect(t.core.closeTab('' as string).exitCode).toBe(2);
+  expect(t.core.closeTab(tab).exitCode).toBe(0);
+  expect(t.ptys.map(p => p.pty.killed)).toEqual([true, false, false, false]);
+  expect(t.order()).toEqual([`A:${t.a2}`, `B:${t.b}`, `C:${t.c}`]);
+  expect(t.stored().workspaces.map(ws => ws.name)).toEqual(['A', 'B', 'C']);
+  expect(t.core.closeTab(tab).exitCode).toBe(1);
+});
+
+test('tab close reaps an exited pane without touching a live sibling tab', async () => {
+  const t = ordered();
+  const tab = t.rows().find(row => row.pane === t.a)!.tab;
+  t.ptys[0]!.exit();
+  await settle();
+  expect(t.core.list().message).toContain('"state": "exited"');
+  expect(t.core.closeTab(tab).exitCode).toBe(0);
+  expect(t.order()).toEqual([`A:${t.a2}`, `B:${t.b}`, `C:${t.c}`]);
+  expect(t.ptys.slice(1).every(p => p.pty.killed === false)).toBe(true);
+});
+
+test('exited pane is archived after 30 minutes then reaped; live sibling stays', async () => {
+  let clock = 1_000_000;
+  let stored = emptyJournal();
+  const ptys: ReturnType<typeof fakePty>[] = [];
+  const archived: Array<{ pane: string; screen: string }> = [];
+  const core = createElsCore({ load: () => stored, save: (next) => { stored = next; }, now: () => clock,
+    spawn: () => { const pty = fakePty(`pty_${ptys.length + 1}`); ptys.push(pty); return pty.pty; },
+    archiveExited: (pane) => { archived.push({ pane: pane.id, screen: pane.scrollback }); },
+  });
+  expect(core.start()).toBeUndefined();
+  const dead = paneOf(core.newPane({ ws: 'W', cwd: '/dead', command: ['sh'] }));
+  const live = paneOf(core.newPane({ ws: 'W', cwd: '/live', command: ['sh'] }));
+  ptys[0]!.setScreen('original screen\n');
+  ptys[0]!.exit();
+  await settle();
+  expect(stored.panes.find((row) => row.id === dead)?.exitedAt).toBe(1_000_000);
+  clock += 30 * 60_000 - 1;
+  expect(core.reapExited()).toBe(0);
+  expect(stored.panes.map((row) => row.id)).toEqual([dead, live]);
+  clock += 1;
+  expect(core.reapExited()).toBe(1);
+  expect(archived).toEqual([{ pane: dead, screen: 'original screen\n' }]);
+  expect(stored.panes.map((row) => row.id)).toEqual([live]);
+  expect(ptys[1]!.pty.killed).toBe(false);
+});
+
+test('an archive or journal save failure leaves the exited pane for retry', async () => {
+  let clock = 1_000_000;
+  let stored = emptyJournal();
+  let archiveFails = true;
+  let saveFails = false;
+  const pty = fakePty('pty_exit');
+  const core = createElsCore({ load: () => stored, now: () => clock,
+    save: (next) => { if (saveFails) throw new Error('disk full'); stored = next; },
+    spawn: () => pty.pty,
+    archiveExited: () => { if (archiveFails) throw new Error('archive unavailable'); },
+  });
+  expect(core.start()).toBeUndefined();
+  const pane = paneOf(core.newPane({ ws: 'W', cwd: '/w', command: ['sh'] }));
+  pty.exit();
+  await settle();
+  clock += 30 * 60_000;
+  expect(core.reapExited()).toBe(0);
+  expect(stored.panes.map((row) => row.id)).toEqual([pane]);
+  archiveFails = false;
+  saveFails = true;
+  expect(core.reapExited()).toBe(0);
+  expect(stored.panes.map((row) => row.id)).toEqual([pane]);
+  saveFails = false;
+  expect(core.reapExited()).toBe(1);
+  expect(stored.panes).toEqual([]);
+});
+
+test('legacy exited pane without an exit clock receives a full retention period at restart', async () => {
+  const original = owner();
+  expect(original.core.start()).toBeUndefined();
+  const pane = paneOf(original.core.newPane({ ws: 'W', cwd: '/old', command: ['sh'] }));
+  original.ptys[0]!.exit();
+  await settle();
+  let stored: SpaceJournal = { ...original.stored(), panes: original.stored().panes.map((row) => {
+    const { exitedAt: _old, ...legacy } = row;
+    return legacy;
+  }) };
+  let clock = 2_000_000;
+  const archived: string[] = [];
+  const core = createElsCore({ load: () => stored, save: (next) => { stored = next; }, now: () => clock,
+    spawn: () => fakePty('unused').pty,
+    archiveExited: (row) => { archived.push(row.id); },
+  });
+  expect(core.start()).toBeUndefined();
+  expect(stored.panes[0]!.exitedAt).toBe(clock);
+  clock += 30 * 60_000 - 1;
+  expect(core.reapExited()).toBe(0);
+  clock += 1;
+  expect(core.reapExited()).toBe(1);
+  expect(archived).toEqual([pane]);
 });

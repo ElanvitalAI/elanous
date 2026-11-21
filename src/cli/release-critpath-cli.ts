@@ -104,7 +104,7 @@ export async function defaultCritpathDeps(log: (line: string) => void): Promise<
 
 export function registerReleaseCritpathCommand(release: Command, depsFactory: (log: (line: string) => void) => Promise<CritpathDeps> = defaultCritpathDeps): void {
   release.command('critpath')
-    .description('수동 크리티컬 패스 한 명령 — prepare → (docs-node 생략) → OP 승인 기록 → publish → npm → verify. 승인 카드 없으면 publish 직전에 멈춘다(rc 75). 끝난 단계는 건너뛴다')
+    .description('수동 크리티컬 패스 한 명령 — prepare → 승인 대기. 원장 human 표식은 미검증이므로 자동 publish/npm 실행을 허용하지 않는다(rc 75)')
     .requiredOption('--version <x.y.z>', '릴리스 판')
     .requiredOption('--notes-file <md>', '공개 릴리스 본문(승인은 이 파일의 sha256 에 묶인다)')
     .option('--cut-commit <sha>', '컷 커밋(40자) — --branch 와 둘 중 하나')

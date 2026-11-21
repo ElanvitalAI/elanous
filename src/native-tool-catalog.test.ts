@@ -34,6 +34,10 @@ test('virtual-window control and context tools are absent while essential tools 
     shouldDefer: true,
     host: ['tui', 'mcp'], safety: ['mutating', 'network'], supportsParallel: false, defaultEnabled: true,
   });
+  // CAPSULE-A2-BASH-DETACH (정본 §3.6 C3:805 · 2026-11-21) — 한 배치의 긴 Bash 3개는
+  // 동기 캡(10s) 대기가 «겹쳐» 돌아야 메인 턴이 20s 안에 idle 로 복귀한다. 직렬 디스패치면
+  // 캡 10s×3 = 30s hold 로 축 위반(시나리오 C3-TRIO 빨강 원문). RunShell(argv 짧은 명령)은 직렬 계약 유지.
+  expect(nativeToolCatalog.find(tool => tool.id === 'bash')?.supportsParallel).toBe(true);
 });
 
 describe('retired solve_mission native catalog entry', () => {

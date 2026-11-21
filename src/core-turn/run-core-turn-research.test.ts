@@ -11,6 +11,7 @@ import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js'
 import { researchTurnForGrounding, runResearchQuestionLadder } from '../auto-research/research-turn.js';
 import { buildLedgerCitationRule, verifiedEvidenceUrls } from '../auto-research/synthesis-evidence-budget.js';
 import { fanOutAxisEvidence } from '../research/axis-fanout.js';
+import { MARKET_DATA_NO_SOURCE_LINE } from '../research/market-evidence.js';
 import { routeResearchOutput } from '../research/output-router.js';
 import {
   isResearchToolAllowed,
@@ -145,6 +146,52 @@ beforeEach(() => {
 });
 
 afterEach(() => mock.restore());
+
+test('market synthesis with zero provider evidence labels web numbers unverified in the final answer', async () => {
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async () => {
+    modelCalls += 1;
+    return modelCalls === 1 ? 'provisional answer'
+      : '웹 게시물은 삼성전자 주가를 70,500원이라 주장한다. https://example.org/stock';
+  });
+  const request = '삼성전자 주가와 수급 변화를 조사해 비교해 줘';
+  const result = await runCoreTurn({
+    sessionId: 'market-no-provider-evidence',
+    messages: [{ role: 'user', content: request }],
+    tools: [tool, webSearchTool, omniSearchTool, webFetchTool],
+    dispatchTool: async () => null, signal, userText: request,
+  }, { runResearch: async () => ({
+    ok: true, output: 'Web snippet: 70,500 KRW. https://example.org/stock',
+    sourceUrls: ['https://example.org/stock'], marketData: {
+      evidenceTexts: [], summary: '시세 공급자 0곳 검사 · 실제 호출 0곳 · 실패 이유: no-symbols',
+    },
+  }) });
+  expect(modelCalls).toBe(2);
+  expect(result.finalText).toContain(MARKET_DATA_NO_SOURCE_LINE);
+  expect(result.finalText).toContain('미검증 숫자');
+  expect(result.finalText).toContain('70500');
+  expect(result.finalText).toContain('시세 공급자 0곳 검사 · 실제 호출 0곳 · 실패 이유: no-symbols');
+});
+
+test('market summary and no-source warning survive a partial-research fallback answer', async () => {
+  let modelCalls = 0;
+  spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async () => {
+    modelCalls += 1;
+    return modelCalls === 1 ? 'provisional answer' : '웹 수치 70,500원은 확인되지 않았다.';
+  });
+  const request = 'compare bond yield changes';
+  const result = await runCoreTurn({
+    sessionId: 'market-fallback-summary', messages: [{ role: 'user', content: request }],
+    tools: [tool, webSearchTool, omniSearchTool, webFetchTool], dispatchTool: async () => null, signal, userText: request,
+  }, { runResearch: async () => ({
+    ok: false, output: 'Partial web snippet only',
+    marketData: { evidenceTexts: [], summary: '시세 공급자 0곳 검사 · 실제 호출 0곳 · 실패 이유: none/collector-error' },
+  }) });
+  expect(modelCalls).toBe(2);
+  expect(result.finalText).toContain(MARKET_DATA_NO_SOURCE_LINE);
+  expect(result.finalText).toContain('미검증 숫자');
+  expect(result.finalText).toContain('시세 공급자 0곳 검사 · 실제 호출 0곳 · 실패 이유: none/collector-error');
+});
 
 test('uses shared research-turn intent in chat surface and injects Bloom evidence', async () => {
   const request = 'compare bond yield changes';

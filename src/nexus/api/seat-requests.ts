@@ -18,6 +18,19 @@ import { publishInsideEvent } from './inside-events.js';
 
 export const SEAT_REQUESTS_PATH = '/v1/seat-requests';
 
+// 출처: #39459 WEBCHAT-REJECTED-TOKEN-NO-CRASH — seatAskClientId 허용 켈라스.
+// PWA randomId()(daemon-session generateSessionId)는 원점이 insecure(http://LAN-IP)면
+// `s-<ts36>-<rand36>` 폴백을 낸다 — 회원 sessionId 정책(webchat-session-owner
+// MEMBER_SESSION_ID)과 같은 폴백을 ask·poll·ack 3경로가 일관되게 받는다(JUD-B #123198).
+// OP 결정 #123699 — 수리 폴백 rand 는 crypto.getRandomValues 64bit(hex 16자 ⊆ base36
+// ≤16자)라 기존 정책을 그대로 통과한다(서버 변경 0 · hex32 유니언 폐기).
+const SEAT_ASK_CLIENT_ID = /^(?:[a-f0-9-]{36}|s-[0-9a-z]{1,16}-[0-9a-z]{1,16})$/i;
+
+function seatAskClientId(req: Request): string | null {
+  const clientId = req.headers.get('x-seat-ask-client');
+  return clientId !== null && SEAT_ASK_CLIENT_ID.test(clientId) ? clientId : null;
+}
+
 interface SeatRequestItem {
   receiptId: string;
   seat: string;
@@ -189,8 +202,8 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   if (req.method === 'GET') {
     const params = new URL(req.url).searchParams;
     if (params.get('answers') === '1') {
-      const clientId = req.headers.get('x-seat-ask-client');
-      if (!clientId || !/^[a-f0-9-]{36}$/i.test(clientId)) return jsonResponse({ error: 'bad_request' }, 400);
+      const clientId = seatAskClientId(req);
+      if (!clientId) return jsonResponse({ error: 'bad_request' }, 400);
       const base = deps.askDeps;
       const messages: Array<{ id: string; text: string; status: 'answered' | 'expired' }> = [];
       await deliverSeatAnswers({ ...base, channel: 'pwa', clientId, send: async (origin, text) => {
@@ -216,8 +229,8 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   if (req.method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
 
   if (new URL(req.url).searchParams.get('answers') === 'ack') {
-    const clientId = req.headers.get('x-seat-ask-client');
-    if (!clientId || !/^[a-f0-9-]{36}$/i.test(clientId)) return jsonResponse({ error: 'bad_request' }, 400);
+    const clientId = seatAskClientId(req);
+    if (!clientId) return jsonResponse({ error: 'bad_request' }, 400);
     let body: unknown;
     try { body = await req.json(); } catch { return jsonResponse({ error: 'bad_request' }, 400); }
     const ids = (body as { ids?: unknown } | null)?.ids;
@@ -250,8 +263,8 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   const text = input.seat === undefined ? (firstAddress?.body ?? input.text).trim() : input.text.trim();
   if (canonicalSeatIdSafe(seat.id) === 'TC' && parseSeatAsk(text)) {
     if (input.attachments !== undefined) return jsonResponse({ error: 'attachments-unsupported' }, 400);
-    const clientId = req.headers.get('x-seat-ask-client');
-    if (!clientId || !/^[a-f0-9-]{36}$/i.test(clientId)) return jsonResponse({ error: 'bad_request' }, 400);
+    const clientId = seatAskClientId(req);
+    if (!clientId) return jsonResponse({ error: 'bad_request' }, 400);
     let ask: string;
     try {
       ask = await askSeat(text, { channel: 'pwa', clientId }, (deps.ceoDeps ?? defaultCeoDeps)(),

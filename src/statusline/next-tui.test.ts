@@ -22,10 +22,13 @@ test('the build stamp is the commit time in KST as yymmdd_hhmm (UTC 15:25 is 00:
   expect(kstStamp(Date.UTC(2026, 11, 31, 15, 0) / 1000)).toBe('270101_0000');
 });
 
-test('official shows no stamp; dev shows its stamp, or leaves it out when the commit time is unknown', () => {
+test('both channels show a build stamp; checkout and plain-version rail installs stay dev', () => {
   const at = Date.UTC(2026, 10, 17, 10, 25) / 1000;
-  expect(versionLabel({ version: '0.3.27', source: 'installed' }, at)).toEqual({ channel: 'official', label: '0.3.27 · official', short: '0.3.27·official' });
-  expect(versionLabel(DEV, at)).toEqual({ channel: 'dev', label: '0.3.28-dev.0 · 261117_1925 · dev', short: '261117_1925·dev', stamp: '261117_1925' });
+  expect(versionLabel({ version: '0.3.27', source: 'installed', channel: 'official', builtAt: at }, at + 3600)).toEqual({
+    channel: 'official', label: '0.3.27 · official · 261117_1925', short: '261117_1925·official', stamp: '261117_1925',
+  });
+  expect(versionLabel({ version: '0.3.27', source: 'installed', channel: 'dev' }, at).channel).toBe('dev');
+  expect(versionLabel(DEV, at)).toEqual({ channel: 'dev', label: '0.3.28-dev.0 · dev · 261117_1925', short: '261117_1925·dev', stamp: '261117_1925' });
   expect(versionLabel(DEV, undefined)).toEqual({ channel: 'dev', label: '0.3.28-dev.0 · dev', short: 'dev' });
   // A release version run from a checkout is still dev (only an installed release is official).
   expect(versionLabel({ version: '0.3.27', source: 'checkout' }, at).channel).toBe('dev');
@@ -54,10 +57,10 @@ test('the footer: legacy facts, then cwd and the version; dev yellow, official g
   const definition = defaultStatuslineDefinition();
   const at = Date.UTC(2026, 10, 17, 10, 25) / 1000;
   const snapshot = nextTuiStatuslineSnapshot(INPUT, '/Users/me/repo', { ...DEV, commitTime: at }, '/Users/me');
-  expect(renderNextTuiStatusline(definition, snapshot, 160, false)).toBe('Turn running · Model gpt-sim · Queue 0 · Bg 0 · ~/repo · 0.3.28-dev.0 · 261117_1925 · dev');
-  expect(renderNextTuiStatusline(definition, snapshot, 160, true)).toContain('\x1b[33m0.3.28-dev.0 · 261117_1925 · dev\x1b[39m');
-  const official = nextTuiStatuslineSnapshot(INPUT, '/Users/me/repo', { version: '0.3.27', sha: 'a'.repeat(40), source: 'installed' }, '/Users/me');
-  expect(renderNextTuiStatusline(definition, official, 160, true)).toContain('\x1b[32m0.3.27 · official\x1b[39m');
+  expect(renderNextTuiStatusline(definition, snapshot, 160, false)).toBe('Turn running · Model gpt-sim · Queue 0 · Bg 0 · ~/repo · 0.3.28-dev.0 · dev · 261117_1925');
+  expect(renderNextTuiStatusline(definition, snapshot, 160, true)).toContain('\x1b[33m0.3.28-dev.0 · dev · 261117_1925\x1b[39m');
+  const official = nextTuiStatuslineSnapshot(INPUT, '/Users/me/repo', { version: '0.3.27', sha: 'a'.repeat(40), source: 'installed', channel: 'official', builtAt: at }, '/Users/me');
+  expect(renderNextTuiStatusline(definition, official, 160, true)).toContain('\x1b[32m0.3.27 · official · 261117_1925\x1b[39m');
   expect(renderNextTuiStatusline(definition, official, 160, false)).toContain('0.3.27 · official');
 });
 
@@ -68,7 +71,7 @@ test('a user statusline.yaml replaces the default; a broken one falls back with 
   writeFileSync(path, 'layouts:\n  - { band: lg, lines: 1, segments: [version] }\n');
   const custom = createNextTuiStatusline({ build: { ...DEV, commitTime: Date.UTC(2026, 10, 17, 10, 25) / 1000 }, cwd: () => dir, userPath: path, color: false });
   expect(custom.warning).toBeUndefined();
-  expect(custom.render(INPUT).shown).toBe('0.3.28-dev.0 · 261117_1925 · dev');
+  expect(custom.render(INPUT).shown).toBe('0.3.28-dev.0 · dev · 261117_1925');
   writeFileSync(path, 'layouts:\n  - { band: lg, lines: 3, segments: [nope] }\n');
   const broken = createNextTuiStatusline({ build: DEV, cwd: () => dir, userPath: path, color: false });
   expect(broken.warning).toMatch(/^Status line: .*statusline\.yaml has \d+ error\(s\) .* — using the default$/);
@@ -79,7 +82,7 @@ test('a user statusline.yaml replaces the default; a broken one falls back with 
 
 test('/status shows the same version label', () => {
   const base = { provider: 'openai-codex', model: 'gpt-sim', auth: 'oauth' as const, account: null };
-  expect(renderNextTuiStatus({ ...base, version: '0.3.28-dev.0 · 261117_1925 · dev' }).at(-1)).toBe('Version: 0.3.28-dev.0 · 261117_1925 · dev');
+  expect(renderNextTuiStatus({ ...base, version: '0.3.28-dev.0 · dev · 261117_1925' }).at(-1)).toBe('Version: 0.3.28-dev.0 · dev · 261117_1925');
   expect(renderNextTuiStatus(base).some((line) => line.startsWith('Version:'))).toBe(false);
 });
 
@@ -120,7 +123,7 @@ test('the build stamp lookup waits for the first painted footer', async () => {
   expect(footer.setCommitTime(Date.UTC(2026, 10, 17, 10, 25) / 1000)).toBe(true);
   expect(footer.setCommitTime(Date.UTC(2026, 10, 17, 10, 25) / 1000)).toBe(false);
   expect(footer.setCommitTime(undefined)).toBe(false);
-  expect(footer.render(INPUT).plain).toContain('0.3.28-dev.0 · 261117_1925 · dev');
+  expect(footer.render(INPUT).plain).toContain('0.3.28-dev.0 · dev · 261117_1925');
 });
 
 const STAMP = Date.UTC(2026, 10, 17, 10, 25) / 1000;
@@ -131,9 +134,9 @@ const footer = (input: Partial<typeof INPUT> & Record<string, unknown>, width: n
 test('footer snapshots: wide keeps the old sentence; below 120 the short line; a long turn outranks cwd and version', () => {
   const busy = { turnState: '응답 중', model: 'openai-codex/gpt-sim', queued: 2, backgroundTasks: 1, elapsedMs: 185_000, measuredUsage: { inputTokens: 14, outputTokens: 6 } };
   // ≥120 with room: the old sentence, then the cwd and the version.
-  expect(footer(busy, 200)).toBe('Turn running · Model openai-codex/gpt-sim · Elapsed 185.0s · Tokens 14/6 · Queue 2 · Bg 1 · ~/elanous-hq/worktrees/UX · 0.3.28-dev.0 · 261117_1925 · dev');
+  expect(footer(busy, 200)).toBe('Turn running · Model openai-codex/gpt-sim · Elapsed 185.0s · Tokens 14/6 · Queue 2 · Bg 1 · ~/elanous-hq/worktrees/UX · 0.3.28-dev.0 · dev · 261117_1925');
   // 130: the old sentence still fits with the cwd shortened to its folder.
-  expect(footer(busy, 130)).toBe('Turn running · Model openai-codex/gpt-sim · Elapsed 185.0s · Tokens 14/6 · Queue 2 · Bg 1 · UX · 0.3.28-dev.0 · 261117_1925 · dev');
+  expect(footer(busy, 130)).toBe('Turn running · Model openai-codex/gpt-sim · Elapsed 185.0s · Tokens 14/6 · Queue 2 · Bg 1 · UX · 0.3.28-dev.0 · dev · 261117_1925');
   // 125: with the old sentence the version would no longer fit, so the short line is drawn (cwd and version stay).
   expect(footer(busy, 125)).toBe('● running 3m · UX · 261117_1925·dev · gpt-sim · Q2·B1·14/6t');
   // 100 and 80 columns.
@@ -163,7 +166,7 @@ test('a turn-end summary or a hint takes only the turn part: cwd, version and a 
   expect(footer.render({ ...INPUT, width: 100 }, turnEnd).plain).toBe(`${turnEnd} · repo · 261117_1925·dev · gpt-sim · Q0·B0`);
   const wide = footer.render({ ...INPUT, width: 160 }, `${turnEnd} · Attachments 1/2 PgUp/PgDn`);
   expect(wide.plain.startsWith(`${turnEnd} · Attachments 1/2 PgUp/PgDn · `)).toBe(true);
-  expect(wide.plain).toContain('0.3.28-dev.0 · 261117_1925 · dev');
+  expect(wide.plain).toContain('0.3.28-dev.0 · dev · 261117_1925');
   // facts (what the logic reads) stay the turn's own text.
   expect(wide.facts.startsWith('Turn running')).toBe(true);
   // A user layout keeps its own segments around the replaced turn.

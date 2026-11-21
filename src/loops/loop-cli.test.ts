@@ -27,7 +27,7 @@ describe('loop activity CLI', () => {
     const activity = command().commands.find(item => item.name() === 'loop')?.commands.find(item => item.name() === 'activity');
     expect(activity).toBeDefined();
     expect(command().commands.find(item => item.name() === 'loop')!.commands.map(item => item.name())).toEqual([
-      'list', 'activity', 'status', 'start', 'stop', 'run', 'package',
+      'list', 'activity', 'status', 'start', 'stop', 'cron', 'run', 'package',
     ]);
     expect(activity!.helpInformation()).toContain('--since <duration-or-date>');
     expect(activity!.helpInformation()).toContain('24h');

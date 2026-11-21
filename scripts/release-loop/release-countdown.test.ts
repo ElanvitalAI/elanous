@@ -139,7 +139,7 @@ test('COUNTDOWN-NODE: an image signal later than the notice cadence still turns 
     expect(seen).toEqual([
       { codes: ['IMAGE_NOT_READY'], longHold: null },
       { codes: ['IMAGE_NOT_READY'], longHold: { since: start.toISOString(), codes: ['IMAGE_NOT_READY'],
-        hint: expect.stringContaining(`eln release critpath --version ${version}`), notifiedAt: new Date(start.getTime() + COUNTDOWN_LONG_HOLD_NOTICE_MS).toISOString() } },
+        hint: expect.stringContaining(`eln release prepare --version ${version}`), notifiedAt: new Date(start.getTime() + COUNTDOWN_LONG_HOLD_NOTICE_MS).toISOString() } },
     ]);
     expect(receipt(root, version)).toMatchObject({ go: true, phase: 'ready', longHold: null });
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -169,7 +169,7 @@ test('COUNTDOWN-NODE: a long hold emits the QUICKPASS notice with its codes at m
     ]);
     for (const notice of notices) {
       expect(notice).toMatchObject({ version, since: start.toISOString(), codes: ['HOST_UNREACHABLE'] });
-      expect(String(notice.hint)).toContain(`eln release critpath --version ${version}`);
+      expect(String(notice.hint)).toContain(`eln release prepare --version ${version}`);
     }
     expect(reachable).toEqual([]);
   } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
@@ -186,7 +186,7 @@ test('COUNTDOWN-NODE: a hold fails only on the explicit deadline — the schedul
     await expect(waitForGateImageT60(graphContext(version), { ledgerRoot: root, now: () => instant,
       probes: { ...goProbes, hostReachable: () => false },
       sleep: async () => { instant = new Date(instant.getTime() + RELEASE_CUT_DUE_WINDOW_MS); } }))
-      .rejects.toThrow(/RELEASE_WINDOW_EXPIRED.*HOST_UNREACHABLE.*eln release critpath --version/);
+      .rejects.toThrow(/RELEASE_WINDOW_EXPIRED.*HOST_UNREACHABLE.*eln release prepare --version/);
     expect(receipt(root, version)).toMatchObject({ go: false, phase: 'hold', holds: [{ code: 'HOST_UNREACHABLE' }] });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

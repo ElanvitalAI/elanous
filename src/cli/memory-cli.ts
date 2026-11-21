@@ -205,6 +205,7 @@ export function registerMemoryCommands(program: Command): void {
     const summary = opts.apply ? applySeatMemoryImport(plan) : summarizeSeatMemoryImport(plan, false);
     ui.header(`seat memory import ${opts.apply ? '(applied)' : '(dry-run — nothing written)'} → ${plan.to}`);
     console.log(`  create ${summary.create} · update ${summary.update} · same ${summary.same} · skipped ${summary.skipped} · index lines dropped ${plan.indexDroppedLines}`);
+    if (plan.supplementalIndex) console.log(`  unindexed reference ${plan.supplementalIndex.file}`);
     for (const [reason, count] of Object.entries(summary.skippedByReason)) console.log(`  skipped ${reason}: ${count}`);
     // 비밀처럼 보인 파일은 이름만(본문·일치 값 0).
     for (const name of summary.refusedNames) console.log(`  refused (secret-pattern): ${name}`);

@@ -65,6 +65,32 @@ describe('daemon-session helpers', () => {
     expect(id.trim()).toBe(id);
   });
 
+  // 출처: #39459 JUD HOLD #123572(OP #123577) · OP 결정 #123699 — insecure 원점 폴백 계약:
+  // randomUUID 부재 시 crypto.getRandomValues 64bit(8바이트 hex 16자) — Math.random 추측
+  // 가능 폴백은 폐기(0번 사용). 이 id 는 seatAskClientId(응답 조회·ack 분리 키)·회원
+  // session owner 로도 쓰인다. hex 16자는 기존 정책 {1,16}을 그대로 통과한다(서버 변경 0).
+  test('generateSessionId insecure fallback = s-<ts36>-<hex64> from crypto.getRandomValues', () => {
+    const savedCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+    let calls = 0;
+    let mathRandomCalls = 0;
+    const originalMathRandom = Math.random;
+    Math.random = () => { mathRandomCalls += 1; return originalMathRandom(); };
+    Object.defineProperty(globalThis, 'crypto', {
+      configurable: true,
+      value: { getRandomValues: (buf: Uint8Array) => { calls += 1; buf.fill(0); return buf; } },
+    });
+    try {
+      const id = generateSessionId();
+      expect(calls).toBe(1); // 출처: #39459 HOLD #123572/#123699 — getRandomValues 정확히 1회(8바이트=64bit)
+      expect(id).toMatch(/^s-[0-9a-z]+-[0-9a-f]{16}$/); // 출처: #39459 OP #123699 — hex 16자(64bit)
+      expect(mathRandomCalls).toBe(0); // 출처: #39459 OP #123699 — Math.random 0번
+    } finally {
+      Math.random = originalMathRandom;
+      if (savedCrypto) Object.defineProperty(globalThis, 'crypto', savedCrypto);
+      else Reflect.deleteProperty(globalThis, 'crypto');
+    }
+  });
+
   test('loadSessionId returns null when storage is empty', () => {
     expect(loadSessionId()).toBeNull();
   });

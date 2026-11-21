@@ -7,8 +7,13 @@ export const marketSecretLookup: MarketSecretLookup = async (id) => {
   return getSecretAsync(id);
 };
 
+/** Only a completed lookup with no value is credential absence; lookup errors keep their own failure path. */
+export class MissingMarketCredentialError extends Error {
+  constructor() { super('key_required'); this.name = 'MissingMarketCredentialError'; }
+}
+
 export async function requiredMarketSecret(id: string, lookup: MarketSecretLookup): Promise<string> {
   const value = await lookup(id);
-  if (!value?.trim()) throw new Error('key_required');
+  if (!value?.trim()) throw new MissingMarketCredentialError();
   return value;
 }

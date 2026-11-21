@@ -36,8 +36,8 @@ export const shellPollRuntime: ToolRuntime<Record<string, unknown>, { output: st
 export const shellKillRuntime: ToolRuntime<Record<string, unknown>, { output: string }> = {
   id: 'shell_kill',
   spec: buildShellKillTool(),
-  async run(req) {
-    return dispatchShellKill(req, getShellRegistry());
+  async run(req, ctx) {
+    return dispatchShellKill(req, getShellRegistry(), ctx.sessionId ?? ctx.parentSessionId);
   },
 };
 

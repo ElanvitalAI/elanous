@@ -11,8 +11,13 @@ import type { WebSearchHit, WebSearchProvider } from '../web-search/provider.js'
 import { debug } from '../debug/log.js';
 import { dispatchWebFetch } from '../skills/tools/webfetch.js';
 import { CRAWL_PROVIDERS } from '../research-bridge/crawl.js';
+import { wantsXSearch } from '../web-search/x-intent.js';
 
 const RESEARCH_EXA_TIMEOUT_MS = 4_500;
+// Grok needs time for search and inference, while a silent Grok must still leave a web fallback window.
+const RESEARCH_SOCIAL_SEARCH_BUDGET_MS = 30_000;
+const RESEARCH_SOCIAL_WEB_FALLBACK_MIN_MS = 5_000;
+const RESEARCH_SOCIAL_GROK_BUDGET_MS = RESEARCH_SOCIAL_SEARCH_BUDGET_MS - RESEARCH_SOCIAL_WEB_FALLBACK_MIN_MS;
 // Leave scheduler/logging headroom under the user-visible 15s aggregate cap.
 export const RESEARCH_SEARCH_BUDGET_MS = 14_500;
 const ENGINE_BREAKER_FAILURE_LIMIT = 2;
@@ -47,6 +52,8 @@ export type AxisSearchHit = WebSearchHit & { engine?: string };
 export interface AxisSearchResult {
   hits: AxisSearchHit[];
   errors: string[];
+  /** Provider synthesis over its returned citations, never an excerpt from one page. */
+  summaries?: Array<{ provider: string; text: string; urls: string[] }>;
   /** Native aggregate search deadline signal; provider messages cannot set this field. */
   budgetExhausted?: boolean;
 }
@@ -86,6 +93,10 @@ export interface ResearchSearchRouting {
   topic?: SearchTopic;
   /** Probe result (fixed reasons). Absent = derived from the supplied ready snapshot. */
   availability?: readonly SearchProviderAvailability[];
+  /** Internal bounded test seam; never raises the production Grok share of the research deadline. */
+  socialGrokBudgetMs?: number;
+  /** Carry the same absolute social deadline through the lazy provider probe. */
+  socialDeadlineAt?: number;
 }
 
 interface ProviderHealth {
@@ -93,11 +104,28 @@ interface ProviderHealth {
   open: boolean;
 }
 
-/** Build one bounded searcher per research prepass. Grok stays on explicit X routes.
+type SocialSite = 'reddit' | 'x' | null;
+
+function socialSiteForAxis(query: string, context?: AxisSearchContext): SocialSite {
+  const text = `${query}\n${context?.questionPrompt ?? ''}`;
+  if (/(?:^|[^\p{L}\p{N}_])(?:reddit|레딧|r\/[A-Za-z0-9_]+)(?![\p{L}\p{N}_])/iu.test(text)) return 'reddit';
+  return wantsXSearch(text) ? 'x' : null;
+}
+
+function isSocialSource(raw: string, site: Exclude<SocialSite, null>): boolean {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return site === 'reddit' ? host === 'reddit.com' || host.endsWith('.reddit.com') || host === 'redd.it'
+      : host === 'x.com' || host === 'www.x.com' || host === 'twitter.com' || host === 'www.twitter.com';
+  } catch { return false; }
+}
+
+/** Build one bounded searcher per research prepass. Explicit Reddit/X axes try Grok first.
  * Provider order: `shadow` (default) keeps the legacy order (Firecrawl → BYOK → keyless ddg) and only records the
  * routed choice; `on` uses SEARCH_PROVIDER_ROUTES for the first call AND the fallback cascade.
- * Per-engine serialization lets a timeout open that engine's
- * breaker before queued Bloom axes start. */
+ * Per-engine serialization counts consecutive failures before queued Bloom axes start. */
 export function createResearchAxisSearcher(
   availableProviders?: readonly WebSearchProvider[],
   now: () => number = Date.now,
@@ -105,9 +133,10 @@ export function createResearchAxisSearcher(
   routing: ResearchSearchRouting = {},
 ): AxisSearch {
   const deadline = inheritedDeadline ?? now() + RESEARCH_SEARCH_BUDGET_MS;
+  const socialDeadline = routing.socialDeadlineAt ?? (inheritedDeadline ?? now() + RESEARCH_SOCIAL_SEARCH_BUDGET_MS);
   if (!availableProviders) {
     let initialized: Promise<AxisSearch> | undefined;
-    return async (query, signal) => {
+    return async (query, signal, context) => {
       // #38331 follow-up (GROUNDING-FIRST-ANSWER-30S): check the caller's abort BEFORE starting the shared probe. Checked
       // after it, a call that arrived already aborted (a head start reaching the searcher after its turn settled) threw
       // here and left the probe — which rejects with that same abort reason — awaited by no one: an unhandled rejection.
@@ -115,12 +144,13 @@ export function createResearchAxisSearcher(
       if (!initialized) {
         initialized = probeResearchWebSearchProvidersAsync(signal,
           Math.max(1, Math.min(15_000, deadline - now())))
-          .then(probe => createResearchAxisSearcher(probe.providers, now, deadline, { ...routing, availability: probe.availability }));
+          .then(probe => createResearchAxisSearcher(probe.providers, now, deadline,
+            { ...routing, availability: probe.availability, socialDeadlineAt: socialDeadline }));
         // Handler at creation: every caller still awaits `initialized` and receives its rejection; this only stops the
         // runtime from reporting it when the last waiter has gone.
         initialized.catch(() => undefined);
       }
-      return (await initialized)(query, signal);
+      return (await initialized)(query, signal, context);
     };
   }
   const metadata = new Map(CRAWL_PROVIDERS.map(provider => [provider.id, provider]));
@@ -129,6 +159,11 @@ export function createResearchAxisSearcher(
   const allowed = availableProviders.filter(provider => provider.id !== 'grok' && provider.id !== 'grok-api'
     && descriptor(provider.id)?.provides.includes('search.web@1'))
     .sort((a, b) => priority(a.id) - priority(b.id));
+  const socialProviders = availableProviders.filter(provider => ['grok-social', 'grok', 'grok-api'].includes(provider.id))
+    .sort((a, b) => (a.id === 'grok' ? 0 : a.id === 'grok-social' ? 1 : 2)
+      - (b.id === 'grok' ? 0 : b.id === 'grok-social' ? 1 : 2));
+  const socialGrokBudgetMs = Math.max(1, Math.min(routing.socialGrokBudgetMs ?? RESEARCH_SOCIAL_GROK_BUDGET_MS,
+    RESEARCH_SOCIAL_GROK_BUDGET_MS));
   const mode = routing.mode ?? searchProviderRoutingMode();
   const topic = routing.topic ?? 'default';
   // A routed provider is usable only when the ready snapshot holds it (same credential gate for first call and fallback).
@@ -146,7 +181,7 @@ export function createResearchAxisSearcher(
   });
   const webFallback = mode === 'on' ? routed : allowed;
   const keylessFallback = webFallback.find(provider => descriptor(provider.id)?.tier === 'free')?.id ?? null;
-  const health = new Map(webFallback.map(provider => [provider.id, { failures: 0, open: false }]));
+  const health = new Map([...webFallback, ...socialProviders].map(provider => [provider.id, { failures: 0, open: false }]));
   let searchBudgetExhausted = false;
   const tails = new Map<string, Promise<void>>();
 
@@ -158,6 +193,9 @@ export function createResearchAxisSearcher(
     excluded: availableProviders.filter(provider => !webFallback.some(allowedProvider => allowedProvider.id === provider.id))
       .map(provider => provider.id),
     budgetMs: RESEARCH_SEARCH_BUDGET_MS,
+    socialBudgetMs: RESEARCH_SOCIAL_SEARCH_BUDGET_MS,
+    socialGrokBudgetMs: RESEARCH_SOCIAL_GROK_BUDGET_MS,
+    socialWebFallbackMinMs: RESEARCH_SOCIAL_WEB_FALLBACK_MIN_MS,
   });
 
   const enqueue = <T>(providerId: string, run: () => Promise<T>): Promise<T> => {
@@ -167,32 +205,47 @@ export function createResearchAxisSearcher(
     return current;
   };
 
-  return async (query, signal) => {
+  return async (query, signal, context) => {
     const hits: AxisSearchHit[] = [];
     const errors: string[] = [];
+    const summaries: NonNullable<AxisSearchResult['summaries']> = [];
+    const perEngine: Record<string, { hits: number; durationMs: number; error?: string }> = {};
     let budgetExhausted = searchBudgetExhausted;
-    if (mode === 'on' && webFallback.length === 0) {
+    const socialSite = socialSiteForAxis(query, context);
+    const requestDeadline = socialSite ? socialDeadline : deadline;
+    const fallback = socialSite ? [...socialProviders, ...webFallback] : webFallback;
+    const socialGrokDeadline = Math.min(requestDeadline - RESEARCH_SOCIAL_WEB_FALLBACK_MIN_MS,
+      now() + socialGrokBudgetMs);
+    if (mode === 'on' && fallback.length === 0) {
       // Loud, coded failure: the whole topic route is unavailable (reasons were emitted with provider-selected).
       return { hits, errors: [searchRouteExhaustedMessage(selection)] };
     }
     const execute = async (provider: WebSearchProvider): Promise<boolean> => enqueue(provider.id, async () => {
       const state = health.get(provider.id)!;
+      const isGrok = provider.id === 'grok-social' || provider.id === 'grok' || provider.id === 'grok-api';
       // A queued call can find the breaker opened by an earlier call on the same engine: same skip, same event.
       if (state.open) {
         debug.log('research.search', 'provider-skipped', { provider: provider.id, reason: 'breaker-open' });
         return false;
       }
-      const remainingMs = deadline - now();
+      const remainingMs = requestDeadline - now();
       if (remainingMs <= 0) {
-        state.open = true;
         searchBudgetExhausted = true;
         budgetExhausted = true;
         errors.push(`${provider.id}: research search budget exhausted`);
+        debug.log('research.search', 'provider-skipped', { provider: provider.id, reason: 'research-budget-exhausted' });
+        return false;
+      }
+      const grokRemainingMs = isGrok && socialSite ? socialGrokDeadline - now() : Number.POSITIVE_INFINITY;
+      if (grokRemainingMs <= 0) {
+        debug.log('research.search', 'provider-skipped', { provider: provider.id, reason: 'social-grok-budget-exhausted' });
         return false;
       }
       const timeoutMs = provider.id === 'exa'
         ? Math.min(RESEARCH_EXA_TIMEOUT_MS, remainingMs)
-        : remainingMs;
+        : socialSite && !isGrok
+          ? Math.min(RESEARCH_SEARCH_BUDGET_MS, remainingMs)
+          : Math.min(remainingMs, grokRemainingMs);
       const startedAt = now();
       try {
         const controller = new AbortController();
@@ -215,26 +268,43 @@ export function createResearchAxisSearcher(
           if (timer !== undefined) clearTimeout(timer);
           signal?.removeEventListener('abort', abortFromCaller);
         }
-        if (result.hits.length === 0) {
+        const socialHits = isGrok && socialSite ? result.hits.filter(hit => isSocialSource(hit.url, socialSite)) : [];
+        const acceptedHits = isGrok && socialSite && socialHits.length === 0 ? [] : result.hits;
+        if (acceptedHits.length === 0) {
           state.failures += 1;
           if (state.failures >= ENGINE_BREAKER_FAILURE_LIMIT) state.open = true;
         } else {
           state.failures = 0;
-          hits.push(...result.hits.map(hit => ({ ...hit, engine: provider.id })));
+          hits.push(...acceptedHits.map(hit => ({ ...hit, engine: provider.id })));
+          if (isGrok && socialSite === 'reddit' && result.note?.trim() && socialHits.length > 0) {
+            // The provider note can mention URLs outside the accepted hit set. Keep only its prose;
+            // the separately bound URL set below is the sole citable source list.
+            const text = result.note.replace(/\[[^\]]*\]\(https?:\/\/[^)]*\)/giu, '')
+              .replace(/https?:\/\/\S+/giu, '').trim().slice(0, 1500);
+            if (text) summaries.push({ provider: provider.id, text, urls: acceptedHits.map(hit => hit.url) });
+          }
         }
         debug.log('research.search', 'provider-complete', {
-          provider: provider.id, queryLength: query.length, hits: result.hits.length,
+          provider: provider.id, queryLength: query.length, hits: acceptedHits.length,
+          ...(isGrok && socialSite === 'reddit' ? { redditHits: socialHits.length } : {}),
+          ...(isGrok && socialSite === 'x' ? { xHits: socialHits.length } : {}),
           durationMs: now() - startedAt, breakerOpen: state.open,
         });
-        return result.hits.length > 0;
+        perEngine[provider.id] = { hits: acceptedHits.length, durationMs: now() - startedAt };
+        return acceptedHits.length > 0;
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const rawMessage = error instanceof Error ? error.message : String(error);
+        // Grok's 401/403 body may contain an internal team id. Keep a fixed user-facing reason.
+        const message = isGrok && /grok responses (?:401|403):/i.test(rawMessage)
+          ? 'grok credential or quota unavailable' : rawMessage;
         const timeout = error instanceof Error && /timeout|timed out|abort/i.test(`${error.name} ${error.message}`);
-        const quota = /quota|credit|rate.?limit|\b429\b|exhaust/i.test(message);
+        const quota = /quota|credit|rate.?limit|\b429\b|exhaust/i.test(message)
+          || isGrok && /grok responses 403:/i.test(rawMessage);
         const blocked = error instanceof Error && 'reason' in error && error.reason === 'blocked';
         state.failures += 1;
-        if (timeout || quota || blocked || state.failures >= ENGINE_BREAKER_FAILURE_LIMIT) state.open = true;
+        if (quota || blocked || state.failures >= ENGINE_BREAKER_FAILURE_LIMIT) state.open = true;
         errors.push(`${provider.id}: ${message}`);
+        perEngine[provider.id] = { hits: 0, durationMs: now() - startedAt, error: message };
         debug.log('research.search', 'provider-failed', {
           provider: provider.id, queryLength: query.length, durationMs: now() - startedAt,
           timeout, quota, blocked, failures: state.failures, breakerOpen: state.open,
@@ -242,8 +312,8 @@ export function createResearchAxisSearcher(
         return false;
       }
     });
-    const runWebFallback = async (): Promise<void> => {
-      for (const provider of webFallback) {
+    const runProviderChain = async (providers: readonly WebSearchProvider[]): Promise<void> => {
+      for (const provider of providers) {
         if (health.get(provider.id)?.open) {
           debug.log('research.search', 'provider-skipped', { provider: provider.id, reason: 'breaker-open' });
           continue;
@@ -251,9 +321,18 @@ export function createResearchAxisSearcher(
         if (await execute(provider)) return;
       }
     };
-    await runWebFallback();
+    if (socialSite) {
+      // Keep social and ordinary web evidence from the same query; each chain keeps its own fallback order.
+      await Promise.all([runProviderChain(socialProviders), runProviderChain(webFallback)]);
+      hits.sort((a, b) => Number(socialProviders.some(provider => provider.id === b.engine))
+        - Number(socialProviders.some(provider => provider.id === a.engine)));
+      debug.log('research.search', 'social-parallel-complete', {
+        queryLength: query.length, socialSite, perEngine, hits: hits.length,
+      });
+    } else await runProviderChain(webFallback);
     if (hits.length === 0 && errors.length === 0) errors.push('no healthy research search provider');
-    return { hits, errors, ...(budgetExhausted || searchBudgetExhausted ? { budgetExhausted: true } : {}) };
+    return { hits, errors, ...(summaries.length ? { summaries } : {}),
+      ...(budgetExhausted || searchBudgetExhausted ? { budgetExhausted: true } : {}) };
   };
 }
 
@@ -353,6 +432,13 @@ function appendSearchEvidence(
       group.error = group.error ? `${group.error}; ${message}` : message;
       group.evidence.push(failedEvidence(question, call.query, message, observedAt));
     }
+  }
+  for (const summary of response.summaries ?? []) {
+    group.evidence.push({
+      questionId: question.id, sourceKind: 'search-summary:grok', source: 'grok-search-summary', observedAt,
+      content: JSON.stringify({ provider: summary.provider, summary: summary.text, citationUrls: summary.urls }),
+      outcome: 'partial', truncated: true,
+    });
   }
   for (const message of response.errors) {
     group.error = group.error ? `${group.error}; ${message}` : message;

@@ -16,6 +16,7 @@ import { dirname } from 'node:path';
 import { memoryDbPath, memoryDbPathIn, mergeStrayMemoryDbOnce, migrateLegacyMemoryDb, strayProdMemoryDbPath } from './memory-db-path.js';
 import { provenanceRefs, provenanceTags, elanousSelfProvenance } from './provenance.js';
 import { within } from '../time/db-window.js';
+import { debug } from '../debug/log.js';
 
 /** Cross-surface memory DB path — managed memory 네임스페이스(memory-db-path). scoped:
  *  ELANOUS_STATE_DIR 격리 인스턴스는 각자 ambient-recall store(운영 무오염). 종전 `~/.elanous/conatus/`
@@ -65,6 +66,18 @@ export interface SurfaceEventRow {
  *  않는다(대표 지시 2026-07-08: Conatus/finance 는 퍼스트 고객이지 코어 아님). 발송/기록
  *  주체가 domain 을 명시해야 하며(finance·elanous·ops …), 미지정만 이 중립 도메인으로. */
 export const DEFAULT_MEMORY_DOMAIN = 'general';
+/** Raw signal rows follow the logs.db seven-day default rather than memory's myelin retention. */
+export const SURFACE_SIGNAL_RETENTION_DAYS = 7;
+
+/** Producer contracts that remain observable signals without entering recallable memory. */
+const LOW_SIGNAL_ROUTES = [
+  { surface: 'ext:tui-observe', kind: 'frame' },
+  { surface: 'context:external', kind: 'exit' },
+  { surface: 'ext:claude-code', kind: 'utterance' },
+] as const;
+const isLowSignal = (surface: string, kind?: string | null): boolean =>
+  LOW_SIGNAL_ROUTES.some(route => route.surface === surface && route.kind === kind);
+const LOW_SIGNAL_SQL = LOW_SIGNAL_ROUTES.map(route => `(surface='${route.surface}' AND kind='${route.kind}')`).join(' OR ');
 
 /** kind별 기본 현저성 (P0 룰 — P2에서 LLM/RPE로 정교화). */
 export function importanceByKind(kind?: string | null): number {
@@ -104,6 +117,17 @@ export function openSurfaceEventsDb(path: string = surfaceEventsDbPath()): Datab
     category TEXT, domain TEXT,
     recall_count INT DEFAULT 0, consolidated INT DEFAULT 0
   )`);
+  // Raw observations remain queryable as signals, without entering episodic memory or its FTS index.
+  db.run(`CREATE TABLE IF NOT EXISTS signals(
+    id TEXT PRIMARY KEY, ts TEXT NOT NULL,
+    surface TEXT NOT NULL, direction TEXT NOT NULL, kind TEXT,
+    session_id TEXT, thread_id TEXT,
+    text TEXT NOT NULL, summary TEXT,
+    importance INT, tags TEXT, refs TEXT,
+    category TEXT, domain TEXT
+  )`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_signals_surface ON signals(surface, kind)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_events_surface ON events(surface, direction)`);
   // GEN 마이그레이션 — 기존 DB에 category/domain 없으면 추가.
@@ -116,10 +140,12 @@ export function openSurfaceEventsDb(path: string = surfaceEventsDbPath()): Datab
   db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
     id UNINDEXED, search_text, tokenize = 'porter'
   )`);
+  let mergedStrayEvents = false;
   if (path !== ':memory:' && path === surfaceEventsDbPath()) {
     // Pre-fix prod-stamped writers left rows in ~/.elanous/surface_events.db; fold them in for every reader.
     try {
       const result = mergeStrayMemoryDbOnce(db, 'surface_events.db', ['events', 'events_fts'], path);
+      mergedStrayEvents = Boolean(result && !result.skipped && (result.merged.events ?? 0) > 0);
       if (result?.skipped === 'busy') void import('../debug/log.js').then(({ debug }) =>
         debug.log('memory.db', 'stray-merge-busy', { name: 'surface_events.db', ...result }, { level: 'warn' })).catch(() => {});
       else if (result && !result.skipped) void import('../debug/log.js').then(({ debug }) =>
@@ -129,6 +155,41 @@ export function openSurfaceEventsDb(path: string = surfaceEventsDbPath()): Datab
       void import('../debug/log.js').then(({ debug }) =>
         debug.log('memory.db', 'stray-merge-failed', { name: 'surface_events.db', reason }, { level: 'warn' })).catch(() => {});
     }
+  }
+  // One-time upgrade of old low-signal memory rows. Keep the same ids and metadata for
+  // operational signal readers; remove their FTS entries so recall cannot resurrect them.
+  db.run('CREATE TABLE IF NOT EXISTS signal_migrations (version INTEGER PRIMARY KEY)');
+  // A stray merge can commit and update its marker before the signal transaction fails.
+  // Check for remaining rows on every open so the next process can finish that migration.
+  const pendingSignalRows = Boolean(db.prepare(`SELECT 1 FROM events WHERE ${LOW_SIGNAL_SQL} LIMIT 1`).get());
+  if (mergedStrayEvents || pendingSignalRows || !db.prepare('SELECT version FROM signal_migrations WHERE version=1').get()) {
+    db.transaction(() => {
+      db.run(`INSERT OR IGNORE INTO signals (id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain)
+        SELECT id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain
+        FROM events WHERE ${LOW_SIGNAL_SQL}`);
+      db.run(`DELETE FROM events_fts WHERE id IN (SELECT id FROM events WHERE ${LOW_SIGNAL_SQL})`);
+      db.run(`DELETE FROM events WHERE ${LOW_SIGNAL_SQL}`);
+      db.run('INSERT OR IGNORE INTO signal_migrations(version) VALUES (1)');
+    })();
+  }
+  // Release-graph delivery can be replayed after the seven-day signal window.
+  // Keep only its stable receipt key and event id after the raw signal expires.
+  const hasDeliveryReceipts = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_delivery_receipts'").get());
+  if (!hasDeliveryReceipts) {
+    const safeRefs = "CASE WHEN json_valid(refs) THEN refs ELSE '{}' END";
+    const eventId = `json_extract(${safeRefs}, '$.eventId')`;
+    const subscriberId = `json_extract(${safeRefs}, '$.subscriberId')`;
+    db.transaction(() => {
+      db.run(`CREATE TABLE IF NOT EXISTS external_delivery_receipts(
+        event_id TEXT NOT NULL, subscriber_id TEXT NOT NULL, surface_event_id TEXT NOT NULL,
+        PRIMARY KEY(event_id, subscriber_id)
+      )`);
+      for (const table of ['events', 'signals']) {
+        db.run(`INSERT OR IGNORE INTO external_delivery_receipts(event_id, subscriber_id, surface_event_id)
+          SELECT ${eventId}, ${subscriberId}, id FROM ${table}
+          WHERE surface='context:external' AND typeof(${eventId})='text' AND typeof(${subscriberId})='text'`);
+      }
+    })();
   }
   return db;
 }
@@ -141,17 +202,23 @@ export function recordEvent(db: Database, evt: SurfaceEventInput): string {
   const importance = evt.importance ?? importanceByKind(evt.kind);
   const category = evt.category ?? categoryOfKind(evt.kind);   // GEN
   const domain = evt.domain ?? DEFAULT_MEMORY_DOMAIN;           // GEN — 코어 중립(미지정=general)
+  const signal = isLowSignal(evt.surface, evt.kind);
   db.transaction(() => {
     db.run(
-      `INSERT INTO events (id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain)
+      `INSERT INTO ${signal ? 'signals' : 'events'} (id, ts, surface, direction, kind, session_id, thread_id, text, summary, importance, tags, refs, category, domain)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, ts, evt.surface, evt.direction, evt.kind ?? null,
        evt.sessionId ?? null, evt.threadId ?? null,
        evt.text, summary, importance, evt.tags ?? null, evt.refs ?? null, category, domain],
     );
-    db.run(`INSERT INTO events_fts (id, search_text) VALUES (?, ?)`,
+    if (!signal) db.run(`INSERT INTO events_fts (id, search_text) VALUES (?, ?)`,
       [id, `${summary}\n${evt.text}\n${evt.tags ?? ''}`]);
   })();
+  if (signal) {
+    // One effect row per accepted input. The daemon's logs.db sink receives metadata only.
+    try { debug.log('memory.signal', 'routed', { id, surface: evt.surface, kind: evt.kind ?? null }); }
+    catch { /* observation cannot make a persisted signal fail */ }
+  }
   return id;
 }
 
@@ -251,8 +318,21 @@ export function querySurfaceUtterances(db: Database, opts: SurfaceUtteranceQuery
   const where = ["julianday(e.ts) >= julianday(?)", "julianday(e.ts) < julianday(?)", "e.direction = 'inbound'", "e.kind IN ('utterance', 'qna')"];
   const params: string[] = [opts.from, opts.to];
   if (opts.surface) { where.push('e.surface = ?'); params.push(opts.surface); }
+  const projection = (table: 'events' | 'signals'): string => {
+    const columns = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name));
+    const column = (name: string, fallback: string) => columns.has(name) ? name : `${fallback} AS ${name}`;
+    return `SELECT id, ts, surface, direction, kind, session_id, thread_id, text, summary,
+      importance, tags, refs, ${column('category', 'NULL')}, ${column('domain', 'NULL')},
+      ${column('recall_count', '0')}, ${column('consolidated', '0')}, ${column('tier', 'NULL')}
+      FROM ${table}`;
+  };
+  const hasSignals = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='signals'").get());
   const rows = db.prepare(
-    `SELECT e.* FROM events e WHERE ${where.join(' AND ')} ORDER BY julianday(e.ts) ASC, e.id ASC`,
+    `WITH utterances AS (
+       ${projection('events')}
+       ${hasSignals ? `UNION ALL ${projection('signals')}` : ''}
+     )
+     SELECT e.* FROM utterances e WHERE ${where.join(' AND ')} ORDER BY julianday(e.ts) ASC, e.id ASC`,
   ).all(...params) as SurfaceEventRow[];
   if (opts.origin === undefined) return rows;
   const wanted = new Set<SurfaceUtteranceOrigin>(typeof opts.origin === 'string' ? [opts.origin] : opts.origin);
@@ -463,20 +543,40 @@ export function classifyTier(ageDays: number, stability: number): 'hot' | 'warm'
   return 'cold';
 }
 
-export interface DecayResult { hot: number; warm: number; cold: number; changed: number }
+export interface DecayResult {
+  hot: number; warm: number; cold: number; changed: number;
+  /** decay가 실제 처리한 행의 전→후 계층 효과 — 전후 재조회 아님(다른 연결의 삽입·삭제 간섭이
+   *  구조적으로 0 · JUD HOLD #117655 3차). */
+  effects: { promoted: number; demoted: number; retained: number };
+}
+
+/** 계층 서수 — hot < warm < cold(효과 수 집계용). */
+const TIER_ORDER: Record<'hot' | 'warm' | 'cold', number> = { hot: 0, warm: 1, cold: 2 };
 
 /** ★ M1 — 전 이벤트 tier 를 stability 기반으로 재계산·갱신(배치). 삭제하지 않는다(강등만).
  *  knowledge-ingest 크론이 pruneStaleEvents 앞에서 호출. 계층 분포 반환. */
-export function applyMemoryDecay(db: Database, opts: { nowMs?: number } = {}): DecayResult {
+export function applyMemoryDecay(db: Database, opts: {
+  nowMs?: number;
+  /** 보정된 stability 곡선(MEM-STABILITY-DAYS-CALIBRATION · 2026-11-21) — 생략 시 기본 곡선. */
+  stability?: (importance: number | null | undefined, recallCount: number | null | undefined) => number;
+} = {}): DecayResult {
   const nowMs = opts.nowMs ?? Date.now();
+  const stability = opts.stability ?? stabilityDays;
   const rows = db.prepare(`SELECT id, ts, importance, recall_count, tier FROM events`).all() as Array<{ id: string; ts: string; importance: number | null; recall_count: number | null; tier: string | null }>;
-  const out: DecayResult = { hot: 0, warm: 0, cold: 0, changed: 0 };
+  const out: DecayResult = { hot: 0, warm: 0, cold: 0, changed: 0, effects: { promoted: 0, demoted: 0, retained: 0 } };
   const upd = db.prepare(`UPDATE events SET tier = ? WHERE id = ?`);
   const tx = db.transaction((items: typeof rows) => {
     for (const r of items) {
       const ageDays = Math.max(0, (nowMs - Date.parse(r.ts)) / 8.64e7);
-      const tier = classifyTier(ageDays, stabilityDays(r.importance, r.recall_count));
+      const tier = classifyTier(ageDays, stability(r.importance, r.recall_count));
       out[tier]++;
+      // 효과 수 — decay가 실제 처리하는 행(items 스냅숏)의 전→후 계층만 센다(JUD HOLD #117655 3차).
+      // 루프 도중 다른 연결이 끼워넣은 행은 items 에 없으므로 구조적으로 효과 수에 섞이지 않는다.
+      const from = TIER_ORDER[(r.tier ?? 'hot') as 'hot' | 'warm' | 'cold'] ?? 0;
+      const to = TIER_ORDER[tier];
+      if (to < from) out.effects.promoted += 1;
+      else if (to > from) out.effects.demoted += 1;
+      else out.effects.retained += 1;
       if ((r.tier ?? 'hot') !== tier) { upd.run(tier, r.id); out.changed++; }
     }
   });
@@ -499,6 +599,10 @@ export function pruneStaleEvents(db: Database, opts: PruneOpts = {}): number {
   const maxAgeDays = opts.maxAgeDays ?? 90;
   const impFloor = opts.importanceFloor ?? 5;
   const cutoff = `-${maxAgeDays} days`;
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='signals'").get()) {
+    db.prepare(`DELETE FROM signals WHERE julianday(ts) < julianday(?, '-${SURFACE_SIGNAL_RETENTION_DAYS} days')`)
+      .run(opts.nowExpr ?? 'now');
+  }
   const ids = (db.prepare(
     `SELECT id FROM events WHERE ts < datetime(?, ?) AND (importance IS NULL OR importance < ?) AND (recall_count IS NULL OR recall_count = 0)`,
   ).all(opts.nowExpr ?? 'now', cutoff, impFloor) as Array<{ id: string }>).map(r => r.id);

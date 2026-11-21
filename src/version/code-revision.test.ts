@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawnSync, spawn } from 'node:child_process';
-import { cliVersion, codeRevision, setCodeRevisionRootForTesting, writePackagedRevision, packageVersion } from './code-revision.js';
+import { cliVersion, codeRevision, installedBuildMetadata, setCodeRevisionRootForTesting, writePackagedRevision, packageVersion } from './code-revision.js';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -97,7 +97,7 @@ test('source package at node_modules/elanous under a monorepo uses rev-parse wit
   expect(codeRevision()).toBe(head.stdout.trim());
   expect(cliVersion()).toBe(`${packageVersion()} ${head.stdout.trim()}`);
   writePackagedRevision(root);
-  expect(JSON.parse(readFileSync(join(root, 'src', 'version', 'packed-revision.json'), 'utf8'))).toEqual({ commit: head.stdout.trim() });
+  expect(JSON.parse(readFileSync(join(root, 'src', 'version', 'packed-revision.json'), 'utf8'))).toEqual({ commit: head.stdout.trim(), builtAt: expect.any(Number) });
 });
 
 test('installer-owned package nested in a checkout cannot inherit its HEAD even without packaged metadata', () => {
@@ -140,7 +140,7 @@ test('source package under a monorepo git root keeps rev-parse priority and can 
   expect(head.status).toBe(0);
   expect(codeRevision()).toBe(head.stdout.trim());
   writePackagedRevision(root);
-  expect(JSON.parse(readFileSync(join(root, 'src', 'version', 'packed-revision.json'), 'utf8'))).toEqual({ commit: head.stdout.trim() });
+  expect(JSON.parse(readFileSync(join(root, 'src', 'version', 'packed-revision.json'), 'utf8'))).toEqual({ commit: head.stdout.trim(), builtAt: expect.any(Number) });
 });
 
 test('install.json commit still wins over the packaged commit', () => {
@@ -148,6 +148,17 @@ test('install.json commit still wins over the packaged commit', () => {
   writeFileSync(join(root, 'install.json'), JSON.stringify({ commit: INSTALLED_COMMIT }));
   writeFileSync(join(root, 'src', 'version', 'packed-revision.json'), JSON.stringify({ commit: PACKED_COMMIT }));
   expect(codeRevision()).toBe(INSTALLED_COMMIT);
+});
+
+test('a legacy official install uses packaged build metadata, while explicit dev wins over its release URL', () => {
+  const root = packageFolder();
+  const source = 'https://github.com/ElanvitalAI/elanous/releases/download/v0.3.27/elanous.tgz';
+  const builtAt = Date.UTC(2026, 10, 20, 21, 28) / 1000;
+  writeFileSync(join(root, 'src', 'version', 'packed-revision.json'), JSON.stringify({ commit: PACKED_COMMIT, builtAt }));
+  writeFileSync(join(root, 'install.json'), JSON.stringify({ source }));
+  expect(installedBuildMetadata(root)).toEqual({ commit: PACKED_COMMIT, channel: 'official', builtAt });
+  writeFileSync(join(root, 'install.json'), JSON.stringify({ source, channel: 'dev', commit: INSTALLED_COMMIT }));
+  expect(installedBuildMetadata(root)).toEqual({ commit: INSTALLED_COMMIT, channel: 'dev', builtAt: undefined });
 });
 
 test('malformed or non-commit packaged metadata cannot become a version', () => {
@@ -166,12 +177,13 @@ test('pack writer records git HEAD in package-owned metadata and refuses unknown
     expect(cwd).toBe(root);
     return { status: 0, stdout: args.includes('--show-toplevel') ? `${root}\n` : `${CHECKOUT_COMMIT}\n`, stderr: '' };
   });
-  writePackagedRevision(root);
-  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ commit: CHECKOUT_COMMIT });
+  const now = () => Date.UTC(2026, 10, 20, 21, 28);
+  writePackagedRevision(root, now);
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ commit: CHECKOUT_COMMIT, builtAt: now() / 1000 });
   setGitCommandRunnerForTesting(() => ({ status: 1, stdout: '', stderr: 'no checkout' }));
-  // 09-24: HEAD 가 없으면 pack 을 막지 않는다(설치기 계약) — 옛 파일만 지우고 커밋 없이 간다.
-  expect(() => writePackagedRevision(root)).not.toThrow();
-  expect(existsSync(path)).toBe(false);
+  // A no-git pack clears a stale revision but still knows when it was built.
+  expect(() => writePackagedRevision(root, now)).not.toThrow();
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ builtAt: now() / 1000 });
   expect(codeRevision()).toBeUndefined();
 });
 
@@ -187,7 +199,7 @@ test.skip('bun pm pack and bash install.sh --source preserve commit for installe
   expect(extracted.status).toBe(0);
   const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' });
   expect(head.status).toBe(0);
-  expect(JSON.parse(extracted.stdout)).toEqual({ commit: head.stdout.trim() });
+  expect(JSON.parse(extracted.stdout)).toEqual({ commit: head.stdout.trim(), builtAt: expect.any(Number) });
   expect(existsSync(join(repo, 'src', 'version', 'packed-revision.json'))).toBe(false);
   const prefix = join(dest, 'installed');
   const installed = spawnSync('bash', [join(repo, 'scripts/install.sh'), '--source', tarball,
@@ -198,7 +210,7 @@ test.skip('bun pm pack and bash install.sh --source preserve commit for installe
   expect(installed.status, `${installed.stdout}\n${installed.stderr}`).toBe(0);
   const installedRoot = join(prefix, 'current', 'node_modules', 'elanous');
   const installedMetadata = join(installedRoot, 'src', 'version', 'packed-revision.json');
-  expect(JSON.parse(readFileSync(installedMetadata, 'utf8'))).toEqual({ commit: head.stdout.trim() });
+  expect(JSON.parse(readFileSync(installedMetadata, 'utf8'))).toEqual({ commit: head.stdout.trim(), builtAt: expect.any(Number) });
   expect(JSON.parse(readFileSync(join(prefix, 'current', 'install.json'), 'utf8')).commit).toBeUndefined();
   const version = spawnSync(join(prefix, 'bin', 'elanous'), ['--version'], {
     cwd: dest, encoding: 'utf8', timeout: 30_000,

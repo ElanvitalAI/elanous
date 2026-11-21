@@ -4,7 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { debug } from '../../debug/log.js';
 import { loopAgentContractErrors } from '../contract/validate.js';
 
-const contractSchema = JSON.parse(readFileSync(resolve(import.meta.dir, '../contract/loop-agent.schema.json'), 'utf8')) as { $id: string };
+import contractSchema from '../contract/loop-agent.schema.json';
 const allowedOverlayFields = new Set(['neighbors', 'cadence', 'grounding', 'budget']);
 type RecordValue = Record<string, unknown>;
 

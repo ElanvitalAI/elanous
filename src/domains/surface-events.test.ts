@@ -1,12 +1,296 @@
-import { test, expect, describe } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { test, expect, describe, spyOn } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createFrameMemoryConsumer } from '../capture/frame-memory.js';
+import { recordExternalEvent } from '../context-bus/external-events.js';
+import { listCoordEvents } from '../context-bus/coord-events.js';
+import { readCondenseEventsIn } from '../context-bus/long-term-memory.js';
+import { contextDayTimeline } from '../context-bus/context-day.js';
+import { debug } from '../debug/log.js';
+import { resetStrayMergeAttempts } from './memory-db-path.js';
+import { _resetDefaultLogStoreForTest, getDefaultLogStore, registerLogStoreSink } from '../mss/logging/log-store.js';
+import { injectUtterance, recordSelfEvent } from './self-awareness.js';
 import {
   openSurfaceEventsDb, recordEvent, recordInboundTurn, queryEvents, importanceByKind, ftsQuery, recallEvents, recentSentDigest, categoryOfKind, pruneStaleEvents,
-  stabilityDays, classifyTier, applyMemoryDecay, querySurfaceUtterances, countSurfaceUtterancesByOrigin, classifySurfaceUtteranceOrigin,
+  stabilityDays, classifyTier, applyMemoryDecay, querySurfaceUtterances, countSurfaceUtterancesByOrigin, classifySurfaceUtteranceOrigin, SURFACE_SIGNAL_RETENTION_DAYS,
 } from './surface-events.js';
 
 const db = () => openSurfaceEventsDb(':memory:');
+
+test('three real low-signal producers write signal rows and zero recallable memories', () => {
+  const d = db();
+  try {
+    let tick = 0;
+    const frames = createFrameMemoryConsumer({ record: input => { recordSelfEvent(d, input); }, now: () => ++tick * 10_000 });
+    for (let i = 0; i < 40; i++) frames.observe({ surfaceId: 'pane-1', instance: 'test-1', frameAt: i, text: `frame ${i}` });
+    for (let i = 0; i < 40; i++) recordExternalEvent({ origin: 'harness-child', kind: 'exit', summary: `child ${i} exit`, source: `elanous://child/${i}` }, { db: d });
+    for (let i = 0; i < 40; i++) injectUtterance({ origin: 'claude-code', text: `utterance ${i}` }, d);
+    expect((d.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n).toBe(0);
+    expect((d.prepare('SELECT COUNT(*) AS n FROM signals').get() as { n: number }).n).toBe(120);
+    expect(queryEvents(d, { query: 'frame' })).toEqual([]);
+    expect(recallEvents(d, { query: 'utterance', bump: false })).toEqual([]);
+  } finally { d.close(); }
+});
+
+test('one accepted signal emits one payload-free effect row for logs.db', () => {
+  const d = db();
+  const effects: Array<{ category: string; event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { effects.push({ category, event, data }); });
+  try {
+    const id = recordEvent(d, { surface: 'ext:tui-observe', direction: 'inbound', kind: 'frame', text: 'FAKE-FRAME-PRIVATE', summary: 'frame' });
+    expect(effects).toEqual([{ category: 'memory.signal', event: 'routed', data: { id, surface: 'ext:tui-observe', kind: 'frame' } }]);
+    expect(JSON.stringify(effects)).not.toContain('FAKE-FRAME-PRIVATE');
+    expect((d.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n).toBe(0);
+  } finally { log.mockRestore(); d.close(); }
+});
+
+test('one signal cycle reaches exactly one logs.db effect row in an isolated state root', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signal-logs-'));
+  const saved = { state: process.env.ELANOUS_STATE_DIR, node: process.env.NODE_ENV };
+  process.env.ELANOUS_STATE_DIR = root;
+  process.env.NODE_ENV = 'production';
+  _resetDefaultLogStoreForTest();
+  const off = registerLogStoreSink(sink => debug.registerSink(sink), 'test');
+  const d = db();
+  try {
+    expect(off).toBeFunction();
+    recordEvent(d, { surface: 'ext:tui-observe', direction: 'inbound', kind: 'frame', text: 'FAKE-PRIVATE-FRAME', summary: 'frame' });
+    debug.flush();
+    const rows = getDefaultLogStore()?.query({ exactCategories: ['memory.signal'] }) ?? [];
+    expect(rows.map(row => row.event)).toEqual(['routed']);
+    expect(JSON.stringify(rows)).not.toContain('FAKE-PRIVATE-FRAME');
+  } finally {
+    d.close(); off?.(); _resetDefaultLogStoreForTest();
+    if (saved.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = saved.state;
+    if (saved.node === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = saved.node;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('20,001 low-signal inputs in one day add zero memory rows', () => {
+  const d = db();
+  try {
+    const inputs = [
+      { surface: 'ext:tui-observe', kind: 'frame' },
+      { surface: 'context:external', kind: 'exit' },
+      { surface: 'ext:claude-code', kind: 'utterance' },
+    ];
+    for (let i = 0; i < 20_001; i++) {
+      const input = inputs[i % inputs.length]!;
+      recordEvent(d, { ...input, direction: 'inbound', text: `fake signal ${i}`, ts: '2026-11-21T00:00:00Z' });
+    }
+    expect((d.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n).toBe(0);
+    expect((d.prepare('SELECT COUNT(*) AS n FROM signals').get() as { n: number }).n).toBe(20_001);
+  } finally { d.close(); }
+}, 30_000);
+
+test('signal retention follows the seven-day logs default without pruning memory', () => {
+  const d = db();
+  try {
+    expect(SURFACE_SIGNAL_RETENTION_DAYS).toBe(7);
+    recordEvent(d, { surface: 'ext:tui-observe', direction: 'inbound', kind: 'frame', text: 'old frame', ts: '2026-11-10T00:00:00Z' });
+    recordEvent(d, { surface: 'ext:tui-observe', direction: 'inbound', kind: 'frame', text: 'recent frame', ts: '2026-11-20T00:00:00Z' });
+    recordEvent(d, { surface: 'telegram', direction: 'inbound', kind: 'qna', text: 'old but durable memory', ts: '2026-11-10T00:00:00Z' });
+    expect(pruneStaleEvents(d, { nowExpr: '2026-11-21T00:00:00Z' })).toBe(0);
+    expect(d.prepare('SELECT text FROM signals').all()).toEqual([{ text: 'recent frame' }]);
+    expect(queryEvents(d, { query: 'durable' })).toHaveLength(1);
+  } finally { d.close(); }
+});
+
+test('existing low-signal memory rows move once with ids preserved and FTS removed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signals-migrate-'));
+  const path = join(root, 'surface_events.db');
+  try {
+    const old = openSurfaceEventsDb(path);
+    old.run('DELETE FROM signal_migrations');
+    for (const [id, surface, kind] of [['f', 'ext:tui-observe', 'frame'], ['e', 'context:external', 'exit'], ['u', 'ext:claude-code', 'utterance']]) {
+      old.run('INSERT INTO events(id,ts,surface,direction,kind,text,summary) VALUES (?,?,?,?,?,?,?)', [id, '2026-11-21T00:00:00Z', surface, 'inbound', kind, `${id} unique-low-signal`, `${id} unique-low-signal`]);
+      old.run('INSERT INTO events_fts(id,search_text) VALUES (?,?)', [id, `${id} unique-low-signal`]);
+    }
+    recordEvent(old, { surface: 'telegram', direction: 'inbound', kind: 'qna', text: 'normal question' });
+    old.close();
+    for (let i = 0; i < 2; i++) {
+      const upgraded = openSurfaceEventsDb(path);
+      expect((upgraded.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n).toBe(1);
+      expect((upgraded.prepare('SELECT COUNT(*) AS n FROM signals').get() as { n: number }).n).toBe(3);
+      expect(upgraded.prepare('SELECT id FROM signals ORDER BY id').all()).toEqual([{ id: 'e' }, { id: 'f' }, { id: 'u' }]);
+      expect(queryEvents(upgraded, { query: 'unique-low-signal' })).toEqual([]);
+      expect(queryEvents(upgraded, { query: 'normal' })).toHaveLength(1);
+      upgraded.close();
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('external exit remains in the coordination journal but cannot enter long-term condensation', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signals-journal-'));
+  const path = join(root, 'surface_events.db');
+  try {
+    const d = openSurfaceEventsDb(path);
+    recordExternalEvent({ origin: 'harness-child', kind: 'exit', summary: 'low signal exit', source: 'elanous://child/exit', at: '2026-11-21T01:00:00Z' }, { db: d });
+    recordEvent(d, { surface: 'coord:channel', direction: 'outbound', kind: '보고', text: 'durable report', summary: 'durable report', refs: JSON.stringify({ seat: 'TC', url: 'https://example.test/report' }), ts: '2026-11-21T01:01:00Z' });
+    expect(listCoordEvents({ since: '2026-11-21T00:00:00Z' }, { db: d }).map(row => row.kind)).toEqual(['exit', '보고']);
+    d.close();
+    expect(readCondenseEventsIn(root, '2026-11-21T00:00:00Z', { path }).events.map(row => row.summary)).toEqual(['durable report']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('read-only coordination readers accept a pre-upgrade database without signals table', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signals-legacy-'));
+  const path = join(root, 'surface_events.db');
+  try {
+    const d = openSurfaceEventsDb(path);
+    recordEvent(d, { surface: 'coord:channel', direction: 'outbound', kind: '보고', text: 'legacy report', summary: 'legacy report', refs: JSON.stringify({ seat: 'TC', recipients: [], all: false, url: 'https://example.test/legacy' }), ts: '2026-11-21T01:00:00Z' });
+    d.run('DROP TABLE signals');
+    d.close();
+    const legacy = new Database(path, { readonly: true });
+    try { expect(listCoordEvents({ since: '2026-11-21T00:00:00Z' }, { db: legacy }).map(row => row.summary)).toEqual(['legacy report']); }
+    finally { legacy.close(); }
+    expect(contextDayTimeline('24h', { now: () => new Date('2026-11-21T02:00:00Z'), dbPath: path }).events.map(row => row.summary)).toEqual(['legacy report']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('read-only utterance query accepts an old database without signals table', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signals-readonly-'));
+  const path = join(root, 'old.db');
+  try {
+    const old = new Database(path);
+    old.run(`CREATE TABLE events(id TEXT, ts TEXT, surface TEXT, direction TEXT, kind TEXT,
+      session_id TEXT, thread_id TEXT, text TEXT, summary TEXT, importance INT, tags TEXT,
+      refs TEXT, recall_count INT, consolidated INT, category TEXT, domain TEXT, tier TEXT)`);
+    old.run("INSERT INTO events(id,ts,surface,direction,kind,text,category,domain) VALUES ('old-human','2026-11-21T01:00:00Z','cli','inbound','utterance','old human','qna','elanous')");
+    old.close();
+    const readonly = new Database(path, { readonly: true });
+    try {
+      expect(querySurfaceUtterances(readonly, { from: '2026-11-21T00:00:00Z', to: '2026-11-22T00:00:00Z' }).map(row => row.text)).toEqual(['old human']);
+    } finally { readonly.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('utterance UNION maps metadata by name across an older physical column order', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signals-order-'));
+  const path = join(root, 'old.db');
+  try {
+    const old = new Database(path);
+    old.run(`CREATE TABLE events(id TEXT, ts TEXT, surface TEXT, direction TEXT, kind TEXT,
+      session_id TEXT, thread_id TEXT, text TEXT, summary TEXT, importance INT, tags TEXT,
+      refs TEXT, recall_count INT, consolidated INT, category TEXT, domain TEXT, tier TEXT)`);
+    old.run(`CREATE TABLE signals(id TEXT, ts TEXT, surface TEXT, direction TEXT, kind TEXT,
+      session_id TEXT, thread_id TEXT, text TEXT, summary TEXT, importance INT, tags TEXT,
+      refs TEXT, category TEXT, domain TEXT)`);
+    old.run("INSERT INTO events(id,ts,surface,direction,kind,text,category,domain,recall_count,consolidated) VALUES ('memory','2026-11-21T01:00:00Z','cli','inbound','utterance','memory body','memory-cat','memory-dom',3,1)");
+    old.run("INSERT INTO signals(id,ts,surface,direction,kind,text,category,domain) VALUES ('signal','2026-11-21T01:00:00Z','ext:claude-code','inbound','utterance','signal body','cat','dom')");
+    old.close();
+    const readonly = new Database(path, { readonly: true });
+    try {
+      const rows = querySurfaceUtterances(readonly, { from: '2026-11-21T00:00:00Z', to: '2026-11-22T00:00:00Z' });
+      expect(rows.find(row => row.id === 'signal')).toMatchObject({
+        id: 'signal', category: 'cat', domain: 'dom', recall_count: 0, consolidated: 0,
+      });
+      expect(rows.find(row => row.id === 'memory')).toMatchObject({
+        id: 'memory', category: 'memory-cat', domain: 'memory-dom', recall_count: 3, consolidated: 1,
+      });
+    } finally { readonly.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a low-signal row merged from stray after the first upgrade still moves to signals', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signals-late-stray-'));
+  const strayPath = join(root, 'stray', 'surface_events.db');
+  const saved = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  resetStrayMergeAttempts(name => name === 'surface_events.db' ? strayPath : undefined);
+  try {
+    const seed = openSurfaceEventsDb(strayPath);
+    recordEvent(seed, { surface: 'outbound', direction: 'outbound', kind: 'alert', text: 'seed' });
+    seed.close();
+    const first = openSurfaceEventsDb();
+    first.close();
+    const late = openSurfaceEventsDb(strayPath);
+    late.run("INSERT INTO events(id,ts,surface,direction,kind,text,summary) VALUES ('late-exit','2026-11-21T01:00:00Z','context:external','outbound','exit','late signal','late signal')");
+    late.run("INSERT INTO events_fts(id,search_text) VALUES ('late-exit','late signal')");
+    late.close();
+    resetStrayMergeAttempts(name => name === 'surface_events.db' ? strayPath : undefined);
+    const reopened = openSurfaceEventsDb();
+    try {
+      expect(reopened.prepare("SELECT id FROM signals WHERE id='late-exit'").all()).toEqual([{ id: 'late-exit' }]);
+      expect(reopened.prepare("SELECT id FROM events WHERE id='late-exit'").all()).toEqual([]);
+      expect(reopened.prepare("SELECT id FROM events_fts WHERE id='late-exit'").all()).toEqual([]);
+    } finally { reopened.close(); }
+  } finally {
+    resetStrayMergeAttempts();
+    if (saved === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = saved;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a fresh process reclassifies late stray signals and retries a failed migration', () => {
+  const root = mkdtempSync(join(tmpdir(), 'surface-signals-restart-'));
+  const home = join(root, 'home');
+  const strayPath = join(home, '.elanous', 'surface_events.db');
+  const canonicalPath = join(home, '.elanous', 'memory', 'surface_events.db');
+  const moduleUrl = pathToFileURL(join(import.meta.dir, 'surface-events.ts')).href;
+  const childCode = `import { openSurfaceEventsDb } from ${JSON.stringify(moduleUrl)};
+    const db = openSurfaceEventsDb();
+    const rows = {
+      events: db.prepare('SELECT id FROM events ORDER BY id').all(),
+      signals: db.prepare('SELECT id FROM signals ORDER BY id').all(),
+      fts: db.prepare('SELECT id FROM events_fts ORDER BY id').all(),
+    };
+    db.close();
+    console.log(JSON.stringify(rows));`;
+  const { ELANOUS_STATE_DIR: _stateDir, ...parentEnv } = process.env;
+  const runFreshProcess = () => spawnSync(process.execPath, ['-e', childCode], {
+      cwd: join(import.meta.dir, '../..'), env: { ...parentEnv, HOME: home }, encoding: 'utf8', timeout: 10_000,
+    });
+  const openInFreshProcess = () => {
+    const child = runFreshProcess();
+    expect(child.status).toBe(0);
+    return JSON.parse(child.stdout.trim()) as { events: Array<{ id: string }>; signals: Array<{ id: string }>; fts: Array<{ id: string }> };
+  };
+  try {
+    mkdirSync(join(home, '.elanous'), { recursive: true });
+    const stray = new Database(strayPath);
+    stray.run('CREATE TABLE events(id TEXT PRIMARY KEY, ts TEXT, surface TEXT, direction TEXT, kind TEXT, text TEXT, summary TEXT)');
+    stray.run('CREATE VIRTUAL TABLE events_fts USING fts5(id UNINDEXED, search_text)');
+    stray.run("INSERT INTO events(id,ts,surface,direction,kind,text) VALUES ('early-memory','2026-11-21T01:00:00Z','cli','inbound','utterance','early')");
+    stray.run("INSERT INTO events_fts(id,search_text) VALUES ('early-memory','early')");
+    stray.close();
+    expect(openInFreshProcess()).toEqual({ events: [{ id: 'early-memory' }], signals: [], fts: [{ id: 'early-memory' }] });
+
+    const late = new Database(strayPath);
+    late.run("INSERT INTO events(id,ts,surface,direction,kind,text) VALUES ('late-signal','2026-11-21T01:01:00Z','context:external','outbound','exit','late signal')");
+    late.run("INSERT INTO events_fts(id,search_text) VALUES ('late-signal','late signal')");
+    late.run("INSERT INTO events(id,ts,surface,direction,kind,text) VALUES ('late-memory','2026-11-21T01:02:00Z','cli','inbound','utterance','late memory')");
+    late.run("INSERT INTO events_fts(id,search_text) VALUES ('late-memory','late memory')");
+    late.close();
+    expect(openInFreshProcess()).toEqual({
+      events: [{ id: 'early-memory' }, { id: 'late-memory' }],
+      signals: [{ id: 'late-signal' }],
+      fts: [{ id: 'early-memory' }, { id: 'late-memory' }],
+    });
+
+    const failedStray = new Database(strayPath);
+    failedStray.run("INSERT INTO events(id,ts,surface,direction,kind,text) VALUES ('retry-signal','2026-11-21T01:03:00Z','context:external','outbound','exit','retry signal')");
+    failedStray.run("INSERT INTO events_fts(id,search_text) VALUES ('retry-signal','retry signal')");
+    failedStray.close();
+    const canonical = new Database(canonicalPath);
+    canonical.run("CREATE TRIGGER fail_signal BEFORE INSERT ON signals BEGIN SELECT RAISE(ABORT, 'injected signal failure'); END");
+    canonical.close();
+    expect(runFreshProcess().status).not.toBe(0);
+    const recover = new Database(canonicalPath);
+    recover.run('DROP TRIGGER fail_signal');
+    recover.close();
+    expect(openInFreshProcess()).toEqual({
+      events: [{ id: 'early-memory' }, { id: 'late-memory' }],
+      signals: [{ id: 'late-signal' }, { id: 'retry-signal' }],
+      fts: [{ id: 'early-memory' }, { id: 'late-memory' }],
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 describe('importanceByKind — kind 룰', () => {
   test('alert/watch-zone = 7', () => {

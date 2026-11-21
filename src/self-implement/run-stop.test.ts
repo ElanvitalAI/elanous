@@ -1,6 +1,9 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { boundRunStopCause, buildRunStopTerminalEvidence, classifyMergeHoldStop, classifyPodExitStop, classifyRunStopReason, classifyStopReasonFromGraph, classifyTerminalHarnessFailure, readRunStopRecord, recordRunStop, runStopChildAttempts, runStopRecorded, RUN_STOP_CLASSES } from './run-stop.js';
+import { boundRunStopCause, buildRunStopTerminalEvidence, classifyMergeHoldStop, classifyPodExitStop, classifyRunStopReason, classifyStopReasonFromGraph, classifyTerminalHarnessFailure, onRunStop, readRunStopRecord, recordRunStop, runStopChildAttempts, runStopRecorded, RUN_STOP_CLASSES } from './run-stop.js';
 import { debug } from '../debug/log.js';
 import { spyOn } from 'bun:test';
 import type { RunLedgerEntry } from './run-ledger.js';
@@ -142,5 +145,91 @@ describe('recordRunStop', () => {
     expect(artifact.toString('utf8')).not.toContain(secret);
     expect(artifact.toString('utf8')).toContain('decomposition-401-invalid-api-key');
     expect(persisted.terminalEvidence?.childRunId).toBe('run-child-retry');
+  });
+});
+
+// ── RUN-STOP-ONE-LINE — 실패 먼저: 수리 전엔 이 아래 시험이 빨강이다(JUD-B #119237/#119258 · PR #39400). ──
+
+describe('recordRunStop — 한 런의 stop 줄은 정확히 하나(재시도는 기존 줄)', () => {
+  test('죽은 프로세스가 적립한 stop 뒤 별도 프로세스 재시도는 두 번째 줄을 적립하지 않는다', () => {
+    // 재현: 카드 쓰기 전 사망으로 원장에만 stop 이 남은 뒤, 15분 창의 별도 프로세스 재시도 —
+    // runStopRecorded Set 은 프로세스 로컬이라 재시도 프로세스에는 비어 있다.
+    const root = mkdtempSync(join(tmpdir(), 'run-stop-one-line-'));
+    const priorStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const runId = 'run-0f1e2d3c-4b5a-4968-8d7e-6f5a4b3c2d1e';
+      const ledgerDir = join(root, 'run-ledger');
+      mkdirSync(ledgerDir, { recursive: true });
+      const ledgerPath = join(ledgerDir, `${runId}.jsonl`);
+      const priorLine: RunLedgerEntry = {
+        timestamp: '2026-11-21T04:43:44.698Z', runId, event: 'stop',
+        data: {
+          class: 'unclassified',
+          cause: '15분 무진척 회수 — 정확 runId stop(unclassified)',
+          evidenceRef: `run-ledger:${runId}:stop`,
+          nextMove: '칸 skip-note 확인 — 사람/판정부가 재발사 여부를 판단',
+        },
+      };
+      writeFileSync(ledgerPath, `${JSON.stringify(priorLine)}\n`);
+      expect(runStopRecorded(runId)).toBe(false); // 재시도 프로세스 — 이 프로세스 Set 은 비어 있다.
+      const retry = recordRunStop({
+        runId, class: 'unclassified', site: 'launch-result-loop',
+        cause: '15분 무진척 회수 — 정확 runId stop(unclassified)',
+        evidenceRef: `run-ledger:${runId}:stop`,
+        nextMove: '칸 skip-note 확인 — 사람/판정부가 재발사 여부를 판단',
+      });
+      const stopLines = readFileSync(ledgerPath, 'utf8').split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line) as RunLedgerEntry)
+        .filter((entry) => entry.event === 'stop');
+      expect(stopLines).toHaveLength(1); // 수리 전: 재적립돼 2줄 — 빨강
+      expect(retry).toMatchObject({ runId, event: 'stop' });
+      expect(runStopRecorded(runId)).toBe(true);
+    } finally {
+      if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('재시도 중복 stop — 반환값·listener는 원장에 남은 기존 줄과 일치(원장에 없는 새 사실 전달 금지 · JUD-B #119409)', () => {
+    // 재현: 원장에 stop 줄이 이미 남아 있는데 class/cause가 다른 별도 프로세스 재시도가 왔다 —
+    // 반환값·live listener 도 «원장에 실제로 남은 줄»이어야 한다. 수리 전엔 이 아래가 빨강이다.
+    const root = mkdtempSync(join(tmpdir(), 'run-stop-settled-line-'));
+    const priorStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    const observed: RunLedgerEntry[] = [];
+    const unsubscribe = onRunStop((entry) => observed.push(entry));
+    try {
+      const runId = 'run-2b3c4d5e-6f7a-4988-8b9c-1d2e3f4a5b6c';
+      const ledgerDir = join(root, 'run-ledger');
+      mkdirSync(ledgerDir, { recursive: true });
+      const ledgerPath = join(ledgerDir, `${runId}.jsonl`);
+      const priorLine: RunLedgerEntry = {
+        timestamp: '2026-11-21T04:43:44.698Z', runId, event: 'stop',
+        data: {
+          class: 'pod-died',
+          cause: '첫 stop — 카드 쓰기 전 프로세스 사망',
+          evidenceRef: `run-ledger:${runId}:stop`,
+          nextMove: '칸 skip-note 확인 — 사람/판정부가 재발사 여부를 판단',
+        },
+      };
+      writeFileSync(ledgerPath, `${JSON.stringify(priorLine)}\n`);
+      expect(runStopRecorded(runId)).toBe(false);
+      const retry = recordRunStop({
+        runId, class: 'unclassified', site: 'launch-result-loop',
+        cause: '재시도 사실 — 원장 줄과 다른 class/cause',
+        evidenceRef: `run-ledger:${runId}:stop`,
+        nextMove: '칸 skip-note 확인 — 사람/판정부가 재발사 여부를 판단',
+      });
+      expect(retry).toEqual(priorLine); // 수리 전: 재시도의 새 entry 가 반환돼 빨강
+      expect(observed).toEqual([priorLine]); // 수리 전: listener 에 새 entry 가 전달돼 빨강
+      expect(readRunStopRecord(retry)?.class).toBe('pod-died'); // 원장 줄이므로 class 도 기존 값
+    } finally {
+      unsubscribe();
+      if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

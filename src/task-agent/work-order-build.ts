@@ -32,7 +32,7 @@ export function buildWorkOrder(input: BuildWorkOrderInput): WorkOrder {
     escalation: input.escalation,
   }));
   if (!parsed.ok) throw new Error(parsed.reason);
-  const budgetLimits = input.budget === undefined ? undefined : workOrderBudgetLimits(input.budget);
+  const budgetLimits = input.budget === undefined ? undefined : workOrderBudgetLimits(input.budget); // TA-BUDGET-WALL: 무효 예산은 관용(budgetLimits 생략) — 벽은 handTask 발사 경계(taBudgetWallRefusal)에서 난다.
   return { ...parsed.order, ...(budgetLimits ? { budgetLimits } : {}) };
 }
 

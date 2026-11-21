@@ -548,6 +548,9 @@ import {
   handleChatEventsGet,
   registerRelayHostChannelRequest, // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 릴레이 신뢰채널 표시
   relayHostChatRouteAllowed, // HANDLE-BARE-HOST-WEBCCHAT-PROXY ⓐ (#39024 must ⓐ) — 채팅 쌍 2경로 게이트
+  relayHostSessionReadRouteAllowed, // WEBCHAT-SESSION-HISTORY-PERSIST — 회원 대화 목록·내용 읽기 2경로
+  relayHostSessionWriteRouteAllowed,
+  relayHostWebChatMember, // WEBCHAT-SESSION-HISTORY-PERSIST — 신뢰채널 회원 memberId
   handlePromptPost,
   handlePromptStreamPost,
   handleSessionDelete,
@@ -1328,6 +1331,8 @@ const WEBCHAT_SESSION_COOKIE_PATHS = [
   BARE_WEBCHAT_ENTRY_PREFIX,
   "/v1/prompt/stream",
   "/v1/chat/events",
+  // WEBCHAT-SESSION-HISTORY-PERSIST — 회원 대화 목록·내용 읽기(GET 2경로 · 회원 스코프).
+  "/v1/sessions/store",
 ] as const;
 
 /**
@@ -1358,12 +1363,14 @@ export function webChatCookieRequestRefusal(request: Request, handle: string): R
   } catch {
     referrerOrigin = undefined;
   }
-  if (request.method === "POST") {
+  if (request.method === "POST" || request.method === "PATCH" || request.method === "DELETE") {
     if (!ownOrigin(origin ?? referrerOrigin))
       return jsonResponse({ error: "webchat-origin-mismatch" }, 403);
-    const type = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
-    if (type !== "application/json")
-      return jsonResponse({ error: "webchat-json-required" }, 415);
+    if (request.method !== "DELETE") {
+      const type = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+      if (type !== "application/json")
+        return jsonResponse({ error: "webchat-json-required" }, 415);
+    }
     return undefined;
   }
   if (origin !== null && !ownOrigin(origin))
@@ -1605,7 +1612,12 @@ export function routeBareWebChatHostRequest(
   // 그 외 경로(404 폴스루 포함)의 응답에는 파생 웹채팅 세션 쿠키 3-Path 삭제와
   // 레거시 __Host-elanous_member_session(Path=/) 중화를 덧붙여 쿠키가 allowlist
   // 밖 경로로 새는 일을 원천 봉쇄한다.
-  const chatRouteAllowed = relayHostChatRouteAllowed(request);
+  // WEBCHAT-SESSION-HISTORY-PERSIST — 회원 대화 목록·내용 읽기 2경로도 같은 표시·CSRF
+  // 검사를 지난다. checkAuth 는 넓히지 않는다 — sessions-store 가 회원 스코프로만 연다.
+  const chatRouteAllowed =
+    relayHostChatRouteAllowed(request) ||
+    relayHostSessionReadRouteAllowed(request) ||
+    relayHostSessionWriteRouteAllowed(request);
   if (chatRouteAllowed) {
     const refused = webChatCookieRequestRefusal(request, handle);
     if (refused) return refused;
@@ -2449,7 +2461,9 @@ export function startNexusHttpServer(
                     (apiRequest.method === "POST" &&
                       forwardedUrl.pathname === "/v1/prompt/stream") ||
                     (apiRequest.method === "GET" &&
-                      forwardedUrl.pathname === "/v1/chat/events");
+                      forwardedUrl.pathname === "/v1/chat/events") ||
+                    // WEBCHAT-SESSION-HISTORY-PERSIST — 회원 대화 목록·내용 읽기 2경로.
+                    relayHostSessionReadRouteAllowed(apiRequest);
                   const pinOwner = chatPair
                     ? ledger.pinOwners.get(
                         bareWebChatOriginHandle(forwardedUrl.hostname) ?? "",
@@ -3515,10 +3529,17 @@ export async function routeRequest(
       !!opts.metaApi &&
       operatorSignal(req, opts.metaApi).operatorSource === "op-proxy" &&
       hasDeclaredPluginHttpGet(BUILTIN_DIR, pathname);
+    // WEBCHAT-SESSION-HISTORY-PERSIST — 신뢰채널 회원의 대화 목록·내용 읽기는 기본 거부를
+    // 지나 sessions-store 로 간다. 거기서 회원 스코프(자기 소유 세션만)로 답한다.
+    const webChatSessionRead =
+      !!opts.metaApi &&
+      (relayHostSessionReadRouteAllowed(req) || relayHostSessionWriteRouteAllowed(req)) &&
+      relayHostWebChatMember(req, opts.metaApi) !== undefined;
     if (
       !(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized) &&
       !graphPeerAuthorized &&
-      !pluginOperator
+      !pluginOperator &&
+      !webChatSessionRead
     ) {
       const name =
         method === "POST" &&

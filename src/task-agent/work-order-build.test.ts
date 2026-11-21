@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
 import { DEFAULT_MAX_HARD_WAIT_SEC } from '../self-implement/headless-elanous-driver.js';
 import { buildWorkOrder, hashWorkOrderContent } from './work-order-build.js';
-import { parseWorkOrder, parseWorkOrderBudget, TA_PILOT_MAX_WALL_SEC, taPodDeadlineSeconds } from './work-order.js';
+import { parseWorkOrder, parseWorkOrderBudget, TA_PILOT_MAX_WALL_SEC, taPodDeadlineSeconds, workOrderBudgetFailureReason } from './work-order.js';
 import { handTask } from './task-hand.js';
 import { criticalUnknownFields } from './work-order.js';
 
@@ -193,7 +193,7 @@ test('budget time table: declared integer seconds in 1..6900 only', () => {
   const rejected = ['0', '0s', '0.5', '0.5s', '0.999s', '1.0001s', '6900.4s', '6900.0000000001s', '6900.000000000001s', '6901s', '6901', '116m', '1.92h', '2h',
     '0.001m', '0.0000000001h', '1e3s', '+60s', '-1', '60S', '1H', '60sec', '1hr', '1d', '', '.5s', '5.s', '1234567s'];
   for (const time of rejected) expect([time, sec(time)]).toEqual([time, null]);
-  expect(parseWorkOrderBudget('time=6900.0000000001s usd=5')).toMatchObject({ ok: false, reason: expect.stringContaining('정수 초') });
+  expect(parseWorkOrderBudget('time=6900.0000000001s usd=5')).toMatchObject({ ok: false, reason: 'budget-time-noninteger' });
 });
 
 test('budget usd table: positive cents, at most two decimals, finite', () => {
@@ -211,12 +211,25 @@ test('budget grammar: duplicates, extra keys, malformed declarations, whitespace
     'TIME=60s usd=1', 'time=60s USD=1', 'Time=60s usd=1', 'time=60s', 'usd=1', '', '모름'];
   for (const budget of rejected) expect([budget, ok(budget)]).toEqual([budget, false]);
   expect(parseWorkOrderBudget('time=60s usd=1 tier=low pod=node-c rework=1')).toMatchObject({ ok: true, timeSec: 60 }); // 출처: #97932 허용 발사 설정 픽스처.
-  expect(parseWorkOrderBudget('time=60s usd=1 unknown=value')).toMatchObject({ ok: false, reason: expect.stringContaining('허용되지 않은 키') });
-  expect(parseWorkOrderBudget('time=7200s time=60s usd=1')).toMatchObject({ ok: false, reason: expect.stringContaining('중복') });
+  expect(parseWorkOrderBudget('time=60s usd=1 unknown=value')).toMatchObject({ ok: false, reason: 'budget-key-not-allowed' });
+  expect(parseWorkOrderBudget('time=7200s time=60s usd=1')).toMatchObject({ ok: false, reason: 'budget-duplicate-key' });
 });
 
 test('taPodDeadlineSeconds: only an integer wall in 1..6900 narrows the Job (wall + 300s grace)', () => {
   expect(taPodDeadlineSeconds({ ELANOUS_TA_WALL_SEC: '60' })).toBe(360);
   expect(taPodDeadlineSeconds({ ELANOUS_TA_WALL_SEC: '6900' })).toBe(7200);
   for (const raw of [undefined, '', '0', '6901', '-1', '1.5', ' 60', '60s', '1e3', '00000', '99999']) expect([raw, taPodDeadlineSeconds({ ELANOUS_TA_WALL_SEC: raw })]).toEqual([raw, undefined]);
+});
+
+
+test('TA-BUDGET-WALL ①: buildWorkOrder 는 무효 예산을 관용한다(budgetLimits 생략) — 벽은 handTask 발사 경계에서 난다', () => {
+  const input = { cellId: 'TA-BUDGET-WALL', version: '0.3.31', priority: 'P0', boundary: 'src/task-agent/task-hand.ts', budget: 'time=1800s usd=1', contract: 'focused 0 fail', escalation: 'OP' };
+  const ok = buildWorkOrder(input);
+  expect(ok.budgetLimits).toEqual({ timeSec: 1800, usdCap: 1 });
+  // 서 계약(TA-WORK-ORDER·COORD-ENTRANCE-FOLD): 상한을 못 만드는 예산은 build 가 관용(budgetLimits 생략) — 거부는 handTask 발사 경계(③④)에서 난다.
+  expect(buildWorkOrder({ ...input, budget: 'time=6900s tier=low' }).budgetLimits).toBeUndefined();
+  expect(buildWorkOrder({ ...input, budget: 'time=7200s usd=1' }).budgetLimits).toBeUndefined();
+  expect(buildWorkOrder({ ...input, budget: undefined }).budgetLimits).toBeUndefined();
+  expect(workOrderBudgetFailureReason('time=6900s tier=low')).toContain('usd');
+  expect(workOrderBudgetFailureReason('time=7200s usd=1')).toBeDefined();
 });

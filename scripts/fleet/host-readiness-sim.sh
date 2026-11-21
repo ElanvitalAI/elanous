@@ -64,7 +64,7 @@ if name=='docker':sys.exit(1 if state.get('images') is False else 0)
 if name=='gh':sys.exit(1 if state.get('auth') is False else 0)
 if name=='elanous':
  if args==['--version']:
-  print('0.3.7' if state.get('version') is False else '0.3.8-dev.0');sys.exit(0)
+  print('0.3.7' if state.get('version') is False else '0.3.8-dev.0 261121_0855 ' + 'a'*40);sys.exit(0)
  if args[:2]==['self-update','--auto']:
   state['version']=True;path.write_text(json.dumps(state));event('version repaired');sys.exit(0)
  if args[:2]==['llm','detect']:

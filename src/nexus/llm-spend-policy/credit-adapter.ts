@@ -69,6 +69,23 @@ export async function readCreditRowStates(policy: LlmSpendPolicyDoc, deps: Credi
   return out;
 }
 
+/**
+ * 관측기 형태(CreditAdapterDeps 주입 버전) — 호출 관문(llm-call-gate)의 RowStateObserver 슬롯에 그대로 들어간다.
+ *   · 정책이 없는 우주(readPolicy → null) → 관측 결과 0개(관문은 어차피 pass-through).
+ *   · 임대가 없는 공급자 → unmeasured(missing-management-lease) — 네트워크 호출 0.
+ *   · 읽기 실패는 readOpenRouterCredit 안에서 unmeasured(request-failed) 로 접지된다(예외 밖으로 0).
+ * ⛔ 결정 로직은 이 파일 밖(oauth) — 여기는 «관측» 만 만든다.
+ */
+export function createCreditRowStateObserver(
+  readPolicy: () => Promise<LlmSpendPolicyDoc | null>,
+  deps: CreditAdapterDeps = {},
+): () => Promise<LlmSpendRowState[]> {
+  return async () => {
+    const policy = await readPolicy();
+    return policy === null ? [] : readCreditRowStates(policy, deps);
+  };
+}
+
 /** 직접 주입된 상태가 어댑터 값을 «덮는다»(행 단위 · 칸 단위 병합) — 시험·후속 칸(지출 원장·임대)이 같은 행에 칸을 더한다. */
 export function mergeRowStates(base: readonly LlmSpendRowState[], injected: readonly LlmSpendRowState[]): LlmSpendRowState[] {
   const merged = new Map<string, LlmSpendRowState>();

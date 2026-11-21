@@ -100,15 +100,18 @@ function readDay(since: string, deps: DayDeps): { since: string; until: string; 
   if (!existsSync(path)) return { since: from, until, events: [], lifecycleEvents: [], lifecycleOffset: 0 };
   const db = new Database(path, { readonly: true });
   try {
-    const events = db.prepare(`SELECT surface, kind, ts, refs, summary FROM events
+    const hasSignals = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='signals'").get());
+    const journal = `SELECT surface, kind, ts, refs, summary, direction FROM events
+      ${hasSignals ? "UNION ALL SELECT surface, kind, ts, refs, summary, direction FROM signals WHERE surface='context:external' AND kind='exit'" : ''}`;
+    const events = db.prepare(`WITH journal AS (${journal}) SELECT surface, kind, ts, refs, summary FROM journal
       WHERE surface IN ('coord:channel', 'context:session', 'context:external')
         AND direction='outbound' AND ts>=? AND ts<=? ORDER BY ts ASC`).all(from, until) as JournalEvent[];
-    const boundaryLifecycleEvents = db.prepare(`SELECT prior.surface, prior.kind, prior.ts, prior.refs, prior.summary FROM events prior
+    const boundaryLifecycleEvents = db.prepare(`WITH journal AS (${journal}) SELECT prior.surface, prior.kind, prior.ts, prior.refs, prior.summary FROM journal prior
       WHERE prior.surface='context:external' AND prior.direction='outbound'
         AND prior.kind IN ('started', 'finished', 'done', 'exit') AND prior.ts<?
         AND json_extract(CASE WHEN json_valid(prior.refs) THEN prior.refs ELSE '{}' END, '$.origin')='codex-agent-mission'
         AND EXISTS (
-          SELECT 1 FROM events current
+          SELECT 1 FROM journal current
           WHERE current.surface='context:external' AND current.direction='outbound'
             AND current.kind IN ('started', 'finished', 'done', 'exit') AND current.ts>=? AND current.ts<=?
             AND json_extract(CASE WHEN json_valid(current.refs) THEN current.refs ELSE '{}' END, '$.origin')='codex-agent-mission'

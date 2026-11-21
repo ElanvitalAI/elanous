@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { authorize, classifyShell, createControl, loadAllowList, pinAllowList, type AllowRule, type ControlExecuteResult, type HitlAnswer, type HitlRequest, type Principal } from './control.js';
+import { appendSendAudit, authorize, classifyShell, createControl, loadAllowList, pinAllowList, type AllowRule, type ControlExecuteResult, type HitlAnswer, type HitlRequest, type Principal } from './control.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -31,6 +31,28 @@ function door(dir: string, hitl?: () => Promise<HitlAnswer>, execute?: () => Pro
 
 const auditLines = (dir: string): { result: string; danger: string; reason?: string; chars: number; sha256: string; fromChars?: number; fromSha256?: string; text?: string }[] =>
   readFileSync(join(dir, 'control-audit.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { result: string; danger: string; reason?: string; chars: number; sha256: string; fromChars?: number; fromSha256?: string; text?: string });
+
+test('socket audit separates observed and claimed PID on all door outcomes', async () => {
+  const dir = stateDir();
+  const { control } = door(dir);
+  await control.run({ principal: cli, action: 'do', target: agent, text: 'private', socketAudit: { peerPid: 42, claimedPid: 99 } });
+  allow(dir, [{ principal: 'OP', workspace: 'HQ', pane: 'p1', actions: ['do'] }]);
+  await control.run({ principal: cli, action: 'do', target: agent, text: 'private', socketAudit: { peerPid: undefined, claimedPid: 99 } });
+  const raw = readFileSync(join(dir, 'control-audit.jsonl'), 'utf8');
+  const rows = raw.trim().split('\n').map(line => JSON.parse(line));
+  expect(rows.map(row => [row.result, row.peerPid, row.claimedPid])).toEqual([
+    ['denied', 42, 99], ['executing', 'unknown', 99], ['executed', 'unknown', 99],
+  ]);
+  expect(raw).not.toContain('private');
+});
+
+test('direct send audit separates socket peer from claim and omits raw text', () => {
+  const dir = stateDir();
+  expect(appendSendAudit(dir, { op: 'send', pane: 'p', text: 'private-text', exitCode: 0, socketAudit: { peerPid: undefined, claimedPid: 99 } })).toBeUndefined();
+  const raw = readFileSync(join(dir, 'control-audit.jsonl'), 'utf8');
+  expect(JSON.parse(raw)).toMatchObject({ peerPid: 'unknown', claimedPid: 99, result: 'executed' });
+  expect(raw).not.toContain('private-text');
+});
 
 test('structural payload reaches the authorized executor intact', async () => {
   const dir = stateDir();
@@ -449,6 +471,24 @@ test('input built-in: authenticated seats only, explicit deny wins, other action
   expect(rows.slice(0, 4).every(row => row.authorization === 'builtin-input')).toBe(true);
   expect(rows.at(-1).reason).toBe('explicit input deny');
   expect(JSON.stringify(rows)).not.toContain('secret');
+});
+
+test('pinning preserves tab-scoped grants and input denies across reload', async () => {
+  const dir = stateDir();
+  const ids = { workspace: (ref: string) => ref === 'HQ' || ref === 'ws-1' ? 'ws-1' : undefined, pane: (ref: string) => ref === 'main' || ref === 'pn-1' ? 'pn-1' : undefined };
+  allow(dir, [
+    { principal: 'local:501', workspace: 'HQ', pane: 'main', tab: 'tab-1', actions: ['read'] },
+    { principal: 'local:501', workspace: 'HQ', pane: 'main', tab: 'tab-1', actions: ['input'], effect: 'deny' },
+  ]);
+  pinAllowList(dir, ids);
+  const rules = loadAllowList(dir);
+  expect(rules.map(rule => rule.tab)).toEqual(['tab-1', 'tab-1']);
+  const principal: Principal = { id: 'local:501', kind: 'cli', callerPane: 'caller', callerSeat: 'OP' };
+  const target = { workspace: 'ws-1', pane: 'pn-1', shell: false };
+  expect(authorize(rules, principal, { ...target, tab: 'tab-2' }, 'read')).toBe(false);
+  const control = createControl({ stateDir: dir, resolve: ids, execute: async () => ({ exitCode: 0, message: 'typed' }) });
+  expect((await control.run({ principal, action: 'input', target: { ...target, tab: 'tab-1' }, text: 'hello' })).ok).toBe(false);
+  expect((await control.run({ principal, action: 'input', target: { ...target, tab: 'tab-2' }, text: 'hello' })).ok).toBe(true);
 });
 
 test('input deny survives pinning and does not grant other actions', async () => {

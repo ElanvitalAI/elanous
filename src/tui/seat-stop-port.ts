@@ -43,12 +43,12 @@ export interface SeatControlLike {
  * stuck behind it. `stopping` is set synchronously (before any await) when a stop starts: at an idle request, or at the
  * turn end of a waiting quit/migrate. A failed checkpoint lifts it again (the seat keeps working).
  */
-export function createSeatStopDriver(deps: { control: SeatControlLike; busy: () => boolean }) {
+export function createSeatStopDriver(deps: { control: SeatControlLike; busy: () => boolean; capsulesActive?: () => boolean }) {
   let waiting = false;
   let stopping = false;
   return {
     async request(request: SeatStopRequest, session?: string): Promise<SeatStopResult> {
-      const busy = deps.busy();
+      const busy = deps.busy() || Boolean(deps.capsulesActive?.());
       const before = stopping;
       if (request.mode === 'force' || !busy) stopping = true;
       try {
@@ -63,7 +63,7 @@ export function createSeatStopDriver(deps: { control: SeatControlLike; busy: () 
     },
     /** Call at the turn end (busy → false), before anything can knock the door. */
     async turnEnded(): Promise<void> {
-      if (!waiting) return;
+      if (!waiting || deps.busy() || deps.capsulesActive?.()) return;
       waiting = false;
       stopping = true;
       try { await deps.control.turnEnded(); } catch (error) { stopping = false; throw error; }

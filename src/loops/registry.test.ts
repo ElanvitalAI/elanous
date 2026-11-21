@@ -9,7 +9,7 @@ import { debug } from '../debug/log.js';
 import { checkLoops } from './checker.js';
 import { inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
-import { listAllLoops, listLoops, loopRecentRuns, loopStatus, registerGraphTriggerRun, runLoop, setLoopEnabled,
+import { listAllLoops, listLoops, loopCronCommand, loopCronLogPath, loopRecentRuns, loopStatus, registerGraphTriggerRun, runLoop, setLoopEnabled,
   type LoopRegistryOptions } from './registry.js';
 import { LOOP_MESSAGE_ROUTES } from './msg-address.js';
 import { MsgStore } from '../msg/msg-store.js';
@@ -412,6 +412,42 @@ test('registry rejects invalid root and stage rather than silently assigning a t
   expect(() => listLoops(f.opts)).toThrow('invalid loop stage for bad');
 });
 
+test('new graph cron uses the state root and rejects cron metacharacters', () => {
+  const f = fixture();
+  expect(loopCronLogPath('daily', f.stateRoot)).toBe(join(f.stateRoot, 'loop-logs', 'elanous-loop-daily.log'));
+  expect(loopCronCommand('daily', 'graphs/daily/cron.yaml', f.root, '/usr/bin/bun', f.stateRoot)).toBe(
+    `cd ${f.root} && /usr/bin/bun bin/elanous.mjs loop cron daily --graph graphs/daily/cron.yaml --state-root ${f.stateRoot} # elanous-loop=daily`);
+  for (const bad of ['relative', '/tmp/bad%path', '/tmp/bad\npath']) {
+    expect(() => loopCronLogPath('daily', bad)).toThrow();
+  }
+});
+
+test('cron command quotes shell-hostile paths and keeps the crontab line shape', () => {
+  const f = fixture();
+  const state = join(f.root, "state it's $safe");
+  const root = join(f.root, "project it's $safe");
+  const bin = join(f.root, "fake bun's");
+  const command = loopCronCommand('daily', "graphs/it's a.yaml", root, bin, state);
+  expect(command).toBe(`cd '${root.replace(/'/g, "'\\''")}' && '${bin.replace(/'/g, "'\\''")}' bin/elanous.mjs loop cron daily --graph 'graphs/it'\\''s a.yaml' --state-root '${state.replace(/'/g, "'\\''")}' # elanous-loop=daily`);
+  // Cron splits on % and newline before the shell runs: reject them up front in any slot.
+  expect(() => loopCronCommand('daily', 'graphs/has % percent.yaml', root, bin, state)).toThrow('invalid cron command path');
+  expect(() => loopCronCommand('daily', 'graphs/x.yaml', 'root\nwith newline', bin, state)).toThrow('invalid cron command path');
+  expect(() => loopCronCommand('daily', 'graphs/x.yaml', root, 'bun\nwith newline', state)).toThrow('invalid cron command path');
+});
+
+test('registration preview is side effect free and mkdir failure prevents dispatch', async () => {
+  const f = fixture();
+  let calls = 0;
+  const opts: LoopRegistryOptions = { ...f.opts, schedules: [], scheduleAction: async () => { calls++; return {}; } };
+  await setLoopEnabled('daily', true, false, opts);
+  expect(calls).toBe(0);
+  expect(() => readFileSync(join(f.stateRoot, 'loop-logs'))).toThrow();
+  mkdirSync(f.stateRoot, { recursive: true });
+  writeFileSync(join(f.stateRoot, 'loop-logs'), 'not a directory');
+  await expect(setLoopEnabled('daily', true, true, opts)).rejects.toThrow();
+  expect(calls).toBe(0);
+});
+
 test('start plans absent cron, --yes registers; stop disables and start restores without deletion', async () => {
   const f = fixture();
   let line = '';
@@ -428,8 +464,10 @@ test('start plans absent cron, --yes registers; stop disables and start restores
     expect(await setLoopEnabled('daily', true, false, opts)).toMatchObject({ dryRun: true, changes: [{ action: 'create', cron: '0 7 * * *' }] });
     expect(line).toBe('');
     expect(await setLoopEnabled('daily', true, true, opts)).toMatchObject({ changed: true });
-    // cron runs in $HOME with a thin PATH — the line enters the package and names bun by absolute path.
-    expect(line).toContain(`cd ${f.opts.root} && ${process.execPath} bin/elanous.mjs graph run `);
+    // cron runs in $HOME with a thin PATH — the line enters the package and names bun by absolute path,
+    // and routes the log through the loop cron wrapper instead of a shell `>>` open (JUD #117698).
+    expect(line).toContain(`cd ${f.opts.root} && ${process.execPath} bin/elanous.mjs loop cron daily --graph `);
+    expect(line).toContain(`--state-root ${f.stateRoot} # elanous-loop=daily`);
     expect(listLoops(opts).find(l => l.id === 'daily')?.enabled).toBe(true);
     expect(await setLoopEnabled('daily', false, false, opts)).toMatchObject({ dryRun: true, changes: [{ action: 'disable' }] });
     expect(await setLoopEnabled('daily', false, true, opts)).toMatchObject({ changed: true });
@@ -458,7 +496,7 @@ test('loop CLI exposes the five lifecycle actions with safe mutation flags', () 
   const program = new Command();
   registerLoopCommands(program);
   const loop = program.commands.find(c => c.name() === 'loop');
-  expect(loop?.commands.map(c => c.name())).toEqual(['list', 'activity', 'status', 'start', 'stop', 'run', 'package']);
+  expect(loop?.commands.map(c => c.name())).toEqual(['list', 'activity', 'status', 'start', 'stop', 'cron', 'run', 'package']);
   expect(loop?.commands.find(c => c.name() === 'start')?.options.map(o => o.long)).toContain('--yes');
   expect(loop?.commands.find(c => c.name() === 'stop')?.options.map(o => o.long)).toContain('--yes');
   expect(loop?.commands.find(c => c.name() === 'run')?.options.map(o => o.long)).toContain('--dry-run');

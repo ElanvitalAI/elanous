@@ -36,6 +36,8 @@ test('fake Nexus slot inventory shows only shared names, presence and last check
   expect(html).toContain('확인 기록 없음');
   expect(html).toContain('/credentials/register?slot=cred%3Aopenai.api_key');
   expect(html).toContain('OpenRouter 계정 연결');
+  expect(html).toContain('TimelyRouter 연결 미리보기');
+  expect(html).toContain('가격은 공급자 원장에서 확인한');
   const openRouterRow = renderedRows(tree).find((row) => row.includes('cred:openrouter.api_key')) ?? '';
   expect(openRouterRow).toContain('QR·키 등록');
   expect(openRouterRow).toContain('/credentials/register?slot=cred%3Aopenrouter.api_key');

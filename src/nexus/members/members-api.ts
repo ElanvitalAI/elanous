@@ -36,6 +36,7 @@ import {
 import { runKcbTryWithinDeadline } from "./kcb-try-deadline.js";
 import { debug } from "../../debug/log.js";
 import { renderMemberHomePage } from "./member-home-page.js";
+import { renderMemberHandlePage } from "./member-handle-page.js";
 import { nexusRootDir } from "../paths.js";
 import { sessionRoot } from "../../session/index.js";
 import {
@@ -45,6 +46,7 @@ import {
   type MemberSessionService,
 } from "./member-sessions.js";
 import { createMemberCloudBackupRoute } from "./member-cloud-backup-route.js";
+import { slugFromName } from "./member-handle-suggest.js";
 import {
   createDeploymentGrantRoute,
   type DeploymentGrantRouteOptions,
@@ -288,6 +290,21 @@ function equalToken(left: string, right: string): boolean {
 
 function memberInviteLink(webOrigin: string, publicId: string): string {
   return new URL(`/r/${encodeURIComponent(publicId)}`, webOrigin).toString();
+}
+
+/**
+ * MEMBER-JOURNEY S1: first code value that is non-empty after trimming. The notice line
+ * (server-rendered) and the submit POST (browser script) must pick the invite code with the
+ * same rule, so this function's own source is embedded into the page script — one definition,
+ * executed on both sides. Must stay free of outer-scope references so `toString()` keeps
+ * emitting standalone browser-runnable JS after the deploy build.
+ */
+function inviteCodeFrom(values: readonly (string | null)[]): string {
+  for (const value of values) {
+    const trimmed = (value ?? "").trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
 }
 
 function legacyMemberInviteLink(
@@ -843,6 +860,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           "/v1/members",
           "/v1/members/referral-code",
           "/v1/members/handle",
+          "/v1/members/handle/check",
           "/v1/members/validate-code",
           "/v1/members/try",
           "/v1/members/newsletter-preference",
@@ -888,7 +906,16 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           );
         }
         const scriptNonce = randomBytes(18).toString("base64url");
-        const page = `<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Elanous 회원 로그인</title><main><h1>Elanous 회원 로그인</h1><p>Google 계정으로 계속합니다.</p><form id="member-login"><label><input name="privacy" type="checkbox" required> 개인정보 처리에 동의합니다</label><label><input name="terms" type="checkbox" required> 이용약관에 동의합니다</label><label>행사 코드 <input name="eventCode" autocomplete="off" maxlength="80"></label><button type="submit">Google로 계속</button><p id="status" role="status"></p></form></main><script nonce="${scriptNonce}">(function(){const form=document.getElementById('member-login');const status=document.getElementById('status');form.addEventListener('submit',async function(event){event.preventDefault();const values=new FormData(form);const params=new URLSearchParams(location.search);status.textContent='Google 로그인으로 이동합니다…';try{const response=await fetch('/v1/members',{method:'POST',credentials:'include',headers:{'content-type':'application/json'},body:JSON.stringify({consents:{privacy:values.get('privacy')==='on'?'privacy-v1':'',terms:values.get('terms')==='on'?'terms-v1':''},eventCode:String(values.get('eventCode')||''),appRedirectUri:params.get('appRedirectUri'),appCodeChallenge:params.get('appCodeChallenge')})});const body=await response.json();if(!response.ok||typeof body.authorizationUrl!=='string')throw new Error('start-failed');location.replace(body.authorizationUrl)}catch{status.textContent='로그인을 시작하지 못했습니다. 입력한 행사 코드를 확인하고 다시 시도해 주세요.'}})})();</script></html>`;
+        // MEMBER-JOURNEY S1: an invite-link code is applied silently (the script reads it from the link); the page never prints it.
+        // The notice line and the POST share inviteCodeFrom so they cannot disagree (JUD #116886).
+        const inviteCode = inviteCodeFrom([
+          url.searchParams.get("code"),
+          url.searchParams.get("eventCode"),
+        ]);
+        const appliedInviteLine = inviteCode
+          ? "<p data-invite-applied>초대 코드 적용됨</p>"
+          : "";
+        const page = `<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Elanous 회원 로그인</title><main><h1>Elanous 회원 로그인</h1><p>Google 계정으로 계속합니다.</p><form id="member-login"><label><input name="privacy" type="checkbox" required> 개인정보 처리에 동의합니다</label><label><input name="terms" type="checkbox" required> 이용약관에 동의합니다</label>${appliedInviteLine}<button type="submit">Google로 계속</button><p id="status" role="status"></p></form></main><script nonce="${scriptNonce}">(function(){const pickInviteCode=${inviteCodeFrom.toString()};const form=document.getElementById('member-login');const status=document.getElementById('status');form.addEventListener('submit',async function(event){event.preventDefault();const values=new FormData(form);const params=new URLSearchParams(location.search);status.textContent='Google 로그인으로 이동합니다…';try{const response=await fetch('/v1/members',{method:'POST',credentials:'include',headers:{'content-type':'application/json'},body:JSON.stringify({consents:{privacy:values.get('privacy')==='on'?'privacy-v1':'',terms:values.get('terms')==='on'?'terms-v1':''},eventCode:pickInviteCode([params.get('code'),params.get('eventCode')]),appRedirectUri:params.get('appRedirectUri'),appCodeChallenge:params.get('appCodeChallenge')})});const body=await response.json();if(!response.ok||typeof body.authorizationUrl!=='string')throw new Error('start-failed');location.replace(body.authorizationUrl)}catch{status.textContent='로그인을 시작하지 못했습니다. 잠시 뒤 다시 시도해 주세요.'}})})();</script></html>`;
         return withCors(
           request,
           new Response(page, {
@@ -1141,7 +1168,9 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           // hosts, and the web /app redirects to «곧 열립니다», so neither is a button target.
           myElanous: { handleAddress: handle ? `${handle}.elanous.app` : null },
           siteUrl: new URL("/", webOrigin).toString(),
-          handleStepUrl: new URL("/members/", webOrigin).toString(),
+          // MEMBER-JOURNEY S3: the handle confirmation step moved from the static site
+          // (/members/) onto the member server itself — same origin as this home.
+          handleStepUrl: new URL("/v1/members/handle", webOrigin).toString(),
           // OP 11-18 (B): an app slot needs an event code (createAppSlotForMember → event-code-required). A member
           // without a slot and without a code is told so, and is not offered a name it cannot save.
           appName: (() => {
@@ -1646,6 +1675,40 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         );
       }
       if (path === "/v1/members/handle") {
+        // MEMBER-JOURNEY-FRICTIONLESS S3: the «내 주소» confirmation step lives on the
+        // member server (the canonical home's origin) — a signed-in member without a
+        // handle confirms here (GET HTML); a member with a handle is sent straight home.
+        // The static site /members/ step is no longer the destination.
+        if (request.method === "GET") {
+          const token = sessionFromCookie(request);
+          const member = token
+            ? options.store.memberForSession(token, new Date(now()).toISOString())
+            : null;
+          if (!member) return json({ error: "unauthorized" }, 401);
+          if (options.store.handleForMember(member.id))
+            return new Response(null, {
+              status: 302,
+              headers: {
+                location: new URL("/v1/members/home", request.url).toString(),
+              },
+            });
+          const nonce = randomBytes(18).toString("base64url");
+          const emailLocalPart = member.email.split("@")[0] ?? "";
+          const page = renderMemberHandlePage({
+            name: member.name,
+            suggestedHandle: slugFromName(member.name, emailLocalPart),
+            homeUrl: new URL("/v1/members/home", request.url).toString(),
+            nonce,
+          });
+          return new Response(page, {
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              "cache-control": "no-store",
+              "referrer-policy": "no-referrer",
+              "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+            },
+          });
+        }
         if (request.method !== "PUT")
           return withCors(
             request,
@@ -1946,6 +2009,56 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         return withCors(
           request,
           json({ appSlot: publicSlot(created.slot) }, 201),
+          webOrigin,
+        );
+      }
+      if (path === "/v1/members/handle/check") {
+        if (request.method !== "GET")
+          return withCors(
+            request,
+            json({ error: "method-not-allowed" }, 405),
+            webOrigin,
+          );
+        const token = sessionFromCookie(request);
+        const member = token
+          ? options.store.memberForSession(token, new Date(now()).toISOString())
+          : null;
+        if (!member)
+          return withCors(
+            request,
+            json({ error: "unauthorized" }, 401),
+            webOrigin,
+          );
+        // Read-only and idempotent. Without ?handle= the answer is about the recommendation built from the caller's own name; with it,
+        // about that one candidate. Nothing about any other member is returned: only the status of the label and labels derived from it.
+        const asked = url.searchParams.getAll("handle");
+        if (asked.length > 1)
+          return withCors(
+            request,
+            json({ error: "invalid-request" }, 400),
+            webOrigin,
+          );
+        const recommended = slugFromName(
+          member.name,
+          member.email.split("@")[0],
+        );
+        const candidate = asked.length === 1 ? asked[0]! : recommended;
+        const result = options.store.handleAvailability(candidate, member.id);
+        // The suggestion is only ever a usable handle: when the recommendation itself is taken, reserved or invalid
+        // it moves to the first free alternative from the same result, or is absent when there is none. A ?handle=
+        // question never carries a suggestion — it is only about the one candidate that was asked about.
+        const usableSuggestion =
+          asked.length === 0
+            ? (result.status === "ok" ? recommended : (result.alternatives[0] ?? null))
+            : null;
+        return withCors(
+          request,
+          json({
+            handle: candidate,
+            status: result.status,
+            alternatives: result.alternatives,
+            suggestion: usableSuggestion,
+          }),
           webOrigin,
         );
       }

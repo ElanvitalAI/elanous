@@ -55,10 +55,11 @@ test('login env key: user, shell, HOME and rc mtimes decide whether a capture st
 });
 
 test('handoff payload never carries the els credentials and only fits its own key', () => {
-  const captured = { PATH: '/bin', ELANOUS_ELS_OWNER_TOKEN: 'owner-secret', ELANOUS_ELS_PANE_TOKEN: 'pane-secret', KEEP: 'yes' };
+  const captured = { PATH: '/bin', ELANOUS_ELS_OWNER_TOKEN: 'owner-secret', ELANOUS_ELS_PANE_TOKEN: 'pane-secret', ELANOUS_CEO_TELEGRAM_TOKEN: 'synthetic-bot-secret', KEEP: 'yes' };
   const packed = packLoginEnv(captured, 'k1');
   expect(packed).not.toContain('owner-secret');
   expect(packed).not.toContain('pane-secret');
+  expect(packed).not.toContain('synthetic-bot-secret');
   expect(unpackLoginEnv(packed, 'k1')).toEqual({ PATH: '/bin', KEEP: 'yes' });
   expect(unpackLoginEnv(packed, 'k2')).toBeUndefined();                        // another user/shell/rc state: capture it yourself
   expect(unpackLoginEnv('not json', 'k1')).toBeUndefined();

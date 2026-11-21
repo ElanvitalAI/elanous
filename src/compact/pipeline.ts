@@ -38,13 +38,18 @@ export interface RunCompactOpts {
   summaryHint?: string;
 }
 
+/** ★ COMPACT P0 (OP #123867, 2026-11-21) — user 원문 예산 이관이 발생하면 요약에
+ *  찍히는 마커. 시험(test/compact-user-directives.test.ts)이 같은 문자열로 계약을
+ *  고정한다(export — 매직 넘버 복제 금지). */
+export const USER_BUDGET_TRANSFER_MARKER = '[user-directive-budget]';
+
 /** Run Layer 1 (tool-output budget) + Layer 2 (microcompact) +
  *  optionally Layer 3 (LLM summarize when `opts.provider` is set).
  *  Returns a fresh message array — input is not mutated. */
 export async function runCompactPipeline(
   messages: LLMMessage[],
   opts: RunCompactOpts = {},
-): Promise<CompactPipelineResult & { replaySourceIndex?: number }> {
+): Promise<CompactPipelineResult & { preservedUserIndices?: number[] }> {
   const policy = { ...DEFAULT_COMPACT_POLICY, ...opts.policy };
   const sessionId = opts.sessionId ?? 'default';
   const now = opts.now ?? Date.now;
@@ -62,8 +67,9 @@ export async function runCompactPipeline(
   let layer3Chars = 0;
   let layer4Verdict: 'skipped' | 'ok' | 'rejected' = 'skipped';
   let layer5FallbackTruncated: 0 | 1 = 0;
-  let userReplayApplied: 0 | 1 = 0;
-  let replaySourceIndex: number | undefined;
+  let userDirectivesPreserved = 0;
+  let userDirectivesBudgetTransferred: 0 | 1 = 0;
+  let preservedUserIndices: number[] | undefined;
   const breakerTripped = isAutoCompactBreakerTripped() ? 1 : 0;
 
   const sliceUntil = Math.max(0, layer2.messages.length - policy.preserveLastN);
@@ -71,7 +77,6 @@ export async function runCompactPipeline(
   //   메시지)는 요약으로 뭉개지 않고 원문 유지(pin). preserveFirst=0 이면 기존 동작.
   const anchorCount = computeAnchorCount(layer2.messages, policy.preserveFirst, sliceUntil);
   const anchors = layer2.messages.slice(0, anchorCount);
-  const anchorHasUser = anchors.some(m => m.role === 'user');
   const sliceForSummary = layer2.messages.slice(anchorCount, sliceUntil);
 
   // 앵커+tail 이 전부를 덮어 요약할 중간이 없으면 L3 스킵(무의미한 요약·null 방지).
@@ -100,52 +105,63 @@ export async function runCompactPipeline(
       if (acceptSummary) {
         const effectiveSliceUntil = summary.preservedTailFrom ?? sliceUntil;
         const tail = layer2.messages.slice(effectiveSliceUntil);
+        // ★ COMPACT P0 (OP #123867, 2026-11-21) — user 메시지는 구조적 보존 대상.
+        //   압축은 assistant·tool 내용만 요약한다: 요약 슬라이스(앵커~tail 사이)의
+        //   user 메시지는 원문 그대로(순서 유지) summary 바로 뒤에 재배치된다 —
+        //   요약 모델이 지시를 빼먹어도 원문은 절대 소실되지 않는다(정규식·키워드
+        //   분류 없이 role 기준 구조적 보존). policy.userPreserveBudgetChars 가
+        //   지정되고 user 원문 합이 예산을 넘을 때만 **가장 오래된** user 메시지부터
+        //   요약으로 이관되고 그 사실이 요약에 명시된다(USER_BUDGET_TRANSFER_MARKER).
+        //   Wave 7 의 조건부 replay(마지막 user 1개만 재주입)는 이 보존으로 대체·폐지.
+        const sliceMsgs = layer2.messages.slice(anchorCount, effectiveSliceUntil);
+        const userTextLength = (m: LLMMessage): number =>
+          typeof m.content === 'string'
+            ? m.content.length
+            : (m.content as ContentBlock[])
+                .filter(b => (b as ContentBlock).type === 'text')
+                .reduce((acc, b) => acc + (b as { text: string }).text.length, 0);
+
+        const budget = policy.userPreserveBudgetChars;
+        // newest→oldest 누적 — 예산 안에 드는 user 접미사(최신 쪽)만 원문 보존,
+        // 그보다 오래된 user 전부 요약 이관. 예산 미지정(undefined)=전부 보존.
+        let keepFrom = sliceMsgs.length;
+        if (typeof budget === 'number' && Number.isFinite(budget) && budget >= 0) {
+          let acc = 0;
+          for (let i = sliceMsgs.length - 1; i >= 0; i--) {
+            const m = sliceMsgs[i]!;
+            if (!isHumanUserMessage(m)) continue;
+            const len = userTextLength(m);
+            if (acc + len > budget) break;
+            acc += len;
+            keepFrom = i;
+          }
+        } else {
+          keepFrom = 0;
+        }
+        const transferred = sliceMsgs.filter((m, i) => isHumanUserMessage(m) && i < keepFrom).length;
+        const keptPositions: number[] = [];
+        sliceMsgs.forEach((m, i) => {
+          if (isHumanUserMessage(m) && i >= keepFrom) keptPositions.push(anchorCount + i);
+        });
+        const preservedUsers = keptPositions.map(p => layer2.messages[p]!);
+        const summaryContent =
+          transferred > 0
+            ? `<context_summary>\n${summary.summary}\n${USER_BUDGET_TRANSFER_MARKER} 가장 오래된 user 메시지 ${transferred}건이 원문 예산(${budget}자) 초과로 이 요약으로 이관됐다.\n</context_summary>`
+            : `<context_summary>\n${summary.summary}\n</context_summary>`;
         const summaryMsg: LLMMessage = {
           role: 'system',
-          content: `<context_summary>\n${summary.summary}\n</context_summary>`,
+          content: summaryContent,
           cacheVolatile: true,
         };
-        // Wave 7 (2026-05-04) — user-message replay. ref/opencode
-        // `compaction.process` (session/compaction.ts:155-175,
-        // 283-338) pattern: when the summarized slice contained the
-        // user's task-intent message and the tail is assistant-only
-        // (multi-turn assistant chain → no user in preserveLastN),
-        // the model loses its anchor to "what was I asked to do?".
-        // Re-emit the last user message from the slice (text-only,
-        // media stripped to keep the replay clean) right after the
-        // summary so task continuation is explicit.
-        // ★ 앵커가 이미 user(=task-intent) 를 pin 했으면 replay 불필요(중복 앵커 방지).
-        //   앵커 미보존(preserveFirst=0) 시엔 기존 replay 로직 유지.
-        const tailHasUser = tail.some(m => m.role === 'user');
-        let replayedUser: LLMMessage | null = null;
-        if (!tailHasUser && !anchorHasUser) {
-          for (let i = sliceForSummary.length - 1; i >= 0; i--) {
-            const m = sliceForSummary[i]!;
-            if (m.role !== 'user') continue;
-            const text = typeof m.content === 'string'
-              ? m.content
-              : (m.content as ContentBlock[])
-                  .filter(b => (b as ContentBlock).type === 'text')
-                  .map(b => (b as { text: string }).text)
-                  .join('\n');
-            if (text.trim().length > 0) {
-              replaySourceIndex = anchorCount + i;
-              replayedUser = {
-                role: 'user',
-                content: text,
-                ...(m.transientTurnUser === true ? { transientTurnUser: true } : {}),
-              };
-            }
-            break;
-          }
-        }
         messagesAfter = [
           ...anchors,
           summaryMsg,
-          ...(replayedUser ? [replayedUser] : []),
+          ...preservedUsers,
           ...tail,
         ];
-        userReplayApplied = replayedUser ? 1 : 0;
+        userDirectivesPreserved = preservedUsers.length;
+        userDirectivesBudgetTransferred = transferred > 0 ? 1 : 0;
+        preservedUserIndices = keptPositions;
         layer3Applied = 1;
         layer3Model = summary.modelUsed ?? '';
         layer3Chars = summary.summary.length;
@@ -168,7 +184,7 @@ export async function runCompactPipeline(
 
   return {
     messages: messagesAfter,
-    ...(replaySourceIndex === undefined ? {} : { replaySourceIndex }),
+    ...(preservedUserIndices ? { preservedUserIndices } : {}),
     diagnostics: {
       layer1ToolOutputBudgetSavedChars: layer1.savedChars,
       layer1ResponsesTrimmed: layer1.responsesTrimmed,
@@ -183,7 +199,8 @@ export async function runCompactPipeline(
       archived: (policy.archiveEnabled
         ? layer1.responsesTrimmed + layer2.cleared
         : 0),
-      userReplayApplied,
+      userDirectivesPreserved,
+      userDirectivesBudgetTransferred,
     },
   };
 }
@@ -203,6 +220,19 @@ export function computeAnchorCount(
     count = Math.max(count, firstUserIdx + 1);
   }
   return Math.min(count, sliceUntil);
+}
+
+/** ★ COMPACT P0(OP #123867) — «사람 user 행» 구조적 판별(보존·drop 공용 계약).
+ *  tool_result 블록을 싣은 user 메시지는 사람 말이 아니라 «도구 출력»이다(OP 처방 ①
+ *  «assistant·tool 내용만 요약») — role 이 user 라도 tool_result 캐리어면 보존 대상에서
+ *  제외되어 짝(tool_use)과 함께 요약 슬라이스에 남는다. 원문으로 살리면 짝만 요약돼
+ *  유령 tool_result 가 되어 wire 가 깨진다. 혼합(tool_result+text) 행도 캐리어다.
+ *  구조적 기준(content 블록 type)이지 키워드·정규식 분류가 아니다. compact-session 의
+ *  overflow 재시도 drop 후보 선정도 이 계약을 공유한다(JUD-B #124147 · OP #124161). */
+export function isHumanUserMessage(m: LLMMessage): boolean {
+  return m.role === 'user'
+    && (typeof m.content === 'string'
+      || !(m.content as ContentBlock[]).some(b => (b as ContentBlock).type === 'tool_result'));
 }
 
 /** Wave 5 fallback — truncateProportional applied to the largest

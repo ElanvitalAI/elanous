@@ -363,7 +363,9 @@ export async function dispatchMsgAck(rawArgs: Record<string, unknown>, deps: Msg
   const cursor = integerArg(rawArgs.id, 'id', 0, Number.MAX_SAFE_INTEGER);
   const store = deps.openStore?.() ?? openMsgStore();
   try {
-    // ELN-SEAT-LIVE 11-18: the tool's ack leaves «seen» like the CLI's (#38305) — it used to move the cursor only.
+    // #122460 (CX-16 postland 실측): the tool's ack moves the cursor only — a tool call is not processing; «seen» is the
+    // answered turn's receipt (tui-queue, queueItemId-bound). The 11-18 tool-ack seen was stamped before the answer and
+    // pushed the queue-bound seen to not-forward.
     const acknowledged = store.ackThroughSeen(to, cursor, 'tool-ack');
     return {
       output: `MsgAck ${to} acknowledged through #${acknowledged}`,

@@ -185,15 +185,17 @@ export async function dispatchNextTuiBash<T>(opts: {
   readonly requiresApproval?: boolean;
   readonly approve: ((command: string, signal?: AbortSignal) => Promise<boolean>) | null;
   readonly signal?: AbortSignal;
-  readonly dispatch: () => Promise<T>;
+  readonly dispatch: (priorHumanApproval: boolean) => Promise<T>;
 }): Promise<T | { error: string }> {
   if (opts.signal?.aborted) return { error: 'Bash blocked: turn cancelled.' };
+  let priorHumanApproval = false;
   if (opts.enabled && (opts.requiresApproval ?? isPotentiallyDestructiveShellCommand(opts.command))) {
     if (!opts.approve) return { error: 'Bash blocked: human approval channel is unavailable.' };
     const approved = await opts.approve(opts.command, opts.signal);
     if (opts.signal?.aborted) return { error: 'Bash blocked: turn cancelled.' };
     if (!approved) return { error: 'Bash blocked: human approval was denied.' };
+    priorHumanApproval = true;
   }
   if (opts.signal?.aborted) return { error: 'Bash blocked: turn cancelled.' };
-  return opts.dispatch();
+  return opts.dispatch(priorHumanApproval);
 }

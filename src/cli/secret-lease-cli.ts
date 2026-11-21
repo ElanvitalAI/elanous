@@ -42,7 +42,7 @@ export function parseUntil(raw: string, nowMs: number): number | undefined {
 function line(res: StaticLeaseResult): string {
   if (!res.ok) return `lease refused · ${res.id} → ${res.target} · ${res.reason} · ${res.detail}`;
   const r = res.record;
-  return `lease ${res.action} · ${r.id} → ${r.target} (${r.targetType}) · leaseId=${r.leaseId} · expiresAt=${r.expiresAt} · fp=${r.fingerprint8}`;
+  return `lease ${res.action} · ${r.id}/${r.envName} → ${r.target} (${r.targetType}) · leaseId=${r.leaseId} · expiresAt=${r.expiresAt} · fp=${r.fingerprint8}`;
 }
 
 /** 순서대로 하나씩 — 같은 대상에 ssh 를 겹쳐 열지 않는다. */
@@ -128,11 +128,11 @@ export function registerSecretLeaseCommands(secret: Command, deps: SecretLeaseCl
       try {
         const configDir = (deps.configDir ?? (() => (require('../elanous-config-dir.js') as typeof import('../elanous-config-dir.js')).getElanousConfigDir()))();
         const nowMs = now();
-        const rows = readStaticLeaseRecords(configDir).map((r) => ({ leaseId: r.leaseId, kind: r.kind, id: r.id, target: r.target, targetType: r.targetType, status: staticLeaseStatus(r, nowMs), issuedAt: r.issuedAt, expiresAt: r.expiresAt, fingerprint8: r.fingerprint8 }));
+        const rows = readStaticLeaseRecords(configDir).map((r) => ({ leaseId: r.leaseId, kind: r.kind, id: r.id, envName: r.envName, target: r.target, targetType: r.targetType, status: staticLeaseStatus(r, nowMs), issuedAt: r.issuedAt, expiresAt: r.expiresAt, fingerprint8: r.fingerprint8 }));
         if (options.json) out.log(JSON.stringify(rows));
         else {
-          out.log('leaseId\tkind\tid\ttarget\tstatus\texpiresAt');
-          for (const r of rows) out.log(`${r.leaseId}\t${r.kind}\t${r.id}\t${r.target}\t${r.status}\t${r.expiresAt}`);
+          out.log('leaseId\tkind\tid\tenvName\ttarget\tstatus\texpiresAt');
+          for (const r of rows) out.log(`${r.leaseId}\t${r.kind}\t${r.id}\t${r.envName}\t${r.target}\t${r.status}\t${r.expiresAt}`);
         }
         exit(0);
       } catch {

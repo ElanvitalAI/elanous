@@ -24,6 +24,18 @@ function fixture(files: Record<string, string>, env: NodeJS.ProcessEnv = {}) {
 }
 
 describe('detectProviders read-only discovery', () => {
+  test('TimelyRouter is proposed only with a complete endpoint, key, and model', async () => {
+    const env = { TIMELYROUTER_API_KEY: 'fake-key', TIMELYROUTER_BASE_URL: 'https://timely.mock.invalid/v1', TIMELYROUTER_MODEL: 'timelyrouter/demo-model' };
+    for (const missing of Object.keys(env)) {
+      const incomplete = { ...env } as Record<string, string>;
+      delete incomplete[missing];
+      expect((await detectProviders(fixture({}, incomplete).deps)).some(row => row.provider === 'timelyrouter')).toBe(false);
+    }
+    const rows = await detectProviders(fixture({}, env).deps);
+    expect(rows.find(row => row.provider === 'timelyrouter')).toMatchObject({ auth: 'apikey', source: 'env:TIMELYROUTER_API_KEY', available: true });
+    expect(JSON.stringify(rows)).not.toContain('fake-key');
+  });
+
   test('Claude CLI status identifies a logged-in agent without handling subscription secrets', async () => {
     const f = fixture({}, { PATH: '/tools' });
     f.deps.access = async (path) => path === '/tools/claude';
