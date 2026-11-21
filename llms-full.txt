@@ -5200,6 +5200,40 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.32
+
+Source: https://docs.elanous.ai/releases/0-3-32/
+
+## Behavior changes
+
+- You can now forward requests sent by the CEO to the task owner and receive the results back.
+- If the message sent to the assignee hasn't been read yet, they'll now be notified again.
+- Improved handling so that messages arriving while a conversation is in progress are processed after the current response finishes.
+- When resuming a task, previous work content and memories are now loaded, making it easy to pick up where you left off.
+- A dialog box for entering the name of the new tab appears in the center of the screen.
+- Check the installed version and build time, and distinguish between the stable and development builds in the terminal.
+- Improved handling of tab control failures and message delivery stability.
+- Improved the flow for reloading a member's session history in web conversations.
+- Fixed an error that occurred when bundling the files required for installation and execution in a clean environment.
+- Known issue: In environments where tab control is not supported, you may need to use herdr to control tabs.
+
+## Security
+
+- We hardened the boundary that verifies allowed origins and member sessions in web conversations.
+- Control characters that cannot be sent to a tab are now rejected, and dangerous commands must go through an approval process.
+- Known issue: Conversation compaction summary requests may include secret values such as API keys verbatim. Please review conversations containing sensitive information before compaction. This will be fixed in 0.3.33.
+
+Plus 134 internal changes.
+
+## Known issues
+
+The following issues are known in this release.
+
+- Gate shards interrupted for time; completed shards preserved and remaining shards will be re-run after release. No user-facing regression known.
+- Two TUI regression checks failed in the release sandbox due to missing test configuration; core chat flows passed. Will re-verify after release.
+
+---
+
 # 0.3.31
 
 Source: https://docs.elanous.ai/releases/0-3-31/
